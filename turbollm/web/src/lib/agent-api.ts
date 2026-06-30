@@ -64,6 +64,29 @@ export async function deleteAgent(id: string): Promise<void> {
   await req<{ ok: boolean }>(`/api/v1/agents/${id}`, { method: 'DELETE' })
 }
 
+// ── Grown skills + lessons (spec 13 redesign §3.3) ─────────────────────────────
+
+export interface LearnedSkill { id: string; agentId: string; name: string; description: string; procedure: string; source?: string; createdAt: string }
+export interface LearnedLesson { id: string; agentId: string; lesson: string; evidence?: string; createdAt: string }
+
+export async function fetchLearned(agentId: string): Promise<{ skills: LearnedSkill[]; lessons: LearnedLesson[] }> {
+  return req(`/api/v1/agents/${agentId}/learned`)
+}
+
+export async function deleteLearnedSkill(agentId: string, skillId: string): Promise<void> {
+  await req<{ ok: boolean }>(`/api/v1/agents/${agentId}/skills/${skillId}`, { method: 'DELETE' })
+}
+
+export async function learnFromFolder(agentId: string, folder: string): Promise<{ ok: true; learning: boolean }> {
+  return req(`/api/v1/agents/${agentId}/learn-folder`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ folder }),
+  })
+}
+
+export async function saveConversationAsSkill(convId: string): Promise<{ ok: true; learning: boolean }> {
+  return req(`/api/v1/conversations/${convId}/save-skill`, { method: 'POST' })
+}
+
 // ── Skills ───────────────────────────────────────────────────────────────────
 
 export async function fetchSkills(): Promise<Skill[]> {

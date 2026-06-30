@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  ArrowDown, Bot, ChevronLeft, ChevronRight, FolderOpen,
+  ArrowDown, BookMarked, Bot, ChevronLeft, ChevronRight, FolderInput, FolderOpen,
   Pencil, Plus, Search, SendHorizontal, Settings2, Square,
   Trash2, X, CheckCircle2, Sparkles,
 } from 'lucide-react'
@@ -11,7 +11,9 @@ import { cn } from '../lib/utils'
 import { ApiError } from '../lib/api'
 import {
   agentKeys, fetchAgents, createAgent, updateAgent, deleteAgent,
+  saveConversationAsSkill, learnFromFolder, fetchLearned, deleteLearnedSkill,
 } from '../lib/agent-api'
+import type { LearnedSkill, LearnedLesson } from '../lib/agent-api'
 import type { AgentType } from '../lib/agent-types'
 import {
   createConversation, listConversations, sendMessage, stopGeneration,
@@ -301,6 +303,124 @@ const KNOWN_SKILLS = [
   { id: 'code', label: 'Code execution', description: 'Run sandboxed code snippets' },
 ]
 
+// ── Learned skills + lessons section (shown when editing an existing agent) ───
+
+function LearnedSection({ agentId }: { agentId: string }) {
+  const qc = useQueryClient()
+  const [folder, setFolder] = useState('')
+  const [learning, setLearning] = useState(false)
+
+  const learnedQ = useQuery({
+    queryKey: ['learned', agentId],
+    queryFn: () => fetchLearned(agentId),
+    staleTime: 0,
+    refetchInterval: 4000,
+  })
+  const skills: LearnedSkill[] = learnedQ.data?.skills ?? []
+  const lessons: LearnedLesson[] = learnedQ.data?.lessons ?? []
+
+  const handleLearnFolder = async () => {
+    const f = folder.trim()
+    if (!f) return
+    setLearning(true)
+    try {
+      await learnFromFolder(agentId, f)
+      toast.success(`Learning a skill from ${f}… (runs in the background)`)
+      setFolder('')
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : 'Could not start learning.')
+    } finally {
+      setLearning(false)
+    }
+  }
+
+  const handleDelete = async (skillId: string) => {
+    try {
+      await deleteLearnedSkill(agentId, skillId)
+      void qc.invalidateQueries({ queryKey: ['learned', agentId] })
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : 'Could not delete skill.')
+    }
+  }
+
+  const empty = skills.length === 0 && lessons.length === 0
+
+  return (
+    <div className="flex flex-col gap-3">
+      <span className="text-[12px] font-medium text-muted">Learned</span>
+
+      {/* Learn from folder row */}
+      <div className="flex flex-col gap-1.5">
+        <label className="flex items-center gap-1.5 text-[12px] text-faint">
+          <FolderInput size={12} />
+          Learn from a folder
+        </label>
+        <div className="flex gap-1.5">
+          <input
+            className="min-w-0 flex-1 rounded-md border border-border bg-bg px-2.5 py-1.5 font-mono text-[12px] text-ink outline-none focus:border-accent placeholder:text-faint"
+            placeholder="/absolute/path/to/folder"
+            value={folder}
+            onChange={(e) => setFolder(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') void handleLearnFolder() }}
+          />
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={learning || !folder.trim()}
+            onClick={() => void handleLearnFolder()}
+          >
+            Learn
+          </Button>
+        </div>
+      </div>
+
+      {/* Skills + lessons list */}
+      {empty ? (
+        <p className="text-[12px] text-faint">
+          No learned skills yet — complete tasks with "Reflect &amp; complete" or learn from a folder.
+        </p>
+      ) : (
+        <div className="flex flex-col gap-2">
+          {skills.map((sk) => (
+            <div
+              key={sk.id}
+              className="flex items-start gap-2 rounded-lg border border-border bg-panel px-3 py-2.5"
+            >
+              <div className="min-w-0 flex-1">
+                <p className="text-[13px] font-medium text-ink">{sk.name}</p>
+                {sk.description && (
+                  <p className="mt-0.5 text-[12px] text-muted">{sk.description}</p>
+                )}
+                {sk.source && (
+                  <span className="mt-1 inline-block rounded-sm bg-panel-2 px-1.5 py-0.5 text-[10px] text-faint">
+                    from {sk.source}
+                  </span>
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={() => void handleDelete(sk.id)}
+                className="mt-0.5 shrink-0 rounded p-1 text-faint transition-colors hover:text-[color:var(--err)]"
+                title="Delete skill"
+              >
+                <Trash2 size={13} />
+              </button>
+            </div>
+          ))}
+          {lessons.length > 0 && (
+            <div className="flex flex-col gap-1 rounded-lg border border-border bg-panel px-3 py-2.5">
+              <p className="mb-1 text-[11px] font-medium text-muted">Lessons</p>
+              {lessons.map((ls) => (
+                <p key={ls.id} className="text-[12px] text-ink">· {ls.lesson}</p>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function ManageAgentsPanel({
   onClose,
 }: {
@@ -495,6 +615,15 @@ function ManageAgentsPanel({
               <p className="text-[11px] text-faint">Writes go to TurboLLM's data folder — not configurable.</p>
             </div>
 
+            {/* Learned skills + lessons — only for existing agents */}
+            {editingId !== 'new' && (
+              <>
+                <div className="border-t border-border" />
+                <LearnedSection agentId={editingId} />
+                <div className="border-t border-border" />
+              </>
+            )}
+
             {/* Actions */}
             <div className="flex gap-2">
               <Button
@@ -622,6 +751,20 @@ export function AgentsScreen() {
 
   // ── Agent task completion (spec 13 redesign §2/§3) ──────────────────────────
   const [completing, setCompleting] = useState(false)
+  const [savingSkill, setSavingSkill] = useState(false)
+
+  const handleSaveAsSkill = async () => {
+    if (!activeId) return
+    setSavingSkill(true)
+    try {
+      await saveConversationAsSkill(activeId)
+      toast.success('Learning a skill from this conversation…')
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : 'Could not save skill.')
+    } finally {
+      setSavingSkill(false)
+    }
+  }
   const handleComplete = async (reflect: boolean) => {
     if (!activeId) return
     setCompleting(true)
@@ -984,7 +1127,10 @@ export function AgentsScreen() {
                 <Button size="sm" variant="outline" disabled={completing} onClick={() => handleComplete(true)}>
                   <Sparkles size={13} /> Reflect &amp; complete
                 </Button>
-                <span className="text-[11px] text-faint">“Reflect” lets the agent learn a lesson from this task.</span>
+                <Button size="sm" variant="outline" disabled={savingSkill} onClick={() => void handleSaveAsSkill()}>
+                  <BookMarked size={13} /> Save as skill
+                </Button>
+                <span className="text-[11px] text-faint">"Reflect" lets the agent learn a lesson from this task.</span>
               </div>
             )}
           </div>

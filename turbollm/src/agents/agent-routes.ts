@@ -103,7 +103,48 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
     // agent_id is a config id, not a DB FK — prune this Hitman's track-record rows (§13).
     d.db.pruneTrackRecordForAgent?.(id)
     d.db.pruneAgentLessons?.(id)
+    d.db.pruneAgentSkills?.(id)
     return c.json({ ok: true })
+  })
+
+  // ── Grown skills (spec 13 redesign §3.3) ────────────────────────────────────
+  const SKILL_CAP = 50
+
+  // List an agent's grown skills + lessons (for the management UI).
+  app.get('/api/v1/agents/:id/learned', (c) => {
+    const id = c.req.param('id')
+    return c.json({
+      skills: d.db.listAgentSkills?.(id) ?? [],
+      lessons: d.db.listAgentLessons?.(id) ?? [],
+    })
+  })
+
+  app.delete('/api/v1/agents/:id/skills/:skillId', (c) => {
+    if (!isLocalRequest(c, d)) return err(c, 403, 'forbidden', 'Local host only.')
+    d.db.deleteAgentSkill?.(c.req.param('skillId'))
+    return c.json({ ok: true })
+  })
+
+  // Learn a skill from a FOLDER (the "point it at a folder" feature). Local-gated (reads
+  // disk). Detached distill → store. Returns immediately.
+  app.post('/api/v1/agents/:id/learn-folder', async (c) => {
+    if (!isLocalRequest(c, d)) return err(c, 403, 'forbidden', 'Local host only.')
+    const id = c.req.param('id')
+    if (!d.store.snapshot().agents.agents.some((a) => a.id === id)) return err(c, 404, 'not_found', 'Agent not found.')
+    const b = await body<{ folder?: string }>(c)
+    const folder = b.folder?.trim()
+    if (!folder) return err(c, 400, 'invalid_input', 'folder is required.')
+    if ((d.db.countAgentSkills?.(id) ?? 0) >= SKILL_CAP) return err(c, 400, 'skill_cap', `Skill limit reached (${SKILL_CAP}).`)
+    void (async () => {
+      try {
+        const { distillFromFolder } = await import('./distiller')
+        const s = await distillFromFolder(d, folder)
+        if (s.name && s.procedure && !d.db.hasAgentSkillNamed?.(id, s.name)) {
+          d.db.addAgentSkill?.({ agentId: id, name: s.name, description: s.description ?? '', procedure: s.procedure, source: 'folder' })
+        }
+      } catch { /* best-effort */ }
+    })()
+    return c.json({ ok: true, learning: true })
   })
 
   // ── Skills (library) ──────────────────────────────────────────────────────

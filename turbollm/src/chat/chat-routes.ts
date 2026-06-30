@@ -115,6 +115,27 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     return c.json({ ok: true, reviewing: !!conv.agentId })
   })
 
+  // Save this conversation as a reusable SKILL for the agent (spec 13 redesign §3.3,
+  // Voyager). Detached distill → store, deduped by name.
+  app.post('/api/v1/conversations/:id/save-skill', (c) => {
+    const conv = db.getConversation(c.req.param('id'), true)
+    if (!conv) return c.json({ error: { code: 'not_found', message: 'Conversation not found.' } }, 404)
+    if (!conv.agentId) return c.json({ error: { code: 'no_agent', message: 'Only agent conversations can become skills.' } }, 400)
+    if ((d.db.countAgentSkills?.(conv.agentId) ?? 0) >= 50) return c.json({ error: { code: 'skill_cap', message: 'Skill limit reached (50).' } }, 400)
+    const agentId = conv.agentId
+    const transcript = (conv.messages ?? []).filter((m) => m.content).map((m) => ({ role: m.role, content: m.content }))
+    void (async () => {
+      try {
+        const { distillFromConversation } = await import('../agents/distiller')
+        const s = await distillFromConversation(d, transcript)
+        if (s.name && s.procedure && !d.db.hasAgentSkillNamed?.(agentId, s.name)) {
+          d.db.addAgentSkill?.({ agentId, name: s.name, description: s.description ?? '', procedure: s.procedure, source: 'conversation' })
+        }
+      } catch { /* best-effort */ }
+    })()
+    return c.json({ ok: true, learning: true })
+  })
+
   app.get('/api/v1/conversations/:id', (c) => {
     const conv = db.getConversation(c.req.param('id'), true)
     if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
@@ -602,17 +623,22 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
   if (boundAgent) {
     const reads = boundAgent.readRoots.map((r) => (r === '<dataDir>' ? d.store.dir() : r))
     const dataDir = d.store.dir()
-    // Self-improvement (spec 13 redesign §3): inject the agent's recent lessons so it
-    // applies what it learned from prior "Reflect & complete" reviews. Top 3, most recent.
+    // Self-improvement (spec 13 redesign §3): inject the agent's recent lessons (Reflexion)
+    // + grown skills (Voyager) so it applies what it learned. Top 3 each, most recent.
     const lessons = d.db.listAgentLessons?.(boundAgent.id, 3) ?? []
     const lessonText = lessons.length
       ? 'Lessons from past tasks (apply them):\n' + lessons.map((l) => `- ${l.lesson}`).join('\n')
+      : ''
+    const skills = d.db.listAgentSkills?.(boundAgent.id, 3) ?? []
+    const skillText = skills.length
+      ? 'Skills you have learned (use the relevant ones):\n' + skills.map((s) => `- ${s.name}: ${s.description}\n  ${s.procedure.replace(/\n/g, ' ').slice(0, 300)}`).join('\n')
       : ''
     const agentSys = [
       boundAgent.systemPrompt || `You are ${boundAgent.name}.`,
       reads.length ? `You can READ files in these folders: ${reads.join(', ')}.` : '',
       `You can WRITE files only in: ${dataDir}.`,
       `Use run_code for computation only (it has no file access); to save a result, return it and call write_file.`,
+      skillText,
       lessonText,
     ].filter(Boolean).join('\n\n')
     const sysIdx = iterMessages.findIndex((m) => m.role === 'system')

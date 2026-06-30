@@ -56,6 +56,18 @@ export interface AgentLesson {
   createdAt: string
 }
 
+/** One per-agent skill grown from experience or a folder (spec 13 redesign §3.3, Voyager). */
+export interface AgentSkill {
+  id: string
+  agentId: string
+  name: string
+  description: string
+  procedure: string
+  /** Where it came from: 'conversation' | 'folder' | 'manual'. */
+  source?: string
+  createdAt: string
+}
+
 /** A background agent run record (v8 migration). */
 export interface AgentRun {
   id: string
@@ -422,6 +434,24 @@ export class ConversationStore {
         PRAGMA user_version = 17;
       `)
     }
+    // v16 (spec 13 redesign §3.3): per-agent SKILLS grown from experience (Voyager) — a
+    // distilled name + description + procedure, injected on future runs. Keyed by config
+    // agent id (not a DB FK); pruned on agent delete.
+    if (v < 16) {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS agent_skills (
+          id          TEXT PRIMARY KEY,
+          agent_id    TEXT NOT NULL,
+          name        TEXT NOT NULL,
+          description TEXT NOT NULL DEFAULT '',
+          procedure   TEXT NOT NULL,
+          source      TEXT,
+          created_at  TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_skills_agent ON agent_skills(agent_id, created_at);
+        PRAGMA user_version = 16;
+      `)
+    }
   }
 
   listConversations(q?: string, kind: 'chat' | 'agent' | 'all' = 'all'): Conversation[] {
@@ -740,6 +770,40 @@ export class ConversationStore {
 
   pruneAgentLessons(agentId: string): void {
     this.db.prepare(`DELETE FROM agent_lessons WHERE agent_id = $a`).run({ $a: agentId } as P)
+  }
+
+  // ── Skills grown from experience (redesign §3.3, Voyager) ─────────────────────
+
+  addAgentSkill(row: { agentId: string; name: string; description?: string; procedure: string; source?: string }): void {
+    const id = randomUUID()
+    const now = new Date().toISOString()
+    this.db.prepare(`INSERT INTO agent_skills (id,agent_id,name,description,procedure,source,created_at) VALUES ($id,$aid,$n,$d,$p,$s,$now)`)
+      .run({ $id: id, $aid: row.agentId, $n: row.name, $d: row.description ?? '', $p: row.procedure, $s: row.source ?? null, $now: now } as P)
+  }
+
+  listAgentSkills(agentId: string, limit = 50): AgentSkill[] {
+    const rows = this.db.prepare(`SELECT * FROM agent_skills WHERE agent_id = $a ORDER BY created_at DESC LIMIT $n`)
+      .all({ $a: agentId, $n: limit } as P) as Array<{ id: string; agent_id: string; name: string; description: string; procedure: string; source: string | null; created_at: string }>
+    return rows.map((r) => ({ id: r.id, agentId: r.agent_id, name: r.name, description: r.description, procedure: r.procedure, source: r.source ?? undefined, createdAt: r.created_at }))
+  }
+
+  /** True if a skill with this (case-insensitive) name already exists for the agent — the
+   *  Curator's dedupe check before inserting a new distilled skill. */
+  hasAgentSkillNamed(agentId: string, name: string): boolean {
+    const r = this.db.prepare(`SELECT 1 FROM agent_skills WHERE agent_id = $a AND lower(name) = lower($n) LIMIT 1`).get({ $a: agentId, $n: name } as P)
+    return !!r
+  }
+
+  countAgentSkills(agentId: string): number {
+    return (this.db.prepare(`SELECT COUNT(*) n FROM agent_skills WHERE agent_id = $a`).get({ $a: agentId } as P) as { n: number }).n
+  }
+
+  deleteAgentSkill(id: string): void {
+    this.db.prepare(`DELETE FROM agent_skills WHERE id = $id`).run({ $id: id } as P)
+  }
+
+  pruneAgentSkills(agentId: string): void {
+    this.db.prepare(`DELETE FROM agent_skills WHERE agent_id = $a`).run({ $a: agentId } as P)
   }
 
   close(): void { this.db.close() }
