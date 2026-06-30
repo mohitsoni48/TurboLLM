@@ -13,6 +13,7 @@ import { useStatus } from './lib/queries'
 import { ApiError, setAuthToken } from './lib/api'
 
 // Route-level code splitting: each screen loads only when first navigated to.
+const WorkspaceScreen = lazy(() => import('./screens/WorkspaceScreen').then((m) => ({ default: m.WorkspaceScreen })))
 const ChatScreen = lazy(() => import('./screens/ChatScreen').then((m) => ({ default: m.ChatScreen })))
 const AgentsScreen = lazy(() => import('./screens/AgentsScreen').then((m) => ({ default: m.AgentsScreen })))
 const ModelsScreen = lazy(() => import('./screens/ModelsScreen').then((m) => ({ default: m.ModelsScreen })))
@@ -73,8 +74,17 @@ export function App() {
       <Shell status={statusQ.data} online={online} version={version}>
         <Suspense fallback={<ScreenFallback />}>
           <Routes>
-            <Route path="/chat" element={<ChatScreen />} />
+            {/* Workspace: Chat | Agent tabs */}
+            <Route path="/workspace" element={<Navigate to="/workspace/chat" replace />} />
+            <Route path="/workspace/chat" element={<WorkspaceScreen />} />
+            <Route path="/workspace/chat/:convId" element={<WorkspaceScreen />} />
+            <Route path="/workspace/agent" element={<WorkspaceScreen />} />
+            <Route path="/workspace/agent/:convId" element={<WorkspaceScreen />} />
+            {/* Back-compat: /chat → Workspace; /chat/:convId stays a standalone view
+                so existing LAN share links (baked as /chat/<id>) keep working. */}
+            <Route path="/chat" element={<Navigate to="/workspace/chat" replace />} />
             <Route path="/chat/:convId" element={<ChatScreen />} />
+            {/* Agents: management grid → edit page */}
             <Route path="/agents" element={<AgentsScreen />} />
             <Route path="/agents/:id" element={<AgentsScreen />} />
             <Route path="/models" element={<ModelsScreen />} />
@@ -82,7 +92,7 @@ export function App() {
             <Route path="/developer" element={<DeveloperScreen />} />
             <Route path="/customize" element={<CustomizeScreen />} />
             <Route path="/settings" element={<SettingsScreen />} />
-            <Route path="*" element={<Navigate to="/chat" replace />} />
+            <Route path="*" element={<Navigate to="/workspace/chat" replace />} />
           </Routes>
         </Suspense>
       </Shell>
