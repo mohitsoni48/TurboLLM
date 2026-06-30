@@ -29,6 +29,8 @@ export interface Conversation {
   /** When set, this chat is bound to an Agent (spec 13 redesign): its system prompt,
    *  granted tools, and folder scope come from the agent. Null = a plain chat. */
   agentId?: string
+  /** Set when the user marks the task complete (spec 13 redesign §2). Null = in progress. */
+  completedAt?: string
   createdAt: string
   updatedAt: string
   messages?: Message[]
@@ -42,6 +44,16 @@ export interface Folder {
   sortOrder: number
   createdAt: string
   updatedAt: string
+}
+
+/** One per-agent lesson distilled by the reviewer (spec 13 redesign §3, Reflexion). */
+export interface AgentLesson {
+  id: string
+  agentId: string
+  lesson: string
+  evidence?: string
+  convId?: string
+  createdAt: string
 }
 
 /** A background agent run record (v8 migration). */
@@ -152,7 +164,7 @@ export interface Message {
   createdAt: string
 }
 
-interface ConvRow { id: string; title: string; system_prompt: string; model_key: string; sampling: string; expert_mode: number; tool_policy: string | null; kind: string | null; folder_id: string | null; tool_overrides: string | null; agent_id: string | null; created_at: string; updated_at: string }
+interface ConvRow { id: string; title: string; system_prompt: string; model_key: string; sampling: string; expert_mode: number; tool_policy: string | null; kind: string | null; folder_id: string | null; tool_overrides: string | null; agent_id: string | null; completed_at: string | null; created_at: string; updated_at: string }
 interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; agent_id: string | null; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null; archived_at: string | null; completion: string | null }
 interface FolderRow { id: string; name: string; sort_order: number; created_at: string; updated_at: string }
 interface MsgRow  { id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string; reasoning: string; attachments: string; text_attachments: string | null; tool_calls: string | null; stats: string; model_key: string | null; research_meta: string | null; created_at: string }
@@ -174,7 +186,7 @@ function safeToolOverrides(s: string | null): Record<string, 'allow' | 'deny'> {
 }
 
 function rowToConv(r: ConvRow): Conversation {
-  return { id: r.id, title: r.title, systemPrompt: r.system_prompt, modelKey: r.model_key, sampling: safeJson(r.sampling) as Record<string, unknown>, expertMode: r.expert_mode === 1, toolPolicy: r.tool_policy ?? undefined, kind: (r.kind === 'agent' ? 'agent' : 'chat'), folderId: r.folder_id ?? null, toolOverrides: safeToolOverrides(r.tool_overrides), agentId: r.agent_id ?? undefined, createdAt: r.created_at, updatedAt: r.updated_at }
+  return { id: r.id, title: r.title, systemPrompt: r.system_prompt, modelKey: r.model_key, sampling: safeJson(r.sampling) as Record<string, unknown>, expertMode: r.expert_mode === 1, toolPolicy: r.tool_policy ?? undefined, kind: (r.kind === 'agent' ? 'agent' : 'chat'), folderId: r.folder_id ?? null, toolOverrides: safeToolOverrides(r.tool_overrides), agentId: r.agent_id ?? undefined, completedAt: r.completed_at ?? undefined, createdAt: r.created_at, updatedAt: r.updated_at }
 }
 
 function rowToFolder(r: FolderRow): Folder {
@@ -390,6 +402,24 @@ export class ConversationStore {
       this.db.exec(`
         ALTER TABLE conversations ADD COLUMN agent_id TEXT;
         PRAGMA user_version = 16;
+      `)
+    }
+    // v17 (spec 13 redesign §2/§3): completion marker on a conversation + the per-agent
+    // lessons store (Reflexion). completed_at null = in-progress. agent_lessons is keyed by
+    // the config agent id (not a DB FK); pruned when the agent is deleted.
+    if (v < 17) {
+      this.db.exec(`
+        ALTER TABLE conversations ADD COLUMN completed_at TEXT;
+        CREATE TABLE IF NOT EXISTS agent_lessons (
+          id         TEXT PRIMARY KEY,
+          agent_id   TEXT NOT NULL,
+          lesson     TEXT NOT NULL,
+          evidence   TEXT,
+          conv_id    TEXT,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_lessons_agent ON agent_lessons(agent_id, created_at);
+        PRAGMA user_version = 17;
       `)
     }
   }
@@ -684,6 +714,32 @@ export class ConversationStore {
   /** Prune a deleted Hitman's track-record rows (agent_id is a config id, not a DB FK). */
   pruneTrackRecordForAgent(agentId: string): void {
     this.db.prepare(`DELETE FROM agent_track_record WHERE agent_id = $a`).run({ $a: agentId } as P)
+  }
+
+  // ── Self-improvement: completion marker + per-agent lessons (redesign §2/§3) ──
+
+  /** Mark a conversation's task complete (archives it from the active agent view). */
+  markConversationComplete(id: string): void {
+    const now = new Date().toISOString()
+    this.db.prepare(`UPDATE conversations SET completed_at = $now, updated_at = $now WHERE id = $id`).run({ $id: id, $now: now } as P)
+  }
+
+  addAgentLesson(row: { agentId: string; lesson: string; evidence?: string; convId?: string }): void {
+    const id = randomUUID()
+    const now = new Date().toISOString()
+    this.db.prepare(`INSERT INTO agent_lessons (id,agent_id,lesson,evidence,conv_id,created_at) VALUES ($id,$aid,$l,$e,$c,$now)`)
+      .run({ $id: id, $aid: row.agentId, $l: row.lesson, $e: row.evidence ?? null, $c: row.convId ?? null, $now: now } as P)
+  }
+
+  /** Most-recent lessons for an agent (for injection at run start; the loop limits to top-N). */
+  listAgentLessons(agentId: string, limit = 50): AgentLesson[] {
+    const rows = this.db.prepare(`SELECT * FROM agent_lessons WHERE agent_id = $a ORDER BY created_at DESC LIMIT $n`)
+      .all({ $a: agentId, $n: limit } as P) as Array<{ id: string; agent_id: string; lesson: string; evidence: string | null; conv_id: string | null; created_at: string }>
+    return rows.map((r) => ({ id: r.id, agentId: r.agent_id, lesson: r.lesson, evidence: r.evidence ?? undefined, convId: r.conv_id ?? undefined, createdAt: r.created_at }))
+  }
+
+  pruneAgentLessons(agentId: string): void {
+    this.db.prepare(`DELETE FROM agent_lessons WHERE agent_id = $a`).run({ $a: agentId } as P)
   }
 
   close(): void { this.db.close() }

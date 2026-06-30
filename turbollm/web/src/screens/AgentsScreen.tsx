@@ -3,7 +3,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowDown, Bot, ChevronLeft, ChevronRight, FolderOpen,
   Pencil, Plus, Search, SendHorizontal, Settings2, Square,
-  Trash2, X,
+  Trash2, X, CheckCircle2, Sparkles,
 } from 'lucide-react'
 import { Button } from '../components/ui/button'
 import { toast } from '../components/ui/sonner'
@@ -15,6 +15,7 @@ import {
 import type { AgentType } from '../lib/agent-types'
 import {
   createConversation, listConversations, sendMessage, stopGeneration,
+  completeConversation, reflectCompleteConversation,
 } from '../lib/chat-api'
 import { useConversation, useConversationMutations } from '../lib/chat-queries'
 import type { ChatSseEvent, Conversation, LiveToolCall } from '../lib/chat-types'
@@ -619,6 +620,28 @@ export function AgentsScreen() {
   const conv = convQ.data
   const messages = conv?.messages ?? []
 
+  // ── Agent task completion (spec 13 redesign §2/§3) ──────────────────────────
+  const [completing, setCompleting] = useState(false)
+  const handleComplete = async (reflect: boolean) => {
+    if (!activeId) return
+    setCompleting(true)
+    try {
+      if (reflect) {
+        const r = await reflectCompleteConversation(activeId)
+        toast.success(r.reviewing ? 'Completed — reflecting on this task…' : 'Task completed.')
+      } else {
+        await completeConversation(activeId)
+        toast.success('Task completed.')
+      }
+      void qc.invalidateQueries({ queryKey: ['conversation', activeId] })
+      void qc.invalidateQueries({ queryKey: ['conversations'] })
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : 'Could not complete the task.')
+    } finally {
+      setCompleting(false)
+    }
+  }
+
   // Debounce search
   useEffect(() => {
     const t = setTimeout(() => setDebouncedQ(searchQ), 200)
@@ -944,6 +967,27 @@ export function AgentsScreen() {
           >
             <ArrowDown size={13} /> Jump to latest
           </button>
+        )}
+
+        {/* Completion bar (agent task) — above the composer */}
+        {activeId && !pickingAgent && conv?.agentId && messages.length > 0 && (
+          <div className="px-8 pb-1">
+            {conv.completedAt ? (
+              <div className="flex items-center gap-1.5 text-[12px] text-muted">
+                <CheckCircle2 size={13} className="text-green-500" /> Task completed
+              </div>
+            ) : (
+              <div className="flex items-center gap-2">
+                <Button size="sm" variant="outline" disabled={completing} onClick={() => handleComplete(false)}>
+                  <CheckCircle2 size={13} /> Complete
+                </Button>
+                <Button size="sm" variant="outline" disabled={completing} onClick={() => handleComplete(true)}>
+                  <Sparkles size={13} /> Reflect &amp; complete
+                </Button>
+                <span className="text-[11px] text-faint">“Reflect” lets the agent learn a lesson from this task.</span>
+              </div>
+            )}
+          </div>
         )}
 
         {/* Composer — only shown when a conversation is active */}

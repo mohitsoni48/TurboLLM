@@ -91,6 +91,8 @@ export interface Conversation {
   folderId?: string | null
   /** When set, this chat is bound to an Agent (its persona/tools/folders). */
   agentId?: string
+  /** Set when the user marks the agent task complete. Null = in progress. */
+  completedAt?: string
   createdAt: string
   updatedAt: string
   messages?: Message[]

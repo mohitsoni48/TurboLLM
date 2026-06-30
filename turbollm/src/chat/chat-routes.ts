@@ -83,6 +83,38 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     return c.json(conv, 201)
   })
 
+  // ── Agent task completion (spec 13 redesign §2/§3) ──────────────────────────
+  // Mark complete: archive the task. No AI cost.
+  app.post('/api/v1/conversations/:id/complete', (c) => {
+    const conv = db.getConversation(c.req.param('id'))
+    if (!conv) return c.json({ error: { code: 'not_found', message: 'Conversation not found.' } }, 404)
+    db.markConversationComplete(conv.id)
+    return c.json({ ok: true })
+  })
+
+  // Reflect & complete: archive, THEN run the reviewer in the background (the human click
+  // is the evidence-gate). A found lesson is stored per-agent for future injection.
+  app.post('/api/v1/conversations/:id/reflect-complete', (c) => {
+    const conv = db.getConversation(c.req.param('id'), true)
+    if (!conv) return c.json({ error: { code: 'not_found', message: 'Conversation not found.' } }, 404)
+    db.markConversationComplete(conv.id)
+    if (conv.agentId) {
+      const agentId = conv.agentId
+      const transcript = (conv.messages ?? [])
+        .filter((m) => m.content)
+        .map((m) => ({ role: m.role, content: m.content }))
+      // Detached — never blocks the response (spec: "run AI later").
+      void (async () => {
+        try {
+          const { reviewConversation } = await import('../agents/reviewer')
+          const r = await reviewConversation(d, transcript)
+          if (r.lesson) db.addAgentLesson({ agentId, lesson: r.lesson, evidence: r.evidence ?? undefined, convId: conv.id })
+        } catch { /* best-effort */ }
+      })()
+    }
+    return c.json({ ok: true, reviewing: !!conv.agentId })
+  })
+
   app.get('/api/v1/conversations/:id', (c) => {
     const conv = db.getConversation(c.req.param('id'), true)
     if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
@@ -570,11 +602,18 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
   if (boundAgent) {
     const reads = boundAgent.readRoots.map((r) => (r === '<dataDir>' ? d.store.dir() : r))
     const dataDir = d.store.dir()
+    // Self-improvement (spec 13 redesign §3): inject the agent's recent lessons so it
+    // applies what it learned from prior "Reflect & complete" reviews. Top 3, most recent.
+    const lessons = d.db.listAgentLessons?.(boundAgent.id, 3) ?? []
+    const lessonText = lessons.length
+      ? 'Lessons from past tasks (apply them):\n' + lessons.map((l) => `- ${l.lesson}`).join('\n')
+      : ''
     const agentSys = [
       boundAgent.systemPrompt || `You are ${boundAgent.name}.`,
       reads.length ? `You can READ files in these folders: ${reads.join(', ')}.` : '',
       `You can WRITE files only in: ${dataDir}.`,
       `Use run_code for computation only (it has no file access); to save a result, return it and call write_file.`,
+      lessonText,
     ].filter(Boolean).join('\n\n')
     const sysIdx = iterMessages.findIndex((m) => m.role === 'system')
     if (sysIdx >= 0) {

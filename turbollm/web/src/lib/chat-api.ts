@@ -28,6 +28,16 @@ export function createConversation(partial?: Partial<Pick<Conversation, 'title' 
   return req('/api/v1/conversations', { method: 'POST', json: partial ?? {} })
 }
 
+/** Mark an agent task complete (archives it). No AI cost. */
+export function completeConversation(id: string): Promise<{ ok: true }> {
+  return req(`/api/v1/conversations/${id}/complete`, { method: 'POST' })
+}
+
+/** Mark complete + run the background reviewer to learn a lesson (spec 13 redesign §3). */
+export function reflectCompleteConversation(id: string): Promise<{ ok: true; reviewing: boolean }> {
+  return req(`/api/v1/conversations/${id}/reflect-complete`, { method: 'POST' })
+}
+
 
 export function getConversation(id: string): Promise<Conversation> {
   return req(`/api/v1/conversations/${encodeURIComponent(id)}`)

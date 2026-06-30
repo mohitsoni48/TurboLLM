@@ -102,6 +102,7 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
     d.store.update((cfg) => { cfg.agents.agents = cfg.agents.agents.filter((x) => x.id !== id) })
     // agent_id is a config id, not a DB FK — prune this Hitman's track-record rows (§13).
     d.db.pruneTrackRecordForAgent?.(id)
+    d.db.pruneAgentLessons?.(id)
     return c.json({ ok: true })
   })
 
