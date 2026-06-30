@@ -50,7 +50,7 @@ function AgentsGrid() {
   const agents = agentsQ.data ?? []
 
   return (
-    <div className="mx-auto flex max-w-5xl flex-col gap-5 px-6 py-6">
+    <div className="flex w-full flex-col gap-5 px-8 py-6">
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex flex-col gap-0.5">
@@ -76,7 +76,7 @@ function AgentsGrid() {
           </Button>
         </div>
       ) : (
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5">
           {agents.map((agent) => (
             <AgentCard key={agent.id} agent={agent} onOpen={() => navigate(`/agents/${agent.id}`)} />
           ))}

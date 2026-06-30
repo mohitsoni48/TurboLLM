@@ -42,31 +42,33 @@ export function App() {
   // Count consecutive failed polls; show the unreachable overlay after 3 (spec 08 §1).
   const [failCount, setFailCount] = useState(0)
   const lastUpdated = useRef(0)
-  // Sticky once a 401 is seen: a raw network-level failure (fetch() itself rejecting —
-  // a Wi-Fi hiccup, DNS blip, a phone browser backgrounding the tab briefly, etc.) is NOT
-  // wrapped as an ApiError (api.ts `request` only wraps a completed HTTP response), so on
-  // a real LAN — as opposed to this dev box's loopback — such hiccups are common. Deriving
-  // `needsAuth` fresh every render off the current error would flicker false on each one,
-  // unmounting AuthGate and wiping whatever key the user was mid-typing. Once a real 401
-  // is observed, stay in the auth-needed state through any number of transient failures;
-  // only an actual successful poll (the key was accepted) clears it.
-  const [authNeeded, setAuthNeeded] = useState(false)
   useEffect(() => {
     if (statusQ.isSuccess) {
       setFailCount(0)
-      setAuthNeeded(false)
     } else if (statusQ.isError && statusQ.errorUpdatedAt !== lastUpdated.current) {
       lastUpdated.current = statusQ.errorUpdatedAt
       setFailCount((c) => c + 1)
-      if (statusQ.error instanceof ApiError && statusQ.error.status === 401) setAuthNeeded(true)
     }
   }, [statusQ.isSuccess, statusQ.isError, statusQ.dataUpdatedAt, statusQ.errorUpdatedAt])
 
   const online = statusQ.isSuccess
   // A 401 isn't a lost connection — the daemon is up but (LAN-exposed) wants an API
   // key. Show the key prompt instead of the misleading "lost connection" overlay.
-  const needsAuth = authNeeded
-  const unreachable = !needsAuth && failCount >= 3
+  const needsAuth = statusQ.isError && statusQ.error instanceof ApiError && statusQ.error.status === 401
+
+  // Latch the auth prompt once we've seen a 401, and keep it up until a poll finally
+  // SUCCEEDS. Without this, a flaky LAN link (common on the remote machine where you're
+  // pasting the key) flips an occasional poll from 401 → generic network error, which
+  // would tear the dialog down, swap in the "lost connection" overlay, and wipe the
+  // half-typed key. Sticky mount = the input keeps its value + focus while you type.
+  const [authLatched, setAuthLatched] = useState(false)
+  useEffect(() => {
+    if (needsAuth) setAuthLatched(true)
+    else if (statusQ.isSuccess) setAuthLatched(false)
+  }, [needsAuth, statusQ.isSuccess])
+
+  // While the key prompt is up, the "lost connection" overlay must yield to it.
+  const unreachable = !authLatched && !needsAuth && failCount >= 3
   const version = statusQ.data?.version ? `v${statusQ.data.version}` : 'v0.0.0-dev'
 
   return (
@@ -96,7 +98,7 @@ export function App() {
           </Routes>
         </Suspense>
       </Shell>
-      {needsAuth && (
+      {authLatched && (
         <AuthGate
           onConnect={(key) => {
             setAuthToken(key)
