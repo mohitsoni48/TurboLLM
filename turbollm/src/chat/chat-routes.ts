@@ -1280,20 +1280,29 @@ async function autoTitle(
         content: 'Generate a concise 3-6 word title for this conversation. Reply with ONLY the title — no quotes, no punctuation, no preamble. /no_think',
       },
     ]
-    const res = await fetch(`${target}/v1/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: engineModelAlias(d.registry.active()?.kind ?? '') ?? ms.model?.key,
-        messages: titleMessages,
-        stream: false,
-        temperature: 0.3,
-        max_tokens: 32,
-        reasoning_budget: 0,
-        chat_template_kwargs: { enable_thinking: false },
-      }),
-      signal: AbortSignal.timeout(20_000),
-    })
+    // Title generation is a LOW-PRIORITY afterthought — acquire the engine gate at 'bg' so
+    // any foreground chat or agent run preempts it (it never blocks real work), and release
+    // as soon as the small call returns.
+    const release = d.gate ? await d.gate.acquire('bg') : null
+    let res: Response
+    try {
+      res = await fetch(`${target}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: engineModelAlias(d.registry.active()?.kind ?? '') ?? ms.model?.key,
+          messages: titleMessages,
+          stream: false,
+          temperature: 0.3,
+          max_tokens: 32,
+          reasoning_budget: 0,
+          chat_template_kwargs: { enable_thinking: false },
+        }),
+        signal: AbortSignal.timeout(20_000),
+      })
+    } finally {
+      release?.()
+    }
     if (!res.ok) return
     const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> }
     let raw = data.choices?.[0]?.message?.content ?? ''

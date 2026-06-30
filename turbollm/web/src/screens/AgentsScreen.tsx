@@ -13,7 +13,7 @@ import { ApiError } from '../lib/api'
 import {
   agentKeys, fetchAgents, createAgent, updateAgent, deleteAgent,
   learnFromFolder, fetchLearned, deleteLearnedSkill,
-  runAgentTurn, streamAgentRun, setAgentMode, cancelAgentRun, reopenAgentConversation, type AgentMode,
+  runAgentTurn, streamAgentRun, setAgentMode, cancelAgentRun, reopenAgentConversation, fetchAgentRuns, type AgentMode,
 } from '../lib/agent-api'
 import type { LearnedSkill, LearnedLesson } from '../lib/agent-api'
 import type { AgentType } from '../lib/agent-types'
@@ -854,7 +854,13 @@ export function AgentsScreen() {
   const mut = useConversationMutations()
   const convQ = useConversation(activeId)
   const conv = convQ.data
-  const messages = conv?.messages ?? []
+  // Drop the trailing empty assistant placeholder the run-manager persists while a run is
+  // in flight — the live StreamingBubble represents it (otherwise an empty bubble shows).
+  const messages = (() => {
+    const ms = conv?.messages ?? []
+    const last = ms[ms.length - 1]
+    return last && last.role === 'assistant' && !last.content ? ms.slice(0, -1) : ms
+  })()
 
   // Permission mode for the active conversation (defaults to 'auto').
   const convMode = (conv?.agentMode as AgentMode | undefined) ?? 'auto'
@@ -1104,6 +1110,28 @@ export function AgentsScreen() {
       runIdRef.current = null
     }
   }
+
+  // Reconnect to an in-progress run when its conversation is opened. Agent runs are long
+  // (minutes) and outlive a page refresh / tab switch; without this the UI shows no signal
+  // even though the run is still working. The run-manager stream replays from seq 0.
+  useEffect(() => {
+    if (!activeId || live) return
+    let cancelled = false
+    void (async () => {
+      try {
+        const runs = await fetchAgentRuns()
+        const running = runs.find((r) => r.convId === activeId && r.status === 'running')
+        if (running && !cancelled) {
+          const ac = new AbortController()
+          abortRef.current = ac
+          runIdRef.current = running.id
+          void streamRun(activeId, running.id, ac.signal)
+        }
+      } catch { /* ignore — best-effort reconnect */ }
+    })()
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeId])
 
   const handleDelete = (m: import('../lib/chat-types').Message) => {
     if (!activeId) return
