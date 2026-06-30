@@ -22,7 +22,7 @@ import type { Deps } from '../deps'
 import { ValueError, type AgentType } from '../config/config'
 import { SkillStore, isBuiltinSkill, isValidSkillId, toSkillId, importSkillsFromFolder, type Skill } from './skills'
 import type { AgentMode } from './pi-adapter'
-import { isLocalRequest } from '../auth'
+import { isLocalOrAuthenticated } from '../auth'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function err(c: any, status: number, code: string, message: string) {
@@ -42,7 +42,7 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
 
   app.post('/api/v1/agents', async (c) => {
     // Configuring an agent grants host-disk read/write scope — gate to the local host.
-    if (!isLocalRequest(c, d)) return err(c, 403, 'forbidden', 'Agents can only be configured on the machine running TurboLLM.')
+    if (!isLocalOrAuthenticated(c, d)) return err(c, 403, 'forbidden', 'Agents can only be configured on the machine running TurboLLM.')
     const b = await body<Partial<AgentType>>(c)
     if (!b.name?.trim()) return err(c, 400, 'invalid_config_value', 'name is required.')
     if (d.store.snapshot().agents.agents.length >= 100) return err(c, 400, 'too_many_agents', 'Agent limit reached (100).')
@@ -69,7 +69,7 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
   })
 
   app.patch('/api/v1/agents/:id', async (c) => {
-    if (!isLocalRequest(c, d)) return err(c, 403, 'forbidden', 'Agents can only be configured on the machine running TurboLLM.')
+    if (!isLocalOrAuthenticated(c, d)) return err(c, 403, 'forbidden', 'Agents can only be configured on the machine running TurboLLM.')
     const id = c.req.param('id')
     const b = await body<Partial<AgentType>>(c)
     const existing = d.store.snapshot().agents.agents.find((a) => a.id === id)
@@ -122,7 +122,7 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
   })
 
   app.delete('/api/v1/agents/:id/skills/:skillId', (c) => {
-    if (!isLocalRequest(c, d)) return err(c, 403, 'forbidden', 'Local host only.')
+    if (!isLocalOrAuthenticated(c, d)) return err(c, 403, 'forbidden', 'Local host only.')
     const skillId = c.req.param('skillId')
     if (isBuiltinSkill(skillId)) return err(c, 400, 'builtin_skill', 'Cannot delete a built-in skill.')
     skills().delete(skillId)
@@ -132,7 +132,7 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
   // Learn a skill from a FOLDER (the "point it at a folder" feature). Local-gated (reads
   // disk). Detached distill → store. Returns immediately.
   app.post('/api/v1/agents/:id/learn-folder', async (c) => {
-    if (!isLocalRequest(c, d)) return err(c, 403, 'forbidden', 'Local host only.')
+    if (!isLocalOrAuthenticated(c, d)) return err(c, 403, 'forbidden', 'Local host only.')
     const id = c.req.param('id')
     if (!d.store.snapshot().agents.agents.some((a) => a.id === id)) return err(c, 404, 'not_found', 'Agent not found.')
     const b = await body<{ folder?: string }>(c)
@@ -196,7 +196,7 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
   app.get('/api/v1/skills', (c) => c.json(skills().list()))
 
   app.post('/api/v1/skills', async (c) => {
-    if (!isLocalRequest(c, d)) return err(c, 403, 'forbidden', 'Skills can only be authored on the machine running TurboLLM.')
+    if (!isLocalOrAuthenticated(c, d)) return err(c, 403, 'forbidden', 'Skills can only be authored on the machine running TurboLLM.')
     const b = await body<Partial<Skill>>(c)
     if (!b.id?.trim() || !/^[a-z0-9-]+$/.test(b.id)) return err(c, 400, 'invalid_config_value', 'id must be kebab-case (a-z0-9-).')
     if (!b.name?.trim()) return err(c, 400, 'invalid_config_value', 'name is required.')
@@ -218,7 +218,7 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
 
   app.delete('/api/v1/skills/:id', (c) => {
     // Deleting a skill removes a file on disk → local-gate + validate the id can't escape.
-    if (!isLocalRequest(c, d)) return err(c, 403, 'forbidden', 'Skills can only be modified on the machine running TurboLLM.')
+    if (!isLocalOrAuthenticated(c, d)) return err(c, 403, 'forbidden', 'Skills can only be modified on the machine running TurboLLM.')
     const id = c.req.param('id')
     if (!isValidSkillId(id)) return err(c, 400, 'invalid_config_value', 'invalid skill id.')
     if (isBuiltinSkill(id)) return err(c, 400, 'builtin_skill', 'Built-in skills cannot be deleted.')
@@ -230,7 +230,7 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
   const MAX_USER_MESSAGE = 100_000 // chars — guard against multi-MB prompts (review L2)
   app.post('/api/v1/agents/:id/runs', async (c) => {
     // A run EXECUTES host-side FS tools — gate it to the local host (review M1).
-    if (!isLocalRequest(c, d)) return err(c, 403, 'forbidden', 'Agent runs can only be launched on the machine running TurboLLM.')
+    if (!isLocalOrAuthenticated(c, d)) return err(c, 403, 'forbidden', 'Agent runs can only be launched on the machine running TurboLLM.')
     if (!d.agents) return err(c, 501, 'not_implemented', 'Agent runner not available.')
     const agentId = c.req.param('id')
     const b = await body<{ title?: string; userMessage?: string }>(c)
@@ -255,7 +255,7 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
   // Run a pi turn INSIDE an existing agent conversation (each chat message = a pi run that
   // continues the thread). Uses the conversation's stored permission mode.
   app.post('/api/v1/agents/conversations/:convId/run', async (c) => {
-    if (!isLocalRequest(c, d)) return err(c, 403, 'forbidden', 'Agent runs can only be launched on the machine running TurboLLM.')
+    if (!isLocalOrAuthenticated(c, d)) return err(c, 403, 'forbidden', 'Agent runs can only be launched on the machine running TurboLLM.')
     if (!d.agents) return err(c, 501, 'not_implemented', 'Agent runner not available.')
     const convId = c.req.param('convId')
     const conv = d.db.getConversation(convId)
@@ -373,7 +373,7 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
 
   // ✓ Mark complete → record 'complete' + archive.
   app.post('/api/v1/agents/runs/:id/complete', (c) => {
-    if (!isLocalRequest(c, d)) return err(c, 403, 'forbidden', 'Local host only.')
+    if (!isLocalOrAuthenticated(c, d)) return err(c, 403, 'forbidden', 'Local host only.')
     const id = c.req.param('id')
     const g = dispositionGuard(id)
     if ('error' in g) return err(c, g.error[0] as 404, g.error[1], g.error[2])
@@ -385,7 +385,7 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
   // ⛔ Flag miss → record 'miss' + feedback, then archive (v1 has no mid-run resume; the
   //    user starts a fresh contract to retry). The miss + feedback feed the track record.
   app.post('/api/v1/agents/runs/:id/flag-miss', async (c) => {
-    if (!isLocalRequest(c, d)) return err(c, 403, 'forbidden', 'Local host only.')
+    if (!isLocalOrAuthenticated(c, d)) return err(c, 403, 'forbidden', 'Local host only.')
     const id = c.req.param('id')
     const g = dispositionGuard(id)
     if ('error' in g) return err(c, g.error[0] as 404, g.error[1], g.error[2])

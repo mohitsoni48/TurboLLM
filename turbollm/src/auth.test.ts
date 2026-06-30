@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { bypassesAuth, isLocalRequest, provisionTunnelApiKey } from './auth'
+import { bypassesAuth, isLocalRequest, isLocalOrAuthenticated, provisionTunnelApiKey } from './auth'
 import type { Context } from 'hono'
 import type { Deps } from './deps'
 
@@ -90,9 +90,9 @@ test('bypassesAuth: tunneled + a genuinely remote caller (loopback=false) is sti
 // traversed the tunnel must not reach these just because it LOOKS loopback, but the
 // daemon's own genuinely-local access (no Cloudflare headers) must be unaffected.
 
-function fakeDeps(overrides: { lanBind?: boolean; tunnelActive?: boolean }): Deps {
+function fakeDeps(overrides: { lanBind?: boolean; tunnelActive?: boolean; requireApiKey?: boolean }): Deps {
   return {
-    store: { snapshot: () => ({ daemon: { lanBind: overrides.lanBind ?? false } } as ReturnType<Deps['store']['snapshot']>) },
+    store: { snapshot: () => ({ daemon: { lanBind: overrides.lanBind ?? false, requireApiKey: overrides.requireApiKey ?? false } } as ReturnType<Deps['store']['snapshot']>) },
     tunnel: overrides.tunnelActive !== undefined ? ({ active: () => overrides.tunnelActive } as Deps['tunnel']) : undefined,
   } as unknown as Deps
 }
@@ -119,6 +119,48 @@ test('isLocalRequest: loopback-only bind with no tunnel at all is still always l
   const d = fakeDeps({ lanBind: false, tunnelActive: false })
   const c = fakeContext({})
   assert.equal(isLocalRequest(c, d), true)
+})
+
+// isLocalOrAuthenticated (agent actions: runs/config/skills, which execute on the host)
+// must inherit the SAME tunnel-safety guarantee as isLocalRequest — a request that
+// actually traversed the Cloud Launch tunnel looks loopback too, so it must never take
+// the bare loopback shortcut; it has to fall through to the requireApiKey check just
+// like any other non-loopback caller (ADR-152).
+
+test('isLocalOrAuthenticated: THE CRITICAL CASE — a tunneled request that looks loopback must NOT bypass without a key', () => {
+  const d = fakeDeps({ lanBind: false, tunnelActive: true, requireApiKey: false })
+  const c = fakeContext({ 'cf-ray': 'abc123-DEL' })
+  assert.equal(isLocalOrAuthenticated(c, d), false)
+})
+
+test('isLocalOrAuthenticated: a tunneled request is allowed once requireApiKey is on (lanAuth already verified the key)', () => {
+  const d = fakeDeps({ lanBind: false, tunnelActive: true, requireApiKey: true })
+  const c = fakeContext({ 'cf-ray': 'abc123-DEL' })
+  assert.equal(isLocalOrAuthenticated(c, d), true)
+})
+
+test('isLocalOrAuthenticated: tunnel active but THIS request carries no Cloudflare headers is still local', () => {
+  const d = fakeDeps({ lanBind: false, tunnelActive: true, requireApiKey: false })
+  const c = fakeContext({})
+  assert.equal(isLocalOrAuthenticated(c, d), true)
+})
+
+test('isLocalOrAuthenticated: loopback-only bind with no tunnel at all is still always local (unchanged behavior)', () => {
+  const d = fakeDeps({ lanBind: false, tunnelActive: false })
+  const c = fakeContext({})
+  assert.equal(isLocalOrAuthenticated(c, d), true)
+})
+
+test('isLocalOrAuthenticated: LAN-exposed, non-loopback, no tunnel, requireApiKey off — remote still blocked', () => {
+  const d = fakeDeps({ lanBind: true, tunnelActive: false, requireApiKey: false })
+  const c = fakeContext({})
+  assert.equal(isLocalOrAuthenticated(c, d), false)
+})
+
+test('isLocalOrAuthenticated: LAN-exposed, non-loopback, no tunnel, requireApiKey on — remote allowed (authenticated by lanAuth)', () => {
+  const d = fakeDeps({ lanBind: true, tunnelActive: false, requireApiKey: true })
+  const c = fakeContext({})
+  assert.equal(isLocalOrAuthenticated(c, d), true)
 })
 
 test('provisionTunnelApiKey: stores a fresh key and returns its full (unhashed) value', () => {
