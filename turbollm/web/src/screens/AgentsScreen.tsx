@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  Archive, ArchiveRestore, ArrowDown, Bot, ChevronLeft, ChevronRight, FolderInput, FolderOpen,
-  Pencil, Plus, Search, SendHorizontal, Settings2, Square,
+  Archive, ArchiveRestore, ArrowDown, Bot, ChevronLeft, ChevronRight, FileText, FolderInput, FolderOpen,
+  Image as ImageIcon, Pencil, Plus, Search, SendHorizontal, Settings2, Square,
   Trash2, X, CheckCircle2, Sparkles, Loader2, XCircle, Activity,
 } from 'lucide-react'
 import { Button } from '../components/ui/button'
+import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem } from '../components/ui/dropdown-menu'
 import { toast } from '../components/ui/sonner'
 import { cn } from '../lib/utils'
 import { ApiError } from '../lib/api'
@@ -907,6 +908,8 @@ export function AgentsScreen() {
 
   // Read-scope attachment handlers
   const [pickerOpen, setPickerOpen] = useState(false)
+  const [pickerMode, setPickerMode] = useState<'file' | 'folder'>('file')
+  const openAttach = (mode: 'file' | 'folder') => { setPickerMode(mode); setPickerOpen(true) }
   const handleAttach = async (path: string) => {
     if (!activeId) return
     try { await addReadScope(activeId, path); void qc.invalidateQueries({ queryKey: ['conversation', activeId] }) }
@@ -1288,45 +1291,6 @@ export function AgentsScreen() {
           </button>
         )}
 
-        {/* Read-scope attachment bar — agent conversations only */}
-        {activeId && !pickingAgent && conv?.agentId && (() => {
-          const baseName = (p: string) => p.split(/[\\/]/).filter(Boolean).pop() || p
-          const scope = conv.readScope ?? []
-          return (
-            <div className="px-8 pb-2">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="flex items-center gap-1 text-[12px] text-muted">
-                  <FolderOpen size={13} />
-                  Files the agent can read
-                </span>
-                {scope.length === 0 && (
-                  <span className="text-[11px] text-faint">No files attached — the agent can&apos;t read from disk yet.</span>
-                )}
-                {scope.map((p) => (
-                  <span
-                    key={p}
-                    title={p}
-                    className="inline-flex items-center gap-1 rounded-md border border-border bg-panel px-2 py-1 text-[12px]"
-                  >
-                    {baseName(p)}
-                    <button
-                      type="button"
-                      aria-label="Remove"
-                      onClick={() => void handleDetach(p)}
-                      className="text-faint hover:text-[color:var(--err)]"
-                    >
-                      <X size={11} />
-                    </button>
-                  </span>
-                ))}
-                <Button size="sm" variant="outline" onClick={() => setPickerOpen(true)}>
-                  <Plus size={13} /> Add file/folder
-                </Button>
-              </div>
-            </div>
-          )
-        })()}
-
         {/* Completion bar (agent task) — above the composer */}
         {activeId && !pickingAgent && conv?.agentId && messages.length > 0 && (
           <div className="px-8 pb-1">
@@ -1356,7 +1320,38 @@ export function AgentsScreen() {
           <div className="px-8 pb-5">
             <div className="w-full">
               <div className="rounded-[var(--radius-lg)] border border-border bg-panel shadow-[var(--shadow-2)] focus-within:border-[color:var(--accent)]">
+                {/* Attached files/folders the agent can read (chat-bound scope) */}
+                {(conv?.readScope ?? []).length > 0 && (
+                  <div className="flex flex-wrap gap-1.5 px-3 pt-2">
+                    {(conv?.readScope ?? []).map((p) => (
+                      <span
+                        key={p}
+                        title={p}
+                        className="inline-flex items-center gap-1 rounded-md border border-border bg-panel-2 px-2 py-0.5 text-[11px] text-muted"
+                      >
+                        <FolderOpen size={11} className="text-faint" />
+                        {p.split(/[\\/]/).filter(Boolean).pop() || p}
+                        <button type="button" aria-label="Remove" onClick={() => void handleDetach(p)} className="text-faint hover:text-[color:var(--err)]">
+                          <X size={10} />
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
                 <div className="flex items-end gap-2 p-2">
+                  {/* + attach menu (file / photo / folder → the agent's read scope) */}
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button size="icon" variant="ghost" className="shrink-0" disabled={!!conv?.completedAt} title="Attach a file, photo, or folder">
+                        <Plus size={16} />
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="start" side="top">
+                      <DropdownMenuItem onClick={() => openAttach('file')}><FileText size={14} className="mr-2" /> Attach file</DropdownMenuItem>
+                      <DropdownMenuItem onClick={() => openAttach('file')}><ImageIcon size={14} className="mr-2" /> Attach photo</DropdownMenuItem>
+                      <DropdownMenuItem onClick={() => openAttach('folder')}><FolderOpen size={14} className="mr-2" /> Attach folder</DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
                   <textarea
                     ref={inputRef}
                     rows={1}
@@ -1405,9 +1400,11 @@ export function AgentsScreen() {
       <FsBrowser
         open={pickerOpen}
         onOpenChange={setPickerOpen}
-        mode="any"
-        title="Attach a file or folder"
-        description="Pick a file, or open a folder and click 'Select this folder'. The agent can read within it. Limited to your home directory."
+        mode={pickerMode}
+        title={pickerMode === 'folder' ? 'Attach a folder' : 'Attach a file'}
+        description={pickerMode === 'folder'
+          ? "Open a folder and click 'Select this folder'. The agent can read within it. Limited to your home directory."
+          : 'Navigate to a file and click it to attach. The agent can read it. Limited to your home directory.'}
         onSelect={(path) => handleAttach(path)}
       />
 
