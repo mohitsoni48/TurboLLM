@@ -787,6 +787,9 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
       let finishReason = ''
       // Accumulate streaming tool_calls by index (OpenAI format: fragmented across chunks)
       const pendingToolCalls = new Map<number, { id: string; name: string; argsBuffer: string }>()
+      // Indices we've already told the UI about (so the long tool-arg generation that
+      // follows the model's text shows an inline "running…" step instead of looking frozen).
+      const announcedToolCalls = new Set<number>()
 
       roundLoop: while (true) {
         const { done, value } = await reader.read()
@@ -835,6 +838,12 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
               if (tc.id && !entry.id) entry.id = tc.id
               if (tc.function?.name && !entry.name) entry.name = tc.function.name
               if (tc.function?.arguments) entry.argsBuffer += tc.function.arguments
+              // The moment we know which tool this is, surface it as pending — the model
+              // may stream a long argument body next, and silence there reads as a freeze.
+              if (entry.id && entry.name && !announcedToolCalls.has(tc.index)) {
+                announcedToolCalls.add(tc.index)
+                await stream.writeSSE({ event: 'tool_call', data: JSON.stringify({ id: entry.id, name: entry.name, args: {}, status: 'pending' }) })
+              }
             }
             continue
           }
