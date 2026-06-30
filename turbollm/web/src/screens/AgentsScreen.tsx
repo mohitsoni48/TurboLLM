@@ -12,16 +12,17 @@ import { ApiError } from '../lib/api'
 import {
   agentKeys, fetchAgents, createAgent, updateAgent, deleteAgent,
   learnFromFolder, fetchLearned, deleteLearnedSkill,
+  runAgentTurn, streamAgentRun, setAgentMode, cancelAgentRun, type AgentMode,
 } from '../lib/agent-api'
 import type { LearnedSkill, LearnedLesson } from '../lib/agent-api'
 import type { AgentType } from '../lib/agent-types'
 import {
-  createConversation, listConversations, sendMessage, stopGeneration,
+  createConversation, listConversations,
   completeConversation, reflectCompleteConversation,
   addReadScope, removeReadScope,
 } from '../lib/chat-api'
 import { useConversation, useConversationMutations } from '../lib/chat-queries'
-import type { ChatSseEvent, Conversation, LiveToolCall } from '../lib/chat-types'
+import type { Conversation, LiveToolCall } from '../lib/chat-types'
 import { appendTextDelta, upsertToolCall, type LiveBlock } from '../lib/live-timeline'
 import type { AgentTask } from '../lib/types'
 import { MessageBubble, StreamingBubble } from './chat/MessageBubble'
@@ -816,6 +817,7 @@ export function AgentsScreen() {
   const [showScrollBtn, setShowScrollBtn] = useState(false)
 
   const abortRef = useRef<AbortController | null>(null)
+  const runIdRef = useRef<string | null>(null)
   const deltaTimestamps = useRef<number[]>([])
   const scrollerRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
@@ -825,6 +827,18 @@ export function AgentsScreen() {
   const convQ = useConversation(activeId)
   const conv = convQ.data
   const messages = conv?.messages ?? []
+
+  // Permission mode for the active conversation (defaults to 'auto').
+  const convMode = (conv?.agentMode as AgentMode | undefined) ?? 'auto'
+  const handleModeChange = async (mode: AgentMode) => {
+    if (!activeId) return
+    try {
+      await setAgentMode(activeId, mode)
+      void qc.invalidateQueries({ queryKey: ['conversation', activeId] })
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : 'Could not change mode.')
+    }
+  }
 
   // ── Agent task completion (spec 13 redesign §2/§3) ──────────────────────────
   const [completing, setCompleting] = useState(false)
@@ -928,37 +942,25 @@ export function AgentsScreen() {
   }
 
   // SSE stream driver — same pattern as ChatScreen
-  const streamFrom = async (convId: string, gen: AsyncGenerator<ChatSseEvent>) => {
+  // Consume a pi run's SSE stream into the live bubble. The run-manager has already
+  // persisted the user + placeholder assistant message, so we init `live` ourselves
+  // (there's no 'meta' event) and reload the conversation on done.
+  const streamRun = async (convId: string, runId: string, signal: AbortSignal) => {
+    deltaTimestamps.current = []
+    setLive({ assistantId: runId, content: '', reasoning: '', progress: null, liveGenTps: 0, genTokens: 0, toolCalls: [], timeline: [] })
+    void qc.invalidateQueries({ queryKey: ['conversation', convId] }) // surface the user message
     try {
-      for await (const evt of gen) {
-        if (evt.event === 'meta') {
-          deltaTimestamps.current = []
-          setLive({
-            assistantId: evt.data.assistantMessageId,
-            content: '',
-            reasoning: '',
-            progress: null,
-            liveGenTps: 0,
-            genTokens: 0,
-            toolCalls: [],
-            timeline: [],
-          })
-          void qc.invalidateQueries({ queryKey: ['conversation', convId] })
-        } else if (evt.event === 'progress') {
-          setLive((l) => l ? { ...l, progress: { phase: evt.data.phase, pct: evt.data.pct, tps: evt.data.tps } } : l)
-        } else if (evt.event === 'reasoning') {
+      for await (const evt of streamAgentRun(runId, signal)) {
+        const data = evt.data as Record<string, unknown>
+        if (evt.event === 'reasoning') {
           const liveTps = pushGenToken()
-          setLive((l) => l ? { ...l, reasoning: l.reasoning + evt.data.delta, progress: null, liveGenTps: liveTps, genTokens: l.genTokens + 1 } : l)
+          setLive((l) => l ? { ...l, reasoning: l.reasoning + String(data.delta ?? ''), liveGenTps: liveTps, genTokens: l.genTokens + 1 } : l)
         } else if (evt.event === 'delta') {
           const liveTps = pushGenToken()
-          setLive((l) => l ? { ...l, content: l.content + evt.data.delta, timeline: appendTextDelta(l.timeline, evt.data.delta), progress: null, liveGenTps: liveTps, genTokens: l.genTokens + 1 } : l)
+          const delta = String(data.delta ?? '')
+          setLive((l) => l ? { ...l, content: l.content + delta, timeline: appendTextDelta(l.timeline, delta), liveGenTps: liveTps, genTokens: l.genTokens + 1 } : l)
         } else if (evt.event === 'tool_call') {
-          const tc = evt.data
-          setLive((l) => {
-            if (!l) return l
-            const call: LiveToolCall = { id: tc.id, name: tc.name, args: tc.args, status: tc.status, result: tc.result }
-            return { ...l, timeline: upsertToolCall(l.timeline, call) }
-          })
+          setLive((l) => l ? { ...l, timeline: upsertToolCall(l.timeline, { id: String(data.id), name: String(data.name), args: (data.args as Record<string, unknown>) ?? {}, status: data.status as LiveToolCall['status'], result: data.result as string | undefined }) } : l)
         } else if (evt.event === 'done') {
           setLive(null)
           void qc.invalidateQueries({ queryKey: ['conversation', convId] })
@@ -967,8 +969,9 @@ export function AgentsScreen() {
         } else if (evt.event === 'error') {
           setLive(null)
           void qc.invalidateQueries({ queryKey: ['conversation', convId] })
-          toast.error(evt.data.message)
+          toast.error(String(data.message ?? 'The run failed.'))
         }
+        // 'compaction' events are ignored for now.
       }
       setLive(null)
       void qc.invalidateQueries({ queryKey: ['conversation', convId] })
@@ -1021,7 +1024,8 @@ export function AgentsScreen() {
 
   const handleStop = async () => {
     abortRef.current?.abort()
-    if (activeId) await stopGeneration(activeId).catch(() => {})
+    // Cancel the pi run server-side (aborting the SSE only closes the client stream).
+    if (runIdRef.current) await cancelAgentRun(runIdRef.current).catch(() => {})
   }
 
   const send = async () => {
@@ -1038,13 +1042,18 @@ export function AgentsScreen() {
     abortRef.current = ac
 
     try {
-      await streamFrom(activeId, sendMessage(activeId, text, ac.signal))
+      // Each message = a pi run that continues the thread (real shell/file execution).
+      const { runId } = await runAgentTurn(activeId, text)
+      runIdRef.current = runId
+      await streamRun(activeId, runId, ac.signal)
     } catch (e) {
       setLive(null)
       if ((e as Error)?.name !== 'AbortError') {
         toast.error(e instanceof ApiError ? e.message : 'Request failed.')
       }
       void qc.invalidateQueries({ queryKey: ['conversation', activeId] })
+    } finally {
+      runIdRef.current = null
     }
   }
 
@@ -1105,29 +1114,47 @@ export function AgentsScreen() {
             <span className="text-[13px] text-muted">New conversation</span>
           )}
 
-          {/* Running tasks pill — right side, before manage button */}
-          {runningCount > 0 && (
-            <button
-              type="button"
-              onClick={() => { setTaskPanelOpen((o) => !o); setManageOpen(false) }}
-              className="ml-auto flex items-center gap-1.5 rounded-full border border-border bg-panel px-2.5 py-1 text-[11px] text-accent hover:bg-panel-2 transition-colors"
-              title="Background tasks running"
-            >
-              <Loader2 size={11} className="animate-spin" />
-              {runningCount} working
-            </button>
-          )}
+          {/* Right-side controls */}
+          <div className="ml-auto flex items-center gap-1.5">
+            {/* Permission mode (per conversation) */}
+            {activeAgent && activeId && (
+              <select
+                value={convMode}
+                onChange={(e) => void handleModeChange(e.target.value as AgentMode)}
+                className="rounded-md border border-border bg-panel px-2 py-1 text-[12px] text-ink outline-none focus:border-accent"
+                title="Permission mode — how much the agent can do without asking"
+              >
+                <option value="auto">Auto · runs tools</option>
+                <option value="bypass">Bypass · full auto</option>
+                <option value="ask">Ask · approve each</option>
+                <option value="read">Read-only</option>
+              </select>
+            )}
 
-          {/* Manage agents toggle — right side */}
-          <Button
-            size="icon"
-            variant="ghost"
-            className={cn(runningCount > 0 ? 'ml-1' : 'ml-auto', 'h-8 w-8', manageOpen && 'bg-panel-2')}
-            onClick={() => { setManageOpen((o) => !o); setTaskPanelOpen(false) }}
-            title="Manage agents"
-          >
-            <Settings2 size={15} />
-          </Button>
+            {/* Running tasks pill */}
+            {runningCount > 0 && (
+              <button
+                type="button"
+                onClick={() => { setTaskPanelOpen((o) => !o); setManageOpen(false) }}
+                className="flex items-center gap-1.5 rounded-full border border-border bg-panel px-2.5 py-1 text-[11px] text-accent hover:bg-panel-2 transition-colors"
+                title="Background tasks running"
+              >
+                <Loader2 size={11} className="animate-spin" />
+                {runningCount} working
+              </button>
+            )}
+
+            {/* Manage agents toggle */}
+            <Button
+              size="icon"
+              variant="ghost"
+              className={cn('h-8 w-8', manageOpen && 'bg-panel-2')}
+              onClick={() => { setManageOpen((o) => !o); setTaskPanelOpen(false) }}
+              title="Manage agents"
+            >
+              <Settings2 size={15} />
+            </Button>
+          </div>
         </div>
 
         {/* Message area */}

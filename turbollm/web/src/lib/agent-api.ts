@@ -88,6 +88,57 @@ export async function saveConversationAsSkill(convId: string): Promise<{ ok: tru
   return req(`/api/v1/conversations/${convId}/save-skill`, { method: 'POST' })
 }
 
+// ── pi agent runs (each agent message = a pi run, spec 13 redesign) ─────────────
+
+export type AgentMode = 'ask' | 'auto' | 'bypass' | 'read'
+
+/** Set a conversation's pi permission mode. */
+export function setAgentMode(convId: string, mode: AgentMode): Promise<{ ok: true; mode: AgentMode }> {
+  return req(`/api/v1/agents/conversations/${encodeURIComponent(convId)}/mode`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode }),
+  })
+}
+
+/** Run a pi turn inside an agent conversation; returns the run id to stream. */
+export function runAgentTurn(convId: string, userMessage: string): Promise<{ runId: string }> {
+  return req(`/api/v1/agents/conversations/${encodeURIComponent(convId)}/run`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ userMessage }),
+  })
+}
+
+export interface AgentRunEvent { event: string; data: Record<string, unknown> }
+
+/** Stream a pi run's events (SSE replay + live-tail). Reconnectable via fromSeq. */
+export async function* streamAgentRun(runId: string, signal: AbortSignal, fromSeq = 0): AsyncGenerator<AgentRunEvent> {
+  const res = await fetch(`/api/v1/agents/runs/${encodeURIComponent(runId)}/stream?fromSeq=${fromSeq}`, {
+    headers: { ...authHeaders() }, signal,
+  })
+  if (!res.ok || !res.body) throw new ApiError('http_error', `Stream failed (${res.status}).`, res.status)
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buf = ''
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      const lines = buf.split('\n')
+      buf = lines.pop() ?? ''
+      let event = ''
+      for (const line of lines) {
+        if (line.startsWith('event: ')) { event = line.slice(7).trim() }
+        else if (line.startsWith('data: ')) {
+          const raw = line.slice(6).trim()
+          try { const data = JSON.parse(raw); if (event) yield { event, data } } catch { /* skip */ }
+          event = ''
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock()
+  }
+}
+
 // ── Skills ───────────────────────────────────────────────────────────────────
 
 export async function fetchSkills(): Promise<Skill[]> {

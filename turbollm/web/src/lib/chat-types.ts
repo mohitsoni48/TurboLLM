@@ -95,6 +95,8 @@ export interface Conversation {
   completedAt?: string
   /** Files/folders attached to this chat that the bound agent may read (chat-bound scope). */
   readScope?: string[]
+  /** pi permission mode for this agent conversation: 'ask'|'auto'|'bypass'|'read'. */
+  agentMode?: string
   createdAt: string
   updatedAt: string
   messages?: Message[]
