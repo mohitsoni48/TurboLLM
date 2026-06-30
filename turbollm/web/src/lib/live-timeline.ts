@@ -25,8 +25,17 @@ export function upsertToolCall(timeline: LiveBlock[], call: LiveToolCall): LiveB
   if (idx >= 0) {
     const updated = timeline.slice()
     const prev = updated[idx] as { kind: 'tool'; call: LiveToolCall }
-    // Keep the args/name from the first (pending) event if the later one omits them.
-    updated[idx] = { kind: 'tool', call: { ...prev.call, ...call } }
+    // Merge, but NEVER let a later event (e.g. tool end, which omits the name/args)
+    // clobber the name/args captured on the pending event.
+    updated[idx] = {
+      kind: 'tool',
+      call: {
+        ...prev.call,
+        ...call,
+        name: call.name && call.name !== 'undefined' ? call.name : prev.call.name,
+        args: call.args && Object.keys(call.args).length ? call.args : prev.call.args,
+      },
+    }
     return updated
   }
   return [...timeline, { kind: 'tool', call }]

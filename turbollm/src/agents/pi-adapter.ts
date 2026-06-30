@@ -112,6 +112,10 @@ export async function runAgentSession(
   session.setAutoCompactionEnabled(true)
 
   let runResult: AgentRunResult | undefined
+  // pi's tool_execution_end carries only the id (no toolName), so remember the name from
+  // the start event and echo it back on end — otherwise the UI overwrites the tool name
+  // with "undefined" when the call completes.
+  const toolNames = new Map<string, string>()
 
   session.subscribe((event) => {
     switch (event.type) {
@@ -125,10 +129,11 @@ export async function runAgentSession(
         break
       }
       case 'tool_execution_start':
+        toolNames.set(event.toolCallId, event.toolName)
         config.onEvent({ event: 'tool_call', data: { id: event.toolCallId, name: event.toolName, args: event.args, status: 'pending' } })
         break
       case 'tool_execution_end':
-        config.onEvent({ event: 'tool_call', data: { id: event.toolCallId, status: event.isError ? 'error' : 'done', result: toolResultText(event.result) } })
+        config.onEvent({ event: 'tool_call', data: { id: event.toolCallId, name: toolNames.get(event.toolCallId), status: event.isError ? 'error' : 'done', result: toolResultText(event.result) } })
         break
       case 'compaction_start':
         config.onEvent({ event: 'compaction', data: { status: 'start' } })
