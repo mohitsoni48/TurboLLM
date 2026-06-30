@@ -1,4 +1,5 @@
 import { hideChildConsoleWindows } from './util/hide-console-windows'
+import { installEngineProgressTap } from './agents/engine-progress-tap'
 import { spawn } from 'node:child_process'
 import { openSync, readFileSync } from 'node:fs'
 import { serve } from '@hono/node-server'
@@ -42,6 +43,11 @@ import type { Deps } from './deps'
 // of its own. Must run before anything spawns — patches the shared low-level
 // spawn path, so it covers the external pi SDK's named spawn import too.
 hideChildConsoleWindows()
+
+// Let agent turns surface llama.cpp prefill progress (the "Processing prompt — N%"
+// bar) the way plain chat does. pi-ai gives no stream seam, so a header-gated fetch
+// tee reads prompt_progress off the engine stream for tagged agent requests only.
+installEngineProgressTap()
 
 // Entrypoint for the TurboLLM daemon (npm bin "turbollm"): wiring + graceful
 // shutdown. ADR-023 (Node/TS stack).

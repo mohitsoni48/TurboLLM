@@ -13,6 +13,7 @@ import type { Deps } from '../deps'
 import type { EventSink } from '../chat/generation'
 import type { ToolCallGuard } from './fs-guard'
 import type { GenerationGate } from './gate'
+import { RUN_HEADER } from './engine-progress-tap'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 export interface PiAgentConfig {
@@ -39,6 +40,9 @@ export interface PiAgentConfig {
   /** Permission mode (ADR pending). 'read' = read-only built-ins; 'auto'/'bypass' =
    *  full read/bash/edit/write; 'ask' = approve each (handled at the tool layer). */
   mode?: AgentMode
+  /** Run id used to tag engine requests so the prefill-progress tap can route
+   *  llama.cpp's prompt_progress back to this run's event sink (spec 13 §prefill). */
+  runId?: string
 }
 
 export type AgentMode = 'ask' | 'auto' | 'bypass' | 'read'
@@ -80,7 +84,7 @@ export async function runAgentSession(
   auth.setRuntimeApiKey('local', 'agent-key')
   const registry = ModelRegistry.inMemory(auth)
 
-  registerLocalProvider(config.baseUrl, config.modelId, auth, registry, config.gate, signal)
+  registerLocalProvider(config.baseUrl, config.modelId, auth, registry, config.gate, signal, config.runId)
   const model = registry.find('local', config.modelId)
   if (!model) throw new Error(`Model ${config.modelId} not found`)
 
@@ -267,6 +271,7 @@ export function registerLocalProvider(
   registry: ModelRegistry,
   gate?: GenerationGate,
   runSignal?: AbortSignal,
+  runId?: string,
 ): void {
   authStorage.setRuntimeApiKey('local', 'agent-key')
   registry.registerProvider('local', {
@@ -285,6 +290,20 @@ export function registerLocalProvider(
               ? AbortSignal.any([runSignal, timeout, ...(options?.signal ? [options.signal] : [])])
               : AbortSignal.any([timeout, ...(options?.signal ? [options.signal] : [])])
             options = { ...options, signal: mergedSignal }
+            // Ask llama.cpp for prefill progress and tag the request so the global
+            // fetch tap (engine-progress-tap) can route prompt_progress back to this
+            // run's UI. onPayload adds the non-standard body field; the header keys
+            // the tap. Both are no-ops without a runId / a llama.cpp engine.
+            if (runId) {
+              options = {
+                ...options,
+                headers: { ...(options.headers as Record<string, string> | undefined), [RUN_HEADER]: runId },
+                onPayload: (payload) => {
+                  if (payload && typeof payload === 'object') (payload as Record<string, unknown>).return_progress = true
+                  return payload
+                },
+              }
+            }
             // Acquire BEFORE the request, release when the stream drains. The
             // returned stream is handed straight to pi; we only attach a release
             // on its terminal result() so the gate is never leaked.

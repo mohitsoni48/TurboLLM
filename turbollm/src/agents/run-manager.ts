@@ -7,6 +7,7 @@ import { EventEmitter } from 'node:events'
 import type { Deps } from '../deps'
 import type { AgentType } from '../config/config'
 import { runAgentSession, type AgentMode } from './pi-adapter'
+import { registerRunProgress, unregisterRunProgress } from './engine-progress-tap'
 import { buildBridgedTools } from './pi-adapter'
 import { makeToolCallGuard } from './fs-guard'
 import { createUpdateDocTool, createCompleteTaskTool, type CompletionSignal } from './task-tools'
@@ -229,6 +230,10 @@ export class AgentRunManager {
       // so the default system prompt treats that folder as in-scope.
       const cwd = agent.writeRoots[0] === '<dataDir>' || !agent.writeRoots[0] ? dataDir : agent.writeRoots[0]
 
+      // Surface llama.cpp prefill progress (the "Processing prompt — N%" bar) to this
+      // run's stream. The fetch tap reads prompt_progress off the engine SSE and calls
+      // this back; unregistered in finally so the map never leaks.
+      registerRunProgress(pending.id, (p) => sink({ event: 'progress', data: p }))
       await runAgentSession(
         {
           baseUrl: `${target}/v1`,
@@ -242,6 +247,7 @@ export class AgentRunManager {
           gate: this.d.gate,
           cwd,
           mode: pending.mode ?? 'auto',
+          runId: pending.id,
           onEvent: (ev) => {
             if (ev.event === 'delta') {
               const d = ev.data as { delta?: string }
@@ -287,6 +293,7 @@ export class AgentRunManager {
         sink({ event: 'error', data: { code: 'interrupted', message: 'The model was unloaded — run interrupted.' } })
       }
     } finally {
+      unregisterRunProgress(pending.id)
       this.finish(pending.id)
     }
   }

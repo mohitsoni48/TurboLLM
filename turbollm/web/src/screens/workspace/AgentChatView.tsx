@@ -588,13 +588,16 @@ export function AgentChatView() {
     try {
       for await (const evt of streamAgentRun(runId, signal)) {
         const data = evt.data as Record<string, unknown>
-        if (evt.event === 'reasoning') {
+        if (evt.event === 'progress') {
+          // llama.cpp prefill progress (phase 'prompt') — surfaced by the engine tap.
+          setLive((l) => l ? { ...l, progress: { phase: String(data.phase ?? 'prompt'), pct: Number(data.pct ?? 0), tps: Number(data.tps ?? 0) } } : l)
+        } else if (evt.event === 'reasoning') {
           const liveTps = pushGenToken()
-          setLive((l) => l ? { ...l, reasoning: l.reasoning + String(data.delta ?? ''), liveGenTps: liveTps, genTokens: l.genTokens + 1 } : l)
+          setLive((l) => l ? { ...l, reasoning: l.reasoning + String(data.delta ?? ''), progress: null, liveGenTps: liveTps, genTokens: l.genTokens + 1 } : l)
         } else if (evt.event === 'delta') {
           const liveTps = pushGenToken()
           const delta = String(data.delta ?? '')
-          setLive((l) => l ? { ...l, content: l.content + delta, timeline: appendTextDelta(l.timeline, delta), liveGenTps: liveTps, genTokens: l.genTokens + 1 } : l)
+          setLive((l) => l ? { ...l, content: l.content + delta, timeline: appendTextDelta(l.timeline, delta), progress: null, liveGenTps: liveTps, genTokens: l.genTokens + 1 } : l)
         } else if (evt.event === 'tool_call') {
           setLive((l) => l ? { ...l, timeline: upsertToolCall(l.timeline, { id: String(data.id), name: String(data.name), args: (data.args as Record<string, unknown>) ?? {}, status: data.status as LiveToolCall['status'], result: data.result as string | undefined }) } : l)
         } else if (evt.event === 'done') {
