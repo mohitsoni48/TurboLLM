@@ -21,6 +21,7 @@ import { randomUUID } from 'node:crypto'
 import type { Deps } from '../deps'
 import { ValueError, type AgentType } from '../config/config'
 import { SkillStore, isBuiltinSkill, isValidSkillId, toSkillId, importSkillsFromFolder, type Skill } from './skills'
+import type { AgentMode } from './pi-adapter'
 import { isLocalRequest } from '../auth'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -249,6 +250,38 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
     } catch (e) {
       return err(c, 400, 'launch_failed', e instanceof Error ? e.message : String(e))
     }
+  })
+
+  // Run a pi turn INSIDE an existing agent conversation (each chat message = a pi run that
+  // continues the thread). Uses the conversation's stored permission mode.
+  app.post('/api/v1/agents/conversations/:convId/run', async (c) => {
+    if (!isLocalRequest(c, d)) return err(c, 403, 'forbidden', 'Agent runs can only be launched on the machine running TurboLLM.')
+    if (!d.agents) return err(c, 501, 'not_implemented', 'Agent runner not available.')
+    const convId = c.req.param('convId')
+    const conv = d.db.getConversation(convId)
+    if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
+    if (!conv.agentId) return err(c, 400, 'not_agent', 'Not an agent conversation.')
+    const b = await body<{ userMessage?: string }>(c)
+    const msg = b.userMessage?.trim()
+    if (!msg) return err(c, 400, 'invalid_input', 'userMessage is required.')
+    const mode = (['ask', 'auto', 'bypass', 'read'].includes(conv.agentMode ?? '') ? conv.agentMode : 'auto') as AgentMode
+    try {
+      const id = await d.agents.launch({ agentId: conv.agentId, title: conv.title, userMessage: msg, convId, mode })
+      return c.json({ runId: id }, 201)
+    } catch (e) {
+      return err(c, 400, 'launch_failed', e instanceof Error ? e.message : String(e))
+    }
+  })
+
+  // Set a conversation's permission mode.
+  app.post('/api/v1/agents/conversations/:convId/mode', async (c) => {
+    const convId = c.req.param('convId')
+    const conv = d.db.getConversation(convId)
+    if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
+    const b = await body<{ mode?: string }>(c)
+    if (!['ask', 'auto', 'bypass', 'read'].includes(b.mode ?? '')) return err(c, 400, 'invalid_input', 'mode must be ask|auto|bypass|read.')
+    d.db.setConversationMode(convId, b.mode!)
+    return c.json({ ok: true, mode: b.mode })
   })
 
   app.get('/api/v1/agents/runs', (c) => {

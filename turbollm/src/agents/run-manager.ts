@@ -6,7 +6,7 @@
 import { EventEmitter } from 'node:events'
 import type { Deps } from '../deps'
 import type { AgentType } from '../config/config'
-import { runAgentSession } from './pi-adapter'
+import { runAgentSession, type AgentMode } from './pi-adapter'
 import { buildBridgedTools } from './pi-adapter'
 import { makeToolCallGuard } from './fs-guard'
 import { createUpdateDocTool, createCompleteTaskTool, type CompletionSignal } from './task-tools'
@@ -41,6 +41,11 @@ export interface LaunchParams {
   agentId: string
   title: string
   userMessage: string
+  /** Run inside an EXISTING agent conversation (continue the thread). When omitted, a new
+   *  conversation is created (one-shot run). */
+  convId?: string
+  /** Permission mode for this turn ('ask'|'auto'|'bypass'|'read'). Default 'auto'. */
+  mode?: AgentMode
 }
 
 interface PendingRun extends LaunchParams {
@@ -82,21 +87,18 @@ export class AgentRunManager {
     const agent = this.agent(params.agentId)
     if (!agent) throw new Error(`Unknown agent: ${params.agentId}`)
 
-    const conv = db.createConversation({
-      title: params.title,
-      systemPrompt: '',
-      kind: 'agent',
-    })
+    // Continue an existing thread when convId is given; otherwise start a fresh one.
+    const convId = params.convId ?? db.createConversation({ title: params.title, systemPrompt: '', kind: 'agent', agentId: params.agentId }).id
 
     const run = db.createAgentRun?.({
-      convId: conv.id,
+      convId,
       title: params.title,
       allowedTools: [],
       agentId: params.agentId,
     })
     if (!run) throw new Error('createAgentRun not available (DB migration pending?)')
 
-    this.queue.push({ ...params, id: run.id, convId: conv.id })
+    this.queue.push({ ...params, id: run.id, convId })
     void this.processNext()
     return run.id
   }
@@ -167,6 +169,13 @@ export class AgentRunManager {
       // INSIDE the try: if the conversation was deleted between launch and now, the FK
       // throw lands in catch (not as an unhandled rejection that wedges the queue, H3).
       this.d.db.updateConversation(pending.convId, { modelKey: ms.model.key })
+      // Capture the prior thread BEFORE adding this turn, so pi gets the conversation so far
+      // as context (each message = a pi run that continues the thread).
+      const prior = (this.d.db.getConversation(pending.convId, true)?.messages ?? []).filter((m) => m.content)
+      const history = prior.map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`).join('\n\n')
+      const promptMessage = history
+        ? `Conversation so far:\n\n${history}\n\n---\n\nUser: ${pending.userMessage}`
+        : pending.userMessage
       this.d.db.addMessage(pending.convId, 'user', pending.userMessage)
       this.d.db.addMessage(pending.convId, 'assistant', '', { stats: { aborted: false } })
       assistantMsg = this.d.db.getLastMessage(pending.convId)
@@ -216,12 +225,13 @@ export class AgentRunManager {
           modelId,
           agent,
           systemPrompt,
-          userMessage: pending.userMessage,
+          userMessage: promptMessage,
           tools: toolNames,
           customTools: [...taskTools, ...bridged],
           onToolCall: guard,
           gate: this.d.gate,
           cwd,
+          mode: pending.mode ?? 'auto',
           onEvent: (ev) => {
             if (ev.event === 'delta') {
               const d = ev.data as { delta?: string }
