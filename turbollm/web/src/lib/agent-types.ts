@@ -1,11 +1,38 @@
 export type AgentRunStatus = 'queued' | 'running' | 'done' | 'failed' | 'cancelled' | 'interrupted'
 
+// ── Agent definitions (the persona-like "Hitman" configs) ──────────────────────
+
+export interface AgentType {
+  id: string
+  name: string
+  description: string
+  builtin?: boolean
+  skills: string[]          // skill ids, or ['*'] for all
+  readRoots: string[]
+  writeRoots: string[]
+  callableAgents: string[]
+  maxIterations?: number
+}
+
+// ── Skills (the global library) ────────────────────────────────────────────────
+
+export interface Skill {
+  id: string
+  name: string
+  description: string
+  instructions: string
+  tools: string[]
+  builtin?: boolean
+}
+
+// ── Runs ("contracts") ─────────────────────────────────────────────────────────
+
 export interface AgentRun {
   id: string
   convId: string
   title: string
   status: AgentRunStatus
-  allowedTools: string[]
+  agentId?: string
   error?: string
   createdAt: string
   updatedAt: string

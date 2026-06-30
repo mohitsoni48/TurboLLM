@@ -1,10 +1,20 @@
 import { authHeaders, ApiError } from './api'
-import type { AgentRun } from './agent-types'
+import type { AgentRun, AgentType, Skill } from './agent-types'
 
 export const agentRunKeys = {
   all: ['agent-runs'] as const,
   list: () => [...agentRunKeys.all, 'list'] as const,
   detail: (id: string) => [...agentRunKeys.all, 'detail', id] as const,
+}
+
+export const agentKeys = {
+  all: ['agents'] as const,
+  list: () => [...agentKeys.all, 'list'] as const,
+}
+
+export const skillKeys = {
+  all: ['skills'] as const,
+  list: () => [...skillKeys.all, 'list'] as const,
 }
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
@@ -28,6 +38,52 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   return data as T
 }
 
+// ── Agent definitions ──────────────────────────────────────────────────────────
+
+export async function fetchAgents(): Promise<AgentType[]> {
+  return req<AgentType[]>('/api/v1/agents')
+}
+
+export async function createAgent(params: Partial<AgentType>): Promise<AgentType> {
+  return req<AgentType>('/api/v1/agents', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  })
+}
+
+export async function updateAgent(id: string, patch: Partial<AgentType>): Promise<AgentType> {
+  return req<AgentType>(`/api/v1/agents/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  })
+}
+
+export async function deleteAgent(id: string): Promise<void> {
+  await req<{ ok: boolean }>(`/api/v1/agents/${id}`, { method: 'DELETE' })
+}
+
+// ── Skills ───────────────────────────────────────────────────────────────────
+
+export async function fetchSkills(): Promise<Skill[]> {
+  return req<Skill[]>('/api/v1/skills')
+}
+
+export async function saveSkill(skill: Skill): Promise<Skill> {
+  return req<Skill>('/api/v1/skills', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(skill),
+  })
+}
+
+export async function deleteSkill(id: string): Promise<void> {
+  await req<{ ok: boolean }>(`/api/v1/skills/${id}`, { method: 'DELETE' })
+}
+
+// ── Runs ─────────────────────────────────────────────────────────────────────
+
 export async function fetchAgentRuns(): Promise<AgentRun[]> {
   return req<AgentRun[]>('/api/v1/agents/runs')
 }
@@ -36,13 +92,12 @@ export async function fetchAgentRun(id: string): Promise<AgentRun> {
   return req<AgentRun>(`/api/v1/agents/runs/${id}`)
 }
 
-export async function createAgentRun(params: {
+/** Launch a run AS a given agent (the run inherits the agent's skills + scope). */
+export async function createAgentRun(agentId: string, params: {
   title?: string
-  systemPrompt?: string
   userMessage: string
-  allowedTools?: string[]
 }): Promise<AgentRun> {
-  return req<AgentRun>('/api/v1/agents/runs', {
+  return req<AgentRun>(`/api/v1/agents/${agentId}/runs`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(params),
