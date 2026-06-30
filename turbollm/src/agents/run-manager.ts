@@ -164,6 +164,10 @@ export class AgentRunManager {
 
     // Accumulate the streamed assistant text so it lands in the DB on completion.
     let fullContent = ''
+    // Hard-ceiling state (hoisted so the catch block can distinguish "hit the limit"
+    // from a user cancel / real failure).
+    const maxToolCalls = agent.maxIterations ?? 30
+    let hitCeiling = false
 
     try {
       const { toolNames, systemPrompt } = this.resolveSkills(agent)
@@ -175,8 +179,23 @@ export class AgentRunManager {
       const bridged = await buildBridgedTools(this.d, agent)
       const bridgedNames = new Set(bridged.map((t) => t.name))
 
-      const guard = makeToolCallGuard(agent, dataDir, bridgedNames)
+      const baseGuard = makeToolCallGuard(agent, dataDir, bridgedNames)
       const modelId = engineModelAlias(this.d.registry.active()?.kind ?? '') ?? ms.model.key
+
+      // Hard ceiling (spec 13 §12.2/§10): pi has no built-in step cap and a small model
+      // may loop forever without calling complete_task. The guard fires before every tool
+      // execution, so count there: once the cap is hit, abort the run and block further
+      // tools. Reaching the ceiling is NOT success — the run ends and awaits review.
+      let toolCallCount = 0
+      const guard: typeof baseGuard = (toolName, input) => {
+        toolCallCount++
+        if (toolCallCount > maxToolCalls) {
+          hitCeiling = true
+          ac.abort()
+          return { block: true, reason: `iteration limit (${maxToolCalls}) reached — stopping for review` }
+        }
+        return baseGuard(toolName, input)
+      }
 
       // Task-tracking tools (§12.2): the working doc + the model's done-signal. Always
       // available — granted to any agent whose skills include the `task-tracking` skill
@@ -220,11 +239,18 @@ export class AgentRunManager {
       this.d.db.updateMessage(assistantMsg.id, { content: fullContent, stats: { aborted: isAbort } })
       // interruptActive() pre-writes 'interrupted' status — don't overwrite it.
       if (!this.interruptedIds.delete(pending.id)) {
-        this.d.db.updateAgentRun?.(pending.id, {
-          status: isAbort ? 'cancelled' : 'failed',
-          error: isAbort ? undefined : (e as Error).message,
-          endedAt: new Date().toISOString(),
-        })
+        if (hitCeiling) {
+          // Hit the iteration ceiling — NOT a failure or cancel. Surfaces as 'done'
+          // (awaiting review); the user dispositions it like any finished contract (§14).
+          sink({ event: 'error', data: { code: 'iteration_limit', message: `Stopped after ${maxToolCalls} tool calls — needs review.` } })
+          this.d.db.updateAgentRun?.(pending.id, { status: 'done', error: `Stopped at iteration limit (${maxToolCalls}).`, endedAt: new Date().toISOString() })
+        } else {
+          this.d.db.updateAgentRun?.(pending.id, {
+            status: isAbort ? 'cancelled' : 'failed',
+            error: isAbort ? undefined : (e as Error).message,
+            endedAt: new Date().toISOString(),
+          })
+        }
       }
     } finally {
       this.finish(pending.id)
