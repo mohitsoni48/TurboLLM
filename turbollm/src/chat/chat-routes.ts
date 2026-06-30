@@ -15,6 +15,8 @@ import type { ExportFormat } from './chat-export'
 import { executeToolCallWithApproval } from '../tools/execute-with-approval'
 import { resolveToolApproval } from '../tools/approval-gate'
 import { buildAgentToolset } from '../agents/agent-tools'
+import { SkillStore } from '../agents/skills'
+import { saveSkillFromConversation } from '../agents/skill-jobs'
 
 // Track in-flight abort controllers per conversation id.
 const inflight = new Map<string, AbortController>()
@@ -128,29 +130,12 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   // Save this conversation as a reusable SKILL for the agent (spec 13 redesign §3.3,
   // Voyager). Detached distill → store, deduped by name.
   app.post('/api/v1/conversations/:id/save-skill', (c) => {
-    const conv = db.getConversation(c.req.param('id'), true)
+    const conv = db.getConversation(c.req.param('id'))
     if (!conv) return c.json({ error: { code: 'not_found', message: 'Conversation not found.' } }, 404)
     if (!conv.agentId) return c.json({ error: { code: 'no_agent', message: 'Only agent conversations can become skills.' } }, 400)
-    if ((d.db.countAgentSkills?.(conv.agentId) ?? 0) >= 50) return c.json({ error: { code: 'skill_cap', message: 'Skill limit reached (50).' } }, 400)
-    const agentId = conv.agentId
-    const transcript = (conv.messages ?? []).filter((m) => m.content).map((m) => ({ role: m.role, content: m.content }))
-    const taskId = d.agentTasks?.start('skill_from_conversation', agentId, 'Learning a skill from this conversation', conv.id)
-    void (async () => {
-      try {
-        if (taskId) d.agentTasks?.step(taskId, 'Distilling a reusable skill…')
-        const { distillFromConversation } = await import('../agents/distiller')
-        const s = await distillFromConversation(d, transcript)
-        if (s.name && s.procedure && !d.db.hasAgentSkillNamed?.(agentId, s.name)) {
-          d.db.addAgentSkill?.({ agentId, name: s.name, description: s.description ?? '', procedure: s.procedure, source: 'conversation' })
-          if (taskId) d.agentTasks?.done(taskId, `Learned skill: ${s.name} — ${s.description ?? ''}`)
-        } else if (taskId) {
-          d.agentTasks?.done(taskId, s.name ? `Skill "${s.name}" already known.` : 'No clear reusable skill found.')
-        }
-      } catch (e) {
-        if (taskId) d.agentTasks?.fail(taskId, e instanceof Error ? e.message : 'distill failed')
-      }
-    })()
-    return c.json({ ok: true, learning: true })
+    // Same background skill author the in-chat save_skill tool uses (skill-creator model).
+    const taskId = saveSkillFromConversation(d, conv.id)
+    return c.json({ ok: true, learning: !!taskId })
   })
 
   app.get('/api/v1/conversations/:id', (c) => {
@@ -646,15 +631,20 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
     const lessonText = lessons.length
       ? 'Lessons from past tasks (apply them):\n' + lessons.map((l) => `- ${l.lesson}`).join('\n')
       : ''
-    const skills = d.db.listAgentSkills?.(boundAgent.id, 3) ?? []
+    // Skills are SKILL.md files in the shared library (skill-creator model). Inject the
+    // available ones (name + when-to-use + procedure) so the agent applies them.
+    const skills = new SkillStore(d.store.dir()).userSkills().slice(0, 8)
     const skillText = skills.length
-      ? 'Skills you have learned (use the relevant ones):\n' + skills.map((s) => `- ${s.name}: ${s.description}\n  ${s.procedure.replace(/\n/g, ' ').slice(0, 300)}`).join('\n')
+      ? 'Skills available to you (apply the relevant ones):\n' + skills.map((s) => `- ${s.name}: ${s.description}\n  ${s.instructions.replace(/\n/g, ' ').slice(0, 300)}`).join('\n')
       : ''
     const agentSys = [
       boundAgent.systemPrompt || `You are ${boundAgent.name}.`,
       reads.length ? `You can READ files in these folders: ${reads.join(', ')}.` : '',
       `You can WRITE files only in: ${dataDir}.`,
       `Use run_code for computation only (it has no file access); to save a result, return it and call write_file.`,
+      // Using skills is proactive (above); SAVING them is not. Only act on an explicit
+      // request, and never suggest it. The save_skill tool is the only path.
+      `Apply the skills above proactively when relevant. Do NOT proactively mention, suggest, or save skills. ONLY when the user EXPLICITLY asks to create or save a skill from this conversation, call the save_skill tool (it writes a SKILL.md into the shared library). Never use any external memory, knowledge-graph, or note tool to store skills.`,
       skillText,
       lessonText,
     ].filter(Boolean).join('\n\n')
@@ -712,7 +702,18 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
     // Agent-bound conversation (spec 13 redesign): merge in the agent's guarded FS/code
     // tools. When conv.agentId is null this is a no-op → plain chat is byte-identical.
     const agent = conv.agentId ? d.store.snapshot().agents.agents.find((a) => a.id === conv.agentId) : undefined
-    const agentTools = agent ? buildAgentToolset(agent, d.store.dir()) : undefined
+    const agentTools = agent
+      ? buildAgentToolset(agent, d.store.dir(), {
+          // In-chat skill author (skill-creator model): the agent calls save_skill, we
+          // read THIS conversation in the background and write a SKILL.md to the library.
+          onSaveSkill: () => {
+            const tid = saveSkillFromConversation(d, conv.id)
+            return tid
+              ? 'Started writing a skill from this conversation in the background. It will appear in the skill library shortly.'
+              : 'There is nothing to turn into a skill yet.'
+          },
+        })
+      : undefined
     const toolDefs = agentTools ? [...baseToolDefs, ...agentTools.defs] : baseToolDefs
 
     outerLoop: while (toolIter <= MAX_TOOL_ITER) {

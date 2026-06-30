@@ -66,7 +66,8 @@ export async function deleteAgent(id: string): Promise<void> {
 
 // ── Grown skills + lessons (spec 13 redesign §3.3) ─────────────────────────────
 
-export interface LearnedSkill { id: string; agentId: string; name: string; description: string; procedure: string; source?: string; createdAt: string }
+// A skill from the shared SKILL.md library (skill-creator model).
+export interface LearnedSkill { id: string; name: string; description: string; instructions: string; tools: string[]; builtin?: boolean; source?: string }
 export interface LearnedLesson { id: string; agentId: string; lesson: string; evidence?: string; createdAt: string }
 
 export async function fetchLearned(agentId: string): Promise<{ skills: LearnedSkill[]; lessons: LearnedLesson[] }> {

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  ArrowDown, BookMarked, Bot, ChevronLeft, ChevronRight, FolderInput, FolderOpen,
+  ArrowDown, Bot, ChevronLeft, ChevronRight, FolderInput, FolderOpen,
   Pencil, Plus, Search, SendHorizontal, Settings2, Square,
   Trash2, X, CheckCircle2, Sparkles, Loader2, XCircle, Activity,
 } from 'lucide-react'
@@ -11,7 +11,7 @@ import { cn } from '../lib/utils'
 import { ApiError } from '../lib/api'
 import {
   agentKeys, fetchAgents, createAgent, updateAgent, deleteAgent,
-  saveConversationAsSkill, learnFromFolder, fetchLearned, deleteLearnedSkill,
+  learnFromFolder, fetchLearned, deleteLearnedSkill,
 } from '../lib/agent-api'
 import type { LearnedSkill, LearnedLesson } from '../lib/agent-api'
 import type { AgentType } from '../lib/agent-types'
@@ -21,6 +21,7 @@ import {
 } from '../lib/chat-api'
 import { useConversation, useConversationMutations } from '../lib/chat-queries'
 import type { ChatSseEvent, Conversation, LiveToolCall } from '../lib/chat-types'
+import { appendTextDelta, upsertToolCall, type LiveBlock } from '../lib/live-timeline'
 import type { AgentTask } from '../lib/types'
 import { MessageBubble, StreamingBubble } from './chat/MessageBubble'
 import { useStatus } from '../lib/queries'
@@ -45,6 +46,7 @@ interface LiveState {
   liveGenTps: number
   genTokens: number
   toolCalls: LiveToolCall[]
+  timeline: LiveBlock[]
 }
 
 // ── Agent sidebar: lists agents as clickable items ───────────────────────────
@@ -348,7 +350,7 @@ function LearnedSection({ agentId }: { agentId: string }) {
 
   return (
     <div className="flex flex-col gap-3">
-      <span className="text-[12px] font-medium text-muted">Learned</span>
+      <span className="text-[12px] font-medium text-muted">Skill library</span>
 
       {/* Learn from folder row */}
       <div className="flex flex-col gap-1.5">
@@ -378,7 +380,7 @@ function LearnedSection({ agentId }: { agentId: string }) {
       {/* Skills + lessons list */}
       {empty ? (
         <p className="text-[12px] text-faint">
-          No learned skills yet — complete tasks with "Reflect &amp; complete" or learn from a folder.
+          No skills yet — tell an agent to "save this as a skill" in chat, or learn from a folder.
         </p>
       ) : (
         <div className="flex flex-col gap-2">
@@ -851,20 +853,7 @@ export function AgentsScreen() {
 
   // ── Agent task completion (spec 13 redesign §2/§3) ──────────────────────────
   const [completing, setCompleting] = useState(false)
-  const [savingSkill, setSavingSkill] = useState(false)
 
-  const handleSaveAsSkill = async () => {
-    if (!activeId) return
-    setSavingSkill(true)
-    try {
-      await saveConversationAsSkill(activeId)
-      toast.success('Learning a skill from this conversation…')
-    } catch (e) {
-      toast.error(e instanceof ApiError ? e.message : 'Could not save skill.')
-    } finally {
-      setSavingSkill(false)
-    }
-  }
   const handleComplete = async (reflect: boolean) => {
     if (!activeId) return
     setCompleting(true)
@@ -964,6 +953,7 @@ export function AgentsScreen() {
             liveGenTps: 0,
             genTokens: 0,
             toolCalls: [],
+            timeline: [],
           })
           void qc.invalidateQueries({ queryKey: ['conversation', convId] })
         } else if (evt.event === 'progress') {
@@ -973,18 +963,13 @@ export function AgentsScreen() {
           setLive((l) => l ? { ...l, reasoning: l.reasoning + evt.data.delta, progress: null, liveGenTps: liveTps, genTokens: l.genTokens + 1 } : l)
         } else if (evt.event === 'delta') {
           const liveTps = pushGenToken()
-          setLive((l) => l ? { ...l, content: l.content + evt.data.delta, progress: null, liveGenTps: liveTps, genTokens: l.genTokens + 1 } : l)
+          setLive((l) => l ? { ...l, content: l.content + evt.data.delta, timeline: appendTextDelta(l.timeline, evt.data.delta), progress: null, liveGenTps: liveTps, genTokens: l.genTokens + 1 } : l)
         } else if (evt.event === 'tool_call') {
           const tc = evt.data
           setLive((l) => {
             if (!l) return l
-            const existing = l.toolCalls.findIndex((x) => x.id === tc.id)
-            if (existing >= 0) {
-              const updated = [...l.toolCalls]
-              updated[existing] = { ...updated[existing], status: tc.status, result: tc.result }
-              return { ...l, toolCalls: updated }
-            }
-            return { ...l, toolCalls: [...l.toolCalls, { id: tc.id, name: tc.name, args: tc.args, status: tc.status, result: tc.result }] }
+            const call: LiveToolCall = { id: tc.id, name: tc.name, args: tc.args, status: tc.status, result: tc.result }
+            return { ...l, timeline: upsertToolCall(l.timeline, call) }
           })
         } else if (evt.event === 'done') {
           setLive(null)
@@ -1208,12 +1193,11 @@ export function AgentsScreen() {
             {/* Streaming bubble */}
             {live && (
               <StreamingBubble
-                content={live.content}
+                timeline={live.timeline}
                 reasoning={live.reasoning}
                 progress={live.progress}
                 liveGenTps={live.liveGenTps}
                 genTokens={live.genTokens}
-                toolCalls={live.toolCalls}
               />
             )}
 
@@ -1258,10 +1242,7 @@ export function AgentsScreen() {
                 <Button size="sm" variant="outline" disabled={completing} onClick={() => handleComplete(true)}>
                   <Sparkles size={13} /> Reflect &amp; complete
                 </Button>
-                <Button size="sm" variant="outline" disabled={savingSkill} onClick={() => void handleSaveAsSkill()}>
-                  <BookMarked size={13} /> Save as skill
-                </Button>
-                <span className="text-[11px] text-faint">"Reflect" lets the agent learn a lesson from this task.</span>
+                <span className="text-[11px] text-faint">Tell the agent to "save this as a skill" in chat to add one to the library.</span>
               </div>
             )}
           </div>

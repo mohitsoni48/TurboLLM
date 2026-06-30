@@ -60,6 +60,22 @@ const RUN_CODE_DEF: ToolDefinition = {
     parameters: { type: 'object', properties: { code: { type: 'string', description: 'JavaScript. Use `return <value>` to return the result.' } }, required: ['code'] },
   },
 }
+const SAVE_SKILL_DEF: ToolDefinition = {
+  type: 'function',
+  function: {
+    name: 'save_skill',
+    description: 'Save a reusable SKILL into the shared skill library (a SKILL.md file under ~/.turbollm/skills). Call this ONLY when the user EXPLICITLY asks to create or save a skill from this conversation (e.g. "make a skill out of this", "save this as a skill"). Do NOT call it proactively or suggest it on your own. This is the only way skills are saved — never use any external memory, knowledge-graph, or note tool.',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Short kebab-case id, e.g. "csv-summary"' },
+        description: { type: 'string', description: 'One sentence: when to apply this skill' },
+        procedure: { type: 'string', description: 'Concise step-by-step procedure (markdown)' },
+      },
+      required: ['name', 'procedure'],
+    },
+  },
+}
 
 // Skill id → which tool defs it grants. (Phase 1: a small built-in mapping; the skill
 // library / grown skills come in later phases.)
@@ -77,8 +93,14 @@ export interface AgentToolset {
   names: Set<string>
 }
 
+export interface AgentToolsetOpts {
+  /** When provided, the agent gets a `save_skill` tool that triggers this (the in-chat
+   *  skill author). Returns a short message shown back to the model as the tool result. */
+  onSaveSkill?: (args: { name?: string; description?: string; procedure?: string }) => string
+}
+
 /** Build the agent's tools + a guarded executor in ToolRegistry shape. */
-export function buildAgentToolset(agent: AgentType, dataDir: string): AgentToolset {
+export function buildAgentToolset(agent: AgentType, dataDir: string, opts: AgentToolsetOpts = {}): AgentToolset {
   // Resolve which tool defs this agent's skills grant (dedup by name).
   const wildcard = agent.skills.includes('*')
   const defsByName = new Map<string, ToolDefinition>()
@@ -87,6 +109,9 @@ export function buildAgentToolset(agent: AgentType, dataDir: string): AgentTools
       for (const d of defs) defsByName.set(d.function.name, d)
     }
   }
+  // Every agent can author skills from chat (skill-creator model) — independent of which
+  // tool-skills it has enabled.
+  if (opts.onSaveSkill) defsByName.set(SAVE_SKILL_DEF.function.name, SAVE_SKILL_DEF)
   const defs = [...defsByName.values()]
   const names = new Set(defs.map((d) => d.function.name))
   // The guard: write confined to ~/.turbollm (the fixed root), read to the agent's
@@ -97,6 +122,15 @@ export function buildAgentToolset(agent: AgentType, dataDir: string): AgentTools
     if (!names.has(call.name)) return `Error: tool "${call.name}" is not available to this agent.`
     // run_code is compute-only (no path) — no guard needed; the sandbox has no FS.
     if (call.name === 'run_code') return execRunCode(call.args, false)
+    // save_skill triggers the background skill author; no FS guard (writes to the library).
+    if (call.name === 'save_skill') {
+      if (!opts.onSaveSkill) return 'Error: saving skills is not available in this conversation.'
+      return opts.onSaveSkill({
+        name: typeof call.args.name === 'string' ? call.args.name : undefined,
+        description: typeof call.args.description === 'string' ? call.args.description : undefined,
+        procedure: typeof call.args.procedure === 'string' ? call.args.procedure : undefined,
+      })
+    }
 
     // Every FS tool is gated by the guard FIRST (canonicalizes + containment-checks).
     const verdict = guard(call.name, call.args)

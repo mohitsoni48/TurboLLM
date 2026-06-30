@@ -20,7 +20,7 @@ import { streamSSE } from 'hono/streaming'
 import { randomUUID } from 'node:crypto'
 import type { Deps } from '../deps'
 import { ValueError, type AgentType } from '../config/config'
-import { SkillStore, isBuiltinSkill, isValidSkillId, type Skill } from './skills'
+import { SkillStore, isBuiltinSkill, isValidSkillId, toSkillId, type Skill } from './skills'
 import { isLocalRequest } from '../auth'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -110,18 +110,21 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
   // ── Grown skills (spec 13 redesign §3.3) ────────────────────────────────────
   const SKILL_CAP = 50
 
-  // List an agent's grown skills + lessons (for the management UI).
+  // The shared skill library + this agent's lessons (for the management UI). Skills are
+  // SKILL.md files shared across agents; lessons (Reflexion) remain per-agent.
   app.get('/api/v1/agents/:id/learned', (c) => {
     const id = c.req.param('id')
     return c.json({
-      skills: d.db.listAgentSkills?.(id) ?? [],
+      skills: skills().userSkills(),
       lessons: d.db.listAgentLessons?.(id) ?? [],
     })
   })
 
   app.delete('/api/v1/agents/:id/skills/:skillId', (c) => {
     if (!isLocalRequest(c, d)) return err(c, 403, 'forbidden', 'Local host only.')
-    d.db.deleteAgentSkill?.(c.req.param('skillId'))
+    const skillId = c.req.param('skillId')
+    if (isBuiltinSkill(skillId)) return err(c, 400, 'builtin_skill', 'Cannot delete a built-in skill.')
+    skills().delete(skillId)
     return c.json({ ok: true })
   })
 
@@ -134,18 +137,37 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
     const b = await body<{ folder?: string }>(c)
     const folder = b.folder?.trim()
     if (!folder) return err(c, 400, 'invalid_input', 'folder is required.')
-    if ((d.db.countAgentSkills?.(id) ?? 0) >= SKILL_CAP) return err(c, 400, 'skill_cap', `Skill limit reached (${SKILL_CAP}).`)
+    const store = skills()
+    if (store.userSkills().length >= SKILL_CAP) return err(c, 400, 'skill_cap', `Skill limit reached (${SKILL_CAP}).`)
     const taskId = d.agentTasks?.start('skill_from_folder', id, `Learning from ${folder}`)
     void (async () => {
       try {
-        if (taskId) d.agentTasks?.step(taskId, 'Reading the folder + distilling a skill…')
-        const { distillFromFolder } = await import('./distiller')
-        const s = await distillFromFolder(d, folder)
-        if (s.name && s.procedure && !d.db.hasAgentSkillNamed?.(id, s.name)) {
-          d.db.addAgentSkill?.({ agentId: id, name: s.name, description: s.description ?? '', procedure: s.procedure, source: 'folder' })
-          if (taskId) d.agentTasks?.done(taskId, `Learned skill: ${s.name} — ${s.description ?? ''}`)
-        } else if (taskId) {
-          d.agentTasks?.done(taskId, s.name ? `Skill "${s.name}" already known.` : 'No clear reusable skill found in that folder.')
+        if (taskId) d.agentTasks?.step(taskId, 'Reading the folder…')
+        const { distillSkillsFromFolder } = await import('./distiller')
+        // Headroom left under the cap — never exceed it even if the folder has more files.
+        const room = Math.max(0, SKILL_CAP - store.userSkills().length)
+        const distilled = await distillSkillsFromFolder(d, folder, {
+          max: room,
+          onProgress: (done, total, file) => {
+            if (taskId) d.agentTasks?.step(taskId, `Distilling ${done + 1}/${total}: ${file}`)
+          },
+        })
+        const added: string[] = []
+        for (const s of distilled) {
+          if (store.userSkills().length >= SKILL_CAP) break
+          if (!s.name || !s.procedure) continue
+          const skillId = toSkillId(s.name)
+          if (!skillId || store.has(skillId) || isBuiltinSkill(skillId)) continue
+          store.write({ id: skillId, name: s.name, description: s.description ?? '', instructions: s.procedure, tools: [] })
+          added.push(skillId)
+        }
+        if (taskId) {
+          d.agentTasks?.done(
+            taskId,
+            added.length > 0
+              ? `Saved ${added.length} skill${added.length === 1 ? '' : 's'}: ${added.join(', ')}`
+              : 'No new reusable skills found in that folder.',
+          )
         }
       } catch (e) {
         if (taskId) d.agentTasks?.fail(taskId, e instanceof Error ? e.message : 'distill failed')

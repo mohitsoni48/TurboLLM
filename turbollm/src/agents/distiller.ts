@@ -74,33 +74,56 @@ export function distillFromConversation(d: Deps, transcript: { role: string; con
   return distill(d, `A successful completed task:\n\n${text}`)
 }
 
-/** Distill a skill from the files in a folder (the "learn from a folder" feature). Reads up
- *  to ~20 small text files under the folder (the agent's guard already vets the path). */
-export function distillFromFolder(d: Deps, folder: string): Promise<DistilledSkill> {
-  if (!existsSync(folder) || !statSync(folder).isDirectory()) {
-    return Promise.resolve({ name: null, description: null, procedure: null })
-  }
-  const parts: string[] = []
-  let budget = 20_000
-  const TEXT = /\.(md|txt|json|ya?ml|csv|js|ts|py|sh|html?|css)$/i
+const FOLDER_TEXT = /\.(md|txt|json|ya?ml|csv|js|ts|py|sh|html?|css)$/i
+
+/** Collect up to `max` small text files under a folder as {name, content} pairs. */
+function collectFolderFiles(folder: string, max: number): { name: string; content: string }[] {
+  const files: { name: string; content: string }[] = []
   const walk = (dir: string, depth: number): void => {
-    if (depth > 4 || budget <= 0) return
+    if (depth > 4 || files.length >= max) return
     let entries: import('node:fs').Dirent[]
     try { entries = readdirSync(dir, { withFileTypes: true }) } catch { return }
     for (const e of entries) {
-      if (budget <= 0) return
+      if (files.length >= max) return
       const p = join(dir, e.name)
       if (e.isDirectory()) { walk(p, depth + 1); continue }
-      if (!TEXT.test(e.name)) continue
+      if (!FOLDER_TEXT.test(e.name)) continue
       try {
         if (statSync(p).size > 200_000) continue
-        const content = readFileSync(p, 'utf8').slice(0, 4000)
-        parts.push(`### ${e.name}\n${content}`)
-        budget -= content.length
+        const content = readFileSync(p, 'utf8').slice(0, 6000).trim()
+        if (content) files.push({ name: e.name, content })
       } catch { /* skip */ }
     }
   }
   walk(folder, 0)
-  if (!parts.length) return Promise.resolve({ name: null, description: null, procedure: null })
-  return distill(d, `Example files from a folder — learn a reusable skill from their patterns:\n\n${parts.join('\n\n')}`)
+  return files
+}
+
+/**
+ * Learn skills from a folder — ONE skill per file (the "point it at a folder" feature).
+ * A skills library is typically one file per skill, so we distill each file independently
+ * and return every skill that came out clean. Best-effort: files that don't yield a
+ * reusable skill are simply skipped. `onProgress` drives the live bg-task step log.
+ */
+export async function distillSkillsFromFolder(
+  d: Deps,
+  folder: string,
+  opts: { max?: number; onProgress?: (done: number, total: number, file: string) => void } = {},
+): Promise<DistilledSkill[]> {
+  if (!existsSync(folder) || !statSync(folder).isDirectory()) return []
+  const max = opts.max ?? 12
+  const files = collectFolderFiles(folder, max)
+  if (!files.length) return []
+  const out: DistilledSkill[] = []
+  const seen = new Set<string>()
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i]
+    opts.onProgress?.(i, files.length, f.name)
+    const s = await distill(d, `A reusable approach captured in "${f.name}":\n\n${f.content}`)
+    if (s.name && s.procedure && !seen.has(s.name)) {
+      seen.add(s.name)
+      out.push(s)
+    }
+  }
+  return out
 }
