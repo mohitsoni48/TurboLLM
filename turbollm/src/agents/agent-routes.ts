@@ -261,6 +261,7 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
     const conv = d.db.getConversation(convId)
     if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
     if (!conv.agentId) return err(c, 400, 'not_agent', 'Not an agent conversation.')
+    if (conv.completedAt) return err(c, 409, 'completed', 'This task is complete — reopen it to send more messages.')
     const b = await body<{ userMessage?: string }>(c)
     const msg = b.userMessage?.trim()
     if (!msg) return err(c, 400, 'invalid_input', 'userMessage is required.')
@@ -282,6 +283,15 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
     if (!['ask', 'auto', 'bypass', 'read'].includes(b.mode ?? '')) return err(c, 400, 'invalid_input', 'mode must be ask|auto|bypass|read.')
     d.db.setConversationMode(convId, b.mode!)
     return c.json({ ok: true, mode: b.mode })
+  })
+
+  // Reopen a completed (archived) agent conversation so it accepts messages again.
+  app.post('/api/v1/agents/conversations/:convId/reopen', (c) => {
+    const convId = c.req.param('convId')
+    const conv = d.db.getConversation(convId)
+    if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
+    d.db.reopenConversation(convId)
+    return c.json({ ok: true })
   })
 
   app.get('/api/v1/agents/runs', (c) => {

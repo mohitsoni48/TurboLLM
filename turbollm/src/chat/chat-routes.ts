@@ -1311,3 +1311,17 @@ async function autoTitle(
     }
   } catch { /* silently ignore */ }
 }
+
+/** Auto-title a conversation from its persisted transcript (used by agent runs, which
+ *  don't go through the chat message endpoint). No-op unless the title is still default
+ *  and the setting is on. Best-effort. */
+export async function autoTitleFromConversation(d: Deps, convId: string): Promise<void> {
+  const conv = d.db.getConversation(convId, true)
+  if (!conv || conv.title !== 'New chat' || !d.store.snapshot().daemon.autoGenerateTitles) return
+  const target = d.manager.target()
+  if (!target) return
+  const msgs = (conv.messages ?? []).filter((m) => m.content).map((m) => ({ role: m.role, content: m.content }))
+  if (!msgs.length) return
+  const lastAssistant = [...msgs].reverse().find((m) => m.role === 'assistant')
+  await autoTitle(d, convId, msgs.slice(0, -1), typeof lastAssistant?.content === 'string' ? lastAssistant.content : '', target)
+}

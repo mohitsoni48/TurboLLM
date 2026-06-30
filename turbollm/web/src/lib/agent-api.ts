@@ -183,6 +183,11 @@ export async function cancelAgentRun(id: string): Promise<void> {
   await req<{ ok: boolean }>(`/api/v1/agents/runs/${id}`, { method: 'DELETE' })
 }
 
+/** Reopen a completed (archived) agent conversation so it accepts messages again. */
+export function reopenAgentConversation(convId: string): Promise<{ ok: true }> {
+  return req(`/api/v1/agents/conversations/${encodeURIComponent(convId)}/reopen`, { method: 'POST' })
+}
+
 // ── Hitman layer: disposition, doc, track record, archive ──────────────────────
 
 export async function completeRun(id: string): Promise<void> {

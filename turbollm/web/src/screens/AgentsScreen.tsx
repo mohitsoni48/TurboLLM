@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  ArrowDown, Bot, ChevronLeft, ChevronRight, FolderInput, FolderOpen,
+  Archive, ArchiveRestore, ArrowDown, Bot, ChevronLeft, ChevronRight, FolderInput, FolderOpen,
   Pencil, Plus, Search, SendHorizontal, Settings2, Square,
   Trash2, X, CheckCircle2, Sparkles, Loader2, XCircle, Activity,
 } from 'lucide-react'
@@ -12,7 +12,7 @@ import { ApiError } from '../lib/api'
 import {
   agentKeys, fetchAgents, createAgent, updateAgent, deleteAgent,
   learnFromFolder, fetchLearned, deleteLearnedSkill,
-  runAgentTurn, streamAgentRun, setAgentMode, cancelAgentRun, type AgentMode,
+  runAgentTurn, streamAgentRun, setAgentMode, cancelAgentRun, reopenAgentConversation, type AgentMode,
 } from '../lib/agent-api'
 import type { LearnedSkill, LearnedLesson } from '../lib/agent-api'
 import type { AgentType } from '../lib/agent-types'
@@ -57,6 +57,7 @@ interface LiveState {
 function AgentConvSidebar({
   activeId,
   agentConvs,
+  archivedConvs,
   onSelect,
   onNew,
   collapsed,
@@ -66,6 +67,7 @@ function AgentConvSidebar({
 }: {
   activeId: string | null
   agentConvs: Conversation[]
+  archivedConvs: Conversation[]
   onSelect: (id: string) => void
   onNew: () => void
   collapsed: boolean
@@ -75,6 +77,7 @@ function AgentConvSidebar({
 }) {
   const mut = useConversationMutations()
   const qc = useQueryClient()
+  const [showArchived, setShowArchived] = useState(false)
   const searchRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
@@ -150,6 +153,30 @@ function AgentConvSidebar({
             onDelete={handleDelete}
           />
         ))}
+
+        {/* Archived (completed) conversations — collapsed by default */}
+        {archivedConvs.length > 0 && (
+          <div className="mt-2 border-t border-border pt-2">
+            <button
+              type="button"
+              onClick={() => setShowArchived((s) => !s)}
+              className="flex w-full items-center gap-1.5 px-3 py-1.5 text-[11px] font-medium text-faint hover:text-muted"
+            >
+              <ChevronRight size={12} className={cn('transition-transform', showArchived && 'rotate-90')} />
+              <Archive size={12} />
+              Archived ({archivedConvs.length})
+            </button>
+            {showArchived && archivedConvs.map((conv) => (
+              <AgentConvItem
+                key={conv.id}
+                conv={conv}
+                active={conv.id === activeId}
+                onSelect={onSelect}
+                onDelete={handleDelete}
+              />
+            ))}
+          </div>
+        )}
       </div>
     </div>
   )
@@ -863,6 +890,21 @@ export function AgentsScreen() {
     }
   }
 
+  const handleReopen = async () => {
+    if (!activeId) return
+    setCompleting(true)
+    try {
+      await reopenAgentConversation(activeId)
+      void qc.invalidateQueries({ queryKey: ['conversation', activeId] })
+      void qc.invalidateQueries({ queryKey: ['conversations'] })
+      setTimeout(() => inputRef.current?.focus(), 50)
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : 'Could not reopen the task.')
+    } finally {
+      setCompleting(false)
+    }
+  }
+
   // Read-scope attachment handlers
   const [pickerOpen, setPickerOpen] = useState(false)
   const handleAttach = async (path: string) => {
@@ -889,7 +931,10 @@ export function AgentsScreen() {
     staleTime: 0,
     retry: false,
   })
-  const agentConvs = (allConvsQ.data?.conversations ?? []).filter((c) => !!c.agentId)
+  const allAgentConvs = (allConvsQ.data?.conversations ?? []).filter((c) => !!c.agentId)
+  // Completed = archived: hidden from the active list, shown in the Archived section.
+  const agentConvs = allAgentConvs.filter((c) => !c.completedAt)
+  const archivedConvs = allAgentConvs.filter((c) => !!c.completedAt)
 
   // All agents (for picker)
   const agentsQ = useQuery({
@@ -1083,6 +1128,7 @@ export function AgentsScreen() {
         <AgentConvSidebar
           activeId={activeId}
           agentConvs={agentConvs}
+          archivedConvs={archivedConvs}
           onSelect={handleSelect}
           onNew={handleNew}
           collapsed={!sidebarOpen}
@@ -1285,8 +1331,11 @@ export function AgentsScreen() {
         {activeId && !pickingAgent && conv?.agentId && messages.length > 0 && (
           <div className="px-8 pb-1">
             {conv.completedAt ? (
-              <div className="flex items-center gap-1.5 text-[12px] text-muted">
-                <CheckCircle2 size={13} className="text-green-500" /> Task completed
+              <div className="flex items-center gap-2 text-[12px] text-muted">
+                <CheckCircle2 size={13} className="text-green-500" /> Task completed &amp; archived
+                <Button size="sm" variant="outline" disabled={completing} onClick={() => void handleReopen()}>
+                  <ArchiveRestore size={13} /> Reopen
+                </Button>
               </div>
             ) : (
               <div className="flex items-center gap-2">
@@ -1313,14 +1362,16 @@ export function AgentsScreen() {
                     rows={1}
                     className="max-h-40 min-h-9 flex-1 resize-none bg-transparent px-2 py-1.5 text-[15px] text-ink outline-none placeholder:overflow-hidden placeholder:whitespace-nowrap placeholder:text-faint"
                     placeholder={
-                      ready
-                        ? activeAgent
-                          ? `Message ${activeAgent.name}…`
-                          : 'Type a message…'
-                        : 'Load a model to start chatting'
+                      conv?.completedAt
+                        ? 'Task completed — reopen to send more messages'
+                        : ready
+                          ? activeAgent
+                            ? `Message ${activeAgent.name}…`
+                            : 'Type a message…'
+                          : 'Load a model to start chatting'
                     }
                     value={input}
-                    disabled={!ready || !!live || !!editingMsgId}
+                    disabled={!ready || !!live || !!editingMsgId || !!conv?.completedAt}
                     onChange={(e) => { setInput(e.target.value); autoResize() }}
                     onKeyDown={(e) => {
                       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void send() }
@@ -1334,7 +1385,7 @@ export function AgentsScreen() {
                     <Button
                       size="icon"
                       onClick={() => void send()}
-                      disabled={!ready || !input.trim() || !!editingMsgId}
+                      disabled={!ready || !input.trim() || !!editingMsgId || !!conv?.completedAt}
                       aria-label="Send"
                     >
                       <SendHorizontal size={15} />

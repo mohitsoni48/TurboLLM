@@ -774,6 +774,12 @@ export class ConversationStore {
     this.db.prepare(`UPDATE conversations SET completed_at = $now, updated_at = $now WHERE id = $id`).run({ $id: id, $now: now } as P)
   }
 
+  /** Reopen a completed/archived conversation so it accepts messages again. */
+  reopenConversation(id: string): void {
+    const now = new Date().toISOString()
+    this.db.prepare(`UPDATE conversations SET completed_at = NULL, updated_at = $now WHERE id = $id`).run({ $id: id, $now: now } as P)
+  }
+
   /** Replace a conversation's read scope (absolute file/folder paths). */
   setConversationReadScope(id: string, paths: string[]): void {
     const now = new Date().toISOString()

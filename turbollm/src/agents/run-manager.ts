@@ -253,6 +253,9 @@ export class AgentRunManager {
         ac.signal,
       )
       if (assistantMsg) this.d.db.updateMessage(assistantMsg.id, { content: fullContent, stats: { aborted: false } })
+      // Auto-name the thread from its content after the first turn (best-effort; no-op once
+      // titled). Dynamic import avoids a chat-routes ↔ run-manager import cycle.
+      void import('../chat/chat-routes').then((m) => m.autoTitleFromConversation(this.d, pending.convId)).catch(() => {})
       // The run reaches 'done' whether the model called complete_task or just stopped.
       // Disposition (complete/miss → track record) happens via the user's button (§14).
       this.d.db.updateAgentRun?.(pending.id, { status: 'done', endedAt: new Date().toISOString() })
