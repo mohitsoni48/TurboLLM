@@ -98,6 +98,15 @@ export class AgentRunManager {
     })
     if (!run) throw new Error('createAgentRun not available (DB migration pending?)')
 
+    // Create the buffer + emitter NOW (not in processNext) so a client that subscribes to
+    // the stream immediately after launch — before the run becomes active, or while it's
+    // queued behind another — finds them and waits for events instead of getting an
+    // instantly-closed stream.
+    const emitter = new EventEmitter()
+    emitter.setMaxListeners(50)
+    this.buffers.set(run.id, new RunBuffer())
+    this.emitters.set(run.id, emitter)
+
     this.queue.push({ ...params, id: run.id, convId })
     void this.processNext()
     return run.id
@@ -121,8 +130,9 @@ export class AgentRunManager {
     const pending = this.queue.shift()!
     this.active = pending.id
 
-    const buffer = new RunBuffer()
-    const emitter = new EventEmitter()
+    // Reuse the buffer + emitter created at launch (so an early subscriber already has them).
+    const buffer = this.buffers.get(pending.id) ?? new RunBuffer()
+    const emitter = this.emitters.get(pending.id) ?? new EventEmitter()
     emitter.setMaxListeners(50)
     const ac = new AbortController()
 
