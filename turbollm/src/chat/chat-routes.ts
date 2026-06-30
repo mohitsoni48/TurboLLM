@@ -103,13 +103,23 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       const transcript = (conv.messages ?? [])
         .filter((m) => m.content)
         .map((m) => ({ role: m.role, content: m.content }))
-      // Detached — never blocks the response (spec: "run AI later").
+      // Detached — never blocks the response (spec: "run AI later"). Tracked so the UI
+      // can show it inline + in a side panel.
+      const taskId = d.agentTasks?.start('review', agentId, 'Reflecting on this task', conv.id)
       void (async () => {
         try {
+          if (taskId) d.agentTasks?.step(taskId, 'Reviewing the conversation for lessons…')
           const { reviewConversation } = await import('../agents/reviewer')
           const r = await reviewConversation(d, transcript)
-          if (r.lesson) db.addAgentLesson({ agentId, lesson: r.lesson, evidence: r.evidence ?? undefined, convId: conv.id })
-        } catch { /* best-effort */ }
+          if (r.lesson) {
+            db.addAgentLesson({ agentId, lesson: r.lesson, evidence: r.evidence ?? undefined, convId: conv.id })
+            if (taskId) d.agentTasks?.done(taskId, `Learned a lesson: ${r.lesson}`)
+          } else if (taskId) {
+            d.agentTasks?.done(taskId, 'Task went smoothly — nothing new to learn.')
+          }
+        } catch (e) {
+          if (taskId) d.agentTasks?.fail(taskId, e instanceof Error ? e.message : 'review failed')
+        }
       })()
     }
     return c.json({ ok: true, reviewing: !!conv.agentId })
@@ -124,14 +134,21 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     if ((d.db.countAgentSkills?.(conv.agentId) ?? 0) >= 50) return c.json({ error: { code: 'skill_cap', message: 'Skill limit reached (50).' } }, 400)
     const agentId = conv.agentId
     const transcript = (conv.messages ?? []).filter((m) => m.content).map((m) => ({ role: m.role, content: m.content }))
+    const taskId = d.agentTasks?.start('skill_from_conversation', agentId, 'Learning a skill from this conversation', conv.id)
     void (async () => {
       try {
+        if (taskId) d.agentTasks?.step(taskId, 'Distilling a reusable skill…')
         const { distillFromConversation } = await import('../agents/distiller')
         const s = await distillFromConversation(d, transcript)
         if (s.name && s.procedure && !d.db.hasAgentSkillNamed?.(agentId, s.name)) {
           d.db.addAgentSkill?.({ agentId, name: s.name, description: s.description ?? '', procedure: s.procedure, source: 'conversation' })
+          if (taskId) d.agentTasks?.done(taskId, `Learned skill: ${s.name} — ${s.description ?? ''}`)
+        } else if (taskId) {
+          d.agentTasks?.done(taskId, s.name ? `Skill "${s.name}" already known.` : 'No clear reusable skill found.')
         }
-      } catch { /* best-effort */ }
+      } catch (e) {
+        if (taskId) d.agentTasks?.fail(taskId, e instanceof Error ? e.message : 'distill failed')
+      }
     })()
     return c.json({ ok: true, learning: true })
   })

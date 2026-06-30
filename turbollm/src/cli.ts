@@ -27,6 +27,7 @@ import { BenchRunner } from './bench/bench'
 import { ModelRouter } from './gateway/model-router'
 import { ToolRegistry } from './tools/tool-registry'
 import { GenerationGate } from './agents/gate'
+import { AgentTaskState } from './agents/task-state'
 import { launchCli } from './cli-launch'
 import { writePidfile, removePidfile, stopDaemon, resolveDaemonPort } from './daemon-pid'
 import { createApp } from './server'
@@ -246,6 +247,7 @@ const appUpdates = new AppUpdateChecker(version)
 // `requestRestart` is attached after the server is created (it must close over it).
 const deps: Deps = { store, registry, manager, scanner, hashes, db, provision, build, updates, appUpdates, hf, downloads, bench, modelRouter, comfy, tools: toolRegistry, version, startedAt }
 deps.gate = new GenerationGate()
+deps.agentTasks = new AgentTaskState()
 // NOTE: the pi-based AgentRunManager (the deferred Phase-5 swarm machinery) is NOT wired
 // here. The shipped agent feature (redesign Phases 1-4) rides chat's own tool loop and
 // does not use pi — wiring AgentRunManager would bundle pi's cross-spawn (CommonJS

@@ -3,7 +3,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowDown, BookMarked, Bot, ChevronLeft, ChevronRight, FolderInput, FolderOpen,
   Pencil, Plus, Search, SendHorizontal, Settings2, Square,
-  Trash2, X, CheckCircle2, Sparkles,
+  Trash2, X, CheckCircle2, Sparkles, Loader2, XCircle, Activity,
 } from 'lucide-react'
 import { Button } from '../components/ui/button'
 import { toast } from '../components/ui/sonner'
@@ -21,6 +21,7 @@ import {
 } from '../lib/chat-api'
 import { useConversation, useConversationMutations } from '../lib/chat-queries'
 import type { ChatSseEvent, Conversation, LiveToolCall } from '../lib/chat-types'
+import type { AgentTask } from '../lib/types'
 import { MessageBubble, StreamingBubble } from './chat/MessageBubble'
 import { useStatus } from '../lib/queries'
 
@@ -714,6 +715,104 @@ function ManageAgentsPanel({
   )
 }
 
+// ── Background agent task components ─────────────────────────────────────────
+
+function taskIcon(status: AgentTask['status'], size = 13) {
+  if (status === 'running') return <Loader2 size={size} className="animate-spin text-accent shrink-0" />
+  if (status === 'done')    return <CheckCircle2 size={size} className="text-green-500 shrink-0" />
+  return <XCircle size={size} className="text-[color:var(--err)] shrink-0" />
+}
+
+/** Inline row shown per-task inside the active conversation's message area. */
+function AgentTaskRow({ task, onClick }: { task: AgentTask; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="flex w-full items-center gap-2 rounded-lg border border-border bg-panel px-3 py-2 text-left text-[12px] transition-colors hover:border-accent hover:bg-panel-2"
+    >
+      {taskIcon(task.status)}
+      <span className={cn('flex-1 truncate', task.status === 'failed' ? 'text-[color:var(--err)]' : 'text-muted')}>
+        {task.label}
+      </span>
+      {task.status === 'running' && (
+        <span className="shrink-0 text-[11px] text-faint">tap for details</span>
+      )}
+    </button>
+  )
+}
+
+/** Right-side drawer that shows all agent tasks with their step logs. */
+function AgentTasksPanel({
+  tasks,
+  onClose,
+}: {
+  tasks: AgentTask[]
+  onClose: () => void
+}) {
+  // Most recent first
+  const sorted = [...tasks].sort((a, b) => b.startedAt - a.startedAt)
+
+  return (
+    <div className="flex h-full w-80 shrink-0 flex-col border-l border-border bg-panel-2">
+      {/* Panel header */}
+      <div className="flex h-12 items-center justify-between border-b border-border px-4">
+        <div className="flex items-center gap-2">
+          <Activity size={14} className="text-accent" />
+          <span className="text-[13px] font-medium text-ink">Background tasks</span>
+        </div>
+        <Button size="icon" variant="ghost" onClick={onClose} title="Close" className="h-7 w-7">
+          <X size={14} />
+        </Button>
+      </div>
+
+      {/* Task list */}
+      <div className="flex-1 overflow-y-auto">
+        {sorted.length === 0 && (
+          <p className="px-4 py-6 text-[12px] text-faint">No background tasks yet.</p>
+        )}
+        {sorted.map((task) => (
+          <div key={task.id} className="flex flex-col gap-2 border-b border-border px-4 py-3">
+            {/* Task header */}
+            <div className="flex items-center gap-2">
+              {taskIcon(task.status, 14)}
+              <span className={cn(
+                'flex-1 text-[13px] font-medium',
+                task.status === 'failed' ? 'text-[color:var(--err)]' : 'text-ink',
+              )}>
+                {task.label}
+              </span>
+            </div>
+
+            {/* Step log */}
+            {task.steps.length > 0 && (
+              <div className="flex flex-col gap-0.5 rounded-md bg-bg px-3 py-2">
+                {task.steps.map((step, i) => (
+                  <p key={i} className="text-[11px] text-muted leading-relaxed">
+                    {step}
+                  </p>
+                ))}
+              </div>
+            )}
+
+            {/* Result or error */}
+            {task.status === 'done' && task.result && (
+              <p className="text-[12px] text-ink">
+                {task.result}
+              </p>
+            )}
+            {task.status === 'failed' && task.error && (
+              <p className="text-[12px] text-[color:var(--err)]">
+                {task.error}
+              </p>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 // ── Main screen ───────────────────────────────────────────────────────────────
 
 export function AgentsScreen() {
@@ -729,6 +828,7 @@ export function AgentsScreen() {
   const [pickingAgent, setPickingAgent] = useState(false) // show agent picker overlay
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [manageOpen, setManageOpen] = useState(false)
+  const [taskPanelOpen, setTaskPanelOpen] = useState(false)
   const [searchQ, setSearchQ] = useState('')
   const [debouncedQ, setDebouncedQ] = useState('')
 
@@ -986,6 +1086,11 @@ export function AgentsScreen() {
   // Find the agent name for the active conversation
   const activeAgent = conv?.agentId ? agents.find((a) => a.id === conv.agentId) : undefined
 
+  // Background agent tasks from the status poll (no extra fetch needed)
+  const allAgentTasks: AgentTask[] = status?.agentTasks ?? []
+  const convAgentTasks = activeId ? allAgentTasks.filter((t) => t.convId === activeId) : []
+  const runningCount = allAgentTasks.filter((t) => t.status === 'running').length
+
   return (
     <div className="flex h-full overflow-hidden">
       {/* Left: agent conversation sidebar */}
@@ -1027,12 +1132,25 @@ export function AgentsScreen() {
             <span className="text-[13px] text-muted">New conversation</span>
           )}
 
+          {/* Running tasks pill — right side, before manage button */}
+          {runningCount > 0 && (
+            <button
+              type="button"
+              onClick={() => { setTaskPanelOpen((o) => !o); setManageOpen(false) }}
+              className="ml-auto flex items-center gap-1.5 rounded-full border border-border bg-panel px-2.5 py-1 text-[11px] text-accent hover:bg-panel-2 transition-colors"
+              title="Background tasks running"
+            >
+              <Loader2 size={11} className="animate-spin" />
+              {runningCount} working
+            </button>
+          )}
+
           {/* Manage agents toggle — right side */}
           <Button
             size="icon"
             variant="ghost"
-            className={cn('ml-auto h-8 w-8', manageOpen && 'bg-panel-2')}
-            onClick={() => setManageOpen((o) => !o)}
+            className={cn(runningCount > 0 ? 'ml-1' : 'ml-auto', 'h-8 w-8', manageOpen && 'bg-panel-2')}
+            onClick={() => { setManageOpen((o) => !o); setTaskPanelOpen(false) }}
             title="Manage agents"
           >
             <Settings2 size={15} />
@@ -1097,6 +1215,19 @@ export function AgentsScreen() {
                 genTokens={live.genTokens}
                 toolCalls={live.toolCalls}
               />
+            )}
+
+            {/* Inline background task rows (tasks tied to this conversation) */}
+            {convAgentTasks.length > 0 && (
+              <div className="flex flex-col gap-1.5">
+                {convAgentTasks.map((task) => (
+                  <AgentTaskRow
+                    key={task.id}
+                    task={task}
+                    onClick={() => { setTaskPanelOpen(true); setManageOpen(false) }}
+                  />
+                ))}
+              </div>
             )}
           </div>
         </div>
@@ -1187,6 +1318,14 @@ export function AgentsScreen() {
       {/* Right: manage agents panel */}
       {manageOpen && (
         <ManageAgentsPanel onClose={() => setManageOpen(false)} />
+      )}
+
+      {/* Right: background tasks panel */}
+      {taskPanelOpen && (
+        <AgentTasksPanel
+          tasks={allAgentTasks}
+          onClose={() => setTaskPanelOpen(false)}
+        />
       )}
     </div>
   )

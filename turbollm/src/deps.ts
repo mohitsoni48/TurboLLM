@@ -17,6 +17,7 @@ import type { ToolRegistry } from './tools/tool-registry'
 import type { GenerationGate } from './agents/gate'
 import type { AgentRunManager } from './agents/run-manager'
 import type { TunnelManager } from './tunnel/manager'
+import type { AgentTaskState } from './agents/task-state'
 
 export interface Deps {
   store: ConfigStore
@@ -57,6 +58,9 @@ export interface Deps {
    *  under tests. Its presence/active() state is what forces auth enforcement on
    *  tunneled traffic regardless of lanBind (see auth.ts lanAuth). */
   tunnel?: TunnelManager
+  /** Background agent-task registry (reviewer + skill distill). Surfaced via /status
+   *  so the UI can show running bg tasks inline. Optional — absent under tests. */
+  agentTasks?: AgentTaskState
   version: string
   startedAt: number
   /** Re-exec the daemon so config changes (port, LAN bind) take effect (spec 08 §2).

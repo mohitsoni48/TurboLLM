@@ -135,14 +135,21 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
     const folder = b.folder?.trim()
     if (!folder) return err(c, 400, 'invalid_input', 'folder is required.')
     if ((d.db.countAgentSkills?.(id) ?? 0) >= SKILL_CAP) return err(c, 400, 'skill_cap', `Skill limit reached (${SKILL_CAP}).`)
+    const taskId = d.agentTasks?.start('skill_from_folder', id, `Learning from ${folder}`)
     void (async () => {
       try {
+        if (taskId) d.agentTasks?.step(taskId, 'Reading the folder + distilling a skill…')
         const { distillFromFolder } = await import('./distiller')
         const s = await distillFromFolder(d, folder)
         if (s.name && s.procedure && !d.db.hasAgentSkillNamed?.(id, s.name)) {
           d.db.addAgentSkill?.({ agentId: id, name: s.name, description: s.description ?? '', procedure: s.procedure, source: 'folder' })
+          if (taskId) d.agentTasks?.done(taskId, `Learned skill: ${s.name} — ${s.description ?? ''}`)
+        } else if (taskId) {
+          d.agentTasks?.done(taskId, s.name ? `Skill "${s.name}" already known.` : 'No clear reusable skill found in that folder.')
         }
-      } catch { /* best-effort */ }
+      } catch (e) {
+        if (taskId) d.agentTasks?.fail(taskId, e instanceof Error ? e.message : 'distill failed')
+      }
     })()
     return c.json({ ok: true, learning: true })
   })
