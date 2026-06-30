@@ -108,6 +108,37 @@ export async function cancelAgentRun(id: string): Promise<void> {
   await req<{ ok: boolean }>(`/api/v1/agents/runs/${id}`, { method: 'DELETE' })
 }
 
+// ── Hitman layer: disposition, doc, track record, archive ──────────────────────
+
+export async function completeRun(id: string): Promise<void> {
+  await req<{ ok: boolean }>(`/api/v1/agents/runs/${id}/complete`, { method: 'POST' })
+}
+
+export async function flagMiss(id: string, feedback: string): Promise<void> {
+  await req<{ ok: boolean }>(`/api/v1/agents/runs/${id}/flag-miss`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ feedback }),
+  })
+}
+
+export async function fetchRunDoc(id: string): Promise<{ content: string }> {
+  return req<{ content: string }>(`/api/v1/agents/runs/${id}/doc`)
+}
+
+export interface TrackRecord {
+  rows: Array<{ id: string; agentId: string; runId: string; model: string; outcome: 'complete' | 'miss'; feedback?: string; ranAt: string }>
+  modelStats: Array<{ model: string; total: number; complete: number; successRate: number }>
+}
+
+export async function fetchTrackRecord(agentId: string): Promise<TrackRecord> {
+  return req<TrackRecord>(`/api/v1/agents/${agentId}/track-record`)
+}
+
+export async function fetchArchive(agentId: string): Promise<AgentRun[]> {
+  return req<AgentRun[]>(`/api/v1/agents/${agentId}/archive`)
+}
+
 /** Async generator that replays buffered events from `fromSeq` then live-tails. */
 export async function* subscribeRunStream(
   id: string,

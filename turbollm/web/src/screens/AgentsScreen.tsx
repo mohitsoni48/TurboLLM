@@ -4,6 +4,7 @@ import {
   Bot, Plus, Trash2, X, Loader2, Wrench,
   CheckCircle2, XCircle, Clock, CircleDot, BookOpen,
   Play, FolderOpen, UserPlus, Shield, Target,
+  AlertTriangle, FileText, Archive, ChevronDown, ChevronRight, Flag,
 } from 'lucide-react'
 import { cn } from '../lib/utils'
 import { Button } from '../components/ui/button'
@@ -15,8 +16,10 @@ import {
   fetchSkills, saveSkill, deleteSkill,
   fetchAgentRuns, fetchAgentRun, createAgentRun, cancelAgentRun,
   subscribeRunStream,
+  completeRun, flagMiss, fetchRunDoc, fetchTrackRecord, fetchArchive,
 } from '../lib/agent-api'
 import type { AgentType, Skill, AgentRun, AgentRunStatus, AgentToolCall } from '../lib/agent-types'
+import { useStatus } from '../lib/queries'
 
 // ── Status helpers ─────────────────────────────────────────────────────────────
 
@@ -98,9 +101,162 @@ function ToolCallRow({ call }: { call: AgentToolCall | LiveToolCall }) {
   )
 }
 
+// ── Progress doc viewer ────────────────────────────────────────────────────────
+
+function ProgressDoc({ run }: { run: AgentRun }) {
+  const [open, setOpen] = useState(false)
+  const isActive = run.status === 'running' || run.status === 'queued'
+
+  const docQ = useQuery({
+    queryKey: ['run-doc', run.id],
+    queryFn: () => fetchRunDoc(run.id),
+    refetchInterval: isActive ? 5000 : false,
+  })
+
+  const content = docQ.data?.content ?? ''
+  if (!content.trim()) return null
+
+  return (
+    <div className="border-t border-border">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="flex w-full items-center gap-2 px-4 py-2.5 text-left hover:bg-panel-2 transition-colors"
+      >
+        {open ? <ChevronDown size={13} className="shrink-0 text-faint" /> : <ChevronRight size={13} className="shrink-0 text-faint" />}
+        <FileText size={13} className="shrink-0 text-muted" />
+        <span className="text-[12px] font-medium text-muted">Progress doc</span>
+        {isActive && (
+          <span className="ml-auto text-[10px] text-faint">Live</span>
+        )}
+      </button>
+      {open && (
+        <div className="px-4 pb-4">
+          <pre className="slim-scroll max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-panel-2 p-3 text-[12px] leading-relaxed text-muted">
+            {content}
+          </pre>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── Disposition buttons ────────────────────────────────────────────────────────
+
+function DispositionPanel({
+  run,
+  onOpenNewContract,
+}: {
+  run: AgentRun
+  onOpenNewContract: (agentId: string) => void
+}) {
+  const qc = useQueryClient()
+  const [flagOpen, setFlagOpen] = useState(false)
+  const [feedback, setFeedback] = useState('')
+
+  const completeMut = useMutation({
+    mutationFn: () => completeRun(run.id),
+    onSuccess: () => {
+      toast.success('Contract marked complete.')
+      void qc.invalidateQueries({ queryKey: agentRunKeys.list() })
+      void qc.invalidateQueries({ queryKey: agentRunKeys.detail(run.id) })
+    },
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not complete contract.'),
+  })
+
+  const flagMut = useMutation({
+    mutationFn: () => flagMiss(run.id, feedback.trim()),
+    onSuccess: () => {
+      toast.success('Flagged — feedback recorded.')
+      setFlagOpen(false)
+      setFeedback('')
+      void qc.invalidateQueries({ queryKey: agentRunKeys.list() })
+      void qc.invalidateQueries({ queryKey: agentRunKeys.detail(run.id) })
+    },
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not flag miss.'),
+  })
+
+  return (
+    <div className="shrink-0 border-t border-border px-4 py-3">
+      {!flagOpen ? (
+        <div className="flex items-center gap-2">
+          <Button
+            size="sm"
+            disabled={completeMut.isPending}
+            onClick={() => completeMut.mutate()}
+            className="gap-1.5"
+          >
+            {completeMut.isPending
+              ? <Loader2 size={12} className="animate-spin" />
+              : <CheckCircle2 size={12} />}
+            Mark complete
+          </Button>
+
+          {run.agentId && (
+            <button
+              type="button"
+              onClick={() => run.agentId && onOpenNewContract(run.agentId)}
+              className="flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-[12px] text-muted transition-colors hover:border-accent hover:text-ink"
+            >
+              <Play size={12} />
+              Reply
+            </button>
+          )}
+
+          <button
+            type="button"
+            onClick={() => setFlagOpen(true)}
+            className="ml-auto flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-[12px] text-muted transition-colors hover:border-red-400 hover:text-red-500"
+          >
+            <Flag size={12} />
+            Flag miss
+          </button>
+        </div>
+      ) : (
+        <div className="space-y-2">
+          <label className="text-[12px] text-muted">What went wrong? (required)</label>
+          <textarea
+            autoFocus
+            value={feedback}
+            onChange={(e) => setFeedback(e.target.value)}
+            placeholder="Describe the issue with this contract's outcome…"
+            rows={3}
+            className="w-full resize-none rounded-lg border border-border bg-panel-2 px-3 py-2 text-[12px] text-ink placeholder:text-faint focus:border-accent focus:outline-none"
+          />
+          <div className="flex items-center gap-2">
+            <Button
+              size="sm"
+              disabled={!feedback.trim() || flagMut.isPending}
+              onClick={() => flagMut.mutate()}
+              className="gap-1.5"
+              style={{ background: 'color-mix(in srgb, var(--err) 80%, transparent)', color: '#fff' }}
+            >
+              {flagMut.isPending ? <Loader2 size={12} className="animate-spin" /> : <Flag size={12} />}
+              Flag miss
+            </Button>
+            <button
+              type="button"
+              onClick={() => { setFlagOpen(false); setFeedback('') }}
+              className="text-[12px] text-muted hover:text-ink"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── Run detail (streaming) ─────────────────────────────────────────────────────
 
-function RunDetail({ run }: { run: AgentRun }) {
+function RunDetail({
+  run,
+  onOpenNewContract,
+}: {
+  run: AgentRun
+  onOpenNewContract?: (agentId: string) => void
+}) {
   const qc = useQueryClient()
   const abortRef = useRef<AbortController | null>(null)
   const [liveContent, setLiveContent] = useState('')
@@ -153,13 +309,27 @@ function RunDetail({ run }: { run: AgentRun }) {
 
   const messages = run.messages ?? []
   const isActive = run.status === 'running' || run.status === 'queued'
+  const showDisposition =
+    run.status === 'done' &&
+    !run.archivedAt &&
+    !run.completion
 
   return (
     <div className="flex h-full flex-col">
       <div className="flex shrink-0 items-center justify-between border-b border-border px-4 py-2.5">
         <div className="min-w-0 flex-1">
           <p className="truncate text-[14px] font-medium text-ink">{run.title}</p>
-          <StatusBadge status={run.status} />
+          <div className="flex items-center gap-2">
+            <StatusBadge status={run.status} />
+            {run.completion && (
+              <span className={cn(
+                'text-[11px] font-medium',
+                run.completion === 'complete' ? 'text-green-500' : 'text-red-400',
+              )}>
+                {run.completion === 'complete' ? '✓ Complete' : '⚑ Miss'}
+              </span>
+            )}
+          </div>
         </div>
         {isActive && (
           <button
@@ -219,6 +389,78 @@ function RunDetail({ run }: { run: AgentRun }) {
         )}
         <div ref={bottomRef} />
       </div>
+
+      {/* Progress doc — collapsible, above disposition bar */}
+      <ProgressDoc run={run} />
+
+      {/* Disposition buttons — only on finished, non-archived, not-yet-dispositioned runs */}
+      {showDisposition && onOpenNewContract && (
+        <DispositionPanel run={run} onOpenNewContract={onOpenNewContract} />
+      )}
+    </div>
+  )
+}
+
+// ── Track-record warning ───────────────────────────────────────────────────────
+
+function TrackRecordWarning({ agentId }: { agentId: string }) {
+  const statusQ = useStatus()
+  const currentModel = statusQ.data?.model?.key
+
+  const trQ = useQuery({
+    queryKey: ['track-record', agentId],
+    queryFn: () => fetchTrackRecord(agentId),
+    enabled: !!agentId,
+    staleTime: 30_000,
+  })
+
+  if (!trQ.data || !agentId) return null
+
+  const stats = trQ.data.modelStats
+  // Only warn when there is data to be meaningful (>= 5 contracts)
+  const qualified = stats.filter((s) => s.total >= 5)
+  if (qualified.length === 0) return null
+
+  const currentStats = currentModel ? qualified.find((s) => s.model === currentModel) : null
+  const bestStats = qualified.reduce((best, s) => (s.successRate > best.successRate ? s : best), qualified[0])
+
+  const showCurrentWarn = currentStats && currentStats.successRate < 0.6
+  const showBestSuggest = bestStats && (!currentStats || bestStats.model !== currentModel) && bestStats.successRate > (currentStats?.successRate ?? 0)
+
+  if (!showCurrentWarn && !showBestSuggest) return null
+
+  return (
+    <div className="mt-3 space-y-1.5">
+      {showCurrentWarn && currentStats && (
+        <div className="flex items-start gap-2 rounded-lg border px-3 py-2 text-[12px]"
+          style={{
+            borderColor: 'color-mix(in srgb, var(--warn, #f59e0b) 40%, transparent)',
+            background: 'color-mix(in srgb, var(--warn, #f59e0b) 10%, transparent)',
+            color: 'color-mix(in srgb, var(--warn, #f59e0b) 90%, var(--ink))',
+          }}
+        >
+          <AlertTriangle size={13} className="mt-0.5 shrink-0" />
+          <span>
+            <span className="font-medium">{currentStats.model}</span> has a{' '}
+            {Math.round(currentStats.successRate * 100)}% success rate on this hitman ({currentStats.complete}/{currentStats.total}).{' '}
+            Consider a different model.
+          </span>
+        </div>
+      )}
+      {showBestSuggest && bestStats && (
+        <div className="flex items-start gap-2 rounded-lg border px-3 py-2 text-[12px]"
+          style={{
+            borderColor: 'color-mix(in srgb, var(--ok, #22c55e) 40%, transparent)',
+            background: 'color-mix(in srgb, var(--ok, #22c55e) 10%, transparent)',
+            color: 'color-mix(in srgb, var(--ok, #22c55e) 90%, var(--ink))',
+          }}
+        >
+          <CheckCircle2 size={13} className="mt-0.5 shrink-0" />
+          <span>
+            <span className="font-medium">{bestStats.model}</span> performs best ({Math.round(bestStats.successRate * 100)}%).
+          </span>
+        </div>
+      )}
     </div>
   )
 }
@@ -227,14 +469,16 @@ function RunDetail({ run }: { run: AgentRun }) {
 
 function NewContractDialog({
   agents,
+  initialAgentId,
   onClose,
   onCreated,
 }: {
   agents: AgentType[]
+  initialAgentId?: string
   onClose: () => void
   onCreated: (id: string) => void
 }) {
-  const [agentId, setAgentId] = useState(agents[0]?.id ?? '')
+  const [agentId, setAgentId] = useState(initialAgentId ?? agents[0]?.id ?? '')
   const [task, setTask] = useState('')
   const qc = useQueryClient()
 
@@ -282,7 +526,10 @@ function NewContractDialog({
           ))}
         </select>
 
-        <label className="mb-1 block text-[12px] text-muted">Task</label>
+        {/* Track-record warning appears once an agent is selected */}
+        {agentId && <TrackRecordWarning agentId={agentId} />}
+
+        <label className="mb-1 mt-3 block text-[12px] text-muted">Task</label>
         <textarea
           autoFocus
           value={task}
@@ -314,11 +561,91 @@ function NewContractDialog({
   )
 }
 
+// ── Archived contracts list ────────────────────────────────────────────────────
+
+function ArchivedContracts({
+  agents,
+  onSelect,
+}: {
+  agents: AgentType[]
+  onSelect: (run: AgentRun) => void
+}) {
+  const [agentId, setAgentId] = useState(agents[0]?.id ?? '')
+
+  const archiveQ = useQuery({
+    queryKey: ['archive', agentId],
+    queryFn: () => fetchArchive(agentId),
+    enabled: !!agentId,
+  })
+
+  const runs = archiveQ.data ?? []
+
+  return (
+    <div className="flex h-full flex-col">
+      {/* Agent picker */}
+      <div className="shrink-0 border-b border-border px-3 py-2">
+        <select
+          value={agentId}
+          onChange={(e) => setAgentId(e.target.value)}
+          className="w-full rounded-lg border border-border bg-panel-2 px-2.5 py-1.5 text-[12px] text-ink focus:border-accent focus:outline-none"
+        >
+          {agents.map((a) => (
+            <option key={a.id} value={a.id}>{a.name}</option>
+          ))}
+        </select>
+      </div>
+
+      <div className="slim-scroll flex-1 overflow-y-auto">
+        {archiveQ.isLoading && (
+          <div className="flex h-20 items-center justify-center">
+            <Loader2 size={16} className="animate-spin text-faint" />
+          </div>
+        )}
+        {!archiveQ.isLoading && runs.length === 0 && (
+          <div className="px-4 py-8 text-center">
+            <Archive size={24} className="mx-auto mb-2 text-faint" />
+            <p className="text-[12px] text-muted">No archived contracts.</p>
+          </div>
+        )}
+        {runs.map((run) => (
+          <button
+            key={run.id}
+            type="button"
+            onClick={() => onSelect(run)}
+            className="w-full border-b border-border px-3 py-2.5 text-left transition-colors hover:bg-panel-2"
+          >
+            <p className="mb-0.5 truncate text-[13px] font-medium text-ink">{run.title}</p>
+            <div className="flex items-center justify-between">
+              <StatusBadge status={run.status} />
+              <div className="flex items-center gap-1.5">
+                {run.completion && (
+                  <span className={cn(
+                    'text-[10px] font-medium',
+                    run.completion === 'complete' ? 'text-green-500' : 'text-red-400',
+                  )}>
+                    {run.completion === 'complete' ? '✓' : '⚑'}
+                  </span>
+                )}
+                <span className="text-[10px] text-faint">{relTime(run.archivedAt ?? run.updatedAt)}</span>
+              </div>
+            </div>
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 // ── Contracts tab ──────────────────────────────────────────────────────────────
+
+type ContractView = 'active' | 'archived'
 
 function ContractsTab({ agents }: { agents: AgentType[] }) {
   const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [selectedArchiveRun, setSelectedArchiveRun] = useState<AgentRun | null>(null)
   const [showNew, setShowNew] = useState(false)
+  const [newContractAgentId, setNewContractAgentId] = useState<string | undefined>()
+  const [view, setView] = useState<ContractView>('active')
 
   const runsQ = useQuery({
     queryKey: agentRunKeys.list(),
@@ -332,7 +659,7 @@ function ContractsTab({ agents }: { agents: AgentType[] }) {
   const detailQ = useQuery({
     queryKey: agentRunKeys.detail(selectedId ?? ''),
     queryFn: () => fetchAgentRun(selectedId!),
-    enabled: !!selectedId,
+    enabled: !!selectedId && view === 'active',
     refetchInterval: (q) => {
       const r = q.state.data
       return (r?.status === 'queued' || r?.status === 'running') ? 5000 : false
@@ -343,78 +670,148 @@ function ContractsTab({ agents }: { agents: AgentType[] }) {
   const selected = detailQ.data
   const agentMap: Record<string, string> = Object.fromEntries(agents.map((a) => [a.id, a.name]))
 
+  const handleOpenNewContract = (agentId: string) => {
+    setNewContractAgentId(agentId)
+    setShowNew(true)
+  }
+
+  const handleSelectArchiveRun = (run: AgentRun) => {
+    setSelectedArchiveRun(run)
+  }
+
   return (
     <div className="flex h-full">
       {/* Sidebar */}
       <div className="flex w-64 shrink-0 flex-col border-r border-border">
+        {/* Header with view toggle */}
         <div className="flex shrink-0 items-center justify-between border-b border-border px-3 py-2.5">
-          <span className="text-[13px] font-semibold text-ink">Contracts</span>
-          <Button size="sm" onClick={() => setShowNew(true)} className="h-6 px-2 text-[11px]">
-            <Plus size={11} /> New
-          </Button>
-        </div>
-
-        <div className="slim-scroll flex-1 overflow-y-auto">
-          {runsQ.isLoading && (
-            <div className="flex h-20 items-center justify-center">
-              <Loader2 size={16} className="animate-spin text-faint" />
-            </div>
-          )}
-          {!runsQ.isLoading && runs.length === 0 && (
-            <div className="px-4 py-8 text-center">
-              <Target size={24} className="mx-auto mb-2 text-faint" />
-              <p className="text-[12px] text-muted">No contracts yet.</p>
-              <p className="mt-0.5 text-[11px] text-faint">Click "New" to assign a task.</p>
-            </div>
-          )}
-          {runs.map((run) => (
+          <div className="flex items-center gap-0.5 rounded-lg border border-border bg-panel-2 p-0.5">
             <button
-              key={run.id}
               type="button"
-              onClick={() => setSelectedId(run.id)}
+              onClick={() => { setView('active'); setSelectedArchiveRun(null) }}
               className={cn(
-                'w-full border-b border-border px-3 py-2.5 text-left transition-colors hover:bg-panel-2',
-                selectedId === run.id && 'bg-panel-2',
+                'rounded-md px-2.5 py-1 text-[11px] font-medium transition-colors',
+                view === 'active' ? 'bg-panel text-ink shadow-sm' : 'text-muted hover:text-ink',
               )}
             >
-              <p className="mb-0.5 truncate text-[13px] font-medium text-ink">{run.title}</p>
-              {run.agentId && agentMap[run.agentId] && (
-                <p className="mb-0.5 truncate text-[11px] text-faint">{agentMap[run.agentId]}</p>
-              )}
-              <div className="flex items-center justify-between">
-                <StatusBadge status={run.status} />
-                <span className="text-[10px] text-faint">{relTime(run.createdAt)}</span>
-              </div>
+              Active
             </button>
-          ))}
+            <button
+              type="button"
+              onClick={() => { setView('archived'); setSelectedId(null) }}
+              className={cn(
+                'flex items-center gap-1 rounded-md px-2.5 py-1 text-[11px] font-medium transition-colors',
+                view === 'archived' ? 'bg-panel text-ink shadow-sm' : 'text-muted hover:text-ink',
+              )}
+            >
+              <Archive size={10} />
+              Archived
+            </button>
+          </div>
+          {view === 'active' && (
+            <Button size="sm" onClick={() => { setNewContractAgentId(undefined); setShowNew(true) }} className="h-6 px-2 text-[11px]">
+              <Plus size={11} /> New
+            </Button>
+          )}
         </div>
+
+        {view === 'active' ? (
+          <div className="slim-scroll flex-1 overflow-y-auto">
+            {runsQ.isLoading && (
+              <div className="flex h-20 items-center justify-center">
+                <Loader2 size={16} className="animate-spin text-faint" />
+              </div>
+            )}
+            {!runsQ.isLoading && runs.length === 0 && (
+              <div className="px-4 py-8 text-center">
+                <Target size={24} className="mx-auto mb-2 text-faint" />
+                <p className="text-[12px] text-muted">No contracts yet.</p>
+                <p className="mt-0.5 text-[11px] text-faint">Click "New" to assign a task.</p>
+              </div>
+            )}
+            {runs.map((run) => (
+              <button
+                key={run.id}
+                type="button"
+                onClick={() => setSelectedId(run.id)}
+                className={cn(
+                  'w-full border-b border-border px-3 py-2.5 text-left transition-colors hover:bg-panel-2',
+                  selectedId === run.id && 'bg-panel-2',
+                )}
+              >
+                <p className="mb-0.5 truncate text-[13px] font-medium text-ink">{run.title}</p>
+                {run.agentId && agentMap[run.agentId] && (
+                  <p className="mb-0.5 truncate text-[11px] text-faint">{agentMap[run.agentId]}</p>
+                )}
+                <div className="flex items-center justify-between">
+                  <StatusBadge status={run.status} />
+                  <div className="flex items-center gap-1.5">
+                    {run.completion && (
+                      <span className={cn(
+                        'text-[10px] font-medium',
+                        run.completion === 'complete' ? 'text-green-500' : 'text-red-400',
+                      )}>
+                        {run.completion === 'complete' ? '✓' : '⚑'}
+                      </span>
+                    )}
+                    <span className="text-[10px] text-faint">{relTime(run.createdAt)}</span>
+                  </div>
+                </div>
+              </button>
+            ))}
+          </div>
+        ) : (
+          <ArchivedContracts
+            agents={agents}
+            onSelect={handleSelectArchiveRun}
+          />
+        )}
       </div>
 
       {/* Detail pane */}
       <div className="flex min-w-0 flex-1 flex-col">
-        {!selectedId ? (
-          <div className="flex h-full flex-col items-center justify-center text-center">
-            <CircleDot size={32} className="mb-3 text-faint" />
-            <p className="text-[14px] font-medium text-ink">Select a contract</p>
-            <p className="mt-1 text-[12px] text-muted">or assign a new task to an agent</p>
-            <Button className="mt-4" size="sm" onClick={() => setShowNew(true)}>
-              <Play size={13} /> New contract
-            </Button>
-          </div>
-        ) : detailQ.isLoading ? (
-          <div className="flex h-full items-center justify-center">
-            <Loader2 size={20} className="animate-spin text-faint" />
-          </div>
-        ) : selected ? (
-          <RunDetail run={selected} />
-        ) : null}
+        {view === 'active' && (
+          <>
+            {!selectedId ? (
+              <div className="flex h-full flex-col items-center justify-center text-center">
+                <CircleDot size={32} className="mb-3 text-faint" />
+                <p className="text-[14px] font-medium text-ink">Select a contract</p>
+                <p className="mt-1 text-[12px] text-muted">or assign a new task to an agent</p>
+                <Button className="mt-4" size="sm" onClick={() => { setNewContractAgentId(undefined); setShowNew(true) }}>
+                  <Play size={13} /> New contract
+                </Button>
+              </div>
+            ) : detailQ.isLoading ? (
+              <div className="flex h-full items-center justify-center">
+                <Loader2 size={20} className="animate-spin text-faint" />
+              </div>
+            ) : selected ? (
+              <RunDetail run={selected} onOpenNewContract={handleOpenNewContract} />
+            ) : null}
+          </>
+        )}
+
+        {view === 'archived' && (
+          <>
+            {!selectedArchiveRun ? (
+              <div className="flex h-full flex-col items-center justify-center text-center">
+                <Archive size={32} className="mb-3 text-faint" />
+                <p className="text-[14px] font-medium text-ink">Select an archived contract</p>
+                <p className="mt-1 text-[12px] text-muted">Archived contracts are read-only</p>
+              </div>
+            ) : (
+              <RunDetail run={selectedArchiveRun} />
+            )}
+          </>
+        )}
       </div>
 
       {showNew && (
         <NewContractDialog
           agents={agents}
-          onClose={() => setShowNew(false)}
-          onCreated={(id) => { setSelectedId(id); void runsQ.refetch() }}
+          initialAgentId={newContractAgentId}
+          onClose={() => { setShowNew(false); setNewContractAgentId(undefined) }}
+          onCreated={(id) => { setSelectedId(id); setView('active'); void runsQ.refetch() }}
         />
       )}
     </div>

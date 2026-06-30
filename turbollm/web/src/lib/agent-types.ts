@@ -38,6 +38,8 @@ export interface AgentRun {
   updatedAt: string
   startedAt?: string
   endedAt?: string
+  archivedAt?: string
+  completion?: 'complete' | 'miss'
   messages?: AgentMessage[]
 }
 
