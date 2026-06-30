@@ -93,6 +93,8 @@ export interface Conversation {
   agentId?: string
   /** Set when the user marks the agent task complete. Null = in progress. */
   completedAt?: string
+  /** Files/folders attached to this chat that the bound agent may read (chat-bound scope). */
+  readScope?: string[]
   createdAt: string
   updatedAt: string
   messages?: Message[]

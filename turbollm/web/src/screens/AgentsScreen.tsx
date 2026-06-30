@@ -18,6 +18,7 @@ import type { AgentType } from '../lib/agent-types'
 import {
   createConversation, listConversations, sendMessage, stopGeneration,
   completeConversation, reflectCompleteConversation,
+  addReadScope, removeReadScope,
 } from '../lib/chat-api'
 import { useConversation, useConversationMutations } from '../lib/chat-queries'
 import type { ChatSseEvent, Conversation, LiveToolCall } from '../lib/chat-types'
@@ -25,6 +26,7 @@ import { appendTextDelta, upsertToolCall, type LiveBlock } from '../lib/live-tim
 import type { AgentTask } from '../lib/types'
 import { MessageBubble, StreamingBubble } from './chat/MessageBubble'
 import { useStatus } from '../lib/queries'
+import { FsBrowser } from './engines/FsBrowser'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -280,7 +282,6 @@ interface AgentFormState {
   description: string
   systemPrompt: string
   skills: string[]
-  readRoots: string
 }
 
 const emptyForm = (): AgentFormState => ({
@@ -288,7 +289,6 @@ const emptyForm = (): AgentFormState => ({
   description: '',
   systemPrompt: '',
   skills: [],
-  readRoots: '',
 })
 
 function agentToForm(a: AgentType): AgentFormState {
@@ -297,7 +297,6 @@ function agentToForm(a: AgentType): AgentFormState {
     description: a.description,
     systemPrompt: a.systemPrompt ?? '',
     skills: a.skills,
-    readRoots: a.readRoots.join('\n'),
   }
 }
 
@@ -468,7 +467,8 @@ function ManageAgentsPanel({
         description: form.description.trim(),
         systemPrompt: form.systemPrompt.trim() || undefined,
         skills: form.skills,
-        readRoots: form.readRoots.split('\n').map((l) => l.trim()).filter(Boolean),
+        // Read access is per-conversation now; agents carry no read roots.
+        readRoots: [],
       }
       if (editingId === 'new') {
         await createAgent(payload)
@@ -590,33 +590,8 @@ function ManageAgentsPanel({
               ))}
             </div>
 
-            {/* Read folders */}
-            <div className="flex flex-col gap-1.5">
-              <label className="flex items-center gap-1.5 text-[12px] font-medium text-muted">
-                <FolderOpen size={13} />
-                Read-access folders
-              </label>
-              <textarea
-                rows={3}
-                className="resize-none rounded-md border border-border bg-bg px-3 py-1.5 font-mono text-[12px] text-ink outline-none focus:border-accent placeholder:text-faint"
-                placeholder={'/home/user/docs\n/home/user/projects'}
-                value={form.readRoots}
-                onChange={(e) => setForm((f) => ({ ...f, readRoots: e.target.value }))}
-              />
-              <p className="text-[11px] text-faint">One absolute path per line.</p>
-            </div>
-
-            {/* Write folder — read-only */}
-            <div className="flex flex-col gap-1.5">
-              <label className="flex items-center gap-1.5 text-[12px] font-medium text-muted">
-                <FolderOpen size={13} />
-                Write folder
-              </label>
-              <div className="rounded-md border border-border bg-panel px-3 py-1.5 font-mono text-[12px] text-faint select-none">
-                ~/.turbollm
-              </div>
-              <p className="text-[11px] text-faint">Writes go to TurboLLM's data folder — not configurable.</p>
-            </div>
+            {/* Read access is per-conversation (attach a file/folder in the chat), and
+                writes always go to ~/.turbollm — neither is configured here. */}
 
             {/* Learned skills + lessons — only for existing agents */}
             {editingId !== 'new' && (
@@ -872,6 +847,19 @@ export function AgentsScreen() {
     } finally {
       setCompleting(false)
     }
+  }
+
+  // Read-scope attachment handlers
+  const [pickerOpen, setPickerOpen] = useState(false)
+  const handleAttach = async (path: string) => {
+    if (!activeId) return
+    try { await addReadScope(activeId, path); void qc.invalidateQueries({ queryKey: ['conversation', activeId] }) }
+    catch (e) { toast.error(e instanceof ApiError ? e.message : 'Could not attach that path.') }
+  }
+  const handleDetach = async (path: string) => {
+    if (!activeId) return
+    try { await removeReadScope(activeId, path); void qc.invalidateQueries({ queryKey: ['conversation', activeId] }) }
+    catch (e) { toast.error(e instanceof ApiError ? e.message : 'Could not remove that path.') }
   }
 
   // Debounce search
@@ -1227,6 +1215,45 @@ export function AgentsScreen() {
           </button>
         )}
 
+        {/* Read-scope attachment bar — agent conversations only */}
+        {activeId && !pickingAgent && conv?.agentId && (() => {
+          const baseName = (p: string) => p.split(/[\\/]/).filter(Boolean).pop() || p
+          const scope = conv.readScope ?? []
+          return (
+            <div className="px-8 pb-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="flex items-center gap-1 text-[12px] text-muted">
+                  <FolderOpen size={13} />
+                  Files the agent can read
+                </span>
+                {scope.length === 0 && (
+                  <span className="text-[11px] text-faint">No files attached — the agent can&apos;t read from disk yet.</span>
+                )}
+                {scope.map((p) => (
+                  <span
+                    key={p}
+                    title={p}
+                    className="inline-flex items-center gap-1 rounded-md border border-border bg-panel px-2 py-1 text-[12px]"
+                  >
+                    {baseName(p)}
+                    <button
+                      type="button"
+                      aria-label="Remove"
+                      onClick={() => void handleDetach(p)}
+                      className="text-faint hover:text-[color:var(--err)]"
+                    >
+                      <X size={11} />
+                    </button>
+                  </span>
+                ))}
+                <Button size="sm" variant="outline" onClick={() => setPickerOpen(true)}>
+                  <Plus size={13} /> Add file/folder
+                </Button>
+              </div>
+            </div>
+          )
+        })()}
+
         {/* Completion bar (agent task) — above the composer */}
         {activeId && !pickingAgent && conv?.agentId && messages.length > 0 && (
           <div className="px-8 pb-1">
@@ -1295,6 +1322,16 @@ export function AgentsScreen() {
           </div>
         )}
       </div>
+
+      {/* File/folder picker for read-scope attachment */}
+      <FsBrowser
+        open={pickerOpen}
+        onOpenChange={setPickerOpen}
+        mode="any"
+        title="Attach a file or folder"
+        description="Pick a file, or open a folder and click 'Select this folder'. The agent can read within it. Limited to your home directory."
+        onSelect={(path) => handleAttach(path)}
+      />
 
       {/* Right: manage agents panel */}
       {manageOpen && (

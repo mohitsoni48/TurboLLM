@@ -25,11 +25,16 @@ export function FsBrowser({
   onOpenChange,
   onSelect,
   mode = 'file',
+  title,
+  description,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
   onSelect: (path: string) => void
-  mode?: 'file' | 'folder'
+  /** 'file' = click a file to pick; 'folder' = pick the current dir; 'any' = either. */
+  mode?: 'file' | 'folder' | 'any'
+  title?: string
+  description?: string
 }) {
   // null = the daemon's home dir (server default); a string = an explicit dir.
   const [path, setPath] = useState<string | null>(null)
@@ -49,9 +54,9 @@ export function FsBrowser({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-lg">
         <DialogHeader>
-          <DialogTitle>{mode === 'folder' ? 'Choose engine folder' : 'Browse for binary'}</DialogTitle>
+          <DialogTitle>{title ?? (mode === 'folder' ? 'Choose engine folder' : 'Browse for binary')}</DialogTitle>
           <DialogDescription>
-            {mode === 'folder' ? (
+            {description ? description : mode === 'folder' ? (
               <>
                 Open the folder that contains your engine build, then click{' '}
                 <span className="font-medium text-ink">Select this folder</span>. We&apos;ll scan it
@@ -125,7 +130,7 @@ export function FsBrowser({
                       <FileIcon size={16} className={inert ? 'shrink-0 text-faint' : 'shrink-0 text-muted'} />
                     )}
                     <span className="min-w-0 flex-1 truncate font-mono">{truncateMiddle(e.name, 48)}</span>
-                    {mode === 'file' && !e.isDir && <span className="shrink-0 text-[11px] text-muted">Select</span>}
+                    {mode !== 'folder' && !e.isDir && <span className="shrink-0 text-[11px] text-muted">Select</span>}
                   </button>
                 </li>
               )
@@ -137,7 +142,7 @@ export function FsBrowser({
           <Button variant="outline" onClick={() => onOpenChange(false)}>
             Cancel
           </Button>
-          {mode === 'folder' && (
+          {mode !== 'file' && (
             <Button onClick={() => data?.path && choose(data.path)} disabled={!data?.path || isFetching}>
               <Check size={16} /> Select this folder
             </Button>

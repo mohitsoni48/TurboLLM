@@ -43,6 +43,16 @@ export function getConversation(id: string): Promise<Conversation> {
   return req(`/api/v1/conversations/${encodeURIComponent(id)}`)
 }
 
+/** Attach a file/folder to a conversation's read scope (chat-bound read access). */
+export function addReadScope(id: string, path: string): Promise<{ ok: true; readScope: string[] }> {
+  return req(`/api/v1/conversations/${encodeURIComponent(id)}/read-scope`, { method: 'POST', json: { path } })
+}
+
+/** Remove a path from a conversation's read scope. */
+export function removeReadScope(id: string, path: string): Promise<{ ok: true; readScope: string[] }> {
+  return req(`/api/v1/conversations/${encodeURIComponent(id)}/read-scope`, { method: 'DELETE', json: { path } })
+}
+
 export function updateConversation(id: string, patch: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'sampling'>>): Promise<Conversation> {
   return req(`/api/v1/conversations/${encodeURIComponent(id)}`, { method: 'PATCH', json: patch })
 }

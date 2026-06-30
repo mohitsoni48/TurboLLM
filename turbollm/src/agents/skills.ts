@@ -65,21 +65,27 @@ export function toSkillMd(skill: Pick<Skill, 'name' | 'description' | 'instructi
   return `---\n${fm.join('\n')}\n---\n\n${skill.instructions.trim()}\n`
 }
 
-/** Parse a SKILL.md back into a skill (id supplied by the caller from the folder name). */
-export function fromSkillMd(id: string, text: string): Skill | null {
+/** Parse a SKILL.md back into a skill (id supplied by the caller from the folder name).
+ *  Tolerant of CRLF line endings, a leading BOM, and quoted frontmatter values. */
+export function fromSkillMd(id: string, raw: string): Skill | null {
+  const text = raw.replace(/^﻿/, '').replace(/\r\n/g, '\n')
   const m = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(text)
   if (!m) return null
   const meta: Record<string, string> = {}
   for (const line of m[1].split('\n')) {
     const c = line.indexOf(':')
     if (c < 0) continue
-    meta[line.slice(0, c).trim().toLowerCase()] = line.slice(c + 1).trim()
+    meta[line.slice(0, c).trim().toLowerCase()] = unquote(line.slice(c + 1).trim())
   }
   const name = meta.name?.trim()
   const instructions = m[2].trim()
   if (!name || !instructions) return null
-  const tools = meta.tools ? meta.tools.split(',').map((t) => t.trim()).filter(Boolean) : []
+  const tools = meta.tools ? meta.tools.split(',').map((t) => unquote(t.trim())).filter(Boolean) : []
   return { id, name, description: meta.description ?? '', instructions, tools, builtin: false }
+}
+
+function unquote(s: string): string {
+  return s.replace(/^["']|["']$/g, '').trim()
 }
 
 function oneLine(s: string): string {
@@ -151,6 +157,52 @@ export class SkillStore {
 }
 export function isBuiltinSkill(id: string): boolean {
   return BUILTIN_SKILLS.some((s) => s.id === id)
+}
+
+/**
+ * Import existing SKILL.md skills from a folder VERBATIM (skill-creator libraries are
+ * `<name>/SKILL.md`). Preserves each skill's folder name + frontmatter — no LLM, no
+ * renaming. Returns the result so the caller can report it. Skills already in the library
+ * are skipped (never clobbered).
+ */
+export function importSkillsFromFolder(
+  store: SkillStore,
+  folder: string,
+  opts: { max?: number; onProgress?: (id: string) => void } = {},
+): { imported: string[]; skipped: string[] } {
+  const imported: string[] = []
+  const skipped: string[] = []
+  if (!existsSync(folder)) return { imported, skipped }
+  const max = opts.max ?? 200
+  const found: { id: string; text: string }[] = []
+  const walk = (dir: string, depth: number): void => {
+    if (depth > 5 || found.length >= max) return
+    let entries: import('node:fs').Dirent[]
+    try { entries = readdirSync(dir, { withFileTypes: true }) } catch { return }
+    // A SKILL.md in this dir → this dir IS a skill; its folder name is the id. A skill is
+    // a leaf — don't descend into it (its references/ may hold example SKILL.md files).
+    const skillFile = entries.find((e) => e.isFile() && e.name.toLowerCase() === 'skill.md')
+    if (skillFile) {
+      const id = toSkillId(dir.split(/[\\/]/).pop() || 'skill')
+      try { found.push({ id, text: readFileSync(join(dir, skillFile.name), 'utf8') }) } catch { /* skip */ }
+      return
+    }
+    for (const e of entries) {
+      if (found.length >= max) return
+      if (e.isDirectory() && !e.name.startsWith('.')) walk(join(dir, e.name), depth + 1)
+    }
+  }
+  walk(folder, 0)
+  for (const f of found) {
+    if (!isValidSkillId(f.id) || isBuiltinSkill(f.id)) continue
+    if (store.has(f.id)) { skipped.push(f.id); continue }
+    const parsed = fromSkillMd(f.id, f.text)
+    if (!parsed) { skipped.push(f.id); continue }
+    store.write({ id: f.id, name: parsed.name, description: parsed.description, instructions: parsed.instructions, tools: parsed.tools })
+    imported.push(f.id)
+    opts.onProgress?.(f.id)
+  }
+  return { imported, skipped }
 }
 
 /** A skill id must be safe to use as a folder name: kebab-case only, no separators,

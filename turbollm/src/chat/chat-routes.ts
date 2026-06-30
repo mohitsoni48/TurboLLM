@@ -1,7 +1,9 @@
 // Chat API routes (spec 07). Conversations CRUD + SSE streaming send + message actions.
 import type { Context, Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
-import { networkInterfaces } from 'node:os'
+import { networkInterfaces, homedir } from 'node:os'
+import { existsSync, realpathSync } from 'node:fs'
+import { resolve } from 'node:path'
 import type { Deps } from '../deps'
 import { clampMaxTokens } from '../config/config'
 import { engineModelAlias } from '../engines/compat'
@@ -136,6 +138,39 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // Same background skill author the in-chat save_skill tool uses (skill-creator model).
     const taskId = saveSkillFromConversation(d, conv.id)
     return c.json({ ok: true, learning: !!taskId })
+  })
+
+  // ── Per-conversation read scope (spec 13 redesign) ──────────────────────────
+  // Read access is chat-bound: the user attaches a file/folder (via the picker) and the
+  // bound agent may read within it. Home-confined, mirrors the /fs/browse boundary.
+  const homeReal = (() => { try { return realpathSync(homedir()) } catch { return homedir() } })()
+  const withinHome = (p: string): boolean => {
+    const h = homeReal.toLowerCase().replace(/[\\/]+$/, '')
+    const t = p.toLowerCase().replace(/[\\/]+$/, '')
+    return t === h || t.startsWith(h + '/') || t.startsWith(h + '\\')
+  }
+  app.post('/api/v1/conversations/:id/read-scope', async (c) => {
+    const conv = db.getConversation(c.req.param('id'))
+    if (!conv) return c.json({ error: { code: 'not_found', message: 'Conversation not found.' } }, 404)
+    const b = await body<{ path?: string }>(c)
+    const raw = b.path?.trim()
+    if (!raw) return c.json({ error: { code: 'invalid_input', message: 'path is required.' } }, 400)
+    const abs = resolve(raw)
+    if (!existsSync(abs)) return c.json({ error: { code: 'not_found', message: 'That file or folder does not exist.' } }, 400)
+    let real: string
+    try { real = realpathSync(abs) } catch { real = abs }
+    if (!withinHome(real)) return c.json({ error: { code: 'forbidden', message: 'Only paths inside your home folder can be attached.' } }, 403)
+    const next = Array.from(new Set([...(conv.readScope ?? []), real]))
+    db.setConversationReadScope(conv.id, next)
+    return c.json({ ok: true, readScope: next })
+  })
+  app.delete('/api/v1/conversations/:id/read-scope', async (c) => {
+    const conv = db.getConversation(c.req.param('id'))
+    if (!conv) return c.json({ error: { code: 'not_found', message: 'Conversation not found.' } }, 404)
+    const b = await body<{ path?: string }>(c)
+    const next = (conv.readScope ?? []).filter((p) => p !== b.path)
+    db.setConversationReadScope(conv.id, next)
+    return c.json({ ok: true, readScope: next })
   })
 
   app.get('/api/v1/conversations/:id', (c) => {
@@ -623,7 +658,8 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
   // creation) so editing the agent updates live conversations. No-op for plain chats.
   const boundAgent = conv.agentId ? d.store.snapshot().agents.agents.find((a) => a.id === conv.agentId) : undefined
   if (boundAgent) {
-    const reads = boundAgent.readRoots.map((r) => (r === '<dataDir>' ? d.store.dir() : r))
+    // Read scope is chat-bound (attached files/folders), not agent-bound.
+    const reads = conv.readScope ?? []
     const dataDir = d.store.dir()
     // Self-improvement (spec 13 redesign §3): inject the agent's recent lessons (Reflexion)
     // + grown skills (Voyager) so it applies what it learned. Top 3 each, most recent.
@@ -639,7 +675,9 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
       : ''
     const agentSys = [
       boundAgent.systemPrompt || `You are ${boundAgent.name}.`,
-      reads.length ? `You can READ files in these folders: ${reads.join(', ')}.` : '',
+      reads.length
+        ? `You can READ files within what the user attached to this chat: ${reads.join(', ')}.`
+        : `No files or folders are attached to this chat, so you cannot read from disk yet. If you need to read something, ask the user to attach a file or folder.`,
       `You can WRITE files only in: ${dataDir}.`,
       `Use run_code for computation only (it has no file access); to save a result, return it and call write_file.`,
       // Using skills is proactive (above); SAVING them is not. Only act on an explicit
@@ -701,7 +739,10 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
     const baseToolDefs = d.tools ? await d.tools.buildToolDefinitions() : []
     // Agent-bound conversation (spec 13 redesign): merge in the agent's guarded FS/code
     // tools. When conv.agentId is null this is a no-op → plain chat is byte-identical.
-    const agent = conv.agentId ? d.store.snapshot().agents.agents.find((a) => a.id === conv.agentId) : undefined
+    const agentBound = conv.agentId ? d.store.snapshot().agents.agents.find((a) => a.id === conv.agentId) : undefined
+    // Read access is chat-bound: the guard reads the conversation's attached scope, not the
+    // agent's (agents carry no read roots now). Writes still go to ~/.turbollm.
+    const agent = agentBound ? { ...agentBound, readRoots: conv.readScope ?? [] } : undefined
     const agentTools = agent
       ? buildAgentToolset(agent, d.store.dir(), {
           // In-chat skill author (skill-creator model): the agent calls save_skill, we

@@ -20,7 +20,7 @@ import { streamSSE } from 'hono/streaming'
 import { randomUUID } from 'node:crypto'
 import type { Deps } from '../deps'
 import { ValueError, type AgentType } from '../config/config'
-import { SkillStore, isBuiltinSkill, isValidSkillId, toSkillId, type Skill } from './skills'
+import { SkillStore, isBuiltinSkill, isValidSkillId, toSkillId, importSkillsFromFolder, type Skill } from './skills'
 import { isLocalRequest } from '../auth'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -108,7 +108,7 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
   })
 
   // ── Grown skills (spec 13 redesign §3.3) ────────────────────────────────────
-  const SKILL_CAP = 50
+  const SKILL_CAP = 200
 
   // The shared skill library + this agent's lessons (for the management UI). Skills are
   // SKILL.md files shared across agents; lessons (Reflexion) remain per-agent.
@@ -142,12 +142,27 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
     const taskId = d.agentTasks?.start('skill_from_folder', id, `Learning from ${folder}`)
     void (async () => {
       try {
-        if (taskId) d.agentTasks?.step(taskId, 'Reading the folder…')
-        const { distillSkillsFromFolder } = await import('./distiller')
-        // Headroom left under the cap — never exceed it even if the folder has more files.
+        if (taskId) d.agentTasks?.step(taskId, 'Scanning the folder for skills…')
         const room = Math.max(0, SKILL_CAP - store.userSkills().length)
-        const distilled = await distillSkillsFromFolder(d, folder, {
+        // Primary path: the folder is a skill library (SKILL.md files) — import them
+        // verbatim, preserving names. No LLM, no renaming.
+        const { imported, skipped } = importSkillsFromFolder(store, folder, {
           max: room,
+          onProgress: (sid) => { if (taskId) d.agentTasks?.step(taskId, `Imported ${sid}`) },
+        })
+        if (imported.length > 0 || skipped.length > 0) {
+          if (taskId) {
+            const parts = [`Imported ${imported.length} skill${imported.length === 1 ? '' : 's'}`]
+            if (skipped.length) parts.push(`${skipped.length} already in library`)
+            d.agentTasks?.done(taskId, imported.length ? `${parts.join(', ')}: ${imported.join(', ')}` : parts.join(', '))
+          }
+          return
+        }
+        // Fallback: no SKILL.md found — distill reusable skills from the folder's text files.
+        if (taskId) d.agentTasks?.step(taskId, 'No skill files found — distilling from the folder…')
+        const { distillSkillsFromFolder } = await import('./distiller')
+        const distilled = await distillSkillsFromFolder(d, folder, {
+          max: Math.max(0, SKILL_CAP - store.userSkills().length),
           onProgress: (done, total, file) => {
             if (taskId) d.agentTasks?.step(taskId, `Distilling ${done + 1}/${total}: ${file}`)
           },
@@ -166,11 +181,11 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
             taskId,
             added.length > 0
               ? `Saved ${added.length} skill${added.length === 1 ? '' : 's'}: ${added.join(', ')}`
-              : 'No new reusable skills found in that folder.',
+              : 'No skills found in that folder.',
           )
         }
       } catch (e) {
-        if (taskId) d.agentTasks?.fail(taskId, e instanceof Error ? e.message : 'distill failed')
+        if (taskId) d.agentTasks?.fail(taskId, e instanceof Error ? e.message : 'learn failed')
       }
     })()
     return c.json({ ok: true, learning: true })

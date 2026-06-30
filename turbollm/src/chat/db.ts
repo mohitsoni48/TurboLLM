@@ -31,6 +31,9 @@ export interface Conversation {
   agentId?: string
   /** Set when the user marks the task complete (spec 13 redesign §2). Null = in progress. */
   completedAt?: string
+  /** Per-conversation read scope (spec 13 redesign): absolute file/folder paths the bound
+   *  agent may read. Read access is chat-bound (attached via the picker), not agent-bound. */
+  readScope?: string[]
   createdAt: string
   updatedAt: string
   messages?: Message[]
@@ -176,7 +179,7 @@ export interface Message {
   createdAt: string
 }
 
-interface ConvRow { id: string; title: string; system_prompt: string; model_key: string; sampling: string; expert_mode: number; tool_policy: string | null; kind: string | null; folder_id: string | null; tool_overrides: string | null; agent_id: string | null; completed_at: string | null; created_at: string; updated_at: string }
+interface ConvRow { id: string; title: string; system_prompt: string; model_key: string; sampling: string; expert_mode: number; tool_policy: string | null; kind: string | null; folder_id: string | null; tool_overrides: string | null; agent_id: string | null; completed_at: string | null; read_scope: string | null; created_at: string; updated_at: string }
 interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; agent_id: string | null; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null; archived_at: string | null; completion: string | null }
 interface FolderRow { id: string; name: string; sort_order: number; created_at: string; updated_at: string }
 interface MsgRow  { id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string; reasoning: string; attachments: string; text_attachments: string | null; tool_calls: string | null; stats: string; model_key: string | null; research_meta: string | null; created_at: string }
@@ -198,7 +201,7 @@ function safeToolOverrides(s: string | null): Record<string, 'allow' | 'deny'> {
 }
 
 function rowToConv(r: ConvRow): Conversation {
-  return { id: r.id, title: r.title, systemPrompt: r.system_prompt, modelKey: r.model_key, sampling: safeJson(r.sampling) as Record<string, unknown>, expertMode: r.expert_mode === 1, toolPolicy: r.tool_policy ?? undefined, kind: (r.kind === 'agent' ? 'agent' : 'chat'), folderId: r.folder_id ?? null, toolOverrides: safeToolOverrides(r.tool_overrides), agentId: r.agent_id ?? undefined, completedAt: r.completed_at ?? undefined, createdAt: r.created_at, updatedAt: r.updated_at }
+  return { id: r.id, title: r.title, systemPrompt: r.system_prompt, modelKey: r.model_key, sampling: safeJson(r.sampling) as Record<string, unknown>, expertMode: r.expert_mode === 1, toolPolicy: r.tool_policy ?? undefined, kind: (r.kind === 'agent' ? 'agent' : 'chat'), folderId: r.folder_id ?? null, toolOverrides: safeToolOverrides(r.tool_overrides), agentId: r.agent_id ?? undefined, completedAt: r.completed_at ?? undefined, readScope: r.read_scope ? (safeJson(r.read_scope) as string[]) : undefined, createdAt: r.created_at, updatedAt: r.updated_at }
 }
 
 function rowToFolder(r: FolderRow): Folder {
@@ -434,10 +437,10 @@ export class ConversationStore {
         PRAGMA user_version = 17;
       `)
     }
-    // v16 (spec 13 redesign §3.3): per-agent SKILLS grown from experience (Voyager) — a
+    // v18 (spec 13 redesign §3.3): per-agent SKILLS grown from experience (Voyager) — a
     // distilled name + description + procedure, injected on future runs. Keyed by config
     // agent id (not a DB FK); pruned on agent delete.
-    if (v < 16) {
+    if (v < 18) {
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS agent_skills (
           id          TEXT PRIMARY KEY,
@@ -449,7 +452,15 @@ export class ConversationStore {
           created_at  TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_skills_agent ON agent_skills(agent_id, created_at);
-        PRAGMA user_version = 16;
+        PRAGMA user_version = 18;
+      `)
+    }
+    // v19 (spec 13 redesign): per-conversation read scope — JSON array of file/folder paths
+    // the bound agent may read. Read access is chat-bound (attached via picker), not agent-bound.
+    if (v < 19) {
+      this.db.exec(`
+        ALTER TABLE conversations ADD COLUMN read_scope TEXT;
+        PRAGMA user_version = 19;
       `)
     }
   }
@@ -752,6 +763,13 @@ export class ConversationStore {
   markConversationComplete(id: string): void {
     const now = new Date().toISOString()
     this.db.prepare(`UPDATE conversations SET completed_at = $now, updated_at = $now WHERE id = $id`).run({ $id: id, $now: now } as P)
+  }
+
+  /** Replace a conversation's read scope (absolute file/folder paths). */
+  setConversationReadScope(id: string, paths: string[]): void {
+    const now = new Date().toISOString()
+    this.db.prepare(`UPDATE conversations SET read_scope = $scope, updated_at = $now WHERE id = $id`)
+      .run({ $id: id, $scope: JSON.stringify(paths), $now: now } as P)
   }
 
   addAgentLesson(row: { agentId: string; lesson: string; evidence?: string; convId?: string }): void {
