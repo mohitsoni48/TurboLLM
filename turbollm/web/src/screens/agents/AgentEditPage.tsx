@@ -1,15 +1,13 @@
 import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { ChevronLeft, FolderInput, Sparkles, Trash2, Wand2 } from 'lucide-react'
+import { ChevronLeft, Trash2, Wand2 } from 'lucide-react'
 import { Button } from '../../components/ui/button'
 import { toast } from '../../components/ui/sonner'
 import { ApiError } from '../../lib/api'
 import {
-  agentKeys, fetchAgents, createAgent, updateAgent, deleteAgent,
-  learnFromFolder, fetchLearned, deleteLearnedSkill, fetchSkills,
+  agentKeys, fetchAgents, createAgent, updateAgent, deleteAgent, fetchSkills,
 } from '../../lib/agent-api'
-import type { LearnedSkill, LearnedLesson } from '../../lib/agent-api'
 import type { AgentType, Skill } from '../../lib/agent-types'
 
 // ── Form model ────────────────────────────────────────────────────────────────
@@ -37,11 +35,11 @@ function agentToForm(a: AgentType): AgentFormState {
   }
 }
 
-// ── Skill picker (the shared library — any skill, granted to this agent) ──────
+// ── Skill picker (which library skills this agent may use) ───────────────────
 //
-// Skills are global (~/.turbollm/skills/<id>/SKILL.md), so a skill saved from ANY
-// agent's chat shows up here and can be re-picked for a new agent. `['*']` grants
-// every skill (including ones added later) without listing them individually.
+// Skills are an independent library (managed under the Skills tab). Here an agent
+// just *references* them by id. `['*']` grants every skill, including ones added
+// later, without listing them individually.
 
 function SkillsPicker({
   skills,
@@ -91,7 +89,7 @@ function SkillsPicker({
         <p className="px-1 py-2 text-[12px] text-faint">Loading skills…</p>
       ) : library.length === 0 ? (
         <p className="px-1 py-2 text-[12px] text-faint">
-          No skills in the library yet — grow one below, or tell an agent to "save this as a skill" in chat.
+          No skills yet — add some under the <Link to="/agents/skills" className="text-accent hover:underline">Skills</Link> tab.
         </p>
       ) : (
         <div className={`flex flex-col gap-1.5 ${grantAll ? 'pointer-events-none opacity-50' : ''}`}>
@@ -117,127 +115,10 @@ function SkillsPicker({
           ))}
         </div>
       )}
-    </div>
-  )
-}
 
-// ── Learned skills + lessons section (grows the shared library) ──────────────
-
-function LearnedSection({ agentId }: { agentId: string }) {
-  const qc = useQueryClient()
-  const [folder, setFolder] = useState('')
-  const [learning, setLearning] = useState(false)
-
-  const learnedQ = useQuery({
-    queryKey: ['learned', agentId],
-    queryFn: () => fetchLearned(agentId),
-    staleTime: 0,
-    refetchInterval: 4000,
-  })
-  const skills: LearnedSkill[] = learnedQ.data?.skills ?? []
-  const lessons: LearnedLesson[] = learnedQ.data?.lessons ?? []
-
-  const handleLearnFolder = async () => {
-    const f = folder.trim()
-    if (!f) return
-    setLearning(true)
-    try {
-      await learnFromFolder(agentId, f)
-      toast.success(`Learning a skill from ${f}… (runs in the background)`)
-      setFolder('')
-    } catch (e) {
-      toast.error(e instanceof ApiError ? e.message : 'Could not start learning.')
-    } finally {
-      setLearning(false)
-    }
-  }
-
-  const handleDelete = async (skillId: string) => {
-    try {
-      await deleteLearnedSkill(agentId, skillId)
-      void qc.invalidateQueries({ queryKey: ['learned', agentId] })
-      void qc.invalidateQueries({ queryKey: ['skills'] })
-    } catch (e) {
-      toast.error(e instanceof ApiError ? e.message : 'Could not delete skill.')
-    }
-  }
-
-  const empty = skills.length === 0 && lessons.length === 0
-
-  return (
-    <div className="flex flex-col gap-3">
-      <span className="flex items-center gap-1.5 text-[12px] font-medium text-muted">
-        <Sparkles size={12} className="text-accent" /> Grow the library
-      </span>
-
-      {/* Learn from folder row */}
-      <div className="flex flex-col gap-1.5">
-        <label className="flex items-center gap-1.5 text-[12px] text-faint">
-          <FolderInput size={12} />
-          Learn a skill from a folder
-        </label>
-        <div className="flex gap-1.5">
-          <input
-            className="min-w-0 flex-1 rounded-md border border-border bg-bg px-2.5 py-1.5 font-mono text-[12px] text-ink outline-none focus:border-accent placeholder:text-faint"
-            placeholder="/absolute/path/to/folder"
-            value={folder}
-            onChange={(e) => setFolder(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter') void handleLearnFolder() }}
-          />
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={learning || !folder.trim()}
-            onClick={() => void handleLearnFolder()}
-          >
-            Learn
-          </Button>
-        </div>
-      </div>
-
-      {/* This agent's grown skills + lessons */}
-      {empty ? (
-        <p className="text-[12px] text-faint">
-          Nothing grown yet — skills learned here join the shared library above.
-        </p>
-      ) : (
-        <div className="flex flex-col gap-2">
-          {skills.map((sk) => (
-            <div
-              key={sk.id}
-              className="flex items-start gap-2 rounded-lg border border-border bg-panel px-3 py-2.5"
-            >
-              <div className="min-w-0 flex-1">
-                <p className="text-[13px] font-medium text-ink">{sk.name}</p>
-                {sk.description && (
-                  <p className="mt-0.5 text-[12px] text-muted">{sk.description}</p>
-                )}
-                {sk.source && (
-                  <span className="mt-1 inline-block rounded-sm bg-panel-2 px-1.5 py-0.5 text-[10px] text-faint">
-                    from {sk.source}
-                  </span>
-                )}
-              </div>
-              <button
-                type="button"
-                onClick={() => void handleDelete(sk.id)}
-                className="mt-0.5 shrink-0 rounded p-1 text-faint transition-colors hover:text-[color:var(--err)]"
-                title="Delete skill"
-              >
-                <Trash2 size={13} />
-              </button>
-            </div>
-          ))}
-          {lessons.length > 0 && (
-            <div className="flex flex-col gap-1 rounded-lg border border-border bg-panel px-3 py-2.5">
-              <p className="mb-1 text-[11px] font-medium text-muted">Lessons</p>
-              {lessons.map((ls) => (
-                <p key={ls.id} className="text-[12px] text-ink">· {ls.lesson}</p>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
+      <Link to="/agents/skills" className="self-start text-[11px] text-faint hover:text-accent">
+        Manage the skill library →
+      </Link>
     </div>
   )
 }
@@ -409,15 +290,9 @@ export function AgentEditPage({ agentId }: { agentId: string }) {
           )}
         </div>
 
-        {/* ── Right: skills (shared library) ── */}
+        {/* ── Right: skills the agent may use (from the shared library) ── */}
         <div className="flex flex-col gap-5">
           <SkillsPicker skills={form.skills} setSkills={(next) => setForm((f) => ({ ...f, skills: next }))} />
-          {!isNew && (
-            <>
-              <div className="border-t border-border" />
-              <LearnedSection agentId={agentId} />
-            </>
-          )}
         </div>
       </div>
     </div>

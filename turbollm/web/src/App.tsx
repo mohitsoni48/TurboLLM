@@ -86,8 +86,10 @@ export function App() {
                 so existing LAN share links (baked as /chat/<id>) keep working. */}
             <Route path="/chat" element={<Navigate to="/workspace/chat" replace />} />
             <Route path="/chat/:convId" element={<ChatScreen />} />
-            {/* Agents: management grid → edit page */}
+            {/* Agents: Agents | Skills tabs. Static /skills routes outrank /agents/:id. */}
             <Route path="/agents" element={<AgentsScreen />} />
+            <Route path="/agents/skills" element={<AgentsScreen />} />
+            <Route path="/agents/skills/:skillId" element={<AgentsScreen />} />
             <Route path="/agents/:id" element={<AgentsScreen />} />
             <Route path="/models" element={<ModelsScreen />} />
             <Route path="/engines" element={<EnginesScreen />} />
