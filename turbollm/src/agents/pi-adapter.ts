@@ -96,6 +96,12 @@ export async function runAgentSession(
     customTools: guardedTools,
   })
 
+  // Context-awareness (spec 13 §12.1): enable pi's native auto-compaction so a long
+  // contract survives the context wall. The working doc is NOT in pi's transcript
+  // (it's DB-persisted, §12.2) so it survives compaction by construction. pi manages
+  // the threshold; we surface a 'compaction' event to the UI when it fires.
+  session.setAutoCompactionEnabled(true)
+
   let runResult: AgentRunResult | undefined
 
   session.subscribe((event) => {
@@ -114,6 +120,12 @@ export async function runAgentSession(
         break
       case 'tool_execution_end':
         config.onEvent({ event: 'tool_call', data: { id: event.toolCallId, status: event.isError ? 'error' : 'done', result: toolResultText(event.result) } })
+        break
+      case 'compaction_start':
+        config.onEvent({ event: 'compaction', data: { status: 'start' } })
+        break
+      case 'compaction_end':
+        config.onEvent({ event: 'compaction', data: { status: 'end' } })
         break
       case 'agent_end': {
         const stats = session.getSessionStats()

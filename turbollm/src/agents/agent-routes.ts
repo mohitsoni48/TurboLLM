@@ -85,6 +85,8 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
     if (!a) return err(c, 404, 'not_found', 'Agent not found.')
     if (a.builtin) return err(c, 400, 'builtin_agent', 'The default agent cannot be deleted.')
     d.store.update((cfg) => { cfg.agents.agents = cfg.agents.agents.filter((x) => x.id !== id) })
+    // agent_id is a config id, not a DB FK — prune this Hitman's track-record rows (§13).
+    d.db.pruneTrackRecordForAgent?.(id)
     return c.json({ ok: true })
   })
 
@@ -138,8 +140,9 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
   })
 
   app.get('/api/v1/agents/runs', (c) => {
-    if (!d.db.listAgentRuns) return err(c, 501, 'not_implemented', 'Agent runner not available.')
-    return c.json(d.db.listAgentRuns())
+    if (!d.db.listActiveAgentRuns) return err(c, 501, 'not_implemented', 'Agent runner not available.')
+    // Active = non-archived contracts (§15); archived ones live under /agents/:id/archive.
+    return c.json(d.db.listActiveAgentRuns())
   })
 
   app.get('/api/v1/agents/runs/:id', (c) => {
@@ -178,5 +181,62 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
         sub.close()
       }
     })
+  })
+
+  // ── Hitman layer (spec 13 §§12-15) ──────────────────────────────────────────
+
+  // The durable working doc for a run.
+  app.get('/api/v1/agents/runs/:id/doc', (c) => {
+    if (!d.db.getRunDoc) return err(c, 501, 'not_implemented', 'Not available.')
+    const run = d.db.getAgentRun?.(c.req.param('id'))
+    if (!run) return err(c, 404, 'not_found', 'Run not found.')
+    return c.json({ content: d.db.getRunDoc(run.id) })
+  })
+
+  // Helper: write a track-record row for a finished contract (the model that ran it
+  // lives on the run's conversation modelKey, set by the run manager).
+  const recordOutcome = (runId: string, outcome: 'complete' | 'miss', feedback?: string) => {
+    const run = d.db.getAgentRun?.(runId)
+    if (!run?.agentId) return
+    const conv = d.db.getConversation(run.convId)
+    const model = conv?.modelKey || 'unknown'
+    d.db.addTrackRecord?.({ agentId: run.agentId, runId, model, outcome, feedback })
+  }
+
+  // ✓ Mark complete → record 'complete' + archive.
+  app.post('/api/v1/agents/runs/:id/complete', (c) => {
+    const id = c.req.param('id')
+    const run = d.db.getAgentRun?.(id)
+    if (!run) return err(c, 404, 'not_found', 'Run not found.')
+    recordOutcome(id, 'complete')
+    d.db.setRunDisposition?.(id, 'complete', true)
+    return c.json({ ok: true })
+  })
+
+  // ⛔ Flag miss → record 'miss' + feedback. Run stays available for the user to Reply.
+  app.post('/api/v1/agents/runs/:id/flag-miss', async (c) => {
+    const id = c.req.param('id')
+    const run = d.db.getAgentRun?.(id)
+    if (!run) return err(c, 404, 'not_found', 'Run not found.')
+    const b = await body<{ feedback?: string }>(c)
+    recordOutcome(id, 'miss', b.feedback?.trim() || undefined)
+    d.db.setRunDisposition?.(id, 'miss', false)
+    return c.json({ ok: true })
+  })
+
+  // Per-Hitman track record (rows + per-model stats) — drives the warn/suggest UI.
+  app.get('/api/v1/agents/:id/track-record', (c) => {
+    if (!d.db.trackRecordForAgent) return err(c, 501, 'not_implemented', 'Not available.')
+    const agentId = c.req.param('id')
+    return c.json({
+      rows: d.db.trackRecordForAgent(agentId),
+      modelStats: d.db.modelStatsForAgent?.(agentId) ?? [],
+    })
+  })
+
+  // Archived contracts for a Hitman.
+  app.get('/api/v1/agents/:id/archive', (c) => {
+    if (!d.db.listArchivedAgentRuns) return err(c, 501, 'not_implemented', 'Not available.')
+    return c.json(d.db.listArchivedAgentRuns(c.req.param('id')))
   })
 }

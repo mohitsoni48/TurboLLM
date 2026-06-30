@@ -10,6 +10,7 @@ import { runAgentSession } from './pi-adapter'
 import { buildBridgedTools } from './pi-adapter'
 import { makeToolCallGuard } from './fs-guard'
 import { createReadFileTool, createListDirTool, createGlobTool, createWriteFileTool } from './fs-tools'
+import { createUpdateDocTool, createCompleteTaskTool, type CompletionSignal } from './task-tools'
 import { SkillStore } from './skills'
 import { engineModelAlias } from '../engines/compat'
 
@@ -152,6 +153,10 @@ export class AgentRunManager {
       return
     }
 
+    // Record the model that runs this contract (read back at disposition time to write
+    // the per-Hitman track record, §12.3). Stored on the run's conversation modelKey.
+    this.d.db.updateConversation(pending.convId, { modelKey: ms.model.key })
+
     // Persist the turn to the run's conversation (reuses the messages table).
     this.d.db.addMessage(pending.convId, 'user', pending.userMessage)
     this.d.db.addMessage(pending.convId, 'assistant', '', { stats: { aborted: false } })
@@ -173,6 +178,12 @@ export class AgentRunManager {
       const guard = makeToolCallGuard(agent, dataDir, bridgedNames)
       const modelId = engineModelAlias(this.d.registry.active()?.kind ?? '') ?? ms.model.key
 
+      // Task-tracking tools (§12.2): the working doc + the model's done-signal. Always
+      // available — granted to any agent whose skills include the `task-tracking` skill
+      // (the default agent does). The guard allows update_doc/complete_task by name.
+      const completion: CompletionSignal = { done: false, summary: '' }
+      const taskTools = [createUpdateDocTool(this.d.db, pending.id), createCompleteTaskTool(completion)]
+
       // Anchor pi's own framing to the agent's primary writable root (its workspace),
       // so the default system prompt treats that folder as in-scope.
       const cwd = agent.writeRoots[0] === '<dataDir>' || !agent.writeRoots[0] ? dataDir : agent.writeRoots[0]
@@ -185,7 +196,7 @@ export class AgentRunManager {
           systemPrompt,
           userMessage: pending.userMessage,
           tools: toolNames,
-          customTools: [...fsTools, ...bridged],
+          customTools: [...fsTools, ...taskTools, ...bridged],
           onToolCall: guard,
           gate: this.d.gate,
           cwd,
@@ -200,6 +211,9 @@ export class AgentRunManager {
         ac.signal,
       )
       this.d.db.updateMessage(assistantMsg.id, { content: fullContent, stats: { aborted: false } })
+      // The run reaches 'done' whether the model called complete_task or just stopped.
+      // Disposition (complete/miss → track record) happens via the user's button (§14),
+      // which records the model that ran it.
       this.d.db.updateAgentRun?.(pending.id, { status: 'done', endedAt: new Date().toISOString() })
     } catch (e) {
       const isAbort = (e as Error)?.name === 'AbortError'
