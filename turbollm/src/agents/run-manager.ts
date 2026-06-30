@@ -1,9 +1,17 @@
-// Background agent runner — one active run at a time; extras queue.
-// Each run gets a dedicated conversation (kind='agent') and its own AbortController.
-// Events are stored in a ring buffer (cap 2000) and live-tailed via EventEmitter.
+// AgentRunManager — daemon-owned agent runs (spec 13 §§5-6, Phase 2).
+// Ports the reconnect machinery from the retired AgentRunner (RunBuffer ring +
+// EventEmitter live-tail + subscribe() + reconcileOnStartup + interruptActive) but
+// drives each run through the pi SDK (runAgentSession) instead of the old
+// runGeneration+checkbox loop. One active run at a time; extras queue.
 import { EventEmitter } from 'node:events'
 import type { Deps } from '../deps'
-import { runGeneration } from '../chat/generation'
+import type { AgentType } from '../config/config'
+import { runAgentSession } from './pi-adapter'
+import { buildBridgedTools } from './pi-adapter'
+import { makeToolCallGuard } from './fs-guard'
+import { createReadFileTool, createListDirTool, createGlobTool, createWriteFileTool } from './fs-tools'
+import { SkillStore } from './skills'
+import { engineModelAlias } from '../engines/compat'
 
 const BUFFER_CAP = 2000
 
@@ -25,18 +33,14 @@ class RunBuffer {
   }
 
   since(fromSeq: number): BufferedEvent[] {
-    // Events older than the ring-buffer window (BUFFER_CAP) are silently dropped —
-    // subscribers reconnecting after a long gap may miss events in that gap.
     return this.events.filter((e) => e.seq >= fromSeq)
   }
 }
 
 export interface LaunchParams {
+  agentId: string
   title: string
-  systemPrompt?: string
   userMessage: string
-  allowedTools: string[]
-  maxToolIter?: number
 }
 
 interface PendingRun extends LaunchParams {
@@ -44,8 +48,9 @@ interface PendingRun extends LaunchParams {
   convId: string
 }
 
-export class AgentRunner {
+export class AgentRunManager {
   private d: Deps
+  private skills: SkillStore
   private buffers = new Map<string, RunBuffer>()
   private emitters = new Map<string, EventEmitter>()
   private acs = new Map<string, AbortController>()
@@ -53,7 +58,10 @@ export class AgentRunner {
   private active: string | null = null
   private interruptedIds = new Set<string>()
 
-  constructor(d: Deps) { this.d = d }
+  constructor(d: Deps) {
+    this.d = d
+    this.skills = new SkillStore(d.store.dir())
+  }
 
   /** On startup: mark any DB runs left in queued/running state as interrupted. */
   reconcileOnStartup(): void {
@@ -63,27 +71,47 @@ export class AgentRunner {
     }
   }
 
+  /** Resolve an agent definition by id from config. */
+  private agent(agentId: string): AgentType | undefined {
+    return this.d.store.snapshot().agents.agents.find((a) => a.id === agentId)
+  }
+
   /** Create a new agent run and queue it. Returns the run ID immediately. */
   async launch(params: LaunchParams): Promise<string> {
     const db = this.d.db
+    const agent = this.agent(params.agentId)
+    if (!agent) throw new Error(`Unknown agent: ${params.agentId}`)
 
-    // Create a dedicated conversation for this run
     const conv = db.createConversation({
       title: params.title,
-      systemPrompt: params.systemPrompt ?? '',
+      systemPrompt: '',
       kind: 'agent',
     })
 
     const run = db.createAgentRun?.({
       convId: conv.id,
       title: params.title,
-      allowedTools: params.allowedTools,
+      allowedTools: [],
+      agentId: params.agentId,
     })
     if (!run) throw new Error('createAgentRun not available (DB migration pending?)')
 
     this.queue.push({ ...params, id: run.id, convId: conv.id })
     void this.processNext()
     return run.id
+  }
+
+  /** Resolve the tools + system prompt an agent's skills grant. */
+  private resolveSkills(agent: AgentType): { toolNames: string[]; systemPrompt: string } {
+    const all = this.skills.list()
+    const active = agent.skills.includes('*') ? all : all.filter((s) => agent.skills.includes(s.id))
+    const toolNames = [...new Set(active.flatMap((s) => s.tools))]
+    const instructions = active.map((s) => s.instructions).filter(Boolean).join('\n\n')
+    const systemPrompt = [
+      `You are ${agent.name}. ${agent.description}`,
+      instructions,
+    ].filter(Boolean).join('\n\n')
+    return { toolNames, systemPrompt }
   }
 
   private async processNext(): Promise<void> {
@@ -109,7 +137,14 @@ export class AgentRunner {
 
     const ms = this.d.manager.status()
     const target = this.d.manager.target()
+    const agent = this.agent(pending.agentId)
 
+    if (!agent) {
+      this.d.db.updateAgentRun?.(pending.id, { status: 'failed', error: 'Agent not found', endedAt: new Date().toISOString() })
+      sink({ event: 'error', data: { code: 'agent_not_found', message: 'Agent definition no longer exists.' } })
+      this.finish(pending.id)
+      return
+    }
     if (ms.state !== 'running' || !ms.model || !target) {
       this.d.db.updateAgentRun?.(pending.id, { status: 'failed', error: 'Model not loaded', endedAt: new Date().toISOString() })
       sink({ event: 'error', data: { code: 'model_not_loaded', message: 'Load a model first.' } })
@@ -117,34 +152,53 @@ export class AgentRunner {
       return
     }
 
-    const conv = this.d.db.getConversation(pending.convId)!
-
+    // Persist the turn to the run's conversation (reuses the messages table).
     this.d.db.addMessage(pending.convId, 'user', pending.userMessage)
     this.d.db.addMessage(pending.convId, 'assistant', '', { stats: { aborted: false } })
     const assistantMsg = this.d.db.getLastMessage(pending.convId)!
 
-    const engineMessages: { role: string; content: unknown }[] = []
-    if (conv.systemPrompt) engineMessages.push({ role: 'system', content: conv.systemPrompt })
-    engineMessages.push({ role: 'user', content: pending.userMessage })
+    // Accumulate the streamed assistant text so it lands in the DB on completion.
+    let fullContent = ''
 
     try {
-      await runGeneration(this.d, sink, {
-        convId: pending.convId,
-        conv,
-        engineMessages,
-        assistantMsg,
-        ms,
-        target,
-        ac,
-        disableThinking: false,
-        maxToolIter: pending.maxToolIter ?? 30,
-        allowedTools: pending.allowedTools,
-        skipAutoTitle: true,
-        gatePriority: 'bg',
-      })
+      const { toolNames, systemPrompt } = this.resolveSkills(agent)
+      const dataDir = this.d.store.dir()
+
+      // FS tools (always available to the adapter; the guard + skill grants gate them).
+      const fsTools = [createReadFileTool(), createListDirTool(), createGlobTool(), createWriteFileTool()]
+      // Bridged ToolRegistry tools (web_search/fetch_url/run_code/mcp__*) the agent's skills grant.
+      const bridged = await buildBridgedTools(this.d, agent)
+      const bridgedNames = new Set(bridged.map((t) => t.name))
+
+      const guard = makeToolCallGuard(agent, dataDir, bridgedNames)
+      const modelId = engineModelAlias(this.d.registry.active()?.kind ?? '') ?? ms.model.key
+
+      await runAgentSession(
+        {
+          baseUrl: `${target}/v1`,
+          modelId,
+          agent,
+          systemPrompt,
+          userMessage: pending.userMessage,
+          tools: toolNames,
+          customTools: [...fsTools, ...bridged],
+          onToolCall: guard,
+          gate: this.d.gate,
+          onEvent: (ev) => {
+            if (ev.event === 'delta') {
+              const d = ev.data as { delta?: string }
+              if (typeof d.delta === 'string') fullContent += d.delta
+            }
+            sink(ev)
+          },
+        },
+        ac.signal,
+      )
+      this.d.db.updateMessage(assistantMsg.id, { content: fullContent, stats: { aborted: false } })
       this.d.db.updateAgentRun?.(pending.id, { status: 'done', endedAt: new Date().toISOString() })
     } catch (e) {
       const isAbort = (e as Error)?.name === 'AbortError'
+      this.d.db.updateMessage(assistantMsg.id, { content: fullContent, stats: { aborted: isAbort } })
       // interruptActive() pre-writes 'interrupted' status — don't overwrite it.
       if (!this.interruptedIds.delete(pending.id)) {
         this.d.db.updateAgentRun?.(pending.id, {
@@ -162,20 +216,18 @@ export class AgentRunner {
     this.emitters.get(id)?.emit('done')
     this.acs.delete(id)
     this.active = null
-    // Delay cleanup so in-flight subscribers can drain pending events before maps are cleared.
+    // Delay cleanup so in-flight subscribers can drain pending events.
     setTimeout(() => { this.buffers.delete(id); this.emitters.delete(id) }, 5000)
     void this.processNext()
   }
 
   cancel(id: string): boolean {
-    // Active run: abort it
     const ac = this.acs.get(id)
     if (ac) {
       ac.abort()
       this.d.db.updateAgentRun?.(id, { status: 'cancelled', endedAt: new Date().toISOString() })
       return true
     }
-    // Queued but not started yet
     const qIdx = this.queue.findIndex((r) => r.id === id)
     if (qIdx >= 0) {
       this.queue.splice(qIdx, 1)
@@ -197,7 +249,6 @@ export class AgentRunner {
     const buffer = this.buffers.get(runId)
     const emitter = this.emitters.get(runId)
 
-    // Run already finished or unknown — return a closed iterable
     if (!emitter) {
       return {
         close() {},

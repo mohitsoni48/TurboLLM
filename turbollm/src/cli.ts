@@ -27,7 +27,7 @@ import { BenchRunner } from './bench/bench'
 import { ModelRouter } from './gateway/model-router'
 import { ToolRegistry } from './tools/tool-registry'
 import { GenerationGate } from './agents/gate'
-import { AgentRunner } from './agents/runner'
+import { AgentRunManager } from './agents/run-manager'
 import { launchCli } from './cli-launch'
 import { writePidfile, removePidfile, stopDaemon, resolveDaemonPort } from './daemon-pid'
 import { createApp } from './server'
@@ -247,8 +247,8 @@ const appUpdates = new AppUpdateChecker(version)
 // `requestRestart` is attached after the server is created (it must close over it).
 const deps: Deps = { store, registry, manager, scanner, hashes, db, provision, build, updates, appUpdates, hf, downloads, bench, modelRouter, comfy, tools: toolRegistry, version, startedAt }
 deps.gate = new GenerationGate()
-deps.agentRunner = new AgentRunner(deps)
-deps.agentRunner.reconcileOnStartup()
+deps.agents = new AgentRunManager(deps)
+deps.agents.reconcileOnStartup()
 // Cloud Launch (ADR-045/152): only wired when --tunnel is passed. Its mere presence
 // on Deps is what forces auth enforcement on tunneled traffic (see auth.ts lanAuth) —
 // absent entirely for the vast majority of runs that never asked for a tunnel.

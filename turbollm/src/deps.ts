@@ -15,7 +15,7 @@ import type { BenchRunner } from './bench/bench'
 import type { ModelRouter } from './gateway/model-router'
 import type { ToolRegistry } from './tools/tool-registry'
 import type { GenerationGate } from './agents/gate'
-import type { AgentRunner } from './agents/runner'
+import type { AgentRunManager } from './agents/run-manager'
 import type { TunnelManager } from './tunnel/manager'
 
 export interface Deps {
@@ -49,8 +49,9 @@ export interface Deps {
   /** Priority-queue mutex serialising engine calls (fg > bg). Optional — absent under
    *  tests; only wired in cli.ts where the agent runner co-exists with chat. */
   gate?: GenerationGate
-  /** Background agent runner. Optional — same wiring conditions as gate. */
-  agentRunner?: AgentRunner
+  /** Daemon-owned agent run manager (spec 13 Phase 2). Optional — same wiring
+   *  conditions as gate (only in the real serve() entrypoint, absent under tests). */
+  agents?: AgentRunManager
   /** Cloud Launch tunnel (ADR-045/152): owns the cloudflared child when `--tunnel` is
    *  active. Optional: only wired in the real `serve()` entrypoint (cli.ts); absent
    *  under tests. Its presence/active() state is what forces auth enforcement on

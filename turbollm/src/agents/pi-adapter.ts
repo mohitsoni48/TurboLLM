@@ -6,10 +6,13 @@ import {
   SessionManager,
   defineTool,
 } from '@earendil-works/pi-coding-agent'
+import { streamSimple as openaiStreamSimple } from '@earendil-works/pi-ai/api/openai-completions'
+import { createAssistantMessageEventStream, type AssistantMessageEventStream } from '@earendil-works/pi-ai'
 import type { AgentType } from '../config/config'
 import type { Deps } from '../deps'
 import type { EventSink } from '../chat/generation'
 import type { ToolCallGuard } from './fs-guard'
+import type { GenerationGate } from './gate'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 export interface PiAgentConfig {
@@ -26,6 +29,9 @@ export interface PiAgentConfig {
    *  so we co-locate enforcement with the tool. A blocked call returns an error
    *  result to the model instead of running. */
   onToolCall: ToolCallGuard
+  /** Shared engine-slot mutex (spec 13 §3.4). When present, pi's engine calls run
+   *  at 'bg' priority so foreground chat preempts them. */
+  gate?: GenerationGate
 }
 
 /** Wrap a custom tool so the guard runs before its execute. A blocked call never
@@ -65,7 +71,7 @@ export async function runAgentSession(
   auth.setRuntimeApiKey('local', 'agent-key')
   const registry = ModelRegistry.inMemory(auth)
 
-  registerLocalProvider(config.baseUrl, config.modelId, auth, registry)
+  registerLocalProvider(config.baseUrl, config.modelId, auth, registry, config.gate)
   const model = registry.find('local', config.modelId)
   if (!model) throw new Error(`Model ${config.modelId} not found`)
 
@@ -173,13 +179,39 @@ export async function buildBridgedTools(
   )
 }
 
+/** Bridge an async-resolved event stream into the synchronous AssistantMessageEventStream
+ *  pi's streamSimple must return: forward every event + the terminal result once the
+ *  inner (gate-held) stream is available. */
+function forwardStream(inner: Promise<AssistantMessageEventStream>): AssistantMessageEventStream {
+  const out = createAssistantMessageEventStream()
+  void inner.then(
+    async (s) => {
+      try {
+        for await (const ev of s) out.push(ev)
+        out.end(await s.result())
+      } catch (e) {
+        out.end()
+        throw e
+      }
+    },
+    () => out.end(), // gate acquire failed — end empty so pi doesn't hang
+  )
+  return out
+}
+
 // ── registerLocalProvider ─────────────────────────────────────────────────────
-/** Register our gateway as a local-openai provider. */
+/** Register our gateway as a local-openai provider. When a GenerationGate is
+ *  supplied, pi's engine calls are bracketed by the gate (spec 13 §3.4) so a
+ *  background agent run yields the single engine slot to foreground chat: we
+ *  provide a custom `streamSimple` that acquires the gate at 'bg' priority,
+ *  delegates to pi-ai's built-in openai-completions streamer, and releases the
+ *  gate when the stream completes (success or error). */
 export function registerLocalProvider(
   baseUrl: string,
   modelId: string,
   authStorage: AuthStorage,
   registry: ModelRegistry,
+  gate?: GenerationGate,
 ): void {
   authStorage.setRuntimeApiKey('local', 'agent-key')
   registry.registerProvider('local', {
@@ -187,6 +219,28 @@ export function registerLocalProvider(
     apiKey: 'agent-key',
     authHeader: true,
     api: 'openai-completions',
+    ...(gate
+      ? {
+          streamSimple: (model, context, options) => {
+            // Acquire BEFORE the request, release when the stream drains. The
+            // returned stream is handed straight to pi; we only attach a release
+            // on its terminal result() so the gate is never leaked.
+            // This provider is registered as 'openai-completions', so model is
+            // that api at runtime — narrow for pi-ai's typed streamSimple.
+            const oaModel = model as Parameters<typeof openaiStreamSimple>[0]
+            const stream = gate
+              .acquire('bg')
+              .then((release) => {
+                const s = openaiStreamSimple(oaModel, context, options)
+                void s.result().finally(release)
+                return s
+              })
+            // pi expects a stream synchronously; bridge the acquire promise by
+            // returning a stream that forwards once the gate is held.
+            return forwardStream(stream)
+          },
+        }
+      : {}),
     models: [{
       id: modelId,
       name: 'Local Model',
