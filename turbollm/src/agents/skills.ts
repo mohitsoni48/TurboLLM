@@ -75,11 +75,15 @@ export class SkillStore {
     return this.list().find(s => s.id === id)
   }
   write(skill: Skill): void {
+    if (!isValidSkillId(skill.id)) throw new Error(`Invalid skill id: ${skill.id}`)
     mkdirSync(this.skillsDir, { recursive: true })
     const path = join(this.skillsDir, `${skill.id}.json`)
-    writeFileSync(path, JSON.stringify(skill, null, 2))
+    writeFileSync(path, JSON.stringify({ ...skill, id: skill.id }, null, 2))
   }
   delete(id: string): void {
+    // Defense-in-depth: never let an id escape the skills dir as a path (../, absolute,
+    // separators). The route validates too, but write()/delete() are the real boundary.
+    if (!isValidSkillId(id)) return
     const path = join(this.skillsDir, `${id}.json`)
     if (existsSync(path)) rmSync(path)
   }
@@ -96,4 +100,11 @@ export class SkillStore {
 }
 export function isBuiltinSkill(id: string): boolean {
   return BUILTIN_SKILLS.some(s => s.id === id)
+}
+
+/** A skill id must be safe to use as a filename: kebab-case only, no separators,
+ *  no traversal, bounded length. The single source of truth for both the route
+ *  and the storage layer. */
+export function isValidSkillId(id: unknown): id is string {
+  return typeof id === 'string' && /^[a-z0-9-]{1,64}$/.test(id)
 }

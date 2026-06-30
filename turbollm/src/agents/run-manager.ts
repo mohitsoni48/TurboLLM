@@ -153,30 +153,34 @@ export class AgentRunManager {
       return
     }
 
-    // Record the model that runs this contract (read back at disposition time to write
-    // the per-Hitman track record, §12.3). Stored on the run's conversation modelKey.
-    this.d.db.updateConversation(pending.convId, { modelKey: ms.model.key })
-
-    // Persist the turn to the run's conversation (reuses the messages table).
-    this.d.db.addMessage(pending.convId, 'user', pending.userMessage)
-    this.d.db.addMessage(pending.convId, 'assistant', '', { stats: { aborted: false } })
-    const assistantMsg = this.d.db.getLastMessage(pending.convId)!
-
     // Accumulate the streamed assistant text so it lands in the DB on completion.
     let fullContent = ''
     // Hard-ceiling state (hoisted so the catch block can distinguish "hit the limit"
-    // from a user cancel / real failure).
-    const maxToolCalls = agent.maxIterations ?? 30
+    // from a user cancel / real failure). Clamp defensively even though config validates.
+    const maxToolCalls = Math.max(1, Math.min(200, Math.floor(agent.maxIterations ?? 30)))
     let hitCeiling = false
+    // assistantMsg is assigned inside the try (the conversation could be deleted between
+    // launch and run); the catch/finally must tolerate it being undefined.
+    let assistantMsg: ReturnType<Deps['db']['getLastMessage']> | undefined
 
     try {
+      // Record the model that runs this contract + persist the turn. These DB writes are
+      // INSIDE the try: if the conversation was deleted between launch and now, the FK
+      // throw lands in catch (not as an unhandled rejection that wedges the queue, H3).
+      this.d.db.updateConversation(pending.convId, { modelKey: ms.model.key })
+      this.d.db.addMessage(pending.convId, 'user', pending.userMessage)
+      this.d.db.addMessage(pending.convId, 'assistant', '', { stats: { aborted: false } })
+      assistantMsg = this.d.db.getLastMessage(pending.convId)
+      if (!assistantMsg) throw new Error('conversation_gone')
+
       const { toolNames, systemPrompt } = this.resolveSkills(agent)
       const dataDir = this.d.store.dir()
 
-      // FS tools (always available to the adapter; the guard + skill grants gate them).
+      // FS tools (always present to the adapter; the guard + skill grants gate them).
       const fsTools = [createReadFileTool(), createListDirTool(), createGlobTool(), createWriteFileTool()]
-      // Bridged ToolRegistry tools (web_search/fetch_url/run_code/mcp__*) the agent's skills grant.
-      const bridged = await buildBridgedTools(this.d, agent)
+      // Bridged ToolRegistry tools the agent's skills grant (by tool NAME). run_code is
+      // never bridged into an autonomous run (security review C4).
+      const bridged = await buildBridgedTools(this.d, toolNames)
       const bridgedNames = new Set(bridged.map((t) => t.name))
 
       const baseGuard = makeToolCallGuard(agent, dataDir, bridgedNames)
@@ -229,28 +233,36 @@ export class AgentRunManager {
         },
         ac.signal,
       )
-      this.d.db.updateMessage(assistantMsg.id, { content: fullContent, stats: { aborted: false } })
+      if (assistantMsg) this.d.db.updateMessage(assistantMsg.id, { content: fullContent, stats: { aborted: false } })
       // The run reaches 'done' whether the model called complete_task or just stopped.
-      // Disposition (complete/miss → track record) happens via the user's button (§14),
-      // which records the model that ran it.
+      // Disposition (complete/miss → track record) happens via the user's button (§14).
       this.d.db.updateAgentRun?.(pending.id, { status: 'done', endedAt: new Date().toISOString() })
+      // Synthetic terminal event in the buffer (M1) so a client replaying from fromSeq
+      // ALWAYS gets a 'done' frame and never spins.
+      sink({ event: 'done', data: { runId: pending.id, status: 'done' } })
     } catch (e) {
       const isAbort = (e as Error)?.name === 'AbortError'
-      this.d.db.updateMessage(assistantMsg.id, { content: fullContent, stats: { aborted: isAbort } })
+      if (assistantMsg) this.d.db.updateMessage(assistantMsg.id, { content: fullContent, stats: { aborted: isAbort } })
       // interruptActive() pre-writes 'interrupted' status — don't overwrite it.
       if (!this.interruptedIds.delete(pending.id)) {
         if (hitCeiling) {
           // Hit the iteration ceiling — NOT a failure or cancel. Surfaces as 'done'
           // (awaiting review); the user dispositions it like any finished contract (§14).
-          sink({ event: 'error', data: { code: 'iteration_limit', message: `Stopped after ${maxToolCalls} tool calls — needs review.` } })
           this.d.db.updateAgentRun?.(pending.id, { status: 'done', error: `Stopped at iteration limit (${maxToolCalls}).`, endedAt: new Date().toISOString() })
+          sink({ event: 'done', data: { runId: pending.id, status: 'done', note: `Stopped after ${maxToolCalls} tool calls — needs review.` } })
         } else {
+          const status = isAbort ? 'cancelled' : 'failed'
           this.d.db.updateAgentRun?.(pending.id, {
-            status: isAbort ? 'cancelled' : 'failed',
+            status,
             error: isAbort ? undefined : (e as Error).message,
             endedAt: new Date().toISOString(),
           })
+          // Always emit a terminal frame so the SSE stream + frontend never hang.
+          sink({ event: 'error', data: { code: status, message: isAbort ? 'Cancelled.' : (e as Error).message } })
         }
+      } else {
+        // Interrupted by eviction — still emit a terminal frame.
+        sink({ event: 'error', data: { code: 'interrupted', message: 'The model was unloaded — run interrupted.' } })
       }
     } finally {
       this.finish(pending.id)

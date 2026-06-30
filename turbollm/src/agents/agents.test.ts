@@ -27,8 +27,27 @@ test('isInsideAny: outside all roots', () => {
   assert.ok(!isInsideAny('/tmp/malicious', ['/home/user/project']))
 })
 
-test('isInsideAny: directory traversal', () => {
-  assert.ok(!isInsideAny('/home/user/project/../../etc/passwd', ['/home/user/project']))
+test('isInsideAny: sibling-prefix is not inside (no /home/bobby in /home/bob)', () => {
+  // isInsideAny takes ALREADY-canonicalized paths (canonicalize() resolves `..` first).
+  // It must not treat a sibling that shares a string prefix as inside.
+  assert.ok(!isInsideAny('/home/user/project-evil/x', ['/home/user/project']))
+})
+
+test('guard: blocks .. traversal out of root (via canonicalize)', () => {
+  // The REAL boundary: the guard canonicalizes, so a ../ path that escapes the root
+  // is blocked even though the raw string starts with the root prefix.
+  const root = mkdtempSync(join(tmpdir(), 'guard-trav-'))
+  try {
+    const guard = makeToolCallGuard(
+      { id: 'default', name: 'Default Agent', description: '', skills: [], readRoots: [root], writeRoots: [], callableAgents: [] },
+      root,
+      new Set(),
+    )
+    // root/../<something outside> must be blocked.
+    assert.ok(blocked(guard('read_file', { path: join(root, '..', 'escapee.txt') })))
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
 })
 
 test('isInsideAny: multiple roots — matches second', () => {
@@ -229,4 +248,66 @@ test('guard: blocks symlink escape out of root', async () => {
 
   // Cleanup
   rmSync(tmp, { recursive: true, force: true })
+})
+
+// ── Adversarial hardening tests (security review) ─────────────────────────────
+
+import { isValidSkillId } from './skills'
+
+test('guard: glob is checked on its `root` field, not `path`', () => {
+  const root = mkdtempSync(join(tmpdir(), 'guard-glob-'))
+  try {
+    const guard = makeToolCallGuard(
+      { id: 'd', name: 'd', description: '', skills: [], readRoots: [root], writeRoots: [], callableAgents: [] },
+      root, new Set(),
+    )
+    // In-root glob root → allowed.
+    assert.ok(allowed(guard('glob', { pattern: '**', root })))
+    // glob with a root OUTSIDE the read roots → blocked (even with no `path` field).
+    assert.ok(blocked(guard('glob', { pattern: '**', root: tmpdir() })))
+    // glob with NO root → blocked (can't validate).
+    assert.ok(blocked(guard('glob', { pattern: '**' })))
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('guard: write_file blocked outside writeRoots even when inside readRoots', () => {
+  const root = mkdtempSync(join(tmpdir(), 'guard-ws-'))
+  const sub = join(root, 'writable')
+  mkdirSync(sub, { recursive: true })
+  try {
+    const guard = makeToolCallGuard(
+      { id: 'd', name: 'd', description: '', skills: [], readRoots: [root], writeRoots: [sub], callableAgents: [] },
+      root, new Set(),
+    )
+    assert.ok(allowed(guard('write_file', { path: join(sub, 'ok.txt') })))
+    // Inside readRoots (root) but NOT inside writeRoots (sub) → write blocked.
+    assert.ok(blocked(guard('write_file', { path: join(root, 'nope.txt') })))
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('guard: rejects embedded-NUL paths', () => {
+  const root = mkdtempSync(join(tmpdir(), 'guard-nul-'))
+  try {
+    const guard = makeToolCallGuard(
+      { id: 'd', name: 'd', description: '', skills: [], readRoots: [root], writeRoots: [], callableAgents: [] },
+      root, new Set(),
+    )
+    assert.ok(blocked(guard('read_file', { path: join(root, 'a\0b') })))
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('isValidSkillId: rejects traversal / separators / absolute', () => {
+  assert.ok(isValidSkillId('my-skill'))
+  assert.ok(!isValidSkillId('../config'))
+  assert.ok(!isValidSkillId('a/b'))
+  assert.ok(!isValidSkillId('C:\evil'))
+  assert.ok(!isValidSkillId(''))
+  assert.ok(!isValidSkillId('UPPER'))
+  assert.ok(!isValidSkillId('a'.repeat(65)))
 })

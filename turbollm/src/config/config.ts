@@ -725,6 +725,60 @@ function validate(c: Config): void {
   for (const dir of c.build.toolchainDirs) {
     if (!isAbsolutePath(dir)) throw new ValueError('build.toolchainDirs', 'toolchain directories must be absolute paths')
   }
+  // Agents (spec 13 §2.1): enforce the schema invariants so a bad config can't widen
+  // an agent's filesystem scope or break the run manager's lookups.
+  validateAgents(c)
+}
+
+/** Validate the agents config block (spec 13 §2.1). Keeps the FS-scope invariant
+ *  (write confined to ~/.turbollm in v1) and the structural guarantees the run
+ *  manager + routes rely on (unique ids, exactly one builtin). */
+function validateAgents(c: Config): void {
+  const dataDir = join(homedir(), '.turbollm')
+  const agents = c.agents?.agents ?? []
+  const ids = new Set<string>()
+  let builtins = 0
+  for (const a of agents) {
+    if (!a.id || typeof a.id !== 'string') throw new ValueError('agents', 'every agent needs a non-empty id')
+    if (ids.has(a.id)) throw new ValueError('agents', `duplicate agent id "${a.id}"`)
+    ids.add(a.id)
+    if (!a.name || typeof a.name !== 'string' || !a.name.trim()) throw new ValueError('agents', `agent "${a.id}" needs a non-empty name`)
+    if (a.builtin) builtins++
+    if (!Array.isArray(a.skills)) throw new ValueError('agents', `agent "${a.id}" skills must be an array`)
+    if (!Array.isArray(a.callableAgents)) throw new ValueError('agents', `agent "${a.id}" callableAgents must be an array`)
+    for (const r of a.readRoots ?? []) {
+      if (typeof r !== 'string' || (r !== '<dataDir>' && !isAbsolutePath(r))) {
+        throw new ValueError('agents', `agent "${a.id}" readRoots must be absolute paths`)
+      }
+    }
+    // Write scope is the security-sensitive one (v1 invariant: write only ~/.turbollm).
+    // Reject any writeRoot that isn't absolute OR escapes the data dir.
+    for (const r of a.writeRoots ?? []) {
+      if (typeof r !== 'string' || (r !== '<dataDir>' && !isAbsolutePath(r))) {
+        throw new ValueError('agents', `agent "${a.id}" writeRoots must be absolute paths`)
+      }
+      if (r !== '<dataDir>' && !isWithinDir(r, dataDir)) {
+        throw new ValueError('agents', `agent "${a.id}" writeRoots must be within ${dataDir} (v1 invariant)`)
+      }
+    }
+    if (a.maxIterations !== undefined) {
+      if (!Number.isInteger(a.maxIterations) || a.maxIterations < 1 || a.maxIterations > 200) {
+        throw new ValueError('agents', `agent "${a.id}" maxIterations must be an integer 1–200`)
+      }
+    }
+  }
+  if (agents.length > 0 && builtins !== 1) {
+    throw new ValueError('agents', `exactly one builtin agent is required (found ${builtins})`)
+  }
+}
+
+/** Path-containment check used by config validation (separate from the runtime
+ *  fs-guard, which canonicalizes symlinks). Normalizes separators for comparison. */
+function isWithinDir(p: string, dir: string): boolean {
+  const norm = (s: string) => s.replace(/[\\/]+/g, '/').replace(/\/+$/, '')
+  const np = norm(p)
+  const nd = norm(dir)
+  return np === nd || np.startsWith(nd + '/')
 }
 
 function isAbsolutePath(p: string): boolean {

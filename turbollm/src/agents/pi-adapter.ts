@@ -75,7 +75,7 @@ export async function runAgentSession(
   auth.setRuntimeApiKey('local', 'agent-key')
   const registry = ModelRegistry.inMemory(auth)
 
-  registerLocalProvider(config.baseUrl, config.modelId, auth, registry, config.gate)
+  registerLocalProvider(config.baseUrl, config.modelId, auth, registry, config.gate, signal)
   const model = registry.find('local', config.modelId)
   if (!model) throw new Error(`Model ${config.modelId} not found`)
 
@@ -168,19 +168,25 @@ export async function runAgentSession(
   return runResult ?? { tokens: { input: 0, output: 0 }, cost: 0 }
 }
 
+// Tools that are NEVER bridged into an autonomous agent run — no human-in-the-loop.
+// run_code executes arbitrary JS; the foreground-chat confirmation gate doesn't apply
+// to unattended agent runs, so it must not be reachable here (security review C4).
+const NON_BRIDGEABLE = new Set(['run_code'])
+
 // ── buildBridgedTools ─────────────────────────────────────────────────────────
-/** Wrap TurboLLM ToolRegistry tools as pi custom tools. */
+/** Wrap TurboLLM ToolRegistry tools as pi custom tools, filtered to the tool NAMES the
+ *  agent's skills actually grant (skills hold tool names; the caller resolves them).
+ *  run_code is excluded unconditionally. */
 export async function buildBridgedTools(
   d: Deps,
-  agent: AgentType,
+  grantedToolNames: string[],
 ): Promise<ReturnType<typeof defineTool>[]> {
   const defs = await d.tools?.buildToolDefinitions() ?? []
+  const granted = new Set(grantedToolNames)
 
-  const granted = agent.skills.includes('*')
-    ? defs
-    : defs.filter((t) => agent.skills.includes(t.function.name))
-
-  return granted.map((t) =>
+  return defs
+    .filter((t) => granted.has(t.function.name) && !NON_BRIDGEABLE.has(t.function.name))
+    .map((t) =>
     defineTool({
       name: t.function.name,
       label: t.function.name,
@@ -212,14 +218,16 @@ function toolResultText(result: unknown): string {
  *  inner (gate-held) stream is available. */
 function forwardStream(inner: Promise<AssistantMessageEventStream>): AssistantMessageEventStream {
   const out = createAssistantMessageEventStream()
+  // NEVER re-throw here: this runs inside `void inner.then(...)`, so a throw becomes an
+  // unhandled rejection (daemon-crash risk, review C1). On any failure just end the
+  // stream so pi sees a clean termination and surfaces the error through its own loop.
   void inner.then(
     async (s) => {
       try {
         for await (const ev of s) out.push(ev)
         out.end(await s.result())
-      } catch (e) {
+      } catch {
         out.end()
-        throw e
       }
     },
     () => out.end(), // gate acquire failed — end empty so pi doesn't hang
@@ -234,12 +242,17 @@ function forwardStream(inner: Promise<AssistantMessageEventStream>): AssistantMe
  *  provide a custom `streamSimple` that acquires the gate at 'bg' priority,
  *  delegates to pi-ai's built-in openai-completions streamer, and releases the
  *  gate when the stream completes (success or error). */
+/** Per-engine-call timeout: if the engine produces nothing for this long, abort the
+ *  request so a stalled (not killed) llama-server can't hold the gate forever (review H1). */
+const GENERATION_TIMEOUT_MS = 10 * 60_000
+
 export function registerLocalProvider(
   baseUrl: string,
   modelId: string,
   authStorage: AuthStorage,
   registry: ModelRegistry,
   gate?: GenerationGate,
+  runSignal?: AbortSignal,
 ): void {
   authStorage.setRuntimeApiKey('local', 'agent-key')
   registry.registerProvider('local', {
@@ -250,6 +263,14 @@ export function registerLocalProvider(
     ...(gate
       ? {
           streamSimple: (model, context, options) => {
+            // Tie the engine fetch to BOTH the run's abort signal (so model eviction /
+            // cancel aborts the in-flight request) AND a hard timeout (so a stalled
+            // engine can't wedge the gate). pi passes options.signal to its fetch.
+            const timeout = AbortSignal.timeout(GENERATION_TIMEOUT_MS)
+            const mergedSignal = runSignal
+              ? AbortSignal.any([runSignal, timeout, ...(options?.signal ? [options.signal] : [])])
+              : AbortSignal.any([timeout, ...(options?.signal ? [options.signal] : [])])
+            options = { ...options, signal: mergedSignal }
             // Acquire BEFORE the request, release when the stream drains. The
             // returned stream is handed straight to pi; we only attach a release
             // on its terminal result() so the gate is never leaked.
@@ -259,9 +280,17 @@ export function registerLocalProvider(
             const stream = gate
               .acquire('bg')
               .then((release) => {
-                const s = openaiStreamSimple(oaModel, context, options)
-                void s.result().finally(release)
-                return s
+                // Guarantee release even if openaiStreamSimple throws SYNCHRONOUSLY
+                // (malformed model/options) — otherwise the gate leaks and the engine
+                // slot wedges for all future runs (review C1 sync-leak).
+                try {
+                  const s = openaiStreamSimple(oaModel, context, options)
+                  void s.result().finally(release)
+                  return s
+                } catch (e) {
+                  release()
+                  throw e
+                }
               })
             // pi expects a stream synchronously; bridge the acquire promise by
             // returning a stream that forwards once the gate is held.

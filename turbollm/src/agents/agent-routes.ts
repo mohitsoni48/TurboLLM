@@ -19,8 +19,8 @@ import type { Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import { randomUUID } from 'node:crypto'
 import type { Deps } from '../deps'
-import type { AgentType } from '../config/config'
-import { SkillStore, isBuiltinSkill, type Skill } from './skills'
+import { ValueError, type AgentType } from '../config/config'
+import { SkillStore, isBuiltinSkill, isValidSkillId, type Skill } from './skills'
 import { isLocalRequest } from '../auth'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -44,6 +44,7 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
     if (!isLocalRequest(c, d)) return err(c, 403, 'forbidden', 'Agents can only be configured on the machine running TurboLLM.')
     const b = await body<Partial<AgentType>>(c)
     if (!b.name?.trim()) return err(c, 400, 'invalid_config_value', 'name is required.')
+    if (d.store.snapshot().agents.agents.length >= 100) return err(c, 400, 'too_many_agents', 'Agent limit reached (100).')
     const dataDir = d.store.dir()
     const agent: AgentType = {
       id: randomUUID(),
@@ -55,7 +56,12 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
       callableAgents: Array.isArray(b.callableAgents) ? b.callableAgents : [],
       maxIterations: typeof b.maxIterations === 'number' ? b.maxIterations : 30,
     }
-    d.store.update((cfg) => { cfg.agents.agents.push(agent) })
+    try {
+      d.store.update((cfg) => { cfg.agents.agents.push(agent) })
+    } catch (e) {
+      if (e instanceof ValueError) return err(c, 400, 'invalid_config_value', e.message)
+      throw e
+    }
     return c.json(agent, 201)
   })
 
@@ -65,17 +71,22 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
     const b = await body<Partial<AgentType>>(c)
     const existing = d.store.snapshot().agents.agents.find((a) => a.id === id)
     if (!existing) return err(c, 404, 'not_found', 'Agent not found.')
-    d.store.update((cfg) => {
-      const a = cfg.agents.agents.find((x) => x.id === id)!
-      // The builtin default's identity (name/id/builtin) is locked; its scope + skills are editable.
-      if (!a.builtin && typeof b.name === 'string' && b.name.trim()) a.name = b.name.trim()
-      if (typeof b.description === 'string') a.description = b.description.trim()
-      if (Array.isArray(b.skills)) a.skills = b.skills
-      if (Array.isArray(b.readRoots)) a.readRoots = b.readRoots
-      if (Array.isArray(b.writeRoots)) a.writeRoots = b.writeRoots
-      if (Array.isArray(b.callableAgents)) a.callableAgents = b.callableAgents
-      if (typeof b.maxIterations === 'number') a.maxIterations = b.maxIterations
-    })
+    try {
+      d.store.update((cfg) => {
+        const a = cfg.agents.agents.find((x) => x.id === id)!
+        // The builtin default's identity (name/id/builtin) is locked; its scope + skills are editable.
+        if (!a.builtin && typeof b.name === 'string' && b.name.trim()) a.name = b.name.trim()
+        if (typeof b.description === 'string') a.description = b.description.trim()
+        if (Array.isArray(b.skills)) a.skills = b.skills
+        if (Array.isArray(b.readRoots)) a.readRoots = b.readRoots
+        if (Array.isArray(b.writeRoots)) a.writeRoots = b.writeRoots
+        if (Array.isArray(b.callableAgents)) a.callableAgents = b.callableAgents
+        if (typeof b.maxIterations === 'number') a.maxIterations = b.maxIterations
+      })
+    } catch (e) {
+      if (e instanceof ValueError) return err(c, 400, 'invalid_config_value', e.message)
+      throw e
+    }
     return c.json(d.store.snapshot().agents.agents.find((a) => a.id === id))
   })
 
@@ -100,6 +111,9 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
     if (!b.name?.trim()) return err(c, 400, 'invalid_config_value', 'name is required.')
     if (isBuiltinSkill(b.id)) return err(c, 400, 'builtin_skill', 'Cannot overwrite a built-in skill.')
     if (!b.instructions?.trim()) return err(c, 400, 'invalid_config_value', 'instructions are required.')
+    // Cap the library (review M4): each list() reads+parses every file.
+    const lib = skills().list()
+    if (!lib.some((s) => s.id === b.id) && lib.length >= 200) return err(c, 400, 'too_many_skills', 'Skill limit reached (200).')
     const skill: Skill = {
       id: b.id.trim(),
       name: b.name.trim(),
@@ -112,26 +126,34 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
   })
 
   app.delete('/api/v1/skills/:id', (c) => {
+    // Deleting a skill removes a file on disk → local-gate + validate the id can't escape.
+    if (!isLocalRequest(c, d)) return err(c, 403, 'forbidden', 'Skills can only be modified on the machine running TurboLLM.')
     const id = c.req.param('id')
+    if (!isValidSkillId(id)) return err(c, 400, 'invalid_config_value', 'invalid skill id.')
     if (isBuiltinSkill(id)) return err(c, 400, 'builtin_skill', 'Built-in skills cannot be deleted.')
     skills().delete(id)
     return c.json({ ok: true })
   })
 
   // ── Runs ──────────────────────────────────────────────────────────────────
+  const MAX_USER_MESSAGE = 100_000 // chars — guard against multi-MB prompts (review L2)
   app.post('/api/v1/agents/:id/runs', async (c) => {
+    // A run EXECUTES host-side FS tools — gate it to the local host (review M1).
+    if (!isLocalRequest(c, d)) return err(c, 403, 'forbidden', 'Agent runs can only be launched on the machine running TurboLLM.')
     if (!d.agents) return err(c, 501, 'not_implemented', 'Agent runner not available.')
     const agentId = c.req.param('id')
     const b = await body<{ title?: string; userMessage?: string }>(c)
-    if (!b.userMessage?.trim()) return err(c, 400, 'invalid_input', 'userMessage is required.')
+    const msg = b.userMessage?.trim()
+    if (!msg) return err(c, 400, 'invalid_input', 'userMessage is required.')
+    if (msg.length > MAX_USER_MESSAGE) return err(c, 400, 'message_too_long', `userMessage exceeds ${MAX_USER_MESSAGE} characters.`)
     if (!d.store.snapshot().agents.agents.some((a) => a.id === agentId)) {
       return err(c, 404, 'not_found', 'Agent not found.')
     }
     try {
       const id = await d.agents.launch({
         agentId,
-        title: b.title?.trim() || 'Agent run',
-        userMessage: b.userMessage.trim(),
+        title: b.title?.trim().slice(0, 200) || 'Agent run',
+        userMessage: msg,
       })
       return c.json(d.db.getAgentRun?.(id), 201)
     } catch (e) {
@@ -164,7 +186,8 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
 
   app.get('/api/v1/agents/runs/:id/stream', (c) => {
     const id = c.req.param('id')
-    const fromSeq = Math.max(0, Number(c.req.query('fromSeq') ?? '0'))
+    const rawSeq = Number(c.req.query('fromSeq') ?? '0')
+    const fromSeq = Number.isFinite(rawSeq) ? Math.max(0, Math.floor(rawSeq)) : 0 // ?fromSeq=abc → 0 (L1)
     if (!d.agents) return err(c, 501, 'not_implemented', 'Agent runner not available.')
     const run = d.db.getAgentRun?.(id)
     if (!run) return err(c, 404, 'not_found', 'Run not found.')
@@ -203,24 +226,40 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
     d.db.addTrackRecord?.({ agentId: run.agentId, runId, model, outcome, feedback })
   }
 
+  // A run can be dispositioned only once, and only after it has finished. These guards
+  // stop a tester from double-completing (duplicate track-record rows) or dispositioning
+  // a still-running contract.
+  const FINISHED = new Set(['done', 'failed', 'cancelled', 'interrupted'])
+  const dispositionGuard = (runId: string): { run: import('../chat/db').AgentRun } | { error: [number, string, string] } => {
+    const run = d.db.getAgentRun?.(runId)
+    if (!run) return { error: [404, 'not_found', 'Run not found.'] }
+    if (run.completion) return { error: [409, 'already_dispositioned', `This contract was already marked "${run.completion}".`] }
+    if (!FINISHED.has(run.status)) return { error: [409, 'run_active', 'This contract is still running — cancel it first or wait for it to finish.'] }
+    return { run }
+  }
+
   // ✓ Mark complete → record 'complete' + archive.
   app.post('/api/v1/agents/runs/:id/complete', (c) => {
+    if (!isLocalRequest(c, d)) return err(c, 403, 'forbidden', 'Local host only.')
     const id = c.req.param('id')
-    const run = d.db.getAgentRun?.(id)
-    if (!run) return err(c, 404, 'not_found', 'Run not found.')
+    const g = dispositionGuard(id)
+    if ('error' in g) return err(c, g.error[0] as 404, g.error[1], g.error[2])
     recordOutcome(id, 'complete')
     d.db.setRunDisposition?.(id, 'complete', true)
     return c.json({ ok: true })
   })
 
-  // ⛔ Flag miss → record 'miss' + feedback. Run stays available for the user to Reply.
+  // ⛔ Flag miss → record 'miss' + feedback, then archive (v1 has no mid-run resume; the
+  //    user starts a fresh contract to retry). The miss + feedback feed the track record.
   app.post('/api/v1/agents/runs/:id/flag-miss', async (c) => {
+    if (!isLocalRequest(c, d)) return err(c, 403, 'forbidden', 'Local host only.')
     const id = c.req.param('id')
-    const run = d.db.getAgentRun?.(id)
-    if (!run) return err(c, 404, 'not_found', 'Run not found.')
+    const g = dispositionGuard(id)
+    if ('error' in g) return err(c, g.error[0] as 404, g.error[1], g.error[2])
     const b = await body<{ feedback?: string }>(c)
-    recordOutcome(id, 'miss', b.feedback?.trim() || undefined)
-    d.db.setRunDisposition?.(id, 'miss', false)
+    const feedback = b.feedback?.trim().slice(0, 5000) || undefined
+    recordOutcome(id, 'miss', feedback)
+    d.db.setRunDisposition?.(id, 'miss', true)
     return c.json({ ok: true })
   })
 

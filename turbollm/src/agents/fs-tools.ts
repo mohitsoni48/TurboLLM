@@ -61,8 +61,14 @@ export function createGlobTool() {
       root: Type.Optional(Type.String({ description: 'Root directory to search from' })),
     }),
     execute: async (_id, params, _signal, _onUpdate, _ctx) => {
-      const results = globMatch(params.pattern, params.root)
-      return { content: [{ type: 'text' as const, text: results.join('\n') }], details: undefined }
+      // The guard requires + containment-checks `root` for glob, so root is present and
+      // in-scope by the time we run. Defense-in-depth: refuse a missing root here too.
+      if (!params.root || typeof params.root !== 'string') {
+        return { content: [{ type: 'text' as const, text: 'glob requires a `root` directory.' }], details: undefined }
+      }
+      const { results, truncated } = globMatch(params.pattern, params.root)
+      const note = truncated ? `\n…(truncated at ${MAX_GLOB_RESULTS} results)` : ''
+      return { content: [{ type: 'text' as const, text: results.join('\n') + note }], details: undefined }
     },
   })
 }
@@ -92,22 +98,29 @@ function readDirEntries(path: string): { name: string; isDir: boolean }[] {
   return entries.map((e: Dirent) => ({ name: e.name, isDir: e.isDirectory() }))
 }
 
-function globMatch(pattern: string, root?: string): string[] {
-  function walk(dir: string): string[] {
-    if (!existsSync(dir) || !statSync(dir).isDirectory()) return []
-    const entries = readdirSync(dir, { withFileTypes: true })
-    const results: string[] = []
-    for (const e of entries) {
-      const child = join(dir, e.name)
-      results.push(child)
-      if (e.isDirectory()) results.push(...walk(child))
-    }
-    return results
-  }
+const MAX_GLOB_RESULTS = 5000
+const MAX_GLOB_DEPTH = 25
 
-  const searchRoot = root || process.cwd()
-  const allPaths = walk(searchRoot)
-  return allPaths.filter(p => simpleMatch(p, pattern))
+/** Bounded, symlink-safe directory walk confined to `root`. Caps total results and
+ *  depth, and never recurses into symlinked dirs (`withFileTypes` reports a symlink as
+ *  NOT a directory, so `e.isDirectory()` is false — no symlink-cycle infinite loop). */
+function globMatch(pattern: string, root: string): { results: string[]; truncated: boolean } {
+  const results: string[] = []
+  let truncated = false
+  const visit = (dir: string, depth: number): void => {
+    if (truncated || depth > MAX_GLOB_DEPTH) return
+    let entries: Dirent[]
+    try { entries = readdirSync(dir, { withFileTypes: true }) } catch { return }
+    for (const e of entries) {
+      if (results.length >= MAX_GLOB_RESULTS) { truncated = true; return }
+      const child = join(dir, e.name)
+      if (simpleMatch(child, pattern)) results.push(child)
+      // Only real directories recurse — symlinked dirs report isDirectory()===false.
+      if (e.isDirectory()) visit(child, depth + 1)
+    }
+  }
+  if (existsSync(root) && statSync(root).isDirectory()) visit(root, 0)
+  return { results, truncated }
 }
 
 function simpleMatch(path: string, pattern: string): boolean {

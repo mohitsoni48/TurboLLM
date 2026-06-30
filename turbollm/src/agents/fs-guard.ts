@@ -1,92 +1,118 @@
-// Filesystem guard — default-deny containment check for agent tool calls (spec 13 §4.2)
-import { realpathSync, readlinkSync, lstatSync } from 'node:fs'
-import { dirname, resolve, sep, posix, isAbsolute } from 'node:path'
+// Filesystem guard — default-deny containment for agent tool calls (spec 13 §4.2).
+//
+// Hardened per adversarial review: canonicalizes symlinks via the nearest existing
+// ancestor (so a symlink ANYWHERE in the path can't escape), case-folds on Windows,
+// rejects embedded NUL / non-absolute / drive-relative roots, validates the correct
+// path field PER TOOL (glob uses `root`, not `path`), and has NO parent-escape clause.
+import { realpathSync } from 'node:fs'
+import { resolve, dirname, basename, join, sep } from 'node:path'
 import type { AgentType } from '../config/config'
 
 const PI_BUILTINS_DENIED = new Set(['bash', 'write', 'edit', 'read', 'ls', 'find', 'grep'])
-const FS_READ = new Set(['read_file', 'list_dir', 'glob'])
-const FS_WRITE = new Set(['write_file', 'create_skill'])
+// Custom FS tools and the field each one actually reads — glob's search root is `root`,
+// not `path`, so the guard MUST check `root` for glob or it validates a field glob ignores.
+const FS_READ_PATH = new Set(['read_file', 'list_dir'])
+const FS_READ_ROOT = new Set(['glob'])
+const FS_WRITE_PATH = new Set(['write_file', 'create_skill'])
+const ALLOWED_ACTION = new Set(['call_agent', 'complete_task', 'update_doc'])
 
 export type ToolCallGuardResult = { allow: true } | { block: true; reason: string }
 export type ToolCallGuard = (toolName: string, input: Record<string, unknown>) => ToolCallGuardResult
+
+const isWin = process.platform === 'win32'
 
 export function makeToolCallGuard(agent: AgentType, dataDir: string, bridgedNames: Set<string>): ToolCallGuard {
   const readRoots = resolveRoots(agent.readRoots, dataDir)
   const writeRoots = resolveRoots(agent.writeRoots, dataDir)
   return (toolName, input) => {
-    // 1. Hard-deny pi built-ins
-    if (PI_BUILTINS_DENIED.has(toolName))
-      return { block: true, reason: `built-in '${toolName}' is not permitted` }
-    // 2. Our FS tools: containment-check
-    if (FS_READ.has(toolName) || FS_WRITE.has(toolName)) {
-      const p = safeRealpath(typeof input.path === 'string' ? input.path : null)
-      const roots = FS_WRITE.has(toolName) ? writeRoots : readRoots
-      if (!p || !isInsideAny(p, roots))
-        return { block: true, reason: `path outside allowed ${FS_WRITE.has(toolName) ? 'write' : 'read'} roots` }
+    // 1. Hard-deny pi built-ins (they bypass our path checks entirely).
+    if (PI_BUILTINS_DENIED.has(toolName)) return { block: true, reason: `built-in '${toolName}' is not permitted` }
+
+    // 2. Our path-taking FS tools: canonicalize + containment-check the RIGHT field.
+    const isReadPath = FS_READ_PATH.has(toolName)
+    const isReadRoot = FS_READ_ROOT.has(toolName)
+    const isWrite = FS_WRITE_PATH.has(toolName)
+    if (isReadPath || isReadRoot || isWrite) {
+      const field = isReadRoot ? input.root : input.path
+      const p = canonicalize(typeof field === 'string' ? field : null)
+      if (!p) return { block: true, reason: `${toolName}: a valid ${isReadRoot ? 'root' : 'path'} is required` }
+      const roots = isWrite ? writeRoots : readRoots
+      if (!isInsideAny(p, roots)) return { block: true, reason: `path outside allowed ${isWrite ? 'write' : 'read'} roots` }
       return { allow: true }
     }
-    // 3. Bridged registry tools — no FS surface
+
+    // 3. Bridged ToolRegistry tools the agent was granted (web_search/fetch_url/mcp__*):
+    //    no direct filesystem surface → allow. (run_code is NOT bridged — see pi-adapter.)
     if (bridgedNames.has(toolName)) return { allow: true }
-    // 4. Known action tools
-    if (toolName === 'call_agent' || toolName === 'complete_task' || toolName === 'update_doc')
-      return { allow: true }
-    // 5. Default-deny: anything unknown is blocked
+
+    // 4. Known action tools (composition + task-tracking).
+    if (ALLOWED_ACTION.has(toolName)) return { allow: true }
+
+    // 5. Default-deny: anything unrecognized is blocked.
     return { block: true, reason: `unrecognized tool '${toolName}' denied` }
   }
 }
 
+/** Resolve config roots to canonical absolute paths. `<dataDir>` → the data dir.
+ *  Non-absolute / drive-relative roots are dropped (config.validate also rejects them);
+ *  every root is canonicalized so a symlinked root matches a canonicalized input path. */
 function resolveRoots(roots: string[], dataDir: string): string[] {
-  return roots.map(r => {
-    if (r === '<dataDir>') return dataDir
-    // On Windows, resolve() treats POSIX absolute paths as relative.
-    // If a root starts with '/', treat it as absolute (our roots are always posix).
-    if (r.startsWith('/')) return r
-    return resolve(r)
-  })
+  const out: string[] = []
+  for (const r of roots) {
+    const raw = r === '<dataDir>' ? dataDir : r
+    if (!isOsAbsolute(raw)) continue
+    const c = canonicalize(raw)
+    if (c) out.push(c)
+  }
+  return out
 }
 
-function safeRealpath(path: string | null): string | null {
-  if (!path) return null
-  try {
-    // Check if path is a symlink first — readlinkSync gives us the target
-    const lstat = lstatSync(path)
-    if (lstat.isSymbolicLink()) {
-      // Read the symlink target and resolve it relative to the symlink's parent
-      const target = readlinkSync(path)
-      const resolvedTarget = isAbsolute(target) ? target : posix.join(dirname(path), target)
-      const targetReal = safeRealpath(resolvedTarget)
-      if (!targetReal) return null
-      return targetReal
-    }
-    // Not a symlink — canonicalize the path
-    const real = realpathSync(path)
-    return posix.normalize(real.split(sep).join('/'))
-  } catch {
-    // Path doesn't exist — canonicalize the parent directory (which exists)
-    // and append the filename. This handles:
-    // 1. New files being written (parent dir exists, file doesn't)
-    // 2. Symlinks that point outside the root (realpathSync fails here)
-    const parent = dirname(path)
-    if (parent === path) return null // can't go higher
+/** Canonicalize an input path: resolve all symlinks in the nearest EXISTING ancestor,
+ *  then re-append the non-existent tail (which therefore cannot contain a symlink).
+ *  Returns a comparison-normalized absolute path, or null if the input is unusable.
+ *  Mirrors the proven routes.ts containment (isWithinHome + realpathSync). */
+function canonicalize(input: string | null): string | null {
+  if (typeof input !== 'string' || input.length === 0) return null
+  if (input.includes('\0')) return null
+  let abs: string
+  try { abs = resolve(input) } catch { return null }
+  const tail: string[] = []
+  let cur = abs
+  for (let i = 0; i < 4096; i++) {
     try {
-      const realParent = realpathSync(parent)
-      const filename = path.split(sep).pop() || ''
-      const canonical = posix.join(posix.normalize(realParent.split(sep).join('/')), filename)
-      return canonical
+      const real = realpathSync(cur)
+      const full = tail.length ? join(real, ...[...tail].reverse()) : real
+      return normForCompare(full)
     } catch {
-      // Parent doesn't exist either — use resolve for containment check
-      const resolved = resolve(path)
-      return posix.normalize(resolved.split(sep).join('/'))
+      const parent = dirname(cur)
+      if (parent === cur) return normForCompare(abs) // reached the root; nothing exists
+      tail.push(basename(cur))
+      cur = parent
     }
   }
+  return normForCompare(abs)
 }
 
+/** Normalize for containment comparison: unify separators to the OS sep and case-fold
+ *  on Windows (NTFS is case-insensitive; 8.3 short names are already expanded by realpath). */
+function normForCompare(p: string): string {
+  const unified = p.split(/[\\/]+/).join(sep)
+  return isWin ? unified.toLowerCase() : unified
+}
+
+function isOsAbsolute(p: string): boolean {
+  if (typeof p !== 'string') return false
+  if (isWin) return /^[a-zA-Z]:[\\/]/.test(p) || /^[\\/]{2}/.test(p) // drive-absolute or UNC
+  return p.startsWith('/')
+}
+
+/** True iff `path` is one of the roots or a descendant. Both sides are normalized.
+ *  No parent-escape clause — containment is exact-match OR startsWith(root + sep). */
 export function isInsideAny(path: string, roots: string[]): boolean {
-  // Resolve path to canonical form (handles .., ., redundant separators)
-  const normalized = posix.normalize(path.split(sep).join('/'))
+  const p = normForCompare(path)
   for (const root of roots) {
-    const rootNorm = posix.normalize(root.split(sep).join('/'))
-    if (normalized === rootNorm || normalized.startsWith(rootNorm + '/') || normalized === rootNorm + '/..') return true
+    const r = normForCompare(root)
+    if (p === r || p.startsWith(r + sep)) return true
   }
   return false
 }
