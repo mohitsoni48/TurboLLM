@@ -9,7 +9,6 @@ import type { AgentType } from '../config/config'
 import { runAgentSession } from './pi-adapter'
 import { buildBridgedTools } from './pi-adapter'
 import { makeToolCallGuard } from './fs-guard'
-import { createReadFileTool, createListDirTool, createGlobTool, createWriteFileTool } from './fs-tools'
 import { createUpdateDocTool, createCompleteTaskTool, type CompletionSignal } from './task-tools'
 import { SkillStore } from './skills'
 import { engineModelAlias } from '../engines/compat'
@@ -176,10 +175,10 @@ export class AgentRunManager {
       const { toolNames, systemPrompt } = this.resolveSkills(agent)
       const dataDir = this.d.store.dir()
 
-      // FS tools (always present to the adapter; the guard + skill grants gate them).
-      const fsTools = [createReadFileTool(), createListDirTool(), createGlobTool(), createWriteFileTool()]
-      // Bridged ToolRegistry tools the agent's skills grant (by tool NAME). run_code is
-      // never bridged into an autonomous run (security review C4).
+      // pi's REAL built-in read/bash/edit/write do the filesystem + shell work now (full
+      // real execution) — we no longer inject the guarded compute-only duplicates that
+      // crippled the agent. Bridged ToolRegistry tools the agent's skills grant (by NAME);
+      // run_code is never bridged into an autonomous run (security review C4).
       const bridged = await buildBridgedTools(this.d, toolNames)
       const bridgedNames = new Set(bridged.map((t) => t.name))
 
@@ -219,7 +218,7 @@ export class AgentRunManager {
           systemPrompt,
           userMessage: pending.userMessage,
           tools: toolNames,
-          customTools: [...fsTools, ...taskTools, ...bridged],
+          customTools: [...taskTools, ...bridged],
           onToolCall: guard,
           gate: this.d.gate,
           cwd,

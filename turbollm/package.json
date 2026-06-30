@@ -46,6 +46,8 @@
     "prepublishOnly": "npm run build:web && npm run build"
   },
   "dependencies": {
+    "@earendil-works/pi-ai": "^0.80.2",
+    "@earendil-works/pi-coding-agent": "^0.80.2",
     "@hono/node-server": "^1.13.0",
     "hono": "^4.6.0",
     "puppeteer-core": "^23.11.1",

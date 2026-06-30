@@ -28,6 +28,7 @@ import { ModelRouter } from './gateway/model-router'
 import { ToolRegistry } from './tools/tool-registry'
 import { GenerationGate } from './agents/gate'
 import { AgentTaskState } from './agents/task-state'
+import { AgentRunManager } from './agents/run-manager'
 import { launchCli } from './cli-launch'
 import { writePidfile, removePidfile, stopDaemon, resolveDaemonPort } from './daemon-pid'
 import { createApp } from './server'
@@ -248,12 +249,11 @@ const appUpdates = new AppUpdateChecker(version)
 const deps: Deps = { store, registry, manager, scanner, hashes, db, provision, build, updates, appUpdates, hf, downloads, bench, modelRouter, comfy, tools: toolRegistry, version, startedAt }
 deps.gate = new GenerationGate()
 deps.agentTasks = new AgentTaskState()
-// NOTE: the pi-based AgentRunManager (the deferred Phase-5 swarm machinery) is NOT wired
-// here. The shipped agent feature (redesign Phases 1-4) rides chat's own tool loop and
-// does not use pi — wiring AgentRunManager would bundle pi's cross-spawn (CommonJS
-// `require('child_process')`), which esbuild can't inline into the ESM bundle (it crashes
-// the built dist/cli.js, though `tsx` dev runs are fine). Re-introduce behind an explicit
-// pi-external tsup config when Phase 5 lands.
+// Agent engine: pi coding-agent runs with real shell/file execution (ADR pending). pi is
+// marked `external` in tsup so its dynamic CommonJS require resolves at runtime instead of
+// being inlined by esbuild (which crashed the bundle) — see tsup.config.ts.
+deps.agents = new AgentRunManager(deps)
+deps.agents.reconcileOnStartup()
 // Cloud Launch (ADR-045/152): only wired when --tunnel is passed. Its mere presence
 // on Deps is what forces auth enforcement on tunneled traffic (see auth.ts lanAuth) —
 // absent entirely for the vast majority of runs that never asked for a tunnel.

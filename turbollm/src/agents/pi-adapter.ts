@@ -36,7 +36,12 @@ export interface PiAgentConfig {
    *  root so pi's default system prompt treats that folder as the workspace (else
    *  pi defaults to the repo dir and the model refuses paths outside it). */
   cwd: string
+  /** Permission mode (ADR pending). 'read' = read-only built-ins; 'auto'/'bypass' =
+   *  full read/bash/edit/write; 'ask' = approve each (handled at the tool layer). */
+  mode?: AgentMode
 }
+
+export type AgentMode = 'ask' | 'auto' | 'bypass' | 'read'
 
 /** Wrap a custom tool so the guard runs before its execute. A blocked call never
  *  reaches the underlying tool — the model gets a denial message as the result. */
@@ -83,16 +88,20 @@ export async function runAgentSession(
   // does not accept the extension `tool_call` hook, so this is where enforcement lives).
   const guardedTools = config.customTools.map((t) => guardTool(t, config.onToolCall))
 
+  // Permission mode (ADR pending) decides which of pi's REAL built-in tools the agent
+  // gets. 'read' restricts to the read-only set; everything else enables pi's full
+  // read/bash/edit/write so the agent can actually do work (start servers, run scripts).
+  const builtinTools = config.mode === 'read'
+    ? { tools: ['read', 'grep', 'find', 'ls'] }
+    : {} // omit noTools/tools → pi enables read, bash, edit, write
   const { session } = await createAgentSession({
     model,
     authStorage: auth,
     modelRegistry: registry,
     cwd: config.cwd,
     sessionManager: SessionManager.inMemory(config.cwd),
-    // Disable pi's built-in read/bash/edit/write entirely — the agent only ever sees
-    // our guarded custom tools (FS, bridged registry, action tools). Belt: the guard
-    // also hard-denies these names if pi ever re-enables them.
-    noTools: 'builtin',
+    ...builtinTools,
+    // Our task-tracking + bridged registry tools, in addition to pi's built-ins.
     customTools: guardedTools,
   })
 
