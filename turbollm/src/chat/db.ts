@@ -26,6 +26,9 @@ export interface Conversation {
    *  absence of a key means "fall through to the global toolPolicies default".
    *  Always populated (defaults to {}) when read via rowToConv/getConversation. */
   toolOverrides?: Record<string, 'allow' | 'deny'>
+  /** When set, this chat is bound to an Agent (spec 13 redesign): its system prompt,
+   *  granted tools, and folder scope come from the agent. Null = a plain chat. */
+  agentId?: string
   createdAt: string
   updatedAt: string
   messages?: Message[]
@@ -149,7 +152,7 @@ export interface Message {
   createdAt: string
 }
 
-interface ConvRow { id: string; title: string; system_prompt: string; model_key: string; sampling: string; expert_mode: number; tool_policy: string | null; kind: string | null; folder_id: string | null; tool_overrides: string | null; created_at: string; updated_at: string }
+interface ConvRow { id: string; title: string; system_prompt: string; model_key: string; sampling: string; expert_mode: number; tool_policy: string | null; kind: string | null; folder_id: string | null; tool_overrides: string | null; agent_id: string | null; created_at: string; updated_at: string }
 interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; agent_id: string | null; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null; archived_at: string | null; completion: string | null }
 interface FolderRow { id: string; name: string; sort_order: number; created_at: string; updated_at: string }
 interface MsgRow  { id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string; reasoning: string; attachments: string; text_attachments: string | null; tool_calls: string | null; stats: string; model_key: string | null; research_meta: string | null; created_at: string }
@@ -171,7 +174,7 @@ function safeToolOverrides(s: string | null): Record<string, 'allow' | 'deny'> {
 }
 
 function rowToConv(r: ConvRow): Conversation {
-  return { id: r.id, title: r.title, systemPrompt: r.system_prompt, modelKey: r.model_key, sampling: safeJson(r.sampling) as Record<string, unknown>, expertMode: r.expert_mode === 1, toolPolicy: r.tool_policy ?? undefined, kind: (r.kind === 'agent' ? 'agent' : 'chat'), folderId: r.folder_id ?? null, toolOverrides: safeToolOverrides(r.tool_overrides), createdAt: r.created_at, updatedAt: r.updated_at }
+  return { id: r.id, title: r.title, systemPrompt: r.system_prompt, modelKey: r.model_key, sampling: safeJson(r.sampling) as Record<string, unknown>, expertMode: r.expert_mode === 1, toolPolicy: r.tool_policy ?? undefined, kind: (r.kind === 'agent' ? 'agent' : 'chat'), folderId: r.folder_id ?? null, toolOverrides: safeToolOverrides(r.tool_overrides), agentId: r.agent_id ?? undefined, createdAt: r.created_at, updatedAt: r.updated_at }
 }
 
 function rowToFolder(r: FolderRow): Folder {
@@ -381,6 +384,14 @@ export class ConversationStore {
         PRAGMA user_version = 15;
       `)
     }
+    // v16 (spec 13 redesign §1): bind a CHAT conversation to an Agent. Null = a plain
+    // chat (no agent, no FS/tools). Additive; existing chats get NULL = unchanged behavior.
+    if (v < 16) {
+      this.db.exec(`
+        ALTER TABLE conversations ADD COLUMN agent_id TEXT;
+        PRAGMA user_version = 16;
+      `)
+    }
   }
 
   listConversations(q?: string, kind: 'chat' | 'agent' | 'all' = 'all'): Conversation[] {
@@ -401,11 +412,11 @@ export class ConversationStore {
     return (this.db.prepare(`SELECT * FROM conversations ORDER BY updated_at DESC LIMIT 200`).all() as unknown as ConvRow[]).map(rowToConv)
   }
 
-  createConversation(partial?: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'modelKey' | 'sampling' | 'expertMode' | 'toolPolicy' | 'kind' | 'folderId'>>): Conversation {
+  createConversation(partial?: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'modelKey' | 'sampling' | 'expertMode' | 'toolPolicy' | 'kind' | 'folderId' | 'agentId'>>): Conversation {
     const now = new Date().toISOString()
     const id = randomUUID()
-    this.db.prepare(`INSERT INTO conversations (id,title,system_prompt,model_key,sampling,expert_mode,tool_policy,kind,folder_id,created_at,updated_at) VALUES ($id,$title,$sp,$mk,$samp,$expert,$tp,$kind,$fid,$now,$now)`)
-      .run({ $id: id, $title: partial?.title ?? 'New chat', $sp: partial?.systemPrompt ?? '', $mk: partial?.modelKey ?? '', $samp: JSON.stringify(partial?.sampling ?? {}), $expert: partial?.expertMode ? 1 : 0, $tp: partial?.toolPolicy ?? null, $kind: partial?.kind ?? 'chat', $fid: partial?.folderId ?? null, $now: now } as P)
+    this.db.prepare(`INSERT INTO conversations (id,title,system_prompt,model_key,sampling,expert_mode,tool_policy,kind,folder_id,agent_id,created_at,updated_at) VALUES ($id,$title,$sp,$mk,$samp,$expert,$tp,$kind,$fid,$aid,$now,$now)`)
+      .run({ $id: id, $title: partial?.title ?? 'New chat', $sp: partial?.systemPrompt ?? '', $mk: partial?.modelKey ?? '', $samp: JSON.stringify(partial?.sampling ?? {}), $expert: partial?.expertMode ? 1 : 0, $tp: partial?.toolPolicy ?? null, $kind: partial?.kind ?? 'chat', $fid: partial?.folderId ?? null, $aid: partial?.agentId ?? null, $now: now } as P)
     return this.getConversation(id)!
   }
 

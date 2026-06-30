@@ -14,6 +14,7 @@ import { buildSnapshot } from './chat-export'
 import type { ExportFormat } from './chat-export'
 import { executeToolCallWithApproval } from '../tools/execute-with-approval'
 import { resolveToolApproval } from '../tools/approval-gate'
+import { buildAgentToolset } from '../agents/agent-tools'
 
 // Track in-flight abort controllers per conversation id.
 const inflight = new Map<string, AbortController>()
@@ -75,8 +76,10 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   })
 
   app.post('/api/v1/conversations', async (c) => {
-    const b = await body<{ title?: string; systemPrompt?: string; modelKey?: string; toolPolicy?: string }>(c)
-    const conv = db.createConversation({ title: b.title, systemPrompt: b.systemPrompt, modelKey: b.modelKey, toolPolicy: b.toolPolicy })
+    const b = await body<{ title?: string; systemPrompt?: string; modelKey?: string; toolPolicy?: string; agentId?: string }>(c)
+    // Bind to an agent (spec 13 redesign): validate it exists; ignore an unknown id.
+    const agentId = b.agentId && d.store.snapshot().agents.agents.some((a) => a.id === b.agentId) ? b.agentId : undefined
+    const conv = db.createConversation({ title: b.title, systemPrompt: b.systemPrompt, modelKey: b.modelKey, toolPolicy: b.toolPolicy, agentId })
     return c.json(conv, 201)
   })
 
@@ -560,6 +563,28 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
   const iterMessages: { role: string; content: unknown; tool_calls?: unknown; tool_call_id?: string }[] =
     ctx.engineMessages.map((m) => ({ role: m.role, content: m.content }))
 
+  // Agent-bound conversation (spec 13 redesign §1.2): inject the agent's CURRENT system
+  // prompt + a note on its readable folders + writable root. Done here (not at conv
+  // creation) so editing the agent updates live conversations. No-op for plain chats.
+  const boundAgent = conv.agentId ? d.store.snapshot().agents.agents.find((a) => a.id === conv.agentId) : undefined
+  if (boundAgent) {
+    const reads = boundAgent.readRoots.map((r) => (r === '<dataDir>' ? d.store.dir() : r))
+    const dataDir = d.store.dir()
+    const agentSys = [
+      boundAgent.systemPrompt || `You are ${boundAgent.name}.`,
+      reads.length ? `You can READ files in these folders: ${reads.join(', ')}.` : '',
+      `You can WRITE files only in: ${dataDir}.`,
+      `Use run_code for computation only (it has no file access); to save a result, return it and call write_file.`,
+    ].filter(Boolean).join('\n\n')
+    const sysIdx = iterMessages.findIndex((m) => m.role === 'system')
+    if (sysIdx >= 0) {
+      const existing = typeof iterMessages[sysIdx].content === 'string' ? iterMessages[sysIdx].content : ''
+      iterMessages[sysIdx] = { ...iterMessages[sysIdx], content: `${agentSys}\n\n${existing}`.trim() }
+    } else {
+      iterMessages.unshift({ role: 'system', content: agentSys })
+    }
+  }
+
   // F-021: inject confidence-loop instruction into Research persona system prompt.
   // Appends to the existing system message (or inserts one if absent).
   const CONFIDENCE_INSTRUCTION =
@@ -601,7 +626,12 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
   d.manager.generationStart()
   try {
     // Get tool definitions once (or empty for engines that don't support tools)
-    const toolDefs = d.tools ? await d.tools.buildToolDefinitions() : []
+    const baseToolDefs = d.tools ? await d.tools.buildToolDefinitions() : []
+    // Agent-bound conversation (spec 13 redesign): merge in the agent's guarded FS/code
+    // tools. When conv.agentId is null this is a no-op → plain chat is byte-identical.
+    const agent = conv.agentId ? d.store.snapshot().agents.agents.find((a) => a.id === conv.agentId) : undefined
+    const agentTools = agent ? buildAgentToolset(agent, d.store.dir()) : undefined
+    const toolDefs = agentTools ? [...baseToolDefs, ...agentTools.defs] : baseToolDefs
 
     outerLoop: while (toolIter <= MAX_TOOL_ITER) {
       toolIter++
@@ -791,24 +821,54 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
           try { parsedArgs = JSON.parse(tc.argsBuffer || '{}') as Record<string, unknown> }
           catch { parsedArgs = {} }
 
-          // Live foreground chat gets the real approval gate (interactive: true) — an
-          // 'ask'-policy tool prompts the user via 'tool_call'/'awaiting_approval' and
-          // waits for POST .../tool-calls/:toolCallId/approve to resolve it.
-          const { result, error: callError } = await executeToolCallWithApproval({
-            tools: d.tools,
-            sink: (ev) => stream.writeSSE({ event: ev.event, data: JSON.stringify(ev.data) }),
-            convId,
-            id: tc.id,
-            name: tc.name,
-            args: parsedArgs,
-            globalPolicies: d.store.snapshot().tools.toolPolicies ?? {},
-            // Re-read fresh on every iteration (not the `conv` snapshot captured at request
-            // start) — otherwise a same-turn repeat tool call misses an "Allow for this
-            // chat" decision the user just made via POST .../tool-calls/:id/approve.
-            convOverrides: d.db.getToolOverrides(convId),
-            signal: ac.signal,
-            interactive: true,
-          })
+          // Is this an agent-owned tool (FS/code, guarded via makeToolCallGuard)? It's
+          // pre-authorized by the agent's own read/write-root scope, so it bypasses the
+          // approval gate entirely and never prompts — route it straight to the agent
+          // executor. Everything else (normal chat tools) still goes through the real
+          // approval gate below.
+          const isAgentTool = agentTools?.names.has(tc.name) ?? false
+
+          let result: string
+          let callError: string | undefined
+
+          if (isAgentTool && agentTools) {
+            // Emit pending event so the frontend can show "calling..."
+            await stream.writeSSE({
+              event: 'tool_call',
+              data: JSON.stringify({ id: tc.id, name: tc.name, args: parsedArgs, status: 'pending' }),
+            })
+            try {
+              result = agentTools.execute({ id: tc.id, name: tc.name, args: parsedArgs })
+            } catch (e) {
+              callError = (e as Error).message
+              result = `Error: ${callError}`
+            }
+            await stream.writeSSE({
+              event: 'tool_call',
+              data: JSON.stringify({ id: tc.id, name: tc.name, args: parsedArgs, status: callError ? 'error' : 'done', result }),
+            })
+          } else {
+            // Live foreground chat gets the real approval gate (interactive: true) — an
+            // 'ask'-policy tool prompts the user via 'tool_call'/'awaiting_approval' and
+            // waits for POST .../tool-calls/:toolCallId/approve to resolve it.
+            const approved = await executeToolCallWithApproval({
+              tools: d.tools,
+              sink: (ev) => stream.writeSSE({ event: ev.event, data: JSON.stringify(ev.data) }),
+              convId,
+              id: tc.id,
+              name: tc.name,
+              args: parsedArgs,
+              globalPolicies: d.store.snapshot().tools.toolPolicies ?? {},
+              // Re-read fresh on every iteration (not the `conv` snapshot captured at request
+              // start) — otherwise a same-turn repeat tool call misses an "Allow for this
+              // chat" decision the user just made via POST .../tool-calls/:id/approve.
+              convOverrides: d.db.getToolOverrides(convId),
+              signal: ac.signal,
+              interactive: true,
+            })
+            result = approved.result
+            callError = approved.error
+          }
 
           // F-021: track web_search calls and accumulate research sources.
           if (tc.name === 'web_search' && !callError) {

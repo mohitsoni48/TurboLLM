@@ -6,10 +6,11 @@ export interface AgentType {
   id: string
   name: string
   description: string
+  systemPrompt?: string     // the agent's persona
   builtin?: boolean
   skills: string[]          // skill ids, or ['*'] for all
   readRoots: string[]
-  writeRoots: string[]
+  writeRoots: string[]      // fixed to ~/.turbollm server-side; not user-settable
   callableAgents: string[]
   maxIterations?: number
 }

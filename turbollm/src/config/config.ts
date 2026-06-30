@@ -186,6 +186,8 @@ export interface AgentType {
   id: string
   name: string
   description: string
+  /** The agent's persona — its system prompt (spec 13 redesign §1.1). */
+  systemPrompt?: string
   builtin?: boolean
   skills: string[]
   readRoots: string[]

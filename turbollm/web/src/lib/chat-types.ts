@@ -89,6 +89,8 @@ export interface Conversation {
   toolPolicy?: string
   /** Folder this conversation is filed under (v10). null/undefined = uncategorized. */
   folderId?: string | null
+  /** When set, this chat is bound to an Agent (its persona/tools/folders). */
+  agentId?: string
   createdAt: string
   updatedAt: string
   messages?: Message[]

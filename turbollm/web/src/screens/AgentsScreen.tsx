@@ -1,1628 +1,1003 @@
-import { useState, useEffect, useRef } from 'react'
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  Bot, Plus, Trash2, X, Loader2, Wrench,
-  CheckCircle2, XCircle, Clock, CircleDot, BookOpen,
-  Play, FolderOpen, UserPlus, Shield, Target,
-  AlertTriangle, FileText, Archive, ChevronDown, ChevronRight, Flag,
+  ArrowDown, Bot, ChevronLeft, ChevronRight, FolderOpen,
+  Pencil, Plus, Search, SendHorizontal, Settings2, Square,
+  Trash2, X,
 } from 'lucide-react'
-import { cn } from '../lib/utils'
 import { Button } from '../components/ui/button'
 import { toast } from '../components/ui/sonner'
+import { cn } from '../lib/utils'
 import { ApiError } from '../lib/api'
 import {
-  agentKeys, skillKeys, agentRunKeys,
-  fetchAgents, createAgent, updateAgent, deleteAgent,
-  fetchSkills, saveSkill, deleteSkill,
-  fetchAgentRuns, fetchAgentRun, createAgentRun, cancelAgentRun,
-  subscribeRunStream,
-  completeRun, flagMiss, fetchRunDoc, fetchTrackRecord, fetchArchive,
+  agentKeys, fetchAgents, createAgent, updateAgent, deleteAgent,
 } from '../lib/agent-api'
-import type { AgentType, Skill, AgentRun, AgentRunStatus, AgentToolCall } from '../lib/agent-types'
+import type { AgentType } from '../lib/agent-types'
+import {
+  createConversation, listConversations, sendMessage, stopGeneration,
+} from '../lib/chat-api'
+import { useConversation, useConversationMutations } from '../lib/chat-queries'
+import type { ChatSseEvent, Conversation, LiveToolCall } from '../lib/chat-types'
+import { MessageBubble, StreamingBubble } from './chat/MessageBubble'
 import { useStatus } from '../lib/queries'
 
-// ── Status helpers ─────────────────────────────────────────────────────────────
-
-const STATUS_ICON: Record<AgentRunStatus, React.ReactNode> = {
-  queued:      <Clock size={12} />,
-  running:     <Loader2 size={12} className="animate-spin" />,
-  done:        <CheckCircle2 size={12} />,
-  failed:      <XCircle size={12} />,
-  cancelled:   <XCircle size={12} />,
-  interrupted: <XCircle size={12} />,
-}
-
-const STATUS_COLOR: Record<AgentRunStatus, string> = {
-  queued:      'text-muted',
-  running:     'text-accent',
-  done:        'text-green-500',
-  failed:      'text-red-500',
-  cancelled:   'text-muted',
-  interrupted: 'text-orange-500',
-}
-
-function StatusBadge({ status }: { status: AgentRunStatus }) {
-  return (
-    <span className={cn('flex items-center gap-1 text-[11px] capitalize', STATUS_COLOR[status])}>
-      {STATUS_ICON[status]}{status}
-    </span>
-  )
-}
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function relTime(iso: string): string {
   const ms = Date.now() - new Date(iso).getTime()
   if (ms < 60_000) return 'just now'
   if (ms < 3_600_000) return `${Math.floor(ms / 60_000)}m ago`
   if (ms < 86_400_000) return `${Math.floor(ms / 3_600_000)}h ago`
-  return new Date(iso).toLocaleDateString()
+  return `${Math.floor(ms / 86_400_000)}d ago`
 }
 
-// ── Tool call row ──────────────────────────────────────────────────────────────
+// ── Live streaming state ──────────────────────────────────────────────────────
 
-interface LiveToolCall {
-  id: string
-  name: string
-  args: Record<string, unknown>
-  status: 'pending' | 'done' | 'error'
-  result?: string
+interface LiveState {
+  assistantId: string
+  content: string
+  reasoning: string
+  progress: { phase: string; pct: number; tps: number } | null
+  liveGenTps: number
+  genTokens: number
+  toolCalls: LiveToolCall[]
 }
 
-function ToolCallRow({ call }: { call: AgentToolCall | LiveToolCall }) {
-  const [open, setOpen] = useState(false)
-  const liveStatus = 'status' in call ? (call as LiveToolCall).status : 'done'
-  const summary =
-    typeof call.args?.query === 'string' ? call.args.query
-    : typeof call.args?.url === 'string' ? call.args.url
-    : typeof call.args?.path === 'string' ? call.args.path
-    : JSON.stringify(call.args ?? {}).slice(0, 80)
-  const result = 'result' in call ? call.result : undefined
+// ── Agent sidebar: lists agents as clickable items ───────────────────────────
 
-  return (
-    <div className="w-full max-w-[85%] rounded-lg border border-border bg-panel px-2.5 py-1.5 text-[12px]">
-      <button
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-center gap-1.5 text-left text-muted hover:text-ink"
-      >
-        {liveStatus === 'pending'
-          ? <Loader2 size={12} className="shrink-0 text-accent animate-spin" />
-          : liveStatus === 'error'
-          ? <XCircle size={12} className="shrink-0 text-red-500" />
-          : <Wrench size={12} className="shrink-0 text-accent" />}
-        <span className="font-medium text-ink">{call.name}</span>
-        <span className="truncate text-faint">{summary}</span>
-      </button>
-      {open && (
-        <pre className="mt-1.5 max-h-48 overflow-auto whitespace-pre-wrap break-words rounded bg-panel-2 p-2 text-[11px] text-muted">
-          {result ?? JSON.stringify(call.args, null, 2)}
-        </pre>
-      )}
-    </div>
-  )
-}
-
-// ── Progress doc viewer ────────────────────────────────────────────────────────
-
-function ProgressDoc({ run }: { run: AgentRun }) {
-  const [open, setOpen] = useState(false)
-  const isActive = run.status === 'running' || run.status === 'queued'
-
-  const docQ = useQuery({
-    queryKey: ['run-doc', run.id],
-    queryFn: () => fetchRunDoc(run.id),
-    refetchInterval: isActive ? 5000 : false,
-  })
-
-  const content = docQ.data?.content ?? ''
-  if (!content.trim()) return null
-
-  return (
-    <div className="border-t border-border">
-      <button
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-center gap-2 px-4 py-2.5 text-left hover:bg-panel-2 transition-colors"
-      >
-        {open ? <ChevronDown size={13} className="shrink-0 text-faint" /> : <ChevronRight size={13} className="shrink-0 text-faint" />}
-        <FileText size={13} className="shrink-0 text-muted" />
-        <span className="text-[12px] font-medium text-muted">Progress doc</span>
-        {isActive && (
-          <span className="ml-auto text-[10px] text-faint">Live</span>
-        )}
-      </button>
-      {open && (
-        <div className="px-4 pb-4">
-          <pre className="slim-scroll max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-panel-2 p-3 text-[12px] leading-relaxed text-muted">
-            {content}
-          </pre>
-        </div>
-      )}
-    </div>
-  )
-}
-
-// ── Disposition buttons ────────────────────────────────────────────────────────
-
-function DispositionPanel({
-  run,
-  onOpenNewContract,
-}: {
-  run: AgentRun
-  onOpenNewContract: (agentId: string) => void
-}) {
-  const qc = useQueryClient()
-  const [flagOpen, setFlagOpen] = useState(false)
-  const [feedback, setFeedback] = useState('')
-
-  const completeMut = useMutation({
-    mutationFn: () => completeRun(run.id),
-    onSuccess: () => {
-      toast.success('Contract marked complete.')
-      void qc.invalidateQueries({ queryKey: agentRunKeys.list() })
-      void qc.invalidateQueries({ queryKey: agentRunKeys.detail(run.id) })
-    },
-    onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not complete contract.'),
-  })
-
-  const flagMut = useMutation({
-    mutationFn: () => flagMiss(run.id, feedback.trim()),
-    onSuccess: () => {
-      toast.success('Flagged — feedback recorded.')
-      setFlagOpen(false)
-      setFeedback('')
-      void qc.invalidateQueries({ queryKey: agentRunKeys.list() })
-      void qc.invalidateQueries({ queryKey: agentRunKeys.detail(run.id) })
-    },
-    onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not flag miss.'),
-  })
-
-  return (
-    <div className="shrink-0 border-t border-border px-4 py-3">
-      {!flagOpen ? (
-        <div className="flex items-center gap-2">
-          <Button
-            size="sm"
-            disabled={completeMut.isPending}
-            onClick={() => completeMut.mutate()}
-            className="gap-1.5"
-          >
-            {completeMut.isPending
-              ? <Loader2 size={12} className="animate-spin" />
-              : <CheckCircle2 size={12} />}
-            Mark complete
-          </Button>
-
-          {run.agentId && (
-            <button
-              type="button"
-              onClick={() => run.agentId && onOpenNewContract(run.agentId)}
-              className="flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-[12px] text-muted transition-colors hover:border-accent hover:text-ink"
-            >
-              <Play size={12} />
-              Reply
-            </button>
-          )}
-
-          <button
-            type="button"
-            onClick={() => setFlagOpen(true)}
-            className="ml-auto flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-[12px] text-muted transition-colors hover:border-red-400 hover:text-red-500"
-          >
-            <Flag size={12} />
-            Flag miss
-          </button>
-        </div>
-      ) : (
-        <div className="space-y-2">
-          <label className="text-[12px] text-muted">What went wrong? (required)</label>
-          <textarea
-            autoFocus
-            value={feedback}
-            onChange={(e) => setFeedback(e.target.value)}
-            placeholder="Describe the issue with this contract's outcome…"
-            rows={3}
-            className="w-full resize-none rounded-lg border border-border bg-panel-2 px-3 py-2 text-[12px] text-ink placeholder:text-faint focus:border-accent focus:outline-none"
-          />
-          <div className="flex items-center gap-2">
-            <Button
-              size="sm"
-              disabled={!feedback.trim() || flagMut.isPending}
-              onClick={() => flagMut.mutate()}
-              className="gap-1.5"
-              style={{ background: 'color-mix(in srgb, var(--err) 80%, transparent)', color: '#fff' }}
-            >
-              {flagMut.isPending ? <Loader2 size={12} className="animate-spin" /> : <Flag size={12} />}
-              Flag miss
-            </Button>
-            <button
-              type="button"
-              onClick={() => { setFlagOpen(false); setFeedback('') }}
-              className="text-[12px] text-muted hover:text-ink"
-            >
-              Cancel
-            </button>
-          </div>
-        </div>
-      )}
-    </div>
-  )
-}
-
-// ── Run detail (streaming) ─────────────────────────────────────────────────────
-
-function RunDetail({
-  run,
-  onOpenNewContract,
-}: {
-  run: AgentRun
-  onOpenNewContract?: (agentId: string) => void
-}) {
-  const qc = useQueryClient()
-  const abortRef = useRef<AbortController | null>(null)
-  const [liveContent, setLiveContent] = useState('')
-  const [liveToolCalls, setLiveToolCalls] = useState<LiveToolCall[]>([])
-  const bottomRef = useRef<HTMLDivElement>(null)
-
-  const cancel = useMutation({
-    mutationFn: () => cancelAgentRun(run.id),
-    onSuccess: () => void qc.invalidateQueries({ queryKey: agentRunKeys.list() }),
-  })
-
-  useEffect(() => {
-    if (run.status !== 'running' && run.status !== 'queued') return
-    const ac = new AbortController()
-    abortRef.current = ac
-    let content = ''
-
-    void (async () => {
-      try {
-        for await (const ev of subscribeRunStream(run.id, 0, ac.signal)) {
-          if (ev.event === 'delta') {
-            content += (ev.data as { delta: string }).delta
-            setLiveContent(content)
-          } else if (ev.event === 'tool_call') {
-            const tc = ev.data as LiveToolCall
-            setLiveToolCalls((prev) => {
-              const idx = prev.findIndex((t) => t.id === tc.id)
-              if (idx >= 0) {
-                const next = [...prev]; next[idx] = tc; return next
-              }
-              return [...prev, tc]
-            })
-          } else if (ev.event === 'done' || ev.event === 'error') {
-            setLiveContent('')
-            setLiveToolCalls([])
-            void qc.invalidateQueries({ queryKey: agentRunKeys.detail(run.id) })
-            void qc.invalidateQueries({ queryKey: agentRunKeys.list() })
-            break
-          }
-        }
-      } catch { /* aborted or closed */ }
-    })()
-
-    return () => { ac.abort(); abortRef.current = null }
-  }, [run.id, run.status, qc])
-
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [liveContent, run.messages?.length, liveToolCalls.length])
-
-  const messages = run.messages ?? []
-  const isActive = run.status === 'running' || run.status === 'queued'
-  const showDisposition =
-    run.status === 'done' &&
-    !run.archivedAt &&
-    !run.completion
-
-  return (
-    <div className="flex h-full flex-col">
-      <div className="flex shrink-0 items-center justify-between border-b border-border px-4 py-2.5">
-        <div className="min-w-0 flex-1">
-          <p className="truncate text-[14px] font-medium text-ink">{run.title}</p>
-          <div className="flex items-center gap-2">
-            <StatusBadge status={run.status} />
-            {run.completion && (
-              <span className={cn(
-                'text-[11px] font-medium',
-                run.completion === 'complete' ? 'text-green-500' : 'text-red-400',
-              )}>
-                {run.completion === 'complete' ? '✓ Complete' : '⚑ Miss'}
-              </span>
-            )}
-          </div>
-        </div>
-        {isActive && (
-          <button
-            type="button"
-            onClick={() => cancel.mutate()}
-            disabled={cancel.isPending}
-            className="ml-3 shrink-0 rounded-lg border border-border px-3 py-1 text-[12px] text-muted transition-colors hover:border-red-400 hover:text-red-500 disabled:opacity-50"
-          >
-            {cancel.isPending ? <Loader2 size={12} className="inline animate-spin" /> : 'Cancel'}
-          </button>
-        )}
-      </div>
-
-      <div className="slim-scroll flex-1 space-y-3 overflow-y-auto p-4">
-        {messages.map((msg) => (
-          <div key={msg.id} className={cn('flex flex-col gap-1.5', msg.role === 'user' ? 'items-end' : 'items-start')}>
-            {msg.toolCalls?.map((tc) => <ToolCallRow key={tc.id} call={tc} />)}
-            {(msg.content || (msg.role === 'assistant' && isActive)) && (
-              <div className={cn(
-                'max-w-[85%] rounded-xl px-3 py-2 text-[13px] leading-relaxed',
-                msg.role === 'user' ? 'bg-accent/15 text-ink' : 'bg-panel-2 text-ink',
-              )}>
-                <p className="whitespace-pre-wrap break-words">{msg.content || '…'}</p>
-              </div>
-            )}
-          </div>
-        ))}
-
-        {liveToolCalls.map((tc) => (
-          <div key={tc.id} className="flex flex-col items-start gap-1.5">
-            <ToolCallRow call={tc} />
-          </div>
-        ))}
-
-        {liveContent && (
-          <div className="flex items-start">
-            <div className="max-w-[85%] rounded-xl bg-panel-2 px-3 py-2 text-[13px] leading-relaxed text-ink">
-              <p className="whitespace-pre-wrap break-words">{liveContent}</p>
-            </div>
-          </div>
-        )}
-
-        {isActive && !liveContent && liveToolCalls.length === 0 && messages.length === 0 && (
-          <div className="flex items-center gap-2 py-4">
-            <Loader2 size={14} className="animate-spin text-accent" />
-            <span className="text-[12px] text-muted">Starting…</span>
-          </div>
-        )}
-
-        {run.error && (
-          <div
-            className="rounded-lg px-3 py-2 text-[12px]"
-            style={{ background: 'color-mix(in srgb, var(--err) 10%, transparent)', color: 'var(--err)' }}
-          >
-            Error: {run.error}
-          </div>
-        )}
-        <div ref={bottomRef} />
-      </div>
-
-      {/* Progress doc — collapsible, above disposition bar */}
-      <ProgressDoc run={run} />
-
-      {/* Disposition buttons — only on finished, non-archived, not-yet-dispositioned runs */}
-      {showDisposition && onOpenNewContract && (
-        <DispositionPanel run={run} onOpenNewContract={onOpenNewContract} />
-      )}
-    </div>
-  )
-}
-
-// ── Track-record warning ───────────────────────────────────────────────────────
-
-function TrackRecordWarning({ agentId }: { agentId: string }) {
-  const statusQ = useStatus()
-  const currentModel = statusQ.data?.model?.key
-
-  const trQ = useQuery({
-    queryKey: ['track-record', agentId],
-    queryFn: () => fetchTrackRecord(agentId),
-    enabled: !!agentId,
-    staleTime: 30_000,
-  })
-
-  if (!trQ.data || !agentId) return null
-
-  const stats = trQ.data.modelStats
-  // Only warn when there is data to be meaningful (>= 5 contracts)
-  const qualified = stats.filter((s) => s.total >= 5)
-  if (qualified.length === 0) return null
-
-  const currentStats = currentModel ? qualified.find((s) => s.model === currentModel) : null
-  const bestStats = qualified.reduce((best, s) => (s.successRate > best.successRate ? s : best), qualified[0])
-
-  const showCurrentWarn = currentStats && currentStats.successRate < 0.6
-  const showBestSuggest = bestStats && (!currentStats || bestStats.model !== currentModel) && bestStats.successRate > (currentStats?.successRate ?? 0)
-
-  if (!showCurrentWarn && !showBestSuggest) return null
-
-  return (
-    <div className="mt-3 space-y-1.5">
-      {showCurrentWarn && currentStats && (
-        <div className="flex items-start gap-2 rounded-lg border px-3 py-2 text-[12px]"
-          style={{
-            borderColor: 'color-mix(in srgb, var(--warn, #f59e0b) 40%, transparent)',
-            background: 'color-mix(in srgb, var(--warn, #f59e0b) 10%, transparent)',
-            color: 'color-mix(in srgb, var(--warn, #f59e0b) 90%, var(--ink))',
-          }}
-        >
-          <AlertTriangle size={13} className="mt-0.5 shrink-0" />
-          <span>
-            <span className="font-medium">{currentStats.model}</span> has a{' '}
-            {Math.round(currentStats.successRate * 100)}% success rate on this hitman ({currentStats.complete}/{currentStats.total}).{' '}
-            Consider a different model.
-          </span>
-        </div>
-      )}
-      {showBestSuggest && bestStats && (
-        <div className="flex items-start gap-2 rounded-lg border px-3 py-2 text-[12px]"
-          style={{
-            borderColor: 'color-mix(in srgb, var(--ok, #22c55e) 40%, transparent)',
-            background: 'color-mix(in srgb, var(--ok, #22c55e) 10%, transparent)',
-            color: 'color-mix(in srgb, var(--ok, #22c55e) 90%, var(--ink))',
-          }}
-        >
-          <CheckCircle2 size={13} className="mt-0.5 shrink-0" />
-          <span>
-            <span className="font-medium">{bestStats.model}</span> performs best ({Math.round(bestStats.successRate * 100)}%).
-          </span>
-        </div>
-      )}
-    </div>
-  )
-}
-
-// ── New Contract dialog ────────────────────────────────────────────────────────
-
-function NewContractDialog({
-  agents,
-  initialAgentId,
-  onClose,
-  onCreated,
-}: {
-  agents: AgentType[]
-  initialAgentId?: string
-  onClose: () => void
-  onCreated: (id: string) => void
-}) {
-  const [agentId, setAgentId] = useState(initialAgentId ?? agents[0]?.id ?? '')
-  const [task, setTask] = useState('')
-  const qc = useQueryClient()
-
-  const create = useMutation({
-    mutationFn: () =>
-      createAgentRun(agentId, {
-        title: task.slice(0, 60) || 'Contract',
-        userMessage: task,
-      }),
-    onSuccess: (run) => {
-      void qc.invalidateQueries({ queryKey: agentRunKeys.list() })
-      onCreated(run.id)
-      onClose()
-    },
-    onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not start contract.'),
-  })
-
-  return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
-      onClick={onClose}
-    >
-      <div
-        className="w-full max-w-lg rounded-xl border border-border bg-panel p-5 shadow-xl"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="mb-4 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <Target size={15} className="text-accent" />
-            <h2 className="text-[15px] font-semibold text-ink">New contract</h2>
-          </div>
-          <button type="button" onClick={onClose} className="text-faint hover:text-ink">
-            <X size={16} />
-          </button>
-        </div>
-
-        <label className="mb-1 block text-[12px] text-muted">Assign to agent</label>
-        <select
-          value={agentId}
-          onChange={(e) => setAgentId(e.target.value)}
-          className="mb-3 w-full rounded-lg border border-border bg-panel-2 px-3 py-2 text-[13px] text-ink focus:border-accent focus:outline-none"
-        >
-          {agents.map((a) => (
-            <option key={a.id} value={a.id}>{a.name}</option>
-          ))}
-        </select>
-
-        {/* Track-record warning appears once an agent is selected */}
-        {agentId && <TrackRecordWarning agentId={agentId} />}
-
-        <label className="mb-1 mt-3 block text-[12px] text-muted">Task</label>
-        <textarea
-          autoFocus
-          value={task}
-          onChange={(e) => setTask(e.target.value)}
-          placeholder="Describe what the agent should do…"
-          rows={5}
-          className="mb-4 w-full resize-none rounded-lg border border-border bg-panel-2 px-3 py-2 text-[13px] text-ink placeholder:text-faint focus:border-accent focus:outline-none"
-        />
-
-        <div className="flex items-center justify-end gap-2">
-          <button
-            type="button"
-            onClick={onClose}
-            className="rounded-lg px-3 py-1.5 text-[13px] text-muted hover:text-ink"
-          >
-            Cancel
-          </button>
-          <Button
-            size="sm"
-            disabled={!task.trim() || !agentId || create.isPending}
-            onClick={() => create.mutate()}
-          >
-            {create.isPending ? <Loader2 size={13} className="animate-spin" /> : <Play size={13} />}
-            Run
-          </Button>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// ── Archived contracts list ────────────────────────────────────────────────────
-
-function ArchivedContracts({
-  agents,
+function AgentConvSidebar({
+  activeId,
+  agentConvs,
   onSelect,
+  onNew,
+  collapsed,
+  onToggle,
+  q,
+  setQ,
 }: {
-  agents: AgentType[]
-  onSelect: (run: AgentRun) => void
+  activeId: string | null
+  agentConvs: Conversation[]
+  onSelect: (id: string) => void
+  onNew: () => void
+  collapsed: boolean
+  onToggle: () => void
+  q: string
+  setQ: (v: string) => void
 }) {
-  const [agentId, setAgentId] = useState(agents[0]?.id ?? '')
+  const mut = useConversationMutations()
+  const qc = useQueryClient()
+  const searchRef = useRef<HTMLInputElement>(null)
 
-  const archiveQ = useQuery({
-    queryKey: ['archive', agentId],
-    queryFn: () => fetchArchive(agentId),
-    enabled: !!agentId,
-  })
-
-  const runs = archiveQ.data ?? []
-
-  return (
-    <div className="flex h-full flex-col">
-      {/* Agent picker */}
-      <div className="shrink-0 border-b border-border px-3 py-2">
-        <select
-          value={agentId}
-          onChange={(e) => setAgentId(e.target.value)}
-          className="w-full rounded-lg border border-border bg-panel-2 px-2.5 py-1.5 text-[12px] text-ink focus:border-accent focus:outline-none"
-        >
-          {agents.map((a) => (
-            <option key={a.id} value={a.id}>{a.name}</option>
-          ))}
-        </select>
-      </div>
-
-      <div className="slim-scroll flex-1 overflow-y-auto">
-        {archiveQ.isLoading && (
-          <div className="flex h-20 items-center justify-center">
-            <Loader2 size={16} className="animate-spin text-faint" />
-          </div>
-        )}
-        {!archiveQ.isLoading && runs.length === 0 && (
-          <div className="px-4 py-8 text-center">
-            <Archive size={24} className="mx-auto mb-2 text-faint" />
-            <p className="text-[12px] text-muted">No archived contracts.</p>
-          </div>
-        )}
-        {runs.map((run) => (
-          <button
-            key={run.id}
-            type="button"
-            onClick={() => onSelect(run)}
-            className="w-full border-b border-border px-3 py-2.5 text-left transition-colors hover:bg-panel-2"
-          >
-            <p className="mb-0.5 truncate text-[13px] font-medium text-ink">{run.title}</p>
-            <div className="flex items-center justify-between">
-              <StatusBadge status={run.status} />
-              <div className="flex items-center gap-1.5">
-                {run.completion && (
-                  <span className={cn(
-                    'text-[10px] font-medium',
-                    run.completion === 'complete' ? 'text-green-500' : 'text-red-400',
-                  )}>
-                    {run.completion === 'complete' ? '✓' : '⚑'}
-                  </span>
-                )}
-                <span className="text-[10px] text-faint">{relTime(run.archivedAt ?? run.updatedAt)}</span>
-              </div>
-            </div>
-          </button>
-        ))}
-      </div>
-    </div>
-  )
-}
-
-// ── Contracts tab ──────────────────────────────────────────────────────────────
-
-type ContractView = 'active' | 'archived'
-
-function ContractsTab({ agents }: { agents: AgentType[] }) {
-  const [selectedId, setSelectedId] = useState<string | null>(null)
-  const [selectedArchiveRun, setSelectedArchiveRun] = useState<AgentRun | null>(null)
-  const [showNew, setShowNew] = useState(false)
-  const [newContractAgentId, setNewContractAgentId] = useState<string | undefined>()
-  const [view, setView] = useState<ContractView>('active')
-
-  const runsQ = useQuery({
-    queryKey: agentRunKeys.list(),
-    queryFn: fetchAgentRuns,
-    refetchInterval: (q) => {
-      const runs = q.state.data ?? []
-      return runs.some((r) => r.status === 'queued' || r.status === 'running') ? 3000 : false
-    },
-  })
-
-  const detailQ = useQuery({
-    queryKey: agentRunKeys.detail(selectedId ?? ''),
-    queryFn: () => fetchAgentRun(selectedId!),
-    enabled: !!selectedId && view === 'active',
-    refetchInterval: (q) => {
-      const r = q.state.data
-      return (r?.status === 'queued' || r?.status === 'running') ? 5000 : false
-    },
-  })
-
-  const runs = runsQ.data ?? []
-  const selected = detailQ.data
-  const agentMap: Record<string, string> = Object.fromEntries(agents.map((a) => [a.id, a.name]))
-
-  const handleOpenNewContract = (agentId: string) => {
-    setNewContractAgentId(agentId)
-    setShowNew(true)
-  }
-
-  const handleSelectArchiveRun = (run: AgentRun) => {
-    setSelectedArchiveRun(run)
-  }
-
-  return (
-    <div className="flex h-full">
-      {/* Sidebar */}
-      <div className="flex w-64 shrink-0 flex-col border-r border-border">
-        {/* Header with view toggle */}
-        <div className="flex shrink-0 items-center justify-between border-b border-border px-3 py-2.5">
-          <div className="flex items-center gap-0.5 rounded-lg border border-border bg-panel-2 p-0.5">
-            <button
-              type="button"
-              onClick={() => { setView('active'); setSelectedArchiveRun(null) }}
-              className={cn(
-                'rounded-md px-2.5 py-1 text-[11px] font-medium transition-colors',
-                view === 'active' ? 'bg-panel text-ink shadow-sm' : 'text-muted hover:text-ink',
-              )}
-            >
-              Active
-            </button>
-            <button
-              type="button"
-              onClick={() => { setView('archived'); setSelectedId(null) }}
-              className={cn(
-                'flex items-center gap-1 rounded-md px-2.5 py-1 text-[11px] font-medium transition-colors',
-                view === 'archived' ? 'bg-panel text-ink shadow-sm' : 'text-muted hover:text-ink',
-              )}
-            >
-              <Archive size={10} />
-              Archived
-            </button>
-          </div>
-          {view === 'active' && (
-            <Button size="sm" onClick={() => { setNewContractAgentId(undefined); setShowNew(true) }} className="h-6 px-2 text-[11px]">
-              <Plus size={11} /> New
-            </Button>
-          )}
-        </div>
-
-        {view === 'active' ? (
-          <div className="slim-scroll flex-1 overflow-y-auto">
-            {runsQ.isLoading && (
-              <div className="flex h-20 items-center justify-center">
-                <Loader2 size={16} className="animate-spin text-faint" />
-              </div>
-            )}
-            {!runsQ.isLoading && runs.length === 0 && (
-              <div className="px-4 py-8 text-center">
-                <Target size={24} className="mx-auto mb-2 text-faint" />
-                <p className="text-[12px] text-muted">No contracts yet.</p>
-                <p className="mt-0.5 text-[11px] text-faint">Click "New" to assign a task.</p>
-              </div>
-            )}
-            {runs.map((run) => (
-              <button
-                key={run.id}
-                type="button"
-                onClick={() => setSelectedId(run.id)}
-                className={cn(
-                  'w-full border-b border-border px-3 py-2.5 text-left transition-colors hover:bg-panel-2',
-                  selectedId === run.id && 'bg-panel-2',
-                )}
-              >
-                <p className="mb-0.5 truncate text-[13px] font-medium text-ink">{run.title}</p>
-                {run.agentId && agentMap[run.agentId] && (
-                  <p className="mb-0.5 truncate text-[11px] text-faint">{agentMap[run.agentId]}</p>
-                )}
-                <div className="flex items-center justify-between">
-                  <StatusBadge status={run.status} />
-                  <div className="flex items-center gap-1.5">
-                    {run.completion && (
-                      <span className={cn(
-                        'text-[10px] font-medium',
-                        run.completion === 'complete' ? 'text-green-500' : 'text-red-400',
-                      )}>
-                        {run.completion === 'complete' ? '✓' : '⚑'}
-                      </span>
-                    )}
-                    <span className="text-[10px] text-faint">{relTime(run.createdAt)}</span>
-                  </div>
-                </div>
-              </button>
-            ))}
-          </div>
-        ) : (
-          <ArchivedContracts
-            agents={agents}
-            onSelect={handleSelectArchiveRun}
-          />
-        )}
-      </div>
-
-      {/* Detail pane */}
-      <div className="flex min-w-0 flex-1 flex-col">
-        {view === 'active' && (
-          <>
-            {!selectedId ? (
-              <div className="flex h-full flex-col items-center justify-center text-center">
-                <CircleDot size={32} className="mb-3 text-faint" />
-                <p className="text-[14px] font-medium text-ink">Select a contract</p>
-                <p className="mt-1 text-[12px] text-muted">or assign a new task to an agent</p>
-                <Button className="mt-4" size="sm" onClick={() => { setNewContractAgentId(undefined); setShowNew(true) }}>
-                  <Play size={13} /> New contract
-                </Button>
-              </div>
-            ) : detailQ.isLoading ? (
-              <div className="flex h-full items-center justify-center">
-                <Loader2 size={20} className="animate-spin text-faint" />
-              </div>
-            ) : selected ? (
-              <RunDetail run={selected} onOpenNewContract={handleOpenNewContract} />
-            ) : null}
-          </>
-        )}
-
-        {view === 'archived' && (
-          <>
-            {!selectedArchiveRun ? (
-              <div className="flex h-full flex-col items-center justify-center text-center">
-                <Archive size={32} className="mb-3 text-faint" />
-                <p className="text-[14px] font-medium text-ink">Select an archived contract</p>
-                <p className="mt-1 text-[12px] text-muted">Archived contracts are read-only</p>
-              </div>
-            ) : (
-              <RunDetail run={selectedArchiveRun} />
-            )}
-          </>
-        )}
-      </div>
-
-      {showNew && (
-        <NewContractDialog
-          agents={agents}
-          initialAgentId={newContractAgentId}
-          onClose={() => { setShowNew(false); setNewContractAgentId(undefined) }}
-          onCreated={(id) => { setSelectedId(id); setView('active'); void runsQ.refetch() }}
-        />
-      )}
-    </div>
-  )
-}
-
-// ── Agent form ─────────────────────────────────────────────────────────────────
-
-type AgentFormState = {
-  name: string
-  description: string
-  skillsAllStar: boolean
-  selectedSkillIds: string[]
-  readRootsText: string
-  maxIterations: string
-}
-
-function agentToForm(agent: AgentType): AgentFormState {
-  const allStar = agent.skills.includes('*')
-  return {
-    name: agent.name,
-    description: agent.description,
-    skillsAllStar: allStar,
-    selectedSkillIds: allStar ? [] : [...agent.skills],
-    readRootsText: agent.readRoots.join('\n'),
-    maxIterations: agent.maxIterations != null ? String(agent.maxIterations) : '',
-  }
-}
-
-function formToAgentPatch(form: AgentFormState): Partial<AgentType> {
-  const skills = form.skillsAllStar ? ['*'] : form.selectedSkillIds
-  const readRoots = form.readRootsText.split('\n').map((s) => s.trim()).filter(Boolean)
-  const maxIter = form.maxIterations.trim() ? parseInt(form.maxIterations, 10) : undefined
-  return {
-    name: form.name.trim(),
-    description: form.description.trim(),
-    skills,
-    readRoots,
-    ...(maxIter != null && !isNaN(maxIter) ? { maxIterations: maxIter } : {}),
-  }
-}
-
-function AgentFormPanel({
-  agent,
-  skills,
-  onSave,
-  onCancel,
-  onDelete,
-  busy,
-}: {
-  agent: AgentType | null
-  skills: Skill[]
-  onSave: (patch: Partial<AgentType>) => void
-  onCancel: () => void
-  onDelete?: () => void
-  busy: boolean
-}) {
-  const [form, setForm] = useState<AgentFormState>(() =>
-    agent ? agentToForm(agent) : {
-      name: '', description: '', skillsAllStar: false,
-      selectedSkillIds: [], readRootsText: '', maxIterations: '',
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+        e.preventDefault()
+        searchRef.current?.focus()
+      }
     }
-  )
-  const set = (patch: Partial<AgentFormState>) => setForm((p) => ({ ...p, ...patch }))
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [])
 
-  const isBuiltin = agent?.builtin ?? false
-  const writeRoot = (agent?.writeRoots[0]) ?? '~/.turbollm'
-
-  const toggleSkill = (id: string) => {
-    set({
-      selectedSkillIds: form.selectedSkillIds.includes(id)
-        ? form.selectedSkillIds.filter((s) => s !== id)
-        : [...form.selectedSkillIds, id],
+  const handleDelete = (e: React.MouseEvent, conv: Conversation) => {
+    e.stopPropagation()
+    mut.remove.mutate(conv.id, {
+      onSuccess: () => {
+        toast.success('Conversation deleted')
+        void qc.invalidateQueries({ queryKey: ['conversations'] })
+      },
+      onError: () => toast.error('Could not delete conversation.'),
     })
   }
 
-  const handleSave = () => {
-    if (!form.name.trim()) { toast.error('Name is required.'); return }
-    onSave(formToAgentPatch(form))
+  if (collapsed) {
+    return (
+      <div className="flex h-full flex-col items-center gap-1 border-r border-border bg-panel-2 py-3">
+        <Button size="icon" variant="ghost" onClick={onToggle} title="Expand sidebar" className="h-7 w-7">
+          <ChevronRight size={15} />
+        </Button>
+        <Button size="icon" variant="ghost" onClick={onNew} title="New agent chat" className="h-7 w-7">
+          <Plus size={15} />
+        </Button>
+      </div>
+    )
   }
 
   return (
-    <div className="flex h-full flex-col overflow-hidden">
-      {/* Header */}
-      <div className="flex shrink-0 items-center justify-between border-b border-border px-4 py-3">
-        <div className="flex items-center gap-2">
-          <Bot size={15} className="text-accent" />
-          <span className="text-[14px] font-semibold text-ink">
-            {agent ? (isBuiltin ? 'Default agent' : 'Edit agent') : 'Hire a hitman'}
-          </span>
-          {isBuiltin && (
-            <span
-              className="rounded px-1.5 py-0.5 text-[10px] font-medium"
-              style={{ background: 'color-mix(in srgb, var(--ok) 18%, transparent)', color: 'var(--ok)' }}
-            >
-              built-in
-            </span>
-          )}
+    <div className="flex h-full flex-col border-r border-border bg-panel-2">
+      {/* Header row */}
+      <div className="flex items-center gap-2 px-3 py-3">
+        <Button size="icon" variant="ghost" onClick={onToggle} title="Collapse sidebar" className="h-7 w-7 shrink-0">
+          <ChevronLeft size={15} />
+        </Button>
+        <div className="relative flex-1">
+          <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-faint" />
+          <input
+            ref={searchRef}
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="Search…"
+            className="h-7 w-full rounded-md border border-border bg-bg pl-7 pr-2 text-[12px] text-ink outline-none placeholder:text-faint"
+          />
         </div>
-        <button type="button" onClick={onCancel} className="text-faint hover:text-ink">
-          <X size={15} />
-        </button>
+        <Button size="icon" variant="ghost" onClick={onNew} title="New agent chat" className="h-7 w-7 shrink-0">
+          <Plus size={15} />
+        </Button>
       </div>
 
-      {/* Body */}
-      <div className="slim-scroll flex-1 space-y-4 overflow-y-auto px-4 py-4">
-        {/* Name */}
-        <div className="flex flex-col gap-1">
-          <label className="text-[12px] text-muted">
-            Name <span style={{ color: 'var(--err)' }}>*</span>
-          </label>
-          <input
-            type="text"
-            value={form.name}
-            onChange={(e) => set({ name: e.target.value })}
-            disabled={isBuiltin}
-            placeholder="e.g. Research Agent"
-            className="rounded-lg border border-border bg-panel-2 px-3 py-2 text-[13px] text-ink placeholder:text-faint focus:border-accent focus:outline-none disabled:opacity-60"
+      {/* Conversation list */}
+      <div className="flex-1 overflow-y-auto px-1 pb-2">
+        {agentConvs.length === 0 && (
+          <p className="px-3 py-4 text-[12px] text-faint">
+            {q ? 'No results.' : 'No agent conversations yet.'}
+          </p>
+        )}
+        {agentConvs.map((conv) => (
+          <AgentConvItem
+            key={conv.id}
+            conv={conv}
+            active={conv.id === activeId}
+            onSelect={onSelect}
+            onDelete={handleDelete}
           />
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function AgentConvItem({
+  conv,
+  active,
+  onSelect,
+  onDelete,
+}: {
+  conv: Conversation
+  active: boolean
+  onSelect: (id: string) => void
+  onDelete: (e: React.MouseEvent, conv: Conversation) => void
+}) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(conv.title)
+  const mut = useConversationMutations()
+
+  const commitRename = () => {
+    setEditing(false)
+    const title = draft.trim()
+    if (!title || title === conv.title) { setDraft(conv.title); return }
+    mut.update.mutate(
+      { id: conv.id, title },
+      { onError: () => { setDraft(conv.title); toast.error('Could not rename.') } },
+    )
+  }
+
+  return (
+    <div
+      onClick={() => !editing && onSelect(conv.id)}
+      className="group relative flex cursor-pointer flex-col gap-0.5 rounded-md px-3 py-2 transition-colors"
+      style={{ background: active ? 'color-mix(in srgb, var(--accent) 10%, transparent)' : 'transparent' }}
+    >
+      {editing ? (
+        <input
+          autoFocus
+          className="w-full bg-transparent text-[13px] font-medium text-ink outline-none"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={commitRename}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') commitRename()
+            if (e.key === 'Escape') { setDraft(conv.title); setEditing(false) }
+          }}
+          onClick={(e) => e.stopPropagation()}
+        />
+      ) : (
+        <span
+          className="truncate text-[13px] font-medium text-ink"
+          style={{ color: active ? 'var(--accent)' : undefined }}
+          onDoubleClick={(e) => { e.stopPropagation(); setEditing(true) }}
+        >
+          {conv.title}
+        </span>
+      )}
+      <span className="text-[11px] text-faint">{relTime(conv.updatedAt)}</span>
+      {!editing && (
+        <div className="absolute right-1.5 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); setDraft(conv.title); setEditing(true) }}
+            className="rounded p-1 text-faint transition-colors hover:text-ink"
+            title="Rename"
+          >
+            <Pencil size={13} />
+          </button>
+          <button
+            type="button"
+            onClick={(e) => onDelete(e, conv)}
+            className="rounded p-1 text-faint transition-colors hover:text-err"
+            title="Delete"
+          >
+            <Trash2 size={13} />
+          </button>
         </div>
+      )}
+    </div>
+  )
+}
 
-        {/* Description */}
-        <div className="flex flex-col gap-1">
-          <label className="text-[12px] text-muted">Description</label>
-          <textarea
-            value={form.description}
-            onChange={(e) => set({ description: e.target.value })}
-            placeholder="What does this agent specialise in?"
-            rows={2}
-            className="resize-none rounded-lg border border-border bg-panel-2 px-3 py-2 text-[13px] text-ink placeholder:text-faint focus:border-accent focus:outline-none"
-          />
+// ── Agent picker: shown when starting a new agent conversation ───────────────
+
+function AgentPicker({
+  agents,
+  onPick,
+}: {
+  agents: AgentType[]
+  onPick: (agent: AgentType) => void
+}) {
+  return (
+    <div className="flex flex-col items-center gap-4 py-16 px-8">
+      <Bot size={32} className="text-faint" />
+      <p className="text-[15px] font-medium text-ink">Choose an agent to chat with</p>
+      <p className="text-[13px] text-muted text-center max-w-sm">
+        Each agent has its own persona, skills, and folder access. Pick one to start a conversation.
+      </p>
+      <div className="mt-2 flex flex-col gap-2 w-full max-w-sm">
+        {agents.map((agent) => (
+          <button
+            key={agent.id}
+            type="button"
+            onClick={() => onPick(agent)}
+            className="flex items-start gap-3 rounded-lg border border-border bg-panel px-4 py-3 text-left transition-colors hover:border-accent hover:bg-panel-2"
+          >
+            <Bot size={16} className="mt-0.5 shrink-0 text-accent" />
+            <div className="min-w-0">
+              <p className="text-[13px] font-medium text-ink">{agent.name}</p>
+              {agent.description && (
+                <p className="mt-0.5 truncate text-[12px] text-muted">{agent.description}</p>
+              )}
+              {agent.skills.length > 0 && (
+                <p className="mt-0.5 text-[11px] text-faint">
+                  Skills: {agent.skills.join(', ')}
+                </p>
+              )}
+            </div>
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+// ── Manage agents panel ───────────────────────────────────────────────────────
+
+interface AgentFormState {
+  name: string
+  description: string
+  systemPrompt: string
+  skills: string[]
+  readRoots: string
+}
+
+const emptyForm = (): AgentFormState => ({
+  name: '',
+  description: '',
+  systemPrompt: '',
+  skills: [],
+  readRoots: '',
+})
+
+function agentToForm(a: AgentType): AgentFormState {
+  return {
+    name: a.name,
+    description: a.description,
+    systemPrompt: a.systemPrompt ?? '',
+    skills: a.skills,
+    readRoots: a.readRoots.join('\n'),
+  }
+}
+
+const KNOWN_SKILLS = [
+  { id: 'filesystem', label: 'Filesystem', description: 'Read files from allowed folders' },
+  { id: 'code', label: 'Code execution', description: 'Run sandboxed code snippets' },
+]
+
+function ManageAgentsPanel({
+  onClose,
+}: {
+  onClose: () => void
+}) {
+  const qc = useQueryClient()
+  const agentsQ = useQuery({
+    queryKey: agentKeys.list(),
+    queryFn: fetchAgents,
+    staleTime: 0,
+  })
+  const agents = agentsQ.data ?? []
+
+  const [editingId, setEditingId] = useState<string | 'new' | null>(null)
+  const [form, setForm] = useState<AgentFormState>(emptyForm())
+  const [saving, setSaving] = useState(false)
+  const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null)
+
+  const openNew = () => {
+    setForm(emptyForm())
+    setEditingId('new')
+    setDeleteConfirm(null)
+  }
+
+  const openEdit = (agent: AgentType) => {
+    setForm(agentToForm(agent))
+    setEditingId(agent.id)
+    setDeleteConfirm(null)
+  }
+
+  const closeEdit = () => {
+    setEditingId(null)
+    setForm(emptyForm())
+  }
+
+  const handleSave = async () => {
+    if (!form.name.trim()) { toast.error('Agent name is required.'); return }
+    setSaving(true)
+    try {
+      const payload: Partial<AgentType> = {
+        name: form.name.trim(),
+        description: form.description.trim(),
+        systemPrompt: form.systemPrompt.trim() || undefined,
+        skills: form.skills,
+        readRoots: form.readRoots.split('\n').map((l) => l.trim()).filter(Boolean),
+      }
+      if (editingId === 'new') {
+        await createAgent(payload)
+        toast.success('Agent created.')
+      } else if (editingId) {
+        await updateAgent(editingId, payload)
+        toast.success('Agent saved.')
+      }
+      void qc.invalidateQueries({ queryKey: agentKeys.list() })
+      closeEdit()
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : 'Could not save agent.')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const handleDelete = async (id: string) => {
+    try {
+      await deleteAgent(id)
+      void qc.invalidateQueries({ queryKey: agentKeys.list() })
+      toast.success('Agent deleted.')
+      if (editingId === id) closeEdit()
+      setDeleteConfirm(null)
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : 'Could not delete agent.')
+    }
+  }
+
+  const toggleSkill = (id: string) => {
+    setForm((f) => ({
+      ...f,
+      skills: f.skills.includes(id) ? f.skills.filter((s) => s !== id) : [...f.skills, id],
+    }))
+  }
+
+  return (
+    <div className="flex h-full w-80 shrink-0 flex-col border-l border-border bg-panel-2">
+      {/* Panel header */}
+      <div className="flex h-12 items-center justify-between border-b border-border px-4">
+        <span className="text-[13px] font-medium text-ink">Manage Agents</span>
+        <div className="flex items-center gap-1">
+          <Button size="icon" variant="ghost" onClick={openNew} title="New agent" className="h-7 w-7">
+            <Plus size={14} />
+          </Button>
+          <Button size="icon" variant="ghost" onClick={onClose} title="Close panel" className="h-7 w-7">
+            <X size={14} />
+          </Button>
         </div>
+      </div>
 
-        {/* Skills */}
-        <div className="flex flex-col gap-1.5">
-          <label className="text-[12px] text-muted">Skills</label>
-          <label className="flex cursor-pointer items-center gap-2 rounded-lg border border-border px-3 py-2 hover:bg-panel-2">
-            <input
-              type="checkbox"
-              checked={form.skillsAllStar}
-              onChange={(e) => set({ skillsAllStar: e.target.checked, selectedSkillIds: [] })}
-              className="h-3.5 w-3.5 accent-[var(--accent)]"
-            />
-            <span className="text-[13px] font-medium text-ink">All skills</span>
-            <span className="ml-auto text-[11px] text-faint">grants every skill</span>
-          </label>
+      {/* Content */}
+      <div className="flex-1 overflow-y-auto">
+        {editingId ? (
+          // ── Editor form ────────────────────────────────────────────────────
+          <div className="flex flex-col gap-4 p-4">
+            <div className="flex items-center gap-2">
+              <button type="button" onClick={closeEdit} className="text-faint hover:text-ink">
+                <ChevronLeft size={16} />
+              </button>
+              <span className="text-[13px] font-medium text-ink">
+                {editingId === 'new' ? 'New agent' : 'Edit agent'}
+              </span>
+            </div>
 
-          {!form.skillsAllStar && skills.length > 0 && (
-            <div className="space-y-0.5 rounded-lg border border-border p-2">
-              {skills.map((skill) => (
+            {/* Name */}
+            <div className="flex flex-col gap-1.5">
+              <label className="text-[12px] font-medium text-muted">Name</label>
+              <input
+                className="rounded-md border border-border bg-bg px-3 py-1.5 text-[13px] text-ink outline-none focus:border-accent placeholder:text-faint"
+                placeholder="My Agent"
+                value={form.name}
+                onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
+              />
+            </div>
+
+            {/* Description */}
+            <div className="flex flex-col gap-1.5">
+              <label className="text-[12px] font-medium text-muted">Description</label>
+              <input
+                className="rounded-md border border-border bg-bg px-3 py-1.5 text-[13px] text-ink outline-none focus:border-accent placeholder:text-faint"
+                placeholder="What does this agent do?"
+                value={form.description}
+                onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))}
+              />
+            </div>
+
+            {/* System prompt */}
+            <div className="flex flex-col gap-1.5">
+              <label className="text-[12px] font-medium text-muted">System prompt</label>
+              <textarea
+                rows={5}
+                className="resize-none rounded-md border border-border bg-bg px-3 py-1.5 text-[13px] text-ink outline-none focus:border-accent placeholder:text-faint"
+                placeholder="You are a helpful assistant that…"
+                value={form.systemPrompt}
+                onChange={(e) => setForm((f) => ({ ...f, systemPrompt: e.target.value }))}
+              />
+            </div>
+
+            {/* Skills */}
+            <div className="flex flex-col gap-2">
+              <label className="text-[12px] font-medium text-muted">Skills</label>
+              {KNOWN_SKILLS.map((skill) => (
                 <label
                   key={skill.id}
-                  className="flex cursor-pointer items-start gap-2 rounded-md px-2 py-1.5 hover:bg-panel-2"
+                  className="flex cursor-pointer items-start gap-2.5 rounded-md border border-border bg-bg px-3 py-2 text-[12px] hover:border-accent"
                 >
                   <input
                     type="checkbox"
-                    checked={form.selectedSkillIds.includes(skill.id)}
+                    className="mt-0.5 shrink-0 accent-[var(--accent)]"
+                    checked={form.skills.includes(skill.id)}
                     onChange={() => toggleSkill(skill.id)}
-                    className="mt-0.5 h-3.5 w-3.5 accent-[var(--accent)]"
                   />
-                  <span className="min-w-0 flex-1">
-                    <span className="block text-[13px] font-medium text-ink">{skill.name}</span>
-                    {skill.description && (
-                      <span className="block text-[11px] leading-snug text-faint">{skill.description}</span>
-                    )}
-                  </span>
-                  {skill.builtin && (
-                    <span
-                      className="ml-auto shrink-0 rounded px-1.5 py-0.5 text-[9px] font-medium"
-                      style={{ background: 'color-mix(in srgb, var(--ok) 18%, transparent)', color: 'var(--ok)' }}
-                    >
-                      built-in
-                    </span>
-                  )}
+                  <div>
+                    <p className="font-medium text-ink">{skill.label}</p>
+                    <p className="text-faint">{skill.description}</p>
+                  </div>
                 </label>
               ))}
             </div>
-          )}
 
-          {!form.skillsAllStar && skills.length === 0 && (
-            <p className="text-[12px] text-faint">
-              No skills yet — create some in the Skills tab.
-            </p>
-          )}
-        </div>
-
-        {/* Read folders */}
-        <div className="flex flex-col gap-1">
-          <div className="flex items-center gap-1.5">
-            <FolderOpen size={12} className="text-muted" />
-            <label className="text-[12px] text-muted">Read folders</label>
-          </div>
-          <textarea
-            value={form.readRootsText}
-            onChange={(e) => set({ readRootsText: e.target.value })}
-            placeholder={'/home/user/projects\n/home/user/docs'}
-            rows={3}
-            className="resize-none rounded-lg border border-border bg-panel-2 px-3 py-2 font-mono text-[12px] text-ink placeholder:text-faint focus:border-accent focus:outline-none"
-          />
-          <p className="text-[11px] text-faint">One absolute path per line.</p>
-        </div>
-
-        {/* Write root (read-only) */}
-        <div className="flex flex-col gap-1">
-          <div className="flex items-center gap-1.5">
-            <Shield size={12} className="text-muted" />
-            <label className="text-[12px] text-muted">Write root <span className="text-faint">(read-only)</span></label>
-          </div>
-          <input
-            type="text"
-            value={writeRoot}
-            readOnly
-            className="rounded-lg border border-border bg-panel-2 px-3 py-2 font-mono text-[12px] text-faint focus:outline-none"
-          />
-        </div>
-
-        {/* Max iterations */}
-        <div className="flex flex-col gap-1">
-          <label className="text-[12px] text-muted">Max iterations <span className="text-faint">(optional)</span></label>
-          <input
-            type="number"
-            value={form.maxIterations}
-            onChange={(e) => set({ maxIterations: e.target.value })}
-            placeholder="e.g. 20"
-            min={1}
-            max={500}
-            className="w-28 rounded-lg border border-border bg-panel-2 px-3 py-2 text-[13px] text-ink placeholder:text-faint focus:border-accent focus:outline-none"
-          />
-        </div>
-      </div>
-
-      {/* Footer */}
-      <div className="flex shrink-0 items-center justify-between border-t border-border px-4 py-3">
-        <div>
-          {!isBuiltin && onDelete && (
-            <button
-              type="button"
-              onClick={onDelete}
-              disabled={busy}
-              className="flex items-center gap-1.5 text-[12px] disabled:opacity-40"
-              style={{ color: 'var(--err)' }}
-            >
-              <Trash2 size={13} /> Delete
-            </button>
-          )}
-        </div>
-        <div className="flex items-center gap-2">
-          <button type="button" onClick={onCancel} className="text-[13px] text-muted hover:text-ink">
-            Cancel
-          </button>
-          <Button size="sm" onClick={handleSave} disabled={busy}>
-            {busy && <Loader2 size={13} className="animate-spin" />}
-            {agent ? 'Save' : 'Hire'}
-          </Button>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// ── Agents tab ─────────────────────────────────────────────────────────────────
-
-type AgentPaneMode =
-  | { type: 'none' }
-  | { type: 'create' }
-  | { type: 'edit'; agent: AgentType }
-
-function AgentsTab({ skills }: { skills: Skill[] }) {
-  const qc = useQueryClient()
-  const [mode, setMode] = useState<AgentPaneMode>({ type: 'none' })
-
-  const agentsQ = useQuery({ queryKey: agentKeys.list(), queryFn: fetchAgents })
-  const agents = agentsQ.data ?? []
-
-  const createMut = useMutation({
-    mutationFn: (patch: Partial<AgentType>) => createAgent(patch),
-    onSuccess: (created) => {
-      void qc.invalidateQueries({ queryKey: agentKeys.list() })
-      toast.success(`Agent "${created.name}" hired.`)
-      setMode({ type: 'edit', agent: created })
-    },
-    onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not create agent.'),
-  })
-
-  const updateMut = useMutation({
-    mutationFn: ({ id, patch }: { id: string; patch: Partial<AgentType> }) => updateAgent(id, patch),
-    onSuccess: (updated) => {
-      void qc.invalidateQueries({ queryKey: agentKeys.list() })
-      toast.success('Agent saved.')
-      setMode({ type: 'edit', agent: updated })
-    },
-    onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not save agent.'),
-  })
-
-  const deleteMut = useMutation({
-    mutationFn: (id: string) => deleteAgent(id),
-    onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: agentKeys.list() })
-      toast.success('Agent removed.')
-      setMode({ type: 'none' })
-    },
-    onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not remove agent.'),
-  })
-
-  const busy = createMut.isPending || updateMut.isPending || deleteMut.isPending
-
-  const handleSave = (patch: Partial<AgentType>) => {
-    if (mode.type === 'create') createMut.mutate(patch)
-    else if (mode.type === 'edit') updateMut.mutate({ id: mode.agent.id, patch })
-  }
-
-  const handleDelete = () => {
-    if (mode.type !== 'edit') return
-    // eslint-disable-next-line no-alert
-    if (!window.confirm(`Remove agent "${mode.agent.name}"?`)) return
-    deleteMut.mutate(mode.agent.id)
-  }
-
-  const formKey =
-    mode.type === 'none' ? 'none'
-    : mode.type === 'create' ? 'create'
-    : mode.agent.id
-
-  return (
-    <div className="flex h-full">
-      {/* Sidebar */}
-      <div className="flex w-60 shrink-0 flex-col border-r border-border">
-        <div className="flex shrink-0 items-center justify-between border-b border-border px-3 py-2.5">
-          <span className="text-[13px] font-semibold text-ink">Agents</span>
-          <Button size="sm" onClick={() => setMode({ type: 'create' })} className="h-6 px-2 text-[11px]">
-            <UserPlus size={11} /> Hire
-          </Button>
-        </div>
-
-        <div className="slim-scroll flex-1 overflow-y-auto">
-          {agentsQ.isLoading && (
-            <div className="flex h-20 items-center justify-center">
-              <Loader2 size={16} className="animate-spin text-faint" />
+            {/* Read folders */}
+            <div className="flex flex-col gap-1.5">
+              <label className="flex items-center gap-1.5 text-[12px] font-medium text-muted">
+                <FolderOpen size={13} />
+                Read-access folders
+              </label>
+              <textarea
+                rows={3}
+                className="resize-none rounded-md border border-border bg-bg px-3 py-1.5 font-mono text-[12px] text-ink outline-none focus:border-accent placeholder:text-faint"
+                placeholder={'/home/user/docs\n/home/user/projects'}
+                value={form.readRoots}
+                onChange={(e) => setForm((f) => ({ ...f, readRoots: e.target.value }))}
+              />
+              <p className="text-[11px] text-faint">One absolute path per line.</p>
             </div>
-          )}
-          {agents.map((agent) => {
-            const isSelected = mode.type === 'edit' && mode.agent.id === agent.id
-            return (
-              <button
-                key={agent.id}
-                type="button"
-                onClick={() => setMode({ type: 'edit', agent })}
-                className={cn(
-                  'w-full border-b border-border px-3 py-2.5 text-left transition-colors hover:bg-panel-2',
-                  isSelected && 'bg-panel-2',
-                )}
+
+            {/* Write folder — read-only */}
+            <div className="flex flex-col gap-1.5">
+              <label className="flex items-center gap-1.5 text-[12px] font-medium text-muted">
+                <FolderOpen size={13} />
+                Write folder
+              </label>
+              <div className="rounded-md border border-border bg-panel px-3 py-1.5 font-mono text-[12px] text-faint select-none">
+                ~/.turbollm
+              </div>
+              <p className="text-[11px] text-faint">Writes go to TurboLLM's data folder — not configurable.</p>
+            </div>
+
+            {/* Actions */}
+            <div className="flex gap-2">
+              <Button
+                size="sm"
+                onClick={() => void handleSave()}
+                disabled={saving || !form.name.trim()}
+                className="flex-1"
               >
-                <div className="flex items-center gap-2">
-                  <Bot
-                    size={14}
-                    className={cn('shrink-0', isSelected ? 'text-accent' : 'text-faint')}
-                  />
-                  <span className="flex-1 truncate text-[13px] font-medium text-ink">{agent.name}</span>
+                {saving ? 'Saving…' : 'Save'}
+              </Button>
+              <Button size="sm" variant="outline" onClick={closeEdit}>
+                Cancel
+              </Button>
+            </div>
+
+            {/* Delete — only for existing non-builtin agents */}
+            {editingId !== 'new' && (() => {
+              const agent = agents.find((a) => a.id === editingId)
+              if (!agent || agent.builtin) return null
+              return deleteConfirm === editingId ? (
+                <div className="flex items-center gap-2 rounded-md border border-border bg-panel p-2 text-[12px]">
+                  <span className="flex-1 text-muted">Delete this agent?</span>
+                  <button
+                    type="button"
+                    onClick={() => void handleDelete(editingId)}
+                    className="rounded px-2 py-1 text-[color:var(--err)] hover:bg-[color:color-mix(in_srgb,var(--err)_12%,transparent)]"
+                  >
+                    Delete
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDeleteConfirm(null)}
+                    className="rounded px-2 py-1 text-faint hover:text-ink"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setDeleteConfirm(editingId)}
+                  className="flex items-center gap-1.5 self-start text-[12px] text-faint hover:text-[color:var(--err)]"
+                >
+                  <Trash2 size={13} />
+                  Delete agent
+                </button>
+              )
+            })()}
+          </div>
+        ) : (
+          // ── Agent cards list ───────────────────────────────────────────────
+          <div className="flex flex-col gap-2 p-3">
+            {agentsQ.isLoading && (
+              <p className="px-1 py-4 text-[12px] text-faint">Loading…</p>
+            )}
+            {!agentsQ.isLoading && agents.length === 0 && (
+              <p className="px-1 py-4 text-[12px] text-faint">No agents yet. Create one above.</p>
+            )}
+            {agents.map((agent) => (
+              <div
+                key={agent.id}
+                className="flex items-start gap-3 rounded-lg border border-border bg-panel px-3 py-2.5"
+              >
+                <Bot size={15} className="mt-0.5 shrink-0 text-accent" />
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-[13px] font-medium text-ink">{agent.name}</p>
+                  {agent.description && (
+                    <p className="truncate text-[11px] text-muted">{agent.description}</p>
+                  )}
                   {agent.builtin && (
-                    <span
-                      className="shrink-0 rounded px-1.5 py-0.5 text-[9px] font-medium"
-                      style={{ background: 'color-mix(in srgb, var(--ok) 18%, transparent)', color: 'var(--ok)' }}
-                    >
-                      default
-                    </span>
+                    <span className="mt-0.5 inline-block text-[10px] text-faint">built-in</span>
                   )}
                 </div>
-                {agent.description && (
-                  <p className="ml-5 mt-0.5 line-clamp-1 text-[11px] text-faint">{agent.description}</p>
-                )}
-              </button>
-            )
-          })}
-          {!agentsQ.isLoading && agents.length === 0 && (
-            <div className="px-4 py-8 text-center">
-              <Bot size={24} className="mx-auto mb-2 text-faint" />
-              <p className="text-[12px] text-muted">No agents yet.</p>
+                <button
+                  type="button"
+                  onClick={() => openEdit(agent)}
+                  className="shrink-0 rounded p-1 text-faint hover:text-ink"
+                  title="Edit agent"
+                >
+                  <Pencil size={13} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ── Main screen ───────────────────────────────────────────────────────────────
+
+export function AgentsScreen() {
+  const { data: status } = useStatus()
+  const model = status?.model
+  const engineState = status?.engine.state
+  const ready = engineState === 'running' && !!model
+
+  const qc = useQueryClient()
+
+  // Conversation state
+  const [activeId, setActiveId] = useState<string | null>(null)
+  const [pickingAgent, setPickingAgent] = useState(false) // show agent picker overlay
+  const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [manageOpen, setManageOpen] = useState(false)
+  const [searchQ, setSearchQ] = useState('')
+  const [debouncedQ, setDebouncedQ] = useState('')
+
+  // Chat state
+  const [live, setLive] = useState<LiveState | null>(null)
+  const [input, setInput] = useState('')
+  const [editingMsgId, setEditingMsgId] = useState<string | null>(null)
+  const [showScrollBtn, setShowScrollBtn] = useState(false)
+
+  const abortRef = useRef<AbortController | null>(null)
+  const deltaTimestamps = useRef<number[]>([])
+  const scrollerRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLTextAreaElement>(null)
+  const userScrolledUp = useRef(false)
+
+  const mut = useConversationMutations()
+  const convQ = useConversation(activeId)
+  const conv = convQ.data
+  const messages = conv?.messages ?? []
+
+  // Debounce search
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedQ(searchQ), 200)
+    return () => clearTimeout(t)
+  }, [searchQ])
+
+  // All conversations — filter to agent-bound ones client-side
+  const allConvsQ = useQuery({
+    queryKey: ['conversations', debouncedQ],
+    queryFn: () => listConversations(debouncedQ || undefined),
+    staleTime: 0,
+    retry: false,
+  })
+  const agentConvs = (allConvsQ.data?.conversations ?? []).filter((c) => !!c.agentId)
+
+  // All agents (for picker)
+  const agentsQ = useQuery({
+    queryKey: agentKeys.list(),
+    queryFn: fetchAgents,
+    staleTime: 30_000,
+  })
+  const agents = agentsQ.data ?? []
+
+  // Scroll helpers
+  const scrollToBottom = useCallback((force = false) => {
+    const el = scrollerRef.current
+    if (!el) return
+    if (force || !userScrolledUp.current) {
+      el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
+      setShowScrollBtn(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    const el = scrollerRef.current
+    if (!el) return
+    const handler = () => {
+      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+      userScrolledUp.current = !atBottom
+      setShowScrollBtn(!atBottom && !!live)
+    }
+    el.addEventListener('scroll', handler)
+    return () => el.removeEventListener('scroll', handler)
+  }, [live])
+
+  useEffect(() => {
+    if (live) scrollToBottom()
+  }, [live, scrollToBottom])
+
+  // Auto-resize textarea
+  const autoResize = () => {
+    const el = inputRef.current
+    if (!el) return
+    el.style.height = 'auto'
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`
+  }
+
+  // Rolling tok/s
+  const pushGenToken = () => {
+    const now = Date.now()
+    deltaTimestamps.current.push(now)
+    deltaTimestamps.current = deltaTimestamps.current.filter((t) => t > now - 2000)
+    return Math.round((deltaTimestamps.current.length / 2) * 10) / 10
+  }
+
+  // SSE stream driver — same pattern as ChatScreen
+  const streamFrom = async (convId: string, gen: AsyncGenerator<ChatSseEvent>) => {
+    try {
+      for await (const evt of gen) {
+        if (evt.event === 'meta') {
+          deltaTimestamps.current = []
+          setLive({
+            assistantId: evt.data.assistantMessageId,
+            content: '',
+            reasoning: '',
+            progress: null,
+            liveGenTps: 0,
+            genTokens: 0,
+            toolCalls: [],
+          })
+          void qc.invalidateQueries({ queryKey: ['conversation', convId] })
+        } else if (evt.event === 'progress') {
+          setLive((l) => l ? { ...l, progress: { phase: evt.data.phase, pct: evt.data.pct, tps: evt.data.tps } } : l)
+        } else if (evt.event === 'reasoning') {
+          const liveTps = pushGenToken()
+          setLive((l) => l ? { ...l, reasoning: l.reasoning + evt.data.delta, progress: null, liveGenTps: liveTps, genTokens: l.genTokens + 1 } : l)
+        } else if (evt.event === 'delta') {
+          const liveTps = pushGenToken()
+          setLive((l) => l ? { ...l, content: l.content + evt.data.delta, progress: null, liveGenTps: liveTps, genTokens: l.genTokens + 1 } : l)
+        } else if (evt.event === 'tool_call') {
+          const tc = evt.data
+          setLive((l) => {
+            if (!l) return l
+            const existing = l.toolCalls.findIndex((x) => x.id === tc.id)
+            if (existing >= 0) {
+              const updated = [...l.toolCalls]
+              updated[existing] = { ...updated[existing], status: tc.status, result: tc.result }
+              return { ...l, toolCalls: updated }
+            }
+            return { ...l, toolCalls: [...l.toolCalls, { id: tc.id, name: tc.name, args: tc.args, status: tc.status, result: tc.result }] }
+          })
+        } else if (evt.event === 'done') {
+          setLive(null)
+          void qc.invalidateQueries({ queryKey: ['conversation', convId] })
+          void qc.invalidateQueries({ queryKey: ['conversations'] })
+          setTimeout(() => scrollToBottom(true), 80)
+        } else if (evt.event === 'error') {
+          setLive(null)
+          void qc.invalidateQueries({ queryKey: ['conversation', convId] })
+          toast.error(evt.data.message)
+        }
+      }
+      setLive(null)
+      void qc.invalidateQueries({ queryKey: ['conversation', convId] })
+    } catch (e) {
+      setLive(null)
+      if ((e as Error)?.name !== 'AbortError') {
+        toast.error(e instanceof ApiError ? e.message : 'Request failed.')
+      }
+      void qc.invalidateQueries({ queryKey: ['conversation', convId] })
+    }
+  }
+
+  // Start a new agent conversation (after user picks an agent)
+  const handleAgentPick = async (agent: AgentType) => {
+    if (!ready) { toast.error('Load a model first.'); return }
+    try {
+      const newConv = await createConversation({
+        agentId: agent.id,
+        systemPrompt: agent.systemPrompt || undefined,
+      })
+      void qc.invalidateQueries({ queryKey: ['conversations'] })
+      setPickingAgent(false)
+      setActiveId(newConv.id)
+      userScrolledUp.current = false
+      setInput('')
+      setLive(null)
+      setTimeout(() => inputRef.current?.focus(), 50)
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : 'Could not start conversation.')
+    }
+  }
+
+  const handleNew = () => {
+    abortRef.current?.abort()
+    setLive(null)
+    setActiveId(null)
+    setInput('')
+    setEditingMsgId(null)
+    setPickingAgent(true)
+  }
+
+  const handleSelect = (id: string) => {
+    if (live) { abortRef.current?.abort(); setLive(null) }
+    setActiveId(id)
+    setEditingMsgId(null)
+    setPickingAgent(false)
+    userScrolledUp.current = false
+    setTimeout(() => scrollToBottom(true), 50)
+  }
+
+  const handleStop = async () => {
+    abortRef.current?.abort()
+    if (activeId) await stopGeneration(activeId).catch(() => {})
+  }
+
+  const send = async () => {
+    const text = input.trim()
+    if (!text || live) return
+    if (!ready) { toast.error('Load a model first.'); return }
+    if (!activeId) { toast.error('Pick an agent first.'); return }
+
+    setInput('')
+    setTimeout(autoResize, 0)
+    userScrolledUp.current = false
+
+    const ac = new AbortController()
+    abortRef.current = ac
+
+    try {
+      await streamFrom(activeId, sendMessage(activeId, text, ac.signal))
+    } catch (e) {
+      setLive(null)
+      if ((e as Error)?.name !== 'AbortError') {
+        toast.error(e instanceof ApiError ? e.message : 'Request failed.')
+      }
+      void qc.invalidateQueries({ queryKey: ['conversation', activeId] })
+    }
+  }
+
+  const handleDelete = (m: import('../lib/chat-types').Message) => {
+    if (!activeId) return
+    mut.deleteMsg.mutate(
+      { convId: activeId, msgId: m.id },
+      { onError: () => toast.error('Could not delete message.') },
+    )
+  }
+
+  // Find the agent name for the active conversation
+  const activeAgent = conv?.agentId ? agents.find((a) => a.id === conv.agentId) : undefined
+
+  return (
+    <div className="flex h-full overflow-hidden">
+      {/* Left: agent conversation sidebar */}
+      <div
+        className="shrink-0"
+        style={{ width: sidebarOpen ? '14rem' : '2.5rem', transition: 'width 0.15s' }}
+      >
+        <AgentConvSidebar
+          activeId={activeId}
+          agentConvs={agentConvs}
+          onSelect={handleSelect}
+          onNew={handleNew}
+          collapsed={!sidebarOpen}
+          onToggle={() => setSidebarOpen((o) => !o)}
+          q={searchQ}
+          setQ={setSearchQ}
+        />
+      </div>
+
+      {/* Center: chat thread */}
+      <div className="relative flex min-w-0 flex-1 flex-col">
+        {/* Chat header */}
+        <div className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-4">
+          {activeAgent && (
+            <div className="flex items-center gap-1.5">
+              <Bot size={15} className="text-accent shrink-0" />
+              <span className="text-[13px] font-medium text-ink">{activeAgent.name}</span>
+              {activeAgent.skills.length > 0 && (
+                <span className="text-[11px] text-faint">
+                  · {activeAgent.skills.join(', ')}
+                </span>
+              )}
             </div>
           )}
-        </div>
-      </div>
-
-      {/* Right pane */}
-      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
-        {mode.type === 'none' && (
-          <div className="flex h-full flex-col items-center justify-center px-8 text-center">
-            <Bot size={36} className="mb-3 text-faint" />
-            <p className="text-[14px] font-medium text-ink">Select an agent to edit</p>
-            <p className="mt-1 text-[13px] text-muted">or hire a new one</p>
-            <Button className="mt-4" size="sm" onClick={() => setMode({ type: 'create' })}>
-              <UserPlus size={13} /> Hire a hitman
-            </Button>
-          </div>
-        )}
-        {mode.type !== 'none' && (
-          <AgentFormPanel
-            key={formKey}
-            agent={mode.type === 'edit' ? mode.agent : null}
-            skills={skills}
-            onSave={handleSave}
-            onCancel={() => setMode({ type: 'none' })}
-            onDelete={mode.type === 'edit' && !mode.agent.builtin ? handleDelete : undefined}
-            busy={busy}
-          />
-        )}
-      </div>
-    </div>
-  )
-}
-
-// ── Skill form ─────────────────────────────────────────────────────────────────
-
-type SkillFormState = {
-  id: string
-  name: string
-  description: string
-  instructions: string
-  toolsText: string
-}
-
-function skillToForm(skill: Skill): SkillFormState {
-  return {
-    id: skill.id,
-    name: skill.name,
-    description: skill.description,
-    instructions: skill.instructions,
-    toolsText: skill.tools.join(', '),
-  }
-}
-
-function formToSkill(form: SkillFormState): Skill {
-  return {
-    id: form.id.trim(),
-    name: form.name.trim(),
-    description: form.description.trim(),
-    instructions: form.instructions,
-    tools: form.toolsText.split(',').map((s) => s.trim()).filter(Boolean),
-  }
-}
-
-function SkillFormPanel({
-  skill,
-  onSave,
-  onCancel,
-  onDelete,
-  busy,
-}: {
-  skill: Skill | null
-  onSave: (s: Skill) => void
-  onCancel: () => void
-  onDelete?: () => void
-  busy: boolean
-}) {
-  const [form, setForm] = useState<SkillFormState>(() =>
-    skill ? skillToForm(skill) : { id: '', name: '', description: '', instructions: '', toolsText: '' }
-  )
-  const set = (patch: Partial<SkillFormState>) => setForm((p) => ({ ...p, ...patch }))
-  const isBuiltin = skill?.builtin ?? false
-
-  const handleSave = () => {
-    if (!form.id.trim()) { toast.error('ID is required.'); return }
-    if (!form.name.trim()) { toast.error('Name is required.'); return }
-    if (!/^[a-z0-9-]+$/.test(form.id.trim())) {
-      toast.error('ID must be kebab-case: lowercase letters, numbers, and hyphens only.')
-      return
-    }
-    onSave(formToSkill(form))
-  }
-
-  return (
-    <div className="flex h-full flex-col overflow-hidden">
-      {/* Header */}
-      <div className="flex shrink-0 items-center justify-between border-b border-border px-4 py-3">
-        <div className="flex items-center gap-2">
-          <BookOpen size={15} className="text-accent" />
-          <span className="text-[14px] font-semibold text-ink">
-            {skill ? (isBuiltin ? 'Built-in skill' : 'Edit skill') : 'New skill'}
-          </span>
-          {isBuiltin && (
-            <span
-              className="rounded px-1.5 py-0.5 text-[10px] font-medium"
-              style={{ background: 'color-mix(in srgb, var(--ok) 18%, transparent)', color: 'var(--ok)' }}
-            >
-              built-in
-            </span>
+          {!activeAgent && !pickingAgent && (
+            <span className="text-[13px] text-muted">Agents</span>
           )}
-        </div>
-        <button type="button" onClick={onCancel} className="text-faint hover:text-ink">
-          <X size={15} />
-        </button>
-      </div>
-
-      {/* Body */}
-      <div className="slim-scroll flex-1 space-y-4 overflow-y-auto px-4 py-4">
-        <div className="flex gap-3">
-          <div className="flex flex-1 flex-col gap-1">
-            <label className="text-[12px] text-muted">
-              ID <span style={{ color: 'var(--err)' }}>*</span>
-            </label>
-            <input
-              type="text"
-              value={form.id}
-              onChange={(e) =>
-                set({ id: e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, '-') })
-              }
-              disabled={!!skill}
-              placeholder="my-skill"
-              className="rounded-lg border border-border bg-panel-2 px-3 py-2 font-mono text-[12px] text-ink placeholder:text-faint focus:border-accent focus:outline-none disabled:opacity-60"
-            />
-          </div>
-          <div className="flex flex-1 flex-col gap-1">
-            <label className="text-[12px] text-muted">
-              Name <span style={{ color: 'var(--err)' }}>*</span>
-            </label>
-            <input
-              type="text"
-              value={form.name}
-              onChange={(e) => set({ name: e.target.value })}
-              disabled={isBuiltin}
-              placeholder="My Skill"
-              className="rounded-lg border border-border bg-panel-2 px-3 py-2 text-[13px] text-ink placeholder:text-faint focus:border-accent focus:outline-none disabled:opacity-60"
-            />
-          </div>
-        </div>
-
-        <div className="flex flex-col gap-1">
-          <label className="text-[12px] text-muted">Description</label>
-          <input
-            type="text"
-            value={form.description}
-            onChange={(e) => set({ description: e.target.value })}
-            disabled={isBuiltin}
-            placeholder="Short summary of what this skill enables"
-            className="rounded-lg border border-border bg-panel-2 px-3 py-2 text-[13px] text-ink placeholder:text-faint focus:border-accent focus:outline-none disabled:opacity-60"
-          />
-        </div>
-
-        <div className="flex flex-col gap-1">
-          <label className="text-[12px] text-muted">Instructions</label>
-          <textarea
-            value={form.instructions}
-            onChange={(e) => set({ instructions: e.target.value })}
-            disabled={isBuiltin}
-            placeholder="Describe what the agent should do when this skill is active…"
-            rows={7}
-            className="resize-none rounded-lg border border-border bg-panel-2 px-3 py-2 text-[13px] text-ink placeholder:text-faint focus:border-accent focus:outline-none disabled:opacity-60"
-          />
-        </div>
-
-        <div className="flex flex-col gap-1">
-          <label className="text-[12px] text-muted">
-            Tools <span className="text-faint">(comma-separated)</span>
-          </label>
-          <input
-            type="text"
-            value={form.toolsText}
-            onChange={(e) => set({ toolsText: e.target.value })}
-            disabled={isBuiltin}
-            placeholder="read_file, write_file, search_web"
-            className="rounded-lg border border-border bg-panel-2 px-3 py-2 font-mono text-[12px] text-ink placeholder:text-faint focus:border-accent focus:outline-none disabled:opacity-60"
-          />
-        </div>
-      </div>
-
-      {/* Footer */}
-      <div className="flex shrink-0 items-center justify-between border-t border-border px-4 py-3">
-        <div>
-          {!isBuiltin && onDelete && (
-            <button
-              type="button"
-              onClick={onDelete}
-              disabled={busy}
-              className="flex items-center gap-1.5 text-[12px] disabled:opacity-40"
-              style={{ color: 'var(--err)' }}
-            >
-              <Trash2 size={13} /> Delete
-            </button>
+          {pickingAgent && (
+            <span className="text-[13px] text-muted">New conversation</span>
           )}
-        </div>
-        <div className="flex items-center gap-2">
-          <button type="button" onClick={onCancel} className="text-[13px] text-muted hover:text-ink">
-            {isBuiltin ? 'Close' : 'Cancel'}
-          </button>
-          {!isBuiltin && (
-            <Button size="sm" onClick={handleSave} disabled={busy}>
-              {busy && <Loader2 size={13} className="animate-spin" />}
-              {skill ? 'Save' : 'Create'}
-            </Button>
-          )}
-        </div>
-      </div>
-    </div>
-  )
-}
 
-// ── Skills tab ─────────────────────────────────────────────────────────────────
-
-type SkillPaneMode =
-  | { type: 'none' }
-  | { type: 'create' }
-  | { type: 'edit'; skill: Skill }
-
-function SkillsTab() {
-  const qc = useQueryClient()
-  const [mode, setMode] = useState<SkillPaneMode>({ type: 'none' })
-
-  const skillsQ = useQuery({ queryKey: skillKeys.list(), queryFn: fetchSkills })
-  const skills = skillsQ.data ?? []
-
-  const saveMut = useMutation({
-    mutationFn: (skill: Skill) => saveSkill(skill),
-    onSuccess: (saved) => {
-      void qc.invalidateQueries({ queryKey: skillKeys.list() })
-      toast.success(mode.type === 'create' ? `Skill "${saved.name}" created.` : 'Skill saved.')
-      setMode({ type: 'edit', skill: saved })
-    },
-    onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not save skill.'),
-  })
-
-  const deleteMut = useMutation({
-    mutationFn: (id: string) => deleteSkill(id),
-    onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: skillKeys.list() })
-      toast.success('Skill removed.')
-      setMode({ type: 'none' })
-    },
-    onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not remove skill.'),
-  })
-
-  const busy = saveMut.isPending || deleteMut.isPending
-
-  const handleDelete = () => {
-    if (mode.type !== 'edit') return
-    // eslint-disable-next-line no-alert
-    if (!window.confirm(`Remove skill "${mode.skill.name}"?`)) return
-    deleteMut.mutate(mode.skill.id)
-  }
-
-  const formKey =
-    mode.type === 'none' ? 'none'
-    : mode.type === 'create' ? 'create'
-    : mode.skill.id
-
-  const builtin = skills.filter((s) => s.builtin)
-  const custom = skills.filter((s) => !s.builtin)
-
-  return (
-    <div className="flex h-full">
-      {/* Sidebar */}
-      <div className="flex w-60 shrink-0 flex-col border-r border-border">
-        <div className="flex shrink-0 items-center justify-between border-b border-border px-3 py-2.5">
-          <span className="text-[13px] font-semibold text-ink">Skills</span>
-          <Button size="sm" onClick={() => setMode({ type: 'create' })} className="h-6 px-2 text-[11px]">
-            <Plus size={11} /> New
+          {/* Manage agents toggle — right side */}
+          <Button
+            size="icon"
+            variant="ghost"
+            className={cn('ml-auto h-8 w-8', manageOpen && 'bg-panel-2')}
+            onClick={() => setManageOpen((o) => !o)}
+            title="Manage agents"
+          >
+            <Settings2 size={15} />
           </Button>
         </div>
 
-        <div className="slim-scroll flex-1 overflow-y-auto">
-          {skillsQ.isLoading && (
-            <div className="flex h-20 items-center justify-center">
-              <Loader2 size={16} className="animate-spin text-faint" />
-            </div>
-          )}
+        {/* Message area */}
+        <div ref={scrollerRef} className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
+          <div className="flex w-full flex-col gap-6 px-8 py-6">
 
-          {builtin.length > 0 && (
-            <>
-              <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-faint">
-                Built-in
+            {/* Agent picker (new conversation state) */}
+            {pickingAgent && agents.length > 0 && (
+              <AgentPicker agents={agents} onPick={(a) => void handleAgentPick(a)} />
+            )}
+            {pickingAgent && agents.length === 0 && !agentsQ.isLoading && (
+              <div className="flex flex-col items-center gap-3 py-16">
+                <Bot size={32} className="text-faint" />
+                <p className="text-[14px] text-muted">No agents yet.</p>
+                <Button size="sm" variant="outline" onClick={() => { setPickingAgent(false); setManageOpen(true) }}>
+                  Create an agent
+                </Button>
               </div>
-              {builtin.map((skill) => {
-                const isSelected = mode.type === 'edit' && mode.skill.id === skill.id
-                return (
-                  <button
-                    key={skill.id}
-                    type="button"
-                    onClick={() => setMode({ type: 'edit', skill })}
-                    className={cn(
-                      'w-full border-b border-border px-3 py-2 text-left transition-colors hover:bg-panel-2',
-                      isSelected && 'bg-panel-2',
-                    )}
-                  >
-                    <div className="flex items-center gap-1.5">
-                      <Wrench size={12} className={isSelected ? 'text-accent' : 'text-faint'} />
-                      <span className="flex-1 truncate text-[13px] text-ink">{skill.name}</span>
-                    </div>
-                  </button>
-                )
-              })}
-            </>
-          )}
+            )}
 
-          {custom.length > 0 && (
-            <>
-              <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-faint">
-                Custom
+            {/* Empty state (no conversation selected, not picking) */}
+            {!pickingAgent && !activeId && (
+              <div className="flex flex-col items-center gap-3 py-16">
+                <Bot size={32} className="text-faint" />
+                <p className="text-[14px] text-muted">
+                  {agentConvs.length > 0
+                    ? 'Select a conversation or start a new one.'
+                    : 'Start a conversation with an agent.'}
+                </p>
+                <Button size="sm" variant="outline" onClick={handleNew}>
+                  <Plus size={14} />
+                  New conversation
+                </Button>
               </div>
-              {custom.map((skill) => {
-                const isSelected = mode.type === 'edit' && mode.skill.id === skill.id
-                return (
-                  <button
-                    key={skill.id}
-                    type="button"
-                    onClick={() => setMode({ type: 'edit', skill })}
-                    className={cn(
-                      'w-full border-b border-border px-3 py-2 text-left transition-colors hover:bg-panel-2',
-                      isSelected && 'bg-panel-2',
-                    )}
-                  >
-                    <div className="flex items-center gap-1.5">
-                      <BookOpen size={12} className={isSelected ? 'text-accent' : 'text-faint'} />
-                      <span className="flex-1 truncate text-[13px] text-ink">{skill.name}</span>
-                    </div>
-                    {skill.description && (
-                      <p className="ml-4 mt-0.5 line-clamp-1 text-[11px] text-faint">{skill.description}</p>
-                    )}
-                  </button>
-                )
-              })}
-            </>
-          )}
+            )}
 
-          {!skillsQ.isLoading && skills.length === 0 && (
-            <div className="px-4 py-8 text-center">
-              <BookOpen size={24} className="mx-auto mb-2 text-faint" />
-              <p className="text-[12px] text-muted">No skills yet.</p>
-            </div>
-          )}
+            {/* Messages */}
+            {!pickingAgent && messages.map((m, i) => (
+              <MessageBubble
+                key={m.id}
+                message={m}
+                isLast={i === messages.length - 1 && !live}
+                onDelete={handleDelete}
+                editingId={editingMsgId}
+                onEdit={(msg) => setEditingMsgId(msg.id)}
+                onEditSave={() => setEditingMsgId(null)}
+                onEditCancel={() => setEditingMsgId(null)}
+              />
+            ))}
+
+            {/* Streaming bubble */}
+            {live && (
+              <StreamingBubble
+                content={live.content}
+                reasoning={live.reasoning}
+                progress={live.progress}
+                liveGenTps={live.liveGenTps}
+                genTokens={live.genTokens}
+                toolCalls={live.toolCalls}
+              />
+            )}
+          </div>
         </div>
-      </div>
 
-      {/* Right pane */}
-      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
-        {mode.type === 'none' && (
-          <div className="flex h-full flex-col items-center justify-center px-8 text-center">
-            <BookOpen size={36} className="mb-3 text-faint" />
-            <p className="text-[14px] font-medium text-ink">Select a skill to view</p>
-            <p className="mt-1 text-[13px] text-muted">or create a new one</p>
-            <Button className="mt-4" size="sm" onClick={() => setMode({ type: 'create' })}>
-              <Plus size={13} /> New skill
-            </Button>
+        {/* Scroll-to-bottom pill */}
+        {showScrollBtn && (
+          <button
+            type="button"
+            onClick={() => { userScrolledUp.current = false; scrollToBottom(true) }}
+            className="absolute bottom-28 left-1/2 -translate-x-1/2 flex items-center gap-1.5 rounded-full border border-border bg-panel px-3 py-1.5 text-[12px] text-muted shadow-[var(--shadow-1)] hover:text-ink"
+          >
+            <ArrowDown size={13} /> Jump to latest
+          </button>
+        )}
+
+        {/* Composer — only shown when a conversation is active */}
+        {activeId && !pickingAgent && (
+          <div className="px-8 pb-5">
+            <div className="w-full">
+              <div className="rounded-[var(--radius-lg)] border border-border bg-panel shadow-[var(--shadow-2)] focus-within:border-[color:var(--accent)]">
+                <div className="flex items-end gap-2 p-2">
+                  <textarea
+                    ref={inputRef}
+                    rows={1}
+                    className="max-h-40 min-h-9 flex-1 resize-none bg-transparent px-2 py-1.5 text-[15px] text-ink outline-none placeholder:overflow-hidden placeholder:whitespace-nowrap placeholder:text-faint"
+                    placeholder={
+                      ready
+                        ? activeAgent
+                          ? `Message ${activeAgent.name}…`
+                          : 'Type a message…'
+                        : 'Load a model to start chatting'
+                    }
+                    value={input}
+                    disabled={!ready || !!live || !!editingMsgId}
+                    onChange={(e) => { setInput(e.target.value); autoResize() }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void send() }
+                    }}
+                  />
+                  {live ? (
+                    <Button size="icon" variant="outline" onClick={() => void handleStop()} title="Stop (Esc)">
+                      <Square size={15} />
+                    </Button>
+                  ) : (
+                    <Button
+                      size="icon"
+                      onClick={() => void send()}
+                      disabled={!ready || !input.trim() || !!editingMsgId}
+                      aria-label="Send"
+                    >
+                      <SendHorizontal size={15} />
+                    </Button>
+                  )}
+                </div>
+              </div>
+              <p className="mt-1.5 px-1 text-[11px] text-faint">
+                {model ? `${model.name} · Enter to send · Shift+Enter for newline` : 'Load a model above to start chatting'}
+              </p>
+            </div>
           </div>
         )}
-        {mode.type !== 'none' && (
-          <SkillFormPanel
-            key={formKey}
-            skill={mode.type === 'edit' ? mode.skill : null}
-            onSave={(s) => saveMut.mutate(s)}
-            onCancel={() => setMode({ type: 'none' })}
-            onDelete={mode.type === 'edit' && !mode.skill.builtin ? handleDelete : undefined}
-            busy={busy}
-          />
-        )}
-      </div>
-    </div>
-  )
-}
-
-// ── Main screen ────────────────────────────────────────────────────────────────
-
-type Tab = 'agents' | 'skills' | 'contracts'
-
-const TABS: { id: Tab; label: string; icon: React.ReactNode }[] = [
-  { id: 'agents',    label: 'Agents',    icon: <Bot size={14} /> },
-  { id: 'skills',    label: 'Skills',    icon: <BookOpen size={14} /> },
-  { id: 'contracts', label: 'Contracts', icon: <Target size={14} /> },
-]
-
-export function AgentsScreen() {
-  const [tab, setTab] = useState<Tab>('agents')
-
-  // Pre-fetch both at root so child tabs share the cache without duplicate requests
-  const agentsQ = useQuery({ queryKey: agentKeys.list(), queryFn: fetchAgents })
-  const skillsQ = useQuery({ queryKey: skillKeys.list(), queryFn: fetchSkills })
-
-  const agents = agentsQ.data ?? []
-  const skills = skillsQ.data ?? []
-
-  return (
-    <div className="flex h-full flex-col">
-      {/* Top bar with title + tab nav */}
-      <div className="flex shrink-0 items-end gap-0 border-b border-border px-4 pt-3">
-        <div className="mb-2.5 mr-6 shrink-0">
-          <h1 className="text-[15px] font-semibold tracking-tight text-ink">Agents</h1>
-          <p className="text-[11px] text-faint">Hire, configure, and run autonomous workers</p>
-        </div>
-        <div className="flex gap-0">
-          {TABS.map((t) => (
-            <button
-              key={t.id}
-              type="button"
-              onClick={() => setTab(t.id)}
-              className={cn(
-                'flex items-center gap-1.5 border-b-2 px-3 pb-2.5 pt-0.5 text-[13px] font-medium transition-colors',
-                tab === t.id
-                  ? 'border-accent text-ink'
-                  : 'border-transparent text-muted hover:text-ink',
-              )}
-            >
-              {t.icon}
-              {t.label}
-            </button>
-          ))}
-        </div>
       </div>
 
-      {/* Tab content */}
-      <div className="flex-1 overflow-hidden">
-        {tab === 'agents'    && <AgentsTab skills={skills} />}
-        {tab === 'skills'    && <SkillsTab />}
-        {tab === 'contracts' && <ContractsTab agents={agents} />}
-      </div>
+      {/* Right: manage agents panel */}
+      {manageOpen && (
+        <ManageAgentsPanel onClose={() => setManageOpen(false)} />
+      )}
     </div>
   )
 }

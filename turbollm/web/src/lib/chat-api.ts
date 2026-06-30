@@ -24,7 +24,7 @@ export function listConversations(q?: string): Promise<{ conversations: Conversa
   return req(`/api/v1/conversations${q ? `?q=${encodeURIComponent(q)}` : ''}`)
 }
 
-export function createConversation(partial?: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'modelKey' | 'toolPolicy'>>): Promise<Conversation> {
+export function createConversation(partial?: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'modelKey' | 'toolPolicy' | 'agentId'>>): Promise<Conversation> {
   return req('/api/v1/conversations', { method: 'POST', json: partial ?? {} })
 }
 

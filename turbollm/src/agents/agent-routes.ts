@@ -50,9 +50,11 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
       id: randomUUID(),
       name: b.name.trim(),
       description: b.description?.trim() ?? '',
+      systemPrompt: typeof b.systemPrompt === 'string' ? b.systemPrompt : '',
       skills: Array.isArray(b.skills) ? b.skills : [],
       readRoots: Array.isArray(b.readRoots) && b.readRoots.length ? b.readRoots : [dataDir],
-      writeRoots: Array.isArray(b.writeRoots) && b.writeRoots.length ? b.writeRoots : [dataDir],
+      // Write root is FIXED to ~/.turbollm (spec 13 redesign §1.1) — never client-settable.
+      writeRoots: [dataDir],
       callableAgents: Array.isArray(b.callableAgents) ? b.callableAgents : [],
       maxIterations: typeof b.maxIterations === 'number' ? b.maxIterations : 30,
     }
@@ -77,9 +79,11 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
         // The builtin default's identity (name/id/builtin) is locked; its scope + skills are editable.
         if (!a.builtin && typeof b.name === 'string' && b.name.trim()) a.name = b.name.trim()
         if (typeof b.description === 'string') a.description = b.description.trim()
+        if (typeof b.systemPrompt === 'string') a.systemPrompt = b.systemPrompt
         if (Array.isArray(b.skills)) a.skills = b.skills
         if (Array.isArray(b.readRoots)) a.readRoots = b.readRoots
-        if (Array.isArray(b.writeRoots)) a.writeRoots = b.writeRoots
+        // writeRoots is FIXED to ~/.turbollm (spec 13 redesign §1.1) — never client-editable.
+        a.writeRoots = [d.store.dir()]
         if (Array.isArray(b.callableAgents)) a.callableAgents = b.callableAgents
         if (typeof b.maxIterations === 'number') a.maxIterations = b.maxIterations
       })
