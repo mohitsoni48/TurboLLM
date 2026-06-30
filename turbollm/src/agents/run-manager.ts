@@ -173,6 +173,10 @@ export class AgentRunManager {
       const guard = makeToolCallGuard(agent, dataDir, bridgedNames)
       const modelId = engineModelAlias(this.d.registry.active()?.kind ?? '') ?? ms.model.key
 
+      // Anchor pi's own framing to the agent's primary writable root (its workspace),
+      // so the default system prompt treats that folder as in-scope.
+      const cwd = agent.writeRoots[0] === '<dataDir>' || !agent.writeRoots[0] ? dataDir : agent.writeRoots[0]
+
       await runAgentSession(
         {
           baseUrl: `${target}/v1`,
@@ -184,6 +188,7 @@ export class AgentRunManager {
           customTools: [...fsTools, ...bridged],
           onToolCall: guard,
           gate: this.d.gate,
+          cwd,
           onEvent: (ev) => {
             if (ev.event === 'delta') {
               const d = ev.data as { delta?: string }

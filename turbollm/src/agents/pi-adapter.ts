@@ -32,6 +32,10 @@ export interface PiAgentConfig {
   /** Shared engine-slot mutex (spec 13 §3.4). When present, pi's engine calls run
    *  at 'bg' priority so foreground chat preempts them. */
   gate?: GenerationGate
+  /** Working directory pi anchors its own framing to. Set to the agent's primary
+   *  root so pi's default system prompt treats that folder as the workspace (else
+   *  pi defaults to the repo dir and the model refuses paths outside it). */
+  cwd: string
 }
 
 /** Wrap a custom tool so the guard runs before its execute. A blocked call never
@@ -83,7 +87,8 @@ export async function runAgentSession(
     model,
     authStorage: auth,
     modelRegistry: registry,
-    sessionManager: SessionManager.inMemory(),
+    cwd: config.cwd,
+    sessionManager: SessionManager.inMemory(config.cwd),
     // Disable pi's built-in read/bash/edit/write entirely — the agent only ever sees
     // our guarded custom tools (FS, bridged registry, action tools). Belt: the guard
     // also hard-denies these names if pi ever re-enables them.
@@ -108,7 +113,7 @@ export async function runAgentSession(
         config.onEvent({ event: 'tool_call', data: { id: event.toolCallId, name: event.toolName, args: event.args, status: 'pending' } })
         break
       case 'tool_execution_end':
-        config.onEvent({ event: 'tool_call', data: { id: event.toolCallId, status: event.isError ? 'error' : 'done', result: event.result } })
+        config.onEvent({ event: 'tool_call', data: { id: event.toolCallId, status: event.isError ? 'error' : 'done', result: toolResultText(event.result) } })
         break
       case 'agent_end': {
         const stats = session.getSessionStats()
@@ -177,6 +182,17 @@ export async function buildBridgedTools(
       },
     }),
   )
+}
+
+/** Extract readable text from pi's tool result ({ content: [{type:'text',text}] }),
+ *  so the SSE `result` field is a string, not "[object Object]". */
+function toolResultText(result: unknown): string {
+  if (typeof result === 'string') return result
+  const content = (result as { content?: Array<{ type?: string; text?: string }> })?.content
+  if (Array.isArray(content)) {
+    return content.filter((p) => p?.type === 'text' && typeof p.text === 'string').map((p) => p.text).join('\n')
+  }
+  return result == null ? '' : String(result)
 }
 
 /** Bridge an async-resolved event stream into the synchronous AssistantMessageEventStream
