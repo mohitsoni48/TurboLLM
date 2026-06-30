@@ -192,18 +192,18 @@ export async function runAgentSession(
 const NON_BRIDGEABLE = new Set(['run_code'])
 
 // ── buildBridgedTools ─────────────────────────────────────────────────────────
-/** Wrap TurboLLM ToolRegistry tools as pi custom tools, filtered to the tool NAMES the
- *  agent's skills actually grant (skills hold tool names; the caller resolves them).
- *  run_code is excluded unconditionally. */
+/** Wrap TurboLLM ToolRegistry tools (built-ins + MCP) as pi custom tools. Pass D:
+ *  every tool is available by default; `disabledTools` is the per-agent denylist.
+ *  run_code is excluded unconditionally (security review C4). */
 export async function buildBridgedTools(
   d: Deps,
-  grantedToolNames: string[],
+  disabledTools: string[] = [],
 ): Promise<ReturnType<typeof defineTool>[]> {
   const defs = await d.tools?.buildToolDefinitions() ?? []
-  const granted = new Set(grantedToolNames)
+  const disabled = new Set(disabledTools)
 
   return defs
-    .filter((t) => granted.has(t.function.name) && !NON_BRIDGEABLE.has(t.function.name))
+    .filter((t) => !NON_BRIDGEABLE.has(t.function.name) && !disabled.has(t.function.name))
     .map((t) =>
     defineTool({
       name: t.function.name,

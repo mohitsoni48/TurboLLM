@@ -1,14 +1,14 @@
 import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { ChevronLeft, Trash2, Wand2 } from 'lucide-react'
+import { ChevronLeft, Trash2, Wand2, Wrench } from 'lucide-react'
 import { Button } from '../../components/ui/button'
 import { toast } from '../../components/ui/sonner'
 import { ApiError } from '../../lib/api'
 import {
-  agentKeys, fetchAgents, createAgent, updateAgent, deleteAgent, fetchSkills,
+  agentKeys, fetchAgents, createAgent, updateAgent, deleteAgent, fetchSkills, fetchAvailableTools,
 } from '../../lib/agent-api'
-import type { AgentType, Skill } from '../../lib/agent-types'
+import type { AgentType, Skill, ToolInfo } from '../../lib/agent-types'
 
 // ── Form model ────────────────────────────────────────────────────────────────
 
@@ -17,6 +17,7 @@ interface AgentFormState {
   description: string
   systemPrompt: string
   skills: string[]
+  disabledTools: string[]
 }
 
 const emptyForm = (): AgentFormState => ({
@@ -24,6 +25,7 @@ const emptyForm = (): AgentFormState => ({
   description: '',
   systemPrompt: '',
   skills: [],
+  disabledTools: [],
 })
 
 function agentToForm(a: AgentType): AgentFormState {
@@ -32,6 +34,7 @@ function agentToForm(a: AgentType): AgentFormState {
     description: a.description,
     systemPrompt: a.systemPrompt ?? '',
     skills: a.skills,
+    disabledTools: a.disabledTools ?? [],
   }
 }
 
@@ -123,6 +126,62 @@ function SkillsPicker({
   )
 }
 
+// ── Tools picker (Pass D: every tool on by default; toggle off per agent) ────
+//
+// The full catalog — built-ins + connected MCP servers. Checked = the agent may
+// use it; unchecking adds the tool to the agent's `disabledTools` denylist.
+
+function ToolsPicker({
+  disabled,
+  setDisabled,
+}: {
+  disabled: string[]
+  setDisabled: (next: string[]) => void
+}) {
+  const toolsQ = useQuery({ queryKey: ['agent-tools'], queryFn: fetchAvailableTools, staleTime: 30_000 })
+  const tools: ToolInfo[] = toolsQ.data ?? []
+  const off = new Set(disabled)
+  const toggle = (name: string) =>
+    setDisabled(off.has(name) ? disabled.filter((d) => d !== name) : [...disabled, name])
+
+  return (
+    <div className="flex flex-col gap-2.5">
+      <div className="flex items-center justify-between">
+        <span className="flex items-center gap-1.5 text-[12px] font-medium text-muted"><Wrench size={12} className="text-accent" /> Tools</span>
+        {tools.length > 0 && <span className="text-[11px] text-faint">{tools.length - off.size}/{tools.length} on</span>}
+      </div>
+      {toolsQ.isLoading ? (
+        <p className="px-1 py-2 text-[12px] text-faint">Loading tools…</p>
+      ) : tools.length === 0 ? (
+        <p className="px-1 py-2 text-[12px] text-faint">
+          No optional tools yet. Connect an MCP server or a web-search provider in Settings → Tools.
+        </p>
+      ) : (
+        <div className="flex flex-col gap-1.5">
+          {tools.map((t) => (
+            <label
+              key={t.name}
+              className="flex cursor-pointer items-start gap-2.5 rounded-md border border-border bg-bg px-3 py-2 text-[12px] hover:border-accent"
+            >
+              <input
+                type="checkbox"
+                className="mt-0.5 shrink-0 accent-[var(--accent)]"
+                checked={!off.has(t.name)}
+                onChange={() => toggle(t.name)}
+              />
+              <div className="min-w-0">
+                <p className="truncate font-mono text-[11px] font-medium text-ink">{t.name}</p>
+                {t.description && <p className="text-faint">{t.description}</p>}
+              </div>
+            </label>
+          ))}
+        </div>
+      )}
+      <p className="text-[11px] text-faint">Read / shell / edit / write are controlled per-chat by the permission mode.</p>
+    </div>
+  )
+}
+
 // ── Edit page (routed: /agents/new and /agents/:id) ──────────────────────────
 
 export function AgentEditPage({ agentId }: { agentId: string }) {
@@ -160,6 +219,7 @@ export function AgentEditPage({ agentId }: { agentId: string }) {
         description: form.description.trim(),
         systemPrompt: form.systemPrompt.trim() || undefined,
         skills: form.skills,
+        disabledTools: form.disabledTools,
         // Read access is per-conversation now; agents carry no read roots.
         readRoots: [],
       }
@@ -290,9 +350,11 @@ export function AgentEditPage({ agentId }: { agentId: string }) {
           )}
         </div>
 
-        {/* ── Right: skills the agent may use (from the shared library) ── */}
+        {/* ── Right: what the agent may use — skills + tools ── */}
         <div className="flex flex-col gap-5">
           <SkillsPicker skills={form.skills} setSkills={(next) => setForm((f) => ({ ...f, skills: next }))} />
+          <div className="border-t border-border" />
+          <ToolsPicker disabled={form.disabledTools} setDisabled={(next) => setForm((f) => ({ ...f, disabledTools: next }))} />
         </div>
       </div>
     </div>

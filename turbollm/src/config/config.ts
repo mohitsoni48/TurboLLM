@@ -193,6 +193,9 @@ export interface AgentType {
   readRoots: string[]
   writeRoots: string[]
   callableAgents: string[]
+  /** Tools this agent may NOT use (Pass D). Every tool — built-ins + MCP — is on by
+   *  default; an id listed here is withheld. Empty/undefined = all tools available. */
+  disabledTools?: string[]
   maxIterations?: number
 }
 

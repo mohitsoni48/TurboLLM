@@ -199,7 +199,9 @@ export class AgentRunManager {
       // real execution) — we no longer inject the guarded compute-only duplicates that
       // crippled the agent. Bridged ToolRegistry tools the agent's skills grant (by NAME);
       // run_code is never bridged into an autonomous run (security review C4).
-      const bridged = await buildBridgedTools(this.d, toolNames)
+      // Pass D: bridge every registry tool (built-ins + MCP) except this agent's
+      // disabled set. Skills still shape the system prompt; they no longer gate tools.
+      const bridged = await buildBridgedTools(this.d, agent.disabledTools ?? [])
       const bridgedNames = new Set(bridged.map((t) => t.name))
 
       const baseGuard = makeToolCallGuard(agent, dataDir, bridgedNames)

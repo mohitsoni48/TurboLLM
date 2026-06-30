@@ -57,6 +57,7 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
       // Write root is FIXED to ~/.turbollm (spec 13 redesign §1.1) — never client-settable.
       writeRoots: [dataDir],
       callableAgents: Array.isArray(b.callableAgents) ? b.callableAgents : [],
+      disabledTools: Array.isArray(b.disabledTools) ? b.disabledTools : [],
       maxIterations: typeof b.maxIterations === 'number' ? b.maxIterations : 30,
     }
     try {
@@ -86,6 +87,7 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
         // writeRoots is FIXED to ~/.turbollm (spec 13 redesign §1.1) — never client-editable.
         a.writeRoots = [d.store.dir()]
         if (Array.isArray(b.callableAgents)) a.callableAgents = b.callableAgents
+        if (Array.isArray(b.disabledTools)) a.disabledTools = b.disabledTools
         if (typeof b.maxIterations === 'number') a.maxIterations = b.maxIterations
       })
     } catch (e) {
@@ -190,6 +192,19 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
       }
     })()
     return c.json({ ok: true, learning: true })
+  })
+
+  // ── Tool catalog (Pass D: tools-per-agent) ─────────────────────────────────
+  // Every tool an agent could use — built-ins + connected MCP servers. The editor
+  // shows these as on-by-default toggles; an agent's `disabledTools` withholds some.
+  // run_code is never available to autonomous agent runs (NON_BRIDGEABLE), so it's
+  // omitted here.
+  app.get('/api/v1/agents/tools', async (c) => {
+    const defs = await d.tools?.buildToolDefinitions() ?? []
+    const tools = defs
+      .filter((t) => t.function.name !== 'run_code')
+      .map((t) => ({ name: t.function.name, description: t.function.description ?? '' }))
+    return c.json(tools)
   })
 
   // ── Skills (library) ──────────────────────────────────────────────────────

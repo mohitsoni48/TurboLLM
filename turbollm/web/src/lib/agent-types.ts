@@ -12,7 +12,14 @@ export interface AgentType {
   readRoots: string[]
   writeRoots: string[]      // fixed to ~/.turbollm server-side; not user-settable
   callableAgents: string[]
+  disabledTools?: string[]  // per-agent tool denylist (Pass D); empty = all tools on
   maxIterations?: number
+}
+
+// A tool the agent could use (built-in or MCP), from GET /api/v1/agents/tools.
+export interface ToolInfo {
+  name: string
+  description: string
 }
 
 // ── Skills (the global library) ────────────────────────────────────────────────

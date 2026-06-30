@@ -1,5 +1,5 @@
 import { authHeaders, ApiError } from './api'
-import type { AgentRun, AgentType, Skill } from './agent-types'
+import type { AgentRun, AgentType, Skill, ToolInfo } from './agent-types'
 
 export const agentRunKeys = {
   all: ['agent-runs'] as const,
@@ -143,6 +143,11 @@ export async function* streamAgentRun(runId: string, signal: AbortSignal, fromSe
 
 export async function fetchSkills(): Promise<Skill[]> {
   return req<Skill[]>('/api/v1/skills')
+}
+
+/** The full tool catalog (built-ins + connected MCP servers) an agent can toggle. */
+export async function fetchAvailableTools(): Promise<ToolInfo[]> {
+  return req<ToolInfo[]>('/api/v1/agents/tools')
 }
 
 export async function saveSkill(skill: Skill): Promise<Skill> {
