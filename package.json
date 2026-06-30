@@ -1,5 +1,7 @@
 {
   "dependencies": {
+    "@earendil-works/pi-ai": "0.80.2",
+    "@earendil-works/pi-coding-agent": "0.80.2",
     "@radix-ui/react-alert-dialog": "^1.1.16",
     "@radix-ui/react-collapsible": "^1.1.13",
     "@radix-ui/react-dialog": "^1.1.16",

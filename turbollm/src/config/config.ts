@@ -180,6 +180,25 @@ export interface BuildConfig {
 export interface CloudDeployConfig {
   runpodTemplateId: string
 }
+/** One agent definition (spec 13 §2.1). Every agent — default, subagents, future
+ *  write-capable coding agents — is an instance of this schema. */
+export interface AgentType {
+  id: string
+  name: string
+  description: string
+  builtin?: boolean
+  skills: string[]
+  readRoots: string[]
+  writeRoots: string[]
+  callableAgents: string[]
+  maxIterations?: number
+}
+
+/** Agents config block (spec 13 §2.1). Lives in config.json under `agents`. */
+export interface AgentsConfig {
+  agents: AgentType[]
+}
+
 /** Global model defaults (spec 05 §3): the base LoadProfile values applied when a
  *  model is first seen and has no saved per-model profile. Saved profiles and
  *  per-request overrides still take precedence; these only replace the built-in
@@ -248,6 +267,8 @@ export interface Config {
   gateway: Gateway
   tools: ToolsConfig
   mcp: McpConfig
+  /** Agents + skills configuration (spec 13 §2.1). */
+  agents: AgentsConfig
   /** Compile-from-source settings (ADR-089/100): toolchain dirs prepended to PATH. */
   build: BuildConfig
   /** Cloud Launch deploy-link settings (ADR-153). */
@@ -362,6 +383,7 @@ export function defaultConfig(): Config {
     gateway: { autoSwap: true, keepN: 1 },
     tools: {},
     mcp: { servers: [] },
+    agents: { agents: [] },
     build: { toolchainDirs: [] },
     cloudDeploy: { runpodTemplateId: '' },
   }
@@ -602,6 +624,39 @@ function normalize(c: Config): void {
           typeof s.id === 'string' && typeof s.name === 'string' &&
           (s.transport === 'stdio' || s.transport === 'sse'))
       : [],
+  }
+  // Agents config (spec 13 §2.1): absent in pre-agent configs → seed the default agent.
+  if (!c.agents || !Array.isArray(c.agents.agents) || c.agents.agents.length === 0) {
+    const dataDir = join(homedir(), '.turbollm')
+    c.agents = {
+      agents: [{
+        id: 'default',
+        name: 'Default Agent',
+        description: 'Full capabilities — all skills, reads its workspace, writes its own config dir.',
+        builtin: true,
+        skills: ['*'],
+        readRoots: [dataDir],
+        writeRoots: [dataDir],
+        callableAgents: ['*'],
+        maxIterations: 30,
+      }],
+    }
+  } else {
+    // Ensure the builtin default exists; don't create a second one.
+    if (!c.agents.agents.some(a => a.builtin)) {
+      const dataDir = join(homedir(), '.turbollm')
+      c.agents.agents.unshift({
+        id: 'default',
+        name: 'Default Agent',
+        description: 'Full capabilities — all skills, reads its workspace, writes its own config dir.',
+        builtin: true,
+        skills: ['*'],
+        readRoots: [dataDir],
+        writeRoots: [dataDir],
+        callableAgents: ['*'],
+        maxIterations: 30,
+      })
+    }
   }
   // Compile-from-source toolchain dirs (ADR-089/100): absent in pre-build configs → [].
   // Keep only non-empty strings; the validator enforces absolute paths.

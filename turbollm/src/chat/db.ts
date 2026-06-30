@@ -309,6 +309,14 @@ export class ConversationStore {
       this.db.exec("ALTER TABLE conversations ADD COLUMN tool_overrides TEXT")
       this.db.exec("PRAGMA user_version = 11")
     }
+    // v12: agent_runs.agent_id — link runs to the AgentType config.
+    // Additive column; existing rows get NULL (backwards-compatible with pre-agent-id runs).
+    if (v < 12) {
+      this.db.exec(`
+        ALTER TABLE agent_runs ADD COLUMN agent_id TEXT;
+        PRAGMA user_version = 12;
+      `)
+    }
   }
 
   listConversations(q?: string, kind: 'chat' | 'agent' | 'all' = 'all'): Conversation[] {
@@ -500,11 +508,12 @@ export class ConversationStore {
 
   // ── Agent run methods (v8 migration) ──────────────────────────────────────
 
-  createAgentRun(params: { convId: string; title: string; allowedTools: string[] }): AgentRun {
+  createAgentRun(params: { convId: string; title: string; allowedTools: string[]; agentId?: string }): AgentRun {
     const id = randomUUID()
     const now = new Date().toISOString()
-    this.db.prepare(`INSERT INTO agent_runs (id,conv_id,title,status,allowed_tools,created_at,updated_at) VALUES ($id,$cid,$title,'queued',$at,$now,$now)`)
-      .run({ $id: id, $cid: params.convId, $title: params.title, $at: JSON.stringify(params.allowedTools), $now: now } as P)
+    const agentId = params.agentId ?? null
+    this.db.prepare(`INSERT INTO agent_runs (id,conv_id,title,status,allowed_tools,agent_id,created_at,updated_at) VALUES ($id,$cid,$title,'queued',$at,$aid,$now,$now)`)
+      .run({ $id: id, $cid: params.convId, $title: params.title, $at: JSON.stringify(params.allowedTools), $aid: agentId, $now: now } as P)
     return this.getAgentRun(id)!
   }
 
