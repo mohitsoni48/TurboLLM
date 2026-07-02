@@ -11,6 +11,34 @@ import { Button } from '../../components/ui/button'
 import { Input } from '../../components/ui/input'
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '../../components/ui/sheet'
 
+/** First path segment reserved by HF for non-model routes — never a repo owner. Keeps
+ *  a datasets/spaces/browse URL from being mistaken for an `owner/repo` model repo. */
+const HF_RESERVED_PREFIX = new Set([
+  'datasets', 'spaces', 'models', 'organizations', 'settings', 'collections', 'blog', 'docs', 'join', 'login', 'pricing',
+])
+
+/** Recognise an HF *repo* landing/tree URL (not a single-file link) and return its
+ *  `owner/repo`, else null. A repo has many quants, so pasting one can't download a
+ *  file directly — the dialog routes it to the repo's quant picker instead. */
+function parseHfRepoUrl(raw: string): string | null {
+  let u: URL
+  try {
+    u = new URL(raw)
+  } catch {
+    return null
+  }
+  if (u.hostname !== 'huggingface.co') return null
+  const parts = u.pathname.split('/').filter(Boolean)
+  if (parts.length < 2) return null
+  // A file link (resolve/blob) is handled by the .gguf path, not here.
+  if (parts.includes('resolve') || parts.includes('blob')) return null
+  const [owner, repo, third] = parts
+  if (HF_RESERVED_PREFIX.has(owner.toLowerCase())) return null
+  // owner/repo, optionally followed by /tree/<rev>/… — anything else isn't a repo root.
+  if (parts.length === 2 || third === 'tree') return `${owner}/${repo}`
+  return null
+}
+
 /** True when the URL is a plausible GGUF download target (spec 10 §8 step 2):
  *  path ends in `.gguf` OR matches an HF resolve blob URL. */
 function isValidGgufUrl(raw: string): boolean {
@@ -64,7 +92,17 @@ function normalizeHfUrl(raw: string): string {
   return raw
 }
 
-export function ImportUrlDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
+export function ImportUrlDialog({
+  open,
+  onClose,
+  onOpenRepo,
+}: {
+  open: boolean
+  onClose: () => void
+  /** Called when the pasted URL is a repo (many quants) rather than a single file —
+   *  routes to the repo's quant picker instead of a direct download. */
+  onOpenRepo?: (repo: string) => void
+}) {
   const mut = useDownloadMutations()
   const [url, setUrl] = useState('')
 
@@ -72,7 +110,11 @@ export function ImportUrlDialog({ open, onClose }: { open: boolean; onClose: () 
   const normalized = useMemo(() => normalizeHfUrl(trimmed), [trimmed])
   const wasNormalized = normalized !== trimmed
   const filename = useMemo(() => deriveFilename(normalized), [normalized])
-  const valid = trimmed.length > 0 && isValidGgufUrl(normalized)
+  // A repo URL (owner/repo, no file) can't download directly — it holds many quants —
+  // so it's routed to the quant picker. A direct .gguf/resolve URL downloads as before.
+  const repoTarget = useMemo(() => parseHfRepoUrl(normalized), [normalized])
+  const validFile = trimmed.length > 0 && isValidGgufUrl(normalized)
+  const valid = validFile || !!repoTarget
   const showInvalid = trimmed.length > 0 && !valid
 
   const enqueueErr = mut.enqueue.error instanceof ApiError ? mut.enqueue.error : null
@@ -86,7 +128,12 @@ export function ImportUrlDialog({ open, onClose }: { open: boolean; onClose: () 
   }
 
   const submit = () => {
-    if (!valid) return
+    if (repoTarget) {
+      onOpenRepo?.(repoTarget)
+      close()
+      return
+    }
+    if (!validFile) return
     mut.enqueue.mutate(
       { url: normalized },
       {
@@ -113,7 +160,8 @@ export function ImportUrlDialog({ open, onClose }: { open: boolean; onClose: () 
         <SheetHeader>
           <SheetTitle>Import from URL</SheetTitle>
           <SheetDescription>
-            Paste a direct link to a <span className="font-mono">.gguf</span> file — any HTTPS host, not just Hugging Face.
+            Paste a <span className="font-mono">.gguf</span> link (any HTTPS host) or a Hugging Face model page — a repo
+            link opens its quant list to pick from.
           </SheetDescription>
         </SheetHeader>
 
@@ -123,23 +171,31 @@ export function ImportUrlDialog({ open, onClose }: { open: boolean; onClose: () 
             value={url}
             onChange={(e) => setUrl(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && submit()}
-            placeholder="https://huggingface.co/owner/repo/resolve/main/model.Q4_K_M.gguf"
+            placeholder="https://huggingface.co/owner/repo  ·  or …/resolve/main/model.Q4_K_M.gguf"
             className="font-mono text-[12px]"
           />
 
-          {filename && valid && (
+          {repoTarget ? (
             <div className="rounded-md border border-border bg-panel-2 px-3 py-2 text-[12px]">
-              <span className="text-muted">Will save as </span>
-              <span className="font-mono text-ink">{filename}</span>
-              {wasNormalized && (
-                <p className="mt-1 text-faint">URL converted to a direct download link.</p>
-              )}
+              <span className="text-muted">Model repo </span>
+              <span className="font-mono text-ink">{repoTarget}</span>
+              <p className="mt-1 text-faint">Opens its quant list so you can pick which one to download.</p>
             </div>
+          ) : (
+            filename && valid && (
+              <div className="rounded-md border border-border bg-panel-2 px-3 py-2 text-[12px]">
+                <span className="text-muted">Will save as </span>
+                <span className="font-mono text-ink">{filename}</span>
+                {wasNormalized && (
+                  <p className="mt-1 text-faint">URL converted to a direct download link.</p>
+                )}
+              </div>
+            )
           )}
 
           {showInvalid && (
             <p className="text-[12px]" style={{ color: 'var(--err)' }}>
-              Enter a valid http(s) link ending in <span className="font-mono">.gguf</span> (or an HF resolve URL).
+              Enter a Hugging Face model link, or an http(s) link ending in <span className="font-mono">.gguf</span>.
             </p>
           )}
 
@@ -157,7 +213,7 @@ export function ImportUrlDialog({ open, onClose }: { open: boolean; onClose: () 
           <Button variant="outline" onClick={close}>Cancel</Button>
           <Button onClick={submit} disabled={!valid || mut.enqueue.isPending}>
             <Link2 size={14} />
-            {mut.enqueue.isPending ? 'Adding…' : 'Import'}
+            {mut.enqueue.isPending ? 'Adding…' : repoTarget ? 'Open' : 'Import'}
           </Button>
         </div>
       </SheetContent>

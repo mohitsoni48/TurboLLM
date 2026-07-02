@@ -15,10 +15,11 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs'
-import { basename, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import type { ConfigStore } from '../config/config'
+import type { HfModelFiles } from '../hf/hf'
 
 export type DownloadStatus = 'queued' | 'downloading' | 'paused' | 'done' | 'error' | 'cancelled'
 
@@ -69,7 +70,6 @@ export interface ProvenanceEntry {
 }
 
 const MAX_CONCURRENT = 2
-const HF_BLOB_RE = /^https?:\/\/huggingface\.co\/.+\/resolve\/.+\.gguf$/i
 
 export interface EnqueueInput {
   repo?: string
@@ -105,6 +105,12 @@ export class DownloadManager {
     /** Called after a download completes so the model list picks up the new file. */
     private onComplete: () => void,
     private authHeaders: () => Record<string, string>,
+    /** Expand a chosen HF GGUF into every concrete file to fetch — all split shards +
+     *  the shared mmproj projector, plus the model's repo-relative directory (spec 10 §3).
+     *  Injected from the HfClient so the download layer stays decoupled from HF discovery.
+     *  Absent under tests that don't exercise repo downloads → those take the single-file
+     *  path instead. */
+    private expand?: (repo: string, rfilename: string, rev?: string) => Promise<HfModelFiles>,
   ) {
     const dir = join(store.dir(), 'downloads')
     mkdirSync(dir, { recursive: true })
@@ -132,60 +138,145 @@ export class DownloadManager {
     return [...this.records.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt))
   }
 
-  /** Enqueue a download. Validates the target + disk space, persists, then kicks
-   *  the queue. Throws DownloadError for caller-actionable failures (no dir set,
-   *  bad URL, insufficient disk). */
-  enqueue(input: EnqueueInput): DownloadRecord {
+  /** Enqueue a download. Validates the target + disk space, persists, then kicks the
+   *  queue. Returns every record created — a single file for a raw non-HF URL, or the
+   *  whole model (all split shards + the shared mmproj) for an HF repo file. Throws
+   *  DownloadError for caller-actionable failures (no dir set, bad URL, insufficient
+   *  disk). */
+  async enqueue(input: EnqueueInput): Promise<DownloadRecord[]> {
     const dir = this.primaryDir()
     if (!dir) throw new DownloadError('no_model_dir', 'Add a model folder in Settings before downloading.')
 
     let repo = (input.repo ?? '').trim()
-    const subdir = (input.subdir ?? '').trim()
-    let url: string
-    let filename: string
+    const explicitSubdir = (input.subdir ?? '').trim()
+    let rfilename = (input.rfilename ?? '').trim()
+    let rev = 'main'
+
     if (input.url) {
       const u = normalizeHfBlobUrl(input.url.trim())
       if (!/^https?:\/\//i.test(u)) throw new DownloadError('invalid_url', 'URL must start with http:// or https://.')
-      const path = safePathname(u)
-      if (!subdir && !/\.gguf$/i.test(path) && !HF_BLOB_RE.test(u.split('?')[0])) {
-        throw new DownloadError('invalid_url', 'URL must point to a .gguf file.')
+      // An HF resolve URL carries a repo + revision + file path — recover them so the
+      // import gets the same subfolder + split-shard + mmproj handling as a Discover
+      // download, and targets the exact revision the user linked (not always `main`).
+      const hf = parseHfResolveUrl(u)
+      if (hf) {
+        repo = hf.repo
+        rfilename = hf.rfilename
+        rev = hf.rev
+      } else {
+        // A non-HF host: a single flat file — its repo structure is unknowable.
+        const path = safePathname(u)
+        if (!explicitSubdir && !/\.gguf$/i.test(path)) throw new DownloadError('invalid_url', 'URL must point to a .gguf file.')
+        const filename = basename(path)
+        if (!explicitSubdir && !/\.gguf$/i.test(filename)) throw new DownloadError('invalid_url', 'Could not derive a .gguf filename from that URL.')
+        const destDir = explicitSubdir ? join(dir, explicitSubdir) : dir
+        mkdirSync(destDir, { recursive: true })
+        if ((input.size ?? 0) > 0) this.assertDisk(dir, input.size!)
+        const dest = join(destDir, filename)
+        if (this.hasLiveDest(dest)) return []
+        return this.commit([{ name: filename, repo: '', url: u, dest, total: input.size ?? 0, sha256: input.sha256 }])
       }
-      filename = basename(path)
-      if (!subdir && !/\.gguf$/i.test(filename)) throw new DownloadError('invalid_url', 'Could not derive a .gguf filename from that URL.')
-      url = u
-      repo = '' // raw-URL import: no provenance
-    } else {
-      const rfilename = (input.rfilename ?? '').trim()
-      if (!repo || !rfilename) throw new DownloadError('invalid_request', 'repo and rfilename are required.')
-      if (!subdir && !/\.gguf$/i.test(rfilename)) throw new DownloadError('invalid_url', 'The file must be a .gguf.')
-      filename = basename(rfilename)
-      url = `https://huggingface.co/${repo}/resolve/main/${rfilename}`
     }
 
-    const total = input.size ?? 0
-    const destDir = subdir ? join(dir, subdir) : dir
-    if (subdir) mkdirSync(destDir, { recursive: true })
-    if (total > 0) this.assertDisk(dir, total)
+    // HF repos are always `owner/name` — reject anything that can't be one (also stops a
+    // degenerate `repo` from sanitising to an empty subfolder that lands in the root).
+    if (!repo.includes('/') || !rfilename) throw new DownloadError('invalid_request', 'repo and rfilename are required.')
+    if (!explicitSubdir && !/\.gguf$/i.test(rfilename)) throw new DownloadError('invalid_url', 'The file must be a .gguf.')
 
-    const id = `dl-${Date.now().toString(36)}-${(this.nextSeq++).toString(36)}`
-    const rec: DownloadRecord = {
-      id,
-      name: filename,
-      repo,
-      url,
-      dest: join(destDir, filename),
-      total,
-      received: 0,
-      status: 'queued',
-      error: null,
-      bytesPerSec: 0,
-      sha256: input.sha256,
-      createdAt: new Date().toISOString(),
+    // Safetensors/MLX pass an explicit subdir and enqueue each component file themselves
+    // — no expansion. Place it (single file) directly under that subdir.
+    if (explicitSubdir || !this.expand) {
+      const filename = basename(rfilename)
+      const destDir = join(dir, explicitSubdir || repoSubdir(repo))
+      mkdirSync(destDir, { recursive: true })
+      const dest = join(destDir, filename)
+      if (this.hasLiveDest(dest)) return []
+      if ((input.size ?? 0) > 0) this.assertDisk(dir, input.size!)
+      return this.commit([
+        { name: filename, repo, url: hfResolveUrl(repo, rev, rfilename), dest, total: input.size ?? 0, sha256: input.sha256 },
+      ])
     }
-    this.records.set(id, rec)
+
+    // Expand a GGUF into every concrete file: all split shards + the shared mmproj. Each
+    // model gets its own <owner>/<repo>/<repo-subdir> folder (mirrors HF's layout and the
+    // primary library's structure), so a model's shards + mmproj sit together for the
+    // scanner to group and two quants that share a shard basename never collide.
+    const { dir: modelDir, files } = await this.expand(repo, rfilename, rev)
+    const destDir = join(dir, repoSubdir(repo), modelDir)
+    mkdirSync(destDir, { recursive: true })
+
+    const targets = files
+      .map((f) => ({ f, dest: join(destDir, basename(f.rfilename)) }))
+      .filter(({ f, dest }) => {
+        // An in-flight/queued job already owns this exact file — never enqueue a second
+        // writer for the same .part (double-click, or two quants sharing one mmproj).
+        if (this.hasLiveDest(dest)) return false
+        // A shared mmproj already on disk: keep it only if it looks incomplete (size
+        // known and mismatched) — otherwise adding a second quant shouldn't re-pull it.
+        if (f.mmproj && existsSync(dest)) {
+          if (f.size <= 0) return false
+          try {
+            return statSync(dest).size !== f.size
+          } catch {
+            return true
+          }
+        }
+        return true
+      })
+    if (targets.length === 0) return []
+
+    const totalBytes = targets.reduce((s, { f }) => s + (f.size || 0), 0)
+    if (totalBytes > 0) this.assertDisk(dir, totalBytes)
+
+    return this.commit(
+      targets.map(({ f, dest }) => ({
+        name: basename(f.rfilename),
+        repo,
+        url: hfResolveUrl(repo, rev, f.rfilename),
+        dest,
+        total: f.size || 0,
+        sha256: f.sha256,
+      })),
+    )
+  }
+
+  /** True when a queued/downloading/paused record already targets this exact dest — the
+   *  guard against two concurrent writers corrupting one file. Terminal records
+   *  (done/cancelled/error) don't block a fresh attempt. */
+  private hasLiveDest(dest: string): boolean {
+    for (const r of this.records.values()) {
+      if (r.dest === dest && (r.status === 'queued' || r.status === 'downloading' || r.status === 'paused')) return true
+    }
+    return false
+  }
+
+  /** Materialise queued records from resolved targets, persist once, and kick the queue. */
+  private commit(
+    targets: Array<{ name: string; repo: string; url: string; dest: string; total: number; sha256?: string }>,
+  ): DownloadRecord[] {
+    const created: DownloadRecord[] = []
+    for (const t of targets) {
+      const id = `dl-${Date.now().toString(36)}-${(this.nextSeq++).toString(36)}`
+      const rec: DownloadRecord = {
+        id,
+        name: t.name,
+        repo: t.repo,
+        url: t.url,
+        dest: t.dest,
+        total: t.total,
+        received: 0,
+        status: 'queued',
+        error: null,
+        bytesPerSec: 0,
+        sha256: t.sha256,
+        createdAt: new Date().toISOString(),
+      }
+      this.records.set(id, rec)
+      created.push(rec)
+    }
     this.persist()
     this.pump()
-    return rec
+    return created
   }
 
   /** Cancel an in-flight or queued job: abort the stream, delete the .part, mark
@@ -296,6 +387,13 @@ export class DownloadManager {
 
       const clen = Number(res.headers.get('content-length') ?? 0)
       if (clen > 0) rec.total = resuming ? startAt + clen : clen
+
+      // Disk guard at download time (spec 10 §6): content-length is often the FIRST real
+      // size we see — a raw URL, or an HF expansion where the tree metadata was
+      // unavailable (sizes 0), both skip the enqueue-time check. Verifying the remaining
+      // bytes here fails a too-large download cleanly (status=error) before writing any,
+      // instead of silently filling the disk.
+      if (clen > 0) this.assertDisk(dirname(part), clen)
 
       const hash = rec.sha256 ? createHash('sha256') : null
       // sha256 can only be verified over the full file; skip it on a partial resume.
@@ -478,4 +576,47 @@ function safePathname(u: string): string {
   } catch {
     return ''
   }
+}
+
+/** Recognise an HF resolve URL and pull out the repo + revision + repo-relative file
+ *  path: `https://huggingface.co/<owner>/<repo>/resolve/<rev>/<path…>.gguf`. Segments are
+ *  URL-decoded (so a `%20` in the path becomes a real space). Returns null for any non-HF
+ *  host or a URL that isn't a .gguf resolve link, so those stay raw imports. */
+function parseHfResolveUrl(u: string): { repo: string; rev: string; rfilename: string } | null {
+  let parsed: URL
+  try {
+    parsed = new URL(u)
+  } catch {
+    return null
+  }
+  if (parsed.hostname !== 'huggingface.co') return null
+  const parts = parsed.pathname.split('/').filter(Boolean)
+  const ri = parts.indexOf('resolve')
+  // Need owner/repo before `resolve`, then a revision, then at least one path segment.
+  if (ri < 2 || parts.length < ri + 3) return null
+  const repo = parts.slice(0, ri).join('/')
+  const rev = decodeURIComponent(parts[ri + 1])
+  const rfilename = parts
+    .slice(ri + 2)
+    .map((s) => decodeURIComponent(s))
+    .join('/')
+  if (!repo.includes('/') || !rev || !rfilename || !/\.gguf$/i.test(rfilename)) return null
+  return { repo, rev, rfilename }
+}
+
+/** Build an HF resolve URL for a repo-relative file, encoding each path segment (so a
+ *  space or `#` in a filename survives) while leaving the `/` separators intact. */
+function hfResolveUrl(repo: string, rev: string, rfilename: string): string {
+  const enc = (p: string) => p.split('/').map(encodeURIComponent).join('/')
+  return `https://huggingface.co/${enc(repo)}/resolve/${encodeURIComponent(rev)}/${enc(rfilename)}`
+}
+
+/** Sanitise an HF repo id (`owner/name`) into a safe relative subdirectory: forward
+ *  slashes only, no absolute/`..`/`.` segments that could escape the model dir. */
+function repoSubdir(repo: string): string {
+  return repo
+    .replace(/\\/g, '/')
+    .split('/')
+    .filter((s) => s && s !== '.' && s !== '..')
+    .join('/')
 }

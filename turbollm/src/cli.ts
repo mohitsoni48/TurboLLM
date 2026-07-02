@@ -198,7 +198,12 @@ const hashes = new HashStore(store.dir())
 const db = new ConversationStore(store.dir())
 const hf = new HfClient(() => store.snapshot().hf.token, version)
 // A completed download triggers a rescan so the new model shows up in the library.
-const downloads = new DownloadManager(store, () => void scanner.rescan(), () => hf.authHeaders())
+const downloads = new DownloadManager(
+  store,
+  () => void scanner.rescan(),
+  () => hf.authHeaders(),
+  (repo, rfilename, rev) => hf.expandModelFiles(repo, rfilename, rev),
+)
 // Auto-benchmark + auto-tune runner (Differentiator #2, spec 09). Owns the engine
 // exclusively for a run; reuses manager/profile control rather than reimplementing it.
 const bench = new BenchRunner(manager, store, scanner, registry, version, hf)
