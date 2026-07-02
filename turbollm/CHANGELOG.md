@@ -25,6 +25,32 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.6.3] - 2026-07-02
+
+**Download folder structure, mmproj, and multipart quant fixes.**
+
+A bug-fix release for Discover downloads. GGUF models were landing flat in your model
+folder, split/multipart quants only fetched their first shard, and a vision model's
+mmproj projector had to be found and placed manually. All three are fixed.
+
+### Fixed
+- **Downloads now land in a per-model `<owner>/<repo>` folder**, mirroring Hugging Face's
+  own layout, instead of flat in the model root.
+- **A vision model's mmproj projector is now fetched automatically** alongside the GGUF,
+  into the same folder — no more manually hunting it down and no more vision models that
+  silently fail to see images because the projector was missing.
+- **Split/multipart quants (e.g. `gpt-oss-120b-GGUF`) now download every shard**, not just
+  the first, so they load as a single working model instead of an orphaned partial file.
+- **Pasting a Hugging Face model page into "Import from URL"** now opens that repo's quant
+  picker instead of a dead-end "not a .gguf" error — a repo has many quants, so picking one
+  there gets the same folder/mmproj/shard handling as downloading through Discover.
+
+### Discord
+- Fixed model downloads landing flat in your model folder instead of in a proper `owner/repo` folder like Hugging Face itself uses.
+- Vision models now automatically grab their mmproj file too — no more manual hunting or broken image support.
+- Multi-part model downloads (like gpt-oss-120b) now grab every piece, not just the first one.
+- Pasting a Hugging Face model page link into Import from URL now opens its quant list instead of erroring out.
+
 ## [1.6.2] - 2026-07-01
 
 **Live model discovery, Linux builds, and MCP marketplace fixes.**

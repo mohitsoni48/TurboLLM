@@ -138,10 +138,14 @@ the detail:
   metadata (arch, params, quant, context, vision) for every file.
 - **Browse & download from Hugging Face**, in-app: a live, sortable list (trending / downloads
   / likes / recently updated / newest) alongside a permanent detail pane — pick a quant, read
-  the **rendered model card**, and download with **resume + SHA-256 verification**. Gated
-  models (Llama, Gemma) work via your own HF token, which **never leaves your machine**.
+  the **rendered model card**, and download with **resume + SHA-256 verification**. Each model
+  lands in its own folder (mirroring Hugging Face's own layout) with its **vision projector and
+  every shard of a split/multipart quant fetched alongside it automatically**. Gated models
+  (Llama, Gemma) work via your own HF token, which **never leaves your machine**.
 - **Import from any URL** — not just Hugging Face. Paste a direct `.gguf` link (model-author
-  sites, mirrors, private servers); it disk-space-checks and downloads through the same manager.
+  sites, mirrors, private servers) and it disk-space-checks and downloads through the same
+  manager; paste a Hugging Face **model page** link instead and it opens that repo's quant
+  picker so you can choose which one to download.
 - **Quant recommendation per GPU** and a **VRAM-fit verdict** so you pick a quant that
   actually fits before you commit.
 - **Primary download folder**, real-time **measured t/s per model**, and **delete-from-disk**.

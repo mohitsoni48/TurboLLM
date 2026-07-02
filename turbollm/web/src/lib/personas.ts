@@ -26,6 +26,8 @@ const TURBOLLM_KNOWLEDGE =
   '**Models** — discover and manage local models.\n' +
   '- **All models** view: scans configured local directories for GGUF, MLX safetensors, vLLM safetensors; badges incompatible models for the active engine.\n' +
   '- **Discover** tab: a live, sortable split-pane (list on the left, detail pane on the right, no dialog) browsing Hugging Face directly — filtered by active engine kind (GGUF for llama.cpp/TurboQuant, MLX tag for MLX, unrestricted for vLLM), sortable by trending / downloads / likes / recently updated / newest; the detail pane renders the actual model card (headings, images, links) and shows a per-quant VRAM-fit dot. Both panes are resizable.\n' +
+  '- **Downloading a GGUF** places it in its own `<owner>/<repo>` folder (mirroring Hugging Face\'s layout) and automatically pulls its vision projector (mmproj) and every shard of a split/multipart quant into that same folder, so it always loads as one working model — no manual mmproj hunting or missing shards.\n' +
+  '- **Import from URL** (link icon next to Discover\'s search box) accepts a direct `.gguf`/resolve link (any HTTPS host) for a one-off download, or a Hugging Face **model page** link, which opens that repo\'s quant picker instead of downloading directly (a repo has many quants — picking one there gets the same folder/mmproj/shard handling as browsing Discover).\n' +
   '- Click a model → **Model Detail** side panel: load profile config, VRAM estimate bar, auto-tune button, per-model saved profile.\n' +
   '- **Load** button starts the model; progress indicator shows load time.\n\n' +
 
