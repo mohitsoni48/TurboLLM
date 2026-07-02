@@ -668,7 +668,9 @@ export function listDownloads(): Promise<DownloadsList> {
   return request<DownloadsList>('/api/v1/downloads')
 }
 
-/** Enqueue a download: an HF repo file {repo, rfilename} OR a raw {url}. */
+/** Enqueue a download: an HF repo file {repo, rfilename} OR a raw {url}. A single HF
+ *  request can fan out into several files (split shards + a shared mmproj projector), so
+ *  the response carries every record created. */
 export function enqueueDownload(input: {
   repo?: string
   rfilename?: string
@@ -676,8 +678,8 @@ export function enqueueDownload(input: {
   size?: number
   sha256?: string
   subdir?: string
-}): Promise<DownloadRecord> {
-  return request<DownloadRecord>('/api/v1/downloads', { method: 'POST', json: input })
+}): Promise<{ downloads: DownloadRecord[] }> {
+  return request<{ downloads: DownloadRecord[] }>('/api/v1/downloads', { method: 'POST', json: input })
 }
 
 export function cancelDownload(id: string): Promise<{ ok: true }> {

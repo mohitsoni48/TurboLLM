@@ -1766,8 +1766,10 @@ export function registerApi(app: Hono, d: Deps): void {
   app.post('/api/v1/downloads', async (c) => {
     const b = await body<{ repo?: string; rfilename?: string; url?: string; size?: number; sha256?: string; subdir?: string }>(c)
     try {
-      const rec = d.downloads.enqueue(b)
-      return c.json(rec, 202)
+      // One request may fan out into several files (split shards + a shared mmproj) —
+      // return every record created so the UI reflects the full queued set.
+      const recs = await d.downloads.enqueue(b)
+      return c.json({ downloads: recs }, 202)
     } catch (e) {
       return dlErr(c, e)
     }

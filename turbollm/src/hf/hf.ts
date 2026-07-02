@@ -103,6 +103,25 @@ export interface HfRepoDetail {
   safetensors?: boolean
 }
 
+/** One concrete file to fetch for a working GGUF model (spec 10 §3): a shard of a
+ *  split group, or a shared mmproj projector. Repo-relative `rfilename` (the download
+ *  manager builds the resolve URL). */
+export interface HfDownloadFile {
+  rfilename: string
+  size: number
+  sha256?: string
+  /** True for the vision projector companion (mmproj-*.gguf). */
+  mmproj: boolean
+}
+
+/** The result of expanding a chosen GGUF: the repo-relative directory the model lives
+ *  in (`''` = repo root) and every file to fetch. All files are placed together under
+ *  `<modelDir>/<owner>/<repo>/<dir>/` so the scanner groups a model's shards + mmproj. */
+export interface HfModelFiles {
+  dir: string
+  files: HfDownloadFile[]
+}
+
 interface CacheRow {
   at: number
   value: unknown
@@ -197,6 +216,64 @@ export class HfClient {
       files,
       ...(safetensors ? { safetensors } : {}),
     }
+  }
+
+  /** Expand a chosen GGUF into every concrete file needed for a working model
+   *  (spec 10 §3): all shards of its split group (NNNNN-of-NNNNN) plus its mmproj vision
+   *  projector. Matching is scoped to the chosen file's OWN repo directory so a repo
+   *  that organises quants in per-quant subfolders (e.g. `Q4_K_M/…`, `Q8_0/…`) never
+   *  cross-matches another quant's identically-named shards. The mmproj is preferred
+   *  from the same directory (mirrors the scanner's per-directory pairing), falling back
+   *  to the largest anywhere in the repo. `rev` is the git revision (branch/tag/commit)
+   *  the download targets. Best-effort: on any HF failure it returns just the one
+   *  requested file. When the requested file is itself an mmproj, none is paired. */
+  async expandModelFiles(repo: string, rfilename: string, rev = 'main'): Promise<HfModelFiles> {
+    const wantBase = base(rfilename).toLowerCase()
+    let tree: RawTreeEntry[]
+    try {
+      tree = await this.getJson<RawTreeEntry[]>(`${BASE}/api/models/${repo}/tree/${encodeURIComponent(rev)}?recursive=true`)
+    } catch {
+      return { dir: dirOf(rfilename), files: [{ rfilename, size: 0, mmproj: wantBase.includes('mmproj') }] }
+    }
+    const ggufs = tree.filter((e) => e.type === 'file' && /\.gguf$/i.test(e.path))
+
+    // Locate the chosen file by basename (the UI carries a split group's first-shard
+    // basename; the tree recovers its full repo path + siblings).
+    const chosen = ggufs.find((e) => base(e.path).toLowerCase() === wantBase)
+    if (!chosen) {
+      // Requested file not in the tree — fall back to the name as given.
+      return { dir: dirOf(rfilename), files: [{ rfilename, size: 0, mmproj: wantBase.includes('mmproj') }] }
+    }
+
+    const modelDir = dirOf(chosen.path)
+    const inModelDir = (e: RawTreeEntry) => dirOf(e.path) === modelDir
+    const files: HfDownloadFile[] = []
+
+    const split = base(chosen.path).match(SPLIT_RE)
+    if (split) {
+      const prefix = split[1].toLowerCase()
+      const total = split[3]
+      for (const e of ggufs) {
+        if (!inModelDir(e)) continue
+        const sm = base(e.path).match(SPLIT_RE)
+        if (sm && sm[1].toLowerCase() === prefix && sm[3] === total) {
+          files.push({ rfilename: e.path, size: sizeOf(e), sha256: e.lfs?.oid, mmproj: false })
+        }
+      }
+      files.sort((a, b) => a.rfilename.localeCompare(b.rfilename))
+    } else {
+      files.push({ rfilename: chosen.path, size: sizeOf(chosen), sha256: chosen.lfs?.oid, mmproj: false })
+    }
+
+    // Pair an mmproj projector with an actual model download (not with another mmproj):
+    // prefer one in the model's own directory, else the largest anywhere in the repo.
+    if (!wantBase.includes('mmproj')) {
+      const projectors = ggufs.filter((e) => base(e.path).toLowerCase().includes('mmproj'))
+      const sameDir = projectors.filter(inModelDir)
+      const best = (sameDir.length ? sameDir : projectors).sort((a, b) => sizeOf(b) - sizeOf(a))[0]
+      if (best) files.push({ rfilename: best.path, size: sizeOf(best), sha256: best.lfs?.oid, mmproj: true })
+    }
+    return { dir: modelDir, files }
   }
 
   /** Public model-card fetch (ADR-099): the cleaned README for `owner/repo`, or '' when
@@ -407,4 +484,11 @@ function sizeOf(e: RawTreeEntry): number {
 function base(p: string): string {
   const i = p.lastIndexOf('/')
   return i >= 0 ? p.slice(i + 1) : p
+}
+
+/** Repo-relative directory of a path (POSIX '/' — HF tree paths are always '/'-joined);
+ *  '' for a root-level file. */
+function dirOf(p: string): string {
+  const i = p.lastIndexOf('/')
+  return i >= 0 ? p.slice(0, i) : ''
 }

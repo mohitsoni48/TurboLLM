@@ -175,7 +175,14 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
         </div>
       </div>
 
-      <ImportUrlDialog open={importOpen} onClose={() => setImportOpen(false)} />
+      <ImportUrlDialog
+        open={importOpen}
+        onClose={() => setImportOpen(false)}
+        onOpenRepo={(repo) => {
+          setSelectedRepo(repo)
+          setImportOpen(false)
+        }}
+      />
     </div>
   )
 }
