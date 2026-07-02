@@ -46,10 +46,9 @@ mmproj projector had to be found and placed manually. All three are fixed.
   there gets the same folder/mmproj/shard handling as downloading through Discover.
 
 ### Discord
-- Fixed model downloads landing flat in your model folder instead of in a proper `owner/repo` folder like Hugging Face itself uses.
-- Vision models now automatically grab their mmproj file too — no more manual hunting or broken image support.
-- Multi-part model downloads (like gpt-oss-120b) now grab every piece, not just the first one.
-- Pasting a Hugging Face model page link into Import from URL now opens its quant list instead of erroring out.
+- Improved model downloads — models now save into proper folders like Hugging Face itself uses.
+- Added support for multipart GGUF downloads (like gpt-oss-120b) — grabs every part now, not just the first.
+- Vision models now auto-download their mmproj file too.
 
 ## [1.6.2] - 2026-07-01
 
