@@ -24,6 +24,7 @@ import {
   buildCardExtractionPrompt,
   hasAnySampling,
   parseCardSampling,
+  parseGenerationParams,
   parseLlmSampling,
   type CardSampling,
 } from '../models/card-sampling'
@@ -925,12 +926,19 @@ export class BenchRunner {
     if (!repo) return undefined // hand-placed file outside a model dir → no upstream card
     this.state = { ...this.state, step: 'Reading model-card recommendations…' }
 
-    // 1. Local GGUF repo card — heuristic.
+    // 1. Structured params sidecar (some quantizers, e.g. unsloth, publish a root-level
+    //    `params`/`generation_config.json` with the exact recommended values) — exact, no
+    //    parsing/inference needed, so it outranks the heuristic and LLM fallback below.
+    const genParams = await this.hf.fetchGenerationParams(repo).catch(() => '')
+    const paramsH = parseGenerationParams(genParams)
+    if (hasAnySampling(paramsH)) return paramsH
+
+    // 2. Local GGUF repo card — heuristic.
     const localCard = await this.hf.fetchModelCard(repo).catch(() => '')
     const localH = parseCardSampling(localCard)
     if (hasAnySampling(localH)) return localH
 
-    // 2. Base-model fallback — the original model's card (where the author states the recommendation).
+    // 3. Base-model fallback — the original model's card (where the author states the recommendation).
     let baseCard = ''
     if (!this.cancelled) {
       const baseRepo = await this.hf.baseModelOf(repo).catch(() => null)
@@ -941,7 +949,7 @@ export class BenchRunner {
       }
     }
 
-    // 3. LLM fallback (one reload) on the richer card — prose-only / unusual phrasing the scan misses.
+    // 4. LLM fallback (one reload) on the richer card — prose-only / unusual phrasing the scan misses.
     if (this.cancelled) return undefined
     const card = baseCard.length > localCard.length ? baseCard : localCard
     if (!card) return undefined

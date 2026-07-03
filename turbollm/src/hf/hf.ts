@@ -285,6 +285,32 @@ export class HfClient {
     return this.getCard(repo, CARD_EXTRACT_MAX)
   }
 
+  /** Fetch a repo's structured generation-params sidecar, if it has one — some quantizers
+   *  (e.g. unsloth) publish a root-level `params` JSON file with the exact recommended
+   *  sampling values (`{"temperature":1.0,"top_k":0,"top_p":1.0,"min_p":0.0,"stop":[…]}`)
+   *  alongside the GGUF shards. When present this is a strictly better signal than the
+   *  README heuristic/LLM extraction (exact values, no parsing/inference needed) — auto-tune
+   *  tries it first. Tries `params` then the more standard `generation_config.json` name.
+   *  Best-effort: '' when neither exists or the repo is unreachable, never throws. */
+  async fetchGenerationParams(repo: string): Promise<string> {
+    for (const name of ['params', 'generation_config.json']) {
+      const url = `${BASE}/${repo}/raw/main/${name}`
+      const now = Date.now()
+      const hit = this.cache.get(url)
+      if (hit && now - hit.at < CACHE_TTL_MS) return hit.value as string
+      try {
+        const res = await fetch(url, { headers: this.authHeaders(), redirect: 'follow' })
+        if (!res.ok) continue
+        const raw = await res.text()
+        this.cache.set(url, { at: now, value: raw })
+        return raw
+      } catch {
+        continue
+      }
+    }
+    return ''
+  }
+
   /** Resolve the upstream base model for a repo (ADR-099 base-model fallback): the `base_model`
    *  declared in the repo's HF card metadata. Most local GGUFs are third-party requants
    *  (lmstudio-community / unsloth / noctrex / …) whose card omits the author's recommended
