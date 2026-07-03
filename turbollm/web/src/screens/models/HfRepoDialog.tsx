@@ -159,10 +159,11 @@ export function HfRepoContent({
     dlMut.enqueue.mutate(
       { repo: detail.repo, rfilename: selectedFile.name, size: selectedFile.sizeBytes, sha256: selectedFile.sha256 },
       {
-        onSuccess: () => {
-          toast.success(`Downloading ${selectedFile.name}`)
-          onClose()
-        },
+        // Stays open (both the Sheet and DiscoverTab's split-pane are "push panel, keep
+        // it open while browsing" per this file's own convention above) — closing here
+        // used to kick the user out of DiscoverTab's permanent detail pane on every
+        // download, and out of the Sheet before they could pick another quant to queue.
+        onSuccess: () => { toast.success(`Downloading ${selectedFile.name}`) },
       },
     )
   }
