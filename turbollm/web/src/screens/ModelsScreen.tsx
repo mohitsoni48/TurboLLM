@@ -1,8 +1,9 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useState, type ReactNode } from 'react'
-import { Boxes, ChevronRight, CircleSlash, Download, Loader2, MoreHorizontal, PackageSearch, RefreshCw, SlidersHorizontal, Trash2, Zap } from 'lucide-react'
+import { Boxes, ChevronRight, CircleSlash, Download, Loader2, MoreHorizontal, PackageSearch, RefreshCw, SlidersHorizontal, Star, Trash2, Zap } from 'lucide-react'
 import { ApiError, deleteModel } from '../lib/api'
 import { queryKeys, useModelActions, useModelDirs, useModelMutations, useModels, useStatus } from '../lib/queries'
+import { usePinnedModels } from '../lib/usePinnedModels'
 import type { ModelEntry } from '../lib/types'
 import { EmptyState, InlineError, ScreenHeader } from '../components/common'
 import { Badge } from '../components/ui/badge'
@@ -37,7 +38,7 @@ type Tab = 'library' | 'discover'
  *  with a single variant stays a flat row (spec 04 §2 / spec 11 §5). */
 type Group = { name: string; variants: ModelEntry[] }
 
-function groupModels(models: ModelEntry[]): Group[] {
+function groupModels(models: ModelEntry[], isPinned: (key: string) => boolean): Group[] {
   const byName = new Map<string, ModelEntry[]>()
   for (const m of models) {
     const k = m.name.toLowerCase()
@@ -53,7 +54,11 @@ function groupModels(models: ModelEntry[]): Group[] {
       order.push(k)
     }
   }
-  return order.map((k) => ({ name: byName.get(k)![0].name, variants: byName.get(k)! }))
+  const groups = order.map((k) => ({ name: byName.get(k)![0].name, variants: byName.get(k)! }))
+  // Pinned/favourited models float to the top; a group is pinned when any of its
+  // variants is pinned. Stable partition keeps the existing order within each half.
+  const isGroupPinned = (g: Group) => g.variants.some((v) => isPinned(v.key))
+  return [...groups.filter(isGroupPinned), ...groups.filter((g) => !isGroupPinned(g))]
 }
 
 export function ModelsScreen() {
@@ -63,6 +68,7 @@ export function ModelsScreen() {
   const actions = useModelActions()
   const del = useDeleteModel()
   const { data: status } = useStatus()
+  const { isPinned, togglePinned } = usePinnedModels()
 
   // A load isn't instant: POST /load returns 202, then the engine spends seconds in
   // `starting` before the model is `running`. Keep the Load buttons in a busy/loading
@@ -112,7 +118,7 @@ export function ModelsScreen() {
     if (filter === 'embedding') return m.embedding
     return true
   })
-  const groups = groupModels(filtered)
+  const groups = groupModels(filtered, isPinned)
 
   const onConfirmDelete = () => {
     const m = confirmDelete
@@ -209,6 +215,8 @@ export function ModelsScreen() {
           setOpenKey={setOpenKey}
           setConfirmDelete={setConfirmDelete}
           onDiscover={onDiscover}
+          isPinned={isPinned}
+          togglePinned={togglePinned}
         />
       )}
 
@@ -257,6 +265,8 @@ function LibraryTab({
   setOpenKey,
   setConfirmDelete,
   onDiscover,
+  isPinned,
+  togglePinned,
 }: {
   modelsQ: ReturnType<typeof useModels>
   mut: ReturnType<typeof useModelMutations>
@@ -273,6 +283,8 @@ function LibraryTab({
   setOpenKey: (k: string | null) => void
   setConfirmDelete: (m: ModelEntry | null) => void
   onDiscover: (m: ModelEntry) => void
+  isPinned: (key: string) => boolean
+  togglePinned: (key: string) => void
 }) {
   return (
     <>
@@ -322,6 +334,8 @@ function LibraryTab({
                 busy={loadBusy}
                 loadingThis={loadingKey === g.variants[0].key}
                 ejecting={actions.eject.isPending}
+                pinned={isPinned(g.variants[0].key)}
+                onTogglePin={() => togglePinned(g.variants[0].key)}
               />
             ) : (
               <ModelGroupRow
@@ -335,6 +349,8 @@ function LibraryTab({
                 busy={loadBusy}
                 loadingKey={loadingKey}
                 ejecting={actions.eject.isPending}
+                isPinned={isPinned}
+                togglePinned={togglePinned}
               />
             ),
           )}
@@ -368,6 +384,8 @@ function ModelGroupRow({
   busy,
   loadingKey,
   ejecting,
+  isPinned,
+  togglePinned,
 }: {
   group: Group
   onLoad: (key: string) => void
@@ -378,9 +396,12 @@ function ModelGroupRow({
   busy: boolean
   loadingKey: string | undefined
   ejecting: boolean
+  isPinned: (key: string) => boolean
+  togglePinned: (key: string) => void
 }) {
   const [open, setOpen] = useState(false)
   const anyLoaded = group.variants.some((v) => v.loaded)
+  const anyPinned = group.variants.some((v) => isPinned(v.key))
   return (
     <div className="rounded-lg border border-border bg-panel">
       <button
@@ -395,6 +416,7 @@ function ModelGroupRow({
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-1.5">
             <span className="truncate font-medium text-ink">{group.name}</span>
+            {anyPinned && <Star size={13} className="shrink-0 fill-current text-accent" />}
             {anyLoaded && <Tag tone="ok">loaded</Tag>}
           </div>
           <div className="mt-0.5 truncate text-[12px] text-muted">
@@ -420,6 +442,8 @@ function ModelGroupRow({
               busy={busy}
               loadingThis={loadingKey === m.key}
               ejecting={ejecting}
+              pinned={isPinned(m.key)}
+              onTogglePin={() => togglePinned(m.key)}
             />
           ))}
         </div>
@@ -439,6 +463,8 @@ function ModelRow({
   busy,
   loadingThis,
   ejecting,
+  pinned,
+  onTogglePin,
 }: {
   m: ModelEntry
   child?: boolean
@@ -452,6 +478,9 @@ function ModelRow({
   /** This specific model is the one currently coming up — show the spinner here. */
   loadingThis: boolean
   ejecting: boolean
+  /** This model is pinned/favourited — floats to the top of the list. */
+  pinned: boolean
+  onTogglePin: () => void
 }) {
   const loadable = !m.incomplete && !m.parseError
   // Engine compatibility (ADR-044): shown in the "All" view via "Show all". An incompatible
@@ -496,6 +525,16 @@ function ModelRow({
         <Stat>{m.nativeCtx ? `${fmtCtx(m.nativeCtx)} ctx` : '—'}</Stat>
         <TpsStat m={m} />
         <div className="ml-auto flex items-center gap-1 sm:ml-0">
+          <button
+            type="button"
+            onClick={onTogglePin}
+            aria-label={pinned ? 'Unpin model' : 'Pin model to top'}
+            aria-pressed={pinned}
+            title={pinned ? 'Unpin' : 'Pin to top'}
+            className={`grid h-8 w-8 place-items-center rounded-md transition-colors hover:bg-panel-2 ${pinned ? 'text-accent' : 'text-muted hover:text-ink'}`}
+          >
+            <Star size={15} className={pinned ? 'fill-current' : ''} />
+          </button>
           <Button
             size="sm"
             onClick={onLoad}
