@@ -25,6 +25,43 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.6.5] - 2026-07-03
+
+**Per-engine model config, chat folders, and a real fix for the MTP draft window.**
+
+Closes out the remaining items from issue #35. The v1.6.4 "MTP control" and "per-engine
+config" fixes shipped incomplete — this release fixes both for real, plus adds chat
+folders and better file-attachment support.
+
+### Added
+- **Model settings are now saved per engine, not shared across every installed engine.**
+  Previously, switching from one engine to another (or between two installs of the same
+  engine) silently reused the same saved profile. Each engine now keeps its own tuning;
+  an untuned engine falls back to whichever engine's profile you saved most recently.
+- **Chat folders** — organize conversations into folders in the sidebar (create, rename,
+  delete, move). Deleting a folder never deletes the conversations inside it — they move
+  back to Uncategorized.
+- **The chat sidebar's width is now drag-resizable.**
+- **More file types are accepted as chat attachments** — JSON, YAML, log files, and common
+  source-code extensions, alongside the existing text/PDF/image support.
+
+### Fixed
+- **MTP and NextN speculative decoding now actually honor the draft min/max settings** —
+  v1.6.4 wired the control into the generic "draft" mode only, not the MTP/NextN modes the
+  original request was actually about.
+- **The model-load menu now shows a visible settings icon on every row**, instead of relying
+  on an easy-to-miss "Alt+click to configure" hint (Alt+click still works as a shortcut).
+- **PDF attachments now extract real text** instead of silently sending garbled binary —
+  they were already accepted, but the content sent to the model was unusable.
+- **Folder contents in the sidebar are now visually distinguishable** from conversations
+  outside any folder (a clear indent guide, plus an explicit "Uncategorized" label).
+
+### Discord
+- Model settings now save per engine — switching engines (or forks like ik_llama.cpp) no longer overwrites your other engine's tuning.
+- Added chat folders — organize your conversations, with a drag-resizable sidebar.
+- Fixed MTP/NextN draft-window controls (they only worked for one speculative mode before).
+- PDF attachments now actually work — previously the text sent to the model was garbled.
+
 ## [1.6.4] - 2026-07-03
 
 **GPU VRAM detection, Windows build fixes, multi-part download fixes, and model list improvements.**

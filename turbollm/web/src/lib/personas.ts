@@ -12,7 +12,10 @@ const TURBOLLM_KNOWLEDGE =
 
   '## Screens\n\n' +
 
-  '**Chat** — main screen. Sidebar lists all conversations (threads).\n' +
+  '**Chat** — main screen. Sidebar lists all conversations (threads), organized into\n' +
+  '  **folders** (create/rename/delete via the sidebar\'s folder controls; move a conversation\n' +
+  '  in/out via its "Move to folder" menu). Deleting a folder never deletes the conversations\n' +
+  '  inside it — they move back to Uncategorized. The sidebar\'s width is drag-resizable.\n' +
   '- Pick a **persona** before the first message; it locks after that (per-conversation).\n' +
   '- Override **sampling** (temperature, top-p, top-k, min-p, repeat/frequency/presence penalty, stop strings) per conversation via conversation settings.\n' +
   '- Set a custom **system prompt** per conversation.\n' +
@@ -21,6 +24,7 @@ const TURBOLLM_KNOWLEDGE =
   '- **Tool-call cards**: live inline cards show each tool call (pending → done / error) as it runs.\n' +
   '- **Web search**: Research persona forces 3–5 `web_search` calls; other personas use it when a search provider key is configured.\n' +
   '- **Export/Import**: export as `.turbollm-chat.json` or OpenAI-format JSON; re-import resumes the conversation. Share button gives a LAN read-only link and a debug snapshot.\n' +
+  '- **Attachments** (paperclip): images (vision models), PDFs (real extracted text via pdf.js, not raw bytes), and plain-text/code files (`.txt`/`.md`/`.csv`/`.json`/`.yaml`/`.log` and common source extensions).\n' +
   '- Edit messages, delete a message, regenerate the last response.\n\n' +
 
   '**Models** — discover and manage local models.\n' +
@@ -28,7 +32,7 @@ const TURBOLLM_KNOWLEDGE =
   '- **Discover** tab: a live, sortable split-pane (list on the left, detail pane on the right, no dialog) browsing Hugging Face directly — filtered by active engine kind (GGUF for llama.cpp/TurboQuant, MLX tag for MLX, unrestricted for vLLM), sortable by trending / downloads / likes / recently updated / newest; the detail pane renders the actual model card (headings, images, links) and shows a per-quant VRAM-fit dot. Both panes are resizable.\n' +
   '- **Downloading a GGUF** places it in its own `<owner>/<repo>` folder (mirroring Hugging Face\'s layout) and automatically pulls its vision projector (mmproj) and every shard of a split/multipart quant into that same folder, so it always loads as one working model — no manual mmproj hunting or missing shards.\n' +
   '- **Import from URL** (link icon next to Discover\'s search box) accepts a direct `.gguf`/resolve link (any HTTPS host) for a one-off download, or a Hugging Face **model page** link, which opens that repo\'s quant picker instead of downloading directly (a repo has many quants — picking one there gets the same folder/mmproj/shard handling as browsing Discover).\n' +
-  '- Click a model → **Model Detail** side panel: load profile config, VRAM estimate bar, auto-tune button, per-model saved profile.\n' +
+  '- Click a model → **Model Detail** side panel: load profile config, VRAM estimate bar, auto-tune button, per-(model, engine) saved profile — switching the active engine saves/loads that engine\'s own tuning for the model, instead of sharing one profile across every installed engine. An untuned engine falls back to whichever engine\'s profile you saved most recently.\n' +
   '- **Load** button starts the model; progress indicator shows load time.\n\n' +
 
   '**Engines** — manage inference backends.\n' +
@@ -111,7 +115,7 @@ const TURBOLLM_KNOWLEDGE =
   '- `flashAttn`: Flash Attention 2 — reduces KV memory footprint especially at large ctx. Strongly recommended when ctx > 32k.\n\n' +
   '**Parallelism & speculative**:\n' +
   '- `parallel`: concurrent request slots (default 1). Increase for gateway multi-client use.\n' +
-  '- Speculative decoding (`speculative`: off / mtp / nextn / draft): `mtp` uses a separate Gemma-style MTP head (`mtpHeadPath`); `nextn` self-speculates off the model\'s own built-in NextN head (Qwen3-family, free — no extra file); `draft` uses a separate small draft GGUF (`draftModelPath`), with configurable `draftMax`/`draftMin` (tokens drafted per step, default 16/1). A well-matched draft/main pair can 2–4× throughput.\n\n' +
+  '- Speculative decoding (`speculative`: off / mtp / nextn / draft): `mtp` uses a separate Gemma-style MTP head (`mtpHeadPath`); `nextn` self-speculates off the model\'s own built-in NextN head (Qwen3-family, free — no extra file); `draft` uses a separate small draft GGUF (`draftModelPath`). All three modes honor configurable `draftMax`/`draftMin` (tokens drafted per step, default 16/1) — the draft-window fields apply to whichever speculative mode is active, not just `draft`. A well-matched draft/main pair can 2–4× throughput.\n\n' +
   '**Sampling defaults** (per-model; overridden per-conversation):\n' +
   '- `temperature`: randomness (0 = greedy/deterministic, 1 = full entropy). Typical range: 0.6–1.0.\n' +
   '- `topK`: keep only top K tokens by probability (0 = disabled).\n' +

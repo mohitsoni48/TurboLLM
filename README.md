@@ -174,7 +174,9 @@ the detail:
   carry a draft head, threads auto — safely gated to what your engine actually accepts.
 - **Multi-GPU, per model** — split a model across cards (layer/row split + main-GPU pick on
   llama.cpp, tensor-parallel on vLLM). Defaults are no-ops, so single-GPU rigs are untouched.
-- **Saved per-model profiles** — tune once, and it loads that way every time.
+- **Saved per-model profiles, per engine** — tune once per (model, engine) pair, so
+  switching engines (or between two installs of the same engine, e.g. a fork) never
+  overwrites another engine's tuning for the same model.
 
 </details>
 
@@ -196,11 +198,13 @@ the detail:
   Creative · Research) per conversation, no prompt-wrangling required. The **Designer** persona
   produces polished, self-contained, previewable designs by default.
 - **Edit, regenerate, delete, copy** any message; **persistent, searchable conversations**
-  with rename, delete, and **auto-generated titles**.
+  with rename, delete, and **auto-generated titles**, organized into **drag-resizable,
+  collapsible folders** you create/rename/move conversations into.
 - **Per-chat system prompt** and **per-chat sampling** overrides — temperature, top-p/k, min-p,
   repeat/presence/frequency penalties, and **stop strings**.
-- **Image input** for vision models, and **TurboLLM Expert** — a built-in assistant that knows
-  the app and your hardware for onboarding and troubleshooting without leaving the UI.
+- **Image input** for vision models, **PDF and code/text attachments** (real extracted text,
+  not raw bytes), and **TurboLLM Expert** — a built-in assistant that knows the app and your
+  hardware for onboarding and troubleshooting without leaving the UI.
 - **Agentic tools** — built-in `web_search` (Tavily), `fetch_url`, and sandboxed `run_code`, plus
   an **MCP marketplace** in Customize: one-click connect for hosted MCPs (GitHub, Linear, Stripe,
   Atlassian, Neon, Supabase, Cloudflare, Zapier, Apify, Mixpanel) and open-source local MCPs
