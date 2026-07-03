@@ -166,15 +166,24 @@ export class Scanner {
       const modelFiles = group.filter((f) => !basename(f.path).toLowerCase().includes('mmproj'))
       const mmprojPath = mmprojFiles.sort((a, b) => b.size - a.size)[0]?.path ?? null
 
-      // Resolve split groups: prefix+total -> shards.
-      const splits = new Map<string, { shards: FileInfo[]; total: number }>()
+      // Resolve split groups: prefix+total -> shards, keyed by shard INDEX so a split is
+      // judged complete by the distinct part numbers present (1..total), not by the raw
+      // file count. A duplicate copy of one shard (e.g. a leftover from a re-download)
+      // must not make an otherwise-complete split look "over-full", and — more importantly
+      // — a missing part must be detected by its absent index, so the presence check is
+      // index-based (spec 04 §2).
+      const splits = new Map<string, { shards: Map<number, FileInfo>; total: number }>()
       const singles: FileInfo[] = []
       for (const f of modelFiles) {
         const m = basename(f.path).match(SPLIT_RE)
         if (m) {
           const gkey = `${m[1]}|${m[3]}`
-          const g = splits.get(gkey) ?? { shards: [], total: Number(m[3]) }
-          g.shards.push(f)
+          const g = splits.get(gkey) ?? { shards: new Map<number, FileInfo>(), total: Number(m[3]) }
+          const idx = Number(m[2])
+          // First writer for an index wins; a duplicate same-index file is ignored so it
+          // can't inflate the count. Deterministic: keep the lexicographically-first path.
+          const prev = g.shards.get(idx)
+          if (!prev || f.path.localeCompare(prev.path) < 0) g.shards.set(idx, f)
           splits.set(gkey, g)
         } else {
           singles.push(f)
@@ -186,10 +195,19 @@ export class Scanner {
         await tick()
       }
       for (const { shards, total } of splits.values()) {
-        shards.sort((a, b) => a.path.localeCompare(b.path))
-        const first = shards[0]
-        const totalSize = shards.reduce((s, x) => s + x.size, 0)
-        const incomplete = shards.length !== total
+        const present = [...shards.values()].sort((a, b) => a.path.localeCompare(b.path))
+        const first = present[0]
+        const totalSize = present.reduce((s, x) => s + x.size, 0)
+        // Complete only when every index 1..total is present on disk (not merely when the
+        // count matches — a duplicate + a hole would otherwise pass the old length check).
+        let incomplete = shards.size !== total
+        if (!incomplete) {
+          for (let i = 1; i <= total; i++)
+            if (!shards.has(i)) {
+              incomplete = true
+              break
+            }
+        }
         entries.push(await this.entryFor(first.path, totalSize, first.mtime, dir, mmprojPath, incomplete))
         await tick()
       }
