@@ -32,6 +32,11 @@ import { toast } from '../components/ui/sonner'
  *  when OFF, the model is told to answer directly. Default ON when unset. */
 const THINKING_DEFAULT_KEY = 'tllm.thinkingEnabled.default'
 
+/** localStorage key for the client-only "confirm before deleting a conversation"
+ *  preference. When ON, deleting a conversation shows a confirmation dialog first;
+ *  when OFF, deletes immediately. Default ON when unset. */
+const CONFIRM_DELETE_KEY = 'tllm.confirmDeleteConversation'
+
 /** A controlled numeric input that doesn't fight the user mid-edit. A raw
  *  `value={number}` with `Number(e.target.value) || min` snaps an emptied field
  *  straight back to a number, so you can't clear it to retype and every partial
@@ -124,6 +129,8 @@ export function SettingsScreen() {
   const [gatewayKeepN, setGatewayKeepN] = useState(1)
   // Client-only "enable thinking by default" preference (ADR-042); default ON.
   const [thinkingEnabled, setThinkingEnabled] = useState(() => localStorage.getItem(THINKING_DEFAULT_KEY) !== 'false')
+  // Client-only "confirm before deleting a conversation" preference; default ON.
+  const [confirmDelete, setConfirmDelete] = useState(() => localStorage.getItem(CONFIRM_DELETE_KEY) !== 'false')
 
   // Full-screen overlay while the daemon re-execs (spec 08 §2).
   const [restartOverlay, setRestartOverlay] = useState(false)
@@ -154,6 +161,11 @@ export function SettingsScreen() {
   useEffect(() => {
     localStorage.setItem(THINKING_DEFAULT_KEY, thinkingEnabled ? 'true' : 'false')
   }, [thinkingEnabled])
+
+  // Persist the confirm-before-delete preference immediately (client-only).
+  useEffect(() => {
+    localStorage.setItem(CONFIRM_DELETE_KEY, confirmDelete ? 'true' : 'false')
+  }, [confirmDelete])
 
   const settingsPayload = () => ({
     // Clamp defensively: NumberField commits unclamped while editing and only
@@ -257,6 +269,20 @@ export function SettingsScreen() {
               type="checkbox"
               checked={thinkingEnabled}
               onChange={(e) => setThinkingEnabled(e.target.checked)}
+              className="h-4 w-4 accent-[var(--accent)]"
+            />
+          </label>
+
+          {/* Confirm before deleting a conversation: client-only, default ON. */}
+          <label className="flex cursor-pointer items-center justify-between border-t border-border py-2 pt-3">
+            <div>
+              <div className="text-[14px] font-medium text-ink">Confirm before deleting a conversation</div>
+              <div className="text-[12px] text-muted">Ask for confirmation before a conversation is deleted. Off = delete immediately with no prompt.</div>
+            </div>
+            <input
+              type="checkbox"
+              checked={confirmDelete}
+              onChange={(e) => setConfirmDelete(e.target.checked)}
               className="h-4 w-4 accent-[var(--accent)]"
             />
           </label>
