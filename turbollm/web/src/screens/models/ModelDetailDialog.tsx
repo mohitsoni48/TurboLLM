@@ -404,18 +404,20 @@ export function ModelDetailDialog({
                     <p className="text-[11px] text-faint">Uses this model's built-in NextN head — no extra file needed.</p>
                   )}
                   {draft.speculative === 'draft' && (
+                    <PathField
+                      label="Draft model GGUF"
+                      hint="A small same-family model."
+                      value={draft.draftModelPath}
+                      placeholder="Path to small draft model"
+                      onChange={(v) => set('draftModelPath', v)}
+                    />
+                  )}
+                  {draft.speculative !== 'off' && (
                     <>
-                      <PathField
-                        label="Draft model GGUF"
-                        hint="A small same-family model."
-                        value={draft.draftModelPath}
-                        placeholder="Path to small draft model"
-                        onChange={(v) => set('draftModelPath', v)}
-                      />
-                      <Row label="Max drafts" hint="Tokens drafted per step (--draft-max). Default 16.">
+                      <Row label="Max drafts" hint="Tokens the draft head proposes per step before verification (--draft-max). Default 16.">
                         <DefaultableNumberInput value={draft.draftMax} placeholder="16" min={1} max={64} onChange={(v) => set('draftMax', v)} />
                       </Row>
-                      <Row label="Min drafts" hint="Minimum tokens drafted per step (--draft-min). Default 1.">
+                      <Row label="Min drafts" hint="Minimum tokens drafted per step before the main model verifies (--draft-min). Default 1.">
                         <DefaultableNumberInput value={draft.draftMin} placeholder="1" min={0} max={8} onChange={(v) => set('draftMin', v)} />
                       </Row>
                     </>

@@ -278,3 +278,29 @@ test('draftMin 0 is emitted (not treated as unset)', () => {
   const args = profileToArgs(p, model(), caps)
   assert.equal(args[args.indexOf('--draft-min') + 1], '0')
 })
+
+// Regression: the draft window is a property of the speculation mechanism itself
+// (llama.cpp's shared verify loop), not specific to how the draft is produced — it must
+// apply to 'mtp' and 'nextn' modes too, not only the external-draft-model 'draft' mode
+// (this was the actual GitHub #35 ask — "MTP control ... min and max MTP drafts").
+test('mtp mode also honors draftMax/draftMin, not just draft mode', () => {
+  const p = { ...base(), speculative: 'mtp' as const, mtpHeadPath: '/models/gemma4-mtp.gguf', draftMax: 4, draftMin: 0 }
+  const args = profileToArgs(p, model(), caps)
+  assert.ok(args.includes('--mtp-head'))
+  assert.equal(args[args.indexOf('--draft-max') + 1], '4')
+  assert.equal(args[args.indexOf('--draft-min') + 1], '0')
+})
+
+test('nextn mode also honors draftMax/draftMin, defaults to 16/1 when unset', () => {
+  const p = { ...base(), speculative: 'nextn' as const, draftMax: 6 }
+  const args = profileToArgs(p, model({ nextnLayers: 1 }), caps)
+  assert.equal(args[args.indexOf('--draft-max') + 1], '6')
+  assert.equal(args[args.indexOf('--draft-min') + 1], '1')
+})
+
+test('off mode emits no draft-max/draft-min flags', () => {
+  const p = { ...base(), speculative: 'off' as const, draftMax: 4, draftMin: 0 }
+  const args = profileToArgs(p, model(), caps)
+  assert.ok(!args.includes('--draft-max'))
+  assert.ok(!args.includes('--draft-min'))
+})
