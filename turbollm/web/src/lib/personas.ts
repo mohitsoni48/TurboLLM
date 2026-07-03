@@ -93,8 +93,8 @@ const TURBOLLM_KNOWLEDGE =
   '- MoE models: search nCpuMoe ∈ [0, nExpertsTotal] — ngl stays maxed, finds minimum nCpuMoe (router experts on CPU) that fits. Reducing nCpuMoe pushes more MoE routing onto the GPU.\n\n' +
   '**Phase 3 — Real benchmark at winner config**:\n' +
   'One real prefill + generation run. Bench prompt: `min(50,000 tokens, ctx × 75%)`. Per-test cap: 3 minutes. Stop/restart/load cancel a running auto-tune. Records prefill t/s, generation t/s, TTFT ms, and VRAM delta.\n\n' +
-  '**Phase 4 — Model card sampling extraction**:\n' +
-  'Fetches the HuggingFace model card and extracts recommended temperature, top_k, top_p, min_p. Falls back to the base model\'s card if the quant card doesn\'t have sampling info. Prefills the Sampling section of the load profile.\n\n' +
+  '**Phase 4 — Recommended sampling extraction**:\n' +
+  'Checks the repo for a structured `params`/`generation_config.json` sidecar first (some quantizers, e.g. unsloth, publish one with exact recommended values — used as-is, no parsing needed). Otherwise fetches the HuggingFace model card and extracts recommended temperature, top_k, top_p, min_p (falling back to the base model\'s card if the quant card doesn\'t have sampling info, then an LLM-read fallback on unusual phrasing). Prefills the Sampling section of the load profile.\n\n' +
   'Results dialog: Save applies the winner config to the model profile (tunedBy: "bench"). "Download run log" checkbox (default checked) downloads a JSON log of every probe (timestamps, parameters, outcomes, VRAM readings, and the winner).\n\n' +
 
   '## Load Profile Parameters\n\n' +
@@ -111,7 +111,7 @@ const TURBOLLM_KNOWLEDGE =
   '- `flashAttn`: Flash Attention 2 — reduces KV memory footprint especially at large ctx. Strongly recommended when ctx > 32k.\n\n' +
   '**Parallelism & speculative**:\n' +
   '- `parallel`: concurrent request slots (default 1). Increase for gateway multi-client use.\n' +
-  '- Speculative decoding: `specModelPath` (draft model path) + `specAcceptThreshold`. A smaller draft model generates candidate tokens; the main model verifies them in parallel. Can 2–4× throughput for well-matched model pairs.\n\n' +
+  '- Speculative decoding (`speculative`: off / mtp / nextn / draft): `mtp` uses a separate Gemma-style MTP head (`mtpHeadPath`); `nextn` self-speculates off the model\'s own built-in NextN head (Qwen3-family, free — no extra file); `draft` uses a separate small draft GGUF (`draftModelPath`), with configurable `draftMax`/`draftMin` (tokens drafted per step, default 16/1). A well-matched draft/main pair can 2–4× throughput.\n\n' +
   '**Sampling defaults** (per-model; overridden per-conversation):\n' +
   '- `temperature`: randomness (0 = greedy/deterministic, 1 = full entropy). Typical range: 0.6–1.0.\n' +
   '- `topK`: keep only top K tokens by probability (0 = disabled).\n' +

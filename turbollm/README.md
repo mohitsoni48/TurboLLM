@@ -148,7 +148,8 @@ the detail:
   picker so you can choose which one to download.
 - **Quant recommendation per GPU** and a **VRAM-fit verdict** so you pick a quant that
   actually fits before you commit.
-- **Primary download folder**, real-time **measured t/s per model**, and **delete-from-disk**.
+- **Primary download folder**, real-time **measured t/s per model**, **delete-from-disk**, and
+  **pin your favourites to the top of the list**.
 
 </details>
 
@@ -158,15 +159,17 @@ the detail:
 <br/>
 
 - **Auto-benchmark on load** derives fast defaults for your exact GPU.
-- **Recommended sampling from the model card** — auto-tune reads the model's Hugging Face card
-  (falling back to the original model behind a requant) and prefills the author's recommended
-  `temperature / top_k / top_p / min_p`. No recommendation → your sampling is left untouched.
+- **Recommended sampling from Hugging Face** — auto-tune checks a repo's structured params /
+  `generation_config.json` sidecar first when the quantizer publishes one (exact values, no
+  guessing), then falls back to reading the model's card (and the original model behind a
+  requant) and prefills the author's recommended `temperature / top_k / top_p / min_p`. No
+  recommendation → your sampling is left untouched.
 - **Real measured tokens/sec** in the model list — **live** while generating, **last-session**
   when idle (never a synthetic estimate).
 - **Full load-parameter UI**, a superset of what other tools expose: context length, GPU offload
   (`-ngl`), **MoE CPU-offload (`--n-cpu-moe`)**, parallel slots, **KV-cache quant type** (incl.
   low-bit on supporting forks), CPU threads, flash attention, and **speculative decoding (NextN /
-  MTP / draft)**.
+  MTP / draft, with a configurable draft min/max window)**.
 - **Fast by default:** flash attention on, NextN self-speculative decoding on for models that
   carry a draft head, threads auto — safely gated to what your engine actually accepts.
 - **Multi-GPU, per model** — split a model across cards (layer/row split + main-GPU pick on

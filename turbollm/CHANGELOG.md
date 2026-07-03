@@ -25,6 +25,42 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.7.0] - 2026-07-03
+
+**GPU VRAM detection, Windows build fixes, multi-part download fixes, and model list improvements.**
+
+### Added
+- **MTP / speculative-decoding draft window is now configurable** — set min/max drafted
+  tokens per step directly in a model's Load settings, instead of a fixed 16/1.
+- **Pin/favourite models** to the top of your library list with a star toggle.
+- **Auto-tune now reads a model's recommended sampling settings from a structured params
+  file** when the quantizer publishes one (e.g. unsloth's `gpt-oss-120b-GGUF`), instead of
+  only scraping the README — more accurate, and no extra model reload needed to find it.
+
+### Fixed
+- **Multi-GPU VRAM is now summed correctly, and a non-primary GPU (e.g. an Intel iGPU
+  alongside your NVIDIA/AMD card) is excluded from the total** — a dual-GPU box was
+  under-reporting its real VRAM, and a laptop with an iGPU could over-report it.
+- **AMD GPU VRAM is now detected correctly on Windows** via `rocm-smi` — previously capped
+  at ~4GB by a Windows limitation, so a 24GB card could show as 4GB.
+- **Windows engine builds no longer fail with `spawn cmd.exe ENOENT`** during a from-source
+  build (e.g. `ik_llama.cpp`).
+- **Multi-part GGUF downloads (e.g. `gpt-oss-120b`) no longer get wrongly flagged "missing
+  parts"** when every shard actually downloaded correctly.
+- **Deleting a conversation now asks for confirmation** (toggle in Settings), and warns if a
+  response is still generating in it.
+- **The Discover model page no longer closes itself** every time you click Download — stays
+  open so you can queue another quant without losing your place.
+- **The built-in web search options (Customize) now show their descriptions** — including
+  that SearXNG needs no API key.
+
+### Discord
+- Model VRAM detection is more accurate now — multi-GPU setups and AMD cards report correctly.
+- Fixed a Windows bug where building an engine from source could fail outright.
+- Multi-part model downloads (like gpt-oss-120b) no longer get stuck saying files are missing.
+- You can now pin your favorite models to the top of the list, and tune MTP draft settings per model.
+- The model download page stays open after you hit Download, so you can grab another quant right after.
+
 ## [1.6.3] - 2026-07-02
 
 **Download folder structure, mmproj, and multipart quant fixes.**
