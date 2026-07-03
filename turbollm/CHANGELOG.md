@@ -25,7 +25,7 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
-## [1.7.0] - 2026-07-03
+## [1.6.4] - 2026-07-03
 
 **GPU VRAM detection, Windows build fixes, multi-part download fixes, and model list improvements.**
 
