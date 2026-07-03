@@ -282,6 +282,15 @@ async function findVcvarsall(): Promise<string | null> {
   }
 }
 
+/** The Windows command interpreter to spawn for our vcvars `.bat` steps. Windows always sets
+ *  `ComSpec` to the full path of cmd.exe (e.g. `C:\Windows\System32\cmd.exe`), which is the
+ *  portable, drive-agnostic way to reach it (Windows may not be on C:). Spawning the bare string
+ *  `'cmd.exe'` instead relies on PATH resolution, which can fail with `spawn cmd.exe ENOENT` if
+ *  PATH is malformed. The bare-string fallback is defensive only (ComSpec should always be set). */
+function winComSpec(): string {
+  return process.env.ComSpec || 'cmd.exe'
+}
+
 /** Run one child process, streaming combined stdout+stderr line-by-line to `onLine` and
  *  resolving with the full stdout text. Rejects with a clear message on a non-zero exit or
  *  spawn error; aborting `signal` kills the child (Node throws AbortError, name preserved). */
@@ -490,7 +499,7 @@ export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: Abo
   if (isWindows) {
     const configureBat = join(buildRoot, '_tllm_configure.bat')
     writeFileSync(configureBat, vcvarsBatch(vcvars!, configureArgs))
-    await runStep('cmd.exe', ['/c', configureBat], { cwd: buildRoot, env, signal, onLine: hooks.log })
+    await runStep(winComSpec(), ['/c', configureBat], { cwd: buildRoot, env, signal, onLine: hooks.log })
   } else {
     await runStep('cmake', configureArgs, { cwd: buildRoot, env, signal, onLine: hooks.log })
   }
@@ -501,7 +510,7 @@ export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: Abo
   if (isWindows) {
     const compileBat = join(buildRoot, '_tllm_build.bat')
     writeFileSync(compileBat, vcvarsBatch(vcvars!, compileArgs))
-    await runStep('cmd.exe', ['/c', compileBat], { cwd: buildRoot, env, signal, onLine: hooks.log })
+    await runStep(winComSpec(), ['/c', compileBat], { cwd: buildRoot, env, signal, onLine: hooks.log })
   } else {
     await runStep('cmake', compileArgs, { cwd: buildRoot, env, signal, onLine: hooks.log })
   }

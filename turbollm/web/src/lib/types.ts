@@ -516,6 +516,10 @@ export type LoadProfile = {
   batchSize?: number
   /** llama.cpp --ubatch-size. Physical micro-batch size. 0 / absent = engine default (512). */
   uBatchSize?: number
+  /** Speculative `draft` mode window (GitHub #35). --draft-max; absent = 16 default. */
+  draftMax?: number
+  /** Speculative `draft` mode window (GitHub #35). --draft-min; absent = 1 default. */
+  draftMin?: number
   tunedBy?: string
 }
 

@@ -134,6 +134,12 @@ export interface LoadProfile {
   /** llama.cpp --ubatch-size (-ub). Physical micro-batch size for prompt processing. 0 / absent =
    *  engine default (512). Must be ≤ batchSize. Tune alongside batchSize for throughput. */
   uBatchSize?: number
+  /** Speculative-decoding draft window, `draft` mode only (GitHub #35). Max tokens the draft
+   *  model proposes per step (--draft-max). Absent → 16 (the previous hardcoded default). */
+  draftMax?: number
+  /** Speculative-decoding draft window, `draft` mode only (GitHub #35). Min tokens drafted per
+   *  step before verification (--draft-min). Absent → 1 (the previous hardcoded default). */
+  draftMin?: number
   /** Provenance of a saved profile (spec 05 §3, 09 §1): 'bench' = written by the
    *  auto-tune runner, 'user' = hand-saved. Absent on heuristic/global defaults. */
   tunedBy?: 'bench' | 'user'
@@ -386,7 +392,8 @@ export function profileToArgs(p: LoadProfile, m: ModelEntry, caps: Capabilities,
     if (nextnVal) a.push('--spec-type', nextnVal, '--model-draft', m.path)
   } else if (p.speculative === 'draft' && p.draftModelPath && has('--model-draft')) {
     if (specType) a.push('--spec-type', 'draft')
-    a.push('--model-draft', p.draftModelPath, '--draft-max', '16', '--draft-min', '1')
+    // Draft window overridable per-model (GitHub #35); absent → the previous 16/1 defaults.
+    a.push('--model-draft', p.draftModelPath, '--draft-max', String(p.draftMax ?? 16), '--draft-min', String(p.draftMin ?? 1))
   }
   // Sampling startup defaults — become the engine's per-request defaults; can still
   // be overridden in the chat request body. Only emitted when non-default to avoid

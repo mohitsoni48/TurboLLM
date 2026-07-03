@@ -68,7 +68,13 @@ function detectGpus(): GpuInfo[] {
         return { name: (name ?? '').trim(), vramMb: parseInt((mb ?? '').trim(), 10) || 0, vendor: 'nvidia' as const }
       })
       .filter((g) => g.vramMb > 0)
-    if (gpus.length) return gpus
+    if (gpus.length) {
+      // Debug aid: dual-GPU users have reported a lower-than-expected total. Log
+      // the raw per-GPU VRAM parsed from nvidia-smi so a future report can tell
+      // "only one card enumerated" apart from "sum bug" (fixed in hardware.ts).
+      console.log(`[sysinfo] nvidia-smi enumerated ${gpus.length} GPU(s): ${gpus.map((g) => `${g.name}=${g.vramMb}MB`).join(', ')}`)
+      return gpus
+    }
   } catch {
     /* no nvidia-smi */
   }
@@ -99,8 +105,19 @@ function detectGpus(): GpuInfo[] {
 }
 
 function enumWindowsGpus(): GpuInfo[] {
+  // AMD first: ROCm's rocm-smi reports true VRAM, unlike WMI's 4GB-capped
+  // AdapterRAM below. Only present when ROCm is installed; falls through if not.
+  try {
+    const amd = rocmSmiGpus()
+    if (amd.length) return amd
+  } catch {
+    /* no rocm-smi (ROCm not installed) — fall back to WMI */
+  }
+
   // Win32_VideoController: Name + AdapterRAM (AdapterRAM caps at 4GB for larger
-  // cards and is unreliable — used only as a weak hint).
+  // cards and is unreliable — used only as a weak hint). This mis-sizes AMD cards
+  // >4GB (e.g. RX 7900 XTX reports ~4GB, not 24GB), which is why AMD is tried via
+  // rocm-smi first above.
   const ps =
     'Get-CimInstance Win32_VideoController | ForEach-Object { "$($_.Name)|$($_.AdapterRAM)" }'
   const out = execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], {
@@ -117,6 +134,50 @@ function enumWindowsGpus(): GpuInfo[] {
       return { name: nm, vramMb: bytes > 0 ? Math.round(bytes / 1e6) : 0, vendor: classifyVendor(nm) }
     })
     .filter((g) => g.name && g.vendor !== 'unknown')
+}
+
+// AMD VRAM on Windows via ROCm's rocm-smi. `--showmeminfo vram --json` returns an
+// object keyed by "card0", "card1", … each with "VRAM Total Memory (B)". Card
+// names aren't in that call, so pair it with --showproductname; degrade to a
+// generic "AMD Radeon GPU" name (vendor still classifies as amd) when a name is
+// missing. Throws when rocm-smi isn't on PATH so the caller falls back to WMI.
+function rocmSmiGpus(): GpuInfo[] {
+  const memJson = execFileSync('rocm-smi', ['--showmeminfo', 'vram', '--json'], {
+    timeout: 8000,
+    windowsHide: true,
+  }).toString()
+
+  let nameJson = ''
+  try {
+    nameJson = execFileSync('rocm-smi', ['--showproductname', '--json'], {
+      timeout: 8000,
+      windowsHide: true,
+    }).toString()
+  } catch {
+    /* names optional — vendor classification and VRAM come from the mem query */
+  }
+  return parseRocmSmi(memJson, nameJson)
+}
+
+/** Pure parser for rocm-smi --json output, split out for direct testing.
+ *  `memJson` is `--showmeminfo vram --json`; `nameJson` (may be empty) is
+ *  `--showproductname --json`. */
+export function parseRocmSmi(memJson: string, nameJson = ''): GpuInfo[] {
+  const mem = JSON.parse(memJson) as Record<string, Record<string, string>>
+  let names: Record<string, Record<string, string>> = {}
+  if (nameJson.trim()) names = JSON.parse(nameJson) as Record<string, Record<string, string>>
+
+  const gpus: GpuInfo[] = []
+  for (const [card, fields] of Object.entries(mem)) {
+    const totalKey = Object.keys(fields).find((k) => /VRAM Total Memory/i.test(k))
+    const bytes = totalKey ? parseInt(String(fields[totalKey]).trim(), 10) || 0 : 0
+    if (bytes <= 0) continue
+    const nameFields = names[card] ?? {}
+    const nameKey = Object.keys(nameFields).find((k) => /(Card Series|Card Model|Product Name|Device Name)/i.test(k))
+    const name = (nameKey ? String(nameFields[nameKey]).trim() : '') || 'AMD Radeon GPU'
+    gpus.push({ name, vramMb: Math.round(bytes / 1e6), vendor: 'amd' })
+  }
+  return gpus
 }
 
 function enumLinuxGpus(): GpuInfo[] {

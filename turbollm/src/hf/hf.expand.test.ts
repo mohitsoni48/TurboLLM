@@ -92,6 +92,45 @@ test('expandModelFiles: recovers the full repo path and reports the model dir fo
   })
 })
 
+test('expandModelFiles: gpt-oss-120b Q4_K_M (2-part split in a per-quant subfolder, root companions + single F16 present) expands to exactly its two shards in one dir', async () => {
+  // Mirrors the real unsloth/gpt-oss-120b-GGUF layout: every quant lives in its own
+  // subfolder as a 2-part split, plus root-level companion files (config.json, params,
+  // template) and a single root F16. Regression guard for the "missing parts" report:
+  // both shards must land under the SAME model dir so the scanner groups them into one
+  // complete split. (b2ecd47 follow-up — this specific repo regressed.)
+  const tree: TreeEntry[] = [
+    { type: 'file', path: 'config.json', size: 100 },
+    { type: 'file', path: 'params', size: 100 },
+    { type: 'file', path: 'template', size: 100 },
+    { type: 'file', path: 'README.md', size: 100 },
+    { type: 'file', path: 'gpt-oss-120b-F16.gguf', lfs: { oid: 'f16', size: 999 } },
+    { type: 'file', path: 'Q4_K_M/gpt-oss-120b-Q4_K_M-00001-of-00002.gguf', lfs: { oid: 'a', size: 10 } },
+    { type: 'file', path: 'Q4_K_M/gpt-oss-120b-Q4_K_M-00002-of-00002.gguf', lfs: { oid: 'b', size: 10 } },
+    { type: 'file', path: 'Q8_0/gpt-oss-120b-Q8_0-00001-of-00002.gguf', lfs: { oid: 'c', size: 20 } },
+    { type: 'file', path: 'Q8_0/gpt-oss-120b-Q8_0-00002-of-00002.gguf', lfs: { oid: 'd', size: 20 } },
+  ]
+  await withTree(tree, async () => {
+    // The Discover UI carries only the first shard's basename (groupFiles sets name = basename).
+    const { dir, files } = await client().expandModelFiles(
+      'unsloth/gpt-oss-120b-GGUF',
+      'gpt-oss-120b-Q4_K_M-00001-of-00002.gguf',
+    )
+    assert.equal(dir, 'Q4_K_M')
+    assert.deepEqual(files.map((f) => f.rfilename), [
+      'Q4_K_M/gpt-oss-120b-Q4_K_M-00001-of-00002.gguf',
+      'Q4_K_M/gpt-oss-120b-Q4_K_M-00002-of-00002.gguf',
+    ])
+    // No mmproj in this repo — must not fabricate one, and the root F16 / other quant / the
+    // companion files must never be pulled into this quant's download set.
+    assert.equal(files.length, 2)
+    assert.equal(files.every((f) => !f.mmproj), true)
+    // Both shards share one repo directory → they will download into one folder and the
+    // scanner will see a complete 2-of-2 split (the crux of the "missing parts" fix).
+    const dirs = new Set(files.map((f) => f.rfilename.slice(0, f.rfilename.lastIndexOf('/'))))
+    assert.equal(dirs.size, 1)
+  })
+})
+
 test('expandModelFiles: same-basename shards in two subfolders do NOT cross-match', async () => {
   const tree: TreeEntry[] = [
     { type: 'file', path: 'Q4_K_M/model-00001-of-00003.gguf', lfs: { oid: 'a1', size: 10 } },

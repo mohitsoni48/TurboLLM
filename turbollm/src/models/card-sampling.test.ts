@@ -4,11 +4,48 @@ import {
   parseCardSampling,
   clampCardSampling,
   hasAnySampling,
+  parseGenerationParams,
   parseLlmSampling,
   buildCardExtractionPrompt,
   relevantCardExcerpt,
   type CardSampling,
 } from './card-sampling'
+
+// ─── generation-params sidecar (structured JSON) ────────────────────────────
+
+test('parseGenerationParams: real unsloth/gpt-oss-120b-GGUF `params` file', () => {
+  const raw = JSON.stringify({
+    stop: ['<|endoftext|>', '<|return|>'],
+    temperature: 1.0,
+    min_p: 0.0,
+    top_k: 0,
+    top_p: 1.0,
+  })
+  // min_p and top_k are legitimately 0 here — not "absent", a real recommendation.
+  assert.deepEqual(parseGenerationParams(raw), { temp: 1.0, topP: 1.0, topK: 0, minP: 0 })
+})
+
+test('parseGenerationParams: unknown/extra keys are ignored, known ones still parsed', () => {
+  const raw = JSON.stringify({ temperature: 0.6, repetition_penalty: 1.1, max_new_tokens: 512 })
+  assert.deepEqual(parseGenerationParams(raw), { temp: 0.6 })
+})
+
+test('parseGenerationParams: out-of-range values are dropped (same gate as the heuristic)', () => {
+  const raw = JSON.stringify({ temperature: 5, top_p: 0.9 })
+  assert.deepEqual(parseGenerationParams(raw), { topP: 0.9 })
+})
+
+test('parseGenerationParams: empty string → {}', () => {
+  assert.deepEqual(parseGenerationParams(''), {})
+})
+
+test('parseGenerationParams: invalid JSON → {} (never throws)', () => {
+  assert.deepEqual(parseGenerationParams('not json'), {})
+})
+
+test('parseGenerationParams: JSON array (not an object) → {}', () => {
+  assert.deepEqual(parseGenerationParams('[1,2,3]'), {})
+})
 
 // ─── heuristic parse ─────────────────────────────────────────────────────────
 

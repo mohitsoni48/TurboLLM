@@ -163,10 +163,16 @@ export function ChatScreen() {
     if (live) scrollToBottom()
   }, [live, scrollToBottom])
 
-  // Ctrl+N new chat, Esc stop
+  // Ctrl+N new chat, Esc stop. Whitelist ONLY these exact combos and preventDefault
+  // solely for the one we handle (Ctrl/Cmd+N) — never for anything else, so native
+  // shortcuts like Ctrl/Cmd+C (copy) are left untouched.
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'n') { e.preventDefault(); handleNew() }
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'n' || e.key === 'N')) {
+        e.preventDefault()
+        handleNew()
+        return
+      }
       if (e.key === 'Escape' && live) { void handleStop() }
     }
     window.addEventListener('keydown', handler)
@@ -280,6 +286,17 @@ export function ChatScreen() {
     setSelectedPersonaId(getConvPersonaId(id))
     userScrolledUp.current = false
     setTimeout(() => scrollToBottom(true), 50)
+  }
+
+  // The currently-open conversation was deleted — abort any live generation and
+  // close it (clear activeId) so we don't hold a dangling reference.
+  const handleActiveDeleted = (id: string) => {
+    if (id !== activeId) return
+    if (live) { abortRef.current?.abort(); setLive(null) }
+    setActiveId(null)
+    setEditingId(null)
+    setInput('')
+    setSelectedPersonaId(getDefaultPersonaId())
   }
 
   const handleStop = async () => {
@@ -469,6 +486,8 @@ export function ChatScreen() {
           onImport={readonly ? undefined : () => importFileRef.current?.click()}
           collapsed={!sidebarOpen}
           onToggle={() => setSidebarOpen((o) => !o)}
+          generating={!!live}
+          onDeleted={handleActiveDeleted}
         />
       </div>
 

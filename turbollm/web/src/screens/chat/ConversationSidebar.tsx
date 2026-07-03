@@ -5,6 +5,21 @@ import { useConversationMutations, useConversations } from '../../lib/chat-queri
 import { Button } from '../../components/ui/button'
 import { Input } from '../../components/ui/input'
 import { toast } from '../../components/ui/sonner'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '../../components/ui/alert-dialog'
+
+/** localStorage key for the client-only "confirm before deleting a conversation"
+ *  preference (mirrors SettingsScreen). Default ON when unset. */
+const CONFIRM_DELETE_KEY = 'tllm.confirmDeleteConversation'
+const confirmDeleteEnabled = (): boolean => localStorage.getItem(CONFIRM_DELETE_KEY) !== 'false'
 
 function relTime(iso: string): string {
   const diff = Date.now() - new Date(iso).getTime()
@@ -21,6 +36,8 @@ export function ConversationSidebar({
   onImport,
   collapsed,
   onToggle,
+  generating,
+  onDeleted,
 }: {
   activeId: string | null
   onSelect: (id: string) => void
@@ -29,9 +46,16 @@ export function ConversationSidebar({
   onImport?: () => void
   collapsed?: boolean
   onToggle?: () => void
+  /** True when a generation is streaming in the active conversation. */
+  generating?: boolean
+  /** Called after a conversation is deleted so the parent can clear its active
+   *  reference when the deleted conversation was the open one. */
+  onDeleted?: (id: string) => void
 }) {
   const [q, setQ] = useState('')
   const [debouncedQ, setDebouncedQ] = useState('')
+  // Conversation queued for a confirmation dialog (null = dialog closed).
+  const [pendingDelete, setPendingDelete] = useState<Conversation | null>(null)
   const searchRef = useRef<HTMLInputElement>(null)
   const mut = useConversationMutations()
   const convsQ = useConversations(debouncedQ || undefined)
@@ -49,13 +73,29 @@ export function ConversationSidebar({
     return () => window.removeEventListener('keydown', handler)
   }, [])
 
-  const onDelete = (e: React.MouseEvent, conv: Conversation) => {
-    e.stopPropagation()
+  // Actually delete a conversation. If it was the active one, tell the parent so
+  // it can close/clear the now-dangling reference.
+  const doDelete = (conv: Conversation) => {
+    const wasActive = conv.id === activeId
     mut.remove.mutate(conv.id, {
-      onSuccess: () => { toast.success('Conversation deleted') },
-      onError:   () => { toast.error('Could not delete conversation.') },
+      onSuccess: () => {
+        toast.success('Conversation deleted')
+        if (wasActive) onDeleted?.(conv.id)
+      },
+      onError: () => { toast.error('Could not delete conversation.') },
     })
   }
+
+  const onDelete = (e: React.MouseEvent, conv: Conversation) => {
+    e.stopPropagation()
+    // When confirmation is enabled, queue the dialog; otherwise delete immediately.
+    if (confirmDeleteEnabled()) setPendingDelete(conv)
+    else doDelete(conv)
+  }
+
+  // Warn that an in-flight generation will be lost only when deleting the active,
+  // currently-generating conversation.
+  const pendingIsActiveGenerating = !!pendingDelete && pendingDelete.id === activeId && !!generating
 
   if (collapsed) {
     return (
@@ -113,6 +153,34 @@ export function ConversationSidebar({
           <ConvItem key={conv.id} conv={conv} active={conv.id === activeId} onSelect={onSelect} onDelete={onDelete} />
         ))}
       </div>
+
+      {/* Delete confirmation (only shown when the "confirm before delete" setting is on). */}
+      <AlertDialog open={!!pendingDelete} onOpenChange={(open) => { if (!open) setPendingDelete(null) }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete this conversation?</AlertDialogTitle>
+            <AlertDialogDescription>
+              {pendingDelete ? (
+                <>
+                  <span className="font-medium text-ink">{pendingDelete.title || 'Untitled conversation'}</span>{' '}
+                  will be permanently deleted. This can’t be undone.
+                  {pendingIsActiveGenerating && (
+                    <> A response is still generating in this conversation — it will be stopped and lost.</>
+                  )}
+                </>
+              ) : null}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => { if (pendingDelete) doDelete(pendingDelete); setPendingDelete(null) }}
+            >
+              Delete
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }

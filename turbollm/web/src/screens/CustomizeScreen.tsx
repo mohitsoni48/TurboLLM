@@ -554,6 +554,8 @@ function McpSection({ servers, search }: { servers: McpServer[]; search: DaemonS
                     </button>
                   </div>
 
+                  <p className="text-[11px] leading-relaxed text-muted">{entry.desc}</p>
+
                   {entry.id === 'searxng' ? (
                     <div className="flex flex-col gap-1">
                       <label className="text-[12px] text-muted">SearXNG URL</label>

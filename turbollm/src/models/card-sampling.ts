@@ -92,6 +92,35 @@ export function hasAnySampling(s: CardSampling): boolean {
   return s.temp != null || s.topP != null || s.topK != null || s.minP != null
 }
 
+/** Parse a repo's structured `params`/`generation_config.json` sidecar (see
+ *  {@link HfClient.fetchGenerationParams}) — a flat JSON object using the same key names as
+ *  the LLM-fallback schema (`temperature`/`top_p`/`top_k`/`min_p`). Exact values, no regex
+ *  guessing, so this is tried before the card heuristic. Returns {} on anything unparseable
+ *  or when `raw` is empty — never throws. */
+export function parseGenerationParams(raw: string): CardSampling {
+  if (!raw) return {}
+  let obj: Record<string, unknown>
+  try {
+    obj = JSON.parse(raw) as Record<string, unknown>
+  } catch {
+    return {}
+  }
+  if (typeof obj !== 'object' || obj === null) return {}
+  const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null)
+  const out: CardSampling = {}
+  const map: [string, keyof CardSampling][] = [
+    ['temperature', 'temp'],
+    ['top_p', 'topP'],
+    ['top_k', 'topK'],
+    ['min_p', 'minP'],
+  ]
+  for (const [jsonKey, field] of map) {
+    const v = num(obj[jsonKey])
+    if (v !== null) out[field] = v
+  }
+  return clampCardSampling(out)
+}
+
 /** Pick the most relevant ~`maxLen`-char slice of a (possibly long) card for the LLM
  *  fallback. A card under the limit is returned whole; otherwise we center the window on
  *  the first sampling cue (temperature/top_k/top_p/min_p or a "recommended settings" /
