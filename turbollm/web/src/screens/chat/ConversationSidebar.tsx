@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState } from 'react'
-import { ChevronLeft, ChevronRight, Download, MessageSquarePlus, Pencil, Search, Trash2 } from 'lucide-react'
-import type { Conversation } from '../../lib/chat-types'
-import { useConversationMutations, useConversations } from '../../lib/chat-queries'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { ChevronDown, ChevronLeft, ChevronRight, Download, Folder as FolderIcon, FolderInput, FolderPlus, MessageSquarePlus, MoreHorizontal, Pencil, Search, Trash2 } from 'lucide-react'
+import type { Conversation, Folder } from '../../lib/chat-types'
+import { useConversationMutations, useConversations, useFolders } from '../../lib/chat-queries'
 import { Button } from '../../components/ui/button'
 import { Input } from '../../components/ui/input'
 import { toast } from '../../components/ui/sonner'
@@ -15,6 +15,14 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '../../components/ui/alert-dialog'
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../../components/ui/collapsible'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '../../components/ui/dropdown-menu'
 
 /** localStorage key for the client-only "confirm before deleting a conversation"
  *  preference (mirrors SettingsScreen). Default ON when unset. */
@@ -56,10 +64,41 @@ export function ConversationSidebar({
   const [debouncedQ, setDebouncedQ] = useState('')
   // Conversation queued for a confirmation dialog (null = dialog closed).
   const [pendingDelete, setPendingDelete] = useState<Conversation | null>(null)
+  // Folder queued for a delete-confirmation dialog (null = dialog closed).
+  const [pendingFolderDelete, setPendingFolderDelete] = useState<Folder | null>(null)
+  // Which folder sections are open. Not persisted — resets on remount.
+  const [openFolders, setOpenFolders] = useState<Set<string>>(new Set())
+  // True while the inline "new folder" name input is showing.
+  const [addingFolder, setAddingFolder] = useState(false)
+  const [newFolderName, setNewFolderName] = useState('')
   const searchRef = useRef<HTMLInputElement>(null)
   const mut = useConversationMutations()
   const convsQ = useConversations(debouncedQ || undefined)
   const convs = convsQ.data?.conversations ?? []
+  const foldersQ = useFolders()
+  const folders = foldersQ.data?.folders ?? []
+
+  const searching = !!debouncedQ
+
+  // Bucket conversations by folderId (only used when not searching). Conversations
+  // whose folderId is null/undefined OR points at a folder that no longer exists fall
+  // into the "ungrouped" bucket.
+  const { byFolder, ungrouped } = useMemo(() => {
+    const known = new Set(folders.map((f) => f.id))
+    const byFolder = new Map<string, Conversation[]>()
+    const ungrouped: Conversation[] = []
+    for (const conv of convs) {
+      const fid = conv.folderId
+      if (fid && known.has(fid)) {
+        const arr = byFolder.get(fid) ?? []
+        arr.push(conv)
+        byFolder.set(fid, arr)
+      } else {
+        ungrouped.push(conv)
+      }
+    }
+    return { byFolder, ungrouped }
+  }, [convs, folders])
 
   useEffect(() => {
     const t = setTimeout(() => setDebouncedQ(q), 200)
@@ -72,6 +111,15 @@ export function ConversationSidebar({
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
   }, [])
+
+  const toggleFolder = (id: string) => {
+    setOpenFolders((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
 
   // Actually delete a conversation. If it was the active one, tell the parent so
   // it can close/clear the now-dangling reference.
@@ -91,6 +139,31 @@ export function ConversationSidebar({
     // When confirmation is enabled, queue the dialog; otherwise delete immediately.
     if (confirmDeleteEnabled()) setPendingDelete(conv)
     else doDelete(conv)
+  }
+
+  const onMove = (conv: Conversation, folderId: string | null) => {
+    mut.moveToFolder.mutate(
+      { convId: conv.id, folderId },
+      { onError: () => { toast.error('Could not move conversation.') } },
+    )
+  }
+
+  const commitNewFolder = () => {
+    const name = newFolderName.trim()
+    setAddingFolder(false)
+    setNewFolderName('')
+    if (!name) return
+    mut.createFolder.mutate(name, {
+      onSuccess: (folder) => { setOpenFolders((prev) => new Set(prev).add(folder.id)) },
+      onError: () => { toast.error('Could not create folder.') },
+    })
+  }
+
+  const doDeleteFolder = (folder: Folder) => {
+    mut.deleteFolder.mutate(folder.id, {
+      onSuccess: () => { toast.success('Folder deleted') },
+      onError: () => { toast.error('Could not delete folder.') },
+    })
   }
 
   // Warn that an in-flight generation will be lost only when deleting the active,
@@ -138,6 +211,9 @@ export function ConversationSidebar({
         <Button size="icon" variant="ghost" onClick={onNew} title="New chat (Ctrl+N)" className="h-7 w-7 shrink-0">
           <MessageSquarePlus size={15} />
         </Button>
+        <Button size="icon" variant="ghost" onClick={() => { setAddingFolder(true); setNewFolderName('') }} title="New folder" className="h-7 w-7 shrink-0">
+          <FolderPlus size={15} />
+        </Button>
         {onImport && (
           <Button size="icon" variant="ghost" onClick={onImport} title="Import chat (.turbollm-chat.json or OpenAI JSON)" className="h-7 w-7 shrink-0">
             <Download size={15} />
@@ -145,13 +221,65 @@ export function ConversationSidebar({
         )}
       </div>
 
+      {/* Inline "new folder" name input — mirrors the conversation-rename inline UX. */}
+      {addingFolder && (
+        <div className="flex items-center gap-2 px-3 pb-2">
+          <FolderIcon size={13} className="shrink-0 text-faint" />
+          <input
+            autoFocus
+            className="w-full bg-transparent text-[13px] font-medium text-ink outline-none placeholder:text-faint"
+            value={newFolderName}
+            placeholder="Folder name…"
+            onChange={(e) => setNewFolderName(e.target.value)}
+            onBlur={commitNewFolder}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') commitNewFolder()
+              if (e.key === 'Escape') { setAddingFolder(false); setNewFolderName('') }
+            }}
+          />
+        </div>
+      )}
+
       <div className="flex-1 overflow-y-auto px-1 pb-2">
-        {convs.length === 0 && (
-          <p className="px-3 py-4 text-[12px] text-faint">{q ? 'No results.' : 'No conversations yet.'}</p>
+        {/* When searching, keep the flat, ungrouped list exactly as before. */}
+        {searching ? (
+          <>
+            {convs.length === 0 && (
+              <p className="px-3 py-4 text-[12px] text-faint">No results.</p>
+            )}
+            {convs.map((conv) => (
+              <ConvItem key={conv.id} conv={conv} active={conv.id === activeId} folders={folders} onSelect={onSelect} onDelete={onDelete} onMove={onMove} />
+            ))}
+          </>
+        ) : (
+          <>
+            {convs.length === 0 && folders.length === 0 && (
+              <p className="px-3 py-4 text-[12px] text-faint">No conversations yet.</p>
+            )}
+
+            {/* One collapsible section per folder. */}
+            {folders.map((folder) => (
+              <FolderSection
+                key={folder.id}
+                folder={folder}
+                items={byFolder.get(folder.id) ?? []}
+                open={openFolders.has(folder.id)}
+                onToggle={() => toggleFolder(folder.id)}
+                onRequestDelete={() => setPendingFolderDelete(folder)}
+                activeId={activeId}
+                folders={folders}
+                onSelect={onSelect}
+                onDelete={onDelete}
+                onMove={onMove}
+              />
+            ))}
+
+            {/* Ungrouped conversations, rendered exactly as before. */}
+            {ungrouped.map((conv) => (
+              <ConvItem key={conv.id} conv={conv} active={conv.id === activeId} folders={folders} onSelect={onSelect} onDelete={onDelete} onMove={onMove} />
+            ))}
+          </>
         )}
-        {convs.map((conv) => (
-          <ConvItem key={conv.id} conv={conv} active={conv.id === activeId} onSelect={onSelect} onDelete={onDelete} />
-        ))}
       </div>
 
       {/* Delete confirmation (only shown when the "confirm before delete" setting is on). */}
@@ -181,20 +309,152 @@ export function ConversationSidebar({
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      {/* Folder-delete confirmation. Folders can contain conversations, so always confirm. */}
+      <AlertDialog open={!!pendingFolderDelete} onOpenChange={(open) => { if (!open) setPendingFolderDelete(null) }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete this folder?</AlertDialogTitle>
+            <AlertDialogDescription>
+              {pendingFolderDelete ? (
+                <>
+                  <span className="font-medium text-ink">{pendingFolderDelete.name}</span>{' '}
+                  will be deleted. Conversations inside it won’t be deleted — they’ll move back to
+                  Uncategorized.
+                </>
+              ) : null}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => { if (pendingFolderDelete) doDeleteFolder(pendingFolderDelete); setPendingFolderDelete(null) }}
+            >
+              Delete folder
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
+  )
+}
+
+/** A single collapsible folder section: header (chevron + name + count + actions
+ *  dropdown) plus its member conversations. Rename is done inline, mirroring ConvItem's
+ *  double-click / Enter-to-commit UX. Delete is confirmed by the parent via AlertDialog. */
+function FolderSection({
+  folder,
+  items,
+  open,
+  onToggle,
+  onRequestDelete,
+  activeId,
+  folders,
+  onSelect,
+  onDelete,
+  onMove,
+}: {
+  folder: Folder
+  items: Conversation[]
+  open: boolean
+  onToggle: () => void
+  onRequestDelete: () => void
+  activeId: string | null
+  folders: Folder[]
+  onSelect: (id: string) => void
+  onDelete: (e: React.MouseEvent, conv: Conversation) => void
+  onMove: (conv: Conversation, folderId: string | null) => void
+}) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(folder.name)
+  const mut = useConversationMutations()
+
+  const commitRename = () => {
+    setEditing(false)
+    const name = draft.trim()
+    if (!name || name === folder.name) { setDraft(folder.name); return }
+    mut.renameFolder.mutate(
+      { id: folder.id, name },
+      { onError: () => { setDraft(folder.name); toast.error('Could not rename folder.') } },
+    )
+  }
+
+  return (
+    <Collapsible open={open} onOpenChange={onToggle}>
+      <div className="group/folder relative flex items-center rounded-md pr-1">
+        {editing ? (
+          <div className="flex flex-1 items-center gap-1.5 px-2 py-1.5">
+            <FolderIcon size={13} className="shrink-0 text-faint" />
+            <input
+              autoFocus
+              className="w-full bg-transparent text-[12px] font-semibold text-ink outline-none"
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onBlur={commitRename}
+              onKeyDown={(e) => { if (e.key === 'Enter') commitRename(); if (e.key === 'Escape') { setDraft(folder.name); setEditing(false) } }}
+              onClick={(e) => e.stopPropagation()}
+            />
+          </div>
+        ) : (
+          <CollapsibleTrigger className="flex flex-1 items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-[12px] font-semibold text-ink transition-colors hover:bg-[color-mix(in_srgb,var(--accent)_8%,transparent)]">
+            <ChevronDown size={13} className={`shrink-0 text-faint transition-transform ${open ? '' : '-rotate-90'}`} />
+            <FolderIcon size={13} className="shrink-0 text-faint" />
+            <span className="truncate" onDoubleClick={(e) => { e.stopPropagation(); setDraft(folder.name); setEditing(true) }}>{folder.name}</span>
+            <span className="ml-auto pl-1 text-[11px] font-normal text-faint">{items.length}</span>
+          </CollapsibleTrigger>
+        )}
+        {!editing && (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                onClick={(e) => e.stopPropagation()}
+                className="rounded p-1 text-faint opacity-0 transition-opacity hover:text-ink group-hover/folder:opacity-100 data-[state=open]:opacity-100"
+                title="Folder actions"
+              >
+                <MoreHorizontal size={13} />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem onSelect={() => { setDraft(folder.name); setEditing(true) }}>
+                <Pencil size={13} /> Rename
+              </DropdownMenuItem>
+              <DropdownMenuItem destructive onSelect={onRequestDelete}>
+                <Trash2 size={13} /> Delete folder
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
+      </div>
+      <CollapsibleContent>
+        <div className="pl-2">
+          {items.length === 0 ? (
+            <p className="px-3 py-1.5 text-[11px] text-faint">Empty folder</p>
+          ) : (
+            items.map((conv) => (
+              <ConvItem key={conv.id} conv={conv} active={conv.id === activeId} folders={folders} onSelect={onSelect} onDelete={onDelete} onMove={onMove} />
+            ))
+          )}
+        </div>
+      </CollapsibleContent>
+    </Collapsible>
   )
 }
 
 function ConvItem({
   conv,
   active,
+  folders,
   onSelect,
   onDelete,
+  onMove,
 }: {
   conv: Conversation
   active: boolean
+  folders: Folder[]
   onSelect: (id: string) => void
   onDelete: (e: React.MouseEvent, conv: Conversation) => void
+  onMove: (conv: Conversation, folderId: string | null) => void
 }) {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(conv.title)
@@ -238,6 +498,40 @@ function ConvItem({
       <span className="text-[11px] text-faint">{relTime(conv.updatedAt)}</span>
       {!editing && (
         <div className="absolute right-1.5 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                onClick={(e) => e.stopPropagation()}
+                className="rounded p-1 text-faint transition-colors hover:text-ink data-[state=open]:text-ink"
+                title="Move to folder"
+              >
+                <FolderInput size={13} />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              {folders.length === 0 && (
+                <DropdownMenuItem disabled>No folders yet</DropdownMenuItem>
+              )}
+              {folders.map((f) => (
+                <DropdownMenuItem
+                  key={f.id}
+                  disabled={f.id === conv.folderId}
+                  onSelect={() => onMove(conv, f.id)}
+                >
+                  <FolderIcon size={13} /> {f.name}
+                </DropdownMenuItem>
+              ))}
+              {conv.folderId && (
+                <>
+                  {folders.length > 0 && <DropdownMenuSeparator />}
+                  <DropdownMenuItem onSelect={() => onMove(conv, null)}>
+                    Uncategorized
+                  </DropdownMenuItem>
+                </>
+              )}
+            </DropdownMenuContent>
+          </DropdownMenu>
           <button
             type="button"
             onClick={(e) => { e.stopPropagation(); setDraft(conv.title); setEditing(true) }}

@@ -19,9 +19,21 @@ export interface Conversation {
   toolPolicy?: string
   /** Conversation kind: 'chat' (default user-facing) or 'agent' (background agent run). */
   kind: 'chat' | 'agent'
+  /** Folder this conversation is filed under (v10). NULL/undefined = uncategorized. */
+  folderId?: string | null
   createdAt: string
   updatedAt: string
   messages?: Message[]
+}
+
+/** A chat folder for grouping conversations in the sidebar (v10 migration). Flat —
+ *  no nesting. Conversations reference it via the nullable conversations.folder_id. */
+export interface Folder {
+  id: string
+  name: string
+  sortOrder: number
+  createdAt: string
+  updatedAt: string
 }
 
 /** A background agent run record (v8 migration). */
@@ -108,8 +120,9 @@ export interface Message {
   createdAt: string
 }
 
-interface ConvRow { id: string; title: string; system_prompt: string; model_key: string; sampling: string; expert_mode: number; tool_policy: string | null; kind: string | null; created_at: string; updated_at: string }
+interface ConvRow { id: string; title: string; system_prompt: string; model_key: string; sampling: string; expert_mode: number; tool_policy: string | null; kind: string | null; folder_id: string | null; created_at: string; updated_at: string }
 interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null }
+interface FolderRow { id: string; name: string; sort_order: number; created_at: string; updated_at: string }
 interface MsgRow  { id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string; reasoning: string; attachments: string; text_attachments: string | null; tool_calls: string | null; stats: string; model_key: string | null; research_meta: string | null; created_at: string }
 
 // node:sqlite named-param objects need an explicit cast to Record<string, SQLInputValue>
@@ -118,7 +131,11 @@ type P = Record<string, SQLInputValue>
 function safeJson(s: string): unknown { try { return JSON.parse(s) } catch { return {} } }
 
 function rowToConv(r: ConvRow): Conversation {
-  return { id: r.id, title: r.title, systemPrompt: r.system_prompt, modelKey: r.model_key, sampling: safeJson(r.sampling) as Record<string, unknown>, expertMode: r.expert_mode === 1, toolPolicy: r.tool_policy ?? undefined, kind: (r.kind === 'agent' ? 'agent' : 'chat'), createdAt: r.created_at, updatedAt: r.updated_at }
+  return { id: r.id, title: r.title, systemPrompt: r.system_prompt, modelKey: r.model_key, sampling: safeJson(r.sampling) as Record<string, unknown>, expertMode: r.expert_mode === 1, toolPolicy: r.tool_policy ?? undefined, kind: (r.kind === 'agent' ? 'agent' : 'chat'), folderId: r.folder_id ?? null, createdAt: r.created_at, updatedAt: r.updated_at }
+}
+
+function rowToFolder(r: FolderRow): Folder {
+  return { id: r.id, name: r.name, sortOrder: r.sort_order, createdAt: r.created_at, updatedAt: r.updated_at }
 }
 
 function rowToAgentRun(r: AgentRunRow): AgentRun {
@@ -252,6 +269,23 @@ export class ConversationStore {
         PRAGMA user_version = 9;
       `)
     }
+    // v10: chat folders. Flat (no nesting) — conversations reference a folder via the
+    // nullable folder_id column. Deleting a folder UNASSIGNS its members (folder_id set
+    // to NULL in app code — see deleteFolder), it never cascade-deletes conversations,
+    // so no inline REFERENCES/ON DELETE constraint is added here. sort_order is reserved
+    // for a future drag-to-reorder; folders currently list in insertion order.
+    if (v < 10) {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS folders (
+          id TEXT PRIMARY KEY, name TEXT NOT NULL,
+          sort_order INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        ALTER TABLE conversations ADD COLUMN folder_id TEXT;
+        CREATE INDEX IF NOT EXISTS idx_conversations_folder ON conversations(folder_id);
+        PRAGMA user_version = 10;
+      `)
+    }
   }
 
   listConversations(q?: string, kind: 'chat' | 'agent' | 'all' = 'all'): Conversation[] {
@@ -272,11 +306,11 @@ export class ConversationStore {
     return (this.db.prepare(`SELECT * FROM conversations ORDER BY updated_at DESC LIMIT 200`).all() as unknown as ConvRow[]).map(rowToConv)
   }
 
-  createConversation(partial?: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'modelKey' | 'sampling' | 'expertMode' | 'toolPolicy' | 'kind'>>): Conversation {
+  createConversation(partial?: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'modelKey' | 'sampling' | 'expertMode' | 'toolPolicy' | 'kind' | 'folderId'>>): Conversation {
     const now = new Date().toISOString()
     const id = randomUUID()
-    this.db.prepare(`INSERT INTO conversations (id,title,system_prompt,model_key,sampling,expert_mode,tool_policy,kind,created_at,updated_at) VALUES ($id,$title,$sp,$mk,$samp,$expert,$tp,$kind,$now,$now)`)
-      .run({ $id: id, $title: partial?.title ?? 'New chat', $sp: partial?.systemPrompt ?? '', $mk: partial?.modelKey ?? '', $samp: JSON.stringify(partial?.sampling ?? {}), $expert: partial?.expertMode ? 1 : 0, $tp: partial?.toolPolicy ?? null, $kind: partial?.kind ?? 'chat', $now: now } as P)
+    this.db.prepare(`INSERT INTO conversations (id,title,system_prompt,model_key,sampling,expert_mode,tool_policy,kind,folder_id,created_at,updated_at) VALUES ($id,$title,$sp,$mk,$samp,$expert,$tp,$kind,$fid,$now,$now)`)
+      .run({ $id: id, $title: partial?.title ?? 'New chat', $sp: partial?.systemPrompt ?? '', $mk: partial?.modelKey ?? '', $samp: JSON.stringify(partial?.sampling ?? {}), $expert: partial?.expertMode ? 1 : 0, $tp: partial?.toolPolicy ?? null, $kind: partial?.kind ?? 'chat', $fid: partial?.folderId ?? null, $now: now } as P)
     return this.getConversation(id)!
   }
 
@@ -378,6 +412,51 @@ export class ConversationStore {
   getLastMessage(convId: string): Message | null {
     const row = this.db.prepare(`SELECT * FROM messages WHERE conv_id = $id ORDER BY seq DESC LIMIT 1`).get({ $id: convId } as P) as unknown as MsgRow | undefined
     return row ? rowToMsg(row) : null
+  }
+
+  // ── Folder methods (v10 migration) ────────────────────────────────────────
+
+  /** All folders in insertion order (sort_order asc, then created_at). */
+  listFolders(): Folder[] {
+    return (this.db.prepare(`SELECT * FROM folders ORDER BY sort_order ASC, created_at ASC`).all() as unknown as FolderRow[]).map(rowToFolder)
+  }
+
+  getFolder(id: string): Folder | null {
+    const row = this.db.prepare(`SELECT * FROM folders WHERE id = $id`).get({ $id: id } as P) as unknown as FolderRow | undefined
+    return row ? rowToFolder(row) : null
+  }
+
+  createFolder(name: string): Folder {
+    const id = randomUUID()
+    const now = new Date().toISOString()
+    this.db.prepare(`INSERT INTO folders (id,name,sort_order,created_at,updated_at) VALUES ($id,$name,0,$now,$now)`)
+      .run({ $id: id, $name: name, $now: now } as P)
+    return this.getFolder(id)!
+  }
+
+  renameFolder(id: string, name: string): boolean {
+    const now = new Date().toISOString()
+    return ((this.db.prepare(`UPDATE folders SET name = $name, updated_at = $now WHERE id = $id`).run({ $id: id, $name: name, $now: now } as P) as unknown) as Changes).changes > 0
+  }
+
+  /** Delete a folder. Member conversations are UNASSIGNED (folder_id → NULL), never
+   *  cascade-deleted. Returns false if the folder did not exist. */
+  deleteFolder(id: string): boolean {
+    // Unassign members explicitly — do not rely on any SQLite ON DELETE behavior
+    // (node:sqlite does not reliably enforce inline FK constraints added via ALTER TABLE).
+    this.db.prepare(`UPDATE conversations SET folder_id = NULL WHERE folder_id = $id`).run({ $id: id } as P)
+    return ((this.db.prepare(`DELETE FROM folders WHERE id = $id`).run({ $id: id } as P) as unknown) as Changes).changes > 0
+  }
+
+  /** Move a conversation into a folder (or out of any folder when folderId is null).
+   *  When folderId is non-null the folder must exist. Returns:
+   *   - { ok: true }             on success,
+   *   - { ok: false, reason }    when the conversation or the target folder is missing. */
+  moveConversationToFolder(convId: string, folderId: string | null): { ok: true } | { ok: false; reason: 'conversation_not_found' | 'folder_not_found' } {
+    if (folderId !== null && !this.getFolder(folderId)) return { ok: false, reason: 'folder_not_found' }
+    const now = new Date().toISOString()
+    const changed = ((this.db.prepare(`UPDATE conversations SET folder_id = $fid, updated_at = $now WHERE id = $id`).run({ $id: convId, $fid: folderId, $now: now } as P) as unknown) as Changes).changes > 0
+    return changed ? { ok: true } : { ok: false, reason: 'conversation_not_found' }
   }
 
   // ── Agent run methods (v8 migration) ──────────────────────────────────────

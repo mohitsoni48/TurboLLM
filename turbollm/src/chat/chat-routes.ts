@@ -33,6 +33,38 @@ async function body<T>(c: Context): Promise<T> { try { return await c.req.json()
 export function registerChatRoutes(app: Hono, d: Deps): void {
   const { db } = d
 
+  // ── folders CRUD (v10) ─────────────────────────────────────────────────────
+  // Flat folders for grouping conversations in the sidebar. Grouping itself is done
+  // client-side; these endpoints only manage folder records + membership moves.
+
+  app.get('/api/v1/folders', (c) => {
+    return c.json({ folders: db.listFolders() })
+  })
+
+  app.post('/api/v1/folders', async (c) => {
+    const b = await body<{ name?: string }>(c)
+    const name = (b.name ?? '').trim()
+    if (!name) return err(c, 400, 'invalid_input', 'Folder name required.')
+    return c.json(db.createFolder(name), 201)
+  })
+
+  app.patch('/api/v1/folders/:id', async (c) => {
+    const b = await body<{ name?: string }>(c)
+    const name = (b.name ?? '').trim()
+    if (!name) return err(c, 400, 'invalid_input', 'Folder name required.')
+    const ok = db.renameFolder(c.req.param('id'), name)
+    if (!ok) return err(c, 404, 'not_found', 'Folder not found.')
+    return c.json(db.getFolder(c.req.param('id'))!)
+  })
+
+  app.delete('/api/v1/folders/:id', (c) => {
+    // Deleting a folder unassigns its member conversations (folder_id → NULL); it never
+    // deletes the conversations themselves.
+    const ok = db.deleteFolder(c.req.param('id'))
+    if (!ok) return err(c, 404, 'not_found', 'Folder not found.')
+    return c.json({ ok: true })
+  })
+
   // ── conversations CRUD ─────────────────────────────────────────────────────
 
   app.get('/api/v1/conversations', (c) => {
@@ -63,6 +95,20 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const ok = db.deleteConversation(c.req.param('id'))
     if (!ok) return err(c, 404, 'not_found', 'Conversation not found.')
     return c.json({ ok: true })
+  })
+
+  // Dedicated move-to-folder route (v10). Kept separate from the generic conversation
+  // PATCH so that route's patch surface (title/systemPrompt/sampling) stays unchanged.
+  // Body: { folderId: string | null } — null moves the conversation out of any folder.
+  app.patch('/api/v1/conversations/:id/folder', async (c) => {
+    const b = await body<{ folderId?: string | null }>(c)
+    const folderId = b.folderId ?? null
+    const res = db.moveConversationToFolder(c.req.param('id'), folderId)
+    if (!res.ok) {
+      if (res.reason === 'folder_not_found') return err(c, 404, 'not_found', 'Folder not found.')
+      return err(c, 404, 'not_found', 'Conversation not found.')
+    }
+    return c.json(db.getConversation(c.req.param('id'))!)
   })
 
   // ── streaming send (spec 07 §2) ────────────────────────────────────────────
