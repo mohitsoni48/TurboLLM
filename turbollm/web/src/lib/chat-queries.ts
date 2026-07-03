@@ -1,19 +1,30 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  createConversation, deleteConversation, deleteMessage, editMessage,
-  getConversation, listConversations, regenerate, stopGeneration, updateConversation,
+  createConversation, createFolder, deleteConversation, deleteFolder, deleteMessage, editMessage,
+  getConversation, listConversations, listFolders, moveConversationToFolder, regenerate,
+  renameFolder, stopGeneration, updateConversation,
 } from './chat-api'
 import type { Conversation } from './chat-types'
 
 export const chatKeys = {
   list: (q?: string) => ['conversations', q ?? ''] as const,
   detail: (id: string | null) => ['conversation', id] as const,
+  folders: ['folders'] as const,
 }
 
 export function useConversations(q?: string) {
   return useQuery({
     queryKey: chatKeys.list(q),
     queryFn: () => listConversations(q),
+    staleTime: 0,
+    retry: false,
+  })
+}
+
+export function useFolders() {
+  return useQuery({
+    queryKey: chatKeys.folders,
+    queryFn: () => listFolders(),
     staleTime: 0,
     retry: false,
   })
@@ -33,6 +44,7 @@ export function useConversationMutations() {
 
   const invalidateList = () => void qc.invalidateQueries({ queryKey: ['conversations'] })
   const invalidateDetail = (id: string) => void qc.invalidateQueries({ queryKey: chatKeys.detail(id) })
+  const invalidateFolders = () => void qc.invalidateQueries({ queryKey: chatKeys.folders })
 
   return {
     create: useMutation({
@@ -61,6 +73,23 @@ update: useMutation({
     regenerate: useMutation({
       mutationFn: (convId: string) => regenerate(convId),
       onSuccess: (_d, convId) => invalidateDetail(convId),
+    }),
+    createFolder: useMutation({
+      mutationFn: (name: string) => createFolder(name),
+      onSuccess: () => { invalidateFolders(); invalidateList() },
+    }),
+    renameFolder: useMutation({
+      mutationFn: (v: { id: string; name: string }) => renameFolder(v.id, v.name),
+      onSuccess: () => { invalidateFolders(); invalidateList() },
+    }),
+    deleteFolder: useMutation({
+      mutationFn: (id: string) => deleteFolder(id),
+      // Deleting a folder unassigns its members, so the conversations list changes too.
+      onSuccess: () => { invalidateFolders(); invalidateList() },
+    }),
+    moveToFolder: useMutation({
+      mutationFn: (v: { convId: string; folderId: string | null }) => moveConversationToFolder(v.convId, v.folderId),
+      onSuccess: (_d, v) => { invalidateFolders(); invalidateList(); invalidateDetail(v.convId) },
     }),
   }
 }

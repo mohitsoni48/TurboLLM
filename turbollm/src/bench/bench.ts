@@ -11,7 +11,7 @@ import { execFile } from 'node:child_process'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import type { BenchResult, ConfigStore } from '../config/config'
+import { setModelProfile, getModelProfile, type BenchResult, type ConfigStore } from '../config/config'
 import type { Manager, StartOpts } from '../engines/manager'
 import type { Registry } from '../engines/registry'
 import type { Engine } from '../config/config'
@@ -168,7 +168,7 @@ export class BenchRunner {
   private logWinner: BenchLogWinner | null = null
   // The finished run's winning candidate, held (not persisted) until the user clicks Save.
   private winning:
-    | { modelKey: string; profile: LoadProfile; cand: BenchCandidate; entry: ModelEntry; sys: SysInfo; engineVersion: string }
+    | { modelKey: string; profile: LoadProfile; cand: BenchCandidate; entry: ModelEntry; sys: SysInfo; engineVersion: string; engineId: string }
     | null = null
 
   constructor(
@@ -207,7 +207,7 @@ export class BenchRunner {
   saveResult(): boolean {
     const w = this.winning
     if (!w) return false
-    const record = this.persistBest(w.modelKey, w.profile, w.cand)
+    const record = this.persistBest(w.modelKey, w.profile, w.cand, w.engineId)
     this.queueTelemetry(record, w.entry, w.sys, this.version, w.engineVersion)
     this.winning = null
     this.state = { ...this.state, result: undefined } // consumed — don't re-show the dialog
@@ -288,7 +288,9 @@ export class BenchRunner {
     this.runLogMeta = { modelKey, startedAt: new Date().toISOString(), sys }
     const active = this.registry.active()
     const caps = active?.capabilities ?? { flags: [], kvTypes: [] }
-    const saved = this.store.snapshot().modelProfiles[modelKey] as Partial<LoadProfile> | undefined
+    // Per-engine profile (issue #35): tune from the profile saved for the active engine
+    // (falling back to the '*' migrated profile), so a re-tune builds on this engine's own basis.
+    const saved = getModelProfile(this.store.snapshot(), modelKey, active?.id ?? '*') as Partial<LoadProfile> | undefined
     const defaults = this.store.snapshot().modelDefaults
     // Honor the user's CURRENT config (the dialog draft, passed as `base`) as the basis for every
     // candidate — ctx, flash-attn, sampling, etc. `base` overrides the saved profile + global
@@ -373,7 +375,7 @@ export class BenchRunner {
           : best.profile
       // Hold the winner instead of auto-saving — the UI shows a Save/Cancel results dialog and
       // persists via POST /bench/save only when the user clicks Save.
-      this.winning = { modelKey, profile, cand: best.cand, entry, sys, engineVersion: active?.version ?? '' }
+      this.winning = { modelKey, profile, cand: best.cand, entry, sys, engineVersion: active?.version ?? '', engineId: active?.id ?? '' }
       this.logWinner = { params: best.cand.params, tps: best.cand.tps ?? 0, prefillTps: best.cand.prefillTps, ttftMs: best.cand.ttftMs ?? 0, vramMb: best.cand.vramMb }
       this.state = {
         running: false,
@@ -1026,7 +1028,7 @@ export class BenchRunner {
 
   /** Save the winning profile as the model's saved profile (tunedBy:'bench') and
    *  persist a benchResults row. Both via the same ConfigStore the route uses. */
-  private persistBest(modelKey: string, profile: LoadProfile, cand: BenchCandidate): BenchResult {
+  private persistBest(modelKey: string, profile: LoadProfile, cand: BenchCandidate, engineId: string): BenchResult {
     const record: BenchResult = {
       modelKey,
       tps: cand.tps ?? 0,
@@ -1037,7 +1039,9 @@ export class BenchRunner {
     }
     const tuned: LoadProfile = { ...profile, tunedBy: 'bench' }
     this.store.update((cfg) => {
-      cfg.modelProfiles[modelKey] = tuned as unknown as Record<string, unknown>
+      // Per-engine profile (issue #35): a tune is only valid for the engine it ran on, so
+      // persist into that engine's slot only. No active engine (engineId '') → '*' fallback.
+      setModelProfile(cfg, modelKey, engineId || '*', tuned)
       cfg.benchResults[modelKey] = record
     })
     return record

@@ -134,11 +134,13 @@ export interface LoadProfile {
   /** llama.cpp --ubatch-size (-ub). Physical micro-batch size for prompt processing. 0 / absent =
    *  engine default (512). Must be ≤ batchSize. Tune alongside batchSize for throughput. */
   uBatchSize?: number
-  /** Speculative-decoding draft window, `draft` mode only (GitHub #35). Max tokens the draft
-   *  model proposes per step (--draft-max). Absent → 16 (the previous hardcoded default). */
+  /** Speculative-decoding draft window (GitHub #35) — applies to every active speculative
+   *  mode (mtp/nextn/draft), not just `draft`. Max tokens the draft head proposes per step
+   *  (--draft-max). Absent → 16 (the previous hardcoded default). */
   draftMax?: number
-  /** Speculative-decoding draft window, `draft` mode only (GitHub #35). Min tokens drafted per
-   *  step before verification (--draft-min). Absent → 1 (the previous hardcoded default). */
+  /** Speculative-decoding draft window (GitHub #35) — applies to every active speculative
+   *  mode (mtp/nextn/draft), not just `draft`. Min tokens drafted per step before
+   *  verification (--draft-min). Absent → 1 (the previous hardcoded default). */
   draftMin?: number
   /** Provenance of a saved profile (spec 05 §3, 09 §1): 'bench' = written by the
    *  auto-tune runner, 'user' = hand-saved. Absent on heuristic/global defaults. */
@@ -381,20 +383,33 @@ export function profileToArgs(p: LoadProfile, m: ModelEntry, caps: Capabilities,
   // Whether the engine accepts a given `--spec-type` value (captured by the probe
   // as `spec-type:<value>`). Empty flags = unprobed → allow (graceful degrade).
   const specAccepts = (v: string) => caps.flags.length === 0 || caps.flags.includes(`spec-type:${v}`)
+  let specActive = false
   if (p.speculative === 'mtp' && p.mtpHeadPath && has('--mtp-head')) {
     if (specType) a.push('--spec-type', 'mtp')
     a.push('--mtp-head', p.mtpHeadPath)
+    specActive = true
   } else if (p.speculative === 'nextn' && specType && has('--model-draft')) {
     // Qwen3 NextN drives the model's OWN built-in head as the draft. The fork
     // names that spec-type `nextn`; mainline llama.cpp names the same mechanism
     // `draft-mtp`. Use whichever the engine accepts — skip if neither.
     const nextnVal = ['nextn', 'draft-mtp'].find((v) => specAccepts(v))
-    if (nextnVal) a.push('--spec-type', nextnVal, '--model-draft', m.path)
+    if (nextnVal) {
+      a.push('--spec-type', nextnVal, '--model-draft', m.path)
+      specActive = true
+    }
   } else if (p.speculative === 'draft' && p.draftModelPath && has('--model-draft')) {
     if (specType) a.push('--spec-type', 'draft')
-    // Draft window overridable per-model (GitHub #35); absent → the previous 16/1 defaults.
-    a.push('--model-draft', p.draftModelPath, '--draft-max', String(p.draftMax ?? 16), '--draft-min', String(p.draftMin ?? 1))
+    a.push('--model-draft', p.draftModelPath)
+    specActive = true
   }
+  // Draft window (GitHub #35): how many tokens the draft head proposes per step before
+  // the main model verifies them, and the minimum before verification kicks in. This is
+  // a property of the speculation mechanism itself (llama.cpp's shared verify loop), not
+  // specific to how the draft is produced — applies to all three modes above, matching
+  // e.g. LM Studio's MTP "max/min draft tokens" controls. Absent -> the previous
+  // hardcoded 16/1 defaults (unchanged behavior for existing profiles).
+  if (specActive && has('--draft-max')) a.push('--draft-max', String(p.draftMax ?? 16))
+  if (specActive && has('--draft-min')) a.push('--draft-min', String(p.draftMin ?? 1))
   // Sampling startup defaults — become the engine's per-request defaults; can still
   // be overridden in the chat request body. Only emitted when non-default to avoid
   // cluttering the startup command. llama-server built-in defaults match these values.

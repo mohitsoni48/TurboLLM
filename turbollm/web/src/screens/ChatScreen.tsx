@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type RefObject } from 'react'
 import { useParams, useSearchParams } from 'react-router-dom'
 import { ArrowDown, Brain, Copy, Download, Paperclip, SendHorizontal, Share2, SlidersHorizontal, Square, UserRound, X } from 'lucide-react'
 import { continueConversation, fetchSysInfo, sendMessage } from '../lib/chat-api'
+import { extractPdfText } from '../lib/pdf-extract'
 import { useConversation, useConversationMutations } from '../lib/chat-queries'
 import { useModelActions, useModels, useStatus } from '../lib/queries'
 import type { ChatSseEvent, LiveToolCall, Message } from '../lib/chat-types'
@@ -21,6 +22,23 @@ import {
   getPersonalization, setConvPersonaId,
   type PersonaId,
 } from '../lib/personas'
+
+// Sidebar width — persisted like DiscoverTab's list/detail split, an in-flow flex-basis
+// (not a CSS var pinned against the app shell, since the sidebar isn't a docked panel).
+const SIDEBAR_WIDTH_KEY = 'tllm-sidebar-w'
+const SIDEBAR_MIN_W = 200
+/** Largest the sidebar may grow: always leave the thread at least 480px. */
+function sidebarMaxW(): number {
+  return Math.max(SIDEBAR_MIN_W, Math.min(480, window.innerWidth - 480))
+}
+function readSavedSidebarWidth(): number {
+  try {
+    const n = parseInt(localStorage.getItem(SIDEBAR_WIDTH_KEY) ?? '', 10)
+    return Number.isFinite(n) ? n : 224 // 224px matches the prior fixed w-56
+  } catch {
+    return 224
+  }
+}
 
 // Streaming state
 interface LiveState {
@@ -50,6 +68,8 @@ export function ChatScreen() {
   const [settingsKey, setSettingsKey] = useState<string | null>(null)
   const [showScrollBtn, setShowScrollBtn] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(true)
+  const sidebarRef = useRef<HTMLDivElement>(null)
+  const [sidebarWidth, setSidebarWidth] = useState(() => Math.min(Math.max(readSavedSidebarWidth(), SIDEBAR_MIN_W), sidebarMaxW()))
   const [attachments, setAttachments] = useState<{ file: File; dataUrl: string }[]>([])
   // Share menu state
   const [shareMenuOpen, setShareMenuOpen] = useState(false)
@@ -307,6 +327,12 @@ export function ChatScreen() {
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files ?? [])
     const loaded = await Promise.all(files.map(async (file) => {
+      const isPdf = file.type === 'application/pdf' || /\.pdf$/i.test(file.name)
+      if (isPdf) {
+        // PDFs are binary — extract real text client-side instead of reading raw bytes as text.
+        const text = await extractPdfText(file)
+        return { file, dataUrl: text }
+      }
       const dataUrl = await new Promise<string>((res) => {
         const r = new FileReader()
         r.onload = () => res(r.result as string)
@@ -385,8 +411,11 @@ export function ChatScreen() {
     if ((!text && attachments.length === 0) || live) return
     if (engineState !== 'running' || !model) { toast.error('Load a model first.'); return }
 
-    const imageAttachments = attachments.filter((a) => a.dataUrl.startsWith('data:image/'))
-    const textAttachments = attachments.filter((a) => !a.dataUrl.startsWith('data:image/'))
+    // Discriminate by file.type (authoritative, same as the preview thumbnail below) rather
+    // than sniffing the extracted dataUrl content — a text/PDF attachment whose content
+    // happens to start with "data:image/" would otherwise get mis-sent as an image.
+    const imageAttachments = attachments.filter((a) => a.file.type.startsWith('image/'))
+    const textAttachments = attachments.filter((a) => !a.file.type.startsWith('image/'))
     const images = imageAttachments.map((a) => a.dataUrl)
     const docContext = textAttachments.map((a) => `[Attached: ${a.file.name}]\n${a.dataUrl}`).join('\n\n')
 
@@ -477,8 +506,15 @@ export function ChatScreen() {
 
   return (
     <div className="flex h-full overflow-hidden">
-      {/* Sidebar (collapsible) */}
-      <div className={sidebarOpen ? 'w-56 shrink-0' : 'w-10 shrink-0'} style={{ transition: 'width 0.15s' }}>
+      {/* Sidebar (collapsible, drag-resizable when open). The collapse/expand width
+          transition lives in the `tllm-chat-sidebar` CSS class (index.css), not inline,
+          so it can be disabled globally while dragging (html.tllm-resizing) without
+          fighting the resize handle's own per-pixel style mutation. */}
+      <div
+        ref={sidebarRef}
+        className={sidebarOpen ? 'tllm-chat-sidebar shrink-0' : 'tllm-chat-sidebar w-10 shrink-0'}
+        style={sidebarOpen ? { width: sidebarWidth } : undefined}
+      >
         <ConversationSidebar
           activeId={activeId}
           onSelect={handleSelect}
@@ -490,6 +526,7 @@ export function ChatScreen() {
           onDeleted={handleActiveDeleted}
         />
       </div>
+      {sidebarOpen && <SidebarResizeHandle sidebarRef={sidebarRef} onCommit={setSidebarWidth} />}
 
       {/* Thread */}
       <div className="relative flex min-w-0 flex-1 flex-col">
@@ -750,7 +787,7 @@ export function ChatScreen() {
                   ref={fileInputRef}
                   type="file"
                   multiple
-                  accept="image/*,.pdf,.txt,.md,.csv"
+                  accept="image/*,.pdf,.txt,.md,.csv,.json,.yaml,.yml,.log,.ts,.tsx,.js,.jsx,.py,.go,.rs,.java,.c,.cpp,.h,.rb,.php,.sh,.sql,.xml,.toml,.ini"
                   hidden
                   onChange={handleFileSelect}
                 />
@@ -790,6 +827,58 @@ export function ChatScreen() {
 
       <ModelDetailDialog modelKey={settingsKey} onClose={() => setSettingsKey(null)} />
     </div>
+  )
+}
+
+// ── Sidebar resize handle ────────────────────────────────────────────────────
+
+/** Thin drag handle between the sidebar and the thread; resizes the sidebar column
+ *  live via direct style mutation (same pattern as DiscoverTab's SplitResizeHandle —
+ *  avoids a React re-render per pointer-move pixel), then commits + persists the
+ *  final width on release. */
+function SidebarResizeHandle({
+  sidebarRef,
+  onCommit,
+}: {
+  sidebarRef: RefObject<HTMLDivElement | null>
+  onCommit: (w: number) => void
+}) {
+  const onPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return
+    e.preventDefault()
+    const startX = e.clientX
+    const startW = sidebarRef.current?.getBoundingClientRect().width ?? readSavedSidebarWidth()
+    document.documentElement.classList.add('tllm-resizing')
+    const onMove = (ev: PointerEvent) => {
+      const w = Math.min(Math.max(startW + (ev.clientX - startX), SIDEBAR_MIN_W), sidebarMaxW())
+      if (sidebarRef.current) sidebarRef.current.style.width = `${Math.round(w)}px`
+    }
+    const onUp = () => {
+      document.documentElement.classList.remove('tllm-resizing')
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      const w = sidebarRef.current?.getBoundingClientRect().width
+      if (w) {
+        const rounded = Math.round(w)
+        onCommit(rounded)
+        try {
+          localStorage.setItem(SIDEBAR_WIDTH_KEY, String(rounded))
+        } catch {
+          /* ignore quota / disabled storage */
+        }
+      }
+    }
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+  }
+  return (
+    <div
+      className="tllm-split-resizer"
+      onPointerDown={onPointerDown}
+      role="separator"
+      aria-orientation="vertical"
+      aria-label="Resize conversation sidebar"
+    />
   )
 }
 

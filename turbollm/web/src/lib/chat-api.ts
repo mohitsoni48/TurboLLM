@@ -1,4 +1,4 @@
-import type { Conversation, Message, ChatSseEvent } from './chat-types'
+import type { Conversation, Folder, Message, ChatSseEvent } from './chat-types'
 import { ApiError, authHeaders } from './api'
 
 async function req<T>(path: string, init?: RequestInit & { json?: unknown }): Promise<T> {
@@ -43,6 +43,29 @@ export function deleteConversation(id: string): Promise<{ ok: true }> {
 
 export function stopGeneration(conversationId: string): Promise<{ ok: true }> {
   return req('/api/v1/chat/stop', { method: 'POST', json: { conversationId } })
+}
+
+// ── folders (v10) ─────────────────────────────────────────────────────────────
+
+export function listFolders(): Promise<{ folders: Folder[] }> {
+  return req('/api/v1/folders')
+}
+
+export function createFolder(name: string): Promise<Folder> {
+  return req('/api/v1/folders', { method: 'POST', json: { name } })
+}
+
+export function renameFolder(id: string, name: string): Promise<Folder> {
+  return req(`/api/v1/folders/${encodeURIComponent(id)}`, { method: 'PATCH', json: { name } })
+}
+
+export function deleteFolder(id: string): Promise<{ ok: true }> {
+  return req(`/api/v1/folders/${encodeURIComponent(id)}`, { method: 'DELETE' })
+}
+
+/** Move a conversation into a folder, or out of any folder when folderId is null. */
+export function moveConversationToFolder(convId: string, folderId: string | null): Promise<Conversation> {
+  return req(`/api/v1/conversations/${encodeURIComponent(convId)}/folder`, { method: 'PATCH', json: { folderId } })
 }
 
 export function editMessage(convId: string, msgId: string, content: string): Promise<{ messages: Message[] }> {

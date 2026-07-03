@@ -501,11 +501,13 @@ export function useDaemonRestart() {
   return useMutation({ mutationFn: () => restartDaemon() })
 }
 
-/** Model detail (entry + resolved profile + VRAM fit). Disabled when key is null. */
-export function useModelDetail(key: string | null): UseQueryResult<ModelDetail> {
+/** Model detail (entry + resolved profile + VRAM fit). Disabled when key is null.
+ *  engineId (issue #35) scopes the resolved profile to a specific installed engine and
+ *  is part of the query key so switching engines refetches that engine's saved profile. */
+export function useModelDetail(key: string | null, engineId?: string): UseQueryResult<ModelDetail> {
   return useQuery({
-    queryKey: ['model', key],
-    queryFn: () => getModelDetail(key as string),
+    queryKey: ['model', key, engineId],
+    queryFn: () => getModelDetail(key as string, engineId),
     enabled: !!key,
     retry: false,
   })
@@ -519,17 +521,18 @@ export function useModelActions() {
   }
   return {
     save: useMutation({
-      mutationFn: (v: { key: string; profile: LoadProfile }) => saveModelProfile(v.key, v.profile),
+      mutationFn: (v: { key: string; profile: LoadProfile; engineId: string }) => saveModelProfile(v.key, v.profile, v.engineId),
       onSuccess: (_d, v) => {
         invalidate()
+        // Prefix-match ['model', key] invalidates every engine variant of the detail query.
         void qc.invalidateQueries({ queryKey: ['model', v.key] })
       },
     }),
     reset: useMutation({
-      mutationFn: (key: string) => resetModelProfile(key),
-      onSuccess: (_d, key) => {
+      mutationFn: (v: { key: string; engineId: string }) => resetModelProfile(v.key, v.engineId),
+      onSuccess: (_d, v) => {
         invalidate()
-        void qc.invalidateQueries({ queryKey: ['model', key] })
+        void qc.invalidateQueries({ queryKey: ['model', v.key] })
       },
     }),
     load: useMutation({

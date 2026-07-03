@@ -84,9 +84,20 @@ export interface Conversation {
   /** When set, the backend enforces a tool_choice policy on the first generation
    *  iteration. 'force_web_search' forces web_search before the model can reply. */
   toolPolicy?: string
+  /** Folder this conversation is filed under (v10). null/undefined = uncategorized. */
+  folderId?: string | null
   createdAt: string
   updatedAt: string
   messages?: Message[]
+}
+
+/** A chat folder for grouping conversations in the sidebar (v10). Flat — no nesting. */
+export interface Folder {
+  id: string
+  name: string
+  sortOrder: number
+  createdAt: string
+  updatedAt: string
 }
 
 // SSE event payloads
