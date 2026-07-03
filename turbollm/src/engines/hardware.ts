@@ -13,7 +13,7 @@ export interface HardwareProfile {
   arch: Arch
   gpuVendor: GpuVendor // primaryVendor()
   hasGpu: boolean // gpuVendor !== 'unknown' && gpus.length > 0
-  vramMb: number // max vramMb across gpus, 0 if none
+  vramMb: number // sum of vramMb across gpus, 0 if none
   gpuName?: string // name of the highest-ranked gpu
 }
 
@@ -29,7 +29,9 @@ export function detectHardware(info: SysInfo = getSysInfo()): HardwareProfile {
     (best, g) => (!best || g.vramMb > best.vramMb ? g : best),
     undefined,
   )
-  const vramMb = info.gpus.reduce((max, g) => (g.vramMb > max ? g.vramMb : max), 0)
+  // Sum VRAM across all GPUs: a multi-GPU box (e.g. 2× RTX 5060 Ti 16GB) pools
+  // its VRAM for inference, so the fit budget is the total, not the largest card.
+  const vramMb = info.gpus.reduce((sum, g) => sum + g.vramMb, 0)
   return {
     platform: process.platform,
     arch,
