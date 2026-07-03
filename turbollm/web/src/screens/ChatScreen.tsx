@@ -411,8 +411,11 @@ export function ChatScreen() {
     if ((!text && attachments.length === 0) || live) return
     if (engineState !== 'running' || !model) { toast.error('Load a model first.'); return }
 
-    const imageAttachments = attachments.filter((a) => a.dataUrl.startsWith('data:image/'))
-    const textAttachments = attachments.filter((a) => !a.dataUrl.startsWith('data:image/'))
+    // Discriminate by file.type (authoritative, same as the preview thumbnail below) rather
+    // than sniffing the extracted dataUrl content — a text/PDF attachment whose content
+    // happens to start with "data:image/" would otherwise get mis-sent as an image.
+    const imageAttachments = attachments.filter((a) => a.file.type.startsWith('image/'))
+    const textAttachments = attachments.filter((a) => !a.file.type.startsWith('image/'))
     const images = imageAttachments.map((a) => a.dataUrl)
     const docContext = textAttachments.map((a) => `[Attached: ${a.file.name}]\n${a.dataUrl}`).join('\n\n')
 

@@ -134,11 +134,13 @@ export interface LoadProfile {
   /** llama.cpp --ubatch-size (-ub). Physical micro-batch size for prompt processing. 0 / absent =
    *  engine default (512). Must be ≤ batchSize. Tune alongside batchSize for throughput. */
   uBatchSize?: number
-  /** Speculative-decoding draft window, `draft` mode only (GitHub #35). Max tokens the draft
-   *  model proposes per step (--draft-max). Absent → 16 (the previous hardcoded default). */
+  /** Speculative-decoding draft window (GitHub #35) — applies to every active speculative
+   *  mode (mtp/nextn/draft), not just `draft`. Max tokens the draft head proposes per step
+   *  (--draft-max). Absent → 16 (the previous hardcoded default). */
   draftMax?: number
-  /** Speculative-decoding draft window, `draft` mode only (GitHub #35). Min tokens drafted per
-   *  step before verification (--draft-min). Absent → 1 (the previous hardcoded default). */
+  /** Speculative-decoding draft window (GitHub #35) — applies to every active speculative
+   *  mode (mtp/nextn/draft), not just `draft`. Min tokens drafted per step before
+   *  verification (--draft-min). Absent → 1 (the previous hardcoded default). */
   draftMin?: number
   /** Provenance of a saved profile (spec 05 §3, 09 §1): 'bench' = written by the
    *  auto-tune runner, 'user' = hand-saved. Absent on heuristic/global defaults. */
