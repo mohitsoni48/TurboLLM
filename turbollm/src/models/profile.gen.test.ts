@@ -256,3 +256,25 @@ test('--grammar gated by engine capability', () => {
 test('deriveDefault grammar is empty string', () => {
   assert.equal(deriveDefault(model(), sys()).grammar, '')
 })
+
+// ── Speculative draft window (GitHub #35) ──────────────────────────────────────
+
+test('draft mode defaults to --draft-max 16 --draft-min 1 when unset', () => {
+  const p = { ...base(), speculative: 'draft' as const, draftModelPath: '/models/draft.gguf' }
+  const args = profileToArgs(p, model(), caps)
+  assert.equal(args[args.indexOf('--draft-max') + 1], '16')
+  assert.equal(args[args.indexOf('--draft-min') + 1], '1')
+})
+
+test('draft mode honors user draftMax/draftMin overrides', () => {
+  const p = { ...base(), speculative: 'draft' as const, draftModelPath: '/models/draft.gguf', draftMax: 8, draftMin: 2 }
+  const args = profileToArgs(p, model(), caps)
+  assert.equal(args[args.indexOf('--draft-max') + 1], '8')
+  assert.equal(args[args.indexOf('--draft-min') + 1], '2')
+})
+
+test('draftMin 0 is emitted (not treated as unset)', () => {
+  const p = { ...base(), speculative: 'draft' as const, draftModelPath: '/models/draft.gguf', draftMin: 0 }
+  const args = profileToArgs(p, model(), caps)
+  assert.equal(args[args.indexOf('--draft-min') + 1], '0')
+})
