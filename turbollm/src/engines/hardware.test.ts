@@ -52,3 +52,29 @@ test('detectHardware: no GPU reports 0 VRAM', () => {
   assert.equal(hw.vramMb, 0)
   assert.equal(hw.hasGpu, false)
 })
+
+// Regression: a non-primary-vendor GPU (an Intel iGPU alongside an NVIDIA/AMD dGPU
+// is a common laptop/desktop layout) must NOT be summed into the fit budget — it
+// isn't usable for offload on the primary (discrete) backend.
+test('detectHardware: an Intel iGPU alongside an NVIDIA dGPU is excluded from the VRAM sum', () => {
+  const info: SysInfo = {
+    ...dualNvidia,
+    gpus: [
+      { name: 'NVIDIA GeForce RTX 4070', vramMb: 12288, vendor: 'nvidia' },
+      { name: 'Intel(R) Iris(R) Xe Graphics', vramMb: 4096, vendor: 'intel' },
+    ],
+  }
+  const hw = detectHardware(info)
+  assert.equal(hw.gpuVendor, 'nvidia')
+  assert.equal(hw.vramMb, 12288, 'the iGPU\'s 4GB must not inflate the usable budget')
+  assert.equal(hw.gpuName, 'NVIDIA GeForce RTX 4070')
+})
+
+// Symmetric case: a lone iGPU with no discrete card at all still reports its own
+// (small) VRAM correctly — the primary-vendor filter must not zero it out.
+test('detectHardware: an iGPU-only box still reports its own VRAM', () => {
+  const info: SysInfo = { ...dualNvidia, gpus: [{ name: 'Intel(R) UHD Graphics', vramMb: 1024, vendor: 'intel' }] }
+  const hw = detectHardware(info)
+  assert.equal(hw.gpuVendor, 'intel')
+  assert.equal(hw.vramMb, 1024)
+})

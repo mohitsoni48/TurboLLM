@@ -29,9 +29,12 @@ export function detectHardware(info: SysInfo = getSysInfo()): HardwareProfile {
     (best, g) => (!best || g.vramMb > best.vramMb ? g : best),
     undefined,
   )
-  // Sum VRAM across all GPUs: a multi-GPU box (e.g. 2× RTX 5060 Ti 16GB) pools
-  // its VRAM for inference, so the fit budget is the total, not the largest card.
-  const vramMb = info.gpus.reduce((sum, g) => sum + g.vramMb, 0)
+  // Sum VRAM across GPUs of the PRIMARY vendor only: a multi-GPU box (e.g. 2× RTX
+  // 5060 Ti 16GB) pools its VRAM for inference, so the fit budget is the total, not
+  // the largest card — but a non-primary-vendor GPU (an Intel iGPU alongside an
+  // NVIDIA/AMD dGPU is common) isn't usable for offload, so it must not inflate the
+  // budget. `ofVendor` is empty only when there's no GPU at all (vramMb correctly 0).
+  const vramMb = ofVendor.reduce((sum, g) => sum + g.vramMb, 0)
   return {
     platform: process.platform,
     arch,
