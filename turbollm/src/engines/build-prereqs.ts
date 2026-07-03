@@ -16,13 +16,26 @@ const execFileP = promisify(execFile)
 
 /** Build a child-process env with `toolchainDirs` prepended to PATH. Empty/blank dirs are
  *  dropped. PATH is matched case-insensitively (Windows uses `Path`); we write back to the
- *  same key name the parent used so we never end up with a duplicate `PATH`/`Path` pair. */
+ *  same key name the parent used so we never end up with a duplicate `PATH`/`Path` pair.
+ *
+ *  IMPORTANT (Windows `spawn cmd.exe ENOENT`): the returned env is a FULL copy of the parent
+ *  `process.env`, so the OS-critical vars Windows needs to resolve a bare command — `SystemRoot`
+ *  / `windir` (System32 location), `PATHEXT`, and `ComSpec` (cmd.exe path) — are always carried
+ *  through. We also split each PATH segment individually and drop empty ones, so a stray
+ *  leading/trailing/doubled delimiter (`;` on Windows) can never survive into the child's PATH —
+ *  a malformed PATH is one way Windows fails to resolve `cmd.exe`. */
 export function buildEnv(toolchainDirs: string[] = []): NodeJS.ProcessEnv {
   const dirs = toolchainDirs.map((d) => d.trim()).filter(Boolean)
-  if (dirs.length === 0) return { ...process.env }
   const env = { ...process.env }
   const key = Object.keys(env).find((k) => k.toLowerCase() === 'path') ?? 'PATH'
-  env[key] = [...dirs, env[key] ?? ''].filter(Boolean).join(delimiter)
+  // Rebuild PATH from the toolchain dirs + every non-empty existing segment. Splitting and
+  // re-filtering guarantees no empty/blank segments (i.e. no leading/trailing/doubled delimiter),
+  // which is what can otherwise break command resolution on Windows.
+  const existing = (env[key] ?? '').split(delimiter)
+  const segments = [...dirs, ...existing].map((s) => s.trim()).filter(Boolean)
+  // Only touch PATH if the parent had one (or we're adding dirs); write back the cleaned value
+  // even when it collapses to empty, so a parent PATH of only delimiters can't survive malformed.
+  if (env[key] !== undefined || dirs.length > 0) env[key] = segments.join(delimiter)
   return env
 }
 

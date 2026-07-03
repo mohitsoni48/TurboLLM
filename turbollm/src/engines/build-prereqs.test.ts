@@ -32,6 +32,60 @@ test('buildEnv: does not create a duplicate PATH/Path key', () => {
   assert.equal(pathKeys.length, Object.keys(process.env).filter((k) => k.toLowerCase() === 'path').length)
 })
 
+// Regression: a trailing/leading/doubled delimiter in PATH can make Windows fail to resolve a
+// bare command with `spawn cmd.exe ENOENT`. buildEnv must never emit an empty PATH segment.
+test('buildEnv: never produces a leading/trailing/doubled delimiter in PATH', () => {
+  const orig = process.env[PATH_KEY]
+  try {
+    for (const seed of [
+      '', // empty existing PATH
+      'onlyone',
+      `a${delimiter}b`,
+      `${delimiter}a${delimiter}b${delimiter}`, // leading + trailing delimiter
+      `a${delimiter}${delimiter}b`, // doubled delimiter
+      `${delimiter}${delimiter}`, // nothing but delimiters
+    ]) {
+      process.env[PATH_KEY] = seed
+      for (const dirs of [[], ['tllm_dir'], ['', '  ', 'tllm_dir']]) {
+        const env = buildEnv(dirs)
+        const path = env[PATH_KEY] ?? ''
+        assert.ok(!path.startsWith(delimiter), `leading delimiter for seed=${JSON.stringify(seed)} dirs=${JSON.stringify(dirs)}`)
+        assert.ok(!path.endsWith(delimiter), `trailing delimiter for seed=${JSON.stringify(seed)} dirs=${JSON.stringify(dirs)}`)
+        assert.ok(!path.includes(delimiter + delimiter), `doubled delimiter for seed=${JSON.stringify(seed)} dirs=${JSON.stringify(dirs)}`)
+        // No empty segment survived.
+        assert.ok(path.split(delimiter).every((s) => s.length > 0) || path === '', `empty segment for seed=${JSON.stringify(seed)}`)
+      }
+    }
+  } finally {
+    if (orig === undefined) delete process.env[PATH_KEY]
+    else process.env[PATH_KEY] = orig
+  }
+})
+
+// The Windows `spawn cmd.exe ENOENT` fix relies on the OS-critical vars surviving into the child
+// env: without SystemRoot/PATHEXT/ComSpec the OS loader can't resolve cmd.exe regardless of PATH.
+// (Env keys are case-insensitive on Windows, so we look them up case-insensitively.)
+test('buildEnv: preserves the parent env vars (OS-critical ones survive the copy)', () => {
+  const lookup = (env: NodeJS.ProcessEnv, name: string): string | undefined => {
+    const k = Object.keys(env).find((x) => x.toLowerCase() === name.toLowerCase())
+    return k === undefined ? undefined : env[k]
+  }
+  const key = '__TLLM_TEST_OS_VAR__'
+  const saved = process.env[key]
+  try {
+    process.env[key] = 'sentinel-value'
+    const env = buildEnv(['tllm_dir'])
+    assert.equal(lookup(env, key), 'sentinel-value')
+    // Whatever the parent actually has for the real OS-critical vars must carry through verbatim.
+    for (const name of ['ComSpec', 'PATHEXT', 'SystemRoot', 'windir']) {
+      assert.equal(lookup(env, name), lookup(process.env, name), `${name} not preserved`)
+    }
+  } finally {
+    if (saved === undefined) delete process.env[key]
+    else process.env[key] = saved
+  }
+})
+
 test('buildCommands: includes --branch when a branch is given', () => {
   const cmds = buildCommands('https://github.com/owner/repo', 'main', 'windows')
   assert.equal(cmds[0], 'git clone --branch "main" --depth 1 "https://github.com/owner/repo" turbo-build')
