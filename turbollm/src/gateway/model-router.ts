@@ -3,7 +3,7 @@
 // the local model library and loads (or swaps to) that model automatically.
 // Inspired by llama-swap; operates on the existing Manager + Scanner primitives.
 import { Manager, type StartOpts } from '../engines/manager'
-import type { ConfigStore, Engine } from '../config/config'
+import { getModelProfile, type ConfigStore, type Engine } from '../config/config'
 import type { Registry } from '../engines/registry'
 import type { Scanner, ModelEntry } from '../models/scanner'
 import type { ComfyGuard } from '../engines/comfy-guard'
@@ -270,7 +270,7 @@ export class ModelRouter {
     const cfg = this.store.snapshot()
     const sys = getSysInfo()
     if (entry.format !== 'gguf') {
-      const savedProfile = cfg.modelProfiles[entry.key] as Partial<LoadProfile> | undefined
+      const savedProfile = getModelProfile(cfg, entry.key, engine.id) as Partial<LoadProfile> | undefined
       return {
         engine,
         model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: entry.nativeCtx, vision: false },
@@ -285,7 +285,7 @@ export class ModelRouter {
         tensorParallelSize: savedProfile?.gpu?.tensorParallelSize,
       }
     }
-    const saved = cfg.modelProfiles[entry.key] as Partial<LoadProfile> | undefined
+    const saved = getModelProfile(cfg, entry.key, engine.id) as Partial<LoadProfile> | undefined
     const profile = resolveProfile(entry, sys, saved, undefined, cfg.modelDefaults)
     // KoboldCpp is a GGUF engine but uses its OWN flag names, so it gets its own small
     // arg-map (ctx/ngl + GPU backend) rather than the llama-server profileToArgs. llamafile

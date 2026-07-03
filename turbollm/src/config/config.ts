@@ -7,7 +7,7 @@ import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync 
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
 
 export interface Capabilities {
   kvTypes: string[]
@@ -184,6 +184,13 @@ export interface DevModel {
   extraArgs: string[]
   label: string
 }
+/** One engine's saved profile for a model (issue #35), timestamped so
+ *  {@link getModelProfile} can fall back to whichever engine's profile was saved most
+ *  recently when the requested engine has none of its own. */
+export interface ProfileEntry {
+  profile: unknown
+  updatedAt: string
+}
 export interface Config {
   version: number
   daemon: Daemon
@@ -195,7 +202,17 @@ export interface Config {
   /** The folder downloads/imports land in (spec 01 §3, ADR-035). When '' or not in
    *  modelDirs, the FIRST entry in modelDirs is the effective default. */
   primaryModelDir: string
-  modelProfiles: Record<string, unknown>
+  /** Saved per-model LoadProfiles, nested by (modelKey → engineId → {@link ProfileEntry})
+   *  so two installed engines (even two builds of the same kind, e.g. llama.cpp CUDA vs
+   *  Vulkan, each with its own {@link Engine.id}) keep independent tunes for the same
+   *  model (issue #35). There's no fixed "default engine" to fall back to — the codebase
+   *  has no reliable way to tell mainline llama.cpp apart from a fork like ik_llama.cpp or
+   *  TurboQuant (both share `kind: 'llama-server'`) — so {@link getModelProfile} instead
+   *  falls back to whichever engine's profile for the model was saved most recently
+   *  (each entry carries its own `updatedAt`). The v2→v3 migration wraps each old flat
+   *  profile into a single entry under the reserved engineId `'*'` (see {@link normalize}).
+   *  `profile` values are still `unknown` (validated/shaped elsewhere as {@link LoadProfile}). */
+  modelProfiles: Record<string, Record<string, ProfileEntry>>
   /** Persisted auto-tune results keyed by modelKey (spec 09 §1, 01 §4). Additive;
    *  absent in old configs → normalize seeds {}. Never throws on load. */
   benchResults: Record<string, BenchResult>
@@ -410,9 +427,15 @@ function migrate(raw: Record<string, unknown>, _from: number): Config {
     if (modelPath) cfg.devModel = { modelPath, extraArgs: extra, label: old.name || '' }
   }
   cfg.version = SCHEMA_VERSION
-  // Preserve any unknown top-level keys from the old file.
+  // Carry EVERY top-level key from the old file forward — both unknown keys (ride-along)
+  // and known ones (engines/apiKeys/modelProfiles/benchResults/modelDirs/lastLoaded/…).
+  // Copying known keys too is required now that this runs for v2→v3 (issue #35): the
+  // ancient pre-v1 path only special-cases the legacy engine/host/port keys, so for a
+  // v2 config the rest of migrate() is a no-op and dropping known keys here would wipe
+  // real user data. normalize() reseats/validates each field afterward (including the
+  // shape migration of modelProfiles), so an old value simply gets normalized in place.
   for (const [k, v] of Object.entries(raw)) {
-    if (!(k in cfg) && k !== 'engine' && k !== 'host' && k !== 'port') {
+    if (k !== 'engine' && k !== 'host' && k !== 'port' && k !== 'version') {
       ;(cfg as unknown as Record<string, unknown>)[k] = v
     }
   }
@@ -460,7 +483,24 @@ function normalize(c: Config): void {
   // Primary model dir (spec 01 §3, ADR-035): absent in old files → '' (effective
   // default falls back to the first modelDir). Never throw on an old config.
   c.primaryModelDir ??= ''
+  // Per-engine model profiles (issue #35, schema v3): modelProfiles moved from a flat
+  // { modelKey → profile } map to a nested { modelKey → { engineId → ProfileEntry } } map
+  // so two installed engines keep independent tunes for the same model. Migrate in place,
+  // shape-based and idempotent (runs every load; must not double-wrap an already-nested
+  // value). Discriminator: a v2 flat profile is a LoadProfile, which always carries a
+  // numeric `ctx` at its top level; a v3 nested map is keyed by engineId (UUID or the
+  // reserved '*'), whose VALUES are {@link ProfileEntry} wrappers — so the map itself
+  // never has a top-level numeric `ctx`. Old profiles are wrapped into a single entry
+  // under the reserved fallback key '*', timestamped at migration time — this is fine
+  // even though it's an approximation of "when it was really last used": it's the only
+  // entry that exists yet, so it's trivially the most recent, and any future per-engine
+  // save (necessarily later) naturally outranks it via getModelProfile's fallback.
   c.modelProfiles ??= {}
+  for (const [modelKey, val] of Object.entries(c.modelProfiles)) {
+    if (val && typeof val === 'object' && typeof (val as { ctx?: unknown }).ctx === 'number') {
+      c.modelProfiles[modelKey] = { '*': { profile: val, updatedAt: new Date().toISOString() } }
+    }
+  }
   // Persisted auto-tune results (spec 09 §1): absent in pre-bench configs → {}.
   c.benchResults ??= {}
   c.autoLoadOnStart ??= false
@@ -584,6 +624,52 @@ function isAbsolutePath(p: string): boolean {
 
 export function findEngine(engines: Engine[], id: string): Engine | undefined {
   return engines.find((e) => e.id === id)
+}
+
+/** Reserved engineId the v2→v3 migration parks every pre-existing flat profile under
+ *  (issue #35). Not otherwise special — it's just one more entry in the per-model map,
+ *  and only wins in {@link getModelProfile} when it happens to be the most recent (or
+ *  only) one; a fresher per-engine save on any real engine outranks it. */
+export const ANY_ENGINE = '*'
+
+/** Resolve a model's saved profile for a specific installed engine (issue #35). Returns
+ *  that engine's own profile if one exists; otherwise falls back to whichever engine's
+ *  profile for this model was saved most recently (there's no fixed "default engine" to
+ *  fall back to — mainline llama.cpp and forks like ik_llama.cpp/TurboQuant are
+ *  indistinguishable in this codebase, both `kind: 'llama-server'` — so "last used" is
+ *  the simplest fallback that doesn't require identifying any engine specially). Returns
+ *  undefined if the model has no saved profile on any engine. The single read seam every
+ *  caller routes through instead of indexing `cfg.modelProfiles[key]` directly. */
+export function getModelProfile(cfg: Config, modelKey: string, engineId: string): unknown {
+  const byEngine = cfg.modelProfiles[modelKey]
+  if (!byEngine) return undefined
+  const exact = byEngine[engineId]
+  if (exact) return exact.profile
+  // `>=` (not `>`): object key insertion order matches save order, so on an exact
+  // millisecond tie (two rapid-fire saves) the later-inserted entry — the truly more
+  // recent one — wins instead of whichever key happened to iterate first.
+  let mostRecent: ProfileEntry | undefined
+  for (const entry of Object.values(byEngine)) {
+    if (!mostRecent || entry.updatedAt >= mostRecent.updatedAt) mostRecent = entry
+  }
+  return mostRecent?.profile
+}
+
+/** Write a model's saved profile into one engine's slot only (issue #35), stamped with
+ *  the current time so {@link getModelProfile}'s "last used" fallback can compare across
+ *  engines. Creates the per-model map if absent; never touches other engines' profiles
+ *  for the same model. */
+export function setModelProfile(cfg: Config, modelKey: string, engineId: string, profile: unknown): void {
+  ;(cfg.modelProfiles[modelKey] ??= {})[engineId] = { profile, updatedAt: new Date().toISOString() }
+}
+
+/** Delete a model's saved profile for one engine only (issue #35). Prunes the per-model
+ *  map when its last slot is removed so `hasProfile`-style emptiness checks stay accurate. */
+export function deleteModelProfile(cfg: Config, modelKey: string, engineId: string): void {
+  const byEngine = cfg.modelProfiles[modelKey]
+  if (!byEngine) return
+  delete byEngine[engineId]
+  if (Object.keys(byEngine).length === 0) delete cfg.modelProfiles[modelKey]
 }
 
 /** Apply the global "max response tokens" cap. `limit <= 0` means unlimited (return

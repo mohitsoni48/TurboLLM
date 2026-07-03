@@ -3,7 +3,7 @@ import { openSync, readFileSync } from 'node:fs'
 import { serve } from '@hono/node-server'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { ConfigStore, defaultConfig, defaultConfigPath, migrateLegacyDataDir } from './config/config'
+import { ConfigStore, defaultConfig, defaultConfigPath, getModelProfile, migrateLegacyDataDir } from './config/config'
 import { Manager, killTrackedEnginesSync, reapStaleEngines, type StartOpts } from './engines/manager'
 import { ComfyGuard } from './engines/comfy-guard'
 import { Registry } from './engines/registry'
@@ -509,7 +509,7 @@ void (async () => {
         extraArgs: [],
       }
     } else {
-      const saved = cfg.modelProfiles[entry.key] as Partial<LoadProfile> | undefined
+      const saved = getModelProfile(cfg, entry.key, active.id) as Partial<LoadProfile> | undefined
       const profile = resolveProfile(entry, sys, saved, undefined, cfg.modelDefaults)
       opts = {
         engine: active,

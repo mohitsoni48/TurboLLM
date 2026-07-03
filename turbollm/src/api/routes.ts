@@ -6,7 +6,7 @@ import { basename, dirname, join, resolve, sep } from 'node:path'
 import { GATE_VERSION, gateNodeSource } from '../comfyui/gate-template'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { homedir, networkInterfaces } from 'node:os'
-import { ValueError, type ApiKey, type Engine, type McpServer } from '../config/config'
+import { ValueError, getModelProfile, setModelProfile, deleteModelProfile, type ApiKey, type Engine, type McpServer } from '../config/config'
 import type { Deps } from '../deps'
 import { type ModelInfo, type StartOpts } from '../engines/manager'
 import { abortAllInFlightChats } from '../chat/chat-routes'
@@ -1026,7 +1026,7 @@ export function registerApi(app: Hono, d: Deps): void {
         // MLX honors sampling defaults; vLLM honors its own load controls (F-027,
         // --max-model-len/--gpu-memory-utilization/--dtype/…) built via vllmProfileToArgs,
         // plus the multi-GPU shard count (ADR-054) mapped to --tensor-parallel-size below.
-        const savedProfile = cfg.modelProfiles[entry.key] as Partial<LoadProfile> | undefined
+        const savedProfile = getModelProfile(cfg, entry.key, active.id) as Partial<LoadProfile> | undefined
         const extraArgs =
           active.kind === 'mlx'
             ? mlxSamplingArgs(savedProfile?.sampling)
@@ -1041,7 +1041,7 @@ export function registerApi(app: Hono, d: Deps): void {
           tensorParallelSize: savedProfile?.gpu?.tensorParallelSize,
         }
       } else {
-        const saved = cfg.modelProfiles[entry.key] as Partial<LoadProfile> | undefined
+        const saved = getModelProfile(cfg, entry.key, active.id) as Partial<LoadProfile> | undefined
         const profile = resolveProfile(entry, sys, saved, b.profileOverrides, cfg.modelDefaults)
         // KoboldCpp is a GGUF engine with its OWN flag names — build its arg-map instead of
         // the llama-server profileToArgs. llamafile IS llama.cpp's server, so it keeps the
@@ -1303,7 +1303,10 @@ export function registerApi(app: Hono, d: Deps): void {
     if (!e) return err(c, 404, 'no_such_model', 'No model with that key.')
     const sys = getSysInfo()
     const snap = d.store.snapshot()
-    const saved = snap.modelProfiles[e.key] as Partial<LoadProfile> | undefined
+    // Per-engine profile (issue #35): the detail dialog passes ?engine=<id> for the engine
+    // it's showing; fall back to the active engine, then the '*' migrated/global profile.
+    const engineId = c.req.query('engine') || d.registry.active()?.id || '*'
+    const saved = getModelProfile(snap, e.key, engineId) as Partial<LoadProfile> | undefined
     const profile = resolveProfile(e, sys, saved, undefined, snap.modelDefaults)
     // `gpu` (first GPU) kept for back-compat; `gpus` (full list) drives the multi-GPU
     // split controls (ADR-054).
@@ -1335,16 +1338,22 @@ export function registerApi(app: Hono, d: Deps): void {
         return err(c, 400, 'invalid_profile_value', 'gpu.tensorParallelSize must be an integer ≥ 1.')
       }
     }
+    // Per-engine profile (issue #35): save into the slot for the engine the client is
+    // editing (?engine=<id>), falling back to the active engine, then the '*' fallback.
+    const engineId = c.req.query('engine') || d.registry.active()?.id || '*'
     d.store.update((cfg) => {
-      cfg.modelProfiles[key] = p as unknown as Record<string, unknown>
+      setModelProfile(cfg, key, engineId, p)
     })
     return c.json(p)
   })
 
   app.post('/api/v1/models/:key/profile/reset', (c) => {
     const key = decodeURIComponent(c.req.param('key'))
+    // Per-engine profile (issue #35): reset only the edited engine's slot (?engine=<id>),
+    // falling back to the active engine, then the '*' fallback.
+    const engineId = c.req.query('engine') || d.registry.active()?.id || '*'
     d.store.update((cfg) => {
-      delete cfg.modelProfiles[key]
+      deleteModelProfile(cfg, key, engineId)
     })
     return c.json({ ok: true })
   })
@@ -1897,7 +1906,10 @@ function overlayModel(e: ModelEntry, d: Deps, lastTpsMap?: Map<string, number>) 
   // guess that's wrong simply 404s when opened; it never marks anything downloaded.
   const provRepo = d.downloads.provenance().find((p) => p.dest === e.path && p.repo)?.repo
   const sourceRepo = provRepo ?? inferRepoFromPath(e.path, snap.modelDirs)
-  return { ...e, loaded, hasProfile: e.key in profiles, lastTps, liveTps, benchTps, compatibleWithActiveEngine, sourceRepo }
+  // Per-engine profiles (issue #35): profiles[e.key] is now an { engineId → profile } map;
+  // "has a saved profile" for the model-list badge means it has at least one engine slot.
+  const hasProfile = !!profiles[e.key] && Object.keys(profiles[e.key]).length > 0
+  return { ...e, loaded, hasProfile, lastTps, liveTps, benchTps, compatibleWithActiveEngine, sourceRepo }
 }
 
 // ---- helpers ----

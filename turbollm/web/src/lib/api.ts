@@ -386,19 +386,23 @@ export function deleteModel(key: string): Promise<{ ok: true; deleted: string[] 
 }
 
 // ── Load profiles + load flow (A4, spec 05) ──────────────────────────────────
-export function getModelDetail(key: string): Promise<ModelDetail> {
-  return request<ModelDetail>(`/api/v1/models/${encodeURIComponent(key)}`)
+// Profiles are per-engine (issue #35): pass the installed engine's id so reads/writes
+// hit that engine's slot. Omitting engineId on read lets the server fall back to the
+// active engine, then the '*' migrated/global profile.
+export function getModelDetail(key: string, engineId?: string): Promise<ModelDetail> {
+  const q = engineId ? `?engine=${encodeURIComponent(engineId)}` : ''
+  return request<ModelDetail>(`/api/v1/models/${encodeURIComponent(key)}${q}`)
 }
 
-export function saveModelProfile(key: string, profile: LoadProfile): Promise<LoadProfile> {
-  return request<LoadProfile>(`/api/v1/models/${encodeURIComponent(key)}/profile`, {
+export function saveModelProfile(key: string, profile: LoadProfile, engineId: string): Promise<LoadProfile> {
+  return request<LoadProfile>(`/api/v1/models/${encodeURIComponent(key)}/profile?engine=${encodeURIComponent(engineId)}`, {
     method: 'PUT',
     json: profile,
   })
 }
 
-export function resetModelProfile(key: string): Promise<{ ok: true }> {
-  return request<{ ok: true }>(`/api/v1/models/${encodeURIComponent(key)}/profile/reset`, {
+export function resetModelProfile(key: string, engineId: string): Promise<{ ok: true }> {
+  return request<{ ok: true }>(`/api/v1/models/${encodeURIComponent(key)}/profile/reset?engine=${encodeURIComponent(engineId)}`, {
     method: 'POST',
     json: {},
   })

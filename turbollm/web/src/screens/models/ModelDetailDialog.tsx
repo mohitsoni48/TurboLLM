@@ -50,8 +50,12 @@ export function ModelDetailDialog({
   /** Open the model's Hugging Face page (card + quants) for the given repo. */
   onViewRepo?: (repo: string) => void
 }) {
-  const detailQ = useModelDetail(modelKey)
+  // Resolve the active engine first: the model detail (resolved profile + VRAM fit) is
+  // per-engine (issue #35), so useModelDetail needs the engine id to fetch that engine's
+  // saved profile. '*' is the server-side fallback when no engine is active.
   const enginesQ = useEngines()
+  const activeEngine = enginesQ.data?.engines.find((e) => e.id === enginesQ.data?.activeEngineId)
+  const detailQ = useModelDetail(modelKey, activeEngine?.id)
   const actions = useModelActions()
   const bench = useBenchActions()
   const benchState = useBenchState()
@@ -95,7 +99,6 @@ export function ModelDetailDialog({
     }
   }, [pendingBenchKey, engineState, bench.start])
 
-  const activeEngine = enginesQ.data?.engines.find((e) => e.id === enginesQ.data?.activeEngineId)
   const kvTypes = activeEngine?.capabilities.kvTypes ?? ['f16']
 
   // Speculative-decoding options: require BOTH engine capability AND model support
@@ -512,7 +515,7 @@ export function ModelDetailDialog({
                       },
                     )
                   if (remember) {
-                    actions.save.mutate({ key: detail.key, profile: draft }, { onSuccess: fireLoad, onError: fireLoad })
+                    actions.save.mutate({ key: detail.key, profile: draft, engineId: activeEngine?.id ?? '*' }, { onSuccess: fireLoad, onError: fireLoad })
                   } else {
                     fireLoad()
                   }
@@ -523,11 +526,11 @@ export function ModelDetailDialog({
                 <Zap size={14} />
                 {detail.loaded ? 'Reload' : 'Load model'}
               </Button>
-              <Button variant="outline" onClick={() => actions.save.mutate({ key: detail.key, profile: draft })} disabled={actions.save.isPending} title="Save without reloading">
+              <Button variant="outline" onClick={() => actions.save.mutate({ key: detail.key, profile: draft, engineId: activeEngine?.id ?? '*' })} disabled={actions.save.isPending} title="Save without reloading">
                 <Save size={14} />
                 Save
               </Button>
-              <Button variant="ghost" onClick={() => actions.reset.mutate(detail.key)} disabled={actions.reset.isPending} title="Reset to defaults">
+              <Button variant="ghost" onClick={() => actions.reset.mutate({ key: detail.key, engineId: activeEngine?.id ?? '*' })} disabled={actions.reset.isPending} title="Reset to defaults">
                 <RotateCcw size={14} />
               </Button>
             </div>
