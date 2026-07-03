@@ -274,7 +274,14 @@ export function ConversationSidebar({
               />
             ))}
 
-            {/* Ungrouped conversations, rendered exactly as before. */}
+            {/* Explicit "Uncategorized" label so it reads as its own section rather than
+                blending into whichever folder happens to render above it — only shown
+                once folders exist at all (a flat list with no folders needs no label). */}
+            {folders.length > 0 && ungrouped.length > 0 && (
+              <div className="px-2 py-1.5 text-[11px] font-medium uppercase tracking-wide text-faint">
+                Uncategorized
+              </div>
+            )}
             {ungrouped.map((conv) => (
               <ConvItem key={conv.id} conv={conv} active={conv.id === activeId} folders={folders} onSelect={onSelect} onDelete={onDelete} onMove={onMove} />
             ))}
@@ -427,7 +434,10 @@ function FolderSection({
         )}
       </div>
       <CollapsibleContent>
-        <div className="pl-2">
+        {/* Left guide line brackets exactly which rows belong to this folder — a plain
+            padding indent alone was too subtle to tell folder contents from the flat
+            ungrouped list below. */}
+        <div className="ml-3 border-l border-border pl-2">
           {items.length === 0 ? (
             <p className="px-3 py-1.5 text-[11px] text-faint">Empty folder</p>
           ) : (

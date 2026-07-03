@@ -248,6 +248,15 @@ html.tllm-resizing .tllm-split-resizer::after {
   background: var(--accent);
 }
 
+/* Chat sidebar column — animates its own collapse/expand toggle, but that transition
+   must not fight the drag-resize handle's per-pixel style mutation while dragging. */
+.tllm-chat-sidebar {
+  transition: width 0.15s;
+}
+html.tllm-resizing .tllm-chat-sidebar {
+  transition: none;
+}
+
 /* App-wide scrollbar — every scrollable element gets the same thin, theme-colored
    scrollbar; the raw OS/browser default never appears anywhere. Applies universally
    (not a per-element opt-in class) so new scrollable regions are styled automatically.
