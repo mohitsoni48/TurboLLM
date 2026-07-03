@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useParams, useSearchParams } from 'react-router-dom'
 import { ArrowDown, Brain, Copy, Download, Paperclip, SendHorizontal, Share2, SlidersHorizontal, Square, UserRound, X } from 'lucide-react'
 import { continueConversation, fetchSysInfo, sendMessage } from '../lib/chat-api'
+import { extractPdfText } from '../lib/pdf-extract'
 import { useConversation, useConversationMutations } from '../lib/chat-queries'
 import { useModelActions, useModels, useStatus } from '../lib/queries'
 import type { ChatSseEvent, LiveToolCall, Message } from '../lib/chat-types'
@@ -307,6 +308,12 @@ export function ChatScreen() {
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files ?? [])
     const loaded = await Promise.all(files.map(async (file) => {
+      const isPdf = file.type === 'application/pdf' || /\.pdf$/i.test(file.name)
+      if (isPdf) {
+        // PDFs are binary — extract real text client-side instead of reading raw bytes as text.
+        const text = await extractPdfText(file)
+        return { file, dataUrl: text }
+      }
       const dataUrl = await new Promise<string>((res) => {
         const r = new FileReader()
         r.onload = () => res(r.result as string)
@@ -750,7 +757,7 @@ export function ChatScreen() {
                   ref={fileInputRef}
                   type="file"
                   multiple
-                  accept="image/*,.pdf,.txt,.md,.csv"
+                  accept="image/*,.pdf,.txt,.md,.csv,.json,.yaml,.yml,.log,.ts,.tsx,.js,.jsx,.py,.go,.rs,.java,.c,.cpp,.h,.rb,.php,.sh,.sql,.xml,.toml,.ini"
                   hidden
                   onChange={handleFileSelect}
                 />
