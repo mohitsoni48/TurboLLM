@@ -1,4 +1,4 @@
-import { Check, ChevronDown, CircleSlash, Cpu, Loader2 } from 'lucide-react'
+import { Check, ChevronDown, CircleSlash, Cpu, Loader2, SlidersHorizontal } from 'lucide-react'
 import type { ModelEntry } from '../lib/types'
 import {
   DropdownMenu,
@@ -11,7 +11,8 @@ import {
 /**
  * Model selector + eject control. Lists discovered models; selecting one loads it
  * (the engine auto-starts), and "Eject" stops the running engine. Shared by the
- * Chat and Models screens. Alt+click a model row to open its config before loading.
+ * Chat and Models screens. Click the sliders icon (or Alt+click a row) to open its
+ * config before loading.
  */
 export function ModelLoadMenu({
   models,
@@ -72,13 +73,26 @@ export function ModelLoadMenu({
                 {active && <Check size={14} className="text-accent" />}
               </span>
               <span className="min-w-0 flex-1 truncate">{m.name}</span>
+              {onSettings && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    onSettings(m.key)
+                  }}
+                  className="grid h-6 w-6 shrink-0 place-items-center rounded text-faint transition-colors hover:bg-panel hover:text-ink"
+                  title="Configure before loading"
+                  aria-label={`Configure ${m.name} before loading`}
+                >
+                  <SlidersHorizontal size={13} />
+                </button>
+              )}
               <span className="shrink-0 text-[11px] uppercase text-faint">
                 {m.quant}
               </span>
             </div>
           )
         })}
-        {onSettings && <div className="px-2 py-1 text-[11px] text-faint">Alt+click to configure</div>}
         {loadedKey && (
           <>
             <DropdownMenuSeparator />
