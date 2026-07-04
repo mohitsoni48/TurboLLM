@@ -1381,6 +1381,7 @@ export function registerApi(app: Hono, d: Deps): void {
       tavilyApiKey?: string
       search?: { provider?: string; tavilyApiKey?: string; kagiApiKey?: string; searxngUrl?: string }
       build?: { toolchainDirs?: string[] }
+      toolPolicies?: Record<string, string>
     }>(c)
 
     const updates: Record<string, unknown> = {}
@@ -1491,6 +1492,24 @@ export function registerApi(app: Hono, d: Deps): void {
       toolchainDirs = dirs
     }
 
+    // Tool-call approval gate: global per-tool policy map. Validate every value is
+    // one of 'ask' | 'allow' | 'deny' so a garbled patch gets a clean 400, not a
+    // silently-dropped/garbage config.
+    let toolPolicies: Record<string, 'ask' | 'allow' | 'deny'> | undefined
+    if (b.toolPolicies !== undefined) {
+      if (typeof b.toolPolicies !== 'object' || b.toolPolicies === null || Array.isArray(b.toolPolicies)) {
+        return err(c, 400, 'invalid_config_value', 'toolPolicies must be an object mapping tool name to ask, allow, or deny.')
+      }
+      const validated: Record<string, 'ask' | 'allow' | 'deny'> = {}
+      for (const [toolName, v] of Object.entries(b.toolPolicies)) {
+        if (v !== 'ask' && v !== 'allow' && v !== 'deny') {
+          return err(c, 400, 'invalid_config_value', `toolPolicies.${toolName} must be ask, allow, or deny.`)
+        }
+        validated[toolName] = v
+      }
+      toolPolicies = validated
+    }
+
     const before = d.store.snapshot().daemon
     d.store.update((cfg) => {
       Object.assign(cfg.daemon, updates)
@@ -1498,6 +1517,7 @@ export function registerApi(app: Hono, d: Deps): void {
       Object.assign(cfg.comfyui, cuUpdates)
       Object.assign(cfg.gateway, gwUpdates)
       if (toolchainDirs !== undefined) cfg.build.toolchainDirs = toolchainDirs
+      if (toolPolicies !== undefined) cfg.tools.toolPolicies = toolPolicies
       if (b.autoLoadOnStart !== undefined) cfg.autoLoadOnStart = !!b.autoLoadOnStart
       if (telemetryLevel !== undefined) cfg.telemetry.level = telemetryLevel
       // HF token (spec 10 §4): write-only. An explicit '' clears it. Never logged.
@@ -1976,6 +1996,9 @@ function settingsPayload(d: Deps) {
     // Build environment (ADR-100): folders prepended to PATH for compile-from-source so a
     // conda-env / custom-path CUDA Toolkit + compiler are found. Not secret — echoed back.
     build: { toolchainDirs: cfg.build.toolchainDirs },
+    // Tool-call approval gate: global per-tool policy ('ask' | 'allow' | 'deny').
+    // Not secret — echoed back directly so Settings can render Tool Permissions.
+    toolPolicies: cfg.tools.toolPolicies ?? {},
   }
 }
 

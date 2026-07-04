@@ -1,12 +1,6 @@
-// Security hardening for built-in tools (F-019).
+// Security hardening for built-in tools.
 // SSRF block: rejects private/loopback destinations before fetch_url executes.
-// run_code gate: returns a confirmation-required message instead of executing
-// when requireRunCodeConfirmation is enabled (default: true).
 import { lookup } from 'node:dns/promises'
-
-/** Message returned to the LLM when run_code is gated pending user confirmation. */
-export const RUN_CODE_BLOCKED_MSG =
-  'Action required: the user must confirm before code can be executed. Please ask the user to approve running this code.'
 
 /** RFC-1918, loopback, and link-local CIDR ranges to block. */
 const PRIVATE_RANGES: Array<(ip: string) => boolean> = [

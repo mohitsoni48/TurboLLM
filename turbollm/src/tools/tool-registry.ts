@@ -111,8 +111,9 @@ export class ToolRegistry {
     // Built-in: fetch_url
     if (name === 'fetch_url') return execFetchUrl(args)
 
-    // Built-in: run_code — gated behind user confirmation when enabled (F-019).
-    if (name === 'run_code') return execRunCode(args, this.toolsCfg.requireRunCodeConfirmation !== false)
+    // Built-in: run_code — approval gating happens upstream in execute-with-approval.ts
+    // before executeTool is ever called, so run_code always executes here.
+    if (name === 'run_code') return execRunCode(args)
 
     // MCP tool: mcp__{serverId}__{toolName}
     const mcpMatch = name.match(/^mcp__([^_]+(?:_[^_]+)*)__(.+)$/)

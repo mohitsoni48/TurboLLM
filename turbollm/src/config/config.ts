@@ -94,9 +94,10 @@ export interface ToolsConfig {
   tavily?: { apiKey: string }
   /** Pluggable web-search provider config (F-020). */
   search?: SearchConfig
-  /** When true (default), run_code emits a confirmation-required message instead of
-   *  executing immediately, giving the user a chance to approve (F-019). */
-  requireRunCodeConfirmation?: boolean
+  /** Global per-tool approval policy (tool-call approval gate). Every tool defaults
+   *  to 'ask' unless explicitly set here to 'allow' or 'deny'. A per-conversation
+   *  override (Conversation.toolOverrides) takes precedence over this map. */
+  toolPolicies?: Record<string, 'ask' | 'allow' | 'deny'>
 }
 
 /** One MCP server the daemon manages as a tool provider (v0.7.0). */
@@ -543,8 +544,23 @@ function normalize(c: Config): void {
     kagiApiKey: sl.kagiApiKey ?? undefined,
     searxngUrl: typeof sl.searxngUrl === 'string' && sl.searxngUrl.trim() ? sl.searxngUrl.trim() : undefined,
   }
-  // requireRunCodeConfirmation (F-019): absent in pre-F-019 configs → true (safe default).
-  c.tools.requireRunCodeConfirmation = tl.requireRunCodeConfirmation !== false
+  // Tool approval-gate policies (replaces the old F-019 requireRunCodeConfirmation stub):
+  // always a plain object; strip any invalid values rather than crash on a garbled config.
+  const rawPolicies = (tl.toolPolicies ?? {}) as Record<string, unknown>
+  const toolPolicies: Record<string, 'ask' | 'allow' | 'deny'> = {}
+  for (const [toolName, v] of Object.entries(rawPolicies)) {
+    if (v === 'ask' || v === 'allow' || v === 'deny') toolPolicies[toolName] = v
+  }
+  // Migration: users who had explicitly disabled the old run_code confirmation
+  // (requireRunCodeConfirmation === false) get that intent preserved as an explicit
+  // 'allow' policy for run_code — but only if they haven't already set one via the
+  // new toolPolicies map. Everyone else falls through to the new 'ask' default, which
+  // is a strict improvement over the old permanently-broken confirmation stub.
+  const legacyRequireRunCodeConfirmation = (tl as Record<string, unknown>).requireRunCodeConfirmation
+  if (legacyRequireRunCodeConfirmation === false && toolPolicies.run_code === undefined) {
+    toolPolicies.run_code = 'allow'
+  }
+  c.tools.toolPolicies = toolPolicies
   // MCP host (v0.7.0): absent in pre-v0.7.0 configs → empty server list.
   const mc = (c.mcp ?? {}) as Partial<McpConfig>
   c.mcp = {

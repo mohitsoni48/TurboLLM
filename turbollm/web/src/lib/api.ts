@@ -529,7 +529,13 @@ export type DaemonSettings = {
   /** Build environment (ADR-100): folders prepended to PATH for compile-from-source so a
    *  conda-env / custom-path CUDA Toolkit + compiler are found. Not secret — echoed back. */
   build: { toolchainDirs: string[] }
+  /** Tool-call approval gate (F-025): per-tool default policy. Missing tools default
+   *  to 'ask'. Keyed by tool name (e.g. 'run_code', 'mcp__server__tool'). */
+  toolPolicies: Record<string, ToolPolicy>
 }
+
+/** Tool-call approval gate policy (mirrors turbollm/src/tools/tool-policy.ts). */
+export type ToolPolicy = 'ask' | 'allow' | 'deny'
 
 export type SearchProvider = 'tavily' | 'kagi' | 'searxng'
 

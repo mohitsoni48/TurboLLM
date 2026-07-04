@@ -12,6 +12,8 @@ import type { ClaimVerdict, ConversationStore, MessageStats, ResearchMeta, Resea
 import { checkReply } from '../tools/research-referee.js'
 import { buildSnapshot } from './chat-export'
 import type { ExportFormat } from './chat-export'
+import { executeToolCallWithApproval } from '../tools/execute-with-approval'
+import { resolveToolApproval } from '../tools/approval-gate'
 
 // Track in-flight abort controllers per conversation id.
 const inflight = new Map<string, AbortController>()
@@ -109,6 +111,51 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       return err(c, 404, 'not_found', 'Conversation not found.')
     }
     return c.json(db.getConversation(c.req.param('id'))!)
+  })
+
+  // ── tool-call approval gate ─────────────────────────────────────────────────
+
+  // Lists the tools currently available to the chat loop (name + description only —
+  // no parameters schema; the frontend just needs this to render Tool Permissions).
+  app.get('/api/v1/tools', async (c) => {
+    const defs = d.tools ? await d.tools.buildToolDefinitions() : []
+    return c.json({ tools: defs.map((t) => ({ name: t.function.name, description: t.function.description ?? '' })) })
+  })
+
+  // Resolves a pending tool-call approval created by the shared approval-gate executor
+  // (execute-with-approval.ts) while streaming a foreground chat response.
+  app.post('/api/v1/conversations/:id/tool-calls/:toolCallId/approve', async (c) => {
+    const { id: convId, toolCallId } = c.req.param()
+    const b = await body<{ toolName?: string; decision?: string }>(c)
+    const toolName = (b.toolName ?? '').trim()
+    const decision = b.decision
+    if (!toolName) return err(c, 400, 'invalid_input', 'toolName is required.')
+    if (decision !== 'allow' && decision !== 'deny' && decision !== 'allow_chat' && decision !== 'always_allow') {
+      return err(c, 400, 'invalid_input', 'decision must be one of: allow, deny, allow_chat, always_allow.')
+    }
+
+    const conv = db.getConversation(convId)
+    if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
+
+    let decisionToApply: 'allow' | 'deny'
+    if (decision === 'always_allow') {
+      d.store.update((cfg) => {
+        cfg.tools.toolPolicies = { ...(cfg.tools.toolPolicies ?? {}), [toolName]: 'allow' }
+      })
+      decisionToApply = 'allow'
+    } else if (decision === 'allow_chat') {
+      db.setToolOverride(convId, toolName, 'allow')
+      decisionToApply = 'allow'
+    } else if (decision === 'allow') {
+      decisionToApply = 'allow'
+    } else {
+      decisionToApply = 'deny'
+    }
+
+    const key = `${convId}:${toolCallId}`
+    const ok = resolveToolApproval(key, decisionToApply)
+    if (!ok) return err(c, 404, 'not_found', 'No pending approval for this tool call (it may have already timed out or been resolved).')
+    return c.json({ ok: true })
   })
 
   // ── streaming send (spec 07 §2) ────────────────────────────────────────────
@@ -740,32 +787,24 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
           try { parsedArgs = JSON.parse(tc.argsBuffer || '{}') as Record<string, unknown> }
           catch { parsedArgs = {} }
 
-          // When run_code confirmation is required, emit a gate event so the
-          // frontend can prompt the user — tool execution is skipped this round (F-019).
-          const requireConfirm =
-            tc.name === 'run_code' &&
-            d.store.snapshot().tools.requireRunCodeConfirmation !== false
-          if (requireConfirm) {
-            await stream.writeSSE({
-              event: 'tool_confirmation_required',
-              data: JSON.stringify({ id: tc.id, name: tc.name, args: parsedArgs }),
-            })
-          }
-
-          // Emit pending event so the frontend can show "calling..."
-          await stream.writeSSE({
-            event: 'tool_call',
-            data: JSON.stringify({ id: tc.id, name: tc.name, args: parsedArgs, status: 'pending' }),
+          // Live foreground chat gets the real approval gate (interactive: true) — an
+          // 'ask'-policy tool prompts the user via 'tool_call'/'awaiting_approval' and
+          // waits for POST .../tool-calls/:toolCallId/approve to resolve it.
+          const { result, error: callError } = await executeToolCallWithApproval({
+            tools: d.tools,
+            sink: (ev) => stream.writeSSE({ event: ev.event, data: JSON.stringify(ev.data) }),
+            convId,
+            id: tc.id,
+            name: tc.name,
+            args: parsedArgs,
+            globalPolicies: d.store.snapshot().tools.toolPolicies ?? {},
+            // Re-read fresh on every iteration (not the `conv` snapshot captured at request
+            // start) — otherwise a same-turn repeat tool call misses an "Allow for this
+            // chat" decision the user just made via POST .../tool-calls/:id/approve.
+            convOverrides: d.db.getToolOverrides(convId),
+            signal: ac.signal,
+            interactive: true,
           })
-
-          let result = ''
-          let callError: string | undefined
-          try {
-            result = await d.tools.executeTool({ id: tc.id, name: tc.name, args: parsedArgs })
-          } catch (e) {
-            callError = (e as Error).message
-            result = `Error: ${callError}`
-          }
 
           // F-021: track web_search calls and accumulate research sources.
           if (tc.name === 'web_search' && !callError) {
@@ -791,12 +830,6 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
           }
 
           allToolCalls.push({ id: tc.id, name: tc.name, args: parsedArgs, result: callError ? undefined : result, error: callError })
-
-          // Emit done event with result
-          await stream.writeSSE({
-            event: 'tool_call',
-            data: JSON.stringify({ id: tc.id, name: tc.name, args: parsedArgs, status: callError ? 'error' : 'done', result }),
-          })
 
           // Inject tool result into iterMessages
           iterMessages.push({ role: 'tool', content: result, tool_call_id: tc.id })

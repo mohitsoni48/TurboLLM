@@ -2,7 +2,7 @@ import { memo, useEffect, useRef, useState, type ReactNode } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
-import { CheckCircle2, ChevronDown, ChevronRight, FileText, Loader2, Pencil, RefreshCw, Trash2, XCircle } from 'lucide-react'
+import { CheckCircle2, ChevronDown, ChevronRight, FileText, HelpCircle, Loader2, Pencil, RefreshCw, Trash2, XCircle } from 'lucide-react'
 import type { ClaimVerdict, LiveToolCall, Message, MessageStats, ResearchMeta, ResearchSource, ToolCallRecord } from '../../lib/chat-types'
 import { Button } from '../../components/ui/button'
 import { CopyButton } from '../../components/ui/copy-button'
@@ -161,9 +161,9 @@ const Markdown = memo(function Markdown({ children, streaming }: { children: str
 
 // ── Tool call cards ───────────────────────────────────────────────────────────
 
-type CardCall = { id: string; name: string; status: 'pending' | 'done' | 'error'; result?: string }
+type CardCall = { id: string; name: string; status: 'pending' | 'done' | 'error' | 'awaiting_approval'; result?: string }
 
-function friendlyName(name: string): string {
+export function friendlyName(name: string): string {
   if (name.startsWith('mcp__')) return name.replace(/^mcp__[^_]+(?:_[^_]+)*__/, '')
   return name.replace(/_/g, ' ')
 }
@@ -171,21 +171,26 @@ function friendlyName(name: string): string {
 function ToolCallCard({ call }: { call: CardCall }) {
   const [expanded, setExpanded] = useState(false)
   const hasOutput = !!(call.result?.length)
+  const awaitingApproval = call.status === 'awaiting_approval'
 
   return (
-    <div className="overflow-hidden rounded-lg border border-border bg-panel-2">
+    <div
+      className="overflow-hidden rounded-lg border bg-panel-2"
+      style={awaitingApproval ? { borderColor: 'var(--warn,#ca8a04)', background: 'color-mix(in srgb, var(--warn,#ca8a04) 6%, transparent)' } : { borderColor: 'var(--border)' }}
+    >
       <button
         type="button"
         onClick={() => hasOutput && setExpanded((e) => !e)}
         className="flex w-full items-center gap-2 px-3 py-1.5 text-left"
         style={{ cursor: hasOutput ? 'pointer' : 'default' }}
       >
-        {call.status === 'pending' && <Loader2 size={12} className="shrink-0 animate-spin" style={{ color: 'var(--accent)' }} />}
-        {call.status === 'done'    && <CheckCircle2 size={12} className="shrink-0" style={{ color: '#4ade80' }} />}
-        {call.status === 'error'   && <XCircle size={12} className="shrink-0" style={{ color: 'var(--err)' }} />}
+        {call.status === 'pending'            && <Loader2 size={12} className="shrink-0 animate-spin" style={{ color: 'var(--accent)' }} />}
+        {call.status === 'done'               && <CheckCircle2 size={12} className="shrink-0" style={{ color: '#4ade80' }} />}
+        {call.status === 'error'              && <XCircle size={12} className="shrink-0" style={{ color: 'var(--err)' }} />}
+        {call.status === 'awaiting_approval'  && <HelpCircle size={12} className="shrink-0" style={{ color: 'var(--warn,#ca8a04)' }} />}
         <span className="font-mono text-[12px] font-medium text-ink">{friendlyName(call.name)}</span>
         <span className="text-[11px] text-faint">
-          {call.status === 'pending' ? 'running…' : call.status === 'error' ? 'error' : 'done'}
+          {call.status === 'pending' ? 'running…' : call.status === 'error' ? 'error' : call.status === 'awaiting_approval' ? 'waiting on you' : 'done'}
         </span>
         {hasOutput && (
           <ChevronDown

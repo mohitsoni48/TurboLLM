@@ -80,6 +80,28 @@ export function regenerate(convId: string): Promise<{ ok: true }> {
   return req(`/api/v1/conversations/${encodeURIComponent(convId)}/regenerate`, { method: 'POST', json: {} })
 }
 
+// ── Tool-call approval gate ───────────────────────────────────────────────────
+
+/** Respond to a tool call awaiting interactive approval. Throws (via `req`'s
+ *  ApiError convention) on non-2xx — e.g. 404 if the approval already timed out
+ *  or was resolved by another client. */
+export function respondToolApproval(
+  convId: string,
+  toolCallId: string,
+  toolName: string,
+  decision: 'allow' | 'deny' | 'allow_chat' | 'always_allow',
+): Promise<void> {
+  return req(`/api/v1/conversations/${encodeURIComponent(convId)}/tool-calls/${encodeURIComponent(toolCallId)}/approve`, {
+    method: 'POST',
+    json: { toolName, decision },
+  })
+}
+
+/** The tool catalog available to the model, for the Tool Permissions settings UI. */
+export function fetchAvailableTools(): Promise<Array<{ name: string; description: string }>> {
+  return req<{ tools: Array<{ name: string; description: string }> }>('/api/v1/tools').then((r) => r.tools)
+}
+
 /** Streaming send — returns an async generator that yields typed SSE events. */
 export async function* sendMessage(
   convId: string,

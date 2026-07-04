@@ -27,9 +27,12 @@ export interface LiveToolCall {
   id: string
   name: string
   args: Record<string, unknown>
-  status: 'pending' | 'done' | 'error'
+  status: 'pending' | 'done' | 'error' | 'awaiting_approval'
   result?: string
 }
+
+/** Tool-call approval gate policy (mirrors turbollm/src/tools/tool-policy.ts). */
+export type ToolPolicy = 'ask' | 'allow' | 'deny'
 
 /** F-021: a single ranked research result from the retrieval service. */
 export interface ResearchSource {
@@ -106,6 +109,6 @@ export type ChatSseEvent =
   | { event: 'progress';  data: { phase: string; processed: number; total: number; pct: number; tps: number } }
   | { event: 'reasoning'; data: { delta: string } }
   | { event: 'delta';     data: { delta: string } }
-  | { event: 'tool_call'; data: { id: string; name: string; args: Record<string, unknown>; status: 'pending' | 'done' | 'error'; result?: string } }
+  | { event: 'tool_call'; data: { id: string; name: string; args: Record<string, unknown>; status: 'pending' | 'done' | 'error' | 'awaiting_approval'; result?: string } }
   | { event: 'done';      data: { message: Message } }
   | { event: 'error';     data: { code: string; message: string } }

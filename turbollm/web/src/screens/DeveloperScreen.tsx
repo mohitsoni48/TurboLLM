@@ -1,11 +1,16 @@
+import { useQuery } from '@tanstack/react-query'
 import { useState } from 'react'
-import { Globe, Key, Plus, Terminal, Trash2 } from 'lucide-react'
+import { ChevronRight, Globe, Key, Plus, ShieldCheck, Terminal, Trash2 } from 'lucide-react'
 import { CopyButton } from '../components/ui/copy-button'
 import { ScreenHeader } from '../components/common'
 import { Button } from '../components/ui/button'
-import { useApiKeys } from '../lib/queries'
-import { ApiError, getConnect, type ConnectInfo, type ConnectStep } from '../lib/api'
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../components/ui/collapsible'
+import { useApiKeys, useSettings } from '../lib/queries'
+import { ApiError, getConnect, type ConnectInfo, type ConnectStep, type ToolPolicy } from '../lib/api'
+import { fetchAvailableTools } from '../lib/chat-api'
+import { friendlyName } from './chat/MessageBubble'
 import { toast } from '../components/ui/sonner'
+import { cn } from '../lib/utils'
 
 const BASE = window.location.origin
 
@@ -33,6 +38,7 @@ export function DeveloperScreen() {
       <div className="flex flex-col gap-6">
         <ServerSection />
         <ApiKeysSection />
+        <ToolPermissionsSection />
         <ApisSection />
         <ConnectSection />
       </div>
@@ -147,6 +153,85 @@ function ApiKeysSection() {
         </Button>
       </div>
     </section>
+  )
+}
+
+// ── Tool permissions (F-025 approval gate) ───────────────────────────────────
+
+const POLICY_OPTIONS: { value: ToolPolicy; label: string }[] = [
+  { value: 'ask',   label: 'Ask' },
+  { value: 'allow', label: 'Allow' },
+  { value: 'deny',  label: 'Deny' },
+]
+
+function ToolPermissionsSection() {
+  const [open, setOpen] = useState(true)
+  const toolsQ = useQuery({ queryKey: ['available-tools'], queryFn: fetchAvailableTools })
+  const { query: settingsQ, save } = useSettings()
+  const tools = toolsQ.data ?? []
+  const policies = settingsQ.data?.toolPolicies ?? {}
+
+  const setPolicy = (name: string, value: ToolPolicy) => {
+    save.mutate(
+      { toolPolicies: { ...policies, [name]: value } },
+      { onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not update tool permission.') },
+    )
+  }
+
+  return (
+    <Collapsible open={open} onOpenChange={setOpen} className="rounded-lg border border-border bg-panel p-4">
+      <CollapsibleTrigger className="flex w-full items-center gap-2 text-left">
+        <ChevronRight size={14} className={cn('shrink-0 text-faint transition-transform', open && 'rotate-90')} />
+        <ShieldCheck size={15} className="text-accent" />
+        <h2 className="text-[13px] font-semibold uppercase tracking-wide text-faint">Tool permissions</h2>
+      </CollapsibleTrigger>
+      <CollapsibleContent>
+        <p className="mb-3 mt-3 text-[12px] text-muted">
+          Control whether each tool the model can call runs automatically, is always blocked, or asks
+          for your approval in chat each time.
+        </p>
+
+        {toolsQ.isLoading && <p className="text-[13px] text-faint">Loading tools…</p>}
+        {!toolsQ.isLoading && tools.length === 0 && (
+          <p className="text-[13px] text-faint">No tools available.</p>
+        )}
+
+        {tools.length > 0 && (
+          <div className="divide-y divide-border rounded-md border border-border">
+            {tools.map((t) => {
+              const current = policies[t.name] ?? 'ask'
+              return (
+                <div key={t.name} className="flex items-center justify-between gap-3 px-3 py-2.5">
+                  <div className="min-w-0">
+                    <div className="font-mono text-[13px] font-medium text-ink">{friendlyName(t.name)}</div>
+                    {t.description && (
+                      <div className="truncate text-[11px] text-faint" title={t.description}>{t.description}</div>
+                    )}
+                  </div>
+                  <div className="flex shrink-0 overflow-hidden rounded-lg border border-border">
+                    {POLICY_OPTIONS.map(({ value, label }) => (
+                      <button
+                        key={value}
+                        type="button"
+                        onClick={() => setPolicy(t.name, value)}
+                        disabled={save.isPending}
+                        className="px-3 py-1.5 text-[12px] transition-colors disabled:opacity-60"
+                        style={{
+                          background: current === value ? 'var(--accent)' : 'transparent',
+                          color: current === value ? 'var(--on-accent)' : 'var(--muted)',
+                        }}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        )}
+      </CollapsibleContent>
+    </Collapsible>
   )
 }
 

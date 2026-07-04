@@ -23,6 +23,11 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
+- **Tool-call approval gate for chat** — every tool call (web search, fetch URL, run code, MCP
+  tools) now asks for your approval by default before it runs. A small bar appears above the
+  message box with **Deny**, **Allow**, **Allow for this chat**, or **Always Allow**. Set
+  per-tool defaults (Ask / Allow / Deny) globally from Developer → Tool permissions. Replaces the
+  old `run_code`-only confirmation, which didn't actually work (it always ran anyway).
 - Fix source builds (CUDA engines) failing configure with a `-- unsupported Microsoft Visual
   Studio version!` CMake error on newer VS releases (e.g. VS2026) that CUDA's nvcc doesn't yet
   recognize as a supported host compiler — cmake now passes nvcc's own `-allow-unsupported-

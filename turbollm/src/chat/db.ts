@@ -21,6 +21,11 @@ export interface Conversation {
   kind: 'chat' | 'agent'
   /** Folder this conversation is filed under (v10). NULL/undefined = uncategorized. */
   folderId?: string | null
+  /** Per-conversation tool-approval overrides (v11, tool-call approval gate). Set via
+   *  "Allow for this chat" — persists across restarts. Only 'allow'/'deny' values;
+   *  absence of a key means "fall through to the global toolPolicies default".
+   *  Always populated (defaults to {}) when read via rowToConv/getConversation. */
+  toolOverrides?: Record<string, 'allow' | 'deny'>
   createdAt: string
   updatedAt: string
   messages?: Message[]
@@ -120,7 +125,7 @@ export interface Message {
   createdAt: string
 }
 
-interface ConvRow { id: string; title: string; system_prompt: string; model_key: string; sampling: string; expert_mode: number; tool_policy: string | null; kind: string | null; folder_id: string | null; created_at: string; updated_at: string }
+interface ConvRow { id: string; title: string; system_prompt: string; model_key: string; sampling: string; expert_mode: number; tool_policy: string | null; kind: string | null; folder_id: string | null; tool_overrides: string | null; created_at: string; updated_at: string }
 interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null }
 interface FolderRow { id: string; name: string; sort_order: number; created_at: string; updated_at: string }
 interface MsgRow  { id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string; reasoning: string; attachments: string; text_attachments: string | null; tool_calls: string | null; stats: string; model_key: string | null; research_meta: string | null; created_at: string }
@@ -130,8 +135,19 @@ type P = Record<string, SQLInputValue>
 
 function safeJson(s: string): unknown { try { return JSON.parse(s) } catch { return {} } }
 
+function safeToolOverrides(s: string | null): Record<string, 'allow' | 'deny'> {
+  if (!s) return {}
+  const parsed = safeJson(s)
+  if (typeof parsed !== 'object' || parsed === null) return {}
+  const out: Record<string, 'allow' | 'deny'> = {}
+  for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+    if (v === 'allow' || v === 'deny') out[k] = v
+  }
+  return out
+}
+
 function rowToConv(r: ConvRow): Conversation {
-  return { id: r.id, title: r.title, systemPrompt: r.system_prompt, modelKey: r.model_key, sampling: safeJson(r.sampling) as Record<string, unknown>, expertMode: r.expert_mode === 1, toolPolicy: r.tool_policy ?? undefined, kind: (r.kind === 'agent' ? 'agent' : 'chat'), folderId: r.folder_id ?? null, createdAt: r.created_at, updatedAt: r.updated_at }
+  return { id: r.id, title: r.title, systemPrompt: r.system_prompt, modelKey: r.model_key, sampling: safeJson(r.sampling) as Record<string, unknown>, expertMode: r.expert_mode === 1, toolPolicy: r.tool_policy ?? undefined, kind: (r.kind === 'agent' ? 'agent' : 'chat'), folderId: r.folder_id ?? null, toolOverrides: safeToolOverrides(r.tool_overrides), createdAt: r.created_at, updatedAt: r.updated_at }
 }
 
 function rowToFolder(r: FolderRow): Folder {
@@ -286,6 +302,13 @@ export class ConversationStore {
         PRAGMA user_version = 10;
       `)
     }
+    // v11 (tool-call approval gate): per-conversation "Allow for this chat" overrides,
+    // persisted as JSON so they survive a restart. Nullable — existing rows get NULL
+    // and are decoded as {} in rowToConv (non-breaking).
+    if (v < 11) {
+      this.db.exec("ALTER TABLE conversations ADD COLUMN tool_overrides TEXT")
+      this.db.exec("PRAGMA user_version = 11")
+    }
   }
 
   listConversations(q?: string, kind: 'chat' | 'agent' | 'all' = 'all'): Conversation[] {
@@ -330,6 +353,22 @@ export class ConversationStore {
     if (patch.systemPrompt !== undefined) { sets.push('system_prompt = $sp'); params.$sp    = patch.systemPrompt }
     if (patch.sampling !== undefined)     { sets.push('sampling = $samp');    params.$samp  = JSON.stringify(patch.sampling) }
     return ((this.db.prepare(`UPDATE conversations SET ${sets.join(', ')} WHERE id = $id`).run(params) as unknown) as Changes).changes > 0
+  }
+
+  /** Per-conversation tool-approval overrides (tool-call approval gate). Empty object
+   *  when unset or the conversation does not exist. */
+  getToolOverrides(id: string): Record<string, 'allow' | 'deny'> {
+    const row = this.db.prepare(`SELECT tool_overrides FROM conversations WHERE id = $id`).get({ $id: id } as P) as unknown as { tool_overrides: string | null } | undefined
+    return safeToolOverrides(row?.tool_overrides ?? null)
+  }
+
+  /** Merges `{[toolName]: decision}` into the conversation's persisted tool overrides
+   *  ("Allow for this chat" — survives a restart). No-op if the conversation is missing. */
+  setToolOverride(id: string, toolName: string, decision: 'allow' | 'deny'): void {
+    const current = this.getToolOverrides(id)
+    current[toolName] = decision
+    this.db.prepare(`UPDATE conversations SET tool_overrides = $json WHERE id = $id`)
+      .run({ $id: id, $json: JSON.stringify(current) } as P)
   }
 
   touchConversation(id: string): void {

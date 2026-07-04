@@ -1,7 +1,9 @@
-// Security hardening tests (F-019): SSRF block on fetch_url, run_code confirmation gate.
+// Security hardening tests: SSRF block on fetch_url. run_code confirmation is now
+// handled upstream by the tool-call approval gate (execute-with-approval.ts) —
+// execRunCode itself always executes.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { checkSsrf, RUN_CODE_BLOCKED_MSG } from './security'
+import { checkSsrf } from './security'
 import { execFetchUrl, execRunCode } from './builtin'
 
 // ── SSRF block ────────────────────────────────────────────────────────────────
@@ -59,19 +61,9 @@ test('execFetchUrl blocks localhost end-to-end', async () => {
   assert.match(result, /blocked/)
 })
 
-// ── run_code confirmation gate ─────────────────────────────────────────────────
+// ── run_code always executes (gating happens upstream) ───────────────────────────
 
-test('execRunCode with requireConfirmation=true skips execution and returns confirmation message', () => {
-  const result = execRunCode({ code: 'return 1 + 1' }, true)
-  assert.strictEqual(result, RUN_CODE_BLOCKED_MSG)
-})
-
-test('execRunCode with requireConfirmation=false executes normally', () => {
-  const result = execRunCode({ code: 'return 1 + 1' }, false)
+test('execRunCode executes normally', () => {
+  const result = execRunCode({ code: 'return 1 + 1' })
   assert.strictEqual(result, '2')
-})
-
-test('execRunCode defaults to executing when requireConfirmation not passed', () => {
-  const result = execRunCode({ code: 'return 2 + 2' })
-  assert.strictEqual(result, '4')
 })

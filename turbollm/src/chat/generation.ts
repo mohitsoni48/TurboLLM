@@ -7,6 +7,7 @@ import { engineModelAlias } from '../engines/compat'
 import { feedChunk, flushState, initParseState } from './parser'
 import { needsExtraPass } from './think-utils'
 import { checkReply } from '../tools/research-referee.js'
+import { executeToolCallWithApproval } from '../tools/execute-with-approval'
 import type { ClaimVerdict, Message, MessageStats, ResearchMeta, ResearchSource, ToolCallRecord } from './db'
 
 /** One event emitted by the generation loop — the sink decides what to do with it. */
@@ -273,25 +274,22 @@ export async function runGeneration(d: Deps, sink: EventSink, ctx: GenerationCtx
           try { parsedArgs = JSON.parse(tc.argsBuffer || '{}') as Record<string, unknown> }
           catch { parsedArgs = {} }
 
-          // run_code confirmation: only for foreground chat (agents pre-authorized at launch)
-          const requireConfirm =
-            tc.name === 'run_code' &&
-            ctx.allowedTools === undefined &&
-            d.store.snapshot().tools.requireRunCodeConfirmation !== false
-          if (requireConfirm) {
-            await sink({ event: 'tool_confirmation_required', data: { id: tc.id, name: tc.name, args: parsedArgs } })
-          }
-
-          await sink({ event: 'tool_call', data: { id: tc.id, name: tc.name, args: parsedArgs, status: 'pending' } })
-
-          let result = ''
-          let callError: string | undefined
-          try {
-            result = await d.tools.executeTool({ id: tc.id, name: tc.name, args: parsedArgs })
-          } catch (e) {
-            callError = (e as Error).message
-            result = `Error: ${callError}`
-          }
+          // Background agent runs never block waiting for a human (interactive: false) —
+          // 'ask'-policy tools are denied outright by the shared approval-gate executor.
+          const { result, error: callError } = await executeToolCallWithApproval({
+            tools: d.tools,
+            sink,
+            convId,
+            id: tc.id,
+            name: tc.name,
+            args: parsedArgs,
+            globalPolicies: d.store.snapshot().tools.toolPolicies ?? {},
+            // Re-read fresh on every iteration rather than the `conv` snapshot captured at
+            // request start, so a concurrently-updated override is always seen.
+            convOverrides: d.db.getToolOverrides(convId),
+            signal: ac.signal,
+            interactive: false,
+          })
 
           if (tc.name === 'web_search' && !callError) {
             searchCallCount++
@@ -309,7 +307,6 @@ export async function runGeneration(d: Deps, sink: EventSink, ctx: GenerationCtx
           }
 
           allToolCalls.push({ id: tc.id, name: tc.name, args: parsedArgs, result: callError ? undefined : result, error: callError })
-          await sink({ event: 'tool_call', data: { id: tc.id, name: tc.name, args: parsedArgs, status: callError ? 'error' : 'done', result } })
           iterMessages.push({ role: 'tool', content: result, tool_call_id: tc.id })
         }
 
