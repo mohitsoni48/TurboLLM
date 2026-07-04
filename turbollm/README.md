@@ -79,7 +79,7 @@ TurboLLM does the opposite:
   a **VRAM-fit verdict before you load** — no more flag guessing.
 - **📊 Real tokens/sec, never faked.** Speed in the model list is *measured on your machine*
   from actual generation — live while you chat, and remembered per model.
-- **🪶 Lightweight.** A ~0.3 MB npm package on Node — **no Electron, no bundled Chromium, no
+- **🪶 Lightweight.** A ~2 MB npm package on Node — **no Electron, no bundled Chromium, no
   Python**. It downloads only the engine your GPU actually needs (Vulkan ≈ 38 MB).
 - **🔌 Drop-in APIs.** OpenAI **and** Anthropic-compatible — so Claude Code and every existing
   tool work unchanged.
@@ -289,7 +289,7 @@ connected); **Remove** undoes it.
 
 <br/>
 
-- A **~0.3 MB npm package** on Node — no Electron, no bundled Chromium, no Python.
+- A **~2 MB npm package** on Node — no Electron, no bundled Chromium, no Python.
 - **Offline-first** — no account, no backend, no internet, no telemetry.
 - **Windows · macOS · Linux**, with a CPU fallback when there's no GPU.
 
