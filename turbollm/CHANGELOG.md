@@ -23,19 +23,48 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [1.7.0] - 2026-07-04
+
+**Cloud Launch tunneling, a configurable VRAM headroom, and a real tool-call approval gate.**
+
+### Added
+- **Cloud Launch (`turbollm --tunnel`)** — spin up a cloudflared quick tunnel and share your
+  local TurboLLM over the internet with one flag, no port forwarding or reverse proxy to set
+  up. An access token is auto-provisioned and required on all tunneled traffic; local access
+  stays unauthenticated as before.
+- **VRAM headroom slider** (Settings → Engine, 300 MB–2 GB, default 1 GB) — tell auto-tune how
+  much VRAM to keep free for other GPU workloads (ComfyUI, a browser full of tabs, etc.)
+  instead of the previous fixed 1 GB margin.
 - **Tool-call approval gate for chat** — every tool call (web search, fetch URL, run code, MCP
   tools) now asks for your approval by default before it runs. A small bar appears above the
   message box with **Deny**, **Allow**, **Allow for this chat**, or **Always Allow**. Set
   per-tool defaults (Ask / Allow / Deny) globally from Developer → Tool permissions. Replaces the
-  old `run_code`-only confirmation, which didn't actually work (it always ran anyway).
-- Fix source builds (CUDA engines) failing configure with a `-- unsupported Microsoft Visual
+  old `run_code`-only confirmation, which didn't actually work (it always ran anyway). Background
+  agents are unaffected — a tool an agent is configured to use still runs without a prompt, since
+  there's no one there to ask.
+
+### Fixed
+- **Dual-GPU systems no longer show the wrong VRAM total** on the Engines screen — the "Your
+  hardware" hero card fell back to a single un-summed GPU's VRAM instead of the primary-vendor
+  sum whenever the recommendation query hadn't resolved yet, which happened on effectively every
+  page load.
+- Source builds (CUDA engines) no longer fail configure with a `-- unsupported Microsoft Visual
   Studio version!` CMake error on newer VS releases (e.g. VS2026) that CUDA's nvcc doesn't yet
   recognize as a supported host compiler — cmake now passes nvcc's own `-allow-unsupported-
   compiler` escape hatch by default, for both the in-app 1-click build and the manual command
   list in the build guide.
-- Fix the build guide's manual command list producing an engine that silently ran CPU-only:
+- The build guide's manual command list no longer produces an engine that silently runs CPU-only:
   a source build doesn't bundle the CUDA runtime, so the commands now also copy the CUDA
   DLLs/shared libs next to the binary — matching what the 1-click build already does.
+- The opencode connect snippet now uses the correct singular `provider` config key.
+
+### Discord
+- New: `turbollm --tunnel` shares your local TurboLLM over the internet in one command, no port forwarding or reverse proxy setup needed.
+- New: a VRAM headroom slider in Settings → Engine lets you tell auto-tune how much VRAM to keep free for other apps like ComfyUI.
+- Tool calls in chat (web search, fetch, run code, MCP tools) now ask for your approval by default, with Deny, Allow, Allow for this chat, or Always Allow.
+- Fixed dual-GPU systems showing the wrong total VRAM on the Engines screen.
 
 ## [1.6.5] - 2026-07-03
 
