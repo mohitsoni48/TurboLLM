@@ -65,7 +65,6 @@ const TURBOLLM_KNOWLEDGE =
   '- ComfyUI integration: URL of a ComfyUI instance; Reverse GPU gate: TurboLLM calls ComfyUI /free before every model load so VRAM is freed first; update banner when installed ComfyUI node is out of date\n' +
   '- Gateway: auto model-swap toggle + Keep-N pool (1–4 models loaded simultaneously, LRU eviction)\n' +
   '- Auth / API key: gateway key required from clients\n' +
-  '- Cloud Launch: start with `turbollm --tunnel` for a cloudflared quick tunnel that shares this instance over the internet (not a Settings toggle — a launch flag); an access token is auto-provisioned and enforced on all tunneled traffic, local access is unaffected\n' +
   '- Telemetry: Off / Anonymous / Full\n' +
   '- About: current version, update-available chip (`npm i -g turbollm`), copy install command\n\n' +
 

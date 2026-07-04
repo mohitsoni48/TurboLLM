@@ -27,13 +27,9 @@ _Nothing yet._
 
 ## [1.7.0] - 2026-07-04
 
-**Cloud Launch tunneling, a configurable VRAM headroom, and a real tool-call approval gate.**
+**A configurable VRAM headroom, a real tool-call approval gate for chat, and engine build fixes.**
 
 ### Added
-- **Cloud Launch (`turbollm --tunnel`)** — spin up a cloudflared quick tunnel and share your
-  local TurboLLM over the internet with one flag, no port forwarding or reverse proxy to set
-  up. An access token is auto-provisioned and required on all tunneled traffic; local access
-  stays unauthenticated as before.
 - **VRAM headroom slider** (Settings → Engine, 300 MB–2 GB, default 1 GB) — tell auto-tune how
   much VRAM to keep free for other GPU workloads (ComfyUI, a browser full of tabs, etc.)
   instead of the previous fixed 1 GB margin.
@@ -61,7 +57,6 @@ _Nothing yet._
 - The opencode connect snippet now uses the correct singular `provider` config key.
 
 ### Discord
-- New: `turbollm --tunnel` shares your local TurboLLM over the internet in one command, no port forwarding or reverse proxy setup needed.
 - New: a VRAM headroom slider in Settings → Engine lets you tell auto-tune how much VRAM to keep free for other apps like ComfyUI.
 - Tool calls in chat (web search, fetch, run code, MCP tools) now ask for your approval by default, with Deny, Allow, Allow for this chat, or Always Allow.
 - Fixed dual-GPU systems showing the wrong total VRAM on the Engines screen.

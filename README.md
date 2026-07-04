@@ -254,9 +254,6 @@ curl http://127.0.0.1:6996/v1/chat/completions \
   Claude Code below. No other local host offers this.
 - **Structured output** — constrain any response to a **GBNF grammar** (or JSON shape).
 - **API-key auth** you can require when sharing over a LAN (Settings → Network).
-- **Cloud Launch (`turbollm --tunnel`)** — share your local instance over the internet with one
-  flag via a cloudflared quick tunnel, no port forwarding or reverse proxy to set up. An access
-  token is auto-provisioned and enforced on all tunneled traffic; local access is unaffected.
 
 **The gateway loads models for you.** Most local hosts make you load a model first, then call it.
 TurboLLM's gateway reads the `model` field of any incoming request, **fuzzy-matches it to your
