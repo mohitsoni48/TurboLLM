@@ -206,10 +206,28 @@ export async function checkBuildPrereqs(toolchainDirs: string[] = []): Promise<B
   return { supported: true, os: platform === 'win32' ? 'windows' : 'linux', tools }
 }
 
+/** The cmake CUDA configure flags — shared with the 1-click build (build-runner.ts imports
+ *  this) so the manual path below can never drift from what the in-app builder actually runs.
+ *  `-allow-unsupported-compiler` works around nvcc's hardcoded host-compiler allowlist (e.g.
+ *  CUDA 13.0 only recognizes MSVC toolsets up to VS2022): a new VS/GCC release routinely ships
+ *  before NVIDIA updates that list, and CMake's own CUDA compiler-id trial-compile dies on it
+ *  before any real compilation happens. The flag only skips that version *check* — a no-op when
+ *  the host compiler is already allowlisted — so it's safe to pass unconditionally. */
+export const CMAKE_CONFIGURE_ARGS = ['-DGGML_CUDA=ON', '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler']
+
+/** CUDA runtime DLLs (Windows) / shared libs (Linux) a llama.cpp CUDA build links against at
+ *  runtime. A build does NOT bundle these, so without copying them next to the binary the
+ *  engine silently falls back to CPU. Shared with build-runner.ts's 1-click-build copy step. */
+export const CUDA_RUNTIME_DLL_PREFIXES = ['cudart64_', 'cublas64_', 'cublaslt64_', 'nvrtc64_', 'nvrtc-builtins64_', 'nvjitlink_']
+export const CUDA_RUNTIME_SO_PREFIXES = ['libcudart.so', 'libcublas.so', 'libcublasLt.so', 'libnvrtc.so', 'libnvrtc-builtins.so', 'libnvJitLink.so']
+
 /** PURE: the exact build command list for `repoUrl` (optional `branch`) on `os`. Used by
  *  the guide's copy-able command block. The trailing comment notes where the binary lands
  *  so the user knows what to point "Add your own engine" at. Defaults to the host's own
- *  platform when `os` is omitted (matches what the 1-click build actually runs here). */
+ *  platform when `os` is omitted (matches what the 1-click build actually runs here). A
+ *  source build doesn't bundle the CUDA runtime, so — mirroring build-runner.ts's own
+ *  post-build copy — we add a step that bundles it next to the binary; otherwise the built
+ *  engine runs (CPU-only) with no indication it silently skipped the GPU. */
 export function buildCommands(
   repoUrl: string,
   branch?: string,
@@ -221,20 +239,34 @@ export function buildCommands(
   const clone = b
     ? `git clone --branch "${b}" --depth 1 "${repoUrl}" turbo-build`
     : `git clone --depth 1 "${repoUrl}" turbo-build`
+  const configure = `cmake -B build ${CMAKE_CONFIGURE_ARGS.join(' ')}`
   if (os === 'linux') {
+    // CUDA 13 vs 12 lay the runtime libs out differently (lib64 vs lib vs the
+    // targets/x86_64-linux/lib some installers use) — try all three; a glob that matches
+    // nothing just makes cp emit a (silenced) "no such file" for that one literal token.
+    const libGlobs = ['lib64', 'lib', 'targets/x86_64-linux/lib']
+      .flatMap((dir) => CUDA_RUNTIME_SO_PREFIXES.map((p) => `$CUDA_ROOT/${dir}/${p}*`))
+      .join(' ')
     return [
       clone,
       'cd turbo-build',
-      'cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release',
+      configure,
       'cmake --build build -j --target llama-server',
-      '# Built binary: build/bin/llama-server — add it via "Add your own engine".',
+      'CUDA_ROOT="$(dirname "$(dirname "$(command -v nvcc)")")"',
+      `cp ${libGlobs} build/bin/ 2>/dev/null`,
+      '# Built binary + its CUDA runtime libs: build/bin/llama-server — add it via "Add your own engine".',
     ]
   }
+  // CUDA 13 ships the runtime DLLs under bin\x64; CUDA 12 puts them in bin itself — check both.
+  const dllGlobs = ['bin', 'bin\\x64']
+    .flatMap((dir) => CUDA_RUNTIME_DLL_PREFIXES.map((p) => `"%CUDA_PATH%\\${dir}\\${p}*.dll"`))
+    .join(' ')
   return [
     clone,
     'cd turbo-build',
-    'cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release',
+    configure,
     'cmake --build build --config Release -j --target llama-server',
-    '# Built binary: build\\bin\\Release\\llama-server.exe — add it via "Add your own engine".',
+    `for %f in (${dllGlobs}) do copy /y "%f" "build\\bin\\Release\\" >nul 2>&1`,
+    '# Built binary + its CUDA runtime DLLs: build\\bin\\Release\\llama-server.exe — add it via "Add your own engine".',
   ]
 }

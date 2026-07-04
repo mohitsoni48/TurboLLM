@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { delimiter } from 'node:path'
-import { buildCommands, buildEnv } from './build-prereqs'
+import { buildCommands, buildEnv, CMAKE_CONFIGURE_ARGS } from './build-prereqs'
 
 const PATH_KEY = Object.keys(process.env).find((k) => k.toLowerCase() === 'path') ?? 'PATH'
 
@@ -104,11 +104,11 @@ test('buildCommands: passes the repo URL through verbatim', () => {
   assert.ok(cmds[0].includes(url))
 })
 
-test('buildCommands: produces the Windows + CUDA cmake steps and the binary-location note', () => {
+test('buildCommands: produces the Windows + CUDA cmake steps (incl. the unsupported-compiler escape hatch) and the binary-location note', () => {
   const cmds = buildCommands('https://github.com/owner/repo', undefined, 'windows')
   assert.deepEqual(cmds.slice(1, 4), [
     'cd turbo-build',
-    'cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release',
+    `cmake -B build ${CMAKE_CONFIGURE_ARGS.join(' ')}`,
     'cmake --build build --config Release -j --target llama-server',
   ])
   assert.match(cmds[cmds.length - 1], /llama-server\.exe/)
@@ -119,9 +119,27 @@ test('buildCommands: produces the Linux + CUDA cmake steps (no config flag, no .
   const cmds = buildCommands('https://github.com/owner/repo', undefined, 'linux')
   assert.deepEqual(cmds.slice(1, 4), [
     'cd turbo-build',
-    'cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release',
+    `cmake -B build ${CMAKE_CONFIGURE_ARGS.join(' ')}`,
     'cmake --build build -j --target llama-server',
   ])
   assert.match(cmds[cmds.length - 1], /build\/bin\/llama-server/)
   assert.ok(!cmds[cmds.length - 1].includes('.exe'))
+})
+
+// Regression: the manual path used to skip bundling the CUDA runtime — the build succeeded
+// but the produced engine silently ran CPU-only until the DLLs/libs were found by hand.
+test('buildCommands: Windows bundles the CUDA runtime DLLs (both CUDA 12 and 13 layouts) next to the binary', () => {
+  const cmds = buildCommands('https://github.com/owner/repo', undefined, 'windows')
+  const copyStep = cmds[4]
+  assert.match(copyStep, /^for %f in \(.*\) do copy \/y "%f" "build\\bin\\Release\\" >nul 2>&1$/)
+  assert.match(copyStep, /"%CUDA_PATH%\\bin\\cudart64_\*\.dll"/)
+  assert.match(copyStep, /"%CUDA_PATH%\\bin\\x64\\cudart64_\*\.dll"/)
+})
+
+test('buildCommands: Linux bundles the CUDA runtime shared libs next to the binary', () => {
+  const cmds = buildCommands('https://github.com/owner/repo', undefined, 'linux')
+  assert.equal(cmds[4], 'CUDA_ROOT="$(dirname "$(dirname "$(command -v nvcc)")")"')
+  const copyStep = cmds[5]
+  assert.match(copyStep, /^cp .* build\/bin\/ 2>\/dev\/null$/)
+  assert.match(copyStep, /\$CUDA_ROOT\/lib64\/libcudart\.so\*/)
 })

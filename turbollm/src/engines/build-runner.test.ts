@@ -21,8 +21,12 @@ test('buildDirName: unparseable URL falls back to "engine"', () => {
   assert.equal(buildDirName('   '), 'engine')
 })
 
-test('CMAKE_CONFIGURE_ARGS: enables CUDA + Release', () => {
-  assert.deepEqual(CMAKE_CONFIGURE_ARGS, ['-DGGML_CUDA=ON', '-DCMAKE_BUILD_TYPE=Release'])
+test('CMAKE_CONFIGURE_ARGS: enables CUDA + Release, allows an unrecognized-but-newer host compiler', () => {
+  assert.deepEqual(CMAKE_CONFIGURE_ARGS, [
+    '-DGGML_CUDA=ON',
+    '-DCMAKE_BUILD_TYPE=Release',
+    '-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler',
+  ])
 })
 
 test('pickGenerator: Ninja when available regardless of platform', () => {

@@ -23,7 +23,14 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
-_Nothing yet._
+- Fix source builds (CUDA engines) failing configure with a `-- unsupported Microsoft Visual
+  Studio version!` CMake error on newer VS releases (e.g. VS2026) that CUDA's nvcc doesn't yet
+  recognize as a supported host compiler — cmake now passes nvcc's own `-allow-unsupported-
+  compiler` escape hatch by default, for both the in-app 1-click build and the manual command
+  list in the build guide.
+- Fix the build guide's manual command list producing an engine that silently ran CPU-only:
+  a source build doesn't bundle the CUDA runtime, so the commands now also copy the CUDA
+  DLLs/shared libs next to the binary — matching what the 1-click build already does.
 
 ## [1.6.5] - 2026-07-03
 
