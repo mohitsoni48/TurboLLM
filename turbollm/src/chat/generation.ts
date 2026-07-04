@@ -289,6 +289,7 @@ export async function runGeneration(d: Deps, sink: EventSink, ctx: GenerationCtx
             convOverrides: d.db.getToolOverrides(convId),
             signal: ac.signal,
             interactive: false,
+            agentAllowedTools: ctx.allowedTools,
           })
 
           if (tc.name === 'web_search' && !callError) {

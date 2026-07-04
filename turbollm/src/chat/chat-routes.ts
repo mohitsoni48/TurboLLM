@@ -152,6 +152,10 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       decisionToApply = 'deny'
     }
 
+    // Invariant: the policy write above must happen before resolveToolApproval below.
+    // A same-turn repeat tool call re-reads policies fresh on every iteration (generation.ts),
+    // so resolving the gate first would let it observe the stale pre-approval policy and
+    // re-prompt for a tool the user just marked "Always Allow" / "Allow for this chat".
     const key = `${convId}:${toolCallId}`
     const ok = resolveToolApproval(key, decisionToApply)
     if (!ok) return err(c, 404, 'not_found', 'No pending approval for this tool call (it may have already timed out or been resolved).')

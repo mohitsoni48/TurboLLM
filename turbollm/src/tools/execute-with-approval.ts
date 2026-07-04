@@ -19,10 +19,15 @@ export async function executeToolCallWithApproval(params: {
   convOverrides: Record<string, 'allow' | 'deny'>
   signal: AbortSignal
   /** true for live foreground chat (can prompt a human); false for background agent runs
-   *  (must never hang waiting for a human — 'ask'-policy tools are denied outright). */
+   *  (must never hang waiting for a human — 'ask'-policy tools are denied unless
+   *  pre-approved via agentAllowedTools). */
   interactive: boolean
+  /** For background agent runs only: the tool names this agent was explicitly configured
+   *  to use. A human already approved this list when setting up the agent, so it stands
+   *  in for the interactive approval a background run can never get. */
+  agentAllowedTools?: string[]
 }): Promise<{ result: string; error?: string }> {
-  const { tools, sink, convId, id, name, args, globalPolicies, convOverrides, signal, interactive } = params
+  const { tools, sink, convId, id, name, args, globalPolicies, convOverrides, signal, interactive, agentAllowedTools } = params
 
   const policy = resolveToolPolicy(name, globalPolicies, convOverrides)
 
@@ -36,19 +41,23 @@ export async function executeToolCallWithApproval(params: {
 
   if (policy === 'ask') {
     if (!interactive) {
-      const result = 'Blocked: this tool requires interactive approval, which is not available for background agent runs.'
-      await sink({ event: 'tool_call', data: { id, name, args, status: 'done', result } })
-      return { result }
+      if (agentAllowedTools?.includes(name)) {
+        cameFromApprovedAsk = true
+      } else {
+        const result = "Blocked: this tool requires interactive approval, which is not available for background agent runs. Add it to this agent's allowed tools, or set it to Allow in Developer → Tool permissions."
+        await sink({ event: 'tool_call', data: { id, name, args, status: 'done', result } })
+        return { result }
+      }
+    } else {
+      await sink({ event: 'tool_call', data: { id, name, args, status: 'awaiting_approval' } })
+      const decision = await waitForToolApproval(`${convId}:${id}`, signal)
+      if (decision === 'deny') {
+        const result = 'Denied by user.'
+        await sink({ event: 'tool_call', data: { id, name, args, status: 'done', result } })
+        return { result }
+      }
+      cameFromApprovedAsk = true
     }
-
-    await sink({ event: 'tool_call', data: { id, name, args, status: 'awaiting_approval' } })
-    const decision = await waitForToolApproval(`${convId}:${id}`, signal)
-    if (decision === 'deny') {
-      const result = 'Denied by user.'
-      await sink({ event: 'tool_call', data: { id, name, args, status: 'done', result } })
-      return { result }
-    }
-    cameFromApprovedAsk = true
   }
 
   // policy === 'allow', or fell through from an approved 'ask'.
