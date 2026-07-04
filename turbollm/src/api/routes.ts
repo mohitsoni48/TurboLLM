@@ -6,7 +6,7 @@ import { basename, dirname, join, resolve, sep } from 'node:path'
 import { GATE_VERSION, gateNodeSource } from '../comfyui/gate-template'
 import { randomUUID } from 'node:crypto'
 import { homedir, networkInterfaces } from 'node:os'
-import { ValueError, getModelProfile, setModelProfile, deleteModelProfile, type ApiKey, type Engine, type McpServer } from '../config/config'
+import { ValueError, getModelProfile, setModelProfile, deleteModelProfile, VRAM_HEADROOM_MIN_MB, VRAM_HEADROOM_MAX_MB, type ApiKey, type Engine, type McpServer } from '../config/config'
 import type { Deps } from '../deps'
 import { type ModelInfo, type StartOpts } from '../engines/manager'
 import { abortAllInFlightChats } from '../chat/chat-routes'
@@ -1377,6 +1377,7 @@ export function registerApi(app: Hono, d: Deps): void {
       autoGenerateTitles?: boolean
       openBrowserOnStart?: boolean
       autoLoadOnStart?: boolean
+      vramHeadroomMb?: number
       lanBind?: boolean
       requireApiKey?: boolean
       telemetryLevel?: string
@@ -1412,6 +1413,17 @@ export function registerApi(app: Hono, d: Deps): void {
     }
     if (b.autoGenerateTitles !== undefined) updates.autoGenerateTitles = !!b.autoGenerateTitles
     if (b.openBrowserOnStart !== undefined) updates.openBrowserOnStart = !!b.openBrowserOnStart
+
+    // VRAM headroom slider for auto-tune (bench.ts's overHeadroom). config.validate() also
+    // enforces this range and would throw on update() otherwise; reject here for a clean 400.
+    let vramHeadroomMb: number | undefined
+    if (b.vramHeadroomMb !== undefined) {
+      const v = Number(b.vramHeadroomMb)
+      if (!Number.isFinite(v) || v < VRAM_HEADROOM_MIN_MB || v > VRAM_HEADROOM_MAX_MB) {
+        return err(c, 400, 'invalid_config_value', `vramHeadroomMb must be ${VRAM_HEADROOM_MIN_MB}–${VRAM_HEADROOM_MAX_MB}.`)
+      }
+      vramHeadroomMb = Math.round(v)
+    }
     // LAN expose toggle (spec 08 §2). Persist only; auto daemon-restart is deferred —
     // the UI tells the user to restart to apply.
     if (b.lanBind !== undefined) updates.lanBind = !!b.lanBind
@@ -1526,6 +1538,7 @@ export function registerApi(app: Hono, d: Deps): void {
       if (toolchainDirs !== undefined) cfg.build.toolchainDirs = toolchainDirs
       if (toolPolicies !== undefined) cfg.tools.toolPolicies = toolPolicies
       if (b.autoLoadOnStart !== undefined) cfg.autoLoadOnStart = !!b.autoLoadOnStart
+      if (vramHeadroomMb !== undefined) cfg.vramHeadroomMb = vramHeadroomMb
       if (telemetryLevel !== undefined) cfg.telemetry.level = telemetryLevel
       // Cloud Launch deploy-link settings (ADR-153): the RunPod Template ID the user
       // published themselves (deploy/runpod/README.md) — not a secret, just an id.
@@ -1984,6 +1997,7 @@ function settingsPayload(d: Deps) {
     autoGenerateTitles: cfg.daemon.autoGenerateTitles,
     openBrowserOnStart: cfg.daemon.openBrowserOnStart,
     autoLoadOnStart: cfg.autoLoadOnStart,
+    vramHeadroomMb: cfg.vramHeadroomMb,
     lanBind: cfg.daemon.lanBind,
     requireApiKey: cfg.daemon.requireApiKey,
     telemetryLevel,

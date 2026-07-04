@@ -9,6 +9,12 @@ import { dirname, join } from 'node:path'
 
 export const SCHEMA_VERSION = 3
 
+/** VRAM headroom slider bounds (MB) for auto-tune's spill-safety margin (see
+ *  {@link Config.vramHeadroomMb} and `bench.ts`'s `overHeadroom`). */
+export const VRAM_HEADROOM_MIN_MB = 300
+export const VRAM_HEADROOM_MAX_MB = 2048
+export const VRAM_HEADROOM_DEFAULT_MB = 1024
+
 export interface Capabilities {
   kvTypes: string[]
   flags: string[]
@@ -226,6 +232,13 @@ export interface Config {
   /** Persisted auto-tune results keyed by modelKey (spec 09 §1, 01 §4). Additive;
    *  absent in old configs → normalize seeds {}. Never throws on load. */
   benchResults: Record<string, BenchResult>
+  /** VRAM to keep free during auto-tune's offload search (MB), so a later desktop /
+   *  ComfyUI VRAM grab can't tip the chosen config into a sysmem spill (bench.ts's
+   *  `overHeadroom`). User-configurable via a Settings slider,
+   *  {@link VRAM_HEADROOM_MIN_MB}–{@link VRAM_HEADROOM_MAX_MB}, default
+   *  {@link VRAM_HEADROOM_DEFAULT_MB}. Absent in pre-this-feature configs → normalize
+   *  seeds the default. */
+  vramHeadroomMb: number
   lastLoaded: LastLoaded
   autoLoadOnStart: boolean
   hf: HF
@@ -339,6 +352,7 @@ export function defaultConfig(): Config {
     primaryModelDir: '',
     modelProfiles: {},
     benchResults: {},
+    vramHeadroomMb: VRAM_HEADROOM_DEFAULT_MB,
     lastLoaded: { modelKey: '', engineId: '' },
     autoLoadOnStart: false,
     hf: { token: '' },
@@ -516,6 +530,12 @@ function normalize(c: Config): void {
   }
   // Persisted auto-tune results (spec 09 §1): absent in pre-bench configs → {}.
   c.benchResults ??= {}
+  // VRAM headroom slider: absent/garbage (pre-feature config, or a stale out-of-range
+  // value) → the default, never thrown on load — mirrors the gateway.keepN clamp below.
+  c.vramHeadroomMb =
+    typeof c.vramHeadroomMb === 'number' && c.vramHeadroomMb >= VRAM_HEADROOM_MIN_MB && c.vramHeadroomMb <= VRAM_HEADROOM_MAX_MB
+      ? c.vramHeadroomMb
+      : VRAM_HEADROOM_DEFAULT_MB
   c.autoLoadOnStart ??= false
   c.featuredOverrideUrl ??= ''
   // ComfyUI coordination (absent in pre-comfyui configs → defaults; never throw on an
@@ -636,6 +656,9 @@ function validate(c: Config): void {
   }
   if (c.activeEngineId && !c.engines.some((e) => e.id === c.activeEngineId)) {
     throw new ValueError('activeEngineId', 'unknown engine id')
+  }
+  if (c.vramHeadroomMb < VRAM_HEADROOM_MIN_MB || c.vramHeadroomMb > VRAM_HEADROOM_MAX_MB) {
+    throw new ValueError('vramHeadroomMb', `must be between ${VRAM_HEADROOM_MIN_MB} and ${VRAM_HEADROOM_MAX_MB} MB`)
   }
   // ComfyUI reverse-gate origin (F-011): empty is allowed (reverse gate just stays off);
   // if set, it must be an http(s):// origin so the `POST {url}/free` call is well-formed.
