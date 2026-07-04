@@ -2301,7 +2301,7 @@ function buildConnectSnippets(cli: string, base: string, apiKey: string, modelNa
             label: 'Merge into ~/.config/opencode/opencode.json',
             snippet: JSON.stringify(
               {
-                providers: {
+                provider: {
                   turbollm: {
                     npm: '@ai-sdk/openai-compatible',
                     options: {
