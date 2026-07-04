@@ -4,9 +4,22 @@
 // is reachable from other machines and EVERY non-loopback request to the API /
 // gateway surface must carry a valid API key. Loopback is always exempt so the
 // local browser UI and `turbollm launch claude` keep working with no key.
-import { createHash } from 'node:crypto'
+//
+// A Cloud Launch tunnel (ADR-045/152) breaks the loopback-as-trust assumption BY
+// ADDRESS ALONE: cloudflared's local leg connects to 127.0.0.1 too, so a request
+// that arrived over the public tunnel URL LOOKS identical to a trusted local caller
+// by address. The fix is NOT "distrust all loopback whenever a tunnel is merely
+// active" — that would also break the daemon's own local CLI tooling (`--stop`,
+// `launch claude`), which has no way to hold a usable key (only hashes are ever
+// stored). Verified empirically against a live cloudflared quick tunnel: Cloudflare's
+// edge injects `cf-ray`/`cf-connecting-ip` on every request it proxies, and a direct
+// local request carries neither — a remote caller can't spoof these away (Cloudflare's
+// edge controls them, not the client), so `isTunneled` below is a precise per-REQUEST
+// signal, not a whole-daemon flag.
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { getConnInfo } from '@hono/node-server/conninfo'
 import type { Context, MiddlewareHandler } from 'hono'
+import type { ApiKey } from './config/config'
 import type { Deps } from './deps'
 
 /** Loopback addresses that never require a key, in the forms Node surfaces them
@@ -14,9 +27,42 @@ import type { Deps } from './deps'
 const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1'])
 
 /** SHA-256 hex of the presented key — the SAME derivation used when keys are
- *  created (api/routes.ts generateApiKey). Stored config holds only this hash. */
+ *  created (generateApiKey below). Stored config holds only this hash. */
 function hashKey(raw: string): string {
   return createHash('sha256').update(raw).digest('hex')
+}
+
+/** Generate a new API key: a `tllm-`-prefixed 40-char random token, its SHA-256 hash
+ *  (the only form persisted), and a display prefix. Shared by the `/api/v1/keys`
+ *  create endpoint and the tunnel auto-provisioning below. */
+export function generateApiKey(): { full: string; hash: string; prefix: string } {
+  const charset = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+  const buf = randomBytes(60)
+  let key = ''
+  for (let i = 0; i < 40; i++) key += charset[buf[i] % 62]
+  const full = `tllm-${key}`
+  const hash = createHash('sha256').update(full).digest('hex')
+  return { full, hash, prefix: full.slice(0, 12) }
+}
+
+/** Provision a fresh, dedicated API key for a Cloud Launch tunnel session and return
+ *  its full (unhashed) value — the only moment it's ever available, since the store
+ *  keeps only the hash (same rule as every other key, spec 06 §5). Always generates a
+ *  new one rather than reusing an existing key: an existing key's raw value can never
+ *  be recovered to print it, and a fresh, clearly-named key is easy to find and revoke
+ *  later from Developer → API Keys. */
+export function provisionTunnelApiKey(d: Deps): string {
+  const { full, hash, prefix } = generateApiKey()
+  const key: ApiKey = {
+    id: randomUUID(),
+    name: `tunnel-${new Date().toISOString()}`,
+    hash,
+    prefix,
+    createdAt: new Date().toISOString(),
+    lastUsedAt: null,
+  }
+  d.store.update((cfg) => cfg.apiKeys.push(key))
+  return full
 }
 
 /** Pull the presented key from any of the accepted headers (spec 06 §5):
@@ -54,31 +100,69 @@ function isLoopback(c: Context): boolean | null {
   return LOOPBACK.has(addr)
 }
 
+/** True when THIS request actually traversed the Cloud Launch tunnel, as opposed to
+ *  "a tunnel merely happens to be active elsewhere". Cloudflare's edge injects
+ *  `cf-ray`/`cf-connecting-ip` on every request it proxies (verified empirically
+ *  against a live quick tunnel) — a direct local request carries neither. A local
+ *  caller forging these headers on their own request only makes THAT request MORE
+ *  restricted (still needs a key), never less — it can't be used to impersonate a
+ *  local caller from the remote side, since Cloudflare's edge (not the client)
+ *  controls what a genuinely tunneled request carries. */
+function isTunneled(c: Context, d: Deps): boolean {
+  if (!d.tunnel?.active()) return false
+  return !!(c.req.header('cf-ray') || c.req.header('cf-connecting-ip'))
+}
+
 /** True when a request is local to the daemon host: either the daemon is loopback-only
  *  bound (no LAN listener at all) or the request came from a loopback address. Use to
- *  gate **local-admin actions that execute a caller-supplied binary** (add/scan engine)
- *  so a LAN client can't trigger arbitrary execution even with a valid API key. Fails
- *  closed: an undetermined address while LAN-exposed is treated as remote. */
+ *  gate **local-admin actions that execute a caller-supplied binary** (add/scan engine,
+ *  build-from-source, CUDA download) so a LAN client can't trigger arbitrary execution
+ *  even with a valid API key. Fails closed: an undetermined address while LAN-exposed
+ *  is treated as remote. Also fails closed for any request that actually traversed a
+ *  Cloud Launch tunnel (ADR-152, see isTunneled) — genuinely local access (the box's
+ *  own terminal, `--stop`, `launch claude`) is unaffected. */
 export function isLocalRequest(c: Context, d: Deps): boolean {
+  if (isTunneled(c, d)) return false
   if (!d.store.snapshot().daemon.lanBind) return true // loopback-only bind → always local
   return isLoopback(c) === true
 }
 
-/** LAN auth middleware (spec 06 §5). Register AFTER cors + the Server header and
- *  BEFORE the API/chat/gateway routes. Enforcement only kicks in when the daemon
- *  is LAN-exposed (lanBind=true); with the default loopback-only bind it is a pure
- *  pass-through, so local dev and the UI can never be locked out. */
+/** Pure decision logic behind lanAuth, extracted so it's directly unit-testable —
+ *  a real "this connection really is loopback" signal needs a live TCP socket,
+ *  which isn't cheap to fake in a test, so the boolean combination itself is
+ *  isolated here instead. True means "let the request through with no key check".
+ *  `tunneled` is a per-REQUEST signal (see isTunneled) — when true, it forces
+ *  enforcement UNCONDITIONALLY (ignores requireApiKey, and does NOT treat loopback
+ *  as proof of a local caller), since a tunneled request looks loopback too (ADR-152). */
+export function bypassesAuth(opts: {
+  lanBind: boolean
+  requireApiKey: boolean
+  tunneled: boolean
+  loopback: boolean | null
+  exempt: boolean
+}): boolean {
+  const { lanBind, requireApiKey, tunneled, loopback, exempt } = opts
+  if (!lanBind && !tunneled) return true // loopback-only, not a tunneled request: no enforcement
+  if (!tunneled && !requireApiKey) return true // user opted into open (unauthenticated) LAN access
+  if (loopback === true && !tunneled) return true // local clients never need a key
+  if (exempt) return true // SPA/static assets + /healthz so a user can paste a key
+  return false
+}
+
+/** LAN auth middleware (spec 06 §5, extended by ADR-152 for tunneled traffic).
+ *  Register AFTER cors + the Server header and BEFORE the API/chat/gateway routes.
+ *  See {@link bypassesAuth} for the enforcement decision. */
 export function lanAuth(d: Deps): MiddlewareHandler {
   return async (c, next) => {
     const daemon = d.store.snapshot().daemon
-    if (!daemon.lanBind) return next() // loopback-only bind: no enforcement
-    if (!daemon.requireApiKey) return next() // user opted into open (unauthenticated) LAN access
-
-    const loopback = isLoopback(c)
-    // Unknown address while LAN-exposed → treat as remote (fail closed).
-    if (loopback === true) return next() // local clients never need a key
-
-    if (isExempt(c)) return next() // SPA/static assets + /healthz so a user can paste a key
+    const allow = bypassesAuth({
+      lanBind: daemon.lanBind,
+      requireApiKey: daemon.requireApiKey,
+      tunneled: isTunneled(c, d),
+      loopback: isLoopback(c),
+      exempt: isExempt(c),
+    })
+    if (allow) return next()
 
     const key = presentedKey(c)
     if (key) {

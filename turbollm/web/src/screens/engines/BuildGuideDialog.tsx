@@ -24,6 +24,16 @@ import {
 } from '../../components/ui/dialog'
 import { AddEngineDialog } from './AddEngineDialog'
 
+// Mirrors build-prereqs.ts's CMAKE_CONFIGURE_ARGS / CUDA_RUNTIME_DLL_PREFIXES /
+// CUDA_RUNTIME_SO_PREFIXES — kept in lockstep by hand (the web bundle can't import Node
+// backend code). `-allow-unsupported-compiler` works around nvcc's hardcoded host-compiler
+// allowlist (a new VS/GCC release routinely ships before NVIDIA updates it); the runtime
+// DLLs/libs aren't bundled by the build itself, so without copying them the produced engine
+// silently falls back to CPU.
+const CMAKE_CONFIGURE_ARGS = ['-DGGML_CUDA=ON', '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler']
+const CUDA_RUNTIME_DLL_PREFIXES = ['cudart64_', 'cublas64_', 'cublaslt64_', 'nvrtc64_', 'nvrtc-builtins64_', 'nvjitlink_']
+const CUDA_RUNTIME_SO_PREFIXES = ['libcudart.so', 'libcublas.so', 'libcublasLt.so', 'libnvrtc.so', 'libnvrtc-builtins.so', 'libnvJitLink.so']
+
 /** The exact build command list for a repo on `os` (mirrors the backend's PURE
  *  `buildCommands` in src/engines/build-prereqs.ts — kept in lockstep so the manual path
  *  matches what the 1-click build runs). */
@@ -32,21 +42,31 @@ function buildCommands(repoUrl: string, branch: string | undefined, os: 'windows
   const clone = b
     ? `git clone --branch ${b} --depth 1 ${repoUrl} turbo-build`
     : `git clone --depth 1 ${repoUrl} turbo-build`
+  const configure = `cmake -B build ${CMAKE_CONFIGURE_ARGS.join(' ')}`
   if (os === 'linux') {
+    const libGlobs = ['lib64', 'lib', 'targets/x86_64-linux/lib']
+      .flatMap((dir) => CUDA_RUNTIME_SO_PREFIXES.map((p) => `$CUDA_ROOT/${dir}/${p}*`))
+      .join(' ')
     return [
       clone,
       'cd turbo-build',
-      'cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release',
+      configure,
       'cmake --build build -j --target llama-server',
-      '# Built binary: build/bin/llama-server — add it via "Add your own engine".',
+      'CUDA_ROOT="$(dirname "$(dirname "$(command -v nvcc)")")"',
+      `cp ${libGlobs} build/bin/ 2>/dev/null`,
+      '# Built binary + its CUDA runtime libs: build/bin/llama-server — add it via "Add your own engine".',
     ]
   }
+  const dllGlobs = ['bin', 'bin\\x64']
+    .flatMap((dir) => CUDA_RUNTIME_DLL_PREFIXES.map((p) => `"%CUDA_PATH%\\${dir}\\${p}*.dll"`))
+    .join(' ')
   return [
     clone,
     'cd turbo-build',
-    'cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release',
+    configure,
     'cmake --build build --config Release -j --target llama-server',
-    '# Built binary: build\\bin\\Release\\llama-server.exe — add it via "Add your own engine".',
+    `for %f in (${dllGlobs}) do copy /y "%f" "build\\bin\\Release\\" >nul 2>&1`,
+    '# Built binary + its CUDA runtime DLLs: build\\bin\\Release\\llama-server.exe — add it via "Add your own engine".',
   ]
 }
 

@@ -5,7 +5,9 @@
 import type { Registry } from './registry'
 import type { ProvisionState } from './provision-state'
 import { getSysInfo, primaryVendor } from '../sysinfo/sysinfo'
-import { LLAMA_BUILD, fallbackChain, provisionBackend, recommendBackendId, type ProvisionProgress } from './download'
+import { LLAMA_BUILD, fallbackChain, provisionBackend, recommendBackendId, type BackendId, type ProvisionProgress } from './download'
+
+const VALID_BACKENDS: BackendId[] = ['cuda', 'rocm', 'sycl', 'vulkan', 'metal', 'cpu']
 
 export async function seedDefaultEngines(
   registry: Registry,
@@ -19,11 +21,22 @@ export async function seedDefaultEngines(
   const vendor = primaryVendor(sys)
   const hasGpu = sys.gpus.length > 0
 
+  // Escape hatch for environments where live GPU detection can't see the real
+  // target hardware — the main case is pre-baking a Docker image at build time
+  // (deploy/runpod/Dockerfile): `docker build` never has GPU passthrough, so
+  // detection always reports "no GPU" and would otherwise always pre-bake the
+  // CPU backend even for an image explicitly built for an NVIDIA GPU box.
+  const forced = process.env.TURBOLLM_SEED_BACKEND as BackendId | undefined
+
   let chain
   try {
-    const recommended = recommendBackendId(vendor, hasGpu, tag)
+    const recommended = forced && VALID_BACKENDS.includes(forced) ? forced : recommendBackendId(vendor, hasGpu, tag)
     chain = fallbackChain(recommended, tag)
-    console.log(`seed: detected GPU vendor=${vendor} (${sys.gpus.map((g) => g.name).join(', ') || 'none'}) → backend ${recommended}`)
+    if (forced) {
+      console.log(`seed: TURBOLLM_SEED_BACKEND=${forced} → backend ${recommended} (skipping live GPU detection)`)
+    } else {
+      console.log(`seed: detected GPU vendor=${vendor} (${sys.gpus.map((g) => g.name).join(', ') || 'none'}) → backend ${recommended}`)
+    }
   } catch (e) {
     console.warn(`seed: ${e instanceof Error ? e.message : e}`)
     return

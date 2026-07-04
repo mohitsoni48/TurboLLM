@@ -71,3 +71,6 @@ Thumbs.db
 
 # local-only test/marketing notes — never ship in the public repo
 /turbollm/posts/
+
+# Playwright MCP tool artifacts (console logs, page snapshots from browser debugging)
+/turbollm/.playwright-mcp/

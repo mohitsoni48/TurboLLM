@@ -31,6 +31,8 @@ import { AgentRunner } from './agents/runner'
 import { launchCli } from './cli-launch'
 import { writePidfile, removePidfile, stopDaemon, resolveDaemonPort } from './daemon-pid'
 import { createApp } from './server'
+import { provisionTunnelApiKey } from './auth'
+import { TunnelManager, reapStaleTunnels, killTrackedTunnelsSync } from './tunnel/manager'
 import type { Deps } from './deps'
 
 // Entrypoint for the TurboLLM daemon (npm bin "turbollm"): wiring + graceful
@@ -137,6 +139,9 @@ if (hasFlag('--help', '-h')) {
     `  --port <n>     Port to listen on / connect to (default: 6996)\n` +
     `  --addr <h:p>   Full host:port override (e.g. 0.0.0.0:6996)\n` +
     `  --no-open      Do not open a browser window on startup\n` +
+    `  --tunnel       Expose this daemon on the internet via a cloudflared quick\n` +
+    `                 tunnel (Cloud Launch) — prints the public URL + a required\n` +
+    `                 access token. For running TurboLLM on a rented cloud GPU box.\n` +
     `  --config <f>   Path to a custom config file\n` +
     `  --stop         Stop a running TurboLLM daemon and exit\n` +
     `  --help, -h     Show this help message\n\n` +
@@ -145,6 +150,7 @@ if (hasFlag('--help', '-h')) {
     `  turbollm --port 9000             # listen on port 9000\n` +
     `  turbollm --no-open               # start without opening a browser\n` +
     `  turbollm --addr 0.0.0.0:6996    # bind to all interfaces (LAN sharing)\n` +
+    `  turbollm --tunnel --no-open      # run on a rented GPU box, reachable via a public URL\n` +
     `  turbollm --stop                  # stop the running daemon\n` +
     `  turbollm launch claude           # open Claude Code on your loaded model\n` +
     `  turbollm launch claude --model qwen3-8b   # load qwen3-8b, then launch\n\n`,
@@ -176,6 +182,12 @@ if (hasFlag('--stop')) {
 // daemon shows "no model loaded". Best-effort; never blocks startup.
 const reaped = await reapStaleEngines(store.dir()).catch(() => 0)
 if (reaped > 0) console.log(`reaped ${reaped} orphaned engine process(es) from a previous run`)
+// Same idea for a cloudflared tunnel orphaned by an unclean previous shutdown — it
+// would otherwise keep a public URL alive pointing at a port nothing still serves.
+try {
+  const reapedTunnels = reapStaleTunnels(store.dir())
+  if (reapedTunnels > 0) console.log(`reaped ${reapedTunnels} orphaned tunnel process(es) from a previous run`)
+} catch { /* best-effort */ }
 
 const registry = new Registry(store)
 const pruned = registry.pruneDeadManagedBuilds()
@@ -231,6 +243,11 @@ const deps: Deps = { store, registry, manager, scanner, hashes, db, provision, b
 deps.gate = new GenerationGate()
 deps.agentRunner = new AgentRunner(deps)
 deps.agentRunner.reconcileOnStartup()
+// Cloud Launch (ADR-045/152): only wired when --tunnel is passed. Its mere presence
+// on Deps is what forces auth enforcement on tunneled traffic (see auth.ts lanAuth) —
+// absent entirely for the vast majority of runs that never asked for a tunnel.
+const tunnelRequested = hasFlag('--tunnel')
+if (tunnelRequested) deps.tunnel = new TunnelManager(store.dir())
 const app = createApp(deps)
 
 // Warm the app-update cache shortly after boot (ADR-031: "once per daemon start") so the
@@ -299,6 +316,12 @@ function openBrowser(url: string): void {
 // ── Start server ──────────────────────────────────────────────────────────────
 const noOpen = hasFlag('--no-open')
 
+// Cached for this process's lifetime: a raw API key can only ever be shown once
+// (the store keeps only its hash), so a tunnel that restarts in-place (a rebind, or
+// a rebind's retry loop) reprints the SAME token instead of minting — and orphaning —
+// a fresh one every time the port changes.
+let tunnelToken: string | null = null
+
 // Bind with retry. On a self-restart the OLD listener may not have released the port
 // the instant the replacement starts (Windows lingers the socket, and a 127.0.0.1 →
 // 0.0.0.0 LAN switch is a conflicting bind), so retry EADDRINUSE for ~10s instead of
@@ -335,6 +358,25 @@ function listen(attempt = 0): void {
 
     // Keep the legacy one-liner for log parsers that key on it.
     process.stdout.write(`TurboLLM ${version} listening on http://${displayHost}:${info.port}\n`)
+
+    // Cloud Launch (ADR-045/152): (re)start the tunnel pointed at whatever port we
+    // just bound — covers both the initial start AND a later rebind (the tunnel
+    // manager tears down any prior tunnel before spawning the new one). Fire-and-
+    // forget: never blocks the banner or the listener on cloudflared's handshake.
+    if (deps.tunnel) {
+      void deps.tunnel
+        .start(info.port)
+        .then((url) => {
+          console.log(`  Tunnel:  ${url}`)
+          tunnelToken ??= provisionTunnelApiKey(deps)
+          console.log(`  Token:   ${tunnelToken}`)
+          console.log(`           (required for anyone using this tunnel URL)`)
+          console.log(``)
+        })
+        .catch((e) => {
+          console.error(`  Tunnel failed to start: ${e instanceof Error ? e.message : e}`)
+        })
+    }
 
     // Write pidfile so `turbollm --stop` can find and stop this process (F-035). Written
     // on every successful bind: the PID is constant, but an in-place rebind changes the
@@ -457,7 +499,7 @@ deps.requestRestart = () => {
   const watchdog = setTimeout(finish, 14_000)
   watchdog.unref()
   try {
-    void manager.shutdown().finally(() => {
+    void Promise.all([manager.shutdown(), deps.tunnel?.shutdown() ?? Promise.resolve()]).finally(() => {
       try {
         db.close()
       } catch {
@@ -548,7 +590,10 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
     updateScheduler.stop()
     comfy.stop()
     toolRegistry.disconnectAll()
-    void manager.shutdown().finally(() => { db.close(); server.close(() => process.exit(0)) })
+    void Promise.all([manager.shutdown(), deps.tunnel?.shutdown() ?? Promise.resolve()]).finally(() => {
+      db.close()
+      server.close(() => process.exit(0))
+    })
     setTimeout(() => process.exit(0), 12_000).unref()
   })
 }
@@ -560,6 +605,9 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
 // startup reap is the backstop for the truly abrupt kills that skip 'exit' too.
 process.on('exit', () => {
   try { killTrackedEnginesSync(store.dir()) } catch { /* best-effort */ }
+  // Same last-resort net for a cloudflared tunnel — a leaked one keeps a PUBLIC URL
+  // alive pointing at a port nothing may be serving anymore, worse than a leaked engine.
+  try { killTrackedTunnelsSync(store.dir()) } catch { /* best-effort */ }
   // Best-effort pidfile cleanup — covers exits that bypass the signal handlers
   // (e.g. process.exit() called elsewhere). Graceful SIGTERM/SIGINT already
   // removed it above; this is a second-layer safety net.

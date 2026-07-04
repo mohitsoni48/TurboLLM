@@ -1,8 +1,9 @@
 // Auto-benchmark + auto-tune runner (Differentiator #2, spec 09 §1). Owns the engine exclusively
 // for the duration of a run. Two-phase per quality-preserving KV-cache type (f16 / q8_0 / turbo4):
 // (1) pin the offload param (ngl for dense, nCpuMoe for MoE) with CHEAP VRAM probes — load, read
-// absolute VRAM, stop, no generation — keeping the most on the GPU while leaving a ≤1 GB headroom
-// (so a later VRAM grab can't tip it into sysmem-spill); (2) run ONE real prefill + tok/s bench at
+// absolute VRAM, stop, no generation — keeping the most on the GPU while leaving a user-configurable
+// VRAM headroom (default 1 GB; Settings → Engine) so a later VRAM grab can't tip it into sysmem-spill;
+// (2) run ONE real prefill + tok/s bench at
 // that config. Picks the overall winner by best prefill AND generation t/s, saves it as the model's
 // profile (tunedBy:'bench'), persists a benchResults row, and — when telemetry is on — queues an
 // anonymized bench_result event. Single active run; additive; fail-safe (a bad candidate is
@@ -130,7 +131,7 @@ const QUALITY_KV = ['f16', 'q8_0', 'turbo4']
 // maximizes t/s in isolation, but then a later desktop / ComfyUI VRAM grab tips the model into
 // "shared GPU memory" (sysmem over PCIe), which silently tanks generation. The search treats a
 // candidate that uses more than (total − headroom) as "too much on GPU" and offloads further.
-const VRAM_HEADROOM_MB = 1024
+// User-configurable (Settings → Engine → VRAM headroom); see Config.vramHeadroomMb.
 // Output-t/s tie band for the speed objective: when two configs are within this relative margin
 // on generation speed, the one with faster prefill wins (best prefill AND t/s, not just t/s).
 const OUTPUT_TIE = 0.05
@@ -306,9 +307,11 @@ export class BenchRunner {
     // resident (see resolveProfile), so the offload search must account for its real VRAM
     // footprint (~1-2 GB) — searching with it excluded would pick an offload that fits WITHOUT
     // the projector, then load the projector on top of that afterward, eating into the
-    // VRAM_HEADROOM_MB safety margin the search thought it had (or spilling outright).
+    // vramHeadroomMb safety margin the search thought it had (or spilling outright).
     const resolved = resolveProfile(entry, sys, saved, base, defaults)
     const baseProfile: LoadProfile = { ...resolved, speculative: 'off', mtpHeadPath: '', draftModelPath: '' }
+    // User-configurable VRAM safety margin for the offload search (Settings → Engine).
+    const headroomMb = this.store.snapshot().vramHeadroomMb
 
     const results: BenchCandidate[] = []
     let best: { cand: BenchCandidate; profile: LoadProfile } | null = null
@@ -339,8 +342,8 @@ export class BenchRunner {
       const kv = kvToTune[i]
       const kvBase: LoadProfile = { ...baseProfile, kvTypeK: kv, kvTypeV: kv }
       const found = entry.moe
-        ? await this.moeSearch(entry, sys, kvBase, caps, results)
-        : await this.denseSearch(entry, sys, kvBase, caps, results)
+        ? await this.moeSearch(entry, sys, kvBase, caps, results, headroomMb)
+        : await this.denseSearch(entry, sys, kvBase, caps, results, headroomMb)
       if (found && (!best || betterBySpeed(found.cand, best.cand))) best = found
       if (best) this.state = { ...this.state, bestTps: best.cand.tps ?? undefined }
     }
@@ -416,7 +419,7 @@ export class BenchRunner {
 
   /** Dense models: pin `ngl` by VRAM probing (Phase 1), then run the full bench once (Phase 2).
    *  More GPU layers = faster, monotonically, up to the no-spill edge — so the best ngl is the
-   *  HIGHEST whose absolute VRAM still leaves the ≤1 GB headroom. Whether a config fits/spills is a
+   *  HIGHEST whose absolute VRAM still leaves the configured headroom. Whether a config fits/spills is a
    *  LOAD-time property, so we find that ngl with cheap load-and-read-VRAM probes (no generation),
    *  and only measure t/s at the winner. CPU-only machines skip straight to ngl=0. */
   private async denseSearch(
@@ -425,11 +428,12 @@ export class BenchRunner {
     base: LoadProfile,
     caps: Engine['capabilities'],
     results: BenchCandidate[],
+    headroomMb: number,
   ): Promise<{ cand: BenchCandidate; profile: LoadProfile } | null> {
     let bestNgl: number | null = 0 // CPU-only box → everything on CPU, no probing needed.
 
     if (sys.gpus.length > 0) {
-      // Binary search ngl ∈ [0, blockCount] for the HIGHEST that loads with ≤1 GB-headroom VRAM.
+      // Binary search ngl ∈ [0, blockCount] for the HIGHEST that loads with enough headroom VRAM.
       const hi0 = entry.blockCount > 0 ? entry.blockCount : 99
       let lo = 0, hi = hi0
       bestNgl = null
@@ -439,7 +443,7 @@ export class BenchRunner {
         const probe = await this.probeVram(entry, sys, { ...base, ngl: mid }, caps)
         this.pushProbe(results, base, 'ngl', mid, probe)
         await this.settleGpu()
-        if (probe.outcome === 'ok' && !overHeadroom(probe.vramAbsMb, sys)) {
+        if (probe.outcome === 'ok' && !overHeadroom(probe.vramAbsMb, sys, headroomMb)) {
           bestNgl = mid // fits with headroom → record, try MORE GPU layers
           lo = mid + 1
         } else {
@@ -454,7 +458,7 @@ export class BenchRunner {
 
   /** MoE models: pin `nCpuMoe` by VRAM probing (Phase 1), then run the full bench once (Phase 2).
    *  Fewer CPU experts = more on GPU = faster, so the best is the LOWEST nCpuMoe whose absolute VRAM
-   *  still leaves the ≤1 GB headroom. Found with cheap load-and-read-VRAM probes (no generation);
+   *  still leaves the configured headroom. Found with cheap load-and-read-VRAM probes (no generation);
    *  t/s is measured only at the winner. */
   private async moeSearch(
     entry: ModelEntry,
@@ -462,6 +466,7 @@ export class BenchRunner {
     base: LoadProfile,
     caps: Engine['capabilities'],
     results: BenchCandidate[],
+    headroomMb: number,
   ): Promise<{ cand: BenchCandidate; profile: LoadProfile } | null> {
     const derived = deriveDefault(entry, sys)
     const maxN = entry.blockCount > 0 ? entry.blockCount : (derived.nCpuMoe || 0)
@@ -474,7 +479,7 @@ export class BenchRunner {
       const probe = await this.probeVram(entry, sys, { ...base, nCpuMoe: mid }, caps)
       this.pushProbe(results, base, 'nCpuMoe', mid, probe)
       await this.settleGpu()
-      if (probe.outcome === 'oom' || overHeadroom(probe.vramAbsMb, sys)) {
+      if (probe.outcome === 'oom' || overHeadroom(probe.vramAbsMb, sys, headroomMb)) {
         lo = mid + 1 // too much on GPU → more CPU experts to free VRAM / restore the headroom
       } else if (probe.outcome === 'ok') {
         bestN = mid // fits with headroom → record, try FEWER CPU experts (more on GPU)
@@ -1129,13 +1134,13 @@ function totalVramMb(sys: SysInfo): number {
   return sys.gpus.reduce((s, g) => s + (g.vramMb || 0), 0)
 }
 
-/** True when a candidate's ABSOLUTE VRAM use leaves less than VRAM_HEADROOM_MB free — i.e. it's
- *  too close to the spill edge. The search then offloads more so the chosen config keeps a safety
+/** True when a candidate's ABSOLUTE VRAM use leaves less than `headroomMb` free — i.e. it's too
+ *  close to the spill edge. The search then offloads more so the chosen config keeps a safety
  *  margin against a later desktop / ComfyUI VRAM grab. Unknown VRAM (non-NVIDIA) → never blocks. */
-function overHeadroom(vramAbsMb: number | null, sys: SysInfo): boolean {
+function overHeadroom(vramAbsMb: number | null, sys: SysInfo, headroomMb: number): boolean {
   const total = totalVramMb(sys)
   if (!vramAbsMb || total <= 0) return false
-  return vramAbsMb > total - VRAM_HEADROOM_MB
+  return vramAbsMb > total - headroomMb
 }
 
 /** The quality-preserving KV-cache types to try, in search order. The model's current/base type

@@ -499,6 +499,10 @@ export type DaemonSettings = {
   autoGenerateTitles: boolean
   openBrowserOnStart: boolean
   autoLoadOnStart: boolean
+  /** VRAM to keep free during auto-tune's offload search, MB (300–2048, default 1024). A
+   *  later desktop / ComfyUI VRAM grab can't tip a config tuned with less headroom into a
+   *  sysmem spill. */
+  vramHeadroomMb: number
   /** Expose the API on the local network (spec 08 §2). Changing this requires a
    *  daemon restart to take effect (POST /api/v1/daemon/restart). */
   lanBind: boolean
@@ -529,7 +533,16 @@ export type DaemonSettings = {
   /** Build environment (ADR-100): folders prepended to PATH for compile-from-source so a
    *  conda-env / custom-path CUDA Toolkit + compiler are found. Not secret — echoed back. */
   build: { toolchainDirs: string[] }
+  /** Tool-call approval gate (F-025): per-tool default policy. Missing tools default
+   *  to 'ask'. Keyed by tool name (e.g. 'run_code', 'mcp__server__tool'). */
+  toolPolicies: Record<string, ToolPolicy>
+  /** Cloud Launch deploy-link settings (ADR-153). The RunPod Template ID the user
+   *  published themselves — not a secret, just an id, echoed back as-is. */
+  cloudDeploy: { runpodTemplateId: string }
 }
+
+/** Tool-call approval gate policy (mirrors turbollm/src/tools/tool-policy.ts). */
+export type ToolPolicy = 'ask' | 'allow' | 'deny'
 
 export type SearchProvider = 'tavily' | 'kagi' | 'searxng'
 

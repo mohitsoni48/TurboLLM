@@ -18,7 +18,7 @@ import { execFile, spawn } from 'node:child_process'
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { delimiter, dirname, join } from 'node:path'
 import { promisify } from 'node:util'
-import { buildEnv, checkBuildPrereqs } from './build-prereqs'
+import { buildEnv, checkBuildPrereqs, CMAKE_CONFIGURE_ARGS, CUDA_RUNTIME_DLL_PREFIXES, CUDA_RUNTIME_SO_PREFIXES } from './build-prereqs'
 import { resolveServerBinary } from './scan'
 import type { BuildPhase } from './build-state'
 
@@ -99,8 +99,9 @@ export function pickGenerator(hasNinja: boolean, isWindows: boolean): 'Ninja' | 
   return isWindows ? 'NMake Makefiles' : 'Unix Makefiles'
 }
 
-/** The cmake CUDA flags (single-config generators honor CMAKE_BUILD_TYPE). */
-export const CMAKE_CONFIGURE_ARGS = ['-DGGML_CUDA=ON', '-DCMAKE_BUILD_TYPE=Release']
+// CMAKE_CONFIGURE_ARGS now lives in build-prereqs.ts (re-exported below) — it's shared with
+// that module's `buildCommands`, the manual-build command list, so the two can never drift.
+export { CMAKE_CONFIGURE_ARGS }
 
 /** PURE: a Windows .bat that enters the MSVC dev env (vcvars x64) then runs one cmake step.
  *  All paths are quoted (vcvars/src/build dirs can contain spaces); the cmake exit code is
@@ -131,13 +132,6 @@ function onPath(env: NodeJS.ProcessEnv, exe: string): boolean {
       }
     })
 }
-
-/** CUDA runtime DLLs a llama.cpp CUDA build links against at runtime. A SOURCE build does
- *  NOT bundle these (unlike the prebuilt release zips), so the produced exe can't start —
- *  and our probe (`--version`) fails — unless they sit beside it or on PATH. We copy them
- *  next to the exe so the engine is self-contained + portable (works even after the CUDA
- *  toolkit dir is removed). Versioned names (e.g. cudart64_13.dll) → match by prefix. */
-const CUDA_RUNTIME_DLL_PREFIXES = ['cudart64_', 'cublas64_', 'cublaslt64_', 'nvrtc64_', 'nvrtc-builtins64_', 'nvjitlink_']
 
 /** Find the directories that hold the CUDA toolkit's runtime DLLs, version-matched to the
  *  build by anchoring on the toolkit that owns `nvcc` (NOT a stray cudart from an unrelated
@@ -199,11 +193,6 @@ function copyCudaRuntimeDlls(env: NodeJS.ProcessEnv, destDir: string, log: (l: s
   if (copied > 0) log(`Bundled ${copied} CUDA runtime DLL(s) next to the binary so the engine is self-contained.`)
   return copied
 }
-
-/** Linux equivalent of {@link CUDA_RUNTIME_DLL_PREFIXES} — the `.so` names match by prefix
- *  since the real files carry a version suffix (e.g. `libcudart.so.12.6.20`, often reached
- *  through a `libcudart.so` / `libcudart.so.12` symlink chain in the same directory). */
-const CUDA_RUNTIME_SO_PREFIXES = ['libcudart.so', 'libcublas.so', 'libcublasLt.so', 'libnvrtc.so', 'libnvrtc-builtins.so', 'libnvJitLink.so']
 
 /** Linux equivalent of {@link cudaDllSourceDirs}: anchor on the toolkit that owns `nvcc` on
  *  PATH, then look at the layouts CUDA installs actually use for the runtime libs — `lib64`

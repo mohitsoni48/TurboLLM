@@ -101,6 +101,23 @@ function NumberField({
 
 const clampN = (n: number, min: number, max: number) => Math.max(min, Math.min(max, Math.round(n)))
 
+/** A labeled range slider with a live formatted value (mirrors the per-model Slider in
+ *  ModelDetailDialog.tsx). */
+function Slider({ label, hint, value, min, max, step, onChange, fmt }: {
+  label: string; hint?: string; value: number; min: number; max: number; step: number; onChange: (v: number) => void; fmt?: (v: number) => string
+}) {
+  return (
+    <div className="py-2">
+      <div className="mb-1 flex items-baseline justify-between">
+        <span className="text-[14px] font-medium text-ink">{label}</span>
+        <span className="font-mono text-[12px] text-muted">{fmt ? fmt(value) : value}</span>
+      </div>
+      {hint && <div className="mb-1.5 text-[12px] text-muted">{hint}</div>}
+      <input type="range" min={min} max={max} step={step} value={value} onChange={(e) => onChange(Number(e.target.value))} className="w-full accent-[var(--accent)]" />
+    </div>
+  )
+}
+
 export function SettingsScreen() {
   const { theme, setTheme } = useUiStore()
   const { query: settingsQ, save } = useSettings()
@@ -111,6 +128,7 @@ export function SettingsScreen() {
   const primaryModelDir = modelDirsQ.data?.primaryDir ?? ''
 
   const [ttl, setTtl] = useState<number>(60)
+  const [vramHeadroom, setVramHeadroom] = useState<number>(1024)
   const [port, setPort] = useState<number>(6996)
   const [autoTitle, setAutoTitle] = useState(true)
   const [openBrowser, setOpenBrowser] = useState(true)
@@ -138,6 +156,7 @@ export function SettingsScreen() {
   useEffect(() => {
     if (settings) {
       setTtl(settings.idleTtlMinutes)
+      setVramHeadroom(settings.vramHeadroomMb ?? 1024)
       setPort(settings.port ?? 6996)
       setAutoTitle(settings.autoGenerateTitles)
       setOpenBrowser(settings.openBrowserOnStart)
@@ -171,6 +190,7 @@ export function SettingsScreen() {
     // Clamp defensively: NumberField commits unclamped while editing and only
     // snaps to range on blur, so guard the final ranges here too (spec 08 §2).
     idleTtlMinutes: clampN(ttl, 0, 1440),
+    vramHeadroomMb: clampN(vramHeadroom, 300, 2048),
     port: clampN(port, 1024, 65535),
     autoGenerateTitles: autoTitle,
     openBrowserOnStart: openBrowser,
@@ -308,6 +328,19 @@ export function SettingsScreen() {
               />
               <span className="text-[12px] text-muted">min</span>
             </div>
+          </div>
+
+          <div className="border-t border-border pt-1">
+            <Slider
+              label="VRAM headroom"
+              hint="VRAM to keep free during auto-tune, so a later app switch or render job doesn't spill the model into slower shared memory"
+              value={vramHeadroom}
+              min={300}
+              max={2048}
+              step={1}
+              onChange={setVramHeadroom}
+              fmt={(v) => (v >= 1024 ? `${(v / 1024).toFixed(1)} GB` : `${v} MB`)}
+            />
           </div>
         </section>
 

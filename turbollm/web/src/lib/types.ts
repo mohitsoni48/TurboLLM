@@ -142,6 +142,9 @@ export type Status = {
   comfyui?: ComfyRuntime | null
   telemetryLevel: string
   uptimeSec: number
+  /** Locally-enabled feature flags (TURBOLLM_FEATURES env var) — internal/dev only,
+   *  deliberately undocumented; see turbollm/src/features.ts. */
+  features?: string[]
 }
 
 /** App self-update check (F-006, GET /api/v1/app/update). Is a newer TurboLLM published

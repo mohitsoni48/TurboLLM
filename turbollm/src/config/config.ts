@@ -9,6 +9,12 @@ import { dirname, join } from 'node:path'
 
 export const SCHEMA_VERSION = 3
 
+/** VRAM headroom slider bounds (MB) for auto-tune's spill-safety margin (see
+ *  {@link Config.vramHeadroomMb} and `bench.ts`'s `overHeadroom`). */
+export const VRAM_HEADROOM_MIN_MB = 300
+export const VRAM_HEADROOM_MAX_MB = 2048
+export const VRAM_HEADROOM_DEFAULT_MB = 1024
+
 export interface Capabilities {
   kvTypes: string[]
   flags: string[]
@@ -94,9 +100,10 @@ export interface ToolsConfig {
   tavily?: { apiKey: string }
   /** Pluggable web-search provider config (F-020). */
   search?: SearchConfig
-  /** When true (default), run_code emits a confirmation-required message instead of
-   *  executing immediately, giving the user a chance to approve (F-019). */
-  requireRunCodeConfirmation?: boolean
+  /** Global per-tool approval policy (tool-call approval gate). Every tool defaults
+   *  to 'ask' unless explicitly set here to 'allow' or 'deny'. A per-conversation
+   *  override (Conversation.toolOverrides) takes precedence over this map. */
+  toolPolicies?: Record<string, 'ask' | 'allow' | 'deny'>
 }
 
 /** One MCP server the daemon manages as a tool provider (v0.7.0). */
@@ -164,6 +171,15 @@ export interface ComfyUI {
 export interface BuildConfig {
   toolchainDirs: string[]
 }
+/** Cloud Launch deploy-link settings (ADR-153, RunPod recipe). RunPod is the only
+ *  provider for now — a user who has published their own RunPod Template (following
+ *  deploy/runpod/README.md) pastes its ID here; the Developer screen's "Deploy on
+ *  RunPod" button just constructs and opens RunPod's own one-click deploy link with
+ *  it. No credentials involved — full API-driven auto-provisioning is a separate,
+ *  bigger, not-yet-built feature (the BYO-cloud orchestration line, ADR-003). */
+export interface CloudDeployConfig {
+  runpodTemplateId: string
+}
 /** Global model defaults (spec 05 §3): the base LoadProfile values applied when a
  *  model is first seen and has no saved per-model profile. Saved profiles and
  *  per-request overrides still take precedence; these only replace the built-in
@@ -216,6 +232,13 @@ export interface Config {
   /** Persisted auto-tune results keyed by modelKey (spec 09 §1, 01 §4). Additive;
    *  absent in old configs → normalize seeds {}. Never throws on load. */
   benchResults: Record<string, BenchResult>
+  /** VRAM to keep free during auto-tune's offload search (MB), so a later desktop /
+   *  ComfyUI VRAM grab can't tip the chosen config into a sysmem spill (bench.ts's
+   *  `overHeadroom`). User-configurable via a Settings slider,
+   *  {@link VRAM_HEADROOM_MIN_MB}–{@link VRAM_HEADROOM_MAX_MB}, default
+   *  {@link VRAM_HEADROOM_DEFAULT_MB}. Absent in pre-this-feature configs → normalize
+   *  seeds the default. */
+  vramHeadroomMb: number
   lastLoaded: LastLoaded
   autoLoadOnStart: boolean
   hf: HF
@@ -227,6 +250,8 @@ export interface Config {
   mcp: McpConfig
   /** Compile-from-source settings (ADR-089/100): toolchain dirs prepended to PATH. */
   build: BuildConfig
+  /** Cloud Launch deploy-link settings (ADR-153). */
+  cloudDeploy: CloudDeployConfig
   devModel?: DevModel
 }
 
@@ -327,6 +352,7 @@ export function defaultConfig(): Config {
     primaryModelDir: '',
     modelProfiles: {},
     benchResults: {},
+    vramHeadroomMb: VRAM_HEADROOM_DEFAULT_MB,
     lastLoaded: { modelKey: '', engineId: '' },
     autoLoadOnStart: false,
     hf: { token: '' },
@@ -337,6 +363,7 @@ export function defaultConfig(): Config {
     tools: {},
     mcp: { servers: [] },
     build: { toolchainDirs: [] },
+    cloudDeploy: { runpodTemplateId: '' },
   }
 }
 
@@ -503,6 +530,12 @@ function normalize(c: Config): void {
   }
   // Persisted auto-tune results (spec 09 §1): absent in pre-bench configs → {}.
   c.benchResults ??= {}
+  // VRAM headroom slider: absent/garbage (pre-feature config, or a stale out-of-range
+  // value) → the default, never thrown on load — mirrors the gateway.keepN clamp below.
+  c.vramHeadroomMb =
+    typeof c.vramHeadroomMb === 'number' && c.vramHeadroomMb >= VRAM_HEADROOM_MIN_MB && c.vramHeadroomMb <= VRAM_HEADROOM_MAX_MB
+      ? c.vramHeadroomMb
+      : VRAM_HEADROOM_DEFAULT_MB
   c.autoLoadOnStart ??= false
   c.featuredOverrideUrl ??= ''
   // ComfyUI coordination (absent in pre-comfyui configs → defaults; never throw on an
@@ -543,8 +576,23 @@ function normalize(c: Config): void {
     kagiApiKey: sl.kagiApiKey ?? undefined,
     searxngUrl: typeof sl.searxngUrl === 'string' && sl.searxngUrl.trim() ? sl.searxngUrl.trim() : undefined,
   }
-  // requireRunCodeConfirmation (F-019): absent in pre-F-019 configs → true (safe default).
-  c.tools.requireRunCodeConfirmation = tl.requireRunCodeConfirmation !== false
+  // Tool approval-gate policies (replaces the old F-019 requireRunCodeConfirmation stub):
+  // always a plain object; strip any invalid values rather than crash on a garbled config.
+  const rawPolicies = (tl.toolPolicies ?? {}) as Record<string, unknown>
+  const toolPolicies: Record<string, 'ask' | 'allow' | 'deny'> = {}
+  for (const [toolName, v] of Object.entries(rawPolicies)) {
+    if (v === 'ask' || v === 'allow' || v === 'deny') toolPolicies[toolName] = v
+  }
+  // Migration: users who had explicitly disabled the old run_code confirmation
+  // (requireRunCodeConfirmation === false) get that intent preserved as an explicit
+  // 'allow' policy for run_code — but only if they haven't already set one via the
+  // new toolPolicies map. Everyone else falls through to the new 'ask' default, which
+  // is a strict improvement over the old permanently-broken confirmation stub.
+  const legacyRequireRunCodeConfirmation = (tl as Record<string, unknown>).requireRunCodeConfirmation
+  if (legacyRequireRunCodeConfirmation === false && toolPolicies.run_code === undefined) {
+    toolPolicies.run_code = 'allow'
+  }
+  c.tools.toolPolicies = toolPolicies
   // MCP host (v0.7.0): absent in pre-v0.7.0 configs → empty server list.
   const mc = (c.mcp ?? {}) as Partial<McpConfig>
   c.mcp = {
@@ -563,6 +611,9 @@ function normalize(c: Config): void {
       ? bd.toolchainDirs.filter((p): p is string => typeof p === 'string' && p.trim() !== '').map((p) => p.trim())
       : [],
   }
+  // Cloud Launch deploy-link settings (ADR-153): absent in pre-ADR-153 configs → ''.
+  const cd = (c.cloudDeploy ?? {}) as Partial<CloudDeployConfig>
+  c.cloudDeploy = { runpodTemplateId: typeof cd.runpodTemplateId === 'string' ? cd.runpodTemplateId.trim() : '' }
   // Telemetry level (spec 09 §3): the UI exposes 'off' | 'anon' | 'full'. Migrate
   // legacy/unknown values safely → 'off' (the conservative, opt-in default).
   c.telemetry.level = normalizeTelemetryLevel(c.telemetry.level)
@@ -605,6 +656,9 @@ function validate(c: Config): void {
   }
   if (c.activeEngineId && !c.engines.some((e) => e.id === c.activeEngineId)) {
     throw new ValueError('activeEngineId', 'unknown engine id')
+  }
+  if (c.vramHeadroomMb < VRAM_HEADROOM_MIN_MB || c.vramHeadroomMb > VRAM_HEADROOM_MAX_MB) {
+    throw new ValueError('vramHeadroomMb', `must be between ${VRAM_HEADROOM_MIN_MB} and ${VRAM_HEADROOM_MAX_MB} MB`)
   }
   // ComfyUI reverse-gate origin (F-011): empty is allowed (reverse gate just stays off);
   // if set, it must be an http(s):// origin so the `POST {url}/free` call is well-formed.

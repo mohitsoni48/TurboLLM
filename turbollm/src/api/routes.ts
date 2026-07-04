@@ -4,16 +4,17 @@ import { streamSSE } from 'hono/streaming'
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { basename, dirname, join, resolve, sep } from 'node:path'
 import { GATE_VERSION, gateNodeSource } from '../comfyui/gate-template'
-import { createHash, randomBytes, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import { homedir, networkInterfaces } from 'node:os'
-import { ValueError, getModelProfile, setModelProfile, deleteModelProfile, type ApiKey, type Engine, type McpServer } from '../config/config'
+import { ValueError, getModelProfile, setModelProfile, deleteModelProfile, VRAM_HEADROOM_MIN_MB, VRAM_HEADROOM_MAX_MB, type ApiKey, type Engine, type McpServer } from '../config/config'
 import type { Deps } from '../deps'
 import { type ModelInfo, type StartOpts } from '../engines/manager'
 import { abortAllInFlightChats } from '../chat/chat-routes'
 import { NameTakenError, NotFoundError } from '../engines/registry'
 import { ProbeError, probe } from '../engines/probe'
 import { resolveServerBinary, suggestEngineName } from '../engines/scan'
-import { isLocalRequest } from '../auth'
+import { generateApiKey, isLocalRequest } from '../auth'
+import { enabledFeatures } from '../features'
 import {
   LLAMA_BUILD,
   availableBackends,
@@ -121,6 +122,11 @@ export function registerApi(app: Hono, d: Deps): void {
       })(),
       telemetryLevel: d.store.snapshot().telemetry.level,
       uptimeSec: Math.floor((Date.now() - d.startedAt) / 1000),
+      // Cloud Launch tunnel (ADR-045/152): null until --tunnel is active.
+      tunnel: d.tunnel ? d.tunnel.snapshot() : null,
+      // Local feature flags (TURBOLLM_FEATURES env var) — deliberately undocumented
+      // in any user-facing README; see features.ts.
+      features: enabledFeatures(),
     })
   })
 
@@ -1371,6 +1377,7 @@ export function registerApi(app: Hono, d: Deps): void {
       autoGenerateTitles?: boolean
       openBrowserOnStart?: boolean
       autoLoadOnStart?: boolean
+      vramHeadroomMb?: number
       lanBind?: boolean
       requireApiKey?: boolean
       telemetryLevel?: string
@@ -1381,6 +1388,8 @@ export function registerApi(app: Hono, d: Deps): void {
       tavilyApiKey?: string
       search?: { provider?: string; tavilyApiKey?: string; kagiApiKey?: string; searxngUrl?: string }
       build?: { toolchainDirs?: string[] }
+      toolPolicies?: Record<string, string>
+      cloudDeploy?: { runpodTemplateId?: string }
     }>(c)
 
     const updates: Record<string, unknown> = {}
@@ -1404,6 +1413,17 @@ export function registerApi(app: Hono, d: Deps): void {
     }
     if (b.autoGenerateTitles !== undefined) updates.autoGenerateTitles = !!b.autoGenerateTitles
     if (b.openBrowserOnStart !== undefined) updates.openBrowserOnStart = !!b.openBrowserOnStart
+
+    // VRAM headroom slider for auto-tune (bench.ts's overHeadroom). config.validate() also
+    // enforces this range and would throw on update() otherwise; reject here for a clean 400.
+    let vramHeadroomMb: number | undefined
+    if (b.vramHeadroomMb !== undefined) {
+      const v = Number(b.vramHeadroomMb)
+      if (!Number.isFinite(v) || v < VRAM_HEADROOM_MIN_MB || v > VRAM_HEADROOM_MAX_MB) {
+        return err(c, 400, 'invalid_config_value', `vramHeadroomMb must be ${VRAM_HEADROOM_MIN_MB}–${VRAM_HEADROOM_MAX_MB}.`)
+      }
+      vramHeadroomMb = Math.round(v)
+    }
     // LAN expose toggle (spec 08 §2). Persist only; auto daemon-restart is deferred —
     // the UI tells the user to restart to apply.
     if (b.lanBind !== undefined) updates.lanBind = !!b.lanBind
@@ -1491,6 +1511,24 @@ export function registerApi(app: Hono, d: Deps): void {
       toolchainDirs = dirs
     }
 
+    // Tool-call approval gate: global per-tool policy map. Validate every value is
+    // one of 'ask' | 'allow' | 'deny' so a garbled patch gets a clean 400, not a
+    // silently-dropped/garbage config.
+    let toolPolicies: Record<string, 'ask' | 'allow' | 'deny'> | undefined
+    if (b.toolPolicies !== undefined) {
+      if (typeof b.toolPolicies !== 'object' || b.toolPolicies === null || Array.isArray(b.toolPolicies)) {
+        return err(c, 400, 'invalid_config_value', 'toolPolicies must be an object mapping tool name to ask, allow, or deny.')
+      }
+      const validated: Record<string, 'ask' | 'allow' | 'deny'> = {}
+      for (const [toolName, v] of Object.entries(b.toolPolicies)) {
+        if (v !== 'ask' && v !== 'allow' && v !== 'deny') {
+          return err(c, 400, 'invalid_config_value', `toolPolicies.${toolName} must be ask, allow, or deny.`)
+        }
+        validated[toolName] = v
+      }
+      toolPolicies = validated
+    }
+
     const before = d.store.snapshot().daemon
     d.store.update((cfg) => {
       Object.assign(cfg.daemon, updates)
@@ -1498,8 +1536,15 @@ export function registerApi(app: Hono, d: Deps): void {
       Object.assign(cfg.comfyui, cuUpdates)
       Object.assign(cfg.gateway, gwUpdates)
       if (toolchainDirs !== undefined) cfg.build.toolchainDirs = toolchainDirs
+      if (toolPolicies !== undefined) cfg.tools.toolPolicies = toolPolicies
       if (b.autoLoadOnStart !== undefined) cfg.autoLoadOnStart = !!b.autoLoadOnStart
+      if (vramHeadroomMb !== undefined) cfg.vramHeadroomMb = vramHeadroomMb
       if (telemetryLevel !== undefined) cfg.telemetry.level = telemetryLevel
+      // Cloud Launch deploy-link settings (ADR-153): the RunPod Template ID the user
+      // published themselves (deploy/runpod/README.md) — not a secret, just an id.
+      if (b.cloudDeploy?.runpodTemplateId !== undefined) {
+        cfg.cloudDeploy.runpodTemplateId = String(b.cloudDeploy.runpodTemplateId).trim()
+      }
       // HF token (spec 10 §4): write-only. An explicit '' clears it. Never logged.
       if (b.hfToken !== undefined) cfg.hf.token = String(b.hfToken).trim()
       // Search provider config (F-020). All key/URL fields are write-only; '' clears them.
@@ -1952,6 +1997,7 @@ function settingsPayload(d: Deps) {
     autoGenerateTitles: cfg.daemon.autoGenerateTitles,
     openBrowserOnStart: cfg.daemon.openBrowserOnStart,
     autoLoadOnStart: cfg.autoLoadOnStart,
+    vramHeadroomMb: cfg.vramHeadroomMb,
     lanBind: cfg.daemon.lanBind,
     requireApiKey: cfg.daemon.requireApiKey,
     telemetryLevel,
@@ -1976,6 +2022,11 @@ function settingsPayload(d: Deps) {
     // Build environment (ADR-100): folders prepended to PATH for compile-from-source so a
     // conda-env / custom-path CUDA Toolkit + compiler are found. Not secret — echoed back.
     build: { toolchainDirs: cfg.build.toolchainDirs },
+    // Cloud Launch deploy-link settings (ADR-153): not secret — echoed back.
+    cloudDeploy: cfg.cloudDeploy,
+    // Tool-call approval gate: global per-tool policy ('ask' | 'allow' | 'deny').
+    // Not secret — echoed back directly so Settings can render Tool Permissions.
+    toolPolicies: cfg.tools.toolPolicies ?? {},
   }
 }
 
@@ -2179,16 +2230,6 @@ function readTail(path: string, n: number): string[] {
 
 // ── API key helpers ────────────────────────────────────────────────────────
 
-function generateApiKey(): { full: string; hash: string; prefix: string } {
-  const charset = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
-  const buf = randomBytes(60)
-  let key = ''
-  for (let i = 0; i < 40; i++) key += charset[buf[i] % 62]
-  const full = `tllm-${key}`
-  const hash = createHash('sha256').update(full).digest('hex')
-  return { full, hash, prefix: full.slice(0, 12) }
-}
-
 // ── filesystem browser helpers (spec 03 §9) ─────────────────────────────────
 
 /** The user's home dir, canonicalized (symlinks resolved) so the containment
@@ -2260,7 +2301,7 @@ function buildConnectSnippets(cli: string, base: string, apiKey: string, modelNa
             label: 'Merge into ~/.config/opencode/opencode.json',
             snippet: JSON.stringify(
               {
-                providers: {
+                provider: {
                   turbollm: {
                     npm: '@ai-sdk/openai-compatible',
                     options: {

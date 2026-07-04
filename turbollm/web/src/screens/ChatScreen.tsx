@@ -11,6 +11,7 @@ import { Button } from '../components/ui/button'
 import { toast } from '../components/ui/sonner'
 import { useQueryClient } from '@tanstack/react-query'
 import { MessageBubble, StreamingBubble } from './chat/MessageBubble'
+import { ToolApprovalBar } from './chat/ToolApprovalBar'
 import { ContextMeter } from './chat/ContextMeter'
 import { ConversationSidebar } from './chat/ConversationSidebar'
 import { ModelLoadMenu } from '../components/ModelLoadMenu'
@@ -504,6 +505,9 @@ export function ChatScreen() {
 
   const ready = engineState === 'running' && !!model
 
+  // At most one tool call awaits interactive approval at a time (the tool loop is sequential).
+  const pendingApproval = live?.toolCalls.find((tc) => tc.status === 'awaiting_approval')
+
   return (
     <div className="flex h-full overflow-hidden">
       {/* Sidebar (collapsible, drag-resizable when open). The collapse/expand width
@@ -750,6 +754,13 @@ export function ChatScreen() {
               <p className="mt-1 text-[11px] text-faint">Select all and copy (Ctrl+C / Cmd+C)</p>
             </div>
           </div>
+        )}
+
+        {/* Tool-call approval gate (inline banner, not a modal — coexists with reading
+            the transcript). Rendered just above the composer while a background tool
+            call awaits interactive approval. */}
+        {!readonly && activeId && pendingApproval && (
+          <ToolApprovalBar key={pendingApproval.id} pending={pendingApproval} convId={activeId} onResolved={() => {}} />
         )}
 
         {/* Composer area (always visible; disabled when no model; hidden in readonly) */}

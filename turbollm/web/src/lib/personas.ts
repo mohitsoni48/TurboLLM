@@ -21,7 +21,7 @@ const TURBOLLM_KNOWLEDGE =
   '- Set a custom **system prompt** per conversation.\n' +
   '- **Artifacts**: HTML/SVG/Mermaid fenced blocks render as sandboxed live previews (shown as images). Download as PNG/JPEG/SVG/GIF/HTML depending on type.\n' +
   '- **Thinking/reasoning**: models that emit `<think>` blocks get a collapsible fold; visible prose renders normally below.\n' +
-  '- **Tool-call cards**: live inline cards show each tool call (pending → done / error) as it runs.\n' +
+  '- **Tool-call approval gate**: every tool call (web search, fetch URL, run code, MCP tools) asks for approval by default before it runs — an inline bar above the composer offers Deny, Allow, Allow for this chat, or Always Allow. Live cards still show each call\'s status (awaiting approval → pending → done / error). Per-tool defaults (Ask / Allow / Deny) are set globally in Developer → Tool permissions. Background agent runs never see this prompt (no one there to answer it) — a tool the agent is configured to use runs without asking.\n' +
   '- **Web search**: Research persona forces 3–5 `web_search` calls; other personas use it when a search provider key is configured.\n' +
   '- **Export/Import**: export as `.turbollm-chat.json` or OpenAI-format JSON; re-import resumes the conversation. Share button gives a LAN read-only link and a debug snapshot.\n' +
   '- **Attachments** (paperclip): images (vision models), PDFs (real extracted text via pdf.js, not raw bytes), and plain-text/code files (`.txt`/`.md`/`.csv`/`.json`/`.yaml`/`.log` and common source extensions).\n' +
@@ -61,6 +61,7 @@ const TURBOLLM_KNOWLEDGE =
   '- Default context length and default GPU layers: global defaults for new model loads\n' +
   '- Auto-load last model on start: re-loads the last-used model at daemon start\n' +
   '- LAN exposure: bind to 0.0.0.0 (LAN) vs 127.0.0.1 (loopback only)\n' +
+  '- VRAM headroom (Settings → Engine): how much VRAM auto-tune keeps free for other GPU workloads — 300 MB to 2 GB, default 1 GB\n' +
   '- ComfyUI integration: URL of a ComfyUI instance; Reverse GPU gate: TurboLLM calls ComfyUI /free before every model load so VRAM is freed first; update banner when installed ComfyUI node is out of date\n' +
   '- Gateway: auto model-swap toggle + Keep-N pool (1–4 models loaded simultaneously, LRU eviction)\n' +
   '- Auth / API key: gateway key required from clients\n' +
@@ -91,7 +92,7 @@ const TURBOLLM_KNOWLEDGE =
   '## Auto-Tune\n\n' +
   'Auto-tune finds the best GPU-offload config for a model given available VRAM. It runs a binary search, not a fixed candidate list. Triggered from the Model Detail panel.\n\n' +
   '**Phase 1 — KV quant sweep** (VRAM probes, no generation):\n' +
-  'Tests quality-preserving KV cache types from best to smaller: f16 → q8_0 → turbo4 (TurboQuant only) / q4_0. Picks the highest-quality type that fits within a 1 GB VRAM headroom buffer. Lower-quality types (q4_0, q4_1) are never auto-selected — quality floor is enforced.\n\n' +
+  'Tests quality-preserving KV cache types from best to smaller: f16 → q8_0 → turbo4 (TurboQuant only) / q4_0. Picks the highest-quality type that fits within the configured VRAM headroom buffer (Settings → Engine, default 1 GB, adjustable 300 MB–2 GB). Lower-quality types (q4_0, q4_1) are never auto-selected — quality floor is enforced.\n\n' +
   '**Phase 2 — Binary search for GPU offload** (~log₂(blockCount) probes, VRAM-only):\n' +
   '- Dense models: search ngl ∈ [0, blockCount] — finds highest ngl that doesn\'t exceed the VRAM headroom.\n' +
   '- MoE models: search nCpuMoe ∈ [0, nExpertsTotal] — ngl stays maxed, finds minimum nCpuMoe (router experts on CPU) that fits. Reducing nCpuMoe pushes more MoE routing onto the GPU.\n\n' +

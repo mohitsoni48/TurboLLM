@@ -177,6 +177,8 @@ the detail:
 - **Saved per-model profiles, per engine** — tune once per (model, engine) pair, so
   switching engines (or between two installs of the same engine, e.g. a fork) never
   overwrites another engine's tuning for the same model.
+- **Configurable VRAM headroom** (Settings → Engine, 300 MB–2 GB, default 1 GB) — tell auto-tune
+  how much VRAM to keep free for other GPU workloads instead of a fixed margin.
 
 </details>
 
@@ -210,6 +212,9 @@ the detail:
   Atlassian, Neon, Supabase, Cloudflare, Zapier, Apify, Mixpanel) and open-source local MCPs
   (filesystem, git, postgres, playwright, …), plus your own custom servers. Connected tools appear
   in every chat with no restart. A **Research** persona forces multi-step web search and cites sources inline.
+- **Tool-call approval gate** — every tool call asks for your approval by default before it runs,
+  with **Deny**, **Allow**, **Allow for this chat**, or **Always Allow** on an inline bar above the
+  composer. Set per-tool defaults globally from Developer → Tool permissions.
 
 </details>
 

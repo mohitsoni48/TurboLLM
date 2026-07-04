@@ -1,7 +1,7 @@
 // Built-in tool definitions and execution (v0.7.0).
 // Tools: web_search (Tavily), fetch_url, run_code (Node vm sandbox).
 import { runInNewContext } from 'node:vm'
-import { checkSsrf, RUN_CODE_BLOCKED_MSG } from './security.js'
+import { checkSsrf } from './security.js'
 import { type SearchConfig } from './search-providers.js'
 import { research, type ResearchResult } from './research-service.js'
 
@@ -150,10 +150,9 @@ export async function execFetchUrl(args: Record<string, unknown>): Promise<strin
 
 // ── Run code ─────────────────────────────────────────────────────────────
 
-export function execRunCode(args: Record<string, unknown>, requireConfirmation = false): string {
+export function execRunCode(args: Record<string, unknown>): string {
   const code = String(args.code ?? '').trim()
   if (!code) return 'Error: code is required.'
-  if (requireConfirmation) return RUN_CODE_BLOCKED_MSG
 
   const output: string[] = []
   const sandbox = {
