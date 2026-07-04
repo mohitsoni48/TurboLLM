@@ -532,6 +532,9 @@ export type DaemonSettings = {
   /** Tool-call approval gate (F-025): per-tool default policy. Missing tools default
    *  to 'ask'. Keyed by tool name (e.g. 'run_code', 'mcp__server__tool'). */
   toolPolicies: Record<string, ToolPolicy>
+  /** Cloud Launch deploy-link settings (ADR-153). The RunPod Template ID the user
+   *  published themselves — not a secret, just an id, echoed back as-is. */
+  cloudDeploy: { runpodTemplateId: string }
 }
 
 /** Tool-call approval gate policy (mirrors turbollm/src/tools/tool-policy.ts). */

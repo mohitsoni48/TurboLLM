@@ -16,6 +16,7 @@ import type { ModelRouter } from './gateway/model-router'
 import type { ToolRegistry } from './tools/tool-registry'
 import type { GenerationGate } from './agents/gate'
 import type { AgentRunner } from './agents/runner'
+import type { TunnelManager } from './tunnel/manager'
 
 export interface Deps {
   store: ConfigStore
@@ -50,6 +51,11 @@ export interface Deps {
   gate?: GenerationGate
   /** Background agent runner. Optional — same wiring conditions as gate. */
   agentRunner?: AgentRunner
+  /** Cloud Launch tunnel (ADR-045/152): owns the cloudflared child when `--tunnel` is
+   *  active. Optional: only wired in the real `serve()` entrypoint (cli.ts); absent
+   *  under tests. Its presence/active() state is what forces auth enforcement on
+   *  tunneled traffic regardless of lanBind (see auth.ts lanAuth). */
+  tunnel?: TunnelManager
   version: string
   startedAt: number
   /** Re-exec the daemon so config changes (port, LAN bind) take effect (spec 08 §2).

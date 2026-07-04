@@ -4,7 +4,7 @@ import { streamSSE } from 'hono/streaming'
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { basename, dirname, join, resolve, sep } from 'node:path'
 import { GATE_VERSION, gateNodeSource } from '../comfyui/gate-template'
-import { createHash, randomBytes, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import { homedir, networkInterfaces } from 'node:os'
 import { ValueError, getModelProfile, setModelProfile, deleteModelProfile, type ApiKey, type Engine, type McpServer } from '../config/config'
 import type { Deps } from '../deps'
@@ -13,7 +13,8 @@ import { abortAllInFlightChats } from '../chat/chat-routes'
 import { NameTakenError, NotFoundError } from '../engines/registry'
 import { ProbeError, probe } from '../engines/probe'
 import { resolveServerBinary, suggestEngineName } from '../engines/scan'
-import { isLocalRequest } from '../auth'
+import { generateApiKey, isLocalRequest } from '../auth'
+import { enabledFeatures } from '../features'
 import {
   LLAMA_BUILD,
   availableBackends,
@@ -121,6 +122,11 @@ export function registerApi(app: Hono, d: Deps): void {
       })(),
       telemetryLevel: d.store.snapshot().telemetry.level,
       uptimeSec: Math.floor((Date.now() - d.startedAt) / 1000),
+      // Cloud Launch tunnel (ADR-045/152): null until --tunnel is active.
+      tunnel: d.tunnel ? d.tunnel.snapshot() : null,
+      // Local feature flags (TURBOLLM_FEATURES env var) — deliberately undocumented
+      // in any user-facing README; see features.ts.
+      features: enabledFeatures(),
     })
   })
 
@@ -1382,6 +1388,7 @@ export function registerApi(app: Hono, d: Deps): void {
       search?: { provider?: string; tavilyApiKey?: string; kagiApiKey?: string; searxngUrl?: string }
       build?: { toolchainDirs?: string[] }
       toolPolicies?: Record<string, string>
+      cloudDeploy?: { runpodTemplateId?: string }
     }>(c)
 
     const updates: Record<string, unknown> = {}
@@ -1520,6 +1527,11 @@ export function registerApi(app: Hono, d: Deps): void {
       if (toolPolicies !== undefined) cfg.tools.toolPolicies = toolPolicies
       if (b.autoLoadOnStart !== undefined) cfg.autoLoadOnStart = !!b.autoLoadOnStart
       if (telemetryLevel !== undefined) cfg.telemetry.level = telemetryLevel
+      // Cloud Launch deploy-link settings (ADR-153): the RunPod Template ID the user
+      // published themselves (deploy/runpod/README.md) — not a secret, just an id.
+      if (b.cloudDeploy?.runpodTemplateId !== undefined) {
+        cfg.cloudDeploy.runpodTemplateId = String(b.cloudDeploy.runpodTemplateId).trim()
+      }
       // HF token (spec 10 §4): write-only. An explicit '' clears it. Never logged.
       if (b.hfToken !== undefined) cfg.hf.token = String(b.hfToken).trim()
       // Search provider config (F-020). All key/URL fields are write-only; '' clears them.
@@ -1996,6 +2008,8 @@ function settingsPayload(d: Deps) {
     // Build environment (ADR-100): folders prepended to PATH for compile-from-source so a
     // conda-env / custom-path CUDA Toolkit + compiler are found. Not secret — echoed back.
     build: { toolchainDirs: cfg.build.toolchainDirs },
+    // Cloud Launch deploy-link settings (ADR-153): not secret — echoed back.
+    cloudDeploy: cfg.cloudDeploy,
     // Tool-call approval gate: global per-tool policy ('ask' | 'allow' | 'deny').
     // Not secret — echoed back directly so Settings can render Tool Permissions.
     toolPolicies: cfg.tools.toolPolicies ?? {},
@@ -2201,16 +2215,6 @@ function readTail(path: string, n: number): string[] {
 }
 
 // ── API key helpers ────────────────────────────────────────────────────────
-
-function generateApiKey(): { full: string; hash: string; prefix: string } {
-  const charset = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
-  const buf = randomBytes(60)
-  let key = ''
-  for (let i = 0; i < 40; i++) key += charset[buf[i] % 62]
-  const full = `tllm-${key}`
-  const hash = createHash('sha256').update(full).digest('hex')
-  return { full, hash, prefix: full.slice(0, 12) }
-}
 
 // ── filesystem browser helpers (spec 03 §9) ─────────────────────────────────
 

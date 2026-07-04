@@ -16,6 +16,25 @@ export function gpuBudgetMb(gpus: SysGpu[], gpu?: LoadProfile['gpu']): number {
   return gpus.reduce((sum, g) => sum + (g.vramMb || 0), 0)
 }
 
+const VENDOR_RANK: Record<string, number> = { nvidia: 4, amd: 3, apple: 3, intel: 2, unknown: 1 }
+
+type VendorGpu = { name: string; vramMb: number; vendor: string }
+
+/** Mirror of the daemon's `detectHardware` primary-vendor VRAM sum (`turbollm/src/engines/
+ *  hardware.ts`) for use as the raw-sysinfo fallback on the Engines screen: before the
+ *  `/recommendation` query resolves (or if it errors, since that query never retries), the
+ *  hero must not regress to a single un-summed card's VRAM on a multi-GPU box. */
+export function primaryVendorSummary(gpus: VendorGpu[]): { gpuName: string | null; vramMb: number } {
+  if (!gpus.length) return { gpuName: null, vramMb: 0 }
+  let vendor = 'unknown'
+  for (const g of gpus) if ((VENDOR_RANK[g.vendor] ?? 1) > (VENDOR_RANK[vendor] ?? 1)) vendor = g.vendor
+  const ofVendor = gpus.filter((g) => g.vendor === vendor)
+  const pool = ofVendor.length ? ofVendor : gpus
+  const headline = pool.reduce<VendorGpu | undefined>((best, g) => (!best || g.vramMb > best.vramMb ? g : best), undefined)
+  const vramMb = ofVendor.reduce((sum, g) => sum + g.vramMb, 0)
+  return { gpuName: headline?.name ?? null, vramMb }
+}
+
 function kvBytesPerElem(t: string): number {
   switch (t) {
     case 'f16': return 2

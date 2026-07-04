@@ -26,6 +26,7 @@ import {
   useUpdatePolicyMutation,
 } from '../lib/queries'
 import { ApiError } from '../lib/api'
+import { primaryVendorSummary } from '../lib/vram'
 import type {
   CatalogEngine,
   Engine,
@@ -217,10 +218,14 @@ function StatusHero({
   const upd = activeEngine ? updates?.updates[activeEngine.id] : undefined
   const showRebuildChip = !!upd?.rebuild && !!upd?.hasUpdate && !!activeEngine?.sourceRepo
 
-  // Hardware line — prefer the recommendation's hardware, fall back to sysinfo.
+  // Hardware line — prefer the recommendation's hardware (already primary-vendor-summed
+  // across all GPUs); before it resolves (or if it errors — that query never retries),
+  // fall back to the same sum computed from raw sysinfo, NOT sys.gpus[0]. A single card's
+  // number here is exactly the multi-GPU bug users have reported ("shows 8gb, only 1 GPU").
   const hw = rec?.hardware
-  const gpuName = hw?.gpuName ?? sys?.gpus[0]?.name ?? null
-  const vramMb = hw?.vramMb ?? sys?.gpus[0]?.vramMb ?? 0
+  const sysFallback = primaryVendorSummary(sys?.gpus ?? [])
+  const gpuName = hw?.gpuName ?? sysFallback.gpuName
+  const vramMb = hw?.vramMb ?? sysFallback.vramMb
   const osName = hw ? platformName(hw.platform) : sys?.os.split('/')[0] ? platformName(sys.os.split('/')[0]) : ''
   const hwLine = [
     gpuName ?? 'CPU-only',

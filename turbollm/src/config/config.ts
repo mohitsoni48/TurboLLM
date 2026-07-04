@@ -165,6 +165,15 @@ export interface ComfyUI {
 export interface BuildConfig {
   toolchainDirs: string[]
 }
+/** Cloud Launch deploy-link settings (ADR-153, RunPod recipe). RunPod is the only
+ *  provider for now — a user who has published their own RunPod Template (following
+ *  deploy/runpod/README.md) pastes its ID here; the Developer screen's "Deploy on
+ *  RunPod" button just constructs and opens RunPod's own one-click deploy link with
+ *  it. No credentials involved — full API-driven auto-provisioning is a separate,
+ *  bigger, not-yet-built feature (the BYO-cloud orchestration line, ADR-003). */
+export interface CloudDeployConfig {
+  runpodTemplateId: string
+}
 /** Global model defaults (spec 05 §3): the base LoadProfile values applied when a
  *  model is first seen and has no saved per-model profile. Saved profiles and
  *  per-request overrides still take precedence; these only replace the built-in
@@ -228,6 +237,8 @@ export interface Config {
   mcp: McpConfig
   /** Compile-from-source settings (ADR-089/100): toolchain dirs prepended to PATH. */
   build: BuildConfig
+  /** Cloud Launch deploy-link settings (ADR-153). */
+  cloudDeploy: CloudDeployConfig
   devModel?: DevModel
 }
 
@@ -338,6 +349,7 @@ export function defaultConfig(): Config {
     tools: {},
     mcp: { servers: [] },
     build: { toolchainDirs: [] },
+    cloudDeploy: { runpodTemplateId: '' },
   }
 }
 
@@ -579,6 +591,9 @@ function normalize(c: Config): void {
       ? bd.toolchainDirs.filter((p): p is string => typeof p === 'string' && p.trim() !== '').map((p) => p.trim())
       : [],
   }
+  // Cloud Launch deploy-link settings (ADR-153): absent in pre-ADR-153 configs → ''.
+  const cd = (c.cloudDeploy ?? {}) as Partial<CloudDeployConfig>
+  c.cloudDeploy = { runpodTemplateId: typeof cd.runpodTemplateId === 'string' ? cd.runpodTemplateId.trim() : '' }
   // Telemetry level (spec 09 §3): the UI exposes 'off' | 'anon' | 'full'. Migrate
   // legacy/unknown values safely → 'off' (the conservative, opt-in default).
   c.telemetry.level = normalizeTelemetryLevel(c.telemetry.level)

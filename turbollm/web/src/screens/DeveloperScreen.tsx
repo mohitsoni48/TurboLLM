@@ -1,11 +1,11 @@
 import { useQuery } from '@tanstack/react-query'
-import { useState } from 'react'
-import { ChevronRight, Globe, Key, Plus, ShieldCheck, Terminal, Trash2 } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { ChevronRight, Cloud, ExternalLink, Globe, Key, Plus, Rocket, ShieldCheck, Terminal, Trash2 } from 'lucide-react'
 import { CopyButton } from '../components/ui/copy-button'
 import { ScreenHeader } from '../components/common'
 import { Button } from '../components/ui/button'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../components/ui/collapsible'
-import { useApiKeys, useSettings } from '../lib/queries'
+import { useApiKeys, useSettings, useStatus } from '../lib/queries'
 import { ApiError, getConnect, type ConnectInfo, type ConnectStep, type ToolPolicy } from '../lib/api'
 import { fetchAvailableTools } from '../lib/chat-api'
 import { friendlyName } from './chat/MessageBubble'
@@ -32,11 +32,19 @@ const CLI_LIST = [
 ]
 
 export function DeveloperScreen() {
+  const { data: status } = useStatus()
+  // Cloud Deploy is behind a local, undocumented feature flag (TURBOLLM_FEATURES=
+  // cloud-deploy) while the RunPod side of it is paused — the tunnel/backend work
+  // is finished and stays shipped, but there's no official RunPod Template yet, so
+  // the button isn't ready for normal users. See turbollm/src/features.ts.
+  const cloudDeployEnabled = !!status?.features?.includes('cloud-deploy')
+
   return (
     <div className="w-full px-6 py-6">
       <ScreenHeader title="Developer" description="Server URLs, API endpoints, keys, and CLI setup." />
       <div className="flex flex-col gap-6">
         <ServerSection />
+        {cloudDeployEnabled && <CloudDeploySection />}
         <ApiKeysSection />
         <ToolPermissionsSection />
         <ApisSection />
@@ -62,6 +70,90 @@ function ServerSection() {
           <CopyButton text={BASE} />
         </div>
       </div>
+    </section>
+  )
+}
+
+// ── Cloud Deploy (ADR-153, RunPod recipe) ──────────────────────────────────────
+
+// The official, maintainer-published RunPod Template (built + pushed to GHCR by
+// .github/workflows/runpod-image.yml, then turned into ONE public RunPod Template by
+// hand — RunPod has no API-less way to automate template creation itself). Empty
+// until that one-time setup is done; users are never expected to publish their own —
+// the Settings field below is an ADVANCED override for people running a custom fork.
+const OFFICIAL_RUNPOD_TEMPLATE_ID = ''
+
+function CloudDeploySection() {
+  const { query: settingsQ, save } = useSettings()
+  const [templateId, setTemplateId] = useState('')
+
+  // Sync the editable draft from the loaded/saved value (same pattern as the other
+  // controlled-input settings fields in SettingsScreen.tsx).
+  useEffect(() => {
+    if (settingsQ.data) setTemplateId(settingsQ.data.cloudDeploy?.runpodTemplateId ?? '')
+  }, [settingsQ.data])
+
+  const savedOverride = (settingsQ.data?.cloudDeploy?.runpodTemplateId ?? '').trim()
+  const dirty = templateId.trim() !== savedOverride
+  // The override (if the user set one) always wins; otherwise fall back to the
+  // official shared template — this is what makes the button work with ZERO setup
+  // for a normal user, unlike the earlier design that required everyone to publish
+  // their own image/template first.
+  const effectiveId = savedOverride || OFFICIAL_RUNPOD_TEMPLATE_ID
+
+  const handleSave = () => {
+    save.mutate(
+      { cloudDeploy: { runpodTemplateId: templateId.trim() } },
+      { onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not save the template id.') },
+    )
+  }
+
+  const deploy = () => {
+    if (!effectiveId) return
+    window.open(`https://runpod.io/console/deploy?template=${encodeURIComponent(effectiveId)}`, '_blank', 'noopener,noreferrer')
+  }
+
+  return (
+    <section className="rounded-lg border border-border bg-panel p-4">
+      <div className="mb-3 flex items-center gap-2">
+        <Cloud size={15} className="text-accent" />
+        <h2 className="text-[13px] font-semibold uppercase tracking-wide text-faint">Cloud Deploy</h2>
+      </div>
+      <p className="mb-3 text-[12px] text-muted">
+        Run TurboLLM on a rented GPU box, reachable over the internet via{' '}
+        <code className="font-mono text-[11px] text-ink">--tunnel</code>. RunPod is the only
+        provider for now — click below to deploy the official TurboLLM template, no setup
+        required. Running a custom fork? Paste your own RunPod Template ID to override it
+        (see <code className="font-mono text-[11px] text-ink">deploy/runpod/README.md</code>).
+      </p>
+      <div className="flex gap-2">
+        <input
+          value={templateId}
+          onChange={(e) => setTemplateId(e.target.value)}
+          placeholder={OFFICIAL_RUNPOD_TEMPLATE_ID ? 'Custom Template ID (optional — leave blank for the official one)' : 'Custom Template ID (optional)'}
+          className="flex-1 rounded-md border border-border bg-bg px-2.5 py-1.5 font-mono text-[13px] text-ink outline-none placeholder:text-faint focus:border-[color:var(--accent)]"
+          onKeyDown={(e) => e.key === 'Enter' && dirty && handleSave()}
+        />
+        <Button size="sm" variant="outline" onClick={handleSave} disabled={!dirty || save.isPending}>
+          {save.isPending ? 'Saving…' : 'Save'}
+        </Button>
+      </div>
+      <Button
+        className="mt-3 w-full"
+        onClick={deploy}
+        disabled={!effectiveId || dirty}
+        title={
+          !effectiveId
+            ? 'No template configured yet'
+            : dirty
+              ? 'Save your changes first'
+              : `Opens RunPod's console in a new tab${savedOverride ? ' (using your custom template)' : ''}`
+        }
+      >
+        <Rocket size={14} />
+        Deploy on RunPod
+        <ExternalLink size={12} />
+      </Button>
     </section>
   )
 }
@@ -165,7 +257,7 @@ const POLICY_OPTIONS: { value: ToolPolicy; label: string }[] = [
 ]
 
 function ToolPermissionsSection() {
-  const [open, setOpen] = useState(true)
+  const [open, setOpen] = useState(false)
   const toolsQ = useQuery({ queryKey: ['available-tools'], queryFn: fetchAvailableTools })
   const { query: settingsQ, save } = useSettings()
   const tools = toolsQ.data ?? []
