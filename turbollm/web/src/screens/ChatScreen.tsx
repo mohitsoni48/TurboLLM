@@ -439,9 +439,17 @@ export function ChatScreen() {
   }
 
   const send = async (overrideInput?: string) => {
-    const text = (overrideInput ?? input).trim()
-    if ((!text && attachments.length === 0) || live) return
+    const rawText = (overrideInput ?? input).trim()
+    if ((!rawText && attachments.length === 0) || live) return
     if (engineState !== 'running' || !model) { toast.error('Load a model first.'); return }
+
+    // A message that starts with '/skill-id' enables that skill for this send — no matter
+    // how the token got there (picker click, Tab-complete, or just typed/pasted) — and the
+    // literal token is stripped before it reaches the model (the skill's own instructions
+    // may define a different natural-language trigger, e.g. "wan <url>" not "/wan <url>").
+    const skillMatch = /^\/([a-z0-9-]+)(?:\s+([\s\S]*))?$/.exec(rawText)
+    const matchedSkill = skillMatch ? pickableSkills.find((s) => s.id === skillMatch[1]) : undefined
+    const text = matchedSkill ? (skillMatch?.[2] ?? '').trim() : rawText
 
     // Discriminate by file.type (authoritative, same as the preview thumbnail below) rather
     // than sniffing the extracted dataUrl content — a text/PDF attachment whose content
@@ -471,17 +479,25 @@ export function ChatScreen() {
             sp = sp ? `${sp}\n\n${hwSection}` : hwSection
           } catch { /* non-fatal — proceed without hardware info */ }
         }
+        const initialSkillIds = matchedSkill
+          ? Array.from(new Set([...pendingSkillIds, matchedSkill.id]))
+          : pendingSkillIds
         const newConv = await mut.create.mutateAsync({
           modelKey: model.key,
           systemPrompt: sp || undefined,
           toolPolicy: selectedPersonaId === 'research' ? 'force_web_search' : undefined,
-          skillIds: pendingSkillIds.length ? pendingSkillIds : undefined,
+          skillIds: initialSkillIds.length ? initialSkillIds : undefined,
         })
         convId = newConv.id
         setConvPersonaId(convId, selectedPersonaId)
         setActiveId(convId)
         setPendingSkillIds([])
+      } else if (matchedSkill && !enabledSkillIds.includes(matchedSkill.id)) {
+        // Existing conversation missing this skill — enable it before sending so the
+        // system-prompt injection picks it up on this very turn, not the next one.
+        await mut.update.mutateAsync({ id: convId, skillIds: Array.from(new Set([...enabledSkillIds, matchedSkill.id])) })
       }
+      if (matchedSkill) toast.success(`Using skill: ${matchedSkill.name}`)
 
       const ac = new AbortController()
       abortRef.current = ac
