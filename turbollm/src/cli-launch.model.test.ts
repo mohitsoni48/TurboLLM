@@ -227,9 +227,8 @@ test('launchCli auto-load prefers lastLoaded.modelKey over the first library mod
     const code = await launchCli('claude', 6996, [], fn, undefined, lastUsedFetch)
     assert.equal(code, 0)
     assert.equal(startedKey, MODELS[1].key, 'should auto-load the last-used model, not the first')
-    // Without --model we auto-load a model but do NOT pin it: ANTHROPIC_MODEL stays unset
-    // so Claude Code uses the gateway's loaded model as-is.
-    assert.equal(calls[0].env['ANTHROPIC_MODEL'], undefined)
+    // We always pin ANTHROPIC_MODEL to the loaded model's key — even without --model.
+    assert.equal(calls[0].env['ANTHROPIC_MODEL'], MODELS[1].key)
   } finally {
     unsilence()
   }
@@ -292,7 +291,7 @@ test('launchCli --model already loaded with same key: skips load and launches', 
   }
 })
 
-test('launchCli without --model: does NOT set ANTHROPIC_MODEL (uses loaded model as-is)', async () => {
+test('launchCli without --model: pins ANTHROPIC_MODEL to the loaded model key', async () => {
   const { calls, fn } = makeSpawn()
   const unsilence = silenceOutput()
   try {
@@ -303,32 +302,32 @@ test('launchCli without --model: does NOT set ANTHROPIC_MODEL (uses loaded model
     )
     assert.equal(code, 0)
     assert.equal(calls.length, 1)
-    assert.equal(calls[0].env['ANTHROPIC_MODEL'], undefined, 'ANTHROPIC_MODEL must be unset without --model')
+    assert.equal(calls[0].env['ANTHROPIC_MODEL'], MODELS[0].key, 'ANTHROPIC_MODEL must be pinned to the loaded key')
     // The rest of the gateway wiring is still applied.
     assert.equal(calls[0].env['ANTHROPIC_BASE_URL'], 'http://127.0.0.1:6996')
     assert.equal(calls[0].env['ANTHROPIC_AUTH_TOKEN'], 'turbollm-local')
+    assert.equal(calls[0].env['CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY'], '1')
   } finally {
     unsilence()
   }
 })
 
-test('launchCli without --model: strips an ANTHROPIC_MODEL inherited from the environment', async () => {
+test('launchCli prefers the model key over its display name for ANTHROPIC_MODEL', async () => {
   const { calls, fn } = makeSpawn()
   const unsilence = silenceOutput()
-  const had = Object.prototype.hasOwnProperty.call(process.env, 'ANTHROPIC_MODEL')
-  const prev = process.env.ANTHROPIC_MODEL
-  process.env.ANTHROPIC_MODEL = 'stray-global-model'
+  // Status reports a distinct key + display name; the key must win.
+  const keyVsName: typeof fetch = (async (input: string | URL | globalThis.Request) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : (input as globalThis.Request).url
+    if (url.includes('/api/v1/status')) {
+      return { ok: true, status: 200, json: async () => ({ engine: { state: 'running' }, model: { key: 'qwen3-8b', name: 'Qwen3 8B' } }) } as Response
+    }
+    return { ok: false, status: 404, json: async () => ({}) } as Response
+  }) as unknown as typeof fetch
   try {
-    const code = await launchCli(
-      'claude', 6996, [], fn,
-      undefined, // no --model flag
-      makeFetch('running', MODELS[0].key),
-    )
+    const code = await launchCli('claude', 6996, [], fn, undefined, keyVsName)
     assert.equal(code, 0)
-    assert.equal(calls[0].env['ANTHROPIC_MODEL'], undefined, 'a stray inherited ANTHROPIC_MODEL must be stripped')
+    assert.equal(calls[0].env['ANTHROPIC_MODEL'], 'qwen3-8b', 'the key, not the display name, must be pinned')
   } finally {
-    if (had) process.env.ANTHROPIC_MODEL = prev
-    else delete process.env.ANTHROPIC_MODEL
     unsilence()
   }
 })

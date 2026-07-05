@@ -36,6 +36,13 @@ export function registerGateway(app: Hono, d: Deps): void {
         400,
       )
     }
+    // Claude Code's gateway model discovery only keeps /v1/models ids that start with
+    // `claude`/`anthropic`, so we advertise local models as `claude-<key>` (see /v1/models
+    // below). Strip that prefix in-place so both the router AND the outbound engine request
+    // (mapToOpenAI reads req.model again) use the real key. The alias is only ever advertised
+    // when gateway.autoSwap is on (see /v1/models below), so routing here still honors the
+    // user's global auto-swap preference like every other request.
+    if (req.model?.startsWith('claude-')) req.model = req.model.slice(7)
     if (!req.max_tokens) {
       return c.json(
         { type: 'error', error: { type: 'invalid_request_error', message: 'max_tokens is required.' } },
@@ -185,6 +192,23 @@ export function registerGateway(app: Hono, d: Deps): void {
 
   app.all('/v1/*', async (c) => {
     const url = new URL(c.req.url)
+
+    // GET /v1/models: always synthesise the list from the WHOLE local library (not just
+    // the loaded model), regardless of whether an engine is running — real key entries for
+    // OpenAI-style consumers. The `claude-<key>` alias (whose id passes Claude Code's
+    // discovery filter — it keeps only claude*/anthropic* ids — and which /v1/messages
+    // strips back to the real key before routing) is only added when gateway.autoSwap is
+    // on: picking a model from Claude Code's /model always requires a swap, so advertising
+    // it while auto-swap is off would let the user pick a model that silently never loads.
+    if (c.req.method === 'GET' && url.pathname === '/v1/models') {
+      const autoSwap = d.store.snapshot().gateway.autoSwap
+      const data = d.scanner.list().models.flatMap((m) => [
+        { id: m.key, object: 'model', owned_by: 'turbollm' },
+        ...(autoSwap ? [{ id: `claude-${m.key}`, object: 'model', display_name: `${m.name} — TurboLLM` }] : []),
+      ])
+      return c.json({ object: 'list', data })
+    }
+
     const isChat = c.req.method === 'POST' && url.pathname === '/v1/chat/completions'
 
     // For chat completions: parse the body to extract the model field for
@@ -198,9 +222,6 @@ export function registerGateway(app: Hono, d: Deps): void {
     const requestedModel = isChat ? ((parsedBody?.model as string | undefined) ?? '') : ''
     const routeResult = await d.modelRouter.route(requestedModel)
     if ('status' in routeResult) {
-      if (c.req.method === 'GET' && url.pathname === '/v1/models') {
-        return c.json({ object: 'list', data: [] })
-      }
       return c.json(
         { error: { message: routeResult.message, type: 'model_not_loaded', code: 'model_not_loaded' } },
         503,

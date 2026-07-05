@@ -25,6 +25,32 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.7.1] - 2026-07-05
+
+**Local coding CLIs: model pinning restored, `/model` now lists your local models, and four new launch targets.**
+
+### Added
+- **`turbollm launch opencode|kilo|openclaw|hermes`** — wire any of these coding CLIs to your
+  local model with one command, the same way `turbollm launch claude` already does. opencode,
+  kilo, and openclaw each get a `turbollm` provider merged into their own config file (an
+  existing config — comments included — is preserved as-is if it's already pointed at
+  TurboLLM); hermes is configured through its own `hermes config set` command instead, since its
+  config file is YAML.
+- **Claude Code's `/model` picker now lists your local models**, so you can switch mid-session
+  instead of only at launch. Turn on **Auto Model Swap** in Settings → Gateway first — the
+  picker only shows local models when a pick can actually load (otherwise it would silently do
+  nothing).
+
+### Changed
+- **`turbollm launch claude` pins the loaded model again by default**, not just when you pass
+  `--model`. Claude Code uses the model name for its status line, `/status`, and context-window
+  sizing even when talking to a local model, so this keeps all three accurate instead of
+  guessing a cloud default.
+
+### Discord
+- New: `turbollm launch opencode`, `kilo`, `openclaw`, and `hermes` wire those coding CLIs to your local model, same as `turbollm launch claude`.
+- New: Claude Code's `/model` picker can now show and switch between your local models (turn on Auto Model Swap in Settings → Gateway first).
+
 ## [1.7.0] - 2026-07-04
 
 **A configurable VRAM headroom, a real tool-call approval gate for chat, and engine build fixes.**
