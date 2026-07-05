@@ -131,10 +131,12 @@ if (hasFlag('--help', '-h')) {
     `  turbollm [options]\n` +
     `  turbollm launch <cli>            # run a coding CLI on your local model\n\n` +
     `Commands:\n` +
-    `  launch claude                    Launch Claude Code wired to TurboLLM\n` +
-    `                                   Uses whatever model is loaded (auto-loads the\n` +
-    `                                   last-used one if none is); does not pin a model.\n` +
-    `  launch claude --model <key>      Load a specific model by key or name and pin it\n\n` +
+    `  launch claude                    Launch Claude Code wired to TurboLLM. Auto-loads\n` +
+    `                                   the last-used model if none is loaded, and pins\n` +
+    `                                   Claude Code to whatever model is loaded.\n` +
+    `  launch claude --model <key>      Load a specific model by key or name, then launch\n` +
+    `  launch opencode|kilo|openclaw|hermes\n` +
+    `                                   Wire that CLI to TurboLLM (writes its config file)\n\n` +
     `Options:\n` +
     `  --port <n>     Port to listen on / connect to (default: 6996)\n` +
     `  --addr <h:p>   Full host:port override (e.g. 0.0.0.0:6996)\n` +
@@ -153,7 +155,8 @@ if (hasFlag('--help', '-h')) {
     `  turbollm --tunnel --no-open      # run on a rented GPU box, reachable via a public URL\n` +
     `  turbollm --stop                  # stop the running daemon\n` +
     `  turbollm launch claude           # open Claude Code on your loaded model\n` +
-    `  turbollm launch claude --model qwen3-8b   # load qwen3-8b, then launch\n\n`,
+    `  turbollm launch claude --model qwen3-8b   # load qwen3-8b, then launch\n` +
+    `  turbollm launch opencode         # wire opencode to TurboLLM, then launch it\n\n`,
   )
   process.exit(0)
 }

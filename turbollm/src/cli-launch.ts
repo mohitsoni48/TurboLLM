@@ -1,22 +1,39 @@
-// `turbollm launch <cli>` — start an Anthropic-compatible coding CLI (e.g. Claude
-// Code) already wired to the local TurboLLM gateway, so it uses whatever model is
-// loaded here instead of a cloud API (spec 06 §6). Ships with the npm package.
+// `turbollm launch <cli>` — start a coding CLI already wired to the local TurboLLM
+// gateway, so it uses whatever model is loaded here instead of a cloud API (spec 06
+// §6). Ships with the npm package.
 //
-// The daemon must already be running; this command is a thin launcher that points
-// the CLI's ANTHROPIC_* env vars at TurboLLM and execs it. If no model is loaded,
-// it auto-loads the last-used model (or the first available one). With --model it
-// resolves and loads a specific model by key/name before launching.
+// The daemon must already be running; this command is a thin launcher. If no model is
+// loaded, it auto-loads the last-used model (or the first available one). With --model
+// it resolves and loads a specific model by key/name before launching.
+//
+// Two wiring styles: Anthropic-protocol tools (claude) get ANTHROPIC_* env vars at
+// spawn time; config-file tools (opencode/kilo/openclaw) get a `turbollm` provider
+// merged into their own config file (prepareConfig) before spawning.
 import { spawn } from 'node:child_process'
+import { homedir } from 'node:os'
+import { readFile, writeFile, mkdir } from 'node:fs/promises'
+import { join, dirname } from 'node:path'
 
 interface CliSpec {
   bin: string
   label: string
   install: string
+  // Anthropic-protocol tools (today: claude) get ANTHROPIC_* env vars set at spawn time.
+  // Config-file tools (opencode/kilo/openclaw) instead get this called once before spawn
+  // to merge a local-gateway provider entry into the tool's own config file.
+  prepareConfig?: (base: string, apiKey: string, modelKey: string, modelName: string) => Promise<PrepareResult>
 }
 
-// Coding CLIs that speak the Anthropic /v1/messages API (what our gateway serves).
+type PrepareResult = { ok: true } | { ok: false; message: string }
+
+const AUTH_TOKEN = 'turbollm-local'
+
 const SUPPORTED: Record<string, CliSpec> = {
   claude: { bin: 'claude', label: 'Claude Code', install: 'npm install -g @anthropic-ai/claude-code' },
+  opencode: { bin: 'opencode', label: 'opencode', install: 'npm install -g opencode-ai', prepareConfig: prepareOpencode },
+  kilo: { bin: 'kilo', label: 'Kilo Code', install: 'npm install -g @kilocode/cli', prepareConfig: prepareKilo },
+  openclaw: { bin: 'openclaw', label: 'openclaw', install: 'npm install -g openclaw@latest', prepareConfig: prepareOpenclaw },
+  hermes: { bin: 'hermes', label: 'Hermes Agent', install: 'npm install -g hermes-agent', prepareConfig: prepareHermes },
 }
 
 interface DaemonStatus {
@@ -82,6 +99,265 @@ function resolveModelKey(models: ModelEntry[], input: string): string | null {
   if (partial) return partial.key
 
   return null
+}
+
+// ── Config-file provider merge (opencode / kilo / openclaw) ─────────────────────
+// Shared FS injection point so unit tests can supply a fake home + in-memory fs
+// without ever touching the real filesystem.
+export interface ConfigFs {
+  home: string
+  readFile: (p: string) => Promise<string>
+  writeFile: (p: string, data: string) => Promise<void>
+  mkdir: (p: string) => Promise<void>
+}
+
+const realFs: ConfigFs = {
+  home: homedir(),
+  readFile: (p) => readFile(p, 'utf8'),
+  writeFile: (p, data) => writeFile(p, data, 'utf8'),
+  mkdir: async (p) => { await mkdir(p, { recursive: true }) },
+}
+
+/** Strips `//` and `/* *\/` comments from JSONC/JSON5 text, tracking string literals
+ *  (single- and double-quoted, with escapes) so a value like `"http://host/v1"` is never
+ *  mistaken for a comment. Used only to DETECT what's already in a commented config —
+ *  we never write back through this (that would silently delete the user's comments). */
+function stripJsonComments(text: string): string {
+  let out = ''
+  let inString: '"' | "'" | null = null
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (inString) {
+      out += ch
+      if (ch === '\\') { out += text[i + 1] ?? ''; i++; continue }
+      if (ch === inString) inString = null
+      continue
+    }
+    if (ch === '"' || ch === "'") { inString = ch; out += ch; continue }
+    if (ch === '/' && text[i + 1] === '/') {
+      while (i < text.length && text[i] !== '\n') i++
+      out += '\n'
+      continue
+    }
+    if (ch === '/' && text[i + 1] === '*') {
+      i += 2
+      while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++
+      i++ // land on the closing '/'
+      continue
+    }
+    out += ch
+  }
+  return out
+}
+
+/** Read + parse an existing config file. Returns:
+ *   - { obj, lenient: false } — clean JSON (or the file is absent: fresh first run) —
+ *     safe to rewrite.
+ *   - { obj, lenient: true }  — only parsed after stripping JSONC comments — NEVER
+ *     rewrite this (would silently delete the user's comments); callers may only
+ *     report success if the file already has what we'd otherwise write.
+ *   - { corrupt: true }       — doesn't parse even leniently; caller MUST NOT touch it. */
+async function readConfigObject(
+  fs: ConfigFs,
+  path: string,
+): Promise<{ obj: Record<string, unknown>; lenient: boolean } | { corrupt: true }> {
+  let raw: string
+  try {
+    raw = await fs.readFile(path)
+  } catch {
+    return { obj: {}, lenient: false } // absent — first run
+  }
+  try {
+    const parsed = JSON.parse(raw) as unknown
+    if (parsed && typeof parsed === 'object') return { obj: parsed as Record<string, unknown>, lenient: false }
+    return { corrupt: true }
+  } catch {
+    // Not clean JSON — likely JSONC (kilo's config format allows comments, and real
+    // configs use them). Retry after stripping comments before giving up.
+    try {
+      const parsed = JSON.parse(stripJsonComments(raw)) as unknown
+      if (parsed && typeof parsed === 'object') return { obj: parsed as Record<string, unknown>, lenient: true }
+      return { corrupt: true }
+    } catch {
+      return { corrupt: true }
+    }
+  }
+}
+
+/** True when an existing provider entry (opencode/kilo's `options.baseURL`, or
+ *  openclaw's `baseUrl`) already points at our own gateway — used to treat a commented
+ *  config that's already correctly wired as success, without ever rewriting it. */
+function providerAlreadyPointsHere(entry: unknown, base: string): boolean {
+  if (!entry || typeof entry !== 'object') return false
+  const e = entry as Record<string, unknown>
+  const options = e.options as Record<string, unknown> | undefined
+  const baseUrl = (options?.baseURL ?? e.baseUrl) as string | undefined
+  return typeof baseUrl === 'string' && baseUrl.startsWith(base)
+}
+
+/** A commented config that ISN'T already pointed at us — we can detect this but can't
+ *  safely fix it (rewriting would delete the user's comments), so ask them to do it by
+ *  hand, same as a genuinely unparseable file. */
+function commentedConfigError(path: string, label: string): PrepareResult {
+  return {
+    ok: false,
+    message:
+      `Found an existing ${label} config at ${path} that uses comments and isn't yet ` +
+      `pointed at TurboLLM — auto-merging would delete your comments when rewriting the file, ` +
+      `so this is left to you.\n` +
+      `Add the "turbollm" provider by hand (see the Connect screen: TurboLLM UI → Developer → Connect a tool), then run this again.`,
+  }
+}
+
+/** Narrows a config sub-value to a plain object, treating absent as `{}` (fresh) but
+ *  any other non-object (a user's config has e.g. `provider: "foo"`) as unsafe to
+ *  merge into — callers bail out via corruptConfigError instead of throwing when a
+ *  property assignment hits a primitive. */
+function asObject(v: unknown): Record<string, unknown> | null {
+  if (v === undefined) return {}
+  return v !== null && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : null
+}
+
+/** Standard "can't safely touch your config" failure — points at the same info the
+ *  web UI's Connect screen shows (Developer → Connect a tool). */
+function corruptConfigError(path: string, label: string): PrepareResult {
+  return {
+    ok: false,
+    message:
+      `Found an existing ${label} config at ${path} that doesn't parse as JSON — not overwriting it.\n` +
+      `Add the "turbollm" provider by hand (see the Connect screen: TurboLLM UI → Developer → Connect a tool), then run this again.`,
+  }
+}
+
+/** opencode — merge a `turbollm` provider into ~/.config/opencode/opencode.json,
+ *  preserving every sibling provider the user already configured. Shape mirrors
+ *  buildConnectSnippets (routes.ts) so both surfaces stay in lockstep. */
+export async function prepareOpencode(base: string, apiKey: string, _modelKey: string, modelName: string, fs: ConfigFs = realFs): Promise<PrepareResult> {
+  const path = join(fs.home, '.config', 'opencode', 'opencode.json')
+  const read = await readConfigObject(fs, path)
+  if ('corrupt' in read) return corruptConfigError(path, 'opencode')
+  const cfg = read.obj
+  const provider = asObject(cfg.provider)
+  if (!provider) return corruptConfigError(path, 'opencode')
+  if (read.lenient) {
+    // Has comments — never rewrite. Only succeed if it's already wired to us.
+    return providerAlreadyPointsHere(provider.turbollm, base) ? { ok: true } : commentedConfigError(path, 'opencode')
+  }
+  provider.turbollm = {
+    npm: '@ai-sdk/openai-compatible',
+    options: { baseURL: `${base}/v1`, apiKey },
+    models: { [modelName]: { id: modelName } },
+  }
+  cfg.provider = provider
+  await fs.mkdir(dirname(path))
+  await fs.writeFile(path, JSON.stringify(cfg, null, 2) + '\n')
+  return { ok: true }
+}
+
+/** kilo — Kilo Code is built on the opencode stack and uses the SAME provider shape
+ *  (verified against the live install: an array-form `models` is rejected with
+ *  "Expected object"). Its real config file is `kilo.jsonc` (JSONC — comments allowed),
+ *  confirmed against the live install, NOT `kilo.json`. Merge the `turbollm` provider
+ *  and set it as the default via the top-level `model` string. */
+export async function prepareKilo(base: string, apiKey: string, _modelKey: string, modelName: string, fs: ConfigFs = realFs): Promise<PrepareResult> {
+  const path = join(fs.home, '.config', 'kilo', 'kilo.jsonc')
+  const read = await readConfigObject(fs, path)
+  if ('corrupt' in read) return corruptConfigError(path, 'Kilo Code')
+  const cfg = read.obj
+  const provider = asObject(cfg.provider)
+  if (!provider) return corruptConfigError(path, 'Kilo Code')
+  if (read.lenient) {
+    // kilo.jsonc allowing comments is its NORMAL format, not an edge case — but we still
+    // never rewrite one (would delete the user's comments). Already-wired configs (like
+    // a hand-curated kilo.jsonc that already has a turbollm provider) succeed as-is.
+    return providerAlreadyPointsHere(provider.turbollm, base) ? { ok: true } : commentedConfigError(path, 'Kilo Code')
+  }
+  provider.turbollm = {
+    npm: '@ai-sdk/openai-compatible',
+    options: { baseURL: `${base}/v1`, apiKey },
+    models: { [modelName]: { id: modelName } },
+  }
+  cfg.provider = provider
+  // provider/model key selects the default model kilo boots with (format: provider/mapKey).
+  cfg.model = `turbollm/${modelName}`
+  await fs.mkdir(dirname(path))
+  await fs.writeFile(path, JSON.stringify(cfg, null, 2) + '\n')
+  return { ok: true }
+}
+
+/** openclaw — merge a `turbollm` provider under models.providers and set it as the
+ *  default primary model. Path per its docs (~/.config/openclaw/openclaw.json); the
+ *  CLI isn't installed on this box to verify empirically, so the path is assumed.
+ *  We write plain JSON (valid JSON5); JSON5-only files are handled on the READ side
+ *  by refusing to overwrite an unparseable file. */
+export async function prepareOpenclaw(base: string, apiKey: string, modelKey: string, modelName: string, fs: ConfigFs = realFs): Promise<PrepareResult> {
+  const path = join(fs.home, '.config', 'openclaw', 'openclaw.json')
+  const read = await readConfigObject(fs, path)
+  if ('corrupt' in read) return corruptConfigError(path, 'openclaw')
+  const cfg = read.obj
+  const models = asObject(cfg.models)
+  const providers = models && asObject(models.providers)
+  const agents = asObject(cfg.agents)
+  const defaults = agents && asObject(agents.defaults)
+  if (!models || !providers || !agents || !defaults) return corruptConfigError(path, 'openclaw')
+  if (read.lenient) {
+    return providerAlreadyPointsHere(providers.turbollm, base) ? { ok: true } : commentedConfigError(path, 'openclaw')
+  }
+  providers.turbollm = {
+    baseUrl: `${base}/v1`,
+    apiKey,
+    api: 'openai-completions',
+    models: [{ id: modelKey, name: modelName }],
+  }
+  models.providers = providers
+  cfg.models = models
+  defaults.model = { primary: `turbollm/${modelKey}` }
+  agents.defaults = defaults
+  cfg.agents = agents
+  await fs.mkdir(dirname(path))
+  await fs.writeFile(path, JSON.stringify(cfg, null, 2) + '\n')
+  return { ok: true }
+}
+
+/** Runs a CLI command to completion, resolving true on exit code 0. Deliberately spawned
+ *  WITHOUT a shell: hermes (the only current caller) is a real, directly-executable binary
+ *  on every platform (confirmed: a native .exe on Windows, not an npm-style .cmd shim), and
+ *  our own model keys contain `|` — under `shell: true` on Windows that's cmd.exe's pipe
+ *  operator, silently mangling the command (args aren't escaped, only concatenated; Node
+ *  itself deprecation-warns about this exact hazard). No shell means no metacharacters. */
+export type RunCommand = (bin: string, args: string[]) => Promise<boolean>
+
+export const realRunCommand: RunCommand = (bin, args) =>
+  new Promise<boolean>((resolve) => {
+    const child = spawn(bin, args, { stdio: 'ignore' })
+    child.on('error', () => resolve(false))
+    child.on('exit', (code) => resolve(code === 0))
+  })
+
+/** hermes — Nous Research's agent CLI. Its config is YAML, not JSON, so rather than
+ *  parsing/writing it ourselves (a YAML dependency, and real risk of corrupting a
+ *  hand-edited file) we shell out to hermes's own `config set <dotted.key> <value>`
+ *  command, same as its own docs recommend. Schema confirmed directly against a real,
+ *  live `hermes config show` on this machine (not just docs): the model block is
+ *  `{ provider, base_url, default }` under the top-level `model` key. */
+export async function prepareHermes(base: string, _apiKey: string, modelKey: string, _modelName: string, run: RunCommand = realRunCommand): Promise<PrepareResult> {
+  const sets: Array<[string, string]> = [
+    ['model.provider', 'custom'],
+    ['model.base_url', `${base}/v1`],
+    ['model.default', modelKey],
+  ]
+  for (const [key, value] of sets) {
+    if (!(await run('hermes', ['config', 'set', key, value]))) {
+      return {
+        ok: false,
+        message:
+          `Failed running "hermes config set ${key} ${value}".\n` +
+          `Configure it by hand: hermes config set model.provider custom && ` +
+          `hermes config set model.base_url ${base}/v1 && hermes config set model.default ${modelKey}`,
+      }
+    }
+  }
+  return { ok: true }
 }
 
 /**
@@ -231,34 +507,49 @@ export async function launchCli(
     return 1
   }
   const model = status.model.name
+  // Prefer the stable key over the display name — it's what the gateway routes on.
+  const pinnedModel = status.model.key ?? model
 
-  // Only PIN a model id (via ANTHROPIC_MODEL) when the user explicitly asked for one with
-  // --model. Without --model we leave it unset so Claude Code talks to whatever model the
-  // gateway currently has loaded, as-is. Pinning makes Claude Code send that id on every
-  // request, which forces the gateway's auto-swap router to resolve it and can surface
-  // model-specific behaviour (e.g. a strict chat template) the user didn't ask for —
-  // when they ran a bare `launch`, they just want "use the loaded model".
   const modelNote = modelKey ? `model: ${model}` : `using loaded model: ${model}`
   process.stdout.write(`▸ Launching ${spec.label} → TurboLLM  (${modelNote}, ${base})\n`)
+
+  // Config-file tools (opencode/kilo/openclaw): merge a `turbollm` provider into the
+  // tool's own config BEFORE spawning, then spawn with a clean env (no ANTHROPIC_* —
+  // those are meaningless to non-Anthropic-protocol tools).
+  if (spec.prepareConfig) {
+    const prep = await spec.prepareConfig(base, AUTH_TOKEN, pinnedModel, model)
+    if (!prep.ok) {
+      process.stderr.write(prep.message + '\n')
+      return 1
+    }
+    const child = _spawn(spec.bin, passthrough, {
+      stdio: 'inherit',
+      shell: process.platform === 'win32',
+      env: process.env,
+    })
+    return await waitForChild(child, spec)
+  }
 
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     ANTHROPIC_BASE_URL: base,
     // No auth is enforced on the local gateway; the CLI just needs a non-empty token.
-    ANTHROPIC_AUTH_TOKEN: 'turbollm-local',
+    ANTHROPIC_AUTH_TOKEN: AUTH_TOKEN,
     // Local LLMs are 30–120 s per response — raise Claude Code's request timeout so it
     // doesn't abort mid-generation. 300 s (5 min) covers even the slowest local model.
     // Zero retries: retrying a slow local model cold-starts it again and makes things worse.
     ANTHROPIC_TIMEOUT: '300000',
     ANTHROPIC_MAX_RETRIES: '0',
-  }
-  if (modelKey) {
-    // --model was given: pin Claude Code to the resolved model.
-    env.ANTHROPIC_MODEL = model
-  } else {
-    // No --model: do not set a model, and strip any ANTHROPIC_MODEL inherited from the
-    // parent environment so a stray global value can't silently pin the model either.
-    delete env.ANTHROPIC_MODEL
+    // Always pin the loaded model's id (key preferred). Claude Code uses the model string
+    // for real client-side bookkeeping even behind a custom base URL — the status line,
+    // `/status`, and context-window / auto-compact sizing all read it — and never validates
+    // it against a cloud catalog when ANTHROPIC_BASE_URL is custom. Pinning to whatever's
+    // actually loaded is therefore safe and fixes those surfaces from silently assuming a
+    // wrong cloud default.
+    ANTHROPIC_MODEL: pinnedModel,
+    // Opt into gateway model discovery: Claude Code queries our /v1/models at startup and
+    // populates the /model picker with the local library (gateway synthesises the entries).
+    CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: '1',
   }
 
   const child = _spawn(spec.bin, passthrough, {
@@ -268,7 +559,12 @@ export async function launchCli(
     env,
   })
 
-  return await new Promise<number>((resolve) => {
+  return await waitForChild(child, spec)
+}
+
+/** Resolve the child's exit code, reporting a friendly install hint on ENOENT. */
+function waitForChild(child: Pick<ReturnType<typeof spawn>, 'on'>, spec: CliSpec): Promise<number> {
+  return new Promise<number>((resolve) => {
     child.on('error', (e: NodeJS.ErrnoException) => {
       if (e.code === 'ENOENT') {
         process.stderr.write(
