@@ -244,6 +244,15 @@ export class ConversationStore {
     this.migrate()
   }
 
+  /** Whether `table` already has `column` — guards ADD COLUMN migrations that may have
+   *  already run under an earlier version number (this branch's migration ladder has
+   *  been renumbered more than once across its history; a stored user_version can lag
+   *  behind columns a prior run already added). */
+  private hasColumn(table: string, column: string): boolean {
+    const rows = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
+    return rows.some((r) => r.name === column)
+  }
+
   private migrate(): void {
     this.db.exec(`PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;`)
     const { user_version: v } = this.db.prepare('PRAGMA user_version').get() as { user_version: number }
@@ -420,17 +429,15 @@ export class ConversationStore {
     // v16 (spec 13 redesign §1): bind a CHAT conversation to an Agent. Null = a plain
     // chat (no agent, no FS/tools). Additive; existing chats get NULL = unchanged behavior.
     if (v < 16) {
-      this.db.exec(`
-        ALTER TABLE conversations ADD COLUMN agent_id TEXT;
-        PRAGMA user_version = 16;
-      `)
+      if (!this.hasColumn('conversations', 'agent_id')) this.db.exec(`ALTER TABLE conversations ADD COLUMN agent_id TEXT;`)
+      this.db.exec(`PRAGMA user_version = 16;`)
     }
     // v17 (spec 13 redesign §2/§3): completion marker on a conversation + the per-agent
     // lessons store (Reflexion). completed_at null = in-progress. agent_lessons is keyed by
     // the config agent id (not a DB FK); pruned when the agent is deleted.
     if (v < 17) {
+      if (!this.hasColumn('conversations', 'completed_at')) this.db.exec(`ALTER TABLE conversations ADD COLUMN completed_at TEXT;`)
       this.db.exec(`
-        ALTER TABLE conversations ADD COLUMN completed_at TEXT;
         CREATE TABLE IF NOT EXISTS agent_lessons (
           id         TEXT PRIMARY KEY,
           agent_id   TEXT NOT NULL,
@@ -464,25 +471,19 @@ export class ConversationStore {
     // v19 (spec 13 redesign): per-conversation read scope — JSON array of file/folder paths
     // the bound agent may read. Read access is chat-bound (attached via picker), not agent-bound.
     if (v < 19) {
-      this.db.exec(`
-        ALTER TABLE conversations ADD COLUMN read_scope TEXT;
-        PRAGMA user_version = 19;
-      `)
+      if (!this.hasColumn('conversations', 'read_scope')) this.db.exec(`ALTER TABLE conversations ADD COLUMN read_scope TEXT;`)
+      this.db.exec(`PRAGMA user_version = 19;`)
     }
     // v20: per-conversation pi permission mode ('ask'|'auto'|'bypass'|'read'). Null = 'auto'.
     if (v < 20) {
-      this.db.exec(`
-        ALTER TABLE conversations ADD COLUMN agent_mode TEXT;
-        PRAGMA user_version = 20;
-      `)
+      if (!this.hasColumn('conversations', 'agent_mode')) this.db.exec(`ALTER TABLE conversations ADD COLUMN agent_mode TEXT;`)
+      this.db.exec(`PRAGMA user_version = 20;`)
     }
     // v21: skill ids enabled for a conversation (JSON string[]) — the shared SKILL.md
     // library injected into chat directly, replacing the agent-bound tool/skill picker.
     if (v < 21) {
-      this.db.exec(`
-        ALTER TABLE conversations ADD COLUMN skill_ids TEXT;
-        PRAGMA user_version = 21;
-      `)
+      if (!this.hasColumn('conversations', 'skill_ids')) this.db.exec(`ALTER TABLE conversations ADD COLUMN skill_ids TEXT;`)
+      this.db.exec(`PRAGMA user_version = 21;`)
     }
   }
 

@@ -867,6 +867,15 @@ export function ChatScreen() {
                     if (skillPickerOpen) {
                       if (e.key === 'ArrowDown') { e.preventDefault(); setSkillPickerIndex((i) => Math.min(i + 1, filteredSkills.length - 1)); return }
                       if (e.key === 'ArrowUp') { e.preventDefault(); setSkillPickerIndex((i) => Math.max(i - 1, 0)); return }
+                      if (e.key === 'Tab') {
+                        // Tab-complete only: fill in the matched skill's name, don't enable it yet
+                        // (Enter still does that, now unambiguous once the text is a full match).
+                        e.preventDefault()
+                        const s = filteredSkills[Math.min(skillPickerIndex, filteredSkills.length - 1)]
+                        setInput(`/${s.id}`)
+                        setTimeout(autoResize, 0)
+                        return
+                      }
                       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); selectSkill(filteredSkills[Math.min(skillPickerIndex, filteredSkills.length - 1)]); return }
                       if (e.key === 'Escape') { e.preventDefault(); setInput(''); return }
                     }

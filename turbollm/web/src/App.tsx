@@ -15,7 +15,6 @@ import { ApiError, setAuthToken } from './lib/api'
 // Route-level code splitting: each screen loads only when first navigated to.
 const WorkspaceScreen = lazy(() => import('./screens/WorkspaceScreen').then((m) => ({ default: m.WorkspaceScreen })))
 const ChatScreen = lazy(() => import('./screens/ChatScreen').then((m) => ({ default: m.ChatScreen })))
-const SkillsLibrary = lazy(() => import('./screens/skills/SkillsLibrary').then((m) => ({ default: m.SkillsLibrary })))
 const SkillEditPage = lazy(() => import('./screens/skills/SkillEditPage').then((m) => ({ default: m.SkillEditPage })))
 const ModelsScreen = lazy(() => import('./screens/ModelsScreen').then((m) => ({ default: m.ModelsScreen })))
 const EnginesScreen = lazy(() => import('./screens/EnginesScreen').then((m) => ({ default: m.EnginesScreen })))
@@ -87,8 +86,7 @@ export function App() {
                 so existing LAN share links (baked as /chat/<id>) keep working. */}
             <Route path="/chat" element={<Navigate to="/workspace/chat" replace />} />
             <Route path="/chat/:convId" element={<ChatScreen />} />
-            {/* Skills: the shared library any chat can enable. Static /new outranks /:skillId. */}
-            <Route path="/skills" element={<SkillsLibrary />} />
+            {/* Skills: managed from within Customize; this route is just the create/edit page. */}
             <Route path="/skills/:skillId" element={<SkillEditPage />} />
             <Route path="/models" element={<ModelsScreen />} />
             <Route path="/engines" element={<EnginesScreen />} />

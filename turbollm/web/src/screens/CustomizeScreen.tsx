@@ -9,17 +9,19 @@ import type { McpServer, DaemonSettings, DaemonSettingsPatch } from '../lib/api'
 import { CLOUD_MCPS, LOCAL_MCPS, CLOUD_CATS, LOCAL_CATS, BUILTIN_SEARCH } from '../lib/mcp-catalog'
 import type { CloudEntry, LocalEntry, BuiltinSearchEntry } from '../lib/mcp-catalog'
 import { BRAND_ICONS } from '../lib/brand-icons'
+import { SkillsLibrary } from './skills/SkillsLibrary'
 
 export function CustomizeScreen() {
   const { query: settingsQ } = useSettings()
   const settings = settingsQ.data
 
   return (
-    <div className="w-full px-6 py-6">
+    <div className="flex w-full flex-col gap-4 px-6 py-6">
       <ScreenHeader
         title="Customize"
-        description="Add tools and external providers the model can call during conversations."
+        description="Add tools, skills, and external providers the model can call during conversations."
       />
+      <SkillsLibrary />
       <McpSection
         servers={settings?.mcp?.servers ?? []}
         search={settings?.search ?? { provider: 'tavily', tavilyKeySet: false, kagiKeySet: false, searxngUrl: '' }}

@@ -71,14 +71,13 @@ export function SkillsLibrary() {
   }
 
   return (
-    <div className="flex w-full flex-col gap-5 px-8 py-6">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div className="flex flex-col gap-0.5">
-          <h1 className="text-[18px] font-semibold text-ink">Skills</h1>
+    <section className="rounded-lg border border-border bg-panel p-4">
+      <div className="mb-3 flex items-start justify-between gap-3">
+        <div>
+          <h2 className="mb-1 text-[13px] font-semibold uppercase tracking-wide text-faint">Skills</h2>
           <p className="text-[12px] text-muted">The shared library — enable any of these in a chat, or via '/' in the composer.</p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex shrink-0 items-center gap-2">
           <input ref={uploadRef} type="file" accept=".md,text/markdown" hidden onChange={(e) => void handleUpload(e)} />
           <Button size="sm" variant="outline" onClick={() => uploadRef.current?.click()}>
             <Upload size={14} /> Upload SKILL.md
@@ -90,7 +89,7 @@ export function SkillsLibrary() {
       </div>
 
       {/* Learn from folder */}
-      <div className="flex flex-col gap-1.5 rounded-lg border border-border bg-panel-2 px-3 py-2.5">
+      <div className="mb-3 flex flex-col gap-1.5 rounded-lg border border-border bg-panel-2 px-3 py-2.5">
         <label className="flex items-center gap-1.5 text-[12px] text-muted">
           <FolderInput size={12} /> Learn a skill from a folder
         </label>
@@ -110,22 +109,22 @@ export function SkillsLibrary() {
 
       {/* Grid */}
       {skillsQ.isLoading ? (
-        <p className="py-12 text-center text-[13px] text-faint">Loading…</p>
+        <p className="py-8 text-center text-[13px] text-faint">Loading…</p>
       ) : skills.length === 0 ? (
-        <div className="flex flex-col items-center gap-3 py-16">
-          <Sparkles size={32} className="text-faint" />
-          <p className="text-[14px] text-muted">No skills yet.</p>
+        <div className="flex flex-col items-center gap-3 py-10">
+          <Sparkles size={28} className="text-faint" />
+          <p className="text-[13px] text-muted">No skills yet.</p>
           <Button size="sm" variant="outline" onClick={() => navigate('/skills/new')}>
             <Plus size={14} /> Create your first skill
           </Button>
         </div>
       ) : (
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5">
+        <div className="grid gap-2" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(185px, 1fr))' }}>
           {skills.map((sk) => (
             <SkillCard key={sk.id} skill={sk} onOpen={() => navigate(`/skills/${sk.id}`)} />
           ))}
         </div>
       )}
-    </div>
+    </section>
   )
 }
