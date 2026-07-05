@@ -1,11 +1,11 @@
 import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { ChevronLeft, Trash2 } from 'lucide-react'
 import { Button } from '../../components/ui/button'
 import { toast } from '../../components/ui/sonner'
 import { ApiError } from '../../lib/api'
-import { fetchSkills, saveSkill, deleteSkill } from '../../lib/agent-api'
+import { fetchSkills, saveSkill, deleteSkill, skillKeys } from '../../lib/agent-api'
 import type { Skill } from '../../lib/agent-types'
 
 interface SkillForm {
@@ -27,12 +27,13 @@ function slugify(name: string): string {
   return name.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60)
 }
 
-export function SkillEditPage({ skillId }: { skillId: string }) {
+export function SkillEditPage() {
+  const { skillId = 'new' } = useParams<{ skillId: string }>()
   const navigate = useNavigate()
   const qc = useQueryClient()
   const isNew = skillId === 'new'
 
-  const skillsQ = useQuery({ queryKey: ['skills'], queryFn: fetchSkills, staleTime: 0 })
+  const skillsQ = useQuery({ queryKey: skillKeys.list(), queryFn: fetchSkills, staleTime: 0 })
   const skill = isNew ? undefined : (skillsQ.data ?? []).find((s) => s.id === skillId)
   const readOnly = !!skill?.builtin
 
@@ -47,7 +48,7 @@ export function SkillEditPage({ skillId }: { skillId: string }) {
     setHydrated(true)
   }
 
-  const goBack = () => navigate('/agents/skills')
+  const goBack = () => navigate('/skills')
 
   const setName = (name: string) =>
     setForm((f) => ({ ...f, name, id: isNew && !idEdited ? slugify(name) : f.id }))
@@ -66,7 +67,7 @@ export function SkillEditPage({ skillId }: { skillId: string }) {
         instructions: form.instructions,
         tools: form.tools,
       })
-      void qc.invalidateQueries({ queryKey: ['skills'] })
+      void qc.invalidateQueries({ queryKey: skillKeys.list() })
       toast.success(isNew ? 'Skill created.' : 'Skill saved.')
       goBack()
     } catch (e) {
@@ -79,7 +80,7 @@ export function SkillEditPage({ skillId }: { skillId: string }) {
   const handleDelete = async () => {
     try {
       await deleteSkill(skillId)
-      void qc.invalidateQueries({ queryKey: ['skills'] })
+      void qc.invalidateQueries({ queryKey: skillKeys.list() })
       toast.success('Skill deleted.')
       goBack()
     } catch (e) {

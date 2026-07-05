@@ -312,43 +312,25 @@ test('isValidSkillId: rejects traversal / separators / absolute', () => {
   assert.ok(!isValidSkillId('a'.repeat(65)))
 })
 
-// ── Agent toolset (Phase 1 chat integration) ──────────────────────────────────
+// ── Skill-creator toolset (chat integration) ──────────────────────────────────
 
-import { buildAgentToolset } from './agent-tools'
+import { buildSaveSkillTool } from './agent-tools'
 
-test('buildAgentToolset: skills map to tool defs; run_code is compute-only', () => {
-  const agent = { id: 'a', name: 'A', description: '', systemPrompt: 'be helpful', skills: ['filesystem', 'code'], readRoots: [], writeRoots: [], callableAgents: [] }
-  const ts = buildAgentToolset(agent, '/data')
-  const names = [...ts.names].sort()
-  assert.deepEqual(names, ['glob', 'list_dir', 'read_file', 'run_code', 'write_file'])
+test('buildSaveSkillTool: grants exactly save_skill', () => {
+  const ts = buildSaveSkillTool(() => 'ok')
+  assert.deepEqual([...ts.names], ['save_skill'])
 })
 
-test('buildAgentToolset: wildcard grants all; unknown tool rejected by executor', () => {
-  const agent = { id: 'a', name: 'A', description: '', skills: ['*'], readRoots: ['/data'], writeRoots: ['/data'], callableAgents: [] }
-  const ts = buildAgentToolset(agent, '/data')
-  assert.ok(ts.names.has('read_file'))
+test('buildSaveSkillTool: save_skill routes to the callback with parsed args', () => {
+  let received: unknown
+  const ts = buildSaveSkillTool((args) => { received = args; return 'saved' })
+  const r = ts.execute({ id: '1', name: 'save_skill', args: { name: 'csv-summary', description: 'Summarize a CSV', procedure: 'Read then summarize.' } })
+  assert.equal(r, 'saved')
+  assert.deepEqual(received, { name: 'csv-summary', description: 'Summarize a CSV', procedure: 'Read then summarize.' })
+})
+
+test('buildSaveSkillTool: unknown tool rejected by executor', () => {
+  const ts = buildSaveSkillTool(() => 'ok')
   const r = ts.execute({ id: '1', name: 'not_a_tool', args: {} })
   assert.match(r, /not available/)
-})
-
-test('buildAgentToolset: write blocked outside ~/.turbollm root', () => {
-  const root = mkdtempSync(join(tmpdir(), 'ats-'))
-  try {
-    const agent = { id: 'a', name: 'A', description: '', skills: ['filesystem'], readRoots: [root], writeRoots: [root], callableAgents: [] }
-    const ts = buildAgentToolset(agent, root)
-    // write inside root → ok; write outside → denied
-    const ok = ts.execute({ id: '1', name: 'write_file', args: { path: join(root, 'x.txt'), content: 'hi' } })
-    assert.match(ok, /Written/)
-    const denied = ts.execute({ id: '2', name: 'write_file', args: { path: join(tmpdir(), 'escape.txt'), content: 'x' } })
-    assert.match(denied, /Denied/)
-  } finally {
-    rmSync(root, { recursive: true, force: true })
-  }
-})
-
-test('buildAgentToolset: run_code computes without filesystem access', () => {
-  const agent = { id: 'a', name: 'A', description: '', skills: ['code'], readRoots: [], writeRoots: [], callableAgents: [] }
-  const ts = buildAgentToolset(agent, '/data')
-  const r = ts.execute({ id: '1', name: 'run_code', args: { code: 'return 2 + 3' } })
-  assert.match(r, /5/)
 })

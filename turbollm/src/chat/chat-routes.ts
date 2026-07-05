@@ -1,9 +1,7 @@
 // Chat API routes (spec 07). Conversations CRUD + SSE streaming send + message actions.
 import type { Context, Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
-import { networkInterfaces, homedir } from 'node:os'
-import { existsSync, realpathSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { networkInterfaces } from 'node:os'
 import type { Deps } from '../deps'
 import { clampMaxTokens } from '../config/config'
 import { engineModelAlias } from '../engines/compat'
@@ -16,7 +14,7 @@ import { buildSnapshot } from './chat-export'
 import type { ExportFormat } from './chat-export'
 import { executeToolCallWithApproval } from '../tools/execute-with-approval'
 import { resolveToolApproval } from '../tools/approval-gate'
-import { buildAgentToolset } from '../agents/agent-tools'
+import { buildSaveSkillTool } from '../agents/agent-tools'
 import { SkillStore } from '../agents/skills'
 import { saveSkillFromConversation } from '../agents/skill-jobs'
 
@@ -80,97 +78,22 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   })
 
   app.post('/api/v1/conversations', async (c) => {
-    const b = await body<{ title?: string; systemPrompt?: string; modelKey?: string; toolPolicy?: string; agentId?: string }>(c)
-    // Bind to an agent (spec 13 redesign): validate it exists; ignore an unknown id.
-    const agentId = b.agentId && d.store.snapshot().agents.agents.some((a) => a.id === b.agentId) ? b.agentId : undefined
-    const conv = db.createConversation({ title: b.title, systemPrompt: b.systemPrompt, modelKey: b.modelKey, toolPolicy: b.toolPolicy, agentId })
+    const b = await body<{ title?: string; systemPrompt?: string; modelKey?: string; toolPolicy?: string; skillIds?: string[] }>(c)
+    // Only keep ids that exist in the shared skill library; silently drop unknown ones.
+    const validIds = new Set(new SkillStore(d.store.dir()).list().map((s) => s.id))
+    const skillIds = Array.isArray(b.skillIds) ? b.skillIds.filter((sid) => validIds.has(sid)) : undefined
+    const conv = db.createConversation({ title: b.title, systemPrompt: b.systemPrompt, modelKey: b.modelKey, toolPolicy: b.toolPolicy, skillIds })
     return c.json(conv, 201)
   })
 
-  // ── Agent task completion (spec 13 redesign §2/§3) ──────────────────────────
-  // Mark complete: archive the task. No AI cost.
-  app.post('/api/v1/conversations/:id/complete', (c) => {
-    const conv = db.getConversation(c.req.param('id'))
-    if (!conv) return c.json({ error: { code: 'not_found', message: 'Conversation not found.' } }, 404)
-    db.markConversationComplete(conv.id)
-    return c.json({ ok: true })
-  })
-
-  // Reflect & complete: archive, THEN run the reviewer in the background (the human click
-  // is the evidence-gate). A found lesson is stored per-agent for future injection.
-  app.post('/api/v1/conversations/:id/reflect-complete', (c) => {
-    const conv = db.getConversation(c.req.param('id'), true)
-    if (!conv) return c.json({ error: { code: 'not_found', message: 'Conversation not found.' } }, 404)
-    db.markConversationComplete(conv.id)
-    if (conv.agentId) {
-      const agentId = conv.agentId
-      const transcript = (conv.messages ?? [])
-        .filter((m) => m.content)
-        .map((m) => ({ role: m.role, content: m.content }))
-      // Detached — never blocks the response (spec: "run AI later"). Tracked so the UI
-      // can show it inline + in a side panel.
-      const taskId = d.agentTasks?.start('review', agentId, 'Reflecting on this task', conv.id)
-      void (async () => {
-        try {
-          if (taskId) d.agentTasks?.step(taskId, 'Reviewing the conversation for lessons…')
-          const { reviewConversation } = await import('../agents/reviewer')
-          const r = await reviewConversation(d, transcript)
-          if (r.lesson) {
-            db.addAgentLesson({ agentId, lesson: r.lesson, evidence: r.evidence ?? undefined, convId: conv.id })
-            if (taskId) d.agentTasks?.done(taskId, `Learned a lesson: ${r.lesson}`)
-          } else if (taskId) {
-            d.agentTasks?.done(taskId, 'Task went smoothly — nothing new to learn.')
-          }
-        } catch (e) {
-          if (taskId) d.agentTasks?.fail(taskId, e instanceof Error ? e.message : 'review failed')
-        }
-      })()
-    }
-    return c.json({ ok: true, reviewing: !!conv.agentId })
-  })
-
-  // Save this conversation as a reusable SKILL for the agent (spec 13 redesign §3.3,
-  // Voyager). Detached distill → store, deduped by name.
+  // Save this conversation as a reusable SKILL (Voyager-style distill from the
+  // transcript). Detached → shared library, deduped by name.
   app.post('/api/v1/conversations/:id/save-skill', (c) => {
     const conv = db.getConversation(c.req.param('id'))
     if (!conv) return c.json({ error: { code: 'not_found', message: 'Conversation not found.' } }, 404)
-    if (!conv.agentId) return c.json({ error: { code: 'no_agent', message: 'Only agent conversations can become skills.' } }, 400)
     // Same background skill author the in-chat save_skill tool uses (skill-creator model).
     const taskId = saveSkillFromConversation(d, conv.id)
     return c.json({ ok: true, learning: !!taskId })
-  })
-
-  // ── Per-conversation read scope (spec 13 redesign) ──────────────────────────
-  // Read access is chat-bound: the user attaches a file/folder (via the picker) and the
-  // bound agent may read within it. Home-confined, mirrors the /fs/browse boundary.
-  const homeReal = (() => { try { return realpathSync(homedir()) } catch { return homedir() } })()
-  const withinHome = (p: string): boolean => {
-    const h = homeReal.toLowerCase().replace(/[\\/]+$/, '')
-    const t = p.toLowerCase().replace(/[\\/]+$/, '')
-    return t === h || t.startsWith(h + '/') || t.startsWith(h + '\\')
-  }
-  app.post('/api/v1/conversations/:id/read-scope', async (c) => {
-    const conv = db.getConversation(c.req.param('id'))
-    if (!conv) return c.json({ error: { code: 'not_found', message: 'Conversation not found.' } }, 404)
-    const b = await body<{ path?: string }>(c)
-    const raw = b.path?.trim()
-    if (!raw) return c.json({ error: { code: 'invalid_input', message: 'path is required.' } }, 400)
-    const abs = resolve(raw)
-    if (!existsSync(abs)) return c.json({ error: { code: 'not_found', message: 'That file or folder does not exist.' } }, 400)
-    let real: string
-    try { real = realpathSync(abs) } catch { real = abs }
-    if (!withinHome(real)) return c.json({ error: { code: 'forbidden', message: 'Only paths inside your home folder can be attached.' } }, 403)
-    const next = Array.from(new Set([...(conv.readScope ?? []), real]))
-    db.setConversationReadScope(conv.id, next)
-    return c.json({ ok: true, readScope: next })
-  })
-  app.delete('/api/v1/conversations/:id/read-scope', async (c) => {
-    const conv = db.getConversation(c.req.param('id'))
-    if (!conv) return c.json({ error: { code: 'not_found', message: 'Conversation not found.' } }, 404)
-    const b = await body<{ path?: string }>(c)
-    const next = (conv.readScope ?? []).filter((p) => p !== b.path)
-    db.setConversationReadScope(conv.id, next)
-    return c.json({ ok: true, readScope: next })
   })
 
   app.get('/api/v1/conversations/:id', (c) => {
@@ -180,7 +103,11 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   })
 
   app.patch('/api/v1/conversations/:id', async (c) => {
-    const b = await body<{ title?: string; systemPrompt?: string; sampling?: Record<string, unknown> }>(c)
+    const b = await body<{ title?: string; systemPrompt?: string; sampling?: Record<string, unknown>; skillIds?: string[] }>(c)
+    if (b.skillIds !== undefined) {
+      const validIds = new Set(new SkillStore(d.store.dir()).list().map((s) => s.id))
+      b.skillIds = b.skillIds.filter((sid) => validIds.has(sid))
+    }
     const ok = db.updateConversation(c.req.param('id'), b)
     if (!ok) return err(c, 404, 'not_found', 'Conversation not found.')
     return c.json(db.getConversation(c.req.param('id'))!)
@@ -653,45 +580,22 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
   const iterMessages: { role: string; content: unknown; tool_calls?: unknown; tool_call_id?: string }[] =
     ctx.engineMessages.map((m) => ({ role: m.role, content: m.content }))
 
-  // Agent-bound conversation (spec 13 redesign §1.2): inject the agent's CURRENT system
-  // prompt + a note on its readable folders + writable root. Done here (not at conv
-  // creation) so editing the agent updates live conversations. No-op for plain chats.
-  const boundAgent = conv.agentId ? d.store.snapshot().agents.agents.find((a) => a.id === conv.agentId) : undefined
-  if (boundAgent) {
-    // Read scope is chat-bound (attached files/folders), not agent-bound.
-    const reads = conv.readScope ?? []
-    const dataDir = d.store.dir()
-    // Self-improvement (spec 13 redesign §3): inject the agent's recent lessons (Reflexion)
-    // + grown skills (Voyager) so it applies what it learned. Top 3 each, most recent.
-    const lessons = d.db.listAgentLessons?.(boundAgent.id, 3) ?? []
-    const lessonText = lessons.length
-      ? 'Lessons from past tasks (apply them):\n' + lessons.map((l) => `- ${l.lesson}`).join('\n')
-      : ''
-    // Skills are SKILL.md files in the shared library (skill-creator model). Inject the
-    // available ones (name + when-to-use + procedure) so the agent applies them.
-    const skills = new SkillStore(d.store.dir()).userSkills().slice(0, 8)
-    const skillText = skills.length
-      ? 'Skills available to you (apply the relevant ones):\n' + skills.map((s) => `- ${s.name}: ${s.description}\n  ${s.instructions.replace(/\n/g, ' ').slice(0, 300)}`).join('\n')
-      : ''
-    const agentSys = [
-      boundAgent.systemPrompt || `You are ${boundAgent.name}.`,
-      reads.length
-        ? `You can READ files within what the user attached to this chat: ${reads.join(', ')}.`
-        : `No files or folders are attached to this chat, so you cannot read from disk yet. If you need to read something, ask the user to attach a file or folder.`,
-      `You can WRITE files only in: ${dataDir}.`,
-      `Use run_code for computation only (it has no file access); to save a result, return it and call write_file.`,
-      // Using skills is proactive (above); SAVING them is not. Only act on an explicit
-      // request, and never suggest it. The save_skill tool is the only path.
-      `Apply the skills above proactively when relevant. Do NOT proactively mention, suggest, or save skills. ONLY when the user EXPLICITLY asks to create or save a skill from this conversation, call the save_skill tool (it writes a SKILL.md into the shared library). Never use any external memory, knowledge-graph, or note tool to store skills.`,
-      skillText,
-      lessonText,
-    ].filter(Boolean).join('\n\n')
-    const sysIdx = iterMessages.findIndex((m) => m.role === 'system')
-    if (sysIdx >= 0) {
-      const existing = typeof iterMessages[sysIdx].content === 'string' ? iterMessages[sysIdx].content : ''
-      iterMessages[sysIdx] = { ...iterMessages[sysIdx], content: `${agentSys}\n\n${existing}`.trim() }
-    } else {
-      iterMessages.unshift({ role: 'system', content: agentSys })
+  // Skills enabled for this conversation (the shared SKILL.md library, picked via
+  // Thread settings or the '/' picker): inject their instructions into the system
+  // prompt. No-op for a plain chat with no skills enabled — byte-identical to today.
+  const enabledSkillIds = new Set(conv.skillIds ?? [])
+  if (enabledSkillIds.size > 0) {
+    const enabledSkills = new SkillStore(d.store.dir()).list().filter((s) => enabledSkillIds.has(s.id))
+    if (enabledSkills.length) {
+      const skillSys = 'Skills enabled for this chat (apply the relevant ones):\n' +
+        enabledSkills.map((s) => `- ${s.name}: ${s.description}\n  ${s.instructions.replace(/\n/g, ' ').slice(0, 300)}`).join('\n')
+      const sysIdx = iterMessages.findIndex((m) => m.role === 'system')
+      if (sysIdx >= 0) {
+        const existing = typeof iterMessages[sysIdx].content === 'string' ? iterMessages[sysIdx].content : ''
+        iterMessages[sysIdx] = { ...iterMessages[sysIdx], content: `${skillSys}\n\n${existing}`.trim() }
+      } else {
+        iterMessages.unshift({ role: 'system', content: skillSys })
+      }
     }
   }
 
@@ -737,25 +641,19 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
   try {
     // Get tool definitions once (or empty for engines that don't support tools)
     const baseToolDefs = d.tools ? await d.tools.buildToolDefinitions() : []
-    // Agent-bound conversation (spec 13 redesign): merge in the agent's guarded FS/code
-    // tools. When conv.agentId is null this is a no-op → plain chat is byte-identical.
-    const agentBound = conv.agentId ? d.store.snapshot().agents.agents.find((a) => a.id === conv.agentId) : undefined
-    // Read access is chat-bound: the guard reads the conversation's attached scope, not the
-    // agent's (agents carry no read roots now). Writes still go to ~/.turbollm.
-    const agent = agentBound ? { ...agentBound, readRoots: conv.readScope ?? [] } : undefined
-    const agentTools = agent
-      ? buildAgentToolset(agent, d.store.dir(), {
-          // In-chat skill author (skill-creator model): the agent calls save_skill, we
-          // read THIS conversation in the background and write a SKILL.md to the library.
-          onSaveSkill: () => {
-            const tid = saveSkillFromConversation(d, conv.id)
-            return tid
-              ? 'Started writing a skill from this conversation in the background. It will appear in the skill library shortly.'
-              : 'There is nothing to turn into a skill yet.'
-          },
+    // 'skill-creator' grants save_skill — the one tool a skill can add beyond the base
+    // registry (every other skill is instructions text only). No-op unless enabled.
+    const skillTools = enabledSkillIds.has('skill-creator')
+      ? buildSaveSkillTool(() => {
+          // In-chat skill author: read THIS conversation in the background and write a
+          // SKILL.md to the shared library.
+          const tid = saveSkillFromConversation(d, conv.id)
+          return tid
+            ? 'Started writing a skill from this conversation in the background. It will appear in the skill library shortly.'
+            : 'There is nothing to turn into a skill yet.'
         })
       : undefined
-    const toolDefs = agentTools ? [...baseToolDefs, ...agentTools.defs] : baseToolDefs
+    const toolDefs = skillTools ? [...baseToolDefs, ...skillTools.defs] : baseToolDefs
 
     outerLoop: while (toolIter <= MAX_TOOL_ITER) {
       toolIter++
@@ -954,24 +852,23 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
           try { parsedArgs = JSON.parse(tc.argsBuffer || '{}') as Record<string, unknown> }
           catch { parsedArgs = {} }
 
-          // Is this an agent-owned tool (FS/code, guarded via makeToolCallGuard)? It's
-          // pre-authorized by the agent's own read/write-root scope, so it bypasses the
-          // approval gate entirely and never prompts — route it straight to the agent
-          // executor. Everything else (normal chat tools) still goes through the real
-          // approval gate below.
-          const isAgentTool = agentTools?.names.has(tc.name) ?? false
+          // save_skill (from the 'skill-creator' skill) is pre-authorized by the user
+          // having enabled that skill for this chat, so it bypasses the approval gate
+          // and routes straight to its own executor. Everything else (normal chat
+          // tools) still goes through the real approval gate below.
+          const isSkillTool = skillTools?.names.has(tc.name) ?? false
 
           let result: string
           let callError: string | undefined
 
-          if (isAgentTool && agentTools) {
+          if (isSkillTool && skillTools) {
             // Emit pending event so the frontend can show "calling..."
             await stream.writeSSE({
               event: 'tool_call',
               data: JSON.stringify({ id: tc.id, name: tc.name, args: parsedArgs, status: 'pending' }),
             })
             try {
-              result = agentTools.execute({ id: tc.id, name: tc.name, args: parsedArgs })
+              result = skillTools.execute({ id: tc.id, name: tc.name, args: parsedArgs })
             } catch (e) {
               callError = (e as Error).message
               result = `Error: ${callError}`

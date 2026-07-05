@@ -56,6 +56,14 @@ const BUILTIN_SKILLS: Skill[] = [
     tools: ['call_agent'],
     builtin: true,
   },
+  {
+    id: 'skill-creator',
+    name: 'Skill Creator',
+    description: 'Save a reusable skill distilled from this conversation.',
+    instructions: 'Do NOT proactively mention, suggest, or save skills. ONLY when the user EXPLICITLY asks to create or save a skill from this conversation (e.g. "make a skill out of this", "save this as a skill"), call the save_skill tool — it writes a SKILL.md into the shared library in the background. Never use any external memory, knowledge-graph, or note tool to store skills.',
+    tools: ['save_skill'],
+    builtin: true,
+  },
 ]
 
 /** Serialize a skill to Claude SKILL.md format: frontmatter + instructions body. */

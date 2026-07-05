@@ -74,8 +74,7 @@ export function ConversationSidebar({
   const searchRef = useRef<HTMLInputElement>(null)
   const mut = useConversationMutations()
   const convsQ = useConversations(debouncedQ || undefined)
-  // Agent conversations live in Workspace → Agent; the Chat tab shows plain chats only.
-  const convs = (convsQ.data?.conversations ?? []).filter((c) => !c.agentId)
+  const convs = convsQ.data?.conversations ?? []
   const foldersQ = useFolders()
   const folders = foldersQ.data?.folders ?? []
 

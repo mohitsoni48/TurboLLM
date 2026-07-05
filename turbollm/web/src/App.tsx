@@ -15,7 +15,8 @@ import { ApiError, setAuthToken } from './lib/api'
 // Route-level code splitting: each screen loads only when first navigated to.
 const WorkspaceScreen = lazy(() => import('./screens/WorkspaceScreen').then((m) => ({ default: m.WorkspaceScreen })))
 const ChatScreen = lazy(() => import('./screens/ChatScreen').then((m) => ({ default: m.ChatScreen })))
-const AgentsScreen = lazy(() => import('./screens/AgentsScreen').then((m) => ({ default: m.AgentsScreen })))
+const SkillsLibrary = lazy(() => import('./screens/skills/SkillsLibrary').then((m) => ({ default: m.SkillsLibrary })))
+const SkillEditPage = lazy(() => import('./screens/skills/SkillEditPage').then((m) => ({ default: m.SkillEditPage })))
 const ModelsScreen = lazy(() => import('./screens/ModelsScreen').then((m) => ({ default: m.ModelsScreen })))
 const EnginesScreen = lazy(() => import('./screens/EnginesScreen').then((m) => ({ default: m.EnginesScreen })))
 const DeveloperScreen = lazy(() => import('./screens/DeveloperScreen').then((m) => ({ default: m.DeveloperScreen })))
@@ -76,21 +77,19 @@ export function App() {
       <Shell status={statusQ.data} online={online} version={version}>
         <Suspense fallback={<ScreenFallback />}>
           <Routes>
-            {/* Workspace: Chat | Agent tabs */}
             <Route path="/workspace" element={<Navigate to="/workspace/chat" replace />} />
             <Route path="/workspace/chat" element={<WorkspaceScreen />} />
             <Route path="/workspace/chat/:convId" element={<WorkspaceScreen />} />
-            <Route path="/workspace/agent" element={<WorkspaceScreen />} />
-            <Route path="/workspace/agent/:convId" element={<WorkspaceScreen />} />
+            {/* Back-compat: the old Workspace → Agent tab is gone; land on Chat instead. */}
+            <Route path="/workspace/agent" element={<Navigate to="/workspace/chat" replace />} />
+            <Route path="/workspace/agent/:convId" element={<Navigate to="/workspace/chat" replace />} />
             {/* Back-compat: /chat → Workspace; /chat/:convId stays a standalone view
                 so existing LAN share links (baked as /chat/<id>) keep working. */}
             <Route path="/chat" element={<Navigate to="/workspace/chat" replace />} />
             <Route path="/chat/:convId" element={<ChatScreen />} />
-            {/* Agents: Agents | Skills tabs. Static /skills routes outrank /agents/:id. */}
-            <Route path="/agents" element={<AgentsScreen />} />
-            <Route path="/agents/skills" element={<AgentsScreen />} />
-            <Route path="/agents/skills/:skillId" element={<AgentsScreen />} />
-            <Route path="/agents/:id" element={<AgentsScreen />} />
+            {/* Skills: the shared library any chat can enable. Static /new outranks /:skillId. */}
+            <Route path="/skills" element={<SkillsLibrary />} />
+            <Route path="/skills/:skillId" element={<SkillEditPage />} />
             <Route path="/models" element={<ModelsScreen />} />
             <Route path="/engines" element={<EnginesScreen />} />
             <Route path="/developer" element={<DeveloperScreen />} />

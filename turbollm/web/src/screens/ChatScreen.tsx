@@ -10,7 +10,9 @@ import { appendTextDelta, upsertToolCall, type LiveBlock } from '../lib/live-tim
 import { ApiError, downloadChatExport, getDebugSnapshot, getShareUrl, importChat } from '../lib/api'
 import { Button } from '../components/ui/button'
 import { toast } from '../components/ui/sonner'
-import { useQueryClient } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { skillKeys, fetchSkills } from '../lib/agent-api'
+import { cn } from '../lib/utils'
 import { MessageBubble, StreamingBubble } from './chat/MessageBubble'
 import { ToolApprovalBar } from './chat/ToolApprovalBar'
 import { ContextMeter } from './chat/ContextMeter'
@@ -118,6 +120,39 @@ export function ChatScreen() {
   const convQ = useConversation(activeId)
   const conv = convQ.data
   const messages = conv?.messages ?? []
+
+  // Skills enabled before a conversation exists yet (first message hasn't been sent).
+  // Once activeId exists, conv.skillIds is the source of truth instead.
+  const [pendingSkillIds, setPendingSkillIds] = useState<string[]>([])
+  const enabledSkillIds = conv?.skillIds ?? pendingSkillIds
+
+  // '/' picker: typing '/' (optionally followed by letters, at the START of an
+  // otherwise-empty composer) shows a filtered skill list. Selecting one enables
+  // that skill for the conversation and clears the token.
+  const skillsQ = useQuery({ queryKey: skillKeys.list(), queryFn: fetchSkills, staleTime: 30_000 })
+  const CHAT_UNSUPPORTED_SKILLS = new Set(['filesystem'])
+  const pickableSkills = (skillsQ.data ?? []).filter((s) => !CHAT_UNSUPPORTED_SKILLS.has(s.id))
+  const skillPickerMatch = /^\/([a-z0-9-]*)$/i.exec(input)
+  const skillPickerQuery = skillPickerMatch?.[1]?.toLowerCase() ?? ''
+  const filteredSkills = skillPickerMatch
+    ? pickableSkills.filter((s) => !skillPickerQuery || s.id.includes(skillPickerQuery) || s.name.toLowerCase().includes(skillPickerQuery))
+    : []
+  const skillPickerOpen = !!skillPickerMatch && filteredSkills.length > 0 && !live
+  const [skillPickerIndex, setSkillPickerIndex] = useState(0)
+  useEffect(() => { setSkillPickerIndex(0) }, [skillPickerQuery, skillPickerOpen])
+
+  const selectSkill = (skill: { id: string; name: string }) => {
+    setInput('')
+    setTimeout(autoResize, 0)
+    if (activeId) {
+      const next = Array.from(new Set([...enabledSkillIds, skill.id]))
+      mut.update.mutate({ id: activeId, skillIds: next })
+    } else {
+      setPendingSkillIds((prev) => Array.from(new Set([...prev, skill.id])))
+    }
+    toast.success(`Skill enabled: ${skill.name}`)
+    setTimeout(() => inputRef.current?.focus(), 0)
+  }
 
   // Open a conversation another screen handed off (e.g. Launch Expert in Settings).
   const pendingConversationId = useUiStore((s) => s.pendingConversationId)
@@ -441,10 +476,12 @@ export function ChatScreen() {
           modelKey: model.key,
           systemPrompt: sp || undefined,
           toolPolicy: selectedPersonaId === 'research' ? 'force_web_search' : undefined,
+          skillIds: pendingSkillIds.length ? pendingSkillIds : undefined,
         })
         convId = newConv.id
         setConvPersonaId(convId, selectedPersonaId)
         setActiveId(convId)
+        setPendingSkillIds([])
       }
 
       const ac = new AbortController()
@@ -762,7 +799,26 @@ export function ChatScreen() {
 
         {/* Composer area (always visible; disabled when no model; hidden in readonly) */}
         {readonly ? null : <div className="px-8 pb-5">
-          <div className="w-full">
+          <div className="relative w-full">
+            {/* '/' skill picker */}
+            {skillPickerOpen && (
+              <div className="absolute bottom-full left-0 mb-2 w-full max-w-sm overflow-hidden rounded-lg border border-border bg-panel shadow-[var(--shadow-2)]">
+                {filteredSkills.map((s, i) => (
+                  <button
+                    key={s.id}
+                    type="button"
+                    onClick={() => selectSkill(s)}
+                    className={cn(
+                      'flex w-full flex-col items-start gap-0.5 px-3 py-2 text-left text-[13px]',
+                      i === skillPickerIndex ? 'bg-panel-2' : 'hover:bg-panel-2',
+                    )}
+                  >
+                    <span className="text-ink">/{s.id}{enabledSkillIds.includes(s.id) ? ' · already on' : ''}</span>
+                    {s.description && <span className="text-[12px] text-muted">{s.description}</span>}
+                  </button>
+                ))}
+              </div>
+            )}
             <div className="rounded-[var(--radius-lg)] border border-border bg-panel shadow-[var(--shadow-2)] focus-within:border-[color:var(--accent)]">
               {/* Attachment previews */}
               {attachments.length > 0 && (
@@ -808,6 +864,12 @@ export function ChatScreen() {
                   disabled={!ready || !!live || !!editingId}
                   onChange={(e) => { setInput(e.target.value); autoResize() }}
                   onKeyDown={(e) => {
+                    if (skillPickerOpen) {
+                      if (e.key === 'ArrowDown') { e.preventDefault(); setSkillPickerIndex((i) => Math.min(i + 1, filteredSkills.length - 1)); return }
+                      if (e.key === 'ArrowUp') { e.preventDefault(); setSkillPickerIndex((i) => Math.max(i - 1, 0)); return }
+                      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); selectSkill(filteredSkills[Math.min(skillPickerIndex, filteredSkills.length - 1)]); return }
+                      if (e.key === 'Escape') { e.preventDefault(); setInput(''); return }
+                    }
                     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void send() }
                     if (e.key === 'ArrowUp' && !input && !live) {
                       const lastUser = messages.findLast((m) => m.role === 'user')

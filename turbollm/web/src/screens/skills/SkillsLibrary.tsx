@@ -1,17 +1,12 @@
-import { useState } from 'react'
+import { useRef, useState, type ChangeEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { useQuery } from '@tanstack/react-query'
-import { FolderInput, Plus, Sparkles, Wrench } from 'lucide-react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { FolderInput, Plus, Sparkles, Upload, Wrench } from 'lucide-react'
 import { Button } from '../../components/ui/button'
 import { toast } from '../../components/ui/sonner'
 import { ApiError } from '../../lib/api'
-import { fetchSkills, learnFromFolder } from '../../lib/agent-api'
+import { fetchSkills, importSkillText, learnFromFolder, skillKeys } from '../../lib/agent-api'
 import type { Skill } from '../../lib/agent-types'
-
-// The shared skill library — independent of any agent. Agents reference these by
-// id in their Skills picker. Learning grows the same library (the trigger agent is
-// just plumbing; the resulting SKILL.md is global).
-const LEARN_TRIGGER_AGENT = 'default'
 
 function SkillCard({ skill, onOpen }: { skill: Skill; onOpen: () => void }) {
   return (
@@ -39,7 +34,8 @@ function SkillCard({ skill, onOpen }: { skill: Skill; onOpen: () => void }) {
 
 export function SkillsLibrary() {
   const navigate = useNavigate()
-  const skillsQ = useQuery({ queryKey: ['skills'], queryFn: fetchSkills, staleTime: 0 })
+  const qc = useQueryClient()
+  const skillsQ = useQuery({ queryKey: skillKeys.list(), queryFn: fetchSkills, staleTime: 0 })
   const skills = skillsQ.data ?? []
 
   const [folder, setFolder] = useState('')
@@ -49,7 +45,7 @@ export function SkillsLibrary() {
     if (!f) return
     setLearning(true)
     try {
-      await learnFromFolder(LEARN_TRIGGER_AGENT, f)
+      await learnFromFolder(f)
       toast.success(`Learning a skill from ${f}… (runs in the background)`)
       setFolder('')
     } catch (e) {
@@ -59,17 +55,38 @@ export function SkillsLibrary() {
     }
   }
 
+  const uploadRef = useRef<HTMLInputElement>(null)
+  const handleUpload = async (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    e.target.value = '' // allow re-selecting the same file
+    if (!file) return
+    try {
+      const text = await file.text()
+      const skill = await importSkillText(text)
+      void qc.invalidateQueries({ queryKey: skillKeys.list() })
+      toast.success(`Imported skill: ${skill.name}`)
+    } catch (err) {
+      toast.error(err instanceof ApiError ? err.message : 'Could not import that file.')
+    }
+  }
+
   return (
     <div className="flex w-full flex-col gap-5 px-8 py-6">
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex flex-col gap-0.5">
           <h1 className="text-[18px] font-semibold text-ink">Skills</h1>
-          <p className="text-[12px] text-muted">The shared library. Agents pick these in their editor; skills live independently here.</p>
+          <p className="text-[12px] text-muted">The shared library — enable any of these in a chat, or via '/' in the composer.</p>
         </div>
-        <Button size="sm" onClick={() => navigate('/agents/skills/new')}>
-          <Plus size={14} /> New skill
-        </Button>
+        <div className="flex items-center gap-2">
+          <input ref={uploadRef} type="file" accept=".md,text/markdown" hidden onChange={(e) => void handleUpload(e)} />
+          <Button size="sm" variant="outline" onClick={() => uploadRef.current?.click()}>
+            <Upload size={14} /> Upload SKILL.md
+          </Button>
+          <Button size="sm" onClick={() => navigate('/skills/new')}>
+            <Plus size={14} /> New skill
+          </Button>
+        </div>
       </div>
 
       {/* Learn from folder */}
@@ -98,14 +115,14 @@ export function SkillsLibrary() {
         <div className="flex flex-col items-center gap-3 py-16">
           <Sparkles size={32} className="text-faint" />
           <p className="text-[14px] text-muted">No skills yet.</p>
-          <Button size="sm" variant="outline" onClick={() => navigate('/agents/skills/new')}>
+          <Button size="sm" variant="outline" onClick={() => navigate('/skills/new')}>
             <Plus size={14} /> Create your first skill
           </Button>
         </div>
       ) : (
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5">
           {skills.map((sk) => (
-            <SkillCard key={sk.id} skill={sk} onOpen={() => navigate(`/agents/skills/${sk.id}`)} />
+            <SkillCard key={sk.id} skill={sk} onOpen={() => navigate(`/skills/${sk.id}`)} />
           ))}
         </div>
       )}

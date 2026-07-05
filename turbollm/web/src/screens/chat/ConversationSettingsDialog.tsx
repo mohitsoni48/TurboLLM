@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { Settings2 } from 'lucide-react'
 import { Button } from '../../components/ui/button'
 import {
@@ -11,6 +12,12 @@ import { useConversationMutations } from '../../lib/chat-queries'
 import type { Conversation } from '../../lib/chat-types'
 import { ApiError } from '../../lib/api'
 import { toast } from '../../components/ui/sonner'
+import { skillKeys, fetchSkills } from '../../lib/agent-api'
+
+// Skills a plain chat can't use yet — they grant filesystem tools that aren't wired
+// into chat (reserved for the future Code surface). Hidden from the picker so toggling
+// them on never promises a capability that silently doesn't work.
+const CHAT_UNSUPPORTED_SKILLS = new Set(['filesystem'])
 
 // Sampling fields per spec 07 §5 (identical to spec 05 §2 sliders)
 const SAMPLING_FIELDS = [
@@ -30,13 +37,21 @@ export function ConversationSettingsDialog({ conv }: { conv: Conversation | unde
   const [open, setOpen] = useState(false)
   const [systemPrompt, setSystemPrompt] = useState('')
   const [sampling, setSampling] = useState<Record<string, number>>({})
+  const [skillIds, setSkillIds] = useState<string[]>([])
+
+  const skillsQ = useQuery({ queryKey: skillKeys.list(), queryFn: fetchSkills, enabled: open, staleTime: 0 })
+  const pickableSkills = (skillsQ.data ?? []).filter((s) => !CHAT_UNSUPPORTED_SKILLS.has(s.id))
 
   useEffect(() => {
     if (open && conv) {
       setSystemPrompt(conv.systemPrompt ?? '')
       setSampling(conv.sampling ?? {})
+      setSkillIds(conv.skillIds ?? [])
     }
   }, [open, conv])
+
+  const toggleSkill = (id: string) =>
+    setSkillIds((prev) => (prev.includes(id) ? prev.filter((s) => s !== id) : [...prev, id]))
 
   const hasOverrides = Object.keys(sampling).length > 0
   const isExpert = conv?.expertMode ?? false
@@ -49,7 +64,7 @@ export function ConversationSettingsDialog({ conv }: { conv: Conversation | unde
   const save = () => {
     if (!conv) return
     // Expert threads keep their server-managed system prompt — only sampling is editable.
-    const patch = isExpert ? { id: conv.id, sampling } : { id: conv.id, systemPrompt, sampling }
+    const patch = isExpert ? { id: conv.id, sampling, skillIds } : { id: conv.id, systemPrompt, sampling, skillIds }
     mut.update.mutate(
       patch,
       {
@@ -150,6 +165,36 @@ export function ConversationSettingsDialog({ conv }: { conv: Conversation | unde
               <p className="mt-2.5 text-[12px] text-faint">
                 Using model defaults · move any slider to override for this thread
               </p>
+            )}
+          </div>
+
+          {/* Skills — the shared SKILL.md library, enabled per thread. Also toggleable
+              inline via the '/' picker in the composer. */}
+          <div>
+            <span className="mb-2.5 block text-[11px] font-medium uppercase tracking-wide text-faint">
+              Skills
+            </span>
+            {skillsQ.isLoading ? (
+              <p className="text-[12px] text-faint">Loading…</p>
+            ) : pickableSkills.length === 0 ? (
+              <p className="text-[12px] text-faint">No skills yet — create one under Skills.</p>
+            ) : (
+              <div className="flex flex-col gap-2">
+                {pickableSkills.map((s) => (
+                  <label key={s.id} className="flex cursor-pointer items-start gap-2 text-[13px]">
+                    <input
+                      type="checkbox"
+                      className="mt-0.5"
+                      checked={skillIds.includes(s.id)}
+                      onChange={() => toggleSkill(s.id)}
+                    />
+                    <span className="flex flex-col">
+                      <span className="text-ink">{s.name}</span>
+                      {s.description && <span className="text-[12px] text-muted">{s.description}</span>}
+                    </span>
+                  </label>
+                ))}
+              </div>
             )}
           </div>
         </div>

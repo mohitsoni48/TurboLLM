@@ -89,14 +89,10 @@ export interface Conversation {
   toolPolicy?: string
   /** Folder this conversation is filed under (v10). null/undefined = uncategorized. */
   folderId?: string | null
-  /** When set, this chat is bound to an Agent (its persona/tools/folders). */
-  agentId?: string
-  /** Set when the user marks the agent task complete. Null = in progress. */
-  completedAt?: string
-  /** Files/folders attached to this chat that the bound agent may read (chat-bound scope). */
-  readScope?: string[]
-  /** pi permission mode for this agent conversation: 'ask'|'auto'|'bypass'|'read'. */
-  agentMode?: string
+  /** Skill ids enabled for this conversation (the shared SKILL.md library). Their
+   *  instructions are injected into the system prompt; 'skill-creator' additionally
+   *  grants the save_skill tool. Undefined/empty = a plain chat with no skills. */
+  skillIds?: string[]
   createdAt: string
   updatedAt: string
   messages?: Message[]
