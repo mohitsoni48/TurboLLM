@@ -1,5 +1,6 @@
 import { useState, useMemo } from 'react'
-import { ArrowLeft, Check, ChevronRight, Loader2, Pencil, Trash2, X } from 'lucide-react'
+import { useSearchParams } from 'react-router-dom'
+import { ArrowLeft, Check, ChevronRight, Loader2, Pencil, Puzzle, Sparkles, Trash2, X } from 'lucide-react'
 import { ScreenHeader } from '../components/common'
 import { Button } from '../components/ui/button'
 import { toast } from '../components/ui/sonner'
@@ -9,11 +10,21 @@ import type { McpServer, DaemonSettings, DaemonSettingsPatch } from '../lib/api'
 import { CLOUD_MCPS, LOCAL_MCPS, CLOUD_CATS, LOCAL_CATS, BUILTIN_SEARCH } from '../lib/mcp-catalog'
 import type { CloudEntry, LocalEntry, BuiltinSearchEntry } from '../lib/mcp-catalog'
 import { BRAND_ICONS } from '../lib/brand-icons'
+import { cn } from '../lib/utils'
 import { SkillsLibrary } from './skills/SkillsLibrary'
+
+const CUSTOMIZE_TABS = [
+  { id: 'skills', label: 'Skills', icon: Sparkles },
+  { id: 'mcp',    label: 'MCP Servers', icon: Puzzle },
+] as const
+type CustomizeTab = (typeof CUSTOMIZE_TABS)[number]['id']
 
 export function CustomizeScreen() {
   const { query: settingsQ } = useSettings()
   const settings = settingsQ.data
+  const [searchParams, setSearchParams] = useSearchParams()
+  const activeTab: CustomizeTab = searchParams.get('tab') === 'mcp' ? 'mcp' : 'skills'
+  const setTab = (tab: CustomizeTab) => setSearchParams(tab === 'skills' ? {} : { tab }, { replace: true })
 
   return (
     <div className="flex w-full flex-col gap-4 px-6 py-6">
@@ -21,11 +32,32 @@ export function CustomizeScreen() {
         title="Customize"
         description="Add tools, skills, and external providers the model can call during conversations."
       />
-      <SkillsLibrary />
-      <McpSection
-        servers={settings?.mcp?.servers ?? []}
-        search={settings?.search ?? { provider: 'tavily', tavilyKeySet: false, kagiKeySet: false, searxngUrl: '' }}
-      />
+
+      <div className="inline-flex w-fit rounded-md border border-border p-0.5">
+        {CUSTOMIZE_TABS.map(({ id, label, icon: Icon }) => (
+          <button
+            key={id}
+            type="button"
+            onClick={() => setTab(id)}
+            className={cn(
+              'flex items-center gap-1.5 rounded px-3 py-1.5 text-[13px] font-medium transition-colors',
+              activeTab === id ? 'bg-accent/12 text-accent' : 'text-muted hover:text-ink',
+            )}
+          >
+            <Icon size={14} />
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {activeTab === 'skills' ? (
+        <SkillsLibrary />
+      ) : (
+        <McpSection
+          servers={settings?.mcp?.servers ?? []}
+          search={settings?.search ?? { provider: 'tavily', tavilyKeySet: false, kagiKeySet: false, searxngUrl: '' }}
+        />
+      )}
     </div>
   )
 }

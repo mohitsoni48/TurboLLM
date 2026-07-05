@@ -52,7 +52,6 @@ interface LiveState {
   progress: { phase: string; pct: number; tps: number } | null
   liveGenTps: number  // rolling 2s window estimate during generation phase
   genTokens: number   // running count of generated tokens (content + reasoning) for this reply
-  toolCalls: LiveToolCall[]
   timeline: LiveBlock[]
 }
 
@@ -397,7 +396,7 @@ export function ChatScreen() {
       for await (const evt of gen) {
         if (evt.event === 'meta') {
           deltaTimestamps.current = []
-          setLive({ assistantId: evt.data.assistantMessageId, content: '', reasoning: '', progress: null, liveGenTps: 0, genTokens: 0, toolCalls: [], timeline: [] })
+          setLive({ assistantId: evt.data.assistantMessageId, content: '', reasoning: '', progress: null, liveGenTps: 0, genTokens: 0, timeline: [] })
           // Optimistically reflect the new/last user msg in the UI by invalidating
           void qc.invalidateQueries({ queryKey: ['conversation', convId] })
         } else if (evt.event === 'progress') {
@@ -540,7 +539,9 @@ export function ChatScreen() {
   const ready = engineState === 'running' && !!model
 
   // At most one tool call awaits interactive approval at a time (the tool loop is sequential).
-  const pendingApproval = live?.toolCalls.find((tc) => tc.status === 'awaiting_approval')
+  // Read from the timeline — the actual live-updated source — not a separate tracked array.
+  const pendingApprovalBlock = live?.timeline.find((b) => b.kind === 'tool' && b.call.status === 'awaiting_approval')
+  const pendingApproval = pendingApprovalBlock?.kind === 'tool' ? pendingApprovalBlock.call : undefined
 
   return (
     <div className="flex h-full overflow-hidden">

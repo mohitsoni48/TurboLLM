@@ -48,7 +48,7 @@ export function SkillEditPage() {
     setHydrated(true)
   }
 
-  const goBack = () => navigate('/skills')
+  const goBack = () => navigate('/customize?tab=skills')
 
   const setName = (name: string) =>
     setForm((f) => ({ ...f, name, id: isNew && !idEdited ? slugify(name) : f.id }))
