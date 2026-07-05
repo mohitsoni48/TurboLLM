@@ -587,8 +587,13 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
   if (enabledSkillIds.size > 0) {
     const enabledSkills = new SkillStore(d.store.dir()).list().filter((s) => enabledSkillIds.has(s.id))
     if (enabledSkills.length) {
-      const skillSys = 'Skills enabled for this chat (apply the relevant ones):\n' +
-        enabledSkills.map((s) => `- ${s.name}: ${s.description}\n  ${s.instructions.replace(/\n/g, ' ').slice(0, 300)}`).join('\n')
+      // Full instructions, formatting intact — a real skill's procedure can run to
+      // several KB and a 300-char preview was silently dropping nearly all of it.
+      // MAX_SKILL_INSTRUCTIONS_CHARS is a safety cap against a pathological file,
+      // not an everyday limit (real skills should always fit under it whole).
+      const MAX_SKILL_INSTRUCTIONS_CHARS = 20_000
+      const skillSys = 'Skills enabled for this chat (apply the relevant ones):\n\n' +
+        enabledSkills.map((s) => `## ${s.name}\n${s.description}\n\n${s.instructions.trim().slice(0, MAX_SKILL_INSTRUCTIONS_CHARS)}`).join('\n\n---\n\n')
       const sysIdx = iterMessages.findIndex((m) => m.role === 'system')
       if (sysIdx >= 0) {
         const existing = typeof iterMessages[sysIdx].content === 'string' ? iterMessages[sysIdx].content : ''
