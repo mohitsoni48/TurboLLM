@@ -186,13 +186,15 @@ async function readConfigObject(
 
 /** True when an existing provider entry (opencode/kilo's `options.baseURL`, or
  *  openclaw's `baseUrl`) already points at our own gateway — used to treat a commented
- *  config that's already correctly wired as success, without ever rewriting it. */
+ *  config that's already correctly wired as success, without ever rewriting it. Requires
+ *  an exact match or a `/`-bounded prefix (not a bare `startsWith`) so e.g. `base` ending
+ *  in `:6996` can never be fooled by a stored URL that merely starts with the same digits. */
 function providerAlreadyPointsHere(entry: unknown, base: string): boolean {
   if (!entry || typeof entry !== 'object') return false
   const e = entry as Record<string, unknown>
   const options = e.options as Record<string, unknown> | undefined
   const baseUrl = (options?.baseURL ?? e.baseUrl) as string | undefined
-  return typeof baseUrl === 'string' && baseUrl.startsWith(base)
+  return typeof baseUrl === 'string' && (baseUrl === base || baseUrl.startsWith(`${base}/`))
 }
 
 /** A commented config that ISN'T already pointed at us — we can detect this but can't
