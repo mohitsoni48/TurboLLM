@@ -141,7 +141,7 @@ export function ChatScreen() {
   useEffect(() => { setSkillPickerIndex(0) }, [skillPickerQuery, skillPickerOpen])
 
   const selectSkill = (skill: { id: string; name: string }) => {
-    setInput('')
+    setInput(`/${skill.id} `)
     setTimeout(autoResize, 0)
     if (activeId) {
       const next = Array.from(new Set([...enabledSkillIds, skill.id]))
