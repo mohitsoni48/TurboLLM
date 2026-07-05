@@ -261,6 +261,12 @@ library, and loads it on the fly** if it isn't already running — then keeps up
 hot** in an LRU pool so the next switch is instant. An agent (or Claude Code) that hops between a
 coding model, a vision model, and an embedder just names each one and it works — no pre-wiring.
 
+**One command wires up more than just Claude Code.** `turbollm launch <cli>` also supports
+`opencode`, `kilo`, `openclaw`, and `hermes` — each gets pointed at TurboLLM the way that tool
+expects (config file merge, or its own CLI command) instead of a manual copy-paste setup. Inside
+Claude Code, `/model` lists your local models directly (with **Auto Model Swap** on in Settings →
+Gateway) so you can switch mid-session instead of only at launch.
+
 </details>
 
 <details>

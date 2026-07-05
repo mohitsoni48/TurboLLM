@@ -261,6 +261,12 @@ library, and loads it on the fly** if it isn't already running — then keeps up
 hot** in an LRU pool so the next switch is instant. An agent (or Claude Code) that hops between a
 coding model, a vision model, and an embedder just names each one and it works — no pre-wiring.
 
+**One command wires up more than just Claude Code.** `turbollm launch <cli>` also supports
+`opencode`, `kilo`, `openclaw`, and `hermes` — each gets pointed at TurboLLM the way that tool
+expects (config file merge, or its own CLI command) instead of a manual copy-paste setup. Inside
+Claude Code, `/model` lists your local models directly (with **Auto Model Swap** on in Settings →
+Gateway) so you can switch mid-session instead of only at launch.
+
 </details>
 
 <details>
@@ -370,12 +376,20 @@ turbollm launch claude               # auto-loads a model if none is running, th
 turbollm launch claude --model qwen3-8b   # load a specific model first, then launch
 ```
 
-It sets Claude Code's `ANTHROPIC_BASE_URL` / `ANTHROPIC_MODEL` at TurboLLM and execs `claude`;
-extra args are forwarded. If no model is loaded it auto-loads your last-used one (or the first
-in your library); `--model` picks a specific one by key or name. If `claude` isn't installed,
-it tells you how. The in-app
-**Developer** screen also shows copy-paste env snippets for any OpenAI- or Anthropic-compatible
-tool (Open WebUI, Kilo Code, opencode, …).
+It sets Claude Code's `ANTHROPIC_BASE_URL` and pins `ANTHROPIC_MODEL` to whatever model is
+loaded (so the status line, `/status`, and context-window sizing all reflect the real model),
+then execs `claude`; extra args are forwarded. If no model is loaded it auto-loads your
+last-used one (or the first in your library); `--model` picks a specific one by key or name.
+If `claude` isn't installed, it tells you how.
+
+Other coding CLIs work too — `turbollm launch opencode`, `turbollm launch kilo`, and
+`turbollm launch openclaw` write a `turbollm` provider into that tool's own config file
+(preserving anything you already configured) and then launch it. If an existing config can't
+be parsed, TurboLLM refuses to overwrite it and prints how to add the provider by hand.
+`turbollm launch hermes` does the equivalent for [Hermes Agent](https://github.com/NousResearch/hermes-agent)
+via its own `hermes config set` command (its config is YAML, so we drive its CLI instead of
+hand-editing that file). The in-app **Developer** screen also shows copy-paste snippets for
+any OpenAI- or Anthropic-compatible tool (Open WebUI, Kilo Code, opencode, …).
 
 ---
 
@@ -402,6 +416,7 @@ turbollm --addr 0.0.0.0:6996    # bind all interfaces (LAN sharing)
 turbollm --stop                 # stop a running daemon (any terminal)
 turbollm launch claude          # start Claude Code (auto-loads a model if none is running)
 turbollm launch claude --model qwen3-8b   # load a specific model, then launch
+turbollm launch opencode        # wire opencode (or kilo / openclaw) to TurboLLM, then launch
 ```
 
 | Flag | Description |
@@ -415,7 +430,9 @@ turbollm launch claude --model qwen3-8b   # load a specific model, then launch
 
 `turbollm launch claude` also accepts `--model <key|name>` to load a specific model before
 launching; without it, an already-loaded model is used, or the last-used / first model is
-auto-loaded.
+auto-loaded. The same command works with `opencode`, `kilo`, and `openclaw` — each gets a
+`turbollm` provider merged into its own config file before it starts — and with `hermes`,
+which gets configured via its own `hermes config set` command instead.
 
 ---
 
