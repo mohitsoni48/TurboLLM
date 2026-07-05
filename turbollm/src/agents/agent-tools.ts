@@ -121,7 +121,7 @@ export function buildAgentToolset(agent: AgentType, dataDir: string, opts: Agent
   const execute = (call: ToolCall): string => {
     if (!names.has(call.name)) return `Error: tool "${call.name}" is not available to this agent.`
     // run_code is compute-only (no path) — no guard needed; the sandbox has no FS.
-    if (call.name === 'run_code') return execRunCode(call.args, false)
+    if (call.name === 'run_code') return execRunCode(call.args)
     // save_skill triggers the background skill author; no FS guard (writes to the library).
     if (call.name === 'save_skill') {
       if (!opts.onSaveSkill) return 'Error: saving skills is not available in this conversation.'
