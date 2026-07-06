@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { ArrowUp, Check, File as FileIcon, Folder, RotateCw } from 'lucide-react'
+import { ArrowRight, ArrowUp, Check, File as FileIcon, Folder, RotateCw } from 'lucide-react'
 import { ApiError } from '../../lib/api'
 import { useFsBrowse } from '../../lib/queries'
 import { truncateMiddle } from '../../lib/utils'
@@ -45,6 +45,18 @@ export function FsBrowser({
     if (open) setPath(null)
   }, [open])
 
+  // Editable address bar: type or paste an absolute path and press Enter (or Go) to jump
+  // there — alongside click-to-browse. Kept in sync with the resolved current location;
+  // an errored/invalid path leaves what you typed in place so you can fix it.
+  const [pathInput, setPathInput] = useState('')
+  useEffect(() => {
+    if (data?.path && data.path !== '::drives') setPathInput(data.path)
+  }, [data?.path])
+  const go = () => {
+    const p = pathInput.trim()
+    if (p) setPath(p)
+  }
+
   const choose = (p: string) => {
     onSelect(p)
     onOpenChange(false)
@@ -81,12 +93,25 @@ export function FsBrowser({
           >
             <ArrowUp size={16} />
           </Button>
-          <div
-            className="min-w-0 flex-1 truncate rounded-md border border-border bg-panel-2 px-2.5 py-1.5 font-mono text-[12px] text-muted"
-            title={data?.path === '::drives' ? 'This PC' : data?.path ?? ''}
+          <input
+            value={pathInput}
+            onChange={(e) => setPathInput(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); go() } }}
+            placeholder={data?.path === '::drives' ? 'This PC — paste or type a path' : 'Paste or type a path'}
+            spellCheck={false}
+            aria-label="Path"
+            className="min-w-0 flex-1 rounded-md border border-border bg-bg px-2.5 py-1.5 font-mono text-[12px] text-ink outline-none placeholder:text-faint focus:border-[color:var(--accent)]"
+          />
+          <Button
+            variant="outline"
+            size="iconSm"
+            onClick={go}
+            disabled={!pathInput.trim() || isFetching}
+            aria-label="Go to path"
+            title="Go to this path"
           >
-            {data?.path === '::drives' ? 'This PC' : data?.path ?? '…'}
-          </div>
+            <ArrowRight size={16} />
+          </Button>
           <Button
             variant="outline"
             size="iconSm"
