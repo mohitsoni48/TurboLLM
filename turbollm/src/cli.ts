@@ -1,5 +1,4 @@
 import { hideChildConsoleWindows } from './util/hide-console-windows'
-import { installEngineProgressTap } from './agents/engine-progress-tap'
 import { spawn } from 'node:child_process'
 import { openSync, readFileSync } from 'node:fs'
 import { serve } from '@hono/node-server'
@@ -30,7 +29,6 @@ import { ModelRouter } from './gateway/model-router'
 import { ToolRegistry } from './tools/tool-registry'
 import { GenerationGate } from './agents/gate'
 import { AgentTaskState } from './agents/task-state'
-import { AgentRunManager } from './agents/run-manager'
 import { launchCli } from './cli-launch'
 import { writePidfile, removePidfile, stopDaemon, resolveDaemonPort } from './daemon-pid'
 import { createApp } from './server'
@@ -43,11 +41,6 @@ import type { Deps } from './deps'
 // of its own. Must run before anything spawns — patches the shared low-level
 // spawn path, so it covers the external pi SDK's named spawn import too.
 hideChildConsoleWindows()
-
-// Let agent turns surface llama.cpp prefill progress (the "Processing prompt — N%"
-// bar) the way plain chat does. pi-ai gives no stream seam, so a header-gated fetch
-// tee reads prompt_progress off the engine stream for tagged agent requests only.
-installEngineProgressTap()
 
 // Entrypoint for the TurboLLM daemon (npm bin "turbollm"): wiring + graceful
 // shutdown. ADR-023 (Node/TS stack).
@@ -262,11 +255,6 @@ const appUpdates = new AppUpdateChecker(version)
 const deps: Deps = { store, registry, manager, scanner, hashes, db, provision, build, updates, appUpdates, hf, downloads, bench, modelRouter, comfy, tools: toolRegistry, version, startedAt }
 deps.gate = new GenerationGate()
 deps.agentTasks = new AgentTaskState()
-// Agent engine: pi coding-agent runs with real shell/file execution (ADR pending). pi is
-// marked `external` in tsup so its dynamic CommonJS require resolves at runtime instead of
-// being inlined by esbuild (which crashed the bundle) — see tsup.config.ts.
-deps.agents = new AgentRunManager(deps)
-deps.agents.reconcileOnStartup()
 // Cloud Launch (ADR-045/152): only wired when --tunnel is passed. Its mere presence
 // on Deps is what forces auth enforcement on tunneled traffic (see auth.ts lanAuth) —
 // absent entirely for the vast majority of runs that never asked for a tunnel.
