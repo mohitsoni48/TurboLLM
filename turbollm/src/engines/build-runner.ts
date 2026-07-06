@@ -18,7 +18,7 @@ import { execFile, spawn } from 'node:child_process'
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { delimiter, dirname, join } from 'node:path'
 import { promisify } from 'node:util'
-import { buildEnv, checkBuildPrereqs, CMAKE_CONFIGURE_ARGS, CUDA_RUNTIME_DLL_PREFIXES, CUDA_RUNTIME_SO_PREFIXES } from './build-prereqs'
+import { buildEnv, checkBuildPrereqs, CMAKE_CONFIGURE_ARGS, CMAKE_CONFIGURE_ARGS_MACOS, CUDA_RUNTIME_DLL_PREFIXES, CUDA_RUNTIME_SO_PREFIXES } from './build-prereqs'
 import { resolveServerBinary } from './scan'
 import type { BuildPhase } from './build-state'
 
@@ -413,16 +413,18 @@ function neutralizeGratuitousAsm(srcDir: string, log: (l: string) => void): void
  *  caller surfaces it via BuildState.fail); on success returns the built binary + commit. */
 export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: AbortSignal): Promise<BuildOutput> {
   const isWindows = process.platform === 'win32'
+  const isMac = process.platform === 'darwin'
   // Force git to FAIL fast instead of blocking on an interactive credential prompt (a
   // private/typo'd URL would otherwise hang the build with stdin ignored). GCM_INTERACTIVE
   // disables the Git Credential Manager GUI on Windows.
   const env = { ...buildEnv(req.toolchainDirs), GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' }
 
   // Fail fast with actionable guidance if the toolchain isn't usable, rather than a deep
-  // cryptic cmake error. CUDA is required because we build with -DGGML_CUDA=ON.
+  // cryptic cmake error. CUDA is required on Windows/Linux (-DGGML_CUDA=ON); macOS builds
+  // with Metal instead, a system framework with no separate toolkit to check for.
   hooks.phase('preparing')
   const prereqs = await checkBuildPrereqs(req.toolchainDirs)
-  if (!prereqs.supported) throw new Error('In-app build is currently Windows or Linux (with CUDA) only.')
+  if (!prereqs.supported) throw new Error('In-app build is currently Windows, Linux, or macOS only.')
   const missing = prereqs.tools.filter((t) => (t.id === 'git' || t.id === 'cmake' || t.id === 'cuda') && !t.found)
   if (missing.length > 0) {
     const names = missing.map((t) => t.name).join(', ')
@@ -432,7 +434,7 @@ export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: Abo
     )
   }
   // Windows: we compile with Ninja/NMake (not the VS generator), so we need the MSVC dev env.
-  // Linux: cmake is invoked directly, so we just need a C++ compiler on PATH.
+  // Linux/macOS: cmake is invoked directly, so we just need a C++ compiler on PATH.
   let vcvars: string | null = null
   if (isWindows) {
     vcvars = await findVcvarsall()
@@ -444,7 +446,9 @@ export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: Abo
     }
   } else if (!prereqs.tools.some((t) => t.id === 'gcc' && t.found)) {
     throw new Error(
-      'Could not find a C++ compiler. Install one (e.g. `sudo apt install build-essential` on Debian/Ubuntu) and retry.',
+      isMac
+        ? 'Could not find a C++ compiler. Install the Xcode Command Line Tools (`xcode-select --install`) and retry.'
+        : 'Could not find a C++ compiler. Install one (e.g. `sudo apt install build-essential` on Debian/Ubuntu) and retry.',
     )
   }
 
@@ -473,7 +477,9 @@ export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: Abo
   const generator = pickGenerator(onPath(env, isWindows ? 'ninja.exe' : 'ninja'), isWindows)
   hooks.log(
     generator === 'Ninja'
-      ? 'Using the Ninja generator (drives nvcc directly — no Visual Studio CUDA integration needed).'
+      ? isWindows
+        ? 'Using the Ninja generator (drives nvcc directly — no Visual Studio CUDA integration needed).'
+        : 'Using the Ninja generator.'
       : isWindows
       ? 'Ninja not found on PATH — using the NMake generator (works, but single-threaded and slower; ' +
           'add a folder containing ninja.exe under Build environment for much faster builds).'
@@ -482,9 +488,9 @@ export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: Abo
   )
 
   // 2) Configure. Windows: inside the MSVC dev env so cl/ml64/INCLUDE/LIB are set (nvcc comes
-  // off PATH). Linux: cmake runs directly — no dev-env shell needed.
+  // off PATH). Linux/macOS: cmake runs directly — no dev-env shell needed.
   hooks.phase('configuring')
-  const configureArgs = ['-G', generator, '-B', buildSubdir, '-S', srcDir, ...CMAKE_CONFIGURE_ARGS]
+  const configureArgs = ['-G', generator, '-B', buildSubdir, '-S', srcDir, ...(isMac ? CMAKE_CONFIGURE_ARGS_MACOS : CMAKE_CONFIGURE_ARGS)]
   if (isWindows) {
     const configureBat = join(buildRoot, '_tllm_configure.bat')
     writeFileSync(configureBat, vcvarsBatch(vcvars!, configureArgs))
@@ -514,7 +520,8 @@ export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: Abo
   // DLLs/.so's, so copy them next to the binary (else the probe + every launch fail to
   // start with missing libs). On Linux the engine launcher also points LD_LIBRARY_PATH
   // at the binary's own directory so these bundled .so's are actually found at runtime.
+  // macOS builds link Metal (a system framework), so there's nothing to bundle.
   if (isWindows) copyCudaRuntimeDlls(env, dirname(binPath), hooks.log)
-  else copyCudaRuntimeLibs(env, dirname(binPath), hooks.log)
+  else if (!isMac) copyCudaRuntimeLibs(env, dirname(binPath), hooks.log)
   return { binPath, commit, buildRoot }
 }

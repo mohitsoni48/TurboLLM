@@ -24,24 +24,35 @@ import {
 } from '../../components/ui/dialog'
 import { AddEngineDialog } from './AddEngineDialog'
 
-// Mirrors build-prereqs.ts's CMAKE_CONFIGURE_ARGS / CUDA_RUNTIME_DLL_PREFIXES /
-// CUDA_RUNTIME_SO_PREFIXES — kept in lockstep by hand (the web bundle can't import Node
-// backend code). `-allow-unsupported-compiler` works around nvcc's hardcoded host-compiler
-// allowlist (a new VS/GCC release routinely ships before NVIDIA updates it); the runtime
-// DLLs/libs aren't bundled by the build itself, so without copying them the produced engine
-// silently falls back to CPU.
+// Mirrors build-prereqs.ts's CMAKE_CONFIGURE_ARGS / CMAKE_CONFIGURE_ARGS_MACOS /
+// CUDA_RUNTIME_DLL_PREFIXES / CUDA_RUNTIME_SO_PREFIXES — kept in lockstep by hand (the web
+// bundle can't import Node backend code). `-allow-unsupported-compiler` works around nvcc's
+// hardcoded host-compiler allowlist (a new VS/GCC release routinely ships before NVIDIA
+// updates it); the runtime DLLs/libs aren't bundled by the build itself, so without copying
+// them the produced engine silently falls back to CPU. Metal needs neither — it's a system
+// framework via the Xcode toolchain, nothing to bundle.
 const CMAKE_CONFIGURE_ARGS = ['-DGGML_CUDA=ON', '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler']
+const CMAKE_CONFIGURE_ARGS_MACOS = ['-DGGML_METAL=ON', '-DCMAKE_BUILD_TYPE=Release']
 const CUDA_RUNTIME_DLL_PREFIXES = ['cudart64_', 'cublas64_', 'cublaslt64_', 'nvrtc64_', 'nvrtc-builtins64_', 'nvjitlink_']
 const CUDA_RUNTIME_SO_PREFIXES = ['libcudart.so', 'libcublas.so', 'libcublasLt.so', 'libnvrtc.so', 'libnvrtc-builtins.so', 'libnvJitLink.so']
 
 /** The exact build command list for a repo on `os` (mirrors the backend's PURE
  *  `buildCommands` in src/engines/build-prereqs.ts — kept in lockstep so the manual path
  *  matches what the 1-click build runs). */
-function buildCommands(repoUrl: string, branch: string | undefined, os: 'windows' | 'linux' | 'other'): string[] {
+function buildCommands(repoUrl: string, branch: string | undefined, os: 'windows' | 'linux' | 'macos' | 'other'): string[] {
   const b = (branch ?? '').trim()
   const clone = b
     ? `git clone --branch ${b} --depth 1 ${repoUrl} turbo-build`
     : `git clone --depth 1 ${repoUrl} turbo-build`
+  if (os === 'macos') {
+    return [
+      clone,
+      'cd turbo-build',
+      `cmake -B build ${CMAKE_CONFIGURE_ARGS_MACOS.join(' ')}`,
+      'cmake --build build -j --target llama-server',
+      '# Built binary: build/bin/llama-server — add it via "Add your own engine".',
+    ]
+  }
   const configure = `cmake -B build ${CMAKE_CONFIGURE_ARGS.join(' ')}`
   if (os === 'linux') {
     const libGlobs = ['lib64', 'lib', 'targets/x86_64-linux/lib']
@@ -81,11 +92,11 @@ const PHASE_LABEL: Record<EngineBuild['phase'], string> = {
   error: 'Build failed',
 }
 
-/** Compile-from-source dialog (ADR-089 + ADR-100, Linux port). On Windows or Linux + CUDA:
- *  a prereq checklist, an editable "Build environment" (PATH dirs so a conda-env / custom
- *  CUDA Toolkit is found), a 1-click "Build it for me" that clones + compiles + registers
- *  in-app with live progress, and the manual command path as a fallback. On macOS the
- *  guided build is parked. */
+/** Compile-from-source dialog (ADR-089 + ADR-100, Linux + macOS ports). On Windows/Linux
+ *  (+ CUDA) or macOS (+ Metal): a prereq checklist, an editable "Build environment" (PATH dirs
+ *  so a conda-env / custom CUDA Toolkit is found — unused on macOS, which needs no GPU toolkit),
+ *  a 1-click "Build it for me" that clones + compiles + registers in-app with live progress,
+ *  and the manual command path as a fallback. */
 export function BuildGuideDialog({
   open,
   onOpenChange,
@@ -204,12 +215,12 @@ export function BuildGuideDialog({
             Checking your build tools…
           </div>
         ) : supported === false ? (
-          // Parked OS (macOS): point at the repo + upstream build docs.
+          // Unrecognized OS: point at the repo + upstream build docs.
           <div className="flex flex-col gap-3">
             <div className="rounded-lg border border-border bg-panel p-4 text-[13px] text-muted">
-              In-app build is currently <span className="font-medium text-ink">Windows or Linux, with CUDA,</span> only.
-              On your system, clone the repo and follow its upstream build instructions, then add the
-              resulting <code className="font-mono">llama-server</code> binary via “Add your own engine”.
+              In-app build isn&apos;t available on this system yet. Clone the repo and follow its
+              upstream build instructions, then add the resulting{' '}
+              <code className="font-mono">llama-server</code> binary via “Add your own engine”.
             </div>
             <a
               href={repoUrl}
@@ -254,9 +265,18 @@ export function BuildGuideDialog({
               <p className="text-[11px] font-medium uppercase tracking-wide text-faint">Build environment</p>
               <div className="flex flex-col gap-2 rounded-lg border border-border bg-panel p-3">
                 <p className="text-[12px] text-muted">
-                  If your CUDA Toolkit or compiler lives in a conda env or a custom location (not on the
-                  system PATH), add that folder — e.g. the env’s <code className="font-mono">bin</code> — so
-                  TurboLLM finds <code className="font-mono">nvcc</code>. Then re-check.
+                  {os === 'macos' ? (
+                    <>
+                      If your compiler or CMake lives in a custom location (not on the system PATH),
+                      add that folder — e.g. a Homebrew <code className="font-mono">bin</code> dir. Then re-check.
+                    </>
+                  ) : (
+                    <>
+                      If your CUDA Toolkit or compiler lives in a conda env or a custom location (not on the
+                      system PATH), add that folder — e.g. the env’s <code className="font-mono">bin</code> — so
+                      TurboLLM finds <code className="font-mono">nvcc</code>. Then re-check.
+                    </>
+                  )}
                 </p>
                 {dirs.map((dir, i) => (
                   <div key={i} className="flex items-center gap-1.5">
@@ -323,7 +343,9 @@ export function BuildGuideDialog({
               </summary>
               <div className="mt-1.5 flex flex-col gap-1.5">
                 <div className="flex items-center justify-between">
-                  <p className="text-[11px] text-faint">{os === 'linux' ? 'Linux + CUDA' : 'Windows + CUDA'}</p>
+                  <p className="text-[11px] text-faint">
+                    {os === 'linux' ? 'Linux + CUDA' : os === 'macos' ? 'macOS + Metal' : 'Windows + CUDA'}
+                  </p>
                   <button
                     type="button"
                     onClick={copy}
@@ -402,8 +424,8 @@ function BuildProgress({
         <div className="flex flex-col gap-1">
           <p className="text-[15px] font-semibold text-ink">Engine ready 🎉</p>
           <p className="text-[13px] text-muted">
-            <span className="font-medium text-ink">{build.engine}</span> was built from source, bundled
-            with its CUDA runtime, and set as your active engine. Load a model to start using it.
+            <span className="font-medium text-ink">{build.engine}</span> was built from source and set as
+            your active engine. Load a model to start using it.
           </p>
         </div>
         <details className="w-full">

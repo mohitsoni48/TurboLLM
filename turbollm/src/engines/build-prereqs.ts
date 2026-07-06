@@ -1,8 +1,8 @@
-// Compile-from-source (Windows or Linux + CUDA) — prerequisite checker + build commands
-// (ADR-089, Linux port). Detects the build toolchain (git/cmake/CUDA/compiler), tells the
-// user what's missing (with install links), and the in-app 1-click build (ADR-100,
-// build-runner.ts) runs the exact commands here. macOS is parked — `checkBuildPrereqs`
-// reports `supported:false` there (no CUDA on macOS).
+// Compile-from-source (Windows/Linux + CUDA, or macOS + Metal) — prerequisite checker + build
+// commands (ADR-089, Linux port; macOS/Metal port). Detects the build toolchain
+// (git/cmake/CUDA-or-compiler), tells the user what's missing (with install links), and the
+// in-app 1-click build (ADR-100, build-runner.ts) runs the exact commands here. macOS has no
+// CUDA, so it builds with Metal instead — no GPU-toolkit prereq, just git/cmake/clang++.
 //
 // Toolchain dirs (ADR-100): the daemon inherits the system PATH, so a CUDA Toolkit /
 // compiler installed in a conda env or a custom location isn't found. {@link buildEnv}
@@ -49,10 +49,10 @@ export interface BuildPrereqTool {
 }
 
 export interface BuildPrereqs {
-  /** Guided build is Windows/Linux + CUDA only for now. False on macOS (parked). */
+  /** Guided build supports Windows, Linux (both + CUDA) and macOS (+ Metal). */
   supported: boolean
   /** Which toolchain shape `tools`/`buildCommands` reflect. 'other' when unsupported. */
-  os: 'windows' | 'linux' | 'other'
+  os: 'windows' | 'linux' | 'macos' | 'other'
   tools: BuildPrereqTool[]
 }
 
@@ -190,16 +190,19 @@ async function checkGcc(env: NodeJS.ProcessEnv): Promise<BuildPrereqTool> {
   return { id: 'gcc', name: 'C++ compiler (g++/clang++)', found, version, installUrl: INSTALL_URLS.gcc }
 }
 
-/** Detect the Windows or Linux + CUDA build toolchain. On macOS the guided build is parked,
- *  so this returns `{ supported:false, os:'other', tools:[] }` without probing anything.
- *  `toolchainDirs` (ADR-100) are prepended to PATH so a conda-env / custom-path CUDA Toolkit
- *  is detected. */
+/** Detect the build toolchain: Windows/Linux + CUDA, or macOS + Metal (no GPU toolkit needed —
+ *  Metal is a system framework, so macOS only needs git/cmake/a C++ compiler). `toolchainDirs`
+ *  (ADR-100) are prepended to PATH so a conda-env / custom-path CUDA Toolkit is detected. */
 export async function checkBuildPrereqs(toolchainDirs: string[] = []): Promise<BuildPrereqs> {
   const platform = process.platform
-  if (platform !== 'win32' && platform !== 'linux') {
+  if (platform !== 'win32' && platform !== 'linux' && platform !== 'darwin') {
     return { supported: false, os: 'other', tools: [] }
   }
   const env = buildEnv(toolchainDirs)
+  if (platform === 'darwin') {
+    const tools = await Promise.all([checkGit(env), checkCmake(env), checkGcc(env)])
+    return { supported: true, os: 'macos', tools }
+  }
   const tools = platform === 'win32'
     ? await Promise.all([checkGit(env), checkCmake(env), checkCuda(env), checkMsvc(env)])
     : await Promise.all([checkGit(env), checkCmake(env), checkCuda(env), checkGcc(env)])
@@ -215,6 +218,11 @@ export async function checkBuildPrereqs(toolchainDirs: string[] = []): Promise<B
  *  the host compiler is already allowlisted — so it's safe to pass unconditionally. */
 export const CMAKE_CONFIGURE_ARGS = ['-DGGML_CUDA=ON', '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler']
 
+/** The cmake Metal configure flags for a macOS build — no CUDA-style unsupported-compiler
+ *  escape hatch needed (Metal is built via the system Xcode toolchain, not a separately
+ *  versioned GPU toolkit). */
+export const CMAKE_CONFIGURE_ARGS_MACOS = ['-DGGML_METAL=ON', '-DCMAKE_BUILD_TYPE=Release']
+
 /** CUDA runtime DLLs (Windows) / shared libs (Linux) a llama.cpp CUDA build links against at
  *  runtime. A build does NOT bundle these, so without copying them next to the binary the
  *  engine silently falls back to CPU. Shared with build-runner.ts's 1-click-build copy step. */
@@ -225,13 +233,18 @@ export const CUDA_RUNTIME_SO_PREFIXES = ['libcudart.so', 'libcublas.so', 'libcub
  *  the guide's copy-able command block. The trailing comment notes where the binary lands
  *  so the user knows what to point "Add your own engine" at. Defaults to the host's own
  *  platform when `os` is omitted (matches what the 1-click build actually runs here). A
- *  source build doesn't bundle the CUDA runtime, so — mirroring build-runner.ts's own
+ *  CUDA source build doesn't bundle the CUDA runtime, so — mirroring build-runner.ts's own
  *  post-build copy — we add a step that bundles it next to the binary; otherwise the built
- *  engine runs (CPU-only) with no indication it silently skipped the GPU. */
+ *  engine runs (CPU-only) with no indication it silently skipped the GPU. Metal needs no such
+ *  step — it's a system framework, always present, nothing to bundle. */
 export function buildCommands(
   repoUrl: string,
   branch?: string,
-  os: 'windows' | 'linux' = process.platform === 'win32' ? 'windows' : 'linux',
+  os: 'windows' | 'linux' | 'macos' = process.platform === 'win32'
+    ? 'windows'
+    : process.platform === 'darwin'
+    ? 'macos'
+    : 'linux',
 ): string[] {
   const b = (branch ?? '').trim()
   // Quote the branch + URL so the copy-pasted command survives a space/special char
@@ -239,6 +252,15 @@ export function buildCommands(
   const clone = b
     ? `git clone --branch "${b}" --depth 1 "${repoUrl}" turbo-build`
     : `git clone --depth 1 "${repoUrl}" turbo-build`
+  if (os === 'macos') {
+    return [
+      clone,
+      'cd turbo-build',
+      `cmake -B build ${CMAKE_CONFIGURE_ARGS_MACOS.join(' ')}`,
+      'cmake --build build -j --target llama-server',
+      '# Built binary: build/bin/llama-server — add it via "Add your own engine".',
+    ]
+  }
   const configure = `cmake -B build ${CMAKE_CONFIGURE_ARGS.join(' ')}`
   if (os === 'linux') {
     // CUDA 13 vs 12 lay the runtime libs out differently (lib64 vs lib vs the
