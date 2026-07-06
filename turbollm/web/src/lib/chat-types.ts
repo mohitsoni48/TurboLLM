@@ -89,6 +89,13 @@ export interface Conversation {
   toolPolicy?: string
   /** Folder this conversation is filed under (v10). null/undefined = uncategorized. */
   folderId?: string | null
+  /** Skill ids enabled for this conversation (the shared SKILL.md library). Their
+   *  instructions are injected into the system prompt; 'skill-creator' additionally
+   *  grants the save_skill tool. Undefined/empty = a plain chat with no skills. */
+  skillIds?: string[]
+  /** Tool-name allow-list baked in from a custom chat Agent at creation (Customize →
+   *  Agents). Undefined/empty = unrestricted (every built-in persona). */
+  allowedTools?: string[]
   createdAt: string
   updatedAt: string
   messages?: Message[]

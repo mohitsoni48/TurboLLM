@@ -15,8 +15,8 @@ import type { BenchRunner } from './bench/bench'
 import type { ModelRouter } from './gateway/model-router'
 import type { ToolRegistry } from './tools/tool-registry'
 import type { GenerationGate } from './agents/gate'
-import type { AgentRunner } from './agents/runner'
 import type { TunnelManager } from './tunnel/manager'
+import type { AgentTaskState } from './agents/task-state'
 
 export interface Deps {
   store: ConfigStore
@@ -46,16 +46,17 @@ export interface Deps {
   /** ComfyUI GPU coordinator (spec: unload/block while ComfyUI renders, reload after).
    *  Optional: only wired in the real `serve()` entrypoint (cli.ts); absent under tests. */
   comfy?: ComfyGuard
-  /** Priority-queue mutex serialising engine calls (fg > bg). Optional — absent under
-   *  tests; only wired in cli.ts where the agent runner co-exists with chat. */
+  /** Priority-queue mutex serialising engine calls (multiple concurrent generation
+   *  requests). Optional — absent under tests; only wired in cli.ts. */
   gate?: GenerationGate
-  /** Background agent runner. Optional — same wiring conditions as gate. */
-  agentRunner?: AgentRunner
   /** Cloud Launch tunnel (ADR-045/152): owns the cloudflared child when `--tunnel` is
    *  active. Optional: only wired in the real `serve()` entrypoint (cli.ts); absent
    *  under tests. Its presence/active() state is what forces auth enforcement on
    *  tunneled traffic regardless of lanBind (see auth.ts lanAuth). */
   tunnel?: TunnelManager
+  /** Background agent-task registry (reviewer + skill distill). Surfaced via /status
+   *  so the UI can show running bg tasks inline. Optional — absent under tests. */
+  agentTasks?: AgentTaskState
   version: string
   startedAt: number
   /** Re-exec the daemon so config changes (port, LAN bind) take effect (spec 08 §2).

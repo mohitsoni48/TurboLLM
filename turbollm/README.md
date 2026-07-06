@@ -196,9 +196,11 @@ the detail:
   the model draws when a comparison, trend, or hierarchy is genuinely worth a visual.
 - **Live artifacts** — `html`, `svg`, and `mermaid` replies render as **sandboxed, offline
   previews** shown as an image, with one-click export to **PNG / JPEG / SVG / animated GIF / HTML**.
-- **Personas** — pick a style (Default · **Designer** · Concise · Detailed · Blunt · Formal · Tutor ·
-  Creative · Research) per conversation, no prompt-wrangling required. The **Designer** persona
-  produces polished, self-contained, previewable designs by default.
+- **Agents** — pick a style (Default · **Designer** · Concise · Detailed · Blunt · Formal · Tutor ·
+  Creative · Research · **Lite** · **Code**) per conversation, no prompt-wrangling required. The
+  **Designer** persona produces polished, self-contained, previewable designs by default; **Lite**
+  strips the hidden prompt to the bare minimum for the fastest responses. See below for editing
+  built-ins or creating your own.
 - **Edit, regenerate, delete, copy** any message; **persistent, searchable conversations**
   with rename, delete, and **auto-generated titles**, organized into **drag-resizable,
   collapsible folders** you create/rename/move conversations into.
@@ -219,17 +221,17 @@ the detail:
 </details>
 
 <details>
-<summary><strong>🤖 Background agents — long-running tasks that don't tie up your chat</strong></summary>
+<summary><strong>🤖 Customize → Agents — edit any built-in, or build your own</strong></summary>
 
 <br/>
 
-- **Launch an agent and walk away.** The **Agents** screen runs tasks in the daemon, separate from
-  the chat tab — describe the task, pick which tools it may use (web search / fetch URL / run code),
-  and let it work.
-- **Live, reconnectable progress.** Watch the run stream in real time; navigate away or reload and
-  the view **reconnects** to the in-progress output. Runs **queue** behind any active run and
-  **persist** across restarts.
-- **Cancel anytime**, and review completed runs (messages + the tool calls they made) later.
+- **Edit any built-in agent in place** — system prompt, which shared skills it uses, and which
+  tools it may call — with a one-click **Reset** back to the original.
+- **Create your own agent** from scratch: a name, description, and system prompt, plus a
+  checklist of which shared skills and which tools it's allowed to use (everything on by
+  default). Pick it from the same in-chat agent picker as the built-ins.
+- **MCP tools grouped by server** in the tool checklist — one toggle selects or deselects an
+  entire server's tools at once, or expand it to pick individually.
 
 </details>
 

@@ -14,6 +14,9 @@ import { buildSnapshot } from './chat-export'
 import type { ExportFormat } from './chat-export'
 import { executeToolCallWithApproval } from '../tools/execute-with-approval'
 import { resolveToolApproval } from '../tools/approval-gate'
+import { buildSaveSkillTool } from '../agents/agent-tools'
+import { SkillStore } from '../agents/skills'
+import { saveSkillFromConversation } from '../agents/skill-jobs'
 
 // Track in-flight abort controllers per conversation id.
 const inflight = new Map<string, AbortController>()
@@ -75,9 +78,26 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   })
 
   app.post('/api/v1/conversations', async (c) => {
-    const b = await body<{ title?: string; systemPrompt?: string; modelKey?: string; toolPolicy?: string }>(c)
-    const conv = db.createConversation({ title: b.title, systemPrompt: b.systemPrompt, modelKey: b.modelKey, toolPolicy: b.toolPolicy })
+    const b = await body<{ title?: string; systemPrompt?: string; modelKey?: string; toolPolicy?: string; skillIds?: string[]; allowedTools?: string[] }>(c)
+    // Only keep ids that exist in the shared skill library; silently drop unknown ones.
+    const validIds = new Set(new SkillStore(d.store.dir()).list().map((s) => s.id))
+    const skillIds = Array.isArray(b.skillIds) ? b.skillIds.filter((sid) => validIds.has(sid)) : undefined
+    // Tool allow-list baked in from a custom chat Agent (Customize → Agents). Not
+    // validated against the live tool catalog — an MCP server disconnecting later
+    // shouldn't retroactively corrupt the conversation's saved intent.
+    const allowedTools = Array.isArray(b.allowedTools) ? b.allowedTools.filter((t) => typeof t === 'string') : undefined
+    const conv = db.createConversation({ title: b.title, systemPrompt: b.systemPrompt, modelKey: b.modelKey, toolPolicy: b.toolPolicy, skillIds, allowedTools })
     return c.json(conv, 201)
+  })
+
+  // Save this conversation as a reusable SKILL (Voyager-style distill from the
+  // transcript). Detached → shared library, deduped by name.
+  app.post('/api/v1/conversations/:id/save-skill', (c) => {
+    const conv = db.getConversation(c.req.param('id'))
+    if (!conv) return c.json({ error: { code: 'not_found', message: 'Conversation not found.' } }, 404)
+    // Same background skill author the in-chat save_skill tool uses (skill-creator model).
+    const taskId = saveSkillFromConversation(d, conv.id)
+    return c.json({ ok: true, learning: !!taskId })
   })
 
   app.get('/api/v1/conversations/:id', (c) => {
@@ -87,7 +107,11 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   })
 
   app.patch('/api/v1/conversations/:id', async (c) => {
-    const b = await body<{ title?: string; systemPrompt?: string; sampling?: Record<string, unknown> }>(c)
+    const b = await body<{ title?: string; systemPrompt?: string; sampling?: Record<string, unknown>; skillIds?: string[] }>(c)
+    if (b.skillIds !== undefined) {
+      const validIds = new Set(new SkillStore(d.store.dir()).list().map((s) => s.id))
+      b.skillIds = b.skillIds.filter((sid) => validIds.has(sid))
+    }
     const ok = db.updateConversation(c.req.param('id'), b)
     if (!ok) return err(c, 404, 'not_found', 'Conversation not found.')
     return c.json(db.getConversation(c.req.param('id'))!)
@@ -560,6 +584,30 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
   const iterMessages: { role: string; content: unknown; tool_calls?: unknown; tool_call_id?: string }[] =
     ctx.engineMessages.map((m) => ({ role: m.role, content: m.content }))
 
+  // Skills enabled for this conversation (the shared SKILL.md library, picked via
+  // Thread settings or the '/' picker): inject their instructions into the system
+  // prompt. No-op for a plain chat with no skills enabled — byte-identical to today.
+  const enabledSkillIds = new Set(conv.skillIds ?? [])
+  if (enabledSkillIds.size > 0) {
+    const enabledSkills = new SkillStore(d.store.dir()).list().filter((s) => enabledSkillIds.has(s.id))
+    if (enabledSkills.length) {
+      // Full instructions, formatting intact — a real skill's procedure can run to
+      // several KB and a 300-char preview was silently dropping nearly all of it.
+      // MAX_SKILL_INSTRUCTIONS_CHARS is a safety cap against a pathological file,
+      // not an everyday limit (real skills should always fit under it whole).
+      const MAX_SKILL_INSTRUCTIONS_CHARS = 20_000
+      const skillSys = 'Skills enabled for this chat (apply the relevant ones):\n\n' +
+        enabledSkills.map((s) => `## ${s.name}\n${s.description}\n\n${s.instructions.trim().slice(0, MAX_SKILL_INSTRUCTIONS_CHARS)}`).join('\n\n---\n\n')
+      const sysIdx = iterMessages.findIndex((m) => m.role === 'system')
+      if (sysIdx >= 0) {
+        const existing = typeof iterMessages[sysIdx].content === 'string' ? iterMessages[sysIdx].content : ''
+        iterMessages[sysIdx] = { ...iterMessages[sysIdx], content: `${skillSys}\n\n${existing}`.trim() }
+      } else {
+        iterMessages.unshift({ role: 'system', content: skillSys })
+      }
+    }
+  }
+
   // F-021: inject confidence-loop instruction into Research persona system prompt.
   // Appends to the existing system message (or inserts one if absent).
   const CONFIDENCE_INSTRUCTION =
@@ -601,7 +649,31 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
   d.manager.generationStart()
   try {
     // Get tool definitions once (or empty for engines that don't support tools)
-    const toolDefs = d.tools ? await d.tools.buildToolDefinitions() : []
+    const baseToolDefs = d.tools ? await d.tools.buildToolDefinitions() : []
+    // 'skill-creator' grants save_skill — the one tool a skill can add beyond the base
+    // registry (every other skill is instructions text only). No-op unless enabled.
+    const skillTools = enabledSkillIds.has('skill-creator')
+      ? buildSaveSkillTool(() => {
+          // In-chat skill author: read THIS conversation in the background and write a
+          // SKILL.md to the shared library.
+          const tid = saveSkillFromConversation(d, conv.id)
+          return tid
+            ? 'Started writing a skill from this conversation in the background. It will appear in the skill library shortly.'
+            : 'There is nothing to turn into a skill yet.'
+        })
+      : undefined
+    // Custom chat Agent tool allow-list (Customize → Agents), baked in at conversation
+    // creation. Undefined/empty = unrestricted — every built-in persona's conversations
+    // take this branch, so their tool list is byte-identical to before this feature.
+    // Applied ONLY to the base (built-in + MCP) registry: skill-granted tools like
+    // save_skill are never enumerated by /api/v1/tools (they only exist once their
+    // skill is enabled), so they can never appear in the allow-list checklist — gating
+    // them a second time here would silently strip save_skill from any agent that has
+    // 'skill-creator' enabled. Enabling the skill IS the allow decision for its tools.
+    const scopedBaseToolDefs = conv.allowedTools?.length
+      ? baseToolDefs.filter((t) => conv.allowedTools!.includes(t.function.name))
+      : baseToolDefs
+    const toolDefs = skillTools ? [...scopedBaseToolDefs, ...skillTools.defs] : scopedBaseToolDefs
 
     outerLoop: while (toolIter <= MAX_TOOL_ITER) {
       toolIter++
@@ -674,6 +746,9 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
       let finishReason = ''
       // Accumulate streaming tool_calls by index (OpenAI format: fragmented across chunks)
       const pendingToolCalls = new Map<number, { id: string; name: string; argsBuffer: string }>()
+      // Indices we've already told the UI about (so the long tool-arg generation that
+      // follows the model's text shows an inline "running…" step instead of looking frozen).
+      const announcedToolCalls = new Set<number>()
 
       roundLoop: while (true) {
         const { done, value } = await reader.read()
@@ -722,6 +797,12 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
               if (tc.id && !entry.id) entry.id = tc.id
               if (tc.function?.name && !entry.name) entry.name = tc.function.name
               if (tc.function?.arguments) entry.argsBuffer += tc.function.arguments
+              // The moment we know which tool this is, surface it as pending — the model
+              // may stream a long argument body next, and silence there reads as a freeze.
+              if (entry.id && entry.name && !announcedToolCalls.has(tc.index)) {
+                announcedToolCalls.add(tc.index)
+                await stream.writeSSE({ event: 'tool_call', data: JSON.stringify({ id: entry.id, name: entry.name, args: {}, status: 'pending' }) })
+              }
             }
             continue
           }
@@ -791,24 +872,53 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
           try { parsedArgs = JSON.parse(tc.argsBuffer || '{}') as Record<string, unknown> }
           catch { parsedArgs = {} }
 
-          // Live foreground chat gets the real approval gate (interactive: true) — an
-          // 'ask'-policy tool prompts the user via 'tool_call'/'awaiting_approval' and
-          // waits for POST .../tool-calls/:toolCallId/approve to resolve it.
-          const { result, error: callError } = await executeToolCallWithApproval({
-            tools: d.tools,
-            sink: (ev) => stream.writeSSE({ event: ev.event, data: JSON.stringify(ev.data) }),
-            convId,
-            id: tc.id,
-            name: tc.name,
-            args: parsedArgs,
-            globalPolicies: d.store.snapshot().tools.toolPolicies ?? {},
-            // Re-read fresh on every iteration (not the `conv` snapshot captured at request
-            // start) — otherwise a same-turn repeat tool call misses an "Allow for this
-            // chat" decision the user just made via POST .../tool-calls/:id/approve.
-            convOverrides: d.db.getToolOverrides(convId),
-            signal: ac.signal,
-            interactive: true,
-          })
+          // save_skill (from the 'skill-creator' skill) is pre-authorized by the user
+          // having enabled that skill for this chat, so it bypasses the approval gate
+          // and routes straight to its own executor. Everything else (normal chat
+          // tools) still goes through the real approval gate below.
+          const isSkillTool = skillTools?.names.has(tc.name) ?? false
+
+          let result: string
+          let callError: string | undefined
+
+          if (isSkillTool && skillTools) {
+            // Emit pending event so the frontend can show "calling..."
+            await stream.writeSSE({
+              event: 'tool_call',
+              data: JSON.stringify({ id: tc.id, name: tc.name, args: parsedArgs, status: 'pending' }),
+            })
+            try {
+              result = skillTools.execute({ id: tc.id, name: tc.name, args: parsedArgs })
+            } catch (e) {
+              callError = (e as Error).message
+              result = `Error: ${callError}`
+            }
+            await stream.writeSSE({
+              event: 'tool_call',
+              data: JSON.stringify({ id: tc.id, name: tc.name, args: parsedArgs, status: callError ? 'error' : 'done', result }),
+            })
+          } else {
+            // Live foreground chat gets the real approval gate (interactive: true) — an
+            // 'ask'-policy tool prompts the user via 'tool_call'/'awaiting_approval' and
+            // waits for POST .../tool-calls/:toolCallId/approve to resolve it.
+            const approved = await executeToolCallWithApproval({
+              tools: d.tools,
+              sink: (ev) => stream.writeSSE({ event: ev.event, data: JSON.stringify(ev.data) }),
+              convId,
+              id: tc.id,
+              name: tc.name,
+              args: parsedArgs,
+              globalPolicies: d.store.snapshot().tools.toolPolicies ?? {},
+              // Re-read fresh on every iteration (not the `conv` snapshot captured at request
+              // start) — otherwise a same-turn repeat tool call misses an "Allow for this
+              // chat" decision the user just made via POST .../tool-calls/:id/approve.
+              convOverrides: d.db.getToolOverrides(convId),
+              signal: ac.signal,
+              interactive: true,
+            })
+            result = approved.result
+            callError = approved.error
+          }
 
           // F-021: track web_search calls and accumulate research sources.
           if (tc.name === 'web_search' && !callError) {
@@ -1087,20 +1197,29 @@ async function autoTitle(
         content: 'Generate a concise 3-6 word title for this conversation. Reply with ONLY the title — no quotes, no punctuation, no preamble. /no_think',
       },
     ]
-    const res = await fetch(`${target}/v1/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: engineModelAlias(d.registry.active()?.kind ?? '') ?? ms.model?.key,
-        messages: titleMessages,
-        stream: false,
-        temperature: 0.3,
-        max_tokens: 32,
-        reasoning_budget: 0,
-        chat_template_kwargs: { enable_thinking: false },
-      }),
-      signal: AbortSignal.timeout(20_000),
-    })
+    // Title generation is a LOW-PRIORITY afterthought — acquire the engine gate at 'bg' so
+    // any foreground chat or agent run preempts it (it never blocks real work), and release
+    // as soon as the small call returns.
+    const release = d.gate ? await d.gate.acquire('bg') : null
+    let res: Response
+    try {
+      res = await fetch(`${target}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: engineModelAlias(d.registry.active()?.kind ?? '') ?? ms.model?.key,
+          messages: titleMessages,
+          stream: false,
+          temperature: 0.3,
+          max_tokens: 32,
+          reasoning_budget: 0,
+          chat_template_kwargs: { enable_thinking: false },
+        }),
+        signal: AbortSignal.timeout(20_000),
+      })
+    } finally {
+      release?.()
+    }
     if (!res.ok) return
     const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> }
     let raw = data.choices?.[0]?.message?.content ?? ''
@@ -1117,4 +1236,18 @@ async function autoTitle(
       d.db.updateConversation(convId, { title })
     }
   } catch { /* silently ignore */ }
+}
+
+/** Auto-title a conversation from its persisted transcript (used by agent runs, which
+ *  don't go through the chat message endpoint). No-op unless the title is still default
+ *  and the setting is on. Best-effort. */
+export async function autoTitleFromConversation(d: Deps, convId: string): Promise<void> {
+  const conv = d.db.getConversation(convId, true)
+  if (!conv || conv.title !== 'New chat' || !d.store.snapshot().daemon.autoGenerateTitles) return
+  const target = d.manager.target()
+  if (!target) return
+  const msgs = (conv.messages ?? []).filter((m) => m.content).map((m) => ({ role: m.role, content: m.content }))
+  if (!msgs.length) return
+  const lastAssistant = [...msgs].reverse().find((m) => m.role === 'assistant')
+  await autoTitle(d, convId, msgs.slice(0, -1), typeof lastAssistant?.content === 'string' ? lastAssistant.content : '', target)
 }

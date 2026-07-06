@@ -13,8 +13,10 @@ import { useStatus } from './lib/queries'
 import { ApiError, setAuthToken } from './lib/api'
 
 // Route-level code splitting: each screen loads only when first navigated to.
+const WorkspaceScreen = lazy(() => import('./screens/WorkspaceScreen').then((m) => ({ default: m.WorkspaceScreen })))
 const ChatScreen = lazy(() => import('./screens/ChatScreen').then((m) => ({ default: m.ChatScreen })))
-const AgentsScreen = lazy(() => import('./screens/AgentsScreen').then((m) => ({ default: m.AgentsScreen })))
+const SkillEditPage = lazy(() => import('./screens/skills/SkillEditPage').then((m) => ({ default: m.SkillEditPage })))
+const AgentEditPage = lazy(() => import('./screens/agents/AgentEditPage').then((m) => ({ default: m.AgentEditPage })))
 const ModelsScreen = lazy(() => import('./screens/ModelsScreen').then((m) => ({ default: m.ModelsScreen })))
 const EnginesScreen = lazy(() => import('./screens/EnginesScreen').then((m) => ({ default: m.EnginesScreen })))
 const DeveloperScreen = lazy(() => import('./screens/DeveloperScreen').then((m) => ({ default: m.DeveloperScreen })))
@@ -41,31 +43,33 @@ export function App() {
   // Count consecutive failed polls; show the unreachable overlay after 3 (spec 08 §1).
   const [failCount, setFailCount] = useState(0)
   const lastUpdated = useRef(0)
-  // Sticky once a 401 is seen: a raw network-level failure (fetch() itself rejecting —
-  // a Wi-Fi hiccup, DNS blip, a phone browser backgrounding the tab briefly, etc.) is NOT
-  // wrapped as an ApiError (api.ts `request` only wraps a completed HTTP response), so on
-  // a real LAN — as opposed to this dev box's loopback — such hiccups are common. Deriving
-  // `needsAuth` fresh every render off the current error would flicker false on each one,
-  // unmounting AuthGate and wiping whatever key the user was mid-typing. Once a real 401
-  // is observed, stay in the auth-needed state through any number of transient failures;
-  // only an actual successful poll (the key was accepted) clears it.
-  const [authNeeded, setAuthNeeded] = useState(false)
   useEffect(() => {
     if (statusQ.isSuccess) {
       setFailCount(0)
-      setAuthNeeded(false)
     } else if (statusQ.isError && statusQ.errorUpdatedAt !== lastUpdated.current) {
       lastUpdated.current = statusQ.errorUpdatedAt
       setFailCount((c) => c + 1)
-      if (statusQ.error instanceof ApiError && statusQ.error.status === 401) setAuthNeeded(true)
     }
   }, [statusQ.isSuccess, statusQ.isError, statusQ.dataUpdatedAt, statusQ.errorUpdatedAt])
 
   const online = statusQ.isSuccess
   // A 401 isn't a lost connection — the daemon is up but (LAN-exposed) wants an API
   // key. Show the key prompt instead of the misleading "lost connection" overlay.
-  const needsAuth = authNeeded
-  const unreachable = !needsAuth && failCount >= 3
+  const needsAuth = statusQ.isError && statusQ.error instanceof ApiError && statusQ.error.status === 401
+
+  // Latch the auth prompt once we've seen a 401, and keep it up until a poll finally
+  // SUCCEEDS. Without this, a flaky LAN link (common on the remote machine where you're
+  // pasting the key) flips an occasional poll from 401 → generic network error, which
+  // would tear the dialog down, swap in the "lost connection" overlay, and wipe the
+  // half-typed key. Sticky mount = the input keeps its value + focus while you type.
+  const [authLatched, setAuthLatched] = useState(false)
+  useEffect(() => {
+    if (needsAuth) setAuthLatched(true)
+    else if (statusQ.isSuccess) setAuthLatched(false)
+  }, [needsAuth, statusQ.isSuccess])
+
+  // While the key prompt is up, the "lost connection" overlay must yield to it.
+  const unreachable = !authLatched && !needsAuth && failCount >= 3
   const version = statusQ.data?.version ? `v${statusQ.data.version}` : 'v0.0.0-dev'
 
   return (
@@ -73,20 +77,30 @@ export function App() {
       <Shell status={statusQ.data} online={online} version={version}>
         <Suspense fallback={<ScreenFallback />}>
           <Routes>
-            <Route path="/chat" element={<ChatScreen />} />
+            <Route path="/workspace" element={<Navigate to="/workspace/chat" replace />} />
+            <Route path="/workspace/chat" element={<WorkspaceScreen />} />
+            <Route path="/workspace/chat/:convId" element={<WorkspaceScreen />} />
+            {/* Back-compat: the old Workspace → Agent tab is gone; land on Chat instead. */}
+            <Route path="/workspace/agent" element={<Navigate to="/workspace/chat" replace />} />
+            <Route path="/workspace/agent/:convId" element={<Navigate to="/workspace/chat" replace />} />
+            {/* Back-compat: /chat → Workspace; /chat/:convId stays a standalone view
+                so existing LAN share links (baked as /chat/<id>) keep working. */}
+            <Route path="/chat" element={<Navigate to="/workspace/chat" replace />} />
             <Route path="/chat/:convId" element={<ChatScreen />} />
-            <Route path="/agents" element={<AgentsScreen />} />
-            <Route path="/agents/:id" element={<AgentsScreen />} />
+            {/* Skills: managed from within Customize; this route is just the create/edit page. */}
+            <Route path="/skills/:skillId" element={<SkillEditPage />} />
+            {/* Agents: managed from within Customize; this route is just the create/edit page. */}
+            <Route path="/agents/:agentId" element={<AgentEditPage />} />
             <Route path="/models" element={<ModelsScreen />} />
             <Route path="/engines" element={<EnginesScreen />} />
             <Route path="/developer" element={<DeveloperScreen />} />
             <Route path="/customize" element={<CustomizeScreen />} />
             <Route path="/settings" element={<SettingsScreen />} />
-            <Route path="*" element={<Navigate to="/chat" replace />} />
+            <Route path="*" element={<Navigate to="/workspace/chat" replace />} />
           </Routes>
         </Suspense>
       </Shell>
-      {needsAuth && (
+      {authLatched && (
         <AuthGate
           onConnect={(key) => {
             setAuthToken(key)

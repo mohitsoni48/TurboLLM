@@ -48,11 +48,11 @@ export function useConversationMutations() {
 
   return {
     create: useMutation({
-      mutationFn: (p?: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'modelKey' | 'toolPolicy'>>) => createConversation(p),
+      mutationFn: (p?: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'modelKey' | 'toolPolicy' | 'skillIds' | 'allowedTools'>>) => createConversation(p),
       onSuccess: invalidateList,
     }),
 update: useMutation({
-      mutationFn: (v: { id: string } & Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'sampling'>>) => updateConversation(v.id, v),
+      mutationFn: (v: { id: string } & Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'sampling' | 'skillIds'>>) => updateConversation(v.id, v),
       onSuccess: (_d, v) => { invalidateList(); invalidateDetail(v.id) },
     }),
     remove: useMutation({

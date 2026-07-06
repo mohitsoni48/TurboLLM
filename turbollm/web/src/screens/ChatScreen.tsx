@@ -4,12 +4,15 @@ import { ArrowDown, Brain, Copy, Download, Paperclip, SendHorizontal, Share2, Sl
 import { continueConversation, fetchSysInfo, sendMessage } from '../lib/chat-api'
 import { extractPdfText } from '../lib/pdf-extract'
 import { useConversation, useConversationMutations } from '../lib/chat-queries'
-import { useModelActions, useModels, useStatus } from '../lib/queries'
+import { useBuiltinAgentOverrides, useChatAgents, useModelActions, useModels, useStatus } from '../lib/queries'
 import type { ChatSseEvent, LiveToolCall, Message } from '../lib/chat-types'
+import { appendTextDelta, upsertToolCall, type LiveBlock } from '../lib/live-timeline'
 import { ApiError, downloadChatExport, getDebugSnapshot, getShareUrl, importChat } from '../lib/api'
 import { Button } from '../components/ui/button'
 import { toast } from '../components/ui/sonner'
-import { useQueryClient } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { skillKeys, fetchSkills } from '../lib/agent-api'
+import { cn } from '../lib/utils'
 import { MessageBubble, StreamingBubble } from './chat/MessageBubble'
 import { ToolApprovalBar } from './chat/ToolApprovalBar'
 import { ContextMeter } from './chat/ContextMeter'
@@ -19,9 +22,8 @@ import { ModelDetailDialog } from './models/ModelDetailDialog'
 import { ConversationSettingsDialog } from './chat/ConversationSettingsDialog'
 import { useUiStore } from '../stores/ui'
 import {
-  PERSONAS, buildSystemPrompt, getConvPersonaId, getDefaultPersonaId,
-  getPersonalization, setConvPersonaId,
-  type PersonaId,
+  buildSystemPrompt, getConvAgentId, getDefaultAgentId,
+  getPersonalization, resolveAgents, setConvAgentId,
 } from '../lib/personas'
 
 // Sidebar width — persisted like DiscoverTab's list/detail split, an in-flow flex-basis
@@ -49,7 +51,7 @@ interface LiveState {
   progress: { phase: string; pct: number; tps: number } | null
   liveGenTps: number  // rolling 2s window estimate during generation phase
   genTokens: number   // running count of generated tokens (content + reasoning) for this reply
-  toolCalls: LiveToolCall[]
+  timeline: LiveBlock[]
 }
 
 export function ChatScreen() {
@@ -99,8 +101,14 @@ export function ChatScreen() {
     setThinkingEnabledState(val)
   }
 
-  // Persona — per-conversation, defaults to the global default from Settings.
-  const [selectedPersonaId, setSelectedPersonaId] = useState<PersonaId>(() => getDefaultPersonaId())
+  // Agent — per-conversation, defaults to the default set in Customize → Agents.
+  // A plain string: besides the fixed built-in ids, a custom agent's id is an
+  // arbitrary server-issued one, resolved against `allAgents` below.
+  const [selectedPersonaId, setSelectedPersonaId] = useState<string>(() => getDefaultAgentId())
+  const customAgentsQ = useChatAgents()
+  const builtinOverridesQ = useBuiltinAgentOverrides()
+  const allAgents = resolveAgents(customAgentsQ.data ?? [], builtinOverridesQ.data ?? {})
+  const selectedAgent = allAgents.find((a) => a.id === selectedPersonaId)
   const abortRef = useRef<AbortController | null>(null)
   const deltaTimestamps = useRef<number[]>([])
   const scrollerRef = useRef<HTMLDivElement>(null)
@@ -116,6 +124,39 @@ export function ChatScreen() {
   const convQ = useConversation(activeId)
   const conv = convQ.data
   const messages = conv?.messages ?? []
+
+  // Skills enabled before a conversation exists yet (first message hasn't been sent).
+  // Once activeId exists, conv.skillIds is the source of truth instead.
+  const [pendingSkillIds, setPendingSkillIds] = useState<string[]>([])
+  const enabledSkillIds = conv?.skillIds ?? pendingSkillIds
+
+  // '/' picker: typing '/' (optionally followed by letters, at the START of an
+  // otherwise-empty composer) shows a filtered skill list. Selecting one enables
+  // that skill for the conversation and clears the token.
+  const skillsQ = useQuery({ queryKey: skillKeys.list(), queryFn: fetchSkills, staleTime: 30_000 })
+  const CHAT_UNSUPPORTED_SKILLS = new Set(['filesystem'])
+  const pickableSkills = (skillsQ.data ?? []).filter((s) => !CHAT_UNSUPPORTED_SKILLS.has(s.id))
+  const skillPickerMatch = /^\/([a-z0-9-]*)$/i.exec(input)
+  const skillPickerQuery = skillPickerMatch?.[1]?.toLowerCase() ?? ''
+  const filteredSkills = skillPickerMatch
+    ? pickableSkills.filter((s) => !skillPickerQuery || s.id.includes(skillPickerQuery) || s.name.toLowerCase().includes(skillPickerQuery))
+    : []
+  const skillPickerOpen = !!skillPickerMatch && filteredSkills.length > 0 && !live
+  const [skillPickerIndex, setSkillPickerIndex] = useState(0)
+  useEffect(() => { setSkillPickerIndex(0) }, [skillPickerQuery, skillPickerOpen])
+
+  const selectSkill = (skill: { id: string; name: string }) => {
+    setInput(`/${skill.id} `)
+    setTimeout(autoResize, 0)
+    if (activeId) {
+      const next = Array.from(new Set([...enabledSkillIds, skill.id]))
+      mut.update.mutate({ id: activeId, skillIds: next })
+    } else {
+      setPendingSkillIds((prev) => Array.from(new Set([...prev, skill.id])))
+    }
+    toast.success(`Skill enabled: ${skill.name}`)
+    setTimeout(() => inputRef.current?.focus(), 0)
+  }
 
   // Open a conversation another screen handed off (e.g. Launch Expert in Settings).
   const pendingConversationId = useUiStore((s) => s.pendingConversationId)
@@ -296,7 +337,7 @@ export function ChatScreen() {
     setActiveId(null)
     setInput('')
     setLive(null)
-    setSelectedPersonaId(getDefaultPersonaId())
+    setSelectedPersonaId(getDefaultAgentId())
     inputRef.current?.focus()
   }
 
@@ -304,7 +345,7 @@ export function ChatScreen() {
     if (live) { abortRef.current?.abort(); setLive(null) }
     setActiveId(id)
     setEditingId(null)
-    setSelectedPersonaId(getConvPersonaId(id))
+    setSelectedPersonaId(getConvAgentId(id))
     userScrolledUp.current = false
     setTimeout(() => scrollToBottom(true), 50)
   }
@@ -317,7 +358,7 @@ export function ChatScreen() {
     setActiveId(null)
     setEditingId(null)
     setInput('')
-    setSelectedPersonaId(getDefaultPersonaId())
+    setSelectedPersonaId(getDefaultAgentId())
   }
 
   const handleStop = async () => {
@@ -360,7 +401,7 @@ export function ChatScreen() {
       for await (const evt of gen) {
         if (evt.event === 'meta') {
           deltaTimestamps.current = []
-          setLive({ assistantId: evt.data.assistantMessageId, content: '', reasoning: '', progress: null, liveGenTps: 0, genTokens: 0, toolCalls: [] })
+          setLive({ assistantId: evt.data.assistantMessageId, content: '', reasoning: '', progress: null, liveGenTps: 0, genTokens: 0, timeline: [] })
           // Optimistically reflect the new/last user msg in the UI by invalidating
           void qc.invalidateQueries({ queryKey: ['conversation', convId] })
         } else if (evt.event === 'progress') {
@@ -371,18 +412,13 @@ export function ChatScreen() {
           setLive((l) => l ? { ...l, reasoning: l.reasoning + evt.data.delta, progress: null, liveGenTps: liveTps, genTokens: l.genTokens + 1 } : l)
         } else if (evt.event === 'delta') {
           const liveTps = pushGenToken()
-          setLive((l) => l ? { ...l, content: l.content + evt.data.delta, progress: null, liveGenTps: liveTps, genTokens: l.genTokens + 1 } : l)
+          setLive((l) => l ? { ...l, content: l.content + evt.data.delta, timeline: appendTextDelta(l.timeline, evt.data.delta), progress: null, liveGenTps: liveTps, genTokens: l.genTokens + 1 } : l)
         } else if (evt.event === 'tool_call') {
           const tc = evt.data
           setLive((l) => {
             if (!l) return l
-            const existing = l.toolCalls.findIndex((x) => x.id === tc.id)
-            if (existing >= 0) {
-              const updated = [...l.toolCalls]
-              updated[existing] = { ...updated[existing], status: tc.status, result: tc.result }
-              return { ...l, toolCalls: updated }
-            }
-            return { ...l, toolCalls: [...l.toolCalls, { id: tc.id, name: tc.name, args: tc.args, status: tc.status, result: tc.result }] }
+            const call: LiveToolCall = { id: tc.id, name: tc.name, args: tc.args, status: tc.status, result: tc.result }
+            return { ...l, timeline: upsertToolCall(l.timeline, call) }
           })
         } else if (evt.event === 'done') {
           setLive(null)
@@ -408,9 +444,17 @@ export function ChatScreen() {
   }
 
   const send = async (overrideInput?: string) => {
-    const text = (overrideInput ?? input).trim()
-    if ((!text && attachments.length === 0) || live) return
+    const rawText = (overrideInput ?? input).trim()
+    if ((!rawText && attachments.length === 0) || live) return
     if (engineState !== 'running' || !model) { toast.error('Load a model first.'); return }
+
+    // A message that starts with '/skill-id' enables that skill for this send — no matter
+    // how the token got there (picker click, Tab-complete, or just typed/pasted) — and the
+    // literal token is stripped before it reaches the model (the skill's own instructions
+    // may define a different natural-language trigger, e.g. "wan <url>" not "/wan <url>").
+    const skillMatch = /^\/([a-z0-9-]+)(?:\s+([\s\S]*))?$/.exec(rawText)
+    const matchedSkill = skillMatch ? pickableSkills.find((s) => s.id === skillMatch[1]) : undefined
+    const text = matchedSkill ? (skillMatch?.[2] ?? '').trim() : rawText
 
     // Discriminate by file.type (authoritative, same as the preview thumbnail below) rather
     // than sniffing the extracted dataUrl content — a text/PDF attachment whose content
@@ -426,10 +470,11 @@ export function ChatScreen() {
     userScrolledUp.current = false
 
     try {
-      // Create conversation on first message, baking in the selected persona + personalization.
+      // Create conversation on first message, baking in the selected agent + personalization.
       let convId = activeId
       if (!convId) {
-        let sp = buildSystemPrompt(selectedPersonaId, getPersonalization())
+        const resolved = allAgents.find((a) => a.id === selectedPersonaId)
+        let sp = buildSystemPrompt(selectedPersonaId, resolved?.systemPrompt ?? '', getPersonalization())
         if (selectedPersonaId === 'expert') {
           try {
             const sys = await fetchSysInfo()
@@ -440,15 +485,28 @@ export function ChatScreen() {
             sp = sp ? `${sp}\n\n${hwSection}` : hwSection
           } catch { /* non-fatal — proceed without hardware info */ }
         }
+        const initialSkillIds = Array.from(new Set([
+          ...pendingSkillIds,
+          ...(resolved?.skillIds ?? []),
+          ...(matchedSkill ? [matchedSkill.id] : []),
+        ]))
         const newConv = await mut.create.mutateAsync({
           modelKey: model.key,
           systemPrompt: sp || undefined,
           toolPolicy: selectedPersonaId === 'research' ? 'force_web_search' : undefined,
+          skillIds: initialSkillIds.length ? initialSkillIds : undefined,
+          allowedTools: resolved?.tools?.length ? resolved.tools : undefined,
         })
         convId = newConv.id
-        setConvPersonaId(convId, selectedPersonaId)
+        setConvAgentId(convId, selectedPersonaId)
         setActiveId(convId)
+        setPendingSkillIds([])
+      } else if (matchedSkill && !enabledSkillIds.includes(matchedSkill.id)) {
+        // Existing conversation missing this skill — enable it before sending so the
+        // system-prompt injection picks it up on this very turn, not the next one.
+        await mut.update.mutateAsync({ id: convId, skillIds: Array.from(new Set([...enabledSkillIds, matchedSkill.id])) })
       }
+      if (matchedSkill) toast.success(`Using skill: ${matchedSkill.name}`)
 
       const ac = new AbortController()
       abortRef.current = ac
@@ -506,7 +564,9 @@ export function ChatScreen() {
   const ready = engineState === 'running' && !!model
 
   // At most one tool call awaits interactive approval at a time (the tool loop is sequential).
-  const pendingApproval = live?.toolCalls.find((tc) => tc.status === 'awaiting_approval')
+  // Read from the timeline — the actual live-updated source — not a separate tracked array.
+  const pendingApprovalBlock = live?.timeline.find((b) => b.kind === 'tool' && b.call.status === 'awaiting_approval')
+  const pendingApproval = pendingApprovalBlock?.kind === 'tool' ? pendingApprovalBlock.call : undefined
 
   return (
     <div className="flex h-full overflow-hidden">
@@ -579,18 +639,15 @@ export function ChatScreen() {
           >
             <Brain size={15} />
           </Button>
-          {activeId && (() => {
-            const p = PERSONAS.find((px) => px.id === selectedPersonaId)
-            return p ? (
-              <span
-                title={p.description}
-                className="inline-flex items-center gap-1 rounded-full border border-border px-2 py-0.5 text-[11px] text-muted select-none"
-              >
-                <UserRound size={11} />
-                {p.name}
-              </span>
-            ) : null
-          })()}
+          {activeId && selectedAgent && (
+            <span
+              title={selectedAgent.description}
+              className="inline-flex items-center gap-1 rounded-full border border-border px-2 py-0.5 text-[11px] text-muted select-none"
+            >
+              <UserRound size={11} />
+              {selectedAgent.name}
+            </span>
+          )}
           {engineState === 'starting' && <span className="text-[12px] text-muted">Loading model…</span>}
           {engineState === 'stopping' && <span className="text-[12px] text-muted">Ejecting…</span>}
           {ready && (
@@ -681,7 +738,7 @@ export function ChatScreen() {
                 {model ? (
                   <>
                     <p className="text-[15px] font-medium text-ink">{model.name}</p>
-                    <PersonaPicker selected={selectedPersonaId} onChange={setSelectedPersonaId} />
+                    <AgentPicker selected={selectedPersonaId} onChange={setSelectedPersonaId} agents={allAgents} />
                     <div className="flex flex-wrap justify-center gap-2">
                       {['Explain something to me', 'Help me write', 'Review this code'].map((s) => (
                         <button
@@ -718,7 +775,7 @@ export function ChatScreen() {
 
             {/* Streaming bubble */}
             {live && (
-              <StreamingBubble content={live.content} reasoning={live.reasoning} progress={live.progress} liveGenTps={live.liveGenTps} genTokens={live.genTokens} toolCalls={live.toolCalls} />
+              <StreamingBubble timeline={live.timeline} reasoning={live.reasoning} progress={live.progress} liveGenTps={live.liveGenTps} genTokens={live.genTokens} />
             )}
 
             <div ref={bottomRef} />
@@ -765,7 +822,26 @@ export function ChatScreen() {
 
         {/* Composer area (always visible; disabled when no model; hidden in readonly) */}
         {readonly ? null : <div className="px-8 pb-5">
-          <div className="w-full">
+          <div className="relative w-full">
+            {/* '/' skill picker */}
+            {skillPickerOpen && (
+              <div className="absolute bottom-full left-0 mb-2 w-full max-w-sm overflow-hidden rounded-lg border border-border bg-panel shadow-[var(--shadow-2)]">
+                {filteredSkills.map((s, i) => (
+                  <button
+                    key={s.id}
+                    type="button"
+                    onClick={() => selectSkill(s)}
+                    className={cn(
+                      'flex w-full flex-col items-start gap-0.5 px-3 py-2 text-left text-[13px]',
+                      i === skillPickerIndex ? 'bg-panel-2' : 'hover:bg-panel-2',
+                    )}
+                  >
+                    <span className="text-ink">/{s.id}{enabledSkillIds.includes(s.id) ? ' · already on' : ''}</span>
+                    {s.description && <span className="text-[12px] text-muted">{s.description}</span>}
+                  </button>
+                ))}
+              </div>
+            )}
             <div className="rounded-[var(--radius-lg)] border border-border bg-panel shadow-[var(--shadow-2)] focus-within:border-[color:var(--accent)]">
               {/* Attachment previews */}
               {attachments.length > 0 && (
@@ -811,6 +887,21 @@ export function ChatScreen() {
                   disabled={!ready || !!live || !!editingId}
                   onChange={(e) => { setInput(e.target.value); autoResize() }}
                   onKeyDown={(e) => {
+                    if (skillPickerOpen) {
+                      if (e.key === 'ArrowDown') { e.preventDefault(); setSkillPickerIndex((i) => Math.min(i + 1, filteredSkills.length - 1)); return }
+                      if (e.key === 'ArrowUp') { e.preventDefault(); setSkillPickerIndex((i) => Math.max(i - 1, 0)); return }
+                      if (e.key === 'Tab') {
+                        // Tab-complete only: fill in the matched skill's name, don't enable it yet
+                        // (Enter still does that, now unambiguous once the text is a full match).
+                        e.preventDefault()
+                        const s = filteredSkills[Math.min(skillPickerIndex, filteredSkills.length - 1)]
+                        setInput(`/${s.id}`)
+                        setTimeout(autoResize, 0)
+                        return
+                      }
+                      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); selectSkill(filteredSkills[Math.min(skillPickerIndex, filteredSkills.length - 1)]); return }
+                      if (e.key === 'Escape') { e.preventDefault(); setInput(''); return }
+                    }
                     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void send() }
                     if (e.key === 'ArrowUp' && !input && !live) {
                       const lastUser = messages.findLast((m) => m.role === 'user')
@@ -893,20 +984,23 @@ function SidebarResizeHandle({
   )
 }
 
-// ── Persona picker ─────────────────────────────────────────────────────────────
+// ── Agent picker ───────────────────────────────────────────────────────────────
 
-function PersonaPicker({ selected, onChange }: { selected: PersonaId; onChange: (id: PersonaId) => void }) {
+function AgentPicker({ selected, onChange, agents }: {
+  selected: string; onChange: (id: string) => void
+  agents: Array<{ id: string; name: string; description: string }>
+}) {
   return (
     <div className="flex flex-col items-center gap-1.5">
-      <p className="text-[11px] uppercase tracking-wide text-faint">Persona</p>
+      <p className="text-[11px] uppercase tracking-wide text-faint">Agent</p>
       <select
         value={selected}
-        onChange={(e) => onChange(e.target.value as PersonaId)}
+        onChange={(e) => onChange(e.target.value)}
         className="rounded-md border border-border bg-bg px-2 py-1.5 text-[13px] text-ink outline-none"
       >
-        {PERSONAS.map((p) => (
-          <option key={p.id} value={p.id}>
-            {p.name} — {p.description}
+        {agents.map((a) => (
+          <option key={a.id} value={a.id}>
+            {a.name} — {a.description}
           </option>
         ))}
       </select>

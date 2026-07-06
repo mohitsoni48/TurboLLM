@@ -1,3 +1,4 @@
+import { hideChildConsoleWindows } from './util/hide-console-windows'
 import { spawn } from 'node:child_process'
 import { openSync, readFileSync } from 'node:fs'
 import { serve } from '@hono/node-server'
@@ -27,13 +28,19 @@ import { BenchRunner } from './bench/bench'
 import { ModelRouter } from './gateway/model-router'
 import { ToolRegistry } from './tools/tool-registry'
 import { GenerationGate } from './agents/gate'
-import { AgentRunner } from './agents/runner'
+import { AgentTaskState } from './agents/task-state'
 import { launchCli } from './cli-launch'
 import { writePidfile, removePidfile, stopDaemon, resolveDaemonPort } from './daemon-pid'
 import { createApp } from './server'
 import { provisionTunnelApiKey } from './auth'
 import { TunnelManager, reapStaleTunnels, killTrackedTunnelsSync } from './tunnel/manager'
 import type { Deps } from './deps'
+
+// Stop child processes (the agent engine's shell tool, engine binaries, git,
+// etc.) from flashing a console window on Windows when the daemon has no console
+// of its own. Must run before anything spawns — patches the shared low-level
+// spawn path, so it covers the external pi SDK's named spawn import too.
+hideChildConsoleWindows()
 
 // Entrypoint for the TurboLLM daemon (npm bin "turbollm"): wiring + graceful
 // shutdown. ADR-023 (Node/TS stack).
@@ -247,8 +254,7 @@ const appUpdates = new AppUpdateChecker(version)
 // `requestRestart` is attached after the server is created (it must close over it).
 const deps: Deps = { store, registry, manager, scanner, hashes, db, provision, build, updates, appUpdates, hf, downloads, bench, modelRouter, comfy, tools: toolRegistry, version, startedAt }
 deps.gate = new GenerationGate()
-deps.agentRunner = new AgentRunner(deps)
-deps.agentRunner.reconcileOnStartup()
+deps.agentTasks = new AgentTaskState()
 // Cloud Launch (ADR-045/152): only wired when --tunnel is passed. Its mere presence
 // on Deps is what forces auth enforcement on tunneled traffic (see auth.ts lanAuth) —
 // absent entirely for the vast majority of runs that never asked for a tunnel.

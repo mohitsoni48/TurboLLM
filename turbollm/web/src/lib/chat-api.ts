@@ -24,16 +24,15 @@ export function listConversations(q?: string): Promise<{ conversations: Conversa
   return req(`/api/v1/conversations${q ? `?q=${encodeURIComponent(q)}` : ''}`)
 }
 
-export function createConversation(partial?: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'modelKey' | 'toolPolicy'>>): Promise<Conversation> {
+export function createConversation(partial?: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'modelKey' | 'toolPolicy' | 'skillIds' | 'allowedTools'>>): Promise<Conversation> {
   return req('/api/v1/conversations', { method: 'POST', json: partial ?? {} })
 }
-
 
 export function getConversation(id: string): Promise<Conversation> {
   return req(`/api/v1/conversations/${encodeURIComponent(id)}`)
 }
 
-export function updateConversation(id: string, patch: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'sampling'>>): Promise<Conversation> {
+export function updateConversation(id: string, patch: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'sampling' | 'skillIds'>>): Promise<Conversation> {
   return req(`/api/v1/conversations/${encodeURIComponent(id)}`, { method: 'PATCH', json: patch })
 }
 

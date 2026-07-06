@@ -25,6 +25,40 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.7.3] - 2026-07-06
+
+**The standalone Agents screen is retired — replaced by a shared Skills library used directly in chat, plus a new Agents tab in Customize for editing personas and building your own.**
+
+### Added
+- **Skills.** A shared library of reusable instructions (Claude-style SKILL.md format) any
+  conversation can enable — via the `/` picker in the composer (Tab-complete included) or a
+  conversation's settings. Manage the library from Customize → Skills: upload a SKILL.md
+  directly, or have TurboLLM learn one from a folder of docs or distill one from an existing
+  conversation's transcript.
+- **Agents in Customize.** A new Agents tab (alongside Skills and MCP Servers) lets you edit any
+  built-in persona's system prompt, skills, and tool access in place — with a Reset button to
+  restore the original — or create your own custom agent from scratch. Each agent gets a name,
+  description, system prompt, and checklists for which shared skills and which tools it may use
+  (everything on by default). MCP tools are grouped by server with one toggle to select or
+  deselect all of a server's tools at once, or expand to pick individually.
+- **Two new built-in agents.** **Lite** strips the hidden system prompt to the bare minimum for the
+  fastest possible responses (every tool still available); **Code** is tuned for precise, idiomatic
+  code with minimal narration.
+
+### Removed
+- **The standalone Agents screen** (background tasks running separately from chat) is gone. It's
+  replaced by Skills used directly inside chat — the same idea, giving the model reusable extra
+  capabilities, without a separate surface to launch into, reconnect to, or lose track of.
+
+### Discord
+- New: Skills — a shared library of reusable instructions you enable per chat with `/`, manage in
+  Customize, upload, or have TurboLLM learn from a folder or an existing conversation.
+- New: Customize → Agents — edit any built-in agent's prompt/skills/tools in place, or create your
+  own from scratch, with a Reset button on the built-ins.
+- New: Lite (fastest, bare-bones prompt) and Code (coding-focused) agents.
+- Changed: the old standalone Agents screen (background tasks) is retired in favor of Skills in
+  chat.
+
 ## [1.7.2] - 2026-07-06
 
 **MTP / speculative-decoding models load and run correctly, the Windows install crash is fixed, and auto-tune now respects your MTP setting.**

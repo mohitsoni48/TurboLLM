@@ -4,6 +4,7 @@ import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
 import { CheckCircle2, ChevronDown, ChevronRight, FileText, HelpCircle, Loader2, Pencil, RefreshCw, Trash2, XCircle } from 'lucide-react'
 import type { ClaimVerdict, LiveToolCall, Message, MessageStats, ResearchMeta, ResearchSource, ToolCallRecord } from '../../lib/chat-types'
+import type { LiveBlock } from '../../lib/live-timeline'
 import { Button } from '../../components/ui/button'
 import { CopyButton } from '../../components/ui/copy-button'
 import { ArtifactCard, isArtifactLang } from '../../components/ArtifactCard'
@@ -217,6 +218,61 @@ function ToolCallsPanel({ calls }: { calls: CardCall[] }) {
   )
 }
 
+// ── Live inline tool step (streaming) ─────────────────────────────────────────
+
+/** Re-renders every second while `active`, so a long step never looks frozen. */
+function useElapsedSeconds(active: boolean): number {
+  const [, tick] = useState(0)
+  const start = useRef<number | null>(null)
+  useEffect(() => {
+    if (!active) { start.current = null; return }
+    start.current = Date.now()
+    const t = setInterval(() => tick((n) => n + 1), 1000)
+    return () => clearInterval(t)
+  }, [active])
+  if (!active || start.current == null) return 0
+  return Math.floor((Date.now() - start.current) / 1000)
+}
+
+/** One tool call rendered inline in the streaming flow, with a live spinner +
+ *  elapsed timer while it runs and an expandable result once it settles. */
+function InlineToolStep({ call }: { call: LiveToolCall }) {
+  const [expanded, setExpanded] = useState(false)
+  const pending = call.status === 'pending'
+  const hasOutput = !!call.result?.length
+  const elapsed = useElapsedSeconds(pending)
+  return (
+    <div className="my-1.5 overflow-hidden rounded-lg border border-border bg-panel-2">
+      <button
+        type="button"
+        onClick={() => hasOutput && setExpanded((e) => !e)}
+        className="flex w-full items-center gap-2 px-3 py-1.5 text-left"
+        style={{ cursor: hasOutput ? 'pointer' : 'default' }}
+      >
+        {pending && <Loader2 size={13} className="shrink-0 animate-spin" style={{ color: 'var(--accent)' }} />}
+        {call.status === 'done'  && <CheckCircle2 size={13} className="shrink-0" style={{ color: '#4ade80' }} />}
+        {call.status === 'error' && <XCircle size={13} className="shrink-0" style={{ color: 'var(--err)' }} />}
+        <span className="font-mono text-[12px] font-medium text-ink">{friendlyName(call.name)}</span>
+        <span className="text-[11px]" style={{ color: pending ? 'var(--accent)' : 'var(--faint)' }}>
+          {pending ? 'running…' : call.status === 'error' ? 'error' : 'done'}
+        </span>
+        {pending && elapsed > 0 && <span className="text-[11px] text-faint">· {elapsed}s</span>}
+        {hasOutput && (
+          <ChevronDown
+            size={11}
+            className={`ml-auto shrink-0 text-faint transition-transform ${expanded ? 'rotate-180' : ''}`}
+          />
+        )}
+      </button>
+      {expanded && call.result && (
+        <pre className="max-h-48 overflow-auto border-t border-border px-3 pb-3 pt-2 font-mono text-[11px] leading-relaxed text-muted whitespace-pre-wrap">
+          {call.result.length > 2000 ? `${call.result.slice(0, 2000)}\n…(truncated)` : call.result}
+        </pre>
+      )}
+    </div>
+  )
+}
+
 // ── F-021: Confidence badge ───────────────────────────────────────────────────
 
 function ConfidenceBadge({ confidence }: { confidence: number }) {
@@ -355,40 +411,43 @@ function AnnotatedReply({ content, verdicts }: { content: string; verdicts: Clai
 // ── Streaming message (in-progress) ──────────────────────────────────────────
 
 export function StreamingBubble({
-  content,
+  timeline,
   reasoning,
   progress,
   liveGenTps,
   genTokens,
-  toolCalls = [],
 }: {
-  content: string
+  timeline: LiveBlock[]
   reasoning: string
   progress: { phase: string; pct: number; tps: number } | null
   liveGenTps: number
   genTokens: number
-  toolCalls?: LiveToolCall[]
 }) {
   const isPrefill = !!progress && progress.phase === 'prompt'
+  const hasTool = timeline.some((b) => b.kind === 'tool')
+  const pendingTool = timeline.some((b) => b.kind === 'tool' && b.call.status === 'pending')
+  const generating = liveGenTps > 0
 
   return (
     <div className="flex gap-3">
       <ModelAvatar />
       <div className="min-w-0 flex-1 pt-0.5">
         {reasoning && <ThinkingBlock reasoning={reasoning} streaming />}
-        <ToolCallsPanel calls={toolCalls} />
-        <div className="prose-tllm text-[15px] leading-[1.7] text-ink">
-          {content ? <Markdown streaming>{content}</Markdown> : (
-            <span className="text-muted">
-              {isPrefill ? 'Processing prompt…' : reasoning ? 'Generating…' : toolCalls.length ? 'Working…' : 'Thinking…'}
-            </span>
-          )}
-        </div>
+
+        {/* Interleaved timeline: text the model wrote and tools it ran, in order */}
+        {timeline.map((b, i) =>
+          b.kind === 'text'
+            ? (b.text
+                ? <div key={i} className="prose-tllm text-[15px] leading-[1.7] text-ink"><Markdown streaming>{b.text}</Markdown></div>
+                : null)
+            : <InlineToolStep key={b.call.id} call={b.call} />,
+        )}
 
         {/* Prefill progress bar */}
         {isPrefill && (
           <div className="mt-2 space-y-1">
             <div className="flex items-center gap-1.5 text-[11px] text-faint">
+              <Loader2 size={11} className="animate-spin" style={{ color: 'var(--accent)' }} />
               <span>Processing prompt</span>
               <span className="font-medium" style={{ color: 'var(--ink)' }}>{progress.pct}%</span>
               {progress.tps > 0 && <span>· {progress.tps.toFixed(0)} tok/s prefill</span>}
@@ -402,16 +461,22 @@ export function StreamingBubble({
           </div>
         )}
 
-        {/* Live generation: running token count + tok/s */}
-        {!isPrefill && (content || reasoning) && (
-          <div className="mt-1 flex items-center gap-1.5 text-[11px] text-faint">
-            <span className="tllm-pulse">·</span>
-            {genTokens > 0 && <span className="font-medium" style={{ color: 'var(--ink)' }}>{genTokens} tok</span>}
-            {liveGenTps > 0
-              ? <span>· {liveGenTps.toFixed(1)} tok/s</span>
-              : genTokens === 0 && <span>…</span>
-            }
-          </div>
+        {/* Always-on activity line — guarantees the bubble never looks hung.
+            While a tool is running its inline step shows the spinner, so we only
+            need a foot line for active generation and the gaps between steps. */}
+        {!isPrefill && !pendingTool && (
+          generating ? (
+            <div className="mt-1 flex items-center gap-1.5 text-[11px] text-faint">
+              <span className="tllm-pulse">·</span>
+              {genTokens > 0 && <span className="font-medium" style={{ color: 'var(--ink)' }}>{genTokens} tok</span>}
+              <span>· {liveGenTps.toFixed(1)} tok/s</span>
+            </div>
+          ) : (
+            <div className="mt-1.5 flex items-center gap-1.5 text-[11px]" style={{ color: 'var(--accent)' }}>
+              <Loader2 size={12} className="animate-spin" />
+              <span>{hasTool ? 'Working…' : reasoning ? 'Generating…' : 'Thinking…'}</span>
+            </div>
+          )
         )}
       </div>
     </div>

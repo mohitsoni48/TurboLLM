@@ -26,6 +26,23 @@ export interface Conversation {
    *  absence of a key means "fall through to the global toolPolicies default".
    *  Always populated (defaults to {}) when read via rowToConv/getConversation. */
   toolOverrides?: Record<string, 'allow' | 'deny'>
+  /** When set, this chat is bound to an Agent (spec 13 redesign): its system prompt,
+   *  granted tools, and folder scope come from the agent. Null = a plain chat. */
+  agentId?: string
+  /** Set when the user marks the task complete (spec 13 redesign §2). Null = in progress. */
+  completedAt?: string
+  /** Per-conversation read scope (spec 13 redesign): absolute file/folder paths the bound
+   *  agent may read. Read access is chat-bound (attached via the picker), not agent-bound. */
+  readScope?: string[]
+  /** pi permission mode for this agent conversation: 'ask'|'auto'|'bypass'|'read'. */
+  agentMode?: string
+  /** Skill ids enabled for this conversation (the shared SKILL.md library). Their
+   *  instructions are injected into the system prompt; 'skill-creator' additionally
+   *  grants the save_skill tool. Undefined/empty = a plain chat with no skills. */
+  skillIds?: string[]
+  /** Tool-name allow-list baked in from a custom chat Agent at creation (Customize →
+   *  Agents). Undefined/empty = unrestricted (every built-in persona). */
+  allowedTools?: string[]
   createdAt: string
   updatedAt: string
   messages?: Message[]
@@ -41,6 +58,28 @@ export interface Folder {
   updatedAt: string
 }
 
+/** One per-agent lesson distilled by the reviewer (spec 13 redesign §3, Reflexion). */
+export interface AgentLesson {
+  id: string
+  agentId: string
+  lesson: string
+  evidence?: string
+  convId?: string
+  createdAt: string
+}
+
+/** One per-agent skill grown from experience or a folder (spec 13 redesign §3.3, Voyager). */
+export interface AgentSkill {
+  id: string
+  agentId: string
+  name: string
+  description: string
+  procedure: string
+  /** Where it came from: 'conversation' | 'folder' | 'manual'. */
+  source?: string
+  createdAt: string
+}
+
 /** A background agent run record (v8 migration). */
 export interface AgentRun {
   id: string
@@ -48,11 +87,35 @@ export interface AgentRun {
   title: string
   status: 'queued' | 'running' | 'done' | 'failed' | 'cancelled' | 'interrupted'
   allowedTools: string[]
+  agentId?: string
   error?: string
   createdAt: string
   updatedAt: string
   startedAt?: string
   endedAt?: string
+  /** Set when the contract is archived (completed). Null = active. */
+  archivedAt?: string
+  /** User disposition outcome: 'complete' | 'miss' | undefined (in-flight). */
+  completion?: 'complete' | 'miss'
+}
+
+/** One per-Hitman track-record row (spec 13 §12.3). */
+export interface TrackRecordRow {
+  id: string
+  agentId: string
+  runId: string
+  model: string
+  outcome: 'complete' | 'miss'
+  feedback?: string
+  ranAt: string
+}
+
+/** Per-model aggregation for a Hitman (spec 13 §12.3). */
+export interface ModelStat {
+  model: string
+  total: number
+  complete: number
+  successRate: number
 }
 
 export interface MessageStats {
@@ -125,8 +188,8 @@ export interface Message {
   createdAt: string
 }
 
-interface ConvRow { id: string; title: string; system_prompt: string; model_key: string; sampling: string; expert_mode: number; tool_policy: string | null; kind: string | null; folder_id: string | null; tool_overrides: string | null; created_at: string; updated_at: string }
-interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null }
+interface ConvRow { id: string; title: string; system_prompt: string; model_key: string; sampling: string; expert_mode: number; tool_policy: string | null; kind: string | null; folder_id: string | null; tool_overrides: string | null; agent_id: string | null; completed_at: string | null; read_scope: string | null; agent_mode: string | null; skill_ids: string | null; allowed_tools: string | null; created_at: string; updated_at: string }
+interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; agent_id: string | null; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null; archived_at: string | null; completion: string | null }
 interface FolderRow { id: string; name: string; sort_order: number; created_at: string; updated_at: string }
 interface MsgRow  { id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string; reasoning: string; attachments: string; text_attachments: string | null; tool_calls: string | null; stats: string; model_key: string | null; research_meta: string | null; created_at: string }
 
@@ -147,7 +210,7 @@ function safeToolOverrides(s: string | null): Record<string, 'allow' | 'deny'> {
 }
 
 function rowToConv(r: ConvRow): Conversation {
-  return { id: r.id, title: r.title, systemPrompt: r.system_prompt, modelKey: r.model_key, sampling: safeJson(r.sampling) as Record<string, unknown>, expertMode: r.expert_mode === 1, toolPolicy: r.tool_policy ?? undefined, kind: (r.kind === 'agent' ? 'agent' : 'chat'), folderId: r.folder_id ?? null, toolOverrides: safeToolOverrides(r.tool_overrides), createdAt: r.created_at, updatedAt: r.updated_at }
+  return { id: r.id, title: r.title, systemPrompt: r.system_prompt, modelKey: r.model_key, sampling: safeJson(r.sampling) as Record<string, unknown>, expertMode: r.expert_mode === 1, toolPolicy: r.tool_policy ?? undefined, kind: (r.kind === 'agent' ? 'agent' : 'chat'), folderId: r.folder_id ?? null, toolOverrides: safeToolOverrides(r.tool_overrides), agentId: r.agent_id ?? undefined, completedAt: r.completed_at ?? undefined, readScope: r.read_scope ? (safeJson(r.read_scope) as string[]) : undefined, agentMode: r.agent_mode ?? undefined, skillIds: r.skill_ids ? (safeJson(r.skill_ids) as string[]) : undefined, allowedTools: r.allowed_tools ? (safeJson(r.allowed_tools) as string[]) : undefined, createdAt: r.created_at, updatedAt: r.updated_at }
 }
 
 function rowToFolder(r: FolderRow): Folder {
@@ -159,9 +222,12 @@ function rowToAgentRun(r: AgentRunRow): AgentRun {
     id: r.id, convId: r.conv_id, title: r.title,
     status: r.status as AgentRun['status'],
     allowedTools: safeJson(r.allowed_tools) as string[],
+    agentId: r.agent_id ?? undefined,
     error: r.error ?? undefined,
     createdAt: r.created_at, updatedAt: r.updated_at,
     startedAt: r.started_at ?? undefined, endedAt: r.ended_at ?? undefined,
+    archivedAt: r.archived_at ?? undefined,
+    completion: (r.completion as AgentRun['completion']) ?? undefined,
   }
 }
 
@@ -179,6 +245,15 @@ export class ConversationStore {
   constructor(dataDir: string) {
     this.db = new DatabaseSync(join(dataDir, 'turbollm.db'))
     this.migrate()
+  }
+
+  /** Whether `table` already has `column` — guards ADD COLUMN migrations that may have
+   *  already run under an earlier version number (this branch's migration ladder has
+   *  been renumbered more than once across its history; a stored user_version can lag
+   *  behind columns a prior run already added). */
+  private hasColumn(table: string, column: string): boolean {
+    const rows = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
+    return rows.some((r) => r.name === column)
   }
 
   private migrate(): void {
@@ -309,6 +384,117 @@ export class ConversationStore {
       this.db.exec("ALTER TABLE conversations ADD COLUMN tool_overrides TEXT")
       this.db.exec("PRAGMA user_version = 11")
     }
+    // v12: agent_runs.agent_id — link runs to the AgentType config.
+    // Additive column; existing rows get NULL (backwards-compatible with pre-agent-id runs).
+    if (v < 12) {
+      this.db.exec(`
+        ALTER TABLE agent_runs ADD COLUMN agent_id TEXT;
+        PRAGMA user_version = 12;
+      `)
+    }
+    // v13 (spec 13 §13): the durable working doc — one current doc per run. Survives
+    // /compact (it is NOT part of the compressible transcript). Cascades on run delete.
+    if (v < 13) {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS agent_run_docs (
+          run_id     TEXT PRIMARY KEY REFERENCES agent_runs(id) ON DELETE CASCADE,
+          content    TEXT NOT NULL DEFAULT '',
+          updated_at TEXT NOT NULL
+        );
+        PRAGMA user_version = 13;
+      `)
+    }
+    // v14 (spec 13 §13): per-Hitman track record — one row per finished contract
+    // (incl. first-try successes). agent_id is a config id (not a DB FK); run_id cascades.
+    if (v < 14) {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS agent_track_record (
+          id          TEXT PRIMARY KEY,
+          agent_id    TEXT NOT NULL,
+          run_id      TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+          model       TEXT NOT NULL,
+          outcome     TEXT NOT NULL,
+          feedback    TEXT,
+          ran_at      TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_track_agent ON agent_track_record(agent_id);
+        PRAGMA user_version = 14;
+      `)
+    }
+    // v15 (spec 13 §13): archive + completion outcome on the run row.
+    if (v < 15) {
+      this.db.exec(`
+        ALTER TABLE agent_runs ADD COLUMN archived_at TEXT;
+        ALTER TABLE agent_runs ADD COLUMN completion TEXT;
+        PRAGMA user_version = 15;
+      `)
+    }
+    // v16 (spec 13 redesign §1): bind a CHAT conversation to an Agent. Null = a plain
+    // chat (no agent, no FS/tools). Additive; existing chats get NULL = unchanged behavior.
+    if (v < 16) {
+      if (!this.hasColumn('conversations', 'agent_id')) this.db.exec(`ALTER TABLE conversations ADD COLUMN agent_id TEXT;`)
+      this.db.exec(`PRAGMA user_version = 16;`)
+    }
+    // v17 (spec 13 redesign §2/§3): completion marker on a conversation + the per-agent
+    // lessons store (Reflexion). completed_at null = in-progress. agent_lessons is keyed by
+    // the config agent id (not a DB FK); pruned when the agent is deleted.
+    if (v < 17) {
+      if (!this.hasColumn('conversations', 'completed_at')) this.db.exec(`ALTER TABLE conversations ADD COLUMN completed_at TEXT;`)
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS agent_lessons (
+          id         TEXT PRIMARY KEY,
+          agent_id   TEXT NOT NULL,
+          lesson     TEXT NOT NULL,
+          evidence   TEXT,
+          conv_id    TEXT,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_lessons_agent ON agent_lessons(agent_id, created_at);
+        PRAGMA user_version = 17;
+      `)
+    }
+    // v18 (spec 13 redesign §3.3): per-agent SKILLS grown from experience (Voyager) — a
+    // distilled name + description + procedure, injected on future runs. Keyed by config
+    // agent id (not a DB FK); pruned on agent delete.
+    if (v < 18) {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS agent_skills (
+          id          TEXT PRIMARY KEY,
+          agent_id    TEXT NOT NULL,
+          name        TEXT NOT NULL,
+          description TEXT NOT NULL DEFAULT '',
+          procedure   TEXT NOT NULL,
+          source      TEXT,
+          created_at  TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_skills_agent ON agent_skills(agent_id, created_at);
+        PRAGMA user_version = 18;
+      `)
+    }
+    // v19 (spec 13 redesign): per-conversation read scope — JSON array of file/folder paths
+    // the bound agent may read. Read access is chat-bound (attached via picker), not agent-bound.
+    if (v < 19) {
+      if (!this.hasColumn('conversations', 'read_scope')) this.db.exec(`ALTER TABLE conversations ADD COLUMN read_scope TEXT;`)
+      this.db.exec(`PRAGMA user_version = 19;`)
+    }
+    // v20: per-conversation pi permission mode ('ask'|'auto'|'bypass'|'read'). Null = 'auto'.
+    if (v < 20) {
+      if (!this.hasColumn('conversations', 'agent_mode')) this.db.exec(`ALTER TABLE conversations ADD COLUMN agent_mode TEXT;`)
+      this.db.exec(`PRAGMA user_version = 20;`)
+    }
+    // v21: skill ids enabled for a conversation (JSON string[]) — the shared SKILL.md
+    // library injected into chat directly, replacing the agent-bound tool/skill picker.
+    if (v < 21) {
+      if (!this.hasColumn('conversations', 'skill_ids')) this.db.exec(`ALTER TABLE conversations ADD COLUMN skill_ids TEXT;`)
+      this.db.exec(`PRAGMA user_version = 21;`)
+    }
+    // v22 (Customize → Agents): tool-name allow-list baked in from a custom chat
+    // Agent at conversation creation (JSON string[]). Null/absent = unrestricted —
+    // built-in personas never set this, preserving today's behavior byte-for-byte.
+    if (v < 22) {
+      if (!this.hasColumn('conversations', 'allowed_tools')) this.db.exec(`ALTER TABLE conversations ADD COLUMN allowed_tools TEXT;`)
+      this.db.exec(`PRAGMA user_version = 22;`)
+    }
   }
 
   listConversations(q?: string, kind: 'chat' | 'agent' | 'all' = 'all'): Conversation[] {
@@ -329,11 +515,11 @@ export class ConversationStore {
     return (this.db.prepare(`SELECT * FROM conversations ORDER BY updated_at DESC LIMIT 200`).all() as unknown as ConvRow[]).map(rowToConv)
   }
 
-  createConversation(partial?: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'modelKey' | 'sampling' | 'expertMode' | 'toolPolicy' | 'kind' | 'folderId'>>): Conversation {
+  createConversation(partial?: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'modelKey' | 'sampling' | 'expertMode' | 'toolPolicy' | 'kind' | 'folderId' | 'agentId' | 'skillIds' | 'allowedTools'>>): Conversation {
     const now = new Date().toISOString()
     const id = randomUUID()
-    this.db.prepare(`INSERT INTO conversations (id,title,system_prompt,model_key,sampling,expert_mode,tool_policy,kind,folder_id,created_at,updated_at) VALUES ($id,$title,$sp,$mk,$samp,$expert,$tp,$kind,$fid,$now,$now)`)
-      .run({ $id: id, $title: partial?.title ?? 'New chat', $sp: partial?.systemPrompt ?? '', $mk: partial?.modelKey ?? '', $samp: JSON.stringify(partial?.sampling ?? {}), $expert: partial?.expertMode ? 1 : 0, $tp: partial?.toolPolicy ?? null, $kind: partial?.kind ?? 'chat', $fid: partial?.folderId ?? null, $now: now } as P)
+    this.db.prepare(`INSERT INTO conversations (id,title,system_prompt,model_key,sampling,expert_mode,tool_policy,kind,folder_id,agent_id,skill_ids,allowed_tools,created_at,updated_at) VALUES ($id,$title,$sp,$mk,$samp,$expert,$tp,$kind,$fid,$aid,$sk,$at,$now,$now)`)
+      .run({ $id: id, $title: partial?.title ?? 'New chat', $sp: partial?.systemPrompt ?? '', $mk: partial?.modelKey ?? '', $samp: JSON.stringify(partial?.sampling ?? {}), $expert: partial?.expertMode ? 1 : 0, $tp: partial?.toolPolicy ?? null, $kind: partial?.kind ?? 'chat', $fid: partial?.folderId ?? null, $aid: partial?.agentId ?? null, $sk: partial?.skillIds ? JSON.stringify(partial.skillIds) : null, $at: partial?.allowedTools ? JSON.stringify(partial.allowedTools) : null, $now: now } as P)
     return this.getConversation(id)!
   }
 
@@ -345,13 +531,15 @@ export class ConversationStore {
     return conv
   }
 
-  updateConversation(id: string, patch: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'sampling'>>): boolean {
+  updateConversation(id: string, patch: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'sampling' | 'modelKey' | 'skillIds'>>): boolean {
     const now = new Date().toISOString()
     const sets: string[] = ['updated_at = $now']
     const params: Record<string, SQLInputValue> = { $id: id, $now: now }
     if (patch.title !== undefined)        { sets.push('title = $title');      params.$title = patch.title }
     if (patch.systemPrompt !== undefined) { sets.push('system_prompt = $sp'); params.$sp    = patch.systemPrompt }
     if (patch.sampling !== undefined)     { sets.push('sampling = $samp');    params.$samp  = JSON.stringify(patch.sampling) }
+    if (patch.modelKey !== undefined)     { sets.push('model_key = $mk');     params.$mk    = patch.modelKey }
+    if (patch.skillIds !== undefined)     { sets.push('skill_ids = $sk');     params.$sk    = JSON.stringify(patch.skillIds) }
     return ((this.db.prepare(`UPDATE conversations SET ${sets.join(', ')} WHERE id = $id`).run(params) as unknown) as Changes).changes > 0
   }
 
@@ -500,11 +688,12 @@ export class ConversationStore {
 
   // ── Agent run methods (v8 migration) ──────────────────────────────────────
 
-  createAgentRun(params: { convId: string; title: string; allowedTools: string[] }): AgentRun {
+  createAgentRun(params: { convId: string; title: string; allowedTools: string[]; agentId?: string }): AgentRun {
     const id = randomUUID()
     const now = new Date().toISOString()
-    this.db.prepare(`INSERT INTO agent_runs (id,conv_id,title,status,allowed_tools,created_at,updated_at) VALUES ($id,$cid,$title,'queued',$at,$now,$now)`)
-      .run({ $id: id, $cid: params.convId, $title: params.title, $at: JSON.stringify(params.allowedTools), $now: now } as P)
+    const agentId = params.agentId ?? null
+    this.db.prepare(`INSERT INTO agent_runs (id,conv_id,title,status,allowed_tools,agent_id,created_at,updated_at) VALUES ($id,$cid,$title,'queued',$at,$aid,$now,$now)`)
+      .run({ $id: id, $cid: params.convId, $title: params.title, $at: JSON.stringify(params.allowedTools), $aid: agentId, $now: now } as P)
     return this.getAgentRun(id)!
   }
 
@@ -532,6 +721,152 @@ export class ConversationStore {
     if (patch.startedAt !== undefined) { sets.push('started_at = $started'); params.$started = patch.startedAt }
     if (patch.endedAt   !== undefined) { sets.push('ended_at = $ended');     params.$ended   = patch.endedAt }
     return ((this.db.prepare(`UPDATE agent_runs SET ${sets.join(', ')} WHERE id = $id`).run(params) as unknown) as Changes).changes > 0
+  }
+
+  // ── Hitman layer (spec 13 §§12-15) ─────────────────────────────────────────
+
+  /** The durable working doc for a run (spec 13 §12.2). '' when none yet. */
+  getRunDoc(runId: string): string {
+    const row = this.db.prepare(`SELECT content FROM agent_run_docs WHERE run_id = $id`).get({ $id: runId } as P) as { content: string } | undefined
+    return row?.content ?? ''
+  }
+
+  upsertRunDoc(runId: string, content: string): void {
+    const now = new Date().toISOString()
+    this.db.prepare(`
+      INSERT INTO agent_run_docs (run_id, content, updated_at) VALUES ($id, $c, $now)
+      ON CONFLICT(run_id) DO UPDATE SET content = $c, updated_at = $now
+    `).run({ $id: runId, $c: content, $now: now } as P)
+  }
+
+  /** Record a finished contract's outcome for the per-Hitman track record (§12.3). */
+  addTrackRecord(row: Omit<TrackRecordRow, 'id' | 'ranAt'> & { ranAt?: string }): void {
+    const id = randomUUID()
+    const ranAt = row.ranAt ?? new Date().toISOString()
+    this.db.prepare(`INSERT INTO agent_track_record (id,agent_id,run_id,model,outcome,feedback,ran_at) VALUES ($id,$aid,$rid,$m,$o,$f,$t)`)
+      .run({ $id: id, $aid: row.agentId, $rid: row.runId, $m: row.model, $o: row.outcome, $f: row.feedback ?? null, $t: ranAt } as P)
+  }
+
+  trackRecordForAgent(agentId: string): TrackRecordRow[] {
+    const rows = this.db.prepare(`SELECT * FROM agent_track_record WHERE agent_id = $a ORDER BY ran_at DESC`).all({ $a: agentId } as P) as Array<{ id: string; agent_id: string; run_id: string; model: string; outcome: string; feedback: string | null; ran_at: string }>
+    return rows.map((r) => ({ id: r.id, agentId: r.agent_id, runId: r.run_id, model: r.model, outcome: r.outcome as 'complete' | 'miss', feedback: r.feedback ?? undefined, ranAt: r.ran_at }))
+  }
+
+  /** Per-model count + success rate for a Hitman (§12.3). Drives warn/suggest. */
+  modelStatsForAgent(agentId: string): ModelStat[] {
+    const rows = this.db.prepare(`
+      SELECT model,
+             COUNT(*) AS total,
+             SUM(CASE WHEN outcome = 'complete' THEN 1 ELSE 0 END) AS complete
+      FROM agent_track_record WHERE agent_id = $a GROUP BY model
+    `).all({ $a: agentId } as P) as Array<{ model: string; total: number; complete: number }>
+    return rows.map((r) => ({ model: r.model, total: r.total, complete: r.complete, successRate: r.total ? r.complete / r.total : 0 }))
+  }
+
+  /** Archive a contract + record its disposition outcome (§14). */
+  setRunDisposition(runId: string, completion: 'complete' | 'miss', archive: boolean): boolean {
+    const now = new Date().toISOString()
+    const sets = ['completion = $c', 'updated_at = $now']
+    const params: Record<string, SQLInputValue> = { $id: runId, $c: completion, $now: now }
+    if (archive) { sets.push('archived_at = $now') }
+    return ((this.db.prepare(`UPDATE agent_runs SET ${sets.join(', ')} WHERE id = $id`).run(params) as unknown) as Changes).changes > 0
+  }
+
+  /** Active (non-archived) runs, newest first. */
+  listActiveAgentRuns(): AgentRun[] {
+    return (this.db.prepare(`SELECT * FROM agent_runs WHERE archived_at IS NULL ORDER BY created_at DESC LIMIT 200`).all() as unknown as AgentRunRow[]).map(rowToAgentRun)
+  }
+
+  /** Archived contracts, optionally filtered to one Hitman (§15). */
+  listArchivedAgentRuns(agentId?: string): AgentRun[] {
+    if (agentId) {
+      return (this.db.prepare(`SELECT * FROM agent_runs WHERE archived_at IS NOT NULL AND agent_id = $a ORDER BY archived_at DESC LIMIT 200`).all({ $a: agentId } as P) as unknown as AgentRunRow[]).map(rowToAgentRun)
+    }
+    return (this.db.prepare(`SELECT * FROM agent_runs WHERE archived_at IS NOT NULL ORDER BY archived_at DESC LIMIT 200`).all() as unknown as AgentRunRow[]).map(rowToAgentRun)
+  }
+
+  /** Prune a deleted Hitman's track-record rows (agent_id is a config id, not a DB FK). */
+  pruneTrackRecordForAgent(agentId: string): void {
+    this.db.prepare(`DELETE FROM agent_track_record WHERE agent_id = $a`).run({ $a: agentId } as P)
+  }
+
+  // ── Self-improvement: completion marker + per-agent lessons (redesign §2/§3) ──
+
+  /** Mark a conversation's task complete (archives it from the active agent view). */
+  markConversationComplete(id: string): void {
+    const now = new Date().toISOString()
+    this.db.prepare(`UPDATE conversations SET completed_at = $now, updated_at = $now WHERE id = $id`).run({ $id: id, $now: now } as P)
+  }
+
+  /** Reopen a completed/archived conversation so it accepts messages again. */
+  reopenConversation(id: string): void {
+    const now = new Date().toISOString()
+    this.db.prepare(`UPDATE conversations SET completed_at = NULL, updated_at = $now WHERE id = $id`).run({ $id: id, $now: now } as P)
+  }
+
+  /** Replace a conversation's read scope (absolute file/folder paths). */
+  setConversationReadScope(id: string, paths: string[]): void {
+    const now = new Date().toISOString()
+    this.db.prepare(`UPDATE conversations SET read_scope = $scope, updated_at = $now WHERE id = $id`)
+      .run({ $id: id, $scope: JSON.stringify(paths), $now: now } as P)
+  }
+
+  /** Set a conversation's pi permission mode ('ask'|'auto'|'bypass'|'read'). */
+  setConversationMode(id: string, mode: string): void {
+    this.db.prepare(`UPDATE conversations SET agent_mode = $mode WHERE id = $id`)
+      .run({ $id: id, $mode: mode } as P)
+  }
+
+  addAgentLesson(row: { agentId: string; lesson: string; evidence?: string; convId?: string }): void {
+    const id = randomUUID()
+    const now = new Date().toISOString()
+    this.db.prepare(`INSERT INTO agent_lessons (id,agent_id,lesson,evidence,conv_id,created_at) VALUES ($id,$aid,$l,$e,$c,$now)`)
+      .run({ $id: id, $aid: row.agentId, $l: row.lesson, $e: row.evidence ?? null, $c: row.convId ?? null, $now: now } as P)
+  }
+
+  /** Most-recent lessons for an agent (for injection at run start; the loop limits to top-N). */
+  listAgentLessons(agentId: string, limit = 50): AgentLesson[] {
+    const rows = this.db.prepare(`SELECT * FROM agent_lessons WHERE agent_id = $a ORDER BY created_at DESC LIMIT $n`)
+      .all({ $a: agentId, $n: limit } as P) as Array<{ id: string; agent_id: string; lesson: string; evidence: string | null; conv_id: string | null; created_at: string }>
+    return rows.map((r) => ({ id: r.id, agentId: r.agent_id, lesson: r.lesson, evidence: r.evidence ?? undefined, convId: r.conv_id ?? undefined, createdAt: r.created_at }))
+  }
+
+  pruneAgentLessons(agentId: string): void {
+    this.db.prepare(`DELETE FROM agent_lessons WHERE agent_id = $a`).run({ $a: agentId } as P)
+  }
+
+  // ── Skills grown from experience (redesign §3.3, Voyager) ─────────────────────
+
+  addAgentSkill(row: { agentId: string; name: string; description?: string; procedure: string; source?: string }): void {
+    const id = randomUUID()
+    const now = new Date().toISOString()
+    this.db.prepare(`INSERT INTO agent_skills (id,agent_id,name,description,procedure,source,created_at) VALUES ($id,$aid,$n,$d,$p,$s,$now)`)
+      .run({ $id: id, $aid: row.agentId, $n: row.name, $d: row.description ?? '', $p: row.procedure, $s: row.source ?? null, $now: now } as P)
+  }
+
+  listAgentSkills(agentId: string, limit = 50): AgentSkill[] {
+    const rows = this.db.prepare(`SELECT * FROM agent_skills WHERE agent_id = $a ORDER BY created_at DESC LIMIT $n`)
+      .all({ $a: agentId, $n: limit } as P) as Array<{ id: string; agent_id: string; name: string; description: string; procedure: string; source: string | null; created_at: string }>
+    return rows.map((r) => ({ id: r.id, agentId: r.agent_id, name: r.name, description: r.description, procedure: r.procedure, source: r.source ?? undefined, createdAt: r.created_at }))
+  }
+
+  /** True if a skill with this (case-insensitive) name already exists for the agent — the
+   *  Curator's dedupe check before inserting a new distilled skill. */
+  hasAgentSkillNamed(agentId: string, name: string): boolean {
+    const r = this.db.prepare(`SELECT 1 FROM agent_skills WHERE agent_id = $a AND lower(name) = lower($n) LIMIT 1`).get({ $a: agentId, $n: name } as P)
+    return !!r
+  }
+
+  countAgentSkills(agentId: string): number {
+    return (this.db.prepare(`SELECT COUNT(*) n FROM agent_skills WHERE agent_id = $a`).get({ $a: agentId } as P) as { n: number }).n
+  }
+
+  deleteAgentSkill(id: string): void {
+    this.db.prepare(`DELETE FROM agent_skills WHERE id = $id`).run({ $id: id } as P)
+  }
+
+  pruneAgentSkills(agentId: string): void {
+    this.db.prepare(`DELETE FROM agent_skills WHERE agent_id = $a`).run({ $a: agentId } as P)
   }
 
   close(): void { this.db.close() }

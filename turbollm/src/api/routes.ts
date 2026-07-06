@@ -102,6 +102,9 @@ export function registerApi(app: Hono, d: Deps): void {
       bench: d.bench.status(),
       downloads: { active: d.downloads.activeCount() },
       engineProvision: d.provision.get(),
+      // Background agent tasks (reviewer + skill distill): running + recently-finished,
+      // so the UI can show them inline in the conversation + a side panel on click.
+      agentTasks: d.agentTasks?.list() ?? [],
       // In-app compile-from-source status (ADR-100): live phase + log tail while a build runs.
       engineBuild: d.build.get(),
       // ComfyUI GPU coordination: lets the UI explain a paused/unloaded engine.
