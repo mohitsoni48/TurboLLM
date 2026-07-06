@@ -67,8 +67,8 @@ export function ScreenHeader({
   actions?: ReactNode
 }) {
   return (
-    <div className="mb-6 flex items-start justify-between gap-4">
-      <div>
+    <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
+      <div className="min-w-0">
         <h1 className="text-[18px] font-semibold tracking-[-0.01em] text-ink">{title}</h1>
         {description && <p className="mt-1 text-[13px] text-muted">{description}</p>}
       </div>

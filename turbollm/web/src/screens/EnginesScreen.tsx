@@ -367,7 +367,7 @@ export function EnginesScreen() {
   const activeEngine = list?.engines.find((e) => e.id === activeId) ?? null
 
   return (
-    <div className="w-full px-6 py-6">
+    <div className="w-full px-4 py-6 md:px-6">
       <ScreenHeader
         title="Engines"
         description="Pick the engine that fits your hardware. Each card shows what it’s good at, its trade-offs, and whether it runs on your machine."
@@ -502,7 +502,7 @@ function EngineHeaderBar({
             <DropdownMenu>
               <DropdownMenuTrigger
                 disabled={busy || groups.length === 0}
-                className="flex h-9 min-w-[220px] items-center gap-2 rounded-lg border border-border bg-bg px-3 text-[13px] text-ink transition-colors hover:border-[color:var(--accent)] disabled:opacity-60"
+                className="flex h-9 w-full min-w-0 items-center gap-2 rounded-lg border border-border bg-bg px-3 text-[13px] text-ink transition-colors hover:border-[color:var(--accent)] disabled:opacity-60 md:w-auto md:min-w-[220px]"
               >
                 <StateChip state={engineState} dotOnly className="shrink-0" />
                 <span className="flex-1 truncate text-left">
@@ -551,7 +551,7 @@ function EngineHeaderBar({
               <DropdownMenu>
                 <DropdownMenuTrigger
                   disabled={busy}
-                  className="flex h-9 min-w-[160px] items-center gap-2 rounded-lg border border-border bg-bg px-3 text-[13px] text-ink transition-colors hover:border-[color:var(--accent)] disabled:opacity-60"
+                  className="flex h-9 w-full min-w-0 items-center gap-2 rounded-lg border border-border bg-bg px-3 text-[13px] text-ink transition-colors hover:border-[color:var(--accent)] disabled:opacity-60 md:w-auto md:min-w-[160px]"
                 >
                   <Layers size={14} className="shrink-0 text-accent" />
                   <span className="flex-1 truncate text-left">

@@ -931,7 +931,7 @@ function GpuPicker({ gpus, value, allowAuto, onChange }: {
     <select
       value={String(value)}
       onChange={(e) => onChange(Number(e.target.value))}
-      className="max-w-[260px] rounded-md border border-border bg-bg px-2 py-1 text-[13px] text-ink outline-none"
+      className="min-w-0 max-w-[260px] rounded-md border border-border bg-bg px-2 py-1 text-[13px] text-ink outline-none"
     >
       {allowAuto && <option value="-1">Auto</option>}
       {gpus.map((g, i) => (

@@ -176,8 +176,8 @@ export function ModelsScreen() {
     <div
       className={
         tab === 'discover'
-          ? 'flex h-full w-full flex-col overflow-hidden px-6 py-6'
-          : 'h-full w-full overflow-y-auto px-6 py-6'
+          ? 'flex h-full w-full flex-col overflow-hidden px-4 py-6 md:px-6'
+          : 'h-full w-full overflow-y-auto px-4 py-6 md:px-6'
       }
     >
       <ScreenHeader

@@ -15,6 +15,7 @@ import type { HfSearchItem, HfSortOption } from '../../lib/types'
 import { EmptyState, InlineError } from '../../components/common'
 import { Input } from '../../components/ui/input'
 import { Skeleton } from '../../components/ui/skeleton'
+import { useIsDesktop } from '../../lib/useIsDesktop'
 import { DownloadsPanel } from './DownloadsPanel'
 import { HfRepoContent } from './HfRepoDialog'
 import { ImportUrlDialog } from './ImportUrlDialog'
@@ -54,6 +55,9 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
   const [importOpen, setImportOpen] = useState(false)
   const listRef = useRef<HTMLDivElement>(null)
   const [listWidth, setListWidth] = useState(() => Math.min(Math.max(readSavedListWidth(), LIST_MIN_W), listMaxW()))
+  // Below md the split-pane stacks (list over detail); the fixed list width + resize
+  // handle only apply on desktop.
+  const isDesktop = useIsDesktop()
 
   // Seed the search when arriving from a library model's "Find other quants" with
   // no known source repo (imported file). Keyed on presetQuery so re-clicking the
@@ -90,9 +94,9 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
     <div className="flex h-full min-h-0 flex-col">
       <DownloadsPanel />
 
-      <div className="mt-3 flex min-h-0 flex-1">
+      <div className="mt-3 flex min-h-0 flex-1 flex-col gap-3 md:flex-row md:gap-0">
         {/* Left: search + sort + scrollable list */}
-        <div ref={listRef} className="flex shrink-0 flex-col gap-2 pr-3" style={{ width: listWidth }}>
+        <div ref={listRef} className="flex max-h-[45vh] min-h-0 flex-col gap-2 md:max-h-none md:shrink-0 md:pr-3" style={isDesktop ? { width: listWidth } : undefined}>
           <div className="flex items-center gap-2">
             <div className="relative flex-1">
               <Search size={15} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-faint" />
@@ -154,7 +158,7 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
           </div>
         </div>
 
-        <SplitResizeHandle listRef={listRef} onCommit={setListWidth} />
+        {isDesktop && <SplitResizeHandle listRef={listRef} onCommit={setListWidth} />}
 
         {/* Right: permanent detail pane — no dialog, just swaps content on selection */}
         <div className="min-h-0 flex-1 overflow-y-auto rounded-lg border border-border bg-panel p-5">
@@ -169,7 +173,7 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
             />
           ) : (
             <div className="flex h-full items-center justify-center">
-              <EmptyState icon={<Search size={24} />} message="Select a model on the left to see details." />
+              <EmptyState icon={<Search size={24} />} message="Select a model to see its details." />
             </div>
           )}
         </div>

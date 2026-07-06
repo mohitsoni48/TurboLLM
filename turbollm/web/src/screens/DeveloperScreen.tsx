@@ -37,7 +37,7 @@ const CLI_LIST: Cli[] = [
  *  a card grid of one-command CLI setups, and a collapsed API reference. */
 export function DeveloperScreen() {
   return (
-    <div className="w-full px-6 py-6">
+    <div className="w-full px-4 py-6 md:px-6">
       <ScreenHeader
         title="Developer"
         description="Point Claude Code, Codex, or any OpenAI / Anthropic app at this machine."

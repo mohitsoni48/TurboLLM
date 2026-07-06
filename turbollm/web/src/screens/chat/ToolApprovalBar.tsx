@@ -47,7 +47,7 @@ export function ToolApprovalBar({
   if (dismissed) return null
 
   return (
-    <div className="mx-8 mb-3 rounded-md border border-[color:var(--warn,#ca8a04)] bg-[color-mix(in_srgb,var(--warn,#ca8a04)_8%,transparent)] px-3 py-2.5 text-[13px]">
+    <div className="mx-3 mb-3 rounded-md border border-[color:var(--warn,#ca8a04)] bg-[color-mix(in_srgb,var(--warn,#ca8a04)_8%,transparent)] px-3 py-2.5 text-[13px] md:mx-8">
       <div className="flex flex-wrap items-baseline gap-x-2">
         <span className="font-medium text-ink">Tool call needs your approval:</span>
         <span className="font-mono text-[12px] text-ink">{friendlyName(pending.name)}</span>
