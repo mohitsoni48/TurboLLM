@@ -76,8 +76,18 @@ export const RUN_CODE_TOOL = {
 
 export { type ResearchResult }
 
+/** PURE: the schema declares a single required `query: string`, but a model sometimes emits
+ *  `queries: string[]` instead (seen from a small local model whose tool-calling drifted from
+ *  the declared schema) — fall back to the first entry rather than silently treating the call
+ *  as query-less. */
+export function resolveSearchQuery(args: Record<string, unknown>): string {
+  if (typeof args.query === 'string') return args.query
+  if (Array.isArray(args.queries) && typeof args.queries[0] === 'string') return args.queries[0]
+  return ''
+}
+
 export async function execWebSearch(args: Record<string, unknown>, searchCfg: SearchConfig): Promise<string> {
-  const query = String(args.query ?? '')
+  const query = resolveSearchQuery(args)
   if (!query.trim()) return 'Error: query is required.'
 
   const intent = typeof args.intent === 'string' ? args.intent : undefined
