@@ -53,11 +53,11 @@ const SORT_PARAM: Record<Exclude<HfSortOption, 'best-match'>, string> = {
 /** The HF `library` facet to filter by, adapted to the active engine kind (spec 10 §2/§7)
  *  — NEVER hardcoded to GGUF, since the format that actually runs depends on the engine:
  *  - llama-server / koboldcpp / llamafile / TurboQuant (all llama.cpp-family) → gguf
- *  - mlx                                                                      → mlx (HF library tag)
+ *  - mlx / rapid-mlx (same on-disk MLX format)                               → mlx (HF library tag)
  *  - vllm / anything else                                                     → no filter (all HF repos)
  *  Shared by `searchModels` and `browseModels` so the two never drift apart. */
 function libraryFilterFor(engineKind?: string): string {
-  if (engineKind === 'mlx') return 'filter=mlx&'
+  if (engineKind === 'mlx' || engineKind === 'rapid-mlx') return 'filter=mlx&'
   if (engineKind === 'vllm') return ''
   return 'filter=gguf&'
 }

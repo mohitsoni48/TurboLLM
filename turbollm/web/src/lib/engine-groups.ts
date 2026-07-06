@@ -25,7 +25,7 @@ export function engineGroupKey(e: Engine): string {
     const backend = parseLlamaBuild(e.binPath)?.backend
     return backend ? `official-llama-${backend}` : 'official-llama'
   }
-  if (e.kind === 'koboldcpp' || e.kind === 'mlx' || e.kind === 'vllm') return e.kind
+  if (e.kind === 'koboldcpp' || e.kind === 'mlx' || e.kind === 'rapid-mlx' || e.kind === 'vllm') return e.kind
   if (/[\\/]engines[\\/]turboquant[\\/]/.test(e.binPath)) return 'turboquant'
   return `user:${e.id}`
 }
@@ -34,6 +34,7 @@ const GROUP_LABEL: Record<string, string> = {
   'official-llama': 'llama.cpp',
   koboldcpp: 'KoboldCpp',
   mlx: 'MLX',
+  'rapid-mlx': 'Rapid-MLX',
   vllm: 'vLLM',
   turboquant: 'TurboQuant',
 }

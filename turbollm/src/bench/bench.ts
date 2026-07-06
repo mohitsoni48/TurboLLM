@@ -270,7 +270,7 @@ export class BenchRunner {
     // flags; KoboldCpp uses a DIFFERENT flag dialect (koboldcppProfileToArgs), so the
     // swept llama.cpp flags wouldn't apply. Both are unsupported. llamafile runs
     // llama.cpp's server with the same flags, so it auto-tunes like llama-server.
-    if (active.kind === 'mlx' || active.kind === 'koboldcpp') {
+    if (active.kind === 'mlx' || active.kind === 'rapid-mlx' || active.kind === 'koboldcpp') {
       throw new BenchError('unsupported_model', 'Auto-tune supports llama.cpp / llamafile (GGUF) engines only.')
     }
     const entry = this.scanner.get(modelKey)

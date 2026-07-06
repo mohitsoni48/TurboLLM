@@ -4,7 +4,7 @@
 //                           and only on success register + activate it and GC the old dir;
 //                           on any failure the old install is left untouched (rollback).
 //   - TurboQuant fork     → re-provision the fork's latest GitHub release (replace dir).
-//   - vLLM / MLX (pip)    → `uv pip install -U/--upgrade` into the existing venv.
+//   - vLLM / MLX / Rapid-MLX (pip) → `uv pip install -U/--upgrade` into the existing venv.
 //
 // Shared by the HTTP update endpoints AND the auto-update scheduler so both take the
 // exact same honest, rollback-safe path. Keeps the pure decision logic (update.ts)
@@ -25,6 +25,7 @@ import {
   provisionTurboquant,
 } from './download'
 import { ensureMlxEnv } from './mlx'
+import { ensureRapidMlxEnv } from './rapid-mlx'
 import { ensureVllmEnv } from './vllm'
 import { ensureKoboldcpp, koboldcppDir } from './koboldcpp'
 import { ensureLlamafile, llamafileDir } from './llamafile'
@@ -47,6 +48,7 @@ const isTurboquant = (binPath: string) => /[\\/]engines[\\/]turboquant[\\/]/.tes
 export async function applyEngineUpdate(d: UpdateApplyDeps, engine: Engine, signal?: AbortSignal): Promise<void> {
   const root = join(d.store.dir(), 'engines')
   if (engine.kind === 'mlx') return applyPipUpdate(d, 'mlx', engine, root)
+  if (engine.kind === 'rapid-mlx') return applyPipUpdate(d, 'rapid-mlx', engine, root)
   if (engine.kind === 'vllm') return applyPipUpdate(d, 'vllm', engine, root)
   if (engine.kind === 'koboldcpp') return applyKoboldcppUpdate(d, engine, root, signal)
   if (engine.kind === 'llamafile') return applyLlamafileUpdate(d, engine, root, signal)
@@ -153,14 +155,20 @@ async function applyLlamafileUpdate(d: UpdateApplyDeps, engine: Engine, root: st
   }
 }
 
-/** vLLM / MLX: upgrade the package in place (uv pip install -U/--upgrade). */
-async function applyPipUpdate(d: UpdateApplyDeps, kind: 'mlx' | 'vllm', engine: Engine, root: string): Promise<void> {
+const PIP_ENGINE_LABEL: Record<'mlx' | 'rapid-mlx' | 'vllm', string> = { mlx: 'MLX', 'rapid-mlx': 'Rapid-MLX', vllm: 'vLLM' }
+
+/** vLLM / MLX / Rapid-MLX: upgrade the package in place (uv pip install -U/--upgrade). */
+async function applyPipUpdate(d: UpdateApplyDeps, kind: 'mlx' | 'rapid-mlx' | 'vllm', engine: Engine, root: string): Promise<void> {
   d.provision.start(kind)
   try {
     if (d.registry.active()?.id === engine.id) await d.manager.stopAndWait()
     if (kind === 'mlx') {
       const rt = await ensureMlxEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), true)
       const eng = d.registry.addMlx(`MLX (${rt.version})`, rt.python, rt.version)
+      d.registry.activate(eng.id)
+    } else if (kind === 'rapid-mlx') {
+      const rt = await ensureRapidMlxEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), true)
+      const eng = d.registry.addRapidMlx(`Rapid-MLX (${rt.version})`, rt.bin, rt.version)
       d.registry.activate(eng.id)
     } else {
       const rt = await ensureVllmEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), true)
@@ -169,7 +177,7 @@ async function applyPipUpdate(d: UpdateApplyDeps, kind: 'mlx' | 'vllm', engine: 
     }
     d.provision.done()
   } catch (e) {
-    d.provision.fail(`Could not update ${kind === 'mlx' ? 'MLX' : 'vLLM'}: ${msg(e)}`)
+    d.provision.fail(`Could not update ${PIP_ENGINE_LABEL[kind]}: ${msg(e)}`)
     throw e
   }
 }

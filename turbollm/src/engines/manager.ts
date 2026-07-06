@@ -7,6 +7,7 @@ import { createConnection, createServer } from 'node:net'
 import { dirname, join } from 'node:path'
 import type { ConfigStore, Engine } from '../config/config'
 import { mlxServerCommand } from './mlx'
+import { rapidMlxServerCommand } from './rapid-mlx'
 import { koboldcppServerCommand } from './koboldcpp'
 import { llamafileServerCommand } from './llamafile'
 import { slotCacheDir } from './slot-cache'
@@ -261,7 +262,8 @@ export class Manager {
     }
 
     const { cmd, args } = engineCommand(opts, port, slotSavePath)
-    const child = spawn(cmd, args, { cwd: dirname(cmd), windowsHide: true, env: pyEngineEnv(opts.engine.kind, this.store.dir(), opts.engine.binPath) })
+    const spawned = needsShellWrapper(opts.engine.kind) ? shellWrapped(cmd, args) : { cmd, args }
+    const child = spawn(spawned.cmd, spawned.args, { cwd: dirname(cmd), windowsHide: true, env: pyEngineEnv(opts.engine.kind, this.store.dir(), opts.engine.binPath) })
     // end:false — otherwise whichever of stdout/stderr closes first would end the
     // shared log stream and drop the other's output. We close it in onTerminated.
     child.stdout?.pipe(logStream, { end: false })
@@ -501,7 +503,7 @@ export class Manager {
       // otherwise flip us to "running" and then hang every request forever on a dead
       // generation thread. Detect a fatal load-failure traceback in the log and surface
       // it as an engine error instead. (Checked before probeReady so we win the race.)
-      if (kind === 'mlx' || kind === 'vllm' || kind === 'sglang') {
+      if (kind === 'mlx' || kind === 'rapid-mlx' || kind === 'vllm' || kind === 'sglang') {
         const loadErr = detectPyLoadFailure(readTail(this.logPathStr, 200))
         if (loadErr) {
           if (this.child === child && this.state === 'starting') {
@@ -545,6 +547,26 @@ export class Manager {
 
 // ---- helpers ---------------------------------------------------------------
 
+/** True when `kind`'s binary needs shell interpretation to run correctly on this platform.
+ *  llamafile ships as an "Actually Portable Executable" (Cosmopolitan libc) — a polyglot whose
+ *  leading bytes look like a DOS/PE header, which a POSIX shell dispatches to the right native
+ *  format for the current OS. Node's `spawn()` calls `execve()` directly (no shell), which fails
+ *  with ENOEXEC on macOS/Linux for this format — confirmed live on macOS: the daemon accepted
+ *  the start request but the process never spawned, while running the identical binary through
+ *  a shell worked immediately. Windows already recognizes the leading MZ/PE header natively, so
+ *  no wrapping is needed there. */
+export function needsShellWrapper(kind: string): boolean {
+  return kind === 'llamafile' && process.platform !== 'win32'
+}
+
+/** Wrap cmd+args to run through /bin/sh with no manual argument quoting/escaping needed: `"$0"`
+ *  and `"$@"` are populated from spawn's own argv array (never string-concatenated), so a path
+ *  or flag containing spaces/special characters passes through unmangled with no shell-injection
+ *  risk from argument content. */
+export function shellWrapped(cmd: string, args: string[]): { cmd: string; args: string[] } {
+  return { cmd: '/bin/sh', args: ['-c', 'exec "$0" "$@"', cmd, ...args] }
+}
+
 /** Build the spawn command for an engine, branching on its kind (spec 03 §2b).
  *  `slotSavePath` (F-014) is appended only for llama.cpp; mlx/vllm don't support it. */
 function engineCommand(opts: StartOpts, port: number, slotSavePath?: string): { cmd: string; args: string[] } {
@@ -553,6 +575,11 @@ function engineCommand(opts: StartOpts, port: number, slotSavePath?: string): { 
     // opts.extraArgs carries mlx-lm's OWN flags (sampling defaults), built by the
     // callers via mlxSamplingArgs — never llama.cpp profile flags.
     return mlxServerCommand(opts.engine.binPath, opts.modelPath, port, '127.0.0.1', opts.extraArgs)
+  }
+  if (opts.engine.kind === 'rapid-mlx') {
+    // Rapid-MLX: run its own OpenAI server binary (venv-installed console script) directly —
+    // it has no launch-time sampling flags to pass (per-request only, vLLM-style).
+    return rapidMlxServerCommand(opts.engine.binPath, opts.modelPath, port, '127.0.0.1')
   }
   if (opts.engine.kind === 'vllm') {
     // vLLM: run the OpenAI server via the provisioned venv python. modelPath is an
@@ -604,7 +631,7 @@ function readinessTimeoutMs(kind: string): number {
  *     `/v1/models` (which calls huggingface_hub `scan_cache_dir()`) doesn't crash with
  *     CacheNotFound when `~/.cache/huggingface/hub` is absent. */
 function pyEngineEnv(kind: string, dataDir: string, binPath: string): NodeJS.ProcessEnv | undefined {
-  if (kind !== 'mlx' && kind !== 'vllm' && kind !== 'sglang') {
+  if (kind !== 'mlx' && kind !== 'rapid-mlx' && kind !== 'vllm' && kind !== 'sglang') {
     if (process.platform === 'win32') return undefined
     const dir = dirname(binPath)
     // Append the existing value only if it's non-empty — glibc's dynamic linker treats an

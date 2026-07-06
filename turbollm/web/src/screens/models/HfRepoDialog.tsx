@@ -501,13 +501,13 @@ function MlxRepoBody({
 }) {
   const totalBytes = detail.files.reduce((s, f) => s + f.sizeBytes, 0)
   const fit = fileFit(totalBytes, vramMb)
-  const description =
-    engineKind === 'mlx'
-      ? 'MLX model — runs on Apple Silicon via mlx-lm. Downloads as a directory of safetensors weights.'
-      : engineKind === 'vllm'
-        ? 'HuggingFace model — runs via vLLM. Downloads as a directory of safetensors weights.'
-        : 'Safetensors model — downloads as a directory of weight files.'
-  const btnLabel = engineKind === 'mlx' ? 'Download MLX model' : 'Download model'
+  const isMlxFamily = engineKind === 'mlx' || engineKind === 'rapid-mlx'
+  const description = isMlxFamily
+    ? 'MLX model — runs on Apple Silicon via mlx-lm. Downloads as a directory of safetensors weights.'
+    : engineKind === 'vllm'
+      ? 'HuggingFace model — runs via vLLM. Downloads as a directory of safetensors weights.'
+      : 'Safetensors model — downloads as a directory of weight files.'
+  const btnLabel = isMlxFamily ? 'Download MLX model' : 'Download model'
   return (
     <div className="flex flex-col gap-4">
       <div className="rounded-md border border-border bg-panel-2 px-3 py-2.5 text-[12px] text-muted">

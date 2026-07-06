@@ -117,6 +117,33 @@ export class Registry {
     return eng
   }
 
+  /** Register a Rapid-MLX engine (kind='rapid-mlx'). Like addMlx, the binPath is a venv-
+   *  installed binary (its `rapid-mlx` console script), so llama.cpp capabilities/flags
+   *  don't apply. */
+  addRapidMlx(name: string, binPath: string, version: string): Engine {
+    const eng: Engine = {
+      id: randomUUID(),
+      name: name.trim() || 'Rapid-MLX',
+      binPath,
+      kind: 'rapid-mlx',
+      version,
+      capabilities: { kvTypes: [], flags: [] },
+      addedAt: new Date().toISOString(),
+    }
+    this.store.update((c) => {
+      // Replace an existing Rapid-MLX engine at the same path rather than duplicating.
+      const existing = c.engines.find((e) => e.kind === 'rapid-mlx' && e.binPath === binPath)
+      if (existing) {
+        existing.version = version
+        eng.id = existing.id
+      } else {
+        c.engines.push(eng)
+      }
+      if (!c.activeEngineId) c.activeEngineId = eng.id
+    })
+    return eng
+  }
+
   /** Register a vLLM engine (kind='vllm'). Like addMlx, the binPath is a venv
    *  python (not a llama-server), so llama.cpp capabilities/flags don't apply. */
   addVllm(name: string, binPath: string, version: string): Engine {
