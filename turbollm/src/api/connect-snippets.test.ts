@@ -35,7 +35,8 @@ test('openclaw is a known CLI with a one-command launch step and a config fallba
 test('hermes is a known CLI with a one-command launch step and a config-set fallback', () => {
   const r = buildConnectSnippets('hermes', BASE, 'key', 'Model', 'model|q4|1')
   assert.equal(r.steps[0].snippet, 'turbollm launch hermes')
-  assert.ok(r.steps.some((s) => s.snippet.includes('hermes config set model.default model|q4|1')))
+  // modelKey is quoted in the snippet — a real key has spaces and `|`, both shell-breaking unquoted.
+  assert.ok(r.steps.some((s) => s.snippet.includes('hermes config set model.default "model|q4|1"')))
 })
 
 test('qwen (not a turbollm launch target) has no one-command step', () => {
