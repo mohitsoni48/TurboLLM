@@ -490,7 +490,7 @@ async function rasterizeStaticFrozen(
  *  Returns true if OK or if the model doesn't support vision. */
 async function verifyWithVision(dataUrl: string): Promise<boolean> {
   try {
-    const res = await fetch('/api/v1/chat/completions', {
+    const res = await fetch('/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
