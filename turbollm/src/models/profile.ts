@@ -377,7 +377,7 @@ export function profileToArgs(p: LoadProfile, m: ModelEntry, caps: Capabilities,
   if (p.chatTemplateFile && has('--chat-template-file')) a.push('--chat-template-file', p.chatTemplateFile)
   // Speculative decoding (spec 05 §8). TurboQuant forks expose `--spec-type`:
   //   mtp   → Gemma-4 MTP: a separate gemma4_assistant GGUF via --mtp-head
-  //   nextn → Qwen3 NextN: point --model-draft at the SAME main-model GGUF
+  //   nextn → Qwen3 NextN: the model's OWN built-in head as the draft
   //   draft → mainline: a separate small draft GGUF
   const specType = has('--spec-type')
   // Whether the engine accepts a given `--spec-type` value (captured by the probe
@@ -388,12 +388,22 @@ export function profileToArgs(p: LoadProfile, m: ModelEntry, caps: Capabilities,
     if (specType) a.push('--spec-type', 'mtp')
     a.push('--mtp-head', p.mtpHeadPath)
     specActive = true
-  } else if (p.speculative === 'nextn' && specType && has('--model-draft')) {
-    // Qwen3 NextN drives the model's OWN built-in head as the draft. The fork
-    // names that spec-type `nextn`; mainline llama.cpp names the same mechanism
-    // `draft-mtp`. Use whichever the engine accepts — skip if neither.
+  } else if (p.speculative === 'nextn' && specType) {
+    // Qwen3 NextN speculative decoding uses the model's own built-in NextN/MTP
+    // head as the draft. Mainline llama.cpp names this spec-type `draft-mtp` and
+    // takes ONLY --spec-type — no --model-draft. Passing --model-draft pointing
+    // at the SAME GGUF (as this used to do unconditionally) makes llama.cpp load
+    // a full second copy of the model into RAM: measured +35GB RAM on a 35B MoE
+    // model (24GB → 59GB) for a 54% SLOWER generation, with no error printed —
+    // a silent, severe regression (GitHub VRAM report). The TurboQuant fork's own
+    // `nextn` spec-type value is a different codebase that DOES want --model-draft
+    // pointing at the same file (verified when this branch was first written) —
+    // only mainline's draft-mtp is exempted here.
     const nextnVal = ['nextn', 'draft-mtp'].find((v) => specAccepts(v))
-    if (nextnVal) {
+    if (nextnVal === 'draft-mtp') {
+      a.push('--spec-type', nextnVal)
+      specActive = true
+    } else if (nextnVal === 'nextn' && has('--model-draft')) {
       a.push('--spec-type', nextnVal, '--model-draft', m.path)
       specActive = true
     }
@@ -408,8 +418,16 @@ export function profileToArgs(p: LoadProfile, m: ModelEntry, caps: Capabilities,
   // specific to how the draft is produced — applies to all three modes above, matching
   // e.g. LM Studio's MTP "max/min draft tokens" controls. Absent -> the previous
   // hardcoded 16/1 defaults (unchanged behavior for existing profiles).
-  if (specActive && has('--draft-max')) a.push('--draft-max', String(p.draftMax ?? 16))
-  if (specActive && has('--draft-min')) a.push('--draft-min', String(p.draftMin ?? 1))
+  // llama.cpp removed --draft-max/--draft-min (GitHub #43); the successors are
+  // --spec-draft-n-max/--spec-draft-n-min. Prefer the old names when the probe
+  // confirms them (keeps unprobed/graceful-degrade and older-engine behavior
+  // unchanged) and fall back to the new names when it confirms only those.
+  if (specActive) {
+    if (has('--draft-max')) a.push('--draft-max', String(p.draftMax ?? 16))
+    else if (has('--spec-draft-n-max')) a.push('--spec-draft-n-max', String(p.draftMax ?? 16))
+    if (has('--draft-min')) a.push('--draft-min', String(p.draftMin ?? 1))
+    else if (has('--spec-draft-n-min')) a.push('--spec-draft-n-min', String(p.draftMin ?? 1))
+  }
   // Sampling startup defaults — become the engine's per-request defaults; can still
   // be overridden in the chat request body. Only emitted when non-default to avoid
   // cluttering the startup command. llama-server built-in defaults match these values.

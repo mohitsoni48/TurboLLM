@@ -49,10 +49,13 @@ try {
 } catch { /* keep fallback */ }
 
 // ── Node version guard ────────────────────────────────────────────────────────
-const nodeMajor = Number(process.versions.node.split('.')[0])
-if (nodeMajor < 22) {
+// 22.13.0, not just 22 — that's when node:sqlite became available without the
+// --experimental-sqlite flag (GitHub #40); on 22.5.0-22.12.x importing it bare
+// throws ERR_UNKNOWN_BUILTIN_MODULE despite `node -v` reporting 22.x.
+const [nodeMajor, nodeMinor] = process.versions.node.split('.').map(Number)
+if (nodeMajor < 22 || (nodeMajor === 22 && nodeMinor < 13)) {
   process.stderr.write(
-    `TurboLLM requires Node.js 22 or newer.\n` +
+    `TurboLLM requires Node.js 22.13.0 or newer.\n` +
     `You are running Node.js ${process.versions.node}.\n` +
     `Please upgrade: https://nodejs.org\n`,
   )

@@ -312,11 +312,8 @@ export class Registry {
    *  e.g. one with `--spec-type` but no captured `spec-type:<value>` entries, so
    *  NextN/MTP gating has the data it needs without a manual re-probe. */
   async ensureProbed(): Promise<void> {
-    const stale = (e: Engine) =>
-      e.capabilities.flags.includes('--spec-type') &&
-      !e.capabilities.flags.some((f) => f.startsWith('spec-type:'))
     for (const e of this.list().engines) {
-      if (e.version && !stale(e)) continue
+      if (e.version && !isStaleCapabilities(e.capabilities.flags)) continue
       try {
         await this.reprobe(e.id)
       } catch {
@@ -324,4 +321,26 @@ export class Registry {
       }
     }
   }
+}
+
+/** True when a saved `capabilities.flags` list was captured by a daemon predating a
+ *  fix to how flags are read out of `--help` output, so a stale-but-installed engine
+ *  keeps failing the same way after an app upgrade until someone happens to hit
+ *  "re-probe" by hand. Checked at every startup (ensureProbed) so the fix in probe.ts
+ *  actually reaches engines that were added before it existed — installing a new
+ *  TurboLLM build alone does NOT retroactively fix already-cached capability data. */
+export function isStaleCapabilities(flags: string[]): boolean {
+  // Case 1 (pre-existing): `--spec-type` was captured but its accepted enum values
+  // (`spec-type:<value>`) weren't — an older probe that predates that extraction.
+  if (flags.includes('--spec-type') && !flags.some((f) => f.startsWith('spec-type:'))) return true
+  // Case 2 (GitHub #43): llama.cpp removed --draft-max/--draft-min/--draft/--draft-n/
+  // --draft-n-min, but --help still NAMES them inside a "this argument has been
+  // removed" notice. A probe from before that fix (see extractFlags in probe.ts)
+  // misread the mention as support and cached these as real flags — profileToArgs
+  // then passes them straight through and the engine exits immediately on launch.
+  // A fresh probe of a genuinely-old llama.cpp that still supports them for real is
+  // an idempotent no-op here (the flags stay present either way), so this is safe
+  // to check unconditionally.
+  if (['--draft-max', '--draft-min', '--draft', '--draft-n', '--draft-n-min'].some((f) => flags.includes(f))) return true
+  return false
 }
