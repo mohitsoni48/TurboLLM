@@ -27,9 +27,14 @@ _Nothing yet._
 
 ## [1.7.3] - 2026-07-06
 
-**A new Agents tab in Customize — edit any built-in's system prompt or build your own with a skill/tool allow-list — plus a smaller, faster install.**
+**The standalone Agents screen is retired — replaced by a shared Skills library used directly in chat, plus a new Agents tab in Customize for editing personas and building your own.**
 
 ### Added
+- **Skills.** A shared library of reusable instructions (Claude-style SKILL.md format) any
+  conversation can enable — via the `/` picker in the composer (Tab-complete included) or a
+  conversation's settings. Manage the library from Customize → Skills: upload a SKILL.md
+  directly, or have TurboLLM learn one from a folder of docs or distill one from an existing
+  conversation's transcript.
 - **Agents in Customize.** A new Agents tab (alongside Skills and MCP Servers) lets you edit any
   built-in persona's system prompt, skills, and tool access in place — with a Reset button to
   restore the original — or create your own custom agent from scratch. Each agent gets a name,
@@ -39,27 +44,20 @@ _Nothing yet._
 - **Two new built-in agents.** **Lite** strips the hidden system prompt to the bare minimum for the
   fastest possible responses (every tool still available); **Code** is tuned for precise, idiomatic
   code with minimal narration.
-- Skills now enable correctly no matter how the `/skill-id` token reaches the composer — picker
-  click, Tab-complete, typed, or pasted.
 
-### Changed
-- **Smaller, faster install.** Removed an unused background-agent engine (built on the pi SDK) that
-  shipped but was never reachable from the UI — cutting the npm package's dependency tree by over
-  200 packages with no change in behavior.
-- Skill instructions are no longer truncated to 300 characters when injected into chat.
-
-### Fixed
-- Clicking a skill in the `/` picker now fills its name into the composer instead of clearing the
-  input.
-- The tool-call approval popup now actually renders.
-- Hardened the skills/agents config migrations.
+### Removed
+- **The standalone Agents screen** (background tasks running separately from chat) is gone. It's
+  replaced by Skills used directly inside chat — the same idea, giving the model reusable extra
+  capabilities, without a separate surface to launch into, reconnect to, or lose track of.
 
 ### Discord
+- New: Skills — a shared library of reusable instructions you enable per chat with `/`, manage in
+  Customize, upload, or have TurboLLM learn from a folder or an existing conversation.
 - New: Customize → Agents — edit any built-in agent's prompt/skills/tools in place, or create your
   own from scratch, with a Reset button on the built-ins.
 - New: Lite (fastest, bare-bones prompt) and Code (coding-focused) agents.
-- Fixed: skill picker and tool-approval popup bugs in chat.
-- Smaller install — dropped ~200 unused packages.
+- Changed: the old standalone Agents screen (background tasks) is retired in favor of Skills in
+  chat.
 
 ## [1.7.2] - 2026-07-06
 
