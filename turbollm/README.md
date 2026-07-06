@@ -446,7 +446,7 @@ Use `--config <file>` to point at an alternate config (its directory becomes the
 
 ## Requirements
 
-- **Node.js 22 or newer** — enforced at startup with a clear message. <https://nodejs.org>
+- **Node.js 22.13.0 or newer** — enforced at startup with a clear message. <https://nodejs.org>
 - **Windows, macOS, or Linux.**
 - A GPU is recommended but **not required** — a CPU build is provisioned as a fallback.
 - On Windows, the first time the auto-downloaded `llama-server` runs, SmartScreen/Defender may
@@ -492,7 +492,7 @@ Prefer Open WebUI's chat breadth? It works great pointed at TurboLLM's OpenAI en
 
 ## Troubleshooting
 
-- **`TurboLLM requires Node.js 22 or newer`** — upgrade Node: <https://nodejs.org>.
+- **`TurboLLM requires Node.js 22.13.0 or newer`** — upgrade Node: <https://nodejs.org>.
 - **Model won't load / OOM** — pick a smaller quant (the VRAM verdict warns you), lower GPU
   offload, or close other GPU apps. Failures surface in the Engines screen with the engine log.
 - **Windows Defender / SmartScreen prompt** — that's the upstream `llama-server` binary on
@@ -519,7 +519,7 @@ node dist/cli.js --port 6996
 Frontend hot-reload: `cd web && npm run dev` (proxies `/api` and `/v1` to the daemon on
 :6996).
 
-**Stack:** Node ≥22 · TypeScript · Hono · `node:sqlite` · tsup — and a React 19 + Tailwind v4 +
+**Stack:** Node ≥22.13 · TypeScript · Hono · `node:sqlite` · tsup — and a React 19 + Tailwind v4 +
 shadcn/ui frontend. One TypeScript codebase, shipped as an npm package.
 
 ---

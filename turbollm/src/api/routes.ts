@@ -1890,6 +1890,7 @@ export function registerApi(app: Hono, d: Deps): void {
     const base = `http://${host}:${port}`
     const ms = d.manager.status()
     const modelName = ms.state === 'running' ? (ms.model?.name ?? 'local') : 'local'
+    const modelKey = ms.state === 'running' ? (ms.model?.key ?? modelName) : modelName
 
     let apiKey = 'not-needed-on-localhost'
     if (lanBind) {
@@ -1910,7 +1911,7 @@ export function registerApi(app: Hono, d: Deps): void {
       apiKey = full
     }
 
-    return c.json(buildConnectSnippets(cli, base, apiKey, modelName))
+    return c.json(buildConnectSnippets(cli, base, apiKey, modelName, modelKey))
   })
 }
 
@@ -2268,7 +2269,7 @@ function getLanIp(): string {
 type ConnectStep = { label: string; snippet: string; lang: string }
 type ConnectResult = { cli: string; title: string; steps: ConnectStep[] }
 
-function buildConnectSnippets(cli: string, base: string, apiKey: string, modelName: string): ConnectResult {
+export function buildConnectSnippets(cli: string, base: string, apiKey: string, modelName: string, modelKey: string = modelName): ConnectResult {
   switch (cli) {
     case 'claude-code':
       return {
@@ -2298,6 +2299,11 @@ function buildConnectSnippets(cli: string, base: string, apiKey: string, modelNa
         title: 'opencode',
         steps: [
           {
+            label: 'Quickest — one command (ships with TurboLLM)',
+            snippet: `turbollm launch opencode`,
+            lang: 'bash',
+          },
+          {
             label: 'Merge into ~/.config/opencode/opencode.json',
             snippet: JSON.stringify(
               {
@@ -2325,6 +2331,11 @@ function buildConnectSnippets(cli: string, base: string, apiKey: string, modelNa
         title: 'Kilo Code',
         steps: [
           {
+            label: 'Quickest — one command (ships with TurboLLM)',
+            snippet: `turbollm launch kilo`,
+            lang: 'bash',
+          },
+          {
             label: 'Add to ~/.config/kilo/kilo.jsonc providers array',
             snippet: JSON.stringify(
               {
@@ -2339,6 +2350,61 @@ function buildConnectSnippets(cli: string, base: string, apiKey: string, modelNa
               2,
             ),
             lang: 'jsonc',
+          },
+        ],
+      }
+    case 'openclaw':
+      return {
+        cli,
+        title: 'openclaw',
+        steps: [
+          {
+            label: 'Quickest — one command (ships with TurboLLM)',
+            snippet: `turbollm launch openclaw`,
+            lang: 'bash',
+          },
+          {
+            label: 'Merge into ~/.config/openclaw/openclaw.json',
+            snippet: JSON.stringify(
+              {
+                models: {
+                  providers: {
+                    turbollm: {
+                      baseUrl: `${base}/v1`,
+                      apiKey: apiKey !== 'not-needed-on-localhost' ? apiKey : 'not-required',
+                      api: 'openai-completions',
+                      models: [{ id: modelKey, name: modelName }],
+                    },
+                  },
+                },
+                agents: { defaults: { model: { primary: `turbollm/${modelKey}` } } },
+              },
+              null,
+              2,
+            ),
+            lang: 'json',
+          },
+        ],
+      }
+    case 'hermes':
+      return {
+        cli,
+        title: 'Hermes Agent',
+        steps: [
+          {
+            label: 'Quickest — one command (ships with TurboLLM)',
+            snippet: `turbollm launch hermes`,
+            lang: 'bash',
+          },
+          {
+            label: 'PowerShell',
+            snippet: `hermes config set model.provider custom; hermes config set model.base_url ${base}/v1; hermes config set model.default "${modelKey}"`,
+            lang: 'powershell',
+          },
+          {
+            label: 'bash / zsh',
+            snippet: `hermes config set model.provider custom && hermes config set model.base_url ${base}/v1 && hermes config set model.default "${modelKey}"`,
+            lang: 'bash',
           },
         ],
       }

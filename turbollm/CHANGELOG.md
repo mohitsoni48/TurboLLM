@@ -25,6 +25,36 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.7.2] - 2026-07-06
+
+**MTP / speculative-decoding models load and run correctly, the Windows install crash is fixed, and auto-tune now respects your MTP setting.**
+
+### Added
+- **Developer → Connect a CLI now covers every launch target.** `openclaw` and `hermes` have their
+  own cards (previously missing), and opencode / kilo / openclaw / hermes each lead with the
+  one-command `turbollm launch <cli>` setup, with the manual config kept as a fallback.
+
+### Changed
+- **Auto-tune respects your MTP setting.** Running auto-tune on an MTP / NextN model now tunes with
+  speculative decoding active — so the chosen GPU/CPU offload leaves room for its real memory
+  footprint — and keeps MTP enabled in the saved profile instead of silently turning it off.
+
+### Fixed
+- **Install no longer crashes on Node 22.5–22.12.** TurboLLM uses Node's built-in SQLite, which only
+  works without an experimental flag on **Node 22.13.0+**. Below that, `npx turbollm` crashed with an
+  obscure `node:sqlite` error; it now requires 22.13.0+ and says so clearly. ([#40](https://github.com/mohitsoni48/TurboLLM/issues/40))
+- **MTP / speculative-decoding models load again.** A newer llama.cpp renamed its speculative-decoding
+  flags; TurboLLM kept passing the removed ones, so any MTP model failed to load. It now detects and
+  uses the current flags, and auto-corrects engines that were already installed. ([#43](https://github.com/mohitsoni48/TurboLLM/issues/43))
+- **MTP no longer balloons system RAM.** Native MTP was loading a second full copy of the model into
+  RAM (tens of GB on large models) and running *slower*; it now uses only a small amount of extra
+  memory and runs faster, as intended.
+
+### Discord
+- Fixed: MTP / speculative-decoding models load again.
+- New: auto-tune keeps your MTP setting on (and tunes with it active) instead of quietly switching it off.
+- New: the Developer → Connect a CLI screen now shows one-command setup for opencode, kilo, openclaw, and hermes too.
+
 ## [1.7.1] - 2026-07-05
 
 **Local coding CLIs: model pinning restored, `/model` now lists your local models, and four new launch targets.**

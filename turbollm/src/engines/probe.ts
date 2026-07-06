@@ -98,7 +98,7 @@ export async function probe(bin: string): Promise<ProbeResult> {
   let version = m ? m[1].trim() : trimLen(firstNonEmptyLine(v.out), 100)
   if (!version) version = 'unknown'
 
-  const flags = [...new Set(h.out.match(RE_FLAG) ?? [])].sort()
+  const flags = extractFlags(h.out)
   const kvTypes = flags.includes('--cache-type-k') ? [...KNOWN_KV] : ['f16']
   if (combined.toLowerCase().includes('turbo')) kvTypes.push('turbo2', 'turbo3', 'turbo4')
 
@@ -151,6 +151,24 @@ function detectFormat(bin: string): BinFormat {
 
 function osLabel(fmt: BinFormat): string {
   return fmt === 'pe' ? 'Windows' : fmt === 'macho' ? 'macOS' : 'Linux'
+}
+
+/** Extracts the set of `--flag` tokens a `--help` dump documents as currently
+ *  accepted. Matches per-line rather than over the whole blob: llama.cpp keeps
+ *  printing removed flags in --help as "--draft-max N   the argument has been
+ *  removed. use --spec-draft-n-max or ..." (GitHub #43) — a naive whole-text
+ *  regex reads that mention as proof --draft-max is still accepted, so
+ *  TurboLLM passes it straight to the engine and it exits immediately on
+ *  launch. Skip any line that says a flag was removed; a genuinely-supported
+ *  successor flag (e.g. --spec-draft-n-max) still gets captured from its own
+ *  dedicated --help entry elsewhere in the output. */
+export function extractFlags(helpText: string): string[] {
+  const flagSet = new Set<string>()
+  for (const line of helpText.split('\n')) {
+    if (/\bhas been removed\b/i.test(line)) continue
+    for (const f of line.match(RE_FLAG) ?? []) flagSet.add(f)
+  }
+  return [...flagSet].sort()
 }
 
 function firstNonEmptyLine(s: string): string {

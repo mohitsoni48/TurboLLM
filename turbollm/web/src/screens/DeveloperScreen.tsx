@@ -25,10 +25,12 @@ const PUBLIC_APIS = [
 ] as const
 
 const CLI_LIST = [
-  { id: 'claude-code', name: 'Claude Code', desc: 'Anthropic-compatible endpoint — the hero demo' },
-  { id: 'opencode',    name: 'opencode',    desc: 'OpenAI-compatible, AI SDK provider config' },
-  { id: 'kilo',        name: 'Kilo Code',   desc: 'OpenAI-compatible, kilo.jsonc provider entry' },
-  { id: 'qwen',        name: 'Qwen Code',   desc: 'OpenAI-compatible (OPENAI_BASE_URL)' },
+  { id: 'claude-code', name: 'Claude Code',  desc: 'turbollm launch claude — Anthropic-compatible endpoint' },
+  { id: 'opencode',    name: 'opencode',     desc: 'turbollm launch opencode — AI SDK provider config' },
+  { id: 'kilo',        name: 'Kilo Code',    desc: 'turbollm launch kilo — kilo.jsonc provider entry' },
+  { id: 'openclaw',    name: 'openclaw',     desc: 'turbollm launch openclaw — provider + default model' },
+  { id: 'hermes',      name: 'Hermes Agent', desc: 'turbollm launch hermes — hermes config set' },
+  { id: 'qwen',        name: 'Qwen Code',    desc: 'OpenAI-compatible (OPENAI_BASE_URL)' },
 ]
 
 export function DeveloperScreen() {

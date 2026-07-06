@@ -297,11 +297,18 @@ export class BenchRunner {
     // candidate — ctx, flash-attn, sampling, etc. `base` overrides the saved profile + global
     // defaults. Auto-tune then CHOOSES the KV-cache type (by reasoning about VRAM, below) and tunes
     // the offload (ngl / nCpuMoe) under it, so the result reflects settings they'll load with.
-    // Tune with speculative decoding OFF. Spec (NextN / MTP / draft) runs the model ~twice per
-    // step, so on a partially-offloaded model the extra CPU work craters t/s (measured ~2 t/s vs
-    // ~24 with it off) and a load-time VRAM probe can't see that runtime cost. The offload + KV
-    // choice here is for the base model; spec stays a separate load-time toggle, best left to the
-    // user for when a model fits fully on the GPU.
+    // Tune WITH the user's speculative-decoding setting (NextN / MTP / draft) active — do NOT force
+    // it off. Auto-tune's job is to fit the config the user will ACTUALLY load, and native MTP/NextN
+    // adds real VRAM (draft KV cache + head compute, ~460 MB measured on a 35B MoE at 200K ctx) that
+    // the offload search must reserve room for; searching with spec excluded would pick an offload
+    // that fits WITHOUT it, then load spec on top and eat the vramHeadroomMb margin (or spill to RAM,
+    // exactly what the projector note below guards against). Keeping spec on also means the winning
+    // profile PRESERVES the user's setting instead of silently resetting it to 'off' on Save.
+    // (This used to force spec off on the theory that it "runs the model ~twice, cratering t/s ~2 vs
+    // ~24" — but that number was measured with the --model-draft double-load bug since fixed; native
+    // MTP is now FASTER, so the premise no longer holds. Modes that genuinely load extra weights
+    // (the fork's `nextn`, Gemma `mtp`) tune slower but that reflects their true footprint, which is
+    // the honest thing to fit against.)
     // Tune WITH the vision projector (mmproj) exactly as the user has it configured (useMmproj /
     // mmprojGpu come from `resolved`, untouched here). A vision model always loads with mmproj
     // resident (see resolveProfile), so the offload search must account for its real VRAM
@@ -309,7 +316,7 @@ export class BenchRunner {
     // the projector, then load the projector on top of that afterward, eating into the
     // vramHeadroomMb safety margin the search thought it had (or spilling outright).
     const resolved = resolveProfile(entry, sys, saved, base, defaults)
-    const baseProfile: LoadProfile = { ...resolved, speculative: 'off', mtpHeadPath: '', draftModelPath: '' }
+    const baseProfile: LoadProfile = resolved
     // User-configurable VRAM safety margin for the offload search (Settings → Engine).
     const headroomMb = this.store.snapshot().vramHeadroomMb
 

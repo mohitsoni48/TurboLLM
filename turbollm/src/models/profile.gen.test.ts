@@ -298,9 +298,58 @@ test('nextn mode also honors draftMax/draftMin, defaults to 16/1 when unset', ()
   assert.equal(args[args.indexOf('--draft-min') + 1], '1')
 })
 
+// Regression: mainline llama.cpp's native NextN/MTP (--spec-type draft-mtp) uses the
+// model's own built-in head — it takes ONLY --spec-type, no --model-draft. Passing
+// --model-draft pointing at the SAME GGUF (the previous unconditional behavior) makes
+// llama.cpp load a full second copy of the model into RAM — measured +35GB RAM on a
+// 35B MoE model for a 54% SLOWER generation, with no error printed at all.
+test('nextn mode on mainline (spec-type:draft-mtp only) omits --model-draft', () => {
+  const capMainline = { kvTypes: [], flags: ['--spec-type', '--model-draft', 'spec-type:draft-mtp'] }
+  const p = { ...base(), speculative: 'nextn' as const }
+  const args = profileToArgs(p, model({ nextnLayers: 1 }), capMainline)
+  assert.ok(args.includes('--spec-type'))
+  assert.equal(args[args.indexOf('--spec-type') + 1], 'draft-mtp')
+  assert.ok(!args.includes('--model-draft'), '--model-draft must not be passed for mainline draft-mtp')
+})
+
+// The TurboQuant fork's own `nextn` spec-type value is a different codebase that DOES
+// want --model-draft pointing at the same file — only mainline's draft-mtp is exempted.
+test('nextn mode on the TurboQuant fork (spec-type:nextn) still includes --model-draft', () => {
+  const capFork = { kvTypes: [], flags: ['--spec-type', '--model-draft', 'spec-type:nextn'] }
+  const p = { ...base(), speculative: 'nextn' as const }
+  const m = model({ nextnLayers: 1 })
+  const args = profileToArgs(p, m, capFork)
+  assert.equal(args[args.indexOf('--spec-type') + 1], 'nextn')
+  assert.equal(args[args.indexOf('--model-draft') + 1], m.path)
+})
+
 test('off mode emits no draft-max/draft-min flags', () => {
   const p = { ...base(), speculative: 'off' as const, draftMax: 4, draftMin: 0 }
   const args = profileToArgs(p, model(), caps)
   assert.ok(!args.includes('--draft-max'))
   assert.ok(!args.includes('--draft-min'))
+})
+
+// Regression: llama.cpp removed --draft-max/--draft-min in favor of
+// --spec-draft-n-max/--spec-draft-n-min (GitHub #43). A probe that correctly
+// reports the old names as unsupported must fall back to the new ones instead
+// of silently dropping draft-window control.
+test('falls back to --spec-draft-n-max/--spec-draft-n-min when the engine only supports the new names', () => {
+  const capNewOnly = { kvTypes: [], flags: ['--mtp-head', '--spec-draft-n-max', '--spec-draft-n-min'] }
+  const p = { ...base(), speculative: 'mtp' as const, mtpHeadPath: '/models/gemma4-mtp.gguf', draftMax: 8, draftMin: 2 }
+  const args = profileToArgs(p, model(), capNewOnly)
+  assert.ok(!args.includes('--draft-max'))
+  assert.ok(!args.includes('--draft-min'))
+  assert.equal(args[args.indexOf('--spec-draft-n-max') + 1], '8')
+  assert.equal(args[args.indexOf('--spec-draft-n-min') + 1], '2')
+})
+
+test('prefers --draft-max/--draft-min when the engine reports both old and new names', () => {
+  const capBoth = { kvTypes: [], flags: ['--mtp-head', '--draft-max', '--draft-min', '--spec-draft-n-max', '--spec-draft-n-min'] }
+  const p = { ...base(), speculative: 'mtp' as const, mtpHeadPath: '/models/gemma4-mtp.gguf', draftMax: 8, draftMin: 2 }
+  const args = profileToArgs(p, model(), capBoth)
+  assert.equal(args[args.indexOf('--draft-max') + 1], '8')
+  assert.equal(args[args.indexOf('--draft-min') + 1], '2')
+  assert.ok(!args.includes('--spec-draft-n-max'))
+  assert.ok(!args.includes('--spec-draft-n-min'))
 })

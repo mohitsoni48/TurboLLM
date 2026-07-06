@@ -100,6 +100,7 @@ const TURBOLLM_KNOWLEDGE =
   'One real prefill + generation run. Bench prompt: `min(50,000 tokens, ctx × 75%)`. Per-test cap: 3 minutes. Stop/restart/load cancel a running auto-tune. Records prefill t/s, generation t/s, TTFT ms, and VRAM delta.\n\n' +
   '**Phase 4 — Recommended sampling extraction**:\n' +
   'Checks the repo for a structured `params`/`generation_config.json` sidecar first (some quantizers, e.g. unsloth, publish one with exact recommended values — used as-is, no parsing needed). Otherwise fetches the HuggingFace model card and extracts recommended temperature, top_k, top_p, min_p (falling back to the base model\'s card if the quant card doesn\'t have sampling info, then an LLM-read fallback on unusual phrasing). Prefills the Sampling section of the load profile.\n\n' +
+  'Speculative decoding (MTP/NextN/draft) stays ACTIVE during the whole tune — the offload/KV search fits the config you actually load, leaving room for spec\'s real VRAM — and Save preserves your speculative setting rather than resetting it to off.\n\n' +
   'Results dialog: Save applies the winner config to the model profile (tunedBy: "bench"). "Download run log" checkbox (default checked) downloads a JSON log of every probe (timestamps, parameters, outcomes, VRAM readings, and the winner).\n\n' +
 
   '## Load Profile Parameters\n\n' +
