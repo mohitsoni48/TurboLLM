@@ -223,6 +223,11 @@ export const CMAKE_CONFIGURE_ARGS = ['-DGGML_CUDA=ON', '-DCMAKE_BUILD_TYPE=Relea
  *  versioned GPU toolkit). */
 export const CMAKE_CONFIGURE_ARGS_MACOS = ['-DGGML_METAL=ON', '-DCMAKE_BUILD_TYPE=Release']
 
+/** CPU-only fallback for a macOS build whose fork references Metal-backend symbols its own
+ *  vendored ggml doesn't implement (build-runner.ts retries with this after detecting that
+ *  specific failure — see isIncompleteMetalBackendError). */
+export const CMAKE_CONFIGURE_ARGS_MACOS_CPU = ['-DGGML_METAL=OFF', '-DCMAKE_BUILD_TYPE=Release']
+
 /** CUDA runtime DLLs (Windows) / shared libs (Linux) a llama.cpp CUDA build links against at
  *  runtime. A build does NOT bundle these, so without copying them next to the binary the
  *  engine silently falls back to CPU. Shared with build-runner.ts's 1-click-build copy step. */

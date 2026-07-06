@@ -18,7 +18,7 @@ import { execFile, spawn } from 'node:child_process'
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { delimiter, dirname, join } from 'node:path'
 import { promisify } from 'node:util'
-import { buildEnv, checkBuildPrereqs, CMAKE_CONFIGURE_ARGS, CMAKE_CONFIGURE_ARGS_MACOS, CUDA_RUNTIME_DLL_PREFIXES, CUDA_RUNTIME_SO_PREFIXES } from './build-prereqs'
+import { buildEnv, checkBuildPrereqs, CMAKE_CONFIGURE_ARGS, CMAKE_CONFIGURE_ARGS_MACOS, CMAKE_CONFIGURE_ARGS_MACOS_CPU, CUDA_RUNTIME_DLL_PREFIXES, CUDA_RUNTIME_SO_PREFIXES } from './build-prereqs'
 import { resolveServerBinary } from './scan'
 import type { BuildPhase } from './build-state'
 
@@ -97,6 +97,15 @@ export function sourceBuildDirOf(binPath: string, enginesRoot: string): string |
 export function pickGenerator(hasNinja: boolean, isWindows: boolean): 'Ninja' | 'NMake Makefiles' | 'Unix Makefiles' {
   if (hasNinja) return 'Ninja'
   return isWindows ? 'NMake Makefiles' : 'Unix Makefiles'
+}
+
+/** PURE: true when a macOS Metal build's compile log shows the fork's own source calling
+ *  Metal-backend symbols (ggml_backend_is_metal, ggml_backend_metal_*) that its vendored ggml
+ *  doesn't actually implement — i.e. this specific fork's Metal support is incomplete, not a
+ *  transient/environmental failure. Lets the 1-click build retry as CPU-only instead of just
+ *  failing (seen in the wild: ik_llama.cpp). */
+export function isIncompleteMetalBackendError(log: string[]): boolean {
+  return log.some((line) => /undeclared identifier 'ggml_backend_(is_metal|metal_\w+)'/.test(line))
 }
 
 // CMAKE_CONFIGURE_ARGS now lives in build-prereqs.ts (re-exported below) — it's shared with
@@ -487,27 +496,47 @@ export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: Abo
           'add a folder containing ninja under Build environment for much faster builds).',
   )
 
-  // 2) Configure. Windows: inside the MSVC dev env so cl/ml64/INCLUDE/LIB are set (nvcc comes
-  // off PATH). Linux/macOS: cmake runs directly — no dev-env shell needed.
-  hooks.phase('configuring')
-  const configureArgs = ['-G', generator, '-B', buildSubdir, '-S', srcDir, ...(isMac ? CMAKE_CONFIGURE_ARGS_MACOS : CMAKE_CONFIGURE_ARGS)]
-  if (isWindows) {
-    const configureBat = join(buildRoot, '_tllm_configure.bat')
-    writeFileSync(configureBat, vcvarsBatch(vcvars!, configureArgs))
-    await runStep(winComSpec(), ['/c', configureBat], { cwd: buildRoot, env, signal, onLine: hooks.log })
-  } else {
-    await runStep('cmake', configureArgs, { cwd: buildRoot, env, signal, onLine: hooks.log })
+  // 2) Configure + 3) compile. Windows: inside the MSVC dev env so cl/ml64/INCLUDE/LIB are set
+  // (nvcc comes off PATH). Linux/macOS: cmake runs directly — no dev-env shell needed.
+  const configureAndCompile = async (cmakeArgs: string[], log: string[]) => {
+    const captureLog = (line: string) => { log.push(line); hooks.log(line) }
+    hooks.phase('configuring')
+    const configureArgs = ['-G', generator, '-B', buildSubdir, '-S', srcDir, ...cmakeArgs]
+    if (isWindows) {
+      const configureBat = join(buildRoot, '_tllm_configure.bat')
+      writeFileSync(configureBat, vcvarsBatch(vcvars!, configureArgs))
+      await runStep(winComSpec(), ['/c', configureBat], { cwd: buildRoot, env, signal, onLine: captureLog })
+    } else {
+      await runStep('cmake', configureArgs, { cwd: buildRoot, env, signal, onLine: captureLog })
+    }
+
+    // Compile just the server target (Ninja/Makefiles parallelize with -j; NMake ignores it).
+    hooks.phase('compiling')
+    const compileArgs = ['--build', buildSubdir, '-j', '--target', 'llama-server']
+    if (isWindows) {
+      const compileBat = join(buildRoot, '_tllm_build.bat')
+      writeFileSync(compileBat, vcvarsBatch(vcvars!, compileArgs))
+      await runStep(winComSpec(), ['/c', compileBat], { cwd: buildRoot, env, signal, onLine: captureLog })
+    } else {
+      await runStep('cmake', compileArgs, { cwd: buildRoot, env, signal, onLine: captureLog })
+    }
   }
 
-  // 3) Compile just the server target (Ninja/Makefiles parallelize with -j; NMake ignores it).
-  hooks.phase('compiling')
-  const compileArgs = ['--build', buildSubdir, '-j', '--target', 'llama-server']
-  if (isWindows) {
-    const compileBat = join(buildRoot, '_tllm_build.bat')
-    writeFileSync(compileBat, vcvarsBatch(vcvars!, compileArgs))
-    await runStep(winComSpec(), ['/c', compileBat], { cwd: buildRoot, env, signal, onLine: hooks.log })
-  } else {
-    await runStep('cmake', compileArgs, { cwd: buildRoot, env, signal, onLine: hooks.log })
+  const buildLog: string[] = []
+  try {
+    await configureAndCompile(isMac ? CMAKE_CONFIGURE_ARGS_MACOS : CMAKE_CONFIGURE_ARGS, buildLog)
+  } catch (e) {
+    // Some forks reference Metal-backend symbols their own vendored ggml doesn't implement
+    // (their Metal support is incomplete, not TurboLLM's build config) — retry CPU-only rather
+    // than just failing. Not a concern on Windows/Linux, which don't attempt Metal at all.
+    if (!isMac || !isIncompleteMetalBackendError(buildLog)) throw e
+    hooks.log(
+      "This fork's Metal backend looks incomplete (references ggml_backend_metal_* symbols its " +
+        'own ggml build doesn\'t implement) — retrying as a CPU-only build.',
+    )
+    rmSync(buildSubdir, { recursive: true, force: true })
+    buildLog.length = 0
+    await configureAndCompile(CMAKE_CONFIGURE_ARGS_MACOS_CPU, buildLog)
   }
 
   // 4) Locate the produced binary (Ninja: build/bin/llama-server[.exe]; layouts vary).
