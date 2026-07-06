@@ -49,6 +49,7 @@ import type {
 } from '../lib/types'
 import { useUiStore } from '../stores/ui'
 import { ScreenHeader, InlineError } from '../components/common'
+import { StateChip } from '../components/StateChip'
 import { Badge } from '../components/ui/badge'
 import { Button } from '../components/ui/button'
 import { Skeleton } from '../components/ui/skeleton'
@@ -306,13 +307,13 @@ const metaFor = (id: string): EngineMeta => ENGINE_META[id] ?? FALLBACK_META
 type CompatLevel = 'ok' | 'caution' | 'none'
 const COMPAT_COLOR: Record<CompatLevel, string> = { ok: 'var(--ok)', caution: 'var(--warn)', none: 'var(--err)' }
 
-/** Green / amber / red hardware fit for a card. `comingSoon` engines skip the "needs a
- *  build" amber (that state is carried by the "Coming soon" chip) and just show fit. */
-function compatFor(fit: EngineFit, comingSoon: boolean): { level: CompatLevel; label: string } {
+/** Green / amber / red hardware fit for a card: incompatible (red) · compatible but with
+ *  no prebuilt so it must be built (amber) · ready to install/installed (green). */
+function compatFor(fit: EngineFit): { level: CompatLevel; label: string } {
   if (fit.compatible.length === 0) {
     return { level: 'none', label: fit.incompatibleReason ?? 'Not supported on your hardware' }
   }
-  if (!comingSoon && fit.compatible.every((v) => !v.hasPrebuilt)) {
+  if (fit.compatible.every((v) => !v.hasPrebuilt)) {
     return { level: 'caution', label: 'Runs after a build' }
   }
   return { level: 'ok', label: 'Compatible' }
@@ -370,7 +371,6 @@ export function EnginesScreen() {
       <ScreenHeader
         title="Engines"
         description="Pick the engine that fits your hardware. Each card shows what it’s good at, its trade-offs, and whether it runs on your machine."
-        actions={<AddEngineDialog />}
       />
 
       <div className="flex flex-col gap-5">
@@ -381,11 +381,6 @@ export function EnginesScreen() {
           backends={backendsQ.data}
           activeEngine={activeEngine}
         />
-
-        {/* Running-engine status (live stats + Stop/Restart). */}
-        {activeEngine && (
-          <EngineStatusHeader status={status} activeEngineName={activeEngine.name} />
-        )}
 
         {/* Zone 2 — engine gallery */}
         {enginesQ.isError ? (
@@ -475,6 +470,9 @@ function EngineHeaderBar({
   const activeBuild = activeEngine ? buildContextFor(activeEngine, backends) : null
 
   const busy = mut.activate.isPending
+  // The active engine's live run-state drives the traffic-light on the selector below
+  // (green running · amber starting · red error · grey stopped).
+  const engineState = status?.engine.state ?? 'stopped'
 
   const activate = (id: string) => {
     if (id === activeEngine?.id) return
@@ -489,7 +487,7 @@ function EngineHeaderBar({
 
   return (
     <div className="rounded-lg border border-border bg-panel p-4">
-      <div className="flex flex-wrap items-end justify-between gap-4">
+      <div className="flex flex-wrap items-start justify-between gap-4">
         <div className="min-w-0">
           <div className="flex items-center gap-1.5 text-[12px] font-medium text-muted">
             <Cpu size={13} className="shrink-0 text-accent" />
@@ -506,7 +504,7 @@ function EngineHeaderBar({
                 disabled={busy || groups.length === 0}
                 className="flex h-9 min-w-[220px] items-center gap-2 rounded-lg border border-border bg-bg px-3 text-[13px] text-ink transition-colors hover:border-[color:var(--accent)] disabled:opacity-60"
               >
-                <span className="flex h-2 w-2 shrink-0 rounded-full" style={{ background: activeEngine ? 'var(--ok)' : 'var(--faint)' }} />
+                <StateChip state={engineState} dotOnly className="shrink-0" />
                 <span className="flex-1 truncate text-left">
                   {activeGroup?.label ?? (groups.length ? 'No engine active' : 'No engine installed')}
                 </span>
@@ -597,6 +595,14 @@ function EngineHeaderBar({
           )}
         </div>
       </div>
+
+      {/* Active-engine status, merged into this panel (state light · model · live stats ·
+          Stop/Restart). The engine name lives once, in the selector above. */}
+      {activeEngine && (
+        <div className="mt-4 border-t border-border pt-3">
+          <EngineStatusHeader status={status} activeEngineName={activeEngine.name} embedded />
+        </div>
+      )}
 
       {showRebuildChip && activeEngine?.sourceRepo && (
         <BuildGuideDialog
@@ -881,17 +887,16 @@ function EngineCard({
   const [rebuildOpen, setRebuildOpen] = useState(false)
   const [buildsOpen, setBuildsOpen] = useState(false)
   const isLlama = e.id === 'llama.cpp'
-  const comingSoon = !!catalog?.comingSoon
   const sourceBuilt = !!catalog?.sourceBuilt
   const incompatible = fit.compatible.length === 0
   const buildYourself = !incompatible && fit.compatible.every((v) => !v.hasPrebuilt)
   const isInstalled = !!catalog?.installed
   const isEnabled = !!catalog?.enabled
   const isDisabled = isInstalled && !isEnabled
-  const compat = compatFor(fit, comingSoon)
+  const compat = compatFor(fit)
 
   return (
-    <div className="flex flex-col rounded-xl border border-border bg-panel p-4" style={comingSoon ? { opacity: 0.85 } : undefined}>
+    <div className="flex flex-col rounded-xl border border-border bg-panel p-4">
       {/* Identity row */}
       <div className="flex items-start gap-3">
         <div className="grid h-9 w-9 shrink-0 place-items-center rounded-[9px] bg-panel-2 text-muted">
@@ -908,8 +913,6 @@ function EngineCard({
               <span className="inline-flex items-center gap-1 text-[11px] font-medium text-muted">
                 <Check size={11} /> Installed
               </span>
-            ) : comingSoon ? (
-              <Badge variant="mono">Coming soon</Badge>
             ) : isDisabled ? (
               <Badge variant="mono">Disabled</Badge>
             ) : null}
@@ -971,9 +974,7 @@ function EngineCard({
         )}
 
         <div className="flex shrink-0 items-center gap-2">
-          {comingSoon ? (
-            <span className="text-[11px] text-muted">Not yet installable</span>
-          ) : isLlama ? (
+          {isLlama ? (
             <Button size="sm" variant="outline" onClick={() => setBuildsOpen((v) => !v)}>
               <Layers size={13} /> Manage GPU builds
               <ChevronDown size={13} className="transition-transform" style={{ transform: buildsOpen ? 'rotate(180deg)' : 'none' }} />
@@ -1065,7 +1066,7 @@ function EngineCard({
           ) : (
             <Button
               size="sm"
-              disabled={anyPending || incompatible || catalog.comingSoon || !installFor(catalog)}
+              disabled={anyPending || incompatible || !installFor(catalog)}
               onClick={() => onInstall(catalog)}
               title={incompatible ? fit.incompatibleReason ?? 'Not supported on this hardware' : `Install ${e.name}`}
             >
@@ -1091,7 +1092,7 @@ function EngineCard({
       )}
 
       {/* Honest per-engine update status (ADR-085) for enabled non-llama engines. */}
-      {!isLlama && !comingSoon && isEnabled && (
+      {!isLlama && isEnabled && (
         <div className="mt-2">
           <CatalogUpdateStatusLine st={updateStatus} />
         </div>

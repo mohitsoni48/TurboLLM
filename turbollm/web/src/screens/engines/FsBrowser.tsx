@@ -14,12 +14,12 @@ import {
 } from '../../components/ui/dialog'
 import { InlineError } from '../../components/common'
 
-/** In-app filesystem browser (spec 03 §9). Navigates directories under the
- *  daemon's home dir. In `file` mode (default) folder rows descend and file rows
- *  select; in `folder` mode folder rows still descend, but a "Select this folder"
- *  action picks the current directory (engine overhaul, Phase 3 — the guided scan
- *  takes a folder). Starts at the home dir (null path → server default). Server
- *  enforces the home-confinement; this is purely a navigator. */
+/** In-app filesystem browser (spec 03 §9). Navigates the local filesystem. In `file`
+ *  mode (default) folder rows descend and file rows select; in `folder` mode folder
+ *  rows still descend, but a "Select this folder" action picks the current directory
+ *  (engine overhaul, Phase 3 — the guided scan takes a folder). Starts at the home dir
+ *  (null path → server default); going "up" past a drive root reaches the drive list on
+ *  Windows. The `/fs/browse` endpoint is local-only (never reachable from the LAN). */
 export function FsBrowser({
   open,
   onOpenChange,
@@ -58,14 +58,14 @@ export function FsBrowser({
           <DialogDescription>
             {description ? description : mode === 'folder' ? (
               <>
-                Open the folder that contains your engine build, then click{' '}
+                Open the folder that contains your engine build — on any drive — then click{' '}
                 <span className="font-medium text-ink">Select this folder</span>. We&apos;ll scan it
-                for <code className="font-mono">llama-server</code>. Limited to your home directory.
+                for <code className="font-mono">llama-server</code>.
               </>
             ) : (
               <>
                 Navigate to the compiled <code className="font-mono">llama-server</code> executable
-                and click it to select. Limited to your home directory.
+                on any drive and click it to select.
               </>
             )}
           </DialogDescription>
@@ -83,9 +83,9 @@ export function FsBrowser({
           </Button>
           <div
             className="min-w-0 flex-1 truncate rounded-md border border-border bg-panel-2 px-2.5 py-1.5 font-mono text-[12px] text-muted"
-            title={data?.path ?? ''}
+            title={data?.path === '::drives' ? 'This PC' : data?.path ?? ''}
           >
-            {data?.path ?? '…'}
+            {data?.path === '::drives' ? 'This PC' : data?.path ?? '…'}
           </div>
           <Button
             variant="outline"
@@ -143,7 +143,10 @@ export function FsBrowser({
             Cancel
           </Button>
           {mode !== 'file' && (
-            <Button onClick={() => data?.path && choose(data.path)} disabled={!data?.path || isFetching}>
+            <Button
+              onClick={() => data?.path && choose(data.path)}
+              disabled={!data?.path || isFetching || data.path === '::drives'}
+            >
               <Check size={16} /> Select this folder
             </Button>
           )}

@@ -1,13 +1,31 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { useState, type ReactNode } from 'react'
-import { Boxes, ChevronRight, CircleSlash, Download, Loader2, MoreHorizontal, PackageSearch, RefreshCw, SlidersHorizontal, Star, Trash2, Zap } from 'lucide-react'
+import { useMemo, useState, type CSSProperties, type ReactNode } from 'react'
+import {
+  AlertTriangle,
+  Boxes,
+  Check,
+  ChevronDown,
+  CircleSlash,
+  Download,
+  FolderPlus,
+  Loader2,
+  MoreHorizontal,
+  PackageSearch,
+  RefreshCw,
+  Search,
+  SlidersHorizontal,
+  Star,
+  Trash2,
+  X,
+  Zap,
+} from 'lucide-react'
 import { ApiError, deleteModel } from '../lib/api'
 import { queryKeys, useModelActions, useModelDirs, useModelMutations, useModels, useStatus } from '../lib/queries'
 import { usePinnedModels } from '../lib/usePinnedModels'
 import type { ModelEntry } from '../lib/types'
 import { EmptyState, InlineError, ScreenHeader } from '../components/common'
-import { Badge } from '../components/ui/badge'
 import { Button } from '../components/ui/button'
+import { Input } from '../components/ui/input'
 import { Skeleton } from '../components/ui/skeleton'
 import {
   AlertDialog,
@@ -23,20 +41,31 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '../components/ui/dropdown-menu'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '../components/ui/dialog'
 import { toast } from '../components/ui/sonner'
 import { ModelDetailDialog } from './models/ModelDetailDialog'
 import { DiscoverTab } from './models/DiscoverTab'
 import { HfRepoDialog } from './models/HfRepoDialog'
-import { ModelDirs } from './models/ModelDirs'
+import { FsBrowser } from './engines/FsBrowser'
 
 type Filter = 'all' | 'vision' | 'moe' | 'nextn' | 'embedding'
 type Tab = 'library' | 'discover'
 
-/** A model name shared by 2+ quant variants becomes a collapsible group; a name
- *  with a single variant stays a flat row (spec 04 §2 / spec 11 §5). */
+/** A model name shared by 2+ quant variants renders as one row with a quant dropdown;
+ *  a single-variant name is a plain row (spec 04 §2 / spec 11 §5). */
 type Group = { name: string; variants: ModelEntry[] }
+
+/** Shared grid template so the column header and every row line up exactly. */
+const ROW_GRID: CSSProperties = { gridTemplateColumns: 'minmax(0,1fr) 104px 64px 52px 78px 148px' }
 
 function groupModels(models: ModelEntry[], isPinned: (key: string) => boolean): Group[] {
   const byName = new Map<string, ModelEntry[]>()
@@ -44,7 +73,6 @@ function groupModels(models: ModelEntry[], isPinned: (key: string) => boolean): 
     const k = m.name.toLowerCase()
     ;(byName.get(k) ?? byName.set(k, []).get(k)!).push(m)
   }
-  // Preserve the incoming (loaded-first, name-asc) order by first appearance.
   const order: string[] = []
   const seen = new Set<string>()
   for (const m of models) {
@@ -55,8 +83,7 @@ function groupModels(models: ModelEntry[], isPinned: (key: string) => boolean): 
     }
   }
   const groups = order.map((k) => ({ name: byName.get(k)![0].name, variants: byName.get(k)! }))
-  // Pinned/favourited models float to the top; a group is pinned when any of its
-  // variants is pinned. Stable partition keeps the existing order within each half.
+  // Pinned models float to the top; a group is pinned when any variant is pinned.
   const isGroupPinned = (g: Group) => g.variants.some((v) => isPinned(v.key))
   return [...groups.filter(isGroupPinned), ...groups.filter((g) => !isGroupPinned(g))]
 }
@@ -71,26 +98,23 @@ export function ModelsScreen() {
   const { isPinned, togglePinned } = usePinnedModels()
 
   // A load isn't instant: POST /load returns 202, then the engine spends seconds in
-  // `starting` before the model is `running`. Keep the Load buttons in a busy/loading
-  // state across that whole window — not just while the mutation POST is in flight —
-  // so the button never looks idle while a model is actually coming up.
+  // `starting` before `running`. Keep the Load buttons busy across that whole window.
   const engineState = status?.engine.state
   const loadBusy = actions.load.isPending || engineState === 'starting' || engineState === 'stopping'
-  // The specific model coming up: the mutation's own key while the POST is in flight,
-  // then the engine's reported loading model once it's `starting`.
   const loadingKey = actions.load.isPending
     ? actions.load.variables?.key
     : engineState === 'starting'
       ? status?.model?.key
       : undefined
+
   const [tab, setTab] = useState<Tab>('library')
   const [filter, setFilter] = useState<Filter>('all')
+  const [search, setSearch] = useState('')
   const [showIncompatible, setShowIncompatible] = useState(false)
+  const [foldersOpen, setFoldersOpen] = useState(false)
   const [openKey, setOpenKey] = useState<string | null>(null)
   const [confirmDelete, setConfirmDelete] = useState<ModelEntry | null>(null)
-  // "Find other quants" for a library model (re-download / pick a different quant):
-  // jump straight to its source repo when known (provenance), else open Discover
-  // pre-searched by model name (imported files have no recorded repo).
+  // "Find other quants": jump to the source repo when known, else Discover by name.
   const [discoverRepo, setDiscoverRepo] = useState<string | null>(null)
   const [presetSearch, setPresetSearch] = useState('')
   const onDiscover = (m: ModelEntry) => {
@@ -106,12 +130,23 @@ export function ModelsScreen() {
   const models = modelsQ.data?.models ?? []
   const dirs = dirsQ.data?.dirs ?? []
   const primaryDir = dirsQ.data?.primaryDir ?? ''
-  // Models the active engine can't load (ADR-044): GGUFs under MLX/vLLM, or
-  // safetensors under llama.cpp. Hidden by default; "Show all" reveals them.
   const incompatibleCount = models.filter((m) => !m.compatibleWithActiveEngine).length
+
+  // Facet-aware filter chips: only offer a facet that at least one model actually has.
+  const facetCounts = useMemo(
+    () => ({
+      vision: models.filter((m) => m.vision).length,
+      moe: models.filter((m) => m.moe).length,
+      nextn: models.filter((m) => (m.nextnLayers ?? 0) > 0).length,
+      embedding: models.filter((m) => m.embedding).length,
+    }),
+    [models],
+  )
+
+  const q = search.trim().toLowerCase()
   const filtered = models.filter((m) => {
     if (!showIncompatible && !m.compatibleWithActiveEngine) return false
-    if (filter === 'all') return true
+    if (q && !m.name.toLowerCase().includes(q)) return false
     if (filter === 'vision') return m.vision
     if (filter === 'moe') return m.moe
     if (filter === 'nextn') return (m.nextnLayers ?? 0) > 0
@@ -150,14 +185,6 @@ export function ModelsScreen() {
             ? 'GGUF models discovered in your folders — reuse what you already have, no re-downloading.'
             : 'Find and download GGUF models from Hugging Face, or import any direct .gguf URL.'
         }
-        actions={
-          tab === 'library' ? (
-            <Button variant="outline" size="sm" onClick={() => mut.rescan.mutate()} disabled={scanning}>
-              <RefreshCw size={14} className={scanning ? 'tllm-pulse' : ''} />
-              {scanning ? 'Scanning…' : 'Rescan'}
-            </Button>
-          ) : undefined
-        }
       />
 
       <div className="mb-5 flex items-center gap-1 border-b border-border">
@@ -177,23 +204,6 @@ export function ModelsScreen() {
         ))}
       </div>
 
-      {tab === 'library' && incompatibleCount > 0 && (
-        <div className="mb-4 flex items-center justify-between gap-3 rounded-[var(--radius)] border border-border bg-panel px-4 py-2.5 text-[12px]">
-          <span className="text-muted">
-            {showIncompatible
-              ? `Showing all models. ${incompatibleCount} can't load on the active engine.`
-              : `${incompatibleCount} ${incompatibleCount === 1 ? 'model is' : 'models are'} hidden — the active engine can't load ${incompatibleCount === 1 ? 'it' : 'them'}.`}
-          </span>
-          <button
-            type="button"
-            onClick={() => setShowIncompatible((v) => !v)}
-            className="shrink-0 font-medium text-accent hover:underline"
-          >
-            {showIncompatible ? 'Show compatible only' : 'Show all'}
-          </button>
-        </div>
-      )}
-
       {tab === 'discover' ? (
         <div className="min-h-0 flex-1">
           <DiscoverTab presetQuery={presetSearch} />
@@ -201,16 +211,22 @@ export function ModelsScreen() {
       ) : (
         <LibraryTab
           modelsQ={modelsQ}
-          mut={mut}
           actions={actions}
           loadBusy={loadBusy}
           loadingKey={loadingKey}
           dirs={dirs}
-          primaryDir={primaryDir}
           scanning={scanning}
           models={models}
+          search={search}
+          setSearch={setSearch}
           filter={filter}
           setFilter={setFilter}
+          facetCounts={facetCounts}
+          incompatibleCount={incompatibleCount}
+          showIncompatible={showIncompatible}
+          setShowIncompatible={setShowIncompatible}
+          rescan={() => mut.rescan.mutate()}
+          openFolders={() => setFoldersOpen(true)}
           groups={groups}
           setOpenKey={setOpenKey}
           setConfirmDelete={setConfirmDelete}
@@ -220,6 +236,13 @@ export function ModelsScreen() {
         />
       )}
 
+      <ModelFoldersDialog
+        open={foldersOpen}
+        onOpenChange={setFoldersOpen}
+        dirs={dirs}
+        primaryDir={primaryDir}
+        mut={mut}
+      />
       <ModelDetailDialog
         modelKey={openKey}
         onClose={() => setOpenKey(null)}
@@ -247,20 +270,24 @@ export function ModelsScreen() {
   )
 }
 
-/** The existing local-library view, unchanged in behavior — extracted so the Models
- *  screen can switch between Library and Discover tabs (spec 10 §2). */
 function LibraryTab({
   modelsQ,
-  mut,
   actions,
   loadBusy,
   loadingKey,
   dirs,
-  primaryDir,
   scanning,
   models,
+  search,
+  setSearch,
   filter,
   setFilter,
+  facetCounts,
+  incompatibleCount,
+  showIncompatible,
+  setShowIncompatible,
+  rescan,
+  openFolders,
   groups,
   setOpenKey,
   setConfirmDelete,
@@ -269,16 +296,22 @@ function LibraryTab({
   togglePinned,
 }: {
   modelsQ: ReturnType<typeof useModels>
-  mut: ReturnType<typeof useModelMutations>
   actions: ReturnType<typeof useModelActions>
   loadBusy: boolean
   loadingKey: string | undefined
   dirs: string[]
-  primaryDir: string
   scanning: boolean
   models: ModelEntry[]
+  search: string
+  setSearch: (s: string) => void
   filter: Filter
   setFilter: (f: Filter) => void
+  facetCounts: { vision: number; moe: number; nextn: number; embedding: number }
+  incompatibleCount: number
+  showIncompatible: boolean
+  setShowIncompatible: (v: boolean) => void
+  rescan: () => void
+  openFolders: () => void
   groups: Group[]
   setOpenKey: (k: string | null) => void
   setConfirmDelete: (m: ModelEntry | null) => void
@@ -286,17 +319,71 @@ function LibraryTab({
   isPinned: (key: string) => boolean
   togglePinned: (key: string) => void
 }) {
+  const facets = (
+    [
+      { id: 'vision', label: 'Vision', count: facetCounts.vision },
+      { id: 'moe', label: 'MoE', count: facetCounts.moe },
+      { id: 'nextn', label: 'NextN', count: facetCounts.nextn },
+      { id: 'embedding', label: 'Embed', count: facetCounts.embedding },
+    ] as { id: Filter; label: string; count: number }[]
+  ).filter((f) => f.count > 0)
+
+  const hasModels = models.length > 0
+
   return (
     <>
-      <ModelDirs dirs={dirs} primaryDir={primaryDir} mut={mut} />
-
-      {models.length > 0 && (
-        <div className="mb-4 flex items-center gap-2">
-          {(['all', 'vision', 'moe', 'nextn', 'embedding'] as Filter[]).map((f) => (
-            <FilterChip key={f} active={filter === f} onClick={() => setFilter(f)}>
-              {f === 'all' ? `All ${models.length}` : f === 'vision' ? 'Vision' : f === 'moe' ? 'MoE' : f === 'nextn' ? 'NextN' : 'Embed'}
+      {/* Toolbar: search · facet-aware filters · folders · rescan */}
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        {hasModels && (
+          <div className="relative min-w-[160px] flex-1">
+            <Search size={15} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-muted" />
+            <Input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search models"
+              className="w-full pl-8 text-[13px]"
+              aria-label="Search models"
+            />
+          </div>
+        )}
+        {hasModels && (
+          <div className="flex flex-wrap items-center gap-1.5">
+            <FilterChip active={filter === 'all'} onClick={() => setFilter('all')}>
+              All {models.length}
             </FilterChip>
-          ))}
+            {facets.map((f) => (
+              <FilterChip key={f.id} active={filter === f.id} onClick={() => setFilter(f.id)}>
+                {f.label} {f.count}
+              </FilterChip>
+            ))}
+          </div>
+        )}
+        <div className="ml-auto flex items-center gap-1.5">
+          <Button variant="outline" size="sm" onClick={openFolders}>
+            <FolderPlus size={14} />
+            Folders{dirs.length ? ` · ${dirs.length}` : ''}
+          </Button>
+          <Button variant="outline" size="sm" onClick={rescan} disabled={scanning}>
+            <RefreshCw size={14} className={scanning ? 'tllm-pulse' : ''} />
+            {scanning ? 'Scanning…' : 'Rescan'}
+          </Button>
+        </div>
+      </div>
+
+      {incompatibleCount > 0 && (
+        <div className="mb-4 flex items-center justify-between gap-3 rounded-[var(--radius)] border border-border bg-panel px-4 py-2.5 text-[12px]">
+          <span className="text-muted">
+            {showIncompatible
+              ? `Showing all models. ${incompatibleCount} can't load on the active engine.`
+              : `${incompatibleCount} ${incompatibleCount === 1 ? 'model is' : 'models are'} hidden — the active engine can't load ${incompatibleCount === 1 ? 'it' : 'them'}.`}
+          </span>
+          <button
+            type="button"
+            onClick={() => setShowIncompatible(!showIncompatible)}
+            className="shrink-0 font-medium text-accent hover:underline"
+          >
+            {showIncompatible ? 'Show compatible only' : 'Show all'}
+          </button>
         </div>
       )}
 
@@ -313,32 +400,38 @@ function LibraryTab({
           icon={<Boxes size={24} />}
           message={
             dirs.length === 0
-              ? 'No model folders yet. Add a folder above to discover the GGUF models you already have.'
+              ? 'No model folders yet. Add a folder to discover the GGUF models you already have.'
               : scanning
                 ? 'Scanning your folders…'
                 : 'No GGUF models found in your folders.'
           }
+          action={
+            dirs.length === 0 ? (
+              <Button size="sm" onClick={openFolders}>
+                <FolderPlus size={14} /> Add a folder
+              </Button>
+            ) : undefined
+          }
         />
+      ) : groups.length === 0 ? (
+        <EmptyState icon={<Search size={24} />} message="No models match your search or filter." />
       ) : (
-        <div className="flex flex-col gap-2">
-          {groups.map((g) =>
-            g.variants.length === 1 ? (
+        <div className="overflow-x-auto">
+          <div className="min-w-[720px] overflow-hidden rounded-xl border border-border bg-panel">
+            {/* Column header */}
+            <div
+              className="grid items-center gap-3 border-b border-border px-4 py-2 text-[11px] font-medium uppercase tracking-wide text-muted"
+              style={ROW_GRID}
+            >
+              <div>Model</div>
+              <div className="text-right">Quant</div>
+              <div className="text-right">Size</div>
+              <div className="text-right">Ctx</div>
+              <div className="text-right">Speed</div>
+              <div />
+            </div>
+            {groups.map((g) => (
               <ModelRow
-                key={g.variants[0].key}
-                m={g.variants[0]}
-                onLoad={() => actions.load.mutate({ key: g.variants[0].key })}
-                onEject={() => actions.eject.mutate()}
-                onTune={() => setOpenKey(g.variants[0].key)}
-                onDelete={() => setConfirmDelete(g.variants[0])}
-                onDiscover={() => onDiscover(g.variants[0])}
-                busy={loadBusy}
-                loadingThis={loadingKey === g.variants[0].key}
-                ejecting={actions.eject.isPending}
-                pinned={isPinned(g.variants[0].key)}
-                onTogglePin={() => togglePinned(g.variants[0].key)}
-              />
-            ) : (
-              <ModelGroupRow
                 key={g.name.toLowerCase()}
                 group={g}
                 onLoad={(key) => actions.load.mutate({ key })}
@@ -352,17 +445,14 @@ function LibraryTab({
                 isPinned={isPinned}
                 togglePinned={togglePinned}
               />
-            ),
-          )}
+            ))}
+          </div>
         </div>
       )}
     </>
   )
 }
 
-/** Inline delete-model mutation. Self-contained here (queries.ts is owned by a
- *  concurrent change) — invalidates the models + status queries on success so the
- *  list reflects the removed files. */
 function useDeleteModel() {
   const qc = useQueryClient()
   return useMutation({
@@ -374,7 +464,9 @@ function useDeleteModel() {
   })
 }
 
-function ModelGroupRow({
+/** One row per model name. Multiple quants collapse into a single row with a quant
+ *  dropdown; the selected quant drives Size / Ctx / Speed / Load and the row actions. */
+function ModelRow({
   group,
   onLoad,
   onEject,
@@ -399,190 +491,257 @@ function ModelGroupRow({
   isPinned: (key: string) => boolean
   togglePinned: (key: string) => void
 }) {
-  const [open, setOpen] = useState(false)
-  const anyLoaded = group.variants.some((v) => v.loaded)
-  const anyPinned = group.variants.some((v) => isPinned(v.key))
-  return (
-    <div className="rounded-lg border border-border bg-panel">
-      <button
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-center gap-3 px-4 py-3 text-left"
-      >
-        <ChevronRight
-          size={16}
-          className={`shrink-0 text-muted transition-transform ${open ? 'rotate-90' : ''}`}
-        />
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-1.5">
-            <span className="truncate font-medium text-ink">{group.name}</span>
-            {anyPinned && <Star size={13} className="shrink-0 fill-current text-accent" />}
-            {anyLoaded && <Tag tone="ok">loaded</Tag>}
-          </div>
-          <div className="mt-0.5 truncate text-[12px] text-muted">
-            {group.variants.length} variants
-            {group.variants[0].arch ? ` · ${group.variants[0].arch}` : ''}
-          </div>
-        </div>
-        <Badge variant="mono">{group.variants.length} quants</Badge>
-      </button>
+  const variants = group.variants
+  const multi = variants.length > 1
+  // Default the selected quant to the loaded variant, else the first. Falls back to the
+  // first if the selected key disappears (e.g. that quant was just deleted).
+  const [selKey, setSelKey] = useState(() => (variants.find((v) => v.loaded) ?? variants[0]).key)
+  const m = variants.find((v) => v.key === selKey) ?? variants[0]
 
-      {open && (
-        <div className="flex flex-col gap-2 border-t border-border px-3 pb-3 pt-2">
-          {group.variants.map((m) => (
-            <ModelRow
-              key={m.key}
-              m={m}
-              child
-              onLoad={() => onLoad(m.key)}
-              onEject={onEject}
-              onTune={() => onTune(m.key)}
-              onDelete={() => onDelete(m)}
-              onDiscover={() => onDiscover(m)}
-              busy={busy}
-              loadingThis={loadingKey === m.key}
-              ejecting={ejecting}
-              pinned={isPinned(m.key)}
-              onTogglePin={() => togglePinned(m.key)}
-            />
-          ))}
-        </div>
-      )}
-    </div>
-  )
-}
-
-function ModelRow({
-  m,
-  child,
-  onLoad,
-  onEject,
-  onTune,
-  onDelete,
-  onDiscover,
-  busy,
-  loadingThis,
-  ejecting,
-  pinned,
-  onTogglePin,
-}: {
-  m: ModelEntry
-  child?: boolean
-  onLoad: () => void
-  onEject: () => void
-  onTune: () => void
-  onDelete: () => void
-  onDiscover: () => void
-  /** Any load/engine transition is in progress — disable the Load buttons. */
-  busy: boolean
-  /** This specific model is the one currently coming up — show the spinner here. */
-  loadingThis: boolean
-  ejecting: boolean
-  /** This model is pinned/favourited — floats to the top of the list. */
-  pinned: boolean
-  onTogglePin: () => void
-}) {
+  const loaded = m.loaded
+  const pinned = isPinned(m.key)
   const loadable = !m.incomplete && !m.parseError
-  // Engine compatibility (ADR-044): shown in the "All" view via "Show all". An incompatible
-  // model can't be loaded by the active engine, so badge which engine it needs and block Load.
   const compatible = m.compatibleWithActiveEngine !== false
   const needsEngine = m.format === 'gguf' ? 'llama.cpp' : 'MLX or vLLM'
-  // Built-in NextN / multi-token-prediction head, read from GGUF metadata
-  // (`nextn_predict_layers`) — not guessed from the arch/name. Gemma-4 MTP needs a
-  // separate head file, so it isn't a list badge; it's offered in the tune dialog.
-  const modelHasNextn = (m.nextnLayers ?? 0) > 0
+  const problem = m.incomplete ? 'missing parts' : m.parseError ? 'unreadable' : !compatible ? `needs ${needsEngine}` : null
+  const loadingThis = loadingKey === m.key
+  const caps = [
+    m.vision && 'Vision',
+    m.moe && 'MoE',
+    m.embedding && 'Embed',
+    (m.nextnLayers ?? 0) > 0 && 'NextN',
+  ].filter(Boolean) as string[]
+
   return (
     <div
-      className={
-        child
-          ? 'group flex flex-col gap-2 rounded-md border border-border bg-panel-2 px-3 py-2.5 sm:flex-row sm:items-center sm:gap-3'
-          : 'group flex flex-col gap-2 rounded-lg border border-border bg-panel px-4 py-3 sm:flex-row sm:items-center sm:gap-3'
-      }
+      className="grid items-center gap-3 border-b border-border px-4 py-2.5 last:border-b-0"
+      style={{ ...ROW_GRID, ...(loaded ? { background: 'color-mix(in srgb, var(--ok) 6%, transparent)' } : {}) }}
     >
-      <div className="min-w-0 flex-1">
-        <div className="flex flex-wrap items-center gap-1.5">
-          <span className="min-w-0 break-words font-medium text-ink sm:truncate">{child ? m.quant : m.name}</span>
-          {m.loaded && <Tag tone="ok">loaded</Tag>}
-          {m.vision && <Tag>vision</Tag>}
-          {m.embedding && <Tag>embed</Tag>}
-          {m.moe && <Tag>MoE</Tag>}
-          {modelHasNextn && <Tag tone="spec">NextN</Tag>}
-          {m.hasProfile && <Tag>tuned</Tag>}
-          {m.incomplete && <Tag tone="warn">missing parts</Tag>}
-          {m.parseError && <Tag tone="err">unreadable</Tag>}
-          {!compatible && <Tag tone="warn">needs {needsEngine}</Tag>}
+      {/* Model */}
+      <div className="min-w-0">
+        <div className="flex items-center gap-2">
+          {pinned && <Star size={13} className="shrink-0 fill-current text-accent" />}
+          {loaded && <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: 'var(--ok)' }} />}
+          {problem && <AlertTriangle size={13} className="shrink-0" style={{ color: m.parseError ? 'var(--err)' : 'var(--warn)' }} />}
+          <span className="truncate text-[14px] font-medium text-ink">{group.name}</span>
+          {caps.slice(0, 2).map((c) => (
+            <CapChip key={c}>{c}</CapChip>
+          ))}
+          {m.hasProfile && <CapChip>tuned</CapChip>}
+          {problem && (
+            <span
+              className="shrink-0 whitespace-nowrap rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide"
+              style={{
+                color: m.parseError ? 'var(--err)' : 'var(--warn)',
+                background: `color-mix(in srgb, ${m.parseError ? 'var(--err)' : 'var(--warn)'} 14%, transparent)`,
+              }}
+            >
+              {problem}
+            </span>
+          )}
         </div>
         <div className="mt-0.5 truncate text-[12px] text-muted">
           {m.arch}
           {m.dir ? ` · ${m.dir}` : ''}
+          {loaded ? ' · running' : ''}
         </div>
       </div>
-      {/* Stats + actions wrap to a second row on mobile so the name above keeps the
-          full width and no longer gets crushed; inline on >= sm. */}
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-2 sm:flex-nowrap sm:gap-3">
-        {!child && <Badge variant="mono">{m.quant}</Badge>}
-        <Stat>{fmtSize(m.sizeBytes)}</Stat>
-        <Stat>{m.nativeCtx ? `${fmtCtx(m.nativeCtx)} ctx` : '—'}</Stat>
-        <TpsStat m={m} />
-        <div className="ml-auto flex items-center gap-1 sm:ml-0">
-          <button
-            type="button"
-            onClick={onTogglePin}
-            aria-label={pinned ? 'Unpin model' : 'Pin model to top'}
-            aria-pressed={pinned}
-            title={pinned ? 'Unpin' : 'Pin to top'}
-            className={`grid h-8 w-8 place-items-center rounded-md transition-colors hover:bg-panel-2 ${pinned ? 'text-accent' : 'text-muted hover:text-ink'}`}
-          >
-            <Star size={15} className={pinned ? 'fill-current' : ''} />
-          </button>
-          <Button
-            size="sm"
-            onClick={onLoad}
-            disabled={!loadable || !compatible || busy}
-            title={!loadable ? 'Model is incomplete or unreadable' : !compatible ? `The active engine can't load this model — switch to ${needsEngine}` : ''}
-          >
-            {loadingThis ? <Loader2 size={14} className="animate-spin" /> : <Zap size={14} />}
-            {loadingThis ? 'Loading…' : m.loaded ? 'Reload' : 'Load'}
-          </Button>
-          {m.incomplete && (
-            <Button size="sm" variant="outline" onClick={onDiscover} title="Download the missing shard files">
-              <Download size={14} />
-              Re-download
-            </Button>
-          )}
-          {m.loaded && (
-            <Button size="sm" variant="outline" onClick={onEject} disabled={ejecting} title="Eject model (stop the engine)">
-              <CircleSlash size={14} />
-              Eject
-            </Button>
-          )}
-          <Button size="sm" variant="ghost" onClick={onTune} disabled={!loadable} title="Load settings">
-            <SlidersHorizontal size={14} />
-          </Button>
+
+      {/* Quant — dropdown when the model has several, else a static label */}
+      <div className="flex justify-end">
+        {multi ? (
           <DropdownMenu>
             <DropdownMenuTrigger
-              aria-label="Model actions"
-              className="grid h-8 w-8 place-items-center rounded-md text-muted opacity-100 transition-opacity hover:bg-panel-2 hover:text-ink focus:opacity-100 data-[state=open]:opacity-100 sm:opacity-0 sm:group-hover:opacity-100"
+              aria-label="Choose quant"
+              className="inline-flex items-center gap-1 rounded-[var(--radius)] border border-border px-2 py-1 font-mono text-[13px] text-ink transition-colors hover:border-[color:var(--accent)]"
             >
-              <MoreHorizontal size={16} />
+              {m.quant}
+              <ChevronDown size={13} className="text-muted" />
             </DropdownMenuTrigger>
-            <DropdownMenuContent align="end">
-              <DropdownMenuItem onSelect={onDiscover}>
-                <PackageSearch size={14} /> Find other quants…
-              </DropdownMenuItem>
-              <DropdownMenuItem
-                destructive
-                disabled={m.loaded}
-                onSelect={onDelete}
-                title={m.loaded ? 'Eject the model before deleting' : undefined}
-              >
-                <Trash2 size={14} /> Delete file…
-              </DropdownMenuItem>
+            <DropdownMenuContent align="end" className="w-[220px]">
+              <div className="px-2 py-1.5 text-[11px] font-medium uppercase tracking-wide text-muted">
+                {variants.length} quants
+              </div>
+              {variants.map((v) => (
+                <DropdownMenuItem key={v.key} onSelect={() => setSelKey(v.key)} className="flex items-center gap-2">
+                  <span className="flex h-4 w-4 shrink-0 items-center justify-center">
+                    {v.key === m.key && <Check size={14} className="text-accent" />}
+                  </span>
+                  <span className="flex-1 font-mono text-[13px] text-ink">{v.quant}</span>
+                  {v.loaded && <span className="text-[11px]" style={{ color: 'var(--ok)' }}>loaded</span>}
+                  <span className="text-[11px] text-muted">{fmtSize(v.sizeBytes)}</span>
+                </DropdownMenuItem>
+              ))}
             </DropdownMenuContent>
           </DropdownMenu>
-        </div>
+        ) : (
+          <span className="font-mono text-[13px] text-muted">{m.quant}</span>
+        )}
+      </div>
+
+      {/* Size / Ctx / Speed — aligned numeric columns */}
+      <div className="text-right text-[13px] tabular-nums text-muted">{fmtSize(m.sizeBytes)}</div>
+      <div className="text-right text-[13px] tabular-nums text-muted">{m.nativeCtx ? fmtCtx(m.nativeCtx) : '—'}</div>
+      <div className="text-right">
+        <TpsStat m={m} />
+      </div>
+
+      {/* Actions — orange Load/Eject · settings · kebab (identical on every row) */}
+      <div className="flex items-center justify-end gap-1.5">
+        {loaded ? (
+          <Button size="sm" onClick={onEject} disabled={ejecting} title="Eject model (stop the engine)">
+            <CircleSlash size={14} />
+            Eject
+          </Button>
+        ) : (
+          <Button
+            size="sm"
+            onClick={() => onLoad(m.key)}
+            disabled={!loadable || !compatible || busy}
+            title={
+              !loadable
+                ? 'Model is incomplete or unreadable'
+                : !compatible
+                  ? `The active engine can't load this model — switch to ${needsEngine}`
+                  : ''
+            }
+          >
+            {loadingThis ? <Loader2 size={14} className="animate-spin" /> : <Zap size={14} />}
+            {loadingThis ? 'Loading…' : 'Load'}
+          </Button>
+        )}
+        <button
+          type="button"
+          onClick={() => onTune(m.key)}
+          disabled={!loadable}
+          aria-label="Load settings"
+          title="Load settings"
+          className="grid h-8 w-8 place-items-center rounded-md text-muted transition-colors hover:bg-panel-2 hover:text-ink disabled:opacity-40"
+        >
+          <SlidersHorizontal size={15} />
+        </button>
+        <DropdownMenu>
+          <DropdownMenuTrigger
+            aria-label="Model actions"
+            className="grid h-8 w-8 place-items-center rounded-md text-muted transition-colors hover:bg-panel-2 hover:text-ink"
+          >
+            <MoreHorizontal size={16} />
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            <DropdownMenuItem onSelect={() => togglePinned(m.key)}>
+              <Star size={14} /> {pinned ? 'Unpin' : 'Pin to top'}
+            </DropdownMenuItem>
+            {m.incomplete && (
+              <DropdownMenuItem onSelect={() => onDiscover(m)}>
+                <Download size={14} /> Re-download missing parts…
+              </DropdownMenuItem>
+            )}
+            <DropdownMenuItem onSelect={() => onDiscover(m)}>
+              <PackageSearch size={14} /> Find other quants…
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              destructive
+              disabled={m.loaded}
+              onSelect={() => onDelete(m)}
+              title={m.loaded ? 'Eject the model before deleting' : undefined}
+            >
+              <Trash2 size={14} /> Delete file…
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
       </div>
     </div>
+  )
+}
+
+/** Folder-management dialog: the scan folders + a real folder picker (any drive),
+ *  replacing the old paste-an-absolute-path panel that sat above the model list. */
+function ModelFoldersDialog({
+  open,
+  onOpenChange,
+  dirs,
+  primaryDir,
+  mut,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  dirs: string[]
+  primaryDir: string
+  mut: ReturnType<typeof useModelMutations>
+}) {
+  const [browse, setBrowse] = useState(false)
+  const addError = mut.addDir.error instanceof ApiError ? mut.addDir.error.message : null
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Model folders</DialogTitle>
+          <DialogDescription>
+            TurboLLM scans these folders for GGUF models. Downloads and imports land in the primary folder.
+          </DialogDescription>
+        </DialogHeader>
+
+        {dirs.length > 0 && (
+          <div className="flex flex-col gap-1.5">
+            {dirs.map((d) => {
+              const isPrimary = d === primaryDir
+              return (
+                <div key={d} className="group/dir flex items-center gap-2 rounded-md border border-border bg-panel-2 px-2.5 py-2 text-[13px]">
+                  <span className="min-w-0 flex-1 truncate font-mono text-muted" title={d}>{d}</span>
+                  {isPrimary ? (
+                    <span
+                      className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide"
+                      style={{ color: 'var(--ok)', background: 'color-mix(in srgb, var(--ok) 12%, transparent)' }}
+                    >
+                      Primary
+                    </span>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => mut.setPrimaryDir.mutate(d)}
+                      disabled={mut.setPrimaryDir.isPending}
+                      title="Downloads and imports will land in this folder"
+                      className="flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-faint transition-colors hover:text-ink"
+                    >
+                      <Star size={12} /> Set primary
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    aria-label={`Remove ${d}`}
+                    onClick={() => mut.removeDir.mutate(d)}
+                    className="shrink-0 rounded p-1 text-muted transition-colors hover:text-ink"
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
+              )
+            })}
+          </div>
+        )}
+
+        <div>
+          <Button size="sm" variant="outline" onClick={() => setBrowse(true)} disabled={mut.addDir.isPending}>
+            <FolderPlus size={14} /> Add folder…
+          </Button>
+          {addError && <p className="mt-2 text-[12px]" style={{ color: 'var(--err)' }}>{addError}</p>}
+        </div>
+
+        <FsBrowser
+          open={browse}
+          mode="folder"
+          title="Choose a model folder"
+          description="Open the folder that holds your GGUF models — on any drive — then click Select this folder."
+          onOpenChange={setBrowse}
+          onSelect={(p) => {
+            setBrowse(false)
+            mut.addDir.mutate(p)
+          }}
+        />
+      </DialogContent>
+    </Dialog>
   )
 }
 
@@ -637,10 +796,7 @@ function DeleteModelDialog({
   )
 }
 
-/** Presentational list of the file paths a delete will remove. The entry only
- *  carries the first shard path; for a split GGUF we synthesize the sibling part
- *  names from the `-NNNNN-of-MMMMM.gguf` pattern so the user sees what's affected.
- *  The backend is authoritative about what actually gets unlinked. */
+/** Presentational list of the file paths a delete will remove (split-GGUF aware). */
 function partPaths(m: ModelEntry): string[] {
   const sep = m.path.includes('\\') ? '\\' : '/'
   const file = m.path.slice(m.path.lastIndexOf(sep) + 1)
@@ -675,52 +831,42 @@ function FilterChip({ active, onClick, children }: { active: boolean; onClick: (
   )
 }
 
-function Tag({ children, tone }: { children: ReactNode; tone?: 'ok' | 'warn' | 'err' | 'spec' }) {
-  const color = tone === 'ok' ? 'var(--ok)' : tone === 'warn' ? 'var(--warn)' : tone === 'err' ? 'var(--err)' : tone === 'spec' ? 'var(--accent)' : 'var(--muted)'
+/** Quiet capability chip (vision / MoE / embed / NextN / tuned) — muted, never loud;
+ *  only problems get a warning color. */
+function CapChip({ children }: { children: ReactNode }) {
   return (
-    <span
-      className="rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide"
-      style={{ color, background: `color-mix(in srgb, ${color} 12%, transparent)` }}
-    >
+    <span className="shrink-0 whitespace-nowrap rounded bg-panel-2 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted">
       {children}
     </span>
   )
 }
 
-function Stat({ children }: { children: ReactNode }) {
-  return <div className="w-[72px] text-right text-[13px] text-muted">{children}</div>
-}
-
-/** Tiered tokens/sec for a model row (spec 04 §5 / 11 §5). Priority:
- *  live (currently loaded & generating → pulsing green) > last session > benchmark
- *  > "—". The tooltip names the source so live and historical figures don't read as
- *  the same thing. */
+/** Tiered tokens/sec (spec 04 §5): live (loaded & generating → pulsing green) >
+ *  last session > benchmark > "—". Tooltip names the source. */
 function TpsStat({ m }: { m: ModelEntry }) {
   if (m.liveTps != null) {
     return (
-      <div className="w-[72px] text-right text-[13px]" title="Live tokens/sec (loaded now)">
-        <span className="tllm-pulse inline-flex items-center gap-1 font-medium" style={{ color: 'var(--ok)' }}>
-          <span className="h-1.5 w-1.5 rounded-full" style={{ background: 'var(--ok)' }} />
-          {Math.round(m.liveTps)} t/s
-        </span>
-      </div>
+      <span className="inline-flex items-center gap-1 text-[13px] font-medium tabular-nums" style={{ color: 'var(--ok)' }} title="Live tokens/sec (loaded now)">
+        <span className="tllm-pulse h-1.5 w-1.5 rounded-full" style={{ background: 'var(--ok)' }} />
+        {Math.round(m.liveTps)} t/s
+      </span>
     )
   }
   if (m.lastTps != null) {
     return (
-      <div className="w-[72px] text-right text-[13px] text-ink" title="Last-session tokens/sec">
+      <span className="text-[13px] tabular-nums text-ink" title="Last-session tokens/sec">
         {Math.round(m.lastTps)} t/s
-      </div>
+      </span>
     )
   }
   if (m.benchTps != null) {
     return (
-      <div className="w-[72px] text-right text-[13px] text-muted" title="Benchmark tokens/sec">
+      <span className="text-[13px] tabular-nums text-muted" title="Benchmark tokens/sec">
         {Math.round(m.benchTps)} t/s
-      </div>
+      </span>
     )
   }
-  return <Stat>—</Stat>
+  return <span className="text-[13px] text-muted">—</span>
 }
 
 function fmtSize(b: number): string {

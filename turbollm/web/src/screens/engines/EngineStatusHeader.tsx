@@ -13,9 +13,13 @@ import { toast } from '../../components/ui/sonner'
 export function EngineStatusHeader({
   status,
   activeEngineName,
+  embedded = false,
 }: {
   status: Status | undefined
   activeEngineName: string | null
+  /** Rendered inside the header panel (no own card/border, engine name omitted —
+   *  it's already shown by the "Running now" selector above). */
+  embedded?: boolean
 }) {
   const state = status?.engine.state ?? 'stopped'
   const error = status?.engine.error
@@ -38,15 +42,17 @@ export function EngineStatusHeader({
     })
 
 
-  return (
-    <div className="rounded-[var(--radius)] border border-[color:var(--accent)] bg-panel p-4">
+  const body = (
+    <>
       <div className="flex flex-wrap items-center gap-3">
-        <div>
-          <div className="text-[12px] text-muted">Active engine</div>
-          <div className="text-sm font-semibold text-ink">
-            {activeEngineName ?? 'None active'}
+        {!embedded && (
+          <div>
+            <div className="text-[12px] text-muted">Active engine</div>
+            <div className="text-sm font-semibold text-ink">
+              {activeEngineName ?? 'None active'}
+            </div>
           </div>
-        </div>
+        )}
         <StateChip state={state} />
         {state === 'starting' && elapsedMs != null && (
           <span className="text-[13px] text-muted">
@@ -116,6 +122,13 @@ export function EngineStatusHeader({
           </pre>
         </div>
       )}
+    </>
+  )
+
+  if (embedded) return body
+  return (
+    <div className="rounded-[var(--radius)] border border-[color:var(--accent)] bg-panel p-4">
+      {body}
     </div>
   )
 }
