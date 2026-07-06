@@ -6,6 +6,7 @@ import { dirname, join, normalize } from 'node:path'
 import { Agent, setGlobalDispatcher } from 'undici'
 import { registerApi } from './api/routes'
 import { registerChatRoutes } from './chat/chat-routes'
+import { registerChatAgentRoutes } from './chat/chat-agent-routes'
 import { registerAgentRoutes } from './agents/agent-routes'
 import type { Deps } from './deps'
 import { registerGateway } from './gateway/gateway'
@@ -44,6 +45,7 @@ export function createApp(d: Deps): Hono {
 
   registerApi(app, d)
   registerChatRoutes(app, d)
+  registerChatAgentRoutes(app, d)
   registerAgentRoutes(app, d)
   registerGateway(app, d)
 

@@ -1,9 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Moon, Sun, Monitor, Save, ExternalLink, ShieldAlert, RefreshCw, Check, X, Loader2, AlertTriangle, ArrowUpCircle } from 'lucide-react'
-import {
-  PERSONAS, getDefaultPersonaId, getPersonalization, savePersonalization,
-  setDefaultPersonaId, type PersonaId, type Personalization,
-} from '../lib/personas'
+import { getPersonalization, savePersonalization, type Personalization } from '../lib/personas'
 import { ScreenHeader } from '../components/common'
 import { Button } from '../components/ui/button'
 import { useUiStore, type Theme } from '../stores/ui'
@@ -1222,12 +1219,10 @@ function StatRow({ label, value }: { label: string; value: string }) {
 // ── Personalization ───────────────────────────────────────────────────────────
 
 function PersonalizationSection() {
-  const [defaultPersona, setDefaultPersonaLocal] = useState<PersonaId>(() => getDefaultPersonaId())
   const [p, setP] = useState<Personalization>(() => getPersonalization())
   const [saved, setSaved] = useState(false)
 
   const handleSave = () => {
-    setDefaultPersonaId(defaultPersona)
     savePersonalization(p)
     setSaved(true)
     setTimeout(() => setSaved(false), 2000)
@@ -1237,29 +1232,11 @@ function PersonalizationSection() {
     <section className="rounded-lg border border-border bg-panel p-4">
       <h2 className="mb-1 text-[13px] font-semibold uppercase tracking-wide text-faint">Personalization</h2>
       <p className="mb-3 text-[12px] text-muted">
-        Applied as hidden context in every new conversation. Persona can also be changed per-chat.
+        Applied as hidden context in every new conversation, on top of whichever agent is selected. Manage
+        agents — including the default one for new chats — under Customize → Agents.
       </p>
 
       <div className="flex flex-col gap-4">
-        {/* Default persona */}
-        <div className="flex flex-col gap-2">
-          <div>
-            <div className="text-[14px] font-medium text-ink">Default persona</div>
-            <div className="text-[12px] text-muted">Applied to new chats unless overridden in the chat window</div>
-          </div>
-          <select
-            value={defaultPersona}
-            onChange={(e) => setDefaultPersonaLocal(e.target.value as PersonaId)}
-            className="rounded-md border border-border bg-bg px-2 py-1.5 text-[13px] text-ink outline-none"
-          >
-            {PERSONAS.map((persona) => (
-              <option key={persona.id} value={persona.id}>
-                {persona.name} — {persona.description}
-              </option>
-            ))}
-          </select>
-        </div>
-
         {/* Assistant name */}
         <div className="flex items-center justify-between gap-4">
           <div className="shrink-0">

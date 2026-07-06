@@ -589,6 +589,51 @@ export function deleteMcpServer(id: string): Promise<{ ok: true }> {
   return request<{ ok: true }>(`/api/v1/mcp/servers/${id}`, { method: 'DELETE' })
 }
 
+// ── Custom chat Agents (Customize → Agents) ───────────────────────────────────
+
+/** A user-created chat Agent: a named system prompt with a skill + tool allow-list,
+ *  selected when starting a new conversation (alongside the built-in personas). */
+export type CustomAgent = {
+  id: string
+  name: string
+  description: string
+  systemPrompt: string
+  skillIds: string[]
+  tools: string[]
+}
+
+export function fetchChatAgents(): Promise<CustomAgent[]> {
+  return request<CustomAgent[]>('/api/v1/chat-agents')
+}
+
+export function addChatAgent(agent: Omit<CustomAgent, 'id'>): Promise<CustomAgent> {
+  return request<CustomAgent>('/api/v1/chat-agents', { method: 'POST', json: agent })
+}
+
+export function updateChatAgent(id: string, patch: Partial<Omit<CustomAgent, 'id'>>): Promise<CustomAgent> {
+  return request<CustomAgent>(`/api/v1/chat-agents/${id}`, { method: 'PUT', json: patch })
+}
+
+export function deleteChatAgent(id: string): Promise<{ ok: true }> {
+  return request<{ ok: true }>(`/api/v1/chat-agents/${id}`, { method: 'DELETE' })
+}
+
+/** A saved customization of a built-in agent — only the changed fields are present.
+ *  Delete (reset) reverts to the frontend's hardcoded default for that id. */
+export type BuiltinAgentOverride = Partial<Pick<CustomAgent, 'name' | 'description' | 'systemPrompt' | 'skillIds' | 'tools'>>
+
+export function fetchBuiltinAgentOverrides(): Promise<Record<string, BuiltinAgentOverride>> {
+  return request<Record<string, BuiltinAgentOverride>>('/api/v1/chat-agents/builtin-overrides')
+}
+
+export function saveBuiltinAgentOverride(id: string, override: BuiltinAgentOverride): Promise<BuiltinAgentOverride> {
+  return request<BuiltinAgentOverride>(`/api/v1/chat-agents/builtin-overrides/${id}`, { method: 'PUT', json: override })
+}
+
+export function resetBuiltinAgentOverride(id: string): Promise<{ ok: true }> {
+  return request<{ ok: true }>(`/api/v1/chat-agents/builtin-overrides/${id}`, { method: 'DELETE' })
+}
+
 /** Re-exec the daemon so port / LAN-bind changes take effect (spec 08 §2). Returns
  *  202 immediately, then the daemon tears down and restarts; the socket briefly
  *  drops, so callers should poll /status until it responds again. */

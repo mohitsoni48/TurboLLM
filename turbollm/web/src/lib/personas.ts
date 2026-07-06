@@ -1,4 +1,4 @@
-export type PersonaId = 'default' | 'designer' | 'blank' | 'blunt' | 'concise' | 'detailed' | 'formal' | 'tutor' | 'creative' | 'research' | 'expert'
+export type PersonaId = 'default' | 'designer' | 'blank' | 'blunt' | 'concise' | 'detailed' | 'formal' | 'tutor' | 'creative' | 'research' | 'expert' | 'lite' | 'code'
 
 export interface Persona {
   id: PersonaId
@@ -53,7 +53,8 @@ const TURBOLLM_KNOWLEDGE =
   '**Customize** (Puzzle icon in nav):\n' +
   '- **MCP marketplace**: a Cloud tab (hosted MCPs connected via Streamable HTTP with an API key — GitHub, Linear, Stripe, Atlassian, Neon, Supabase, Cloudflare, Zapier, Apify, Mixpanel), a Local tab (open-source stdio MCPs spawned via npx/uvx — filesystem, git, postgres, playwright, etc.), and a Connected tab listing active servers (each with its real brand logo). One-click connect; only services that actually connect via a static key are listed (OAuth-only services are deliberately excluded).\n' +
   '- **Built-in web search**: its own section above the marketplace tabs (not mixed into the Local tab) — Tavily (default), Kagi, or SearXNG (self-hosted). Clicking one configures just that provider (API key or URL); the active one shows an "Active" badge and appears in the Connected tab too. Required for web_search, fetch_url, and the Research persona.\n' +
-  '- **Custom MCP servers**: add/edit/delete your own MCP servers (stdio subprocess or SSE/HTTP). Tools from all connected servers appear automatically as callable tools in chat, with no daemon restart.\n\n' +
+  '- **Custom MCP servers**: add/edit/delete your own MCP servers (stdio subprocess or SSE/HTTP). Tools from all connected servers appear automatically as callable tools in chat, with no daemon restart.\n' +
+  '- **Agents**: the built-in personas (below) plus any you create yourself — name, description, system prompt, and a checklist of which shared skills and which tools it may use (everything checked by default). Custom agents are picked from the same in-chat picker as the built-ins.\n\n' +
 
   '**Settings**:\n' +
   '- Theme: light / dark / system\n' +
@@ -68,10 +69,11 @@ const TURBOLLM_KNOWLEDGE =
   '- Telemetry: Off / Anonymous / Full\n' +
   '- About: current version, update-available chip (`npm i -g turbollm`), copy install command\n\n' +
 
-  '## Personas\n\n' +
-  'Personas are style presets selected at conversation creation; locked after the first message. All personas except Blank automatically get the text-chart capability, artifact rendering capability, and current date injected into the system prompt.\n\n' +
+  '## Agents (formerly "Personas")\n\n' +
+  'Agents are style presets selected at conversation creation; locked after the first message. All agents except Blank and Lite automatically get the text-chart capability, artifact rendering capability, and current date injected into the system prompt. Managed under Customize → Agents, alongside Skills and MCP Servers — built-in agents are read-only; custom agents you create there also carry a skill + tool allow-list (everything checked by default) that is baked into the conversation at creation.\n\n' +
   '- **Default**: balanced; Unicode chart/table + artifact rendering capability\n' +
   '- **Blank**: zero system prompt — raw model output, nothing injected\n' +
+  '- **Lite**: bare-bones system prompt (skips the chart/artifact capability text) for the fastest possible turnaround; every tool stays available\n' +
   '- **Concise**: shortest possible answers, bullet points over paragraphs\n' +
   '- **Detailed**: thorough explanations with context, examples, and reasoning\n' +
   '- **Blunt**: direct, no preamble, no pleasantries\n' +
@@ -79,6 +81,7 @@ const TURBOLLM_KNOWLEDGE =
   '- **Tutor**: asks a clarifying question first, then teaches step by step\n' +
   '- **Research**: forces 3–5 web_search calls before composing; cites all sources (requires a search provider key in Customize)\n' +
   '- **Creative**: vivid language, unexpected angles\n' +
+  '- **Code**: coding expert — correct, idiomatic code with minimal narration\n' +
   '- **Designer**: one self-contained artifact per response (html/svg/mermaid); optimized for mockups, UI components, diagrams; HARD offline constraint (no CDNs)\n' +
   '- **TurboLLM Expert**: this persona\n\n' +
 
@@ -293,6 +296,26 @@ export const PERSONAS: readonly Persona[] = [
     description: 'Knows TurboLLM inside-out — explains features, helps configure engines and models, and troubleshoots',
     systemPrompt: TURBOLLM_KNOWLEDGE,
   },
+  {
+    id: 'lite',
+    name: 'Lite',
+    description: 'Minimal system prompt for maximum speed — skips chart/artifact instructions, every tool stays available',
+    systemPrompt: '',
+  },
+  {
+    id: 'code',
+    name: 'Code',
+    description: 'Coding expert — correct, idiomatic code with minimal narration',
+    systemPrompt:
+      'You are an expert software engineer. Prioritize correct, idiomatic, production-quality code over verbose explanation.\n\n' +
+      '- Always put code in a fenced block with the right language tag.\n' +
+      '- Default to the codebase\'s existing style, libraries, and patterns when context is available; otherwise pick clean, modern, widely-used conventions for the language.\n' +
+      '- Keep prose minimal: a short note on approach/tradeoffs before the code, nothing after unless the user asks a follow-up question.\n' +
+      '- Do not pad with restating the request, apologies, or filler like "Certainly!" or "Here is the code you asked for".\n' +
+      '- Flag real correctness, security, or performance issues you notice — briefly, don\'t lecture.\n' +
+      '- If requirements are ambiguous in a way that changes the implementation, ask one focused question before writing code; otherwise make a reasonable choice and note the assumption in one line.\n' +
+      '- Prefer small, focused diffs over rewrites when editing existing code.',
+  },
 ]
 
 export interface Personalization {
@@ -307,25 +330,23 @@ const LS_ASSISTANT_NAME = 'tllm.personal.assistantName'
 const LS_USER_NAME = 'tllm.personal.userName'
 const LS_CUSTOM_INSTRUCTIONS = 'tllm.personal.customInstructions'
 
-function isPersonaId(v: unknown): v is PersonaId {
-  return PERSONAS.some((p) => p.id === v)
+/** Any string is a valid agent id here — besides the fixed built-in {@link PersonaId}s,
+ *  a user-created custom Agent (Customize → Agents) has an arbitrary server-issued id.
+ *  Callers resolve the id against the combined builtin + custom list at render time and
+ *  fall back gracefully (e.g. to the default agent) if it no longer exists. */
+export function getDefaultAgentId(): string {
+  return localStorage.getItem(LS_DEFAULT_PERSONA) || 'default'
 }
 
-export function getDefaultPersonaId(): PersonaId {
-  const v = localStorage.getItem(LS_DEFAULT_PERSONA)
-  return isPersonaId(v) ? v : 'default'
-}
-
-export function setDefaultPersonaId(id: PersonaId): void {
+export function setDefaultAgentId(id: string): void {
   localStorage.setItem(LS_DEFAULT_PERSONA, id)
 }
 
-export function getConvPersonaId(convId: string): PersonaId {
-  const v = localStorage.getItem(LS_CONV_PERSONA(convId))
-  return isPersonaId(v) ? v : getDefaultPersonaId()
+export function getConvAgentId(convId: string): string {
+  return localStorage.getItem(LS_CONV_PERSONA(convId)) || getDefaultAgentId()
 }
 
-export function setConvPersonaId(convId: string, id: PersonaId): void {
+export function setConvAgentId(convId: string, id: string): void {
   localStorage.setItem(LS_CONV_PERSONA(convId), id)
 }
 
@@ -394,13 +415,59 @@ When NOT to use them (important — do not over-render):
 - Code meant to be read, copied, or used in a project (a function, a script, a config) → a normal code block in its real language, NOT an artifact. Wrapping ordinary code in html/svg/mermaid is wrong.
 - A 1–2 number comparison → just say the numbers. Small text tables/sparklines → the Unicode style above.`
 
-/** Build the hidden system prompt for a new conversation from a persona + personalization. */
-export function buildSystemPrompt(personaId: PersonaId, p: Personalization): string {
-  if (personaId === 'blank') return ''
-  const persona = PERSONAS.find((px) => px.id === personaId)
+/** An agent as actually presented in the UI: a built-in persona (optionally
+ *  customized via a {@link BuiltinAgentOverride}) or a fully user-created custom
+ *  Agent. `skillIds`/`tools` are only set for custom agents and overridden
+ *  built-ins — undefined means "unrestricted" (today's behavior for every
+ *  untouched built-in). */
+export interface ResolvedAgent {
+  id: string
+  name: string
+  description: string
+  systemPrompt: string
+  builtin: boolean
+  /** True for a built-in that has a saved override (shown as "Modified" + resettable). */
+  overridden?: boolean
+  skillIds?: string[]
+  tools?: string[]
+}
+
+type MinimalCustomAgent = { id: string; name: string; description: string; systemPrompt: string; skillIds: string[]; tools: string[] }
+type MinimalOverride = { name?: string; description?: string; systemPrompt?: string; skillIds?: string[]; tools?: string[] }
+
+/** Merge the hardcoded built-in personas + their saved overrides + the user's custom
+ *  agents into one list — the single source of truth for the agent picker, the
+ *  Customize → Agents library, and conversation creation. */
+export function resolveAgents(customAgents: MinimalCustomAgent[], overrides: Record<string, MinimalOverride>): ResolvedAgent[] {
+  const builtins: ResolvedAgent[] = PERSONAS.map((p) => {
+    const o = overrides[p.id]
+    return {
+      id: p.id,
+      name: o?.name ?? p.name,
+      description: o?.description ?? p.description,
+      systemPrompt: o?.systemPrompt ?? p.systemPrompt,
+      builtin: true,
+      overridden: !!o,
+      skillIds: o?.skillIds,
+      tools: o?.tools,
+    }
+  })
+  const customs: ResolvedAgent[] = customAgents.map((a) => ({ ...a, builtin: false }))
+  return [...customs, ...builtins]
+}
+
+/** Build the hidden system prompt for a new conversation. `agentId` drives the
+ *  Blank/Lite special-cases; `systemPrompt` is the already-resolved effective text
+ *  (built-in default, its override, or a custom agent's prompt — see {@link resolveAgents}). */
+export function buildSystemPrompt(agentId: string, systemPrompt: string, p: Personalization): string {
+  if (agentId === 'blank') return ''
   const today = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
-  const parts: string[] = [TURBOLLM_BASE_CAPABILITY, TURBOLLM_ARTIFACTS_CAPABILITY, `Today's date is ${today}.`]
-  if (persona?.systemPrompt) parts.push(persona.systemPrompt)
+  // Lite skips the chart/artifact capability injection entirely — the point of the
+  // persona is the shortest possible hidden prompt.
+  const parts: string[] = agentId === 'lite'
+    ? [`Today's date is ${today}.`]
+    : [TURBOLLM_BASE_CAPABILITY, TURBOLLM_ARTIFACTS_CAPABILITY, `Today's date is ${today}.`]
+  if (systemPrompt) parts.push(systemPrompt)
   if (p.assistantName.trim()) parts.push(`Your name is ${p.assistantName.trim()}.`)
   if (p.userName.trim()) parts.push(`The user's name is ${p.userName.trim()}.`)
   if (p.customInstructions.trim()) parts.push(p.customInstructions.trim())

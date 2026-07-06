@@ -4,7 +4,7 @@ import { ArrowDown, Brain, Copy, Download, Paperclip, SendHorizontal, Share2, Sl
 import { continueConversation, fetchSysInfo, sendMessage } from '../lib/chat-api'
 import { extractPdfText } from '../lib/pdf-extract'
 import { useConversation, useConversationMutations } from '../lib/chat-queries'
-import { useModelActions, useModels, useStatus } from '../lib/queries'
+import { useBuiltinAgentOverrides, useChatAgents, useModelActions, useModels, useStatus } from '../lib/queries'
 import type { ChatSseEvent, LiveToolCall, Message } from '../lib/chat-types'
 import { appendTextDelta, upsertToolCall, type LiveBlock } from '../lib/live-timeline'
 import { ApiError, downloadChatExport, getDebugSnapshot, getShareUrl, importChat } from '../lib/api'
@@ -22,9 +22,8 @@ import { ModelDetailDialog } from './models/ModelDetailDialog'
 import { ConversationSettingsDialog } from './chat/ConversationSettingsDialog'
 import { useUiStore } from '../stores/ui'
 import {
-  PERSONAS, buildSystemPrompt, getConvPersonaId, getDefaultPersonaId,
-  getPersonalization, setConvPersonaId,
-  type PersonaId,
+  buildSystemPrompt, getConvAgentId, getDefaultAgentId,
+  getPersonalization, resolveAgents, setConvAgentId,
 } from '../lib/personas'
 
 // Sidebar width — persisted like DiscoverTab's list/detail split, an in-flow flex-basis
@@ -102,8 +101,14 @@ export function ChatScreen() {
     setThinkingEnabledState(val)
   }
 
-  // Persona — per-conversation, defaults to the global default from Settings.
-  const [selectedPersonaId, setSelectedPersonaId] = useState<PersonaId>(() => getDefaultPersonaId())
+  // Agent — per-conversation, defaults to the default set in Customize → Agents.
+  // A plain string: besides the fixed built-in ids, a custom agent's id is an
+  // arbitrary server-issued one, resolved against `allAgents` below.
+  const [selectedPersonaId, setSelectedPersonaId] = useState<string>(() => getDefaultAgentId())
+  const customAgentsQ = useChatAgents()
+  const builtinOverridesQ = useBuiltinAgentOverrides()
+  const allAgents = resolveAgents(customAgentsQ.data ?? [], builtinOverridesQ.data ?? {})
+  const selectedAgent = allAgents.find((a) => a.id === selectedPersonaId)
   const abortRef = useRef<AbortController | null>(null)
   const deltaTimestamps = useRef<number[]>([])
   const scrollerRef = useRef<HTMLDivElement>(null)
@@ -332,7 +337,7 @@ export function ChatScreen() {
     setActiveId(null)
     setInput('')
     setLive(null)
-    setSelectedPersonaId(getDefaultPersonaId())
+    setSelectedPersonaId(getDefaultAgentId())
     inputRef.current?.focus()
   }
 
@@ -340,7 +345,7 @@ export function ChatScreen() {
     if (live) { abortRef.current?.abort(); setLive(null) }
     setActiveId(id)
     setEditingId(null)
-    setSelectedPersonaId(getConvPersonaId(id))
+    setSelectedPersonaId(getConvAgentId(id))
     userScrolledUp.current = false
     setTimeout(() => scrollToBottom(true), 50)
   }
@@ -353,7 +358,7 @@ export function ChatScreen() {
     setActiveId(null)
     setEditingId(null)
     setInput('')
-    setSelectedPersonaId(getDefaultPersonaId())
+    setSelectedPersonaId(getDefaultAgentId())
   }
 
   const handleStop = async () => {
@@ -465,10 +470,11 @@ export function ChatScreen() {
     userScrolledUp.current = false
 
     try {
-      // Create conversation on first message, baking in the selected persona + personalization.
+      // Create conversation on first message, baking in the selected agent + personalization.
       let convId = activeId
       if (!convId) {
-        let sp = buildSystemPrompt(selectedPersonaId, getPersonalization())
+        const resolved = allAgents.find((a) => a.id === selectedPersonaId)
+        let sp = buildSystemPrompt(selectedPersonaId, resolved?.systemPrompt ?? '', getPersonalization())
         if (selectedPersonaId === 'expert') {
           try {
             const sys = await fetchSysInfo()
@@ -479,17 +485,20 @@ export function ChatScreen() {
             sp = sp ? `${sp}\n\n${hwSection}` : hwSection
           } catch { /* non-fatal — proceed without hardware info */ }
         }
-        const initialSkillIds = matchedSkill
-          ? Array.from(new Set([...pendingSkillIds, matchedSkill.id]))
-          : pendingSkillIds
+        const initialSkillIds = Array.from(new Set([
+          ...pendingSkillIds,
+          ...(resolved?.skillIds ?? []),
+          ...(matchedSkill ? [matchedSkill.id] : []),
+        ]))
         const newConv = await mut.create.mutateAsync({
           modelKey: model.key,
           systemPrompt: sp || undefined,
           toolPolicy: selectedPersonaId === 'research' ? 'force_web_search' : undefined,
           skillIds: initialSkillIds.length ? initialSkillIds : undefined,
+          allowedTools: resolved?.tools?.length ? resolved.tools : undefined,
         })
         convId = newConv.id
-        setConvPersonaId(convId, selectedPersonaId)
+        setConvAgentId(convId, selectedPersonaId)
         setActiveId(convId)
         setPendingSkillIds([])
       } else if (matchedSkill && !enabledSkillIds.includes(matchedSkill.id)) {
@@ -630,18 +639,15 @@ export function ChatScreen() {
           >
             <Brain size={15} />
           </Button>
-          {activeId && (() => {
-            const p = PERSONAS.find((px) => px.id === selectedPersonaId)
-            return p ? (
-              <span
-                title={p.description}
-                className="inline-flex items-center gap-1 rounded-full border border-border px-2 py-0.5 text-[11px] text-muted select-none"
-              >
-                <UserRound size={11} />
-                {p.name}
-              </span>
-            ) : null
-          })()}
+          {activeId && selectedAgent && (
+            <span
+              title={selectedAgent.description}
+              className="inline-flex items-center gap-1 rounded-full border border-border px-2 py-0.5 text-[11px] text-muted select-none"
+            >
+              <UserRound size={11} />
+              {selectedAgent.name}
+            </span>
+          )}
           {engineState === 'starting' && <span className="text-[12px] text-muted">Loading model…</span>}
           {engineState === 'stopping' && <span className="text-[12px] text-muted">Ejecting…</span>}
           {ready && (
@@ -732,7 +738,7 @@ export function ChatScreen() {
                 {model ? (
                   <>
                     <p className="text-[15px] font-medium text-ink">{model.name}</p>
-                    <PersonaPicker selected={selectedPersonaId} onChange={setSelectedPersonaId} />
+                    <AgentPicker selected={selectedPersonaId} onChange={setSelectedPersonaId} agents={allAgents} />
                     <div className="flex flex-wrap justify-center gap-2">
                       {['Explain something to me', 'Help me write', 'Review this code'].map((s) => (
                         <button
@@ -978,20 +984,23 @@ function SidebarResizeHandle({
   )
 }
 
-// ── Persona picker ─────────────────────────────────────────────────────────────
+// ── Agent picker ───────────────────────────────────────────────────────────────
 
-function PersonaPicker({ selected, onChange }: { selected: PersonaId; onChange: (id: PersonaId) => void }) {
+function AgentPicker({ selected, onChange, agents }: {
+  selected: string; onChange: (id: string) => void
+  agents: Array<{ id: string; name: string; description: string }>
+}) {
   return (
     <div className="flex flex-col items-center gap-1.5">
-      <p className="text-[11px] uppercase tracking-wide text-faint">Persona</p>
+      <p className="text-[11px] uppercase tracking-wide text-faint">Agent</p>
       <select
         value={selected}
-        onChange={(e) => onChange(e.target.value as PersonaId)}
+        onChange={(e) => onChange(e.target.value)}
         className="rounded-md border border-border bg-bg px-2 py-1.5 text-[13px] text-ink outline-none"
       >
-        {PERSONAS.map((p) => (
-          <option key={p.id} value={p.id}>
-            {p.name} — {p.description}
+        {agents.map((a) => (
+          <option key={a.id} value={a.id}>
+            {a.name} — {a.description}
           </option>
         ))}
       </select>

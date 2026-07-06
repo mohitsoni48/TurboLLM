@@ -75,6 +75,13 @@ import {
   addMcpServer,
   updateMcpServer,
   deleteMcpServer,
+  fetchChatAgents,
+  addChatAgent,
+  updateChatAgent,
+  deleteChatAgent,
+  fetchBuiltinAgentOverrides,
+  saveBuiltinAgentOverride,
+  resetBuiltinAgentOverride,
   restartDaemon,
   restartEngine,
   saveModelProfile,
@@ -83,6 +90,8 @@ import {
   stopEngine,
   type DaemonSettingsPatch,
   type McpServer,
+  type CustomAgent,
+  type BuiltinAgentOverride,
   type SysInfo,
   type TelemetryLevel,
 } from './api'
@@ -556,6 +565,39 @@ export function useMcpMutations() {
     add: useMutation({ mutationFn: (s: Omit<McpServer, 'id'>) => addMcpServer(s), onSuccess: refresh }),
     update: useMutation({ mutationFn: ({ id, patch }: { id: string; patch: Partial<Omit<McpServer, 'id'>> }) => updateMcpServer(id, patch), onSuccess: refresh }),
     remove: useMutation({ mutationFn: (id: string) => deleteMcpServer(id), onSuccess: refresh }),
+  }
+}
+
+// ── Custom chat Agents (Customize → Agents) ───────────────────────────────────
+
+export const chatAgentKeys = { list: ['chat-agents'] as const }
+
+export function useChatAgents(): UseQueryResult<CustomAgent[]> {
+  return useQuery({ queryKey: chatAgentKeys.list, queryFn: fetchChatAgents, staleTime: 0 })
+}
+
+export function useChatAgentMutations() {
+  const qc = useQueryClient()
+  const refresh = () => void qc.invalidateQueries({ queryKey: chatAgentKeys.list })
+  return {
+    add: useMutation({ mutationFn: (a: Omit<CustomAgent, 'id'>) => addChatAgent(a), onSuccess: refresh }),
+    update: useMutation({ mutationFn: ({ id, patch }: { id: string; patch: Partial<Omit<CustomAgent, 'id'>> }) => updateChatAgent(id, patch), onSuccess: refresh }),
+    remove: useMutation({ mutationFn: (id: string) => deleteChatAgent(id), onSuccess: refresh }),
+  }
+}
+
+export const builtinAgentOverrideKeys = { all: ['builtin-agent-overrides'] as const }
+
+export function useBuiltinAgentOverrides(): UseQueryResult<Record<string, BuiltinAgentOverride>> {
+  return useQuery({ queryKey: builtinAgentOverrideKeys.all, queryFn: fetchBuiltinAgentOverrides, staleTime: 0 })
+}
+
+export function useBuiltinAgentOverrideMutations() {
+  const qc = useQueryClient()
+  const refresh = () => void qc.invalidateQueries({ queryKey: builtinAgentOverrideKeys.all })
+  return {
+    save: useMutation({ mutationFn: ({ id, override }: { id: string; override: BuiltinAgentOverride }) => saveBuiltinAgentOverride(id, override), onSuccess: refresh }),
+    reset: useMutation({ mutationFn: (id: string) => resetBuiltinAgentOverride(id), onSuccess: refresh }),
   }
 }
 

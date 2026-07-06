@@ -180,6 +180,28 @@ export interface BuildConfig {
 export interface CloudDeployConfig {
   runpodTemplateId: string
 }
+/** A user-created chat Agent (Customize → Agents): a named system prompt with a
+ *  scoped skill + tool allow-list, selected when starting a new conversation —
+ *  distinct from {@link AgentType} below, which scopes the separate pi-driven
+ *  background-run engine (filesystem read/write roots, max iterations). Chat
+ *  agents never touch the filesystem outside the normal tool-approval gate. */
+export interface CustomChatAgent {
+  id: string
+  name: string
+  description: string
+  systemPrompt: string
+  /** Skill ids (from the shared skill library) auto-enabled when a conversation
+   *  starts with this agent. */
+  skillIds: string[]
+  /** Tool names (built-ins + MCP) this agent may call. Baked into the conversation
+   *  at creation time as an allow-list (spec: chat agents §1). */
+  tools: string[]
+}
+/** A saved customization of a built-in agent (Customize → Agents "Edit" + Reset).
+ *  Keyed by the built-in's fixed frontend id (e.g. 'default', 'code') — only the
+ *  fields the user changed need be present; Reset deletes the entry, reverting to
+ *  the frontend's hardcoded default. */
+export type BuiltinAgentOverride = Partial<Pick<CustomChatAgent, 'name' | 'description' | 'systemPrompt' | 'skillIds' | 'tools'>>
 /** One agent definition (spec 13 §2.1). Every agent — default, subagents, future
  *  write-capable coding agents — is an instance of this schema. */
 export interface AgentType {
@@ -274,6 +296,11 @@ export interface Config {
   mcp: McpConfig
   /** Agents + skills configuration (spec 13 §2.1). */
   agents: AgentsConfig
+  /** User-created chat Agents (Customize → Agents) — separate from {@link agents}
+   *  above (the background pi-agent-run schema). */
+  customAgents: CustomChatAgent[]
+  /** Per-built-in-agent customizations (Customize → Agents "Edit" + Reset). */
+  builtinAgentOverrides: Record<string, BuiltinAgentOverride>
   /** Compile-from-source settings (ADR-089/100): toolchain dirs prepended to PATH. */
   build: BuildConfig
   /** Cloud Launch deploy-link settings (ADR-153). */
@@ -389,6 +416,8 @@ export function defaultConfig(): Config {
     tools: {},
     mcp: { servers: [] },
     agents: { agents: [] },
+    customAgents: [],
+    builtinAgentOverrides: {},
     build: { toolchainDirs: [] },
     cloudDeploy: { runpodTemplateId: '' },
   }
@@ -663,6 +692,37 @@ function normalize(c: Config): void {
       })
     }
   }
+  // Custom chat agents (Customize → Agents): absent in pre-feature configs → [].
+  // Filter to well-shaped entries rather than throwing on a garbled config.
+  c.customAgents = Array.isArray(c.customAgents)
+    ? c.customAgents.filter((a): a is CustomChatAgent =>
+        !!a && typeof a === 'object' &&
+        typeof (a as CustomChatAgent).id === 'string' && typeof (a as CustomChatAgent).name === 'string')
+      .map((a) => ({
+        id: a.id,
+        name: a.name,
+        description: typeof a.description === 'string' ? a.description : '',
+        systemPrompt: typeof a.systemPrompt === 'string' ? a.systemPrompt : '',
+        skillIds: Array.isArray(a.skillIds) ? a.skillIds.filter((s): s is string => typeof s === 'string') : [],
+        tools: Array.isArray(a.tools) ? a.tools.filter((t): t is string => typeof t === 'string') : [],
+      }))
+    : []
+  // Built-in agent overrides (Customize → Agents "Edit" + Reset): absent in
+  // pre-feature configs → {}. Filter to well-shaped entries.
+  const rawOverrides = (c.builtinAgentOverrides ?? {}) as Record<string, unknown>
+  const builtinAgentOverrides: Record<string, BuiltinAgentOverride> = {}
+  for (const [id, v] of Object.entries(rawOverrides)) {
+    if (!v || typeof v !== 'object') continue
+    const o = v as Partial<BuiltinAgentOverride>
+    const clean: BuiltinAgentOverride = {}
+    if (typeof o.name === 'string') clean.name = o.name
+    if (typeof o.description === 'string') clean.description = o.description
+    if (typeof o.systemPrompt === 'string') clean.systemPrompt = o.systemPrompt
+    if (Array.isArray(o.skillIds)) clean.skillIds = o.skillIds.filter((s): s is string => typeof s === 'string')
+    if (Array.isArray(o.tools)) clean.tools = o.tools.filter((t): t is string => typeof t === 'string')
+    if (Object.keys(clean).length) builtinAgentOverrides[id] = clean
+  }
+  c.builtinAgentOverrides = builtinAgentOverrides
   // Compile-from-source toolchain dirs (ADR-089/100): absent in pre-build configs → [].
   // Keep only non-empty strings; the validator enforces absolute paths.
   const bd = (c.build ?? {}) as Partial<BuildConfig>
@@ -733,6 +793,25 @@ function validate(c: Config): void {
   // Agents (spec 13 §2.1): enforce the schema invariants so a bad config can't widen
   // an agent's filesystem scope or break the run manager's lookups.
   validateAgents(c)
+  validateCustomAgents(c)
+}
+
+/** Custom chat agents (Customize → Agents): unique non-empty ids/names, capped list. */
+const CUSTOM_AGENT_CAP = 50
+function validateCustomAgents(c: Config): void {
+  const ids = new Set<string>()
+  for (const a of c.customAgents) {
+    if (!a.id.trim()) throw new ValueError('customAgents', 'every agent needs a non-empty id')
+    if (ids.has(a.id)) throw new ValueError('customAgents', `duplicate agent id "${a.id}"`)
+    ids.add(a.id)
+    if (!a.name.trim()) throw new ValueError('customAgents', `agent "${a.id}" needs a non-empty name`)
+  }
+  if (c.customAgents.length > CUSTOM_AGENT_CAP) {
+    throw new ValueError('customAgents', `agent limit reached (${CUSTOM_AGENT_CAP})`)
+  }
+  if (Object.keys(c.builtinAgentOverrides).length > CUSTOM_AGENT_CAP) {
+    throw new ValueError('builtinAgentOverrides', `override limit reached (${CUSTOM_AGENT_CAP})`)
+  }
 }
 
 /** Validate the agents config block (spec 13 §2.1). Keeps the FS-scope invariant

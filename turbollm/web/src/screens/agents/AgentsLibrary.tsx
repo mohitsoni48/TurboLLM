@@ -1,0 +1,120 @@
+import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { Bot, Plus, RotateCcw, Star, Wrench } from 'lucide-react'
+import { Button } from '../../components/ui/button'
+import { toast } from '../../components/ui/sonner'
+import { useBuiltinAgentOverrideMutations, useBuiltinAgentOverrides, useChatAgents } from '../../lib/queries'
+import { resolveAgents, getDefaultAgentId, setDefaultAgentId, type ResolvedAgent } from '../../lib/personas'
+import { ApiError } from '../../lib/api'
+
+function AgentCard({ agent, isDefault, onOpen, onSetDefault, onReset }: {
+  agent: ResolvedAgent; isDefault: boolean; onOpen: () => void; onSetDefault: () => void; onReset: () => void
+}) {
+  const skillCount = agent.skillIds?.length
+  const toolCount = agent.tools?.length
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      onClick={onOpen}
+      onKeyDown={(e) => { if (e.key === 'Enter') onOpen() }}
+      className="flex flex-col gap-2 rounded-xl border border-border bg-panel px-4 py-3.5 text-left transition-colors hover:border-accent hover:bg-panel-2"
+    >
+      <div className="flex items-center gap-2">
+        <div className="grid h-8 w-8 shrink-0 place-items-center rounded-lg" style={{ background: 'color-mix(in srgb, var(--accent) 14%, transparent)' }}>
+          <Bot size={15} className="text-accent" />
+        </div>
+        <span className="min-w-0 flex-1 truncate text-[14px] font-medium text-ink">{agent.name}</span>
+        <button
+          type="button"
+          title={isDefault ? 'Default agent for new chats' : 'Set as default agent'}
+          onClick={(e) => { e.stopPropagation(); onSetDefault() }}
+          className="shrink-0 rounded p-0.5 text-faint transition-colors hover:text-accent"
+        >
+          <Star size={14} className={isDefault ? 'fill-current text-accent' : undefined} />
+        </button>
+        {agent.overridden && (
+          <button
+            type="button"
+            title="Reset to default"
+            onClick={(e) => { e.stopPropagation(); onReset() }}
+            className="shrink-0 rounded p-0.5 text-faint transition-colors hover:text-accent"
+          >
+            <RotateCcw size={13} />
+          </button>
+        )}
+        {agent.builtin && (
+          <span className="shrink-0 rounded-sm bg-panel-2 px-1.5 py-0.5 text-[10px] text-faint">
+            {agent.overridden ? 'modified' : 'built-in'}
+          </span>
+        )}
+      </div>
+      {agent.description && <p className="line-clamp-2 text-[12px] text-muted">{agent.description}</p>}
+      {(skillCount || toolCount) ? (
+        <p className="mt-auto flex items-center gap-1 truncate text-[11px] text-faint">
+          <Wrench size={10} />
+          {skillCount ? `${skillCount} skill${skillCount === 1 ? '' : 's'}` : null}
+          {skillCount && toolCount ? ' · ' : null}
+          {toolCount ? `${toolCount} tool${toolCount === 1 ? '' : 's'}` : null}
+        </p>
+      ) : null}
+    </div>
+  )
+}
+
+export function AgentsLibrary() {
+  const navigate = useNavigate()
+  const customQ = useChatAgents()
+  const overridesQ = useBuiltinAgentOverrides()
+  const overrideMut = useBuiltinAgentOverrideMutations()
+  const agents = resolveAgents(customQ.data ?? [], overridesQ.data ?? {})
+
+  const [defaultId, setDefaultIdLocal] = useState(() => getDefaultAgentId())
+  const handleSetDefault = (agent: ResolvedAgent) => {
+    setDefaultAgentId(agent.id)
+    setDefaultIdLocal(agent.id)
+    toast.success(`${agent.name} is now the default agent for new chats.`)
+  }
+
+  const handleReset = (agent: ResolvedAgent) => {
+    overrideMut.reset.mutate(agent.id, {
+      onSuccess: () => toast.success(`${agent.name} reset to its default.`),
+      onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not reset agent.'),
+    })
+  }
+
+  const loading = customQ.isLoading || overridesQ.isLoading
+
+  return (
+    <section className="rounded-lg border border-border bg-panel p-4">
+      <div className="mb-3 flex items-start justify-between gap-3">
+        <div>
+          <h2 className="mb-1 text-[13px] font-semibold uppercase tracking-wide text-faint">Agents</h2>
+          <p className="text-[12px] text-muted">
+            Pick one when starting a new chat. Built-in agents can be edited in place (Reset restores the default) — or create your own with a custom system prompt and a skill/tool allow-list.
+          </p>
+        </div>
+        <Button size="sm" onClick={() => navigate('/agents/new')} className="shrink-0">
+          <Plus size={14} /> New agent
+        </Button>
+      </div>
+
+      {loading ? (
+        <p className="py-8 text-center text-[13px] text-faint">Loading…</p>
+      ) : (
+        <div className="grid gap-2" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(185px, 1fr))' }}>
+          {agents.map((agent) => (
+            <AgentCard
+              key={agent.id}
+              agent={agent}
+              isDefault={agent.id === defaultId}
+              onOpen={() => navigate(`/agents/${agent.id}`)}
+              onSetDefault={() => handleSetDefault(agent)}
+              onReset={() => handleReset(agent)}
+            />
+          ))}
+        </div>
+      )}
+    </section>
+  )
+}

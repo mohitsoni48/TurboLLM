@@ -1,6 +1,6 @@
 import { useState, useMemo } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { ArrowLeft, Check, ChevronRight, Loader2, Pencil, Puzzle, Sparkles, Trash2, X } from 'lucide-react'
+import { ArrowLeft, Bot, Check, ChevronRight, Loader2, Pencil, Puzzle, Sparkles, Trash2, X } from 'lucide-react'
 import { ScreenHeader } from '../components/common'
 import { Button } from '../components/ui/button'
 import { toast } from '../components/ui/sonner'
@@ -12,8 +12,10 @@ import type { CloudEntry, LocalEntry, BuiltinSearchEntry } from '../lib/mcp-cata
 import { BRAND_ICONS } from '../lib/brand-icons'
 import { cn } from '../lib/utils'
 import { SkillsLibrary } from './skills/SkillsLibrary'
+import { AgentsLibrary } from './agents/AgentsLibrary'
 
 const CUSTOMIZE_TABS = [
+  { id: 'agents', label: 'Agents', icon: Bot },
   { id: 'skills', label: 'Skills', icon: Sparkles },
   { id: 'mcp',    label: 'MCP Servers', icon: Puzzle },
 ] as const
@@ -23,14 +25,15 @@ export function CustomizeScreen() {
   const { query: settingsQ } = useSettings()
   const settings = settingsQ.data
   const [searchParams, setSearchParams] = useSearchParams()
-  const activeTab: CustomizeTab = searchParams.get('tab') === 'mcp' ? 'mcp' : 'skills'
-  const setTab = (tab: CustomizeTab) => setSearchParams(tab === 'skills' ? {} : { tab }, { replace: true })
+  const tabParam = searchParams.get('tab')
+  const activeTab: CustomizeTab = tabParam === 'mcp' ? 'mcp' : tabParam === 'skills' ? 'skills' : 'agents'
+  const setTab = (tab: CustomizeTab) => setSearchParams(tab === 'agents' ? {} : { tab }, { replace: true })
 
   return (
     <div className="flex w-full flex-col gap-4 px-6 py-6">
       <ScreenHeader
         title="Customize"
-        description="Add tools, skills, and external providers the model can call during conversations."
+        description="Add agents, skills, and external providers the model can call during conversations."
       />
 
       <div className="inline-flex w-fit rounded-md border border-border p-0.5">
@@ -50,7 +53,9 @@ export function CustomizeScreen() {
         ))}
       </div>
 
-      {activeTab === 'skills' ? (
+      {activeTab === 'agents' ? (
+        <AgentsLibrary />
+      ) : activeTab === 'skills' ? (
         <SkillsLibrary />
       ) : (
         <McpSection

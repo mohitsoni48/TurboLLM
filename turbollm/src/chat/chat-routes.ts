@@ -78,11 +78,15 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   })
 
   app.post('/api/v1/conversations', async (c) => {
-    const b = await body<{ title?: string; systemPrompt?: string; modelKey?: string; toolPolicy?: string; skillIds?: string[] }>(c)
+    const b = await body<{ title?: string; systemPrompt?: string; modelKey?: string; toolPolicy?: string; skillIds?: string[]; allowedTools?: string[] }>(c)
     // Only keep ids that exist in the shared skill library; silently drop unknown ones.
     const validIds = new Set(new SkillStore(d.store.dir()).list().map((s) => s.id))
     const skillIds = Array.isArray(b.skillIds) ? b.skillIds.filter((sid) => validIds.has(sid)) : undefined
-    const conv = db.createConversation({ title: b.title, systemPrompt: b.systemPrompt, modelKey: b.modelKey, toolPolicy: b.toolPolicy, skillIds })
+    // Tool allow-list baked in from a custom chat Agent (Customize → Agents). Not
+    // validated against the live tool catalog — an MCP server disconnecting later
+    // shouldn't retroactively corrupt the conversation's saved intent.
+    const allowedTools = Array.isArray(b.allowedTools) ? b.allowedTools.filter((t) => typeof t === 'string') : undefined
+    const conv = db.createConversation({ title: b.title, systemPrompt: b.systemPrompt, modelKey: b.modelKey, toolPolicy: b.toolPolicy, skillIds, allowedTools })
     return c.json(conv, 201)
   })
 
@@ -658,7 +662,18 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
             : 'There is nothing to turn into a skill yet.'
         })
       : undefined
-    const toolDefs = skillTools ? [...baseToolDefs, ...skillTools.defs] : baseToolDefs
+    // Custom chat Agent tool allow-list (Customize → Agents), baked in at conversation
+    // creation. Undefined/empty = unrestricted — every built-in persona's conversations
+    // take this branch, so their tool list is byte-identical to before this feature.
+    // Applied ONLY to the base (built-in + MCP) registry: skill-granted tools like
+    // save_skill are never enumerated by /api/v1/tools (they only exist once their
+    // skill is enabled), so they can never appear in the allow-list checklist — gating
+    // them a second time here would silently strip save_skill from any agent that has
+    // 'skill-creator' enabled. Enabling the skill IS the allow decision for its tools.
+    const scopedBaseToolDefs = conv.allowedTools?.length
+      ? baseToolDefs.filter((t) => conv.allowedTools!.includes(t.function.name))
+      : baseToolDefs
+    const toolDefs = skillTools ? [...scopedBaseToolDefs, ...skillTools.defs] : scopedBaseToolDefs
 
     outerLoop: while (toolIter <= MAX_TOOL_ITER) {
       toolIter++

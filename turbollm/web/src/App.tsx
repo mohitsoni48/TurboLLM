@@ -16,6 +16,7 @@ import { ApiError, setAuthToken } from './lib/api'
 const WorkspaceScreen = lazy(() => import('./screens/WorkspaceScreen').then((m) => ({ default: m.WorkspaceScreen })))
 const ChatScreen = lazy(() => import('./screens/ChatScreen').then((m) => ({ default: m.ChatScreen })))
 const SkillEditPage = lazy(() => import('./screens/skills/SkillEditPage').then((m) => ({ default: m.SkillEditPage })))
+const AgentEditPage = lazy(() => import('./screens/agents/AgentEditPage').then((m) => ({ default: m.AgentEditPage })))
 const ModelsScreen = lazy(() => import('./screens/ModelsScreen').then((m) => ({ default: m.ModelsScreen })))
 const EnginesScreen = lazy(() => import('./screens/EnginesScreen').then((m) => ({ default: m.EnginesScreen })))
 const DeveloperScreen = lazy(() => import('./screens/DeveloperScreen').then((m) => ({ default: m.DeveloperScreen })))
@@ -88,6 +89,8 @@ export function App() {
             <Route path="/chat/:convId" element={<ChatScreen />} />
             {/* Skills: managed from within Customize; this route is just the create/edit page. */}
             <Route path="/skills/:skillId" element={<SkillEditPage />} />
+            {/* Agents: managed from within Customize; this route is just the create/edit page. */}
+            <Route path="/agents/:agentId" element={<AgentEditPage />} />
             <Route path="/models" element={<ModelsScreen />} />
             <Route path="/engines" element={<EnginesScreen />} />
             <Route path="/developer" element={<DeveloperScreen />} />

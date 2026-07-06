@@ -93,6 +93,9 @@ export interface Conversation {
    *  instructions are injected into the system prompt; 'skill-creator' additionally
    *  grants the save_skill tool. Undefined/empty = a plain chat with no skills. */
   skillIds?: string[]
+  /** Tool-name allow-list baked in from a custom chat Agent at creation (Customize →
+   *  Agents). Undefined/empty = unrestricted (every built-in persona). */
+  allowedTools?: string[]
   createdAt: string
   updatedAt: string
   messages?: Message[]
