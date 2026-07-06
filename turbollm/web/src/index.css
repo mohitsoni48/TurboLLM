@@ -251,7 +251,7 @@ html.tllm-resizing .tllm-split-resizer::after {
 /* Chat sidebar column — animates its own collapse/expand toggle, but that transition
    must not fight the drag-resize handle's per-pixel style mutation while dragging. */
 .tllm-chat-sidebar {
-  transition: width 0.15s;
+  transition: width 0.15s, transform 0.2s ease;
 }
 html.tllm-resizing .tllm-chat-sidebar {
   transition: none;

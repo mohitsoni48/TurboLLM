@@ -233,8 +233,8 @@ export function AgentEditPage() {
   }
 
   return (
-    <div className="flex w-full max-w-4xl flex-col gap-5 px-8 py-6">
-      <div className="flex items-center gap-2">
+    <div className="flex w-full max-w-4xl flex-col gap-5 px-4 py-6 md:px-8">
+      <div className="flex flex-wrap items-center gap-2">
         <button type="button" onClick={goBack} className="text-faint hover:text-ink" title="Back to agents"><ChevronLeft size={18} /></button>
         <span className="text-[15px] font-medium text-ink">
           {isNew ? 'New agent' : isBuiltin ? (override ? 'Edit agent (modified built-in)' : 'Edit agent (built-in)') : 'Edit agent'}

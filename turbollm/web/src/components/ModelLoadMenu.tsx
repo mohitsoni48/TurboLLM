@@ -41,7 +41,7 @@ export function ModelLoadMenu({
   return (
     <DropdownMenu>
       <DropdownMenuTrigger
-        className="flex h-8 max-w-[260px] items-center gap-1.5 rounded-md border border-border bg-panel px-2.5 text-[13px] text-ink transition-colors hover:border-[color:var(--accent)] disabled:opacity-60"
+        className="flex h-8 max-w-[160px] items-center gap-1.5 rounded-md border border-border bg-panel px-2.5 text-[13px] text-ink transition-colors hover:border-[color:var(--accent)] disabled:opacity-60 md:max-w-[260px]"
         disabled={pending}
       >
         {pending || ejecting ? (

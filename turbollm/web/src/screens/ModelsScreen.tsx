@@ -23,6 +23,8 @@ import { ApiError, deleteModel } from '../lib/api'
 import { queryKeys, useModelActions, useModelDirs, useModelMutations, useModels, useStatus } from '../lib/queries'
 import { usePinnedModels } from '../lib/usePinnedModels'
 import type { ModelEntry } from '../lib/types'
+import { cn } from '../lib/utils'
+import { useIsDesktop } from '../lib/useIsDesktop'
 import { EmptyState, InlineError, ScreenHeader } from '../components/common'
 import { Button } from '../components/ui/button'
 import { Input } from '../components/ui/input'
@@ -329,6 +331,9 @@ function LibraryTab({
   ).filter((f) => f.count > 0)
 
   const hasModels = models.length > 0
+  // Below md the wide six-column table would push its Load button ~350px off-screen,
+  // so each model renders as a stacked card instead. Desktop keeps the aligned table.
+  const isDesktop = useIsDesktop()
 
   return (
     <>
@@ -417,23 +422,26 @@ function LibraryTab({
         <EmptyState icon={<Search size={24} />} message="No models match your search or filter." />
       ) : (
         <div className="overflow-x-auto">
-          <div className="min-w-[720px] overflow-hidden rounded-xl border border-border bg-panel">
-            {/* Column header */}
-            <div
-              className="grid items-center gap-3 border-b border-border px-4 py-2 text-[11px] font-medium uppercase tracking-wide text-muted"
-              style={ROW_GRID}
-            >
-              <div>Model</div>
-              <div className="text-right">Quant</div>
-              <div className="text-right">Size</div>
-              <div className="text-right">Ctx</div>
-              <div className="text-right">Speed</div>
-              <div />
-            </div>
+          <div className={cn('overflow-hidden rounded-xl border border-border bg-panel', isDesktop && 'min-w-[720px]')}>
+            {/* Column header — desktop table only; the mobile card list needs none. */}
+            {isDesktop && (
+              <div
+                className="grid items-center gap-3 border-b border-border px-4 py-2 text-[11px] font-medium uppercase tracking-wide text-muted"
+                style={ROW_GRID}
+              >
+                <div>Model</div>
+                <div className="text-right">Quant</div>
+                <div className="text-right">Size</div>
+                <div className="text-right">Ctx</div>
+                <div className="text-right">Speed</div>
+                <div />
+              </div>
+            )}
             {groups.map((g) => (
               <ModelRow
                 key={g.name.toLowerCase()}
                 group={g}
+                layout={isDesktop ? 'row' : 'card'}
                 onLoad={(key) => actions.load.mutate({ key })}
                 onEject={() => actions.eject.mutate()}
                 onTune={(key) => setOpenKey(key)}
@@ -468,6 +476,7 @@ function useDeleteModel() {
  *  dropdown; the selected quant drives Size / Ctx / Speed / Load and the row actions. */
 function ModelRow({
   group,
+  layout = 'row',
   onLoad,
   onEject,
   onTune,
@@ -480,6 +489,8 @@ function ModelRow({
   togglePinned,
 }: {
   group: Group
+  /** 'row' = the aligned desktop table row; 'card' = the mobile stacked card. */
+  layout?: 'row' | 'card'
   onLoad: (key: string) => void
   onEject: () => void
   onTune: (key: string) => void
@@ -512,145 +523,167 @@ function ModelRow({
     (m.nextnLayers ?? 0) > 0 && 'NextN',
   ].filter(Boolean) as string[]
 
+  const loadedBg = loaded ? { background: 'color-mix(in srgb, var(--ok) 6%, transparent)' } : undefined
+
+  // ── Shared cells (rendered once; only one layout branch below uses them) ──────
+  const nameBlock = (
+    <div className="min-w-0">
+      <div className="flex items-center gap-2">
+        {pinned && <Star size={13} className="shrink-0 fill-current text-accent" />}
+        {loaded && <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: 'var(--ok)' }} />}
+        {problem && <AlertTriangle size={13} className="shrink-0" style={{ color: m.parseError ? 'var(--err)' : 'var(--warn)' }} />}
+        <span className="truncate text-[14px] font-medium text-ink">{group.name}</span>
+        {caps.slice(0, 2).map((c) => (
+          <CapChip key={c}>{c}</CapChip>
+        ))}
+        {m.hasProfile && <CapChip>tuned</CapChip>}
+        {problem && (
+          <span
+            className="shrink-0 whitespace-nowrap rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide"
+            style={{
+              color: m.parseError ? 'var(--err)' : 'var(--warn)',
+              background: `color-mix(in srgb, ${m.parseError ? 'var(--err)' : 'var(--warn)'} 14%, transparent)`,
+            }}
+          >
+            {problem}
+          </span>
+        )}
+      </div>
+      <div className="mt-0.5 truncate text-[12px] text-muted">
+        {m.arch}
+        {m.dir ? ` · ${m.dir}` : ''}
+        {loaded ? ' · running' : ''}
+      </div>
+    </div>
+  )
+
+  const quantEl = multi ? (
+    <DropdownMenu>
+      <DropdownMenuTrigger
+        aria-label="Choose quant"
+        className="inline-flex items-center gap-1 rounded-[var(--radius)] border border-border px-2 py-1 font-mono text-[13px] text-ink transition-colors hover:border-[color:var(--accent)]"
+      >
+        {m.quant}
+        <ChevronDown size={13} className="text-muted" />
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-[220px]">
+        <div className="px-2 py-1.5 text-[11px] font-medium uppercase tracking-wide text-muted">
+          {variants.length} quants
+        </div>
+        {variants.map((v) => (
+          <DropdownMenuItem key={v.key} onSelect={() => setSelKey(v.key)} className="flex items-center gap-2">
+            <span className="flex h-4 w-4 shrink-0 items-center justify-center">
+              {v.key === m.key && <Check size={14} className="text-accent" />}
+            </span>
+            <span className="flex-1 font-mono text-[13px] text-ink">{v.quant}</span>
+            {v.loaded && <span className="text-[11px]" style={{ color: 'var(--ok)' }}>loaded</span>}
+            <span className="text-[11px] text-muted">{fmtSize(v.sizeBytes)}</span>
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  ) : (
+    <span className="font-mono text-[13px] text-muted">{m.quant}</span>
+  )
+
+  const actionButtons = (
+    <>
+      {loaded ? (
+        <Button size="sm" onClick={onEject} disabled={ejecting} title="Eject model (stop the engine)">
+          <CircleSlash size={14} />
+          Eject
+        </Button>
+      ) : (
+        <Button
+          size="sm"
+          onClick={() => onLoad(m.key)}
+          disabled={!loadable || !compatible || busy}
+          title={
+            !loadable
+              ? 'Model is incomplete or unreadable'
+              : !compatible
+                ? `The active engine can't load this model — switch to ${needsEngine}`
+                : ''
+          }
+        >
+          {loadingThis ? <Loader2 size={14} className="animate-spin" /> : <Zap size={14} />}
+          {loadingThis ? 'Loading…' : 'Load'}
+        </Button>
+      )}
+      <button
+        type="button"
+        onClick={() => onTune(m.key)}
+        disabled={!loadable}
+        aria-label="Load settings"
+        title="Load settings"
+        className="grid h-8 w-8 place-items-center rounded-md text-muted transition-colors hover:bg-panel-2 hover:text-ink disabled:opacity-40"
+      >
+        <SlidersHorizontal size={15} />
+      </button>
+      <DropdownMenu>
+        <DropdownMenuTrigger
+          aria-label="Model actions"
+          className="grid h-8 w-8 place-items-center rounded-md text-muted transition-colors hover:bg-panel-2 hover:text-ink"
+        >
+          <MoreHorizontal size={16} />
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end">
+          <DropdownMenuItem onSelect={() => togglePinned(m.key)}>
+            <Star size={14} /> {pinned ? 'Unpin' : 'Pin to top'}
+          </DropdownMenuItem>
+          {m.incomplete && (
+            <DropdownMenuItem onSelect={() => onDiscover(m)}>
+              <Download size={14} /> Re-download missing parts…
+            </DropdownMenuItem>
+          )}
+          <DropdownMenuItem onSelect={() => onDiscover(m)}>
+            <PackageSearch size={14} /> Find other quants…
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem
+            destructive
+            disabled={m.loaded}
+            onSelect={() => onDelete(m)}
+            title={m.loaded ? 'Eject the model before deleting' : undefined}
+          >
+            <Trash2 size={14} /> Delete file…
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </>
+  )
+
+  // Mobile: a stacked card — name, a compact meta line, then the actions row — so the
+  // Load button stays on-screen instead of scrolled ~350px right in the wide table.
+  if (layout === 'card') {
+    return (
+      <div className="flex flex-col gap-2 border-b border-border px-4 py-3 last:border-b-0" style={loadedBg}>
+        {nameBlock}
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px] text-muted">
+          {quantEl}
+          <span className="tabular-nums">{fmtSize(m.sizeBytes)}</span>
+          <span className="tabular-nums">{m.nativeCtx ? fmtCtx(m.nativeCtx) : '—'}</span>
+          <TpsStat m={m} />
+        </div>
+        <div className="flex items-center gap-1.5">{actionButtons}</div>
+      </div>
+    )
+  }
+
+  // Desktop: the aligned six-column table row (unchanged).
   return (
     <div
       className="grid items-center gap-3 border-b border-border px-4 py-2.5 last:border-b-0"
-      style={{ ...ROW_GRID, ...(loaded ? { background: 'color-mix(in srgb, var(--ok) 6%, transparent)' } : {}) }}
+      style={{ ...ROW_GRID, ...(loadedBg ?? {}) }}
     >
-      {/* Model */}
-      <div className="min-w-0">
-        <div className="flex items-center gap-2">
-          {pinned && <Star size={13} className="shrink-0 fill-current text-accent" />}
-          {loaded && <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: 'var(--ok)' }} />}
-          {problem && <AlertTriangle size={13} className="shrink-0" style={{ color: m.parseError ? 'var(--err)' : 'var(--warn)' }} />}
-          <span className="truncate text-[14px] font-medium text-ink">{group.name}</span>
-          {caps.slice(0, 2).map((c) => (
-            <CapChip key={c}>{c}</CapChip>
-          ))}
-          {m.hasProfile && <CapChip>tuned</CapChip>}
-          {problem && (
-            <span
-              className="shrink-0 whitespace-nowrap rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide"
-              style={{
-                color: m.parseError ? 'var(--err)' : 'var(--warn)',
-                background: `color-mix(in srgb, ${m.parseError ? 'var(--err)' : 'var(--warn)'} 14%, transparent)`,
-              }}
-            >
-              {problem}
-            </span>
-          )}
-        </div>
-        <div className="mt-0.5 truncate text-[12px] text-muted">
-          {m.arch}
-          {m.dir ? ` · ${m.dir}` : ''}
-          {loaded ? ' · running' : ''}
-        </div>
-      </div>
-
-      {/* Quant — dropdown when the model has several, else a static label */}
-      <div className="flex justify-end">
-        {multi ? (
-          <DropdownMenu>
-            <DropdownMenuTrigger
-              aria-label="Choose quant"
-              className="inline-flex items-center gap-1 rounded-[var(--radius)] border border-border px-2 py-1 font-mono text-[13px] text-ink transition-colors hover:border-[color:var(--accent)]"
-            >
-              {m.quant}
-              <ChevronDown size={13} className="text-muted" />
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="w-[220px]">
-              <div className="px-2 py-1.5 text-[11px] font-medium uppercase tracking-wide text-muted">
-                {variants.length} quants
-              </div>
-              {variants.map((v) => (
-                <DropdownMenuItem key={v.key} onSelect={() => setSelKey(v.key)} className="flex items-center gap-2">
-                  <span className="flex h-4 w-4 shrink-0 items-center justify-center">
-                    {v.key === m.key && <Check size={14} className="text-accent" />}
-                  </span>
-                  <span className="flex-1 font-mono text-[13px] text-ink">{v.quant}</span>
-                  {v.loaded && <span className="text-[11px]" style={{ color: 'var(--ok)' }}>loaded</span>}
-                  <span className="text-[11px] text-muted">{fmtSize(v.sizeBytes)}</span>
-                </DropdownMenuItem>
-              ))}
-            </DropdownMenuContent>
-          </DropdownMenu>
-        ) : (
-          <span className="font-mono text-[13px] text-muted">{m.quant}</span>
-        )}
-      </div>
-
-      {/* Size / Ctx / Speed — aligned numeric columns */}
+      {nameBlock}
+      <div className="flex justify-end">{quantEl}</div>
       <div className="text-right text-[13px] tabular-nums text-muted">{fmtSize(m.sizeBytes)}</div>
       <div className="text-right text-[13px] tabular-nums text-muted">{m.nativeCtx ? fmtCtx(m.nativeCtx) : '—'}</div>
       <div className="text-right">
         <TpsStat m={m} />
       </div>
-
-      {/* Actions — orange Load/Eject · settings · kebab (identical on every row) */}
-      <div className="flex items-center justify-end gap-1.5">
-        {loaded ? (
-          <Button size="sm" onClick={onEject} disabled={ejecting} title="Eject model (stop the engine)">
-            <CircleSlash size={14} />
-            Eject
-          </Button>
-        ) : (
-          <Button
-            size="sm"
-            onClick={() => onLoad(m.key)}
-            disabled={!loadable || !compatible || busy}
-            title={
-              !loadable
-                ? 'Model is incomplete or unreadable'
-                : !compatible
-                  ? `The active engine can't load this model — switch to ${needsEngine}`
-                  : ''
-            }
-          >
-            {loadingThis ? <Loader2 size={14} className="animate-spin" /> : <Zap size={14} />}
-            {loadingThis ? 'Loading…' : 'Load'}
-          </Button>
-        )}
-        <button
-          type="button"
-          onClick={() => onTune(m.key)}
-          disabled={!loadable}
-          aria-label="Load settings"
-          title="Load settings"
-          className="grid h-8 w-8 place-items-center rounded-md text-muted transition-colors hover:bg-panel-2 hover:text-ink disabled:opacity-40"
-        >
-          <SlidersHorizontal size={15} />
-        </button>
-        <DropdownMenu>
-          <DropdownMenuTrigger
-            aria-label="Model actions"
-            className="grid h-8 w-8 place-items-center rounded-md text-muted transition-colors hover:bg-panel-2 hover:text-ink"
-          >
-            <MoreHorizontal size={16} />
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end">
-            <DropdownMenuItem onSelect={() => togglePinned(m.key)}>
-              <Star size={14} /> {pinned ? 'Unpin' : 'Pin to top'}
-            </DropdownMenuItem>
-            {m.incomplete && (
-              <DropdownMenuItem onSelect={() => onDiscover(m)}>
-                <Download size={14} /> Re-download missing parts…
-              </DropdownMenuItem>
-            )}
-            <DropdownMenuItem onSelect={() => onDiscover(m)}>
-              <PackageSearch size={14} /> Find other quants…
-            </DropdownMenuItem>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem
-              destructive
-              disabled={m.loaded}
-              onSelect={() => onDelete(m)}
-              title={m.loaded ? 'Eject the model before deleting' : undefined}
-            >
-              <Trash2 size={14} /> Delete file…
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-      </div>
+      <div className="flex items-center justify-end gap-1.5">{actionButtons}</div>
     </div>
   )
 }

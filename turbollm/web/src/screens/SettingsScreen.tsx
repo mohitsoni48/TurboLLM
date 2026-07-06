@@ -279,22 +279,24 @@ export function SettingsScreen() {
       gatewayKeepN !== (settings.gateway?.keepN ?? 1))
 
   return (
-    <div className="w-full px-6 py-6">
+    <div className="w-full px-4 py-6 md:px-6">
       <ScreenHeader title="Settings" description="Configure TurboLLM behavior and appearance." />
 
       {restartOverlay && <RestartOverlay onDismiss={() => setRestartOverlay(false)} />}
 
-      <div className="relative flex gap-6">
-        {/* Left rail: category nav */}
-        <nav className="w-44 shrink-0">
-          <div className="flex flex-col gap-1">
+      {/* Two-pane on desktop; below md the rail stacks above the content as a
+          horizontal, scrollable tab strip (same pattern as Customize). */}
+      <div className="relative flex flex-col gap-4 md:flex-row md:gap-6">
+        {/* Category nav: vertical rail at md+, horizontal scroller on mobile. */}
+        <nav className="shrink-0 md:w-44">
+          <div className="flex gap-1 overflow-x-auto pb-1 md:flex-col md:overflow-visible md:pb-0">
             {SETTINGS_CATS.map(({ id, label, icon: Icon }) => (
               <button
                 key={id}
                 type="button"
                 onClick={() => setActiveCat(id)}
                 className={cn(
-                  'flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-[13px] font-medium transition-colors',
+                  'flex shrink-0 items-center gap-2 whitespace-nowrap rounded-md px-3 py-2 text-left text-[13px] font-medium transition-colors md:w-full',
                   activeCat === id ? 'bg-accent/12 text-accent' : 'text-muted hover:text-ink',
                 )}
               >
@@ -312,7 +314,7 @@ export function SettingsScreen() {
               {/* Theme */}
               <section className="rounded-lg border border-border bg-panel p-4">
                 <h2 className="mb-3 text-[13px] font-semibold uppercase tracking-wide text-faint">Appearance</h2>
-                <div className="flex items-center justify-between">
+                <div className="flex flex-col items-start gap-3 sm:flex-row sm:items-center sm:justify-between">
                   <div>
                     <div className="text-[14px] font-medium text-ink">Theme</div>
                     <div className="text-[12px] text-muted">Choose light, dark, or follow your system setting</div>
@@ -613,7 +615,7 @@ export function SettingsScreen() {
 
           {/* Unified sticky Save bar — only for daemon-settings draft changes. */}
           {dirty && (
-            <div className="sticky bottom-0 -mx-6 mt-2 flex items-center justify-between border-t border-border bg-panel px-6 py-3">
+            <div className="sticky bottom-0 -mx-4 mt-2 flex items-center justify-between border-t border-border bg-panel px-4 py-3 md:-mx-6 md:px-6">
               <span className="text-[13px] text-muted">Unsaved changes</span>
               <Button onClick={handleSave} disabled={save.isPending || settingsQ.isLoading}>
                 <Save size={14} />
@@ -1337,7 +1339,7 @@ function PersonalizationSection() {
 
       <div className="flex flex-col gap-4">
         {/* Assistant name */}
-        <div className="flex items-center justify-between gap-4">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
           <div className="shrink-0">
             <div className="text-[14px] font-medium text-ink">Assistant name</div>
             <div className="text-[12px] text-muted">What the assistant calls itself (empty = model default)</div>
@@ -1347,12 +1349,12 @@ function PersonalizationSection() {
             value={p.assistantName}
             onChange={(e) => setP((prev) => ({ ...prev, assistantName: e.target.value }))}
             placeholder="e.g. Aria"
-            className="w-40 rounded-md border border-border bg-bg px-2 py-1 text-[13px] text-ink outline-none placeholder:text-faint"
+            className="w-full rounded-md border border-border bg-bg px-2 py-1 text-[13px] text-ink outline-none placeholder:text-faint sm:w-40"
           />
         </div>
 
         {/* User name */}
-        <div className="flex items-center justify-between gap-4">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
           <div className="shrink-0">
             <div className="text-[14px] font-medium text-ink">Your name</div>
             <div className="text-[12px] text-muted">How the assistant addresses you (empty = not set)</div>
@@ -1362,7 +1364,7 @@ function PersonalizationSection() {
             value={p.userName}
             onChange={(e) => setP((prev) => ({ ...prev, userName: e.target.value }))}
             placeholder="e.g. Alex"
-            className="w-40 rounded-md border border-border bg-bg px-2 py-1 text-[13px] text-ink outline-none placeholder:text-faint"
+            className="w-full rounded-md border border-border bg-bg px-2 py-1 text-[13px] text-ink outline-none placeholder:text-faint sm:w-40"
           />
         </div>
 

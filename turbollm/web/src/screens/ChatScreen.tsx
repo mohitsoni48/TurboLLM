@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type RefObject } from 'react'
 import { useParams, useSearchParams } from 'react-router-dom'
-import { ArrowDown, Brain, Copy, Download, Paperclip, SendHorizontal, Share2, SlidersHorizontal, Square, UserRound, X } from 'lucide-react'
+import { ArrowDown, Brain, Copy, Download, PanelLeft, Paperclip, SendHorizontal, Share2, SlidersHorizontal, Square, UserRound, X } from 'lucide-react'
 import { continueConversation, fetchSysInfo, sendMessage } from '../lib/chat-api'
 import { extractPdfText } from '../lib/pdf-extract'
 import { useConversation, useConversationMutations } from '../lib/chat-queries'
@@ -21,6 +21,7 @@ import { ModelLoadMenu } from '../components/ModelLoadMenu'
 import { ModelDetailDialog } from './models/ModelDetailDialog'
 import { ConversationSettingsDialog } from './chat/ConversationSettingsDialog'
 import { useUiStore } from '../stores/ui'
+import { useIsDesktop } from '../lib/useIsDesktop'
 import {
   buildSystemPrompt, getConvAgentId, getDefaultAgentId,
   getPersonalization, resolveAgents, setConvAgentId,
@@ -71,6 +72,9 @@ export function ChatScreen() {
   const [settingsKey, setSettingsKey] = useState<string | null>(null)
   const [showScrollBtn, setShowScrollBtn] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(true)
+  // Below md the sidebar is an off-canvas drawer, hidden until opened from the header.
+  const isDesktop = useIsDesktop()
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
   const sidebarRef = useRef<HTMLDivElement>(null)
   const [sidebarWidth, setSidebarWidth] = useState(() => Math.min(Math.max(readSavedSidebarWidth(), SIDEBAR_MIN_W), sidebarMaxW()))
   const [attachments, setAttachments] = useState<{ file: File; dataUrl: string }[]>([])
@@ -574,23 +578,39 @@ export function ChatScreen() {
           transition lives in the `tllm-chat-sidebar` CSS class (index.css), not inline,
           so it can be disabled globally while dragging (html.tllm-resizing) without
           fighting the resize handle's own per-pixel style mutation. */}
+      {/* Mobile: dim backdrop behind the drawer; tap to dismiss. */}
+      {!isDesktop && mobileSidebarOpen && (
+        <div
+          className="fixed inset-0 z-30 bg-black/40 md:hidden"
+          onClick={() => setMobileSidebarOpen(false)}
+          aria-hidden
+        />
+      )}
       <div
         ref={sidebarRef}
-        className={sidebarOpen ? 'tllm-chat-sidebar shrink-0' : 'tllm-chat-sidebar w-10 shrink-0'}
-        style={sidebarOpen ? { width: sidebarWidth } : undefined}
+        className={cn(
+          'tllm-chat-sidebar',
+          isDesktop
+            ? sidebarOpen ? 'shrink-0' : 'w-10 shrink-0'
+            : cn(
+                'fixed inset-y-0 left-0 z-40 w-[84vw] max-w-[300px] shadow-[var(--shadow-2)]',
+                mobileSidebarOpen ? 'translate-x-0' : '-translate-x-full',
+              ),
+        )}
+        style={isDesktop && sidebarOpen ? { width: sidebarWidth } : undefined}
       >
         <ConversationSidebar
           activeId={activeId}
-          onSelect={handleSelect}
-          onNew={handleNew}
+          onSelect={(id) => { handleSelect(id); if (!isDesktop) setMobileSidebarOpen(false) }}
+          onNew={() => { handleNew(); if (!isDesktop) setMobileSidebarOpen(false) }}
           onImport={readonly ? undefined : () => importFileRef.current?.click()}
-          collapsed={!sidebarOpen}
-          onToggle={() => setSidebarOpen((o) => !o)}
+          collapsed={isDesktop ? !sidebarOpen : false}
+          onToggle={isDesktop ? () => setSidebarOpen((o) => !o) : () => setMobileSidebarOpen(false)}
           generating={!!live}
           onDeleted={handleActiveDeleted}
         />
       </div>
-      {sidebarOpen && <SidebarResizeHandle sidebarRef={sidebarRef} onCommit={setSidebarWidth} />}
+      {isDesktop && sidebarOpen && <SidebarResizeHandle sidebarRef={sidebarRef} onCommit={setSidebarWidth} />}
 
       {/* Thread */}
       <div className="relative flex min-w-0 flex-1 flex-col">
@@ -604,7 +624,18 @@ export function ChatScreen() {
         )}
 
         {/* Chat header: model load/switch/eject (always available) */}
-        <div className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-4">
+        <div className="flex h-12 shrink-0 items-center gap-1.5 border-b border-border px-3 md:gap-2 md:px-4">
+          {/* Mobile: open the conversation drawer (the sidebar is off-canvas below md). */}
+          <Button
+            size="icon"
+            variant="ghost"
+            className="h-8 w-8 shrink-0 md:hidden"
+            onClick={() => setMobileSidebarOpen(true)}
+            title="Conversations"
+            aria-label="Open conversations"
+          >
+            <PanelLeft size={16} />
+          </Button>
           <ModelLoadMenu
             models={allModels}
             loadedKey={model?.key ?? null}
@@ -642,7 +673,7 @@ export function ChatScreen() {
           {activeId && selectedAgent && (
             <span
               title={selectedAgent.description}
-              className="inline-flex items-center gap-1 rounded-full border border-border px-2 py-0.5 text-[11px] text-muted select-none"
+              className="hidden items-center gap-1 rounded-full border border-border px-2 py-0.5 text-[11px] text-muted select-none sm:inline-flex"
             >
               <UserRound size={11} />
               {selectedAgent.name}
@@ -651,7 +682,9 @@ export function ChatScreen() {
           {engineState === 'starting' && <span className="text-[12px] text-muted">Loading model…</span>}
           {engineState === 'stopping' && <span className="text-[12px] text-muted">Ejecting…</span>}
           {ready && (
-            <ContextMeter ctxUsed={ctxUsed} ctxMax={ctxMax} />
+            <div className="ml-auto hidden sm:flex">
+              <ContextMeter ctxUsed={ctxUsed} ctxMax={ctxMax} />
+            </div>
           )}
 
           {/* Share / Export menu (F-023, F-024) — only when a conversation is active */}
@@ -701,7 +734,7 @@ export function ChatScreen() {
 
         {/* Message list — always visible; empty state shown only when no messages */}
         <div ref={scrollerRef} className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
-          <div className="flex w-full flex-col gap-6 px-8 py-6">
+          <div className="flex w-full flex-col gap-6 px-4 py-4 md:px-8 md:py-6">
             {/* Hidden import file input (F-024) */}
             <input
               ref={importFileRef}
@@ -821,7 +854,7 @@ export function ChatScreen() {
         )}
 
         {/* Composer area (always visible; disabled when no model; hidden in readonly) */}
-        {readonly ? null : <div className="px-8 pb-5">
+        {readonly ? null : <div className="px-3 pb-3 md:px-8 md:pb-5">
           <div className="relative w-full">
             {/* '/' skill picker */}
             {skillPickerOpen && (
@@ -991,12 +1024,12 @@ function AgentPicker({ selected, onChange, agents }: {
   agents: Array<{ id: string; name: string; description: string }>
 }) {
   return (
-    <div className="flex flex-col items-center gap-1.5">
+    <div className="flex w-full max-w-xs flex-col items-center gap-1.5">
       <p className="text-[11px] uppercase tracking-wide text-faint">Agent</p>
       <select
         value={selected}
         onChange={(e) => onChange(e.target.value)}
-        className="rounded-md border border-border bg-bg px-2 py-1.5 text-[13px] text-ink outline-none"
+        className="w-full max-w-full truncate rounded-md border border-border bg-bg px-2 py-1.5 text-[13px] text-ink outline-none"
       >
         {agents.map((a) => (
           <option key={a.id} value={a.id}>
