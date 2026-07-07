@@ -58,6 +58,89 @@ test('second shard missing from disk → incomplete=true (the regression)', () =
   }
 })
 
+// Regression: some HF repos embed the chat template in tokenizer_config.json (older
+// convention); others ship it as a standalone chat_template.jinja (current convention,
+// e.g. leonsarmiento/Qwen3.6-27B-3bit-mlx). Only checking tokenizer_config.json missed
+// every repo using the newer convention — hasChatTemplate came back false even when a
+// real, valid chat_template.jinja sat right next to it.
+
+test('chat_template embedded in tokenizer_config.json → hasChatTemplate=true', () => {
+  const dir = makeTmpDir()
+  try {
+    setupMlxDir(dir, [])
+    writeFileSync(join(dir, 'tokenizer_config.json'), JSON.stringify({ chat_template: '{{ messages }}' }))
+    assert.equal(mlxEntryFor(dir).hasChatTemplate, true)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('standalone chat_template.jinja file, absent from tokenizer_config.json → hasChatTemplate=true', () => {
+  const dir = makeTmpDir()
+  try {
+    setupMlxDir(dir, [])
+    writeFileSync(join(dir, 'tokenizer_config.json'), JSON.stringify({ tokenizer_class: 'GPT2Tokenizer' }))
+    writeFileSync(join(dir, 'chat_template.jinja'), '{{ messages }}')
+    assert.equal(mlxEntryFor(dir).hasChatTemplate, true)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('neither embedded nor standalone chat template → hasChatTemplate=false', () => {
+  const dir = makeTmpDir()
+  try {
+    setupMlxDir(dir, [])
+    writeFileSync(join(dir, 'tokenizer_config.json'), JSON.stringify({ tokenizer_class: 'GPT2Tokenizer' }))
+    assert.equal(mlxEntryFor(dir).hasChatTemplate, false)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// Regression: MLX-format models always reported vision=false regardless of config.json,
+// unlike GGUF (which detects vision via a paired mmproj file) — so a genuinely
+// vision-capable MLX model (e.g. gemma4, which has both vision_config and audio_config)
+// never showed up under the Models screen's "Vision" filter tab. audio (a distinct
+// capability from vision — a model can have either, both, or neither) was previously
+// untracked entirely.
+
+test('config.json with vision_config → vision=true', () => {
+  const dir = makeTmpDir()
+  try {
+    writeFileSync(join(dir, 'config.json'), JSON.stringify({ model_type: 'llama', vision_config: {} }))
+    const entry = mlxEntryFor(dir)
+    assert.equal(entry.vision, true)
+    assert.equal(entry.audio, false)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('config.json with audio_config → audio=true', () => {
+  const dir = makeTmpDir()
+  try {
+    writeFileSync(join(dir, 'config.json'), JSON.stringify({ model_type: 'gemma4', audio_config: {} }))
+    const entry = mlxEntryFor(dir)
+    assert.equal(entry.audio, true)
+    assert.equal(entry.vision, false)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('config.json with neither vision_config nor audio_config → both false (plain text model)', () => {
+  const dir = makeTmpDir()
+  try {
+    writeFileSync(join(dir, 'config.json'), JSON.stringify({ model_type: 'llama' }))
+    const entry = mlxEntryFor(dir)
+    assert.equal(entry.vision, false)
+    assert.equal(entry.audio, false)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('first shard missing, second present → incomplete=true', () => {
   const dir = makeTmpDir()
   try {

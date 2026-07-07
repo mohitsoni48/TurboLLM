@@ -514,10 +514,25 @@ function ModelRow({
   const loadable = !m.incomplete && !m.parseError
   const compatible = m.compatibleWithActiveEngine !== false
   const needsEngine = m.format === 'gguf' ? 'llama.cpp' : 'MLX or vLLM'
-  const problem = m.incomplete ? 'missing parts' : m.parseError ? 'unreadable' : !compatible ? `needs ${needsEngine}` : null
+  // GGUF models fall back to llama.cpp's built-in per-architecture chat template when the
+  // file has none; MLX-format models have no such fallback (mlx-lm/Rapid-MLX read the
+  // template directly), so a missing one is a real, user-visible dead end at chat time —
+  // surfaced here instead of a first-message 400. Only checked once the model is otherwise
+  // loadable/compatible; an incomplete or engine-mismatched model has a more pressing problem.
+  const noChatTemplate = m.format === 'mlx' && !m.hasChatTemplate
+  const problem = m.incomplete
+    ? 'missing parts'
+    : m.parseError
+      ? 'unreadable'
+      : !compatible
+        ? `needs ${needsEngine}`
+        : noChatTemplate
+          ? 'no chat template'
+          : null
   const loadingThis = loadingKey === m.key
   const caps = [
     m.vision && 'Vision',
+    m.audio && 'Audio',
     m.moe && 'MoE',
     m.embedding && 'Embed',
     (m.nextnLayers ?? 0) > 0 && 'NextN',

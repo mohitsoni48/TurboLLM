@@ -491,6 +491,13 @@ export function vllmProfileToArgs(p: LoadProfile): string[] {
   const v = p.vllm ?? defaultVllm()
   const a: string[] = []
   if (v.maxModelLen > 0) a.push('--max-model-len', String(v.maxModelLen))
+  // vLLM's own --max-num-batched-tokens defaults to 2048, and its scheduler config
+  // validator hard-rejects (refuses to start) any effective max-model-len larger than
+  // that — not a soft truncation. p.ctx mirrors what vLLM itself derives from the
+  // model's max_position_embeddings when --max-model-len is left unset, so raise
+  // --max-num-batched-tokens in lockstep whenever that would otherwise exceed 2048.
+  const effectiveMaxLen = v.maxModelLen > 0 ? v.maxModelLen : p.ctx
+  if (effectiveMaxLen > 2048) a.push('--max-num-batched-tokens', String(effectiveMaxLen))
   if (v.gpuMemoryUtilization > 0 && v.gpuMemoryUtilization !== 0.9) {
     a.push('--gpu-memory-utilization', String(v.gpuMemoryUtilization))
   }

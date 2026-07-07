@@ -44,7 +44,7 @@ import { runBuild, buildDirName, sameRepo, sourceBuildBinary, sourceBuildDirOf }
 import { provisionCuda } from '../engines/cuda-provision'
 import { detectHardware } from '../engines/hardware'
 import { recommendEngines } from '../engines/recommend'
-import { engineAcceptsFormat } from '../engines/compat'
+import { engineAcceptsFormat, engineRejectsAudioModel } from '../engines/compat'
 import { ScannerError, type ModelEntry } from '../models/scanner'
 import { estimateVram, type LoadProfile, profileToArgs, resolveProfile, vllmProfileToArgs } from '../models/profile'
 import { getSysInfo, primaryVendor } from '../sysinfo/sysinfo'
@@ -1061,6 +1061,14 @@ export function registerApi(app: Hono, d: Deps): void {
       if (!engineAcceptsFormat(active.kind, entry.format)) {
         return err(c, 409, 'engine_model_mismatch', formatMismatchMessage(active.kind, entry.format))
       }
+      if (entry.audio && engineRejectsAudioModel(active.kind)) {
+        return err(
+          c,
+          409,
+          'engine_model_mismatch',
+          'Rapid-MLX cannot load models with an audio tower (a confirmed upstream mlx-vlm bug) — switch to the MLX engine instead.',
+        )
+      }
       let opts: StartOpts
       if (entry.format !== 'gguf') {
         // MLX / vLLM: the model dir is the launch target (no llama.cpp -ngl/ctx knobs).
@@ -1981,7 +1989,9 @@ function overlayModel(e: ModelEntry, d: Deps, lastTpsMap?: Map<string, number>) 
   // list filter so e.g. only GGUFs show under a llama.cpp engine, safetensors under
   // MLX/vLLM. No active engine → everything is shown (compatible: true).
   const active = d.registry.active()
-  const compatibleWithActiveEngine = active ? engineAcceptsFormat(active.kind, e.format) : true
+  const compatibleWithActiveEngine = active
+    ? engineAcceptsFormat(active.kind, e.format) && !(e.audio && engineRejectsAudioModel(active.kind))
+    : true
   // Source HF repo: confirmed from download provenance, else inferred from the
   // on-disk layout (LM Studio / huggingface-cli store models as
   // <root>/<owner>/<repo>/<file>). Lets the library open the model's HF page —

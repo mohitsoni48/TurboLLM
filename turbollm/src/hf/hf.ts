@@ -180,11 +180,16 @@ export class HfClient {
     let safetensors: boolean | undefined
     if (isSafetensors) {
       safetensors = true
-      // Collect all component files: safetensors weights + JSON config/tokenizer files.
+      // Collect all component files: safetensors weights + JSON config/tokenizer files +
+      // the chat template. Modern HF repos ship the chat template as a standalone
+      // `chat_template.jinja` (current convention) rather than embedded in
+      // tokenizer_config.json — omitting it here left every such repo's local download
+      // permanently unable to chat (mlx-lm degrades gracefully without one, but engines
+      // like Rapid-MLX/vLLM hard-fail — confirmed live with leonsarmiento/Qwen3.6-27B-3bit-mlx).
       const components = tree.filter(
         (e) =>
           e.type === 'file' &&
-          (/\.safetensors$/i.test(e.path) || /\.json$/i.test(e.path)) &&
+          (/\.safetensors$/i.test(e.path) || /\.json$/i.test(e.path) || /\.jinja$/i.test(e.path)) &&
           !e.path.includes('/'), // root-level only — no nested model card assets
       )
       files = components.map((e) => ({

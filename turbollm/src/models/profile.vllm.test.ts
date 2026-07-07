@@ -12,7 +12,7 @@ function model(over: Partial<ModelEntry> = {}): ModelEntry {
     key: 'm', name: 'm', path: '/models/m', dir: '/models', format: 'mlx',
     sizeBytes: 8_000_000_000, sizeLabel: '8 GB', arch: 'llama', quant: 'fp16',
     nativeCtx: 32768, blockCount: 32, headCountKv: 8, moe: false, expertCount: 0,
-    nextnLayers: 0, vision: false, mmprojPath: null, hasChatTemplate: true, embedding: false,
+    nextnLayers: 0, vision: false, audio: false, mmprojPath: null, hasChatTemplate: true, embedding: false,
     incomplete: false, parseError: null, loaded: false, hasProfile: false,
     benchTps: null, mtime: '', ...over,
   }
@@ -34,14 +34,35 @@ function valAfter(args: string[], flag: string): string | undefined {
   return i >= 0 ? args[i + 1] : undefined
 }
 
-test('default vLLM profile emits no flags (no behavior change)', () => {
-  const args = vllmProfileToArgs(deriveDefault(model(), sys))
+test('default vLLM profile on a tiny-context model emits no flags (no behavior change)', () => {
+  const args = vllmProfileToArgs(deriveDefault(model({ nativeCtx: 2048 }), sys))
   assert.deepEqual(args, [])
 })
 
 test('maxModelLen emitted only when > 0', () => {
   assert.equal(valAfter(vllmProfileToArgs(withVllm({ maxModelLen: 0 })), '--max-model-len'), undefined)
   assert.equal(valAfter(vllmProfileToArgs(withVllm({ maxModelLen: 16384 })), '--max-model-len'), '16384')
+})
+
+// Regression: vLLM's own --max-num-batched-tokens defaults to 2048, and its scheduler
+// config validator refuses to start at all (pydantic ValidationError) if the effective
+// max-model-len exceeds that — reproduced live on this Mac with a real model whose
+// native context (8192, the model's own max_position_embeddings) exceeded vLLM's
+// default. Since virtually every real model's context exceeds 2048, an unset
+// maxModelLen must still raise --max-num-batched-tokens to match.
+test('max-num-batched-tokens raised to match the effective max-model-len when it exceeds 2048', () => {
+  const p = deriveDefault(model({ nativeCtx: 8192 }), sys) // p.ctx = min(8192, 8192) = 8192
+  assert.equal(valAfter(vllmProfileToArgs(p), '--max-num-batched-tokens'), '8192')
+})
+
+test('max-num-batched-tokens follows an explicit maxModelLen override, not p.ctx', () => {
+  const args = vllmProfileToArgs(withVllm({ maxModelLen: 16384 }))
+  assert.equal(valAfter(args, '--max-num-batched-tokens'), '16384')
+})
+
+test('max-num-batched-tokens omitted when the effective max-model-len is at or below 2048', () => {
+  const p = deriveDefault(model({ nativeCtx: 2048 }), sys)
+  assert.equal(valAfter(vllmProfileToArgs(p), '--max-num-batched-tokens'), undefined)
 })
 
 test('gpuMemoryUtilization emitted only when it differs from vLLM default 0.9', () => {
@@ -65,7 +86,9 @@ test('kvCacheDtype emitted only when not auto', () => {
 })
 
 test('enforceEager and trustRemoteCode are boolean flags', () => {
-  assert.equal(vllmProfileToArgs(withVllm({ enforceEager: false, trustRemoteCode: false })).length, 0)
+  const off = vllmProfileToArgs(withVllm({ enforceEager: false, trustRemoteCode: false }))
+  assert.ok(!off.includes('--enforce-eager'))
+  assert.ok(!off.includes('--trust-remote-code'))
   const on = vllmProfileToArgs(withVllm({ enforceEager: true, trustRemoteCode: true }))
   assert.ok(on.includes('--enforce-eager'))
   assert.ok(on.includes('--trust-remote-code'))

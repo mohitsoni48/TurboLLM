@@ -22,6 +22,10 @@ export interface ModelEntry {
   expertCount: number
   nextnLayers: number
   vision: boolean
+  /** True for MLX-format models whose config.json declares an audio_config (an audio
+   *  tower/encoder, e.g. gemma4's Conformer audio module). GGUF detection isn't
+   *  implemented (no observed need yet) — always false there. */
+  audio: boolean
   mmprojPath: string | null
   hasChatTemplate: boolean
   /** True for embedding models (BERT-family arch or known embed filename patterns).
@@ -262,6 +266,7 @@ export class Scanner {
       expertCount: meta?.expertCount ?? 0,
       nextnLayers: meta?.nextnLayers ?? 0,
       vision,
+      audio: false,
       mmprojPath: vision ? mmprojPath : null,
       hasChatTemplate: meta?.hasChatTemplate ?? false,
       embedding: isEmbeddingModel(arch, fileName),
@@ -373,6 +378,11 @@ interface MlxConfig {
   /** Multimodal models (gemma4_unified, llava, qwen-vl…) nest the language-model
    *  fields under `text_config`; read ctx/layers/heads from there when absent up top. */
   text_config?: Omit<MlxConfig, 'text_config'>
+  /** Presence (not contents) is the only thing read — an image/vision tower exists. */
+  vision_config?: unknown
+  /** Presence (not contents) is the only thing read — an audio tower/encoder exists
+   *  (e.g. gemma4's Conformer audio module). */
+  audio_config?: unknown
 }
 
 /** Human quant label for a safetensors model dir. Recognizes HF/vLLM post-training
@@ -423,7 +433,12 @@ export function mlxEntryFor(dir: string): ModelEntry {
       }
     }
     const tc = join(dir, 'tokenizer_config.json')
-    if (existsSync(tc)) hasChatTemplate = readFileSync(tc, 'utf8').includes('chat_template')
+    // Modern HF repos ship the chat template as a standalone `chat_template.jinja` file
+    // (mlx-lm/transformers both read it) rather than embedded in tokenizer_config.json —
+    // either location counts.
+    hasChatTemplate =
+      (existsSync(tc) && readFileSync(tc, 'utf8').includes('chat_template')) ||
+      existsSync(join(dir, 'chat_template.jinja'))
   } catch {
     /* best effort */
   }
@@ -468,7 +483,8 @@ export function mlxEntryFor(dir: string): ModelEntry {
     moe: expertCount > 0,
     expertCount,
     nextnLayers: 0,
-    vision: false,
+    vision: cfg.vision_config != null,
+    audio: cfg.audio_config != null,
     mmprojPath: null,
     hasChatTemplate,
     embedding: isEmbeddingModel(arch, basename(dir)),

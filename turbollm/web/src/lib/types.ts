@@ -447,6 +447,9 @@ export type ModelEntry = {
   /** >0 when the GGUF carries a built-in NextN multi-token-prediction head. */
   nextnLayers: number
   vision: boolean
+  /** True for MLX-format models whose config.json declares an audio_config (an audio
+   *  tower/encoder, e.g. gemma4's Conformer audio module). Always false for GGUF. */
+  audio: boolean
   mmprojPath: string | null
   hasChatTemplate: boolean
   /** True when the model is an embedding model (BERT-family or embed filename pattern).

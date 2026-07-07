@@ -28,6 +28,22 @@ export function engineAcceptsFormat(engineKind: string, format: ModelFormat): bo
 }
 
 /**
+ * True when `engineKind` is known to fail loading a model with an audio tower/encoder
+ * (`ModelEntry.audio`). Rapid-MLX bundles `mlx_vlm` for VLM support; its gemma4
+ * `sanitize()` unconditionally transposes `subsample_conv_projection.conv.weight`
+ * assuming a raw PyTorch-layout checkpoint, but MLX-native checkpoints already store
+ * it in MLX layout — the load double-transposes and crashes with a shape-mismatch
+ * `ValueError`. Confirmed live, reproduced even after upgrading to the latest
+ * available `mlx-vlm` (0.6.4) — not a missing file, not fixable by re-downloading.
+ * The plain MLX engine (`mlx-lm`) never attempts VLM/audio loading at all, so it's
+ * unaffected — only Rapid-MLX is excluded here. Vision-only models (no audio_config)
+ * are NOT excluded; only the confirmed-broken audio path is.
+ */
+export function engineRejectsAudioModel(engineKind: string): boolean {
+  return engineKind === 'rapid-mlx'
+}
+
+/**
  * The value an OpenAI-compatible request must put in its `model` field for this engine.
  *
  * llama.cpp ignores the field (it serves the single loaded model), so we leave the
