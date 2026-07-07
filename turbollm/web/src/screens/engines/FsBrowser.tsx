@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { ArrowUp, Check, File as FileIcon, Folder, RotateCw } from 'lucide-react'
+import { ArrowRight, ArrowUp, Check, File as FileIcon, Folder, RotateCw } from 'lucide-react'
 import { ApiError } from '../../lib/api'
 import { useFsBrowse } from '../../lib/queries'
 import { truncateMiddle } from '../../lib/utils'
@@ -14,12 +14,12 @@ import {
 } from '../../components/ui/dialog'
 import { InlineError } from '../../components/common'
 
-/** In-app filesystem browser (spec 03 §9). Navigates directories under the
- *  daemon's home dir. In `file` mode (default) folder rows descend and file rows
- *  select; in `folder` mode folder rows still descend, but a "Select this folder"
- *  action picks the current directory (engine overhaul, Phase 3 — the guided scan
- *  takes a folder). Starts at the home dir (null path → server default). Server
- *  enforces the home-confinement; this is purely a navigator. */
+/** In-app filesystem browser (spec 03 §9). Navigates the local filesystem. In `file`
+ *  mode (default) folder rows descend and file rows select; in `folder` mode folder
+ *  rows still descend, but a "Select this folder" action picks the current directory
+ *  (engine overhaul, Phase 3 — the guided scan takes a folder). Starts at the home dir
+ *  (null path → server default); going "up" past a drive root reaches the drive list on
+ *  Windows. The `/fs/browse` endpoint is local-only (never reachable from the LAN). */
 export function FsBrowser({
   open,
   onOpenChange,
@@ -45,6 +45,18 @@ export function FsBrowser({
     if (open) setPath(null)
   }, [open])
 
+  // Editable address bar: type or paste an absolute path and press Enter (or Go) to jump
+  // there — alongside click-to-browse. Kept in sync with the resolved current location;
+  // an errored/invalid path leaves what you typed in place so you can fix it.
+  const [pathInput, setPathInput] = useState('')
+  useEffect(() => {
+    if (data?.path && data.path !== '::drives') setPathInput(data.path)
+  }, [data?.path])
+  const go = () => {
+    const p = pathInput.trim()
+    if (p) setPath(p)
+  }
+
   const choose = (p: string) => {
     onSelect(p)
     onOpenChange(false)
@@ -58,14 +70,14 @@ export function FsBrowser({
           <DialogDescription>
             {description ? description : mode === 'folder' ? (
               <>
-                Open the folder that contains your engine build, then click{' '}
+                Open the folder that contains your engine build — on any drive — then click{' '}
                 <span className="font-medium text-ink">Select this folder</span>. We&apos;ll scan it
-                for <code className="font-mono">llama-server</code>. Limited to your home directory.
+                for <code className="font-mono">llama-server</code>.
               </>
             ) : (
               <>
                 Navigate to the compiled <code className="font-mono">llama-server</code> executable
-                and click it to select. Limited to your home directory.
+                on any drive and click it to select.
               </>
             )}
           </DialogDescription>
@@ -81,12 +93,25 @@ export function FsBrowser({
           >
             <ArrowUp size={16} />
           </Button>
-          <div
-            className="min-w-0 flex-1 truncate rounded-md border border-border bg-panel-2 px-2.5 py-1.5 font-mono text-[12px] text-muted"
-            title={data?.path ?? ''}
+          <input
+            value={pathInput}
+            onChange={(e) => setPathInput(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); go() } }}
+            placeholder={data?.path === '::drives' ? 'This PC — paste or type a path' : 'Paste or type a path'}
+            spellCheck={false}
+            aria-label="Path"
+            className="min-w-0 flex-1 rounded-md border border-border bg-bg px-2.5 py-1.5 font-mono text-[12px] text-ink outline-none placeholder:text-faint focus:border-[color:var(--accent)]"
+          />
+          <Button
+            variant="outline"
+            size="iconSm"
+            onClick={go}
+            disabled={!pathInput.trim() || isFetching}
+            aria-label="Go to path"
+            title="Go to this path"
           >
-            {data?.path ?? '…'}
-          </div>
+            <ArrowRight size={16} />
+          </Button>
           <Button
             variant="outline"
             size="iconSm"
@@ -143,7 +168,10 @@ export function FsBrowser({
             Cancel
           </Button>
           {mode !== 'file' && (
-            <Button onClick={() => data?.path && choose(data.path)} disabled={!data?.path || isFetching}>
+            <Button
+              onClick={() => data?.path && choose(data.path)}
+              disabled={!data?.path || isFetching || data.path === '::drives'}
+            >
               <Check size={16} /> Select this folder
             </Button>
           )}

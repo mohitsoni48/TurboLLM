@@ -177,8 +177,8 @@ the detail:
 - **Saved per-model profiles, per engine** — tune once per (model, engine) pair, so
   switching engines (or between two installs of the same engine, e.g. a fork) never
   overwrites another engine's tuning for the same model.
-- **Configurable VRAM headroom** (Settings → Engine, 300 MB–2 GB, default 1 GB) — tell auto-tune
-  how much VRAM to keep free for other GPU workloads instead of a fixed margin.
+- **Configurable VRAM headroom** (Settings → Models & loading → Advanced, 300 MB–2 GB, default
+  1 GB) — tell auto-tune how much VRAM to keep free for other GPU workloads instead of a fixed margin.
 
 </details>
 
@@ -216,7 +216,7 @@ the detail:
   in every chat with no restart. A **Research** persona forces multi-step web search and cites sources inline.
 - **Tool-call approval gate** — every tool call asks for your approval by default before it runs,
   with **Deny**, **Allow**, **Allow for this chat**, or **Always Allow** on an inline bar above the
-  composer. Set per-tool defaults globally from Developer → Tool permissions.
+  composer. Set per-tool defaults globally from Settings → Tools & safety.
 
 </details>
 
@@ -255,7 +255,7 @@ curl http://127.0.0.1:6996/v1/chat/completions \
 - **Anthropic-compatible** `/v1/messages` — including **tool use and streaming** — which powers
   Claude Code below. No other local host offers this.
 - **Structured output** — constrain any response to a **GBNF grammar** (or JSON shape).
-- **API-key auth** you can require when sharing over a LAN (Settings → Network).
+- **API-key auth** you can require when sharing over a LAN (Settings → Network & sharing).
 
 **The gateway loads models for you.** Most local hosts make you load a model first, then call it.
 TurboLLM's gateway reads the `model` field of any incoming request, **fuzzy-matches it to your
@@ -267,7 +267,7 @@ coding model, a vision model, and an embedder just names each one and it works �
 `opencode`, `kilo`, `openclaw`, and `hermes` — each gets pointed at TurboLLM the way that tool
 expects (config file merge, or its own CLI command) instead of a manual copy-paste setup. Inside
 Claude Code, `/model` lists your local models directly (with **Auto Model Swap** on in Settings →
-Gateway) so you can switch mid-session instead of only at launch.
+Models & loading) so you can switch mid-session instead of only at launch.
 
 </details>
 
@@ -285,7 +285,7 @@ fight for memory (and one usually OOMs). TurboLLM can hand the GPU over automati
 It's **push-based, not polling** — ComfyUI signals TurboLLM the moment a job starts/ends, so the
 handoff is immediate and deterministic (the model is gone *before* ComfyUI executes).
 
-**One-time setup** (Settings → ComfyUI): turn on **Pause for ComfyUI**, enter your ComfyUI folder
+**One-time setup** (Settings → Network & sharing → ComfyUI): turn on **Pause for ComfyUI**, enter your ComfyUI folder
 (the one containing `custom_nodes`), click **Install gate** (it writes a small custom node wired to
 this daemon), then **restart ComfyUI** once. The panel shows a live indicator (rendering / idle /
 connected); **Remove** undoes it.
@@ -333,7 +333,7 @@ daemon any time with **Ctrl+C**.
 No other local-LLM app lets you run **whatever inference engine you want**. TurboLLM treats
 the engine as a swappable component.
 
-**Add a custom engine** (Engines screen → **Add engine**):
+**Add a custom engine** (Engines screen → **Add your own engine**):
 
 1. Compile or download any `llama-server`-compatible binary — stock
    [llama.cpp](https://github.com/ggml-org/llama.cpp), a community fork, or your own build.
@@ -398,13 +398,14 @@ any OpenAI- or Anthropic-compatible tool (Open WebUI, Kilo Code, opencode, …).
 ## Use it from any device on your network
 
 The UI runs in the browser, so any phone, tablet, or laptop on your LAN can use the model on
-your GPU box:
+your GPU box — every screen is responsive down to phone widths, with the desktop layout
+untouched:
 
 ```bash
 turbollm --addr 0.0.0.0:6996    # bind all interfaces, then open http://<your-ip>:6996
 ```
 
-Turn on **Require API key** in Settings → Network when you expose it.
+Turn on **Require API key** in Settings → Network & sharing when you expose it.
 
 ---
 

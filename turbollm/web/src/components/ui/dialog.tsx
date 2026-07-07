@@ -28,7 +28,7 @@ export const DialogContent = React.forwardRef<
     <DialogPrimitive.Content
       ref={ref}
       className={cn(
-        'fixed left-1/2 top-1/2 z-50 w-full max-w-md -translate-x-1/2 -translate-y-1/2',
+        'fixed left-1/2 top-1/2 z-50 w-[calc(100%_-_2rem)] max-w-md -translate-x-1/2 -translate-y-1/2',
         'rounded-[var(--radius-lg)] border border-border bg-panel p-5 shadow-[var(--shadow-2)]',
         'focus:outline-none',
         className,
@@ -60,7 +60,7 @@ export function DialogFooter({
 }: React.HTMLAttributes<HTMLDivElement>) {
   return (
     <div
-      className={cn('mt-5 flex justify-end gap-2', className)}
+      className={cn('mt-5 flex flex-wrap justify-end gap-2', className)}
       {...props}
     />
   )

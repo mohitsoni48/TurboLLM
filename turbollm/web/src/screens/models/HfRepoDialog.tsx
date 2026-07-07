@@ -202,11 +202,9 @@ export function HfRepoContent({
           a Dialog.Root context) — this content renders both inside a Sheet (HfRepoDialog)
           and bare, with no dialog ancestor at all (DiscoverTab's split-pane right column). */}
       <div className="mb-4 flex flex-col gap-1">
-        <h2 className="truncate pr-6 text-[16px] font-semibold tracking-[-0.01em] text-ink">
-          <span className="inline-flex items-center gap-1.5">
-            {gated && <Lock size={14} style={{ color: 'var(--warn)' }} />}
-            {repo}
-          </span>
+        <h2 className="flex items-center gap-1.5 pr-6 text-[16px] font-semibold tracking-[-0.01em] text-ink">
+          {gated && <Lock size={14} className="shrink-0" style={{ color: 'var(--warn)' }} />}
+          <span className="truncate">{repo}</span>
         </h2>
         <p className="text-[13px] text-muted">
           {detail
@@ -474,7 +472,7 @@ function ModelCard({ text }: { text: string }) {
             className ? (
               <code className="block overflow-x-auto rounded bg-bg p-2 font-mono text-[13px] leading-relaxed">{children}</code>
             ) : (
-              <code className="rounded bg-bg px-1 py-0.5 font-mono text-[13px]">{children}</code>
+              <code className="break-all rounded bg-bg px-1 py-0.5 font-mono text-[13px]">{children}</code>
             ),
           table: ({ children }) => <div className="my-1 overflow-x-auto"><table className="w-full border-collapse text-[13.5px]">{children}</table></div>,
           th: ({ children }) => <th className="border border-border bg-bg px-2 py-1 text-left font-semibold text-ink">{children}</th>,

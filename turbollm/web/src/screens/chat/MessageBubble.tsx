@@ -534,7 +534,7 @@ export function MessageBubble({
             </div>
           ) : (
             <div className="flex max-w-[75%] flex-col items-end">
-              <div className="whitespace-pre-wrap rounded-[var(--radius-lg)] bg-accent px-4 py-2.5 text-[15px] leading-[1.6] text-on-accent">
+              <div className="whitespace-pre-wrap break-words rounded-[var(--radius-lg)] bg-accent px-4 py-2.5 text-[15px] leading-[1.6] text-on-accent">
                 {message.content}
               </div>
               {message.attachments?.filter((a) => a.startsWith('data:image')).map((url, i) => (

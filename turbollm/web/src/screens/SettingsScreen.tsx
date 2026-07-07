@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
-import { Moon, Sun, Monitor, Save, ExternalLink, ShieldAlert, RefreshCw, Check, X, Loader2, AlertTriangle, ArrowUpCircle } from 'lucide-react'
+import { Moon, Sun, Monitor, Save, ExternalLink, ShieldAlert, RefreshCw, Check, X, Loader2, AlertTriangle, ArrowUpCircle, SlidersHorizontal, Boxes, ShieldCheck, Wifi, Cpu, ChevronRight } from 'lucide-react'
 import { getPersonalization, savePersonalization, type Personalization } from '../lib/personas'
 import { ScreenHeader } from '../components/common'
 import { Button } from '../components/ui/button'
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../components/ui/collapsible'
+import { cn } from '../lib/utils'
 import { useUiStore, type Theme } from '../stores/ui'
 import {
   useComfyGate,
@@ -19,6 +21,7 @@ import {
 } from '../lib/queries'
 import { CopyButton } from '../components/ui/copy-button'
 import { ModelDirs } from './models/ModelDirs'
+import { ToolPermissionsSection } from './settings/ToolPermissionsSection'
 
 import { ApiError, type TelemetryLevel } from '../lib/api'
 import { TELEMETRY_UI_ENABLED } from '../lib/flags'
@@ -98,6 +101,17 @@ function NumberField({
 
 const clampN = (n: number, min: number, max: number) => Math.max(min, Math.min(max, Math.round(n)))
 
+/** Settings categories for the two-pane layout. Each maps to one pane of sections. */
+type CatId = 'general' | 'models' | 'tools' | 'network' | 'system'
+
+const SETTINGS_CATS: { id: CatId; label: string; icon: React.ElementType }[] = [
+  { id: 'general', label: 'General', icon: SlidersHorizontal },
+  { id: 'models', label: 'Models & loading', icon: Boxes },
+  { id: 'tools', label: 'Tools & safety', icon: ShieldCheck },
+  { id: 'network', label: 'Network & sharing', icon: Wifi },
+  { id: 'system', label: 'System', icon: Cpu },
+]
+
 /** A labeled range slider with a live formatted value (mirrors the per-model Slider in
  *  ModelDetailDialog.tsx). */
 function Slider({ label, hint, value, min, max, step, onChange, fmt }: {
@@ -149,6 +163,9 @@ export function SettingsScreen() {
 
   // Full-screen overlay while the daemon re-execs (spec 08 §2).
   const [restartOverlay, setRestartOverlay] = useState(false)
+
+  // Active category for the two-pane settings layout.
+  const [activeCat, setActiveCat] = useState<CatId>('general')
 
   useEffect(() => {
     if (settings) {
@@ -237,292 +254,376 @@ export function SettingsScreen() {
     })
   }
 
+  // The daemon-settings draft is dirty when any tracked field diverges from the
+  // loaded settings. Drives the single sticky Save bar (Personalization and the HF
+  // token keep their own save actions and are intentionally excluded here).
+  const dirty =
+    !!settings &&
+    (ttl !== settings.idleTtlMinutes ||
+      vramHeadroom !== (settings.vramHeadroomMb ?? 1024) ||
+      port !== (settings.port ?? 6996) ||
+      autoTitle !== settings.autoGenerateTitles ||
+      openBrowser !== settings.openBrowserOnStart ||
+      autoLoad !== (settings.autoLoadOnStart ?? false) ||
+      defCtx !== (settings.modelDefaults?.ctx ?? 8192) ||
+      defNgl !== (settings.modelDefaults?.ngl ?? 99) ||
+      defImageMax !== (settings.modelDefaults?.imageMaxTokens ?? 0) ||
+      defMaxTokens !== (settings.modelDefaults?.maxTokens ?? 0) ||
+      telemetry !== (settings.telemetryLevel ?? 'off') ||
+      lanBind !== (settings.lanBind ?? false) ||
+      requireApiKey !== (settings.requireApiKey ?? true) ||
+      comfyEnabled !== (settings.comfyui?.enabled ?? false) ||
+      comfyUrl.trim() !== (settings.comfyui?.url ?? '') ||
+      comfyReverseGate !== (settings.comfyui?.reverseGate ?? false) ||
+      gatewayAutoSwap !== (settings.gateway?.autoSwap ?? true) ||
+      gatewayKeepN !== (settings.gateway?.keepN ?? 1))
+
   return (
-    <div className="w-full px-6 py-6">
+    <div className="w-full px-4 py-6 md:px-6">
       <ScreenHeader title="Settings" description="Configure TurboLLM behavior and appearance." />
 
       {restartOverlay && <RestartOverlay onDismiss={() => setRestartOverlay(false)} />}
 
-      <div className="flex flex-col gap-6">
-
-        {/* Theme */}
-        <section className="rounded-lg border border-border bg-panel p-4">
-          <h2 className="mb-3 text-[13px] font-semibold uppercase tracking-wide text-faint">Appearance</h2>
-          <div className="flex items-center justify-between">
-            <div>
-              <div className="text-[14px] font-medium text-ink">Theme</div>
-              <div className="text-[12px] text-muted">Choose light, dark, or follow your system setting</div>
-            </div>
-            <div className="flex overflow-hidden rounded-lg border border-border">
-              {([
-                { value: 'light', label: 'Light', Icon: Sun },
-                { value: 'system', label: 'System', Icon: Monitor },
-                { value: 'dark', label: 'Dark', Icon: Moon },
-              ] as { value: Theme; label: string; Icon: React.ElementType }[]).map(({ value, label, Icon }) => (
-                <button
-                  key={value}
-                  type="button"
-                  onClick={() => setTheme(value)}
-                  className="flex items-center gap-1.5 px-3 py-2 text-[13px] transition-colors"
-                  style={{
-                    background: theme === value ? 'var(--accent)' : 'transparent',
-                    color: theme === value ? 'var(--on-accent)' : 'var(--muted)',
-                  }}
-                >
-                  <Icon size={14} />
-                  {label}
-                </button>
-              ))}
-            </div>
+      {/* Two-pane on desktop; below md the rail stacks above the content as a
+          horizontal, scrollable tab strip (same pattern as Customize). */}
+      <div className="relative flex flex-col gap-4 md:flex-row md:gap-6">
+        {/* Category nav: vertical rail at md+, horizontal scroller on mobile. */}
+        <nav className="shrink-0 md:w-44">
+          <div className="flex gap-1 overflow-x-auto pb-1 md:flex-col md:overflow-visible md:pb-0">
+            {SETTINGS_CATS.map(({ id, label, icon: Icon }) => (
+              <button
+                key={id}
+                type="button"
+                onClick={() => setActiveCat(id)}
+                className={cn(
+                  'flex shrink-0 items-center gap-2 whitespace-nowrap rounded-md px-3 py-2 text-left text-[13px] font-medium transition-colors md:w-full',
+                  activeCat === id ? 'bg-accent/12 text-accent' : 'text-muted hover:text-ink',
+                )}
+              >
+                <Icon size={15} className="shrink-0" />
+                {label}
+              </button>
+            ))}
           </div>
+        </nav>
 
-          {/* Enable thinking by default (ADR-042): client-only, default ON. */}
-          <label className="mt-2 flex cursor-pointer items-center justify-between border-t border-border py-2 pt-3">
-            <div>
-              <div className="text-[14px] font-medium text-ink">Enable thinking by default</div>
-              <div className="text-[12px] text-muted">Let reasoning models think before answering in new chats (you can toggle it per chat). Off = answer directly, faster.</div>
-            </div>
-            <input
-              type="checkbox"
-              checked={thinkingEnabled}
-              onChange={(e) => setThinkingEnabled(e.target.checked)}
-              className="h-4 w-4 accent-[var(--accent)]"
-            />
-          </label>
+        {/* Content pane: only the active category's sections */}
+        <div className="min-w-0 flex-1 flex flex-col gap-6">
+          {activeCat === 'general' && (
+            <>
+              {/* Theme */}
+              <section className="rounded-lg border border-border bg-panel p-4">
+                <h2 className="mb-3 text-[13px] font-semibold uppercase tracking-wide text-faint">Appearance</h2>
+                <div className="flex flex-col items-start gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div>
+                    <div className="text-[14px] font-medium text-ink">Theme</div>
+                    <div className="text-[12px] text-muted">Choose light, dark, or follow your system setting</div>
+                  </div>
+                  <div className="flex overflow-hidden rounded-lg border border-border">
+                    {([
+                      { value: 'light', label: 'Light', Icon: Sun },
+                      { value: 'system', label: 'System', Icon: Monitor },
+                      { value: 'dark', label: 'Dark', Icon: Moon },
+                    ] as { value: Theme; label: string; Icon: React.ElementType }[]).map(({ value, label, Icon }) => (
+                      <button
+                        key={value}
+                        type="button"
+                        onClick={() => setTheme(value)}
+                        className="flex items-center gap-1.5 px-3 py-2 text-[13px] transition-colors"
+                        style={{
+                          background: theme === value ? 'var(--accent)' : 'transparent',
+                          color: theme === value ? 'var(--on-accent)' : 'var(--muted)',
+                        }}
+                      >
+                        <Icon size={14} />
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
 
-          {/* Confirm before deleting a conversation: client-only, default ON. */}
-          <label className="flex cursor-pointer items-center justify-between border-t border-border py-2 pt-3">
-            <div>
-              <div className="text-[14px] font-medium text-ink">Confirm before deleting a conversation</div>
-              <div className="text-[12px] text-muted">Ask for confirmation before a conversation is deleted. Off = delete immediately with no prompt.</div>
-            </div>
-            <input
-              type="checkbox"
-              checked={confirmDelete}
-              onChange={(e) => setConfirmDelete(e.target.checked)}
-              className="h-4 w-4 accent-[var(--accent)]"
-            />
-          </label>
-        </section>
+                {/* Enable thinking by default (ADR-042): client-only, default ON. */}
+                <label className="mt-2 flex cursor-pointer items-center justify-between border-t border-border py-2 pt-3">
+                  <div>
+                    <div className="text-[14px] font-medium text-ink">Enable thinking by default</div>
+                    <div className="text-[12px] text-muted">Let reasoning models think before answering in new chats (you can toggle it per chat). Off = answer directly, faster.</div>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={thinkingEnabled}
+                    onChange={(e) => setThinkingEnabled(e.target.checked)}
+                    className="h-4 w-4 accent-[var(--accent)]"
+                  />
+                </label>
 
-        {/* Engine */}
-        <section className="rounded-lg border border-border bg-panel p-4">
-          <h2 className="mb-3 text-[13px] font-semibold uppercase tracking-wide text-faint">Engine</h2>
+                {/* Confirm before deleting a conversation: client-only, default ON. */}
+                <label className="flex cursor-pointer items-center justify-between border-t border-border py-2 pt-3">
+                  <div>
+                    <div className="text-[14px] font-medium text-ink">Confirm before deleting a conversation</div>
+                    <div className="text-[12px] text-muted">Ask for confirmation before a conversation is deleted. Off = delete immediately with no prompt.</div>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={confirmDelete}
+                    onChange={(e) => setConfirmDelete(e.target.checked)}
+                    className="h-4 w-4 accent-[var(--accent)]"
+                  />
+                </label>
+              </section>
 
-          <div className="flex items-center justify-between py-2">
-            <div>
-              <div className="text-[14px] font-medium text-ink">Idle timeout</div>
-              <div className="text-[12px] text-muted">Unload model after this many minutes of inactivity (0 = never)</div>
-            </div>
-            <div className="flex items-center gap-2">
-              <NumberField
-                value={ttl}
-                min={0}
-                max={1440}
-                onCommit={setTtl}
-                ariaLabel="Idle timeout in minutes"
-                className="w-20 rounded-md border border-border bg-bg px-2 py-1 text-right text-[13px] text-ink outline-none"
+              {/* Personalization */}
+              <PersonalizationSection />
+
+              {/* Chat */}
+              <section className="rounded-lg border border-border bg-panel p-4">
+                <h2 className="mb-3 text-[13px] font-semibold uppercase tracking-wide text-faint">Chat</h2>
+
+                <label className="flex cursor-pointer items-center justify-between py-2">
+                  <div>
+                    <div className="text-[14px] font-medium text-ink">Auto-generate chat titles</div>
+                    <div className="text-[12px] text-muted">Uses the model to create a title after the first exchange</div>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={autoTitle}
+                    onChange={(e) => setAutoTitle(e.target.checked)}
+                    className="h-4 w-4 accent-[var(--accent)]"
+                  />
+                </label>
+              </section>
+
+              {/* Startup */}
+              <section className="rounded-lg border border-border bg-panel p-4">
+                <h2 className="mb-3 text-[13px] font-semibold uppercase tracking-wide text-faint">Startup</h2>
+
+                <label className="flex cursor-pointer items-center justify-between py-2">
+                  <div>
+                    <div className="text-[14px] font-medium text-ink">Open browser on start</div>
+                    <div className="text-[12px] text-muted">Automatically open the UI when the daemon starts</div>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={openBrowser}
+                    onChange={(e) => setOpenBrowser(e.target.checked)}
+                    className="h-4 w-4 accent-[var(--accent)]"
+                  />
+                </label>
+
+                <label className="flex cursor-pointer items-center justify-between py-2">
+                  <div>
+                    <div className="text-[14px] font-medium text-ink">Auto-load last model</div>
+                    <div className="text-[12px] text-muted">Reload the last-used model automatically when the daemon starts</div>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={autoLoad}
+                    onChange={(e) => setAutoLoad(e.target.checked)}
+                    className="h-4 w-4 accent-[var(--accent)]"
+                  />
+                </label>
+              </section>
+            </>
+          )}
+
+          {activeCat === 'models' && (
+            <>
+              {/* Engine — idle timeout (primary) */}
+              <section className="rounded-lg border border-border bg-panel p-4">
+                <h2 className="mb-3 text-[13px] font-semibold uppercase tracking-wide text-faint">Engine</h2>
+
+                <div className="flex items-center justify-between py-2">
+                  <div>
+                    <div className="text-[14px] font-medium text-ink">Idle timeout</div>
+                    <div className="text-[12px] text-muted">Unload model after this many minutes of inactivity (0 = never)</div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <NumberField
+                      value={ttl}
+                      min={0}
+                      max={1440}
+                      onCommit={setTtl}
+                      ariaLabel="Idle timeout in minutes"
+                      className="w-20 rounded-md border border-border bg-bg px-2 py-1 text-right text-[13px] text-ink outline-none"
+                    />
+                    <span className="text-[12px] text-muted">min</span>
+                  </div>
+                </div>
+              </section>
+
+              {/* Model Defaults — context length (primary) */}
+              <section className="rounded-lg border border-border bg-panel p-4">
+                <h2 className="mb-1 text-[13px] font-semibold uppercase tracking-wide text-faint">Model Defaults</h2>
+                <p className="mb-3 text-[12px] text-muted">
+                  Applied the first time a model is loaded. A model's own saved settings always
+                  override these.
+                </p>
+
+                <div className="flex items-center justify-between py-2">
+                  <div>
+                    <div className="text-[14px] font-medium text-ink">Context length</div>
+                    <div className="text-[12px] text-muted">Default context window, capped at each model's native max</div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <NumberField
+                      value={defCtx}
+                      min={256}
+                      step={512}
+                      onCommit={setDefCtx}
+                      ariaLabel="Default context length"
+                      className="w-24 rounded-md border border-border bg-bg px-2 py-1 text-right text-[13px] text-ink outline-none"
+                    />
+                    <span className="text-[12px] text-muted">tok</span>
+                  </div>
+                </div>
+              </section>
+
+              {/* Gateway intelligence (v0.6.0) */}
+              <GatewaySection
+                autoSwap={gatewayAutoSwap}
+                setAutoSwap={setGatewayAutoSwap}
+                keepN={gatewayKeepN}
+                setKeepN={setGatewayKeepN}
               />
-              <span className="text-[12px] text-muted">min</span>
-            </div>
-          </div>
 
-          <div className="border-t border-border pt-1">
-            <Slider
-              label="VRAM headroom"
-              hint="VRAM to keep free during auto-tune, so a later app switch or render job doesn't spill the model into slower shared memory"
-              value={vramHeadroom}
-              min={300}
-              max={2048}
-              step={1}
-              onChange={setVramHeadroom}
-              fmt={(v) => (v >= 1024 ? `${(v / 1024).toFixed(1)} GB` : `${v} MB`)}
-            />
-          </div>
-        </section>
+              {/* Models — folders */}
+              <ModelDirs dirs={modelDirs} primaryDir={primaryModelDir} mut={modelDirsMut} />
 
-        {/* Model Defaults (spec 05 §3) */}
-        <section className="rounded-lg border border-border bg-panel p-4">
-          <h2 className="mb-1 text-[13px] font-semibold uppercase tracking-wide text-faint">Model Defaults</h2>
-          <p className="mb-3 text-[12px] text-muted">
-            Applied the first time a model is loaded. A model's own saved settings always
-            override these.
-          </p>
+              {/* Models — Hugging Face token (spec 10 §4) */}
+              <HfTokenSection tokenSet={settings?.hfTokenSet ?? false} onSaved={() => void settingsQ.refetch()} />
 
-          <div className="flex items-center justify-between py-2">
-            <div>
-              <div className="text-[14px] font-medium text-ink">Context length</div>
-              <div className="text-[12px] text-muted">Default context window, capped at each model's native max</div>
-            </div>
-            <div className="flex items-center gap-2">
-              <NumberField
-                value={defCtx}
-                min={256}
-                step={512}
-                onCommit={setDefCtx}
-                ariaLabel="Default context length"
-                className="w-24 rounded-md border border-border bg-bg px-2 py-1 text-right text-[13px] text-ink outline-none"
+              {/* Advanced — expert knobs, collapsed by default (auto-first) */}
+              <Collapsible className="rounded-lg border border-border bg-panel p-4">
+                <CollapsibleTrigger className="group flex w-full items-center gap-2 text-left">
+                  <ChevronRight size={14} className="shrink-0 text-faint transition-transform group-data-[state=open]:rotate-90" />
+                  <h2 className="text-[13px] font-semibold uppercase tracking-wide text-faint">Advanced</h2>
+                </CollapsibleTrigger>
+                <CollapsibleContent>
+                  <div className="mt-3 border-t border-border pt-1">
+                    <Slider
+                      label="VRAM headroom"
+                      hint="VRAM to keep free during auto-tune, so a later app switch or render job doesn't spill the model into slower shared memory"
+                      value={vramHeadroom}
+                      min={300}
+                      max={2048}
+                      step={1}
+                      onChange={setVramHeadroom}
+                      fmt={(v) => (v >= 1024 ? `${(v / 1024).toFixed(1)} GB` : `${v} MB`)}
+                    />
+                  </div>
+
+                  <div className="flex items-center justify-between border-t border-border py-2">
+                    <div>
+                      <div className="text-[14px] font-medium text-ink">GPU layers</div>
+                      <div className="text-[12px] text-muted">Layers to offload to the GPU (99 = all); ignored on CPU-only machines</div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <NumberField
+                        value={defNgl}
+                        min={0}
+                        max={99}
+                        onCommit={setDefNgl}
+                        ariaLabel="Default GPU layers"
+                        className="w-20 rounded-md border border-border bg-bg px-2 py-1 text-right text-[13px] text-ink outline-none"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="flex items-center justify-between border-t border-border py-2">
+                    <div>
+                      <div className="text-[14px] font-medium text-ink">Image max tokens</div>
+                      <div className="text-[12px] text-muted">Per-image token budget for vision models (0 = engine default)</div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <NumberField
+                        value={defImageMax}
+                        min={0}
+                        step={256}
+                        onCommit={setDefImageMax}
+                        ariaLabel="Image max tokens"
+                        className="w-24 rounded-md border border-border bg-bg px-2 py-1 text-right text-[13px] text-ink outline-none"
+                      />
+                      <span className="text-[12px] text-muted">tok</span>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center justify-between border-t border-border py-2">
+                    <div>
+                      <div className="text-[14px] font-medium text-ink">Max response tokens</div>
+                      <div className="text-[12px] text-muted">Hard cap on tokens generated per reply (0 = unlimited). Also caps Claude Code / API requests.</div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <NumberField
+                        value={defMaxTokens}
+                        min={0}
+                        step={256}
+                        onCommit={setDefMaxTokens}
+                        ariaLabel="Max response tokens"
+                        className="w-24 rounded-md border border-border bg-bg px-2 py-1 text-right text-[13px] text-ink outline-none"
+                      />
+                      <span className="text-[12px] text-muted">tok</span>
+                    </div>
+                  </div>
+                </CollapsibleContent>
+              </Collapsible>
+            </>
+          )}
+
+          {activeCat === 'tools' && (
+            <>
+              {/* Tool permissions — moved here from Developer. */}
+              <ToolPermissionsSection />
+            </>
+          )}
+
+          {activeCat === 'network' && (
+            <>
+              {/* Network (spec 08 §2) */}
+              <NetworkSection lanBind={lanBind} setLanBind={setLanBind} requireApiKey={requireApiKey} setRequireApiKey={setRequireApiKey} port={port} setPort={setPort} />
+
+              {/* ComfyUI GPU coordination */}
+              <ComfyUiSection
+                enabled={comfyEnabled}
+                setEnabled={setComfyEnabled}
+                gatePath={settings?.comfyui?.gatePath ?? ''}
+                url={comfyUrl}
+                setUrl={setComfyUrl}
+                reverseGate={comfyReverseGate}
+                setReverseGate={setComfyReverseGate}
               />
-              <span className="text-[12px] text-muted">tok</span>
+            </>
+          )}
+
+          {activeCat === 'system' && (
+            <>
+              {/* Hardware */}
+              <HardwarePanel />
+
+              {/* Privacy & telemetry (spec 09 §5) — hidden for MVP launch (ADR-041);
+                  no telemetry uploader ships yet. Re-enable via flags.ts when it does. */}
+              {TELEMETRY_UI_ENABLED && <PrivacySection level={telemetry} setLevel={setTelemetry} />}
+
+              {/* Advanced (spec 08 §2): daemon restart */}
+              <AdvancedSection onRestart={requestRestart} />
+
+              {/* About + app self-update check (F-006) */}
+              <AboutSection />
+
+              {/* Help */}
+              <HelpSection />
+            </>
+          )}
+
+          {/* Unified sticky Save bar — only for daemon-settings draft changes. */}
+          {dirty && (
+            <div className="sticky bottom-0 -mx-4 mt-2 flex items-center justify-between border-t border-border bg-panel px-4 py-3 md:-mx-6 md:px-6">
+              <span className="text-[13px] text-muted">Unsaved changes</span>
+              <Button onClick={handleSave} disabled={save.isPending || settingsQ.isLoading}>
+                <Save size={14} />
+                {save.isPending ? 'Saving…' : 'Save settings'}
+              </Button>
             </div>
-          </div>
-
-          <div className="flex items-center justify-between py-2">
-            <div>
-              <div className="text-[14px] font-medium text-ink">GPU layers</div>
-              <div className="text-[12px] text-muted">Layers to offload to the GPU (99 = all); ignored on CPU-only machines</div>
-            </div>
-            <div className="flex items-center gap-2">
-              <NumberField
-                value={defNgl}
-                min={0}
-                max={99}
-                onCommit={setDefNgl}
-                ariaLabel="Default GPU layers"
-                className="w-20 rounded-md border border-border bg-bg px-2 py-1 text-right text-[13px] text-ink outline-none"
-              />
-            </div>
-          </div>
-
-          <div className="flex items-center justify-between py-2">
-            <div>
-              <div className="text-[14px] font-medium text-ink">Image max tokens</div>
-              <div className="text-[12px] text-muted">Per-image token budget for vision models (0 = engine default)</div>
-            </div>
-            <div className="flex items-center gap-2">
-              <NumberField
-                value={defImageMax}
-                min={0}
-                step={256}
-                onCommit={setDefImageMax}
-                ariaLabel="Image max tokens"
-                className="w-24 rounded-md border border-border bg-bg px-2 py-1 text-right text-[13px] text-ink outline-none"
-              />
-              <span className="text-[12px] text-muted">tok</span>
-            </div>
-          </div>
-
-          <div className="flex items-center justify-between py-2">
-            <div>
-              <div className="text-[14px] font-medium text-ink">Max response tokens</div>
-              <div className="text-[12px] text-muted">Hard cap on tokens generated per reply (0 = unlimited). Also caps Claude Code / API requests.</div>
-            </div>
-            <div className="flex items-center gap-2">
-              <NumberField
-                value={defMaxTokens}
-                min={0}
-                step={256}
-                onCommit={setDefMaxTokens}
-                ariaLabel="Max response tokens"
-                className="w-24 rounded-md border border-border bg-bg px-2 py-1 text-right text-[13px] text-ink outline-none"
-              />
-              <span className="text-[12px] text-muted">tok</span>
-            </div>
-          </div>
-        </section>
-
-        {/* Chat */}
-        <section className="rounded-lg border border-border bg-panel p-4">
-          <h2 className="mb-3 text-[13px] font-semibold uppercase tracking-wide text-faint">Chat</h2>
-
-          <label className="flex cursor-pointer items-center justify-between py-2">
-            <div>
-              <div className="text-[14px] font-medium text-ink">Auto-generate chat titles</div>
-              <div className="text-[12px] text-muted">Uses the model to create a title after the first exchange</div>
-            </div>
-            <input
-              type="checkbox"
-              checked={autoTitle}
-              onChange={(e) => setAutoTitle(e.target.checked)}
-              className="h-4 w-4 accent-[var(--accent)]"
-            />
-          </label>
-        </section>
-
-        {/* Personalization */}
-        <PersonalizationSection />
-
-        {/* Startup */}
-        <section className="rounded-lg border border-border bg-panel p-4">
-          <h2 className="mb-3 text-[13px] font-semibold uppercase tracking-wide text-faint">Startup</h2>
-
-          <label className="flex cursor-pointer items-center justify-between py-2">
-            <div>
-              <div className="text-[14px] font-medium text-ink">Open browser on start</div>
-              <div className="text-[12px] text-muted">Automatically open the UI when the daemon starts</div>
-            </div>
-            <input
-              type="checkbox"
-              checked={openBrowser}
-              onChange={(e) => setOpenBrowser(e.target.checked)}
-              className="h-4 w-4 accent-[var(--accent)]"
-            />
-          </label>
-
-          <label className="flex cursor-pointer items-center justify-between py-2">
-            <div>
-              <div className="text-[14px] font-medium text-ink">Auto-load last model</div>
-              <div className="text-[12px] text-muted">Reload the last-used model automatically when the daemon starts</div>
-            </div>
-            <input
-              type="checkbox"
-              checked={autoLoad}
-              onChange={(e) => setAutoLoad(e.target.checked)}
-              className="h-4 w-4 accent-[var(--accent)]"
-            />
-          </label>
-        </section>
-
-        {/* ComfyUI GPU coordination */}
-        <ComfyUiSection
-          enabled={comfyEnabled}
-          setEnabled={setComfyEnabled}
-          gatePath={settings?.comfyui?.gatePath ?? ''}
-          url={comfyUrl}
-          setUrl={setComfyUrl}
-          reverseGate={comfyReverseGate}
-          setReverseGate={setComfyReverseGate}
-        />
-
-        {/* Gateway intelligence (v0.6.0) */}
-        <GatewaySection
-          autoSwap={gatewayAutoSwap}
-          setAutoSwap={setGatewayAutoSwap}
-          keepN={gatewayKeepN}
-          setKeepN={setGatewayKeepN}
-        />
-
-        {/* Network (spec 08 §2) */}
-        <NetworkSection lanBind={lanBind} setLanBind={setLanBind} requireApiKey={requireApiKey} setRequireApiKey={setRequireApiKey} port={port} setPort={setPort} />
-        {/* Models — folders */}
-        <ModelDirs dirs={modelDirs} primaryDir={primaryModelDir} mut={modelDirsMut} />
-
-        {/* Models — Hugging Face token (spec 10 §4) */}
-        <HfTokenSection tokenSet={settings?.hfTokenSet ?? false} onSaved={() => void settingsQ.refetch()} />
-
-        {/* Privacy & telemetry (spec 09 §5) — hidden for MVP launch (ADR-041);
-            no telemetry uploader ships yet. Re-enable via flags.ts when it does. */}
-        {TELEMETRY_UI_ENABLED && <PrivacySection level={telemetry} setLevel={setTelemetry} />}
-
-        {/* Hardware */}
-        <HardwarePanel />
-
-        {/* Save */}
-        <div className="flex justify-end">
-          <Button onClick={handleSave} disabled={save.isPending || settingsQ.isLoading}>
-            <Save size={14} />
-            {save.isPending ? 'Saving…' : 'Save settings'}
-          </Button>
+          )}
         </div>
-
-        {/* Advanced (spec 08 §2): daemon restart */}
-        <AdvancedSection onRestart={requestRestart} />
-
-        {/* About + app self-update check (F-006) */}
-        <AboutSection />
-
-        {/* Help */}
-        <HelpSection />
       </div>
     </div>
   )
@@ -1238,7 +1339,7 @@ function PersonalizationSection() {
 
       <div className="flex flex-col gap-4">
         {/* Assistant name */}
-        <div className="flex items-center justify-between gap-4">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
           <div className="shrink-0">
             <div className="text-[14px] font-medium text-ink">Assistant name</div>
             <div className="text-[12px] text-muted">What the assistant calls itself (empty = model default)</div>
@@ -1248,12 +1349,12 @@ function PersonalizationSection() {
             value={p.assistantName}
             onChange={(e) => setP((prev) => ({ ...prev, assistantName: e.target.value }))}
             placeholder="e.g. Aria"
-            className="w-40 rounded-md border border-border bg-bg px-2 py-1 text-[13px] text-ink outline-none placeholder:text-faint"
+            className="w-full rounded-md border border-border bg-bg px-2 py-1 text-[13px] text-ink outline-none placeholder:text-faint sm:w-40"
           />
         </div>
 
         {/* User name */}
-        <div className="flex items-center justify-between gap-4">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
           <div className="shrink-0">
             <div className="text-[14px] font-medium text-ink">Your name</div>
             <div className="text-[12px] text-muted">How the assistant addresses you (empty = not set)</div>
@@ -1263,7 +1364,7 @@ function PersonalizationSection() {
             value={p.userName}
             onChange={(e) => setP((prev) => ({ ...prev, userName: e.target.value }))}
             placeholder="e.g. Alex"
-            className="w-40 rounded-md border border-border bg-bg px-2 py-1 text-[13px] text-ink outline-none placeholder:text-faint"
+            className="w-full rounded-md border border-border bg-bg px-2 py-1 text-[13px] text-ink outline-none placeholder:text-faint sm:w-40"
           />
         </div>
 

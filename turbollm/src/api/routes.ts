@@ -2,7 +2,7 @@
 import type { Context, Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { basename, dirname, join, resolve, sep } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { GATE_VERSION, gateNodeSource } from '../comfyui/gate-template'
 import { randomUUID } from 'node:crypto'
 import { homedir, networkInterfaces } from 'node:os'
@@ -944,25 +944,30 @@ export function registerApi(app: Hono, d: Deps): void {
     }
   })
 
-  // ---- filesystem browser (spec 03 §9): pick an engine binary by navigating the
-  // disk from the browser. Loopback-only and confined to the user's home dir so a
-  // page on the LAN cannot read arbitrary files through the daemon.
+  // ---- filesystem browser (spec 03 §9): pick an engine binary/folder by navigating
+  // the disk from the browser. LOCAL-ONLY (isLocalRequest, matching /engines/scan): a
+  // page on the LAN — even with a valid key — cannot read the filesystem through the
+  // daemon; only the browser on the machine running TurboLLM can. Deliberately NOT
+  // home-confined, so an engine that lives on another drive (D:\) or outside home is
+  // reachable — the local user already picks (and executes) arbitrary binaries via scan.
   app.get('/api/v1/fs/browse', (c) => {
-    const home = realHome()
+    if (!isLocalRequest(c, d))
+      return err(c, 403, 'forbidden', 'Browsing the filesystem is only available on the machine running TurboLLM.')
     const raw = (c.req.query('path') ?? '').trim()
-    // Resolve the requested path; default to the home dir when none is given.
-    const target = raw ? resolve(raw) : home
-    // Canonicalize symlinks before the containment check so a symlink inside home
-    // that points outside cannot be used to escape. Fall back to the lexical path
-    // if the target doesn't exist yet (it then fails the readdir below cleanly).
+    // Windows "This PC": a virtual root above the drive letters, so the user can hop
+    // between drives (C:\, D:\, …). Reached by going "up" from a drive root.
+    if (raw === FS_DRIVES_ROOT && process.platform === 'win32') {
+      return c.json({ path: FS_DRIVES_ROOT, parent: null, entries: listWindowsDrives() })
+    }
+    // Default to the home dir (a sensible starting point); any path is allowed.
+    const target = raw ? resolve(raw) : homedir()
+    // Canonicalize symlinks; fall back to the lexical path if it doesn't exist yet
+    // (it then fails the readdir below cleanly).
     let real: string
     try {
       real = realpathSync(target)
     } catch {
       real = target
-    }
-    if (!isWithinHome(real, home)) {
-      return err(c, 403, 'path_outside_home', 'That folder is outside your home directory.')
     }
     let entries: { name: string; path: string; isDir: boolean }[]
     try {
@@ -985,9 +990,11 @@ export function registerApi(app: Hono, d: Deps): void {
     } catch {
       return err(c, 400, 'fs_read_failed', 'Could not read that folder (permission denied or not a directory).')
     }
-    // Parent is null at the home root or once it would escape home.
-    const parentDir = real === home ? null : dirname(real)
-    const parent = parentDir && isWithinHome(parentDir, home) ? parentDir : null
+    // Parent: the containing dir; at a filesystem/drive root, go up to the Windows drive
+    // list (so the user can switch drives) or stop (null) on a single-root OS.
+    const parentDir = dirname(real)
+    const parent =
+      parentDir === real ? (process.platform === 'win32' ? FS_DRIVES_ROOT : null) : parentDir
     return c.json({ path: real, parent, entries })
   })
 
@@ -2236,24 +2243,23 @@ function readTail(path: string, n: number): string[] {
 
 // ── filesystem browser helpers (spec 03 §9) ─────────────────────────────────
 
-/** The user's home dir, canonicalized (symlinks resolved) so the containment
- *  check below compares like-with-like. */
-function realHome(): string {
-  const h = homedir()
-  try {
-    return realpathSync(h)
-  } catch {
-    return h
-  }
-}
+/** Sentinel path for the Windows "This PC" drive list — a virtual root above the
+ *  drive letters (C:\, D:\, …) so the browser can hop between drives. */
+const FS_DRIVES_ROOT = '::drives'
 
-/** True when `p` is the home dir itself or a descendant of it. Compares the
- *  normalized paths and requires a trailing separator on the prefix so
- *  `/home/bobby` is not treated as inside `/home/bob`. Cross-platform: `sep`
- *  is `\` on Windows, `/` elsewhere. */
-function isWithinHome(p: string, home: string): boolean {
-  if (p === home) return true
-  return p.startsWith(home.endsWith(sep) ? home : home + sep)
+/** Available Windows drive roots (C:\, D:\, …) as browsable entries. Probes A–Z;
+ *  only the drives that exist on the box respond, missing ones are skipped. */
+function listWindowsDrives(): { name: string; path: string; isDir: boolean }[] {
+  const drives: { name: string; path: string; isDir: boolean }[] = []
+  for (let i = 65; i <= 90; i++) {
+    const root = `${String.fromCharCode(i)}:\\`
+    try {
+      if (existsSync(root)) drives.push({ name: root, path: root, isDir: true })
+    } catch {
+      /* unreadable drive (e.g. an empty removable slot) — skip */
+    }
+  }
+  return drives
 }
 
 function getLanIp(): string {

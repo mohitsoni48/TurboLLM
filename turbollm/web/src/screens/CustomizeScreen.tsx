@@ -30,7 +30,7 @@ export function CustomizeScreen() {
   const setTab = (tab: CustomizeTab) => setSearchParams(tab === 'agents' ? {} : { tab }, { replace: true })
 
   return (
-    <div className="flex w-full flex-col gap-4 px-6 py-6">
+    <div className="flex w-full flex-col gap-4 px-4 py-6 md:px-6">
       <ScreenHeader
         title="Customize"
         description="Add agents, skills, and external providers the model can call during conversations."
