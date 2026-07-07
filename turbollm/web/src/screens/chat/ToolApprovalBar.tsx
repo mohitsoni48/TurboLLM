@@ -1,7 +1,6 @@
 import { useState } from 'react'
 import { respondToolApproval } from '../../lib/chat-api'
-import { describeToolCall } from '../../lib/tool-explain'
-import { friendlyName } from './MessageBubble'
+import { describeToolCall, friendlyName } from '../../lib/tool-explain'
 import { Button } from '../../components/ui/button'
 import { toast } from '../../components/ui/sonner'
 import { ApiError } from '../../lib/api'

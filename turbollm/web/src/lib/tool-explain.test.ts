@@ -1,18 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-
-// tool-explain.ts pulls in MessageBubble.tsx -> stores/ui.ts, which reads localStorage at
-// module load (theme init) — stub it so this file is importable under plain node:test (no DOM).
-;(globalThis as unknown as { localStorage: Storage }).localStorage ??= {
-  getItem: () => null,
-  setItem: () => {},
-  removeItem: () => {},
-  clear: () => {},
-  key: () => null,
-  length: 0,
-} as Storage
-
-const { describeToolCall } = await import('./tool-explain')
+import { describeToolCall } from './tool-explain'
 
 // Regression: a model emitting `queries: [...]` instead of the schema's `query` used to render
 // as the literal string "undefined" in the tool-approval dialog. Mirrors resolveSearchQuery in
