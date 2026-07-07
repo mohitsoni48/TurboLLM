@@ -25,6 +25,51 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.7.4] - 2026-07-07
+
+**Engines, Library, Developer, and Settings redesigned, and every screen now works on mobile.**
+
+### Added
+- Mobile-responsive layouts across every screen (drawer navigation, stacked cards, horizontal
+  tab strips, split panes that stack vertically) — the desktop/landscape layout is unchanged.
+- **Library**: a dedicated Folders dialog with a real folder picker for managing model
+  directories, plus name search and facet-aware filter chips (a chip only appears if at least
+  one model has it).
+- **Engines**: per-card hardware-fit indicators (green/amber/red: Compatible / runs after a
+  build / incompatible + reason) and grounded pros/cons for every engine.
+- The folder/file picker (used by model folders and "Add your own engine") gained an editable
+  address bar — paste or type an absolute path and jump there directly, alongside click-to-browse.
+
+### Changed
+- **Library**: rows are now a column-aligned two-tier layout (name + one state signal + quiet
+  capability chips, with aligned Quant/Size/Ctx/Speed columns); multi-quant models fold into one
+  row with a quant dropdown instead of a collapsible group.
+- **Engines**: the active-engine bar and hardware-fit selector merged into one panel with a
+  run-state traffic light (green running / amber starting / red error / grey stopped); llama.cpp
+  variants unified under one "Manage GPU builds" card; "Add your own engine" moved into a compact
+  strip.
+- **Developer**: narrowed to connecting external tools — a Connection panel, one-command CLI
+  setup cards, and a collapsed API reference. Cloud Deploy (RunPod) moved behind an internal
+  feature flag, off by default.
+- **Settings**: reorganized into a two-pane, five-category layout (General · Models & loading ·
+  Tools & safety · Network & sharing · System) with one sticky Save bar; expert knobs (GPU
+  layers, VRAM headroom, image/response token caps) moved into a collapsible Advanced section.
+  Tool permissions moved here from Developer (Settings → Tools & safety).
+- "Add your own engine" filesystem browsing is local-only (same restriction as engine scanning)
+  but can now browse the whole local filesystem, including other drives on Windows — previously
+  confined to your home directory.
+
+### Fixed
+- Every dialog now keeps a gutter on narrow screens instead of rendering flush to the viewport edge.
+- Assorted mobile overflow issues: chat header controls clipping on narrow screens, Library
+  action buttons pushed off-screen, Settings controls clipped at the edge, and long Hugging Face
+  repo names/inline code overflowing their containers.
+
+### Discord
+- New, clearer look for the Engines, Library, Developer, and Settings screens.
+- The whole app now works properly in your phone's browser, not just on desktop.
+- Picking a model folder or a custom engine now lets you paste in a path directly, or browse to any drive.
+
 ## [1.7.3] - 2026-07-06
 
 **The standalone Agents screen is retired — replaced by a shared Skills library used directly in chat, plus a new Agents tab in Customize for editing personas and building your own.**

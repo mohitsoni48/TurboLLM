@@ -21,7 +21,7 @@ const TURBOLLM_KNOWLEDGE =
   '- Set a custom **system prompt** per conversation.\n' +
   '- **Artifacts**: HTML/SVG/Mermaid fenced blocks render as sandboxed live previews (shown as images). Download as PNG/JPEG/SVG/GIF/HTML depending on type.\n' +
   '- **Thinking/reasoning**: models that emit `<think>` blocks get a collapsible fold; visible prose renders normally below.\n' +
-  '- **Tool-call approval gate**: every tool call (web search, fetch URL, run code, MCP tools) asks for approval by default before it runs — an inline bar above the composer offers Deny, Allow, Allow for this chat, or Always Allow. Live cards still show each call\'s status (awaiting approval → pending → done / error). Per-tool defaults (Ask / Allow / Deny) are set globally in Developer → Tool permissions. Background agent runs never see this prompt (no one there to answer it) — a tool the agent is configured to use runs without asking.\n' +
+  '- **Tool-call approval gate**: every tool call (web search, fetch URL, run code, MCP tools) asks for approval by default before it runs — an inline bar above the composer offers Deny, Allow, Allow for this chat, or Always Allow. Live cards still show each call\'s status (awaiting approval → pending → done / error). Per-tool defaults (Ask / Allow / Deny) are set globally in Settings → Tools & safety. Background agent runs never see this prompt (no one there to answer it) — a tool the agent is configured to use runs without asking.\n' +
   '- **Web search**: Research persona forces 3–5 `web_search` calls; other personas use it when a search provider key is configured.\n' +
   '- **Export/Import**: export as `.turbollm-chat.json` or OpenAI-format JSON; re-import resumes the conversation. Share button gives a LAN read-only link and a debug snapshot.\n' +
   '- **Attachments** (paperclip): images (vision models), PDFs (real extracted text via pdf.js, not raw bytes), and plain-text/code files (`.txt`/`.md`/`.csv`/`.json`/`.yaml`/`.log` and common source extensions).\n' +
@@ -33,16 +33,22 @@ const TURBOLLM_KNOWLEDGE =
   '- **Downloading a GGUF** places it in its own `<owner>/<repo>` folder (mirroring Hugging Face\'s layout) and automatically pulls its vision projector (mmproj) and every shard of a split/multipart quant into that same folder, so it always loads as one working model — no manual mmproj hunting or missing shards.\n' +
   '- **Import from URL** (link icon next to Discover\'s search box) accepts a direct `.gguf`/resolve link (any HTTPS host) for a one-off download, or a Hugging Face **model page** link, which opens that repo\'s quant picker instead of downloading directly (a repo has many quants — picking one there gets the same folder/mmproj/shard handling as browsing Discover).\n' +
   '- Click a model → **Model Detail** side panel: load profile config, VRAM estimate bar, auto-tune button, per-(model, engine) saved profile — switching the active engine saves/loads that engine\'s own tuning for the model, instead of sharing one profile across every installed engine. An untuned engine falls back to whichever engine\'s profile you saved most recently.\n' +
-  '- **Load** button starts the model; progress indicator shows load time.\n\n' +
+  '- **Load** button starts the model; progress indicator shows load time.\n' +
+  '- **Multi-quant models** fold into one row with a quant dropdown (Size/Ctx/Speed/Load follow the selected quant), instead of one row per quant.\n' +
+  '- **Folders** (dialog, opened from the Library toolbar): add/remove/set-primary the local directories TurboLLM scans for models, via a real folder picker (any drive) or a pasted absolute path.\n\n' +
 
   '**Engines** — manage inference backends.\n' +
-  '- **Running now** dropdown at top: switch between installed engines (one active at a time).\n' +
-  '- **Install & manage** catalog: all engines with hardware fit verdict (Recommended / Installed / Incompatible + reason). Incompatible engines are greyed out.\n' +
-  '- **Advanced** (collapsible): per-backend llama.cpp variants — CUDA, ROCm, CPU, Vulkan, SYCL. Install, update, or switch here.\n' +
-  '- **Add your own engine**: guided folder scan that probes a binary and registers it as a custom engine.\n' +
+  '- One merged panel at top shows the **active engine** (a run-state traffic light: green running / amber starting / red error / grey stopped) plus a **Running now** dropdown to switch between installed engines.\n' +
+  '- **Engine gallery**: cards for every engine with a **hardware-fit mark** (green Compatible / amber "runs after a build" / red incompatible + reason), a real pros/cons list, and speed/VRAM/OS attributes.\n' +
+  '- **Manage GPU builds** (llama.cpp card): per-backend variants — CUDA, ROCm, CPU, Vulkan, SYCL. Install, update, or switch the active build here.\n' +
+  '- **Add your own engine** (compact strip at the bottom): guided folder scan that probes a binary and registers it as a custom engine. Filesystem browsing here is local-only (only the machine running TurboLLM can browse it) but reaches the whole local filesystem, including other drives on Windows.\n' +
   '- **In-app build**: clone → cmake → compile (CUDA), on Windows or Linux (incl. WSL2); auto-downloads CUDA toolkit if absent on Windows (~490 MB from NVIDIA redist — on Linux, install CUDA via your distro/NVIDIA installer first); live phase log + success screen.\n' +
   '- **Engine updates**: honest check vs GitHub releases/latest; rollback-safe (probe new build before swap, old build kept until success).\n' +
   '- Per-engine auto-update policy: Off / Notify / Auto (default Notify).\n\n' +
+
+  '**Developer** — connect an outside app or CLI to this server.\n' +
+  '- **Connection panel**: the server URL and your API key(s) in one place.\n' +
+  '- **One-command CLI setup cards**: `turbollm launch claude|opencode|kilo|openclaw|hermes` for each supported coding CLI, plus a collapsed reference for the public `/v1/*` API.\n\n' +
 
   '**Agents** — background agent runs (v1.5.0+).\n' +
   '- Detached conversations that run without the UI open.\n' +
@@ -56,18 +62,12 @@ const TURBOLLM_KNOWLEDGE =
   '- **Custom MCP servers**: add/edit/delete your own MCP servers (stdio subprocess or SSE/HTTP). Tools from all connected servers appear automatically as callable tools in chat, with no daemon restart.\n' +
   '- **Agents**: the built-in personas (below) plus any you create yourself — name, description, system prompt, and a checklist of which shared skills and which tools it may use (everything checked by default). Custom agents are picked from the same in-chat picker as the built-ins.\n\n' +
 
-  '**Settings**:\n' +
-  '- Theme: light / dark / system\n' +
-  '- Idle timeout: auto-stops the engine after N minutes of inactivity (frees VRAM)\n' +
-  '- Default context length and default GPU layers: global defaults for new model loads\n' +
-  '- Auto-load last model on start: re-loads the last-used model at daemon start\n' +
-  '- LAN exposure: bind to 0.0.0.0 (LAN) vs 127.0.0.1 (loopback only)\n' +
-  '- VRAM headroom (Settings → Engine): how much VRAM auto-tune keeps free for other GPU workloads — 300 MB to 2 GB, default 1 GB\n' +
-  '- ComfyUI integration: URL of a ComfyUI instance; Reverse GPU gate: TurboLLM calls ComfyUI /free before every model load so VRAM is freed first; update banner when installed ComfyUI node is out of date\n' +
-  '- Gateway: auto model-swap toggle + Keep-N pool (1–4 models loaded simultaneously, LRU eviction)\n' +
-  '- Auth / API key: gateway key required from clients\n' +
-  '- Telemetry: Off / Anonymous / Full\n' +
-  '- About: current version, update-available chip (`npm i -g turbollm`), copy install command\n\n' +
+  '**Settings** — a two-pane layout, five categories in the left rail, one sticky Save bar:\n' +
+  '- **General**: theme (light/dark/system), enable-thinking-by-default, confirm-before-delete, personalization (assistant name / your name), auto-generate chat titles, open browser on start.\n' +
+  '- **Models & loading**: idle timeout (auto-stop after N minutes), default context length, Gateway (auto model-swap + Keep-N pool, 1–4 models), model folders, Hugging Face token, and an **Advanced** collapsible for expert knobs — default GPU layers, VRAM headroom (300 MB–2 GB, default 1 GB), and image/response token caps.\n' +
+  '- **Tools & safety**: per-tool Ask/Allow/Deny defaults for every tool the model can call (web_search, fetch_url, run_code, MCP tools).\n' +
+  '- **Network & sharing**: LAN exposure (bind to 0.0.0.0 vs loopback-only), port, require-API-key auth, and ComfyUI integration (URL, Reverse GPU gate, update banner).\n' +
+  '- **System**: hardware panel, telemetry (Off / Anonymous / Full), About (current version, update-available chip, copy install command).\n\n' +
 
   '## Agents (formerly "Personas")\n\n' +
   'Agents are style presets selected at conversation creation; locked after the first message. All agents except Blank and Lite automatically get the text-chart capability, artifact rendering capability, and current date injected into the system prompt. Managed under Customize → Agents, alongside Skills and MCP Servers — built-in agents are read-only; custom agents you create there also carry a skill + tool allow-list (everything checked by default) that is baked into the conversation at creation.\n\n' +
@@ -95,7 +95,7 @@ const TURBOLLM_KNOWLEDGE =
   '## Auto-Tune\n\n' +
   'Auto-tune finds the best GPU-offload config for a model given available VRAM. It runs a binary search, not a fixed candidate list. Triggered from the Model Detail panel.\n\n' +
   '**Phase 1 — KV quant sweep** (VRAM probes, no generation):\n' +
-  'Tests quality-preserving KV cache types from best to smaller: f16 → q8_0 → turbo4 (TurboQuant only) / q4_0. Picks the highest-quality type that fits within the configured VRAM headroom buffer (Settings → Engine, default 1 GB, adjustable 300 MB–2 GB). Lower-quality types (q4_0, q4_1) are never auto-selected — quality floor is enforced.\n\n' +
+  'Tests quality-preserving KV cache types from best to smaller: f16 → q8_0 → turbo4 (TurboQuant only) / q4_0. Picks the highest-quality type that fits within the configured VRAM headroom buffer (Settings → Models & loading → Advanced, default 1 GB, adjustable 300 MB–2 GB). Lower-quality types (q4_0, q4_1) are never auto-selected — quality floor is enforced.\n\n' +
   '**Phase 2 — Binary search for GPU offload** (~log₂(blockCount) probes, VRAM-only):\n' +
   '- Dense models: search ngl ∈ [0, blockCount] — finds highest ngl that doesn\'t exceed the VRAM headroom.\n' +
   '- MoE models: search nCpuMoe ∈ [0, nExpertsTotal] — ngl stays maxed, finds minimum nCpuMoe (router experts on CPU) that fits. Reducing nCpuMoe pushes more MoE routing onto the GPU.\n\n' +
@@ -163,7 +163,7 @@ const TURBOLLM_KNOWLEDGE =
   '- **OpenAI-compatible**: `POST /v1/chat/completions`, `GET /v1/models`, `POST /v1/embeddings`\n' +
   '- **Anthropic-compatible**: `POST /v1/messages`\n' +
   '- **Auto model-swap**: request arrives with any model name → fuzzy-matched against available models → loads it automatically (mutex-serialized). Works with Claude Code, Continue, Open WebUI, any compatible client.\n' +
-  '- **Keep-N pool**: 1–4 models simultaneously with LRU eviction (Settings → Gateway).\n' +
+  '- **Keep-N pool**: 1–4 models simultaneously with LRU eviction (Settings → Models & loading).\n' +
   '- **`turbollm launch claude`**: launches Claude Code pointed at the gateway with proper slow-model timeouts (`ANTHROPIC_TIMEOUT=300000`, `ANTHROPIC_MAX_RETRIES=0`). Auto-discovers the daemon port (pidfile → config → default 6996). Always pins `ANTHROPIC_MODEL` to whatever the gateway currently has loaded (so Claude Code\'s status line, `/status`, and context-window sizing are accurate); `--model <name>` loads a different model first, then pins that one. Also opts into Claude Code\'s gateway model-discovery, so `/model` lists your local models — requires **Auto Model Swap** on (Settings → Gateway), otherwise picking a model in `/model` would silently do nothing.\n' +
   '- **`turbollm launch opencode|kilo|openclaw|hermes`**: wires those coding CLIs to TurboLLM the same way — opencode/kilo/openclaw get a `turbollm` provider merged into their own config file (an existing config, comments included, is left untouched if already pointed at TurboLLM); hermes is configured via its own `hermes config set` command instead, since its config is YAML.\n' +
   '- **Embeddings**: bert-family / filename-pattern models (bge-, nomic-embed, -embed…) auto-detected; embedding models get a separate pool slot and are never LRU-evicted by chat requests.\n' +
@@ -182,7 +182,7 @@ const TURBOLLM_KNOWLEDGE =
   '**Context exhausted**: Increase `ctx` in the load profile (needs more VRAM). Enable `contextOverflow: shift` so old messages slide off. Or start a new conversation.\n\n' +
   '**MLX hang / silent failure**: Now detected — TurboLLM reads the traceback and shows `model_load_failed` instead of hanging. Ensure the model isn\'t a partial download (check the re-download button for incomplete shards).\n\n' +
   '**Empty assistant reply after web searches**: TurboLLM detects an empty-body finish and forces one extra generation pass automatically.\n\n' +
-  '**ComfyUI VRAM conflict**: Enable Settings → ComfyUI → Reverse GPU gate. TurboLLM calls ComfyUI `/free` before every model load. Also install/update the TurboLLM ComfyUI node (update banner appears in Settings when outdated).\n\n' +
+  '**ComfyUI VRAM conflict**: Enable Settings → Network & sharing → ComfyUI → Reverse GPU gate. TurboLLM calls ComfyUI `/free` before every model load. Also install/update the TurboLLM ComfyUI node (update banner appears in Settings when outdated).\n\n' +
   '**Engine update says "up to date" incorrectly**: Fixed in v1.0.0. Update TurboLLM itself if on an older version.\n\n' +
   '**No Download run log after auto-tune**: The checkbox appears in the Save Results dialog at the end of an auto-tune run (not during). "Download run log" is checked by default.\n\n' +
   '**`turbollm --stop` doesn\'t work**: Available since v1.4.0. Update via `npm i -g turbollm`.\n\n' +
