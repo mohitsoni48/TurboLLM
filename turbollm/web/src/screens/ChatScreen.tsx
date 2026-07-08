@@ -528,11 +528,15 @@ export function ChatScreen() {
 
   const handleEditSave = (msgId: string, content: string) => {
     if (!activeId) return
+    // GitHub #52: editing the model's own reply just fixes its text in place — no reason
+    // to trigger ANOTHER reply after it. Only a user-message edit resends (branching the
+    // downstream history, per ADR — see chat-routes.ts's PUT /messages/:msgId).
+    const isUserMessage = messages.find((m) => m.id === msgId)?.role === 'user'
     setEditingId(null)
     mut.editMsg.mutate({ convId: activeId, msgId, content }, {
       onSuccess: () => {
         userScrolledUp.current = false
-        if (engineState === 'running' && model) {
+        if (isUserMessage && engineState === 'running' && model) {
           const ac = new AbortController()
           abortRef.current = ac
           void streamFrom(activeId, continueConversation(activeId, ac.signal, !thinkingEnabled))
@@ -796,6 +800,7 @@ export function ChatScreen() {
               <MessageBubble
                 key={m.id}
                 message={m}
+                convId={readonly ? undefined : activeId ?? undefined}
                 isLast={i === messages.length - 1 && !live}
                 onEdit={readonly ? undefined : (msg) => setEditingId(msg.id)}
                 onDelete={readonly ? undefined : handleDelete}

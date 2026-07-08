@@ -1,10 +1,12 @@
 import { memo, useEffect, useRef, useState, type ReactNode } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
-import { CheckCircle2, ChevronDown, ChevronRight, FileText, HelpCircle, Loader2, Pencil, RefreshCw, Trash2, XCircle } from 'lucide-react'
+import { CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, FileText, HelpCircle, Loader2, Pencil, RefreshCw, Trash2, XCircle } from 'lucide-react'
 import type { ClaimVerdict, LiveToolCall, Message, MessageStats, ResearchMeta, ResearchSource, ToolCallRecord } from '../../lib/chat-types'
 import type { LiveBlock } from '../../lib/live-timeline'
+import { activateVariant, getMessageVariants } from '../../lib/chat-api'
 import { Button } from '../../components/ui/button'
 import { CopyButton } from '../../components/ui/copy-button'
 import { ArtifactCard, isArtifactLang } from '../../components/ArtifactCard'
@@ -487,6 +489,7 @@ export function StreamingBubble({
 
 export function MessageBubble({
   message,
+  convId,
   isLast,
   onEdit,
   onDelete,
@@ -497,6 +500,9 @@ export function MessageBubble({
   showThinking = true,
 }: {
   message: Message
+  /** Needed for the chat-branching variant switcher (GitHub #52); optional so read-only
+   *  share views can keep omitting it — the switcher just doesn't render without it. */
+  convId?: string
   isLast: boolean
   /** When undefined, edit/delete/regenerate action buttons are hidden (read-only mode). */
   onEdit?: (m: Message) => void
@@ -553,10 +559,13 @@ export function MessageBubble({
             </div>
           )}
           {!isEditing && (
-            <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
-              <CopyButton text={message.content} className="rounded p-1 hover:bg-panel-2" />
-              {onEdit && <ActionBtn icon={<Pencil size={12} />}  label="Edit"   onClick={() => { setEditDraft(message.content); onEdit(message) }} />}
-              {onDelete && <ActionBtn icon={<Trash2 size={12} />} label="Delete" onClick={() => onDelete(message)} destructive />}
+            <div className="flex items-center gap-0.5">
+              {convId && message.variantGroup && <VariantSwitcher convId={convId} message={message} />}
+              <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+                <CopyButton text={message.content} className="rounded p-1 hover:bg-panel-2" />
+                {onEdit && <ActionBtn icon={<Pencil size={12} />}  label="Edit"   onClick={() => { setEditDraft(message.content); onEdit(message) }} />}
+                {onDelete && <ActionBtn icon={<Trash2 size={12} />} label="Delete" onClick={() => onDelete(message)} destructive />}
+              </div>
             </div>
           )}
         </div>
@@ -582,7 +591,27 @@ export function MessageBubble({
           <ThinkingBlock reasoning={message.reasoning} thinkMs={message.stats.thinkMs} showThinking={showThinking} />
         )}
         <ToolCallsPanel calls={completedToolCalls} />
-        {hasError ? (
+        {isEditing ? (
+          <div className="w-full">
+            <textarea
+              autoFocus
+              className="w-full resize-none rounded-[var(--radius-lg)] border border-accent bg-panel px-4 py-2.5 text-[15px] leading-[1.6] text-ink outline-none"
+              rows={4}
+              value={editDraft}
+              onChange={(e) => setEditDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); onEditSave(editDraft) }
+                if (e.key === 'Escape') onEditCancel()
+              }}
+            />
+            <div className="mt-1.5 flex gap-1.5">
+              <Button size="sm" variant="ghost" onClick={onEditCancel}>Cancel</Button>
+              {/* GitHub #52: unlike a user-message edit, this only fixes the reply's own
+                  text in place — it doesn't resend or trigger a new generation. */}
+              <Button size="sm" onClick={() => onEditSave(editDraft)}>Save</Button>
+            </div>
+          </div>
+        ) : hasError ? (
           <div className="rounded-lg border px-4 py-3 text-[14px]" style={{ borderColor: 'var(--err)', color: 'var(--err)', background: 'color-mix(in srgb, var(--err) 8%, transparent)' }}>
             Generation failed or was stopped.
             {isLast && onRegenerate && <button type="button" className="ml-3 underline" onClick={onRegenerate}>Regenerate</button>}
@@ -604,12 +633,70 @@ export function MessageBubble({
         {/* F-021: sources panel */}
         {rm && <SourcesPanel meta={rm} />}
         <StatsRow stats={message.stats} />
-        <div className="mt-1 flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
-          <CopyButton text={message.content} className="rounded p-1 hover:bg-panel-2" />
-          {isLast && onRegenerate && <ActionBtn icon={<RefreshCw size={12} />} label="Regenerate" onClick={onRegenerate} />}
-          {onDelete && <ActionBtn icon={<Trash2 size={12} />} label="Delete" onClick={() => onDelete(message)} destructive />}
-        </div>
+        {!isEditing && (
+          <div className="mt-1 flex items-center gap-0.5">
+            {convId && message.variantGroup && <VariantSwitcher convId={convId} message={message} />}
+            <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+              <CopyButton text={message.content} className="rounded p-1 hover:bg-panel-2" />
+              {onEdit && <ActionBtn icon={<Pencil size={12} />} label="Edit" onClick={() => { setEditDraft(message.content); onEdit(message) }} />}
+              {isLast && onRegenerate && <ActionBtn icon={<RefreshCw size={12} />} label="Regenerate" onClick={onRegenerate} />}
+              {onDelete && <ActionBtn icon={<Trash2 size={12} />} label="Delete" onClick={() => onDelete(message)} destructive />}
+            </div>
+          </div>
+        )}
       </div>
+    </div>
+  )
+}
+
+// ── Chat branching (GitHub #52): ‹ 2/3 › switcher for regenerated sibling replies ──
+
+function VariantSwitcher({ convId, message }: { convId: string; message: Message }) {
+  const qc = useQueryClient()
+  const group = message.variantGroup!
+  const variantsQ = useQuery({
+    queryKey: ['message-variants', group],
+    queryFn: () => getMessageVariants(convId, message.id),
+  })
+  const [switching, setSwitching] = useState(false)
+
+  const variants = variantsQ.data?.variants ?? []
+  const index = variants.findIndex((v) => v.id === message.id)
+  // Bail if still loading, a group that collapsed to one, or a stale query mid-refetch
+  // (index -1 — this message isn't in the list yet) rather than risk indexing variants[-2].
+  if (variants.length < 2 || index === -1) return null
+  const go = async (targetId: string) => {
+    setSwitching(true)
+    try {
+      await activateVariant(convId, targetId)
+      await qc.invalidateQueries({ queryKey: ['message-variants', group] })
+      await qc.invalidateQueries({ queryKey: ['conversation', convId] })
+    } finally {
+      setSwitching(false)
+    }
+  }
+
+  return (
+    <div className="flex items-center gap-0.5 text-[11px] text-faint">
+      <button
+        type="button"
+        disabled={switching || index <= 0}
+        onClick={() => go(variants[index - 1].id)}
+        className="grid h-5 w-5 place-items-center rounded hover:bg-panel-2 disabled:pointer-events-none disabled:opacity-30"
+        title="Previous version"
+      >
+        <ChevronLeft size={12} />
+      </button>
+      <span className="tabular-nums">{index + 1}/{variants.length}</span>
+      <button
+        type="button"
+        disabled={switching || index >= variants.length - 1}
+        onClick={() => go(variants[index + 1].id)}
+        className="grid h-5 w-5 place-items-center rounded hover:bg-panel-2 disabled:pointer-events-none disabled:opacity-30"
+        title="Next version"
+      >
+        <ChevronRight size={12} />
+      </button>
     </div>
   )
 }

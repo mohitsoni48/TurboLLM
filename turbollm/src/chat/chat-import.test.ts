@@ -19,6 +19,7 @@ function makeConv(overrides: Partial<Conversation & { messages: Message[] }> = {
     expertMode: false,
     toolPolicy: 'force_web_search',
     kind: 'chat',
+    preserveThinking: false,
     createdAt: '2026-06-19T00:00:00.000Z',
     updatedAt: '2026-06-19T00:00:01.000Z',
     messages: [],
@@ -39,6 +40,9 @@ function makeMsg(role: 'user' | 'assistant', content: string, extra?: Partial<Me
     toolCalls: [],
     stats: {},
     createdAt: '2026-06-19T00:00:02.000Z',
+    variantGroup: null,
+    isActive: true,
+    branchOf: null,
     ...extra,
   }
 }

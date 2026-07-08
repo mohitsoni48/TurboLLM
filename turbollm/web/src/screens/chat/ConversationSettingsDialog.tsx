@@ -38,6 +38,7 @@ export function ConversationSettingsDialog({ conv }: { conv: Conversation | unde
   const [systemPrompt, setSystemPrompt] = useState('')
   const [sampling, setSampling] = useState<Record<string, number>>({})
   const [skillIds, setSkillIds] = useState<string[]>([])
+  const [preserveThinking, setPreserveThinking] = useState(false)
 
   const skillsQ = useQuery({ queryKey: skillKeys.list(), queryFn: fetchSkills, enabled: open, staleTime: 0 })
   const pickableSkills = (skillsQ.data ?? []).filter((s) => !CHAT_UNSUPPORTED_SKILLS.has(s.id))
@@ -47,6 +48,7 @@ export function ConversationSettingsDialog({ conv }: { conv: Conversation | unde
       setSystemPrompt(conv.systemPrompt ?? '')
       setSampling(conv.sampling ?? {})
       setSkillIds(conv.skillIds ?? [])
+      setPreserveThinking(conv.preserveThinking ?? false)
     }
   }, [open, conv])
 
@@ -64,7 +66,9 @@ export function ConversationSettingsDialog({ conv }: { conv: Conversation | unde
   const save = () => {
     if (!conv) return
     // Expert threads keep their server-managed system prompt — only sampling is editable.
-    const patch = isExpert ? { id: conv.id, sampling, skillIds } : { id: conv.id, systemPrompt, sampling, skillIds }
+    const patch = isExpert
+      ? { id: conv.id, sampling, skillIds, preserveThinking }
+      : { id: conv.id, systemPrompt, sampling, skillIds, preserveThinking }
     mut.update.mutate(
       patch,
       {
@@ -196,6 +200,25 @@ export function ConversationSettingsDialog({ conv }: { conv: Conversation | unde
                 ))}
               </div>
             )}
+          </div>
+
+          {/* GitHub #52: fold past reasoning back into what's resent to the model,
+              instead of only ever resending each turn's final answer. */}
+          <div>
+            <label className="flex cursor-pointer items-start gap-2 text-[13px]">
+              <input
+                type="checkbox"
+                className="mt-0.5"
+                checked={preserveThinking}
+                onChange={(e) => setPreserveThinking(e.target.checked)}
+              />
+              <span className="flex flex-col">
+                <span className="text-ink">Preserve thinking across turns</span>
+                <span className="text-[12px] text-muted">
+                  Resend the model's past reasoning on later turns, not just its final answers. Off by default — uses more tokens per request.
+                </span>
+              </span>
+            </label>
           </div>
         </div>
 

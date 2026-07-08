@@ -43,6 +43,11 @@ export interface Conversation {
   /** Tool-name allow-list baked in from a custom chat Agent at creation (Customize →
    *  Agents). Undefined/empty = unrestricted (every built-in persona). */
   allowedTools?: string[]
+  /** GitHub #52: when true, past turns' reasoning is folded back into what's resent to
+   *  the engine (wrapped in <think> tags, with chat_template_kwargs.preserve_thinking
+   *  set so the template doesn't strip it back out) instead of only their final content.
+   *  Off by default. */
+  preserveThinking: boolean
   createdAt: string
   updatedAt: string
   messages?: Message[]
@@ -186,12 +191,21 @@ export interface Message {
   /** F-021/F-022: research metadata (confidence, sources, referee verdicts). Absent on non-research messages. */
   researchMeta?: ResearchMeta
   createdAt: string
+  /** Chat branching (GitHub #52): shared by this message and its regenerated siblings.
+   *  Null when the message has never been regenerated (no branch UI to show). */
+  variantGroup: string | null
+  /** Chat branching: whether this is the sibling currently shown/sent as history.
+   *  getMessages() only returns active messages. */
+  isActive: boolean
+  /** Chat branching (user-message edits): the specific message-version id this row's
+   *  downstream tail was frozen under, when it's not part of the live/active tail. */
+  branchOf: string | null
 }
 
-interface ConvRow { id: string; title: string; system_prompt: string; model_key: string; sampling: string; expert_mode: number; tool_policy: string | null; kind: string | null; folder_id: string | null; tool_overrides: string | null; agent_id: string | null; completed_at: string | null; read_scope: string | null; agent_mode: string | null; skill_ids: string | null; allowed_tools: string | null; created_at: string; updated_at: string }
+interface ConvRow { id: string; title: string; system_prompt: string; model_key: string; sampling: string; expert_mode: number; tool_policy: string | null; kind: string | null; folder_id: string | null; tool_overrides: string | null; agent_id: string | null; completed_at: string | null; read_scope: string | null; agent_mode: string | null; skill_ids: string | null; allowed_tools: string | null; preserve_thinking: number; created_at: string; updated_at: string }
 interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; agent_id: string | null; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null; archived_at: string | null; completion: string | null }
 interface FolderRow { id: string; name: string; sort_order: number; created_at: string; updated_at: string }
-interface MsgRow  { id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string; reasoning: string; attachments: string; text_attachments: string | null; tool_calls: string | null; stats: string; model_key: string | null; research_meta: string | null; created_at: string }
+interface MsgRow  { id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string; reasoning: string; attachments: string; text_attachments: string | null; tool_calls: string | null; stats: string; model_key: string | null; research_meta: string | null; created_at: string; variant_group: string | null; is_active: number; branch_of: string | null }
 
 // node:sqlite named-param objects need an explicit cast to Record<string, SQLInputValue>
 type P = Record<string, SQLInputValue>
@@ -210,7 +224,7 @@ function safeToolOverrides(s: string | null): Record<string, 'allow' | 'deny'> {
 }
 
 function rowToConv(r: ConvRow): Conversation {
-  return { id: r.id, title: r.title, systemPrompt: r.system_prompt, modelKey: r.model_key, sampling: safeJson(r.sampling) as Record<string, unknown>, expertMode: r.expert_mode === 1, toolPolicy: r.tool_policy ?? undefined, kind: (r.kind === 'agent' ? 'agent' : 'chat'), folderId: r.folder_id ?? null, toolOverrides: safeToolOverrides(r.tool_overrides), agentId: r.agent_id ?? undefined, completedAt: r.completed_at ?? undefined, readScope: r.read_scope ? (safeJson(r.read_scope) as string[]) : undefined, agentMode: r.agent_mode ?? undefined, skillIds: r.skill_ids ? (safeJson(r.skill_ids) as string[]) : undefined, allowedTools: r.allowed_tools ? (safeJson(r.allowed_tools) as string[]) : undefined, createdAt: r.created_at, updatedAt: r.updated_at }
+  return { id: r.id, title: r.title, systemPrompt: r.system_prompt, modelKey: r.model_key, sampling: safeJson(r.sampling) as Record<string, unknown>, expertMode: r.expert_mode === 1, toolPolicy: r.tool_policy ?? undefined, kind: (r.kind === 'agent' ? 'agent' : 'chat'), folderId: r.folder_id ?? null, toolOverrides: safeToolOverrides(r.tool_overrides), agentId: r.agent_id ?? undefined, completedAt: r.completed_at ?? undefined, readScope: r.read_scope ? (safeJson(r.read_scope) as string[]) : undefined, agentMode: r.agent_mode ?? undefined, skillIds: r.skill_ids ? (safeJson(r.skill_ids) as string[]) : undefined, allowedTools: r.allowed_tools ? (safeJson(r.allowed_tools) as string[]) : undefined, preserveThinking: r.preserve_thinking === 1, createdAt: r.created_at, updatedAt: r.updated_at }
 }
 
 function rowToFolder(r: FolderRow): Folder {
@@ -232,7 +246,7 @@ function rowToAgentRun(r: AgentRunRow): AgentRun {
 }
 
 function rowToMsg(r: MsgRow): Message {
-  const msg: Message = { id: r.id, convId: r.conv_id, seq: r.seq, role: r.role, content: r.content, reasoning: r.reasoning, attachments: safeJson(r.attachments) as string[], textAttachments: r.text_attachments ? safeJson(r.text_attachments) as string[] : [], toolCalls: r.tool_calls ? safeJson(r.tool_calls) as ToolCallRecord[] : [], stats: safeJson(r.stats) as Partial<MessageStats>, createdAt: r.created_at }
+  const msg: Message = { id: r.id, convId: r.conv_id, seq: r.seq, role: r.role, content: r.content, reasoning: r.reasoning, attachments: safeJson(r.attachments) as string[], textAttachments: r.text_attachments ? safeJson(r.text_attachments) as string[] : [], toolCalls: r.tool_calls ? safeJson(r.tool_calls) as ToolCallRecord[] : [], stats: safeJson(r.stats) as Partial<MessageStats>, createdAt: r.created_at, variantGroup: r.variant_group, isActive: r.is_active !== 0, branchOf: r.branch_of }
   if (r.research_meta) msg.researchMeta = safeJson(r.research_meta) as ResearchMeta
   return msg
 }
@@ -495,6 +509,34 @@ export class ConversationStore {
       if (!this.hasColumn('conversations', 'allowed_tools')) this.db.exec(`ALTER TABLE conversations ADD COLUMN allowed_tools TEXT;`)
       this.db.exec(`PRAGMA user_version = 22;`)
     }
+    // v23 (GitHub #52 item 2 — chat branching): regenerating a reply used to delete it
+    // outright. Now the old message is kept and deactivated instead — `variant_group`
+    // groups a message with its regenerated siblings (defaults to the group's own first
+    // message id), `is_active` marks which one is currently shown/sent as history.
+    // Existing rows default to is_active=1, variant_group=NULL (no branch UI for them).
+    if (v < 23) {
+      if (!this.hasColumn('messages', 'variant_group')) this.db.exec(`ALTER TABLE messages ADD COLUMN variant_group TEXT;`)
+      if (!this.hasColumn('messages', 'is_active')) this.db.exec(`ALTER TABLE messages ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1;`)
+      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_variant_group ON messages(conv_id, variant_group);`)
+      this.db.exec(`PRAGMA user_version = 23;`)
+    }
+    // v24 (GitHub #52 item 2, extended to user-message edits): editing an earlier user
+    // message used to hard-delete everything after it. Now that whole downstream tail is
+    // frozen (deactivated) instead, tagged with `branch_of` = the specific message version
+    // it was frozen under, so switching back to that version can restore exactly what was
+    // there — including whichever regenerate-sibling (variant_group) was active within it.
+    if (v < 24) {
+      if (!this.hasColumn('messages', 'branch_of')) this.db.exec(`ALTER TABLE messages ADD COLUMN branch_of TEXT;`)
+      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_branch_of ON messages(conv_id, branch_of);`)
+      this.db.exec(`PRAGMA user_version = 24;`)
+    }
+    // v25 (GitHub #52 item 1): per-conversation "preserve thinking across turns" toggle.
+    // Off by default — matches today's behavior, where only the final visible content of
+    // past turns is ever resent to the engine, never raw reasoning.
+    if (v < 25) {
+      if (!this.hasColumn('conversations', 'preserve_thinking')) this.db.exec(`ALTER TABLE conversations ADD COLUMN preserve_thinking INTEGER NOT NULL DEFAULT 0;`)
+      this.db.exec(`PRAGMA user_version = 25;`)
+    }
   }
 
   listConversations(q?: string, kind: 'chat' | 'agent' | 'all' = 'all'): Conversation[] {
@@ -531,7 +573,7 @@ export class ConversationStore {
     return conv
   }
 
-  updateConversation(id: string, patch: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'sampling' | 'modelKey' | 'skillIds'>>): boolean {
+  updateConversation(id: string, patch: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'sampling' | 'modelKey' | 'skillIds' | 'preserveThinking'>>): boolean {
     const now = new Date().toISOString()
     const sets: string[] = ['updated_at = $now']
     const params: Record<string, SQLInputValue> = { $id: id, $now: now }
@@ -540,6 +582,7 @@ export class ConversationStore {
     if (patch.sampling !== undefined)     { sets.push('sampling = $samp');    params.$samp  = JSON.stringify(patch.sampling) }
     if (patch.modelKey !== undefined)     { sets.push('model_key = $mk');     params.$mk    = patch.modelKey }
     if (patch.skillIds !== undefined)     { sets.push('skill_ids = $sk');     params.$sk    = JSON.stringify(patch.skillIds) }
+    if (patch.preserveThinking !== undefined) { sets.push('preserve_thinking = $pt'); params.$pt = patch.preserveThinking ? 1 : 0 }
     return ((this.db.prepare(`UPDATE conversations SET ${sets.join(', ')} WHERE id = $id`).run(params) as unknown) as Changes).changes > 0
   }
 
@@ -567,11 +610,13 @@ export class ConversationStore {
     return ((this.db.prepare(`DELETE FROM conversations WHERE id = $id`).run({ $id: id } as P) as unknown) as Changes).changes > 0
   }
 
+  /** Active-branch messages only — this is the conversation as the user sees it and as
+   *  it's sent to the engine. Regenerated-away siblings (is_active=0) are excluded. */
   getMessages(convId: string): Message[] {
-    return (this.db.prepare(`SELECT * FROM messages WHERE conv_id = $id ORDER BY seq ASC`).all({ $id: convId } as P) as unknown as MsgRow[]).map(rowToMsg)
+    return (this.db.prepare(`SELECT * FROM messages WHERE conv_id = $id AND is_active = 1 ORDER BY seq ASC`).all({ $id: convId } as P) as unknown as MsgRow[]).map(rowToMsg)
   }
 
-  addMessage(convId: string, role: 'user' | 'assistant', content: string, extra?: Partial<Pick<Message, 'reasoning' | 'attachments' | 'textAttachments' | 'toolCalls' | 'stats'>>): Message {
+  addMessage(convId: string, role: 'user' | 'assistant', content: string, extra?: Partial<Pick<Message, 'reasoning' | 'attachments' | 'textAttachments' | 'toolCalls' | 'stats' | 'variantGroup'>>): Message {
     const id = randomUUID()
     const now = new Date().toISOString()
     const row = this.db.prepare(`SELECT COALESCE(MAX(seq),0) AS ms FROM messages WHERE conv_id = $id`).get({ $id: convId } as P) as unknown as { ms: number }
@@ -580,8 +625,8 @@ export class ConversationStore {
     const modelKey = role === 'assistant' ? this.conversationModelKey(convId) : null
     const textAttachments = extra?.textAttachments?.length ? JSON.stringify(extra.textAttachments) : null
     const toolCalls = extra?.toolCalls?.length ? JSON.stringify(extra.toolCalls) : null
-    this.db.prepare(`INSERT INTO messages (id,conv_id,seq,role,content,reasoning,attachments,text_attachments,tool_calls,stats,model_key,created_at) VALUES ($id,$cid,$seq,$role,$content,$reasoning,$attachments,$ta,$tc,$stats,$mk,$now)`)
-      .run({ $id: id, $cid: convId, $seq: row.ms + 1, $role: role, $content: content, $reasoning: extra?.reasoning ?? '', $attachments: JSON.stringify(extra?.attachments ?? []), $ta: textAttachments, $tc: toolCalls, $stats: JSON.stringify(extra?.stats ?? {}), $mk: modelKey, $now: now } as P)
+    this.db.prepare(`INSERT INTO messages (id,conv_id,seq,role,content,reasoning,attachments,text_attachments,tool_calls,stats,model_key,created_at,variant_group,is_active) VALUES ($id,$cid,$seq,$role,$content,$reasoning,$attachments,$ta,$tc,$stats,$mk,$now,$vg,1)`)
+      .run({ $id: id, $cid: convId, $seq: row.ms + 1, $role: role, $content: content, $reasoning: extra?.reasoning ?? '', $attachments: JSON.stringify(extra?.attachments ?? []), $ta: textAttachments, $tc: toolCalls, $stats: JSON.stringify(extra?.stats ?? {}), $mk: modelKey, $now: now, $vg: extra?.variantGroup ?? null } as P)
     this.touchConversation(convId)
     return this.getMessage(id)!
   }
@@ -613,10 +658,6 @@ export class ConversationStore {
     return ((this.db.prepare(`DELETE FROM messages WHERE id = $id`).run({ $id: id } as P) as unknown) as Changes).changes > 0
   }
 
-  deleteMessagesAfterSeq(convId: string, seq: number): void {
-    this.db.prepare(`DELETE FROM messages WHERE conv_id = $id AND seq > $seq`).run({ $id: convId, $seq: seq } as P)
-  }
-
   /** Most-recent assistant gen t/s per model (spec 04 §5 `lastTps`). For each
    *  model_key, takes the newest assistant message that recorded a positive
    *  `stats.tps` and returns its value. Rows with NULL model_key (pre-v2) or no
@@ -636,9 +677,65 @@ export class ConversationStore {
     return out
   }
 
+  /** Active branch only — matches getMessages(). Used to find "the last thing the user
+   *  currently sees" (e.g. to decide whether a fresh assistant placeholder follows it). */
   getLastMessage(convId: string): Message | null {
+    const row = this.db.prepare(`SELECT * FROM messages WHERE conv_id = $id AND is_active = 1 ORDER BY seq DESC LIMIT 1`).get({ $id: convId } as P) as unknown as MsgRow | undefined
+    return row ? rowToMsg(row) : null
+  }
+
+  /** Like getLastMessage, but ignores is_active — the globally last-inserted row in this
+   *  conversation, regardless of which branch it belongs to. */
+  getLastMessageAnyStatus(convId: string): Message | null {
     const row = this.db.prepare(`SELECT * FROM messages WHERE conv_id = $id ORDER BY seq DESC LIMIT 1`).get({ $id: convId } as P) as unknown as MsgRow | undefined
     return row ? rowToMsg(row) : null
+  }
+
+  /** The message immediately after `afterSeq` in this conversation, regardless of
+   *  is_active — used right after regenerate deactivates a reply, to find specifically
+   *  THAT message (not just "whatever has the highest seq anywhere," which would pick up
+   *  an unrelated later branch's messages in a conversation with more than one branch
+   *  point — seq is monotonic and per-row-unique, so this is unambiguous). */
+  getNextMessageAfterSeq(convId: string, afterSeq: number): Message | null {
+    const row = this.db.prepare(`SELECT * FROM messages WHERE conv_id = $id AND seq > $seq ORDER BY seq ASC LIMIT 1`).get({ $id: convId, $seq: afterSeq } as P) as unknown as MsgRow | undefined
+    return row ? rowToMsg(row) : null
+  }
+
+  /** Chat branching (GitHub #52): deactivate a message instead of deleting it, and
+   *  establish its variant_group (its own id) if this is its first regeneration. */
+  deactivateMessage(id: string): void {
+    this.db.prepare(`UPDATE messages SET is_active = 0, variant_group = COALESCE(variant_group, id) WHERE id = $id`).run({ $id: id } as P)
+  }
+
+  /** All siblings sharing a variant_group (active + inactive), oldest first — the full
+   *  set the branch switcher UI (‹ 2/3 ›) needs. */
+  getMessageVariants(variantGroup: string): Message[] {
+    return (this.db.prepare(`SELECT * FROM messages WHERE variant_group = $vg ORDER BY seq ASC`).all({ $vg: variantGroup } as P) as unknown as MsgRow[]).map(rowToMsg)
+  }
+
+  /** Switches which sibling in a variant group is the active/shown one. No-op (returns
+   *  false) if targetId isn't actually a member of that group. */
+  setActiveVariant(variantGroup: string, targetId: string): boolean {
+    const target = this.getMessage(targetId)
+    if (!target || target.variantGroup !== variantGroup) return false
+    this.db.prepare(`UPDATE messages SET is_active = 0 WHERE variant_group = $vg`).run({ $vg: variantGroup } as P)
+    this.db.prepare(`UPDATE messages SET is_active = 1 WHERE id = $id`).run({ $id: targetId } as P)
+    return true
+  }
+
+  /** Chat branching (user-message edits, GitHub #52): freeze the currently-active tail
+   *  after `afterSeq` — everything downstream of an edited/switched-away-from message —
+   *  by deactivating it and tagging it with `anchorId` so restoreTail can bring back
+   *  exactly this state later, including whichever regenerate-sibling was active in it. */
+  freezeTail(convId: string, afterSeq: number, anchorId: string): void {
+    this.db.prepare(`UPDATE messages SET is_active = 0, branch_of = $anchor WHERE conv_id = $id AND seq > $seq AND is_active = 1`)
+      .run({ $id: convId, $seq: afterSeq, $anchor: anchorId } as P)
+  }
+
+  /** Chat branching: reactivate every message previously frozen under `anchorId` — the
+   *  inverse of freezeTail, used when switching back to that message version. */
+  restoreTail(anchorId: string): void {
+    this.db.prepare(`UPDATE messages SET is_active = 1 WHERE branch_of = $anchor`).run({ $anchor: anchorId } as P)
   }
 
   // ── Folder methods (v10 migration) ────────────────────────────────────────

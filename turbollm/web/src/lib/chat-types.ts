@@ -73,6 +73,11 @@ export interface Message {
   /** F-021/F-022: research metadata (confidence, sources, referee verdicts). */
   researchMeta?: ResearchMeta
   createdAt: string
+  /** Chat branching (GitHub #52): shared by this message and its regenerated siblings.
+   *  Null when it's never been regenerated — no branch switcher to show. */
+  variantGroup: string | null
+  /** Chat branching: whether this is the sibling currently shown/sent as history. */
+  isActive: boolean
 }
 
 export interface Conversation {
@@ -96,6 +101,9 @@ export interface Conversation {
   /** Tool-name allow-list baked in from a custom chat Agent at creation (Customize →
    *  Agents). Undefined/empty = unrestricted (every built-in persona). */
   allowedTools?: string[]
+  /** GitHub #52: when true, past turns' reasoning is resent to the engine (not just
+   *  their final answer) so the model can see its own prior thinking. Off by default. */
+  preserveThinking: boolean
   createdAt: string
   updatedAt: string
   messages?: Message[]
