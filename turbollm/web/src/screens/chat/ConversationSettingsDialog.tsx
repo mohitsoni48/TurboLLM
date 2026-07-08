@@ -99,7 +99,7 @@ export function ConversationSettingsDialog({ conv }: { conv: Conversation | unde
           <DialogTitle>Thread settings</DialogTitle>
         </DialogHeader>
 
-        <div className="flex flex-col gap-5">
+        <div className="flex max-h-[60vh] flex-col gap-5 overflow-y-auto">
           {/* System prompt */}
           <div>
             <label className="mb-1.5 block text-[11px] font-medium uppercase tracking-wide text-faint">
