@@ -6,6 +6,8 @@ import {
   Dialog,
   DialogContent,
   DialogClose,
+  DialogHeader,
+  DialogTitle,
   DialogTrigger,
 } from '../../components/ui/dialog'
 import { useConversationMutations } from '../../lib/chat-queries'
@@ -93,9 +95,9 @@ export function ConversationSettingsDialog({ conv }: { conv: Conversation | unde
       </DialogTrigger>
 
       <DialogContent className="max-w-md">
-        <div className="mb-4">
-          <span className="text-[15px] font-semibold text-ink">Thread settings</span>
-        </div>
+        <DialogHeader>
+          <DialogTitle>Thread settings</DialogTitle>
+        </DialogHeader>
 
         <div className="flex flex-col gap-5">
           {/* System prompt */}
