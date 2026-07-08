@@ -174,7 +174,9 @@ export function installedBackendBuild(
  *  huge tree can't make the scan hang — default keeps the original full-walk
  *  behavior for existing callers. */
 export function findFile(dir: string, name: string, skipDir?: (dirName: string) => boolean): string | null {
-  for (const e of readdirSync(dir, { withFileTypes: true })) {
+  const entries = tryReaddir(dir)
+  if (!entries) return null
+  for (const e of entries) {
     const full = join(dir, e.name)
     if (e.isDirectory()) {
       if (skipDir?.(e.name)) continue
@@ -185,6 +187,16 @@ export function findFile(dir: string, name: string, skipDir?: (dirName: string) 
     }
   }
   return null
+}
+
+/** Read a directory's entries, or null if it can't be read (e.g. an OS-protected folder
+ *  throwing EPERM/EACCES) — lets a broad recursive scan skip past it instead of crashing. */
+function tryReaddir(dir: string) {
+  try {
+    return readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return null
+  }
 }
 
 function findServer(dir: string): string | null {

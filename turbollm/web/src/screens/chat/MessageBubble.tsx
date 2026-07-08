@@ -432,7 +432,7 @@ export function StreamingBubble({
     <div className="flex gap-3">
       <ModelAvatar />
       <div className="min-w-0 flex-1 pt-0.5">
-        {reasoning && <ThinkingBlock reasoning={reasoning} streaming />}
+        {reasoning?.trim() && <ThinkingBlock reasoning={reasoning} streaming />}
 
         {/* Interleaved timeline: text the model wrote and tools it ran, in order */}
         {timeline.map((b, i) =>
@@ -578,7 +578,7 @@ export function MessageBubble({
     <div className="group flex gap-3">
       <ModelAvatar />
       <div className="min-w-0 flex-1 pt-0.5">
-        {message.reasoning && (
+        {message.reasoning?.trim() && (
           <ThinkingBlock reasoning={message.reasoning} thinkMs={message.stats.thinkMs} showThinking={showThinking} />
         )}
         <ToolCallsPanel calls={completedToolCalls} />

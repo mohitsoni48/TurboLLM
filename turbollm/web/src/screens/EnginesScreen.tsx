@@ -637,7 +637,7 @@ function EngineGallery({
   const install = useBackendInstall()
   const engineMut = useEngineMutations()
   const policyMut = useUpdatePolicyMutation()
-  const [deleteTarget, setDeleteTarget] = useState<{ e: CatalogEngine; registryId: string } | null>(null)
+  const [deleteTarget, setDeleteTarget] = useState<{ name: string; registryId: string } | null>(null)
 
   const catalogById = useMemo(() => {
     const m = new Map<string, CatalogEngine>()
@@ -751,18 +751,19 @@ function EngineGallery({
   const requestDelete = (e: CatalogEngine) => {
     const registryId = registryEngineId(e)
     if (!registryId) { toast.error(`Could not find the installed ${e.name} engine to delete.`); return }
-    setDeleteTarget({ e, registryId })
+    setDeleteTarget({ name: e.name, registryId })
   }
+  const requestDeleteCustom = (eng: Engine) => setDeleteTarget({ name: eng.name, registryId: eng.id })
   const doDelete = () => {
     if (!deleteTarget) return
     engineMut.purge.mutate(deleteTarget.registryId, {
       onSuccess: () => {
-        toast.success(`${deleteTarget.e.name} deleted`)
+        toast.success(`${deleteTarget.name} deleted`)
         setDeleteTarget(null)
       },
       onError: (err) => {
         setDeleteTarget(null)
-        toast.error(err instanceof ApiError ? err.message : `Could not delete ${deleteTarget.e.name}.`)
+        toast.error(err instanceof ApiError ? err.message : `Could not delete ${deleteTarget.name}.`)
       },
     })
   }
@@ -776,6 +777,20 @@ function EngineGallery({
     })
     // Push engines that can't run here (red) to the bottom; stable otherwise.
     .sort((a, b) => (a.compatible.length === 0 ? 1 : 0) - (b.compatible.length === 0 ? 1 : 0))
+
+  // GitHub #51: a custom-added engine (arbitrary binPath, matches no catalog entry) used to be
+  // silently omitted here — it only ever showed up buried in the "Running now" dropdown above,
+  // even though the backend registered it correctly. Surface it as its own card so "add your own
+  // engine" actually shows the engine you added.
+  const matchedRegistryIds = new Set(
+    fits.map((fit) => registryEngineId(catalogById.get(fit.engine.id) ?? (fit.engine as CatalogEngine))).filter(Boolean),
+  )
+  // Auto-downloaded official llama.cpp builds already have dedicated UI — the llama.cpp
+  // card's own "Manage GPU builds" expander (LlamaCppBackendRows) — so exclude those too;
+  // only a genuinely uncategorized engine (any binPath outside both conventions) is "custom".
+  const customEngines = (registry?.engines ?? []).filter(
+    (e) => !matchedRegistryIds.has(e.id) && !isOfficialLlama(e.binPath),
+  )
 
   return (
     <section className="flex flex-col gap-3">
@@ -806,6 +821,34 @@ function EngineGallery({
         })}
       </div>
 
+      {customEngines.length > 0 && (
+        <div className="flex flex-col gap-2">
+          {customEngines.map((eng) => (
+            <div
+              key={eng.id}
+              className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border bg-panel px-4 py-3"
+            >
+              <div className="flex min-w-0 items-center gap-2">
+                <Wrench size={15} className="shrink-0 text-accent" />
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="truncate text-sm font-medium text-ink">{eng.name}</span>
+                    <Badge>Custom</Badge>
+                  </div>
+                  <div className="truncate text-[12px] text-muted" title={eng.binPath}>{eng.binPath}</div>
+                </div>
+              </div>
+              <div className="flex shrink-0 items-center gap-2">
+                {eng.version && <span className="text-[12px] text-faint">{eng.version}</span>}
+                <Button variant="outline" size="sm" onClick={() => requestDeleteCustom(eng)}>
+                  Delete
+                </Button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* Add your own engine — a compact strip, not a half-empty card. */}
       <div className="mt-1 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-dashed border-border-strong bg-panel px-4 py-3">
         <div className="min-w-0">
@@ -828,7 +871,7 @@ function EngineGallery({
       <AlertDialog open={!!deleteTarget} onOpenChange={(open) => { if (!open) setDeleteTarget(null) }}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Delete {deleteTarget?.e.name}?</AlertDialogTitle>
+            <AlertDialogTitle>Delete {deleteTarget?.name}?</AlertDialogTitle>
             <AlertDialogDescription>
               Files for this engine are removed from disk. Your models are not affected.
             </AlertDialogDescription>
