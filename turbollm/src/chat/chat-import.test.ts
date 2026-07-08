@@ -43,6 +43,7 @@ function makeMsg(role: 'user' | 'assistant', content: string, extra?: Partial<Me
     variantGroup: null,
     isActive: true,
     branchOf: null,
+    edited: false,
     ...extra,
   }
 }

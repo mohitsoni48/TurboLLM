@@ -78,6 +78,8 @@ export interface Message {
   variantGroup: string | null
   /** Chat branching: whether this is the sibling currently shown/sent as history. */
   isActive: boolean
+  /** True only when a user explicitly edited this assistant reply's text in place. */
+  edited: boolean
 }
 
 export interface Conversation {

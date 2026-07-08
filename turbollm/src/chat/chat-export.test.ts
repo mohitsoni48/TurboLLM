@@ -41,6 +41,7 @@ function makeMsg(role: 'user' | 'assistant', content: string, overrides: Partial
     variantGroup: null,
     isActive: true,
     branchOf: null,
+    edited: false,
     ...overrides,
   }
 }

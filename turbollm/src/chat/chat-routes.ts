@@ -342,7 +342,9 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     if (msg.role === 'assistant') {
       // GitHub #52: edit the model's own reply in place — just fixing text, not resending,
       // so no branching/truncation. (Regenerating a NEW reply is the separate /regenerate flow.)
-      db.updateMessage(msgId, { content: trimmed })
+      // Tag it "edited" so the UI can show that — this route is the ONLY place that ever
+      // sets it, unlike the generation-completion save which writes content too.
+      db.updateMessage(msgId, { content: trimmed, edited: true })
       return c.json({ messages: db.getMessages(convId) })
     }
 
