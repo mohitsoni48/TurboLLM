@@ -17,15 +17,17 @@ const TURBOLLM_KNOWLEDGE =
   '  in/out via its "Move to folder" menu). Deleting a folder never deletes the conversations\n' +
   '  inside it — they move back to Uncategorized. The sidebar\'s width is drag-resizable.\n' +
   '- Pick a **persona** before the first message; it locks after that (per-conversation).\n' +
-  '- Override **sampling** (temperature, top-p, top-k, min-p, repeat/frequency/presence penalty, stop strings) per conversation via conversation settings.\n' +
+  '- Override **sampling** (temperature, top-p, top-k, min-p, repeat/frequency/presence penalty, stop strings) per conversation via Thread settings — sliders default to the loaded model\'s own recommended values, not generic constants. Thread settings is reachable even before the first message is sent (as soon as a model is loaded).\n' +
   '- Set a custom **system prompt** per conversation.\n' +
+  '- **Preserve thinking across turns** (Thread settings toggle, on by default for new conversations) — resends the model\'s past reasoning on later turns, not just its final answers, so it has real context for follow-ups. Uses more tokens per request.\n' +
   '- **Artifacts**: HTML/SVG/Mermaid fenced blocks render as sandboxed live previews (shown as images). Download as PNG/JPEG/SVG/GIF/HTML depending on type.\n' +
   '- **Thinking/reasoning**: models that emit `<think>` blocks get a collapsible fold; visible prose renders normally below.\n' +
   '- **Tool-call approval gate**: every tool call (web search, fetch URL, run code, MCP tools) asks for approval by default before it runs — an inline bar above the composer offers Deny, Allow, Allow for this chat, or Always Allow. Live cards still show each call\'s status (awaiting approval → pending → done / error). Per-tool defaults (Ask / Allow / Deny) are set globally in Settings → Tools & safety. Background agent runs never see this prompt (no one there to answer it) — a tool the agent is configured to use runs without asking.\n' +
   '- **Web search**: Research persona forces 3–5 `web_search` calls; other personas use it when a search provider key is configured.\n' +
   '- **Export/Import**: export as `.turbollm-chat.json` or OpenAI-format JSON; re-import resumes the conversation. Share button gives a LAN read-only link and a debug snapshot.\n' +
   '- **Attachments** (paperclip): images (vision models), PDFs (real extracted text via pdf.js, not raw bytes), and plain-text/code files (`.txt`/`.md`/`.csv`/`.json`/`.yaml`/`.log` and common source extensions).\n' +
-  '- Edit messages, delete a message, regenerate the last response.\n\n' +
+  '- **Edit a message or regenerate a reply and neither destroys history** — both create a branch, switchable via a ‹ 1/2 › control on the message (works for nested branch points too); delete a message or copy any message\'s text.\n' +
+  '- **Switching to a different conversation never cancels a reply that\'s still generating** — it keeps going in the background and saves when done. The sidebar shows a spinning indicator on any conversation generating in the background, and a dot on one that just finished while you were elsewhere (clears once you open it).\n\n' +
 
   '**Models** — discover and manage local models.\n' +
   '- **All models** view: scans configured local directories for GGUF, MLX safetensors, vLLM safetensors; badges incompatible models for the active engine.\n' +

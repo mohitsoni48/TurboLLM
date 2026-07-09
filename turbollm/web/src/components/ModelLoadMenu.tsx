@@ -1,5 +1,6 @@
-import { Check, ChevronDown, CircleSlash, Cpu, Loader2, SlidersHorizontal } from 'lucide-react'
+import { Check, ChevronDown, CircleSlash, Cpu, Loader2, SlidersHorizontal, Star } from 'lucide-react'
 import type { ModelEntry } from '../lib/types'
+import { usePinnedModels } from '../lib/usePinnedModels'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -35,7 +36,17 @@ export function ModelLoadMenu({
   onSettings?: (key: string) => void
   align?: 'start' | 'end'
 }) {
-  const loadable = models.filter((m) => !m.incomplete && !m.parseError)
+  const { isPinned } = usePinnedModels()
+  // Pinned models float to the top (same convention as the library list in ModelsScreen),
+  // stable otherwise so unpinned order is unaffected.
+  const loadable = models
+    .filter((m) => !m.incomplete && !m.parseError)
+    .map((m, i) => ({ m, i }))
+    .sort((a, b) => {
+      const p = Number(isPinned(b.m.key)) - Number(isPinned(a.m.key))
+      return p !== 0 ? p : a.i - b.i
+    })
+    .map(({ m }) => m)
   const label = ejecting ? 'Ejecting…' : (loadedName || (loadedKey ? 'Loaded model' : 'Load a model'))
 
   return (
@@ -58,6 +69,7 @@ export function ModelLoadMenu({
         </div>
         {loadable.map((m) => {
           const active = m.key === loadedKey
+          const pinned = isPinned(m.key)
           return (
             <div
               key={m.key}
@@ -72,6 +84,7 @@ export function ModelLoadMenu({
               <span className="flex h-4 w-4 shrink-0 items-center justify-center">
                 {active && <Check size={14} className="text-accent" />}
               </span>
+              {pinned && <Star size={12} className="shrink-0 fill-current text-accent" />}
               <span className="min-w-0 flex-1 truncate">{m.name}</span>
               {onSettings && (
                 <button

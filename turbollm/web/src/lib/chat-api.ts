@@ -24,7 +24,7 @@ export function listConversations(q?: string): Promise<{ conversations: Conversa
   return req(`/api/v1/conversations${q ? `?q=${encodeURIComponent(q)}` : ''}`)
 }
 
-export function createConversation(partial?: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'modelKey' | 'toolPolicy' | 'skillIds' | 'allowedTools'>>): Promise<Conversation> {
+export function createConversation(partial?: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'modelKey' | 'toolPolicy' | 'skillIds' | 'allowedTools' | 'sampling' | 'preserveThinking'>>): Promise<Conversation> {
   return req('/api/v1/conversations', { method: 'POST', json: partial ?? {} })
 }
 
@@ -32,7 +32,7 @@ export function getConversation(id: string): Promise<Conversation> {
   return req(`/api/v1/conversations/${encodeURIComponent(id)}`)
 }
 
-export function updateConversation(id: string, patch: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'sampling' | 'skillIds'>>): Promise<Conversation> {
+export function updateConversation(id: string, patch: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'sampling' | 'skillIds' | 'preserveThinking'>>): Promise<Conversation> {
   return req(`/api/v1/conversations/${encodeURIComponent(id)}`, { method: 'PATCH', json: patch })
 }
 
@@ -77,6 +77,19 @@ export function deleteMessage(convId: string, msgId: string): Promise<{ ok: true
 
 export function regenerate(convId: string): Promise<{ ok: true }> {
   return req(`/api/v1/conversations/${encodeURIComponent(convId)}/regenerate`, { method: 'POST', json: {} })
+}
+
+// ── Chat branching (GitHub #52) ────────────────────────────────────────────────
+
+/** All siblings (active + inactive) sharing a message's variant_group, oldest first —
+ *  for the ‹ 1/2 › branch switcher. Only meaningful when message.variantGroup is set. */
+export function getMessageVariants(convId: string, msgId: string): Promise<{ variants: Message[] }> {
+  return req(`/api/v1/conversations/${encodeURIComponent(convId)}/messages/${encodeURIComponent(msgId)}/variants`)
+}
+
+/** Switch which sibling in a variant group is active/shown. */
+export function activateVariant(convId: string, msgId: string): Promise<{ messages: Message[] }> {
+  return req(`/api/v1/conversations/${encodeURIComponent(convId)}/messages/${encodeURIComponent(msgId)}/activate`, { method: 'POST', json: {} })
 }
 
 // ── Tool-call approval gate ───────────────────────────────────────────────────

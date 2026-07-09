@@ -78,7 +78,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   })
 
   app.post('/api/v1/conversations', async (c) => {
-    const b = await body<{ title?: string; systemPrompt?: string; modelKey?: string; toolPolicy?: string; skillIds?: string[]; allowedTools?: string[] }>(c)
+    const b = await body<{ title?: string; systemPrompt?: string; modelKey?: string; toolPolicy?: string; skillIds?: string[]; allowedTools?: string[]; sampling?: Record<string, number>; preserveThinking?: boolean }>(c)
     // Only keep ids that exist in the shared skill library; silently drop unknown ones.
     const validIds = new Set(new SkillStore(d.store.dir()).list().map((s) => s.id))
     const skillIds = Array.isArray(b.skillIds) ? b.skillIds.filter((sid) => validIds.has(sid)) : undefined
@@ -86,7 +86,9 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // validated against the live tool catalog — an MCP server disconnecting later
     // shouldn't retroactively corrupt the conversation's saved intent.
     const allowedTools = Array.isArray(b.allowedTools) ? b.allowedTools.filter((t) => typeof t === 'string') : undefined
-    const conv = db.createConversation({ title: b.title, systemPrompt: b.systemPrompt, modelKey: b.modelKey, toolPolicy: b.toolPolicy, skillIds, allowedTools })
+    const sampling = (b.sampling && typeof b.sampling === 'object') ? b.sampling : undefined
+    const preserveThinking = typeof b.preserveThinking === 'boolean' ? b.preserveThinking : undefined
+    const conv = db.createConversation({ title: b.title, systemPrompt: b.systemPrompt, modelKey: b.modelKey, toolPolicy: b.toolPolicy, skillIds, allowedTools, sampling, preserveThinking })
     return c.json(conv, 201)
   })
 
@@ -107,7 +109,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   })
 
   app.patch('/api/v1/conversations/:id', async (c) => {
-    const b = await body<{ title?: string; systemPrompt?: string; sampling?: Record<string, unknown>; skillIds?: string[] }>(c)
+    const b = await body<{ title?: string; systemPrompt?: string; sampling?: Record<string, unknown>; skillIds?: string[]; preserveThinking?: boolean }>(c)
     if (b.skillIds !== undefined) {
       const validIds = new Set(new SkillStore(d.store.dir()).list().map((s) => s.id))
       b.skillIds = b.skillIds.filter((sid) => validIds.has(sid))
@@ -231,7 +233,13 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       const engineMessages: { role: string; content: unknown }[] = []
       if (conv.systemPrompt) engineMessages.push({ role: 'system', content: conv.systemPrompt })
       for (const m of allMsgs) {
-        engineMessages.push({ role: m.role, content: m.content })
+        // GitHub #52: when preserveThinking is on, fold past reasoning back into what's
+        // resent so the model sees its own prior thinking, not just the final answer —
+        // the default behavior (off) matches what's always been sent.
+        const content = (conv.preserveThinking && m.role === 'assistant' && m.reasoning?.trim())
+          ? `<think>\n${m.reasoning}\n</think>\n\n${m.content}`
+          : m.content
+        engineMessages.push({ role: m.role, content })
       }
       // Fold any attached document text into the prompt; attach images as multimodal parts.
       const fullContent = b.docContext
@@ -269,8 +277,19 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const lastUser = (conv.messages ?? []).filter((m) => m.role === 'user').at(-1)
     if (!lastUser) return err(c, 400, 'no_user_message', 'No user message to respond to.')
 
+    // Chat branching (GitHub #52): if /regenerate just deactivated the prior reply, the new
+    // placeholder joins its variant_group so the client can render a ‹ 1/2 › sibling switcher
+    // instead of the old reply simply having vanished. Must look specifically at the message
+    // immediately after the current active tail (getNextMessageAfterSeq), NOT "whatever has
+    // the globally highest seq" — a conversation with more than one branch point can have
+    // unrelated, higher-seq messages sitting inactive in a completely different branch.
+    const priorVariant = db.getNextMessageAfterSeq(convId, lastUser.seq)
+    const variantGroup = priorVariant && priorVariant.role === 'assistant' && !priorVariant.isActive
+      ? (priorVariant.variantGroup ?? priorVariant.id)
+      : undefined
+
     // Create a placeholder assistant message
-    db.addMessage(convId, 'assistant', '', { stats: { aborted: false } })
+    db.addMessage(convId, 'assistant', '', { stats: { aborted: false }, variantGroup })
     const assistantMsg = db.getLastMessage(convId)!
 
     const ac = new AbortController()
@@ -287,7 +306,13 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       const engineMessages: { role: string; content: unknown }[] = []
       if (conv.systemPrompt) engineMessages.push({ role: 'system', content: conv.systemPrompt })
       for (const m of allMsgs) {
-        engineMessages.push({ role: m.role, content: m.content })
+        // GitHub #52: when preserveThinking is on, fold past reasoning back into what's
+        // resent so the model sees its own prior thinking, not just the final answer —
+        // the default behavior (off) matches what's always been sent.
+        const content = (conv.preserveThinking && m.role === 'assistant' && m.reasoning?.trim())
+          ? `<think>\n${m.reasoning}\n</think>\n\n${m.content}`
+          : m.content
+        engineMessages.push({ role: m.role, content })
       }
 
       await runGeneration(d, stream, { convId, conv, engineMessages, assistantMsg, ms, target, ac, disableThinking: b.disableThinking ?? false })
@@ -310,13 +335,29 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   app.put('/api/v1/conversations/:id/messages/:msgId', async (c) => {
     const { id: convId, msgId } = c.req.param()
     const b = await body<{ content?: string }>(c)
-    if (!b.content?.trim()) return err(c, 400, 'invalid_input', 'content required.')
+    const trimmed = b.content?.trim()
+    if (!trimmed) return err(c, 400, 'invalid_input', 'content required.')
     const msg = db.getMessage(msgId)
     if (!msg || msg.convId !== convId) return err(c, 404, 'not_found', 'Message not found.')
-    if (msg.role !== 'user') return err(c, 400, 'invalid_input', 'Can only edit user messages.')
     if (inflight.has(convId)) return err(c, 409, 'generation_in_flight', 'Stop generation first.')
-    db.updateMessage(msgId, { content: b.content.trim() })
-    db.deleteMessagesAfterSeq(convId, msg.seq)
+
+    if (msg.role === 'assistant') {
+      // GitHub #52: edit the model's own reply in place — just fixing text, not resending,
+      // so no branching/truncation. (Regenerating a NEW reply is the separate /regenerate flow.)
+      // Tag it "edited" so the UI can show that — this route is the ONLY place that ever
+      // sets it, unlike the generation-completion save which writes content too.
+      db.updateMessage(msgId, { content: trimmed, edited: true })
+      return c.json({ messages: db.getMessages(convId) })
+    }
+
+    // role === 'user': edit-and-resend now BRANCHES instead of destroying the downstream
+    // history (GitHub #52) — the old message and everything after it is frozen, not deleted,
+    // the same way /regenerate keeps a deactivated reply instead of deleting it.
+    if (trimmed === msg.content) return c.json({ messages: db.getMessages(convId) }) // no-op
+    db.freezeTail(convId, msg.seq, msg.id)
+    db.deactivateMessage(msg.id)
+    const variantGroup = db.getMessage(msg.id)!.variantGroup!
+    db.addMessage(convId, 'user', trimmed, { variantGroup, attachments: msg.attachments, textAttachments: msg.textAttachments })
     return c.json({ messages: db.getMessages(convId) })
   })
 
@@ -332,8 +373,42 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const convId = c.req.param('id')
     if (inflight.has(convId)) return err(c, 409, 'generation_in_flight', 'Stop generation first.')
     const last = db.getLastMessage(convId)
-    if (last?.role === 'assistant') db.deleteMessage(last.id)
+    // Chat branching (GitHub #52): deactivate rather than delete — the old reply is kept
+    // as a sibling variant, not destroyed. /continue (called next by the client) creates
+    // the new reply and joins it to the same variant_group.
+    if (last?.role === 'assistant') db.deactivateMessage(last.id)
     return c.json({ ok: true })
+  })
+
+  // Chat branching: list all siblings (active + inactive) for the ‹ 1/2 › switcher UI.
+  app.get('/api/v1/conversations/:id/messages/:msgId/variants', (c) => {
+    const { id: convId, msgId } = c.req.param()
+    const msg = db.getMessage(msgId)
+    if (!msg || msg.convId !== convId) return err(c, 404, 'not_found', 'Message not found.')
+    if (!msg.variantGroup) return c.json({ variants: [msg] })
+    return c.json({ variants: db.getMessageVariants(msg.variantGroup) })
+  })
+
+  // Chat branching: switch which sibling in a variant group is the active one. For a
+  // user-message group this also swaps the entire downstream tail (freeze the one we're
+  // leaving, restore the one we're entering) — an assistant-reply group never has anything
+  // downstream to move, since /regenerate only ever acts on the last message.
+  app.post('/api/v1/conversations/:id/messages/:msgId/activate', (c) => {
+    const { id: convId, msgId } = c.req.param()
+    const msg = db.getMessage(msgId)
+    if (!msg || msg.convId !== convId) return err(c, 404, 'not_found', 'Message not found.')
+    if (!msg.variantGroup) return err(c, 400, 'invalid_input', 'Message has no alternate versions.')
+    if (inflight.has(convId)) return err(c, 409, 'generation_in_flight', 'Stop generation first.')
+    if (msg.isActive) return c.json({ messages: db.getMessages(convId) }) // already active, no-op
+
+    if (msg.role === 'user') {
+      const currentActive = db.getMessageVariants(msg.variantGroup).find((v) => v.isActive)
+      if (currentActive) db.freezeTail(convId, currentActive.seq, currentActive.id)
+      db.restoreTail(msgId)
+    }
+    const ok = db.setActiveVariant(msg.variantGroup, msgId)
+    if (!ok) return err(c, 500, 'internal', 'Could not switch branch.')
+    return c.json({ messages: db.getMessages(convId) })
   })
 
   // ── F-023: export / debug snapshot ────────────────────────────────────────
@@ -690,10 +765,15 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
       const cappedMax = clampMaxTokens(reqBody.max_tokens as number | undefined, maxLimit)
       if (cappedMax != null) reqBody.max_tokens = cappedMax
       else delete reqBody.max_tokens
+      // GitHub #52: disableThinking (this turn) and preserveThinking (past turns) are
+      // independent and can both be relevant at once, so merge rather than overwrite.
+      const templateKwargs: Record<string, unknown> = {}
       if (disableThinking) {
         reqBody.reasoning_budget = 0
-        reqBody.chat_template_kwargs = { enable_thinking: false }
+        templateKwargs.enable_thinking = false
       }
+      if (conv.preserveThinking) templateKwargs.preserve_thinking = true
+      if (Object.keys(templateKwargs).length) reqBody.chat_template_kwargs = templateKwargs
       // Attach tools only to engines whose OpenAI server accepts a `tools` array as
       // passthrough. vLLM is strict: a `tools` array (which defaults tool_choice to
       // "auto") is REJECTED with HTTP 400 — "auto tool choice requires
@@ -1008,10 +1088,15 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
       const cappedMax = clampMaxTokens(reqBody.max_tokens as number | undefined, maxLimit)
       if (cappedMax != null) reqBody.max_tokens = cappedMax
       else delete reqBody.max_tokens
+      // GitHub #52: disableThinking (this turn) and preserveThinking (past turns) are
+      // independent and can both be relevant at once, so merge rather than overwrite.
+      const templateKwargs: Record<string, unknown> = {}
       if (disableThinking) {
         reqBody.reasoning_budget = 0
-        reqBody.chat_template_kwargs = { enable_thinking: false }
+        templateKwargs.enable_thinking = false
       }
+      if (conv.preserveThinking) templateKwargs.preserve_thinking = true
+      if (Object.keys(templateKwargs).length) reqBody.chat_template_kwargs = templateKwargs
 
       const res = await fetch(`${target}/v1/chat/completions`, {
         method: 'POST',

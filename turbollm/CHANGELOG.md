@@ -25,6 +25,51 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.7.5] - 2026-07-09
+
+**Chat branching, message editing, preserve-thinking, and a background-generation UX pass — plus a real CUDA fallback bug and a model-swap silent failure fixed.**
+
+### Added
+- **Chat branching** — editing a message or regenerating a reply no longer overwrites history:
+  both create a branch, switchable via a ‹ 1/2 › control on the message, including nested branch
+  points (branching inside an already-branched conversation).
+- **In-place message editing for assistant replies** — fixes the text without triggering a new
+  generation; shows an "Edited" tag.
+- **Preserve thinking across turns** (Thread settings) — resends the model's past reasoning on
+  later turns, not just its final answers. On by default for new conversations.
+- **Thread settings usable on a blank chat** — reachable as soon as a model is loaded, even
+  before the first message is sent.
+- **Sampling sliders now default to the loaded model's own recommended values** instead of fixed
+  generic constants.
+- **Skills list in Thread settings is now collapsible** (collapsed by default) with a master
+  on/off checkbox.
+- **Pinned models now sort to the top of the chat model picker**, not just the Library list.
+- **Background-generation sidebar indicators** — a live spinner on any conversation still
+  generating in the background, and a dot on one that finished while you were elsewhere.
+
+### Changed
+- **Switching conversations no longer cancels an in-flight reply** — it keeps generating and
+  saves normally; only an explicit Stop/Eject/delete cancels a generation now.
+- Custom-added engines now render their own card in the engine gallery instead of being invisible
+  next to auto-downloaded official builds.
+
+### Fixed
+- The CUDA backend could silently fall back to CPU if its cudart runtime bundle never finished
+  downloading — a completeness check now catches this and backfills existing installs without
+  forcing a re-download.
+- Reloading the same model or switching models could sometimes leave nothing loaded, with no
+  error shown — a slow engine stop could abandon the load silently.
+- Engine directory scanning could crash on a permission-restricted subfolder.
+- A streaming display bug could briefly show an empty "thinking" block.
+- The Thread settings dialog could overflow off-screen with a lot of skills installed.
+- `ConversationSettingsDialog` now uses an accessible dialog title (screen-reader fix).
+
+### Discord
+- Editing a message or regenerating a reply no longer wipes out what came after it — every version is saved, and you can flip between them.
+- Chats now remember their own reasoning across turns by default, so follow-up questions actually build on what the model already figured out.
+- Switching to a different chat mid-reply no longer kills the generation — it finishes in the background, and the sidebar shows you which chats are still working (and which ones just finished).
+- Fixed a couple of real bugs: the CUDA backend silently falling back to CPU on some installs, and switching models sometimes leaving nothing loaded at all.
+
 ## [1.7.4] - 2026-07-07
 
 **Engines, Library, Developer, and Settings redesigned, and every screen now works on mobile.**

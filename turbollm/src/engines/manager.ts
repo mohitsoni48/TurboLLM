@@ -165,12 +165,22 @@ export class Manager {
    *  outcome. */
   async load(opts: StartOpts, hooks?: { beforeStart?: () => Promise<void> }): Promise<void> {
     await Manager.runExclusive(async () => {
-      if (this.state === 'running' || this.state === 'starting' || this.state === 'stopping') {
-        await this.stopAndWait()
+      try {
+        if (this.state === 'running' || this.state === 'starting' || this.state === 'stopping') {
+          await this.stopAndWait()
+        }
+        if (hooks?.beforeStart) await hooks.beforeStart()
+        await this.startInternal(opts)
+        await this.awaitNotStarting()
+      } catch (e) {
+        // routes.ts fires load() without awaiting and only console.warns the rejection —
+        // without this, a failed swap left `state` wherever it last was (often still
+        // 'stopping'), which read to the user as "no model loaded" with no indication
+        // anything went wrong or that a retry could help.
+        this.state = 'error'
+        this.errInfo = { code: 'load_failed', message: e instanceof Error ? e.message : String(e), exitCode: -1, logTail: [] }
+        throw e
       }
-      if (hooks?.beforeStart) await hooks.beforeStart()
-      await this.startInternal(opts)
-      await this.awaitNotStarting()
     })
   }
 
@@ -308,12 +318,31 @@ export class Manager {
       // Used by the ComfyUI guard, which needs the VRAM freed NOW before ComfyUI runs.
       if (opts?.force) this.forceStop()
       else this.stop()
-      await Promise.race([exited, sleep(10_000)])
+      await this.waitForExit(exited)
     } else if (this.state === 'stopping') {
-      await Promise.race([exited, sleep(10_000)])
+      await this.waitForExit(exited)
     } else if (this.state === 'error') {
       this.state = 'stopped'
       this.errInfo = null
+    }
+  }
+
+  /** Wait for `exited` up to 10s; if it hasn't resolved by then, force-kill and wait
+   *  unconditionally. A bare timeout here previously let stopAndWait() return with the
+   *  process still alive and `state` stuck at 'stopping' (e.g. a slow Windows tree-kill) —
+   *  the very next startInternal() would then throw BusyError, silently abandoning a model
+   *  swap (the caller in routes.ts fires load() without awaiting and only logs the
+   *  rejection). Bypasses forceStop()'s running/starting-only guard by calling the
+   *  module-level forceKill directly, since by this point state is already 'stopping'. */
+  private async waitForExit(exited: Promise<void>): Promise<void> {
+    const result = await Promise.race([exited.then(() => 'exited' as const), sleep(10_000).then(() => 'timeout' as const)])
+    if (result === 'timeout' && this.child) {
+      forceKill(this.child)
+      // Bounded too: forceKill's taskkill is fire-and-forget (failures swallowed), so an
+      // unbounded await here on an unkillable/zombie process would wedge this forever —
+      // and since stopAndWait() runs inside the exclusive load gate, that deadlocks every
+      // future load(), which is worse than the 'stuck at stopping' bug this replaced.
+      await Promise.race([exited, sleep(5_000)])
     }
   }
 

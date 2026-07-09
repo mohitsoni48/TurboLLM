@@ -4,7 +4,7 @@
 // the app-data engines dir. No bundling, no system paths, dependency-free
 // (Node fetch; PowerShell Expand-Archive / tar for extraction). The user can
 // override the backend; we fall back GPU → Vulkan → CPU if a build won't run.
-import { createWriteStream, existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs'
+import { createWriteStream, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { execFile, execFileSync } from 'node:child_process'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
@@ -162,8 +162,10 @@ export function installedBackendBuild(
     const m = re.exec(name)
     if (!m) continue
     const dir = join(enginesRoot, name)
-    const bin = findServer(dir)
-    if (!bin) continue
+    // A dir with a server binary but no completion marker is a partial/legacy install
+    // (see PROVISION_MARKER) — must not be reported as a working, installed build.
+    if (!isFullyProvisioned(dir)) continue
+    const bin = findServer(dir)!
     if (!best || buildNum(m[1]) > buildNum(best.tag)) best = { dir, tag: m[1], bin }
   }
   return best
@@ -174,7 +176,9 @@ export function installedBackendBuild(
  *  huge tree can't make the scan hang — default keeps the original full-walk
  *  behavior for existing callers. */
 export function findFile(dir: string, name: string, skipDir?: (dirName: string) => boolean): string | null {
-  for (const e of readdirSync(dir, { withFileTypes: true })) {
+  const entries = tryReaddir(dir)
+  if (!entries) return null
+  for (const e of entries) {
     const full = join(dir, e.name)
     if (e.isDirectory()) {
       if (skipDir?.(e.name)) continue
@@ -185,6 +189,16 @@ export function findFile(dir: string, name: string, skipDir?: (dirName: string) 
     }
   }
   return null
+}
+
+/** Read a directory's entries, or null if it can't be read (e.g. an OS-protected folder
+ *  throwing EPERM/EACCES) — lets a broad recursive scan skip past it instead of crashing. */
+function tryReaddir(dir: string) {
+  try {
+    return readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return null
+  }
 }
 
 function findServer(dir: string): string | null {
@@ -238,6 +252,45 @@ export async function extractArchive(archive: string, destDir: string): Promise<
   stripMacOsQuarantine(destDir)
 }
 
+// Written into a backend build dir once EVERY asset (e.g. CUDA's binary + its cudart
+// runtime bundle) has downloaded and extracted successfully. Its presence is what
+// "installed" actually means — a dir with a server binary but no marker means an
+// earlier run stopped partway (e.g. an asset was added to a backend after this dir was
+// first provisioned, or a prior version only fetched one of several required assets),
+// which used to be silently mistaken for a complete, working install (real bug: the CUDA
+// backend then falls back to CPU with no error, because ggml-cuda.dll can't find the
+// cudart64_*/cublas64_*/cublasLt64_* DLLs it needs but nothing downloaded them).
+const PROVISION_MARKER = '.turbollm-provisioned'
+
+/** Whether `dir` has the CUDA cudart runtime DLLs directly beside the server binary
+ *  (`cudart64_*.dll` — extracted from the second asset). Non-recursive: the multi-asset
+ *  extraction always places them at the top level, same as the server binary itself. */
+function hasCudartRuntime(dir: string): boolean {
+  try {
+    return readdirSync(dir).some((f) => /^cudart64_\d+\.dll$/i.test(f))
+  } catch {
+    return false
+  }
+}
+
+/** Whether every asset for this backend was ever confirmed downloaded. Presence of
+ *  PROVISION_MARKER is the fast path. Builds installed by a TurboLLM version older than
+ *  the marker (or before this backend needed a second asset) have no marker yet — for
+ *  those, backfill: a CUDA dir only counts as complete if the cudart DLLs are actually
+ *  there (the real signal this whole check exists to verify); any other backend is
+ *  single-asset, so the binary alone is proof enough. Writes the marker on first pass so
+ *  this only needs to re-derive it once per build dir. */
+function isFullyProvisioned(dir: string): boolean {
+  if (existsSync(join(dir, PROVISION_MARKER))) return !!findServer(dir)
+  const bin = findServer(dir)
+  if (!bin) return false
+  if (/-cuda$/.test(dir) && !hasCudartRuntime(dir)) return false
+  // Best-effort: a read-only dir or full disk shouldn't 500 the caller (this runs inside
+  // route handlers) — a failed write just means the next call re-derives it the same way.
+  try { writeFileSync(join(dir, PROVISION_MARKER), JSON.stringify({ backfilled: true })) } catch { /* re-derived next time */ }
+  return true
+}
+
 /**
  * Ensure a backend is downloaded + extracted; return the llama-server path.
  * Multi-asset backends (CUDA = binary + cudart) extract into the same dir so the
@@ -252,7 +305,7 @@ export async function provisionBackend(
 ): Promise<string> {
   const destDir = join(enginesRoot, `llama.cpp-${tag}-${backend.id}`)
 
-  if (existsSync(destDir)) {
+  if (isFullyProvisioned(destDir)) {
     const found = findServer(destDir)
     if (found) return found
   }
@@ -281,6 +334,7 @@ export async function provisionBackend(
 
   const bin = findServer(destDir)
   if (!bin) throw new Error('llama-server not found in extracted archive(s)')
+  writeFileSync(join(destDir, PROVISION_MARKER), JSON.stringify({ assets: backend.assets, tag }))
   return bin
 }
 

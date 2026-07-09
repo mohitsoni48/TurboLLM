@@ -201,11 +201,19 @@ the detail:
   **Designer** persona produces polished, self-contained, previewable designs by default; **Lite**
   strips the hidden prompt to the bare minimum for the fastest responses. See below for editing
   built-ins or creating your own.
-- **Edit, regenerate, delete, copy** any message; **persistent, searchable conversations**
-  with rename, delete, and **auto-generated titles**, organized into **drag-resizable,
-  collapsible folders** you create/rename/move conversations into.
+- **Edit or regenerate any message without losing history** — both branch instead of
+  overwriting, with a **‹ 1/2 › switcher** to flip between versions (including nested branch
+  points); delete and copy still work as before. **Persistent, searchable conversations** with
+  rename, delete, and **auto-generated titles**, organized into **drag-resizable, collapsible
+  folders** you create/rename/move conversations into.
+- **Switching chats never cancels a reply** — an in-flight generation keeps running in the
+  background and saves normally; the sidebar shows a live indicator on any chat still generating,
+  and a dot on one that finished while you were elsewhere.
+- **Preserve thinking across turns** (on by default) — the model's past reasoning is resent on
+  later turns, not just its final answers, so follow-ups have real context to work with.
 - **Per-chat system prompt** and **per-chat sampling** overrides — temperature, top-p/k, min-p,
-  repeat/presence/frequency penalties, and **stop strings**.
+  repeat/presence/frequency penalties, and **stop strings** — prefilled from the loaded model's
+  own recommended values, available even before you send the first message.
 - **Image input** for vision models, **PDF and code/text attachments** (real extracted text,
   not raw bytes), and **TurboLLM Expert** — a built-in assistant that knows the app and your
   hardware for onboarding and troubleshooting without leaving the UI.
