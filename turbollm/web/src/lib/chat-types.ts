@@ -104,7 +104,8 @@ export interface Conversation {
    *  Agents). Undefined/empty = unrestricted (every built-in persona). */
   allowedTools?: string[]
   /** GitHub #52: when true, past turns' reasoning is resent to the engine (not just
-   *  their final answer) so the model can see its own prior thinking. Off by default. */
+   *  their final answer) so the model can see its own prior thinking. On by default for
+   *  new conversations; conversations from before this default flipped stay off. */
   preserveThinking: boolean
   createdAt: string
   updatedAt: string

@@ -72,7 +72,11 @@ update: useMutation({
     }),
     regenerate: useMutation({
       mutationFn: (convId: string) => regenerate(convId),
-      onSuccess: (_d, convId) => invalidateDetail(convId),
+      // Regenerate adds a new sibling to a variant group; without this the switcher's
+      // cached list is stale until something else happens to remount it (it self-corrects
+      // today only because the active message's id changes on refetch, which is load-bearing
+      // but not obvious — invalidate explicitly instead of relying on that).
+      onSuccess: (_d, convId) => { invalidateDetail(convId); void qc.invalidateQueries({ queryKey: ['message-variants'] }) },
     }),
     createFolder: useMutation({
       mutationFn: (name: string) => createFolder(name),

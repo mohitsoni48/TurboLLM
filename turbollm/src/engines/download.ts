@@ -285,7 +285,9 @@ function isFullyProvisioned(dir: string): boolean {
   const bin = findServer(dir)
   if (!bin) return false
   if (/-cuda$/.test(dir) && !hasCudartRuntime(dir)) return false
-  writeFileSync(join(dir, PROVISION_MARKER), JSON.stringify({ backfilled: true }))
+  // Best-effort: a read-only dir or full disk shouldn't 500 the caller (this runs inside
+  // route handlers) — a failed write just means the next call re-derives it the same way.
+  try { writeFileSync(join(dir, PROVISION_MARKER), JSON.stringify({ backfilled: true })) } catch { /* re-derived next time */ }
   return true
 }
 

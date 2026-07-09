@@ -338,7 +338,11 @@ export class Manager {
     const result = await Promise.race([exited.then(() => 'exited' as const), sleep(10_000).then(() => 'timeout' as const)])
     if (result === 'timeout' && this.child) {
       forceKill(this.child)
-      await exited
+      // Bounded too: forceKill's taskkill is fire-and-forget (failures swallowed), so an
+      // unbounded await here on an unkillable/zombie process would wedge this forever —
+      // and since stopAndWait() runs inside the exclusive load gate, that deadlocks every
+      // future load(), which is worse than the 'stuck at stopping' bug this replaced.
+      await Promise.race([exited, sleep(5_000)])
     }
   }
 
