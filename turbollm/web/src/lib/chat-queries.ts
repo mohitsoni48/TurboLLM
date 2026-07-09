@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  createConversation, createFolder, deleteConversation, deleteFolder, deleteMessage, editMessage,
-  getConversation, listConversations, listFolders, moveConversationToFolder, regenerate,
+  createConversation, createFolder, deleteConversation, deleteFolder, deleteMemoryFact, deleteMessage, editMessage,
+  getConversation, listConversations, listFolders, listMemoryFacts, moveConversationToFolder, regenerate,
   renameFolder, stopGeneration, updateConversation,
 } from './chat-api'
 import type { Conversation } from './chat-types'
@@ -10,6 +10,31 @@ export const chatKeys = {
   list: (q?: string) => ['conversations', q ?? ''] as const,
   detail: (id: string | null) => ['conversation', id] as const,
   folders: ['folders'] as const,
+}
+
+export const memoryKeys = {
+  list: ['memory-facts'] as const,
+}
+
+/** Auto-memory (Release 3) fact list — fetched regardless of the feature toggle so a user
+ *  can review/clean up what's been saved even with extraction turned off. */
+export function useMemoryFacts() {
+  return useQuery({
+    queryKey: memoryKeys.list,
+    queryFn: listMemoryFacts,
+    staleTime: 0,
+    retry: false,
+  })
+}
+
+export function useMemoryFactMutations() {
+  const qc = useQueryClient()
+  return {
+    remove: useMutation({
+      mutationFn: (id: string) => deleteMemoryFact(id),
+      onSuccess: () => void qc.invalidateQueries({ queryKey: memoryKeys.list }),
+    }),
+  }
 }
 
 export function useConversations(q?: string) {

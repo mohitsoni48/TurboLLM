@@ -64,6 +64,15 @@ export interface Folder {
   updatedAt: string
 }
 
+/** One durable fact extracted from a user's own chat messages (Release 3, auto-memory).
+ *  No FK to conversations — deleting the source chat shouldn't delete the fact it produced. */
+export interface MemoryFact {
+  id: string
+  factText: string
+  sourceConvId?: string
+  createdAt: string
+}
+
 /** One per-agent lesson distilled by the reviewer (spec 13 redesign §3, Reflexion). */
 export interface AgentLesson {
   id: string
@@ -122,6 +131,88 @@ export interface ModelStat {
   total: number
   complete: number
   successRate: number
+}
+
+export interface TokenUsageDay {
+  date: string
+  promptTokens: number
+  genTokens: number
+  totalTokens: number
+  messageCount: number
+}
+
+/** Per-model usage within the selected range, for the Tokens dashboard's Models tab. */
+export interface ModelUsage {
+  modelKey: string
+  displayName: string
+  messageCount: number
+  promptTokens: number
+  genTokens: number
+  totalTokens: number
+}
+
+/** One day's per-model token split, for the Models tab's stacked bar chart. Only models
+ *  with activity that day are listed (no zero entries). */
+export interface DailyModelBreakdown {
+  date: string
+  totalTokens: number
+  byModel: { modelKey: string; tokens: number }[]
+}
+
+export type TokenUsageRange = 'all' | '30d' | '7d'
+
+/** One heatmap cell. `start` is a bucket key whose format depends on `granularityHours`:
+ *  "YYYY-MM-DDTHH" for hourly, "YYYY-MM-DD-AM"/"-PM" for 12h, "YYYY-MM-DD" for daily. */
+export interface ActivityBucket {
+  start: string
+  totalTokens: number
+  messageCount: number
+}
+
+/** Overview heatmap data — box granularity zooms in as the range narrows (1 box = 1h for
+ *  7d, 12h for 30d, 1 day for all) so the grid stays visually dense instead of showing a
+ *  handful of sparse day-cells for short ranges. */
+export interface TokenActivity {
+  granularityHours: 1 | 12 | 24
+  buckets: ActivityBucket[]
+}
+
+export interface TokenUsageStats {
+  range: TokenUsageRange
+  sessions: number
+  messages: number
+  totalTokens: number
+  activeDays: number
+  /** Lifetime, not scoped by `range` — a streak isn't a "last N days" concept. */
+  currentStreak: number
+  longestStreak: number
+  /** Local hour of day (0-23) with the most messages in range; null with no data. */
+  peakHour: number | null
+  favoriteModel: string | null
+  firstMessageAt: string | null
+  /** Lifetime, not scoped by `range` — same as the streak fields. Drives the milestone
+   *  ladder and the frontend's fun-fact comparison, both of which should stay stable as
+   *  the user switches the range tab, not jump around with it. */
+  lifetimeTotalTokens: number
+  milestone: { achieved: number | null; next: number | null; progressPct: number | null }
+  activity: TokenActivity
+  dailyByModel: DailyModelBreakdown[]
+  byModel: ModelUsage[]
+}
+
+const RANGE_WINDOW_DAYS: Record<'30d' | '7d', number> = { '30d': 30, '7d': 7 }
+
+const TOKEN_MILESTONES = [
+  1_000, 10_000, 100_000, 500_000, 1_000_000, 5_000_000,
+  10_000_000, 50_000_000, 100_000_000, 500_000_000, 1_000_000_000,
+]
+
+/** "gemma 4 e4b|Q6_K|6217256480" -> "Gemma 4 E4b". Good enough for a dashboard label —
+ *  the model may since have been renamed/deleted, so this derives purely from the stored
+ *  key rather than cross-referencing the live model list. */
+function titleCaseModelName(modelKey: string): string {
+  const raw = modelKey.split('|')[0] ?? modelKey
+  return raw.replace(/\b\w/g, (c) => c.toUpperCase())
 }
 
 export interface MessageStats {
@@ -548,6 +639,22 @@ export class ConversationStore {
       if (!this.hasColumn('messages', 'edited')) this.db.exec(`ALTER TABLE messages ADD COLUMN edited INTEGER NOT NULL DEFAULT 0;`)
       this.db.exec(`PRAGMA user_version = 26;`)
     }
+    // v27 (Release 3, auto-memory): durable facts extracted from the user's own chat
+    // messages, injected into future new conversations. No FK to conversations — deleting
+    // a source chat shouldn't delete the fact it produced (same provenance-column pattern
+    // as agent_lessons above).
+    if (v < 27) {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS memory_facts (
+          id             TEXT PRIMARY KEY,
+          fact_text      TEXT NOT NULL,
+          source_conv_id TEXT,
+          created_at     TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_facts_created ON memory_facts(created_at);
+        PRAGMA user_version = 27;
+      `)
+    }
   }
 
   listConversations(q?: string, kind: 'chat' | 'agent' | 'all' = 'all'): Conversation[] {
@@ -690,6 +797,196 @@ export class ConversationStore {
       if (typeof tps === 'number' && tps > 0) out.set(r.model_key, Math.round(tps * 10) / 10)
     }
     return out
+  }
+
+  /** Token usage dashboard (Release 3): sessions/messages/tokens/active-days scoped to
+   *  `range`, lifetime streaks (a streak isn't a "last N days" concept), the local hour
+   *  with the most activity, a per-model breakdown, and the heatmap day buckets — all from
+   *  one pass over `messages`. Days are bucketed by LOCAL calendar date (this daemon and its
+   *  user are always the same machine), not UTC, so a late-night session lands on the day
+   *  the user actually thinks of as "today". */
+  tokenUsageStats(range: TokenUsageRange = 'all'): TokenUsageStats {
+    const rows = this.db.prepare(`
+      SELECT conv_id, created_at, stats, model_key FROM messages
+      WHERE role = 'assistant'
+      ORDER BY created_at ASC
+    `).all() as unknown as { conv_id: string; created_at: string; stats: string; model_key: string | null }[]
+
+    if (rows.length === 0) {
+      return {
+        range, sessions: 0, messages: 0, totalTokens: 0, activeDays: 0,
+        currentStreak: 0, longestStreak: 0, peakHour: null, favoriteModel: null,
+        firstMessageAt: null, lifetimeTotalTokens: 0, milestone: { achieved: null, next: null, progressPct: null },
+        activity: { granularityHours: 24, buckets: [] }, dailyByModel: [], byModel: [],
+      }
+    }
+
+    const dayKey = (iso: string) => {
+      const d = new Date(iso)
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+    }
+    const addDays = (key: string, n: number) => {
+      const [y, m, d] = key.split('-').map(Number)
+      const dt = new Date(y, m - 1, d + n)
+      return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`
+    }
+
+    // Per-local-day totals across the FULL history — needed for the lifetime streaks
+    // regardless of `range`, and reused below for the heatmap window.
+    const dayBuckets = new Map<string, { promptTokens: number; genTokens: number; messageCount: number }>()
+    const firstMessageAt = rows[0].created_at
+    for (const r of rows) {
+      const key = dayKey(r.created_at)
+      const b = dayBuckets.get(key) ?? { promptTokens: 0, genTokens: 0, messageCount: 0 }
+      const s = safeJson(r.stats) as Partial<MessageStats>
+      b.promptTokens += typeof s.promptTokens === 'number' ? s.promptTokens : 0
+      b.genTokens += typeof s.genTokens === 'number' ? s.genTokens : 0
+      b.messageCount++
+      dayBuckets.set(key, b)
+    }
+
+    const todayKey = dayKey(new Date().toISOString())
+    const firstKey = dayKey(firstMessageAt)
+
+    let longestStreak = 0, run = 0
+    for (let key = firstKey; key <= todayKey; key = addDays(key, 1)) {
+      if (dayBuckets.has(key)) { run++; longestStreak = Math.max(longestStreak, run) } else { run = 0 }
+    }
+    let currentStreak = 0
+    {
+      // Grace period: if today has no activity yet, the streak isn't broken until
+      // tomorrow — check from yesterday instead of reporting 0 the moment you wake up.
+      let key = dayBuckets.has(todayKey) ? todayKey : addDays(todayKey, -1)
+      while (key >= firstKey && dayBuckets.has(key)) { currentStreak++; key = addDays(key, -1) }
+    }
+
+    // "all" always shows at least 180 days of boxes (GitHub-graph convention, scaled
+    // down) — a brand-new account pads out with empty cells before its first message
+    // instead of rendering a tiny, sparse-looking grid. An account older than that still
+    // shows its full real history (never truncated).
+    const minAllStart = addDays(todayKey, -179)
+    const heatStart = range === 'all'
+      ? (firstKey < minAllStart ? firstKey : minAllStart)
+      : addDays(todayKey, -(RANGE_WINDOW_DAYS[range] - 1))
+    // String comparison is safe and deliberately used over Date parsing here — both sides
+    // are zero-padded "YYYY-MM-DD" keys, and `new Date("YYYY-MM-DD")` parses as UTC
+    // midnight (not local), a classic footgun this sidesteps entirely.
+    const scopedRows = range === 'all' ? rows : rows.filter((r) => dayKey(r.created_at) >= heatStart)
+
+    const convIds = new Set<string>()
+    const hourTally = new Map<number, number>()
+    const modelTally = new Map<string, { messageCount: number; promptTokens: number; genTokens: number }>()
+    const dayModelTally = new Map<string, Map<string, number>>()
+    let totalTokens = 0
+    for (const r of scopedRows) {
+      convIds.add(r.conv_id)
+      const s = safeJson(r.stats) as Partial<MessageStats>
+      const pt = typeof s.promptTokens === 'number' ? s.promptTokens : 0
+      const gt = typeof s.genTokens === 'number' ? s.genTokens : 0
+      totalTokens += pt + gt
+      const hour = new Date(r.created_at).getHours()
+      hourTally.set(hour, (hourTally.get(hour) ?? 0) + 1)
+      if (r.model_key) {
+        const m = modelTally.get(r.model_key) ?? { messageCount: 0, promptTokens: 0, genTokens: 0 }
+        m.messageCount++; m.promptTokens += pt; m.genTokens += gt
+        modelTally.set(r.model_key, m)
+
+        const day = dayKey(r.created_at)
+        const dm = dayModelTally.get(day) ?? new Map<string, number>()
+        dm.set(r.model_key, (dm.get(r.model_key) ?? 0) + pt + gt)
+        dayModelTally.set(day, dm)
+      }
+    }
+
+    let peakHour: number | null = null, peakHourCount = -1
+    for (const [hour, count] of hourTally) if (count > peakHourCount) { peakHour = hour; peakHourCount = count }
+
+    const byModel: ModelUsage[] = [...modelTally.entries()]
+      .map(([modelKey, m]) => ({
+        modelKey, displayName: titleCaseModelName(modelKey),
+        messageCount: m.messageCount, promptTokens: m.promptTokens, genTokens: m.genTokens,
+        totalTokens: m.promptTokens + m.genTokens,
+      }))
+      .sort((a, b) => b.totalTokens - a.totalTokens)
+
+    const days: TokenUsageDay[] = []
+    const dailyByModel: DailyModelBreakdown[] = []
+    let activeDays = 0
+    for (let key = heatStart; key <= todayKey; key = addDays(key, 1)) {
+      const b = dayBuckets.get(key)
+      if (b && b.messageCount > 0) activeDays++
+      const dayTotalTokens = (b?.promptTokens ?? 0) + (b?.genTokens ?? 0)
+      days.push({
+        date: key,
+        promptTokens: b?.promptTokens ?? 0, genTokens: b?.genTokens ?? 0,
+        totalTokens: dayTotalTokens, messageCount: b?.messageCount ?? 0,
+      })
+      const dm = dayModelTally.get(key)
+      dailyByModel.push({
+        date: key, totalTokens: dayTotalTokens,
+        byModel: dm ? [...dm.entries()].map(([modelKey, tokens]) => ({ modelKey, tokens })) : [],
+      })
+    }
+
+    // Overview heatmap: box granularity zooms in as the range narrows so the grid stays
+    // visually dense (a 7-cell or 30-cell day-level grid looks broken/sparse) — 1h boxes
+    // for 7d, 12h boxes for 30d, 1-day boxes (the classic GitHub-style grid) for all.
+    let activity: TokenActivity
+    if (range === 'all') {
+      activity = {
+        granularityHours: 24,
+        buckets: days.map((d) => ({ start: d.date, totalTokens: d.totalTokens, messageCount: d.messageCount })),
+      }
+    } else {
+      const granularityHours = range === '7d' ? 1 : 12
+      const subTally = new Map<string, { totalTokens: number; messageCount: number }>()
+      for (const r of scopedRows) {
+        const d = new Date(r.created_at)
+        const day = dayKey(r.created_at)
+        const bucketKey = granularityHours === 1
+          ? `${day}T${String(d.getHours()).padStart(2, '0')}`
+          : `${day}-${d.getHours() < 12 ? 'AM' : 'PM'}`
+        const s = safeJson(r.stats) as Partial<MessageStats>
+        const pt = typeof s.promptTokens === 'number' ? s.promptTokens : 0
+        const gt = typeof s.genTokens === 'number' ? s.genTokens : 0
+        const b = subTally.get(bucketKey) ?? { totalTokens: 0, messageCount: 0 }
+        b.totalTokens += pt + gt; b.messageCount++
+        subTally.set(bucketKey, b)
+      }
+      const buckets: ActivityBucket[] = []
+      for (let key = heatStart; key <= todayKey; key = addDays(key, 1)) {
+        if (granularityHours === 1) {
+          for (let h = 0; h < 24; h++) {
+            const bucketKey = `${key}T${String(h).padStart(2, '0')}`
+            const b = subTally.get(bucketKey)
+            buckets.push({ start: bucketKey, totalTokens: b?.totalTokens ?? 0, messageCount: b?.messageCount ?? 0 })
+          }
+        } else {
+          for (const half of ['AM', 'PM'] as const) {
+            const bucketKey = `${key}-${half}`
+            const b = subTally.get(bucketKey)
+            buckets.push({ start: bucketKey, totalTokens: b?.totalTokens ?? 0, messageCount: b?.messageCount ?? 0 })
+          }
+        }
+      }
+      activity = { granularityHours, buckets }
+    }
+
+    let lifetimeTotalTokens = 0
+    for (const b of dayBuckets.values()) lifetimeTotalTokens += b.promptTokens + b.genTokens
+    const achieved = [...TOKEN_MILESTONES].reverse().find((m) => m <= lifetimeTotalTokens) ?? null
+    const next = TOKEN_MILESTONES.find((m) => m > lifetimeTotalTokens) ?? null
+    const progressPct = next !== null
+      ? Math.round(((lifetimeTotalTokens - (achieved ?? 0)) / (next - (achieved ?? 0))) * 1000) / 10
+      : null
+
+    return {
+      range, sessions: convIds.size, messages: scopedRows.length, totalTokens, activeDays,
+      currentStreak, longestStreak, peakHour,
+      favoriteModel: byModel[0]?.displayName ?? null,
+      firstMessageAt, lifetimeTotalTokens, milestone: { achieved, next, progressPct },
+      activity, dailyByModel, byModel,
+    }
   }
 
   /** Active branch only — matches getMessages(). Used to find "the last thing the user
@@ -945,6 +1242,27 @@ export class ConversationStore {
 
   pruneAgentLessons(agentId: string): void {
     this.db.prepare(`DELETE FROM agent_lessons WHERE agent_id = $a`).run({ $a: agentId } as P)
+  }
+
+  // ── Auto-memory (Release 3) ───────────────────────────────────────────────────
+  // Insert/list/delete only — no update. Facts are reviewed and removed, not hand-edited.
+
+  addMemoryFact(row: { factText: string; sourceConvId?: string }): MemoryFact {
+    const id = randomUUID()
+    const now = new Date().toISOString()
+    this.db.prepare(`INSERT INTO memory_facts (id,fact_text,source_conv_id,created_at) VALUES ($id,$ft,$sc,$now)`)
+      .run({ $id: id, $ft: row.factText, $sc: row.sourceConvId ?? null, $now: now } as P)
+    return { id, factText: row.factText, sourceConvId: row.sourceConvId, createdAt: now }
+  }
+
+  listMemoryFacts(): MemoryFact[] {
+    const rows = this.db.prepare(`SELECT * FROM memory_facts ORDER BY created_at DESC`)
+      .all() as Array<{ id: string; fact_text: string; source_conv_id: string | null; created_at: string }>
+    return rows.map((r) => ({ id: r.id, factText: r.fact_text, sourceConvId: r.source_conv_id ?? undefined, createdAt: r.created_at }))
+  }
+
+  deleteMemoryFact(id: string): boolean {
+    return ((this.db.prepare(`DELETE FROM memory_facts WHERE id = $id`).run({ $id: id } as P) as unknown) as Changes).changes > 0
   }
 
   // ── Skills grown from experience (redesign §3.3, Voyager) ─────────────────────

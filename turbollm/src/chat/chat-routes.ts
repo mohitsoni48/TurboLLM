@@ -17,6 +17,7 @@ import { resolveToolApproval } from '../tools/approval-gate'
 import { buildSaveSkillTool } from '../agents/agent-tools'
 import { SkillStore } from '../agents/skills'
 import { saveSkillFromConversation } from '../agents/skill-jobs'
+import { extractMemoryFacts } from './memory'
 
 // Track in-flight abort controllers per conversation id.
 const inflight = new Map<string, AbortController>()
@@ -68,6 +69,24 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const ok = db.deleteFolder(c.req.param('id'))
     if (!ok) return err(c, 404, 'not_found', 'Folder not found.')
     return c.json({ ok: true })
+  })
+
+  // ── auto-memory (Release 3) ────────────────────────────────────────────────
+
+  app.get('/api/v1/memory', (c) => c.json({ facts: db.listMemoryFacts() }))
+
+  app.delete('/api/v1/memory/:id', (c) => {
+    const ok = db.deleteMemoryFact(c.req.param('id'))
+    if (!ok) return err(c, 404, 'not_found', 'Fact not found.')
+    return c.json({ ok: true })
+  })
+
+  // ── token usage dashboard (Release 3) ─────────────────────────────────────
+
+  app.get('/api/v1/tokens/usage', (c) => {
+    const q = c.req.query('range')
+    const range = q === '30d' || q === '7d' ? q : 'all'
+    return c.json(db.tokenUsageStats(range))
   })
 
   // ── conversations CRUD ─────────────────────────────────────────────────────
@@ -253,7 +272,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
         : fullContent
       engineMessages.push({ role: 'user', content: userContent })
 
-      await runGeneration(d, stream, { convId, conv, engineMessages, assistantMsg, ms, target, ac, disableThinking: b.disableThinking ?? false })
+      await runGeneration(d, stream, { convId, conv, engineMessages, assistantMsg, ms, target, ac, disableThinking: b.disableThinking ?? false, userText: content })
     })
   })
 
@@ -619,6 +638,10 @@ interface GenerationCtx {
   /** When true, instruct the engine to skip reasoning entirely (model answers
    *  directly). Mirrors the params autoTitle uses. */
   disableThinking: boolean
+  /** Release 3, auto-memory: the clean, just-typed user text (never docContext/attachments/
+   *  tool output) for this turn. Undefined on regenerate — no new user text exists there,
+   *  so extraction is skipped by design (also avoids re-extracting already-scanned text). */
+  userText?: string
 }
 
 /**
@@ -1257,6 +1280,14 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
 
   if (!aborted && conv.title === 'New chat' && d.store.snapshot().daemon.autoGenerateTitles) {
     setTimeout(() => { void autoTitle(d, convId, ctx.engineMessages, fullContent, target) }, 1000)
+  }
+
+  // Release 3, auto-memory: extract durable facts from the just-typed user text (never
+  // fires on regenerate, where ctx.userText is unset). Staggered slightly after autoTitle's
+  // own setTimeout so the two out-of-band calls don't hit the engine on the exact same tick
+  // — not load-bearing, both are fire-and-forget.
+  if (!aborted && ctx.userText && d.store.snapshot().daemon.autoMemoryEnabled) {
+    setTimeout(() => { void extractMemoryFacts(d, convId, ctx.userText!, target) }, 1500)
   }
 }
 

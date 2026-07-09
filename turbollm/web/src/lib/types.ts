@@ -487,6 +487,53 @@ export type ModelDirs = {
   primaryDir: string
 }
 
+// ── Token usage dashboard (Release 3) ────────────────────────────────────────
+export type ActivityBucket = {
+  start: string
+  totalTokens: number
+  messageCount: number
+}
+
+export type TokenActivity = {
+  granularityHours: 1 | 12 | 24
+  buckets: ActivityBucket[]
+}
+
+export type ModelUsage = {
+  modelKey: string
+  displayName: string
+  messageCount: number
+  promptTokens: number
+  genTokens: number
+  totalTokens: number
+}
+
+export type DailyModelBreakdown = {
+  date: string
+  totalTokens: number
+  byModel: { modelKey: string; tokens: number }[]
+}
+
+export type TokenUsageRange = 'all' | '30d' | '7d'
+
+export type TokenUsageStats = {
+  range: TokenUsageRange
+  sessions: number
+  messages: number
+  totalTokens: number
+  activeDays: number
+  currentStreak: number
+  longestStreak: number
+  peakHour: number | null
+  favoriteModel: string | null
+  firstMessageAt: string | null
+  lifetimeTotalTokens: number
+  milestone: { achieved: number | null; next: number | null; progressPct: number | null }
+  activity: TokenActivity
+  dailyByModel: DailyModelBreakdown[]
+  byModel: ModelUsage[]
+}
+
 // ── Load profiles + VRAM fit (A4, spec 05) ───────────────────────────────────
 export type Sampling = {
   temp: number

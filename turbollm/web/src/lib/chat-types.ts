@@ -112,6 +112,14 @@ export interface Conversation {
   messages?: Message[]
 }
 
+/** A durable fact extracted from the user's own chat messages (Release 3, auto-memory). */
+export interface MemoryFact {
+  id: string
+  factText: string
+  sourceConvId?: string
+  createdAt: string
+}
+
 /** A chat folder for grouping conversations in the sidebar (v10). Flat — no nesting. */
 export interface Folder {
   id: string

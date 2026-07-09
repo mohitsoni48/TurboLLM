@@ -54,6 +54,11 @@ export interface Daemon {
   openBrowserOnStart: boolean
   theme: string
   autoGenerateTitles: boolean
+  /** Release 3: background extraction of durable facts from the user's own chat messages,
+   *  injected into future new conversations. Off by default — unlike autoGenerateTitles,
+   *  this builds a persistent cross-conversation profile of the user, so it's opt-in
+   *  (same trust-surface posture as lanBind), not default-on. */
+  autoMemoryEnabled: boolean
 }
 export interface Telemetry {
   level: string
@@ -396,6 +401,7 @@ export function defaultConfig(): Config {
       openBrowserOnStart: true,
       theme: 'system',
       autoGenerateTitles: true,
+      autoMemoryEnabled: false,
     },
     telemetry: { level: 'unset', machineId: '' },
     apiKeys: [],

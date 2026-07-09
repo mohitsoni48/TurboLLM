@@ -1,4 +1,4 @@
-import type { Conversation, Folder, Message, ChatSseEvent } from './chat-types'
+import type { Conversation, Folder, Message, ChatSseEvent, MemoryFact } from './chat-types'
 import { ApiError, authHeaders } from './api'
 
 async function req<T>(path: string, init?: RequestInit & { json?: unknown }): Promise<T> {
@@ -77,6 +77,16 @@ export function deleteMessage(convId: string, msgId: string): Promise<{ ok: true
 
 export function regenerate(convId: string): Promise<{ ok: true }> {
   return req(`/api/v1/conversations/${encodeURIComponent(convId)}/regenerate`, { method: 'POST', json: {} })
+}
+
+// ── Auto-memory (Release 3) ─────────────────────────────────────────────────────
+
+export function listMemoryFacts(): Promise<{ facts: MemoryFact[] }> {
+  return req('/api/v1/memory')
+}
+
+export function deleteMemoryFact(id: string): Promise<{ ok: true }> {
+  return req(`/api/v1/memory/${encodeURIComponent(id)}`, { method: 'DELETE' })
 }
 
 // ── Chat branching (GitHub #52) ────────────────────────────────────────────────
