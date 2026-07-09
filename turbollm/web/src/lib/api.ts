@@ -27,6 +27,8 @@ import type {
   ModelsList,
   Status,
   AppUpdate,
+  TokenUsageStats,
+  TokenUsageRange,
 } from './types'
 
 const AUTH_KEY = 'tllm.authToken'
@@ -107,6 +109,11 @@ export function getStatus(): Promise<Status> {
 /** Live running-session stats (B4) ride on the status payload — surfaced from the
  *  status poll rather than a separate endpoint. Re-exported for convenience. */
 export type { EngineStats } from './types'
+
+// ── Token usage dashboard (Release 3) ────────────────────────────────────────
+export function getTokenUsage(range: TokenUsageRange = 'all'): Promise<TokenUsageStats> {
+  return request<TokenUsageStats>(`/api/v1/tokens/usage?range=${range}`)
+}
 
 // ── Engines registry (spec 02 §2) ────────────────────────────────────────────
 export function listEngines(): Promise<EnginesList> {
@@ -497,6 +504,9 @@ export type DaemonSettings = {
   port: number
   theme: string
   autoGenerateTitles: boolean
+  /** Release 3: background extraction of durable facts from the user's own chat messages,
+   *  injected into future new conversations. Off by default (opt-in trust surface). */
+  autoMemoryEnabled: boolean
   openBrowserOnStart: boolean
   autoLoadOnStart: boolean
   /** VRAM to keep free during auto-tune's offload search, MB (300–2048, default 1024). A

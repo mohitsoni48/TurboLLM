@@ -22,6 +22,7 @@ import {
 import { CopyButton } from '../components/ui/copy-button'
 import { ModelDirs } from './models/ModelDirs'
 import { ToolPermissionsSection } from './settings/ToolPermissionsSection'
+import { MemorySection } from './settings/MemorySection'
 
 import { ApiError, type TelemetryLevel } from '../lib/api'
 import { TELEMETRY_UI_ENABLED } from '../lib/flags'
@@ -373,6 +374,9 @@ export function SettingsScreen() {
 
               {/* Personalization */}
               <PersonalizationSection />
+
+              {/* Auto-memory (Release 3) */}
+              <MemorySection />
 
               {/* Chat */}
               <section className="rounded-lg border border-border bg-panel p-4">

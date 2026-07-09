@@ -1385,6 +1385,7 @@ export function registerApi(app: Hono, d: Deps): void {
       port?: number
       theme?: string
       autoGenerateTitles?: boolean
+      autoMemoryEnabled?: boolean
       openBrowserOnStart?: boolean
       autoLoadOnStart?: boolean
       vramHeadroomMb?: number
@@ -1422,6 +1423,7 @@ export function registerApi(app: Hono, d: Deps): void {
       updates.theme = b.theme
     }
     if (b.autoGenerateTitles !== undefined) updates.autoGenerateTitles = !!b.autoGenerateTitles
+    if (b.autoMemoryEnabled !== undefined) updates.autoMemoryEnabled = !!b.autoMemoryEnabled
     if (b.openBrowserOnStart !== undefined) updates.openBrowserOnStart = !!b.openBrowserOnStart
 
     // VRAM headroom slider for auto-tune (bench.ts's overHeadroom). config.validate() also
@@ -2006,6 +2008,7 @@ function settingsPayload(d: Deps) {
     port: cfg.daemon.port,
     theme: cfg.daemon.theme,
     autoGenerateTitles: cfg.daemon.autoGenerateTitles,
+    autoMemoryEnabled: cfg.daemon.autoMemoryEnabled,
     openBrowserOnStart: cfg.daemon.openBrowserOnStart,
     autoLoadOnStart: cfg.autoLoadOnStart,
     vramHeadroomMb: cfg.vramHeadroomMb,

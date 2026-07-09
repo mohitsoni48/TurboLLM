@@ -461,7 +461,7 @@ export function resolveAgents(customAgents: MinimalCustomAgent[], overrides: Rec
 /** Build the hidden system prompt for a new conversation. `agentId` drives the
  *  Blank/Lite special-cases; `systemPrompt` is the already-resolved effective text
  *  (built-in default, its override, or a custom agent's prompt — see {@link resolveAgents}). */
-export function buildSystemPrompt(agentId: string, systemPrompt: string, p: Personalization): string {
+export function buildSystemPrompt(agentId: string, systemPrompt: string, p: Personalization, memoryFacts: string[] = []): string {
   if (agentId === 'blank') return ''
   const today = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
   // Lite skips the chart/artifact capability injection entirely — the point of the
@@ -473,5 +473,11 @@ export function buildSystemPrompt(agentId: string, systemPrompt: string, p: Pers
   if (p.assistantName.trim()) parts.push(`Your name is ${p.assistantName.trim()}.`)
   if (p.userName.trim()) parts.push(`The user's name is ${p.userName.trim()}.`)
   if (p.customInstructions.trim()) parts.push(p.customInstructions.trim())
+  // Release 3, auto-memory: facts extracted from the user's own past messages. Baked in
+  // once at conversation creation (same as everything else here) — new conversations pick
+  // up whatever's known at creation time; an already-open chat never retroactively gains it.
+  if (memoryFacts.length) {
+    parts.push(`What you know about the user from past conversations:\n${memoryFacts.map((f) => `- ${f}`).join('\n')}`)
+  }
   return parts.join('\n\n')
 }

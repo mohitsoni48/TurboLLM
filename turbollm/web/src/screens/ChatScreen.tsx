@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type RefObject } from 'react'
 import { useParams, useSearchParams } from 'react-router-dom'
 import { ArrowDown, Brain, Copy, Download, PanelLeft, Paperclip, SendHorizontal, Share2, SlidersHorizontal, Square, UserRound, X } from 'lucide-react'
-import { continueConversation, fetchSysInfo, sendMessage } from '../lib/chat-api'
+import { continueConversation, fetchSysInfo, listMemoryFacts, sendMessage } from '../lib/chat-api'
 import { extractPdfText } from '../lib/pdf-extract'
 import { useConversation, useConversationMutations } from '../lib/chat-queries'
-import { useBuiltinAgentOverrides, useChatAgents, useEngines, useModelActions, useModelDetail, useModels, useStatus } from '../lib/queries'
+import { useBuiltinAgentOverrides, useChatAgents, useEngines, useModelActions, useModelDetail, useModels, useSettings, useStatus } from '../lib/queries'
 import type { ChatSseEvent, LiveToolCall, Message } from '../lib/chat-types'
 import { appendTextDelta, upsertToolCall, type LiveBlock } from '../lib/live-timeline'
 import { ApiError, downloadChatExport, getDebugSnapshot, getShareUrl, importChat } from '../lib/api'
@@ -59,6 +59,7 @@ export function ChatScreen() {
   const { data: status } = useStatus()
   const model = status?.model
   const engineState = status?.engine.state
+  const { query: settingsQ } = useSettings()
 
   // The loaded model's resolved sampling defaults, for the Thread settings sliders
   // (LoadedModel itself carries no sampling — it lives on the per-engine LoadProfile,
@@ -582,7 +583,17 @@ export function ChatScreen() {
       // Create conversation on first message, baking in the selected agent + personalization.
       if (!convId) {
         const resolved = allAgents.find((a) => a.id === selectedPersonaId)
-        let sp = buildSystemPrompt(selectedPersonaId, resolved?.systemPrompt ?? '', getPersonalization())
+        // Release 3, auto-memory: only fetched when the toggle is on, so turning it off is
+        // a complete off-switch for new chats (not just "extraction stops" while stale
+        // facts keep leaking into every future conversation).
+        let memoryFacts: string[] = []
+        if (settingsQ.data?.autoMemoryEnabled) {
+          try {
+            const { facts } = await listMemoryFacts()
+            memoryFacts = facts.map((f) => f.factText)
+          } catch { /* non-fatal — proceed without memory */ }
+        }
+        let sp = buildSystemPrompt(selectedPersonaId, resolved?.systemPrompt ?? '', getPersonalization(), memoryFacts)
         if (selectedPersonaId === 'expert') {
           try {
             const sys = await fetchSysInfo()

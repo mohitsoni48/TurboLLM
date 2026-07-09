@@ -41,6 +41,7 @@ import {
   getAppUpdate,
   setEngineUpdatePolicy,
   getStatus,
+  getTokenUsage,
   startBench,
   getSettings,
   installComfyGate,
@@ -115,6 +116,8 @@ import type {
   ModelDirs,
   ModelsList,
   Status,
+  TokenUsageStats,
+  TokenUsageRange,
 } from './types'
 // SysInfo is defined in api.ts (not types.ts) — re-export for convenience
 export type { SysInfo }
@@ -130,6 +133,7 @@ export const queryKeys = {
   models: ['models'] as const,
   modelDirs: ['modeldirs'] as const,
   downloads: ['downloads'] as const,
+  tokenUsage: (range: TokenUsageRange) => ['token-usage', range] as const,
 }
 
 /** Status poll every 2s, paused when the tab is hidden (spec 00 §4). Polls at 1s
@@ -148,6 +152,22 @@ export function useStatus(): UseQueryResult<Status> {
         : 2000,
     refetchIntervalInBackground: false,
     // Keep the prior value visible while a poll is in flight to avoid flicker.
+    placeholderData: (prev) => prev,
+    retry: false,
+  })
+}
+
+/** Token usage dashboard (Release 3) — a "check when visited" screen, not a live
+ *  status indicator, so no polling: default TanStack refetch-on-focus/mount is enough.
+ *  `placeholderData` keeps the previous range's data visible while a new range loads —
+ *  besides avoiding a loading flicker on tab switch, this matters functionally: without
+ *  it, `data` would briefly go undefined on every range switch, which would reroll
+ *  anything memoized off a `data`-derived value (e.g. the fun-fact pick) even though nothing
+ *  about the lifetime totals actually changed. */
+export function useTokenUsage(range: TokenUsageRange = 'all'): UseQueryResult<TokenUsageStats> {
+  return useQuery({
+    queryKey: queryKeys.tokenUsage(range),
+    queryFn: () => getTokenUsage(range),
     placeholderData: (prev) => prev,
     retry: false,
   })

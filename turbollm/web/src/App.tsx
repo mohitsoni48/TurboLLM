@@ -18,6 +18,7 @@ const ChatScreen = lazy(() => import('./screens/ChatScreen').then((m) => ({ defa
 const SkillEditPage = lazy(() => import('./screens/skills/SkillEditPage').then((m) => ({ default: m.SkillEditPage })))
 const AgentEditPage = lazy(() => import('./screens/agents/AgentEditPage').then((m) => ({ default: m.AgentEditPage })))
 const ModelsScreen = lazy(() => import('./screens/ModelsScreen').then((m) => ({ default: m.ModelsScreen })))
+const TokensScreen = lazy(() => import('./screens/TokensScreen').then((m) => ({ default: m.TokensScreen })))
 const EnginesScreen = lazy(() => import('./screens/EnginesScreen').then((m) => ({ default: m.EnginesScreen })))
 const DeveloperScreen = lazy(() => import('./screens/DeveloperScreen').then((m) => ({ default: m.DeveloperScreen })))
 const CustomizeScreen = lazy(() => import('./screens/CustomizeScreen').then((m) => ({ default: m.CustomizeScreen })))
@@ -92,6 +93,7 @@ export function App() {
             {/* Agents: managed from within Customize; this route is just the create/edit page. */}
             <Route path="/agents/:agentId" element={<AgentEditPage />} />
             <Route path="/models" element={<ModelsScreen />} />
+            <Route path="/usage" element={<TokensScreen />} />
             <Route path="/engines" element={<EnginesScreen />} />
             <Route path="/developer" element={<DeveloperScreen />} />
             <Route path="/customize" element={<CustomizeScreen />} />
