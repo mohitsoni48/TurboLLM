@@ -74,7 +74,19 @@ export function ChatScreen() {
   const readonly = searchParams.get('readonly') === '1'
 
   const [activeId, setActiveId] = useState<string | null>(routeConvId ?? null)
-  const [live, setLive] = useState<LiveState | null>(null)
+  // streamFrom's async loop outlives the render that started it, so it needs the CURRENT
+  // activeId (not the one closed over when the generation began) to tell whether a
+  // 'done'/'error' event landed on the conversation the user is still looking at.
+  const activeIdRef = useRef(activeId)
+  activeIdRef.current = activeId
+  // Keyed by convId, not a single global value — a generation keeps running server-side
+  // after the user navigates away (b6d84f3), so its live state must survive navigation
+  // too, and multiple conversations can legitimately be generating at once.
+  const [liveByConv, setLiveByConv] = useState<Record<string, LiveState>>({})
+  const live = activeId ? liveByConv[activeId] : undefined
+  // Conversations whose generation finished while the user was elsewhere. Cleared when
+  // the user navigates to that conversation. Session-only by design (not persisted).
+  const [recentlyCompletedIds, setRecentlyCompletedIds] = useState<Set<string>>(new Set())
   const [input, setInput] = useState('')
   const [editingId, setEditingId] = useState<string | null>(null)
   const [settingsKey, setSettingsKey] = useState<string | null>(null)
@@ -121,8 +133,10 @@ export function ChatScreen() {
   const builtinOverridesQ = useBuiltinAgentOverrides()
   const allAgents = resolveAgents(customAgentsQ.data ?? [], builtinOverridesQ.data ?? {})
   const selectedAgent = allAgents.find((a) => a.id === selectedPersonaId)
-  const abortRef = useRef<AbortController | null>(null)
-  const deltaTimestamps = useRef<number[]>([])
+  // Keyed by convId — generations can run concurrently across conversations now that
+  // switching away no longer aborts them (b6d84f3).
+  const abortRefs = useRef<Record<string, AbortController>>({})
+  const deltaTimestamps = useRef<Record<string, number[]>>({})
   const scrollerRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
@@ -231,7 +245,13 @@ export function ChatScreen() {
     )
   }
   const handleEject = () => {
-    if (live) { abortRef.current?.abort(); setLive(null) }
+    // Ejecting kills the whole engine — every in-flight generation across every
+    // conversation dies with it, not just the active one.
+    if (Object.keys(abortRefs.current).length > 0) {
+      for (const ac of Object.values(abortRefs.current)) ac.abort()
+      abortRefs.current = {}
+    }
+    setLiveByConv((prev) => (Object.keys(prev).length > 0 ? {} : prev))
     modelActions.eject.mutate(undefined, {
       onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not eject model.'),
     })
@@ -281,7 +301,7 @@ export function ChatScreen() {
         handleNew()
         return
       }
-      if (e.key === 'Escape' && live) { void handleStop() }
+      if (e.key === 'Escape' && activeId && liveByConv[activeId]) { void handleStop() }
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
@@ -382,7 +402,6 @@ export function ChatScreen() {
   const handleNew = () => {
     setActiveId(null)
     setInput('')
-    setLive(null)
     setSelectedPersonaId(getDefaultAgentId())
     inputRef.current?.focus()
   }
@@ -390,12 +409,19 @@ export function ChatScreen() {
   const handleSelect = (id: string) => {
     // Switching conversations must not kill an in-flight generation — only an explicit
     // Stop/Eject/delete should. The backend keeps generating and saves the result when
-    // done; we just stop showing its live bubble here (setLive(null)) since it belongs
-    // to the conversation being left, not the one we're switching to.
-    if (live) setLive(null)
+    // done; live state is now per-conversation (keyed by convId, not activeId), so it
+    // needs no clearing here — the render layer just looks up whatever entry (if any)
+    // matches the newly-active id.
     setActiveId(id)
     setEditingId(null)
     setSelectedPersonaId(getConvAgentId(id))
+    if (recentlyCompletedIds.has(id)) {
+      setRecentlyCompletedIds((prev) => {
+        const next = new Set(prev)
+        next.delete(id)
+        return next
+      })
+    }
     userScrolledUp.current = false
     setTimeout(() => scrollToBottom(true), 50)
   }
@@ -404,7 +430,14 @@ export function ChatScreen() {
   // close it (clear activeId) so we don't hold a dangling reference.
   const handleActiveDeleted = (id: string) => {
     if (id !== activeId) return
-    if (live) { abortRef.current?.abort(); setLive(null) }
+    abortRefs.current[id]?.abort()
+    delete abortRefs.current[id]
+    setLiveByConv((prev) => {
+      if (!(id in prev)) return prev
+      const next = { ...prev }
+      delete next[id]
+      return next
+    })
     setActiveId(null)
     setEditingId(null)
     setInput('')
@@ -412,8 +445,10 @@ export function ChatScreen() {
   }
 
   const handleStop = async () => {
-    abortRef.current?.abort()
-    if (activeId) await mut.stop.mutateAsync(activeId).catch(() => {})
+    if (activeId) {
+      abortRefs.current[activeId]?.abort()
+      await mut.stop.mutateAsync(activeId).catch(() => {})
+    }
   }
 
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -437,59 +472,80 @@ export function ChatScreen() {
     e.target.value = ''
   }
 
-  // Record one generated token and return the rolling 2-second tok/s estimate.
-  const pushGenToken = () => {
+  // Record one generated token for `convId` and return its rolling 2-second tok/s estimate.
+  const pushGenToken = (convId: string) => {
     const now = Date.now()
-    deltaTimestamps.current.push(now)
-    deltaTimestamps.current = deltaTimestamps.current.filter((t) => t > now - 2000)
-    return Math.round((deltaTimestamps.current.length / 2) * 10) / 10
+    const timestamps = [...(deltaTimestamps.current[convId] ?? []), now].filter((t) => t > now - 2000)
+    deltaTimestamps.current[convId] = timestamps
+    return Math.round((timestamps.length / 2) * 10) / 10
+  }
+
+  // Applies `updater` to convId's live entry, no-op if it's already gone (e.g. the
+  // conversation was deleted or ejected mid-stream) — mirrors the old `l ? ... : l` guard.
+  const updateLive = (convId: string, updater: (l: LiveState) => LiveState) => {
+    setLiveByConv((prev) => (prev[convId] ? { ...prev, [convId]: updater(prev[convId]) } : prev))
+  }
+  const clearLive = (convId: string) => {
+    setLiveByConv((prev) => {
+      if (!(convId in prev)) return prev
+      const next = { ...prev }
+      delete next[convId]
+      return next
+    })
   }
 
   // Shared SSE consumer: drives live streaming state for either a fresh send or a continue.
+  // Every setLiveByConv/abortRefs access below targets `convId` — the parameter — not
+  // `activeId`, because by the time an event arrives the user may have navigated to a
+  // different conversation while this generation keeps running in the background.
   const streamFrom = async (convId: string, gen: AsyncGenerator<ChatSseEvent>) => {
     try {
       for await (const evt of gen) {
         if (evt.event === 'meta') {
-          deltaTimestamps.current = []
-          setLive({ assistantId: evt.data.assistantMessageId, content: '', reasoning: '', progress: null, liveGenTps: 0, genTokens: 0, timeline: [] })
+          deltaTimestamps.current[convId] = []
+          setLiveByConv((prev) => ({
+            ...prev,
+            [convId]: { assistantId: evt.data.assistantMessageId, content: '', reasoning: '', progress: null, liveGenTps: 0, genTokens: 0, timeline: [] },
+          }))
           // Optimistically reflect the new/last user msg in the UI by invalidating
           void qc.invalidateQueries({ queryKey: ['conversation', convId] })
         } else if (evt.event === 'progress') {
-          setLive((l) => l ? { ...l, progress: { phase: evt.data.phase, pct: evt.data.pct, tps: evt.data.tps } } : l)
+          updateLive(convId, (l) => ({ ...l, progress: { phase: evt.data.phase, pct: evt.data.pct, tps: evt.data.tps } }))
         } else if (evt.event === 'reasoning') {
           // Thinking tokens count toward generation too — track rate + count.
-          const liveTps = pushGenToken()
-          setLive((l) => l ? { ...l, reasoning: l.reasoning + evt.data.delta, progress: null, liveGenTps: liveTps, genTokens: l.genTokens + 1 } : l)
+          const liveTps = pushGenToken(convId)
+          updateLive(convId, (l) => ({ ...l, reasoning: l.reasoning + evt.data.delta, progress: null, liveGenTps: liveTps, genTokens: l.genTokens + 1 }))
         } else if (evt.event === 'delta') {
-          const liveTps = pushGenToken()
-          setLive((l) => l ? { ...l, content: l.content + evt.data.delta, timeline: appendTextDelta(l.timeline, evt.data.delta), progress: null, liveGenTps: liveTps, genTokens: l.genTokens + 1 } : l)
+          const liveTps = pushGenToken(convId)
+          updateLive(convId, (l) => ({ ...l, content: l.content + evt.data.delta, timeline: appendTextDelta(l.timeline, evt.data.delta), progress: null, liveGenTps: liveTps, genTokens: l.genTokens + 1 }))
         } else if (evt.event === 'tool_call') {
           const tc = evt.data
-          setLive((l) => {
-            if (!l) return l
-            const call: LiveToolCall = { id: tc.id, name: tc.name, args: tc.args, status: tc.status, result: tc.result }
-            return { ...l, timeline: upsertToolCall(l.timeline, call) }
-          })
+          const call: LiveToolCall = { id: tc.id, name: tc.name, args: tc.args, status: tc.status, result: tc.result }
+          updateLive(convId, (l) => ({ ...l, timeline: upsertToolCall(l.timeline, call) }))
         } else if (evt.event === 'done') {
-          setLive(null)
+          clearLive(convId)
+          if (convId !== activeIdRef.current) setRecentlyCompletedIds((prev) => new Set(prev).add(convId))
           void qc.invalidateQueries({ queryKey: ['conversation', convId] })
           void qc.invalidateQueries({ queryKey: ['conversations'] })
           setTimeout(() => scrollToBottom(true), 80)
         } else if (evt.event === 'error') {
-          setLive(null)
+          clearLive(convId)
+          if (convId !== activeIdRef.current) setRecentlyCompletedIds((prev) => new Set(prev).add(convId))
           void qc.invalidateQueries({ queryKey: ['conversation', convId] })
           toast.error(evt.data.message)
         }
       }
       // Stream ended without an explicit done/error (e.g. network cut, silent close)
-      setLive(null)
+      clearLive(convId)
       void qc.invalidateQueries({ queryKey: ['conversation', convId] })
     } catch (e) {
-      setLive(null)
+      clearLive(convId)
       if ((e as Error)?.name !== 'AbortError') {
         toast.error(e instanceof ApiError ? e.message : 'Request failed.')
       }
       void qc.invalidateQueries({ queryKey: ['conversation', convId] })
+    } finally {
+      delete abortRefs.current[convId]
     }
   }
 
@@ -519,9 +575,11 @@ export function ChatScreen() {
     setTimeout(autoResize, 0)
     userScrolledUp.current = false
 
+    // Hoisted above the try so the catch block can target the right conversation's
+    // live/abort state even when it fails partway through creating a new conversation.
+    let convId = activeId
     try {
       // Create conversation on first message, baking in the selected agent + personalization.
-      let convId = activeId
       if (!convId) {
         const resolved = allAgents.find((a) => a.id === selectedPersonaId)
         let sp = buildSystemPrompt(selectedPersonaId, resolved?.systemPrompt ?? '', getPersonalization())
@@ -567,16 +625,16 @@ export function ChatScreen() {
       if (matchedSkill) toast.success(`Using skill: ${matchedSkill.name}`)
 
       const ac = new AbortController()
-      abortRef.current = ac
+      abortRefs.current[convId] = ac
 
       const textAttachmentNames = textAttachments.map((a) => a.file.name)
       await streamFrom(convId, sendMessage(convId, text, ac.signal, images, docContext, textAttachmentNames, !thinkingEnabled))
     } catch (e) {
-      setLive(null)
+      if (convId) clearLive(convId)
       if ((e as Error)?.name !== 'AbortError') {
         toast.error(e instanceof ApiError ? e.message : 'Request failed.')
       }
-      if (activeId) void qc.invalidateQueries({ queryKey: ['conversation', activeId] })
+      if (convId) void qc.invalidateQueries({ queryKey: ['conversation', convId] })
     }
   }
 
@@ -592,7 +650,7 @@ export function ChatScreen() {
         userScrolledUp.current = false
         if (isUserMessage && engineState === 'running' && model) {
           const ac = new AbortController()
-          abortRef.current = ac
+          abortRefs.current[activeId] = ac
           void streamFrom(activeId, continueConversation(activeId, ac.signal, !thinkingEnabled))
         }
       },
@@ -605,7 +663,7 @@ export function ChatScreen() {
     if (engineState !== 'running' || !model) { toast.error('Load a model first.'); return }
     await mut.regenerate.mutateAsync(activeId).catch(() => {})
     const ac = new AbortController()
-    abortRef.current = ac
+    abortRefs.current[activeId] = ac
     void streamFrom(activeId, continueConversation(activeId, ac.signal, !thinkingEnabled))
   }
 
@@ -629,6 +687,8 @@ export function ChatScreen() {
   // Read from the timeline — the actual live-updated source — not a separate tracked array.
   const pendingApprovalBlock = live?.timeline.find((b) => b.kind === 'tool' && b.call.status === 'awaiting_approval')
   const pendingApproval = pendingApprovalBlock?.kind === 'tool' ? pendingApprovalBlock.call : undefined
+
+  const generatingIds = useMemo(() => new Set(Object.keys(liveByConv)), [liveByConv])
 
   return (
     <div className="flex h-full overflow-hidden">
@@ -665,6 +725,8 @@ export function ChatScreen() {
           collapsed={isDesktop ? !sidebarOpen : false}
           onToggle={isDesktop ? () => setSidebarOpen((o) => !o) : () => setMobileSidebarOpen(false)}
           generating={!!live}
+          generatingIds={generatingIds}
+          recentlyCompletedIds={recentlyCompletedIds}
           onDeleted={handleActiveDeleted}
         />
       </div>

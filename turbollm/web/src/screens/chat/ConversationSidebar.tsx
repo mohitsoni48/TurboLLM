@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { ChevronDown, ChevronLeft, ChevronRight, Download, Folder as FolderIcon, FolderInput, FolderPlus, MessageSquarePlus, MoreHorizontal, Pencil, Search, Trash2 } from 'lucide-react'
+import { ChevronDown, ChevronLeft, ChevronRight, Circle, Download, Folder as FolderIcon, FolderInput, FolderPlus, Loader2, MessageSquarePlus, MoreHorizontal, Pencil, Search, Trash2 } from 'lucide-react'
 import type { Conversation, Folder } from '../../lib/chat-types'
 import { useConversationMutations, useConversations, useFolders } from '../../lib/chat-queries'
 import { Button } from '../../components/ui/button'
@@ -45,6 +45,8 @@ export function ConversationSidebar({
   collapsed,
   onToggle,
   generating,
+  generatingIds,
+  recentlyCompletedIds,
   onDeleted,
 }: {
   activeId: string | null
@@ -56,6 +58,12 @@ export function ConversationSidebar({
   onToggle?: () => void
   /** True when a generation is streaming in the active conversation. */
   generating?: boolean
+  /** Ids of every conversation currently streaming a generation (including ones the
+   *  user has navigated away from) — drives the spinning in-progress indicator. */
+  generatingIds?: Set<string>
+  /** Ids of conversations whose generation finished while the user was elsewhere —
+   *  drives the "new result" dot until the user visits that conversation. */
+  recentlyCompletedIds?: Set<string>
   /** Called after a conversation is deleted so the parent can clear its active
    *  reference when the deleted conversation was the open one. */
   onDeleted?: (id: string) => void
@@ -248,7 +256,17 @@ export function ConversationSidebar({
               <p className="px-3 py-4 text-[12px] text-faint">No results.</p>
             )}
             {convs.map((conv) => (
-              <ConvItem key={conv.id} conv={conv} active={conv.id === activeId} folders={folders} onSelect={onSelect} onDelete={onDelete} onMove={onMove} />
+              <ConvItem
+                key={conv.id}
+                conv={conv}
+                active={conv.id === activeId}
+                folders={folders}
+                onSelect={onSelect}
+                onDelete={onDelete}
+                onMove={onMove}
+                generating={generatingIds?.has(conv.id)}
+                recentlyCompleted={recentlyCompletedIds?.has(conv.id)}
+              />
             ))}
           </>
         ) : (
@@ -271,6 +289,8 @@ export function ConversationSidebar({
                 onSelect={onSelect}
                 onDelete={onDelete}
                 onMove={onMove}
+                generatingIds={generatingIds}
+                recentlyCompletedIds={recentlyCompletedIds}
               />
             ))}
 
@@ -283,7 +303,17 @@ export function ConversationSidebar({
               </div>
             )}
             {ungrouped.map((conv) => (
-              <ConvItem key={conv.id} conv={conv} active={conv.id === activeId} folders={folders} onSelect={onSelect} onDelete={onDelete} onMove={onMove} />
+              <ConvItem
+                key={conv.id}
+                conv={conv}
+                active={conv.id === activeId}
+                folders={folders}
+                onSelect={onSelect}
+                onDelete={onDelete}
+                onMove={onMove}
+                generating={generatingIds?.has(conv.id)}
+                recentlyCompleted={recentlyCompletedIds?.has(conv.id)}
+              />
             ))}
           </>
         )}
@@ -360,6 +390,8 @@ function FolderSection({
   onSelect,
   onDelete,
   onMove,
+  generatingIds,
+  recentlyCompletedIds,
 }: {
   folder: Folder
   items: Conversation[]
@@ -371,6 +403,8 @@ function FolderSection({
   onSelect: (id: string) => void
   onDelete: (e: React.MouseEvent, conv: Conversation) => void
   onMove: (conv: Conversation, folderId: string | null) => void
+  generatingIds?: Set<string>
+  recentlyCompletedIds?: Set<string>
 }) {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(folder.name)
@@ -442,7 +476,17 @@ function FolderSection({
             <p className="px-3 py-1.5 text-[11px] text-faint">Empty folder</p>
           ) : (
             items.map((conv) => (
-              <ConvItem key={conv.id} conv={conv} active={conv.id === activeId} folders={folders} onSelect={onSelect} onDelete={onDelete} onMove={onMove} />
+              <ConvItem
+                key={conv.id}
+                conv={conv}
+                active={conv.id === activeId}
+                folders={folders}
+                onSelect={onSelect}
+                onDelete={onDelete}
+                onMove={onMove}
+                generating={generatingIds?.has(conv.id)}
+                recentlyCompleted={recentlyCompletedIds?.has(conv.id)}
+              />
             ))
           )}
         </div>
@@ -458,6 +502,8 @@ function ConvItem({
   onSelect,
   onDelete,
   onMove,
+  generating,
+  recentlyCompleted,
 }: {
   conv: Conversation
   active: boolean
@@ -465,6 +511,10 @@ function ConvItem({
   onSelect: (id: string) => void
   onDelete: (e: React.MouseEvent, conv: Conversation) => void
   onMove: (conv: Conversation, folderId: string | null) => void
+  /** True while this conversation is streaming a generation (foreground or background). */
+  generating?: boolean
+  /** True when this conversation's generation finished while the user was elsewhere. */
+  recentlyCompleted?: boolean
 }) {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(conv.title)
@@ -497,13 +547,21 @@ function ConvItem({
           onClick={(e) => e.stopPropagation()}
         />
       ) : (
-        <span
-          className="truncate text-[13px] font-medium text-ink"
-          style={{ color: active ? 'var(--accent)' : undefined }}
-          onDoubleClick={(e) => { e.stopPropagation(); setEditing(true) }}
-        >
-          {conv.title}
-        </span>
+        <div className="flex min-w-0 items-center gap-1.5">
+          <span
+            className="min-w-0 truncate text-[13px] font-medium text-ink"
+            style={{ color: active ? 'var(--accent)' : undefined }}
+            onDoubleClick={(e) => { e.stopPropagation(); setEditing(true) }}
+          >
+            {conv.title}
+          </span>
+          {generating && (
+            <Loader2 size={12} className="shrink-0 animate-spin" style={{ color: 'var(--accent)' }} aria-label="Generating" />
+          )}
+          {!generating && recentlyCompleted && (
+            <Circle size={7} className="shrink-0 fill-current text-accent" aria-label="New reply" />
+          )}
+        </div>
       )}
       <span className="text-[11px] text-faint">{relTime(conv.updatedAt)}</span>
       {!editing && (
