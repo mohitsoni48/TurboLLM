@@ -46,7 +46,8 @@ export interface Conversation {
   /** GitHub #52: when true, past turns' reasoning is folded back into what's resent to
    *  the engine (wrapped in <think> tags, with chat_template_kwargs.preserve_thinking
    *  set so the template doesn't strip it back out) instead of only their final content.
-   *  Off by default. */
+   *  On by default for new conversations (createConversation); the underlying column
+   *  still defaults to 0 for already-migrated rows — see createConversation's comment. */
   preserveThinking: boolean
   createdAt: string
   updatedAt: string
@@ -567,11 +568,14 @@ export class ConversationStore {
     return (this.db.prepare(`SELECT * FROM conversations ORDER BY updated_at DESC LIMIT 200`).all() as unknown as ConvRow[]).map(rowToConv)
   }
 
-  createConversation(partial?: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'modelKey' | 'sampling' | 'expertMode' | 'toolPolicy' | 'kind' | 'folderId' | 'agentId' | 'skillIds' | 'allowedTools'>>): Conversation {
+  createConversation(partial?: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'modelKey' | 'sampling' | 'expertMode' | 'toolPolicy' | 'kind' | 'folderId' | 'agentId' | 'skillIds' | 'allowedTools' | 'preserveThinking'>>): Conversation {
     const now = new Date().toISOString()
     const id = randomUUID()
-    this.db.prepare(`INSERT INTO conversations (id,title,system_prompt,model_key,sampling,expert_mode,tool_policy,kind,folder_id,agent_id,skill_ids,allowed_tools,created_at,updated_at) VALUES ($id,$title,$sp,$mk,$samp,$expert,$tp,$kind,$fid,$aid,$sk,$at,$now,$now)`)
-      .run({ $id: id, $title: partial?.title ?? 'New chat', $sp: partial?.systemPrompt ?? '', $mk: partial?.modelKey ?? '', $samp: JSON.stringify(partial?.sampling ?? {}), $expert: partial?.expertMode ? 1 : 0, $tp: partial?.toolPolicy ?? null, $kind: partial?.kind ?? 'chat', $fid: partial?.folderId ?? null, $aid: partial?.agentId ?? null, $sk: partial?.skillIds ? JSON.stringify(partial.skillIds) : null, $at: partial?.allowedTools ? JSON.stringify(partial.allowedTools) : null, $now: now } as P)
+    // preserve_thinking's column default is baked in at ALTER TABLE time (v25) and can't
+    // be changed retroactively for already-migrated DBs — so "on by default for new chats"
+    // is enforced here instead, by always writing an explicit value.
+    this.db.prepare(`INSERT INTO conversations (id,title,system_prompt,model_key,sampling,expert_mode,tool_policy,kind,folder_id,agent_id,skill_ids,allowed_tools,preserve_thinking,created_at,updated_at) VALUES ($id,$title,$sp,$mk,$samp,$expert,$tp,$kind,$fid,$aid,$sk,$at,$pt,$now,$now)`)
+      .run({ $id: id, $title: partial?.title ?? 'New chat', $sp: partial?.systemPrompt ?? '', $mk: partial?.modelKey ?? '', $samp: JSON.stringify(partial?.sampling ?? {}), $expert: partial?.expertMode ? 1 : 0, $tp: partial?.toolPolicy ?? null, $kind: partial?.kind ?? 'chat', $fid: partial?.folderId ?? null, $aid: partial?.agentId ?? null, $sk: partial?.skillIds ? JSON.stringify(partial.skillIds) : null, $at: partial?.allowedTools ? JSON.stringify(partial.allowedTools) : null, $pt: (partial?.preserveThinking ?? true) ? 1 : 0, $now: now } as P)
     return this.getConversation(id)!
   }
 

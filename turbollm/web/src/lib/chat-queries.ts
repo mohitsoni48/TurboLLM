@@ -48,7 +48,7 @@ export function useConversationMutations() {
 
   return {
     create: useMutation({
-      mutationFn: (p?: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'modelKey' | 'toolPolicy' | 'skillIds' | 'allowedTools'>>) => createConversation(p),
+      mutationFn: (p?: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'modelKey' | 'toolPolicy' | 'skillIds' | 'allowedTools' | 'sampling' | 'preserveThinking'>>) => createConversation(p),
       onSuccess: invalidateList,
     }),
 update: useMutation({

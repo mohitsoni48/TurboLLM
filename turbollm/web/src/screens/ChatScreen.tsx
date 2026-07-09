@@ -1,10 +1,10 @@
-import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type RefObject } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type RefObject } from 'react'
 import { useParams, useSearchParams } from 'react-router-dom'
 import { ArrowDown, Brain, Copy, Download, PanelLeft, Paperclip, SendHorizontal, Share2, SlidersHorizontal, Square, UserRound, X } from 'lucide-react'
 import { continueConversation, fetchSysInfo, sendMessage } from '../lib/chat-api'
 import { extractPdfText } from '../lib/pdf-extract'
 import { useConversation, useConversationMutations } from '../lib/chat-queries'
-import { useBuiltinAgentOverrides, useChatAgents, useModelActions, useModels, useStatus } from '../lib/queries'
+import { useBuiltinAgentOverrides, useChatAgents, useEngines, useModelActions, useModelDetail, useModels, useStatus } from '../lib/queries'
 import type { ChatSseEvent, LiveToolCall, Message } from '../lib/chat-types'
 import { appendTextDelta, upsertToolCall, type LiveBlock } from '../lib/live-timeline'
 import { ApiError, downloadChatExport, getDebugSnapshot, getShareUrl, importChat } from '../lib/api'
@@ -19,7 +19,7 @@ import { ContextMeter } from './chat/ContextMeter'
 import { ConversationSidebar } from './chat/ConversationSidebar'
 import { ModelLoadMenu } from '../components/ModelLoadMenu'
 import { ModelDetailDialog } from './models/ModelDetailDialog'
-import { ConversationSettingsDialog } from './chat/ConversationSettingsDialog'
+import { ConversationSettingsDialog, type ConversationSettingsDraft } from './chat/ConversationSettingsDialog'
 import { useUiStore } from '../stores/ui'
 import { useIsDesktop } from '../lib/useIsDesktop'
 import {
@@ -59,6 +59,14 @@ export function ChatScreen() {
   const { data: status } = useStatus()
   const model = status?.model
   const engineState = status?.engine.state
+
+  // The loaded model's resolved sampling defaults, for the Thread settings sliders
+  // (LoadedModel itself carries no sampling — it lives on the per-engine LoadProfile,
+  // same source ModelDetailDialog reads/writes; see ADR discussion in that file).
+  const enginesQ = useEngines()
+  const activeEngine = enginesQ.data?.engines.find((e) => e.id === enginesQ.data?.activeEngineId)
+  const modelDetailQ = useModelDetail(model?.key ?? null, activeEngine?.id)
+  const modelSampling = modelDetailQ.data?.profile.sampling
 
   // Route params: /chat/:convId?readonly=1
   const { convId: routeConvId } = useParams<{ convId?: string }>()
@@ -133,6 +141,40 @@ export function ChatScreen() {
   // Once activeId exists, conv.skillIds is the source of truth instead.
   const [pendingSkillIds, setPendingSkillIds] = useState<string[]>([])
   const enabledSkillIds = conv?.skillIds ?? pendingSkillIds
+
+  // Same pattern, extended to the other Thread-settings fields (GitHub #52 follow-up):
+  // lets the settings dialog be used on a blank chat screen, before a conversation
+  // exists to PATCH. Folded into mut.create.mutateAsync() on first send, then reset.
+  const [pendingSystemPrompt, setPendingSystemPrompt] = useState('')
+  const [pendingSampling, setPendingSampling] = useState<Record<string, number>>({})
+  const [pendingPreserveThinking, setPendingPreserveThinking] = useState(true)
+  const draftOnChange = useCallback((patch: Partial<{
+    systemPrompt: string
+    sampling: Record<string, number>
+    skillIds: string[]
+    preserveThinking: boolean
+  }>) => {
+    if (patch.systemPrompt !== undefined) setPendingSystemPrompt(patch.systemPrompt)
+    if (patch.sampling !== undefined) setPendingSampling(patch.sampling)
+    if (patch.skillIds !== undefined) setPendingSkillIds(patch.skillIds)
+    if (patch.preserveThinking !== undefined) setPendingPreserveThinking(patch.preserveThinking)
+  }, [])
+  // draft is undefined until a model is loaded — the settings dialog uses its presence
+  // to enable/disable the trigger on a not-yet-created conversation. Memoized so its
+  // identity is stable across unrelated re-renders (composer typing, etc.) — the dialog
+  // resyncs its local state whenever this object changes identity.
+  const hasConv = !!conv
+  const modelLoaded = !!model
+  const draft: ConversationSettingsDraft | undefined = useMemo(() => {
+    if (hasConv || !modelLoaded) return undefined
+    return {
+      systemPrompt: pendingSystemPrompt,
+      sampling: pendingSampling,
+      skillIds: pendingSkillIds,
+      preserveThinking: pendingPreserveThinking,
+      onChange: draftOnChange,
+    }
+  }, [hasConv, modelLoaded, pendingSystemPrompt, pendingSampling, pendingSkillIds, pendingPreserveThinking, draftOnChange])
 
   // '/' picker: typing '/' (optionally followed by letters, at the START of an
   // otherwise-empty composer) shows a filtered skill list. Selecting one enables
@@ -346,7 +388,11 @@ export function ChatScreen() {
   }
 
   const handleSelect = (id: string) => {
-    if (live) { abortRef.current?.abort(); setLive(null) }
+    // Switching conversations must not kill an in-flight generation — only an explicit
+    // Stop/Eject/delete should. The backend keeps generating and saves the result when
+    // done; we just stop showing its live bubble here (setLive(null)) since it belongs
+    // to the conversation being left, not the one we're switching to.
+    if (live) setLive(null)
     setActiveId(id)
     setEditingId(null)
     setSelectedPersonaId(getConvAgentId(id))
@@ -494,17 +540,25 @@ export function ChatScreen() {
           ...(resolved?.skillIds ?? []),
           ...(matchedSkill ? [matchedSkill.id] : []),
         ]))
+        // A system prompt set via Thread settings before the first message is an
+        // explicit override — it wins over the agent's own default system prompt.
+        const finalSystemPrompt = pendingSystemPrompt.trim() || sp
         const newConv = await mut.create.mutateAsync({
           modelKey: model.key,
-          systemPrompt: sp || undefined,
+          systemPrompt: finalSystemPrompt || undefined,
           toolPolicy: selectedPersonaId === 'research' ? 'force_web_search' : undefined,
           skillIds: initialSkillIds.length ? initialSkillIds : undefined,
           allowedTools: resolved?.tools?.length ? resolved.tools : undefined,
+          sampling: Object.keys(pendingSampling).length ? pendingSampling : undefined,
+          preserveThinking: pendingPreserveThinking,
         })
         convId = newConv.id
         setConvAgentId(convId, selectedPersonaId)
         setActiveId(convId)
         setPendingSkillIds([])
+        setPendingSystemPrompt('')
+        setPendingSampling({})
+        setPendingPreserveThinking(true)
       } else if (matchedSkill && !enabledSkillIds.includes(matchedSkill.id)) {
         // Existing conversation missing this skill — enable it before sending so the
         // system-prompt injection picks it up on this very turn, not the next one.
@@ -661,7 +715,7 @@ export function ChatScreen() {
               <SlidersHorizontal size={15} />
             </Button>
           )}
-          <ConversationSettingsDialog conv={conv} />
+          <ConversationSettingsDialog conv={conv} draft={draft} modelSampling={modelSampling} />
           <Button
             size="icon"
             variant="ghost"

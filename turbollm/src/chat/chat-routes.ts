@@ -78,7 +78,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   })
 
   app.post('/api/v1/conversations', async (c) => {
-    const b = await body<{ title?: string; systemPrompt?: string; modelKey?: string; toolPolicy?: string; skillIds?: string[]; allowedTools?: string[] }>(c)
+    const b = await body<{ title?: string; systemPrompt?: string; modelKey?: string; toolPolicy?: string; skillIds?: string[]; allowedTools?: string[]; sampling?: Record<string, number>; preserveThinking?: boolean }>(c)
     // Only keep ids that exist in the shared skill library; silently drop unknown ones.
     const validIds = new Set(new SkillStore(d.store.dir()).list().map((s) => s.id))
     const skillIds = Array.isArray(b.skillIds) ? b.skillIds.filter((sid) => validIds.has(sid)) : undefined
@@ -86,7 +86,9 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // validated against the live tool catalog — an MCP server disconnecting later
     // shouldn't retroactively corrupt the conversation's saved intent.
     const allowedTools = Array.isArray(b.allowedTools) ? b.allowedTools.filter((t) => typeof t === 'string') : undefined
-    const conv = db.createConversation({ title: b.title, systemPrompt: b.systemPrompt, modelKey: b.modelKey, toolPolicy: b.toolPolicy, skillIds, allowedTools })
+    const sampling = (b.sampling && typeof b.sampling === 'object') ? b.sampling : undefined
+    const preserveThinking = typeof b.preserveThinking === 'boolean' ? b.preserveThinking : undefined
+    const conv = db.createConversation({ title: b.title, systemPrompt: b.systemPrompt, modelKey: b.modelKey, toolPolicy: b.toolPolicy, skillIds, allowedTools, sampling, preserveThinking })
     return c.json(conv, 201)
   })
 

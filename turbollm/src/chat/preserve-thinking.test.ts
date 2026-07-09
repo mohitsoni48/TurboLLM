@@ -14,11 +14,11 @@ function tempStore(): { store: ConversationStore; dir: string } {
   return { store: new ConversationStore(dir), dir }
 }
 
-test('a fresh conversation defaults to preserveThinking: false', () => {
+test('a fresh conversation defaults to preserveThinking: true', () => {
   const { store, dir } = tempStore()
   try {
     const conv = store.createConversation()
-    assert.equal(conv.preserveThinking, false)
+    assert.equal(conv.preserveThinking, true)
   } finally {
     store.close()
     rmSync(dir, { recursive: true, force: true })
