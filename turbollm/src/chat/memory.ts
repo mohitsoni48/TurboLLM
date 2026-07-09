@@ -26,18 +26,28 @@ ${userText.slice(0, 2000)}
 """`
 }
 
+// Filler words common to first-person fact statements ("I live in X", "my name is Y") —
+// stripped before the Jaccard comparison below, since two DIFFERENT facts of the same
+// shape (e.g. "I live in Paris" vs "I live in Berlin") share every word except the one
+// that actually matters, which otherwise pushes their overlap over the dedup threshold.
+const FACT_STOPWORDS = new Set([
+  'i', 'a', 'an', 'the', 'is', 'am', 'are', 'was', 'were', 'in', 'on', 'at',
+  'as', 'my', 'of', 'to', 'for', 'and', 'or', 'with',
+])
+
 /** Cheap, pure string-similarity dedup — no second model call. Duplicate if either
- *  string contains the other, or word-overlap (Jaccard) is high. Exported for unit tests. */
+ *  string contains the other, or word-overlap (Jaccard) over CONTENT words is high. */
 export function isDuplicateFact(existing: string[], candidate: string): boolean {
   const norm = (s: string) => s.toLowerCase().trim().replace(/[.!?]+$/, '')
+  const contentWords = (s: string) => new Set(s.split(/\s+/).filter((w) => w && !FACT_STOPWORDS.has(w)))
   const c = norm(candidate)
   if (!c) return true
   for (const e of existing) {
     const ne = norm(e)
     if (!ne) continue
     if (ne.includes(c) || c.includes(ne)) return true
-    const ws1 = new Set(ne.split(/\s+/))
-    const ws2 = new Set(c.split(/\s+/))
+    const ws1 = contentWords(ne)
+    const ws2 = contentWords(c)
     const intersection = [...ws1].filter((w) => ws2.has(w)).length
     const union = new Set([...ws1, ...ws2]).size
     if (union > 0 && intersection / union >= 0.6) return true

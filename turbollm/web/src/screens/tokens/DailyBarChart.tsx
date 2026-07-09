@@ -25,7 +25,10 @@ function niceMax(n: number): number {
 
 function formatAxisTick(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n % 1_000_000 === 0 ? 0 : 1)}M`
-  if (n >= 1_000) return `${(n / 1_000).toFixed(0)}K`
+  // A bare toFixed(0) here collapsed adjacent ticks to the same label (e.g. axisMax=2000
+  // gives ticks [2000, 1500, 1000, ...] and both 2000 and 1500 round to "2K") — one decimal
+  // for non-round-thousand values disambiguates them, same as the M branch above.
+  if (n >= 1_000) return `${(n / 1_000).toFixed(n % 1_000 === 0 ? 0 : 1)}K`
   return String(Math.round(n))
 }
 

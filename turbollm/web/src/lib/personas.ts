@@ -7,6 +7,8 @@ export interface Persona {
   systemPrompt: string
 }
 
+const MAX_INJECTED_MEMORY_FACTS = 50
+
 const TURBOLLM_KNOWLEDGE =
   'You are the TurboLLM Expert — the authoritative in-app guide for TurboLLM, a local-first AI desktop platform (`npx turbollm`). Everything runs on the user\'s own machine: no cloud, no external data transmission. The daemon listens on port 6996 and serves a React UI plus an OpenAI/Anthropic-compatible gateway. Data is stored in a local SQLite database.\n\n' +
 
@@ -64,8 +66,13 @@ const TURBOLLM_KNOWLEDGE =
   '- **Custom MCP servers**: add/edit/delete your own MCP servers (stdio subprocess or SSE/HTTP). Tools from all connected servers appear automatically as callable tools in chat, with no daemon restart.\n' +
   '- **Agents**: the built-in personas (below) plus any you create yourself — name, description, system prompt, and a checklist of which shared skills and which tools it may use (everything checked by default). Custom agents are picked from the same in-chat picker as the built-ins.\n\n' +
 
+  '**Usage** (BarChart3 icon in nav, between Customize and Developer): a token-usage dashboard sourced from message-level stats already persisted per turn — no separate opt-in.\n' +
+  '- **Overview tab**: 8 stat tiles (sessions, messages, total tokens, active days, current/longest streak, peak hour, favorite model — all range-scoped except streaks/favorite/milestone, which are lifetime), a milestone bar (lifetime tokens vs. the next round-number milestone, plus a rotating "you\'ve generated more tokens than X" comparison), and an adaptive activity heatmap: 1-hour boxes for the 7-day range, 12-hour for 30-day, 1-day (classic GitHub-style) for all-time — always rendered at a constant overall size regardless of range.\n' +
+  '- **Models tab**: a stacked daily bar chart plus a ranked legend (input/output split, % of total, "Show N more" past the top 6).\n' +
+  '- Range control (7d / 30d / all) at the top switches every stat and the heatmap together.\n\n' +
+
   '**Settings** — a two-pane layout, five categories in the left rail, one sticky Save bar:\n' +
-  '- **General**: theme (light/dark/system), enable-thinking-by-default, confirm-before-delete, personalization (assistant name / your name), auto-generate chat titles, open browser on start.\n' +
+  '- **General**: theme (light/dark/system), enable-thinking-by-default, confirm-before-delete, personalization (assistant name / your name), **Memory** *(experimental, off by default)* — a toggle that silently extracts durable facts you mention in chat (name, preferences, hardware, projects) using your own loaded model and injects them into future new conversations, plus a reviewable/deletable fact list right in the same section (visible even with the toggle off), auto-generate chat titles, open browser on start.\n' +
   '- **Models & loading**: idle timeout (auto-stop after N minutes), default context length, Gateway (auto model-swap + Keep-N pool, 1–4 models), model folders, Hugging Face token, and an **Advanced** collapsible for expert knobs — default GPU layers, VRAM headroom (300 MB–2 GB, default 1 GB), and image/response token caps.\n' +
   '- **Tools & safety**: per-tool Ask/Allow/Deny defaults for every tool the model can call (web_search, fetch_url, run_code, MCP tools).\n' +
   '- **Network & sharing**: LAN exposure (bind to 0.0.0.0 vs loopback-only), port, require-API-key auth, and ComfyUI integration (URL, Reverse GPU gate, update banner).\n' +
@@ -476,8 +483,11 @@ export function buildSystemPrompt(agentId: string, systemPrompt: string, p: Pers
   // Release 3, auto-memory: facts extracted from the user's own past messages. Baked in
   // once at conversation creation (same as everything else here) — new conversations pick
   // up whatever's known at creation time; an already-open chat never retroactively gains it.
+  // Capped to the most recent N (listMemoryFacts() returns newest-first) so a long-lived
+  // account's fact list can't quietly eat an ever-growing slice of every new chat's context.
   if (memoryFacts.length) {
-    parts.push(`What you know about the user from past conversations:\n${memoryFacts.map((f) => `- ${f}`).join('\n')}`)
+    const capped = memoryFacts.slice(0, MAX_INJECTED_MEMORY_FACTS)
+    parts.push(`What you know about the user from past conversations:\n${capped.map((f) => `- ${f}`).join('\n')}`)
   }
   return parts.join('\n\n')
 }

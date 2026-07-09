@@ -225,6 +225,13 @@ the detail:
 - **Tool-call approval gate** — every tool call asks for your approval by default before it runs,
   with **Deny**, **Allow**, **Allow for this chat**, or **Always Allow** on an inline bar above the
   composer. Set per-tool defaults globally from Settings → Tools & safety.
+- **Usage dashboard** — a GitHub-style activity heatmap of your local generation history (adaptive
+  1h/12h/24h boxes for the 7-day/30-day/all-time views), streaks, peak hour, a per-model
+  breakdown, and a lifetime token-milestone tracker.
+- **Auto-memory** *(experimental, off by default)* — silently extracts durable facts you mention
+  in chat (name, preferences, hardware) using your own loaded model, and carries them into future
+  new conversations. Nothing leaves your device; the full fact list is reviewable and deletable
+  from Settings → Memory, and turning the toggle off stops new chats from seeing it immediately.
 
 </details>
 

@@ -65,7 +65,11 @@ function pickFunFact(lifetimeTotalTokens: number): string | null {
   if (!band) return null
   const pick = band.refs[Math.floor(Math.random() * band.refs.length)]
   const multiplier = Math.round(lifetimeTotalTokens / pick.tokens)
-  if (multiplier < 1) return null
+  // A total near a band's own lower boundary can still land a weak "~1x" against that
+  // band's smallest reference, depending on which ref the random pick landed on — bump the
+  // floor to 2x so the fact is either meaningfully large or (consistently) absent, never a
+  // coin-flip between "~1x" and no fact at all for two nearby totals in the same band.
+  if (multiplier < 2) return null
   return `You've used ~${multiplier.toLocaleString()}x more tokens than ${pick.name}.`
 }
 
