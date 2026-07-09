@@ -43,11 +43,11 @@ _Nothing yet._
   stops new facts from being injected into new chats.
 
 ### Discord
-- New **Usage** tab: a GitHub-style heatmap of your local generation activity, streaks, and a fun
-  milestone tracker ("you've generated more tokens than the complete works of Shakespeare").
-- New **experimental** auto-memory option (off by default): TurboLLM can quietly remember things
-  you mention — like your name or hardware — and bring them into new chats automatically. Fully
-  reviewable and deletable from Settings, and it never leaves your machine.
+- Added a usage dashboard to show your tokens — input and output, per model, with a daily
+  activity heatmap and streaks.
+- Added an experimental auto-memory option (off by default): TurboLLM can remember things you
+  mention, like your name or hardware, and bring them into new chats. Reviewable and deletable
+  from Settings, and it never leaves your machine.
 
 ## [1.7.5] - 2026-07-09
 
