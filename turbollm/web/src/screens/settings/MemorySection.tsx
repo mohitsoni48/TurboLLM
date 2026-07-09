@@ -4,6 +4,7 @@ import { useSettings } from '../../lib/queries'
 import { useMemoryFacts, useMemoryFactMutations } from '../../lib/chat-queries'
 import { ApiError } from '../../lib/api'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../../components/ui/collapsible'
+import { Badge } from '../../components/ui/badge'
 import { toast } from '../../components/ui/sonner'
 import { cn } from '../../lib/utils'
 
@@ -46,6 +47,7 @@ export function MemorySection() {
         <ChevronRight size={14} className={cn('shrink-0 text-faint transition-transform', open && 'rotate-90')} />
         <Brain size={15} className="text-accent" />
         <h2 className="text-[13px] font-semibold uppercase tracking-wide text-faint">Memory</h2>
+        <Badge variant="accent" className="normal-case tracking-normal">Experimental</Badge>
       </CollapsibleTrigger>
       <CollapsibleContent>
         <label className="mt-3 flex cursor-pointer items-center justify-between border-b border-border py-2 pb-3">
