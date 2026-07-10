@@ -582,7 +582,10 @@ export function MessageBubble({
   // "phantom" content area that still shows Copy/Edit/Regenerate/Delete on hover (the
   // streaming-side ADR-174 .trim() guard only ever covered the reasoning block above, never
   // this completed-message path).
-  const isEmptyFinish = !message.content?.trim() && !message.reasoning?.trim() && completedToolCalls.length === 0
+  // researchMeta excluded (pre-release review, Finding E): a research-only turn can finish
+  // with empty content/reasoning but a real sources panel + confidence badge below — showing
+  // "This message is empty." above real, populated content would be self-contradictory.
+  const isEmptyFinish = !message.content?.trim() && !message.reasoning?.trim() && completedToolCalls.length === 0 && !message.researchMeta
   const hasError = isEmptyFinish
   const rm: ResearchMeta | undefined = message.researchMeta
   const verdicts = rm?.refereeVerdicts ?? []

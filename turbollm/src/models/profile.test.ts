@@ -63,3 +63,12 @@ test('profileToArgs: --n-cpu-moe never emitted for a non-MoE model even without 
   const args = profileToArgs(p, denseModel, caps)
   assert.equal(args.includes('--n-cpu-moe'), false)
 })
+
+test('profileToArgs: nglFit is ignored for MoE models — -ngl still emitted (pre-release review, Finding D)', () => {
+  // The UI hides "Auto-fit GPU layers" and force-shows the slider for MoE models (nCpuMoeFit
+  // is the real MoE offload control there); a stray nglFit:true on a MoE profile must not
+  // silently turn that still-visible slider into a no-op.
+  const p = { ...deriveDefault(moeModel, sys), ngl: 20, nglFit: true }
+  const args = profileToArgs(p, moeModel, caps)
+  assert.deepEqual(args.slice(args.indexOf('-ngl'), args.indexOf('-ngl') + 2), ['-ngl', '20'])
+})

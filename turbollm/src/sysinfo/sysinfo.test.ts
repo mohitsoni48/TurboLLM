@@ -68,6 +68,15 @@ test('isIntegratedGpuName: discrete Intel Arc cards (model number) are NOT integ
   assert.equal(isIntegratedGpuName('Intel(R) Arc(TM) B580'), false)
 })
 
+test('isIntegratedGpuName: discrete Intel Arc Pro workstation cards (2-digit model) are NOT integrated', () => {
+  // Pre-release review regression: the original 3-digit-only pattern misclassified these
+  // as integrated, over-reporting their VRAM (the dangerous direction — a load could pass
+  // the fit check on a system-RAM estimate then OOM on the card's real, smaller VRAM).
+  assert.equal(isIntegratedGpuName('Intel(R) Arc(TM) Pro A60 Graphics'), false)
+  assert.equal(isIntegratedGpuName('Intel(R) Arc(TM) Pro A50'), false)
+  assert.equal(isIntegratedGpuName('Intel(R) Arc(TM) Pro B60'), false)
+})
+
 test('isIntegratedGpuName: newest generic Intel branding (no UHD/Iris/Arc qualifier) is integrated', () => {
   // Real name reported by WMI on a Core Ultra 7 265K (Arrow Lake-S) dev box.
   assert.equal(isIntegratedGpuName('Intel(R) Graphics'), true)

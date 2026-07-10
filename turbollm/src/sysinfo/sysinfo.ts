@@ -65,8 +65,13 @@ export function isIntegratedGpuName(name: string): boolean {
   // Classic Intel integrated branding — never used for a discrete card.
   if (/iris|uhd graphics|hd graphics/.test(n)) return true
   // Intel's newer "Arc Graphics" iGPU branding (Meteor Lake/Lunar Lake+) carries no
-  // model number; every discrete Arc card does (A380/A750/A770/B570/B580/...).
-  if (/\barc\b/.test(n) && !/\b[ab]\d{3}\b/.test(n)) return true
+  // model number; every discrete Arc card does — consumer 3-digit (A380/A750/A770/
+  // B570/B580) AND the 2-digit "Arc Pro" workstation line (A40/A50/A60, B50/B60).
+  // Pre-release review caught the original 3-digit-only pattern misclassifying Arc
+  // Pro cards as integrated, over-reporting their VRAM (dangerous direction — could
+  // green-light a load that then OOMs); \d{2,4} plus an optional "pro" also covers
+  // any future model-number length without narrowing further.
+  if (/\barc\b/.test(n) && !/\b(?:pro\s+)?[ab]\d{2,4}\b/.test(n)) return true
   // AMD APU iGPU branding ("Radeon(TM) Graphics", generic) vs. a discrete card, which
   // always carries an RX/PRO/Instinct/Vega-N model name.
   if (/radeon.*graphics/.test(n) && !/\b(rx|pro|instinct|vega\s*\d|firepro)\b/.test(n)) return true
