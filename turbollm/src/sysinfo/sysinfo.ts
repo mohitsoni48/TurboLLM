@@ -53,6 +53,36 @@ export function classifyVendor(name: string): GpuVendor {
   return 'unknown'
 }
 
+/** True for GPU names that are almost certainly an integrated GPU sharing system RAM
+ *  rather than having independent dedicated VRAM. Used to correct dedicated-VRAM
+ *  readings that are actively wrong for iGPUs (WMI's AdapterRAM on Windows, the missing
+ *  sysfs attribute on Linux — see enumWindowsGpus/linuxVramMb below) without
+ *  misclassifying a discrete card that happens to share a vendor (e.g. Intel Arc dGPUs,
+ *  which do report real dedicated VRAM). Name-pattern heuristic, not yet live-verified
+ *  against real iGPU hardware — see docs/TODO.md Release 4. */
+export function isIntegratedGpuName(name: string): boolean {
+  const n = name.toLowerCase()
+  // Classic Intel integrated branding — never used for a discrete card.
+  if (/iris|uhd graphics|hd graphics/.test(n)) return true
+  // Intel's newer "Arc Graphics" iGPU branding (Meteor Lake/Lunar Lake+) carries no
+  // model number; every discrete Arc card does — consumer 3-digit (A380/A750/A770/
+  // B570/B580) AND the 2-digit "Arc Pro" workstation line (A40/A50/A60, B50/B60).
+  // Pre-release review caught the original 3-digit-only pattern misclassifying Arc
+  // Pro cards as integrated, over-reporting their VRAM (dangerous direction — could
+  // green-light a load that then OOMs); \d{2,4} plus an optional "pro" also covers
+  // any future model-number length without narrowing further.
+  if (/\barc\b/.test(n) && !/\b(?:pro\s+)?[ab]\d{2,4}\b/.test(n)) return true
+  // AMD APU iGPU branding ("Radeon(TM) Graphics", generic) vs. a discrete card, which
+  // always carries an RX/PRO/Instinct/Vega-N model name.
+  if (/radeon.*graphics/.test(n) && !/\b(rx|pro|instinct|vega\s*\d|firepro)\b/.test(n)) return true
+  // Newest Intel Core Ultra generic branding — plain "Intel(R) Graphics" with no
+  // qualifier at all (confirmed on a real Core Ultra 7 265K / Arrow Lake-S box).
+  // Intel's only current discrete lineup is Arc-branded, so any other Intel name
+  // containing "graphics" with no Arc qualifier is integrated.
+  if (/intel/.test(n) && /graphics/.test(n) && !/\barc\b/.test(n)) return true
+  return false
+}
+
 function detectGpus(): GpuInfo[] {
   // 1) NVIDIA (Windows/Linux): nvidia-smi gives exact name + VRAM.
   try {
@@ -131,7 +161,17 @@ function enumWindowsGpus(): GpuInfo[] {
       const [name, ram] = line.split('|')
       const nm = (name ?? '').trim()
       const bytes = parseInt((ram ?? '').trim(), 10) || 0
-      return { name: nm, vramMb: bytes > 0 ? Math.round(bytes / 1e6) : 0, vendor: classifyVendor(nm) }
+      // AdapterRAM is a weak hint at best (see comment above) and is actively wrong
+      // for integrated GPUs — it reports a tiny fixed aperture (or 0), not the real
+      // chunk of system RAM the OS lets an iGPU use, which was making quant
+      // auto-selection always pick the smallest file and the fit check always show
+      // red. Apply the same shared-memory heuristic used for Apple Silicon below,
+      // scaled down (50% vs. 65%) to match Windows' more conservative default
+      // "shared GPU memory" cap.
+      const vramMb = isIntegratedGpuName(nm)
+        ? Math.round((os.totalmem() / 1e6) * 0.5)
+        : bytes > 0 ? Math.round(bytes / 1e6) : 0
+      return { name: nm, vramMb, vendor: classifyVendor(nm) }
     })
     .filter((g) => g.name && g.vendor !== 'unknown')
 }
@@ -193,7 +233,19 @@ function enumLinuxGpus(): GpuInfo[] {
     .map((line) => {
       const vendor = classifyVendor(line)
       const slot = line.trim().split(/\s+/)[0] ?? ''
-      return { name: line.replace(/"/g, '').trim().slice(0, 80), vramMb: linuxVramMb(slot), vendor }
+      const name = line.replace(/"/g, '').trim().slice(0, 80)
+      const sysfsVramMb = linuxVramMb(slot)
+      // sysfs's mem_info_vram_total only exists for amdgpu-driven cards (dedicated
+      // VRAM, or an APU's BIOS carveout) — Intel iGPUs / nouveau read 0 here, which
+      // means "no dedicated VRAM", not "no usable memory". Reporting that literal 0
+      // was making quant auto-selection always pick the smallest file and the fit
+      // check always show red, on hardware where the real constraint is different.
+      const vramMb = sysfsVramMb > 0
+        ? sysfsVramMb
+        : isIntegratedGpuName(name)
+          ? Math.round((os.totalmem() / 1e6) * 0.5)
+          : 0
+      return { name, vramMb, vendor }
     })
     .filter((g) => g.vendor !== 'unknown')
 }

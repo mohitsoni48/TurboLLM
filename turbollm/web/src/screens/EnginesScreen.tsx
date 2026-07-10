@@ -73,6 +73,7 @@ import {
 } from '../components/ui/alert-dialog'
 import { AddEngineDialog } from './engines/AddEngineDialog'
 import { BuildGuideDialog } from './engines/BuildGuideDialog'
+import { CustomBuildDialog } from './engines/CustomBuildDialog'
 import { EngineStatusHeader } from './engines/EngineStatusHeader'
 import { EngineLogPanel } from './engines/EngineLogPanel'
 import { LlamaCppBackendRows } from './engines/ManagedEngines'
@@ -864,6 +865,7 @@ function EngineGallery({
           >
             Request an engine <ExternalLink size={11} />
           </a>
+          <CustomBuildDialog />
           <AddEngineDialog />
         </div>
       </div>

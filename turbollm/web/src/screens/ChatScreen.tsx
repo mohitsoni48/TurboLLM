@@ -5,7 +5,7 @@ import { continueConversation, fetchSysInfo, listMemoryFacts, sendMessage } from
 import { extractPdfText } from '../lib/pdf-extract'
 import { useConversation, useConversationMutations } from '../lib/chat-queries'
 import { useBuiltinAgentOverrides, useChatAgents, useEngines, useModelActions, useModelDetail, useModels, useSettings, useStatus } from '../lib/queries'
-import type { ChatSseEvent, LiveToolCall, Message } from '../lib/chat-types'
+import type { ChatSseEvent, Conversation, LiveToolCall, Message } from '../lib/chat-types'
 import { appendTextDelta, upsertToolCall, type LiveBlock } from '../lib/live-timeline'
 import { ApiError, downloadChatExport, getDebugSnapshot, getShareUrl, importChat } from '../lib/api'
 import { Button } from '../components/ui/button'
@@ -524,7 +524,27 @@ export function ChatScreen() {
           const call: LiveToolCall = { id: tc.id, name: tc.name, args: tc.args, status: tc.status, result: tc.result }
           updateLive(convId, (l) => ({ ...l, timeline: upsertToolCall(l.timeline, call) }))
         } else if (evt.event === 'done') {
-          clearLive(convId)
+          // Patch the final content into the cache BEFORE clearing live state (pre-release
+          // review, Finding A): clearLive un-hides the placeholder synchronously, but the real
+          // content only arrives via the async invalidateQueries refetch below — without this
+          // patch, the now-visible placeholder would briefly render with its stale empty
+          // content (a "This message is empty." flash) in that window. Reading the live
+          // snapshot via setLiveByConv's own functional updater guarantees it isn't stale, even
+          // though React may batch prior delta/reasoning updates that haven't rendered yet.
+          setLiveByConv((prev) => {
+            const l = prev[convId]
+            if (l) {
+              qc.setQueryData<Conversation>(['conversation', convId], (old) =>
+                old
+                  ? { ...old, messages: (old.messages ?? []).map((m) => (m.id === l.assistantId ? { ...m, content: l.content, reasoning: l.reasoning } : m)) }
+                  : old,
+              )
+            }
+            if (!(convId in prev)) return prev
+            const next = { ...prev }
+            delete next[convId]
+            return next
+          })
           if (convId !== activeIdRef.current) setRecentlyCompletedIds((prev) => new Set(prev).add(convId))
           void qc.invalidateQueries({ queryKey: ['conversation', convId] })
           void qc.invalidateQueries({ queryKey: ['conversations'] })
@@ -922,21 +942,28 @@ export function ChatScreen() {
               </div>
             )}
 
-            {/* Messages */}
-            {messages.map((m, i) => (
-              <MessageBubble
-                key={m.id}
-                message={m}
-                convId={readonly ? undefined : activeId ?? undefined}
-                isLast={i === messages.length - 1 && !live}
-                onEdit={readonly ? undefined : (msg) => setEditingId(msg.id)}
-                onDelete={readonly ? undefined : handleDelete}
-                onRegenerate={readonly ? undefined : handleRegenerate}
-                editingId={editingId}
-                onEditSave={(content) => handleEditSave(m.id, content)}
-                onEditCancel={() => setEditingId(null)}
-              />
-            ))}
+            {/* Messages — skip the in-flight assistant placeholder while it's still live
+                below. The backend inserts that row the moment generation starts
+                (chat-routes.ts: `db.addMessage(convId, 'assistant', '', ...)`, before any
+                token has streamed), and the 'meta' event's optimistic refetch can pull it
+                into this list before the StreamingBubble below has caught up — a real empty
+                message bubble momentarily rendering above the answer that's still typing in. */}
+            {messages
+              .filter((m) => m.id !== live?.assistantId)
+              .map((m, i, arr) => (
+                <MessageBubble
+                  key={m.id}
+                  message={m}
+                  convId={readonly ? undefined : activeId ?? undefined}
+                  isLast={i === arr.length - 1 && !live}
+                  onEdit={readonly ? undefined : (msg) => setEditingId(msg.id)}
+                  onDelete={readonly ? undefined : handleDelete}
+                  onRegenerate={readonly ? undefined : handleRegenerate}
+                  editingId={editingId}
+                  onEditSave={(content) => handleEditSave(m.id, content)}
+                  onEditCancel={() => setEditingId(null)}
+                />
+              ))}
 
             {/* Streaming bubble */}
             {live && (

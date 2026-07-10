@@ -46,6 +46,7 @@ const TURBOLLM_KNOWLEDGE =
   '- **Engine gallery**: cards for every engine with a **hardware-fit mark** (green Compatible / amber "runs after a build" / red incompatible + reason), a real pros/cons list, and speed/VRAM/OS attributes.\n' +
   '- **Manage GPU builds** (llama.cpp card): per-backend variants — CUDA, ROCm, CPU, Vulkan, SYCL. Install, update, or switch the active build here.\n' +
   '- **Add your own engine** (compact strip at the bottom): guided folder scan that probes a binary and registers it as a custom engine. Filesystem browsing here is local-only (only the machine running TurboLLM can browse it) but reaches the whole local filesystem, including other drives on Windows.\n' +
+  '- **Add via git repo** (same strip): paste any llama.cpp-compatible fork\'s git URL (+ optional branch, blank = the repo\'s own default) and build it in-app with one click — no manual clone/point-at-folder step needed, reuses the same build pipeline as the catalog\'s "Build it for me".\n' +
   '- **In-app build**: clone → cmake → compile (CUDA), on Windows or Linux (incl. WSL2); auto-downloads CUDA toolkit if absent on Windows (~490 MB from NVIDIA redist — on Linux, install CUDA via your distro/NVIDIA installer first); live phase log + success screen.\n' +
   '- **Engine updates**: honest check vs GitHub releases/latest; rollback-safe (probe new build before swap, old build kept until success).\n' +
   '- Per-engine auto-update policy: Off / Notify / Auto (default Notify).\n\n' +
@@ -117,13 +118,13 @@ const TURBOLLM_KNOWLEDGE =
 
   '## Load Profile Parameters\n\n' +
   '**Core**:\n' +
-  '- `ngl` (GPU layers): 0 = CPU only; blockCount = all layers on GPU. Higher = faster inference but more VRAM. Shown as a slider with the real layer count as max.\n' +
+  '- `ngl` (GPU layers): 0 = CPU only; blockCount = all layers on GPU. Higher = faster inference but more VRAM. Shown as a slider with the real layer count as max. An **Auto-fit GPU layers** toggle (off by default, hidden for MoE models) hands this decision to llama.cpp\'s own memory-fitting logic at load time instead — Auto-tune honors it too, skipping its own search when on.\n' +
   '- `ctx` (context length): max token window. VRAM scales linearly with ctx (KV cache). Reduce if VRAM is tight; increase for long conversations.\n' +
   '- `threads`: CPU threads for computation. Defaults to core count.\n' +
   '- `batchSize` (`--batch-size`, default 2048): logical batch size — how many prompt tokens are submitted per decode step during prefill. Larger = faster prefill on long prompts, more VRAM at load. Leave blank for the engine default.\n' +
   '- `uBatchSize` (`--ubatch-size`, default 512): physical micro-batch size — the chunk actually computed at once. Must be ≤ batchSize. Tune down if a large batch OOMs at load. Both live in the main llama.cpp settings (not Advanced); blank = engine default.\n\n' +
   '**MoE models only**:\n' +
-  '- `nCpuMoe` (CPU MoE expert count): number of MoE router experts kept on CPU. Reducing it frees GPU VRAM (moves more routing to GPU). Auto-tune searches this for MoE models.\n\n' +
+  '- `nCpuMoe` (CPU MoE expert count): number of MoE router experts kept on CPU. Reducing it frees GPU VRAM (moves more routing to GPU). Auto-tune searches this for MoE models. An **Auto-fit MoE CPU offload** toggle (off by default) hands this to llama.cpp\'s own fit logic instead — a finer-grained per-tensor strategy than the fixed count — and Auto-tune skips its own search when it\'s on.\n\n' +
   '**KV Cache**:\n' +
   '- `kvTypeK` / `kvTypeV`: KV cache quantization. `f16` = best quality, most VRAM. `q8_0` = good quality, ~2× smaller. `q4_0` / `q4_1` = smaller, lower quality. `turbo4` = TurboQuant-specific, high-speed specialized quant. Auto-tune picks automatically.\n' +
   '- `flashAttn`: Flash Attention 2 — reduces KV memory footprint especially at large ctx. Strongly recommended when ctx > 32k.\n\n' +

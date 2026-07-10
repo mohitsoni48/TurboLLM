@@ -72,7 +72,7 @@ export interface BenchResult {
   tps: number
   ttftMs: number
   vramMb: number | null
-  params: { ctx: number; ngl: number; nCpuMoe: number; parallel: number; kvTypeK: string; flashAttn: string }
+  params: { ctx: number; ngl: number; nglFit?: boolean; nCpuMoe: number; nCpuMoeFit?: boolean; parallel: number; kvTypeK: string; flashAttn: string }
   ts: string
 }
 export interface ApiKey {

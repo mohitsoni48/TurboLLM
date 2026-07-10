@@ -81,7 +81,26 @@ export function defaultVllm(): VllmProfile {
 export interface LoadProfile {
   ctx: number
   ngl: number
+  /** When true, omit `-ngl` entirely and let llama.cpp's own `-fit` memory-fitting logic (always
+   *  active unless overridden) decide how many layers land on GPU vs CPU at load time, instead of
+   *  the fixed `ngl` value. `ngl` is kept as the last manual value so switching back restores it.
+   *  Absent / false on pre-feature profiles → unchanged existing behavior (always emit -ngl).
+   *  Ignored for MoE models (see {@link profileToArgs}) — `nCpuMoeFit` is the real MoE offload
+   *  control there. **Assumption, not yet capability-probed (pre-release review, Finding C):**
+   *  this relies on the active engine's llama.cpp build actually implementing `-fit` when `-ngl`
+   *  is omitted — a build old enough to predate it would default to CPU-only (`n_gpu_layers=0`)
+   *  instead, silently tanking performance with no error. Opt-in and off by default, so the blast
+   *  radius is small, but worth a capability probe (mirroring how `caps.kvTypes` gates KV-quant
+   *  options) if this turns out to bite a user on an older engine build. */
+  nglFit?: boolean
   nCpuMoe: number
+  /** Same idea as {@link nglFit}, for `--n-cpu-moe` (MoE expert CPU-offload count). llama.cpp's
+   *  `-fit` handles MoE offload with a more granular per-tensor fractional strategy than the
+   *  simple N-experts-on-CPU count this app exposes (live-verified: it can fit MORE onto the GPU
+   *  than a coarse fixed count would), so omitting the flag can genuinely do better than a manual
+   *  number. Absent / false → unchanged existing behavior. Same engine-version assumption as
+   *  {@link nglFit} applies here too. */
+  nCpuMoeFit?: boolean
   parallel: number
   kvUnified: boolean
   kvTypeK: string
@@ -333,7 +352,12 @@ export function resolveProfile(
 export function profileToArgs(p: LoadProfile, m: ModelEntry, caps: Capabilities, cores = 0): string[] {
   const has = (flag: string) => caps.flags.length === 0 || caps.flags.includes(flag)
   const a: string[] = ['-c', String(p.ctx)]
-  if (p.ngl > 0) a.push('-ngl', String(p.ngl))
+  // nglFit: omit -ngl entirely so llama.cpp's own -fit logic picks the offload (see LoadProfile).
+  // Ignored for MoE models (pre-release review, Finding D) — the UI hides the "Auto-fit GPU
+  // layers" toggle and force-shows the plain slider for MoE (nCpuMoeFit is the real MoE
+  // offload control), so honoring a stray nglFit:true here would silently make that slider a
+  // no-op with no UI path to notice or undo it.
+  if ((!p.nglFit || m.moe) && p.ngl > 0) a.push('-ngl', String(p.ngl))
   // Multi-GPU split (ADR-054). Defaults are no-ops: 'layer' + empty tensorSplit +
   // mainGpu -1 emit nothing, preserving llama.cpp's built-in even split across GPUs.
   const g = p.gpu
@@ -349,7 +373,8 @@ export function profileToArgs(p: LoadProfile, m: ModelEntry, caps: Capabilities,
   // quadrupling KV memory (seen in logs).
   if (has('--parallel')) a.push('--parallel', String(p.parallel))
   if (p.parallel > 1 && p.kvUnified && has('--kv-unified')) a.push('--kv-unified')
-  if (m.moe && p.nCpuMoe > 0 && has('--n-cpu-moe')) a.push('--n-cpu-moe', String(p.nCpuMoe))
+  // nCpuMoeFit: omit --n-cpu-moe so -fit's finer-grained MoE offload strategy decides instead.
+  if (m.moe && !p.nCpuMoeFit && p.nCpuMoe > 0 && has('--n-cpu-moe')) a.push('--n-cpu-moe', String(p.nCpuMoe))
   // Emit a non-default KV cache type only when the engine supports the VALUE, not just
   // the --cache-type-k FLAG: e.g. TurboQuant's turbo2/3/4 must NOT leak into a standard
   // llama.cpp / llamafile engine (which has the flag but rejects the value → launch fails).

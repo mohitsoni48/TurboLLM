@@ -75,7 +75,7 @@ export type EngineStats = {
  *  measured run, else the failure mode — the sweep records it and continues. */
 export type BenchCandidate = {
   label: string
-  params: { ctx: number; ngl: number; nCpuMoe: number; parallel: number; kvTypeK: string; flashAttn: string }
+  params: { ctx: number; ngl: number; nglFit?: boolean; nCpuMoe: number; nCpuMoeFit?: boolean; parallel: number; kvTypeK: string; flashAttn: string }
   outcome: 'ok' | 'timeout' | 'crash' | 'oom'
   tps: number | null
   ttftMs: number | null
@@ -549,7 +549,11 @@ export type Sampling = {
 export type LoadProfile = {
   ctx: number
   ngl: number
+  /** Auto-fit: when true, omit -ngl and let llama.cpp's own -fit logic pick the GPU/CPU split. */
+  nglFit?: boolean
   nCpuMoe: number
+  /** Auto-fit for MoE CPU offload: when true, omit --n-cpu-moe and let -fit decide. */
+  nCpuMoeFit?: boolean
   parallel: number
   kvUnified: boolean
   kvTypeK: string

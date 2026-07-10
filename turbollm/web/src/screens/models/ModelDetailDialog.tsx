@@ -234,7 +234,16 @@ export function ModelDetailDialog({
           <div className="py-10 text-center text-[13px] text-muted">Loading…</div>
         ) : (
           <div className="flex flex-col gap-4">
-            {fit && <VramBar estMb={fit.estMb} totalMb={fit.totalVramMb} verdict={fit.verdict} />}
+            {fit && (
+              (draft.nglFit || draft.nCpuMoeFit) ? (
+                <div className="rounded-md border border-border bg-panel-2 px-3 py-2 text-[12px] text-muted">
+                  Auto-fit is on — llama.cpp will choose how much of the model fits on GPU at load
+                  time, so no estimate is shown here.
+                </div>
+              ) : (
+                <VramBar estMb={fit.estMb} totalMb={fit.totalVramMb} verdict={fit.verdict} />
+              )
+            )}
 
             {isLlamaCpp && detail.gpu && (
               <AutoTune
@@ -294,10 +303,37 @@ export function ModelDetailDialog({
             <Section>
               <Slider label="Context length" hint="Tokens of history the model can use." value={draft.ctx} min={512} max={Math.max(512, detail.nativeCtx || 8192)} step={512} onChange={(v) => set('ctx', v)} fmt={(v) => v.toLocaleString()} />
               {detail.gpu && (
-                <Slider label="GPU layers" hint={detail.blockCount > 0 ? `${detail.blockCount} total layers.` : 'All layers on GPU = max performance.'} value={draft.ngl} min={0} max={detail.blockCount > 0 ? detail.blockCount : 99} step={1} onChange={(v) => set('ngl', v)} fmt={(v) => (v >= (detail.blockCount > 0 ? detail.blockCount : 99) ? 'All' : String(v))} />
+                <>
+                  {/* MoE models' GPU/CPU tradeoff is governed by nCpuMoe below, not ngl —
+                      auto-tune's moeSearch never touches ngl for them either — so "Auto-fit GPU
+                      layers" has nothing meaningful to control here; hidden for MoE models. The
+                      slider still shows unconditionally for MoE (guarding against nglFit somehow
+                      being true with no UI path to turn it back off). */}
+                  {!detail.moe && (
+                    <Toggle
+                      label="Auto-fit GPU layers"
+                      hint="Let llama.cpp decide how many layers fit on GPU at load time, instead of a fixed number. Adapts automatically if free VRAM changes; off by default."
+                      value={draft.nglFit ?? false}
+                      onChange={(v) => set('nglFit', v)}
+                    />
+                  )}
+                  {(!draft.nglFit || detail.moe) && (
+                    <Slider label="GPU layers" hint={detail.blockCount > 0 ? `${detail.blockCount} total layers.` : 'All layers on GPU = max performance.'} value={draft.ngl} min={0} max={detail.blockCount > 0 ? detail.blockCount : 99} step={1} onChange={(v) => set('ngl', v)} fmt={(v) => (v >= (detail.blockCount > 0 ? detail.blockCount : 99) ? 'All' : String(v))} />
+                  )}
+                </>
               )}
               {detail.moe && detail.blockCount > 0 && (
-                <Slider label="MoE experts on CPU" hint="Higher = less VRAM, slower. Lower = faster if it fits." value={draft.nCpuMoe} min={0} max={detail.blockCount} step={1} onChange={(v) => set('nCpuMoe', v)} />
+                <>
+                  <Toggle
+                    label="Auto-fit MoE CPU offload"
+                    hint="Let llama.cpp decide the GPU/CPU split for MoE experts at load time — a finer-grained strategy than a fixed count. Off by default."
+                    value={draft.nCpuMoeFit ?? false}
+                    onChange={(v) => set('nCpuMoeFit', v)}
+                  />
+                  {!draft.nCpuMoeFit && (
+                    <Slider label="MoE experts on CPU" hint="Higher = less VRAM, slower. Lower = faster if it fits." value={draft.nCpuMoe} min={0} max={detail.blockCount} step={1} onChange={(v) => set('nCpuMoe', v)} />
+                  )}
+                </>
               )}
               <Row label="Context overflow" hint="What to do when the context window fills up.">
                 <Segmented
@@ -637,7 +673,7 @@ function AutoTuneResultDialog({
   onCancel,
 }: {
   result?: {
-    params: { ctx: number; ngl: number; nCpuMoe: number; parallel: number; kvTypeK: string; flashAttn: string }
+    params: { ctx: number; ngl: number; nglFit?: boolean; nCpuMoe: number; nCpuMoeFit?: boolean; parallel: number; kvTypeK: string; flashAttn: string }
     tps: number
     ttftMs?: number
     vramMb: number | null
@@ -675,8 +711,10 @@ function AutoTuneResultDialog({
               {result && (
                 <div className="rounded-md border border-border bg-panel-2 px-3 py-1.5">
                   <ConfigSection title="Runtime" />
-                  <ConfigRow label="GPU layers" value={result.params.ngl} />
-                  {result.params.nCpuMoe > 0 && <ConfigRow label="MoE experts on CPU" value={result.params.nCpuMoe} />}
+                  <ConfigRow label="GPU layers" value={result.params.nglFit ? 'Auto-fit' : result.params.ngl} />
+                  {(result.params.nCpuMoeFit || result.params.nCpuMoe > 0) && (
+                    <ConfigRow label="MoE experts on CPU" value={result.params.nCpuMoeFit ? 'Auto-fit' : result.params.nCpuMoe} />
+                  )}
                   <ConfigRow label="Context length" value={`${result.params.ctx.toLocaleString()} tok`} />
                   <ConfigRow label="KV cache type" value={result.params.kvTypeK} />
                   <ConfigRow label="Flash attention" value={result.params.flashAttn} />

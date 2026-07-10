@@ -571,13 +571,22 @@ export function MessageBubble({
   }
 
   // Assistant
-  const hasError = message.stats.aborted && !message.content
   const completedToolCalls: CardCall[] = (message.toolCalls ?? []).map((tc: ToolCallRecord) => ({
     id: tc.id,
     name: tc.name,
     status: tc.error ? 'error' : 'done',
     result: tc.error ?? tc.result,
   }))
+  // A message with no content, no reasoning, and no tool calls has nothing to show — render
+  // the same fallback card an aborted-empty finish already used, instead of leaving a blank
+  // "phantom" content area that still shows Copy/Edit/Regenerate/Delete on hover (the
+  // streaming-side ADR-174 .trim() guard only ever covered the reasoning block above, never
+  // this completed-message path).
+  // researchMeta excluded (pre-release review, Finding E): a research-only turn can finish
+  // with empty content/reasoning but a real sources panel + confidence badge below — showing
+  // "This message is empty." above real, populated content would be self-contradictory.
+  const isEmptyFinish = !message.content?.trim() && !message.reasoning?.trim() && completedToolCalls.length === 0 && !message.researchMeta
+  const hasError = isEmptyFinish
   const rm: ResearchMeta | undefined = message.researchMeta
   const verdicts = rm?.refereeVerdicts ?? []
   return (
@@ -608,7 +617,7 @@ export function MessageBubble({
         </div>
       ) : hasError ? (
         <div className="rounded-lg border px-4 py-3 text-[14px]" style={{ borderColor: 'var(--err)', color: 'var(--err)', background: 'color-mix(in srgb, var(--err) 8%, transparent)' }}>
-          Generation failed or was stopped.
+          {message.stats.aborted ? 'Generation failed or was stopped.' : 'This message is empty.'}
           {isLast && onRegenerate && <button type="button" className="ml-3 underline" onClick={onRegenerate}>Regenerate</button>}
         </div>
       ) : (
