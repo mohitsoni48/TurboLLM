@@ -10,6 +10,7 @@ import { activateVariant, getMessageVariants } from '../../lib/chat-api'
 import { Button } from '../../components/ui/button'
 import { CopyButton } from '../../components/ui/copy-button'
 import { ArtifactCard, isArtifactLang } from '../../components/ArtifactCard'
+import { friendlyName } from '../../lib/tool-explain'
 
 // ── Thinking block ────────────────────────────────────────────────────────────
 
@@ -165,11 +166,6 @@ const Markdown = memo(function Markdown({ children, streaming }: { children: str
 // ── Tool call cards ───────────────────────────────────────────────────────────
 
 type CardCall = { id: string; name: string; status: 'pending' | 'done' | 'error' | 'awaiting_approval'; result?: string }
-
-export function friendlyName(name: string): string {
-  if (name.startsWith('mcp__')) return name.replace(/^mcp__[^_]+(?:_[^_]+)*__/, '')
-  return name.replace(/_/g, ' ')
-}
 
 function ToolCallCard({ call }: { call: CardCall }) {
   const [expanded, setExpanded] = useState(false)

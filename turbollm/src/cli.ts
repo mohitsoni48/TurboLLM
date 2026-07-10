@@ -558,7 +558,7 @@ void (async () => {
     if (entry.format !== 'gguf') {
       opts = {
         engine: active,
-        model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: entry.nativeCtx, vision: false },
+        model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: entry.nativeCtx, vision: entry.vision },
         modelPath: entry.path,
         extraArgs: [],
       }

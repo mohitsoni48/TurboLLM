@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { engineAcceptsFormat, engineModelAlias, ENGINE_MODEL_ALIAS } from './compat'
+import { engineAcceptsFormat, engineModelAlias, engineRejectsAudioModel, ENGINE_MODEL_ALIAS } from './compat'
 import { vllmServerCommand, vllmServeBlocker } from './vllm'
 import { mlxServerCommand, mlxSamplingArgs } from './mlx'
 
@@ -18,6 +18,18 @@ test('engineAcceptsFormat: koboldcpp + llamafile are GGUF engines (Phase 4)', ()
   assert.equal(engineAcceptsFormat('koboldcpp', 'mlx'), false)
   assert.equal(engineAcceptsFormat('llamafile', 'gguf'), true)
   assert.equal(engineAcceptsFormat('llamafile', 'mlx'), false)
+})
+
+// Regression: Rapid-MLX's bundled mlx_vlm double-transposes gemma4's audio-tower conv
+// weights (confirmed live, reproduced even on the latest available mlx-vlm 0.6.4) — not
+// a missing file, not fixable by re-downloading. Only Rapid-MLX is excluded; plain MLX
+// never attempts VLM/audio loading and is unaffected; vision-only models (no audio
+// tower) are not excluded either.
+test('engineRejectsAudioModel: true only for rapid-mlx', () => {
+  assert.equal(engineRejectsAudioModel('rapid-mlx'), true)
+  assert.equal(engineRejectsAudioModel('mlx'), false)
+  assert.equal(engineRejectsAudioModel('vllm'), false)
+  assert.equal(engineRejectsAudioModel('llama-server'), false)
 })
 
 test('engineModelAlias: fixed alias for mlx/vllm, null (keep caller value) for llama.cpp', () => {

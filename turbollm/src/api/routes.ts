@@ -33,6 +33,7 @@ import {
 } from '../engines/update'
 import type { BackendId } from '../engines/download'
 import { ensureMlxEnv, mlxSamplingArgs } from '../engines/mlx'
+import { ensureRapidMlxEnv } from '../engines/rapid-mlx'
 import { ensureVllmEnv } from '../engines/vllm'
 import { ensureSglangEnv } from '../engines/sglang'
 import { ensureKoboldcpp, koboldcppBinPath, koboldcppDir, koboldcppProfileToArgs } from '../engines/koboldcpp'
@@ -43,7 +44,7 @@ import { runBuild, buildDirName, sameRepo, sourceBuildBinary, sourceBuildDirOf }
 import { provisionCuda } from '../engines/cuda-provision'
 import { detectHardware } from '../engines/hardware'
 import { recommendEngines } from '../engines/recommend'
-import { engineAcceptsFormat } from '../engines/compat'
+import { engineAcceptsFormat, engineRejectsAudioModel } from '../engines/compat'
 import { ScannerError, type ModelEntry } from '../models/scanner'
 import { estimateVram, type LoadProfile, profileToArgs, resolveProfile, vllmProfileToArgs } from '../models/profile'
 import { getSysInfo, primaryVendor } from '../sysinfo/sysinfo'
@@ -387,6 +388,30 @@ export function registerApi(app: Hono, d: Deps): void {
     return c.json({ accepted: true, engine: 'mlx' }, 202)
   })
 
+  // Provision the Rapid-MLX engine (macOS-only): uv → venv → rapid-mlx, then register as a
+  // kind='rapid-mlx' engine. 202 + progress via /status. ?update=1 upgrades to the latest
+  // release (passes --upgrade to uv pip install). Mirrors the MLX endpoint above.
+  app.post('/api/v1/engines/rapid-mlx', (c) => {
+    if (process.platform !== 'darwin') {
+      return err(c, 409, 'unsupported_platform', 'Rapid-MLX is only available on macOS (Apple Silicon).')
+    }
+    { const busy = engineWorkBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
+    const root = join(d.store.dir(), 'engines')
+    const upgrade = c.req.query('update') === '1'
+    void (async () => {
+      try {
+        d.provision.start('rapid-mlx')
+        const rt = await ensureRapidMlxEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), upgrade)
+        const eng = d.registry.addRapidMlx(`Rapid-MLX (${rt.version})`, rt.bin, rt.version)
+        d.registry.activate(eng.id)
+        d.provision.done()
+      } catch (e) {
+        d.provision.fail(`Could not install Rapid-MLX: ${e instanceof Error ? e.message : e}`)
+      }
+    })()
+    return c.json({ accepted: true, engine: 'rapid-mlx' }, 202)
+  })
+
   // Engine catalog (ADR-044): the hardcoded, browsable list of installable
   // engines for this platform. Per-entry `installed` is disk-based (files exist);
   // `enabled` is registry-based (a registered engine entry exists for this kind).
@@ -398,8 +423,8 @@ export function registerApi(app: Hono, d: Deps): void {
       let enabled: boolean | undefined
       if (e.provision === 'pip') {
         // pip engines: installed = venv python exists on disk; enabled = registered in registry.
-        const venvSubdir = e.id === 'mlx' ? 'mlx' : 'vllm'
-        const pyPath = join(enginesRoot, venvSubdir, 'venv',
+        // Every pip catalog id names its own venv subdir 1:1 (mlx/rapid-mlx/vllm/sglang).
+        const pyPath = join(enginesRoot, e.id, 'venv',
           process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python')
         installed = existsSync(pyPath)
         enabled = regEngines.some((x) => x.kind === e.kind)
@@ -460,24 +485,24 @@ export function registerApi(app: Hono, d: Deps): void {
     return c.json({ hardware: hw, recommendation: rec })
   })
 
-  // Compile-from-source prereq check (ADR-089). Read-only: detects the Windows/Linux + CUDA
-  // build toolchain (git / cmake / CUDA / MSVC-or-gcc) so the build guide can show what's
-  // missing + install links. The configured toolchain dirs (ADR-100) are prepended to PATH
-  // so a conda-env / custom-path CUDA Toolkit is found. On macOS it reports `supported:false`
-  // (guided build is parked there).
+  // Compile-from-source prereq check (ADR-089, macOS/Metal port). Read-only: detects the
+  // Windows/Linux + CUDA (or macOS + Metal) build toolchain (git / cmake / CUDA-or-compiler)
+  // so the build guide can show what's missing + install links. The configured toolchain
+  // dirs (ADR-100) are prepended to PATH so a conda-env / custom-path CUDA Toolkit is found.
   app.get('/api/v1/build/prereqs', async (c) =>
     c.json(await checkBuildPrereqs(d.store.snapshot().build.toolchainDirs)),
   )
 
-  // 1-click compile-from-source (ADR-100, Windows/Linux + CUDA). Clones the repo, runs cmake,
-  // compiles llama-server, then registers + activates the built binary. Long-running; 202
-  // immediately + live phase/log via GET /status engineBuild. Gated to the local host —
-  // it executes a compiler from a user-supplied repo, so a LAN client must not trigger it.
+  // 1-click compile-from-source (ADR-100, Windows/Linux + CUDA, or macOS + Metal). Clones the
+  // repo, runs cmake, compiles llama-server, then registers + activates the built binary.
+  // Long-running; 202 immediately + live phase/log via GET /status engineBuild. Gated to the
+  // local host — it executes a compiler from a user-supplied repo, so a LAN client must not
+  // trigger it.
   app.post('/api/v1/build/run', async (c) => {
     if (!isLocalRequest(c, d))
       return err(c, 403, 'forbidden', 'Building an engine is only available on the machine running TurboLLM.')
-    if (process.platform !== 'win32' && process.platform !== 'linux')
-      return err(c, 409, 'unsupported_platform', 'In-app build is currently Windows or Linux (with CUDA) only.')
+    if (process.platform !== 'win32' && process.platform !== 'linux' && process.platform !== 'darwin')
+      return err(c, 409, 'unsupported_platform', 'In-app build is currently Windows, Linux, or macOS only.')
     const b = await body<{ repoUrl?: string; branch?: string; name?: string }>(c)
     const repoUrl = (b.repoUrl ?? '').trim()
     if (!/^https?:\/\//i.test(repoUrl))
@@ -1036,6 +1061,14 @@ export function registerApi(app: Hono, d: Deps): void {
       if (!engineAcceptsFormat(active.kind, entry.format)) {
         return err(c, 409, 'engine_model_mismatch', formatMismatchMessage(active.kind, entry.format))
       }
+      if (entry.audio && engineRejectsAudioModel(active.kind)) {
+        return err(
+          c,
+          409,
+          'engine_model_mismatch',
+          'Rapid-MLX cannot load models with an audio tower (a confirmed upstream mlx-vlm bug) — switch to the MLX engine instead.',
+        )
+      }
       let opts: StartOpts
       if (entry.format !== 'gguf') {
         // MLX / vLLM: the model dir is the launch target (no llama.cpp -ngl/ctx knobs).
@@ -1047,11 +1080,11 @@ export function registerApi(app: Hono, d: Deps): void {
           active.kind === 'mlx'
             ? mlxSamplingArgs(savedProfile?.sampling)
             : active.kind === 'vllm'
-              ? vllmProfileToArgs(resolveProfile(entry, sys, savedProfile, b.profileOverrides, cfg.modelDefaults))
+              ? vllmProfileToArgs(resolveProfile(entry, sys, savedProfile, b.profileOverrides, cfg.modelDefaults), entry.nativeCtx)
               : []
         opts = {
           engine: active,
-          model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: entry.nativeCtx, vision: false },
+          model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: entry.nativeCtx, vision: entry.vision },
           modelPath: entry.path,
           extraArgs,
           tensorParallelSize: savedProfile?.gpu?.tensorParallelSize,
@@ -1956,7 +1989,9 @@ function overlayModel(e: ModelEntry, d: Deps, lastTpsMap?: Map<string, number>) 
   // list filter so e.g. only GGUFs show under a llama.cpp engine, safetensors under
   // MLX/vLLM. No active engine → everything is shown (compatible: true).
   const active = d.registry.active()
-  const compatibleWithActiveEngine = active ? engineAcceptsFormat(active.kind, e.format) : true
+  const compatibleWithActiveEngine = active
+    ? engineAcceptsFormat(active.kind, e.format) && !(e.audio && engineRejectsAudioModel(active.kind))
+    : true
   // Source HF repo: confirmed from download provenance, else inferred from the
   // on-disk layout (LM Studio / huggingface-cli store models as
   // <root>/<owner>/<repo>/<file>). Lets the library open the model's HF page —
@@ -1976,6 +2011,8 @@ function overlayModel(e: ModelEntry, d: Deps, lastTpsMap?: Map<string, number>) 
 function formatMismatchMessage(engineKind: string, format: 'gguf' | 'mlx'): string {
   if (engineKind === 'mlx')
     return 'The active engine is MLX — pick a safetensors model, or switch to a llama.cpp engine for GGUF.'
+  if (engineKind === 'rapid-mlx')
+    return 'The active engine is Rapid-MLX — pick a safetensors model, or switch to a llama.cpp engine for GGUF.'
   if (engineKind === 'vllm')
     return 'The active engine is vLLM — pick a safetensors / HF model, or switch to a llama.cpp engine for GGUF.'
   // llama.cpp / fork active, model is a safetensors dir.
@@ -2167,6 +2204,7 @@ function regErr(c: Context, e: unknown) {
  * Mapping:
  *   - pip kind='mlx'        → engines/mlx/venv (and its uv sibling stays; we only
  *                             wipe the venv that holds the package)
+ *   - pip kind='rapid-mlx'  → engines/rapid-mlx/venv
  *   - pip kind='vllm'       → engines/vllm/venv
  *   - TurboQuant fork       → engines/turboquant (detected by its binPath pattern)
  *   - llama.cpp backends    → engines/llama.cpp-{tag}-{id} (via DELETE /backends/:id)
@@ -2182,6 +2220,11 @@ function engineInstallDir(eng: Engine, enginesRoot: string): string | null {
   // pip: mlx venv
   if (eng.kind === 'mlx') {
     const d = join(enginesRoot, 'mlx', 'venv')
+    return inside(d) ? d : null
+  }
+  // pip: rapid-mlx venv
+  if (eng.kind === 'rapid-mlx') {
+    const d = join(enginesRoot, 'rapid-mlx', 'venv')
     return inside(d) ? d : null
   }
   // pip: vllm venv

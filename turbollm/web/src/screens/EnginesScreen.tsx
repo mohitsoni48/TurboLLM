@@ -106,6 +106,7 @@ function catalogIdFor(e: Engine): string {
  *  backend from the registered name for official builds; falls back to the kind. */
 function buildContextFor(e: Engine, backends: EngineBackends | undefined): string {
   if (e.kind === 'mlx') return 'MLX · Apple Metal'
+  if (e.kind === 'rapid-mlx') return 'Rapid-MLX · Apple Metal'
   if (e.kind === 'vllm') return 'vLLM'
   if (e.kind === 'koboldcpp') return 'KoboldCpp'
   if (e.kind === 'llamafile') return 'llamafile'
@@ -664,11 +665,13 @@ function EngineGallery({
     provisioning ||
     install.vllm.isPending ||
     install.mlx.isPending ||
+    install.rapidMlx.isPending ||
     install.turboquant.isPending ||
     install.koboldcpp.isPending ||
     install.llamafile.isPending ||
     install.updateVllm.isPending ||
     install.updateMlx.isPending ||
+    install.updateRapidMlx.isPending ||
     install.updateTurboquant.isPending ||
     install.updateKoboldcpp.isPending ||
     install.updateLlamafile.isPending ||
@@ -679,6 +682,7 @@ function EngineGallery({
   const installFor = (e: CatalogEngine) => {
     if (e.installEndpoint === '/api/v1/engines/vllm') return install.vllm
     if (e.installEndpoint === '/api/v1/engines/mlx') return install.mlx
+    if (e.installEndpoint === '/api/v1/engines/rapid-mlx') return install.rapidMlx
     if (e.installEndpoint === '/api/v1/engines/turboquant') return install.turboquant
     if (e.installEndpoint === '/api/v1/engines/koboldcpp') return install.koboldcpp
     if (e.installEndpoint === '/api/v1/engines/llamafile') return install.llamafile
@@ -687,6 +691,7 @@ function EngineGallery({
   const updateFor = (e: CatalogEngine) => {
     if (e.installEndpoint === '/api/v1/engines/vllm') return install.updateVllm
     if (e.installEndpoint === '/api/v1/engines/mlx') return install.updateMlx
+    if (e.installEndpoint === '/api/v1/engines/rapid-mlx') return install.updateRapidMlx
     if (e.installEndpoint === '/api/v1/engines/turboquant') return install.updateTurboquant
     if (e.installEndpoint === '/api/v1/engines/koboldcpp') return install.updateKoboldcpp
     if (e.installEndpoint === '/api/v1/engines/llamafile') return install.updateLlamafile

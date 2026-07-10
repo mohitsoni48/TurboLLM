@@ -15,14 +15,32 @@ export type ModelFormat = 'gguf' | 'mlx'
  *   - llamafile (kind 'llamafile') → GGUF (it bundles llama.cpp's server)
  *   - KoboldCpp (kind 'koboldcpp') → GGUF (it wraps llama.cpp)
  *   - MLX (kind 'mlx') → MLX-format safetensors directories
+ *   - Rapid-MLX (kind 'rapid-mlx') → the same MLX-format directories as the MLX engine
  *   - vLLM (kind 'vllm') → HF safetensors directories — the same on-disk shape the
  *     scanner tags 'mlx' (config.json + *.safetensors + tokenizer)
  */
 export function engineAcceptsFormat(engineKind: string, format: ModelFormat): boolean {
   if (engineKind === 'mlx') return format === 'mlx'
+  if (engineKind === 'rapid-mlx') return format === 'mlx'
   if (engineKind === 'vllm') return format === 'mlx'
   // llama-server / forks, llamafile, koboldcpp — all GGUF.
   return format === 'gguf'
+}
+
+/**
+ * True when `engineKind` is known to fail loading a model with an audio tower/encoder
+ * (`ModelEntry.audio`). Rapid-MLX bundles `mlx_vlm` for VLM support; its gemma4
+ * `sanitize()` unconditionally transposes `subsample_conv_projection.conv.weight`
+ * assuming a raw PyTorch-layout checkpoint, but MLX-native checkpoints already store
+ * it in MLX layout — the load double-transposes and crashes with a shape-mismatch
+ * `ValueError`. Confirmed live, reproduced even after upgrading to the latest
+ * available `mlx-vlm` (0.6.4) — not a missing file, not fixable by re-downloading.
+ * The plain MLX engine (`mlx-lm`) never attempts VLM/audio loading at all, so it's
+ * unaffected — only Rapid-MLX is excluded here. Vision-only models (no audio_config)
+ * are NOT excluded; only the confirmed-broken audio path is.
+ */
+export function engineRejectsAudioModel(engineKind: string): boolean {
+  return engineKind === 'rapid-mlx'
 }
 
 /**
@@ -35,11 +53,16 @@ export function engineAcceptsFormat(engineKind: string, format: ModelFormat): bo
  * and 404 (vLLM) or fail to load (mlx-lm) if it doesn't match a known name — they would
  * never match TurboLLM's internal model key (a display name with spaces). We launch both
  * under the fixed alias `default_model` (mlx-lm's built-in alias for its `--model`; vLLM
- * via `--served-model-name`), so requests must send exactly that. Returns null when the
- * engine ignores the field and the original value should be kept.
+ * via `--served-model-name`), so requests must send exactly that. Rapid-MLX has no
+ * `--served-model-name`-style launch flag — its own convention is the fixed literal
+ * "default", always accepted for whatever model is currently serving regardless of what
+ * was passed on the command line. Returns null when the engine ignores the field and the
+ * original value should be kept.
  */
 export const ENGINE_MODEL_ALIAS = 'default_model'
+export const RAPID_MLX_MODEL_ALIAS = 'default'
 export function engineModelAlias(engineKind: string): string | null {
+  if (engineKind === 'rapid-mlx') return RAPID_MLX_MODEL_ALIAS
   return engineKind === 'mlx' || engineKind === 'vllm' || engineKind === 'sglang' ? ENGINE_MODEL_ALIAS : null
 }
 

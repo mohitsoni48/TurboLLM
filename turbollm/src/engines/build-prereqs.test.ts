@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { delimiter } from 'node:path'
-import { buildCommands, buildEnv, CMAKE_CONFIGURE_ARGS } from './build-prereqs'
+import { buildCommands, buildEnv, CMAKE_CONFIGURE_ARGS, CMAKE_CONFIGURE_ARGS_MACOS } from './build-prereqs'
 
 const PATH_KEY = Object.keys(process.env).find((k) => k.toLowerCase() === 'path') ?? 'PATH'
 
@@ -142,4 +142,19 @@ test('buildCommands: Linux bundles the CUDA runtime shared libs next to the bina
   const copyStep = cmds[5]
   assert.match(copyStep, /^cp .* build\/bin\/ 2>\/dev\/null$/)
   assert.match(copyStep, /\$CUDA_ROOT\/lib64\/libcudart\.so\*/)
+})
+
+test('buildCommands: produces the macOS + Metal cmake steps (no CUDA flags, no runtime-copy step) and the binary-location note', () => {
+  const cmds = buildCommands('https://github.com/owner/repo', undefined, 'macos')
+  assert.deepEqual(cmds, [
+    'git clone --depth 1 "https://github.com/owner/repo" turbo-build',
+    'cd turbo-build',
+    `cmake -B build ${CMAKE_CONFIGURE_ARGS_MACOS.join(' ')}`,
+    'cmake --build build -j --target llama-server',
+    '# Built binary: build/bin/llama-server — add it via "Add your own engine".',
+  ])
+})
+
+test('CMAKE_CONFIGURE_ARGS_MACOS: enables Metal + Release, no CUDA flags', () => {
+  assert.deepEqual(CMAKE_CONFIGURE_ARGS_MACOS, ['-DGGML_METAL=ON', '-DCMAKE_BUILD_TYPE=Release'])
 })

@@ -34,6 +34,7 @@ import {
   updateBackend,
   updateVllm,
   updateMlx,
+  updateRapidMlx,
   updateTurboquant,
   updateKoboldcpp,
   updateLlamafile,
@@ -51,6 +52,7 @@ import {
   hfTokenTest,
   installBackend,
   installMlx,
+  installRapidMlx,
   installVllm,
   installTurboquant,
   installKoboldcpp,
@@ -310,6 +312,7 @@ export function useBackendInstall() {
   return {
     backend: useMutation({ mutationFn: (backend: string) => installBackend(backend), onSuccess: invalidate }),
     mlx: useMutation({ mutationFn: () => installMlx(), onSuccess: invalidate }),
+    rapidMlx: useMutation({ mutationFn: () => installRapidMlx(), onSuccess: invalidate }),
     vllm: useMutation({ mutationFn: () => installVllm(), onSuccess: invalidate }),
     turboquant: useMutation({ mutationFn: () => installTurboquant(), onSuccess: invalidate }),
     koboldcpp: useMutation({ mutationFn: () => installKoboldcpp(), onSuccess: invalidate }),
@@ -321,6 +324,7 @@ export function useBackendInstall() {
     // Update re-provisions each engine kind to the latest release.
     updateVllm: useMutation({ mutationFn: () => updateVllm(), onSuccess: invalidate }),
     updateMlx: useMutation({ mutationFn: () => updateMlx(), onSuccess: invalidate }),
+    updateRapidMlx: useMutation({ mutationFn: () => updateRapidMlx(), onSuccess: invalidate }),
     updateTurboquant: useMutation({ mutationFn: () => updateTurboquant(), onSuccess: invalidate }),
     updateKoboldcpp: useMutation({ mutationFn: () => updateKoboldcpp(), onSuccess: invalidate }),
     updateLlamafile: useMutation({ mutationFn: () => updateLlamafile(), onSuccess: invalidate }),

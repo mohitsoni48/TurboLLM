@@ -345,12 +345,12 @@ export type BuildPrereqTool = {
   installUrl: string
 }
 
-/** GET /api/v1/build/prereqs payload. `supported` is false on macOS (guided build is
- *  Windows/Linux + CUDA only for now); `tools` is empty there. `os` tells the UI which
- *  toolchain shape `tools` reflects (and which manual command block to show). */
+/** GET /api/v1/build/prereqs payload. Guided build supports Windows, Linux (both + CUDA) and
+ *  macOS (+ Metal — no GPU-toolkit prereq, so `tools` there is just git/cmake/compiler). `os`
+ *  tells the UI which toolchain shape `tools` reflects (and which manual command block to show). */
 export type BuildPrereqs = {
   supported: boolean
-  os: 'windows' | 'linux' | 'other'
+  os: 'windows' | 'linux' | 'macos' | 'other'
   tools: BuildPrereqTool[]
 }
 
@@ -447,6 +447,9 @@ export type ModelEntry = {
   /** >0 when the GGUF carries a built-in NextN multi-token-prediction head. */
   nextnLayers: number
   vision: boolean
+  /** True for MLX-format models whose config.json declares an audio_config (an audio
+   *  tower/encoder, e.g. gemma4's Conformer audio module). Always false for GGUF. */
+  audio: boolean
   mmprojPath: string | null
   hasChatTemplate: boolean
   /** True when the model is an embedding model (BERT-family or embed filename pattern).

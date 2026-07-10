@@ -1,9 +1,24 @@
-import { friendlyName } from '../screens/chat/MessageBubble'
+/** Strips an MCP tool's server-prefix (`mcp__server__tool` → `tool`) and turns
+ *  underscores into spaces for display, e.g. in the approval bar and tool-call cards. */
+export function friendlyName(name: string): string {
+  if (name.startsWith('mcp__')) return name.replace(/^mcp__[^_]+(?:_[^_]+)*__/, '')
+  return name.replace(/_/g, ' ')
+}
+
+/** PURE: mirrors resolveSearchQuery in src/tools/builtin.ts — the schema declares a single
+ *  required `query: string`, but a model sometimes emits `queries: string[]` instead (seen from
+ *  a small local model whose tool-calling drifted from the declared schema); fall back to the
+ *  first entry rather than rendering the literal string "undefined" in the approval dialog. */
+function resolveSearchQuery(args: Record<string, unknown>): string {
+  if (typeof args.query === 'string') return args.query
+  if (Array.isArray(args.queries) && typeof args.queries[0] === 'string') return args.queries[0]
+  return ''
+}
 
 /** Short, one-line human-readable summary of what a tool call is about to run.
  *  Used in the approval bar (and optionally as a tool-call card tooltip). */
 export function describeToolCall(name: string, args: Record<string, unknown>): string {
-  if (name === 'web_search') return `Search the web for "${String(args.query)}"`
+  if (name === 'web_search') return `Search the web for "${resolveSearchQuery(args)}"`
   if (name === 'fetch_url') return `Fetch ${String(args.url)}`
   if (name === 'run_code') {
     const code = String(args.code)

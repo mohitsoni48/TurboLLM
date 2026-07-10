@@ -25,7 +25,7 @@ import { toast } from '../../components/ui/sonner'
  * model format (safetensors dirs report format 'mlx' under any engine, so format can't tell
  * MLX from vLLM). `'none'` covers an absent/unrecognised engine: show sampling only, assume nothing.
  */
-type LoadMode = 'llamacpp' | 'mlx' | 'vllm' | 'none'
+type LoadMode = 'llamacpp' | 'mlx' | 'rapid-mlx' | 'vllm' | 'none'
 
 function loadModeForEngine(engineKind: string | undefined): LoadMode {
   switch (engineKind) {
@@ -33,6 +33,8 @@ function loadModeForEngine(engineKind: string | undefined): LoadMode {
       return 'llamacpp'
     case 'mlx':
       return 'mlx'
+    case 'rapid-mlx':
+      return 'rapid-mlx'
     case 'vllm':
       return 'vllm'
     default:
@@ -158,6 +160,7 @@ export function ModelDetailDialog({
   const loadMode = loadModeForEngine(activeEngine?.kind)
   const isLlamaCpp = loadMode === 'llamacpp'
   const isMlx = loadMode === 'mlx'
+  const isRapidMlx = loadMode === 'rapid-mlx'
   const isVllm = loadMode === 'vllm'
   // The runner requires a free engine (409 otherwise). When this model is loaded,
   // stop it first, then start the sweep once the engine has settled.
@@ -267,6 +270,14 @@ export function ModelDetailDialog({
                 MLX (Apple Silicon, mlx-lm) manages context and KV cache automatically — there are no
                 context/GPU-layer/KV knobs to set. Only the <span className="text-ink">sampling defaults</span> below
                 apply at load; per-conversation overrides still work in chat.
+              </div>
+            )}
+
+            {isRapidMlx && (
+              <div className="rounded-md border border-border bg-panel-2 px-3 py-2.5 text-[12px] text-muted">
+                Rapid-MLX manages context and KV cache automatically — there are no context/GPU-layer/KV
+                knobs to set, and no launch-time sampling defaults either; sampling is set
+                <span className="text-ink"> per-conversation</span> in chat.
               </div>
             )}
 
@@ -403,6 +414,11 @@ export function ModelDetailDialog({
             </Section>
             )}
 
+            {/* Rapid-MLX takes no launch-time sampling args at all (rapidMlxServerCommand only
+                passes serve/model/host/port) — the banner above already sends users to
+                per-conversation chat settings instead, so showing these as editable/saveable
+                launch-time controls here would be dead UI contradicting that banner. */}
+            {!isRapidMlx && (<>
             <SectionTitle>Sampling</SectionTitle>
             <Section>
               <Slider label="Temperature" value={draft.sampling.temp} min={0} max={2} step={0.05} onChange={(v) => setS('temp', v)} fmt={(v) => v.toFixed(2)} />
@@ -422,6 +438,7 @@ export function ModelDetailDialog({
               />
               </>)}
             </Section>
+            </>)}
 
             {isLlamaCpp && specOptions.length > 1 && (
               <>

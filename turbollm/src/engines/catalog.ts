@@ -214,6 +214,31 @@ const ALL: CatalogEngine[] = [
     ],
   },
   {
+    id: 'rapid-mlx',
+    name: 'Rapid-MLX',
+    kind: 'rapid-mlx',
+    description:
+      'A fast Apple-Silicon engine built on MLX with an OpenAI-compatible server — continuous batching and prompt caching.',
+    provision: 'pip',
+    homepage: 'https://github.com/raullenchai/Rapid-MLX',
+    repo: 'raullenchai/Rapid-MLX',
+    platforms: ['darwin'],
+    support: 'experimental',
+    installEndpoint: '/api/v1/engines/rapid-mlx',
+    note: 'macOS (Apple Silicon) only. Loads the same MLX-format model directories as the MLX engine.',
+    variants: [
+      {
+        id: 'rapid-mlx',
+        label: 'Apple Metal',
+        repo: 'raullenchai/Rapid-MLX',
+        requires: { platform: ['darwin'], gpuVendor: ['apple'] },
+        stability: 'experimental',
+        speed: 'fastest',
+        hasPrebuilt: true,
+      },
+    ],
+  },
+  {
     id: 'sglang',
     name: 'SGLang',
     kind: 'sglang',

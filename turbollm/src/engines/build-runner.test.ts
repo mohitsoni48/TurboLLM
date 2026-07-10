@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildDirName, CMAKE_CONFIGURE_ARGS, pickGenerator, vcvarsBatch, stripGenericAsmLanguage, sameRepo, sourceBuildDirOf } from './build-runner'
+import { buildDirName, CMAKE_CONFIGURE_ARGS, isIncompleteMetalBackendError, pickGenerator, vcvarsBatch, stripGenericAsmLanguage, sameRepo, sourceBuildDirOf } from './build-runner'
 import { join } from 'node:path'
 
 test('buildDirName: repo name from a .git URL, branch appended', () => {
@@ -37,6 +37,31 @@ test('pickGenerator: Ninja when available regardless of platform', () => {
 test('pickGenerator: falls back to NMake on Windows, Unix Makefiles on Linux', () => {
   assert.equal(pickGenerator(false, true), 'NMake Makefiles')
   assert.equal(pickGenerator(false, false), 'Unix Makefiles')
+})
+
+// Regression: ik_llama.cpp on macOS references ggml_backend_is_metal / ggml_backend_metal_set_n_cb
+// in its own src/llama-dflash.cpp, but its vendored ggml doesn't implement them (its own catalog
+// note says "CPU + CUDA only, no ROCm/Metal") — the guided build should detect this specific
+// clang error and retry CPU-only rather than just failing.
+test('isIncompleteMetalBackendError: detects the real ik_llama.cpp clang error', () => {
+  const log = [
+    "/path/src/llama-dflash.cpp:204:9: error: use of undeclared identifier 'ggml_backend_is_metal'; did you mean 'ggml_backend_is_cpu'?",
+    "/path/src/llama-dflash.cpp:205:9: error: use of undeclared identifier 'ggml_backend_metal_set_n_cb'",
+    'make[3]: *** [src/CMakeFiles/llama.dir/llama-dflash.cpp.o] Error 1',
+  ]
+  assert.equal(isIncompleteMetalBackendError(log), true)
+})
+
+test('isIncompleteMetalBackendError: false for an unrelated compile error', () => {
+  const log = [
+    "error: use of undeclared identifier 'foo_bar_baz'",
+    'make[3]: *** [src/CMakeFiles/llama.dir/some-file.cpp.o] Error 1',
+  ]
+  assert.equal(isIncompleteMetalBackendError(log), false)
+})
+
+test('isIncompleteMetalBackendError: false for an empty/successful log', () => {
+  assert.equal(isIncompleteMetalBackendError([]), false)
 })
 
 test('vcvarsBatch: calls vcvars x64, then cmake, quotes spaced args, propagates exit code', () => {

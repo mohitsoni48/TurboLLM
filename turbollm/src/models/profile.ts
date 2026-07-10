@@ -486,11 +486,22 @@ export function profileToArgs(p: LoadProfile, m: ModelEntry, caps: Capabilities,
  *  -m/--model/--served-model-name/--host/--port and the tensor-parallel flag; this returns the
  *  rest. Each flag is emitted only when it deviates from vLLM's own default, so a fresh profile
  *  produces no extra args (launch is unchanged from before this feature). User `extraArgs` pass
- *  through last so they can override anything. */
-export function vllmProfileToArgs(p: LoadProfile): string[] {
+ *  through last so they can override anything.
+ *
+ *  `nativeCtx` is the model's own uncapped `max_position_embeddings` (`ModelEntry.nativeCtx`) —
+ *  deliberately NOT `p.ctx`, which `deriveDefault()` caps at 8192 for llama.cpp/MLX's KV-memory
+ *  sizing and has no bearing on vLLM once `--max-model-len` is left unset (see below). */
+export function vllmProfileToArgs(p: LoadProfile, nativeCtx: number): string[] {
   const v = p.vllm ?? defaultVllm()
   const a: string[] = []
   if (v.maxModelLen > 0) a.push('--max-model-len', String(v.maxModelLen))
+  // vLLM's own --max-num-batched-tokens defaults to 2048, and its scheduler config
+  // validator hard-rejects (refuses to start) any effective max-model-len larger than
+  // that — not a soft truncation. When --max-model-len is left unset, vLLM derives its
+  // own from the model's real max_position_embeddings, so --max-num-batched-tokens must
+  // be raised to match THAT (nativeCtx), not the 8192-capped p.ctx used elsewhere.
+  const effectiveMaxLen = v.maxModelLen > 0 ? v.maxModelLen : nativeCtx || 8192
+  if (effectiveMaxLen > 2048) a.push('--max-num-batched-tokens', String(effectiveMaxLen))
   if (v.gpuMemoryUtilization > 0 && v.gpuMemoryUtilization !== 0.9) {
     a.push('--gpu-memory-utilization', String(v.gpuMemoryUtilization))
   }
