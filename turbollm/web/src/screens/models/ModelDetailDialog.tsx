@@ -414,6 +414,11 @@ export function ModelDetailDialog({
             </Section>
             )}
 
+            {/* Rapid-MLX takes no launch-time sampling args at all (rapidMlxServerCommand only
+                passes serve/model/host/port) — the banner above already sends users to
+                per-conversation chat settings instead, so showing these as editable/saveable
+                launch-time controls here would be dead UI contradicting that banner. */}
+            {!isRapidMlx && (<>
             <SectionTitle>Sampling</SectionTitle>
             <Section>
               <Slider label="Temperature" value={draft.sampling.temp} min={0} max={2} step={0.05} onChange={(v) => setS('temp', v)} fmt={(v) => v.toFixed(2)} />
@@ -433,6 +438,7 @@ export function ModelDetailDialog({
               />
               </>)}
             </Section>
+            </>)}
 
             {isLlamaCpp && specOptions.length > 1 && (
               <>

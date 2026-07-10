@@ -11,7 +11,7 @@ import {
   X,
   XCircle,
 } from 'lucide-react'
-import { useBuild, useBuildPrereqs, useSettings, useStatus } from '../../lib/queries'
+import { useBuild, useBuildPrereqs, useSettings, useStatus, useSysInfo } from '../../lib/queries'
 import type { BuildPrereqTool, EngineBuild } from '../../lib/types'
 import { Button } from '../../components/ui/button'
 import {
@@ -412,6 +412,11 @@ function BuildProgress({
   const isError = build.phase === 'error'
   const isDone = build.phase === 'done'
   const accent = isError ? 'var(--err, #ef4444)' : isDone ? 'var(--ok)' : 'var(--accent)'
+  // Windows/Linux CUDA builds still physically bundle the CUDA runtime (build-runner.ts's
+  // runBuild() copies the DLLs/libs post-build); only macOS (Metal, a system framework) has
+  // nothing to bundle. Success copy must reflect that, not claim the same thing for all three.
+  const { data: sysInfo } = useSysInfo()
+  const bundlesCudaRuntime = sysInfo?.os === 'windows' || sysInfo?.os === 'linux'
 
   // Success screen — distinct, celebratory; the engine is built + active. Only for a build;
   // a finished CUDA download is dismissed by the parent (which re-probes prereqs).
@@ -424,8 +429,9 @@ function BuildProgress({
         <div className="flex flex-col gap-1">
           <p className="text-[15px] font-semibold text-ink">Engine ready 🎉</p>
           <p className="text-[13px] text-muted">
-            <span className="font-medium text-ink">{build.engine}</span> was built from source and set as
-            your active engine. Load a model to start using it.
+            <span className="font-medium text-ink">{build.engine}</span> was built from source
+            {bundlesCudaRuntime ? ', bundled with its CUDA runtime,' : ''} and set as your active
+            engine. Load a model to start using it.
           </p>
         </div>
         <details className="w-full">

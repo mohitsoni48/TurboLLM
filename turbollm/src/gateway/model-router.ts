@@ -273,14 +273,14 @@ export class ModelRouter {
       const savedProfile = getModelProfile(cfg, entry.key, engine.id) as Partial<LoadProfile> | undefined
       return {
         engine,
-        model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: entry.nativeCtx, vision: false },
+        model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: entry.nativeCtx, vision: entry.vision },
         modelPath: entry.path,
         // MLX honors sampling as launch defaults; vLLM honors its own load controls (F-027).
         extraArgs:
           engine.kind === 'mlx'
             ? mlxSamplingArgs(savedProfile?.sampling)
             : engine.kind === 'vllm'
-              ? vllmProfileToArgs(resolveProfile(entry, sys, savedProfile, undefined, cfg.modelDefaults))
+              ? vllmProfileToArgs(resolveProfile(entry, sys, savedProfile, undefined, cfg.modelDefaults), entry.nativeCtx)
               : [],
         tensorParallelSize: savedProfile?.gpu?.tensorParallelSize,
       }

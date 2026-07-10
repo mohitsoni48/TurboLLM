@@ -1080,11 +1080,11 @@ export function registerApi(app: Hono, d: Deps): void {
           active.kind === 'mlx'
             ? mlxSamplingArgs(savedProfile?.sampling)
             : active.kind === 'vllm'
-              ? vllmProfileToArgs(resolveProfile(entry, sys, savedProfile, b.profileOverrides, cfg.modelDefaults))
+              ? vllmProfileToArgs(resolveProfile(entry, sys, savedProfile, b.profileOverrides, cfg.modelDefaults), entry.nativeCtx)
               : []
         opts = {
           engine: active,
-          model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: entry.nativeCtx, vision: false },
+          model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: entry.nativeCtx, vision: entry.vision },
           modelPath: entry.path,
           extraArgs,
           tensorParallelSize: savedProfile?.gpu?.tensorParallelSize,
