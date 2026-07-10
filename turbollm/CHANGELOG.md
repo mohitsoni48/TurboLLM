@@ -25,6 +25,31 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.7.7] - 2026-07-10
+
+**Custom engine self-service, auto-fit GPU/MoE offload, and two real bug fixes.**
+
+### Added
+- **Custom engine: build from any git repo** — Engines → "Add via git repo" lets you point at
+  any llama.cpp-compatible fork's URL (+ optional branch) and build it in-app with one click,
+  reusing the existing build pipeline. No more manually cloning and adding the binary by hand.
+- **Auto-fit GPU layers / MoE CPU offload** — new toggles in a model's Load settings (and
+  honored by Auto-tune) that let llama.cpp decide the GPU/CPU split for you at load time,
+  instead of a fixed number — useful when a large context or model doesn't fit the old fixed
+  default. Off by default.
+
+### Fixed
+- A brief empty message bubble could appear above the real reply on a fresh chat send, with
+  working Copy/Edit/Delete controls on it — a backend placeholder message racing the UI's
+  optimistic refresh.
+- On a machine with an integrated GPU, its VRAM was sometimes reported as if it were dedicated
+  graphics memory, causing wrong model-quant defaults and false "won't fit" warnings.
+
+### Discord
+- Add a custom engine straight from a git repo URL and build it in one click — no more manual clone-and-point.
+- New "Auto-fit" option for GPU layers and MoE offload: let TurboLLM figure out the best split automatically instead of guessing a number yourself.
+- Fixed a rare empty-message flash in chat and a VRAM-reporting bug on integrated GPUs.
+
 ## [1.7.6] - 2026-07-09
 
 **Token usage dashboard and an opt-in auto-memory feature.**

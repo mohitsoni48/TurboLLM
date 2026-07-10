@@ -170,6 +170,10 @@ the detail:
   (`-ngl`), **MoE CPU-offload (`--n-cpu-moe`)**, parallel slots, **KV-cache quant type** (incl.
   low-bit on supporting forks), CPU threads, flash attention, and **speculative decoding (NextN /
   MTP / draft, with a configurable draft min/max window)**.
+- **Auto-fit GPU layers / MoE offload** — an optional toggle (off by default) that hands the
+  GPU/CPU split decision to llama.cpp's own memory-fitting logic at load time instead of a fixed
+  number, honored by Auto-tune too. Useful when a large context or model doesn't fit your usual
+  fixed setting.
 - **Fast by default:** flash attention on, NextN self-speculative decoding on for models that
   carry a draft head, threads auto — safely gated to what your engine actually accepts.
 - **Multi-GPU, per model** — split a model across cards (layer/row split + main-GPU pick on
@@ -362,6 +366,10 @@ No prebuilt for your OS? The **build-from-source guide** checks your toolchain (
 CUDA / a compiler — MSVC on Windows, gcc/clang on Linux), hands you the exact build commands
 (or a 1-click **"Build it for me"** on Windows and Linux), then drops you into the folder scan
 above.
+
+**Or skip the manual clone entirely** — Engines screen → **Add via git repo**: paste any
+llama.cpp-compatible fork's git URL (+ optional branch, defaults to the repo's own default) and
+build it in-app with the same 1-click flow, no separate "point at a folder" step needed.
 
 **Auto-provisioned default.** Don't want to fetch anything? On first run TurboLLM downloads
 the right upstream prebuilt for your GPU automatically — and a **backend picker** lets you
