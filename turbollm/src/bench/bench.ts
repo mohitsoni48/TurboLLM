@@ -34,7 +34,19 @@ import {
  *  the failure mode (timeout/crash/oom) — the sweep keeps going on a failure. */
 export interface BenchCandidate {
   label: string
-  params: { ctx: number; ngl: number; nCpuMoe: number; parallel: number; kvTypeK: string; flashAttn: string }
+  params: {
+    ctx: number
+    ngl: number
+    /** True when this candidate used auto-fit (-ngl omitted) instead of the pinned `ngl` value —
+     *  see `LoadProfile.nglFit`. `ngl` itself is meaningless/stale when this is true. */
+    nglFit?: boolean
+    nCpuMoe: number
+    /** Same idea as `nglFit`, for `--n-cpu-moe` — see `LoadProfile.nCpuMoeFit`. */
+    nCpuMoeFit?: boolean
+    parallel: number
+    kvTypeK: string
+    flashAttn: string
+  }
   outcome: 'ok' | 'timeout' | 'crash' | 'oom'
   tps: number | null
   /** Prefill (prompt-processing) speed, tok/s — from the engine's `prompt_per_second`. Part of
@@ -437,6 +449,12 @@ export class BenchRunner {
     results: BenchCandidate[],
     headroomMb: number,
   ): Promise<{ cand: BenchCandidate; profile: LoadProfile } | null> {
+    // User chose auto-fit (LoadProfile.nglFit) — trust llama.cpp's own -fit logic for the
+    // GPU/CPU split instead of empirically binary-searching it ourselves; just measure speed
+    // once at whatever it picks. Skips the whole probe phase, and the winning profile keeps
+    // nglFit:true so future loads stay adaptive rather than pinning today's specific number.
+    if (base.nglFit) return this.benchAt(entry, sys, base, caps, results, 'auto-fit')
+
     let bestNgl: number | null = 0 // CPU-only box → everything on CPU, no probing needed.
 
     if (sys.gpus.length > 0) {
@@ -475,6 +493,9 @@ export class BenchRunner {
     results: BenchCandidate[],
     headroomMb: number,
   ): Promise<{ cand: BenchCandidate; profile: LoadProfile } | null> {
+    // Same idea as denseSearch's nglFit check, for MoE CPU-offload auto-fit.
+    if (base.nCpuMoeFit) return this.benchAt(entry, sys, base, caps, results, 'auto-fit')
+
     const derived = deriveDefault(entry, sys)
     const maxN = entry.blockCount > 0 ? entry.blockCount : (derived.nCpuMoe || 0)
     let lo = 0, hi = maxN
@@ -644,7 +665,9 @@ export class BenchRunner {
     const params = {
       ctx: profile.ctx,
       ngl: profile.ngl,
+      nglFit: profile.nglFit,
       nCpuMoe: profile.nCpuMoe,
+      nCpuMoeFit: profile.nCpuMoeFit,
       parallel: profile.parallel,
       kvTypeK: profile.kvTypeK,
       flashAttn: profile.flashAttn,

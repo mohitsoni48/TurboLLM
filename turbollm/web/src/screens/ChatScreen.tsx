@@ -922,21 +922,28 @@ export function ChatScreen() {
               </div>
             )}
 
-            {/* Messages */}
-            {messages.map((m, i) => (
-              <MessageBubble
-                key={m.id}
-                message={m}
-                convId={readonly ? undefined : activeId ?? undefined}
-                isLast={i === messages.length - 1 && !live}
-                onEdit={readonly ? undefined : (msg) => setEditingId(msg.id)}
-                onDelete={readonly ? undefined : handleDelete}
-                onRegenerate={readonly ? undefined : handleRegenerate}
-                editingId={editingId}
-                onEditSave={(content) => handleEditSave(m.id, content)}
-                onEditCancel={() => setEditingId(null)}
-              />
-            ))}
+            {/* Messages — skip the in-flight assistant placeholder while it's still live
+                below. The backend inserts that row the moment generation starts
+                (chat-routes.ts: `db.addMessage(convId, 'assistant', '', ...)`, before any
+                token has streamed), and the 'meta' event's optimistic refetch can pull it
+                into this list before the StreamingBubble below has caught up — a real empty
+                message bubble momentarily rendering above the answer that's still typing in. */}
+            {messages
+              .filter((m) => m.id !== live?.assistantId)
+              .map((m, i, arr) => (
+                <MessageBubble
+                  key={m.id}
+                  message={m}
+                  convId={readonly ? undefined : activeId ?? undefined}
+                  isLast={i === arr.length - 1 && !live}
+                  onEdit={readonly ? undefined : (msg) => setEditingId(msg.id)}
+                  onDelete={readonly ? undefined : handleDelete}
+                  onRegenerate={readonly ? undefined : handleRegenerate}
+                  editingId={editingId}
+                  onEditSave={(content) => handleEditSave(m.id, content)}
+                  onEditCancel={() => setEditingId(null)}
+                />
+              ))}
 
             {/* Streaming bubble */}
             {live && (

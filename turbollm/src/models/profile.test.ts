@@ -1,0 +1,65 @@
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { deriveDefault, profileToArgs } from './profile'
+import type { ModelEntry } from './scanner'
+import type { SysInfo } from '../sysinfo/sysinfo'
+import type { Capabilities } from '../config/config'
+
+const sys: SysInfo = {
+  os: 'win32/x64',
+  cpu: 'Test CPU',
+  cores: 16,
+  ramMB: 65536,
+  gpus: [{ name: 'Test GPU', vramMb: 16000, vendor: 'nvidia' }],
+}
+
+const denseModel: ModelEntry = {
+  key: 'dense-test', name: 'Dense Test', path: 'x.gguf', dir: '.', format: 'gguf',
+  sizeBytes: 1e9, sizeLabel: '1B', arch: 'llama', quant: 'Q4_K_M', nativeCtx: 8192,
+  blockCount: 32, headCountKv: 8, moe: false, expertCount: 0, nextnLayers: 0,
+  vision: false, mmprojPath: null, hasChatTemplate: true, embedding: false,
+  incomplete: false, parseError: null, loaded: false, hasProfile: false,
+  benchTps: null, mtime: '',
+}
+
+const moeModel: ModelEntry = { ...denseModel, key: 'moe-test', name: 'MoE Test', moe: true, expertCount: 8 }
+
+// Empty flags/kvTypes = unprobed → `has()` and `kvOk()` in profileToArgs graceful-degrade to
+// "allow" (see profile.ts comments), so every flag under test is actually emitted when expected.
+const caps: Capabilities = { kvTypes: [], flags: [] }
+
+test('profileToArgs: emits -ngl by default', () => {
+  const p = { ...deriveDefault(denseModel, sys), ngl: 20 }
+  const args = profileToArgs(p, denseModel, caps)
+  assert.deepEqual(args.slice(args.indexOf('-ngl'), args.indexOf('-ngl') + 2), ['-ngl', '20'])
+})
+
+test('profileToArgs: nglFit omits -ngl entirely, regardless of the stale ngl value', () => {
+  const p = { ...deriveDefault(denseModel, sys), ngl: 20, nglFit: true }
+  const args = profileToArgs(p, denseModel, caps)
+  assert.equal(args.includes('-ngl'), false)
+})
+
+test('profileToArgs: nglFit false/absent keeps emitting -ngl (backward compat)', () => {
+  const p = { ...deriveDefault(denseModel, sys), ngl: 99 }
+  const args = profileToArgs(p, denseModel, caps)
+  assert.equal(args.includes('-ngl'), true)
+})
+
+test('profileToArgs: emits --n-cpu-moe by default on an MoE model', () => {
+  const p = { ...deriveDefault(moeModel, sys), nCpuMoe: 4 }
+  const args = profileToArgs(p, moeModel, caps)
+  assert.deepEqual(args.slice(args.indexOf('--n-cpu-moe'), args.indexOf('--n-cpu-moe') + 2), ['--n-cpu-moe', '4'])
+})
+
+test('profileToArgs: nCpuMoeFit omits --n-cpu-moe entirely, regardless of the stale value', () => {
+  const p = { ...deriveDefault(moeModel, sys), nCpuMoe: 4, nCpuMoeFit: true }
+  const args = profileToArgs(p, moeModel, caps)
+  assert.equal(args.includes('--n-cpu-moe'), false)
+})
+
+test('profileToArgs: --n-cpu-moe never emitted for a non-MoE model even without nCpuMoeFit', () => {
+  const p = { ...deriveDefault(denseModel, sys), nCpuMoe: 4 }
+  const args = profileToArgs(p, denseModel, caps)
+  assert.equal(args.includes('--n-cpu-moe'), false)
+})

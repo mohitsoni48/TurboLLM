@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { parseRocmSmi } from './sysinfo'
+import { parseRocmSmi, isIntegratedGpuName } from './sysinfo'
 
 // rocm-smi --showmeminfo vram --json output for an RX 7900 XTX (24GB). The WMI
 // AdapterRAM fallback would cap this at ~4GB; rocm-smi reports the true total.
@@ -50,4 +50,40 @@ test('parseRocmSmi: cards reporting zero/unknown VRAM are skipped', () => {
     card1: { 'Some Other Field': 'x' },
   })
   assert.equal(parseRocmSmi(badMem).length, 0)
+})
+
+test('isIntegratedGpuName: classic Intel integrated branding is integrated', () => {
+  assert.equal(isIntegratedGpuName('Intel(R) Iris(R) Xe Graphics'), true)
+  assert.equal(isIntegratedGpuName('Intel(R) UHD Graphics 770'), true)
+  assert.equal(isIntegratedGpuName('Intel(R) HD Graphics 620'), true)
+})
+
+test('isIntegratedGpuName: Intel Arc iGPU (no model number) is integrated', () => {
+  assert.equal(isIntegratedGpuName('Intel(R) Arc(TM) Graphics'), true)
+})
+
+test('isIntegratedGpuName: discrete Intel Arc cards (model number) are NOT integrated', () => {
+  assert.equal(isIntegratedGpuName('Intel(R) Arc(TM) A770 Graphics'), false)
+  assert.equal(isIntegratedGpuName('Intel(R) Arc(TM) A380'), false)
+  assert.equal(isIntegratedGpuName('Intel(R) Arc(TM) B580'), false)
+})
+
+test('isIntegratedGpuName: newest generic Intel branding (no UHD/Iris/Arc qualifier) is integrated', () => {
+  // Real name reported by WMI on a Core Ultra 7 265K (Arrow Lake-S) dev box.
+  assert.equal(isIntegratedGpuName('Intel(R) Graphics'), true)
+})
+
+test('isIntegratedGpuName: generic AMD APU branding is integrated', () => {
+  assert.equal(isIntegratedGpuName('AMD Radeon(TM) Graphics'), true)
+})
+
+test('isIntegratedGpuName: discrete AMD cards are NOT integrated', () => {
+  assert.equal(isIntegratedGpuName('AMD Radeon RX 7900 XTX'), false)
+  assert.equal(isIntegratedGpuName('AMD Radeon PRO W7900'), false)
+  assert.equal(isIntegratedGpuName('AMD Instinct MI300X'), false)
+})
+
+test('isIntegratedGpuName: NVIDIA and unrelated names are NOT integrated', () => {
+  assert.equal(isIntegratedGpuName('NVIDIA GeForce RTX 5070 Ti'), false)
+  assert.equal(isIntegratedGpuName('Apple M3 Max'), false)
 })
