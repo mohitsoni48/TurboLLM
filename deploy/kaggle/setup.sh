@@ -1,66 +1,100 @@
 #!/usr/bin/env bash
-# TurboLLM on Kaggle (2×T4) — idempotent one-time setup. Safe to re-run; each step
-# skips itself if already done, so the only thing a re-run really does after the first
-# is `git pull` + rebuild the web UI (the fast half of the dev loop).
+# TurboLLM on Kaggle (2×T4) — idempotent setup. Designed so a FRESH session (Kaggle
+# resets system packages each start, but /kaggle/working persists) is FAST: the ~40-min
+# CUDA build and the 17 GB model download happen exactly once and are then skipped; npm
+# install and the web build only re-run when the git commit actually changed.
 #
-# Why build from source (this repo) instead of `npm i -g turbollm`: so fixes on the
-# branch take effect. Why a native CUDA build of the TurboQuant fork instead of the
-# prebuilt: Kaggle's container ships the NVIDIA driver but NO Vulkan ICD, so TurboLLM's
-# default Linux/NVIDIA pick (Vulkan) silently runs on CPU. CUDA is the only backend that
-# actually uses the two T4s here. Building ON the T4 box auto-detects sm_75 — no
-# cross-arch / glibc juggling.
+# First run  : Node + toolchain + npm + web + CUDA build + model  (~40 min, one time)
+# Later runs : Node (~1 min) + [everything else cached]           (~1-2 min)
+#
+# Why a native CUDA build of the TurboQuant fork (not the prebuilt): Kaggle ships the
+# NVIDIA driver but NO Vulkan ICD, so TurboLLM's default Linux/NVIDIA pick (Vulkan)
+# silently runs on CPU. CUDA is the only backend that uses the two T4s here. Building ON
+# the T4 auto-detects sm_75 — no cross-arch / glibc juggling.
 #
 # Usage:  bash deploy/kaggle/setup.sh
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"        # .../TurboLLM
+TLLM_DIR="$REPO_DIR/turbollm"
 WORK="${KAGGLE_WORKING:-/kaggle/working}"
 ENGINE_DIR="$WORK/turboquant"
+ENGINE_BIN="$ENGINE_DIR/build/bin/llama-server"
 MODELS_DIR="$WORK/models"
+WEB_STAMP="$WORK/.webdist-commit"
 TQ_REPO="https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant"  # default branch = feature/turboquant-kv-cache
 MODEL_REPO="unsloth/Qwen3.6-27B-MTP-GGUF"
 MODEL_FILE="${TURBOLLM_MODEL_FILE:-Qwen3.6-27B-Q4_K_M.gguf}"           # ~17GB, fits across 2×T4 (30GB)
 BUILD_JOBS="${TURBOLLM_BUILD_JOBS:-2}"                                 # cap parallelism — unbounded -j OOMs Kaggle's ~29GB
 
 log()  { echo -e "\n\033[1;36m== $* ==\033[0m"; }
+skip() { echo -e "   \033[0;32m✓ $*\033[0m"; }
 fail() { echo -e "\n\033[1;31mSETUP FAILED: $*\033[0m" >&2; exit 1; }
 
+CUR_COMMIT="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+
 # ---------------------------------------------------------------------------
-# 1) Node >= 22.13 (TurboLLM needs node:sqlite unflagged)
+# 1) Node >= 22.13 (TurboLLM needs node:sqlite unflagged) — needed EVERY session
 # ---------------------------------------------------------------------------
+log "Node.js"
 NODE_MAJOR="$(node -e 'process.stdout.write(String(process.versions.node.split(".").map(Number)[0]))' 2>/dev/null || echo 0)"
 if [ "$NODE_MAJOR" -lt 22 ]; then
-  log "Installing Node 22 (NodeSource)"
-  curl -fsSL https://deb.nodesource.com/setup_22.x | bash - || fail "NodeSource setup failed"
-  apt-get install -y --no-install-recommends nodejs || fail "node install failed"
+  echo "   installing Node 22 (NodeSource)…"
+  curl -fsSL https://deb.nodesource.com/setup_22.x | bash - >/dev/null 2>&1 || fail "NodeSource setup failed"
+  apt-get install -y --no-install-recommends nodejs >/dev/null 2>&1 || fail "node install failed"
 fi
-log "Node $(node -v)"
+echo "   Node $(node -v)"
 
 # ---------------------------------------------------------------------------
-# 2) Build toolchain (cmake / gcc / curl+gomp runtime deps)
+# 2) Runtime shared libs the CUDA binary loads (libgomp / libcurl) — usually already
+#    present on Kaggle, so this is a fast check that skips apt entirely in that case.
 # ---------------------------------------------------------------------------
-if ! command -v cmake >/dev/null; then
-  log "Installing build toolchain"
-  apt-get update -qq
-  apt-get install -y --no-install-recommends cmake build-essential libcurl4-openssl-dev libgomp1 git \
-    || fail "toolchain install failed"
+log "Engine runtime libs"
+need_rt=""
+ldconfig -p 2>/dev/null | grep -q 'libgomp\.so\.1'  || need_rt="$need_rt libgomp1"
+ldconfig -p 2>/dev/null | grep -q 'libcurl\.so\.4'  || need_rt="$need_rt libcurl4"
+if [ -n "$need_rt" ]; then
+  echo "   installing:$need_rt"
+  apt-get update -qq && apt-get install -y --no-install-recommends $need_rt >/dev/null 2>&1 || fail "runtime libs install failed"
+else
+  skip "libgomp/libcurl already present"
 fi
-command -v nvcc >/dev/null || fail "nvcc not found — this notebook needs a GPU accelerator (Settings → Accelerator → GPU T4 x2)"
-log "cmake $(cmake --version | head -1 | awk '{print $3}') · nvcc $(nvcc --version | grep -oiE 'release [0-9.]+' | head -1)"
 
 # ---------------------------------------------------------------------------
-# 3) TurboLLM deps + web UI (run-from-source serves web from turbollm/src/webdist)
+# 3) Build toolchain — ONLY needed to compile the engine. Skipped once the binary exists.
 # ---------------------------------------------------------------------------
-log "TurboLLM npm deps + web build"
-cd "$REPO_DIR/turbollm"
-npm ci               || fail "npm ci (root) failed"
-npm run build:web    || fail "web build failed"
+if [ ! -x "$ENGINE_BIN" ]; then
+  log "Build toolchain (cmake / gcc)"
+  command -v cmake >/dev/null || { apt-get update -qq && apt-get install -y --no-install-recommends cmake build-essential libcurl4-openssl-dev git >/dev/null 2>&1; } || fail "toolchain install failed"
+  command -v nvcc  >/dev/null || fail "nvcc not found — enable the GPU accelerator (Settings → Accelerator → GPU T4 x2)"
+  echo "   cmake $(cmake --version | head -1 | awk '{print $3}') · nvcc $(nvcc --version | grep -oiE 'release [0-9.]+' | head -1)"
+fi
 
 # ---------------------------------------------------------------------------
-# 4) Native CUDA build of the TurboQuant fork (auto-detects sm_75 on the T4)
+# 4) TurboLLM npm deps (cached across sessions) + web UI (rebuilt only when the commit
+#    changed, so a `git pull` that touches the UI is reflected but re-runs are instant).
 # ---------------------------------------------------------------------------
-if [ ! -x "$ENGINE_DIR/build/bin/llama-server" ]; then
-  log "Cloning + building TurboQuant (CUDA), -j$BUILD_JOBS — expect ~20-30 min"
+log "TurboLLM deps + web UI"
+cd "$TLLM_DIR"
+if [ -x node_modules/.bin/tsx ]; then
+  skip "npm deps present"
+else
+  echo "   npm ci…"; npm ci >/dev/null 2>&1 || fail "npm ci failed"
+fi
+if [ -f src/webdist/index.html ] && [ "$(cat "$WEB_STAMP" 2>/dev/null)" = "$CUR_COMMIT" ]; then
+  skip "web UI up to date (commit ${CUR_COMMIT:0:8})"
+else
+  echo "   building web UI…"; npm run build:web >/dev/null 2>&1 || fail "web build failed"
+  echo "$CUR_COMMIT" > "$WEB_STAMP"
+fi
+
+# ---------------------------------------------------------------------------
+# 5) Native CUDA build of the TurboQuant fork (auto-detects sm_75). ONE TIME.
+# ---------------------------------------------------------------------------
+if [ -x "$ENGINE_BIN" ]; then
+  log "CUDA engine"; skip "already built: $ENGINE_BIN  (rm -rf $ENGINE_DIR to force rebuild)"
+else
+  log "Building TurboQuant CUDA engine, -j$BUILD_JOBS — ONE TIME, expect ~30-40 min"
   rm -rf "$ENGINE_DIR"
   git clone --depth 1 "$TQ_REPO" "$ENGINE_DIR" || fail "clone failed"
   cd "$ENGINE_DIR"
@@ -68,7 +102,7 @@ if [ ! -x "$ENGINE_DIR/build/bin/llama-server" ]; then
   # path, so FindCUDAToolkit can't resolve the CUDA::cuda_driver target ("target not found"
   # at configure time). Point CMAKE_LIBRARY_PATH at wherever libcuda.so actually lives.
   LIBCUDA_DIR="$(dirname "$(find / -name 'libcuda.so*' 2>/dev/null | head -1)")"
-  log "libcuda.so dir: ${LIBCUDA_DIR:-<not found>}"
+  echo "   libcuda.so dir: ${LIBCUDA_DIR:-<not found>}"
   cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler \
     ${LIBCUDA_DIR:+-DCMAKE_LIBRARY_PATH="$LIBCUDA_DIR"} || fail "cmake configure failed"
@@ -79,22 +113,23 @@ if [ ! -x "$ENGINE_DIR/build/bin/llama-server" ]; then
   for d in lib64 lib targets/x86_64-linux/lib; do
     cp "$CUDA_ROOT/$d/"libcudart.so* "$CUDA_ROOT/$d/"libcublas.so* "$CUDA_ROOT/$d/"libcublasLt.so* build/bin/ 2>/dev/null || true
   done
-  log "Built $ENGINE_DIR/build/bin/llama-server"
-else
-  log "TurboQuant binary already built — skipping (rm -rf $ENGINE_DIR to force rebuild)"
+  [ -x "$ENGINE_BIN" ] || fail "compile finished but $ENGINE_BIN is missing"
+  echo "   Built $ENGINE_BIN"
 fi
 
 # ---------------------------------------------------------------------------
-# 5) Model (Q4_K_M ~17GB) — big + dense enough that a 2×T4 tensor-split matters
+# 6) Model (Q4_K_M ~17GB) — big + dense enough that a 2×T4 tensor-split matters.
+#    hf_hub_download resumes a partial file, so an interrupted download self-heals.
 # ---------------------------------------------------------------------------
+log "Model $MODEL_FILE"
 mkdir -p "$MODELS_DIR"
-if [ ! -f "$MODELS_DIR/$MODEL_FILE" ]; then
-  log "Downloading $MODEL_FILE"
-  pip install -q huggingface_hub || fail "huggingface_hub install failed"
+if [ -f "$MODELS_DIR/$MODEL_FILE" ]; then
+  skip "already present ($(du -h "$MODELS_DIR/$MODEL_FILE" | cut -f1))"
+else
+  echo "   downloading…"
+  pip install -q huggingface_hub >/dev/null 2>&1 || fail "huggingface_hub install failed"
   python3 -c "from huggingface_hub import hf_hub_download; hf_hub_download('$MODEL_REPO','$MODEL_FILE',local_dir='$MODELS_DIR')" \
     || fail "model download failed"
-else
-  log "Model $MODEL_FILE already present — skipping"
 fi
 
-log "Setup complete — now run:  bash deploy/kaggle/serve.sh start"
+echo -e "\n\033[1;32m== Setup complete — next: bash deploy/kaggle/serve.sh start ==\033[0m"

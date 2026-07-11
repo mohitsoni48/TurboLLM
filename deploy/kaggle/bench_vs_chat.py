@@ -117,10 +117,19 @@ def main():
     args = ap.parse_args()
     B = args.base.rstrip("/")
 
+    def size_of(m):
+        s = m.get("sizeBytes")
+        if isinstance(s, (int, float)) and s:
+            return s
+        try:  # model keys look like "qwen3.6-27b|Q4_K_M|<sizeBytes>"
+            return int(str(m.get("key", "")).split("|")[-1])
+        except Exception:
+            return 0
     models = call(B, "/api/v1/models").get("models", [])
     ggufs = [m for m in models if m.get("format") == "gguf" and not m.get("incomplete")]
     if not ggufs:
         print("No complete GGUF models found — register a model dir first.", file=sys.stderr); sys.exit(1)
+    ggufs.sort(key=size_of, reverse=True)  # prefer the highest-quant (largest) complete model
     key = args.model or ggufs[0]["key"]
     print(f"Models: {[m['key'] for m in ggufs]}\nUsing model key: {key}")
 
