@@ -125,8 +125,21 @@ def main():
             return int(str(m.get("key", "")).split("|")[-1])
         except Exception:
             return 0
-    models = call(B, "/api/v1/models").get("models", [])
-    ggufs = [m for m in models if m.get("format") == "gguf" and not m.get("incomplete")]
+    def list_ggufs():
+        ms = call(B, "/api/v1/models").get("models", [])
+        return [m for m in ms if m.get("format") == "gguf" and not m.get("incomplete")]
+    ggufs = list_ggufs()
+    if not ggufs:
+        # A model-dir scan is async, so a just-downloaded file may not be indexed yet —
+        # trigger a rescan and wait for it to appear before giving up.
+        print("No models yet — rescanning model dirs…")
+        try: call(B, "/api/v1/models/rescan", "POST")
+        except Exception: pass
+        for _ in range(30):
+            time.sleep(2)
+            ggufs = list_ggufs()
+            if ggufs:
+                break
     if not ggufs:
         print("No complete GGUF models found — register a model dir first.", file=sys.stderr); sys.exit(1)
     ggufs.sort(key=size_of, reverse=True)  # prefer the highest-quant (largest) complete model
