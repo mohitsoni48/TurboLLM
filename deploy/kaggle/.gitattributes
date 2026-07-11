@@ -1,0 +1,3 @@
+# Shell scripts here run on Linux (Kaggle) — force LF so a Windows checkout with
+# core.autocrlf=true can never commit CRLF and break them with "bad interpreter".
+*.sh text eol=lf
