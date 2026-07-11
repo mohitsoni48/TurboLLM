@@ -56,41 +56,34 @@ When a fix is pushed to the branch, on Kaggle just:
 
 ## The test procedure (the actual investigation)
 
-All calls are loopback (no token). `B=http://localhost:6996`, `M` = model key (from
-`GET $B/api/v1/models` after the model dir is registered — typically the filename).
+One script does the whole comparison end-to-end (auto-tune → save winner → load → measure
+real streaming chat tok/s → sample both T4s → diff winner-vs-loaded config):
 
-1. **Engine surface** — confirm CUDA engine is active and dual-GPU is seen:
-   ```python
-   !curl -s localhost:6996/api/v1/sysinfo | python3 -m json.tool          # expect 2 GPUs
-   !curl -s localhost:6996/api/v1/engines | python3 -m json.tool          # TurboQuant CUDA active
-   ```
-   In the GUI the hardware line should read **`2× Tesla T4 · 30 GB · Linux`**.
+```python
+!cd /kaggle/working/TurboLLM && python3 deploy/kaggle/bench_vs_chat.py --ctx 8192
+```
 
-2. **Auto-tune** — run the built-in benchmark and capture the winner's tok/s + profile:
-   ```python
-   !curl -s -X POST localhost:6996/api/v1/bench -H 'content-type: application/json' -d "{\"modelKey\":\"$M\"}"
-   # poll GET /api/v1/status → .bench ; then the full result + winner:
-   !curl -s localhost:6996/api/v1/bench/log | python3 -m json.tool
-   ```
-   Note `winner.tps` (decode), `winner.prefillTps`, and `winner.params` (the split/offload
-   that won — this is what chat must reuse).
+It prints, side by side:
+- **auto-tune decode tps** (`winner.tps`) vs **chat decode tps** (measured off the live
+  `/v1/chat/completions` stream, exactly what the UI shows) and their ratio — the consumer
+  complaint is chat ≪ auto-tune,
+- **winner params vs the profile chat actually loaded** — a mismatch here is the usual
+  cause (auto-tune's winning offload/ctx not being what chat loads),
+- **per-GPU peak mem + util during the chat** — both GPU 0 and GPU 1 must be non-zero on a
+  dual-GPU load.
 
-3. **Chat with the winning profile** — apply the winner, load, measure real tok/s:
-   ```python
-   # apply winner via PUT /api/v1/models/$M/profile, POST /api/v1/engine/start, then a
-   # streamed /v1/chat/completions and compute tok/s from usage + wall time.
-   ```
-   The **core comparison**: chat decode tok/s vs `winner.tps`. Consumer complaint = chat ≪
-   auto-tune. Capture both numbers.
+Manual pokes at the same surfaces (all loopback, no token needed):
 
-4. **Both GPUs actually working** — while a chat is generating:
-   ```python
-   !nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv
-   ```
-   Expect non-zero memory + util on **both** GPU 0 and GPU 1.
+```python
+!curl -s localhost:6996/api/v1/sysinfo | python3 -m json.tool     # expect 2 GPUs
+!curl -s localhost:6996/api/v1/engines | python3 -m json.tool     # TurboQuant CUDA active
+!nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv   # during a chat
+```
 
-Record numbers per iteration; when a discrepancy is root-caused, fix on the branch, push,
-pull, and re-run steps 2–4.
+In the GUI the hardware line should now read **`2× Tesla T4 · 30 GB · Linux`**.
+
+When a discrepancy is root-caused, fix on the branch, push, `git pull` on Kaggle, restart,
+and re-run the script.
 
 ## Notes / knobs
 
