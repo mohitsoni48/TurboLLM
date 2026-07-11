@@ -47,6 +47,32 @@ def fmt_params(p):
     return (f"ctx={p.get('ctx')} ngl={ngl} nCpuMoe={ncm} parallel={p.get('parallel')} "
             f"kvTypeK={p.get('kvTypeK')} flashAttn={p.get('flashAttn')}")
 
+def ensure_idle(base, timeout=90):
+    """Auto-tune 409s while a model is loaded or a bench is running (single-server guard). Clear
+    both, then POLL until the engine is actually stopped — a model loaded via the GUI (or a 200K
+    context that takes >few s to free) otherwise makes POST /api/v1/bench fail with 409 Conflict."""
+    def state():
+        try:
+            s = call(base, "/api/v1/status")
+        except Exception:
+            return None, None
+        return (s.get("engine") or {}).get("state"), (s.get("bench") or {}).get("running")
+    eng, bench = state()
+    if eng in (None, "stopped", "idle", "") and not bench:
+        return
+    print(f"Engine busy (state={eng}, bench={bench}) — stopping it before auto-tune…", flush=True)
+    for path in ("/api/v1/bench/cancel", "/api/v1/engine/stop"):
+        try: call(base, path, "POST")
+        except Exception: pass
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(2)
+        eng, bench = state()
+        if eng in (None, "stopped", "idle", "") and not bench:
+            print(f"  engine now {eng!r}, bench idle — proceeding", flush=True)
+            return
+    print(f"  warning: engine still {eng!r} after {timeout}s — trying the bench anyway", flush=True)
+
 def run_bench(base, model_key, ctx):
     body = {"modelKey": model_key}
     if ctx:
@@ -160,6 +186,7 @@ def main():
     active = next((e for e in eng.get("engines", []) if e.get("id") == eng.get("activeEngineId")), None)
     print(f"  active engine: {active.get('name') if active else '(none)'}")
 
+    ensure_idle(B)  # unload any GUI-loaded model / cancel a stale bench so POST /bench doesn't 409
     winner = run_bench(B, key, args.ctx)
     if not winner:
         print("No winner from auto-tune — cannot compare.", file=sys.stderr); sys.exit(1)
