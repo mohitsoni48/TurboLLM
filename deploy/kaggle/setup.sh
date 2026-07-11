@@ -89,10 +89,35 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 5) Native CUDA build of the TurboQuant fork (auto-detects sm_75). ONE TIME.
+# 5) CUDA engine. Prefer a PREBUILT bundle (so nobody re-runs the ~40 min compile):
+#    a) $TURBOLLM_ENGINE_URL — a http(s) URL to turboquant-cuda-t4.tar.gz
+#    b) an attached Kaggle dataset — /kaggle/input/**/turboquant-cuda-t4*.tar.gz
+#    c) a local bundle left in /kaggle/working by publish_engine.sh
+#    Only when none is found do we build from source. Kaggle wipes /kaggle/working on
+#    session stop, so hosting the bundle (a/b) is what makes this a one-time cost.
 # ---------------------------------------------------------------------------
+find_prebuilt() {
+  [ -n "${TURBOLLM_ENGINE_URL:-}" ] && { echo "$TURBOLLM_ENGINE_URL"; return; }
+  local t
+  t="$(ls /kaggle/input/*/turboquant-cuda-t4*.tar.gz 2>/dev/null | head -1)"; [ -n "$t" ] && { echo "$t"; return; }
+  [ -f "$WORK/turboquant-cuda-t4.tar.gz" ] && echo "$WORK/turboquant-cuda-t4.tar.gz"
+}
+PREBUILT="$(find_prebuilt)"
 if [ -x "$ENGINE_BIN" ]; then
   log "CUDA engine"; skip "already built: $ENGINE_BIN  (rm -rf $ENGINE_DIR to force rebuild)"
+elif [ -n "$PREBUILT" ]; then
+  log "CUDA engine — reusing prebuilt bundle (skips the ~40 min build)"
+  mkdir -p "$ENGINE_DIR/build"
+  if [[ "$PREBUILT" == http* ]]; then
+    echo "   downloading $PREBUILT"
+    curl -fSL "$PREBUILT" -o /tmp/tq-cuda-t4.tar.gz || fail "prebuilt download failed"
+    tar -xzf /tmp/tq-cuda-t4.tar.gz -C "$ENGINE_DIR/build" || fail "prebuilt extract failed"
+  else
+    echo "   extracting $PREBUILT"
+    tar -xzf "$PREBUILT" -C "$ENGINE_DIR/build" || fail "prebuilt extract failed"
+  fi
+  [ -x "$ENGINE_BIN" ] || fail "prebuilt extracted but $ENGINE_BIN is missing"
+  skip "prebuilt ready: $ENGINE_BIN"
 else
   log "Building TurboQuant CUDA engine, -j$BUILD_JOBS — ONE TIME, expect ~30-40 min"
   rm -rf "$ENGINE_DIR"
