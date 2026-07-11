@@ -118,9 +118,9 @@ def main():
     B = args.base.rstrip("/")
 
     models = call(B, "/api/v1/models").get("models", [])
-    ggufs = [m for m in models if m.get("format") == "gguf"]
+    ggufs = [m for m in models if m.get("format") == "gguf" and not m.get("incomplete")]
     if not ggufs:
-        print("No GGUF models found — register a model dir first.", file=sys.stderr); sys.exit(1)
+        print("No complete GGUF models found — register a model dir first.", file=sys.stderr); sys.exit(1)
     key = args.model or ggufs[0]["key"]
     print(f"Models: {[m['key'] for m in ggufs]}\nUsing model key: {key}")
 
