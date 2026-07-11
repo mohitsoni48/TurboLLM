@@ -62,8 +62,10 @@ start_daemon() {
 
 register_engine() {
   log "Registering model dir + CUDA engine (idempotent)"
+  # The modeldirs endpoint expects {"dir": …} (NOT {"path": …}) — a wrong key silently
+  # 400s and the scanner never sees the models. (routes.ts POST /api/v1/modeldirs)
   curl -s -X POST "$BASE/api/v1/modeldirs" -H 'content-type: application/json' \
-    -d "{\"path\":\"$MODELS_DIR\"}" >/dev/null || true
+    -d "{\"dir\":\"$MODELS_DIR\"}" >/dev/null || true
   # Add the engine; if the name/binary is already registered, fall back to looking it up
   # by binPath. Either way we end with its id and activate it.
   local add id
