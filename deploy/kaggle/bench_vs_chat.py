@@ -98,7 +98,12 @@ def measure_chat(base, model_key, prompt, max_tokens):
                     delta = json.loads(payload)["choices"][0].get("delta", {})
                 except Exception:
                     continue
-                if delta.get("content"):
+                # Count decoded tokens on EITHER channel: a reasoning model (Qwen3.6, Gemma-4)
+                # streams its thinking as `reasoning_content` and only the final answer as
+                # `content`. Counting `content` alone made a mostly-thinking 200-token budget look
+                # like 0-1 tokens -> decode_tps n/a even though both GPUs were clearly generating.
+                # Decode throughput is the same rate regardless of channel.
+                if delta.get("content") or delta.get("reasoning_content"):
                     if t_first is None: t_first = time.time()
                     n += 1
     finally:
