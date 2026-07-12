@@ -14,7 +14,10 @@ set -uo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TLLM_DIR="$REPO_DIR/turbollm"
 WORK="${KAGGLE_WORKING:-/kaggle/working}"
-ENGINE_BIN="$WORK/turboquant/build/bin/llama-server"
+# Must match setup.sh's TURBOLLM_ENGINE_ROOT (the one-click notebook extracts the engine to
+# /tmp to keep it off the /kaggle/working output quota).
+ENGINE_ROOT="${TURBOLLM_ENGINE_ROOT:-$WORK/turboquant}"
+ENGINE_BIN="$ENGINE_ROOT/build/bin/llama-server"
 ENGINE_DIR="$(dirname "$ENGINE_BIN")"
 MODELS_DIR="$WORK/models"
 TQ_REPO="https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant"
@@ -61,11 +64,20 @@ start_daemon() {
 }
 
 register_engine() {
-  log "Registering model dir + CUDA engine (idempotent)"
+  log "Registering model dirs + CUDA engine (idempotent)"
+  # Register EVERY model source so the user can pick either path with no config:
+  #   $MODELS_DIR  → where the GUI's built-in model downloader saves HF models
+  #   /kaggle/input → any Kaggle Model/dataset the user attached via "Add Input"
+  #   $TURBOLLM_EXTRA_MODEL_DIRS → optional extra colon-separated dirs
   # The modeldirs endpoint expects {"dir": …} (NOT {"path": …}) — a wrong key silently
   # 400s and the scanner never sees the models. (routes.ts POST /api/v1/modeldirs)
-  curl -s -X POST "$BASE/api/v1/modeldirs" -H 'content-type: application/json' \
-    -d "{\"dir\":\"$MODELS_DIR\"}" >/dev/null || true
+  mkdir -p "$MODELS_DIR"
+  local dir
+  for dir in "$MODELS_DIR" /kaggle/input $(echo "${TURBOLLM_EXTRA_MODEL_DIRS:-}" | tr ':' ' '); do
+    [ -n "$dir" ] && [ -d "$dir" ] || continue
+    curl -s -X POST "$BASE/api/v1/modeldirs" -H 'content-type: application/json' \
+      -d "{\"dir\":\"$dir\"}" >/dev/null || true
+  done
   # Add the engine; if the name/binary is already registered, fall back to looking it up
   # by binPath. Either way we end with its id and activate it.
   local add id

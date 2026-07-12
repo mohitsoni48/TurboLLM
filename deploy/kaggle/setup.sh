@@ -18,7 +18,10 @@ set -uo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"        # .../TurboLLM
 TLLM_DIR="$REPO_DIR/turbollm"
 WORK="${KAGGLE_WORKING:-/kaggle/working}"
-ENGINE_DIR="$WORK/turboquant"
+# Where the engine lives. The one-click notebook sets this to /tmp so the 3.8 GB extracted
+# engine doesn't eat the 19.5 GB /kaggle/working OUTPUT quota — leaving that free for models
+# the user downloads in the GUI. Default keeps the old in-/kaggle/working location.
+ENGINE_DIR="${TURBOLLM_ENGINE_ROOT:-$WORK/turboquant}"
 ENGINE_BIN="$ENGINE_DIR/build/bin/llama-server"
 MODELS_DIR="$WORK/models"
 WEB_STAMP="$WORK/.webdist-commit"
@@ -32,6 +35,17 @@ skip() { echo -e "   \033[0;32m✓ $*\033[0m"; }
 fail() { echo -e "\n\033[1;31mSETUP FAILED: $*\033[0m" >&2; exit 1; }
 
 CUR_COMMIT="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+
+# Locate a PREBUILT engine bundle up front — its presence lets us skip BOTH the ~40 min compile
+# and the build-toolchain apt install below:
+#   a) $TURBOLLM_ENGINE_URL  b) an attached Kaggle dataset  c) a local bundle in /kaggle/working.
+find_prebuilt() {
+  [ -n "${TURBOLLM_ENGINE_URL:-}" ] && { echo "$TURBOLLM_ENGINE_URL"; return; }
+  local t
+  t="$(ls /kaggle/input/*/turboquant-cuda-t4*.tar.gz 2>/dev/null | head -1)"; [ -n "$t" ] && { echo "$t"; return; }
+  [ -f "$WORK/turboquant-cuda-t4.tar.gz" ] && echo "$WORK/turboquant-cuda-t4.tar.gz"
+}
+PREBUILT="$(find_prebuilt)"
 
 # ---------------------------------------------------------------------------
 # 1) Node >= 22.13 (TurboLLM needs node:sqlite unflagged) — needed EVERY session
@@ -63,7 +77,7 @@ fi
 # ---------------------------------------------------------------------------
 # 3) Build toolchain — ONLY needed to compile the engine. Skipped once the binary exists.
 # ---------------------------------------------------------------------------
-if [ ! -x "$ENGINE_BIN" ]; then
+if [ ! -x "$ENGINE_BIN" ] && [ -z "$PREBUILT" ]; then
   log "Build toolchain (cmake / gcc)"
   command -v cmake >/dev/null || { apt-get update -qq && apt-get install -y --no-install-recommends cmake build-essential libcurl4-openssl-dev git >/dev/null 2>&1; } || fail "toolchain install failed"
   command -v nvcc  >/dev/null || fail "nvcc not found — enable the GPU accelerator (Settings → Accelerator → GPU T4 x2)"
@@ -96,13 +110,6 @@ fi
 #    Only when none is found do we build from source. Kaggle wipes /kaggle/working on
 #    session stop, so hosting the bundle (a/b) is what makes this a one-time cost.
 # ---------------------------------------------------------------------------
-find_prebuilt() {
-  [ -n "${TURBOLLM_ENGINE_URL:-}" ] && { echo "$TURBOLLM_ENGINE_URL"; return; }
-  local t
-  t="$(ls /kaggle/input/*/turboquant-cuda-t4*.tar.gz 2>/dev/null | head -1)"; [ -n "$t" ] && { echo "$t"; return; }
-  [ -f "$WORK/turboquant-cuda-t4.tar.gz" ] && echo "$WORK/turboquant-cuda-t4.tar.gz"
-}
-PREBUILT="$(find_prebuilt)"
 if [ -x "$ENGINE_BIN" ]; then
   log "CUDA engine"; skip "already built: $ENGINE_BIN  (rm -rf $ENGINE_DIR to force rebuild)"
 elif [ -n "$PREBUILT" ]; then
@@ -146,9 +153,14 @@ fi
 # 6) Model (Q4_K_M ~17GB) — big + dense enough that a 2×T4 tensor-split matters.
 #    hf_hub_download resumes a partial file, so an interrupted download self-heals.
 # ---------------------------------------------------------------------------
-log "Model $MODEL_FILE"
+log "Model"
 mkdir -p "$MODELS_DIR"
-if [ -f "$MODELS_DIR/$MODEL_FILE" ]; then
+# One-click flow ships WITHOUT a baked-in model: the user picks one in the GUI's model
+# downloader (lands in $MODELS_DIR) or attaches a Kaggle model (served from /kaggle/input,
+# which serve.sh also registers). Set TURBOLLM_SKIP_MODEL=1 to skip the download entirely.
+if [ -n "${TURBOLLM_SKIP_MODEL:-}" ]; then
+  skip "model download skipped (TURBOLLM_SKIP_MODEL) — choose one in the GUI or attach a Kaggle model"
+elif [ -f "$MODELS_DIR/$MODEL_FILE" ]; then
   skip "already present ($(du -h "$MODELS_DIR/$MODEL_FILE" | cut -f1))"
 else
   echo "   downloading…"
