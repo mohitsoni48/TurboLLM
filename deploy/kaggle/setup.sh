@@ -144,6 +144,17 @@ elif [ -n "$RAW_ENGINE_DIR" ]; then
   # plain 644 file like the uploaded llama-server) — unconditionally executable, matching what
   # a normal build produces for everything under bin/.
   chmod -R +rx "$ENGINE_DIR/build/bin"
+  # Self-heal: the build's SONAME symlinks (e.g. libfoo.so.0 -> libfoo.so.0.1.2) don't survive
+  # Kaggle's dataset upload — they land as broken 0-byte regular files, while the fully-versioned
+  # real file uploads fine (live-verified: "error while loading shared libraries: …: file too
+  # short"). Any 0-byte libX.so* file gets its content replaced from the largest non-empty
+  # sibling sharing its base name — reconstructing what the symlink used to point to.
+  ( cd "$ENGINE_DIR/build/bin" && for f in *.so*; do
+      [ -f "$f" ] && [ ! -s "$f" ] || continue
+      base="$(echo "$f" | sed -E 's/\.so(\.[0-9]+)*$/.so/')"
+      real="$(ls -S "$base"* 2>/dev/null | while read -r c; do [ -s "$c" ] && { echo "$c"; break; }; done)"
+      [ -n "$real" ] && [ "$real" != "$f" ] && { echo "   self-healing 0-byte $f <- $real"; cp "$real" "$f"; }
+    done )
   [ -x "$ENGINE_BIN" ] || fail "copied $RAW_ENGINE_DIR but $ENGINE_BIN is still missing/not executable"
   skip "copied: $ENGINE_BIN  (from $RAW_ENGINE_DIR)"
 elif [ -n "$PREBUILT" ]; then
