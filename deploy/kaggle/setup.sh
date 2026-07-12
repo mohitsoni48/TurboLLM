@@ -132,11 +132,20 @@ fi
 if [ -x "$ENGINE_BIN" ]; then
   log "CUDA engine"; skip "already built: $ENGINE_BIN  (rm -rf $ENGINE_DIR to force rebuild)"
 elif [ -n "$RAW_ENGINE_DIR" ]; then
-  log "CUDA engine — linking a raw engine dir attached as a Kaggle dataset (no extract needed)"
+  log "CUDA engine — copying a raw engine dir attached as a Kaggle dataset (no build needed)"
+  # Kaggle's dataset upload strips the executable bit (verified: llama-server lands 644 on
+  # /kaggle/input), and that mount is read-only anyway — so a SYMLINK straight into it fails
+  # `-x` and can't be chmod'd in place. Copy the ~2.7 GB bin/ dir to /tmp instead (off the
+  # /kaggle/working quota, same as the tarball path) and fix the permissions on the copy.
   mkdir -p "$ENGINE_DIR/build"
-  ln -sfn "$RAW_ENGINE_DIR" "$ENGINE_DIR/build/bin"
-  [ -x "$ENGINE_BIN" ] || fail "linked $RAW_ENGINE_DIR but $ENGINE_BIN is still missing"
-  skip "linked: $ENGINE_BIN -> $RAW_ENGINE_DIR"
+  rm -rf "$ENGINE_DIR/build/bin"
+  cp -r "$RAW_ENGINE_DIR" "$ENGINE_DIR/build/bin" || fail "copying $RAW_ENGINE_DIR failed"
+  # `chmod +x` (not `u+X`, which only propagates an EXISTING exec bit and does nothing for a
+  # plain 644 file like the uploaded llama-server) — unconditionally executable, matching what
+  # a normal build produces for everything under bin/.
+  chmod -R +rx "$ENGINE_DIR/build/bin"
+  [ -x "$ENGINE_BIN" ] || fail "copied $RAW_ENGINE_DIR but $ENGINE_BIN is still missing/not executable"
+  skip "copied: $ENGINE_BIN  (from $RAW_ENGINE_DIR)"
 elif [ -n "$PREBUILT" ]; then
   log "CUDA engine — reusing prebuilt bundle (skips the ~40 min build)"
   mkdir -p "$ENGINE_DIR/build"
