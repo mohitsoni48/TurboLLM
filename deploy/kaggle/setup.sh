@@ -38,7 +38,7 @@ CUR_COMMIT="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
 
 # Locate a PREBUILT engine bundle up front — its presence lets us skip BOTH the ~40 min compile
 # and the build-toolchain apt install below:
-#   a) $TURBOLLM_ENGINE_URL  b) an attached Kaggle dataset  c) a local bundle in /kaggle/working.
+#   a) $TURBOLLM_ENGINE_URL  b) an attached Kaggle dataset (tarball)  c) a local bundle in /kaggle/working.
 find_prebuilt() {
   [ -n "${TURBOLLM_ENGINE_URL:-}" ] && { echo "$TURBOLLM_ENGINE_URL"; return; }
   local t
@@ -46,6 +46,21 @@ find_prebuilt() {
   [ -f "$WORK/turboquant-cuda-t4.tar.gz" ] && echo "$WORK/turboquant-cuda-t4.tar.gz"
 }
 PREBUILT="$(find_prebuilt)"
+
+# ALSO check for a RAW (already-extracted) engine dir on an attached Kaggle dataset — e.g. a
+# tarball uploaded via Kaggle's "New Dataset" web UI, which auto-extracts archives on upload, so
+# no turboquant-cuda-t4*.tar.gz ever lands on disk even though the exact same files are there
+# (verified: the dataset that publish_engine.sh's tarball produces ends up mounted at
+# /kaggle/input/<slug>/bin/llama-server + its sibling .so files). Cheaper than the tarball path —
+# no download/extract, symlink straight into /kaggle/input (read-only, which is fine — we only
+# execute from it).
+find_raw_engine_dir() {
+  local d
+  for d in /kaggle/input/*/bin /kaggle/input/*/*/bin; do
+    [ -x "$d/llama-server" ] && { echo "$d"; return; }
+  done
+}
+RAW_ENGINE_DIR="$(find_raw_engine_dir)"
 
 # ---------------------------------------------------------------------------
 # 1) Node >= 22.13 (TurboLLM needs node:sqlite unflagged) — needed EVERY session
@@ -77,7 +92,7 @@ fi
 # ---------------------------------------------------------------------------
 # 3) Build toolchain — ONLY needed to compile the engine. Skipped once the binary exists.
 # ---------------------------------------------------------------------------
-if [ ! -x "$ENGINE_BIN" ] && [ -z "$PREBUILT" ]; then
+if [ ! -x "$ENGINE_BIN" ] && [ -z "$PREBUILT" ] && [ -z "$RAW_ENGINE_DIR" ]; then
   log "Build toolchain (cmake / gcc)"
   command -v cmake >/dev/null || { apt-get update -qq && apt-get install -y --no-install-recommends cmake build-essential libcurl4-openssl-dev git >/dev/null 2>&1; } || fail "toolchain install failed"
   command -v nvcc  >/dev/null || fail "nvcc not found — enable the GPU accelerator (Settings → Accelerator → GPU T4 x2)"
@@ -104,14 +119,22 @@ fi
 
 # ---------------------------------------------------------------------------
 # 5) CUDA engine. Prefer a PREBUILT bundle (so nobody re-runs the ~40 min compile):
-#    a) $TURBOLLM_ENGINE_URL — a http(s) URL to turboquant-cuda-t4.tar.gz
-#    b) an attached Kaggle dataset — /kaggle/input/**/turboquant-cuda-t4*.tar.gz
-#    c) a local bundle left in /kaggle/working by publish_engine.sh
+#    a) a RAW engine dir on an attached Kaggle dataset — /kaggle/input/**/bin/llama-server
+#       (symlinked in place, no download/extract — see find_raw_engine_dir above)
+#    b) $TURBOLLM_ENGINE_URL — a http(s) URL to turboquant-cuda-t4.tar.gz
+#    c) an attached Kaggle dataset (tarball) — /kaggle/input/**/turboquant-cuda-t4*.tar.gz
+#    d) a local bundle left in /kaggle/working by publish_engine.sh
 #    Only when none is found do we build from source. Kaggle wipes /kaggle/working on
-#    session stop, so hosting the bundle (a/b) is what makes this a one-time cost.
+#    session stop, so hosting the bundle (a/b/c) is what makes this a one-time cost.
 # ---------------------------------------------------------------------------
 if [ -x "$ENGINE_BIN" ]; then
   log "CUDA engine"; skip "already built: $ENGINE_BIN  (rm -rf $ENGINE_DIR to force rebuild)"
+elif [ -n "$RAW_ENGINE_DIR" ]; then
+  log "CUDA engine — linking a raw engine dir attached as a Kaggle dataset (no extract needed)"
+  mkdir -p "$ENGINE_DIR/build"
+  ln -sfn "$RAW_ENGINE_DIR" "$ENGINE_DIR/build/bin"
+  [ -x "$ENGINE_BIN" ] || fail "linked $RAW_ENGINE_DIR but $ENGINE_BIN is still missing"
+  skip "linked: $ENGINE_BIN -> $RAW_ENGINE_DIR"
 elif [ -n "$PREBUILT" ]; then
   log "CUDA engine — reusing prebuilt bundle (skips the ~40 min build)"
   mkdir -p "$ENGINE_DIR/build"
