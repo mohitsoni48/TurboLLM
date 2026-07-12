@@ -42,7 +42,11 @@ CUR_COMMIT="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
 find_prebuilt() {
   [ -n "${TURBOLLM_ENGINE_URL:-}" ] && { echo "$TURBOLLM_ENGINE_URL"; return; }
   local t
-  t="$(ls /kaggle/input/*/turboquant-cuda-t4*.tar.gz 2>/dev/null | head -1)"; [ -n "$t" ] && { echo "$t"; return; }
+  # Depth of /kaggle/input mounts varies (observed both /kaggle/input/<slug>/… and
+  # /kaggle/input/datasets/<owner>/<slug>/… on different Kaggle accounts/notebook types) —
+  # `find` searches any depth instead of guessing one.
+  t="$(find /kaggle/input -maxdepth 6 -iname 'turboquant-cuda-t4*.tar.gz' 2>/dev/null | head -1)"
+  [ -n "$t" ] && { echo "$t"; return; }
   [ -f "$WORK/turboquant-cuda-t4.tar.gz" ] && echo "$WORK/turboquant-cuda-t4.tar.gz"
 }
 PREBUILT="$(find_prebuilt)"
@@ -51,16 +55,14 @@ PREBUILT="$(find_prebuilt)"
 # tarball uploaded via Kaggle's "New Dataset" web UI, which auto-extracts archives on upload, so
 # no turboquant-cuda-t4*.tar.gz ever lands on disk even though the exact same files are there
 # (verified: the dataset that publish_engine.sh's tarball produces ends up mounted at
-# /kaggle/input/<slug>/bin/llama-server + its sibling .so files). Cheaper than the tarball path —
-# no download/extract, symlink straight into /kaggle/input (read-only, which is fine — we only
-# execute from it).
+# .../bin/llama-server + its sibling .so files, at whatever depth Kaggle chose for this input).
+# Cheaper than the tarball path — no download/extract, symlink straight into /kaggle/input
+# (read-only, which is fine — we only execute from it).
 find_raw_engine_dir() {
-  local d
-  for d in /kaggle/input/*/bin /kaggle/input/*/*/bin; do
-    [ -x "$d/llama-server" ] && { echo "$d"; return; }
-  done
+  dirname "$(find /kaggle/input -maxdepth 7 -path '*/bin/llama-server' 2>/dev/null | head -1)" 2>/dev/null
 }
 RAW_ENGINE_DIR="$(find_raw_engine_dir)"
+[ "$RAW_ENGINE_DIR" = "." ] && RAW_ENGINE_DIR=""
 
 # ---------------------------------------------------------------------------
 # 1) Node >= 22.13 (TurboLLM needs node:sqlite unflagged) — needed EVERY session
