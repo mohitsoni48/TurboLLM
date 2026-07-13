@@ -14,7 +14,7 @@
 // on disk; the pi cwd is a caller-supplied scratch/repo folder that is ALSO the containment root.
 import { join, resolve } from 'node:path'
 import { readFile } from 'node:fs/promises'
-import { Type } from 'typebox'
+import { Type, Unsafe, type TSchema } from 'typebox'
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -526,6 +526,18 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     return finalText.trim() || '(the skill produced no output)'
   }
 
+  // MCP tools (Customize → MCP Servers) — the same tools Chat gets from any user-connected MCP
+  // server, extended to Code (founder decision, 2026-07-13: "all the tools built from customize
+  // that are added in chat should be available in code as well"). Fetched HERE, once, before the
+  // sync `extension` closure below (pi's extensionFactories are sync — buildToolDefinitions() is
+  // async, so it can't be called inside that closure) — a fresh list per turn is correct anyway,
+  // since MCP servers can be connected/disconnected between turns via Customize while a session
+  // is open. Filtered to MCP-prefixed names only (web_search/fetch_url are already registered
+  // above; run_code is registered unconditionally below) — see mcpToolDefs' own safety note by
+  // the tool_call hook for why these are treated differently from web_search/fetch_url.
+  const mcpToolDefs = d.tools ? (await d.tools.buildToolDefinitions()).filter((t) => t.function.name.startsWith('mcp__')) : []
+  const mcpToolNames = new Set(mcpToolDefs.map((t) => t.function.name))
+
   // ── the inline extension: containment + approval + diff plumbing ──────────────
   const extension = (pi: ExtensionAPI): void => {
     // Background-priority engine slot, acquired/released around each provider request. Also
@@ -611,7 +623,11 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       // the already-registered edit/write/bash tools run unapproved.
       const dbMode = (d.db.getConversation(convId)?.agentMode ?? mode) as CodeMode
       const liveMode: CodeMode = dbMode === 'plan' ? mode : dbMode
-      if (liveMode === 'ask' && MUTATING_TOOLS.has(toolName)) {
+      // mcpToolNames: MCP-server tools (Customize → MCP Servers) get the SAME ask-mode approval
+      // gate as edit/write/bash — see mcpToolDefs' own comment for why they're treated as
+      // mutating despite not being in the hardcoded MUTATING_TOOLS set (their names are dynamic,
+      // resolved per-run from whatever MCP servers are currently connected).
+      if (liveMode === 'ask' && (MUTATING_TOOLS.has(toolName) || mcpToolNames.has(toolName))) {
         await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'awaiting_approval' } })
         const decision = await waitForToolApproval(`${convId}:${toolCallId}`, signal)
         if (decision === 'deny') {
@@ -800,6 +816,52 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
           return { content: [{ type: 'text', text }], details: {} }
         },
       })
+
+      // run_code (founder decision, 2026-07-13: extend Chat's Customize-configured tools to
+      // Code) — a sandboxed JS snippet runner with explicitly NO fs/network/process access
+      // (builtin.ts's own RUN_CODE_TOOL description). Genuinely inert, so registered
+      // unconditionally like web_search/fetch_url — no approval gate, every mode including plan.
+      // MCP tools below get the opposite treatment (ask-mode gated, excluded from plan) because,
+      // unlike this, they're arbitrary external providers with no such safety guarantee.
+      pi.registerTool({
+        name: 'run_code',
+        label: 'Run code',
+        description: 'Execute a JavaScript snippet in a sandbox with no network, file, or process access, ' +
+          'and return the result. Useful for calculations, data transformation, and quick logic checks.',
+        promptSnippet: 'run_code(code) - execute a sandboxed JS snippet and return the result',
+        parameters: Type.Object({
+          code: Type.String({ description: 'JavaScript code to execute. The last expression is the return value.' }),
+        }),
+        async execute(toolCallId, params) {
+          const text = await tools.executeTool({ id: toolCallId, name: 'run_code', args: params })
+          return { content: [{ type: 'text', text }], details: {} }
+        },
+      })
+
+      // MCP tools (Customize → MCP Servers) — see mcpToolDefs' own comment above for how these
+      // were fetched. Unlike web_search/fetch_url/run_code, these are arbitrary EXTERNAL tool
+      // providers with no safety guarantee pi/Code can verify — a connected filesystem-style MCP
+      // server, for instance, has no relationship to this session's repoRoot containment at all.
+      // Treated as MUTATING for Code's own mode-gate purposes (mcpToolNames is checked alongside
+      // MUTATING_TOOLS in the tool_call hook below): unconfined in auto, ask-mode-approved via
+      // the SAME waitForToolApproval gate edit/write/bash already use (not Chat's own separate
+      // tool-policy system — Code's mode model is the single source of truth for approval here),
+      // and simply not registered at all in plan mode, mirroring how plan omits edit/write/bash.
+      if (mode !== 'plan') {
+        for (const def of mcpToolDefs) {
+          const toolName = def.function.name
+          pi.registerTool({
+            name: toolName,
+            label: def.function.name,
+            description: def.function.description ?? '',
+            parameters: Unsafe<Record<string, unknown>>((def.function.parameters ?? { type: 'object', properties: {} }) as TSchema),
+            async execute(toolCallId, params) {
+              const text = await tools.executeTool({ id: toolCallId, name: toolName, args: params })
+              return { content: [{ type: 'text', text }], details: {} }
+            },
+          })
+        }
+      }
     }
 
     // LSP integration (founder-reported gap, 2026-07-13, item 3: "for a new code, it should 1st
