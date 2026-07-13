@@ -104,3 +104,10 @@ test('buildAppendPrompt: plan mode with hasWebTools=true still omits edit guidan
   assert.ok(!blocks.some((b) => b.includes('first read the file, then copy')))
   assert.ok(blocks.some((b) => b.includes('STRICT RULE, no exceptions')))
 })
+
+test('buildAppendPrompt: LSP guidance appears in auto/ask but not plan mode (no edit tool there)', () => {
+  const auto = buildAppendPrompt('auto')
+  const plan = buildAppendPrompt('plan')
+  assert.ok(auto.some((b) => b.includes('LSP diagnostics for')))
+  assert.ok(!plan.some((b) => b.includes('LSP diagnostics for')))
+})

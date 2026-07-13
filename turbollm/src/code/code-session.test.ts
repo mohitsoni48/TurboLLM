@@ -102,10 +102,10 @@ test('buildAppendPrompt: plan omits edit guidance; auto/ask include it', () => {
   const plan = buildAppendPrompt('plan')
   const auto = buildAppendPrompt('auto')
   const ask = buildAppendPrompt('ask')
-  // Plan mode has no edit tool, so the edit-reliability block is dropped.
+  // Plan mode has no edit tool, so the edit-reliability and LSP blocks are both dropped.
   assert.equal(plan.length, 2)
-  assert.equal(auto.length, 3)
-  assert.equal(ask.length, 3)
+  assert.equal(auto.length, 4)
+  assert.equal(ask.length, 4)
   assert.ok(plan.every((b) => typeof b === 'string' && b.length > 0))
   // Every mode's guidance mentions its own name.
   assert.match(plan[1], /PLAN/)
@@ -145,8 +145,11 @@ test('skillsBlock: caps a pathological instructions body at 20,000 chars', () =>
 })
 
 test('buildAppendPrompt: with no skills argument, output is unchanged from before Task 4', () => {
+  // basePersona + modeGuidance always; +editReliabilityGuidance +lspGuidance outside plan mode
+  // (plan has no edit tool, see buildAppendPrompt's own comment); hasWebTools defaults false so
+  // the item 1/2 blocks are omitted here (covered separately in persona.test.ts).
   for (const m of ['auto', 'plan', 'ask'] as CodeMode[]) {
-    assert.equal(buildAppendPrompt(m).length, m === 'plan' ? 2 : 3)
+    assert.equal(buildAppendPrompt(m).length, m === 'plan' ? 2 : 4)
   }
 })
 

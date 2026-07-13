@@ -22,7 +22,7 @@ import { streamSSE } from 'hono/streaming'
 import type { Deps } from '../deps'
 import type { AgentRun } from '../chat/db'
 import { CodeRunManager } from './code-run-manager'
-import { compactCodeSession } from './code-session'
+import { compactCodeSession, disposeLspClientsForConv } from './code-session'
 import { revertFileEdits } from './revert'
 import type { CodeMode } from './persona'
 
@@ -251,6 +251,7 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
     const run = db.getAgentRun(id)
     if (!run) return err(c, 404, 'not_found', 'Session not found.')
     if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop the current run before deleting this session.')
+    disposeLspClientsForConv(run.convId)
     db.deleteCodeSession(id)
     return c.json({ ok: true })
   })

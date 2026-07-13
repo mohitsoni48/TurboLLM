@@ -12,7 +12,8 @@
 //
 // Everything is in-memory (auth/models/sessions/settings) so a run touches no global pi config
 // on disk; the pi cwd is a caller-supplied scratch/repo folder that is ALSO the containment root.
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
+import { readFile } from 'node:fs/promises'
 import { Type } from 'typebox'
 import {
   createAgentSession,
@@ -36,6 +37,8 @@ import { SkillStore, type Skill } from '../agents/skills'
 import { isContainedFromRoot } from './containment'
 import { buildAppendPrompt, toolsForMode, type CodeMode } from './persona'
 import { waitForToolApproval } from '../tools/approval-gate'
+import { LspClient, type LspDiagnostic } from './lsp-client'
+import { lspSpecForPath, lspSpecForLanguage, SUPPORTED_LSP_LANGUAGES, type LspServerSpec } from './lsp-registry'
 
 // A fabricated zero Usage for replayed history entries — pi requires the field on
 // AssistantMessage, but exact historical token counts don't matter for replay; pi recomputes
@@ -228,6 +231,26 @@ export function isDependencyAddCommand(command: string): boolean {
   return DEPENDENCY_ADD_PATTERNS.some((re) => re.test(command))
 }
 
+// LSP integration (item 3) — MODULE-level, keyed by convId (not per-runCodeSession-call): a code
+// session is one function call PER TURN (see code-run-manager.ts's own comment, "the one function
+// the manager drives per turn"), so a per-turn-scoped client would pay the npx cold-start cost
+// (up to LspClient's own ~60s ceiling) on EVERY turn instead of once per session — defeating the
+// entire point of keeping a warm, already-initialized language-server process. Persists for the
+// life of the daemon process; disposed explicitly on session delete (see
+// disposeLspClientsForConv, called from code-routes.ts's DELETE route) rather than an idle
+// timeout — simpler, and bounded by "one entry per code session that actually used an LSP, until
+// that session is deleted," which is a small, self-limiting number in practice.
+const lspClientsByConv = new Map<string, Map<string, LspClient>>()
+
+/** Disposes and forgets every LSP client running for `convId` (all languages). Called on session
+ *  delete so a deleted session's language-server child processes don't outlive it. */
+export function disposeLspClientsForConv(convId: string): void {
+  const clients = lspClientsByConv.get(convId)
+  if (!clients) return
+  for (const c of clients.values()) c.dispose()
+  lspClientsByConv.delete(convId)
+}
+
 /**
  * Run a Code session end-to-end against `repoRoot`, streaming SSE to `sink`.
  * Resolves when the pi agentic loop settles (or the run is aborted).
@@ -348,6 +371,22 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
   // this" (not tied to any specific package name, which would require unreliable parsing). Reset
   // at turn_start, same lifecycle as consecutiveToolFailures.
   let hasSearchedWebThisTurn = false
+
+  // LSP integration (item 3): one running language-server process per `language`, cached at
+  // MODULE scope keyed by convId so it survives across turns — see lspClientsByConv's own
+  // comment for why (this function runs once PER TURN, not once per whole session). TS/JS share
+  // one typescript-language-server process (lsp-registry.ts). Lazily started on first use (an
+  // explicit install_lsp call OR the first edit/write to a matching file).
+  const getLspClient = (spec: LspServerSpec): LspClient => {
+    let clients = lspClientsByConv.get(convId)
+    if (!clients) { clients = new Map(); lspClientsByConv.set(convId, clients) }
+    let client = clients.get(spec.language)
+    if (!client) {
+      client = new LspClient(spec, repoRoot)
+      clients.set(spec.language, client)
+    }
+    return client
+  }
 
   /** Runs one skill as a REAL, contained agentic sub-session — a separate pi session (its own
    *  history, not seeded with the outer conversation) but with the SAME mode-based tool access
@@ -626,6 +665,40 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
         }
       }
 
+      // LSP diagnostics (item 3) — "always use lsp whenever making a code change in a file".
+      // Fires on every SUCCESSFUL edit/write to a file in a supported language (see
+      // lsp-registry.ts): starts (or reuses) that language's server, opens/updates the file with
+      // its just-written content, and appends real compiler/type-checker diagnostics onto the
+      // edit/write's own result — same content-mutation pattern as the nudges above. Silent when
+      // there are zero diagnostics (a clean edit shouldn't add noise to every single tool result).
+      // Best-effort by design: a file read failure or a language server that never starts must
+      // never block or fail the edit itself — diagnostics are a bonus signal, not a gate. Known,
+      // accepted cost: the FIRST edit to a given language in a fresh session may add real latency
+      // (up to LspClient's own ~60s ceiling) while npx downloads the server package on a cold
+      // cache — every edit after that reuses the already-running process.
+      if (!event.isError && (event.toolName === 'edit' || event.toolName === 'write')) {
+        const relPath = typeof event.input.path === 'string' ? event.input.path : ''
+        const spec = relPath ? lspSpecForPath(relPath) : null
+        if (spec) {
+          try {
+            const absPath = resolve(repoRoot, relPath)
+            const content = await readFile(absPath, 'utf8')
+            const diagnostics: LspDiagnostic[] = await getLspClient(spec).getDiagnostics(absPath, content)
+            if (diagnostics.length > 0) {
+              const shown = diagnostics.slice(0, 20)
+              const lines = shown.map((d) => `  ${d.severity} ${d.line}:${d.character} ${d.message}${d.source ? ` (${d.source})` : ''}`)
+              const more = diagnostics.length > shown.length ? `\n  …and ${diagnostics.length - shown.length} more` : ''
+              event.content.push({
+                type: 'text',
+                text: `\n\n[LSP diagnostics for ${relPath} (${spec.language}):\n${lines.join('\n')}${more}]`,
+              })
+            }
+          } catch {
+            // Best-effort — see comment above.
+          }
+        }
+      }
+
       const text = event.content
         .map((c) => (c.type === 'text' ? c.text : ''))
         .join('')
@@ -728,6 +801,36 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
         },
       })
     }
+
+    // LSP integration (founder-reported gap, 2026-07-13, item 3: "for a new code, it should 1st
+    // analyse the coding language and install its lsp and always use lsp whenever making a code
+    // change in a file"). Explicit tool for warming up a language server before a big task; NOT
+    // required before editing — edit/write results below automatically start the right server and
+    // append real diagnostics on their own. Not gated on `d.tools` (unlike web_search/fetch_url
+    // above) since this doesn't depend on ToolRegistry at all — it spawns its own npx process.
+    pi.registerTool({
+      name: 'install_lsp',
+      label: 'Install LSP',
+      description: 'Ensure the language server for a language is installed (via npx, on demand — no ' +
+        'global install) and running, so real compiler/type-checker diagnostics are available. Not ' +
+        'required before editing (edits automatically start the right server and surface diagnostics), ' +
+        `but useful to warm one up before a large multi-file task. Supported languages: ${SUPPORTED_LSP_LANGUAGES.join(', ')}.`,
+      promptSnippet: 'install_lsp(language) - ensure a language server is installed and ready',
+      parameters: Type.Object({
+        language: Type.String({ description: `One of: ${SUPPORTED_LSP_LANGUAGES.join(', ')}.` }),
+      }),
+      async execute(_toolCallId, params) {
+        const spec = lspSpecForLanguage(params.language)
+        if (!spec) {
+          return { content: [{ type: 'text', text: `No LSP available for "${params.language}" yet. Supported: ${SUPPORTED_LSP_LANGUAGES.join(', ')}.` }], details: {} }
+        }
+        const result = await getLspClient(spec).ensureStarted()
+        const text = result.ok
+          ? `${spec.language} language server is installed and running.`
+          : `Failed to start the ${spec.language} language server: ${result.error}`
+        return { content: [{ type: 'text', text }], details: {} }
+      },
+    })
   }
 
   // ── resource loader with the inline extension + real append system prompt ─────

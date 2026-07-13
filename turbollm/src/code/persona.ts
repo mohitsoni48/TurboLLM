@@ -89,6 +89,27 @@ export function editReliabilityGuidance(): string {
   ].join(' ')
 }
 
+/** LSP guidance (founder-reported gap, 2026-07-13, item 3: "always use lsp whenever making a code
+ *  change in a file"). Unlike items 1/2, the enforcement here is already MECHANICAL and automatic
+ *  (code-session.ts's tool_result hook appends real diagnostics to every successful edit/write in
+ *  a supported language, no model action required) — this guidance exists so the model correctly
+ *  INTERPRETS those "[LSP diagnostics for ...]" blocks when it sees them (real compiler/type
+ *  errors to fix, not advisory noise) and knows `install_lsp` exists to pre-warm a language server
+ *  before a large task. Skipped in plan mode, same as editReliabilityGuidance — plan has no edit
+ *  tool, so there is nothing for diagnostics to attach to. */
+export function lspGuidance(): string {
+  return [
+    'When you successfully edit or write a file in a supported language (TypeScript, JavaScript, or',
+    'Python), a real language server automatically checks it and — if there are issues — appends a',
+    '"[LSP diagnostics for <path>]" block to that tool\'s own result. Treat these as real compiler/',
+    'type-checker errors and warnings, not advisory noise: fix them before moving on to unrelated',
+    'work, the same way you would treat a failing build. You do not need to do anything to trigger',
+    'this — it runs automatically. Call install_lsp(language) once before starting a large',
+    'multi-file task in a language to avoid paying the language server\'s one-time startup cost on',
+    'your first edit.',
+  ].join(' ')
+}
+
 /** Anti-fallback guidance (founder-reported gap, 2026-07-13, item 1): local models tend to
  *  quietly swap in an easier, DIFFERENT feature after a couple of failed attempts instead of
  *  persisting on the one actually requested (a real repro: failing to implement Android's
@@ -212,8 +233,13 @@ export function agentsMdBlock(repoRoot: string, globalDir: string): string {
  *  keeps today's exact output. */
 export function buildAppendPrompt(mode: CodeMode, skills: Skill[] = [], agentsMd?: { repoRoot: string; globalDir: string }, hasWebTools = false): string[] {
   const blocks = [basePersona(), modeGuidance(mode)]
-  // Read-only plan mode has no edit tool, so the edit guidance is irrelevant there.
-  if (mode !== 'plan') blocks.push(editReliabilityGuidance())
+  // Read-only plan mode has no edit tool, so the edit/LSP guidance is irrelevant there — install_lsp
+  // is still registered in plan mode, but pre-warming a server with nothing to attach diagnostics
+  // to isn't worth explaining in the prompt.
+  if (mode !== 'plan') {
+    blocks.push(editReliabilityGuidance())
+    blocks.push(lspGuidance())
+  }
   // Only when web_search/fetch_url are actually registered — see antiFallbackGuidance's comment.
   if (hasWebTools) {
     blocks.push(antiFallbackGuidance())
