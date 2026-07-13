@@ -70,6 +70,16 @@ export interface ResearchMeta {
   refereeVerdicts?: ClaimVerdict[]
 }
 
+/** Code, item 6 (2026-07-13): an ordered text/tool-call timeline, in TRUE chronological order —
+ *  lets a completed Code turn render with the same interleaving the live view already gets right,
+ *  instead of a fixed "reasoning → all tool calls grouped → final text" layout. Tool blocks
+ *  reference an id into this same message's `toolCalls`, mirroring db.ts's MessageTimelineBlock.
+ *  Absent on messages persisted before this field existed — callers fall back to the old grouped
+ *  rendering when it's missing. */
+export type MessageTimelineBlock =
+  | { type: 'text'; text: string }
+  | { type: 'tool'; id: string }
+
 export interface Message {
   id: string
   convId: string
@@ -80,6 +90,8 @@ export interface Message {
   attachments: string[]
   textAttachments: string[]
   toolCalls: ToolCallRecord[]
+  /** Code, item 6 — see MessageTimelineBlock's own comment. */
+  timeline?: MessageTimelineBlock[]
   stats: Partial<MessageStats>
   /** F-021/F-022: research metadata (confidence, sources, referee verdicts). */
   researchMeta?: ResearchMeta

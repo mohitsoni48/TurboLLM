@@ -341,6 +341,15 @@ export interface ToolCallRecord {
   firstChangedLine?: number
 }
 
+/** Code, item 6 (2026-07-13): an ordered text/tool-call timeline for an assistant message, in
+ *  TRUE chronological order — the fix for completed Code turns rendering in a fixed "reasoning →
+ *  all tool calls grouped → final text" layout regardless of how they actually interleaved live.
+ *  Tool blocks reference an id into this same message's `toolCalls` array rather than duplicating
+ *  the full record — `toolCalls` remains the single source of truth for a call's data. */
+export type MessageTimelineBlock =
+  | { type: 'text'; text: string }
+  | { type: 'tool'; id: string }
+
 /** F-021: research metadata attached to Research-persona assistant messages. */
 export interface ResearchMeta {
   /** Self-assessed confidence score emitted by the model (0.0–1.0). */
@@ -380,6 +389,9 @@ export interface Message {
   textAttachments: string[]
   /** Tool calls made by this assistant turn (v0.7.0). */
   toolCalls: ToolCallRecord[]
+  /** Code, item 6 — ordered text/tool-call interleave. Absent on messages persisted before this
+   *  field existed, and on non-Code (chat) messages, which never populate it. */
+  timeline?: MessageTimelineBlock[]
   stats: Partial<MessageStats>
   /** F-021/F-022: research metadata (confidence, sources, referee verdicts). Absent on non-research messages. */
   researchMeta?: ResearchMeta
@@ -401,7 +413,7 @@ export interface Message {
 interface ConvRow { id: string; title: string; system_prompt: string; model_key: string; sampling: string; expert_mode: number; tool_policy: string | null; kind: string | null; folder_id: string | null; tool_overrides: string | null; agent_id: string | null; completed_at: string | null; read_scope: string | null; agent_mode: string | null; skill_ids: string | null; allowed_tools: string | null; preserve_thinking: number; created_at: string; updated_at: string }
 interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; agent_id: string | null; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null; archived_at: string | null; completion: string | null; repo_root: string | null; repo_branch: string | null; use_worktree: number | null; worktree_branch: string | null; worktree_base: string | null; lines_added: number | null; lines_removed: number | null; compaction_summary: string | null; compaction_upto_message_id: string | null; compaction_tokens_before: number | null; cleared_upto_message_id: string | null }
 interface FolderRow { id: string; name: string; sort_order: number; created_at: string; updated_at: string }
-interface MsgRow  { id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string; reasoning: string; attachments: string; text_attachments: string | null; tool_calls: string | null; stats: string; model_key: string | null; research_meta: string | null; created_at: string; variant_group: string | null; is_active: number; branch_of: string | null; edited: number }
+interface MsgRow  { id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string; reasoning: string; attachments: string; text_attachments: string | null; tool_calls: string | null; timeline: string | null; stats: string; model_key: string | null; research_meta: string | null; created_at: string; variant_group: string | null; is_active: number; branch_of: string | null; edited: number }
 
 // node:sqlite named-param objects need an explicit cast to Record<string, SQLInputValue>
 type P = Record<string, SQLInputValue>
@@ -455,6 +467,7 @@ function rowToAgentRun(r: AgentRunRow): AgentRun {
 function rowToMsg(r: MsgRow): Message {
   const msg: Message = { id: r.id, convId: r.conv_id, seq: r.seq, role: r.role, content: r.content, reasoning: r.reasoning, attachments: safeJson(r.attachments) as string[], textAttachments: r.text_attachments ? safeJson(r.text_attachments) as string[] : [], toolCalls: r.tool_calls ? safeJson(r.tool_calls) as ToolCallRecord[] : [], stats: safeJson(r.stats) as Partial<MessageStats>, createdAt: r.created_at, variantGroup: r.variant_group, isActive: r.is_active !== 0, branchOf: r.branch_of, edited: r.edited === 1 }
   if (r.research_meta) msg.researchMeta = safeJson(r.research_meta) as ResearchMeta
+  if (r.timeline) msg.timeline = safeJson(r.timeline) as MessageTimelineBlock[]
   return msg
 }
 
@@ -802,6 +815,17 @@ export class ConversationStore {
       if (!this.hasColumn('agent_runs', 'cleared_upto_message_id')) this.db.exec(`ALTER TABLE agent_runs ADD COLUMN cleared_upto_message_id TEXT;`)
       this.db.exec(`PRAGMA user_version = 30;`)
     }
+    // v31 (Code, founder-reported gap 2026-07-13, item 6): an ordered text/tool-call timeline
+    // for assistant messages, so a completed Code turn can render in TRUE chronological order
+    // instead of today's fixed "reasoning → all tool calls grouped → final text" layout — the
+    // persisted `content`+`toolCalls` shape has no interleave-position marker to reconstruct from.
+    // JSON array of {type:'text',text} | {type:'tool',id} blocks (tool blocks reference an id in
+    // `toolCalls` rather than duplicating it). Nullable — existing rows get NULL and the UI falls
+    // back to the pre-fix grouped rendering for them (non-breaking, no backfill).
+    if (v < 31) {
+      if (!this.hasColumn('messages', 'timeline')) this.db.exec(`ALTER TABLE messages ADD COLUMN timeline TEXT;`)
+      this.db.exec(`PRAGMA user_version = 31;`)
+    }
   }
 
   listConversations(q?: string, kind: 'chat' | 'agent' | 'all' = 'all'): Conversation[] {
@@ -910,12 +934,13 @@ export class ConversationStore {
     return row ? rowToMsg(row) : null
   }
 
-  updateMessage(id: string, patch: Partial<Pick<Message, 'content' | 'reasoning' | 'toolCalls' | 'stats' | 'researchMeta' | 'edited'>>): boolean {
+  updateMessage(id: string, patch: Partial<Pick<Message, 'content' | 'reasoning' | 'toolCalls' | 'timeline' | 'stats' | 'researchMeta' | 'edited'>>): boolean {
     const sets: string[] = []
     const params: Record<string, SQLInputValue> = { $id: id }
     if (patch.content      !== undefined) { sets.push('content = $content');         params.$content      = patch.content }
     if (patch.reasoning    !== undefined) { sets.push('reasoning = $reasoning');     params.$reasoning    = patch.reasoning }
     if (patch.toolCalls    !== undefined) { sets.push('tool_calls = $tc');           params.$tc           = JSON.stringify(patch.toolCalls) }
+    if (patch.timeline     !== undefined) { sets.push('timeline = $tl');             params.$tl           = JSON.stringify(patch.timeline) }
     if (patch.stats        !== undefined) { sets.push('stats = $stats');             params.$stats        = JSON.stringify(patch.stats) }
     if (patch.researchMeta !== undefined) { sets.push('research_meta = $rm');        params.$rm           = JSON.stringify(patch.researchMeta) }
     if (patch.edited       !== undefined) { sets.push('edited = $edited');           params.$edited       = patch.edited ? 1 : 0 }

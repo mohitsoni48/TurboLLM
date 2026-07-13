@@ -16,7 +16,7 @@ import {
   Terminal,
   XCircle,
 } from 'lucide-react'
-import type { LiveToolCall, Message, ToolCallRecord } from '../../lib/chat-types'
+import type { LiveToolCall, Message, MessageTimelineBlock, ToolCallRecord } from '../../lib/chat-types'
 import type { LiveBlock } from '../../lib/live-timeline'
 import { friendlyName } from '../../lib/tool-explain'
 import { cn } from '../../lib/utils'
@@ -536,6 +536,12 @@ function CodeMessageEntry({ message, onRevert }: { message: Message; onRevert?: 
   }
   const calls = (message.toolCalls ?? []).map(toRecordCall)
   const isEmpty = !message.content?.trim() && !message.reasoning?.trim() && calls.length === 0
+  // Item 6: a message persisted with a real timeline renders in TRUE chronological order — a run
+  // of tool calls followed by text followed by another run of tool calls stays three separate
+  // blocks in that order, instead of always collapsing into one "all tools, then all text" shape.
+  // `timeline` is absent on messages saved before this field existed; those fall back to the
+  // pre-fix grouped rendering below (same shape this component has always used).
+  const chunks = message.timeline?.length ? chunkPersistedTimeline(message.timeline, message.toolCalls ?? []) : null
   return (
     <div className="tllm-rise-in flex flex-col gap-3">
       {message.reasoning?.trim() && (
@@ -543,22 +549,41 @@ function CodeMessageEntry({ message, onRevert }: { message: Message; onRevert?: 
           <CodeReasoning reasoning={message.reasoning} />
         </RailEntry>
       )}
-      {calls.length > 0 && (
-        <RailEntry icon={runIcon(calls)} tone={runTone(calls)}>
-          <ToolRun calls={calls} batchTime={message.createdAt} />
-        </RailEntry>
-      )}
-      {isEmpty ? (
+      {chunks
+        ? chunks.map((c, i) =>
+          c.kind === 'text'
+            ? (
+                <RailEntry key={i} icon={SquareTerminal}>
+                  <CodeCommentary content={c.text} />
+                </RailEntry>
+              )
+            : (
+                <RailEntry key={i} icon={runIcon(c.calls)} tone={runTone(c.calls)}>
+                  <ToolRun calls={c.calls} batchTime={message.createdAt} />
+                </RailEntry>
+              ),
+        )
+        : (
+            <>
+              {calls.length > 0 && (
+                <RailEntry icon={runIcon(calls)} tone={runTone(calls)}>
+                  <ToolRun calls={calls} batchTime={message.createdAt} />
+                </RailEntry>
+              )}
+              {message.content?.trim() && (
+                <RailEntry icon={SquareTerminal}>
+                  <CodeCommentary content={message.content} />
+                </RailEntry>
+              )}
+            </>
+          )}
+      {isEmpty && (
         <RailEntry icon={XCircle} tone="err">
           <p className="text-[13px]" style={{ color: 'var(--err)' }}>
             {message.stats.aborted ? 'Run stopped or failed.' : 'No output for this turn.'}
           </p>
         </RailEntry>
-      ) : message.content?.trim() ? (
-        <RailEntry icon={SquareTerminal}>
-          <CodeCommentary content={message.content} />
-        </RailEntry>
-      ) : null}
+      )}
     </div>
   )
 }
@@ -588,6 +613,38 @@ function chunkTimeline(timeline: LiveBlock[]): StreamChunk[] {
       i++
     }
     chunks.push({ kind: 'tools', calls: run })
+  }
+  return chunks
+}
+
+/** The SAME chunking as chunkTimeline (above), for a PERSISTED message's `timeline` (item 6):
+ *  walks the ordered text/tool-call blocks a completed turn was saved with, grouping consecutive
+ *  tool blocks into one run and starting a fresh run the instant a text block appears — so a tool
+ *  call that comes after some text never merges backward into an earlier group, matching the true
+ *  order the turn actually ran in rather than today's fixed "all tool calls in one group"
+ *  rendering. `{type:'tool', id}` blocks are resolved against `toolCalls` by id; a dangling id
+ *  (shouldn't happen — both are written together in the same updateMessage call) is skipped
+ *  rather than crashing the render. */
+function chunkPersistedTimeline(timeline: MessageTimelineBlock[], toolCalls: ToolCallRecord[]): StreamChunk[] {
+  const byId = new Map(toolCalls.map((tc) => [tc.id, tc]))
+  const chunks: StreamChunk[] = []
+  let i = 0
+  while (i < timeline.length) {
+    const b = timeline[i]
+    if (b.type === 'text') {
+      if (b.text) chunks.push({ kind: 'text', text: b.text })
+      i++
+      continue
+    }
+    const run: NormalizedCall[] = []
+    while (i < timeline.length) {
+      const cur = timeline[i]
+      if (cur.type !== 'tool') break
+      const tc = byId.get(cur.id)
+      if (tc) run.push(toRecordCall(tc))
+      i++
+    }
+    if (run.length) chunks.push({ kind: 'tools', calls: run })
   }
   return chunks
 }

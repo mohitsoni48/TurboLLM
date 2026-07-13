@@ -25,7 +25,7 @@
 // because completed turns are already persisted as DB messages (getCodeSession returns them).
 import { EventEmitter } from 'node:events'
 import type { Deps } from '../deps'
-import type { ToolCallRecord } from '../chat/db'
+import type { ToolCallRecord, MessageTimelineBlock } from '../chat/db'
 import { autoTitleFromConversation } from '../chat/chat-routes'
 import { runCodeSession } from './code-session'
 import type { CodeMode } from './persona'
@@ -249,13 +249,27 @@ export class CodeRunManager {
     let content = ''
     let reasoning = ''
     const toolCalls: ToolCallRecord[] = []
+    // Item 6: the SAME ordered interleave the live SSE view reconstructs client-side
+    // (web/src/lib/live-timeline.ts's appendTextDelta/upsertToolCall), built once here instead of
+    // reconstructed after the fact — `content`/`toolCalls` above accumulate text and tool calls
+    // SEPARATELY and lose the true order between them, which was the whole bug. `reasoning`
+    // deliberately does NOT participate (mirrors the live view: reasoning renders as its own
+    // leading block, never interleaved with text/tool blocks).
+    const timeline: MessageTimelineBlock[] = []
     const sink = (ev: { event: string; data: unknown }) => {
       const data = ev.data as Record<string, unknown>
-      if (ev.event === 'delta') content += String(data.delta ?? '')
+      if (ev.event === 'delta') {
+        const delta = String(data.delta ?? '')
+        content += delta
+        const last = timeline[timeline.length - 1]
+        if (last && last.type === 'text') last.text += delta
+        else timeline.push({ type: 'text', text: delta })
+      }
       else if (ev.event === 'reasoning') reasoning += String(data.delta ?? '')
       else if (ev.event === 'tool_call' && (data.status === 'done' || data.status === 'error')) {
+        const id = String(data.id ?? '')
         toolCalls.push({
-          id: String(data.id ?? ''),
+          id,
           name: String(data.name ?? ''),
           args: (data.args as Record<string, unknown>) ?? {},
           result: data.status === 'done' ? (data.result as string | undefined) : undefined,
@@ -267,6 +281,7 @@ export class CodeRunManager {
           patch: data.patch as string | undefined,
           firstChangedLine: data.firstChangedLine as number | undefined,
         })
+        timeline.push({ type: 'tool', id })
       }
       push(ev.event, ev.data)
     }
@@ -291,11 +306,17 @@ export class CodeRunManager {
       })
 
       const finalContent = content.trim() || result.finalText
+      // Rare fallback: pi's own getLastAssistantText() produced text the delta stream never
+      // carried (result.finalText used instead of the empty accumulated `content`). Mirror it
+      // into the timeline too so a completed message's timeline text always matches its content
+      // — otherwise the interleaved render would silently drop this reply's only content.
+      if (!content.trim() && result.finalText.trim()) timeline.push({ type: 'text', text: result.finalText })
       const ctxStats = this.reliableContextStats(s.convId, { ctxUsed: result.contextUsed, ctxMax: result.contextMax }, result.aborted)
       this.d.db.updateMessage(assistantMsg.id, {
         content: finalContent,
         reasoning,
         toolCalls,
+        timeline,
         stats: { ctxUsed: ctxStats.ctxUsed, ctxMax: ctxStats.ctxMax, model: model?.key, aborted: result.aborted },
       })
       if (result.finalText.trim()) this.d.db.upsertRunDoc(sessionId, result.finalText.trim())
@@ -324,7 +345,7 @@ export class CodeRunManager {
       // "usage cannot shrink" floor as the success path below, just with a reported 0 as input).
       const carried = isAbort ? this.reliableContextStats(s.convId, { ctxUsed: 0, ctxMax: 0 }, true) : undefined
       if (content.trim() || reasoning.trim() || toolCalls.length) {
-        this.d.db.updateMessage(assistantMsg.id, { content: content.trim(), reasoning, toolCalls, stats: { aborted: isAbort, ...carried } })
+        this.d.db.updateMessage(assistantMsg.id, { content: content.trim(), reasoning, toolCalls, timeline, stats: { aborted: isAbort, ...carried } })
       } else {
         this.d.db.updateMessage(assistantMsg.id, { stats: { aborted: isAbort, ...carried } })
       }
