@@ -20,6 +20,7 @@ import type { LiveBlock } from '../../lib/live-timeline'
 import { friendlyName } from '../../lib/tool-explain'
 import { cn } from '../../lib/utils'
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '../../components/ui/sheet'
+import { CopyButton } from '../../components/ui/copy-button'
 import { Markdown } from '../chat/MessageBubble'
 
 // ── Code session transcript ──────────────────────────────────────────────────
@@ -408,10 +409,13 @@ function runIcon(calls: NormalizedCall[]) {
 function CodeInstructionEntry({ content }: { content: string }) {
   return (
     <div
-      className="ml-auto w-fit max-w-[min(88%,900px)] rounded-lg border px-4 py-3"
+      className="group ml-auto w-fit max-w-[min(88%,900px)] rounded-lg border px-4 py-3"
       style={{ borderColor: 'color-mix(in srgb, var(--accent) 35%, var(--border))', background: 'color-mix(in srgb, var(--accent) 6%, transparent)' }}
     >
       <p className="whitespace-pre-wrap text-[14px] leading-relaxed text-ink">{content}</p>
+      <div className="mt-1 flex justify-end opacity-0 transition-opacity group-hover:opacity-100">
+        <CopyButton text={content} size={12} />
+      </div>
     </div>
   )
 }
@@ -449,8 +453,15 @@ function CodeReasoning({ reasoning, streaming }: { reasoning: string; streaming?
 function CodeCommentary({ content, streaming }: { content: string; streaming?: boolean }) {
   if (!content.trim()) return null
   return (
-    <div className="prose-tllm text-[14px] leading-[1.7] text-ink">
-      <Markdown streaming={streaming}>{content}</Markdown>
+    <div className="group">
+      <div className="prose-tllm text-[14px] leading-[1.7] text-ink">
+        <Markdown streaming={streaming}>{content}</Markdown>
+      </div>
+      {!streaming && (
+        <div className="opacity-0 transition-opacity group-hover:opacity-100">
+          <CopyButton text={content} size={12} />
+        </div>
+      )}
     </div>
   )
 }

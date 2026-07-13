@@ -146,6 +146,18 @@ export function CodeComposer({
     onValueChange(`/${cmd.id} `)
   }
 
+  // Grow the textarea with its content (up to the CSS max-h-* cap below, which then scrolls
+  // internally) instead of staying pinned at its initial `rows` height. Resetting to 'auto'
+  // first lets scrollHeight reflect the CONTENT's natural height (not the previous inline
+  // height) before growing/shrinking to match — also what makes it shrink back down after a
+  // submit clears the value, not just grow one-way.
+  useEffect(() => {
+    const el = inputRef.current
+    if (!el) return
+    el.style.height = 'auto'
+    el.style.height = `${el.scrollHeight}px`
+  }, [value, inputRef])
+
   return (
     <div>
       <div className="relative">

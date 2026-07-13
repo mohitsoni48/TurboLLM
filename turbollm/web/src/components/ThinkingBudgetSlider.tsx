@@ -52,7 +52,11 @@ export function ThinkingBudgetSlider({ value, onChange }: { value: number; onCha
         <Brain size={15} />
       </button>
       {open && (
-        <div className="absolute right-0 top-full z-20 mt-2 w-64 rounded-[var(--radius-lg)] border border-border bg-panel p-3 shadow-[var(--shadow-2)]">
+        // Opens UPWARD (bottom-full), not downward: this control lives in a composer toolbar
+        // docked at the bottom of the screen (Chat + Code), so top-full used to push the panel
+        // off the bottom of the viewport / behind the OS taskbar. Mirrors CodeComposer's own
+        // slash-command picker, which already opens upward for the same reason.
+        <div className="absolute right-0 bottom-full z-20 mb-2 w-64 rounded-[var(--radius-lg)] border border-border bg-panel p-3 shadow-[var(--shadow-2)]">
           <div className="mb-2 flex items-center justify-between text-[12px]">
             <span className="font-medium text-ink">Thinking budget</span>
             <span className="text-muted">{formatBudget(value)}</span>

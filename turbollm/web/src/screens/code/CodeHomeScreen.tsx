@@ -240,17 +240,9 @@ export function CodeHomeScreen() {
     inputRef.current?.focus()
   }
 
-  const autoResize = () => {
-    const el = inputRef.current
-    if (!el) return
-    el.style.height = 'auto'
-    el.style.height = `${Math.min(el.scrollHeight, 192)}px`
-  }
-
   const fillTask = (text: string) => {
     setInput(text)
     inputRef.current?.focus()
-    setTimeout(autoResize, 0)
   }
 
   // Composer commands like /compact only make sense against an EXISTING session's real
@@ -435,7 +427,7 @@ export function CodeHomeScreen() {
         <CodeComposer
           inputRef={inputRef}
           value={input}
-          onValueChange={(v) => { setInput(v); autoResize() }}
+          onValueChange={setInput}
           onSubmit={() => void send()}
           placeholder="Describe a task or ask a question…"
           repo={{

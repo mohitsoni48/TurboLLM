@@ -147,6 +147,17 @@ export function CodeSessionScreen() {
   }, [sessionId])
 
   const [live, setLive] = useState<LiveState | null>(null)
+  // A queued follow-up's user message is persisted (POST /messages) the moment it's SUBMITTED,
+  // not when its own turn actually starts — code-routes.ts's `enqueue` can leave it waiting
+  // behind the active run for a while. Since `messages` renders in seq order, that follow-up's
+  // instruction card used to appear ABOVE the still-streaming current turn's live content
+  // (which always renders last, after the full `messages` list) — reading as if the queued
+  // message had jumped ahead. The existing "Queued" chips below the composer already show
+  // what's waiting, so cut the transcript off at the current live turn's own assistant
+  // placeholder — anything after it (an already-persisted but not-yet-started queued follow-up)
+  // stays hidden from the transcript until it actually starts running.
+  const liveBoundaryIdx = live ? messages.findIndex((m) => m.id === live.assistantId) : -1
+  const transcriptMessages = liveBoundaryIdx === -1 ? messages : messages.slice(0, liveBoundaryIdx + 1)
   const [input, setInput] = useState('')
   // The SERVER-side message queue's contents (tasks waiting behind the active run). Driven by
   // the daemon — `queue` SSE frames while streaming, plus the session detail on load — NOT
@@ -195,13 +206,6 @@ export function CodeSessionScreen() {
   }, [live])
 
   useEffect(() => { if (live) scrollToBottom() }, [live, scrollToBottom])
-
-  const autoResize = () => {
-    const el = inputRef.current
-    if (!el) return
-    el.style.height = 'auto'
-    el.style.height = `${Math.min(el.scrollHeight, 160)}px`
-  }
 
   // ── the single, reconnectable run subscription ────────────────────────────────
   // ONE persistent GET /stream per mounted session (not one-per-turn). It replays whatever the
@@ -350,15 +354,13 @@ export function CodeSessionScreen() {
     if (!sessionId) return
     const instructions = COMPACT_RE.exec(text)?.[1]?.trim() || undefined
     setInput('')
-    setTimeout(autoResize, 0)
     try {
       const result = await compactCodeSession(sessionId, instructions)
       void qc.invalidateQueries({ queryKey: codeKeys.detail(sessionId) })
       toast.success(`Compacted — ${result.tokensBefore.toLocaleString()} tokens of history summarized.`)
     } catch (e) {
       setInput(text) // restore so the command isn't lost
-      setTimeout(autoResize, 0)
-      if (e instanceof ApiError && e.code === 'nothing_to_compact') toast.info('Nothing to compact yet — history is already short enough.')
+        if (e instanceof ApiError && e.code === 'nothing_to_compact') toast.info('Nothing to compact yet — history is already short enough.')
       else toast.error(e instanceof ApiError ? e.message : 'Could not compact.')
     }
   }
@@ -372,7 +374,6 @@ export function CodeSessionScreen() {
   const runClear = async () => {
     if (!sessionId) return
     setInput('')
-    setTimeout(autoResize, 0)
     try {
       await clearMut.mutateAsync(sessionId)
       toast.success('Chat cleared — use /resume or the banner above to bring it back.')
@@ -384,7 +385,6 @@ export function CodeSessionScreen() {
   const runResume = async () => {
     if (!sessionId) return
     setInput('')
-    setTimeout(autoResize, 0)
     try {
       await resumeMut.mutateAsync(sessionId)
       toast.success('Chat resumed.')
@@ -402,7 +402,6 @@ export function CodeSessionScreen() {
     if (RESUME_RE.test(text)) { await runResume(); return }
     const finalText = rewriteSkillCommand(text)
     setInput('')
-    setTimeout(autoResize, 0)
     userScrolledUp.current = false
     // Always POST: the daemon starts the turn if idle, or QUEUES it (in order) behind the active
     // run. Either way it's owned server-side, so a queued follow-up survives a disconnect. The
@@ -413,8 +412,7 @@ export function CodeSessionScreen() {
       connect()
     } catch (e) {
       setInput(text) // restore so the message isn't lost
-      setTimeout(autoResize, 0)
-      toast.error(e instanceof ApiError ? e.message : 'Could not send.')
+        toast.error(e instanceof ApiError ? e.message : 'Could not send.')
     }
   }
 
@@ -575,7 +573,7 @@ export function CodeSessionScreen() {
             )}
             {!notFound && (
               <CodeTranscript
-                messages={messages}
+                messages={transcriptMessages}
                 liveAssistantId={live?.assistantId}
                 live={live ? { timeline: live.timeline, reasoning: live.reasoning } : null}
               />
@@ -619,7 +617,7 @@ export function CodeSessionScreen() {
           <CodeComposer
             inputRef={inputRef}
             value={input}
-            onValueChange={(v) => { setInput(v); autoResize() }}
+            onValueChange={setInput}
             onSubmit={() => void send()}
             placeholder={live ? 'Queue a follow-up…' : 'Send a follow-up…'}
             textareaDisabled={false}
