@@ -11,7 +11,7 @@ import { registerAgentRoutes } from './agents/agent-routes'
 import { registerCodeRoutes } from './code/code-routes'
 import type { Deps } from './deps'
 import { registerGateway } from './gateway/gateway'
-import { lanAuth } from './auth'
+import { lanAuth, codeAuth } from './auth'
 
 // Reuse TCP connections for all engine and HF fetch calls. Without this, Node
 // opens a new connection per request — ~5–20 ms of extra latency every Claude
@@ -41,6 +41,9 @@ export function createApp(d: Deps): Hono {
   // LAN auth gate (spec 06 §5): no-op while loopback-only (lanBind=false); once
   // LAN-exposed, requires a valid API key for non-loopback /api/* and /v1/* calls.
   app.use('*', lanAuth(d))
+  // Code-specific gate (independent of requireApiKey — see auth.ts's codeAuth doc comment):
+  // Code always needs a key from a non-host device, even when the rest of the app is open.
+  app.use('/api/v1/code/*', codeAuth(d))
 
   app.get('/healthz', (c) => c.json({ status: 'ok', version: d.version }))
 

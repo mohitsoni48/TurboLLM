@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useRef, useState } from 'react'
+import { lazy, Suspense, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import {
   Navigate,
   Route,
@@ -11,6 +11,7 @@ import { UnreachableOverlay } from './components/UnreachableOverlay'
 import { AuthGate } from './components/AuthGate'
 import { useStatus } from './lib/queries'
 import { ApiError, setAuthToken } from './lib/api'
+import { subscribeCodeAuthNeeded, isCodeAuthNeeded } from './lib/auth-signal'
 
 // Route-level code splitting: each screen loads only when first navigated to.
 const WorkspaceScreen = lazy(() => import('./screens/WorkspaceScreen').then((m) => ({ default: m.WorkspaceScreen })))
@@ -58,7 +59,10 @@ export function App() {
   const online = statusQ.isSuccess
   // A 401 isn't a lost connection — the daemon is up but (LAN-exposed) wants an API
   // key. Show the key prompt instead of the misleading "lost connection" overlay.
-  const needsAuth = statusQ.isError && statusQ.error instanceof ApiError && statusQ.error.status === 401
+  // Code has its OWN always-on key gate independent of the global one (auth.ts's codeAuth) —
+  // /status itself never 401s for it, so code-api.ts marks this separate signal instead.
+  const codeAuthNeeded = useSyncExternalStore(subscribeCodeAuthNeeded, isCodeAuthNeeded)
+  const needsAuth = (statusQ.isError && statusQ.error instanceof ApiError && statusQ.error.status === 401) || codeAuthNeeded
 
   // Latch the auth prompt once we've seen a 401, and keep it up until a poll finally
   // SUCCEEDS. Without this, a flaky LAN link (common on the remote machine where you're

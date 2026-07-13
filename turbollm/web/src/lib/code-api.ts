@@ -3,12 +3,18 @@
 import type { Conversation } from './chat-types'
 import type { CodeSession, CodeSessionFilter, CodeStreamEvent, CreateCodeSessionParams } from './code-types'
 import { ApiError, authHeaders } from './api'
+import { markCodeAuthNeeded, clearCodeAuthNeeded } from './auth-signal'
 
 async function req<T>(path: string, init?: RequestInit & { json?: unknown }): Promise<T> {
   const headers: Record<string, string> = { Accept: 'application/json', ...authHeaders(), ...((init?.headers as Record<string, string>) ?? {}) }
   let body = init?.body
   if (init && 'json' in init && init.json !== undefined) { headers['Content-Type'] = 'application/json'; body = JSON.stringify(init.json) }
   const res = await fetch(path, { ...init, headers, body })
+  // Code always requires a key from a non-host device (auth.ts's codeAuth), independent of
+  // whether the rest of the app is open — App.tsx's own key prompt only watches the global
+  // /status poll, which never 401s for this gate, so surface it via a shared signal instead.
+  if (res.status === 401) markCodeAuthNeeded()
+  else if (res.ok) clearCodeAuthNeeded()
   if (res.status === 204) return undefined as T
   const text = await res.text()
   const data = text ? (() => { try { return JSON.parse(text) } catch { return undefined } })() : undefined
@@ -133,6 +139,8 @@ export async function* streamCodeSession(
     headers: { ...authHeaders() },
     signal,
   })
+  if (res.status === 401) markCodeAuthNeeded()
+  else if (res.ok) clearCodeAuthNeeded()
   if (!res.ok || !res.body) {
     const text = await res.text().catch(() => '')
     const env = (() => { try { return JSON.parse(text) } catch { return undefined } })() as { error?: { code?: string; message?: string } } | undefined
