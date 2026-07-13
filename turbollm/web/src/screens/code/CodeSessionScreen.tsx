@@ -20,6 +20,7 @@ import { ToolApprovalBar } from '../chat/ToolApprovalBar'
 import { ConversationSidebar } from '../chat/ConversationSidebar'
 import { readSavedSidebarWidth, SIDEBAR_MIN_W, sidebarMaxW, SidebarResizeHandle } from '../chat/SidebarResizeHandle'
 import { ModelDetailDialog } from '../models/ModelDetailDialog'
+import { FsBrowser } from '../engines/FsBrowser'
 import { CodeComposer } from './CodeComposer'
 import { CodeTranscript } from './CodeTranscript'
 import { AGENT_MODES, type AgentModeId } from './code-mock'
@@ -159,6 +160,10 @@ export function CodeSessionScreen() {
   const liveBoundaryIdx = live ? messages.findIndex((m) => m.id === live.assistantId) : -1
   const transcriptMessages = liveBoundaryIdx === -1 ? messages : messages.slice(0, liveBoundaryIdx + 1)
   const [input, setInput] = useState('')
+  // "Add context" — absolute paths picked via a file browser, sent alongside the next follow-up
+  // as contextFiles (see code-api.ts's startCodeRun / code-routes.ts's contextFilesBlock).
+  const [contextFiles, setContextFiles] = useState<string[]>([])
+  const [contextBrowserOpen, setContextBrowserOpen] = useState(false)
   // The SERVER-side message queue's contents (tasks waiting behind the active run). Driven by
   // the daemon — `queue` SSE frames while streaming, plus the session detail on load — NOT
   // browser memory, so queued follow-ups survive a disconnect/reload and still fire in order
@@ -338,15 +343,19 @@ export function CodeSessionScreen() {
   // but Code's invocation model differs: there's no persistent "enabled skills" state to mutate
   // here (unlike Chat's conversations.skillIds), so the model only knows to use a skill via a real
   // invoke_skill(skillId, task) TOOL CALL (persona.ts's skillCatalogBlock) — plain "/skillid" text
-  // means nothing to it. Submitting "/skillid task" REWRITES the message into an explicit
-  // instruction telling the model to call that tool (see rewriteSkillCommand below).
+  // means nothing to it. Submitting "/skillid task" USED TO rewrite the stored/displayed message
+  // itself into an explicit tool instruction — the founder flagged this as bad UX (your own typed
+  // message shouldn't be silently altered). Now the literal text is always what's stored/shown;
+  // skillPromptOverride computes a SEPARATE string sent only as this turn's prompt (see
+  // startCodeRun's promptOverride param / code-routes.ts) to still reliably steer the model
+  // toward invoke_skill, without touching what the user actually typed.
   const skillsQ = useQuery({ queryKey: skillKeys.list(), queryFn: fetchSkills, staleTime: 30_000 })
   const SKILL_RE = /^\/([a-z0-9-]+)(?:\s+([\s\S]*))?$/i
-  const rewriteSkillCommand = (text: string): string => {
+  const skillPromptOverride = (text: string): string | undefined => {
     const match = SKILL_RE.exec(text)
     const skill = match ? (skillsQ.data ?? []).find((s) => s.id === match[1]) : undefined
     const task = (match?.[2] ?? '').trim()
-    return skill && task ? `Use the invoke_skill tool with skillId "${skill.id}" for this task: ${task}` : text
+    return skill && task ? `Use the invoke_skill tool with skillId "${skill.id}" for this task: ${task}` : undefined
   }
 
   const COMPACT_RE = /^\/compact\b\s*(.*)$/i
@@ -360,7 +369,7 @@ export function CodeSessionScreen() {
       toast.success(`Compacted — ${result.tokensBefore.toLocaleString()} tokens of history summarized.`)
     } catch (e) {
       setInput(text) // restore so the command isn't lost
-        if (e instanceof ApiError && e.code === 'nothing_to_compact') toast.info('Nothing to compact yet — history is already short enough.')
+      if (e instanceof ApiError && e.code === 'nothing_to_compact') toast.info('Nothing to compact yet — history is already short enough.')
       else toast.error(e instanceof ApiError ? e.message : 'Could not compact.')
     }
   }
@@ -400,19 +409,22 @@ export function CodeSessionScreen() {
     if (COMPACT_RE.test(text)) { await runCompact(text); return }
     if (CLEAR_RE.test(text)) { await runClear(); return }
     if (RESUME_RE.test(text)) { await runResume(); return }
-    const finalText = rewriteSkillCommand(text)
+    const promptOverride = skillPromptOverride(text)
+    const filesToSend = contextFiles
     setInput('')
+    setContextFiles([])
     userScrolledUp.current = false
     // Always POST: the daemon starts the turn if idle, or QUEUES it (in order) behind the active
     // run. Either way it's owned server-side, so a queued follow-up survives a disconnect. The
     // open stream reflects the result (a new `queue` frame, or the turn going live when it runs).
     try {
-      await startCodeRun(sessionId, finalText, thinkingBudget)
+      await startCodeRun(sessionId, text, thinkingBudget, promptOverride, filesToSend)
       void qc.invalidateQueries({ queryKey: codeKeys.detail(sessionId) })
       connect()
     } catch (e) {
       setInput(text) // restore so the message isn't lost
-        toast.error(e instanceof ApiError ? e.message : 'Could not send.')
+      setContextFiles(filesToSend)
+      toast.error(e instanceof ApiError ? e.message : 'Could not send.')
     }
   }
 
@@ -638,7 +650,9 @@ export function CodeSessionScreen() {
             live={!!live}
             onStop={() => void handleStop()}
             sendDisabled={!input.trim()}
-            onAddContext={() => toast('Add context is coming', { description: 'Attach files, folders, or URLs to steer the agent — not wired yet.' })}
+            onAddContext={() => setContextBrowserOpen(true)}
+            contextFiles={contextFiles}
+            onRemoveContextFile={(p) => setContextFiles((cf) => cf.filter((x) => x !== p))}
             slashCommands={[
               { id: 'compact', description: 'Summarize the conversation so far into one summary, to free up context' },
               { id: 'clear', description: 'Clear the chat — repo, worktree, and branch stay as they are' },
@@ -652,6 +666,15 @@ export function CodeSessionScreen() {
         </div>
       </div>
       <ModelDetailDialog modelKey={settingsKey} onClose={() => setSettingsKey(null)} />
+      <FsBrowser
+        open={contextBrowserOpen}
+        onOpenChange={setContextBrowserOpen}
+        onSelect={(p) => setContextFiles((cf) => (cf.includes(p) ? cf : [...cf, p]))}
+        mode="file"
+        startPath={session?.repoRoot}
+        title="Add context"
+        description="Pick a file to point the agent at — it'll read it if relevant to the task."
+      />
     </div>
   )
 }

@@ -1,5 +1,5 @@
 import { useEffect, useState, type RefObject } from 'react'
-import { Check, ChevronDown, CircleDot, FolderGit2, FolderOpen, GitBranch, ListTodo, Plus, SendHorizontal, Square, Wand2 } from 'lucide-react'
+import { Check, ChevronDown, CircleDot, FileText, FolderGit2, FolderOpen, GitBranch, ListTodo, Plus, SendHorizontal, Square, Wand2, X } from 'lucide-react'
 import { Button } from '../../components/ui/button'
 import {
   DropdownMenu,
@@ -104,6 +104,10 @@ export interface CodeComposerProps {
   sendDisabled: boolean
 
   onAddContext?: () => void
+  /** Absolute paths currently attached via "Add context" — rendered as removable chips.
+   *  Cleared by the caller after a successful send (same lifecycle as `value`). */
+  contextFiles?: string[]
+  onRemoveContextFile?: (path: string) => void
   hintText: string
 
   /** -1 = unlimited (default), 0 = off, N>0 = a real token cap — same control/semantics as
@@ -125,7 +129,7 @@ export function CodeComposer({
   repo, mode, onModeChange,
   models, loadedKey, loadedName, modelPending, ejecting, onLoadModel, onEjectModel, onModelSettings,
   ctxUsed, ctxMax, live, onStop, sendDisabled,
-  onAddContext, hintText, slashCommands = [],
+  onAddContext, contextFiles, onRemoveContextFile, hintText, slashCommands = [],
   thinkingBudget, onThinkingBudgetChange,
 }: CodeComposerProps) {
   const ModeIcon = MODE_ICONS[mode.id]
@@ -322,6 +326,34 @@ export function CodeComposer({
                 </div>
               </div>
             </div>
+          </div>
+        )}
+
+        {/* Attached context-file chips — files picked via "Add context" (the Plus button in the
+            toolbar below). Removable individually; cleared by the caller once the message sends,
+            same lifecycle as the textarea's own value. */}
+        {!!contextFiles?.length && (
+          <div className="flex flex-wrap items-center gap-1.5 border-b border-border px-3 py-2">
+            {contextFiles.map((p) => (
+              <span
+                key={p}
+                title={p}
+                className="inline-flex max-w-[220px] items-center gap-1 rounded-full border border-border bg-panel-2 px-2.5 py-1 text-[12px] text-muted"
+              >
+                <FileText size={11} className="shrink-0 text-faint" />
+                <span className="min-w-0 truncate">{p.split(/[\\/]/).filter(Boolean).pop() || p}</span>
+                {onRemoveContextFile && (
+                  <button
+                    type="button"
+                    onClick={() => onRemoveContextFile(p)}
+                    aria-label={`Remove ${p}`}
+                    className="shrink-0 text-faint transition-colors hover:text-ink"
+                  >
+                    <X size={11} />
+                  </button>
+                )}
+              </span>
+            ))}
           </div>
         )}
 

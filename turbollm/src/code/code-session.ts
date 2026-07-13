@@ -618,7 +618,9 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     // message — the actual cause of "context fills up in 1-2 messages", not a compaction bug).
     // `noSkills: true` below is pi's OWN unrelated skill-discovery mechanism (kept off for
     // prompt hygiene) — this is TurboLLM's own Skills library.
-    appendSystemPrompt: buildAppendPrompt(mode, skills),
+    // agentsMd: <repoRoot>/AGENTS.md + ~/.turbollm/agents.md, like OpenCode — d.store.dir() IS
+    // TurboLLM's own data dir (the same one SkillStore above reads from).
+    appendSystemPrompt: buildAppendPrompt(mode, skills, { repoRoot, globalDir: d.store.dir() }),
     // Keep the prompt lean and deterministic — no global skills/prompts/themes discovery.
     noSkills: true,
     noPromptTemplates: true,

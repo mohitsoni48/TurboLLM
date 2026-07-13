@@ -27,6 +27,7 @@ export function FsBrowser({
   mode = 'file',
   title,
   description,
+  startPath,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -35,14 +36,19 @@ export function FsBrowser({
   mode?: 'file' | 'folder' | 'any'
   title?: string
   description?: string
+  /** Opens directly at this dir instead of the daemon's home dir — e.g. the session's own
+   *  repoRoot, so picking a context file doesn't start with a trek from the home directory. */
+  startPath?: string
 }) {
-  // null = the daemon's home dir (server default); a string = an explicit dir.
-  const [path, setPath] = useState<string | null>(null)
+  // null = the daemon's home dir (server default) or `startPath` when given; a string = an
+  // explicit dir the user has since navigated to.
+  const [path, setPath] = useState<string | null>(startPath ?? null)
   const { data, isFetching, error, refetch } = useFsBrowse(path, open)
 
-  // Reset to the home dir each time the browser is reopened.
+  // Reset to startPath (or the home dir) each time the browser is reopened.
   useEffect(() => {
-    if (open) setPath(null)
+    if (open) setPath(startPath ?? null)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open])
 
   // Editable address bar: type or paste an absolute path and press Enter (or Go) to jump

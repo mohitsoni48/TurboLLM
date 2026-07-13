@@ -37,6 +37,10 @@ export interface CreateCodeSessionParams {
   useWorktree?: boolean
   worktreeBranch?: string
   worktreeBase?: string
+  /** Absolute paths picked via the composer's "Add context" file browser — stored as the
+   *  seeded task message's textAttachments, folded into the actual first-turn prompt as a
+   *  read-this-file nudge (code-routes.ts's contextFilesBlock) when that turn runs. */
+  contextFiles?: string[]
 }
 
 // SSE event payloads for GET /api/v1/code/sessions/:id/stream (code-routes.ts). Reuses

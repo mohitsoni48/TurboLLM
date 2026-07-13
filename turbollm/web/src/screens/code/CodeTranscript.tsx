@@ -406,12 +406,27 @@ function runIcon(calls: NormalizedCall[]) {
  *  the same way chat's own user bubble is (`min(88%,900px)`, see MessageBubble.tsx)
  *  so alone that's enough to read as "yours" against the agent's left-aligned
  *  activity, without a heading or reverting to full chat-bubble chrome. */
-function CodeInstructionEntry({ content }: { content: string }) {
+function CodeInstructionEntry({ content, contextFiles }: { content: string; contextFiles?: string[] }) {
   return (
     <div
       className="group ml-auto w-fit max-w-[min(88%,900px)] rounded-lg border px-4 py-3"
       style={{ borderColor: 'color-mix(in srgb, var(--accent) 35%, var(--border))', background: 'color-mix(in srgb, var(--accent) 6%, transparent)' }}
     >
+      {!!contextFiles?.length && (
+        <div className="mb-2 flex flex-wrap justify-end gap-1.5">
+          {contextFiles.map((p) => (
+            <span
+              key={p}
+              title={p}
+              className="inline-flex max-w-[200px] items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] text-muted"
+              style={{ borderColor: 'color-mix(in srgb, var(--accent) 25%, var(--border))' }}
+            >
+              <FileText size={10} className="shrink-0 text-faint" />
+              <span className="min-w-0 truncate">{p.split(/[\\/]/).filter(Boolean).pop() || p}</span>
+            </span>
+          ))}
+        </div>
+      )}
       <p className="whitespace-pre-wrap text-[14px] leading-relaxed text-ink">{content}</p>
       <div className="mt-1 flex justify-end opacity-0 transition-opacity group-hover:opacity-100">
         <CopyButton text={content} size={12} />
@@ -487,7 +502,7 @@ function CodeMessageEntry({ message }: { message: Message }) {
   if (message.role === 'user') {
     return (
       <RailEntry icon={SquareTerminal} tone="accent">
-        <CodeInstructionEntry content={message.content} />
+        <CodeInstructionEntry content={message.content} contextFiles={message.textAttachments} />
       </RailEntry>
     )
   }

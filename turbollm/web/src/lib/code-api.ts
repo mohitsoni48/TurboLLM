@@ -92,11 +92,29 @@ export function compactCodeSession(id: string, instructions?: string): Promise<{
 /** Start (or queue) a turn. Returns immediately — the run is owned by the daemon, NOT by this
  *  request, so it keeps executing even if this fetch's connection is dropped. An empty `content`
  *  runs the seeded task (first turn); a non-empty one is a follow-up. `queued` is true when the
- *  turn had to wait behind an already-active run. Watch the run via {@link streamCodeSession}. */
-export async function startCodeRun(sessionId: string, content: string, thinkingBudget?: number): Promise<{ ok: true; queued: boolean; userMessageId: string }> {
+ *  turn had to wait behind an already-active run. Watch the run via {@link streamCodeSession}.
+ *  `promptOverride`, when given, is what actually gets PROMPTED to the model this turn — `content`
+ *  is still what's stored/shown verbatim as the user's message. Used to steer the model toward
+ *  invoke_skill from the "/skillid task" composer shorthand without altering the founder's own
+ *  typed message (see CodeSessionScreen.tsx's skill picker — it used to rewrite `content` itself,
+ *  which the founder explicitly asked to stop). `contextFiles`, when given, are absolute paths
+ *  picked via the composer's "Add context" file browser — stored as attachment chips on the
+ *  message, folded server-side into a "read this file" nudge for this turn's prompt. */
+export async function startCodeRun(
+  sessionId: string,
+  content: string,
+  thinkingBudget?: number,
+  promptOverride?: string,
+  contextFiles?: string[],
+): Promise<{ ok: true; queued: boolean; userMessageId: string }> {
   return req(`/api/v1/code/sessions/${encodeURIComponent(sessionId)}/messages`, {
     method: 'POST',
-    json: { content: content || undefined, thinkingBudget: thinkingBudget !== undefined && thinkingBudget !== -1 ? thinkingBudget : undefined },
+    json: {
+      content: content || undefined,
+      promptOverride: promptOverride || undefined,
+      contextFiles: contextFiles?.length ? contextFiles : undefined,
+      thinkingBudget: thinkingBudget !== undefined && thinkingBudget !== -1 ? thinkingBudget : undefined,
+    },
   })
 }
 

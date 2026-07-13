@@ -31,6 +31,17 @@ async function body<T>(c: Context): Promise<T> { try { return await c.req.json()
 
 const VALID_MODES = new Set<CodeMode>(['auto', 'plan', 'ask'])
 
+/** Formats attached context-file paths (the composer's "Add context" file picker) as a prompt
+ *  instruction — PATHS only, never fetched/inlined content: the agent already has a real `read`
+ *  tool, containment-checked the exact same way any other read call is, so pointing it at the
+ *  file is simpler and strictly safer than a second, separate content-fetch path here. Returns
+ *  '' when there are none, so it's a no-op to prepend unconditionally. */
+export function contextFilesBlock(paths: string[] | undefined): string {
+  const clean = (paths ?? []).map((p) => p.trim()).filter(Boolean)
+  if (clean.length === 0) return ''
+  return `Context file(s) the user attached — read them if relevant before proceeding:\n${clean.map((p) => `- ${p}`).join('\n')}\n\n`
+}
+
 /** agent_runs.status → sidebar SessionStatus (plan §2). 'merged' is unused in Phase 1. */
 export function toSessionStatus(status: AgentRun['status']): 'merged' | 'review' | 'done' | 'aborted' {
   switch (status) {
@@ -91,7 +102,7 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
   app.post('/api/v1/code/sessions', async (c) => {
     const b = await body<{
       repoRoot?: string; repoBranch?: string; modelKey?: string; mode?: string; task?: string
-      useWorktree?: boolean; worktreeBranch?: string; worktreeBase?: string
+      useWorktree?: boolean; worktreeBranch?: string; worktreeBase?: string; contextFiles?: string[]
     }>(c)
     const repoRoot = (b.repoRoot ?? '').trim()
     const task = (b.task ?? '').trim()
@@ -113,8 +124,10 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
       worktreeBranch: b.worktreeBranch,  // captured; NOT acted on in Phase 1
       worktreeBase: b.worktreeBase,      // captured; NOT acted on in Phase 1
     })
-    // Seed the task as the first user message so re-opening the session shows it.
-    db.addMessage(conv.id, 'user', task)
+    // Seed the task as the first user message so re-opening the session shows it. Any attached
+    // context-file paths are stored as textAttachments (shown as chips) — POST /messages folds
+    // them into the actual prompt when this seeded task's turn runs (see contextFilesBlock).
+    db.addMessage(conv.id, 'user', task, { textAttachments: b.contextFiles })
     return c.json({ sessionId: run.id, convId: conv.id }, 201)
   })
 
@@ -319,7 +332,7 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
   // that is how a follow-up submitted mid-run survives a disconnect and still fires in order.
   app.post('/api/v1/code/sessions/:id/messages', async (c) => {
     const id = c.req.param('id')
-    const b = await body<{ content?: string; thinkingBudget?: number }>(c)
+    const b = await body<{ content?: string; promptOverride?: string; contextFiles?: string[]; thinkingBudget?: number }>(c)
 
     const run = db.getAgentRun(id)
     if (!run) return err(c, 404, 'not_found', 'Session not found.')
@@ -340,13 +353,19 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
     let userMsgId: string
     let task: string
     if (followUp) {
-      userMsgId = db.addMessage(run.convId, 'user', followUp).id
-      task = followUp
+      userMsgId = db.addMessage(run.convId, 'user', followUp, { textAttachments: b.contextFiles }).id
+      // promptOverride lets the CALLER separate "what's stored/shown" from "what's actually
+      // prompted this turn" — the founder's own literal message must never be silently rewritten
+      // (see CodeSessionScreen.tsx's skill-invocation picker, the one caller of this today), but
+      // the model still needs an explicit nudge to invoke a picked skill. Future turns' history
+      // replay always uses the STORED message (followUp), never the override, so past turns read
+      // back as what the user actually said, not the synthetic nudge that steered that one turn.
+      task = contextFilesBlock(b.contextFiles) + ((b.promptOverride ?? '').trim() || followUp)
     } else {
       const lastUser = (conv.messages ?? []).filter((m) => m.role === 'user').at(-1)
       if (!lastUser) return err(c, 400, 'no_task', 'No task to run.')
       userMsgId = lastUser.id
-      task = lastUser.content
+      task = contextFilesBlock(lastUser.textAttachments) + lastUser.content
     }
 
     const { queued } = runs.enqueue(id, { convId: run.convId, repoRoot: run.repoRoot, task, userMsgId, thinkingBudget: b.thinkingBudget })

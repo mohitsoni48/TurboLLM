@@ -5,6 +5,8 @@
 // weak LOCAL model (TurboLLM's core case) relies on far more than a frontier model does —
 // replacing it would strip exactly the scaffolding those models need.
 
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import type { Skill } from '../agents/skills'
 
 export type CodeMode = 'auto' | 'plan' | 'ask'
@@ -133,13 +135,48 @@ export function skillCatalogBlock(skills: Skill[]): string {
   return header + lines.join('\n') + footer
 }
 
-/** The full append-prompt block for a session, in order. `skills` defaults to empty so
- *  every existing call site (and test) that doesn't pass it keeps today's exact output. */
-export function buildAppendPrompt(mode: CodeMode, skills: Skill[] = []): string[] {
+/** Reads one AGENTS.md-style file, trimmed. Missing file, permission error, or a path that
+ *  isn't a plain file are all treated the same way — silently absent, not a failure. This
+ *  block is optional standing context (like OpenCode's AGENTS.md convention), never something
+ *  that should block a turn from running just because a file is unreadable. */
+function readAgentsFile(path: string): string | null {
+  try {
+    const text = readFileSync(path, 'utf8').trim()
+    return text || null
+  } catch {
+    return null
+  }
+}
+
+/** `<repoRoot>/AGENTS.md` (project-level, the user's own repo) and `<globalDir>/agents.md`
+ *  (global — TurboLLM's own data dir, e.g. `~/.turbollm/agents.md`), like OpenCode's AGENTS.md
+ *  convention: standing project/user instructions picked up automatically, no per-session setup.
+ *  Global comes first (broader, user-wide defaults), then project (more specific, overrides in
+ *  spirit if they conflict — same "more specific wins" reading order the rest of this file's
+ *  guidance already follows: persona → mode → edit rules → skills → these). Neither file is
+ *  required to exist; this returns '' when there's nothing to add. */
+export function agentsMdBlock(repoRoot: string, globalDir: string): string {
+  const global = readAgentsFile(join(globalDir, 'agents.md'))
+  const project = readAgentsFile(join(repoRoot, 'AGENTS.md'))
+  const parts: string[] = []
+  if (global) parts.push(`## Global instructions (~/.turbollm/agents.md)\n\n${global}`)
+  if (project) parts.push(`## Project instructions (AGENTS.md)\n\n${project}`)
+  if (parts.length === 0) return ''
+  return 'The user has provided the following standing instructions for this project — follow them:\n\n' + parts.join('\n\n---\n\n')
+}
+
+/** The full append-prompt block for a session, in order. `skills` defaults to empty and
+ *  `agentsMd` defaults to omitted so every existing call site (and test) that doesn't pass them
+ *  keeps today's exact output. */
+export function buildAppendPrompt(mode: CodeMode, skills: Skill[] = [], agentsMd?: { repoRoot: string; globalDir: string }): string[] {
   const blocks = [basePersona(), modeGuidance(mode)]
   // Read-only plan mode has no edit tool, so the edit guidance is irrelevant there.
   if (mode !== 'plan') blocks.push(editReliabilityGuidance())
   const catalog = skillCatalogBlock(skills)
   if (catalog) blocks.push(catalog)
+  if (agentsMd) {
+    const agents = agentsMdBlock(agentsMd.repoRoot, agentsMd.globalDir)
+    if (agents) blocks.push(agents)
+  }
   return blocks
 }

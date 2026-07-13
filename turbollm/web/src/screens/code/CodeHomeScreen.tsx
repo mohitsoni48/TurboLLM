@@ -61,11 +61,6 @@ function pushRecentRepo(path: string): string[] {
 
 const SESSION_DAYS = mockSessionDays()
 
-const previewToast = () =>
-  toast('Task handoff is the next milestone', {
-    description: 'The Code launchpad is a UI preview — agent execution lands with the pi-SDK integration.',
-  })
-
 /** Suggest a worktree branch name from the task text — kebab of the first few
  *  words under a `turbo/` prefix (the naming agent-created branches will use).
  *  Shown as the branch input's placeholder so an empty field means "accept
@@ -139,6 +134,10 @@ export function CodeHomeScreen() {
   const [repoPath, setRepoPath] = useState<string | null>(null)
   const [recentRepos, setRecentRepos] = useState<string[]>(() => readRecentRepos())
   const [browserOpen, setBrowserOpen] = useState(false)
+  // "Add context" — absolute paths picked via a SEPARATE file-mode browser (browserOpen above is
+  // the repo picker, folder-mode). Sent as contextFiles alongside the seeded task.
+  const [contextFiles, setContextFiles] = useState<string[]>([])
+  const [contextBrowserOpen, setContextBrowserOpen] = useState(false)
   const gitQ = useGitBranch(repoPath, !!repoPath)
   const repoBranch = gitQ.data?.isRepo ? gitQ.data.branch : ''
   const repoBranches = gitQ.data?.isRepo ? gitQ.data.branches : []
@@ -275,6 +274,7 @@ export function CodeHomeScreen() {
         useWorktree,
         worktreeBranch: useWorktree ? (branchName.trim() || suggestBranchName(task)) : undefined,
         worktreeBase: useWorktree ? baseBranch : undefined,
+        contextFiles: contextFiles.length ? contextFiles : undefined,
       })
       navigate(`/workspace/code/${sessionId}`)
     } catch (e) {
@@ -462,7 +462,9 @@ export function CodeHomeScreen() {
           ctxUsed={0}
           ctxMax={model?.ctx ?? 0}
           sendDisabled={!input.trim() || !repoPath || !engineReady || submitting}
-          onAddContext={previewToast}
+          onAddContext={() => setContextBrowserOpen(true)}
+          contextFiles={contextFiles}
+          onRemoveContextFile={(p) => setContextFiles((cf) => cf.filter((x) => x !== p))}
           hintText="Enter to start · Shift+Enter for newline · 100% local — your code never leaves this machine"
         />
       </div>
@@ -475,6 +477,15 @@ export function CodeHomeScreen() {
       mode="folder"
       title="Choose a repository"
       description="Open the project folder you want the agent to work in, then click Select this folder."
+    />
+    <FsBrowser
+      open={contextBrowserOpen}
+      onOpenChange={setContextBrowserOpen}
+      onSelect={(p) => setContextFiles((cf) => (cf.includes(p) ? cf : [...cf, p]))}
+      mode="file"
+      startPath={repoPath ?? undefined}
+      title="Add context"
+      description="Pick a file to point the agent at — it'll read it if relevant to the task."
     />
     <ModelDetailDialog modelKey={settingsKey} onClose={() => setSettingsKey(null)} />
     </>
