@@ -10,6 +10,7 @@ import {
   HelpCircle,
   Layers,
   Loader2,
+  RotateCcw,
   Search,
   SquareTerminal,
   Terminal,
@@ -406,7 +407,16 @@ function runIcon(calls: NormalizedCall[]) {
  *  the same way chat's own user bubble is (`min(88%,900px)`, see MessageBubble.tsx)
  *  so alone that's enough to read as "yours" against the agent's left-aligned
  *  activity, without a heading or reverting to full chat-bubble chrome. */
-function CodeInstructionEntry({ content, contextFiles }: { content: string; contextFiles?: string[] }) {
+function CodeInstructionEntry({
+  content, contextFiles, onRevert,
+}: {
+  content: string
+  contextFiles?: string[]
+  /** Omitted for the session's very first message (nothing before it to revert to) or
+   *  whenever a run is live (the backend 409s on this anyway — hidden here for a cleaner
+   *  affordance rather than a guaranteed-fail click). */
+  onRevert?: () => void
+}) {
   return (
     <div
       className="group ml-auto w-fit max-w-[min(88%,900px)] rounded-lg border px-4 py-3"
@@ -428,8 +438,19 @@ function CodeInstructionEntry({ content, contextFiles }: { content: string; cont
         </div>
       )}
       <p className="whitespace-pre-wrap text-[14px] leading-relaxed text-ink">{content}</p>
-      <div className="mt-1 flex justify-end opacity-0 transition-opacity group-hover:opacity-100">
+      <div className="mt-1 flex items-center justify-end gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
         <CopyButton text={content} size={12} />
+        {onRevert && (
+          <button
+            type="button"
+            onClick={onRevert}
+            title="Revert to this message — rewinds the chat back to here"
+            aria-label="Revert to this message"
+            className="rounded p-1 text-faint transition-colors hover:text-ink"
+          >
+            <RotateCcw size={12} />
+          </button>
+        )}
       </div>
     </div>
   )
@@ -498,11 +519,11 @@ function RailEntry({ icon: Icon, tone = 'muted', children }: { icon: typeof Squa
   )
 }
 
-function CodeMessageEntry({ message }: { message: Message }) {
+function CodeMessageEntry({ message, onRevert }: { message: Message; onRevert?: () => void }) {
   if (message.role === 'user') {
     return (
       <RailEntry icon={SquareTerminal} tone="accent">
-        <CodeInstructionEntry content={message.content} contextFiles={message.textAttachments} />
+        <CodeInstructionEntry content={message.content} contextFiles={message.textAttachments} onRevert={onRevert} />
       </RailEntry>
     )
   }
@@ -611,11 +632,15 @@ function CodeStreamingEntry({ timeline, reasoning }: { timeline: LiveBlock[]; re
 }
 
 export function CodeTranscript({
-  messages, liveAssistantId, live,
+  messages, liveAssistantId, live, onRevert,
 }: {
   messages: Message[]
   liveAssistantId?: string
   live?: { timeline: LiveBlock[]; reasoning: string } | null
+  /** Revert affordance on each user message — omitted entirely (via `undefined`) while a run
+   *  is live, and never shown on the FIRST message (nothing before it to revert to; `messages`
+   *  here is already cut at any existing /clear point, so index 0 is always correct). */
+  onRevert?: (messageId: string) => void
 }) {
   return (
     <div className="relative flex flex-col gap-5 pl-8">
@@ -624,7 +649,13 @@ export function CodeTranscript({
       <div className="absolute left-[2px] top-2 bottom-2 w-px" style={{ background: 'var(--border)' }} aria-hidden />
       {messages
         .filter((m) => m.id !== liveAssistantId)
-        .map((m) => <CodeMessageEntry key={m.id} message={m} />)}
+        .map((m, i) => (
+          <CodeMessageEntry
+            key={m.id}
+            message={m}
+            onRevert={onRevert && !live && i > 0 && m.role === 'user' ? () => onRevert(m.id) : undefined}
+          />
+        ))}
       {live && (
         <CodeStreamingEntry timeline={live.timeline} reasoning={live.reasoning} />
       )}

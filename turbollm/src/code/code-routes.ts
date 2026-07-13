@@ -23,6 +23,7 @@ import type { Deps } from '../deps'
 import type { AgentRun } from '../chat/db'
 import { CodeRunManager } from './code-run-manager'
 import { compactCodeSession } from './code-session'
+import { revertFileEdits } from './revert'
 import type { CodeMode } from './persona'
 
 type S = 200 | 201 | 202 | 400 | 404 | 409 | 500
@@ -314,6 +315,46 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
     if (!run.clearedUpToMessageId) return err(c, 400, 'not_cleared', 'This session has not been cleared.')
     db.setClearedUpToMessageId(id, null)
     return c.json({ ok: true })
+  })
+
+  // ── revert to a user message ──────────────────────────────────────────────────
+  // Rewinds the transcript to just before `messageId` (reusing the SAME clearedUpToMessageId
+  // mechanism /clear + /resume already use — nothing is deleted, /resume still un-hides it) and
+  // returns that message's original text so the caller can refill the composer with it.
+  // Optionally (revertFiles) also reverse-applies every 'edit' tool call's stored patch for the
+  // discarded messages, walking any touched file back to its pre-edit content — see revert.ts.
+  app.post('/api/v1/code/sessions/:id/revert', async (c) => {
+    const id = c.req.param('id')
+    const b = await body<{ messageId?: string; revertFiles?: boolean }>(c)
+    const messageId = (b.messageId ?? '').trim()
+    if (!messageId) return err(c, 400, 'invalid_input', 'messageId is required.')
+
+    const run = db.getAgentRun(id)
+    if (!run) return err(c, 404, 'not_found', 'Session not found.')
+    if (!run.repoRoot) return err(c, 400, 'invalid_input', 'Session has no repo root.')
+    if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop or wait for the current run before reverting.')
+    const conv = db.getConversation(run.convId, true)
+    if (!conv) return err(c, 404, 'not_found', 'Session conversation not found.')
+
+    const messages = conv.messages ?? []
+    const idx = messages.findIndex((m) => m.id === messageId)
+    if (idx === -1) return err(c, 404, 'not_found', 'Message not found.')
+    if (messages[idx].role !== 'user') return err(c, 400, 'invalid_input', 'Can only revert to a user message.')
+    if (idx === 0) return err(c, 400, 'invalid_input', 'This is the first message in the session — nothing before it to revert to.')
+
+    const cutMessage = messages[idx - 1]
+    const revertText = messages[idx].content
+
+    let revertedFiles: string[] = []
+    let failedFiles: string[] = []
+    if (b.revertFiles) {
+      const result = revertFileEdits(messages.slice(idx), run.repoRoot)
+      revertedFiles = result.reverted
+      failedFiles = result.failed
+    }
+
+    db.setClearedUpToMessageId(id, cutMessage.id)
+    return c.json({ ok: true, clearedUpToMessageId: cutMessage.id, revertText, revertedFiles, failedFiles })
   })
 
   // ── stop the in-flight run (+ drop the queue) ─────────────────────────────────

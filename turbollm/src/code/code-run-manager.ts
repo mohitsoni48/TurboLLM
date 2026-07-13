@@ -260,6 +260,12 @@ export class CodeRunManager {
           args: (data.args as Record<string, unknown>) ?? {},
           result: data.status === 'done' ? (data.result as string | undefined) : undefined,
           error: data.status === 'error' ? (data.result as string | undefined) : undefined,
+          // Edit tool only — carried through from code-session.ts's isEditToolResult handling.
+          // Previously dropped here, so the diff panel went blank for any completed tool call
+          // after a page reload, and revert-to-message had nothing to reverse-apply.
+          diff: data.diff as string | undefined,
+          patch: data.patch as string | undefined,
+          firstChangedLine: data.firstChangedLine as number | undefined,
         })
       }
       push(ev.event, ev.data)

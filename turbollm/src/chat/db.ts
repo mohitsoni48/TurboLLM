@@ -270,6 +270,13 @@ export interface ToolCallRecord {
   args: Record<string, unknown>
   result?: string
   error?: string
+  /** Code mode only (pi's edit tool result) — a display-oriented diff and a standard unified
+   *  patch of the change. Persisted so the diff panel and revert-to-message (code-routes.ts's
+   *  revert endpoint) both still have this after a page reload, not just on the live SSE
+   *  stream that produced it. */
+  diff?: string
+  patch?: string
+  firstChangedLine?: number
 }
 
 /** F-021: research metadata attached to Research-persona assistant messages. */

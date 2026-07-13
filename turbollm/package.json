@@ -49,6 +49,7 @@
     "@earendil-works/pi-ai": "0.80.6",
     "@earendil-works/pi-coding-agent": "0.80.6",
     "@hono/node-server": "^1.13.0",
+    "diff": "^9.0.0",
     "hono": "^4.6.0",
     "puppeteer-core": "^23.11.1",
     "typebox": "1.1.38",

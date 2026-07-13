@@ -57,6 +57,20 @@ export function resumeCodeSession(id: string): Promise<{ ok: true }> {
   return req(`/api/v1/code/sessions/${encodeURIComponent(id)}/resume`, { method: 'POST', json: {} })
 }
 
+/** Reverts the transcript to just before `messageId` — reuses the same clear/resume mechanism
+ *  (nothing is deleted; /resume still un-hides it), and returns the message's ORIGINAL text so
+ *  the caller can refill the composer with it verbatim. `revertFiles`, when true, ALSO
+ *  reverse-applies every edit-tool patch recorded for the discarded messages (revert.ts) —
+ *  `revertedFiles`/`failedFiles` report which paths actually changed vs. couldn't be reverted
+ *  cleanly (drifted, missing, or outside the repo). Rejects 409 while a run is active. */
+export function revertCodeSession(
+  id: string,
+  messageId: string,
+  revertFiles?: boolean,
+): Promise<{ ok: true; clearedUpToMessageId: string; revertText: string; revertedFiles: string[]; failedFiles: string[] }> {
+  return req(`/api/v1/code/sessions/${encodeURIComponent(id)}/revert`, { method: 'POST', json: { messageId, revertFiles } })
+}
+
 export interface CodeSessionDetail {
   session: CodeSession
   conversation: Conversation

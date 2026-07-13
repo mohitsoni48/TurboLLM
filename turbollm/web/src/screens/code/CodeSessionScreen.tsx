@@ -5,14 +5,18 @@ import { ArrowDown, Clock, Eraser, FolderOpen, GitBranch, PanelLeft, Pencil, Rot
 import { ApiError } from '../../lib/api'
 import { skillKeys, fetchSkills } from '../../lib/agent-api'
 import { useModelActions, useModels, useStatus } from '../../lib/queries'
-import { compactCodeSession, startCodeRun, streamCodeSession, stopCodeSession } from '../../lib/code-api'
+import { compactCodeSession, revertCodeSession, startCodeRun, streamCodeSession, stopCodeSession } from '../../lib/code-api'
 import {
   codeKeys, useClearCodeSession, useCodeSession, useCodeSessionRename, useResumeCodeSession,
   useUpdateCodeSessionMode,
 } from '../../lib/code-queries'
 import type { LiveToolCall } from '../../lib/chat-types'
 import { appendTextDelta, upsertToolCall, type LiveBlock } from '../../lib/live-timeline'
-import { Button } from '../../components/ui/button'
+import { Button, buttonVariants } from '../../components/ui/button'
+import {
+  AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
+  AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
+} from '../../components/ui/alert-dialog'
 import { toast } from '../../components/ui/sonner'
 import { useIsDesktop } from '../../lib/useIsDesktop'
 import { cn, folderName, writeLastCodeSessionId } from '../../lib/utils'
@@ -403,6 +407,36 @@ export function CodeSessionScreen() {
     }
   }
 
+  // Revert-to-message: rewinds the transcript to just before a user message (same underlying
+  // clearedUpToMessageId mechanism as /clear — /resume still un-hides it) and refills the
+  // composer with that message's ORIGINAL text. When the discarded range touched real files
+  // (any edit-tool call with a stored patch), asks whether to ALSO reverse-apply those edits —
+  // reverting the transcript alone is always safe/reversible; reverting files is a real,
+  // separate, less-reversible action the user should explicitly opt into.
+  const [pendingRevert, setPendingRevert] = useState<{ messageId: string; hasFileEdits: boolean } | null>(null)
+  const openRevertConfirm = (messageId: string) => {
+    const idx = messages.findIndex((m) => m.id === messageId)
+    const hasFileEdits = idx !== -1 && messages.slice(idx).some((m) => m.toolCalls.some((tc) => tc.name === 'edit' && !!tc.patch))
+    setPendingRevert({ messageId, hasFileEdits })
+  }
+  const runRevert = async (messageId: string, revertFiles: boolean) => {
+    if (!sessionId) return
+    try {
+      const result = await revertCodeSession(sessionId, messageId, revertFiles)
+      void qc.invalidateQueries({ queryKey: codeKeys.detail(sessionId) })
+      setInput(result.revertText)
+      if (result.failedFiles.length) {
+        toast.warning(`Reverted — ${result.failedFiles.length} file(s) couldn't be cleanly reverted (they may have drifted since).`)
+      } else if (result.revertedFiles.length) {
+        toast.success(`Reverted the chat and ${result.revertedFiles.length} file(s).`)
+      } else {
+        toast.success('Reverted to this message.')
+      }
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : 'Could not revert.')
+    }
+  }
+
   const send = async () => {
     const text = input.trim()
     if (!text || !sessionId) return
@@ -588,6 +622,7 @@ export function CodeSessionScreen() {
                 messages={transcriptMessages}
                 liveAssistantId={live?.assistantId}
                 live={live ? { timeline: live.timeline, reasoning: live.reasoning } : null}
+                onRevert={live || queued.length > 0 ? undefined : openRevertConfirm}
               />
             )}
           </div>
@@ -675,6 +710,41 @@ export function CodeSessionScreen() {
         title="Add context"
         description="Pick a file to point the agent at — it'll read it if relevant to the task."
       />
+      {/* Revert confirmation — only asks about files when the discarded range actually touched
+          any (a plain history rewind is always offered with one click, no dialog needed for
+          that half; this dialog exists purely for the file-mutation decision). */}
+      <AlertDialog open={!!pendingRevert} onOpenChange={(open) => { if (!open) setPendingRevert(null) }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Revert to this message?</AlertDialogTitle>
+            <AlertDialogDescription>
+              {pendingRevert?.hasFileEdits
+                ? 'This rewinds the chat back to here and refills the composer with your original message. The agent also edited files since then — revert those too, or just the chat?'
+                : 'This rewinds the chat back to here and refills the composer with your original message. Nothing is deleted — you can bring it back with /resume.'}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            {pendingRevert?.hasFileEdits ? (
+              <>
+                <AlertDialogAction
+                  className={cn(buttonVariants({ variant: 'outline' }))}
+                  onClick={() => { const id = pendingRevert?.messageId; if (id) void runRevert(id, false) }}
+                >
+                  Chat only
+                </AlertDialogAction>
+                <AlertDialogAction onClick={() => { const id = pendingRevert?.messageId; if (id) void runRevert(id, true) }}>
+                  Chat + files
+                </AlertDialogAction>
+              </>
+            ) : (
+              <AlertDialogAction onClick={() => { const id = pendingRevert?.messageId; if (id) void runRevert(id, false) }}>
+                Revert
+              </AlertDialogAction>
+            )}
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }
