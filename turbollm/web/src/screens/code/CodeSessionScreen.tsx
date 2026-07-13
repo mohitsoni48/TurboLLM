@@ -477,9 +477,31 @@ export function CodeSessionScreen() {
   const pendingApprovalBlock = live?.timeline.find((b) => b.kind === 'tool' && b.call.status === 'awaiting_approval')
   const pendingApproval = pendingApprovalBlock?.kind === 'tool' ? pendingApprovalBlock.call : undefined
 
-  const lastStats = messages.findLast((m) => m.role === 'assistant')?.stats
-  const ctxUsed = lastStats?.ctxUsed ?? 0
-  const ctxMax = status?.model?.ctx || lastStats?.ctxMax || 0
+  // The last assistant message with a REAL ctxUsed, not just the last assistant row — a new turn
+  // gets an empty placeholder row (code-run-manager.ts's pump(), `stats: {aborted: false}`, no
+  // ctxUsed field) the instant it starts, which `messages.findLast(role === 'assistant')` alone
+  // would pick up immediately, snapping the ring to 0% right when a turn begins (items 4 and 5 of
+  // the founder's 2026-07-13 report turned out to share this one root cause: reading a statless
+  // placeholder as "the last assistant message"). Skipping to the last message that actually HAS
+  // ctxUsed keeps the ring showing the last real value instead of a false 0.
+  const lastRealStats = messages.findLast((m) => m.role === 'assistant' && m.stats?.ctxUsed !== undefined)?.stats
+  // While a turn is live, no persisted message has this turn's real ctxUsed yet — pi only reports
+  // it once the turn fully completes. Rather than stay frozen at the pre-turn value the whole
+  // time (item 4's exact complaint), estimate live usage from what's already streaming in: the
+  // pre-turn base plus a rough chars/4 token estimate of everything accumulated in `live` so far
+  // (text, reasoning, and each tool call's serialized args/result). Not exact — there is no real
+  // tokenizer on the client — but a moving, directionally-correct estimate is a large improvement
+  // over a ring frozen at 0%/stale for the whole duration of a long run.
+  const liveCharsSoFar = live
+    ? live.content.length + live.reasoning.length + live.timeline.reduce((sum, b) => {
+      if (b.kind !== 'tool') return sum
+      return sum + JSON.stringify(b.call.args).length + (b.call.result?.length ?? 0)
+    }, 0)
+    : 0
+  const ctxUsed = live
+    ? (lastRealStats?.ctxUsed ?? 0) + Math.ceil(liveCharsSoFar / 4)
+    : lastRealStats?.ctxUsed ?? 0
+  const ctxMax = status?.model?.ctx || lastRealStats?.ctxMax || 0
 
   const notFound = detailQ.isError
   // Initial load only (not a reconnect/refetch) — detailQ.data is undefined until the first
