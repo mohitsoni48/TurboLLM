@@ -21,9 +21,33 @@ export function applyTheme(theme: Theme): void {
   document.documentElement.classList.toggle('dark', resolveDark(theme))
 }
 
+// A percentage, e.g. 85–130 in 5% steps (100 = default/1×) — driven by a Slider
+// in Settings (same component as the VRAM headroom slider), not a fixed enum.
+export type FontSize = number
+
+const FONT_SIZE_KEY = 'tllm.fontSize'
+const FONT_SIZE_DEFAULT: FontSize = 100
+const FONT_SIZE_MIN: FontSize = 85
+const FONT_SIZE_MAX: FontSize = 130
+
+function readStoredFontSize(): FontSize {
+  const v = Number(localStorage.getItem(FONT_SIZE_KEY))
+  return Number.isFinite(v) && v >= FONT_SIZE_MIN && v <= FONT_SIZE_MAX ? v : FONT_SIZE_DEFAULT
+}
+
+/** Set the `--font-scale` custom property on <html> (index.css reads this via
+ *  `calc(14px * var(--font-scale, 1))`), converting the stored percentage to a
+ *  multiplier — so every rem/em-relative size in the app scales together, not
+ *  just literal px bumps in individual components. */
+export function applyFontSize(fontSize: FontSize): void {
+  document.documentElement.style.setProperty('--font-scale', String(fontSize / 100))
+}
+
 type UiState = {
   theme: Theme
   setTheme: (theme: Theme) => void
+  fontSize: FontSize
+  setFontSize: (fontSize: FontSize) => void
   logPanelOpen: boolean
   setLogPanelOpen: (open: boolean) => void
   /** A conversation id another screen wants the Chat screen to open (e.g. the
@@ -38,6 +62,12 @@ export const useUiStore = create<UiState>((set) => ({
     localStorage.setItem(THEME_KEY, theme)
     applyTheme(theme)
     set({ theme })
+  },
+  fontSize: readStoredFontSize(),
+  setFontSize: (fontSize) => {
+    localStorage.setItem(FONT_SIZE_KEY, String(fontSize))
+    applyFontSize(fontSize)
+    set({ fontSize })
   },
   logPanelOpen: false,
   setLogPanelOpen: (logPanelOpen) => set({ logPanelOpen }),

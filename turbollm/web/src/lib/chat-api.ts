@@ -132,12 +132,12 @@ export async function* sendMessage(
   images?: string[],
   docContext?: string,
   textAttachments?: string[],
-  disableThinking?: boolean,
+  thinkingBudget?: number,
 ): AsyncGenerator<ChatSseEvent> {
   const res = await fetch(`/api/v1/conversations/${encodeURIComponent(convId)}/messages`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ content, images: images?.length ? images : undefined, docContext: docContext || undefined, textAttachments: textAttachments?.length ? textAttachments : undefined, disableThinking: disableThinking || undefined }),
+    body: JSON.stringify({ content, images: images?.length ? images : undefined, docContext: docContext || undefined, textAttachments: textAttachments?.length ? textAttachments : undefined, thinkingBudget: thinkingBudget !== undefined && thinkingBudget !== -1 ? thinkingBudget : undefined }),
     signal,
   })
   if (!res.ok || !res.body) {
@@ -182,12 +182,12 @@ export async function* sendMessage(
 export async function* continueConversation(
   convId: string,
   signal: AbortSignal,
-  disableThinking?: boolean,
+  thinkingBudget?: number,
 ): AsyncGenerator<ChatSseEvent> {
   const res = await fetch(`/api/v1/conversations/${encodeURIComponent(convId)}/continue`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ disableThinking: disableThinking || undefined }),
+    body: JSON.stringify({ thinkingBudget: thinkingBudget !== undefined && thinkingBudget !== -1 ? thinkingBudget : undefined }),
     signal,
   })
   if (!res.ok || !res.body) {

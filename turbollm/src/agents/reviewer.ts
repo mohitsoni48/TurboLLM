@@ -51,7 +51,7 @@ export async function reviewConversation(
         ],
         temperature: 0.2,
         max_tokens: 600,
-        reasoning_budget: 0,
+        thinking_budget_tokens: 0,
         chat_template_kwargs: { enable_thinking: false },
         response_format: { type: 'json_object' },
         stream: false,

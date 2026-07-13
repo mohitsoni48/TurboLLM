@@ -17,8 +17,9 @@ export interface Conversation {
   /** Tool-calling policy for this conversation. 'force_web_search' forces the model
    *  to call web_search on the first iteration before composing a reply. */
   toolPolicy?: string
-  /** Conversation kind: 'chat' (default user-facing) or 'agent' (background agent run). */
-  kind: 'chat' | 'agent'
+  /** Conversation kind: 'chat' (default user-facing), 'agent' (background agent run),
+   *  or 'code' (a real pi-SDK Code session — parallel to 'agent', its own UI surface). */
+  kind: 'chat' | 'agent' | 'code'
   /** Folder this conversation is filed under (v10). NULL/undefined = uncategorized. */
   folderId?: string | null
   /** Per-conversation tool-approval overrides (v11, tool-call approval gate). Set via
@@ -112,6 +113,30 @@ export interface AgentRun {
   archivedAt?: string
   /** User disposition outcome: 'complete' | 'miss' | undefined (in-flight). */
   completion?: 'complete' | 'miss'
+  // ── Code session fields (v28) — populated only for a 'code'-kind run. ──────────
+  /** The scratch/repo folder that is the pi session cwd (the containment root). */
+  repoRoot?: string
+  /** The sidebar "branch" label captured at creation (git rev-parse of repoRoot). */
+  repoBranch?: string
+  /** Whether the composer's "isolate in a worktree" tickbox was checked. */
+  useWorktree?: boolean
+  /** Captured worktree intent — stored, NOT acted on in Phase 1 (fast-follow). */
+  worktreeBranch?: string
+  /** Captured worktree intent — stored, NOT acted on in Phase 1 (fast-follow). */
+  worktreeBase?: string
+  /** Sidebar "add" stat. 0 for Phase 1 (real diff stats are a fast-follow). */
+  linesAdded?: number
+  /** Sidebar "del" stat. 0 for Phase 1 (real diff stats are a fast-follow). */
+  linesRemoved?: number
+  // ── Manual /compact (v29) — one active compaction per session, not incremental history. ──
+  /** The summary that replaces every message at/before compactionUpToMessageId when a future
+   *  turn's history is replayed (code-session.ts's seedPriorHistory). Undefined = never compacted. */
+  compactionSummary?: string
+  /** The last DB message id that's covered by compactionSummary — messages after this one
+   *  still replay in full. */
+  compactionUpToMessageId?: string
+  /** pi's own reported token count immediately before this compaction ran — display only. */
+  compactionTokensBefore?: number
 }
 
 /** One per-Hitman track-record row (spec 13 §12.3). */
@@ -298,7 +323,7 @@ export interface Message {
 }
 
 interface ConvRow { id: string; title: string; system_prompt: string; model_key: string; sampling: string; expert_mode: number; tool_policy: string | null; kind: string | null; folder_id: string | null; tool_overrides: string | null; agent_id: string | null; completed_at: string | null; read_scope: string | null; agent_mode: string | null; skill_ids: string | null; allowed_tools: string | null; preserve_thinking: number; created_at: string; updated_at: string }
-interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; agent_id: string | null; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null; archived_at: string | null; completion: string | null }
+interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; agent_id: string | null; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null; archived_at: string | null; completion: string | null; repo_root: string | null; repo_branch: string | null; use_worktree: number | null; worktree_branch: string | null; worktree_base: string | null; lines_added: number | null; lines_removed: number | null; compaction_summary: string | null; compaction_upto_message_id: string | null; compaction_tokens_before: number | null }
 interface FolderRow { id: string; name: string; sort_order: number; created_at: string; updated_at: string }
 interface MsgRow  { id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string; reasoning: string; attachments: string; text_attachments: string | null; tool_calls: string | null; stats: string; model_key: string | null; research_meta: string | null; created_at: string; variant_group: string | null; is_active: number; branch_of: string | null; edited: number }
 
@@ -319,7 +344,7 @@ function safeToolOverrides(s: string | null): Record<string, 'allow' | 'deny'> {
 }
 
 function rowToConv(r: ConvRow): Conversation {
-  return { id: r.id, title: r.title, systemPrompt: r.system_prompt, modelKey: r.model_key, sampling: safeJson(r.sampling) as Record<string, unknown>, expertMode: r.expert_mode === 1, toolPolicy: r.tool_policy ?? undefined, kind: (r.kind === 'agent' ? 'agent' : 'chat'), folderId: r.folder_id ?? null, toolOverrides: safeToolOverrides(r.tool_overrides), agentId: r.agent_id ?? undefined, completedAt: r.completed_at ?? undefined, readScope: r.read_scope ? (safeJson(r.read_scope) as string[]) : undefined, agentMode: r.agent_mode ?? undefined, skillIds: r.skill_ids ? (safeJson(r.skill_ids) as string[]) : undefined, allowedTools: r.allowed_tools ? (safeJson(r.allowed_tools) as string[]) : undefined, preserveThinking: r.preserve_thinking === 1, createdAt: r.created_at, updatedAt: r.updated_at }
+  return { id: r.id, title: r.title, systemPrompt: r.system_prompt, modelKey: r.model_key, sampling: safeJson(r.sampling) as Record<string, unknown>, expertMode: r.expert_mode === 1, toolPolicy: r.tool_policy ?? undefined, kind: (r.kind === 'agent' ? 'agent' : r.kind === 'code' ? 'code' : 'chat'), folderId: r.folder_id ?? null, toolOverrides: safeToolOverrides(r.tool_overrides), agentId: r.agent_id ?? undefined, completedAt: r.completed_at ?? undefined, readScope: r.read_scope ? (safeJson(r.read_scope) as string[]) : undefined, agentMode: r.agent_mode ?? undefined, skillIds: r.skill_ids ? (safeJson(r.skill_ids) as string[]) : undefined, allowedTools: r.allowed_tools ? (safeJson(r.allowed_tools) as string[]) : undefined, preserveThinking: r.preserve_thinking === 1, createdAt: r.created_at, updatedAt: r.updated_at }
 }
 
 function rowToFolder(r: FolderRow): Folder {
@@ -337,6 +362,16 @@ function rowToAgentRun(r: AgentRunRow): AgentRun {
     startedAt: r.started_at ?? undefined, endedAt: r.ended_at ?? undefined,
     archivedAt: r.archived_at ?? undefined,
     completion: (r.completion as AgentRun['completion']) ?? undefined,
+    repoRoot: r.repo_root ?? undefined,
+    repoBranch: r.repo_branch ?? undefined,
+    useWorktree: r.use_worktree === null ? undefined : r.use_worktree === 1,
+    worktreeBranch: r.worktree_branch ?? undefined,
+    worktreeBase: r.worktree_base ?? undefined,
+    linesAdded: r.lines_added ?? undefined,
+    linesRemoved: r.lines_removed ?? undefined,
+    compactionSummary: r.compaction_summary ?? undefined,
+    compactionUpToMessageId: r.compaction_upto_message_id ?? undefined,
+    compactionTokensBefore: r.compaction_tokens_before ?? undefined,
   }
 }
 
@@ -654,6 +689,32 @@ export class ConversationStore {
         CREATE INDEX IF NOT EXISTS idx_memory_facts_created ON memory_facts(created_at);
         PRAGMA user_version = 27;
       `)
+    }
+    // v28 (Code, real pi-SDK agent): a 'code'-kind run stores the scratch/repo folder it
+    // runs against (the pi cwd + containment root), the sidebar branch label, and the
+    // composer's worktree intent (captured but NOT acted on in Phase 1). Diff stat columns
+    // default to 0 for Phase 1. All additive + nullable — existing agent_runs rows get NULL
+    // and are decoded as undefined in rowToAgentRun (non-breaking). hasColumn-guarded because
+    // this branch's migration ladder has been renumbered before (see hasColumn's comment).
+    if (v < 28) {
+      if (!this.hasColumn('agent_runs', 'repo_root'))       this.db.exec(`ALTER TABLE agent_runs ADD COLUMN repo_root TEXT;`)
+      if (!this.hasColumn('agent_runs', 'repo_branch'))     this.db.exec(`ALTER TABLE agent_runs ADD COLUMN repo_branch TEXT;`)
+      if (!this.hasColumn('agent_runs', 'use_worktree'))    this.db.exec(`ALTER TABLE agent_runs ADD COLUMN use_worktree INTEGER;`)
+      if (!this.hasColumn('agent_runs', 'worktree_branch')) this.db.exec(`ALTER TABLE agent_runs ADD COLUMN worktree_branch TEXT;`)
+      if (!this.hasColumn('agent_runs', 'worktree_base'))   this.db.exec(`ALTER TABLE agent_runs ADD COLUMN worktree_base TEXT;`)
+      if (!this.hasColumn('agent_runs', 'lines_added'))     this.db.exec(`ALTER TABLE agent_runs ADD COLUMN lines_added INTEGER;`)
+      if (!this.hasColumn('agent_runs', 'lines_removed'))   this.db.exec(`ALTER TABLE agent_runs ADD COLUMN lines_removed INTEGER;`)
+      this.db.exec(`PRAGMA user_version = 28;`)
+    }
+    // v29 (Code, manual /compact): one active compaction per session — a summary plus the last
+    // DB message id it covers. Not incremental (a second /compact re-summarizes everything up
+    // to that point again, replacing the old summary), which keeps seedPriorHistory's replay
+    // logic (code-session.ts) simple: at most one summary entry, then raw messages after it.
+    if (v < 29) {
+      if (!this.hasColumn('agent_runs', 'compaction_summary'))          this.db.exec(`ALTER TABLE agent_runs ADD COLUMN compaction_summary TEXT;`)
+      if (!this.hasColumn('agent_runs', 'compaction_upto_message_id'))  this.db.exec(`ALTER TABLE agent_runs ADD COLUMN compaction_upto_message_id TEXT;`)
+      if (!this.hasColumn('agent_runs', 'compaction_tokens_before'))    this.db.exec(`ALTER TABLE agent_runs ADD COLUMN compaction_tokens_before INTEGER;`)
+      this.db.exec(`PRAGMA user_version = 29;`)
     }
   }
 
@@ -1097,12 +1158,26 @@ export class ConversationStore {
 
   // ── Agent run methods (v8 migration) ──────────────────────────────────────
 
-  createAgentRun(params: { convId: string; title: string; allowedTools: string[]; agentId?: string }): AgentRun {
+  createAgentRun(params: { convId: string; title: string; allowedTools: string[]; agentId?: string; repoRoot?: string; repoBranch?: string; useWorktree?: boolean; worktreeBranch?: string; worktreeBase?: string }): AgentRun {
     const id = randomUUID()
     const now = new Date().toISOString()
     const agentId = params.agentId ?? null
-    this.db.prepare(`INSERT INTO agent_runs (id,conv_id,title,status,allowed_tools,agent_id,created_at,updated_at) VALUES ($id,$cid,$title,'queued',$at,$aid,$now,$now)`)
-      .run({ $id: id, $cid: params.convId, $title: params.title, $at: JSON.stringify(params.allowedTools), $aid: agentId, $now: now } as P)
+    // Code runs carry repo/worktree metadata (v28); background 'agent' runs pass none of it
+    // and every code column is written NULL (byte-identical to the pre-v28 insert for them).
+    this.db.prepare(`INSERT INTO agent_runs (id,conv_id,title,status,allowed_tools,agent_id,repo_root,repo_branch,use_worktree,worktree_branch,worktree_base,lines_added,lines_removed,created_at,updated_at) VALUES ($id,$cid,$title,'queued',$at,$aid,$rr,$rb,$uw,$wb,$wbase,$la,$lr,$now,$now)`)
+      .run({
+        $id: id, $cid: params.convId, $title: params.title, $at: JSON.stringify(params.allowedTools), $aid: agentId,
+        $rr: params.repoRoot ?? null,
+        $rb: params.repoBranch ?? null,
+        $uw: params.useWorktree === undefined ? null : (params.useWorktree ? 1 : 0),
+        $wb: params.worktreeBranch ?? null,
+        $wbase: params.worktreeBase ?? null,
+        // Phase 1: diff stats are not computed yet — seed a code run's counters at 0 so the
+        // sidebar shows +0/-0 rather than a blank; a background 'agent' run leaves them NULL.
+        $la: params.repoRoot !== undefined ? 0 : null,
+        $lr: params.repoRoot !== undefined ? 0 : null,
+        $now: now,
+      } as P)
     return this.getAgentRun(id)!
   }
 
@@ -1121,7 +1196,7 @@ export class ConversationStore {
     return (this.db.prepare(`SELECT * FROM agent_runs ORDER BY created_at DESC LIMIT 200`).all() as unknown as AgentRunRow[]).map(rowToAgentRun)
   }
 
-  updateAgentRun(id: string, patch: Partial<Pick<AgentRun, 'status' | 'error' | 'startedAt' | 'endedAt'>>): boolean {
+  updateAgentRun(id: string, patch: Partial<Pick<AgentRun, 'status' | 'error' | 'startedAt' | 'endedAt' | 'title' | 'compactionSummary' | 'compactionUpToMessageId' | 'compactionTokensBefore'>>): boolean {
     const now = new Date().toISOString()
     const sets: string[] = ['updated_at = $now']
     const params: Record<string, SQLInputValue> = { $id: id, $now: now }
@@ -1129,6 +1204,10 @@ export class ConversationStore {
     if (patch.error     !== undefined) { sets.push('error = $error');        params.$error   = patch.error }
     if (patch.startedAt !== undefined) { sets.push('started_at = $started'); params.$started = patch.startedAt }
     if (patch.endedAt   !== undefined) { sets.push('ended_at = $ended');     params.$ended   = patch.endedAt }
+    if (patch.title     !== undefined) { sets.push('title = $title');       params.$title   = patch.title }
+    if (patch.compactionSummary        !== undefined) { sets.push('compaction_summary = $csum');    params.$csum = patch.compactionSummary }
+    if (patch.compactionUpToMessageId  !== undefined) { sets.push('compaction_upto_message_id = $cupto'); params.$cupto = patch.compactionUpToMessageId }
+    if (patch.compactionTokensBefore   !== undefined) { sets.push('compaction_tokens_before = $ctok'); params.$ctok = patch.compactionTokensBefore }
     return ((this.db.prepare(`UPDATE agent_runs SET ${sets.join(', ')} WHERE id = $id`).run(params) as unknown) as Changes).changes > 0
   }
 

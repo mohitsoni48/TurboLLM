@@ -21,6 +21,12 @@ export interface ToolCallRecord {
   args: Record<string, unknown>
   result?: string
   error?: string
+  /** Code mode only (pi's edit tool result) — a unified diff of the change, when the
+   *  backend forwards one. Not currently persisted across a page reload; present only
+   *  on records read straight off the live SSE stream. */
+  diff?: string
+  patch?: string
+  firstChangedLine?: number
 }
 
 export interface LiveToolCall {
@@ -29,6 +35,11 @@ export interface LiveToolCall {
   args: Record<string, unknown>
   status: 'pending' | 'done' | 'error' | 'awaiting_approval'
   result?: string
+  /** Code mode only — pi edit tool's real diff/patch output, carried on the terminal
+   *  tool_call SSE event (see turbollm/src/code/code-session.ts's tool_result hook). */
+  diff?: string
+  patch?: string
+  firstChangedLine?: number
 }
 
 /** Tool-call approval gate policy (mirrors turbollm/src/tools/tool-policy.ts). */
@@ -135,6 +146,6 @@ export type ChatSseEvent =
   | { event: 'progress';  data: { phase: string; processed: number; total: number; pct: number; tps: number } }
   | { event: 'reasoning'; data: { delta: string } }
   | { event: 'delta';     data: { delta: string } }
-  | { event: 'tool_call'; data: { id: string; name: string; args: Record<string, unknown>; status: 'pending' | 'done' | 'error' | 'awaiting_approval'; result?: string } }
+  | { event: 'tool_call'; data: { id: string; name: string; args: Record<string, unknown>; status: 'pending' | 'done' | 'error' | 'awaiting_approval'; result?: string; diff?: string; patch?: string; firstChangedLine?: number } }
   | { event: 'done';      data: { message: Message } }
   | { event: 'error';     data: { code: string; message: string } }

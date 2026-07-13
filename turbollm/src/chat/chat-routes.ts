@@ -211,7 +211,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
   app.post('/api/v1/conversations/:id/messages', async (c) => {
     const convId = c.req.param('id')
-    const b = await body<{ content?: string; images?: string[]; docContext?: string; textAttachments?: string[]; disableThinking?: boolean }>(c)
+    const b = await body<{ content?: string; images?: string[]; docContext?: string; textAttachments?: string[]; thinkingBudget?: number }>(c)
     const content = (b.content ?? '').trim()
     const images = b.images ?? []
     const textAttachments = b.textAttachments ?? []
@@ -272,7 +272,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
         : fullContent
       engineMessages.push({ role: 'user', content: userContent })
 
-      await runGeneration(d, stream, { convId, conv, engineMessages, assistantMsg, ms, target, ac, disableThinking: b.disableThinking ?? false, userText: content })
+      await runGeneration(d, stream, { convId, conv, engineMessages, assistantMsg, ms, target, ac, thinkingBudget: b.thinkingBudget ?? -1, userText: content })
     })
   })
 
@@ -281,7 +281,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
   app.post('/api/v1/conversations/:id/continue', async (c) => {
     const convId = c.req.param('id')
-    const b = await body<{ disableThinking?: boolean }>(c)
+    const b = await body<{ thinkingBudget?: number }>(c)
 
     const conv = db.getConversation(convId, true)
     if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
@@ -334,7 +334,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
         engineMessages.push({ role: m.role, content })
       }
 
-      await runGeneration(d, stream, { convId, conv, engineMessages, assistantMsg, ms, target, ac, disableThinking: b.disableThinking ?? false })
+      await runGeneration(d, stream, { convId, conv, engineMessages, assistantMsg, ms, target, ac, thinkingBudget: b.thinkingBudget ?? -1 })
     })
   })
 
@@ -635,9 +635,11 @@ interface GenerationCtx {
   ms: ManagerStatus
   target: string
   ac: AbortController
-  /** When true, instruct the engine to skip reasoning entirely (model answers
-   *  directly). Mirrors the params autoTitle uses. */
-  disableThinking: boolean
+  /** Reasoning token budget for this turn: -1 = unlimited (default), 0 = thinking off
+   *  entirely, N>0 = a real sampler-enforced cap. Sent to the engine as
+   *  `thinking_budget_tokens` (0 additionally sets `chat_template_kwargs.enable_thinking:
+   *  false`, mirroring the params autoTitle uses). */
+  thinkingBudget: number
   /** Release 3, auto-memory: the clean, just-typed user text (never docContext/attachments/
    *  tool output) for this turn. Undefined on regenerate — no new user text exists there,
    *  so extraction is skipped by design (also avoids re-extracting already-scanned text). */
@@ -652,7 +654,7 @@ interface GenerationCtx {
  */
 async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx): Promise<void> {
   const { db } = d
-  const { convId, conv, assistantMsg, ms, target, ac, disableThinking } = ctx
+  const { convId, conv, assistantMsg, ms, target, ac, thinkingBudget } = ctx
 
   // Map conversation sampling overrides (camelCase) to the engine's snake_case names.
   const convS = conv.sampling ?? {}
@@ -788,12 +790,16 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
       const cappedMax = clampMaxTokens(reqBody.max_tokens as number | undefined, maxLimit)
       if (cappedMax != null) reqBody.max_tokens = cappedMax
       else delete reqBody.max_tokens
-      // GitHub #52: disableThinking (this turn) and preserveThinking (past turns) are
+      // GitHub #52: thinkingBudget (this turn) and preserveThinking (past turns) are
       // independent and can both be relevant at once, so merge rather than overwrite.
+      // thinking_budget_tokens (not the unrecognized `reasoning_budget`) is the field the
+      // engine's sampler actually reads — see reasoning-budget.cpp in the TurboQuant fork.
       const templateKwargs: Record<string, unknown> = {}
-      if (disableThinking) {
-        reqBody.reasoning_budget = 0
+      if (thinkingBudget === 0) {
+        reqBody.thinking_budget_tokens = 0
         templateKwargs.enable_thinking = false
+      } else if (thinkingBudget > 0) {
+        reqBody.thinking_budget_tokens = thinkingBudget
       }
       if (conv.preserveThinking) templateKwargs.preserve_thinking = true
       if (Object.keys(templateKwargs).length) reqBody.chat_template_kwargs = templateKwargs
@@ -1111,12 +1117,16 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
       const cappedMax = clampMaxTokens(reqBody.max_tokens as number | undefined, maxLimit)
       if (cappedMax != null) reqBody.max_tokens = cappedMax
       else delete reqBody.max_tokens
-      // GitHub #52: disableThinking (this turn) and preserveThinking (past turns) are
+      // GitHub #52: thinkingBudget (this turn) and preserveThinking (past turns) are
       // independent and can both be relevant at once, so merge rather than overwrite.
+      // thinking_budget_tokens (not the unrecognized `reasoning_budget`) is the field the
+      // engine's sampler actually reads — see reasoning-budget.cpp in the TurboQuant fork.
       const templateKwargs: Record<string, unknown> = {}
-      if (disableThinking) {
-        reqBody.reasoning_budget = 0
+      if (thinkingBudget === 0) {
+        reqBody.thinking_budget_tokens = 0
         templateKwargs.enable_thinking = false
+      } else if (thinkingBudget > 0) {
+        reqBody.thinking_budget_tokens = thinkingBudget
       }
       if (conv.preserveThinking) templateKwargs.preserve_thinking = true
       if (Object.keys(templateKwargs).length) reqBody.chat_template_kwargs = templateKwargs
@@ -1328,7 +1338,7 @@ async function autoTitle(
           stream: false,
           temperature: 0.3,
           max_tokens: 32,
-          reasoning_budget: 0,
+          thinking_budget_tokens: 0,
           chat_template_kwargs: { enable_thinking: false },
         }),
         signal: AbortSignal.timeout(20_000),

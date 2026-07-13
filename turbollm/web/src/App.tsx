@@ -14,6 +14,8 @@ import { ApiError, setAuthToken } from './lib/api'
 
 // Route-level code splitting: each screen loads only when first navigated to.
 const WorkspaceScreen = lazy(() => import('./screens/WorkspaceScreen').then((m) => ({ default: m.WorkspaceScreen })))
+const CodeHomeScreen = lazy(() => import('./screens/code/CodeHomeScreen').then((m) => ({ default: m.CodeHomeScreen })))
+const CodeSessionScreen = lazy(() => import('./screens/code/CodeSessionScreen').then((m) => ({ default: m.CodeSessionScreen })))
 const ChatScreen = lazy(() => import('./screens/ChatScreen').then((m) => ({ default: m.ChatScreen })))
 const SkillEditPage = lazy(() => import('./screens/skills/SkillEditPage').then((m) => ({ default: m.SkillEditPage })))
 const AgentEditPage = lazy(() => import('./screens/agents/AgentEditPage').then((m) => ({ default: m.AgentEditPage })))
@@ -81,6 +83,9 @@ export function App() {
             <Route path="/workspace" element={<Navigate to="/workspace/chat" replace />} />
             <Route path="/workspace/chat" element={<WorkspaceScreen />} />
             <Route path="/workspace/chat/:convId" element={<WorkspaceScreen />} />
+            {/* Code — Workspace's second mode, not a separate nav item. */}
+            <Route path="/workspace/code" element={<CodeHomeScreen />} />
+            <Route path="/workspace/code/:sessionId" element={<CodeSessionScreen />} />
             {/* Back-compat: the old Workspace → Agent tab is gone; land on Chat instead. */}
             <Route path="/workspace/agent" element={<Navigate to="/workspace/chat" replace />} />
             <Route path="/workspace/agent/:convId" element={<Navigate to="/workspace/chat" replace />} />
