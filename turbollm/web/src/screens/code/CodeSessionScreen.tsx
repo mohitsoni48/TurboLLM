@@ -257,11 +257,13 @@ export function CodeSessionScreen() {
             setLive(null)
             void qc.invalidateQueries({ queryKey: codeKeys.detail(sessionId) })
             void qc.invalidateQueries({ queryKey: ['code-sessions'] })
+            void qc.invalidateQueries({ queryKey: ['code-stats'] })
             setTimeout(() => scrollToBottom(true), 80)
           } else if (evt.event === 'error') {
             setLive(null)
             void qc.invalidateQueries({ queryKey: codeKeys.detail(sessionId) })
             void qc.invalidateQueries({ queryKey: ['code-sessions'] })
+            void qc.invalidateQueries({ queryKey: ['code-stats'] })
             toast.error(evt.data.message)
           }
         }

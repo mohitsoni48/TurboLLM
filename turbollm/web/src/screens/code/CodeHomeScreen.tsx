@@ -9,20 +9,16 @@ import { cn } from '../../lib/utils'
 import { ApiError } from '../../lib/api'
 import { useGitBranch, useModelActions, useModels, useStatus } from '../../lib/queries'
 import { createCodeSession } from '../../lib/code-api'
+import { useCodeStats } from '../../lib/code-queries'
+import type { CodeStatsRange } from '../../lib/code-types'
 import { ConversationSidebar } from '../chat/ConversationSidebar'
 import { readSavedSidebarWidth, SIDEBAR_MIN_W, sidebarMaxW, SidebarResizeHandle } from '../chat/SidebarResizeHandle'
 import { FsBrowser } from '../engines/FsBrowser'
 import { ModelDetailDialog } from '../models/ModelDetailDialog'
+import { Skeleton } from '../../components/ui/skeleton'
 import { CodeActivityHeatmap } from './CodeActivityHeatmap'
 import { CodeComposer } from './CodeComposer'
-import {
-  AGENT_MODES,
-  CODE_STATS,
-  FUN_FACT,
-  STARTER_TASKS,
-  mockSessionDays,
-  type CodeRange,
-} from './code-mock'
+import { AGENT_MODES, STARTER_TASKS } from './code-mock'
 
 /** Recently-used repo folders (this browser only) — a plain path list so the composer's
  *  repo pill has quick options beyond "Browse…" without TurboLLM tracking a project
@@ -54,12 +50,10 @@ function pushRecentRepo(path: string): string[] {
 // Repo, model, and session data are real (fs/browse + git-branch, GET /status, the
 // code-routes.ts session API). Model loading reuses ChatScreen.tsx's own
 // useModels/useModelActions hooks verbatim — selecting a model here is a real
-// load, not a preview stub. The coding-activity stats/heatmap band stays mock —
-// see code-mock.ts — until real diff-stat aggregation lands (Phase 1 plan §6 item 5).
+// load, not a preview stub. The coding-activity stats/heatmap band is real too
+// (GET /api/v1/code/stats, db.ts's codeStats) — no more mock CODE_STATS/mockSessionDays.
 // Submitting a task creates a real session and hands off to CodeSessionScreen.tsx,
 // which renders the SAME CodeComposer for follow-ups — see that file for why.
-
-const SESSION_DAYS = mockSessionDays()
 
 /** Suggest a worktree branch name from the task text — kebab of the first few
  *  words under a `turbo/` prefix (the naming agent-created branches will use).
@@ -117,18 +111,31 @@ function Segmented<T extends string>({
 }
 
 /** Stat tile — mirrors the Usage screen's tile exactly, plus a quiet hover. */
-function StatTile({ label, value }: { label: string; value: string }) {
+function StatTile({ label, value, loading }: { label: string; value: string; loading?: boolean }) {
   return (
     <div className="rounded-lg border border-border bg-panel p-4 transition-colors hover:border-border-strong">
       <div className="text-[12px] text-muted">{label}</div>
-      <div className="mt-1 truncate text-[20px] font-semibold tracking-[-0.01em] text-ink tabular-nums">{value}</div>
+      {loading
+        ? <Skeleton className="mt-1.5 h-6 w-16" />
+        : <div className="mt-1 truncate text-[20px] font-semibold tracking-[-0.01em] text-ink tabular-nums">{value}</div>}
     </div>
   )
 }
 
+/** "+1234 −567" — matches the sidebar's own per-session diff-stat chip style. Omits a zero
+ *  side entirely rather than printing "+0" for a diff that only ever removed (or only ever
+ *  added) lines. "—" when there's genuinely no diff activity at all yet. */
+function formatDiff(added: number, removed: number): string {
+  if (added === 0 && removed === 0) return '—'
+  const parts: string[] = []
+  if (added > 0) parts.push(`+${added.toLocaleString()}`)
+  if (removed > 0) parts.push(`−${removed.toLocaleString()}`)
+  return parts.join(' ')
+}
+
 export function CodeHomeScreen() {
   const navigate = useNavigate()
-  const [range, setRange] = useState<CodeRange>('all')
+  const [range, setRange] = useState<CodeStatsRange>('all')
   // Real repo picker: a path chosen via the local filesystem browser (no server-side
   // "known repos" registry — see FsBrowser). null until the user picks one.
   const [repoPath, setRepoPath] = useState<string | null>(null)
@@ -205,7 +212,8 @@ export function CodeHomeScreen() {
   const sidebarRef = useRef<HTMLDivElement>(null)
 
   const userName = getPersonalization().userName.trim()
-  const stats = CODE_STATS[range]
+  const statsQ = useCodeStats(range)
+  const stats = statsQ.data
 
   // The launchpad's job is starting a task — put the cursor there on arrival.
   // Desktop only: autofocus on mobile would pop the keyboard over the page.
@@ -346,13 +354,6 @@ export function CodeHomeScreen() {
         {/* No Chat|Code mode switch here — the sidebar's pill (ConversationSidebar.tsx)
             is the single place to switch modes; duplicating it in this header too
             was redundant chrome. */}
-        <span
-          className="ml-auto inline-flex items-center gap-1.5 rounded-full border border-border bg-panel-2 px-2.5 py-1 text-[11px] leading-none text-muted"
-          title="Sessions run for real — the activity stats and heatmap below are illustrative until diff-stat tracking lands."
-        >
-          <span className="h-1.5 w-1.5 rounded-full" style={{ background: 'var(--warn)' }} />
-          Beta · activity stats are illustrative
-        </span>
       </div>
 
       {/* Scrollable content — mirrors ChatScreen's `scrollerRef` div exactly. No
@@ -382,22 +383,28 @@ export function CodeHomeScreen() {
               />
             </div>
             <div className="mt-3 grid grid-cols-2 gap-3 md:grid-cols-4">
-              <StatTile label="Sessions" value={stats.sessions.toLocaleString()} />
-              <StatTile label="Tasks shipped" value={stats.tasksShipped.toLocaleString()} />
-              <StatTile label="Files touched" value={stats.filesTouched.toLocaleString()} />
-              <StatTile label="Diff shipped" value={stats.diffShipped} />
-              <StatTile label="Active days" value={stats.activeDays.toLocaleString()} />
-              <StatTile label="Current streak" value={stats.currentStreak} />
-              <StatTile label="Longest streak" value={stats.longestStreak} />
-              <StatTile label="Favorite model" value={stats.favoriteModel} />
+              <StatTile label="Sessions" value={(stats?.sessions ?? 0).toLocaleString()} loading={statsQ.isLoading} />
+              <StatTile label="Tasks shipped" value={(stats?.tasksShipped ?? 0).toLocaleString()} loading={statsQ.isLoading} />
+              <StatTile label="Files touched" value={(stats?.filesTouched ?? 0).toLocaleString()} loading={statsQ.isLoading} />
+              <StatTile label="Diff shipped" value={formatDiff(stats?.diffAdded ?? 0, stats?.diffRemoved ?? 0)} loading={statsQ.isLoading} />
+              <StatTile label="Active days" value={(stats?.activeDays ?? 0).toLocaleString()} loading={statsQ.isLoading} />
+              <StatTile label="Current streak" value={`${stats?.currentStreak ?? 0}d`} loading={statsQ.isLoading} />
+              <StatTile label="Longest streak" value={`${stats?.longestStreak ?? 0}d`} loading={statsQ.isLoading} />
+              <StatTile label="Favorite model" value={stats?.favoriteModel ?? '—'} loading={statsQ.isLoading} />
             </div>
             <div className="mt-3 rounded-lg border border-border bg-panel p-4">
               <div className="mb-3 flex items-baseline justify-between gap-3">
                 <span className="text-[13px] font-medium text-ink">Session activity</span>
                 <span className="text-[11px] text-faint">one box = one day</span>
               </div>
-              <CodeActivityHeatmap days={SESSION_DAYS} />
-              <p className="mt-3 text-center text-[12px] italic text-muted">{FUN_FACT}</p>
+              {statsQ.isLoading
+                ? <Skeleton className="h-[122px] w-full" />
+                : <CodeActivityHeatmap days={stats?.heatmap ?? []} />}
+              {!!stats && stats.diffAdded > 0 && (
+                <p className="mt-3 text-center text-[12px] italic text-muted">
+                  Agents have added {stats.diffAdded.toLocaleString()} line{stats.diffAdded === 1 ? '' : 's'} here.
+                </p>
+              )}
             </div>
           </div>
         </div>

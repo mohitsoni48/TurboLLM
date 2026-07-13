@@ -1,15 +1,27 @@
 import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  archiveCodeSession, clearCodeSession, deleteCodeSession, getCodeSession, listCodeSessions,
+  archiveCodeSession, clearCodeSession, deleteCodeSession, getCodeSession, getCodeStats, listCodeSessions,
   resumeCodeSession, updateCodeSessionMode, updateCodeSessionTitle,
 } from './code-api'
-import type { CodeSessionFilter } from './code-types'
+import type { CodeSessionFilter, CodeStatsRange } from './code-types'
 import { toast } from '../components/ui/sonner'
 
 export const codeKeys = {
   list: (filter: CodeSessionFilter = 'active') => ['code-sessions', filter] as const,
   detail: (id: string | null) => ['code-session', id] as const,
+  stats: (range: CodeStatsRange = 'all') => ['code-stats', range] as const,
+}
+
+/** Launchpad "Coding activity" real stats — no polling (unlike the session list, nothing
+ *  drives frequent live updates for this; a session create/turn completion invalidates it
+ *  explicitly the same way it already invalidates the session list). */
+export function useCodeStats(range: CodeStatsRange = 'all') {
+  return useQuery({
+    queryKey: codeKeys.stats(range),
+    queryFn: () => getCodeStats(range),
+    staleTime: 30_000,
+  })
 }
 
 /** Sidebar session list — polled gently; a code run can take a while, so there's no
@@ -43,7 +55,12 @@ export function useDeleteCodeSession() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: (id: string) => deleteCodeSession(id),
-    onSuccess: () => void qc.invalidateQueries({ queryKey: ['code-sessions'] }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ['code-sessions'] })
+      // A deleted run genuinely changes the aggregate activity stats (unlike archive/rename/
+      // mode-change/clear/resume, which don't touch anything codeStats() counts).
+      void qc.invalidateQueries({ queryKey: ['code-stats'] })
+    },
   })
 }
 

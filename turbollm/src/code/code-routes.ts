@@ -132,6 +132,14 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
     return c.json({ sessionId: run.id, convId: conv.id }, 201)
   })
 
+  // ── launchpad "Coding activity" stats ─────────────────────────────────────────
+  // Real numbers (db.ts's codeStats) — replaces code-mock.ts's always-fake CODE_STATS.
+  app.get('/api/v1/code/stats', (c) => {
+    const q = c.req.query('range')
+    const range = q === '30d' || q === '7d' ? q : 'all'
+    return c.json(db.codeStats(range))
+  })
+
   // ── list sessions (sidebar) ───────────────────────────────────────────────────
   // ?filter=active|archived|all — default 'active' (archived sessions hidden unless asked
   // for), mirrors the founder-requested All/Active/Archived sidebar filter.

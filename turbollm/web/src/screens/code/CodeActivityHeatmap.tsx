@@ -1,5 +1,5 @@
 import { useLayoutEffect, useRef } from 'react'
-import type { SessionDay } from './code-mock'
+import type { CodeStatsDay as SessionDay } from '../../lib/code-types'
 
 // ── Session heatmap (Code launchpad) ─────────────────────────────────────────
 //

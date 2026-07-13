@@ -232,6 +232,40 @@ export interface TokenUsageStats {
   byModel: ModelUsage[]
 }
 
+export type CodeStatsRange = 'all' | '30d' | '7d'
+
+/** One heatmap cell — one box per LOCAL calendar day (unlike token usage's sub-day zoom, Code
+ *  sessions are coarse enough that day-granularity is always right, at any range). */
+export interface CodeStatsDay {
+  date: string
+  sessions: number
+}
+
+export interface CodeStatsResult {
+  range: CodeStatsRange
+  sessions: number
+  /** Runs that finished with status 'done' — aborted/failed/interrupted runs don't count as
+   *  "shipped" even though they're real sessions. */
+  tasksShipped: number
+  /** Distinct file paths touched by an edit or write tool call, in range. */
+  filesTouched: number
+  /** Real +/- line counts from every edit tool call's stored unified diff (ADR-199 made these
+   *  actually persist) — NOT from agent_runs.lines_added/lines_removed, which are still always
+   *  0 (columns exist, nothing ever writes them); computed fresh from messages instead, so
+   *  there's no separate running counter that could drift from what's actually in the diffs. */
+  diffAdded: number
+  diffRemoved: number
+  activeDays: number
+  /** Lifetime, not scoped by `range` — mirrors tokenUsageStats' own semantics (a streak isn't a
+   *  "last N days" concept), so these stay stable as the range tab is switched. */
+  currentStreak: number
+  longestStreak: number
+  favoriteModel: string | null
+  /** At least 180 days of boxes for 'all' (padded with empty cells for a new install), the real
+   *  window for '30d'/'7d' — same convention as tokenUsageStats' heatmap. */
+  heatmap: CodeStatsDay[]
+}
+
 const RANGE_WINDOW_DAYS: Record<'30d' | '7d', number> = { '30d': 30, '7d': 7 }
 
 const TOKEN_MILESTONES = [
@@ -245,6 +279,34 @@ const TOKEN_MILESTONES = [
 function titleCaseModelName(modelKey: string): string {
   const raw = modelKey.split('|')[0] ?? modelKey
   return raw.replace(/\b\w/g, (c) => c.toUpperCase())
+}
+
+/** Local calendar date key ("YYYY-MM-DD") for a timestamp — this daemon and its user are
+ *  always the same machine, so local time (not UTC) is what "today"/"yesterday" means.
+ *  Shared by tokenUsageStats and codeStats so both bucket days identically. */
+function dayKey(iso: string): string {
+  const d = new Date(iso)
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+/** `key` shifted by `n` local calendar days (negative goes back). */
+function addDays(key: string, n: number): string {
+  const [y, m, d] = key.split('-').map(Number)
+  const dt = new Date(y, m - 1, d + n)
+  return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`
+}
+
+/** Counts +/- lines in a unified diff (skips the +++/--- file-header lines, which start with
+ *  the same characters but aren't real changes) — server-side twin of CodeTranscript.tsx's own
+ *  diffStats, used to aggregate real "diff shipped" totals for the Code activity stats. */
+function countDiffLines(diff: string): { add: number; del: number } {
+  let add = 0, del = 0
+  for (const line of diff.split('\n')) {
+    if (line.startsWith('+++') || line.startsWith('---')) continue
+    if (line.startsWith('+')) add++
+    else if (line.startsWith('-')) del++
+  }
+  return { add, del }
 }
 
 export interface MessageStats {
@@ -906,16 +968,6 @@ export class ConversationStore {
       }
     }
 
-    const dayKey = (iso: string) => {
-      const d = new Date(iso)
-      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
-    }
-    const addDays = (key: string, n: number) => {
-      const [y, m, d] = key.split('-').map(Number)
-      const dt = new Date(y, m - 1, d + n)
-      return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`
-    }
-
     // Per-local-day totals across the FULL history — needed for the lifetime streaks
     // regardless of `range`, and reused below for the heatmap window.
     const dayBuckets = new Map<string, { promptTokens: number; genTokens: number; messageCount: number }>()
@@ -1071,6 +1123,103 @@ export class ConversationStore {
       favoriteModel: byModel[0]?.displayName ?? null,
       firstMessageAt, lifetimeTotalTokens, milestone: { achieved, next, progressPct },
       activity, dailyByModel, byModel,
+    }
+  }
+
+  /** Code launchpad's "Coding activity" stats — real numbers, replacing code-mock.ts's
+   *  CODE_STATS/mockSessionDays (which were always fake). Mirrors tokenUsageStats' own
+   *  day-bucket/streak/range pattern closely (dayKey/addDays are the same shared helpers) —
+   *  everything computed fresh from agent_runs + messages on each call, not from a maintained
+   *  running counter, so it's always internally consistent with whatever data actually exists. */
+  codeStats(range: CodeStatsRange = 'all'): CodeStatsResult {
+    const runs = this.db.prepare(`
+      SELECT ar.id, ar.status, ar.created_at, c.model_key
+      FROM agent_runs ar JOIN conversations c ON c.id = ar.conv_id
+      WHERE c.kind = 'code'
+      ORDER BY ar.created_at ASC
+    `).all() as unknown as { id: string; status: string; created_at: string; model_key: string }[]
+
+    if (runs.length === 0) {
+      return {
+        range, sessions: 0, tasksShipped: 0, filesTouched: 0, diffAdded: 0, diffRemoved: 0,
+        activeDays: 0, currentStreak: 0, longestStreak: 0, favoriteModel: null, heatmap: [],
+      }
+    }
+
+    // Per-local-day run counts across the FULL history — needed for lifetime streaks
+    // regardless of `range`, and reused below for the heatmap window.
+    const dayBuckets = new Map<string, number>()
+    for (const r of runs) {
+      const key = dayKey(r.created_at)
+      dayBuckets.set(key, (dayBuckets.get(key) ?? 0) + 1)
+    }
+    const firstKey = dayKey(runs[0].created_at)
+    const todayKey = dayKey(new Date().toISOString())
+
+    let longestStreak = 0, run = 0
+    for (let key = firstKey; key <= todayKey; key = addDays(key, 1)) {
+      if (dayBuckets.has(key)) { run++; longestStreak = Math.max(longestStreak, run) } else { run = 0 }
+    }
+    let currentStreak = 0
+    {
+      // Grace period: if today has no session yet, the streak isn't broken until tomorrow.
+      let key = dayBuckets.has(todayKey) ? todayKey : addDays(todayKey, -1)
+      while (key >= firstKey && dayBuckets.has(key)) { currentStreak++; key = addDays(key, -1) }
+    }
+
+    const minAllStart = addDays(todayKey, -179)
+    const heatStart = range === 'all'
+      ? (firstKey < minAllStart ? firstKey : minAllStart)
+      : addDays(todayKey, -(RANGE_WINDOW_DAYS[range] - 1))
+
+    const scopedRuns = range === 'all' ? runs : runs.filter((r) => dayKey(r.created_at) >= heatStart)
+
+    const modelTally = new Map<string, number>()
+    let tasksShipped = 0
+    const activeDaySet = new Set<string>()
+    for (const r of scopedRuns) {
+      if (r.status === 'done') tasksShipped++
+      if (r.model_key) modelTally.set(r.model_key, (modelTally.get(r.model_key) ?? 0) + 1)
+      activeDaySet.add(dayKey(r.created_at))
+    }
+    let favoriteModelKey: string | null = null, favoriteCount = -1
+    for (const [k, n] of modelTally) if (n > favoriteCount) { favoriteModelKey = k; favoriteCount = n }
+
+    const heatmap: CodeStatsDay[] = []
+    for (let key = heatStart; key <= todayKey; key = addDays(key, 1)) {
+      heatmap.push({ date: key, sessions: dayBuckets.get(key) ?? 0 })
+    }
+
+    // filesTouched + diffAdded/diffRemoved: scoped by each MESSAGE's own created_at (when the
+    // tool call actually ran), not the owning run's — a long session's later turns land on a
+    // later day than its first message, so this is the more honest scoping of the two.
+    const msgRows = this.db.prepare(`
+      SELECT m.created_at, m.tool_calls FROM messages m JOIN conversations c ON c.id = m.conv_id
+      WHERE c.kind = 'code' AND m.role = 'assistant' AND m.tool_calls IS NOT NULL
+    `).all() as unknown as { created_at: string; tool_calls: string }[]
+
+    const filePaths = new Set<string>()
+    let diffAdded = 0, diffRemoved = 0
+    for (const r of msgRows) {
+      if (range !== 'all' && dayKey(r.created_at) < heatStart) continue
+      const calls = safeJson(r.tool_calls) as ToolCallRecord[] | undefined
+      if (!Array.isArray(calls)) continue
+      for (const tc of calls) {
+        const path = typeof tc.args?.path === 'string' ? tc.args.path : undefined
+        if (path && (tc.name === 'edit' || tc.name === 'write')) filePaths.add(path)
+        if (tc.name === 'edit' && tc.diff) {
+          const { add, del } = countDiffLines(tc.diff)
+          diffAdded += add
+          diffRemoved += del
+        }
+      }
+    }
+
+    return {
+      range, sessions: scopedRuns.length, tasksShipped, filesTouched: filePaths.size,
+      diffAdded, diffRemoved, activeDays: activeDaySet.size, currentStreak, longestStreak,
+      favoriteModel: favoriteModelKey ? titleCaseModelName(favoriteModelKey) : null,
+      heatmap,
     }
   }
 

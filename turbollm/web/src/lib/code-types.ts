@@ -61,3 +61,27 @@ export type CodeSseEvent =
  *  can reconnect with ?fromSeq=<last seq>. Synthetic connect-time frames (meta/queue) carry no
  *  id and so leave `seq` undefined — they never advance the reconnect cursor. */
 export type CodeStreamEvent = CodeSseEvent & { seq?: number }
+
+// ── Launchpad "Coding activity" stats (GET /api/v1/code/stats) — mirrors turbollm/src/chat/
+// db.ts's CodeStatsResult/CodeStatsDay exactly; real numbers, not code-mock.ts's old fakes. ──
+
+export type CodeStatsRange = 'all' | '30d' | '7d'
+
+export interface CodeStatsDay {
+  date: string
+  sessions: number
+}
+
+export interface CodeStats {
+  range: CodeStatsRange
+  sessions: number
+  tasksShipped: number
+  filesTouched: number
+  diffAdded: number
+  diffRemoved: number
+  activeDays: number
+  currentStreak: number
+  longestStreak: number
+  favoriteModel: string | null
+  heatmap: CodeStatsDay[]
+}

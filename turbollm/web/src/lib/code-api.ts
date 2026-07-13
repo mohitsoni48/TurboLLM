@@ -1,7 +1,7 @@
 // Code launchpad API client — mirrors chat-api.ts's conventions (req() helper, the
 // hand-rolled SSE line parser) against turbollm/src/code/code-routes.ts.
 import type { Conversation } from './chat-types'
-import type { CodeSession, CodeSessionFilter, CodeStreamEvent, CreateCodeSessionParams } from './code-types'
+import type { CodeSession, CodeSessionFilter, CodeStats, CodeStatsRange, CodeStreamEvent, CreateCodeSessionParams } from './code-types'
 import { ApiError, authHeaders } from './api'
 import { markCodeAuthNeeded, clearCodeAuthNeeded } from './auth-signal'
 
@@ -31,6 +31,11 @@ export function createCodeSession(params: CreateCodeSessionParams): Promise<{ se
 
 export function listCodeSessions(filter: CodeSessionFilter = 'active'): Promise<{ sessions: CodeSession[] }> {
   return req(`/api/v1/code/sessions?filter=${filter}`)
+}
+
+/** Launchpad "Coding activity" real stats — replaces code-mock.ts's CODE_STATS/mockSessionDays. */
+export function getCodeStats(range: CodeStatsRange = 'all'): Promise<CodeStats> {
+  return req(`/api/v1/code/stats?range=${range}`)
 }
 
 /** Archives (or unarchives) a session — it stays fully intact, just hidden from the default
