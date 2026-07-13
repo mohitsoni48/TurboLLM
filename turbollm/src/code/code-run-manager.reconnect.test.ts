@@ -232,3 +232,79 @@ test('stop() aborts the active run and drops everything queued behind it', async
   assert.equal(mgr.isActive(sessionId), false)
   assert.equal(store.getAgentRun(sessionId)?.status, 'interrupted', 'aborted run recorded as interrupted')
 })
+
+// ── an aborted turn's context-usage stats never regress below the last confirmed value ─
+
+test('an aborted turn does not report ctxUsed lower than the last completed turn (context cannot shrink)', async () => {
+  const { d, store } = makeDeps()
+  const repoRoot = tmp('tllm-code-repo-')
+  // Turn 1: a runner that completes normally with a real, healthy contextUsed.
+  const goodRunner: CodeSessionRunner = (async () => ({ finalText: 'ok', contextUsed: 5000, contextMax: 131072, aborted: false })) as CodeSessionRunner
+  const mgr1 = new CodeRunManager(d, { runner: goodRunner })
+  const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'first')
+  mgr1.enqueue(sessionId, { convId, repoRoot, task: 'first', userMsgId })
+  await collect(mgr1.subscribe(sessionId, 0), () => false)
+  assert.equal(store.getConversation(convId, true)?.messages?.findLast((m) => m.role === 'assistant')?.stats.ctxUsed, 5000)
+
+  // Turn 2: simulates the real live bug (2026-07-13) — an aborted turn's OWN contextUsed
+  // estimate came back much lower than reality (pi's estimator caught mid-assembly), resolving
+  // normally (not throwing) with { aborted: true, contextUsed: 800 }.
+  const flakyAbortRunner: CodeSessionRunner = (async () => ({ finalText: '', contextUsed: 800, contextMax: 131072, aborted: true })) as CodeSessionRunner
+  const mgr2 = new CodeRunManager(d, { runner: flakyAbortRunner })
+  const u2 = store.addMessage(convId, 'user', 'second')
+  mgr2.enqueue(sessionId, { convId, repoRoot, task: 'second', userMsgId: u2.id })
+  await collect(mgr2.subscribe(sessionId, 0), () => false)
+
+  const last = store.getConversation(convId, true)?.messages?.findLast((m) => m.role === 'assistant')
+  assert.equal(last?.stats.aborted, true)
+  assert.equal(last?.stats.ctxUsed, 5000, 'floored at the last confirmed value, not the unreliable lower one')
+  assert.equal(last?.stats.ctxMax, 131072)
+})
+
+test('an aborted turn that reports a HIGHER ctxUsed than before is trusted as-is', async () => {
+  const { d, store } = makeDeps()
+  const repoRoot = tmp('tllm-code-repo-')
+  const goodRunner: CodeSessionRunner = (async () => ({ finalText: 'ok', contextUsed: 5000, contextMax: 131072, aborted: false })) as CodeSessionRunner
+  const mgr1 = new CodeRunManager(d, { runner: goodRunner })
+  const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'first')
+  mgr1.enqueue(sessionId, { convId, repoRoot, task: 'first', userMsgId })
+  await collect(mgr1.subscribe(sessionId, 0), () => false)
+
+  // A genuinely larger number (e.g. the turn streamed a lot of tool output before being
+  // stopped) is real growth, not the bug — must NOT be clamped down to the prior value.
+  const higherAbortRunner: CodeSessionRunner = (async () => ({ finalText: '', contextUsed: 9000, contextMax: 131072, aborted: true })) as CodeSessionRunner
+  const mgr2 = new CodeRunManager(d, { runner: higherAbortRunner })
+  const u2 = store.addMessage(convId, 'user', 'second')
+  mgr2.enqueue(sessionId, { convId, repoRoot, task: 'second', userMsgId: u2.id })
+  await collect(mgr2.subscribe(sessionId, 0), () => false)
+
+  const last = store.getConversation(convId, true)?.messages?.findLast((m) => m.role === 'assistant')
+  assert.equal(last?.stats.ctxUsed, 9000, 'a real higher value is trusted, not clamped')
+})
+
+test('a runner that THROWS AbortError also floors ctxUsed at the last confirmed value', async () => {
+  const { d, store } = makeDeps()
+  const repoRoot = tmp('tllm-code-repo-')
+  const goodRunner: CodeSessionRunner = (async () => ({ finalText: 'ok', contextUsed: 3000, contextMax: 8192, aborted: false })) as CodeSessionRunner
+  const mgr1 = new CodeRunManager(d, { runner: goodRunner })
+  const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'first')
+  mgr1.enqueue(sessionId, { convId, repoRoot, task: 'first', userMsgId })
+  await collect(mgr1.subscribe(sessionId, 0), () => false)
+
+  // Simulates the ORIGINAL bug's exact trigger: runCodeSession throws an AbortError (e.g. from
+  // an aborted gate.acquire()) before ever computing its own contextUsed.
+  const throwingRunner: CodeSessionRunner = (async () => {
+    const err = new Error('gate_acquire_aborted')
+    err.name = 'AbortError'
+    throw err
+  }) as CodeSessionRunner
+  const mgr2 = new CodeRunManager(d, { runner: throwingRunner })
+  const u2 = store.addMessage(convId, 'user', 'second')
+  mgr2.enqueue(sessionId, { convId, repoRoot, task: 'second', userMsgId: u2.id })
+  await collect(mgr2.subscribe(sessionId, 0), () => false)
+
+  const last = store.getConversation(convId, true)?.messages?.findLast((m) => m.role === 'assistant')
+  assert.equal(last?.stats.aborted, true)
+  assert.equal(last?.stats.ctxUsed, 3000, 'a thrown AbortError still carries forward the last known context, not 0')
+  assert.equal(store.getAgentRun(sessionId)?.status, 'interrupted')
+})

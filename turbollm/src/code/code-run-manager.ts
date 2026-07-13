@@ -178,6 +178,36 @@ export class CodeRunManager {
     return { queued: willQueue }
   }
 
+  /** The most recent real ctxUsed/ctxMax on record for this conversation (the last assistant
+   *  turn that actually completed and got a genuine stats.ctxUsed from runCodeSession), or
+   *  undefined if none exists yet. Used when a turn ABORTS before runCodeSession returns a
+   *  result — see the catch block in pump() for why this matters. */
+  private lastKnownContextStats(convId: string): { ctxUsed: number; ctxMax: number } | undefined {
+    const messages = this.d.db.getConversation(convId, true)?.messages ?? []
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const stats = messages[i].stats
+      if (typeof stats?.ctxUsed === 'number' && stats.ctxUsed > 0) {
+        return { ctxUsed: stats.ctxUsed, ctxMax: stats.ctxMax ?? 0 }
+      }
+    }
+    return undefined
+  }
+
+  /** Context usage can only GROW within an ongoing session — a follow-up turn only ever adds
+   *  tokens, never removes them. Found live (2026-07-13): on an aborted turn, runCodeSession's
+   *  own contextUsed can legitimately compute a much SMALLER number than reality (pi's own
+   *  context estimator falls back to counting whatever partial/interrupted session state it
+   *  has, which an early abort can catch mid-assembly) — e.g. 1045 tokens reported immediately
+   *  after a prior turn had already confirmed 4932. A UI reading that as "context dropped" is
+   *  exactly the founder-reported "ctx size changed from 50% to 0%" symptom. Since usage cannot
+   *  really shrink, floor an aborted turn's reported value at the last confirmed one. */
+  private reliableContextStats(convId: string, reported: { ctxUsed: number; ctxMax: number }, aborted: boolean): { ctxUsed: number; ctxMax: number } {
+    if (!aborted) return reported
+    const last = this.lastKnownContextStats(convId)
+    if (!last || reported.ctxUsed >= last.ctxUsed) return reported
+    return last
+  }
+
   /** Emit the current queue state so live subscribers can update their "Queued" chips. */
   private emitQueue(sessionId: string): void {
     const s = this.sessions.get(sessionId)
@@ -255,15 +285,16 @@ export class CodeRunManager {
       })
 
       const finalContent = content.trim() || result.finalText
+      const ctxStats = this.reliableContextStats(s.convId, { ctxUsed: result.contextUsed, ctxMax: result.contextMax }, result.aborted)
       this.d.db.updateMessage(assistantMsg.id, {
         content: finalContent,
         reasoning,
         toolCalls,
-        stats: { ctxUsed: result.contextUsed, ctxMax: result.contextMax, model: model?.key, aborted: result.aborted },
+        stats: { ctxUsed: ctxStats.ctxUsed, ctxMax: ctxStats.ctxMax, model: model?.key, aborted: result.aborted },
       })
       if (result.finalText.trim()) this.d.db.upsertRunDoc(sessionId, result.finalText.trim())
       this.d.db.updateAgentRun(sessionId, { status: result.aborted ? 'interrupted' : 'done', endedAt: new Date().toISOString() })
-      push('done', { contextUsed: result.contextUsed, contextMax: result.contextMax, aborted: result.aborted })
+      push('done', { contextUsed: ctxStats.ctxUsed, contextMax: ctxStats.ctxMax, aborted: result.aborted })
       // Code sessions never go through the chat message endpoint, so nothing else fires
       // auto-title for them — best-effort, no-ops once the title's been set once (see
       // autoTitleFromConversation's own guard). It writes conversations.title, but the
@@ -279,10 +310,17 @@ export class CodeRunManager {
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e)
       const isAbort = (e as Error)?.name === 'AbortError'
+      // An abort here means runCodeSession THREW before returning any contextUsed/contextMax at
+      // all — but the conversation's real context did NOT shrink (a stop/timeout doesn't erase
+      // prior turns). Found live (2026-07-13): this used to hardcode contextUsed/contextMax to 0
+      // on every abort, which reads exactly like "context lost" in the UI's usage ring even
+      // though nothing was actually lost — reuse the last turn's real stats instead (same
+      // "usage cannot shrink" floor as the success path below, just with a reported 0 as input).
+      const carried = isAbort ? this.reliableContextStats(s.convId, { ctxUsed: 0, ctxMax: 0 }, true) : undefined
       if (content.trim() || reasoning.trim() || toolCalls.length) {
-        this.d.db.updateMessage(assistantMsg.id, { content: content.trim(), reasoning, toolCalls, stats: { aborted: isAbort } })
+        this.d.db.updateMessage(assistantMsg.id, { content: content.trim(), reasoning, toolCalls, stats: { aborted: isAbort, ...carried } })
       } else {
-        this.d.db.updateMessage(assistantMsg.id, { stats: { aborted: isAbort } })
+        this.d.db.updateMessage(assistantMsg.id, { stats: { aborted: isAbort, ...carried } })
       }
       this.d.db.updateAgentRun(sessionId, {
         status: isAbort ? 'interrupted' : 'failed',
@@ -290,7 +328,7 @@ export class CodeRunManager {
         endedAt: new Date().toISOString(),
       })
       // A terminal frame either way, so a live subscriber's loop always ends.
-      if (isAbort) push('done', { contextUsed: 0, contextMax: 0, aborted: true })
+      if (isAbort) push('done', { contextUsed: carried?.ctxUsed ?? 0, contextMax: carried?.ctxMax ?? 0, aborted: true })
       else push('error', { code: 'run_error', message })
     } finally {
       const ss = this.sessions.get(sessionId)
