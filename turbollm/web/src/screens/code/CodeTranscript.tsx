@@ -22,6 +22,7 @@ import { friendlyName } from '../../lib/tool-explain'
 import { cn } from '../../lib/utils'
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '../../components/ui/sheet'
 import { CopyButton } from '../../components/ui/copy-button'
+import { Skeleton } from '../../components/ui/skeleton'
 import { Markdown } from '../chat/MessageBubble'
 
 // ── Code session transcript ──────────────────────────────────────────────────
@@ -519,18 +520,24 @@ function RailEntry({ icon: Icon, tone = 'muted', children }: { icon: typeof Squa
   )
 }
 
+/** Quiet fade + rise on arrival for a persisted transcript entry — deliberately NOT applied to
+ *  CodeStreamingEntry's live chunks below, whose index-keyed shape shifts constantly while
+ *  tokens stream in; retriggering this on every reflow there would be distracting flicker, not
+ *  polish. A finished message mounts once and stays put, so this only ever plays once. */
 function CodeMessageEntry({ message, onRevert }: { message: Message; onRevert?: () => void }) {
   if (message.role === 'user') {
     return (
-      <RailEntry icon={SquareTerminal} tone="accent">
-        <CodeInstructionEntry content={message.content} contextFiles={message.textAttachments} onRevert={onRevert} />
-      </RailEntry>
+      <div className="tllm-rise-in">
+        <RailEntry icon={SquareTerminal} tone="accent">
+          <CodeInstructionEntry content={message.content} contextFiles={message.textAttachments} onRevert={onRevert} />
+        </RailEntry>
+      </div>
     )
   }
   const calls = (message.toolCalls ?? []).map(toRecordCall)
   const isEmpty = !message.content?.trim() && !message.reasoning?.trim() && calls.length === 0
   return (
-    <div className="flex flex-col gap-3">
+    <div className="tllm-rise-in flex flex-col gap-3">
       {message.reasoning?.trim() && (
         <RailEntry icon={Terminal}>
           <CodeReasoning reasoning={message.reasoning} />
@@ -659,6 +666,32 @@ export function CodeTranscript({
       {live && (
         <CodeStreamingEntry timeline={live.timeline} reasoning={live.reasoning} />
       )}
+    </div>
+  )
+}
+
+/** Loading placeholder for a session's FIRST load (before any real data has arrived) — matches
+ *  the transcript's own rail language (marker + content block) rather than a bare spinner or
+ *  blank space, per spec 11 §8. Not used for reconnects/refetches, only the initial GET. */
+export function CodeTranscriptSkeleton() {
+  return (
+    <div className="relative flex flex-col gap-5 pl-8">
+      <div className="absolute left-[2px] top-2 bottom-2 w-px" style={{ background: 'var(--border)' }} aria-hidden />
+      <div className="relative">
+        <div className="absolute -left-[27px] top-0.5 h-6 w-6 shrink-0 rounded-full">
+          <Skeleton className="h-full w-full rounded-full" />
+        </div>
+        <div className="ml-auto w-fit max-w-[min(88%,900px)] rounded-lg border border-border px-4 py-3">
+          <Skeleton className="h-3.5 w-64" />
+        </div>
+      </div>
+      <div className="relative flex flex-col gap-2">
+        <div className="absolute -left-[27px] top-0.5 h-6 w-6 shrink-0 rounded-full">
+          <Skeleton className="h-full w-full rounded-full" />
+        </div>
+        <Skeleton className="h-3.5 w-[80%]" />
+        <Skeleton className="h-3.5 w-[55%]" />
+      </div>
     </div>
   )
 }

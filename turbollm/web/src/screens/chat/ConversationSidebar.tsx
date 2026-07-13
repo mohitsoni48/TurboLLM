@@ -25,6 +25,7 @@ import {
   DropdownMenuTrigger,
 } from '../../components/ui/dropdown-menu'
 import { cn, folderName, readLastChatConvId, readLastCodeSessionId } from '../../lib/utils'
+import { Skeleton } from '../../components/ui/skeleton'
 import { useArchiveCodeSession, useCodeSessionRename, useCodeSessions, useDeleteCodeSession } from '../../lib/code-queries'
 import type { CodeSession, CodeSessionFilter, SessionStatus } from '../../lib/code-types'
 import { ApiError } from '../../lib/api'
@@ -62,6 +63,20 @@ const CODE_STATUS_LABEL: Record<SessionStatus, string> = {
   review: 'Needs review',
   done: 'Done',
   aborted: 'Aborted',
+}
+
+/** Skeleton row matching CodeSessionItem's exact layout (status dot + title + subtitle line) —
+ *  spec 11 §8: never a bare spinner/text, show the shape of what's coming. */
+function CodeSessionSkeletonRow() {
+  return (
+    <div className="flex flex-col gap-1.5 px-3 py-2">
+      <div className="flex items-center gap-1.5">
+        <Skeleton className="h-1.5 w-1.5 shrink-0 rounded-full" />
+        <Skeleton className="h-3.5 w-[65%]" />
+      </div>
+      <Skeleton className="h-2.5 w-[85%]" />
+    </div>
+  )
 }
 
 function CodeSessionItem({
@@ -200,7 +215,11 @@ function CodeSessionsList({ q, onRequestDelete }: { q: string; onRequestDelete: 
         </div>
       </div>
       {sessionsQ.isLoading ? (
-        <p className="px-3 py-4 text-[12px] text-faint">Loading…</p>
+        <>
+          <CodeSessionSkeletonRow />
+          <CodeSessionSkeletonRow />
+          <CodeSessionSkeletonRow />
+        </>
       ) : filtered.length === 0 ? (
         <p className="px-3 py-4 text-[12px] text-faint">
           {q.trim() ? 'No results.' : filter === 'archived' ? 'No archived sessions.' : 'No code sessions yet.'}

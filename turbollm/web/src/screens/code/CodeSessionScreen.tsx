@@ -26,7 +26,7 @@ import { readSavedSidebarWidth, SIDEBAR_MIN_W, sidebarMaxW, SidebarResizeHandle 
 import { ModelDetailDialog } from '../models/ModelDetailDialog'
 import { FsBrowser } from '../engines/FsBrowser'
 import { CodeComposer } from './CodeComposer'
-import { CodeTranscript } from './CodeTranscript'
+import { CodeTranscript, CodeTranscriptSkeleton } from './CodeTranscript'
 import { AGENT_MODES, type AgentModeId } from './code-mock'
 
 interface LiveState {
@@ -480,6 +480,10 @@ export function CodeSessionScreen() {
   const ctxMax = status?.model?.ctx || lastStats?.ctxMax || 0
 
   const notFound = detailQ.isError
+  // Initial load only (not a reconnect/refetch) — detailQ.data is undefined until the first
+  // response lands. Skeleton matches the transcript's own rail shape (spec 11 §8: never a bare
+  // spinner/blank void).
+  const initialLoading = detailQ.isLoading && !detailQ.data
   const generatingIds = useMemo(() => (live ? new Set([sessionId ?? '']) : new Set<string>()), [live, sessionId])
 
   return (
@@ -617,7 +621,8 @@ export function CodeSessionScreen() {
                 </button>
               </div>
             )}
-            {!notFound && (
+            {initialLoading && <CodeTranscriptSkeleton />}
+            {!notFound && !initialLoading && (
               <CodeTranscript
                 messages={transcriptMessages}
                 liveAssistantId={live?.assistantId}
