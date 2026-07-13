@@ -1,24 +1,65 @@
 import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { getCodeSession, listCodeSessions, updateCodeSessionMode, updateCodeSessionTitle } from './code-api'
+import {
+  archiveCodeSession, clearCodeSession, deleteCodeSession, getCodeSession, listCodeSessions,
+  resumeCodeSession, updateCodeSessionMode, updateCodeSessionTitle,
+} from './code-api'
+import type { CodeSessionFilter } from './code-types'
 import { toast } from '../components/ui/sonner'
 
 export const codeKeys = {
-  list: ['code-sessions'] as const,
+  list: (filter: CodeSessionFilter = 'active') => ['code-sessions', filter] as const,
   detail: (id: string | null) => ['code-session', id] as const,
 }
 
 /** Sidebar session list — polled gently; a code run can take a while, so there's no
  *  need for chat's faster cadence. Refetch is driven mostly by explicit invalidation
  *  from the session screen (on session create / turn completion). */
-export function useCodeSessions() {
+export function useCodeSessions(filter: CodeSessionFilter = 'active') {
   return useQuery({
-    queryKey: codeKeys.list,
-    queryFn: listCodeSessions,
+    queryKey: codeKeys.list(filter),
+    queryFn: () => listCodeSessions(filter),
     staleTime: 0,
     retry: false,
     refetchInterval: 5000,
     refetchIntervalInBackground: false,
+  })
+}
+
+/** Archive/unarchive — invalidates every filter's list (an archive moves a session between
+ *  the active/archived buckets, and 'all' always needs a refetch either way). */
+export function useArchiveCodeSession() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (v: { id: string; archived: boolean }) => archiveCodeSession(v.id, v.archived),
+    onSuccess: (_d, v) => {
+      void qc.invalidateQueries({ queryKey: ['code-sessions'] })
+      void qc.invalidateQueries({ queryKey: codeKeys.detail(v.id) })
+    },
+  })
+}
+
+export function useDeleteCodeSession() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (id: string) => deleteCodeSession(id),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ['code-sessions'] }),
+  })
+}
+
+export function useClearCodeSession() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (id: string) => clearCodeSession(id),
+    onSuccess: (_d, id) => void qc.invalidateQueries({ queryKey: codeKeys.detail(id) }),
+  })
+}
+
+export function useResumeCodeSession() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (id: string) => resumeCodeSession(id),
+    onSuccess: (_d, id) => void qc.invalidateQueries({ queryKey: codeKeys.detail(id) }),
   })
 }
 
@@ -28,6 +69,12 @@ export function useCodeSession(id: string | null) {
     queryFn: () => getCodeSession(id!),
     enabled: !!id,
     retry: false,
+    // Overrides the app's global refetchOnWindowFocus:false (main.tsx) for this one query:
+    // without it, a session deleted/archived from another tab (or another device on the LAN)
+    // stays stale here indefinitely — no poll, no invalidation reaches this tab's cache — until
+    // some unrelated action happens to fail with a 404. Refetching on focus catches it as soon
+    // as the user comes back to this tab, before they try to act on a session that's gone.
+    refetchOnWindowFocus: true,
   })
 }
 
@@ -39,7 +86,7 @@ export function useUpdateCodeSessionMode() {
     mutationFn: (v: { id: string; mode: string }) => updateCodeSessionMode(v.id, v.mode),
     onSuccess: (_d, v) => {
       void qc.invalidateQueries({ queryKey: codeKeys.detail(v.id) })
-      void qc.invalidateQueries({ queryKey: codeKeys.list })
+      void qc.invalidateQueries({ queryKey: ['code-sessions'] })
     },
   })
 }
@@ -51,7 +98,7 @@ export function useUpdateCodeSessionTitle() {
     mutationFn: (v: { id: string; title: string }) => updateCodeSessionTitle(v.id, v.title),
     onSuccess: (_d, v) => {
       void qc.invalidateQueries({ queryKey: codeKeys.detail(v.id) })
-      void qc.invalidateQueries({ queryKey: codeKeys.list })
+      void qc.invalidateQueries({ queryKey: ['code-sessions'] })
     },
   })
 }

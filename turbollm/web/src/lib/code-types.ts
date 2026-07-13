@@ -19,7 +19,14 @@ export interface CodeSession {
   createdAt: string
   repoRoot: string
   error?: string
+  /** Set when archived — hidden from the default (active) sidebar list. */
+  archivedAt?: string
+  /** Set when this session has been /clear'd — the last message id everything at/before is
+   *  hidden. Undefined = never cleared, or resumed back from one. */
+  clearedUpToMessageId?: string
 }
+
+export type CodeSessionFilter = 'active' | 'archived' | 'all'
 
 export interface CreateCodeSessionParams {
   repoRoot: string

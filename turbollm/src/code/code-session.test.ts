@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { toolsForMode, buildAppendPrompt, skillsBlock, skillCatalogBlock, type CodeMode } from './persona'
 import { toSessionStatus } from './code-routes'
-import { MUTATING_TOOLS, PATH_TOOLS, resolveEffectiveHistory } from './code-session'
+import { MUTATING_TOOLS, PATH_TOOLS, resolveEffectiveHistory, compactCodeSession } from './code-session'
 import { ConversationStore } from '../chat/db'
 import type { Deps } from '../deps'
 import type { Skill } from '../agents/skills'
@@ -227,4 +227,110 @@ test('resolveEffectiveHistory: a compaction marker pointing at a deleted/missing
   // everything because a stale/corrupt marker couldn't be resolved.
   assert.match(summaryText!, /stale summary/)
   assert.equal(messages.length, 2)
+})
+
+// ── resolveEffectiveHistory + /clear + /resume ───────────────────────────────────────
+
+test('resolveEffectiveHistory: after a /clear marker — no summary, only messages after the cut', () => {
+  const { d, store, convId, sessionId } = makeCodeConv()
+  store.addMessage(convId, 'user', 'old task')
+  const oldReply = store.addMessage(convId, 'assistant', 'old reply')
+  store.addMessage(convId, 'user', 'new task')
+
+  store.setClearedUpToMessageId(sessionId, oldReply.id)
+
+  const { summaryText, messages } = resolveEffectiveHistory(d, convId, sessionId)
+  assert.equal(summaryText, null)
+  assert.equal(messages.length, 1)
+  assert.equal(messages[0].content, 'new task')
+})
+
+test('resolveEffectiveHistory: a /clear after an earlier /compact wins — blank slate, no summary carried forward', () => {
+  const { d, store, convId, sessionId } = makeCodeConv()
+  store.addMessage(convId, 'user', 'old task 1')
+  const oldReply = store.addMessage(convId, 'assistant', 'old reply 1')
+  store.addMessage(convId, 'user', 'new task 2')
+  const newReply = store.addMessage(convId, 'assistant', 'new reply 2')
+  store.addMessage(convId, 'user', 'newest task 3')
+
+  store.updateAgentRun(sessionId, { compactionSummary: 'summary of task 1', compactionUpToMessageId: oldReply.id })
+  store.setClearedUpToMessageId(sessionId, newReply.id) // clears everything up through the compacted turn too
+
+  const { summaryText, messages } = resolveEffectiveHistory(d, convId, sessionId)
+  assert.equal(summaryText, null)
+  assert.equal(messages.length, 1)
+  assert.equal(messages[0].content, 'newest task 3')
+})
+
+test('resolveEffectiveHistory: /resume (clearing the marker back to null) restores full history, including an earlier compaction', () => {
+  const { d, store, convId, sessionId } = makeCodeConv()
+  store.addMessage(convId, 'user', 'old task 1')
+  const oldReply = store.addMessage(convId, 'assistant', 'old reply 1')
+  store.addMessage(convId, 'user', 'new task 2')
+  const newReply = store.addMessage(convId, 'assistant', 'new reply 2')
+
+  store.updateAgentRun(sessionId, { compactionSummary: 'summary of task 1', compactionUpToMessageId: oldReply.id })
+  store.setClearedUpToMessageId(sessionId, newReply.id)
+  store.setClearedUpToMessageId(sessionId, null) // /resume
+
+  const { summaryText, messages } = resolveEffectiveHistory(d, convId, sessionId)
+  assert.match(summaryText!, /summary of task 1/)
+  assert.equal(messages.length, 2)
+  assert.equal(messages[0].content, 'new task 2')
+  assert.equal(messages[1].content, 'new reply 2')
+})
+
+test('resolveEffectiveHistory: an unresolvable /clear marker (deleted/missing message id) falls through to compaction-only behavior', () => {
+  const { d, store, convId, sessionId } = makeCodeConv()
+  store.addMessage(convId, 'user', 'task')
+  store.addMessage(convId, 'assistant', 'reply')
+  store.setClearedUpToMessageId(sessionId, 'does-not-exist')
+
+  const { summaryText, messages } = resolveEffectiveHistory(d, convId, sessionId)
+  assert.equal(summaryText, null)
+  assert.equal(messages.length, 2)
+})
+
+// ── ConversationStore: Code session lifecycle (archive/delete) ───────────────────────
+
+test('setAgentRunArchived: sets and clears archived_at, round trip', () => {
+  const { store, sessionId } = makeCodeConv()
+  assert.equal(store.getAgentRun(sessionId)!.archivedAt, undefined)
+
+  store.setAgentRunArchived(sessionId, true)
+  assert.ok(store.getAgentRun(sessionId)!.archivedAt)
+
+  store.setAgentRunArchived(sessionId, false)
+  assert.equal(store.getAgentRun(sessionId)!.archivedAt, undefined)
+})
+
+test('deleteCodeSession: removes messages, the run, and the conversation; false for an unknown id', () => {
+  const { store, convId, sessionId } = makeCodeConv()
+  store.addMessage(convId, 'user', 'task')
+  store.addMessage(convId, 'assistant', 'reply')
+
+  assert.equal(store.deleteCodeSession(sessionId), true)
+  assert.equal(store.getAgentRun(sessionId), null)
+  assert.equal(store.getConversation(convId), null)
+  assert.equal(store.getMessages(convId).length, 0)
+
+  assert.equal(store.deleteCodeSession('does-not-exist'), false)
+})
+
+// ── compactCodeSession: the clear guard (found by review, not by hand) ───────────────
+
+test('compactCodeSession: rejects with session_cleared when the session has an active /clear marker, before touching the model', async () => {
+  const { d, store, convId, sessionId } = makeCodeConv()
+  store.addMessage(convId, 'user', 'task')
+  const reply = store.addMessage(convId, 'assistant', 'reply')
+  store.setClearedUpToMessageId(sessionId, reply.id)
+
+  // No d.manager/d.registry configured on this fake Deps — if the clear guard didn't fire
+  // before any model-dependent code, this would throw a DIFFERENT (TypeError) error instead,
+  // which would also fail this assertion, but for the wrong reason. Asserting the exact
+  // message pins it to the guard specifically.
+  await assert.rejects(
+    () => compactCodeSession({ d, convId, sessionId, repoRoot: '/repo' }),
+    /session_cleared/,
+  )
 })

@@ -137,6 +137,13 @@ export interface AgentRun {
   compactionUpToMessageId?: string
   /** pi's own reported token count immediately before this compaction ran — display only. */
   compactionTokensBefore?: number
+  // ── Manual /clear + /resume (v30) — a soft, resumable "clear chat" marker. ──────────────
+  /** The last DB message id covered by a /clear — resolveEffectiveHistory (code-session.ts)
+   *  replays nothing at/before this point AND injects no summary (unlike compaction, a clear
+   *  is a blank slate). Undefined = never cleared, or resumed back from one. The transcript UI
+   *  hides messages at/before this point too, with a banner offering /resume to un-hide them —
+   *  the underlying messages are never deleted, so resuming restores them exactly. */
+  clearedUpToMessageId?: string
 }
 
 /** One per-Hitman track-record row (spec 13 §12.3). */
@@ -323,7 +330,7 @@ export interface Message {
 }
 
 interface ConvRow { id: string; title: string; system_prompt: string; model_key: string; sampling: string; expert_mode: number; tool_policy: string | null; kind: string | null; folder_id: string | null; tool_overrides: string | null; agent_id: string | null; completed_at: string | null; read_scope: string | null; agent_mode: string | null; skill_ids: string | null; allowed_tools: string | null; preserve_thinking: number; created_at: string; updated_at: string }
-interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; agent_id: string | null; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null; archived_at: string | null; completion: string | null; repo_root: string | null; repo_branch: string | null; use_worktree: number | null; worktree_branch: string | null; worktree_base: string | null; lines_added: number | null; lines_removed: number | null; compaction_summary: string | null; compaction_upto_message_id: string | null; compaction_tokens_before: number | null }
+interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; agent_id: string | null; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null; archived_at: string | null; completion: string | null; repo_root: string | null; repo_branch: string | null; use_worktree: number | null; worktree_branch: string | null; worktree_base: string | null; lines_added: number | null; lines_removed: number | null; compaction_summary: string | null; compaction_upto_message_id: string | null; compaction_tokens_before: number | null; cleared_upto_message_id: string | null }
 interface FolderRow { id: string; name: string; sort_order: number; created_at: string; updated_at: string }
 interface MsgRow  { id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string; reasoning: string; attachments: string; text_attachments: string | null; tool_calls: string | null; stats: string; model_key: string | null; research_meta: string | null; created_at: string; variant_group: string | null; is_active: number; branch_of: string | null; edited: number }
 
@@ -372,6 +379,7 @@ function rowToAgentRun(r: AgentRunRow): AgentRun {
     compactionSummary: r.compaction_summary ?? undefined,
     compactionUpToMessageId: r.compaction_upto_message_id ?? undefined,
     compactionTokensBefore: r.compaction_tokens_before ?? undefined,
+    clearedUpToMessageId: r.cleared_upto_message_id ?? undefined,
   }
 }
 
@@ -715,6 +723,15 @@ export class ConversationStore {
       if (!this.hasColumn('agent_runs', 'compaction_upto_message_id'))  this.db.exec(`ALTER TABLE agent_runs ADD COLUMN compaction_upto_message_id TEXT;`)
       if (!this.hasColumn('agent_runs', 'compaction_tokens_before'))    this.db.exec(`ALTER TABLE agent_runs ADD COLUMN compaction_tokens_before INTEGER;`)
       this.db.exec(`PRAGMA user_version = 29;`)
+    }
+    // v30 (Code, /clear + /resume): a soft "clear chat" marker — the last DB message id
+    // covered by a clear, mirroring compaction_upto_message_id's shape but with no summary
+    // text (a clear is a blank slate, not a summarized carry-forward). Null = never cleared,
+    // or resumed back from one. resolveEffectiveHistory (code-session.ts) takes whichever of
+    // this and the compaction cut point is later in the message sequence.
+    if (v < 30) {
+      if (!this.hasColumn('agent_runs', 'cleared_upto_message_id')) this.db.exec(`ALTER TABLE agent_runs ADD COLUMN cleared_upto_message_id TEXT;`)
+      this.db.exec(`PRAGMA user_version = 30;`)
     }
   }
 
@@ -1209,6 +1226,39 @@ export class ConversationStore {
     if (patch.compactionUpToMessageId  !== undefined) { sets.push('compaction_upto_message_id = $cupto'); params.$cupto = patch.compactionUpToMessageId }
     if (patch.compactionTokensBefore   !== undefined) { sets.push('compaction_tokens_before = $ctok'); params.$ctok = patch.compactionTokensBefore }
     return ((this.db.prepare(`UPDATE agent_runs SET ${sets.join(', ')} WHERE id = $id`).run(params) as unknown) as Changes).changes > 0
+  }
+
+  // ── Code session lifecycle (archive/delete/clear) ───────────────────────────
+
+  /** Archive or unarchive a Code session — a separate, single-purpose setter (not folded into
+   *  updateAgentRun's patch) because `archivedAt` needs to be explicitly CLEARABLE (unarchive),
+   *  which updateAgentRun's `!== undefined` convention can't express for a nullable field. */
+  setAgentRunArchived(id: string, archived: boolean): boolean {
+    const now = new Date().toISOString()
+    return ((this.db.prepare(`UPDATE agent_runs SET archived_at = $at, updated_at = $now WHERE id = $id`)
+      .run({ $id: id, $at: archived ? now : null, $now: now } as P) as unknown) as Changes).changes > 0
+  }
+
+  /** Set or clear (`null`) a Code session's /clear cut point — see AgentRun.clearedUpToMessageId. */
+  setClearedUpToMessageId(id: string, messageId: string | null): boolean {
+    const now = new Date().toISOString()
+    return ((this.db.prepare(`UPDATE agent_runs SET cleared_upto_message_id = $mid, updated_at = $now WHERE id = $id`)
+      .run({ $id: id, $mid: messageId, $now: now } as P) as unknown) as Changes).changes > 0
+  }
+
+  /** Permanently delete a Code session: its messages, working doc, and the agent_run +
+   *  conversation rows. There is no FK cascade on these tables (each is deleted explicitly,
+   *  same as chat's own conversation delete never cascaded to messages) — miss one and it's
+   *  an orphaned row, not a crash, but still worth getting right. Returns false if the run
+   *  didn't exist. */
+  deleteCodeSession(runId: string): boolean {
+    const run = this.getAgentRun(runId)
+    if (!run) return false
+    this.db.prepare(`DELETE FROM messages WHERE conv_id = $cid`).run({ $cid: run.convId } as P)
+    this.db.prepare(`DELETE FROM agent_run_docs WHERE run_id = $id`).run({ $id: runId } as P)
+    this.db.prepare(`DELETE FROM agent_runs WHERE id = $id`).run({ $id: runId } as P)
+    this.db.prepare(`DELETE FROM conversations WHERE id = $cid`).run({ $cid: run.convId } as P)
+    return true
   }
 
   // ── Hitman layer (spec 13 §§12-15) ─────────────────────────────────────────

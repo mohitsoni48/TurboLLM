@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom'
-import { ChevronDown, ChevronLeft, ChevronRight, Circle, Download, Folder as FolderIcon, FolderInput, FolderPlus, Loader2, MessageSquare, MessageSquarePlus, MoreHorizontal, Pencil, Search, SquareTerminal, Trash2 } from 'lucide-react'
+import { Archive, ArchiveRestore, ChevronDown, ChevronLeft, ChevronRight, Circle, Download, Folder as FolderIcon, FolderInput, FolderPlus, Loader2, MessageSquare, MessageSquarePlus, MoreHorizontal, Pencil, Plus, Search, SquareTerminal, Trash2 } from 'lucide-react'
 import type { Conversation, Folder } from '../../lib/chat-types'
 import { useConversationMutations, useConversations, useFolders } from '../../lib/chat-queries'
 import { Button } from '../../components/ui/button'
@@ -25,8 +25,9 @@ import {
   DropdownMenuTrigger,
 } from '../../components/ui/dropdown-menu'
 import { cn, folderName, readLastChatConvId, readLastCodeSessionId } from '../../lib/utils'
-import { useCodeSessionRename, useCodeSessions } from '../../lib/code-queries'
-import type { CodeSession, SessionStatus } from '../../lib/code-types'
+import { useArchiveCodeSession, useCodeSessionRename, useCodeSessions, useDeleteCodeSession } from '../../lib/code-queries'
+import type { CodeSession, CodeSessionFilter, SessionStatus } from '../../lib/code-types'
+import { ApiError } from '../../lib/api'
 
 /** localStorage key for the client-only "confirm before deleting a conversation"
  *  preference (mirrors SettingsScreen). Default ON when unset. */
@@ -63,10 +64,28 @@ const CODE_STATUS_LABEL: Record<SessionStatus, string> = {
   aborted: 'Aborted',
 }
 
-function CodeSessionItem({ session, active, onOpen }: { session: CodeSession; active: boolean; onOpen: () => void }) {
+function CodeSessionItem({
+  session, active, onOpen, onRequestDelete,
+}: {
+  session: CodeSession
+  active: boolean
+  onOpen: () => void
+  onRequestDelete: () => void
+}) {
   // Rename: same double-click / Enter-to-commit UX as ConvItem below, through the
   // shared useCodeSessionRename hook (also used by CodeSessionScreen's header).
   const rename = useCodeSessionRename(session.id, session.title)
+  const archiveMut = useArchiveCodeSession()
+  const archived = !!session.archivedAt
+  const toggleArchive = () => {
+    archiveMut.mutate(
+      { id: session.id, archived: !archived },
+      {
+        onSuccess: () => toast.success(archived ? 'Session unarchived' : 'Session archived'),
+        onError: (e) => toast.error(e instanceof ApiError ? e.message : `Could not ${archived ? 'unarchive' : 'archive'} session.`),
+      },
+    )
+  }
   return (
     <div
       onClick={() => !rename.editing && onOpen()}
@@ -99,9 +118,9 @@ function CodeSessionItem({ session, active, onOpen }: { session: CodeSession; ac
         )}
       </div>
       <span className="truncate text-[11px] text-faint">
-        {CODE_STATUS_LABEL[session.status]} · {folderName(session.repoRoot)}{session.branch ? ` · ${session.branch}` : ''} · {session.when}
+        {archived ? 'Archived · ' : ''}{CODE_STATUS_LABEL[session.status]} · {folderName(session.repoRoot)}{session.branch ? ` · ${session.branch}` : ''} · {session.when}
       </span>
-      {/* Hover reveal: diff stats + rename + open affordance — same interaction
+      {/* Hover reveal: diff stats + actions menu + open affordance — same interaction
           language as ConvItem's hover-revealed folder-move/rename buttons. */}
       {!rename.editing && (
         <div className="absolute right-1.5 top-1/2 flex -translate-y-1/2 items-center gap-1.5 opacity-0 transition-opacity group-hover:opacity-100">
@@ -111,14 +130,31 @@ function CodeSessionItem({ session, active, onOpen }: { session: CodeSession; ac
               <span style={{ color: 'var(--err)' }}>&minus;{session.del}</span>
             </span>
           )}
-          <button
-            type="button"
-            onClick={(e) => { e.stopPropagation(); rename.start() }}
-            className="rounded p-0.5 text-faint transition-colors hover:text-ink"
-            title="Rename session"
-          >
-            <Pencil size={12} />
-          </button>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                onClick={(e) => e.stopPropagation()}
+                className="rounded p-1 text-faint transition-colors hover:text-ink data-[state=open]:text-ink"
+                title="Session actions"
+              >
+                <MoreHorizontal size={13} />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem onSelect={() => rename.start()}>
+                <Pencil size={13} /> Rename
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={toggleArchive}>
+                {archived ? <ArchiveRestore size={13} /> : <Archive size={13} />}
+                {archived ? 'Unarchive' : 'Archive'}
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem destructive onSelect={onRequestDelete}>
+                <Trash2 size={13} /> Delete
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
           <ChevronRight size={13} className="shrink-0 text-faint" />
         </div>
       )}
@@ -126,32 +162,60 @@ function CodeSessionItem({ session, active, onOpen }: { session: CodeSession; ac
   )
 }
 
-function CodeSessionsList({ q }: { q: string }) {
+const CODE_FILTER_OPTIONS: { value: CodeSessionFilter; label: string }[] = [
+  { value: 'active', label: 'Active' },
+  { value: 'archived', label: 'Archived' },
+  { value: 'all', label: 'All' },
+]
+
+function CodeSessionsList({ q, onRequestDelete }: { q: string; onRequestDelete: (session: CodeSession) => void }) {
   const navigate = useNavigate()
   const { sessionId: activeSessionId } = useParams<{ sessionId?: string }>()
-  const sessionsQ = useCodeSessions()
+  // Not persisted — resets to 'active' on remount, same as chat's open-folder state above.
+  const [filter, setFilter] = useState<CodeSessionFilter>('active')
+  const sessionsQ = useCodeSessions(filter)
   const sessions = sessionsQ.data?.sessions ?? []
   const filtered = q.trim()
     ? sessions.filter((s) => s.title.toLowerCase().includes(q.trim().toLowerCase()))
     : sessions
 
-  if (sessionsQ.isLoading) {
-    return <p className="px-3 py-4 text-[12px] text-faint">Loading…</p>
-  }
-  if (filtered.length === 0) {
-    return <p className="px-3 py-4 text-[12px] text-faint">{q.trim() ? 'No results.' : 'No code sessions yet.'}</p>
-  }
-
   return (
     <>
-      {filtered.map((s) => (
-        <CodeSessionItem
-          key={s.id}
-          session={s}
-          active={s.id === activeSessionId}
-          onOpen={() => navigate(`/workspace/code/${s.id}`)}
-        />
-      ))}
+      <div className="flex justify-center px-2 pb-2">
+        <div className="flex overflow-hidden rounded-md border border-border text-[11px]" role="group" aria-label="Filter sessions">
+          {CODE_FILTER_OPTIONS.map((o) => (
+            <button
+              key={o.value}
+              type="button"
+              onClick={() => setFilter(o.value)}
+              className="px-2.5 py-1 font-medium transition-colors"
+              style={{
+                background: filter === o.value ? 'var(--accent)' : 'transparent',
+                color: filter === o.value ? 'var(--on-accent)' : 'var(--muted)',
+              }}
+            >
+              {o.label}
+            </button>
+          ))}
+        </div>
+      </div>
+      {sessionsQ.isLoading ? (
+        <p className="px-3 py-4 text-[12px] text-faint">Loading…</p>
+      ) : filtered.length === 0 ? (
+        <p className="px-3 py-4 text-[12px] text-faint">
+          {q.trim() ? 'No results.' : filter === 'archived' ? 'No archived sessions.' : 'No code sessions yet.'}
+        </p>
+      ) : (
+        filtered.map((s) => (
+          <CodeSessionItem
+            key={s.id}
+            session={s}
+            active={s.id === activeSessionId}
+            onOpen={() => navigate(`/workspace/code/${s.id}`)}
+            onRequestDelete={() => onRequestDelete(s)}
+          />
+        ))
+      )}
     </>
   )
 }
@@ -188,6 +252,10 @@ export function ConversationSidebar({
   onDeleted?: (id: string) => void
 }) {
   const { pathname } = useLocation()
+  const navigate = useNavigate()
+  // Only set while viewing an actual Code session (/workspace/code/:sessionId) — used to tell
+  // whether a deleted session was the one currently open, so we can navigate away from it.
+  const { sessionId: activeCodeSessionId } = useParams<{ sessionId?: string }>()
   // Workspace has two mutually-exclusive modes sharing this one sidebar column —
   // Chat mode shows chat folders/conversations, Code mode shows code sessions,
   // never both at once. Route is the single source of truth for which is active
@@ -205,6 +273,21 @@ export function ConversationSidebar({
   const [pendingDelete, setPendingDelete] = useState<Conversation | null>(null)
   // Folder queued for a delete-confirmation dialog (null = dialog closed).
   const [pendingFolderDelete, setPendingFolderDelete] = useState<Folder | null>(null)
+  // Code session queued for a delete-confirmation dialog (null = dialog closed). Always
+  // confirmed (unlike chat's optional "confirm before delete" setting) — a Code session
+  // carries repo/branch/worktree context that's more costly to lose than a chat.
+  const [pendingCodeDelete, setPendingCodeDelete] = useState<CodeSession | null>(null)
+  const deleteCodeMut = useDeleteCodeSession()
+  const doDeleteCodeSession = (session: CodeSession) => {
+    const wasActive = session.id === activeCodeSessionId
+    deleteCodeMut.mutate(session.id, {
+      onSuccess: () => {
+        toast.success('Session deleted')
+        if (wasActive) navigate('/workspace/code')
+      },
+      onError: () => { toast.error('Could not delete session.') },
+    })
+  }
   // Which folder sections are open. Not persisted — resets on remount.
   const [openFolders, setOpenFolders] = useState<Set<string>>(new Set())
   // True while the inline "new folder" name input is showing.
@@ -342,11 +425,15 @@ export function ConversationSidebar({
         >
           <SquareTerminal size={15} />
         </Link>
-        {!isCodeMode && (
-          <Button size="icon" variant="ghost" onClick={onNew} title="New chat (Ctrl+N)" className="h-7 w-7">
-            <MessageSquarePlus size={15} />
-          </Button>
-        )}
+        <Button
+          size="icon"
+          variant="ghost"
+          onClick={onNew}
+          title={isCodeMode ? 'New session' : 'New chat (Ctrl+N)'}
+          className="h-7 w-7"
+        >
+          {isCodeMode ? <Plus size={15} /> : <MessageSquarePlus size={15} />}
+        </Button>
         {!isCodeMode && onImport && (
           <Button size="icon" variant="ghost" onClick={onImport} title="Import chat (.turbollm-chat.json or OpenAI JSON)" className="h-7 w-7">
             <Download size={15} />
@@ -415,13 +502,18 @@ export function ConversationSidebar({
             className="h-7 pl-7 text-[12px]"
           />
         </div>
-        {/* New chat / New folder / Import are chat-specific actions — hidden in Code
-            mode rather than left dangling above a list they don't act on. */}
-        {!isCodeMode && (
-          <Button size="icon" variant="ghost" onClick={onNew} title="New chat (Ctrl+N)" className="h-7 w-7 shrink-0">
-            <MessageSquarePlus size={15} />
-          </Button>
-        )}
+        {/* New folder / Import are chat-specific actions — hidden in Code mode rather than
+            left dangling above a list they don't act on. New (chat/session) applies to both
+            modes — onNew is wired per-mode by whichever screen renders this sidebar. */}
+        <Button
+          size="icon"
+          variant="ghost"
+          onClick={onNew}
+          title={isCodeMode ? 'New session' : 'New chat (Ctrl+N)'}
+          className="h-7 w-7 shrink-0"
+        >
+          {isCodeMode ? <Plus size={15} /> : <MessageSquarePlus size={15} />}
+        </Button>
         {!isCodeMode && (
           <Button size="icon" variant="ghost" onClick={() => { setAddingFolder(true); setNewFolderName('') }} title="New folder" className="h-7 w-7 shrink-0">
             <FolderPlus size={15} />
@@ -458,7 +550,7 @@ export function ConversationSidebar({
           // Code mode: ONLY code sessions, flat (no section header — see
           // CodeSessionsList above) — never co-displayed with chat history
           // (that was the bug this replaced: both histories showing at once).
-          <CodeSessionsList q={debouncedQ} />
+          <CodeSessionsList q={debouncedQ} onRequestDelete={setPendingCodeDelete} />
         ) : (
           // Chat mode: ONLY chat folders/conversations — unchanged from how this
           // behaved before the Code section existed.
@@ -584,6 +676,34 @@ export function ConversationSidebar({
               onClick={() => { if (pendingFolderDelete) doDeleteFolder(pendingFolderDelete); setPendingFolderDelete(null) }}
             >
               Delete folder
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Code session delete confirmation — always shown (no "skip confirm" setting, unlike
+          chat's optional one): a session carries repo/branch/worktree context that's more
+          costly to lose. Archiving is the reversible alternative, offered right in the menu. */}
+      <AlertDialog open={!!pendingCodeDelete} onOpenChange={(open) => { if (!open) setPendingCodeDelete(null) }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete this session?</AlertDialogTitle>
+            <AlertDialogDescription>
+              {pendingCodeDelete ? (
+                <>
+                  <span className="font-medium text-ink">{pendingCodeDelete.title || 'Untitled session'}</span>{' '}
+                  and its conversation will be permanently deleted. This can’t be undone — archive it instead
+                  if you might want it back.
+                </>
+              ) : null}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => { if (pendingCodeDelete) doDeleteCodeSession(pendingCodeDelete); setPendingCodeDelete(null) }}
+            >
+              Delete
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

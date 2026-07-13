@@ -73,6 +73,8 @@ function toSidebarRow(run: AgentRun) {
     createdAt: run.createdAt,
     repoRoot: run.repoRoot ?? '',
     error: run.error,
+    archivedAt: run.archivedAt,
+    clearedUpToMessageId: run.clearedUpToMessageId,
   }
 }
 
@@ -117,11 +119,17 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
   })
 
   // ── list sessions (sidebar) ───────────────────────────────────────────────────
+  // ?filter=active|archived|all — default 'active' (archived sessions hidden unless asked
+  // for), mirrors the founder-requested All/Active/Archived sidebar filter.
   app.get('/api/v1/code/sessions', (c) => {
+    const filter = (c.req.query('filter') ?? 'active') as 'active' | 'archived' | 'all'
     // Only code-kind runs — a run maps to a code conversation. Filter by the conv kind.
     const runs = db.listAgentRuns().filter((r) => {
       const conv = db.getConversation(r.convId)
-      return conv?.kind === 'code'
+      if (conv?.kind !== 'code') return false
+      if (filter === 'active') return !r.archivedAt
+      if (filter === 'archived') return !!r.archivedAt
+      return true
     })
     const rows = runs.map((r) => {
       const row = toSidebarRow(r)
@@ -190,17 +198,62 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
     return c.json({ ok: true, title })
   })
 
+  // ── archive / unarchive ────────────────────────────────────────────────────
+  // A session stays fully intact when archived (repo/messages/everything) — this only sets
+  // archived_at, which the sidebar list (GET /sessions?filter=) uses to hide it by default.
+  // Reuses the SAME agent_runs.archived_at column the older Hitman/background-agent layer
+  // added — this is a genuinely separate concern (a Code session isn't a Hitman contract),
+  // but the column's semantics ("hidden from the default list, not deleted") line up exactly,
+  // so a second column would just be the same bit duplicated.
+  app.post('/api/v1/code/sessions/:id/archive', async (c) => {
+    const id = c.req.param('id')
+    const run = db.getAgentRun(id)
+    if (!run) return err(c, 404, 'not_found', 'Session not found.')
+    const b = await body<{ archived?: boolean }>(c)
+    const archived = b.archived !== false
+    // Only ARCHIVING is blocked while a run is active — same hazard as delete (hiding a
+    // still-executing session from the default 'Active' filter makes it easy to lose track
+    // of, even though the run itself isn't harmed). Unarchiving is always harmless, so it's
+    // never blocked.
+    if (archived && runs.isActive(id)) return err(c, 409, 'run_active', 'Stop the current run before archiving this session.')
+    db.setAgentRunArchived(id, archived)
+    return c.json({ ok: true, archived })
+  })
+
+  // ── delete ─────────────────────────────────────────────────────────────────
+  // Permanent — messages, the working doc, and the agent_run + conversation rows are all
+  // gone (db.deleteCodeSession). Blocked while a run is active so a live turn never deletes
+  // out from under itself; the client is expected to stop the run first (or the user retries).
+  app.delete('/api/v1/code/sessions/:id', (c) => {
+    const id = c.req.param('id')
+    const run = db.getAgentRun(id)
+    if (!run) return err(c, 404, 'not_found', 'Session not found.')
+    if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop the current run before deleting this session.')
+    db.deleteCodeSession(id)
+    return c.json({ ok: true })
+  })
+
   // ── manual /compact ────────────────────────────────────────────────────────
   // Summarizes history-so-far into one summary (code-session.ts's compactCodeSession) so future
   // turns replay the summary instead of every raw message. Blocked while a run is active — it's
   // a separate, tool-less pi session so it wouldn't corrupt anything, but compacting history
   // out from under a turn that's mid-flight against the OLD history is confusing UX regardless.
+  //
+  // ALSO blocked while the session is /clear'd (found by review, not by hand): resolveEffectiveHistory
+  // restricts a cleared session to only the post-clear messages, so compacting here would summarize
+  // ONLY those and persist a new compactionUpToMessageId past the clear point — a later /resume
+  // would then fall through to that (partial) compaction instead of the full raw history, silently
+  // and permanently losing everything before the clear despite /resume's "restores exactly as it
+  // was" contract. Requiring /resume before /compact keeps that contract airtight: compaction only
+  // ever sees full history, and resume only ever undoes a clear, never a compaction that happened
+  // to run while cleared.
   app.post('/api/v1/code/sessions/:id/compact', async (c) => {
     const id = c.req.param('id')
     const run = db.getAgentRun(id)
     if (!run) return err(c, 404, 'not_found', 'Session not found.')
     if (!run.repoRoot) return err(c, 400, 'invalid_input', 'Session has no repo root.')
     if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop or wait for the current run before compacting.')
+    if (run.clearedUpToMessageId) return err(c, 409, 'session_cleared', 'Resume this session before compacting — compacting a cleared session would lose the hidden history.')
     const ms = d.manager.status()
     if (ms.state !== 'running' || !ms.model) return err(c, 409, 'model_not_loaded', 'Load a model first.')
     const b = await body<{ instructions?: string }>(c)
@@ -213,8 +266,41 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e)
       if (message === 'nothing_to_compact') return err(c, 400, 'nothing_to_compact', 'Nothing to compact yet — history is already short enough.')
+      if (message === 'session_cleared') return err(c, 409, 'session_cleared', 'Resume this session before compacting — compacting a cleared session would lose the hidden history.')
       return err(c, 500, 'compact_failed', message)
     }
+  })
+
+  // ── /clear + /resume ───────────────────────────────────────────────────────
+  // /clear hides the conversation so far (a blank slate for the model AND the transcript UI)
+  // WITHOUT touching the session's repo/worktree/branch or deleting anything — it just sets
+  // cleared_upto_message_id to the current last message, which resolveEffectiveHistory
+  // (code-session.ts) and the frontend transcript both cut at. /resume un-hides it by setting
+  // that marker back to null — the messages were never deleted, so resuming restores the
+  // conversation exactly as it was. Both blocked while a run is active, same rationale as
+  // /compact: clearing/resuming out from under a turn mid-flight against the OLD history frame
+  // is confusing regardless of whether it would technically corrupt anything.
+  app.post('/api/v1/code/sessions/:id/clear', (c) => {
+    const id = c.req.param('id')
+    const run = db.getAgentRun(id)
+    if (!run) return err(c, 404, 'not_found', 'Session not found.')
+    if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop or wait for the current run before clearing.')
+    const conv = db.getConversation(run.convId, true)
+    const lastMsg = (conv?.messages ?? []).at(-1)
+    if (!lastMsg) return err(c, 400, 'nothing_to_clear', 'Nothing to clear yet.')
+    if (run.clearedUpToMessageId === lastMsg.id) return err(c, 400, 'nothing_to_clear', 'Already cleared up to the latest message.')
+    db.setClearedUpToMessageId(id, lastMsg.id)
+    return c.json({ ok: true, clearedUpToMessageId: lastMsg.id })
+  })
+
+  app.post('/api/v1/code/sessions/:id/resume', (c) => {
+    const id = c.req.param('id')
+    const run = db.getAgentRun(id)
+    if (!run) return err(c, 404, 'not_found', 'Session not found.')
+    if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop or wait for the current run before resuming.')
+    if (!run.clearedUpToMessageId) return err(c, 400, 'not_cleared', 'This session has not been cleared.')
+    db.setClearedUpToMessageId(id, null)
+    return c.json({ ok: true })
   })
 
   // ── stop the in-flight run (+ drop the queue) ─────────────────────────────────

@@ -1,7 +1,7 @@
 // Code launchpad API client — mirrors chat-api.ts's conventions (req() helper, the
 // hand-rolled SSE line parser) against turbollm/src/code/code-routes.ts.
 import type { Conversation } from './chat-types'
-import type { CodeSession, CodeStreamEvent, CreateCodeSessionParams } from './code-types'
+import type { CodeSession, CodeSessionFilter, CodeStreamEvent, CreateCodeSessionParams } from './code-types'
 import { ApiError, authHeaders } from './api'
 
 async function req<T>(path: string, init?: RequestInit & { json?: unknown }): Promise<T> {
@@ -23,8 +23,32 @@ export function createCodeSession(params: CreateCodeSessionParams): Promise<{ se
   return req('/api/v1/code/sessions', { method: 'POST', json: params })
 }
 
-export function listCodeSessions(): Promise<{ sessions: CodeSession[] }> {
-  return req('/api/v1/code/sessions')
+export function listCodeSessions(filter: CodeSessionFilter = 'active'): Promise<{ sessions: CodeSession[] }> {
+  return req(`/api/v1/code/sessions?filter=${filter}`)
+}
+
+/** Archives (or unarchives) a session — it stays fully intact, just hidden from the default
+ *  (active) sidebar list. */
+export function archiveCodeSession(id: string, archived: boolean): Promise<{ ok: true; archived: boolean }> {
+  return req(`/api/v1/code/sessions/${encodeURIComponent(id)}/archive`, { method: 'POST', json: { archived } })
+}
+
+/** Permanently deletes a session — messages, working doc, and the session record. */
+export function deleteCodeSession(id: string): Promise<{ ok: true }> {
+  return req(`/api/v1/code/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' })
+}
+
+/** `/clear` — hides the conversation so far (repo/worktree/branch untouched, nothing deleted).
+ *  Rejects with code 'nothing_to_clear' (400) when there's nothing to clear or it's already
+ *  cleared up to the latest message. */
+export function clearCodeSession(id: string): Promise<{ ok: true; clearedUpToMessageId: string }> {
+  return req(`/api/v1/code/sessions/${encodeURIComponent(id)}/clear`, { method: 'POST', json: {} })
+}
+
+/** `/resume` — undoes a /clear, restoring the full conversation. Rejects with code
+ *  'not_cleared' (400) when the session hasn't been cleared. */
+export function resumeCodeSession(id: string): Promise<{ ok: true }> {
+  return req(`/api/v1/code/sessions/${encodeURIComponent(id)}/resume`, { method: 'POST', json: {} })
 }
 
 export interface CodeSessionDetail {

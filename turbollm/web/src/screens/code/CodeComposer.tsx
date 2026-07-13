@@ -342,14 +342,19 @@ export function CodeComposer({
 
         {/* Toolbar — same five-slot shape in both variants: mode | add-context |
             spacer | context ring | model | send/stop. Mode and model are both
-            editable in both variants — "at any stage" applies to each identically. */}
-        <div className="flex items-center gap-1 px-2.5 pb-2.5">
+            editable in both variants — "at any stage" applies to each identically.
+            `overflow-x-auto` is a safety net on narrow phones — with every slot filled
+            (mode + add-context + ring + thinking-budget + model + send/stop) the row
+            can exceed a ~375px viewport; scrolling the row itself keeps Send reachable
+            without changing layout at any width that already fits (same pattern the
+            launchpad's activity heatmap already uses for its own overflow-prone row). */}
+        <div className="flex items-center gap-1 overflow-x-auto px-2.5 pb-2.5">
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <button
                 type="button"
                 title={`${mode.label} — ${mode.desc}`}
-                className="inline-flex h-8 items-center gap-1.5 rounded-md px-2.5 text-[12px] font-medium text-muted transition-colors hover:bg-panel-2 hover:text-ink"
+                className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md px-2.5 text-[12px] font-medium text-muted transition-colors hover:bg-panel-2 hover:text-ink"
               >
                 <ModeIcon size={13} />
                 {mode.label}
@@ -381,7 +386,7 @@ export function CodeComposer({
               onClick={onAddContext}
               title="Add context — files, folders, or URLs"
               aria-label="Add context"
-              className="grid h-8 w-8 place-items-center rounded-md text-muted transition-colors hover:bg-panel-2 hover:text-ink"
+              className="grid h-8 w-8 shrink-0 place-items-center rounded-md text-muted transition-colors hover:bg-panel-2 hover:text-ink"
             >
               <Plus size={15} />
             </button>
@@ -409,7 +414,7 @@ export function CodeComposer({
               {!sendDisabled && (
                 <Button
                   size="icon"
-                  className="h-8 w-8"
+                  className="h-8 w-8 shrink-0"
                   onClick={onSubmit}
                   aria-label="Queue follow-up"
                   title="Queue this follow-up — runs after the current run finishes"
@@ -417,12 +422,12 @@ export function CodeComposer({
                   <SendHorizontal size={15} />
                 </Button>
               )}
-              <Button size="icon" variant="outline" className="h-8 w-8" onClick={onStop} title="Stop this run">
+              <Button size="icon" variant="outline" className="h-8 w-8 shrink-0" onClick={onStop} title="Stop this run">
                 <Square size={15} />
               </Button>
             </>
           ) : (
-            <Button size="icon" className="h-8 w-8" onClick={onSubmit} disabled={sendDisabled} aria-label="Send">
+            <Button size="icon" className="h-8 w-8 shrink-0" onClick={onSubmit} disabled={sendDisabled} aria-label="Send">
               <SendHorizontal size={15} />
             </Button>
           )}

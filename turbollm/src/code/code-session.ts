@@ -32,7 +32,7 @@ import type { TextContent, ToolCall as PiToolCall, Usage } from '@earendil-works
 import type { Deps } from '../deps'
 import type { Message as DbMessage } from '../chat/db'
 import { engineModelAlias } from '../engines/compat'
-import { SkillStore } from '../agents/skills'
+import { SkillStore, type Skill } from '../agents/skills'
 import { isContainedFromRoot } from './containment'
 import { buildAppendPrompt, toolsForMode, type CodeMode } from './persona'
 import { waitForToolApproval } from '../tools/approval-gate'
@@ -134,16 +134,31 @@ const COMPACTION_PREFIX = 'Summary of earlier conversation in this session (comp
 const COMPACTION_SUFFIX = '\n\n(End of summary — the actual conversation continues below.)'
 
 /** Everything a fresh pi session needs replayed for this conversation, respecting any existing
- *  manual compaction: a synthetic summary message standing in for everything at/before
- *  agent_runs.compaction_upto_message_id, followed by the real DB messages after it. Shared by
+ *  manual compaction AND a more recent manual /clear: a synthetic summary message standing in
+ *  for everything at/before agent_runs.compaction_upto_message_id, followed by the real DB
+ *  messages after it — UNLESS agent_runs.cleared_upto_message_id sits at or after that point, in
+ *  which case the clear wins: a blank slate (no summary carried forward) from the clear point
+ *  onward. /resume sets cleared_upto_message_id back to null, which falls straight through to
+ *  the compaction-only behavior again (exactly as if the clear never happened). Shared by
  *  runCodeSession (normal turns) and compactCodeSession (re-summarizing), so both always agree
  *  on what "history so far" means. */
 export function resolveEffectiveHistory(d: Deps, convId: string, sessionId: string): { summaryText: string | null; messages: DbMessage[] } {
   const all = d.db.getConversation(convId, true)?.messages ?? []
   const run = d.db.getAgentRun(sessionId)
+  const compactionIdx = run?.compactionUpToMessageId ? all.findIndex((m) => m.id === run.compactionUpToMessageId) : -1
+  const clearedIdx = run?.clearedUpToMessageId ? all.findIndex((m) => m.id === run.clearedUpToMessageId) : -1
+  // A RESOLVABLE clear that's at/after any compaction cut wins outright — a blank slate, no
+  // summary carried forward. An unresolvable (stale/corrupt) clear marker falls through to the
+  // compaction-only path below, same "degrade to replaying raw rather than silently dropping
+  // everything" philosophy as an unresolvable compaction marker.
+  if (clearedIdx !== -1 && clearedIdx >= compactionIdx) {
+    return { summaryText: null, messages: all.slice(clearedIdx + 1) }
+  }
   if (!run?.compactionUpToMessageId) return { summaryText: null, messages: all }
-  const cutIdx = all.findIndex((m) => m.id === run.compactionUpToMessageId)
-  const rest = cutIdx === -1 ? all : all.slice(cutIdx + 1)
+  // An unresolvable compaction marker (cut message deleted/corrupt) still surfaces its summary —
+  // replaying every raw message alongside a redundant summary loses nothing, whereas resolving
+  // it as "no compaction at all" would silently discard a real (if now unanchored) summary.
+  const rest = compactionIdx === -1 ? all : all.slice(compactionIdx + 1)
   return { summaryText: `${COMPACTION_PREFIX}${run.compactionSummary}${COMPACTION_SUFFIX}`, messages: rest }
 }
 
@@ -206,6 +221,10 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
   const modelId = engineModelAlias(engineKind) ?? ms.model.key
   // REAL context window from the loaded model (plan §3, point 3) — never a hardcoded 32768.
   const contextWindow = ms.model.ctx > 0 ? ms.model.ctx : 8192
+  // Captured once here (rather than re-read as `ms.model.name` at each registration site)
+  // because TS's null-narrowing of `ms.model` from the guard above doesn't reliably propagate
+  // into runSkillSubSession's nested function declaration below.
+  const modelDisplayName = ms.model.name || 'Local Model'
 
   // The FULL shared SkillStore — the main prompt only ever sees names+descriptions of these
   // (persona.ts's skillCatalogBlock); invoke_skill (registered below) looks a specific one up
@@ -266,7 +285,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     models: [
       {
         id: modelId,
-        name: ms.model.name || 'Local Model',
+        name: modelDisplayName,
         reasoning: false,
         input: ['text'],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -288,6 +307,144 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
   let heldGate: (() => void) | undefined
   const releaseGate = () => { const r = heldGate; heldGate = undefined; r?.() }
 
+  /** Runs one skill as a REAL, contained agentic sub-session — a separate pi session (its own
+   *  history, not seeded with the outer conversation) but with the SAME mode-based tool access
+   *  and safety boundary as the outer session: `auto`/`ask` get the default read/bash/edit/write
+   *  toolset, `plan` gets the read-only set, and every path-taking tool is containment-checked
+   *  against the SAME repoRoot regardless of mode. `ask` additionally gates mutating tools
+   *  through the SAME waitForToolApproval() the outer session's own tool_call hook uses, keyed
+   *  the same way (`${convId}:${toolCallId}`) — the existing approval UI picks these up for free
+   *  since they're plumbed through the SAME sink with the SAME event shape.
+   *
+   *  Replaces an earlier version that ran the skill as one isolated, tool-less text completion —
+   *  safe, but meant a skill whose whole point is real execution (e.g. shelling out to a script,
+   *  submitting a ComfyUI job) could only ever narrate what it would have done, never actually do
+   *  it. Founder-reported live: asked for a skill that downloads+processes a video, got a
+   *  confidently-worded "done" with nothing on disk to show for it — exactly what a tool-less
+   *  completion given instructions that assume real tool access will always produce. */
+  async function runSkillSubSession(skillMode: CodeMode, skill: Skill, task: string): Promise<string> {
+    const skillAuth = AuthStorage.inMemory()
+    const skillRegistry = ModelRegistry.inMemory(skillAuth)
+    skillRegistry.registerProvider('local', {
+      baseUrl: `${target}/v1`,
+      apiKey: 'agent-key',
+      authHeader: true,
+      api: 'openai-completions',
+      models: [{
+        id: modelId,
+        name: modelDisplayName,
+        reasoning: false,
+        input: ['text'],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow,
+        maxTokens: 8192,
+        compat: { supportsDeveloperRole: false, thinkingFormat: 'qwen-chat-template' },
+      }],
+    })
+    const skillModel = skillRegistry.find('local', modelId)
+    if (!skillModel) throw new Error('Failed to register local model with pi.')
+
+    let skillHeldGate: (() => void) | undefined
+    const releaseSkillGate = () => { const r = skillHeldGate; skillHeldGate = undefined; r?.() }
+
+    const skillExtension = (pi: ExtensionAPI): void => {
+      pi.on('before_provider_request', async () => {
+        releaseSkillGate()
+        if (d.gate) skillHeldGate = await d.gate.acquire('bg', { signal })
+        return undefined
+      })
+      pi.on('after_provider_response', () => { releaseSkillGate() })
+
+      // Same containment + approval boundary as the outer session's own tool_call hook
+      // (deliberately duplicated rather than shared — this runs against a DIFFERENT pi session
+      // object, and the two hooks are already small enough that factoring them out would cost
+      // more in indirection than it saves).
+      pi.on('tool_call', async (event: ToolCallEvent): Promise<ToolCallEventResult | void> => {
+        const toolName = event.toolName
+        const toolCallId = event.toolCallId
+        const input = event.input as Record<string, unknown>
+        await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'pending' } })
+
+        if (PATH_TOOLS.has(toolName)) {
+          const p = input.path
+          const pathRequired = toolName === 'read' || toolName === 'edit' || toolName === 'write'
+          if (p !== undefined && typeof p === 'string') {
+            if (!isContainedFromRoot(p, repoRoot)) {
+              const reason = 'path is outside the allowed repo root'
+              await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
+              return { block: true, reason }
+            }
+          } else if (pathRequired) {
+            const reason = `${toolName}: a valid path is required`
+            await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
+            return { block: true, reason }
+          }
+        }
+
+        if (skillMode === 'ask' && MUTATING_TOOLS.has(toolName)) {
+          await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'awaiting_approval' } })
+          const decision = await waitForToolApproval(`${convId}:${toolCallId}`, signal)
+          if (decision === 'deny') {
+            const reason = 'denied by user'
+            await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
+            return { block: true, reason }
+          }
+        }
+        return
+      })
+
+      pi.on('tool_result', async (event: ToolResultEvent): Promise<void> => {
+        const text = event.content.map((c) => (c.type === 'text' ? c.text : '')).join('')
+        const data: Record<string, unknown> = {
+          id: event.toolCallId, name: event.toolName, args: event.input,
+          status: event.isError ? 'error' : 'done', result: text,
+        }
+        if (isEditToolResult(event) && event.details) {
+          data.diff = event.details.diff
+          data.patch = event.details.patch
+          data.firstChangedLine = event.details.firstChangedLine
+        }
+        await sink({ event: 'tool_call', data })
+      })
+    }
+
+    const skillAgentDir = join(d.store.dir(), 'pi-agent')
+    const skillResourceLoader = new DefaultResourceLoader({
+      cwd: repoRoot,
+      agentDir: skillAgentDir,
+      settingsManager: SettingsManager.inMemory(),
+      extensionFactories: [{ name: 'turbollm-skill', factory: skillExtension }],
+      appendSystemPrompt: [skill.instructions.trim()],
+      noSkills: true,
+      noPromptTemplates: true,
+      noThemes: true,
+    })
+    await skillResourceLoader.reload()
+
+    // No invoke_skill tool registered here — a skill cannot invoke another skill (v1 scope).
+    const skillTools = toolsForMode(skillMode)
+    const { session: skillSession } = await createAgentSession({
+      cwd: repoRoot,
+      agentDir: skillAgentDir,
+      model: skillModel,
+      authStorage: skillAuth,
+      modelRegistry: skillRegistry,
+      resourceLoader: skillResourceLoader,
+      sessionManager: SessionManager.inMemory(repoRoot),
+      settingsManager: SettingsManager.inMemory(),
+      ...(skillTools ? { tools: skillTools } : {}),
+    })
+
+    try {
+      await skillSession.prompt(task)
+    } finally {
+      releaseSkillGate()
+    }
+    const finalText = skillSession.getLastAssistantText() ?? ''
+    skillSession.dispose()
+    return finalText.trim() || '(the skill produced no output)'
+  }
+
   // ── the inline extension: containment + approval + diff plumbing ──────────────
   const extension = (pi: ExtensionAPI): void => {
     // Background-priority engine slot, acquired/released around each provider request. Also
@@ -297,7 +454,11 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     // outgoing payload (pi-coding-agent's BeforeProviderRequestEventResult contract).
     pi.on('before_provider_request', async (event) => {
       releaseGate() // defensive: never hold two
-      if (d.gate) heldGate = await d.gate.acquire('bg')
+      // `signal` is this turn's own abort signal (Stop / connection drop) — passed through so a
+      // stuck queue wait can actually be given up on. A genuinely stuck/leaked gate now rejects
+      // (see gate.ts's own comment for the incident this fixed) rather than hanging the whole
+      // turn forever with no way to cancel it.
+      if (d.gate) heldGate = await d.gate.acquire('bg', { signal })
       if (thinkingBudget === 0) {
         const payload = event.payload as Record<string, unknown>
         return {
@@ -403,17 +564,18 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     })
 
     // The main prompt only ever sees a skill's name + description (persona.ts's
-    // skillCatalogBlock) — this is how the model actually USES one: an isolated, single-shot
-    // completion with the skill's full instructions as ITS system prompt and no tools of its
-    // own (pure text generation, so it can't touch the filesystem/shell regardless of mode —
-    // the same safety property as the rest of this run's mode gating, just automatic here
-    // since there's nothing to gate). The result comes back as this tool's output; the full
-    // instructions never enter the main session's context.
+    // skillCatalogBlock) — this is how the model actually USES one: a real, contained agentic
+    // sub-session (runSkillSubSession, above) with the CURRENT mode's own tool access and
+    // safety boundary — auto/ask get real read/bash/edit/write against this session's own
+    // repoRoot, plan gets read-only, ask gates mutations through the same approval UI the main
+    // session uses. The result (the skill's final reply) comes back as this tool's output; the
+    // full instructions never enter the MAIN session's own context.
     pi.registerTool({
       name: 'invoke_skill',
       label: 'Invoke skill',
       description: 'Load a skill from the catalog above and use it for a specific task. Runs the ' +
-        'skill\'s full instructions in an isolated call and returns its output — the instructions ' +
+        'skill\'s full instructions as a real sub-session with this session\'s own tools (subject to ' +
+        'the current mode\'s access/approval rules) and returns its final reply — the instructions ' +
         'themselves never enter this conversation.',
       promptSnippet: 'invoke_skill(skillId, task) - use a skill from the catalog for a specific task',
       parameters: Type.Object({
@@ -426,29 +588,17 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
           const known = skills.map((s) => s.id).join(', ')
           return { content: [{ type: 'text', text: `No skill "${params.skillId}" in the catalog. Known skill ids: ${known}` }], details: {} }
         }
-        releaseGate() // defensive: never hold two
-        if (d.gate) heldGate = await d.gate.acquire('bg')
+        // Live mode — mirrors the outer tool_call hook's own resolution just above (re-read
+        // fresh from the DB so a mid-run mode switch applies to the NEXT invoke_skill call too,
+        // same plan-mode exception: plan's toolset is fixed at session-creation time, so a
+        // mid-run switch to/from plan only takes effect on the skill's next invocation).
+        const dbMode = (d.db.getConversation(convId)?.agentMode ?? mode) as CodeMode
+        const liveMode: CodeMode = dbMode === 'plan' ? mode : dbMode
         try {
-          const res = await fetch(`${target}/v1/chat/completions`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              model: modelId,
-              messages: [
-                { role: 'system', content: skill.instructions.trim() },
-                { role: 'user', content: params.task },
-              ],
-              stream: false,
-              max_tokens: 4096,
-            }),
-            signal,
-          })
-          if (!res.ok) return { content: [{ type: 'text', text: `invoke_skill: engine returned ${res.status}` }], details: {} }
-          const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> }
-          const text = data.choices?.[0]?.message?.content?.trim() || '(the skill produced no output)'
+          const text = await runSkillSubSession(liveMode, skill, params.task)
           return { content: [{ type: 'text', text }], details: {} }
-        } finally {
-          releaseGate()
+        } catch (e) {
+          return { content: [{ type: 'text', text: `invoke_skill: failed (${e instanceof Error ? e.message : String(e)}) — try again.` }], details: {} }
         }
       },
     })
@@ -562,6 +712,14 @@ export interface CompactCodeResult {
  *  or run a command regardless of the session's mode. */
 export async function compactCodeSession(params: CompactCodeParams): Promise<CompactCodeResult> {
   const { d, convId, sessionId, repoRoot, customInstructions } = params
+
+  // Never compact a cleared session (code-routes.ts's route already blocks this too, but the
+  // invariant belongs here, not just at its one current caller): resolveEffectiveHistory
+  // restricts a cleared session to only the post-clear messages, so compacting would summarize
+  // ONLY those and persist a new cut point past the clear — a later /resume would then silently
+  // and permanently lose everything before the clear, contradicting /resume's "restores exactly
+  // as it was" contract.
+  if (d.db.getAgentRun(sessionId)?.clearedUpToMessageId) throw new Error('session_cleared')
 
   const ms = d.manager.status()
   if (ms.state !== 'running' || !ms.model) throw new Error('model_not_loaded')

@@ -1,12 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { ArrowDown, Clock, FolderOpen, GitBranch, PanelLeft, Pencil } from 'lucide-react'
+import { ArrowDown, Clock, Eraser, FolderOpen, GitBranch, PanelLeft, Pencil, RotateCcw } from 'lucide-react'
 import { ApiError } from '../../lib/api'
 import { skillKeys, fetchSkills } from '../../lib/agent-api'
 import { useModelActions, useModels, useStatus } from '../../lib/queries'
 import { compactCodeSession, startCodeRun, streamCodeSession, stopCodeSession } from '../../lib/code-api'
-import { codeKeys, useCodeSession, useCodeSessionRename, useUpdateCodeSessionMode } from '../../lib/code-queries'
+import {
+  codeKeys, useClearCodeSession, useCodeSession, useCodeSessionRename, useResumeCodeSession,
+  useUpdateCodeSessionMode,
+} from '../../lib/code-queries'
 import type { LiveToolCall } from '../../lib/chat-types'
 import { appendTextDelta, upsertToolCall, type LiveBlock } from '../../lib/live-timeline'
 import { Button } from '../../components/ui/button'
@@ -55,7 +58,16 @@ export function CodeSessionScreen() {
   const detailQ = useCodeSession(sessionId ?? null)
   const session = detailQ.data?.session
   const conversation = detailQ.data?.conversation
-  const messages = conversation?.messages ?? []
+  const allMessages = conversation?.messages ?? []
+  // /clear hides everything at/before clearedUpToMessageId from the transcript (the messages
+  // themselves are never deleted — /resume un-hides them again). `messages` below is what the
+  // rest of this screen renders/measures (context ring, transcript); server-side history replay
+  // for the MODEL applies the same cut via resolveEffectiveHistory (code-session.ts).
+  const clearedIdx = session?.clearedUpToMessageId
+    ? allMessages.findIndex((m) => m.id === session.clearedUpToMessageId)
+    : -1
+  const messages = clearedIdx === -1 ? allMessages : allMessages.slice(clearedIdx + 1)
+  const clearedCount = clearedIdx === -1 ? 0 : clearedIdx + 1
 
   // Rename — same shared hook/UX as the sidebar's CodeSessionItem (ConversationSidebar.tsx),
   // surfaced here too since the header is the bigger, always-visible spot for a session's title.
@@ -231,12 +243,12 @@ export function CodeSessionScreen() {
           } else if (evt.event === 'done') {
             setLive(null)
             void qc.invalidateQueries({ queryKey: codeKeys.detail(sessionId) })
-            void qc.invalidateQueries({ queryKey: codeKeys.list })
+            void qc.invalidateQueries({ queryKey: ['code-sessions'] })
             setTimeout(() => scrollToBottom(true), 80)
           } else if (evt.event === 'error') {
             setLive(null)
             void qc.invalidateQueries({ queryKey: codeKeys.detail(sessionId) })
-            void qc.invalidateQueries({ queryKey: codeKeys.list })
+            void qc.invalidateQueries({ queryKey: ['code-sessions'] })
             toast.error(evt.data.message)
           }
         }
@@ -244,7 +256,7 @@ export function CodeSessionScreen() {
         streamActiveRef.current = false
         setLive(null)
         void qc.invalidateQueries({ queryKey: codeKeys.detail(sessionId) })
-        void qc.invalidateQueries({ queryKey: codeKeys.list })
+        void qc.invalidateQueries({ queryKey: ['code-sessions'] })
       } catch (e) {
         if (ac.signal.aborted) { streamActiveRef.current = false; return }
         // Network drop mid-run — the DAEMON kept executing. Reconnect from the last seq seen so
@@ -351,10 +363,43 @@ export function CodeSessionScreen() {
     }
   }
 
+  // `/clear` hides the conversation so far (repo/worktree/branch untouched, nothing deleted);
+  // `/resume` un-hides it. Same "composer command, not a real turn" shape as /compact above.
+  const CLEAR_RE = /^\/clear\b\s*$/i
+  const RESUME_RE = /^\/resume\b\s*$/i
+  const clearMut = useClearCodeSession()
+  const resumeMut = useResumeCodeSession()
+  const runClear = async () => {
+    if (!sessionId) return
+    setInput('')
+    setTimeout(autoResize, 0)
+    try {
+      await clearMut.mutateAsync(sessionId)
+      toast.success('Chat cleared — use /resume or the banner above to bring it back.')
+    } catch (e) {
+      if (e instanceof ApiError && e.code === 'nothing_to_clear') toast.info(e.message)
+      else toast.error(e instanceof ApiError ? e.message : 'Could not clear.')
+    }
+  }
+  const runResume = async () => {
+    if (!sessionId) return
+    setInput('')
+    setTimeout(autoResize, 0)
+    try {
+      await resumeMut.mutateAsync(sessionId)
+      toast.success('Chat resumed.')
+    } catch (e) {
+      if (e instanceof ApiError && e.code === 'not_cleared') toast.info(e.message)
+      else toast.error(e instanceof ApiError ? e.message : 'Could not resume.')
+    }
+  }
+
   const send = async () => {
     const text = input.trim()
     if (!text || !sessionId) return
     if (COMPACT_RE.test(text)) { await runCompact(text); return }
+    if (CLEAR_RE.test(text)) { await runClear(); return }
+    if (RESUME_RE.test(text)) { await runResume(); return }
     const finalText = rewriteSkillCommand(text)
     setInput('')
     setTimeout(autoResize, 0)
@@ -454,7 +499,7 @@ export function CodeSessionScreen() {
                 />
               ) : (
                 <span
-                  className="min-w-0 truncate text-[13px] font-medium text-ink"
+                  className="min-w-0 flex-1 truncate text-[13px] font-medium text-ink"
                   title={session.title}
                   onDoubleClick={rename.start}
                 >
@@ -471,17 +516,28 @@ export function CodeSessionScreen() {
                   <Pencil size={13} />
                 </button>
               )}
+              {/* Repo/branch context — shown at every width (previously md:-only, hiding it
+                  entirely on mobile with no other way to see it in this screen). The title's
+                  own min-w-0 flex-1 truncate yields space to these before anything gets fully
+                  cut off — but that alone isn't enough: these chips are shrink-0 (fixed to
+                  their natural width) with no cap, so a genuinely long repo path + branch name
+                  can still claim ALL the row's width and squeeze the title to literally 0px,
+                  invisible (caught live, not by inspection — measured 0px with a real long
+                  repo/branch pair at 375px). Capping each chip's own text at a small max-width
+                  on mobile (relaxed back to fully visible at md: and up, unchanged from before
+                  this fix) guarantees the title always keeps a real minimum, at the cost of the
+                  chip text itself truncating instead. */}
               <span
-                className="hidden shrink-0 items-center gap-1 rounded-full border border-border px-2 py-0.5 text-[11px] text-muted md:inline-flex"
+                className="inline-flex shrink-0 items-center gap-1 rounded-full border border-border px-2 py-0.5 text-[11px] text-muted"
                 title={session.repoRoot}
               >
-                <FolderOpen size={11} />
-                {folderName(session.repoRoot)}
+                <FolderOpen size={11} className="shrink-0" />
+                <span className="max-w-[70px] truncate md:max-w-none">{folderName(session.repoRoot)}</span>
               </span>
               {session.branch && (
-                <span className="hidden shrink-0 items-center gap-1 rounded-full border border-border px-2 py-0.5 text-[11px] text-muted md:inline-flex">
-                  <GitBranch size={11} />
-                  {session.branch}
+                <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-border px-2 py-0.5 text-[11px] text-muted">
+                  <GitBranch size={11} className="shrink-0" />
+                  <span className="max-w-[70px] truncate md:max-w-none">{session.branch}</span>
                 </span>
               )}
             </>
@@ -497,6 +553,24 @@ export function CodeSessionScreen() {
               <div className="flex flex-col items-center gap-2 py-16 text-center">
                 <p className="text-[14px] text-muted">This session couldn&rsquo;t be found.</p>
                 <Button size="sm" variant="outline" onClick={() => navigate('/workspace/code')}>Back to Code</Button>
+              </div>
+            )}
+            {/* /clear banner — the underlying messages are never deleted, so this is a
+                reminder + one-click undo, not a warning about lost data. */}
+            {!notFound && session?.clearedUpToMessageId && (
+              <div className="mb-4 flex items-center gap-2 rounded-lg border border-border bg-panel-2 px-3 py-2 text-[12px] text-muted">
+                <Eraser size={13} className="shrink-0 text-faint" />
+                <span className="flex-1">
+                  Chat cleared — {clearedCount} earlier message{clearedCount === 1 ? '' : 's'} hidden.
+                </span>
+                <button
+                  type="button"
+                  onClick={() => void runResume()}
+                  disabled={resumeMut.isPending}
+                  className="inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-1 font-medium text-ink transition-colors hover:bg-panel"
+                >
+                  <RotateCcw size={12} /> Resume
+                </button>
               </div>
             )}
             {!notFound && (
@@ -569,6 +643,8 @@ export function CodeSessionScreen() {
             onAddContext={() => toast('Add context is coming', { description: 'Attach files, folders, or URLs to steer the agent — not wired yet.' })}
             slashCommands={[
               { id: 'compact', description: 'Summarize the conversation so far into one summary, to free up context' },
+              { id: 'clear', description: 'Clear the chat — repo, worktree, and branch stay as they are' },
+              ...(session?.clearedUpToMessageId ? [{ id: 'resume', description: 'Bring back a cleared chat' }] : []),
               ...(skillsQ.data ?? []).map((s) => ({ id: s.id, description: s.description })),
             ]}
             hintText={live

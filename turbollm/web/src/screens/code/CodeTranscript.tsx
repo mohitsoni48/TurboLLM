@@ -109,11 +109,16 @@ const KIND_VERB: Record<string, string> = {
 }
 
 /** A file-taking tool's `path` arg, for a card's header — falls back to the
- *  friendly tool name when there's no path (bash, or an odd/legacy call shape). */
+ *  friendly tool name when there's no path (bash, or an odd/legacy call shape).
+ *  invoke_skill has neither a path nor a command, just a skillId, so without this it would
+ *  render as the unhelpfully generic "invoke skill" for every skill call alike. */
 function toolLabel(name: string, args: Record<string, unknown>): string {
   const path = args.path
   if (typeof path === 'string' && path.trim()) return path
   if (BASH_TOOLS.has(name) && typeof args.command === 'string') return args.command
+  if (name === 'invoke_skill' && typeof args.skillId === 'string' && args.skillId.trim()) {
+    return `${friendlyName(name)} (${args.skillId})`
+  }
   return friendlyName(name)
 }
 
