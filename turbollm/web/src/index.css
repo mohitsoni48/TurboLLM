@@ -94,7 +94,9 @@ body {
   background: var(--bg);
   color: var(--ink);
   font-family: var(--font-sans);
-  font-size: 14px;
+  /* --font-scale is set on <html> by the Settings → Font size preference
+     (stores/ui.ts applyFontSize) — small/medium/large multiply this base. */
+  font-size: calc(14px * var(--font-scale, 1));
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
 }
@@ -110,6 +112,27 @@ body {
 :focus-visible {
   outline: 2px solid color-mix(in srgb, var(--accent) 40%, transparent);
   outline-offset: 1px;
+}
+
+/* Rise-in entrance used by the Code launchpad — sections stagger via inline
+   animation-delay. Motion-sensitive users get an instant render instead. */
+@keyframes tllm-rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.tllm-rise {
+  animation: tllm-rise 0.45s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .tllm-rise {
+    animation: none;
+  }
 }
 
 /* starting-state pulse (spec 11 §3/§8) */

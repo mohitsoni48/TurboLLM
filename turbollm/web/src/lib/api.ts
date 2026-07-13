@@ -366,6 +366,17 @@ export function browseFs(path?: string): Promise<FsListing> {
   return request<FsListing>(`/api/v1/fs/browse${q}`)
 }
 
+/** Current branch + known local branches for a folder, local-only (Code launchpad's
+ *  repo picker). `isRepo` is false for a plain (non-git) scratch folder — not an error. */
+export interface GitBranchInfo {
+  isRepo: boolean
+  branch: string
+  branches: string[]
+}
+export function getGitBranch(path: string): Promise<GitBranchInfo> {
+  return request<GitBranchInfo>(`/api/v1/fs/git-branch?path=${encodeURIComponent(path)}`)
+}
+
 // ── Models (discovery, spec 04) ──────────────────────────────────────────────
 export function getModels(): Promise<ModelsList> {
   return request<ModelsList>('/api/v1/models')

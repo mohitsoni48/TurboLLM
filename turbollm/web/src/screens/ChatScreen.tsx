@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type RefObject } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useParams, useSearchParams } from 'react-router-dom'
-import { ArrowDown, Brain, Copy, Download, PanelLeft, Paperclip, SendHorizontal, Share2, SlidersHorizontal, Square, UserRound, X } from 'lucide-react'
+import { ArrowDown, Copy, Download, PanelLeft, Paperclip, SendHorizontal, Share2, SlidersHorizontal, Square, UserRound, X } from 'lucide-react'
 import { continueConversation, fetchSysInfo, listMemoryFacts, sendMessage } from '../lib/chat-api'
 import { extractPdfText } from '../lib/pdf-extract'
 import { useConversation, useConversationMutations } from '../lib/chat-queries'
@@ -12,11 +12,13 @@ import { Button } from '../components/ui/button'
 import { toast } from '../components/ui/sonner'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { skillKeys, fetchSkills } from '../lib/agent-api'
-import { cn } from '../lib/utils'
+import { cn, writeLastChatConvId } from '../lib/utils'
+import { ThinkingBudgetSlider } from '../components/ThinkingBudgetSlider'
 import { MessageBubble, StreamingBubble } from './chat/MessageBubble'
 import { ToolApprovalBar } from './chat/ToolApprovalBar'
 import { ContextMeter } from './chat/ContextMeter'
 import { ConversationSidebar } from './chat/ConversationSidebar'
+import { readSavedSidebarWidth, SIDEBAR_MIN_W, sidebarMaxW, SidebarResizeHandle } from './chat/SidebarResizeHandle'
 import { ModelLoadMenu } from '../components/ModelLoadMenu'
 import { ModelDetailDialog } from './models/ModelDetailDialog'
 import { ConversationSettingsDialog, type ConversationSettingsDraft } from './chat/ConversationSettingsDialog'
@@ -27,22 +29,9 @@ import {
   getPersonalization, resolveAgents, setConvAgentId,
 } from '../lib/personas'
 
-// Sidebar width — persisted like DiscoverTab's list/detail split, an in-flow flex-basis
-// (not a CSS var pinned against the app shell, since the sidebar isn't a docked panel).
-const SIDEBAR_WIDTH_KEY = 'tllm-sidebar-w'
-const SIDEBAR_MIN_W = 200
-/** Largest the sidebar may grow: always leave the thread at least 480px. */
-function sidebarMaxW(): number {
-  return Math.max(SIDEBAR_MIN_W, Math.min(480, window.innerWidth - 480))
-}
-function readSavedSidebarWidth(): number {
-  try {
-    const n = parseInt(localStorage.getItem(SIDEBAR_WIDTH_KEY) ?? '', 10)
-    return Number.isFinite(n) ? n : 224 // 224px matches the prior fixed w-56
-  } catch {
-    return 224
-  }
-}
+// Sidebar width constants + the drag-resize handle now live in
+// ./chat/SidebarResizeHandle.tsx — shared with CodeHomeScreen, which shows the
+// same resizable ConversationSidebar in Code mode.
 
 // Streaming state
 interface LiveState {
@@ -75,6 +64,9 @@ export function ChatScreen() {
   const readonly = searchParams.get('readonly') === '1'
 
   const [activeId, setActiveId] = useState<string | null>(routeConvId ?? null)
+  // Remember this as the last-opened Chat conversation, so switching to Code and back
+  // via the Workspace mode pill (ConversationSidebar.tsx) restores it.
+  useEffect(() => { if (activeId) writeLastChatConvId(activeId) }, [activeId])
   // streamFrom's async loop outlives the render that started it, so it needs the CURRENT
   // activeId (not the one closed over when the generation began) to tell whether a
   // 'done'/'error' event landed on the conversation the user is still looking at.
@@ -108,22 +100,24 @@ export function ChatScreen() {
   const [importError, setImportError] = useState<string | null>(null)
   const [importModelMismatch, setImportModelMismatch] = useState<string | null>(null)
 
-  // Thinking toggle — per-conversation, persisted in localStorage. When OFF the
-  // model is told to skip reasoning entirely (answers directly), not merely to
-  // hide the reasoning. Reads per-conv key first; falls back to global default;
-  // defaults to ON (reasoning models think).
-  const readThinkingEnabled = (convId: string | null): boolean => {
+  // Thinking budget — per-conversation, persisted in localStorage. -1 = unlimited
+  // (reasoning models think freely, today's default), 0 = off (model answers directly,
+  // no reasoning generated), N>0 = a real sampler-enforced token cap (thinking_budget_tokens
+  // — see chat-routes.ts). Supersedes the old on/off-only `tllm.thinkingEnabled.*` toggle
+  // (ADR-042) now that the engine genuinely supports a graduated budget, not just 0/-1.
+  // Reads per-conv key first; falls back to global default; defaults to unlimited.
+  const readThinkingBudget = (convId: string | null): number => {
     if (convId) {
-      const perConv = localStorage.getItem(`tllm.thinkingEnabled.${convId}`)
-      if (perConv !== null) return perConv !== 'false'
+      const perConv = localStorage.getItem(`tllm.thinkingBudget.${convId}`)
+      if (perConv !== null) return Number(perConv)
     }
-    const global = localStorage.getItem('tllm.thinkingEnabled.default')
-    return global !== 'false'
+    const global = localStorage.getItem('tllm.thinkingBudget.default')
+    return global !== null ? Number(global) : -1
   }
-  const [thinkingEnabled, setThinkingEnabledState] = useState<boolean>(() => readThinkingEnabled(null))
-  const setThinkingEnabled = (val: boolean) => {
-    if (activeId) localStorage.setItem(`tllm.thinkingEnabled.${activeId}`, String(val))
-    setThinkingEnabledState(val)
+  const [thinkingBudget, setThinkingBudgetState] = useState<number>(() => readThinkingBudget(null))
+  const setThinkingBudget = (val: number) => {
+    if (activeId) localStorage.setItem(`tllm.thinkingBudget.${activeId}`, String(val))
+    setThinkingBudgetState(val)
   }
 
   // Agent — per-conversation, defaults to the default set in Customize → Agents.
@@ -308,9 +302,9 @@ export function ChatScreen() {
     return () => window.removeEventListener('keydown', handler)
   })
 
-  // Sync thinking toggle when conversation changes.
+  // Sync thinking budget when conversation changes.
   useEffect(() => {
-    setThinkingEnabledState(readThinkingEnabled(activeId))
+    setThinkingBudgetState(readThinkingBudget(activeId))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeId])
 
@@ -659,7 +653,7 @@ export function ChatScreen() {
       abortRefs.current[convId] = ac
 
       const textAttachmentNames = textAttachments.map((a) => a.file.name)
-      await streamFrom(convId, sendMessage(convId, text, ac.signal, images, docContext, textAttachmentNames, !thinkingEnabled))
+      await streamFrom(convId, sendMessage(convId, text, ac.signal, images, docContext, textAttachmentNames, thinkingBudget))
     } catch (e) {
       if (convId) clearLive(convId)
       if ((e as Error)?.name !== 'AbortError') {
@@ -682,7 +676,7 @@ export function ChatScreen() {
         if (isUserMessage && engineState === 'running' && model) {
           const ac = new AbortController()
           abortRefs.current[activeId] = ac
-          void streamFrom(activeId, continueConversation(activeId, ac.signal, !thinkingEnabled))
+          void streamFrom(activeId, continueConversation(activeId, ac.signal, thinkingBudget))
         }
       },
       onError: () => toast.error('Could not edit message.'),
@@ -695,7 +689,7 @@ export function ChatScreen() {
     await mut.regenerate.mutateAsync(activeId).catch(() => {})
     const ac = new AbortController()
     abortRefs.current[activeId] = ac
-    void streamFrom(activeId, continueConversation(activeId, ac.signal, !thinkingEnabled))
+    void streamFrom(activeId, continueConversation(activeId, ac.signal, thinkingBudget))
   }
 
   const handleDelete = (m: Message) => {
@@ -809,18 +803,7 @@ export function ChatScreen() {
             </Button>
           )}
           <ConversationSettingsDialog conv={conv} draft={draft} modelSampling={modelSampling} />
-          <Button
-            size="icon"
-            variant="ghost"
-            className="h-8 w-8"
-            onClick={() => setThinkingEnabled(!thinkingEnabled)}
-            title={thinkingEnabled
-              ? 'Thinking on — model reasons before answering. Click to disable.'
-              : 'Thinking off — model answers directly. Click to enable reasoning.'}
-            style={{ color: thinkingEnabled ? 'var(--accent)' : 'var(--faint)' }}
-          >
-            <Brain size={15} />
-          </Button>
+          <ThinkingBudgetSlider value={thinkingBudget} onChange={setThinkingBudget} />
           {activeId && selectedAgent && (
             <span
               title={selectedAgent.description}
@@ -1121,58 +1104,6 @@ export function ChatScreen() {
 
       <ModelDetailDialog modelKey={settingsKey} onClose={() => setSettingsKey(null)} />
     </div>
-  )
-}
-
-// ── Sidebar resize handle ────────────────────────────────────────────────────
-
-/** Thin drag handle between the sidebar and the thread; resizes the sidebar column
- *  live via direct style mutation (same pattern as DiscoverTab's SplitResizeHandle —
- *  avoids a React re-render per pointer-move pixel), then commits + persists the
- *  final width on release. */
-function SidebarResizeHandle({
-  sidebarRef,
-  onCommit,
-}: {
-  sidebarRef: RefObject<HTMLDivElement | null>
-  onCommit: (w: number) => void
-}) {
-  const onPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
-    if (e.button !== 0) return
-    e.preventDefault()
-    const startX = e.clientX
-    const startW = sidebarRef.current?.getBoundingClientRect().width ?? readSavedSidebarWidth()
-    document.documentElement.classList.add('tllm-resizing')
-    const onMove = (ev: PointerEvent) => {
-      const w = Math.min(Math.max(startW + (ev.clientX - startX), SIDEBAR_MIN_W), sidebarMaxW())
-      if (sidebarRef.current) sidebarRef.current.style.width = `${Math.round(w)}px`
-    }
-    const onUp = () => {
-      document.documentElement.classList.remove('tllm-resizing')
-      window.removeEventListener('pointermove', onMove)
-      window.removeEventListener('pointerup', onUp)
-      const w = sidebarRef.current?.getBoundingClientRect().width
-      if (w) {
-        const rounded = Math.round(w)
-        onCommit(rounded)
-        try {
-          localStorage.setItem(SIDEBAR_WIDTH_KEY, String(rounded))
-        } catch {
-          /* ignore quota / disabled storage */
-        }
-      }
-    }
-    window.addEventListener('pointermove', onMove)
-    window.addEventListener('pointerup', onUp)
-  }
-  return (
-    <div
-      className="tllm-split-resizer"
-      onPointerDown={onPointerDown}
-      role="separator"
-      aria-orientation="vertical"
-      aria-label="Resize conversation sidebar"
-    />
   )
 }
 

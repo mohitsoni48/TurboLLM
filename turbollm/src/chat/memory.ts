@@ -88,7 +88,7 @@ export async function extractMemoryFacts(d: Deps, convId: string, userText: stri
           stream: false,
           temperature: 0.2,
           max_tokens: 200,
-          reasoning_budget: 0,
+          thinking_budget_tokens: 0,
           chat_template_kwargs: { enable_thinking: false },
         }),
         signal: AbortSignal.timeout(20_000),

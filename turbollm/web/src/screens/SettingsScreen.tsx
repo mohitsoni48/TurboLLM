@@ -28,10 +28,12 @@ import { ApiError, type TelemetryLevel } from '../lib/api'
 import { TELEMETRY_UI_ENABLED } from '../lib/flags'
 import { toast } from '../components/ui/sonner'
 
-/** localStorage key for the client-only "enable thinking by default" preference
- *  (ADR-042). When ON, reasoning models think before answering in new chats;
- *  when OFF, the model is told to answer directly. Default ON when unset. */
-const THINKING_DEFAULT_KEY = 'tllm.thinkingEnabled.default'
+/** localStorage key for the client-only default thinking budget: -1 = unlimited
+ *  (default), 0 = off, N>0 = a real sampler-enforced token cap — same key ChatScreen's
+ *  and CodeComposer's own ThinkingBudgetSlider fall back to when a conversation/session
+ *  has no per-entity value of its own yet. Supersedes the old boolean-only ADR-042 key. */
+const THINKING_DEFAULT_KEY = 'tllm.thinkingBudget.default'
+const THINKING_MAX_BUDGET = 16_000
 
 /** localStorage key for the client-only "confirm before deleting a conversation"
  *  preference. When ON, deleting a conversation shows a confirmation dialog first;
@@ -131,7 +133,7 @@ function Slider({ label, hint, value, min, max, step, onChange, fmt }: {
 }
 
 export function SettingsScreen() {
-  const { theme, setTheme } = useUiStore()
+  const { theme, setTheme, fontSize, setFontSize } = useUiStore()
   const { query: settingsQ, save } = useSettings()
   const settings = settingsQ.data
   const modelDirsQ = useModelDirs()
@@ -157,8 +159,11 @@ export function SettingsScreen() {
   const [comfyReverseGate, setComfyReverseGate] = useState(false)
   const [gatewayAutoSwap, setGatewayAutoSwap] = useState(true)
   const [gatewayKeepN, setGatewayKeepN] = useState(1)
-  // Client-only "enable thinking by default" preference (ADR-042); default ON.
-  const [thinkingEnabled, setThinkingEnabled] = useState(() => localStorage.getItem(THINKING_DEFAULT_KEY) !== 'false')
+  // Client-only default thinking budget; default -1 (unlimited).
+  const [thinkingBudget, setThinkingBudget] = useState<number>(() => {
+    const v = localStorage.getItem(THINKING_DEFAULT_KEY)
+    return v !== null ? Number(v) : -1
+  })
   // Client-only "confirm before deleting a conversation" preference; default ON.
   const [confirmDelete, setConfirmDelete] = useState(() => localStorage.getItem(CONFIRM_DELETE_KEY) !== 'false')
 
@@ -191,10 +196,10 @@ export function SettingsScreen() {
     }
   }, [settings])
 
-  // Persist the thinking preference immediately (no Save round-trip; it's client-only).
+  // Persist the thinking budget immediately (no Save round-trip; it's client-only).
   useEffect(() => {
-    localStorage.setItem(THINKING_DEFAULT_KEY, thinkingEnabled ? 'true' : 'false')
-  }, [thinkingEnabled])
+    localStorage.setItem(THINKING_DEFAULT_KEY, String(thinkingBudget))
+  }, [thinkingBudget])
 
   // Persist the confirm-before-delete preference immediately (client-only).
   useEffect(() => {
@@ -343,19 +348,35 @@ export function SettingsScreen() {
                   </div>
                 </div>
 
-                {/* Enable thinking by default (ADR-042): client-only, default ON. */}
-                <label className="mt-2 flex cursor-pointer items-center justify-between border-t border-border py-2 pt-3">
-                  <div>
-                    <div className="text-[14px] font-medium text-ink">Enable thinking by default</div>
-                    <div className="text-[12px] text-muted">Let reasoning models think before answering in new chats (you can toggle it per chat). Off = answer directly, faster.</div>
-                  </div>
-                  <input
-                    type="checkbox"
-                    checked={thinkingEnabled}
-                    onChange={(e) => setThinkingEnabled(e.target.checked)}
-                    className="h-4 w-4 accent-[var(--accent)]"
+                {/* Font size: same Slider component as VRAM headroom (Models & loading →
+                    Advanced), scales the whole app's type via --font-scale (index.css). */}
+                <div className="border-t border-border pt-3">
+                  <Slider
+                    label="Font size"
+                    hint="Scale text across the whole app"
+                    value={fontSize}
+                    min={85}
+                    max={130}
+                    step={5}
+                    onChange={setFontSize}
+                    fmt={(v) => `${v}%`}
                   />
-                </label>
+                </div>
+
+                {/* Default thinking budget: client-only, default unlimited. Real sampler-enforced
+                    token cap (thinking_budget_tokens), not just on/off — see ThinkingBudgetSlider. */}
+                <div className="mt-2 border-t border-border pt-3">
+                  <Slider
+                    label="Thinking budget by default"
+                    hint="How much a reasoning model may think before answering in new chats/sessions (you can adjust it per chat or session). 0 = answer directly, faster."
+                    value={thinkingBudget < 0 ? THINKING_MAX_BUDGET : Math.min(thinkingBudget, THINKING_MAX_BUDGET)}
+                    min={0}
+                    max={THINKING_MAX_BUDGET}
+                    step={500}
+                    onChange={(v) => setThinkingBudget(v >= THINKING_MAX_BUDGET ? -1 : v)}
+                    fmt={(v) => (v >= THINKING_MAX_BUDGET ? 'Unlimited' : v === 0 ? 'Off' : `${v.toLocaleString()} tokens`)}
+                  />
+                </div>
 
                 {/* Confirm before deleting a conversation: client-only, default ON. */}
                 <label className="flex cursor-pointer items-center justify-between border-t border-border py-2 pt-3">

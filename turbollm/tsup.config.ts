@@ -10,6 +10,9 @@ export default defineConfig({
   banner: { js: '#!/usr/bin/env node' },
   // node:sqlite is a Node 22+ built-in; mark explicitly external so the
   // node: prefix is preserved in the bundle (esbuild strips it otherwise).
-  external: ['node:sqlite'],
+  // pi-ai/pi-coding-agent pull in cross-spawn (dynamic require of child_process)
+  // which esbuild cannot bundle; externalizing avoids the "Dynamic require of
+  // child_process is not supported" crash at runtime.
+  external: ['node:sqlite', '@earendil-works/pi-ai', '@earendil-works/pi-coding-agent'],
   noExternal: [],
 })

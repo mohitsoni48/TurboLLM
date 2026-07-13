@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, useState, type ReactNode } from 'react'
+import { memo, useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -105,7 +105,11 @@ function childrenToString(node: ReactNode): string {
   return ''
 }
 
-const Markdown = memo(function Markdown({ children, streaming }: { children: string; streaming?: boolean }) {
+// Exported (in addition to the default export usage below) so CodeTranscript.tsx
+// can render assistant prose with the exact same renderer chat uses, rather than
+// a second markdown pipeline — Code mode's commentary is genuinely the same kind
+// of content chat's is, just presented in a different frame around it.
+export const Markdown = memo(function Markdown({ children, streaming }: { children: string; streaming?: boolean }) {
   return (
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
@@ -165,11 +169,50 @@ const Markdown = memo(function Markdown({ children, streaming }: { children: str
 
 // ── Tool call cards ───────────────────────────────────────────────────────────
 
-type CardCall = { id: string; name: string; status: 'pending' | 'done' | 'error' | 'awaiting_approval'; result?: string }
+type CardCall = {
+  id: string
+  name: string
+  status: 'pending' | 'done' | 'error' | 'awaiting_approval'
+  result?: string
+  /** Code mode only — pi's edit tool real diff output (turbollm/src/code/code-session.ts). */
+  diff?: string
+}
+
+// ── Diff view (Code mode) ───────────────────────────────────────────────────────
+//
+// Renders pi's own unified-diff output for the edit tool — no diffing is computed
+// client-side, this just colors the lines pi already produced. Handles the standard
+// unified-diff line prefixes (+/-/space, @@ hunk headers, \ no-newline markers);
+// anything else (e.g. a stray blank line) renders as plain context.
+function DiffView({ diff }: { diff: string }) {
+  const lines = diff.replace(/\n$/, '').split('\n')
+  return (
+    <div className="max-h-64 overflow-auto border-t border-border font-mono text-[11px] leading-relaxed">
+      {lines.map((line, i) => {
+        let style: CSSProperties = { color: 'var(--muted)' }
+        if (line.startsWith('+++') || line.startsWith('---')) {
+          style = { color: 'var(--faint)' }
+        } else if (line.startsWith('@@')) {
+          style = { color: 'var(--accent)', background: 'color-mix(in srgb, var(--accent) 8%, transparent)' }
+        } else if (line.startsWith('+')) {
+          style = { color: 'var(--ok)', background: 'color-mix(in srgb, var(--ok) 8%, transparent)' }
+        } else if (line.startsWith('-')) {
+          style = { color: 'var(--err)', background: 'color-mix(in srgb, var(--err) 8%, transparent)' }
+        }
+        return (
+          <div key={i} className="whitespace-pre px-3 py-[1px]" style={style}>
+            {line || ' '}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
 
 function ToolCallCard({ call }: { call: CardCall }) {
   const [expanded, setExpanded] = useState(false)
-  const hasOutput = !!(call.result?.length)
+  const hasDiff = !!call.diff?.trim()
+  const hasOutput = !!(call.result?.length) || hasDiff
   const awaitingApproval = call.status === 'awaiting_approval'
 
   return (
@@ -198,7 +241,8 @@ function ToolCallCard({ call }: { call: CardCall }) {
           />
         )}
       </button>
-      {expanded && call.result && (
+      {expanded && hasDiff && <DiffView diff={call.diff!} />}
+      {expanded && !hasDiff && call.result && (
         <pre className="max-h-48 overflow-auto border-t border-border px-3 pb-3 pt-2 font-mono text-[11px] leading-relaxed text-muted whitespace-pre-wrap">
           {call.result.length > 2000 ? `${call.result.slice(0, 2000)}\n…(truncated)` : call.result}
         </pre>
@@ -237,7 +281,8 @@ function useElapsedSeconds(active: boolean): number {
 function InlineToolStep({ call }: { call: LiveToolCall }) {
   const [expanded, setExpanded] = useState(false)
   const pending = call.status === 'pending'
-  const hasOutput = !!call.result?.length
+  const hasDiff = !!call.diff?.trim()
+  const hasOutput = !!call.result?.length || hasDiff
   const elapsed = useElapsedSeconds(pending)
   return (
     <div className="my-1.5 overflow-hidden rounded-lg border border-border bg-panel-2">
@@ -262,7 +307,8 @@ function InlineToolStep({ call }: { call: LiveToolCall }) {
           />
         )}
       </button>
-      {expanded && call.result && (
+      {expanded && hasDiff && <DiffView diff={call.diff!} />}
+      {expanded && !hasDiff && call.result && (
         <pre className="max-h-48 overflow-auto border-t border-border px-3 pb-3 pt-2 font-mono text-[11px] leading-relaxed text-muted whitespace-pre-wrap">
           {call.result.length > 2000 ? `${call.result.slice(0, 2000)}\n…(truncated)` : call.result}
         </pre>
@@ -514,7 +560,12 @@ export function MessageBubble({
       <div className="group flex justify-end gap-2">
         <div className="flex flex-col items-end gap-1">
           {isEditing ? (
-            <div className="w-full max-w-[75%]">
+            // Was max-w-[75%] — wrapped user messages far too early given the rest of
+            // the app (composer, message column) deliberately has no width cap at all.
+            // min(88%, 900px): wide enough to stop premature wrapping, capped so a
+            // single-sentence message doesn't stretch absurdly wide on an ultrawide
+            // monitor. Kept in sync with the non-editing bubble below — same value.
+            <div className="w-full max-w-[min(88%,900px)]">
               <textarea
                 autoFocus
                 className="w-full resize-none rounded-[var(--radius-lg)] border border-accent bg-panel px-4 py-2.5 text-[15px] leading-[1.6] text-ink outline-none"
@@ -532,7 +583,7 @@ export function MessageBubble({
               </div>
             </div>
           ) : (
-            <div className="flex max-w-[75%] flex-col items-end">
+            <div className="flex max-w-[min(88%,900px)] flex-col items-end">
               <div className="whitespace-pre-wrap break-words rounded-[var(--radius-lg)] bg-accent px-4 py-2.5 text-[15px] leading-[1.6] text-on-accent">
                 {message.content}
               </div>
@@ -572,6 +623,7 @@ export function MessageBubble({
     name: tc.name,
     status: tc.error ? 'error' : 'done',
     result: tc.error ?? tc.result,
+    diff: tc.diff,
   }))
   // A message with no content, no reasoning, and no tool calls has nothing to show — render
   // the same fallback card an aborted-empty finish already used, instead of leaving a blank
