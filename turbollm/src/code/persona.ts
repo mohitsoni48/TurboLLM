@@ -89,6 +89,30 @@ export function editReliabilityGuidance(): string {
   ].join(' ')
 }
 
+/** Anti-fallback guidance (founder-reported gap, 2026-07-13, item 1): local models tend to
+ *  quietly swap in an easier, DIFFERENT feature after a couple of failed attempts instead of
+ *  persisting on the one actually requested (a real repro: failing to implement Android's
+ *  Camera2 API, then silently building a photo picker instead). This is deliberately paired with
+ *  a MECHANICAL enforcement in code-session.ts's tool_result hook (consecutiveToolFailures) that
+ *  injects a hard nudge into the failing tool's own result after 2 real failures — this prompt
+ *  text is the soft, first line of defense; the hook is the backstop for when the model doesn't
+ *  follow it. Only added when web_search/fetch_url are actually registered (code-session.ts,
+ *  gated on `d.tools`), since telling the model to call tools that don't exist would be worse
+ *  than saying nothing. */
+export function antiFallbackGuidance(): string {
+  return [
+    'When you fail at a task twice in a row (a build error, a failing test, an API that doesn\'t',
+    'behave as expected), do NOT quietly substitute an easier or different feature than what was',
+    'actually requested — that is a critical failure even if the substitute "works". Instead, call',
+    'web_search for the official documentation (and Stack Overflow or similar as a secondary',
+    'source, weighting official docs higher) on the exact error or API you are stuck on, use',
+    'fetch_url to read the most relevant result, and retry the ORIGINAL task with what you',
+    'learned. This also applies to dependencies: before adding any library or package on any',
+    'platform, search for its latest version and official docs first, then implement against',
+    'what you actually read rather than assumed prior knowledge.',
+  ].join(' ')
+}
+
 /** The pi tool set for a Code mode. plan is READ-ONLY (its real safety mechanism): mutating
  *  tools simply aren't in the toolset, so nothing reaches the containment/approval hook to gate.
  *  auto/ask use pi's DEFAULT tool set (read/bash/edit/write) — returned as `undefined` so the
@@ -168,10 +192,12 @@ export function agentsMdBlock(repoRoot: string, globalDir: string): string {
 /** The full append-prompt block for a session, in order. `skills` defaults to empty and
  *  `agentsMd` defaults to omitted so every existing call site (and test) that doesn't pass them
  *  keeps today's exact output. */
-export function buildAppendPrompt(mode: CodeMode, skills: Skill[] = [], agentsMd?: { repoRoot: string; globalDir: string }): string[] {
+export function buildAppendPrompt(mode: CodeMode, skills: Skill[] = [], agentsMd?: { repoRoot: string; globalDir: string }, hasWebTools = false): string[] {
   const blocks = [basePersona(), modeGuidance(mode)]
   // Read-only plan mode has no edit tool, so the edit guidance is irrelevant there.
   if (mode !== 'plan') blocks.push(editReliabilityGuidance())
+  // Only when web_search/fetch_url are actually registered — see antiFallbackGuidance's comment.
+  if (hasWebTools) blocks.push(antiFallbackGuidance())
   const catalog = skillCatalogBlock(skills)
   if (catalog) blocks.push(catalog)
   if (agentsMd) {

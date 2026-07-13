@@ -307,6 +307,16 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
   let heldGate: (() => void) | undefined
   const releaseGate = () => { const r = heldGate; heldGate = undefined; r?.() }
 
+  // Mechanical anti-fallback tracker (founder-reported gap, 2026-07-13, item 1): counts REAL
+  // consecutive tool failures across the run. Soft system-prompt guidance alone repeats the same
+  // reliability problem being fixed here — a local model can just not follow it — so once this
+  // hits the threshold, the tool_result hook below injects a hard nudge directly into the
+  // failing tool's own result text, which the model is guaranteed to see next (it can't skip its
+  // own tool result the way it can skip a system-prompt aside). Reset on any success AND at the
+  // start of each new top-level turn, so failures from a past, already-resolved task don't leak
+  // into an unrelated new one.
+  let consecutiveToolFailures = 0
+
   /** Runs one skill as a REAL, contained agentic sub-session — a separate pi session (its own
    *  history, not seeded with the outer conversation) but with the SAME mode-based tool access
    *  and safety boundary as the outer session: `auto`/`ask` get the default read/bash/edit/write
@@ -475,6 +485,8 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     })
     pi.on('after_provider_response', () => { releaseGate() })
 
+    pi.on('turn_start', () => { consecutiveToolFailures = 0 })
+
     // The ENTIRE containment/approval boundary (plan risk flag 2). Runs before tool.execute().
     pi.on('tool_call', async (event: ToolCallEvent): Promise<ToolCallEventResult | void> => {
       const toolName = event.toolName
@@ -545,6 +557,23 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     // result — and, for the edit tool, its real diff/patch/firstChangedLine (plan §3d). No
     // diff is computed here; this is pi's own output, just plumbed through to the SSE stream.
     pi.on('tool_result', async (event: ToolResultEvent): Promise<void> => {
+      // Mechanical anti-fallback nudge — see consecutiveToolFailures' own comment above. Skip
+      // web_search/fetch_url themselves so a flaky search doesn't nudge the model to... search.
+      if (event.isError) {
+        consecutiveToolFailures++
+        if (consecutiveToolFailures >= 2 && event.toolName !== 'web_search' && event.toolName !== 'fetch_url') {
+          event.content.push({
+            type: 'text',
+            text: `\n\n[SYSTEM: failed attempt #${consecutiveToolFailures} in a row on this task. Stop ` +
+              'retrying blindly, and do NOT silently substitute an easier or different feature instead of ' +
+              'the one actually requested. Call web_search for the official documentation (Stack Overflow ' +
+              'as a fallback, official docs weighted higher) on the exact error or API you are stuck on, ' +
+              'read it, then retry the ORIGINAL task with what you learned.]',
+          })
+        }
+      } else {
+        consecutiveToolFailures = 0
+      }
       const text = event.content
         .map((c) => (c.type === 'text' ? c.text : ''))
         .join('')
@@ -602,6 +631,51 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
         }
       },
     })
+
+    // Real web access (founder-reported gap, 2026-07-13): Code previously had NO way to look
+    // anything up — only Chat had web_search/fetch_url. A local model that fails at something
+    // (a real repro: Camera2 API) tends to silently substitute an easier, DIFFERENT feature
+    // instead of persisting — persona.ts's guidance now tells it to search official docs after 2
+    // failed attempts, which is meaningless without an actual tool to do that with. Both reuse
+    // the EXACT SAME implementation chat's own tools use (ToolRegistry.executeTool) — same
+    // provider config, same SSRF checks — not a second, divergent implementation. Neither is a
+    // path-taking or mutating tool (not in PATH_TOOLS/MUTATING_TOOLS above), so they're never
+    // containment-checked or ask-mode-gated, in every mode including plan — researching before
+    // touching files is exactly what plan mode is for.
+    if (d.tools) {
+      const tools = d.tools
+      pi.registerTool({
+        name: 'web_search',
+        label: 'Web search',
+        description: 'Search the web for real-time information — official documentation, release ' +
+          'notes, current library/package versions, and how other real projects solved the same ' +
+          'problem. Use this whenever your own knowledge might be stale (a specific API, a library ' +
+          'version, a platform SDK) or after failing to get something working twice — don\'t guess ' +
+          'a third time, look it up, prioritizing official docs over forum answers.',
+        promptSnippet: 'web_search(query) - search the web for docs, versions, and working examples',
+        parameters: Type.Object({
+          query: Type.String({ description: 'A precise, specific query — e.g. "Android Camera2 API official documentation" or "npm react latest version".' }),
+        }),
+        async execute(toolCallId, params) {
+          const text = await tools.executeTool({ id: toolCallId, name: 'web_search', args: params })
+          return { content: [{ type: 'text', text }], details: {} }
+        },
+      })
+      pi.registerTool({
+        name: 'fetch_url',
+        label: 'Fetch URL',
+        description: 'Fetch the text content of a URL — e.g. an official docs page or API reference ' +
+          'found via web_search. Returns the page\'s main text, stripped of HTML.',
+        promptSnippet: 'fetch_url(url) - fetch the text content of a URL',
+        parameters: Type.Object({
+          url: Type.String({ description: 'The URL to fetch (must start with http:// or https://).' }),
+        }),
+        async execute(toolCallId, params) {
+          const text = await tools.executeTool({ id: toolCallId, name: 'fetch_url', args: params })
+          return { content: [{ type: 'text', text }], details: {} }
+        },
+      })
+    }
   }
 
   // ── resource loader with the inline extension + real append system prompt ─────
@@ -620,7 +694,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     // prompt hygiene) — this is TurboLLM's own Skills library.
     // agentsMd: <repoRoot>/AGENTS.md + ~/.turbollm/agents.md, like OpenCode — d.store.dir() IS
     // TurboLLM's own data dir (the same one SkillStore above reads from).
-    appendSystemPrompt: buildAppendPrompt(mode, skills, { repoRoot, globalDir: d.store.dir() }),
+    appendSystemPrompt: buildAppendPrompt(mode, skills, { repoRoot, globalDir: d.store.dir() }, !!d.tools),
     // Keep the prompt lean and deterministic — no global skills/prompts/themes discovery.
     noSkills: true,
     noPromptTemplates: true,

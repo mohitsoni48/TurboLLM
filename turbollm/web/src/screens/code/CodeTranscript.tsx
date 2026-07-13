@@ -510,10 +510,10 @@ function RailEntry({ icon: Icon, tone = 'muted', children }: { icon: typeof Squa
   return (
     <div className="relative">
       <div
-        className="absolute -left-[27px] top-0.5 grid h-6 w-6 shrink-0 place-items-center rounded-full border bg-panel"
+        className="absolute -left-[25px] top-0.5 grid h-5 w-5 shrink-0 place-items-center rounded-full border bg-panel"
         style={{ borderColor: color, color }}
       >
-        <Icon size={12} />
+        <Icon size={10} />
       </div>
       {children}
     </div>
@@ -678,7 +678,7 @@ export function CodeTranscriptSkeleton() {
     <div className="relative flex flex-col gap-5 pl-8">
       <div className="absolute left-[2px] top-2 bottom-2 w-px" style={{ background: 'var(--border)' }} aria-hidden />
       <div className="relative">
-        <div className="absolute -left-[27px] top-0.5 h-6 w-6 shrink-0 rounded-full">
+        <div className="absolute -left-[25px] top-0.5 h-5 w-5 shrink-0 rounded-full">
           <Skeleton className="h-full w-full rounded-full" />
         </div>
         <div className="ml-auto w-fit max-w-[min(88%,900px)] rounded-lg border border-border px-4 py-3">
@@ -686,7 +686,7 @@ export function CodeTranscriptSkeleton() {
         </div>
       </div>
       <div className="relative flex flex-col gap-2">
-        <div className="absolute -left-[27px] top-0.5 h-6 w-6 shrink-0 rounded-full">
+        <div className="absolute -left-[25px] top-0.5 h-5 w-5 shrink-0 rounded-full">
           <Skeleton className="h-full w-full rounded-full" />
         </div>
         <Skeleton className="h-3.5 w-[80%]" />
