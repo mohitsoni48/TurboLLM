@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { toolsForMode, buildAppendPrompt, skillsBlock, skillCatalogBlock, type CodeMode } from './persona'
 import { toSessionStatus } from './code-routes'
-import { MUTATING_TOOLS, PATH_TOOLS, resolveEffectiveHistory, compactCodeSession } from './code-session'
+import { MUTATING_TOOLS, PATH_TOOLS, resolveEffectiveHistory, compactCodeSession, isDependencyAddCommand } from './code-session'
 import { ConversationStore } from '../chat/db'
 import type { Deps } from '../deps'
 import type { Skill } from '../agents/skills'
@@ -61,6 +61,39 @@ test('PATH_TOOLS: path-checked tools include the fs tools but NOT bash', () => {
   assert.deepEqual([...PATH_TOOLS].sort(), ['edit', 'find', 'grep', 'ls', 'read', 'write'])
   // bash takes `command`, not `path` — it must not be containment-checked by path.
   assert.ok(!PATH_TOOLS.has('bash'))
+})
+
+test('isDependencyAddCommand: detects install/add commands across common package managers', () => {
+  const positives = [
+    'npm install left-pad',
+    'npm i axios --save',
+    'npm add lodash',
+    'yarn add react',
+    'pnpm add vite',
+    'pip install requests',
+    'pip3 install numpy',
+    'poetry add django',
+    'cargo add serde',
+    'go get github.com/gorilla/mux',
+    'gem install rails',
+    'bundle add sinatra',
+    'composer require monolog/monolog',
+    'cd app && npm install express',
+  ]
+  for (const cmd of positives) assert.ok(isDependencyAddCommand(cmd), `expected match: ${cmd}`)
+})
+
+test('isDependencyAddCommand: does not flag bare/lockfile/local installs', () => {
+  const negatives = [
+    'npm install',
+    'npm ci',
+    'pip install -r requirements.txt',
+    'pip install -e .',
+    'npm run build',
+    'npm test',
+    'git commit -m "add dependency notes"',
+  ]
+  for (const cmd of negatives) assert.ok(!isDependencyAddCommand(cmd), `expected no match: ${cmd}`)
 })
 
 // ── buildAppendPrompt ───────────────────────────────────────────────────────────────

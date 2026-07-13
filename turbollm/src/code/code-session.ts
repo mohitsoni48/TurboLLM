@@ -203,6 +203,31 @@ export const MUTATING_TOOLS = new Set(['edit', 'write', 'bash'])
 // bash is deliberately absent — it takes `command`, not `path` (see risk flag 1).
 export const PATH_TOOLS = new Set(['read', 'edit', 'write', 'grep', 'find', 'ls'])
 
+// Mechanical half of the dependency-discipline fix (founder-reported gap, 2026-07-13, item 2,
+// see persona.ts's dependencyDisciplineGuidance for the full rationale): matches shell commands
+// that add a NEW dependency across common package managers, deliberately requiring an argument
+// after the add/install verb so a bare `npm install`/`pip install -r requirements.txt` (installing
+// from an existing manifest, not deciding on a new dependency) doesn't false-positive. This only
+// covers CLI installs — a precise, well-defined signal, same quality bar as Fix 1's `isError`.
+// Manifest edits made by hand (e.g. Gradle's `dependencies {}` block) have no equally precise
+// signal without false-positiving on unrelated edits to the same file, so those aren't checked
+// here and rely on the prompt guidance alone.
+const DEPENDENCY_ADD_PATTERNS = [
+  /\bnpm\s+(i|install|add)\s+\S/,
+  /\byarn\s+add\s+\S/,
+  /\bpnpm\s+add\s+\S/,
+  /\bpip3?\s+install\s+(?!-r\b)(?!-e\s+\.)\S/,
+  /\bpoetry\s+add\s+\S/,
+  /\bcargo\s+add\s+\S/,
+  /\bgo\s+get\s+\S/,
+  /\bgem\s+install\s+\S/,
+  /\bbundle\s+add\s+\S/,
+  /\bcomposer\s+require\s+\S/,
+]
+export function isDependencyAddCommand(command: string): boolean {
+  return DEPENDENCY_ADD_PATTERNS.some((re) => re.test(command))
+}
+
 /**
  * Run a Code session end-to-end against `repoRoot`, streaming SSE to `sink`.
  * Resolves when the pi agentic loop settles (or the run is aborted).
@@ -316,6 +341,13 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
   // start of each new top-level turn, so failures from a past, already-resolved task don't leak
   // into an unrelated new one.
   let consecutiveToolFailures = 0
+
+  // Mechanical half of the dependency-discipline fix (item 2, see isDependencyAddCommand's own
+  // comment and persona.ts's dependencyDisciplineGuidance). Tracks whether a web_search/fetch_url
+  // call has succeeded so far THIS turn — a coarse but honest proxy for "did you actually research
+  // this" (not tied to any specific package name, which would require unreliable parsing). Reset
+  // at turn_start, same lifecycle as consecutiveToolFailures.
+  let hasSearchedWebThisTurn = false
 
   /** Runs one skill as a REAL, contained agentic sub-session — a separate pi session (its own
    *  history, not seeded with the outer conversation) but with the SAME mode-based tool access
@@ -485,7 +517,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     })
     pi.on('after_provider_response', () => { releaseGate() })
 
-    pi.on('turn_start', () => { consecutiveToolFailures = 0 })
+    pi.on('turn_start', () => { consecutiveToolFailures = 0; hasSearchedWebThisTurn = false })
 
     // The ENTIRE containment/approval boundary (plan risk flag 2). Runs before tool.execute().
     pi.on('tool_call', async (event: ToolCallEvent): Promise<ToolCallEventResult | void> => {
@@ -574,6 +606,26 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       } else {
         consecutiveToolFailures = 0
       }
+
+      // Mechanical dependency-discipline nudge (item 2) — see isDependencyAddCommand's own
+      // comment. Fires regardless of isError: even a SUCCESSFUL install without prior research is
+      // exactly the behavior being discouraged. Applies to whichever result comes first — a
+      // successful web_search/fetch_url flips the flag for the rest of the turn.
+      if (event.toolName === 'web_search' || event.toolName === 'fetch_url') {
+        if (!event.isError) hasSearchedWebThisTurn = true
+      } else if (event.toolName === 'bash' && !hasSearchedWebThisTurn) {
+        const command = typeof event.input.command === 'string' ? event.input.command : ''
+        if (isDependencyAddCommand(command)) {
+          event.content.push({
+            type: 'text',
+            text: '\n\n[SYSTEM: this looks like a new-dependency install with no web_search/fetch_url ' +
+              'call yet this turn. If you have not already verified the LATEST version and read its real ' +
+              'official documentation, do that now (web_search then fetch_url) before continuing to use ' +
+              'this dependency — do not implement against assumed/remembered version knowledge.]',
+          })
+        }
+      }
+
       const text = event.content
         .map((c) => (c.type === 'text' ? c.text : ''))
         .join('')

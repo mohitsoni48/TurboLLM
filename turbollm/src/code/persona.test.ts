@@ -86,3 +86,21 @@ test('buildAppendPrompt: passing agentsMd with no files present adds nothing ext
   const without = buildAppendPrompt('auto')
   assert.deepEqual(withAgents, without)
 })
+
+test('buildAppendPrompt: hasWebTools=false (default) omits anti-fallback and dependency-discipline guidance', () => {
+  const blocks = buildAppendPrompt('auto')
+  assert.ok(!blocks.some((b) => b.includes('do NOT quietly substitute')))
+  assert.ok(!blocks.some((b) => b.includes('STRICT RULE, no exceptions')))
+})
+
+test('buildAppendPrompt: hasWebTools=true appends both anti-fallback and dependency-discipline blocks', () => {
+  const blocks = buildAppendPrompt('auto', [], undefined, true)
+  assert.ok(blocks.some((b) => b.includes('do NOT quietly substitute')))
+  assert.ok(blocks.some((b) => b.includes('STRICT RULE, no exceptions')))
+})
+
+test('buildAppendPrompt: plan mode with hasWebTools=true still omits edit guidance but keeps web-tool guidance', () => {
+  const blocks = buildAppendPrompt('plan', [], undefined, true)
+  assert.ok(!blocks.some((b) => b.includes('first read the file, then copy')))
+  assert.ok(blocks.some((b) => b.includes('STRICT RULE, no exceptions')))
+})

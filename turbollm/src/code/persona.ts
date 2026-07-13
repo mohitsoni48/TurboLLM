@@ -106,10 +106,28 @@ export function antiFallbackGuidance(): string {
     'actually requested — that is a critical failure even if the substitute "works". Instead, call',
     'web_search for the official documentation (and Stack Overflow or similar as a secondary',
     'source, weighting official docs higher) on the exact error or API you are stuck on, use',
-    'fetch_url to read the most relevant result, and retry the ORIGINAL task with what you',
-    'learned. This also applies to dependencies: before adding any library or package on any',
-    'platform, search for its latest version and official docs first, then implement against',
-    'what you actually read rather than assumed prior knowledge.',
+    'fetch_url to read the most relevant result, and retry the ORIGINAL task with what you learned.',
+  ].join(' ')
+}
+
+/** Dependency version/docs discipline (founder-reported gap, 2026-07-13, item 2 — described as a
+ *  STRICT, non-negotiable rule, unlike item 1's "after 2 failures" trigger this applies to EVERY
+ *  new dependency, on every platform: npm, pip, Gradle/Android, cargo, go modules, etc). Paired
+ *  with a MECHANICAL backstop in code-session.ts's tool_result hook (isDependencyAddCommand) that
+ *  nudges when a package-manager "add" shell command runs without a same-turn web_search/fetch_url
+ *  first — that backstop only covers CLI installs (a precise, well-defined signal); manifest edits
+ *  made by hand (e.g. Gradle's `dependencies {}` block) have no equally precise mechanical signal
+ *  without false-positiving on unrelated edits to the same file, so those rely on this prompt text
+ *  alone. Only added when web_search/fetch_url are actually registered, same as antiFallbackGuidance. */
+export function dependencyDisciplineGuidance(): string {
+  return [
+    'STRICT RULE, no exceptions: before adding ANY new dependency — a library, package, or SDK, on',
+    'ANY platform (npm/yarn/pnpm, pip/poetry, Gradle/Android, cargo, go modules, gems, composer,',
+    'anything) — you MUST first call web_search to find its current LATEST version (never assume a',
+    'version from memory, it may be outdated), then use fetch_url to read that version\'s real',
+    'official documentation. Only after doing both should you write the dependency declaration or',
+    'install command, and implement against what you actually just read rather than remembered',
+    'training knowledge, which is frequently stale for fast-moving libraries.',
   ].join(' ')
 }
 
@@ -197,7 +215,10 @@ export function buildAppendPrompt(mode: CodeMode, skills: Skill[] = [], agentsMd
   // Read-only plan mode has no edit tool, so the edit guidance is irrelevant there.
   if (mode !== 'plan') blocks.push(editReliabilityGuidance())
   // Only when web_search/fetch_url are actually registered — see antiFallbackGuidance's comment.
-  if (hasWebTools) blocks.push(antiFallbackGuidance())
+  if (hasWebTools) {
+    blocks.push(antiFallbackGuidance())
+    blocks.push(dependencyDisciplineGuidance())
+  }
   const catalog = skillCatalogBlock(skills)
   if (catalog) blocks.push(catalog)
   if (agentsMd) {
