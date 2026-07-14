@@ -68,9 +68,17 @@ settings section.**
   interrupt instead of a cryptic failure.
 
 ### Discord
-- **New: Code** — a local coding agent, right in TurboLLM. Point it at a project folder, describe a task, and it reads, edits, and runs commands to get it done — entirely on your own GPU. Turn it on in Settings → Experimental.
-- **New: thinking-budget slider** — dial reasoning length up, down, or off, for both Chat and Code.
-- Fixed a bug where Code could occasionally produce an empty reply on a long/tool-heavy turn instead of a real answer.
+**Features**
+- **Thinking-budget slider** — dial reasoning length up, down, or off, for both Chat and Code.
+
+**Bugfix**
+- macOS: Metal builds, Rapid-MLX, and other cross-engine parity fixes.
+- Multi-GPU: the auto-tuner now tunes the actual split across cards, not just offload + KV quant.
+
+**Experimental** *(Settings → Experimental, off by default)*
+- **Code** — a local coding agent, right in TurboLLM. Point it at a project folder, describe a task, and it reads, edits, and runs commands to get it done — entirely on your own GPU.
+- **Memory**'s on/off switch now lives here too (its settings stay in General).
+- **Cloud Launch (RunPod)** — earliest stage, a toggle for what's coming.
 
 ## [1.7.7] - 2026-07-10
 
