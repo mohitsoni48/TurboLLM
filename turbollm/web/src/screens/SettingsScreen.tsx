@@ -398,6 +398,12 @@ export function SettingsScreen() {
               {/* Personalization */}
               <PersonalizationSection />
 
+              {/* Auto-memory (Release 3) — its ORIGINAL location, unchanged. Only unlocked when
+                  Settings → Experimental's Memory row is on (2026-07-14): visibility here AND
+                  whether extraction actually runs (chat-routes.ts) both gate on that same flag,
+                  not just this section's own "remember facts" toggle underneath it. */}
+              {settings?.experimental?.memory && <MemorySection />}
+
               {/* Chat */}
               <section className="rounded-lg border border-border bg-panel p-4">
                 <h2 className="mb-3 text-[13px] font-semibold uppercase tracking-wide text-faint">Chat</h2>
@@ -619,12 +625,11 @@ export function SettingsScreen() {
 
           {activeCat === 'experimental' && (
             <>
-              {/* Code, Cloud Launch/RunPod — simple on/off rows */}
+              {/* Memory, Code, Cloud Launch/RunPod — three master on/off rows. Memory's OWN
+                  settings (the "remember facts" toggle + facts list) stay in General — this is
+                  only the unlock switch, see PersonalizationSection's neighboring block above
+                  where MemorySection actually renders. */}
               <ExperimentalSection />
-
-              {/* Auto-memory (Release 3) — keeps its own richer collapsible (facts list) rather
-                  than folding into ExperimentalSection's bare checkbox-row shape. */}
-              <MemorySection />
             </>
           )}
 

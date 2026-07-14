@@ -1,4 +1,4 @@
-import { FlaskConical, SquareTerminal, Rocket } from 'lucide-react'
+import { FlaskConical, SquareTerminal, Rocket, Brain } from 'lucide-react'
 import { useSettings } from '../../lib/queries'
 import { ApiError } from '../../lib/api'
 import { Badge } from '../../components/ui/badge'
@@ -39,15 +39,18 @@ function FeatureRow({
 
 /** Experimental features (2026-07-14, preparing for wider distribution): still-in-progress
  *  capabilities, off by default for new/distributed installs, turned on individually here.
- *  Code and Cloud Launch/RunPod are simple on/off rows; Memory keeps its own richer collapsible
- *  (a facts list to review/delete) rendered separately right below this section rather than
- *  folded into a bare checkbox row — see SettingsScreen.tsx's 'experimental' category block. */
+ *  ALL THREE are simple master on/off rows in this ONE list — Memory's own richer settings
+ *  (the "remember facts about you" toggle + facts list) stay in their ORIGINAL location,
+ *  Settings → General's MemorySection, and only render there when this row is checked. This is
+ *  a correction of an earlier version that moved MemorySection's whole UI into this tab — the
+ *  founder was explicit that Memory's settings belong where they've always been, gated on
+ *  visibility (and, on the backend, on actually running) by this checkbox alone, not relocated. */
 export function ExperimentalSection() {
   const { query: settingsQ, save } = useSettings()
-  const experimental = settingsQ.data?.experimental ?? { code: false, cloudDeploy: false }
+  const experimental = settingsQ.data?.experimental ?? { memory: false, code: false, cloudDeploy: false }
   const busy = save.isPending
 
-  const setFlag = (key: 'code' | 'cloudDeploy', value: boolean) => {
+  const setFlag = (key: 'memory' | 'code' | 'cloudDeploy', value: boolean) => {
     save.mutate(
       { experimental: { [key]: value } },
       { onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not update experimental setting.') },
@@ -65,6 +68,14 @@ export function ExperimentalSection() {
         Still-in-progress features, off by default. Turn on what you want to try — nothing here is required
         for the rest of TurboLLM to work.
       </p>
+      <FeatureRow
+        icon={Brain}
+        title="Memory"
+        description="Silently remembers durable facts from your chats. Its settings live in General — this only controls whether that section is unlocked and actually runs."
+        checked={experimental.memory}
+        onChange={(v) => setFlag('memory', v)}
+        disabled={busy}
+      />
       <FeatureRow
         icon={SquareTerminal}
         title="Code"

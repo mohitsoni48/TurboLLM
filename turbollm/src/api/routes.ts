@@ -1466,7 +1466,7 @@ export function registerApi(app: Hono, d: Deps): void {
       build?: { toolchainDirs?: string[] }
       toolPolicies?: Record<string, string>
       cloudDeploy?: { runpodTemplateId?: string }
-      experimental?: { code?: boolean; cloudDeploy?: boolean }
+      experimental?: { memory?: boolean; code?: boolean; cloudDeploy?: boolean }
     }>(c)
 
     const updates: Record<string, unknown> = {}
@@ -1627,6 +1627,7 @@ export function registerApi(app: Hono, d: Deps): void {
       // Object.assign(cfg.daemon, updates) — a patch touching only one flag must not clobber
       // the other back to whatever `updates.experimental` would otherwise silently overwrite it
       // with (same reasoning as cloudDeploy's own per-field handling just above).
+      if (b.experimental?.memory !== undefined) cfg.daemon.experimental.memory = !!b.experimental.memory
       if (b.experimental?.code !== undefined) cfg.daemon.experimental.code = !!b.experimental.code
       if (b.experimental?.cloudDeploy !== undefined) cfg.daemon.experimental.cloudDeploy = !!b.experimental.cloudDeploy
       // HF token (spec 10 §4): write-only. An explicit '' clears it. Never logged.

@@ -1295,8 +1295,14 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
   // Release 3, auto-memory: extract durable facts from the just-typed user text (never
   // fires on regenerate, where ctx.userText is unset). Staggered slightly after autoTitle's
   // own setTimeout so the two out-of-band calls don't hit the engine on the exact same tick
-  // — not load-bearing, both are fire-and-forget.
-  if (!aborted && ctx.userText && d.store.snapshot().daemon.autoMemoryEnabled) {
+  // — not load-bearing, both are fire-and-forget. Two-layer gate (2026-07-14): `experimental.
+  // memory` is the master "is this feature unlocked at all" switch (Settings → Experimental);
+  // `autoMemoryEnabled` is the finer opt-in within that (Settings → General's MemorySection,
+  // which itself only renders when experimental.memory is on). Both must be true — the founder
+  // was explicit that turning Memory off in Experimental must actually stop it acting, not just
+  // hide its settings UI while extraction keeps running underneath.
+  const daemonCfg = d.store.snapshot().daemon
+  if (!aborted && ctx.userText && daemonCfg.experimental.memory && daemonCfg.autoMemoryEnabled) {
     setTimeout(() => { void extractMemoryFacts(d, convId, ctx.userText!, target) }, 1500)
   }
 }

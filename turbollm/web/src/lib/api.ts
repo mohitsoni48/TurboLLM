@@ -571,7 +571,7 @@ export type DaemonSettings = {
   cloudDeploy: { runpodTemplateId: string }
   /** Experimental feature flags (2026-07-14, Settings → Experimental). Off by default for
    *  new/distributed installs. */
-  experimental: { code: boolean; cloudDeploy: boolean }
+  experimental: { memory: boolean; code: boolean; cloudDeploy: boolean }
 }
 
 /** Tool-call approval gate policy (mirrors turbollm/src/tools/tool-policy.ts). */
