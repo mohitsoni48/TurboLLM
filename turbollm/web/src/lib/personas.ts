@@ -29,7 +29,15 @@ const TURBOLLM_KNOWLEDGE =
   '- **Export/Import**: export as `.turbollm-chat.json` or OpenAI-format JSON; re-import resumes the conversation. Share button gives a LAN read-only link and a debug snapshot.\n' +
   '- **Attachments** (paperclip): images (vision models), PDFs (real extracted text via pdf.js, not raw bytes), and plain-text/code files (`.txt`/`.md`/`.csv`/`.json`/`.yaml`/`.log` and common source extensions).\n' +
   '- **Edit a message or regenerate a reply and neither destroys history** — both create a branch, switchable via a ‹ 1/2 › control on the message (works for nested branch points too); delete a message or copy any message\'s text.\n' +
-  '- **Switching to a different conversation never cancels a reply that\'s still generating** — it keeps going in the background and saves when done. The sidebar shows a spinning indicator on any conversation generating in the background, and a dot on one that just finished while you were elsewhere (clears once you open it).\n\n' +
+  '- **Switching to a different conversation never cancels a reply that\'s still generating** — it keeps going in the background and saves when done. The sidebar shows a spinning indicator on any conversation generating in the background, and a dot on one that just finished while you were elsewhere (clears once you open it).\n' +
+  '- **Thinking budget**: a graduated slider (not just on/off) — cap reasoning to a specific token count, disable it entirely, or leave it unlimited. Same control in Code.\n\n' +
+
+  '**Code** (Workspace → Code tab, next to Chat; opt-in via Settings → Experimental, off by default — the whole tab is hidden until enabled) — a local coding agent on the same loaded model, working in a real project directory. Nothing leaves the machine.\n' +
+  '- Point it at a repo folder (optional isolated git worktree so the real checkout stays untouched), describe a task, pick a mode (plan-only / ask-before-mutating / auto plan-and-edit) — it reads, edits files, runs shell commands, and reports a real diff.\n' +
+  '- **Persistent sessions**: archive/filter past runs, revert to any earlier message (with optional real file-edit reversal), attach files as context, transcript copy. A "Coding activity" dashboard (sessions, tasks shipped, files touched, diff shipped, streaks) is built from real history.\n' +
+  '- **Real LSP integration** for TypeScript/JavaScript and Python — detects the language, installs the language server if needed, uses it for edits.\n' +
+  '- **Same tools Chat gets from Customize**: any connected MCP server, plus the sandboxed run_code tool, alongside honest skill invocation and AGENTS.md/agents.md support.\n' +
+  '- Gated behind its own API key on non-host devices (independent of Chat\'s own gate).\n\n' +
 
   '**Models** — discover and manage local models.\n' +
   '- **All models** view: scans configured local directories for GGUF, MLX safetensors, vLLM safetensors; badges incompatible models for the active engine.\n' +
@@ -72,11 +80,12 @@ const TURBOLLM_KNOWLEDGE =
   '- **Models tab**: a stacked daily bar chart plus a ranked legend (input/output split, % of total, "Show N more" past the top 6).\n' +
   '- Range control (7d / 30d / all) at the top switches every stat and the heatmap together.\n\n' +
 
-  '**Settings** — a two-pane layout, five categories in the left rail, one sticky Save bar:\n' +
-  '- **General**: theme (light/dark/system), enable-thinking-by-default, confirm-before-delete, personalization (assistant name / your name), **Memory** *(experimental, off by default)* — a toggle that silently extracts durable facts you mention in chat (name, preferences, hardware, projects) using your own loaded model and injects them into future new conversations, plus a reviewable/deletable fact list right in the same section (visible even with the toggle off), auto-generate chat titles, open browser on start.\n' +
+  '**Settings** — a two-pane layout, six categories in the left rail, one sticky Save bar:\n' +
+  '- **General**: theme (light/dark/system), enable-thinking-by-default, confirm-before-delete, personalization (assistant name / your name), **Memory** — its toggle now lives in Experimental (see below); when on, the reviewable/deletable fact list still shows here, auto-generate chat titles, open browser on start.\n' +
   '- **Models & loading**: idle timeout (auto-stop after N minutes), default context length, Gateway (auto model-swap + Keep-N pool, 1–4 models), model folders, Hugging Face token, and an **Advanced** collapsible for expert knobs — default GPU layers, VRAM headroom (300 MB–2 GB, default 1 GB), and image/response token caps.\n' +
   '- **Tools & safety**: per-tool Ask/Allow/Deny defaults for every tool the model can call (web_search, fetch_url, run_code, MCP tools).\n' +
   '- **Network & sharing**: LAN exposure (bind to 0.0.0.0 vs loopback-only), port, require-API-key auth, and ComfyUI integration (URL, Reverse GPU gate, update banner).\n' +
+  '- **Experimental**: still-in-progress features, off by default — a single on/off row each for **Memory** (silently extracts durable facts from chat using the loaded model; its own settings stay in General, unlocked once this is on), **Code** (the Workspace → Code tab; disabling this removes the tab entirely, not just its content), and **Cloud Launch/RunPod** (earliest-stage of the three — turning it on doesn\'t yet unlock a built UI).\n' +
   '- **System**: hardware panel, telemetry (Off / Anonymous / Full), About (current version, update-available chip, copy install command).\n\n' +
 
   '## Agents (formerly "Personas")\n\n' +

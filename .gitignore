@@ -74,3 +74,10 @@ Thumbs.db
 
 # Playwright MCP tool artifacts (console logs, page snapshots from browser debugging)
 /turbollm/.playwright-mcp/
+/.playwright-mcp/
+
+# Downloaded engine binaries (multi-GB; not product source, build-time content)
+/turbollm/engines/
+
+# Ad-hoc screenshots dropped at repo root during debugging
+/dashboard-preview.png

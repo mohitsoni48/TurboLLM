@@ -94,7 +94,9 @@ body {
   background: var(--bg);
   color: var(--ink);
   font-family: var(--font-sans);
-  font-size: 14px;
+  /* --font-scale is set on <html> by the Settings → Font size preference
+     (stores/ui.ts applyFontSize) — small/medium/large multiply this base. */
+  font-size: calc(14px * var(--font-scale, 1));
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
 }
@@ -112,6 +114,27 @@ body {
   outline-offset: 1px;
 }
 
+/* Rise-in entrance used by the Code launchpad — sections stagger via inline
+   animation-delay. Motion-sensitive users get an instant render instead. */
+@keyframes tllm-rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.tllm-rise {
+  animation: tllm-rise 0.45s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .tllm-rise {
+    animation: none;
+  }
+}
+
 /* starting-state pulse (spec 11 §3/§8) */
 @keyframes tllm-pulse {
   0%,
@@ -124,6 +147,27 @@ body {
 }
 .tllm-pulse {
   animation: tllm-pulse 1.2s ease-in-out infinite;
+}
+
+/* Code transcript entries: a quiet fade + slight rise on arrival, one-shot (not looping like
+   tllm-pulse above) — new rail entries used to just pop in instantly. */
+@keyframes tllm-rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.tllm-rise-in {
+  animation: tllm-rise-in 0.2s ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .tllm-rise-in {
+    animation: none;
+  }
 }
 
 /* Model config panel. Slides in from the RIGHT at every width (Radix data-state).

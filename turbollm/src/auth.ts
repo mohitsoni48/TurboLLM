@@ -166,6 +166,28 @@ export function isLocalOrAuthenticated(c: Context, d: Deps): boolean {
   return daemon.requireApiKey === true    // remote (or tunneled) allowed only behind required (verified) API key
 }
 
+/** Checks the presented key (any of the accepted headers, see presentedKey) against stored API
+ *  keys; bumps lastUsedAt best-effort on a match. Shared by lanAuth and codeAuth below so both
+ *  enforce the identical credential check — only WHEN each one is triggered differs. */
+export function verifyPresentedKey(c: Context, d: Deps): boolean {
+  const key = presentedKey(c)
+  if (!key) return false
+  const hash = hashKey(key)
+  const cfg = d.store.snapshot()
+  const match = cfg.apiKeys.find((k) => k.hash === hash)
+  if (!match) return false
+  // Best-effort lastUsedAt bump (spec 06 §5). Never block the request on it.
+  try {
+    d.store.update((mut) => {
+      const k = mut.apiKeys.find((x) => x.id === match.id)
+      if (k) k.lastUsedAt = new Date().toISOString()
+    })
+  } catch {
+    /* swallow — usage tracking is best-effort */
+  }
+  return true
+}
+
 /** LAN auth middleware (spec 06 §5). Register AFTER cors + the Server header and
  *  BEFORE the API/chat/gateway routes. Enforcement only kicks in when the daemon
  *  is LAN-exposed (lanBind=true); with the default loopback-only bind it is a pure
@@ -181,29 +203,47 @@ export function lanAuth(d: Deps): MiddlewareHandler {
       exempt: isExempt(c),
     })
     if (allow) return next()
-
-    const key = presentedKey(c)
-    if (key) {
-      const hash = hashKey(key)
-      const cfg = d.store.snapshot()
-      const match = cfg.apiKeys.find((k) => k.hash === hash)
-      if (match) {
-        // Best-effort lastUsedAt bump (spec 06 §5). Never block the request on it.
-        try {
-          d.store.update((mut) => {
-            const k = mut.apiKeys.find((x) => x.id === match.id)
-            if (k) k.lastUsedAt = new Date().toISOString()
-          })
-        } catch {
-          /* swallow — usage tracking is best-effort */
-        }
-        return next()
-      }
-    }
+    if (verifyPresentedKey(c, d)) return next()
 
     return c.json(
       { error: { code: 'unauthorized', message: 'A valid API key is required for non-local access.' } },
       401,
+    )
+  }
+}
+
+/** Code-specific gate, INDEPENDENT of the global requireApiKey toggle above. Chat (and most of
+ *  the app) can stay open on the LAN with no key — today's default, and lanAuth's job. Code is
+ *  different: it executes real bash/edit/write against the user's own filesystem, so a
+ *  non-host device must always present a valid API key to reach it, even when requireApiKey is
+ *  off for everything else. A no-op for anything local to the host (isLocalRequest already
+ *  covers the loopback-only-bind case AND correctly treats a genuinely tunneled request as
+ *  non-local, ADR-152) — register this scoped to /api/v1/code/* only, AFTER lanAuth. */
+export function codeAuth(d: Deps): MiddlewareHandler {
+  return async (c, next) => {
+    if (isLocalRequest(c, d)) return next()
+    if (verifyPresentedKey(c, d)) return next()
+
+    return c.json(
+      { error: { code: 'unauthorized', message: 'A valid API key is required to access Code from a non-host device.' } },
+      401,
+    )
+  }
+}
+
+/** Experimental-feature gate (2026-07-14, preparing for wider distribution): Code is now an
+ *  opt-in experimental feature (Settings → Experimental), off by default for new/distributed
+ *  installs. This is INDEPENDENT of codeAuth above — codeAuth answers "is this caller allowed
+ *  to reach Code at all", this answers "is Code even turned on" — both must pass. Register on
+ *  /api/v1/code/* alongside codeAuth in server.ts. A 403 (not 401): the caller may be fully
+ *  authenticated and simply have the feature turned off, which is a different failure mode from
+ *  a missing/invalid credential. */
+export function requireExperimentalCode(d: Deps): MiddlewareHandler {
+  return async (c, next) => {
+    if (d.store.snapshot().daemon.experimental.code) return next()
+    return c.json(
+      { error: { code: 'feature_disabled', message: 'Code is an experimental feature. Enable it in Settings → Experimental.' } },
+      403,
     )
   }
 }

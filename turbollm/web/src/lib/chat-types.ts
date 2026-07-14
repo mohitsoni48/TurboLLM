@@ -21,6 +21,12 @@ export interface ToolCallRecord {
   args: Record<string, unknown>
   result?: string
   error?: string
+  /** Code mode only (pi's edit tool result) — a unified diff of the change, when the
+   *  backend forwards one. Not currently persisted across a page reload; present only
+   *  on records read straight off the live SSE stream. */
+  diff?: string
+  patch?: string
+  firstChangedLine?: number
 }
 
 export interface LiveToolCall {
@@ -29,6 +35,11 @@ export interface LiveToolCall {
   args: Record<string, unknown>
   status: 'pending' | 'done' | 'error' | 'awaiting_approval'
   result?: string
+  /** Code mode only — pi edit tool's real diff/patch output, carried on the terminal
+   *  tool_call SSE event (see turbollm/src/code/code-session.ts's tool_result hook). */
+  diff?: string
+  patch?: string
+  firstChangedLine?: number
 }
 
 /** Tool-call approval gate policy (mirrors turbollm/src/tools/tool-policy.ts). */
@@ -59,6 +70,16 @@ export interface ResearchMeta {
   refereeVerdicts?: ClaimVerdict[]
 }
 
+/** Code, item 6 (2026-07-13): an ordered text/tool-call timeline, in TRUE chronological order —
+ *  lets a completed Code turn render with the same interleaving the live view already gets right,
+ *  instead of a fixed "reasoning → all tool calls grouped → final text" layout. Tool blocks
+ *  reference an id into this same message's `toolCalls`, mirroring db.ts's MessageTimelineBlock.
+ *  Absent on messages persisted before this field existed — callers fall back to the old grouped
+ *  rendering when it's missing. */
+export type MessageTimelineBlock =
+  | { type: 'text'; text: string }
+  | { type: 'tool'; id: string }
+
 export interface Message {
   id: string
   convId: string
@@ -69,6 +90,8 @@ export interface Message {
   attachments: string[]
   textAttachments: string[]
   toolCalls: ToolCallRecord[]
+  /** Code, item 6 — see MessageTimelineBlock's own comment. */
+  timeline?: MessageTimelineBlock[]
   stats: Partial<MessageStats>
   /** F-021/F-022: research metadata (confidence, sources, referee verdicts). */
   researchMeta?: ResearchMeta
@@ -135,6 +158,6 @@ export type ChatSseEvent =
   | { event: 'progress';  data: { phase: string; processed: number; total: number; pct: number; tps: number } }
   | { event: 'reasoning'; data: { delta: string } }
   | { event: 'delta';     data: { delta: string } }
-  | { event: 'tool_call'; data: { id: string; name: string; args: Record<string, unknown>; status: 'pending' | 'done' | 'error' | 'awaiting_approval'; result?: string } }
+  | { event: 'tool_call'; data: { id: string; name: string; args: Record<string, unknown>; status: 'pending' | 'done' | 'error' | 'awaiting_approval'; result?: string; diff?: string; patch?: string; firstChangedLine?: number } }
   | { event: 'done';      data: { message: Message } }
   | { event: 'error';     data: { code: string; message: string } }

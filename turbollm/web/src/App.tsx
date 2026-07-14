@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useRef, useState } from 'react'
+import { lazy, Suspense, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react'
 import {
   Navigate,
   Route,
@@ -9,11 +9,14 @@ import { TooltipProvider } from './components/ui/tooltip'
 import { Shell } from './components/Shell'
 import { UnreachableOverlay } from './components/UnreachableOverlay'
 import { AuthGate } from './components/AuthGate'
-import { useStatus } from './lib/queries'
+import { useStatus, useSettings } from './lib/queries'
 import { ApiError, setAuthToken } from './lib/api'
+import { subscribeCodeAuthNeeded, isCodeAuthNeeded } from './lib/auth-signal'
 
 // Route-level code splitting: each screen loads only when first navigated to.
 const WorkspaceScreen = lazy(() => import('./screens/WorkspaceScreen').then((m) => ({ default: m.WorkspaceScreen })))
+const CodeHomeScreen = lazy(() => import('./screens/code/CodeHomeScreen').then((m) => ({ default: m.CodeHomeScreen })))
+const CodeSessionScreen = lazy(() => import('./screens/code/CodeSessionScreen').then((m) => ({ default: m.CodeSessionScreen })))
 const ChatScreen = lazy(() => import('./screens/ChatScreen').then((m) => ({ default: m.ChatScreen })))
 const SkillEditPage = lazy(() => import('./screens/skills/SkillEditPage').then((m) => ({ default: m.SkillEditPage })))
 const AgentEditPage = lazy(() => import('./screens/agents/AgentEditPage').then((m) => ({ default: m.AgentEditPage })))
@@ -37,6 +40,20 @@ function ScreenFallback() {
   )
 }
 
+/** Route-level gate for Code (2026-07-14, Settings → Experimental) — the authoritative check;
+ *  ConversationSidebar.tsx hiding the Chat|Code pill is a UX nicety, not the real gate, since a
+ *  direct navigation or stale bookmark bypasses hidden UI entirely. Redirects to Chat when the
+ *  flag is off. Shows the same loading fallback the route-chunk Suspense uses while the setting
+ *  is still being fetched, rather than redirecting prematurely on a fast first paint before the
+ *  real value is known — a false "disabled" flash would bounce a user with the flag ON right
+ *  back out of Code before the settings query resolves. */
+function RequireCodeEnabled({ children }: { children: ReactNode }) {
+  const { query } = useSettings()
+  if (query.isLoading) return <ScreenFallback />
+  if (!query.data?.experimental?.code) return <Navigate to="/workspace/chat" replace />
+  return <>{children}</>
+}
+
 export function App() {
   const statusQ = useStatus()
   const qc = useQueryClient()
@@ -56,7 +73,10 @@ export function App() {
   const online = statusQ.isSuccess
   // A 401 isn't a lost connection — the daemon is up but (LAN-exposed) wants an API
   // key. Show the key prompt instead of the misleading "lost connection" overlay.
-  const needsAuth = statusQ.isError && statusQ.error instanceof ApiError && statusQ.error.status === 401
+  // Code has its OWN always-on key gate independent of the global one (auth.ts's codeAuth) —
+  // /status itself never 401s for it, so code-api.ts marks this separate signal instead.
+  const codeAuthNeeded = useSyncExternalStore(subscribeCodeAuthNeeded, isCodeAuthNeeded)
+  const needsAuth = (statusQ.isError && statusQ.error instanceof ApiError && statusQ.error.status === 401) || codeAuthNeeded
 
   // Latch the auth prompt once we've seen a 401, and keep it up until a poll finally
   // SUCCEEDS. Without this, a flaky LAN link (common on the remote machine where you're
@@ -81,6 +101,10 @@ export function App() {
             <Route path="/workspace" element={<Navigate to="/workspace/chat" replace />} />
             <Route path="/workspace/chat" element={<WorkspaceScreen />} />
             <Route path="/workspace/chat/:convId" element={<WorkspaceScreen />} />
+            {/* Code — Workspace's second mode, not a separate nav item. Gated behind the
+                experimental flag (Settings → Experimental) — see RequireCodeEnabled above. */}
+            <Route path="/workspace/code" element={<RequireCodeEnabled><CodeHomeScreen /></RequireCodeEnabled>} />
+            <Route path="/workspace/code/:sessionId" element={<RequireCodeEnabled><CodeSessionScreen /></RequireCodeEnabled>} />
             {/* Back-compat: the old Workspace → Agent tab is gone; land on Chat instead. */}
             <Route path="/workspace/agent" element={<Navigate to="/workspace/chat" replace />} />
             <Route path="/workspace/agent/:convId" element={<Navigate to="/workspace/chat" replace />} />

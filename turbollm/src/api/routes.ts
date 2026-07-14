@@ -2,6 +2,7 @@
 import type { Context, Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
 import { basename, dirname, join, resolve } from 'node:path'
 import { GATE_VERSION, gateNodeSource } from '../comfyui/gate-template'
 import { randomUUID } from 'node:crypto'
@@ -1023,6 +1024,37 @@ export function registerApi(app: Hono, d: Deps): void {
     return c.json({ path: real, parent, entries })
   })
 
+  // ---- git info for the Code repo picker: current branch + known local branches ----
+  // LOCAL-ONLY, same gate as fs/browse — a LAN client never gets to run git on this
+  // machine's disk. Best-effort: any folder that isn't a git repo (or has no commits
+  // yet) just reports isRepo:false rather than erroring, so the picker still works for
+  // a plain scratch folder.
+  app.get('/api/v1/fs/git-branch', (c) => {
+    if (!isLocalRequest(c, d))
+      return err(c, 403, 'forbidden', 'Reading git info is only available on the machine running TurboLLM.')
+    const raw = (c.req.query('path') ?? '').trim()
+    if (!raw) return err(c, 400, 'invalid_input', 'path is required.')
+    const cwd = resolve(raw)
+    if (!existsSync(cwd) || !statSync(cwd).isDirectory()) {
+      return c.json({ isRepo: false, branch: '', branches: [] })
+    }
+    const git = (args: string[]): string => execFileSync('git', args, { cwd, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000, windowsHide: true }).trim()
+    try {
+      // Confirms we're inside a real work tree (not just a bare/.git dir).
+      if (git(['rev-parse', '--is-inside-work-tree']) !== 'true') return c.json({ isRepo: false, branch: '', branches: [] })
+      let branch = ''
+      try { branch = git(['rev-parse', '--abbrev-ref', 'HEAD']) } catch { /* unborn HEAD (no commits yet) */ }
+      if (branch === 'HEAD') branch = '' // detached HEAD — no meaningful branch name
+      let branches: string[] = []
+      try {
+        branches = git(['branch', '--format=%(refname:short)']).split('\n').map((s) => s.trim()).filter(Boolean)
+      } catch { /* no branches yet */ }
+      return c.json({ isRepo: true, branch, branches })
+    } catch {
+      return c.json({ isRepo: false, branch: '', branches: [] })
+    }
+  })
+
   // ---- lifecycle (A2) ----
   app.post('/api/v1/engine/start', async (c) => {
     const b = await body<{
@@ -1434,6 +1466,7 @@ export function registerApi(app: Hono, d: Deps): void {
       build?: { toolchainDirs?: string[] }
       toolPolicies?: Record<string, string>
       cloudDeploy?: { runpodTemplateId?: string }
+      experimental?: { memory?: boolean; code?: boolean; cloudDeploy?: boolean }
     }>(c)
 
     const updates: Record<string, unknown> = {}
@@ -1590,6 +1623,13 @@ export function registerApi(app: Hono, d: Deps): void {
       if (b.cloudDeploy?.runpodTemplateId !== undefined) {
         cfg.cloudDeploy.runpodTemplateId = String(b.cloudDeploy.runpodTemplateId).trim()
       }
+      // Experimental feature flags (2026-07-14, Settings → Experimental): per-field merge, not
+      // Object.assign(cfg.daemon, updates) — a patch touching only one flag must not clobber
+      // the other back to whatever `updates.experimental` would otherwise silently overwrite it
+      // with (same reasoning as cloudDeploy's own per-field handling just above).
+      if (b.experimental?.memory !== undefined) cfg.daemon.experimental.memory = !!b.experimental.memory
+      if (b.experimental?.code !== undefined) cfg.daemon.experimental.code = !!b.experimental.code
+      if (b.experimental?.cloudDeploy !== undefined) cfg.daemon.experimental.cloudDeploy = !!b.experimental.cloudDeploy
       // HF token (spec 10 §4): write-only. An explicit '' clears it. Never logged.
       if (b.hfToken !== undefined) cfg.hf.token = String(b.hfToken).trim()
       // Search provider config (F-020). All key/URL fields are write-only; '' clears them.
@@ -2075,6 +2115,9 @@ function settingsPayload(d: Deps) {
     build: { toolchainDirs: cfg.build.toolchainDirs },
     // Cloud Launch deploy-link settings (ADR-153): not secret — echoed back.
     cloudDeploy: cfg.cloudDeploy,
+    // Experimental feature flags (2026-07-14): not secret — echoed back for Settings →
+    // Experimental and for the frontend to decide whether to show the Code entry point at all.
+    experimental: cfg.daemon.experimental,
     // Tool-call approval gate: global per-tool policy ('ask' | 'allow' | 'deny').
     // Not secret — echoed back directly so Settings can render Tool Permissions.
     toolPolicies: cfg.tools.toolPolicies ?? {},

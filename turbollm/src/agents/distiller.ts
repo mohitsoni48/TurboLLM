@@ -44,7 +44,7 @@ async function distill(d: Deps, material: string): Promise<DistilledSkill> {
         ],
         temperature: 0.3,
         max_tokens: 800,
-        reasoning_budget: 0,
+        thinking_budget_tokens: 0,
         chat_template_kwargs: { enable_thinking: false },
         response_format: { type: 'json_object' },
         stream: false,

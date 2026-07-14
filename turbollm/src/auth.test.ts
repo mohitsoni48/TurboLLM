@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { bypassesAuth, isLocalRequest, isLocalOrAuthenticated, provisionTunnelApiKey } from './auth'
+import { createHash } from 'node:crypto'
+import { bypassesAuth, isLocalRequest, isLocalOrAuthenticated, provisionTunnelApiKey, verifyPresentedKey, codeAuth } from './auth'
 import type { Context } from 'hono'
 import type { Deps } from './deps'
 
@@ -178,4 +179,109 @@ test('provisionTunnelApiKey: stores a fresh key and returns its full (unhashed) 
   assert.equal(pushed.length, 1)
   assert.match(pushed[0].name, /^tunnel-/)
   assert.notEqual(pushed[0].hash, full) // only the hash is persisted, never the raw key
+})
+
+// codeAuth (Code-specific gate, independent of the global requireApiKey toggle): Chat can
+// stay open on the LAN with no key, but Code must always require one from a non-host device —
+// see auth.ts's own doc comment on codeAuth for the rationale (real bash/edit/write access).
+
+const RAW_KEY = 'tllm-testkeyABCDEFGHIJKLMNOPQRSTUVWXYZ01'
+const RAW_KEY_HASH = createHash('sha256').update(RAW_KEY).digest('hex')
+
+function fakeDepsWithKeys(overrides: { lanBind?: boolean; tunnelActive?: boolean; hasKey?: boolean }): Deps {
+  const apiKeys = overrides.hasKey
+    ? [{ id: 'k1', name: 'test', hash: RAW_KEY_HASH, prefix: RAW_KEY.slice(0, 12), createdAt: '', lastUsedAt: null }]
+    : []
+  return {
+    store: {
+      snapshot: () => ({
+        daemon: { lanBind: overrides.lanBind ?? false, requireApiKey: false },
+        apiKeys,
+      } as unknown as ReturnType<Deps['store']['snapshot']>),
+      update: (fn: (cfg: { apiKeys: typeof apiKeys }) => void) => fn({ apiKeys }),
+    },
+    tunnel: overrides.tunnelActive !== undefined ? ({ active: () => overrides.tunnelActive } as Deps['tunnel']) : undefined,
+  } as unknown as Deps
+}
+
+test('verifyPresentedKey: no header at all → false', () => {
+  const d = fakeDepsWithKeys({ hasKey: true })
+  const c = fakeContext({})
+  assert.equal(verifyPresentedKey(c, d), false)
+})
+
+test('verifyPresentedKey: a key that matches no stored hash → false', () => {
+  const d = fakeDepsWithKeys({ hasKey: true })
+  const c = fakeContext({ 'x-turbollm-auth': 'tllm-wrongwrongwrongwrongwrongwrongwrongwr' })
+  assert.equal(verifyPresentedKey(c, d), false)
+})
+
+test('verifyPresentedKey: the correct key (via X-TurboLLM-Auth) → true', () => {
+  const d = fakeDepsWithKeys({ hasKey: true })
+  const c = fakeContext({ 'x-turbollm-auth': RAW_KEY })
+  assert.equal(verifyPresentedKey(c, d), true)
+})
+
+test('verifyPresentedKey: the correct key via Authorization: Bearer → true', () => {
+  const d = fakeDepsWithKeys({ hasKey: true })
+  const c = fakeContext({ authorization: `Bearer ${RAW_KEY}` })
+  assert.equal(verifyPresentedKey(c, d), true)
+})
+
+/** A minimal fake Hono context for exercising codeAuth end-to-end as real middleware —
+ *  everything lanAuth's own test suite above stops short of (it only tests the pure
+ *  bypassesAuth/isLocalRequest logic). Records what json() returned, if anything; each test
+ *  tracks whether its own next() ran via its own local closure variable. */
+function fakeMiddlewareContext(headers: Record<string, string | undefined>): { c: Context; jsonResult: () => { body: unknown; status: number } | undefined } {
+  let jsonResult: { body: unknown; status: number } | undefined
+  const c = {
+    req: { header: (name: string) => headers[name.toLowerCase()] },
+    json: (body: unknown, status: number) => { jsonResult = { body, status }; return jsonResult },
+  } as unknown as Context
+  return { c, jsonResult: () => jsonResult }
+}
+
+test('codeAuth: a request local to the host (loopback-only bind) always passes, no key needed', async () => {
+  const d = fakeDepsWithKeys({ lanBind: false, hasKey: false })
+  const { c, jsonResult } = fakeMiddlewareContext({})
+  let called = false
+  await codeAuth(d)(c, async () => { called = true })
+  assert.equal(called, true)
+  assert.equal(jsonResult(), undefined)
+})
+
+test('codeAuth: LAN-exposed + no key presented at all → 401, even though Chat-style access would be open', async () => {
+  const d = fakeDepsWithKeys({ lanBind: true, hasKey: true })
+  const { c, jsonResult } = fakeMiddlewareContext({})
+  let called = false
+  await codeAuth(d)(c, async () => { called = true })
+  assert.equal(called, false)
+  assert.equal(jsonResult()?.status, 401)
+})
+
+test('codeAuth: LAN-exposed + a valid key presented → passes', async () => {
+  const d = fakeDepsWithKeys({ lanBind: true, hasKey: true })
+  const { c, jsonResult } = fakeMiddlewareContext({ 'x-turbollm-auth': RAW_KEY })
+  let called = false
+  await codeAuth(d)(c, async () => { called = true })
+  assert.equal(called, true)
+  assert.equal(jsonResult(), undefined)
+})
+
+test('codeAuth: LAN-exposed + a WRONG key presented → still 401', async () => {
+  const d = fakeDepsWithKeys({ lanBind: true, hasKey: true })
+  const { c, jsonResult } = fakeMiddlewareContext({ 'x-turbollm-auth': 'tllm-nope0000000000000000000000000000000' })
+  let called = false
+  await codeAuth(d)(c, async () => { called = true })
+  assert.equal(called, false)
+  assert.equal(jsonResult()?.status, 401)
+})
+
+test('codeAuth: a genuinely tunneled request is never treated as local, even with lanBind off', async () => {
+  const d = fakeDepsWithKeys({ lanBind: false, tunnelActive: true, hasKey: true })
+  const { c, jsonResult } = fakeMiddlewareContext({ 'cf-ray': 'abc123-DEL' })
+  let called = false
+  await codeAuth(d)(c, async () => { called = true })
+  assert.equal(called, false)
+  assert.equal(jsonResult()?.status, 401)
 })

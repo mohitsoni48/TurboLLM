@@ -366,6 +366,17 @@ export function browseFs(path?: string): Promise<FsListing> {
   return request<FsListing>(`/api/v1/fs/browse${q}`)
 }
 
+/** Current branch + known local branches for a folder, local-only (Code launchpad's
+ *  repo picker). `isRepo` is false for a plain (non-git) scratch folder — not an error. */
+export interface GitBranchInfo {
+  isRepo: boolean
+  branch: string
+  branches: string[]
+}
+export function getGitBranch(path: string): Promise<GitBranchInfo> {
+  return request<GitBranchInfo>(`/api/v1/fs/git-branch?path=${encodeURIComponent(path)}`)
+}
+
 // ── Models (discovery, spec 04) ──────────────────────────────────────────────
 export function getModels(): Promise<ModelsList> {
   return request<ModelsList>('/api/v1/models')
@@ -558,6 +569,9 @@ export type DaemonSettings = {
   /** Cloud Launch deploy-link settings (ADR-153). The RunPod Template ID the user
    *  published themselves — not a secret, just an id, echoed back as-is. */
   cloudDeploy: { runpodTemplateId: string }
+  /** Experimental feature flags (2026-07-14, Settings → Experimental). Off by default for
+   *  new/distributed installs. */
+  experimental: { memory: boolean; code: boolean; cloudDeploy: boolean }
 }
 
 /** Tool-call approval gate policy (mirrors turbollm/src/tools/tool-policy.ts). */
@@ -569,8 +583,11 @@ export type SearchProvider = 'tavily' | 'kagi' | 'searxng'
  *  `hfToken` (spec 10 §4) that sets/clears the stored Hugging Face token. `comfyui`
  *  is patchable per-field (only `enabled` is set here; `gatePath` is owned by the
  *  install endpoints). */
-export type DaemonSettingsPatch = Partial<Omit<DaemonSettings, 'comfyui' | 'tavilyKeySet' | 'search' | 'mcp'>> & {
+export type DaemonSettingsPatch = Partial<Omit<DaemonSettings, 'comfyui' | 'tavilyKeySet' | 'search' | 'mcp' | 'experimental'>> & {
   comfyui?: Partial<ComfyUiSettings>
+  /** Patchable per-field — the backend applies each key independently (api/routes.ts), so a
+   *  patch touching only one flag must not be forced to also supply the other. */
+  experimental?: Partial<DaemonSettings['experimental']>
   hfToken?: string
   /** Write-only: set or clear the Tavily API key (legacy alias for `search.tavilyApiKey`). */
   tavilyApiKey?: string

@@ -17,6 +17,7 @@ import {
   getApiKeys,
   getConnect,
   getEngineBackends,
+  getGitBranch,
   getModelDetail,
   getModelDirs,
   getModels,
@@ -434,6 +435,18 @@ export function useFsBrowse(path: string | null, enabled: boolean) {
     enabled,
     retry: false,
     placeholderData: (prev) => prev,
+  })
+}
+
+/** Current branch + local branch list for a chosen repo folder (Code launchpad's
+ *  repo picker). Disabled until a folder is actually picked. */
+export function useGitBranch(path: string | null, enabled: boolean) {
+  return useQuery({
+    queryKey: ['git-branch', path],
+    queryFn: () => getGitBranch(path!),
+    enabled: enabled && !!path,
+    retry: false,
+    staleTime: 10_000,
   })
 }
 

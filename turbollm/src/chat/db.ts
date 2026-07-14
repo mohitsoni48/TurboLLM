@@ -17,8 +17,9 @@ export interface Conversation {
   /** Tool-calling policy for this conversation. 'force_web_search' forces the model
    *  to call web_search on the first iteration before composing a reply. */
   toolPolicy?: string
-  /** Conversation kind: 'chat' (default user-facing) or 'agent' (background agent run). */
-  kind: 'chat' | 'agent'
+  /** Conversation kind: 'chat' (default user-facing), 'agent' (background agent run),
+   *  or 'code' (a real pi-SDK Code session — parallel to 'agent', its own UI surface). */
+  kind: 'chat' | 'agent' | 'code'
   /** Folder this conversation is filed under (v10). NULL/undefined = uncategorized. */
   folderId?: string | null
   /** Per-conversation tool-approval overrides (v11, tool-call approval gate). Set via
@@ -112,6 +113,37 @@ export interface AgentRun {
   archivedAt?: string
   /** User disposition outcome: 'complete' | 'miss' | undefined (in-flight). */
   completion?: 'complete' | 'miss'
+  // ── Code session fields (v28) — populated only for a 'code'-kind run. ──────────
+  /** The scratch/repo folder that is the pi session cwd (the containment root). */
+  repoRoot?: string
+  /** The sidebar "branch" label captured at creation (git rev-parse of repoRoot). */
+  repoBranch?: string
+  /** Whether the composer's "isolate in a worktree" tickbox was checked. */
+  useWorktree?: boolean
+  /** Captured worktree intent — stored, NOT acted on in Phase 1 (fast-follow). */
+  worktreeBranch?: string
+  /** Captured worktree intent — stored, NOT acted on in Phase 1 (fast-follow). */
+  worktreeBase?: string
+  /** Sidebar "add" stat. 0 for Phase 1 (real diff stats are a fast-follow). */
+  linesAdded?: number
+  /** Sidebar "del" stat. 0 for Phase 1 (real diff stats are a fast-follow). */
+  linesRemoved?: number
+  // ── Manual /compact (v29) — one active compaction per session, not incremental history. ──
+  /** The summary that replaces every message at/before compactionUpToMessageId when a future
+   *  turn's history is replayed (code-session.ts's seedPriorHistory). Undefined = never compacted. */
+  compactionSummary?: string
+  /** The last DB message id that's covered by compactionSummary — messages after this one
+   *  still replay in full. */
+  compactionUpToMessageId?: string
+  /** pi's own reported token count immediately before this compaction ran — display only. */
+  compactionTokensBefore?: number
+  // ── Manual /clear + /resume (v30) — a soft, resumable "clear chat" marker. ──────────────
+  /** The last DB message id covered by a /clear — resolveEffectiveHistory (code-session.ts)
+   *  replays nothing at/before this point AND injects no summary (unlike compaction, a clear
+   *  is a blank slate). Undefined = never cleared, or resumed back from one. The transcript UI
+   *  hides messages at/before this point too, with a banner offering /resume to un-hide them —
+   *  the underlying messages are never deleted, so resuming restores them exactly. */
+  clearedUpToMessageId?: string
 }
 
 /** One per-Hitman track-record row (spec 13 §12.3). */
@@ -200,6 +232,40 @@ export interface TokenUsageStats {
   byModel: ModelUsage[]
 }
 
+export type CodeStatsRange = 'all' | '30d' | '7d'
+
+/** One heatmap cell — one box per LOCAL calendar day (unlike token usage's sub-day zoom, Code
+ *  sessions are coarse enough that day-granularity is always right, at any range). */
+export interface CodeStatsDay {
+  date: string
+  sessions: number
+}
+
+export interface CodeStatsResult {
+  range: CodeStatsRange
+  sessions: number
+  /** Runs that finished with status 'done' — aborted/failed/interrupted runs don't count as
+   *  "shipped" even though they're real sessions. */
+  tasksShipped: number
+  /** Distinct file paths touched by an edit or write tool call, in range. */
+  filesTouched: number
+  /** Real +/- line counts from every edit tool call's stored unified diff (ADR-199 made these
+   *  actually persist) — NOT from agent_runs.lines_added/lines_removed, which are still always
+   *  0 (columns exist, nothing ever writes them); computed fresh from messages instead, so
+   *  there's no separate running counter that could drift from what's actually in the diffs. */
+  diffAdded: number
+  diffRemoved: number
+  activeDays: number
+  /** Lifetime, not scoped by `range` — mirrors tokenUsageStats' own semantics (a streak isn't a
+   *  "last N days" concept), so these stay stable as the range tab is switched. */
+  currentStreak: number
+  longestStreak: number
+  favoriteModel: string | null
+  /** At least 180 days of boxes for 'all' (padded with empty cells for a new install), the real
+   *  window for '30d'/'7d' — same convention as tokenUsageStats' heatmap. */
+  heatmap: CodeStatsDay[]
+}
+
 const RANGE_WINDOW_DAYS: Record<'30d' | '7d', number> = { '30d': 30, '7d': 7 }
 
 const TOKEN_MILESTONES = [
@@ -213,6 +279,34 @@ const TOKEN_MILESTONES = [
 function titleCaseModelName(modelKey: string): string {
   const raw = modelKey.split('|')[0] ?? modelKey
   return raw.replace(/\b\w/g, (c) => c.toUpperCase())
+}
+
+/** Local calendar date key ("YYYY-MM-DD") for a timestamp — this daemon and its user are
+ *  always the same machine, so local time (not UTC) is what "today"/"yesterday" means.
+ *  Shared by tokenUsageStats and codeStats so both bucket days identically. */
+function dayKey(iso: string): string {
+  const d = new Date(iso)
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+/** `key` shifted by `n` local calendar days (negative goes back). */
+function addDays(key: string, n: number): string {
+  const [y, m, d] = key.split('-').map(Number)
+  const dt = new Date(y, m - 1, d + n)
+  return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`
+}
+
+/** Counts +/- lines in a unified diff (skips the +++/--- file-header lines, which start with
+ *  the same characters but aren't real changes) — server-side twin of CodeTranscript.tsx's own
+ *  diffStats, used to aggregate real "diff shipped" totals for the Code activity stats. */
+function countDiffLines(diff: string): { add: number; del: number } {
+  let add = 0, del = 0
+  for (const line of diff.split('\n')) {
+    if (line.startsWith('+++') || line.startsWith('---')) continue
+    if (line.startsWith('+')) add++
+    else if (line.startsWith('-')) del++
+  }
+  return { add, del }
 }
 
 export interface MessageStats {
@@ -238,7 +332,23 @@ export interface ToolCallRecord {
   args: Record<string, unknown>
   result?: string
   error?: string
+  /** Code mode only (pi's edit tool result) — a display-oriented diff and a standard unified
+   *  patch of the change. Persisted so the diff panel and revert-to-message (code-routes.ts's
+   *  revert endpoint) both still have this after a page reload, not just on the live SSE
+   *  stream that produced it. */
+  diff?: string
+  patch?: string
+  firstChangedLine?: number
 }
+
+/** Code, item 6 (2026-07-13): an ordered text/tool-call timeline for an assistant message, in
+ *  TRUE chronological order — the fix for completed Code turns rendering in a fixed "reasoning →
+ *  all tool calls grouped → final text" layout regardless of how they actually interleaved live.
+ *  Tool blocks reference an id into this same message's `toolCalls` array rather than duplicating
+ *  the full record — `toolCalls` remains the single source of truth for a call's data. */
+export type MessageTimelineBlock =
+  | { type: 'text'; text: string }
+  | { type: 'tool'; id: string }
 
 /** F-021: research metadata attached to Research-persona assistant messages. */
 export interface ResearchMeta {
@@ -279,6 +389,9 @@ export interface Message {
   textAttachments: string[]
   /** Tool calls made by this assistant turn (v0.7.0). */
   toolCalls: ToolCallRecord[]
+  /** Code, item 6 — ordered text/tool-call interleave. Absent on messages persisted before this
+   *  field existed, and on non-Code (chat) messages, which never populate it. */
+  timeline?: MessageTimelineBlock[]
   stats: Partial<MessageStats>
   /** F-021/F-022: research metadata (confidence, sources, referee verdicts). Absent on non-research messages. */
   researchMeta?: ResearchMeta
@@ -298,9 +411,9 @@ export interface Message {
 }
 
 interface ConvRow { id: string; title: string; system_prompt: string; model_key: string; sampling: string; expert_mode: number; tool_policy: string | null; kind: string | null; folder_id: string | null; tool_overrides: string | null; agent_id: string | null; completed_at: string | null; read_scope: string | null; agent_mode: string | null; skill_ids: string | null; allowed_tools: string | null; preserve_thinking: number; created_at: string; updated_at: string }
-interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; agent_id: string | null; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null; archived_at: string | null; completion: string | null }
+interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; agent_id: string | null; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null; archived_at: string | null; completion: string | null; repo_root: string | null; repo_branch: string | null; use_worktree: number | null; worktree_branch: string | null; worktree_base: string | null; lines_added: number | null; lines_removed: number | null; compaction_summary: string | null; compaction_upto_message_id: string | null; compaction_tokens_before: number | null; cleared_upto_message_id: string | null }
 interface FolderRow { id: string; name: string; sort_order: number; created_at: string; updated_at: string }
-interface MsgRow  { id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string; reasoning: string; attachments: string; text_attachments: string | null; tool_calls: string | null; stats: string; model_key: string | null; research_meta: string | null; created_at: string; variant_group: string | null; is_active: number; branch_of: string | null; edited: number }
+interface MsgRow  { id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string; reasoning: string; attachments: string; text_attachments: string | null; tool_calls: string | null; timeline: string | null; stats: string; model_key: string | null; research_meta: string | null; created_at: string; variant_group: string | null; is_active: number; branch_of: string | null; edited: number }
 
 // node:sqlite named-param objects need an explicit cast to Record<string, SQLInputValue>
 type P = Record<string, SQLInputValue>
@@ -319,7 +432,7 @@ function safeToolOverrides(s: string | null): Record<string, 'allow' | 'deny'> {
 }
 
 function rowToConv(r: ConvRow): Conversation {
-  return { id: r.id, title: r.title, systemPrompt: r.system_prompt, modelKey: r.model_key, sampling: safeJson(r.sampling) as Record<string, unknown>, expertMode: r.expert_mode === 1, toolPolicy: r.tool_policy ?? undefined, kind: (r.kind === 'agent' ? 'agent' : 'chat'), folderId: r.folder_id ?? null, toolOverrides: safeToolOverrides(r.tool_overrides), agentId: r.agent_id ?? undefined, completedAt: r.completed_at ?? undefined, readScope: r.read_scope ? (safeJson(r.read_scope) as string[]) : undefined, agentMode: r.agent_mode ?? undefined, skillIds: r.skill_ids ? (safeJson(r.skill_ids) as string[]) : undefined, allowedTools: r.allowed_tools ? (safeJson(r.allowed_tools) as string[]) : undefined, preserveThinking: r.preserve_thinking === 1, createdAt: r.created_at, updatedAt: r.updated_at }
+  return { id: r.id, title: r.title, systemPrompt: r.system_prompt, modelKey: r.model_key, sampling: safeJson(r.sampling) as Record<string, unknown>, expertMode: r.expert_mode === 1, toolPolicy: r.tool_policy ?? undefined, kind: (r.kind === 'agent' ? 'agent' : r.kind === 'code' ? 'code' : 'chat'), folderId: r.folder_id ?? null, toolOverrides: safeToolOverrides(r.tool_overrides), agentId: r.agent_id ?? undefined, completedAt: r.completed_at ?? undefined, readScope: r.read_scope ? (safeJson(r.read_scope) as string[]) : undefined, agentMode: r.agent_mode ?? undefined, skillIds: r.skill_ids ? (safeJson(r.skill_ids) as string[]) : undefined, allowedTools: r.allowed_tools ? (safeJson(r.allowed_tools) as string[]) : undefined, preserveThinking: r.preserve_thinking === 1, createdAt: r.created_at, updatedAt: r.updated_at }
 }
 
 function rowToFolder(r: FolderRow): Folder {
@@ -337,12 +450,24 @@ function rowToAgentRun(r: AgentRunRow): AgentRun {
     startedAt: r.started_at ?? undefined, endedAt: r.ended_at ?? undefined,
     archivedAt: r.archived_at ?? undefined,
     completion: (r.completion as AgentRun['completion']) ?? undefined,
+    repoRoot: r.repo_root ?? undefined,
+    repoBranch: r.repo_branch ?? undefined,
+    useWorktree: r.use_worktree === null ? undefined : r.use_worktree === 1,
+    worktreeBranch: r.worktree_branch ?? undefined,
+    worktreeBase: r.worktree_base ?? undefined,
+    linesAdded: r.lines_added ?? undefined,
+    linesRemoved: r.lines_removed ?? undefined,
+    compactionSummary: r.compaction_summary ?? undefined,
+    compactionUpToMessageId: r.compaction_upto_message_id ?? undefined,
+    compactionTokensBefore: r.compaction_tokens_before ?? undefined,
+    clearedUpToMessageId: r.cleared_upto_message_id ?? undefined,
   }
 }
 
 function rowToMsg(r: MsgRow): Message {
   const msg: Message = { id: r.id, convId: r.conv_id, seq: r.seq, role: r.role, content: r.content, reasoning: r.reasoning, attachments: safeJson(r.attachments) as string[], textAttachments: r.text_attachments ? safeJson(r.text_attachments) as string[] : [], toolCalls: r.tool_calls ? safeJson(r.tool_calls) as ToolCallRecord[] : [], stats: safeJson(r.stats) as Partial<MessageStats>, createdAt: r.created_at, variantGroup: r.variant_group, isActive: r.is_active !== 0, branchOf: r.branch_of, edited: r.edited === 1 }
   if (r.research_meta) msg.researchMeta = safeJson(r.research_meta) as ResearchMeta
+  if (r.timeline) msg.timeline = safeJson(r.timeline) as MessageTimelineBlock[]
   return msg
 }
 
@@ -655,6 +780,52 @@ export class ConversationStore {
         PRAGMA user_version = 27;
       `)
     }
+    // v28 (Code, real pi-SDK agent): a 'code'-kind run stores the scratch/repo folder it
+    // runs against (the pi cwd + containment root), the sidebar branch label, and the
+    // composer's worktree intent (captured but NOT acted on in Phase 1). Diff stat columns
+    // default to 0 for Phase 1. All additive + nullable — existing agent_runs rows get NULL
+    // and are decoded as undefined in rowToAgentRun (non-breaking). hasColumn-guarded because
+    // this branch's migration ladder has been renumbered before (see hasColumn's comment).
+    if (v < 28) {
+      if (!this.hasColumn('agent_runs', 'repo_root'))       this.db.exec(`ALTER TABLE agent_runs ADD COLUMN repo_root TEXT;`)
+      if (!this.hasColumn('agent_runs', 'repo_branch'))     this.db.exec(`ALTER TABLE agent_runs ADD COLUMN repo_branch TEXT;`)
+      if (!this.hasColumn('agent_runs', 'use_worktree'))    this.db.exec(`ALTER TABLE agent_runs ADD COLUMN use_worktree INTEGER;`)
+      if (!this.hasColumn('agent_runs', 'worktree_branch')) this.db.exec(`ALTER TABLE agent_runs ADD COLUMN worktree_branch TEXT;`)
+      if (!this.hasColumn('agent_runs', 'worktree_base'))   this.db.exec(`ALTER TABLE agent_runs ADD COLUMN worktree_base TEXT;`)
+      if (!this.hasColumn('agent_runs', 'lines_added'))     this.db.exec(`ALTER TABLE agent_runs ADD COLUMN lines_added INTEGER;`)
+      if (!this.hasColumn('agent_runs', 'lines_removed'))   this.db.exec(`ALTER TABLE agent_runs ADD COLUMN lines_removed INTEGER;`)
+      this.db.exec(`PRAGMA user_version = 28;`)
+    }
+    // v29 (Code, manual /compact): one active compaction per session — a summary plus the last
+    // DB message id it covers. Not incremental (a second /compact re-summarizes everything up
+    // to that point again, replacing the old summary), which keeps seedPriorHistory's replay
+    // logic (code-session.ts) simple: at most one summary entry, then raw messages after it.
+    if (v < 29) {
+      if (!this.hasColumn('agent_runs', 'compaction_summary'))          this.db.exec(`ALTER TABLE agent_runs ADD COLUMN compaction_summary TEXT;`)
+      if (!this.hasColumn('agent_runs', 'compaction_upto_message_id'))  this.db.exec(`ALTER TABLE agent_runs ADD COLUMN compaction_upto_message_id TEXT;`)
+      if (!this.hasColumn('agent_runs', 'compaction_tokens_before'))    this.db.exec(`ALTER TABLE agent_runs ADD COLUMN compaction_tokens_before INTEGER;`)
+      this.db.exec(`PRAGMA user_version = 29;`)
+    }
+    // v30 (Code, /clear + /resume): a soft "clear chat" marker — the last DB message id
+    // covered by a clear, mirroring compaction_upto_message_id's shape but with no summary
+    // text (a clear is a blank slate, not a summarized carry-forward). Null = never cleared,
+    // or resumed back from one. resolveEffectiveHistory (code-session.ts) takes whichever of
+    // this and the compaction cut point is later in the message sequence.
+    if (v < 30) {
+      if (!this.hasColumn('agent_runs', 'cleared_upto_message_id')) this.db.exec(`ALTER TABLE agent_runs ADD COLUMN cleared_upto_message_id TEXT;`)
+      this.db.exec(`PRAGMA user_version = 30;`)
+    }
+    // v31 (Code, founder-reported gap 2026-07-13, item 6): an ordered text/tool-call timeline
+    // for assistant messages, so a completed Code turn can render in TRUE chronological order
+    // instead of today's fixed "reasoning → all tool calls grouped → final text" layout — the
+    // persisted `content`+`toolCalls` shape has no interleave-position marker to reconstruct from.
+    // JSON array of {type:'text',text} | {type:'tool',id} blocks (tool blocks reference an id in
+    // `toolCalls` rather than duplicating it). Nullable — existing rows get NULL and the UI falls
+    // back to the pre-fix grouped rendering for them (non-breaking, no backfill).
+    if (v < 31) {
+      if (!this.hasColumn('messages', 'timeline')) this.db.exec(`ALTER TABLE messages ADD COLUMN timeline TEXT;`)
+      this.db.exec(`PRAGMA user_version = 31;`)
+    }
   }
 
   listConversations(q?: string, kind: 'chat' | 'agent' | 'all' = 'all'): Conversation[] {
@@ -763,12 +934,13 @@ export class ConversationStore {
     return row ? rowToMsg(row) : null
   }
 
-  updateMessage(id: string, patch: Partial<Pick<Message, 'content' | 'reasoning' | 'toolCalls' | 'stats' | 'researchMeta' | 'edited'>>): boolean {
+  updateMessage(id: string, patch: Partial<Pick<Message, 'content' | 'reasoning' | 'toolCalls' | 'timeline' | 'stats' | 'researchMeta' | 'edited'>>): boolean {
     const sets: string[] = []
     const params: Record<string, SQLInputValue> = { $id: id }
     if (patch.content      !== undefined) { sets.push('content = $content');         params.$content      = patch.content }
     if (patch.reasoning    !== undefined) { sets.push('reasoning = $reasoning');     params.$reasoning    = patch.reasoning }
     if (patch.toolCalls    !== undefined) { sets.push('tool_calls = $tc');           params.$tc           = JSON.stringify(patch.toolCalls) }
+    if (patch.timeline     !== undefined) { sets.push('timeline = $tl');             params.$tl           = JSON.stringify(patch.timeline) }
     if (patch.stats        !== undefined) { sets.push('stats = $stats');             params.$stats        = JSON.stringify(patch.stats) }
     if (patch.researchMeta !== undefined) { sets.push('research_meta = $rm');        params.$rm           = JSON.stringify(patch.researchMeta) }
     if (patch.edited       !== undefined) { sets.push('edited = $edited');           params.$edited       = patch.edited ? 1 : 0 }
@@ -819,16 +991,6 @@ export class ConversationStore {
         firstMessageAt: null, lifetimeTotalTokens: 0, milestone: { achieved: null, next: null, progressPct: null },
         activity: { granularityHours: 24, buckets: [] }, dailyByModel: [], byModel: [],
       }
-    }
-
-    const dayKey = (iso: string) => {
-      const d = new Date(iso)
-      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
-    }
-    const addDays = (key: string, n: number) => {
-      const [y, m, d] = key.split('-').map(Number)
-      const dt = new Date(y, m - 1, d + n)
-      return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`
     }
 
     // Per-local-day totals across the FULL history — needed for the lifetime streaks
@@ -989,6 +1151,103 @@ export class ConversationStore {
     }
   }
 
+  /** Code launchpad's "Coding activity" stats — real numbers, replacing code-mock.ts's
+   *  CODE_STATS/mockSessionDays (which were always fake). Mirrors tokenUsageStats' own
+   *  day-bucket/streak/range pattern closely (dayKey/addDays are the same shared helpers) —
+   *  everything computed fresh from agent_runs + messages on each call, not from a maintained
+   *  running counter, so it's always internally consistent with whatever data actually exists. */
+  codeStats(range: CodeStatsRange = 'all'): CodeStatsResult {
+    const runs = this.db.prepare(`
+      SELECT ar.id, ar.status, ar.created_at, c.model_key
+      FROM agent_runs ar JOIN conversations c ON c.id = ar.conv_id
+      WHERE c.kind = 'code'
+      ORDER BY ar.created_at ASC
+    `).all() as unknown as { id: string; status: string; created_at: string; model_key: string }[]
+
+    if (runs.length === 0) {
+      return {
+        range, sessions: 0, tasksShipped: 0, filesTouched: 0, diffAdded: 0, diffRemoved: 0,
+        activeDays: 0, currentStreak: 0, longestStreak: 0, favoriteModel: null, heatmap: [],
+      }
+    }
+
+    // Per-local-day run counts across the FULL history — needed for lifetime streaks
+    // regardless of `range`, and reused below for the heatmap window.
+    const dayBuckets = new Map<string, number>()
+    for (const r of runs) {
+      const key = dayKey(r.created_at)
+      dayBuckets.set(key, (dayBuckets.get(key) ?? 0) + 1)
+    }
+    const firstKey = dayKey(runs[0].created_at)
+    const todayKey = dayKey(new Date().toISOString())
+
+    let longestStreak = 0, run = 0
+    for (let key = firstKey; key <= todayKey; key = addDays(key, 1)) {
+      if (dayBuckets.has(key)) { run++; longestStreak = Math.max(longestStreak, run) } else { run = 0 }
+    }
+    let currentStreak = 0
+    {
+      // Grace period: if today has no session yet, the streak isn't broken until tomorrow.
+      let key = dayBuckets.has(todayKey) ? todayKey : addDays(todayKey, -1)
+      while (key >= firstKey && dayBuckets.has(key)) { currentStreak++; key = addDays(key, -1) }
+    }
+
+    const minAllStart = addDays(todayKey, -179)
+    const heatStart = range === 'all'
+      ? (firstKey < minAllStart ? firstKey : minAllStart)
+      : addDays(todayKey, -(RANGE_WINDOW_DAYS[range] - 1))
+
+    const scopedRuns = range === 'all' ? runs : runs.filter((r) => dayKey(r.created_at) >= heatStart)
+
+    const modelTally = new Map<string, number>()
+    let tasksShipped = 0
+    const activeDaySet = new Set<string>()
+    for (const r of scopedRuns) {
+      if (r.status === 'done') tasksShipped++
+      if (r.model_key) modelTally.set(r.model_key, (modelTally.get(r.model_key) ?? 0) + 1)
+      activeDaySet.add(dayKey(r.created_at))
+    }
+    let favoriteModelKey: string | null = null, favoriteCount = -1
+    for (const [k, n] of modelTally) if (n > favoriteCount) { favoriteModelKey = k; favoriteCount = n }
+
+    const heatmap: CodeStatsDay[] = []
+    for (let key = heatStart; key <= todayKey; key = addDays(key, 1)) {
+      heatmap.push({ date: key, sessions: dayBuckets.get(key) ?? 0 })
+    }
+
+    // filesTouched + diffAdded/diffRemoved: scoped by each MESSAGE's own created_at (when the
+    // tool call actually ran), not the owning run's — a long session's later turns land on a
+    // later day than its first message, so this is the more honest scoping of the two.
+    const msgRows = this.db.prepare(`
+      SELECT m.created_at, m.tool_calls FROM messages m JOIN conversations c ON c.id = m.conv_id
+      WHERE c.kind = 'code' AND m.role = 'assistant' AND m.tool_calls IS NOT NULL
+    `).all() as unknown as { created_at: string; tool_calls: string }[]
+
+    const filePaths = new Set<string>()
+    let diffAdded = 0, diffRemoved = 0
+    for (const r of msgRows) {
+      if (range !== 'all' && dayKey(r.created_at) < heatStart) continue
+      const calls = safeJson(r.tool_calls) as ToolCallRecord[] | undefined
+      if (!Array.isArray(calls)) continue
+      for (const tc of calls) {
+        const path = typeof tc.args?.path === 'string' ? tc.args.path : undefined
+        if (path && (tc.name === 'edit' || tc.name === 'write')) filePaths.add(path)
+        if (tc.name === 'edit' && tc.diff) {
+          const { add, del } = countDiffLines(tc.diff)
+          diffAdded += add
+          diffRemoved += del
+        }
+      }
+    }
+
+    return {
+      range, sessions: scopedRuns.length, tasksShipped, filesTouched: filePaths.size,
+      diffAdded, diffRemoved, activeDays: activeDaySet.size, currentStreak, longestStreak,
+      favoriteModel: favoriteModelKey ? titleCaseModelName(favoriteModelKey) : null,
+      heatmap,
+    }
+  }
+
   /** Active branch only — matches getMessages(). Used to find "the last thing the user
    *  currently sees" (e.g. to decide whether a fresh assistant placeholder follows it). */
   getLastMessage(convId: string): Message | null {
@@ -1097,12 +1356,26 @@ export class ConversationStore {
 
   // ── Agent run methods (v8 migration) ──────────────────────────────────────
 
-  createAgentRun(params: { convId: string; title: string; allowedTools: string[]; agentId?: string }): AgentRun {
+  createAgentRun(params: { convId: string; title: string; allowedTools: string[]; agentId?: string; repoRoot?: string; repoBranch?: string; useWorktree?: boolean; worktreeBranch?: string; worktreeBase?: string }): AgentRun {
     const id = randomUUID()
     const now = new Date().toISOString()
     const agentId = params.agentId ?? null
-    this.db.prepare(`INSERT INTO agent_runs (id,conv_id,title,status,allowed_tools,agent_id,created_at,updated_at) VALUES ($id,$cid,$title,'queued',$at,$aid,$now,$now)`)
-      .run({ $id: id, $cid: params.convId, $title: params.title, $at: JSON.stringify(params.allowedTools), $aid: agentId, $now: now } as P)
+    // Code runs carry repo/worktree metadata (v28); background 'agent' runs pass none of it
+    // and every code column is written NULL (byte-identical to the pre-v28 insert for them).
+    this.db.prepare(`INSERT INTO agent_runs (id,conv_id,title,status,allowed_tools,agent_id,repo_root,repo_branch,use_worktree,worktree_branch,worktree_base,lines_added,lines_removed,created_at,updated_at) VALUES ($id,$cid,$title,'queued',$at,$aid,$rr,$rb,$uw,$wb,$wbase,$la,$lr,$now,$now)`)
+      .run({
+        $id: id, $cid: params.convId, $title: params.title, $at: JSON.stringify(params.allowedTools), $aid: agentId,
+        $rr: params.repoRoot ?? null,
+        $rb: params.repoBranch ?? null,
+        $uw: params.useWorktree === undefined ? null : (params.useWorktree ? 1 : 0),
+        $wb: params.worktreeBranch ?? null,
+        $wbase: params.worktreeBase ?? null,
+        // Phase 1: diff stats are not computed yet — seed a code run's counters at 0 so the
+        // sidebar shows +0/-0 rather than a blank; a background 'agent' run leaves them NULL.
+        $la: params.repoRoot !== undefined ? 0 : null,
+        $lr: params.repoRoot !== undefined ? 0 : null,
+        $now: now,
+      } as P)
     return this.getAgentRun(id)!
   }
 
@@ -1121,7 +1394,7 @@ export class ConversationStore {
     return (this.db.prepare(`SELECT * FROM agent_runs ORDER BY created_at DESC LIMIT 200`).all() as unknown as AgentRunRow[]).map(rowToAgentRun)
   }
 
-  updateAgentRun(id: string, patch: Partial<Pick<AgentRun, 'status' | 'error' | 'startedAt' | 'endedAt'>>): boolean {
+  updateAgentRun(id: string, patch: Partial<Pick<AgentRun, 'status' | 'error' | 'startedAt' | 'endedAt' | 'title' | 'compactionSummary' | 'compactionUpToMessageId' | 'compactionTokensBefore'>>): boolean {
     const now = new Date().toISOString()
     const sets: string[] = ['updated_at = $now']
     const params: Record<string, SQLInputValue> = { $id: id, $now: now }
@@ -1129,7 +1402,44 @@ export class ConversationStore {
     if (patch.error     !== undefined) { sets.push('error = $error');        params.$error   = patch.error }
     if (patch.startedAt !== undefined) { sets.push('started_at = $started'); params.$started = patch.startedAt }
     if (patch.endedAt   !== undefined) { sets.push('ended_at = $ended');     params.$ended   = patch.endedAt }
+    if (patch.title     !== undefined) { sets.push('title = $title');       params.$title   = patch.title }
+    if (patch.compactionSummary        !== undefined) { sets.push('compaction_summary = $csum');    params.$csum = patch.compactionSummary }
+    if (patch.compactionUpToMessageId  !== undefined) { sets.push('compaction_upto_message_id = $cupto'); params.$cupto = patch.compactionUpToMessageId }
+    if (patch.compactionTokensBefore   !== undefined) { sets.push('compaction_tokens_before = $ctok'); params.$ctok = patch.compactionTokensBefore }
     return ((this.db.prepare(`UPDATE agent_runs SET ${sets.join(', ')} WHERE id = $id`).run(params) as unknown) as Changes).changes > 0
+  }
+
+  // ── Code session lifecycle (archive/delete/clear) ───────────────────────────
+
+  /** Archive or unarchive a Code session — a separate, single-purpose setter (not folded into
+   *  updateAgentRun's patch) because `archivedAt` needs to be explicitly CLEARABLE (unarchive),
+   *  which updateAgentRun's `!== undefined` convention can't express for a nullable field. */
+  setAgentRunArchived(id: string, archived: boolean): boolean {
+    const now = new Date().toISOString()
+    return ((this.db.prepare(`UPDATE agent_runs SET archived_at = $at, updated_at = $now WHERE id = $id`)
+      .run({ $id: id, $at: archived ? now : null, $now: now } as P) as unknown) as Changes).changes > 0
+  }
+
+  /** Set or clear (`null`) a Code session's /clear cut point — see AgentRun.clearedUpToMessageId. */
+  setClearedUpToMessageId(id: string, messageId: string | null): boolean {
+    const now = new Date().toISOString()
+    return ((this.db.prepare(`UPDATE agent_runs SET cleared_upto_message_id = $mid, updated_at = $now WHERE id = $id`)
+      .run({ $id: id, $mid: messageId, $now: now } as P) as unknown) as Changes).changes > 0
+  }
+
+  /** Permanently delete a Code session: its messages, working doc, and the agent_run +
+   *  conversation rows. There is no FK cascade on these tables (each is deleted explicitly,
+   *  same as chat's own conversation delete never cascaded to messages) — miss one and it's
+   *  an orphaned row, not a crash, but still worth getting right. Returns false if the run
+   *  didn't exist. */
+  deleteCodeSession(runId: string): boolean {
+    const run = this.getAgentRun(runId)
+    if (!run) return false
+    this.db.prepare(`DELETE FROM messages WHERE conv_id = $cid`).run({ $cid: run.convId } as P)
+    this.db.prepare(`DELETE FROM agent_run_docs WHERE run_id = $id`).run({ $id: runId } as P)
+    this.db.prepare(`DELETE FROM agent_runs WHERE id = $id`).run({ $id: runId } as P)
+    this.db.prepare(`DELETE FROM conversations WHERE id = $cid`).run({ $cid: run.convId } as P)
+    return true
   }
 
   // ── Hitman layer (spec 13 §§12-15) ─────────────────────────────────────────
