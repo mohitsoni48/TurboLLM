@@ -24,15 +24,15 @@ type VendorGpu = { name: string; vramMb: number; vendor: string }
  *  hardware.ts`) for use as the raw-sysinfo fallback on the Engines screen: before the
  *  `/recommendation` query resolves (or if it errors, since that query never retries), the
  *  hero must not regress to a single un-summed card's VRAM on a multi-GPU box. */
-export function primaryVendorSummary(gpus: VendorGpu[]): { gpuName: string | null; vramMb: number } {
-  if (!gpus.length) return { gpuName: null, vramMb: 0 }
+export function primaryVendorSummary(gpus: VendorGpu[]): { gpuName: string | null; vramMb: number; count: number } {
+  if (!gpus.length) return { gpuName: null, vramMb: 0, count: 0 }
   let vendor = 'unknown'
   for (const g of gpus) if ((VENDOR_RANK[g.vendor] ?? 1) > (VENDOR_RANK[vendor] ?? 1)) vendor = g.vendor
   const ofVendor = gpus.filter((g) => g.vendor === vendor)
   const pool = ofVendor.length ? ofVendor : gpus
   const headline = pool.reduce<VendorGpu | undefined>((best, g) => (!best || g.vramMb > best.vramMb ? g : best), undefined)
   const vramMb = ofVendor.reduce((sum, g) => sum + g.vramMb, 0)
-  return { gpuName: headline?.name ?? null, vramMb }
+  return { gpuName: headline?.name ?? null, vramMb, count: pool.length }
 }
 
 function kvBytesPerElem(t: string): number {

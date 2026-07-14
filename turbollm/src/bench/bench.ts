@@ -17,7 +17,7 @@ import type { Manager, StartOpts } from '../engines/manager'
 import type { Registry } from '../engines/registry'
 import type { Engine } from '../config/config'
 import type { Scanner, ModelEntry } from '../models/scanner'
-import { deriveDefault, profileToArgs, resolveProfile, type LoadProfile } from '../models/profile'
+import { deriveDefault, estimateVram, gpuBudgetMb, profileToArgs, resolveProfile, type GpuProfile, type LoadProfile } from '../models/profile'
 import { getSysInfo, type SysInfo } from '../sysinfo/sysinfo'
 import type { HfClient } from '../hf/hf'
 import { inferRepoFromPath } from '../api/path-utils'
@@ -344,27 +344,48 @@ export class BenchRunner {
     //   • big KV → a smaller quant frees real VRAM for more of the model on the GPU, but its kernel
     //     can be slower (turbo4), so tune BOTH the smallest (max-fit) and q8_0 (stock fallback) and
     //     let the measured prefill + t/s decide.
-    const kvCandidates = pickKvQuants(baseProfile.kvTypeK, caps.kvTypes)
-    // Default to the user's own KV type (covers CPU-only — no VRAM pressure, the quant barely
-    // matters — and unprobed/single-candidate engines). Only with a GPU and a real choice do we
-    // size the cache and decide.
-    let kvToTune = kvCandidates.slice(0, 1)
-    if (sys.gpus.length > 0 && kvCandidates.length > 1) {
-      const spread = await this.calibrateKvSpread(entry, sys, baseProfile, caps, kvCandidates, results)
-      kvToTune = decideKvToBench(spread, kvCandidates)
-      const swing = spread < 0 ? 'unknown' : spread >= Number.MAX_SAFE_INTEGER ? 'huge' : `${Math.round(spread)} MB`
-      this.state = { ...this.state, step: `KV cache swing ${swing} → tuning ${kvToTune.join(' + ')}`, candidates: results }
-      this.emit(`KV spread ${swing} → tuning ${kvToTune.join(' + ')}`)
-    }
+    // --- Choose the multi-GPU SPLIT strategy too, not just offload+KV (ADR-054) ---
+    // llama.cpp's default is an even LAYER-split across every visible GPU. But a model that fits on
+    // ONE card is almost always faster there: a layer-split runs the GPUs as a sequential pipeline
+    // (one busy at a time) and copies activations across PCIe every token, so on a fits-on-one model
+    // it's strictly slower than single-GPU — the reported "dual-GPU is slower than my single GPU".
+    // So on a >1-GPU box we tune single-GPU (when the model plausibly fits one card, even only with
+    // the smallest quality KV) FIRST, then the layer-split, and let measured t/s pick. A single-GPU
+    // box or a split-incapable engine yields exactly one strategy → unchanged behavior. (Row-split
+    // is a deliberate follow-up: its per-layer all-reduce rarely pays off on PCIe-only multi-GPU.)
+    const splitStrategies = pickSplitStrategies(entry, sys, baseProfile, caps)
+    for (const gpu of splitStrategies) {
+      if (this.cancelled || Date.now() > this.deadline) break
+      const splitBase: LoadProfile = { ...baseProfile, gpu }
+      if (splitStrategies.length > 1) {
+        const label = splitLabel(gpu, sys.gpus.length)
+        this.state = { ...this.state, step: `Trying ${label}…`, candidates: results }
+        this.emit(`split strategy → ${label}`)
+      }
 
-    for (let i = 0; i < kvToTune.length && !this.cancelled && Date.now() <= this.deadline; i++) {
-      const kv = kvToTune[i]
-      const kvBase: LoadProfile = { ...baseProfile, kvTypeK: kv, kvTypeV: kv }
-      const found = entry.moe
-        ? await this.moeSearch(entry, sys, kvBase, caps, results, headroomMb)
-        : await this.denseSearch(entry, sys, kvBase, caps, results, headroomMb)
-      if (found && (!best || betterBySpeed(found.cand, best.cand))) best = found
-      if (best) this.state = { ...this.state, bestTps: best.cand.tps ?? undefined }
+      // Decide which KV quant(s) to tune UNDER THIS split: the VRAM budget differs (one card vs the
+      // summed pool), so single-GPU may need turbo4 to fit where a layer-split is fine at f16.
+      // Default to the user's own KV type (covers CPU-only — no VRAM pressure — and unprobed/single-
+      // candidate engines). Only with a GPU and a real choice do we size the cache and decide.
+      const kvCandidates = pickKvQuants(splitBase.kvTypeK, caps.kvTypes)
+      let kvToTune = kvCandidates.slice(0, 1)
+      if (sys.gpus.length > 0 && kvCandidates.length > 1) {
+        const spread = await this.calibrateKvSpread(entry, sys, splitBase, caps, kvCandidates, results)
+        kvToTune = decideKvToBench(spread, kvCandidates)
+        const swing = spread < 0 ? 'unknown' : spread >= Number.MAX_SAFE_INTEGER ? 'huge' : `${Math.round(spread)} MB`
+        this.state = { ...this.state, step: `KV cache swing ${swing} → tuning ${kvToTune.join(' + ')}`, candidates: results }
+        this.emit(`KV spread ${swing} → tuning ${kvToTune.join(' + ')}`)
+      }
+
+      for (let i = 0; i < kvToTune.length && !this.cancelled && Date.now() <= this.deadline; i++) {
+        const kv = kvToTune[i]
+        const kvBase: LoadProfile = { ...splitBase, kvTypeK: kv, kvTypeV: kv }
+        const found = entry.moe
+          ? await this.moeSearch(entry, sys, kvBase, caps, results, headroomMb)
+          : await this.denseSearch(entry, sys, kvBase, caps, results, headroomMb)
+        if (found && (!best || betterBySpeed(found.cand, best.cand))) best = found
+        if (best) this.state = { ...this.state, bestTps: best.cand.tps ?? undefined }
+      }
     }
 
     // Engine is always left stopped at the end of a run (AC#3 for cancel; also tidy
@@ -458,6 +479,10 @@ export class BenchRunner {
     let bestNgl: number | null = 0 // CPU-only box → everything on CPU, no probing needed.
 
     if (sys.gpus.length > 0) {
+      // The VRAM this split is allowed to use: all cards for a layer/row split, ONE card for a
+      // single-GPU 'none' split (ADR-054). The headroom gate must judge against THIS, not the summed
+      // pool — else a 14 GB single-GPU load looks safe against a 30 GB total when it's at one card's edge.
+      const budgetMb = gpuBudgetMb(sys, base)
       // Binary search ngl ∈ [0, blockCount] for the HIGHEST that loads with enough headroom VRAM.
       const hi0 = entry.blockCount > 0 ? entry.blockCount : 99
       let lo = 0, hi = hi0
@@ -468,7 +493,7 @@ export class BenchRunner {
         const probe = await this.probeVram(entry, sys, { ...base, ngl: mid }, caps)
         this.pushProbe(results, base, 'ngl', mid, probe)
         await this.settleGpu()
-        if (probe.outcome === 'ok' && !overHeadroom(probe.vramAbsMb, sys, headroomMb)) {
+        if (probe.outcome === 'ok' && !overHeadroom(probe.vramAbsMb, budgetMb, headroomMb)) {
           bestNgl = mid // fits with headroom → record, try MORE GPU layers
           lo = mid + 1
         } else {
@@ -498,6 +523,8 @@ export class BenchRunner {
 
     const derived = deriveDefault(entry, sys)
     const maxN = entry.blockCount > 0 ? entry.blockCount : (derived.nCpuMoe || 0)
+    // VRAM budget for THIS split (one card for single-GPU 'none', summed pool otherwise) — see denseSearch.
+    const budgetMb = gpuBudgetMb(sys, base)
     let lo = 0, hi = maxN
     let bestN: number | null = null
 
@@ -507,7 +534,7 @@ export class BenchRunner {
       const probe = await this.probeVram(entry, sys, { ...base, nCpuMoe: mid }, caps)
       this.pushProbe(results, base, 'nCpuMoe', mid, probe)
       await this.settleGpu()
-      if (probe.outcome === 'oom' || overHeadroom(probe.vramAbsMb, sys, headroomMb)) {
+      if (probe.outcome === 'oom' || overHeadroom(probe.vramAbsMb, budgetMb, headroomMb)) {
         lo = mid + 1 // too much on GPU → more CPU experts to free VRAM / restore the headroom
       } else if (probe.outcome === 'ok') {
         bestN = mid // fits with headroom → record, try FEWER CPU experts (more on GPU)
@@ -1159,18 +1186,64 @@ function benchPromptTokens(ctx: number): number {
   return Math.max(256, Math.min(8_192, Math.floor(ctx * 0.75)))
 }
 
-/** Total dedicated VRAM across all GPUs, MB (0 when none / non-NVIDIA). */
-function totalVramMb(sys: SysInfo): number {
-  return sys.gpus.reduce((s, g) => s + (g.vramMb || 0), 0)
+/** True when a candidate's ABSOLUTE VRAM use leaves less than `headroomMb` free within `budgetMb`
+ *  — the VRAM this profile is allowed to use: the summed pool for a layer/row split, or a SINGLE
+ *  card for a single-GPU 'none' split (ADR-054; `gpuBudgetMb`). The search then offloads more so
+ *  the chosen config keeps a safety margin against a later desktop / ComfyUI VRAM grab. Unknown
+ *  VRAM (non-NVIDIA) or no budget → never blocks. */
+export function overHeadroom(vramAbsMb: number | null, budgetMb: number, headroomMb: number): boolean {
+  if (!vramAbsMb || budgetMb <= 0) return false
+  return vramAbsMb > budgetMb - headroomMb
 }
 
-/** True when a candidate's ABSOLUTE VRAM use leaves less than `headroomMb` free — i.e. it's too
- *  close to the spill edge. The search then offloads more so the chosen config keeps a safety
- *  margin against a later desktop / ComfyUI VRAM grab. Unknown VRAM (non-NVIDIA) → never blocks. */
-function overHeadroom(vramAbsMb: number | null, sys: SysInfo, headroomMb: number): boolean {
-  const total = totalVramMb(sys)
-  if (!vramAbsMb || total <= 0) return false
-  return vramAbsMb > total - headroomMb
+/** Which multi-GPU split strategies auto-tune should try, in search order (ADR-054). A single-GPU
+ *  box — or an engine whose probe didn't confirm the split flags — yields just the profile's own gpu
+ *  setting (one strategy → unchanged behavior). A >1-GPU box returns single-GPU FIRST (the whole
+ *  model on one card, offered when it plausibly fits even with the smallest quality-preserving KV
+ *  quant, which the inner sweep can then pick) and the profile's split (default: layer across all)
+ *  second. Single-GPU is tried first because, when the model fits one card, it beats any split (a
+ *  layer-split is a sequential cross-GPU pipeline + per-token PCIe activation copies), so a
+ *  budget-truncated run still measured the likely winner. */
+export function pickSplitStrategies(
+  entry: ModelEntry,
+  sys: SysInfo,
+  base: LoadProfile,
+  caps: Engine['capabilities'],
+): GpuProfile[] {
+  const has = (flag: string) => caps.flags.length === 0 || caps.flags.includes(flag)
+  if (sys.gpus.length <= 1 || !has('--split-mode') || !has('--main-gpu')) return [base.gpu]
+
+  const strategies: GpuProfile[] = []
+  // Single-GPU: whole model on one card. Judge feasibility with the SMALLEST quality-preserving KV
+  // the engine offers (the inner KV sweep can pick it to fit), so a model that only fits one card
+  // with turbo4 still gets the single-GPU branch it would win on.
+  const kvOpts = pickKvQuants(base.kvTypeK, caps.kvTypes)
+  const bestFitKv = kvOpts.reduce((a, b) => (kvBytes(b) < kvBytes(a) ? b : a), kvOpts[0] ?? base.kvTypeK)
+  const mainGpu = base.gpu.mainGpu >= 0 ? base.gpu.mainGpu : 0
+  const single: GpuProfile = { ...base.gpu, splitMode: 'none', mainGpu, tensorSplit: [] }
+  const singleFits =
+    estimateVram({ ...base, gpu: single, kvTypeK: bestFitKv, kvTypeV: bestFitKv }, entry, sys).verdict !== 'overflow'
+  if (singleFits) strategies.push(single)
+
+  // The profile's current split (default: layer across all GPUs) — always kept, as the fallback for
+  // models too big for one card and so a tuned result can never be worse than today's default.
+  strategies.push(base.gpu)
+
+  // De-dup by the fields that actually reach the launch args (e.g. the user already pinned 'none').
+  const seen = new Set<string>()
+  return strategies.filter((g) => {
+    const key = `${g.splitMode}|${g.mainGpu >= 0 ? g.mainGpu : 0}|${g.tensorSplit.join(',')}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+/** Human-readable label for a split strategy, for the live step / bench log. */
+function splitLabel(g: GpuProfile, gpuCount: number): string {
+  if (g.splitMode === 'none') return `single-GPU (GPU ${g.mainGpu >= 0 ? g.mainGpu : 0})`
+  if (g.splitMode === 'row') return `row-split across ${gpuCount} GPUs`
+  return `layer-split across ${gpuCount} GPUs`
 }
 
 /** The quality-preserving KV-cache types to try, in search order. The model's current/base type
