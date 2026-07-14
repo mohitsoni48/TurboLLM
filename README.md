@@ -236,6 +236,35 @@ the detail:
   in chat (name, preferences, hardware) using your own loaded model, and carries them into future
   new conversations. Nothing leaves your device; the full fact list is reviewable and deletable
   from Settings → Memory, and turning the toggle off stops new chats from seeing it immediately.
+- **Thinking-budget control** — a graduated slider, not just on/off: cap reasoning to a specific
+  token count, disable it entirely, or leave it unlimited. Works in Chat and Code alike.
+
+</details>
+
+<details>
+<summary><strong>🧑‍💻 Code — a local coding agent, in a real project directory</strong></summary>
+<em>(experimental, off by default — Settings → Experimental)</em>
+
+<br/>
+
+Workspace → Code hands a task to an agent running on the same model you already have loaded —
+point it at a repo folder, describe what you want, and it reads, edits, and runs commands to get
+there. Entirely local; nothing leaves your machine.
+
+- **Real repo access** — plans and edits end-to-end (or asks before mutating, or plan-only,
+  depending on mode), with an optional isolated git worktree so your actual checkout stays
+  untouched, and a real diff summary of what changed.
+- **Persistent sessions** — archive/filter past runs, revert to any earlier message (with
+  optional real file-edit reversal), attach files as context, and a "Coding activity" dashboard
+  (sessions, tasks shipped, files touched, diff shipped, streaks) built from real history, not
+  mock data.
+- **Real LSP integration** for TypeScript/JavaScript and Python — detects the language, installs
+  the language server if needed, and uses it for edits.
+- **The same tools Chat gets from Customize** — any connected MCP server, plus the sandboxed
+  `run_code` tool — are available to Code too, alongside honest skill invocation and
+  `AGENTS.md`/`agents.md` support.
+- **Independent access control** — gated behind its own API key on non-host devices, separate
+  from Chat's gate, and hidden entirely until you opt in from Settings → Experimental.
 
 </details>
 

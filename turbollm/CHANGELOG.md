@@ -25,6 +25,53 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.8.0] - 2026-07-14
+
+**Code — a local coding agent that reads, edits, and runs commands in a real project directory,
+entirely on your own machine — plus graduated thinking-budget control and a new Experimental
+settings section.**
+
+### Added
+- **Code** (Workspace → Code, opt-in via Settings → Experimental) — a local coding agent built on
+  the same model you already have loaded. Point it at a real repo folder (optionally in an
+  isolated git worktree so your checkout stays untouched), hand it a task, and it plans, edits
+  files, runs shell commands, and reports a real diff — all local, nothing leaves your machine.
+  - **Session workspace**: persistent sessions with archive/filters, revert-to-message (with
+    optional real file-edit reversal), "Add context" file attachments, honest skill invocation,
+    `AGENTS.md`/`agents.md` support, transcript copy, and a real "Coding activity" dashboard
+    (sessions, tasks shipped, files touched, diff shipped, streaks) — no mock data.
+  - **Real LSP integration** for TypeScript/JavaScript and Python — Code detects the language,
+    installs the language server if needed, and uses it for edits.
+  - **The same tools Chat gets from Customize** — any connected MCP server, plus the sandboxed
+    `run_code` tool — are now available to Code sessions too.
+  - **Independent API-key gating** on non-host devices, separate from Chat's own gate.
+- **Graduated thinking-budget control** (Chat and Code) — a real token-budget slider, not just an
+  on/off toggle: cap reasoning to a specific token count, turn it off entirely, or leave it
+  unlimited.
+- **Settings → Experimental** — a new opt-in section gating three still-in-progress features
+  (Code, Memory, Cloud Launch/RunPod), off by default. Disabling Code removes its entry point
+  entirely.
+
+### Fixed
+- macOS: Metal builds, Rapid-MLX, and other cross-engine parity fixes (#50).
+- Multi-GPU: the auto-tuner now tunes the actual split across cards, not just offload + KV quant
+  (#57).
+- Code: a turn could truncate to almost no output (a single reasoning token, then a hard stop)
+  whenever the prompt — system prompt plus the full tool-schema catalog — used a large enough
+  share of the loaded model's context window. Every Code turn now generates until it naturally
+  finishes or the context genuinely runs out, instead of stopping at a stale token ceiling fixed
+  at model-load time.
+- Code: context-usage % now updates live during a run and no longer drops to near-zero on an
+  aborted turn or resets to 0% right after a completed turn.
+- Code: message and tool-call order is now preserved exactly as it happened on completed turns.
+- Code: a stop hit while a turn was queued behind another generation is now recorded as a clean
+  interrupt instead of a cryptic failure.
+
+### Discord
+- **New: Code** — a local coding agent, right in TurboLLM. Point it at a project folder, describe a task, and it reads, edits, and runs commands to get it done — entirely on your own GPU. Turn it on in Settings → Experimental.
+- **New: thinking-budget slider** — dial reasoning length up, down, or off, for both Chat and Code.
+- Fixed a bug where Code could occasionally produce an empty reply on a long/tool-heavy turn instead of a real answer.
+
 ## [1.7.7] - 2026-07-10
 
 **Custom engine self-service, auto-fit GPU/MoE offload, and two real bug fixes.**
