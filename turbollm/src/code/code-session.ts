@@ -429,10 +429,15 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     const releaseSkillGate = () => { const r = skillHeldGate; skillHeldGate = undefined; r?.() }
 
     const skillExtension = (pi: ExtensionAPI): void => {
-      pi.on('before_provider_request', async () => {
+      pi.on('before_provider_request', async (event) => {
         releaseSkillGate()
         if (d.gate) skillHeldGate = await d.gate.acquire('bg', { signal })
-        return undefined
+        // Same stale-ceiling strip as the outer session's own hook above — this sub-session
+        // declares the identical maxTokens: 8192 and would otherwise forward it verbatim too.
+        const payload = { ...(event.payload as Record<string, unknown>) }
+        delete payload.max_tokens
+        delete payload.max_completion_tokens
+        return payload
       })
       pi.on('after_provider_response', () => { releaseSkillGate() })
 
@@ -1062,14 +1067,39 @@ export async function compactCodeSession(params: CompactCodeParams): Promise<Com
   seedPriorHistory(sessionManager, effectiveMessages, modelId, (piId, msgIndex) => entryTrack.push({ piId, msgIndex }))
   if (entryTrack.length === 0) throw new Error('nothing_to_compact')
 
+  // Same stale-ceiling strip as the main session's own before_provider_request hook — this
+  // compaction session declares the identical maxTokens: 8192, and runs precisely when history
+  // (hence prompt_tokens) is near the context limit, making the overflow this closes the most
+  // likely to hit here of any Code code path.
+  const compactExtension = (pi: ExtensionAPI): void => {
+    pi.on('before_provider_request', async (event) => {
+      const payload = { ...(event.payload as Record<string, unknown>) }
+      delete payload.max_tokens
+      delete payload.max_completion_tokens
+      return payload
+    })
+  }
+  const compactAgentDir = join(d.store.dir(), 'pi-agent')
+  const compactResourceLoader = new DefaultResourceLoader({
+    cwd: repoRoot,
+    agentDir: compactAgentDir,
+    settingsManager: SettingsManager.inMemory(),
+    extensionFactories: [{ name: 'turbollm-compact', factory: compactExtension }],
+    noSkills: true,
+    noPromptTemplates: true,
+    noThemes: true,
+  })
+  await compactResourceLoader.reload()
+
   const { session } = await createAgentSession({
     cwd: repoRoot,
-    agentDir: join(d.store.dir(), 'pi-agent'),
+    agentDir: compactAgentDir,
     model,
     authStorage,
     modelRegistry,
     sessionManager,
     settingsManager: SettingsManager.inMemory(),
+    resourceLoader: compactResourceLoader,
     tools: [], // pure summarization — no tool needs to run, and none should be able to.
   })
   let result: Awaited<ReturnType<typeof session.compact>>
