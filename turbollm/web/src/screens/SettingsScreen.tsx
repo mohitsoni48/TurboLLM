@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Moon, Sun, Monitor, Save, ExternalLink, ShieldAlert, RefreshCw, Check, X, Loader2, AlertTriangle, ArrowUpCircle, SlidersHorizontal, Boxes, ShieldCheck, Wifi, Cpu, ChevronRight } from 'lucide-react'
+import { Moon, Sun, Monitor, Save, ExternalLink, ShieldAlert, RefreshCw, Check, X, Loader2, AlertTriangle, ArrowUpCircle, SlidersHorizontal, Boxes, ShieldCheck, Wifi, Cpu, ChevronRight, FlaskConical } from 'lucide-react'
 import { getPersonalization, savePersonalization, type Personalization } from '../lib/personas'
 import { ScreenHeader } from '../components/common'
 import { Button } from '../components/ui/button'
@@ -23,6 +23,7 @@ import { CopyButton } from '../components/ui/copy-button'
 import { ModelDirs } from './models/ModelDirs'
 import { ToolPermissionsSection } from './settings/ToolPermissionsSection'
 import { MemorySection } from './settings/MemorySection'
+import { ExperimentalSection } from './settings/ExperimentalSection'
 
 import { ApiError, type TelemetryLevel } from '../lib/api'
 import { TELEMETRY_UI_ENABLED } from '../lib/flags'
@@ -105,13 +106,14 @@ function NumberField({
 const clampN = (n: number, min: number, max: number) => Math.max(min, Math.min(max, Math.round(n)))
 
 /** Settings categories for the two-pane layout. Each maps to one pane of sections. */
-type CatId = 'general' | 'models' | 'tools' | 'network' | 'system'
+type CatId = 'general' | 'models' | 'tools' | 'network' | 'experimental' | 'system'
 
 const SETTINGS_CATS: { id: CatId; label: string; icon: React.ElementType }[] = [
   { id: 'general', label: 'General', icon: SlidersHorizontal },
   { id: 'models', label: 'Models & loading', icon: Boxes },
   { id: 'tools', label: 'Tools & safety', icon: ShieldCheck },
   { id: 'network', label: 'Network & sharing', icon: Wifi },
+  { id: 'experimental', label: 'Experimental', icon: FlaskConical },
   { id: 'system', label: 'System', icon: Cpu },
 ]
 
@@ -396,9 +398,6 @@ export function SettingsScreen() {
               {/* Personalization */}
               <PersonalizationSection />
 
-              {/* Auto-memory (Release 3) */}
-              <MemorySection />
-
               {/* Chat */}
               <section className="rounded-lg border border-border bg-panel p-4">
                 <h2 className="mb-3 text-[13px] font-semibold uppercase tracking-wide text-faint">Chat</h2>
@@ -615,6 +614,17 @@ export function SettingsScreen() {
                 reverseGate={comfyReverseGate}
                 setReverseGate={setComfyReverseGate}
               />
+            </>
+          )}
+
+          {activeCat === 'experimental' && (
+            <>
+              {/* Code, Cloud Launch/RunPod — simple on/off rows */}
+              <ExperimentalSection />
+
+              {/* Auto-memory (Release 3) — keeps its own richer collapsible (facts list) rather
+                  than folding into ExperimentalSection's bare checkbox-row shape. */}
+              <MemorySection />
             </>
           )}
 

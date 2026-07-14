@@ -1466,6 +1466,7 @@ export function registerApi(app: Hono, d: Deps): void {
       build?: { toolchainDirs?: string[] }
       toolPolicies?: Record<string, string>
       cloudDeploy?: { runpodTemplateId?: string }
+      experimental?: { code?: boolean; cloudDeploy?: boolean }
     }>(c)
 
     const updates: Record<string, unknown> = {}
@@ -1622,6 +1623,12 @@ export function registerApi(app: Hono, d: Deps): void {
       if (b.cloudDeploy?.runpodTemplateId !== undefined) {
         cfg.cloudDeploy.runpodTemplateId = String(b.cloudDeploy.runpodTemplateId).trim()
       }
+      // Experimental feature flags (2026-07-14, Settings → Experimental): per-field merge, not
+      // Object.assign(cfg.daemon, updates) — a patch touching only one flag must not clobber
+      // the other back to whatever `updates.experimental` would otherwise silently overwrite it
+      // with (same reasoning as cloudDeploy's own per-field handling just above).
+      if (b.experimental?.code !== undefined) cfg.daemon.experimental.code = !!b.experimental.code
+      if (b.experimental?.cloudDeploy !== undefined) cfg.daemon.experimental.cloudDeploy = !!b.experimental.cloudDeploy
       // HF token (spec 10 §4): write-only. An explicit '' clears it. Never logged.
       if (b.hfToken !== undefined) cfg.hf.token = String(b.hfToken).trim()
       // Search provider config (F-020). All key/URL fields are write-only; '' clears them.
@@ -2107,6 +2114,9 @@ function settingsPayload(d: Deps) {
     build: { toolchainDirs: cfg.build.toolchainDirs },
     // Cloud Launch deploy-link settings (ADR-153): not secret — echoed back.
     cloudDeploy: cfg.cloudDeploy,
+    // Experimental feature flags (2026-07-14): not secret — echoed back for Settings →
+    // Experimental and for the frontend to decide whether to show the Code entry point at all.
+    experimental: cfg.daemon.experimental,
     // Tool-call approval gate: global per-tool policy ('ask' | 'allow' | 'deny').
     // Not secret — echoed back directly so Settings can render Tool Permissions.
     toolPolicies: cfg.tools.toolPolicies ?? {},

@@ -59,6 +59,20 @@ export interface Daemon {
    *  this builds a persistent cross-conversation profile of the user, so it's opt-in
    *  (same trust-surface posture as lanBind), not default-on. */
   autoMemoryEnabled: boolean
+  /** Experimental features (2026-07-14, preparing for wider distribution): still-in-progress
+   *  capabilities gated behind an explicit opt-in toggle in Settings → Experimental, off by
+   *  default for new/distributed installs. `autoMemoryEnabled` above predates this and keeps
+   *  its own field (no migration needed) but is surfaced in the SAME Settings tab as these. */
+  experimental: ExperimentalFeatures
+}
+export interface ExperimentalFeatures {
+  /** Gates the entire Code workspace (both the UI entry point and /api/v1/code/* itself —
+   *  see auth.ts's requireExperimentalCode). */
+  code: boolean
+  /** Gates the Cloud Launch / RunPod deploy-link surface (ADR-153's cloudDeploy config,
+   *  previously only reachable via the internal-only TURBOLLM_FEATURES=cloud-deploy env var,
+   *  features.ts — this is now the primary, user-facing way to turn it on). */
+  cloudDeploy: boolean
 }
 export interface Telemetry {
   level: string
@@ -402,6 +416,7 @@ export function defaultConfig(): Config {
       theme: 'system',
       autoGenerateTitles: true,
       autoMemoryEnabled: false,
+      experimental: { code: false, cloudDeploy: false },
     },
     telemetry: { level: 'unset', machineId: '' },
     apiKeys: [],
@@ -740,6 +755,10 @@ function normalize(c: Config): void {
   // Cloud Launch deploy-link settings (ADR-153): absent in pre-ADR-153 configs → ''.
   const cd = (c.cloudDeploy ?? {}) as Partial<CloudDeployConfig>
   c.cloudDeploy = { runpodTemplateId: typeof cd.runpodTemplateId === 'string' ? cd.runpodTemplateId.trim() : '' }
+  // Experimental feature flags (2026-07-14): absent in pre-this-decision configs → both
+  // default false, same conservative posture as autoMemoryEnabled/lanBind.
+  const ex = (c.daemon.experimental ?? {}) as Partial<ExperimentalFeatures>
+  c.daemon.experimental = { code: ex.code === true, cloudDeploy: ex.cloudDeploy === true }
   // Telemetry level (spec 09 §3): the UI exposes 'off' | 'anon' | 'full'. Migrate
   // legacy/unknown values safely → 'off' (the conservative, opt-in default).
   c.telemetry.level = normalizeTelemetryLevel(c.telemetry.level)
