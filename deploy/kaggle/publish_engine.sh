@@ -9,7 +9,9 @@
 set -uo pipefail
 
 WORK="${KAGGLE_WORKING:-/kaggle/working}"
-ENGINE_DIR="$WORK/turboquant"
+# Must match setup.sh's TURBOLLM_ENGINE_ROOT — the one-click notebook builds/copies the engine to
+# /tmp (off the /kaggle/working quota), not $WORK/turboquant.
+ENGINE_DIR="${TURBOLLM_ENGINE_ROOT:-$WORK/turboquant}"
 ENGINE_BIN="$ENGINE_DIR/build/bin/llama-server"
 OUT="$WORK/turboquant-cuda-t4.tar.gz"
 
