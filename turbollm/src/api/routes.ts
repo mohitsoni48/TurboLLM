@@ -1038,7 +1038,7 @@ export function registerApi(app: Hono, d: Deps): void {
     if (!existsSync(cwd) || !statSync(cwd).isDirectory()) {
       return c.json({ isRepo: false, branch: '', branches: [] })
     }
-    const git = (args: string[]): string => execFileSync('git', args, { cwd, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
+    const git = (args: string[]): string => execFileSync('git', args, { cwd, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000, windowsHide: true }).trim()
     try {
       // Confirms we're inside a real work tree (not just a bare/.git dir).
       if (git(['rev-parse', '--is-inside-work-tree']) !== 'true') return c.json({ isRepo: false, branch: '', branches: [] })

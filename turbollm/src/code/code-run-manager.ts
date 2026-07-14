@@ -336,7 +336,11 @@ export class CodeRunManager {
       }
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e)
-      const isAbort = (e as Error)?.name === 'AbortError'
+      // A queued turn's gate wait rejects with a plain Error (name 'Error', not 'AbortError') on
+      // both user-stop and gate timeout — see gate.ts's giveUp(new Error('gate_acquire_aborted'/
+      // 'gate_acquire_timeout')). Treat those the same as a real AbortError so a Stop hit while
+      // still queued behind another generation records a clean interrupt, not a cryptic "failed".
+      const isAbort = (e as Error)?.name === 'AbortError' || message === 'gate_acquire_aborted' || message === 'gate_acquire_timeout'
       // An abort here means runCodeSession THREW before returning any contextUsed/contextMax at
       // all — but the conversation's real context did NOT shrink (a stop/timeout doesn't erase
       // prior turns). Found live (2026-07-13): this used to hardcode contextUsed/contextMax to 0

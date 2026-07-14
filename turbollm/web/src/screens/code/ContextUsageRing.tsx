@@ -84,7 +84,7 @@ export function ContextUsageRing({ used, max }: { used: number; max: number }) {
         <SheetContent className="overflow-y-auto p-5" onPointerDownOutside={(e) => e.preventDefault()}>
           <SheetHeader>
             <SheetTitle>Context usage</SheetTitle>
-            <SheetDescription>How much of this task's context window is filled (preview — mock data).</SheetDescription>
+            <SheetDescription>How much of this task's context window is filled.</SheetDescription>
           </SheetHeader>
 
           <div className="mt-2 flex flex-col items-center gap-3 rounded-lg border border-border bg-panel-2 py-6">
