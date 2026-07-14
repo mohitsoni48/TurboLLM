@@ -552,8 +552,19 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       // (see gate.ts's own comment for the incident this fixed) rather than hanging the whole
       // turn forever with no way to cancel it.
       if (d.gate) heldGate = await d.gate.acquire('bg', { signal })
+      const payload = { ...(event.payload as Record<string, unknown>) }
+      // Strip the completion-length cap pi derives from this model's declared `maxTokens` (a
+      // fixed ceiling set once in the model metadata above, at model-load time). Sent verbatim as
+      // max_tokens/max_completion_tokens on every turn, it ignores how many tokens THIS turn's
+      // prompt already used — once prompt + that stale ceiling exceeds the loaded context window,
+      // llama.cpp stops generation almost immediately (reproduced live: a tool-schema-heavy Code
+      // prompt near a small loaded ctx produced one reasoning token then hard-stopped, aborted:
+      // false). chat-routes.ts avoids this via clampMaxTokens + deleting the field when uncapped
+      // (its own before-send step) — mirror that here so generation is bounded only by the
+      // model's real remaining context, not a number fixed before this turn's prompt existed.
+      delete payload.max_tokens
+      delete payload.max_completion_tokens
       if (thinkingBudget === 0) {
-        const payload = event.payload as Record<string, unknown>
         return {
           ...payload,
           thinking_budget_tokens: 0,
@@ -561,10 +572,9 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
         }
       }
       if (thinkingBudget > 0) {
-        const payload = event.payload as Record<string, unknown>
         return { ...payload, thinking_budget_tokens: thinkingBudget }
       }
-      return undefined // unlimited (default) — leave the payload untouched
+      return payload // unlimited (default) — still stripped of the stale max_tokens ceiling
     })
     pi.on('after_provider_response', () => { releaseGate() })
 
