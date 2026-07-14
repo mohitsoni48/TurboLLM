@@ -450,13 +450,16 @@ function EngineHeaderBar({
 
   // Hardware line — prefer the recommendation's summed hardware; fall back to the same
   // primary-vendor sum from raw sysinfo (NOT sys.gpus[0], which is the multi-GPU bug).
+  // GPU count always comes from raw sysinfo — it's the same physical GPUs either way, and
+  // the daemon's HardwareProfile doesn't carry a count, only the summed/headline fields.
   const hw = rec?.hardware
   const sysFallback = primaryVendorSummary(sys?.gpus ?? [])
   const gpuName = hw?.gpuName ?? sysFallback.gpuName
   const vramMb = hw?.vramMb ?? sysFallback.vramMb
+  const gpuCount = sysFallback.count
   const osName = hw ? platformName(hw.platform) : sys?.os.split('/')[0] ? platformName(sys.os.split('/')[0]) : ''
   const hwLine = [
-    gpuName ?? 'CPU-only',
+    gpuName ? (gpuCount > 1 ? `${gpuCount}× ${gpuName}` : gpuName) : 'CPU-only',
     vramMb > 0 ? `${(vramMb / 1024).toFixed(0)} GB` : null,
     osName || null,
   ]

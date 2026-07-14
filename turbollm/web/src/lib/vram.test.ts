@@ -14,6 +14,7 @@ test('primaryVendorSummary: dual-GPU VRAM is summed, not just gpus[0]', () => {
   const summary = primaryVendorSummary(gpus)
   assert.equal(summary.vramMb, 32768, 'two 16GB cards pool to 32GB, not one card\'s 16GB')
   assert.equal(summary.gpuName, 'NVIDIA GeForce RTX 5060 Ti')
+  assert.equal(summary.count, 2, 'dual-GPU boxes must report a count so the UI can show "2×"')
 })
 
 test('primaryVendorSummary: an Intel iGPU alongside an NVIDIA dGPU is excluded from the sum', () => {
@@ -24,10 +25,12 @@ test('primaryVendorSummary: an Intel iGPU alongside an NVIDIA dGPU is excluded f
   const summary = primaryVendorSummary(gpus)
   assert.equal(summary.vramMb, 12288, 'the iGPU\'s 4GB must not inflate the usable budget')
   assert.equal(summary.gpuName, 'NVIDIA GeForce RTX 4070')
+  assert.equal(summary.count, 1, 'the excluded iGPU must not inflate the NVIDIA count')
 })
 
 test('primaryVendorSummary: no GPUs reports null name and 0 VRAM', () => {
   const summary = primaryVendorSummary([])
   assert.equal(summary.gpuName, null)
   assert.equal(summary.vramMb, 0)
+  assert.equal(summary.count, 0)
 })
