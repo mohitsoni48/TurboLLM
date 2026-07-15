@@ -41,6 +41,12 @@ export interface Engine {
   /** Optional branch to compare commits against (ADR-088). Empty/absent → the repo's
    *  default branch (resolved via the `HEAD` commits ref). */
   sourceBranch?: string
+  /** Set only when this build was pinned to an exact historical commit (build-runner's
+   *  `commit` field), e.g. for A/B-ing a specific past commit against the branch tip.
+   *  Distinct from `sourceBranch` deliberately — a pinned-commit build must never be
+   *  treated as "the same engine, just rebuilt" as a plain branch-tip build of the same
+   *  repo (registration would silently replace one with the other). */
+  sourceCommit?: string
 }
 export interface Daemon {
   host: string

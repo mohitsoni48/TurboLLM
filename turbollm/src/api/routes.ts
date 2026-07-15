@@ -504,7 +504,7 @@ export function registerApi(app: Hono, d: Deps): void {
       return err(c, 403, 'forbidden', 'Building an engine is only available on the machine running TurboLLM.')
     if (process.platform !== 'win32' && process.platform !== 'linux' && process.platform !== 'darwin')
       return err(c, 409, 'unsupported_platform', 'In-app build is currently Windows, Linux, or macOS only.')
-    const b = await body<{ repoUrl?: string; branch?: string; name?: string }>(c)
+    const b = await body<{ repoUrl?: string; branch?: string; commit?: string; name?: string }>(c)
     const repoUrl = (b.repoUrl ?? '').trim()
     if (!/^https?:\/\//i.test(repoUrl))
       return err(c, 400, 'invalid_config_value', 'A http(s) repo URL is required.')
@@ -513,12 +513,15 @@ export function registerApi(app: Hono, d: Deps): void {
     // positional URL). Reject it — belt-and-suspenders, even though builds are local-only.
     if (branch && branch.startsWith('-'))
       return err(c, 400, 'invalid_config_value', 'Branch name cannot start with "-".')
+    const commit = (b.commit ?? '').trim() || undefined
+    if (commit && !/^[0-9a-f]{7,40}$/i.test(commit))
+      return err(c, 400, 'invalid_config_value', 'commit must be a hex SHA (7-40 chars).')
     const busy = engineWorkBusy(d)
     if (busy) return err(c, 409, 'engine_already_running', busy)
     const name = (b.name ?? '').trim() || undefined
     const enginesRoot = join(d.store.dir(), 'engines')
     const toolchainDirs = d.store.snapshot().build.toolchainDirs
-    const buildRoot = join(enginesRoot, 'build', buildDirName(repoUrl, branch))
+    const buildRoot = join(enginesRoot, 'build', buildDirName(repoUrl, branch, commit))
     // Reserve the build slot SYNCHRONOUSLY (before returning 202) so two near-simultaneous
     // POSTs can't both pass the busy-check and race on the same buildRoot / clobber buildAbort.
     const ac = new AbortController()
@@ -529,7 +532,7 @@ export function registerApi(app: Hono, d: Deps): void {
         let out
         try {
           out = await runBuild(
-            { repoUrl, branch, enginesRoot, toolchainDirs },
+            { repoUrl, branch, commit, enginesRoot, toolchainDirs },
             { phase: (p) => d.build.phase(p), log: (line) => d.build.log(line) },
             ac.signal,
           )
@@ -561,11 +564,21 @@ export function registerApi(app: Hono, d: Deps): void {
         // existing engine by binPath OR by source repo+branch (a fresh compile can land at a
         // slightly different binPath) and replace it in place (stop it first if it's the
         // running active one) so we re-probe fresh capabilities without a NameTaken clash.
+        // A commit-pinned build (req.commit set) is a DELIBERATELY DISTINCT snapshot — it must
+        // never match/replace a plain branch-tip build of the same repo+branch (or vice versa),
+        // only a prior build pinned to that SAME commit, else A/B-ing an old commit against the
+        // current build silently deletes the current one's registration (its files on disk are
+        // untouched, but it vanishes from the engine list).
         // A failure HERE keeps the built binary on disk (no GC) so it isn't thrown away.
         const engines = d.registry.list().engines
         const prior =
           engines.find((e) => e.binPath === out.binPath) ??
-          engines.find((e) => e.sourceRepo === repoUrl && (e.sourceBranch ?? '') === (branch ?? ''))
+          engines.find(
+            (e) =>
+              e.sourceRepo === repoUrl &&
+              (e.sourceBranch ?? '') === (branch ?? '') &&
+              (e.sourceCommit ?? '') === (commit ?? ''),
+          )
         if (prior) {
           if (d.registry.active()?.id === prior.id) await d.manager.stopAndWait()
           try { d.registry.remove(prior.id) } catch { /* already gone */ }
@@ -573,6 +586,7 @@ export function registerApi(app: Hono, d: Deps): void {
         const eng = (await d.registry.add(prior?.name ?? name ?? '', out.binPath, {
           sourceRepo: repoUrl,
           sourceBranch: branch,
+          sourceCommit: commit,
         })).engine
         d.registry.activate(eng.id)
         d.build.log(`Registered "${eng.name}" — built from ${out.commit.slice(0, 8)}.`)

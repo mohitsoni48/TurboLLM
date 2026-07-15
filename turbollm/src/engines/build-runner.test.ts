@@ -21,6 +21,22 @@ test('buildDirName: unparseable URL falls back to "engine"', () => {
   assert.equal(buildDirName('   '), 'engine')
 })
 
+test('buildDirName: a pinned commit gets its OWN dir, never the same as a plain branch build', () => {
+  // Safety-critical: runBuild() rmSync's buildRoot at the start of every run. If a
+  // commit-pinned build ever collapsed to the same dir as the plain repo/branch build, it
+  // would silently wipe an existing (possibly currently-installed) engine build.
+  const repo = 'https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant'
+  const plain = buildDirName(repo)
+  const branched = buildDirName(repo, 'feature/turboquant-kv-cache')
+  const pinned = buildDirName(repo, undefined, '11a241d0db78a68e0a5b99fe6f36de6683100f6a')
+  const pinnedWithBranch = buildDirName(repo, 'feature/turboquant-kv-cache', '11a241d0db78a68e0a5b99fe6f36de6683100f6a')
+  assert.notEqual(pinned, plain)
+  assert.notEqual(pinned, branched)
+  assert.equal(pinned, 'atomic-llama-cpp-turboquant-11a241d0db78')
+  // commit takes priority over branch when both are set (same dir either way).
+  assert.equal(pinnedWithBranch, pinned)
+})
+
 test('CMAKE_CONFIGURE_ARGS: enables CUDA + Release, allows an unrecognized-but-newer host compiler', () => {
   assert.deepEqual(CMAKE_CONFIGURE_ARGS, [
     '-DGGML_CUDA=ON',

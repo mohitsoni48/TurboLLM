@@ -27,6 +27,10 @@ const execFileP = promisify(execFile)
 export interface BuildRequest {
   repoUrl: string
   branch?: string
+  /** Pin the build to an exact commit SHA instead of a branch tip — for A/B-ing a specific
+   *  historical commit (e.g. bisecting a reported regression). Takes priority over `branch`
+   *  when both are set. Requires the remote to allow fetching arbitrary SHAs (GitHub does). */
+  commit?: string
   /** `<dataDir>/engines` — builds live under `<enginesRoot>/build/<slug>/`. */
   enginesRoot: string
   /** Dirs prepended to PATH for the build (ADR-100). */
@@ -50,11 +54,15 @@ export interface BuildOutput {
 /** PURE: a filesystem-safe directory slug for a repo+branch, so a rebuild of the same
  *  source reuses (overwrites) the same dir. e.g. ("https://github.com/ikawrakow/ik_llama.cpp.git",
  *  "sidestream") → "ik_llama.cpp-sidestream". Falls back to "engine" for an unparseable URL. */
-export function buildDirName(repoUrl: string, branch?: string): string {
+export function buildDirName(repoUrl: string, branch?: string, commit?: string): string {
   const last = repoUrl.trim().replace(/\/+$/, '').split(/[\\/]/).pop() ?? ''
   const repo = last.replace(/\.git$/i, '').trim() || 'engine'
   const b = (branch ?? '').trim()
-  const raw = b ? `${repo}-${b}` : repo
+  const sha = (commit ?? '').trim()
+  // A pinned commit must land in its OWN dir — otherwise it collapses to the same name as a
+  // plain branch build of the same repo and `runBuild`'s clean-start rmSync would silently wipe
+  // an existing (possibly currently-installed) build of that repo.
+  const raw = sha ? `${repo}-${sha.slice(0, 12)}` : b ? `${repo}-${b}` : repo
   // Keep it tame on disk: collapse anything outside [A-Za-z0-9._-] to a single dash.
   return raw.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'engine'
 }
@@ -461,19 +469,31 @@ export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: Abo
     )
   }
 
-  const buildRoot = join(req.enginesRoot, 'build', buildDirName(req.repoUrl, req.branch))
+  const buildRoot = join(req.enginesRoot, 'build', buildDirName(req.repoUrl, req.branch, req.commit))
   const srcDir = join(buildRoot, 'src')
   const buildSubdir = join(buildRoot, 'build')
   // Start clean so a rebuild never mixes old + new objects.
   rmSync(buildRoot, { recursive: true, force: true })
   mkdirSync(buildRoot, { recursive: true })
 
-  // 1) Shallow clone.
+  // 1) Shallow clone — a branch tip, or (when `req.commit` is set) an exact historical SHA.
   hooks.phase('cloning')
-  const cloneArgs = ['clone', '--depth', '1']
-  if ((req.branch ?? '').trim()) cloneArgs.push('--branch', req.branch!.trim())
-  cloneArgs.push(req.repoUrl, srcDir)
-  await runStep('git', cloneArgs, { env, signal, onLine: hooks.log })
+  const pinnedCommit = (req.commit ?? '').trim()
+  if (pinnedCommit) {
+    // A plain `clone --branch` can't check out an arbitrary SHA (shallow history only has the
+    // tip). Init + fetch that one commit by SHA instead — GitHub allows fetching any reachable
+    // SHA, not just refs.
+    mkdirSync(srcDir, { recursive: true })
+    await runStep('git', ['init'], { cwd: srcDir, env, signal, onLine: hooks.log })
+    await runStep('git', ['remote', 'add', 'origin', req.repoUrl], { cwd: srcDir, env, signal, onLine: hooks.log })
+    await runStep('git', ['fetch', '--depth', '1', 'origin', pinnedCommit], { cwd: srcDir, env, signal, onLine: hooks.log })
+    await runStep('git', ['checkout', 'FETCH_HEAD'], { cwd: srcDir, env, signal, onLine: hooks.log })
+  } else {
+    const cloneArgs = ['clone', '--depth', '1']
+    if ((req.branch ?? '').trim()) cloneArgs.push('--branch', req.branch!.trim())
+    cloneArgs.push(req.repoUrl, srcDir)
+    await runStep('git', cloneArgs, { env, signal, onLine: hooks.log })
+  }
 
   // Record the built commit (ADR-088 provenance / rebuild comparison).
   const commit = (await runStep('git', ['-C', srcDir, 'rev-parse', 'HEAD'], { env, signal, onLine: () => {} })).trim()
