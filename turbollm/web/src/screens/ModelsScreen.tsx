@@ -530,12 +530,16 @@ function ModelRow({
           ? 'no chat template'
           : null
   const loadingThis = loadingKey === m.key
+  // Order matters: only the first 2 render on the card row (space-constrained), so the
+  // rarer, more decision-relevant capabilities (NextN, Embed) go first — otherwise a model
+  // that's ALSO Vision+MoE (common for the bigger models that carry a NextN head) always had
+  // its NextN tag silently crowded out despite the NextN filter/count already finding it.
   const caps = [
+    (m.nextnLayers ?? 0) > 0 && 'NextN',
+    m.embedding && 'Embed',
     m.vision && 'Vision',
     m.audio && 'Audio',
     m.moe && 'MoE',
-    m.embedding && 'Embed',
-    (m.nextnLayers ?? 0) > 0 && 'NextN',
   ].filter(Boolean) as string[]
 
   const loadedBg = loaded ? { background: 'color-mix(in srgb, var(--ok) 6%, transparent)' } : undefined
