@@ -80,6 +80,7 @@ import { LlamaCppBackendRows } from './engines/ManagedEngines'
 import {
   groupEngines,
   memberToActivate,
+  repoSlug,
   variantLabel,
   type EngineGroup,
 } from '../lib/engine-groups'
@@ -91,13 +92,21 @@ const ISSUE_URL =
  *  `<config>/engines/llama.cpp-<tag>-<backend>/`; everything else is a user fork. */
 const isOfficialLlama = (binPath: string) => /[\\/]engines[\\/]llama\.cpp-/.test(binPath)
 
-/** Map a registered engine to its catalog id ('llama.cpp' | 'turboquant' | 'mlx' | 'vllm').
- *  Used to line a running engine up against its catalog card. */
-function catalogIdFor(e: Engine): string {
+/** Map a registered engine to its catalog id ('llama.cpp' | 'turboquant' | 'ik_llama.cpp' |
+ *  'mlx' | 'vllm' | …). Used to line a running engine up against its catalog card. Prefers
+ *  `sourceRepo` (set for ANY engine built via "Add via git repo", ADR-186) over binPath
+ *  sniffing — the binPath pattern only matches TurboLLM's own auto-download layout
+ *  (`engines/turboquant/…`), not the git-build layout (`engines/build/<repo-name>/…`), so a
+ *  self-service TurboQuant/ik_llama.cpp build fell through to the 'llama.cpp' default and
+ *  showed the wrong catalog card as active. */
+export function catalogIdFor(e: Engine): string {
   if (e.kind === 'mlx') return 'mlx'
   if (e.kind === 'vllm') return 'vllm'
   if (e.kind === 'koboldcpp') return 'koboldcpp'
   if (e.kind === 'llamafile') return 'llamafile'
+  const repo = repoSlug(e.sourceRepo)
+  if (repo === 'atomicbot-ai/atomic-llama-cpp-turboquant') return 'turboquant'
+  if (repo === 'ikawrakow/ik_llama.cpp') return 'ik_llama.cpp'
   if (/[\\/]engines[\\/]turboquant[\\/]/.test(e.binPath)) return 'turboquant'
   return 'llama.cpp'
 }

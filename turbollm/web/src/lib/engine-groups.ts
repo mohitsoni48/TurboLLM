@@ -13,6 +13,17 @@ export function isOfficialLlama(binPath: string): boolean {
   return /[\\/]engines[\\/]llama\.cpp-/.test(binPath)
 }
 
+/** Normalize a git source repo (full URL or `owner/repo`) to lowercase `owner/repo`, so a
+ *  fork identity can be compared regardless of URL form (`https://github.com/x/y`,
+ *  `https://github.com/x/y.git`, or the bare `x/y`). `undefined` for engines with no
+ *  `sourceRepo` (official auto-downloads, pip engines). */
+export function repoSlug(sourceRepo: string | undefined): string | undefined {
+  return sourceRepo
+    ?.replace(/^https?:\/\/github\.com\//i, '')
+    .replace(/\.git$/i, '')
+    .toLowerCase()
+}
+
 /** A logical-engine grouping key. Engines that share a key collapse into one row.
  *  Each official llama.cpp BACKEND is its own engine (`'official-llama-<backend>'`, e.g.
  *  cuda/rocm) so the "Running now" dropdown lists them individually — the user switches
@@ -26,6 +37,11 @@ export function engineGroupKey(e: Engine): string {
     return backend ? `official-llama-${backend}` : 'official-llama'
   }
   if (e.kind === 'koboldcpp' || e.kind === 'mlx' || e.kind === 'rapid-mlx' || e.kind === 'vllm') return e.kind
+  // A TurboQuant build built via "Add via git repo" (ADR-186) lands at
+  // engines/build/atomic-llama-cpp-turboquant/…, not the auto-download layout the binPath
+  // regex below matches — check sourceRepo first so both install paths collapse into one
+  // group (and so a rebuild doesn't spawn a second, un-merged "TurboQuant" row).
+  if (repoSlug(e.sourceRepo) === 'atomicbot-ai/atomic-llama-cpp-turboquant') return 'turboquant'
   if (/[\\/]engines[\\/]turboquant[\\/]/.test(e.binPath)) return 'turboquant'
   return `user:${e.id}`
 }

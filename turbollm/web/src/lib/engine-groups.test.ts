@@ -6,6 +6,7 @@ import {
   latestMemberId,
   memberToActivate,
   parseLlamaBuild,
+  repoSlug,
   variantLabel,
 } from './engine-groups'
 import type { Engine } from './types'
@@ -45,6 +46,27 @@ test('engineGroupKey maps pip engines to their kind', () => {
 
 test('engineGroupKey detects TurboQuant by path', () => {
   assert.equal(engineGroupKey(turboquant), 'turboquant')
+})
+
+test('engineGroupKey detects a self-service ("Add via git repo") TurboQuant build by sourceRepo, not just path', () => {
+  // Real shape from ADR-186's git-build flow: engines/build/<repo-name>/build/bin/…, which the
+  // binPath-only regex never matches (that only recognizes the auto-download layout).
+  const gitBuiltTurboQuant = eng({
+    id: 'tq2',
+    name: 'TurboQuant',
+    binPath: 'C:\\Users\\x\\.turbollm\\engines\\build\\atomic-llama-cpp-turboquant\\build\\bin\\llama-server.exe',
+    sourceRepo: 'https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant',
+  })
+  assert.equal(engineGroupKey(gitBuiltTurboQuant), 'turboquant')
+  // Both install paths collapse into the SAME group so a rebuild doesn't spawn a second row.
+  assert.equal(engineGroupKey(gitBuiltTurboQuant), engineGroupKey(turboquant))
+})
+
+test('repoSlug normalizes full URL, .git suffix, and bare owner/repo the same way', () => {
+  assert.equal(repoSlug('https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant'), 'atomicbot-ai/atomic-llama-cpp-turboquant')
+  assert.equal(repoSlug('https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant.git'), 'atomicbot-ai/atomic-llama-cpp-turboquant')
+  assert.equal(repoSlug('AtomicBot-ai/atomic-llama-cpp-turboquant'), 'atomicbot-ai/atomic-llama-cpp-turboquant')
+  assert.equal(repoSlug(undefined), undefined)
 })
 
 test('engineGroupKey gives user-added engines a distinct, unmerged key', () => {
