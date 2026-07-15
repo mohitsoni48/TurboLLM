@@ -11,8 +11,8 @@ function model(over: Partial<ModelEntry> = {}): ModelEntry {
   return {
     key: 'm|q4|1', name: 'm', path: '/models/m.gguf', dir: '/models', format: 'gguf',
     sizeBytes: 8_000_000_000, sizeLabel: '8 GB', arch: 'llama', quant: 'Q4_K_M',
-    nativeCtx: 32768, blockCount: 32, headCountKv: 8, moe: false, expertCount: 0,
-    nextnLayers: 0, vision: false, audio: false, mmprojPath: null, hasChatTemplate: true, embedding: false,
+    nativeCtx: 32768, blockCount: 32, headCountKv: 8, headDim: 0, moe: false, expertCount: 0,
+    nextnLayers: 0, vision: false, audio: false, mmprojPath: null, mmprojSizeBytes: 0, hasChatTemplate: true, embedding: false,
     incomplete: false, parseError: null, loaded: false, hasProfile: false,
     benchTps: null, mtime: '', ...over,
   }
@@ -115,6 +115,36 @@ test('kvOffload false excludes the KV cache from the VRAM estimate', () => {
   const onGpu = estimateVram({ ...base(), kvOffload: true }, m, s)
   const inRam = estimateVram({ ...base(), kvOffload: false }, m, s)
   assert.ok(inRam.estMb < onGpu.estMb, 'KV in RAM should lower the GPU estimate')
+})
+
+// ── Real per-head dim + mmproj sizing (regression: both were flat guesses that
+// systematically underestimated VRAM for GQA/MQA models and vision models) ────────────
+
+test('a declared headDim (GQA/MQA real dim) scales the KV estimate — not the flat HEAD_DIM constant', () => {
+  const s = sys()
+  // Same model, only headDim differs: 256 is exactly 2x the 128 fallback, so the KV-cache
+  // TERM must double (~1074 MB more at this test model's ctx/blocks/heads) — weights (8000
+  // MB, dominates the total) and the flat overhead are unaffected, so assert the DELTA, not
+  // the ratio of the full totals. Before this fix, headDim was ignored entirely: this delta
+  // would have been exactly 0.
+  const withKnownHeadDim = estimateVram(base(), model({ headDim: 256 }), s)
+  const withFallbackHeadDim = estimateVram(base(), model({ headDim: 0 }), s)
+  const delta = withKnownHeadDim.estMb - withFallbackHeadDim.estMb
+  assert.ok(
+    delta > 900,
+    `headDim:256 should add ~1074 MB of extra KV over the headDim:0 (128-fallback) estimate — got a delta of ${delta} (${withFallbackHeadDim.estMb} -> ${withKnownHeadDim.estMb})`,
+  )
+})
+
+test('mmproj VRAM scales with the real mmproj file size, not a flat constant', () => {
+  const s = sys()
+  const p = { ...base(), useMmproj: true, mmprojGpu: true }
+  const smallProjector = estimateVram(p, model({ mmprojPath: '/models/mmproj.gguf', mmprojSizeBytes: 200_000_000 }), s)
+  const largeProjector = estimateVram(p, model({ mmprojPath: '/models/mmproj.gguf', mmprojSizeBytes: 1_800_000_000 }), s)
+  assert.ok(
+    largeProjector.estMb - smallProjector.estMb > 1_400,
+    `a ~1.6 GB larger mmproj file should add roughly that much to the estimate — got ${largeProjector.estMb} vs ${smallProjector.estMb}`,
+  )
 })
 
 // ── Context overflow ──────────────────────────────────────────────────────────

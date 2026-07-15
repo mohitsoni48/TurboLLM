@@ -11,8 +11,8 @@ function model(over: Partial<ModelEntry> = {}): ModelEntry {
   return {
     key: 'm', name: 'm', path: '/models/m', dir: '/models', format: 'mlx',
     sizeBytes: 8_000_000_000, sizeLabel: '8 GB', arch: 'llama', quant: 'fp16',
-    nativeCtx: 32768, blockCount: 32, headCountKv: 8, moe: false, expertCount: 0,
-    nextnLayers: 0, vision: false, audio: false, mmprojPath: null, hasChatTemplate: true, embedding: false,
+    nativeCtx: 32768, blockCount: 32, headCountKv: 8, headDim: 0, moe: false, expertCount: 0,
+    nextnLayers: 0, vision: false, audio: false, mmprojPath: null, mmprojSizeBytes: 0, hasChatTemplate: true, embedding: false,
     incomplete: false, parseError: null, loaded: false, hasProfile: false,
     benchTps: null, mtime: '', ...over,
   }

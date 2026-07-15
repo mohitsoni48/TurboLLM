@@ -22,6 +22,12 @@ export interface GgufMeta {
   blockCount: number
   embedLen: number
   headCountKv: number
+  /** Real per-head dimension from `<arch>.attention.key_length` (falling back to
+   *  `value_length`) — llama.cpp's own authoritative field for KV-cache sizing. NOT always
+   *  `embedding_length / head_count`: GQA/MQA architectures with a decoupled head dimension
+   *  (e.g. Qwen3.6-27B's real 256 vs. its embedding-derived ~128) diverge from that ratio.
+   *  0 when the GGUF doesn't declare it — callers fall back to a conservative constant. */
+  headDim: number
   expertCount: number
   /** `<arch>.nextn_predict_layers` — >0 means the GGUF carries a built-in NextN /
    *  multi-token-prediction head (self-speculative decoding). 0 = none. */
@@ -171,6 +177,10 @@ export function parseGguf(path: string): GgufMeta {
     const kvCount = r.u64()
 
     const m: Partial<GgufMeta> = { hasChatTemplate: false }
+    // key_length/value_length are usually equal (both = the real per-head dim); tracked
+    // separately since a GGUF can in principle declare only one.
+    let keyLength: number | undefined
+    let valueLength: number | undefined
     for (let i = 0; i < kvCount; i++) {
       const key = r.str()
       const t = r.u32()
@@ -182,6 +192,8 @@ export function parseGguf(path: string): GgufMeta {
       else if (key.endsWith('.block_count')) m.blockCount = readNumberOrMax(r, t)
       else if (key.endsWith('.embedding_length')) m.embedLen = readNumberOrMax(r, t)
       else if (key.endsWith('.attention.head_count_kv')) m.headCountKv = readNumberOrMax(r, t)
+      else if (key.endsWith('.attention.key_length')) keyLength = readNumberOrMax(r, t)
+      else if (key.endsWith('.attention.value_length')) valueLength = readNumberOrMax(r, t)
       else if (key.endsWith('.expert_count')) m.expertCount = readNumberOrMax(r, t)
       else if (key.endsWith('.nextn_predict_layers')) m.nextnLayers = readNumberOrMax(r, t)
       else if (key === 'tokenizer.chat_template') {
@@ -201,6 +213,7 @@ export function parseGguf(path: string): GgufMeta {
       blockCount: m.blockCount ?? 0,
       embedLen: m.embedLen ?? 0,
       headCountKv: m.headCountKv ?? 0,
+      headDim: keyLength ?? valueLength ?? 0,
       expertCount: m.expertCount ?? 0,
       nextnLayers: m.nextnLayers ?? 0,
       hasChatTemplate: m.hasChatTemplate ?? false,

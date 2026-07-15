@@ -175,7 +175,10 @@ export interface VramFit {
   verdict: FitVerdict
 }
 
-const HEAD_DIM = 128 // embedLen/headCount approximation (spec 05 §6)
+// Fallback only, used when the GGUF/config doesn't declare a real per-head dimension
+// (ModelEntry.headDim === 0) — a common architecture default, not a universal one; GQA/MQA
+// models with a decoupled head size (see ModelEntry.headDim's doc) diverge from it.
+const HEAD_DIM = 128
 
 function kvBytesPerElem(t: string): number {
   switch (t) {
@@ -221,7 +224,12 @@ export function estimateVram(p: LoadProfile, m: ModelEntry, sys: SysInfo): VramF
   const weightsMb = sizeMb * Math.max(0, Math.min(1, gpuFrac))
 
   const kvHeads = m.headCountKv || 8
-  const kvElems = 2 * blocks * p.ctx * kvHeads * HEAD_DIM
+  // Real per-head dim when the GGUF/config declares it (attention.key_length, or HF's
+  // head_dim) — GQA/MQA models can diverge sharply from embedding_length/head_count
+  // (e.g. Qwen3.6-27B: real 256 vs. HEAD_DIM's 128 constant, a 2x KV-size miss). Falls
+  // back to the constant only when the model doesn't declare it.
+  const headDim = m.headDim || HEAD_DIM
+  const kvElems = 2 * blocks * p.ctx * kvHeads * headDim
   // KV cache only counts against VRAM when it's offloaded to the GPU. With --no-kv-offload
   // (kvOffload === false) it lives in system RAM, so it adds nothing to the GPU estimate.
   // Absent on pre-feature profiles → treated as the GPU default.
@@ -229,7 +237,11 @@ export function estimateVram(p: LoadProfile, m: ModelEntry, sys: SysInfo): VramF
     ? 0
     : ((kvElems * kvBytesPerElem(p.kvTypeK)) / 1e6) * (p.kvUnified ? 1 : Math.max(1, p.parallel))
 
-  const mmprojMb = p.useMmproj && p.mmprojGpu && m.mmprojPath ? 600 : 0
+  // The mmproj file's on-disk size is a much closer proxy for its real VRAM footprint than
+  // a flat guess (already-quantized weights load close to 1:1) — a measured ~15% overhead
+  // for the vision encoder's activation/compute buffers on top of raw weight size roughly
+  // matches llama.cpp's own reported worst-case mmproj estimate for a real 27B-VL model.
+  const mmprojMb = p.useMmproj && p.mmprojGpu && m.mmprojPath ? (m.mmprojSizeBytes / 1e6) * 1.15 : 0
   const estMb = Math.round(weightsMb + kvMb + 800 + mmprojMb)
   const pct = estMb / totalVramMb
   const verdict: FitVerdict = pct <= 0.8 ? 'fits' : pct <= 0.95 ? 'tight' : 'overflow'

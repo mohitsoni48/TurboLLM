@@ -16,8 +16,8 @@ const sys: SysInfo = {
 const denseModel: ModelEntry = {
   key: 'dense-test', name: 'Dense Test', path: 'x.gguf', dir: '.', format: 'gguf',
   sizeBytes: 1e9, sizeLabel: '1B', arch: 'llama', quant: 'Q4_K_M', nativeCtx: 8192,
-  blockCount: 32, headCountKv: 8, moe: false, expertCount: 0, nextnLayers: 0,
-  vision: false, audio: false, mmprojPath: null, hasChatTemplate: true, embedding: false,
+  blockCount: 32, headCountKv: 8, headDim: 0, moe: false, expertCount: 0, nextnLayers: 0,
+  vision: false, audio: false, mmprojPath: null, mmprojSizeBytes: 0, hasChatTemplate: true, embedding: false,
   incomplete: false, parseError: null, loaded: false, hasProfile: false,
   benchTps: null, mtime: '',
 }

@@ -18,6 +18,9 @@ export interface ModelEntry {
   nativeCtx: number
   blockCount: number
   headCountKv: number
+  /** Real per-head dimension (GgufMeta.headDim) — 0 when the GGUF doesn't declare
+   *  attention.key_length/value_length. See profile.ts's estimateVram for the fallback. */
+  headDim: number
   moe: boolean
   expertCount: number
   nextnLayers: number
@@ -27,6 +30,9 @@ export interface ModelEntry {
    *  implemented (no observed need yet) — always false there. */
   audio: boolean
   mmprojPath: string | null
+  /** On-disk size of the mmproj file, bytes (0 when `mmprojPath` is null). Used to size
+   *  the vision projector's VRAM contribution instead of a flat guess. */
+  mmprojSizeBytes: number
   hasChatTemplate: boolean
   /** True for embedding models (BERT-family arch or known embed filename patterns).
    *  Passed to llama-server as --embeddings to activate /v1/embeddings. */
@@ -46,7 +52,7 @@ interface CacheRow {
 }
 
 // Bump when GgufMeta gains a field so on-disk caches re-parse (see loadCache).
-const CACHE_VERSION = 2
+const CACHE_VERSION = 3
 
 const SPLIT_RE = /^(.*)-(\d{5})-of-(\d{5})\.gguf$/i
 
@@ -168,7 +174,9 @@ export class Scanner {
     for (const [dir, group] of byDir) {
       const mmprojFiles = group.filter((f) => basename(f.path).toLowerCase().includes('mmproj'))
       const modelFiles = group.filter((f) => !basename(f.path).toLowerCase().includes('mmproj'))
-      const mmprojPath = mmprojFiles.sort((a, b) => b.size - a.size)[0]?.path ?? null
+      const mmproj = mmprojFiles.sort((a, b) => b.size - a.size)[0]
+      const mmprojPath = mmproj?.path ?? null
+      const mmprojSizeBytes = mmproj?.size ?? 0
 
       // Resolve split groups: prefix+total -> shards, keyed by shard INDEX so a split is
       // judged complete by the distinct part numbers present (1..total), not by the raw
@@ -195,7 +203,7 @@ export class Scanner {
       }
 
       for (const f of singles) {
-        entries.push(await this.entryFor(f.path, f.size, f.mtime, dir, mmprojPath, false))
+        entries.push(await this.entryFor(f.path, f.size, f.mtime, dir, mmprojPath, mmprojSizeBytes, false))
         await tick()
       }
       for (const { shards, total } of splits.values()) {
@@ -212,7 +220,7 @@ export class Scanner {
               break
             }
         }
-        entries.push(await this.entryFor(first.path, totalSize, first.mtime, dir, mmprojPath, incomplete))
+        entries.push(await this.entryFor(first.path, totalSize, first.mtime, dir, mmprojPath, mmprojSizeBytes, incomplete))
         await tick()
       }
     }
@@ -226,6 +234,7 @@ export class Scanner {
     mtimeMs: number,
     dir: string,
     mmprojPath: string | null,
+    mmprojSizeBytes: number,
     incomplete: boolean,
   ): Promise<ModelEntry> {
     let meta: GgufMeta | null = null
@@ -262,12 +271,14 @@ export class Scanner {
       nativeCtx: meta?.nativeCtx ?? 0,
       blockCount: meta?.blockCount ?? 0,
       headCountKv: meta?.headCountKv ?? 0,
+      headDim: meta?.headDim ?? 0,
       moe: (meta?.expertCount ?? 0) > 0,
       expertCount: meta?.expertCount ?? 0,
       nextnLayers: meta?.nextnLayers ?? 0,
       vision,
       audio: false,
       mmprojPath: vision ? mmprojPath : null,
+      mmprojSizeBytes: vision ? mmprojSizeBytes : 0,
       hasChatTemplate: meta?.hasChatTemplate ?? false,
       embedding: isEmbeddingModel(arch, fileName),
       incomplete,
@@ -365,6 +376,9 @@ interface MlxConfig {
   max_position_embeddings?: number
   num_hidden_layers?: number
   num_key_value_heads?: number
+  /** Real per-head dimension, when the config declares it explicitly (GQA/MQA models
+   *  with a decoupled head size). Absent → callers fall back to a conservative constant. */
+  head_dim?: number
   num_local_experts?: number
   num_experts?: number
   /** MLX-style on-disk quantization (mlx-lm convert). */
@@ -480,12 +494,14 @@ export function mlxEntryFor(dir: string): ModelEntry {
     nativeCtx: cfg.max_position_embeddings ?? lm.max_position_embeddings ?? 0,
     blockCount: cfg.num_hidden_layers ?? lm.num_hidden_layers ?? 0,
     headCountKv: cfg.num_key_value_heads ?? lm.num_key_value_heads ?? 0,
+    headDim: cfg.head_dim ?? lm.head_dim ?? 0,
     moe: expertCount > 0,
     expertCount,
     nextnLayers: 0,
     vision: cfg.vision_config != null,
     audio: cfg.audio_config != null,
     mmprojPath: null,
+    mmprojSizeBytes: 0,
     hasChatTemplate,
     embedding: isEmbeddingModel(arch, basename(dir)),
     incomplete,
