@@ -12,6 +12,7 @@
 </p>
 
 <p align="center">
+  <a href="https://turbollm.dev"><img src="https://img.shields.io/badge/turbollm.dev-docs%20·%20models%20·%20guides-e2552e" alt="turbollm.dev" /></a>
   <a href="https://www.npmjs.com/package/turbollm"><img src="https://img.shields.io/npm/v/turbollm.svg?color=e2552e" alt="npm version" /></a>
   <a href="https://www.npmjs.com/package/turbollm"><img src="https://img.shields.io/npm/dm/turbollm.svg?color=e2552e" alt="npm downloads" /></a>
   <img src="https://img.shields.io/badge/node-%E2%89%A522-3c873a.svg" alt="node >= 22" />
@@ -20,6 +21,11 @@
   <a href="https://ko-fi.com/mohitsoni"><img src="https://img.shields.io/badge/Ko--fi-support%20us-FF5E5B?logo=kofi&logoColor=white" alt="Ko-fi" /></a>
   <a href="https://github.com/sponsors/mohitsoni48"><img src="https://img.shields.io/badge/GitHub%20Sponsors-support%20us-EA4AAA?logo=githubsponsors&logoColor=white" alt="GitHub Sponsors" /></a>
   <a href="https://discord.gg/v6kRbV7nC"><img src="https://img.shields.io/badge/Discord-join%20chat-5865F2?logo=discord&logoColor=white" alt="Discord" /></a>
+</p>
+
+<p align="center">
+  <sub><strong>Source-available</strong> under <a href="#license">FSL-1.1</a> — free for personal and
+  internal business use; every release converts to <strong>Apache-2.0</strong> two years after it ships.</sub>
 </p>
 
 <!-- Brand: shipped app icon web/public/brand/turbollm-icon-512.jpeg · high-res masters web/brand-assets/ (unshipped) · in-app mark web/src/components/Logo.tsx · favicon web/public/favicon.svg -->
@@ -31,6 +37,12 @@ npx turbollm
 That one command starts a local daemon, opens a browser UI, and serves your models over an
 API any tool can talk to. TurboLLM is the **performance & bleeding-edge layer for local
 LLMs** — built for people who today hand-compile forks and hunt forums for the right flags.
+The speed is measured, not promised: **74.7 vs 61 t/s on the *same* official llama.cpp as
+LM Studio — and 2.2× on forks it can't load** ([the numbers](#speed-turbollm-vs-lm-studio)).
+
+<p align="center">
+  <strong>📖 Full docs · what runs on your GPU · model picks → <a href="https://turbollm.dev">turbollm.dev</a></strong>
+</p>
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/mohitsoni48/TurboLLM/main/assets/how-it-works.svg?v=2" width="860" alt="How TurboLLM works: clients -> one lightweight daemon -> any engine on your GPU" />
@@ -41,6 +53,7 @@ LLMs** — built for people who today hand-compile forks and hunt forums for the
 ## Contents
 
 - [Why TurboLLM](#why-turbollm)
+- [Who this is for — and who it isn't](#who-this-is-for--and-who-it-isnt)
 - [Speed: TurboLLM vs LM Studio](#speed-turbollm-vs-lm-studio)
 - [Features](#features)
 - [Quick start](#quick-start)
@@ -87,6 +100,27 @@ TurboLLM does the opposite:
   loads it on demand, keeping your favorites hot in a small pool — so an agent that hops between
   models just works, with nothing to pre-wire.
 - **🔒 Offline-first & private.** No account, no backend, no internet, **no telemetry.**
+
+---
+
+## Who this is for — and who it isn't
+
+**It's for you if:**
+
+- you're tired of hand-tuning `-ngl` / KV / offload flags for every model and never trusting
+  the speed number;
+- you want community forks (low-bit KV cache, NextN speculative decoding, new quant formats)
+  on day 0 — without compiling anything;
+- you're pointing agents or **Claude Code** at a local model and want that to be one command;
+- you already have folders of GGUFs from LM Studio / Ollama and refuse to re-download them.
+
+**It's probably not for you if:**
+
+- you want a zero-terminal, one-click desktop installer — TurboLLM currently needs
+  [Node ≥22](#requirements) and one terminal command (a packaged installer is planned);
+- you're happy with a single blessed runtime and stock settings — LM Studio and Ollama
+  already serve that well;
+- you need training or fine-tuning — TurboLLM is inference only.
 
 ---
 
@@ -501,7 +535,22 @@ Use `--config <file>` to point at an alternate config (its directory becomes the
 
 ## Requirements
 
-- **Node.js 22.13.0 or newer** — enforced at startup with a clear message. <https://nodejs.org>
+- **Node.js 22.13.0 or newer** — enforced at startup with a clear message.
+
+  <details>
+  <summary><strong>Don't have Node?</strong> One command installs it.</summary>
+
+  <br/>
+
+  - **Windows:** `winget install OpenJS.NodeJS.LTS` (or download from <https://nodejs.org>)
+  - **macOS:** `brew install node` (or download from <https://nodejs.org>)
+  - **Linux:** use your distro's package manager or <https://nodejs.org> — make sure it's
+    v22+ (`node --version`)
+
+  Then open a **new terminal** (Windows needs one for `PATH` to refresh) and run `npx turbollm`.
+
+  </details>
+
 - **Windows, macOS, or Linux.**
 - A GPU is recommended but **not required** — a CPU build is provisioned as a fallback.
 - On Windows, the first time the auto-downloaded `llama-server` runs, SmartScreen/Defender may
@@ -582,14 +631,33 @@ shadcn/ui frontend. One TypeScript codebase, shipped as an npm package.
 ## Community
 
 Questions, ideas, and show-and-tell — join the [Discord](https://discord.gg/v6kRbV7nC).
+Want to contribute? See [CONTRIBUTING.md](https://github.com/mohitsoni48/TurboLLM/blob/main/CONTRIBUTING.md).
+
+If TurboLLM saved you flag-hunting time, a ⭐ on the repo helps others find it.
 
 ---
 
 ## License
 
 Source-available under the **Functional Source License 1.1 (Apache-2.0 future grant)** — SPDX
-**`FSL-1.1-ALv2`**. Free for personal use, internal business use, education, and research; the
-only restriction is shipping a competing product. Each release converts to Apache-2.0 two
-years after it's published. Full text: [LICENSE.md](https://github.com/mohitsoni48/TurboLLM/blob/main/turbollm/LICENSE.md).
+**`FSL-1.1-ALv2`**. Full text: [LICENSE.md](https://github.com/mohitsoni48/TurboLLM/blob/main/turbollm/LICENSE.md).
+
+**License FAQ** (plain-language summary — the license text is what's binding):
+
+- **Can I use it for free?** Yes. Personal use, internal business use, education, research,
+  and self-hosting — including commercially, inside your company — are all free. The license
+  permits *any* use except the one below.
+- **What's the one restriction?** You can't take TurboLLM and ship it (or its functionality)
+  as a **competing commercial product or service**. That's the entire boundary.
+- **Can I fork it or redistribute it?** Yes — modify, fork, and redistribute freely for any
+  permitted purpose; keep the license text and copyright notices with it.
+- **When does it become fully open source?** The license includes an **irrevocable** grant:
+  each release converts to **Apache-2.0 exactly two years** after that release is published.
+  The first public release shipped June 2026, so it converts in June 2028 — and every release
+  after it follows on its own two-year clock.
+- **Why not MIT/Apache from day one?** TurboLLM is built by a solo maintainer; FSL prevents a
+  large vendor from re-skinning it as their own product while it's young, and the future grant
+  guarantees the full open-source outcome anyway. (Sentry created the FSL; GitButler, PowerSync,
+  and Codecov ship under it too.)
 
 <p align="center"><sub>Built for people who refuse to wait for the mainstream to bless the fast path. ⚡</sub></p>
