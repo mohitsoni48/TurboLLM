@@ -144,6 +144,20 @@ export interface AgentRun {
    *  hides messages at/before this point too, with a banner offering /resume to un-hide them —
    *  the underlying messages are never deleted, so resuming restores them exactly. */
   clearedUpToMessageId?: string
+  // ── Revert to a user message (v33) — a real, resumable deactivation, NOT a clearedUpToMessageId
+  // reuse. ─────────────────────────────────────────────────────────────────────────────────────
+  /** The id of the message a revert cut FROM (inclusive) — that message and everything after it
+   *  (at the moment of the revert) were deactivated (is_active=0, the same mechanism Chat's own
+   *  branching uses — see Message.isActive), not merely hidden by a movable cursor. getMessages()
+   *  filters is_active=1 unconditionally, so deactivated messages disappear from every consumer
+   *  (transcript, resolveEffectiveHistory, revertFileEdits) with no separate cut-logic needed —
+   *  unlike clearedUpToMessageId, this correctly supports reverting to ANY earlier user message,
+   *  not just the most recent one, since messages BEFORE this id are never touched. Undefined =
+   *  never reverted, or resumed back from one. /resume reactivates (is_active=1) every message
+   *  from this id onward and clears this field — nothing is ever deleted. Mutually exclusive with
+   *  clearedUpToMessageId (each blocks starting the other; /resume undoes whichever is active) —
+   *  two independent hidden-and-resumable states on one session would be genuinely confusing. */
+  revertedFromMessageId?: string
   // ── Manual-rename persistence (v32) ─────────────────────────────────────────────────────
   /** True once the auto-generated title has been mirrored from conversations.title onto this
    *  run's own title exactly once (code-run-manager.ts's pump()) — gates that mirror to fire
@@ -417,7 +431,7 @@ export interface Message {
 }
 
 interface ConvRow { id: string; title: string; system_prompt: string; model_key: string; sampling: string; expert_mode: number; tool_policy: string | null; kind: string | null; folder_id: string | null; tool_overrides: string | null; agent_id: string | null; completed_at: string | null; read_scope: string | null; agent_mode: string | null; skill_ids: string | null; allowed_tools: string | null; preserve_thinking: number; created_at: string; updated_at: string }
-interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; agent_id: string | null; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null; archived_at: string | null; completion: string | null; repo_root: string | null; repo_branch: string | null; use_worktree: number | null; worktree_branch: string | null; worktree_base: string | null; lines_added: number | null; lines_removed: number | null; compaction_summary: string | null; compaction_upto_message_id: string | null; compaction_tokens_before: number | null; cleared_upto_message_id: string | null; title_auto_synced: number | null }
+interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; agent_id: string | null; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null; archived_at: string | null; completion: string | null; repo_root: string | null; repo_branch: string | null; use_worktree: number | null; worktree_branch: string | null; worktree_base: string | null; lines_added: number | null; lines_removed: number | null; compaction_summary: string | null; compaction_upto_message_id: string | null; compaction_tokens_before: number | null; cleared_upto_message_id: string | null; reverted_from_message_id: string | null; title_auto_synced: number | null }
 interface FolderRow { id: string; name: string; sort_order: number; created_at: string; updated_at: string }
 interface MsgRow  { id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string; reasoning: string; attachments: string; text_attachments: string | null; tool_calls: string | null; timeline: string | null; stats: string; model_key: string | null; research_meta: string | null; created_at: string; variant_group: string | null; is_active: number; branch_of: string | null; edited: number }
 
@@ -467,6 +481,7 @@ function rowToAgentRun(r: AgentRunRow): AgentRun {
     compactionUpToMessageId: r.compaction_upto_message_id ?? undefined,
     compactionTokensBefore: r.compaction_tokens_before ?? undefined,
     clearedUpToMessageId: r.cleared_upto_message_id ?? undefined,
+    revertedFromMessageId: r.reverted_from_message_id ?? undefined,
     titleAutoSynced: r.title_auto_synced === 1,
   }
 }
@@ -846,6 +861,18 @@ export class ConversationStore {
     if (v < 32) {
       if (!this.hasColumn('agent_runs', 'title_auto_synced')) this.db.exec(`ALTER TABLE agent_runs ADD COLUMN title_auto_synced INTEGER;`)
       this.db.exec(`PRAGMA user_version = 32;`)
+    }
+    // v33 (Code, founder-reported bug 2026-07-17, found live against a real 40-message session):
+    // revert-to-message previously reused clearedUpToMessageId (a movable prefix cursor), which
+    // can only hide "everything before X, show everything after" — backwards from what a revert
+    // needs (discard the reverted message and everything after it, keep everything before it),
+    // and structurally incapable of that for any message that isn't already at the tail. Real
+    // deactivation (is_active=0, the same mechanism Chat's branching already uses — getMessages()
+    // filters is_active=1 unconditionally) fixes both: it needs a marker of its own so /resume
+    // knows what to reactivate. Nullable — existing rows get NULL (never reverted).
+    if (v < 33) {
+      if (!this.hasColumn('agent_runs', 'reverted_from_message_id')) this.db.exec(`ALTER TABLE agent_runs ADD COLUMN reverted_from_message_id TEXT;`)
+      this.db.exec(`PRAGMA user_version = 33;`)
     }
   }
 
@@ -1447,6 +1474,35 @@ export class ConversationStore {
     const now = new Date().toISOString()
     return ((this.db.prepare(`UPDATE agent_runs SET cleared_upto_message_id = $mid, updated_at = $now WHERE id = $id`)
       .run({ $id: id, $mid: messageId, $now: now } as P) as unknown) as Changes).changes > 0
+  }
+
+  /** Set or clear (`null`) a Code session's revert marker — see AgentRun.revertedFromMessageId. */
+  setRevertedFromMessageId(id: string, messageId: string | null): boolean {
+    const now = new Date().toISOString()
+    return ((this.db.prepare(`UPDATE agent_runs SET reverted_from_message_id = $mid, updated_at = $now WHERE id = $id`)
+      .run({ $id: id, $mid: messageId, $now: now } as P) as unknown) as Changes).changes > 0
+  }
+
+  /** Revert-to-message (v33): deactivates `fromMessageId` and every message after it (by `seq`,
+   *  within the same conversation) — is_active=0, same mechanism Chat's branching uses. Unlike
+   *  clearedUpToMessageId's movable cursor, this correctly discards a range starting anywhere in
+   *  history while leaving everything BEFORE it untouched and visible. Returns the number of rows
+   *  deactivated (0 if `fromMessageId` doesn't exist). */
+  deactivateMessagesFrom(convId: string, fromMessageId: string): number {
+    const from = this.db.prepare(`SELECT seq FROM messages WHERE id = $id AND conv_id = $cid`).get({ $id: fromMessageId, $cid: convId } as P) as unknown as { seq: number } | undefined
+    if (!from) return 0
+    return ((this.db.prepare(`UPDATE messages SET is_active = 0 WHERE conv_id = $cid AND seq >= $seq`)
+      .run({ $cid: convId, $seq: from.seq } as P) as unknown) as Changes).changes
+  }
+
+  /** Undoes {@link deactivateMessagesFrom} — reactivates `fromMessageId` and every message after
+   *  it (by `seq`). Safe to call even if `fromMessageId` itself no longer exists (a no-op, 0
+   *  rows) — mirrors deactivateMessagesFrom's own lookup-then-range-update shape. */
+  reactivateMessagesFrom(convId: string, fromMessageId: string): number {
+    const from = this.db.prepare(`SELECT seq FROM messages WHERE id = $id AND conv_id = $cid`).get({ $id: fromMessageId, $cid: convId } as P) as unknown as { seq: number } | undefined
+    if (!from) return 0
+    return ((this.db.prepare(`UPDATE messages SET is_active = 1 WHERE conv_id = $cid AND seq >= $seq`)
+      .run({ $cid: convId, $seq: from.seq } as P) as unknown) as Changes).changes
   }
 
   /** Permanently delete a Code session: its messages, working doc, and the agent_run +

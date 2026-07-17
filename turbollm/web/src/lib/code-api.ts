@@ -72,7 +72,7 @@ export function revertCodeSession(
   id: string,
   messageId: string,
   revertFiles?: boolean,
-): Promise<{ ok: true; clearedUpToMessageId: string; revertText: string; revertedFiles: string[]; failedFiles: string[] }> {
+): Promise<{ ok: true; revertedFromMessageId: string; revertText: string; revertedFiles: string[]; failedFiles: string[] }> {
   return req(`/api/v1/code/sessions/${encodeURIComponent(id)}/revert`, { method: 'POST', json: { messageId, revertFiles } })
 }
 

@@ -549,9 +549,9 @@ export type DaemonSettings = {
   autoMemoryEnabled: boolean
   openBrowserOnStart: boolean
   autoLoadOnStart: boolean
-  /** VRAM to keep free during auto-tune's offload search, MB (300–2048, default 1024). A
-   *  later desktop / ComfyUI VRAM grab can't tip a config tuned with less headroom into a
-   *  sysmem spill. */
+  /** VRAM to keep free during auto-tune's offload search, MB (300–2048, default 1024) — OR 0, an
+   *  explicit opt-in letting the MoE hill-climb spill past all headroom for more t/s. A later
+   *  desktop / ComfyUI VRAM grab can't tip a config tuned with less headroom into a sysmem spill. */
   vramHeadroomMb: number
   /** Expose the API on the local network (spec 08 §2). Changing this requires a
    *  daemon restart to take effect (POST /api/v1/daemon/restart). */

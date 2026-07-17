@@ -212,7 +212,9 @@ export function SettingsScreen() {
     // Clamp defensively: NumberField commits unclamped while editing and only
     // snaps to range on blur, so guard the final ranges here too (spec 08 §2).
     idleTtlMinutes: clampN(ttl, 0, 1440),
-    vramHeadroomMb: clampN(vramHeadroom, 300, 2048),
+    // 0 is the distinct "allow VRAM spill" opt-in (VRAM_HEADROOM_SPILL_MB), not a smaller safety
+    // margin — clampN(v, 300, 2048) would otherwise clamp it up to 300 and silently discard it.
+    vramHeadroomMb: vramHeadroom === 0 ? 0 : clampN(vramHeadroom, 300, 2048),
     port: clampN(port, 1024, 65535),
     autoGenerateTitles: autoTitle,
     openBrowserOnStart: openBrowser,
@@ -531,13 +533,20 @@ export function SettingsScreen() {
                   <div className="mt-3 border-t border-border pt-1">
                     <Slider
                       label="VRAM headroom"
-                      hint="VRAM to keep free during auto-tune, so a later app switch or render job doesn't spill the model into slower shared memory"
+                      hint={
+                        vramHeadroom === 0
+                          ? "VRAM spill allowed. For MoE models, auto-tune will keep moving experts onto the GPU past this point as long as it measures a real speed gain — even if that spills the model into slower shared memory. Drag right to restore a safety margin."
+                          : "VRAM to keep free during auto-tune, so a later app switch or render job doesn't spill the model into slower shared memory. Drag all the way to the left to instead let auto-tune spill on purpose for more speed."
+                      }
                       value={vramHeadroom}
-                      min={300}
+                      min={0}
                       max={2048}
                       step={1}
-                      onChange={setVramHeadroom}
-                      fmt={(v) => (v >= 1024 ? `${(v / 1024).toFixed(1)} GB` : `${v} MB`)}
+                      // Snaps straight from 300 to 0 — 0 is a distinct "allow VRAM spill" opt-in
+                      // (VRAM_HEADROOM_SPILL_MB), not a smaller safety margin, so 1–299 isn't a
+                      // real intermediate value: only the literal minimum position drops to 0.
+                      onChange={(v) => setVramHeadroom(v === 0 ? 0 : Math.max(300, v))}
+                      fmt={(v) => (v === 0 ? '0 MB — spill allowed' : v >= 1024 ? `${(v / 1024).toFixed(1)} GB` : `${v} MB`)}
                     />
                   </div>
 

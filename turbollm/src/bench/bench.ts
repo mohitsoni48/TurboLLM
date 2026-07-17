@@ -12,7 +12,7 @@ import { execFile } from 'node:child_process'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { setModelProfile, getModelProfile, type BenchResult, type ConfigStore } from '../config/config'
+import { setModelProfile, getModelProfile, VRAM_HEADROOM_SPILL_MB, type BenchResult, type ConfigStore } from '../config/config'
 import type { Manager, StartOpts } from '../engines/manager'
 import type { Registry } from '../engines/registry'
 import type { Engine } from '../config/config'
@@ -520,7 +520,16 @@ export class BenchRunner {
   /** MoE models: pin `nCpuMoe` by VRAM probing (Phase 1), then run the full bench once (Phase 2).
    *  Fewer CPU experts = more on GPU = faster, so the best is the LOWEST nCpuMoe whose absolute VRAM
    *  still leaves the configured headroom. Found with cheap load-and-read-VRAM probes (no generation);
-   *  t/s is measured only at the winner. */
+   *  t/s is measured only at the winner. Then (founder-directed, 2026-07-17, gated to an explicit
+   *  headroom=0 opt-in after live testing showed the unconditional version silently overriding
+   *  the user's own configured safety margin): the headroom-safe winner isn't always the fastest
+   *  config for a MoE model — some real VRAM spill can still net a higher t/s. When (and ONLY
+   *  when) the user has set VRAM headroom to {@link VRAM_HEADROOM_SPILL_MB}, hill-climbs past the
+   *  safe winner, one nCpuMoe step at a time, for as long as each further step measures BOTH
+   *  generation AND prefill speed holding up (see `spillImproves`) — a step that trades away
+   *  prompt-processing speed for a small generation gain, or vice versa, isn't a real win. At any
+   *  real (non-zero) headroom this is skipped entirely — the
+   *  configured margin is honored as-is, exactly like every other search in this file. */
   private async moeSearch(
     entry: ModelEntry,
     sys: SysInfo,
@@ -563,6 +572,35 @@ export class BenchRunner {
       this.emit(`nCpuMoe=${bestN} exceeded headroom after generation (${found.cand.vramAbsMb} MB) — retrying at nCpuMoe=${bestN + 1}`)
       const safer = await this.benchAt(entry, sys, { ...base, nCpuMoe: bestN + 1 }, caps, results, `nCpuMoe=${bestN + 1} (headroom backoff)`)
       if (safer) found = safer
+    }
+    // VRAM-spill hill-climb (founder-directed, 2026-07-17) — ONLY when the user has explicitly
+    // opted in via VRAM_HEADROOM_SPILL_MB (0, Settings → Engine → Advanced). At any real headroom
+    // value this is skipped outright: live-testing the unconditional version showed it silently
+    // overriding the user's own configured safety margin, which this app never does anywhere else
+    // in the search (see the headroom-backoff check just above, which always honors it).
+    // From whatever the headroom-safe step landed on, keep moving MORE experts to the GPU one at
+    // a time — spilling past the configured headroom on purpose — for as long as each further
+    // step measures strictly faster. Stops (keeping the previous, better step) the instant a spill
+    // step measures no faster, OR fails outright (oom/crash/timeout) — a failed step is never
+    // treated as "an increase". Anchored on the ACTUAL nCpuMoe of `found` (not the pre-backoff
+    // `bestN`), since the headroom backoff above may have already moved off it. Floors at
+    // nCpuMoe=0 (every expert already on GPU).
+    if (headroomMb === VRAM_HEADROOM_SPILL_MB && found && found.cand.tps !== null) {
+      let current = found
+      while (current.cand.params.nCpuMoe > 0 && !this.cancelled && Date.now() <= this.deadline) {
+        const spillN = current.cand.params.nCpuMoe - 1
+        const prev = { tps: current.cand.tps as number, prefillTps: current.cand.prefillTps }
+        const prevLabel = `${prev.tps.toFixed(1)} tok/s (prefill ${prev.prefillTps !== null ? prev.prefillTps.toFixed(1) : 'n/a'} tok/s)`
+        this.emit(`nCpuMoe=${current.cand.params.nCpuMoe} measured ${prevLabel} — trying VRAM-spill nCpuMoe=${spillN}`)
+        const spillFound = await this.benchAt(entry, sys, { ...base, nCpuMoe: spillN }, caps, results, `nCpuMoe=${spillN} (VRAM-spill hill-climb)`)
+        if (!spillImproves(prev, spillFound?.cand ?? null)) {
+          this.emit(`nCpuMoe=${spillN} spill did not improve on ${prevLabel} (generation or prefill speed decreased) — stopping climb, keeping nCpuMoe=${current.cand.params.nCpuMoe}`)
+          break
+        }
+        current = spillFound as { cand: BenchCandidate; profile: LoadProfile }
+        this.state = { ...this.state, bestTps: current.cand.tps ?? undefined }
+      }
+      found = current
     }
     return found
   }
@@ -1395,6 +1433,27 @@ export function betterBySpeed(
   if (rel > OUTPUT_TIE) return true
   if (rel < -OUTPUT_TIE) return false
   return (a.prefillTps ?? 0) > (b.prefillTps ?? 0)
+}
+
+/** MoE VRAM-spill hill-climb decision (founder-directed, 2026-07-17; extended same day, after live
+ *  testing, to also guard prefill speed): should auto-tune keep moving another MoE expert onto the
+ *  GPU past the safe-headroom point? Stops (keeping the previous, better step) the instant EITHER
+ *  generation t/s OR prefill t/s decreases — a spill that trades away prompt-processing speed for
+ *  a small generation gain (or vice versa) isn't a real win. A failed candidate (null, or any
+ *  non-'ok' outcome) is never treated as an improvement. A candidate with no prefill reading is
+ *  treated the same as a decrease (fail-safe: this feature already trades away a real safety
+ *  margin for speed, so an unverifiable metric should never wave a spill step through) — but a
+ *  missing reading on the PREVIOUS step (nothing to compare against) just skips the prefill check
+ *  rather than blocking on it. No tie band here (unlike `betterBySpeed`): this is a
+ *  one-directional search for "still climbing", not a final-winner comparison. */
+export function spillImproves(
+  previous: { tps: number; prefillTps: number | null },
+  candidate: { outcome: BenchCandidate['outcome']; tps: number | null; prefillTps: number | null } | null,
+): boolean {
+  if (!candidate || candidate.outcome !== 'ok' || candidate.tps === null) return false
+  if (candidate.tps < previous.tps) return false
+  if (previous.prefillTps !== null && (candidate.prefillTps === null || candidate.prefillTps < previous.prefillTps)) return false
+  return true
 }
 
 /** Bytes per cached element for a KV-cache type (defaults to f16's 2 for unknown types). Note:

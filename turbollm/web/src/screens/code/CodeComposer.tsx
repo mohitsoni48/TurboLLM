@@ -109,6 +109,13 @@ export interface CodeComposerProps {
   contextFiles?: string[]
   onRemoveContextFile?: (path: string) => void
   hintText: string
+  /** A real, in-progress state (running / compacting) — founder feedback, 2026-07-17: the old
+   *  approach folded this into `hintText` as tiny 11px faint-gray text below the composer,
+   *  identical in weight to the boring "Enter to send" keyboard hint, so an actual in-flight
+   *  operation (especially manual /compact, which disables the whole composer) was easy to miss
+   *  entirely. Rendered instead as its own prominent, accent-colored banner directly ABOVE the
+   *  textarea when present; `hintText` stays reserved for the idle keyboard-shortcut copy. */
+  statusText?: string
 
   /** -1 = unlimited (default), 0 = off, N>0 = a real token cap — same control/semantics as
    *  ChatScreen's own thinking budget slider (chat-routes.ts's `thinkingBudget`), applied to
@@ -129,7 +136,7 @@ export function CodeComposer({
   repo, mode, onModeChange,
   models, loadedKey, loadedName, modelPending, ejecting, onLoadModel, onEjectModel, onModelSettings,
   ctxUsed, ctxMax, live, onStop, sendDisabled,
-  onAddContext, contextFiles, onRemoveContextFile, hintText, slashCommands = [],
+  onAddContext, contextFiles, onRemoveContextFile, hintText, statusText, slashCommands = [],
   thinkingBudget, onThinkingBudgetChange,
 }: CodeComposerProps) {
   const ModeIcon = MODE_ICONS[mode.id]
@@ -357,6 +364,22 @@ export function CodeComposer({
           </div>
         )}
 
+        {/* Prominent in-progress banner (running / compacting) — directly above the textarea,
+            accent-colored, its own row (not folded into the faint keyboard-hint text below). */}
+        {statusText && (
+          <div
+            className="flex items-center gap-2 border-b px-3 py-2 text-[13px] font-medium"
+            style={{
+              borderColor: 'color-mix(in srgb, var(--accent) 35%, var(--border))',
+              background: 'color-mix(in srgb, var(--accent) 12%, transparent)',
+              color: 'var(--accent)',
+            }}
+          >
+            <Loader2 size={14} className="shrink-0 animate-spin" />
+            <span>{statusText}</span>
+          </div>
+        )}
+
         {/* Task input */}
         <textarea
           ref={inputRef}
@@ -478,17 +501,16 @@ export function CodeComposer({
         </div>
       </div>
       </div>
-      {/* Persistent, always-visible busy indicator (founder-reported gap, 2026-07-13): the only
-          "is the agent busy" signal near the composer used to be this hint's plain STRING swap
-          (idle text ↔ running text) — no icon, no animation. The inline CodeThinking/
-          CodeStreamingEntry activity live INSIDE the scrolling transcript body and can be
-          scrolled out of view during a long run; this lives in the composer itself, so it's
-          visible regardless of scroll position. Reuses CodeThinking's own spinner styling
-          (Loader2, accent color) rather than inventing a new motion language. */}
-      <p className="mt-2 flex items-center justify-center gap-1.5 text-center text-[11px] text-faint">
-        {live && <Loader2 size={11} className="shrink-0 animate-spin" style={{ color: 'var(--accent)' }} />}
-        <span>{hintText}</span>
-      </p>
+      {/* Persistent, always-visible busy indicator (founder-reported gap, 2026-07-13; moved to
+          its own prominent banner ABOVE the textarea, 2026-07-17 — a second founder report that
+          folding it into this tiny 11px faint-gray hint made it too easy to miss for a real
+          in-progress state like manual /compact, which disables the whole composer). This line is
+          now ONLY the idle keyboard-shortcut copy — hidden entirely while `statusText` is
+          showing, since "Enter to send" is irrelevant (and wrong) while the composer is
+          disabled. */}
+      {!statusText && (
+        <p className="mt-2 text-center text-[11px] text-faint">{hintText}</p>
+      )}
     </div>
   )
 }

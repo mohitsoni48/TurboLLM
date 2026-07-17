@@ -20,7 +20,7 @@
 import type { Context, Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import type { Deps } from '../deps'
-import type { AgentRun } from '../chat/db'
+import type { AgentRun, Message } from '../chat/db'
 import { CodeRunManager } from './code-run-manager'
 import { compactCodeSession, disposeLspClientsForConv } from './code-session'
 import { revertFileEdits } from './revert'
@@ -31,6 +31,24 @@ function err(c: Context, s: S, code: string, msg: string) { return c.json({ erro
 async function body<T>(c: Context): Promise<T> { try { return await c.req.json() as T } catch { return {} as T } }
 
 const VALID_MODES = new Set<CodeMode>(['auto', 'plan', 'ask'])
+
+/** Pure validation for POST .../revert (founder bug report, 2026-07-17; corrected same day after
+ *  live-testing against a real 40-message session — see the route below for the full story): is
+ *  `messageId` a valid revert target in `messages`? Exported for direct unit testing without a
+ *  live route/DB/CodeRunManager. Deliberately does NOT decide any cut point — a revert deactivates
+ *  (is_active=0) `messageId` and everything after it (ConversationStore.deactivateMessagesFrom),
+ *  which correctly discards the reverted range while leaving everything BEFORE it untouched,
+ *  unlike the old clearedUpToMessageId-cursor approach this replaces. */
+export function resolveRevertCut(
+  messages: Message[],
+  messageId: string,
+): { ok: true; revertText: string } | { ok: false; error: 'not_found' | 'not_a_user_message' | 'no_earlier_message' } {
+  const idx = messages.findIndex((m) => m.id === messageId)
+  if (idx === -1) return { ok: false, error: 'not_found' }
+  if (messages[idx].role !== 'user') return { ok: false, error: 'not_a_user_message' }
+  if (idx === 0) return { ok: false, error: 'no_earlier_message' }
+  return { ok: true, revertText: messages[idx].content }
+}
 
 /** Formats attached context-file paths (the composer's "Add context" file picker) as a prompt
  *  instruction — PATHS only, never fetched/inlined content: the agent already has a real `read`
@@ -87,6 +105,7 @@ function toSidebarRow(run: AgentRun) {
     error: run.error,
     archivedAt: run.archivedAt,
     clearedUpToMessageId: run.clearedUpToMessageId,
+    revertedFromMessageId: run.revertedFromMessageId,
   }
 }
 
@@ -302,12 +321,15 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
   // that marker back to null — the messages were never deleted, so resuming restores the
   // conversation exactly as it was. Both blocked while a run is active, same rationale as
   // /compact: clearing/resuming out from under a turn mid-flight against the OLD history frame
-  // is confusing regardless of whether it would technically corrupt anything.
+  // is confusing regardless of whether it would technically corrupt anything. ALSO blocked while
+  // reverted (v33) — /clear and revert are two independent resumable hidden-states; stacking them
+  // on one session would leave /resume ambiguous about which one it's undoing.
   app.post('/api/v1/code/sessions/:id/clear', (c) => {
     const id = c.req.param('id')
     const run = db.getAgentRun(id)
     if (!run) return err(c, 404, 'not_found', 'Session not found.')
     if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop or wait for the current run before clearing.')
+    if (run.revertedFromMessageId) return err(c, 409, 'session_reverted', 'Resume this session before clearing — it currently has a reverted message pending.')
     const conv = db.getConversation(run.convId, true)
     const lastMsg = (conv?.messages ?? []).at(-1)
     if (!lastMsg) return err(c, 400, 'nothing_to_clear', 'Nothing to clear yet.')
@@ -321,17 +343,41 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
     const run = db.getAgentRun(id)
     if (!run) return err(c, 404, 'not_found', 'Session not found.')
     if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop or wait for the current run before resuming.')
+    // Undoes whichever of the two independent resumable hidden-states is active (v33) — they're
+    // mutually exclusive (see /clear and /revert's own guards), so at most one is ever set.
+    if (run.revertedFromMessageId) {
+      db.reactivateMessagesFrom(run.convId, run.revertedFromMessageId)
+      db.setRevertedFromMessageId(id, null)
+      return c.json({ ok: true })
+    }
     if (!run.clearedUpToMessageId) return err(c, 400, 'not_cleared', 'This session has not been cleared.')
     db.setClearedUpToMessageId(id, null)
     return c.json({ ok: true })
   })
 
   // ── revert to a user message ──────────────────────────────────────────────────
-  // Rewinds the transcript to just before `messageId` (reusing the SAME clearedUpToMessageId
-  // mechanism /clear + /resume already use — nothing is deleted, /resume still un-hides it) and
-  // returns that message's original text so the caller can refill the composer with it.
+  // Rewinds the transcript to just before `messageId` by DEACTIVATING (is_active=0) it and every
+  // message after it — ConversationStore.deactivateMessagesFrom, the same mechanism Chat's own
+  // branching already relies on (getMessages() filters is_active=1 unconditionally, so a
+  // deactivated message disappears from every consumer — transcript, resolveEffectiveHistory,
+  // revertFileEdits below — with no separate cut-logic needed anywhere). Nothing is deleted;
+  // /resume reactivates the same range. Returns messageId's original text so the caller can
+  // refill the composer with it.
+  //
+  // Corrected 2026-07-17 (same day, live-tested against a real 40-message session): a first pass
+  // reused clearedUpToMessageId (the /clear + /resume cursor) instead. That mechanism can only
+  // express "hide everything BEFORE a point, show everything after" — backwards from what revert
+  // needs (discard the reverted message and everything AFTER it, keep everything before), and
+  // structurally incapable of that for any message that isn't already at the very end: reverting
+  // to the session's actual last user message left that message's own reply orphaned and visible
+  // with nothing above it, and reverting to an EARLIER message (the revert affordance appears on
+  // every user message, not just the last — CodeTranscript.tsx) would have hidden the wrong half
+  // of history entirely. Real per-message deactivation fixes both, and generalizes correctly to
+  // any revert target, not just the last message.
+  //
   // Optionally (revertFiles) also reverse-applies every 'edit' tool call's stored patch for the
   // discarded messages, walking any touched file back to its pre-edit content — see revert.ts.
+  // ALSO blocked while cleared (v33) — same mutual-exclusion rationale as /clear's own guard.
   app.post('/api/v1/code/sessions/:id/revert', async (c) => {
     const id = c.req.param('id')
     const b = await body<{ messageId?: string; revertFiles?: boolean }>(c)
@@ -342,28 +388,31 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
     if (!run) return err(c, 404, 'not_found', 'Session not found.')
     if (!run.repoRoot) return err(c, 400, 'invalid_input', 'Session has no repo root.')
     if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop or wait for the current run before reverting.')
+    if (run.clearedUpToMessageId) return err(c, 409, 'session_cleared', 'Resume this session before reverting — it currently has cleared messages pending.')
+    if (run.revertedFromMessageId) return err(c, 409, 'session_reverted', 'Resume this session before reverting again — it already has a reverted message pending.')
     const conv = db.getConversation(run.convId, true)
     if (!conv) return err(c, 404, 'not_found', 'Session conversation not found.')
 
     const messages = conv.messages ?? []
-    const idx = messages.findIndex((m) => m.id === messageId)
-    if (idx === -1) return err(c, 404, 'not_found', 'Message not found.')
-    if (messages[idx].role !== 'user') return err(c, 400, 'invalid_input', 'Can only revert to a user message.')
-    if (idx === 0) return err(c, 400, 'invalid_input', 'This is the first message in the session — nothing before it to revert to.')
-
-    const cutMessage = messages[idx - 1]
-    const revertText = messages[idx].content
+    const cut = resolveRevertCut(messages, messageId)
+    if (!cut.ok) {
+      if (cut.error === 'not_found') return err(c, 404, 'not_found', 'Message not found.')
+      if (cut.error === 'not_a_user_message') return err(c, 400, 'invalid_input', 'Can only revert to a user message.')
+      return err(c, 400, 'invalid_input', 'This is the first message in the session — nothing before it to revert to.')
+    }
 
     let revertedFiles: string[] = []
     let failedFiles: string[] = []
     if (b.revertFiles) {
+      const idx = messages.findIndex((m) => m.id === messageId)
       const result = revertFileEdits(messages.slice(idx), run.repoRoot)
       revertedFiles = result.reverted
       failedFiles = result.failed
     }
 
-    db.setClearedUpToMessageId(id, cutMessage.id)
-    return c.json({ ok: true, clearedUpToMessageId: cutMessage.id, revertText, revertedFiles, failedFiles })
+    db.deactivateMessagesFrom(run.convId, messageId)
+    db.setRevertedFromMessageId(id, messageId)
+    return c.json({ ok: true, revertedFromMessageId: messageId, revertText: cut.revertText, revertedFiles, failedFiles })
   })
 
   // ── stop the in-flight run (+ drop the queue) ─────────────────────────────────
