@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildDirName, CMAKE_CONFIGURE_ARGS, isIncompleteMetalBackendError, pickGenerator, vcvarsBatch, stripGenericAsmLanguage, sameRepo, sourceBuildDirOf } from './build-runner'
+import { buildDirName, CMAKE_CONFIGURE_ARGS, isIncompleteMetalBackendError, pickGenerator, vcvarsBatch, stripGenericAsmLanguage, sameRepo, sourceBuildDirOf, notCmakeProjectError } from './build-runner'
 import { join } from 'node:path'
 
 test('buildDirName: repo name from a .git URL, branch appended', () => {
@@ -148,4 +148,16 @@ test('sourceBuildDirOf: derives the build dir from a source-built binPath', () =
 test('sourceBuildDirOf: null for a non-source-build binary path', () => {
   const root = join('C:', 'e')
   assert.equal(sourceBuildDirOf(join(root, 'turboquant', 'llama-server.exe'), root), null)
+})
+
+// GitHub #61: exllamav3 (a pure-Python engine, no CMakeLists.txt) failed 1-click build with a
+// bare "cmake exited with code 1" and no explanation. notCmakeProjectError fails fast instead.
+test('notCmakeProjectError: null (no error) when CMakeLists.txt is present', () => {
+  assert.equal(notCmakeProjectError(true), null)
+})
+
+test('notCmakeProjectError: actionable message when CMakeLists.txt is absent', () => {
+  const msg = notCmakeProjectError(false)
+  assert.ok(msg && /CMakeLists\.txt/.test(msg))
+  assert.ok(msg && /llama\.cpp/.test(msg))
 })
