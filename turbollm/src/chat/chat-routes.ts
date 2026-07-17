@@ -1324,6 +1324,17 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
 
 // ── auto title generation ──────────────────────────────────────────────────
 
+/** PURE: the last `n` actual conversation turns to ground title generation in — excludes the
+ *  injected system prompt (capability boilerplate + persona + personalization + auto-memory
+ *  facts, see buildSystemPrompt). For a BRAND NEW conversation — exactly when auto-title fires —
+ *  engineMessages is just [system, user], so a plain `.slice(-n)` grabs the memory-stuffed
+ *  system message right alongside the real first message. A model handed a hefty "what I know
+ *  about you" block next to one short user turn often titled the chat off THAT instead of what
+ *  was actually asked (GitHub: "gets title based on memory and not based on msg I send"). */
+export function recentTitleTurns(messages: { role: string; content: unknown }[], n = 2): { role: string; content: unknown }[] {
+  return messages.filter((m) => m.role !== 'system').slice(-n)
+}
+
 async function autoTitle(
   d: Deps,
   convId: string,
@@ -1335,7 +1346,7 @@ async function autoTitle(
     const ms = d.manager.status()
     if (ms.state !== 'running') return
     const titleMessages = [
-      ...prevMessages.slice(-2),
+      ...recentTitleTurns(prevMessages),
       { role: 'assistant', content: assistantReply.slice(0, 500) },
       {
         role: 'user',
