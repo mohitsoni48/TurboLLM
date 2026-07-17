@@ -25,6 +25,66 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.8.1] - 2026-07-17
+
+**A large batch of reliability fixes — auto-tune accuracy, Code's revert-to-message and /compact,
+and a real VRAM-detection bug — plus an opt-in MoE auto-tune "VRAM-spill" search.**
+
+### Added
+- **MoE auto-tune "VRAM-spill" search** (opt-in) — set VRAM headroom to 0 (Settings → Models &
+  loading → Advanced) to let auto-tune keep pushing more experts onto the GPU past its normal
+  safety margin, as long as both generation AND prompt-processing speed keep improving. Off by
+  default; your configured headroom is otherwise always honored exactly as before.
+- Auto-tune's results dialog now also shows prefill (prompt-processing) speed, not just generation
+  speed.
+
+### Fixed
+- **Auto-tune vs. real chat speed gap** — the benchmark now uses a representative prompt and depth
+  instead of a short generic one, so the tok/s it reports is much closer to what you'll actually
+  see in a real conversation.
+- **Auto-tune no longer picks the KV-cache type for you** — it tunes GPU/CPU offload on whichever
+  KV type you already have selected, and shows an advisory note (not an automatic switch) when a
+  faster type is available. Fixes a case where the "quality-preserving" pick auto-tune made was
+  measurably slower and used more VRAM than a manual choice.
+- Auto-tune wrongly skipped single-GPU placement whenever a model missed fitting fully on one card
+  by even a hair, forcing a slower cross-GPU split even when the split had plenty of room to spare
+  (#62). A related fix stops a noisy VRAM reading from silently ruling out a smaller KV-cache type.
+- Auto-tune could lose an unsaved manual config edit when a run started, and Cancel could take up
+  to 8 seconds to actually stop.
+- **AMD/Intel dedicated GPUs on Windows could be reported as ~4 GB VRAM** regardless of their real
+  size, due to a 32-bit limit in the Windows API used to read it (#63).
+- **1-click engine build failed with a bare "Code 1"** for a repo that isn't a CMake project (e.g.
+  exllamav3) — now fails fast with a clear explanation instead (#61).
+- **Code: long sessions that ran out of context just failed** instead of compacting, with no way
+  to continue; a related crash from a background language-server message race is also fixed (#60).
+- **Code: revert-to-message was fundamentally broken** — reverting to an earlier message could
+  leave it (and its reply) still showing, or in some cases hide the wrong part of the conversation
+  entirely. Reverting now correctly discards the reverted message and everything after it, and
+  `/resume` still brings it back exactly as before.
+- **Code: manual `/compact` always said "nothing to compact,"** no matter how long the real
+  conversation was — root-caused to how a session's most recent turn interacted with the
+  underlying compaction logic. Also added a real "Compacting conversation…" indicator; previously
+  the composer just went blank with no feedback while it worked.
+- Code: Blank persona could still leak tool instructions into the model despite promising none; an
+  aborted/empty message kept showing Copy/Edit controls; an interrupted generation could show 0
+  tokens even though real output was saved; and hover-only actions in chat/Code were unreachable on
+  touch devices — all fixed.
+- Code: custom-added engines (via "Add via git repo" or a manual path) now get the same
+  Disable/Enable/Delete/Rebuild controls a built-in catalog engine has.
+- Sidebar conversation titles now update live without a page reload; an auto-generated title no
+  longer gets derailed by injected memory facts on a brand-new chat.
+- macOS engine parity fixes (Metal builds, Rapid-MLX, and other cross-engine fixes) (#50).
+
+### Discord
+- Fixed a real VRAM-detection bug that showed some AMD/Intel GPUs as ~4 GB regardless of their
+  actual size.
+- Auto-tune is noticeably more accurate now — it no longer silently picks a slower KV-cache type
+  or skips single-GPU placement when it shouldn't, and its benchmark better matches real chat speed.
+- Code's revert-to-message and manual `/compact` were both broken in ways that made long coding
+  sessions painful — both are fixed, and `/compact` now shows real progress instead of going silent.
+- New opt-in "VRAM-spill" search for MoE models — trade a configurable safety margin for extra
+  speed, only if you turn it on.
+
 ## [1.8.0] - 2026-07-14
 
 **Code — a local coding agent that reads, edits, and runs commands in a real project directory,

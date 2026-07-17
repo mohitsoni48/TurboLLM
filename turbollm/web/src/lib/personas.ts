@@ -87,7 +87,7 @@ const TURBOLLM_KNOWLEDGE =
 
   '**Settings** — a two-pane layout, six categories in the left rail, one sticky Save bar:\n' +
   '- **General**: theme (light/dark/system), enable-thinking-by-default, confirm-before-delete, personalization (assistant name / your name), **Memory** — its toggle now lives in Experimental (see below); when on, the reviewable/deletable fact list still shows here, auto-generate chat titles, open browser on start.\n' +
-  '- **Models & loading**: idle timeout (auto-stop after N minutes), default context length, Gateway (auto model-swap + Keep-N pool, 1–4 models), model folders, Hugging Face token, and an **Advanced** collapsible for expert knobs — default GPU layers, VRAM headroom (300 MB–2 GB, default 1 GB), and image/response token caps.\n' +
+  '- **Models & loading**: idle timeout (auto-stop after N minutes), default context length, Gateway (auto model-swap + Keep-N pool, 1–4 models), model folders, Hugging Face token, and an **Advanced** collapsible for expert knobs — default GPU layers, VRAM headroom (300 MB–2 GB, default 1 GB, or drag to 0 to opt into MoE auto-tune\'s "VRAM-spill" search — see Auto-Tune below), and image/response token caps.\n' +
   '- **Tools & safety**: per-tool Ask/Allow/Deny defaults for every tool the model can call (web_search, fetch_url, run_code, MCP tools).\n' +
   '- **Network & sharing**: LAN exposure (bind to 0.0.0.0 vs loopback-only), port, require-API-key auth, and ComfyUI integration (URL, Reverse GPU gate, update banner).\n' +
   '- **Experimental**: still-in-progress features, off by default — a single on/off row each for **Memory** (silently extracts durable facts from chat using the loaded model; its own settings stay in General, unlocked once this is on), **Code** (the Workspace → Code tab; disabling this removes the tab entirely, not just its content), and **Cloud Launch/RunPod** (earliest-stage of the three — turning it on doesn\'t yet unlock a built UI).\n' +
@@ -118,11 +118,10 @@ const TURBOLLM_KNOWLEDGE =
 
   '## Auto-Tune\n\n' +
   'Auto-tune finds the best GPU-offload config for a model given available VRAM. It runs a binary search, not a fixed candidate list. Triggered from the Model Detail panel.\n\n' +
-  '**Phase 1 — KV quant sweep** (VRAM probes, no generation):\n' +
-  'Tests quality-preserving KV cache types from best to smaller: f16 → q8_0 → turbo4 (TurboQuant only) / q4_0. Picks the highest-quality type that fits within the configured VRAM headroom buffer (Settings → Models & loading → Advanced, default 1 GB, adjustable 300 MB–2 GB). Lower-quality types (q4_0, q4_1) are never auto-selected — quality floor is enforced.\n\n' +
-  '**Phase 2 — Binary search for GPU offload** (~log₂(blockCount) probes, VRAM-only):\n' +
-  '- Dense models: search ngl ∈ [0, blockCount] — finds highest ngl that doesn\'t exceed the VRAM headroom.\n' +
-  '- MoE models: search nCpuMoe ∈ [0, nExpertsTotal] — ngl stays maxed, finds minimum nCpuMoe (router experts on CPU) that fits. Reducing nCpuMoe pushes more MoE routing onto the GPU.\n\n' +
+  '**Phase 1 — Offload search** (VRAM probes, no generation), on whatever KV-cache type you already have selected — auto-tune no longer picks the KV type for you:\n' +
+  '- Dense models: search ngl ∈ [0, blockCount] — finds highest ngl that doesn\'t exceed the configured VRAM headroom buffer (Settings → Models & loading → Advanced, default 1 GB, adjustable 300 MB–2 GB).\n' +
+  '- MoE models: search nCpuMoe ∈ [0, nExpertsTotal] — ngl stays maxed, finds minimum nCpuMoe (router experts on CPU) that fits the headroom. Reducing nCpuMoe pushes more MoE routing onto the GPU. If VRAM headroom is set to 0 (an explicit opt-in, not the default), MoE models then hill-climb PAST that safe point — pushing nCpuMoe lower still, for as long as each further step measures both generation AND prompt-processing speed still improving.\n' +
+  '- If the winning config is slow (under 20 tok/s) and a smaller, non-lossy KV type would fit, the results dialog shows an advisory naming it — it never switches the type automatically.\n\n' +
   '**Phase 3 — Real benchmark at winner config**:\n' +
   'One real prefill + generation run. Bench prompt: `min(50,000 tokens, ctx × 75%)`. Per-test cap: 3 minutes. Stop/restart/load cancel a running auto-tune. Records prefill t/s, generation t/s, TTFT ms, and VRAM delta.\n\n' +
   '**Phase 4 — Recommended sampling extraction**:\n' +

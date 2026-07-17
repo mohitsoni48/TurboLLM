@@ -12,9 +12,9 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { toolsForMode, buildAppendPrompt, skillsBlock, skillCatalogBlock, type CodeMode } from './persona'
-import { toSessionStatus } from './code-routes'
-import { MUTATING_TOOLS, PATH_TOOLS, resolveEffectiveHistory, compactCodeSession, isDependencyAddCommand, compactionSettingsFor } from './code-session'
-import { ConversationStore } from '../chat/db'
+import { toSessionStatus, resolveRevertCut } from './code-routes'
+import { MUTATING_TOOLS, PATH_TOOLS, resolveEffectiveHistory, compactCodeSession, isDependencyAddCommand, compactionSettingsFor, keepRecentTokensFor } from './code-session'
+import { ConversationStore, type Message } from '../chat/db'
 import type { Deps } from '../deps'
 import type { Skill } from '../agents/skills'
 
@@ -47,6 +47,127 @@ test('toSessionStatus: failed / cancelled / interrupted → aborted', () => {
 test('toSessionStatus: running / queued → review', () => {
   assert.equal(toSessionStatus('running'), 'review')
   assert.equal(toSessionStatus('queued'), 'review')
+})
+
+// ── resolveRevertCut (code-routes.ts) — validation only; the actual hide/show behavior is now
+// ConversationStore.deactivateMessagesFrom (below), not a clearedUpToMessageId cut point ---------
+
+function makeRevertConv(): { store: ConversationStore; convId: string } {
+  const store = new ConversationStore(mkdtempSync(join(tmpdir(), 'tllm-revert-cut-')))
+  const conv = store.createConversation({ kind: 'code' })
+  return { store, convId: conv.id }
+}
+
+test('resolveRevertCut: a valid target returns its original text', () => {
+  const { store, convId } = makeRevertConv()
+  store.addMessage(convId, 'user', 'first task')
+  store.addMessage(convId, 'assistant', 'first reply')
+  const m1 = store.addMessage(convId, 'user', 'second task')
+  store.addMessage(convId, 'assistant', 'second reply')
+
+  const messages = store.getConversation(convId, true)!.messages!
+  assert.deepEqual(resolveRevertCut(messages, m1.id), { ok: true, revertText: 'second task' })
+})
+
+test('resolveRevertCut: reverting to a non-user message is rejected', () => {
+  const { store, convId } = makeRevertConv()
+  store.addMessage(convId, 'user', 'task')
+  const reply = store.addMessage(convId, 'assistant', 'reply')
+  const messages = store.getConversation(convId, true)!.messages!
+  assert.deepEqual(resolveRevertCut(messages, reply.id), { ok: false, error: 'not_a_user_message' })
+})
+
+test('resolveRevertCut: reverting to the FIRST message is rejected (nothing earlier to keep)', () => {
+  const { store, convId } = makeRevertConv()
+  const first = store.addMessage(convId, 'user', 'first task')
+  const messages = store.getConversation(convId, true)!.messages!
+  assert.deepEqual(resolveRevertCut(messages, first.id), { ok: false, error: 'no_earlier_message' })
+})
+
+test('resolveRevertCut: unknown message id is rejected', () => {
+  const { store, convId } = makeRevertConv()
+  store.addMessage(convId, 'user', 'task')
+  const messages = store.getConversation(convId, true)!.messages!
+  assert.deepEqual(resolveRevertCut(messages, 'does-not-exist'), { ok: false, error: 'not_found' })
+})
+
+// ── ConversationStore.deactivateMessagesFrom / reactivateMessagesFrom (db.ts) — the real
+// revert-to-message mechanism (v33), replacing the clearedUpToMessageId reuse the founder caught
+// live-testing against a real 40-message session (AMOLEDBurnFix): reverting to the session's
+// actual LAST user message left that message's own reply orphaned and visible with nothing above
+// it, since clearedUpToMessageId can only hide a PREFIX and show a SUFFIX — backwards from what a
+// revert needs. Real per-message deactivation fixes this generally, for any revert target -------
+
+test('deactivateMessagesFrom: hides the target message AND everything after it, but nothing before', () => {
+  const { store, convId } = makeRevertConv()
+  store.addMessage(convId, 'user', 'first task')
+  store.addMessage(convId, 'assistant', 'first reply')
+  const m1 = store.addMessage(convId, 'user', 'second task')
+  store.addMessage(convId, 'assistant', 'second reply')
+
+  const affected = store.deactivateMessagesFrom(convId, m1.id)
+  assert.equal(affected, 2, 'the reverted message + its own reply')
+  const visible = store.getMessages(convId)
+  assert.deepEqual(visible.map((m) => m.content), ['first task', 'first reply'], 'everything before the reverted message stays visible; nothing orphaned after it')
+})
+
+test('deactivateMessagesFrom: reverting to the actual LAST user message hides its own reply too (the exact reported bug)', () => {
+  const { store, convId } = makeRevertConv()
+  store.addMessage(convId, 'user', 'go do the thing')
+  const lastUser = store.addMessage(convId, 'user', 'delete them no needed')
+  store.addMessage(convId, 'assistant', 'Done. The store-assets/ directory has been deleted.')
+
+  store.deactivateMessagesFrom(convId, lastUser.id)
+  const visible = store.getMessages(convId)
+  assert.deepEqual(visible.map((m) => m.content), ['go do the thing'])
+  assert.ok(!visible.some((m) => m.id === lastUser.id))
+})
+
+test('deactivateMessagesFrom: reverting to an EARLY message preserves everything before it, unlike a clearedUpToMessageId cut', () => {
+  const { store, convId } = makeRevertConv()
+  store.addMessage(convId, 'user', 'm0')
+  store.addMessage(convId, 'assistant', 'r0')
+  const early = store.addMessage(convId, 'user', 'm1') // revert target, well before the end
+  store.addMessage(convId, 'assistant', 'r1')
+  store.addMessage(convId, 'user', 'm2')
+  store.addMessage(convId, 'assistant', 'r2')
+
+  store.deactivateMessagesFrom(convId, early.id)
+  assert.deepEqual(store.getMessages(convId).map((m) => m.content), ['m0', 'r0'])
+})
+
+test('deactivateMessagesFrom: unknown message id is a no-op (0 rows), never throws', () => {
+  const { store, convId } = makeRevertConv()
+  store.addMessage(convId, 'user', 'task')
+  assert.equal(store.deactivateMessagesFrom(convId, 'does-not-exist'), 0)
+  assert.equal(store.getMessages(convId).length, 1, 'untouched')
+})
+
+test('reactivateMessagesFrom: undoes deactivateMessagesFrom exactly, restoring full history (the /resume contract)', () => {
+  const { store, convId } = makeRevertConv()
+  store.addMessage(convId, 'user', 'first task')
+  const m1 = store.addMessage(convId, 'user', 'second task')
+  store.addMessage(convId, 'assistant', 'second reply')
+
+  store.deactivateMessagesFrom(convId, m1.id)
+  assert.equal(store.getMessages(convId).length, 1)
+  const restored = store.reactivateMessagesFrom(convId, m1.id)
+  assert.equal(restored, 2)
+  assert.deepEqual(store.getMessages(convId).map((m) => m.content), ['first task', 'second task', 'second reply'])
+})
+
+test('reactivateMessagesFrom: a NEW message sent after a revert is unaffected by a later /resume of that revert', () => {
+  const { store, convId } = makeRevertConv()
+  store.addMessage(convId, 'user', 'first task')
+  const m1 = store.addMessage(convId, 'user', 'second task (attempt 1)')
+  store.deactivateMessagesFrom(convId, m1.id)
+  // Resend after the revert — appended fresh, same as the real /messages route would do.
+  store.addMessage(convId, 'user', 'second task (attempt 2)')
+  assert.deepEqual(store.getMessages(convId).map((m) => m.content), ['first task', 'second task (attempt 2)'])
+
+  // Resuming (undoing) the revert brings attempt 1 back WITHOUT disturbing attempt 2.
+  store.reactivateMessagesFrom(convId, m1.id)
+  assert.deepEqual(store.getMessages(convId).map((m) => m.content), ['first task', 'second task (attempt 1)', 'second task (attempt 2)'])
 })
 
 // ── tool-set contracts ──────────────────────────────────────────────────────────────
@@ -96,6 +217,74 @@ test('compactionSettingsFor: monotonically non-decreasing with contextWindow (be
   const big = compactionSettingsFor(65536)
   assert.ok(big.reserveTokens >= small.reserveTokens)
   assert.ok(big.keepRecentTokens >= small.keepRecentTokens)
+})
+
+// ── keepRecentTokensFor (code-session.ts) — founder-reported, 2026-07-17 ("I have never yet
+// successfully compacted... keeps saying conversation is short"). Root-caused live against a
+// real 272K-token AMOLEDBurnFix session: pi's own bundled findCutPoint has a genuine bug where a
+// trailing tool-call-only run bigger than keepRecentTokens makes it silently keep EVERYTHING
+// instead of falling back to the last real cut point. This guards against it by ensuring
+// keepRecentTokens is never smaller than the conversation's own last turn -----------------------
+
+function fakeTurnMsg(role: 'user' | 'assistant', content: string, toolResults: string[] = []): Message {
+  return {
+    role,
+    content,
+    toolCalls: toolResults.map((result, i) => ({ id: `tc${i}`, name: 'read', args: {}, result })),
+  } as unknown as Message
+}
+
+test('keepRecentTokensFor: leaves the base value untouched when the last turn is small', () => {
+  const messages = [fakeTurnMsg('user', 'hi'), fakeTurnMsg('assistant', 'hello')]
+  assert.equal(keepRecentTokensFor(messages, 20000), 20000)
+})
+
+test('keepRecentTokensFor: bumps keepRecentTokens past a large trailing tool-call-only turn', () => {
+  const bigResult = 'x'.repeat(40000) // ~10,000 tokens each
+  const messages = [
+    fakeTurnMsg('user', 'first task'),
+    fakeTurnMsg('assistant', 'reply', ['small']),
+    fakeTurnMsg('user', 'do something big'),
+    fakeTurnMsg('assistant', 'working on it', [bigResult, bigResult]),
+  ]
+  const bumped = keepRecentTokensFor(messages, 2867) // compactionSettingsFor(8192)'s own value
+  assert.ok(bumped > 2867, 'should be bumped above the small base')
+  assert.ok(bumped >= Math.ceil((bigResult.length * 2) / 4), "should cover the last turn's real size")
+})
+
+test('keepRecentTokensFor: reproduces the exact reported bug scenario and confirms the fix covers it', () => {
+  // Mirrors the real AMOLEDBurnFix session that reproduced this: the LAST turn alone (one
+  // assistant message + ~30 tool results) summed to ~12K estimated tokens — bigger than
+  // compactionSettingsFor's own scaled keepRecentTokens for an 8K or 32K local context (2867 /
+  // 11469), which is exactly what made pi's findCutPoint fail every time.
+  const toolResults = Array.from({ length: 30 }, () => 'y'.repeat(1600)) // ~12,000 tokens total
+  const messages = [
+    fakeTurnMsg('user', 'first task'),
+    fakeTurnMsg('assistant', 'first reply'),
+    fakeTurnMsg('user', 'delete them no needed'),
+    fakeTurnMsg('assistant', 'Done.', toolResults),
+  ]
+  const lastTurnTokens = toolResults.reduce((sum, r) => sum + Math.ceil(r.length / 4), 0)
+  assert.ok(lastTurnTokens > 11469, 'sanity: the synthetic last turn must exceed the 32K-ctx scaled threshold to reproduce the bug')
+  const bumped = keepRecentTokensFor(messages, 11469)
+  assert.ok(bumped > lastTurnTokens, 'bumped keepRecentTokens must exceed the whole last turn, not just be somewhat bigger')
+})
+
+test('keepRecentTokensFor: no user message at all returns the base unchanged', () => {
+  const messages = [fakeTurnMsg('assistant', 'just a reply, no user turn')]
+  assert.equal(keepRecentTokensFor(messages, 5000), 5000)
+})
+
+test('keepRecentTokensFor: only counts the LAST turn, not the whole conversation', () => {
+  const bigOldResult = 'z'.repeat(400000) // huge, but from an EARLIER turn
+  const messages = [
+    fakeTurnMsg('user', 'old big task'),
+    fakeTurnMsg('assistant', 'huge old reply', [bigOldResult]),
+    fakeTurnMsg('user', 'small recent task'),
+    fakeTurnMsg('assistant', 'small recent reply'),
+  ]
+  // The last turn (small recent task + reply) is tiny — the huge earlier turn must NOT inflate it.
+  assert.equal(keepRecentTokensFor(messages, 20000), 20000)
 })
 
 test('isDependencyAddCommand: detects install/add commands across common package managers', () => {

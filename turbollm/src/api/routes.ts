@@ -7,7 +7,7 @@ import { basename, dirname, join, resolve } from 'node:path'
 import { GATE_VERSION, gateNodeSource } from '../comfyui/gate-template'
 import { randomUUID } from 'node:crypto'
 import { homedir, networkInterfaces } from 'node:os'
-import { ValueError, getModelProfile, setModelProfile, deleteModelProfile, VRAM_HEADROOM_MIN_MB, VRAM_HEADROOM_MAX_MB, type ApiKey, type Engine, type McpServer } from '../config/config'
+import { ValueError, getModelProfile, setModelProfile, deleteModelProfile, VRAM_HEADROOM_MIN_MB, VRAM_HEADROOM_MAX_MB, VRAM_HEADROOM_SPILL_MB, type ApiKey, type Engine, type McpServer } from '../config/config'
 import type { Deps } from '../deps'
 import { type ModelInfo, type StartOpts } from '../engines/manager'
 import { abortAllInFlightChats } from '../chat/chat-routes'
@@ -1565,8 +1565,11 @@ export function registerApi(app: Hono, d: Deps): void {
     let vramHeadroomMb: number | undefined
     if (b.vramHeadroomMb !== undefined) {
       const v = Number(b.vramHeadroomMb)
-      if (!Number.isFinite(v) || v < VRAM_HEADROOM_MIN_MB || v > VRAM_HEADROOM_MAX_MB) {
-        return err(c, 400, 'invalid_config_value', `vramHeadroomMb must be ${VRAM_HEADROOM_MIN_MB}–${VRAM_HEADROOM_MAX_MB}.`)
+      // VRAM_HEADROOM_SPILL_MB (0) is a distinct, valid opt-in value — not part of the
+      // MIN_MB–MAX_MB safety-margin range, but not out-of-range either.
+      const valid = v === VRAM_HEADROOM_SPILL_MB || (v >= VRAM_HEADROOM_MIN_MB && v <= VRAM_HEADROOM_MAX_MB)
+      if (!Number.isFinite(v) || !valid) {
+        return err(c, 400, 'invalid_config_value', `vramHeadroomMb must be ${VRAM_HEADROOM_SPILL_MB} (allow VRAM spill) or ${VRAM_HEADROOM_MIN_MB}–${VRAM_HEADROOM_MAX_MB}.`)
       }
       vramHeadroomMb = Math.round(v)
     }

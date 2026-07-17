@@ -188,6 +188,46 @@ export function compactionSettingsFor(contextWindow: number): { enabled: boolean
   return { enabled: true, reserveTokens, keepRecentTokens }
 }
 
+/** Rough chars/4 token estimate for one DB message + its tool calls' args/results — mirrors pi's
+ *  own heuristic (compaction.js's estimateTokens) closely enough to size a safety margin against
+ *  (see keepRecentTokensFor below), not to reproduce pi's count exactly. */
+export function estimateMessageTokensRough(m: DbMessage): number {
+  let chars = m.content.length
+  for (const tc of m.toolCalls) {
+    chars += tc.name.length + JSON.stringify(tc.args).length // the assistant's own toolCall block
+    chars += (tc.result ?? tc.error ?? '').length // the separate toolResult entry
+  }
+  return Math.ceil(chars / 4)
+}
+
+/** Founder-reported, 2026-07-17 ("I have never yet successfully compacted... keeps saying
+ *  conversation is short") — root-caused against a real 272K-token AMOLEDBurnFix session: pi's
+ *  bundled findCutPoint (compaction.js) has a genuine bug. It walks backward from the newest
+ *  entry accumulating token estimates until `keepRecentTokens` is reached, then searches for the
+ *  closest valid cut point AT OR AFTER that position — but a "cut point" can only be a user/
+ *  assistant/etc. message, never a tool result (pi's own rule: never cut a tool call apart from
+ *  its result). When a session's LAST turn is a heavy tool-call turn (common in agentic coding —
+ *  a single turn easily has dozens of tool results with no later user/assistant message), and
+ *  `keepRecentTokens` is smaller than that whole trailing run's size, the threshold gets crossed
+ *  entirely INSIDE that run — where there is no valid cut point at or after the crossing position
+ *  — so the search comes up empty and silently falls back to keeping EVERYTHING (cutIndex 0)
+ *  instead of the last real cut point, reporting "nothing to compact" no matter how large the
+ *  actual conversation is. Reproduced directly: a real session's trailing tool-call run alone
+ *  summed to ~12K estimated tokens; keepRecentTokens=2867/11469 (compactionSettingsFor's own
+ *  scaled values for an 8K/32K local context — ADR-224) both hit the bug, 12000+ did not.
+ *  Can't patch the bundled dependency, so work around it here: never let keepRecentTokens end up
+ *  smaller than the conversation's own last turn, so pi's threshold-crossing walk always lands at
+ *  or before a real cut point instead of running past every one of them. `messages` should be
+ *  whatever pi is about to have seeded (repriorMessages for auto-compaction, the full
+ *  effectiveMessages for manual /compact) — NOT the live in-flight turn, which isn't seeded yet. */
+export function keepRecentTokensFor(messages: DbMessage[], baseKeepRecentTokens: number): number {
+  const lastUserIdx = messages.map((m) => m.role).lastIndexOf('user')
+  if (lastUserIdx === -1) return baseKeepRecentTokens
+  let lastTurnTokens = 0
+  for (let i = lastUserIdx; i < messages.length; i++) lastTurnTokens += estimateMessageTokensRough(messages[i])
+  return Math.max(baseKeepRecentTokens, lastTurnTokens + 512) // margin past the exact boundary
+}
+
 /** A minimal SSE sink — matches the chat wire shape so the existing frontend parser works. */
 export type CodeSseSink = (ev: { event: string; data: unknown }) => void | Promise<void>
 
@@ -305,17 +345,23 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
   // ── in-memory pi services (no global pi config on disk) ──────────────────────
   const authStorage = AuthStorage.inMemory()
   const modelRegistry = ModelRegistry.inMemory(authStorage)
-  // Auto-compaction settings scaled to THIS model's real ctx (see compactionSettingsFor) — pi's
-  // own hosted-model-sized defaults would otherwise make auto-compaction self-defeating here.
-  const settingsManager = SettingsManager.inMemory({ compaction: compactionSettingsFor(contextWindow) })
   // Seed prior turns (see seedPriorHistory's own comment), respecting any existing manual
   // /compact — everything up to but NOT including the current turn's user message.
   // code-run-manager.ts's pump() has already appended both `task`'s own user message AND an
   // empty assistant placeholder for THIS turn by the time we get here, so the current turn is
-  // excluded by cutting at the last user message, not by seq.
+  // excluded by cutting at the last user message, not by seq. Computed BEFORE settingsManager
+  // below (moved up from its original spot) since keepRecentTokensFor needs priorMessages.
   const { summaryText, messages: effectiveMessages } = resolveEffectiveHistory(d, convId, sessionId)
   const lastUserIdx = effectiveMessages.findLastIndex((m) => m.role === 'user')
   const priorMessages = lastUserIdx > 0 ? effectiveMessages.slice(0, lastUserIdx) : []
+  // Auto-compaction settings scaled to THIS model's real ctx (see compactionSettingsFor) — pi's
+  // own hosted-model-sized defaults would otherwise make auto-compaction self-defeating here.
+  // keepRecentTokens further guarded by keepRecentTokensFor — see its doc comment for the real
+  // pi-side bug this works around (a heavy-tool-call-ending turn otherwise makes pi's own
+  // findCutPoint silently keep everything and report nothing left to compact).
+  const autoCompactionSettings = compactionSettingsFor(contextWindow)
+  autoCompactionSettings.keepRecentTokens = keepRecentTokensFor(priorMessages, autoCompactionSettings.keepRecentTokens)
+  const settingsManager = SettingsManager.inMemory({ compaction: autoCompactionSettings })
   const seedHistoryInto = (sm: SessionManager): void => {
     if (summaryText) sm.appendMessage({ role: 'user', content: summaryText, timestamp: Date.now() })
     if (priorMessages.length > 0) seedPriorHistory(sm, priorMessages, modelId)
@@ -1090,6 +1136,8 @@ export async function compactCodeSession(params: CompactCodeParams): Promise<Com
 
   const { summaryText, messages: effectiveMessages } = resolveEffectiveHistory(d, convId, sessionId)
   if (effectiveMessages.length === 0) throw new Error('nothing_to_compact')
+  const compactionSettings = compactionSettingsFor(contextWindow)
+  compactionSettings.keepRecentTokens = keepRecentTokensFor(effectiveMessages, compactionSettings.keepRecentTokens)
 
   const authStorage = AuthStorage.inMemory()
   const modelRegistry = ModelRegistry.inMemory(authStorage)
@@ -1149,10 +1197,13 @@ export async function compactCodeSession(params: CompactCodeParams): Promise<Com
     authStorage,
     modelRegistry,
     sessionManager,
-    // Ctx-scaled settings (compactionSettingsFor) — pi's hosted-model-sized defaults could ask
-    // to keep more "recent" tokens than this model's real context window even has room for,
-    // producing a compacted result that still doesn't fit.
-    settingsManager: SettingsManager.inMemory({ compaction: compactionSettingsFor(contextWindow) }),
+    // Ctx-scaled settings (compactionSettingsFor), keepRecentTokens further guarded by
+    // keepRecentTokensFor — pi's hosted-model-sized defaults could ask to keep more "recent"
+    // tokens than this model's real context window even has room for, producing a compacted
+    // result that still doesn't fit; the guard fixes a real bug in pi's own findCutPoint (see its
+    // doc comment) that otherwise makes manual /compact report "nothing to compact" on a
+    // heavy-tool-call-ending session, no matter how large the real conversation is.
+    settingsManager: SettingsManager.inMemory({ compaction: compactionSettings }),
     resourceLoader: compactResourceLoader,
     tools: [], // pure summarization — no tool needs to run, and none should be able to.
   })

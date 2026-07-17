@@ -218,6 +218,9 @@ the detail:
   overwrites another engine's tuning for the same model.
 - **Configurable VRAM headroom** (Settings → Models & loading → Advanced, 300 MB–2 GB, default
   1 GB) — tell auto-tune how much VRAM to keep free for other GPU workloads instead of a fixed margin.
+  Drag it to 0 to opt into an experimental **MoE "VRAM-spill" search** — auto-tune keeps pushing more
+  experts onto the GPU past the safe margin as long as both generation and prompt-processing speed
+  keep improving.
 
 </details>
 

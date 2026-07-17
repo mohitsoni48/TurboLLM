@@ -24,6 +24,10 @@ export interface CodeSession {
   /** Set when this session has been /clear'd — the last message id everything at/before is
    *  hidden. Undefined = never cleared, or resumed back from one. */
   clearedUpToMessageId?: string
+  /** Set when a message has been reverted-to — that message id and everything after it is
+   *  deactivated (not deleted; /resume reactivates it). Mutually exclusive with
+   *  clearedUpToMessageId. Undefined = never reverted, or resumed back from one. */
+  revertedFromMessageId?: string
 }
 
 export type CodeSessionFilter = 'active' | 'archived' | 'all'

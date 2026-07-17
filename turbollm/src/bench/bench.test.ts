@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { pickKvQuants, betterBySpeed, kvSpeedAdvisory, parseRocmVramUsed, benchPromptTokens, buildBenchMessages } from './bench'
+import { pickKvQuants, betterBySpeed, spillImproves, kvSpeedAdvisory, parseRocmVramUsed, benchPromptTokens, buildBenchMessages } from './bench'
 
 // ---- pickKvQuants: quality-preserving KV sweep, base-first ------------------
 
@@ -62,6 +62,46 @@ test('betterBySpeed: 27B reality — turbo4 wins on both', () => {
 test('betterBySpeed: null / zero handling', () => {
   assert.equal(betterBySpeed({ tps: 10, prefillTps: null }, { tps: 0, prefillTps: null }), true)
   assert.equal(betterBySpeed({ tps: null, prefillTps: null }, { tps: null, prefillTps: null }), false)
+})
+
+// ---- spillImproves: MoE VRAM-spill hill-climb decision (founder-directed, 2026-07-17; extended
+// same day to also guard prefill speed) ----------------------------------------------------------
+
+test('spillImproves: both generation and prefill hold up (no decrease) — keeps climbing', () => {
+  assert.equal(spillImproves({ tps: 20, prefillTps: 900 }, { outcome: 'ok', tps: 22, prefillTps: 950 }), true)
+  // Equal counts as "not decreased", not just a strict increase.
+  assert.equal(spillImproves({ tps: 20, prefillTps: 900 }, { outcome: 'ok', tps: 20, prefillTps: 900 }), true)
+})
+
+test('spillImproves: generation t/s decreases — stops the climb even if prefill improved', () => {
+  assert.equal(spillImproves({ tps: 20, prefillTps: 900 }, { outcome: 'ok', tps: 19.9, prefillTps: 1200 }), false)
+})
+
+test('spillImproves: prefill decreases — stops the climb even if generation t/s improved', () => {
+  assert.equal(spillImproves({ tps: 20, prefillTps: 900 }, { outcome: 'ok', tps: 25, prefillTps: 899 }), false)
+})
+
+test('spillImproves: a candidate with no prefill reading is treated as a decrease (fail-safe)', () => {
+  assert.equal(spillImproves({ tps: 20, prefillTps: 900 }, { outcome: 'ok', tps: 25, prefillTps: null }), false)
+})
+
+test('spillImproves: the PREVIOUS step having no prefill reading skips the prefill check entirely', () => {
+  assert.equal(spillImproves({ tps: 20, prefillTps: null }, { outcome: 'ok', tps: 22, prefillTps: null }), true)
+  assert.equal(spillImproves({ tps: 20, prefillTps: null }, { outcome: 'ok', tps: 22, prefillTps: 5 }), true)
+})
+
+test('spillImproves: a failed spill step (oom/crash/timeout) is never "an increase"', () => {
+  assert.equal(spillImproves({ tps: 20, prefillTps: 900 }, { outcome: 'oom', tps: null, prefillTps: null }), false)
+  assert.equal(spillImproves({ tps: 20, prefillTps: 900 }, { outcome: 'crash', tps: null, prefillTps: null }), false)
+  assert.equal(spillImproves({ tps: 20, prefillTps: 900 }, { outcome: 'timeout', tps: null, prefillTps: null }), false)
+})
+
+test('spillImproves: null candidate (benchAt itself returned null) stops the climb', () => {
+  assert.equal(spillImproves({ tps: 20, prefillTps: 900 }, null), false)
+})
+
+test('spillImproves: an "ok" outcome with a null tps (shouldn\'t happen, but defensively) stops the climb', () => {
+  assert.equal(spillImproves({ tps: 20, prefillTps: 900 }, { outcome: 'ok', tps: null, prefillTps: 950 }), false)
 })
 
 // ---- kvSpeedAdvisory: ADR-219 — auto-tune no longer picks the KV type, just notes when a

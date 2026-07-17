@@ -14,6 +14,14 @@ export const SCHEMA_VERSION = 3
 export const VRAM_HEADROOM_MIN_MB = 300
 export const VRAM_HEADROOM_MAX_MB = 2048
 export const VRAM_HEADROOM_DEFAULT_MB = 1024
+/** Special sentinel, distinct from the {@link VRAM_HEADROOM_MIN_MB}–{@link VRAM_HEADROOM_MAX_MB}
+ *  safety-margin range: an explicit opt-in to let auto-tune spill PAST all VRAM headroom during
+ *  its MoE hill-climb search (`bench.ts`'s `moeSearch`), trading the safety margin for a real
+ *  measured tok/s gain when one exists. Founder call, 2026-07-17 (after live-testing the
+ *  hill-climb unconditionally): the hill-climb must never silently override a user's configured
+ *  safety margin, so it's gated on this exact value — anything in 1–299 is invalid, same as
+ *  before. The Settings slider snaps straight from {@link VRAM_HEADROOM_MIN_MB} to this value. */
+export const VRAM_HEADROOM_SPILL_MB = 0
 
 export interface Capabilities {
   kvTypes: string[]
@@ -342,8 +350,9 @@ export interface Config {
    *  ComfyUI VRAM grab can't tip the chosen config into a sysmem spill (bench.ts's
    *  `overHeadroom`). User-configurable via a Settings slider,
    *  {@link VRAM_HEADROOM_MIN_MB}–{@link VRAM_HEADROOM_MAX_MB}, default
-   *  {@link VRAM_HEADROOM_DEFAULT_MB}. Absent in pre-this-feature configs → normalize
-   *  seeds the default. */
+   *  {@link VRAM_HEADROOM_DEFAULT_MB} — OR the {@link VRAM_HEADROOM_SPILL_MB} sentinel (0), an
+   *  explicit opt-in to let auto-tune's MoE hill-climb spill past all headroom for more t/s.
+   *  Absent in pre-this-feature configs → normalize seeds the default. */
   vramHeadroomMb: number
   lastLoaded: LastLoaded
   autoLoadOnStart: boolean
@@ -652,8 +661,11 @@ function normalize(c: Config): void {
   c.benchResults ??= {}
   // VRAM headroom slider: absent/garbage (pre-feature config, or a stale out-of-range
   // value) → the default, never thrown on load — mirrors the gateway.keepN clamp below.
+  // VRAM_HEADROOM_SPILL_MB (0) is a valid, distinct value — the explicit "allow spill" opt-in —
+  // not an out-of-range value to normalize away.
   c.vramHeadroomMb =
-    typeof c.vramHeadroomMb === 'number' && c.vramHeadroomMb >= VRAM_HEADROOM_MIN_MB && c.vramHeadroomMb <= VRAM_HEADROOM_MAX_MB
+    typeof c.vramHeadroomMb === 'number' &&
+    (c.vramHeadroomMb === VRAM_HEADROOM_SPILL_MB || (c.vramHeadroomMb >= VRAM_HEADROOM_MIN_MB && c.vramHeadroomMb <= VRAM_HEADROOM_MAX_MB))
       ? c.vramHeadroomMb
       : VRAM_HEADROOM_DEFAULT_MB
   c.autoLoadOnStart ??= false
@@ -853,8 +865,8 @@ function validate(c: Config): void {
   if (c.activeEngineId && !c.engines.some((e) => e.id === c.activeEngineId)) {
     throw new ValueError('activeEngineId', 'unknown engine id')
   }
-  if (c.vramHeadroomMb < VRAM_HEADROOM_MIN_MB || c.vramHeadroomMb > VRAM_HEADROOM_MAX_MB) {
-    throw new ValueError('vramHeadroomMb', `must be between ${VRAM_HEADROOM_MIN_MB} and ${VRAM_HEADROOM_MAX_MB} MB`)
+  if (c.vramHeadroomMb !== VRAM_HEADROOM_SPILL_MB && (c.vramHeadroomMb < VRAM_HEADROOM_MIN_MB || c.vramHeadroomMb > VRAM_HEADROOM_MAX_MB)) {
+    throw new ValueError('vramHeadroomMb', `must be ${VRAM_HEADROOM_SPILL_MB} (allow VRAM spill) or between ${VRAM_HEADROOM_MIN_MB} and ${VRAM_HEADROOM_MAX_MB} MB`)
   }
   // ComfyUI reverse-gate origin (F-011): empty is allowed (reverse gate just stays off);
   // if set, it must be an http(s):// origin so the `POST {url}/free` call is well-formed.

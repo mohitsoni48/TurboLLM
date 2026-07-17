@@ -372,11 +372,19 @@ export function CodeSessionScreen() {
     return skill && task ? `Use the invoke_skill tool with skillId "${skill.id}" for this task: ${task}` : undefined
   }
 
+  // Founder-reported UX gap, 2026-07-17: manual /compact showed NO progress indication at all
+  // while compactCodeSession awaited (a real LLM summarization call, easily several seconds to a
+  // minute+) — the composer just went blank with nothing to show for it until a toast finally
+  // landed. `live.compacting` (driving the SAME "Compacting conversation…" hint text below) only
+  // ever fires for AUTO-compaction's SSE event mid-turn; the manual command is a separate,
+  // non-streaming POST with no live state of its own until now.
+  const [manualCompacting, setManualCompacting] = useState(false)
   const COMPACT_RE = /^\/compact\b\s*(.*)$/i
   const runCompact = async (text: string) => {
     if (!sessionId) return
     const instructions = COMPACT_RE.exec(text)?.[1]?.trim() || undefined
     setInput('')
+    setManualCompacting(true)
     try {
       const result = await compactCodeSession(sessionId, instructions)
       void qc.invalidateQueries({ queryKey: codeKeys.detail(sessionId) })
@@ -385,6 +393,8 @@ export function CodeSessionScreen() {
       setInput(text) // restore so the command isn't lost
       if (e instanceof ApiError && e.code === 'nothing_to_compact') toast.info('Nothing to compact yet — history is already short enough.')
       else toast.error(e instanceof ApiError ? e.message : 'Could not compact.')
+    } finally {
+      setManualCompacting(false)
     }
   }
 
@@ -417,12 +427,12 @@ export function CodeSessionScreen() {
     }
   }
 
-  // Revert-to-message: rewinds the transcript to just before a user message (same underlying
-  // clearedUpToMessageId mechanism as /clear — /resume still un-hides it) and refills the
-  // composer with that message's ORIGINAL text. When the discarded range touched real files
-  // (any edit-tool call with a stored patch), asks whether to ALSO reverse-apply those edits —
-  // reverting the transcript alone is always safe/reversible; reverting files is a real,
-  // separate, less-reversible action the user should explicitly opt into.
+  // Revert-to-message: rewinds the transcript to just before a user message — deactivating it
+  // and everything after it (v33; independent of /clear's clearedUpToMessageId cursor — /resume
+  // still un-hides it) — and refills the composer with that message's ORIGINAL text. When the
+  // discarded range touched real files (any edit-tool call with a stored patch), asks whether to
+  // ALSO reverse-apply those edits — reverting the transcript alone is always safe/reversible;
+  // reverting files is a real, separate, less-reversible action the user should explicitly opt into.
   const [pendingRevert, setPendingRevert] = useState<{ messageId: string; hasFileEdits: boolean } | null>(null)
   const openRevertConfirm = (messageId: string) => {
     const idx = messages.findIndex((m) => m.id === messageId)
@@ -668,6 +678,22 @@ export function CodeSessionScreen() {
                 </button>
               </div>
             )}
+            {/* Revert banner — same non-destructive framing as /clear's: the reverted-from
+                message and everything after it are deactivated, never deleted (v33). */}
+            {!notFound && session?.revertedFromMessageId && (
+              <div className="mb-4 flex items-center gap-2 rounded-lg border border-border bg-panel-2 px-3 py-2 text-[12px] text-muted">
+                <RotateCcw size={13} className="shrink-0 text-faint" />
+                <span className="flex-1">Reverted to an earlier message — later messages hidden.</span>
+                <button
+                  type="button"
+                  onClick={() => void runResume()}
+                  disabled={resumeMut.isPending}
+                  className="inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-1 font-medium text-ink transition-colors hover:bg-panel"
+                >
+                  <RotateCcw size={12} /> Resume
+                </button>
+              </div>
+            )}
             {initialLoading && <CodeTranscriptSkeleton />}
             {!notFound && !initialLoading && (
               <CodeTranscript
@@ -728,7 +754,7 @@ export function CodeSessionScreen() {
             onValueChange={setInput}
             onSubmit={() => void send()}
             placeholder={live ? 'Queue a follow-up…' : 'Send a follow-up…'}
-            textareaDisabled={false}
+            textareaDisabled={manualCompacting}
             mode={modeInfo}
             onModeChange={handleModeChange}
             models={allModels}
@@ -745,21 +771,28 @@ export function CodeSessionScreen() {
             ctxMax={ctxMax}
             live={!!live}
             onStop={() => void handleStop()}
-            sendDisabled={!input.trim()}
+            sendDisabled={!input.trim() || manualCompacting}
             onAddContext={() => setContextBrowserOpen(true)}
             contextFiles={contextFiles}
             onRemoveContextFile={(p) => setContextFiles((cf) => cf.filter((x) => x !== p))}
             slashCommands={[
               { id: 'compact', description: 'Summarize the conversation so far into one summary, to free up context' },
               { id: 'clear', description: 'Clear the chat — repo, worktree, and branch stay as they are' },
-              ...(session?.clearedUpToMessageId ? [{ id: 'resume', description: 'Bring back a cleared chat' }] : []),
+              ...(session?.clearedUpToMessageId || session?.revertedFromMessageId ? [{ id: 'resume', description: 'Bring back a cleared or reverted chat' }] : []),
               ...(skillsQ.data ?? []).map((s) => ({ id: s.id, description: s.description })),
             ]}
-            hintText={live
-              ? (live.compacting
-                  ? 'Compacting conversation…'
-                  : queued.length ? `${queued.length} queued · Enter to queue another` : 'Running — Enter to queue a follow-up')
-              : 'Enter to send · Shift+Enter for newline'}
+            // Prominent, accent-colored banner above the textarea for any real in-progress
+            // state (founder feedback, 2026-07-17: folding this into the tiny faint hint text
+            // below made an actual busy state — especially manual /compact, which disables the
+            // whole composer — too easy to miss). hintText stays reserved for the idle case.
+            statusText={
+              manualCompacting || live?.compacting
+                ? 'Compacting conversation…'
+                : live
+                  ? (queued.length ? `${queued.length} queued · Enter to queue another` : 'Running — Enter to queue a follow-up')
+                  : undefined
+            }
+            hintText="Enter to send · Shift+Enter for newline"
           />
         </div>
       </div>
