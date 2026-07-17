@@ -117,20 +117,25 @@ export interface BenchState {
 const READY_TIMEOUT_MS = 150_000
 // Per-candidate cap: load + warmup + the measured request must all finish within this window,
 // else the candidate is recorded 'timeout' and the sweep moves on — one hung config can't stall
-// the run.
-const PER_TEST_TIMEOUT_MS = 3 * 60_000
+// the run. Raised from 3 to 10 minutes (ADR-217 round 2): the bench prompt now targets depth near
+// the CONFIGURED ctx (see benchPromptTokens) instead of an 8k cap, so a deep-ctx candidate does
+// TWO full prefills at that depth (the warmup prefill-gate, then the measured request re-processes
+// from scratch on purpose — see the `cache_prompt: false` comment in `chat`) — 10 min covers that
+// at realistic prefill speeds with margin; the existing prefill-overrun projection in
+// `prefillProbe` still fails a genuinely-too-slow config fast rather than waiting out the cap.
+const PER_TEST_TIMEOUT_MS = 10 * 60_000
 // Grace before judging prefill speed — give the first tokens time to flow before projecting.
 const PREFILL_GRACE_MS = 8_000
 // Overall budget — sized to fit a full binary search of per-test-capped trials (~log2(layers)).
-const TOTAL_BUDGET_MS = 20 * 60_000
+// Raised from 20 to 45 minutes alongside PER_TEST_TIMEOUT_MS (ADR-217 round 2) — deep-ctx bench
+// trials are slower by design now, and a run can measure 2+ KV types plus a headroom-backoff
+// retry, each up to PER_TEST_TIMEOUT_MS.
+const TOTAL_BUDGET_MS = 45 * 60_000
 // Memory-pressure / GPU-exhaustion signatures. Beyond a clean "out of memory", a config that
 // overflows VRAM often surfaces a secondary CUDA fault (failed allocation, or "device not ready"
 // during graph capture once the allocation failed). Treat all of these as OOM so the search
 // offloads more and the result reads as a fit problem rather than a mystery crash.
 const OOM_RE = /out of memory|cudaMalloc|failed to allocate|unable to allocate|device not ready|CUDA error/i
-
-// English text is roughly 4 characters per token — used to size the bench prompt.
-const CHARS_PER_TOKEN = 4
 
 // Auto-tune may also sweep the KV-cache quant — but only ever SELECTS a quality-preserving type:
 // full-precision f16, near-lossless q8_0, and (on TurboQuant forks) turbo4 (≈ q8_0 quality). This
@@ -477,12 +482,14 @@ export class BenchRunner {
     if (base.nglFit) return this.benchAt(entry, sys, base, caps, results, 'auto-fit')
 
     let bestNgl: number | null = 0 // CPU-only box → everything on CPU, no probing needed.
+    // The VRAM this split is allowed to use: all cards for a layer/row split, ONE card for a
+    // single-GPU 'none' split (ADR-054). The headroom gate must judge against THIS, not the summed
+    // pool — else a 14 GB single-GPU load looks safe against a 30 GB total when it's at one card's
+    // edge. Computed unconditionally (0 on a CPU-only box) so the Phase-2 re-check below can reuse
+    // it too (ADR-217) — `overHeadroom` treats a ≤0 budget as "never over".
+    const budgetMb = gpuBudgetMb(sys, base)
 
     if (sys.gpus.length > 0) {
-      // The VRAM this split is allowed to use: all cards for a layer/row split, ONE card for a
-      // single-GPU 'none' split (ADR-054). The headroom gate must judge against THIS, not the summed
-      // pool — else a 14 GB single-GPU load looks safe against a 30 GB total when it's at one card's edge.
-      const budgetMb = gpuBudgetMb(sys, base)
       // Binary search ngl ∈ [0, blockCount] for the HIGHEST that loads with enough headroom VRAM.
       const hi0 = entry.blockCount > 0 ? entry.blockCount : 99
       let lo = 0, hi = hi0
@@ -492,7 +499,7 @@ export class BenchRunner {
         this.state = { ...this.state, step: `KV ${base.kvTypeK}: probing ngl=${mid} (range ${lo}–${hi})…`, candidates: results }
         const probe = await this.probeVram(entry, sys, { ...base, ngl: mid }, caps)
         this.pushProbe(results, base, 'ngl', mid, probe)
-        await this.settleGpu()
+        await this.settleGpu(sys)
         if (probe.outcome === 'ok' && !overHeadroom(probe.vramAbsMb, budgetMb, headroomMb)) {
           bestNgl = mid // fits with headroom → record, try MORE GPU layers
           lo = mid + 1
@@ -503,7 +510,16 @@ export class BenchRunner {
     }
 
     if (bestNgl === null) return null
-    return this.benchAt(entry, sys, { ...base, ngl: bestNgl }, caps, results, `ngl=${bestNgl}`)
+    let found = await this.benchAt(entry, sys, { ...base, ngl: bestNgl }, caps, results, `ngl=${bestNgl}`)
+    // Phase 2 (the actual timed run) can allocate more VRAM than Phase 1's load-only probe did
+    // (lazy cuBLAS/graph-capture scratch buffers) — re-validate against the REAL post-generation
+    // VRAM and back off one layer if it silently blew through the user's headroom (ADR-217).
+    if (found && overHeadroom(found.cand.vramAbsMb, budgetMb, headroomMb) && bestNgl > 0) {
+      this.emit(`ngl=${bestNgl} exceeded headroom after generation (${found.cand.vramAbsMb} MB) — retrying at ngl=${bestNgl - 1}`)
+      const safer = await this.benchAt(entry, sys, { ...base, ngl: bestNgl - 1 }, caps, results, `ngl=${bestNgl - 1} (headroom backoff)`)
+      if (safer) found = safer
+    }
+    return found
   }
 
   /** MoE models: pin `nCpuMoe` by VRAM probing (Phase 1), then run the full bench once (Phase 2).
@@ -533,7 +549,7 @@ export class BenchRunner {
       this.state = { ...this.state, step: `KV ${base.kvTypeK}: probing nCpuMoe=${mid} (range ${lo}–${hi})…`, candidates: results }
       const probe = await this.probeVram(entry, sys, { ...base, nCpuMoe: mid }, caps)
       this.pushProbe(results, base, 'nCpuMoe', mid, probe)
-      await this.settleGpu()
+      await this.settleGpu(sys)
       if (probe.outcome === 'oom' || overHeadroom(probe.vramAbsMb, budgetMb, headroomMb)) {
         lo = mid + 1 // too much on GPU → more CPU experts to free VRAM / restore the headroom
       } else if (probe.outcome === 'ok') {
@@ -545,7 +561,15 @@ export class BenchRunner {
     }
 
     if (bestN === null) return null
-    return this.benchAt(entry, sys, { ...base, nCpuMoe: bestN }, caps, results, `nCpuMoe=${bestN}`)
+    let found = await this.benchAt(entry, sys, { ...base, nCpuMoe: bestN }, caps, results, `nCpuMoe=${bestN}`)
+    // Same Phase-1-vs-Phase-2 VRAM gap as denseSearch — back off (more CPU experts, less VRAM) one
+    // step if the real measured run blew through headroom (ADR-217).
+    if (found && overHeadroom(found.cand.vramAbsMb, budgetMb, headroomMb) && bestN < maxN) {
+      this.emit(`nCpuMoe=${bestN} exceeded headroom after generation (${found.cand.vramAbsMb} MB) — retrying at nCpuMoe=${bestN + 1}`)
+      const safer = await this.benchAt(entry, sys, { ...base, nCpuMoe: bestN + 1 }, caps, results, `nCpuMoe=${bestN + 1} (headroom backoff)`)
+      if (safer) found = safer
+    }
+    return found
   }
 
   /** Measure how much the KV-cache QUANT swings VRAM at this context — so we tune only the quant(s)
@@ -579,10 +603,10 @@ export class BenchRunner {
     this.state = { ...this.state, step: `Sizing the KV cache (${big} vs ${small})…`, candidates: results }
     const pBig = await this.probeVram(entry, sys, { ...base, kvTypeK: big, kvTypeV: big, ...refOffload }, caps)
     this.pushProbe(results, { ...base, kvTypeK: big, ...refOffload }, knob, knobVal, pBig)
-    await this.settleGpu()
+    await this.settleGpu(sys)
     const pSmall = await this.probeVram(entry, sys, { ...base, kvTypeK: small, kvTypeV: small, ...refOffload }, caps)
     this.pushProbe(results, { ...base, kvTypeK: small, ...refOffload }, knob, knobVal, pSmall)
-    await this.settleGpu()
+    await this.settleGpu(sys)
 
     if (pBig.outcome !== 'ok' || pBig.vramAbsMb === null) return Number.MAX_SAFE_INTEGER // huge cache
     if (pSmall.outcome !== 'ok' || pSmall.vramAbsMb === null) return -1 // couldn't size it
@@ -622,7 +646,7 @@ export class BenchRunner {
     let vramAbsMb: number | null = null
     if (outcome === 'ok') {
       await sleep(800) // let the allocator settle so the VRAM reading is final
-      vramAbsMb = await readNvidiaVramMb()
+      vramAbsMb = await readGpuVramMb(sys)
     }
     await this.manager.stopAndWait().catch(() => {})
     return { outcome, vramAbsMb }
@@ -674,7 +698,7 @@ export class BenchRunner {
     results.push(cand)
     this.emit(`bench ${label} → ${cand.outcome}${cand.tps != null ? ` (${cand.tps.toFixed(1)} tok/s)` : ''}`, cand)
     this.state = { ...this.state, candidates: results, bestTps: cand.tps ?? this.state.bestTps }
-    await this.settleGpu()
+    await this.settleGpu(sys)
     return cand.outcome === 'ok' && cand.tps !== null ? { cand, profile } : null
   }
 
@@ -722,7 +746,7 @@ export class BenchRunner {
       extraArgs: profileToArgs(profile, entry, caps, sys.cores),
     }
 
-    const vramBefore = await readNvidiaVramMb()
+    const vramBefore = await readGpuVramMb(sys)
     phase('loading model…')
     try {
       await this.manager.start(opts)
@@ -744,21 +768,22 @@ export class BenchRunner {
     }
     const logPath = this.manager.logPath()
 
-    // Bench prompt = 75% of the configured ctx, capped at 8k (see benchPromptTokens).
-    const promptContent = makeBenchContent(benchPromptTokens(profile.ctx))
+    // Bench request sized to this profile's configured ctx (ADR-217 round 2) — see
+    // buildBenchMessages for why depth matters here.
+    const benchMessages = buildBenchMessages(profile.ctx)
 
     // Prefill gate (doubles as warmup): stream the prompt and fail fast if it's spilling/crawling
     // or the engine faults — so a config that doesn't fit at this ctx is rejected in seconds and the
     // search offloads more, instead of hanging out the whole per-test budget.
     phase('warming up…')
-    const warm = await this.prefillProbe(target, promptContent, remaining(), logPath, stepPrefix)
+    const warm = await this.prefillProbe(target, benchMessages, remaining(), logPath, stepPrefix)
     if (warm !== 'ok') {
       await this.manager.stopAndWait().catch(() => {})
       return fail(warm.fault)
     }
     phase('measuring t/s…')
-    const measured = await this.runChatWatched(target, promptContent, 128, remaining(), logPath)
-    const vramAfter = await readNvidiaVramMb()
+    const measured = await this.runChatWatched(target, benchMessages, 128, remaining(), logPath)
+    const vramAfter = await readGpuVramMb(sys)
     await this.manager.stopAndWait().catch(() => {})
 
     if ('fault' in measured) return fail(measured.fault)
@@ -796,13 +821,13 @@ export class BenchRunner {
    *  in a "device not ready" state that otherwise cascades into every following trial failing — the
    *  cause of spurious "no candidate found" on large models. Returns fast when VRAM is already low
    *  (the normal success case). Best-effort; never throws. */
-  private async settleGpu(): Promise<void> {
+  private async settleGpu(sys: SysInfo): Promise<void> {
     await sleep(1500) // base: let the killed engine process release + the driver settle
-    let prev = await readNvidiaVramMb()
-    if (prev === null) return // non-NVIDIA / no nvidia-smi: the fixed wait is all we can do
+    let prev = await readGpuVramMb(sys)
+    if (prev === null) return // no live VRAM reader for this vendor: the fixed wait is all we can do
     for (let i = 0; i < 12 && !this.cancelled; i++) {
       await sleep(1000)
-      const cur = await readNvidiaVramMb()
+      const cur = await readGpuVramMb(sys)
       if (cur === null || cur >= prev - 64) return // released / stabilized (no further drop)
       prev = cur
     }
@@ -814,7 +839,7 @@ export class BenchRunner {
    *  result is classified accordingly. Returns the timing, or a `fault` outcome. */
   private async runChatWatched(
     target: string,
-    content: string,
+    messages: BenchMessage[],
     maxTokens: number,
     budgetMs: number,
     logPath: string,
@@ -838,7 +863,7 @@ export class BenchRunner {
 
     let timed: { tps: number; prefillTps: number | null; ttftMs: number } | null = null
     try {
-      timed = await this.chat(target, content, maxTokens, budgetMs, probe.signal)
+      timed = await this.chat(target, messages, maxTokens, budgetMs, probe.signal)
     } catch {
       timed = null
     } finally {
@@ -858,7 +883,7 @@ export class BenchRunner {
    *  the warm prompt cache makes the following measured request fast and accurate. */
   private async prefillProbe(
     target: string,
-    content: string,
+    messages: BenchMessage[],
     budgetMs: number,
     logPath: string,
     stepPrefix: string,
@@ -886,7 +911,7 @@ export class BenchRunner {
       const res = await fetch(`${target}/v1/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: 'bench', messages: [{ role: 'user', content }], max_tokens: 8, temperature: 0, seed: 42, stream: true, return_progress: true }),
+        body: JSON.stringify({ model: 'bench', messages, max_tokens: 8, temperature: 0, seed: 42, stream: true, return_progress: true }),
         signal: AbortSignal.any(signals),
       })
       if (!res.ok || !res.body) throw new Error('no stream')
@@ -935,7 +960,7 @@ export class BenchRunner {
 
   /** One non-streaming /v1/chat/completions request. Returns engine-reported tps + ttftMs, or null.
    *  Aborts on the per-test timeout, the cancel kill-switch, or `extraSignal` (the fault watchdog). */
-  private async chat(target: string, content: string, maxTokens: number, timeoutMs: number, extraSignal?: AbortSignal): Promise<{ tps: number; prefillTps: number | null; ttftMs: number } | null> {
+  private async chat(target: string, messages: BenchMessage[], maxTokens: number, timeoutMs: number, extraSignal?: AbortSignal): Promise<{ tps: number; prefillTps: number | null; ttftMs: number } | null> {
     const signals: AbortSignal[] = [AbortSignal.timeout(timeoutMs)]
     if (this.abort) signals.push(this.abort.signal)
     if (extraSignal) signals.push(extraSignal)
@@ -944,7 +969,7 @@ export class BenchRunner {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: 'bench',
-        messages: [{ role: 'user', content }],
+        messages,
         max_tokens: maxTokens,
         temperature: 0,
         seed: 42,
@@ -1158,32 +1183,143 @@ export class BenchRunner {
 
 // ---- helpers ----------------------------------------------------------------
 
-/** Filler text for the bench prompt — varied enough to avoid tokenizer-dedup tricks. */
-const BENCH_BASE =
-  'Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor ' +
-  'incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud ' +
-  'exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure ' +
-  'dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. ' +
-  'Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt ' +
-  'mollit anim id est laborum. '
-
-/** Build a bench prompt of approximately `targetTokens` tokens by repeating BENCH_BASE.
- *  Uses a 4-chars-per-token estimate — close enough for English lorem text. */
-function makeBenchContent(targetTokens: number): string {
-  const targetChars = Math.max(BENCH_BASE.length, targetTokens * CHARS_PER_TOKEN)
-  const reps = Math.ceil(targetChars / BENCH_BASE.length)
-  return BENCH_BASE.repeat(reps).slice(0, targetChars) + '\n\nSummarize the passage above in one sentence.'
+/** A chat message for the bench request — mirrors the wire shape `/v1/chat/completions` expects. */
+export interface BenchMessage {
+  role: 'system' | 'user' | 'assistant'
+  content: string
 }
 
-/** How many prompt tokens to use for a bench trial: 75% of the configured context, capped at 8k.
- *  The cap matters for BOTH speed and accuracy. Speed: a huge model at 200K would otherwise spend
- *  the whole trial prefilling tens of thousands of tokens. Accuracy: generation t/s falls with how
- *  deep the context is, and a very deep measurement reflects a worst case, not typical use — an 8k
- *  context is representative of normal prompts and makes the per-token attention cost (which is
- *  where a low-bit KV's slower kernel shows up) realistic rather than exaggerated. KV/VRAM is
- *  allocated for the full ctx at load regardless, so this only sizes the speed measurement. */
-function benchPromptTokens(ctx: number): number {
-  return Math.max(256, Math.min(8_192, Math.floor(ctx * 0.75)))
+/** Bench system prompt: the "Default" agent's REAL injected prompt (ADR-217) — mirrors
+ *  `web/src/lib/personas.ts`'s `TURBOLLM_BASE_CAPABILITY` + `TURBOLLM_ARTIFACTS_CAPABILITY` +
+ *  date line verbatim (Default carries no persona text of its own, and a bench run has no
+ *  personalization/memory facts to inject). No shared module exists between `web/` and `src/`
+ *  (separate build targets), so this is kept in sync with personas.ts BY HAND — if one changes,
+ *  update the other. Using the real system prompt (instead of synthetic filler) means the bench
+ *  request's prefill shape matches what a real first chat message actually sends. */
+const BENCH_SYSTEM_PROMPT = `You are running inside TurboLLM, a local-first AI chat app. You can render text-based charts and graphics using Unicode characters. Use them when a visual would genuinely make the response clearer — not by default.
+
+A chart is appropriate when:
+- Comparing 3+ items by a numeric metric (rankings, benchmarks, budgets)
+- Showing a trend, distribution, or progression over time or stages
+- Presenting a hierarchy or dependency tree
+- The user asks about data that has a clear pattern hard to read in prose
+
+A chart is NOT appropriate for:
+- Conversational replies, opinions, or explanations
+- Data with only 1–2 values (just state the numbers inline)
+- Lists that are purely qualitative (no meaningful numeric comparison)
+
+When a chart is warranted:
+- Bar / column charts: use block fill characters █ ▓ ▒ ░ with a numeric scale and axis labels
+- Tables: use box-drawing characters ┌ ─ ┐ │ └ ┘ ├ ┤ ┬ ┴ ┼ for clean borders; align columns
+- Line / trend: sketch with · ╌ ╍ ╱ ╲ characters; mark key points with ●
+- Tree / hierarchy: use └─ ├─ │ connectors
+- Progress / gauge: [████████░░] style with a percentage
+
+Always include a title, axis/column labels, and the underlying numbers. Keep charts compact — no wider than ~60 characters. Wrap chart output in a plain code block (\`\`\`) so spacing is preserved.
+
+TurboLLM also live-previews three kinds of fenced code block, so you can return RENDERED visuals, not just text. When the user wants something visual or interactive, reply with ONE self-contained fenced block in the right language:
+
+- \`\`\`mermaid — diagrams: flowcharts, sequence/class/ER/state diagrams, gantt, mind maps, pie charts. Reach for this on "diagram", "flowchart", "flow", "architecture", "sequence", "how X works" (visually), "org chart", "timeline".
+- \`\`\`svg — static vector graphics: icons, logos, illustrations, simple scenes, or charts you draw by hand (bar/line/scatter). Reach for this on "draw", "icon", "logo", "illustration", "graphic".
+- \`\`\`html — interactive or animated results: a web page, UI mockup, form, canvas animation, game, calculator — anything needing live CSS/JS. Must be fully self-contained: inline CSS/JS only, NO external URLs, scripts, fonts, images, or network calls (they are blocked).
+
+When to use them:
+- ONLY when a rendered visual or runnable result is genuinely what the user asked for. Pick the simplest type that satisfies it — a flowchart is mermaid, not html; an icon is svg, not html.
+- Put any explanation BEFORE or AFTER the block, never inside it. At most one artifact per response.
+
+Keep the syntax valid (a diagram that fails to parse is worse than a simpler one that renders):
+- mermaid: prefer simple flowcharts/graphs. Wrap any node or message label that contains spaces, parentheses, slashes, or punctuation in double quotes. In sequence diagrams, do NOT use activate/deactivate unless every activate has a matching deactivate — when in doubt, leave them out.
+- svg/html: self-contained only — no external URLs, CDNs, fonts, or images.
+
+When NOT to use them (important — do not over-render):
+- Plain questions, opinions, explanations, or conversation → normal prose.
+- Code meant to be read, copied, or used in a project (a function, a script, a config) → a normal code block in its real language, NOT an artifact. Wrapping ordinary code in html/svg/mermaid is wrong.
+- A 1–2 number comparison → just say the numbers. Small text tables/sparklines → the Unicode style above.
+
+Today's date is ${new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}.`
+
+/** Fixed bench question (ADR-217) — one realistic, medium-length technical question, held
+ *  constant across every bench run so results stay comparable run-to-run. Deterministic sampling
+ *  (`temperature: 0`, `seed: 42` in {@link BenchRunner.chat}) means the same question always
+ *  measures the same thing. Always the LAST message — see {@link buildBenchMessages}. */
+const BENCH_QUESTION = 'Explain the main differences between TCP and UDP, and give a couple of real-world scenarios where each one is the better choice.'
+
+// English text is roughly 4 characters per token — used only to size how much filler content
+// {@link buildBenchMessages} needs to add to reach the target depth; the real prefill then reports
+// the real token count.
+const CHARS_PER_TOKEN = 4
+
+// Fraction of the configured ctx the bench prompt targets, before the depth cap below — see
+// {@link benchPromptTokens}.
+const BENCH_CTX_FRACTION = 0.75
+// Depth cap (ADR-217 round 3): a founder live test at the UNCAPPED 150k depth (0.75 × their
+// 200k ctx) measured 3.2 tok/s (127s just for first token) — MORE pessimistic than their real
+// ~11 tok/s chat experience, not just slower to bench. A mid-depth test at 22k tokens measured
+// 10.4 tok/s, matching real chat almost exactly. So depth beyond ~20-30k tokens isn't just
+// expensive to bench, it's actively LESS representative of typical real usage — real
+// conversations rarely sustain tens of thousands of tokens of *dense* back-and-forth before a
+// user would have started a fresh chat or the context reset. 32k is the founder-directed cap:
+// deep enough to capture the real depth-dependent slowdown (validated: 22k already tracked real
+// chat within ~5%), capped low enough that bench time stays close to the original ~8k-depth
+// runtime instead of scaling unboundedly with ctx.
+const BENCH_MAX_PROMPT_TOKENS = 32_000
+
+/** How many prompt tokens the bench trial should target: {@link BENCH_CTX_FRACTION} of the
+ *  configured context, capped at {@link BENCH_MAX_PROMPT_TOKENS} (ADR-217 round 3 — see that
+ *  constant's comment for why the cap is correctness, not just speed). Floored at 256 so a tiny
+ *  ctx still gets a minimally-realistic bench. */
+export function benchPromptTokens(ctx: number): number {
+  return Math.max(256, Math.min(BENCH_MAX_PROMPT_TOKENS, Math.floor(ctx * BENCH_CTX_FRACTION)))
+}
+
+/** Deterministic filler topics used to pad the bench prompt out toward the target depth (ADR-217
+ *  round 2) — realistic technical prose, not Lorem-ipsum repetition, so the attention pattern isn't
+ *  degenerate. Cycled in a fixed order (never random / never Date/Math.random-seeded) so a bench
+ *  run stays exactly reproducible. */
+const FILLER_TOPICS = [
+  'the history and evolution of relational databases, from IBM System R through modern distributed SQL engines',
+  'how modern CPUs use branch prediction and speculative execution to hide pipeline stalls',
+  'the tradeoffs between microservices and monolithic architectures for a mid-sized SaaS company',
+  'how TCP congestion control algorithms like Reno, Cubic, and BBR differ in their approach to bandwidth estimation',
+  "the design philosophy behind Rust's ownership and borrowing system compared to garbage collection",
+  'how content delivery networks use anycast routing and edge caching to reduce latency',
+  'the tradeoffs between REST, GraphQL, and gRPC for building internal service APIs',
+  'how modern GPUs pipeline shader execution across thousands of parallel cores',
+]
+
+/** One filler assistant answer for {@link FILLER_TOPICS}. `round` distinguishes repeated cycles
+ *  through the topic list (needed once the target depth exceeds one pass) so the prompt isn't
+ *  made of byte-identical repeated blocks. */
+function fillerAnswer(topic: string, round: number): string {
+  const sentences: string[] = []
+  for (let i = 0; i < 40; i++) {
+    sentences.push(
+      `Regarding ${topic} (pass ${round}, point ${i + 1}), the underlying tradeoffs depend heavily on the specific ` +
+        'workload, the scale of the system, and the operational constraints the team is working under, which is ' +
+        'why experienced engineers tend to reach for established patterns before inventing something bespoke.',
+    )
+  }
+  return sentences.join(' ')
+}
+
+/** Build the bench request for `ctx`: the real Default-agent system prompt, deterministic
+ *  realistic filler exchanges padded out to ~{@link benchPromptTokens}(ctx) tokens (ADR-217 round
+ *  2 — matches the depth a real, substantially-filled conversation reaches at this ctx), then the
+ *  fixed {@link BENCH_QUESTION} as the final turn so every run asks the identical last question. */
+export function buildBenchMessages(ctx: number): BenchMessage[] {
+  const targetChars = benchPromptTokens(ctx) * CHARS_PER_TOKEN
+  const messages: BenchMessage[] = [{ role: 'system', content: BENCH_SYSTEM_PROMPT }]
+  let chars = BENCH_SYSTEM_PROMPT.length
+  for (let round = 0; chars < targetChars; round++) {
+    const topic = FILLER_TOPICS[round % FILLER_TOPICS.length]
+    const q = `Can you explain ${topic}?`
+    const a = fillerAnswer(topic, Math.floor(round / FILLER_TOPICS.length) + 1)
+    messages.push({ role: 'user', content: q }, { role: 'assistant', content: a })
+    chars += q.length + a.length
+  }
+  messages.push({ role: 'user', content: BENCH_QUESTION })
+  return messages
 }
 
 /** True when a candidate's ABSOLUTE VRAM use leaves less than `headroomMb` free within `budgetMb`
@@ -1324,6 +1460,55 @@ function readNvidiaVramMb(): Promise<number | null> {
       resolve(null)
     }
   })
+}
+
+/** Pure parser for `rocm-smi --showmeminfo vram --json` output, split out for direct testing
+ *  (mirrors `sysinfo.ts`'s `parseRocmSmi`). Sums "VRAM Total Used Memory (B)" across every card.
+ *  Null on unparseable JSON or when no card reports a positive used-memory figure. */
+export function parseRocmVramUsed(memJson: string): number | null {
+  try {
+    const mem = JSON.parse(memJson) as Record<string, Record<string, string>>
+    let total = 0
+    for (const fields of Object.values(mem)) {
+      const usedKey = Object.keys(fields).find((k) => /VRAM Total Used Memory/i.test(k))
+      const bytes = usedKey ? parseInt(String(fields[usedKey]).trim(), 10) || 0 : 0
+      total += bytes
+    }
+    const mb = Math.round(total / 1e6)
+    return mb > 0 ? mb : null
+  } catch {
+    return null
+  }
+}
+
+/** Best-effort current AMD VRAM use in MB (sum across cards) via ROCm's rocm-smi. Null when
+ *  rocm-smi is absent (ROCm not installed) or its output can't be parsed — never throws.
+ *  Mirrors `sysinfo.ts`'s `parseRocmSmi` (same `--showmeminfo vram --json` call), reading
+ *  "VRAM Total Used Memory (B)" instead of "VRAM Total Memory (B)" (ADR-217: before this, the
+ *  headroom gate had zero VRAM protection on AMD — {@link readNvidiaVramMb} silently returned
+ *  null on every AMD box and {@link overHeadroom} treats unknown VRAM as "never over"). */
+function readRocmVramMb(): Promise<number | null> {
+  return new Promise((resolve) => {
+    try {
+      execFile('rocm-smi', ['--showmeminfo', 'vram', '--json'], { timeout: 8000, windowsHide: true }, (err, stdout) => {
+        resolve(err || !stdout ? null : parseRocmVramUsed(stdout))
+      })
+    } catch {
+      resolve(null)
+    }
+  })
+}
+
+/** Best-effort current GPU VRAM use in MB (sum across GPUs), vendor-aware (ADR-217). Tries
+ *  nvidia-smi first (unconditionally — cheap to attempt, and correct even without `sys`), then
+ *  falls back to rocm-smi only when the box has a known AMD GPU. Null when neither applies
+ *  (Intel/Apple/CPU-only, or no live VRAM reader for that vendor) — matches
+ *  {@link overHeadroom}'s "unknown VRAM never blocks" contract. Never throws. */
+async function readGpuVramMb(sys: SysInfo): Promise<number | null> {
+  const nv = await readNvidiaVramMb()
+  if (nv !== null) return nv
+  if (sys.gpus.some((g) => g.vendor === 'amd')) return readRocmVramMb()
+  return null
 }
 
 function sleep(ms: number): Promise<void> {

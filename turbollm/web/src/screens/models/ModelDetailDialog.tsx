@@ -692,6 +692,7 @@ function AutoTuneResultDialog({
   result?: {
     params: { ctx: number; ngl: number; nglFit?: boolean; nCpuMoe: number; nCpuMoeFit?: boolean; parallel: number; kvTypeK: string; flashAttn: string }
     tps: number
+    prefillTps?: number | null
     ttftMs?: number
     vramMb: number | null
     sampling?: CardSampling
@@ -747,7 +748,8 @@ function AutoTuneResultDialog({
                   )}
 
                   <ConfigSection title="Measured" />
-                  <ConfigRow label="Speed" value={`${result.tps.toFixed(1)} tok/s`} />
+                  <ConfigRow label="Generation speed" value={`${result.tps.toFixed(1)} tok/s`} />
+                  {result.prefillTps != null && <ConfigRow label="Prefill speed" value={`${result.prefillTps.toFixed(0)} tok/s`} />}
                   {result.vramMb != null && <ConfigRow label="VRAM used" value={`~${result.vramMb.toLocaleString()} MB`} />}
                   {result.ttftMs ? <ConfigRow label="First token" value={`${Math.round(result.ttftMs)} ms`} /> : null}
                 </div>
