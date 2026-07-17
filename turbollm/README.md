@@ -168,8 +168,9 @@ the detail:
 <br/>
 
 - **Use the folders you already have.** Point TurboLLM at any directory of GGUFs — your
-  existing LM Studio / Ollama / manual downloads — **no re-downloading.** It parses GGUF
-  metadata (arch, params, quant, context, vision) for every file.
+  existing LM Studio folders or manual downloads — **no re-downloading.** It parses GGUF
+  metadata (arch, params, quant, context, vision) for every file. (Models pulled by
+  `ollama pull` live in Ollama's own blob store, which TurboLLM doesn't read.)
 - **Browse & download from Hugging Face**, in-app: a live, sortable list (trending / downloads
   / likes / recently updated / newest) alongside a permanent detail pane — pick a quant, read
   the **rendered model card**, and download with **resume + SHA-256 verification**. Each model
@@ -583,7 +584,7 @@ Marks reflect mid-2026; verify the moving rows against each tool's current docs.
 | Speculative decoding (draft / MTP) | ✅ | ✅ | ◐ env flag | ❌ |
 | Web UI from any LAN device | ✅ | ❌ | ❌ | ✅ |
 | **Lightweight** (no Electron / no Python) | ✅ npm | ❌ Electron | ✅ Go | ❌ Python |
-| Offline-first · **no telemetry** | ✅ | ◐ analytics on by default | ✅ | ✅ |
+| Offline-first · **no telemetry** | ✅ verifiable (source-available) | ◐ closed app — not verifiable | ✅ | ✅ |
 
 LM Studio and Ollama both added Anthropic `/v1/messages` endpoints in 2026, so the API rows are
 now parity — Claude Code works against any of them. TurboLLM's durable edges are **any engine
