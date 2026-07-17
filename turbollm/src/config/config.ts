@@ -48,6 +48,29 @@ export interface Engine {
    *  repo (registration would silently replace one with the other). */
   sourceCommit?: string
 }
+
+/** A custom (non-catalog) engine's identity, remembered independent of its live
+ *  {@link Engine} registration (GitHub: "custom engine treated as an outsider").
+ *
+ *  A catalog engine (llama.cpp, TurboQuant, …) can be disabled then re-enabled instantly
+ *  because its fixed, hardcoded homepage URL lets the backend re-scan disk for a still-built
+ *  binary. A custom repo has no such fixed identity anywhere else in the system — once its
+ *  {@link Engine} row is removed (Disable), nothing remembers which repo it came from. This
+ *  record is that memory: written when a non-catalog engine is added, kept across a Disable
+ *  (registry.remove), and only dropped on an explicit purge/delete — so Enable can re-detect
+ *  the still-built binary and re-register it with no rebuild, the same as a catalog engine. */
+export interface CustomEngineSource {
+  name: string
+  /** Binary path at the time this was recorded. Still valid after a Disable (files are only
+   *  removed on purge) — used to both re-register on Enable and to check the build still
+   *  exists on disk before offering that. */
+  binPath: string
+  kind: string
+  sourceRepo?: string
+  sourceBranch?: string
+  sourceCommit?: string
+  addedAt: string
+}
 export interface Daemon {
   host: string
   port: number
@@ -294,6 +317,8 @@ export interface Config {
   telemetry: Telemetry
   apiKeys: ApiKey[]
   engines: Engine[]
+  /** Custom (non-catalog) engine identities, kept across Disable — see {@link CustomEngineSource}. */
+  customEngineSources: CustomEngineSource[]
   activeEngineId: string
   modelDirs: string[]
   /** The folder downloads/imports land in (spec 01 §3, ADR-035). When '' or not in
@@ -437,6 +462,7 @@ export function defaultConfig(): Config {
     telemetry: { level: 'unset', machineId: '' },
     apiKeys: [],
     engines: [],
+    customEngineSources: [],
     activeEngineId: '',
     modelDirs: [],
     primaryModelDir: '',
@@ -599,6 +625,7 @@ function normalize(c: Config): void {
   c.lastLoaded = { ...d.lastLoaded, ...(c.lastLoaded ?? {}) }
   c.apiKeys ??= []
   c.engines ??= []
+  c.customEngineSources ??= []
   c.modelDirs ??= []
   // Primary model dir (spec 01 §3, ADR-035): absent in old files → '' (effective
   // default falls back to the first modelDir). Never throw on an old config.

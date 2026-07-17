@@ -71,16 +71,22 @@ export function buildDirName(repoUrl: string, branch?: string, commit?: string):
  *  a `github.com/` host prefix, a trailing `.git`/slash, and case. Lets us match a catalog
  *  entry's homepage to a source-built engine's stored `sourceRepo`. */
 export function sameRepo(a?: string, b?: string): boolean {
-  const norm = (s?: string) =>
-    (s ?? '')
-      .trim()
-      .toLowerCase()
-      .replace(/^https?:\/\//, '')
-      .replace(/^github\.com\//, '')
-      .replace(/\.git$/, '')
-      .replace(/\/+$/, '')
-  const na = norm(a)
-  return na !== '' && na === norm(b)
+  const na = normRepoUrl(a)
+  return na !== '' && na === normRepoUrl(b)
+}
+
+/** PURE: normalize a repo identifier (full URL or `owner/repo`) to a comparable/keyable form —
+ *  strips scheme, a `github.com/` host prefix, a trailing `.git`/slash, and case. Exported (not
+ *  just {@link sameRepo}'s internal helper) so a stable per-repo KEY can be built the same way
+ *  a match is judged — e.g. {@link customSourceKey} in registry.ts. */
+export function normRepoUrl(s?: string): string {
+  return (s ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/^github\.com\//, '')
+    .replace(/\.git$/, '')
+    .replace(/\/+$/, '')
 }
 
 /** The built `llama-server` for a repo (+optional branch) under `enginesRoot`, or null. Used

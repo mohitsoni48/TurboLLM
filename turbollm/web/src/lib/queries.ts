@@ -32,6 +32,7 @@ import {
   deleteEngineBackend,
   enableBackend,
   purgeEngine,
+  forgetCustomEngineSource,
   updateBackend,
   updateVllm,
   updateMlx,
@@ -402,6 +403,11 @@ export function useEngineMutations() {
     /** Purge: unregister + delete files from disk (catalog engines only, never models). */
     purge: useMutation({
       mutationFn: (id: string) => purgeEngine(id),
+      onSuccess: invalidate,
+    }),
+    /** Forget a DISABLED custom engine's remembered identity — no live engine to purge. */
+    forgetCustomSource: useMutation({
+      mutationFn: (key: string) => forgetCustomEngineSource(key),
       onSuccess: invalidate,
     }),
     activate: useMutation({
