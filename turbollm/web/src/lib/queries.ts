@@ -70,6 +70,7 @@ import {
   loadModel,
   removeDownload,
   removeEngine,
+  disableCustomEngine,
   removeModelDir,
   renameEngine,
   scanEngineFolder,
@@ -398,6 +399,12 @@ export function useEngineMutations() {
     }),
     remove: useMutation({
       mutationFn: (id: string) => removeEngine(id),
+      onSuccess: invalidate,
+    }),
+    /** Disable a CUSTOM (non-catalog) engine — backfills its customEngineSources record
+     *  first if one doesn't exist yet, so Disable never silently forgets it. */
+    disableCustom: useMutation({
+      mutationFn: (id: string) => disableCustomEngine(id),
       onSuccess: invalidate,
     }),
     /** Purge: unregister + delete files from disk (catalog engines only, never models). */

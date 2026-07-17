@@ -915,7 +915,11 @@ export function registerApi(app: Hono, d: Deps): void {
   // Registered BEFORE the :id route below — Hono matches in registration order, and :id would
   // otherwise swallow "custom-sources" as its own param value.
   app.delete('/api/v1/engines/custom-sources/:key', (c) => {
-    d.registry.forgetCustomSource(decodeURIComponent(c.req.param('key')))
+    // c.req.param() already URL-decodes path segments (Hono) — decoding again corrupts any
+    // key containing a literal '%' (the binPath fallback key can) and throws on an invalid
+    // escape, since a normal key's second decode is a harmless no-op that hid this on the
+    // happy path.
+    d.registry.forgetCustomSource(c.req.param('key'))
     return c.json({ ok: true })
   })
 
@@ -926,8 +930,19 @@ export function registerApi(app: Hono, d: Deps): void {
       return err(c, 409, 'engine_in_use', 'Stop the engine before removing it.')
     }
     const purge = c.req.query('purge') === '1'
+    // Set by the frontend's custom-engine Disable (never alongside purge): a custom engine
+    // added before customEngineSources tracking existed has no recorded identity, so a plain
+    // Disable would otherwise vanish it with no Enable path back. recordCustomSource is a
+    // record-or-refresh, so this is a no-op when a record already exists.
+    const recordSource = c.req.query('recordSource') === '1'
     try {
       const eng = d.registry.get(id)
+      if (recordSource && !purge && eng) {
+        d.registry.recordCustomSource({
+          name: eng.name, binPath: eng.binPath, kind: eng.kind,
+          sourceRepo: eng.sourceRepo, sourceBranch: eng.sourceBranch, sourceCommit: eng.sourceCommit,
+        })
+      }
       d.registry.remove(id)
       // ?purge=1: also delete the engine's installed files from disk.
       // Only removes dirs under {dataDir}/engines/ — never touches model dirs.

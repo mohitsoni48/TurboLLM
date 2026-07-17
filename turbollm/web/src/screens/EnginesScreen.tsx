@@ -690,6 +690,7 @@ function EngineGallery({
     install.updateKoboldcpp.isPending ||
     install.updateLlamafile.isPending ||
     engineMut.remove.isPending ||
+    engineMut.disableCustom.isPending ||
     engineMut.purge.isPending
 
   // ── lifecycle (unchanged behavior; mirrors ManagedEngines.DiscoverEngines) ──
@@ -779,7 +780,7 @@ function EngineGallery({
   // lookup needed, unlike a catalog engine (which has to be re-matched via binPath/sourceRepo
   // conventions since it has no single fixed id of its own).
   const doDisableCustom = (eng: Engine) => {
-    engineMut.remove.mutate(eng.id, {
+    engineMut.disableCustom.mutate(eng.id, {
       onSuccess: () => toast.success(`${eng.name} disabled`),
       onError: (err) => toast.error(err instanceof ApiError ? err.message : `Could not disable ${eng.name}.`),
     })

@@ -278,6 +278,15 @@ export function removeEngine(id: string): Promise<{ ok: true }> {
   })
 }
 
+/** Disable a CUSTOM (non-catalog) engine — same DELETE as removeEngine, but tells the
+ *  backend to backfill its customEngineSources record first if one doesn't exist yet, so a
+ *  build added before that tracking existed doesn't vanish on Disable with no way back. */
+export function disableCustomEngine(id: string): Promise<{ ok: true }> {
+  return request<{ ok: true }>(`/api/v1/engines/${encodeURIComponent(id)}?recordSource=1`, {
+    method: 'DELETE',
+  })
+}
+
 /** Unregister a catalog engine AND delete its installed files from disk.
  *  Models are never touched — only the engine's install dir under engines/. */
 export function purgeEngine(id: string): Promise<{ ok: true }> {
