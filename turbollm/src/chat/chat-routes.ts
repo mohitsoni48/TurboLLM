@@ -763,14 +763,19 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
         })
       : undefined
     // Custom chat Agent tool allow-list (Customize → Agents), baked in at conversation
-    // creation. Undefined/empty = unrestricted — every built-in persona's conversations
-    // take this branch, so their tool list is byte-identical to before this feature.
+    // creation. Undefined (never set) = unrestricted — every untouched built-in persona's
+    // conversations take this branch, so their tool list is byte-identical to before this
+    // feature. An EXPLICIT empty array is different from unset, though — it means a
+    // built-in deliberately fixed its tool list to none (e.g. the Blank persona: "raw model
+    // output, no instructions injected" has to mean no tool-calling preamble too, not just
+    // an empty system prompt — GitHub #52) — so it must actually filter down to zero tools,
+    // not fall through to unrestricted the way a merely-absent list does.
     // Applied ONLY to the base (built-in + MCP) registry: skill-granted tools like
     // save_skill are never enumerated by /api/v1/tools (they only exist once their
     // skill is enabled), so they can never appear in the allow-list checklist — gating
     // them a second time here would silently strip save_skill from any agent that has
     // 'skill-creator' enabled. Enabling the skill IS the allow decision for its tools.
-    const scopedBaseToolDefs = conv.allowedTools?.length
+    const scopedBaseToolDefs = conv.allowedTools !== undefined
       ? baseToolDefs.filter((t) => conv.allowedTools!.includes(t.function.name))
       : baseToolDefs
     const toolDefs = skillTools ? [...scopedBaseToolDefs, ...skillTools.defs] : scopedBaseToolDefs
@@ -1218,13 +1223,23 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
   const thinkMs = thinkStart && thinkEnd ? thinkEnd - thinkStart : 0
   const ctxMax = ms.model?.ctx ?? 4096
 
+  // An aborted stream (Stop clicked, or the client disconnected mid-generation) can be cut off
+  // before the engine's final usage/timings chunk ever arrives, leaving completion_tokens at its
+  // default 0 — even though real output WAS generated, IS persisted (fullContent below), and WILL
+  // sit in context for the next turn. liveOut (incremented per streamed delta, above) is the one
+  // number we still have in that case; fall back to it instead of silently reporting "0 tokens"
+  // for a message that plainly has content (GitHub #52: "when you interrupt a model's response,
+  // the token count remains as 0+0, yet the model still sees the message in context, and the
+  // total token count remains unchanged").
+  const genTokensFallback = finalUsage.completion_tokens || liveOut
+
   const stats: Partial<MessageStats> = {
     ttftMs,
     totalMs,
     thinkMs,
     // Full context occupancy: cache-reused prompt tokens still sit in the KV cache / context
     // window (they're skipped only for recomputation), so they must stay counted here.
-    ctxUsed: (finalUsage.prompt_tokens ?? 0) + (finalUsage.completion_tokens ?? 0),
+    ctxUsed: (finalUsage.prompt_tokens ?? 0) + genTokensFallback,
     ctxMax,
     model: ms.model?.name ?? '',
     aborted,
@@ -1242,7 +1257,7 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
     stats.cachedTokens = cachedExplicit ?? Math.max(0, (fullPrompt || processed) - processed)
   } else {
     stats.promptTokens = fullPrompt
-    stats.genTokens    = finalUsage.completion_tokens ?? 0
+    stats.genTokens    = genTokensFallback
     stats.genMs        = totalMs - ttftMs
     stats.tps          = stats.genMs > 0 ? Math.round((stats.genTokens / stats.genMs) * 1000 * 10) / 10 : 0
     stats.cachedTokens = cachedExplicit ?? 0
@@ -1309,6 +1324,17 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
 
 // ── auto title generation ──────────────────────────────────────────────────
 
+/** PURE: the last `n` actual conversation turns to ground title generation in — excludes the
+ *  injected system prompt (capability boilerplate + persona + personalization + auto-memory
+ *  facts, see buildSystemPrompt). For a BRAND NEW conversation — exactly when auto-title fires —
+ *  engineMessages is just [system, user], so a plain `.slice(-n)` grabs the memory-stuffed
+ *  system message right alongside the real first message. A model handed a hefty "what I know
+ *  about you" block next to one short user turn often titled the chat off THAT instead of what
+ *  was actually asked (GitHub: "gets title based on memory and not based on msg I send"). */
+export function recentTitleTurns(messages: { role: string; content: unknown }[], n = 2): { role: string; content: unknown }[] {
+  return messages.filter((m) => m.role !== 'system').slice(-n)
+}
+
 async function autoTitle(
   d: Deps,
   convId: string,
@@ -1320,7 +1346,7 @@ async function autoTitle(
     const ms = d.manager.status()
     if (ms.state !== 'running') return
     const titleMessages = [
-      ...prevMessages.slice(-2),
+      ...recentTitleTurns(prevMessages),
       { role: 'assistant', content: assistantReply.slice(0, 500) },
       {
         role: 'user',

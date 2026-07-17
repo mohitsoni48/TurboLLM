@@ -167,6 +167,27 @@ export function resolveEffectiveHistory(d: Deps, convId: string, sessionId: stri
   return { summaryText: `${COMPACTION_PREFIX}${run.compactionSummary}${COMPACTION_SUFFIX}`, messages: rest }
 }
 
+// pi's own auto-compaction defaults (reserveTokens: 16384, keepRecentTokens: 20000 — 36384 total)
+// assume a large HOSTED model's context window (100K+ tokens). A local model's real context is
+// often far smaller — 8K-32K is common on consumer GPUs — and left unscaled, reserve+keepRecent
+// ALONE can exceed the model's whole window. That makes compaction self-defeating: pi "compacts"
+// but still aims to keep ~20000 tokens of recent history, which the very next request can't fit
+// under either, immediately overflowing again — and pi only auto-retries an overflow ONCE before
+// giving up for good with "Context overflow recovery failed..." (GitHub #60: "ran out of
+// context... it just failed", with no attempt to roll up context that could actually succeed).
+const PI_DEFAULT_RESERVE_TOKENS = 16384
+const PI_DEFAULT_KEEP_RECENT_TOKENS = 20000
+
+/** Auto-compaction settings scaled to the REAL loaded model's context window instead of pi's
+ *  hosted-model-sized defaults — reserve ~15% and keep-recent ~35% of `contextWindow` (leaving
+ *  the other ~50% for the compaction summary, system prompt/skills, and the new turn), capped at
+ *  pi's own defaults so a large-context local setup (e.g. a 200K-ctx build) is unaffected. */
+export function compactionSettingsFor(contextWindow: number): { enabled: boolean; reserveTokens: number; keepRecentTokens: number } {
+  const reserveTokens = Math.max(512, Math.min(PI_DEFAULT_RESERVE_TOKENS, Math.round(contextWindow * 0.15)))
+  const keepRecentTokens = Math.max(1024, Math.min(PI_DEFAULT_KEEP_RECENT_TOKENS, Math.round(contextWindow * 0.35)))
+  return { enabled: true, reserveTokens, keepRecentTokens }
+}
+
 /** A minimal SSE sink — matches the chat wire shape so the existing frontend parser works. */
 export type CodeSseSink = (ev: { event: string; data: unknown }) => void | Promise<void>
 
@@ -284,7 +305,9 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
   // ── in-memory pi services (no global pi config on disk) ──────────────────────
   const authStorage = AuthStorage.inMemory()
   const modelRegistry = ModelRegistry.inMemory(authStorage)
-  const settingsManager = SettingsManager.inMemory()
+  // Auto-compaction settings scaled to THIS model's real ctx (see compactionSettingsFor) — pi's
+  // own hosted-model-sized defaults would otherwise make auto-compaction self-defeating here.
+  const settingsManager = SettingsManager.inMemory({ compaction: compactionSettingsFor(contextWindow) })
   // Seed prior turns (see seedPriorHistory's own comment), respecting any existing manual
   // /compact — everything up to but NOT including the current turn's user message.
   // code-run-manager.ts's pump() has already appended both `task`'s own user message AND an
@@ -520,7 +543,9 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       modelRegistry: skillRegistry,
       resourceLoader: skillResourceLoader,
       sessionManager: SessionManager.inMemory(repoRoot),
-      settingsManager: SettingsManager.inMemory(),
+      // Same ctx-scaled auto-compaction settings as the outer session (compactionSettingsFor) —
+      // a skill sub-session shares the same model/contextWindow, so the same defaults apply.
+      settingsManager: SettingsManager.inMemory({ compaction: compactionSettingsFor(contextWindow) }),
       customTools: [skillBash],
       ...(skillTools ? { tools: skillTools } : {}),
     })
@@ -1124,7 +1149,10 @@ export async function compactCodeSession(params: CompactCodeParams): Promise<Com
     authStorage,
     modelRegistry,
     sessionManager,
-    settingsManager: SettingsManager.inMemory(),
+    // Ctx-scaled settings (compactionSettingsFor) — pi's hosted-model-sized defaults could ask
+    // to keep more "recent" tokens than this model's real context window even has room for,
+    // producing a compacted result that still doesn't fit.
+    settingsManager: SettingsManager.inMemory({ compaction: compactionSettingsFor(contextWindow) }),
     resourceLoader: compactResourceLoader,
     tools: [], // pure summarization — no tool needs to run, and none should be able to.
   })

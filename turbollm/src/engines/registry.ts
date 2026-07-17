@@ -2,8 +2,9 @@
 // enforced by the API layer using the Manager's live state.
 import { existsSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
-import { ConfigStore, Engine, UpdatePolicy, ValueError, findEngine } from '../config/config'
+import { ConfigStore, CustomEngineSource, Engine, UpdatePolicy, ValueError, findEngine } from '../config/config'
 import { probe } from './probe'
+import { normRepoUrl } from './build-runner'
 
 /** Auto-provisioned official builds live under `<dataDir>/engines/llama.cpp-…/`.
  *  User forks are arbitrary paths and are never auto-removed. */
@@ -283,6 +284,31 @@ export class Registry {
     })
   }
 
+  /** Record (or refresh) a custom engine's identity so it survives a later Disable —
+   *  see {@link CustomEngineSource}. Idempotent: a second call for the same identity
+   *  (customSourceKey) overwrites in place rather than accumulating duplicates. */
+  recordCustomSource(entry: Omit<CustomEngineSource, 'addedAt'>): void {
+    this.store.update((c) => {
+      const key = customSourceKey(entry)
+      const record: CustomEngineSource = { ...entry, addedAt: new Date().toISOString() }
+      const i = c.customEngineSources.findIndex((s) => customSourceKey(s) === key)
+      if (i >= 0) c.customEngineSources[i] = record
+      else c.customEngineSources.push(record)
+    })
+  }
+
+  customSources(): CustomEngineSource[] {
+    return this.store.snapshot().customEngineSources
+  }
+
+  /** Drop a custom engine's remembered identity — called on an explicit purge/delete
+   *  (never on a plain Disable, which is exactly what this record is meant to survive). */
+  forgetCustomSource(key: string): void {
+    this.store.update((c) => {
+      c.customEngineSources = c.customEngineSources.filter((s) => customSourceKey(s) !== key)
+    })
+  }
+
   activate(id: string): void {
     this.store.update((c) => {
       if (!findEngine(c.engines, id)) throw new NotFoundError()
@@ -350,6 +376,17 @@ export class Registry {
       }
     }
   }
+}
+
+/** PURE: stable identity key for a custom engine source — sourceRepo+branch+commit when
+ *  git-built (a rebuild lands at a different binPath each time, so binPath alone can't be the
+ *  key), else the binPath itself (a plain "point at a binary" add has nothing else to key by).
+ *  Shared between {@link Registry.recordCustomSource}/{@link Registry.forgetCustomSource} and
+ *  a live {@link Engine} so the two can be cross-referenced (same shape: sourceRepo?/
+ *  sourceBranch?/sourceCommit?/binPath). */
+export function customSourceKey(s: { sourceRepo?: string; sourceBranch?: string; sourceCommit?: string; binPath: string }): string {
+  if (!s.sourceRepo) return s.binPath
+  return `${normRepoUrl(s.sourceRepo)}#${(s.sourceBranch ?? '').trim().toLowerCase()}#${(s.sourceCommit ?? '').trim().toLowerCase()}`
 }
 
 /** True when a saved `capabilities.flags` list was captured by a daemon predating a

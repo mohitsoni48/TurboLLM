@@ -605,7 +605,7 @@ export function MessageBubble({
           {!isEditing && (
             <div className="flex items-center gap-0.5">
               {convId && message.variantGroup && <VariantSwitcher convId={convId} message={message} />}
-              <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+              <div className="hover-actions flex items-center gap-0.5">
                 <CopyButton text={message.content} className="rounded p-1 hover:bg-panel-2" />
                 {onEdit && <ActionBtn icon={<Pencil size={12} />}  label="Edit"   onClick={() => { setEditDraft(message.content); onEdit(message) }} />}
                 {onDelete && <ActionBtn icon={<Trash2 size={12} />} label="Delete" onClick={() => onDelete(message)} destructive />}
@@ -692,9 +692,15 @@ export function MessageBubble({
       {!isEditing && (
         <div className="mt-1 flex items-center gap-0.5">
           {convId && message.variantGroup && <VariantSwitcher convId={convId} message={message} />}
-          <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
-            <CopyButton text={message.content} className="rounded p-1 hover:bg-panel-2" />
-            {onEdit && <ActionBtn icon={<Pencil size={12} />} label="Edit" onClick={() => { setEditDraft(message.content); onEdit(message) }} />}
+          <div className="hover-actions flex items-center gap-0.5">
+            {/* GitHub #52 (v1.7.5 fix was incomplete): Copy/Edit make no sense on a message
+                with no content to copy or edit — hasError already replaces the content area
+                with "This message is empty."/"Generation failed…", but this action row still
+                rendered all four buttons underneath regardless, which is the "block" the
+                follow-up report was pointing at. Delete/Regenerate stay: both are genuinely
+                useful on a failed/empty message. */}
+            {!hasError && <CopyButton text={message.content} className="rounded p-1 hover:bg-panel-2" />}
+            {!hasError && onEdit && <ActionBtn icon={<Pencil size={12} />} label="Edit" onClick={() => { setEditDraft(message.content); onEdit(message) }} />}
             {isLast && onRegenerate && <ActionBtn icon={<RefreshCw size={12} />} label="Regenerate" onClick={onRegenerate} />}
             {onDelete && <ActionBtn icon={<Trash2 size={12} />} label="Delete" onClick={() => onDelete(message)} destructive />}
           </div>

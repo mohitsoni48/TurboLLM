@@ -136,25 +136,29 @@ function detectGpus(): GpuInfo[] {
 
 function enumWindowsGpus(): GpuInfo[] {
   // AMD first: ROCm's rocm-smi reports true VRAM, unlike WMI's 4GB-capped
-  // AdapterRAM below. Only present when ROCm is installed; falls through if not.
+  // AdapterRAM below. Only present when ROCm is installed; falls through if not —
+  // which is the COMMON case for consumer Radeon cards (ROCm's Windows support is
+  // limited and doesn't cover most gaming GPUs, e.g. the RX 9000 series), so most
+  // AMD users still hit the WMI path below.
   try {
     const amd = rocmSmiGpus()
     if (amd.length) return amd
   } catch {
-    /* no rocm-smi (ROCm not installed) — fall back to WMI */
+    /* no rocm-smi (ROCm not installed, or unsupported on this card) — fall back to WMI */
   }
 
   // Win32_VideoController: Name + AdapterRAM (AdapterRAM caps at 4GB for larger
   // cards and is unreliable — used only as a weak hint). This mis-sizes AMD cards
-  // >4GB (e.g. RX 7900 XTX reports ~4GB, not 24GB), which is why AMD is tried via
-  // rocm-smi first above.
+  // >4GB (e.g. RX 7900 XTX / RX 9070 XT report ~4GB, not their real 16-24GB —
+  // GitHub #63), which is why AMD is tried via rocm-smi first above, and why the
+  // registry is cross-checked below for whatever falls through to here.
   const ps =
     'Get-CimInstance Win32_VideoController | ForEach-Object { "$($_.Name)|$($_.AdapterRAM)" }'
   const out = execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], {
     timeout: 8000,
     windowsHide: true,
   }).toString()
-  return out
+  const wmiGpus = out
     .trim()
     .split('\n')
     .map((line) => {
@@ -174,6 +178,69 @@ function enumWindowsGpus(): GpuInfo[] {
       return { name: nm, vramMb, vendor: classifyVendor(nm) }
     })
     .filter((g) => g.name && g.vendor !== 'unknown')
+
+  // AdapterRAM is a 32-bit DWORD — it silently caps/wraps for ANY card past ~4 GB, not just
+  // AMD (the exact "4.3 GB" GitHub #63 reported for a real 16 GB card). The registry keeps the
+  // SAME total as a proper 64-bit value under each display adapter's driver key — this is how
+  // GPU-Z/HWiNFO get it right too — so read it and prefer it over AdapterRAM whenever it's
+  // bigger, for every discrete card. rocm-smi above already covers the ROCm-equipped AMD case;
+  // this covers everyone who fell through to WMI (most consumer AMD/Intel dGPU owners).
+  const registryVram = readWindowsVramRegistry()
+  return wmiGpus.map((g) => {
+    if (isIntegratedGpuName(g.name)) return g
+    const fromRegistry = findRegistryVram(registryVram, g.name)
+    return fromRegistry !== undefined && fromRegistry > g.vramMb ? { ...g, vramMb: fromRegistry } : g
+  })
+}
+
+/** A display adapter's true VRAM as read from the registry, before matching to a WMI entry. */
+export interface RegistryVram {
+  name: string
+  vramMb: number
+}
+
+// Display-adapter driver class GUID (stable across all Windows versions) — each installed
+// adapter gets a numbered subkey here with its driver-reported HardwareInformation.qwMemorySize.
+const DISPLAY_CLASS_GUID = '{4d36e968-e325-11ce-bfc1-08002be10318}'
+
+/** Best-effort read of every display adapter's true VRAM from the Windows registry — a proper
+ *  64-bit value, unlike WMI's 32-bit-capped AdapterRAM (see enumWindowsGpus). Empty array on any
+ *  failure (missing key, no permission, non-Windows): the caller just keeps the AdapterRAM value. */
+function readWindowsVramRegistry(): RegistryVram[] {
+  try {
+    const ps =
+      `Get-ChildItem 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Class\\${DISPLAY_CLASS_GUID}' -ErrorAction SilentlyContinue | ` +
+      "ForEach-Object { $p = Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue; " +
+      "if ($p.'HardwareInformation.qwMemorySize') { \"$($p.DriverDesc)|$($p.'HardwareInformation.qwMemorySize')\" } }"
+    const out = execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], {
+      timeout: 8000,
+      windowsHide: true,
+    }).toString()
+    return parseWindowsVramRegistry(out)
+  } catch {
+    return []
+  }
+}
+
+/** Pure parser for {@link readWindowsVramRegistry}'s PowerShell output, split out for direct
+ *  testing (mirrors {@link parseRocmSmi}). Each line is "DriverDesc|qwMemorySize(bytes)". */
+export function parseWindowsVramRegistry(psOutput: string): RegistryVram[] {
+  const out: RegistryVram[] = []
+  for (const line of psOutput.trim().split('\n')) {
+    const [name, bytes] = line.split('|')
+    const nm = (name ?? '').trim()
+    const b = parseInt((bytes ?? '').trim(), 10)
+    if (nm && Number.isFinite(b) && b > 0) out.push({ name: nm, vramMb: Math.round(b / 1e6) })
+  }
+  return out
+}
+
+/** Loose GPU-name match between WMI's Name and the registry's DriverDesc — normally identical,
+ *  but can differ in trademark symbols/punctuation/whitespace/case, so compare a normalized form. */
+function findRegistryVram(entries: RegistryVram[], wmiName: string): number | undefined {
+  const norm = (s: string) => s.toLowerCase().replace(/[^\w\s]/g, '').replace(/\s+/g, ' ').trim()
+  const target = norm(wmiName)
+  return entries.find((e) => norm(e.name) === target)?.vramMb
 }
 
 // AMD VRAM on Windows via ROCm's rocm-smi. `--showmeminfo vram --json` returns an

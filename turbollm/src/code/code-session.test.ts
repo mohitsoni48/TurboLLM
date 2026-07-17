@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { toolsForMode, buildAppendPrompt, skillsBlock, skillCatalogBlock, type CodeMode } from './persona'
 import { toSessionStatus } from './code-routes'
-import { MUTATING_TOOLS, PATH_TOOLS, resolveEffectiveHistory, compactCodeSession, isDependencyAddCommand } from './code-session'
+import { MUTATING_TOOLS, PATH_TOOLS, resolveEffectiveHistory, compactCodeSession, isDependencyAddCommand, compactionSettingsFor } from './code-session'
 import { ConversationStore } from '../chat/db'
 import type { Deps } from '../deps'
 import type { Skill } from '../agents/skills'
@@ -61,6 +61,41 @@ test('PATH_TOOLS: path-checked tools include the fs tools but NOT bash', () => {
   assert.deepEqual([...PATH_TOOLS].sort(), ['edit', 'find', 'grep', 'ls', 'read', 'write'])
   // bash takes `command`, not `path` — it must not be containment-checked by path.
   assert.ok(!PATH_TOOLS.has('bash'))
+})
+
+// GitHub #60: "ran out of context... it just failed, no attempt to roll up context." pi's own
+// auto-compaction defaults (reserve 16384 + keep-recent 20000 = 36384 tokens) assume a large
+// hosted model — unscaled, that alone can exceed a typical local model's real context window,
+// making compaction self-defeating (it "succeeds" but the result still doesn't fit, and pi only
+// retries an overflow once before giving up for good).
+test('compactionSettingsFor: scales down for a small local context window (8K)', () => {
+  const s = compactionSettingsFor(8192)
+  assert.equal(s.enabled, true)
+  assert.ok(s.reserveTokens + s.keepRecentTokens < 8192, 'reserve+keepRecent must leave real headroom')
+})
+
+test('compactionSettingsFor: reserve+keepRecent stays a bounded fraction of ctx (32K)', () => {
+  const s = compactionSettingsFor(32768)
+  assert.ok(s.reserveTokens + s.keepRecentTokens <= 32768 * 0.6)
+})
+
+test('compactionSettingsFor: never below a sane floor, even for a tiny context', () => {
+  const s = compactionSettingsFor(2048)
+  assert.ok(s.reserveTokens >= 512)
+  assert.ok(s.keepRecentTokens >= 1024)
+})
+
+test('compactionSettingsFor: caps at pi\'s own defaults for a large-context local build (200K)', () => {
+  const s = compactionSettingsFor(200_000)
+  assert.equal(s.reserveTokens, 16384)
+  assert.equal(s.keepRecentTokens, 20000)
+})
+
+test('compactionSettingsFor: monotonically non-decreasing with contextWindow (below the cap)', () => {
+  const small = compactionSettingsFor(8192)
+  const big = compactionSettingsFor(65536)
+  assert.ok(big.reserveTokens >= small.reserveTokens)
+  assert.ok(big.keepRecentTokens >= small.keepRecentTokens)
 })
 
 test('isDependencyAddCommand: detects install/add commands across common package managers', () => {

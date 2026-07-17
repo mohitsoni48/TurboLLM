@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { parseRocmSmi, isIntegratedGpuName } from './sysinfo'
+import { parseRocmSmi, isIntegratedGpuName, parseWindowsVramRegistry } from './sysinfo'
 
 // rocm-smi --showmeminfo vram --json output for an RX 7900 XTX (24GB). The WMI
 // AdapterRAM fallback would cap this at ~4GB; rocm-smi reports the true total.
@@ -95,4 +95,32 @@ test('isIntegratedGpuName: discrete AMD cards are NOT integrated', () => {
 test('isIntegratedGpuName: NVIDIA and unrelated names are NOT integrated', () => {
   assert.equal(isIntegratedGpuName('NVIDIA GeForce RTX 5070 Ti'), false)
   assert.equal(isIntegratedGpuName('Apple M3 Max'), false)
+})
+
+// ---- parseWindowsVramRegistry: true VRAM via the registry's 64-bit qwMemorySize, unlike WMI's
+// 32-bit-capped AdapterRAM (GitHub #63: a real 16 GB AMD card was detected as "4.3 GB") --------
+
+test('parseWindowsVramRegistry: reports true 16GB VRAM the 4GB WMI cap would miss', () => {
+  const out = 'AMD Radeon RX 9070 XT|17179869184' // exactly 16 GiB, in bytes
+  const entries = parseWindowsVramRegistry(out)
+  assert.equal(entries.length, 1)
+  assert.equal(entries[0].name, 'AMD Radeon RX 9070 XT')
+  assert.equal(entries[0].vramMb, 17180)
+  assert.ok(entries[0].vramMb > 4300, 'must be well above the ~4.3GB WMI AdapterRAM cap')
+})
+
+test('parseWindowsVramRegistry: multiple adapters each parse', () => {
+  const out = 'AMD Radeon RX 9070 XT|17179869184\nIntel(R) UHD Graphics 770|0'
+  const entries = parseWindowsVramRegistry(out)
+  // The iGPU's qwMemorySize of 0 is dropped — isIntegratedGpuName already handles iGPU sizing
+  // via the shared-memory heuristic, so a zero/missing registry entry is simply skipped.
+  assert.equal(entries.length, 1)
+  assert.equal(entries[0].name, 'AMD Radeon RX 9070 XT')
+})
+
+test('parseWindowsVramRegistry: blank/malformed lines are skipped, not crashed on', () => {
+  assert.deepEqual(parseWindowsVramRegistry(''), [])
+  assert.deepEqual(parseWindowsVramRegistry('\n\n'), [])
+  assert.deepEqual(parseWindowsVramRegistry('no pipe here'), [])
+  assert.deepEqual(parseWindowsVramRegistry('Some Card|not-a-number'), [])
 })

@@ -1,6 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
+  customSourceIsLive,
+  customSourceKey,
   engineGroupKey,
   groupEngines,
   latestMemberId,
@@ -119,4 +121,33 @@ test('memberToActivate prefers the active member, then latest, then first', () =
   assert.equal(memberToActivate(g, null)?.id, 'b') // none active → latest
   const noTags = groupEngines([turboquant, mlx]).find((x) => x.key === 'turboquant')!
   assert.equal(memberToActivate(noTags, null)?.id, 'c') // no latest → first
+})
+
+// customSourceKey MUST mirror the backend's registry.ts version exactly — it's used to match a
+// "Forget" request against the same record the backend keyed it under (GitHub: custom-engine
+// parity for disable/enable/rebuild).
+
+test('customSourceKey: matches the backend registry.ts test vectors byte-for-byte', () => {
+  const a = { binPath: '/build/a/llama-server', sourceRepo: 'https://github.com/user/fork', sourceBranch: 'main' }
+  const b = { binPath: '/build/b/llama-server', sourceRepo: 'https://github.com/user/fork', sourceBranch: 'main' }
+  assert.equal(customSourceKey(a), customSourceKey(b)) // rebuild → different binPath, same key
+  const forms = [
+    { binPath: 'x', sourceRepo: 'https://github.com/User/Fork', sourceBranch: '' },
+    { binPath: 'x', sourceRepo: 'https://github.com/user/fork.git', sourceBranch: '' },
+    { binPath: 'x', sourceRepo: 'https://github.com/user/fork/', sourceBranch: '' },
+  ]
+  assert.ok(forms.every((f) => customSourceKey(f) === customSourceKey(forms[0])))
+  assert.notEqual(
+    customSourceKey({ binPath: 'x', sourceRepo: 'r', sourceBranch: 'main' }),
+    customSourceKey({ binPath: 'x', sourceRepo: 'r', sourceBranch: 'main', sourceCommit: 'abc' }),
+  )
+  assert.equal(customSourceKey({ binPath: '/opt/my-server' }), '/opt/my-server')
+})
+
+test('customSourceIsLive: true when a live engine shares the same identity, false otherwise', () => {
+  const source = { name: 'My Fork', binPath: '/build/v1/llama-server', sourceRepo: 'https://github.com/user/fork', sourceBranch: 'main', addedAt: '', binPathExists: true }
+  const liveSameRepo = eng({ id: 'live', binPath: '/build/v2/llama-server', sourceRepo: 'https://github.com/user/fork', sourceBranch: 'main' })
+  assert.equal(customSourceIsLive(source, [liveSameRepo]), true)
+  assert.equal(customSourceIsLive(source, [userFork]), false)
+  assert.equal(customSourceIsLive(source, []), false)
 })

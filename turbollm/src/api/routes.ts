@@ -11,7 +11,7 @@ import { ValueError, getModelProfile, setModelProfile, deleteModelProfile, VRAM_
 import type { Deps } from '../deps'
 import { type ModelInfo, type StartOpts } from '../engines/manager'
 import { abortAllInFlightChats } from '../chat/chat-routes'
-import { NameTakenError, NotFoundError } from '../engines/registry'
+import { NameTakenError, NotFoundError, customSourceKey } from '../engines/registry'
 import { ProbeError, probe } from '../engines/probe'
 import { resolveServerBinary, suggestEngineName } from '../engines/scan'
 import { generateApiKey, isLocalRequest } from '../auth'
@@ -154,7 +154,17 @@ export function registerApi(app: Hono, d: Deps): void {
   // ---- engine registry (A1) ----
   app.get('/api/v1/engines', (c) => {
     const { engines, activeEngineId } = d.registry.list()
-    return c.json({ engines, activeEngineId })
+    // Custom (non-catalog) engines that are currently DISABLED — recorded (recordCustomSource)
+    // when added, kept across a plain Disable, dropped only on purge. Cross-referenced against
+    // the LIVE registry by customSourceKey so a re-enabled/rebuilt entry doesn't show twice.
+    // binPathExists lets the UI offer a real "Enable" (re-register, no rebuild) vs. a
+    // "build no longer on disk, rebuild from source" state for one the user deleted by hand.
+    const liveKeys = new Set(engines.map((e) => customSourceKey(e)))
+    const customDisabled = d.registry
+      .customSources()
+      .filter((s) => !liveKeys.has(customSourceKey(s)))
+      .map((s) => ({ ...s, binPathExists: existsSync(s.binPath) }))
+    return c.json({ engines, activeEngineId, customDisabled })
   })
 
   // ---- engine backends (ADR-025): hardware-aware default + override ----
@@ -589,6 +599,13 @@ export function registerApi(app: Hono, d: Deps): void {
           sourceCommit: commit,
         })).engine
         d.registry.activate(eng.id)
+        // A genuinely custom repo (not one of the catalog's own known projects) needs its
+        // identity remembered independent of the live registration — see recordCustomSource's
+        // own doc comment. A catalog repo already gets equivalent treatment from the /catalog
+        // endpoint's own disk scan, so it's deliberately excluded here.
+        if (!isCatalogRepo(repoUrl)) {
+          d.registry.recordCustomSource({ name: eng.name, binPath: eng.binPath, kind: eng.kind, sourceRepo: repoUrl, sourceBranch: branch, sourceCommit: commit })
+        }
         d.build.log(`Registered "${eng.name}" — built from ${out.commit.slice(0, 8)}.`)
         d.build.done()
       } catch (e) {
@@ -816,13 +833,20 @@ export function registerApi(app: Hono, d: Deps): void {
     // Refuse it from non-loopback callers even with a key (defense in depth).
     if (!isLocalRequest(c, d))
       return err(c, 403, 'forbidden', 'Engines can only be added from the machine running TurboLLM.')
-    const b = await body<{ name?: string; binPath?: string; sourceRepo?: string; sourceBranch?: string }>(c)
+    const b = await body<{ name?: string; binPath?: string; sourceRepo?: string; sourceBranch?: string; sourceCommit?: string }>(c)
     if (!b.binPath || !b.binPath.trim()) return err(c, 400, 'invalid_config_value', 'binPath is required.')
     try {
       const { engine, warning } = await d.registry.add(b.name ?? '', b.binPath, {
         sourceRepo: b.sourceRepo,
         sourceBranch: b.sourceBranch,
+        sourceCommit: b.sourceCommit,
       })
+      // Same custom-source tracking as the 1-click build completion above — a manually
+      // pointed-at binary (with or without a sourceRepo) is just as much a "custom engine"
+      // as a self-service build, and deserves the same Disable-survives-as-Enable treatment.
+      if (!isCatalogRepo(b.sourceRepo)) {
+        d.registry.recordCustomSource({ name: engine.name, binPath: engine.binPath, kind: engine.kind, sourceRepo: b.sourceRepo, sourceBranch: b.sourceBranch, sourceCommit: b.sourceCommit })
+      }
       // `probe_no_version` is non-blocking (spec 03 §2): the engine is saved, but
       // the response carries a warning flag so the dialog can prompt the user.
       return c.json({ ...engine, warning: warning ?? null }, 201)
@@ -885,6 +909,20 @@ export function registerApi(app: Hono, d: Deps): void {
     }
   })
 
+  // Forget a DISABLED custom engine's remembered identity (customEngineSources) — no live
+  // registry entry to delete (that's the whole point: it's disabled, not registered), so this
+  // is distinct from DELETE /api/v1/engines/:id?purge=1 below. Never touches files on disk.
+  // Registered BEFORE the :id route below — Hono matches in registration order, and :id would
+  // otherwise swallow "custom-sources" as its own param value.
+  app.delete('/api/v1/engines/custom-sources/:key', (c) => {
+    // c.req.param() already URL-decodes path segments (Hono) — decoding again corrupts any
+    // key containing a literal '%' (the binPath fallback key can) and throws on an invalid
+    // escape, since a normal key's second decode is a harmless no-op that hid this on the
+    // happy path.
+    d.registry.forgetCustomSource(c.req.param('key'))
+    return c.json({ ok: true })
+  })
+
   app.delete('/api/v1/engines/:id', (c) => {
     const id = c.req.param('id')
     const { activeEngineId } = d.registry.list()
@@ -892,8 +930,19 @@ export function registerApi(app: Hono, d: Deps): void {
       return err(c, 409, 'engine_in_use', 'Stop the engine before removing it.')
     }
     const purge = c.req.query('purge') === '1'
+    // Set by the frontend's custom-engine Disable (never alongside purge): a custom engine
+    // added before customEngineSources tracking existed has no recorded identity, so a plain
+    // Disable would otherwise vanish it with no Enable path back. recordCustomSource is a
+    // record-or-refresh, so this is a no-op when a record already exists.
+    const recordSource = c.req.query('recordSource') === '1'
     try {
       const eng = d.registry.get(id)
+      if (recordSource && !purge && eng) {
+        d.registry.recordCustomSource({
+          name: eng.name, binPath: eng.binPath, kind: eng.kind,
+          sourceRepo: eng.sourceRepo, sourceBranch: eng.sourceBranch, sourceCommit: eng.sourceCommit,
+        })
+      }
       d.registry.remove(id)
       // ?purge=1: also delete the engine's installed files from disk.
       // Only removes dirs under {dataDir}/engines/ — never touches model dirs.
@@ -903,6 +952,11 @@ export function registerApi(app: Hono, d: Deps): void {
         if (purgeDir && existsSync(purgeDir)) {
           rmSync(purgeDir, { recursive: true, force: true })
         }
+        // A purge is a real delete, not a Disable — drop any remembered custom-engine
+        // identity too, so a purged engine doesn't linger as a "disabled" card with a
+        // now-broken Enable (its files are gone). A plain Disable (no purge) leaves this
+        // record alone; that's the whole point of recordCustomSource.
+        d.registry.forgetCustomSource(customSourceKey(eng))
       }
       return c.json({ ok: true })
     } catch (e) {
@@ -2244,6 +2298,16 @@ function benchError(c: Context, e: unknown) {
 function engineBusy(d: Deps): boolean {
   const s = d.manager.status().state
   return s === 'running' || s === 'starting' || s === 'stopping'
+}
+
+/** True when `repoUrl` matches a known catalog engine's homepage (llama.cpp, TurboQuant, …).
+ *  Gates {@link Registry.recordCustomSource}: a catalog repo already gets its own re-enable
+ *  detection (the /catalog endpoint's `sourceBuildBinary(enginesRoot, e.homepage)` scan, keyed
+ *  by that fixed, hardcoded URL) — recording it as a "custom" source too would just duplicate
+ *  that, and could show the SAME build as two different cards. */
+function isCatalogRepo(repoUrl: string | undefined): boolean {
+  if (!repoUrl) return false
+  return catalogForPlatform().some((e) => sameRepo(repoUrl, e.homepage))
 }
 
 function regErr(c: Context, e: unknown) {

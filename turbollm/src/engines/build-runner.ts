@@ -71,16 +71,22 @@ export function buildDirName(repoUrl: string, branch?: string, commit?: string):
  *  a `github.com/` host prefix, a trailing `.git`/slash, and case. Lets us match a catalog
  *  entry's homepage to a source-built engine's stored `sourceRepo`. */
 export function sameRepo(a?: string, b?: string): boolean {
-  const norm = (s?: string) =>
-    (s ?? '')
-      .trim()
-      .toLowerCase()
-      .replace(/^https?:\/\//, '')
-      .replace(/^github\.com\//, '')
-      .replace(/\.git$/, '')
-      .replace(/\/+$/, '')
-  const na = norm(a)
-  return na !== '' && na === norm(b)
+  const na = normRepoUrl(a)
+  return na !== '' && na === normRepoUrl(b)
+}
+
+/** PURE: normalize a repo identifier (full URL or `owner/repo`) to a comparable/keyable form —
+ *  strips scheme, a `github.com/` host prefix, a trailing `.git`/slash, and case. Exported (not
+ *  just {@link sameRepo}'s internal helper) so a stable per-repo KEY can be built the same way
+ *  a match is judged — e.g. {@link customSourceKey} in registry.ts. */
+export function normRepoUrl(s?: string): string {
+  return (s ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/^github\.com\//, '')
+    .replace(/\.git$/, '')
+    .replace(/\/+$/, '')
 }
 
 /** The built `llama-server` for a repo (+optional branch) under `enginesRoot`, or null. Used
@@ -114,6 +120,21 @@ export function pickGenerator(hasNinja: boolean, isWindows: boolean): 'Ninja' | 
  *  failing (seen in the wild: ik_llama.cpp). */
 export function isIncompleteMetalBackendError(log: string[]): boolean {
   return log.some((line) => /undeclared identifier 'ggml_backend_(is_metal|metal_\w+)'/.test(line))
+}
+
+/** PURE: the actionable failure message when the cloned repo isn't a llama.cpp-family CMake
+ *  project — null when it is. Checked right after cloning: without it, a Python-only engine
+ *  (e.g. exllamav3, GitHub #61) burns through the toolchain checks and clone, then dies on a
+ *  bare "cmake exited with code 1" with the real reason (no CMakeLists.txt) buried in the
+ *  scrolled build log instead of the headline error. */
+export function notCmakeProjectError(hasCMakeLists: boolean): string | null {
+  if (hasCMakeLists) return null
+  return (
+    "This repository doesn't look like a llama.cpp-based (CMake) project — no CMakeLists.txt was " +
+    'found at its root. 1-click build currently only supports llama.cpp-family engines built with ' +
+    'CMake. If this project exposes a llama-server-compatible binary some other way, add it as a ' +
+    'custom engine by pointing TurboLLM directly at that binary instead of building from source.'
+  )
 }
 
 // CMAKE_CONFIGURE_ARGS now lives in build-prereqs.ts (re-exported below) — it's shared with
@@ -497,6 +518,11 @@ export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: Abo
 
   // Record the built commit (ADR-088 provenance / rebuild comparison).
   const commit = (await runStep('git', ['-C', srcDir, 'rev-parse', 'HEAD'], { env, signal, onLine: () => {} })).trim()
+
+  // Fail fast with an actionable reason when this isn't a llama.cpp-family CMake project at all
+  // (GitHub #61) — before sinking minutes into a configure/compile that can only die cryptically.
+  const notCmake = notCmakeProjectError(existsSync(join(srcDir, 'CMakeLists.txt')))
+  if (notCmake) throw new Error(notCmake)
 
   // Drop a gratuitous ASM-language declaration some forks ship (no assembly sources) so the
   // MSVC build doesn't die on "No CMAKE_ASM_COMPILER could be found" for a language nothing uses.

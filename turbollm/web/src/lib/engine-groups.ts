@@ -5,7 +5,7 @@
 // than one installed variant, surface a second "version" dropdown to pick the build.
 //
 // Pure + framework-free so it is unit-testable on its own (imported by EnginesScreen).
-import type { Engine } from './types'
+import type { CustomEngineSource, Engine } from './types'
 
 /** Official llama.cpp builds auto-downloaded by TurboLLM live in
  *  `<config>/engines/llama.cpp-<tag>-<backend>/`. Matches EnginesScreen.isOfficialLlama. */
@@ -22,6 +22,31 @@ export function repoSlug(sourceRepo: string | undefined): string | undefined {
     ?.replace(/^https?:\/\/github\.com\//i, '')
     .replace(/\.git$/i, '')
     .toLowerCase()
+}
+
+/** PURE: MUST mirror the backend's registry.ts `customSourceKey` exactly (down to the
+ *  normalization steps) — this is used to look up a "Forget" request against the SAME record
+ *  the backend keyed it under, and a mismatch here means the request silently matches nothing.
+ *  Deliberately not built on `repoSlug` above, which normalizes slightly differently (no
+ *  trailing-slash strip) — a divergence there wouldn't matter for its own display purpose but
+ *  would break this identity match. */
+export function customSourceKey(s: { sourceRepo?: string; sourceBranch?: string; sourceCommit?: string; binPath: string }): string {
+  if (!s.sourceRepo) return s.binPath
+  const normRepoUrl = s.sourceRepo
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/^github\.com\//, '')
+    .replace(/\.git$/, '')
+    .replace(/\/+$/, '')
+  return `${normRepoUrl}#${(s.sourceBranch ?? '').trim().toLowerCase()}#${(s.sourceCommit ?? '').trim().toLowerCase()}`
+}
+
+/** True when a live registered `Engine` corresponds to a recorded `CustomEngineSource` —
+ *  i.e. the custom engine is currently ENABLED, not disabled. */
+export function customSourceIsLive(source: CustomEngineSource, liveEngines: Engine[]): boolean {
+  const key = customSourceKey(source)
+  return liveEngines.some((e) => customSourceKey(e) === key)
 }
 
 /** A logical-engine grouping key. Engines that share a key collapse into one row.

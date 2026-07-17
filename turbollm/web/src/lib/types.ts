@@ -216,11 +216,31 @@ export type Engine = {
   sourceRepo?: string
   /** Optional branch to compare commits against (ADR-088). Empty → default branch. */
   sourceBranch?: string
+  /** Set only when this build was pinned to an exact historical commit. */
+  sourceCommit?: string
+}
+
+/** A custom (non-catalog) engine remembered even while disabled (see backend
+ *  CustomEngineSource) — lets Enable re-register the still-built binary with no rebuild. */
+export type CustomEngineSource = {
+  name: string
+  binPath: string
+  kind?: string
+  sourceRepo?: string
+  sourceBranch?: string
+  sourceCommit?: string
+  addedAt: string
+  /** Whether `binPath` still exists on disk — false means the user removed the build
+   *  folder by hand; Enable can't work until it's rebuilt. */
+  binPathExists: boolean
 }
 
 export type EnginesList = {
   engines: Engine[]
   activeEngineId: string
+  /** Custom engines the user has added before but are not currently registered
+   *  (Disabled, or never re-enabled since) — see {@link CustomEngineSource}. */
+  customDisabled: CustomEngineSource[]
 }
 
 /** POST /api/v1/engines/scan result (engine overhaul, Phase 3). Read-only preflight

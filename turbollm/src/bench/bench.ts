@@ -1301,16 +1301,26 @@ export function pickSplitStrategies(
   if (sys.gpus.length <= 1 || !has('--split-mode') || !has('--main-gpu')) return [base.gpu]
 
   const strategies: GpuProfile[] = []
-  // Single-GPU: whole model on one card. Judge feasibility with the SMALLEST quality-preserving KV
-  // the engine offers (the inner KV sweep can pick it to fit), so a model that only fits one card
-  // with turbo4 still gets the single-GPU branch it would win on.
+  // Single-GPU: as much of the model as this ONE card can hold. Judge feasibility with the SMALLEST
+  // quality-preserving KV the engine offers (the inner KV sweep can pick it to fit), so a model that
+  // only fits one card with turbo4 still gets the single-GPU branch it would win on.
   const kvOpts = pickKvQuants(base.kvTypeK, caps.kvTypes)
   const bestFitKv = kvOpts.reduce((a, b) => (kvBytes(b) < kvBytes(a) ? b : a), kvOpts[0] ?? base.kvTypeK)
   const mainGpu = base.gpu.mainGpu >= 0 ? base.gpu.mainGpu : 0
   const single: GpuProfile = { ...base.gpu, splitMode: 'none', mainGpu, tensorSplit: [] }
-  const singleFits =
-    estimateVram({ ...base, gpu: single, kvTypeK: bestFitKv, kvTypeV: bestFitKv }, entry, sys).verdict !== 'overflow'
-  if (singleFits) strategies.push(single)
+  // Feasibility is NOT "does the model fit at FULL GPU offload" — the inner offload search
+  // (denseSearch/moeSearch) already handles PARTIAL residency just fine, and a single card holding
+  // most of the model (CPU covering only the tail) still beats a cross-GPU layer-split, which pays a
+  // PCIe activation-copy tax at every layer boundary — worse yet with mismatched card speeds. Gating
+  // on "fits fully" skipped single-GPU whenever a model exceeded one card's capacity by even a
+  // little, forcing the slower split even when 90%+ of the model would happily sit on one GPU
+  // (GitHub #62: a model whose weights just missed a 16 GB card only ever got tried as a 2-GPU
+  // layer-split — comfortably fitting with VRAM to spare — and that came in at 4.8 tok/s). Instead,
+  // find the largest GPU-resident fraction this ONE card can hold and offer single-GPU only when
+  // CPU wouldn't end up doing the majority of the work — below that, the summed multi-GPU pool
+  // (kept as today's fallback either way) is the sounder bet.
+  const singleFrac = maxGpuFraction(entry, sys, { ...base, gpu: single, kvTypeK: bestFitKv, kvTypeV: bestFitKv })
+  if (singleFrac >= 0.5) strategies.push(single)
 
   // The profile's current split (default: layer across all GPUs) — always kept, as the fallback for
   // models too big for one card and so a tuned result can never be worse than today's default.
@@ -1324,6 +1334,33 @@ export function pickSplitStrategies(
     seen.add(key)
     return true
   })
+}
+
+/** The largest GPU-resident fraction (0..1) of `entry` that fits under `profile.gpu`'s own VRAM
+ *  budget, per {@link estimateVram}'s math — a cheap deterministic binary search (no real probing).
+ *  Dense: highest ngl/blockCount that isn't 'overflow'. MoE: complement of the lowest nCpuMoe/blockCount
+ *  that isn't 'overflow' (more CPU experts = less GPU residency, so the search direction inverts).
+ *  Used to decide whether single-GPU is even worth trying — see {@link pickSplitStrategies}. */
+function maxGpuFraction(entry: ModelEntry, sys: SysInfo, profile: LoadProfile): number {
+  const blocks = entry.blockCount > 0 ? entry.blockCount : 1
+  const fits = (n: number) =>
+    estimateVram(entry.moe ? { ...profile, nCpuMoe: n } : { ...profile, ngl: n }, entry, sys).verdict !== 'overflow'
+  let lo = 0
+  let hi = blocks
+  if (entry.moe) {
+    let best = blocks // worst case: every expert on CPU
+    while (lo <= hi) {
+      const mid = Math.floor((lo + hi) / 2)
+      if (fits(mid)) { best = mid; hi = mid - 1 } else { lo = mid + 1 }
+    }
+    return 1 - best / blocks
+  }
+  let best = 0
+  while (lo <= hi) {
+    const mid = Math.floor((lo + hi) / 2)
+    if (fits(mid)) { best = mid; lo = mid + 1 } else { hi = mid - 1 }
+  }
+  return best / blocks
 }
 
 /** Human-readable label for a split strategy, for the live step / bench log. */

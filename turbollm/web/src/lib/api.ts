@@ -131,8 +131,19 @@ export function addEngine(input: {
    *  notify-only "newer source available → rebuild" check. Omitted when empty. */
   sourceRepo?: string
   sourceBranch?: string
+  /** Set only when re-registering a build pinned to an exact historical commit. */
+  sourceCommit?: string
 }): Promise<AddEngineResult> {
   return request<AddEngineResult>('/api/v1/engines', { method: 'POST', json: input })
+}
+
+/** Forget a DISABLED custom engine's remembered identity (backend CustomEngineSource) — no
+ *  live registered engine to purge, so this is distinct from {@link purgeEngine}. Never
+ *  touches files on disk; `key` is the same identity string the entry carries as `customSourceKey`. */
+export function forgetCustomEngineSource(key: string): Promise<{ ok: true }> {
+  return request<{ ok: true }>(`/api/v1/engines/custom-sources/${encodeURIComponent(key)}`, {
+    method: 'DELETE',
+  })
 }
 
 /** Guided Add-engine scan (engine overhaul, Phase 3): given a chosen FOLDER or a
@@ -263,6 +274,15 @@ export function renameEngine(id: string, name: string): Promise<Engine> {
 
 export function removeEngine(id: string): Promise<{ ok: true }> {
   return request<{ ok: true }>(`/api/v1/engines/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  })
+}
+
+/** Disable a CUSTOM (non-catalog) engine — same DELETE as removeEngine, but tells the
+ *  backend to backfill its customEngineSources record first if one doesn't exist yet, so a
+ *  build added before that tracking existed doesn't vanish on Disable with no way back. */
+export function disableCustomEngine(id: string): Promise<{ ok: true }> {
+  return request<{ ok: true }>(`/api/v1/engines/${encodeURIComponent(id)}?recordSource=1`, {
     method: 'DELETE',
   })
 }

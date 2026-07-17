@@ -7,6 +7,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { stripThinkingBlocks, needsExtraPass } from './think-utils.js'
+import { recentTitleTurns } from './chat-routes.js'
 
 // ── stripThinkingBlocks ───────────────────────────────────────────────────────
 
@@ -69,4 +70,46 @@ test('needsExtraPass: returns false for plain text with no thinking tokens', () 
 
 test('needsExtraPass: returns false when think block is followed by non-whitespace', () => {
   assert.equal(needsExtraPass('<think>step</think>\n\nActual answer here.'), false)
+})
+
+// ── recentTitleTurns ──────────────────────────────────────────────────────────
+// GitHub: "the AI generated chat title is broken. It gets title based on memory and not based
+// on msg I send." For a brand-new conversation (exactly when auto-title fires), engineMessages
+// is just [system, user] — a plain slice(-2) grabbed the memory-stuffed system prompt right
+// alongside the real first message.
+
+test('recentTitleTurns: excludes the injected system prompt for a brand-new conversation', () => {
+  const engineMessages = [
+    { role: 'system', content: 'You are TurboLLM...\n\nWhat you know about the user from past conversations:\n- Likes cats\n- Works in finance' },
+    { role: 'user', content: 'How do I center a div in CSS?' },
+  ]
+  const turns = recentTitleTurns(engineMessages)
+  assert.equal(turns.length, 1)
+  assert.equal(turns[0].role, 'user')
+  assert.equal(turns[0].content, 'How do I center a div in CSS?')
+})
+
+test('recentTitleTurns: still takes the last N when there IS real history (no system message present)', () => {
+  const engineMessages = [
+    { role: 'user', content: 'first turn' },
+    { role: 'assistant', content: 'first reply' },
+    { role: 'user', content: 'second turn' },
+  ]
+  const turns = recentTitleTurns(engineMessages)
+  assert.deepEqual(turns.map((t) => t.content), ['first reply', 'second turn'])
+})
+
+test('recentTitleTurns: a system message is excluded even when mixed in with real history', () => {
+  const engineMessages = [
+    { role: 'system', content: 'hidden capability + memory block' },
+    { role: 'user', content: 'first turn' },
+    { role: 'assistant', content: 'first reply' },
+  ]
+  const turns = recentTitleTurns(engineMessages)
+  assert.ok(turns.every((t) => t.role !== 'system'))
+  assert.deepEqual(turns.map((t) => t.content), ['first turn', 'first reply'])
+})
+
+test('recentTitleTurns: empty input yields empty output, no throw', () => {
+  assert.deepEqual(recentTitleTurns([]), [])
 })

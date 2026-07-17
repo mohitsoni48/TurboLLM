@@ -39,6 +39,7 @@ import { ApiError } from '../lib/api'
 import { primaryVendorSummary } from '../lib/vram'
 import type {
   CatalogEngine,
+  CustomEngineSource,
   Engine,
   EngineBackends,
   EngineFit,
@@ -78,6 +79,7 @@ import { EngineStatusHeader } from './engines/EngineStatusHeader'
 import { EngineLogPanel } from './engines/EngineLogPanel'
 import { LlamaCppBackendRows } from './engines/ManagedEngines'
 import {
+  customSourceKey,
   groupEngines,
   memberToActivate,
   repoSlug,
@@ -688,6 +690,7 @@ function EngineGallery({
     install.updateKoboldcpp.isPending ||
     install.updateLlamafile.isPending ||
     engineMut.remove.isPending ||
+    engineMut.disableCustom.isPending ||
     engineMut.purge.isPending
 
   // ── lifecycle (unchanged behavior; mirrors ManagedEngines.DiscoverEngines) ──
@@ -772,6 +775,33 @@ function EngineGallery({
     setDeleteTarget({ name: e.name, registryId })
   }
   const requestDeleteCustom = (eng: Engine) => setDeleteTarget({ name: eng.name, registryId: eng.id })
+  // Custom-engine parity (GitHub: "treated as an outsider... same UI as catalogue engines"):
+  // Disable is just registry.remove keyed by the LIVE engine's own id — no registryEngineId
+  // lookup needed, unlike a catalog engine (which has to be re-matched via binPath/sourceRepo
+  // conventions since it has no single fixed id of its own).
+  const doDisableCustom = (eng: Engine) => {
+    engineMut.disableCustom.mutate(eng.id, {
+      onSuccess: () => toast.success(`${eng.name} disabled`),
+      onError: (err) => toast.error(err instanceof ApiError ? err.message : `Could not disable ${eng.name}.`),
+    })
+  }
+  // Enable re-registers using the SAME identity that was remembered (recordCustomSource) —
+  // instant, no rebuild, exactly like a catalog engine's sourceBuilt Enable.
+  const doEnableCustom = (source: CustomEngineSource) => {
+    engineMut.add.mutate(
+      { name: source.name, binPath: source.binPath, sourceRepo: source.sourceRepo, sourceBranch: source.sourceBranch, sourceCommit: source.sourceCommit },
+      {
+        onSuccess: () => toast.success(`${source.name} enabled`),
+        onError: (err) => toast.error(err instanceof ApiError ? err.message : `Could not enable ${source.name}.`),
+      },
+    )
+  }
+  const doForgetCustom = (source: CustomEngineSource) => {
+    engineMut.forgetCustomSource.mutate(customSourceKey(source), {
+      onSuccess: () => toast.success(`${source.name} removed`),
+      onError: (err) => toast.error(err instanceof ApiError ? err.message : `Could not remove ${source.name}.`),
+    })
+  }
   const doDelete = () => {
     if (!deleteTarget) return
     engineMut.purge.mutate(deleteTarget.registryId, {
@@ -809,6 +839,18 @@ function EngineGallery({
   const customEngines = (registry?.engines ?? []).filter(
     (e) => !matchedRegistryIds.has(e.id) && !isOfficialLlama(e.binPath),
   )
+  // GitHub: "a custom engine added from git url is treated as an outsider — it should get the
+  // same UI as catalogue engines with disable/enable/delete/rebuild." Unlike a catalog engine
+  // (re-enabled via its own fixed, hardcoded homepage URL), a disabled custom engine has no
+  // other identity anywhere in the system — customDisabled (backend customEngineSources) is
+  // that memory, so Enable can re-register the still-built binary instead of the entry just
+  // vanishing. Already excludes anything matching a currently-live engine (backend-computed).
+  const customDisabled = registry?.customDisabled ?? []
+  // Reuses engineMut.add (the same mutation catalog Enable/Install already use) — a disabled
+  // custom engine's Enable is exactly that: re-register the still-built binary, no rebuild.
+  // engineMut.add is shared with AddEngineDialog/catalog Enable too, so this key just won't
+  // match any customDisabled entry while one of THOSE is in flight — harmless, no false spinner.
+  const enablingKey = engineMut.add.isPending ? customSourceKey(engineMut.add.variables ?? { binPath: '' }) : null
 
   return (
     <section className="flex flex-col gap-3">
@@ -839,30 +881,40 @@ function EngineGallery({
         })}
       </div>
 
-      {customEngines.length > 0 && (
+      {(customEngines.length > 0 || customDisabled.length > 0) && (
         <div className="flex flex-col gap-2">
           {customEngines.map((eng) => (
-            <div
+            <CustomEngineCard
               key={eng.id}
-              className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border bg-panel px-4 py-3"
-            >
-              <div className="flex min-w-0 items-center gap-2">
-                <Wrench size={15} className="shrink-0 text-accent" />
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2">
-                    <span className="truncate text-sm font-medium text-ink">{eng.name}</span>
-                    <Badge>Custom</Badge>
-                  </div>
-                  <div className="truncate text-[12px] text-muted" title={eng.binPath}>{eng.binPath}</div>
-                </div>
-              </div>
-              <div className="flex shrink-0 items-center gap-2">
-                {eng.version && <span className="text-[12px] text-faint">{eng.version}</span>}
-                <Button variant="outline" size="sm" onClick={() => requestDeleteCustom(eng)}>
-                  Delete
-                </Button>
-              </div>
-            </div>
+              name={eng.name}
+              binPath={eng.binPath}
+              version={eng.version}
+              sourceRepo={eng.sourceRepo}
+              sourceBranch={eng.sourceBranch}
+              disabled={false}
+              binPathExists
+              anyPending={anyPending}
+              enabling={false}
+              onDisable={() => doDisableCustom(eng)}
+              onEnable={() => {}}
+              onDelete={() => requestDeleteCustom(eng)}
+            />
+          ))}
+          {customDisabled.map((source) => (
+            <CustomEngineCard
+              key={customSourceKey(source)}
+              name={source.name}
+              binPath={source.binPath}
+              sourceRepo={source.sourceRepo}
+              sourceBranch={source.sourceBranch}
+              disabled
+              binPathExists={source.binPathExists}
+              anyPending={anyPending}
+              enabling={enablingKey === customSourceKey(source)}
+              onDisable={() => {}}
+              onEnable={() => doEnableCustom(source)}
+              onDelete={() => doForgetCustom(source)}
+            />
           ))}
         </div>
       )}
@@ -1158,6 +1210,95 @@ function EngineCard({
         <div className="mt-2">
           <CatalogUpdateStatusLine st={updateStatus} />
         </div>
+      )}
+    </div>
+  )
+}
+
+/** One custom (non-catalog) engine — either currently live (`disabled: false`) or remembered
+ *  but not registered (`disabled: true`, from backend customEngineSources). Gives a custom
+ *  engine the SAME lifecycle actions a catalog card gets (Rebuild/Disable/Enable/Delete),
+ *  not just a name + a single Delete button (GitHub: "treated as an outsider"). */
+function CustomEngineCard({
+  name,
+  binPath,
+  version,
+  sourceRepo,
+  sourceBranch,
+  disabled,
+  binPathExists,
+  anyPending,
+  enabling,
+  onDisable,
+  onEnable,
+  onDelete,
+}: {
+  name: string
+  binPath: string
+  version?: string
+  sourceRepo?: string
+  sourceBranch?: string
+  disabled: boolean
+  binPathExists: boolean
+  anyPending: boolean
+  enabling: boolean
+  onDisable: () => void
+  onEnable: () => void
+  onDelete: () => void
+}) {
+  const [rebuildOpen, setRebuildOpen] = useState(false)
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border bg-panel px-4 py-3">
+      <div className="flex min-w-0 items-center gap-2">
+        <Wrench size={15} className="shrink-0 text-accent" />
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <span className="truncate text-sm font-medium text-ink">{name}</span>
+            <Badge>Custom</Badge>
+            {disabled && <Badge variant="mono">Disabled</Badge>}
+          </div>
+          <div className="truncate text-[12px] text-muted" title={binPath}>{binPath}</div>
+        </div>
+      </div>
+      <div className="flex shrink-0 items-center gap-2">
+        {version && <span className="text-[12px] text-faint">{version}</span>}
+        {disabled && !binPathExists && (
+          <span
+            className="text-[11px] text-faint"
+            title="The build folder for this engine no longer exists on disk — rebuild from the repo to bring it back."
+          >
+            Build not found on disk
+          </span>
+        )}
+        {sourceRepo && (
+          <Button size="sm" variant="outline" disabled={anyPending} onClick={() => setRebuildOpen(true)}>
+            <RefreshCw size={13} /> Rebuild
+          </Button>
+        )}
+        {disabled ? (
+          binPathExists && (
+            <Button size="sm" disabled={anyPending || enabling} onClick={onEnable}>
+              {enabling ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />} Enable
+            </Button>
+          )
+        ) : (
+          <Button variant="outline" size="sm" disabled={anyPending} onClick={onDisable}>
+            Disable
+          </Button>
+        )}
+        <Button variant="outline" size="sm" onClick={onDelete}>
+          {disabled ? 'Remove' : 'Delete'}
+        </Button>
+      </div>
+      {sourceRepo && (
+        <BuildGuideDialog
+          open={rebuildOpen}
+          onOpenChange={setRebuildOpen}
+          repoUrl={sourceRepo}
+          branch={sourceBranch || undefined}
+          engineName={name}
+          mode="rebuild"
+        />
       )}
     </div>
   )
