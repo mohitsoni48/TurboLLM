@@ -43,6 +43,15 @@ export function useConversations(q?: string) {
     queryFn: () => listConversations(q),
     staleTime: 0,
     retry: false,
+    // Same live-sync gap as useConversation below, for the sidebar's list instead of one open
+    // conversation: autoTitle (chat-routes.ts) runs ~1s+ AFTER the SSE stream's 'done' event has
+    // already closed, entirely out-of-band from the response the frontend is watching — nothing
+    // ever told this query the title changed, so the sidebar (and the still-"New chat" active
+    // conversation's header) was stuck showing the old title until a manual reload remounted it
+    // (GitHub: "the auto generated chat title doesn't update until i refresh"). Same 4s cadence
+    // as useConversation's own multi-device poll.
+    refetchInterval: 4000,
+    refetchIntervalInBackground: false,
   })
 }
 
