@@ -680,8 +680,9 @@ export class BenchRunner {
     const active = this.registry.active()
     if (!active) return fail('crash')
 
-    // Per-test cap (3 min): the whole trial — load + warmup + measured request — must finish
-    // within this, else it's recorded 'timeout' and the sweep continues. Also bounded by the
+    // Per-test cap (PER_TEST_TIMEOUT_MS, 10 min — raised from 3 for deep-ctx trials, ADR-217
+    // round 2): the whole trial — load + warmup + measured request — must finish within this,
+    // else it's recorded 'timeout' and the sweep continues. Also bounded by the
     // global deadline so a near-budget start can't overrun.
     const testDeadline = Math.min(Date.now() + PER_TEST_TIMEOUT_MS, this.deadline)
     const remaining = () => Math.max(1_000, testDeadline - Date.now())
@@ -1395,10 +1396,15 @@ const TURBO_KV_TYPES = new Set(['turbo2', 'turbo3', 'turbo4'])
  *  engine wasn't probed. `20` is a blunt heuristic, not a guarantee. */
 export function kvSpeedAdvisory(tps: number | null, currentKv: string, supportedKvTypes: string[]): string | null {
   if ((tps ?? 0) >= 20 || supportedKvTypes.length === 0) return null
-  const isTurbo = TURBO_KV_TYPES.has(currentKv)
-  const candidates = supportedKvTypes.filter(
-    (t) => t !== currentKv && kvBytes(t) <= kvBytes(currentKv) && (!isTurbo || !TURBO_KV_TYPES.has(t)),
-  )
+  // Turbo types are ALWAYS excluded from the recommendation candidates, regardless of whether
+  // `currentKv` itself is turbo — they're exactly the types whose real cost KV_BYTES understates
+  // (ADR-219/220), so they can never be the "faster, standard" alternative this advisory offers.
+  // A prior version of this filter incorrectly gated the exclusion on `TURBO_KV_TYPES.has(currentKv)`,
+  // which — because `(!isTurbo || ...)` short-circuits true whenever isTurbo is false — meant the
+  // exclusion silently did nothing for the common case (a non-turbo current type), letting the
+  // smallest-nominal-size turbo type (turbo2, 0.25 bytes) win every time. Caught in independent
+  // review before merge (ADR-222) — see the regression test covering exactly this combination.
+  const candidates = supportedKvTypes.filter((t) => t !== currentKv && kvBytes(t) <= kvBytes(currentKv) && !TURBO_KV_TYPES.has(t))
   if (candidates.length === 0) return null
   const smallest = kvSmallest(candidates)
   return `This result used the "${currentKv}" KV cache type. A different type (e.g. "${smallest}") may run faster, at some output-quality cost — try it manually if you want the extra speed.`

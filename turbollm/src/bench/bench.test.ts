@@ -82,6 +82,23 @@ test('kvSpeedAdvisory: slow result but already at the smallest available type �
   assert.equal(kvSpeedAdvisory(5, 'q4_0', ['f16', 'q8_0', 'q4_0']), null)
 })
 
+test('kvSpeedAdvisory: NON-turbo current type on a TurboQuant fork must never recommend a turbo type (regression — caught in independent review before merge)', () => {
+  // f16/q8_0 are the common case (most users aren't on turbo* to begin with). Turbo types must
+  // be excluded from the candidate pool regardless of what the CURRENT type is — a prior version
+  // gated the exclusion on the current type already being turbo, so it silently did nothing here
+  // and recommended turbo2 (the smallest nominal size) instead of a real standard type.
+  const supported = ['f16', 'q8_0', 'q4_0', 'turbo2', 'turbo3', 'turbo4']
+  const msgF16 = kvSpeedAdvisory(10, 'f16', supported)
+  assert.ok(msgF16)
+  assert.match(msgF16, /q4_0|q8_0/)
+  assert.doesNotMatch(msgF16, /turbo/)
+
+  const msgQ80 = kvSpeedAdvisory(10, 'q8_0', supported)
+  assert.ok(msgQ80)
+  assert.match(msgQ80, /q4_0/)
+  assert.doesNotMatch(msgQ80, /turbo/)
+})
+
 test('kvSpeedAdvisory: unprobed engine (empty kvTypes) → no advisory, nothing to suggest', () => {
   assert.equal(kvSpeedAdvisory(5, 'f16', []), null)
 })
