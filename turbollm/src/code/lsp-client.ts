@@ -157,7 +157,11 @@ export class LspClient {
       const result = await Promise.race([initialize.then(() => 'ok' as const), spawnFailure.then((e) => `error:${e}` as const), timeout])
       if (result === 'timeout') throw new Error(`${this.spec.language} language server did not initialize within ${INITIALIZE_TIMEOUT_MS}ms`)
       if (result.startsWith('error:')) throw new Error(result.slice('error:'.length))
-      conn.sendNotification('initialized', {})
+      // sendNotification returns a Promise that can reject ASYNCHRONOUSLY (e.g. ERR_STREAM_DESTROYED
+      // if the server process's stdin already closed) — fire-and-forget without a .catch() turns
+      // that into an unhandled rejection that crashes the whole daemon process (see dispose()'s own
+      // comment below for the exact stack this produces — GitHub #60's attached log).
+      conn.sendNotification('initialized', {}).catch(() => {})
       this.ready = true
       return { ok: true }
     } catch (e) {
@@ -186,9 +190,9 @@ export class LspClient {
     })
 
     if (version === 1) {
-      this.conn.sendNotification('textDocument/didOpen', { textDocument: { uri, languageId: this.spec.languageId, version, text } })
+      this.conn.sendNotification('textDocument/didOpen', { textDocument: { uri, languageId: this.spec.languageId, version, text } }).catch(() => {})
     } else {
-      this.conn.sendNotification('textDocument/didChange', { textDocument: { uri, version }, contentChanges: [{ text }] })
+      this.conn.sendNotification('textDocument/didChange', { textDocument: { uri, version }, contentChanges: [{ text }] }).catch(() => {})
     }
 
     await Promise.race([waitForPush, new Promise<void>((resolve) => setTimeout(resolve, DIAGNOSTICS_WAIT_MS))])
@@ -197,7 +201,14 @@ export class LspClient {
 
   dispose(): void {
     this.ready = false
-    try { this.conn?.sendNotification('exit') } catch { /* best-effort */ }
+    // sendNotification returns a Promise, and it can reject ASYNCHRONOUSLY — after this
+    // synchronous try/catch has already exited — when the server process's stdin is already
+    // closed (ERR_STREAM_DESTROYED: "Cannot call write after a stream was destroyed"). Without
+    // the .catch() below, that becomes an unhandled rejection that crashes the whole daemon
+    // process (GitHub #60's attached log: this exact stack, from vscode-jsonrpc's
+    // StreamMessageWriter → Writable.write). 'exit' is a courtesy notification either way —
+    // dispose() proceeds to kill the process regardless of whether it's delivered.
+    try { this.conn?.sendNotification('exit').catch(() => {}) } catch { /* best-effort */ }
     this.conn?.dispose()
     this.conn = null
     if (this.proc && !this.proc.killed) this.proc.kill()
