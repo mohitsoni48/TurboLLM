@@ -166,13 +166,13 @@ export function ModelDetailDialog({
   // stop it first, then start the sweep once the engine has settled.
   const startBenchRun = () => {
     if (!detail) return
-    // Persist the current draft FIRST, before anything else (ADR-220). The draft only ever
-    // lives in this component's local state — sending it as `base` tells auto-tune to start
-    // its search from these settings, but doesn't save them. If the user cancels the run or
-    // doesn't click Save on the results dialog, their own manual edits were gone with no way
-    // back (a real founder-reported data-loss report). Save it exactly like the "Save without
-    // reloading" button would, so it's recoverable regardless of what auto-tune does next.
-    if (draft) actions.save.mutate({ key: detail.key, profile: draft, engineId: activeEngine?.id ?? '*' })
+    // Use the current draft as the search's starting basis (ctx, sampling, etc.) via `base`
+    // below — but do NOT persist it (ADR-221). An earlier attempt saved the draft to the
+    // backend right here (ADR-220), which created the opposite problem: cancelling a run the
+    // founder didn't like left that pre-auto-tune draft permanently saved even though they'd
+    // never asked to commit it. The real cause of the original "my config was gone" report was
+    // the stale-refetch effect below firing on every `benchDone` (cancel included) BEFORE any
+    // save happened — fixed there instead; no defensive save needed here.
     if (detail.loaded) {
       // Stop the engine; the effect above starts the sweep once it reports stopped.
       setPendingBenchKey(detail.key)
@@ -182,21 +182,18 @@ export function ModelDetailDialog({
     }
   }
 
-  // When a sweep finishes it saves the tuned profile server-side — refetch the detail
-  // so the form reflects the new settings immediately (no close/reopen needed).
-  useEffect(() => {
-    if (benchDone && detail?.key) {
-      void qc.invalidateQueries({ queryKey: ['model', detail.key] })
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [benchDone, detail?.key])
-
   // Auto-tune results dialog (shown on a finished run). Both buttons close the whole model dialog;
   // Save persists the tuned profile (POST /bench/save), Cancel discards it.
   const onTuneSave = (downloadLog: boolean) => {
     bench.save.mutate(undefined, {
       onSuccess: () => {
         toast.success('Tuned settings saved')
+        // Refetch ONLY here — right after an actual save — so the form reflects the new
+        // settings immediately (no close/reopen needed). ADR-221: this used to fire on every
+        // `benchDone` (completion OR cancel), refetching stale server data over the user's
+        // still-unsaved local draft before they'd even decided Save vs. Cancel — the real
+        // cause of the original "my config was gone" report.
+        if (detail?.key) void qc.invalidateQueries({ queryKey: ['model', detail.key] })
         if (downloadLog) {
           const a = document.createElement('a')
           a.href = '/api/v1/bench/log'
