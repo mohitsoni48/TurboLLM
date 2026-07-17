@@ -653,17 +653,20 @@ function chunkPersistedTimeline(timeline: MessageTimelineBlock[], toolCalls: Too
  *  context, which can run many seconds with zero timeline/reasoning content.
  *  Without this, CodeStreamingEntry renders nothing at all and the turn looks
  *  stuck (chat/MessageBubble.tsx's StreamingBubble has the equivalent
- *  "always-on activity line" for the same reason). */
-function CodeThinking() {
+ *  "always-on activity line" for the same reason). `label` distinguishes pi's
+ *  auto-compaction (which silently summarizes history mid-turn with no other
+ *  signal) from ordinary "no content yet" — same spinner, different text, so a
+ *  long compaction pause doesn't read as a stuck/dead run. */
+function CodeThinking({ label = 'thinking…' }: { label?: string }) {
   return (
     <div className="flex items-center gap-1.5 font-mono text-[11px] text-muted">
       <Loader2 size={12} className="shrink-0 animate-spin" style={{ color: 'var(--accent)' }} />
-      <span>thinking…</span>
+      <span>{label}</span>
     </div>
   )
 }
 
-function CodeStreamingEntry({ timeline, reasoning }: { timeline: LiveBlock[]; reasoning: string }) {
+function CodeStreamingEntry({ timeline, reasoning, compacting }: { timeline: LiveBlock[]; reasoning: string; compacting?: boolean }) {
   const chunks = chunkTimeline(timeline)
   const hasContent = !!reasoning?.trim() || chunks.length > 0
   return (
@@ -686,11 +689,17 @@ function CodeStreamingEntry({ timeline, reasoning }: { timeline: LiveBlock[]; re
               </RailEntry>
             ),
       )}
-      {!hasContent && (
-        <RailEntry icon={Terminal} tone="accent">
-          <CodeThinking />
-        </RailEntry>
-      )}
+      {compacting
+        ? (
+            <RailEntry icon={Terminal} tone="accent">
+              <CodeThinking label="Compacting conversation…" />
+            </RailEntry>
+          )
+        : !hasContent && (
+            <RailEntry icon={Terminal} tone="accent">
+              <CodeThinking />
+            </RailEntry>
+          )}
     </div>
   )
 }
@@ -700,7 +709,7 @@ export function CodeTranscript({
 }: {
   messages: Message[]
   liveAssistantId?: string
-  live?: { timeline: LiveBlock[]; reasoning: string } | null
+  live?: { timeline: LiveBlock[]; reasoning: string; compacting?: boolean } | null
   /** Revert affordance on each user message — omitted entirely (via `undefined`) while a run
    *  is live, and never shown on the FIRST message (nothing before it to revert to; `messages`
    *  here is already cut at any existing /clear point, so index 0 is always correct). */
@@ -721,7 +730,7 @@ export function CodeTranscript({
           />
         ))}
       {live && (
-        <CodeStreamingEntry timeline={live.timeline} reasoning={live.reasoning} />
+        <CodeStreamingEntry timeline={live.timeline} reasoning={live.reasoning} compacting={live.compacting} />
       )}
     </div>
   )

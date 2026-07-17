@@ -1,5 +1,5 @@
 import { useEffect, useState, type RefObject } from 'react'
-import { Check, ChevronDown, CircleDot, FileText, FolderGit2, FolderOpen, GitBranch, ListTodo, Plus, SendHorizontal, Square, Wand2, X } from 'lucide-react'
+import { Check, ChevronDown, CircleDot, FileText, FolderGit2, FolderOpen, GitBranch, ListTodo, Loader2, Plus, SendHorizontal, Square, Wand2, X } from 'lucide-react'
 import { Button } from '../../components/ui/button'
 import {
   DropdownMenu,
@@ -478,7 +478,17 @@ export function CodeComposer({
         </div>
       </div>
       </div>
-      <p className="mt-2 text-center text-[11px] text-faint">{hintText}</p>
+      {/* Persistent, always-visible busy indicator (founder-reported gap, 2026-07-13): the only
+          "is the agent busy" signal near the composer used to be this hint's plain STRING swap
+          (idle text ↔ running text) — no icon, no animation. The inline CodeThinking/
+          CodeStreamingEntry activity live INSIDE the scrolling transcript body and can be
+          scrolled out of view during a long run; this lives in the composer itself, so it's
+          visible regardless of scroll position. Reuses CodeThinking's own spinner styling
+          (Loader2, accent color) rather than inventing a new motion language. */}
+      <p className="mt-2 flex items-center justify-center gap-1.5 text-center text-[11px] text-faint">
+        {live && <Loader2 size={11} className="shrink-0 animate-spin" style={{ color: 'var(--accent)' }} />}
+        <span>{hintText}</span>
+      </p>
     </div>
   )
 }

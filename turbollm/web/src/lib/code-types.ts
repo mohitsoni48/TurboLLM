@@ -43,6 +43,14 @@ export interface CreateCodeSessionParams {
   contextFiles?: string[]
 }
 
+/** One entry in the server-side message queue (turns waiting behind the active one).
+ *  `userMsgId` identifies the entry (not just its text) so a per-chip action — e.g. "Send now"
+ *  — can target one specific queued turn even if two queued tasks have identical text. */
+export interface QueuedTurn {
+  userMsgId: string
+  task: string
+}
+
 // SSE event payloads for GET /api/v1/code/sessions/:id/stream (code-routes.ts). Reuses
 // chat's tool_call/reasoning/delta wire shape verbatim (same sink), but 'meta'/'done' carry
 // different fields than chat's — a real, separate type, not a reuse of ChatSseEvent.
@@ -53,7 +61,8 @@ export type CodeSseEvent =
   | { event: 'reasoning'; data: { delta: string } }
   | { event: 'delta';     data: { delta: string } }
   | { event: 'tool_call'; data: { id: string; name: string; args: Record<string, unknown>; status: 'pending' | 'done' | 'error' | 'awaiting_approval'; result?: string; diff?: string; patch?: string; firstChangedLine?: number } }
-  | { event: 'queue';     data: { queued: string[] } }
+  | { event: 'queue';     data: { queued: QueuedTurn[] } }
+  | { event: 'compaction'; data: { phase: 'start' | 'end'; reason: 'manual' | 'threshold' | 'overflow'; aborted?: boolean; tokensBefore?: number } }
   | { event: 'done';      data: { contextUsed: number; contextMax: number; aborted: boolean } }
   | { event: 'error';     data: { code: string; message: string } }
 

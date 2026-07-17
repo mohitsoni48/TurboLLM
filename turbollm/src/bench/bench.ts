@@ -107,6 +107,10 @@ export interface BenchState {
     /** The subset of `sampling` that came from the HF card (ADR-099), when any was found —
      *  used to mark those rows "from model card". Absent when no card / nothing parsed. */
     recommendedSampling?: CardSampling
+    /** ADR-219: a note shown (not acted on) when the winner is under 20 tok/s and the engine
+     *  supports a smaller KV-cache type than the one tuned — surfaces that a faster, lower-
+     *  quality option exists without auto-tune silently picking it. Absent otherwise. */
+    kvAdvisory?: string
   }
 }
 
@@ -117,20 +121,25 @@ export interface BenchState {
 const READY_TIMEOUT_MS = 150_000
 // Per-candidate cap: load + warmup + the measured request must all finish within this window,
 // else the candidate is recorded 'timeout' and the sweep moves on — one hung config can't stall
-// the run.
-const PER_TEST_TIMEOUT_MS = 3 * 60_000
+// the run. Raised from 3 to 10 minutes (ADR-217 round 2): the bench prompt now targets depth near
+// the CONFIGURED ctx (see benchPromptTokens) instead of an 8k cap, so a deep-ctx candidate does
+// TWO full prefills at that depth (the warmup prefill-gate, then the measured request re-processes
+// from scratch on purpose — see the `cache_prompt: false` comment in `chat`) — 10 min covers that
+// at realistic prefill speeds with margin; the existing prefill-overrun projection in
+// `prefillProbe` still fails a genuinely-too-slow config fast rather than waiting out the cap.
+const PER_TEST_TIMEOUT_MS = 10 * 60_000
 // Grace before judging prefill speed — give the first tokens time to flow before projecting.
 const PREFILL_GRACE_MS = 8_000
 // Overall budget — sized to fit a full binary search of per-test-capped trials (~log2(layers)).
-const TOTAL_BUDGET_MS = 20 * 60_000
+// Raised from 20 to 45 minutes alongside PER_TEST_TIMEOUT_MS (ADR-217 round 2) — deep-ctx bench
+// trials are slower by design now, and a run can measure 2+ KV types plus a headroom-backoff
+// retry, each up to PER_TEST_TIMEOUT_MS.
+const TOTAL_BUDGET_MS = 45 * 60_000
 // Memory-pressure / GPU-exhaustion signatures. Beyond a clean "out of memory", a config that
 // overflows VRAM often surfaces a secondary CUDA fault (failed allocation, or "device not ready"
 // during graph capture once the allocation failed). Treat all of these as OOM so the search
 // offloads more and the result reads as a fit problem rather than a mystery crash.
 const OOM_RE = /out of memory|cudaMalloc|failed to allocate|unable to allocate|device not ready|CUDA error/i
-
-// English text is roughly 4 characters per token — used to size the bench prompt.
-const CHARS_PER_TOKEN = 4
 
 // Auto-tune may also sweep the KV-cache quant — but only ever SELECTS a quality-preserving type:
 // full-precision f16, near-lossless q8_0, and (on TurboQuant forks) turbo4 (≈ q8_0 quality). This
@@ -147,10 +156,6 @@ const QUALITY_KV = ['f16', 'q8_0', 'turbo4']
 // Output-t/s tie band for the speed objective: when two configs are within this relative margin
 // on generation speed, the one with faster prefill wins (best prefill AND t/s, not just t/s).
 const OUTPUT_TIE = 0.05
-// If swapping the KV-cache quant from largest (f16) to smallest changes VRAM by less than this, the
-// cache is small enough that the quant barely affects how much of the model fits on the GPU — so
-// the highest-precision, fastest-kernel type (f16) is the right pick and no quant sweep is needed.
-const KV_SPREAD_MIN = 1024
 // Bytes per cached element by KV-cache type — used only to order candidates by size (largest =
 // most VRAM, smallest = least) so calibration probes the two extremes. Mirrors llama.cpp's types.
 const KV_BYTES: Record<string, number> = {
@@ -213,6 +218,17 @@ export class BenchRunner {
     if (!this.state.running) return
     this.cancelled = true
     this.abort?.abort()
+  }
+
+  /** Stop the engine — force-killed immediately when the run is cancelled (the user is actively
+   *  waiting for it to stop, ADR-220), gracefully otherwise (lets llama-server release resources
+   *  cleanly between candidates during a normal run). Every stop in this file goes through this
+   *  one chokepoint instead of calling `manager.stopAndWait()` directly, so a cancel is fast
+   *  regardless of which code path notices it first. Previously every stop used the graceful
+   *  TERM→8s-then-kill path unconditionally, so cancelling could take up to 8s per in-flight
+   *  stop — a real, reported "Cancel doesn't cancel immediately" bug. */
+  private async stopEngine(): Promise<void> {
+    await this.manager.stopAndWait({ force: this.cancelled }).catch(() => {})
   }
 
   /** Persist the finished run's winning profile (the user clicked Save). Returns false if there is
@@ -290,7 +306,7 @@ export class BenchRunner {
       // The run is fully guarded internally; this is a last-resort net so a thrown
       // error never leaves `running` stuck true.
       this.state = { running: false, modelKey, done: true, error: e instanceof Error ? e.message : String(e), candidates: this.state.candidates }
-      void this.manager.stopAndWait().catch(() => {})
+      void this.stopEngine()
     })
   }
 
@@ -335,16 +351,13 @@ export class BenchRunner {
     const results: BenchCandidate[] = []
     let best: { cand: BenchCandidate; profile: LoadProfile } | null = null
 
-    // --- Choose which KV-cache type(s) to tune, by reasoning about VRAM (not by sweeping all) ---
-    // The quant only matters in proportion to how big the KV cache actually is. Measure that cheaply:
-    // the VRAM SPREAD between the largest and smallest candidate at one shared offload is exactly
-    // their KV-size difference (weights/overhead cancel) — true for any architecture, hybrid or not.
-    //   • tiny KV (spread ≤ KV_SPREAD_MIN) → the quant barely changes the fit, so the highest-
-    //     precision/fastest-kernel type (f16) wins outright → tune just that.
-    //   • big KV → a smaller quant frees real VRAM for more of the model on the GPU, but its kernel
-    //     can be slower (turbo4), so tune BOTH the smallest (max-fit) and q8_0 (stock fallback) and
-    //     let the measured prefill + t/s decide.
-    // --- Choose the multi-GPU SPLIT strategy too, not just offload+KV (ADR-054) ---
+    // --- Choose the multi-GPU SPLIT strategy (ADR-054) — the KV-cache TYPE is no longer swept
+    // here (ADR-219): auto-tune tunes offload (ngl/nCpuMoe) on whatever KV type the user already
+    // has selected, instead of silently choosing between f16/q8_0/turbo4 itself. Founder call
+    // after live-testing showed a lower-precision type (q4_0) measurably outperforming turbo4 on
+    // deep-context real chat — that's a genuine quality/speed tradeoff the user should make
+    // explicitly, not one auto-tune should pick for them. See the KV-cache speed advisory below
+    // instead, which surfaces the option without silently taking it.
     // llama.cpp's default is an even LAYER-split across every visible GPU. But a model that fits on
     // ONE card is almost always faster there: a layer-split runs the GPUs as a sequential pipeline
     // (one busy at a time) and copies activations across PCIe every token, so on a fits-on-one model
@@ -363,34 +376,16 @@ export class BenchRunner {
         this.emit(`split strategy → ${label}`)
       }
 
-      // Decide which KV quant(s) to tune UNDER THIS split: the VRAM budget differs (one card vs the
-      // summed pool), so single-GPU may need turbo4 to fit where a layer-split is fine at f16.
-      // Default to the user's own KV type (covers CPU-only — no VRAM pressure — and unprobed/single-
-      // candidate engines). Only with a GPU and a real choice do we size the cache and decide.
-      const kvCandidates = pickKvQuants(splitBase.kvTypeK, caps.kvTypes)
-      let kvToTune = kvCandidates.slice(0, 1)
-      if (sys.gpus.length > 0 && kvCandidates.length > 1) {
-        const spread = await this.calibrateKvSpread(entry, sys, splitBase, caps, kvCandidates, results)
-        kvToTune = decideKvToBench(spread, kvCandidates)
-        const swing = spread < 0 ? 'unknown' : spread >= Number.MAX_SAFE_INTEGER ? 'huge' : `${Math.round(spread)} MB`
-        this.state = { ...this.state, step: `KV cache swing ${swing} → tuning ${kvToTune.join(' + ')}`, candidates: results }
-        this.emit(`KV spread ${swing} → tuning ${kvToTune.join(' + ')}`)
-      }
-
-      for (let i = 0; i < kvToTune.length && !this.cancelled && Date.now() <= this.deadline; i++) {
-        const kv = kvToTune[i]
-        const kvBase: LoadProfile = { ...splitBase, kvTypeK: kv, kvTypeV: kv }
-        const found = entry.moe
-          ? await this.moeSearch(entry, sys, kvBase, caps, results, headroomMb)
-          : await this.denseSearch(entry, sys, kvBase, caps, results, headroomMb)
-        if (found && (!best || betterBySpeed(found.cand, best.cand))) best = found
-        if (best) this.state = { ...this.state, bestTps: best.cand.tps ?? undefined }
-      }
+      const found = entry.moe
+        ? await this.moeSearch(entry, sys, splitBase, caps, results, headroomMb)
+        : await this.denseSearch(entry, sys, splitBase, caps, results, headroomMb)
+      if (found && (!best || betterBySpeed(found.cand, best.cand))) best = found
+      if (best) this.state = { ...this.state, bestTps: best.cand.tps ?? undefined }
     }
 
     // Engine is always left stopped at the end of a run (AC#3 for cancel; also tidy
     // for a normal finish — the user explicitly loads afterward).
-    await this.manager.stopAndWait().catch(() => {})
+    await this.stopEngine()
 
     if (best) {
       // Card-derived recommended sampling (ADR-099): read the model author's recommended
@@ -403,7 +398,7 @@ export class BenchRunner {
       let recommended: CardSampling | undefined
       if (!this.cancelled && Date.now() <= this.deadline) {
         recommended = await this.extractCardSampling(entry, best.profile, caps, sys).catch(() => undefined)
-        await this.manager.stopAndWait().catch(() => {}) // in case the LLM fallback loaded a model
+        await this.stopEngine() // in case the LLM fallback loaded a model
       }
       // A cancel DURING extraction (the LLM fallback can run for minutes) must not resurrect the
       // results dialog or re-hold a profile the user just discarded: cancel() cleared winning +
@@ -416,6 +411,10 @@ export class BenchRunner {
         recommended && hasAnySampling(recommended)
           ? { ...best.profile, sampling: { ...best.profile.sampling, ...recommended } }
           : best.profile
+      // ADR-219: note (don't auto-switch) when a smaller, faster KV-cache type is available —
+      // auto-tune no longer picks the KV type itself, so a slow result deserves a pointer to the
+      // tradeoff rather than silence.
+      const kvAdvisory = kvSpeedAdvisory(best.cand.tps, profile.kvTypeK, caps.kvTypes)
       // Hold the winner instead of auto-saving — the UI shows a Save/Cancel results dialog and
       // persists via POST /bench/save only when the user clicks Save.
       this.winning = { modelKey, profile, cand: best.cand, entry, sys, engineVersion: active?.version ?? '', engineId: active?.id ?? '' }
@@ -440,6 +439,7 @@ export class BenchRunner {
             minP: profile.sampling.minP,
           },
           ...(recommended && hasAnySampling(recommended) ? { recommendedSampling: recommended } : {}),
+          ...(kvAdvisory ? { kvAdvisory } : {}),
         },
         candidates: results,
       }
@@ -477,12 +477,14 @@ export class BenchRunner {
     if (base.nglFit) return this.benchAt(entry, sys, base, caps, results, 'auto-fit')
 
     let bestNgl: number | null = 0 // CPU-only box → everything on CPU, no probing needed.
+    // The VRAM this split is allowed to use: all cards for a layer/row split, ONE card for a
+    // single-GPU 'none' split (ADR-054). The headroom gate must judge against THIS, not the summed
+    // pool — else a 14 GB single-GPU load looks safe against a 30 GB total when it's at one card's
+    // edge. Computed unconditionally (0 on a CPU-only box) so the Phase-2 re-check below can reuse
+    // it too (ADR-217) — `overHeadroom` treats a ≤0 budget as "never over".
+    const budgetMb = gpuBudgetMb(sys, base)
 
     if (sys.gpus.length > 0) {
-      // The VRAM this split is allowed to use: all cards for a layer/row split, ONE card for a
-      // single-GPU 'none' split (ADR-054). The headroom gate must judge against THIS, not the summed
-      // pool — else a 14 GB single-GPU load looks safe against a 30 GB total when it's at one card's edge.
-      const budgetMb = gpuBudgetMb(sys, base)
       // Binary search ngl ∈ [0, blockCount] for the HIGHEST that loads with enough headroom VRAM.
       const hi0 = entry.blockCount > 0 ? entry.blockCount : 99
       let lo = 0, hi = hi0
@@ -492,7 +494,7 @@ export class BenchRunner {
         this.state = { ...this.state, step: `KV ${base.kvTypeK}: probing ngl=${mid} (range ${lo}–${hi})…`, candidates: results }
         const probe = await this.probeVram(entry, sys, { ...base, ngl: mid }, caps)
         this.pushProbe(results, base, 'ngl', mid, probe)
-        await this.settleGpu()
+        await this.settleGpu(sys)
         if (probe.outcome === 'ok' && !overHeadroom(probe.vramAbsMb, budgetMb, headroomMb)) {
           bestNgl = mid // fits with headroom → record, try MORE GPU layers
           lo = mid + 1
@@ -503,7 +505,16 @@ export class BenchRunner {
     }
 
     if (bestNgl === null) return null
-    return this.benchAt(entry, sys, { ...base, ngl: bestNgl }, caps, results, `ngl=${bestNgl}`)
+    let found = await this.benchAt(entry, sys, { ...base, ngl: bestNgl }, caps, results, `ngl=${bestNgl}`)
+    // Phase 2 (the actual timed run) can allocate more VRAM than Phase 1's load-only probe did
+    // (lazy cuBLAS/graph-capture scratch buffers) — re-validate against the REAL post-generation
+    // VRAM and back off one layer if it silently blew through the user's headroom (ADR-217).
+    if (found && overHeadroom(found.cand.vramAbsMb, budgetMb, headroomMb) && bestNgl > 0) {
+      this.emit(`ngl=${bestNgl} exceeded headroom after generation (${found.cand.vramAbsMb} MB) — retrying at ngl=${bestNgl - 1}`)
+      const safer = await this.benchAt(entry, sys, { ...base, ngl: bestNgl - 1 }, caps, results, `ngl=${bestNgl - 1} (headroom backoff)`)
+      if (safer) found = safer
+    }
+    return found
   }
 
   /** MoE models: pin `nCpuMoe` by VRAM probing (Phase 1), then run the full bench once (Phase 2).
@@ -533,7 +544,7 @@ export class BenchRunner {
       this.state = { ...this.state, step: `KV ${base.kvTypeK}: probing nCpuMoe=${mid} (range ${lo}–${hi})…`, candidates: results }
       const probe = await this.probeVram(entry, sys, { ...base, nCpuMoe: mid }, caps)
       this.pushProbe(results, base, 'nCpuMoe', mid, probe)
-      await this.settleGpu()
+      await this.settleGpu(sys)
       if (probe.outcome === 'oom' || overHeadroom(probe.vramAbsMb, budgetMb, headroomMb)) {
         lo = mid + 1 // too much on GPU → more CPU experts to free VRAM / restore the headroom
       } else if (probe.outcome === 'ok') {
@@ -545,52 +556,15 @@ export class BenchRunner {
     }
 
     if (bestN === null) return null
-    return this.benchAt(entry, sys, { ...base, nCpuMoe: bestN }, caps, results, `nCpuMoe=${bestN}`)
-  }
-
-  /** Measure how much the KV-cache QUANT swings VRAM at this context — so we tune only the quant(s)
-   *  that matter instead of sweeping all. Two cheap probes (largest vs smallest candidate) at ONE
-   *  shared offload: their VRAM difference is exactly the KV-size difference (weights + overhead are
-   *  identical at the same offload), valid for any architecture. Returns that swing in MB scaled to
-   *  the full model, `Number.MAX_SAFE_INTEGER` if even the largest quant won't load (cache enormous
-   *  → definitely the big-KV regime), or -1 if it couldn't be sized at all. */
-  private async calibrateKvSpread(
-    entry: ModelEntry,
-    sys: SysInfo,
-    base: LoadProfile,
-    caps: Engine['capabilities'],
-    candidates: string[],
-    results: BenchCandidate[],
-  ): Promise<number> {
-    const big = kvLargest(candidates)
-    const small = kvSmallest(candidates)
-    if (big === small) return 0
-
-    // A shared offload where the KV is resident on the GPU (so the swing is measurable) yet the
-    // model loads even with the LARGEST cache: MoE → all experts on CPU (attention + KV stay on
-    // GPU); dense → a small fraction of layers on GPU.
-    const blocks = entry.blockCount > 0 ? entry.blockCount : 32
-    const moeMax = entry.blockCount > 0 ? entry.blockCount : deriveDefault(entry, sys).nCpuMoe || 0
-    const refNgl = Math.max(1, Math.floor(blocks / 4))
-    const refOffload: Partial<LoadProfile> = entry.moe ? { nCpuMoe: moeMax, ngl: 99 } : { ngl: refNgl }
-    const knob: 'ngl' | 'nCpuMoe' = entry.moe ? 'nCpuMoe' : 'ngl'
-    const knobVal = entry.moe ? moeMax : refNgl
-
-    this.state = { ...this.state, step: `Sizing the KV cache (${big} vs ${small})…`, candidates: results }
-    const pBig = await this.probeVram(entry, sys, { ...base, kvTypeK: big, kvTypeV: big, ...refOffload }, caps)
-    this.pushProbe(results, { ...base, kvTypeK: big, ...refOffload }, knob, knobVal, pBig)
-    await this.settleGpu()
-    const pSmall = await this.probeVram(entry, sys, { ...base, kvTypeK: small, kvTypeV: small, ...refOffload }, caps)
-    this.pushProbe(results, { ...base, kvTypeK: small, ...refOffload }, knob, knobVal, pSmall)
-    await this.settleGpu()
-
-    if (pBig.outcome !== 'ok' || pBig.vramAbsMb === null) return Number.MAX_SAFE_INTEGER // huge cache
-    if (pSmall.outcome !== 'ok' || pSmall.vramAbsMb === null) return -1 // couldn't size it
-    let spread = pBig.vramAbsMb - pSmall.vramAbsMb
-    // Dense: only the GPU layers' KV is resident at refNgl, so scale the partial swing up to the
-    // whole model. (MoE keeps every attention layer's KV on GPU already → no scaling.)
-    if (!entry.moe) spread = spread * (blocks / refNgl)
-    return Math.max(0, spread)
+    let found = await this.benchAt(entry, sys, { ...base, nCpuMoe: bestN }, caps, results, `nCpuMoe=${bestN}`)
+    // Same Phase-1-vs-Phase-2 VRAM gap as denseSearch — back off (more CPU experts, less VRAM) one
+    // step if the real measured run blew through headroom (ADR-217).
+    if (found && overHeadroom(found.cand.vramAbsMb, budgetMb, headroomMb) && bestN < maxN) {
+      this.emit(`nCpuMoe=${bestN} exceeded headroom after generation (${found.cand.vramAbsMb} MB) — retrying at nCpuMoe=${bestN + 1}`)
+      const safer = await this.benchAt(entry, sys, { ...base, nCpuMoe: bestN + 1 }, caps, results, `nCpuMoe=${bestN + 1} (headroom backoff)`)
+      if (safer) found = safer
+    }
+    return found
   }
 
   /** A cheap VRAM probe (Phase 1 of a search): load the candidate, wait for readiness — by which
@@ -622,9 +596,9 @@ export class BenchRunner {
     let vramAbsMb: number | null = null
     if (outcome === 'ok') {
       await sleep(800) // let the allocator settle so the VRAM reading is final
-      vramAbsMb = await readNvidiaVramMb()
+      vramAbsMb = await readGpuVramMb(sys)
     }
-    await this.manager.stopAndWait().catch(() => {})
+    await this.stopEngine()
     return { outcome, vramAbsMb }
   }
 
@@ -674,7 +648,7 @@ export class BenchRunner {
     results.push(cand)
     this.emit(`bench ${label} → ${cand.outcome}${cand.tps != null ? ` (${cand.tps.toFixed(1)} tok/s)` : ''}`, cand)
     this.state = { ...this.state, candidates: results, bestTps: cand.tps ?? this.state.bestTps }
-    await this.settleGpu()
+    await this.settleGpu(sys)
     return cand.outcome === 'ok' && cand.tps !== null ? { cand, profile } : null
   }
 
@@ -706,8 +680,9 @@ export class BenchRunner {
     const active = this.registry.active()
     if (!active) return fail('crash')
 
-    // Per-test cap (3 min): the whole trial — load + warmup + measured request — must finish
-    // within this, else it's recorded 'timeout' and the sweep continues. Also bounded by the
+    // Per-test cap (PER_TEST_TIMEOUT_MS, 10 min — raised from 3 for deep-ctx trials, ADR-217
+    // round 2): the whole trial — load + warmup + measured request — must finish within this,
+    // else it's recorded 'timeout' and the sweep continues. Also bounded by the
     // global deadline so a near-budget start can't overrun.
     const testDeadline = Math.min(Date.now() + PER_TEST_TIMEOUT_MS, this.deadline)
     const remaining = () => Math.max(1_000, testDeadline - Date.now())
@@ -722,7 +697,7 @@ export class BenchRunner {
       extraArgs: profileToArgs(profile, entry, caps, sys.cores),
     }
 
-    const vramBefore = await readNvidiaVramMb()
+    const vramBefore = await readGpuVramMb(sys)
     phase('loading model…')
     try {
       await this.manager.start(opts)
@@ -733,33 +708,34 @@ export class BenchRunner {
     // Wait for ready / detect crash / OOM within the readiness window (and per-test cap).
     const outcome = await this.awaitReady(testDeadline)
     if (outcome !== 'ok') {
-      await this.manager.stopAndWait().catch(() => {})
+      await this.stopEngine()
       return fail(outcome)
     }
 
     const target = this.manager.target()
     if (!target) {
-      await this.manager.stopAndWait().catch(() => {})
+      await this.stopEngine()
       return fail('crash')
     }
     const logPath = this.manager.logPath()
 
-    // Bench prompt = 75% of the configured ctx, capped at 8k (see benchPromptTokens).
-    const promptContent = makeBenchContent(benchPromptTokens(profile.ctx))
+    // Bench request sized to this profile's configured ctx (ADR-217 round 2) — see
+    // buildBenchMessages for why depth matters here.
+    const benchMessages = buildBenchMessages(profile.ctx)
 
     // Prefill gate (doubles as warmup): stream the prompt and fail fast if it's spilling/crawling
     // or the engine faults — so a config that doesn't fit at this ctx is rejected in seconds and the
     // search offloads more, instead of hanging out the whole per-test budget.
     phase('warming up…')
-    const warm = await this.prefillProbe(target, promptContent, remaining(), logPath, stepPrefix)
+    const warm = await this.prefillProbe(target, benchMessages, remaining(), logPath, stepPrefix)
     if (warm !== 'ok') {
-      await this.manager.stopAndWait().catch(() => {})
+      await this.stopEngine()
       return fail(warm.fault)
     }
     phase('measuring t/s…')
-    const measured = await this.runChatWatched(target, promptContent, 128, remaining(), logPath)
-    const vramAfter = await readNvidiaVramMb()
-    await this.manager.stopAndWait().catch(() => {})
+    const measured = await this.runChatWatched(target, benchMessages, 128, remaining(), logPath)
+    const vramAfter = await readGpuVramMb(sys)
+    await this.stopEngine()
 
     if ('fault' in measured) return fail(measured.fault)
     const vramMb = vramBefore !== null && vramAfter !== null ? Math.max(0, vramAfter - vramBefore) : vramAfter
@@ -796,13 +772,13 @@ export class BenchRunner {
    *  in a "device not ready" state that otherwise cascades into every following trial failing — the
    *  cause of spurious "no candidate found" on large models. Returns fast when VRAM is already low
    *  (the normal success case). Best-effort; never throws. */
-  private async settleGpu(): Promise<void> {
+  private async settleGpu(sys: SysInfo): Promise<void> {
     await sleep(1500) // base: let the killed engine process release + the driver settle
-    let prev = await readNvidiaVramMb()
-    if (prev === null) return // non-NVIDIA / no nvidia-smi: the fixed wait is all we can do
+    let prev = await readGpuVramMb(sys)
+    if (prev === null) return // no live VRAM reader for this vendor: the fixed wait is all we can do
     for (let i = 0; i < 12 && !this.cancelled; i++) {
       await sleep(1000)
-      const cur = await readNvidiaVramMb()
+      const cur = await readGpuVramMb(sys)
       if (cur === null || cur >= prev - 64) return // released / stabilized (no further drop)
       prev = cur
     }
@@ -814,7 +790,7 @@ export class BenchRunner {
    *  result is classified accordingly. Returns the timing, or a `fault` outcome. */
   private async runChatWatched(
     target: string,
-    content: string,
+    messages: BenchMessage[],
     maxTokens: number,
     budgetMs: number,
     logPath: string,
@@ -838,7 +814,7 @@ export class BenchRunner {
 
     let timed: { tps: number; prefillTps: number | null; ttftMs: number } | null = null
     try {
-      timed = await this.chat(target, content, maxTokens, budgetMs, probe.signal)
+      timed = await this.chat(target, messages, maxTokens, budgetMs, probe.signal)
     } catch {
       timed = null
     } finally {
@@ -858,7 +834,7 @@ export class BenchRunner {
    *  the warm prompt cache makes the following measured request fast and accurate. */
   private async prefillProbe(
     target: string,
-    content: string,
+    messages: BenchMessage[],
     budgetMs: number,
     logPath: string,
     stepPrefix: string,
@@ -886,7 +862,7 @@ export class BenchRunner {
       const res = await fetch(`${target}/v1/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: 'bench', messages: [{ role: 'user', content }], max_tokens: 8, temperature: 0, seed: 42, stream: true, return_progress: true }),
+        body: JSON.stringify({ model: 'bench', messages, max_tokens: 8, temperature: 0, seed: 42, stream: true, return_progress: true }),
         signal: AbortSignal.any(signals),
       })
       if (!res.ok || !res.body) throw new Error('no stream')
@@ -935,7 +911,7 @@ export class BenchRunner {
 
   /** One non-streaming /v1/chat/completions request. Returns engine-reported tps + ttftMs, or null.
    *  Aborts on the per-test timeout, the cancel kill-switch, or `extraSignal` (the fault watchdog). */
-  private async chat(target: string, content: string, maxTokens: number, timeoutMs: number, extraSignal?: AbortSignal): Promise<{ tps: number; prefillTps: number | null; ttftMs: number } | null> {
+  private async chat(target: string, messages: BenchMessage[], maxTokens: number, timeoutMs: number, extraSignal?: AbortSignal): Promise<{ tps: number; prefillTps: number | null; ttftMs: number } | null> {
     const signals: AbortSignal[] = [AbortSignal.timeout(timeoutMs)]
     if (this.abort) signals.push(this.abort.signal)
     if (extraSignal) signals.push(extraSignal)
@@ -944,7 +920,7 @@ export class BenchRunner {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: 'bench',
-        messages: [{ role: 'user', content }],
+        messages,
         max_tokens: maxTokens,
         temperature: 0,
         seed: 42,
@@ -1049,11 +1025,11 @@ export class BenchRunner {
     const ready = await this.awaitReady(Date.now() + READY_TIMEOUT_MS)
     const target = ready === 'ok' ? this.manager.target() : null
     if (!target) {
-      await this.manager.stopAndWait().catch(() => {})
+      await this.stopEngine()
       return undefined
     }
     const text = await this.chatText(target, buildCardExtractionPrompt(card), 200, 60_000).catch(() => null)
-    await this.manager.stopAndWait().catch(() => {})
+    await this.stopEngine()
     return text ? parseLlmSampling(text) : undefined
   }
 
@@ -1158,32 +1134,143 @@ export class BenchRunner {
 
 // ---- helpers ----------------------------------------------------------------
 
-/** Filler text for the bench prompt — varied enough to avoid tokenizer-dedup tricks. */
-const BENCH_BASE =
-  'Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor ' +
-  'incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud ' +
-  'exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure ' +
-  'dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. ' +
-  'Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt ' +
-  'mollit anim id est laborum. '
-
-/** Build a bench prompt of approximately `targetTokens` tokens by repeating BENCH_BASE.
- *  Uses a 4-chars-per-token estimate — close enough for English lorem text. */
-function makeBenchContent(targetTokens: number): string {
-  const targetChars = Math.max(BENCH_BASE.length, targetTokens * CHARS_PER_TOKEN)
-  const reps = Math.ceil(targetChars / BENCH_BASE.length)
-  return BENCH_BASE.repeat(reps).slice(0, targetChars) + '\n\nSummarize the passage above in one sentence.'
+/** A chat message for the bench request — mirrors the wire shape `/v1/chat/completions` expects. */
+export interface BenchMessage {
+  role: 'system' | 'user' | 'assistant'
+  content: string
 }
 
-/** How many prompt tokens to use for a bench trial: 75% of the configured context, capped at 8k.
- *  The cap matters for BOTH speed and accuracy. Speed: a huge model at 200K would otherwise spend
- *  the whole trial prefilling tens of thousands of tokens. Accuracy: generation t/s falls with how
- *  deep the context is, and a very deep measurement reflects a worst case, not typical use — an 8k
- *  context is representative of normal prompts and makes the per-token attention cost (which is
- *  where a low-bit KV's slower kernel shows up) realistic rather than exaggerated. KV/VRAM is
- *  allocated for the full ctx at load regardless, so this only sizes the speed measurement. */
-function benchPromptTokens(ctx: number): number {
-  return Math.max(256, Math.min(8_192, Math.floor(ctx * 0.75)))
+/** Bench system prompt: the "Default" agent's REAL injected prompt (ADR-217) — mirrors
+ *  `web/src/lib/personas.ts`'s `TURBOLLM_BASE_CAPABILITY` + `TURBOLLM_ARTIFACTS_CAPABILITY` +
+ *  date line verbatim (Default carries no persona text of its own, and a bench run has no
+ *  personalization/memory facts to inject). No shared module exists between `web/` and `src/`
+ *  (separate build targets), so this is kept in sync with personas.ts BY HAND — if one changes,
+ *  update the other. Using the real system prompt (instead of synthetic filler) means the bench
+ *  request's prefill shape matches what a real first chat message actually sends. */
+const BENCH_SYSTEM_PROMPT = `You are running inside TurboLLM, a local-first AI chat app. You can render text-based charts and graphics using Unicode characters. Use them when a visual would genuinely make the response clearer — not by default.
+
+A chart is appropriate when:
+- Comparing 3+ items by a numeric metric (rankings, benchmarks, budgets)
+- Showing a trend, distribution, or progression over time or stages
+- Presenting a hierarchy or dependency tree
+- The user asks about data that has a clear pattern hard to read in prose
+
+A chart is NOT appropriate for:
+- Conversational replies, opinions, or explanations
+- Data with only 1–2 values (just state the numbers inline)
+- Lists that are purely qualitative (no meaningful numeric comparison)
+
+When a chart is warranted:
+- Bar / column charts: use block fill characters █ ▓ ▒ ░ with a numeric scale and axis labels
+- Tables: use box-drawing characters ┌ ─ ┐ │ └ ┘ ├ ┤ ┬ ┴ ┼ for clean borders; align columns
+- Line / trend: sketch with · ╌ ╍ ╱ ╲ characters; mark key points with ●
+- Tree / hierarchy: use └─ ├─ │ connectors
+- Progress / gauge: [████████░░] style with a percentage
+
+Always include a title, axis/column labels, and the underlying numbers. Keep charts compact — no wider than ~60 characters. Wrap chart output in a plain code block (\`\`\`) so spacing is preserved.
+
+TurboLLM also live-previews three kinds of fenced code block, so you can return RENDERED visuals, not just text. When the user wants something visual or interactive, reply with ONE self-contained fenced block in the right language:
+
+- \`\`\`mermaid — diagrams: flowcharts, sequence/class/ER/state diagrams, gantt, mind maps, pie charts. Reach for this on "diagram", "flowchart", "flow", "architecture", "sequence", "how X works" (visually), "org chart", "timeline".
+- \`\`\`svg — static vector graphics: icons, logos, illustrations, simple scenes, or charts you draw by hand (bar/line/scatter). Reach for this on "draw", "icon", "logo", "illustration", "graphic".
+- \`\`\`html — interactive or animated results: a web page, UI mockup, form, canvas animation, game, calculator — anything needing live CSS/JS. Must be fully self-contained: inline CSS/JS only, NO external URLs, scripts, fonts, images, or network calls (they are blocked).
+
+When to use them:
+- ONLY when a rendered visual or runnable result is genuinely what the user asked for. Pick the simplest type that satisfies it — a flowchart is mermaid, not html; an icon is svg, not html.
+- Put any explanation BEFORE or AFTER the block, never inside it. At most one artifact per response.
+
+Keep the syntax valid (a diagram that fails to parse is worse than a simpler one that renders):
+- mermaid: prefer simple flowcharts/graphs. Wrap any node or message label that contains spaces, parentheses, slashes, or punctuation in double quotes. In sequence diagrams, do NOT use activate/deactivate unless every activate has a matching deactivate — when in doubt, leave them out.
+- svg/html: self-contained only — no external URLs, CDNs, fonts, or images.
+
+When NOT to use them (important — do not over-render):
+- Plain questions, opinions, explanations, or conversation → normal prose.
+- Code meant to be read, copied, or used in a project (a function, a script, a config) → a normal code block in its real language, NOT an artifact. Wrapping ordinary code in html/svg/mermaid is wrong.
+- A 1–2 number comparison → just say the numbers. Small text tables/sparklines → the Unicode style above.
+
+Today's date is ${new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}.`
+
+/** Fixed bench question (ADR-217) — one realistic, medium-length technical question, held
+ *  constant across every bench run so results stay comparable run-to-run. Deterministic sampling
+ *  (`temperature: 0`, `seed: 42` in {@link BenchRunner.chat}) means the same question always
+ *  measures the same thing. Always the LAST message — see {@link buildBenchMessages}. */
+const BENCH_QUESTION = 'Explain the main differences between TCP and UDP, and give a couple of real-world scenarios where each one is the better choice.'
+
+// English text is roughly 4 characters per token — used only to size how much filler content
+// {@link buildBenchMessages} needs to add to reach the target depth; the real prefill then reports
+// the real token count.
+const CHARS_PER_TOKEN = 4
+
+// Fraction of the configured ctx the bench prompt targets, before the depth cap below — see
+// {@link benchPromptTokens}.
+const BENCH_CTX_FRACTION = 0.75
+// Depth cap (ADR-217 round 3): a founder live test at the UNCAPPED 150k depth (0.75 × their
+// 200k ctx) measured 3.2 tok/s (127s just for first token) — MORE pessimistic than their real
+// ~11 tok/s chat experience, not just slower to bench. A mid-depth test at 22k tokens measured
+// 10.4 tok/s, matching real chat almost exactly. So depth beyond ~20-30k tokens isn't just
+// expensive to bench, it's actively LESS representative of typical real usage — real
+// conversations rarely sustain tens of thousands of tokens of *dense* back-and-forth before a
+// user would have started a fresh chat or the context reset. 32k is the founder-directed cap:
+// deep enough to capture the real depth-dependent slowdown (validated: 22k already tracked real
+// chat within ~5%), capped low enough that bench time stays close to the original ~8k-depth
+// runtime instead of scaling unboundedly with ctx.
+const BENCH_MAX_PROMPT_TOKENS = 32_000
+
+/** How many prompt tokens the bench trial should target: {@link BENCH_CTX_FRACTION} of the
+ *  configured context, capped at {@link BENCH_MAX_PROMPT_TOKENS} (ADR-217 round 3 — see that
+ *  constant's comment for why the cap is correctness, not just speed). Floored at 256 so a tiny
+ *  ctx still gets a minimally-realistic bench. */
+export function benchPromptTokens(ctx: number): number {
+  return Math.max(256, Math.min(BENCH_MAX_PROMPT_TOKENS, Math.floor(ctx * BENCH_CTX_FRACTION)))
+}
+
+/** Deterministic filler topics used to pad the bench prompt out toward the target depth (ADR-217
+ *  round 2) — realistic technical prose, not Lorem-ipsum repetition, so the attention pattern isn't
+ *  degenerate. Cycled in a fixed order (never random / never Date/Math.random-seeded) so a bench
+ *  run stays exactly reproducible. */
+const FILLER_TOPICS = [
+  'the history and evolution of relational databases, from IBM System R through modern distributed SQL engines',
+  'how modern CPUs use branch prediction and speculative execution to hide pipeline stalls',
+  'the tradeoffs between microservices and monolithic architectures for a mid-sized SaaS company',
+  'how TCP congestion control algorithms like Reno, Cubic, and BBR differ in their approach to bandwidth estimation',
+  "the design philosophy behind Rust's ownership and borrowing system compared to garbage collection",
+  'how content delivery networks use anycast routing and edge caching to reduce latency',
+  'the tradeoffs between REST, GraphQL, and gRPC for building internal service APIs',
+  'how modern GPUs pipeline shader execution across thousands of parallel cores',
+]
+
+/** One filler assistant answer for {@link FILLER_TOPICS}. `round` distinguishes repeated cycles
+ *  through the topic list (needed once the target depth exceeds one pass) so the prompt isn't
+ *  made of byte-identical repeated blocks. */
+function fillerAnswer(topic: string, round: number): string {
+  const sentences: string[] = []
+  for (let i = 0; i < 40; i++) {
+    sentences.push(
+      `Regarding ${topic} (pass ${round}, point ${i + 1}), the underlying tradeoffs depend heavily on the specific ` +
+        'workload, the scale of the system, and the operational constraints the team is working under, which is ' +
+        'why experienced engineers tend to reach for established patterns before inventing something bespoke.',
+    )
+  }
+  return sentences.join(' ')
+}
+
+/** Build the bench request for `ctx`: the real Default-agent system prompt, deterministic
+ *  realistic filler exchanges padded out to ~{@link benchPromptTokens}(ctx) tokens (ADR-217 round
+ *  2 — matches the depth a real, substantially-filled conversation reaches at this ctx), then the
+ *  fixed {@link BENCH_QUESTION} as the final turn so every run asks the identical last question. */
+export function buildBenchMessages(ctx: number): BenchMessage[] {
+  const targetChars = benchPromptTokens(ctx) * CHARS_PER_TOKEN
+  const messages: BenchMessage[] = [{ role: 'system', content: BENCH_SYSTEM_PROMPT }]
+  let chars = BENCH_SYSTEM_PROMPT.length
+  for (let round = 0; chars < targetChars; round++) {
+    const topic = FILLER_TOPICS[round % FILLER_TOPICS.length]
+    const q = `Can you explain ${topic}?`
+    const a = fillerAnswer(topic, Math.floor(round / FILLER_TOPICS.length) + 1)
+    messages.push({ role: 'user', content: q }, { role: 'assistant', content: a })
+    chars += q.length + a.length
+  }
+  messages.push({ role: 'user', content: BENCH_QUESTION })
+  return messages
 }
 
 /** True when a candidate's ABSOLUTE VRAM use leaves less than `headroomMb` free within `budgetMb`
@@ -1273,31 +1360,54 @@ export function betterBySpeed(
   return (a.prefillTps ?? 0) > (b.prefillTps ?? 0)
 }
 
-/** Bytes per cached element for a KV-cache type (defaults to f16's 2 for unknown types). */
+/** Bytes per cached element for a KV-cache type (defaults to f16's 2 for unknown types). Note:
+ *  this is a nominal/declared size, not a measured one — ADR-219 found turbo4's REAL VRAM and
+ *  compute cost is higher than its 0.5-bytes-per-element entry here implies (it runs a Walsh-
+ *  Hadamard rotation + InnerQ calibration per cached token, plus extra rotation-tensor VRAM, none
+ *  of which this table accounts for) — treat comparisons using this table as directional only. */
 function kvBytes(t: string): number {
   return KV_BYTES[t] ?? 2
 }
-/** The largest / smallest KV-cache type in a candidate set (by bytes per element). */
-function kvLargest(c: string[]): string {
-  return c.reduce((a, b) => (kvBytes(b) > kvBytes(a) ? b : a), c[0])
-}
+/** The smallest KV-cache type in a candidate set (by nominal bytes per element). */
 function kvSmallest(c: string[]): string {
   return c.reduce((a, b) => (kvBytes(b) < kvBytes(a) ? b : a), c[0])
 }
 
-/** Decide which quality-preserving KV-cache type(s) to actually tune, from the measured VRAM swing
- *  (see {@link calibrateKvSpread}). Tiny swing → the cache is small, so the quant barely changes
- *  the fit and the highest-precision/fastest-kernel type (f16) wins → tune only it. Big (or
- *  un-sizable, spread < 0) swing → the smallest type frees real VRAM for more of the model on the
- *  GPU, but its kernel can be slower (turbo4), so tune BOTH the smallest and the q8_0 stock fallback
- *  and let the measured prefill + t/s pick the winner. */
-export function decideKvToBench(spreadMb: number, candidates: string[]): string[] {
-  const has = (t: string) => candidates.includes(t)
-  const largest = kvLargest(candidates)
-  if (spreadMb >= 0 && spreadMb <= KV_SPREAD_MIN) return [largest]
-  const smallest = has('turbo4') ? 'turbo4' : kvSmallest(candidates)
-  const stock = has('q8_0') ? 'q8_0' : largest
-  return [...new Set([smallest, stock])]
+/** TurboQuant's rotation-based KV types (ADR-219). Confirmed from the fork's own source
+ *  (turbo-wht.cu/.cuh, InnerQ calibration state, "+3 rotation tensor overhead" in its merge
+ *  notes): these run a Walsh-Hadamard rotation + variance-equalizing calibration on every cached
+ *  token, plus real extra rotation-tensor VRAM — none of which `KV_BYTES`'s nominal bytes-per-
+ *  element accounts for. That's WHY turbo4 and q4_0 show the identical "0.5" in `KV_BYTES` (both
+ *  nominally 4-bit) yet turbo4 measured meaningfully slower and higher-VRAM in real testing: the
+ *  table only captures the raw quantized size, not this extra cost. It's a deliberate trade for
+ *  better quality at low bit-widths (the fork's own notes: "turbo4/turbo3 match f16 quality"),
+ *  not a bug — see {@link kvSpeedAdvisory}. */
+const TURBO_KV_TYPES = new Set(['turbo2', 'turbo3', 'turbo4'])
+
+/** ADR-219: auto-tune no longer sweeps KV-cache type — it tunes offload on whatever type the user
+ *  already selected, since the quality/speed tradeoff (confirmed real via ADR-217/219's live
+ *  testing: turbo4 vs. q4_0 on the same offload, then root-caused in TurboQuant's own source — see
+ *  {@link TURBO_KV_TYPES}) belongs to the user, not a silent auto-pick. This surfaces that tradeoff
+ *  instead of hiding it: when the winner is slow (<20 tok/s), find the smallest available type that
+ *  is NOT a turbo type (whose real cost `KV_BYTES` understates) and no bigger, nominally, than the
+ *  one tuned — note it without switching anything. A same-size non-turbo alternative still counts
+ *  (that's exactly the turbo4-vs-q4_0 case that motivated this), which a plain "strictly smaller
+ *  bytes" comparison would miss. Null when already fast enough, no such alternative exists, or the
+ *  engine wasn't probed. `20` is a blunt heuristic, not a guarantee. */
+export function kvSpeedAdvisory(tps: number | null, currentKv: string, supportedKvTypes: string[]): string | null {
+  if ((tps ?? 0) >= 20 || supportedKvTypes.length === 0) return null
+  // Turbo types are ALWAYS excluded from the recommendation candidates, regardless of whether
+  // `currentKv` itself is turbo — they're exactly the types whose real cost KV_BYTES understates
+  // (ADR-219/220), so they can never be the "faster, standard" alternative this advisory offers.
+  // A prior version of this filter incorrectly gated the exclusion on `TURBO_KV_TYPES.has(currentKv)`,
+  // which — because `(!isTurbo || ...)` short-circuits true whenever isTurbo is false — meant the
+  // exclusion silently did nothing for the common case (a non-turbo current type), letting the
+  // smallest-nominal-size turbo type (turbo2, 0.25 bytes) win every time. Caught in independent
+  // review before merge (ADR-222) — see the regression test covering exactly this combination.
+  const candidates = supportedKvTypes.filter((t) => t !== currentKv && kvBytes(t) <= kvBytes(currentKv) && !TURBO_KV_TYPES.has(t))
+  if (candidates.length === 0) return null
+  const smallest = kvSmallest(candidates)
+  return `This result used the "${currentKv}" KV cache type. A different type (e.g. "${smallest}") may run faster, at some output-quality cost — try it manually if you want the extra speed.`
 }
 
 /** Best-effort current NVIDIA VRAM use in MB (sum across GPUs). Null on non-NVIDIA
@@ -1324,6 +1434,55 @@ function readNvidiaVramMb(): Promise<number | null> {
       resolve(null)
     }
   })
+}
+
+/** Pure parser for `rocm-smi --showmeminfo vram --json` output, split out for direct testing
+ *  (mirrors `sysinfo.ts`'s `parseRocmSmi`). Sums "VRAM Total Used Memory (B)" across every card.
+ *  Null on unparseable JSON or when no card reports a positive used-memory figure. */
+export function parseRocmVramUsed(memJson: string): number | null {
+  try {
+    const mem = JSON.parse(memJson) as Record<string, Record<string, string>>
+    let total = 0
+    for (const fields of Object.values(mem)) {
+      const usedKey = Object.keys(fields).find((k) => /VRAM Total Used Memory/i.test(k))
+      const bytes = usedKey ? parseInt(String(fields[usedKey]).trim(), 10) || 0 : 0
+      total += bytes
+    }
+    const mb = Math.round(total / 1e6)
+    return mb > 0 ? mb : null
+  } catch {
+    return null
+  }
+}
+
+/** Best-effort current AMD VRAM use in MB (sum across cards) via ROCm's rocm-smi. Null when
+ *  rocm-smi is absent (ROCm not installed) or its output can't be parsed — never throws.
+ *  Mirrors `sysinfo.ts`'s `parseRocmSmi` (same `--showmeminfo vram --json` call), reading
+ *  "VRAM Total Used Memory (B)" instead of "VRAM Total Memory (B)" (ADR-217: before this, the
+ *  headroom gate had zero VRAM protection on AMD — {@link readNvidiaVramMb} silently returned
+ *  null on every AMD box and {@link overHeadroom} treats unknown VRAM as "never over"). */
+function readRocmVramMb(): Promise<number | null> {
+  return new Promise((resolve) => {
+    try {
+      execFile('rocm-smi', ['--showmeminfo', 'vram', '--json'], { timeout: 8000, windowsHide: true }, (err, stdout) => {
+        resolve(err || !stdout ? null : parseRocmVramUsed(stdout))
+      })
+    } catch {
+      resolve(null)
+    }
+  })
+}
+
+/** Best-effort current GPU VRAM use in MB (sum across GPUs), vendor-aware (ADR-217). Tries
+ *  nvidia-smi first (unconditionally — cheap to attempt, and correct even without `sys`), then
+ *  falls back to rocm-smi only when the box has a known AMD GPU. Null when neither applies
+ *  (Intel/Apple/CPU-only, or no live VRAM reader for that vendor) — matches
+ *  {@link overHeadroom}'s "unknown VRAM never blocks" contract. Never throws. */
+async function readGpuVramMb(sys: SysInfo): Promise<number | null> {
+  const nv = await readNvidiaVramMb()
+  if (nv !== null) return nv
+  if (sys.gpus.some((g) => g.vendor === 'amd')) return readRocmVramMb()
+  return null
 }
 
 function sleep(ms: number): Promise<void> {

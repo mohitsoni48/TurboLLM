@@ -17,6 +17,7 @@ import { readFile } from 'node:fs/promises'
 import { Type, Unsafe, type TSchema } from 'typebox'
 import {
   createAgentSession,
+  createBashTool,
   DefaultResourceLoader,
   ModelRegistry,
   AuthStorage,
@@ -29,6 +30,7 @@ import {
   type ToolResultEvent,
   type AgentSessionEvent,
 } from '@earendil-works/pi-coding-agent'
+import { createRobustBashOperations } from './robust-bash'
 import type { TextContent, ToolCall as PiToolCall, Usage } from '@earendil-works/pi-ai'
 import type { Deps } from '../deps'
 import type { Message as DbMessage } from '../chat/db'
@@ -295,30 +297,27 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     if (summaryText) sm.appendMessage({ role: 'user', content: summaryText, timestamp: Date.now() })
     if (priorMessages.length > 0) seedPriorHistory(sm, priorMessages, modelId)
   }
-  let sessionManager = SessionManager.inMemory(repoRoot)
+  const sessionManager = SessionManager.inMemory(repoRoot)
   seedHistoryInto(sessionManager)
-  // Defensive check + retry + text fallback: live testing of a founder-reported "Code forgot my
-  // last message" bug (2026-07-13) caught this exact seed silently registering FEWER entries
+  // Defensive check + text fallback: live testing of a founder-reported "Code forgot my last
+  // message" bug (2026-07-13, ADR-194) caught this exact seed silently registering FEWER entries
   // than it should have — sometimes zero, sometimes only a partial subset (e.g. the user's
   // message but not the assistant's reply) — in roughly 1 of every 5-6 turns, and occasionally
-  // in a long unbroken streak. Reproduced repeatedly with instrumented logging, but the root
-  // cause inside pi's SessionManager/tree-building couldn't be pinned down (the seeding code
-  // itself is fully synchronous with no plausible interleaving). A fresh SessionManager +
-  // re-seed recovers MOST of the time but not always — when it doesn't, fall back to prepending
-  // a plain-text transcript onto the prompt itself: session.prompt(task) is the one path proven
-  // reliable in every single trial (it's the actual turn — always exercised), so it can't fail
-  // the same way appendMessage() apparently can. Always log so a recurrence leaves forensic
-  // evidence (session id, expected vs actual count) instead of a silent wrong answer.
+  // in a long unbroken streak. The root cause inside pi's SessionManager/tree-building was never
+  // pinned down. This used to retry on a second fresh SessionManager before falling back to text;
+  // removed 2026-07-15 (ADR-210) after confirming, by reading pi's own SessionManager.appendMessage/
+  // getEntries source, that seedHistoryInto is fully synchronous, in-memory, and has no I/O — so
+  // re-running it on the SAME unmutated priorMessages/summaryText can never produce a different
+  // entry count than the first attempt did. The retry was dead weight; the plain-text fallback
+  // below is the one path proven reliable in every trial (it's the actual turn — always
+  // exercised), so it can't fail the same way appendMessage() apparently can. Always log so a
+  // recurrence leaves forensic evidence (session id, expected vs actual count) instead of a
+  // silent wrong answer.
   const expectedEntries = (summaryText ? 1 : 0) + countReplayEntries(priorMessages)
   let task = rawTask
   if (expectedEntries > 0 && sessionManager.getEntries().length < expectedEntries) {
-    console.warn(`[code-session] history seed for session ${sessionId} produced ${sessionManager.getEntries().length}/${expectedEntries} expected entries — retrying on a fresh SessionManager`)
-    sessionManager = SessionManager.inMemory(repoRoot)
-    seedHistoryInto(sessionManager)
-    if (sessionManager.getEntries().length < expectedEntries) {
-      console.warn(`[code-session] retry for session ${sessionId} still only produced ${sessionManager.getEntries().length}/${expectedEntries} — falling back to a plain-text history prefix on this turn's prompt`)
-      task = `${HISTORY_FALLBACK_PREFIX}${renderHistoryFallbackText(summaryText, priorMessages)}${HISTORY_FALLBACK_SUFFIX}${rawTask}`
-    }
+    console.warn(`[code-session] history seed for session ${sessionId} produced ${sessionManager.getEntries().length}/${expectedEntries} expected entries — falling back to a plain-text history prefix on this turn's prompt`)
+    task = `${HISTORY_FALLBACK_PREFIX}${renderHistoryFallbackText(summaryText, priorMessages)}${HISTORY_FALLBACK_SUFFIX}${rawTask}`
   }
   // Isolated, shippable agent-config dir under TurboLLM's own data dir (never an arbitrary
   // system path). It's a fresh empty dir, so no user global extensions/skills are discovered.
@@ -509,6 +508,10 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
 
     // No invoke_skill tool registered here — a skill cannot invoke another skill (v1 scope).
     const skillTools = toolsForMode(skillMode)
+    // Same verified-kill bash tool the main session uses (see its own registration above for the
+    // full root-cause writeup) — a skill sub-session runs real bash calls too and deserves the
+    // same reliable Stop behavior, not just the outer session.
+    const skillBash = createBashTool(repoRoot, { operations: createRobustBashOperations({ sessionLabel: `${sessionId}:skill:${skill.id}` }) })
     const { session: skillSession } = await createAgentSession({
       cwd: repoRoot,
       agentDir: skillAgentDir,
@@ -518,6 +521,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       resourceLoader: skillResourceLoader,
       sessionManager: SessionManager.inMemory(repoRoot),
       settingsManager: SettingsManager.inMemory(),
+      customTools: [skillBash],
       ...(skillTools ? { tools: skillTools } : {}),
     })
 
@@ -939,6 +943,18 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
   // (read/bash/edit/write) — toolsForMode returns undefined so `tools` is omitted below.
   const tools = toolsForMode(mode)
 
+  // Stop-button reliability (founder-reported gap, 2026-07-17): a customTool with the same name
+  // as a built-in cleanly REPLACES it (confirmed in pi-coding-agent's own source,
+  // agent-session.js's _refreshToolRegistry — built-ins populate the registry first, then
+  // customTools Map.set() over them by name), and is filtered by the SAME tools/excludeTools
+  // allowlist as built-ins — so passing this unconditionally is safe: plan mode's toolsForMode
+  // allowlist already excludes 'bash', so this customTool simply never activates there, no mode
+  // check needed here. See robust-bash.ts's own header for the full root-cause writeup (verified
+  // live, repeated, timed testing): pi's own bash tool already wires abort correctly, but its
+  // Windows kill (taskkill /F /T against a Git-Bash-rooted process tree) intermittently fails to
+  // actually kill the spawned process — this swaps in a verified, escalating kill instead.
+  const robustBash = createBashTool(repoRoot, { operations: createRobustBashOperations({ sessionLabel: sessionId }) })
+
   const { session } = await createAgentSession({
     cwd: repoRoot,
     agentDir,
@@ -948,6 +964,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     resourceLoader,
     sessionManager,
     settingsManager,
+    customTools: [robustBash],
     ...(tools ? { tools } : {}),
   })
 
@@ -967,6 +984,15 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       } else if (ame.type === 'thinking_delta') {
         void sink({ event: 'reasoning', data: { delta: ame.delta } })
       }
+    } else if (ev.type === 'compaction_start') {
+      // pi's own AUTO-compaction (distinct from the manual /compact route below, which only
+      // ever calls session.compact() on demand) — a real first-class pi feature this session
+      // registered no listener for until now, so it fired with zero UI feedback: the transcript
+      // just went quiet while pi silently summarized history mid-turn. Forwarded so the
+      // frontend can show a real "Compacting conversation…" state instead of a generic/blank gap.
+      void sink({ event: 'compaction', data: { phase: 'start', reason: ev.reason } })
+    } else if (ev.type === 'compaction_end') {
+      void sink({ event: 'compaction', data: { phase: 'end', reason: ev.reason, aborted: ev.aborted, tokensBefore: ev.result?.tokensBefore } })
     }
   })
 

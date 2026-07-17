@@ -317,11 +317,18 @@ export class Manager {
     const exited = this.exited
     if (this.state === 'running' || this.state === 'starting') {
       // force: SIGKILL immediately rather than the graceful TERM→8s-then-kill path.
-      // Used by the ComfyUI guard, which needs the VRAM freed NOW before ComfyUI runs.
+      // Used by the ComfyUI guard, which needs the VRAM freed NOW before ComfyUI runs, and by
+      // auto-tune's cancel (ADR-220).
       if (opts?.force) this.forceStop()
       else this.stop()
       await this.waitForExit(exited)
     } else if (this.state === 'stopping') {
+      // A force request landing while a graceful stop is ALREADY in flight (e.g. auto-tune's
+      // cancel arriving in the narrow window right after a probe's own non-forced stop already
+      // started) must not just passively wait out the remainder of that graceful timer — kill
+      // now. Bypasses forceStop()'s running/starting-only guard by calling the module-level
+      // forceKill directly, since state is already 'stopping' (ADR-220).
+      if (opts?.force && this.child) forceKill(this.child)
       await this.waitForExit(exited)
     } else if (this.state === 'error') {
       this.state = 'stopped'

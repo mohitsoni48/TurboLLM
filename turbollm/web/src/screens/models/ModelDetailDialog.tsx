@@ -1,5 +1,4 @@
 ﻿import { useEffect, useMemo, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
-import { useQueryClient } from '@tanstack/react-query'
 import { ChevronDown, ExternalLink, Gauge, RotateCcw, Save, X, Zap } from 'lucide-react'
 import { ApiError } from '../../lib/api'
 import { useBenchActions, useBenchState, useEngines, useModelActions, useModelDetail, useStatus } from '../../lib/queries'
@@ -65,7 +64,6 @@ export function ModelDetailDialog({
   const [draft, setDraft] = useState<LoadProfile | null>(null)
   const [advanced, setAdvanced] = useState(false)
   const [remember, setRemember] = useState(true)
-  const qc = useQueryClient()
 
   const detail = detailQ.data
   const statusQ = useStatus()
@@ -166,6 +164,13 @@ export function ModelDetailDialog({
   // stop it first, then start the sweep once the engine has settled.
   const startBenchRun = () => {
     if (!detail) return
+    // Use the current draft as the search's starting basis (ctx, sampling, etc.) via `base`
+    // below — but do NOT persist it (ADR-221). An earlier attempt saved the draft to the
+    // backend right here (ADR-220), which created the opposite problem: cancelling a run the
+    // founder didn't like left that pre-auto-tune draft permanently saved even though they'd
+    // never asked to commit it. The real cause of the original "my config was gone" report was
+    // the stale-refetch effect below firing on every `benchDone` (cancel included) BEFORE any
+    // save happened — fixed there instead; no defensive save needed here.
     if (detail.loaded) {
       // Stop the engine; the effect above starts the sweep once it reports stopped.
       setPendingBenchKey(detail.key)
@@ -175,21 +180,19 @@ export function ModelDetailDialog({
     }
   }
 
-  // When a sweep finishes it saves the tuned profile server-side — refetch the detail
-  // so the form reflects the new settings immediately (no close/reopen needed).
-  useEffect(() => {
-    if (benchDone && detail?.key) {
-      void qc.invalidateQueries({ queryKey: ['model', detail.key] })
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [benchDone, detail?.key])
-
   // Auto-tune results dialog (shown on a finished run). Both buttons close the whole model dialog;
   // Save persists the tuned profile (POST /bench/save), Cancel discards it.
   const onTuneSave = (downloadLog: boolean) => {
     bench.save.mutate(undefined, {
       onSuccess: () => {
         toast.success('Tuned settings saved')
+        // No explicit invalidateQueries needed here — `bench.save`'s own mutation hook
+        // (useBenchActions, queries.ts) already invalidates the `['model']` prefix on success,
+        // which covers this detail query and runs independent of this component's lifecycle.
+        // ADR-221: the bug was a `benchDone`-keyed effect that refetched on EVERY completion
+        // (cancel included), clobbering unsaved local edits before the user had even decided
+        // Save vs. Cancel — that effect is deleted; a real save is the only thing that should
+        // ever trigger a refetch, and the existing hook-level invalidation already does that.
         if (downloadLog) {
           const a = document.createElement('a')
           a.href = '/api/v1/bench/log'
@@ -692,10 +695,12 @@ function AutoTuneResultDialog({
   result?: {
     params: { ctx: number; ngl: number; nglFit?: boolean; nCpuMoe: number; nCpuMoeFit?: boolean; parallel: number; kvTypeK: string; flashAttn: string }
     tps: number
+    prefillTps?: number | null
     ttftMs?: number
     vramMb: number | null
     sampling?: CardSampling
     recommendedSampling?: CardSampling
+    kvAdvisory?: string
   }
   modelName?: string
   onSave: (downloadLog: boolean) => void
@@ -747,10 +752,15 @@ function AutoTuneResultDialog({
                   )}
 
                   <ConfigSection title="Measured" />
-                  <ConfigRow label="Speed" value={`${result.tps.toFixed(1)} tok/s`} />
+                  <ConfigRow label="Generation speed" value={`${result.tps.toFixed(1)} tok/s`} />
+                  {result.prefillTps != null && <ConfigRow label="Prefill speed" value={`${result.prefillTps.toFixed(0)} tok/s`} />}
                   {result.vramMb != null && <ConfigRow label="VRAM used" value={`~${result.vramMb.toLocaleString()} MB`} />}
                   {result.ttftMs ? <ConfigRow label="First token" value={`${Math.round(result.ttftMs)} ms`} /> : null}
                 </div>
+              )}
+
+              {result?.kvAdvisory && (
+                <p className="text-[12px]" style={{ color: 'var(--warn)' }}>{result.kvAdvisory}</p>
               )}
 
               <span className="text-faint">

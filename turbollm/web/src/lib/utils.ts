@@ -22,6 +22,17 @@ export function folderName(repoRoot: string): string {
   return parts.at(-1) ?? repoRoot
 }
 
+/** "+1234 −567" — matches the sidebar's own per-session diff-stat chip style. Omits a zero
+ *  side entirely rather than printing "+0" for a diff that only ever removed (or only ever
+ *  added) lines. "—" when there's genuinely no diff activity at all yet. */
+export function formatDiff(added: number, removed: number): string {
+  if (added === 0 && removed === 0) return '—'
+  const parts: string[] = []
+  if (added > 0) parts.push(`+${added.toLocaleString()}`)
+  if (removed > 0) parts.push(`−${removed.toLocaleString()}`)
+  return parts.join(' ')
+}
+
 // ── Last-opened id per Workspace mode ──────────────────────────────────────────
 //
 // The Chat|Code pill in ConversationSidebar.tsx used to always link to the bare

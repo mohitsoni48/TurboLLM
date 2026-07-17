@@ -137,10 +137,12 @@ export class CodeRunManager {
     return !!s && (s.active !== null || s.queue.length > 0)
   }
 
-  /** The tasks currently WAITING behind the active turn (not the running one) — the server-side
-   *  message queue, surfaced to the UI so its "Queued" chips survive a disconnect. */
-  queued(sessionId: string): string[] {
-    return this.sessions.get(sessionId)?.queue.map((t) => t.task) ?? []
+  /** The turns currently WAITING behind the active turn (not the running one) — the server-side
+   *  message queue, surfaced to the UI so its "Queued" chips survive a disconnect. `userMsgId`
+   *  (not just index) identifies each entry so a per-chip action (sendNow) can target one
+   *  specific queued turn even if two queued tasks have identical text. */
+  queued(sessionId: string): { userMsgId: string; task: string }[] {
+    return this.sessions.get(sessionId)?.queue.map((t) => ({ userMsgId: t.userMsgId, task: t.task })) ?? []
   }
 
   /** The in-flight turn's message ids, so a reconnecting stream can synthesize a `meta` frame
@@ -212,7 +214,7 @@ export class CodeRunManager {
   private emitQueue(sessionId: string): void {
     const s = this.sessions.get(sessionId)
     if (!s) return
-    const ev = s.buffer.push('queue', { queued: s.queue.map((t) => t.task) })
+    const ev = s.buffer.push('queue', { queued: this.queued(sessionId) })
     s.emitter.emit('event', ev)
   }
 
@@ -327,11 +329,15 @@ export class CodeRunManager {
       // autoTitleFromConversation's own guard). It writes conversations.title, but the
       // sidebar/session list reads agent_runs.title (set to the raw task text at session
       // creation) — mirror the generated title onto the session record too, or the sidebar
-      // never sees it.
-      if (!result.aborted) {
+      // never sees it. Gated on titleAutoSynced (founder-reported gap, 2026-07-14): this used
+      // to re-mirror unconditionally on EVERY successful turn, silently reverting a manual
+      // rename on the very next completed turn — the auto-generated name is a first-run
+      // convenience and should only ever assert itself once, never again after.
+      if (!result.aborted && !this.d.db.getAgentRun(sessionId)?.titleAutoSynced) {
         void autoTitleFromConversation(this.d, s.convId).then(() => {
+          if (this.d.db.getAgentRun(sessionId)?.titleAutoSynced) return
           const title = this.d.db.getConversation(s.convId)?.title
-          if (title && title !== 'New chat') this.d.db.updateAgentRun(sessionId, { title })
+          if (title && title !== 'New chat') this.d.db.updateAgentRun(sessionId, { title, titleAutoSynced: true })
         })
       }
     } catch (e) {
@@ -391,6 +397,26 @@ export class CodeRunManager {
     if (s.queue.length > 0) { s.queue = []; this.emitQueue(sessionId) }
     s.active?.ac.abort()
     return had
+  }
+
+  /** Atomically stop the currently active turn AND promote a specific queued turn to run next —
+   *  the "Send now" action on a queued chip. Unlike stop(), this does NOT drop the rest of the
+   *  queue: only the target turn is moved to the front, the remaining queued turns still run
+   *  afterward in their original relative order. A naive "stop() then re-enqueue" would race the
+   *  abort against pump()'s own re-entrant call and, with 2+ queued turns, could let whichever
+   *  was already first run instead of the one the user actually clicked. Returns false if
+   *  userMsgId isn't currently in the queue (already running, already finished, unknown session)
+   *  — the caller should treat that as a harmless no-op, not an error. */
+  sendNow(sessionId: string, userMsgId: string): boolean {
+    const s = this.sessions.get(sessionId)
+    if (!s) return false
+    const idx = s.queue.findIndex((t) => t.userMsgId === userMsgId)
+    if (idx === -1) return false
+    const [turn] = s.queue.splice(idx, 1)
+    s.queue.unshift(turn)
+    this.emitQueue(sessionId)
+    s.active?.ac.abort()
+    return true
   }
 
   /**

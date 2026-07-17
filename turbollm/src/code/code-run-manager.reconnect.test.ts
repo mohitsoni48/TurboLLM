@@ -180,11 +180,11 @@ test('a queued follow-up survives a mid-run disconnect and runs in order server-
   const u2 = store.addMessage(convId, 'user', 'second')
   const r2 = mgr.enqueue(sessionId, { convId, repoRoot, task: 'second', userMsgId: u2.id })
   assert.equal(r2.queued, true, 'the follow-up queued behind the active turn')
-  assert.deepEqual(mgr.queued(sessionId), ['second'], 'server-side queue holds the follow-up')
+  assert.deepEqual(mgr.queued(sessionId), [{ userMsgId: u2.id, task: 'second' }], 'server-side queue holds the follow-up')
 
   // DISCONNECT mid-run. The queue is server-side, so it must survive.
   sub1.close()
-  assert.deepEqual(mgr.queued(sessionId), ['second'], 'queue survived the client disconnect')
+  assert.deepEqual(mgr.queued(sessionId), [{ userMsgId: u2.id, task: 'second' }], 'queue survived the client disconnect')
 
   // Reconnect and watch everything to the end.
   const sub2 = mgr.subscribe(sessionId, 0)
@@ -203,6 +203,61 @@ test('a queued follow-up survives a mid-run disconnect and runs in order server-
   assert.equal(mgr.isActive(sessionId), false, 'session idle after both turns')
 })
 
+// ── sendNow() promotes one queued turn without dropping the rest ───────────────────────
+
+test('sendNow() stops the active turn and promotes the target queued turn, keeping the rest queued', async () => {
+  const { d, store } = makeDeps()
+  const runner: CodeSessionRunner = (params) => {
+    const marker = params.task === 'first' ? 'r1' : params.task === 'second' ? 'r2' : 'r3'
+    return pacedRunner(marker)(params)
+  }
+  const mgr = new CodeRunManager(d, { runner })
+  const repoRoot = tmp('tllm-code-repo-')
+  const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'first')
+
+  // Turn 1 active; queue turns 2 and 3 behind it, in that order.
+  mgr.enqueue(sessionId, { convId, repoRoot, task: 'first', userMsgId })
+  const sub1 = mgr.subscribe(sessionId, 0)
+  await collect(sub1, (ev) => ev.event === 'tool_call')
+  const u2 = store.addMessage(convId, 'user', 'second')
+  mgr.enqueue(sessionId, { convId, repoRoot, task: 'second', userMsgId: u2.id })
+  const u3 = store.addMessage(convId, 'user', 'third')
+  mgr.enqueue(sessionId, { convId, repoRoot, task: 'third', userMsgId: u3.id })
+  assert.deepEqual(mgr.queued(sessionId).map((t) => t.task), ['second', 'third'], 'FIFO order before sendNow')
+
+  // "Send now" on the THIRD turn — must stop turn 1 AND move turn 3 to the FRONT, without
+  // dropping turn 2 (a naive stop()-then-requeue would either drop turn 2 or run turn 2 first).
+  const ok = mgr.sendNow(sessionId, u3.id)
+  assert.equal(ok, true)
+  assert.deepEqual(mgr.queued(sessionId).map((t) => t.task), ['third', 'second'], 'target promoted to front, the rest survives')
+
+  sub1.close()
+  const all = await collect(mgr.subscribe(sessionId, 0), () => false)
+  assert.equal(all.ended, true)
+
+  // Turn 1 aborted (no file). Turn 3 ran BEFORE turn 2 (promoted), and turn 2 still ran after.
+  assert.equal(existsSync(join(repoRoot, 'r1.txt')), false, 'turn 1 was stopped before finishing')
+  assert.equal(existsSync(join(repoRoot, 'r2.txt')), true, 'turn 2 (demoted) still ran eventually')
+  assert.equal(existsSync(join(repoRoot, 'r3.txt')), true, 'turn 3 (promoted) ran')
+  assert.equal(mgr.queued(sessionId).length, 0, 'queue drained')
+  assert.equal(mgr.isActive(sessionId), false)
+})
+
+test('sendNow() on an unknown/already-run userMsgId is a harmless no-op', async () => {
+  const { d, store } = makeDeps()
+  const mgr = new CodeRunManager(d, { runner: pacedRunner('delta') })
+  const repoRoot = tmp('tllm-code-repo-')
+  const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'do delta')
+  mgr.enqueue(sessionId, { convId, repoRoot, task: 'do delta', userMsgId })
+
+  assert.equal(mgr.sendNow(sessionId, 'not-a-real-id'), false, 'unknown userMsgId returns false')
+  assert.equal(mgr.sendNow('not-a-real-session', userMsgId), false, 'unknown session returns false')
+  assert.equal(mgr.isActive(sessionId), true, 'the real active turn was untouched by either no-op call')
+
+  await collect(mgr.subscribe(sessionId, 0), () => false)
+  assert.equal(existsSync(join(repoRoot, 'delta.txt')), true, 'the active turn completed normally')
+})
+
 // ── stop() aborts the active run AND clears the queue ─────────────────────────────────
 
 test('stop() aborts the active run and drops everything queued behind it', async () => {
@@ -214,7 +269,7 @@ test('stop() aborts the active run and drops everything queued behind it', async
   mgr.enqueue(sessionId, { convId, repoRoot, task: 'do gamma', userMsgId })
   const u2 = store.addMessage(convId, 'user', 'queued one')
   mgr.enqueue(sessionId, { convId, repoRoot, task: 'queued one', userMsgId: u2.id })
-  assert.deepEqual(mgr.queued(sessionId), ['queued one'])
+  assert.deepEqual(mgr.queued(sessionId), [{ userMsgId: u2.id, task: 'queued one' }])
 
   const sub1 = mgr.subscribe(sessionId, 0)
   await collect(sub1, (ev) => ev.event === 'tool_call') // early return closes sub1 (a disconnect)
@@ -280,6 +335,36 @@ test('an aborted turn that reports a HIGHER ctxUsed than before is trusted as-is
 
   const last = store.getConversation(convId, true)?.messages?.findLast((m) => m.role === 'assistant')
   assert.equal(last?.stats.ctxUsed, 9000, 'a real higher value is trusted, not clamped')
+})
+
+// ── a manual rename survives a later successful turn (founder-reported gap, 2026-07-14) ─
+
+test('a manual session rename is not reverted by a later successful turn\'s auto-title mirror', async () => {
+  const { d, store } = makeDeps()
+  const repoRoot = tmp('tllm-code-repo-')
+  const okRunner: CodeSessionRunner = (async () => ({ finalText: 'ok', contextUsed: 100, contextMax: 8192, aborted: false })) as CodeSessionRunner
+  const mgr = new CodeRunManager(d, { runner: okRunner })
+  const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'first')
+
+  // Simulate an already-generated conversation title (bypasses needing to mock the real
+  // title-generation completions call — autoTitleFromConversation's own guard short-circuits
+  // once conv.title isn't 'New chat', exactly as it would after a real generation).
+  store.updateConversation(convId, { title: 'Auto Generated Title' })
+
+  // Turn 1: the mirror fires for the first time — agent_runs.title picks up the generated name.
+  mgr.enqueue(sessionId, { convId, repoRoot, task: 'first', userMsgId })
+  await collect(mgr.subscribe(sessionId, 0), () => false)
+  assert.equal(store.getAgentRun(sessionId)?.title, 'Auto Generated Title')
+  assert.equal(store.getAgentRun(sessionId)?.titleAutoSynced, true, 'mirror marks itself synced after the first successful turn')
+
+  // The user renames the session (PATCH .../title route, mirrored here directly).
+  store.updateAgentRun(sessionId, { title: 'My Custom Name' })
+
+  // Turn 2: a second successful turn must NOT re-mirror conversations.title over the rename.
+  const u2 = store.addMessage(convId, 'user', 'second')
+  mgr.enqueue(sessionId, { convId, repoRoot, task: 'second', userMsgId: u2.id })
+  await collect(mgr.subscribe(sessionId, 0), () => false)
+  assert.equal(store.getAgentRun(sessionId)?.title, 'My Custom Name', 'manual rename survives a later completed turn')
 })
 
 test('a runner that THROWS AbortError also floors ctxUsed at the last confirmed value', async () => {
