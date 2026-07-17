@@ -139,7 +139,7 @@ function CodeSessionItem({
       {/* Hover reveal: diff stats + actions menu + open affordance — same interaction
           language as ConvItem's hover-revealed folder-move/rename buttons. */}
       {!rename.editing && (
-        <div className="absolute right-1.5 top-1/2 flex -translate-y-1/2 items-center gap-1.5 opacity-0 transition-opacity group-hover:opacity-100">
+        <div className="hover-actions absolute right-1.5 top-1/2 flex -translate-y-1/2 items-center gap-1.5">
           {session.status !== 'aborted' && (session.add > 0 || session.del > 0) && (
             <span className="rounded bg-panel-2 px-1 py-0.5 font-mono text-[10px] tabular-nums">
               <span style={{ color: 'var(--ok)' }}>+{session.add}</span>{' '}
@@ -930,7 +930,7 @@ function ConvItem({
       )}
       <span className="text-[11px] text-faint">{relTime(conv.updatedAt)}</span>
       {!editing && (
-        <div className="absolute right-1.5 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+        <div className="hover-actions absolute right-1.5 top-1/2 flex -translate-y-1/2 items-center gap-0.5">
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <button

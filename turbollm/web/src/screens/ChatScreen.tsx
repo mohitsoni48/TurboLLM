@@ -631,7 +631,10 @@ export function ChatScreen() {
           systemPrompt: finalSystemPrompt || undefined,
           toolPolicy: selectedPersonaId === 'research' ? 'force_web_search' : undefined,
           skillIds: initialSkillIds.length ? initialSkillIds : undefined,
-          allowedTools: resolved?.tools?.length ? resolved.tools : undefined,
+          // Pass an explicit empty array through as-is (e.g. Blank's fixed []) — collapsing it
+          // to undefined here would silently turn "zero tools" back into "unrestricted" before
+          // the request ever reaches the backend (GitHub #52).
+          allowedTools: resolved?.tools,
           sampling: Object.keys(pendingSampling).length ? pendingSampling : undefined,
           preserveThinking: pendingPreserveThinking,
         })

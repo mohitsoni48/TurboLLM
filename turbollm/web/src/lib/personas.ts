@@ -5,6 +5,11 @@ export interface Persona {
   name: string
   description: string
   systemPrompt: string
+  /** Fixed tool allow-list for a built-in whose definition REQUIRES a specific tool set,
+   *  independent of any user override — currently only 'blank' (empty array: raw model output
+   *  means no tool-calling instructions either, not just an empty system prompt). Absent for
+   *  every other built-in, which stays unrestricted by default (see resolveAgents). */
+  tools?: string[]
 }
 
 const MAX_INJECTED_MEMORY_FACTS = 50
@@ -244,6 +249,10 @@ export const PERSONAS: readonly Persona[] = [
     name: 'Blank',
     description: 'Zero system prompt — raw model output, no instructions injected',
     systemPrompt: '',
+    // "No instructions injected" must also mean no tool-calling preamble — many chat templates
+    // render one whenever ANY tools are offered, regardless of the (blank) system prompt text
+    // (GitHub #52: "the model still is being fed tool instructions even in the blank template").
+    tools: [],
   },
   {
     id: 'concise',
@@ -468,7 +477,9 @@ export function resolveAgents(customAgents: MinimalCustomAgent[], overrides: Rec
       builtin: true,
       overridden: !!o,
       skillIds: o?.skillIds,
-      tools: o?.tools,
+      // Override wins when present (even an explicit []); otherwise fall through to the
+      // built-in's OWN fixed tools (e.g. Blank's []), not straight to undefined/unrestricted.
+      tools: o?.tools ?? p.tools,
     }
   })
   const customs: ResolvedAgent[] = customAgents.map((a) => ({ ...a, builtin: false }))

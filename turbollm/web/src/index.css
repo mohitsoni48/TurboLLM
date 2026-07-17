@@ -149,6 +149,26 @@ body {
   animation: tllm-pulse 1.2s ease-in-out infinite;
 }
 
+/* Hover-reveal row actions (message copy/edit/regenerate/delete, conversation rename/delete,
+   Code transcript step actions): hidden until `.group:hover` on a device that actually HAS hover
+   (a mouse) — but on a touchscreen there's no hover state to ever trigger, so these stayed
+   permanently invisible and the buttons were completely unreachable (GitHub #52: "in a phone,
+   it is impossible to edit, delete, or copy any messages"). `(hover: none)` covers touch input;
+   `(pointer: coarse)` also catches devices that technically report hover but whose primary
+   input is imprecise (some hybrid tablets). */
+.hover-actions {
+  opacity: 0;
+  transition: opacity 150ms;
+}
+.group:hover .hover-actions {
+  opacity: 1;
+}
+@media (hover: none), (pointer: coarse) {
+  .hover-actions {
+    opacity: 1;
+  }
+}
+
 /* Code transcript entries: a quiet fade + slight rise on arrival, one-shot (not looping like
    tllm-pulse above) — new rail entries used to just pop in instantly. */
 @keyframes tllm-rise-in {

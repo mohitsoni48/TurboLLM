@@ -439,7 +439,7 @@ function CodeInstructionEntry({
         </div>
       )}
       <p className="whitespace-pre-wrap text-[14px] leading-relaxed text-ink">{content}</p>
-      <div className="mt-1 flex items-center justify-end gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+      <div className="hover-actions mt-1 flex items-center justify-end gap-0.5">
         <CopyButton text={content} size={12} />
         {onRevert && (
           <button
@@ -495,7 +495,7 @@ function CodeCommentary({ content, streaming }: { content: string; streaming?: b
         <Markdown streaming={streaming}>{content}</Markdown>
       </div>
       {!streaming && (
-        <div className="opacity-0 transition-opacity group-hover:opacity-100">
+        <div className="hover-actions">
           <CopyButton text={content} size={12} />
         </div>
       )}
