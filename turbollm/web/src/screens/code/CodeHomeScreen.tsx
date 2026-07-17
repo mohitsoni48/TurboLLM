@@ -5,7 +5,7 @@ import { Button } from '../../components/ui/button'
 import { toast } from '../../components/ui/sonner'
 import { getPersonalization } from '../../lib/personas'
 import { useIsDesktop } from '../../lib/useIsDesktop'
-import { cn } from '../../lib/utils'
+import { cn, formatDiff } from '../../lib/utils'
 import { ApiError } from '../../lib/api'
 import { useGitBranch, useModelActions, useModels, useStatus } from '../../lib/queries'
 import { createCodeSession } from '../../lib/code-api'
@@ -120,17 +120,6 @@ function StatTile({ label, value, loading }: { label: string; value: string; loa
         : <div className="mt-1 truncate text-[20px] font-semibold tracking-[-0.01em] text-ink tabular-nums">{value}</div>}
     </div>
   )
-}
-
-/** "+1234 −567" — matches the sidebar's own per-session diff-stat chip style. Omits a zero
- *  side entirely rather than printing "+0" for a diff that only ever removed (or only ever
- *  added) lines. "—" when there's genuinely no diff activity at all yet. */
-function formatDiff(added: number, removed: number): string {
-  if (added === 0 && removed === 0) return '—'
-  const parts: string[] = []
-  if (added > 0) parts.push(`+${added.toLocaleString()}`)
-  if (removed > 0) parts.push(`−${removed.toLocaleString()}`)
-  return parts.join(' ')
 }
 
 export function CodeHomeScreen() {

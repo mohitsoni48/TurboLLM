@@ -373,6 +373,16 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
     return c.json({ ok: true })
   })
 
+  // ── "Send now" on a queued follow-up: stop the active turn, promote this one to run next ──
+  // Unlike /stop, this does NOT drop the rest of the queue — see CodeRunManager.sendNow's own
+  // comment for why a naive stop-then-requeue can't do this atomically with 2+ queued turns.
+  app.post('/api/v1/code/sessions/:id/queue/:userMsgId/send-now', (c) => {
+    const id = c.req.param('id')
+    const userMsgId = c.req.param('userMsgId')
+    const ok = runs.sendNow(id, userMsgId)
+    return c.json({ ok })
+  })
+
   // ── start / queue a turn (daemon-owned; returns JSON, NOT a stream) ────────────
   // This ONLY starts (or queues) the run in CodeRunManager and returns immediately. The event
   // stream is fetched separately via GET /stream, so the run's lifetime is decoupled from any

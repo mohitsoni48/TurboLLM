@@ -144,6 +144,12 @@ export interface AgentRun {
    *  hides messages at/before this point too, with a banner offering /resume to un-hide them —
    *  the underlying messages are never deleted, so resuming restores them exactly. */
   clearedUpToMessageId?: string
+  // ── Manual-rename persistence (v32) ─────────────────────────────────────────────────────
+  /** True once the auto-generated title has been mirrored from conversations.title onto this
+   *  run's own title exactly once (code-run-manager.ts's pump()) — gates that mirror to fire
+   *  only at the session's first successful turn, never again, so a later manual rename of the
+   *  session sticks instead of reverting on the next completed turn. */
+  titleAutoSynced?: boolean
 }
 
 /** One per-Hitman track-record row (spec 13 §12.3). */
@@ -411,7 +417,7 @@ export interface Message {
 }
 
 interface ConvRow { id: string; title: string; system_prompt: string; model_key: string; sampling: string; expert_mode: number; tool_policy: string | null; kind: string | null; folder_id: string | null; tool_overrides: string | null; agent_id: string | null; completed_at: string | null; read_scope: string | null; agent_mode: string | null; skill_ids: string | null; allowed_tools: string | null; preserve_thinking: number; created_at: string; updated_at: string }
-interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; agent_id: string | null; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null; archived_at: string | null; completion: string | null; repo_root: string | null; repo_branch: string | null; use_worktree: number | null; worktree_branch: string | null; worktree_base: string | null; lines_added: number | null; lines_removed: number | null; compaction_summary: string | null; compaction_upto_message_id: string | null; compaction_tokens_before: number | null; cleared_upto_message_id: string | null }
+interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; agent_id: string | null; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null; archived_at: string | null; completion: string | null; repo_root: string | null; repo_branch: string | null; use_worktree: number | null; worktree_branch: string | null; worktree_base: string | null; lines_added: number | null; lines_removed: number | null; compaction_summary: string | null; compaction_upto_message_id: string | null; compaction_tokens_before: number | null; cleared_upto_message_id: string | null; title_auto_synced: number | null }
 interface FolderRow { id: string; name: string; sort_order: number; created_at: string; updated_at: string }
 interface MsgRow  { id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string; reasoning: string; attachments: string; text_attachments: string | null; tool_calls: string | null; timeline: string | null; stats: string; model_key: string | null; research_meta: string | null; created_at: string; variant_group: string | null; is_active: number; branch_of: string | null; edited: number }
 
@@ -461,6 +467,7 @@ function rowToAgentRun(r: AgentRunRow): AgentRun {
     compactionUpToMessageId: r.compaction_upto_message_id ?? undefined,
     compactionTokensBefore: r.compaction_tokens_before ?? undefined,
     clearedUpToMessageId: r.cleared_upto_message_id ?? undefined,
+    titleAutoSynced: r.title_auto_synced === 1,
   }
 }
 
@@ -825,6 +832,20 @@ export class ConversationStore {
     if (v < 31) {
       if (!this.hasColumn('messages', 'timeline')) this.db.exec(`ALTER TABLE messages ADD COLUMN timeline TEXT;`)
       this.db.exec(`PRAGMA user_version = 31;`)
+    }
+    // v32 (Code, founder-reported gap 2026-07-14): a manual session rename used to silently
+    // revert on the next completed turn — code-run-manager.ts's pump() unconditionally mirrored
+    // conversations.title onto agent_runs.title after EVERY successful turn (auto-title's own
+    // regeneration guard only stops conversations.title from changing again, not the mirror
+    // re-applying that now-frozen value over a manual rename). Fix (founder-decided): the mirror
+    // should only ever run ONCE, at the session's first successful turn, never again after,
+    // regardless of any rename in between. 0/NULL = not yet synced; existing rows default to
+    // NULL (their title may already have been mirrored under the old unconditional behavior —
+    // treated as "not yet synced" is harmless, it just allows exactly one more mirror before
+    // this fix's guard takes over for good).
+    if (v < 32) {
+      if (!this.hasColumn('agent_runs', 'title_auto_synced')) this.db.exec(`ALTER TABLE agent_runs ADD COLUMN title_auto_synced INTEGER;`)
+      this.db.exec(`PRAGMA user_version = 32;`)
     }
   }
 
@@ -1389,12 +1410,12 @@ export class ConversationStore {
       const placeholders = opts.statuses.map((_, i) => `$s${i}`).join(',')
       const params: Record<string, SQLInputValue> = {}
       opts.statuses.forEach((s, i) => { params[`$s${i}`] = s })
-      return (this.db.prepare(`SELECT * FROM agent_runs WHERE status IN (${placeholders}) ORDER BY created_at DESC LIMIT 200`).all(params) as unknown as AgentRunRow[]).map(rowToAgentRun)
+      return (this.db.prepare(`SELECT * FROM agent_runs WHERE status IN (${placeholders}) ORDER BY updated_at DESC LIMIT 200`).all(params) as unknown as AgentRunRow[]).map(rowToAgentRun)
     }
-    return (this.db.prepare(`SELECT * FROM agent_runs ORDER BY created_at DESC LIMIT 200`).all() as unknown as AgentRunRow[]).map(rowToAgentRun)
+    return (this.db.prepare(`SELECT * FROM agent_runs ORDER BY updated_at DESC LIMIT 200`).all() as unknown as AgentRunRow[]).map(rowToAgentRun)
   }
 
-  updateAgentRun(id: string, patch: Partial<Pick<AgentRun, 'status' | 'error' | 'startedAt' | 'endedAt' | 'title' | 'compactionSummary' | 'compactionUpToMessageId' | 'compactionTokensBefore'>>): boolean {
+  updateAgentRun(id: string, patch: Partial<Pick<AgentRun, 'status' | 'error' | 'startedAt' | 'endedAt' | 'title' | 'compactionSummary' | 'compactionUpToMessageId' | 'compactionTokensBefore' | 'titleAutoSynced'>>): boolean {
     const now = new Date().toISOString()
     const sets: string[] = ['updated_at = $now']
     const params: Record<string, SQLInputValue> = { $id: id, $now: now }
@@ -1406,6 +1427,7 @@ export class ConversationStore {
     if (patch.compactionSummary        !== undefined) { sets.push('compaction_summary = $csum');    params.$csum = patch.compactionSummary }
     if (patch.compactionUpToMessageId  !== undefined) { sets.push('compaction_upto_message_id = $cupto'); params.$cupto = patch.compactionUpToMessageId }
     if (patch.compactionTokensBefore   !== undefined) { sets.push('compaction_tokens_before = $ctok'); params.$ctok = patch.compactionTokensBefore }
+    if (patch.titleAutoSynced          !== undefined) { sets.push('title_auto_synced = $tas'); params.$tas = patch.titleAutoSynced ? 1 : 0 }
     return ((this.db.prepare(`UPDATE agent_runs SET ${sets.join(', ')} WHERE id = $id`).run(params) as unknown) as Changes).changes > 0
   }
 

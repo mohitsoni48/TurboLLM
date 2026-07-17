@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { ArrowDown, Clock, Eraser, FolderOpen, GitBranch, PanelLeft, Pencil, RotateCcw } from 'lucide-react'
+import { ArrowDown, Clock, Diff, Eraser, FolderOpen, GitBranch, PanelLeft, Pencil, RotateCcw, SendHorizontal } from 'lucide-react'
 import { ApiError } from '../../lib/api'
 import { skillKeys, fetchSkills } from '../../lib/agent-api'
 import { useModelActions, useModels, useStatus } from '../../lib/queries'
-import { compactCodeSession, revertCodeSession, startCodeRun, streamCodeSession, stopCodeSession } from '../../lib/code-api'
+import { compactCodeSession, revertCodeSession, sendCodeQueuedTurnNow, startCodeRun, streamCodeSession, stopCodeSession } from '../../lib/code-api'
+import type { QueuedTurn } from '../../lib/code-types'
 import {
   codeKeys, useClearCodeSession, useCodeSession, useCodeSessionRename, useResumeCodeSession,
   useUpdateCodeSessionMode,
@@ -19,7 +20,7 @@ import {
 } from '../../components/ui/alert-dialog'
 import { toast } from '../../components/ui/sonner'
 import { useIsDesktop } from '../../lib/useIsDesktop'
-import { cn, folderName, writeLastCodeSessionId } from '../../lib/utils'
+import { cn, folderName, formatDiff, writeLastCodeSessionId } from '../../lib/utils'
 import { ToolApprovalBar } from '../chat/ToolApprovalBar'
 import { ConversationSidebar } from '../chat/ConversationSidebar'
 import { readSavedSidebarWidth, SIDEBAR_MIN_W, sidebarMaxW, SidebarResizeHandle } from '../chat/SidebarResizeHandle'
@@ -34,6 +35,10 @@ interface LiveState {
   content: string
   reasoning: string
   timeline: LiveBlock[]
+  /** True between a 'compaction' SSE event's start and end phases — pi's own AUTO-compaction
+   *  silently summarizing history mid-turn (distinct from the manual /compact command). Drives
+   *  CodeThinking's "Compacting conversation…" state instead of a blank/generic gap. */
+  compacting?: boolean
 }
 
 /** Apply `fn` to the current live block, creating one (anchored to `fallbackId`) if none exists
@@ -172,7 +177,7 @@ export function CodeSessionScreen() {
   // the daemon — `queue` SSE frames while streaming, plus the session detail on load — NOT
   // browser memory, so queued follow-ups survive a disconnect/reload and still fire in order
   // server-side. (Previously this was a client-only array that was lost on navigation.)
-  const [queued, setQueued] = useState<string[]>([])
+  const [queued, setQueued] = useState<QueuedTurn[]>([])
   // The GET /stream subscription. Aborting it only DETACHES this client from the run — the
   // daemon keeps executing it — so it never stops the run. One active stream per mounted session.
   const streamAbortRef = useRef<AbortController | null>(null)
@@ -243,6 +248,9 @@ export function CodeSessionScreen() {
             void qc.invalidateQueries({ queryKey: codeKeys.detail(sessionId) })
           } else if (evt.event === 'queue') {
             setQueued(evt.data.queued)
+          } else if (evt.event === 'compaction') {
+            const compacting = evt.data.phase === 'start'
+            setLive((l) => reduceLive(l, activeAssistantIdRef.current, (b) => ({ ...b, compacting })))
           } else if (evt.event === 'reasoning') {
             const delta = evt.data.delta
             setLive((l) => reduceLive(l, activeAssistantIdRef.current, (b) => ({ ...b, reasoning: b.reasoning + delta })))
@@ -472,6 +480,15 @@ export function CodeSessionScreen() {
     await stopCodeSession(sessionId).catch(() => {})
   }
 
+  // "Send now" on a queued chip: stops the active turn and promotes this one to run next,
+  // WITHOUT dropping the rest of the queue (unlike handleStop above). No optimistic setQueued
+  // here — the reordered queue comes back as a fresh `queue` SSE frame moments later, and
+  // guessing the reorder client-side risks a flash of the wrong order if it doesn't match.
+  const handleSendNow = async (userMsgId: string) => {
+    if (!sessionId) return
+    await sendCodeQueuedTurnNow(sessionId, userMsgId).catch(() => {})
+  }
+
   // At most one tool call awaits interactive approval at a time (ask mode's gate is
   // sequential — same invariant ChatScreen relies on).
   const pendingApprovalBlock = live?.timeline.find((b) => b.kind === 'tool' && b.call.status === 'awaiting_approval')
@@ -612,6 +629,12 @@ export function CodeSessionScreen() {
                   <span className="max-w-[70px] truncate md:max-w-none">{session.branch}</span>
                 </span>
               )}
+              {(session.add > 0 || session.del > 0) && (
+                <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-border px-2 py-0.5 text-[11px] text-muted">
+                  <Diff size={11} className="shrink-0" />
+                  <span className="max-w-[70px] truncate md:max-w-none">{formatDiff(session.add, session.del)}</span>
+                </span>
+              )}
             </>
           )}
         </div>
@@ -650,7 +673,7 @@ export function CodeSessionScreen() {
               <CodeTranscript
                 messages={transcriptMessages}
                 liveAssistantId={live?.assistantId}
-                live={live ? { timeline: live.timeline, reasoning: live.reasoning } : null}
+                live={live ? { timeline: live.timeline, reasoning: live.reasoning, compacting: live.compacting } : null}
                 onRevert={live || queued.length > 0 ? undefined : openRevertConfirm}
               />
             )}
@@ -680,12 +703,21 @@ export function CodeSessionScreen() {
               <span className="inline-flex items-center gap-1 text-[11px] font-medium text-muted">
                 <Clock size={11} className="text-faint" /> Queued
               </span>
-              {queued.map((q, i) => (
+              {queued.map((q) => (
                 <span
-                  key={i}
-                  className="inline-flex max-w-[240px] items-center gap-1 rounded-full border border-border bg-panel-2 px-2.5 py-1 text-[12px] text-muted"
+                  key={q.userMsgId}
+                  className="inline-flex max-w-[280px] items-center gap-1 rounded-full border border-border bg-panel-2 py-1 pr-1 pl-2.5 text-[12px] text-muted"
                 >
-                  <span className="min-w-0 truncate" title={q}>{q}</span>
+                  <span className="min-w-0 truncate" title={q.task}>{q.task}</span>
+                  <button
+                    type="button"
+                    onClick={() => void handleSendNow(q.userMsgId)}
+                    title="Send now — stop the current run and run this one next"
+                    aria-label="Send now"
+                    className="grid h-5 w-5 shrink-0 place-items-center rounded-full text-faint transition-colors hover:bg-panel hover:text-ink"
+                  >
+                    <SendHorizontal size={11} />
+                  </button>
                 </span>
               ))}
             </div>
@@ -724,7 +756,9 @@ export function CodeSessionScreen() {
               ...(skillsQ.data ?? []).map((s) => ({ id: s.id, description: s.description })),
             ]}
             hintText={live
-              ? (queued.length ? `${queued.length} queued · Enter to queue another` : 'Running — Enter to queue a follow-up')
+              ? (live.compacting
+                  ? 'Compacting conversation…'
+                  : queued.length ? `${queued.length} queued · Enter to queue another` : 'Running — Enter to queue a follow-up')
               : 'Enter to send · Shift+Enter for newline'}
           />
         </div>

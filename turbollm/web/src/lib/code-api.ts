@@ -1,7 +1,7 @@
 // Code launchpad API client — mirrors chat-api.ts's conventions (req() helper, the
 // hand-rolled SSE line parser) against turbollm/src/code/code-routes.ts.
 import type { Conversation } from './chat-types'
-import type { CodeSession, CodeSessionFilter, CodeStats, CodeStatsRange, CodeStreamEvent, CreateCodeSessionParams } from './code-types'
+import type { CodeSession, CodeSessionFilter, CodeStats, CodeStatsRange, CodeStreamEvent, CreateCodeSessionParams, QueuedTurn } from './code-types'
 import { ApiError, authHeaders } from './api'
 import { markCodeAuthNeeded, clearCodeAuthNeeded } from './auth-signal'
 
@@ -83,9 +83,9 @@ export interface CodeSessionDetail {
   /** True when a run is live in the daemon right now — the frontend reconnects the stream when
    *  this is set on load, instead of assuming a fresh page has nothing in flight. */
   running: boolean
-  /** Tasks waiting behind the active turn (server-side queue) — restores the "Queued" chips
+  /** Turns waiting behind the active one (server-side queue) — restores the "Queued" chips
    *  after a reload/reconnect. */
-  queued: string[]
+  queued: QueuedTurn[]
 }
 export function getCodeSession(id: string): Promise<CodeSessionDetail> {
   return req(`/api/v1/code/sessions/${encodeURIComponent(id)}`)
@@ -93,6 +93,12 @@ export function getCodeSession(id: string): Promise<CodeSessionDetail> {
 
 export function stopCodeSession(id: string): Promise<{ ok: true }> {
   return req(`/api/v1/code/sessions/${encodeURIComponent(id)}/stop`, { method: 'POST', json: {} })
+}
+
+/** "Send now" on a queued follow-up chip: stops the active turn and promotes this specific
+ *  queued turn to run next, keeping the rest of the queue intact (see CodeRunManager.sendNow). */
+export function sendCodeQueuedTurnNow(id: string, userMsgId: string): Promise<{ ok: boolean }> {
+  return req(`/api/v1/code/sessions/${encodeURIComponent(id)}/queue/${encodeURIComponent(userMsgId)}/send-now`, { method: 'POST', json: {} })
 }
 
 /** Changes a session's mode (auto/plan/ask) for its NEXT run — the mode picker is

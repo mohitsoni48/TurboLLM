@@ -92,6 +92,16 @@ export function useCodeSession(id: string | null) {
     // some unrelated action happens to fail with a 404. Refetching on focus catches it as soon
     // as the user comes back to this tab, before they try to act on a session that's gone.
     refetchOnWindowFocus: true,
+    // Multi-device/multi-tab live sync (founder-reported gap, 2026-07-15): the multi-subscriber
+    // SSE infrastructure (CodeRunManager's RingBuffer+EventEmitter) already fans out correctly to
+    // any client that calls connect() — the gap was that a PASSIVE second device/tab (one that
+    // didn't start the run) never learned `running` flipped to true, since this query never
+    // polled: CodeSessionScreen.tsx only calls connect() from a useEffect keyed on
+    // detailQ.data?.running changing, and refetchOnWindowFocus alone only catches it on
+    // blur/refocus, never on a second monitor / never-blurred tab. Plain polling, matching the
+    // cadence useCodeSessions already uses for the sidebar list.
+    refetchInterval: 6000,
+    refetchIntervalInBackground: false,
   })
 }
 
