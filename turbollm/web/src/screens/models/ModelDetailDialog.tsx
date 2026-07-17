@@ -1,5 +1,4 @@
 ﻿import { useEffect, useMemo, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
-import { useQueryClient } from '@tanstack/react-query'
 import { ChevronDown, ExternalLink, Gauge, RotateCcw, Save, X, Zap } from 'lucide-react'
 import { ApiError } from '../../lib/api'
 import { useBenchActions, useBenchState, useEngines, useModelActions, useModelDetail, useStatus } from '../../lib/queries'
@@ -65,7 +64,6 @@ export function ModelDetailDialog({
   const [draft, setDraft] = useState<LoadProfile | null>(null)
   const [advanced, setAdvanced] = useState(false)
   const [remember, setRemember] = useState(true)
-  const qc = useQueryClient()
 
   const detail = detailQ.data
   const statusQ = useStatus()
@@ -188,12 +186,13 @@ export function ModelDetailDialog({
     bench.save.mutate(undefined, {
       onSuccess: () => {
         toast.success('Tuned settings saved')
-        // Refetch ONLY here — right after an actual save — so the form reflects the new
-        // settings immediately (no close/reopen needed). ADR-221: this used to fire on every
-        // `benchDone` (completion OR cancel), refetching stale server data over the user's
-        // still-unsaved local draft before they'd even decided Save vs. Cancel — the real
-        // cause of the original "my config was gone" report.
-        if (detail?.key) void qc.invalidateQueries({ queryKey: ['model', detail.key] })
+        // No explicit invalidateQueries needed here — `bench.save`'s own mutation hook
+        // (useBenchActions, queries.ts) already invalidates the `['model']` prefix on success,
+        // which covers this detail query and runs independent of this component's lifecycle.
+        // ADR-221: the bug was a `benchDone`-keyed effect that refetched on EVERY completion
+        // (cancel included), clobbering unsaved local edits before the user had even decided
+        // Save vs. Cancel — that effect is deleted; a real save is the only thing that should
+        // ever trigger a refetch, and the existing hook-level invalidation already does that.
         if (downloadLog) {
           const a = document.createElement('a')
           a.href = '/api/v1/bench/log'
