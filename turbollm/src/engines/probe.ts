@@ -99,8 +99,7 @@ export async function probe(bin: string): Promise<ProbeResult> {
   if (!version) version = 'unknown'
 
   const flags = extractFlags(h.out)
-  const kvTypes = flags.includes('--cache-type-k') ? [...KNOWN_KV] : ['f16']
-  if (combined.toLowerCase().includes('turbo')) kvTypes.push('turbo2', 'turbo3', 'turbo4')
+  const kvTypes = detectKvTypes(h.out, flags.includes('--cache-type-k'))
 
   // Capture the accepted `--spec-type` enum values (e.g. `none,draft-mtp,nextn`)
   // as `spec-type:<value>` pseudo-flags. The enum differs by engine — official
@@ -169,6 +168,25 @@ export function extractFlags(helpText: string): string[] {
     for (const f of line.match(RE_FLAG) ?? []) flagSet.add(f)
   }
   return [...flagSet].sort()
+}
+
+/** Detect which KV-cache types --cache-type-k actually accepts, from that flag's OWN help
+ *  block — not a blind "does 'turbo' appear anywhere in --help" search across the whole output
+ *  (a real false-positive bug: an unrelated engine — e.g. ik_llama.cpp — can mention "turbo"
+ *  somewhere in its help text with no connection to KV cache types, and used to get turbo2/3/4
+ *  added to its capabilities, which either silently degrades in `profileToArgs`'s `kvOk` gate or
+ *  can leak an unsupported --cache-type-k value into a launch on an engine that doesn't
+ *  understand it). `\s+\S+\b` right after the flag (not `-`) excludes the -draft/-first/-last
+ *  sibling flags, whose text is unrelated to the main K-cache type enum. Split out for direct
+ *  testing — confirmed against the TurboQuant fork's real --help output ("allowed values: ...
+ *  turbo2, turbo3, turbo4") and ik_llama.cpp's (no such list near --cache-type-k at all). */
+export function detectKvTypes(helpText: string, hasCacheTypeFlag: boolean): string[] {
+  const kvTypes = hasCacheTypeFlag ? [...KNOWN_KV] : ['f16']
+  const kvFlagBlock = /--cache-type-k\s+\S+\b([\s\S]{0,400}?)(?=\n\s*\(default|\n\s{2,}-[a-zA-Z]|\n\n|$)/i.exec(helpText)
+  if (kvFlagBlock) {
+    for (const t of ['turbo2', 'turbo3', 'turbo4']) if (kvFlagBlock[1].includes(t) && !kvTypes.includes(t)) kvTypes.push(t)
+  }
+  return kvTypes
 }
 
 function firstNonEmptyLine(s: string): string {

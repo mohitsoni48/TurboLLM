@@ -166,6 +166,13 @@ export function ModelDetailDialog({
   // stop it first, then start the sweep once the engine has settled.
   const startBenchRun = () => {
     if (!detail) return
+    // Persist the current draft FIRST, before anything else (ADR-220). The draft only ever
+    // lives in this component's local state — sending it as `base` tells auto-tune to start
+    // its search from these settings, but doesn't save them. If the user cancels the run or
+    // doesn't click Save on the results dialog, their own manual edits were gone with no way
+    // back (a real founder-reported data-loss report). Save it exactly like the "Save without
+    // reloading" button would, so it's recoverable regardless of what auto-tune does next.
+    if (draft) actions.save.mutate({ key: detail.key, profile: draft, engineId: activeEngine?.id ?? '*' })
     if (detail.loaded) {
       // Stop the engine; the effect above starts the sweep once it reports stopped.
       setPendingBenchKey(detail.key)
@@ -697,6 +704,7 @@ function AutoTuneResultDialog({
     vramMb: number | null
     sampling?: CardSampling
     recommendedSampling?: CardSampling
+    kvAdvisory?: string
   }
   modelName?: string
   onSave: (downloadLog: boolean) => void
@@ -753,6 +761,10 @@ function AutoTuneResultDialog({
                   {result.vramMb != null && <ConfigRow label="VRAM used" value={`~${result.vramMb.toLocaleString()} MB`} />}
                   {result.ttftMs ? <ConfigRow label="First token" value={`${Math.round(result.ttftMs)} ms`} /> : null}
                 </div>
+              )}
+
+              {result?.kvAdvisory && (
+                <p className="text-[12px]" style={{ color: 'var(--warn)' }}>{result.kvAdvisory}</p>
               )}
 
               <span className="text-faint">

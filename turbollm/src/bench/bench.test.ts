@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { pickKvQuants, betterBySpeed, decideKvToBench, parseRocmVramUsed, benchPromptTokens, buildBenchMessages } from './bench'
+import { pickKvQuants, betterBySpeed, kvSpeedAdvisory, parseRocmVramUsed, benchPromptTokens, buildBenchMessages } from './bench'
 
 // ---- pickKvQuants: quality-preserving KV sweep, base-first ------------------
 
@@ -64,34 +64,30 @@ test('betterBySpeed: null / zero handling', () => {
   assert.equal(betterBySpeed({ tps: null, prefillTps: null }, { tps: null, prefillTps: null }), false)
 })
 
-// ---- decideKvToBench: VRAM-reasoned KV pruning (the fast path) ---------------
+// ---- kvSpeedAdvisory: ADR-219 — auto-tune no longer picks the KV type, just notes when a
+// nominally-smaller one is available and the result is slow --------------------------------
 
-const TURBO = ['f16', 'q8_0', 'turbo4'] // TurboQuant fork
-const STOCK = ['f16', 'q8_0'] // official llama.cpp
-
-test('decideKvToBench: tiny KV swing → tune only the largest (f16), no sweep', () => {
-  assert.deepEqual(decideKvToBench(300, TURBO), ['f16'])
-  assert.deepEqual(decideKvToBench(1024, TURBO), ['f16']) // boundary is inclusive
-  assert.deepEqual(decideKvToBench(800, STOCK), ['f16'])
+test('kvSpeedAdvisory: fast result (>=20 tok/s) → no advisory even if a smaller type exists', () => {
+  assert.equal(kvSpeedAdvisory(25, 'turbo4', ['f16', 'q8_0', 'q4_0', 'turbo4']), null)
 })
 
-test('decideKvToBench: 35B (hybrid MoE, ~3 GB swing) → turbo4 + q8_0, picks q8_0 once measured', () => {
-  // The ~3 GB f16↔turbo4 swing puts us in the big-KV path; measurement then prefers q8_0.
-  assert.deepEqual(decideKvToBench(3186, TURBO), ['turbo4', 'q8_0'])
+test('kvSpeedAdvisory: slow result + a real nominally-smaller type available → advisory names it', () => {
+  const msg = kvSpeedAdvisory(10.4, 'turbo4', ['f16', 'q8_0', 'q4_0', 'turbo4'])
+  assert.ok(msg)
+  assert.match(msg, /turbo4/)
+  assert.match(msg, /q4_0/)
 })
 
-test('decideKvToBench: 27B / Gemma (huge KV) → turbo4 + q8_0 (measurement splits them)', () => {
-  assert.deepEqual(decideKvToBench(13000, TURBO), ['turbo4', 'q8_0'])
-  assert.deepEqual(decideKvToBench(Number.MAX_SAFE_INTEGER, TURBO), ['turbo4', 'q8_0'])
+test('kvSpeedAdvisory: slow result but already at the smallest available type → no advisory', () => {
+  assert.equal(kvSpeedAdvisory(5, 'q4_0', ['f16', 'q8_0', 'q4_0']), null)
 })
 
-test('decideKvToBench: un-sizable (spread < 0) is treated as big-KV, safely', () => {
-  assert.deepEqual(decideKvToBench(-1, TURBO), ['turbo4', 'q8_0'])
+test('kvSpeedAdvisory: unprobed engine (empty kvTypes) → no advisory, nothing to suggest', () => {
+  assert.equal(kvSpeedAdvisory(5, 'f16', []), null)
 })
 
-test('decideKvToBench: stock engine (no turbo) → just q8_0 in the big-KV regime', () => {
-  assert.deepEqual(decideKvToBench(5000, STOCK), ['q8_0'])
-  assert.deepEqual(decideKvToBench(-1, STOCK), ['q8_0'])
+test('kvSpeedAdvisory: null tps treated as 0 (slow) — still checks for a smaller type', () => {
+  assert.ok(kvSpeedAdvisory(null, 'f16', ['f16', 'q4_0']))
 })
 
 // ---- parseRocmVramUsed: AMD live VRAM reading (ADR-217 — the headroom gate was fully inert on

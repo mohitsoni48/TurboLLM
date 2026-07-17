@@ -107,6 +107,10 @@ export interface BenchState {
     /** The subset of `sampling` that came from the HF card (ADR-099), when any was found —
      *  used to mark those rows "from model card". Absent when no card / nothing parsed. */
     recommendedSampling?: CardSampling
+    /** ADR-219: a note shown (not acted on) when the winner is under 20 tok/s and the engine
+     *  supports a smaller KV-cache type than the one tuned — surfaces that a faster, lower-
+     *  quality option exists without auto-tune silently picking it. Absent otherwise. */
+    kvAdvisory?: string
   }
 }
 
@@ -152,10 +156,6 @@ const QUALITY_KV = ['f16', 'q8_0', 'turbo4']
 // Output-t/s tie band for the speed objective: when two configs are within this relative margin
 // on generation speed, the one with faster prefill wins (best prefill AND t/s, not just t/s).
 const OUTPUT_TIE = 0.05
-// If swapping the KV-cache quant from largest (f16) to smallest changes VRAM by less than this, the
-// cache is small enough that the quant barely affects how much of the model fits on the GPU — so
-// the highest-precision, fastest-kernel type (f16) is the right pick and no quant sweep is needed.
-const KV_SPREAD_MIN = 1024
 // Bytes per cached element by KV-cache type — used only to order candidates by size (largest =
 // most VRAM, smallest = least) so calibration probes the two extremes. Mirrors llama.cpp's types.
 const KV_BYTES: Record<string, number> = {
@@ -218,6 +218,17 @@ export class BenchRunner {
     if (!this.state.running) return
     this.cancelled = true
     this.abort?.abort()
+  }
+
+  /** Stop the engine — force-killed immediately when the run is cancelled (the user is actively
+   *  waiting for it to stop, ADR-220), gracefully otherwise (lets llama-server release resources
+   *  cleanly between candidates during a normal run). Every stop in this file goes through this
+   *  one chokepoint instead of calling `manager.stopAndWait()` directly, so a cancel is fast
+   *  regardless of which code path notices it first. Previously every stop used the graceful
+   *  TERM→8s-then-kill path unconditionally, so cancelling could take up to 8s per in-flight
+   *  stop — a real, reported "Cancel doesn't cancel immediately" bug. */
+  private async stopEngine(): Promise<void> {
+    await this.manager.stopAndWait({ force: this.cancelled }).catch(() => {})
   }
 
   /** Persist the finished run's winning profile (the user clicked Save). Returns false if there is
@@ -295,7 +306,7 @@ export class BenchRunner {
       // The run is fully guarded internally; this is a last-resort net so a thrown
       // error never leaves `running` stuck true.
       this.state = { running: false, modelKey, done: true, error: e instanceof Error ? e.message : String(e), candidates: this.state.candidates }
-      void this.manager.stopAndWait().catch(() => {})
+      void this.stopEngine()
     })
   }
 
@@ -340,16 +351,13 @@ export class BenchRunner {
     const results: BenchCandidate[] = []
     let best: { cand: BenchCandidate; profile: LoadProfile } | null = null
 
-    // --- Choose which KV-cache type(s) to tune, by reasoning about VRAM (not by sweeping all) ---
-    // The quant only matters in proportion to how big the KV cache actually is. Measure that cheaply:
-    // the VRAM SPREAD between the largest and smallest candidate at one shared offload is exactly
-    // their KV-size difference (weights/overhead cancel) — true for any architecture, hybrid or not.
-    //   • tiny KV (spread ≤ KV_SPREAD_MIN) → the quant barely changes the fit, so the highest-
-    //     precision/fastest-kernel type (f16) wins outright → tune just that.
-    //   • big KV → a smaller quant frees real VRAM for more of the model on the GPU, but its kernel
-    //     can be slower (turbo4), so tune BOTH the smallest (max-fit) and q8_0 (stock fallback) and
-    //     let the measured prefill + t/s decide.
-    // --- Choose the multi-GPU SPLIT strategy too, not just offload+KV (ADR-054) ---
+    // --- Choose the multi-GPU SPLIT strategy (ADR-054) — the KV-cache TYPE is no longer swept
+    // here (ADR-219): auto-tune tunes offload (ngl/nCpuMoe) on whatever KV type the user already
+    // has selected, instead of silently choosing between f16/q8_0/turbo4 itself. Founder call
+    // after live-testing showed a lower-precision type (q4_0) measurably outperforming turbo4 on
+    // deep-context real chat — that's a genuine quality/speed tradeoff the user should make
+    // explicitly, not one auto-tune should pick for them. See the KV-cache speed advisory below
+    // instead, which surfaces the option without silently taking it.
     // llama.cpp's default is an even LAYER-split across every visible GPU. But a model that fits on
     // ONE card is almost always faster there: a layer-split runs the GPUs as a sequential pipeline
     // (one busy at a time) and copies activations across PCIe every token, so on a fits-on-one model
@@ -368,34 +376,16 @@ export class BenchRunner {
         this.emit(`split strategy → ${label}`)
       }
 
-      // Decide which KV quant(s) to tune UNDER THIS split: the VRAM budget differs (one card vs the
-      // summed pool), so single-GPU may need turbo4 to fit where a layer-split is fine at f16.
-      // Default to the user's own KV type (covers CPU-only — no VRAM pressure — and unprobed/single-
-      // candidate engines). Only with a GPU and a real choice do we size the cache and decide.
-      const kvCandidates = pickKvQuants(splitBase.kvTypeK, caps.kvTypes)
-      let kvToTune = kvCandidates.slice(0, 1)
-      if (sys.gpus.length > 0 && kvCandidates.length > 1) {
-        const spread = await this.calibrateKvSpread(entry, sys, splitBase, caps, kvCandidates, results)
-        kvToTune = decideKvToBench(spread, kvCandidates)
-        const swing = spread < 0 ? 'unknown' : spread >= Number.MAX_SAFE_INTEGER ? 'huge' : `${Math.round(spread)} MB`
-        this.state = { ...this.state, step: `KV cache swing ${swing} → tuning ${kvToTune.join(' + ')}`, candidates: results }
-        this.emit(`KV spread ${swing} → tuning ${kvToTune.join(' + ')}`)
-      }
-
-      for (let i = 0; i < kvToTune.length && !this.cancelled && Date.now() <= this.deadline; i++) {
-        const kv = kvToTune[i]
-        const kvBase: LoadProfile = { ...splitBase, kvTypeK: kv, kvTypeV: kv }
-        const found = entry.moe
-          ? await this.moeSearch(entry, sys, kvBase, caps, results, headroomMb)
-          : await this.denseSearch(entry, sys, kvBase, caps, results, headroomMb)
-        if (found && (!best || betterBySpeed(found.cand, best.cand))) best = found
-        if (best) this.state = { ...this.state, bestTps: best.cand.tps ?? undefined }
-      }
+      const found = entry.moe
+        ? await this.moeSearch(entry, sys, splitBase, caps, results, headroomMb)
+        : await this.denseSearch(entry, sys, splitBase, caps, results, headroomMb)
+      if (found && (!best || betterBySpeed(found.cand, best.cand))) best = found
+      if (best) this.state = { ...this.state, bestTps: best.cand.tps ?? undefined }
     }
 
     // Engine is always left stopped at the end of a run (AC#3 for cancel; also tidy
     // for a normal finish — the user explicitly loads afterward).
-    await this.manager.stopAndWait().catch(() => {})
+    await this.stopEngine()
 
     if (best) {
       // Card-derived recommended sampling (ADR-099): read the model author's recommended
@@ -408,7 +398,7 @@ export class BenchRunner {
       let recommended: CardSampling | undefined
       if (!this.cancelled && Date.now() <= this.deadline) {
         recommended = await this.extractCardSampling(entry, best.profile, caps, sys).catch(() => undefined)
-        await this.manager.stopAndWait().catch(() => {}) // in case the LLM fallback loaded a model
+        await this.stopEngine() // in case the LLM fallback loaded a model
       }
       // A cancel DURING extraction (the LLM fallback can run for minutes) must not resurrect the
       // results dialog or re-hold a profile the user just discarded: cancel() cleared winning +
@@ -421,6 +411,10 @@ export class BenchRunner {
         recommended && hasAnySampling(recommended)
           ? { ...best.profile, sampling: { ...best.profile.sampling, ...recommended } }
           : best.profile
+      // ADR-219: note (don't auto-switch) when a smaller, faster KV-cache type is available —
+      // auto-tune no longer picks the KV type itself, so a slow result deserves a pointer to the
+      // tradeoff rather than silence.
+      const kvAdvisory = kvSpeedAdvisory(best.cand.tps, profile.kvTypeK, caps.kvTypes)
       // Hold the winner instead of auto-saving — the UI shows a Save/Cancel results dialog and
       // persists via POST /bench/save only when the user clicks Save.
       this.winning = { modelKey, profile, cand: best.cand, entry, sys, engineVersion: active?.version ?? '', engineId: active?.id ?? '' }
@@ -445,6 +439,7 @@ export class BenchRunner {
             minP: profile.sampling.minP,
           },
           ...(recommended && hasAnySampling(recommended) ? { recommendedSampling: recommended } : {}),
+          ...(kvAdvisory ? { kvAdvisory } : {}),
         },
         candidates: results,
       }
@@ -572,51 +567,6 @@ export class BenchRunner {
     return found
   }
 
-  /** Measure how much the KV-cache QUANT swings VRAM at this context — so we tune only the quant(s)
-   *  that matter instead of sweeping all. Two cheap probes (largest vs smallest candidate) at ONE
-   *  shared offload: their VRAM difference is exactly the KV-size difference (weights + overhead are
-   *  identical at the same offload), valid for any architecture. Returns that swing in MB scaled to
-   *  the full model, `Number.MAX_SAFE_INTEGER` if even the largest quant won't load (cache enormous
-   *  → definitely the big-KV regime), or -1 if it couldn't be sized at all. */
-  private async calibrateKvSpread(
-    entry: ModelEntry,
-    sys: SysInfo,
-    base: LoadProfile,
-    caps: Engine['capabilities'],
-    candidates: string[],
-    results: BenchCandidate[],
-  ): Promise<number> {
-    const big = kvLargest(candidates)
-    const small = kvSmallest(candidates)
-    if (big === small) return 0
-
-    // A shared offload where the KV is resident on the GPU (so the swing is measurable) yet the
-    // model loads even with the LARGEST cache: MoE → all experts on CPU (attention + KV stay on
-    // GPU); dense → a small fraction of layers on GPU.
-    const blocks = entry.blockCount > 0 ? entry.blockCount : 32
-    const moeMax = entry.blockCount > 0 ? entry.blockCount : deriveDefault(entry, sys).nCpuMoe || 0
-    const refNgl = Math.max(1, Math.floor(blocks / 4))
-    const refOffload: Partial<LoadProfile> = entry.moe ? { nCpuMoe: moeMax, ngl: 99 } : { ngl: refNgl }
-    const knob: 'ngl' | 'nCpuMoe' = entry.moe ? 'nCpuMoe' : 'ngl'
-    const knobVal = entry.moe ? moeMax : refNgl
-
-    this.state = { ...this.state, step: `Sizing the KV cache (${big} vs ${small})…`, candidates: results }
-    const pBig = await this.probeVram(entry, sys, { ...base, kvTypeK: big, kvTypeV: big, ...refOffload }, caps)
-    this.pushProbe(results, { ...base, kvTypeK: big, ...refOffload }, knob, knobVal, pBig)
-    await this.settleGpu(sys)
-    const pSmall = await this.probeVram(entry, sys, { ...base, kvTypeK: small, kvTypeV: small, ...refOffload }, caps)
-    this.pushProbe(results, { ...base, kvTypeK: small, ...refOffload }, knob, knobVal, pSmall)
-    await this.settleGpu(sys)
-
-    if (pBig.outcome !== 'ok' || pBig.vramAbsMb === null) return Number.MAX_SAFE_INTEGER // huge cache
-    if (pSmall.outcome !== 'ok' || pSmall.vramAbsMb === null) return -1 // couldn't size it
-    let spread = pBig.vramAbsMb - pSmall.vramAbsMb
-    // Dense: only the GPU layers' KV is resident at refNgl, so scale the partial swing up to the
-    // whole model. (MoE keeps every attention layer's KV on GPU already → no scaling.)
-    if (!entry.moe) spread = spread * (blocks / refNgl)
-    return Math.max(0, spread)
-  }
-
   /** A cheap VRAM probe (Phase 1 of a search): load the candidate, wait for readiness — by which
    *  point the weights, the full KV cache, AND the compute buffers are all allocated — read the
    *  absolute GPU VRAM in use, then stop. NO prefill, NO generation. The offload param is decided
@@ -648,7 +598,7 @@ export class BenchRunner {
       await sleep(800) // let the allocator settle so the VRAM reading is final
       vramAbsMb = await readGpuVramMb(sys)
     }
-    await this.manager.stopAndWait().catch(() => {})
+    await this.stopEngine()
     return { outcome, vramAbsMb }
   }
 
@@ -757,13 +707,13 @@ export class BenchRunner {
     // Wait for ready / detect crash / OOM within the readiness window (and per-test cap).
     const outcome = await this.awaitReady(testDeadline)
     if (outcome !== 'ok') {
-      await this.manager.stopAndWait().catch(() => {})
+      await this.stopEngine()
       return fail(outcome)
     }
 
     const target = this.manager.target()
     if (!target) {
-      await this.manager.stopAndWait().catch(() => {})
+      await this.stopEngine()
       return fail('crash')
     }
     const logPath = this.manager.logPath()
@@ -778,13 +728,13 @@ export class BenchRunner {
     phase('warming up…')
     const warm = await this.prefillProbe(target, benchMessages, remaining(), logPath, stepPrefix)
     if (warm !== 'ok') {
-      await this.manager.stopAndWait().catch(() => {})
+      await this.stopEngine()
       return fail(warm.fault)
     }
     phase('measuring t/s…')
     const measured = await this.runChatWatched(target, benchMessages, 128, remaining(), logPath)
     const vramAfter = await readGpuVramMb(sys)
-    await this.manager.stopAndWait().catch(() => {})
+    await this.stopEngine()
 
     if ('fault' in measured) return fail(measured.fault)
     const vramMb = vramBefore !== null && vramAfter !== null ? Math.max(0, vramAfter - vramBefore) : vramAfter
@@ -1074,11 +1024,11 @@ export class BenchRunner {
     const ready = await this.awaitReady(Date.now() + READY_TIMEOUT_MS)
     const target = ready === 'ok' ? this.manager.target() : null
     if (!target) {
-      await this.manager.stopAndWait().catch(() => {})
+      await this.stopEngine()
       return undefined
     }
     const text = await this.chatText(target, buildCardExtractionPrompt(card), 200, 60_000).catch(() => null)
-    await this.manager.stopAndWait().catch(() => {})
+    await this.stopEngine()
     return text ? parseLlmSampling(text) : undefined
   }
 
@@ -1409,31 +1359,49 @@ export function betterBySpeed(
   return (a.prefillTps ?? 0) > (b.prefillTps ?? 0)
 }
 
-/** Bytes per cached element for a KV-cache type (defaults to f16's 2 for unknown types). */
+/** Bytes per cached element for a KV-cache type (defaults to f16's 2 for unknown types). Note:
+ *  this is a nominal/declared size, not a measured one — ADR-219 found turbo4's REAL VRAM and
+ *  compute cost is higher than its 0.5-bytes-per-element entry here implies (it runs a Walsh-
+ *  Hadamard rotation + InnerQ calibration per cached token, plus extra rotation-tensor VRAM, none
+ *  of which this table accounts for) — treat comparisons using this table as directional only. */
 function kvBytes(t: string): number {
   return KV_BYTES[t] ?? 2
 }
-/** The largest / smallest KV-cache type in a candidate set (by bytes per element). */
-function kvLargest(c: string[]): string {
-  return c.reduce((a, b) => (kvBytes(b) > kvBytes(a) ? b : a), c[0])
-}
+/** The smallest KV-cache type in a candidate set (by nominal bytes per element). */
 function kvSmallest(c: string[]): string {
   return c.reduce((a, b) => (kvBytes(b) < kvBytes(a) ? b : a), c[0])
 }
 
-/** Decide which quality-preserving KV-cache type(s) to actually tune, from the measured VRAM swing
- *  (see {@link calibrateKvSpread}). Tiny swing → the cache is small, so the quant barely changes
- *  the fit and the highest-precision/fastest-kernel type (f16) wins → tune only it. Big (or
- *  un-sizable, spread < 0) swing → the smallest type frees real VRAM for more of the model on the
- *  GPU, but its kernel can be slower (turbo4), so tune BOTH the smallest and the q8_0 stock fallback
- *  and let the measured prefill + t/s pick the winner. */
-export function decideKvToBench(spreadMb: number, candidates: string[]): string[] {
-  const has = (t: string) => candidates.includes(t)
-  const largest = kvLargest(candidates)
-  if (spreadMb >= 0 && spreadMb <= KV_SPREAD_MIN) return [largest]
-  const smallest = has('turbo4') ? 'turbo4' : kvSmallest(candidates)
-  const stock = has('q8_0') ? 'q8_0' : largest
-  return [...new Set([smallest, stock])]
+/** TurboQuant's rotation-based KV types (ADR-219). Confirmed from the fork's own source
+ *  (turbo-wht.cu/.cuh, InnerQ calibration state, "+3 rotation tensor overhead" in its merge
+ *  notes): these run a Walsh-Hadamard rotation + variance-equalizing calibration on every cached
+ *  token, plus real extra rotation-tensor VRAM — none of which `KV_BYTES`'s nominal bytes-per-
+ *  element accounts for. That's WHY turbo4 and q4_0 show the identical "0.5" in `KV_BYTES` (both
+ *  nominally 4-bit) yet turbo4 measured meaningfully slower and higher-VRAM in real testing: the
+ *  table only captures the raw quantized size, not this extra cost. It's a deliberate trade for
+ *  better quality at low bit-widths (the fork's own notes: "turbo4/turbo3 match f16 quality"),
+ *  not a bug — see {@link kvSpeedAdvisory}. */
+const TURBO_KV_TYPES = new Set(['turbo2', 'turbo3', 'turbo4'])
+
+/** ADR-219: auto-tune no longer sweeps KV-cache type — it tunes offload on whatever type the user
+ *  already selected, since the quality/speed tradeoff (confirmed real via ADR-217/219's live
+ *  testing: turbo4 vs. q4_0 on the same offload, then root-caused in TurboQuant's own source — see
+ *  {@link TURBO_KV_TYPES}) belongs to the user, not a silent auto-pick. This surfaces that tradeoff
+ *  instead of hiding it: when the winner is slow (<20 tok/s), find the smallest available type that
+ *  is NOT a turbo type (whose real cost `KV_BYTES` understates) and no bigger, nominally, than the
+ *  one tuned — note it without switching anything. A same-size non-turbo alternative still counts
+ *  (that's exactly the turbo4-vs-q4_0 case that motivated this), which a plain "strictly smaller
+ *  bytes" comparison would miss. Null when already fast enough, no such alternative exists, or the
+ *  engine wasn't probed. `20` is a blunt heuristic, not a guarantee. */
+export function kvSpeedAdvisory(tps: number | null, currentKv: string, supportedKvTypes: string[]): string | null {
+  if ((tps ?? 0) >= 20 || supportedKvTypes.length === 0) return null
+  const isTurbo = TURBO_KV_TYPES.has(currentKv)
+  const candidates = supportedKvTypes.filter(
+    (t) => t !== currentKv && kvBytes(t) <= kvBytes(currentKv) && (!isTurbo || !TURBO_KV_TYPES.has(t)),
+  )
+  if (candidates.length === 0) return null
+  const smallest = kvSmallest(candidates)
+  return `This result used the "${currentKv}" KV cache type. A different type (e.g. "${smallest}") may run faster, at some output-quality cost — try it manually if you want the extra speed.`
 }
 
 /** Best-effort current NVIDIA VRAM use in MB (sum across GPUs). Null on non-NVIDIA
