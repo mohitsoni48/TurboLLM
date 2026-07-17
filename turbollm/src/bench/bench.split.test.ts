@@ -61,11 +61,23 @@ test('multi-GPU, model fits one card → single-GPU FIRST, then layer-split', ()
 
 test('multi-GPU, model too big for one card even at smallest KV → layer-split only', () => {
   const s = sys([24000, 24000])
-  // ~60 GB weights: overflows a single 24 GB card no matter the KV quant, but the summed pool is
-  // its only hope — so single-GPU is not offered, layer-split is kept.
+  // ~60 GB weights: even fully on CPU (ngl=0) plus KV/overhead this barely clears one 24 GB card,
+  // and any real GPU residency overflows it fast — so single-GPU is well under 50% and skipped.
   const strats = pickSplitStrategies(model({ sizeBytes: 60_000_000_000 }), s, base(s), caps)
   assert.equal(strats.length, 1)
   assert.equal(strats[0].splitMode, 'layer')
+})
+
+test('multi-GPU, model just barely exceeds one card at FULL offload → single-GPU still offered (GitHub #62)', () => {
+  // 15 GB weights on a 16 GB card: doesn't fit at ngl=32 (full offload) but easily fits at a
+  // partial ngl (CPU covering only the tail) — the search should get a shot at that, instead of
+  // being forced straight into a slower cross-GPU layer-split the way GitHub #62 reported (a model
+  // that easily fit fully split across two cards, with VRAM to spare, was never tried on one card
+  // alone even though the vast majority of it would sit there fine).
+  const s = sys([16000, 16000])
+  const strats = pickSplitStrategies(model({ sizeBytes: 15_000_000_000, blockCount: 32, nativeCtx: 8192 }), s, base(s, { ctx: 8192 }), caps)
+  assert.ok(strats.some((g) => g.splitMode === 'none'), 'single-GPU strategy should be offered')
+  assert.equal(strats[0].splitMode, 'none', 'tried first — the likely winner')
 })
 
 test('single-GPU is offered thanks to the smallest-KV fit estimate (turbo4), not the base f16', () => {
