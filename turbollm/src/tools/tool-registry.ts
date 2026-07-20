@@ -2,7 +2,7 @@
 // Manages MCP server lifecycle and presents a unified tool list to the chat loop.
 import type { McpServer, ToolsConfig } from '../config/config'
 import {
-  WEB_SEARCH_TOOL, FETCH_URL_TOOL, RUN_CODE_TOOL,
+  webSearchTool, FETCH_URL_TOOL, RUN_CODE_TOOL,
   execWebSearch, execFetchUrl, execRunCode, webSearchUnavailableMessage,
 } from './builtin'
 import { searchConfigured } from './search-providers'
@@ -71,7 +71,8 @@ export class ToolRegistry {
     const defs: ToolDefinition[] = []
 
     // Built-in tools — only available when the required config is present
-    if (searchConfigured(this.toolsCfg.search)) defs.push(WEB_SEARCH_TOOL)
+    // Built fresh per request so its embedded date is today's, not the daemon's start date.
+    if (searchConfigured(this.toolsCfg.search)) defs.push(webSearchTool())
     defs.push(FETCH_URL_TOOL)
     defs.push(RUN_CODE_TOOL)
 

@@ -9,45 +9,66 @@ import {
 
 // ── Tool JSON-schema definitions (OpenAI tool format) ─────────────────────
 
-export const WEB_SEARCH_TOOL = {
-  type: 'function' as const,
-  function: {
-    name: 'web_search',
-    description:
-      'Search the web for real-time information. Call this BEFORE answering any question that depends on current events, recent data, prices, specific facts, or anything your training data may not cover accurately. ' +
-      'Formulate a precise, keyword-focused query — include names, dates, or version numbers when relevant. ' +
-      'Run multiple focused searches rather than one broad one for complex questions. ' +
-      'Returns up to 8 pre-ranked results. Each entry carries a substantial excerpt from the page — not a one-line snippet — plus a relevanceScore (0–1), a source URL, and the publication date when the source reports one. ' +
-      'Judge sources by authority, not only by how closely their wording echoes the question: prefer primary and official sources — the organisation\'s own site, official documentation, the original announcement, report, filing, or paper — over roundups, listicles and "best of" articles, which are often re-titled stale content dressed up as current. ' +
-      'When an excerpt reads as authoritative but is too thin to answer from, call fetch_url on that result to read the full page rather than filling the gap from memory.',
-    parameters: {
-      type: 'object',
-      properties: {
-        query: {
-          type: 'string',
-          description:
-            'A precise, specific search query. Use key terms and identifiers. ' +
-            'Good: "Python 3.13 release date new features". Bad: "Python new stuff". ' +
-            'Good: "NVIDIA RTX 5090 benchmark 2025". Bad: "new GPU benchmarks".',
+/**
+ * Build the web_search tool definition, stamped with the CURRENT date.
+ *
+ * Built per request rather than defined once as a const, for two reasons. A daemon can run for
+ * weeks, so a date captured at module load would go stale exactly the way the conversation's
+ * frozen system prompt did. And more importantly, the date has to appear HERE: a traced run
+ * showed a model with `Today's date is 2026-07-20` in its system prompt still searching
+ * "...16GB VRAM 2025" twice, because the schema it reads while composing a query sat thousands
+ * of characters away from that line — and the schema's own example said "2025".
+ */
+export function webSearchTool(today: string = todayIso()) {
+  const year = today.slice(0, 4)
+  return {
+    type: 'function' as const,
+    function: {
+      name: 'web_search',
+      description:
+        `Search the web for real-time information. TODAY IS ${today}. ` +
+        'Call this BEFORE answering any question that depends on current events, recent data, prices, specific facts, or anything your training data may not cover accurately. ' +
+        // The failure this addresses, observed in a real run: asked for the best current option in
+        // a category, the model searched for the specific products it remembered — all superseded —
+        // and got accurate pages about obsolete things. Retrieval cannot correct a stale question.
+        'DISCOVERY BEFORE RECALL: when you need what is best/current/latest in some category, your FIRST search must NOT name a specific product, model, version, brand or person you are recalling from memory — what you remember may have been replaced, and a search only returns what you ask about. ' +
+        `Search the category itself plus the current year (e.g. "<category> ${year}", "latest <category> released"), read which names actually exist now, and only THEN search those names. ` +
+        'Run multiple focused searches rather than one broad one for complex questions. ' +
+        'Returns up to 8 pre-ranked results. Each entry carries a substantial excerpt from the page — not a one-line snippet — plus a relevanceScore (0–1), a source URL, and the publication date when the source reports one. ' +
+        'Judge sources by authority, not only by how closely their wording echoes the question: prefer primary and official sources — the organisation\'s own site, official documentation, the original announcement, report, filing, or paper — over roundups, listicles and "best of" articles, which are often re-titled stale content dressed up as current. ' +
+        'When an excerpt reads as authoritative but is too thin to answer from, call fetch_url on that result to read the full page rather than filling the gap from memory.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: {
+            type: 'string',
+            description:
+              'A precise, specific search query. Use key terms and identifiers. ' +
+              // Examples carry the live year deliberately: the previous hardcoded "2025" was
+              // teaching every model to date its queries to a year that is no longer current.
+              `When recency matters use ${year} — never a year you recall from training, which is how a search silently returns correct answers about superseded things. ` +
+              `Good: "Python 3.13 release date new features". Bad: "Python new stuff". ` +
+              `Good: "NVIDIA RTX 5090 benchmark ${year}". Bad: "new GPU benchmarks".`,
+          },
+          intent: {
+            type: 'string',
+            enum: ['factual', 'recent_news', 'comparison', 'how_to'],
+            description: 'Optional: the type of answer needed. Helps the retrieval service weight results appropriately.',
+          },
+          freshness: {
+            type: 'string',
+            enum: ['current', 'any'],
+            description:
+              'Optional: "current" asks the search provider for recent results and penalises sources published more than 90 days ago. ' +
+              'Pass "current" whenever the answer can go stale: questions using latest/newest/current/right now/this year, ' +
+              'software releases and version numbers, prices, benchmarks, rankings, ongoing events, and news. ' +
+              'Omit it (or pass "any") for timeless background facts such as definitions, history, or how something works.',
+          },
         },
-        intent: {
-          type: 'string',
-          enum: ['factual', 'recent_news', 'comparison', 'how_to'],
-          description: 'Optional: the type of answer needed. Helps the retrieval service weight results appropriately.',
-        },
-        freshness: {
-          type: 'string',
-          enum: ['current', 'any'],
-          description:
-            'Optional: "current" asks the search provider for recent results and penalises sources published more than 90 days ago. ' +
-            'Pass "current" whenever the answer can go stale: questions using latest/newest/current/right now/this year, ' +
-            'software releases and version numbers, prices, benchmarks, rankings, ongoing events, and news. ' +
-            'Omit it (or pass "any") for timeless background facts such as definitions, history, or how something works.',
-        },
+        required: ['query'],
       },
-      required: ['query'],
     },
-  },
+  }
 }
 
 export const FETCH_URL_TOOL = {
