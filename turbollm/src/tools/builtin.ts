@@ -15,7 +15,9 @@ export const WEB_SEARCH_TOOL = {
       'Search the web for real-time information. Call this BEFORE answering any question that depends on current events, recent data, prices, specific facts, or anything your training data may not cover accurately. ' +
       'Formulate a precise, keyword-focused query — include names, dates, or version numbers when relevant. ' +
       'Run multiple focused searches rather than one broad one for complex questions. ' +
-      'Results are pre-ranked by relevance — each entry includes a relevanceScore (0–1), a key passage, a source URL, and the publication date when the source reports one.',
+      'Returns up to 8 pre-ranked results. Each entry carries a substantial excerpt from the page — not a one-line snippet — plus a relevanceScore (0–1), a source URL, and the publication date when the source reports one. ' +
+      'Judge sources by authority, not only by how closely their wording echoes the question: prefer primary and official sources — the organisation\'s own site, official documentation, the original announcement, report, filing, or paper — over roundups, listicles and "best of" articles, which are often re-titled stale content dressed up as current. ' +
+      'When an excerpt reads as authoritative but is too thin to answer from, call fetch_url on that result to read the full page rather than filling the gap from memory.',
     parameters: {
       type: 'object',
       properties: {
@@ -107,9 +109,26 @@ export function normalizeIsoDate(raw: string | undefined): string | undefined {
 
 /** PURE: flatten remote text to a single line. The result block is newline-delimited and
  *  re-parsed by chat-routes.ts, so any page-controlled field that is allowed to contain a
- *  newline can forge an entire extra `[N]` source entry (F-019). */
+ *  newline can forge an entire extra `[N]` source entry (F-019).
+ *
+ *  Two classes of character need handling beyond a plain `\s` collapse. Both were found by
+ *  replaying a hostile fixture through the real chat-routes parser, and both matter more now
+ *  that a passage is a multi-sentence excerpt rather than one sentence — more attacker-chosen
+ *  text per result is more room to hide them:
+ *   - U+0085 (NEL) is a Unicode line terminator that JavaScript's `\s` does NOT cover, so it
+ *     survived the old collapse. It cannot forge a block on its own (the parser keys off a
+ *     literal `\n`), but it still reaches the model and the sources panel as a live break.
+ *   - Bidi and invisible formatting controls cannot forge a block either, but they let a
+ *     hostile title or excerpt RENDER in the panel as text it does not contain — visually
+ *     reordered, or with segments hidden. They are dropped rather than collapsed because they
+ *     are zero-width: turning them into spaces would corrupt legitimate text. U+200C/U+200D
+ *     (ZWNJ/ZWJ) are deliberately NOT dropped — they are load-bearing in Indic, Persian and
+ *     Arabic script and in emoji sequences, and this app is general-purpose. */
 function oneLine(s: string): string {
-  return s.replace(/\s+/g, ' ').trim()
+  return s
+    .replace(/[\u200b\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, '')
+    .replace(/[\s\u0085]+/g, ' ')
+    .trim()
 }
 
 /** PURE: render a result's publication date for the model, e.g. "2026-07-14 (6 days ago)".
@@ -159,14 +178,19 @@ export async function execWebSearch(args: Record<string, unknown>, searchCfg: Se
   for (const [i, r] of results.entries()) {
     // Title and passage are attacker-controlled page text and both terminate a line of this
     // block format, so both are collapsed to a single line. Without this a page whose winning
-    // sentence contains newlines can emit its own `[N]/Source:/Domain:/Key passage:` block —
+    // text contains newlines can emit its own `[N]/Source:/Domain:/Key passage:` block —
     // verified to forge a fully-attacker-controlled entry that chat-routes.ts then persists as
-    // a real citation. extractPassage returns ONE sentence by design, so nothing is lost.
+    // a real citation. The passage is now a multi-sentence excerpt rather than one sentence, so
+    // it carries far more attacker-chosen text through here; oneLine() is what makes that safe.
     lines.push(`\n[${i + 1}] ${oneLine(r.title)}`)
     lines.push(`Source: ${r.url}`)
     // Published/Retrieved are appended AFTER Freshness on purpose: chat-routes.ts re-parses this
     // exact line into the UI's sources panel, and this ordering keeps its prefix match intact.
     lines.push(`Domain: ${r.domain} | Relevance: ${r.relevanceScore.toFixed(2)} | Freshness: ${r.freshnessSignal} | Published: ${publishedLabel(r)} | Retrieved: ${retrieved}`)
+    // MUST stay the LAST line of the block: chat-routes.ts captures this field forward to the
+    // next `[N]` or end-of-string, so any labelled line added after it would be swallowed into
+    // the citation text. The excerpt's size is not tuned here — see MAX_PASSAGE_CHARS in
+    // research-service.ts, which bounds the per-result payload this line renders.
     lines.push(`Key passage: ${oneLine(r.passage)}`)
   }
   return lines.join('\n').trim()
