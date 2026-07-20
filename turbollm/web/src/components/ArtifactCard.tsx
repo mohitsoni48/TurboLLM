@@ -3,6 +3,12 @@ import { Download, Loader2, ChevronDown, Maximize2, Minimize2 } from 'lucide-rea
 import { toast } from 'sonner'
 import { cn } from '../lib/utils'
 import { useUiStore, resolveDark } from '../stores/ui'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from './ui/dropdown-menu'
 
 // Fenced-block language → artifact MIME type
 const ARTIFACT_LANGS: Record<string, string> = {
@@ -577,7 +583,6 @@ export function ArtifactCard({ lang, code }: ArtifactCardProps) {
   const [availW, setAvailW] = useState(0)
   const [maxH, setMaxH] = useState(screenCap)
   const [mermaid, setMermaid] = useState<{ svg?: string; error?: string; loading?: boolean }>({})
-  const [menuOpen, setMenuOpen] = useState(false)
   const [busy, setBusy] = useState(false)
   const iframeRef = useRef<HTMLIFrameElement>(null)
   const staticRef = useRef<HTMLIFrameElement>(null)
@@ -736,13 +741,6 @@ export function ArtifactCard({ lang, code }: ArtifactCardProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [type, staticDims, fitReady, stableCode, theme])
 
-  useEffect(() => {
-    if (!menuOpen) return
-    const close = () => setMenuOpen(false)
-    document.addEventListener('mousedown', close)
-    return () => document.removeEventListener('mousedown', close)
-  }, [menuOpen])
-
   const srcdoc = type !== 'application/vnd.mermaid' ? buildSrcdoc(type, stableCode) : ''
   const mermaidSrcdoc = mermaid.svg ? buildSrcdoc('image/svg+xml', mermaid.svg) : ''
 
@@ -777,7 +775,6 @@ export function ArtifactCard({ lang, code }: ArtifactCardProps) {
   const formats: Fmt[] = type === 'text/html' ? ['png', 'jpeg', 'gif', 'html'] : ['png', 'jpeg', 'svg']
 
   async function download(fmt: Fmt) {
-    setMenuOpen(false)
     setBusy(true)
     try {
       if (fmt === 'svg') {
@@ -947,33 +944,28 @@ export function ArtifactCard({ lang, code }: ArtifactCardProps) {
             >
               {fitMode === 'height' ? <Maximize2 size={12} /> : <Minimize2 size={12} />}
             </button>
-            <div className="relative" onMouseDown={(e) => e.stopPropagation()}>
-              <button
-                type="button"
+            <DropdownMenu>
+              <DropdownMenuTrigger
                 title="Download"
-                onClick={() => setMenuOpen((o) => !o)}
                 className="flex items-center rounded p-1 text-faint transition-colors hover:text-ink"
               >
                 {busy ? <Loader2 size={12} className="animate-spin" /> : <Download size={12} />}
                 <ChevronDown size={9} className="ml-0.5" />
-              </button>
-              {menuOpen && (
-                <div className="absolute right-0 z-10 mt-1 min-w-28 overflow-hidden rounded-md border border-border bg-panel shadow-lg">
-                  {formats.map((f) => (
-                    <button
-                      key={f}
-                      type="button"
-                      onClick={() => void download(f)}
-                      className="block w-full px-3 py-1.5 text-left text-[12px] text-muted hover:bg-panel-2 hover:text-ink"
-                    >
-                      {FMT_LABEL[f]}
-                      {f === 'gif' && <span className="ml-1 text-[10px] text-faint">animation</span>}
-                      {f === 'html' && <span className="ml-1 text-[10px] text-faint">source</span>}
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="min-w-28">
+                {formats.map((f) => (
+                  <DropdownMenuItem
+                    key={f}
+                    className="text-[12px]"
+                    onSelect={() => void download(f)}
+                  >
+                    {FMT_LABEL[f]}
+                    {f === 'gif' && <span className="ml-1 text-[10px] text-faint">animation</span>}
+                    {f === 'html' && <span className="ml-1 text-[10px] text-faint">source</span>}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
         </div>
 

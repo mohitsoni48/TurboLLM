@@ -9,6 +9,13 @@ import type { ChatSseEvent, Conversation, LiveToolCall, Message } from '../lib/c
 import { appendTextDelta, upsertToolCall, type LiveBlock } from '../lib/live-timeline'
 import { ApiError, downloadChatExport, getDebugSnapshot, getShareUrl, importChat } from '../lib/api'
 import { Button } from '../components/ui/button'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '../components/ui/dropdown-menu'
 import { toast } from '../components/ui/sonner'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { skillKeys, fetchSkills } from '../lib/agent-api'
@@ -91,10 +98,8 @@ export function ChatScreen() {
   const sidebarRef = useRef<HTMLDivElement>(null)
   const [sidebarWidth, setSidebarWidth] = useState(() => Math.min(Math.max(readSavedSidebarWidth(), SIDEBAR_MIN_W), sidebarMaxW()))
   const [attachments, setAttachments] = useState<{ file: File; dataUrl: string }[]>([])
-  // Share menu state
-  const [shareMenuOpen, setShareMenuOpen] = useState(false)
+  // Share menu clipboard fallback (F-023)
   const [clipboardFallback, setClipboardFallback] = useState<{ text: string; title: string } | null>(null)
-  const shareMenuRef = useRef<HTMLDivElement>(null)
   // Import state (F-024)
   const importFileRef = useRef<HTMLInputElement>(null)
   const [importError, setImportError] = useState<string | null>(null)
@@ -308,22 +313,9 @@ export function ChatScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeId])
 
-  // Close share menu on outside click
-  useEffect(() => {
-    if (!shareMenuOpen) return
-    const handler = (e: MouseEvent) => {
-      if (shareMenuRef.current && !shareMenuRef.current.contains(e.target as Node)) {
-        setShareMenuOpen(false)
-      }
-    }
-    document.addEventListener('mousedown', handler)
-    return () => document.removeEventListener('mousedown', handler)
-  }, [shareMenuOpen])
-
   // ── Share handlers (F-023) ────────────────────────────────────────────────
 
   const copyText = async (text: string, successMsg: string, title: string) => {
-    setShareMenuOpen(false)
     try {
       await navigator.clipboard.writeText(text)
       toast.success(successMsg)
@@ -355,7 +347,6 @@ export function ChatScreen() {
 
   const handleExportChat = () => {
     if (!activeId) return
-    setShareMenuOpen(false)
     downloadChatExport(activeId)
   }
 
@@ -826,52 +817,40 @@ export function ChatScreen() {
 
           {/* Share / Export menu (F-023, F-024) — only when a conversation is active */}
           {activeId && (
-            <div ref={shareMenuRef} className="relative ml-auto">
-              <Button
-                size="icon"
-                variant="ghost"
-                className="h-8 w-8"
-                onClick={() => setShareMenuOpen((o) => !o)}
-                title="Share or export this chat"
-              >
-                <Share2 size={15} />
-              </Button>
-              {shareMenuOpen && (
-                <div className="absolute right-0 top-9 z-50 min-w-[180px] rounded-md border border-border bg-panel shadow-[var(--shadow-2)] py-1">
-                  <button
-                    type="button"
-                    onClick={() => void handleCopyLink()}
-                    className="flex w-full items-center gap-2 px-3 py-2 text-[13px] text-ink hover:bg-panel-2"
-                  >
-                    <Copy size={13} className="text-muted" />
-                    Copy link (LAN)
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void handleCopyDebugInfo()}
-                    className="flex w-full items-center gap-2 px-3 py-2 text-[13px] text-ink hover:bg-panel-2"
-                  >
-                    <Copy size={13} className="text-muted" />
-                    Copy debug info
-                  </button>
-                  <div className="my-1 border-t border-border" />
-                  <button
-                    type="button"
-                    onClick={handleExportChat}
-                    className="flex w-full items-center gap-2 px-3 py-2 text-[13px] text-ink hover:bg-panel-2"
-                  >
-                    <Download size={13} className="text-muted" />
-                    Export chat
-                  </button>
-                </div>
-              )}
-            </div>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  className="ml-auto h-8 w-8"
+                  title="Share or export this chat"
+                >
+                  <Share2 size={15} />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="min-w-[180px]">
+                <DropdownMenuItem className="text-[13px]" onSelect={() => void handleCopyLink()}>
+                  <Copy size={13} className="text-muted" />
+                  Copy link (LAN)
+                </DropdownMenuItem>
+                <DropdownMenuItem className="text-[13px]" onSelect={() => void handleCopyDebugInfo()}>
+                  <Copy size={13} className="text-muted" />
+                  Copy debug info
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem className="text-[13px]" onSelect={handleExportChat}>
+                  <Download size={13} className="text-muted" />
+                  Export chat
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           )}
         </div>
 
         {/* Message list — always visible; empty state shown only when no messages */}
         <div ref={scrollerRef} className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
-          <div className="flex w-full flex-col gap-6 px-4 py-4 md:px-8 md:py-6">
+          {/* 768px thread measure (spec 11 §2) — must match the composer wrapper below */}
+          <div className="mx-auto flex w-full max-w-3xl flex-col gap-6 px-4 py-4 md:px-8 md:py-6">
             {/* Hidden import file input (F-024) */}
             <input
               ref={importFileRef}
@@ -884,7 +863,7 @@ export function ChatScreen() {
             {/* Model mismatch banner (F-024): shown after a successful import when the
                 exported model isn't available on this machine. Inline, not a toast. */}
             {importModelMismatch && (
-              <div className="mb-2 flex items-start gap-2 rounded-md border border-[color:var(--warn,#ca8a04)] bg-[color-mix(in_srgb,var(--warn,#ca8a04)_8%,transparent)] px-3 py-2 text-[13px]">
+              <div className="mb-2 flex items-start gap-2 rounded-md border border-[color:var(--warn)] bg-[color-mix(in_srgb,var(--warn)_8%,transparent)] px-3 py-2 text-[13px]">
                 <span className="flex-1">
                   <span className="font-medium">Model not found:</span>{' '}
                   <span className="font-mono">{importModelMismatch}</span> is not available on this machine.
@@ -960,12 +939,13 @@ export function ChatScreen() {
           </div>
         </div>
 
-        {/* Scroll-to-bottom pill */}
+        {/* Scroll-to-bottom pill (spec 07 §7) — fades in over 150ms via the shared
+            tllm-rise-in keyframe (index.css), suppressed for motion-sensitive users */}
         {showScrollBtn && (
           <button
             type="button"
             onClick={() => { userScrolledUp.current = false; scrollToBottom(true) }}
-            className="absolute bottom-28 left-1/2 -translate-x-1/2 flex items-center gap-1.5 rounded-full border border-border bg-panel px-3 py-1.5 text-[12px] text-muted shadow-[var(--shadow-1)] hover:text-ink"
+            className="absolute bottom-28 left-1/2 -translate-x-1/2 flex animate-[tllm-rise-in_150ms_ease-out] items-center gap-1.5 rounded-full border border-border bg-panel px-3 py-1.5 text-[13px] text-muted shadow-[var(--shadow-2)] transition-colors hover:text-ink motion-reduce:animate-none"
           >
             <ArrowDown size={13} /> Jump to latest
           </button>
@@ -995,11 +975,13 @@ export function ChatScreen() {
             the transcript). Rendered just above the composer while a background tool
             call awaits interactive approval. */}
         {!readonly && activeId && pendingApproval && (
-          <ToolApprovalBar key={pendingApproval.id} pending={pendingApproval} convId={activeId} onResolved={() => {}} />
+          <div className="mx-auto w-full max-w-3xl">
+            <ToolApprovalBar key={pendingApproval.id} pending={pendingApproval} convId={activeId} onResolved={() => {}} />
+          </div>
         )}
 
         {/* Composer area (always visible; disabled when no model; hidden in readonly) */}
-        {readonly ? null : <div className="px-3 pb-3 md:px-8 md:pb-5">
+        {readonly ? null : <div className="mx-auto w-full max-w-3xl px-3 pb-3 md:px-8 md:pb-5">
           <div className="relative w-full">
             {/* '/' skill picker */}
             {skillPickerOpen && (
@@ -1098,9 +1080,12 @@ export function ChatScreen() {
                 )}
               </div>
             </div>
-            <p className="mt-1.5 px-1 text-[11px] text-faint">
-              {model ? `${model.name} · Enter to send · Shift+Enter for newline` : 'Load a model above to start chatting'}
-            </p>
+            {/* No-model hint lives in the textarea placeholder above — don't repeat it here. */}
+            {model && (
+              <p className="mt-1.5 px-1 text-[11px] text-faint">
+                {model.name} · Enter to send · Shift+Enter for newline
+              </p>
+            )}
           </div>
         </div>}
       </div>
