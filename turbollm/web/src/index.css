@@ -11,7 +11,7 @@
   --panel-2: #f4f2ee;
   --ink: #1a1a18;
   --muted: #6b6a66;
-  --faint: #9c9a94;
+  --faint: #6f6e69;
   --border: #e7e4de;
   --border-strong: #d6d2c8;
   --accent: #c96442;
@@ -26,6 +26,8 @@
   --radius-sm: 8px;
   --shadow-1: 0 1px 2px rgb(0 0 0 / 0.05);
   --shadow-2: 0 4px 16px rgb(0 0 0 / 0.07);
+  /* code-block surface (spec 11 §4): --panel-2 in light, its own near-black in dark. */
+  --code-bg: var(--panel-2);
   /* log panel is the same near-black in both themes (spec 11 §6); its foreground
      tokens are defined here so components never inline hex. */
   --log-bg: #0b0b0c;
@@ -51,6 +53,7 @@
   --warn: #d8a45a;
   --err: #e06c5f;
   --info: #7da3c4;
+  --code-bg: #111114;
 }
 
 /* Map design tokens to the Tailwind v4 theme so utilities like bg-panel,
@@ -71,6 +74,7 @@
   --color-warn: var(--warn);
   --color-err: var(--err);
   --color-info: var(--info);
+  --color-code-bg: var(--code-bg);
 
   --radius-sm: var(--radius-sm);
   --radius-md: var(--radius);
@@ -113,6 +117,169 @@ body {
   outline: 2px solid color-mix(in srgb, var(--accent) 40%, transparent);
   outline-offset: 1px;
 }
+
+/* ── Assistant markdown prose (spec 11 §4 + spec 07 §7) ───────────────────────
+   Applied by MessageBubble/CodeTranscript around rendered assistant markdown.
+   Type is em-based so it tracks the wrapper's font-size (15px chat, 14px Code).
+   Deliberately unlayered: these must beat both the Tailwind preflight resets
+   (which strip heading/list/blockquote styling) and utility classes on the
+   renderer's element overrides. */
+.prose-tllm h1,
+.prose-tllm h2,
+.prose-tllm h3,
+.prose-tllm h4,
+.prose-tllm h5,
+.prose-tllm h6 {
+  font-weight: 600;
+  line-height: 1.3;
+  margin: 1.2em 0 0.5em;
+}
+.prose-tllm h1 { font-size: 1.25em; }
+.prose-tllm h2 { font-size: 1.15em; }
+.prose-tllm h3,
+.prose-tllm h4,
+.prose-tllm h5,
+.prose-tllm h6 { font-size: 1.05em; }
+.prose-tllm p { margin: 0.75em 0; }
+.prose-tllm ul,
+.prose-tllm ol {
+  margin: 0.75em 0;
+  padding-left: 1.5em;
+}
+.prose-tllm ul { list-style: disc; }
+.prose-tllm ol { list-style: decimal; }
+.prose-tllm li { margin: 0.25em 0; }
+.prose-tllm li > p,
+.prose-tllm li > ul,
+.prose-tllm li > ol { margin: 0.25em 0; }
+.prose-tllm blockquote {
+  margin: 0.75em 0;
+  padding: 2px 0 2px 12px;
+  border-left: 3px solid var(--border-strong);
+  color: var(--muted);
+}
+.prose-tllm table { border-collapse: collapse; }
+.prose-tllm th,
+.prose-tllm td {
+  border: 1px solid var(--border);
+  padding: 8px 12px;
+  font-size: 13px;
+}
+.prose-tllm th { font-weight: 600; }
+.prose-tllm hr {
+  margin: 1.25em 0;
+  border: 0;
+  border-top: 1px solid var(--border);
+}
+/* Inline code only — scoped by parent because block code lives inside the
+   renderer's div wrapper (MessageBubble unwraps <pre>), so a bare
+   `.prose-tllm code` would also clobber block-code padding/background. */
+.prose-tllm p > code,
+.prose-tllm li > code,
+.prose-tllm td > code,
+.prose-tllm th > code,
+.prose-tllm h1 > code,
+.prose-tllm h2 > code,
+.prose-tllm h3 > code,
+.prose-tllm h4 > code,
+.prose-tllm blockquote code {
+  background: var(--panel-2);
+  border-radius: var(--radius-sm);
+  padding: 1px 5px;
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+.prose-tllm a { color: var(--accent); text-decoration: none; }
+.prose-tllm a:hover { text-decoration: underline; text-underline-offset: 2px; }
+.prose-tllm strong { font-weight: 600; }
+.prose-tllm em { font-style: italic; }
+.prose-tllm > :first-child { margin-top: 0; }
+.prose-tllm > :last-child { margin-bottom: 0; }
+
+/* ── highlight.js palette (spec 11 §4): github / github-dark ported inline with
+   the background overridden to transparent — the block surface comes from
+   --code-bg. Hex is permitted here only: index.css is the palette home. */
+.hljs { background: transparent; color: inherit; }
+.hljs-subst,
+.hljs-tag,
+.hljs-punctuation { color: inherit; }
+.hljs-doctag,
+.hljs-keyword,
+.hljs-meta .hljs-keyword,
+.hljs-template-tag,
+.hljs-template-variable,
+.hljs-type,
+.hljs-variable.language_ { color: #d73a49; }
+.hljs-title,
+.hljs-title.class_,
+.hljs-title.class_.inherited__,
+.hljs-title.function_ { color: #6f42c1; }
+.hljs-attr,
+.hljs-attribute,
+.hljs-literal,
+.hljs-meta,
+.hljs-number,
+.hljs-operator,
+.hljs-variable,
+.hljs-selector-attr,
+.hljs-selector-class,
+.hljs-selector-id { color: #005cc5; }
+.hljs-regexp,
+.hljs-string,
+.hljs-meta .hljs-string { color: #032f62; }
+.hljs-built_in,
+.hljs-symbol { color: #e36209; }
+.hljs-comment,
+.hljs-code,
+.hljs-formula { color: #6a737d; }
+.hljs-name,
+.hljs-quote,
+.hljs-selector-tag,
+.hljs-selector-pseudo { color: #22863a; }
+.hljs-section { color: #005cc5; font-weight: 600; }
+.hljs-bullet { color: #735c0f; }
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: 600; }
+.hljs-addition { color: #22863a; background-color: #f0fff4; }
+.hljs-deletion { color: #b31d28; background-color: #ffeef0; }
+
+.dark .hljs-doctag,
+.dark .hljs-keyword,
+.dark .hljs-meta .hljs-keyword,
+.dark .hljs-template-tag,
+.dark .hljs-template-variable,
+.dark .hljs-type,
+.dark .hljs-variable.language_ { color: #ff7b72; }
+.dark .hljs-title,
+.dark .hljs-title.class_,
+.dark .hljs-title.class_.inherited__,
+.dark .hljs-title.function_ { color: #d2a8ff; }
+.dark .hljs-attr,
+.dark .hljs-attribute,
+.dark .hljs-literal,
+.dark .hljs-meta,
+.dark .hljs-number,
+.dark .hljs-operator,
+.dark .hljs-variable,
+.dark .hljs-selector-attr,
+.dark .hljs-selector-class,
+.dark .hljs-selector-id { color: #79c0ff; }
+.dark .hljs-regexp,
+.dark .hljs-string,
+.dark .hljs-meta .hljs-string { color: #a5d6ff; }
+.dark .hljs-built_in,
+.dark .hljs-symbol { color: #ffa657; }
+.dark .hljs-comment,
+.dark .hljs-code,
+.dark .hljs-formula { color: #8b949e; }
+.dark .hljs-name,
+.dark .hljs-quote,
+.dark .hljs-selector-tag,
+.dark .hljs-selector-pseudo { color: #7ee787; }
+.dark .hljs-section { color: #1f6feb; }
+.dark .hljs-bullet { color: #f2cc60; }
+.dark .hljs-addition { color: #aff5b4; background-color: #033a16; }
+.dark .hljs-deletion { color: #ffdcd7; background-color: #67060c; }
 
 /* Rise-in entrance used by the Code launchpad — sections stagger via inline
    animation-delay. Motion-sensitive users get an instant render instead. */

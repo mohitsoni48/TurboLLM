@@ -10,7 +10,7 @@ export function UnreachableOverlay() {
       role="alertdialog"
       aria-label="Lost connection to daemon"
     >
-      <Loader2 size={24} className="tllm-pulse text-muted" />
+      <Loader2 size={24} className="animate-spin text-muted" />
       <p className="text-[14px] text-ink">
         Lost connection to TurboLLM daemon — retrying…
       </p>

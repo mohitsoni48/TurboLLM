@@ -145,8 +145,8 @@ export const Markdown = memo(function Markdown({ children, streaming }: { childr
             return <ArtifactCard lang={lang} code={childrenToString(children).replace(/\n$/, '')} />
           }
           return (
-            <div className="relative my-2 overflow-hidden rounded-lg border border-border">
-              <div className="flex items-center justify-between border-b border-border bg-panel-2 px-3 py-1 font-mono text-[11px] text-muted">
+            <div className="relative my-2 overflow-hidden rounded-md border border-border bg-[var(--code-bg)]">
+              <div className="flex items-center justify-between border-b border-border bg-panel-2 px-3 py-1 font-mono text-[12px] text-muted">
                 <span>{lang}</span>
                 <CopyButton text={childrenToString(children)} size={12} />
               </div>
@@ -218,7 +218,7 @@ function ToolCallCard({ call }: { call: CardCall }) {
   return (
     <div
       className="overflow-hidden rounded-lg border bg-panel-2"
-      style={awaitingApproval ? { borderColor: 'var(--warn,#ca8a04)', background: 'color-mix(in srgb, var(--warn,#ca8a04) 6%, transparent)' } : { borderColor: 'var(--border)' }}
+      style={awaitingApproval ? { borderColor: 'var(--warn)', background: 'color-mix(in srgb, var(--warn) 6%, transparent)' } : { borderColor: 'var(--border)' }}
     >
       <button
         type="button"
@@ -227,9 +227,9 @@ function ToolCallCard({ call }: { call: CardCall }) {
         style={{ cursor: hasOutput ? 'pointer' : 'default' }}
       >
         {call.status === 'pending'            && <Loader2 size={12} className="shrink-0 animate-spin" style={{ color: 'var(--accent)' }} />}
-        {call.status === 'done'               && <CheckCircle2 size={12} className="shrink-0" style={{ color: '#4ade80' }} />}
+        {call.status === 'done'               && <CheckCircle2 size={12} className="shrink-0" style={{ color: 'var(--ok)' }} />}
         {call.status === 'error'              && <XCircle size={12} className="shrink-0" style={{ color: 'var(--err)' }} />}
-        {call.status === 'awaiting_approval'  && <HelpCircle size={12} className="shrink-0" style={{ color: 'var(--warn,#ca8a04)' }} />}
+        {call.status === 'awaiting_approval'  && <HelpCircle size={12} className="shrink-0" style={{ color: 'var(--warn)' }} />}
         <span className="font-mono text-[12px] font-medium text-ink">{friendlyName(call.name)}</span>
         <span className="text-[11px] text-faint">
           {call.status === 'pending' ? 'running…' : call.status === 'error' ? 'error' : call.status === 'awaiting_approval' ? 'waiting on you' : 'done'}
@@ -293,7 +293,7 @@ function InlineToolStep({ call }: { call: LiveToolCall }) {
         style={{ cursor: hasOutput ? 'pointer' : 'default' }}
       >
         {pending && <Loader2 size={13} className="shrink-0 animate-spin" style={{ color: 'var(--accent)' }} />}
-        {call.status === 'done'  && <CheckCircle2 size={13} className="shrink-0" style={{ color: '#4ade80' }} />}
+        {call.status === 'done'  && <CheckCircle2 size={13} className="shrink-0" style={{ color: 'var(--ok)' }} />}
         {call.status === 'error' && <XCircle size={13} className="shrink-0" style={{ color: 'var(--err)' }} />}
         <span className="font-mono text-[12px] font-medium text-ink">{friendlyName(call.name)}</span>
         <span className="text-[11px]" style={{ color: pending ? 'var(--accent)' : 'var(--faint)' }}>
@@ -664,7 +664,7 @@ export function MessageBubble({
           </div>
         </div>
       ) : hasError ? (
-        <div className="rounded-lg border px-4 py-3 text-[14px]" style={{ borderColor: 'var(--err)', color: 'var(--err)', background: 'color-mix(in srgb, var(--err) 8%, transparent)' }}>
+        <div className="rounded-lg border px-4 py-3 text-[13px]" style={{ borderColor: 'var(--err)', color: 'var(--err)', background: 'color-mix(in srgb, var(--err) 10%, transparent)' }}>
           {message.stats.aborted ? 'Generation failed or was stopped.' : 'This message is empty.'}
           {isLast && onRegenerate && <button type="button" className="ml-3 underline" onClick={onRegenerate}>Regenerate</button>}
         </div>
