@@ -166,9 +166,17 @@ function entityStem(s: string): string {
  *  (NHS, FDA, NASA, BBC), which is exactly an entity name. A fully-uppercased query
  *  carries no such signal, so it gets no acronym treatment. */
 function entityTerms(query: string): Set<string> {
-  const terms = new Set(tokenize(query).filter((t) => t.length >= 4))
+  // GENERIC_URL_LABELS are filtered out here, not just on the domain side: "best", "guide" and
+  // friends are never part of an entity's name, and counting them let a farm qualify as one —
+  // "comparethebestmortgagerates" matched on best+mortgage+rates before this filter.
+  const terms = new Set(
+    tokenize(query).filter((t) => t.length >= 4 && !GENERIC_URL_LABELS.has(t)),
+  )
   if (query !== query.toUpperCase()) {
-    for (const m of query.match(/\b[A-Z]{3,6}\b/g) ?? []) terms.add(m.toLowerCase())
+    for (const m of query.match(/\b[A-Z]{3,6}\b/g) ?? []) {
+      const lower = m.toLowerCase()
+      if (!GENERIC_URL_LABELS.has(lower)) terms.add(lower)
+    }
   }
   return terms
 }
@@ -209,12 +217,36 @@ export function officialSourceBoost(query: string, url: string): number {
     return false
   }
 
+  /**
+   * Multi-word names arrive concatenated in a domain ("bankofengland.co.uk",
+   * "johnshopkins.org", "kingarthurbaking.com"), so whole-label equality misses exactly the
+   * organisations most worth surfacing — measured: bankofengland.co.uk ranked 7th for
+   * "Bank of England base rate announcement" while a five-year-old news article led.
+   * Requiring TWO distinct query terms is what keeps this from becoming substring matching:
+   * "bestteslacars" contains "tesla" but no second term, so it stays unboosted.
+   */
+  const isConcatenatedName = (candidate: string): boolean => {
+    if (candidate.length < 8) return false
+    let hits = 0
+    let covered = 0
+    for (const t of terms) {
+      if (t.length >= 4 && candidate.includes(t)) {
+        hits++
+        covered += t.length
+      }
+    }
+    // ≥2 terms, and they must account for most of the label — otherwise a long content-farm
+    // domain that happens to embed two short query words would qualify.
+    return hits >= 2 && covered >= candidate.length * 0.6
+  }
+
   // The entity's own domain is the strongest form of this signal.
   const labels = host.split('.')
   for (let i = 0; i < labels.length - 1; i++) {
     // Skip the TLD (last label) and registry noise; "nhs" is the name in "nhs.uk".
     if (SUFFIX_LABELS.has(labels[i])) continue
     if (matches(labels[i])) return 0.25
+    if (isConcatenatedName(labels[i])) return 0.22
   }
 
   // Its official page on a shared platform (huggingface.co/Qwen, instagram.com/michelin).
@@ -457,7 +489,20 @@ function yearMentionHint(content: string): 'recent' | 'dated' | 'unknown' {
  * With no date we report 'unknown' rather than guessing from prose: the year a
  * snippet happens to mention says nothing reliable about when it was published.
  */
-function freshnessSignal(ageDays?: number): 'recent' | 'dated' | 'unknown' {
+/**
+ * Multiplier applied to a result's score when the caller asked for `freshness: 'current'`.
+ * Never zero: an old page can still be the best available answer, and hard-filtering by age
+ * would silently hide the only source on a niche question. Topic-agnostic — "the user wants
+ * current information" means the same thing for interest rates, medical guidance and sport.
+ */
+export function currentnessMultiplier(ageDays: number): number {
+  if (ageDays <= FRESH_MAX_AGE_DAYS) return 1
+  if (ageDays <= 365) return 0.85
+  if (ageDays <= DATED_MIN_AGE_DAYS) return 0.65
+  return 0.45
+}
+
+export function freshnessSignal(ageDays?: number): 'recent' | 'dated' | 'unknown' {
   if (ageDays === undefined) return 'unknown'
   if (ageDays <= FRESH_MAX_AGE_DAYS) return 'recent'
   if (ageDays >= DATED_MIN_AGE_DAYS) return 'dated'
@@ -520,15 +565,27 @@ export async function research(
     const domain = extractDomain(r.url)
     const text = `${r.title} ${r.content}`
     const kwScore = keywordOverlap(q.query, text)
-    // Composite source quality replaces the raw domain score in the same 0.3 slot: keyword
-    // overlap is the signal SEO pages optimise hardest, so the counterweight has to live in
-    // the term that can tell a first-party source from a page shaped like one.
+    // Composite source quality replaces the raw domain score: keyword overlap is the signal
+    // SEO pages optimise hardest, so the counterweight has to live in the term that can tell
+    // a first-party source from a page shaped like one.
     const sq = sourceQuality(q.query, r.title, r.url, q.intent)
     const publishedDate = normalizePublishedDate(r.publishedDate)
     const ageDays = publishedDate ? ageInDays(publishedDate, now) : undefined
     const signal = freshnessSignal(ageDays)
     const fs = freshnessScore(ageDays, r.content, q.freshness)
-    const relevanceScore = 0.5 * kwScore + 0.3 * sq + 0.2 * fs
+    // Weighting (ADR-230 follow-up): keyword overlap was 0.5 and source quality 0.3, which let
+    // SEO/listicle pages win — they are engineered to match the user's exact phrasing, so the
+    // term they game carried more weight than the term that can tell a first-party source from
+    // a page merely shaped like one. Measured on a real query, a 0.20 aggregator penalty moved
+    // the final score by only 0.06 and a content farm stayed at rank 2. Shifting 0.15 from
+    // keyword to source makes that penalty worth 0.09 and the official-source boost 0.11 —
+    // enough to actually reorder. Keyword overlap still leads on topical relevance; it just no
+    // longer outvotes provenance.
+    // NOTE: the `freshness:'current'` age constraint is NOT applied here. Providers seldom
+    // return dates on general search, so at this point most ages are unknown; it is applied
+    // once in execWebSearch after dates have been read off the pages themselves, against the
+    // full set of known ages. Applying it in both places would double-penalise.
+    const relevanceScore = 0.35 * kwScore + 0.45 * sq + 0.2 * fs
     const passage = extractPassage(q.query, r.content)
 
     return {

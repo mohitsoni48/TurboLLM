@@ -3,7 +3,9 @@
 import { runInNewContext } from 'node:vm'
 import { checkSsrf } from './security.js'
 import { type SearchConfig } from './search-providers.js'
-import { research, type ResearchResult } from './research-service.js'
+import {
+  ageInDays, currentnessMultiplier, freshnessSignal, research, type ResearchResult,
+} from './research-service.js'
 
 // ── Tool JSON-schema definitions (OpenAI tool format) ─────────────────────
 
@@ -152,6 +154,73 @@ export function resolveSearchQuery(args: Record<string, unknown>): string {
   return ''
 }
 
+/** Ceiling on bytes read per date probe. Publication metadata lives in <head>, so the first
+ *  chunk is enough — and a cap is what stops a hostile or merely enormous page from tying up
+ *  the search. */
+const DATE_PROBE_MAX_BYTES = 96_000
+/** Per-probe timeout. Short on purpose: a missing date costs a "Published: unknown" label,
+ *  which is honest, whereas a slow probe costs the whole research turn. */
+const DATE_PROBE_TIMEOUT_MS = 4_000
+
+/**
+ * Fill in publication dates the search provider did not supply, by reading each page's own
+ * metadata. Measured motivation: across 8 real searches the provider returned a date for
+ * 0 of 80 results (Tavily only emits `published_date` on `topic:'news'`), so `freshnessSignal`
+ * was permanently 'unknown' and the 0.2 freshness weight was inert — the model could not tell
+ * a 2025 page from a 2026 one, which is precisely the reported "gives me stale data" symptom.
+ *
+ * Deliberately best-effort and non-fatal: probes run concurrently, each is SSRF-checked,
+ * byte-capped and short-timeout'd, and ANY failure simply leaves the result's date unknown.
+ * A research turn must never fail, hang, or lose results because a source was slow.
+ * Mutates in place; only fields derived from the discovered date are touched.
+ */
+export async function backfillPublishedDates(results: ResearchResult[]): Promise<void> {
+  const missing = results.filter((r) => !r.publishedDate)
+  if (missing.length === 0) return
+
+  await Promise.allSettled(
+    missing.map(async (r) => {
+      if (await checkSsrf(r.url)) return // same guard as fetch_url; never probe internal hosts
+      let resp: Response
+      try {
+        resp = await fetch(r.url, {
+          headers: { 'User-Agent': 'TurboLLM/0.7 (tool-fetch)' },
+          signal: AbortSignal.timeout(DATE_PROBE_TIMEOUT_MS),
+        })
+      } catch {
+        return
+      }
+      if (!resp.ok || !resp.body) return
+
+      // Stream only as far as the byte cap: <head> comes first, so this reads the metadata
+      // without pulling whole articles across the wire.
+      let html = ''
+      try {
+        const reader = resp.body.getReader()
+        const decoder = new TextDecoder()
+        let read = 0
+        while (read < DATE_PROBE_MAX_BYTES) {
+          const { done, value } = await reader.read()
+          if (done) break
+          read += value.byteLength
+          html += decoder.decode(value, { stream: true })
+        }
+        await reader.cancel().catch(() => {})
+      } catch {
+        return
+      }
+
+      // extractPublishedDate funnels through normalizeIsoDate, so nothing but a bare
+      // 'YYYY-MM-DD' can reach the rendered block (F-019).
+      const iso = extractPublishedDate(html)
+      if (!iso) return
+      r.publishedDate = iso
+      r.ageDays = ageInDays(iso)
+      r.freshnessSignal = freshnessSignal(r.ageDays)
+    }),
+  )
+}
+
 export async function execWebSearch(args: Record<string, unknown>, searchCfg: SearchConfig): Promise<string> {
   const query = resolveSearchQuery(args)
   if (!query.trim()) return 'Error: query is required.'
@@ -167,6 +236,23 @@ export async function execWebSearch(args: Record<string, unknown>, searchCfg: Se
   }
 
   if (results.length === 0) return 'No results found.'
+
+  // Providers rarely supply dates on general search; read them off the pages instead, so the
+  // model can actually weigh a source's age instead of seeing "unknown" on every line.
+  await backfillPublishedDates(results)
+
+  // Now that ages are actually known, honour an explicit request for CURRENT information.
+  // This runs here rather than inside research()'s scorer because at scoring time almost every
+  // age is still unknown — applying it there let a 2007 encyclopedia article outrank a page
+  // published the same day, since an undated result escapes the constraint entirely.
+  if (freshness === 'current') {
+    for (const r of results) {
+      if (typeof r.ageDays === 'number') {
+        r.relevanceScore = Math.round(r.relevanceScore * currentnessMultiplier(r.ageDays) * 1000) / 1000
+      }
+    }
+    results.sort((a, b) => b.relevanceScore - a.relevanceScore)
+  }
 
   const retrieved = todayIso()
   // The query is echoed on one line: strip newlines so it cannot fake a `[N]` result block.
