@@ -21,11 +21,20 @@ export interface ResearchResult {
   freshnessSignal: 'recent' | 'dated' | 'unknown'
   /** Hostname extracted from url (e.g. "en.wikipedia.org"). */
   domain: string
+  /** Provider-supplied publish date, ISO 'YYYY-MM-DD'. Absent when unknown/unparseable. */
+  publishedDate?: string
+  /** Whole days between publishedDate and now. Absent when there is no publishedDate. */
+  ageDays?: number
 }
 
 const MIN_RELEVANCE_SCORE = 0.4
 const MAX_RESULTS = 5
 const MAX_SEARCH_RESULTS = 10
+
+/** F-021's decided threshold: at or under this age a result counts as fresh. */
+const FRESH_MAX_AGE_DAYS = 90
+/** Matches the pre-existing 'dated' bucket (3+ calendar years old). */
+const DATED_MIN_AGE_DAYS = 3 * 365
 
 // ── Trusted / penalised domain map ────────────────────────────────────────────
 
@@ -121,6 +130,18 @@ export function keywordOverlap(query: string, text: string): number {
 // ── Passage extraction ────────────────────────────────────────────────────────
 
 /**
+ * Tie-break rank for equally-scoring sentences: a markdown heading restates the
+ * question, a dated sentence usually carries the answer. Higher wins.
+ */
+function passagePriority(sentence: string): number {
+  const s = sentence.trim()
+  let rank = 0
+  if (/^#{1,6}\s/.test(s)) rank -= 2 // markdown heading
+  if (/\b(19|20)\d{2}\b/.test(s)) rank += 1 // carries a year / absolute date
+  return rank
+}
+
+/**
  * Return the sentence in `content` with the highest keyword overlap against `query`.
  * Falls back to the first 200 chars if no sentence boundary found.
  */
@@ -138,7 +159,7 @@ export function extractPassage(query: string, content: string): string {
   let bestScore = keywordOverlap(query, sentences[0])
   for (let i = 1; i < sentences.length; i++) {
     const s = keywordOverlap(query, sentences[i])
-    if (s > bestScore) {
+    if (s > bestScore || (s === bestScore && passagePriority(sentences[i]) > passagePriority(bestSentence))) {
       bestScore = s
       bestSentence = sentences[i]
     }
@@ -149,29 +170,83 @@ export function extractPassage(query: string, content: string): string {
 // ── Freshness signal ───────────────────────────────────────────────────────────
 
 /**
- * Simple heuristic: scan the content for date-like strings and gauge recency.
- * Only penalises when `freshness: 'current'`.
+ * Normalise a provider-supplied date to 'YYYY-MM-DD', or undefined.
+ * F-019: this value comes from remote content, so accept only a bare ISO calendar
+ * date that also survives Date parsing — anything else is dropped, never passed on.
  */
-function freshnessSignal(content: string, freshness?: 'current' | 'any'): 'recent' | 'dated' | 'unknown' {
-  if (!freshness || freshness === 'any') return 'unknown'
+export function normalizePublishedDate(raw?: string): string | undefined {
+  if (typeof raw !== 'string') return undefined
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw.trim())
+  if (!m) return undefined
+  const [, y, mo, d] = m
+  const ms = Date.UTC(Number(y), Number(mo) - 1, Number(d))
+  const dt = new Date(ms)
+  // Reject impossible calendar dates (e.g. 2026-02-31 rolling over into March).
+  if (dt.getUTCFullYear() !== Number(y) || dt.getUTCMonth() !== Number(mo) - 1 || dt.getUTCDate() !== Number(d)) {
+    return undefined
+  }
+  return `${y}-${mo}-${d}`
+}
 
-  // Look for year patterns in content
-  const currentYear = new Date().getFullYear()
+/** Whole days between an ISO date and `now`. Future dates clamp to 0. */
+export function ageInDays(isoDate: string, now: number = Date.now()): number | undefined {
+  const normalized = normalizePublishedDate(isoDate)
+  if (!normalized) return undefined
+  const published = Date.parse(`${normalized}T00:00:00Z`)
+  if (Number.isNaN(published)) return undefined
+  return Math.max(0, Math.floor((now - published) / 86_400_000))
+}
+
+/**
+ * Weak prose hint used only when the provider gave us no publish date: the newest
+ * year mentioned in the snippet. Never authoritative — a page can quote any year.
+ */
+function yearMentionHint(content: string): 'recent' | 'dated' | 'unknown' {
   const yearMatches = content.match(/\b(20\d{2})\b/g)
   if (!yearMatches) return 'unknown'
-
-  const years = yearMatches.map(Number)
-  const maxYear = Math.max(...years)
+  const currentYear = new Date().getFullYear()
+  const maxYear = Math.max(...yearMatches.map(Number))
   if (maxYear >= currentYear - 1) return 'recent'
   if (maxYear <= currentYear - 3) return 'dated'
   return 'unknown'
 }
 
-function freshnessScore(signal: 'recent' | 'dated' | 'unknown', freshness?: 'current' | 'any'): number {
-  if (!freshness || freshness === 'any') return 0.5 // neutral
-  if (signal === 'recent') return 0.9
-  if (signal === 'dated') return 0.2
-  return 0.5 // unknown → neutral
+/**
+ * Recency label from the real publish date when we have one, at any `freshness`
+ * setting — the model has no other way to tell how old a result is.
+ * With no date we report 'unknown' rather than guessing from prose: the year a
+ * snippet happens to mention says nothing reliable about when it was published.
+ */
+function freshnessSignal(ageDays?: number): 'recent' | 'dated' | 'unknown' {
+  if (ageDays === undefined) return 'unknown'
+  if (ageDays <= FRESH_MAX_AGE_DAYS) return 'recent'
+  if (ageDays >= DATED_MIN_AGE_DAYS) return 'dated'
+  return 'unknown'
+}
+
+/**
+ * Freshness component of the composite score.
+ * Default/'any' stays flat-neutral so ranking is byte-identical to pre-date behaviour
+ * (the conservative default). Only `freshness: 'current'` actually penalises age,
+ * which is what F-021 decided and what the tool description promises the model.
+ */
+function freshnessScore(ageDays: number | undefined, content: string, freshness?: 'current' | 'any'): number {
+  if (freshness !== 'current') return 0.5 // neutral
+
+  if (ageDays !== undefined) {
+    if (ageDays <= FRESH_MAX_AGE_DAYS) return 1
+    if (ageDays <= 180) return 0.6
+    if (ageDays <= 365) return 0.4
+    if (ageDays < DATED_MIN_AGE_DAYS) return 0.2
+    return 0.1
+  }
+
+  // No date: nudge only. Kept inside 0.45–0.6 so a dateless result never sinks
+  // below a genuinely fresh one or outranks it on prose alone.
+  const hint = yearMentionHint(content)
+  if (hint === 'recent') return 0.6
+  if (hint === 'dated') return 0.45
+  return 0.5
 }
 
 // ── Main research function ────────────────────────────────────────────────────
@@ -193,18 +268,23 @@ export async function research(
 
   let raw
   try {
-    raw = await client.search(q.query, MAX_SEARCH_RESULTS)
+    // Only ask the provider to restrict by recency when the caller explicitly wants
+    // current results — otherwise the request is exactly what it was before.
+    raw = await client.search(q.query, MAX_SEARCH_RESULTS, q.freshness === 'current' ? { recent: true } : undefined)
   } catch {
     return []
   }
 
+  const now = Date.now()
   const scored: ResearchResult[] = raw.map((r) => {
     const domain = extractDomain(r.url)
     const text = `${r.title} ${r.content}`
     const kwScore = keywordOverlap(q.query, text)
     const ds = domainScore(r.url)
-    const signal = freshnessSignal(r.content, q.freshness)
-    const fs = freshnessScore(signal, q.freshness)
+    const publishedDate = normalizePublishedDate(r.publishedDate)
+    const ageDays = publishedDate ? ageInDays(publishedDate, now) : undefined
+    const signal = freshnessSignal(ageDays)
+    const fs = freshnessScore(ageDays, r.content, q.freshness)
     const relevanceScore = 0.5 * kwScore + 0.3 * ds + 0.2 * fs
     const passage = extractPassage(q.query, r.content)
 
@@ -215,6 +295,8 @@ export async function research(
       relevanceScore: Math.round(relevanceScore * 1000) / 1000,
       freshnessSignal: signal,
       domain,
+      publishedDate,
+      ageDays,
     }
   })
 

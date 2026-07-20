@@ -15,7 +15,7 @@ export const WEB_SEARCH_TOOL = {
       'Search the web for real-time information. Call this BEFORE answering any question that depends on current events, recent data, prices, specific facts, or anything your training data may not cover accurately. ' +
       'Formulate a precise, keyword-focused query — include names, dates, or version numbers when relevant. ' +
       'Run multiple focused searches rather than one broad one for complex questions. ' +
-      'Results are pre-ranked by relevance — each entry includes a relevanceScore (0–1), a key passage, and a source URL.',
+      'Results are pre-ranked by relevance — each entry includes a relevanceScore (0–1), a key passage, a source URL, and the publication date when the source reports one.',
     parameters: {
       type: 'object',
       properties: {
@@ -34,7 +34,11 @@ export const WEB_SEARCH_TOOL = {
         freshness: {
           type: 'string',
           enum: ['current', 'any'],
-          description: 'Optional: "current" penalises results older than 90 days. Use for breaking news or time-sensitive queries.',
+          description:
+            'Optional: "current" asks the search provider for recent results and penalises sources published more than 90 days ago. ' +
+            'Pass "current" whenever the answer can go stale: questions using latest/newest/current/right now/this year, ' +
+            'software releases and version numbers, prices, benchmarks, rankings, ongoing events, and news. ' +
+            'Omit it (or pass "any") for timeless background facts such as definitions, history, or how something works.',
         },
       },
       required: ['query'],
@@ -76,6 +80,49 @@ export const RUN_CODE_TOOL = {
 
 export { type ResearchResult }
 
+/** PURE: today's date as 'YYYY-MM-DD' (UTC), stamped on results so the model can tell how old
+ *  a source is instead of guessing from its training cutoff. */
+function todayIso(): string {
+  return new Date().toISOString().slice(0, 10)
+}
+
+/** PURE: accept only a strict, real 'YYYY-MM-DD' calendar date in a sane range, else undefined.
+ *  Every date rendered by this module comes from remote pages or search providers, so this is the
+ *  single choke point that keeps untrusted text out of the result block — nothing containing a
+ *  '|' or a newline can survive it, so a hostile page cannot forge extra fields or result entries. */
+export function normalizeIsoDate(raw: string | undefined): string | undefined {
+  if (!raw) return undefined
+  const match = /\d{4}-\d{2}-\d{2}/.exec(raw)
+  if (!match) return undefined
+  const iso = match[0]
+  const ms = Date.parse(`${iso}T00:00:00Z`)
+  if (Number.isNaN(ms)) return undefined
+  // Rejects calendar-invalid dates that would otherwise roll over (e.g. 2026-02-31).
+  if (new Date(ms).toISOString().slice(0, 10) !== iso) return undefined
+  const year = Number(iso.slice(0, 4))
+  // Absurd dates: pre-web, or far enough ahead to be a broken clock rather than a scheduled post.
+  if (year < 1990 || year > new Date().getUTCFullYear() + 1) return undefined
+  return iso
+}
+
+/** PURE: flatten remote text to a single line. The result block is newline-delimited and
+ *  re-parsed by chat-routes.ts, so any page-controlled field that is allowed to contain a
+ *  newline can forge an entire extra `[N]` source entry (F-019). */
+function oneLine(s: string): string {
+  return s.replace(/\s+/g, ' ').trim()
+}
+
+/** PURE: render a result's publication date for the model, e.g. "2026-07-14 (6 days ago)".
+ *  Says "unknown" rather than staying silent — an absent date must not read as a fresh one. */
+function publishedLabel(r: ResearchResult): string {
+  const iso = normalizeIsoDate(r.publishedDate)
+  if (!iso) return 'unknown'
+  const age = r.ageDays
+  if (typeof age !== 'number' || !Number.isFinite(age) || age < 0) return iso
+  if (age === 0) return `${iso} (today)`
+  return `${iso} (${age === 1 ? '1 day' : `${age} days`} ago)`
+}
+
 /** PURE: the schema declares a single required `query: string`, but a model sometimes emits
  *  `queries: string[]` instead (seen from a small local model whose tool-calling drifted from
  *  the declared schema) — fall back to the first entry rather than silently treating the call
@@ -102,17 +149,103 @@ export async function execWebSearch(args: Record<string, unknown>, searchCfg: Se
 
   if (results.length === 0) return 'No results found.'
 
-  const lines: string[] = [`RESEARCH RESULTS (${results.length} ranked results for "${query}"):`]
+  const retrieved = todayIso()
+  // The query is echoed on one line: strip newlines so it cannot fake a `[N]` result block.
+  const lines: string[] = [
+    `RESEARCH RESULTS (${results.length} ranked results for "${query.replace(/\s+/g, ' ')}"):`,
+    `Retrieved: ${retrieved} — this search ran today, so treat ${retrieved} as the current date. ` +
+      'Weigh each result against its Published date; "Published: unknown" means the source reported no date, not that it is current.',
+  ]
   for (const [i, r] of results.entries()) {
-    lines.push(`\n[${i + 1}] ${r.title}`)
+    // Title and passage are attacker-controlled page text and both terminate a line of this
+    // block format, so both are collapsed to a single line. Without this a page whose winning
+    // sentence contains newlines can emit its own `[N]/Source:/Domain:/Key passage:` block —
+    // verified to forge a fully-attacker-controlled entry that chat-routes.ts then persists as
+    // a real citation. extractPassage returns ONE sentence by design, so nothing is lost.
+    lines.push(`\n[${i + 1}] ${oneLine(r.title)}`)
     lines.push(`Source: ${r.url}`)
-    lines.push(`Domain: ${r.domain} | Relevance: ${r.relevanceScore.toFixed(2)} | Freshness: ${r.freshnessSignal}`)
-    lines.push(`Key passage: ${r.passage}`)
+    // Published/Retrieved are appended AFTER Freshness on purpose: chat-routes.ts re-parses this
+    // exact line into the UI's sources panel, and this ordering keeps its prefix match intact.
+    lines.push(`Domain: ${r.domain} | Relevance: ${r.relevanceScore.toFixed(2)} | Freshness: ${r.freshnessSignal} | Published: ${publishedLabel(r)} | Retrieved: ${retrieved}`)
+    lines.push(`Key passage: ${oneLine(r.passage)}`)
   }
   return lines.join('\n').trim()
 }
 
 // ── Fetch URL ─────────────────────────────────────────────────────────────
+
+/** Meta name/property keys that carry a publication date, lowercased. */
+const DATE_META_KEYS = new Set([
+  'article:published_time',
+  'og:article:published_time',
+  'og:published_time',
+  'datepublished',
+  'date',
+  'dc.date',
+  'dc.date.issued',
+  'pubdate',
+  'publish-date',
+])
+
+/**
+ * PURE: best-effort publication date from raw HTML, in priority order:
+ * JSON-LD `datePublished` → publication-date `<meta>` → `<time datetime>`.
+ * Returns 'YYYY-MM-DD' or undefined.
+ *
+ * Must run on the RAW html: the strip chain in execFetchUrl removes <script> (killing JSON-LD)
+ * and every tag attribute (killing <meta content> and <time datetime>), so by the time the model
+ * sees the page, all three date signals are already gone.
+ */
+export function extractPublishedDate(html: string): string | undefined {
+  // Matched by regex rather than JSON.parse — the page is untrusted and we only ever want a
+  // date-shaped substring out of it, never a parsed object graph.
+  for (const block of html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
+    const iso = normalizeIsoDate(/"datePublished"\s*:\s*"([^"]{1,64})"/i.exec(block[1])?.[1])
+    if (iso) return iso
+  }
+
+  // Attribute order varies across sites, so match the whole tag and pick the pieces out of it.
+  for (const tag of html.matchAll(/<meta\s[^>]*>/gi)) {
+    const key = /\b(?:property|name|itemprop)\s*=\s*["']([^"']{1,64})["']/i.exec(tag[0])?.[1]
+    if (!key || !DATE_META_KEYS.has(key.trim().toLowerCase())) continue
+    const iso = normalizeIsoDate(/\bcontent\s*=\s*["']([^"']{1,64})["']/i.exec(tag[0])?.[1])
+    if (iso) return iso
+  }
+
+  for (const tag of html.matchAll(/<time\s[^>]*>/gi)) {
+    const iso = normalizeIsoDate(/\bdatetime\s*=\s*["']([^"']{1,64})["']/i.exec(tag[0])?.[1])
+    if (iso) return iso
+  }
+
+  return undefined
+}
+
+/** Meta keys carrying a LAST-MODIFIED date, lowercased. */
+const MODIFIED_META_KEYS = new Set(['article:modified_time', 'og:updated_time', 'datemodified', 'last-modified', 'dc.date.modified'])
+
+/**
+ * PURE: best-effort LAST-MODIFIED date from raw HTML ('YYYY-MM-DD' or undefined).
+ *
+ * Why this exists: on a living document `datePublished` is the CREATION date and is
+ * actively misleading about how current the content is. Measured on
+ * en.wikipedia.org/wiki/Qwen — datePublished 2024-11-29, dateModified 2026-07-19, with
+ * body text current to May 2026. Reporting only "Published: 2024-11-29" tells the model
+ * to discount the freshest source it has, which is the exact failure this whole change
+ * set exists to fix, just inverted. Both dates are reported so the model can judge.
+ */
+export function extractModifiedDate(html: string): string | undefined {
+  for (const block of html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
+    const iso = normalizeIsoDate(/"dateModified"\s*:\s*"([^"]{1,64})"/i.exec(block[1])?.[1])
+    if (iso) return iso
+  }
+  for (const tag of html.matchAll(/<meta\s[^>]*>/gi)) {
+    const key = /\b(?:property|name|itemprop)\s*=\s*["']([^"']{1,64})["']/i.exec(tag[0])?.[1]
+    if (!key || !MODIFIED_META_KEYS.has(key.trim().toLowerCase())) continue
+    const iso = normalizeIsoDate(/\bcontent\s*=\s*["']([^"']{1,64})["']/i.exec(tag[0])?.[1])
+    if (iso) return iso
+  }
+  return undefined
+}
 
 export async function execFetchUrl(args: Record<string, unknown>): Promise<string> {
   const url = String(args.url ?? '').trim()
@@ -135,8 +268,12 @@ export async function execFetchUrl(args: Record<string, unknown>): Promise<strin
   const contentType = resp.headers.get('content-type') ?? ''
   const text = await resp.text().catch(() => '')
   let content: string
+  let published: string | undefined
+  let modified: string | undefined
 
   if (contentType.includes('text/html')) {
+    published = extractPublishedDate(text)
+    modified = extractModifiedDate(text)
     // Strip HTML tags and collapse whitespace
     content = text
       .replace(/<script[\s\S]*?<\/script>/gi, '')
@@ -153,9 +290,18 @@ export async function execFetchUrl(args: Record<string, unknown>): Promise<strin
     content = text.trim()
   }
 
-  // Truncate to ~4000 chars to fit comfortably in the context window
-  if (content.length > 4000) content = content.slice(0, 4000) + '\n[truncated]'
-  return content || '(empty response)'
+  // Built only from validated ISO dates and today's date — no page text reaches this line, so a
+  // hostile document cannot spoof or overrun it. `Updated` is emitted only when the page reports a
+  // modified date NEWER than its published date: on a living document (wiki, changelog, docs page)
+  // the published date alone would make a source updated yesterday look years stale.
+  const header = modified && modified > (published ?? '')
+    ? `Published: ${published ?? 'unknown'} | Updated: ${modified} | Retrieved: ${todayIso()}`
+    : `Published: ${published ?? 'unknown'} | Retrieved: ${todayIso()}`
+
+  // Truncate to ~4000 chars (header included) to fit comfortably in the context window
+  const budget = 4000 - header.length - 1
+  if (content.length > budget) content = content.slice(0, budget) + '\n[truncated]'
+  return `${header}\n${content || '(empty response)'}`
 }
 
 // ── Run code ─────────────────────────────────────────────────────────────
