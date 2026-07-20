@@ -221,6 +221,44 @@ export async function backfillPublishedDates(results: ResearchResult[]): Promise
   )
 }
 
+/**
+ * Why web_search cannot run. Structural, not per-engine and not per-provider:
+ *  - 'not_configured'  — no search provider is set up, so the tool exists but cannot execute.
+ *  - 'tools_unreachable' — the tool list never reached the model at all. Today that is the
+ *    engine-kind gate in chat-routes.ts (ADR-111: vLLM/SGLang reject a `tools` array unless
+ *    launched with --enable-auto-tool-choice and a --tool-call-parser), but it equally covers
+ *    an empty registry or an Agent allow-list that filtered web_search out. Anything that
+ *    leaves the model unable to search reports the same way, so a future engine with the same
+ *    limitation degrades honestly without anyone adding its name here.
+ */
+export type WebSearchUnavailableReason = 'not_configured' | 'tools_unreachable'
+
+/**
+ * PURE: the honest explanation shown to the MODEL when a research turn cannot search.
+ *
+ * Why this exists: the Research persona's prompt asserts it has searched, and the engine-kind
+ * gate suppresses tools SILENTLY — so on an engine that cannot receive tools the model
+ * performs zero searches, answers purely from training data, and the user gets a confident,
+ * uncited, potentially years-stale answer with nothing indicating anything went wrong. That is
+ * the same reported "stale data" symptom as a bad ranking, but invisible. Telling the model
+ * plainly that it has no search access converts a silent wrong answer into a stated limitation.
+ *
+ * Deliberately topic-agnostic: it describes the CAPABILITY that is missing and says nothing
+ * about the subject being researched, so it reads the same for a medical, legal or sports
+ * question.
+ */
+export function webSearchUnavailableMessage(reason: WebSearchUnavailableReason): string {
+  const cause = reason === 'not_configured'
+    ? 'No web-search provider is configured (Settings → Tools).'
+    : 'Web search is not available in this conversation — the active engine did not receive the tool list.'
+  return (
+    `${cause} You CANNOT search the web on this turn, and no results will arrive however many times you ask. ` +
+    'Answer from your own knowledge only, and say so plainly at the top of your reply: state that you could not search, ' +
+    'that what follows is from training data which may be out of date, and flag anything that is likely to have changed since. ' +
+    'Do not claim or imply that you searched, do not invent sources, citations, URLs or dates, and do not emit a confidence line.'
+  )
+}
+
 export async function execWebSearch(args: Record<string, unknown>, searchCfg: SearchConfig): Promise<string> {
   const query = resolveSearchQuery(args)
   if (!query.trim()) return 'Error: query is required.'
@@ -357,6 +395,29 @@ export function extractModifiedDate(html: string): string | undefined {
   return undefined
 }
 
+/**
+ * Ceiling on the total characters fetch_url returns for one page, header included.
+ *
+ * Raised from 4,000 (ADR-230, quality over speed). The tradeoff is real in both directions:
+ * a bigger ceiling costs prefill time and context on every fetch, but 4,000 chars is roughly
+ * the first screen of a page, and the substance of the documents worth fetching — a spec
+ * table, a reference page, a guidance document, a filing — reliably sits BELOW the
+ * navigation, boilerplate and intro that the strip chain leaves in place. Measured effect of
+ * the old cap: the model fetched an authoritative source, got its masthead, and answered
+ * from memory anyway, which is the failure fetch_url exists to prevent. 20,000 chars is
+ * ~5k tokens: affordable several times over in the long contexts that are routine on target
+ * hardware, and still far below any single page's full text, so a hostile or merely enormous
+ * document cannot flood the window. Tune here — nothing else depends on the value.
+ */
+export const FETCH_URL_MAX_CHARS = 20_000
+
+/** Appended when a page is cut, so the model knows it is looking at a PREFIX and can decide
+ *  to fetch a more specific URL rather than concluding the page did not contain the answer.
+ *  Static text: no page content reaches it, so it cannot be spoofed into a different field. */
+const FETCH_URL_TRUNCATION_MARKER =
+  '\n[truncated: this page was longer than the fetch limit and is cut off here. ' +
+  'If the answer is not above, fetch a more specific URL on this site rather than assuming the page lacks it.]'
+
 export async function execFetchUrl(args: Record<string, unknown>): Promise<string> {
   const url = String(args.url ?? '').trim()
   if (!url) return 'Error: url is required.'
@@ -408,9 +469,10 @@ export async function execFetchUrl(args: Record<string, unknown>): Promise<strin
     ? `Published: ${published ?? 'unknown'} | Updated: ${modified} | Retrieved: ${todayIso()}`
     : `Published: ${published ?? 'unknown'} | Retrieved: ${todayIso()}`
 
-  // Truncate to ~4000 chars (header included) to fit comfortably in the context window
-  const budget = 4000 - header.length - 1
-  if (content.length > budget) content = content.slice(0, budget) + '\n[truncated]'
+  // Reserve room for the marker so a truncated page still fits under the ceiling — the old
+  // code sliced to the full budget and THEN appended, overshooting by the marker's length.
+  const budget = FETCH_URL_MAX_CHARS - header.length - 1 - FETCH_URL_TRUNCATION_MARKER.length
+  if (content.length > budget) content = content.slice(0, budget) + FETCH_URL_TRUNCATION_MARKER
   return `${header}\n${content || '(empty response)'}`
 }
 

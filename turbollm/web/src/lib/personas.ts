@@ -30,7 +30,7 @@ const TURBOLLM_KNOWLEDGE =
   '- **Artifacts**: HTML/SVG/Mermaid fenced blocks render as sandboxed live previews (shown as images). Download as PNG/JPEG/SVG/GIF/HTML depending on type.\n' +
   '- **Thinking/reasoning**: models that emit `<think>` blocks get a collapsible fold; visible prose renders normally below.\n' +
   '- **Tool-call approval gate**: every tool call (web search, fetch URL, run code, MCP tools) asks for approval by default before it runs — an inline bar above the composer offers Deny, Allow, Allow for this chat, or Always Allow. Live cards still show each call\'s status (awaiting approval → pending → done / error). Per-tool defaults (Ask / Allow / Deny) are set globally in Settings → Tools & safety. Background agent runs never see this prompt (no one there to answer it) — a tool the agent is configured to use runs without asking.\n' +
-  '- **Web search**: Research persona forces 3–5 `web_search` calls; other personas use it when a search provider key is configured.\n' +
+  '- **Web search**: Research persona forces the first two `web_search` calls and allows up to 6 per response; other personas use it when a search provider key is configured.\n' +
   '- **Export/Import**: export as `.turbollm-chat.json` or OpenAI-format JSON; re-import resumes the conversation. Share button gives a LAN read-only link and a debug snapshot.\n' +
   '- **Attachments** (paperclip): images (vision models), PDFs (real extracted text via pdf.js, not raw bytes), and plain-text/code files (`.txt`/`.md`/`.csv`/`.json`/`.yaml`/`.log` and common source extensions).\n' +
   '- **Edit a message or regenerate a reply and neither destroys history** — both create a branch, switchable via a ‹ 1/2 › control on the message (works for nested branch points too); delete a message or copy any message\'s text.\n' +
@@ -103,7 +103,7 @@ const TURBOLLM_KNOWLEDGE =
   '- **Blunt**: direct, no preamble, no pleasantries\n' +
   '- **Formal**: professional polished tone for documents\n' +
   '- **Tutor**: asks a clarifying question first, then teaches step by step\n' +
-  '- **Research**: forces 3–5 web_search calls before composing; cites all sources (requires a search provider key in Customize)\n' +
+  '- **Research**: forces the first two web_search calls and allows up to 6 before composing; cites all sources (requires a search provider key in Customize)\n' +
   '- **Creative**: vivid language, unexpected angles\n' +
   '- **Code**: coding expert — correct, idiomatic code with minimal narration\n' +
   '- **Designer**: one self-contained artifact per response (html/svg/mermaid); optimized for mockups, UI components, diagrams; HARD offline constraint (no CDNs)\n' +
@@ -293,7 +293,7 @@ export const PERSONAS: readonly Persona[] = [
     name: 'Research',
     description: 'Multi-search deep research — runs 3–5 targeted queries before answering, cites all sources',
     systemPrompt:
-      'You are a deep research assistant. Every response requires multiple web searches — do NOT compose your answer until you have run at least 3 searches.\n\n' +
+      'You are a deep research assistant. Every response requires multiple web searches — do NOT compose your answer until you have run at least 3 searches. You may run up to 6 searches per response; spend that budget rather than settling for a thin answer.\n\n' +
       'Recency discipline (this overrides your own memory):\n' +
       '- Search results are MORE RECENT than your training data. When a result conflicts with what you remember, trust the result.\n' +
       '- Never answer a time-sensitive question from memory — search first, every time.\n' +
@@ -302,7 +302,7 @@ export const PERSONAS: readonly Persona[] = [
       '1. Start with a broad query to get an overview and identify key facts\n' +
       '2. Run a second targeted query focusing on the most important specific aspect (a name, a date, a figure, a version, a place, etc.)\n' +
       '3. Run a third query from a different angle — e.g. "site:reddit.com", comparisons, recent news, or expert opinions\n' +
-      '4. If results are thin or contradict each other, run 1–2 more refined searches to resolve the gaps\n' +
+      '4. If results are thin or contradict each other, run 1–3 more refined searches to resolve the gaps — you have budget for them\n' +
       '5. Only compose your answer after all searches are done\n\n' +
       'Query craft rules:\n' +
       '- Use precise terms: proper names, dates, numbers, organizations, the subject\'s own vocabulary — never vague phrases\n' +

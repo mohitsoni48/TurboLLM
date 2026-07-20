@@ -1,7 +1,13 @@
 // F-021: deterministic retrieval service.
 // Wraps the pluggable search provider (F-020) and scores/ranks/filters results
 // without any LLM calls — pure string/math, fully testable.
-import { searchProviderClient, searchConfigured, type SearchConfig, type FetchImpl } from './search-providers.js'
+import {
+  searchProviderClient,
+  searchConfigured,
+  type SearchConfig,
+  type FetchImpl,
+  type SearchResult,
+} from './search-providers.js'
 
 export interface ResearchQuery {
   query: string
@@ -273,17 +279,29 @@ export function officialDocsBoost(url: string): number {
   }
 }
 
-/** The universal listicle/roundup signature. Subject-independent by construction: these fire
- *  on "Best Mattresses 2026" and "Top 10 Diets Ranked" exactly as on tech roundups. */
-const AGGREGATOR_PATTERNS: RegExp[] = [
+/** The universal listicle/roundup vocabulary. Subject-independent by construction: these fire
+ *  on "Best Mattresses 2026" and "Top 10 Diets Ranked" exactly as on tech roundups.
+ *
+ *  Split out from AGGREGATOR_PATTERNS because these are the *deletable* ones — each matches a
+ *  self-contained bait phrase, so debaitQuery() can excise it from a user's question and leave a
+ *  grammatical query behind. Single source of truth on purpose: the page-shape penalty and the
+ *  query reformulator must never disagree about what counts as bait. */
+const AGGREGATOR_BAIT: RegExp[] = [
   /\bbest\b/,
-  /\btop\s+\d+/,
+  /\btop\s+\d+\b/,
   /\b\d+\s+(best|top|ways|reasons|tips|things|ideas|alternatives)\b/,
   /\bultimate\s+guide\b/,
   /\branked\b/,
   /\breviews?\b|\breviewed\b/,
   /\bround\s?up\b/,
   /\b(vs|versus)\b/,
+]
+
+/** The universal listicle/roundup signature: the deletable vocabulary plus span-shaped patterns
+ *  that only make sense as detectors. `which … should you` spans arbitrary text between its two
+ *  halves, so deleting the whole match would swallow the subject of the question with it. */
+const AGGREGATOR_PATTERNS: RegExp[] = [
+  ...AGGREGATOR_BAIT,
   /\bwhich\b[\s\S]*\bshould\s+you\b/,
 ]
 
@@ -320,6 +338,85 @@ export function aggregatorPenalty(title: string, url: string, intent?: string): 
   // A year alongside a listicle marker is the annual-refresh signature ("Best X in 2026"),
   // where the year is a republish stamp rather than evidence of new reporting.
   return /\b(19|20)\d{2}\b/.test(text) ? 0.2 : 0.15
+}
+
+/** Bait that only exists in a *question*, so it has no page-shape counterpart in
+ *  AGGREGATOR_PATTERNS. A bare year is included here and not there for the same reason
+ *  aggregatorPenalty treats it as a modifier rather than a trigger: on a page it is an
+ *  annual-refresh stamp, and in a query it pins retrieval to roundups republished that year. */
+/**
+ * Substantive-term count for the "is anything left to search for?" guard.
+ *
+ * Deliberately NOT tokenize(): that one is ASCII-only (`\W` is `[^A-Za-z0-9_]`) and it scores
+ * every result in the system, so widening it would shift every relevance score. Here the only
+ * question is whether the debaited query still says something, and an ASCII split erases a CJK
+ * or Cyrillic query outright — which would silently deny the fan-out to exactly the users who
+ * are not searching in English. Minimum length 2, because a CJK word routinely is two characters.
+ */
+function substantiveTermCount(text: string): number {
+  return text
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter((t) => t.length >= 2 && !STOP_WORDS.has(t)).length
+}
+
+const QUERY_ONLY_BAIT: RegExp[] = [
+  /\bwhich\b/gi,
+  /\bshould\s+(you|i|we)\b/gi,
+  /\b(19|20)\d{2}\b/g,
+]
+
+/**
+ * Rewrite an aggregator-shaped question into the substantive terms underneath it, or return
+ * null when there is no bait to strip.
+ *
+ * Re-ranking can only reorder what the provider returned, and for a listicle-shaped question the
+ * entire top-10 can be roundups — measured. A human researcher reformulates at that point, so we
+ * do the same mechanically: "best opensource LLMs I can use with 16gb vram" is phrasing that
+ * ranks roundups, while the same question without "best" ranks documentation and specs. Universal
+ * by construction, because it strips the same vocabulary the roundup detector already knows:
+ * "best mattress for back pain" → "mattress for back pain", "top 10 exercises for lower back
+ * pain ranked" → "exercises for lower back pain".
+ *
+ * Only the bait is removed. Ordinary filler ("that I can use with") is left alone deliberately —
+ * search providers already discount it, and shredding a query into keywords risks changing what
+ * was asked, which is the one thing a reformulation must not do.
+ */
+export function debaitQuery(query: string): string | null {
+  if (typeof query !== 'string' || !query.trim()) return null
+
+  // Same exemptions the penalty uses: "best practices" is documentation language and a
+  // systematic/literature review is a primary source, so neither is bait worth stripping —
+  // and stripping it would actively corrupt the query ("systematic review of statins").
+  const lower = query.toLowerCase()
+  if (AGGREGATOR_EXEMPTIONS.some((re) => re.test(lower))) return null
+
+  // Detection uses the FULL pattern set but deletion only the deletable subset, so a
+  // `which … should you` question still qualifies for a reformulation without its subject being
+  // swallowed by the span match. A query carrying no roundup vocabulary at all is already the
+  // substantive form: its pool is the pool we want, and a second call would just burn a request.
+  if (!AGGREGATOR_PATTERNS.some((re) => re.test(lower))) return null
+
+  let out = query
+  for (const re of AGGREGATOR_BAIT) {
+    // The shared patterns are stored unflagged (aggregatorPenalty only tests them); rebuild each
+    // as a fresh global/case-insensitive copy so there is no shared lastIndex to leak between calls.
+    out = out.replace(new RegExp(re.source, 'gi'), ' ')
+  }
+  // Gated behind the bait check on purpose. A year is only noise NEXT TO roundup vocabulary
+  // ("Best Mattresses 2026"); on its own it is usually the whole point of the question, and
+  // turning "who won the 1974 World Cup" into "who won the World Cup" would be a regression.
+  for (const re of QUERY_ONLY_BAIT) out = out.replace(re, ' ')
+
+  // Collapse the holes left behind, then trim leading/trailing punctuation the bait was attached
+  // to ("Best: mattresses?" → "mattresses"). Unicode-aware so non-Latin queries survive intact.
+  out = out.replace(/\s+/g, ' ').trim().replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '').trim()
+
+  if (!out || out.toLowerCase() === query.trim().toLowerCase()) return null
+  // Under two substantive terms there is nothing left to retrieve on — "best of 2026" reduces to
+  // noise, and searching noise costs a provider call for results that cannot outrank the primary.
+  if (substantiveTermCount(out) < 2) return null
+  return out
 }
 
 /**
@@ -534,12 +631,115 @@ function freshnessScore(ageDays: number | undefined, content: string, freshness?
   return 0.5
 }
 
+// ── Deduplication ─────────────────────────────────────────────────────────────
+//
+// Providers routinely return the same page more than once — measured live: one bank's site held
+// ranks 3 AND 6 with an identical date, another took ranks 1 AND 2. On an 8-result budget that is
+// up to a quarter of the model's context spent re-reading a page it has already read, and the
+// distinct source that would have filled the slot is never seen. Deduping the raw pool *before*
+// scoring is what makes the 8 surfaced results 8 distinct pages.
+
+/** Query params that identify a campaign or a referrer rather than a page. Only these are
+ *  dropped: for a great many sites (search results, article ids, product variants, pagination)
+ *  the query string IS the page identity, so blanket-stripping it would merge distinct pages. */
+const TRACKING_PARAMS =
+  /^(utm_[a-z0-9_]+|fbclid|gclid|dclid|msclkid|mc_cid|mc_eid|igshid|ref|referrer|source)$/i
+
+/**
+ * Canonical identity key for a URL. Deliberately not a valid URL — it exists only to answer
+ * "are these two results the same page?".
+ *
+ * Scheme is dropped entirely (http and https serve one page and providers mix them), as is a
+ * leading "www.", the fragment (same document, different anchor) and any trailing slash.
+ * Remaining params are kept but sorted, since their order is not part of a page's identity.
+ */
+export function normalizeUrlIdentity(url: string): string {
+  const raw = String(url ?? '').trim()
+  try {
+    const u = new URL(raw.startsWith('http') ? raw : `https://${raw}`)
+    for (const key of [...u.searchParams.keys()]) {
+      if (TRACKING_PARAMS.test(key)) u.searchParams.delete(key)
+    }
+    u.searchParams.sort()
+    const host = u.hostname.toLowerCase().replace(/^www\./, '')
+    const path = u.pathname.replace(/\/+$/, '')
+    const qs = u.searchParams.toString()
+    return `${host}${path}${qs ? `?${qs}` : ''}`
+  } catch {
+    // Unparseable input still deserves exact-match dedupe rather than being dropped.
+    return raw.toLowerCase()
+  }
+}
+
+/** Whitespace/case-insensitive headline identity. */
+function normalizeTitleIdentity(title: string): string {
+  return String(title ?? '').trim().replace(/\s+/g, ' ').toLowerCase()
+}
+
+/**
+ * Which copy of a duplicated page to keep. NOT "the first one seen": a publish date is the
+ * scarcer signal (freshness ranking and the `current` constraint both depend on it, and the
+ * backfill pass downstream costs a page fetch to recover one), and after that more content
+ * simply means more for extractPassage to work with.
+ */
+function isBetterDuplicate(candidate: SearchResult, incumbent: SearchResult): boolean {
+  const candidateDated = !!candidate.publishedDate
+  const incumbentDated = !!incumbent.publishedDate
+  if (candidateDated !== incumbentDated) return candidateDated
+  return (candidate.content?.length ?? 0) > (incumbent.content?.length ?? 0)
+}
+
+/** Collapse groups sharing a key, keeping the best member of each in the position the group
+ *  first appeared. A null key means "never a duplicate" and passes straight through. */
+function collapseBy(
+  results: SearchResult[],
+  keyOf: (r: SearchResult) => string | null,
+): SearchResult[] {
+  const seenAt = new Map<string, number>()
+  const out: SearchResult[] = []
+  for (const r of results) {
+    const key = keyOf(r)
+    if (key === null) {
+      out.push(r)
+      continue
+    }
+    const at = seenAt.get(key)
+    if (at === undefined) {
+      seenAt.set(key, out.length)
+      out.push(r)
+    } else if (isBetterDuplicate(r, out[at])) {
+      out[at] = r
+    }
+  }
+  return out
+}
+
+/**
+ * Remove duplicate pages from a raw provider pool, preserving provider order otherwise.
+ * Two passes, because the same page hides behind two different disguises.
+ */
+export function dedupeSearchResults(results: SearchResult[]): SearchResult[] {
+  // 1. Same URL once normalised — the tracking-param / scheme / www / trailing-slash variants.
+  const byUrl = collapseBy(results, (r) => (r?.url ? normalizeUrlIdentity(r.url) : null))
+
+  // 2. Same site AND same headline at different paths. This is the ordinary CMS shape (an article
+  //    reachable via its section route, its dated permalink and an AMP/print copy), which the URL
+  //    pass cannot catch. Scoped to one host on purpose: two different outlets legitimately publish
+  //    under the same headline, and those are genuinely two sources.
+  return collapseBy(byUrl, (r) => {
+    const title = normalizeTitleIdentity(r?.title ?? '')
+    if (!title) return null
+    return `${extractDomain(r.url ?? '')}\u0000${title}`
+  })
+}
+
 // ── Main research function ────────────────────────────────────────────────────
 
 /**
- * Run a web search via the configured provider, then deterministically score,
- * rank, filter (≥0.4), and cap (top MAX_RESULTS) the results. Returns ResearchResult[].
- * Returns [] if the provider is not configured.
+ * Run a web search via the configured provider — plus, when the question is aggregator-shaped,
+ * one concurrent debaited reformulation — then dedupe the merged pool and deterministically
+ * score, rank, filter (≥0.4) and cap (top MAX_RESULTS) the results. Returns ResearchResult[].
+ * Returns [] if the provider is not configured or the primary search fails.
  */
 export async function research(
   q: ResearchQuery,
@@ -551,16 +751,32 @@ export async function research(
   const client = searchProviderClient(cfg, fetchImpl)
   if (!client) return []
 
-  let raw
-  try {
-    // Only ask the provider to restrict by recency when the caller explicitly wants
-    // current results — otherwise the request is exactly what it was before.
-    raw = await client.search(q.query, MAX_SEARCH_RESULTS, q.freshness === 'current' ? { recent: true } : undefined)
-  } catch {
-    return []
-  }
+  // Only ask the provider to restrict by recency when the caller explicitly wants
+  // current results — otherwise the request is exactly what it was before.
+  const opts = q.freshness === 'current' ? { recent: true } : undefined
+
+  // Fan-out: at most ONE extra call, and only when the question is aggregator-shaped and there is
+  // something substantive left after debaiting. Concurrent, so latency is one round-trip either
+  // way, and best-effort — a failed reformulation must never cost the user their search.
+  const debaited = debaitQuery(q.query)
+  const primaryCall = client.search(q.query, MAX_SEARCH_RESULTS, opts).then(
+    (r) => r,
+    () => null, // null distinguishes "the search failed" from "the search found nothing".
+  )
+  const extraCall: Promise<SearchResult[]> = debaited
+    ? client.search(debaited, MAX_SEARCH_RESULTS, opts).catch(() => [])
+    : Promise.resolve([])
+
+  const [primaryRaw, extraRaw] = await Promise.all([primaryCall, extraCall])
+  if (primaryRaw === null) return []
+
+  // Dedupe before scoring, so the MAX_RESULTS slots are spent on MAX_RESULTS distinct pages.
+  // The primary pool goes first: on a tie the reformulation is the fallback, not the answer.
+  const raw = dedupeSearchResults([...primaryRaw, ...extraRaw])
 
   const now = Date.now()
+  // Every result is scored against the ORIGINAL question, including the ones the reformulation
+  // found: the debaited query is a retrieval device, not a restatement of what was asked.
   const scored: ResearchResult[] = raw.map((r) => {
     const domain = extractDomain(r.url)
     const text = `${r.title} ${r.content}`

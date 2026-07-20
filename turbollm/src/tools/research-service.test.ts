@@ -11,10 +11,13 @@ import {
   officialDocsBoost,
   aggregatorPenalty,
   sourceQuality,
+  debaitQuery,
+  dedupeSearchResults,
+  normalizeUrlIdentity,
   MAX_PASSAGE_CHARS,
   type ResearchQuery,
 } from './research-service.js'
-import type { SearchConfig, FetchImpl } from './search-providers.js'
+import type { SearchConfig, FetchImpl, SearchResult } from './search-providers.js'
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -428,4 +431,241 @@ test('research: comparison intent stops the listicle penalty from reordering res
     scoreOf(exempt, 'sleepblog.net') > scoreOf(penalised, 'sleepblog.net'),
     'comparison intent should lift the roundup back up',
   )
+})
+
+// ── Deduplication ─────────────────────────────────────────────────────────────
+//
+// ⚠️ Same universality rule as the block above: dedupe is a STRUCTURAL property of URLs and
+// headlines, so every case here is cooking / medicine / sport. If it only reads as correct for a
+// technical query, it is the wrong rule.
+
+function result(over: Partial<SearchResult>): SearchResult {
+  return { title: 'T', url: 'https://example.org/a', content: 'body', ...over }
+}
+
+test('normalizeUrlIdentity: scheme, www, trailing slash and fragment are not page identity', () => {
+  const canonical = normalizeUrlIdentity('https://nhs.uk/conditions/gout')
+  assert.equal(normalizeUrlIdentity('http://nhs.uk/conditions/gout'), canonical)
+  assert.equal(normalizeUrlIdentity('https://www.nhs.uk/conditions/gout'), canonical)
+  assert.equal(normalizeUrlIdentity('https://NHS.uk/conditions/gout/'), canonical)
+  assert.equal(normalizeUrlIdentity('https://nhs.uk/conditions/gout#symptoms'), canonical)
+})
+
+test('normalizeUrlIdentity: tracking params are dropped, meaningful params are kept', () => {
+  const bare = normalizeUrlIdentity('https://bbc.co.uk/sport/football')
+  assert.equal(
+    normalizeUrlIdentity(
+      'https://bbc.co.uk/sport/football?utm_source=x&utm_medium=y&fbclid=z&gclid=q&ref=nav&source=rss',
+    ),
+    bare,
+  )
+  // A recipe id IS the page; merging these would hide a distinct source.
+  assert.notEqual(
+    normalizeUrlIdentity('https://bbcgoodfood.com/recipe?id=roast-chicken'),
+    normalizeUrlIdentity('https://bbcgoodfood.com/recipe?id=roast-lamb'),
+  )
+})
+
+test('normalizeUrlIdentity: param order is not page identity', () => {
+  assert.equal(
+    normalizeUrlIdentity('https://parkrun.org.uk/results?event=bushy&year=2024'),
+    normalizeUrlIdentity('https://parkrun.org.uk/results?year=2024&event=bushy'),
+  )
+})
+
+test('dedupeSearchResults: www/http/tracking variants of one page collapse to one', () => {
+  const out = dedupeSearchResults([
+    result({ title: 'Gout: symptoms', url: 'https://www.nhs.uk/conditions/gout/' }),
+    result({ title: 'Gout: symptoms', url: 'http://nhs.uk/conditions/gout?utm_campaign=news' }),
+  ])
+  assert.equal(out.length, 1)
+})
+
+test('dedupeSearchResults: keeps the copy WITH a publish date, not the first seen', () => {
+  const out = dedupeSearchResults([
+    result({ title: 'Marathon world record', url: 'https://worldathletics.org/records/marathon', content: 'aaaa' }),
+    result({
+      title: 'Marathon world record',
+      url: 'https://www.worldathletics.org/records/marathon',
+      publishedDate: '2026-03-01',
+      content: 'a',
+    }),
+  ])
+  assert.equal(out.length, 1)
+  assert.equal(out[0].publishedDate, '2026-03-01', 'the dated copy is the scarcer signal')
+})
+
+test('dedupeSearchResults: with dates equal, keeps the copy with more content to excerpt', () => {
+  const out = dedupeSearchResults([
+    result({ title: 'Sourdough hydration', url: 'https://kingarthurbaking.com/guides/sourdough', content: 'short' }),
+    result({
+      title: 'Sourdough hydration',
+      url: 'https://kingarthurbaking.com/guides/sourdough/',
+      content: 'a much longer body with far more to excerpt from',
+    }),
+  ])
+  assert.equal(out.length, 1)
+  assert.match(out[0].content, /much longer body/)
+})
+
+test('dedupeSearchResults: same site + same headline at different paths collapses (CMS pattern)', () => {
+  const out = dedupeSearchResults([
+    result({ title: 'Statins and muscle pain', url: 'https://bhf.org.uk/news/statins-muscle-pain' }),
+    result({ title: '  Statins   and Muscle Pain  ', url: 'https://bhf.org.uk/2026/07/statins-muscle-pain' }),
+  ])
+  assert.equal(out.length, 1)
+})
+
+test('dedupeSearchResults: the same headline on two different sites is two sources', () => {
+  const out = dedupeSearchResults([
+    result({ title: 'England win the Ashes', url: 'https://bbc.co.uk/sport/cricket/ashes' }),
+    result({ title: 'England win the Ashes', url: 'https://theguardian.com/sport/ashes' }),
+  ])
+  assert.equal(out.length, 2)
+})
+
+test('dedupeSearchResults: distinct pages on one site are all kept', () => {
+  const out = dedupeSearchResults([
+    result({ title: 'Braising', url: 'https://seriouseats.com/braising' }),
+    result({ title: 'Roasting', url: 'https://seriouseats.com/roasting' }),
+    result({ title: 'Poaching', url: 'https://seriouseats.com/poaching' }),
+  ])
+  assert.equal(out.length, 3)
+})
+
+test('research: duplicate provider hits do not consume separate result slots', async () => {
+  const fetch = stubFetch([
+    {
+      title: 'Base rate decision',
+      url: 'https://bankofengland.co.uk/monetary-policy',
+      content: 'The base rate decision explained in detail.',
+    },
+    {
+      title: 'Base rate decision',
+      url: 'https://www.bankofengland.co.uk/monetary-policy/?utm_source=news',
+      content: 'The base rate decision explained in detail.',
+    },
+    { title: 'Base rate commentary', url: 'https://skipton.co.uk/rates', content: 'Base rate commentary for savers.' },
+  ])
+  const results = await research({ query: 'bank base rate decision' }, CFG, fetch)
+  const urls = new Set(results.map((r) => normalizeUrlIdentity(r.url)))
+  assert.equal(urls.size, results.length, 'every surfaced result must be a distinct page')
+  assert.equal(results.length, 2)
+})
+
+// ── Query debaiting (fan-out) ─────────────────────────────────────────────────
+
+test('debaitQuery: strips listicle bait from a consumer-health question', () => {
+  assert.equal(debaitQuery('best mattress for back pain'), 'mattress for back pain')
+})
+
+test('debaitQuery: strips "top N" and "ranked" (sport)', () => {
+  assert.equal(debaitQuery('top 10 marathon training plans ranked'), 'marathon training plans')
+})
+
+test('debaitQuery: strips a "which … should you" framing (cooking)', () => {
+  assert.equal(debaitQuery('which slow cooker should you buy'), 'slow cooker buy')
+})
+
+test('debaitQuery: strips the annual-refresh year alongside bait', () => {
+  assert.equal(debaitQuery('best air fryer 2026 reviews'), 'air fryer')
+})
+
+test('debaitQuery: a year on its own is the question, not bait', () => {
+  // The load-bearing universality case: stripping 1974 here would answer a different question.
+  assert.equal(debaitQuery('who won the 1974 World Cup'), null)
+})
+
+test('debaitQuery: a plain question is already substantive — no extra call', () => {
+  assert.equal(debaitQuery('how long to rest a roast chicken'), null)
+  assert.equal(debaitQuery('symptoms of plantar fasciitis'), null)
+})
+
+test('debaitQuery: a systematic review is a primary source, not bait', () => {
+  assert.equal(debaitQuery('systematic review of statin side effects'), null)
+})
+
+test('debaitQuery: "best practices" is documentation language, not bait', () => {
+  assert.equal(debaitQuery('food safety best practices for reheating rice'), null)
+})
+
+test('debaitQuery: nothing substantive left after stripping — skip the call', () => {
+  assert.equal(debaitQuery('best of 2026'), null)
+  assert.equal(debaitQuery('top 10 ranked'), null)
+})
+
+test('debaitQuery: does not mangle non-Latin queries', () => {
+  // Latin-script bait attached to a non-Latin subject; the subject must survive intact.
+  assert.equal(debaitQuery('best ramen 東京 レシピ'), 'ramen 東京 レシピ')
+})
+
+test('research: an aggregator-shaped query issues exactly one extra search, merged and deduped', async () => {
+  const queries: string[] = []
+  const fetchImpl: FetchImpl = (async (_url: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body ?? '{}'))
+    queries.push(body.query)
+    // The reformulation surfaces a primary source the baited query never returned.
+    const results =
+      body.query === 'mattress for back pain'
+        ? [{
+            title: 'Mattress firmness and lumbar support',
+            url: 'https://nhs.uk/mattress-back-pain',
+            content: 'Mattress firmness guidance for back pain.',
+          }]
+        : [{
+            title: 'Best Mattresses for Back Pain 2026',
+            url: 'https://sleepblog.net/best-mattress',
+            content: 'Our pick of the best mattress for back pain.',
+          }]
+    return { ok: true, status: 200, json: async () => ({ results }), text: async () => '{}' } as Response
+  }) as unknown as FetchImpl
+
+  const results = await research({ query: 'best mattress for back pain' }, CFG, fetchImpl)
+  assert.deepEqual(queries, ['best mattress for back pain', 'mattress for back pain'])
+  assert.ok(results.some((r) => r.domain === 'nhs.uk'), 'the reformulation must contribute results')
+})
+
+test('research: a plain query issues no extra search', async () => {
+  const queries: string[] = []
+  const fetchImpl: FetchImpl = (async (_url: string | URL | Request, init?: RequestInit) => {
+    queries.push(JSON.parse(String(init?.body ?? '{}')).query)
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        results: [{
+          title: 'Plantar fasciitis',
+          url: 'https://nhs.uk/plantar-fasciitis',
+          content: 'Plantar fasciitis treatment advice.',
+        }],
+      }),
+      text: async () => '{}',
+    } as Response
+  }) as unknown as FetchImpl
+
+  await research({ query: 'symptoms of plantar fasciitis' }, CFG, fetchImpl)
+  assert.equal(queries.length, 1)
+})
+
+test('research: a failed reformulation never breaks the search', async () => {
+  let call = 0
+  const fetchImpl: FetchImpl = (async () => {
+    // The primary call resolves; the reformulation blows up.
+    if (++call === 2) throw new Error('provider rate limit')
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        results: [{
+          title: 'Best Mattresses for Back Pain',
+          url: 'https://sleepblog.net/best-mattress',
+          content: 'The best mattress for back pain reviewed.',
+        }],
+      }),
+      text: async () => '{}',
+    } as Response
+  }) as unknown as FetchImpl
+
+  const results = await research({ query: 'best mattress for back pain' }, CFG, fetchImpl)
+  assert.ok(results.length > 0, 'the primary pool must still be returned')
 })
