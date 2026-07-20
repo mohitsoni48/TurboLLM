@@ -181,8 +181,7 @@ body {
 .prose-tllm h1 > code,
 .prose-tllm h2 > code,
 .prose-tllm h3 > code,
-.prose-tllm h4 > code,
-.prose-tllm blockquote code {
+.prose-tllm h4 > code {
   background: var(--panel-2);
   border-radius: var(--radius-sm);
   padding: 1px 5px;

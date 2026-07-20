@@ -142,6 +142,13 @@ export function ChatScreen() {
   const bottomRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const userScrolledUp = useRef(false)
+  // Per-conversation scroll offsets (spec 07 §7: "Preserve scroll on conversation
+  // switch"). In-memory refs by design — no re-renders, dies with the screen.
+  // Absence of an entry means "was pinned at bottom". `pendingScrollRestore` carries
+  // the offset captured at switch time, so the restore effect can't read a map entry
+  // that the content swap's clamped scroll event may have just overwritten.
+  const scrollOffsets = useRef<Record<string, number>>({})
+  const pendingScrollRestore = useRef<{ id: string; top: number | null } | null>(null)
   const qc = useQueryClient()
   const mut = useConversationMutations()
   const modelsQ = useModels()
@@ -275,6 +282,18 @@ export function ChatScreen() {
     }
   }, [])
 
+  // Save the current conversation's scroll position into the per-conversation map.
+  // At-bottom (< 80px — same threshold as the streaming pin) clears the entry, so
+  // switching back to a bottom-pinned conversation lands at the bottom again.
+  const saveScrollOffset = useCallback(() => {
+    const el = scrollerRef.current
+    const id = activeIdRef.current
+    if (!el || !id) return
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+    if (atBottom) delete scrollOffsets.current[id]
+    else scrollOffsets.current[id] = el.scrollTop
+  }, [])
+
   useEffect(() => {
     const el = scrollerRef.current
     if (!el) return
@@ -282,14 +301,41 @@ export function ChatScreen() {
       const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80
       userScrolledUp.current = !atBottom
       setShowScrollBtn(!atBottom && !!live)
+      saveScrollOffset()
     }
     el.addEventListener('scroll', handler)
     return () => el.removeEventListener('scroll', handler)
-  }, [live])
+  }, [live, saveScrollOffset])
 
   useEffect(() => {
     if (live) scrollToBottom()
   }, [live, scrollToBottom])
+
+  // Preserve scroll on conversation switch (spec 07 §7): once the switched-to
+  // conversation's messages are in the DOM (convQ catches up to activeId a render
+  // later on a cold cache), restore its saved offset — or land at the bottom when
+  // none was saved. Instant jumps, not smooth: the content just appeared, and a
+  // smooth scroll would race the save-on-scroll handler above.
+  useEffect(() => {
+    const el = scrollerRef.current
+    const pending = pendingScrollRestore.current
+    if (!el || !activeId || conv?.id !== activeId || pending?.id !== activeId) return
+    pendingScrollRestore.current = null
+    if (pending.top === null) {
+      // Never visited this session, or last seen pinned at bottom → bottom, as before.
+      userScrolledUp.current = false
+      el.scrollTop = el.scrollHeight
+      setShowScrollBtn(false)
+    } else {
+      el.scrollTop = pending.top
+      // A restored mid-thread offset counts as "scrolled up": a stream running in
+      // this conversation shows the jump-to-latest pill instead of yanking to bottom.
+      const atBottom = el.scrollHeight - pending.top - el.clientHeight < 80
+      userScrolledUp.current = !atBottom
+      setShowScrollBtn(!atBottom && !!liveByConv[activeId])
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeId, conv?.id])
 
   // Ctrl+N new chat, Esc stop. Whitelist ONLY these exact combos and preventDefault
   // solely for the one we handle (Ctrl/Cmd+N) — never for anything else, so native
@@ -386,6 +432,7 @@ export function ChatScreen() {
   }
 
   const handleNew = () => {
+    saveScrollOffset()
     setActiveId(null)
     setInput('')
     setSelectedPersonaId(getDefaultAgentId())
@@ -398,6 +445,11 @@ export function ChatScreen() {
     // done; live state is now per-conversation (keyed by convId, not activeId), so it
     // needs no clearing here — the render layer just looks up whatever entry (if any)
     // matches the newly-active id.
+    // Preserve scroll (spec 07 §7): save the outgoing conversation's offset now —
+    // before the content swap clamps it — and capture the target's saved offset for
+    // the restore effect to apply once the target's messages have rendered.
+    saveScrollOffset()
+    pendingScrollRestore.current = { id, top: scrollOffsets.current[id] ?? null }
     setActiveId(id)
     setEditingId(null)
     setSelectedPersonaId(getConvAgentId(id))
@@ -408,8 +460,6 @@ export function ChatScreen() {
         return next
       })
     }
-    userScrolledUp.current = false
-    setTimeout(() => scrollToBottom(true), 50)
   }
 
   // The currently-open conversation was deleted — abort any live generation and
@@ -418,6 +468,7 @@ export function ChatScreen() {
     if (id !== activeId) return
     abortRefs.current[id]?.abort()
     delete abortRefs.current[id]
+    delete scrollOffsets.current[id]
     setLiveByConv((prev) => {
       if (!(id in prev)) return prev
       const next = { ...prev }
@@ -533,7 +584,11 @@ export function ChatScreen() {
           if (convId !== activeIdRef.current) setRecentlyCompletedIds((prev) => new Set(prev).add(convId))
           void qc.invalidateQueries({ queryKey: ['conversation', convId] })
           void qc.invalidateQueries({ queryKey: ['conversations'] })
-          setTimeout(() => scrollToBottom(true), 80)
+          // Only nudge the scroller when the finished conversation is the one on
+          // screen, and never force past the ≥80px pin (spec 07 §7): a user reading
+          // up-thread — or a restored mid-thread offset — keeps their place, and a
+          // background completion must not yank the conversation being looked at.
+          if (convId === activeIdRef.current) setTimeout(() => scrollToBottom(), 80)
         } else if (evt.event === 'error') {
           clearLive(convId)
           if (convId !== activeIdRef.current) setRecentlyCompletedIds((prev) => new Set(prev).add(convId))
@@ -940,8 +995,11 @@ export function ChatScreen() {
         </div>
 
         {/* Scroll-to-bottom pill (spec 07 §7) — fades in over 150ms via the shared
-            tllm-rise-in keyframe (index.css), suppressed for motion-sensitive users */}
-        {showScrollBtn && (
+            tllm-rise-in keyframe (index.css), suppressed for motion-sensitive users.
+            Gated on `live` too: it's a streaming affordance, and now that done/error
+            no longer force-scroll (which used to reset showScrollBtn), the stale flag
+            must not leave the pill hanging after a stream ends mid-thread. */}
+        {showScrollBtn && live && (
           <button
             type="button"
             onClick={() => { userScrolledUp.current = false; scrollToBottom(true) }}
@@ -1080,9 +1138,10 @@ export function ChatScreen() {
                 )}
               </div>
             </div>
-            {/* No-model hint lives in the textarea placeholder above — don't repeat it here. */}
+            {/* No-model hint lives in the textarea placeholder above — don't repeat it here.
+                Hidden ≤720px per spec 11 §4 (the spec value is 720, not the md 768 breakpoint). */}
             {model && (
-              <p className="mt-1.5 px-1 text-[11px] text-faint">
+              <p className="mt-1.5 px-1 text-[11px] text-faint max-[720px]:hidden">
                 {model.name} · Enter to send · Shift+Enter for newline
               </p>
             )}

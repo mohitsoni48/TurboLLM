@@ -116,7 +116,9 @@ export const Markdown = memo(function Markdown({ children, streaming }: { childr
       rehypePlugins={[rehypeHighlight]}
       components={{
         a: ({ children, href }) => (
-          <a href={href} target="_blank" rel="noopener noreferrer" className="text-accent underline underline-offset-2">{children}</a>
+          // Styling comes entirely from the unlayered .prose-tllm a rules (index.css);
+          // this override exists only to force new-tab + noopener on every link.
+          <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>
         ),
         code: ({ className, children, ...props }) => {
           // A fenced block without a language tag has no className — detect it by
@@ -157,9 +159,12 @@ export const Markdown = memo(function Markdown({ children, streaming }: { childr
           )
         },
         pre: ({ children }) => <>{children}</>,
-        table: ({ children }) => <div className="overflow-x-auto my-2"><table className="w-full border-collapse text-[13px]">{children}</table></div>,
-        th: ({ children }) => <th className="border border-border bg-panel-2 px-3 py-1.5 text-left font-semibold text-[13px]">{children}</th>,
-        td: ({ children }) => <td className="border border-border px-3 py-1.5 text-[13px]">{children}</td>,
+        // Borders/padding/font-size/weight for table cells come from the unlayered
+        // .prose-tllm table/th/td rules (index.css) — only what prose doesn't set
+        // stays here: the scroll wrapper, full width, header tint, left-aligned th
+        // (UA default centers th). td needs no override at all anymore.
+        table: ({ children }) => <div className="overflow-x-auto my-2"><table className="w-full text-[13px]">{children}</table></div>,
+        th: ({ children }) => <th className="bg-panel-2 text-left">{children}</th>,
       }}
     >
       {children}
