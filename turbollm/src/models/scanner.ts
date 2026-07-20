@@ -21,6 +21,37 @@ export interface ModelEntry {
   /** Real per-head dimension (GgufMeta.headDim) — 0 when the GGUF doesn't declare
    *  attention.key_length/value_length. See profile.ts's estimateVram for the fallback. */
   headDim: number
+  /** Sliding-window size in tokens (`<arch>.attention.sliding_window`, Gemma 3/4).
+   *  Sliding layers' KV cache stops growing at this many tokens instead of at `ctx`.
+   *  Absent unless the GGUF declares it — see {@link kvCacheElems}. */
+  slidingWindow?: number
+  /** Per-layer sliding-window flags (`<arch>.attention.sliding_window_pattern`);
+   *  `true` = that layer is a sliding (windowed) layer, `false` = a global/full one.
+   *  Only honored when its length equals `blockCount`. Absent unless declared. */
+  slidingWindowPattern?: boolean[]
+  /** Per-head dimension used by the SLIDING layers specifically
+   *  (`<arch>.attention.key_length_swa`). Gemma 4 halves it (256) versus its global
+   *  layers (512), so the two layer kinds must be sized separately. Absent/0 → the
+   *  sliding layers reuse `headDim`. */
+  headDimSwa?: number
+  /** Per-layer KV-head counts (`<arch>.attention.head_count_kv` when the GGUF declares
+   *  it as an ARRAY rather than a scalar — e.g. Gemma-4-26B-A4B's 8-on-sliding /
+   *  2-on-global layout). Wins over the scalar `headCountKv` when its length equals
+   *  `blockCount`. Absent unless declared as an array. */
+  headCountKvPerLayer?: number[]
+  /** Hybrid linear/SSM layout stride (`<arch>.full_attention_interval`, Qwen3.5/3.6,
+   *  Qwen3-Next): with interval N only every Nth layer keeps a growing KV cache; the
+   *  rest hold a small constant recurrent state. Absent/0 → the layout is UNDECLARED
+   *  and {@link kvCacheElems} keeps the conservative all-layer estimate, even for a
+   *  model that clearly is hybrid (see its doc). */
+  fullAttentionInterval?: number
+  /** SSM/recurrent-state dimensions (`<arch>.ssm.inner_size` / `.state_size` /
+   *  `.conv_kernel`). Used to size the small CONSTANT state a linear layer holds, so
+   *  the estimate stays honest instead of dropping those layers to zero. Absent on
+   *  every non-hybrid model. */
+  ssmInnerSize?: number
+  ssmStateSize?: number
+  ssmConvKernel?: number
   moe: boolean
   expertCount: number
   nextnLayers: number
@@ -52,7 +83,48 @@ interface CacheRow {
 }
 
 // Bump when GgufMeta gains a field so on-disk caches re-parse (see loadCache).
-const CACHE_VERSION = 3
+// 4: attention-layout fields (sliding window / hybrid-SSM layout, ADR-223) — rows cached
+// by an older build predate the new keys, so re-parsing is what makes the improved KV
+// estimate actually apply to already-scanned models instead of only to new ones.
+const CACHE_VERSION = 4
+
+/** Optional attention-layout metadata the GGUF parser surfaces (ADR-223).
+ *
+ *  Read as a structural view over {@link GgufMeta} rather than off it field-by-field:
+ *  every key here is genuinely optional in the file format (only two model families
+ *  declare any of it), so treating them as "maybe present" at the boundary keeps this
+ *  file honest about that, and a GGUF declaring none of them produces an entry that is
+ *  byte-for-byte what it was before — which is exactly the degradation guarantee the KV
+ *  estimator relies on. */
+interface AttentionLayoutMeta {
+  slidingWindow?: number
+  slidingWindowPattern?: boolean[]
+  headDimSwa?: number
+  headCountKvPerLayer?: number[]
+  fullAttentionInterval?: number
+  ssmInnerSize?: number
+  ssmStateSize?: number
+  ssmConvKernel?: number
+}
+
+/** Copy the declared attention-layout fields onto a ModelEntry, omitting anything the
+ *  GGUF didn't declare. Omitting rather than storing 0/[] matters twice over: the model
+ *  list is serialized to the API and to the on-disk cache for EVERY model, and — more
+ *  importantly — it keeps "absent" unambiguous for {@link kvCacheElems}, which must not
+ *  mistake a zeroed placeholder for a real declaration. */
+function attentionLayoutOf(meta: GgufMeta | null): Partial<ModelEntry> {
+  const a: AttentionLayoutMeta = meta ?? {}
+  const out: Partial<ModelEntry> = {}
+  if (a.slidingWindow) out.slidingWindow = a.slidingWindow
+  if (a.slidingWindowPattern?.length) out.slidingWindowPattern = a.slidingWindowPattern
+  if (a.headDimSwa) out.headDimSwa = a.headDimSwa
+  if (a.headCountKvPerLayer?.length) out.headCountKvPerLayer = a.headCountKvPerLayer
+  if (a.fullAttentionInterval) out.fullAttentionInterval = a.fullAttentionInterval
+  if (a.ssmInnerSize) out.ssmInnerSize = a.ssmInnerSize
+  if (a.ssmStateSize) out.ssmStateSize = a.ssmStateSize
+  if (a.ssmConvKernel) out.ssmConvKernel = a.ssmConvKernel
+  return out
+}
 
 const SPLIT_RE = /^(.*)-(\d{5})-of-(\d{5})\.gguf$/i
 
@@ -272,6 +344,9 @@ export class Scanner {
       blockCount: meta?.blockCount ?? 0,
       headCountKv: meta?.headCountKv ?? 0,
       headDim: meta?.headDim ?? 0,
+      // Only present on the handful of models that declare a non-uniform attention
+      // layout; everything else keeps the shape (and the KV estimate) it had before.
+      ...attentionLayoutOf(meta),
       moe: (meta?.expertCount ?? 0) > 0,
       expertCount: meta?.expertCount ?? 0,
       nextnLayers: meta?.nextnLayers ?? 0,
