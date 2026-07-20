@@ -4,7 +4,8 @@ import { runInNewContext } from 'node:vm'
 import { checkSsrf } from './security.js'
 import { type SearchConfig } from './search-providers.js'
 import {
-  ageInDays, currentnessMultiplier, freshnessSignal, research, type ResearchResult,
+  ageInDays, aggregatorPenalty, currentnessMultiplier, freshnessSignal, officialDocsBoost,
+  officialSourceBoost, research, type ResearchResult,
 } from './research-service.js'
 
 // ── Tool JSON-schema definitions (OpenAI tool format) ─────────────────────
@@ -195,6 +196,39 @@ const DATE_PROBE_TIMEOUT_MS = 4_000
  * A research turn must never fail, hang, or lose results because a source was slow.
  * Mutates in place; only fields derived from the discovered date are touched.
  */
+/**
+ * Warn the model, in the results themselves, when this result set cannot support a
+ * recommendation on its own.
+ *
+ * Why this is a data-level note rather than one more line of system prompt: a traced run showed
+ * a mid-size local model reliably obeying single concrete rules (it passed freshness:'current'
+ * on 7 of 7 calls) while multi-step strategy instructions drifted after the first search. So the
+ * warning is delivered at the moment of reading, attached to the evidence it describes.
+ *
+ * It is also just true. Some questions ("best X for Y") are commercially farmed keywords where
+ * essentially every indexed page is a roundup — verified independently of any one provider. A
+ * roundup is fine for LEARNING WHICH NAMES EXIST and useless for establishing that one is
+ * current, so saying exactly that is more honest than silently ranking one of them first.
+ *
+ * Topic-agnostic: it fires off the structural signals already computed, never off the subject.
+ */
+export function sourceAdvisory(query: string, results: ResearchResult[]): string | null {
+  if (results.length === 0) return null
+  const roundups = results.filter((r) => aggregatorPenalty(r.title, r.url) > 0).length
+  const primaries = results.filter(
+    (r) => officialSourceBoost(query, r.url) > 0 || officialDocsBoost(r.url) > 0,
+  ).length
+  // Only when roundups dominate AND nothing first-party made the cut — a mixed set means the
+  // model has a real source available and needs no nudge.
+  if (primaries > 0 || roundups < Math.ceil(results.length / 2)) return null
+  return (
+    `CAUTION: ${roundups} of these ${results.length} results are roundup/"best of" pages and none is a primary or official source. ` +
+    'Pages like these are frequently re-published with a new date and stale contents, so they establish which names EXIST, not which is current or correct. ' +
+    'Treat every name below as a CANDIDATE, not an answer: before recommending one, search that name against its own official source (the maker/organisation/authority behind it) and confirm the specifics there. ' +
+    'If you cannot confirm a candidate that way, say so rather than repeating the roundup.'
+  )
+}
+
 export async function backfillPublishedDates(results: ResearchResult[]): Promise<void> {
   const missing = results.filter((r) => !r.publishedDate)
   if (missing.length === 0) return
@@ -320,6 +354,10 @@ export async function execWebSearch(args: Record<string, unknown>, searchCfg: Se
     `Retrieved: ${retrieved} — this search ran today, so treat ${retrieved} as the current date. ` +
       'Weigh each result against its Published date; "Published: unknown" means the source reported no date, not that it is current.',
   ]
+  // Sits in the header, above the `[N]` blocks: chat-routes.ts's sources parser anchors on
+  // `[N]`, so header lines are invisible to it and cannot disturb the sources panel.
+  const advisory = sourceAdvisory(query, results)
+  if (advisory) lines.push(advisory)
   for (const [i, r] of results.entries()) {
     // Title and passage are attacker-controlled page text and both terminate a line of this
     // block format, so both are collapsed to a single line. Without this a page whose winning
