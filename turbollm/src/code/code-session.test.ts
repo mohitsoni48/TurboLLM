@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { toolsForMode, buildAppendPrompt, skillsBlock, skillCatalogBlock, type CodeMode } from './persona'
 import { toSessionStatus, resolveRevertCut } from './code-routes'
-import { MUTATING_TOOLS, PATH_TOOLS, resolveEffectiveHistory, compactCodeSession, isDependencyAddCommand, compactionSettingsFor, keepRecentTokensFor } from './code-session'
+import { MUTATING_TOOLS, PATH_TOOLS, resolveEffectiveHistory, compactCodeSession, isDependencyAddCommand, compactionSettingsFor, keepRecentTokensFor, ToolLoopTracker, toolCallSignature, LOOP_BREAK_AFTER } from './code-session'
 import { ConversationStore, type Message } from '../chat/db'
 import type { Deps } from '../deps'
 import type { Skill } from '../agents/skills'
@@ -593,4 +593,53 @@ test('compactCodeSession: rejects with session_cleared when the session has an a
     () => compactCodeSession({ d, convId, sessionId, repoRoot: '/repo' }),
     /session_cleared/,
   )
+})
+
+// ── ToolLoopTracker / toolCallSignature — consecutive-identical-call loop breaker ──
+
+test('toolCallSignature: identical calls match regardless of arg key order', () => {
+  assert.equal(
+    toolCallSignature('edit', { path: 'a.ts', content: 'x' }),
+    toolCallSignature('edit', { content: 'x', path: 'a.ts' }),
+  )
+})
+
+test('toolCallSignature: different tool, args, or nested values do NOT match', () => {
+  const base = toolCallSignature('read', { path: 'a.ts' })
+  assert.notEqual(base, toolCallSignature('write', { path: 'a.ts' }))       // tool differs
+  assert.notEqual(base, toolCallSignature('read', { path: 'b.ts' }))        // arg differs
+  assert.notEqual(
+    toolCallSignature('bash', { command: 'ls', opts: { cwd: 'a' } }),
+    toolCallSignature('bash', { command: 'ls', opts: { cwd: 'b' } }),       // nested differs
+  )
+})
+
+test('ToolLoopTracker: counts consecutive identical calls; the (LOOP_BREAK_AFTER+1)th trips it', () => {
+  const t = new ToolLoopTracker()
+  const call = () => t.record('read', { path: 'a.ts' })
+  // The first LOOP_BREAK_AFTER calls run normally (count never exceeds the threshold)…
+  for (let n = 1; n <= LOOP_BREAK_AFTER; n++) assert.equal(call(), n)
+  // …the very next identical call is the one the hook breaks on.
+  assert.ok(LOOP_BREAK_AFTER + 1 > LOOP_BREAK_AFTER)
+  assert.equal(call(), LOOP_BREAK_AFTER + 1)
+  // It keeps tripping while the model keeps repeating (never silently lets it resume).
+  assert.equal(call(), LOOP_BREAK_AFTER + 2)
+})
+
+test('ToolLoopTracker: any different call resets the run to 1', () => {
+  const t = new ToolLoopTracker()
+  t.record('read', { path: 'a.ts' })
+  t.record('read', { path: 'a.ts' })
+  assert.equal(t.record('read', { path: 'a.ts' }), 3)
+  assert.equal(t.record('read', { path: 'b.ts' }), 1)   // different args → reset
+  assert.equal(t.record('read', { path: 'b.ts' }), 2)
+  assert.equal(t.record('ls', { path: 'b.ts' }), 1)     // different tool → reset
+})
+
+test('ToolLoopTracker: reset() clears the count (new top-level turn)', () => {
+  const t = new ToolLoopTracker()
+  t.record('bash', { command: 'npm test' })
+  t.record('bash', { command: 'npm test' })
+  t.reset()
+  assert.equal(t.record('bash', { command: 'npm test' }), 1)
 })
