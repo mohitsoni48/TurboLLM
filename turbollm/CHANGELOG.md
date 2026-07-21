@@ -25,6 +25,38 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.8.2] - 2026-07-21
+
+**Research mode that works to stay current, correct VRAM estimates for modern models, and a batch
+of chat-UI polish.**
+
+### Fixed
+- **Research mode no longer leans on stale training data.** A full overhaul of the research
+  pipeline: it now reads each source's real publication date, prefers primary/official sources
+  over "best of" listicles, discovers what's *current* before drilling into names it already
+  remembers, hands the model far more of each page to read (not a one-sentence snippet),
+  de-duplicates results, and searches more before composing an answer. Ask it something like "the
+  best open models for my GPU" and it works to surface today's answer instead of last year's.
+- **VRAM fit estimates were badly over-counting for modern models.** Recent Qwen (3.5 / 3.6 /
+  Next) and Gemma (3 / 4) use attention designs where only some layers keep a growing KV cache, but
+  TurboLLM counted every layer at full context — over-estimating KV-cache memory by up to ~18× and
+  wrongly flagging models as "tight" or "won't fit." Estimates now read the model's real attention
+  layout from the GGUF. Models whose layout isn't declared keep the previous conservative estimate.
+- **Chat markdown now renders with proper styling** — headings, lists, tables, and code blocks
+  (with a language label and syntax highlighting) were previously flat, unstyled text.
+- **Low-contrast text fixed** — faint/secondary text now meets WCAG AA contrast in both dark and
+  light themes.
+- **Scroll position is preserved when switching between conversations** instead of jumping to the
+  bottom.
+- **Windows: discrete AMD/Intel GPUs no longer misreport as ~4 GB VRAM** when the registry read
+  exits with a non-zero status — the valid 64-bit VRAM value is now kept. (Thanks @almshary, #69.)
+
+### Discord
+- Research mode got a big accuracy overhaul — it now checks how recent each source is, prefers official/primary sources over SEO "best of" listicles, and reads full pages instead of snippets, so it works to give you today's answer instead of last year's.
+- VRAM fit estimates are now correct for modern Qwen and Gemma models — TurboLLM was massively over-counting KV-cache memory and wrongly saying big models "won't fit" when they actually do.
+- Chat renders markdown properly now (headings, tables, code blocks with syntax highlighting), text contrast is fixed in dark and light themes, and your scroll position is kept when you switch chats.
+- Windows fix: AMD/Intel GPUs that were showing 4 GB now report their real VRAM — thanks to contributor @almshary.
+
 ## [1.8.1] - 2026-07-17
 
 **A large batch of reliability fixes — auto-tune accuracy, Code's revert-to-message and /compact,
