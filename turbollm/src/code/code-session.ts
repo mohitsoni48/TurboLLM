@@ -480,8 +480,10 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
   // at turn_start, same lifecycle as consecutiveToolFailures.
   let hasSearchedWebThisTurn = false
 
-  // Consecutive identical tool-call loop breaker (see ToolLoopTracker's own comment). Same
-  // per-turn lifecycle as the counters above — reset at turn_start.
+  // Consecutive identical tool-call loop breaker (see ToolLoopTracker's own comment). Scoped to
+  // this whole user task: constructed once here (runCodeSession runs once per task), and NOT reset
+  // on pi's `turn_start` — that fires per agentic round, so resetting there would clear the count
+  // between the very repeats it needs to catch (see the turn_start handler below).
   const toolLoop = new ToolLoopTracker()
 
   // LSP integration (item 3): one running language-server process per `language`, cached at
@@ -702,7 +704,14 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     })
     pi.on('after_provider_response', () => { releaseGate() })
 
-    pi.on('turn_start', () => { consecutiveToolFailures = 0; hasSearchedWebThisTurn = false; toolLoop.reset() })
+    // NOTE: pi's `turn_start` fires once per agentic ROUND (each model step; it carries an
+    // incrementing turnIndex), NOT once per top-level user task — `agent_start` is the per-task
+    // boundary. So this handler resets these counters every round. toolLoop is deliberately NOT
+    // reset here: it must count identical calls ACROSS rounds within a task (that IS the loop), and
+    // it's already scoped per-task by being constructed once per runCodeSession call. (The two
+    // counters below reset per-round too, which blunts them across a multi-round retry — a
+    // pre-existing issue, left as-is here to keep this change scoped to the loop breaker.)
+    pi.on('turn_start', () => { consecutiveToolFailures = 0; hasSearchedWebThisTurn = false })
 
     // The ENTIRE containment/approval boundary (plan risk flag 2). Runs before tool.execute().
     pi.on('tool_call', async (event: ToolCallEvent): Promise<ToolCallEventResult | void> => {
