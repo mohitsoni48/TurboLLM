@@ -50,8 +50,14 @@ of chat-UI polish.**
   bottom.
 - **Windows: discrete AMD/Intel GPUs no longer misreport as ~4 GB VRAM** when the registry read
   exits with a non-zero status — the valid 64-bit VRAM value is now kept. (Thanks @almshary, #69.)
+- **Code: the agent no longer gets stuck repeating the same action.** A local model could fall
+  into an infinite loop, calling the same tool with the same arguments over and over — the run
+  never finished and Stop/queue couldn't take effect. It now detects a repeated identical call and
+  automatically breaks the model out of the loop, and its built-in "stop retrying, look it up"
+  guidance (which had been silently ineffective) works again.
 
 ### Discord
+- Code no longer gets stuck in an infinite loop repeating the same action — it now detects when a local model keeps making the identical call and automatically breaks it out so the run can finish.
 - Research mode got a big accuracy overhaul — it now checks how recent each source is, prefers official/primary sources over SEO "best of" listicles, and reads full pages instead of snippets, so it works to give you today's answer instead of last year's.
 - VRAM fit estimates are now correct for modern Qwen and Gemma models — TurboLLM was massively over-counting KV-cache memory and wrongly saying big models "won't fit" when they actually do.
 - Chat renders markdown properly now (headings, tables, code blocks with syntax highlighting), text contrast is fixed in dark and light themes, and your scroll position is kept when you switch chats.
