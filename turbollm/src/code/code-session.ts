@@ -704,14 +704,13 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     })
     pi.on('after_provider_response', () => { releaseGate() })
 
-    // NOTE: pi's `turn_start` fires once per agentic ROUND (each model step; it carries an
-    // incrementing turnIndex), NOT once per top-level user task — `agent_start` is the per-task
-    // boundary. So this handler resets these counters every round. toolLoop is deliberately NOT
-    // reset here: it must count identical calls ACROSS rounds within a task (that IS the loop), and
-    // it's already scoped per-task by being constructed once per runCodeSession call. (The two
-    // counters below reset per-round too, which blunts them across a multi-round retry — a
-    // pre-existing issue, left as-is here to keep this change scoped to the loop breaker.)
-    pi.on('turn_start', () => { consecutiveToolFailures = 0; hasSearchedWebThisTurn = false })
+    // No turn_start reset — deliberately. pi fires `turn_start` once per agentic ROUND (it carries
+    // an incrementing turnIndex; `agent_start` is the per-task boundary), so resetting here cleared
+    // these counters between rounds, which silently defeated ALL THREE: the loop breaker (identical
+    // calls span rounds), the anti-fallback nudge (a failing retry loop spans rounds), and the
+    // dependency-discipline check. All three are already scoped to one user task by being
+    // (re)created per runCodeSession call; consecutiveToolFailures additionally clears on any tool
+    // SUCCESS in the tool_result hook below, which is the correct "made real progress" reset.
 
     // The ENTIRE containment/approval boundary (plan risk flag 2). Runs before tool.execute().
     pi.on('tool_call', async (event: ToolCallEvent): Promise<ToolCallEventResult | void> => {
