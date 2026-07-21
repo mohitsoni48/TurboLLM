@@ -210,18 +210,26 @@ function readWindowsVramRegistry(): RegistryVram[] {
   try {
     const ps =
       `Get-ChildItem 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Class\\${DISPLAY_CLASS_GUID}' -ErrorAction SilentlyContinue | ` +
-      "ForEach-Object { $p = Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue; " +
-      "if ($p.'HardwareInformation.qwMemorySize') { \"$($p.DriverDesc)|$($p.'HardwareInformation.qwMemorySize')\" } }"
+      "Where-Object { $_.PSChildName -match '^\\d{4}$' } | " +
+      "ForEach-Object { " +
+      "try { " +
+      "$p = Get-ItemProperty -Path $_.PSPath -ErrorAction Stop; " +
+      "if ($p.'HardwareInformation.qwMemorySize') { " +
+      "\"$($p.DriverDesc)|$($p.'HardwareInformation.qwMemorySize')\" " +
+      "} " +
+      "} catch { } " +
+      "}; exit 0"
+
     const out = execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], {
       timeout: 8000,
       windowsHide: true,
     }).toString()
+
     return parseWindowsVramRegistry(out)
   } catch {
     return []
   }
 }
-
 /** Pure parser for {@link readWindowsVramRegistry}'s PowerShell output, split out for direct
  *  testing (mirrors {@link parseRocmSmi}). Each line is "DriverDesc|qwMemorySize(bytes)". */
 export function parseWindowsVramRegistry(psOutput: string): RegistryVram[] {
