@@ -483,7 +483,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
   // Consecutive identical tool-call loop breaker (see ToolLoopTracker's own comment). Scoped to
   // this whole user task: constructed once here (runCodeSession runs once per task), and NOT reset
   // on pi's `turn_start` — that fires per agentic round, so resetting there would clear the count
-  // between the very repeats it needs to catch (see the turn_start handler below).
+  // between the very repeats it needs to catch (see the no-turn_start-reset note below).
   const toolLoop = new ToolLoopTracker()
 
   // LSP integration (item 3): one running language-server process per `language`, cached at

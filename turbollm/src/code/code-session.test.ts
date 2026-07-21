@@ -614,14 +614,23 @@ test('toolCallSignature: different tool, args, or nested values do NOT match', (
   )
 })
 
+test('toolCallSignature: undefined / missing / no args are deterministic (identical shapes match)', () => {
+  // Loop detection only needs the same call to yield the same signature — these branches must
+  // not throw and must be stable so a model repeating a bare/undefined-arg call still trips it.
+  assert.equal(toolCallSignature('read', { path: undefined }), toolCallSignature('read', { path: undefined }))
+  assert.equal(toolCallSignature('ls', {}), toolCallSignature('ls', {}))
+  assert.equal(toolCallSignature('bash', undefined), toolCallSignature('bash', undefined))
+})
+
 test('ToolLoopTracker: counts consecutive identical calls; the (LOOP_BREAK_AFTER+1)th trips it', () => {
   const t = new ToolLoopTracker()
   const call = () => t.record('read', { path: 'a.ts' })
   // The first LOOP_BREAK_AFTER calls run normally (count never exceeds the threshold)…
   for (let n = 1; n <= LOOP_BREAK_AFTER; n++) assert.equal(call(), n)
-  // …the very next identical call is the one the hook breaks on.
-  assert.ok(LOOP_BREAK_AFTER + 1 > LOOP_BREAK_AFTER)
-  assert.equal(call(), LOOP_BREAK_AFTER + 1)
+  // …the very next identical call returns a count the hook trips on (record() > LOOP_BREAK_AFTER).
+  const trip = call()
+  assert.equal(trip, LOOP_BREAK_AFTER + 1)
+  assert.ok(trip > LOOP_BREAK_AFTER, 'the (LOOP_BREAK_AFTER+1)th call exceeds the block threshold')
   // It keeps tripping while the model keeps repeating (never silently lets it resume).
   assert.equal(call(), LOOP_BREAK_AFTER + 2)
 })
