@@ -21,6 +21,10 @@ export interface GgufMeta {
   nativeCtx: number
   blockCount: number
   embedLen: number
+  /** Max KV-head count across layers. Architectures that vary the count per layer
+   *  (Gemma 4 declares an array) collapse to the largest — the conservative choice for a
+   *  single-number estimate. Use `headCountKvPerLayer` when it's non-empty for the real
+   *  per-layer values. */
   headCountKv: number
   /** Real per-head dimension from `<arch>.attention.key_length` (falling back to
    *  `value_length`) — llama.cpp's own authoritative field for KV-cache sizing. NOT always
@@ -33,6 +37,47 @@ export interface GgufMeta {
    *  multi-token-prediction head (self-speculative decoding). 0 = none. */
   nextnLayers: number
   hasChatTemplate: boolean
+
+  // ---- Attention layout (optional; all absent-by-default) --------------------------
+  // Most GGUFs (plain llama/mistral/qwen2-style dense attention) declare none of the
+  // keys below and every field here stays 0/[] — callers must treat that as "unknown
+  // layout, assume every layer caches the full context", i.e. exactly the old behaviour.
+  // These exist because two families badly violate that assumption:
+  //   - sliding-window attention (Gemma 3/4): most layers cap at a fixed window, and the
+  //     window layers use a *different* head dim (and sometimes a different KV-head
+  //     count) than the global ones.
+  //   - hybrid linear/SSM attention (Qwen3.5/3.6, Qwen3-Next): only every Nth layer keeps
+  //     a growing KV cache; the rest hold a small constant recurrent state.
+
+  /** `<arch>.attention.sliding_window` — window size in tokens for sliding layers.
+   *  0 when absent. */
+  slidingWindow: number
+  /** `<arch>.attention.sliding_window_pattern` when declared as a per-layer boolean
+   *  array; `true` = that layer is SLIDING (windowed), `false` = full/global attention.
+   *  `[]` when absent, or when the architecture declares it as a scalar stride instead —
+   *  we don't guess a mask from a stride, so callers fall back to the conservative
+   *  every-layer-is-global estimate. Length is expected to equal `blockCount`. */
+  slidingWindowPattern: boolean[]
+  /** `<arch>.attention.key_length_swa` (falling back to `value_length_swa`) — the
+   *  per-head dim used by *sliding* layers, which Gemma 4 sets to half its global
+   *  `key_length`. 0 when absent; callers then reuse `headDim` for every layer, which
+   *  over-counts rather than under-counts. */
+  headDimSwa: number
+  /** `<arch>.attention.head_count_kv` when it is declared as a per-layer ARRAY (Gemma
+   *  4's 26B-A4B does; its sliding and global layers use different counts). `[]` when
+   *  the key is scalar or absent — the scalar is always available as `headCountKv`. */
+  headCountKvPerLayer: number[]
+  /** `<arch>.full_attention_interval` — on hybrid linear/SSM architectures, every Nth
+   *  layer is real full attention (and thus the only layers with a growing KV cache);
+   *  the others hold a constant-size recurrent state. 0 when absent. */
+  fullAttentionInterval: number
+  /** `<arch>.ssm.inner_size` / `.ssm.state_size` / `.ssm.conv_kernel` — the recurrent
+   *  state dimensions on hybrid architectures. Non-zero values are the marker that a
+   *  model is hybrid *at all*, even when it declines to declare `full_attention_interval`
+   *  (Qwen3-Coder-Next does exactly that: hybrid with an undeclared layout). 0 when absent. */
+  ssmInnerSize: number
+  ssmStateSize: number
+  ssmConvKernel: number
 }
 
 const MAGIC = 0x46554747 // "GGUF" little-endian
@@ -149,20 +194,54 @@ function skipValue(r: BufReader, t: number): void {
   r.skip(scalarSize(t))
 }
 
-// Reads a numeric value or, for an int array (e.g. per-layer head_count_kv),
-// the maximum element.
-function readNumberOrMax(r: BufReader, t: number): number {
+// Reads a numeric value as a list. A scalar yields a one-element list; an array is
+// materialized in order. `isArray` is kept separate from `values.length` so a genuine
+// one-element array isn't mistaken for a scalar.
+function readNumberList(r: BufReader, t: number): { values: number[]; isArray: boolean } {
   if (t === T_ARRAY) {
     const elemType = r.u32()
     const count = r.u64()
-    let max = 0
-    for (let i = 0; i < count; i++) {
-      const v = Number(readScalar(r, elemType))
-      if (v > max) max = v
-    }
-    return max
+    const values: number[] = []
+    for (let i = 0; i < count; i++) values.push(Number(readScalar(r, elemType)))
+    return { values, isArray: true }
   }
-  return Number(readScalar(r, t))
+  return { values: [Number(readScalar(r, t))], isArray: false }
+}
+
+// Reads a numeric value or, for an int array (e.g. per-layer head_count_kv),
+// the maximum element.
+function readNumberOrMax(r: BufReader, t: number): number {
+  return maxOf(readNumberList(r, t).values)
+}
+
+// Max of an already-read list, floored at 0 (an empty array reads as 0, matching the
+// "unknown" convention the rest of this parser uses).
+function maxOf(values: number[]): number {
+  let max = 0
+  for (const v of values) if (v > max) max = v
+  return max
+}
+
+// Reads a per-layer boolean mask (e.g. sliding_window_pattern). Non-array values are
+// consumed and reported as `[]`: some architectures declare this key as a scalar stride
+// rather than a mask, and inventing a mask from a stride risks *under*-counting the KV
+// cache. An unknown layout must degrade to the conservative estimate, not a guess.
+function readBoolArray(r: BufReader, t: number): boolean[] {
+  if (t !== T_ARRAY) {
+    skipValue(r, t)
+    return []
+  }
+  const elemType = r.u32()
+  const count = r.u64()
+  const out: boolean[] = []
+  for (let i = 0; i < count; i++) {
+    const v = readScalar(r, elemType)
+    // Bool arrays are the real-world shape; ints/strings are tolerated so a
+    // differently-typed writer doesn't silently produce an all-true mask
+    // (`Boolean('false')` is `true`).
+    out.push(typeof v === 'string' ? v.toLowerCase() === 'true' : Boolean(v))
+  }
+  return out
 }
 
 /** Parse the GGUF metadata header. Throws GgufError on a non-GGUF/truncated file. */
@@ -181,6 +260,9 @@ export function parseGguf(path: string): GgufMeta {
     // separately since a GGUF can in principle declare only one.
     let keyLength: number | undefined
     let valueLength: number | undefined
+    // Same pairing for the sliding-window variants of those two keys.
+    let keyLengthSwa: number | undefined
+    let valueLengthSwa: number | undefined
     for (let i = 0; i < kvCount; i++) {
       const key = r.str()
       const t = r.u32()
@@ -191,9 +273,25 @@ export function parseGguf(path: string): GgufMeta {
       else if (key.endsWith('.context_length')) m.nativeCtx = readNumberOrMax(r, t)
       else if (key.endsWith('.block_count')) m.blockCount = readNumberOrMax(r, t)
       else if (key.endsWith('.embedding_length')) m.embedLen = readNumberOrMax(r, t)
-      else if (key.endsWith('.attention.head_count_kv')) m.headCountKv = readNumberOrMax(r, t)
+      else if (key.endsWith('.attention.head_count_kv')) {
+        // Scalar on most architectures, a per-layer array on Gemma 4's 26B-A4B. Keep the
+        // max as the scalar `headCountKv` (unchanged behaviour) and additionally retain
+        // the array, since collapsing [8,8,8,8,8,2,…] to 8 assigns the global layers 4x
+        // the KV heads they actually use.
+        const kv = readNumberList(r, t)
+        m.headCountKv = maxOf(kv.values)
+        if (kv.isArray) m.headCountKvPerLayer = kv.values
+      }
       else if (key.endsWith('.attention.key_length')) keyLength = readNumberOrMax(r, t)
       else if (key.endsWith('.attention.value_length')) valueLength = readNumberOrMax(r, t)
+      else if (key.endsWith('.attention.key_length_swa')) keyLengthSwa = readNumberOrMax(r, t)
+      else if (key.endsWith('.attention.value_length_swa')) valueLengthSwa = readNumberOrMax(r, t)
+      else if (key.endsWith('.attention.sliding_window')) m.slidingWindow = readNumberOrMax(r, t)
+      else if (key.endsWith('.attention.sliding_window_pattern')) m.slidingWindowPattern = readBoolArray(r, t)
+      else if (key.endsWith('.full_attention_interval')) m.fullAttentionInterval = readNumberOrMax(r, t)
+      else if (key.endsWith('.ssm.inner_size')) m.ssmInnerSize = readNumberOrMax(r, t)
+      else if (key.endsWith('.ssm.state_size')) m.ssmStateSize = readNumberOrMax(r, t)
+      else if (key.endsWith('.ssm.conv_kernel')) m.ssmConvKernel = readNumberOrMax(r, t)
       else if (key.endsWith('.expert_count')) m.expertCount = readNumberOrMax(r, t)
       else if (key.endsWith('.nextn_predict_layers')) m.nextnLayers = readNumberOrMax(r, t)
       else if (key === 'tokenizer.chat_template') {
@@ -217,6 +315,14 @@ export function parseGguf(path: string): GgufMeta {
       expertCount: m.expertCount ?? 0,
       nextnLayers: m.nextnLayers ?? 0,
       hasChatTemplate: m.hasChatTemplate ?? false,
+      slidingWindow: m.slidingWindow ?? 0,
+      slidingWindowPattern: m.slidingWindowPattern ?? [],
+      headDimSwa: keyLengthSwa ?? valueLengthSwa ?? 0,
+      headCountKvPerLayer: m.headCountKvPerLayer ?? [],
+      fullAttentionInterval: m.fullAttentionInterval ?? 0,
+      ssmInnerSize: m.ssmInnerSize ?? 0,
+      ssmStateSize: m.ssmStateSize ?? 0,
+      ssmConvKernel: m.ssmConvKernel ?? 0,
     }
   } finally {
     closeSync(fd)

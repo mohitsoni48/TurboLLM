@@ -269,6 +269,46 @@ export const MUTATING_TOOLS = new Set(['edit', 'write', 'bash'])
 // bash is deliberately absent — it takes `command`, not `path` (see risk flag 1).
 export const PATH_TOOLS = new Set(['read', 'edit', 'write', 'grep', 'find', 'ls'])
 
+// ── Consecutive identical tool-call loop breaker (founder-reported) ────────────
+// A weak local model can get stuck firing the SAME tool with the SAME arguments over and over,
+// making no progress — the turn never settles and reads to the user as a hung agent. After
+// LOOP_BREAK_AFTER consecutive identical calls the tool_call hook stops EXECUTING the tool and
+// hands the model a direct break-the-loop instruction instead (delivered as the blocked call's
+// result, which the model is guaranteed to read). Silent to the user — no prompt, no
+// confirmation; the run self-heals. A different tool, different arguments, or a new top-level
+// turn resets the count. The first LOOP_BREAK_AFTER identical calls still run normally, so a
+// model that legitimately repeats a call a few times is unaffected — only a genuine loop is cut.
+export const LOOP_BREAK_AFTER = 3
+
+/** Order-stable signature of a tool call: the name plus its arguments with object keys sorted at
+ *  every depth, so a model re-emitting the same call with its keys in a different order still
+ *  compares equal. Pure. */
+export function toolCallSignature(name: string, input: unknown): string {
+  const stable = (v: unknown): string => {
+    if (v === null || typeof v !== 'object') return JSON.stringify(v) ?? 'undefined'
+    if (Array.isArray(v)) return `[${v.map(stable).join(',')}]`
+    const o = v as Record<string, unknown>
+    return `{${Object.keys(o).sort().map((k) => `${JSON.stringify(k)}:${stable(o[k])}`).join(',')}}`
+  }
+  return `${name}\u0000${stable(input)}`
+}
+
+/** Tracks consecutive identical tool calls within a turn. `record()` returns the running count
+ *  for the current (tool, args) signature — 1 for a fresh call, N for the Nth identical one in a
+ *  row; any different call resets it to 1. The caller breaks the loop once the count exceeds
+ *  {@link LOOP_BREAK_AFTER}. Deliberately isolable so it's unit-testable without pi or a model. */
+export class ToolLoopTracker {
+  private lastSig: string | null = null
+  private count = 0
+  record(name: string, input: unknown): number {
+    const sig = toolCallSignature(name, input)
+    if (sig === this.lastSig) this.count += 1
+    else { this.lastSig = sig; this.count = 1 }
+    return this.count
+  }
+  reset(): void { this.lastSig = null; this.count = 0 }
+}
+
 // Mechanical half of the dependency-discipline fix (founder-reported gap, 2026-07-13, item 2,
 // see persona.ts's dependencyDisciplineGuidance for the full rationale): matches shell commands
 // that add a NEW dependency across common package managers, deliberately requiring an argument
@@ -439,6 +479,12 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
   // this" (not tied to any specific package name, which would require unreliable parsing). Reset
   // at turn_start, same lifecycle as consecutiveToolFailures.
   let hasSearchedWebThisTurn = false
+
+  // Consecutive identical tool-call loop breaker (see ToolLoopTracker's own comment). Scoped to
+  // this whole user task: constructed once here (runCodeSession runs once per task), and NOT reset
+  // on pi's `turn_start` — that fires per agentic round, so resetting there would clear the count
+  // between the very repeats it needs to catch (see the no-turn_start-reset note below).
+  const toolLoop = new ToolLoopTracker()
 
   // LSP integration (item 3): one running language-server process per `language`, cached at
   // MODULE scope keyed by convId so it survives across turns — see lspClientsByConv's own
@@ -658,7 +704,13 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     })
     pi.on('after_provider_response', () => { releaseGate() })
 
-    pi.on('turn_start', () => { consecutiveToolFailures = 0; hasSearchedWebThisTurn = false })
+    // No turn_start reset — deliberately. pi fires `turn_start` once per agentic ROUND (it carries
+    // an incrementing turnIndex; `agent_start` is the per-task boundary), so resetting here cleared
+    // these counters between rounds, which silently defeated ALL THREE: the loop breaker (identical
+    // calls span rounds), the anti-fallback nudge (a failing retry loop spans rounds), and the
+    // dependency-discipline check. All three are already scoped to one user task by being
+    // (re)created per runCodeSession call; consecutiveToolFailures additionally clears on any tool
+    // SUCCESS in the tool_result hook below, which is the correct "made real progress" reset.
 
     // The ENTIRE containment/approval boundary (plan risk flag 2). Runs before tool.execute().
     pi.on('tool_call', async (event: ToolCallEvent): Promise<ToolCallEventResult | void> => {
@@ -668,6 +720,19 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
 
       // Always surface the call as pending so the UI shows an inline step immediately.
       await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'pending' } })
+
+      // 0. Loop breaker — BEFORE containment/mode, so it catches a stuck model regardless of tool
+      //    or mode. A weak local model can fire the SAME call with the SAME args indefinitely; once
+      //    it has done so more than LOOP_BREAK_AFTER times in a row, stop executing it and hand the
+      //    model a break-the-loop instruction as the (blocked) result instead. Silent to the user.
+      if (toolLoop.record(toolName, input) > LOOP_BREAK_AFTER) {
+        const reason = `[SYSTEM: you have called \`${toolName}\` with identical arguments too many ` +
+          'times in a row and it is not making progress — this call was NOT executed. Stop repeating ' +
+          'it: take a different action, call it with different arguments, or, if you already have what ' +
+          'you need, give your final answer now.]'
+        await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
+        return { block: true, reason }
+      }
 
       // 1. Containment (plan §3b) — BEFORE any mode logic, so it applies in every mode
       //    including auto. Only tools that take a `path` are checkable here.

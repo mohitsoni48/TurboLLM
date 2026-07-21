@@ -145,11 +145,11 @@ function BrandCircle({ name, color, iconSlug }: { name: string; color: string; i
 function AuthBadge({ auth }: { auth: CloudEntry['auth'] }) {
   const label = auth === 'oauth' ? 'OAuth' : auth === 'key' ? 'API Key' : 'OAuth/Key'
   const bg = auth === 'oauth'
-    ? 'color-mix(in srgb, #d97706 18%, transparent)'
+    ? 'color-mix(in srgb, var(--warn) 18%, transparent)'
     : auth === 'key'
     ? 'color-mix(in srgb, var(--ok) 18%, transparent)'
     : 'color-mix(in srgb, var(--accent) 18%, transparent)'
-  const fg = auth === 'oauth' ? '#d97706' : auth === 'key' ? 'var(--ok)' : 'var(--accent)'
+  const fg = auth === 'oauth' ? 'var(--warn)' : auth === 'key' ? 'var(--ok)' : 'var(--accent)'
   return (
     <span className="rounded px-1.5 py-0.5 text-[10px] font-medium" style={{ background: bg, color: fg }}>
       {label}
@@ -161,7 +161,7 @@ function RuntimeBadge({ uvx }: { uvx?: boolean }) {
   return (
     <span className="rounded px-1.5 py-0.5 text-[10px] font-medium"
       style={uvx
-        ? { background: 'color-mix(in srgb, #7c3aed 18%, transparent)', color: '#7c3aed' }
+        ? { background: 'color-mix(in srgb, var(--info) 18%, transparent)', color: 'var(--info)' }
         : { background: 'color-mix(in srgb, var(--accent) 18%, transparent)', color: 'var(--accent)' }}>
       {uvx ? 'uvx' : 'npx'}
     </span>
@@ -175,7 +175,7 @@ function McpCard({ entry, tab, isSelected, isConnected, onSelect }: {
   return (
     <button type="button" onClick={onSelect}
       className="relative flex flex-col gap-2 rounded-lg border bg-panel-2 p-3 text-left transition-colors hover:bg-bg"
-      style={{ borderColor: isSelected ? 'var(--accent)' : isConnected ? 'color-mix(in srgb, var(--ok) 50%, transparent)' : 'var(--border, #e2e2e2)' }}>
+      style={{ borderColor: isSelected ? 'var(--accent)' : isConnected ? 'color-mix(in srgb, var(--ok) 50%, transparent)' : 'var(--border)' }}>
       {isConnected && (
         <span className="absolute right-2 top-2 flex items-center gap-0.5 rounded px-1 py-0.5 text-[9px] font-semibold"
           style={{ background: 'color-mix(in srgb, var(--ok) 15%, transparent)', color: 'var(--ok)' }}>
@@ -566,7 +566,7 @@ function McpSection({ servers, search }: { servers: McpServer[]; search: DaemonS
                 return (
                   <button key={b.id} type="button" onClick={() => selectBuiltin(isOpen ? null : b.id)}
                     className="flex items-center gap-2 rounded-lg border bg-panel px-2.5 py-1.5 text-left transition-colors hover:bg-bg"
-                    style={{ borderColor: isOpen ? 'var(--accent)' : isActive ? 'color-mix(in srgb, var(--ok) 50%, transparent)' : 'var(--border, #e2e2e2)' }}>
+                    style={{ borderColor: isOpen ? 'var(--accent)' : isActive ? 'color-mix(in srgb, var(--ok) 50%, transparent)' : 'var(--border)' }}>
                     <BrandCircle name={b.name} color={nameColor(b.name)} iconSlug={b.iconSlug} />
                     <span className="text-[13px] font-medium text-ink">{b.name}</span>
                     {isActive && (
@@ -635,7 +635,7 @@ function McpSection({ servers, search }: { servers: McpServer[]; search: DaemonS
                   <button key={cat} type="button" onClick={() => { setActiveCat(cat); selectCard(null) }}
                     className="rounded-full px-2.5 py-0.5 text-[11px] font-medium transition-colors"
                     style={activeCat === cat
-                      ? { background: 'var(--accent)', color: '#fff' }
+                      ? { background: 'var(--accent)', color: 'var(--on-accent)' }
                       : { background: 'color-mix(in srgb, var(--muted) 12%, transparent)', color: 'var(--muted)' }}>
                     {cat}
                   </button>

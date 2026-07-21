@@ -36,6 +36,36 @@ type S = 200 | 201 | 202 | 400 | 404 | 409 | 500
 function err(c: Context, s: S, code: string, msg: string) { return c.json({ error: { code, message: msg } }, s) }
 async function body<T>(c: Context): Promise<T> { try { return await c.req.json() as T } catch { return {} as T } }
 
+// ── current-date injection ─────────────────────────────────────────────────
+// The date used to be baked into conv.systemPrompt once, client-side, at conversation
+// creation — so a chat started in March still told the model it was March in July.
+// It is now assembled per request instead, on every path that builds engineMessages.
+
+/** Matches the app's own injected date line so a prompt persisted with a stale copy can be
+ *  cleaned before the fresh one is appended (the model must never see two dates). Deliberately
+ *  narrow — whole line, our exact opening, length-bounded — so user-authored prose that merely
+ *  mentions a date survives. Also matches the line this file emits, keeping the strip idempotent. */
+// `$` (with /m) is load-bearing: it forces the length bound to cover the WHOLE line, so a long
+// user-authored line that merely opens this way fails to match instead of being truncated at 140.
+const BAKED_DATE_LINE = /^Today['’]s date is [^\n]{0,140}$\n?/gm
+
+/** DATE ONLY, never a clock time: llama.cpp prefix-caching keys on the prompt prefix, so a
+ *  per-turn timestamp would invalidate the prefill cache on every single turn. */
+function currentDateLine(now: Date): string {
+  const y = now.getFullYear()
+  const m = String(now.getMonth() + 1).padStart(2, '0')
+  const d = String(now.getDate()).padStart(2, '0')
+  return `Today's date is ${y}-${m}-${d}. Use it only when the request depends on the current date; otherwise ignore it.`
+}
+
+/** Stored system prompt + today's date, appended LAST so everything ahead of it stays a stable
+ *  cache prefix across a date rollover. Callers must keep gating on a non-empty stored prompt —
+ *  the Blank agent means zero system message, and that still holds. */
+export function withCurrentDate(systemPrompt: string, now = new Date()): string {
+  const base = systemPrompt.replace(BAKED_DATE_LINE, '').replace(/\n{3,}/g, '\n\n').trim()
+  return base ? `${base}\n\n${currentDateLine(now)}` : currentDateLine(now)
+}
+
 export function registerChatRoutes(app: Hono, d: Deps): void {
   const { db } = d
 
@@ -250,7 +280,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       // Build messages array for engine
       const allMsgs = (conv.messages ?? []).filter(m => m.id !== assistantMsg.id)
       const engineMessages: { role: string; content: unknown }[] = []
-      if (conv.systemPrompt) engineMessages.push({ role: 'system', content: conv.systemPrompt })
+      if (conv.systemPrompt) engineMessages.push({ role: 'system', content: withCurrentDate(conv.systemPrompt) })
       for (const m of allMsgs) {
         // GitHub #52: when preserveThinking is on, fold past reasoning back into what's
         // resent so the model sees its own prior thinking, not just the final answer —
@@ -323,7 +353,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       // Build messages array for engine from the existing (already-trimmed) history.
       const allMsgs = (conv.messages ?? []).filter((m) => m.id !== assistantMsg.id)
       const engineMessages: { role: string; content: unknown }[] = []
-      if (conv.systemPrompt) engineMessages.push({ role: 'system', content: conv.systemPrompt })
+      if (conv.systemPrompt) engineMessages.push({ role: 'system', content: withCurrentDate(conv.systemPrompt) })
       for (const m of allMsgs) {
         // GitHub #52: when preserveThinking is on, fold past reasoning back into what's
         // resent so the model sees its own prior thinking, not just the final answer —
@@ -708,10 +738,23 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
     }
   }
 
+  // Search budget for a force_web_search turn. The Research persona plans 3–5 targeted
+  // queries; at 3 the model got exactly ONE discretionary search (iterations 1–2 are
+  // tool_choice-forced) and the confidence re-loop below had no room left to fire at all,
+  // so the advertised strategy was not executable. 6 = 5 planned + at least one
+  // confidence-driven refinement (ADR-230: quality over latency). SINGLE SOURCE OF TRUTH —
+  // the instruction text the model is told and the guard the code enforces must never
+  // disagree again, so both read this constant.
+  const MAX_SEARCH_CALLS = 6
+  // Bounds how many times a low-confidence answer may be folded back for refinement. The
+  // re-loop does not force a tool call, so a model that keeps answering without searching
+  // would otherwise never advance searchCallCount and would spin until MAX_TOOL_ITER.
+  const MAX_CONFIDENCE_RETRIES = 2
+
   // F-021: inject confidence-loop instruction into Research persona system prompt.
   // Appends to the existing system message (or inserts one if absent).
   const CONFIDENCE_INSTRUCTION =
-    '\n\nAfter reviewing the search results, include a confidence assessment on a line by itself before your final answer: `[confidence: 0.XX]` where XX is your confidence (0.0–1.0) that your answer is accurate and current. If your confidence is below 0.8, call web_search again with a more specific query first. Maximum 3 search calls per response.'
+    `\n\nAfter reviewing the search results, include a confidence assessment on a line by itself before your final answer: \`[confidence: 0.XX]\` where XX is your confidence (0.0–1.0) that your answer is accurate and current. If your confidence is below 0.8, call web_search again with a more specific query first. Maximum ${MAX_SEARCH_CALLS} search calls per response.`
   if (conv.toolPolicy === 'force_web_search') {
     const sysIdx = iterMessages.findIndex((m) => m.role === 'system')
     if (sysIdx >= 0) {
@@ -722,10 +765,18 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
     }
   }
 
-  const MAX_TOOL_ITER = 10
+  // Outer ceiling on tool rounds. Worst case for a research turn that actually uses its
+  // budget: 6 web_search rounds + up to 6 fetch_url/MCP rounds (the persona tells the model
+  // to fetch_url any authoritative-looking result whose excerpt is thin) + 3 answer-
+  // composition rounds (initial + MAX_CONFIDENCE_RETRIES refinements) = 15. 16 leaves one
+  // round of headroom so a legitimate investigation is never truncated mid-flight. This is
+  // a ceiling, not a target — ordinary chats still finish in 1–2 rounds and are unaffected.
+  const MAX_TOOL_ITER = 16
   let toolIter = 0
-  /** Number of web_search tool calls made this turn (caps confidence re-loop at 3). */
+  /** Number of web_search tool calls made this turn (caps the confidence re-loop). */
   let searchCallCount = 0
+  /** Confidence-driven refinement passes taken this turn (capped at MAX_CONFIDENCE_RETRIES). */
+  let confidenceRetries = 0
   /** Accumulated ResearchResult[] from all web_search calls this turn (F-021). */
   const allResearchSources: ResearchSource[] = []
   /** Confidence score parsed from model output (F-021); undefined for non-research turns. */
@@ -1042,8 +1093,13 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
             // args (zero extra network cost — the registry already called it).
             // We parse what we can from the result string as a fallback.
             try {
-              // Re-parse sources from result text: each [N] block has Domain/Relevance line
-              const sourceMatches = [...result.matchAll(/\[(\d+)\] (.+?)\nSource: (\S+)\nDomain: (\S+) \| Relevance: ([\d.]+) \| Freshness: (\w+)\nKey passage: ([\s\S]+?)(?=\n\[|\s*$)/g)]
+              // Re-parse sources from result text: each [N] block has Domain/Relevance line.
+              // LOCKSTEP: this regex must track the exact line emitted by execWebSearch in
+              // tools/builtin.ts — if they drift, every source silently vanishes from the UI
+              // and from the persisted message. `Published`/`Retrieved` were appended after
+              // `Freshness`, so both trailing groups are optional and this parses the pre-date
+              // format too. m[7] = published label, m[8] = retrieval date, m[9] = passage.
+              const sourceMatches = [...result.matchAll(/\[(\d+)\] (.+?)\nSource: (\S+)\nDomain: (\S+) \| Relevance: ([\d.]+) \| Freshness: (\w+)(?: \| Published: ([^|\n]*?))?(?: \| Retrieved: ([\d-]+))?\nKey passage: ([\s\S]+?)(?=\n\[|\s*$)/g)]
               for (const m of sourceMatches) {
                 allResearchSources.push({
                   title: m[2].trim(),
@@ -1051,7 +1107,7 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
                   domain: m[4].trim(),
                   relevanceScore: parseFloat(m[5]),
                   freshnessSignal: (m[6].trim() as 'recent' | 'dated' | 'unknown'),
-                  passage: m[7].trim(),
+                  passage: m[9].trim(),
                 })
               }
             } catch { /* parsing is best-effort */ }
@@ -1070,7 +1126,7 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
       // ── F-021: Confidence loop (no tool calls — model gave final answer) ─────
       // For Research persona: parse [confidence: 0.XX] from accumulated content,
       // strip it from visible reply, and trigger another search pass if < 0.8
-      // and search budget allows (max 3 web_search calls per turn).
+      // and search budget allows (max MAX_SEARCH_CALLS web_search calls per turn).
       if (conv.toolPolicy === 'force_web_search' && fullContent && d.tools) {
         const confMatch = fullContent.match(/\[confidence:\s*([\d.]+)\]/i)
         if (confMatch) {
@@ -1079,8 +1135,9 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
           // Strip confidence marker from visible content regardless
           fullContent = fullContent.replace(/\[confidence:\s*[\d.]+\]\s*/gi, '').trim()
 
-          if (conf < 0.8 && searchCallCount < 3) {
-            console.log(`[chat] F-021: confidence ${conf} < 0.8 (searches: ${searchCallCount}/3) — re-entering search loop`)
+          if (conf < 0.8 && searchCallCount < MAX_SEARCH_CALLS && confidenceRetries < MAX_CONFIDENCE_RETRIES) {
+            confidenceRetries++
+            console.log(`[chat] F-021: confidence ${conf} < 0.8 (searches: ${searchCallCount}/${MAX_SEARCH_CALLS}, retry ${confidenceRetries}/${MAX_CONFIDENCE_RETRIES}) — re-entering search loop`)
             const toolDefs2 = await d.tools.buildToolDefinitions()
             if (toolDefs2.some((t) => t.function.name === 'web_search')) {
               // Fold the low-confidence answer back and ask the model to refine

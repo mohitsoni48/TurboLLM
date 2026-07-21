@@ -196,6 +196,136 @@ export function defaultSampling(): Sampling {
   return { temp: 0.8, topP: 0.95, topK: 40, minP: 0.05, repeatPenalty: 1.0, presencePenalty: 0.0, frequencyPenalty: 0.0, stop: [] }
 }
 
+/** Is layer `i` a full-attention layer under a hybrid linear/SSM layout of stride N?
+ *
+ *  Convention: the LAST layer of each group of N, i.e. `(i + 1) % N === 0` — matching
+ *  upstream's own `layer_types` derivation for these architectures (Qwen3-Next/Qwen3.5/
+ *  Qwen3.6 build the list as "full_attention if (i+1) % full_attention_interval == 0
+ *  else linear_attention"). For a block count that divides evenly by N — every real
+ *  model observed so far — the offset only moves WHICH layers are full, not how many
+ *  (64 blocks / interval 4 = 16 full layers either way), so the totals are robust to it;
+ *  it matters only when a per-layer KV-head array has to be indexed alongside, and no
+ *  observed model combines the two. */
+function isFullAttentionLayer(i: number, interval: number): boolean {
+  return (i + 1) % interval === 0
+}
+
+/** The hybrid stride to actually apply, or 0 for "no usable hybrid layout".
+ *
+ *  Rejects three ways the declaration can be unusable, all of which must fall back to the
+ *  conservative all-layer estimate rather than to a partial one:
+ *   - `<= 1`: interval 1 means every layer is full attention, i.e. the legacy formula.
+ *   - `> blocks`: NO layer would satisfy `(i+1) % interval === 0`, so the loop in
+ *     {@link kvCacheElems} would count zero layers and report a KV cache of ZERO bytes.
+ *     That is the single worst failure mode this file can produce — it turns a real
+ *     21 GB estimate into 12.8 GB and flips the verdict from `overflow` to `fits` on a
+ *     16 GB card. Reachable without a malformed interval, too: `blocks` falls back to 1
+ *     when `block_count` is missing or unparsed, and 1 < any real interval.
+ *   - non-finite/non-integer: `%` against those yields NaN, which is never `=== 0`, so
+ *     it degenerates to the same zero-layer count. */
+function hybridInterval(m: ModelEntry, blocks: number): number {
+  const interval = m.fullAttentionInterval ?? 0
+  if (!Number.isInteger(interval) || interval <= 1 || interval > blocks) return 0
+  return interval
+}
+
+/** Number of linear/SSM layers — layers that hold a small constant recurrent state
+ *  instead of a growing KV cache. 0 whenever the layout isn't declared, which is the
+ *  whole point: an undeclared layout must not be guessed at (see {@link kvCacheElems}). */
+function linearLayerCount(m: ModelEntry): number {
+  const blocks = m.blockCount || 1
+  const interval = hybridInterval(m, blocks)
+  if (interval === 0) return 0
+  let n = 0
+  for (let i = 0; i < blocks; i++) if (!isFullAttentionLayer(i, interval)) n++
+  return n
+}
+
+/** Elements in the context-scaled KV cache for `ctx` tokens (ADR-216 addendum 2, ADR-223).
+ *
+ *  The old formula counted EVERY layer at FULL context. That is right for a plain dense
+ *  transformer and badly wrong for the two families that no longer are:
+ *
+ *   - hybrid linear/SSM (Qwen3.5/3.6, Qwen3-Next): only every Nth layer keeps a growing
+ *     KV cache; the rest hold a constant recurrent state — a ~4x over-count.
+ *   - sliding-window (Gemma 3/4): most layers cap at a fixed window, and Gemma also uses
+ *     a different head dim AND a different KV-head count on sliding vs global layers —
+ *     measured up to an ~18x over-count.
+ *
+ *  Over-counting isn't cosmetic here: it pushes the fit verdict to "tight"/"overflow"
+ *  and mis-drives auto-tune's headroom gate for a very popular model family.
+ *
+ *  DEGRADATION IS THE LOAD-BEARING PART. Every layout field is optional, and a model
+ *  that declares none of them — the overwhelming majority: plain llama/mistral/qwen2
+ *  dense architectures — takes the legacy branch below and gets bit-for-bit the number
+ *  it got before. Crucially, a model with hybrid EVIDENCE but no declared layout (e.g.
+ *  Qwen3-Coder-Next: ssm.* keys present, no full_attention_interval) also takes the
+ *  legacy branch rather than a guessed interval. That deliberately over-counts by ~4x,
+ *  because the failure modes are not symmetric: this estimate is user-facing (ADR-012)
+ *  AND feeds auto-tune's headroom gate, so an under-estimate buys a failed load and a
+ *  bad tune, while an over-estimate only costs a pessimistic verdict.
+ *
+ *  Pure and exported for unit testing against the measured ground truth in
+ *  profile.kv.test.ts. */
+export function kvCacheElems(m: ModelEntry, ctx: number): number {
+  const blocks = m.blockCount || 1
+  const kvHeads = m.headCountKv || 8
+  const headDim = m.headDim || HEAD_DIM
+
+  // A per-layer array is honored only when it covers every layer. A short or mismatched
+  // one is treated as absent rather than index-clamped: reading past its end would
+  // silently substitute a smaller head count, i.e. under-count.
+  const perLayerHeads =
+    m.headCountKvPerLayer?.length === blocks ? m.headCountKvPerLayer : undefined
+
+  // Sliding-window layout needs BOTH the per-layer pattern and the window size — a
+  // pattern with no window has no cap to apply, so it isn't actionable on its own.
+  const window = m.slidingWindow ?? 0
+  const swaPattern =
+    window > 0 && m.slidingWindowPattern?.length === blocks ? m.slidingWindowPattern : undefined
+  const swaHeadDim = (m.headDimSwa ?? 0) > 0 ? (m.headDimSwa as number) : headDim
+
+  // Hybrid layout, only when the stride is declared AND usable against this block count
+  // — see hybridInterval for the strides that are rejected and why zeroing matters.
+  const interval = hybridInterval(m, blocks)
+  const hybrid = interval > 0 && swaPattern === undefined
+
+  // Legacy path: nothing declared (or nothing actionable). Unchanged from before —
+  // this is the branch essentially every model in the wild takes.
+  if (swaPattern === undefined && !hybrid) return 2 * blocks * ctx * kvHeads * headDim
+
+  let elems = 0
+  for (let i = 0; i < blocks; i++) {
+    // Linear/SSM layers keep no ctx-scaled cache at all; their constant state is
+    // accounted for separately by ssmStateElems so it can't be scaled by ctx.
+    if (hybrid && !isFullAttentionLayer(i, interval)) continue
+    const sliding = swaPattern?.[i] === true
+    const tokens = sliding ? Math.min(ctx, window) : ctx
+    const heads = perLayerHeads?.[i] || kvHeads
+    const dim = sliding ? swaHeadDim : headDim
+    elems += 2 * tokens * heads * dim // ×2 for the K and V caches
+  }
+  return elems
+}
+
+/** Elements in the CONSTANT recurrent state held by linear/SSM layers — roughly
+ *  `inner_size * (state_size + conv_kernel - 1)` per layer (the SSM state plus the
+ *  causal-conv window). Derived from the model's own ssm.* metadata rather than a magic
+ *  number, and deliberately NOT scaled by ctx: that's the entire point of a recurrent
+ *  layer. Small but not zero — ~38.6M elements (~77 MB at f16) for Qwen3.6-27B's 48
+ *  linear layers, which matches an independent analysis of that model.
+ *
+ *  0 unless the layout AND the dimensions are both declared, so it can never turn the
+ *  conservative legacy estimate into a smaller one. */
+export function ssmStateElems(m: ModelEntry): number {
+  const layers = linearLayerCount(m)
+  const inner = m.ssmInnerSize ?? 0
+  const state = m.ssmStateSize ?? 0
+  if (layers === 0 || inner <= 0 || state <= 0) return 0
+  const conv = Math.max(1, m.ssmConvKernel ?? 1)
+  return layers * inner * (state + conv - 1)
+}
+
 /** The VRAM budget a profile can use (ADR-054). A layer/row split — and the default —
  *  spreads the model across ALL detected GPUs, so the honest budget is their summed
  *  VRAM. 'none' restricts to a single GPU (mainGpu, else GPU 0). Single-GPU boxes are
@@ -223,19 +353,23 @@ export function estimateVram(p: LoadProfile, m: ModelEntry, sys: SysInfo): VramF
     : Math.min(p.ngl, blocks) / blocks
   const weightsMb = sizeMb * Math.max(0, Math.min(1, gpuFrac))
 
-  const kvHeads = m.headCountKv || 8
-  // Real per-head dim when the GGUF/config declares it (attention.key_length, or HF's
-  // head_dim) — GQA/MQA models can diverge sharply from embedding_length/head_count
-  // (e.g. Qwen3.6-27B: real 256 vs. HEAD_DIM's 128 constant, a 2x KV-size miss). Falls
-  // back to the constant only when the model doesn't declare it.
-  const headDim = m.headDim || HEAD_DIM
-  const kvElems = 2 * blocks * p.ctx * kvHeads * headDim
+  // Attention-layout-aware KV sizing (ADR-223): counts each layer for what it actually
+  // caches instead of assuming every layer holds full context. Falls back to exactly the
+  // old all-layer formula for any model that doesn't declare its layout — see kvCacheElems.
+  const kvElems = kvCacheElems(m, p.ctx)
+  // The linear/SSM layers' constant recurrent state. Sized at f32 (4 bytes) and NOT scaled by
+  // --cache-type-k: llama.cpp keeps recurrent state unquantized, so applying the user's KV quant
+  // here would under-count it. f32 rather than f16 is the deliberate, safer reading — this
+  // estimate also drives auto-tune's headroom gate, where under-counting costs a failed load
+  // while over-counting only costs a pessimistic verdict. Worth ~155 MB on a 27B, 0 on every
+  // non-hybrid model.
+  const ssmMb = (ssmStateElems(m) * 4) / 1e6
   // KV cache only counts against VRAM when it's offloaded to the GPU. With --no-kv-offload
   // (kvOffload === false) it lives in system RAM, so it adds nothing to the GPU estimate.
   // Absent on pre-feature profiles → treated as the GPU default.
   const kvMb = p.kvOffload === false
     ? 0
-    : ((kvElems * kvBytesPerElem(p.kvTypeK)) / 1e6) * (p.kvUnified ? 1 : Math.max(1, p.parallel))
+    : (((kvElems * kvBytesPerElem(p.kvTypeK)) / 1e6) + ssmMb) * (p.kvUnified ? 1 : Math.max(1, p.parallel))
 
   // The mmproj file's on-disk size is a much closer proxy for its real VRAM footprint than
   // a flat guess (already-quantized weights load close to 1:1) — a measured ~15% overhead

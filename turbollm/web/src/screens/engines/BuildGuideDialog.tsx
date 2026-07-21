@@ -411,7 +411,7 @@ function BuildProgress({
 }) {
   const isError = build.phase === 'error'
   const isDone = build.phase === 'done'
-  const accent = isError ? 'var(--err, #ef4444)' : isDone ? 'var(--ok)' : 'var(--accent)'
+  const accent = isError ? 'var(--err)' : isDone ? 'var(--ok)' : 'var(--accent)'
   // Windows/Linux CUDA builds still physically bundle the CUDA runtime (build-runner.ts's
   // runBuild() copies the DLLs/libs post-build); only macOS (Metal, a system framework) has
   // nothing to bundle. Success copy must reflect that, not claim the same thing for all three.

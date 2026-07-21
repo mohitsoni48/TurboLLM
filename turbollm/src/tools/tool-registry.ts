@@ -2,8 +2,8 @@
 // Manages MCP server lifecycle and presents a unified tool list to the chat loop.
 import type { McpServer, ToolsConfig } from '../config/config'
 import {
-  WEB_SEARCH_TOOL, FETCH_URL_TOOL, RUN_CODE_TOOL,
-  execWebSearch, execFetchUrl, execRunCode,
+  webSearchTool, FETCH_URL_TOOL, RUN_CODE_TOOL,
+  execWebSearch, execFetchUrl, execRunCode, webSearchUnavailableMessage,
 } from './builtin'
 import { searchConfigured } from './search-providers'
 import { createMcpClient, type IMcpClient } from './mcp-client'
@@ -71,7 +71,8 @@ export class ToolRegistry {
     const defs: ToolDefinition[] = []
 
     // Built-in tools — only available when the required config is present
-    if (searchConfigured(this.toolsCfg.search)) defs.push(WEB_SEARCH_TOOL)
+    // Built fresh per request so its embedded date is today's, not the daemon's start date.
+    if (searchConfigured(this.toolsCfg.search)) defs.push(webSearchTool())
     defs.push(FETCH_URL_TOOL)
     defs.push(RUN_CODE_TOOL)
 
@@ -103,7 +104,12 @@ export class ToolRegistry {
     // Built-in: web_search (provider chosen via tools.search — F-020)
     if (name === 'web_search') {
       if (!searchConfigured(this.toolsCfg.search)) {
-        return 'Error: no web-search provider configured. Add one in Settings → Tools.'
+        // Reachable only when a model calls web_search despite it being absent from the tool
+        // list (buildToolDefinitions omits it when unconfigured) — small models do hallucinate
+        // tool names. The old text just named the misconfiguration; it did not tell the model
+        // what to DO, so a Research turn could still narrate a search it never ran. This says
+        // "you cannot search, disclose that" instead. Same wording the system-prompt path uses.
+        return `Error: ${webSearchUnavailableMessage('not_configured')}`
       }
       return execWebSearch(args, this.toolsCfg.search!)
     }
@@ -134,6 +140,14 @@ export class ToolRegistry {
     }
 
     return `Error: unknown tool "${name}"`
+  }
+
+  /** Whether web_search can actually execute (a provider is configured). Distinct from whether
+   *  the model can REACH it — the tool list may still be suppressed downstream (see the
+   *  engine-kind gate in chat-routes.ts). Callers that need to explain a failed research turn
+   *  use this to pick between the 'not_configured' and 'tools_unreachable' reasons. */
+  searchAvailable(): boolean {
+    return searchConfigured(this.toolsCfg.search)
   }
 
   /** Whether any tools are currently available (determines if tools should be sent to engine). */
