@@ -17,7 +17,6 @@ import {
   MoreHorizontal,
   Network,
   Package,
-  Puzzle,
   RefreshCw,
   Rocket,
   Server,
@@ -334,17 +333,6 @@ const ENGINE_META: Record<string, EngineMeta> = {
     ],
     cons: ['Solo maintainer, fast churn (v0.4.0 dropped TurboQuant/TCQ)', 'No install endpoint yet — build from source', 'KVarN types need the raw flags field, not auto-tune yet'],
   },
-  croco: {
-    icon: Puzzle,
-    tagline: 'KoboldCpp + ik_llama quants',
-    format: 'GGUF',
-    pros: [
-      "Carries ik_llama.cpp's SOTA IQ quants into KoboldCpp",
-      'Wide KV-cache quant mode selection',
-      'Active fork, frequent point releases',
-    ],
-    cons: ['Not yet one-click installable in TurboLLM', 'Mainly NVIDIA/CUDA-tuned', 'No macOS build published'],
-  },
 }
 
 const FALLBACK_META: EngineMeta = { icon: Boxes, tagline: 'Inference engine', format: '', pros: [], cons: [] }
@@ -358,9 +346,6 @@ const COMPAT_COLOR: Record<CompatLevel, string> = { ok: 'var(--ok)', caution: 'v
 /** Green / amber / red hardware fit for a card: incompatible (red) · compatible but with
  *  no prebuilt so it must be built (amber) · ready to install/installed (green). */
 function compatFor(fit: EngineFit): { level: CompatLevel; label: string } {
-  if (fit.engine.comingSoon) {
-    return { level: 'caution', label: 'Not yet installable' }
-  }
   if (fit.compatible.length === 0) {
     return { level: 'none', label: fit.incompatibleReason ?? 'Not supported on your hardware' }
   }
@@ -1042,7 +1027,6 @@ function EngineCard({
   const sourceBuilt = !!catalog?.sourceBuilt
   const incompatible = fit.compatible.length === 0
   const buildYourself = !incompatible && fit.compatible.every((v) => !v.hasPrebuilt)
-  const comingSoon = !!catalog?.comingSoon
   const isInstalled = !!catalog?.installed
   const isEnabled = !!catalog?.enabled
   const isDisabled = isInstalled && !isEnabled
@@ -1199,10 +1183,6 @@ function EngineCard({
                 />
               )}
             </>
-          ) : comingSoon ? (
-            <span className="max-w-[240px] text-right text-[11px] text-muted" title={catalog?.note}>
-              {catalog?.note ?? 'Not yet installable in TurboLLM.'}
-            </span>
           ) : buildYourself ? (
             <>
               <Button

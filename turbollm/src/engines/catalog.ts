@@ -12,8 +12,10 @@
 //   - 'builtin':        already provisioned by another path (the auto default).
 //
 // Honesty rule (project HARD RULE / ADR-012 ethos): an engine is only listed as
-// installable when a real provisioning path exists. Use `comingSoon: true` for
-// engines without a real release path yet; remove the flag once they publish one.
+// installable when a real provisioning path exists. If NEITHER build-from-source
+// NOR one-click install works yet, don't list it at all — a "coming soon, not
+// actually installable" entry reads as a red flag, not awareness (ADR-239). Add
+// the entry once a real path (either one) is built.
 
 import { type BackendId, availableBackends } from './download'
 import type { Arch } from './hardware'
@@ -472,29 +474,6 @@ const ALL: CatalogEngine[] = [
         hasPrebuilt: false,
       },
     ],
-  },
-  {
-    id: 'croco',
-    name: 'Croco.Cpp',
-    kind: 'koboldcpp',
-    description:
-      "A KoboldCpp mod carrying ik_llama.cpp's SOTA IQ quants and extra KV-cache modes, mainly for NVIDIA/CUDA users.",
-    provision: 'github-release',
-    homepage: 'https://github.com/Nexesenex/croco.cpp',
-    repo: 'Nexesenex/croco.cpp',
-    // No macOS release asset published (Windows/Linux only).
-    platforms: ['win32', 'linux'],
-    support: 'experimental',
-    installEndpoint: '',
-    // Genuinely not installable here yet, on EITHER path: it's Python + PyInstaller-packaged
-    // like upstream KoboldCpp (confirmed via repo listing — koboldcpp.py + make_pyinstaller*
-    // scripts), not a plain CMake project, so the guided build-from-source flow
-    // (notCmakeProjectError, build-runner.ts) can't produce a working binary from it either.
-    // One-click install needs new provisioning code (a croco.ts mirroring koboldcpp.ts) plus
-    // empirical verification that its CLI flags match koboldcppProfileToArgs's — not yet done
-    // (ADR-238 deliberately deferred this rather than shipping a broken or unverified path).
-    comingSoon: true,
-    note: "Not yet one-click installable in TurboLLM — it needs new provisioning code (like KoboldCpp's), which hasn't been built. Not buildable from source here either (Python/PyInstaller-packaged, not a plain CMake project).",
   },
 ]
 

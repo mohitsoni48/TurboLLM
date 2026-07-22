@@ -179,10 +179,6 @@ test('recommendEngines: every catalog engine is classified (none left unclassifi
   // reason about all four engines (compatible OR incompatible-with-reason).
   const rec = recommendEngines(nvidiaWin, fullCatalog())
   for (const fit of rec.fits) {
-    // comingSoon engines (e.g. croco) have no provisioning path yet, so there's no
-    // hardware fit to reason about — the UI special-cases them before ever consulting
-    // fit.compatible/variants (EnginesScreen.tsx's compatFor/EngineCard).
-    if (fit.engine.comingSoon) continue
     assert.ok(fit.variants.length > 0, `${fit.engine.id} should have variants to classify`)
     const classified = fit.compatible.length > 0 || fit.incompatibleReason !== undefined
     assert.ok(classified, `${fit.engine.id} must be either compatible or carry an incompatibleReason`)
