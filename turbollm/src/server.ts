@@ -25,10 +25,29 @@ const WEB_ROOT = join(dirname(fileURLToPath(import.meta.url)), 'webdist')
 export function createApp(d: Deps): Hono {
   const app = new Hono()
 
+  // /v1/* (OpenAI/Anthropic-compatible gateway) stays fully permissive — arbitrary
+  // client software (Claude Code, other CLIs/tools) needs to reach it cross-origin,
+  // and it carries no browser-fingerprinting surface the way /api/* does.
   app.use(
-    '*',
+    '/v1/*',
     cors({
       origin: '*',
+      allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+      allowHeaders: ['Content-Type', 'Authorization', 'x-api-key', 'X-TurboLLM-Auth'],
+    }),
+  )
+  // /api/* origin-allowlisted (ADR-216 open question, resolved): wildcard CORS here let
+  // ANY website silently read a loopback user's GPU/CPU/RAM via unauthenticated
+  // /api/v1/sysinfo while the daemon runs — a fingerprinting surface, not just the
+  // turbollm.dev "Suggest for my hardware" integration it was added to support. Compat
+  // swept 2026-07-22: that page (docs/site-build/pages/what-can-i-run.html) is the ONLY
+  // real cross-origin /api/* caller in the codebase, running from the production origin.
+  // A same-origin request (the app's own served UI) is unaffected either way — the
+  // browser never applies CORS to it.
+  app.use(
+    '/api/*',
+    cors({
+      origin: 'https://turbollm.dev',
       allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
       allowHeaders: ['Content-Type', 'Authorization', 'x-api-key', 'X-TurboLLM-Auth'],
     }),
