@@ -202,9 +202,12 @@ the detail:
 - **Real measured tokens/sec** in the model list — **live** while generating, **last-session**
   when idle (never a synthetic estimate).
 - **Full load-parameter UI**, a superset of what other tools expose: context length, GPU offload
-  (`-ngl`), **MoE CPU-offload (`--n-cpu-moe`)**, parallel slots, **KV-cache quant type** (incl.
-  low-bit on supporting forks), CPU threads, flash attention, and **speculative decoding (NextN /
-  MTP / draft, with a configurable draft min/max window)**.
+  (`-ngl`), **MoE CPU-offload (`--n-cpu-moe`)**, parallel slots, **independent K and V cache-quant
+  type** (incl. low-bit on supporting forks), CPU threads, flash attention, **speculative decoding
+  (NextN / MTP / draft, with a configurable draft min/max window)**, a **pinned engine port** per
+  model, and a **custom/raw flags** field for anything not exposed as its own control.
+- **Copy the exact launch command** for a loaded model — runs the same config standalone with
+  llama.cpp/the fork directly, no TurboLLM required.
 - **Auto-fit GPU layers / MoE offload** — an optional toggle (off by default) that hands the
   GPU/CPU split decision to llama.cpp's own memory-fitting logic at load time instead of a fixed
   number, honored by Auto-tune too. Useful when a large context or model doesn't fit your usual
@@ -266,10 +269,12 @@ the detail:
   in every chat with no restart. A **Research** persona forces multi-step web search and cites sources inline.
 - **Tool-call approval gate** — every tool call asks for your approval by default before it runs,
   with **Deny**, **Allow**, **Allow for this chat**, or **Always Allow** on an inline bar above the
-  composer. Set per-tool defaults globally from Settings → Tools & safety.
+  composer. Set per-tool defaults globally from Settings → Tools & safety, or flip **Auto-allow
+  all** to skip prompts entirely — a tool set to Deny still stays blocked either way.
 - **Usage dashboard** — a GitHub-style activity heatmap of your local generation history (adaptive
   1h/12h/24h boxes for the 7-day/30-day/all-time views), streaks, peak hour, a per-model
-  breakdown, and a lifetime token-milestone tracker.
+  breakdown, a lifetime token-milestone tracker, and a separate **API tab** tracking tokens hitting
+  the gateway from external tools like Claude Code — not just in-app chat.
 - **Auto-memory** *(experimental, off by default)* — silently extracts durable facts you mention
   in chat (name, preferences, hardware) using your own loaded model, and carries them into future
   new conversations. Nothing leaves your device; the full fact list is reviewable and deletable
