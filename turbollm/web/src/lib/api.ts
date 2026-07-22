@@ -815,6 +815,13 @@ export function removeDownload(id: string): Promise<{ ok: true }> {
   return request<{ ok: true }>(`/api/v1/downloads/${encodeURIComponent(id)}`, { method: 'DELETE' })
 }
 
+export function resumeDownload(id: string): Promise<{ ok: true }> {
+  return request<{ ok: true }>(`/api/v1/downloads/${encodeURIComponent(id)}/resume`, {
+    method: 'POST',
+    json: {},
+  })
+}
+
 // ── Chat (non-streaming gateway passthrough) ─────────────────────────────────
 export function chatCompletion(input: {
   model: string

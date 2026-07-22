@@ -296,6 +296,21 @@ export class DownloadManager {
     return true
   }
 
+  /** Resume a paused or errored job (spec 10 §5): re-queue it so pump() picks it back
+   *  up. run() already resumes from the .part file's byte offset via a Range request —
+   *  this just flips the status so the queue actually starts it again. A restart-
+   *  restored job comes back as 'paused' with no automatic way back to 'downloading'
+   *  until this is called. */
+  resume(id: string): boolean {
+    const rec = this.records.get(id)
+    if (!rec || (rec.status !== 'paused' && rec.status !== 'error')) return false
+    rec.status = 'queued'
+    rec.error = null
+    this.persist()
+    this.pump()
+    return true
+  }
+
   /** Remove a record entirely (and any lingering .part). */
   remove(id: string): boolean {
     const rec = this.records.get(id)

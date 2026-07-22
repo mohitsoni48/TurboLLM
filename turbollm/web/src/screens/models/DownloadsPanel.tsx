@@ -3,7 +3,7 @@
 // percent, speed, and a Cancel action. Completed rows show a "✓ added to library"
 // confirmation and can be removed. Renders nothing-but-empty-state when idle.
 
-import { CheckCircle2, Download, X } from 'lucide-react'
+import { CheckCircle2, Download, RotateCw, X } from 'lucide-react'
 import { useDownloads, useDownloadMutations } from '../../lib/queries'
 import type { DownloadRecord } from '../../lib/types'
 import { Button } from '../../components/ui/button'
@@ -35,7 +35,9 @@ export function DownloadsPanel() {
             d={d}
             onCancel={() => mut.cancel.mutate(d.id)}
             onRemove={() => mut.remove.mutate(d.id)}
+            onResume={() => mut.resume.mutate(d.id)}
             cancelling={mut.cancel.isPending}
+            resuming={mut.resume.isPending}
           />
         ))}
       </div>
@@ -47,18 +49,25 @@ function DownloadRow({
   d,
   onCancel,
   onRemove,
+  onResume,
   cancelling,
+  resuming,
 }: {
   d: DownloadRecord
   onCancel: () => void
   onRemove: () => void
+  onResume: () => void
   cancelling: boolean
+  resuming: boolean
 }) {
   const pct = d.total > 0 ? Math.min(100, Math.round((d.received / d.total) * 100)) : 0
   const inFlight = d.status === 'downloading' || d.status === 'queued' || d.status === 'paused'
   const isDone = d.status === 'done'
   const isError = d.status === 'error'
   const isCancelled = d.status === 'cancelled'
+  // paused (a restart-restored job) or errored (a network hiccup) both have a .part
+  // file on disk and can continue from that byte offset via Range — see resume().
+  const canResume = d.status === 'paused' || isError
 
   const barColor = isError ? 'var(--err)' : isDone ? 'var(--ok)' : 'var(--accent)'
 
@@ -74,6 +83,18 @@ function DownloadRow({
             <StatusLine d={d} pct={pct} />
           </div>
         </div>
+        {canResume && (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={onResume}
+            disabled={resuming}
+            title="Resume from where it left off"
+          >
+            <RotateCw size={13} />
+            Resume
+          </Button>
+        )}
         {inFlight && (
           <Button
             size="sm"
