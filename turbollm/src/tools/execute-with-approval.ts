@@ -17,6 +17,9 @@ export async function executeToolCallWithApproval(params: {
   args: Record<string, unknown>
   globalPolicies: Record<string, ToolPolicy>
   convOverrides: Record<string, 'allow' | 'deny'>
+  /** Settings → Tool permissions master toggle (default off) — silences a resolved
+   *  'ask' only; an explicit 'deny' is still honored. See resolveToolPolicy. */
+  autoAllowAll?: boolean
   signal: AbortSignal
   /** true for live foreground chat (can prompt a human); false for background agent runs
    *  (must never hang waiting for a human — 'ask'-policy tools are denied unless
@@ -27,9 +30,9 @@ export async function executeToolCallWithApproval(params: {
    *  in for the interactive approval a background run can never get. */
   agentAllowedTools?: string[]
 }): Promise<{ result: string; error?: string }> {
-  const { tools, sink, convId, id, name, args, globalPolicies, convOverrides, signal, interactive, agentAllowedTools } = params
+  const { tools, sink, convId, id, name, args, globalPolicies, convOverrides, signal, interactive, agentAllowedTools, autoAllowAll } = params
 
-  const policy = resolveToolPolicy(name, globalPolicies, convOverrides)
+  const policy = resolveToolPolicy(name, globalPolicies, convOverrides, autoAllowAll)
 
   if (policy === 'deny') {
     const result = 'Blocked: this tool is set to Deny in Tool Permissions settings.'

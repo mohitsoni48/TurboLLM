@@ -6,13 +6,18 @@
 export type ToolPolicy = 'ask' | 'allow' | 'deny'
 
 /** Per-conversation override wins over the global default; falling through to 'ask'
- *  when neither is set (safe-by-default: a brand-new/unclassified tool always prompts). */
+ *  when neither is set (safe-by-default: a brand-new/unclassified tool always prompts).
+ *  `autoAllowAll` (Settings → Tool permissions master toggle) only silences a resolved
+ *  'ask' — it never overrides an explicit 'deny' (global or per-conversation), which
+ *  stays a deliberate decision the user already made. */
 export function resolveToolPolicy(
   name: string,
   globalPolicies: Record<string, ToolPolicy>,
   convOverrides: Record<string, 'allow' | 'deny'>,
+  autoAllowAll = false,
 ): ToolPolicy {
   if (convOverrides[name]) return convOverrides[name]
-  if (globalPolicies[name]) return globalPolicies[name]
-  return 'ask'
+  const global = globalPolicies[name]
+  if (global) return global === 'ask' && autoAllowAll ? 'allow' : global
+  return autoAllowAll ? 'allow' : 'ask'
 }

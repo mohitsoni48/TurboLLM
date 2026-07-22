@@ -1533,6 +1533,7 @@ export function registerApi(app: Hono, d: Deps): void {
       search?: { provider?: string; tavilyApiKey?: string; kagiApiKey?: string; searxngUrl?: string }
       build?: { toolchainDirs?: string[] }
       toolPolicies?: Record<string, string>
+      autoAllowAll?: boolean
       cloudDeploy?: { runpodTemplateId?: string }
       experimental?: { memory?: boolean; code?: boolean; cloudDeploy?: boolean }
     }>(c)
@@ -1686,6 +1687,7 @@ export function registerApi(app: Hono, d: Deps): void {
       Object.assign(cfg.gateway, gwUpdates)
       if (toolchainDirs !== undefined) cfg.build.toolchainDirs = toolchainDirs
       if (toolPolicies !== undefined) cfg.tools.toolPolicies = toolPolicies
+      if (b.autoAllowAll !== undefined) cfg.tools.autoAllowAll = !!b.autoAllowAll
       if (b.autoLoadOnStart !== undefined) cfg.autoLoadOnStart = !!b.autoLoadOnStart
       if (vramHeadroomMb !== undefined) cfg.vramHeadroomMb = vramHeadroomMb
       if (telemetryLevel !== undefined) cfg.telemetry.level = telemetryLevel
@@ -2192,6 +2194,7 @@ function settingsPayload(d: Deps) {
     // Tool-call approval gate: global per-tool policy ('ask' | 'allow' | 'deny').
     // Not secret — echoed back directly so Settings can render Tool Permissions.
     toolPolicies: cfg.tools.toolPolicies ?? {},
+    autoAllowAll: cfg.tools.autoAllowAll ?? false,
   }
 }
 

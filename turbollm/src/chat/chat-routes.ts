@@ -1078,6 +1078,7 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
               // start) — otherwise a same-turn repeat tool call misses an "Allow for this
               // chat" decision the user just made via POST .../tool-calls/:id/approve.
               convOverrides: d.db.getToolOverrides(convId),
+              autoAllowAll: d.store.snapshot().tools.autoAllowAll ?? false,
               signal: ac.signal,
               interactive: true,
             })

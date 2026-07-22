@@ -6,6 +6,7 @@ import { ApiError, type ToolPolicy } from '../../lib/api'
 import { fetchAvailableTools } from '../../lib/chat-api'
 import { friendlyName } from '../../lib/tool-explain'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../../components/ui/collapsible'
+import { Switch } from '../../components/ui/switch'
 import { toast } from '../../components/ui/sonner'
 import { cn } from '../../lib/utils'
 
@@ -23,10 +24,18 @@ export function ToolPermissionsSection() {
   const { query: settingsQ, save } = useSettings()
   const tools = toolsQ.data ?? []
   const policies = settingsQ.data?.toolPolicies ?? {}
+  const autoAllowAll = settingsQ.data?.autoAllowAll ?? false
 
   const setPolicy = (name: string, value: ToolPolicy) => {
     save.mutate(
       { toolPolicies: { ...policies, [name]: value } },
+      { onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not update tool permission.') },
+    )
+  }
+
+  const setAutoAllowAll = (value: boolean) => {
+    save.mutate(
+      { autoAllowAll: value },
       { onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not update tool permission.') },
     )
   }
@@ -43,6 +52,16 @@ export function ToolPermissionsSection() {
           Control whether each tool the model can call runs automatically, is always blocked, or asks
           for your approval in chat each time.
         </p>
+
+        <div className="mb-3 flex items-center justify-between gap-3 rounded-md border border-border px-3 py-2.5">
+          <div className="min-w-0">
+            <div className="text-[13px] font-medium text-ink">Auto-allow all</div>
+            <div className="text-[11px] text-faint">
+              Skip the approval prompt for every tool set to Ask below. A tool set to Deny stays blocked.
+            </div>
+          </div>
+          <Switch checked={autoAllowAll} onCheckedChange={setAutoAllowAll} disabled={save.isPending} />
+        </div>
 
         {toolsQ.isLoading && <p className="text-[13px] text-faint">Loading tools…</p>}
         {!toolsQ.isLoading && tools.length === 0 && (
