@@ -562,8 +562,9 @@ export type TokenUsageStats = {
 }
 
 /** Gateway (external-client) token usage — Claude Code, other CLIs/extensions hitting
- *  /v1/messages or /v1/chat/completions — kept separate from the chat-scoped fields above
- *  (GitHub #71; see db.ts's ApiUsageStats doc comment for why). */
+ *  /v1/messages or /v1/chat/completions (GitHub #71). This isolated breakdown (by source, by
+ *  model) is separate, but TokenUsageStats.totalTokens/lifetimeTotalTokens/milestone already
+ *  INCLUDE it — see db.ts's ApiUsageStats doc comment for why. */
 export type ApiUsageSource = 'anthropic' | 'openai'
 
 export type ApiModelUsage = {

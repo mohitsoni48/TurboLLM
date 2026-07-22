@@ -220,7 +220,7 @@ export function TokensScreen() {
           )}
 
           {tab === 'models' && (
-            <ModelsTab models={data.byModel} dailyByModel={data.dailyByModel} totalTokens={data.totalTokens} />
+            <ModelsTab models={data.byModel} dailyByModel={data.dailyByModel} />
           )}
 
           {tab === 'api' && <ApiUsageTab api={data.api} />}

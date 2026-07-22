@@ -31,9 +31,10 @@ _Nothing yet._
 `/api/*` CORS hole).**
 
 ### Added
-- **Usage → API tab** — tracks tokens hitting the OpenAI/Anthropic-compatible gateway from
-  external tools (Claude Code, other CLIs/extensions), separately from in-app chat, split by
-  source and model. (#71)
+- **Usage tracking now covers the gateway, not just in-app chat** — tokens hitting the
+  OpenAI/Anthropic-compatible gateway from external tools (Claude Code, other CLIs/extensions)
+  now count toward the Overview totals and lifetime milestone, with a dedicated API tab for the
+  breakdown by source and model. (#71)
 - **Auto-allow-all tools toggle** (Settings → Tools & safety) — skip the approval prompt for every
   tool set to Ask; a tool explicitly set to Deny still stays blocked.
 - **Custom/raw engine flags** — a field in the model config panel to append arbitrary

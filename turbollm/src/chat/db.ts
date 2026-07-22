@@ -250,10 +250,12 @@ export interface TokenUsageStats {
   activity: TokenActivity
   dailyByModel: DailyModelBreakdown[]
   byModel: ModelUsage[]
-  /** Tokens from gateway (external client) traffic — Claude Code, other CLIs/extensions —
-   *  kept as a separate bucket rather than merged into the fields above (GitHub #71): those
-   *  fields' "sessions"/streak/milestone semantics are chat-conversation concepts that gateway
-   *  requests don't participate in (no conv_id, no role). */
+  /** Tokens from gateway (external client) traffic — Claude Code, other CLIs/extensions
+   *  (GitHub #71). This isolated breakdown (by source, by model) is separate, but `totalTokens`/
+   *  `lifetimeTotalTokens`/`milestone` above already INCLUDE it (founder-directed, 2026-07-22 —
+   *  Overview must reflect all usage, not just chat). Only `sessions`/`messages`/streak/
+   *  peak-hour/favorite-model stay chat-only: those are chat-conversation concepts (a gateway
+   *  request has no conv_id, isn't a "session") with no clean API equivalent. */
   api: ApiUsageStats
 }
 
@@ -321,6 +323,19 @@ const TOKEN_MILESTONES = [
   1_000, 10_000, 100_000, 500_000, 1_000_000, 5_000_000,
   10_000_000, 50_000_000, 100_000_000, 500_000_000, 1_000_000_000,
 ]
+
+/** Where a lifetime token total sits on the milestone ladder. Shared by both branches of
+ *  tokenUsageStats (empty-rows and the real computation) — as of 2026-07-22 the lifetime
+ *  total fed in is the COMBINED chat+API figure, so this only ever computes, never decides
+ *  which figure to use. */
+function milestoneFor(lifetimeTotalTokens: number): { achieved: number | null; next: number | null; progressPct: number | null } {
+  const achieved = [...TOKEN_MILESTONES].reverse().find((m) => m <= lifetimeTotalTokens) ?? null
+  const next = TOKEN_MILESTONES.find((m) => m > lifetimeTotalTokens) ?? null
+  const progressPct = next !== null
+    ? Math.round(((lifetimeTotalTokens - (achieved ?? 0)) / (next - (achieved ?? 0))) * 1000) / 10
+    : null
+  return { achieved, next, progressPct }
+}
 
 /** "gemma 4 e4b|Q6_K|6217256480" -> "Gemma 4 E4b". Good enough for a dashboard label —
  *  the model may since have been renamed/deleted, so this derives purely from the stored
@@ -1082,14 +1097,20 @@ export class ConversationStore {
     `).all() as unknown as { conv_id: string; created_at: string; stats: string; model_key: string | null }[]
 
     if (rows.length === 0) {
+      // Computed independently — a user with zero in-app chats but real gateway (Claude
+      // Code / extension) traffic still has something to show here. "Total tokens" /
+      // "Lifetime tokens" (below and in the main branch) are the founder-directed
+      // combined figure (2026-07-22) — Overview must reflect ALL usage, not just chat,
+      // so a chat-less API-only user still gets a real milestone reading instead of a
+      // permanently-stuck-at-zero one.
+      const api = this.apiUsageStats(range)
+      const milestone = milestoneFor(api.lifetimeTotalTokens)
       return {
-        range, sessions: 0, messages: 0, totalTokens: 0, activeDays: 0,
+        range, sessions: 0, messages: 0, totalTokens: api.totalTokens, activeDays: 0,
         currentStreak: 0, longestStreak: 0, peakHour: null, favoriteModel: null,
-        firstMessageAt: null, lifetimeTotalTokens: 0, milestone: { achieved: null, next: null, progressPct: null },
+        firstMessageAt: null, lifetimeTotalTokens: api.lifetimeTotalTokens, milestone,
         activity: { granularityHours: 24, buckets: [] }, dailyByModel: [], byModel: [],
-        // Computed independently — a user with zero in-app chats but real gateway (Claude
-        // Code / extension) traffic still has something to show here.
-        api: this.apiUsageStats(range),
+        api,
       }
     }
 
@@ -1234,21 +1255,29 @@ export class ConversationStore {
       activity = { granularityHours, buckets }
     }
 
-    let lifetimeTotalTokens = 0
-    for (const b of dayBuckets.values()) lifetimeTotalTokens += b.promptTokens + b.genTokens
-    const achieved = [...TOKEN_MILESTONES].reverse().find((m) => m <= lifetimeTotalTokens) ?? null
-    const next = TOKEN_MILESTONES.find((m) => m > lifetimeTotalTokens) ?? null
-    const progressPct = next !== null
-      ? Math.round(((lifetimeTotalTokens - (achieved ?? 0)) / (next - (achieved ?? 0))) * 1000) / 10
-      : null
+    let chatLifetimeTotalTokens = 0
+    for (const b of dayBuckets.values()) chatLifetimeTotalTokens += b.promptTokens + b.genTokens
+
+    // Founder-directed (2026-07-22): Overview's "Total tokens" / "Lifetime tokens" / milestone
+    // ladder must reflect ALL usage, not just in-app chat — a heavy Claude Code / extension user
+    // was seeing a headline total that silently excluded most of their real usage, with the API
+    // figures only visible by switching to a separate tab. `sessions`/`messages`/streak/peak-hour/
+    // favorite-model stay chat-only below: those are chat-conversation-shaped concepts (a gateway
+    // request has no conv_id, isn't a "session") with no clean 1:1 API equivalent, and the founder
+    // asked specifically about "usage" totals, not those. The isolated `api` breakdown (by source,
+    // by model) remains available in its own tab for anyone who wants the split.
+    const api = this.apiUsageStats(range)
+    const combinedTotalTokens = totalTokens + api.totalTokens
+    const combinedLifetimeTotalTokens = chatLifetimeTotalTokens + api.lifetimeTotalTokens
+    const milestone = milestoneFor(combinedLifetimeTotalTokens)
 
     return {
-      range, sessions: convIds.size, messages: scopedRows.length, totalTokens, activeDays,
+      range, sessions: convIds.size, messages: scopedRows.length, totalTokens: combinedTotalTokens, activeDays,
       currentStreak, longestStreak, peakHour,
       favoriteModel: byModel[0]?.displayName ?? null,
-      firstMessageAt, lifetimeTotalTokens, milestone: { achieved, next, progressPct },
+      firstMessageAt, lifetimeTotalTokens: combinedLifetimeTotalTokens, milestone,
       activity, dailyByModel, byModel,
-      api: this.apiUsageStats(range),
+      api,
     }
   }
 
