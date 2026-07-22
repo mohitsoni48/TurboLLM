@@ -1110,6 +1110,13 @@ function EngineCard({
         </div>
       )}
 
+      {/* Extra context (Windows build caveats, "no prebuilts published", flag guidance, etc.)
+       *  — comingSoon engines show their note in the footer instead (it IS the primary
+       *  explanation there), so skip it here to avoid showing it twice. */}
+      {catalog?.note && !catalog.comingSoon && (
+        <p className="mt-3 text-[12px] leading-snug text-muted">{catalog.note}</p>
+      )}
+
       {/* Footer: docs link + primary action / manage */}
       <div className="mt-3 flex items-center justify-between gap-2 border-t border-border pt-3">
         {catalog ? (
