@@ -140,6 +140,48 @@ function isEmbeddingModel(arch: string, name: string): boolean {
   return EMBED_ARCHS.has(arch.toLowerCase()) || EMBED_FILE_RE.test(name)
 }
 
+/** How many identical characters two (already-lowercased) strings share from the start —
+ *  a cheap, realistic correlation signal for GGUF filenames: a repo's model and mmproj
+ *  files typically share a "<repo-name>-…" prefix before diverging into their own
+ *  quant/format suffix (e.g. "gemma-4-12b-it-qat" vs "gemma-4-12b-mmproj-F16"). */
+function commonPrefixLen(a: string, b: string): number {
+  let i = 0
+  while (i < a.length && i < b.length && a[i] === b[i]) i++
+  return i
+}
+
+const MIN_MMPROJ_CORRELATION_PREFIX = 6
+
+/** Picks the mmproj that actually belongs to `modelFile` out of every mmproj candidate
+ *  in the same directory. Fixes a real bug (Discord thread, 2026-07-20): a modelDir the
+ *  user points at manually with more than one vision model's files sitting flat in one
+ *  folder used to pick "the single largest mmproj in the directory" and attach it to
+ *  EVERY model there, regardless of which model it actually belongs to — wiring the wrong
+ *  projector onto a model, which then fails to start with an incompatible vision tower.
+ *
+ *  1. One candidate → unambiguous, use it (the common case — and ADR-145's per-repo
+ *     download folders mean TurboLLM's own downloader never produces more than one).
+ *  2. Filename correlation (shared prefix before quant/format suffixes diverge) narrows
+ *     to exactly one candidate → use it.
+ *  3. Still ambiguous (no correlation, or several candidates all correlate) → the mmproj
+ *     with the closest mtime to the model file wins: files pulled down in the same HF
+ *     download land within moments of each other, so this reliably tells two repos' files
+ *     apart even when the mmproj is generically named — e.g. "mmproj-F16.gguf", the ACTUAL
+ *     repro case (gemma-4-12B-it-qat-GGUF), which carries no model identity to correlate
+ *     by name at all. */
+function resolveMmproj(modelFile: FileInfo, candidates: FileInfo[]): FileInfo | undefined {
+  if (candidates.length <= 1) return candidates[0]
+  const modelName = basename(modelFile.path).toLowerCase()
+  const correlated = candidates.filter(
+    (c) => commonPrefixLen(modelName, basename(c.path).toLowerCase()) >= MIN_MMPROJ_CORRELATION_PREFIX,
+  )
+  if (correlated.length === 1) return correlated[0]
+  const pool = correlated.length > 1 ? correlated : candidates
+  return pool.reduce((best, c) =>
+    Math.abs(c.mtime - modelFile.mtime) < Math.abs(best.mtime - modelFile.mtime) ? c : best,
+  )
+}
+
 /** Thrown by Scanner operations that fail in a caller-actionable way (e.g. delete
  *  of an unknown key). Carries a machine-checkable `code` for the API envelope. */
 export class ScannerError extends Error {
@@ -246,9 +288,6 @@ export class Scanner {
     for (const [dir, group] of byDir) {
       const mmprojFiles = group.filter((f) => basename(f.path).toLowerCase().includes('mmproj'))
       const modelFiles = group.filter((f) => !basename(f.path).toLowerCase().includes('mmproj'))
-      const mmproj = mmprojFiles.sort((a, b) => b.size - a.size)[0]
-      const mmprojPath = mmproj?.path ?? null
-      const mmprojSizeBytes = mmproj?.size ?? 0
 
       // Resolve split groups: prefix+total -> shards, keyed by shard INDEX so a split is
       // judged complete by the distinct part numbers present (1..total), not by the raw
@@ -275,7 +314,8 @@ export class Scanner {
       }
 
       for (const f of singles) {
-        entries.push(await this.entryFor(f.path, f.size, f.mtime, dir, mmprojPath, mmprojSizeBytes, false))
+        const mmproj = resolveMmproj(f, mmprojFiles)
+        entries.push(await this.entryFor(f.path, f.size, f.mtime, dir, mmproj?.path ?? null, mmproj?.size ?? 0, false))
         await tick()
       }
       for (const { shards, total } of splits.values()) {
@@ -292,7 +332,8 @@ export class Scanner {
               break
             }
         }
-        entries.push(await this.entryFor(first.path, totalSize, first.mtime, dir, mmprojPath, mmprojSizeBytes, incomplete))
+        const mmproj = resolveMmproj(first, mmprojFiles)
+        entries.push(await this.entryFor(first.path, totalSize, first.mtime, dir, mmproj?.path ?? null, mmproj?.size ?? 0, incomplete))
         await tick()
       }
     }
