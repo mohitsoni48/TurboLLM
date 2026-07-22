@@ -1997,6 +1997,12 @@ export function registerApi(app: Hono, d: Deps): void {
     return c.json({ ok: true })
   })
 
+  app.post('/api/v1/downloads/:id/resume', (c) => {
+    const ok = d.downloads.resume(c.req.param('id'))
+    if (!ok) return err(c, 404, 'no_such_download', 'No paused or errored download with that id.')
+    return c.json({ ok: true })
+  })
+
   app.delete('/api/v1/downloads/:id', (c) => {
     const ok = d.downloads.remove(c.req.param('id'))
     if (!ok) return err(c, 404, 'no_such_download', 'No download with that id.')

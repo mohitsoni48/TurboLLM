@@ -69,6 +69,7 @@ import {
   listEngines,
   loadModel,
   removeDownload,
+  resumeDownload,
   removeEngine,
   disableCustomEngine,
   removeModelDir,
@@ -737,6 +738,7 @@ export function useDownloadMutations() {
     }),
     cancel: useMutation({ mutationFn: (id: string) => cancelDownload(id), onSuccess: invalidate }),
     remove: useMutation({ mutationFn: (id: string) => removeDownload(id), onSuccess: invalidate }),
+    resume: useMutation({ mutationFn: (id: string) => resumeDownload(id), onSuccess: invalidate }),
   }
 }
 
