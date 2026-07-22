@@ -60,9 +60,12 @@ export function estimateVram(
   const kvElems = 2 * blocks * p.ctx * (m.headCountKv || 8) * HEAD_DIM
   // KV cache only weighs on VRAM when offloaded to the GPU; in RAM mode (--no-kv-offload) it
   // costs no VRAM. Absent on pre-feature profiles → treated as the GPU default.
+  // kvElems is the COMBINED K+V count (×2, identical shape for both) — halved so an
+  // asymmetric quant (K=q8_0, V=q4_0) is weighted correctly instead of assuming V
+  // matches K's byte width (mirrors the same split in src/models/profile.ts).
   const kvMb = p.kvOffload === false
     ? 0
-    : ((kvElems * kvBytesPerElem(p.kvTypeK)) / 1e6) * (p.kvUnified ? 1 : Math.max(1, p.parallel))
+    : ((kvElems / 2) * (kvBytesPerElem(p.kvTypeK) + kvBytesPerElem(p.kvTypeV)) / 1e6) * (p.kvUnified ? 1 : Math.max(1, p.parallel))
   const mmprojMb = p.useMmproj && p.mmprojGpu && m.mmprojPath ? 600 : 0
   const estMb = Math.round(weightsMb + kvMb + 800 + mmprojMb)
   const pct = estMb / totalVramMb

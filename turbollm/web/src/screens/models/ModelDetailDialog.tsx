@@ -6,6 +6,7 @@ import type { CardSampling, LoadProfile, SysGpu } from '../../lib/types'
 import { defaultGpu, defaultVllm } from '../../lib/types'
 import { estimateVram, gpuBudgetMb } from '../../lib/vram'
 import { Button } from '../../components/ui/button'
+import { CopyButton } from '../../components/ui/copy-button'
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '../../components/ui/sheet'
 import {
   AlertDialog,
@@ -391,12 +392,21 @@ export function ModelDetailDialog({
               <Row label="Parallel slots">
                 <NumberInput value={draft.parallel} min={1} max={16} onChange={(v) => set('parallel', v)} />
               </Row>
-              <Row label="KV cache type" hint="turbo* are TurboQuant-fork exclusive.">
-                <Select value={draft.kvTypeK} options={kvTypes} onChange={(v) => setDraft((d) => (d ? { ...d, kvTypeK: v, kvTypeV: v } : d))} />
+              <Row label="K cache type" hint="turbo* are TurboQuant-fork exclusive.">
+                <Select value={draft.kvTypeK} options={kvTypes} onChange={(v) => set('kvTypeK', v)} />
+              </Row>
+              <Row label="V cache type" hint="A quantized V cache needs Flash attention on (llama.cpp requirement).">
+                <Select value={draft.kvTypeV} options={kvTypes} onChange={(v) => set('kvTypeV', v)} />
               </Row>
               <Row label="Flash attention">
                 <Segmented value={draft.flashAttn} options={['auto', 'on', 'off']} onChange={(v) => set('flashAttn', v as LoadProfile['flashAttn'])} />
               </Row>
+              {draft.kvTypeV !== 'f16' && draft.flashAttn === 'off' && (
+                <p className="text-[11px]" style={{ color: 'var(--warn)' }}>
+                  V cache is quantized but Flash attention is off — llama.cpp requires Flash attention for
+                  a quantized V cache and may refuse to load. Set Flash attention to Auto or On.
+                </p>
+              )}
               <Row label="KV cache" hint="VRAM is fastest; RAM frees VRAM for bigger models.">
                 <Segmented
                   value={draft.kvOffload === false ? 'RAM' : 'GPU'}
@@ -435,9 +445,10 @@ export function ModelDetailDialog({
               <Row label="Stop strings" hint="Halt generation when any of these sequences is produced.">
                 <div className="w-full" />
               </Row>
-              <StopStringInput
+              <ChipListInput
                 value={draft.sampling.stop}
                 onChange={(v) => setDraft((d) => d ? { ...d, sampling: { ...d.sampling, stop: v } } : d)}
+                emptyPlaceholder="Type a stop string, press Enter"
               />
               </>)}
             </Section>
@@ -514,6 +525,14 @@ export function ModelDetailDialog({
                 />
                 {detail.vision && <Toggle label="Vision encoder on GPU" value={draft.mmprojGpu} onChange={(v) => set('mmprojGpu', v)} />}
                 {draft.parallel > 1 && <Toggle label="Unified KV across slots" value={draft.kvUnified} onChange={(v) => set('kvUnified', v)} />}
+                <Row label="Engine port" hint="Pin this model's engine to a specific port instead of auto-assigning the first free one (8081+). Falls back to auto if taken.">
+                  <DefaultableNumberInput value={draft.port || undefined} placeholder="auto" min={1024} max={65535} onChange={(v) => set('port', v)} />
+                </Row>
+                {detail.loaded && statusQ.data?.engine.launchCommand && (
+                  <Row label="Launch command" hint="The exact command TurboLLM spawned this model with.">
+                    <CopyButton text={statusQ.data.engine.launchCommand} label="Copy" size={14} />
+                  </Row>
+                )}
                 <Row label="RoPE scaling" hint="Extend context beyond the model's trained limit. 'none' = model native.">
                   <Segmented
                     value={draft.ropeScalingType}
@@ -534,6 +553,22 @@ export function ModelDetailDialog({
               </Section>
             )}
             </>)}
+
+            {(isLlamaCpp || isVllm) && (
+              <>
+                <SectionTitle>Custom flags</SectionTitle>
+                <Section>
+                  <Row label="Extra command-line flags" hint="Appended to the launch command last, so they can override anything above. e.g. --something value">
+                    <div className="w-full" />
+                  </Row>
+                  <ChipListInput
+                    value={draft.extraArgs}
+                    onChange={(v) => set('extraArgs', v)}
+                    emptyPlaceholder="Type a flag, press Enter"
+                  />
+                </Section>
+              </>
+            )}
 
             {loadError && <p className="text-[12px]" style={{ color: 'var(--err)' }}>{loadError}</p>}
 
@@ -1093,7 +1128,11 @@ function PathField({ label, hint, value, placeholder, onChange }: {
   )
 }
 
-function StopStringInput({ value, onChange }: { value: string[]; onChange: (v: string[]) => void }) {
+/** Generic chip-list text input: type, press Enter (or blur), get a removable chip.
+ *  Used for stop strings and for custom/raw engine flags (extraArgs) — same shape. */
+function ChipListInput({ value, onChange, placeholder = 'Add another…', emptyPlaceholder }: {
+  value: string[]; onChange: (v: string[]) => void; placeholder?: string; emptyPlaceholder: string
+}) {
   const [input, setInput] = useState('')
   const add = (s: string) => {
     const t = s.trim()
@@ -1115,7 +1154,7 @@ function StopStringInput({ value, onChange }: { value: string[]; onChange: (v: s
       <input
         type="text"
         value={input}
-        placeholder={value.length ? 'Add another…' : 'Type a stop string, press Enter'}
+        placeholder={value.length ? placeholder : emptyPlaceholder}
         onChange={(e) => setInput(e.target.value)}
         onKeyDown={(e) => {
           if (e.key === 'Enter') { e.preventDefault(); add(input) }

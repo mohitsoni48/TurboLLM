@@ -102,6 +102,12 @@ export interface LoadProfile {
    *  {@link nglFit} applies here too. */
   nCpuMoeFit?: boolean
   parallel: number
+  /** Pin this model's engine instance to a specific loopback port instead of the
+   *  default 8081+ first-free walk (allocPort in manager.ts). 0/undefined = auto.
+   *  Distinct from the main daemon port (6996/6997) — this is only the per-model
+   *  llama-server/mlx/vllm/etc. child process's own port. Falls back to auto if the
+   *  requested port is already taken. */
+  port?: number
   kvUnified: boolean
   kvTypeK: string
   kvTypeV: string
@@ -367,9 +373,14 @@ export function estimateVram(p: LoadProfile, m: ModelEntry, sys: SysInfo): VramF
   // KV cache only counts against VRAM when it's offloaded to the GPU. With --no-kv-offload
   // (kvOffload === false) it lives in system RAM, so it adds nothing to the GPU estimate.
   // Absent on pre-feature profiles → treated as the GPU default.
+  // kvCacheElems returns the COMBINED K+V element count (always ×2, identical shape for
+  // both — see its own comment); halving it gives the K-only / V-only count so an
+  // asymmetric quant (e.g. K=q8_0, V=q4_0) is weighted correctly instead of assuming V
+  // matches K's byte width.
+  const kvBytesMb = ((kvElems / 2) * kvBytesPerElem(p.kvTypeK) + (kvElems / 2) * kvBytesPerElem(p.kvTypeV)) / 1e6
   const kvMb = p.kvOffload === false
     ? 0
-    : (((kvElems * kvBytesPerElem(p.kvTypeK)) / 1e6) + ssmMb) * (p.kvUnified ? 1 : Math.max(1, p.parallel))
+    : (kvBytesMb + ssmMb) * (p.kvUnified ? 1 : Math.max(1, p.parallel))
 
   // The mmproj file's on-disk size is a much closer proxy for its real VRAM footprint than
   // a flat guess (already-quantized weights load close to 1:1) — a measured ~15% overhead

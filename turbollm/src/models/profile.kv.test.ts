@@ -191,6 +191,21 @@ test('estimateVram: --no-kv-offload still zeroes the KV term, recurrent state in
   assert.equal(estimateVram(p, qwen36_27b, sys).estMb, Math.round(1000 + 800))
 })
 
+test('estimateVram: asymmetric K/V quant (K=q8_0, V=f16) is weighted independently, not as if both matched K', () => {
+  // Release 1 (2026-07-22): the KV term used to read only kvTypeK and assume V matched it.
+  // kvCacheElems returns the COMBINED K+V count; half is K-only, half is V-only.
+  const p = { ...deriveDefault(dense, sys), ctx: CTX, ngl: 99, kvTypeK: 'q8_0', kvTypeV: 'f16' }
+  const weightsMb = dense.sizeBytes / 1e6
+  const halfElems = legacyElems(dense, CTX) / 2 // legacyElems is already the ×2 combined count
+  const kvMb = (halfElems * 1 /* q8_0 */ + halfElems * 2 /* f16 */) / 1e6
+  assert.equal(estimateVram(p, dense, sys).estMb, Math.round(weightsMb + kvMb + 800))
+  // Sanity: strictly between the all-q8_0 and all-f16 readings, not equal to either.
+  const allQ8 = Math.round(weightsMb + (halfElems * 2 * 1) / 1e6 + 800)
+  const allF16 = Math.round(weightsMb + (halfElems * 2 * 2) / 1e6 + 800)
+  const mixed = estimateVram(p, dense, sys).estMb
+  assert.ok(mixed > allQ8 && mixed < allF16, `expected ${allQ8} < ${mixed} < ${allF16}`)
+})
+
 test('kvCacheElems: an interval that no layer can satisfy must NOT zero the KV cache', () => {
   // Regression: `hybrid` used to be gated on `interval > 1` alone. When the stride
   // exceeds the block count, NO layer satisfies (i+1) % interval === 0, so the loop

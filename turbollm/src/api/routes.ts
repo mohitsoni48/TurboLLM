@@ -83,6 +83,8 @@ export function registerApi(app: Hono, d: Deps): void {
       pid: ms.pid,
     }
     if (ms.err) engine.error = ms.err
+    const launchCommand = d.manager.launchCommand()
+    if (launchCommand) engine.launchCommand = launchCommand
     const model = ms.model
       ? { key: ms.model.key, name: ms.model.name, quant: ms.model.quant, ctx: ms.model.ctx, vision: ms.model.vision, loadElapsedMs: ms.loadElapsedMs }
       : null
@@ -1188,6 +1190,7 @@ export function registerApi(app: Hono, d: Deps): void {
           modelPath: entry.path,
           extraArgs,
           tensorParallelSize: savedProfile?.gpu?.tensorParallelSize,
+          preferredPort: savedProfile?.port,
         }
       } else {
         const saved = getModelProfile(cfg, entry.key, active.id) as Partial<LoadProfile> | undefined
@@ -1204,6 +1207,7 @@ export function registerApi(app: Hono, d: Deps): void {
           model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: profile.ctx, vision: entry.vision },
           modelPath: entry.path,
           extraArgs,
+          preferredPort: profile.port,
         }
       }
       // Single chokepoint (rule 3): load() stops the current model, runs the reverse
