@@ -37,6 +37,9 @@ export interface StartOpts {
   /** vLLM multi-GPU shard count (ADR-054). Only consumed by the vllm branch of
    *  {@link engineCommand}; llama.cpp carries its GPU flags in extraArgs instead. */
   tensorParallelSize?: number
+  /** Per-model pinned port (LoadProfile.port), engine-agnostic. Tried first by
+   *  allocPort(); falls back to the normal 8081+ walk if unset or already taken. */
+  preferredPort?: number
 }
 export interface Status {
   state: State
@@ -146,6 +149,7 @@ export class Manager {
   private child: ChildProcess | null = null
   private startedAt = 0
   private errInfo: ErrInfo | null = null
+  private lastCommand: { cmd: string; args: string[] } | null = null
   private lastActivity = 0
   private logPathStr = ''
   private exited: Promise<void> = Promise.resolve()
@@ -233,7 +237,7 @@ export class Manager {
       }
     }
 
-    const port = await allocPort()
+    const port = await allocPort(opts.preferredPort)
     const logPath = join(this.store.dir(), 'logs', `engine-${opts.engine.id}.log`)
     mkdirSync(dirname(logPath), { recursive: true })
     const logStream = createWriteStream(logPath) // truncates
@@ -262,6 +266,11 @@ export class Manager {
     }
 
     const { cmd, args } = engineCommand(opts, port, slotSavePath)
+    // The UNWRAPPED command (before the POSIX-llamafile shell-quoting workaround below) is
+    // what a human would actually type in their own terminal — stored for "copy exact launch
+    // command" (GitHub Discord ask). Not logged before now: the file only ever had a port-only
+    // header line, never the real argv.
+    this.lastCommand = { cmd, args }
     const spawned = needsShellWrapper(opts.engine.kind) ? shellWrapped(cmd, args) : { cmd, args }
     const child = spawn(spawned.cmd, spawned.args, { cwd: dirname(cmd), windowsHide: true, env: pyEngineEnv(opts.engine.kind, this.store.dir(), opts.engine.binPath) })
     // end:false — otherwise whichever of stdout/stderr closes first would end the
@@ -361,6 +370,28 @@ export class Manager {
     // load() stops the current engine (if any) and starts the same opts again, all
     // under the global load gate — so a restart can't race a concurrent swap.
     await this.load(opts)
+  }
+
+  /** The exact command last spawned, formatted for copy-paste into a terminal
+   *  (GitHub Discord ask — "copy exact launch command"). Only meaningful while this
+   *  engine is the one actually running; null once stopped/swapped so a stale
+   *  command from a PREVIOUS model can never be copied as if it were current.
+   *
+   *  Deliberately NOT byte-identical to what TurboLLM itself spawned: the point of
+   *  copying it is running the SAME model+config standalone, with llama.cpp/the fork
+   *  directly and TurboLLM out of the picture entirely — so `--no-webui` (added only
+   *  because TurboLLM serves its own frontend and doesn't want llama-server's built-in
+   *  one competing with it, `buildArgs` in this file) is stripped here: for a standalone
+   *  run it's the only UI available, so silently carrying it over would hand the user a
+   *  server with no way to talk to it. Everything else (model path, offload, KV type,
+   *  sampling, extra flags) is copied verbatim — it's what makes the command reproduce
+   *  the exact same config. */
+  launchCommand(): string | null {
+    if (this.state !== 'running' && this.state !== 'starting') return null
+    if (!this.lastCommand) return null
+    const args = this.lastCommand.args.filter((a) => a !== '--no-webui')
+    const quote = (s: string) => (/[\s"]/.test(s) ? `"${s.replace(/"/g, '\\"')}"` : s)
+    return [this.lastCommand.cmd, ...args].map(quote).join(' ')
   }
 
   status(): Status {
@@ -700,7 +731,19 @@ function buildArgs(opts: StartOpts, port: number, slotSavePath?: string): string
   return args
 }
 
-function allocPort(): Promise<number> {
+/** Checks a single port for availability without the 8081+ walk — used to try a
+ *  user-pinned {@link StartOpts.preferredPort} first, falling back to the normal
+ *  walk (never rejecting) if it's already taken. */
+function portFree(p: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const srv = createServer()
+    srv.once('error', () => resolve(false))
+    srv.listen(p, '127.0.0.1', () => srv.close(() => resolve(true)))
+  })
+}
+
+async function allocPort(preferredPort?: number): Promise<number> {
+  if (preferredPort && preferredPort > 0 && (await portFree(preferredPort))) return preferredPort
   return new Promise((resolve, reject) => {
     const tryPort = (p: number) => {
       if (p > 8181) return reject(new Error('no_free_port'))

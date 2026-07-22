@@ -19,16 +19,20 @@ function colorForRank(rank: number): string {
 }
 
 /** Per-model breakdown — stacked usage chart + a ranked legend with in/out split and
- *  share of total (Release 3, Models tab). */
+ *  share of total (Release 3, Models tab). This tab only ever lists CHAT models (API/gateway
+ *  usage has its own tab + models list) — the "% of total" baseline is this list's own sum,
+ *  not the page-level total, since that total is the combined chat+API figure (2026-07-22) and
+ *  would otherwise make percentages under-report by however much of overall usage was API. */
 export function ModelsTab({
-  models, dailyByModel, totalTokens,
-}: { models: ModelUsage[]; dailyByModel: DailyModelBreakdown[]; totalTokens: number }) {
+  models, dailyByModel,
+}: { models: ModelUsage[]; dailyByModel: DailyModelBreakdown[] }) {
   const [expanded, setExpanded] = useState(false)
 
   if (!models.length) {
     return <p className="py-8 text-center text-[13px] text-faint">No model usage in this range yet.</p>
   }
 
+  const totalTokens = models.reduce((sum, m) => sum + m.totalTokens, 0)
   const rankOf = new Map(models.map((m, i) => [m.modelKey, i]))
   const chartDays = dailyByModel.map((d) => ({
     date: d.date,

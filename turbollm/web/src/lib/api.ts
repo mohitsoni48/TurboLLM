@@ -586,6 +586,10 @@ export type DaemonSettings = {
   /** Tool-call approval gate (F-025): per-tool default policy. Missing tools default
    *  to 'ask'. Keyed by tool name (e.g. 'run_code', 'mcp__server__tool'). */
   toolPolicies: Record<string, ToolPolicy>
+  /** Master toggle (Settings → Tool permissions), default off: when true, every tool
+   *  call that would show an "awaiting approval" prompt runs immediately instead.
+   *  Only silences a resolved 'ask' — an explicit 'deny' is still honored. */
+  autoAllowAll: boolean
   /** Cloud Launch deploy-link settings (ADR-153). The RunPod Template ID the user
    *  published themselves — not a secret, just an id, echoed back as-is. */
   cloudDeploy: { runpodTemplateId: string }

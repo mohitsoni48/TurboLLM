@@ -6,6 +6,7 @@ import { useTokenUsage } from '../lib/queries'
 import type { TokenUsageRange } from '../lib/types'
 import { ActivityHeatmap } from './tokens/ActivityHeatmap'
 import { ModelsTab } from './tokens/ModelsTab'
+import { ApiUsageTab } from './tokens/ApiUsageTab'
 
 function formatTokenCount(n: number): string {
   if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(n >= 10_000_000_000 ? 0 : 1)}B`
@@ -137,7 +138,7 @@ function Segmented<T extends string>({
  *  sourced entirely from message-level stats already persisted per turn. */
 export function TokensScreen() {
   const [range, setRange] = useState<TokenUsageRange>('all')
-  const [tab, setTab] = useState<'overview' | 'models'>('overview')
+  const [tab, setTab] = useState<'overview' | 'models' | 'api'>('overview')
   const { data, isLoading, isError, refetch } = useTokenUsage(range)
 
   // Lifetime-driven, not range-scoped, and re-rolled only when the underlying lifetime
@@ -147,7 +148,9 @@ export function TokensScreen() {
     () => (lifetimeTotalTokens > 0 ? pickFunFact(lifetimeTotalTokens) : null),
     [lifetimeTotalTokens],
   )
-  const isEmpty = data?.firstMessageAt === null
+  // A user with zero in-app chats but real gateway (Claude Code / extension) traffic
+  // still has something to show — only the true both-empty case gets the empty state.
+  const isEmpty = data?.firstMessageAt === null && (data?.api.requests ?? 0) === 0
 
   return (
     <div className="w-full px-4 py-6 md:px-6">
@@ -176,7 +179,11 @@ export function TokensScreen() {
             <Segmented
               value={tab}
               onChange={setTab}
-              options={[{ value: 'overview', label: 'Overview' }, { value: 'models', label: 'Models' }]}
+              options={[
+                { value: 'overview', label: 'Overview' },
+                { value: 'models', label: 'Models' },
+                { value: 'api', label: 'API' },
+              ]}
             />
             <Segmented
               value={range}
@@ -213,8 +220,10 @@ export function TokensScreen() {
           )}
 
           {tab === 'models' && (
-            <ModelsTab models={data.byModel} dailyByModel={data.dailyByModel} totalTokens={data.totalTokens} />
+            <ModelsTab models={data.byModel} dailyByModel={data.dailyByModel} />
           )}
+
+          {tab === 'api' && <ApiUsageTab api={data.api} />}
         </div>
       )}
     </div>

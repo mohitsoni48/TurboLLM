@@ -83,12 +83,13 @@ const TURBOLLM_KNOWLEDGE =
   '**Usage** (BarChart3 icon in nav, between Customize and Developer): a token-usage dashboard sourced from message-level stats already persisted per turn — no separate opt-in.\n' +
   '- **Overview tab**: 8 stat tiles (sessions, messages, total tokens, active days, current/longest streak, peak hour, favorite model — all range-scoped except streaks/favorite/milestone, which are lifetime), a milestone bar (lifetime tokens vs. the next round-number milestone, plus a rotating "you\'ve generated more tokens than X" comparison), and an adaptive activity heatmap: 1-hour boxes for the 7-day range, 12-hour for 30-day, 1-day (classic GitHub-style) for all-time — always rendered at a constant overall size regardless of range.\n' +
   '- **Models tab**: a stacked daily bar chart plus a ranked legend (input/output split, % of total, "Show N more" past the top 6).\n' +
+  '- **API tab**: tokens hitting the OpenAI/Anthropic-compatible gateway (`/v1/*`) from EXTERNAL tools — Claude Code, other CLIs/extensions — tracked separately from in-app chat above (gateway requests create no conversation, so they never appeared in Overview/Models before this). Requests/tokens split by source (Claude Code / Anthropic-protocol vs. OpenAI-compatible) and by model.\n' +
   '- Range control (7d / 30d / all) at the top switches every stat and the heatmap together.\n\n' +
 
   '**Settings** — a two-pane layout, six categories in the left rail, one sticky Save bar:\n' +
   '- **General**: theme (light/dark/system), enable-thinking-by-default, confirm-before-delete, personalization (assistant name / your name), **Memory** — its toggle now lives in Experimental (see below); when on, the reviewable/deletable fact list still shows here, auto-generate chat titles, open browser on start.\n' +
   '- **Models & loading**: idle timeout (auto-stop after N minutes), default context length, Gateway (auto model-swap + Keep-N pool, 1–4 models), model folders, Hugging Face token, and an **Advanced** collapsible for expert knobs — default GPU layers, VRAM headroom (300 MB–2 GB, default 1 GB, or drag to 0 to opt into MoE auto-tune\'s "VRAM-spill" search — see Auto-Tune below), and image/response token caps.\n' +
-  '- **Tools & safety**: per-tool Ask/Allow/Deny defaults for every tool the model can call (web_search, fetch_url, run_code, MCP tools).\n' +
+  '- **Tools & safety**: per-tool Ask/Allow/Deny defaults for every tool the model can call (web_search, fetch_url, run_code, MCP tools), plus an **Auto-allow all** master toggle (default off) that skips the approval prompt for anything set to Ask — a tool explicitly set to Deny still stays blocked either way.\n' +
   '- **Network & sharing**: LAN exposure (bind to 0.0.0.0 vs loopback-only), port, require-API-key auth, and ComfyUI integration (URL, Reverse GPU gate, update banner).\n' +
   '- **Experimental**: still-in-progress features, off by default — a single on/off row each for **Memory** (silently extracts durable facts from chat using the loaded model; its own settings stay in General, unlocked once this is on), **Code** (the Workspace → Code tab; disabling this removes the tab entirely, not just its content), and **Cloud Launch/RunPod** (earliest-stage of the three — turning it on doesn\'t yet unlock a built UI).\n' +
   '- **System**: hardware panel, telemetry (Off / Anonymous / Full), About (current version, update-available chip, copy install command).\n\n' +
@@ -139,8 +140,8 @@ const TURBOLLM_KNOWLEDGE =
   '**MoE models only**:\n' +
   '- `nCpuMoe` (CPU MoE expert count): number of MoE router experts kept on CPU. Reducing it frees GPU VRAM (moves more routing to GPU). Auto-tune searches this for MoE models. An **Auto-fit MoE CPU offload** toggle (off by default) hands this to llama.cpp\'s own fit logic instead — a finer-grained per-tensor strategy than the fixed count — and Auto-tune skips its own search when it\'s on.\n\n' +
   '**KV Cache**:\n' +
-  '- `kvTypeK` / `kvTypeV`: KV cache quantization. `f16` = best quality, most VRAM. `q8_0` = good quality, ~2× smaller. `q4_0` / `q4_1` = smaller, lower quality. `turbo4` = TurboQuant-specific, high-speed specialized quant. Auto-tune picks automatically.\n' +
-  '- `flashAttn`: Flash Attention 2 — reduces KV memory footprint especially at large ctx. Strongly recommended when ctx > 32k.\n\n' +
+  '- `kvTypeK` / `kvTypeV`: KV cache quantization, set INDEPENDENTLY (two separate selects — e.g. keep K at f16 while quantizing V). `f16` = best quality, most VRAM. `q8_0` = good quality, ~2× smaller. `q4_0` / `q4_1` = smaller, lower quality. `turbo4` = TurboQuant-specific, high-speed specialized quant. Auto-tune does NOT pick the KV type — it tunes offload on whatever type you already have selected (a slow result gets a non-switching advisory naming a faster alternative instead).\n' +
+  '- `flashAttn`: Flash Attention 2 — reduces KV memory footprint especially at large ctx. Strongly recommended when ctx > 32k, and REQUIRED if V is quantized (llama.cpp refuses a quantized V cache with flash attention off).\n\n' +
   '**Parallelism & speculative**:\n' +
   '- `parallel`: concurrent request slots (default 1). Increase for gateway multi-client use.\n' +
   '- Speculative decoding (`speculative`: off / mtp / nextn / draft): `mtp` uses a separate Gemma-style MTP head (`mtpHeadPath`); `nextn` self-speculates off the model\'s own built-in NextN head (Qwen3-family, free — no extra file); `draft` uses a separate small draft GGUF (`draftModelPath`). All three modes honor configurable `draftMax`/`draftMin` (tokens drafted per step, default 16/1) — the draft-window fields apply to whichever speculative mode is active, not just `draft`. A well-matched draft/main pair can 2–4× throughput.\n\n' +
@@ -159,7 +160,10 @@ const TURBOLLM_KNOWLEDGE =
   '**Advanced**:\n' +
   '- `grammar` (GBNF): constrain generation to a format (JSON schema, structured output).\n' +
   '- `ropeScalingType` / `ropeFreqBase` / `ropeFreqScale`: RoPE context extension for models that support it (e.g. YaRN).\n' +
-  '- Multi-GPU (shown only when >1 GPU detected): `splitMode` (row / layer), `tensorSplit` (fraction array), `mainGpu` (output GPU index).\n\n' +
+  '- Multi-GPU (shown only when >1 GPU detected): `splitMode` (row / layer), `tensorSplit` (fraction array), `mainGpu` (output GPU index).\n' +
+  '- `port`: pin this model\'s engine to a specific port instead of auto-assigning the first free one (8081+). Falls back to auto if the pinned port is already taken. Distinct from the main daemon port (6996).\n' +
+  '- `extraArgs`: free-text custom/raw command-line flags, appended to the launch command last so they can override anything above. For llama.cpp/vLLM engines.\n' +
+  '- **Copy launch command**: once a model is loaded, its exact spawned command is copyable from the model config panel — runs the same model+config standalone with llama.cpp/the fork directly, no TurboLLM needed (`--no-webui` is stripped from the copy since TurboLLM\'s own reason for it — running its own frontend instead — doesn\'t apply standalone).\n\n' +
   '**MLX note**: context and KV parameters are hidden for MLX models — MLX sizes the KV cache dynamically. Only temperature, top-p, top-k, and min-p are available (the only flags mlx-lm.server supports).\n\n' +
 
   '## Engines\n\n' +

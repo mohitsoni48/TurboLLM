@@ -24,6 +24,9 @@ export type EngineRuntime = {
   error?: EngineError
   port?: number
   pid?: number
+  /** The exact command last spawned, formatted for copy-paste into a terminal.
+   *  Present only while this engine is the one actually running/starting. */
+  launchCommand?: string
 }
 
 /** Loaded model from GET /api/v1/status (null when none). */
@@ -555,6 +558,31 @@ export type TokenUsageStats = {
   activity: TokenActivity
   dailyByModel: DailyModelBreakdown[]
   byModel: ModelUsage[]
+  api: ApiUsageStats
+}
+
+/** Gateway (external-client) token usage — Claude Code, other CLIs/extensions hitting
+ *  /v1/messages or /v1/chat/completions (GitHub #71). This isolated breakdown (by source, by
+ *  model) is separate, but TokenUsageStats.totalTokens/lifetimeTotalTokens/milestone already
+ *  INCLUDE it — see db.ts's ApiUsageStats doc comment for why. */
+export type ApiUsageSource = 'anthropic' | 'openai'
+
+export type ApiModelUsage = {
+  modelKey: string
+  displayName: string
+  requests: number
+  promptTokens: number
+  genTokens: number
+  totalTokens: number
+}
+
+export type ApiUsageStats = {
+  range: TokenUsageRange
+  requests: number
+  totalTokens: number
+  lifetimeTotalTokens: number
+  bySource: { source: ApiUsageSource; requests: number; totalTokens: number }[]
+  byModel: ApiModelUsage[]
 }
 
 // ── Load profiles + VRAM fit (A4, spec 05) ───────────────────────────────────
@@ -578,6 +606,8 @@ export type LoadProfile = {
   /** Auto-fit for MoE CPU offload: when true, omit --n-cpu-moe and let -fit decide. */
   nCpuMoeFit?: boolean
   parallel: number
+  /** Pin this model's engine instance to a specific loopback port. 0/undefined = auto. */
+  port?: number
   kvUnified: boolean
   kvTypeK: string
   kvTypeV: string

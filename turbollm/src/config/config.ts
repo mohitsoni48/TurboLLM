@@ -170,6 +170,11 @@ export interface ToolsConfig {
    *  to 'ask' unless explicitly set here to 'allow' or 'deny'. A per-conversation
    *  override (Conversation.toolOverrides) takes precedence over this map. */
   toolPolicies?: Record<string, 'ask' | 'allow' | 'deny'>
+  /** Master toggle (Settings → Tool permissions), default OFF: when true, every tool
+   *  call that would otherwise show an "awaiting approval" prompt runs immediately
+   *  instead. Only silences a resolved 'ask' — an explicit 'deny' (global or
+   *  per-conversation) is still honored; see resolveToolPolicy. */
+  autoAllowAll?: boolean
 }
 
 /** One MCP server the daemon manages as a tool provider (v0.7.0). */
@@ -725,6 +730,7 @@ function normalize(c: Config): void {
     toolPolicies.run_code = 'allow'
   }
   c.tools.toolPolicies = toolPolicies
+  c.tools.autoAllowAll = tl.autoAllowAll === true
   // MCP host (v0.7.0): absent in pre-v0.7.0 configs → empty server list.
   const mc = (c.mcp ?? {}) as Partial<McpConfig>
   c.mcp = {

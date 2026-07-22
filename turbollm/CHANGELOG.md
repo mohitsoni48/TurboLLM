@@ -25,6 +25,47 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.8.3] - 2026-07-22
+
+**API token tracking, tool/model config batch, and two real bug fixes (mmproj pairing, an
+`/api/*` CORS hole).**
+
+### Added
+- **Usage tracking now covers the gateway, not just in-app chat** — tokens hitting the
+  OpenAI/Anthropic-compatible gateway from external tools (Claude Code, other CLIs/extensions)
+  now count toward the Overview totals and lifetime milestone, with a dedicated API tab for the
+  breakdown by source and model. (#71)
+- **Auto-allow-all tools toggle** (Settings → Tools & safety) — skip the approval prompt for every
+  tool set to Ask; a tool explicitly set to Deny still stays blocked.
+- **Custom/raw engine flags** — a field in the model config panel to append arbitrary
+  command-line flags to the launch command.
+- **Per-model engine port** — pin a model's engine to a specific port instead of always
+  auto-assigning the first free one.
+- **Independent K/V cache quant** — the KV cache type is now two selects (K and V) instead of one
+  combined dropdown, so you can e.g. keep K at full quality while quantizing V.
+- **Copy launch command** — copies the exact command to run the loaded model standalone with
+  llama.cpp/the fork directly, no TurboLLM required.
+
+### Fixed
+- **Security: `/api/*` had wildcard CORS**, letting any website silently read a loopback user's
+  GPU/CPU/RAM via unauthenticated `/api/v1/sysinfo` while the daemon ran. Tightened to an origin
+  allowlist; the OpenAI/Anthropic gateway (`/v1/*`) stays fully open, as it needs to be.
+- **A folder with more than one vision model could load the wrong image projector** onto a model,
+  which then failed to start. Projector pairing now matches by filename correlation, falling back
+  to closest-modified-time, instead of always picking the directory's largest file.
+- **VRAM estimate assumed the V cache quant always matched K** — now weighted independently, so an
+  asymmetric K/V setting (e.g. K=q8_0, V=f16) reads correctly instead of over- or under-estimating.
+- Two token-tracking gaps found while building the API tab above: a non-streaming OpenAI-compatible
+  request could silently record zero usage, and a streaming one omitted usage entirely without an
+  explicit opt-in flag.
+
+### Discord
+- New Usage → API tab shows how many tokens Claude Code and other external tools are pulling through TurboLLM — not just in-app chat.
+- Auto-allow-all toggle to skip tool approval prompts when you want; Deny always still blocks.
+- Model config: pin a model to a specific port, add custom launch flags, set K and V cache quant separately, and copy a ready-to-run llama.cpp command.
+- Fixed a bug where a folder with more than one vision model could load the wrong image projector.
+- Closed a security hole where any website could quietly read your GPU info while TurboLLM was running.
+
 ## [1.8.2] - 2026-07-21
 
 **Research mode that works to stay current, correct VRAM estimates for modern models, and a batch
