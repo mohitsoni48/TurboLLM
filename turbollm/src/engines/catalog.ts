@@ -417,6 +417,85 @@ const ALL: CatalogEngine[] = [
       },
     ],
   },
+  {
+    id: 'prism',
+    name: 'Prism (llama.cpp fork)',
+    kind: 'llama-server',
+    description:
+      'A llama.cpp fork tuned for 1-2 bit ternary/Bonsai models. Ships llama-server but has no install endpoint here yet — build it, then add your own engine.',
+    provision: 'github-release',
+    homepage: 'https://github.com/PrismML-Eng/llama.cpp',
+    repo: 'PrismML-Eng/llama.cpp',
+    // The fork itself publishes extensive per-commit prebuilt archives (CUDA/Vulkan/ROCm ×
+    // win/linux/macOS, same naming convention as official llama.cpp) — but TurboLLM doesn't
+    // resolve them automatically (deliberately deferred, see ADR-238). Build-from-source only.
+    platforms: ['win32', 'darwin', 'linux'],
+    support: 'experimental',
+    installEndpoint: '',
+    note: 'Upstream publishes prebuilt binaries, but TurboLLM builds from source here (guided walkthrough) rather than resolving a specific release asset. Proven on a ternary/Bonsai-class model at 200K context (Q2_0 + q8 KV).',
+    variants: [
+      {
+        id: 'prism-source',
+        label: 'Build from source',
+        repo: 'PrismML-Eng/llama.cpp',
+        requires: {},
+        stability: 'experimental',
+        speed: 'fast',
+        hasPrebuilt: false,
+      },
+    ],
+  },
+  {
+    id: 'beellama',
+    name: 'BeeLlama.cpp',
+    kind: 'llama-server',
+    description:
+      'A llama.cpp fork adding variance-normalized KV-cache quantization (KVarN), a KV precision tail, and adaptive DFlash speculative decoding. Ships llama-server but has no install endpoint here yet — build it, then add your own engine.',
+    provision: 'github-release',
+    homepage: 'https://github.com/Anbeeld/beellama.cpp',
+    repo: 'Anbeeld/beellama.cpp',
+    // Also publishes a full prebuilt matrix (CUDA/ROCm/Vulkan/SYCL/CPU) in one normal
+    // release — but solo-maintainer, fast-churn fork (v0.4.0 dropped its own TurboQuant/TCQ
+    // support), so one-click install is deliberately deferred; build-from-source only.
+    platforms: ['win32', 'darwin', 'linux'],
+    support: 'experimental',
+    installEndpoint: '',
+    note: "Upstream publishes prebuilt binaries, but TurboLLM builds from source here. The KVarN cache types (kvarn2...kvarn8, set via --cache-type-k/-v) aren't in the auto-tune sweep yet — use the custom/raw flags field to set them manually.",
+    variants: [
+      {
+        id: 'beellama-source',
+        label: 'Build from source',
+        repo: 'Anbeeld/beellama.cpp',
+        requires: {},
+        stability: 'experimental',
+        speed: 'fast',
+        hasPrebuilt: false,
+      },
+    ],
+  },
+  {
+    id: 'croco',
+    name: 'Croco.Cpp',
+    kind: 'koboldcpp',
+    description:
+      "A KoboldCpp mod carrying ik_llama.cpp's SOTA IQ quants and extra KV-cache modes, mainly for NVIDIA/CUDA users.",
+    provision: 'github-release',
+    homepage: 'https://github.com/Nexesenex/croco.cpp',
+    repo: 'Nexesenex/croco.cpp',
+    // No macOS release asset published (Windows/Linux only).
+    platforms: ['win32', 'linux'],
+    support: 'experimental',
+    installEndpoint: '',
+    // Genuinely not installable here yet, on EITHER path: it's Python + PyInstaller-packaged
+    // like upstream KoboldCpp (confirmed via repo listing — koboldcpp.py + make_pyinstaller*
+    // scripts), not a plain CMake project, so the guided build-from-source flow
+    // (notCmakeProjectError, build-runner.ts) can't produce a working binary from it either.
+    // One-click install needs new provisioning code (a croco.ts mirroring koboldcpp.ts) plus
+    // empirical verification that its CLI flags match koboldcppProfileToArgs's — not yet done
+    // (ADR-238 deliberately deferred this rather than shipping a broken or unverified path).
+    comingSoon: true,
+    note: "Not yet one-click installable in TurboLLM — it needs new provisioning code (like KoboldCpp's), which hasn't been built. Not buildable from source here either (Python/PyInstaller-packaged, not a plain CMake project).",
+  },
 ]
 
 /** The catalog as seen on this platform: engines runnable here, plus a per-entry
