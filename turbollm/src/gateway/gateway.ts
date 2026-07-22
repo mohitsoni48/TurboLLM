@@ -118,6 +118,9 @@ export function registerGateway(app: Hono, d: Deps): void {
         (u) => {
           try {
             d.manager.recordCompletion({ inputTokens: u.inputTokens, outputTokens: u.outputTokens })
+            // Durable counterpart to the ephemeral session counter above (GitHub #71) — the
+            // session counter resets on engine restart and was never persisted/surfaced.
+            d.db.recordApiUsage({ source: 'anthropic', modelKey: req.model ?? null, promptTokens: u.inputTokens, genTokens: u.outputTokens })
           } catch { /* swallow — stats are best-effort */ }
         },
         // Live per-request progress for the engine card (prefill % + token count),
@@ -144,7 +147,7 @@ export function registerGateway(app: Hono, d: Deps): void {
 
     try {
       const oaiRes = (await res.json()) as Record<string, unknown>
-      recordOpenAiUsage(d, oaiRes) // session stats (B4), fail-safe
+      recordOpenAiUsage(d, oaiRes, 'anthropic', req.model ?? null) // session stats (B4) + durable #71 record, fail-safe
       return c.json(mapFromOpenAI(oaiRes, modelName))
     } finally {
       d.manager.generationEnd()
@@ -252,6 +255,15 @@ export function registerGateway(app: Hono, d: Deps): void {
           const alias = engineModelAlias(d.registry.active()?.kind ?? '')
           if (alias) parsedBody.model = alias
         }
+        // A streaming OpenAI response omits the final `usage` chunk unless the caller
+        // opts in via `stream_options.include_usage` (standard OpenAI API behavior,
+        // which llama.cpp's server mirrors) — without this, recordOpenAiStreamUsage
+        // below silently sees no usage and GitHub #71 undercounts every streaming
+        // OpenAI-protocol client that doesn't already request it. Only fills the gap
+        // when the caller left it unset; never overrides an explicit choice.
+        if (parsedBody?.stream === true && parsedBody.stream_options === undefined) {
+          parsedBody.stream_options = { include_usage: true }
+        }
         headers.delete('content-length') // re-serialised body has a new length
         init.body = parsedBody ? JSON.stringify(parsedBody) : ''
       } else {
@@ -272,7 +284,15 @@ export function registerGateway(app: Hono, d: Deps): void {
         // copy drains, paired so the counter can't leak. (OpenAI clients don't get the
         // prefill % — injecting return_progress would pollute their stream.)
         d.manager.generationStart()
-        void recordOpenAiStreamUsage(d, b).finally(() => d.manager.generationEnd())
+        // The requester's own `stream` flag decides the drain shape: a non-streaming
+        // OpenAI client (common for scripted/extension callers, `stream` false/absent)
+        // gets ONE plain JSON body from the engine, not SSE `data:` lines — the SSE
+        // parser would silently see no matches and record nothing (GitHub #71: this
+        // gap would have made external-client tracking wrong for a common case).
+        const drain = parsedBody?.stream === true
+          ? recordOpenAiStreamUsage(d, b, 'openai', requestedModel || null)
+          : recordOpenAiJsonUsage(d, b, 'openai', requestedModel || null)
+        void drain.finally(() => d.manager.generationEnd())
         return new Response(a, { status: res.status, headers: res.headers })
       } catch {
         return new Response(res.body, { status: res.status, headers: res.headers })
@@ -285,8 +305,10 @@ export function registerGateway(app: Hono, d: Deps): void {
 
 // ── session-stats recording helpers (B4) ────────────────────────────────────
 
-/** Record usage from a non-streaming OpenAI completion. Fail-safe. */
-function recordOpenAiUsage(d: Deps, oai: Record<string, unknown>): void {
+/** Record usage from a non-streaming OpenAI completion. Fail-safe. Also persists a durable
+ *  `api_usage` row (GitHub #71) — `source`/`modelKey` distinguish gateway (external-client)
+ *  traffic from in-app chat, which records into `messages` instead. */
+function recordOpenAiUsage(d: Deps, oai: Record<string, unknown>, source: 'anthropic' | 'openai', modelKey: string | null): void {
   try {
     const usage = oai.usage as { prompt_tokens?: number; completion_tokens?: number } | undefined
     const timings = oai.timings as { prompt_per_second?: number; predicted_per_second?: number } | undefined
@@ -296,12 +318,26 @@ function recordOpenAiUsage(d: Deps, oai: Record<string, unknown>): void {
       promptTps: timings?.prompt_per_second,
       genTps: timings?.predicted_per_second,
     })
+    d.db.recordApiUsage({ source, modelKey, promptTokens: usage?.prompt_tokens ?? 0, genTokens: usage?.completion_tokens ?? 0 })
   } catch { /* swallow — stats are best-effort */ }
 }
 
-/** Drain a teed copy of a streaming OpenAI SSE body to record final usage (B4).
- *  Never touches the client-facing stream; all errors are swallowed. */
-async function recordOpenAiStreamUsage(d: Deps, body: ReadableStream<Uint8Array>): Promise<void> {
+/** Drain a teed copy of a NON-streaming OpenAI JSON body (a single response, not SSE) to
+ *  record usage — the `/v1/*` pass-through's counterpart to `recordOpenAiStreamUsage` for
+ *  requests where the caller didn't set `stream: true`. Never touches the client-facing
+ *  stream; all errors are swallowed. */
+async function recordOpenAiJsonUsage(d: Deps, body: ReadableStream<Uint8Array>, source: 'anthropic' | 'openai', modelKey: string | null): Promise<void> {
+  try {
+    const text = await new Response(body).text()
+    const oai = JSON.parse(text) as Record<string, unknown>
+    recordOpenAiUsage(d, oai, source, modelKey)
+  } catch { /* swallow — stats are best-effort */ }
+}
+
+/** Drain a teed copy of a streaming OpenAI SSE body to record final usage (B4) plus a
+ *  durable `api_usage` row (GitHub #71). Never touches the client-facing stream; all
+ *  errors are swallowed. */
+async function recordOpenAiStreamUsage(d: Deps, body: ReadableStream<Uint8Array>, source: 'anthropic' | 'openai', modelKey: string | null): Promise<void> {
   try {
     const reader = body.getReader()
     const dec = new TextDecoder()
@@ -341,5 +377,6 @@ async function recordOpenAiStreamUsage(d: Deps, body: ReadableStream<Uint8Array>
       }
     }
     d.manager.recordCompletion({ inputTokens: promptTokens, outputTokens: completionTokens, promptTps, genTps })
+    d.db.recordApiUsage({ source, modelKey, promptTokens, genTokens: completionTokens })
   } catch { /* swallow — stats are best-effort */ }
 }

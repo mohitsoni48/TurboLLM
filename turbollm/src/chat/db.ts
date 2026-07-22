@@ -250,6 +250,35 @@ export interface TokenUsageStats {
   activity: TokenActivity
   dailyByModel: DailyModelBreakdown[]
   byModel: ModelUsage[]
+  /** Tokens from gateway (external client) traffic — Claude Code, other CLIs/extensions —
+   *  kept as a separate bucket rather than merged into the fields above (GitHub #71): those
+   *  fields' "sessions"/streak/milestone semantics are chat-conversation concepts that gateway
+   *  requests don't participate in (no conv_id, no role). */
+  api: ApiUsageStats
+}
+
+/** One request source recorded against `api_usage` — the two gateway entry points
+ *  (gateway.ts): the Anthropic-protocol translation and the OpenAI-compatible pass-through. */
+export type ApiUsageSource = 'anthropic' | 'openai'
+
+export interface ApiModelUsage {
+  modelKey: string
+  displayName: string
+  requests: number
+  promptTokens: number
+  genTokens: number
+  totalTokens: number
+}
+
+/** Token usage from external (gateway) clients — Claude Code, other CLIs/extensions hitting
+ *  /v1/messages or /v1/chat/completions — as opposed to in-app chat (`TokenUsageStats`). */
+export interface ApiUsageStats {
+  range: TokenUsageRange
+  requests: number
+  totalTokens: number
+  lifetimeTotalTokens: number
+  bySource: { source: ApiUsageSource; requests: number; totalTokens: number }[]
+  byModel: ApiModelUsage[]
 }
 
 export type CodeStatsRange = 'all' | '30d' | '7d'
@@ -874,6 +903,26 @@ export class ConversationStore {
       if (!this.hasColumn('agent_runs', 'reverted_from_message_id')) this.db.exec(`ALTER TABLE agent_runs ADD COLUMN reverted_from_message_id TEXT;`)
       this.db.exec(`PRAGMA user_version = 33;`)
     }
+    // v34 (GitHub #71): tokens hitting the gateway (/v1/messages, /v1/chat/completions) from
+    // external clients — Claude Code, other CLIs/extensions — never landed in `messages` (that
+    // table is chat-conversation rows only; gateway requests create no conversation). Usage was
+    // silently invisible to the Tokens dashboard. One row per completed gateway request, kept
+    // deliberately separate from `messages` (no conv_id/role — it isn't a chat turn) rather than
+    // merged into the existing streak/session semantics there, which are chat-specific concepts.
+    if (v < 34) {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS api_usage (
+          id             TEXT PRIMARY KEY,
+          created_at     TEXT NOT NULL,
+          source         TEXT NOT NULL,
+          model_key      TEXT,
+          prompt_tokens  INTEGER NOT NULL DEFAULT 0,
+          gen_tokens     INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_api_usage_created ON api_usage(created_at);
+        PRAGMA user_version = 34;
+      `)
+    }
   }
 
   listConversations(q?: string, kind: 'chat' | 'agent' | 'all' = 'all'): Conversation[] {
@@ -1038,6 +1087,9 @@ export class ConversationStore {
         currentStreak: 0, longestStreak: 0, peakHour: null, favoriteModel: null,
         firstMessageAt: null, lifetimeTotalTokens: 0, milestone: { achieved: null, next: null, progressPct: null },
         activity: { granularityHours: 24, buckets: [] }, dailyByModel: [], byModel: [],
+        // Computed independently — a user with zero in-app chats but real gateway (Claude
+        // Code / extension) traffic still has something to show here.
+        api: this.apiUsageStats(range),
       }
     }
 
@@ -1196,6 +1248,75 @@ export class ConversationStore {
       favoriteModel: byModel[0]?.displayName ?? null,
       firstMessageAt, lifetimeTotalTokens, milestone: { achieved, next, progressPct },
       activity, dailyByModel, byModel,
+      api: this.apiUsageStats(range),
+    }
+  }
+
+  /** Insert one completed gateway request (GitHub #71) — called from the two gateway entry
+   *  points (gateway.ts) right where in-app chat already records into `messages`. Fully
+   *  additive/fail-safe: callers wrap this the same way `recordCompletion` is wrapped. */
+  recordApiUsage(rec: { source: ApiUsageSource; modelKey: string | null; promptTokens: number; genTokens: number }): void {
+    this.db.prepare(`
+      INSERT INTO api_usage (id, created_at, source, model_key, prompt_tokens, gen_tokens)
+      VALUES ($id, $createdAt, $source, $modelKey, $promptTokens, $genTokens)
+    `).run({
+      $id: randomUUID(),
+      $createdAt: new Date().toISOString(),
+      $source: rec.source,
+      $modelKey: rec.modelKey,
+      $promptTokens: Math.max(0, Math.floor(rec.promptTokens) || 0),
+      $genTokens: Math.max(0, Math.floor(rec.genTokens) || 0),
+    } as P)
+  }
+
+  /** Gateway (external-client) token usage — see `ApiUsageStats`'s doc comment for why this
+   *  is a separate bucket from `tokenUsageStats`. Same local-day range scoping as the chat
+   *  stats above, but no streak/session concepts (a gateway request isn't a chat turn). */
+  apiUsageStats(range: TokenUsageRange = 'all'): ApiUsageStats {
+    const rows = this.db.prepare(`
+      SELECT created_at, source, model_key, prompt_tokens, gen_tokens FROM api_usage
+      ORDER BY created_at ASC
+    `).all() as unknown as { created_at: string; source: ApiUsageSource; model_key: string | null; prompt_tokens: number; gen_tokens: number }[]
+
+    let lifetimeTotalTokens = 0
+    for (const r of rows) lifetimeTotalTokens += r.prompt_tokens + r.gen_tokens
+
+    if (rows.length === 0) {
+      return { range, requests: 0, totalTokens: 0, lifetimeTotalTokens: 0, bySource: [], byModel: [] }
+    }
+
+    const todayKey = dayKey(new Date().toISOString())
+    const heatStart = range === 'all' ? null : addDays(todayKey, -(RANGE_WINDOW_DAYS[range] - 1))
+    const scoped = heatStart === null ? rows : rows.filter((r) => dayKey(r.created_at) >= heatStart)
+
+    const sourceTally = new Map<ApiUsageSource, { requests: number; totalTokens: number }>()
+    const modelTally = new Map<string, { requests: number; promptTokens: number; genTokens: number }>()
+    let totalTokens = 0
+    for (const r of scoped) {
+      const tokens = r.prompt_tokens + r.gen_tokens
+      totalTokens += tokens
+      const st = sourceTally.get(r.source) ?? { requests: 0, totalTokens: 0 }
+      st.requests++; st.totalTokens += tokens
+      sourceTally.set(r.source, st)
+      if (r.model_key) {
+        const mt = modelTally.get(r.model_key) ?? { requests: 0, promptTokens: 0, genTokens: 0 }
+        mt.requests++; mt.promptTokens += r.prompt_tokens; mt.genTokens += r.gen_tokens
+        modelTally.set(r.model_key, mt)
+      }
+    }
+
+    const byModel: ApiModelUsage[] = [...modelTally.entries()]
+      .map(([modelKey, m]) => ({
+        modelKey, displayName: titleCaseModelName(modelKey),
+        requests: m.requests, promptTokens: m.promptTokens, genTokens: m.genTokens,
+        totalTokens: m.promptTokens + m.genTokens,
+      }))
+      .sort((a, b) => b.totalTokens - a.totalTokens)
+
+    return {
+      range, requests: scoped.length, totalTokens, lifetimeTotalTokens,
+      bySource: [...sourceTally.entries()].map(([source, s]) => ({ source, ...s })),
+      byModel,
     }
   }
 
