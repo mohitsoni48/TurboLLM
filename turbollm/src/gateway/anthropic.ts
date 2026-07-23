@@ -9,7 +9,10 @@ type ABlock =
   | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } }
   | { type: 'tool_use'; id: string; name: string; input: unknown }
   | { type: 'tool_result'; tool_use_id: string; content: string | Array<{ type: string; text?: string }> }
-type AMessage = { role: 'user' | 'assistant'; content: string | ABlock[] }
+// 'system' is undocumented but real: Claude Code injects hook context (e.g. SessionStart)
+// as a `role:'system'` entry directly into `messages`, not just via the top-level `system`
+// field — see mapToOpenAI's per-message role handling below.
+type AMessage = { role: 'user' | 'assistant' | 'system'; content: string | ABlock[] }
 
 export interface AnthropicRequest {
   model?: string
@@ -23,7 +26,11 @@ export interface AnthropicRequest {
   stream?: boolean
   tools?: Array<{ name: string; description?: string; input_schema: Record<string, unknown> }>
   tool_choice?: { type: 'auto' | 'any' | 'tool'; name?: string }
-  thinking?: { type: 'enabled'; budget_tokens?: number }
+  // 'enabled' with an explicit budget_tokens is the documented shape; 'adaptive' (no
+  // budget_tokens, plus a display field) is a real shape confirmed live from Claude
+  // Code (2026-07-23) — the type value isn't branched on below, only budget_tokens'
+  // presence/validity, so any thinking-enabled type string is accepted.
+  thinking?: { type: string; budget_tokens?: number; display?: string }
   metadata?: unknown
 }
 
@@ -81,6 +88,20 @@ export function mapToOpenAI(req: AnthropicRequest): Record<string, unknown> {
             : parts
         messages.push({ role: 'user', content })
       }
+    } else if ((msg.role as string) === 'system') {
+      // Claude Code sometimes injects a `role: 'system'` entry directly into `messages`
+      // (e.g. a SessionStart-hook context block), separate from the top-level `system`
+      // field. Falling through to the assistant branch below relabeled this as something
+      // the ASSISTANT had already said — which made the model see a conversation that
+      // looked already finished, so it emitted an immediate end-of-turn with zero output
+      // (a real "no response" bug, confirmed via a live capture of an actual Claude Code
+      // request: a `role:'system'` message as messages[1], mis-mapped to `role:'assistant'`,
+      // reproduced a stream with output_tokens:1 and no content blocks at all).
+      const text = raw
+        .filter((b) => b.type === 'text')
+        .map((b) => (b as { text?: string }).text ?? '')
+        .join('\n')
+      if (text) messages.push({ role: 'system', content: text })
     } else {
       let text = ''
       const toolCalls: unknown[] = []
@@ -134,6 +155,42 @@ export function mapToOpenAI(req: AnthropicRequest): Record<string, unknown> {
           : tc.type === 'any'
             ? 'required'
             : { type: 'function', function: { name: tc.name } }
+  }
+  // Forward the caller's extended-thinking budget to the field the engine's sampler
+  // actually reads (thinking_budget_tokens — mirrors chat-routes.ts's runGeneration).
+  // Without this, a client with thinking enabled got no budget at all — the local
+  // model reasoned unconstrained and could exhaust the entire max_tokens on thinking,
+  // leaving zero tokens for the actual answer (a real "no response" bug, not a timeout
+  // or crash — the request succeeds, it just never reaches visible text).
+  //
+  // Two real shapes seen in the wild, both must be handled:
+  //  - {type:'enabled', budget_tokens:N} — an explicit budget; honor it exactly.
+  //  - {type:'adaptive', ...} (Claude Code's actual request, confirmed live 2026-07-23:
+  //    max_tokens 32000, thinking:{type:'adaptive',display:'omitted'}, no budget_tokens
+  //    at all) — the client deliberately left the budget to the server/model. Real
+  //    Anthropic models cap their own adaptive reasoning sensibly; a local model has no
+  //    such built-in restraint, so leaving thinking_budget_tokens unset here reproduced
+  //    the exact bug (thinking consumed the entire 32000-token budget, twice in a row,
+  //    with zero tokens ever reaching visible text). Any thinking type with no usable
+  //    budget_tokens gets a conservative default: half of max_tokens, guaranteeing the
+  //    other half survives for the actual answer regardless of how verbose the model's
+  //    reasoning is.
+  if (req.thinking) {
+    const requested = req.thinking.budget_tokens
+    const hasMaxTokens = Number.isFinite(req.max_tokens) && (req.max_tokens ?? 0) > 0
+    if (Number.isFinite(requested) && (requested ?? 0) > 0) {
+      // `req.max_tokens` here already reflects the server-side maxTokens cap applied in
+      // gateway.ts (clampMaxTokens runs before mapToOpenAI) — but the caller's requested
+      // budget does not know about that cap. An explicit budget >= the (possibly-clamped)
+      // max_tokens can reintroduce this exact bug via the explicit-budget path: thinking
+      // consumes the whole capped response, leaving nothing for the actual answer. Bound
+      // it to the same half-of-max_tokens invariant the no-budget default already relies on.
+      oai.thinking_budget_tokens = hasMaxTokens
+        ? Math.min(requested!, Math.floor(req.max_tokens! / 2))
+        : requested
+    } else if (hasMaxTokens) {
+      oai.thinking_budget_tokens = Math.floor(req.max_tokens! / 2)
+    }
   }
   return oai
 }
