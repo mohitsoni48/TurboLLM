@@ -49,6 +49,7 @@ const TURBOLLM_KNOWLEDGE =
   '- **Discover** tab: a live, sortable split-pane (list on the left, detail pane on the right, no dialog) browsing Hugging Face directly — filtered by active engine kind (GGUF for llama.cpp/TurboQuant, MLX tag for MLX, unrestricted for vLLM), sortable by trending / downloads / likes / recently updated / newest; the detail pane renders the actual model card (headings, images, links) and shows a per-quant VRAM-fit dot. Both panes are resizable.\n' +
   '- **Downloading a GGUF** places it in its own `<owner>/<repo>` folder (mirroring Hugging Face\'s layout) and automatically pulls its vision projector (mmproj) and every shard of a split/multipart quant into that same folder, so it always loads as one working model — no manual mmproj hunting or missing shards.\n' +
   '- **Import from URL** (link icon next to Discover\'s search box) accepts a direct `.gguf`/resolve link (any HTTPS host) for a one-off download, or a Hugging Face **model page** link, which opens that repo\'s quant picker instead of downloading directly (a repo has many quants — picking one there gets the same folder/mmproj/shard handling as browsing Discover).\n' +
+  '- **An interrupted download (e.g. a daemon restart) can be resumed** — it comes back showing "Paused" with a Resume button that continues from the exact byte it left off at, not a full restart. Cancel deletes the partial file instead.\n' +
   '- Click a model → **Model Detail** side panel: load profile config, VRAM estimate bar, auto-tune button, per-(model, engine) saved profile — switching the active engine saves/loads that engine\'s own tuning for the model, instead of sharing one profile across every installed engine. An untuned engine falls back to whichever engine\'s profile you saved most recently.\n' +
   '- **Load** button starts the model; progress indicator shows load time.\n' +
   '- **Multi-quant models** fold into one row with a quant dropdown (Size/Ctx/Speed/Load follow the selected quant), instead of one row per quant.\n' +
@@ -184,6 +185,10 @@ const TURBOLLM_KNOWLEDGE =
   'GGUF model bundled into a single self-contained executable. Very easy distribution. Launch flag is `--no-webui` (not `--nobrowser`). Full gateway passthrough verified.\n\n' +
   '**ik_llama.cpp** (Linux / macOS — GGUF):\n' +
   'Drop-in fork with additional quantization optimizations. No universal prebuilt — build from source, then register via "Add your own engine."\n\n' +
+  '**Prism** (Windows / Linux / macOS — GGUF):\n' +
+  'llama.cpp fork tuned for 1-2 bit ternary/Bonsai models. Build-from-source only (guided walkthrough) — no one-click install, even though upstream publishes prebuilts.\n\n' +
+  '**BeeLlama.cpp** (Windows / Linux / macOS — GGUF):\n' +
+  'llama.cpp fork adding variance-normalized KV-cache quantization (KVarN: `kvarn2`…`kvarn8`, set via `--cache-type-k`/`-v`), a KV precision tail, and adaptive DFlash speculative decoding. Build-from-source only. The KVarN types aren\'t in the auto-tune sweep yet — set them via the custom/raw flags field.\n\n' +
 
   '## Gateway\n\n' +
   'TurboLLM at `http://localhost:6996` exposes:\n' +
