@@ -25,6 +25,32 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.8.5] - 2026-07-23
+
+**Three gateway bugs fixed, all affecting the Claude Code / Anthropic-protocol integration
+(`turbollm launch claude`).**
+
+### Fixed
+- **The OpenAI-compatible `/v1/*` pass-through could return a bodyless 500.** A client
+  disconnecting at just the wrong moment (before its engine request was sent) left `fetch()` an
+  already-aborted signal, which throws immediately with no guard around it. Now caught and
+  returned as a structured error distinguishing a client disconnect from a real engine-unreachable
+  failure.
+- **Claude Code's extended-thinking budget was never forwarded to the local model.** With no
+  budget set, the model could spend its entire response budget on reasoning and never reach a
+  visible answer — the request succeeded, it just looked like silence. Now forwarded to the
+  engine (defaulting to a conservative share of the response budget when the client leaves it
+  unset), and bounded so an explicit budget can't do the same thing when a server-side response
+  cap is configured.
+- **A hook-injected context message could get silently misread as something the assistant had
+  already said**, which made the local model treat its turn as already finished and produce no
+  visible response at all — the real root cause of `turbollm launch claude` intermittently
+  producing nothing. Now mapped correctly.
+
+### Discord
+- Fixed a bug where `turbollm launch claude` could silently produce no response at all — no error, just silence.
+- Local models used with Claude Code now budget their reasoning properly instead of occasionally spending the whole response on thinking.
+
 ## [1.8.4] - 2026-07-22
 
 **Two new engine catalog entries, and downloads can now actually be resumed.**
