@@ -92,6 +92,37 @@ test('mapToOpenAI leaves thinking_budget_tokens unset when thinking is enabled b
   assert.equal('thinking_budget_tokens' in oai, false)
 })
 
+// ── mapToOpenAI maps a `role:'system'` entry inside `messages` correctly ────
+// Regression coverage for a real bug (found + fully root-caused live 2026-07-23, via a
+// captured real Claude Code request): Claude Code injects hook context (e.g. a
+// SessionStart-hook block) as a `role:'system'` message directly inside `messages` —
+// not just via the top-level `system` field. The per-message loop below only branched
+// on `msg.role === 'user'`; anything else (including this system entry) fell into the
+// assistant branch and got hardcoded to `role: 'assistant'`. That made the model see a
+// conversation where the ASSISTANT had apparently already spoken (the hook-context
+// text), so it treated its turn as already finished and emitted an immediate
+// end-of-turn with zero content blocks — a real "no response" bug, not a timeout or
+// crash. Replaying the exact captured request (2 messages: a user turn, then this
+// system-role turn) against the fixed code produced a real thinking block + real text;
+// against the pre-fix code it produced output_tokens:1 and no content blocks at all.
+test('mapToOpenAI maps a mid-conversation role:"system" message to an OpenAI system message, not assistant', () => {
+  const oai = mapToOpenAI({
+    messages: [
+      { role: 'user', content: 'hi' },
+      { role: 'system', content: [{ type: 'text', text: 'SessionStart hook additional context: ...' }] },
+    ],
+    max_tokens: 100,
+  })
+  const msgs = oai.messages as Array<{ role: string; content?: unknown }>
+  const injected = msgs.find((m) => m.content === 'SessionStart hook additional context: ...')
+  assert.ok(injected, 'the system-role message must appear in the mapped messages')
+  assert.equal(injected!.role, 'system')
+  assert.ok(
+    !msgs.some((m) => m.role === 'assistant' && m.content === 'SessionStart hook additional context: ...'),
+    'must NOT be relabeled as an assistant message',
+  )
+})
+
 // ── streamToAnthropic live progress ─────────────────────────────────────────
 
 /** Build a ReadableStream of OpenAI-style SSE bytes from raw line strings. */
