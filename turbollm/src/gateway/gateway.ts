@@ -272,7 +272,32 @@ export function registerGateway(app: Hono, d: Deps): void {
       }
     }
 
-    const res = await fetch(upstream, init)
+    // Unguarded before this fix: a throw here (e.g. the client disconnecting while the
+    // body was being parsed/routed above hands fetch an ALREADY-aborted signal, which
+    // throws immediately with no network I/O — clientAbort() fires ac.abort() synchronously
+    // when c.req.raw.signal.aborted is already true) escaped straight to Hono's default
+    // error handler: a bodyless 500 with no diagnostic, and no client-facing error envelope
+    // at all. Mirrors the /v1/messages handler's guard above.
+    let res: Response
+    try {
+      res = await fetch(upstream, init)
+    } catch (e) {
+      const err = e as Error & { cause?: unknown }
+      const isAbort = err.name === 'AbortError' || ac.signal.aborted
+      const cause = err.cause instanceof Error ? `: ${err.cause.message}` : ''
+      return c.json(
+        {
+          error: {
+            message: isAbort
+              ? 'Client disconnected before the engine responded.'
+              : `${err.message || 'Engine unreachable.'}${cause}`,
+            type: 'api_error',
+            code: isAbort ? 'client_disconnected' : 'engine_unreachable',
+          },
+        },
+        500,
+      )
+    }
 
     // Best-effort session-stats recording (B4) for OpenAI chat completions, fully
     // fail-safe and non-intrusive: tee the body so the client still gets the exact
