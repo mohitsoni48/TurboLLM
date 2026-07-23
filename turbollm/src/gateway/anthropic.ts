@@ -9,7 +9,10 @@ type ABlock =
   | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } }
   | { type: 'tool_use'; id: string; name: string; input: unknown }
   | { type: 'tool_result'; tool_use_id: string; content: string | Array<{ type: string; text?: string }> }
-type AMessage = { role: 'user' | 'assistant'; content: string | ABlock[] }
+// 'system' is undocumented but real: Claude Code injects hook context (e.g. SessionStart)
+// as a `role:'system'` entry directly into `messages`, not just via the top-level `system`
+// field — see mapToOpenAI's per-message role handling below.
+type AMessage = { role: 'user' | 'assistant' | 'system'; content: string | ABlock[] }
 
 export interface AnthropicRequest {
   model?: string
@@ -85,6 +88,20 @@ export function mapToOpenAI(req: AnthropicRequest): Record<string, unknown> {
             : parts
         messages.push({ role: 'user', content })
       }
+    } else if ((msg.role as string) === 'system') {
+      // Claude Code sometimes injects a `role: 'system'` entry directly into `messages`
+      // (e.g. a SessionStart-hook context block), separate from the top-level `system`
+      // field. Falling through to the assistant branch below relabeled this as something
+      // the ASSISTANT had already said — which made the model see a conversation that
+      // looked already finished, so it emitted an immediate end-of-turn with zero output
+      // (a real "no response" bug, confirmed via a live capture of an actual Claude Code
+      // request: a `role:'system'` message as messages[1], mis-mapped to `role:'assistant'`,
+      // reproduced a stream with output_tokens:1 and no content blocks at all).
+      const text = raw
+        .filter((b) => b.type === 'text')
+        .map((b) => (b as { text?: string }).text ?? '')
+        .join('\n')
+      if (text) messages.push({ role: 'system', content: text })
     } else {
       let text = ''
       const toolCalls: unknown[] = []
