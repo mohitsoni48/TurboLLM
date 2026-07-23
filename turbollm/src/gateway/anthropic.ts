@@ -23,7 +23,11 @@ export interface AnthropicRequest {
   stream?: boolean
   tools?: Array<{ name: string; description?: string; input_schema: Record<string, unknown> }>
   tool_choice?: { type: 'auto' | 'any' | 'tool'; name?: string }
-  thinking?: { type: 'enabled'; budget_tokens?: number }
+  // 'enabled' with an explicit budget_tokens is the documented shape; 'adaptive' (no
+  // budget_tokens, plus a display field) is a real shape confirmed live from Claude
+  // Code (2026-07-23) — the type value isn't branched on below, only budget_tokens'
+  // presence/validity, so any thinking-enabled type string is accepted.
+  thinking?: { type: string; budget_tokens?: number; display?: string }
   metadata?: unknown
 }
 
@@ -134,6 +138,33 @@ export function mapToOpenAI(req: AnthropicRequest): Record<string, unknown> {
           : tc.type === 'any'
             ? 'required'
             : { type: 'function', function: { name: tc.name } }
+  }
+  // Forward the caller's extended-thinking budget to the field the engine's sampler
+  // actually reads (thinking_budget_tokens — mirrors chat-routes.ts's runGeneration).
+  // Without this, a client with thinking enabled got no budget at all — the local
+  // model reasoned unconstrained and could exhaust the entire max_tokens on thinking,
+  // leaving zero tokens for the actual answer (a real "no response" bug, not a timeout
+  // or crash — the request succeeds, it just never reaches visible text).
+  //
+  // Two real shapes seen in the wild, both must be handled:
+  //  - {type:'enabled', budget_tokens:N} — an explicit budget; honor it exactly.
+  //  - {type:'adaptive', ...} (Claude Code's actual request, confirmed live 2026-07-23:
+  //    max_tokens 32000, thinking:{type:'adaptive',display:'omitted'}, no budget_tokens
+  //    at all) — the client deliberately left the budget to the server/model. Real
+  //    Anthropic models cap their own adaptive reasoning sensibly; a local model has no
+  //    such built-in restraint, so leaving thinking_budget_tokens unset here reproduced
+  //    the exact bug (thinking consumed the entire 32000-token budget, twice in a row,
+  //    with zero tokens ever reaching visible text). Any thinking type with no usable
+  //    budget_tokens gets a conservative default: half of max_tokens, guaranteeing the
+  //    other half survives for the actual answer regardless of how verbose the model's
+  //    reasoning is.
+  if (req.thinking) {
+    const requested = req.thinking.budget_tokens
+    if (Number.isFinite(requested) && (requested ?? 0) > 0) {
+      oai.thinking_budget_tokens = requested
+    } else if (Number.isFinite(req.max_tokens) && (req.max_tokens ?? 0) > 0) {
+      oai.thinking_budget_tokens = Math.floor(req.max_tokens! / 2)
+    }
   }
   return oai
 }

@@ -35,6 +35,63 @@ test('mapToOpenAI sets return_progress only for streaming requests', () => {
   assert.equal(nonStreamed.return_progress, undefined)
 })
 
+// ── mapToOpenAI forwards the extended-thinking budget ───────────────────────
+// Regression coverage for a real bug (found + fully root-caused live 2026-07-23):
+// mapToOpenAI never forwarded any thinking budget to thinking_budget_tokens (the
+// field the engine's sampler actually reads — see chat-routes.ts's runGeneration for
+// the same mechanism on the in-app chat path). With no budget forwarded, the local
+// model reasoned unconstrained and could exhaust the entire max_tokens response on
+// "thinking," leaving zero tokens for the actual answer — the request succeeds (200,
+// valid stream) but the user sees no response at all.
+//
+// Captured from a REAL Claude Code request via temporary daemon-side logging:
+// {"max_tokens":32000,"thinking":{"type":"adaptive","display":"omitted"},"stream":true}
+// — note there is no `budget_tokens` at all, and `type` is `"adaptive"`, not the
+// `"enabled"` this code originally (and wrongly) assumed was the only real shape.
+// An adaptive/budget-less thinking request gets a conservative default (half of
+// max_tokens) rather than being left unbounded — confirmed to fix the live repro
+// (the exact request above, replayed against the real daemon, produced visible text
+// after this fix; it produced nothing, twice in a row, before it).
+
+test('mapToOpenAI forwards an explicit thinking.budget_tokens exactly, unchanged', () => {
+  const oai = mapToOpenAI({
+    messages: [{ role: 'user', content: 'hi' }],
+    max_tokens: 32000,
+    thinking: { type: 'enabled', budget_tokens: 4096 },
+  })
+  assert.equal(oai.thinking_budget_tokens, 4096)
+})
+
+test('mapToOpenAI leaves thinking_budget_tokens unset when the caller sends no thinking field at all', () => {
+  const oai = mapToOpenAI({ messages: [{ role: 'user', content: 'hi' }], max_tokens: 1024 })
+  assert.equal('thinking_budget_tokens' in oai, false)
+})
+
+test('mapToOpenAI defaults to half of max_tokens for adaptive thinking with no budget_tokens (the real Claude Code shape)', () => {
+  const oai = mapToOpenAI({
+    messages: [{ role: 'user', content: 'hi' }],
+    max_tokens: 32000,
+    thinking: { type: 'adaptive', display: 'omitted' },
+  })
+  assert.equal(oai.thinking_budget_tokens, 16000)
+})
+
+test('mapToOpenAI defaults to half of max_tokens when thinking is enabled but budget_tokens is missing, zero, or negative', () => {
+  const missing = mapToOpenAI({ messages: [{ role: 'user', content: 'hi' }], max_tokens: 1024, thinking: { type: 'enabled' } })
+  assert.equal(missing.thinking_budget_tokens, 512)
+
+  const zero = mapToOpenAI({ messages: [{ role: 'user', content: 'hi' }], max_tokens: 1024, thinking: { type: 'enabled', budget_tokens: 0 } })
+  assert.equal(zero.thinking_budget_tokens, 512)
+
+  const negative = mapToOpenAI({ messages: [{ role: 'user', content: 'hi' }], max_tokens: 1024, thinking: { type: 'enabled', budget_tokens: -5 } })
+  assert.equal(negative.thinking_budget_tokens, 512)
+})
+
+test('mapToOpenAI leaves thinking_budget_tokens unset when thinking is enabled but max_tokens is absent (nothing sane to default off of)', () => {
+  const oai = mapToOpenAI({ messages: [{ role: 'user', content: 'hi' }], thinking: { type: 'enabled' } })
+  assert.equal('thinking_budget_tokens' in oai, false)
+})
+
 // ── streamToAnthropic live progress ─────────────────────────────────────────
 
 /** Build a ReadableStream of OpenAI-style SSE bytes from raw line strings. */
