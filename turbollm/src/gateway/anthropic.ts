@@ -177,9 +177,18 @@ export function mapToOpenAI(req: AnthropicRequest): Record<string, unknown> {
   //    reasoning is.
   if (req.thinking) {
     const requested = req.thinking.budget_tokens
+    const hasMaxTokens = Number.isFinite(req.max_tokens) && (req.max_tokens ?? 0) > 0
     if (Number.isFinite(requested) && (requested ?? 0) > 0) {
-      oai.thinking_budget_tokens = requested
-    } else if (Number.isFinite(req.max_tokens) && (req.max_tokens ?? 0) > 0) {
+      // `req.max_tokens` here already reflects the server-side maxTokens cap applied in
+      // gateway.ts (clampMaxTokens runs before mapToOpenAI) — but the caller's requested
+      // budget does not know about that cap. An explicit budget >= the (possibly-clamped)
+      // max_tokens can reintroduce this exact bug via the explicit-budget path: thinking
+      // consumes the whole capped response, leaving nothing for the actual answer. Bound
+      // it to the same half-of-max_tokens invariant the no-budget default already relies on.
+      oai.thinking_budget_tokens = hasMaxTokens
+        ? Math.min(requested!, Math.floor(req.max_tokens! / 2))
+        : requested
+    } else if (hasMaxTokens) {
       oai.thinking_budget_tokens = Math.floor(req.max_tokens! / 2)
     }
   }

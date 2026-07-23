@@ -53,13 +53,35 @@ test('mapToOpenAI sets return_progress only for streaming requests', () => {
 // (the exact request above, replayed against the real daemon, produced visible text
 // after this fix; it produced nothing, twice in a row, before it).
 
-test('mapToOpenAI forwards an explicit thinking.budget_tokens exactly, unchanged', () => {
+test('mapToOpenAI forwards an explicit thinking.budget_tokens exactly, unchanged, when it fits within half of max_tokens', () => {
   const oai = mapToOpenAI({
     messages: [{ role: 'user', content: 'hi' }],
     max_tokens: 32000,
     thinking: { type: 'enabled', budget_tokens: 4096 },
   })
   assert.equal(oai.thinking_budget_tokens, 4096)
+})
+
+// Regression coverage for a real gap flagged by pre-release review (2026-07-23): a server-side
+// maxTokens cap clamps req.max_tokens in gateway.ts BEFORE mapToOpenAI runs, but a client's
+// explicit budget_tokens doesn't know about that cap. An explicit budget >= the (possibly
+// clamped) max_tokens could reintroduce the exact "no response" bug this file's other tests
+// guard against, just via the explicit-budget path instead of the no-budget default path.
+test('mapToOpenAI clamps an explicit thinking.budget_tokens that exceeds half of max_tokens', () => {
+  const oai = mapToOpenAI({
+    messages: [{ role: 'user', content: 'hi' }],
+    max_tokens: 4096,
+    thinking: { type: 'enabled', budget_tokens: 24000 },
+  })
+  assert.equal(oai.thinking_budget_tokens, 2048)
+})
+
+test('mapToOpenAI forwards an explicit thinking.budget_tokens unclamped when max_tokens is absent', () => {
+  const oai = mapToOpenAI({
+    messages: [{ role: 'user', content: 'hi' }],
+    thinking: { type: 'enabled', budget_tokens: 24000 },
+  })
+  assert.equal(oai.thinking_budget_tokens, 24000)
 })
 
 test('mapToOpenAI leaves thinking_budget_tokens unset when the caller sends no thinking field at all', () => {
