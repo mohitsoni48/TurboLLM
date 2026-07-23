@@ -25,6 +25,28 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.8.4] - 2026-07-22
+
+**Two new engine catalog entries, and downloads can now actually be resumed.**
+
+### Added
+- **Engine catalog: Prism and BeeLlama** — two llama.cpp forks, build-from-source (guided
+  walkthrough). Prism specializes in 1-2 bit ternary/Bonsai models; BeeLlama adds
+  variance-normalized KV-cache quantization (KVarN), a KV precision tail, and adaptive DFlash
+  speculative decoding.
+
+### Fixed
+- **Interrupted downloads can now be resumed.** A download interrupted mid-transfer (e.g. a daemon
+  restart) previously came back showing "Paused" with no way to continue it — Cancel was the only
+  option. A Resume action now picks up exactly where it left off, byte-for-byte.
+
+### Discord
+- Two new engines in the catalog: **Prism** (great for 1-2 bit ternary models) and **BeeLlama**
+  (better KV-cache compression + speculative decoding). Both build from source with a guided
+  walkthrough — no manual setup.
+- Fixed a real annoyance: an interrupted download used to be stuck forever with no way to continue
+  it. Now it just resumes.
+
 ## [1.8.3] - 2026-07-22
 
 **API token tracking, tool/model config batch, and two real bug fixes (mmproj pairing, an

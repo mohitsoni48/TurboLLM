@@ -10,6 +10,7 @@ import {
   Feather,
   Flame,
   Gauge,
+  Gem,
   Layers,
   Loader2,
   Minus,
@@ -309,6 +310,28 @@ const ENGINE_META: Record<string, EngineMeta> = {
       'FP8 / FP4 / INT4 for Blackwell / Hopper',
     ],
     cons: ['NVIDIA + Linux only (Docker)', 'TensorRT backend needs per-model builds', 'Heavyweight setup'],
+  },
+  prism: {
+    icon: Gem,
+    tagline: '1-2 bit ternary specialist',
+    format: 'GGUF',
+    pros: [
+      'Purpose-built for 1-2 bit ternary/Bonsai models',
+      'Tracks upstream llama.cpp closely (per-commit builds)',
+      'Same llama-server API + GGUF flow',
+    ],
+    cons: ['Niche — most value only for ternary/BitNet-class models', 'No install endpoint yet — build from source', 'Small community'],
+  },
+  beellama: {
+    icon: Layers,
+    tagline: 'KV-cache precision at lower bits',
+    format: 'GGUF',
+    pros: [
+      'KVarN: independent K/V bit-widths, better quality-per-bit',
+      'KV precision tail keeps recent tokens exact, cheaply',
+      'Adaptive DFlash speculative decoding',
+    ],
+    cons: ['Solo maintainer, fast churn (v0.4.0 dropped TurboQuant/TCQ)', 'No install endpoint yet — build from source', 'KVarN types need the raw flags field, not auto-tune yet'],
   },
 }
 
