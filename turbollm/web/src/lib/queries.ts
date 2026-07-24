@@ -151,7 +151,7 @@ export function useStatus(): UseQueryResult<Status> {
     // Poll faster (1s) while an auto-tune sweep runs OR a completion is actively
     // streaming, so the inline progress and the live "Generating…" indicator stay live.
     refetchInterval: (q) =>
-      q.state.data?.bench.running ||
+      q.state.data?.bench?.running ||
       q.state.data?.engineBuild?.active ||
       (q.state.data?.engineStats?.activeRequests ?? 0) > 0
         ? 1000

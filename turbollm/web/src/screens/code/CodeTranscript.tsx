@@ -1,22 +1,32 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import {
+  Brain,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
+  Circle,
+  Clock,
+  CornerDownRight,
   FileEdit,
   FilePlus,
   FileText,
   FolderTree,
   HelpCircle,
   Layers,
+  ListChecks,
   Loader2,
+  MessageSquare,
   RotateCcw,
   Search,
+  SendHorizontal,
   SquareTerminal,
   Terminal,
   XCircle,
 } from 'lucide-react'
 import type { LiveToolCall, Message, MessageTimelineBlock, ToolCallRecord } from '../../lib/chat-types'
+import type { QueuedTurn, ShellRun, SteerKind, TodoItem } from '../../lib/code-types'
+import type { RetryState } from '../../lib/code-session-client'
+import { useDisplayPref } from '../../lib/code-display-prefs'
 import type { LiveBlock } from '../../lib/live-timeline'
 import { friendlyName } from '../../lib/tool-explain'
 import { cn } from '../../lib/utils'
@@ -68,13 +78,16 @@ interface NormalizedCall {
   status: ToolStatus
   result?: string
   diff?: string
+  /** Live cumulative output snapshot while a streaming tool (bash) is still running (Phase 2) —
+   *  only ever present on a live call, never a persisted one. */
+  partial?: string
 }
 
 function toRecordCall(tc: ToolCallRecord): NormalizedCall {
   return { id: tc.id, name: tc.name, args: tc.args, status: tc.error ? 'error' : 'done', result: tc.error ?? tc.result, diff: tc.diff }
 }
 function toLiveCall(tc: LiveToolCall): NormalizedCall {
-  return { id: tc.id, name: tc.name, args: tc.args, status: tc.status, result: tc.result, diff: tc.diff }
+  return { id: tc.id, name: tc.name, args: tc.args, status: tc.status, result: tc.result, diff: tc.diff, partial: tc.partial }
 }
 
 const EDIT_TOOLS = new Set(['edit'])
@@ -179,7 +192,7 @@ function CodeDiffPanel({ diff }: { diff: string }) {
                   <td
                     colSpan={3}
                     className="select-none whitespace-pre px-3 py-1"
-                    style={{ color: 'var(--accent)', background: 'color-mix(in srgb, var(--accent) 8%, transparent)' }}
+                    style={{ color: 'var(--accent)', background: 'var(--diff-hunk-bg)' }}
                   >
                     {line}
                   </td>
@@ -201,9 +214,9 @@ function CodeDiffPanel({ diff }: { diff: string }) {
             if (!isAdd && !isNoNewline) oldLine++
             if (!isDel && !isNoNewline) newLine++
             const bg = isAdd
-              ? 'color-mix(in srgb, var(--ok) 10%, transparent)'
+              ? 'var(--diff-add-bg)'
               : isDel
-                ? 'color-mix(in srgb, var(--err) 10%, transparent)'
+                ? 'var(--diff-del-bg)'
                 : undefined
             const fg = isAdd ? 'var(--ok)' : isDel ? 'var(--err)' : 'var(--ink)'
             return (
@@ -222,13 +235,18 @@ function CodeDiffPanel({ diff }: { diff: string }) {
 
 /** Non-diff tool output (bash stdout, read/grep/find/ls results) — the SAME
  *  near-black log tokens EngineLogPanel.tsx uses for real process output, so
- *  this reads as a console, not a chat attachment. */
-function CodeOutputPanel({ text }: { text: string }) {
-  const truncated = text.length > 4000 ? `${text.slice(0, 4000)}\n…(truncated)` : text
+ *  this reads as a console, not a chat attachment. When `streaming` (a live
+ *  `tool_progress` snapshot, Phase 2) it follows the TAIL (newest output, like a
+ *  real terminal) instead of the head, and shows a pulsing cursor. */
+function CodeOutputPanel({ text, streaming }: { text: string; streaming?: boolean }) {
+  const truncated = text.length > 4000
+    ? (streaming ? `…(earlier output hidden)\n${text.slice(-4000)}` : `${text.slice(0, 4000)}\n…(truncated)`)
+    : text
   return (
     <div className="max-h-80 overflow-auto border-t border-border" style={{ background: 'var(--log-bg)' }}>
       <pre className="whitespace-pre-wrap px-3 py-2 font-mono text-[12px] leading-relaxed" style={{ color: 'var(--log-ink)' }}>
-        {truncated || <span style={{ color: 'var(--log-faint)' }}>(no output)</span>}
+        {truncated || <span style={{ color: 'var(--log-faint)' }}>{streaming ? '' : '(no output)'}</span>}
+        {streaming && <span className="tllm-pulse" style={{ color: 'var(--log-faint)' }}>▋</span>}
       </pre>
     </div>
   )
@@ -244,15 +262,26 @@ function CodeToolCard({ call }: { call: NormalizedCall }) {
   const Icon = toolIcon(call.name)
   const label = toolLabel(call.name, call.args)
   const hasDiff = !!call.diff?.trim()
-  const hasOutput = !!call.result?.length || hasDiff
+  // Live cumulative output while the tool is still running (bash) — shown before the terminal
+  // `result` exists (Phase 2). Once the real result lands it takes over.
+  const streamingPartial = call.status === 'pending' && !!call.partial?.length && !call.result?.length
+  const hasOutput = !!call.result?.length || hasDiff || !!call.partial?.length
   const [expanded, setExpanded] = useState(hasDiff)
+  // `/details` (ADR-258) is a global override that force-opens every card's detail for reviewing a
+  // long run; the per-card toggle still works when it's off. `open` is what actually drives the
+  // panels below.
+  const detailsPref = useDisplayPref('details')
+  const open = expanded || detailsPref
+  // Auto-open while live output is streaming in, and STAY open once it finalizes (so the panel the
+  // user was already watching doesn't collapse out from under them the instant the tool finishes).
+  useEffect(() => { if (streamingPartial) setExpanded(true) }, [streamingPartial])
   const stats = hasDiff ? diffStats(call.diff!) : null
 
   return (
     <div
       className="overflow-hidden rounded-lg border"
       style={call.status === 'awaiting_approval'
-        ? { borderColor: 'var(--warn)', background: 'color-mix(in srgb, var(--warn) 6%, transparent)' }
+        ? { borderColor: 'var(--warn)', background: 'var(--toolcard-approval-bg)' }
         : { borderColor: 'var(--border)' }}
     >
       <button
@@ -271,8 +300,10 @@ function CodeToolCard({ call }: { call: NormalizedCall }) {
         )}
         <StatusIcon status={call.status} />
       </button>
-      {expanded && hasDiff && <CodeDiffPanel diff={call.diff!} />}
-      {expanded && !hasDiff && call.result && <CodeOutputPanel text={call.result} />}
+      {open && hasDiff && <CodeDiffPanel diff={call.diff!} />}
+      {open && !hasDiff && call.result && <CodeOutputPanel text={call.result} />}
+      {/* Live stream — the terminal result (above) supersedes it the moment it arrives. */}
+      {open && !hasDiff && !call.result && call.partial && <CodeOutputPanel text={call.partial} streaming />}
     </div>
   )
 }
@@ -311,6 +342,8 @@ function ToolCallDetailRow({ call }: { call: NormalizedCall }) {
             <CodeDiffPanel diff={call.diff!} />
           ) : call.result ? (
             <CodeOutputPanel text={call.result} />
+          ) : call.partial ? (
+            <CodeOutputPanel text={call.partial} streaming />
           ) : (
             <div className="px-3 py-2 text-[12px] text-faint">No output.</div>
           )}
@@ -421,7 +454,7 @@ function CodeInstructionEntry({
   return (
     <div
       className="group ml-auto w-fit max-w-[min(88%,900px)] rounded-lg border px-4 py-3"
-      style={{ borderColor: 'color-mix(in srgb, var(--accent) 35%, var(--border))', background: 'color-mix(in srgb, var(--accent) 6%, transparent)' }}
+      style={{ borderColor: 'var(--instruction-border)', background: 'var(--instruction-bg)' }}
     >
       {!!contextFiles?.length && (
         <div className="mb-2 flex flex-wrap justify-end gap-1.5">
@@ -430,7 +463,7 @@ function CodeInstructionEntry({
               key={p}
               title={p}
               className="inline-flex max-w-[200px] items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] text-muted"
-              style={{ borderColor: 'color-mix(in srgb, var(--accent) 25%, var(--border))' }}
+              style={{ borderColor: 'var(--instruction-chip-border)' }}
             >
               <FileText size={10} className="shrink-0 text-faint" />
               <span className="min-w-0 truncate">{p.split(/[\\/]/).filter(Boolean).pop() || p}</span>
@@ -457,10 +490,85 @@ function CodeInstructionEntry({
   )
 }
 
+/** A user-run shell command (`!command`/`!!command`, ADR-258) — the `$ cmd` header over a
+ *  console-style output panel (the SAME --log-* tokens tool output uses, so it reads as a real
+ *  terminal). Renders both a persisted `!` result (from a message's `shell` tool call) and an
+ *  ephemeral `!!` result (client-only), identically. */
+function CodeShellEntry({ command, output, exitCode, timedOut }: { command: string; output: string; exitCode: number | null; timedOut?: boolean }) {
+  const failed = timedOut || (exitCode !== null && exitCode !== 0)
+  return (
+    <div className="overflow-hidden rounded-lg border" style={{ borderColor: failed ? 'color-mix(in srgb, var(--err) 40%, var(--border))' : 'var(--border)' }}>
+      <div className="flex items-center gap-2 bg-panel-2 px-3 py-1.5">
+        <SquareTerminal size={13} className="shrink-0 text-muted" />
+        <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-ink">$ {command}</span>
+        {timedOut
+          ? <span className="shrink-0 font-mono text-[11px]" style={{ color: 'var(--err)' }}>timed out</span>
+          : failed
+            ? <span className="shrink-0 font-mono text-[11px]" style={{ color: 'var(--err)' }}>exit {exitCode}</span>
+            : null}
+      </div>
+      {output.trim() && <CodeOutputPanel text={output} />}
+    </div>
+  )
+}
+
+/** A message the user has submitted that hasn't run yet — the server-side queue's contents,
+ *  rendered INLINE at the transcript tail (after the live turn) instead of the old separate
+ *  "Queued" chip strip below the composer (the founder read that strip as a bug — a message you
+ *  sent seeming to vanish from the conversation). Same right-aligned instruction grammar as
+ *  CodeInstructionEntry so it reads as "yours", but translucent + dashed to say "not sent yet",
+ *  with a badge distinguishing a queued STEER (will redirect the current turn) from a FOLLOW-UP
+ *  (runs after it) — information the old chip never surfaced. Reuses the --instruction-* tokens
+ *  (Phase 0) at reduced opacity rather than introducing queue-specific hex. */
+function CodeQueuedEntry({ task, kind, onSendNow }: { task: string; kind: SteerKind; onSendNow?: () => void }) {
+  const isSteer = kind === 'steer'
+  const Badge = isSteer ? CornerDownRight : Clock
+  return (
+    <div className="tllm-rise-in">
+      <RailEntry icon={MessageSquare} tone="muted">
+        <div
+          className="group ml-auto w-fit max-w-[min(88%,900px)] rounded-lg border border-dashed px-4 py-3 opacity-70"
+          style={{ borderColor: 'var(--instruction-chip-border)', background: 'var(--instruction-bg)' }}
+        >
+          <div className="mb-1.5 flex items-center justify-end">
+            <span
+              className="inline-flex items-center gap-1 rounded-full border border-dashed px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted"
+              style={{ borderColor: 'var(--instruction-chip-border)' }}
+              title={isSteer
+                ? 'Queued as a steer — it will redirect the current turn when it runs'
+                : 'Queued — it will run as a new turn after the current one finishes'}
+            >
+              <Badge size={10} className="shrink-0" />
+              {isSteer ? 'Steers this turn' : 'Runs next'}
+            </span>
+          </div>
+          <p className="whitespace-pre-wrap text-[14px] leading-relaxed text-ink">{task}</p>
+          {onSendNow && (
+            <div className="mt-1 flex items-center justify-end">
+              <button
+                type="button"
+                onClick={onSendNow}
+                title="Send now — stop the current run and run this one next"
+                className="inline-flex items-center gap-1 rounded p-1 text-[11px] font-medium text-faint transition-colors hover:text-ink"
+              >
+                <SendHorizontal size={12} /> Send now
+              </button>
+            </div>
+          )}
+        </div>
+      </RailEntry>
+    </div>
+  )
+}
+
 /** The agent's internal reasoning — monospace/log-toned (it's narration of a
  *  process, closer to "activity" than a final answer), collapsed by default. */
 function CodeReasoning({ reasoning, streaming }: { reasoning: string; streaming?: boolean }) {
   const [open, setOpen] = useState(false)
+  // `/thinking` (ADR-258) force-opens every reasoning block globally for reviewing a long run; the
+  // per-block toggle still works when it's off. `show` is what actually drives the panel.
+  const thinkingPref = useDisplayPref('thinking')
+  const show = open || thinkingPref
   return (
     <div className="overflow-hidden rounded-lg border border-border">
       <button
@@ -469,9 +577,9 @@ function CodeReasoning({ reasoning, streaming }: { reasoning: string; streaming?
         className="flex w-full items-center gap-1.5 bg-panel-2 px-3 py-1.5 text-left font-mono text-[11px] text-muted hover:text-ink"
       >
         {streaming ? 'reasoning…' : 'reasoning'}
-        {streaming && !open && <span className="tllm-pulse">·</span>}
+        {streaming && !show && <span className="tllm-pulse">·</span>}
       </button>
-      {open && (
+      {show && (
         <pre
           className="max-h-48 overflow-auto whitespace-pre-wrap px-3 py-2 font-mono text-[11px] leading-relaxed"
           style={{ background: 'var(--log-bg)', color: 'var(--log-faint)' }}
@@ -526,9 +634,27 @@ function RailEntry({ icon: Icon, tone = 'muted', children }: { icon: typeof Squa
  *  polish. A finished message mounts once and stays put, so this only ever plays once. */
 function CodeMessageEntry({ message, onRevert }: { message: Message; onRevert?: () => void }) {
   if (message.role === 'user') {
+    // A persisted `!command` (ADR-258) is a user message carrying a `shell` tool call — render it
+    // as a terminal entry, not a chat-style instruction bubble.
+    const shell = (message.toolCalls ?? []).find((tc) => tc.name === 'shell')
+    if (shell) {
+      const args = shell.args as { command?: unknown; exitCode?: unknown; timedOut?: unknown }
+      return (
+        <div className="tllm-rise-in">
+          <RailEntry icon={SquareTerminal} tone="muted">
+            <CodeShellEntry
+              command={typeof args.command === 'string' ? args.command : ''}
+              output={shell.result ?? ''}
+              exitCode={typeof args.exitCode === 'number' ? args.exitCode : null}
+              timedOut={args.timedOut === true}
+            />
+          </RailEntry>
+        </div>
+      )
+    }
     return (
       <div className="tllm-rise-in">
-        <RailEntry icon={SquareTerminal} tone="accent">
+        <RailEntry icon={MessageSquare} tone="accent">
           <CodeInstructionEntry content={message.content} contextFiles={message.textAttachments} onRevert={onRevert} />
         </RailEntry>
       </div>
@@ -545,7 +671,7 @@ function CodeMessageEntry({ message, onRevert }: { message: Message; onRevert?: 
   return (
     <div className="tllm-rise-in flex flex-col gap-3">
       {message.reasoning?.trim() && (
-        <RailEntry icon={Terminal}>
+        <RailEntry icon={Brain}>
           <CodeReasoning reasoning={message.reasoning} />
         </RailEntry>
       )}
@@ -553,15 +679,17 @@ function CodeMessageEntry({ message, onRevert }: { message: Message; onRevert?: 
         ? chunks.map((c, i) =>
           c.kind === 'text'
             ? (
-                <RailEntry key={i} icon={SquareTerminal}>
+                <RailEntry key={i} icon={MessageSquare}>
                   <CodeCommentary content={c.text} />
                 </RailEntry>
               )
-            : (
-                <RailEntry key={i} icon={runIcon(c.calls)} tone={runTone(c.calls)}>
-                  <ToolRun calls={c.calls} batchTime={message.createdAt} />
-                </RailEntry>
-              ),
+            : c.kind === 'tools'
+              ? (
+                  <RailEntry key={i} icon={runIcon(c.calls)} tone={runTone(c.calls)}>
+                    <ToolRun calls={c.calls} batchTime={message.createdAt} />
+                  </RailEntry>
+                )
+              : null, // a persisted message never carries live-only turn dividers
         )
         : (
             <>
@@ -571,7 +699,7 @@ function CodeMessageEntry({ message, onRevert }: { message: Message; onRevert?: 
                 </RailEntry>
               )}
               {message.content?.trim() && (
-                <RailEntry icon={SquareTerminal}>
+                <RailEntry icon={MessageSquare}>
                   <CodeCommentary content={message.content} />
                 </RailEntry>
               )}
@@ -594,6 +722,7 @@ function CodeMessageEntry({ message, onRevert }: { message: Message; onRevert?: 
 type StreamChunk =
   | { kind: 'text'; text: string }
   | { kind: 'tools'; calls: NormalizedCall[] }
+  | { kind: 'turn'; index: number }
 
 function chunkTimeline(timeline: LiveBlock[]): StreamChunk[] {
   const chunks: StreamChunk[] = []
@@ -605,6 +734,11 @@ function chunkTimeline(timeline: LiveBlock[]): StreamChunk[] {
       i++
       continue
     }
+    if (b.kind === 'turn') {
+      chunks.push({ kind: 'turn', index: b.index })
+      i++
+      continue
+    }
     const run: NormalizedCall[] = []
     while (i < timeline.length) {
       const cur = timeline[i]
@@ -612,7 +746,7 @@ function chunkTimeline(timeline: LiveBlock[]): StreamChunk[] {
       run.push(toLiveCall(cur.call))
       i++
     }
-    chunks.push({ kind: 'tools', calls: run })
+    if (run.length) chunks.push({ kind: 'tools', calls: run })
   }
   return chunks
 }
@@ -657,63 +791,148 @@ function chunkPersistedTimeline(timeline: MessageTimelineBlock[], toolCalls: Too
  *  auto-compaction (which silently summarizes history mid-turn with no other
  *  signal) from ordinary "no content yet" — same spinner, different text, so a
  *  long compaction pause doesn't read as a stuck/dead run. */
-function CodeThinking({ label = 'thinking…' }: { label?: string }) {
+function CodeThinking({ label = 'thinking…', tone = 'accent' }: { label?: string; tone?: 'accent' | 'warn' }) {
   return (
     <div className="flex items-center gap-1.5 font-mono text-[11px] text-muted">
-      <Loader2 size={12} className="shrink-0 animate-spin" style={{ color: 'var(--accent)' }} />
+      <Loader2 size={12} className="shrink-0 animate-spin" style={{ color: tone === 'warn' ? 'var(--warn)' : 'var(--accent)' }} />
       <span>{label}</span>
     </div>
   )
 }
 
-function CodeStreamingEntry({ timeline, reasoning, compacting }: { timeline: LiveBlock[]; reasoning: string; compacting?: boolean }) {
+/** A subtle divider between agentic rounds within one live assistant turn (Phase 2, ADR-249) —
+ *  just a thin tokenized rule, deliberately low-weight (this is grouping, not a hard section
+ *  break). Rendered outside the rail (no marker dot) so it reads as a separator spanning the
+ *  rounds rather than another activity entry. Live-only: a persisted turn has no round markers,
+ *  so the finished transcript reads as one continuous log.
+ *  No "Round N" text label (dropped per founder feedback, 2026-07-24 — the line alone is the
+ *  grouping signal; a literal round counter read as unwanted clutter). `index` stays a param
+ *  even though it's now unused for display, so the call site doesn't need to change if a label
+ *  (e.g. a tooltip) is ever wanted back. */
+function TurnDivider({ index: _index }: { index: number }) {
+  return <span className="block h-px" style={{ background: 'var(--border)' }} aria-hidden />
+}
+
+const TODO_STATUS_COLOR: Record<TodoItem['status'], string> = {
+  pending: 'var(--faint)',
+  in_progress: 'var(--accent)',
+  completed: 'var(--ok)',
+}
+
+function TodoStatusIcon({ status }: { status: TodoItem['status'] }) {
+  if (status === 'completed') return <CheckCircle2 size={12} className="mt-0.5 shrink-0" style={{ color: TODO_STATUS_COLOR.completed }} />
+  if (status === 'in_progress') return <Loader2 size={12} className="mt-0.5 shrink-0 animate-spin" style={{ color: TODO_STATUS_COLOR.in_progress }} />
+  return <Circle size={12} className="mt-0.5 shrink-0" style={{ color: TODO_STATUS_COLOR.pending }} />
+}
+
+/** The model's own plan for the CURRENT live turn (ADR-255, `update_todos`) — a compact
+ *  checklist, not another chat-style card: a quiet header ("Plan · N/total") over a plain list,
+ *  same visual weight as CodeReasoning/CodeThinking rather than a heavier new pattern. Ephemeral
+ *  and live-only by design (the backend never persists todos past a turn, and resets them at the
+ *  start of every new one — see LiveState.todos's doc comment) — renders nothing once `todos` is
+ *  empty/undefined, so a finished turn's transcript entry never carries a stale plan.
+ *  Pinned above the composer by CodeSessionScreen.tsx, NOT rendered inline in the scrolling
+ *  transcript (founder feedback, 2026-07-24: a plan you have to scroll to find isn't a plan) —
+ *  exported so the screen can render it directly, outside CodeStreamingEntry. */
+export function TodoChecklist({ todos }: { todos: TodoItem[] }) {
+  if (todos.length === 0) return null
+  const done = todos.filter((t) => t.status === 'completed').length
+  return (
+    <div className="overflow-hidden rounded-lg border border-border">
+      <div className="flex items-center gap-1.5 bg-panel-2 px-3 py-1.5 text-[11px] font-medium text-muted">
+        <ListChecks size={12} className="shrink-0" />
+        <span>Plan</span>
+        <span className="ml-auto font-mono text-[10px] tabular-nums text-faint">{done}/{todos.length}</span>
+      </div>
+      <ul className="flex flex-col gap-1.5 px-3 py-2">
+        {todos.map((t, i) => (
+          <li key={i} className="flex items-start gap-1.5 text-[12px] leading-snug">
+            <TodoStatusIcon status={t.status} />
+            <span className={cn(t.status === 'completed' ? 'text-faint line-through' : t.status === 'in_progress' ? 'text-ink' : 'text-muted')}>
+              {t.content}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
+function CodeStreamingEntry({
+  timeline, reasoning, compacting, retry,
+}: {
+  timeline: LiveBlock[]
+  reasoning: string
+  compacting?: boolean
+  retry?: RetryState | null
+}) {
   const chunks = chunkTimeline(timeline)
   const hasContent = !!reasoning?.trim() || chunks.length > 0
   return (
     <div className="flex flex-col gap-3">
       {reasoning?.trim() && (
-        <RailEntry icon={Terminal} tone="accent">
+        <RailEntry icon={Brain} tone="accent">
           <CodeReasoning reasoning={reasoning} streaming />
         </RailEntry>
       )}
       {chunks.map((c, i) =>
         c.kind === 'text'
           ? (
-              <RailEntry key={i} icon={SquareTerminal} tone="accent">
+              <RailEntry key={i} icon={MessageSquare} tone="accent">
                 <CodeCommentary content={c.text} streaming />
               </RailEntry>
             )
-          : (
-              <RailEntry key={i} icon={runIcon(c.calls)} tone={runTone(c.calls)}>
-                <ToolRun calls={c.calls} />
-              </RailEntry>
-            ),
+          : c.kind === 'turn'
+            ? <TurnDivider key={i} index={c.index} />
+            : (
+                <RailEntry key={i} icon={runIcon(c.calls)} tone={runTone(c.calls)}>
+                  <ToolRun calls={c.calls} />
+                </RailEntry>
+              ),
       )}
-      {compacting
+      {/* One shared status-banner slot (ADR-250) — retry is the most salient transient state so it
+          takes priority over compaction and the generic "thinking" placeholder. */}
+      {retry
         ? (
-            <RailEntry icon={Terminal} tone="accent">
-              <CodeThinking label="Compacting conversation…" />
+            <RailEntry icon={RotateCcw} tone="accent">
+              <CodeThinking tone="warn" label={`Retrying… attempt ${retry.attempt} of ${retry.maxAttempts}${retry.message ? ` — ${retry.message}` : ''}`} />
             </RailEntry>
           )
-        : !hasContent && (
-            <RailEntry icon={Terminal} tone="accent">
-              <CodeThinking />
-            </RailEntry>
-          )}
+        : compacting
+          ? (
+              <RailEntry icon={Brain} tone="accent">
+                <CodeThinking label="Compacting conversation…" />
+              </RailEntry>
+            )
+          : !hasContent && (
+              <RailEntry icon={Brain} tone="accent">
+                <CodeThinking />
+              </RailEntry>
+            )}
     </div>
   )
 }
 
 export function CodeTranscript({
-  messages, liveAssistantId, live, onRevert,
+  messages, liveAssistantId, live, onRevert, queued, onSendNowQueued, shellRuns,
 }: {
   messages: Message[]
   liveAssistantId?: string
-  live?: { timeline: LiveBlock[]; reasoning: string; compacting?: boolean } | null
+  live?: { timeline: LiveBlock[]; reasoning: string; compacting?: boolean; retry?: RetryState | null } | null
   /** Revert affordance on each user message — omitted entirely (via `undefined`) while a run
    *  is live, and never shown on the FIRST message (nothing before it to revert to; `messages`
    *  here is already cut at any existing /clear point, so index 0 is always correct). */
   onRevert?: (messageId: string) => void
+  /** The server-side message queue (turns waiting behind the active run), rendered inline as
+   *  translucent cards at the tail — AFTER the live turn, in send order — never interleaved above
+   *  it (the ADR-199 ordering invariant; the caller has already excluded these from `messages`). */
+  queued?: QueuedTurn[]
+  /** "Send now" on a queued card — stops the active turn and promotes this one to run next.
+   *  Omitted disables the affordance (the card still renders). */
+  onSendNowQueued?: (userMsgId: string) => void
+  /** Transcript-only `!!command` results (ADR-258) — client-only, rendered at the very tail. A `!`
+   *  result is NOT here; it's a persisted message rendered inline by CodeMessageEntry. */
+  shellRuns?: ShellRun[]
 }) {
   return (
     <div className="relative flex flex-col gap-5 pl-8">
@@ -730,8 +949,23 @@ export function CodeTranscript({
           />
         ))}
       {live && (
-        <CodeStreamingEntry timeline={live.timeline} reasoning={live.reasoning} compacting={live.compacting} />
+        <CodeStreamingEntry timeline={live.timeline} reasoning={live.reasoning} compacting={live.compacting} retry={live.retry} />
       )}
+      {queued?.map((q) => (
+        <CodeQueuedEntry
+          key={q.userMsgId}
+          task={q.task}
+          kind={q.kind ?? 'followUp'}
+          onSendNow={onSendNowQueued ? () => onSendNowQueued(q.userMsgId) : undefined}
+        />
+      ))}
+      {shellRuns?.map((s) => (
+        <div key={s.id} className="tllm-rise-in">
+          <RailEntry icon={SquareTerminal} tone="muted">
+            <CodeShellEntry command={s.command} output={s.output} exitCode={s.exitCode} timedOut={s.timedOut} />
+          </RailEntry>
+        </div>
+      ))}
     </div>
   )
 }

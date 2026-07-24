@@ -1,4 +1,4 @@
-import { defineConfig } from 'vite'
+import { defineConfig } from 'vitest/config'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 
@@ -12,6 +12,38 @@ export default defineConfig({
       '/healthz': 'http://127.0.0.1:6996',
       '/v1': 'http://127.0.0.1:6996',
     },
+  },
+  test: {
+    environment: 'jsdom',
+    // jsdom's default document origin is the opaque `about:blank` — its own localStorage
+    // implementation throws "not accessible" under an opaque origin, which crashes any
+    // component test that (transitively) imports stores/ui.ts at module init (reads
+    // localStorage for the persisted theme/font-size). A real http(s) URL gives it a real
+    // origin, so localStorage behaves like an actual browser instead of needing a hand-rolled
+    // polyfill (setup.ts still stubs matchMedia separately — jsdom never implements that one).
+    environmentOptions: { jsdom: { url: 'http://localhost:3000' } },
+    globals: true,
+    setupFiles: ['./src/test/setup.ts'],
+    // Node 22+ ships its own global `localStorage` (the `--webstorage` flag, on by default),
+    // which shadows jsdom's implementation entirely and throws without a `--localstorage-file`
+    // path configured — the root cause setup.ts's polyfill works around at the JS layer. That
+    // polyfill wins functionally (it overwrites the global before any test file's imports run),
+    // but Node still prints its own startup warning about the unset flag regardless, since the
+    // warning fires independently of whether the global later gets overwritten. Disabling the
+    // feature outright on the actual worker processes Vitest spawns removes the warning at the
+    // source instead of just working around its symptom.
+    execArgv: ['--no-experimental-webstorage'],
+    // engine-groups/personas/tool-explain/vram already use `node:test` and run via the
+    // repo root's `tsx --test` (backend convention) — leave them to that runner rather
+    // than having Vitest try (and fail) to collect them too.
+    exclude: [
+      '**/node_modules/**',
+      '**/e2e/**',
+      'src/lib/engine-groups.test.ts',
+      'src/lib/personas.test.ts',
+      'src/lib/tool-explain.test.ts',
+      'src/lib/vram.test.ts',
+    ],
   },
   build: {
     outDir: '../src/webdist',

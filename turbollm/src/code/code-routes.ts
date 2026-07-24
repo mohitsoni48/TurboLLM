@@ -21,9 +21,12 @@ import type { Context, Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import type { Deps } from '../deps'
 import type { AgentRun, Message } from '../chat/db'
-import { CodeRunManager } from './code-run-manager'
+import { CodeRunManager, type SteerKind } from './code-run-manager'
 import { compactCodeSession, disposeLspClientsForConv } from './code-session'
 import { revertFileEdits } from './revert'
+import { codeSessionExportFilename, serializeCodeSessionMarkdown } from './session-export'
+import { commitGitChanges, getGithubCompareUrl, getGitStatus, pushGitBranch } from './git-actions'
+import { runShellCommand, shellContextText } from './code-shell'
 import type { CodeMode } from './persona'
 
 type S = 200 | 201 | 202 | 400 | 404 | 409 | 500
@@ -100,6 +103,7 @@ function toSidebarRow(run: AgentRun) {
     add: run.linesAdded ?? 0,
     del: run.linesRemoved ?? 0,
     mode: undefined as string | undefined, // filled from conv below when available
+    running: undefined as boolean | undefined, // filled from CodeRunManager below when available
     createdAt: run.createdAt,
     repoRoot: run.repoRoot ?? '',
     error: run.error,
@@ -165,16 +169,19 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
   app.get('/api/v1/code/sessions', (c) => {
     const filter = (c.req.query('filter') ?? 'active') as 'active' | 'archived' | 'all'
     // Only code-kind runs — a run maps to a code conversation. Filter by the conv kind.
-    const runs = db.listAgentRuns().filter((r) => {
+    const agentRuns = db.listAgentRuns().filter((r) => {
       const conv = db.getConversation(r.convId)
       if (conv?.kind !== 'code') return false
       if (filter === 'active') return !r.archivedAt
       if (filter === 'archived') return !!r.archivedAt
       return true
     })
-    const rows = runs.map((r) => {
+    const rows = agentRuns.map((r) => {
       const row = toSidebarRow(r)
       row.mode = db.getConversation(r.convId)?.agentMode
+      // Sidebar's own liveness signal (ADR-256) — same authoritative check the detail route
+      // uses below, so a background session (tab not open) still shows as running.
+      row.running = runs.isActive(r.id)
       return row
     })
     return c.json({ sessions: rows })
@@ -197,7 +204,34 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
       // Tasks waiting behind the active turn — the server-side message queue, so its chips
       // survive a page reload / reconnect.
       queued: runs.queued(run.id),
+      // The active turn's current step checklist (ADR-255), so a reopened session shows live
+      // progress immediately without waiting for the next update_todos frame. [] when none.
+      todos: runs.todos(run.id),
     })
+  })
+
+  // ── export (Phase 3, ADR-251) ─────────────────────────────────────────────────
+  // GET /api/v1/code/sessions/:id/export?format=markdown — Markdown-only for this pass (HTML is
+  // a spec-15-§5 fast-follow; session-export.ts's serializer is written so that fast-follow can
+  // reuse this same Markdown through the app's existing renderer instead of a second serializer).
+  // Deliberately NOT blocked on an active run (unlike /compact, /archive, /delete above) —
+  // exporting mid-generation is safe: this only reads what's already persisted in
+  // `conv.messages`, so an in-flight turn's not-yet-saved content is naturally just absent from
+  // the export rather than an error case to guard against.
+  app.get('/api/v1/code/sessions/:id/export', (c) => {
+    const id = c.req.param('id')
+    const run = db.getAgentRun(id)
+    if (!run) return err(c, 404, 'not_found', 'Session not found.')
+    const conv = db.getConversation(run.convId, true)
+    if (!conv) return err(c, 404, 'not_found', 'Session conversation not found.')
+    const format = c.req.query('format') === 'html' ? 'html' : 'markdown'
+    if (format === 'html') return err(c, 400, 'unsupported_format', 'HTML export is not available yet — use format=markdown.')
+
+    const md = serializeCodeSessionMarkdown(run, conv)
+    const filename = codeSessionExportFilename(run.title, run.createdAt, 'md')
+    c.header('Content-Disposition', `attachment; filename="${filename}"`)
+    c.header('Content-Type', 'text/markdown; charset=utf-8')
+    return c.body(md)
   })
 
   // ── change mode (auto/plan/ask) — live for the ask-approval gate ──────────────
@@ -315,12 +349,14 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
 
   // ── /clear + /resume ───────────────────────────────────────────────────────
   // /clear hides the conversation so far (a blank slate for the model AND the transcript UI)
-  // WITHOUT touching the session's repo/worktree/branch or deleting anything — it just sets
-  // cleared_upto_message_id to the current last message, which resolveEffectiveHistory
-  // (code-session.ts) and the frontend transcript both cut at. /resume un-hides it by setting
-  // that marker back to null — the messages were never deleted, so resuming restores the
-  // conversation exactly as it was. Both blocked while a run is active, same rationale as
-  // /compact: clearing/resuming out from under a turn mid-flight against the OLD history frame
+  // WITHOUT touching the session's repo/worktree/branch or deleting anything — it DEACTIVATES
+  // (is_active=0) every message up to and including the current last one (v34/ADR-261, the SAME
+  // mechanism /revert uses), so getMessages()/getConversation() drop them from every consumer at
+  // the source (the model's replay via resolveEffectiveHistory, session export, and the transcript
+  // alike); clearedUpToMessageId records the cut so /resume knows the range. /resume REACTIVATES
+  // (is_active=1) that same prefix and nulls the marker — the messages were never deleted, so it
+  // restores the conversation exactly as it was. Both blocked while a run is active, same rationale
+  // as /compact: clearing/resuming out from under a turn mid-flight against the OLD history frame
   // is confusing regardless of whether it would technically corrupt anything. ALSO blocked while
   // reverted (v33) — /clear and revert are two independent resumable hidden-states; stacking them
   // on one session would leave /resume ambiguous about which one it's undoing.
@@ -334,6 +370,13 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
     const lastMsg = (conv?.messages ?? []).at(-1)
     if (!lastMsg) return err(c, 400, 'nothing_to_clear', 'Nothing to clear yet.')
     if (run.clearedUpToMessageId === lastMsg.id) return err(c, 400, 'nothing_to_clear', 'Already cleared up to the latest message.')
+    // Real deactivation (v34, ADR-261): is_active=0 on the whole prefix up to AND including the
+    // current last message — the SAME mechanism /revert uses — so cleared history disappears from
+    // getMessages()/getConversation() at the source (session export, the model's own replay via
+    // resolveEffectiveHistory, and the transcript), not just a client-side display slice that left
+    // the rows is_active=1 (the export-leak bug this fixes). clearedUpToMessageId still records the
+    // cut so /resume knows the exact range to reactivate.
+    db.deactivateMessagesUpTo(run.convId, lastMsg.id)
     db.setClearedUpToMessageId(id, lastMsg.id)
     return c.json({ ok: true, clearedUpToMessageId: lastMsg.id })
   })
@@ -351,6 +394,10 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
       return c.json({ ok: true })
     }
     if (!run.clearedUpToMessageId) return err(c, 400, 'not_cleared', 'This session has not been cleared.')
+    // Real reactivation (v34) — is_active=1 on the same prefix /clear deactivated, the mirror of the
+    // /revert branch above. A turn added AFTER the clear has a higher seq than the cut, so it's
+    // untouched; only the originally-cleared history comes back.
+    db.reactivateMessagesUpTo(run.convId, run.clearedUpToMessageId)
     db.setClearedUpToMessageId(id, null)
     return c.json({ ok: true })
   })
@@ -415,6 +462,129 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
     return c.json({ ok: true, revertedFromMessageId: messageId, revertText: cut.revertText, revertedFiles, failedFiles })
   })
 
+  // ── git status / commit / push / PR-link (Phase 3, ADR-259) ───────────────────────────────
+  // Real `git` subprocess calls in the session's own repoRoot — see git-actions.ts's own header
+  // for the full scope note (commit+push only, no gh/GitHub-API call, push never forces).
+  //
+  // /git/status is read-only against the filesystem, so — unlike commit/push below — it does NOT
+  // gate on runs.isActive(id): a live agent turn's own bash/edit tool calls are already reading
+  // and writing that same working tree concurrently, and a `git status` racing with them is no
+  // different from a human running one in a second terminal (same as a plain read, not a
+  // conflicting mutation). Deliberately NOT gated on clearedUpToMessageId/revertedFromMessageId
+  // either — those are conversation-history hidden-states, an orthogonal concern from the actual
+  // git working tree.
+  app.get('/api/v1/code/sessions/:id/git/status', async (c) => {
+    const run = db.getAgentRun(c.req.param('id'))
+    if (!run) return err(c, 404, 'not_found', 'Session not found.')
+    if (!run.repoRoot) return err(c, 400, 'invalid_input', 'Session has no repo root.')
+    const status = await getGitStatus(run.repoRoot)
+    return c.json({ ok: true, status })
+  })
+
+  // Commit and push DO gate on runs.isActive(id) — same discipline as /compact, /clear, /revert
+  // above: a live turn's own edit/write tool calls mutate this exact working tree, so staging or
+  // committing concurrently risks capturing a file mid-write. (The pi tool-call approval gate,
+  // waitForToolApproval/resolveToolApproval, is a different mechanism for a different shape of
+  // action — it exists to gate the MODEL interrupting a live turn to ask permission for a tool
+  // call; these are plain user-triggered REST actions with no live turn or toolCallId involved at
+  // all, so the run_active 409 below — the same guard every other repo-mutating Code route already
+  // uses — is the correct fit, not a bypass of the approval gate.)
+  app.post('/api/v1/code/sessions/:id/git/commit', async (c) => {
+    const id = c.req.param('id')
+    const run = db.getAgentRun(id)
+    if (!run) return err(c, 404, 'not_found', 'Session not found.')
+    if (!run.repoRoot) return err(c, 400, 'invalid_input', 'Session has no repo root.')
+    if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop or wait for the current run before committing.')
+    const b = await body<{ message?: string; files?: string[] }>(c)
+    try {
+      const result = await commitGitChanges(run.repoRoot, b.message ?? '', b.files)
+      return c.json({ ok: true, ...result })
+    } catch (e) {
+      const message = e instanceof Error ? e.message : 'Commit failed.'
+      if (/commit message is required/i.test(message)) return err(c, 400, 'invalid_input', message)
+      if (/not a git repository/i.test(message)) return err(c, 400, 'not_a_git_repo', message)
+      if (/nothing to commit|nothing staged/i.test(message)) return err(c, 400, 'nothing_to_commit', message)
+      if (/outside the repo/i.test(message)) return err(c, 400, 'invalid_input', message)
+      return err(c, 500, 'git_commit_failed', message)
+    }
+  })
+
+  app.post('/api/v1/code/sessions/:id/git/push', async (c) => {
+    const id = c.req.param('id')
+    const run = db.getAgentRun(id)
+    if (!run) return err(c, 404, 'not_found', 'Session not found.')
+    if (!run.repoRoot) return err(c, 400, 'invalid_input', 'Session has no repo root.')
+    if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop or wait for the current run before pushing.')
+    const result = await pushGitBranch(run.repoRoot)
+    if (!result.ok) {
+      const status = result.reason === 'diverged' ? 409 : 400
+      return err(c, status, result.reason, result.message)
+    }
+    const compareUrl = await getGithubCompareUrl(run.repoRoot, result.branch)
+    return c.json({ ok: true, remote: result.remote, branch: result.branch, compareUrl })
+  })
+
+  // Standalone lookup (independent of push) — lets the UI offer "Create PR" for a branch that
+  // was already pushed by a previous session/turn, without pushing again.
+  app.get('/api/v1/code/sessions/:id/git/compare-url', async (c) => {
+    const run = db.getAgentRun(c.req.param('id'))
+    if (!run) return err(c, 404, 'not_found', 'Session not found.')
+    if (!run.repoRoot) return err(c, 400, 'invalid_input', 'Session has no repo root.')
+    const status = await getGitStatus(run.repoRoot)
+    if (!status.isRepo || status.detached || !status.branch) return c.json({ ok: true, compareUrl: null })
+    const compareUrl = await getGithubCompareUrl(run.repoRoot, status.branch)
+    return c.json({ ok: true, compareUrl })
+  })
+
+  // `!command` / `!!command` shell escape (ADR-258) — the USER runs a shell command in the session
+  // repoRoot (via the same robust-bash wrapper the agent's own bash tool uses). Gated on
+  // runs.isActive, same discipline as commit/push/compact/revert: a user command can mutate the
+  // working tree, and `feedToModel` additionally writes a conversation message that a live turn's
+  // history is mid-use of. `feedToModel` (the `!` variant) persists the command + its output as a
+  // user message so the model sees it as context on the next turn (seedPriorHistory replays a user
+  // message's content verbatim); `!!` passes false — the output is returned for a transcript-only
+  // peek and nothing is persisted.
+  app.post('/api/v1/code/sessions/:id/exec', async (c) => {
+    const id = c.req.param('id')
+    const run = db.getAgentRun(id)
+    if (!run) return err(c, 404, 'not_found', 'Session not found.')
+    if (!run.repoRoot) return err(c, 400, 'invalid_input', 'Session has no repo root.')
+    if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop or wait for the current run before running a command.')
+    const b = await body<{ command?: string; feedToModel?: boolean }>(c)
+    const command = (b.command ?? '').trim()
+    if (!command) return err(c, 400, 'invalid_input', 'A command is required.')
+    const feedToModel = b.feedToModel !== false // default true (the `!` variant); `!!` sends false
+
+    let result
+    try {
+      result = await runShellCommand(command, run.repoRoot, id)
+    } catch (e) {
+      return err(c, 500, 'exec_failed', e instanceof Error ? e.message : 'Command failed to run.')
+    }
+
+    let messageId: string | undefined
+    if (feedToModel) {
+      const msg = db.addMessage(run.convId, 'user', shellContextText(result), {
+        toolCalls: [{
+          id: `shell-${Date.now()}`,
+          name: 'shell',
+          args: { command, exitCode: result.exitCode, timedOut: result.timedOut },
+          result: result.output,
+        }],
+      })
+      messageId = msg.id
+    }
+    return c.json({
+      ok: true,
+      command,
+      output: result.output,
+      exitCode: result.exitCode,
+      timedOut: result.timedOut,
+      truncated: result.truncated,
+      messageId,
+    }, 200)
+  })
+
   // ── stop the in-flight run (+ drop the queue) ─────────────────────────────────
   app.post('/api/v1/code/sessions/:id/stop', (c) => {
     const id = c.req.param('id')
@@ -441,7 +611,12 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
   // that is how a follow-up submitted mid-run survives a disconnect and still fires in order.
   app.post('/api/v1/code/sessions/:id/messages', async (c) => {
     const id = c.req.param('id')
-    const b = await body<{ content?: string; promptOverride?: string; contextFiles?: string[]; thinkingBudget?: number }>(c)
+    const b = await body<{ content?: string; promptOverride?: string; contextFiles?: string[]; thinkingBudget?: number; kind?: string }>(c)
+    // How to deliver this message when a run is already active (Phase 1, ADR-246): 'steer'
+    // redirects the CURRENTLY ACTIVE turn, 'followUp' queues a fresh turn behind it. Anything
+    // else — including the field being omitted by the not-yet-updated frontend — defaults to
+    // 'followUp', which is byte-for-byte today's behavior (zero change for existing callers).
+    const kind: SteerKind = b.kind === 'steer' ? 'steer' : 'followUp'
 
     const run = db.getAgentRun(id)
     if (!run) return err(c, 404, 'not_found', 'Session not found.')
@@ -456,20 +631,20 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
     if (ms.state !== 'running' || !ms.model) return err(c, 409, 'model_not_loaded', 'Load a model first.')
     if (!d.manager.target()) return err(c, 409, 'model_not_loaded', 'Engine not running.')
 
-    // The task for this turn: an explicit follow-up body wins; otherwise the last user message
+    // The task for this turn: an explicit message body wins; otherwise the last user message
     // (the seeded task on the first run).
-    const followUp = (b.content ?? '').trim()
+    const newContent = (b.content ?? '').trim()
     let userMsgId: string
     let task: string
-    if (followUp) {
-      userMsgId = db.addMessage(run.convId, 'user', followUp, { textAttachments: b.contextFiles }).id
+    if (newContent) {
+      userMsgId = db.addMessage(run.convId, 'user', newContent, { textAttachments: b.contextFiles }).id
       // promptOverride lets the CALLER separate "what's stored/shown" from "what's actually
       // prompted this turn" — the founder's own literal message must never be silently rewritten
       // (see CodeSessionScreen.tsx's skill-invocation picker, the one caller of this today), but
       // the model still needs an explicit nudge to invoke a picked skill. Future turns' history
-      // replay always uses the STORED message (followUp), never the override, so past turns read
+      // replay always uses the STORED message (newContent), never the override, so past turns read
       // back as what the user actually said, not the synthetic nudge that steered that one turn.
-      task = contextFilesBlock(b.contextFiles) + ((b.promptOverride ?? '').trim() || followUp)
+      task = contextFilesBlock(b.contextFiles) + ((b.promptOverride ?? '').trim() || newContent)
     } else {
       const lastUser = (conv.messages ?? []).filter((m) => m.role === 'user').at(-1)
       if (!lastUser) return err(c, 400, 'no_task', 'No task to run.')
@@ -477,8 +652,17 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
       task = contextFilesBlock(lastUser.textAttachments) + lastUser.content
     }
 
-    const { queued } = runs.enqueue(id, { convId: run.convId, repoRoot: run.repoRoot, task, userMsgId, thinkingBudget: b.thinkingBudget })
-    return c.json({ ok: true, queued, userMessageId: userMsgId }, 202)
+    // 'steer' tries to inject into the live turn (falling back to the queue if there's nothing to
+    // steer); 'followUp' (the default) queues a fresh turn exactly as before. `steered` tells the
+    // caller which happened — the frontend renders an injected message inline instead of as a
+    // pending "Queued" chip.
+    const enqueueParams = { convId: run.convId, repoRoot: run.repoRoot, task, userMsgId, thinkingBudget: b.thinkingBudget }
+    if (kind === 'steer') {
+      const { steered, queued } = await runs.steer(id, enqueueParams)
+      return c.json({ ok: true, queued, steered, userMessageId: userMsgId }, 202)
+    }
+    const { queued } = runs.enqueue(id, enqueueParams)
+    return c.json({ ok: true, queued, steered: false, userMessageId: userMsgId }, 202)
   })
 
   // ── (re)connect to a session's run stream (SSE) ───────────────────────────────
@@ -506,6 +690,10 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
       if (meta) await stream.writeSSE({ event: 'meta', data: JSON.stringify(meta) })
       // Current server-side queue snapshot, so the client's "Queued" chips are correct on connect.
       await stream.writeSSE({ event: 'queue', data: JSON.stringify({ queued: runs.queued(id) }) })
+      // Current step checklist snapshot (ADR-255), so a mid-turn (re)connect shows live progress up
+      // front. Only when non-empty — no point emitting an empty checklist on every connect.
+      const currentTodos = runs.todos(id)
+      if (currentTodos.length > 0) await stream.writeSSE({ event: 'todos', data: JSON.stringify({ todos: currentTodos }) })
 
       for await (const ev of sub) {
         // The `id:` field carries the seq so the client can reconnect with ?fromSeq=<last id>.

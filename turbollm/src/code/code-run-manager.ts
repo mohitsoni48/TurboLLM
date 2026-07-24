@@ -27,8 +27,14 @@ import { EventEmitter } from 'node:events'
 import type { Deps } from '../deps'
 import type { ToolCallRecord, MessageTimelineBlock } from '../chat/db'
 import { autoTitleFromConversation } from '../chat/chat-routes'
-import { runCodeSession } from './code-session'
+import { runCodeSession, type SteerHandle, type TodoItem } from './code-session'
 import type { CodeMode } from './persona'
+
+/** How a new message submitted while a run is active should be delivered (Phase 1, ADR-246):
+ *  `'steer'` interrupts and redirects the CURRENTLY ACTIVE turn (pi's session.steer), `'followUp'`
+ *  waits its turn in the server-side queue and runs as a fresh turn after (today's behavior, and
+ *  the default when a caller omits it — the not-yet-updated frontend). */
+export type SteerKind = 'steer' | 'followUp'
 
 /** The one function the manager drives per turn. Defaults to the real pi-SDK `runCodeSession`;
  *  injectable so the daemon-ownership + reconnect mechanism can be exercised deterministically
@@ -87,12 +93,19 @@ interface PendingTurn {
   userMsgId: string
   /** -1 = unlimited (default), 0 = off, N>0 = a real token cap — see RunCodeParams.thinkingBudget. */
   thinkingBudget: number
+  /** What the caller requested for this message — recorded even for a queued entry so the UI can
+   *  distinguish a steer that fell back to the queue from a plain follow-up (see SteerKind). */
+  kind: SteerKind
 }
 
 interface ActiveTurn {
   ac: AbortController
   assistantMsgId: string
   userMsgId: string
+  /** The live turn's steer handle, set by runCodeSession's onSteerable once its pi session is
+   *  streaming and cleared (null) when it settles. Lets steer() inject into THIS turn instead of
+   *  queueing a fresh one. null while the session is still starting up or already finishing. */
+  steer: SteerHandle | null
 }
 
 interface SessionState {
@@ -107,6 +120,11 @@ interface SessionState {
    *  already-persisted earlier turn); bumped to buffer.head() when the session goes idle (so
    *  a fresh reconnect replays nothing and hands straight off to the DB transcript). */
   replayFloor: number
+  /** The latest todo/step checklist the active turn emitted via update_todos (ADR-255), held so a
+   *  (re)connecting client gets the current list up front (like the queue), not only if it happened
+   *  to be watching when the frame streamed. Reset to [] at the start of each turn — a checklist is
+   *  the CURRENT turn's plan, never carried over from a prior one. */
+  todos: TodoItem[]
   cleanupTimer?: ReturnType<typeof setTimeout>
 }
 
@@ -141,8 +159,14 @@ export class CodeRunManager {
    *  message queue, surfaced to the UI so its "Queued" chips survive a disconnect. `userMsgId`
    *  (not just index) identifies each entry so a per-chip action (sendNow) can target one
    *  specific queued turn even if two queued tasks have identical text. */
-  queued(sessionId: string): { userMsgId: string; task: string }[] {
-    return this.sessions.get(sessionId)?.queue.map((t) => ({ userMsgId: t.userMsgId, task: t.task })) ?? []
+  queued(sessionId: string): { userMsgId: string; task: string; kind: SteerKind }[] {
+    return this.sessions.get(sessionId)?.queue.map((t) => ({ userMsgId: t.userMsgId, task: t.task, kind: t.kind })) ?? []
+  }
+
+  /** The active turn's current todo/step checklist (ADR-255), for a (re)connecting client to show
+   *  up front. Empty when no turn has emitted one this turn (or the session is unknown). */
+  todos(sessionId: string): TodoItem[] {
+    return this.sessions.get(sessionId)?.todos ?? []
   }
 
   /** The in-flight turn's message ids, so a reconnecting stream can synthesize a `meta` frame
@@ -157,7 +181,7 @@ export class CodeRunManager {
     if (!s) {
       const emitter = new EventEmitter()
       emitter.setMaxListeners(0) // unbounded: many tabs may watch one session
-      s = { convId, repoRoot, buffer: new RingBuffer(), emitter, queue: [], active: null, replayFloor: 0 }
+      s = { convId, repoRoot, buffer: new RingBuffer(), emitter, queue: [], active: null, replayFloor: 0, todos: [] }
       this.sessions.set(sessionId, s)
     }
     if (s.cleanupTimer) { clearTimeout(s.cleanupTimer); s.cleanupTimer = undefined }
@@ -171,13 +195,43 @@ export class CodeRunManager {
    *
    * `queued` is true when the turn had to wait (a run was already active), false when it started.
    */
-  enqueue(sessionId: string, params: { convId: string; repoRoot: string; task: string; userMsgId: string; thinkingBudget?: number }): { queued: boolean } {
+  enqueue(sessionId: string, params: { convId: string; repoRoot: string; task: string; userMsgId: string; thinkingBudget?: number; kind?: SteerKind }): { queued: boolean } {
     const s = this.ensure(sessionId, params.convId, params.repoRoot)
     const willQueue = s.active !== null
-    s.queue.push({ task: params.task, userMsgId: params.userMsgId, thinkingBudget: params.thinkingBudget ?? -1 })
+    s.queue.push({ task: params.task, userMsgId: params.userMsgId, thinkingBudget: params.thinkingBudget ?? -1, kind: params.kind ?? 'followUp' })
     this.emitQueue(sessionId)
     void this.pump(sessionId)
     return { queued: willQueue }
+  }
+
+  /**
+   * Steer a message into the CURRENTLY ACTIVE turn (pi's session.steer, reached via the handle
+   * runCodeSession registers) so it redirects the running turn instead of queueing a fresh one
+   * behind it.
+   *
+   * Falls back to enqueue() (follow-up/queue) rather than erroring when there is nothing live to
+   * steer — either no active turn at all, or the active turn stopped streaming in the moment
+   * before we reached it (a race: the turn just finished). In the fallback the message is never
+   * dropped; it simply runs as the next turn instead, and its queue entry keeps kind:'steer' so
+   * the UI can still tell it apart from a plain follow-up.
+   *
+   * Returns `steered` (delivered into the live turn) and, when it wasn't, `queued` (whether the
+   * fallback had to wait behind an active turn, mirroring enqueue's own return).
+   */
+  async steer(
+    sessionId: string,
+    params: { convId: string; repoRoot: string; task: string; userMsgId: string; thinkingBudget?: number },
+  ): Promise<{ steered: boolean; queued: boolean }> {
+    const active = this.sessions.get(sessionId)?.active
+    if (active?.steer) {
+      try {
+        if (await active.steer(params.task)) return { steered: true, queued: false }
+      } catch {
+        // A steer that can't be delivered live still runs — fall through to the queue below.
+      }
+    }
+    const { queued } = this.enqueue(sessionId, { ...params, kind: 'steer' })
+    return { steered: false, queued }
   }
 
   /** The most recent real ctxUsed/ctxMax on record for this conversation (the last assistant
@@ -231,11 +285,14 @@ export class CodeRunManager {
     // empty placeholder whose id the live block dedups against (CodeTranscript liveAssistantId).
     const assistantMsg = this.d.db.addMessage(s.convId, 'assistant', '', { stats: { aborted: false } })
     const ac = new AbortController()
-    s.active = { ac, assistantMsgId: assistantMsg.id, userMsgId: turn.userMsgId }
+    s.active = { ac, assistantMsgId: assistantMsg.id, userMsgId: turn.userMsgId, steer: null }
 
     // Only this turn (from its meta onward) is replayable to a fresh reconnect — earlier turns
     // are already DB-persisted messages.
     s.replayFloor = s.buffer.head()
+    // A checklist belongs to the CURRENT turn — clear any list a prior turn left behind so a
+    // reconnect to this fresh turn (before the model emits its own todos) shows nothing stale.
+    s.todos = []
 
     const push = (event: string, data: unknown) => {
       const ss = this.sessions.get(sessionId)
@@ -268,6 +325,13 @@ export class CodeRunManager {
         else timeline.push({ type: 'text', text: delta })
       }
       else if (ev.event === 'reasoning') reasoning += String(data.delta ?? '')
+      else if (ev.event === 'todos') {
+        // Hold the latest checklist in live state so a (re)connecting client gets it up front (the
+        // stream handler snapshots runs.todos on connect) — the frame is already normalized by the
+        // update_todos tool. Ephemeral: never DB-persisted, just carried for reconnect like queue.
+        const ss = this.sessions.get(sessionId)
+        if (ss) ss.todos = Array.isArray(data.todos) ? (data.todos as TodoItem[]) : []
+      }
       else if (ev.event === 'tool_call' && (data.status === 'done' || data.status === 'error')) {
         const id = String(data.id ?? '')
         toolCalls.push({
@@ -305,6 +369,13 @@ export class CodeRunManager {
         task: turn.task,
         signal: ac.signal,
         sink,
+        // Publish/withdraw the live turn's steer handle so steer() can inject into THIS turn.
+        // Reads s.active fresh each call (rather than closing over the ActiveTurn captured above)
+        // so a null clear can't accidentally resurrect a handle onto a since-replaced turn.
+        onSteerable: (steer) => {
+          const cur = this.sessions.get(sessionId)?.active
+          if (cur && cur.ac === ac) cur.steer = steer
+        },
       })
 
       const finalContent = content.trim() || result.finalText

@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  archiveCodeSession, clearCodeSession, deleteCodeSession, getCodeSession, getCodeStats, listCodeSessions,
-  resumeCodeSession, updateCodeSessionMode, updateCodeSessionTitle,
+  archiveCodeSession, clearCodeSession, commitCodeSessionGit, deleteCodeSession, downloadCodeSessionExport,
+  getCodeSession, getCodeSessionCompareUrl, getCodeSessionGitStatus, getCodeStats, listCodeSessions,
+  pushCodeSessionGit, resumeCodeSession, updateCodeSessionMode, updateCodeSessionTitle,
 } from './code-api'
 import type { CodeSessionFilter, CodeStatsRange } from './code-types'
+import { ApiError } from './api'
 import { toast } from '../components/ui/sonner'
 
 export const codeKeys = {
@@ -157,4 +159,68 @@ export function useCodeSessionRename(sessionId: string | undefined, currentTitle
   }
 
   return { editing, draft, setDraft, start, cancel, commit }
+}
+
+/** Triggers a session's Markdown export as a real browser download. A mutation (not a plain
+ *  click handler) purely for its built-in `isPending`/`isError` state — nothing here needs
+ *  cache invalidation, since export reads already-persisted data without changing it. */
+export function useExportCodeSession() {
+  return useMutation({
+    mutationFn: (sessionId: string) => downloadCodeSessionExport(sessionId),
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not export this session.'),
+  })
+}
+
+/** Git status for the session's repoRoot (branch, per-file changes, ahead/behind, remote info) —
+ *  only fetched while `enabled` (the git actions dialog is open), not polled continuously: unlike
+ *  the session list/detail queries, nothing needs live git state while the dialog is closed. */
+export function useCodeSessionGitStatus(sessionId: string | null, enabled: boolean) {
+  return useQuery({
+    queryKey: ['code-session-git-status', sessionId],
+    queryFn: () => getCodeSessionGitStatus(sessionId!),
+    enabled: !!sessionId && enabled,
+    retry: false,
+    staleTime: 0,
+  })
+}
+
+/** Commits, then invalidates this session's git status so the dialog immediately reflects the
+ *  now-clean (or partially-clean) working tree without a manual refetch. */
+export function useCommitCodeSessionGit() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (v: { sessionId: string; message: string; files?: string[] }) =>
+      commitCodeSessionGit(v.sessionId, v.message, v.files),
+    onSuccess: (_d, v) => void qc.invalidateQueries({ queryKey: ['code-session-git-status', v.sessionId] }),
+  })
+}
+
+/** Pushes the current branch. Resolves to a typed `PushGitResult` (never throws for the expected
+ *  rejection cases — see code-api.ts's pushCodeSessionGit) — invalidates git status AND the
+ *  compare-url lookup below on any attempt, successful or not, since even a rejected push can
+ *  change ahead/behind (a `git fetch` isn't run here, but a future status check should still
+ *  re-derive from the current repo state rather than serve a stale cached one). */
+export function usePushCodeSessionGit() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (sessionId: string) => pushCodeSessionGit(sessionId),
+    onSettled: (_d, _e, sessionId) => {
+      void qc.invalidateQueries({ queryKey: ['code-session-git-status', sessionId] })
+      void qc.invalidateQueries({ queryKey: ['code-session-compare-url', sessionId] })
+    },
+  })
+}
+
+/** Standalone "Create PR" link lookup — for a branch already pushed by an EARLIER session/turn,
+ *  so the dialog can offer it even before this session's own Push button is ever clicked. Only
+ *  fetched while the git dialog is open and the branch isn't detached (mirrors
+ *  useCodeSessionGitStatus's own enabled-gating). */
+export function useCodeSessionCompareUrl(sessionId: string | null, enabled: boolean) {
+  return useQuery({
+    queryKey: ['code-session-compare-url', sessionId],
+    queryFn: () => getCodeSessionCompareUrl(sessionId!),
+    enabled: !!sessionId && enabled,
+    retry: false,
+    staleTime: 0,
+  })
 }

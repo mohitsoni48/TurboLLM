@@ -152,6 +152,23 @@ export function dependencyDisciplineGuidance(): string {
   ].join(' ')
 }
 
+/** Todo/step tracker guidance (ADR-255) — nudges the model to surface a live checklist for a
+ *  genuinely multi-step task via the update_todos tool (registered in code-session.ts), the same
+ *  way lspGuidance explains install_lsp. Deliberately NOT mandatory: for a trivial single-action
+ *  request a checklist is noise, so the guidance scopes it to multi-step work. Non-plan only (like
+ *  edit/LSP guidance): plan mode's whole deliverable is already a written step-by-step plan, so a
+ *  parallel live checklist there would just duplicate it. */
+export function todoTrackerGuidance(): string {
+  return [
+    'For a task with several distinct steps, call update_todos to give the user a live checklist:',
+    'send the full list of steps (each { content, status }) when you start, mark a step in_progress',
+    'when you begin it and completed as soon as it is done, and re-send the WHOLE list on every',
+    'update (it replaces the previous one). This shows the user the plan and real progress instead',
+    'of an opaque run of tool calls. Do NOT use it for trivial single-step requests — a one-item',
+    'checklist is just noise.',
+  ].join(' ')
+}
+
 /** The pi tool set for a Code mode. plan is READ-ONLY (its real safety mechanism): mutating
  *  tools simply aren't in the toolset, so nothing reaches the containment/approval hook to gate.
  *  auto/ask use pi's DEFAULT tool set (read/bash/edit/write) — returned as `undefined` so the
@@ -239,6 +256,7 @@ export function buildAppendPrompt(mode: CodeMode, skills: Skill[] = [], agentsMd
   if (mode !== 'plan') {
     blocks.push(editReliabilityGuidance())
     blocks.push(lspGuidance())
+    blocks.push(todoTrackerGuidance())
   }
   // Only when web_search/fetch_url are actually registered — see antiFallbackGuidance's comment.
   if (hasWebTools) {

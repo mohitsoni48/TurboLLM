@@ -28,6 +28,21 @@ export interface CodeSession {
    *  deactivated (not deleted; /resume reactivates it). Mutually exclusive with
    *  clearedUpToMessageId. Undefined = never reverted, or resumed back from one. */
   revertedFromMessageId?: string
+  /** True when a run is live in the daemon right now (not merely the persisted status, which
+   *  collapses 'running'/'queued' into 'review' for display) — drives the sidebar's live
+   *  indicator for a session running in the background, tab not open (ADR-256). Currently only
+   *  populated by GET /api/v1/code/sessions/:id (session detail); GET /api/v1/code/sessions (the
+   *  sidebar list) does not send it yet — undefined until that's added. */
+  running?: boolean
+}
+
+/** One step in the model's own plan for the CURRENT turn (ADR-255) — driven by pi's
+ *  `update_todos` custom tool, relayed live via the `todos` SSE event below. Ephemeral: the
+ *  backend clears its todos at the start of every new turn, so a checklist never carries over
+ *  from a prior turn (it won't re-assert until the model calls `update_todos` again). */
+export interface TodoItem {
+  content: string
+  status: 'pending' | 'in_progress' | 'completed'
 }
 
 export type CodeSessionFilter = 'active' | 'archived' | 'all'
@@ -47,12 +62,65 @@ export interface CreateCodeSessionParams {
   contextFiles?: string[]
 }
 
+/** How a submitted message is delivered when a run is already active (Phase 1, ADR-246):
+ *  'steer' redirects the CURRENTLY ACTIVE turn (pi's `session.steer`), 'followUp' queues a fresh
+ *  turn behind it. A 'steer' that arrives too late to inject falls back to the queue still tagged
+ *  'steer'. Backend defaults to 'followUp' (byte-for-byte the pre-ADR-246 behavior). */
+export type SteerKind = 'steer' | 'followUp'
+
 /** One entry in the server-side message queue (turns waiting behind the active one).
- *  `userMsgId` identifies the entry (not just its text) so a per-chip action — e.g. "Send now"
+ *  `userMsgId` identifies the entry (not just its text) so a per-entry action — e.g. "Send now"
  *  — can target one specific queued turn even if two queued tasks have identical text. */
 export interface QueuedTurn {
   userMsgId: string
   task: string
+  /** Which delivery the turn was submitted as — drives the inline queued card's steer-vs-follow-up
+   *  badge. Backend tags every queued entry (default 'followUp'). */
+  kind: SteerKind
+}
+
+/** POST /api/v1/code/sessions/:id/messages request body (start or queue a turn). */
+export interface CodeSendMessageBody {
+  content?: string
+  promptOverride?: string
+  contextFiles?: string[]
+  thinkingBudget?: number
+  /** Delivery mode when a run is already active — 'steer' redirects the live turn, 'followUp'
+   *  (default) queues behind it. Omitted = 'followUp'. */
+  kind?: SteerKind
+}
+
+/** POST .../messages response (202). `steered` is true ONLY when a 'steer' actually injected into
+ *  a live turn; a steer that fell back to the queue, or any 'followUp', reports `steered: false`. */
+export interface CodeSendMessageResponse {
+  ok: true
+  queued: boolean
+  steered: boolean
+  userMessageId: string
+}
+
+/** POST .../exec response — a user-run `!command`/`!!command` shell escape (ADR-258). `messageId`
+ *  is set only for the `!` variant (feedToModel), which persists the command+output as a user
+ *  message the model reads next turn; `!!` returns output for a transcript-only peek. */
+export interface CodeExecResponse {
+  ok: true
+  command: string
+  output: string
+  exitCode: number | null
+  timedOut: boolean
+  truncated: boolean
+  messageId?: string
+}
+
+/** One transcript-only `!!command` result (never persisted) — held in client state and rendered at
+ *  the transcript tail. `!command` results are NOT this shape; they come back as a persisted
+ *  message carrying a `shell` tool call. */
+export interface ShellRun {
+  id: string
+  command: string
+  output: string
+  exitCode: number | null
+  timedOut: boolean
 }
 
 // SSE event payloads for GET /api/v1/code/sessions/:id/stream (code-routes.ts). Reuses
@@ -67,6 +135,21 @@ export type CodeSseEvent =
   | { event: 'tool_call'; data: { id: string; name: string; args: Record<string, unknown>; status: 'pending' | 'done' | 'error' | 'awaiting_approval'; result?: string; diff?: string; patch?: string; firstChangedLine?: number } }
   | { event: 'queue';     data: { queued: QueuedTurn[] } }
   | { event: 'compaction'; data: { phase: 'start' | 'end'; reason: 'manual' | 'threshold' | 'overflow'; aborted?: boolean; tokensBefore?: number } }
+  // Phase 2 (ADR-249/250) — pi's own agentic-loop signals, relayed by code-session.ts:
+  //   'turn': an agentic ROUND boundary within one assistant turn (a model→tools→model cycle),
+  //     NOT a message delta. `toolResults` (end only) is how many tool results that round produced.
+  //   'retry': pi's auto-retry on a transient provider failure — `start` carries the triggering
+  //     error + backoff, `end` reports whether the retry eventually succeeded.
+  //   'tool_progress': a CUMULATIVE (not incremental) live-output snapshot from a tool that streams
+  //     progress (bash does; edit doesn't) — correlate to the live tool card by `id`, replace-not-append.
+  | { event: 'turn';      data: { phase: 'start'; index: number } | { phase: 'end'; index: number; toolResults: number } }
+  | { event: 'retry';     data: { phase: 'start'; attempt: number; maxAttempts: number; delayMs: number; message: string } | { phase: 'end'; attempt: number; success: boolean; message?: string } }
+  | { event: 'tool_progress'; data: { id: string; name: string; partial: string } }
+  // 'todos' (ADR-255): the model's current plan for THIS turn, via pi's `update_todos` tool.
+  // Full-list replace each time, not incremental — same "cumulative snapshot" shape as
+  // tool_progress. The backend resets its own todos at the start of every new turn, so this
+  // frame simply won't re-fire until the model calls update_todos again for the new one.
+  | { event: 'todos';     data: { todos: TodoItem[] } }
   | { event: 'done';      data: { contextUsed: number; contextMax: number; aborted: boolean } }
   | { event: 'error';     data: { code: string; message: string } }
 
@@ -98,3 +181,37 @@ export interface CodeStats {
   favoriteModel: string | null
   heatmap: CodeStatsDay[]
 }
+
+// ── Git actions (Phase 3, ADR-259) — GET/POST /api/v1/code/sessions/:id/git/* ──────────────────
+// Mirrors turbollm/src/code/git-actions.ts's own types exactly; see that file for the full
+// scope note (commit+push only, no gh/GitHub-API call, push never forces).
+
+export interface GitFileStatus {
+  path: string
+  /** Raw two-character porcelain status code (e.g. 'M ', '??', ' D', 'AM') — rendered as-is
+   *  rather than re-interpreted, so no meaning is lost or guessed at client-side. */
+  code: string
+}
+
+export interface GitStatusResult {
+  isRepo: boolean
+  /** '' for an unborn HEAD (brand-new repo, no commits yet) or a detached HEAD. */
+  branch: string
+  detached: boolean
+  files: GitFileStatus[]
+  hasRemote: boolean
+  hasUpstream: boolean
+  ahead: number
+  behind: number
+}
+
+export interface CommitGitResult {
+  hash: string
+  filesCommitted: number
+}
+
+export type PushGitReason = 'not_a_repo' | 'no_remote' | 'detached_head' | 'diverged' | 'push_failed'
+
+export type PushGitResult =
+  | { ok: true; remote: string; branch: string; compareUrl: string | null }
+  | { ok: false; reason: PushGitReason; message: string }

@@ -111,3 +111,10 @@ test('buildAppendPrompt: LSP guidance appears in auto/ask but not plan mode (no 
   assert.ok(auto.some((b) => b.includes('LSP diagnostics for')))
   assert.ok(!plan.some((b) => b.includes('LSP diagnostics for')))
 })
+
+test('buildAppendPrompt: todo-tracker guidance (update_todos) appears in auto/ask but not plan mode', () => {
+  assert.ok(buildAppendPrompt('auto').some((b) => b.includes('call update_todos')))
+  assert.ok(buildAppendPrompt('ask').some((b) => b.includes('call update_todos')))
+  // Plan mode's deliverable is already a written step list, so no live checklist guidance there.
+  assert.ok(!buildAppendPrompt('plan').some((b) => b.includes('call update_todos')))
+})

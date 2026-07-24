@@ -13,10 +13,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { toolsForMode, buildAppendPrompt, skillsBlock, skillCatalogBlock, type CodeMode } from './persona'
 import { toSessionStatus, resolveRevertCut } from './code-routes'
-import { MUTATING_TOOLS, PATH_TOOLS, resolveEffectiveHistory, compactCodeSession, isDependencyAddCommand, compactionSettingsFor, keepRecentTokensFor, ToolLoopTracker, toolCallSignature, LOOP_BREAK_AFTER } from './code-session'
+import { MUTATING_TOOLS, PATH_TOOLS, resolveEffectiveHistory, compactCodeSession, isDependencyAddCommand, compactionSettingsFor, keepRecentTokensFor, ToolLoopTracker, toolCallSignature, LOOP_BREAK_AFTER, codeEventToFrame, validateDelegateTask, normalizeDelegateResult, DELEGATE_SUBAGENT_TIMEOUT_MS, normalizeTodos, summarizeTodos, MAX_TODOS, type TodoItem } from './code-session'
 import { ConversationStore, type Message } from '../chat/db'
 import type { Deps } from '../deps'
 import type { Skill } from '../agents/skills'
+import type { AgentSessionEvent } from '@earendil-works/pi-coding-agent'
 
 // ── toolsForMode ──────────────────────────────────────────────────────────────────
 
@@ -168,6 +169,57 @@ test('reactivateMessagesFrom: a NEW message sent after a revert is unaffected by
   // Resuming (undoing) the revert brings attempt 1 back WITHOUT disturbing attempt 2.
   store.reactivateMessagesFrom(convId, m1.id)
   assert.deepEqual(store.getMessages(convId).map((m) => m.content), ['first task', 'second task (attempt 1)', 'second task (attempt 2)'])
+})
+
+// ── deactivateMessagesUpTo / reactivateMessagesUpTo (db.ts) — the /clear PREFIX deactivation (v34,
+// ADR-261). The mirror of deactivateMessagesFrom's suffix: /clear hides everything up to AND
+// INCLUDING the cut, so getMessages()/getConversation()/export/model-replay all exclude it at the
+// source (is_active=0), replacing the old client-only clearedUpToMessageId display cursor. --------
+
+test('deactivateMessagesUpTo: deactivates the cut message AND everything before it, leaving later turns active', () => {
+  const { store, convId } = makeRevertConv()
+  store.addMessage(convId, 'user', 'old task')
+  const oldReply = store.addMessage(convId, 'assistant', 'old reply')
+  store.addMessage(convId, 'user', 'newer, kept turn')
+
+  const affected = store.deactivateMessagesUpTo(convId, oldReply.id)
+  assert.equal(affected, 2, 'the two messages at/before the cut')
+  assert.deepEqual(store.getMessages(convId).map((m) => m.content), ['newer, kept turn'], 'everything at/before the cut is hidden; the later turn stays')
+})
+
+test('deactivateMessagesUpTo: an unknown message id is a no-op (0 rows), never throws', () => {
+  const { store, convId } = makeRevertConv()
+  store.addMessage(convId, 'user', 'task')
+  assert.equal(store.deactivateMessagesUpTo(convId, 'does-not-exist'), 0)
+  assert.equal(store.getMessages(convId).length, 1, 'untouched')
+})
+
+test('reactivateMessagesUpTo: undoes a /clear exactly, restoring the cleared prefix (the /resume contract)', () => {
+  const { store, convId } = makeRevertConv()
+  store.addMessage(convId, 'user', 'first')
+  const cut = store.addMessage(convId, 'assistant', 'first reply')
+  store.deactivateMessagesUpTo(convId, cut.id)
+  assert.equal(store.getMessages(convId).length, 0, 'the whole history is cleared')
+
+  const restored = store.reactivateMessagesUpTo(convId, cut.id)
+  assert.equal(restored, 2)
+  assert.deepEqual(store.getMessages(convId).map((m) => m.content), ['first', 'first reply'])
+})
+
+test('reactivateMessagesUpTo: a NEW turn appended AFTER a /clear is unaffected by a later /resume (step-6 case)', () => {
+  const { store, convId } = makeRevertConv()
+  store.addMessage(convId, 'user', 'A')
+  const cut = store.addMessage(convId, 'assistant', 'B') // clear cut here
+  store.deactivateMessagesUpTo(convId, cut.id)
+  // A brand-new turn after the clear — higher seq than the cut, so it must never be touched by the
+  // clear's own resume, and it must remain visible throughout.
+  store.addMessage(convId, 'user', 'C (new turn after clear)')
+  assert.deepEqual(store.getMessages(convId).map((m) => m.content), ['C (new turn after clear)'])
+
+  // /resume reactivates ONLY the originally-cleared prefix (seq <= cut); the new turn is already
+  // active and stays exactly once, not duplicated or disturbed.
+  store.reactivateMessagesUpTo(convId, cut.id)
+  assert.deepEqual(store.getMessages(convId).map((m) => m.content), ['A', 'B', 'C (new turn after clear)'])
 })
 
 // ── tool-set contracts ──────────────────────────────────────────────────────────────
@@ -326,10 +378,11 @@ test('buildAppendPrompt: plan omits edit guidance; auto/ask include it', () => {
   const plan = buildAppendPrompt('plan')
   const auto = buildAppendPrompt('auto')
   const ask = buildAppendPrompt('ask')
-  // Plan mode has no edit tool, so the edit-reliability and LSP blocks are both dropped.
+  // Plan mode has no edit tool, so the edit-reliability, LSP, and todo-tracker blocks are all
+  // dropped there (auto/ask get basePersona + mode + edit + lsp + todo = 5).
   assert.equal(plan.length, 2)
-  assert.equal(auto.length, 4)
-  assert.equal(ask.length, 4)
+  assert.equal(auto.length, 5)
+  assert.equal(ask.length, 5)
   assert.ok(plan.every((b) => typeof b === 'string' && b.length > 0))
   // Every mode's guidance mentions its own name.
   assert.match(plan[1], /PLAN/)
@@ -369,11 +422,11 @@ test('skillsBlock: caps a pathological instructions body at 20,000 chars', () =>
 })
 
 test('buildAppendPrompt: with no skills argument, output is unchanged from before Task 4', () => {
-  // basePersona + modeGuidance always; +editReliabilityGuidance +lspGuidance outside plan mode
-  // (plan has no edit tool, see buildAppendPrompt's own comment); hasWebTools defaults false so
-  // the item 1/2 blocks are omitted here (covered separately in persona.test.ts).
+  // basePersona + modeGuidance always; +editReliabilityGuidance +lspGuidance +todoTrackerGuidance
+  // outside plan mode (plan has no edit tool, see buildAppendPrompt's own comment); hasWebTools
+  // defaults false so the item 1/2 blocks are omitted here (covered separately in persona.test.ts).
   for (const m of ['auto', 'plan', 'ask'] as CodeMode[]) {
-    assert.equal(buildAppendPrompt(m).length, m === 'plan' ? 2 : 4)
+    assert.equal(buildAppendPrompt(m).length, m === 'plan' ? 2 : 5)
   }
 })
 
@@ -491,12 +544,15 @@ test('resolveEffectiveHistory: a compaction marker pointing at a deleted/missing
 
 // ── resolveEffectiveHistory + /clear + /resume ───────────────────────────────────────
 
-test('resolveEffectiveHistory: after a /clear marker — no summary, only messages after the cut', () => {
+test('resolveEffectiveHistory: after a /clear (v34 — real deactivation) — no summary, only the still-active post-clear messages', () => {
   const { d, store, convId, sessionId } = makeCodeConv()
   store.addMessage(convId, 'user', 'old task')
   const oldReply = store.addMessage(convId, 'assistant', 'old reply')
   store.addMessage(convId, 'user', 'new task')
 
+  // A real /clear now DEACTIVATES the prefix (is_active=0) AND records the marker — mirror both, so
+  // getConversation/getMessages already excludes the cleared messages (no cursor slice here anymore).
+  store.deactivateMessagesUpTo(convId, oldReply.id)
   store.setClearedUpToMessageId(sessionId, oldReply.id)
 
   const { summaryText, messages } = resolveEffectiveHistory(d, convId, sessionId)
@@ -514,10 +570,11 @@ test('resolveEffectiveHistory: a /clear after an earlier /compact wins — blank
   store.addMessage(convId, 'user', 'newest task 3')
 
   store.updateAgentRun(sessionId, { compactionSummary: 'summary of task 1', compactionUpToMessageId: oldReply.id })
-  store.setClearedUpToMessageId(sessionId, newReply.id) // clears everything up through the compacted turn too
+  store.deactivateMessagesUpTo(convId, newReply.id) // /clear deactivates everything through the compacted turn too
+  store.setClearedUpToMessageId(sessionId, newReply.id)
 
   const { summaryText, messages } = resolveEffectiveHistory(d, convId, sessionId)
-  assert.equal(summaryText, null)
+  assert.equal(summaryText, null) // the earlier compaction summary is behind the clear — dropped
   assert.equal(messages.length, 1)
   assert.equal(messages[0].content, 'newest task 3')
 })
@@ -530,7 +587,11 @@ test('resolveEffectiveHistory: /resume (clearing the marker back to null) restor
   const newReply = store.addMessage(convId, 'assistant', 'new reply 2')
 
   store.updateAgentRun(sessionId, { compactionSummary: 'summary of task 1', compactionUpToMessageId: oldReply.id })
+  // /clear (deactivate + marker), then /resume (reactivate + null the marker) — the round trip must
+  // restore full history AND the earlier compaction summary, exactly as if the clear never happened.
+  store.deactivateMessagesUpTo(convId, newReply.id)
   store.setClearedUpToMessageId(sessionId, newReply.id)
+  store.reactivateMessagesUpTo(convId, newReply.id)
   store.setClearedUpToMessageId(sessionId, null) // /resume
 
   const { summaryText, messages } = resolveEffectiveHistory(d, convId, sessionId)
@@ -540,10 +601,13 @@ test('resolveEffectiveHistory: /resume (clearing the marker back to null) restor
   assert.equal(messages[1].content, 'new reply 2')
 })
 
-test('resolveEffectiveHistory: an unresolvable /clear marker (deleted/missing message id) falls through to compaction-only behavior', () => {
+test('resolveEffectiveHistory: a set /clear marker drops any summary and returns only active messages (blank-slate path)', () => {
   const { d, store, convId, sessionId } = makeCodeConv()
   store.addMessage(convId, 'user', 'task')
   store.addMessage(convId, 'assistant', 'reply')
+  // A set clear marker takes the blank-slate branch regardless of the marker resolving to a specific
+  // row — the cleared messages are is_active=0 at the source, so `all` is whatever stays active. Here
+  // nothing was deactivated (a defensive stale-marker case), so both raw messages remain, no summary.
   store.setClearedUpToMessageId(sessionId, 'does-not-exist')
 
   const { summaryText, messages } = resolveEffectiveHistory(d, convId, sessionId)
@@ -651,4 +715,217 @@ test('ToolLoopTracker: reset() clears the count (new top-level turn)', () => {
   t.record('bash', { command: 'npm test' })
   t.reset()
   assert.equal(t.record('bash', { command: 'npm test' }), 1)
+})
+
+// ── codeEventToFrame (code-session.ts) — pi AgentSessionEvent → SSE frame map (Phase 2, ADR-250).
+// The live agentic loop that PRODUCES these events is out of scope here (needs a loaded model),
+// same as the rest of this file — but the pure event→frame contract the relay depends on is fully
+// testable without one. This is exactly what the relay closure now delegates to. ------------------
+
+// codeEventToFrame only reads a handful of fields per event; a minimal literal cast to the union
+// is enough to exercise it without constructing full AgentMessage/ToolResultMessage shapes.
+const evt = (e: Record<string, unknown>): AgentSessionEvent => e as unknown as AgentSessionEvent
+const freshCounter = () => ({ index: 0 })
+
+test('codeEventToFrame: message_update text_delta → a delta frame (existing behavior preserved)', () => {
+  const frame = codeEventToFrame(evt({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'hi' } }), freshCounter())
+  assert.deepEqual(frame, { event: 'delta', data: { delta: 'hi' } })
+})
+
+test('codeEventToFrame: message_update thinking_delta → a reasoning frame (existing behavior preserved)', () => {
+  const frame = codeEventToFrame(evt({ type: 'message_update', assistantMessageEvent: { type: 'thinking_delta', delta: 'hmm' } }), freshCounter())
+  assert.deepEqual(frame, { event: 'reasoning', data: { delta: 'hmm' } })
+})
+
+test('codeEventToFrame: a message_update sub-event we do not surface → null (no stray frame)', () => {
+  assert.equal(codeEventToFrame(evt({ type: 'message_update', assistantMessageEvent: { type: 'tool_call_delta', delta: 'x' } }), freshCounter()), null)
+})
+
+test('codeEventToFrame: compaction_start / compaction_end → compaction frames (existing behavior preserved)', () => {
+  assert.deepEqual(
+    codeEventToFrame(evt({ type: 'compaction_start', reason: 'threshold' }), freshCounter()),
+    { event: 'compaction', data: { phase: 'start', reason: 'threshold' } },
+  )
+  assert.deepEqual(
+    codeEventToFrame(evt({ type: 'compaction_end', reason: 'threshold', aborted: false, result: { tokensBefore: 5000 } }), freshCounter()),
+    { event: 'compaction', data: { phase: 'end', reason: 'threshold', aborted: false, tokensBefore: 5000 } },
+  )
+})
+
+test('codeEventToFrame: turn_start / turn_end → turn frames sharing one index; the counter advances on end', () => {
+  const counter = freshCounter()
+  assert.deepEqual(codeEventToFrame(evt({ type: 'turn_start' }), counter), { event: 'turn', data: { phase: 'start', index: 0 } })
+  assert.equal(counter.index, 0, 'turn_start does not advance the counter')
+  assert.deepEqual(codeEventToFrame(evt({ type: 'turn_end', message: {}, toolResults: [{}, {}] }), counter), { event: 'turn', data: { phase: 'end', index: 0, toolResults: 2 } })
+  assert.equal(counter.index, 1, 'turn_end advances the counter so the next turn gets a fresh index')
+  // The next turn's start/end share index 1 (a start/end pair is always one number).
+  assert.deepEqual(codeEventToFrame(evt({ type: 'turn_start' }), counter), { event: 'turn', data: { phase: 'start', index: 1 } })
+})
+
+test('codeEventToFrame: auto_retry_start → a retry frame with attempt/max/delay + the error message', () => {
+  const frame = codeEventToFrame(evt({ type: 'auto_retry_start', attempt: 2, maxAttempts: 5, delayMs: 1500, errorMessage: 'rate limited' }), freshCounter())
+  assert.deepEqual(frame, { event: 'retry', data: { phase: 'start', attempt: 2, maxAttempts: 5, delayMs: 1500, message: 'rate limited' } })
+})
+
+test('codeEventToFrame: auto_retry_end → a retry frame carrying success and the final error (if any)', () => {
+  assert.deepEqual(
+    codeEventToFrame(evt({ type: 'auto_retry_end', success: true, attempt: 3 }), freshCounter()),
+    { event: 'retry', data: { phase: 'end', attempt: 3, success: true, message: undefined } },
+  )
+  assert.deepEqual(
+    codeEventToFrame(evt({ type: 'auto_retry_end', success: false, attempt: 5, finalError: 'gave up' }), freshCounter()),
+    { event: 'retry', data: { phase: 'end', attempt: 5, success: false, message: 'gave up' } },
+  )
+})
+
+test('codeEventToFrame: tool_execution_update → a tool_progress frame with the flattened partial text', () => {
+  const frame = codeEventToFrame(evt({
+    type: 'tool_execution_update', toolCallId: 'tc1', toolName: 'bash',
+    args: { command: 'ls' }, partialResult: { content: [{ type: 'text', text: 'line1\n' }, { type: 'text', text: 'line2\n' }], details: undefined },
+  }), freshCounter())
+  assert.deepEqual(frame, { event: 'tool_progress', data: { id: 'tc1', name: 'bash', partial: 'line1\nline2\n' } })
+})
+
+test('codeEventToFrame: tool_execution_update with an empty/odd partialResult yields partial "" (never throws)', () => {
+  // The bash tool emits an initial empty snapshot ({ content: [] }); non-text/absent content is
+  // defended against since partialResult is typed `any`.
+  assert.deepEqual(
+    codeEventToFrame(evt({ type: 'tool_execution_update', toolCallId: 't', toolName: 'bash', args: {}, partialResult: { content: [] } }), freshCounter()),
+    { event: 'tool_progress', data: { id: 't', name: 'bash', partial: '' } },
+  )
+  assert.deepEqual(
+    codeEventToFrame(evt({ type: 'tool_execution_update', toolCallId: 't', toolName: 'bash', args: {}, partialResult: null }), freshCounter()),
+    { event: 'tool_progress', data: { id: 't', name: 'bash', partial: '' } },
+  )
+})
+
+test('codeEventToFrame: lifecycle events that would DUPLICATE the tool_call pending/done frames are not surfaced', () => {
+  // tool_execution_start/_end mirror the pending/done tool_call frames the extension hooks already
+  // emit — relaying them too would double-render every call, so they must map to null. Likewise for
+  // the message/agent boundary events the relay doesn't use.
+  const counter = freshCounter()
+  for (const type of ['tool_execution_start', 'tool_execution_end', 'message_start', 'message_end', 'agent_start', 'agent_settled', 'entry_appended']) {
+    assert.equal(codeEventToFrame(evt({ type }), counter), null, `${type} must not produce a frame`)
+  }
+  assert.equal(counter.index, 0, 'unsurfaced events never touch the turn counter')
+})
+
+// ── delegate_task pure helpers (code-session.ts) — the subagent/task-delegation tool (ADR-259).
+// The live nested sub-session (runDelegatedSubSession, needs a loaded model) is out of scope here,
+// same as runSkillSubSession and the rest of this file; its resource-contention correctness rests
+// on GenerationGate, which gate.test.ts already proves (single-holder serialization, fg-preempt,
+// abort/timeout self-heal). These cover the tool's own pure input/result decision logic. -----------
+
+test('validateDelegateTask: a real task string is accepted and trimmed', () => {
+  assert.deepEqual(validateDelegateTask('  investigate the auth flow  '), { ok: true, task: 'investigate the auth flow' })
+})
+
+test('validateDelegateTask: empty, whitespace-only, or non-string input is rejected with a usable message', () => {
+  for (const bad of ['', '   ', '\n\t', undefined, null, 42, {}]) {
+    const r = validateDelegateTask(bad as unknown)
+    assert.equal(r.ok, false, `expected rejection for ${JSON.stringify(bad)}`)
+    if (!r.ok) assert.match(r.message, /non-empty description/)
+  }
+})
+
+test('normalizeDelegateResult: a completed sub-agent returns its final text, trimmed', () => {
+  assert.equal(normalizeDelegateResult('  the summary of what I did  '), 'the summary of what I did')
+})
+
+test('normalizeDelegateResult: an empty completed result becomes an explicit no-output placeholder (never "")', () => {
+  assert.equal(normalizeDelegateResult('   '), '(the delegated sub-agent produced no output.)')
+})
+
+test('normalizeDelegateResult: a timed-out run is reported as INCOMPLETE and carries any partial text', () => {
+  const out = normalizeDelegateResult('got halfway through the refactor', { timedOut: true, timeoutMs: 5 * 60_000 })
+  assert.match(out, /did not finish within ~5 minute/)
+  assert.match(out, /INCOMPLETE/)
+  assert.match(out, /Partial progress before it was stopped:\ngot halfway through the refactor/)
+})
+
+test('normalizeDelegateResult: a timed-out run with NO partial output omits the partial section', () => {
+  const out = normalizeDelegateResult('', { timedOut: true })
+  assert.match(out, /did not finish/)
+  assert.doesNotMatch(out, /Partial progress/)
+  // Falls back to the module default timeout when timeoutMs is omitted.
+  assert.match(out, new RegExp(`~${Math.round(DELEGATE_SUBAGENT_TIMEOUT_MS / 60_000)} minute`))
+})
+
+test('DELEGATE_SUBAGENT_TIMEOUT_MS: is a sane positive bound (minutes, not ms typo)', () => {
+  assert.ok(DELEGATE_SUBAGENT_TIMEOUT_MS >= 60_000 && DELEGATE_SUBAGENT_TIMEOUT_MS <= 30 * 60_000)
+})
+
+// ── update_todos pure helpers (code-session.ts) — the todo/step progress tracker (ADR-255). The
+// live tool (registered on a running pi session) is out of scope here, same as the rest of this
+// file; these cover the model-facing input coercion + the confirmation summary. --------------------
+
+test('normalizeTodos: passes through a clean list, trimming content and keeping order', () => {
+  const raw = [
+    { content: '  Add the route  ', status: 'completed' },
+    { content: 'Wire the UI', status: 'in_progress' },
+    { content: 'Write tests', status: 'pending' },
+  ]
+  assert.deepEqual(normalizeTodos(raw), [
+    { content: 'Add the route', status: 'completed' },
+    { content: 'Wire the UI', status: 'in_progress' },
+    { content: 'Write tests', status: 'pending' },
+  ])
+})
+
+test('normalizeTodos: a non-array (or missing) argument is an empty list, never a throw', () => {
+  for (const bad of [undefined, null, 'nope', 42, {}]) {
+    assert.deepEqual(normalizeTodos(bad as unknown), [])
+  }
+})
+
+test('normalizeTodos: drops entries with empty/whitespace/non-string content', () => {
+  const raw = [
+    { content: 'keep me', status: 'pending' },
+    { content: '   ', status: 'pending' },
+    { content: '', status: 'pending' },
+    { content: 123, status: 'pending' },
+    { status: 'pending' }, // no content at all
+    'not an object',
+    null,
+  ]
+  assert.deepEqual(normalizeTodos(raw), [{ content: 'keep me', status: 'pending' }])
+})
+
+test('normalizeTodos: an unknown/missing status defaults to pending (never a bogus status)', () => {
+  const raw = [
+    { content: 'a', status: 'done' },      // 'done' is not a valid status (it's 'completed')
+    { content: 'b' },                       // missing status
+    { content: 'c', status: 'in_progress' }, // valid, preserved
+  ]
+  assert.deepEqual(normalizeTodos(raw), [
+    { content: 'a', status: 'pending' },
+    { content: 'b', status: 'pending' },
+    { content: 'c', status: 'in_progress' },
+  ])
+})
+
+test('normalizeTodos: caps the list at MAX_TODOS', () => {
+  const raw = Array.from({ length: MAX_TODOS + 25 }, (_, i) => ({ content: `step ${i}`, status: 'pending' }))
+  const out = normalizeTodos(raw)
+  assert.equal(out.length, MAX_TODOS)
+  assert.equal(out[0].content, 'step 0')
+})
+
+test('summarizeTodos: reports counts of done and in-progress steps', () => {
+  const todos: TodoItem[] = [
+    { content: 'a', status: 'completed' },
+    { content: 'b', status: 'completed' },
+    { content: 'c', status: 'in_progress' },
+    { content: 'd', status: 'pending' },
+  ]
+  assert.equal(summarizeTodos(todos), 'Tracking 4 step(s): 2/4 done, 1 in progress.')
+})
+
+test('summarizeTodos: omits the in-progress clause when nothing is in progress', () => {
+  const todos: TodoItem[] = [{ content: 'a', status: 'completed' }, { content: 'b', status: 'pending' }]
+  assert.equal(summarizeTodos(todos), 'Tracking 2 step(s): 1/2 done.')
+})
+
+test('summarizeTodos: an empty list reads as an explicit clear', () => {
+  assert.equal(summarizeTodos([]), 'Todo list cleared.')
 })

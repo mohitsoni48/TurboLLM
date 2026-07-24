@@ -28,6 +28,9 @@ export function CopyButton({
       type="button"
       onClick={handle}
       title={copied ? 'Copied!' : 'Copy'}
+      // Real accessible name always, not just a title tooltip — matters most for the icon-only
+      // case (no `label` passed), where the button otherwise has no accessible name at all.
+      aria-label={copied ? 'Copied' : (label ?? 'Copy')}
       className={`inline-flex items-center gap-1.5 rounded transition-colors ${
         copied ? '' : 'text-faint hover:text-ink'
       } ${padding} ${className ?? ''}`}

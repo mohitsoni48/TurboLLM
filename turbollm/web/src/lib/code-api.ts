@@ -1,7 +1,11 @@
 // Code launchpad API client — mirrors chat-api.ts's conventions (req() helper, the
 // hand-rolled SSE line parser) against turbollm/src/code/code-routes.ts.
 import type { Conversation } from './chat-types'
-import type { CodeSession, CodeSessionFilter, CodeStats, CodeStatsRange, CodeStreamEvent, CreateCodeSessionParams, QueuedTurn } from './code-types'
+import type {
+  CodeExecResponse, CodeSendMessageBody, CodeSendMessageResponse, CodeSession, CodeSessionFilter, CodeStats,
+  CodeStatsRange, CodeStreamEvent, CommitGitResult, CreateCodeSessionParams, GitStatusResult, PushGitReason,
+  PushGitResult, QueuedTurn, SteerKind, TodoItem,
+} from './code-types'
 import { ApiError, authHeaders } from './api'
 import { markCodeAuthNeeded, clearCodeAuthNeeded } from './auth-signal'
 
@@ -86,6 +90,9 @@ export interface CodeSessionDetail {
   /** Turns waiting behind the active one (server-side queue) — restores the "Queued" chips
    *  after a reload/reconnect. */
   queued: QueuedTurn[]
+  /** The live turn's current checklist, if the run is active — reflects the daemon's in-memory
+   *  state (reset per turn), same reconnect-resilience purpose as `queued`. */
+  todos: TodoItem[]
 }
 export function getCodeSession(id: string): Promise<CodeSessionDetail> {
   return req(`/api/v1/code/sessions/${encodeURIComponent(id)}`)
@@ -130,23 +137,42 @@ export function compactCodeSession(id: string, instructions?: string): Promise<{
  *  typed message (see CodeSessionScreen.tsx's skill picker — it used to rewrite `content` itself,
  *  which the founder explicitly asked to stop). `contextFiles`, when given, are absolute paths
  *  picked via the composer's "Add context" file browser — stored as attachment chips on the
- *  message, folded server-side into a "read this file" nudge for this turn's prompt. */
+ *  message, folded server-side into a "read this file" nudge for this turn's prompt. `kind`
+ *  (Phase 1, ADR-246) chooses how the turn is delivered while a run is already active — 'steer'
+ *  redirects the live turn, 'followUp' (default when omitted) queues behind it; the response's
+ *  `steered` reports whether a 'steer' actually injected live vs. fell back to the queue. */
 export async function startCodeRun(
   sessionId: string,
   content: string,
   thinkingBudget?: number,
   promptOverride?: string,
   contextFiles?: string[],
-): Promise<{ ok: true; queued: boolean; userMessageId: string }> {
-  return req(`/api/v1/code/sessions/${encodeURIComponent(sessionId)}/messages`, {
-    method: 'POST',
-    json: {
-      content: content || undefined,
-      promptOverride: promptOverride || undefined,
-      contextFiles: contextFiles?.length ? contextFiles : undefined,
-      thinkingBudget: thinkingBudget !== undefined && thinkingBudget !== -1 ? thinkingBudget : undefined,
-    },
-  })
+  kind?: SteerKind,
+): Promise<CodeSendMessageResponse> {
+  const body: CodeSendMessageBody = {
+    content: content || undefined,
+    promptOverride: promptOverride || undefined,
+    contextFiles: contextFiles?.length ? contextFiles : undefined,
+    thinkingBudget: thinkingBudget !== undefined && thinkingBudget !== -1 ? thinkingBudget : undefined,
+    kind,
+  }
+  return req(`/api/v1/code/sessions/${encodeURIComponent(sessionId)}/messages`, { method: 'POST', json: body })
+}
+
+/** `!command` / `!!command` shell escape (ADR-258): run `command` in the session's repo root.
+ *  `feedToModel` true (the `!` variant) persists the command+output as a user message the model
+ *  reads next turn (response carries its `messageId`); false (`!!`) is a transcript-only peek. */
+export function execShellCommand(id: string, command: string, feedToModel: boolean): Promise<CodeExecResponse> {
+  return req(`/api/v1/code/sessions/${encodeURIComponent(id)}/exec`, { method: 'POST', json: { command, feedToModel } })
+}
+
+/** Confirmation copy for a `steer` send — the daemon can silently fall back to queuing the message
+ *  if the live turn already settled between the click and the request (`steered:false`), so the
+ *  toast reports which actually happened rather than assuming the steer landed. */
+export function steerOutcomeMessage(steered: boolean): string {
+  return steered
+    ? 'Steered into the current turn.'
+    : 'Queued to run next — the current turn had already moved on.'
 }
 
 /** (Re)connect to a session's run stream from `fromSeq` (the last ring-buffer seq already seen;
@@ -201,4 +227,87 @@ export async function* streamCodeSession(
   } finally {
     reader.releaseLock()
   }
+}
+
+// ── Session export (Phase 3, ADR-251) ───────────────────────────────────────────────────────
+// GET .../export returns the raw file body (not JSON, so it bypasses req()) with a real
+// Content-Disposition attachment filename — read that back rather than re-deriving a filename
+// client-side, so the export's name always matches exactly what the server actually sent.
+const CONTENT_DISPOSITION_FILENAME_RE = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i
+
+/** Fetches a session's Markdown export and triggers a real browser download (Blob + a
+ *  temporary `<a download>` click, immediately revoked) — no server-side file write, per
+ *  `turbollm/CLAUDE.md`'s cross-platform/no-stray-paths rule. Throws `ApiError` on a non-OK
+ *  response, same shape every other Code API call throws, so callers can toast.error() it
+ *  uniformly. */
+export async function downloadCodeSessionExport(sessionId: string, format: 'markdown' = 'markdown'): Promise<void> {
+  const res = await fetch(`/api/v1/code/sessions/${encodeURIComponent(sessionId)}/export?format=${format}`, {
+    method: 'GET',
+    headers: { ...authHeaders() },
+  })
+  if (res.status === 401) markCodeAuthNeeded()
+  else if (res.ok) clearCodeAuthNeeded()
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    const env = (() => { try { return JSON.parse(text) } catch { return undefined } })() as { error?: { code?: string; message?: string } } | undefined
+    throw new ApiError(env?.error?.code ?? 'http_error', env?.error?.message ?? `Export failed with status ${res.status}.`, res.status)
+  }
+  const disposition = res.headers.get('Content-Disposition') ?? ''
+  const filename = CONTENT_DISPOSITION_FILENAME_RE.exec(disposition)?.[1]?.trim() || `code-session.${format === 'markdown' ? 'md' : format}`
+  const blob = await res.blob()
+  const url = URL.createObjectURL(blob)
+  try {
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+  } finally {
+    URL.revokeObjectURL(url)
+  }
+}
+
+// ── Git actions (Phase 3, ADR-259) ──────────────────────────────────────────────────────────
+// Thin clients over turbollm/src/code/git-actions.ts's routes — see that file's header for the
+// full scope note (commit+push only, no gh/GitHub-API call, push never forces).
+
+export function getCodeSessionGitStatus(sessionId: string): Promise<{ ok: true; status: GitStatusResult }> {
+  return req(`/api/v1/code/sessions/${encodeURIComponent(sessionId)}/git/status`)
+}
+
+/** `files` omitted stages everything (`git add -A`); given, stages ONLY those paths. Rejects
+ *  (ApiError) for every failure case — no message, not a repo, nothing to commit/stage, or a
+ *  containment violation — with a specific `error.code`/`message` from the route, not a generic
+ *  failure. */
+export function commitCodeSessionGit(sessionId: string, message: string, files?: string[]): Promise<{ ok: true } & CommitGitResult> {
+  return req(`/api/v1/code/sessions/${encodeURIComponent(sessionId)}/git/commit`, { method: 'POST', json: { message, files } })
+}
+
+const PUSH_GIT_REASONS: ReadonlySet<string> = new Set<PushGitReason>(['not_a_repo', 'no_remote', 'detached_head', 'diverged', 'push_failed'])
+
+/** Pushes the current branch (setting the upstream on first push). NEVER forces. Resolves to a
+ *  typed `PushGitResult` rather than throwing for the EXPECTED rejection cases (diverged, no
+ *  remote, detached HEAD, generic push failure) — the route sends those as a 400/409 whose
+ *  `error.code` is exactly one of {@link PushGitReason}, caught here and turned back into the
+ *  same discriminated union `git-actions.ts` returns server-side. A genuinely unexpected error
+ *  (session not found, no repo root at all) still throws `ApiError`, same as every other call. */
+export async function pushCodeSessionGit(sessionId: string): Promise<PushGitResult> {
+  try {
+    return await req<{ ok: true; remote: string; branch: string; compareUrl: string | null }>(
+      `/api/v1/code/sessions/${encodeURIComponent(sessionId)}/git/push`,
+      { method: 'POST', json: {} },
+    )
+  } catch (e) {
+    if (e instanceof ApiError && PUSH_GIT_REASONS.has(e.code)) {
+      return { ok: false, reason: e.code as PushGitReason, message: e.message }
+    }
+    throw e
+  }
+}
+
+/** Standalone PR-link lookup (independent of push) — for a branch already pushed by an earlier
+ *  session/turn. Never throws for "no link available"; `compareUrl` is simply null. */
+export function getCodeSessionCompareUrl(sessionId: string): Promise<{ ok: true; compareUrl: string | null }> {
+  return req(`/api/v1/code/sessions/${encodeURIComponent(sessionId)}/git/compare-url`)
 }

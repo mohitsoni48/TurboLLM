@@ -40,7 +40,7 @@
     "dev": "tsx watch src/cli.ts",
     "start": "tsx src/cli.ts",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test",
+    "test": "tsx --test \"src/**/*.test.ts\" \"web/src/lib/engine-groups.test.ts\" \"web/src/lib/personas.test.ts\" \"web/src/lib/tool-explain.test.ts\" \"web/src/lib/vram.test.ts\"",
     "build:web": "cd web && npm ci && npm run build",
     "build": "npm run typecheck && tsup && node -e \"const fs=require('fs'),p='dist/cli.js',c=fs.readFileSync(p,'utf8');fs.writeFileSync(p,c.replaceAll('from \\\"sqlite\\\"','from \\\"node:sqlite\\\"'))\" && node -e \"require('fs').cpSync('src/webdist','dist/webdist',{recursive:true,force:true})\"",
     "prepublishOnly": "npm run build:web && npm run build"
