@@ -516,7 +516,7 @@ export function registerApi(app: Hono, d: Deps): void {
       return err(c, 403, 'forbidden', 'Building an engine is only available on the machine running TurboLLM.')
     if (process.platform !== 'win32' && process.platform !== 'linux' && process.platform !== 'darwin')
       return err(c, 409, 'unsupported_platform', 'In-app build is currently Windows, Linux, or macOS only.')
-    const b = await body<{ repoUrl?: string; branch?: string; commit?: string; name?: string }>(c)
+    const b = await body<{ repoUrl?: string; branch?: string; commit?: string; name?: string; patchUrl?: string; patchSha256?: string }>(c)
     const repoUrl = (b.repoUrl ?? '').trim()
     if (!/^https?:\/\//i.test(repoUrl))
       return err(c, 400, 'invalid_config_value', 'A http(s) repo URL is required.')
@@ -528,6 +528,17 @@ export function registerApi(app: Hono, d: Deps): void {
     const commit = (b.commit ?? '').trim() || undefined
     if (commit && !/^[0-9a-f]{7,40}$/i.test(commit))
       return err(c, 400, 'invalid_config_value', 'commit must be a hex SHA (7-40 chars).')
+    // Optional pinned patch (solar_open2-class engines): both-or-neither — a patch is only ever
+    // applied with a checksum to verify it against (build-runner enforces this too; validate here
+    // so a bad request fails fast with a clear 400 instead of failing mid-build).
+    const patchUrl = (b.patchUrl ?? '').trim() || undefined
+    const patchSha256 = (b.patchSha256 ?? '').trim() || undefined
+    if (!!patchUrl !== !!patchSha256)
+      return err(c, 400, 'invalid_config_value', 'patchUrl and patchSha256 must be provided together — a patch may only be applied with a pinned checksum.')
+    if (patchUrl && !/^https?:\/\//i.test(patchUrl))
+      return err(c, 400, 'invalid_config_value', 'patchUrl must be an http(s) URL.')
+    if (patchSha256 && !/^[0-9a-f]{64}$/i.test(patchSha256))
+      return err(c, 400, 'invalid_config_value', 'patchSha256 must be a 64-char hex SHA-256.')
     const busy = engineWorkBusy(d)
     if (busy) return err(c, 409, 'engine_already_running', busy)
     const name = (b.name ?? '').trim() || undefined
@@ -544,7 +555,7 @@ export function registerApi(app: Hono, d: Deps): void {
         let out
         try {
           out = await runBuild(
-            { repoUrl, branch, commit, enginesRoot, toolchainDirs },
+            { repoUrl, branch, commit, patchUrl, patchSha256, enginesRoot, toolchainDirs },
             { phase: (p) => d.build.phase(p), log: (line) => d.build.log(line) },
             ac.signal,
           )
@@ -599,6 +610,7 @@ export function registerApi(app: Hono, d: Deps): void {
           sourceRepo: repoUrl,
           sourceBranch: branch,
           sourceCommit: commit,
+          sourcePatchUrl: patchUrl,
         })).engine
         d.registry.activate(eng.id)
         // A genuinely custom repo (not one of the catalog's own known projects) needs its
@@ -606,7 +618,7 @@ export function registerApi(app: Hono, d: Deps): void {
         // own doc comment. A catalog repo already gets equivalent treatment from the /catalog
         // endpoint's own disk scan, so it's deliberately excluded here.
         if (!isCatalogRepo(repoUrl)) {
-          d.registry.recordCustomSource({ name: eng.name, binPath: eng.binPath, kind: eng.kind, sourceRepo: repoUrl, sourceBranch: branch, sourceCommit: commit })
+          d.registry.recordCustomSource({ name: eng.name, binPath: eng.binPath, kind: eng.kind, sourceRepo: repoUrl, sourceBranch: branch, sourceCommit: commit, sourcePatchUrl: patchUrl })
         }
         d.build.log(`Registered "${eng.name}" — built from ${out.commit.slice(0, 8)}.`)
         d.build.done()
@@ -942,7 +954,7 @@ export function registerApi(app: Hono, d: Deps): void {
       if (recordSource && !purge && eng) {
         d.registry.recordCustomSource({
           name: eng.name, binPath: eng.binPath, kind: eng.kind,
-          sourceRepo: eng.sourceRepo, sourceBranch: eng.sourceBranch, sourceCommit: eng.sourceCommit,
+          sourceRepo: eng.sourceRepo, sourceBranch: eng.sourceBranch, sourceCommit: eng.sourceCommit, sourcePatchUrl: eng.sourcePatchUrl,
         })
       }
       d.registry.remove(id)

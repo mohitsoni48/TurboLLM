@@ -336,6 +336,15 @@ export type CatalogEngine = {
   installEndpoint: string
   comingSoon?: boolean
   note?: string
+  /** Pin the build-from-source to an exact commit (7-40 hex) — e.g. the commit a `patchUrl`
+   *  was authored against. */
+  sourceCommit?: string
+  /** URL of a unified-diff patch applied on top of `sourceCommit` before compiling (an arch not
+   *  yet in mainline, e.g. solar_open2). Sent to /build/run with `patchSha256`. */
+  patchUrl?: string
+  /** Pinned SHA-256 the downloaded `patchUrl` is verified against (backend hard-fails on a
+   *  mismatch). Set iff `patchUrl` is set. */
+  patchSha256?: string
   /** Whether this engine can run on the current OS. */
   supportedHere: boolean
   /** Whether the engine's files exist on disk (disk-based check). */

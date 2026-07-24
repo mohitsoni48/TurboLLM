@@ -193,7 +193,7 @@ export function getBuildPrereqs(): Promise<BuildPrereqs> {
 
 /** Start a 1-click in-app build (ADR-100). 202 immediately; progress streams via
  *  GET /api/v1/status `engineBuild`. Windows/Linux + CUDA only; local-host only. */
-export function runBuild(args: { repoUrl: string; branch?: string; name?: string }): Promise<{ accepted: boolean }> {
+export function runBuild(args: { repoUrl: string; branch?: string; commit?: string; name?: string; patchUrl?: string; patchSha256?: string }): Promise<{ accepted: boolean }> {
   return request('/api/v1/build/run', { method: 'POST', json: args })
 }
 

@@ -77,6 +77,15 @@ export interface CatalogEngine {
   comingSoon?: boolean
   /** Extra context shown under the card (support caveats, etc.). */
   note?: string
+  /** Pin the build-from-source to an exact commit SHA (7-40 hex). Set when the entry needs a
+   *  specific historical commit — e.g. one that a `patchUrl` was authored against. */
+  sourceCommit?: string
+  /** URL of a unified-diff patch applied on top of `sourceCommit` before compiling — for an
+   *  architecture not yet in the repo's mainline (e.g. solar_open2). Requires `patchSha256`. */
+  patchUrl?: string
+  /** Pinned lowercase 64-char hex SHA-256 the downloaded `patchUrl` is verified against before
+   *  it's applied (build-runner hard-fails on a mismatch). Set iff `patchUrl` is set. */
+  patchSha256?: string
   /** Installable variants (one per hardware path). Optional: llama.cpp derives
    *  its variants at call time via llamaCppVariants(); other engines list them
    *  inline or leave undefined (handled in later phases). */
@@ -471,6 +480,40 @@ const ALL: CatalogEngine[] = [
         requires: {},
         stability: 'experimental',
         speed: 'fast',
+        hasPrebuilt: false,
+      },
+    ],
+  },
+  {
+    id: 'solar-open2',
+    name: 'Solar Open 2 (patched llama.cpp)',
+    kind: 'llama-server',
+    description:
+      "Upstage's Solar Open 2 (250B-A15B MoE) isn't in mainline llama.cpp yet — this builds official llama.cpp at a pinned commit with a community patch that adds the solar_open2 architecture, then runs it on the standard llama-server path.",
+    provision: 'github-release',
+    // Builds the OFFICIAL llama.cpp repo (like the prism/beellama build-from-source cards, no
+    // real github-release asset is resolved) — pinned to the exact commit the patch was authored
+    // against, then the checksum-verified patch is applied before compiling. The patch is an
+    // INDEPENDENT community diff, NOT reviewed or endorsed by Upstage or upstream llama.cpp — same
+    // fork-provenance honesty as the prism/beellama entries above (Honesty rule at the top).
+    homepage: 'https://github.com/ggml-org/llama.cpp',
+    repo: 'ggml-org/llama.cpp',
+    sourceCommit: '846e991ec3c7ccec49112ff2c5b00b710e5f551d',
+    patchUrl: 'https://huggingface.co/prometheusAIR/Solar-Open2-250B-GGUF/resolve/main/solar_open2-llama.cpp.patch',
+    patchSha256: '998a9cef479d3b01f25e473793890b05b887a8ce85563431b3b053b14bb21fa8',
+    platforms: ['win32', 'darwin', 'linux'],
+    support: 'experimental',
+    installEndpoint: '',
+    note:
+      'Unofficial: applies an independent community patch (not affiliated with or reviewed by Upstage or upstream llama.cpp) on top of a pinned llama.cpp commit, verified against a pinned SHA-256 before it is applied. This is a 250B-total / ~15B-active MoE — the upstream port was tested on workstation-class hardware (128GB DDR5 + a 96GB RTX PRO 6000), not a typical consumer box; GGUF quants run ~89 GiB (Q2_K) to 191 GiB (Q6_K), with IQ4_XS (~127 GiB) recommended. Two known quirks on this arch: pass -ub 512 or -ub 4096 (a batch size of -ub 2048 crashes with a CUDA illegal-memory-access), and add --no-mmap for any CPU-offloaded setup (mmap page-faulting collapses throughput ~10x on this port).',
+    variants: [
+      {
+        id: 'solar-open2-source',
+        label: 'Build from source (patched)',
+        repo: 'ggml-org/llama.cpp',
+        requires: {},
+        stability: 'experimental',
+        speed: 'baseline',
         hasPrebuilt: false,
       },
     ],

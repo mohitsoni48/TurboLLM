@@ -103,6 +103,9 @@ export function BuildGuideDialog({
   repoUrl,
   engineName,
   branch,
+  commit,
+  patchUrl,
+  patchSha256,
   mode = 'build',
 }: {
   open: boolean
@@ -110,6 +113,14 @@ export function BuildGuideDialog({
   repoUrl: string
   engineName: string
   branch?: string
+  /** Pin the build to an exact commit (a catalog entry's `sourceCommit`) — undefined for the
+   *  usual branch-tip build. Required when a `patchUrl` must apply against a known commit. */
+  commit?: string
+  /** A pinned, checksum-verified patch to apply on top of `commit` before compiling (a catalog
+   *  entry's `patchUrl`/`patchSha256`). Both undefined for every non-patched entry, so their
+   *  request shape is unchanged. */
+  patchUrl?: string
+  patchSha256?: string
   /** 'rebuild' relabels the action for the ADR-088 "newer source" chip. */
   mode?: 'build' | 'rebuild'
 }) {
@@ -185,7 +196,9 @@ export function BuildGuideDialog({
 
   const startBuild = () => {
     setIntent('build')
-    build.start.mutate({ repoUrl, branch, name: engineName })
+    // commit/patchUrl/patchSha256 are only defined for a catalog entry that pins them (e.g.
+    // solar-open2); undefined for every other entry, so their request shape is unchanged.
+    build.start.mutate({ repoUrl, branch, commit, patchUrl, patchSha256, name: engineName })
   }
 
   const downloadCuda = () => {
