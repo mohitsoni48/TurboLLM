@@ -1,7 +1,7 @@
 services:
   turbollm:
     build:
-      context: ./deploy/runpod
+      context: .
       dockerfile: Dockerfile.amd
     image: turbollm-amd:latest
     container_name: turbollm-amd
