@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process'
 import os from 'node:os'
 import fs from 'node:fs'
 
-export type GpuVendor = 'nvidia' | 'amd' | 'intel' | 'apple' | 'unknown'
+export type GpuVendor = 'nvidia' | 'amd' | 'intel' | 'apple' | 'arm' | 'qualcomm' | 'unknown'
 
 export interface GpuInfo {
   name: string
@@ -26,8 +26,8 @@ export function getSysInfo(): SysInfo {
   if (cached) return cached
   cached = {
     os: `${process.platform}/${process.arch}`,
-    cpu: os.cpus()[0]?.model?.trim() ?? '',
-    cores: os.cpus().length || 1,
+    cpu: getCpuModel(),
+    cores: getCpuCoreCount(),
     ramMB: Math.round(os.totalmem() / 1e6),
     gpus: detectGpus(),
   }
@@ -38,7 +38,8 @@ export function getSysInfo(): SysInfo {
 export function primaryVendor(info: SysInfo = getSysInfo()): GpuVendor {
   // Prefer a discrete accelerator over an integrated one (Intel iGPU alongside
   // an NVIDIA/AMD dGPU is common): rank nvidia/amd/apple above intel.
-  const rank: Record<GpuVendor, number> = { nvidia: 4, amd: 3, apple: 3, intel: 2, unknown: 1 }
+  // Rank arm/qualcomm (mobile iGPUs) same as intel for Vulkan backend selection.
+  const rank: Record<GpuVendor, number> = { nvidia: 4, amd: 3, apple: 3, intel: 2, arm: 2, qualcomm: 2, unknown: 1 }
   let best: GpuVendor = 'unknown'
   for (const g of info.gpus) if (rank[g.vendor] > rank[best]) best = g.vendor
   return best
@@ -50,6 +51,8 @@ export function classifyVendor(name: string): GpuVendor {
   if (/amd|radeon|\brx\b|instinct|vega|firepro/.test(n)) return 'amd'
   if (/intel|arc|iris|\buhd\b|\bhd graphics\b/.test(n)) return 'intel'
   if (/apple/.test(n)) return 'apple'
+  if (/mali|immortalis/.test(n)) return 'arm'
+  if (/adreno/.test(n)) return 'qualcomm'
   return 'unknown'
 }
 
@@ -80,6 +83,9 @@ export function isIntegratedGpuName(name: string): boolean {
   // Intel's only current discrete lineup is Arc-branded, so any other Intel name
   // containing "graphics" with no Arc qualifier is integrated.
   if (/intel/.test(n) && /graphics/.test(n) && !/\barc\b/.test(n)) return true
+  // ARM Mali / Qualcomm Adreno mobile GPUs always share system RAM.
+  if (/mali|immortalis/.test(n)) return true
+  if (/adreno/.test(n)) return true
   return false
 }
 
@@ -122,7 +128,7 @@ function detectGpus(): GpuInfo[] {
     }
   }
 
-  // 3) AMD / Intel (and NVIDIA without nvidia-smi): enumerate adapters by name.
+  // 3) AMD / Intel / ARM / Qualcomm (and NVIDIA without nvidia-smi): enumerate adapters by name.
   //    VRAM is best-effort here; vendor is what backend selection needs.
   try {
     const gpus = process.platform === 'win32' ? enumWindowsGpus() : enumLinuxGpus()
@@ -296,33 +302,97 @@ export function parseRocmSmi(memJson: string, nameJson = ''): GpuInfo[] {
 }
 
 function enumLinuxGpus(): GpuInfo[] {
+  // 1) Desktop Linux path (lspci)
   // lspci gives vendor + name but no VRAM size; read VRAM per-adapter from
   // sysfs (linuxVramMb), matched by the adapter's PCI slot.
-  const out = execFileSync('sh', ['-c', "lspci -mm 2>/dev/null | grep -iE 'VGA|3D|Display'"], {
-    timeout: 8000,
-  }).toString()
-  return out
-    .trim()
-    .split('\n')
-    .filter(Boolean)
-    .map((line) => {
-      const vendor = classifyVendor(line)
-      const slot = line.trim().split(/\s+/)[0] ?? ''
-      const name = line.replace(/"/g, '').trim().slice(0, 80)
-      const sysfsVramMb = linuxVramMb(slot)
-      // sysfs's mem_info_vram_total only exists for amdgpu-driven cards (dedicated
-      // VRAM, or an APU's BIOS carveout) — Intel iGPUs / nouveau read 0 here, which
-      // means "no dedicated VRAM", not "no usable memory". Reporting that literal 0
-      // was making quant auto-selection always pick the smallest file and the fit
-      // check always show red, on hardware where the real constraint is different.
-      const vramMb = sysfsVramMb > 0
-        ? sysfsVramMb
-        : isIntegratedGpuName(name)
-          ? Math.round((os.totalmem() / 1e6) * 0.5)
-          : 0
-      return { name, vramMb, vendor }
-    })
-    .filter((g) => g.vendor !== 'unknown')
+  try {
+    const out = execFileSync('sh', ['-c', "lspci -mm 2>/dev/null | grep -iE 'VGA|3D|Display'"], {
+      timeout: 8000,
+    }).toString()
+    
+    if (out.trim()) {
+      const gpus = out
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => {
+          const vendor = classifyVendor(line)
+          const slot = line.trim().split(/\s+/)[0] ?? ''
+          const name = line.replace(/"/g, '').trim().slice(0, 80)
+          const sysfsVramMb = linuxVramMb(slot)
+          // sysfs's mem_info_vram_total only exists for amdgpu-driven cards (dedicated
+          // VRAM, or an APU's BIOS carveout) — Intel iGPUs / nouveau read 0 here, which
+          // means "no dedicated VRAM", not "no usable memory". Reporting that literal 0
+          // was making quant auto-selection always pick the smallest file and the fit
+          // check always show red, on hardware where the real constraint is different.
+          const vramMb = sysfsVramMb > 0
+            ? sysfsVramMb
+            : isIntegratedGpuName(name)
+              ? Math.round((os.totalmem() / 1e6) * 0.5)
+              : 0
+          return { name, vramMb, vendor }
+        })
+        .filter((g) => g.vendor !== 'unknown')
+        
+      if (gpus.length) return gpus
+    }
+  } catch {
+    /* lspci not available (Android) — fall through to vulkaninfo */
+  }
+
+  // 2) Android / Termux path (vulkaninfo)
+  // lspci doesn't exist on Android. We fall back to vulkaninfo, which queries
+  // the Vulkan loader directly. This correctly identifies Mali/Adreno GPUs.
+  return enumVulkanGpus()
+}
+
+/** Parse `vulkaninfo --summary` for GPU name and type. Works on Termux + Android. */
+function enumVulkanGpus(): GpuInfo[] {
+  try {
+    // Force the Android system loader (same fix that made vulkaninfo work in your shell).
+    // LD_PRELOAD=liblzma.so works around the Xzs_Construct dlopen bug on Android 15/16.
+    const env = {
+      ...process.env,
+      LD_LIBRARY_PATH: `/system/lib64:${process.env.LD_LIBRARY_PATH ?? ''}`,
+      LD_PRELOAD: '/system/lib64/liblzma.so',
+    }
+    const out = execFileSync('vulkaninfo', ['--summary'], { timeout: 8000, env }).toString()
+    const gpus: GpuInfo[] = []
+    const lines = out.split('\n')
+    let inDevice = false
+    let deviceName = ''
+    let deviceType = ''
+    for (const line of lines) {
+      if (/^GPU\d+:/.test(line.trim())) {
+        if (deviceName) gpus.push(makeVulkanGpu(deviceName, deviceType))
+        inDevice = true
+        deviceName = ''
+        deviceType = ''
+        continue
+      }
+      if (inDevice) {
+        const m1 = line.match(/deviceName\s*=\s*(.+)/i)
+        if (m1) deviceName = m1[1].trim()
+        const m2 = line.match(/deviceType\s*=\s*(.+)/i)
+        if (m2) deviceType = m2[1].trim()
+      }
+    }
+    if (deviceName) gpus.push(makeVulkanGpu(deviceName, deviceType))
+    return gpus
+  } catch {
+    return []
+  }
+}
+
+function makeVulkanGpu(name: string, deviceType: string): GpuInfo {
+  const vendor = classifyVendor(name)
+  const integrated = /INTEGRATED_GPU/i.test(deviceType) || isIntegratedGpuName(name)
+  // Mali/Adreno share system RAM; estimate 50% (matches the Windows iGPU heuristic).
+  // Lower this to 0.3–0.4 if the tool then tries to load a model that's too large.
+  const vramMb = integrated
+    ? Math.round((os.totalmem() / 1e6) * 0.5)
+    : 0
+  return { name, vramMb, vendor }
 }
 
 // amdgpu exposes total VRAM in bytes via sysfs (incl. the BIOS carveout on
@@ -343,4 +413,47 @@ function linuxVramMb(pciSlot: string): number {
     }
   }
   return 0
+}
+
+/** Android/Termux fallback for CPU model, as os.cpus() is often restricted or empty. */
+function getCpuModel(): string {
+  const model = os.cpus()[0]?.model?.trim()
+  if (model && model.length > 0) return model
+  // Android /proc/cpuinfo usually has a "Hardware" or "model name" line.
+  if (process.platform === 'linux') {
+    try {
+      const cpuinfo = fs.readFileSync('/proc/cpuinfo', 'utf8')
+      const m =
+        cpuinfo.match(/Hardware\s*:\s*(.+)/) ||
+        cpuinfo.match(/model name\s*:\s*(.+)/)
+      if (m) return m[1].trim()
+    } catch {
+      /* ignore */
+    }
+  }
+  return model ?? ''
+}
+
+/** Android/Termux fallback for CPU core count, as os.cpus() often reports 1 due to cgroups. */
+function getCpuCoreCount(): number {
+  const cpus = os.cpus()
+  if (cpus.length > 1) return cpus.length
+  // Fallback 1: nproc (available in Termux)
+  try {
+    const n = parseInt(execFileSync('nproc', { timeout: 2000 }).toString().trim(), 10)
+    if (n > 0) return n
+  } catch {
+    /* nproc missing */
+  }
+  // Fallback 2: count "processor" lines in /proc/cpuinfo
+  if (process.platform === 'linux') {
+    try {
+      const cpuinfo = fs.readFileSync('/proc/cpuinfo', 'utf8')
+      const matches = cpuinfo.match(/processor\s*:/g)
+      if (matches && matches.length > 0) return matches.length
+    } catch {
+      /* ignore */
+    }
+  }
+  return cpus.length || 1
 }
