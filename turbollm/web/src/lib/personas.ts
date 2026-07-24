@@ -42,7 +42,9 @@ const TURBOLLM_KNOWLEDGE =
   '- **Persistent sessions**: archive/filter past runs, revert to any earlier message (with optional real file-edit reversal), attach files as context, transcript copy. A "Coding activity" dashboard (sessions, tasks shipped, files touched, diff shipped, streaks) is built from real history.\n' +
   '- **Real LSP integration** for TypeScript/JavaScript and Python — detects the language, installs the language server if needed, uses it for edits.\n' +
   '- **Same tools Chat gets from Customize**: any connected MCP server, plus the sandboxed run_code tool, alongside honest skill invocation and AGENTS.md/agents.md support.\n' +
-  '- Gated behind its own API key on non-host devices (independent of Chat\'s own gate).\n\n' +
+  '- Gated behind its own API key on non-host devices (independent of Chat\'s own gate).\n' +
+  '- **Live prefill progress**: while the model processes a large prompt, a progress bar shows processed/total tokens.\n' +
+  '- **Stuck-loop protection**: if the model repeats the exact same tool call too many times in a row even after being nudged to stop, the run auto-stops and reports itself as stopped rather than hanging forever.\n\n' +
 
   '**Models** — discover and manage local models.\n' +
   '- **All models** view: scans configured local directories for GGUF, MLX safetensors, vLLM safetensors; badges incompatible models for the active engine.\n' +

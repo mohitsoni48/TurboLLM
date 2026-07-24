@@ -150,19 +150,18 @@ const COMPACTION_SUFFIX = '\n\n(End of summary — the actual conversation conti
 export function resolveEffectiveHistory(d: Deps, convId: string, sessionId: string): { summaryText: string | null; messages: DbMessage[] } {
   const all = d.db.getConversation(convId, true)?.messages ?? []
   const run = d.db.getAgentRun(sessionId)
-  const compactionIdx = run?.compactionUpToMessageId ? all.findIndex((m) => m.id === run.compactionUpToMessageId) : -1
-  const clearedIdx = run?.clearedUpToMessageId ? all.findIndex((m) => m.id === run.clearedUpToMessageId) : -1
-  // A RESOLVABLE clear that's at/after any compaction cut wins outright — a blank slate, no
-  // summary carried forward. An unresolvable (stale/corrupt) clear marker falls through to the
-  // compaction-only path below, same "degrade to replaying raw rather than silently dropping
-  // everything" philosophy as an unresolvable compaction marker.
-  if (clearedIdx !== -1 && clearedIdx >= compactionIdx) {
-    return { summaryText: null, messages: all.slice(clearedIdx + 1) }
-  }
+  // /clear (v34, ADR-261) now DEACTIVATES its messages (is_active=0), so getConversation →
+  // getMessages has already dropped them from `all` — no cursor slice needed here anymore. A
+  // cleared session is a blank slate: also drop any earlier compaction summary (it summarized
+  // history that now sits behind the clear), returning just the still-active post-clear messages.
+  // /resume reactivates that history and nulls this marker, falling straight through to the
+  // compaction/full path below again (exactly as if the clear never happened).
+  if (run?.clearedUpToMessageId) return { summaryText: null, messages: all }
   if (!run?.compactionUpToMessageId) return { summaryText: null, messages: all }
   // An unresolvable compaction marker (cut message deleted/corrupt) still surfaces its summary —
   // replaying every raw message alongside a redundant summary loses nothing, whereas resolving
   // it as "no compaction at all" would silently discard a real (if now unanchored) summary.
+  const compactionIdx = all.findIndex((m) => m.id === run.compactionUpToMessageId)
   const rest = compactionIdx === -1 ? all : all.slice(compactionIdx + 1)
   return { summaryText: `${COMPACTION_PREFIX}${run.compactionSummary}${COMPACTION_SUFFIX}`, messages: rest }
 }
@@ -231,6 +230,12 @@ export function keepRecentTokensFor(messages: DbMessage[], baseKeepRecentTokens:
 /** A minimal SSE sink — matches the chat wire shape so the existing frontend parser works. */
 export type CodeSseSink = (ev: { event: string; data: unknown }) => void | Promise<void>
 
+/** Injects a message into the CURRENTLY ACTIVE turn via pi's real `session.steer()` (Phase 1,
+ *  ADR-246). Resolves `true` when the message was actually handed to the live agent loop, `false`
+ *  when the turn is no longer streaming (a race — it just finished), so the caller can fall back
+ *  to follow-up/queue behavior instead of dropping the message into a dead session. */
+export type SteerHandle = (text: string) => Promise<boolean>
+
 export interface RunCodeParams {
   d: Deps
   convId: string
@@ -250,6 +255,12 @@ export interface RunCodeParams {
   /** Fires when the HTTP request is aborted / the run is stopped. */
   signal: AbortSignal
   sink: CodeSseSink
+  /** Registers (and later clears) a {@link SteerHandle} the daemon-side run manager can call to
+   *  STEER a message into THIS live turn instead of queueing a fresh one behind it (Phase 1,
+   *  ADR-246). Called with the handle once the pi session exists, and again with `null` in the
+   *  finally when the turn settles, so the manager never routes a steer into a disposed session.
+   *  Optional: the reconnect tests' injected runners don't steer and simply omit it. */
+  onSteerable?: (steer: SteerHandle | null) => void
 }
 
 export interface RunCodeResult {
@@ -279,6 +290,17 @@ export const PATH_TOOLS = new Set(['read', 'edit', 'write', 'grep', 'find', 'ls'
 // turn resets the count. The first LOOP_BREAK_AFTER identical calls still run normally, so a
 // model that legitimately repeats a call a few times is unaffected — only a genuine loop is cut.
 export const LOOP_BREAK_AFTER = 3
+
+// The soft nudge above assumes the model actually reads and acts on the blocked-call result — a
+// genuinely stuck weak/local model can just re-emit the exact same call again anyway, and
+// ToolLoopTracker.record() has no ceiling (a re-tripped signature keeps incrementing forever, see
+// its own test), so nothing was stopping this from repeating indefinitely — reproduced live
+// (founder-reported, 2026-07-24: the nudge fired and had "no effect", the run stayed stuck).
+// LOOP_ABORT_AFTER is the hard ceiling: after this many consecutive identical calls (i.e. the
+// model ignored LOOP_ABORT_AFTER - LOOP_BREAK_AFTER separate nudges), stop assuming it'll
+// self-heal and abort the run outright via session.abort() — the same real-stop path a user's own
+// Stop button uses, so it surfaces as a genuinely stopped run (stats.aborted), not a silent hang.
+export const LOOP_ABORT_AFTER = LOOP_BREAK_AFTER + 3
 
 /** Order-stable signature of a tool call: the name plus its arguments with object keys sorted at
  *  every depth, so a model re-emitting the same call with its keys in a different order still
@@ -352,6 +374,202 @@ export function disposeLspClientsForConv(convId: string): void {
   if (!clients) return
   for (const c of clients.values()) c.dispose()
   lspClientsByConv.delete(convId)
+}
+
+/** Extract the plain text out of a pi tool `partialResult` (tool_execution_update) — pi's bash
+ *  tool streams `{ content: [{ type: 'text', text }], details }` snapshots through it (verified in
+ *  the bundled bash tool's `onUpdate`). Mirrors the tool_result hook's own content-flattening;
+ *  tool-agnostic and defensive since `partialResult` is typed `any` and other tools could differ. */
+function extractPartialText(partialResult: unknown): string {
+  const pr = partialResult as { content?: Array<{ type?: string; text?: string }> } | null | undefined
+  if (!pr || !Array.isArray(pr.content)) return ''
+  return pr.content.map((c) => (c?.type === 'text' ? c.text ?? '' : '')).join('')
+}
+
+/** One SSE frame the relay emits, or null for an event we deliberately don't surface. */
+export type CodeRelayFrame = { event: string; data: Record<string, unknown> } | null
+
+/** Pure map from a pi `AgentSessionEvent` to the SSE frame the Code relay emits for it (Phase 2,
+ *  ADR-250). Extracted from runCodeSession's session.subscribe closure so the whole event→frame
+ *  contract is unit-testable without a live pi session or a loaded model (the live loop itself
+ *  stays out of scope, same as the rest of code-session.test.ts).
+ *
+ *  Surfaces, beyond the original text/thinking deltas and compaction:
+ *   • turn_start / turn_end        → a `turn` frame (phase + a monotonic index the caller threads
+ *     via `turnCounter`, incremented on turn_end so a start/end pair share one index) so the UI can
+ *     group a turn's deltas + tool calls into one visual unit.
+ *   • auto_retry_start / _end      → a `retry` frame (attempt / maxAttempts / delayMs / message) so
+ *     the UI can show a real "Retrying…" banner when pi auto-retries a transient provider failure,
+ *     instead of a silent stall.
+ *   • tool_execution_update        → a `tool_progress` frame carrying the tool call's incremental
+ *     output snapshot. pi's built-in bash tool streams stdout/stderr through this (verified); the
+ *     edit tool is atomic and never emits it. DISTINCT from the `tool_call` frames the tool_call/
+ *     tool_result extension hooks already emit (pending → done): this fills the live gap between
+ *     them. tool_execution_start/_end are intentionally NOT surfaced — they'd duplicate those
+ *     pending/done `tool_call` frames and double-render every call.
+ *
+ *  All the new frames are ephemeral live signals: code-run-manager's sink persists nothing for
+ *  them (it keys DB accumulation off delta/reasoning/tool_call), so they only ever cost a
+ *  live-tail + reconnect-replay frame, never DB writes. */
+export function codeEventToFrame(ev: AgentSessionEvent, turnCounter: { index: number }): CodeRelayFrame {
+  switch (ev.type) {
+    case 'message_update': {
+      const ame = ev.assistantMessageEvent
+      if (ame.type === 'text_delta') return { event: 'delta', data: { delta: ame.delta } }
+      if (ame.type === 'thinking_delta') return { event: 'reasoning', data: { delta: ame.delta } }
+      return null
+    }
+    case 'compaction_start':
+      return { event: 'compaction', data: { phase: 'start', reason: ev.reason } }
+    case 'compaction_end':
+      return { event: 'compaction', data: { phase: 'end', reason: ev.reason, aborted: ev.aborted, tokensBefore: ev.result?.tokensBefore } }
+    case 'turn_start':
+      return { event: 'turn', data: { phase: 'start', index: turnCounter.index } }
+    case 'turn_end': {
+      const frame: CodeRelayFrame = { event: 'turn', data: { phase: 'end', index: turnCounter.index, toolResults: ev.toolResults.length } }
+      turnCounter.index++
+      return frame
+    }
+    case 'auto_retry_start':
+      return { event: 'retry', data: { phase: 'start', attempt: ev.attempt, maxAttempts: ev.maxAttempts, delayMs: ev.delayMs, message: ev.errorMessage } }
+    case 'auto_retry_end':
+      return { event: 'retry', data: { phase: 'end', attempt: ev.attempt, success: ev.success, message: ev.finalError } }
+    case 'tool_execution_update':
+      return { event: 'tool_progress', data: { id: ev.toolCallId, name: ev.toolName, partial: extractPartialText(ev.partialResult) } }
+    default:
+      return null
+  }
+}
+
+// ── Delegated sub-tasks (delegate_task tool, ADR-259) ──────────────────────────────
+// Hard ceiling on ONE delegated sub-task's wall-clock time. A delegated sub-agent runs a full
+// nested agentic loop; without a bound a stuck/looping sub-task could hold a background engine slot
+// (via d.gate) far longer than the parent — or any waiting foreground Chat — should tolerate. On
+// expiry the sub-session is aborted and whatever it produced so far is returned as an explicit
+// "did not finish" result, never a silent hang. A parent Stop aborts it immediately too (sooner).
+export const DELEGATE_SUBAGENT_TIMEOUT_MS = 5 * 60_000
+
+/** Validate the `task` argument the model passes to delegate_task. Pure/exported so the tool's
+ *  input contract is unit-testable without a live pi session or a loaded model. */
+export function validateDelegateTask(raw: unknown): { ok: true; task: string } | { ok: false; message: string } {
+  const task = typeof raw === 'string' ? raw.trim() : ''
+  if (!task) return { ok: false, message: 'delegate_task: `task` must be a non-empty description of the sub-task to delegate.' }
+  return { ok: true, task }
+}
+
+/** Fold a delegated sub-agent's final text into the single string returned to the PARENT as the
+ *  tool result — the ONLY thing that crosses back (the sub-agent's step-by-step transcript never
+ *  enters the parent's context). Pure/exported for unit testing. A timed-out / stopped run is
+ *  reported as explicitly INCOMPLETE (with any partial text) rather than passed off as a finished
+ *  answer, so the parent doesn't build on a half-done result believing it succeeded. */
+export function normalizeDelegateResult(finalText: string, opts?: { timedOut?: boolean; timeoutMs?: number }): string {
+  const text = finalText.trim()
+  if (opts?.timedOut) {
+    const mins = Math.max(1, Math.round((opts.timeoutMs ?? DELEGATE_SUBAGENT_TIMEOUT_MS) / 60_000))
+    const partial = text ? `\n\nPartial progress before it was stopped:\n${text}` : ''
+    return `(the delegated sub-task did not finish within ~${mins} minute(s) and was stopped — treat it as INCOMPLETE; consider doing it yourself or delegating a smaller piece.${partial})`
+  }
+  return text || '(the delegated sub-agent produced no output.)'
+}
+
+// System-prompt preamble appended AFTER the normal mode persona for a delegated sub-agent, so it
+// behaves as a focused, self-contained worker: it never sees the parent conversation, cannot
+// delegate further or invoke skills (enforced structurally — those tools are simply not registered
+// on the sub-session, giving a hard nesting depth of 1), and must end with a self-contained summary
+// since that summary is all the parent receives.
+const DELEGATED_SUBAGENT_PREAMBLE = 'You are an isolated sub-agent handling ONE delegated sub-task on behalf of a parent coding agent. ' +
+  'You do NOT see the parent conversation or its history — everything you need is in the task message below. ' +
+  'Do exactly that task and nothing more, using your tools against the same repository. You cannot delegate ' +
+  'further or invoke skills. When finished, end your reply with a concise, self-contained summary of what you ' +
+  'did, what you found, and anything the parent needs in order to continue — that summary is the ONLY thing ' +
+  'returned to the parent.'
+
+// ── Todo / step progress tracker (update_todos tool, ADR-255) ──────────────────────
+// A structured checklist the model maintains for a multi-step task so the UI can show live
+// progress ("3/7 done") instead of an opaque stream of tool calls. The model re-sends the WHOLE
+// list each call (replace, not diff — the simplest model to call correctly); it's emitted as an
+// ephemeral `todos` SSE frame and held in the run's live state for reconnect (code-run-manager.ts),
+// never a DB column. Registered ONLY on the top-level session — a delegated/skill sub-session never
+// gets update_todos, so a sub-agent's internal steps stay out of the parent's list (one list per
+// top-level turn; see the delegate_task interaction note in this task's write-up).
+export interface TodoItem { content: string; status: 'pending' | 'in_progress' | 'completed' }
+const TODO_STATUSES = new Set<TodoItem['status']>(['pending', 'in_progress', 'completed'])
+// A real multi-step task is a handful of steps, not hundreds — this caps a confused/looping model
+// from emitting an unbounded list (and bounds the frame size).
+export const MAX_TODOS = 50
+
+/** Coerce the model's raw update_todos argument into a clean TodoItem[] (pure/exported for
+ *  testing). Local models send messy input, so this is defensive: a non-array → []; each entry
+ *  must be an object with non-empty `content` (trimmed) or it's dropped; an unknown/missing status
+ *  defaults to 'pending'; the list is capped at MAX_TODOS. The result REPLACES the prior list —
+ *  the tool's contract is "re-send the full current list each call", not incremental diffs. */
+export function normalizeTodos(raw: unknown): TodoItem[] {
+  if (!Array.isArray(raw)) return []
+  const out: TodoItem[] = []
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue
+    const rec = item as Record<string, unknown>
+    const content = typeof rec.content === 'string' ? rec.content.trim() : ''
+    if (!content) continue
+    const status = typeof rec.status === 'string' && TODO_STATUSES.has(rec.status as TodoItem['status'])
+      ? (rec.status as TodoItem['status']) : 'pending'
+    out.push({ content, status })
+    if (out.length >= MAX_TODOS) break
+  }
+  return out
+}
+
+/** One-line confirmation returned to the model after an update_todos call (pure/exported), so it
+ *  gets concrete feedback that the list registered and where it stands — e.g. "Tracking 7 step(s):
+ *  3 done, 1 in progress." An empty list reads as an explicit clear. */
+export function summarizeTodos(todos: TodoItem[]): string {
+  if (todos.length === 0) return 'Todo list cleared.'
+  const completed = todos.filter((t) => t.status === 'completed').length
+  const inProgress = todos.filter((t) => t.status === 'in_progress').length
+  const parts = [`${completed}/${todos.length} done`]
+  if (inProgress > 0) parts.push(`${inProgress} in progress`)
+  return `Tracking ${todos.length} step(s): ${parts.join(', ')}.`
+}
+
+// ── Real prefill (prompt-processing) progress via llama.cpp /slots ─────────────────
+// Founder-reported: Code shows the prompt-processing phase as a generic "thinking" spinner while
+// Chat shows a real progress bar. Chat gets it by hand-parsing llama.cpp's own `prompt_progress`
+// SSE field from its own raw HTTP call; Code goes through pi's `openai` client, which never
+// surfaces that field. So we read progress OUT OF BAND from the engine's own `/slots` endpoint
+// (enabled by default, no --slots flag) while a provider request is in flight — independent of pi's
+// request entirely. `pct = n_prompt_tokens_processed / n_prompt_tokens`.
+export const PREFILL_POLL_MS = 300
+
+export interface PrefillProgress { processed: number; total: number; pct: number }
+
+function isProcessingSlot(s: unknown): s is { n_prompt_tokens: number; n_prompt_tokens_processed: number } {
+  if (!s || typeof s !== 'object') return false
+  const r = s as Record<string, unknown>
+  return r.is_processing === true && typeof r.n_prompt_tokens === 'number' && typeof r.n_prompt_tokens_processed === 'number'
+}
+
+/** Pick THIS request's prefill progress out of a llama.cpp `/slots` response — pure/exported so the
+ *  slot-matching + percentage logic is testable without a live engine (mirrors codeEventToFrame's
+ *  extract-pure-decision-logic pattern). Returns null ("emit nothing this poll") for anything
+ *  unusable: a non-array body, no slot actively processing, a zero/absent prompt-token total, or
+ *  processed<0.
+ *
+ *  Slot matching: returns null when MORE THAN ONE slot is processing at once. The in-app gate
+ *  (gate.ts) serializes Code+Chat generations and llama.cpp defaults to --parallel 1 (a single
+ *  slot), so the normal case has exactly one processing slot that is unambiguously ours. Only a
+ *  user-set --parallel>1 running a genuinely concurrent generation the gate does NOT cover (gateway
+ *  / Claude-Code traffic never takes the gate) can light up two slots simultaneously — and pi's
+ *  openai client never exposes the llama.cpp `id_task` needed to correlate precisely, so we refuse
+ *  to guess and show nothing rather than risk attributing another request's progress to this turn. */
+export function pickPrefillProgress(slots: unknown): PrefillProgress | null {
+  if (!Array.isArray(slots)) return null
+  const processing = slots.filter(isProcessingSlot)
+  if (processing.length !== 1) return null
+  const total = processing[0].n_prompt_tokens
+  const processed = processing[0].n_prompt_tokens_processed
+  if (!(total > 0) || processed < 0) return null
+  const pct = Math.min(100, Math.max(0, Math.round((processed / total) * 100)))
+  return { processed, total, pct }
 }
 
 /**
@@ -652,6 +870,181 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     return finalText.trim() || '(the skill produced no output)'
   }
 
+  /** Runs one free-form DELEGATED sub-task as a REAL, contained agentic sub-session (delegate_task
+   *  tool, ADR-259) — a sibling of runSkillSubSession with the same isolation, containment, mode-
+   *  based tool access, and ask-mode approval boundary, but driven by a caller-supplied task string
+   *  instead of a pre-authored skill's fixed instructions. Its own history is NOT seeded with the
+   *  parent conversation (the whole point: keep the sub-task's step-by-step work out of the parent's
+   *  token budget); only its final summary is returned.
+   *
+   *  Nesting depth is hard-capped at 1: the sub-session registers NO invoke_skill and NO
+   *  delegate_task tool (they're only registered on the outer session below), so a delegated
+   *  sub-agent structurally cannot spawn its own sub-agents — no runaway recursion.
+   *
+   *  Resource contention (the real correctness concern): a delegated sub-task runs INSIDE the
+   *  parent's tool_call execution, which pi runs BETWEEN provider requests — the parent's own
+   *  provider request already completed when the model emitted this tool call, and the parent's
+   *  before/after_provider_request hooks release d.gate around each request, so the parent holds NO
+   *  gate while this sub-session runs. The sub-session acquires d.gate('bg') around its OWN provider
+   *  requests exactly as runSkillSubSession does, so it serializes cleanly against foreground Chat
+   *  (which preempts at 'fg') and any other background work, WITHOUT self-deadlocking against its
+   *  own parent. It is therefore not true concurrent engine load — it runs while the parent turn is
+   *  parked awaiting this result. Bounded by DELEGATE_SUBAGENT_TIMEOUT_MS and the parent's Stop
+   *  signal (whichever fires first), so a stuck sub-task can never hold a slot indefinitely. */
+  async function runDelegatedSubSession(subMode: CodeMode, task: string): Promise<string> {
+    const subAuth = AuthStorage.inMemory()
+    const subRegistry = ModelRegistry.inMemory(subAuth)
+    subRegistry.registerProvider('local', {
+      baseUrl: `${target}/v1`,
+      apiKey: 'agent-key',
+      authHeader: true,
+      api: 'openai-completions',
+      models: [{
+        id: modelId,
+        name: modelDisplayName,
+        reasoning: false,
+        input: ['text'],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow,
+        maxTokens: 8192,
+        compat: { supportsDeveloperRole: false, thinkingFormat: 'qwen-chat-template' },
+      }],
+    })
+    const subModel = subRegistry.find('local', modelId)
+    if (!subModel) throw new Error('Failed to register local model with pi.')
+
+    // Bounded lifetime: the parent's Stop (signal) OR a hard timeout aborts the sub-agent. subAc
+    // is what the sub-session's gate acquires and its own session.abort() key off, so both causes
+    // unstick a queued gate wait and stop the loop the same way.
+    const subAc = new AbortController()
+    let timedOut = false
+    const onParentAbort = () => subAc.abort()
+    if (signal.aborted) subAc.abort()
+    else signal.addEventListener('abort', onParentAbort, { once: true })
+    const timer = setTimeout(() => { timedOut = true; subAc.abort() }, DELEGATE_SUBAGENT_TIMEOUT_MS)
+
+    let subHeldGate: (() => void) | undefined
+    const releaseSubGate = () => { const r = subHeldGate; subHeldGate = undefined; r?.() }
+
+    const subExtension = (pi: ExtensionAPI): void => {
+      pi.on('before_provider_request', async (event) => {
+        releaseSubGate()
+        // 'bg' priority + subAc.signal: foreground Chat preempts, and a parent Stop / timeout gives
+        // up a queued wait instead of hanging (see gate.ts). The parent isn't holding the gate here
+        // (it released before executing this tool), so this acquire can't deadlock against it.
+        if (d.gate) subHeldGate = await d.gate.acquire('bg', { signal: subAc.signal })
+        const payload = { ...(event.payload as Record<string, unknown>) }
+        delete payload.max_tokens
+        delete payload.max_completion_tokens
+        return payload
+      })
+      pi.on('after_provider_response', () => { releaseSubGate() })
+
+      // Same containment + approval boundary as the outer/skill sessions (deliberately duplicated,
+      // per the note on runSkillSubSession's own hooks — a different pi session object, and the hook
+      // is small enough that sharing would cost more in indirection than it saves). Approval waits
+      // key off subAc.signal so a parent Stop / timeout also cancels a pending approval prompt.
+      pi.on('tool_call', async (event: ToolCallEvent): Promise<ToolCallEventResult | void> => {
+        const toolName = event.toolName
+        const toolCallId = event.toolCallId
+        const input = event.input as Record<string, unknown>
+        await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'pending' } })
+
+        if (PATH_TOOLS.has(toolName)) {
+          const p = input.path
+          const pathRequired = toolName === 'read' || toolName === 'edit' || toolName === 'write'
+          if (p !== undefined && typeof p === 'string') {
+            if (!isContainedFromRoot(p, repoRoot)) {
+              const reason = 'path is outside the allowed repo root'
+              await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
+              return { block: true, reason }
+            }
+          } else if (pathRequired) {
+            const reason = `${toolName}: a valid path is required`
+            await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
+            return { block: true, reason }
+          }
+        }
+
+        if (subMode === 'ask' && MUTATING_TOOLS.has(toolName)) {
+          await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'awaiting_approval' } })
+          const decision = await waitForToolApproval(`${convId}:${toolCallId}`, subAc.signal)
+          if (decision === 'deny') {
+            const reason = 'denied by user'
+            await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
+            return { block: true, reason }
+          }
+        }
+        return
+      })
+
+      pi.on('tool_result', async (event: ToolResultEvent): Promise<void> => {
+        const text = event.content.map((c) => (c.type === 'text' ? c.text : '')).join('')
+        const data: Record<string, unknown> = {
+          id: event.toolCallId, name: event.toolName, args: event.input,
+          status: event.isError ? 'error' : 'done', result: text,
+        }
+        if (isEditToolResult(event) && event.details) {
+          data.diff = event.details.diff
+          data.patch = event.details.patch
+          data.firstChangedLine = event.details.firstChangedLine
+        }
+        await sink({ event: 'tool_call', data })
+      })
+    }
+
+    const subAgentDir = join(d.store.dir(), 'pi-agent')
+    const subResourceLoader = new DefaultResourceLoader({
+      cwd: repoRoot,
+      agentDir: subAgentDir,
+      settingsManager: SettingsManager.inMemory(),
+      extensionFactories: [{ name: 'turbollm-delegate', factory: subExtension }],
+      // The normal mode persona (no skill catalog — a delegated sub-agent can't invoke skills),
+      // plus the delegation preamble that frames it as a focused, summary-returning worker.
+      appendSystemPrompt: [...buildAppendPrompt(subMode, [], { repoRoot, globalDir: d.store.dir() }, !!d.tools), DELEGATED_SUBAGENT_PREAMBLE],
+      noSkills: true,
+      noPromptTemplates: true,
+      noThemes: true,
+    })
+    await subResourceLoader.reload()
+
+    const subTools = toolsForMode(subMode)
+    const subBash = createBashTool(repoRoot, { operations: createRobustBashOperations({ sessionLabel: `${sessionId}:delegate` }) })
+    const { session: subSession } = await createAgentSession({
+      cwd: repoRoot,
+      agentDir: subAgentDir,
+      model: subModel,
+      authStorage: subAuth,
+      modelRegistry: subRegistry,
+      resourceLoader: subResourceLoader,
+      sessionManager: SessionManager.inMemory(repoRoot),
+      settingsManager: SettingsManager.inMemory({ compaction: compactionSettingsFor(contextWindow) }),
+      customTools: [subBash],
+      ...(subTools ? { tools: subTools } : {}),
+      // No invoke_skill / delegate_task / web / mcp / lsp tools registered → depth-1, bounded set.
+    })
+
+    const onSubAbort = () => { void subSession.abort() }
+    if (subAc.signal.aborted) onSubAbort()
+    else subAc.signal.addEventListener('abort', onSubAbort, { once: true })
+
+    try {
+      await subSession.prompt(task)
+    } catch (e) {
+      // A Stop / timeout aborts mid-prompt (AbortError, or a gate give-up) — return whatever the
+      // sub-agent produced so far as an explicit "incomplete" result rather than throwing. Any
+      // OTHER error is a real failure and propagates to delegate_task's execute catch.
+      if (!timedOut && !subAc.signal.aborted) throw e
+    } finally {
+      clearTimeout(timer)
+      signal.removeEventListener('abort', onParentAbort)
+      releaseSubGate()
+    }
+    const finalText = subSession.getLastAssistantText() ?? ''
+    subSession.dispose()
+    return normalizeDelegateResult(finalText, timedOut ? { timedOut: true, timeoutMs: DELEGATE_SUBAGENT_TIMEOUT_MS } : undefined)
+  }
+
   // MCP tools (Customize → MCP Servers) — the same tools Chat gets from any user-connected MCP
   // server, extended to Code (founder decision, 2026-07-13: "all the tools built from customize
   // that are added in chat should be available in code as well"). Fetched HERE, once, before the
@@ -665,6 +1058,40 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
   const mcpToolNames = new Set(mcpToolDefs.map((t) => t.function.name))
 
   // ── the inline extension: containment + approval + diff plumbing ──────────────
+  // Prefill progress poller (see pickPrefillProgress above) — reads the engine's /slots endpoint
+  // while a provider request is in flight and relays a `prefill` SSE frame. Lifecycle is per
+  // agentic ROUND: started in before_provider_request, stopped the instant prefill completes
+  // (processed>=total), the first real token streams (message_update, a cross-check against stale
+  // slot numbers), the response ends, or the turn aborts. A self-rearming setTimeout — NOT
+  // setInterval — so a slow /slots fetch never stacks overlapping polls; every /slots failure or
+  // odd shape is swallowed, because prefill telemetry must never break the actual generation.
+  let prefillTimer: ReturnType<typeof setTimeout> | undefined
+  let prefillActive = false
+  const stopPrefillPoll = (): void => {
+    prefillActive = false
+    if (prefillTimer) { clearTimeout(prefillTimer); prefillTimer = undefined }
+  }
+  const startPrefillPoll = (): void => {
+    stopPrefillPoll()
+    prefillActive = true
+    let lastPct = -1
+    const tick = async (): Promise<void> => {
+      if (!prefillActive) return
+      try {
+        const res = await fetch(`${target}/slots`, { signal })
+        if (res.ok) {
+          const progress = pickPrefillProgress(await res.json())
+          if (progress && prefillActive) {
+            if (progress.pct !== lastPct) { lastPct = progress.pct; void sink({ event: 'prefill', data: { ...progress } }) }
+            if (progress.processed >= progress.total) { stopPrefillPoll(); return }
+          }
+        }
+      } catch { /* /slots must never break generation — skip this turn's prefill silently */ }
+      if (prefillActive) prefillTimer = setTimeout(() => void tick(), PREFILL_POLL_MS)
+    }
+    prefillTimer = setTimeout(() => void tick(), PREFILL_POLL_MS)
+  }
+
   const extension = (pi: ExtensionAPI): void => {
     // Background-priority engine slot, acquired/released around each provider request. Also
     // where the thinking budget is injected: pi makes its own provider HTTP call (registered
@@ -678,6 +1105,9 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       // (see gate.ts's own comment for the incident this fixed) rather than hanging the whole
       // turn forever with no way to cancel it.
       if (d.gate) heldGate = await d.gate.acquire('bg', { signal })
+      // Gate acquired, request is about to go out — begin polling /slots for prefill progress for
+      // THIS round (stopped on first token / completion / response end / abort). Best-effort.
+      startPrefillPoll()
       const payload = { ...(event.payload as Record<string, unknown>) }
       // Strip the completion-length cap pi derives from this model's declared `maxTokens` (a
       // fixed ceiling set once in the model metadata above, at model-load time). Sent verbatim as
@@ -702,7 +1132,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       }
       return payload // unlimited (default) — still stripped of the stale max_tokens ceiling
     })
-    pi.on('after_provider_response', () => { releaseGate() })
+    pi.on('after_provider_response', () => { stopPrefillPoll(); releaseGate() })
 
     // No turn_start reset — deliberately. pi fires `turn_start` once per agentic ROUND (it carries
     // an incrementing turnIndex; `agent_start` is the per-task boundary), so resetting here cleared
@@ -724,8 +1154,22 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       // 0. Loop breaker — BEFORE containment/mode, so it catches a stuck model regardless of tool
       //    or mode. A weak local model can fire the SAME call with the SAME args indefinitely; once
       //    it has done so more than LOOP_BREAK_AFTER times in a row, stop executing it and hand the
-      //    model a break-the-loop instruction as the (blocked) result instead. Silent to the user.
-      if (toolLoop.record(toolName, input) > LOOP_BREAK_AFTER) {
+      //    model a break-the-loop instruction as the (blocked) result instead.
+      const loopCount = toolLoop.record(toolName, input)
+      if (loopCount > LOOP_ABORT_AFTER) {
+        // The nudge below didn't work — LOOP_ABORT_AFTER - LOOP_BREAK_AFTER separate nudges were
+        // sent and the model kept re-emitting the exact same call anyway. Stop assuming it'll
+        // self-heal: abort the run for real (same path the user's own Stop button uses, so this
+        // surfaces as a genuinely stopped run — stats.aborted — not a silent hang) rather than
+        // trip the same soft block forever (founder-reported live, 2026-07-24: "no effect").
+        const reason = `[SYSTEM: \`${toolName}\` was called with identical arguments ${loopCount} times ` +
+          'in a row, including after being told to stop — this run has been stopped automatically ' +
+          'rather than continue looping. Start a new turn with different instructions to try again.]'
+        await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
+        void session.abort()
+        return { block: true, reason }
+      }
+      if (loopCount > LOOP_BREAK_AFTER) {
         const reason = `[SYSTEM: you have called \`${toolName}\` with identical arguments too many ` +
           'times in a row and it is not making progress — this call was NOT executed. Stop repeating ' +
           'it: take a different action, call it with different arguments, or, if you already have what ' +
@@ -928,6 +1372,77 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       },
     })
 
+    // Delegate a focused, self-contained sub-task to an isolated sub-agent (delegate_task, ADR-259):
+    // a real nested agentic sub-session (runDelegatedSubSession, above) that shares this session's
+    // repo + tools + mode/approval boundary, runs the sub-task to completion, and returns ONLY its
+    // final summary — the sub-agent's step-by-step work never enters this conversation, keeping the
+    // parent's context focused. Depth-capped at 1 (the sub-agent gets no delegate_task/invoke_skill),
+    // gate-serialized so it never starves foreground Chat, and time-bounded. See its own doc comment.
+    pi.registerTool({
+      name: 'delegate_task',
+      label: 'Delegate task',
+      description: 'Delegate a focused, self-contained sub-task to an isolated sub-agent that has ' +
+        'your same repository access and tools (subject to the current mode), runs it to completion, ' +
+        'and returns ONLY its final summary — the sub-agent\'s step-by-step work never enters this ' +
+        'conversation, so your own context stays focused. Use it for a well-scoped chunk you can ' +
+        'describe completely up front (e.g. "investigate how X works and report back", or "apply ' +
+        'this specific refactor across these files"). The sub-agent does NOT see this conversation, ' +
+        'so put everything it needs in the task; it cannot delegate further or invoke skills.',
+      promptSnippet: 'delegate_task(task) - hand a focused, fully-described sub-task to an isolated sub-agent and get back its summary',
+      parameters: Type.Object({
+        task: Type.String({ description: 'The complete, self-contained sub-task, including every bit of context the sub-agent needs (it does not see this conversation or its history).' }),
+      }),
+      async execute(_toolCallId, params) {
+        const valid = validateDelegateTask(params.task)
+        if (!valid.ok) return { content: [{ type: 'text', text: valid.message }], details: {} }
+        // Live mode — same fresh-from-DB resolution and plan-mode exception as invoke_skill above.
+        const dbMode = (d.db.getConversation(convId)?.agentMode ?? mode) as CodeMode
+        const liveMode: CodeMode = dbMode === 'plan' ? mode : dbMode
+        try {
+          const text = await runDelegatedSubSession(liveMode, valid.task)
+          return { content: [{ type: 'text', text }], details: {} }
+        } catch (e) {
+          return { content: [{ type: 'text', text: `delegate_task: failed (${e instanceof Error ? e.message : String(e)}) — try again, or do the task yourself.` }], details: {} }
+        }
+      },
+    })
+
+    // Todo / step progress tracker (update_todos, ADR-255): the model maintains a visible checklist
+    // of a multi-step task's steps so the UI shows live progress instead of an opaque tool-call
+    // stream. Whole-list-replace each call (simplest for a model to get right). Emits an ephemeral
+    // `todos` SSE frame via the same sink every other event uses; code-run-manager holds the latest
+    // list in the run's live state so it survives a reconnect (like the queue), no DB column needed.
+    // Registered on the top-level session ONLY (never on delegate_task/skill sub-sessions), so the
+    // list is strictly the parent turn's plan — a delegated sub-agent's internal steps stay hidden.
+    pi.registerTool({
+      name: 'update_todos',
+      label: 'Update todos',
+      description: 'Maintain a visible checklist of the steps for a multi-step task so the user can ' +
+        'see your plan and live progress. Call it when you START a task that has several distinct ' +
+        'steps (send the full list, each step pending), and again whenever a step\'s state changes: ' +
+        'mark a step in_progress when you begin it and completed as soon as it is done. ALWAYS send ' +
+        'the ENTIRE current list each call — it REPLACES the previous one, it is not a diff. Skip it ' +
+        'for trivial single-step requests; a one-item checklist is just noise.',
+      promptSnippet: 'update_todos(todos) - show/refresh a checklist of steps for a multi-step task (send the whole list each call)',
+      parameters: Type.Object({
+        todos: Type.Array(
+          Type.Object({
+            content: Type.String({ description: 'The step as a short imperative phrase, e.g. "Add the /export route".' }),
+            status: Type.Union(
+              [Type.Literal('pending'), Type.Literal('in_progress'), Type.Literal('completed')],
+              { description: 'pending, in_progress, or completed.' },
+            ),
+          }),
+          { description: 'The COMPLETE current step list, in order — replaces the previous list entirely.' },
+        ),
+      }),
+      async execute(_toolCallId, params) {
+        const todos = normalizeTodos(params.todos)
+        await sink({ event: 'todos', data: { todos } })
+        return { content: [{ type: 'text', text: summarizeTodos(todos) }], details: {} }
+      },
+    })
+
     // Real web access (founder-reported gap, 2026-07-13): Code previously had NO way to look
     // anything up — only Chat had web_search/fetch_url. A local model that fails at something
     // (a real repro: Camera2 API) tends to silently substitute an easier, DIFFERENT feature
@@ -1112,32 +1627,43 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
   // ── relay streaming deltas/reasoning from the session event stream ────────────
   // Tool-call SSE is driven entirely by the extension hooks above; here we only relay the
   // model's text/thinking deltas so the two never double-emit.
+  // Relay pi's event stream to SSE via the pure codeEventToFrame map (see its doc comment for the
+  // full event→frame contract and rationale). Text/thinking deltas and compaction were surfaced
+  // before; turn boundaries, auto-retries, and live tool-output streaming are the Phase 2 additions
+  // (ADR-250). `turnCounter` is this run's own monotonic turn index, mutated across events.
+  const turnCounter = { index: 0 }
   const unsubscribe = session.subscribe((ev: AgentSessionEvent) => {
-    if (ev.type === 'message_update') {
-      const ame = ev.assistantMessageEvent
-      if (ame.type === 'text_delta') {
-        void sink({ event: 'delta', data: { delta: ame.delta } })
-      } else if (ame.type === 'thinking_delta') {
-        void sink({ event: 'reasoning', data: { delta: ame.delta } })
-      }
-    } else if (ev.type === 'compaction_start') {
-      // pi's own AUTO-compaction (distinct from the manual /compact route below, which only
-      // ever calls session.compact() on demand) — a real first-class pi feature this session
-      // registered no listener for until now, so it fired with zero UI feedback: the transcript
-      // just went quiet while pi silently summarized history mid-turn. Forwarded so the
-      // frontend can show a real "Compacting conversation…" state instead of a generic/blank gap.
-      void sink({ event: 'compaction', data: { phase: 'start', reason: ev.reason } })
-    } else if (ev.type === 'compaction_end') {
-      void sink({ event: 'compaction', data: { phase: 'end', reason: ev.reason, aborted: ev.aborted, tokensBefore: ev.result?.tokensBefore } })
-    }
+    // First real model output means prefill is over — stop the /slots poller now, a cross-check in
+    // case a slot's numbers never quite reach n_prompt_tokens (stale/rounding) before decode begins.
+    if (ev.type === 'message_update') stopPrefillPoll()
+    const frame = codeEventToFrame(ev, turnCounter)
+    if (frame) void sink(frame)
   })
 
+  // Steering (Phase 1, ADR-246): hand the run manager a handle it can call to inject a message
+  // into THIS live turn via pi's real session.steer(), delivered after the current assistant
+  // turn's tool calls finish and before the next LLM call — redirecting the SAME turn rather than
+  // queueing a fresh one. pi keeps the agentic loop alive until the steered message is drained
+  // (agent-session.js's _runAgentPrompt loops while agent.hasQueuedMessages()), so the
+  // `await session.prompt(task)` below still resolves only after the steered continuation settles
+  // and the one accumulating assistant message captures it all. Guarded on isStreaming: if the
+  // turn has already settled by the time a steer lands (a race — it just finished), return false
+  // so the manager falls back to follow-up/queue instead of dropping it into a dead session.
+  const steerHandle: SteerHandle = async (text) => {
+    if (!session.isStreaming) return false
+    await session.steer(text)
+    return true
+  }
+
   d.manager.generationStart()
+  params.onSteerable?.(steerHandle)
   try {
     // Not-streaming prompt: resolves after the whole agentic loop settles (mirrors pi's own
-    // print mode). Steering/follow-up messages are a fast-follow.
+    // print mode), including any steered continuation folded in via steerHandle above.
     await session.prompt(task)
   } finally {
+    params.onSteerable?.(null)
+    stopPrefillPoll() // belt-and-suspenders: never leak the /slots timer past the turn (incl. abort)
     unsubscribe()
     releaseGate()
     d.manager.generationEnd()

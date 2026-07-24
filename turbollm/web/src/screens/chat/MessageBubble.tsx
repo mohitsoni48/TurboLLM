@@ -487,7 +487,9 @@ export function StreamingBubble({
           ? (b.text
               ? <div key={i} className="prose-tllm text-[15px] leading-[1.7] text-ink"><Markdown streaming>{b.text}</Markdown></div>
               : null)
-          : <InlineToolStep key={b.call.id} call={b.call} />,
+          : b.kind === 'tool'
+            ? <InlineToolStep key={b.call.id} call={b.call} />
+            : null, // 'turn' round-divider blocks are Code-only; chat never emits them
       )}
 
       {/* Prefill progress bar */}

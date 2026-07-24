@@ -180,11 +180,11 @@ test('a queued follow-up survives a mid-run disconnect and runs in order server-
   const u2 = store.addMessage(convId, 'user', 'second')
   const r2 = mgr.enqueue(sessionId, { convId, repoRoot, task: 'second', userMsgId: u2.id })
   assert.equal(r2.queued, true, 'the follow-up queued behind the active turn')
-  assert.deepEqual(mgr.queued(sessionId), [{ userMsgId: u2.id, task: 'second' }], 'server-side queue holds the follow-up')
+  assert.deepEqual(mgr.queued(sessionId), [{ userMsgId: u2.id, task: 'second', kind: 'followUp' }], 'server-side queue holds the follow-up (tagged followUp by default)')
 
   // DISCONNECT mid-run. The queue is server-side, so it must survive.
   sub1.close()
-  assert.deepEqual(mgr.queued(sessionId), [{ userMsgId: u2.id, task: 'second' }], 'queue survived the client disconnect')
+  assert.deepEqual(mgr.queued(sessionId), [{ userMsgId: u2.id, task: 'second', kind: 'followUp' }], 'queue survived the client disconnect')
 
   // Reconnect and watch everything to the end.
   const sub2 = mgr.subscribe(sessionId, 0)
@@ -269,7 +269,7 @@ test('stop() aborts the active run and drops everything queued behind it', async
   mgr.enqueue(sessionId, { convId, repoRoot, task: 'do gamma', userMsgId })
   const u2 = store.addMessage(convId, 'user', 'queued one')
   mgr.enqueue(sessionId, { convId, repoRoot, task: 'queued one', userMsgId: u2.id })
-  assert.deepEqual(mgr.queued(sessionId), [{ userMsgId: u2.id, task: 'queued one' }])
+  assert.deepEqual(mgr.queued(sessionId), [{ userMsgId: u2.id, task: 'queued one', kind: 'followUp' }])
 
   const sub1 = mgr.subscribe(sessionId, 0)
   await collect(sub1, (ev) => ev.event === 'tool_call') // early return closes sub1 (a disconnect)
@@ -392,4 +392,149 @@ test('a runner that THROWS AbortError also floors ctxUsed at the last confirmed 
   assert.equal(last?.stats.aborted, true)
   assert.equal(last?.stats.ctxUsed, 3000, 'a thrown AbortError still carries forward the last known context, not 0')
   assert.equal(store.getAgentRun(sessionId)?.status, 'interrupted')
+})
+
+// ── steer/followUp dispatch (Phase 1, ADR-246) ─────────────────────────────────────────
+//
+// These drive the manager's steer() vs enqueue() dispatch with an injected runner that exposes
+// (or refuses) a live steer handle, exactly the way the real runCodeSession publishes pi's
+// session.steer via onSteerable — no loaded model needed.
+
+/** A runner that publishes a steer handle via onSteerable (like runCodeSession does once its pi
+ *  session is streaming), records every steered text into `steerLog`, and stays "active" long
+ *  enough (holdMs) for a test to steer into it before it settles. `streaming: false` makes the
+ *  handle refuse (return false) to simulate the turn having just finished (the race the fallback
+ *  guards). Honors the abort signal like the real runner. */
+function steerableRunner(opts: { steerLog: string[]; streaming?: boolean; holdMs?: number }): CodeSessionRunner {
+  return (async (params) => {
+    const { signal } = params
+    params.onSteerable?.(async (text: string) => {
+      if (opts.streaming === false) return false
+      opts.steerLog.push(text)
+      return true
+    })
+    const hold = opts.holdMs ?? 120
+    const start = Date.now()
+    while (Date.now() - start < hold) {
+      if (signal.aborted) break
+      await delay(10)
+    }
+    params.onSteerable?.(null)
+    return { finalText: 'ok', contextUsed: 100, contextMax: 8192, aborted: signal.aborted }
+  }) as CodeSessionRunner
+}
+
+test('enqueue tags a queued follow-up with kind:followUp by default', async () => {
+  const { d, store } = makeDeps()
+  const mgr = new CodeRunManager(d, { runner: pacedRunner('fu') })
+  const repoRoot = tmp('tllm-code-repo-')
+  const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'first')
+  mgr.enqueue(sessionId, { convId, repoRoot, task: 'first', userMsgId })
+  const sub1 = mgr.subscribe(sessionId, 0)
+  await collect(sub1, (ev) => ev.event === 'tool_call')
+  const u2 = store.addMessage(convId, 'user', 'second')
+  mgr.enqueue(sessionId, { convId, repoRoot, task: 'second', userMsgId: u2.id })
+  assert.deepEqual(mgr.queued(sessionId), [{ userMsgId: u2.id, task: 'second', kind: 'followUp' }])
+  sub1.close()
+  await collect(mgr.subscribe(sessionId, 0), () => false)
+})
+
+test('steer() injects into the ACTIVE turn via the live handle, and does NOT queue', async () => {
+  const { d, store } = makeDeps()
+  const steerLog: string[] = []
+  const mgr = new CodeRunManager(d, { runner: steerableRunner({ steerLog, holdMs: 250 }) })
+  const repoRoot = tmp('tllm-code-repo-')
+  const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'first')
+
+  mgr.enqueue(sessionId, { convId, repoRoot, task: 'first', userMsgId })
+  await delay(40) // let the turn start and register its steer handle
+  assert.equal(mgr.isActive(sessionId), true)
+
+  const u2 = store.addMessage(convId, 'user', 'go left instead')
+  const res = await mgr.steer(sessionId, { convId, repoRoot, task: 'go left instead', userMsgId: u2.id })
+  assert.equal(res.steered, true, 'delivered into the live turn')
+  assert.equal(res.queued, false)
+  assert.deepEqual(steerLog, ['go left instead'], 'pi steer handle received the message')
+  assert.deepEqual(mgr.queued(sessionId), [], 'a steered message is never queued')
+
+  await collect(mgr.subscribe(sessionId, 0), () => false)
+})
+
+test('steer() with no active turn falls back to starting the turn (never errors)', async () => {
+  const { d, store } = makeDeps()
+  const steerLog: string[] = []
+  const mgr = new CodeRunManager(d, { runner: steerableRunner({ steerLog, holdMs: 20 }) })
+  const repoRoot = tmp('tllm-code-repo-')
+  const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'first')
+
+  // Idle session: nothing live to steer, so it falls back to enqueue, which STARTS the turn.
+  const res = await mgr.steer(sessionId, { convId, repoRoot, task: 'first', userMsgId })
+  assert.equal(res.steered, false, 'nothing live to steer')
+  assert.equal(res.queued, false, 'idle session: fell back to starting the turn, not queuing behind one')
+  assert.deepEqual(steerLog, [], 'the handle was never called (no active turn existed)')
+  assert.equal(mgr.isActive(sessionId), true, 'the fallback started the turn')
+
+  await collect(mgr.subscribe(sessionId, 0), () => false)
+})
+
+test('steer() falls back to the queue (tagged kind:steer) when the live turn is no longer streaming', async () => {
+  const { d, store } = makeDeps()
+  const steerLog: string[] = []
+  // streaming:false → the handle returns false, simulating the turn having just settled (race).
+  const mgr = new CodeRunManager(d, { runner: steerableRunner({ steerLog, streaming: false, holdMs: 250 }) })
+  const repoRoot = tmp('tllm-code-repo-')
+  const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'first')
+
+  mgr.enqueue(sessionId, { convId, repoRoot, task: 'first', userMsgId })
+  await delay(40)
+
+  const u2 = store.addMessage(convId, 'user', 'redirect')
+  const res = await mgr.steer(sessionId, { convId, repoRoot, task: 'redirect', userMsgId: u2.id })
+  assert.equal(res.steered, false, 'the handle refused (not streaming)')
+  assert.equal(res.queued, true, 'fell back to queuing behind the still-active turn')
+  assert.deepEqual(steerLog, [], 'no message delivered live')
+  assert.deepEqual(mgr.queued(sessionId), [{ userMsgId: u2.id, task: 'redirect', kind: 'steer' }], 'the fallback queue entry preserves the requested kind')
+
+  await collect(mgr.subscribe(sessionId, 0), () => false)
+})
+
+// ── todo/step checklist live state (ADR-255) ───────────────────────────────────────────
+
+/** A runner that emits one `todos` frame (the update_todos tool's SSE shape) then completes. */
+function todoRunner(todos: Array<{ content: string; status: string }>): CodeSessionRunner {
+  return (async (params) => {
+    params.sink({ event: 'todos', data: { todos } })
+    return { finalText: 'ok', contextUsed: 100, contextMax: 8192, aborted: false }
+  }) as CodeSessionRunner
+}
+
+test('a todos frame is captured into the run\'s live state and exposed via todos() for reconnect', async () => {
+  const { d, store } = makeDeps()
+  const list = [{ content: 'step 1', status: 'in_progress' }, { content: 'step 2', status: 'pending' }]
+  const mgr = new CodeRunManager(d, { runner: todoRunner(list) })
+  const repoRoot = tmp('tllm-code-repo-')
+  const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'multi-step')
+  mgr.enqueue(sessionId, { convId, repoRoot, task: 'multi-step', userMsgId })
+  await collect(mgr.subscribe(sessionId, 0), () => false)
+  assert.deepEqual(mgr.todos(sessionId), list, 'the latest checklist is held in live state (snapshot on connect)')
+})
+
+test('a new turn resets the checklist so a prior turn\'s todos never leak forward', async () => {
+  const { d, store } = makeDeps()
+  const runner: CodeSessionRunner = (params) => {
+    if (params.task === 'first') return todoRunner([{ content: 'a', status: 'pending' }])(params)
+    // Turn 2 emits NO todos frame — the pump-time reset must clear turn 1's list on its own.
+    return (async () => ({ finalText: 'ok', contextUsed: 1, contextMax: 2, aborted: false }))()
+  }
+  const mgr = new CodeRunManager(d, { runner })
+  const repoRoot = tmp('tllm-code-repo-')
+  const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'first')
+  mgr.enqueue(sessionId, { convId, repoRoot, task: 'first', userMsgId })
+  await collect(mgr.subscribe(sessionId, 0), () => false)
+  assert.deepEqual(mgr.todos(sessionId), [{ content: 'a', status: 'pending' }], 'turn 1 left a checklist')
+
+  const u2 = store.addMessage(convId, 'user', 'second')
+  mgr.enqueue(sessionId, { convId, repoRoot, task: 'second', userMsgId: u2.id })
+  await collect(mgr.subscribe(sessionId, 0), () => false)
+  assert.deepEqual(mgr.todos(sessionId), [], 'turn 2 emitted no checklist, so the reset left it empty — no leak from turn 1')
 })
