@@ -597,8 +597,9 @@ export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: Abo
     } catch (e) {
       if ((e as Error)?.name === 'AbortError') throw e
       throw new Error(
-        'The verified patch does not apply cleanly against the checked-out commit — it may have drifted from the ' +
-          'commit it was authored against. ' + (e instanceof Error ? e.message : String(e)),
+        'The verified patch failed to apply against the checked-out commit (most likely it has drifted from the ' +
+          'commit it was authored against, but see the underlying error below for the exact cause). ' +
+          (e instanceof Error ? e.message : String(e)),
       )
     }
     await runStep('git', ['-C', srcDir, 'apply', patchFile], { env, signal, onLine: hooks.log })
