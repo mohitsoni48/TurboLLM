@@ -25,6 +25,39 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.8.7] - 2026-07-24
+
+**Code feature: a denser, more familiar terminal-style redesign, a real prefill progress bar, and a fix for a rare stuck-loop bug.**
+
+### Added
+- **Real prefill progress bar in Code.** While the model is processing a large prompt, Code now
+  shows live progress (processed/total tokens) by polling the local engine's `/slots` endpoint —
+  independent of the underlying agent SDK, which doesn't expose this natively.
+- **Consecutive similar terminal commands are now grouped** into a single expandable unit (e.g. a
+  run of `git` commands) instead of each appearing as its own separate line.
+- **A hard stop for tool-call loops.** If the model keeps repeating the exact same tool call after
+  already being told to stop, the run is now aborted outright and reported as a stopped run,
+  instead of silently repeating the same unhelpful nudge forever.
+
+### Changed
+- **Code's UI redesigned toward a denser, more familiar terminal feel** — closer to what users of
+  tools like opencode/Claude Code CLI already expect: flat tool-call lines instead of cards, a
+  persistent stats footer, a loaded-resources header (AGENTS.md/skills), and updated icons.
+
+### Fixed
+- User message cards in Code had an odd, hard-to-notice copy/revert button layout and low-contrast
+  background in dark theme — buttons moved outside the card and background contrast increased.
+- Terminal commands run by the agent now default to **collapsed** instead of expanded.
+- Removed a duplicate stat ("Auto · 16% ctx") that was shown twice in the Code composer footer.
+- A visual clipping bug on the "running" status banner's rounded corners.
+
+### Discord
+- Code now shows a live prefill progress bar while the model processes large prompts.
+- Code's UI got a denser, more familiar terminal-style redesign — flat tool lines, a persistent
+  stats footer, and grouped terminal commands.
+- Fixed a rare bug where a stuck AI tool-call loop in Code could repeat forever instead of
+  stopping.
+
 ## [1.8.6] - 2026-07-24
 
 **New engine: Solar Open 2, via a checksum-verified patch build.**
