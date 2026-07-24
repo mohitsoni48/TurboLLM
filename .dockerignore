@@ -1,0 +1,10 @@
+.git
+**/node_modules
+**/dist
+**/src/webdist
+assets
+deploy
+*.md
+*.bat
+*.cmd
+lib

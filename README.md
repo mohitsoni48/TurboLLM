@@ -637,6 +637,70 @@ shadcn/ui frontend. One TypeScript codebase, shipped as an npm package.
 
 ---
 
+## 🐳 Docker Deployment (NVIDIA / AMD GPU)
+
+TurboLLM includes Docker support with dedicated configurations for NVIDIA CUDA
+and AMD ROCm GPUs.
+
+The Docker images provide an isolated environment while allowing TurboLLM to
+access your GPU directly for accelerated local LLM inference.
+
+---
+
+## NVIDIA GPU (CUDA)
+
+### Requirements
+
+- NVIDIA GPU with CUDA support
+- Installed NVIDIA drivers
+- NVIDIA Container Toolkit
+
+Install NVIDIA Container Toolkit:
+
+```bash
+# Ubuntu / Debian example
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
+sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+
+curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#' | \
+sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+
+sudo apt update
+sudo apt install -y nvidia-container-toolkit
+
+sudo systemctl restart docker
+
+docker compose -f docker-compose-nvidia.yaml up -d
+```
+
+## AMD GPU
+
+### Requirements
+
+- AMD ROCm
+- Installed AMD drivers
+
+```bash
+# Ubuntu / Debian example
+sudo apt update
+sudo apt install wget gnupg
+
+wget https://repo.radeon.com/rocm/rocm.gpg.key -O - | \
+sudo gpg --dearmor -o /usr/share/keyrings/rocm.gpg
+
+echo "deb [arch=amd64 signed-by=/usr/share/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/latest ubuntu main" | \
+sudo tee /etc/apt/sources.list.d/rocm.list
+
+sudo apt update
+
+sudo apt install rocm
+sudo usermod -aG render,video $USER
+sudo reboot
+
+docker compose -f docker-compose-amd.yaml up -d
+```
+---
 ## Community
 
 Questions, ideas, and show-and-tell — join the [Discord](https://discord.gg/v6kRbV7nC).

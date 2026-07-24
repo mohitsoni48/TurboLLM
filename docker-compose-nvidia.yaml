@@ -1,0 +1,35 @@
+services:
+  turbollm:
+    # Build context must be the root of a clone of https://github.com/mohitsoni48/TurboLLM
+    # (this Dockerfile expects to find the `turbollm/` subfolder in it). Put this
+    # docker-compose.yml (and the Dockerfile) at the repo root, or change `context:` below
+    # to point at wherever you cloned it.
+    build:
+      context: .
+      dockerfile: Dockerfile.nvidia
+    image: turbollm-nvidia:latest
+    container_name: turbollm-nvidia
+    restart: unless-stopped
+    ports:
+      - "6996:6996"
+    volumes:
+      # Persists config.json, the chat SQLite DB, downloaded engines/models, and logs
+      # across container restarts/rebuilds (this is ~/.turbollm inside the container).
+      - turbollm-data:/root/.turbollm
+
+    # --- NVIDIA GPU passthrough (requires the NVIDIA Container Toolkit on the host) ---
+    # Delete this whole "environment" + "deploy" block if you're running CPU-only —
+    # TurboLLM falls back to a CPU build automatically.
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  turbollm-data:
