@@ -102,8 +102,8 @@ export function normRepoUrl(s?: string): string {
 /** The built `llama-server` for a repo (+optional branch) under `enginesRoot`, or null. Used
  *  to detect a source-built engine whose registry entry was removed (disabled) but whose build
  *  output still sits on disk under `engines/build/<slug>/`. */
-export function sourceBuildBinary(enginesRoot: string, repoUrl: string, branch?: string): string | null {
-  const root = join(enginesRoot, 'build', buildDirName(repoUrl, branch))
+export function sourceBuildBinary(enginesRoot: string, repoUrl: string, branch?: string, commit?: string): string | null {
+  const root = join(enginesRoot, 'build', buildDirName(repoUrl, branch, commit))
   return resolveServerBinary(join(root, 'build')) ?? resolveServerBinary(root)
 }
 

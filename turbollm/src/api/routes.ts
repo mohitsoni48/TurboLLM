@@ -463,9 +463,20 @@ export function registerApi(app: Hono, d: Deps): void {
       // manage menu (rebuild/disable/delete) instead of a stale "Build from source". Also
       // detect a built-but-disabled engine (registry entry removed, build output still on disk)
       // so Enable can re-register it.
-      const srcEng = regEngines.find((x) => sameRepo(x.sourceRepo, e.homepage))
+      // A repo-only match isn't enough for a catalog entry that pins a commit/patch (e.g.
+      // solar-open2 vs. the plain llama.cpp entry — both build ggml-org/llama.cpp): without also
+      // requiring the SAME commit + patch, a plain unpatched llama.cpp build would falsely read
+      // as "solar-open2 already installed" and hand out a binary with no solar_open2 support at
+      // all. Entries with no commit/patch pin (sourceCommit/patchUrl both '') still match each
+      // other exactly as before.
+      const srcEng = regEngines.find(
+        (x) =>
+          sameRepo(x.sourceRepo, e.homepage) &&
+          (x.sourceCommit ?? '') === (e.sourceCommit ?? '') &&
+          (x.sourcePatchUrl ?? '') === (e.patchUrl ?? ''),
+      )
       let sourceBinPath: string | undefined = srcEng?.binPath
-      if (!srcEng) sourceBinPath = sourceBuildBinary(enginesRoot, e.homepage) ?? undefined
+      if (!srcEng) sourceBinPath = sourceBuildBinary(enginesRoot, e.homepage, undefined, e.sourceCommit) ?? undefined
       const sourceBuilt = !!srcEng || !!sourceBinPath
       if (srcEng) {
         installed = true
