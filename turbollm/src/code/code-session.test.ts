@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { toolsForMode, buildAppendPrompt, skillsBlock, skillCatalogBlock, type CodeMode } from './persona'
 import { toSessionStatus, resolveRevertCut } from './code-routes'
-import { MUTATING_TOOLS, PATH_TOOLS, resolveEffectiveHistory, compactCodeSession, isDependencyAddCommand, compactionSettingsFor, keepRecentTokensFor, ToolLoopTracker, toolCallSignature, LOOP_BREAK_AFTER, codeEventToFrame, validateDelegateTask, normalizeDelegateResult, DELEGATE_SUBAGENT_TIMEOUT_MS, normalizeTodos, summarizeTodos, MAX_TODOS, type TodoItem } from './code-session'
+import { MUTATING_TOOLS, PATH_TOOLS, resolveEffectiveHistory, compactCodeSession, isDependencyAddCommand, compactionSettingsFor, keepRecentTokensFor, ToolLoopTracker, toolCallSignature, LOOP_BREAK_AFTER, LOOP_ABORT_AFTER, codeEventToFrame, validateDelegateTask, normalizeDelegateResult, DELEGATE_SUBAGENT_TIMEOUT_MS, normalizeTodos, summarizeTodos, MAX_TODOS, pickPrefillProgress, PREFILL_POLL_MS, type TodoItem } from './code-session'
 import { ConversationStore, type Message } from '../chat/db'
 import type { Deps } from '../deps'
 import type { Skill } from '../agents/skills'
@@ -699,6 +699,20 @@ test('ToolLoopTracker: counts consecutive identical calls; the (LOOP_BREAK_AFTER
   assert.equal(call(), LOOP_BREAK_AFTER + 2)
 })
 
+test('ToolLoopTracker: the count keeps climbing past LOOP_BREAK_AFTER, crossing LOOP_ABORT_AFTER for the hard-stop escalation', () => {
+  // Founder-reported live (2026-07-24): the soft nudge alone had "no effect" — a stuck model just
+  // re-emitted the exact same call anyway, and since record() never caps, the hook's own
+  // LOOP_ABORT_AFTER check (code-session.ts, tool_call hook) needs count to keep growing past the
+  // soft threshold so it can actually cross the hard one and abort the run for real.
+  assert.ok(LOOP_ABORT_AFTER > LOOP_BREAK_AFTER, 'the hard-stop threshold must be strictly past the soft-nudge one')
+  const t = new ToolLoopTracker()
+  const call = () => t.record('bash', { command: 'npm test' })
+  let last = 0
+  for (let n = 1; n <= LOOP_ABORT_AFTER; n++) last = call()
+  assert.equal(last, LOOP_ABORT_AFTER, 'still at the threshold, not yet past it')
+  assert.equal(call(), LOOP_ABORT_AFTER + 1, 'the next identical call is the one that crosses it')
+})
+
 test('ToolLoopTracker: any different call resets the run to 1', () => {
   const t = new ToolLoopTracker()
   t.record('read', { path: 'a.ts' })
@@ -928,4 +942,58 @@ test('summarizeTodos: omits the in-progress clause when nothing is in progress',
 
 test('summarizeTodos: an empty list reads as an explicit clear', () => {
   assert.equal(summarizeTodos([]), 'Todo list cleared.')
+})
+
+// ── pickPrefillProgress (code-session.ts) — the llama.cpp /slots → prefill-percentage extractor,
+// pure/isolable so the slot-matching + math is tested without a live engine (mirrors codeEventToFrame).
+
+const procSlot = (processed: number, total: number, extra: Record<string, unknown> = {}) =>
+  ({ is_processing: true, n_prompt_tokens: total, n_prompt_tokens_processed: processed, ...extra })
+
+test('pickPrefillProgress: a single processing slot yields processed/total/pct (rounded)', () => {
+  assert.deepEqual(pickPrefillProgress([procSlot(27140, 93760)]), { processed: 27140, total: 93760, pct: 29 })
+})
+
+test('pickPrefillProgress: pct is clamped to 100 when processed reaches or exceeds total', () => {
+  assert.equal(pickPrefillProgress([procSlot(93760, 93760)])?.pct, 100)
+  assert.equal(pickPrefillProgress([procSlot(99999, 93760)])?.pct, 100)
+})
+
+test('pickPrefillProgress: 0 processed against a real total is a valid 0%', () => {
+  assert.deepEqual(pickPrefillProgress([procSlot(0, 1000)]), { processed: 0, total: 1000, pct: 0 })
+})
+
+test('pickPrefillProgress: null for a non-array body (an error object, null, undefined)', () => {
+  assert.equal(pickPrefillProgress({ error: 'not found' }), null)
+  assert.equal(pickPrefillProgress(null), null)
+  assert.equal(pickPrefillProgress(undefined), null)
+})
+
+test('pickPrefillProgress: null when no slot is processing (idle engine / empty array)', () => {
+  assert.equal(pickPrefillProgress([{ is_processing: false, n_prompt_tokens: 100, n_prompt_tokens_processed: 0 }]), null)
+  assert.equal(pickPrefillProgress([]), null)
+})
+
+test('pickPrefillProgress: null when the processing slot has a zero/absent prompt-token total (avoid /0)', () => {
+  assert.equal(pickPrefillProgress([procSlot(0, 0)]), null)
+  assert.equal(pickPrefillProgress([{ is_processing: true, n_prompt_tokens_processed: 5 }]), null)
+})
+
+test('pickPrefillProgress: bails (null) when MORE THAN ONE slot is processing — ambiguous, would risk a wrong bar', () => {
+  // Only reachable under --parallel>1 with a concurrent generation the gate doesn't serialize; pi
+  // exposes no id_task to correlate, so showing nothing beats attributing another request's progress.
+  assert.equal(pickPrefillProgress([procSlot(10, 100), procSlot(50, 200)]), null)
+})
+
+test('pickPrefillProgress: ignores idle/malformed slots and uses the single valid processing one', () => {
+  const slots = [
+    { is_processing: false, n_prompt_tokens: 100, n_prompt_tokens_processed: 100 }, // idle → ignored
+    { is_processing: true },                                                         // malformed → ignored
+    procSlot(400, 800),                                                              // the real one
+  ]
+  assert.deepEqual(pickPrefillProgress(slots), { processed: 400, total: 800, pct: 50 })
+})
+
+test('PREFILL_POLL_MS: a sane sub-second poll interval', () => {
+  assert.ok(PREFILL_POLL_MS >= 100 && PREFILL_POLL_MS <= 1000)
 })

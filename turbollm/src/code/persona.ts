@@ -228,6 +228,19 @@ function readAgentsFile(path: string): string | null {
   }
 }
 
+/** Whether a project (`<repoRoot>/AGENTS.md`) and/or global (`<globalDir>/agents.md`) AGENTS.md
+ *  file is actually present — for the loaded-resources header (ADR-262), which needs a boolean per
+ *  file, not the injected prompt text `agentsMdBlock` returns. Uses the exact same lookup +
+ *  whitespace-only-counts-as-absent rule as `agentsMdBlock`, so "present here" always matches
+ *  "actually injected into the prompt." Cheap (two small reads); safe to call per session-detail
+ *  request. */
+export function agentsMdPresence(repoRoot: string, globalDir: string): { project: boolean; global: boolean } {
+  return {
+    project: readAgentsFile(join(repoRoot, 'AGENTS.md')) !== null,
+    global: readAgentsFile(join(globalDir, 'agents.md')) !== null,
+  }
+}
+
 /** `<repoRoot>/AGENTS.md` (project-level, the user's own repo) and `<globalDir>/agents.md`
  *  (global — TurboLLM's own data dir, e.g. `~/.turbollm/agents.md`), like OpenCode's AGENTS.md
  *  convention: standing project/user instructions picked up automatically, no per-session setup.

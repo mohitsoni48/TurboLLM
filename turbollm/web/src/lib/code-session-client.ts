@@ -40,6 +40,14 @@ export interface LiveState {
    *  LiveState object below (`meta` with a new assistantId) omits it — the backend's own
    *  reset-per-turn semantics need no separate client-side clear. */
   todos?: TodoItem[]
+  /** Prompt-processing (prefill) progress from a `prefill` SSE frame — llama.cpp only, present
+   *  ONLY before the first token of a turn. Cleared back to null the instant a real delta/reasoning
+   *  token arrives (the backend also stops firing prefill frames then) and on turn end (the whole
+   *  LiveState is discarded). Null/absent is the NORMAL path (non-llama.cpp engines, or a prompt
+   *  that prefills inside one poll interval and never gets a frame). Drives the transcript's
+   *  "Processing prompt NN%" bar, which takes the status-banner slot over retry/compacting/thinking
+   *  while active — prefill happens strictly before generation, so the two never co-render. */
+  prefill?: { processed: number; total: number; pct: number } | null
 }
 
 /** Apply `fn` to the current live block, creating one (anchored to `fallbackId`) if none exists
@@ -140,10 +148,16 @@ export class CodeSessionClient {
             this.emitLive(reduceLive(this.live, this.activeAssistantId, (b) => ({ ...b, compacting })))
           } else if (evt.event === 'reasoning') {
             const delta = evt.data.delta
-            this.emitLive(reduceLive(this.live, this.activeAssistantId, (b) => ({ ...b, reasoning: b.reasoning + delta })))
+            // A real reasoning token = prefill is over; clear the bar (the backend also stops firing
+            // prefill frames at the first token, so this is belt-and-suspenders).
+            this.emitLive(reduceLive(this.live, this.activeAssistantId, (b) => ({ ...b, reasoning: b.reasoning + delta, prefill: null })))
+          } else if (evt.event === 'prefill') {
+            const prefill = evt.data
+            this.emitLive(reduceLive(this.live, this.activeAssistantId, (b) => ({ ...b, prefill })))
           } else if (evt.event === 'delta') {
             const delta = evt.data.delta
-            this.emitLive(reduceLive(this.live, this.activeAssistantId, (b) => ({ ...b, content: b.content + delta, timeline: appendTextDelta(b.timeline, delta) })))
+            // First real content token = prefill is over; clear the bar as generation takes over.
+            this.emitLive(reduceLive(this.live, this.activeAssistantId, (b) => ({ ...b, content: b.content + delta, timeline: appendTextDelta(b.timeline, delta), prefill: null })))
           } else if (evt.event === 'tool_call') {
             const tc = evt.data
             const call: LiveToolCall = { id: tc.id, name: tc.name, args: tc.args, status: tc.status, result: tc.result, diff: tc.diff, patch: tc.patch, firstChangedLine: tc.firstChangedLine }

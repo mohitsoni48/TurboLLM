@@ -93,6 +93,10 @@ export interface CodeSessionDetail {
   /** The live turn's current checklist, if the run is active — reflects the daemon's in-memory
    *  state (reset per turn), same reconnect-resilience purpose as `queued`. */
   todos: TodoItem[]
+  /** Whether an AGENTS.md is loaded for this session (ADR-262 loaded-resources header) — `project`
+   *  = `<repoRoot>/AGENTS.md`, `global` = `~/.turbollm/agents.md`. Same lookup persona.ts injects
+   *  into the prompt, so this reflects what the model actually receives. */
+  hasAgentsMd: { project: boolean; global: boolean }
 }
 export function getCodeSession(id: string): Promise<CodeSessionDetail> {
   return req(`/api/v1/code/sessions/${encodeURIComponent(id)}`)

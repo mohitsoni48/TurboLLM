@@ -14,7 +14,7 @@ import { ThinkingBudgetSlider } from '../../components/ThinkingBudgetSlider'
 import { toast } from '../../components/ui/sonner'
 import { browseFs } from '../../lib/api'
 import type { ModelEntry } from '../../lib/types'
-import { cn } from '../../lib/utils'
+import { cn, folderName } from '../../lib/utils'
 import { ContextUsageRing } from './ContextUsageRing'
 import { AGENT_MODES, type AgentMode, type AgentModeId } from './code-mock'
 
@@ -101,6 +101,24 @@ function relativeToRoot(root: string, target: string): string {
   const r = norm(root)
   const t = norm(target)
   return t.startsWith(`${r}/`) ? t.slice(r.length + 1) : t
+}
+
+// ── Stats footer (ADR-262) ────────────────────────────────────────────────────
+//
+// Local, tiny formatters — deliberately NOT imported from ContextUsageRing.tsx's fmtTokens or
+// ThinkingBudgetSlider.tsx's formatBudget, since neither is exported and this task is scoped to
+// CodeComposer.tsx only (no edits to either sibling component). Same simple k/M convention as
+// ContextUsageRing's own fmtTokens for consistency across the app.
+function fmtCompactTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`
+  return String(n)
+}
+
+function thinkingCompactLabel(budget: number): string {
+  if (budget < 0) return 'Think: Unlimited'
+  if (budget === 0) return 'Think: Off'
+  return `Think: ${fmtCompactTokens(budget)}`
 }
 
 // ── Image/screenshot paste (ADR-259) ─────────────────────────────────────────
@@ -222,6 +240,23 @@ export interface CodeComposerProps {
   thinkingBudget: number
   onThinkingBudgetChange: (v: number) => void
 
+  /** The session's checked-out branch — mid-session only (CodeSessionScreen, which has no
+   *  `repo` prop). Powers the stats footer's branch readout (ADR-262); omit entirely to render
+   *  no branch segment. Not needed pre-session — the launchpad's own repo-picker row already
+   *  shows the branch as a chip (`repo.branchLabel`), so the footer skips it there to avoid
+   *  showing the same branch name twice in one composer. */
+  repoBranch?: string
+
+  /** The most recently COMPLETED turn's real token counts (`MessageStats.promptTokens`/
+   *  `genTokens`, chat-types.ts — real, backend-tracked data, not an estimate). Powers the stats
+   *  footer's `↑`/`↓` readout (ADR-262). Both undefined (the default) renders no token segment
+   *  at all rather than a misleading 0/0 — this is genuinely not wired from any caller yet (no
+   *  per-turn stats are threaded into this component today), so it stays invisible until a
+   *  caller starts passing real numbers. See CodeComposer's footer doc comment for the exact
+   *  follow-up this needs (a `CodeSessionScreen.tsx` change, outside this task's scope). */
+  lastPromptTokens?: number
+  lastGenTokens?: number
+
   /** '/' commands this composer variant supports (e.g. compact only applies mid-session, not on
    *  the launchpad's "start a new session" composer — see CodeSessionScreen/CodeHomeScreen for
    *  which list each passes). Selecting one INSERTS the token (`/id `), it does not submit —
@@ -241,11 +276,11 @@ export interface CodeComposerProps {
 
 export function CodeComposer({
   inputRef, value, onValueChange, onSubmit, placeholder, textareaDisabled,
-  repo, repoRoot, mode, onModeChange,
+  repo, repoRoot, repoBranch, mode, onModeChange,
   models, loadedKey, loadedName, modelPending, ejecting, onLoadModel, onEjectModel, onModelSettings,
   ctxUsed, ctxMax, live, onStop, sendDisabled,
   onAddContext, contextFiles, onRemoveContextFile, hintText, statusText, slashCommands = [],
-  thinkingBudget, onThinkingBudgetChange, onImagesChange,
+  thinkingBudget, onThinkingBudgetChange, onImagesChange, lastPromptTokens, lastGenTokens,
 }: CodeComposerProps) {
   const ModeIcon = MODE_ICONS[mode.id]
 
@@ -714,6 +749,13 @@ export function CodeComposer({
               if (e.key === 'Tab') { e.preventDefault(); selectMention(mentionResults[Math.min(mentionIndex, mentionResults.length - 1)]); return }
               if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); selectMention(mentionResults[Math.min(mentionIndex, mentionResults.length - 1)]); return }
               if (e.key === 'Escape') { e.preventDefault(); setMentionDismissed(true); return }
+            } else if (e.key === 'Escape' && live && onStop) {
+              // Real, functional shortcut (not just advertised) — matches pi's own "escape
+              // interrupt" convention (spec 14 §2.3). Gated behind the picker checks above so it
+              // never fires while a popover is open and Escape's job there is to dismiss it.
+              e.preventDefault()
+              onStop()
+              return
             }
             if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSubmit() }
           }}
@@ -835,37 +877,73 @@ export function CodeComposer({
         </div>
       </div>
       </div>
-      {/* Persistent status/keybind footer (task #8, ADR-249) — ALWAYS rendered now, replacing
-          the old `{!statusText && <p>{hintText}</p>}` this block used to be. That version hid
-          for the FULL duration of every live run (statusText is set whenever `live` is true, not
-          just during manual /compact), which is exactly the "hide-while-busy" behavior spec 15
-          §4 calls out to fix — a persistent terminal-status-line footer (spec 14 §2.3's
-          reference: pi's own "1.7%/272k (auto)") should stay put. Mode + context stay accurate
-          regardless of state; only the keybind-hint segment still hides, and only while
-          `textareaDisabled` (manual /compact) — that's the one state "Enter to send" is
-          genuinely WRONG (the textarea can't be typed into at all), the same case the founder's
-          2026-07-17 report originally flagged.
-          Mode and context % are already visible in the toolbar above (the mode button, the
-          ContextUsageRing) — repeating them here read as pure clutter in real use (founder
-          feedback, 2026-07-24), so this footer is keybind hints only, the one thing that ISN'T
-          shown anywhere else. `/`/`@` hints only appear when those pickers can actually open
-          right now (real slashCommands present, a repo root to search, and not `live` — both
-          pickers gate on `!live` themselves) — no hint for a key that doesn't do anything in this
-          composer instance.
-          `flex-wrap` instead of the toolbar's own `overflow-x-auto` (flagged in the original
-          audit as a narrow-phone workaround, not a pattern worth repeating): on a narrow
-          viewport this wraps to a second line rather than clipping or requiring horizontal
-          scroll. */}
+      {/* Persistent stats/keybind footer (ADR-262) — the REAL footer ADR-249 originally intended
+          and task #8 shipped as a keybind-only placeholder for. Audited against every other
+          display in this file first (founder-specified hard constraint — this composer already
+          shipped and had to walk back one duplication today: the old version of THIS footer
+          repeating the toolbar's mode label + ContextUsageRing's context%):
+            - Mode is NOT repeated here — the toolbar's mode dropdown button is still the one
+              place it's shown, unchanged.
+            - Model name is NOT repeated here either, even though ADR-262's own reference list
+              includes "model" — ModelLoadMenu's trigger already shows `loadedName` as permanent
+              visible text (not just an icon), so adding it here would be the exact literal-text
+              duplication class of bug, not a judgment call.
+            - Context %/max IS shown here, as the actual digits — ContextUsageRing communicates
+              roughly the same information via ring color + a hover tooltip, but never renders the
+              percentage as always-visible text; this is genuinely the one place you can read the
+              precise number without hovering or opening the Sheet, matching how pi/opencode's own
+              footers are the ONLY place their percentage appears.
+            - Thinking effort IS shown here, compactly — the toolbar's Brain icon color-codes
+              on/off but never shows the actual budget value except in its title tooltip or its own
+              open dropdown; this is new information, not a repeat.
+            - Branch/cwd render ONLY in the mid-session variant (no `repo` prop) — pre-session, the
+              launchpad's own repo-picker row already shows both (repoPath's folder name in the
+              trigger, `repo.branchLabel` as a chip), so repeating them here would duplicate that
+              row specifically.
+            - Tokens ↑/↓ (`lastPromptTokens`/`lastGenTokens`) are real backend-tracked data
+              (`MessageStats.promptTokens`/`genTokens`, chat-types.ts) — NOT fabricated, NOT an
+              estimate — but nothing feeds these props yet (no per-turn stats are threaded into
+              this component today); they simply render nothing until a caller (CodeSessionScreen.tsx,
+              outside this composer-only task's scope) starts passing real numbers. Left as a ready
+              receiving end rather than omitted outright, so wiring it later is a small follow-up
+              rather than new composer-side plumbing.
+          Keybinds are now genuinely PERMANENT (no more hiding while `textareaDisabled`) — each
+          clause instead governs its own accuracy: "Enter to send" only claims true when the
+          textarea can actually be typed into; "Esc to stop" only appears once a run is actually
+          live (and is now a REAL handler on the textarea above, not just an advertised label).
+          `flex-wrap` instead of the toolbar's own `overflow-x-auto` (flagged in the original audit
+          as a narrow-phone workaround, not a pattern worth repeating): on a narrow viewport this
+          wraps to a second line rather than clipping or requiring horizontal scroll.
+          `font-mono tabular-nums` on the stats segment specifically — genuinely data/stats
+          content, the same carve-out the context stat already established (ADR-252/262). */}
       <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-0.5 px-1 text-[11px] text-faint">
-        {!textareaDisabled && (
-          <span className="min-w-0 truncate">
-            {[
-              hintText,
-              !live && slashCommands.length > 0 ? '/ for commands' : null,
-              !live && effectiveRepoRoot ? '@ to mention a file' : null,
-            ].filter(Boolean).join(' · ')}
+        <span className="inline-flex shrink-0 items-center gap-2 font-mono tabular-nums">
+          <span title={thinkingCompactLabel(thinkingBudget)}>{thinkingCompactLabel(thinkingBudget)}</span>
+          {ctxMax > 0 && (
+            <span title={`Context: ${ctxUsed.toLocaleString()} / ${ctxMax.toLocaleString()} tokens`}>
+              {Math.round(Math.min(1, ctxUsed / ctxMax) * 100)}%/{fmtCompactTokens(ctxMax)}
+            </span>
+          )}
+          {lastPromptTokens !== undefined && lastGenTokens !== undefined && (
+            <span title={`Last turn: ${lastPromptTokens.toLocaleString()} prompt, ${lastGenTokens.toLocaleString()} generated`}>
+              &uarr;{fmtCompactTokens(lastPromptTokens)} &darr;{fmtCompactTokens(lastGenTokens)}
+            </span>
+          )}
+        </span>
+        {!repo && (repoBranch || effectiveRepoRoot) && (
+          <span className="inline-flex min-w-0 shrink-0 items-center gap-1 truncate">
+            {repoBranch && <span className="truncate">{repoBranch}</span>}
+            {effectiveRepoRoot && <span className="truncate text-faint">{repoBranch ? ' · ' : ''}{folderName(effectiveRepoRoot)}</span>}
           </span>
         )}
+        <span className="ml-auto min-w-0 truncate">
+          {[
+            !textareaDisabled ? hintText : null,
+            !live && slashCommands.length > 0 ? '/ for commands' : null,
+            !live && effectiveRepoRoot ? '@ to mention a file' : null,
+            live ? 'Esc to stop' : null,
+          ].filter(Boolean).join(' · ')}
+        </span>
       </div>
     </div>
   )

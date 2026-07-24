@@ -2,7 +2,7 @@ import { useRef, useState } from 'react'
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
-import { CodeComposer, type CodeComposerProps, type PendingImage } from './CodeComposer'
+import { CodeComposer, type CodeComposerProps, type PendingImage, type RepoPickerState } from './CodeComposer'
 import { AGENT_MODES } from './code-mock'
 import { steerOutcomeMessage } from '../../lib/code-api'
 import { toast } from '../../components/ui/sonner'
@@ -45,22 +45,42 @@ vi.mock('../../lib/api', async (importOriginal) => {
   }
 })
 
+/** Minimal RepoPickerState — enough to render the pre-session repo/worktree row without
+ *  crashing; individual fields overridden per-test where the exact displayed text matters. */
+function makeRepo(overrides: Partial<RepoPickerState> = {}): RepoPickerState {
+  return {
+    repoPath: '/repo', recentRepos: [], onChoose: () => {}, onBrowse: () => {},
+    branchLabel: 'main', branchTitle: 'main', useWorktree: false, onWorktreeChange: () => {},
+    branchName: '', onBranchNameChange: () => {}, branchNamePlaceholder: '',
+    baseBranch: 'main', onBaseBranchChange: () => {}, repoBranches: [], currentBranch: 'main',
+    ...overrides,
+  }
+}
+
 /** Minimal stateful wrapper — CodeComposer is a controlled component (value/onValueChange), so
  *  a real harness needs to actually apply the callback back into `value` for typing/selecting
  *  to behave like it does in the app, not just record calls. */
 function Harness({
-  repoRoot, onSubmit = () => {}, onImagesChange,
+  repoRoot, repo, repoBranch, onSubmit = () => {}, onImagesChange, onStop,
   mode = AGENT_MODES[0], ctxUsed = 0, ctxMax = 0, live, textareaDisabled, slashCommands,
+  thinkingBudget = -1, loadedName = null, lastPromptTokens, lastGenTokens,
 }: {
   repoRoot?: string
+  repo?: RepoPickerState
+  repoBranch?: string
   onSubmit?: () => void
   onImagesChange?: (images: PendingImage[]) => void
+  onStop?: () => void
   mode?: (typeof AGENT_MODES)[number]
   ctxUsed?: number
   ctxMax?: number
   live?: boolean
   textareaDisabled?: boolean
   slashCommands?: { id: string; description: string }[]
+  thinkingBudget?: number
+  loadedName?: string | null
+  lastPromptTokens?: number
+  lastGenTokens?: number
 }) {
   const [value, setValue] = useState('')
   const inputRef = useRef<HTMLTextAreaElement>(null)
@@ -72,11 +92,13 @@ function Harness({
       onSubmit={onSubmit}
       placeholder="Describe a task…"
       repoRoot={repoRoot}
+      repo={repo}
+      repoBranch={repoBranch}
       mode={mode}
       onModeChange={() => {}}
       models={[]}
-      loadedKey={null}
-      loadedName={null}
+      loadedKey={loadedName ? 'k1' : null}
+      loadedName={loadedName}
       modelPending={false}
       ejecting={false}
       onLoadModel={() => {}}
@@ -84,13 +106,16 @@ function Harness({
       ctxUsed={ctxUsed}
       ctxMax={ctxMax}
       live={live}
+      onStop={onStop}
       textareaDisabled={textareaDisabled}
       sendDisabled={false}
       hintText="Enter to send"
-      thinkingBudget={-1}
+      thinkingBudget={thinkingBudget}
       onThinkingBudgetChange={() => {}}
       onImagesChange={onImagesChange}
       slashCommands={slashCommands}
+      lastPromptTokens={lastPromptTokens}
+      lastGenTokens={lastGenTokens}
     />
   )
 }
@@ -233,16 +258,64 @@ describe('CodeComposer image paste', () => {
   })
 })
 
-describe('CodeComposer persistent status/keybind footer', () => {
-  // Founder feedback (2026-07-24), testing the real UI: mode + context % duplicated in the
-  // footer what the toolbar's mode button and ContextUsageRing already show, right above it —
-  // pure clutter in practice, cut regardless of the original "mirrors pi's footer" rationale.
-  // The footer is keybind hints only now — the one thing genuinely not shown anywhere else.
-  it('does not duplicate the mode or context percentage the toolbar already shows', () => {
-    render(<Harness mode={AGENT_MODES[1]} ctxUsed={25} ctxMax={100} />)
-    // "Plan first" appears exactly once now — only the toolbar's mode-picker button.
+describe('CodeComposer real stats footer (ADR-262)', () => {
+  it('shows context %/max as real digits — genuinely new info, NOT a duplicate (ContextUsageRing never renders % as text)', () => {
+    render(<Harness ctxUsed={25} ctxMax={100} />)
+    expect(screen.getByText('25%/100')).toBeInTheDocument()
+  })
+
+  it('omits the context segment entirely when ctxMax is 0 (no NaN%, matches ContextUsageRing\'s own guard)', () => {
+    render(<Harness ctxUsed={0} ctxMax={0} />)
+    expect(screen.queryByText(/%\//)).not.toBeInTheDocument()
+  })
+
+  it('shows a compact thinking-effort readout — genuinely new info (the Brain icon never shows the value as text)', () => {
+    const { rerender } = render(<Harness thinkingBudget={-1} />)
+    expect(screen.getByText('Think: Unlimited')).toBeInTheDocument()
+    rerender(<Harness thinkingBudget={0} />)
+    expect(screen.getByText('Think: Off')).toBeInTheDocument()
+    rerender(<Harness thinkingBudget={4000} />)
+    expect(screen.getByText('Think: 4.0k')).toBeInTheDocument()
+  })
+
+  it('does NOT duplicate mode (toolbar button only) or model name (ModelLoadMenu trigger only)', () => {
+    render(<Harness mode={AGENT_MODES[1]} loadedName="Qwen3.6-35B" ctxUsed={25} ctxMax={100} />)
+    // "Plan first" appears exactly once — only the toolbar's mode-picker button, never repeated.
     expect(screen.getAllByText('Plan first')).toHaveLength(1)
-    expect(screen.queryByText(/% ctx/)).not.toBeInTheDocument()
+    // Model name is ALREADY always-visible text via ModelLoadMenu — the footer must never repeat it,
+    // even though ADR-262's own reference list mentions "model" (see CodeComposer.tsx's footer
+    // doc comment for why this one specifically stays toolbar-only).
+    expect(screen.getAllByText('Qwen3.6-35B')).toHaveLength(1)
+  })
+
+  it('shows branch/cwd ONLY mid-session (no `repo` prop) — pre-session, the repo-picker row already shows both', () => {
+    const { rerender } = render(<Harness repoRoot="/Users/me/projects/my-app" repoBranch="feature/x" />)
+    expect(screen.getByText('feature/x')).toBeInTheDocument()
+    expect(screen.getByText('my-app', { exact: false })).toBeInTheDocument()
+
+    // Pre-session: `repo` present → repo-picker row shows the folder name AND repo.branchLabel as
+    // its own chip already, so the footer must suppress its own copy to avoid a real duplicate.
+    rerender(<Harness repo={makeRepo({ repoPath: '/Users/me/projects/my-app', branchLabel: 'feature/x' })} repoBranch="feature/x" />)
+    // "feature/x" still legitimately appears once (the repo row's chip) — assert it did NOT
+    // become two after adding the footer's branch prop, i.e. the footer suppressed its own copy.
+    expect(screen.getAllByText('feature/x')).toHaveLength(1)
+  })
+
+  it('omits tokens ↑/↓ when not wired (undefined props) — never fabricates 0/0', () => {
+    render(<Harness />)
+    expect(screen.queryByText(/↑/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/↓/)).not.toBeInTheDocument()
+  })
+
+  it('shows real tokens ↑/↓ once a caller passes them', () => {
+    render(<Harness lastPromptTokens={4700} lastGenTokens={44} />)
+    expect(screen.getByText('↑4.7k ↓44')).toBeInTheDocument()
+  })
+
+  it('never shows a cost figure — local models have no per-token cost, so it is omitted, not a misleading $0.00', () => {
+    // ADR-249's own earlier finding, reaffirmed by ADR-262: cost stays out of scope regardless.
+    const { container } = render(<Harness ctxUsed={25} ctxMax={100} lastPromptTokens={100} lastGenTokens={10} live />)
+    expect(container.textContent).not.toContain('$')
   })
 
   it('shows the "/" and "@" hints only when those pickers are actually available', () => {
@@ -255,23 +328,18 @@ describe('CodeComposer persistent status/keybind footer', () => {
     expect(screen.getByText(/mention a file/)).toBeInTheDocument()
   })
 
-  it('drops the "/" and "@" hints while a run is live (both pickers gate on !live), but keeps the base hint text', () => {
+  it('drops the "/" and "@" hints while a run is live (both pickers gate on !live), shows "Esc to stop" instead', () => {
     render(<Harness repoRoot="/repo" slashCommands={[{ id: 'compact', description: 'x' }]} live />)
-    expect(screen.getByText('Enter to send')).toBeInTheDocument()
     expect(screen.queryByText(/for commands/)).not.toBeInTheDocument()
     expect(screen.queryByText(/mention a file/)).not.toBeInTheDocument()
+    expect(screen.getByText(/Esc to stop/)).toBeInTheDocument()
   })
 
-  it('hides the keybind-hint segment entirely while the textarea is disabled (manual /compact) — "Enter to send" would be wrong then', () => {
-    render(<Harness textareaDisabled />)
+  it('the footer stays visible while textareaDisabled (permanent now, no more hide-while-busy) — only the "Enter to send" clause specifically is dropped, since it would be wrong then', () => {
+    render(<Harness textareaDisabled ctxUsed={25} ctxMax={100} />)
     expect(screen.queryByText('Enter to send')).not.toBeInTheDocument()
-  })
-
-  it('never shows a cost figure — local models have no per-token cost, so it is omitted, not a misleading $0.00', () => {
-    // Phase 2 resolved the open cost-field question by omitting it for Code (100%-local). Guard that
-    // no "$"-prefixed cost ever leaks into the composer/footer.
-    const { container } = render(<Harness ctxUsed={25} ctxMax={100} live />)
-    expect(container.textContent).not.toContain('$')
+    // Stats stay put — this was the whole point of making the footer permanent.
+    expect(screen.getByText('25%/100')).toBeInTheDocument()
   })
 
   it('keybind-hint honesty: the advertised "Enter to send" actually submits on Enter', async () => {
@@ -285,6 +353,27 @@ describe('CodeComposer persistent status/keybind footer', () => {
     expect(screen.getByText(/Enter to send/)).toBeInTheDocument()
     await user.type(textarea, '{Enter}')
     expect(onSubmit).toHaveBeenCalledTimes(1)
+  })
+
+  it('keybind-hint honesty: the advertised "Esc to stop" actually stops on Escape while live', async () => {
+    const user = userEvent.setup()
+    const onStop = vi.fn()
+    render(<Harness live onStop={onStop} />)
+    const textarea = screen.getByPlaceholderText('Describe a task…')
+    expect(screen.getByText(/Esc to stop/)).toBeInTheDocument()
+    textarea.focus()
+    await user.keyboard('{Escape}')
+    expect(onStop).toHaveBeenCalledTimes(1)
+  })
+
+  it('Escape does NOT stop when not live (no false claim, nothing to stop)', async () => {
+    const user = userEvent.setup()
+    const onStop = vi.fn()
+    render(<Harness live={false} onStop={onStop} />)
+    const textarea = screen.getByPlaceholderText('Describe a task…')
+    textarea.focus()
+    await user.keyboard('{Escape}')
+    expect(onStop).not.toHaveBeenCalled()
   })
 })
 

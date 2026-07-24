@@ -145,6 +145,13 @@ export type CodeSseEvent =
   | { event: 'turn';      data: { phase: 'start'; index: number } | { phase: 'end'; index: number; toolResults: number } }
   | { event: 'retry';     data: { phase: 'start'; attempt: number; maxAttempts: number; delayMs: number; message: string } | { phase: 'end'; attempt: number; success: boolean; message?: string } }
   | { event: 'tool_progress'; data: { id: string; name: string; partial: string } }
+  // 'prefill' (llama.cpp only): prompt-processing progress BEFORE the first token, polled off
+  // the engine's /slots endpoint independently of the pi SDK. Emitted only on a `pct` change
+  // (deduped) and stops firing at completion or the first real token — so it's always done by the
+  // time any delta/reasoning arrives. Silently absent on non-llama.cpp engines or when /slots is
+  // unavailable: "no prefill frame ever arrives, generation just starts" is the NORMAL path, not
+  // an error. `processed`/`total` are prompt tokens; `pct` is the rounded percentage.
+  | { event: 'prefill';   data: { processed: number; total: number; pct: number } }
   // 'todos' (ADR-255): the model's current plan for THIS turn, via pi's `update_todos` tool.
   // Full-list replace each time, not incremental — same "cumulative snapshot" shape as
   // tool_progress. The backend resets its own todos at the start of every new turn, so this

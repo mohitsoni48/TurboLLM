@@ -47,7 +47,7 @@
      row highlight, is NOT Code-specific — candidate for a spec-11 app-wide
      token instead; left out of this Code-scoped layer pending that decision. */
   --instruction-border: color-mix(in srgb, var(--accent) 35%, var(--border));
-  --instruction-bg: color-mix(in srgb, var(--accent) 6%, transparent);
+  --instruction-bg: color-mix(in srgb, var(--accent) 14%, transparent);
   --instruction-chip-border: color-mix(in srgb, var(--accent) 25%, var(--border));
   /* Status banner border reuses --instruction-border (identical 35%-accent-
      over-border math at both call sites); only the background differs. */

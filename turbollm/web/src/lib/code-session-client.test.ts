@@ -435,3 +435,73 @@ describe('CodeSessionClient — todos (ADR-255)', () => {
     expect(lastLive(liveStates)!.todos).toEqual([{ content: 'Step 1', status: 'in_progress' }])
   })
 })
+
+describe('CodeSessionClient — prefill (llama.cpp /slots progress)', () => {
+  const lastLive = (states: (LiveState | null)[]) => states.filter((s): s is LiveState => s !== null).at(-1)
+
+  it('reduces a prefill frame into LiveState.prefill, latest snapshot winning', async () => {
+    const { handlers, liveStates } = makeHandlers()
+    const stream = streamOf([
+      { event: 'meta', data: { userMessageId: 'u1', assistantMessageId: 'a1' }, seq: 0 },
+      { event: 'prefill', data: { processed: 512, total: 2048, pct: 25 }, seq: 1 },
+      { event: 'prefill', data: { processed: 1536, total: 2048, pct: 75 }, seq: 2 },
+    ] as CodeStreamEvent[])
+    new CodeSessionClient('s1', handlers, stream).connect()
+    await flush()
+    // Deduped/latest-wins: the second frame replaces the first.
+    expect(lastLive(liveStates)!.prefill).toEqual({ processed: 1536, total: 2048, pct: 75 })
+  })
+
+  it('clears prefill to null the instant the first content delta arrives', async () => {
+    const { handlers, liveStates } = makeHandlers()
+    const stream = streamOf([
+      { event: 'meta', data: { userMessageId: 'u1', assistantMessageId: 'a1' }, seq: 0 },
+      { event: 'prefill', data: { processed: 2000, total: 2048, pct: 98 }, seq: 1 },
+      { event: 'delta', data: { delta: 'Hello' }, seq: 2 },
+    ] as CodeStreamEvent[])
+    new CodeSessionClient('s1', handlers, stream).connect()
+    await flush()
+    const final = lastLive(liveStates)!
+    expect(final.prefill).toBeNull()
+    expect(final.content).toBe('Hello')
+  })
+
+  it('clears prefill to null when the first token is a reasoning delta (thinking model)', async () => {
+    const { handlers, liveStates } = makeHandlers()
+    const stream = streamOf([
+      { event: 'meta', data: { userMessageId: 'u1', assistantMessageId: 'a1' }, seq: 0 },
+      { event: 'prefill', data: { processed: 1000, total: 1000, pct: 100 }, seq: 1 },
+      { event: 'reasoning', data: { delta: 'let me think' }, seq: 2 },
+    ] as CodeStreamEvent[])
+    new CodeSessionClient('s1', handlers, stream).connect()
+    await flush()
+    const final = lastLive(liveStates)!
+    expect(final.prefill).toBeNull()
+    expect(final.reasoning).toBe('let me think')
+  })
+
+  it('clears prefill on turn end (done discards the whole live state → next turn has no stale bar)', async () => {
+    const { handlers } = makeHandlers()
+    const stream = streamOf([
+      { event: 'meta', data: { userMessageId: 'u1', assistantMessageId: 'a1' }, seq: 0 },
+      { event: 'prefill', data: { processed: 500, total: 1000, pct: 50 }, seq: 1 },
+      { event: 'done', data: { contextUsed: 1, contextMax: 2, aborted: false }, seq: 2 },
+    ] as CodeStreamEvent[])
+    new CodeSessionClient('s1', handlers, stream).connect()
+    await flush()
+    // The turn ended: live is null, so there's no prefill left to render.
+    expect(handlers.onLive).toHaveBeenLastCalledWith(null)
+  })
+
+  it('is undefined when no prefill frame ever arrives (non-llama.cpp / sub-poll prompt — the normal path)', async () => {
+    const { handlers, liveStates } = makeHandlers()
+    const stream = streamOf([
+      { event: 'meta', data: { userMessageId: 'u1', assistantMessageId: 'a1' }, seq: 0 },
+      { event: 'delta', data: { delta: 'straight to generation' }, seq: 1 },
+    ] as CodeStreamEvent[])
+    new CodeSessionClient('s1', handlers, stream).connect()
+    await flush()
+    // Falsy (never-set undefined, or nulled by the delta clear) — either way no bar renders.
+    expect(lastLive(liveStates)!.prefill).toBeFalsy()
+  })
+})

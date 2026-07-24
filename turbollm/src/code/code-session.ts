@@ -291,6 +291,17 @@ export const PATH_TOOLS = new Set(['read', 'edit', 'write', 'grep', 'find', 'ls'
 // model that legitimately repeats a call a few times is unaffected — only a genuine loop is cut.
 export const LOOP_BREAK_AFTER = 3
 
+// The soft nudge above assumes the model actually reads and acts on the blocked-call result — a
+// genuinely stuck weak/local model can just re-emit the exact same call again anyway, and
+// ToolLoopTracker.record() has no ceiling (a re-tripped signature keeps incrementing forever, see
+// its own test), so nothing was stopping this from repeating indefinitely — reproduced live
+// (founder-reported, 2026-07-24: the nudge fired and had "no effect", the run stayed stuck).
+// LOOP_ABORT_AFTER is the hard ceiling: after this many consecutive identical calls (i.e. the
+// model ignored LOOP_ABORT_AFTER - LOOP_BREAK_AFTER separate nudges), stop assuming it'll
+// self-heal and abort the run outright via session.abort() — the same real-stop path a user's own
+// Stop button uses, so it surfaces as a genuinely stopped run (stats.aborted), not a silent hang.
+export const LOOP_ABORT_AFTER = LOOP_BREAK_AFTER + 3
+
 /** Order-stable signature of a tool call: the name plus its arguments with object keys sorted at
  *  every depth, so a model re-emitting the same call with its keys in a different order still
  *  compares equal. Pure. */
@@ -518,6 +529,47 @@ export function summarizeTodos(todos: TodoItem[]): string {
   const parts = [`${completed}/${todos.length} done`]
   if (inProgress > 0) parts.push(`${inProgress} in progress`)
   return `Tracking ${todos.length} step(s): ${parts.join(', ')}.`
+}
+
+// ── Real prefill (prompt-processing) progress via llama.cpp /slots ─────────────────
+// Founder-reported: Code shows the prompt-processing phase as a generic "thinking" spinner while
+// Chat shows a real progress bar. Chat gets it by hand-parsing llama.cpp's own `prompt_progress`
+// SSE field from its own raw HTTP call; Code goes through pi's `openai` client, which never
+// surfaces that field. So we read progress OUT OF BAND from the engine's own `/slots` endpoint
+// (enabled by default, no --slots flag) while a provider request is in flight — independent of pi's
+// request entirely. `pct = n_prompt_tokens_processed / n_prompt_tokens`.
+export const PREFILL_POLL_MS = 300
+
+export interface PrefillProgress { processed: number; total: number; pct: number }
+
+function isProcessingSlot(s: unknown): s is { n_prompt_tokens: number; n_prompt_tokens_processed: number } {
+  if (!s || typeof s !== 'object') return false
+  const r = s as Record<string, unknown>
+  return r.is_processing === true && typeof r.n_prompt_tokens === 'number' && typeof r.n_prompt_tokens_processed === 'number'
+}
+
+/** Pick THIS request's prefill progress out of a llama.cpp `/slots` response — pure/exported so the
+ *  slot-matching + percentage logic is testable without a live engine (mirrors codeEventToFrame's
+ *  extract-pure-decision-logic pattern). Returns null ("emit nothing this poll") for anything
+ *  unusable: a non-array body, no slot actively processing, a zero/absent prompt-token total, or
+ *  processed<0.
+ *
+ *  Slot matching: returns null when MORE THAN ONE slot is processing at once. The in-app gate
+ *  (gate.ts) serializes Code+Chat generations and llama.cpp defaults to --parallel 1 (a single
+ *  slot), so the normal case has exactly one processing slot that is unambiguously ours. Only a
+ *  user-set --parallel>1 running a genuinely concurrent generation the gate does NOT cover (gateway
+ *  / Claude-Code traffic never takes the gate) can light up two slots simultaneously — and pi's
+ *  openai client never exposes the llama.cpp `id_task` needed to correlate precisely, so we refuse
+ *  to guess and show nothing rather than risk attributing another request's progress to this turn. */
+export function pickPrefillProgress(slots: unknown): PrefillProgress | null {
+  if (!Array.isArray(slots)) return null
+  const processing = slots.filter(isProcessingSlot)
+  if (processing.length !== 1) return null
+  const total = processing[0].n_prompt_tokens
+  const processed = processing[0].n_prompt_tokens_processed
+  if (!(total > 0) || processed < 0) return null
+  const pct = Math.min(100, Math.max(0, Math.round((processed / total) * 100)))
+  return { processed, total, pct }
 }
 
 /**
@@ -1006,6 +1058,40 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
   const mcpToolNames = new Set(mcpToolDefs.map((t) => t.function.name))
 
   // ── the inline extension: containment + approval + diff plumbing ──────────────
+  // Prefill progress poller (see pickPrefillProgress above) — reads the engine's /slots endpoint
+  // while a provider request is in flight and relays a `prefill` SSE frame. Lifecycle is per
+  // agentic ROUND: started in before_provider_request, stopped the instant prefill completes
+  // (processed>=total), the first real token streams (message_update, a cross-check against stale
+  // slot numbers), the response ends, or the turn aborts. A self-rearming setTimeout — NOT
+  // setInterval — so a slow /slots fetch never stacks overlapping polls; every /slots failure or
+  // odd shape is swallowed, because prefill telemetry must never break the actual generation.
+  let prefillTimer: ReturnType<typeof setTimeout> | undefined
+  let prefillActive = false
+  const stopPrefillPoll = (): void => {
+    prefillActive = false
+    if (prefillTimer) { clearTimeout(prefillTimer); prefillTimer = undefined }
+  }
+  const startPrefillPoll = (): void => {
+    stopPrefillPoll()
+    prefillActive = true
+    let lastPct = -1
+    const tick = async (): Promise<void> => {
+      if (!prefillActive) return
+      try {
+        const res = await fetch(`${target}/slots`, { signal })
+        if (res.ok) {
+          const progress = pickPrefillProgress(await res.json())
+          if (progress && prefillActive) {
+            if (progress.pct !== lastPct) { lastPct = progress.pct; void sink({ event: 'prefill', data: { ...progress } }) }
+            if (progress.processed >= progress.total) { stopPrefillPoll(); return }
+          }
+        }
+      } catch { /* /slots must never break generation — skip this turn's prefill silently */ }
+      if (prefillActive) prefillTimer = setTimeout(() => void tick(), PREFILL_POLL_MS)
+    }
+    prefillTimer = setTimeout(() => void tick(), PREFILL_POLL_MS)
+  }
+
   const extension = (pi: ExtensionAPI): void => {
     // Background-priority engine slot, acquired/released around each provider request. Also
     // where the thinking budget is injected: pi makes its own provider HTTP call (registered
@@ -1019,6 +1105,9 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       // (see gate.ts's own comment for the incident this fixed) rather than hanging the whole
       // turn forever with no way to cancel it.
       if (d.gate) heldGate = await d.gate.acquire('bg', { signal })
+      // Gate acquired, request is about to go out — begin polling /slots for prefill progress for
+      // THIS round (stopped on first token / completion / response end / abort). Best-effort.
+      startPrefillPoll()
       const payload = { ...(event.payload as Record<string, unknown>) }
       // Strip the completion-length cap pi derives from this model's declared `maxTokens` (a
       // fixed ceiling set once in the model metadata above, at model-load time). Sent verbatim as
@@ -1043,7 +1132,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       }
       return payload // unlimited (default) — still stripped of the stale max_tokens ceiling
     })
-    pi.on('after_provider_response', () => { releaseGate() })
+    pi.on('after_provider_response', () => { stopPrefillPoll(); releaseGate() })
 
     // No turn_start reset — deliberately. pi fires `turn_start` once per agentic ROUND (it carries
     // an incrementing turnIndex; `agent_start` is the per-task boundary), so resetting here cleared
@@ -1065,8 +1154,22 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       // 0. Loop breaker — BEFORE containment/mode, so it catches a stuck model regardless of tool
       //    or mode. A weak local model can fire the SAME call with the SAME args indefinitely; once
       //    it has done so more than LOOP_BREAK_AFTER times in a row, stop executing it and hand the
-      //    model a break-the-loop instruction as the (blocked) result instead. Silent to the user.
-      if (toolLoop.record(toolName, input) > LOOP_BREAK_AFTER) {
+      //    model a break-the-loop instruction as the (blocked) result instead.
+      const loopCount = toolLoop.record(toolName, input)
+      if (loopCount > LOOP_ABORT_AFTER) {
+        // The nudge below didn't work — LOOP_ABORT_AFTER - LOOP_BREAK_AFTER separate nudges were
+        // sent and the model kept re-emitting the exact same call anyway. Stop assuming it'll
+        // self-heal: abort the run for real (same path the user's own Stop button uses, so this
+        // surfaces as a genuinely stopped run — stats.aborted — not a silent hang) rather than
+        // trip the same soft block forever (founder-reported live, 2026-07-24: "no effect").
+        const reason = `[SYSTEM: \`${toolName}\` was called with identical arguments ${loopCount} times ` +
+          'in a row, including after being told to stop — this run has been stopped automatically ' +
+          'rather than continue looping. Start a new turn with different instructions to try again.]'
+        await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
+        void session.abort()
+        return { block: true, reason }
+      }
+      if (loopCount > LOOP_BREAK_AFTER) {
         const reason = `[SYSTEM: you have called \`${toolName}\` with identical arguments too many ` +
           'times in a row and it is not making progress — this call was NOT executed. Stop repeating ' +
           'it: take a different action, call it with different arguments, or, if you already have what ' +
@@ -1530,6 +1633,9 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
   // (ADR-250). `turnCounter` is this run's own monotonic turn index, mutated across events.
   const turnCounter = { index: 0 }
   const unsubscribe = session.subscribe((ev: AgentSessionEvent) => {
+    // First real model output means prefill is over — stop the /slots poller now, a cross-check in
+    // case a slot's numbers never quite reach n_prompt_tokens (stale/rounding) before decode begins.
+    if (ev.type === 'message_update') stopPrefillPoll()
     const frame = codeEventToFrame(ev, turnCounter)
     if (frame) void sink(frame)
   })
@@ -1557,6 +1663,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     await session.prompt(task)
   } finally {
     params.onSteerable?.(null)
+    stopPrefillPoll() // belt-and-suspenders: never leak the /slots timer past the turn (incl. abort)
     unsubscribe()
     releaseGate()
     d.manager.generationEnd()

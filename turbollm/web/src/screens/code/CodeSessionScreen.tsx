@@ -31,6 +31,7 @@ import { readSavedSidebarWidth, SIDEBAR_MIN_W, sidebarMaxW, SidebarResizeHandle 
 import { ModelDetailDialog } from '../models/ModelDetailDialog'
 import { FsBrowser } from '../engines/FsBrowser'
 import { CodeComposer } from './CodeComposer'
+import { CodeResourcesHeader } from './CodeResourcesHeader'
 import { CodeGitDialog } from './CodeGitDialog'
 import { CodeTranscript, CodeTranscriptSkeleton, TodoChecklist } from './CodeTranscript'
 import { AGENT_MODES, type AgentModeId } from './code-mock'
@@ -704,6 +705,18 @@ export function CodeSessionScreen() {
           )}
         </div>
 
+        {/* Loaded-resources header (ADR-262) — a collapsible strip surfacing the AGENTS.md +
+            skills persona.ts loads server-side but the UI never showed. Fixed below the title bar
+            (not scrolling with the transcript) so it stays a glanceable resource indicator.
+            Deliberately no mode/model/context here — those have their single home in the composer
+            (ADR-262's no-duplication constraint). */}
+        {session && !notFound && (
+          <CodeResourcesHeader
+            skillCount={skillsQ.data?.length ?? 0}
+            hasAgentsMd={detailQ.data?.hasAgentsMd ?? { project: false, global: false }}
+          />
+        )}
+
         {/* Transcript — activity-log presentation (CodeTranscript.tsx), not
             chat's bubble stack. See that file's header comment for the full
             rationale. */}
@@ -752,7 +765,7 @@ export function CodeSessionScreen() {
               <CodeTranscript
                 messages={transcriptMessages}
                 liveAssistantId={live?.assistantId}
-                live={live ? { timeline: live.timeline, reasoning: live.reasoning, compacting: live.compacting, retry: live.retry } : null}
+                live={live ? { timeline: live.timeline, reasoning: live.reasoning, compacting: live.compacting, retry: live.retry, prefill: live.prefill } : null}
                 onRevert={live || queued.length > 0 ? undefined : openRevertConfirm}
                 queued={queued}
                 onSendNowQueued={(id) => void handleSendNow(id)}
@@ -781,10 +794,12 @@ export function CodeSessionScreen() {
             feedback, 2026-07-24: rendering it inline in the transcript, per the original #16
             build, meant it scrolled away the moment there was enough reasoning/tool output to
             push it off-screen — exactly wrong for something meant to stay visible as a reference
-            while the turn runs). `bg-panel-2` + its own border gives it a clearly distinct band
-            between the conversation and the input, rather than blending into either. */}
+            while the turn runs). Just a top border sets it off from the transcript above — the
+            old bordered-card + bg-panel-2 band read as a floating card next to the flat log
+            (founder feedback, 2026-07-24); flat now (ADR-262), so it reads as a pinned strip of
+            the same log, not a separate panel. */}
         {!!live?.todos?.length && (
-          <div className="border-t border-border bg-panel-2 px-3 py-2 md:px-8">
+          <div className="border-t border-border px-3 py-1.5 md:px-8">
             <TodoChecklist todos={live.todos} />
           </div>
         )}

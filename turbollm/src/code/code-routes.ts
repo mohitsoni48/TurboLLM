@@ -27,6 +27,7 @@ import { revertFileEdits } from './revert'
 import { codeSessionExportFilename, serializeCodeSessionMarkdown } from './session-export'
 import { commitGitChanges, getGithubCompareUrl, getGitStatus, pushGitBranch } from './git-actions'
 import { runShellCommand, shellContextText } from './code-shell'
+import { agentsMdPresence } from './persona'
 import type { CodeMode } from './persona'
 
 type S = 200 | 201 | 202 | 400 | 404 | 409 | 500
@@ -207,6 +208,13 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
       // The active turn's current step checklist (ADR-255), so a reopened session shows live
       // progress immediately without waiting for the next update_todos frame. [] when none.
       todos: runs.todos(run.id),
+      // Whether an AGENTS.md is actually loaded for this session (ADR-262's loaded-resources
+      // header) — project (<repoRoot>/AGENTS.md) and/or global (~/.turbollm/agents.md). Computed
+      // with the SAME lookup persona.ts injects into the prompt, so "shown as loaded" == "actually
+      // fed to the model". Both false when the session has no repoRoot.
+      hasAgentsMd: run.repoRoot
+        ? agentsMdPresence(run.repoRoot, d.store.dir())
+        : { project: false, global: false },
     })
   })
 

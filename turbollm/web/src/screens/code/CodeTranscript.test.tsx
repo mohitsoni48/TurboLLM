@@ -215,7 +215,7 @@ describe('CodeTranscript — Phase 2 live rendering', () => {
     expect(screen.getByText('streaming output here')).toBeInTheDocument()
   })
 
-  it('supersedes the live partial with the terminal result across the pending→done transition', () => {
+  it('supersedes the live partial with the terminal result across the pending→done transition (while manually expanded)', () => {
     const { rerender } = render(
       <CodeTranscript
         messages={[]}
@@ -225,10 +225,13 @@ describe('CodeTranscript — Phase 2 live rendering', () => {
         }}
       />,
     )
-    // While running, the card auto-opens and shows the streaming partial.
+    // While running, the card auto-opens and shows the streaming partial — no click needed.
     expect(screen.getByText('stale partial')).toBeInTheDocument()
-    // The same tool call finishes (same id → same card instance, so it stays open): the terminal
-    // result takes over and the now-stale partial is gone.
+    // A user watching it click to keep it open explicitly (simulates them having expanded it —
+    // see the next test for the DEFAULT collapse-on-finish behavior when they haven't). This
+    // flips `expanded` true, which PERSISTS across the rerender below (same call id → same
+    // component instance → same state), so no second click is needed after it.
+    fireEvent.click(screen.getByText('ls'))
     rerender(
       <CodeTranscript
         messages={[]}
@@ -240,6 +243,36 @@ describe('CodeTranscript — Phase 2 live rendering', () => {
     )
     expect(screen.getByText('final result')).toBeInTheDocument()
     expect(screen.queryByText('stale partial')).not.toBeInTheDocument()
+  })
+
+  it('collapses back to the default (no diff → closed) once a streamed command finishes, unless the user expanded it themselves', () => {
+    // Founder feedback, 2026-07-24: an earlier version force-expanded and NEVER reverted once a
+    // command streamed live output, so every bash call stayed open forever after finishing —
+    // this is the actual regression guard for the fix.
+    const { rerender } = render(
+      <CodeTranscript
+        messages={[]}
+        live={{
+          timeline: [{ kind: 'tool', call: { id: 't1', name: 'bash', args: { command: 'ls' }, status: 'pending', partial: 'live output' } }],
+          reasoning: '',
+        }}
+      />,
+    )
+    expect(screen.getByText('live output')).toBeInTheDocument() // visible while actually streaming
+    rerender(
+      <CodeTranscript
+        messages={[]}
+        live={{
+          timeline: [{ kind: 'tool', call: { id: 't1', name: 'bash', args: { command: 'ls' }, status: 'done', result: 'final result' } }],
+          reasoning: '',
+        }}
+      />,
+    )
+    // Finished, no diff, never manually expanded — collapsed by default, same as any other call.
+    expect(screen.queryByText('final result')).not.toBeInTheDocument()
+    // Still reachable by clicking — collapsed is the default, not a removed capability.
+    fireEvent.click(screen.getByText('ls'))
+    expect(screen.getByText('final result')).toBeInTheDocument()
   })
 
   it('shows the Retrying banner and NOT the Compacting one when a retry and compaction overlap', () => {
@@ -264,6 +297,57 @@ describe('CodeTranscript — Phase 2 live rendering', () => {
   it('never shows a "Round N" label at any round index, however high', () => {
     render(<CodeTranscript messages={[]} live={{ timeline: [{ kind: 'turn', index: 3 }], reasoning: '' }} />)
     expect(screen.queryByText(/Round \d/)).not.toBeInTheDocument()
+  })
+})
+
+describe('CodeTranscript — prefill progress bar (llama.cpp /slots)', () => {
+  it('shows the "Processing prompt NN%" line and a bar filled to the pct while prefill is active', () => {
+    const { container } = render(
+      <CodeTranscript
+        messages={[]}
+        live={{ timeline: [], reasoning: '', prefill: { processed: 750, total: 1000, pct: 75 } }}
+      />,
+    )
+    expect(screen.getByText('Processing prompt')).toBeInTheDocument()
+    expect(screen.getByText('75%')).toBeInTheDocument()
+    // The bar's fill width tracks the pct (the second inner div is the --accent fill).
+    const fill = container.querySelector('div[style*="width: 75%"]')
+    expect(fill).toBeInTheDocument()
+  })
+
+  it('shows NO prefill line when no prefill frame ever arrived (normal path — falls to the thinking placeholder)', () => {
+    render(<CodeTranscript messages={[]} live={{ timeline: [], reasoning: '' }} />)
+    expect(screen.queryByText('Processing prompt')).not.toBeInTheDocument()
+    // The default empty-live path shows the generic thinking placeholder instead.
+    expect(screen.getByText('thinking…')).toBeInTheDocument()
+  })
+
+  it('takes priority over the thinking placeholder while active (only the bar shows, not both)', () => {
+    render(<CodeTranscript messages={[]} live={{ timeline: [], reasoning: '', prefill: { processed: 100, total: 1000, pct: 10 } }} />)
+    expect(screen.getByText('Processing prompt')).toBeInTheDocument()
+    expect(screen.queryByText('thinking…')).not.toBeInTheDocument()
+  })
+
+  it('takes priority over the retry banner while active (prefill precedes generation)', () => {
+    render(
+      <CodeTranscript
+        messages={[]}
+        live={{ timeline: [], reasoning: '', prefill: { processed: 100, total: 1000, pct: 10 }, retry: { attempt: 1, maxAttempts: 3, message: 'blip' } }}
+      />,
+    )
+    expect(screen.getByText('Processing prompt')).toBeInTheDocument()
+    expect(screen.queryByText(/Retrying…/)).not.toBeInTheDocument()
+  })
+
+  it('clears (bar gone) once real content has arrived and prefill is nulled', () => {
+    render(
+      <CodeTranscript
+        messages={[]}
+        live={{ timeline: [{ kind: 'text', text: 'generated text' }], reasoning: '', prefill: null }}
+      />,
+    )
+    expect(screen.queryByText('Processing prompt')).not.toBeInTheDocument()
+    expect(screen.getByText('generated text')).toBeInTheDocument()
   })
 })
 
@@ -371,5 +455,125 @@ describe('CodeTranscript — !command / !!command shell escape (ADR-258)', () =>
   it('marks a timed-out shell run', () => {
     render(<CodeTranscript messages={[]} shellRuns={[{ id: 'sh1', command: 'sleep 99', output: '', exitCode: null, timedOut: true }]} />)
     expect(screen.getByText('timed out')).toBeInTheDocument()
+  })
+})
+
+describe('CodeTranscript — grouping consecutive similar terminal commands', () => {
+  // A live-timeline `bash` tool block. Grouping happens in ToolRun, which both the live and
+  // persisted paths render through, so exercising it via `live` covers both.
+  function bashBlock(id: string, command: string, opts?: { status?: 'pending' | 'done' | 'error'; result?: string }) {
+    return { kind: 'tool' as const, call: { id, name: 'bash', args: { command }, status: opts?.status ?? 'done', result: opts?.result } }
+  }
+  function readBlock(id: string, path: string) {
+    return { kind: 'tool' as const, call: { id, name: 'read', args: { path }, status: 'done' as const } }
+  }
+
+  it('groups 3 consecutive git commands into one collapsed line with the right count', () => {
+    render(
+      <CodeTranscript
+        messages={[]}
+        live={{
+          timeline: [
+            bashBlock('t1', 'git status'),
+            bashBlock('t2', 'git add .'),
+            bashBlock('t3', 'git commit -m "fix"'),
+          ],
+          reasoning: '',
+        }}
+      />,
+    )
+    expect(screen.getByText('3 git commands')).toBeInTheDocument()
+    // Collapsed by default — the individual command lines are hidden until the group is expanded.
+    expect(screen.queryByText('git status')).not.toBeInTheDocument()
+    expect(screen.queryByText('git add .')).not.toBeInTheDocument()
+  })
+
+  it('leaves a lone git command ungrouped when its neighbours are different commands', () => {
+    render(
+      <CodeTranscript
+        messages={[]}
+        live={{
+          timeline: [
+            bashBlock('t1', 'npm test'),
+            bashBlock('t2', 'git status'),
+            bashBlock('t3', 'ls -la'),
+          ],
+          reasoning: '',
+        }}
+      />,
+    )
+    // No group formed — every command has a distinct leading word, so each stays its own line.
+    expect(screen.queryByText(/\d+ git commands/)).not.toBeInTheDocument()
+    expect(screen.getByText('git status')).toBeInTheDocument()
+    expect(screen.getByText('npm test')).toBeInTheDocument()
+    expect(screen.getByText('ls -la')).toBeInTheDocument()
+  })
+
+  it('produces two separate groups for two different consecutive-similar runs (2 git then 2 npm)', () => {
+    render(
+      <CodeTranscript
+        messages={[]}
+        live={{
+          timeline: [
+            bashBlock('t1', 'git status'),
+            bashBlock('t2', 'git add .'),
+            bashBlock('t3', 'npm install'),
+            bashBlock('t4', 'npm test'),
+          ],
+          reasoning: '',
+        }}
+      />,
+    )
+    expect(screen.getByText('2 git commands')).toBeInTheDocument()
+    expect(screen.getByText('2 npm commands')).toBeInTheDocument()
+    // Not merged into one group.
+    expect(screen.queryByText('4 git commands')).not.toBeInTheDocument()
+  })
+
+  it('expands a group to reveal each command as its own independently-expandable line', () => {
+    render(
+      <CodeTranscript
+        messages={[]}
+        live={{
+          timeline: [
+            bashBlock('t1', 'git status', { result: 'on branch main' }),
+            bashBlock('t2', 'git add .', { result: 'staged 1 file' }),
+            bashBlock('t3', 'git log', { result: 'commit abc123' }),
+          ],
+          reasoning: '',
+        }}
+      />,
+    )
+    // Collapsed: neither the command lines nor their outputs are visible.
+    expect(screen.queryByText('git status')).not.toBeInTheDocument()
+    expect(screen.queryByText('on branch main')).not.toBeInTheDocument()
+
+    // Expand the group → the three command lines appear, but each keeps ITS OWN output collapsed.
+    fireEvent.click(screen.getByText('3 git commands'))
+    expect(screen.getByText('git status')).toBeInTheDocument()
+    expect(screen.getByText('git add .')).toBeInTheDocument()
+    expect(screen.getByText('git log')).toBeInTheDocument()
+    expect(screen.queryByText('on branch main')).not.toBeInTheDocument()
+
+    // Each inner line is still independently expandable for its own output.
+    fireEvent.click(screen.getByText('git status'))
+    expect(screen.getByText('on branch main')).toBeInTheDocument()
+    // Expanding one does not reveal another's output.
+    expect(screen.queryByText('staged 1 file')).not.toBeInTheDocument()
+  })
+
+  it('never groups non-bash tool calls (consecutive reads stay separate lines)', () => {
+    render(
+      <CodeTranscript
+        messages={[]}
+        live={{
+          timeline: [readBlock('t1', 'a.ts'), readBlock('t2', 'b.ts')],
+          reasoning: '',
+        }}
+      />,
+    )
+    expect(screen.getByText('a.ts')).toBeInTheDocument()
+    expect(screen.getByText('b.ts')).toBeInTheDocument()
+    expect(screen.queryByText(/commands$/)).not.toBeInTheDocument()
   })
 })
