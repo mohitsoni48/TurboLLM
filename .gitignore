@@ -76,6 +76,10 @@ Thumbs.db
 /turbollm/.playwright-mcp/
 /.playwright-mcp/
 
+# Playwright test-runner output (turbollm/web) — traces/screenshots from `npm run test:e2e`
+/turbollm/web/test-results/
+/turbollm/web/playwright-report/
+
 # Downloaded engine binaries (multi-GB; not product source, build-time content)
 /turbollm/engines/
 

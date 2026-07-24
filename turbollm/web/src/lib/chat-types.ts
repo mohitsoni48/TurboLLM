@@ -40,6 +40,10 @@ export interface LiveToolCall {
   diff?: string
   patch?: string
   firstChangedLine?: number
+  /** Code mode only (Phase 2, ADR-250) — the latest CUMULATIVE live-output snapshot from a
+   *  `tool_progress` SSE frame while the tool is still running (bash streams its stdout; edit
+   *  doesn't). Shown streaming in the tool card until the terminal `result` supersedes it. */
+  partial?: string
 }
 
 /** Tool-call approval gate policy (mirrors turbollm/src/tools/tool-policy.ts). */

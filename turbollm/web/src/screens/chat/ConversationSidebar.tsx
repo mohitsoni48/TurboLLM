@@ -112,7 +112,18 @@ function CodeSessionItem({
       style={{ background: active ? 'color-mix(in srgb, var(--accent) 10%, transparent)' : 'transparent' }}
     >
       <div className="flex min-w-0 items-center gap-1.5">
-        <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: CODE_STATUS_DOT[session.status] }} aria-hidden />
+        {/* Live indicator (ADR-256) — overrides the static status dot whenever the daemon
+            reports this run as actually active right now, including sessions running in the
+            background (tab not open elsewhere). `session.running` comes from the polled sidebar
+            list query (useCodeSessions, 5s interval) — no per-open-tab tracking needed. Without
+            this, a background-running session's status collapses to the same amber "review" dot
+            as a long-finished, unreviewed one (toSessionStatus in code-routes.ts), indistinguishable
+            from actually generating. */}
+        <span
+          className={cn('h-1.5 w-1.5 shrink-0 rounded-full', session.running && 'tllm-pulse')}
+          style={{ background: session.running ? 'var(--ok)' : CODE_STATUS_DOT[session.status] }}
+          aria-hidden
+        />
         {rename.editing ? (
           <input
             autoFocus
@@ -134,7 +145,7 @@ function CodeSessionItem({
         )}
       </div>
       <span className="truncate text-[11px] text-faint">
-        {archived ? 'Archived · ' : ''}{CODE_STATUS_LABEL[session.status]} · {folderName(session.repoRoot)}{session.branch ? ` · ${session.branch}` : ''} · {session.when}
+        {archived ? 'Archived · ' : ''}{session.running ? 'Running' : CODE_STATUS_LABEL[session.status]} · {folderName(session.repoRoot)}{session.branch ? ` · ${session.branch}` : ''} · {session.when}
       </span>
       {/* Hover reveal: diff stats + actions menu + open affordance — same interaction
           language as ConvItem's hover-revealed folder-move/rename buttons. */}
@@ -153,6 +164,12 @@ function CodeSessionItem({
                 onClick={(e) => e.stopPropagation()}
                 className="rounded p-1 text-faint transition-colors hover:text-ink data-[state=open]:text-ink"
                 title="Session actions"
+                // Session-specific, not the generic "Session actions" the title tooltip uses —
+                // this button repeats once per row, so a shared name would be ambiguous to a
+                // screen reader across multiple sessions (final gate, spec 16 §9 item 4; also
+                // caught colliding with CodeSessionScreen.tsx's own header button of the same
+                // generic name when both are on screen at once).
+                aria-label={`Actions for ${session.title}`}
               >
                 <MoreHorizontal size={13} />
               </button>

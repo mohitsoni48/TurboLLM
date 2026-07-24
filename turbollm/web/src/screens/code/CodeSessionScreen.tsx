@@ -1,23 +1,27 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { ArrowDown, Clock, Diff, Eraser, FolderOpen, GitBranch, PanelLeft, Pencil, RotateCcw, SendHorizontal } from 'lucide-react'
+import { ArrowDown, Diff, Download, Eraser, FolderOpen, GitBranch, MoreHorizontal, PanelLeft, Pencil, RotateCcw } from 'lucide-react'
 import { ApiError } from '../../lib/api'
 import { skillKeys, fetchSkills } from '../../lib/agent-api'
 import { useModelActions, useModels, useStatus } from '../../lib/queries'
-import { compactCodeSession, revertCodeSession, sendCodeQueuedTurnNow, startCodeRun, streamCodeSession, stopCodeSession } from '../../lib/code-api'
-import type { QueuedTurn } from '../../lib/code-types'
+import { compactCodeSession, execShellCommand, revertCodeSession, sendCodeQueuedTurnNow, startCodeRun, steerOutcomeMessage, stopCodeSession } from '../../lib/code-api'
+import type { QueuedTurn, ShellRun, SteerKind } from '../../lib/code-types'
 import {
-  codeKeys, useClearCodeSession, useCodeSession, useCodeSessionRename, useResumeCodeSession,
-  useUpdateCodeSessionMode,
+  codeKeys, useClearCodeSession, useCodeSession, useCodeSessionRename, useExportCodeSession,
+  useResumeCodeSession, useUpdateCodeSessionMode,
 } from '../../lib/code-queries'
-import type { LiveToolCall } from '../../lib/chat-types'
-import { appendTextDelta, upsertToolCall, type LiveBlock } from '../../lib/live-timeline'
+import { CodeSessionClient, type LiveState } from '../../lib/code-session-client'
+import { matchCodeCommand, pickerCodeCommands } from '../../lib/code-commands'
+import { toggleDisplayPref } from '../../lib/code-display-prefs'
 import { Button, buttonVariants } from '../../components/ui/button'
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
   AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
 } from '../../components/ui/alert-dialog'
+import {
+  DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger,
+} from '../../components/ui/dropdown-menu'
 import { toast } from '../../components/ui/sonner'
 import { useIsDesktop } from '../../lib/useIsDesktop'
 import { cn, folderName, formatDiff, writeLastCodeSessionId } from '../../lib/utils'
@@ -27,28 +31,22 @@ import { readSavedSidebarWidth, SIDEBAR_MIN_W, sidebarMaxW, SidebarResizeHandle 
 import { ModelDetailDialog } from '../models/ModelDetailDialog'
 import { FsBrowser } from '../engines/FsBrowser'
 import { CodeComposer } from './CodeComposer'
-import { CodeTranscript, CodeTranscriptSkeleton } from './CodeTranscript'
+import { CodeResourcesHeader } from './CodeResourcesHeader'
+import { CodeGitDialog } from './CodeGitDialog'
+import { CodeTranscript, CodeTranscriptSkeleton, TodoChecklist } from './CodeTranscript'
 import { AGENT_MODES, type AgentModeId } from './code-mock'
 
-interface LiveState {
-  assistantId: string
-  content: string
-  reasoning: string
-  timeline: LiveBlock[]
-  /** True between a 'compaction' SSE event's start and end phases — pi's own AUTO-compaction
-   *  silently summarizing history mid-turn (distinct from the manual /compact command). Drives
-   *  CodeThinking's "Compacting conversation…" state instead of a blank/generic gap. */
-  compacting?: boolean
-}
-
-/** Apply `fn` to the current live block, creating one (anchored to `fallbackId`) if none exists
- *  yet — so a live delta/tool_call that arrives on a reconnect BEFORE a `meta` frame (e.g. the
- *  real meta aged out of the daemon's ring buffer) still attaches to the right assistant turn
- *  instead of being dropped. */
-function reduceLive(l: LiveState | null, fallbackId: string, fn: (b: LiveState) => LiveState): LiveState {
-  const base = l ?? { assistantId: fallbackId, content: '', reasoning: '', timeline: [] }
-  return fn(base)
-}
+/** The fixed prompt `/init` sends (ADR-258) — drives the agent to inspect the repo and author an
+ *  AGENTS.md, which persona.ts's agentsMdBlock then picks up on every later turn. Sent as this
+ *  turn's promptOverride only; the stored user message stays the literal "/init". */
+const INIT_AGENTS_PROMPT =
+  'Create or update an AGENTS.md file at the root of this repository. First inspect the project — ' +
+  'its README, package/build manifests, test and lint scripts, directory layout, and dominant ' +
+  'conventions — then write a concise AGENTS.md capturing: how to build, test, run, and lint the ' +
+  'project; the key commands; the code style and conventions a contributor should follow; and ' +
+  'anything non-obvious about the architecture. If an AGENTS.md already exists, review and improve ' +
+  'it rather than overwriting it wholesale. Keep it practical and specific to THIS repo — no ' +
+  'generic boilerplate.'
 
 /** The real execution view for a Code session (Phase 1 plan §5) — streams from
  *  the real pi-SDK run via code-api.ts. Renders CodeTranscript.tsx (a
@@ -68,16 +66,11 @@ export function CodeSessionScreen() {
   const detailQ = useCodeSession(sessionId ?? null)
   const session = detailQ.data?.session
   const conversation = detailQ.data?.conversation
-  const allMessages = conversation?.messages ?? []
-  // /clear hides everything at/before clearedUpToMessageId from the transcript (the messages
-  // themselves are never deleted — /resume un-hides them again). `messages` below is what the
-  // rest of this screen renders/measures (context ring, transcript); server-side history replay
-  // for the MODEL applies the same cut via resolveEffectiveHistory (code-session.ts).
-  const clearedIdx = session?.clearedUpToMessageId
-    ? allMessages.findIndex((m) => m.id === session.clearedUpToMessageId)
-    : -1
-  const messages = clearedIdx === -1 ? allMessages : allMessages.slice(clearedIdx + 1)
-  const clearedCount = clearedIdx === -1 ? 0 : clearedIdx + 1
+  // /clear now DEACTIVATES its messages server-side (is_active=0, v34/ADR-261), the same mechanism
+  // /revert uses — so the API already omits cleared history from `conversation.messages` (getMessages
+  // filters is_active=1). No client-side cut is needed anymore; `messages` is just the active set the
+  // screen renders/measures. /resume reactivates the range and the messages reappear on the next fetch.
+  const messages = conversation?.messages ?? []
 
   // Rename — same shared hook/UX as the sidebar's CodeSessionItem (ConversationSidebar.tsx),
   // surfaced here too since the header is the bigger, always-visible spot for a session's title.
@@ -89,7 +82,7 @@ export function CodeSessionScreen() {
   // the query refetch reconciles `session.mode` to match. Reset whenever the
   // session itself changes so a stale override never survives a navigation.
   const [modeOverride, setModeOverride] = useState<AgentModeId | null>(null)
-  useEffect(() => { setModeOverride(null) }, [sessionId])
+  useEffect(() => { setModeOverride(null); setShellRuns([]) }, [sessionId])
 
   // Remember this as the last-opened Code session, so switching to Chat and back
   // via the Workspace mode pill (ConversationSidebar.tsx) restores it.
@@ -120,6 +113,8 @@ export function CodeSessionScreen() {
     engineState === 'starting' ||
     engineState === 'stopping'
   const [settingsKey, setSettingsKey] = useState<string | null>(null)
+  const [gitDialogOpen, setGitDialogOpen] = useState(false)
+  const exportMut = useExportCodeSession()
   const handleLoadModel = (key: string) => {
     modelActions.load.mutate(
       { key },
@@ -157,36 +152,41 @@ export function CodeSessionScreen() {
   }, [sessionId])
 
   const [live, setLive] = useState<LiveState | null>(null)
-  // A queued follow-up's user message is persisted (POST /messages) the moment it's SUBMITTED,
-  // not when its own turn actually starts — code-routes.ts's `enqueue` can leave it waiting
-  // behind the active run for a while. Since `messages` renders in seq order, that follow-up's
-  // instruction card used to appear ABOVE the still-streaming current turn's live content
-  // (which always renders last, after the full `messages` list) — reading as if the queued
-  // message had jumped ahead. The existing "Queued" chips below the composer already show
-  // what's waiting, so cut the transcript off at the current live turn's own assistant
-  // placeholder — anything after it (an already-persisted but not-yet-started queued follow-up)
-  // stays hidden from the transcript until it actually starts running.
-  const liveBoundaryIdx = live ? messages.findIndex((m) => m.id === live.assistantId) : -1
-  const transcriptMessages = liveBoundaryIdx === -1 ? messages : messages.slice(0, liveBoundaryIdx + 1)
-  const [input, setInput] = useState('')
-  // "Add context" — absolute paths picked via a file browser, sent alongside the next follow-up
-  // as contextFiles (see code-api.ts's startCodeRun / code-routes.ts's contextFilesBlock).
-  const [contextFiles, setContextFiles] = useState<string[]>([])
-  const [contextBrowserOpen, setContextBrowserOpen] = useState(false)
   // The SERVER-side message queue's contents (tasks waiting behind the active run). Driven by
   // the daemon — `queue` SSE frames while streaming, plus the session detail on load — NOT
   // browser memory, so queued follow-ups survive a disconnect/reload and still fire in order
   // server-side. (Previously this was a client-only array that was lost on navigation.)
   const [queued, setQueued] = useState<QueuedTurn[]>([])
-  // The GET /stream subscription. Aborting it only DETACHES this client from the run — the
-  // daemon keeps executing it — so it never stops the run. One active stream per mounted session.
-  const streamAbortRef = useRef<AbortController | null>(null)
-  const streamActiveRef = useRef(false)
-  // The last ring-buffer seq this client has consumed, so a reconnect resumes from there.
-  const lastSeqRef = useRef(0)
-  // The in-flight turn's assistant message id (from the `meta` frame), so live deltas that arrive
-  // after a reconnect (whose meta may have aged out of the buffer) still attach to the right turn.
-  const activeAssistantIdRef = useRef('')
+  // Transcript-only `!!command` results (ADR-258) — client-side, never persisted, rendered at the
+  // transcript tail. `!command` results are NOT here; they come back as a persisted message.
+  const [shellRuns, setShellRuns] = useState<ShellRun[]>([])
+  // A queued follow-up's user message is persisted (POST /messages) the moment it's SUBMITTED,
+  // not when its own turn actually starts — code-routes.ts's `enqueue` can leave it waiting
+  // behind the active run for a while. Since `messages` renders in seq order, that follow-up's
+  // instruction card would appear ABOVE the still-streaming current turn's live content (which
+  // always renders last, after the full `messages` list) — reading as if the queued message had
+  // jumped ahead (the ADR-199 ordering fix). Two cuts keep queued turns strictly at the tail:
+  //   1. cut the transcript at the current live turn's own assistant placeholder — anything after
+  //      it (an already-persisted but not-yet-started queued follow-up) stays out of `messages`;
+  //   2. also drop any message whose id is a live queue entry — belt-and-suspenders for the brief
+  //      on-load/reconnect window where the queue is seeded but `live` isn't set yet (cut #1's
+  //      boundary doesn't exist), so a queued message never renders BOTH as a normal transcript
+  //      card and as its inline translucent queued card (CodeTranscript renders those from
+  //      `queued` directly, at the tail).
+  const queuedIds = new Set(queued.map((q) => q.userMsgId))
+  const liveBoundaryIdx = live ? messages.findIndex((m) => m.id === live.assistantId) : -1
+  const cutMessages = liveBoundaryIdx === -1 ? messages : messages.slice(0, liveBoundaryIdx + 1)
+  const transcriptMessages = queuedIds.size ? cutMessages.filter((m) => !queuedIds.has(m.id)) : cutMessages
+  const [input, setInput] = useState('')
+  // "Add context" — absolute paths picked via a file browser, sent alongside the next follow-up
+  // as contextFiles (see code-api.ts's startCodeRun / code-routes.ts's contextFilesBlock).
+  const [contextFiles, setContextFiles] = useState<string[]>([])
+  const [contextBrowserOpen, setContextBrowserOpen] = useState(false)
+  // The GET /stream subscription, owned by a React-free client (code-session-client.ts). It owns
+  // the reconnect loop, the ring-buffer seq cursor, and the event-to-LiveState reduction; this
+  // screen only mirrors its `onLive` into `live` state and drives connect()/abort(). Aborting only
+  // DETACHES this client from the run — the daemon keeps executing it — so it never stops the run.
+  const clientRef = useRef<CodeSessionClient | null>(null)
   const autoStartedRef = useRef<string | null>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const scrollerRef = useRef<HTMLDivElement>(null)
@@ -222,81 +222,47 @@ export function CodeSessionScreen() {
   useEffect(() => { if (live) scrollToBottom() }, [live, scrollToBottom])
 
   // ── the single, reconnectable run subscription ────────────────────────────────
-  // ONE persistent GET /stream per mounted session (not one-per-turn). It replays whatever the
-  // daemon already buffered for the in-flight turn (from lastSeqRef) then live-tails; on a
-  // network drop it reconnects from the last seq seen. It ends only when the daemon reports the
-  // session idle (the async generator completing) — at which point we reconcile with the DB
-  // transcript. Because the run is daemon-owned, closing this stream never stops the run.
-  const RECONNECT_MAX = 6
-  const connect = useCallback(() => {
-    if (!sessionId || streamActiveRef.current) return
-    streamActiveRef.current = true
-    const ac = new AbortController()
-    streamAbortRef.current = ac
-    let attempt = 0
-
-    const run = async () => {
-      try {
-        for await (const evt of streamCodeSession(sessionId, lastSeqRef.current, ac.signal)) {
-          if (typeof evt.seq === 'number') lastSeqRef.current = Math.max(lastSeqRef.current, evt.seq + 1)
-          if (evt.event === 'meta') {
-            attempt = 0 // a real frame means the connection is healthy again
-            activeAssistantIdRef.current = evt.data.assistantMessageId
-            setLive((l) => (l && l.assistantId === evt.data.assistantMessageId
-              ? l
-              : { assistantId: evt.data.assistantMessageId, content: '', reasoning: '', timeline: [] }))
-            void qc.invalidateQueries({ queryKey: codeKeys.detail(sessionId) })
-          } else if (evt.event === 'queue') {
-            setQueued(evt.data.queued)
-          } else if (evt.event === 'compaction') {
-            const compacting = evt.data.phase === 'start'
-            setLive((l) => reduceLive(l, activeAssistantIdRef.current, (b) => ({ ...b, compacting })))
-          } else if (evt.event === 'reasoning') {
-            const delta = evt.data.delta
-            setLive((l) => reduceLive(l, activeAssistantIdRef.current, (b) => ({ ...b, reasoning: b.reasoning + delta })))
-          } else if (evt.event === 'delta') {
-            const delta = evt.data.delta
-            setLive((l) => reduceLive(l, activeAssistantIdRef.current, (b) => ({ ...b, content: b.content + delta, timeline: appendTextDelta(b.timeline, delta) })))
-          } else if (evt.event === 'tool_call') {
-            const tc = evt.data
-            const call: LiveToolCall = { id: tc.id, name: tc.name, args: tc.args, status: tc.status, result: tc.result, diff: tc.diff, patch: tc.patch, firstChangedLine: tc.firstChangedLine }
-            setLive((l) => reduceLive(l, activeAssistantIdRef.current, (b) => ({ ...b, timeline: upsertToolCall(b.timeline, call) })))
-          } else if (evt.event === 'done') {
-            setLive(null)
-            void qc.invalidateQueries({ queryKey: codeKeys.detail(sessionId) })
-            void qc.invalidateQueries({ queryKey: ['code-sessions'] })
-            void qc.invalidateQueries({ queryKey: ['code-stats'] })
-            setTimeout(() => scrollToBottom(true), 80)
-          } else if (evt.event === 'error') {
-            setLive(null)
-            void qc.invalidateQueries({ queryKey: codeKeys.detail(sessionId) })
-            void qc.invalidateQueries({ queryKey: ['code-sessions'] })
-            void qc.invalidateQueries({ queryKey: ['code-stats'] })
-            toast.error(evt.data.message)
-          }
-        }
-        // Generator completed = the daemon says this session is idle. Stop and reconcile with DB.
-        streamActiveRef.current = false
-        setLive(null)
+  // Build/tear down ONE React-free CodeSessionClient per mounted session. The client owns the
+  // persistent GET /stream (replay-from-seq + live-tail + reconnect) and the event-to-LiveState
+  // reduction; this screen only supplies the framework side effects (state sync, query
+  // invalidation, toasts, scroll) and mirrors `onLive` into `live`. Recreating it per session is
+  // what resets the seq cursor / active-assistant id (the old teardown effect's manual resets),
+  // and its abort() DETACHES without stopping the daemon-owned run. Declared BEFORE the auto-start
+  // / reconnect-on-load effects so clientRef.current is populated by the time they run.
+  useEffect(() => {
+    if (!sessionId) return
+    const client = new CodeSessionClient(sessionId, {
+      onLive: setLive,
+      onQueue: setQueued,
+      onTurnStart: () => { void qc.invalidateQueries({ queryKey: codeKeys.detail(sessionId) }) },
+      onTurnDone: () => {
         void qc.invalidateQueries({ queryKey: codeKeys.detail(sessionId) })
         void qc.invalidateQueries({ queryKey: ['code-sessions'] })
-      } catch (e) {
-        if (ac.signal.aborted) { streamActiveRef.current = false; return }
-        // Network drop mid-run — the DAEMON kept executing. Reconnect from the last seq seen so
-        // we replay only what we missed and continue live.
-        attempt += 1
-        if (attempt <= RECONNECT_MAX && streamAbortRef.current === ac) {
-          setTimeout(() => { if (streamAbortRef.current === ac && !ac.signal.aborted) void run() }, Math.min(500 * attempt, 3000))
-        } else {
-          streamActiveRef.current = false
-          setLive(null)
-          if (!(e instanceof ApiError && e.status === 404)) toast.error('Lost connection to the run.')
-        }
-      }
+        void qc.invalidateQueries({ queryKey: ['code-stats'] })
+        setTimeout(() => scrollToBottom(true), 80)
+      },
+      onTurnError: (message) => {
+        void qc.invalidateQueries({ queryKey: codeKeys.detail(sessionId) })
+        void qc.invalidateQueries({ queryKey: ['code-sessions'] })
+        void qc.invalidateQueries({ queryKey: ['code-stats'] })
+        toast.error(message)
+      },
+      onIdle: () => {
+        void qc.invalidateQueries({ queryKey: codeKeys.detail(sessionId) })
+        void qc.invalidateQueries({ queryKey: ['code-sessions'] })
+      },
+      onLostConnection: (silent) => { if (!silent) toast.error('Lost connection to the run.') },
+    })
+    clientRef.current = client
+    return () => {
+      // DETACHES this client without stopping the daemon-owned run; discarding the instance resets
+      // the reconnect cursor for the next session.
+      client.abort()
+      clientRef.current = null
+      setLive(null)
     }
-    void run()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, qc, scrollToBottom])
+  }, [sessionId])
 
   // Auto-start the first run of a freshly-created session (one seeded user message, no reply,
   // nothing live in the daemon). POST kicks it off server-side; then we connect to watch it.
@@ -314,7 +280,7 @@ export function CodeSessionScreen() {
       // would still hold the PREVIOUS session's value. readThinkingBudget is a synchronous
       // localStorage read, immune to that ordering race.
       void startCodeRun(sessionId, '', readThinkingBudget(sessionId))
-        .then(() => { void qc.invalidateQueries({ queryKey: codeKeys.detail(sessionId) }); connect() })
+        .then(() => { void qc.invalidateQueries({ queryKey: codeKeys.detail(sessionId) }); clientRef.current?.connect() })
         .catch((e) => { autoStartedRef.current = null; toast.error(e instanceof ApiError ? e.message : 'Could not start the run.') })
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -325,28 +291,17 @@ export function CodeSessionScreen() {
   // buffered history and continuing live — instead of assuming a fresh page has nothing in flight.
   useEffect(() => {
     if (!sessionId || !detailQ.isSuccess) return
-    if (detailQ.data?.running && !streamActiveRef.current) connect()
+    if (detailQ.data?.running && !clientRef.current?.isActive) clientRef.current?.connect()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, detailQ.isSuccess, detailQ.data?.running])
 
-  // Seed the queued chips from the session detail on load, until the stream's own `queue` frames
-  // take over as the live source of truth.
+  // Seed the queued turns from the session detail on load, until the stream's own `queue` frames
+  // take over as the live source of truth. (Rendered inline as cards at the transcript tail now,
+  // not the old below-composer chip strip — see CodeTranscript's CodeQueuedEntry.)
   useEffect(() => {
-    if (!streamActiveRef.current) setQueued(detailQ.data?.queued ?? [])
+    if (!clientRef.current?.isActive) setQueued(detailQ.data?.queued ?? [])
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, detailQ.data?.queued])
-
-  // Tear down the subscription on unmount / session change — DETACHES this client without
-  // stopping the daemon-owned run, and resets the reconnect cursor for the next session.
-  useEffect(() => {
-    return () => {
-      streamAbortRef.current?.abort()
-      streamActiveRef.current = false
-      setLive(null)
-      lastSeqRef.current = 0
-      activeAssistantIdRef.current = ''
-    }
-  }, [sessionId])
 
   // `/compact [focus instructions]` — a composer command, not a normal turn: it never reaches
   // startCodeRun/the daemon queue, just the dedicated compact endpoint. Case-insensitive,
@@ -379,10 +334,11 @@ export function CodeSessionScreen() {
   // ever fires for AUTO-compaction's SSE event mid-turn; the manual command is a separate,
   // non-streaming POST with no live state of its own until now.
   const [manualCompacting, setManualCompacting] = useState(false)
-  const COMPACT_RE = /^\/compact\b\s*(.*)$/i
   const runCompact = async (text: string) => {
     if (!sessionId) return
-    const instructions = COMPACT_RE.exec(text)?.[1]?.trim() || undefined
+    // `text` is always a /compact input here (send() dispatched on it) — read its captured
+    // argument (pi's customInstructions) back off the same registry pattern that matched it.
+    const instructions = matchCodeCommand(text)?.match[1]?.trim() || undefined
     setInput('')
     setManualCompacting(true)
     try {
@@ -400,8 +356,7 @@ export function CodeSessionScreen() {
 
   // `/clear` hides the conversation so far (repo/worktree/branch untouched, nothing deleted);
   // `/resume` un-hides it. Same "composer command, not a real turn" shape as /compact above.
-  const CLEAR_RE = /^\/clear\b\s*$/i
-  const RESUME_RE = /^\/resume\b\s*$/i
+  // Their triggers live in the shared registry (code-commands.ts) — see send()'s dispatch.
   const clearMut = useClearCodeSession()
   const resumeMut = useResumeCodeSession()
   const runClear = async () => {
@@ -457,13 +412,67 @@ export function CodeSessionScreen() {
     }
   }
 
-  const send = async () => {
+  // `!command`/`!!command` shell escape (ADR-258): run the command in the repo, not a model turn.
+  // `!` (feedToModel) persists the command+output as a user message the model reads next turn — it
+  // shows up in the transcript via the detail refetch (as a `shell` tool call on that message). `!!`
+  // is transcript-only: its result is held in ephemeral client state and never persisted or fed to
+  // the model.
+  const runShell = async (bang: string, command: string) => {
+    if (!sessionId || !command) return
+    const feedToModel = bang === '!'
+    setInput('')
+    userScrolledUp.current = false
+    try {
+      const res = await execShellCommand(sessionId, command, feedToModel)
+      if (feedToModel) {
+        void qc.invalidateQueries({ queryKey: codeKeys.detail(sessionId) })
+      } else {
+        setShellRuns((r) => [...r, { id: `sh-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, command: res.command, output: res.output, exitCode: res.exitCode, timedOut: res.timedOut }])
+      }
+      setTimeout(() => scrollToBottom(true), 60)
+    } catch (e) {
+      setInput(`${bang}${command}`) // restore so the command isn't lost
+      toast.error(e instanceof ApiError ? e.message : 'Could not run the command.')
+    }
+  }
+
+  // `kind` (Phase 1, ADR-246) picks how this message is delivered when a run is already active:
+  // 'followUp' (the default — byte-identical to pre-ADR-246 behavior) queues a fresh turn behind
+  // the active one; 'steer' redirects the CURRENTLY ACTIVE turn. The UI trigger that chooses which
+  // is being built separately in CodeComposer.tsx — this signature is the plumbing it calls into.
+  const send = async (kind: SteerKind = 'followUp') => {
     const text = input.trim()
     if (!text || !sessionId) return
-    if (COMPACT_RE.test(text)) { await runCompact(text); return }
-    if (CLEAR_RE.test(text)) { await runClear(); return }
-    if (RESUME_RE.test(text)) { await runResume(); return }
-    const promptOverride = skillPromptOverride(text)
+    // Built-in composer commands — matched against the ONE shared registry (code-commands.ts) that
+    // also feeds the '/' picker's list, then dispatched by id. Most never reach startCodeRun (their
+    // own endpoint / an instant client-side toggle); `/init` is the exception — a real agentic turn
+    // with a fixed prompt (falls through below). Anything not a built-in becomes a normal turn (with
+    // skillPromptOverride still steering an invoke_skill for a "/skillid task").
+    const command = matchCodeCommand(text)
+    if (command) {
+      if (command.id === 'compact') { await runCompact(text); return }
+      if (command.id === 'clear') { await runClear(); return }
+      if (command.id === 'resume') { await runResume(); return }
+      // `/details` + `/thinking` (ADR-258) — instant global display toggles, not a turn. The
+      // literal command text is never stored/sent; it just flips a persisted UI preference.
+      if (command.id === 'details' || command.id === 'thinking') {
+        const on = toggleDisplayPref(command.id)
+        setInput('')
+        toast.success(command.id === 'details'
+          ? `Tool-call details ${on ? 'shown' : 'collapsed'} for every step.`
+          : `Reasoning ${on ? 'always shown' : 'hidden by default'}.`)
+        return
+      }
+      // `!command` / `!!command` (ADR-258) — run a shell command in the repo, not a model turn.
+      // match[1] is the bang ('!' feeds output to the model as context, '!!' doesn't), match[2] the
+      // command. Never reaches startCodeRun.
+      if (command.id === 'shell') { await runShell(command.match[1], command.match[2].trim()); return }
+    }
+    // `/init` (ADR-258) is a real turn: the composer text stays "/init" (shown verbatim, per the
+    // founder's don't-rewrite-my-message rule) while a fixed instruction is what's actually prompted
+    // — the agent inspects the repo and writes AGENTS.md, which persona.ts's agentsMdBlock reads back
+    // on every subsequent turn. Same promptOverride mechanism the "/skillid task" shorthand uses.
+    const promptOverride = command?.id === 'init' ? INIT_AGENTS_PROMPT : skillPromptOverride(text)
     const filesToSend = contextFiles
     setInput('')
     setContextFiles([])
@@ -472,9 +481,12 @@ export function CodeSessionScreen() {
     // run. Either way it's owned server-side, so a queued follow-up survives a disconnect. The
     // open stream reflects the result (a new `queue` frame, or the turn going live when it runs).
     try {
-      await startCodeRun(sessionId, text, thinkingBudget, promptOverride, filesToSend)
+      const res = await startCodeRun(sessionId, text, thinkingBudget, promptOverride, filesToSend, kind)
+      // `steered` reports whether a steer actually injected into the live turn vs. was queued —
+      // confirm the real outcome. followUp needs no toast: its queued card already shows inline.
+      if (kind === 'steer') toast.success(steerOutcomeMessage(res.steered))
       void qc.invalidateQueries({ queryKey: codeKeys.detail(sessionId) })
-      connect()
+      clientRef.current?.connect()
     } catch (e) {
       setInput(text) // restore so the message isn't lost
       setContextFiles(filesToSend)
@@ -490,7 +502,7 @@ export function CodeSessionScreen() {
     await stopCodeSession(sessionId).catch(() => {})
   }
 
-  // "Send now" on a queued chip: stops the active turn and promotes this one to run next,
+  // "Send now" on a queued card: stops the active turn and promotes this one to run next,
   // WITHOUT dropping the rest of the queue (unlike handleStop above). No optimistic setQueued
   // here — the reordered queue comes back as a fresh `queue` SSE frame moments later, and
   // guessing the reorder client-side risks a flash of the wrong order if it doesn't match.
@@ -590,7 +602,7 @@ export function CodeSessionScreen() {
               {rename.editing ? (
                 <input
                   autoFocus
-                  className="min-w-0 flex-1 bg-transparent text-[13px] font-medium text-ink outline-none"
+                  className="min-w-[80px] flex-1 bg-transparent text-[13px] font-medium text-ink outline-none"
                   value={rename.draft}
                   onChange={(e) => rename.setDraft(e.target.value)}
                   onBlur={rename.commit}
@@ -598,7 +610,7 @@ export function CodeSessionScreen() {
                 />
               ) : (
                 <span
-                  className="min-w-0 flex-1 truncate text-[13px] font-medium text-ink"
+                  className="min-w-[80px] flex-1 truncate text-[13px] font-medium text-ink"
                   title={session.title}
                   onDoubleClick={rename.start}
                 >
@@ -610,44 +622,100 @@ export function CodeSessionScreen() {
                   type="button"
                   onClick={rename.start}
                   className="shrink-0 rounded p-1 text-faint transition-colors hover:text-ink"
+                  aria-label="Rename session"
                   title="Rename session"
                 >
                   <Pencil size={13} />
                 </button>
               )}
-              {/* Repo/branch context — shown at every width (previously md:-only, hiding it
-                  entirely on mobile with no other way to see it in this screen). The title's
-                  own min-w-0 flex-1 truncate yields space to these before anything gets fully
-                  cut off — but that alone isn't enough: these chips are shrink-0 (fixed to
-                  their natural width) with no cap, so a genuinely long repo path + branch name
-                  can still claim ALL the row's width and squeeze the title to literally 0px,
-                  invisible (caught live, not by inspection — measured 0px with a real long
-                  repo/branch pair at 375px). Capping each chip's own text at a small max-width
-                  on mobile (relaxed back to fully visible at md: and up, unchanged from before
-                  this fix) guarantees the title always keeps a real minimum, at the cost of the
-                  chip text itself truncating instead. */}
-              <span
-                className="inline-flex shrink-0 items-center gap-1 rounded-full border border-border px-2 py-0.5 text-[11px] text-muted"
-                title={session.repoRoot}
-              >
-                <FolderOpen size={11} className="shrink-0" />
-                <span className="max-w-[70px] truncate md:max-w-none">{folderName(session.repoRoot)}</span>
-              </span>
-              {session.branch && (
-                <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-border px-2 py-0.5 text-[11px] text-muted">
-                  <GitBranch size={11} className="shrink-0" />
-                  <span className="max-w-[70px] truncate md:max-w-none">{session.branch}</span>
+              {/* Repo/branch/diff-stat chips + the session-actions menu, grouped into one
+                  shrinkable, horizontally-scrollable strip — NOT siblings-of-title directly
+                  anymore. Root cause of a real regression (caught live by Playwright at 375px/
+                  320px, spec 16 §2): every chip here is shrink-0 (a fixed-size pill; only its
+                  OWN inner text truncates via max-w-[70px]), and the title above was `min-w-0
+                  flex-1` — in flexbox, `min-w-0` means the title has NO real floor, so it's the
+                  only element that can be squeezed, all the way to literally 0px, the instant the
+                  shrink-0 siblings' total natural width exceeds the row's available space. That
+                  was already fragile with just two chips (repo+branch); adding the diff-stat chip
+                  and the Export/Git overflow menu (Phase 3) pushed the fixed total past the
+                  container width even on a single long repo+branch pair, reproducing the exact
+                  original 0px bug. The real fix is structural, not "cap one more thing": the title
+                  now has a genuine min-width floor (`min-w-[80px]`, not `min-w-0`) so flexbox's own
+                  shrink algorithm has a hard stop it will never squeeze past, and everything else
+                  that used to compete with it directly is moved into ITS OWN flex child
+                  (`min-w-0 shrink overflow-x-auto`, no `flex-1`) — a plain flex item, so once the
+                  title claims its guaranteed minimum, 100% of any further squeeze lands on this
+                  group instead. Nothing is ever clipped/hidden: `overflow-x-auto` (the same pattern
+                  CodeComposer.tsx's own toolbar row already uses for the same reason) lets the
+                  chips/menu scroll horizontally within their own strip when they don't all fit,
+                  so Export/Git stays reachable rather than disappearing off-screen. This holds
+                  regardless of how many chips end up present — it's the shrink/min-width
+                  RELATIONSHIP between the title and the group that's now correct, not a count of
+                  today's specific chips. */}
+              <div className="flex min-w-0 shrink items-center gap-1.5 overflow-x-auto">
+                <span
+                  className="inline-flex shrink-0 items-center gap-1 rounded-full border border-border px-2 py-0.5 text-[11px] text-muted"
+                  title={session.repoRoot}
+                >
+                  <FolderOpen size={11} className="shrink-0" />
+                  <span className="max-w-[70px] truncate md:max-w-none">{folderName(session.repoRoot)}</span>
                 </span>
-              )}
-              {(session.add > 0 || session.del > 0) && (
-                <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-border px-2 py-0.5 text-[11px] text-muted">
-                  <Diff size={11} className="shrink-0" />
-                  <span className="max-w-[70px] truncate md:max-w-none">{formatDiff(session.add, session.del)}</span>
-                </span>
-              )}
+                {session.branch && (
+                  <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-border px-2 py-0.5 text-[11px] text-muted">
+                    <GitBranch size={11} className="shrink-0" />
+                    <span className="max-w-[70px] truncate md:max-w-none">{session.branch}</span>
+                  </span>
+                )}
+                {(session.add > 0 || session.del > 0) && (
+                  <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-border px-2 py-0.5 text-[11px] text-muted">
+                    <Diff size={11} className="shrink-0" />
+                    <span className="max-w-[70px] truncate md:max-w-none">{formatDiff(session.add, session.del)}</span>
+                  </span>
+                )}
+                {/* Session actions (Phase 3, ADR-251/259) — Export + Git grouped into one overflow
+                    menu rather than two more standalone buttons: neither action is frequent
+                    enough to earn its own always-visible icon. Works regardless of run state —
+                    export reads only already-persisted messages, and the git dialog fetches live
+                    status itself when opened. */}
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <button
+                      type="button"
+                      className="shrink-0 rounded p-1 text-faint transition-colors hover:text-ink data-[state=open]:text-ink"
+                      title="Session actions"
+                      aria-label="Session actions"
+                    >
+                      <MoreHorizontal size={15} />
+                    </button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end">
+                    <DropdownMenuItem
+                      disabled={exportMut.isPending}
+                      onSelect={() => exportMut.mutate(session.id)}
+                    >
+                      <Download size={13} /> {exportMut.isPending ? 'Exporting…' : 'Export'}
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onSelect={() => setGitDialogOpen(true)}>
+                      <GitBranch size={13} /> Git…
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </div>
             </>
           )}
         </div>
+
+        {/* Loaded-resources header (ADR-262) — a collapsible strip surfacing the AGENTS.md +
+            skills persona.ts loads server-side but the UI never showed. Fixed below the title bar
+            (not scrolling with the transcript) so it stays a glanceable resource indicator.
+            Deliberately no mode/model/context here — those have their single home in the composer
+            (ADR-262's no-duplication constraint). */}
+        {session && !notFound && (
+          <CodeResourcesHeader
+            skillCount={skillsQ.data?.length ?? 0}
+            hasAgentsMd={detailQ.data?.hasAgentsMd ?? { project: false, global: false }}
+          />
+        )}
 
         {/* Transcript — activity-log presentation (CodeTranscript.tsx), not
             chat's bubble stack. See that file's header comment for the full
@@ -665,9 +733,7 @@ export function CodeSessionScreen() {
             {!notFound && session?.clearedUpToMessageId && (
               <div className="mb-4 flex items-center gap-2 rounded-lg border border-border bg-panel-2 px-3 py-2 text-[12px] text-muted">
                 <Eraser size={13} className="shrink-0 text-faint" />
-                <span className="flex-1">
-                  Chat cleared — {clearedCount} earlier message{clearedCount === 1 ? '' : 's'} hidden.
-                </span>
+                <span className="flex-1">Chat cleared — earlier messages hidden.</span>
                 <button
                   type="button"
                   onClick={() => void runResume()}
@@ -699,8 +765,11 @@ export function CodeSessionScreen() {
               <CodeTranscript
                 messages={transcriptMessages}
                 liveAssistantId={live?.assistantId}
-                live={live ? { timeline: live.timeline, reasoning: live.reasoning, compacting: live.compacting } : null}
+                live={live ? { timeline: live.timeline, reasoning: live.reasoning, compacting: live.compacting, retry: live.retry, prefill: live.prefill } : null}
                 onRevert={live || queued.length > 0 ? undefined : openRevertConfirm}
+                queued={queued}
+                onSendNowQueued={(id) => void handleSendNow(id)}
+                shellRuns={shellRuns}
               />
             )}
           </div>
@@ -720,39 +789,30 @@ export function CodeSessionScreen() {
           <ToolApprovalBar key={pendingApproval.id} pending={pendingApproval} convId={session?.convId ?? ''} onResolved={() => {}} />
         )}
 
+        {/* The live turn's plan — pinned here, OUTSIDE the scrolling transcript above and
+            directly above the composer, so it never scrolls out of view mid-turn (founder
+            feedback, 2026-07-24: rendering it inline in the transcript, per the original #16
+            build, meant it scrolled away the moment there was enough reasoning/tool output to
+            push it off-screen — exactly wrong for something meant to stay visible as a reference
+            while the turn runs). Just a top border sets it off from the transcript above — the
+            old bordered-card + bg-panel-2 band read as a floating card next to the flat log
+            (founder feedback, 2026-07-24); flat now (ADR-262), so it reads as a pinned strip of
+            the same log, not a separate panel. */}
+        {!!live?.todos?.length && (
+          <div className="border-t border-border px-3 py-1.5 md:px-8">
+            <TodoChecklist todos={live.todos} />
+          </div>
+        )}
+
         {/* Composer — the SAME CodeComposer CodeHomeScreen.tsx renders (no
             `repo`: the repo is fixed for the session's lifetime). Mode and
             model are both editable here too — see the handlers above. */}
         <div className="px-3 pb-3 md:px-8 md:pb-5">
-          {queued.length > 0 && (
-            <div className="mb-2 flex flex-wrap items-center gap-1.5">
-              <span className="inline-flex items-center gap-1 text-[11px] font-medium text-muted">
-                <Clock size={11} className="text-faint" /> Queued
-              </span>
-              {queued.map((q) => (
-                <span
-                  key={q.userMsgId}
-                  className="inline-flex max-w-[280px] items-center gap-1 rounded-full border border-border bg-panel-2 py-1 pr-1 pl-2.5 text-[12px] text-muted"
-                >
-                  <span className="min-w-0 truncate" title={q.task}>{q.task}</span>
-                  <button
-                    type="button"
-                    onClick={() => void handleSendNow(q.userMsgId)}
-                    title="Send now — stop the current run and run this one next"
-                    aria-label="Send now"
-                    className="grid h-5 w-5 shrink-0 place-items-center rounded-full text-faint transition-colors hover:bg-panel hover:text-ink"
-                  >
-                    <SendHorizontal size={11} />
-                  </button>
-                </span>
-              ))}
-            </div>
-          )}
           <CodeComposer
             inputRef={inputRef}
             value={input}
             onValueChange={setInput}
-            onSubmit={() => void send()}
+            onSubmit={(kind) => void send(kind)}
             placeholder={live ? 'Queue a follow-up…' : 'Send a follow-up…'}
             textareaDisabled={manualCompacting}
             mode={modeInfo}
@@ -776,9 +836,9 @@ export function CodeSessionScreen() {
             contextFiles={contextFiles}
             onRemoveContextFile={(p) => setContextFiles((cf) => cf.filter((x) => x !== p))}
             slashCommands={[
-              { id: 'compact', description: 'Summarize the conversation so far into one summary, to free up context' },
-              { id: 'clear', description: 'Clear the chat — repo, worktree, and branch stay as they are' },
-              ...(session?.clearedUpToMessageId || session?.revertedFromMessageId ? [{ id: 'resume', description: 'Bring back a cleared or reverted chat' }] : []),
+              // Built-ins from the shared registry (code-commands.ts) — the same source send()
+              // parses against — then the dynamic skills appended after.
+              ...pickerCodeCommands({ cleared: !!(session?.clearedUpToMessageId || session?.revertedFromMessageId) }),
               ...(skillsQ.data ?? []).map((s) => ({ id: s.id, description: s.description })),
             ]}
             // Prominent, accent-colored banner above the textarea for any real in-progress
@@ -797,6 +857,7 @@ export function CodeSessionScreen() {
         </div>
       </div>
       <ModelDetailDialog modelKey={settingsKey} onClose={() => setSettingsKey(null)} />
+      {session && <CodeGitDialog sessionId={session.id} open={gitDialogOpen} onOpenChange={setGitDialogOpen} />}
       <FsBrowser
         open={contextBrowserOpen}
         onOpenChange={setContextBrowserOpen}

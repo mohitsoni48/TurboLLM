@@ -34,6 +34,28 @@
   --log-ink: #d6d3cd;
   --log-faint: #7a7872;
   --log-err-ink: #e0b3ad;
+
+  /* ── Code feature surface tokens (spec 14 Phase 0 / ADR-252) ────────────
+     Named after the surface they style (instruction/diff/toolcard/status),
+     never `--code-*`/`--codeui-*` — that prefix is already taken above by
+     the markdown code-block surface. Each is a color-mix() over tokens that
+     already flip between :root/.dark (--accent/--warn/--ok/--err/--border),
+     so a single declaration self-adjusts per theme — no .dark override
+     needed here, same reasoning as why --log-* above only sets one value.
+     TODO: --chip-active-bg (color-mix(in srgb, var(--accent) 10%, transparent)),
+     used by both CodeComposer's worktree chip and ConversationSidebar's active-
+     row highlight, is NOT Code-specific — candidate for a spec-11 app-wide
+     token instead; left out of this Code-scoped layer pending that decision. */
+  --instruction-border: color-mix(in srgb, var(--accent) 35%, var(--border));
+  --instruction-bg: color-mix(in srgb, var(--accent) 14%, transparent);
+  --instruction-chip-border: color-mix(in srgb, var(--accent) 25%, var(--border));
+  /* Status banner border reuses --instruction-border (identical 35%-accent-
+     over-border math at both call sites); only the background differs. */
+  --status-banner-bg: color-mix(in srgb, var(--accent) 12%, transparent);
+  --toolcard-approval-bg: color-mix(in srgb, var(--warn) 6%, transparent);
+  --diff-hunk-bg: color-mix(in srgb, var(--accent) 8%, transparent);
+  --diff-add-bg: color-mix(in srgb, var(--ok) 10%, transparent);
+  --diff-del-bg: color-mix(in srgb, var(--err) 10%, transparent);
 }
 
 .dark {
@@ -314,6 +336,11 @@ body {
 .tllm-pulse {
   animation: tllm-pulse 1.2s ease-in-out infinite;
 }
+@media (prefers-reduced-motion: reduce) {
+  .tllm-pulse {
+    animation: none;
+  }
+}
 
 /* Hover-reveal row actions (message copy/edit/regenerate/delete, conversation rename/delete,
    Code transcript step actions): hidden until `.group:hover` on a device that actually HAS hover
@@ -387,11 +414,26 @@ body {
 .tllm-sheet[data-state='closed'] {
   animation: tllm-sheet-out-right 0.24s ease-in;
 }
+@media (prefers-reduced-motion: reduce) {
+  .tllm-sheet[data-state='open'],
+  .tllm-sheet[data-state='closed'] {
+    animation: none;
+  }
+}
 
 /* Desktop (≥768px, matches the app's nav breakpoint): right-docked panel and a
    matching right-pad on the shell so the rest of the UI resizes (no overlap). */
 .app-shell {
   transition: padding-right 0.28s cubic-bezier(0.32, 0.72, 0, 1);
+}
+@media (prefers-reduced-motion: reduce) {
+  /* Paired with .tllm-sheet's own reduced-motion override above — without this, a
+     reduced-motion user would still see the shell's padding slide over 280ms even
+     though the panel itself now appears/disappears instantly, a jarring half-fixed
+     mismatch between the two halves of the same open/close interaction. */
+  .app-shell {
+    transition: none;
+  }
 }
 @media (min-width: 768px) {
   .tllm-sheet {

@@ -1655,6 +1655,34 @@ export class ConversationStore {
       .run({ $cid: convId, $seq: from.seq } as P) as unknown) as Changes).changes
   }
 
+  /** /clear (v34): deactivates `uptoMessageId` and every message BEFORE it (by `seq`) — a real,
+   *  resumable PREFIX deactivation (is_active=0), the mirror of {@link deactivateMessagesFrom}'s
+   *  suffix and the same mechanism /revert and Chat branching use. Replaces /clear's old
+   *  clearedUpToMessageId DISPLAY cursor, which left the "cleared" rows is_active=1 — so
+   *  getMessages()/getConversation() (hence session export AND the model's own history replay via
+   *  resolveEffectiveHistory) still saw them, applying the cut only client-side. /clear hides
+   *  everything up to AND INCLUDING the cut (showing only turns added AFTER it), so this is a
+   *  prefix. Returns the number of rows deactivated (0 if `uptoMessageId` doesn't exist). Only ever
+   *  called on Code conversations, which have no regenerate/branch siblings, so every prefix row is
+   *  active at clear time — same coarse assumption reactivateMessagesFrom already relies on. */
+  deactivateMessagesUpTo(convId: string, uptoMessageId: string): number {
+    const upto = this.db.prepare(`SELECT seq FROM messages WHERE id = $id AND conv_id = $cid`).get({ $id: uptoMessageId, $cid: convId } as P) as unknown as { seq: number } | undefined
+    if (!upto) return 0
+    return ((this.db.prepare(`UPDATE messages SET is_active = 0 WHERE conv_id = $cid AND seq <= $seq`)
+      .run({ $cid: convId, $seq: upto.seq } as P) as unknown) as Changes).changes
+  }
+
+  /** Undoes {@link deactivateMessagesUpTo} — reactivates `uptoMessageId` and every message before
+   *  it (by `seq`). A NEW turn appended after a /clear has a HIGHER seq than the cut, so /resume
+   *  never touches it — only the originally-cleared prefix comes back. Safe if `uptoMessageId` no
+   *  longer exists (0 rows). */
+  reactivateMessagesUpTo(convId: string, uptoMessageId: string): number {
+    const upto = this.db.prepare(`SELECT seq FROM messages WHERE id = $id AND conv_id = $cid`).get({ $id: uptoMessageId, $cid: convId } as P) as unknown as { seq: number } | undefined
+    if (!upto) return 0
+    return ((this.db.prepare(`UPDATE messages SET is_active = 1 WHERE conv_id = $cid AND seq <= $seq`)
+      .run({ $cid: convId, $seq: upto.seq } as P) as unknown) as Changes).changes
+  }
+
   /** Permanently delete a Code session: its messages, working doc, and the agent_run +
    *  conversation rows. There is no FK cascade on these tables (each is deleted explicitly,
    *  same as chat's own conversation delete never cascaded to messages) — miss one and it's

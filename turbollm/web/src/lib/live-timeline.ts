@@ -4,9 +4,13 @@ import type { LiveToolCall } from './chat-types'
 // emits and the tools it calls, in the exact order they arrive over SSE. This is
 // what makes the live bubble read like "wrote a bit → ran read_file → wrote more"
 // instead of a detached stack of tool cards above the text.
+// A `turn` block is a zero-content divider marking an agentic-round boundary within
+// one assistant turn (Phase 2, ADR-249) — inserted between rounds so a long multi-round
+// run reads as grouped rounds rather than one undifferentiated wall.
 export type LiveBlock =
   | { kind: 'text'; text: string }
   | { kind: 'tool'; call: LiveToolCall }
+  | { kind: 'turn'; index: number }
 
 /** Append a content delta, merging into the trailing text block when there is one. */
 export function appendTextDelta(timeline: LiveBlock[], delta: string): LiveBlock[] {
@@ -39,4 +43,24 @@ export function upsertToolCall(timeline: LiveBlock[], call: LiveToolCall): LiveB
     return updated
   }
   return [...timeline, { kind: 'tool', call }]
+}
+
+/** Fold a `tool_progress` snapshot into the matching tool-call block by id — the SAME upsert
+ *  mechanism, narrowed to the live-output field. `partial` is CUMULATIVE (a full snapshot each
+ *  time, not a delta), so it REPLACES rather than appends. A snapshot for a tool block that isn't
+ *  in the timeline yet (progress before its `pending` frame, e.g. after a reconnect that dropped
+ *  the opener) is ignored rather than synthesizing a nameless card. */
+export function applyToolProgress(timeline: LiveBlock[], id: string, partial: string): LiveBlock[] {
+  const idx = timeline.findIndex((b) => b.kind === 'tool' && b.call.id === id)
+  if (idx < 0) return timeline
+  const updated = timeline.slice()
+  const prev = updated[idx] as { kind: 'tool'; call: LiveToolCall }
+  updated[idx] = { kind: 'tool', call: { ...prev.call, partial } }
+  return updated
+}
+
+/** Append an agentic-round divider (Phase 2). Called on a `turn` start for rounds AFTER the first
+ *  (index > 0) — the first round needs no leading divider. */
+export function appendTurnMarker(timeline: LiveBlock[], index: number): LiveBlock[] {
+  return [...timeline, { kind: 'turn', index }]
 }
