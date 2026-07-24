@@ -290,7 +290,7 @@ export function useBuild() {
   }
   return {
     start: useMutation({
-      mutationFn: (v: { repoUrl: string; branch?: string; name?: string }) => apiRunBuild(v),
+      mutationFn: (v: { repoUrl: string; branch?: string; commit?: string; name?: string; patchUrl?: string; patchSha256?: string }) => apiRunBuild(v),
       onSuccess: () => void qc.invalidateQueries({ queryKey: queryKeys.status }),
     }),
     cancel: useMutation({ mutationFn: () => cancelBuild(), onSuccess: refresh }),

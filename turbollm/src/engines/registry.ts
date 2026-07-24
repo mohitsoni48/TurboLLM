@@ -54,7 +54,7 @@ export class Registry {
   async add(
     name: string,
     binPath: string,
-    source?: { sourceRepo?: string; sourceBranch?: string; sourceCommit?: string },
+    source?: { sourceRepo?: string; sourceBranch?: string; sourceCommit?: string; sourcePatchUrl?: string },
   ): Promise<AddResult> {
     const finalName = name.trim() || 'llama-server'
     this.assertNameFree(finalName)
@@ -62,6 +62,7 @@ export class Registry {
     const sourceRepo = source?.sourceRepo?.trim() || undefined
     const sourceBranch = source?.sourceBranch?.trim() || undefined
     const sourceCommit = source?.sourceCommit?.trim() || undefined
+    const sourcePatchUrl = source?.sourcePatchUrl?.trim() || undefined
     const eng: Engine = {
       id: randomUUID(),
       name: finalName,
@@ -73,6 +74,7 @@ export class Registry {
       ...(sourceRepo ? { sourceRepo } : {}),
       ...(sourceBranch ? { sourceBranch } : {}),
       ...(sourceCommit ? { sourceCommit } : {}),
+      ...(sourcePatchUrl ? { sourcePatchUrl } : {}),
     }
     this.store.update((c) => {
       // Re-check under the store lock — the name could have been taken between the

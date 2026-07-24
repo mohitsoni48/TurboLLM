@@ -25,6 +25,36 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.8.6] - 2026-07-24
+
+**New engine: Solar Open 2, via a checksum-verified patch build.**
+
+### Added
+- **Solar Open 2 (250B-A15B) engine catalog entry.** Its architecture isn't in mainline
+  llama.cpp yet — this builds official llama.cpp at a pinned commit with a community patch
+  applied, entirely through the existing "Build from source" 1-click flow. The patch is
+  downloaded and verified against a pinned SHA-256 before it's ever applied; a mismatch hard-fails
+  the build with no fallback.
+- The 1-click build pipeline gained a general `patchUrl`/`patchSha256` capability — reusable by
+  any future engine that needs a pre-compile patch, not specific to this one.
+
+### Fixed
+- **Building official llama.cpp from source could fail on Windows with "Filename too long."**
+  `core.longpaths` was never set, so any repo with deeply-nested paths (llama.cpp's own
+  `tools/ui` and `examples/llama.swiftui` included) broke the checkout. Not specific to any one
+  engine — this affected every Windows "Build from source" flow against the official repo.
+- **The Engines screen could misreport a catalog entry as already built.** The "is this already
+  installed" check matched any registered build of the same repository URL, ignoring which
+  commit/patch it was built from — so an existing plain llama.cpp build could make a
+  differently-pinned entry (like Solar Open 2) falsely show as installed, handing out a binary
+  that didn't actually have the needed support.
+
+### Discord
+- New engine: **Solar Open 2** (Upstage's 250B model) — 1-click build right from the Engines
+  screen, patch verified automatically before it's applied.
+- Fixed a Windows bug where building official llama.cpp from source could fail on repos with long
+  file paths.
+
 ## [1.8.5] - 2026-07-23
 
 **Three gateway bugs fixed, all affecting the Claude Code / Anthropic-protocol integration

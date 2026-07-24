@@ -1178,6 +1178,9 @@ function EngineCard({
                   onOpenChange={setRebuildOpen}
                   repoUrl={catalog.homepage}
                   branch={catalog.sourceBranch || undefined}
+                  commit={catalog.sourceCommit}
+                  patchUrl={catalog.patchUrl}
+                  patchSha256={catalog.patchSha256}
                   engineName={e.name}
                   mode="rebuild"
                 />
@@ -1197,6 +1200,9 @@ function EngineCard({
                 open={guideOpen}
                 onOpenChange={setGuideOpen}
                 repoUrl={catalog.homepage}
+                commit={catalog.sourceCommit}
+                patchUrl={catalog.patchUrl}
+                patchSha256={catalog.patchSha256}
                 engineName={e.name}
               />
             </>

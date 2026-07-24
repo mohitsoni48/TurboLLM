@@ -55,6 +55,10 @@ export interface Engine {
    *  treated as "the same engine, just rebuilt" as a plain branch-tip build of the same
    *  repo (registration would silently replace one with the other). */
   sourceCommit?: string
+  /** Set only when this build applied a pinned third-party patch on top of `sourceCommit`
+   *  (build-runner's `patchUrl`), e.g. an architecture not yet in mainline llama.cpp. Provenance
+   *  only — records that this binary isn't a plain build of `sourceRepo`@`sourceCommit`. */
+  sourcePatchUrl?: string
 }
 
 /** A custom (non-catalog) engine's identity, remembered independent of its live
@@ -77,6 +81,7 @@ export interface CustomEngineSource {
   sourceRepo?: string
   sourceBranch?: string
   sourceCommit?: string
+  sourcePatchUrl?: string
   addedAt: string
 }
 export interface Daemon {

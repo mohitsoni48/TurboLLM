@@ -15,6 +15,7 @@
 // The toolchain PATH override (build-prereqs.ts `buildEnv`) is applied so a conda-env /
 // custom-path CUDA Toolkit (and a user-provided ninja) are found. Windows or Linux + CUDA only.
 import { execFile, spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { delimiter, dirname, join } from 'node:path'
 import { promisify } from 'node:util'
@@ -31,6 +32,15 @@ export interface BuildRequest {
    *  historical commit (e.g. bisecting a reported regression). Takes priority over `branch`
    *  when both are set. Requires the remote to allow fetching arbitrary SHAs (GitHub does). */
   commit?: string
+  /** Optional URL of a unified-diff patch to apply on top of the checked-out commit before
+   *  configuring — for an engine whose architecture isn't in the repo's mainline yet and needs
+   *  a third-party patch to compile (e.g. solar_open2). Opt-in: unset = the build is unchanged.
+   *  MUST be paired with {@link patchSha256} — a patch is never applied without a pinned hash. */
+  patchUrl?: string
+  /** Pinned lowercase 64-char hex SHA-256 the downloaded {@link patchUrl} bytes are verified
+   *  against before the patch is applied. A mismatch hard-fails the build (never apply an
+   *  unverified/mutated patch). Required whenever `patchUrl` is set. */
+  patchSha256?: string
   /** `<dataDir>/engines` — builds live under `<enginesRoot>/build/<slug>/`. */
   enginesRoot: string
   /** Dirs prepended to PATH for the build (ADR-100). */
@@ -92,8 +102,8 @@ export function normRepoUrl(s?: string): string {
 /** The built `llama-server` for a repo (+optional branch) under `enginesRoot`, or null. Used
  *  to detect a source-built engine whose registry entry was removed (disabled) but whose build
  *  output still sits on disk under `engines/build/<slug>/`. */
-export function sourceBuildBinary(enginesRoot: string, repoUrl: string, branch?: string): string | null {
-  const root = join(enginesRoot, 'build', buildDirName(repoUrl, branch))
+export function sourceBuildBinary(enginesRoot: string, repoUrl: string, branch?: string, commit?: string): string | null {
+  const root = join(enginesRoot, 'build', buildDirName(repoUrl, branch, commit))
   return resolveServerBinary(join(root, 'build')) ?? resolveServerBinary(root)
 }
 
@@ -134,6 +144,40 @@ export function notCmakeProjectError(hasCMakeLists: boolean): string | null {
     'found at its root. 1-click build currently only supports llama.cpp-family engines built with ' +
     'CMake. If this project exposes a llama-server-compatible binary some other way, add it as a ' +
     'custom engine by pointing TurboLLM directly at that binary instead of building from source.'
+  )
+}
+
+/** PURE: the security guard for the optional patch step. A patch may be applied ONLY when a
+ *  pinned SHA-256 is supplied to verify its downloaded bytes against — so a `patchUrl` with no
+ *  `patchSha256` must refuse *before any network call*. Returns the actionable error string in
+ *  that case, else null (no patch, or a patch with a pin — both fine to proceed). */
+export function missingPatchShaError(patchUrl?: string, patchSha256?: string): string | null {
+  if (!(patchUrl ?? '').trim()) return null
+  if ((patchSha256 ?? '').trim()) return null
+  return (
+    'Refusing to apply a build patch with no pinned SHA-256 checksum — a patch may only be applied when its exact ' +
+    'downloaded bytes can be verified against a known hash.'
+  )
+}
+
+/** PURE: lowercase hex SHA-256 of a buffer — the checksum a downloaded patch's bytes are pinned
+ *  against before it is ever applied. */
+export function sha256Hex(bytes: Buffer): string {
+  return createHash('sha256').update(bytes).digest('hex')
+}
+
+/** PURE: null when a downloaded patch's actual SHA-256 matches the pinned one (case-insensitive),
+ *  else the actionable hard-fail error. This is the load-bearing safety property of the patched
+ *  build: a mutated/compromised remote patch whose bytes don't match the pin must NEVER be
+ *  applied — the build stops here instead. */
+export function patchChecksumMismatchError(expectedSha256: string, actualSha256: string): string | null {
+  const want = expectedSha256.trim().toLowerCase()
+  const got = actualSha256.trim().toLowerCase()
+  if (want === got) return null
+  return (
+    `The downloaded patch did not match its pinned SHA-256 checksum (expected ${want}, got ${got}). TurboLLM refused ` +
+    'to apply an unverified patch — the remote file may have changed or been tampered with. The build was stopped ' +
+    'before any patch was applied.'
   )
 }
 
@@ -500,17 +544,22 @@ export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: Abo
   // 1) Shallow clone — a branch tip, or (when `req.commit` is set) an exact historical SHA.
   hooks.phase('cloning')
   const pinnedCommit = (req.commit ?? '').trim()
+  // Windows' default ~260-char MAX_PATH breaks a checkout of any repo with deeply-nested paths
+  // (llama.cpp itself ships some, e.g. tools/ui's Svelte components and examples/llama.swiftui's
+  // Xcode project) with "Filename too long" / "cannot create directory" — not an edge case, this
+  // is the official repo. `core.longpaths` lifts that limit; harmless no-op on Linux/macOS.
   if (pinnedCommit) {
     // A plain `clone --branch` can't check out an arbitrary SHA (shallow history only has the
     // tip). Init + fetch that one commit by SHA instead — GitHub allows fetching any reachable
     // SHA, not just refs.
     mkdirSync(srcDir, { recursive: true })
     await runStep('git', ['init'], { cwd: srcDir, env, signal, onLine: hooks.log })
+    if (isWindows) await runStep('git', ['config', 'core.longpaths', 'true'], { cwd: srcDir, env, signal, onLine: hooks.log })
     await runStep('git', ['remote', 'add', 'origin', req.repoUrl], { cwd: srcDir, env, signal, onLine: hooks.log })
     await runStep('git', ['fetch', '--depth', '1', 'origin', pinnedCommit], { cwd: srcDir, env, signal, onLine: hooks.log })
     await runStep('git', ['checkout', 'FETCH_HEAD'], { cwd: srcDir, env, signal, onLine: hooks.log })
   } else {
-    const cloneArgs = ['clone', '--depth', '1']
+    const cloneArgs = isWindows ? ['-c', 'core.longpaths=true', 'clone', '--depth', '1'] : ['clone', '--depth', '1']
     if ((req.branch ?? '').trim()) cloneArgs.push('--branch', req.branch!.trim())
     cloneArgs.push(req.repoUrl, srcDir)
     await runStep('git', cloneArgs, { env, signal, onLine: hooks.log })
@@ -518,6 +567,44 @@ export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: Abo
 
   // Record the built commit (ADR-088 provenance / rebuild comparison).
   const commit = (await runStep('git', ['-C', srcDir, 'rev-parse', 'HEAD'], { env, signal, onLine: () => {} })).trim()
+
+  // 1b) Apply a pinned, checksum-verified third-party patch on top of the checked-out commit,
+  // when the catalog entry ships one — for an architecture not yet in the repo's mainline that
+  // needs a patch to compile (e.g. solar_open2). OPT-IN: with no `patchUrl` the build below is
+  // byte-for-byte unchanged. The load-bearing safety property is verification: a patch is applied
+  // ONLY after its downloaded bytes match a SHA-256 pinned in app code — no pin refuses (before
+  // any network call), a byte mismatch hard-fails, so a mutated/compromised remote diff is never
+  // silently applied.
+  const patchUrl = (req.patchUrl ?? '').trim()
+  if (patchUrl) {
+    const expectedSha = (req.patchSha256 ?? '').trim()
+    const guard = missingPatchShaError(patchUrl, expectedSha)
+    if (guard) throw new Error(guard)
+    hooks.log(`Downloading build patch from ${patchUrl} …`)
+    const res = await fetch(patchUrl, { signal })
+    if (!res.ok) throw new Error(`Failed to download the build patch (HTTP ${res.status} ${res.statusText}) from ${patchUrl}.`)
+    const patchBytes = Buffer.from(await res.arrayBuffer())
+    const actualSha = sha256Hex(patchBytes)
+    const mismatch = patchChecksumMismatchError(expectedSha, actualSha)
+    if (mismatch) throw new Error(mismatch)
+    const patchFile = join(buildRoot, '_tllm_patch.diff')
+    writeFileSync(patchFile, patchBytes)
+    hooks.log(`Patch verified against its pinned checksum (sha256 ${actualSha.slice(0, 12)}…).`)
+    // --check first so a patch that has drifted from the pinned commit fails with a clear reason
+    // BEFORE we mutate the working tree, rather than leaving a half-applied source dir behind.
+    try {
+      await runStep('git', ['-C', srcDir, 'apply', '--check', patchFile], { env, signal, onLine: hooks.log })
+    } catch (e) {
+      if ((e as Error)?.name === 'AbortError') throw e
+      throw new Error(
+        'The verified patch failed to apply against the checked-out commit (most likely it has drifted from the ' +
+          'commit it was authored against, but see the underlying error below for the exact cause). ' +
+          (e instanceof Error ? e.message : String(e)),
+      )
+    }
+    await runStep('git', ['-C', srcDir, 'apply', patchFile], { env, signal, onLine: hooks.log })
+    hooks.log(`Applied verified patch (sha256 ${actualSha.slice(0, 12)}…) on top of ${commit.slice(0, 8)}.`)
+  }
 
   // Fail fast with an actionable reason when this isn't a llama.cpp-family CMake project at all
   // (GitHub #61) — before sinking minutes into a configure/compile that can only die cryptically.

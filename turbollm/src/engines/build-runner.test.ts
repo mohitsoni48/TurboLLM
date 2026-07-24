@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildDirName, CMAKE_CONFIGURE_ARGS, isIncompleteMetalBackendError, pickGenerator, vcvarsBatch, stripGenericAsmLanguage, sameRepo, sourceBuildDirOf, notCmakeProjectError } from './build-runner'
+import { buildDirName, CMAKE_CONFIGURE_ARGS, isIncompleteMetalBackendError, pickGenerator, vcvarsBatch, stripGenericAsmLanguage, sameRepo, sourceBuildDirOf, notCmakeProjectError, missingPatchShaError, sha256Hex, patchChecksumMismatchError } from './build-runner'
 import { join } from 'node:path'
 
 test('buildDirName: repo name from a .git URL, branch appended', () => {
@@ -160,4 +160,44 @@ test('notCmakeProjectError: actionable message when CMakeLists.txt is absent', (
   const msg = notCmakeProjectError(false)
   assert.ok(msg && /CMakeLists\.txt/.test(msg))
   assert.ok(msg && /llama\.cpp/.test(msg))
+})
+
+// ── Pinned-patch build (solar_open2-class engines) ───────────────────────────
+// The load-bearing safety property: a build patch is applied ONLY after its downloaded bytes
+// match a SHA-256 pinned in app code. runBuild() drives these three PURE helpers in order
+// (guard → verify), so testing them proves the invariant without a real clone/fetch/compile:
+//   1. missingPatchShaError — refuses a patchUrl with no pin, BEFORE any network call.
+//   2. sha256Hex — the checksum the downloaded bytes are pinned against.
+//   3. patchChecksumMismatchError — hard-fails a byte mismatch BEFORE git apply runs.
+
+test('missingPatchShaError: a patch URL without a pinned checksum is refused', () => {
+  const msg = missingPatchShaError('https://example.com/x.patch', undefined)
+  assert.ok(msg && /pinned SHA-256/.test(msg))
+  // whitespace-only checksum counts as absent
+  assert.ok(missingPatchShaError('https://example.com/x.patch', '   '))
+})
+
+test('missingPatchShaError: null when no patch, or a patch WITH a checksum', () => {
+  assert.equal(missingPatchShaError(undefined, undefined), null)
+  assert.equal(missingPatchShaError('', 'deadbeef'), null) // no URL → nothing to apply
+  assert.equal(missingPatchShaError('https://example.com/x.patch', 'deadbeef'), null)
+})
+
+test('sha256Hex: known vector (sha256 of "abc")', () => {
+  assert.equal(sha256Hex(Buffer.from('abc')), 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad')
+})
+
+test('patchChecksumMismatchError: null when actual matches pinned (case-insensitive)', () => {
+  const sha = sha256Hex(Buffer.from('abc'))
+  assert.equal(patchChecksumMismatchError(sha, sha), null)
+  assert.equal(patchChecksumMismatchError(sha.toUpperCase(), sha), null)
+})
+
+test('patchChecksumMismatchError: actionable hard-fail when bytes do not match the pin', () => {
+  const pinned = sha256Hex(Buffer.from('the patch we vetted'))
+  const actual = sha256Hex(Buffer.from('a mutated/compromised patch'))
+  const msg = patchChecksumMismatchError(pinned, actual)
+  assert.ok(msg && /did not match/.test(msg))
+  assert.ok(msg && msg.includes(pinned.toLowerCase()) && msg.includes(actual.toLowerCase()))
+  assert.ok(msg && /before any patch was applied/.test(msg))
 })
