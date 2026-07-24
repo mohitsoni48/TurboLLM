@@ -9,7 +9,6 @@ services:
       dockerfile: Dockerfile.nvidia
     image: turbollm-nvidia:latest
     container_name: turbollm-nvidia
-    restart: unless-stopped
     ports:
       - "6996:6996"
     volumes:
@@ -30,6 +29,12 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f -s http://turbollm:6996/api/v1/status >/dev/null"]
+      interval: 1s
+      timeout: 3s
+      retries: 3
 
 volumes:
   turbollm-data:
+    name: turbollm-data

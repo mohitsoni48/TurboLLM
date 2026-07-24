@@ -647,9 +647,9 @@ access your GPU directly for accelerated local LLM inference.
 
 ---
 
-## NVIDIA GPU (CUDA)
+### NVIDIA GPU (CUDA)
 
-### Requirements
+#### Requirements
 
 - NVIDIA GPU with CUDA support
 - Installed NVIDIA drivers
@@ -674,9 +674,9 @@ sudo systemctl restart docker
 docker compose -f docker-compose-nvidia.yaml up -d
 ```
 
-## AMD GPU
+### AMD GPU
 
-### Requirements
+#### Requirements
 
 - AMD ROCm
 - Installed AMD drivers

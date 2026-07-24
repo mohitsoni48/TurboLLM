@@ -1,11 +1,10 @@
 services:
   turbollm:
     build:
-      context: .
+      context: ./deploy/runpod
       dockerfile: Dockerfile.amd
     image: turbollm-amd:latest
     container_name: turbollm-amd
-    restart: unless-stopped
     ports:
       - "6996:6996"
     volumes:
@@ -25,6 +24,13 @@ services:
     # the usual cause is that the host's `render` group GID doesn't match any group
     # name inside the container. Find the host GID with `getent group render` and
     # replace the "render" line above with that numeric GID instead.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f -s http://turbollm:6996/api/v1/status >/dev/null"]
+      interval: 1s
+      timeout: 3s
+      retries: 3
 
 volumes:
   turbollm-data:
+    name: turbollm-data
+    
