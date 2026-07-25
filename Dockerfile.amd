@@ -46,6 +46,15 @@ COPY --from=build /src/bin ./bin
 COPY --from=build /src/package.json ./package.json
 COPY --from=build /src/node_modules ./node_modules
 
+# Create models folder
+RUN mkdir -p /root/.turbollm/models
+# Define the model path
+RUN echo '{ \
+      "modelDirs": [ \
+        "/root/.turbollm/models" \
+      ] \
+    }' > /root/.turbollm/config.json
+
 # Force the GPU backend during the image build.
 # Docker builds cannot detect the host GPU.
 ENV TURBOLLM_SEED_BACKEND=rocm
