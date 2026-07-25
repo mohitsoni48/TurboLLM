@@ -722,11 +722,14 @@ export function getTelemetryPreview(level: TelemetryLevel): Promise<TelemetryPre
 }
 
 /** LAN network info (spec 08 §2): expose state, the reachable LAN URL, and whether
- *  an API key exists (required for non-local access). */
+ *  an API key exists (required for non-local access). `requireApiKey` + `isHost` mirror the
+ *  backend's /api/v1/keys host gate so the UI can honestly reflect the same rule. */
 export type NetworkInfo = {
   lanBind: boolean
   lanUrl: string
   hasApiKey: boolean
+  requireApiKey: boolean
+  isHost: boolean
 }
 
 export function getNetworkInfo(): Promise<NetworkInfo> {

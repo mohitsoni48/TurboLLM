@@ -1884,13 +1884,17 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   // ── network info (spec 08 §2): LAN expose state + the reachable LAN URL + whether
-  // an API key exists (non-local access requires one).
+  // an API key exists (non-local access requires one). `requireApiKey` + `isHost` (added
+  // alongside the /api/v1/keys host gate above) let the UI honestly reflect that same rule
+  // instead of just hiding a button while the underlying route is still reachable.
   app.get('/api/v1/settings/network', (c) => {
     const cfg = d.store.snapshot()
     return c.json({
       lanBind: cfg.daemon.lanBind,
       lanUrl: `http://${getLanIp()}:${cfg.daemon.port}`,
       hasApiKey: cfg.apiKeys.length > 0,
+      requireApiKey: cfg.daemon.requireApiKey,
+      isHost: isLocalRequest(c, d),
     })
   })
 
@@ -2060,7 +2064,20 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   // ── API keys (spec 06 §5) ────────────────────────────────────────────────
+  // Host-only while the LAN is open and unauthenticated (lanBind on, requireApiKey off):
+  // lanAuth's bypassesAuth deliberately lets that combination through with NO credential at
+  // all (spec 06 §5's "opted into open LAN access"), which is fine for chat/models but would
+  // let any device that can merely load the page list key names or mint itself a durable
+  // `tllm-...` key with zero credential — a real self-escalation (that key keeps working even
+  // after requireApiKey is later turned on), not just an info leak. Once requireApiKey IS on,
+  // a non-host caller only reaches this handler at all by already having presented a valid key
+  // (lanAuth ran first), so self-service key management from another device is fine then.
+  function keysHostGate(c: Context): boolean {
+    return isLocalRequest(c, d) || d.store.snapshot().daemon.requireApiKey
+  }
+
   app.get('/api/v1/keys', (c) => {
+    if (!keysHostGate(c)) return err(c, 403, 'forbidden', 'API keys are only visible from this machine until "Require an API key" is turned on.')
     const keys = d.store.snapshot().apiKeys.map(({ id, name, prefix, createdAt, lastUsedAt }) => ({
       id,
       name,
@@ -2072,6 +2089,7 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   app.post('/api/v1/keys', async (c) => {
+    if (!keysHostGate(c)) return err(c, 403, 'forbidden', 'API keys can only be created from this machine until "Require an API key" is turned on.')
     const b = await body<{ name?: string }>(c)
     const name = (b.name ?? '').trim()
     if (!name) return err(c, 400, 'invalid_config_value', 'name is required.')
