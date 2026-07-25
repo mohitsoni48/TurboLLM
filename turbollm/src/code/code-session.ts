@@ -187,6 +187,21 @@ export function compactionSettingsFor(contextWindow: number): { enabled: boolean
   return { enabled: true, reserveTokens, keepRecentTokens }
 }
 
+/** Hard-abort safety margin for the near-overflow check below — deliberately TIGHTER than
+ *  compactionSettingsFor's own reserveTokens (~15% of contextWindow). That reserve is the normal
+ *  "compact soon" signal pi's own threshold check already handles correctly BETWEEN turns; this
+ *  is a separate, later, genuine last-resort "about to actually overflow and error" signal for
+ *  the one case a turn-boundary-only check structurally cannot reach — a single CONTINUOUS turn
+ *  running dozens of rounds with no boundary to trigger at (root-caused, see decision log: pi's
+ *  _checkCompaction is only ever invoked before a new session.prompt() or after the whole
+ *  agentic loop settles, never mid-loop). Small and fixed-fraction rather than reusing
+ *  reserveTokens, so this only fires meaningfully AFTER the normal reserve has already been
+ *  crossed within one unbroken turn — proof the boundary check truly never got a chance to run,
+ *  not a duplicate of it firing early. */
+export function nearOverflowReserveTokens(contextWindow: number): number {
+  return Math.max(256, Math.round(contextWindow * 0.05))
+}
+
 /** Rough chars/4 token estimate for one DB message + its tool calls' args/results — mirrors pi's
  *  own heuristic (compaction.js's estimateTokens) closely enough to size a safety margin against
  *  (see keepRecentTokensFor below), not to reproduce pi's count exactly. */
@@ -1252,6 +1267,11 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
           'in a row, including after being told to stop — this run has been stopped automatically ' +
           'rather than continue looping. Start a new turn with different instructions to try again.]'
         await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
+        // Pre-existing gap, fixed alongside the near-overflow check below (both call session.abort()
+        // directly, not through the external `signal` the `aborted` flag was originally wired to):
+        // without this, the comment above ("surfaces as... stats.aborted") was not actually true —
+        // `aborted` was only ever set by the Stop-button/connection-drop listener.
+        aborted = true
         void session.abort()
         return { block: true, reason }
       }
@@ -1400,6 +1420,32 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
             // Best-effort — see comment above.
           }
         }
+      }
+
+      // Near-overflow hard-abort, root-caused and decided 2026-07-25 (see decision log) — a long
+      // CONTINUOUS turn can run dozens of rounds without ever hitting a turn boundary, so pi's own
+      // auto-compaction threshold check (only ever invoked before a new session.prompt() or after
+      // the whole agentic loop settles) structurally never gets a chance to run. Rather than let
+      // the NEXT round's request genuinely overflow and error, check the real live context usage
+      // after every round and abort cleanly — same session.abort() path the loop breaker above
+      // uses, so this surfaces as a real stopped run (stats.aborted), not a crash. The next turn
+      // then starts through the normal, already-working turn-boundary compaction path. Uses
+      // session.getContextUsage() directly (pi's real provider-reported usage, not an estimate) —
+      // NOT session.compact() — a mid-loop compact() call was investigated and found NOT to
+      // actually prevent this turn's own request from continuing to grow (runLoop snapshots the
+      // message context once at turn start; nothing re-syncs it mid-loop), so this deliberately
+      // does not attempt that. worst case is a turn stopping a bit early with partial progress
+      // instead of a hard overflow crash.
+      const usage = session.getContextUsage()
+      if (typeof usage?.tokens === 'number' && usage.tokens > usage.contextWindow - nearOverflowReserveTokens(usage.contextWindow)) {
+        event.content.push({
+          type: 'text',
+          text: '\n\n[SYSTEM: this turn is approaching the model\'s real context limit and has been ' +
+            'stopped automatically to avoid a hard overflow error. Continue the task in a new message ' +
+            '— the next turn starts from freshly compacted history.]',
+        })
+        aborted = true
+        void session.abort()
       }
 
       const text = event.content

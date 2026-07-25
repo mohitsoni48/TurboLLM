@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { toolsForMode, buildAppendPrompt, skillsBlock, skillCatalogBlock, type CodeMode } from './persona'
 import { toSessionStatus, resolveRevertCut } from './code-routes'
-import { MUTATING_TOOLS, PATH_TOOLS, WRITE_PATH_TOOLS, resolveEffectiveHistory, compactCodeSession, lookbackPreCompactionHistory, isDependencyAddCommand, compactionSettingsFor, keepRecentTokensFor, ToolLoopTracker, toolCallSignature, LOOP_BREAK_AFTER, LOOP_ABORT_AFTER, codeEventToFrame, validateDelegateTask, normalizeDelegateResult, DELEGATE_SUBAGENT_TIMEOUT_MS, normalizeTodos, summarizeTodos, MAX_TODOS, pickPrefillProgress, PREFILL_POLL_MS, type TodoItem } from './code-session'
+import { MUTATING_TOOLS, PATH_TOOLS, WRITE_PATH_TOOLS, resolveEffectiveHistory, compactCodeSession, lookbackPreCompactionHistory, isDependencyAddCommand, compactionSettingsFor, nearOverflowReserveTokens, keepRecentTokensFor, ToolLoopTracker, toolCallSignature, LOOP_BREAK_AFTER, LOOP_ABORT_AFTER, codeEventToFrame, validateDelegateTask, normalizeDelegateResult, DELEGATE_SUBAGENT_TIMEOUT_MS, normalizeTodos, summarizeTodos, MAX_TODOS, pickPrefillProgress, PREFILL_POLL_MS, type TodoItem } from './code-session'
 import { ConversationStore, type Message } from '../chat/db'
 import type { Deps } from '../deps'
 import type { Skill } from '../agents/skills'
@@ -274,6 +274,23 @@ test('compactionSettingsFor: caps at pi\'s own defaults for a large-context loca
   const s = compactionSettingsFor(200_000)
   assert.equal(s.reserveTokens, 16384)
   assert.equal(s.keepRecentTokens, 20000)
+})
+
+test('nearOverflowReserveTokens: never below a sane floor, even for a tiny context', () => {
+  assert.equal(nearOverflowReserveTokens(2048), 256)
+})
+
+test('nearOverflowReserveTokens: scales to 5% of the context window above the floor', () => {
+  assert.equal(nearOverflowReserveTokens(200_000), 10_000)
+})
+
+test('nearOverflowReserveTokens: deliberately tighter than compactionSettingsFor\'s own reserveTokens at every context size — it must only fire AFTER the normal reserve is already crossed', () => {
+  for (const ctx of [2048, 8192, 32768, 128_000, 200_000]) {
+    assert.ok(
+      nearOverflowReserveTokens(ctx) <= compactionSettingsFor(ctx).reserveTokens,
+      `at ctx=${ctx}, near-overflow margin (${nearOverflowReserveTokens(ctx)}) must not exceed the normal compaction reserve (${compactionSettingsFor(ctx).reserveTokens})`,
+    )
+  }
 })
 
 test('compactionSettingsFor: monotonically non-decreasing with contextWindow (below the cap)', () => {
