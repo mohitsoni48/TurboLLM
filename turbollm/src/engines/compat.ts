@@ -77,6 +77,8 @@ const VENDOR_DISPLAY: Record<GpuVendor, string> = {
   amd: 'AMD',
   intel: 'Intel',
   apple: 'Apple Silicon',
+  arm: 'ARM Mali',
+  qualcomm: 'Qualcomm Adreno',
   unknown: 'no detected GPU',
 }
 

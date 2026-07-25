@@ -349,13 +349,21 @@ function enumLinuxGpus(): GpuInfo[] {
 /** Parse `vulkaninfo --summary` for GPU name and type. Works on Termux + Android. */
 function enumVulkanGpus(): GpuInfo[] {
   try {
-    // Force the Android system loader (same fix that made vulkaninfo work in your shell).
-    // LD_PRELOAD=liblzma.so works around the Xzs_Construct dlopen bug on Android 15/16.
-    const env = {
-      ...process.env,
-      LD_LIBRARY_PATH: `/system/lib64:${process.env.LD_LIBRARY_PATH ?? ''}`,
-      LD_PRELOAD: '/system/lib64/liblzma.so',
-    }
+    // The Android system loader + liblzma preload work around the Xzs_Construct
+    // dlopen bug in vulkaninfo on Android 15/16. This is Android-specific —
+    // /system/lib64/liblzma.so doesn't exist on a normal Linux box — so gate
+    // the env override on `process.platform === 'android'` and run plain
+    // vulkaninfo everywhere else. (We only land here on Linux when lspci is
+    // missing, e.g. inside some containers, not just Android — keep that path
+    // clean.)
+    const isAndroid = process.platform === 'android'
+    const env = isAndroid
+      ? {
+          ...process.env,
+          LD_LIBRARY_PATH: `/system/lib64:${process.env.LD_LIBRARY_PATH ?? ''}`,
+          LD_PRELOAD: '/system/lib64/liblzma.so',
+        }
+      : process.env
     const out = execFileSync('vulkaninfo', ['--summary'], { timeout: 8000, env }).toString()
     const gpus: GpuInfo[] = []
     const lines = out.split('\n')
@@ -420,7 +428,10 @@ function getCpuModel(): string {
   const model = os.cpus()[0]?.model?.trim()
   if (model && model.length > 0) return model
   // Android /proc/cpuinfo usually has a "Hardware" or "model name" line.
-  if (process.platform === 'linux') {
+  // Note: Node reports `process.platform === 'android'` on Termux/Android — distinct
+  // from 'linux' (see NodeJS.Platform type) — so we must include it here, otherwise
+  // the exact Android case this fallback exists for would silently never trigger.
+  if (process.platform === 'linux' || process.platform === 'android') {
     try {
       const cpuinfo = fs.readFileSync('/proc/cpuinfo', 'utf8')
       const m =
@@ -445,8 +456,10 @@ function getCpuCoreCount(): number {
   } catch {
     /* nproc missing */
   }
-  // Fallback 2: count "processor" lines in /proc/cpuinfo
-  if (process.platform === 'linux') {
+  // Fallback 2: count "processor" lines in /proc/cpuinfo.
+  // Same Android note as getCpuModel(): must include 'android' explicitly,
+  // otherwise the fallback silently skips on the platform it's meant to fix.
+  if (process.platform === 'linux' || process.platform === 'android') {
     try {
       const cpuinfo = fs.readFileSync('/proc/cpuinfo', 'utf8')
       const matches = cpuinfo.match(/processor\s*:/g)
