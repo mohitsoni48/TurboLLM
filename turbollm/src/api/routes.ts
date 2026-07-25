@@ -2118,7 +2118,15 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   // ── CLI connect snippets (spec 06 §6) ────────────────────────────────────
+  // Same host gate as /api/v1/keys above, and for the same reason — arguably more urgent here:
+  // this route doesn't just expose existing key metadata, it MINTS a brand-new live key (below)
+  // and returns its full raw value embedded in the setup snippets on every single call while
+  // lanBind is on, with no action beyond loading the page (ConnectSection queries it eagerly for
+  // the default-selected CLI). Ungated, a non-host viewer on an open, unauthenticated LAN could
+  // get a real credential just by opening Developer — worse than the list/create case, since it
+  // requires no explicit "create" click at all.
   app.get('/api/v1/connect/:cli', (c) => {
+    if (!keysHostGate(c)) return err(c, 403, 'forbidden', 'Connect setup is only available from this machine until "Require an API key" is turned on.')
     const cli = c.req.param('cli')
     const cfg = d.store.snapshot()
     const { port, lanBind } = cfg.daemon

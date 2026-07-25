@@ -1,8 +1,10 @@
-// Covers the two Developer-pane fixes: (1) Server URL shows the LAN-reachable address once LAN
-// sharing is on, not just window.location.origin (which still reads 127.0.0.1/localhost even
-// when OTHER devices reach the daemon over the LAN); (2) API key management is hidden — with an
-// explanatory message, not just silently missing — for a non-host viewer while the LAN is open
-// and unauthenticated (requireApiKey off). The real security boundary is server-side
+// Covers the three Developer-pane fixes: (1) Server URL shows the LAN-reachable address once
+// LAN sharing is on, not just window.location.origin (which still reads 127.0.0.1/localhost even
+// when OTHER devices reach the daemon over the LAN); (2) the API-keys list + create form is
+// hidden — with an explanatory message, not just silently missing — for a non-host viewer while
+// the LAN is open and unauthenticated (requireApiKey off); (3) same lock for the "Connect an
+// app" setup snippets, which embed a live API key and — unlike the keys list — fetch
+// automatically on page load with no click required. The real security boundary is server-side
 // (keys-network.test.ts); this only verifies the UI honestly reflects that same state.
 import { render, screen } from '@testing-library/react'
 import { QueryClientProvider, QueryClient } from '@tanstack/react-query'
@@ -10,6 +12,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { NetworkInfo } from '../lib/api'
 
 let networkInfo: NetworkInfo | undefined
+const getConnectSpy = vi.fn(() => Promise.resolve({ cli: 'claude-code', title: '', steps: [{ label: 'bash', snippet: 'ANTHROPIC_AUTH_TOKEN="tllm-secret-value" claude', lang: 'bash' }] }))
 
 vi.mock('../lib/queries', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/queries')>()
@@ -26,7 +29,7 @@ vi.mock('../lib/queries', async (importOriginal) => {
 
 vi.mock('../lib/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/api')>()
-  return { ...actual, getConnect: () => Promise.resolve({ cli: 'claude-code', title: '', steps: [] }) }
+  return { ...actual, getConnect: (...args: unknown[]) => getConnectSpy(...(args as [])) }
 })
 
 function renderScreen() {
@@ -64,7 +67,7 @@ describe('DeveloperScreen — API key management gating', () => {
     networkInfo = { lanBind: true, lanUrl: 'http://192.168.1.5:6996', hasApiKey: false, requireApiKey: false, isHost: true }
     await renderScreen()
     expect(screen.getByPlaceholderText('Key name (e.g. claude-code)')).toBeInTheDocument()
-    expect(screen.queryByText(/only available from this machine/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/API key management is only available/i)).not.toBeInTheDocument()
   })
 
   it('shows the key list + create form once requireApiKey is on, even for a non-host viewer', async () => {
@@ -77,13 +80,39 @@ describe('DeveloperScreen — API key management gating', () => {
     networkInfo = { lanBind: true, lanUrl: 'http://192.168.1.5:6996', hasApiKey: false, requireApiKey: false, isHost: false }
     await renderScreen()
     expect(screen.queryByPlaceholderText('Key name (e.g. claude-code)')).not.toBeInTheDocument()
-    expect(screen.getByText(/only available from this machine/i)).toBeInTheDocument()
+    expect(screen.getByText(/API key management is only available/i)).toBeInTheDocument()
   })
 
   it('fails CLOSED (locked) while network info is still loading, rather than flashing the form', async () => {
     networkInfo = undefined
     await renderScreen()
     expect(screen.queryByPlaceholderText('Key name (e.g. claude-code)')).not.toBeInTheDocument()
-    expect(screen.getByText(/only available from this machine/i)).toBeInTheDocument()
+    expect(screen.getByText(/API key management is only available/i)).toBeInTheDocument()
+  })
+})
+
+describe('DeveloperScreen — Connect-an-app setup snippet gating', () => {
+  beforeEach(() => { networkInfo = undefined; getConnectSpy.mockClear() })
+
+  it('fetches and shows the live-key setup snippet on the host machine, even with LAN open and no auth yet', async () => {
+    networkInfo = { lanBind: true, lanUrl: 'http://192.168.1.5:6996', hasApiKey: false, requireApiKey: false, isHost: true }
+    await renderScreen()
+    await screen.findByText(/tllm-secret-value/)
+    expect(getConnectSpy).toHaveBeenCalled()
+  })
+
+  it('does NOT fetch the setup snippet for a non-host viewer while the LAN is open and unauthenticated — no key is minted', async () => {
+    networkInfo = { lanBind: true, lanUrl: 'http://192.168.1.5:6996', hasApiKey: false, requireApiKey: false, isHost: false }
+    await renderScreen()
+    await screen.findByText(/Setup snippets include a live API key/i)
+    expect(screen.queryByText(/tllm-secret-value/)).not.toBeInTheDocument()
+    expect(getConnectSpy).not.toHaveBeenCalled()
+  })
+
+  it('fetches the setup snippet again once requireApiKey is on, even for a non-host viewer', async () => {
+    networkInfo = { lanBind: true, lanUrl: 'http://192.168.1.5:6996', hasApiKey: true, requireApiKey: true, isHost: false }
+    await renderScreen()
+    await screen.findByText(/tllm-secret-value/)
+    expect(getConnectSpy).toHaveBeenCalled()
   })
 })

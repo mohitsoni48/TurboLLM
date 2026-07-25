@@ -7,11 +7,24 @@ import { ScreenHeader } from '../components/common'
 import { Button } from '../components/ui/button'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../components/ui/collapsible'
 import { useApiKeys, useNetworkInfo } from '../lib/queries'
-import { ApiError, getConnect, type ConnectStep } from '../lib/api'
+import { ApiError, getConnect, type ConnectStep, type NetworkInfo } from '../lib/api'
 import { toast } from '../components/ui/sonner'
 import { cn } from '../lib/utils'
 
 const BASE = window.location.origin
+
+/** Host-only while the LAN is open and unauthenticated (lanBind on, requireApiKey off): in that
+ *  state the backend accepts key material from ANY device with no credential at all (spec 06 §5's
+ *  "opted into open LAN access") — a non-host viewer could otherwise list/create keys directly, OR
+ *  (the connect-setup snippets) get a live key just by loading the page. Mirrors the server-
+ *  enforced gate `keysHostGate` in routes.ts (both /api/v1/keys and /api/v1/connect/:cli) — this
+ *  hides the UI to match, it isn't the actual security boundary. `net` undefined (still loading)
+ *  fails CLOSED so nothing containing key material flashes visible before the real state is known.
+ *  ONE shared definition so the two call sites (API keys list, connect-setup snippets) can't drift
+ *  out of sync with each other or with the backend rule. */
+function isKeysLocked(net: NetworkInfo | undefined): boolean {
+  return net ? !net.isHost && !net.requireApiKey : true
+}
 
 // Only the endpoints an external app actually builds against (OpenAI + Anthropic
 // compatible). The daemon's own internal /api/v1/* management endpoints are not
@@ -64,15 +77,7 @@ function ConnectionPanel() {
   // dashboard locally even though LAN sharing is on for OTHER devices — show the actually
   // LAN-reachable URL in that case, since that's the address an external app needs.
   const serverUrl = net?.lanBind && net.lanUrl ? net.lanUrl : BASE
-
-  // Host-only while the LAN is open and unauthenticated (lanBind on, requireApiKey off):
-  // in that state the backend itself accepts key management from ANY device with no
-  // credential (spec 06 §5's "opted into open LAN access"), so a non-host viewer here could
-  // otherwise list key names or mint itself a durable key with zero credential. Mirrors the
-  // server-enforced gate on /api/v1/keys (routes.ts) — this hides the UI to match, it isn't
-  // the actual security boundary. `net` undefined (still loading) fails CLOSED (locked) so
-  // the form never flashes visible then disappears once the real state arrives.
-  const keysLocked = net ? !net.isHost && !net.requireApiKey : true
+  const keysLocked = isKeysLocked(net)
 
   const handleCreate = () => {
     const name = newName.trim()
@@ -185,8 +190,14 @@ function ConnectionPanel() {
 // ── Connect an app ────────────────────────────────────────────────────────────
 
 function ConnectSection() {
+  const { data: net } = useNetworkInfo()
   const [selected, setSelected] = useState<string>(CLI_LIST[0].id)
   const cli = CLI_LIST.find((c) => c.id === selected) ?? CLI_LIST[0]
+  // Setup snippets embed a live API key when the daemon is LAN-exposed (routes.ts's
+  // GET /api/v1/connect/:cli mints one on every call) — same lock as the API-keys list above,
+  // and just as necessary here: unlike that list, this fires automatically the moment the
+  // page loads (no click needed) for whichever CLI is selected by default.
+  const keysLocked = isKeysLocked(net)
 
   return (
     <section>
@@ -201,7 +212,17 @@ function ConnectSection() {
         ))}
       </div>
 
-      <SetupPanel key={cli.id} cli={cli} />
+      {keysLocked ? (
+        <div className="mt-3 flex items-start gap-2 rounded-xl border border-border bg-panel p-4 text-[13px] text-faint">
+          <Lock size={14} className="mt-0.5 shrink-0" />
+          <span>
+            Setup snippets include a live API key, so they're only available from this machine
+            until "Require an API key" is turned on for LAN access (Settings → Network).
+          </span>
+        </div>
+      ) : (
+        <SetupPanel key={cli.id} cli={cli} />
+      )}
     </section>
   )
 }

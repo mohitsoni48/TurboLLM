@@ -15,8 +15,9 @@ import type { Deps } from '../deps'
 type FakeConfig = { daemon: { lanBind: boolean; requireApiKey: boolean; port: number }; apiKeys: Array<{ id: string; name: string; hash: string; prefix: string; createdAt: string; lastUsedAt: string | null }> }
 
 /** Minimal Deps double: registerApi only touches these fields at ROUTE-HANDLER time (lazy
- *  closures), never at registration time (confirmed by reading routes.ts's top), so a store-only
- *  double is sufficient for exercising /api/v1/keys and /api/v1/settings/network specifically. */
+ *  closures), never at registration time (confirmed by reading routes.ts's top), so a store +
+ *  manager double is sufficient for exercising /api/v1/keys, /api/v1/settings/network, and
+ *  /api/v1/connect/:cli specifically. */
 function fakeApp(cfg: FakeConfig): { app: Hono; cfg: FakeConfig } {
   const app = new Hono()
   const d = {
@@ -25,6 +26,7 @@ function fakeApp(cfg: FakeConfig): { app: Hono; cfg: FakeConfig } {
       snapshot: () => cfg,
       update: (fn: (c: FakeConfig) => void) => fn(cfg),
     },
+    manager: { status: () => ({ state: 'stopped', model: null }) },
   } as unknown as Deps
   registerApi(app, d)
   return { app, cfg }
@@ -101,4 +103,27 @@ test('GET /api/v1/settings/network: requireApiKey field reflects the live config
   const res = await app.request('/api/v1/settings/network')
   const body = (await res.json()) as { requireApiKey: boolean }
   assert.equal(body.requireApiKey, true)
+})
+
+// ── GET /api/v1/connect/:cli — worse than the list/create case: this route MINTS a fresh live
+// key on every call while lanBind is on, and (in the real UI) fires automatically the instant
+// the Developer page loads, with no explicit click required at all.
+
+test('GET /api/v1/connect/:cli: 403 for a non-host caller while the LAN is open and unauthenticated — no key minted', async () => {
+  const { app, cfg } = fakeApp(baseConfig({ lanBind: true, requireApiKey: false }))
+  const res = await app.request('/api/v1/connect/claude-code')
+  assert.equal(res.status, 403)
+  assert.equal(cfg.apiKeys.length, 0, 'no key must have actually been minted by the blocked request')
+})
+
+test('GET /api/v1/connect/:cli: 200 with a real live key when lanBind is off (loopback-only — always local)', async () => {
+  const { app } = fakeApp(baseConfig({ lanBind: false }))
+  const res = await app.request('/api/v1/connect/claude-code')
+  assert.equal(res.status, 200)
+})
+
+test('GET /api/v1/connect/:cli: 200 for a non-host caller once requireApiKey is already on (self-service is fine post-auth)', async () => {
+  const { app } = fakeApp(baseConfig({ lanBind: true, requireApiKey: true }))
+  const res = await app.request('/api/v1/connect/claude-code')
+  assert.equal(res.status, 200)
 })
