@@ -8,7 +8,7 @@ import {
   siHubspot, siMixpanel, siGoogle,
   siPostgresql, siGit, siPuppeteer, siGoogledrive, siBrave,
   siDocker, siRedis, siMongodb, siObsidian, siYoutube, siRss,
-  siKubernetes, siMysql, siKagi, siSearxng,
+  siKubernetes, siMysql, siKagi, siSearxng, siUpstash,
 } from 'simple-icons'
 
 export type BrandIcon = { path: string; hex: string }
@@ -46,4 +46,5 @@ export const BRAND_ICONS: Record<string, BrandIcon> = {
   mysql:      { path: siMysql.path,      hex: siMysql.hex },
   kagi:       { path: siKagi.path,       hex: siKagi.hex },
   searxng:    { path: siSearxng.path,    hex: siSearxng.hex },
+  upstash:    { path: siUpstash.path,    hex: siUpstash.hex },
 }

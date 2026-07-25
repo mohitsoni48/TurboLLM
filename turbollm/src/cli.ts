@@ -31,6 +31,7 @@ import { GenerationGate } from './agents/gate'
 import { AgentTaskState } from './agents/task-state'
 import { launchCli } from './cli-launch'
 import { writePidfile, removePidfile, stopDaemon, resolveDaemonPort } from './daemon-pid'
+import { runMcpServer } from './mcp-server'
 import { createApp } from './server'
 import { provisionTunnelApiKey } from './auth'
 import { TunnelManager, reapStaleTunnels, killTrackedTunnelsSync } from './tunnel/manager'
@@ -132,6 +133,24 @@ if (argv[0] === 'launch') {
   process.exit(code)
 }
 
+// ── `turbollm mcp-server` — expose Code as an MCP tool over stdio (TODO.md item 4) ──────
+// A thin bridge to an ALREADY-RUNNING daemon's existing HTTP API — deliberately does NOT
+// start a daemon, load a model, or touch ConfigStore/Manager itself, so it stays a fast,
+// side-effect-free process an MCP host can spawn per connection. See mcp-server.ts for the
+// full scope rationale. Handled here (before the heavy daemon bootstrap below) for the same
+// reason `launch` is: this process's job ends at stdio, it never needs Registry/Manager/etc.
+if (argv[0] === 'mcp-server') {
+  const mcpConfigPath = argValue('--config', defaultConfigPath())
+  const mcpExplicitPort = Number(argValue('--port', '')) || undefined
+  const mcpPort = resolveDaemonPort(
+    dirname(mcpConfigPath),
+    mcpExplicitPort,
+    configuredDaemonPort(mcpConfigPath),
+  )
+  await runMcpServer(`http://127.0.0.1:${mcpPort}`, version)
+  process.exit(0)
+}
+
 // ── --help / -h ───────────────────────────────────────────────────────────────
 if (hasFlag('--help', '-h')) {
   process.stdout.write(
@@ -146,7 +165,11 @@ if (hasFlag('--help', '-h')) {
     `                                   Claude Code to whatever model is loaded.\n` +
     `  launch claude --model <key>      Load a specific model by key or name, then launch\n` +
     `  launch opencode|kilo|openclaw|hermes\n` +
-    `                                   Wire that CLI to TurboLLM (writes its config file)\n\n` +
+    `                                   Wire that CLI to TurboLLM (writes its config file)\n` +
+    `  mcp-server                       Run an MCP server over stdio, bridging to an already-\n` +
+    `                                   running TurboLLM daemon so other agentic CLIs can\n` +
+    `                                   delegate tasks to Code. Add to a host's MCP config as:\n` +
+    `                                   { "command": "npx", "args": ["turbollm", "mcp-server"] }\n\n` +
     `Options:\n` +
     `  --port <n>     Port to listen on / connect to (default: 6996)\n` +
     `  --addr <h:p>   Full host:port override (e.g. 0.0.0.0:6996)\n` +

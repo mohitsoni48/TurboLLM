@@ -1,4 +1,4 @@
-import { FlaskConical, SquareTerminal, Rocket, Brain } from 'lucide-react'
+import { FlaskConical, Rocket, Brain } from 'lucide-react'
 import { useSettings } from '../../lib/queries'
 import { ApiError } from '../../lib/api'
 import { Badge } from '../../components/ui/badge'
@@ -39,18 +39,20 @@ function FeatureRow({
 
 /** Experimental features (2026-07-14, preparing for wider distribution): still-in-progress
  *  capabilities, off by default for new/distributed installs, turned on individually here.
- *  ALL THREE are simple master on/off rows in this ONE list — Memory's own richer settings
+ *  Both are simple master on/off rows in this ONE list — Memory's own richer settings
  *  (the "remember facts about you" toggle + facts list) stay in their ORIGINAL location,
  *  Settings → General's MemorySection, and only render there when this row is checked. This is
  *  a correction of an earlier version that moved MemorySection's whole UI into this tab — the
  *  founder was explicit that Memory's settings belong where they've always been, gated on
- *  visibility (and, on the backend, on actually running) by this checkbox alone, not relocated. */
+ *  visibility (and, on the backend, on actually running) by this checkbox alone, not relocated.
+ *  Code used to be a third row here — removed when it graduated to generally available
+ *  (ADR-280), rather than staying an opt-in toggle. */
 export function ExperimentalSection() {
   const { query: settingsQ, save } = useSettings()
-  const experimental = settingsQ.data?.experimental ?? { memory: false, code: false, cloudDeploy: false }
+  const experimental = settingsQ.data?.experimental ?? { memory: false, cloudDeploy: false }
   const busy = save.isPending
 
-  const setFlag = (key: 'memory' | 'code' | 'cloudDeploy', value: boolean) => {
+  const setFlag = (key: 'memory' | 'cloudDeploy', value: boolean) => {
     save.mutate(
       { experimental: { [key]: value } },
       { onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not update experimental setting.') },
@@ -74,14 +76,6 @@ export function ExperimentalSection() {
         description="Silently remembers durable facts from your chats. Its settings live in General — this only controls whether that section is unlocked and actually runs."
         checked={experimental.memory}
         onChange={(v) => setFlag('memory', v)}
-        disabled={busy}
-      />
-      <FeatureRow
-        icon={SquareTerminal}
-        title="Code"
-        description="A local coding agent that reads, edits, and runs commands in a real project directory. Disabling this removes the Code entry point entirely."
-        checked={experimental.code}
-        onChange={(v) => setFlag('code', v)}
         disabled={busy}
       />
       <FeatureRow

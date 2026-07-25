@@ -1020,6 +1020,20 @@ export class ConversationStore {
     return (this.db.prepare(`SELECT * FROM messages WHERE conv_id = $id AND is_active = 1 ORDER BY seq ASC`).all({ $id: convId } as P) as unknown as MsgRow[]).map(rowToMsg)
   }
 
+  /** Like {@link deactivateMessagesFrom}'s own range (seq >= fromMessageId's seq) — but returns
+   *  the actual rows regardless of is_active, unlike getMessages' unconditional is_active=1
+   *  filter. Needed for Code's /revert file-revert path: a SUPERSEDING revert (ADR-278) that
+   *  passes revertFiles=true must be able to see edit-tool patches from a PREVIOUSLY reverted,
+   *  already-inactive range too — getMessages alone would silently drop that range, making
+   *  revertFileEdits skip files a prior chat-only revert never touched, while the caller's
+   *  success toast still claims everything from the new cut onward was reverted. */
+  getMessagesFromIncludingInactive(convId: string, fromMessageId: string): Message[] {
+    const from = this.db.prepare(`SELECT seq FROM messages WHERE id = $id AND conv_id = $cid`).get({ $id: fromMessageId, $cid: convId } as P) as unknown as { seq: number } | undefined
+    if (!from) return []
+    return (this.db.prepare(`SELECT * FROM messages WHERE conv_id = $cid AND seq >= $seq ORDER BY seq ASC`)
+      .all({ $cid: convId, $seq: from.seq } as P) as unknown as MsgRow[]).map(rowToMsg)
+  }
+
   addMessage(convId: string, role: 'user' | 'assistant', content: string, extra?: Partial<Pick<Message, 'reasoning' | 'attachments' | 'textAttachments' | 'toolCalls' | 'stats' | 'variantGroup'>>): Message {
     const id = randomUUID()
     const now = new Date().toISOString()

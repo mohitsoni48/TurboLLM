@@ -829,6 +829,10 @@ export function CodeSessionScreen() {
             onModelSettings={(key) => setSettingsKey(key)}
             ctxUsed={ctxUsed}
             ctxMax={ctxMax}
+            lastPromptTokens={lastRealStats?.promptTokens}
+            lastGenTokens={lastRealStats?.genTokens}
+            lastPromptTps={lastRealStats?.promptTps}
+            lastGenTps={lastRealStats?.tps}
             live={!!live}
             onStop={() => void handleStop()}
             sendDisabled={!input.trim() || manualCompacting}

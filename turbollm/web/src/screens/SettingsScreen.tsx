@@ -22,6 +22,7 @@ import {
 import { CopyButton } from '../components/ui/copy-button'
 import { ModelDirs } from './models/ModelDirs'
 import { ToolPermissionsSection } from './settings/ToolPermissionsSection'
+import { CodeContextSection } from './settings/CodeContextSection'
 import { MemorySection } from './settings/MemorySection'
 import { ExperimentalSection } from './settings/ExperimentalSection'
 
@@ -611,6 +612,9 @@ export function SettingsScreen() {
             <>
               {/* Tool permissions — moved here from Developer. */}
               <ToolPermissionsSection />
+
+              {/* Code's AGENTS.md-style standing-context candidate lists. */}
+              <CodeContextSection />
             </>
           )}
 

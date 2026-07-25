@@ -5,16 +5,6 @@ import { describe, expect, it, vi } from 'vitest'
 import { ConversationSidebar } from './ConversationSidebar'
 import type { CodeSession } from '../../lib/code-types'
 
-// Code mode is gated behind Settings → Experimental (ConversationSidebar.tsx:299) — force it on
-// so the sidebar actually renders CodeSessionsList instead of the chat folder/conversation list.
-vi.mock('../../lib/api', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../../lib/api')>()
-  return {
-    ...actual,
-    getSettings: vi.fn(async () => ({ experimental: { code: true } }) as ReturnType<typeof actual.getSettings> extends Promise<infer T> ? T : never),
-  }
-})
-
 const RUNNING_SESSION: CodeSession = {
   id: 's-running',
   convId: 'c-running',

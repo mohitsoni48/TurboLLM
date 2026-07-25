@@ -99,12 +99,13 @@ export interface Daemon {
   /** Release 3: background extraction of durable facts from the user's own chat messages,
    *  injected into future new conversations. Off by default — unlike autoGenerateTitles,
    *  this builds a persistent cross-conversation profile of the user, so it's opt-in
-   *  (same trust-surface posture as lanBind), not default-on. Two-layer gate, same shape as
-   *  Code: `experimental.memory` (below) is the master "is this feature unlocked at all"
+   *  (same trust-surface posture as lanBind), not default-on. Two-layer gate:
+   *  `experimental.memory` (below) is the master "is this feature unlocked at all"
    *  switch — MemorySection's own UI in Settings → General only renders when it's on, and
    *  extraction only runs when BOTH it and this field are true (chat-routes.ts). This field is
-   *  the finer opt-in WITHIN that (do you actually want facts remembered), same relationship
-   *  Code's own mode/tool settings have to `experimental.code` unlocking the workspace itself. */
+   *  the finer opt-in WITHIN that (do you actually want facts remembered). Code used to follow
+   *  this same two-layer shape via `experimental.code` — removed when Code graduated out of
+   *  experimental status and became available to everyone by default (ADR-280). */
   autoMemoryEnabled: boolean
   /** Experimental features (2026-07-14, preparing for wider distribution): still-in-progress
    *  capabilities gated behind an explicit opt-in toggle in Settings → Experimental, off by
@@ -118,9 +119,6 @@ export interface ExperimentalFeatures {
    *  section reappears in its ORIGINAL location in General — this does NOT relocate Memory's
    *  settings into the Experimental tab, only gates whether they're reachable at all. */
   memory: boolean
-  /** Gates the entire Code workspace (both the UI entry point and /api/v1/code/* itself —
-   *  see auth.ts's requireExperimentalCode). */
-  code: boolean
   /** Gates the Cloud Launch / RunPod deploy-link surface (ADR-153's cloudDeploy config,
    *  previously only reachable via the internal-only TURBOLLM_FEATURES=cloud-deploy env var,
    *  features.ts — this is now the primary, user-facing way to turn it on). */
@@ -246,6 +244,23 @@ export interface ComfyUI {
  *  point at their conda env's bin (or the CUDA bin) and have it picked up. Absolute paths. */
 export interface BuildConfig {
   toolchainDirs: string[]
+}
+/** Standing-context filename candidates for Code's AGENTS.md-style injection
+ *  (persona.ts's agentsMdBlock) — tried in order per side, first EXISTING match wins. Global-
+ *  only for now (applies to every repo alike, not a per-repo setting — see decision-log for the
+ *  rationale): solves the common "this repo uses CLAUDE.md, not AGENTS.md" case with zero
+ *  configuration, since the shipped defaults already include CLAUDE.md. Entries must be
+ *  RELATIVE (validate() below rejects an absolute one with a clean 400) — persona.ts still
+ *  containment-checks each one again at read time regardless, since config.json is hand-editable
+ *  and route-level validation alone can't be trusted as the only gate. */
+export interface CodeConfig {
+  /** Tried against each repo's own root. Defaults mirror persona.ts's own
+   *  DEFAULT_AGENTS_MD_PROJECT_CANDIDATES (duplicated as a literal, not imported — config.ts
+   *  stays dependency-free of feature modules by design; update both if this ever changes). */
+  agentsMdProjectCandidates: string[]
+  /** Tried against the global TurboLLM data dir (~/.turbollm). Mirrors persona.ts's
+   *  DEFAULT_AGENTS_MD_GLOBAL_CANDIDATES. */
+  agentsMdGlobalCandidates: string[]
 }
 /** Cloud Launch deploy-link settings (ADR-153, RunPod recipe). RunPod is the only
  *  provider for now — a user who has published their own RunPod Template (following
@@ -382,6 +397,8 @@ export interface Config {
   builtinAgentOverrides: Record<string, BuiltinAgentOverride>
   /** Compile-from-source settings (ADR-089/100): toolchain dirs prepended to PATH. */
   build: BuildConfig
+  /** Code's AGENTS.md-style standing-context candidate lists. */
+  code: CodeConfig
   /** Cloud Launch deploy-link settings (ADR-153). */
   cloudDeploy: CloudDeployConfig
   devModel?: DevModel
@@ -476,7 +493,7 @@ export function defaultConfig(): Config {
       theme: 'system',
       autoGenerateTitles: true,
       autoMemoryEnabled: false,
-      experimental: { memory: false, code: false, cloudDeploy: false },
+      experimental: { memory: false, cloudDeploy: false },
     },
     telemetry: { level: 'unset', machineId: '' },
     apiKeys: [],
@@ -501,6 +518,7 @@ export function defaultConfig(): Config {
     customAgents: [],
     builtinAgentOverrides: {},
     build: { toolchainDirs: [] },
+    code: { agentsMdProjectCandidates: ['AGENTS.md', 'agents.md', 'CLAUDE.md'], agentsMdGlobalCandidates: ['agents.md', 'AGENTS.md', 'CLAUDE.md'] },
     cloudDeploy: { runpodTemplateId: '' },
   }
 }
@@ -818,19 +836,34 @@ function normalize(c: Config): void {
       ? bd.toolchainDirs.filter((p): p is string => typeof p === 'string' && p.trim() !== '').map((p) => p.trim())
       : [],
   }
+  // AGENTS.md candidate lists: absent/empty in pre-this-decision configs → the real defaults
+  // (NOT []), so a fresh/upgraded config resolves standing context exactly like the old hardcoded
+  // 'AGENTS.md'/'agents.md' literals did, plus CLAUDE.md. The validator enforces relative paths.
+  const cc = (c.code ?? {}) as Partial<CodeConfig>
+  const cleanCandidates = (v: unknown, fallback: string[]): string[] => {
+    const filtered = Array.isArray(v) ? v.filter((p): p is string => typeof p === 'string' && p.trim() !== '').map((p) => p.trim()) : []
+    return filtered.length > 0 ? filtered : fallback
+  }
+  c.code = {
+    agentsMdProjectCandidates: cleanCandidates(cc.agentsMdProjectCandidates, ['AGENTS.md', 'agents.md', 'CLAUDE.md']),
+    agentsMdGlobalCandidates: cleanCandidates(cc.agentsMdGlobalCandidates, ['agents.md', 'AGENTS.md', 'CLAUDE.md']),
+  }
   // Cloud Launch deploy-link settings (ADR-153): absent in pre-ADR-153 configs → ''.
   const cd = (c.cloudDeploy ?? {}) as Partial<CloudDeployConfig>
   c.cloudDeploy = { runpodTemplateId: typeof cd.runpodTemplateId === 'string' ? cd.runpodTemplateId.trim() : '' }
   // Experimental feature flags (2026-07-14): absent in pre-this-decision configs → default
-  // false for code/cloudDeploy, same conservative posture as lanBind. `memory` is the one
+  // false for cloudDeploy, same conservative posture as lanBind. `memory` is the one
   // exception: a config that ALREADY had autoMemoryEnabled=true (the user had genuinely opted
   // in before this gate existed) migrates to memory=true too, so the section they were already
   // using doesn't silently vanish from Settings → General the moment they upgrade — a config
   // that never turned it on gets memory=false, the same conservative default as everything else.
+  // `code` was removed from this shape entirely (ADR-280) when Code graduated out of
+  // experimental status — an old config's stale `experimental.code` value (if any survives in
+  // an on-disk config.json from before this change) is simply dropped here, not migrated,
+  // since there's no longer a field for it to migrate into.
   const ex = (c.daemon.experimental ?? {}) as Partial<ExperimentalFeatures>
   c.daemon.experimental = {
     memory: ex.memory === true || c.daemon.autoMemoryEnabled === true,
-    code: ex.code === true,
     cloudDeploy: ex.cloudDeploy === true,
   }
   // Telemetry level (spec 09 §3): the UI exposes 'off' | 'anon' | 'full'. Migrate
@@ -888,6 +921,18 @@ function validate(c: Config): void {
   // matter the daemon's cwd when it spawns git/cmake.
   for (const dir of c.build.toolchainDirs) {
     if (!isAbsolutePath(dir)) throw new ValueError('build.toolchainDirs', 'toolchain directories must be absolute paths')
+  }
+  // AGENTS.md candidates: the OPPOSITE constraint from toolchainDirs — must be RELATIVE (resolved
+  // against a repo root / the global data dir, never an absolute host path), and capped short so a
+  // pathological config can't turn every turn into dozens of stat() calls. This is a clean-400
+  // convenience, not the real security boundary — persona.ts containment-checks each entry again
+  // at read time regardless, since this config is hand-editable and bypasses this route entirely.
+  const MAX_AGENTS_MD_CANDIDATES = 8
+  for (const [field, list] of [['code.agentsMdProjectCandidates', c.code.agentsMdProjectCandidates], ['code.agentsMdGlobalCandidates', c.code.agentsMdGlobalCandidates]] as const) {
+    if (list.length > MAX_AGENTS_MD_CANDIDATES) throw new ValueError(field, `at most ${MAX_AGENTS_MD_CANDIDATES} candidates`)
+    for (const entry of list) {
+      if (isAbsolutePath(entry)) throw new ValueError(field, 'candidates must be relative filenames/paths, not absolute')
+    }
   }
   // Agents (spec 13 §2.1): enforce the schema invariants so a bad config can't widen
   // an agent's filesystem scope or break the run manager's lookups.

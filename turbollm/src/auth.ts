@@ -230,20 +230,3 @@ export function codeAuth(d: Deps): MiddlewareHandler {
     )
   }
 }
-
-/** Experimental-feature gate (2026-07-14, preparing for wider distribution): Code is now an
- *  opt-in experimental feature (Settings → Experimental), off by default for new/distributed
- *  installs. This is INDEPENDENT of codeAuth above — codeAuth answers "is this caller allowed
- *  to reach Code at all", this answers "is Code even turned on" — both must pass. Register on
- *  /api/v1/code/* alongside codeAuth in server.ts. A 403 (not 401): the caller may be fully
- *  authenticated and simply have the feature turned off, which is a different failure mode from
- *  a missing/invalid credential. */
-export function requireExperimentalCode(d: Deps): MiddlewareHandler {
-  return async (c, next) => {
-    if (d.store.snapshot().daemon.experimental.code) return next()
-    return c.json(
-      { error: { code: 'feature_disabled', message: 'Code is an experimental feature. Enable it in Settings → Experimental.' } },
-      403,
-    )
-  }
-}

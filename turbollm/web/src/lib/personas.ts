@@ -37,7 +37,7 @@ const TURBOLLM_KNOWLEDGE =
   '- **Switching to a different conversation never cancels a reply that\'s still generating** — it keeps going in the background and saves when done. The sidebar shows a spinning indicator on any conversation generating in the background, and a dot on one that just finished while you were elsewhere (clears once you open it).\n' +
   '- **Thinking budget**: a graduated slider (not just on/off) — cap reasoning to a specific token count, disable it entirely, or leave it unlimited. Same control in Code.\n\n' +
 
-  '**Code** (Workspace → Code tab, next to Chat; opt-in via Settings → Experimental, off by default — the whole tab is hidden until enabled) — a local coding agent on the same loaded model, working in a real project directory. Nothing leaves the machine.\n' +
+  '**Code** (Workspace → Code tab, next to Chat — on by default for everyone, no setup needed) — a local coding agent on the same loaded model, working in a real project directory. Nothing leaves the machine.\n' +
   '- Point it at a repo folder (optional isolated git worktree so the real checkout stays untouched), describe a task, pick a mode (plan-only / ask-before-mutating / auto plan-and-edit) — it reads, edits files, runs shell commands, and reports a real diff.\n' +
   '- **Persistent sessions**: archive/filter past runs, revert to any earlier message (with optional real file-edit reversal), attach files as context, transcript copy. A "Coding activity" dashboard (sessions, tasks shipped, files touched, diff shipped, streaks) is built from real history.\n' +
   '- **Real LSP integration** for TypeScript/JavaScript and Python — detects the language, installs the language server if needed, uses it for edits.\n' +
@@ -67,9 +67,11 @@ const TURBOLLM_KNOWLEDGE =
   '- **Engine updates**: honest check vs GitHub releases/latest; rollback-safe (probe new build before swap, old build kept until success).\n' +
   '- Per-engine auto-update policy: Off / Notify / Auto (default Notify).\n\n' +
 
-  '**Developer** — connect an outside app or CLI to this server.\n' +
-  '- **Connection panel**: the server URL and your API key(s) in one place.\n' +
-  '- **One-command CLI setup cards**: `turbollm launch claude|opencode|kilo|openclaw|hermes` for each supported coding CLI, plus a collapsed reference for the public `/v1/*` API.\n\n' +
+  '**Developer** — connect an outside app or CLI to this server, or expose Code to one.\n' +
+  '- **Connection panel**: the server URL (shows your LAN address when sharing is on, not just localhost) and your API key(s) in one place.\n' +
+  '- **One-command CLI setup cards**: `turbollm launch claude|opencode|kilo|openclaw|hermes` for each supported coding CLI, plus a collapsed reference for the public `/v1/*` API.\n' +
+  '- **TurboLLM MCP section**: setup for `turbollm mcp-server`, a stdio MCP server exposing Code as a `delegate_code_task` tool any MCP-compatible tool can call (Claude Desktop, Cursor, Windsurf, Cline, Claude Code, etc.) — the reverse direction from the rest of this screen.\n' +
+  '- **Key management is host-only while the LAN is open and unauthenticated** (LAN sharing on, "Require an API key" off in Settings → Network): viewing/creating/revoking keys and the connect-setup snippets (which embed a live key) are locked to this machine until a key is required, with an explanatory message instead of just silently missing.\n\n' +
 
   '**Agents** — background agent runs (v1.5.0+).\n' +
   '- Detached conversations that run without the UI open.\n' +
@@ -94,7 +96,7 @@ const TURBOLLM_KNOWLEDGE =
   '- **Models & loading**: idle timeout (auto-stop after N minutes), default context length, Gateway (auto model-swap + Keep-N pool, 1–4 models), model folders, Hugging Face token, and an **Advanced** collapsible for expert knobs — default GPU layers, VRAM headroom (300 MB–2 GB, default 1 GB, or drag to 0 to opt into MoE auto-tune\'s "VRAM-spill" search — see Auto-Tune below), and image/response token caps.\n' +
   '- **Tools & safety**: per-tool Ask/Allow/Deny defaults for every tool the model can call (web_search, fetch_url, run_code, MCP tools), plus an **Auto-allow all** master toggle (default off) that skips the approval prompt for anything set to Ask — a tool explicitly set to Deny still stays blocked either way.\n' +
   '- **Network & sharing**: LAN exposure (bind to 0.0.0.0 vs loopback-only), port, require-API-key auth, and ComfyUI integration (URL, Reverse GPU gate, update banner).\n' +
-  '- **Experimental**: still-in-progress features, off by default — a single on/off row each for **Memory** (silently extracts durable facts from chat using the loaded model; its own settings stay in General, unlocked once this is on), **Code** (the Workspace → Code tab; disabling this removes the tab entirely, not just its content), and **Cloud Launch/RunPod** (earliest-stage of the three — turning it on doesn\'t yet unlock a built UI).\n' +
+  '- **Experimental**: still-in-progress features, off by default — a single on/off row each for **Memory** (silently extracts durable facts from chat using the loaded model; its own settings stay in General, unlocked once this is on) and **Cloud Launch/RunPod** (turning it on doesn\'t yet unlock a built UI). Code used to be a third row here — it\'s generally available now, no toggle needed.\n' +
   '- **System**: hardware panel, telemetry (Off / Anonymous / Full), About (current version, update-available chip, copy install command).\n\n' +
 
   '## Agents (formerly "Personas")\n\n' +

@@ -390,7 +390,14 @@ export class CodeRunManager {
         reasoning,
         toolCalls,
         timeline,
-        stats: { ctxUsed: ctxStats.ctxUsed, ctxMax: ctxStats.ctxMax, model: model?.key, aborted: result.aborted },
+        stats: {
+          ctxUsed: ctxStats.ctxUsed, ctxMax: ctxStats.ctxMax, model: model?.key, aborted: result.aborted,
+          // Real per-turn token/timing stats (foldTurnUsage, code-session.ts) — omitted by
+          // runCodeSession (not zeroed) when the engine returned no usable usage at all.
+          promptTokens: result.promptTokens, genTokens: result.genTokens, cachedTokens: result.cachedTokens,
+          promptMs: result.promptMs, genMs: result.genMs, promptTps: result.promptTps, tps: result.tps,
+          ttftMs: result.ttftMs, totalMs: result.totalMs,
+        },
       })
       if (result.finalText.trim()) this.d.db.upsertRunDoc(sessionId, result.finalText.trim())
       this.d.db.updateAgentRun(sessionId, { status: result.aborted ? 'interrupted' : 'done', endedAt: new Date().toISOString() })
