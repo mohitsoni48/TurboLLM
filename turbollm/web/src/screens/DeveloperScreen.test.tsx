@@ -133,7 +133,7 @@ describe('DeveloperScreen — TurboLLM MCP section', () => {
     networkInfo = { lanBind: false, lanUrl: '', hasApiKey: false, requireApiKey: false, isHost: true }
     await renderScreen()
     expect(screen.getByText('delegate_code_task parameters')).toBeInTheDocument()
-    for (const name of ['repoRoot', 'task', 'mode', 'modelKey', 'timeoutSeconds']) {
+    for (const name of ['repoRoot', 'task', 'mode', 'timeoutSeconds']) {
       expect(screen.getByText(name)).toBeInTheDocument()
     }
   })

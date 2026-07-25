@@ -6,13 +6,15 @@
 // composes with real DB state (a /clear'd session, an "active" run).
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { createPatch } from 'diff'
 import { Hono } from 'hono'
 import { ConversationStore } from '../chat/db'
 import { registerCodeRoutes } from './code-routes'
 import type { Deps } from '../deps'
+import type { ToolCallRecord } from '../chat/db'
 
 function tmp(prefix: string): string {
   return mkdtempSync(join(tmpdir(), prefix))
@@ -210,4 +212,54 @@ test('the mutual-exclusion lock releases: /clear → /resume → /revert all suc
   // permanent lock) — reverting to the now-reactivated 'second' user message.
   const revert = await app.request(`/api/v1/code/sessions/${run.id}/revert`, { method: 'POST', body: JSON.stringify({ messageId: target.id }), headers: { 'Content-Type': 'application/json' } })
   assert.equal(revert.status, 200)
+})
+
+// ── HIGH finding, v1.9.0 pre-release review: a superseding revert with revertFiles:true must
+// reach edit patches from a PRIOR revert's already-deactivated range too, not just the newly-
+// exposed active range — see code-routes.ts's /revert handler comment for the full mechanism.
+test('POST .../revert (superseding, revertFiles: true) reaches an edit patch from a PRIOR chat-only revert\'s already-hidden range', async () => {
+  const repoRoot = mkdtempSync(join(tmpdir(), 'tllm-revert-supersede-files-'))
+  const db = new ConversationStore(tmp('tllm-revert-supersede-files-'))
+  const { app } = makeApp(db)
+  const { conv, run } = seedSession(db, { repoRoot })
+
+  const v0 = 'line1\nold\nline3\n'
+  const v1 = 'line1\nnew\nline3\n'
+  writeFileSync(join(repoRoot, 'a.txt'), v1)
+  const patch = createPatch('a.txt', v0, v1)
+  const editToolCall: ToolCallRecord = { id: 'tc-1', name: 'edit', args: { path: 'a.txt' }, patch }
+
+  const first = db.addMessage(conv.id, 'user', 'first')
+  const second = db.addMessage(conv.id, 'user', 'second') // the SECOND (further-back) revert target
+  const third = db.addMessage(conv.id, 'user', 'third') // the FIRST (chat-only) revert target
+  db.addMessage(conv.id, 'assistant', 'reply with an edit', { toolCalls: [editToolCall] })
+
+  // First revert — "Chat only" (revertFiles: false). Hides 'third' + the edit-carrying reply;
+  // the file is deliberately left untouched on disk (v1), matching the real UI's "Chat only" path.
+  const r1 = await app.request(`/api/v1/code/sessions/${run.id}/revert`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ messageId: third.id, revertFiles: false }),
+  })
+  assert.equal(r1.status, 200)
+  assert.equal(readFileSync(join(repoRoot, 'a.txt'), 'utf8'), v1, 'chat-only revert must not touch the file')
+
+  // Second revert — SUPERSEDES, further back to 'second', WITH revertFiles: true. The naive
+  // `messages.slice(idx)` (is_active=1 only) would see only ['second'] here — no tool calls at
+  // all, since the edit-carrying reply is already deactivated by the first revert — and silently
+  // report nothing to revert. getMessagesFromIncludingInactive must reach past that hidden range.
+  const r2 = await app.request(`/api/v1/code/sessions/${run.id}/revert`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ messageId: second.id, revertFiles: true }),
+  })
+  assert.equal(r2.status, 200)
+  const body = (await r2.json()) as { revertedFiles: string[]; failedFiles: string[] }
+  assert.deepEqual(body.revertedFiles, ['a.txt'], 'must actually revert the file this time, not silently no-op')
+  assert.deepEqual(body.failedFiles, [])
+  assert.equal(readFileSync(join(repoRoot, 'a.txt'), 'utf8'), v0, 'file walked all the way back to its pre-edit content')
+
+  const conv2 = db.getConversation(conv.id, true)!
+  const active = new Set((conv2.messages ?? []).map((m) => m.id))
+  assert.ok(active.has(first.id))
+  assert.ok(!active.has(second.id))
+  assert.ok(!active.has(third.id))
 })

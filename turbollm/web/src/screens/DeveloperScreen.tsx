@@ -43,7 +43,6 @@ const MCP_PARAMS = [
   { name: 'repoRoot', required: true, desc: 'Absolute path to the repo the task should run against.' },
   { name: 'task', required: true, desc: 'What to do, in plain language.' },
   { name: 'mode', required: false, desc: 'auto / plan / ask — defaults to auto.' },
-  { name: 'modelKey', required: false, desc: 'Pin a specific model instead of whatever is currently loaded.' },
   { name: 'timeoutSeconds', required: false, desc: 'Give up waiting after this long — defaults to 1800 (30 min).' },
 ] as const
 

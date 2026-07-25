@@ -2109,6 +2109,11 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   app.delete('/api/v1/keys/:id', (c) => {
+    // Same host gate as GET/POST above (found missing here in the v1.9.0 pre-release review):
+    // without it, a non-host device on an open, unauthenticated LAN could revoke ANY key by id —
+    // breaking another device's already-configured access — protected by nothing but an
+    // unguessable UUID rather than an actual credential check.
+    if (!keysHostGate(c)) return err(c, 403, 'forbidden', 'API keys can only be revoked from this machine until "Require an API key" is turned on.')
     const id = c.req.param('id')
     d.store.update((cfg) => {
       cfg.apiKeys = cfg.apiKeys.filter((k) => k.id !== id)

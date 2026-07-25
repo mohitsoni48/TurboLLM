@@ -36,7 +36,6 @@ export const DELEGATE_TOOL_SCHEMA = {
       repoRoot: { type: 'string', description: 'Absolute path to the repository/directory the task should run against.' },
       task: { type: 'string', description: 'The task to perform, in natural language.' },
       mode: { type: 'string', enum: ['auto', 'plan', 'ask'], description: 'Permission mode for the run. Defaults to auto (full read/write/bash access, contained to repoRoot).' },
-      modelKey: { type: 'string', description: 'Optional — use a specific model key instead of whatever is currently loaded.' },
       timeoutSeconds: { type: 'number', description: 'Give up waiting after this many seconds (default 1800 = 30 minutes).' },
     },
     required: ['repoRoot', 'task'],
@@ -47,11 +46,20 @@ const DEFAULT_TIMEOUT_SECONDS = 1800
 const POLL_INTERVAL_MS = 1500
 const HTTP_TIMEOUT_MS = 10_000
 
+// No `modelKey` param, deliberately (found and removed in the v1.9.0 pre-release review): a Code
+// session's `modelKey` (POST /api/v1/code/sessions) is stored purely as a display LABEL on the
+// conversation row — nothing in runCodeSession/code-run-manager reads it to actually load or
+// switch models, the turn always runs against whatever's currently loaded (code-session.ts's
+// d.manager.status()). The old schema documented it as "use a specific model key instead of
+// whatever is currently loaded," which was simply false, and — since this MCP tool exposes no way
+// to ever list/see that label back — there was no way for a caller to even notice the promise
+// wasn't kept. Real model-pinning (load the requested model before running the turn) would be a
+// genuine feature needing its own careful pass through this project's model-loading subsystem, not
+// a quick add-on here.
 export interface DelegateParams {
   repoRoot: string
   task: string
   mode?: string
-  modelKey?: string
   timeoutSeconds?: number
 }
 
@@ -92,7 +100,7 @@ export async function delegateCodeTask(
     createRes = await fetchImpl(`${baseUrl}/api/v1/code/sessions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ repoRoot, task, mode: params.mode ?? 'auto', modelKey: params.modelKey }),
+      body: JSON.stringify({ repoRoot, task, mode: params.mode ?? 'auto' }),
       signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
     })
   } catch (e) {
@@ -183,7 +191,6 @@ export async function handleMcpRequest(
           repoRoot: args.repoRoot,
           task: args.task,
           mode: isString(args.mode) ? args.mode : undefined,
-          modelKey: isString(args.modelKey) ? args.modelKey : undefined,
           timeoutSeconds: typeof args.timeoutSeconds === 'number' ? args.timeoutSeconds : undefined,
         }, fetchImpl)
         return { jsonrpc: '2.0', id: req.id, result: { content: [{ type: 'text', text: result.text }], isError: !result.ok } }

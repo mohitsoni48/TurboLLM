@@ -458,8 +458,7 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
     // revertedFromMessageId cut (that cut and everything after it is already is_active=0 and thus
     // unreachable through the normal UI). "Revert again" can therefore only ever mean "revert
     // further back," never forward into already-hidden history — deactivateMessagesFrom below is
-    // idempotent-safe to call again with an earlier cutoff, and revertFileEdits' slice naturally
-    // covers the superset (the previously-reverted range plus the newly-included earlier range).
+    // idempotent-safe to call again with an earlier cutoff.
     // /compact and /clear keep their own hard stop while reverted (line 381 above, and the
     // clearedUpToMessageId guard above) — losing hidden history to a compaction/clear is a bigger,
     // less-reversible deal than superseding one revert cursor with another.
@@ -477,8 +476,16 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
     let revertedFiles: string[] = []
     let failedFiles: string[] = []
     if (b.revertFiles) {
-      const idx = messages.findIndex((m) => m.id === messageId)
-      const result = revertFileEdits(messages.slice(idx), run.repoRoot)
+      // NOT messages.slice(idx) — `messages` came from getConversation's is_active=1 filter, so
+      // it silently EXCLUDES any range a PRIOR revert already deactivated. Superseding a prior
+      // chat-only revert (revertFiles=false) with a further-back one that DOES ask for file
+      // reverts must still reach that earlier range's edit patches, or files it touched are
+      // silently left edited on disk while the success toast below claims otherwise (found in
+      // Opus PR review, pre-release gate for v1.9.0). getMessagesFromIncludingInactive walks the
+      // real seq-ordered row range regardless of is_active — the same range deactivateMessagesFrom
+      // itself operates on below.
+      const rangeMessages = db.getMessagesFromIncludingInactive(run.convId, messageId)
+      const result = revertFileEdits(rangeMessages, run.repoRoot)
       revertedFiles = result.reverted
       failedFiles = result.failed
     }
