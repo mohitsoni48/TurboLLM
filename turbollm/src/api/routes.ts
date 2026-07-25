@@ -1559,6 +1559,7 @@ export function registerApi(app: Hono, d: Deps): void {
       tavilyApiKey?: string
       search?: { provider?: string; tavilyApiKey?: string; kagiApiKey?: string; searxngUrl?: string }
       build?: { toolchainDirs?: string[] }
+      code?: { agentsMdProjectCandidates?: string[]; agentsMdGlobalCandidates?: string[] }
       toolPolicies?: Record<string, string>
       autoAllowAll?: boolean
       cloudDeploy?: { runpodTemplateId?: string }
@@ -1688,6 +1689,30 @@ export function registerApi(app: Hono, d: Deps): void {
       toolchainDirs = dirs
     }
 
+    // AGENTS.md candidate lists (Code's standing-context injection, persona.ts) — the OPPOSITE
+    // constraint from toolchainDirs: must be RELATIVE, not absolute. Clean-400 convenience only;
+    // persona.ts containment-checks each entry again at read time regardless (see config.ts's
+    // CodeConfig doc comment for why route-level validation alone isn't the real boundary).
+    const MAX_AGENTS_MD_CANDIDATES = 8
+    let agentsMdProjectCandidates: string[] | undefined
+    let agentsMdGlobalCandidates: string[] | undefined
+    for (const [key, out] of [
+      ['agentsMdProjectCandidates', (v: string[]) => { agentsMdProjectCandidates = v }],
+      ['agentsMdGlobalCandidates', (v: string[]) => { agentsMdGlobalCandidates = v }],
+    ] as const) {
+      const raw = b.code?.[key]
+      if (raw === undefined) continue
+      if (!Array.isArray(raw)) return err(c, 400, 'invalid_config_value', `code.${key} must be an array of filenames.`)
+      const list = raw.map((p) => String(p).trim()).filter(Boolean)
+      if (list.length > MAX_AGENTS_MD_CANDIDATES) return err(c, 400, 'invalid_config_value', `code.${key}: at most ${MAX_AGENTS_MD_CANDIDATES} candidates.`)
+      for (const entry of list) {
+        if (/^([a-zA-Z]:[\\/]|[\\/])/.test(entry)) {
+          return err(c, 400, 'invalid_config_value', `code.${key}: "${entry}" must be a relative filename/path, not absolute.`)
+        }
+      }
+      out(list)
+    }
+
     // Tool-call approval gate: global per-tool policy map. Validate every value is
     // one of 'ask' | 'allow' | 'deny' so a garbled patch gets a clean 400, not a
     // silently-dropped/garbage config.
@@ -1713,6 +1738,8 @@ export function registerApi(app: Hono, d: Deps): void {
       Object.assign(cfg.comfyui, cuUpdates)
       Object.assign(cfg.gateway, gwUpdates)
       if (toolchainDirs !== undefined) cfg.build.toolchainDirs = toolchainDirs
+      if (agentsMdProjectCandidates !== undefined) cfg.code.agentsMdProjectCandidates = agentsMdProjectCandidates
+      if (agentsMdGlobalCandidates !== undefined) cfg.code.agentsMdGlobalCandidates = agentsMdGlobalCandidates
       if (toolPolicies !== undefined) cfg.tools.toolPolicies = toolPolicies
       if (b.autoAllowAll !== undefined) cfg.tools.autoAllowAll = !!b.autoAllowAll
       if (b.autoLoadOnStart !== undefined) cfg.autoLoadOnStart = !!b.autoLoadOnStart
@@ -2219,6 +2246,9 @@ function settingsPayload(d: Deps) {
     // Build environment (ADR-100): folders prepended to PATH for compile-from-source so a
     // conda-env / custom-path CUDA Toolkit + compiler are found. Not secret — echoed back.
     build: { toolchainDirs: cfg.build.toolchainDirs },
+    // Code's AGENTS.md-style standing-context candidate lists (config.ts's CodeConfig):
+    // not secret — echoed back.
+    code: cfg.code,
     // Cloud Launch deploy-link settings (ADR-153): not secret — echoed back.
     cloudDeploy: cfg.cloudDeploy,
     // Experimental feature flags (2026-07-14): not secret — echoed back for Settings →

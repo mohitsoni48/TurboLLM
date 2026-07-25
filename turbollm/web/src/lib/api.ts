@@ -583,6 +583,9 @@ export type DaemonSettings = {
   /** Build environment (ADR-100): folders prepended to PATH for compile-from-source so a
    *  conda-env / custom-path CUDA Toolkit + compiler are found. Not secret — echoed back. */
   build: { toolchainDirs: string[] }
+  /** Code's AGENTS.md-style standing-context candidate lists (config.ts's CodeConfig) — tried
+   *  in order per side, first EXISTING file wins. Not secret — echoed back. */
+  code: { agentsMdProjectCandidates: string[]; agentsMdGlobalCandidates: string[] }
   /** Tool-call approval gate (F-025): per-tool default policy. Missing tools default
    *  to 'ask'. Keyed by tool name (e.g. 'run_code', 'mcp__server__tool'). */
   toolPolicies: Record<string, ToolPolicy>
@@ -607,11 +610,14 @@ export type SearchProvider = 'tavily' | 'kagi' | 'searxng'
  *  `hfToken` (spec 10 §4) that sets/clears the stored Hugging Face token. `comfyui`
  *  is patchable per-field (only `enabled` is set here; `gatePath` is owned by the
  *  install endpoints). */
-export type DaemonSettingsPatch = Partial<Omit<DaemonSettings, 'comfyui' | 'tavilyKeySet' | 'search' | 'mcp' | 'experimental'>> & {
+export type DaemonSettingsPatch = Partial<Omit<DaemonSettings, 'comfyui' | 'tavilyKeySet' | 'search' | 'mcp' | 'experimental' | 'code'>> & {
   comfyui?: Partial<ComfyUiSettings>
   /** Patchable per-field — the backend applies each key independently (api/routes.ts), so a
    *  patch touching only one flag must not be forced to also supply the other. */
   experimental?: Partial<DaemonSettings['experimental']>
+  /** Patchable per-field, same reason as `experimental` — routes.ts applies each candidate list
+   *  independently. */
+  code?: Partial<DaemonSettings['code']>
   hfToken?: string
   /** Write-only: set or clear the Tavily API key (legacy alias for `search.tavilyApiKey`). */
   tavilyApiKey?: string

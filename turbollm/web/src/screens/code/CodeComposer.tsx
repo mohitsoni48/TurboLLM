@@ -256,6 +256,10 @@ export interface CodeComposerProps {
    *  follow-up this needs (a `CodeSessionScreen.tsx` change, outside this task's scope). */
   lastPromptTokens?: number
   lastGenTokens?: number
+  /** Same turn's real prefill/generation speed (`MessageStats.promptTps`/`tps`) — rendered
+   *  alongside the token counts above, same undefined-means-omit rule. */
+  lastPromptTps?: number
+  lastGenTps?: number
 
   /** '/' commands this composer variant supports (e.g. compact only applies mid-session, not on
    *  the launchpad's "start a new session" composer — see CodeSessionScreen/CodeHomeScreen for
@@ -281,6 +285,7 @@ export function CodeComposer({
   ctxUsed, ctxMax, live, onStop, sendDisabled,
   onAddContext, contextFiles, onRemoveContextFile, hintText, statusText, slashCommands = [],
   thinkingBudget, onThinkingBudgetChange, onImagesChange, lastPromptTokens, lastGenTokens,
+  lastPromptTps, lastGenTps,
 }: CodeComposerProps) {
   const ModeIcon = MODE_ICONS[mode.id]
 
@@ -900,13 +905,12 @@ export function CodeComposer({
               launchpad's own repo-picker row already shows both (repoPath's folder name in the
               trigger, `repo.branchLabel` as a chip), so repeating them here would duplicate that
               row specifically.
-            - Tokens ↑/↓ (`lastPromptTokens`/`lastGenTokens`) are real backend-tracked data
-              (`MessageStats.promptTokens`/`genTokens`, chat-types.ts) — NOT fabricated, NOT an
-              estimate — but nothing feeds these props yet (no per-turn stats are threaded into
-              this component today); they simply render nothing until a caller (CodeSessionScreen.tsx,
-              outside this composer-only task's scope) starts passing real numbers. Left as a ready
-              receiving end rather than omitted outright, so wiring it later is a small follow-up
-              rather than new composer-side plumbing.
+            - Tokens ↑/↓ and t/s (`lastPromptTokens`/`lastGenTokens`/`lastPromptTps`/`lastGenTps`)
+              are real backend-tracked data (`MessageStats`, chat-types.ts) — NOT fabricated, NOT
+              an estimate — fed from `CodeSessionScreen.tsx`'s `lastRealStats`, itself sourced
+              from `code-session.ts`'s `foldTurnUsage` (summed across every agentic round of the
+              turn, mirroring Chat's own engine-agnostic timing fallback). Still `undefined` (no
+              segment rendered) whenever the engine returns no usable usage at all.
           Keybinds are now genuinely PERMANENT (no more hiding while `textareaDisabled`) — each
           clause instead governs its own accuracy: "Enter to send" only claims true when the
           textarea can actually be typed into; "Esc to stop" only appears once a run is actually
@@ -925,8 +929,12 @@ export function CodeComposer({
             </span>
           )}
           {lastPromptTokens !== undefined && lastGenTokens !== undefined && (
-            <span title={`Last turn: ${lastPromptTokens.toLocaleString()} prompt, ${lastGenTokens.toLocaleString()} generated`}>
+            <span title={`Last turn: ${lastPromptTokens.toLocaleString()} prompt` +
+              (lastPromptTps !== undefined ? ` (${lastPromptTps.toFixed(0)} tok/s prefill)` : '') +
+              `, ${lastGenTokens.toLocaleString()} generated` +
+              (lastGenTps !== undefined ? ` (${lastGenTps.toFixed(1)} tok/s)` : '')}>
               &uarr;{fmtCompactTokens(lastPromptTokens)} &darr;{fmtCompactTokens(lastGenTokens)}
+              {lastGenTps !== undefined && ` · ${lastGenTps.toFixed(1)} t/s`}
             </span>
           )}
         </span>

@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { toolsForMode, buildAppendPrompt, skillsBlock, skillCatalogBlock, type CodeMode } from './persona'
 import { toSessionStatus, resolveRevertCut } from './code-routes'
-import { MUTATING_TOOLS, PATH_TOOLS, resolveEffectiveHistory, compactCodeSession, isDependencyAddCommand, compactionSettingsFor, keepRecentTokensFor, ToolLoopTracker, toolCallSignature, LOOP_BREAK_AFTER, LOOP_ABORT_AFTER, codeEventToFrame, validateDelegateTask, normalizeDelegateResult, DELEGATE_SUBAGENT_TIMEOUT_MS, normalizeTodos, summarizeTodos, MAX_TODOS, pickPrefillProgress, PREFILL_POLL_MS, type TodoItem } from './code-session'
+import { MUTATING_TOOLS, PATH_TOOLS, WRITE_PATH_TOOLS, resolveEffectiveHistory, compactCodeSession, lookbackPreCompactionHistory, isDependencyAddCommand, compactionSettingsFor, keepRecentTokensFor, ToolLoopTracker, toolCallSignature, LOOP_BREAK_AFTER, LOOP_ABORT_AFTER, codeEventToFrame, validateDelegateTask, normalizeDelegateResult, DELEGATE_SUBAGENT_TIMEOUT_MS, normalizeTodos, summarizeTodos, MAX_TODOS, pickPrefillProgress, PREFILL_POLL_MS, type TodoItem } from './code-session'
 import { ConversationStore, type Message } from '../chat/db'
 import type { Deps } from '../deps'
 import type { Skill } from '../agents/skills'
@@ -234,6 +234,18 @@ test('PATH_TOOLS: path-checked tools include the fs tools but NOT bash', () => {
   assert.deepEqual([...PATH_TOOLS].sort(), ['edit', 'find', 'grep', 'ls', 'read', 'write'])
   // bash takes `command`, not `path` — it must not be containment-checked by path.
   assert.ok(!PATH_TOOLS.has('bash'))
+})
+
+test('WRITE_PATH_TOOLS: only edit/write are actually CONFINED to repoRoot (2026-07-25 loosening)', () => {
+  assert.deepEqual([...WRITE_PATH_TOOLS].sort(), ['edit', 'write'])
+  // read/grep/find/ls are in PATH_TOOLS (still path-checked for "is a path required") but must
+  // NOT be in WRITE_PATH_TOOLS (no longer confined to repoRoot) — this is the actual loosening.
+  for (const t of ['read', 'grep', 'find', 'ls']) {
+    assert.ok(PATH_TOOLS.has(t), `${t} should still be in PATH_TOOLS`)
+    assert.ok(!WRITE_PATH_TOOLS.has(t), `${t} should NOT be confined to repoRoot`)
+  }
+  // WRITE_PATH_TOOLS must be a subset of PATH_TOOLS, never wider.
+  for (const t of WRITE_PATH_TOOLS) assert.ok(PATH_TOOLS.has(t))
 })
 
 // GitHub #60: "ran out of context... it just failed, no attempt to roll up context." pi's own
@@ -656,6 +668,33 @@ test('compactCodeSession: rejects with session_cleared when the session has an a
   await assert.rejects(
     () => compactCodeSession({ d, convId, sessionId, repoRoot: '/repo' }),
     /session_cleared/,
+  )
+})
+
+test('lookbackPreCompactionHistory: rejects with nothing_compacted when the session was never compacted, before touching the model', async () => {
+  const { d, store, convId, sessionId } = makeCodeConv()
+  store.addMessage(convId, 'user', 'task')
+  store.addMessage(convId, 'assistant', 'reply')
+  // No compactionUpToMessageId set — same "no d.manager/d.registry configured, so touching the
+  // model would throw a different TypeError instead" pin as compactCodeSession's own test above.
+  await assert.rejects(
+    () => lookbackPreCompactionHistory({ d, convId, sessionId, repoRoot: '/repo', question: 'what did we decide?' }),
+    /nothing_compacted/,
+  )
+})
+
+test('lookbackPreCompactionHistory: an UNRESOLVABLE cut (marker points at a deleted message) still finds real history to answer from, rather than throwing', async () => {
+  const { d, store, convId, sessionId } = makeCodeConv()
+  store.addMessage(convId, 'user', 'task')
+  store.addMessage(convId, 'assistant', 'reply')
+  store.updateAgentRun(sessionId, { compactionSummary: 'summary', compactionUpToMessageId: 'deleted-id', compactionTokensBefore: 100 })
+  // Mirrors resolveEffectiveHistory's own stated policy for the same situation: an unresolvable
+  // cut (cutIdx === -1) falls back to the FULL message list rather than an empty one — real data
+  // is still there, so this must reach the model_not_loaded guard (no d.manager on this fake
+  // Deps), NOT nothing_compacted. Confirms the fallback path doesn't silently swallow real history.
+  await assert.rejects(
+    () => lookbackPreCompactionHistory({ d, convId, sessionId, repoRoot: '/repo', question: 'what did we decide?' }),
+    (e: unknown) => e instanceof TypeError, // d.manager.status() throws — proves it got past both guards
   )
 })
 

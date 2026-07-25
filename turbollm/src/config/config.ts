@@ -247,6 +247,23 @@ export interface ComfyUI {
 export interface BuildConfig {
   toolchainDirs: string[]
 }
+/** Standing-context filename candidates for Code's AGENTS.md-style injection
+ *  (persona.ts's agentsMdBlock) — tried in order per side, first EXISTING match wins. Global-
+ *  only for now (applies to every repo alike, not a per-repo setting — see decision-log for the
+ *  rationale): solves the common "this repo uses CLAUDE.md, not AGENTS.md" case with zero
+ *  configuration, since the shipped defaults already include CLAUDE.md. Entries must be
+ *  RELATIVE (validate() below rejects an absolute one with a clean 400) — persona.ts still
+ *  containment-checks each one again at read time regardless, since config.json is hand-editable
+ *  and route-level validation alone can't be trusted as the only gate. */
+export interface CodeConfig {
+  /** Tried against each repo's own root. Defaults mirror persona.ts's own
+   *  DEFAULT_AGENTS_MD_PROJECT_CANDIDATES (duplicated as a literal, not imported — config.ts
+   *  stays dependency-free of feature modules by design; update both if this ever changes). */
+  agentsMdProjectCandidates: string[]
+  /** Tried against the global TurboLLM data dir (~/.turbollm). Mirrors persona.ts's
+   *  DEFAULT_AGENTS_MD_GLOBAL_CANDIDATES. */
+  agentsMdGlobalCandidates: string[]
+}
 /** Cloud Launch deploy-link settings (ADR-153, RunPod recipe). RunPod is the only
  *  provider for now — a user who has published their own RunPod Template (following
  *  deploy/runpod/README.md) pastes its ID here; the Developer screen's "Deploy on
@@ -382,6 +399,8 @@ export interface Config {
   builtinAgentOverrides: Record<string, BuiltinAgentOverride>
   /** Compile-from-source settings (ADR-089/100): toolchain dirs prepended to PATH. */
   build: BuildConfig
+  /** Code's AGENTS.md-style standing-context candidate lists. */
+  code: CodeConfig
   /** Cloud Launch deploy-link settings (ADR-153). */
   cloudDeploy: CloudDeployConfig
   devModel?: DevModel
@@ -501,6 +520,7 @@ export function defaultConfig(): Config {
     customAgents: [],
     builtinAgentOverrides: {},
     build: { toolchainDirs: [] },
+    code: { agentsMdProjectCandidates: ['AGENTS.md', 'agents.md', 'CLAUDE.md'], agentsMdGlobalCandidates: ['agents.md', 'AGENTS.md', 'CLAUDE.md'] },
     cloudDeploy: { runpodTemplateId: '' },
   }
 }
@@ -818,6 +838,18 @@ function normalize(c: Config): void {
       ? bd.toolchainDirs.filter((p): p is string => typeof p === 'string' && p.trim() !== '').map((p) => p.trim())
       : [],
   }
+  // AGENTS.md candidate lists: absent/empty in pre-this-decision configs → the real defaults
+  // (NOT []), so a fresh/upgraded config resolves standing context exactly like the old hardcoded
+  // 'AGENTS.md'/'agents.md' literals did, plus CLAUDE.md. The validator enforces relative paths.
+  const cc = (c.code ?? {}) as Partial<CodeConfig>
+  const cleanCandidates = (v: unknown, fallback: string[]): string[] => {
+    const filtered = Array.isArray(v) ? v.filter((p): p is string => typeof p === 'string' && p.trim() !== '').map((p) => p.trim()) : []
+    return filtered.length > 0 ? filtered : fallback
+  }
+  c.code = {
+    agentsMdProjectCandidates: cleanCandidates(cc.agentsMdProjectCandidates, ['AGENTS.md', 'agents.md', 'CLAUDE.md']),
+    agentsMdGlobalCandidates: cleanCandidates(cc.agentsMdGlobalCandidates, ['agents.md', 'AGENTS.md', 'CLAUDE.md']),
+  }
   // Cloud Launch deploy-link settings (ADR-153): absent in pre-ADR-153 configs → ''.
   const cd = (c.cloudDeploy ?? {}) as Partial<CloudDeployConfig>
   c.cloudDeploy = { runpodTemplateId: typeof cd.runpodTemplateId === 'string' ? cd.runpodTemplateId.trim() : '' }
@@ -888,6 +920,18 @@ function validate(c: Config): void {
   // matter the daemon's cwd when it spawns git/cmake.
   for (const dir of c.build.toolchainDirs) {
     if (!isAbsolutePath(dir)) throw new ValueError('build.toolchainDirs', 'toolchain directories must be absolute paths')
+  }
+  // AGENTS.md candidates: the OPPOSITE constraint from toolchainDirs — must be RELATIVE (resolved
+  // against a repo root / the global data dir, never an absolute host path), and capped short so a
+  // pathological config can't turn every turn into dozens of stat() calls. This is a clean-400
+  // convenience, not the real security boundary — persona.ts containment-checks each entry again
+  // at read time regardless, since this config is hand-editable and bypasses this route entirely.
+  const MAX_AGENTS_MD_CANDIDATES = 8
+  for (const [field, list] of [['code.agentsMdProjectCandidates', c.code.agentsMdProjectCandidates], ['code.agentsMdGlobalCandidates', c.code.agentsMdGlobalCandidates]] as const) {
+    if (list.length > MAX_AGENTS_MD_CANDIDATES) throw new ValueError(field, `at most ${MAX_AGENTS_MD_CANDIDATES} candidates`)
+    for (const entry of list) {
+      if (isAbsolutePath(entry)) throw new ValueError(field, 'candidates must be relative filenames/paths, not absolute')
+    }
   }
   // Agents (spec 13 §2.1): enforce the schema invariants so a bad config can't widen
   // an agent's filesystem scope or break the run manager's lookups.

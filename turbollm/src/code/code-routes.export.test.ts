@@ -166,6 +166,36 @@ test('POST .../clear is refused (409 session_reverted) while the session has a p
   assert.equal(((await res.json()) as { error?: { code?: string } }).error?.code, 'session_reverted')
 })
 
+test('POST .../revert while already reverted SUPERSEDES (200, not 409) when reverting further back', async () => {
+  const db = new ConversationStore(tmp('tllm-revert-supersede-'))
+  const { app } = makeApp(db)
+  const { conv, run } = seedSession(db, { repoRoot: '/repo' })
+  const first = db.addMessage(conv.id, 'user', 'first')
+  db.addMessage(conv.id, 'assistant', 'reply one')
+  const second = db.addMessage(conv.id, 'user', 'second')
+  db.addMessage(conv.id, 'assistant', 'reply two')
+  const third = db.addMessage(conv.id, 'user', 'third')
+  db.addMessage(conv.id, 'assistant', 'reply three')
+
+  // First revert — cuts back to 'third'.
+  const r1 = await app.request(`/api/v1/code/sessions/${run.id}/revert`, { method: 'POST', body: JSON.stringify({ messageId: third.id }), headers: { 'Content-Type': 'application/json' } })
+  assert.equal(r1.status, 200)
+  assert.equal(db.getAgentRun(run.id)?.revertedFromMessageId, third.id)
+
+  // Second revert, further back to 'second' — must SUPERSEDE, not 409. 'second' is still
+  // is_active=1 (it's before the first cut), so it's exactly the case the UI can actually submit.
+  const r2 = await app.request(`/api/v1/code/sessions/${run.id}/revert`, { method: 'POST', body: JSON.stringify({ messageId: second.id }), headers: { 'Content-Type': 'application/json' } })
+  assert.equal(r2.status, 200)
+  assert.equal(db.getAgentRun(run.id)?.revertedFromMessageId, second.id)
+
+  // 'first' stays active (before both cuts); 'second' and everything after is now deactivated.
+  const conv2 = db.getConversation(conv.id, true)!
+  const active = new Set((conv2.messages ?? []).map((m) => m.id))
+  assert.ok(active.has(first.id))
+  assert.ok(!active.has(second.id))
+  assert.ok(!active.has(third.id))
+})
+
 test('the mutual-exclusion lock releases: /clear → /resume → /revert all succeed in sequence', async () => {
   const db = new ConversationStore(tmp('tllm-clear-revert-'))
   const { app } = makeApp(db)
