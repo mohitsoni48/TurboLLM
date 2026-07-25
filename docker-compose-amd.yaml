@@ -1,0 +1,38 @@
+services:
+  turbollm:
+    build:
+      context: .
+      dockerfile: Dockerfile.amd
+    image: turbollm-amd:latest
+    container_name: turbollm-amd
+    ports:
+      - "6996:6996"
+    volumes:
+      - turbollm-data:/root/.turbollm
+
+    # --- AMD GPU passthrough (ROCm) ---
+    # /dev/kfd is the ROCm kernel driver device; /dev/dri is the DRM/GPU device nodes.
+    # This is the same pair AMD's own docs use for `docker run --device=/dev/kfd
+    # --device=/dev/dri --group-add video`.
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    # If the container can't see the GPU (permission denied on /dev/kfd or /dev/dri),
+    # the usual cause is that the host's `render` group GID doesn't match any group
+    # name inside the container. Find the host GID with `getent group render` and
+    # replace the "render" line above with that numeric GID instead.
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:6996/api/v1/status >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  turbollm-data:
+    name: turbollm-data
+    

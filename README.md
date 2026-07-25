@@ -286,6 +286,7 @@ the detail:
 
 <details>
 <summary><strong>🧑‍💻 Code — a local coding agent, in a real project directory</strong></summary>
+<em>(experimental, off by default — Settings → Experimental)</em>
 
 <br/>
 
@@ -306,11 +307,7 @@ there. Entirely local; nothing leaves your machine.
   `run_code` tool — are available to Code too, alongside honest skill invocation and
   `AGENTS.md`/`agents.md` support.
 - **Independent access control** — gated behind its own API key on non-host devices, separate
-  from Chat's gate.
-- **Expose it to other tools over MCP** — `turbollm mcp-server` runs a stdio MCP server so any
-  MCP-compatible tool (Claude Desktop, Cursor, Windsurf, Cline, Claude Code, and more) can
-  delegate a real coding task to Code, not just chat completions. Setup snippets for any host are
-  in the Developer tab.
+  from Chat's gate, and hidden entirely until you opt in from Settings → Experimental.
 
 </details>
 
@@ -640,6 +637,70 @@ shadcn/ui frontend. One TypeScript codebase, shipped as an npm package.
 
 ---
 
+## 🐳 Docker Deployment (NVIDIA / AMD GPU)
+
+TurboLLM includes Docker support with dedicated configurations for NVIDIA CUDA
+and AMD ROCm GPUs.
+
+The Docker images provide an isolated environment while allowing TurboLLM to
+access your GPU directly for accelerated local LLM inference.
+
+---
+
+### NVIDIA GPU (CUDA)
+
+#### Requirements
+
+- NVIDIA GPU with CUDA support
+- Installed NVIDIA drivers
+- NVIDIA Container Toolkit
+
+Install NVIDIA Container Toolkit:
+
+```bash
+# Ubuntu / Debian example
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
+sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+
+curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#' | \
+sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+
+sudo apt update
+sudo apt install -y nvidia-container-toolkit
+
+sudo systemctl restart docker
+
+docker compose -f docker-compose-nvidia.yaml up -d
+```
+
+### AMD GPU
+
+#### Requirements
+
+- AMD ROCm
+- Installed AMD drivers
+
+```bash
+# Ubuntu / Debian example
+sudo apt update
+sudo apt install wget gnupg
+
+wget https://repo.radeon.com/rocm/rocm.gpg.key -O - | \
+sudo gpg --dearmor -o /usr/share/keyrings/rocm.gpg
+
+echo "deb [arch=amd64 signed-by=/usr/share/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/latest ubuntu main" | \
+sudo tee /etc/apt/sources.list.d/rocm.list
+
+sudo apt update
+
+sudo apt install rocm
+sudo usermod -aG render,video $USER
+sudo reboot
+
+docker compose -f docker-compose-amd.yaml up -d
+```
+---
 ## Community
 
 Questions, ideas, and show-and-tell — join the [Discord](https://discord.gg/v6kRbV7nC).
