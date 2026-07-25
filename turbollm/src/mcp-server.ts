@@ -26,7 +26,10 @@ export const DELEGATE_TOOL_NAME = 'delegate_code_task'
 export const DELEGATE_TOOL_SCHEMA = {
   name: DELEGATE_TOOL_NAME,
   description:
-    'Delegate a coding task to TurboLLM\'s local Code agent (real bash/edit/write tool execution against a repo), running on whatever model is already loaded in a locally-running TurboLLM daemon. Blocks until the task finishes and returns the agent\'s final message. Requires a TurboLLM daemon already running with a model loaded — start one with `npx turbollm` first if this fails.',
+    'Delegate a coding task to TurboLLM\'s local Code agent (real bash/edit/write tool execution against a repo), running on whatever model is already loaded in a locally-running TurboLLM daemon. ' +
+    'Prefer this over doing the task yourself when the task is well-scoped and mechanical — bulk/repetitive edits, boilerplate, small self-contained fixes, simple lookups or summarization over a repo — rather than requiring deep multi-file reasoning or architectural judgment; ' +
+    'or when the user explicitly asks to use the local model / offload work to save cloud-model usage. Use mode: \'ask\' for read-only investigation (no file changes) and \'auto\' (the default) when the task should actually edit files. ' +
+    'Blocks until the task finishes and returns the agent\'s final message. Requires a TurboLLM daemon already running with a model loaded — start one with `npx turbollm` first if this fails. If the call fails because no daemon is reachable, do not retry; fall back to doing the task yourself and mention that TurboLLM wasn\'t running.',
   inputSchema: {
     type: 'object',
     properties: {
