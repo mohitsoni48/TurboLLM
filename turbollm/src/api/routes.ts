@@ -1563,7 +1563,7 @@ export function registerApi(app: Hono, d: Deps): void {
       toolPolicies?: Record<string, string>
       autoAllowAll?: boolean
       cloudDeploy?: { runpodTemplateId?: string }
-      experimental?: { memory?: boolean; code?: boolean; cloudDeploy?: boolean }
+      experimental?: { memory?: boolean; cloudDeploy?: boolean }
     }>(c)
 
     const updates: Record<string, unknown> = {}
@@ -1755,7 +1755,6 @@ export function registerApi(app: Hono, d: Deps): void {
       // the other back to whatever `updates.experimental` would otherwise silently overwrite it
       // with (same reasoning as cloudDeploy's own per-field handling just above).
       if (b.experimental?.memory !== undefined) cfg.daemon.experimental.memory = !!b.experimental.memory
-      if (b.experimental?.code !== undefined) cfg.daemon.experimental.code = !!b.experimental.code
       if (b.experimental?.cloudDeploy !== undefined) cfg.daemon.experimental.cloudDeploy = !!b.experimental.cloudDeploy
       // HF token (spec 10 §4): write-only. An explicit '' clears it. Never logged.
       if (b.hfToken !== undefined) cfg.hf.token = String(b.hfToken).trim()

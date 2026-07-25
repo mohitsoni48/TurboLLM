@@ -99,12 +99,13 @@ export interface Daemon {
   /** Release 3: background extraction of durable facts from the user's own chat messages,
    *  injected into future new conversations. Off by default — unlike autoGenerateTitles,
    *  this builds a persistent cross-conversation profile of the user, so it's opt-in
-   *  (same trust-surface posture as lanBind), not default-on. Two-layer gate, same shape as
-   *  Code: `experimental.memory` (below) is the master "is this feature unlocked at all"
+   *  (same trust-surface posture as lanBind), not default-on. Two-layer gate:
+   *  `experimental.memory` (below) is the master "is this feature unlocked at all"
    *  switch — MemorySection's own UI in Settings → General only renders when it's on, and
    *  extraction only runs when BOTH it and this field are true (chat-routes.ts). This field is
-   *  the finer opt-in WITHIN that (do you actually want facts remembered), same relationship
-   *  Code's own mode/tool settings have to `experimental.code` unlocking the workspace itself. */
+   *  the finer opt-in WITHIN that (do you actually want facts remembered). Code used to follow
+   *  this same two-layer shape via `experimental.code` — removed when Code graduated out of
+   *  experimental status and became available to everyone by default (ADR-280). */
   autoMemoryEnabled: boolean
   /** Experimental features (2026-07-14, preparing for wider distribution): still-in-progress
    *  capabilities gated behind an explicit opt-in toggle in Settings → Experimental, off by
@@ -118,9 +119,6 @@ export interface ExperimentalFeatures {
    *  section reappears in its ORIGINAL location in General — this does NOT relocate Memory's
    *  settings into the Experimental tab, only gates whether they're reachable at all. */
   memory: boolean
-  /** Gates the entire Code workspace (both the UI entry point and /api/v1/code/* itself —
-   *  see auth.ts's requireExperimentalCode). */
-  code: boolean
   /** Gates the Cloud Launch / RunPod deploy-link surface (ADR-153's cloudDeploy config,
    *  previously only reachable via the internal-only TURBOLLM_FEATURES=cloud-deploy env var,
    *  features.ts — this is now the primary, user-facing way to turn it on). */
@@ -495,7 +493,7 @@ export function defaultConfig(): Config {
       theme: 'system',
       autoGenerateTitles: true,
       autoMemoryEnabled: false,
-      experimental: { memory: false, code: false, cloudDeploy: false },
+      experimental: { memory: false, cloudDeploy: false },
     },
     telemetry: { level: 'unset', machineId: '' },
     apiKeys: [],
@@ -854,15 +852,18 @@ function normalize(c: Config): void {
   const cd = (c.cloudDeploy ?? {}) as Partial<CloudDeployConfig>
   c.cloudDeploy = { runpodTemplateId: typeof cd.runpodTemplateId === 'string' ? cd.runpodTemplateId.trim() : '' }
   // Experimental feature flags (2026-07-14): absent in pre-this-decision configs → default
-  // false for code/cloudDeploy, same conservative posture as lanBind. `memory` is the one
+  // false for cloudDeploy, same conservative posture as lanBind. `memory` is the one
   // exception: a config that ALREADY had autoMemoryEnabled=true (the user had genuinely opted
   // in before this gate existed) migrates to memory=true too, so the section they were already
   // using doesn't silently vanish from Settings → General the moment they upgrade — a config
   // that never turned it on gets memory=false, the same conservative default as everything else.
+  // `code` was removed from this shape entirely (ADR-280) when Code graduated out of
+  // experimental status — an old config's stale `experimental.code` value (if any survives in
+  // an on-disk config.json from before this change) is simply dropped here, not migrated,
+  // since there's no longer a field for it to migrate into.
   const ex = (c.daemon.experimental ?? {}) as Partial<ExperimentalFeatures>
   c.daemon.experimental = {
     memory: ex.memory === true || c.daemon.autoMemoryEnabled === true,
-    code: ex.code === true,
     cloudDeploy: ex.cloudDeploy === true,
   }
   // Telemetry level (spec 09 §3): the UI exposes 'off' | 'anon' | 'full'. Migrate
