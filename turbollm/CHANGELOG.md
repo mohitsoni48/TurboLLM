@@ -25,6 +25,50 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.9.0] - 2026-07-25
+
+**Code is now available to everyone by default, and can be exposed to other AI coding tools over MCP.**
+
+### Added
+- **Code is generally available.** No longer an opt-in experimental toggle — it's on for every
+  install, no setup required.
+- **`turbollm mcp-server`** — exposes Code as an MCP tool (`delegate_code_task`) so other
+  MCP-compatible tools (Claude Desktop, Cursor, Windsurf, Cline, Claude Code, and more — not
+  TurboLLM-specific) can hand off real coding tasks to your local model. A new "TurboLLM MCP"
+  section in Developer walks through setup for any of them.
+- **MCP marketplace:** added Context7 and Firecrawl to the built-in MCP server catalog.
+- **AGENTS.md support is now configurable** — set your own project and global AGENTS.md file
+  paths instead of only the default location.
+- **Real token/sec stats for Code**, shown per turn instead of missing entirely.
+- **Tool-call lines in Code now visually distinguish reads from writes**, so it's easier to see at
+  a glance what the agent actually changed.
+
+### Changed
+- **Reverting further back in Code now just works**, instead of requiring you to resume first —
+  a second revert cleanly supersedes the first.
+- **The Developer pane's Server URL now shows your LAN address** when sharing is on, instead of
+  `localhost` (which only works from this machine).
+
+### Fixed
+- **Two real security gaps closed in the Developer pane's API key management:** while LAN sharing
+  is on and "Require an API key" is off, key management (viewing, creating, and revoking keys, and
+  the per-CLI connect setup snippets that embed a live key) is now restricted to this machine only
+  — previously any device on the network could reach it with no credential at all.
+- **A rare crash during very long, continuous Code turns** — the daemon now proactively stops a
+  turn just before it would hit the model's real context limit, instead of erroring out.
+- **AGENTS.md/CLAUDE.md content was being sent to the model twice every turn** in Code — now sent
+  once.
+
+### Discord
+- Code just graduated from "experimental" to on-by-default for everyone.
+- You can now plug TurboLLM's Code agent into Claude Desktop, Cursor, Windsurf, Cline, or any other
+  MCP-compatible tool — not just Claude Code — via a new `turbollm mcp-server` command. Setup
+  instructions are right there in the Developer tab.
+- Closed two real security holes: on an open, unauthenticated LAN, another device could previously
+  view/create/revoke your API keys or grab a live one from the connect-setup snippets just by
+  loading the page. Both now require you to be on the host machine (or have auth turned on).
+- Reverting further back in a Code session now just works, instead of demanding you resume first.
+
 ## [1.8.7] - 2026-07-24
 
 **Code feature: a denser, more familiar terminal-style redesign, a real prefill progress bar, and a fix for a rare stuck-loop bug.**

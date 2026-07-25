@@ -286,7 +286,6 @@ the detail:
 
 <details>
 <summary><strong>🧑‍💻 Code — a local coding agent, in a real project directory</strong></summary>
-<em>(experimental, off by default — Settings → Experimental)</em>
 
 <br/>
 
@@ -307,7 +306,11 @@ there. Entirely local; nothing leaves your machine.
   `run_code` tool — are available to Code too, alongside honest skill invocation and
   `AGENTS.md`/`agents.md` support.
 - **Independent access control** — gated behind its own API key on non-host devices, separate
-  from Chat's gate, and hidden entirely until you opt in from Settings → Experimental.
+  from Chat's gate.
+- **Expose it to other tools over MCP** — `turbollm mcp-server` runs a stdio MCP server so any
+  MCP-compatible tool (Claude Desktop, Cursor, Windsurf, Cline, Claude Code, and more) can
+  delegate a real coding task to Code, not just chat completions. Setup snippets for any host are
+  in the Developer tab.
 
 </details>
 
