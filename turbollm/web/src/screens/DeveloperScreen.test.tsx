@@ -116,3 +116,34 @@ describe('DeveloperScreen — Connect-an-app setup snippet gating', () => {
     expect(getConnectSpy).toHaveBeenCalled()
   })
 })
+
+describe('DeveloperScreen — TurboLLM MCP section', () => {
+  beforeEach(() => { networkInfo = undefined })
+
+  it('shows the generic MCP host config and the Claude Code one-liner', async () => {
+    networkInfo = { lanBind: false, lanUrl: '', hasApiKey: false, requireApiKey: false, isHost: true }
+    await renderScreen()
+    expect(screen.getByText('TurboLLM MCP')).toBeInTheDocument()
+    expect(screen.getByText(/"command": "npx"/)).toBeInTheDocument()
+    expect(screen.getByText(/"args": \[/)).toBeInTheDocument()
+    expect(screen.getByText('claude mcp add turbollm -- npx turbollm mcp-server')).toBeInTheDocument()
+  })
+
+  it('lists the delegate_code_task parameters', async () => {
+    networkInfo = { lanBind: false, lanUrl: '', hasApiKey: false, requireApiKey: false, isHost: true }
+    await renderScreen()
+    expect(screen.getByText('delegate_code_task parameters')).toBeInTheDocument()
+    for (const name of ['repoRoot', 'task', 'mode', 'modelKey', 'timeoutSeconds']) {
+      expect(screen.getByText(name)).toBeInTheDocument()
+    }
+  })
+
+  it('is NOT gated behind the host-only key lock — it embeds no secret, unlike the sections above', async () => {
+    networkInfo = { lanBind: true, lanUrl: 'http://192.168.1.5:6996', hasApiKey: false, requireApiKey: false, isHost: false }
+    await renderScreen()
+    // Both sections above ARE locked in this exact state (see the other describe blocks) —
+    // this section must render fully regardless, since it has nothing sensitive to protect.
+    expect(screen.getByText('TurboLLM MCP')).toBeInTheDocument()
+    expect(screen.getByText(/"command": "npx"/)).toBeInTheDocument()
+  })
+})

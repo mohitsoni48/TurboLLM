@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import type { LucideIcon } from 'lucide-react'
-import { Bot, ChevronRight, Code2, Globe, Key, Loader2, Lock, Plug, Plus, Sparkles, Terminal, Trash2, Wrench } from 'lucide-react'
+import { Bot, ChevronRight, Code2, Globe, Key, Loader2, Lock, Plug, Plus, Sparkles, Terminal, Trash2, Workflow, Wrench } from 'lucide-react'
 import { CopyButton } from '../components/ui/copy-button'
 import { ScreenHeader } from '../components/common'
 import { Button } from '../components/ui/button'
@@ -36,6 +36,17 @@ const PUBLIC_APIS = [
   { method: 'GET', path: '/v1/models', desc: 'Models list' },
 ] as const
 
+// `delegate_code_task`'s params (turbollm/src/mcp-server.ts's DELEGATE_TOOL_SCHEMA) — kept as
+// display copy here, not fetched from the daemon: this is documentation, not live state, and
+// the tool schema itself is only reachable over the MCP stdio protocol, not a plain HTTP route.
+const MCP_PARAMS = [
+  { name: 'repoRoot', required: true, desc: 'Absolute path to the repo the task should run against.' },
+  { name: 'task', required: true, desc: 'What to do, in plain language.' },
+  { name: 'mode', required: false, desc: 'auto / plan / ask — defaults to auto.' },
+  { name: 'modelKey', required: false, desc: 'Pin a specific model instead of whatever is currently loaded.' },
+  { name: 'timeoutSeconds', required: false, desc: 'Give up waiting after this long — defaults to 1800 (30 min).' },
+] as const
+
 type Cli = { id: string; name: string; hint: string; icon: LucideIcon }
 const CLI_LIST: Cli[] = [
   { id: 'claude-code', name: 'Claude Code', hint: 'turbollm launch claude', icon: Sparkles },
@@ -58,6 +69,7 @@ export function DeveloperScreen() {
       <div className="flex flex-col gap-6">
         <ConnectionPanel />
         <ConnectSection />
+        <McpSection />
         <ApiReferenceSection />
       </div>
     </div>
@@ -283,6 +295,78 @@ function SnippetBlock({ step }: { step: ConnectStep }) {
         <CopyButton text={step.snippet} className="absolute right-2 top-2" />
       </div>
     </div>
+  )
+}
+
+// ── TurboLLM MCP (delegate_code_task) ──────────────────────────────────────────
+// The REVERSE direction from everything above: instead of an outside app calling TurboLLM's
+// chat-completions API, this lets any MCP-compatible tool hand TurboLLM's own Code agent a task
+// to run. No secret material in this section (the config is a static command, and the bridge only
+// ever talks to the daemon over loopback) — unlike the API keys / connect-setup snippets above,
+// nothing here needs host-only gating.
+const MCP_CONFIG_SNIPPET: ConnectStep = {
+  label: 'Any MCP host (Claude Desktop, Cursor, Windsurf, Cline, etc.) — paste into its MCP settings',
+  lang: 'json',
+  snippet: JSON.stringify(
+    { mcpServers: { turbollm: { command: 'npx', args: ['turbollm', 'mcp-server'] } } },
+    null,
+    2,
+  ),
+}
+const MCP_CLAUDE_CODE_SNIPPET: ConnectStep = {
+  label: 'Claude Code',
+  lang: 'bash',
+  snippet: 'claude mcp add turbollm -- npx turbollm mcp-server',
+}
+
+function McpSection() {
+  return (
+    <section className="rounded-lg border border-border bg-panel p-4">
+      <div className="mb-1 flex items-center gap-2">
+        <Workflow size={15} className="text-accent" />
+        <h2 className="text-[13px] font-semibold uppercase tracking-wide text-faint">TurboLLM MCP</h2>
+      </div>
+      <p className="mb-3 text-[13px] text-muted">
+        Let ANY MCP-compatible tool — not just Claude Code — delegate real coding tasks to
+        TurboLLM's local Code agent (bash/edit/write, containment, permission modes), running on
+        whatever model is loaded in this daemon.
+      </p>
+
+      <div className="mb-3 rounded-md border border-border bg-bg p-3">
+        <div className="mb-1.5 text-[12px] font-medium text-ink">What it does</div>
+        <ul className="list-disc space-y-1 pl-4 text-[13px] text-muted">
+          <li>Exposes one tool, <code className="font-mono text-[12px] text-ink">delegate_code_task</code>, over MCP's standard stdio transport.</li>
+          <li>Hand it a repo path and a task in plain language — it runs a full Code session (reads, edits, runs shell commands) and returns the agent's final result.</li>
+          <li>Runs on whatever model is already loaded here — nothing extra to configure on TurboLLM's side.</li>
+        </ul>
+      </div>
+
+      <div className="mb-3 flex flex-col gap-2.5">
+        <SnippetBlock step={MCP_CONFIG_SNIPPET} />
+        <SnippetBlock step={MCP_CLAUDE_CODE_SNIPPET} />
+      </div>
+
+      <div className="rounded-md border border-border bg-bg p-3">
+        <div className="mb-1.5 text-[12px] font-medium text-ink">delegate_code_task parameters</div>
+        <div className="divide-y divide-border">
+          {MCP_PARAMS.map((p) => (
+            <div key={p.name} className="flex items-start gap-3 py-1.5 first:pt-0 last:pb-0">
+              <code className="w-28 shrink-0 font-mono text-[12px] text-ink">
+                {p.name}
+                {!p.required && <span className="text-faint">?</span>}
+              </code>
+              <span className="text-[13px] text-muted">{p.desc}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <p className="mt-3 text-[11px] text-faint">
+        Requires a model already loaded in this daemon. The bridge only talks to the daemon over
+        loopback, so it has to run on this same machine — a remote MCP host can't point it at a
+        daemon on a different computer.
+      </p>
+    </section>
   )
 }
 
