@@ -33,6 +33,7 @@ import { launchCli } from './cli-launch'
 import { writePidfile, removePidfile, stopDaemon, resolveDaemonPort } from './daemon-pid'
 import { runMcpServer } from './mcp-server'
 import { createApp } from './server'
+import { registerTerminalWs } from './terminal/terminal-routes'
 import { provisionTunnelApiKey } from './auth'
 import { TunnelManager, reapStaleTunnels, killTrackedTunnelsSync } from './tunnel/manager'
 import type { Deps } from './deps'
@@ -362,7 +363,7 @@ let tunnelToken: string | null = null
 // 0.0.0.0 LAN switch is a conflicting bind), so retry EADDRINUSE for ~10s instead of
 // crashing — otherwise a restart leaves the user with NO daemon. `server` is mutable
 // so the restart handler below always closes the live instance.
-let server: ReturnType<typeof serve>
+let server!: ReturnType<typeof serve>
 let rebinding = false // suppress the full banner + browser-open during an in-place rebind
 let prevHost = host // remembered before a rebind so we can revert if the new bind fails
 let prevPort = port
@@ -442,6 +443,12 @@ function listen(attempt = 0): void {
   server = s
 }
 listen()
+
+// Register the terminal WebSocket upgrade handler on the raw HTTP server.
+// This intercepts /api/v1/code/terminal/ws upgrades before Hono's SPA fallback.
+// serve() returns ServerType (Http2Server | Server) from @hono/node-server,
+// but we only need the .on('upgrade', ...) interface which is common to both.
+registerTerminalWs(server as unknown as import('http').Server, deps)
 
 // In-place rebind (no full restart): re-point the HTTP listener at the host/port the
 // config now wants, keeping the engine, model, DB, and chat state alive. A LAN toggle

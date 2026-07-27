@@ -52,6 +52,12 @@ export function authHeaders(): Record<string, string> {
   return token ? { 'X-TurboLLM-Auth': token } : {}
 }
 
+/** The raw stored key, for the one surface that can't send a header — a browser
+ *  WebSocket handshake (terminal-connection.ts) — and so must put it in the URL instead. */
+export function getAuthToken(): string | null {
+  return localStorage.getItem(AUTH_KEY)
+}
+
 /** Persist (or clear) the API key this client sends as X-TurboLLM-Auth. Needed for
  *  LAN access, where the daemon requires a key for non-loopback requests (spec 06 §5). */
 export function setAuthToken(token: string): void {

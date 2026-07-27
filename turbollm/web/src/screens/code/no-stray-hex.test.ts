@@ -10,6 +10,11 @@ import { describe, expect, it } from 'vitest'
 
 const CODE_SCREENS_DIR = join(import.meta.dirname, '.')
 
+// Files that legitimately use hex/functional colors (e.g., xterm.js theme objects can't use
+// CSS variables — the colors are baked into a JS object, not a CSS class). Each entry is a
+// simple name match against the basename.
+const STRAY_HEX_EXCEPTIONS = new Set(['TerminalView'])
+
 // `#`-prefixed hex color literals (3/4/6/8 hex digits, word-boundaried so this doesn't false-hit
 // on things like URL fragments or non-color hex-looking tokens) and raw rgba()/hsla() function
 // calls — the two ways to bypass `var(--token)` and inline a color directly.
@@ -30,6 +35,8 @@ describe('Code screens: no stray hex/rgba/hsla outside the token system', () => 
   })
 
   for (const file of files) {
+    // Skip files with explicit exceptions (e.g., xterm.js theme objects need hex).
+    if (STRAY_HEX_EXCEPTIONS.has(file.split(/[\\/]/).pop()!.replace('.tsx', ''))) continue
     it(`${file.split(/[\\/]/).pop()} uses only var(--token) for color, no inline hex/rgba/hsla`, () => {
       const src = readFileSync(file, 'utf8')
       const hexMatch = src.match(HEX_PATTERN)

@@ -127,6 +127,16 @@ export function isLocalRequest(c: Context, d: Deps): boolean {
   return isLoopback(c) === true
 }
 
+/** Same decision as {@link isLocalRequest}, for the one surface that has no Hono `Context`:
+ *  the raw `http.Server` 'upgrade' event a WebSocket handshake arrives on (registerTerminalWs).
+ *  Takes the remote address and headers directly instead of pulling them off a Context. */
+export function isLocalUpgrade(remoteAddress: string | undefined, headers: NodeJS.Dict<string | string[]>, d: Deps): boolean {
+  const tunneled = !!d.tunnel?.active() && !!(headers['cf-ray'] || headers['cf-connecting-ip'])
+  if (tunneled) return false
+  if (!d.store.snapshot().daemon.lanBind) return true // loopback-only bind → always local
+  return !!remoteAddress && LOOPBACK.has(remoteAddress)
+}
+
 /** Pure decision logic behind lanAuth, extracted so it's directly unit-testable —
  *  a real "this connection really is loopback" signal needs a live TCP socket,
  *  which isn't cheap to fake in a test, so the boolean combination itself is
@@ -166,11 +176,11 @@ export function isLocalOrAuthenticated(c: Context, d: Deps): boolean {
   return daemon.requireApiKey === true    // remote (or tunneled) allowed only behind required (verified) API key
 }
 
-/** Checks the presented key (any of the accepted headers, see presentedKey) against stored API
- *  keys; bumps lastUsedAt best-effort on a match. Shared by lanAuth and codeAuth below so both
- *  enforce the identical credential check — only WHEN each one is triggered differs. */
-export function verifyPresentedKey(c: Context, d: Deps): boolean {
-  const key = presentedKey(c)
+/** Checks a raw candidate key against stored API keys; bumps lastUsedAt best-effort on a
+ *  match. The credential-check core shared by every auth surface — HTTP (verifyPresentedKey,
+ *  which sources the raw value from headers) and the WebSocket upgrade handler (which sources
+ *  it from a query param, since browsers can't set custom headers on a WebSocket handshake). */
+export function verifyKeyValue(key: string, d: Deps): boolean {
   if (!key) return false
   const hash = hashKey(key)
   const cfg = d.store.snapshot()
@@ -186,6 +196,13 @@ export function verifyPresentedKey(c: Context, d: Deps): boolean {
     /* swallow — usage tracking is best-effort */
   }
   return true
+}
+
+/** Checks the presented key (any of the accepted headers, see presentedKey) against stored API
+ *  keys. Shared by lanAuth and codeAuth below so both enforce the identical credential check —
+ *  only WHEN each one is triggered differs. */
+export function verifyPresentedKey(c: Context, d: Deps): boolean {
+  return verifyKeyValue(presentedKey(c), d)
 }
 
 /** LAN auth middleware (spec 06 §5). Register AFTER cors + the Server header and

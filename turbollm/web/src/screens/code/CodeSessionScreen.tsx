@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { ArrowDown, Diff, Download, Eraser, FolderOpen, GitBranch, MoreHorizontal, PanelLeft, Pencil, RotateCcw } from 'lucide-react'
+import { ArrowDown, Diff, Download, Eraser, FolderOpen, GitBranch, MoreHorizontal, PanelLeft, Pencil, RotateCcw, Terminal as TerminalIcon } from 'lucide-react'
 import { ApiError } from '../../lib/api'
 import { skillKeys, fetchSkills } from '../../lib/agent-api'
 import { useModelActions, useModels, useStatus } from '../../lib/queries'
@@ -35,6 +35,7 @@ import { CodeResourcesHeader } from './CodeResourcesHeader'
 import { CodeGitDialog } from './CodeGitDialog'
 import { CodeTranscript, CodeTranscriptSkeleton, TodoChecklist } from './CodeTranscript'
 import { AGENT_MODES, type AgentModeId } from './code-mock'
+import { TerminalView } from './TerminalView'
 
 /** The fixed prompt `/init` sends (ADR-258) — drives the agent to inspect the repo and author an
  *  AGENTS.md, which persona.ts's agentsMdBlock then picks up on every later turn. Sent as this
@@ -114,6 +115,8 @@ export function CodeSessionScreen() {
     engineState === 'stopping'
   const [settingsKey, setSettingsKey] = useState<string | null>(null)
   const [gitDialogOpen, setGitDialogOpen] = useState(false)
+  // Terminal view — when open, replaces transcript/composer with a full claude TUI.
+  const [terminalOpen, setTerminalOpen] = useState(false)
   const exportMut = useExportCodeSession()
   const handleLoadModel = (key: string) => {
     modelActions.load.mutate(
@@ -703,162 +706,164 @@ export function CodeSessionScreen() {
               </div>
             </>
           )}
+          {/* Terminal toggle — always visible; opens a full-screen claude TUI */}
+          {session && (
+            <Button
+              size="icon"
+              variant={terminalOpen ? 'default' : 'ghost'}
+              className="h-8 w-8 shrink-0"
+              onClick={() => setTerminalOpen((o) => !o)}
+              title={terminalOpen ? 'Close terminal' : 'Open terminal (runs claude CLI)'}
+            >
+              <TerminalIcon size={16} />
+            </Button>
+          )}
         </div>
 
-        {/* Loaded-resources header (ADR-262) — a collapsible strip surfacing the AGENTS.md +
-            skills persona.ts loads server-side but the UI never showed. Fixed below the title bar
-            (not scrolling with the transcript) so it stays a glanceable resource indicator.
-            Deliberately no mode/model/context here — those have their single home in the composer
-            (ADR-262's no-duplication constraint). */}
-        {session && !notFound && (
+        {/* Loaded-resources header — shown only when terminal is NOT open */}
+        {!terminalOpen && session && !notFound && (
           <CodeResourcesHeader
             skillCount={skillsQ.data?.length ?? 0}
             hasAgentsMd={detailQ.data?.hasAgentsMd ?? { project: false, global: false }}
           />
         )}
 
-        {/* Transcript — activity-log presentation (CodeTranscript.tsx), not
-            chat's bubble stack. See that file's header comment for the full
-            rationale. */}
-        <div ref={scrollerRef} className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
-          <div className="flex w-full flex-col px-4 py-4 md:px-8 md:py-6">
-            {notFound && (
-              <div className="flex flex-col items-center gap-2 py-16 text-center">
-                <p className="text-[14px] text-muted">This session couldn&rsquo;t be found.</p>
-                <Button size="sm" variant="outline" onClick={() => navigate('/workspace/code')}>Back to Code</Button>
-              </div>
-            )}
-            {/* /clear banner — the underlying messages are never deleted, so this is a
-                reminder + one-click undo, not a warning about lost data. */}
-            {!notFound && session?.clearedUpToMessageId && (
-              <div className="mb-4 flex items-center gap-2 rounded-lg border border-border bg-panel-2 px-3 py-2 text-[12px] text-muted">
-                <Eraser size={13} className="shrink-0 text-faint" />
-                <span className="flex-1">Chat cleared — earlier messages hidden.</span>
-                <button
-                  type="button"
-                  onClick={() => void runResume()}
-                  disabled={resumeMut.isPending}
-                  className="inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-1 font-medium text-ink transition-colors hover:bg-panel"
-                >
-                  <RotateCcw size={12} /> Resume
-                </button>
-              </div>
-            )}
-            {/* Revert banner — same non-destructive framing as /clear's: the reverted-from
-                message and everything after it are deactivated, never deleted (v33). */}
-            {!notFound && session?.revertedFromMessageId && (
-              <div className="mb-4 flex items-center gap-2 rounded-lg border border-border bg-panel-2 px-3 py-2 text-[12px] text-muted">
-                <RotateCcw size={13} className="shrink-0 text-faint" />
-                <span className="flex-1">Reverted to an earlier message — later messages hidden.</span>
-                <button
-                  type="button"
-                  onClick={() => void runResume()}
-                  disabled={resumeMut.isPending}
-                  className="inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-1 font-medium text-ink transition-colors hover:bg-panel"
-                >
-                  <RotateCcw size={12} /> Resume
-                </button>
-              </div>
-            )}
-            {initialLoading && <CodeTranscriptSkeleton />}
-            {!notFound && !initialLoading && (
-              <CodeTranscript
-                messages={transcriptMessages}
-                liveAssistantId={live?.assistantId}
-                live={live ? { timeline: live.timeline, reasoning: live.reasoning, compacting: live.compacting, retry: live.retry, prefill: live.prefill } : null}
-                onRevert={live || queued.length > 0 ? undefined : openRevertConfirm}
-                queued={queued}
-                onSendNowQueued={(id) => void handleSendNow(id)}
-                shellRuns={shellRuns}
-              />
-            )}
-          </div>
-        </div>
-
-        {showScrollBtn && (
-          <button
-            type="button"
-            onClick={() => { userScrolledUp.current = false; scrollToBottom(true) }}
-            className="absolute bottom-28 left-1/2 -translate-x-1/2 flex items-center gap-1.5 rounded-full border border-border bg-panel px-3 py-1.5 text-[12px] text-muted shadow-[var(--shadow-1)] hover:text-ink"
-          >
-            <ArrowDown size={13} /> Jump to latest
-          </button>
-        )}
-
-        {sessionId && pendingApproval && (
-          <ToolApprovalBar key={pendingApproval.id} pending={pendingApproval} convId={session?.convId ?? ''} onResolved={() => {}} />
-        )}
-
-        {/* The live turn's plan — pinned here, OUTSIDE the scrolling transcript above and
-            directly above the composer, so it never scrolls out of view mid-turn (founder
-            feedback, 2026-07-24: rendering it inline in the transcript, per the original #16
-            build, meant it scrolled away the moment there was enough reasoning/tool output to
-            push it off-screen — exactly wrong for something meant to stay visible as a reference
-            while the turn runs). Just a top border sets it off from the transcript above — the
-            old bordered-card + bg-panel-2 band read as a floating card next to the flat log
-            (founder feedback, 2026-07-24); flat now (ADR-262), so it reads as a pinned strip of
-            the same log, not a separate panel. */}
-        {!!live?.todos?.length && (
-          <div className="border-t border-border px-3 py-1.5 md:px-8">
-            <TodoChecklist todos={live.todos} />
-          </div>
-        )}
-
-        {/* Composer — the SAME CodeComposer CodeHomeScreen.tsx renders (no
-            `repo`: the repo is fixed for the session's lifetime). Mode and
-            model are both editable here too — see the handlers above. */}
-        <div className="px-3 pb-3 md:px-8 md:pb-5">
-          <CodeComposer
-            inputRef={inputRef}
-            value={input}
-            onValueChange={setInput}
-            onSubmit={(kind) => void send(kind)}
-            placeholder={live ? 'Queue a follow-up…' : 'Send a follow-up…'}
-            textareaDisabled={manualCompacting}
-            mode={modeInfo}
-            onModeChange={handleModeChange}
-            models={allModels}
-            loadedKey={model?.key ?? null}
-            loadedName={model?.name ?? null}
-            modelPending={modelBusy}
-            ejecting={modelActions.eject.isPending}
-            onLoadModel={handleLoadModel}
-            onEjectModel={handleEject}
-            thinkingBudget={thinkingBudget}
-            onThinkingBudgetChange={setThinkingBudget}
-            onModelSettings={(key) => setSettingsKey(key)}
-            ctxUsed={ctxUsed}
-            ctxMax={ctxMax}
-            lastPromptTokens={lastRealStats?.promptTokens}
-            lastGenTokens={lastRealStats?.genTokens}
-            lastPromptTps={lastRealStats?.promptTps}
-            lastGenTps={lastRealStats?.tps}
-            live={!!live}
-            onStop={() => void handleStop()}
-            sendDisabled={!input.trim() || manualCompacting}
-            onAddContext={() => setContextBrowserOpen(true)}
-            contextFiles={contextFiles}
-            onRemoveContextFile={(p) => setContextFiles((cf) => cf.filter((x) => x !== p))}
-            slashCommands={[
-              // Built-ins from the shared registry (code-commands.ts) — the same source send()
-              // parses against — then the dynamic skills appended after.
-              ...pickerCodeCommands({ cleared: !!(session?.clearedUpToMessageId || session?.revertedFromMessageId) }),
-              ...(skillsQ.data ?? []).map((s) => ({ id: s.id, description: s.description })),
-            ]}
-            // Prominent, accent-colored banner above the textarea for any real in-progress
-            // state (founder feedback, 2026-07-17: folding this into the tiny faint hint text
-            // below made an actual busy state — especially manual /compact, which disables the
-            // whole composer — too easy to miss). hintText stays reserved for the idle case.
-            statusText={
-              manualCompacting || live?.compacting
-                ? 'Compacting conversation…'
-                : live
-                  ? (queued.length ? `${queued.length} queued · Enter to queue another` : 'Running — Enter to queue a follow-up')
-                  : undefined
-            }
-            hintText="Enter to send · Shift+Enter for newline"
+        {/* Main content — either the full-screen claude TUI (terminalOpen) or the
+            normal transcript + composer view */}
+        {terminalOpen && session ? (
+          <TerminalView
+            sessionId={session.id}
+            // repoRoot is derived server-side from the Code session's AgentRun
+            onClose={() => setTerminalOpen(false)}
           />
-        </div>
+        ) : (
+          <>
+            {/* Transcript — activity-log presentation (CodeTranscript.tsx), not
+                chat's bubble stack. See that file's header comment for the full
+                rationale. */}
+            <div ref={scrollerRef} className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
+              <div className="flex w-full flex-col px-4 py-4 md:px-8 md:py-6">
+                {notFound && (
+                  <div className="flex flex-col items-center gap-2 py-16 text-center">
+                    <p className="text-[14px] text-muted">This session couldn&rsquo;t be found.</p>
+                    <Button size="sm" variant="outline" onClick={() => navigate('/workspace/code')}>Back to Code</Button>
+                  </div>
+                )}
+                {/* /clear banner */}
+                {!notFound && session?.clearedUpToMessageId && (
+                  <div className="mb-4 flex items-center gap-2 rounded-lg border border-border bg-panel-2 px-3 py-2 text-[12px] text-muted">
+                    <Eraser size={13} className="shrink-0 text-faint" />
+                    <span className="flex-1">Chat cleared — earlier messages hidden.</span>
+                    <button
+                      type="button"
+                      onClick={() => void runResume()}
+                      disabled={resumeMut.isPending}
+                      className="inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-1 font-medium text-ink transition-colors hover:bg-panel"
+                    >
+                      <RotateCcw size={12} /> Resume
+                    </button>
+                  </div>
+                )}
+                {/* Revert banner */}
+                {!notFound && session?.revertedFromMessageId && (
+                  <div className="mb-4 flex items-center gap-2 rounded-lg border border-border bg-panel-2 px-3 py-2 text-[12px] text-muted">
+                    <RotateCcw size={13} className="shrink-0 text-faint" />
+                    <span className="flex-1">Reverted to an earlier message — later messages hidden.</span>
+                    <button
+                      type="button"
+                      onClick={() => void runResume()}
+                      disabled={resumeMut.isPending}
+                      className="inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-1 font-medium text-ink transition-colors hover:bg-panel"
+                    >
+                      <RotateCcw size={12} /> Resume
+                    </button>
+                  </div>
+                )}
+                {initialLoading && <CodeTranscriptSkeleton />}
+                {!notFound && !initialLoading && (
+                  <CodeTranscript
+                    messages={transcriptMessages}
+                    liveAssistantId={live?.assistantId}
+                    live={live ? { timeline: live.timeline, reasoning: live.reasoning, compacting: live.compacting, retry: live.retry, prefill: live.prefill } : null}
+                    onRevert={live || queued.length > 0 ? undefined : openRevertConfirm}
+                    queued={queued}
+                    onSendNowQueued={(id) => void handleSendNow(id)}
+                    shellRuns={shellRuns}
+                  />
+                )}
+              </div>
+            </div>
+
+            {showScrollBtn && (
+              <button
+                type="button"
+                onClick={() => { userScrolledUp.current = false; scrollToBottom(true) }}
+                className="absolute bottom-28 left-1/2 -translate-x-1/2 flex items-center gap-1.5 rounded-full border border-border bg-panel px-3 py-1.5 text-[12px] text-muted shadow-[var(--shadow-1)] hover:text-ink"
+              >
+                <ArrowDown size={13} /> Jump to latest
+              </button>
+            )}
+
+            {sessionId && pendingApproval && (
+              <ToolApprovalBar key={pendingApproval.id} pending={pendingApproval} convId={session?.convId ?? ''} onResolved={() => {}} />
+            )}
+
+            {/* The live turn's plan — pinned above the composer */}
+            {!!live?.todos?.length && (
+              <div className="border-t border-border px-3 py-1.5 md:px-8">
+                <TodoChecklist todos={live.todos} />
+              </div>
+            )}
+
+            {/* Composer — the SAME CodeComposer CodeHomeScreen.tsx renders */}
+            <div className="px-3 pb-3 md:px-8 md:pb-5">
+              <CodeComposer
+                inputRef={inputRef}
+                value={input}
+                onValueChange={setInput}
+                onSubmit={(kind) => void send(kind)}
+                placeholder={live ? 'Queue a follow-up…' : 'Send a follow-up…'}
+                textareaDisabled={manualCompacting}
+                mode={modeInfo}
+                onModeChange={handleModeChange}
+                models={allModels}
+                loadedKey={model?.key ?? null}
+                loadedName={model?.name ?? null}
+                modelPending={modelBusy}
+                ejecting={modelActions.eject.isPending}
+                onLoadModel={handleLoadModel}
+                onEjectModel={handleEject}
+                thinkingBudget={thinkingBudget}
+                onThinkingBudgetChange={setThinkingBudget}
+                onModelSettings={(key) => setSettingsKey(key)}
+                ctxUsed={ctxUsed}
+                ctxMax={ctxMax}
+                lastPromptTokens={lastRealStats?.promptTokens}
+                lastGenTokens={lastRealStats?.genTokens}
+                lastPromptTps={lastRealStats?.promptTps}
+                lastGenTps={lastRealStats?.tps}
+                live={!!live}
+                onStop={() => void handleStop()}
+                sendDisabled={!input.trim() || manualCompacting}
+                onAddContext={() => setContextBrowserOpen(true)}
+                contextFiles={contextFiles}
+                onRemoveContextFile={(p) => setContextFiles((cf) => cf.filter((x) => x !== p))}
+                slashCommands={[
+                  ...pickerCodeCommands({ cleared: !!(session?.clearedUpToMessageId || session?.revertedFromMessageId) }),
+                  ...(skillsQ.data ?? []).map((s) => ({ id: s.id, description: s.description })),
+                ]}
+                statusText={
+                  manualCompacting || live?.compacting
+                    ? 'Compacting conversation…'
+                    : live
+                      ? (queued.length ? `${queued.length} queued · Enter to queue another` : 'Running — Enter to queue a follow-up')
+                      : undefined
+                }
+                hintText="Enter to send · Shift+Enter for newline"
+              />
+            </div>
+          </>
+        )}
       </div>
       <ModelDetailDialog modelKey={settingsKey} onClose={() => setSettingsKey(null)} />
       {session && <CodeGitDialog sessionId={session.id} open={gitDialogOpen} onOpenChange={setGitDialogOpen} />}
