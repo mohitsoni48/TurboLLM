@@ -92,6 +92,30 @@ function toolIcon(name: string) {
   return Terminal
 }
 
+// Mirrors the backend's MUTATING_TOOLS (code-session.ts) — edit/write/bash are the tools that
+// can change the filesystem; read/grep/find/ls never do. bash carries no path argument (the
+// backend's own comment: "containment can't confine it, the mode system is its only guard"), so
+// this is a conservative "may write" signal applied to EVERY bash call, never sniffed from the
+// command string itself — a heuristic that labels a destructive command "read" would actively
+// mislead, which is worse than no label at all.
+const MUTATING_TOOLS = new Set(['edit', 'write', 'bash'])
+
+function isMutating(name: string): boolean {
+  return MUTATING_TOOLS.has(name)
+}
+
+/** Hover tooltip explaining what a tool call actually does, read/write-explicit. `label` is the
+ *  same path/command string the line itself already shows. */
+function toolTooltip(name: string, label: string): string {
+  if (EDIT_TOOLS.has(name)) return `Modifies ${label}`
+  if (WRITE_TOOLS.has(name)) return `Creates or overwrites ${label}`
+  if (BASH_TOOLS.has(name)) return 'Runs a shell command — may read or write anywhere'
+  if (READ_TOOLS.has(name)) return `Reads ${label}`
+  if (SEARCH_TOOLS.has(name)) return `Searches for ${label}`
+  if (name === 'ls') return `Lists ${label}`
+  return friendlyName(name)
+}
+
 /** A file-taking tool's `path` arg, for the flat line's label — falls back to the
  *  friendly tool name when there's no path (bash, or an odd/legacy call shape).
  *  invoke_skill has neither a path nor a command, just a skillId, so without this it would
@@ -226,6 +250,7 @@ function CodeOutputPanel({ text, streaming }: { text: string; streaming?: boolea
 function CodeToolLine({ call }: { call: NormalizedCall }) {
   const Icon = toolIcon(call.name)
   const label = toolLabel(call.name, call.args)
+  const mutating = isMutating(call.name)
   const hasDiff = !!call.diff?.trim()
   // Live cumulative output while the tool is still running (bash) — shown before the terminal
   // `result` exists (Phase 2). Once the real result lands it takes over.
@@ -248,9 +273,14 @@ function CodeToolLine({ call }: { call: NormalizedCall }) {
         type="button"
         onClick={() => hasOutput && setExpanded((e) => !e)}
         disabled={!hasOutput}
+        title={toolTooltip(call.name, label)}
         className="flex w-full items-center gap-2 rounded px-1 py-0.5 text-left transition-colors hover:bg-panel-2 disabled:cursor-default disabled:hover:bg-transparent"
       >
-        <Icon size={13} className="shrink-0 text-muted" />
+        <Icon
+          size={13}
+          className={cn('shrink-0', !mutating && 'text-muted')}
+          style={mutating ? { color: 'var(--warn)' } : undefined}
+        />
         <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-ink">{label}</span>
         {stats && (stats.add > 0 || stats.del > 0) && (
           <span className="shrink-0 font-mono text-[11px] tabular-nums">
@@ -337,10 +367,13 @@ function CodeToolGroup({ lead, calls }: { lead: string; calls: NormalizedCall[] 
       <button
         type="button"
         onClick={() => setExpanded((e) => !e)}
+        title="Runs shell commands — may read or write anywhere"
         className="flex w-full items-center gap-2 rounded px-1 py-0.5 text-left transition-colors hover:bg-panel-2"
       >
         <ChevronRight size={13} className={cn('shrink-0 text-faint transition-transform', open && 'rotate-90')} />
-        <Terminal size={13} className="shrink-0 text-muted" />
+        {/* Every member of a group is a bash call (groupToolCalls/bashLeadWord) — same
+            unconditional warn tint as a single CodeToolLine's bash icon. */}
+        <Terminal size={13} className="shrink-0" style={{ color: 'var(--warn)' }} />
         <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-ink">{calls.length} {lead} commands</span>
         <StatusIcon status={status} />
       </button>

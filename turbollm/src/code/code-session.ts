@@ -187,6 +187,21 @@ export function compactionSettingsFor(contextWindow: number): { enabled: boolean
   return { enabled: true, reserveTokens, keepRecentTokens }
 }
 
+/** Hard-abort safety margin for the near-overflow check below — deliberately TIGHTER than
+ *  compactionSettingsFor's own reserveTokens (~15% of contextWindow). That reserve is the normal
+ *  "compact soon" signal pi's own threshold check already handles correctly BETWEEN turns; this
+ *  is a separate, later, genuine last-resort "about to actually overflow and error" signal for
+ *  the one case a turn-boundary-only check structurally cannot reach — a single CONTINUOUS turn
+ *  running dozens of rounds with no boundary to trigger at (root-caused, see decision log: pi's
+ *  _checkCompaction is only ever invoked before a new session.prompt() or after the whole
+ *  agentic loop settles, never mid-loop). Small and fixed-fraction rather than reusing
+ *  reserveTokens, so this only fires meaningfully AFTER the normal reserve has already been
+ *  crossed within one unbroken turn — proof the boundary check truly never got a chance to run,
+ *  not a duplicate of it firing early. */
+export function nearOverflowReserveTokens(contextWindow: number): number {
+  return Math.max(256, Math.round(contextWindow * 0.05))
+}
+
 /** Rough chars/4 token estimate for one DB message + its tool calls' args/results — mirrors pi's
  *  own heuristic (compaction.js's estimateTokens) closely enough to size a safety margin against
  *  (see keepRecentTokensFor below), not to reproduce pi's count exactly. */
@@ -270,15 +285,63 @@ export interface RunCodeResult {
   contextUsed: number
   contextMax: number
   aborted: boolean
+  /** Real per-turn token/timing stats — see foldTurnUsage's doc comment. Omitted entirely
+   *  (not zeroed) when the engine returned no usable usage at all. */
+  promptTokens?: number
+  genTokens?: number
+  cachedTokens?: number
+  promptMs?: number
+  genMs?: number
+  promptTps?: number
+  tps?: number
+  ttftMs?: number
+  totalMs?: number
+}
+
+/** Folds pi's own SessionStats.tokens (already turn-scoped — replayed prior-turn history is
+ *  seeded with ZERO_USAGE, see below, so the sum reflects only this turn's real provider
+ *  rounds) together with wall-clock timing accumulated across every agentic round of this turn
+ *  into the same MessageStats shape Chat's own engine-agnostic fallback produces
+ *  (chat-routes.ts's `else` branch) — no llama.cpp-specific `timings` object is available here,
+ *  since Code goes through pi's OpenAI-compatible client rather than a raw fetch. Never
+ *  fabricates a 0: if the engine returned no real usage at all (e.g. ignores
+ *  `include_usage`), every field is omitted so the UI leaves the stat off rather than showing a
+ *  misleadingly precise zero (mirrors CodeComposer's own `!== undefined` render guard). */
+export function foldTurnUsage(
+  tokens: { input: number; output: number; cacheRead: number; cacheWrite: number },
+  timing: { promptMsTotal: number; genMsTotal: number; ttftMs?: number; totalMs: number },
+): Pick<RunCodeResult, 'promptTokens' | 'genTokens' | 'cachedTokens' | 'promptMs' | 'genMs' | 'promptTps' | 'tps' | 'ttftMs' | 'totalMs'> {
+  const promptTokens = tokens.input + tokens.cacheRead + tokens.cacheWrite
+  const genTokens = tokens.output
+  if (promptTokens === 0 && genTokens === 0) return {}
+  return {
+    promptTokens,
+    genTokens,
+    cachedTokens: tokens.cacheRead,
+    promptMs: timing.promptMsTotal,
+    genMs: timing.genMsTotal,
+    promptTps: timing.promptMsTotal > 0 ? Math.round((promptTokens / timing.promptMsTotal) * 1000 * 10) / 10 : 0,
+    tps: timing.genMsTotal > 0 ? Math.round((genTokens / timing.genMsTotal) * 1000 * 10) / 10 : 0,
+    ttftMs: timing.ttftMs,
+    totalMs: timing.totalMs,
+  }
 }
 
 // pi's built-in mutating tools that require approval in ASK mode. read/grep/find/ls are
 // read-only and never gated. bash has no path argument, so containment can't confine it —
 // the mode system is its only guard (ask = approval, plan = not in toolset, auto = unconfined).
 export const MUTATING_TOOLS = new Set(['edit', 'write', 'bash'])
-// Tools whose path argument must pass the containment check before executing (plan §3b).
-// bash is deliberately absent — it takes `command`, not `path` (see risk flag 1).
+// Tools whose path argument routes through the containment gate below (plan §3b) — not all of
+// them are actually BLOCKED by it, see WRITE_PATH_TOOLS. bash is deliberately absent — it takes
+// `command`, not `path` (see risk flag 1).
 export const PATH_TOOLS = new Set(['read', 'edit', 'write', 'grep', 'find', 'ls'])
+// The subset of PATH_TOOLS actually CONFINED to repoRoot (loosened 2026-07-25, founder ask:
+// "allow reads outside the repo folder while keeping writes confined to it"). edit/write stay
+// hard-confined — writing outside the project is the real safety boundary. read/grep/find/ls may
+// now target any path on the host filesystem: referencing a sibling repo, a shared lib, or system
+// docs while investigating is a normal, safe read. containment.ts's isContainedFromRoot is only
+// actually enforced (as a block) for entries in this set — see the shared PATH_TOOLS gate below.
+export const WRITE_PATH_TOOLS = new Set(['edit', 'write'])
 
 // ── Consecutive identical tool-call loop breaker (founder-reported) ────────────
 // A weak local model can get stuck firing the SAME tool with the SAME arguments over and over,
@@ -783,11 +846,13 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
         const input = event.input as Record<string, unknown>
         await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'pending' } })
 
+        // Only WRITE_PATH_TOOLS members (edit/write) are actually confined to repoRoot — same
+        // loosened boundary as the outer session's own hook (2026-07-25).
         if (PATH_TOOLS.has(toolName)) {
           const p = input.path
           const pathRequired = toolName === 'read' || toolName === 'edit' || toolName === 'write'
           if (p !== undefined && typeof p === 'string') {
-            if (!isContainedFromRoot(p, repoRoot)) {
+            if (WRITE_PATH_TOOLS.has(toolName) && !isContainedFromRoot(p, repoRoot)) {
               const reason = 'path is outside the allowed repo root'
               await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
               return { block: true, reason }
@@ -834,6 +899,16 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       extensionFactories: [{ name: 'turbollm-skill', factory: skillExtension }],
       appendSystemPrompt: [skill.instructions.trim()],
       noSkills: true,
+      // pi's own DefaultResourceLoader has a BUILT-IN AGENTS.md/CLAUDE.md loader
+      // (loadProjectContextFiles, resource-loader.js) that injects a second, separate
+      // <project_context> block into the system prompt — on top of, and overlapping with,
+      // persona.ts's own hand-rolled version (buildAppendPrompt's agentsMd block, fed via
+      // appendSystemPrompt above). Found 2026-07-25 (pi-SDK audit): any repo with a top-level
+      // AGENTS.md/CLAUDE.md was getting its content sent to the model TWICE every turn. pi's
+      // native path is also uncapped (no MAX_AGENTS_MD_CHARS) and ignores containment entirely —
+      // persona.ts's version is strictly better, so disable pi's native one rather than the
+      // reverse. Same fix at all 5 DefaultResourceLoader construction sites in this file.
+      noContextFiles: true,
       noPromptTemplates: true,
       noThemes: true,
     })
@@ -950,11 +1025,13 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
         const input = event.input as Record<string, unknown>
         await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'pending' } })
 
+        // Only WRITE_PATH_TOOLS members (edit/write) are actually confined to repoRoot — same
+        // loosened boundary as the outer session's own hook (2026-07-25).
         if (PATH_TOOLS.has(toolName)) {
           const p = input.path
           const pathRequired = toolName === 'read' || toolName === 'edit' || toolName === 'write'
           if (p !== undefined && typeof p === 'string') {
-            if (!isContainedFromRoot(p, repoRoot)) {
+            if (WRITE_PATH_TOOLS.has(toolName) && !isContainedFromRoot(p, repoRoot)) {
               const reason = 'path is outside the allowed repo root'
               await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
               return { block: true, reason }
@@ -1001,8 +1078,16 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       extensionFactories: [{ name: 'turbollm-delegate', factory: subExtension }],
       // The normal mode persona (no skill catalog — a delegated sub-agent can't invoke skills),
       // plus the delegation preamble that frames it as a focused, summary-returning worker.
-      appendSystemPrompt: [...buildAppendPrompt(subMode, [], { repoRoot, globalDir: d.store.dir() }, !!d.tools), DELEGATED_SUBAGENT_PREAMBLE],
+      appendSystemPrompt: [...buildAppendPrompt(subMode, [], {
+        repoRoot,
+        globalDir: d.store.dir(),
+        projectCandidates: d.store.snapshot().code.agentsMdProjectCandidates,
+        globalCandidates: d.store.snapshot().code.agentsMdGlobalCandidates,
+      }, !!d.tools), DELEGATED_SUBAGENT_PREAMBLE],
       noSkills: true,
+      // Disables pi's own native AGENTS.md/CLAUDE.md loader — see the skill sub-session's
+      // identical construction above for the full double-injection writeup.
+      noContextFiles: true,
       noPromptTemplates: true,
       noThemes: true,
     })
@@ -1067,6 +1152,20 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
   // odd shape is swallowed, because prefill telemetry must never break the actual generation.
   let prefillTimer: ReturnType<typeof setTimeout> | undefined
   let prefillActive = false
+
+  // ── real per-turn token/timing stats (foldTurnUsage above) ────────────────────
+  // Wall-clock timing accumulated across every agentic ROUND of this turn (a Code turn can run
+  // dozens of rounds — see runLoop in pi-agent-core). Each round: roundStartedAt is set the
+  // instant the gate is acquired and the request is about to go out (before_provider_request,
+  // below); roundFirstTokenAt is set on that round's first message_update; the round closes out
+  // on message_end, folding (firstToken - start) into promptMsTotal and (end - firstToken) into
+  // genMsTotal. ttftMs is captured once, on the very first token of the whole turn.
+  let turnStartedAt = 0
+  let promptMsTotal = 0
+  let genMsTotal = 0
+  let ttftMs: number | undefined
+  let roundStartedAt: number | undefined
+  let roundFirstTokenAt: number | undefined
   const stopPrefillPoll = (): void => {
     prefillActive = false
     if (prefillTimer) { clearTimeout(prefillTimer); prefillTimer = undefined }
@@ -1108,6 +1207,8 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       // Gate acquired, request is about to go out — begin polling /slots for prefill progress for
       // THIS round (stopped on first token / completion / response end / abort). Best-effort.
       startPrefillPoll()
+      roundStartedAt = Date.now()
+      roundFirstTokenAt = undefined
       const payload = { ...(event.payload as Record<string, unknown>) }
       // Strip the completion-length cap pi derives from this model's declared `maxTokens` (a
       // fixed ceiling set once in the model metadata above, at model-load time). Sent verbatim as
@@ -1166,6 +1267,11 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
           'in a row, including after being told to stop — this run has been stopped automatically ' +
           'rather than continue looping. Start a new turn with different instructions to try again.]'
         await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
+        // Pre-existing gap, fixed alongside the near-overflow check below (both call session.abort()
+        // directly, not through the external `signal` the `aborted` flag was originally wired to):
+        // without this, the comment above ("surfaces as... stats.aborted") was not actually true —
+        // `aborted` was only ever set by the Stop-button/connection-drop listener.
+        aborted = true
         void session.abort()
         return { block: true, reason }
       }
@@ -1179,7 +1285,9 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       }
 
       // 1. Containment (plan §3b) — BEFORE any mode logic, so it applies in every mode
-      //    including auto. Only tools that take a `path` are checkable here.
+      //    including auto. Only tools that take a `path` are checkable here. Only
+      //    WRITE_PATH_TOOLS members (edit/write) are actually confined to repoRoot — read/grep/
+      //    find/ls may target any path on the host filesystem (loosened 2026-07-25).
       if (PATH_TOOLS.has(toolName)) {
         const p = input.path
         // grep/find/ls accept an optional path defaulting to cwd (contained by definition);
@@ -1189,7 +1297,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
           // Resolve a RELATIVE path against the session repoRoot, NOT the daemon's own cwd —
           // pi's read/edit/write/ls tools emit repo-relative paths, and resolving those against
           // process.cwd() falsely rejected legitimate in-bounds calls in every mode.
-          if (!isContainedFromRoot(p, repoRoot)) {
+          if (WRITE_PATH_TOOLS.has(toolName) && !isContainedFromRoot(p, repoRoot)) {
             const reason = 'path is outside the allowed repo root'
             await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
             return { block: true, reason }
@@ -1314,6 +1422,32 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
         }
       }
 
+      // Near-overflow hard-abort, root-caused and decided 2026-07-25 (see decision log) — a long
+      // CONTINUOUS turn can run dozens of rounds without ever hitting a turn boundary, so pi's own
+      // auto-compaction threshold check (only ever invoked before a new session.prompt() or after
+      // the whole agentic loop settles) structurally never gets a chance to run. Rather than let
+      // the NEXT round's request genuinely overflow and error, check the real live context usage
+      // after every round and abort cleanly — same session.abort() path the loop breaker above
+      // uses, so this surfaces as a real stopped run (stats.aborted), not a crash. The next turn
+      // then starts through the normal, already-working turn-boundary compaction path. Uses
+      // session.getContextUsage() directly (pi's real provider-reported usage, not an estimate) —
+      // NOT session.compact() — a mid-loop compact() call was investigated and found NOT to
+      // actually prevent this turn's own request from continuing to grow (runLoop snapshots the
+      // message context once at turn start; nothing re-syncs it mid-loop), so this deliberately
+      // does not attempt that. worst case is a turn stopping a bit early with partial progress
+      // instead of a hard overflow crash.
+      const usage = session.getContextUsage()
+      if (typeof usage?.tokens === 'number' && usage.tokens > usage.contextWindow - nearOverflowReserveTokens(usage.contextWindow)) {
+        event.content.push({
+          type: 'text',
+          text: '\n\n[SYSTEM: this turn is approaching the model\'s real context limit and has been ' +
+            'stopped automatically to avoid a hard overflow error. Continue the task in a new message ' +
+            '— the next turn starts from freshly compacted history.]',
+        })
+        aborted = true
+        void session.abort()
+      }
+
       const text = event.content
         .map((c) => (c.type === 'text' ? c.text : ''))
         .join('')
@@ -1403,6 +1537,39 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
           return { content: [{ type: 'text', text }], details: {} }
         } catch (e) {
           return { content: [{ type: 'text', text: `delegate_task: failed (${e instanceof Error ? e.message : String(e)}) — try again, or do the task yourself.` }], details: {} }
+        }
+      },
+    })
+
+    // Look back past a prior /compact without replaying the whole raw history inline
+    // (lookback_history) — the pre-compaction messages are still sitting in the DB, unreferenced;
+    // this answers a targeted question against them via an isolated sub-session (see
+    // lookbackPreCompactionHistory's own doc comment) and returns ONLY the answer.
+    pi.registerTool({
+      name: 'lookback_history',
+      label: 'Look back before compaction',
+      description: 'If this session has been compacted (its earlier history was summarized to save ' +
+        'context), ask a targeted question about what happened in that summarized-away part — e.g. ' +
+        '"what did we decide about X" or "what was the exact error message before we compacted". ' +
+        'Answers from the ORIGINAL messages, not just the summary, without loading them into your ' +
+        'own context. Returns an error if this session has never been compacted (nothing to look ' +
+        'back at) — check the compaction summary already in your context first.',
+      promptSnippet: 'lookback_history(question) - ask a targeted question about this session\'s pre-compaction history',
+      parameters: Type.Object({
+        question: Type.String({ description: 'The specific question to answer from the pre-compaction history.' }),
+      }),
+      async execute(_toolCallId, params) {
+        const q = (params.question ?? '').trim()
+        if (!q) return { content: [{ type: 'text', text: 'lookback_history: `question` must be non-empty.' }], details: {} }
+        try {
+          const { answer } = await lookbackPreCompactionHistory({ d, convId, sessionId, repoRoot, question: q, signal })
+          return { content: [{ type: 'text', text: answer }], details: {} }
+        } catch (e) {
+          const message = e instanceof Error ? e.message : String(e)
+          if (message === 'nothing_compacted') {
+            return { content: [{ type: 'text', text: 'This session has not been compacted — there is no summarized-away history to look back at. Everything is already in your own context.' }], details: {} }
+          }
+          return { content: [{ type: 'text', text: `lookback_history: failed (${message}) — try again.` }], details: {} }
         }
       },
     })
@@ -1579,11 +1746,21 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     // message — the actual cause of "context fills up in 1-2 messages", not a compaction bug).
     // `noSkills: true` below is pi's OWN unrelated skill-discovery mechanism (kept off for
     // prompt hygiene) — this is TurboLLM's own Skills library.
-    // agentsMd: <repoRoot>/AGENTS.md + ~/.turbollm/agents.md, like OpenCode — d.store.dir() IS
-    // TurboLLM's own data dir (the same one SkillStore above reads from).
-    appendSystemPrompt: buildAppendPrompt(mode, skills, { repoRoot, globalDir: d.store.dir() }, !!d.tools),
+    // agentsMd: <repoRoot>/<candidate> + <TurboLLM data dir>/<candidate>, like OpenCode — d.store.dir()
+    // IS TurboLLM's own data dir (the same one SkillStore above reads from). Candidate lists read
+    // fresh from config here (not passed in from further up) so a Settings change takes effect on
+    // this session's NEXT turn without needing a new session — see persona.ts's own doc comment.
+    appendSystemPrompt: buildAppendPrompt(mode, skills, {
+      repoRoot,
+      globalDir: d.store.dir(),
+      projectCandidates: d.store.snapshot().code.agentsMdProjectCandidates,
+      globalCandidates: d.store.snapshot().code.agentsMdGlobalCandidates,
+    }, !!d.tools),
     // Keep the prompt lean and deterministic — no global skills/prompts/themes discovery.
     noSkills: true,
+    // Disables pi's own native AGENTS.md/CLAUDE.md loader — see the skill sub-session's
+    // identical construction above for the full double-injection writeup.
+    noContextFiles: true,
     noPromptTemplates: true,
     noThemes: true,
   })
@@ -1635,7 +1812,22 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
   const unsubscribe = session.subscribe((ev: AgentSessionEvent) => {
     // First real model output means prefill is over — stop the /slots poller now, a cross-check in
     // case a slot's numbers never quite reach n_prompt_tokens (stale/rounding) before decode begins.
-    if (ev.type === 'message_update') stopPrefillPoll()
+    if (ev.type === 'message_update') {
+      stopPrefillPoll()
+      if (roundStartedAt !== undefined && roundFirstTokenAt === undefined) {
+        roundFirstTokenAt = Date.now()
+        if (ttftMs === undefined) ttftMs = roundFirstTokenAt - turnStartedAt
+      }
+    } else if (ev.type === 'message_end' && ev.message.role === 'assistant' && roundStartedAt !== undefined) {
+      // Round closes out — fold this round's prefill/gen split into the turn totals (see the
+      // state declarations above for why this is summed across rounds, not just the last one).
+      const roundEnded = Date.now()
+      const firstTok = roundFirstTokenAt ?? roundEnded
+      promptMsTotal += firstTok - roundStartedAt
+      genMsTotal += roundEnded - firstTok
+      roundStartedAt = undefined
+      roundFirstTokenAt = undefined
+    }
     const frame = codeEventToFrame(ev, turnCounter)
     if (frame) void sink(frame)
   })
@@ -1657,6 +1849,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
 
   d.manager.generationStart()
   params.onSteerable?.(steerHandle)
+  turnStartedAt = Date.now()
   try {
     // Not-streaming prompt: resolves after the whole agentic loop settles (mirrors pi's own
     // print mode), including any steered continuation folded in via steerHandle above.
@@ -1675,9 +1868,10 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
   // Prefer pi's live context-usage estimate; fall back to the aggregate token total.
   const contextUsed = stats.contextUsage?.tokens ?? stats.tokens.total ?? 0
   const contextMax = stats.contextUsage?.contextWindow ?? contextWindow
+  const usage = foldTurnUsage(stats.tokens, { promptMsTotal, genMsTotal, ttftMs, totalMs: Date.now() - turnStartedAt })
   session.dispose()
 
-  return { finalText, contextUsed, contextMax, aborted }
+  return { finalText, contextUsed, contextMax, aborted, ...usage }
 }
 
 export interface CompactCodeParams {
@@ -1776,6 +1970,11 @@ export async function compactCodeSession(params: CompactCodeParams): Promise<Com
     settingsManager: SettingsManager.inMemory(),
     extensionFactories: [{ name: 'turbollm-compact', factory: compactExtension }],
     noSkills: true,
+    // Disables pi's own native AGENTS.md/CLAUDE.md loader — see the skill sub-session's
+    // identical construction above for the full double-injection writeup. Doubly relevant here:
+    // this session's whole purpose is summarizing DB history, so pi's own uncapped
+    // <project_context> injection would be pure noise on top of that.
+    noContextFiles: true,
     noPromptTemplates: true,
     noThemes: true,
   })
@@ -1830,4 +2029,136 @@ export async function compactCodeSession(params: CompactCodeParams): Promise<Com
   })
 
   return { summary: result.summary, upToMessageId, tokensBefore: result.tokensBefore }
+}
+
+export interface LookbackParams {
+  d: Deps
+  convId: string
+  sessionId: string
+  repoRoot: string
+  question: string
+  signal?: AbortSignal
+}
+
+export interface LookbackResult {
+  answer: string
+}
+
+/** `delegate_task`'s sibling for the one thing it can't do: answer a question grounded in
+ *  messages a PRIOR `/compact` already summarized away, which this session's own live context no
+ *  longer carries raw. Today's `/compact` is non-incremental (see compactCodeSession's own doc
+ *  comment) — a second `/compact` re-summarizes everything again, so "the pre-compaction range"
+ *  here just means "every message up to and including the CURRENT compactionUpToMessageId
+ *  cursor" — that already covers any number of stacked prior compactions, since compaction never
+ *  deletes DB rows, only moves the cursor (resolveEffectiveHistory).
+ *
+ *  Same isolation principle as delegate_task/runSkillSubSession: a dedicated, TOOL-LESS pi
+ *  session seeded with the raw pre-compaction messages, prompted with the model's own question,
+ *  and only the final answer text returned — the raw history itself never re-enters the parent
+ *  session's own context, so this doesn't defeat the point of having compacted in the first
+ *  place. */
+export async function lookbackPreCompactionHistory(params: LookbackParams): Promise<LookbackResult> {
+  const { d, convId, sessionId, repoRoot, question, signal } = params
+  const run = d.db.getAgentRun(sessionId)
+  if (!run?.compactionUpToMessageId) throw new Error('nothing_compacted')
+
+  const ms = d.manager.status()
+  if (ms.state !== 'running' || !ms.model) throw new Error('model_not_loaded')
+  const target = d.manager.target()
+  if (!target) throw new Error('model_not_loaded')
+  const engineKind = d.registry.active()?.kind ?? ''
+  const modelId = engineModelAlias(engineKind) ?? ms.model.key
+  const contextWindow = ms.model.ctx > 0 ? ms.model.ctx : 8192
+
+  // Everything up to and including the cut, from the FULL (never-deactivated-by-compaction) DB
+  // history — compaction only ever moves this cursor, it never deletes rows, so this is genuinely
+  // the raw original text regardless of how many compactions have happened since.
+  const all = d.db.getConversation(convId, true)?.messages ?? []
+  const cutIdx = all.findIndex((m) => m.id === run.compactionUpToMessageId)
+  const preCompaction = cutIdx === -1 ? all : all.slice(0, cutIdx + 1)
+  if (preCompaction.length === 0) throw new Error('nothing_compacted')
+
+  const authStorage = AuthStorage.inMemory()
+  const modelRegistry = ModelRegistry.inMemory(authStorage)
+  modelRegistry.registerProvider('local', {
+    baseUrl: `${target}/v1`,
+    apiKey: 'agent-key',
+    authHeader: true,
+    api: 'openai-completions',
+    models: [{
+      id: modelId,
+      name: ms.model.name || 'Local Model',
+      reasoning: false,
+      input: ['text'],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow,
+      maxTokens: 8192,
+      compat: { supportsDeveloperRole: false, thinkingFormat: 'qwen-chat-template' },
+    }],
+  })
+  const model = modelRegistry.find('local', modelId)
+  if (!model) throw new Error('Failed to register local model with pi.')
+
+  const sessionManager = SessionManager.inMemory(repoRoot)
+  const entryTrack: { piId: string; msgIndex: number }[] = []
+  seedPriorHistory(sessionManager, preCompaction, modelId, (piId, msgIndex) => entryTrack.push({ piId, msgIndex }))
+  if (entryTrack.length === 0) throw new Error('nothing_compacted')
+
+  // Same stale-ceiling strip as compactCodeSession's own before_provider_request hook.
+  const lookbackExtension = (pi: ExtensionAPI): void => {
+    pi.on('before_provider_request', async (event) => {
+      const payload = { ...(event.payload as Record<string, unknown>) }
+      delete payload.max_tokens
+      delete payload.max_completion_tokens
+      return payload
+    })
+  }
+  const lookbackAgentDir = join(d.store.dir(), 'pi-agent')
+  const lookbackResourceLoader = new DefaultResourceLoader({
+    cwd: repoRoot,
+    agentDir: lookbackAgentDir,
+    settingsManager: SettingsManager.inMemory(),
+    extensionFactories: [{ name: 'turbollm-lookback', factory: lookbackExtension }],
+    noSkills: true,
+    // Disables pi's own native AGENTS.md/CLAUDE.md loader — see the skill sub-session's
+    // identical construction above for the full double-injection writeup.
+    noContextFiles: true,
+    noPromptTemplates: true,
+    noThemes: true,
+  })
+  await lookbackResourceLoader.reload()
+
+  const { session } = await createAgentSession({
+    cwd: repoRoot,
+    agentDir: lookbackAgentDir,
+    model,
+    authStorage,
+    modelRegistry,
+    sessionManager,
+    settingsManager: SettingsManager.inMemory(),
+    resourceLoader: lookbackResourceLoader,
+    tools: [], // read-only Q&A over already-seeded history — no tool needs to run, none should.
+  })
+
+  const onAbort = () => { void session.abort() }
+  if (signal?.aborted) onAbort()
+  else signal?.addEventListener('abort', onAbort, { once: true })
+  // Reuses delegate_task's own bound — same "isolated, read-only sub-session" risk shape.
+  const timer = setTimeout(() => void session.abort(), DELEGATE_SUBAGENT_TIMEOUT_MS)
+
+  try {
+    await session.prompt(
+      'Answer the following question using ONLY the conversation history above, which is from ' +
+      'earlier in this same coding session, before it was compacted/summarized away. Be concise ' +
+      'and specific — quote or reference exactly what was said/decided if relevant. If the history ' +
+      'does not actually answer the question, say so plainly rather than guessing.\n\n' +
+      `Question: ${question}`,
+    )
+  } finally {
+    clearTimeout(timer)
+    signal?.removeEventListener('abort', onAbort)
+  }
+  const answer = session.getLastAssistantText()?.trim() || '(no answer produced)'
+  session.dispose()
+  return { answer }
 }

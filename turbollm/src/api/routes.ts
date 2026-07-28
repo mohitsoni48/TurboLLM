@@ -1559,10 +1559,11 @@ export function registerApi(app: Hono, d: Deps): void {
       tavilyApiKey?: string
       search?: { provider?: string; tavilyApiKey?: string; kagiApiKey?: string; searxngUrl?: string }
       build?: { toolchainDirs?: string[] }
+      code?: { agentsMdProjectCandidates?: string[]; agentsMdGlobalCandidates?: string[] }
       toolPolicies?: Record<string, string>
       autoAllowAll?: boolean
       cloudDeploy?: { runpodTemplateId?: string }
-      experimental?: { memory?: boolean; code?: boolean; cloudDeploy?: boolean }
+      experimental?: { memory?: boolean; cloudDeploy?: boolean }
     }>(c)
 
     const updates: Record<string, unknown> = {}
@@ -1688,6 +1689,30 @@ export function registerApi(app: Hono, d: Deps): void {
       toolchainDirs = dirs
     }
 
+    // AGENTS.md candidate lists (Code's standing-context injection, persona.ts) — the OPPOSITE
+    // constraint from toolchainDirs: must be RELATIVE, not absolute. Clean-400 convenience only;
+    // persona.ts containment-checks each entry again at read time regardless (see config.ts's
+    // CodeConfig doc comment for why route-level validation alone isn't the real boundary).
+    const MAX_AGENTS_MD_CANDIDATES = 8
+    let agentsMdProjectCandidates: string[] | undefined
+    let agentsMdGlobalCandidates: string[] | undefined
+    for (const [key, out] of [
+      ['agentsMdProjectCandidates', (v: string[]) => { agentsMdProjectCandidates = v }],
+      ['agentsMdGlobalCandidates', (v: string[]) => { agentsMdGlobalCandidates = v }],
+    ] as const) {
+      const raw = b.code?.[key]
+      if (raw === undefined) continue
+      if (!Array.isArray(raw)) return err(c, 400, 'invalid_config_value', `code.${key} must be an array of filenames.`)
+      const list = raw.map((p) => String(p).trim()).filter(Boolean)
+      if (list.length > MAX_AGENTS_MD_CANDIDATES) return err(c, 400, 'invalid_config_value', `code.${key}: at most ${MAX_AGENTS_MD_CANDIDATES} candidates.`)
+      for (const entry of list) {
+        if (/^([a-zA-Z]:[\\/]|[\\/])/.test(entry)) {
+          return err(c, 400, 'invalid_config_value', `code.${key}: "${entry}" must be a relative filename/path, not absolute.`)
+        }
+      }
+      out(list)
+    }
+
     // Tool-call approval gate: global per-tool policy map. Validate every value is
     // one of 'ask' | 'allow' | 'deny' so a garbled patch gets a clean 400, not a
     // silently-dropped/garbage config.
@@ -1713,6 +1738,8 @@ export function registerApi(app: Hono, d: Deps): void {
       Object.assign(cfg.comfyui, cuUpdates)
       Object.assign(cfg.gateway, gwUpdates)
       if (toolchainDirs !== undefined) cfg.build.toolchainDirs = toolchainDirs
+      if (agentsMdProjectCandidates !== undefined) cfg.code.agentsMdProjectCandidates = agentsMdProjectCandidates
+      if (agentsMdGlobalCandidates !== undefined) cfg.code.agentsMdGlobalCandidates = agentsMdGlobalCandidates
       if (toolPolicies !== undefined) cfg.tools.toolPolicies = toolPolicies
       if (b.autoAllowAll !== undefined) cfg.tools.autoAllowAll = !!b.autoAllowAll
       if (b.autoLoadOnStart !== undefined) cfg.autoLoadOnStart = !!b.autoLoadOnStart
@@ -1728,7 +1755,6 @@ export function registerApi(app: Hono, d: Deps): void {
       // the other back to whatever `updates.experimental` would otherwise silently overwrite it
       // with (same reasoning as cloudDeploy's own per-field handling just above).
       if (b.experimental?.memory !== undefined) cfg.daemon.experimental.memory = !!b.experimental.memory
-      if (b.experimental?.code !== undefined) cfg.daemon.experimental.code = !!b.experimental.code
       if (b.experimental?.cloudDeploy !== undefined) cfg.daemon.experimental.cloudDeploy = !!b.experimental.cloudDeploy
       // HF token (spec 10 §4): write-only. An explicit '' clears it. Never logged.
       if (b.hfToken !== undefined) cfg.hf.token = String(b.hfToken).trim()
@@ -1857,13 +1883,17 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   // ── network info (spec 08 §2): LAN expose state + the reachable LAN URL + whether
-  // an API key exists (non-local access requires one).
+  // an API key exists (non-local access requires one). `requireApiKey` + `isHost` (added
+  // alongside the /api/v1/keys host gate above) let the UI honestly reflect that same rule
+  // instead of just hiding a button while the underlying route is still reachable.
   app.get('/api/v1/settings/network', (c) => {
     const cfg = d.store.snapshot()
     return c.json({
       lanBind: cfg.daemon.lanBind,
       lanUrl: `http://${getLanIp()}:${cfg.daemon.port}`,
       hasApiKey: cfg.apiKeys.length > 0,
+      requireApiKey: cfg.daemon.requireApiKey,
+      isHost: isLocalRequest(c, d),
     })
   })
 
@@ -2033,7 +2063,20 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   // ── API keys (spec 06 §5) ────────────────────────────────────────────────
+  // Host-only while the LAN is open and unauthenticated (lanBind on, requireApiKey off):
+  // lanAuth's bypassesAuth deliberately lets that combination through with NO credential at
+  // all (spec 06 §5's "opted into open LAN access"), which is fine for chat/models but would
+  // let any device that can merely load the page list key names or mint itself a durable
+  // `tllm-...` key with zero credential — a real self-escalation (that key keeps working even
+  // after requireApiKey is later turned on), not just an info leak. Once requireApiKey IS on,
+  // a non-host caller only reaches this handler at all by already having presented a valid key
+  // (lanAuth ran first), so self-service key management from another device is fine then.
+  function keysHostGate(c: Context): boolean {
+    return isLocalRequest(c, d) || d.store.snapshot().daemon.requireApiKey
+  }
+
   app.get('/api/v1/keys', (c) => {
+    if (!keysHostGate(c)) return err(c, 403, 'forbidden', 'API keys are only visible from this machine until "Require an API key" is turned on.')
     const keys = d.store.snapshot().apiKeys.map(({ id, name, prefix, createdAt, lastUsedAt }) => ({
       id,
       name,
@@ -2045,6 +2088,7 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   app.post('/api/v1/keys', async (c) => {
+    if (!keysHostGate(c)) return err(c, 403, 'forbidden', 'API keys can only be created from this machine until "Require an API key" is turned on.')
     const b = await body<{ name?: string }>(c)
     const name = (b.name ?? '').trim()
     if (!name) return err(c, 400, 'invalid_config_value', 'name is required.')
@@ -2065,6 +2109,11 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   app.delete('/api/v1/keys/:id', (c) => {
+    // Same host gate as GET/POST above (found missing here in the v1.9.0 pre-release review):
+    // without it, a non-host device on an open, unauthenticated LAN could revoke ANY key by id —
+    // breaking another device's already-configured access — protected by nothing but an
+    // unguessable UUID rather than an actual credential check.
+    if (!keysHostGate(c)) return err(c, 403, 'forbidden', 'API keys can only be revoked from this machine until "Require an API key" is turned on.')
     const id = c.req.param('id')
     d.store.update((cfg) => {
       cfg.apiKeys = cfg.apiKeys.filter((k) => k.id !== id)
@@ -2073,7 +2122,15 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   // ── CLI connect snippets (spec 06 §6) ────────────────────────────────────
+  // Same host gate as /api/v1/keys above, and for the same reason — arguably more urgent here:
+  // this route doesn't just expose existing key metadata, it MINTS a brand-new live key (below)
+  // and returns its full raw value embedded in the setup snippets on every single call while
+  // lanBind is on, with no action beyond loading the page (ConnectSection queries it eagerly for
+  // the default-selected CLI). Ungated, a non-host viewer on an open, unauthenticated LAN could
+  // get a real credential just by opening Developer — worse than the list/create case, since it
+  // requires no explicit "create" click at all.
   app.get('/api/v1/connect/:cli', (c) => {
+    if (!keysHostGate(c)) return err(c, 403, 'forbidden', 'Connect setup is only available from this machine until "Require an API key" is turned on.')
     const cli = c.req.param('cli')
     const cfg = d.store.snapshot()
     const { port, lanBind } = cfg.daemon
@@ -2219,6 +2276,9 @@ function settingsPayload(d: Deps) {
     // Build environment (ADR-100): folders prepended to PATH for compile-from-source so a
     // conda-env / custom-path CUDA Toolkit + compiler are found. Not secret — echoed back.
     build: { toolchainDirs: cfg.build.toolchainDirs },
+    // Code's AGENTS.md-style standing-context candidate lists (config.ts's CodeConfig):
+    // not secret — echoed back.
+    code: cfg.code,
     // Cloud Launch deploy-link settings (ADR-153): not secret — echoed back.
     cloudDeploy: cfg.cloudDeploy,
     // Experimental feature flags (2026-07-14): not secret — echoed back for Settings →

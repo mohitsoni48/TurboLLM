@@ -8,6 +8,7 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { Skill } from '../agents/skills'
+import { isContainedFromRoot } from './containment'
 
 export type CodeMode = 'auto' | 'plan' | 'ask'
 
@@ -34,13 +35,34 @@ const MAX_SKILL_INSTRUCTIONS_CHARS = 20_000
 // the ~157K-token full-instructions bug this replaced either way.
 const MAX_SKILL_CATALOG_CHARS = 16_000
 
+// Same safety-cap style as the two skill budgets above, applied to a single AGENTS.md-style
+// file — this repo's own CLAUDE.md is ~8.7K chars, so 20K gives real headroom without being
+// unbounded. A user-configured candidate PATH (config.code.agentsMd*Candidates, config.ts) makes
+// this genuinely reachable now, where the old hardcoded 'AGENTS.md'/'agents.md' literals never
+// pointed anywhere pathological.
+const MAX_AGENTS_MD_CHARS = 20_000
+// Bounds the configured candidate list itself, so a pathological config can't turn every turn
+// into dozens of stat() calls per side.
+const MAX_AGENTS_MD_CANDIDATES = 8
+
+// Built-in fallback candidate lists — used whenever a caller doesn't pass its own (existing call
+// sites/tests all rely on this). Solves the common "this repo uses CLAUDE.md, not AGENTS.md" case
+// (this very repo included) with zero configuration: CLAUDE.md is already a candidate. First
+// EXISTING match wins per side — not a merge/concatenation — mirroring "CLAUDE.md instead of
+// AGENTS.md," not "CLAUDE.md as well as." Includes both AGENTS.md/agents.md casings on each side
+// (not just the historical per-side casing) so a case-sensitive filesystem (Linux, case-sensitive
+// APFS) doesn't silently drop a file Windows/default-macOS would have picked up.
+export const DEFAULT_AGENTS_MD_PROJECT_CANDIDATES = ['AGENTS.md', 'agents.md', 'CLAUDE.md']
+export const DEFAULT_AGENTS_MD_GLOBAL_CANDIDATES = ['agents.md', 'AGENTS.md', 'CLAUDE.md']
+
 /** Short product persona framing. */
 export function basePersona(): string {
   return [
     'You are TurboLLM Code, a coding agent running fully locally on the user\'s own machine.',
     'You are working inside a single project directory. Keep changes tightly scoped to the task,',
     'prefer the smallest correct edit, and explain what you changed and why in your final reply.',
-    'You cannot access anything outside the project directory — file tools are confined to it.',
+    'You may read files anywhere on the machine (e.g. a sibling repo or shared library) if it',
+    'helps the task, but edits and new files are confined to this project directory.',
   ].join(' ')
 }
 
@@ -215,53 +237,93 @@ export function skillCatalogBlock(skills: Skill[]): string {
   return header + lines.join('\n') + footer
 }
 
-/** Reads one AGENTS.md-style file, trimmed. Missing file, permission error, or a path that
- *  isn't a plain file are all treated the same way — silently absent, not a failure. This
- *  block is optional standing context (like OpenCode's AGENTS.md convention), never something
- *  that should block a turn from running just because a file is unreadable. */
+/** Reads one AGENTS.md-style file, trimmed and capped at MAX_AGENTS_MD_CHARS. Missing file,
+ *  permission error, or a path that isn't a plain file are all treated the same way — silently
+ *  absent, not a failure. This block is optional standing context (like OpenCode's AGENTS.md
+ *  convention), never something that should block a turn from running just because a file is
+ *  unreadable. */
 function readAgentsFile(path: string): string | null {
   try {
     const text = readFileSync(path, 'utf8').trim()
-    return text || null
+    if (!text) return null
+    return text.length > MAX_AGENTS_MD_CHARS ? text.slice(0, MAX_AGENTS_MD_CHARS) : text
   } catch {
     return null
   }
 }
 
-/** Whether a project (`<repoRoot>/AGENTS.md`) and/or global (`<globalDir>/agents.md`) AGENTS.md
- *  file is actually present — for the loaded-resources header (ADR-262), which needs a boolean per
- *  file, not the injected prompt text `agentsMdBlock` returns. Uses the exact same lookup +
- *  whitespace-only-counts-as-absent rule as `agentsMdBlock`, so "present here" always matches
- *  "actually injected into the prompt." Cheap (two small reads); safe to call per session-detail
- *  request. */
-export function agentsMdPresence(repoRoot: string, globalDir: string): { project: boolean; global: boolean } {
+/** Tries each candidate filename against `root`, IN ORDER — the first candidate that is
+ *  containment-checked in-bounds AND resolves to a readable, non-whitespace file wins; the rest
+ *  are never even read. First-existing-wins, not a merge of every match (see the default lists'
+ *  own comment for why). A candidate that isn't relative or escapes `root` (absolute path, `..`
+ *  traversal, a symlink escape) is skipped exactly like a missing file — silent, never throws —
+ *  since this is the one thing that turns a previously hardcoded-safe read into a
+ *  user-configurable one; `isContainedFromRoot` is the same primitive every real tool call
+ *  (read/edit/write/grep/find/ls) is already checked against. */
+function resolveAgentsFile(root: string, candidates: string[]): { name: string; text: string } | null {
+  for (const entry of candidates.slice(0, MAX_AGENTS_MD_CANDIDATES)) {
+    if (!isContainedFromRoot(entry, root)) continue
+    const text = readAgentsFile(join(root, entry))
+    if (text !== null) return { name: entry, text }
+  }
+  return null
+}
+
+/** Whether a project and/or global AGENTS.md-style file is actually present — for the
+ *  loaded-resources header (ADR-262), which needs a boolean per side, not the injected prompt
+ *  text `agentsMdBlock` returns. Uses the exact same resolution + whitespace-only-counts-as-absent
+ *  rule as `agentsMdBlock`, so "shown loaded" always matches "actually injected into the prompt."
+ *  Cheap; safe to call per session-detail request. Candidate lists default to the built-ins so
+ *  every existing call site keeps working unchanged. Deliberately still {project, global} booleans
+ *  only, NOT the resolved filename — showing which candidate actually matched is a real header UX
+ *  improvement but touches ADR-262's shipped surface across several files, so it needs its own
+ *  vetting pass rather than riding along with this change. */
+export function agentsMdPresence(
+  repoRoot: string,
+  globalDir: string,
+  projectCandidates: string[] = DEFAULT_AGENTS_MD_PROJECT_CANDIDATES,
+  globalCandidates: string[] = DEFAULT_AGENTS_MD_GLOBAL_CANDIDATES,
+): { project: boolean; global: boolean } {
   return {
-    project: readAgentsFile(join(repoRoot, 'AGENTS.md')) !== null,
-    global: readAgentsFile(join(globalDir, 'agents.md')) !== null,
+    project: resolveAgentsFile(repoRoot, projectCandidates) !== null,
+    global: resolveAgentsFile(globalDir, globalCandidates) !== null,
   }
 }
 
-/** `<repoRoot>/AGENTS.md` (project-level, the user's own repo) and `<globalDir>/agents.md`
- *  (global — TurboLLM's own data dir, e.g. `~/.turbollm/agents.md`), like OpenCode's AGENTS.md
- *  convention: standing project/user instructions picked up automatically, no per-session setup.
- *  Global comes first (broader, user-wide defaults), then project (more specific, overrides in
- *  spirit if they conflict — same "more specific wins" reading order the rest of this file's
- *  guidance already follows: persona → mode → edit rules → skills → these). Neither file is
- *  required to exist; this returns '' when there's nothing to add. */
-export function agentsMdBlock(repoRoot: string, globalDir: string): string {
-  const global = readAgentsFile(join(globalDir, 'agents.md'))
-  const project = readAgentsFile(join(repoRoot, 'AGENTS.md'))
+/** Project-level (`<repoRoot>/<first matching candidate>`) and global (`<globalDir>/<first
+ *  matching candidate>`) standing instructions, like OpenCode's AGENTS.md convention — picked up
+ *  automatically, no per-session setup. Global comes first (broader, user-wide defaults), then
+ *  project (more specific, overrides in spirit if they conflict — same "more specific wins"
+ *  reading order the rest of this file's guidance already follows: persona → mode → edit rules →
+ *  skills → these). Neither side is required to exist; this returns '' when nothing resolves.
+ *  Candidate lists default to the built-ins so every existing call site keeps working unchanged. */
+export function agentsMdBlock(
+  repoRoot: string,
+  globalDir: string,
+  projectCandidates: string[] = DEFAULT_AGENTS_MD_PROJECT_CANDIDATES,
+  globalCandidates: string[] = DEFAULT_AGENTS_MD_GLOBAL_CANDIDATES,
+): string {
+  const global = resolveAgentsFile(globalDir, globalCandidates)
+  const project = resolveAgentsFile(repoRoot, projectCandidates)
   const parts: string[] = []
-  if (global) parts.push(`## Global instructions (~/.turbollm/agents.md)\n\n${global}`)
-  if (project) parts.push(`## Project instructions (AGENTS.md)\n\n${project}`)
+  if (global) parts.push(`## Global instructions (~/.turbollm/${global.name})\n\n${global.text}`)
+  if (project) parts.push(`## Project instructions (${project.name})\n\n${project.text}`)
   if (parts.length === 0) return ''
   return 'The user has provided the following standing instructions for this project — follow them:\n\n' + parts.join('\n\n---\n\n')
 }
 
 /** The full append-prompt block for a session, in order. `skills` defaults to empty and
  *  `agentsMd` defaults to omitted so every existing call site (and test) that doesn't pass them
- *  keeps today's exact output. */
-export function buildAppendPrompt(mode: CodeMode, skills: Skill[] = [], agentsMd?: { repoRoot: string; globalDir: string }, hasWebTools = false): string[] {
+ *  keeps today's exact output. `agentsMd.projectCandidates`/`globalCandidates` default to the
+ *  built-in lists (DEFAULT_AGENTS_MD_*_CANDIDATES) when omitted — a caller that resolves them
+ *  from config (code-session.ts) should read `d.store.snapshot().code` fresh at call time, not
+ *  cache them, so a changed setting takes effect on the session's next turn. */
+export function buildAppendPrompt(
+  mode: CodeMode,
+  skills: Skill[] = [],
+  agentsMd?: { repoRoot: string; globalDir: string; projectCandidates?: string[]; globalCandidates?: string[] },
+  hasWebTools = false,
+): string[] {
   const blocks = [basePersona(), modeGuidance(mode)]
   // Read-only plan mode has no edit tool, so the edit/LSP guidance is irrelevant there — install_lsp
   // is still registered in plan mode, but pre-warming a server with nothing to attach diagnostics
@@ -279,7 +341,12 @@ export function buildAppendPrompt(mode: CodeMode, skills: Skill[] = [], agentsMd
   const catalog = skillCatalogBlock(skills)
   if (catalog) blocks.push(catalog)
   if (agentsMd) {
-    const agents = agentsMdBlock(agentsMd.repoRoot, agentsMd.globalDir)
+    const agents = agentsMdBlock(
+      agentsMd.repoRoot,
+      agentsMd.globalDir,
+      agentsMd.projectCandidates ?? DEFAULT_AGENTS_MD_PROJECT_CANDIDATES,
+      agentsMd.globalCandidates ?? DEFAULT_AGENTS_MD_GLOBAL_CANDIDATES,
+    )
     if (agents) blocks.push(agents)
   }
   return blocks

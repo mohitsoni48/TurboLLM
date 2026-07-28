@@ -213,7 +213,12 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
       // with the SAME lookup persona.ts injects into the prompt, so "shown as loaded" == "actually
       // fed to the model". Both false when the session has no repoRoot.
       hasAgentsMd: run.repoRoot
-        ? agentsMdPresence(run.repoRoot, d.store.dir())
+        ? agentsMdPresence(
+          run.repoRoot,
+          d.store.dir(),
+          d.store.snapshot().code.agentsMdProjectCandidates,
+          d.store.snapshot().code.agentsMdGlobalCandidates,
+        )
         : { project: false, global: false },
     })
   })
@@ -444,7 +449,19 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
     if (!run.repoRoot) return err(c, 400, 'invalid_input', 'Session has no repo root.')
     if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop or wait for the current run before reverting.')
     if (run.clearedUpToMessageId) return err(c, 409, 'session_cleared', 'Resume this session before reverting — it currently has cleared messages pending.')
-    if (run.revertedFromMessageId) return err(c, 409, 'session_reverted', 'Resume this session before reverting again — it already has a reverted message pending.')
+    // A second revert while one is already pending SUPERSEDES it rather than 409ing (founder
+    // feedback, 2026-07-24 — the earlier hard stop cost real friction on "revert, try again,
+    // doesn't work, revert further back", a common iterative-debugging pattern). Safe by
+    // construction, not just by convention: the revert affordance only ever renders on a message
+    // getMessages() actually returned, which filters is_active=1 — so any messageId this handler
+    // receives is necessarily STILL ACTIVE, which by definition means it sits BEFORE the current
+    // revertedFromMessageId cut (that cut and everything after it is already is_active=0 and thus
+    // unreachable through the normal UI). "Revert again" can therefore only ever mean "revert
+    // further back," never forward into already-hidden history — deactivateMessagesFrom below is
+    // idempotent-safe to call again with an earlier cutoff.
+    // /compact and /clear keep their own hard stop while reverted (line 381 above, and the
+    // clearedUpToMessageId guard above) — losing hidden history to a compaction/clear is a bigger,
+    // less-reversible deal than superseding one revert cursor with another.
     const conv = db.getConversation(run.convId, true)
     if (!conv) return err(c, 404, 'not_found', 'Session conversation not found.')
 
@@ -459,8 +476,16 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
     let revertedFiles: string[] = []
     let failedFiles: string[] = []
     if (b.revertFiles) {
-      const idx = messages.findIndex((m) => m.id === messageId)
-      const result = revertFileEdits(messages.slice(idx), run.repoRoot)
+      // NOT messages.slice(idx) — `messages` came from getConversation's is_active=1 filter, so
+      // it silently EXCLUDES any range a PRIOR revert already deactivated. Superseding a prior
+      // chat-only revert (revertFiles=false) with a further-back one that DOES ask for file
+      // reverts must still reach that earlier range's edit patches, or files it touched are
+      // silently left edited on disk while the success toast below claims otherwise (found in
+      // Opus PR review, pre-release gate for v1.9.0). getMessagesFromIncludingInactive walks the
+      // real seq-ordered row range regardless of is_active — the same range deactivateMessagesFrom
+      // itself operates on below.
+      const rangeMessages = db.getMessagesFromIncludingInactive(run.convId, messageId)
+      const result = revertFileEdits(rangeMessages, run.repoRoot)
       revertedFiles = result.reverted
       failedFiles = result.failed
     }

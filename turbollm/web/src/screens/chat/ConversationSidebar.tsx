@@ -29,7 +29,6 @@ import { Skeleton } from '../../components/ui/skeleton'
 import { useArchiveCodeSession, useCodeSessionRename, useCodeSessions, useDeleteCodeSession } from '../../lib/code-queries'
 import type { CodeSession, CodeSessionFilter, SessionStatus } from '../../lib/code-types'
 import { ApiError } from '../../lib/api'
-import { useSettings } from '../../lib/queries'
 
 /** localStorage key for the client-only "confirm before deleting a conversation"
  *  preference (mirrors SettingsScreen). Default ON when unset. */
@@ -298,11 +297,6 @@ export function ConversationSidebar({
   // never both at once. Route is the single source of truth for which is active
   // (kept in sync with the Chat|Code pill in CodeHomeScreen's own header).
   const isCodeMode = pathname.startsWith('/workspace/code')
-  // Code is an experimental feature (2026-07-14, Settings → Experimental), off by default —
-  // hides the Code pill entirely rather than showing it disabled/locked (founder's chosen
-  // behavior). If the flag is off WHILE already viewing Code (turned off mid-session), the
-  // pill just won't render on the next paint — App.tsx's route guard handles navigating away.
-  const codeExperimentalEnabled = useSettings().query.data?.experimental?.code ?? false
   // Switching modes restores whatever conversation/session was last open in the OTHER
   // mode, instead of always resetting to that mode's list/launchpad root.
   const lastChatConvId = readLastChatConvId()
@@ -490,10 +484,7 @@ export function ConversationSidebar({
       {/* Mode switch (Chat|Code) — mirrors the pill in CodeHomeScreen's own header,
           kept in sync via the route (isCodeMode above). Lets the user flip modes
           from the sidebar itself, not just the main content header. This replaced
-          the old single-purpose "Code · preview" footer link. Hidden entirely (not just the
-          Code side) when Code is experimentally disabled — a two-way switcher with only one
-          reachable option is pointless UI; the sidebar just shows plain Chat content instead. */}
-      {codeExperimentalEnabled && (
+          the old single-purpose "Code · preview" footer link. */}
       <div className="px-3 pt-3">
         <div className="flex overflow-hidden rounded-lg border border-border" role="group" aria-label="Workspace mode">
           {isCodeMode ? (
@@ -530,7 +521,6 @@ export function ConversationSidebar({
           )}
         </div>
       </div>
-      )}
 
       <div className="flex items-center gap-2 px-3 pb-3 pt-2">
         {onToggle && (

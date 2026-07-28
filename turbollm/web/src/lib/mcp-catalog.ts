@@ -174,6 +174,16 @@ export const CLOUD_MCPS: CloudEntry[] = [
     url: 'https://mcp.mixpanel.com/mcp',
     keyNote: 'Create a service account at mixpanel.com → Settings → Service Accounts, then run: echo -n "username:secret" | base64 — and paste "Basic <that-base64>" here (include the word Basic).',
   },
+  {
+    id: 'firecrawl',
+    name: 'Firecrawl',
+    cat: 'Automation',
+    desc: 'Scrape, crawl, and search the live web into clean, LLM-ready pages.',
+    auth: 'key',
+    color: '#fa5d19',
+    url: 'https://mcp.firecrawl.dev/v2/mcp',
+    keyNote: 'Get an API key at firecrawl.dev → API Keys. A keyless tier works for basic scrape/search, but crawl/extract/agent tools and higher limits need a key.',
+  },
 ]
 
 export const LOCAL_MCPS: LocalEntry[] = [
@@ -373,6 +383,17 @@ export const LOCAL_MCPS: LocalEntry[] = [
       { key: 'COMFYUI_URL', desc: 'ComfyUI server URL (default: http://127.0.0.1:8188)', required: false },
       { key: 'CIVITAI_API_TOKEN', desc: 'For downloading models from CivitAI', required: false },
       { key: 'HUGGINGFACE_TOKEN', desc: 'For downloading models from Hugging Face', required: false },
+    ],
+  },
+  {
+    id: 'context7',
+    name: 'Context7',
+    cat: 'AI',
+    desc: 'Up-to-date, version-specific docs and code examples for any library.',
+    cmd: 'npx -y @upstash/context7-mcp',
+    iconSlug: 'upstash',
+    envs: [
+      { key: 'CONTEXT7_API_KEY', desc: 'Optional — from context7.com/dashboard for higher rate limits', required: false },
     ],
   },
 ]
