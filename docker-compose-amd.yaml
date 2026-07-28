@@ -8,6 +8,12 @@ services:
     ports:
       - "6996:6996"
     volumes:
+      # Persists config.json, the chat SQLite DB, downloaded engines/models, and logs
+      # across container restarts/rebuilds (this is ~/.turbollm inside the container).
+      # NOTE: the image seeds daemon.lanBind=true in this config.json, so the daemon's
+      # default requireApiKey behavior actually enforces on this exposed port. Don't
+      # flip lanBind back to false while this port is published — that reopens the
+      # port to unauthenticated access.
       - turbollm-data:/root/.turbollm
 
     # --- AMD GPU passthrough (ROCm) ---
@@ -35,4 +41,3 @@ services:
 volumes:
   turbollm-data:
     name: turbollm-data
-    

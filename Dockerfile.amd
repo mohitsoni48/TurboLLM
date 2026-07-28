@@ -49,10 +49,18 @@ COPY --from=build /src/node_modules ./node_modules
 # Create models folder
 RUN mkdir -p /root/.turbollm/models
 # Define the model path
+# lanBind must be true here: the container always binds 0.0.0.0 (see CMD below), and
+# --addr alone does not set this flag (src/cli.ts) — without it, src/auth.ts's
+# bypassesAuth() treats the daemon as loopback-only and skips the API key check even
+# though the port is published to the host/LAN.
 RUN echo '{ \
       "modelDirs": [ \
         "/root/.turbollm/models" \
-      ] \
+      ], \
+      "daemon": { \
+        "lanBind": true, \
+        "requireApiKey": true \
+      } \
     }' > /root/.turbollm/config.json
 
 # Force the GPU backend during the image build.
