@@ -102,7 +102,7 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
   const onCloseRef = useRef(onClose)
   onCloseRef.current = onClose
 
-  const { send, sendResize, ws } = useTerminalConnection(terminalId, {
+  const { send, sendResize } = useTerminalConnection(terminalId, {
     onClose: (code, reason) => {
       if (code !== 1000) {
         toast.warning(`Terminal connection closed: ${reason || code}`)
@@ -111,6 +111,13 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     onError: () => {
       toast.error('Terminal connection error.')
     },
+    // PTY output → xterm display. Passed straight through to useTerminalConnection, which
+    // attaches this as ws.onmessage synchronously at connect() time — NOT via our own effect
+    // keyed on a returned `ws` value (that used to be how this worked, and it raced: the
+    // server's scrollback replay can arrive before such an effect gets a chance to run,
+    // silently dropping it — see the hook's own doc comment for the full trace of the live
+    // "terminal goes blank on switching, fixes itself a few switches later" bug this closes).
+    onMessage: (data) => terminalRef.current?.write(data),
   })
 
   // Lets CodeSessionScreen drive the CLI's own commands (e.g. `/model`, to switch models
@@ -120,21 +127,6 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
   useImperativeHandle(ref, () => ({
     sendCommand: (command: string) => send(`${command}\r`),
   }), [send])
-
-  // PTY output → xterm display. This is the OTHER half of the bridge — term.onData
-  // (below) already sends keystrokes TO the PTY, but incoming WebSocket messages were
-  // never written back to the terminal, so the screen stayed permanently blank no
-  // matter what ran server-side. `ws` is a new WebSocket instance per (re)connect, so
-  // this must re-attach onmessage whenever it changes.
-  useEffect(() => {
-    if (!ws) return
-    const handler = (ev: MessageEvent) => {
-      const data = typeof ev.data === 'string' ? ev.data : ''
-      if (data) terminalRef.current?.write(data)
-    }
-    ws.addEventListener('message', handler)
-    return () => ws.removeEventListener('message', handler)
-  }, [ws])
 
   useEffect(() => {
     if (!containerRef.current) return

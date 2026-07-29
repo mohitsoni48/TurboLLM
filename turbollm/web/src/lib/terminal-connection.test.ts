@@ -4,7 +4,8 @@
 // but a hard failure from any genuinely non-local client (LAN/mobile), where codeAuth always
 // requires a key (auth.ts). Mirrors code-api.test.ts's localStorage/fetch stubbing.
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { createTerminalForSession, killTerminalForSession } from './terminal-connection'
+import { renderHook } from '@testing-library/react'
+import { createTerminalForSession, killTerminalForSession, useTerminalConnection } from './terminal-connection'
 import { setAuthToken } from './api'
 import { isCodeAuthNeeded, clearCodeAuthNeeded } from './auth-signal'
 
@@ -89,5 +90,78 @@ describe('killTerminalForSession', () => {
       '/api/v1/code/sessions/sess-1/terminal/kill',
       expect.objectContaining({ headers: expect.objectContaining({ 'X-TurboLLM-Auth': 'my-secret-key' }) }),
     )
+  })
+})
+
+// ── useTerminalConnection: onMessage must never race the WebSocket's own open/message events ──
+// Regression for a real, live bug: onmessage used to be attached by the CALLER (TerminalView.tsx)
+// in a separate effect keyed on this hook's returned `ws` value, which only updates on React's
+// NEXT re-render after `onopen` (itself scheduled, not synchronous with the socket's own event
+// dispatch). The server sends its scrollback replay essentially the instant the connection
+// completes — if that message arrived before the caller's effect got a chance to attach a
+// listener, it was silently dropped. Symptom reported live: a Code-session terminal going blank
+// on switching sessions, then working again a few switches later (a race that sometimes loses).
+// Fixed by attaching onmessage synchronously inside connect(), in the SAME block as onopen/
+// onclose/onerror — this test proves a message dispatched in the same synchronous call as open
+// (the worst case for the old race) still reaches the caller.
+
+class FakeWebSocket {
+  static readonly CONNECTING = 0
+  static readonly OPEN = 1
+  static readonly CLOSING = 2
+  static readonly CLOSED = 3
+  readonly CONNECTING = 0
+  readonly OPEN = 1
+  readonly CLOSING = 2
+  readonly CLOSED = 3
+  readyState = FakeWebSocket.CONNECTING
+  onopen: (() => void) | null = null
+  onmessage: ((ev: { data: string }) => void) | null = null
+  onclose: ((ev: { code: number; reason: string }) => void) | null = null
+  onerror: (() => void) | null = null
+  send = vi.fn()
+  close = vi.fn()
+  constructor(public url: string) {}
+
+  /** Test helper standing in for the real server behavior: the connection opens AND the
+   *  scrollback replay arrives in the same synchronous call — the exact worst case the old
+   *  race needed luck to avoid. */
+  openThenImmediatelyMessage(data: string): void {
+    this.readyState = FakeWebSocket.OPEN
+    this.onopen?.()
+    this.onmessage?.({ data })
+  }
+}
+
+describe('useTerminalConnection: onMessage race', () => {
+  it('delivers a message dispatched in the same synchronous call as open (no separate attach step needed)', () => {
+    let created: FakeWebSocket | null = null
+    vi.stubGlobal('WebSocket', class extends FakeWebSocket {
+      constructor(url: string) { super(url); created = this }
+    })
+
+    const onMessage = vi.fn()
+    renderHook(() => useTerminalConnection('term-1', { onMessage }))
+
+    expect(created).not.toBeNull()
+    created!.openThenImmediatelyMessage('scrollback replay content')
+
+    expect(onMessage).toHaveBeenCalledWith('scrollback replay content')
+  })
+
+  it('delivers every subsequent message too, not just the first', () => {
+    let created: FakeWebSocket | null = null
+    vi.stubGlobal('WebSocket', class extends FakeWebSocket {
+      constructor(url: string) { super(url); created = this }
+    })
+
+    const onMessage = vi.fn()
+    renderHook(() => useTerminalConnection('term-1', { onMessage }))
+
+    created!.openThenImmediatelyMessage('first')
+    created!.onmessage?.({ data: 'second' })
+    created!.onmessage?.({ data: 'third' })
+
+    expect(onMessage.mock.calls.map((c) => c[0])).toEqual(['first', 'second', 'third'])
   })
 })

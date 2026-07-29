@@ -19,6 +19,17 @@ interface UseTerminalConnectionOptions {
   onClose?: (code: number, reason: string) => void
   /** Called when a raw PTY error occurs. */
   onError?: (err: Event) => void
+  /** Called for every raw text frame the PTY sends (output + the scrollback replay the server
+   *  sends immediately on connect). Set as `ws.onmessage` synchronously inside connect() —
+   *  NOT via a caller-side effect keyed on the returned `ws` value. That used to be how this
+   *  worked, and it raced: the server sends the scrollback replay essentially the instant the
+   *  connection completes, but the returned `ws` value only updates on React's NEXT re-render
+   *  (triggered by `onopen`'s setState, itself scheduled — not synchronous with the WebSocket's
+   *  own event dispatch), so a caller's effect could attach its listener just after that first
+   *  message already fired with nothing listening. Found live: a Code-session terminal going
+   *  blank on switching, then working again a few switches later — exactly the signature of a
+   *  race that sometimes loses and sometimes doesn't. */
+  onMessage?: (data: string) => void
 }
 
 /**
@@ -60,6 +71,14 @@ export function useTerminalConnection(
     ws.onopen = () => {
       setState('connected')
       optionsRef.current.onConnect?.()
+    }
+
+    // Attached HERE, synchronously with the WebSocket's own creation — never via a later
+    // effect keyed on this hook's returned `ws` value (see onMessage's doc comment for the
+    // race that produced live).
+    ws.onmessage = (ev) => {
+      const data = typeof ev.data === 'string' ? ev.data : ''
+      if (data) optionsRef.current.onMessage?.(data)
     }
 
     ws.onclose = (ev) => {
