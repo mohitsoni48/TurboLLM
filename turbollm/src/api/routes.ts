@@ -54,6 +54,7 @@ import { DownloadError } from '../downloads/downloads'
 import { BenchError } from '../bench/bench'
 import { inferRepoFromPath } from './path-utils'
 import { screenshotArtifact, findChrome } from '../artifacts/screenshot'
+import { readQueue, remove as removeQueued } from '../telemetry/queue'
 
 type Status = 200 | 201 | 202 | 400 | 401 | 403 | 404 | 409 | 500 | 501 | 503
 
@@ -1880,6 +1881,20 @@ export function registerApi(app: Hono, d: Deps): void {
     const raw = (c.req.query('level') ?? '').trim()
     const level = ['off', 'anon', 'full'].includes(raw) ? raw : 'off'
     return c.json(telemetryPreview(level, d.version))
+  })
+
+  // Regenerate the anonymous machine id (ADR-299). The data contract promises
+  // this UUID is "not tied to identity; regeneratable" — that promise needs a
+  // control behind it, not just a sentence in the docs. Anything already queued
+  // is discarded: it carries the OLD id, so uploading it after a regenerate
+  // would link the two ids together and defeat the point.
+  app.post('/api/v1/telemetry/regenerate-id', (c) => {
+    const machineId = randomUUID()
+    d.store.update((cfg) => {
+      cfg.telemetry.machineId = machineId
+    })
+    for (const q of readQueue(d.store.dir())) removeQueued(d.store.dir(), q.file)
+    return c.json({ machineId })
   })
 
   // ── network info (spec 08 §2): LAN expose state + the reachable LAN URL + whether

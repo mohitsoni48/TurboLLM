@@ -36,6 +36,7 @@ import { createApp } from './server'
 import { provisionTunnelApiKey } from './auth'
 import { TunnelManager, reapStaleTunnels, killTrackedTunnelsSync } from './tunnel/manager'
 import type { Deps } from './deps'
+import { TELEMETRY_ENV } from './telemetry/disabled'
 
 // Stop child processes (the agent engine's shell tool, engine binaries, git,
 // etc.) from flashing a console window on Windows when the daemon has no console
@@ -93,6 +94,11 @@ function argValue(name: string, fallback: string): string {
   const i = process.argv.indexOf(name)
   return i >= 0 && i + 1 < process.argv.length ? process.argv[i + 1] : fallback
 }
+
+// `--no-telemetry` is expressed as the env var rather than a second code path,
+// so the flag and TURBOLLM_TELEMETRY can never disagree (ADR-299). Set before
+// anything reads it. One-way by design: it can only turn telemetry off.
+if (hasFlag('--no-telemetry')) process.env[TELEMETRY_ENV] = 'off'
 
 /** The daemon's configured port from config.json, falling back to the shipped
  *  default. Best-effort — a missing/invalid config yields the shipped default.
@@ -178,6 +184,9 @@ if (hasFlag('--help', '-h')) {
     `                 tunnel (Cloud Launch) — prints the public URL + a required\n` +
     `                 access token. For running TurboLLM on a rented cloud GPU box.\n` +
     `  --config <f>   Path to a custom config file\n` +
+    `  --no-telemetry Disable telemetry entirely, whatever this install's saved\n` +
+    `                 setting says (same as TURBOLLM_TELEMETRY=off). For CI,\n` +
+    `                 containers, and scripted daemons.\n` +
     `  --stop         Stop a running TurboLLM daemon and exit\n` +
     `  --help, -h     Show this help message\n\n` +
     `Examples:\n` +
