@@ -23,6 +23,7 @@ import type { Deps } from '../deps'
 import { createRequire } from 'node:module'
 import { isLocalUpgrade, verifyKeyValue } from '../auth'
 import { sessionAuth } from '../code/session-auth'
+import { claudePermissionModeChoices, resolveClaudePermissionMode } from './agent-modes'
 import { TerminalManager } from './terminal-manager'
 
 async function body<T>(c: Context): Promise<T> { try { return await c.req.json() as T } catch { return {} as T } }
@@ -49,17 +50,26 @@ const AGENT_SESSION_ID_FLAGS: Partial<Record<string, { first: string; resume: st
 /** Pure/exported so the resume-flag decision is unit-testable without a live PTY/daemon (mirrors
  *  code-session.ts's codeEventToFrame pattern). `sessionId` is always TurboLLM's own Code
  *  session id (run.id) — passed as the CLI's OWN session id too, so "which conversation to
- *  resume" is never ambiguous even when two Code sessions share a repoRoot. */
+ *  resume" is never ambiguous even when two Code sessions share a repoRoot.
+ *
+ *  `permissionMode` carries the session's TurboLLM mode (auto/plan/ask) across to the CLI's own
+ *  permission mode — already resolved to a value THIS CLI accepts by agent-modes.ts, which is why
+ *  it arrives as a string rather than being mapped here. Null/undefined appends nothing, so an
+ *  agent with no confirmed mapping (everything except claude) launches exactly as before.
+ *  Everything after `launch <agent>` that isn't one of our own flags is forwarded to the CLI
+ *  verbatim by cli.ts's passthrough filter — `--permission-mode` included. */
 export function buildTerminalLaunchCommand(
   agent: string,
   port: number,
   token: string,
   sessionId: string,
   launchedOnce: boolean,
+  permissionMode?: string | null,
 ): string {
   const flags = AGENT_SESSION_ID_FLAGS[agent]
   const sessionArg = flags ? ` ${launchedOnce ? flags.resume : flags.first} ${sessionId}` : ''
-  return `turbollm launch ${agent} --port ${port} --token ${token}${sessionArg}`
+  const modeArg = permissionMode ? ` --permission-mode ${permissionMode}` : ''
+  return `turbollm launch ${agent} --port ${port} --token ${token}${sessionArg}${modeArg}`
 }
 
 // ── types ──────────────────────────────────────────────────────────────
@@ -162,7 +172,16 @@ export function registerTerminalRoutes(app: Hono, d: Deps): void {
       // the CLI's OWN session id; any later one resumes that EXACT id, never "whatever this
       // directory's most recent conversation happens to be" (see buildTerminalLaunchCommand's
       // doc comment for the live bug that distinction fixes).
-      const launchCommand = buildTerminalLaunchCommand(agent, port, token, run.id, !!run.terminalLaunchedOnce)
+      // Start the CLI in the mode this session was created with (auto/plan/ask), rather than
+      // whatever the CLI defaults to. The mode lives on the conversation (`agent_mode`, the same
+      // column PATCH .../mode writes), so a mode changed before reopening applies to the next
+      // launch — a CLI can't be switched mid-session from out here.
+      const mode = d.db.getConversation(run.convId)?.agentMode ?? 'auto'
+      const permissionMode = resolveClaudePermissionMode(mode, await claudePermissionModeChoices())
+      const launchCommand = buildTerminalLaunchCommand(
+        agent, port, token, run.id, !!run.terminalLaunchedOnce,
+        agent === 'claude' ? permissionMode : null,
+      )
       const terminalId = m.create(run.repoRoot, run.id, cols, rows, launchCommand)
       if (!run.terminalLaunchedOnce) d.db.updateAgentRun(run.id, { terminalLaunchedOnce: true })
       return c.json({ terminalId }, 201)

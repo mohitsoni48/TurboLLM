@@ -44,3 +44,32 @@ test('buildTerminalLaunchCommand: an agent with no confirmed session-id flags st
   assert.equal(first, 'turbollm launch opencode --port 6996 --token tok-123')
   assert.equal(relaunch, 'turbollm launch opencode --port 6996 --token tok-123')
 })
+
+// ── mode inheritance (founder, 2026-07-29) ────────────────────────────────────
+// The session's TurboLLM mode has to reach the CLI, or picking "Plan first" and then launching
+// claude silently gave you whatever the CLI defaults to. The VALUE is resolved by agent-modes.ts
+// (which knows what the installed binary accepts); this only has to append it correctly.
+
+test('buildTerminalLaunchCommand: the session\'s permission mode rides along, after the session flag', () => {
+  const cmd = buildTerminalLaunchCommand('claude', 6996, 'tok-123', 'session-abc', false, 'plan')
+  assert.equal(
+    cmd,
+    'turbollm launch claude --port 6996 --token tok-123 --session-id session-abc --permission-mode plan',
+  )
+})
+
+test('buildTerminalLaunchCommand: a relaunch keeps carrying the mode', () => {
+  const cmd = buildTerminalLaunchCommand('claude', 6996, 'tok-123', 'session-abc', true, 'auto')
+  assert.ok(cmd.includes('--resume session-abc'))
+  assert.ok(cmd.endsWith('--permission-mode auto'))
+})
+
+test('buildTerminalLaunchCommand: no mode resolved means the flag is absent entirely, not empty', () => {
+  // An unmapped agent, or a CLI whose accepted values we couldn't determine, must launch exactly
+  // as it did before — never `--permission-mode` with a missing/blank value, which would make
+  // commander swallow the NEXT token as the mode.
+  for (const mode of [undefined, null, '']) {
+    const cmd = buildTerminalLaunchCommand('claude', 6996, 'tok', 'sess', false, mode as string | null | undefined)
+    assert.equal(cmd, 'turbollm launch claude --port 6996 --token tok --session-id sess')
+  }
+})

@@ -574,6 +574,17 @@ html.tllm-resizing .tllm-chat-sidebar {
 }
 *::-webkit-scrollbar-thumb:hover { background-color: var(--muted); }
 
+/* Code → terminal-agent sessions: the one deliberate exception to the universal rule above
+   (founder, 2026-07-29). That pane hosts a full-screen TUI which owns and repaints every cell
+   itself, so a scrollbar track riding on top of it reads as app chrome pushed INTO the terminal —
+   and while a TUI is in the alternate screen buffer there is nothing to scroll anyway. Scoped to
+   `.tllm-terminal` (TerminalView.tsx) rather than relaxing the app-wide rule, and beats it on
+   specificity. Only the visible bar goes: `overflow-y: scroll` stays, so wheel/trackpad scrolling
+   through the normal-buffer scrollback still works exactly as before. Measured side effect: the
+   viewport gets back the ~10px the thin bar was taking out of its client width. */
+.tllm-terminal .xterm-viewport { scrollbar-width: none; }
+.tllm-terminal .xterm-viewport::-webkit-scrollbar { width: 0; height: 0; display: none; }
+
 /* sonner toast tokens → our palette */
 [data-sonner-toaster] {
   --normal-bg: var(--panel);

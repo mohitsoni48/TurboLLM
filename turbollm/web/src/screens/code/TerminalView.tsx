@@ -235,5 +235,29 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     return () => window.removeEventListener('keydown', handler)
   }, [])
 
-  return <div ref={containerRef} className="min-h-0 flex-1 p-0" style={{ background: 'var(--term-bg)' }} />
+  // Horizontal padding matches TerminalToolbar's own `px-3 md:px-8` (founder, 2026-07-29: the CLI
+  // output sat flush against the window edge while everything below it was inset).
+  //
+  // It goes on a WRAPPER, not on the element xterm mounts into, and that distinction is load-
+  // bearing rather than cosmetic. FitAddon derives the column count from
+  // `getComputedStyle(terminal.element.parentElement).width`, subtracting only the padding of the
+  // `.xterm` element ITSELF. Under Tailwind's `box-sizing: border-box` that computed width is the
+  // BORDER box — measured in the live app: an 864px container with 32px gutters still reports
+  // `width: 864px`, not 800px. Padding the mount element directly therefore sizes the grid to
+  // space it doesn't have (~8 columns too many here) and the right edge is clipped, silently, only
+  // at md+ where the gutter is wide. With the padding one level out, the mount element's own box
+  // IS the available space and the arithmetic is right by construction. The ResizeObserver above
+  // watches that inner element, so crossing the `md` breakpoint re-fits like any other resize.
+  //
+  // Vertical stays 0 so the terminal still runs edge to edge into the toolbar's own border, and
+  // `--term-bg` sits on the wrapper so the gutter reads as part of the terminal, not a seam.
+  //
+  // `tllm-terminal` is the hook for the one place the app-wide scrollbar rule is overridden
+  // (index.css) — a TUI repaints the whole pane itself, so a scrollbar track on top of it reads as
+  // app chrome intruding. Wheel scrolling is unaffected; see that rule for the full reasoning.
+  return (
+    <div className="tllm-terminal flex min-h-0 flex-1 flex-col px-3 md:px-8" style={{ background: 'var(--term-bg)' }}>
+      <div ref={containerRef} className="min-h-0 flex-1" />
+    </div>
+  )
 })
