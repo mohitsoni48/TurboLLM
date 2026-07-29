@@ -141,6 +141,11 @@ export type Status = {
   engineProvision?: EngineProvision
   /** In-app compile-from-source status (ADR-100). */
   engineBuild?: EngineBuild
+  /** Whether this install can spawn a PTY at all — `node-pty` is an optional native dependency,
+   *  so a healthy install may simply not have it. Gates whether terminal-only Code agents are
+   *  offered at all. Optional here so an older daemon (which never sends it) is treated as
+   *  unknown by the caller rather than as a hard "unavailable". */
+  terminalAvailable?: boolean
   /** ComfyUI GPU coordination state (null when the feature is off / not wired). */
   comfyui?: ComfyRuntime | null
   /** Background agent tasks (reviewer + skill distill) — running + recently finished. */

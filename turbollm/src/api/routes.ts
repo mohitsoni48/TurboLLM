@@ -16,6 +16,7 @@ import { ProbeError, probe } from '../engines/probe'
 import { resolveServerBinary, suggestEngineName } from '../engines/scan'
 import { generateApiKey, isLocalRequest } from '../auth'
 import { enabledFeatures } from '../features'
+import { isTerminalBackendAvailable } from '../terminal/terminal-routes'
 import {
   LLAMA_BUILD,
   availableBackends,
@@ -111,6 +112,10 @@ export function registerApi(app: Hono, d: Deps): void {
       agentTasks: d.agentTasks?.list() ?? [],
       // In-app compile-from-source status (ADR-100): live phase + log tail while a build runs.
       engineBuild: d.build.get(),
+      // Whether this install can spawn a PTY at all (node-pty is an optional native dependency,
+      // so a healthy install may legitimately not have it). The Code agent picker reads this to
+      // decide whether a terminal-only agent is even offerable on this machine.
+      terminalAvailable: isTerminalBackendAvailable(),
       // ComfyUI GPU coordination: lets the UI explain a paused/unloaded engine.
       // Also expose the installed gate node version so the UI can prompt an upgrade.
       comfyui: (() => {

@@ -53,13 +53,15 @@
     "@xterm/xterm": "^6.0.0",
     "diff": "^9.0.0",
     "hono": "^4.6.0",
-    "node-pty": "^1.1.0",
     "puppeteer-core": "^23.11.1",
     "typebox": "1.1.38",
     "undici": "^7.0.0",
     "vscode-jsonrpc": "^9.0.1",
     "vscode-uri": "^3.1.0",
     "ws": "^8.21.1"
+  },
+  "optionalDependencies": {
+    "node-pty": "^1.1.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

@@ -1,5 +1,5 @@
 import { Check, ChevronDown, Terminal } from 'lucide-react'
-import { useSettings } from '../../lib/queries'
+import { useSettings, useStatus } from '../../lib/queries'
 import { ApiError } from '../../lib/api'
 import { toast } from '../../components/ui/sonner'
 import { cn } from '../../lib/utils'
@@ -16,9 +16,16 @@ import type { CodeAgent } from '../../lib/code-types'
 // they're withdrawn from the picker until their terminal integration is actually verified against
 // a real binary, rather than shipping a choice that half-works. Re-adding them is this list plus
 // nothing else. Same rule as the engine catalog: don't offer what isn't confirmed (ADR-239).
-const AGENTS: Array<{ id: CodeAgent; label: string; description: string }> = [
+//
+// `needsTerminal` marks an agent that can only run inside a PTY. `node-pty` is an OPTIONAL
+// dependency — it's a native module, and a failed build must not fail the install for everyone —
+// so npm skips it silently when no prebuild fits the platform/ABI, and a perfectly healthy install
+// can have no way to spawn a terminal at all. Those agents are hidden there rather than offered
+// and then failing at session-open, which is the same ADR-239 rule applied per machine instead of
+// per catalog.
+const ALL_AGENTS: Array<{ id: CodeAgent; label: string; description: string; needsTerminal?: boolean }> = [
   { id: 'turbollm', label: 'turbollm', description: 'The built-in chat agent — uses whatever model TurboLLM has loaded.' },
-  { id: 'claude', label: 'claude', description: 'Launches inside a full-screen terminal (turbollm launch claude).' },
+  { id: 'claude', label: 'claude', description: 'Launches inside a full-screen terminal (turbollm launch claude).', needsTerminal: true },
 ]
 
 /** Which coding agent NEW Code sessions launch with. Read once, at session creation
@@ -26,15 +33,24 @@ const AGENTS: Array<{ id: CodeAgent; label: string; description: string }> = [
  *  already-open session keeps whatever it was created with, same as its repoRoot. */
 export function CodeAgentSection() {
   const { query: settingsQ, save } = useSettings()
+  const statusQ = useStatus()
+  // Only a daemon that explicitly says `false` has no terminal backend. `undefined` means the
+  // daemon predates this flag, and every such build had node-pty as a hard dependency — so
+  // treating "unknown" as available is the accurate reading, not an optimistic one.
+  const terminalAvailable = statusQ.data?.terminalAvailable !== false
+  const agents = ALL_AGENTS.filter((a) => !a.needsTerminal || terminalAvailable)
   const current = settingsQ.data?.code?.defaultAgent ?? 'turbollm'
-  // A stored agent that is no longer listed (someone who had picked pi/opencode before they were
-  // withdrawn) must still be reported honestly: the daemon keeps honoring the saved value for new
-  // sessions, so falling back to AGENTS[0] here would label the trigger "turbollm" while Code
-  // actually launches pi. Show what is really set; the list below is what you can change it to.
-  const selected = AGENTS.find((a) => a.id === current) ?? {
+  // A stored agent that isn't in the offered list — someone who picked pi/opencode before they
+  // were withdrawn, or `claude` on a machine whose terminal backend didn't install — must still be
+  // reported honestly: the daemon keeps honoring the saved value for new sessions, so falling back
+  // to the first entry here would label the trigger "turbollm" while Code actually launches
+  // something else. Show what is really set, and say WHY it isn't in the list.
+  const selected = agents.find((a) => a.id === current) ?? {
     id: current,
     label: current,
-    description: 'No longer offered — choose one below to change it.',
+    description: ALL_AGENTS.some((a) => a.id === current && a.needsTerminal) && !terminalAvailable
+      ? 'Needs a terminal, which this install does not have — choose one below to change it.'
+      : 'No longer offered — choose one below to change it.',
   }
 
   const onError = (e: unknown) => toast.error(e instanceof ApiError ? e.message : 'Could not update the Code agent.')
@@ -64,7 +80,7 @@ export function CodeAgentSection() {
           </button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="start" className="w-[--radix-dropdown-menu-trigger-width]">
-          {AGENTS.map((agent) => (
+          {agents.map((agent) => (
             <DropdownMenuItem
               key={agent.id}
               onSelect={() => {

@@ -316,7 +316,9 @@ there. Entirely local; nothing leaves your machine.
   model picker, context ring, thinking-budget slider and stats row stay right where they are: the
   CLI replaces the transcript, not the controls. It starts in the mode you picked (auto / plan /
   ask), the thinking budget applies live with no restart, switching models keeps your scrollback,
-  and the conversation survives a restart of TurboLLM.
+  and the conversation survives a restart of TurboLLM. The terminal backend is an optional native
+  component — if it can't be built for your platform it's skipped (TurboLLM installs and runs
+  normally), and this agent simply isn't offered on that machine.
 
 </details>
 

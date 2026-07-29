@@ -83,14 +83,37 @@ function err(c: Context, s: S, code: string, msg: string) {
 
 let terminalManager: TerminalManager | null = null
 
+/** Whether this install actually has a terminal backend.
+ *
+ *  `node-pty` is an OPTIONAL dependency (it is a native module, and TurboLLM's whole pitch is
+ *  "no compiling, no Python" — a failed node-gyp build must not fail the install for everyone).
+ *  npm therefore skips it silently when no prebuild fits the platform/ABI, which means a perfectly
+ *  healthy install can have no way to spawn a PTY. Exported so the UI can be told BEFORE offering
+ *  a terminal-only agent, rather than letting someone pick `claude` and discover at session-open
+ *  that this machine can't run it (same rule as the engine catalog: never offer what isn't
+ *  actually available, ADR-239).
+ *
+ *  Cached — the answer can't change for the life of the daemon process. */
+let backendAvailable: boolean | null = null
+
+export function isTerminalBackendAvailable(): boolean {
+  if (backendAvailable === null) {
+    try {
+      require.resolve('node-pty')
+      backendAvailable = true
+    } catch {
+      backendAvailable = false
+    }
+  }
+  return backendAvailable
+}
+
 function getManager(_d: Deps): TerminalManager {
   if (!terminalManager) {
-    try {
-      // Force the require here so tests can run without node-pty installed.
-      require.resolve('node-pty')
+    // Force the resolve here (via the shared check above) so tests can run without node-pty
+    // installed, and so the UI's availability flag and this construction can never disagree.
+    if (isTerminalBackendAvailable()) {
       terminalManager = new TerminalManager(_d.store.dir())
-    } catch {
-      // node-pty not available
     }
   }
   return terminalManager ?? {

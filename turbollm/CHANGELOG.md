@@ -51,6 +51,10 @@ _Nothing yet._
   scrollbar over the CLI's own interface (wheel scrolling is unchanged).
 - **The Code agent picker offers `turbollm` and `claude` only.** `pi` and `opencode` are withdrawn
   until their terminal integration is verified against a real binary — no half-working choices.
+- **The terminal backend is now an optional install.** TurboLLM no longer fails to install if the
+  native terminal component can't be built for your platform — it's skipped, everything else works,
+  and the `claude` agent is simply not offered on that machine rather than appearing and then
+  failing when you open a session.
 
 ### Fixed
 - **Tokens/sec in Code with a CLI agent was wrong** — it reported end-to-end throughput, so
