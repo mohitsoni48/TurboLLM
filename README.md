@@ -311,6 +311,12 @@ there. Entirely local; nothing leaves your machine.
   MCP-compatible tool (Claude Desktop, Cursor, Windsurf, Cline, Claude Code, and more) can
   delegate a real coding task to Code, not just chat completions. Setup snippets for any host are
   in the Developer tab.
+- **Or run Claude Code itself, inside Code** — set Settings → Code agent to `claude` and a session
+  opens the real CLI in a full-screen terminal, on your local model, in your project folder. The
+  model picker, context ring, thinking-budget slider and stats row stay right where they are: the
+  CLI replaces the transcript, not the controls. It starts in the mode you picked (auto / plan /
+  ask), the thinking budget applies live with no restart, switching models keeps your scrollback,
+  and the conversation survives a restart of TurboLLM.
 
 </details>
 
