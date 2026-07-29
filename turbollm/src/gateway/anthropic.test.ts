@@ -145,6 +145,109 @@ test('mapToOpenAI maps a mid-conversation role:"system" message to an OpenAI sys
   )
 })
 
+// ── mapToOpenAI folds every system-role text into ONE leading message ──────
+// Regression for a real bug hit live (2026-07-29): a mid-conversation role:'system' message
+// (fixed above to map correctly, not as 'assistant') was still emitted at its ORIGINAL position
+// in `messages` — after the top-level `system` field's own message and after any user/assistant
+// turns before it. That produced an array like [system, user, assistant, system, ...], which a
+// strict jinja chat template (Qwen3.6/Ornith) rejects outright with a real 400: `Jinja Exception:
+// System message must be at the beginning`. Every system-role text (the top-level `system` field
+// AND any mid-conversation role:'system' entries) must fold into exactly one message at index 0.
+test('mapToOpenAI folds a top-level system field + a mid-conversation system message into ONE leading system message', () => {
+  const oai = mapToOpenAI({
+    system: 'You are Claude Code.',
+    messages: [
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: 'hello' },
+      { role: 'system', content: [{ type: 'text', text: 'SessionStart hook additional context: ...' }] },
+      { role: 'user', content: 'do the thing' },
+    ],
+    max_tokens: 100,
+  })
+  const msgs = oai.messages as Array<{ role: string; content?: unknown }>
+  assert.equal(msgs.filter((m) => m.role === 'system').length, 1, 'exactly one system message must survive')
+  assert.equal(msgs[0].role, 'system', 'the system message must be first — the whole point of the fix')
+  assert.equal(msgs[0].content, 'You are Claude Code.\n\nSessionStart hook additional context: ...')
+  assert.deepEqual(
+    msgs.slice(1).map((m) => m.role),
+    ['user', 'assistant', 'user'],
+    'every other message keeps its original order and role, with the system entry removed from its old position',
+  )
+})
+
+test('mapToOpenAI: a mid-conversation system message with no top-level system field still ends up first', () => {
+  const oai = mapToOpenAI({
+    messages: [
+      { role: 'user', content: 'hi' },
+      { role: 'system', content: [{ type: 'text', text: 'hook context' }] },
+    ],
+    max_tokens: 100,
+  })
+  const msgs = oai.messages as Array<{ role: string; content?: unknown }>
+  assert.equal(msgs[0].role, 'system')
+  assert.equal(msgs[0].content, 'hook context')
+  assert.equal(msgs[1].role, 'user')
+})
+
+// ── mapToOpenAI strips JSON-Schema `format` from tool parameters ────────────
+// Regression for a real bug hit live (2026-07-29): a Notion MCP tool's deeply-nested rich_text
+// schema had a `date.start` field with `format: 'date'`. llama.cpp's JSON-schema-to-grammar
+// converter has a bug for that format — it emits regex-style `\d` escapes GBNF doesn't support,
+// which fails to parse and breaks tool-calling for the WHOLE request (a real 400: "Failed to
+// initialize samplers: failed to parse grammar"), not just that one field. `format` must be
+// stripped recursively — through nested `properties`, `items`, and `anyOf` — before forwarding
+// any tool schema to the engine.
+test('mapToOpenAI strips a top-level `format` keyword from a tool parameter schema', () => {
+  const oai = mapToOpenAI({
+    messages: [{ role: 'user', content: 'hi' }],
+    max_tokens: 100,
+    tools: [
+      {
+        name: 'set_date',
+        input_schema: { type: 'object', properties: { day: { type: 'string', format: 'date' } } },
+      },
+    ],
+  })
+  const tools = oai.tools as Array<{ function: { parameters: Record<string, unknown> } }>
+  const day = (tools[0].function.parameters.properties as Record<string, unknown>).day as Record<string, unknown>
+  assert.equal('format' in day, false, 'format must be stripped, not just ignored')
+  assert.equal(day.type, 'string', 'the rest of the schema must survive untouched')
+})
+
+test('mapToOpenAI strips `format` recursively through nested properties, arrays, and anyOf', () => {
+  const oai = mapToOpenAI({
+    messages: [{ role: 'user', content: 'hi' }],
+    max_tokens: 100,
+    tools: [
+      {
+        name: 'notion_create_comment',
+        input_schema: {
+          type: 'object',
+          properties: {
+            rich_text: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  mention: {
+                    anyOf: [
+                      { type: 'object', properties: { date: { type: 'object', properties: { start: { type: 'string', format: 'date' } } } } },
+                    ],
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    ],
+  })
+  // Walk the exact same nested path a real Notion tool schema has and confirm no `format`
+  // key survives anywhere in the tree — a JSON.stringify round-trip is the simplest whole-tree check.
+  const tools = oai.tools as Array<{ function: { parameters: unknown } }>
+  assert.equal(JSON.stringify(tools[0].function.parameters).includes('"format"'), false)
+})
+
 // ── streamToAnthropic live progress ─────────────────────────────────────────
 
 /** Build a ReadableStream of OpenAI-style SSE bytes from raw line strings. */

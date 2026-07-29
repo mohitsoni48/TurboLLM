@@ -11,7 +11,7 @@ type ABlock =
   | { type: 'tool_result'; tool_use_id: string; content: string | Array<{ type: string; text?: string }> }
 // 'system' is undocumented but real: Claude Code injects hook context (e.g. SessionStart)
 // as a `role:'system'` entry directly into `messages`, not just via the top-level `system`
-// field — see mapToOpenAI's per-message role handling below.
+// field — mapToOpenAI folds every one of these into a single leading system message (see there).
 type AMessage = { role: 'user' | 'assistant' | 'system'; content: string | ABlock[] }
 
 export interface AnthropicRequest {
@@ -36,9 +36,40 @@ export interface AnthropicRequest {
 
 // ─── Mapping: Anthropic → OpenAI ──────────────────────────────────────────
 
+/** Recursively strips the JSON-Schema `format` keyword from a tool's parameter schema before
+ *  forwarding it to the engine. llama.cpp's JSON-schema-to-grammar converter has a real bug for
+ *  at least `format: 'date'` — it emits regex-style `\d` escapes GBNF doesn't support, which
+ *  fails to parse and breaks tool-calling for the ENTIRE request, not just that one field
+ *  (confirmed live: a Notion MCP tool's deeply-nested `rich_text` schema had a `date.start`
+ *  field with `format: 'date'`, producing a real 400 "Failed to initialize samplers: failed to
+ *  parse grammar"). `format` is a pure validation hint in JSON Schema — dropping it doesn't
+ *  change what values are structurally valid, only removes a stricter pattern the grammar would
+ *  otherwise try (and, for this llama.cpp version, fail) to enforce. */
+function stripJsonSchemaFormat(schema: unknown): unknown {
+  if (Array.isArray(schema)) return schema.map(stripJsonSchemaFormat)
+  if (schema && typeof schema === 'object') {
+    const out: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(schema as Record<string, unknown>)) {
+      if (key === 'format') continue
+      out[key] = stripJsonSchemaFormat(value)
+    }
+    return out
+  }
+  return schema
+}
+
 export function mapToOpenAI(req: AnthropicRequest): Record<string, unknown> {
   const messages: Record<string, unknown>[] = []
 
+  // Collect EVERY system-role text into ONE combined message at index 0 — Claude Code sometimes
+  // injects a role:'system' entry directly into `messages` (e.g. a SessionStart-hook context
+  // block) IN ADDITION to the top-level `system` field. Emitting each at its own original position
+  // (the prior behavior) produced an array like [system, user, assistant, system, ...] — a strict
+  // jinja chat template (Qwen3.6/Ornith) rejects that outright with `raise_exception('System
+  // message must be at the beginning')`, a real 400 hit live via a terminal-agent Claude Code
+  // session. Folding every system-role text into one leading message satisfies that constraint
+  // for any template while dropping no content.
+  const systemParts: string[] = []
   if (req.system) {
     const text =
       typeof req.system === 'string'
@@ -47,10 +78,21 @@ export function mapToOpenAI(req: AnthropicRequest): Record<string, unknown> {
             .filter((b) => b.type === 'text')
             .map((b) => (b as { text?: string }).text ?? '')
             .join('\n')
-    if (text) messages.push({ role: 'system', content: text })
+    if (text) systemParts.push(text)
   }
+  for (const msg of req.messages) {
+    if (msg.role !== 'system') continue
+    const raw = msg.content
+    const text =
+      typeof raw === 'string'
+        ? raw
+        : raw.filter((b) => b.type === 'text').map((b) => (b as { text?: string }).text ?? '').join('\n')
+    if (text) systemParts.push(text)
+  }
+  if (systemParts.length > 0) messages.push({ role: 'system', content: systemParts.join('\n\n') })
 
   for (const msg of req.messages) {
+    if (msg.role === 'system') continue // already folded into the single leading system message above
     const raw = msg.content
     if (typeof raw === 'string') {
       messages.push({ role: msg.role, content: raw })
@@ -88,20 +130,6 @@ export function mapToOpenAI(req: AnthropicRequest): Record<string, unknown> {
             : parts
         messages.push({ role: 'user', content })
       }
-    } else if ((msg.role as string) === 'system') {
-      // Claude Code sometimes injects a `role: 'system'` entry directly into `messages`
-      // (e.g. a SessionStart-hook context block), separate from the top-level `system`
-      // field. Falling through to the assistant branch below relabeled this as something
-      // the ASSISTANT had already said — which made the model see a conversation that
-      // looked already finished, so it emitted an immediate end-of-turn with zero output
-      // (a real "no response" bug, confirmed via a live capture of an actual Claude Code
-      // request: a `role:'system'` message as messages[1], mis-mapped to `role:'assistant'`,
-      // reproduced a stream with output_tokens:1 and no content blocks at all).
-      const text = raw
-        .filter((b) => b.type === 'text')
-        .map((b) => (b as { text?: string }).text ?? '')
-        .join('\n')
-      if (text) messages.push({ role: 'system', content: text })
     } else {
       let text = ''
       const toolCalls: unknown[] = []
@@ -145,7 +173,7 @@ export function mapToOpenAI(req: AnthropicRequest): Record<string, unknown> {
   if (req.tools?.length) {
     oai.tools = req.tools.map((t) => ({
       type: 'function',
-      function: { name: t.name, description: t.description, parameters: t.input_schema },
+      function: { name: t.name, description: t.description, parameters: stripJsonSchemaFormat(t.input_schema) },
     }))
     const tc = req.tool_choice
     if (tc)
