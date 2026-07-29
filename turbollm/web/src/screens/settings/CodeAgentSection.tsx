@@ -11,11 +11,14 @@ import {
 } from '../../components/ui/dropdown-menu'
 import type { CodeAgent } from '../../lib/code-types'
 
+// `pi` and `opencode` are deliberately NOT offered right now. Both are still supported end to end
+// (cli-launch.ts, the CodeAgent type, and any session already created with one keeps working) —
+// they're withdrawn from the picker until their terminal integration is actually verified against
+// a real binary, rather than shipping a choice that half-works. Re-adding them is this list plus
+// nothing else. Same rule as the engine catalog: don't offer what isn't confirmed (ADR-239).
 const AGENTS: Array<{ id: CodeAgent; label: string; description: string }> = [
   { id: 'turbollm', label: 'turbollm', description: 'The built-in chat agent — uses whatever model TurboLLM has loaded.' },
-  { id: 'pi', label: 'pi', description: 'Launches inside a full-screen terminal (turbollm launch pi).' },
   { id: 'claude', label: 'claude', description: 'Launches inside a full-screen terminal (turbollm launch claude).' },
-  { id: 'opencode', label: 'opencode', description: 'Launches inside a full-screen terminal (turbollm launch opencode).' },
 ]
 
 /** Which coding agent NEW Code sessions launch with. Read once, at session creation
@@ -24,7 +27,15 @@ const AGENTS: Array<{ id: CodeAgent; label: string; description: string }> = [
 export function CodeAgentSection() {
   const { query: settingsQ, save } = useSettings()
   const current = settingsQ.data?.code?.defaultAgent ?? 'turbollm'
-  const selected = AGENTS.find((a) => a.id === current) ?? AGENTS[0]
+  // A stored agent that is no longer listed (someone who had picked pi/opencode before they were
+  // withdrawn) must still be reported honestly: the daemon keeps honoring the saved value for new
+  // sessions, so falling back to AGENTS[0] here would label the trigger "turbollm" while Code
+  // actually launches pi. Show what is really set; the list below is what you can change it to.
+  const selected = AGENTS.find((a) => a.id === current) ?? {
+    id: current,
+    label: current,
+    description: 'No longer offered — choose one below to change it.',
+  }
 
   const onError = (e: unknown) => toast.error(e instanceof ApiError ? e.message : 'Could not update the Code agent.')
 
