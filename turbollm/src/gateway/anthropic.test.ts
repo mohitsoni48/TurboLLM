@@ -275,6 +275,60 @@ test('mapToOpenAI strips a `pattern` keyword from a tool parameter schema, neste
   assert.ok(serialized.includes('"phone"'), 'the rest of the schema must survive untouched')
 })
 
+// ── mapToOpenAI strips the numeric/length/count BOUND keywords too ──────────────────────────
+// A second, distinct grammar failure mode, root-caused from the engine's own dump of the failing
+// grammar: llama.cpp compiles bound keywords into GBNF `{m,n}` repetition operators and giant
+// digit-range rules, then refuses the grammar when rule-complexity × repetition trips its guard
+// ("number of rules that are going to be repeated multiplied by the new repetition exceeds sane
+// defaults"). The real failing request carried all three shapes asserted below.
+test('mapToOpenAI strips bound keywords that llama.cpp compiles into {m,n} repetitions', () => {
+  const oai = mapToOpenAI({
+    messages: [{ role: 'user', content: 'hi' }],
+    max_tokens: 100,
+    tools: [
+      {
+        name: 'sync_assets',
+        input_schema: {
+          type: 'object',
+          properties: {
+            // `maxItems: 255` → `(item){0,255}` in GBNF
+            assets: {
+              type: 'array',
+              maxItems: 255,
+              minItems: 1,
+              // `maxLength` → `char{1,255}`
+              items: { type: 'object', properties: { name: { type: 'string', minLength: 1, maxLength: 255 } } },
+            },
+            // `maximum: Number.MAX_SAFE_INTEGER` → ONE rule thousands of elements long
+            offset: { type: 'integer', minimum: 0, maximum: 9007199254740991 },
+            ratio: { type: 'number', exclusiveMinimum: 0, exclusiveMaximum: 1, multipleOf: 0.01 },
+          },
+        },
+      },
+    ],
+  })
+  const params = (oai.tools as Array<{ function: { parameters: unknown } }>)[0].function.parameters
+  const serialized = JSON.stringify(params)
+
+  for (const keyword of ['minLength', 'maxLength', 'minItems', 'maxItems', 'minimum', 'maximum', 'exclusiveMinimum', 'exclusiveMaximum', 'multipleOf']) {
+    assert.equal(serialized.includes(`"${keyword}"`), false, `${keyword} must be stripped, at any depth`)
+  }
+  // Structure — the part constrained decoding actually needs — must survive intact.
+  assert.ok(serialized.includes('"assets"') && serialized.includes('"offset"') && serialized.includes('"ratio"'))
+  assert.ok(serialized.includes('"array"') && serialized.includes('"integer"'), 'types must survive')
+  assert.ok(serialized.includes('"items"') && serialized.includes('"name"'), 'nested shape must survive')
+})
+
+test('mapToOpenAI keeps `enum`, which constrains decoding without emitting any repetition', () => {
+  const oai = mapToOpenAI({
+    messages: [{ role: 'user', content: 'hi' }],
+    max_tokens: 100,
+    tools: [{ name: 'pick', input_schema: { type: 'object', properties: { mode: { type: 'string', enum: ['a', 'b'] } } } }],
+  })
+  const params = (oai.tools as Array<{ function: { parameters: unknown } }>)[0].function.parameters
+  assert.ok(JSON.stringify(params).includes('"enum"'), 'enum is alternation, not repetition — keep it')
+})
+
 // ── streamToAnthropic live progress ─────────────────────────────────────────
 
 /** Build a ReadableStream of OpenAI-style SSE bytes from raw line strings. */

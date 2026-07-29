@@ -36,20 +36,43 @@ export interface AnthropicRequest {
 
 // ─── Mapping: Anthropic → OpenAI ──────────────────────────────────────────
 
-/** JSON-Schema keywords stripped before forwarding a tool schema to the engine — both get
- *  compiled into GBNF grammar by llama.cpp's JSON-schema-to-grammar converter, and both have
- *  confirmed-live parse failures that break tool-calling for the ENTIRE request, not just the
- *  one field: `format` (e.g. `format: 'date'` emits regex-style `\d` escapes GBNF doesn't
- *  support — a real Notion MCP tool's deeply-nested `rich_text.date.start` field hit this,
- *  producing "Failed to initialize samplers: failed to parse grammar"). `pattern` is an
- *  arbitrary caller-supplied regex — a strictly BIGGER risk than format's fixed, hardcoded
- *  conversions, since any construct a third-party tool's regex happens to use (backreferences,
- *  lookaheads, unicode classes, …) that doesn't translate cleanly to GBNF hits the exact same
- *  failure class, just via a different tool/field each time. Both are pure validation hints in
- *  JSON Schema — dropping them doesn't change what values are structurally valid, only removes
- *  a stricter constraint the grammar would otherwise try (and, on this llama.cpp build, isn't
- *  guaranteed to succeed at) enforcing. */
-const UNSUPPORTED_SCHEMA_KEYWORDS = new Set(['format', 'pattern'])
+/** JSON-Schema keywords stripped before forwarding a tool schema to the engine. All of them are
+ *  pure *validation* hints — none changes which values are structurally valid — but llama.cpp's
+ *  JSON-schema-to-grammar converter compiles every one of them into GBNF, where they cause parse
+ *  failures that kill tool-calling for the ENTIRE request (a 400 "Failed to initialize samplers:
+ *  failed to parse grammar"), not just the offending field. Two distinct failure modes, both hit
+ *  live against Ornith 1.0 35B:
+ *
+ *  1. Invalid GBNF output — `format` (e.g. `format: 'date'` emits regex-style `\d` escapes GBNF
+ *     doesn't support) and `pattern` (an arbitrary caller-supplied regex, a strictly bigger risk
+ *     since any construct that doesn't translate cleanly — backreferences, lookaheads, unicode
+ *     classes — fails the same way via a different tool each time).
+ *
+ *  2. Grammar-size explosion — the bound keywords compile into GBNF `{m,n}` repetition operators
+ *     and enormous digit-range rules, and llama.cpp guards on rule-complexity × repetition
+ *     ("number of rules that are going to be repeated multiplied by the new repetition exceeds
+ *     sane defaults"). `maxItems: 255` becomes `(item){0,255}`; `maxLength: 255` becomes
+ *     `char{1,255}`; `maximum: 9007199254740991` becomes a SINGLE rule thousands of elements
+ *     long, densely nested with `[0-9]{15}`. That guard is reached far sooner than the numbers
+ *     suggest on models whose chat template uses an XML tool-call format (Qwen3-Coder-style
+ *     `<parameter=name>…</parameter>`, which Ornith/Qwen3.6 uses): llama.cpp emits a
+ *     character-by-character "match until `</parameter>`" state machine per string argument, so
+ *     a realistic Claude Code tool set (built-ins + MCP servers) already sits at ~5k rules
+ *     BEFORE any repetition is applied. Measured on the real failing request: 3,822 of 5,127
+ *     rules were those per-argument state machines. */
+const UNSUPPORTED_SCHEMA_KEYWORDS = new Set([
+  'format',
+  'pattern',
+  'minLength',
+  'maxLength',
+  'minItems',
+  'maxItems',
+  'minimum',
+  'maximum',
+  'exclusiveMinimum',
+  'exclusiveMaximum',
+  'multipleOf',
+])
 
 function stripUnsupportedSchemaKeywords(schema: unknown): unknown {
   if (Array.isArray(schema)) return schema.map(stripUnsupportedSchemaKeywords)
