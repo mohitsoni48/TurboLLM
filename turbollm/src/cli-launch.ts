@@ -22,6 +22,23 @@ interface CliSpec {
   // Config-file tools (opencode/kilo/openclaw) instead get this called once before spawn
   // to merge a local-gateway provider entry into the tool's own config file.
   prepareConfig?: (base: string, apiKey: string, modelKey: string, modelName: string) => Promise<PrepareResult>
+  // CLIs that accept a caller-chosen session id expose two mutually exclusive flags: one that
+  // REGISTERS a new id, one that RESUMES an existing one. Passing the wrong one is a hard,
+  // immediate failure — and the daemon genuinely cannot know which state the CLI is in, because
+  // `agent_runs.terminal_launched_once` is set optimistically the moment we build the launch
+  // command (terminal-routes.ts). A session the founder opened but never sent a message in was
+  // never persisted by the CLI, so the next launch resumes an id the CLI has never heard of.
+  // Both directions are fully recoverable by swapping the flag, so that's what we do.
+  sessionFlags?: SessionFlags
+}
+
+interface SessionFlags {
+  /** Flag that registers a caller-chosen id on a NEW conversation. */
+  register: string
+  /** Flag that resumes an EXISTING conversation by id. */
+  resume: string
+  /** Lowercased stderr substrings meaning "wrong flag for this id". */
+  mismatch: string[]
 }
 
 type PrepareResult = { ok: true } | { ok: false; message: string }
@@ -29,7 +46,20 @@ type PrepareResult = { ok: true } | { ok: false; message: string }
 const AUTH_TOKEN = 'turbollm-local'
 
 const SUPPORTED: Record<string, CliSpec> = {
-  claude: { bin: 'claude', label: 'Claude Code', install: 'npm install -g @anthropic-ai/claude-code' },
+  claude: {
+    bin: 'claude',
+    label: 'Claude Code',
+    install: 'npm install -g @anthropic-ai/claude-code',
+    // Measured against the real CLI: both mismatches exit 1 with nothing on stdout and one of
+    // these lines on stderr, before any TUI paints or any model call is made.
+    //   --session-id <existing> -> "Error: Session ID <uuid> is already in use."
+    //   --resume     <unknown>  -> "No conversation found with session ID: <uuid>"
+    sessionFlags: {
+      register: '--session-id',
+      resume: '--resume',
+      mismatch: ['no conversation found with session id', 'is already in use'],
+    },
+  },
   opencode: { bin: 'opencode', label: 'opencode', install: 'npm install -g opencode-ai', prepareConfig: prepareOpencode },
   kilo: { bin: 'kilo', label: 'Kilo Code', install: 'npm install -g @kilocode/cli', prepareConfig: prepareKilo },
   openclaw: { bin: 'openclaw', label: 'openclaw', install: 'npm install -g openclaw@latest', prepareConfig: prepareOpenclaw },
@@ -48,12 +78,11 @@ interface ModelEntry {
   name: string
 }
 
-// Type-safe subset of spawn's return value that launchCli actually uses.
-type SpawnLike = (
-  cmd: string,
-  args: string[],
-  opts: Parameters<typeof spawn>[2],
-) => Pick<ReturnType<typeof spawn>, 'on'>
+// Type-safe subset of spawn's return value that launchCli actually uses. `stderr` is optional
+// because test fakes hand back a bare EventEmitter — session recovery degrades to "no retry"
+// rather than throwing when it isn't there.
+type SpawnedChild = Pick<ReturnType<typeof spawn>, 'on'> & Partial<Pick<ReturnType<typeof spawn>, 'stderr'>>
+type SpawnLike = (cmd: string, args: string[], opts: Parameters<typeof spawn>[2]) => SpawnedChild
 
 /** Fetch the current daemon status. Returns null on network error. */
 async function fetchStatus(base: string, _fetch: typeof fetch = fetch): Promise<DaemonStatus | null> {
@@ -578,12 +607,11 @@ export async function launchCli(
       process.stderr.write(prep.message + '\n')
       return 1
     }
-    const child = _spawn(spec.bin, passthrough, {
+    return await spawnWithSessionRecovery(spec, passthrough, {
       stdio: 'inherit',
       shell: process.platform === 'win32',
       env: process.env,
-    })
-    return await waitForChild(child, spec)
+    }, _spawn)
   }
 
   const env: NodeJS.ProcessEnv = {
@@ -610,14 +638,61 @@ export async function launchCli(
     CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: '1',
   }
 
-  const child = _spawn(spec.bin, passthrough, {
+  return await spawnWithSessionRecovery(spec, passthrough, {
     stdio: 'inherit',
     // On Windows the CLI is usually a `.cmd`/`.ps1` shim; a shell resolves it via PATHEXT.
     shell: process.platform === 'win32',
     env,
+  }, _spawn)
+}
+
+/** Swap a session flag for its complement, keeping the id argument in place — e.g.
+ *  `--resume <id>` ⇄ `--session-id <id>`. Returns null when args carry neither flag, which is
+ *  the normal case for a hand-run `turbollm launch claude`. */
+export function swapSessionFlag(args: string[], flags: SessionFlags): string[] | null {
+  const i = args.findIndex((a) => a === flags.resume || a === flags.register)
+  if (i === -1) return null
+  const out = [...args]
+  out[i] = out[i] === flags.resume ? flags.register : flags.resume
+  return out
+}
+
+/** Spawn the CLI; if it dies immediately because the session flag didn't match the CLI's actual
+ *  state, swap the flag and try once. Only that specific, self-identified failure retries — any
+ *  other non-zero exit is passed straight through, so a genuine error is never masked or run
+ *  twice. See CliSpec.sessionFlags for why the daemon can't just pick the right flag up front. */
+async function spawnWithSessionRecovery(
+  spec: CliSpec,
+  args: string[],
+  opts: Parameters<typeof spawn>[2],
+  _spawn: SpawnLike,
+): Promise<number> {
+  const flags = spec.sessionFlags
+  const retryArgs = flags ? swapSessionFlag(args, flags) : null
+  // No session flag in play — spawn normally so the CLI keeps the real stderr handle.
+  if (!flags || !retryArgs) return await waitForChild(_spawn(spec.bin, args, opts), spec)
+
+  const child = _spawn(spec.bin, args, { ...opts, stdio: ['inherit', 'inherit', 'pipe'] })
+  let captured = ''
+  child.stderr?.on('data', (chunk: Buffer | string) => {
+    // Forward verbatim and immediately — the CLI's own output must reach the user unchanged.
+    process.stderr.write(chunk)
+    if (captured.length < 4096) captured += String(chunk)
   })
 
-  return await waitForChild(child, spec)
+  const code = await waitForChild(child, spec)
+  const lower = captured.toLowerCase()
+  if (code === 0 || !flags.mismatch.some((m) => lower.includes(m))) return code
+
+  // Say which way we're recovering — "starting a fresh one" would be a lie when the id turned
+  // out to already exist and we're switching to resuming it.
+  const startingFresh = retryArgs.includes(flags.register)
+  process.stdout.write(
+    startingFresh
+      ? `▸ That ${spec.label} session is gone — starting a fresh one.\n`
+      : `▸ That ${spec.label} session already exists — resuming it.\n`,
+  )
+  return await waitForChild(_spawn(spec.bin, retryArgs, opts), spec)
 }
 
 /** Resolve the child's exit code, reporting a friendly install hint on ENOENT. */
