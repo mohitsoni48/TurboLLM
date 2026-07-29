@@ -1,0 +1,34 @@
+name = "turbollm-telemetry"
+main = "src/index.ts"
+compatibility_date = "2026-07-01"
+
+# The public ingest endpoint. Public on purpose (ADR-299): a credential shipped
+# in a source-available client is not a credential, so we do not pretend the URL
+# is a secret. Abuse is handled by validation + rate limiting, not obscurity.
+routes = [{ pattern = "t.turbollm.dev/*", zone_name = "turbollm.dev" }]
+
+# The owned raw mirror. Create with:
+#   wrangler d1 create turbollm-telemetry
+# then paste the returned database_id below and apply schema.sql.
+[[d1_databases]]
+binding = "DB"
+database_name = "turbollm-telemetry"
+database_id = "REPLACE_WITH_ID_FROM_wrangler_d1_create"
+
+# Rate-limit counters only. Keys are machine ids and TRUNCATED HASHES of IPs
+# with a 1-hour TTL — the IP itself is never stored, here or in D1.
+#   wrangler kv namespace create RL
+[[kv_namespaces]]
+binding = "RL"
+id = "REPLACE_WITH_ID_FROM_wrangler_kv_namespace_create"
+
+[observability]
+enabled = true
+
+# PostHog credentials are Worker SECRETS, never committed and never shipped:
+#   wrangler secret put POSTHOG_KEY
+#   wrangler secret put POSTHOG_HOST   # optional, defaults to us.i.posthog.com
+#
+# Before going live, set a spend cap on the account. A public unauthenticated
+# endpoint should never be able to cost money, and the whole anti-abuse design
+# assumes a flood is merely noisy rather than expensive.

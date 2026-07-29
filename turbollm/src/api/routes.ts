@@ -2284,6 +2284,13 @@ function settingsPayload(d: Deps) {
     lanBind: cfg.daemon.lanBind,
     requireApiKey: cfg.daemon.requireApiKey,
     telemetryLevel,
+    // Whether the user has ever actually answered (ADR-299 Decision 4).
+    // `telemetryLevel` above deliberately collapses the first-run 'unset'
+    // sentinel to 'off' so every consumer fails safe — but that also makes
+    // "never asked" indistinguishable from "chose Off", and the first-run
+    // consent card needs exactly that distinction. Hence a separate flag
+    // rather than leaking 'unset' into the level enum.
+    telemetryDecided: cfg.telemetry.level !== 'unset',
     modelDefaults: cfg.modelDefaults,
     comfyui: cfg.comfyui,
     gateway: cfg.gateway,
