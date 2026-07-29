@@ -796,6 +796,7 @@ export function CodeSessionScreen() {
                 position the chat composer occupies so switching agents only changes what's
                 ABOVE this row. */}
             <TerminalToolbar
+              agent={session.codeAgent}
               models={allModels}
               loadedKey={model?.key ?? null}
               loadedName={model?.name ?? null}
@@ -804,7 +805,19 @@ export function CodeSessionScreen() {
               onLoadModel={handleLoadModel}
               onEjectModel={handleEject}
               onModelSettings={(key) => setSettingsKey(key)}
-              ctxUsed={ctxUsed}
+              // NOT the shared `ctxUsed` above — that one reads the last PERSISTED assistant
+              // message's stats, and a terminal-agent session never writes one: the CLI talks to
+              // the gateway directly, so nothing of its conversation lands in the code session's
+              // message store. The ring and footer were therefore showing whichever stale value
+              // happened to be sitting in this session's very first (pre-terminal) turn, frozen
+              // forever. Measured live on 2026-07-29 against the founder's own `claude` session:
+              // persisted message said 30,645 tokens / 15% (written two days earlier, and the
+              // number in the screenshot that prompted this fix) while the CLI's actual context
+              // at that moment was 98,259 / 49%. The last gateway request's prompt size IS this
+              // conversation's real current context — an Anthropic-style CLI resends the whole
+              // conversation every turn — and it's already polled for the footer's ↑ figure, so
+              // it costs nothing extra and is the same quantity `ctxUsed` means for a chat turn.
+              ctxUsed={lastUsage?.promptTokens ?? 0}
               ctxMax={ctxMax}
               thinkingBudget={thinkingBudget}
               onThinkingBudgetChange={setThinkingBudget}
