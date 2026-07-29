@@ -36,22 +36,28 @@ export interface AnthropicRequest {
 
 // ─── Mapping: Anthropic → OpenAI ──────────────────────────────────────────
 
-/** Recursively strips the JSON-Schema `format` keyword from a tool's parameter schema before
- *  forwarding it to the engine. llama.cpp's JSON-schema-to-grammar converter has a real bug for
- *  at least `format: 'date'` — it emits regex-style `\d` escapes GBNF doesn't support, which
- *  fails to parse and breaks tool-calling for the ENTIRE request, not just that one field
- *  (confirmed live: a Notion MCP tool's deeply-nested `rich_text` schema had a `date.start`
- *  field with `format: 'date'`, producing a real 400 "Failed to initialize samplers: failed to
- *  parse grammar"). `format` is a pure validation hint in JSON Schema — dropping it doesn't
- *  change what values are structurally valid, only removes a stricter pattern the grammar would
- *  otherwise try (and, for this llama.cpp version, fail) to enforce. */
-function stripJsonSchemaFormat(schema: unknown): unknown {
-  if (Array.isArray(schema)) return schema.map(stripJsonSchemaFormat)
+/** JSON-Schema keywords stripped before forwarding a tool schema to the engine — both get
+ *  compiled into GBNF grammar by llama.cpp's JSON-schema-to-grammar converter, and both have
+ *  confirmed-live parse failures that break tool-calling for the ENTIRE request, not just the
+ *  one field: `format` (e.g. `format: 'date'` emits regex-style `\d` escapes GBNF doesn't
+ *  support — a real Notion MCP tool's deeply-nested `rich_text.date.start` field hit this,
+ *  producing "Failed to initialize samplers: failed to parse grammar"). `pattern` is an
+ *  arbitrary caller-supplied regex — a strictly BIGGER risk than format's fixed, hardcoded
+ *  conversions, since any construct a third-party tool's regex happens to use (backreferences,
+ *  lookaheads, unicode classes, …) that doesn't translate cleanly to GBNF hits the exact same
+ *  failure class, just via a different tool/field each time. Both are pure validation hints in
+ *  JSON Schema — dropping them doesn't change what values are structurally valid, only removes
+ *  a stricter constraint the grammar would otherwise try (and, on this llama.cpp build, isn't
+ *  guaranteed to succeed at) enforcing. */
+const UNSUPPORTED_SCHEMA_KEYWORDS = new Set(['format', 'pattern'])
+
+function stripUnsupportedSchemaKeywords(schema: unknown): unknown {
+  if (Array.isArray(schema)) return schema.map(stripUnsupportedSchemaKeywords)
   if (schema && typeof schema === 'object') {
     const out: Record<string, unknown> = {}
     for (const [key, value] of Object.entries(schema as Record<string, unknown>)) {
-      if (key === 'format') continue
-      out[key] = stripJsonSchemaFormat(value)
+      if (UNSUPPORTED_SCHEMA_KEYWORDS.has(key)) continue
+      out[key] = stripUnsupportedSchemaKeywords(value)
     }
     return out
   }
@@ -173,7 +179,7 @@ export function mapToOpenAI(req: AnthropicRequest): Record<string, unknown> {
   if (req.tools?.length) {
     oai.tools = req.tools.map((t) => ({
       type: 'function',
-      function: { name: t.name, description: t.description, parameters: stripJsonSchemaFormat(t.input_schema) },
+      function: { name: t.name, description: t.description, parameters: stripUnsupportedSchemaKeywords(t.input_schema) },
     }))
     const tc = req.tool_choice
     if (tc)

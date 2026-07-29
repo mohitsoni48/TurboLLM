@@ -248,6 +248,33 @@ test('mapToOpenAI strips `format` recursively through nested properties, arrays,
   assert.equal(JSON.stringify(tools[0].function.parameters).includes('"format"'), false)
 })
 
+// ── mapToOpenAI ALSO strips `pattern` — the same failure class, a different keyword ────────
+// `pattern` is an arbitrary caller-supplied regex, compiled into GBNF the same way `format` is —
+// a strictly BIGGER risk than format's fixed conversions, since any construct a third-party
+// tool's regex happens to use can fail the same way, via a different tool/field each time.
+test('mapToOpenAI strips a `pattern` keyword from a tool parameter schema, nested or not', () => {
+  const oai = mapToOpenAI({
+    messages: [{ role: 'user', content: 'hi' }],
+    max_tokens: 100,
+    tools: [
+      {
+        name: 'set_phone',
+        input_schema: {
+          type: 'object',
+          properties: {
+            phone: { type: 'string', pattern: '^\\+?[0-9]{7,15}$' },
+            contact: { type: 'object', properties: { id: { type: 'string', pattern: '^[A-Z0-9]{8}$' } } },
+          },
+        },
+      },
+    ],
+  })
+  const tools = oai.tools as Array<{ function: { parameters: unknown } }>
+  const serialized = JSON.stringify(tools[0].function.parameters)
+  assert.equal(serialized.includes('"pattern"'), false, 'pattern must be stripped, nested or not')
+  assert.ok(serialized.includes('"phone"'), 'the rest of the schema must survive untouched')
+})
+
 // ── streamToAnthropic live progress ─────────────────────────────────────────
 
 /** Build a ReadableStream of OpenAI-style SSE bytes from raw line strings. */
