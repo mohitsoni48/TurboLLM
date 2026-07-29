@@ -29,6 +29,29 @@ async function body<T>(c: Context): Promise<T> { try { return await c.req.json()
 
 const require = createRequire(import.meta.url)
 
+// ── terminal-agent auto-resume across a daemon restart ──────────────────
+// The flag each supported agent's own CLI accepts to pick its last conversation back up in
+// the current directory, instead of starting a blank one. Only agents with a CONFIRMED flag are
+// listed — an agent absent here just starts fresh on every launch (today's behavior for all of
+// them), never a guess at unverified CLI syntax for a tool this session hasn't tested.
+const AGENT_CONTINUE_FLAG: Partial<Record<string, string>> = {
+  claude: '--continue',
+}
+
+/** Pure/exported so the resume-flag decision is unit-testable without a live PTY/daemon (mirrors
+ *  code-session.ts's codeEventToFrame pattern). A genuinely first-ever launch (`launchedOnce`
+ *  false) always starts fresh; a later one passes the agent's own continue flag ONLY when one is
+ *  confirmed for that agent — an unlisted agent still starts fresh rather than guessing syntax. */
+export function buildTerminalLaunchCommand(
+  agent: string,
+  port: number,
+  token: string,
+  launchedOnce: boolean,
+): string {
+  const continueFlag = launchedOnce ? AGENT_CONTINUE_FLAG[agent] : undefined
+  return `turbollm launch ${agent} --port ${port} --token ${token}${continueFlag ? ` ${continueFlag}` : ''}`
+}
+
 // ── types ──────────────────────────────────────────────────────────────
 
 type S = 200 | 201 | 400 | 404 | 409 | 500 | 501
@@ -115,8 +138,14 @@ export function registerTerminalRoutes(app: Hono, d: Deps): void {
       // already-running auth is never invalidated by a token that would differ from what it
       // still has cached — but even if it did, mint() returns the SAME token for this session.
       const token = sessionAuth.mint(run.id)
-      const launchCommand = `turbollm launch ${agent} --port ${port} --token ${token}`
+      // Auto-resume (found live: a daemon restart kills this terminal's PTY, but the
+      // conversation itself didn't end) — a genuinely first-ever launch starts fresh; any
+      // later one (the in-memory TerminalManager has no record, but the DB does) passes the
+      // agent's own continue flag so the CLI picks its interrupted conversation back up
+      // instead of the founder losing it entirely on every restart.
+      const launchCommand = buildTerminalLaunchCommand(agent, port, token, !!run.terminalLaunchedOnce)
       const terminalId = m.create(run.repoRoot, run.id, cols, rows, launchCommand)
+      if (!run.terminalLaunchedOnce) d.db.updateAgentRun(run.id, { terminalLaunchedOnce: true })
       return c.json({ terminalId }, 201)
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Failed to create terminal session.'

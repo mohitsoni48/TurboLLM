@@ -168,6 +168,13 @@ export interface AgentRun {
    *  only at the session's first successful turn, never again, so a later manual rename of the
    *  session sticks instead of reverting on the next completed turn. */
   titleAutoSynced?: boolean
+  // ── Terminal-agent auto-resume across a daemon restart (v37) ────────────────────────────
+  /** True once a terminal has been created for this session at least once. terminal-routes.ts
+   *  reads this BEFORE creating a new terminal to decide whether this is a genuinely first-ever
+   *  launch or a restart-reconnect (the in-memory TerminalManager/PTY died with the daemon, but
+   *  the session itself didn't) — the latter passes the agent's own continue/resume flag so the
+   *  CLI picks its interrupted conversation back up instead of starting a blank one. */
+  terminalLaunchedOnce?: boolean
 }
 
 /** One per-Hitman track-record row (spec 13 §12.3). */
@@ -479,7 +486,7 @@ export interface Message {
 }
 
 interface ConvRow { id: string; title: string; system_prompt: string; model_key: string; sampling: string; expert_mode: number; tool_policy: string | null; kind: string | null; folder_id: string | null; tool_overrides: string | null; agent_id: string | null; completed_at: string | null; read_scope: string | null; agent_mode: string | null; skill_ids: string | null; allowed_tools: string | null; preserve_thinking: number; created_at: string; updated_at: string }
-interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; agent_id: string | null; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null; archived_at: string | null; completion: string | null; repo_root: string | null; repo_branch: string | null; use_worktree: number | null; worktree_branch: string | null; worktree_base: string | null; lines_added: number | null; lines_removed: number | null; compaction_summary: string | null; compaction_upto_message_id: string | null; compaction_tokens_before: number | null; cleared_upto_message_id: string | null; reverted_from_message_id: string | null; title_auto_synced: number | null; code_agent: string | null }
+interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; agent_id: string | null; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null; archived_at: string | null; completion: string | null; repo_root: string | null; repo_branch: string | null; use_worktree: number | null; worktree_branch: string | null; worktree_base: string | null; lines_added: number | null; lines_removed: number | null; compaction_summary: string | null; compaction_upto_message_id: string | null; compaction_tokens_before: number | null; cleared_upto_message_id: string | null; reverted_from_message_id: string | null; title_auto_synced: number | null; code_agent: string | null; terminal_launched_once: number | null }
 interface FolderRow { id: string; name: string; sort_order: number; created_at: string; updated_at: string }
 interface MsgRow  { id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string; reasoning: string; attachments: string; text_attachments: string | null; tool_calls: string | null; timeline: string | null; stats: string; model_key: string | null; research_meta: string | null; created_at: string; variant_group: string | null; is_active: number; branch_of: string | null; edited: number }
 
@@ -532,6 +539,7 @@ function rowToAgentRun(r: AgentRunRow): AgentRun {
     clearedUpToMessageId: r.cleared_upto_message_id ?? undefined,
     revertedFromMessageId: r.reverted_from_message_id ?? undefined,
     titleAutoSynced: r.title_auto_synced === 1,
+    terminalLaunchedOnce: r.terminal_launched_once === 1,
   }
 }
 
@@ -961,6 +969,17 @@ export class ConversationStore {
       if (!this.hasColumn('api_usage', 'duration_ms')) this.db.exec(`ALTER TABLE api_usage ADD COLUMN duration_ms INTEGER;`)
       this.db.exec(`CREATE INDEX IF NOT EXISTS idx_api_usage_code_session ON api_usage(code_session_id, created_at);`)
       this.db.exec(`PRAGMA user_version = 36;`)
+    }
+    // v37 (terminal-agent auto-resume across a daemon restart): whether a terminal has ever
+    // been created for this session — lets terminal-routes.ts tell a genuinely first-ever
+    // launch apart from a restart-reconnect (the in-memory PTY died with the daemon, the
+    // session didn't) and pass the CLI's own continue/resume flag on the latter. Additive +
+    // defaulted to 0 — every pre-existing row reads as "never launched", which just means its
+    // NEXT terminal open is treated as fresh (the same behavior as today), never wrongly
+    // resumed into a conversation that was never actually interrupted.
+    if (v < 37) {
+      if (!this.hasColumn('agent_runs', 'terminal_launched_once')) this.db.exec(`ALTER TABLE agent_runs ADD COLUMN terminal_launched_once INTEGER NOT NULL DEFAULT 0;`)
+      this.db.exec(`PRAGMA user_version = 37;`)
     }
   }
 
@@ -1659,7 +1678,7 @@ export class ConversationStore {
     return (this.db.prepare(`SELECT * FROM agent_runs ORDER BY updated_at DESC LIMIT 200`).all() as unknown as AgentRunRow[]).map(rowToAgentRun)
   }
 
-  updateAgentRun(id: string, patch: Partial<Pick<AgentRun, 'status' | 'error' | 'startedAt' | 'endedAt' | 'title' | 'compactionSummary' | 'compactionUpToMessageId' | 'compactionTokensBefore' | 'titleAutoSynced'>>): boolean {
+  updateAgentRun(id: string, patch: Partial<Pick<AgentRun, 'status' | 'error' | 'startedAt' | 'endedAt' | 'title' | 'compactionSummary' | 'compactionUpToMessageId' | 'compactionTokensBefore' | 'titleAutoSynced' | 'terminalLaunchedOnce'>>): boolean {
     const now = new Date().toISOString()
     const sets: string[] = ['updated_at = $now']
     const params: Record<string, SQLInputValue> = { $id: id, $now: now }
@@ -1672,6 +1691,7 @@ export class ConversationStore {
     if (patch.compactionUpToMessageId  !== undefined) { sets.push('compaction_upto_message_id = $cupto'); params.$cupto = patch.compactionUpToMessageId }
     if (patch.compactionTokensBefore   !== undefined) { sets.push('compaction_tokens_before = $ctok'); params.$ctok = patch.compactionTokensBefore }
     if (patch.titleAutoSynced          !== undefined) { sets.push('title_auto_synced = $tas'); params.$tas = patch.titleAutoSynced ? 1 : 0 }
+    if (patch.terminalLaunchedOnce     !== undefined) { sets.push('terminal_launched_once = $tlo'); params.$tlo = patch.terminalLaunchedOnce ? 1 : 0 }
     return ((this.db.prepare(`UPDATE agent_runs SET ${sets.join(', ')} WHERE id = $id`).run(params) as unknown) as Changes).changes > 0
   }
 
