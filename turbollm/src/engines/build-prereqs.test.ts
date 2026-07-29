@@ -5,20 +5,69 @@ import { buildCommands, buildEnv, CMAKE_CONFIGURE_ARGS, CMAKE_CONFIGURE_ARGS_MAC
 
 const PATH_KEY = Object.keys(process.env).find((k) => k.toLowerCase() === 'path') ?? 'PATH'
 
-test('buildEnv: no dirs → a copy of process.env (PATH unchanged)', () => {
-  const env = buildEnv([])
-  assert.equal(env[PATH_KEY], process.env[PATH_KEY])
-  assert.notEqual(env, process.env) // a copy, not the live object
+// NOTE: use delimiter-free dir names throughout — on Linux `path.delimiter` is ':', so a Windows
+// drive path like "C:\\x" would split on its own colon and make these assertions platform-fragile.
+
+/** Run `fn` with PATH pinned to `seed`, restoring the machine's real one afterward.
+ *
+ *  Any assertion about buildEnv's OUTPUT has to control its INPUT. buildEnv deliberately
+ *  normalizes PATH (drops empty/blank segments — see the anti-doubled-delimiter test below, which
+ *  encodes the real intended behavior), so "the inherited PATH comes through unchanged" is only a
+ *  coherent expectation when what was inherited was already clean. The original versions of the
+ *  two tests below read the developer's REAL PATH and asserted byte-identity, which made them pass
+ *  or fail by machine: this dev box's PATH contains both `;;` and a trailing `;`, so those
+ *  assertions and the normalization requirement contradicted each other outright and the file
+ *  failed 2/15 here while passing elsewhere (2026-07-29). */
+function withPath(seed: string, fn: () => void): void {
+  const orig = process.env[PATH_KEY]
+  try {
+    process.env[PATH_KEY] = seed
+    fn()
+  } finally {
+    if (orig === undefined) delete process.env[PATH_KEY]
+    else process.env[PATH_KEY] = orig
+  }
+}
+
+test('buildEnv: no dirs → a copy of process.env, an already-clean PATH carried through as-is', () => {
+  const clean = ['tllm_p1', 'tllm_p2'].join(delimiter)
+  withPath(clean, () => {
+    const env = buildEnv([])
+    assert.equal(env[PATH_KEY], clean)
+    assert.notEqual(env, process.env) // a copy, not the live object
+  })
 })
 
-// NOTE: use delimiter-free dir names below — on Linux `path.delimiter` is ':', so a Windows
-// drive path like "C:\\x" would split on its own colon and make these assertions platform-fragile.
+test('buildEnv: no dirs → a MESSY inherited PATH is normalized, not carried through verbatim', () => {
+  // The other half of the pair above, and the case that used to be untested despite being the
+  // one every real machine can hit: buildEnv is expected to clean this up, so a test asserting
+  // "unchanged" against such a PATH would be asserting the opposite of the intended behavior.
+  withPath(`${delimiter}tllm_p1${delimiter}${delimiter} ${delimiter}tllm_p2${delimiter}`, () => {
+    assert.equal(buildEnv([])[PATH_KEY], `tllm_p1${delimiter}tllm_p2`)
+  })
+})
+
 test('buildEnv: prepends dirs to PATH in order, before the inherited PATH', () => {
-  const a = 'tllm_dir_a'
-  const b = 'tllm_dir_b'
-  const env = buildEnv([a, b])
-  assert.ok((env[PATH_KEY] ?? '').startsWith(a + delimiter + b + delimiter))
-  assert.ok((env[PATH_KEY] ?? '').endsWith(process.env[PATH_KEY] ?? ''))
+  const inherited = ['tllm_p1', 'tllm_p2'].join(delimiter)
+  withPath(inherited, () => {
+    // Exact equality against a fixture, rather than startsWith/endsWith against whatever the
+    // machine happens to have — pins the full result including ordering.
+    assert.equal(
+      buildEnv(['tllm_dir_a', 'tllm_dir_b'])[PATH_KEY],
+      ['tllm_dir_a', 'tllm_dir_b', 'tllm_p1', 'tllm_p2'].join(delimiter),
+    )
+  })
+})
+
+test('buildEnv: every segment of the REAL inherited PATH survives, in order, whatever shape it is in', () => {
+  // Deliberately reads the live process.env — this is the property the two tests above were
+  // reaching for when they compared strings: on a real machine nothing may be dropped or
+  // reordered. Byte-identity can't be that property (a PATH with `;;` or a trailing `;` is
+  // normalized by design), but "same segments, same order, prefixed by our dirs" can, and it
+  // holds on any machine.
+  const inherited = (process.env[PATH_KEY] ?? '').split(delimiter).map((s) => s.trim()).filter(Boolean)
+  const out = (buildEnv(['tllm_dir'])[PATH_KEY] ?? '').split(delimiter)
+  assert.deepEqual(out, ['tllm_dir', ...inherited])
 })
 
 test('buildEnv: drops empty/whitespace dirs', () => {

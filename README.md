@@ -309,8 +309,16 @@ there. Entirely local; nothing leaves your machine.
   from Chat's gate.
 - **Expose it to other tools over MCP** — `turbollm mcp-server` runs a stdio MCP server so any
   MCP-compatible tool (Claude Desktop, Cursor, Windsurf, Cline, Claude Code, and more) can
-  delegate a real coding task to Code, not just chat completions. Setup snippets for any host
-  are in the Developer tab.
+  delegate a real coding task to Code, not just chat completions. Setup snippets for any host are
+  in the Developer tab.
+- **Or run Claude Code itself, inside Code** — set Settings → Code agent to `claude` and a session
+  opens the real CLI in a full-screen terminal, on your local model, in your project folder. The
+  model picker, context ring, thinking-budget slider and stats row stay right where they are: the
+  CLI replaces the transcript, not the controls. It starts in the mode you picked (auto / plan /
+  ask), the thinking budget applies live with no restart, switching models keeps your scrollback,
+  and the conversation survives a restart of TurboLLM. The terminal backend is an optional native
+  component — if it can't be built for your platform it's skipped (TurboLLM installs and runs
+  normally), and this agent simply isn't offered on that machine.
 
 </details>
 
@@ -648,6 +656,10 @@ and AMD ROCm GPUs.
 The Docker images provide an isolated environment while allowing TurboLLM to
 access your GPU directly for accelerated local LLM inference.
 
+> The `Dockerfile.*` and `docker-compose-*.yaml` files referenced below live in the
+> [GitHub repository](https://github.com/mohitsoni48/TurboLLM), not in the npm package —
+> clone the repo to use them.
+
 ---
 
 ### NVIDIA GPU (CUDA)
@@ -703,7 +715,9 @@ sudo reboot
 
 docker compose -f docker-compose-amd.yaml up -d
 ```
+
 ---
+
 ## Community
 
 Questions, ideas, and show-and-tell — join the [Discord](https://discord.gg/v6kRbV7nC).

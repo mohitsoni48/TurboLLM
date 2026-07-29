@@ -11,7 +11,7 @@ type ABlock =
   | { type: 'tool_result'; tool_use_id: string; content: string | Array<{ type: string; text?: string }> }
 // 'system' is undocumented but real: Claude Code injects hook context (e.g. SessionStart)
 // as a `role:'system'` entry directly into `messages`, not just via the top-level `system`
-// field — see mapToOpenAI's per-message role handling below.
+// field — mapToOpenAI folds every one of these into a single leading system message (see there).
 type AMessage = { role: 'user' | 'assistant' | 'system'; content: string | ABlock[] }
 
 export interface AnthropicRequest {
@@ -36,9 +36,94 @@ export interface AnthropicRequest {
 
 // ─── Mapping: Anthropic → OpenAI ──────────────────────────────────────────
 
+/** JSON-Schema keywords stripped before forwarding a tool schema to the engine. All of them are
+ *  pure *validation* hints — none changes which values are structurally valid — but llama.cpp's
+ *  JSON-schema-to-grammar converter compiles every one of them into GBNF, where they cause parse
+ *  failures that kill tool-calling for the ENTIRE request (a 400 "Failed to initialize samplers:
+ *  failed to parse grammar"), not just the offending field. Two distinct failure modes, both hit
+ *  live against Ornith 1.0 35B:
+ *
+ *  1. Invalid GBNF output — `format` (e.g. `format: 'date'` emits regex-style `\d` escapes GBNF
+ *     doesn't support) and `pattern` (an arbitrary caller-supplied regex, a strictly bigger risk
+ *     since any construct that doesn't translate cleanly — backreferences, lookaheads, unicode
+ *     classes — fails the same way via a different tool each time).
+ *
+ *  2. Grammar-size explosion — the bound keywords compile into GBNF `{m,n}` repetition operators
+ *     and enormous digit-range rules, and llama.cpp guards on rule-complexity × repetition
+ *     ("number of rules that are going to be repeated multiplied by the new repetition exceeds
+ *     sane defaults"). `maxItems: 255` becomes `(item){0,255}`; `maxLength: 255` becomes
+ *     `char{1,255}`; `maximum: 9007199254740991` becomes a SINGLE rule thousands of elements
+ *     long, densely nested with `[0-9]{15}`. That guard is reached far sooner than the numbers
+ *     suggest on models whose chat template uses an XML tool-call format (Qwen3-Coder-style
+ *     `<parameter=name>…</parameter>`, which Ornith/Qwen3.6 uses): llama.cpp emits a
+ *     character-by-character "match until `</parameter>`" state machine per string argument, so
+ *     a realistic Claude Code tool set (built-ins + MCP servers) already sits at ~5k rules
+ *     BEFORE any repetition is applied. Measured on the real failing request: 3,822 of 5,127
+ *     rules were those per-argument state machines. */
+const UNSUPPORTED_SCHEMA_KEYWORDS = new Set([
+  'format',
+  'pattern',
+  'minLength',
+  'maxLength',
+  'minItems',
+  'maxItems',
+  'minimum',
+  'maximum',
+  'exclusiveMinimum',
+  'exclusiveMaximum',
+  'multipleOf',
+])
+
+/** Keys whose VALUE is a map of caller-chosen NAME -> schema, rather than a schema itself. Their
+ *  keys are parameter names and must never be filtered as though they were schema keywords.
+ *
+ *  Missing this distinction silently deleted tool parameters: the strip below matched by key at
+ *  every depth, so a tool with a parameter literally named `pattern` lost that parameter outright.
+ *  That is not hypothetical — Claude Code's own Grep tool takes a REQUIRED `pattern` argument, and
+ *  `format`/`maximum`/`minimum` are equally ordinary parameter names. Measured before the fix: a
+ *  Grep-shaped schema carrying {pattern, path, format, maximum} reached the engine as {path}
+ *  alone, while `required: ["pattern"]` still referenced the property that had just been removed —
+ *  an internally contradictory schema advertising a tool the model cannot correctly call. */
+const SCHEMA_NAME_MAP_KEYS = new Set(['properties', 'patternProperties', '$defs', 'definitions'])
+
+function stripUnsupportedSchemaKeywords(schema: unknown): unknown {
+  if (Array.isArray(schema)) return schema.map(stripUnsupportedSchemaKeywords)
+  if (schema && typeof schema === 'object') {
+    const out: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(schema as Record<string, unknown>)) {
+      if (UNSUPPORTED_SCHEMA_KEYWORDS.has(key)) continue
+      out[key] = SCHEMA_NAME_MAP_KEYS.has(key) ? stripSchemaNameMap(value) : stripUnsupportedSchemaKeywords(value)
+    }
+    return out
+  }
+  return schema
+}
+
+/** Recurse a name -> schema map: every NAME is kept verbatim (it's the caller's parameter name),
+ *  and each VALUE goes through the normal strip, so bound keywords INSIDE a parameter's own schema
+ *  are still removed — `properties: { pattern: { type: 'string', maxLength: 2000 } }` keeps the
+ *  `pattern` parameter and drops its `maxLength`. */
+function stripSchemaNameMap(map: unknown): unknown {
+  if (!map || typeof map !== 'object' || Array.isArray(map)) return stripUnsupportedSchemaKeywords(map)
+  const out: Record<string, unknown> = {}
+  for (const [name, sub] of Object.entries(map as Record<string, unknown>)) {
+    out[name] = stripUnsupportedSchemaKeywords(sub)
+  }
+  return out
+}
+
 export function mapToOpenAI(req: AnthropicRequest): Record<string, unknown> {
   const messages: Record<string, unknown>[] = []
 
+  // Collect EVERY system-role text into ONE combined message at index 0 — Claude Code sometimes
+  // injects a role:'system' entry directly into `messages` (e.g. a SessionStart-hook context
+  // block) IN ADDITION to the top-level `system` field. Emitting each at its own original position
+  // (the prior behavior) produced an array like [system, user, assistant, system, ...] — a strict
+  // jinja chat template (Qwen3.6/Ornith) rejects that outright with `raise_exception('System
+  // message must be at the beginning')`, a real 400 hit live via a terminal-agent Claude Code
+  // session. Folding every system-role text into one leading message satisfies that constraint
+  // for any template while dropping no content.
+  const systemParts: string[] = []
   if (req.system) {
     const text =
       typeof req.system === 'string'
@@ -47,10 +132,21 @@ export function mapToOpenAI(req: AnthropicRequest): Record<string, unknown> {
             .filter((b) => b.type === 'text')
             .map((b) => (b as { text?: string }).text ?? '')
             .join('\n')
-    if (text) messages.push({ role: 'system', content: text })
+    if (text) systemParts.push(text)
   }
+  for (const msg of req.messages) {
+    if (msg.role !== 'system') continue
+    const raw = msg.content
+    const text =
+      typeof raw === 'string'
+        ? raw
+        : raw.filter((b) => b.type === 'text').map((b) => (b as { text?: string }).text ?? '').join('\n')
+    if (text) systemParts.push(text)
+  }
+  if (systemParts.length > 0) messages.push({ role: 'system', content: systemParts.join('\n\n') })
 
   for (const msg of req.messages) {
+    if (msg.role === 'system') continue // already folded into the single leading system message above
     const raw = msg.content
     if (typeof raw === 'string') {
       messages.push({ role: msg.role, content: raw })
@@ -88,20 +184,6 @@ export function mapToOpenAI(req: AnthropicRequest): Record<string, unknown> {
             : parts
         messages.push({ role: 'user', content })
       }
-    } else if ((msg.role as string) === 'system') {
-      // Claude Code sometimes injects a `role: 'system'` entry directly into `messages`
-      // (e.g. a SessionStart-hook context block), separate from the top-level `system`
-      // field. Falling through to the assistant branch below relabeled this as something
-      // the ASSISTANT had already said — which made the model see a conversation that
-      // looked already finished, so it emitted an immediate end-of-turn with zero output
-      // (a real "no response" bug, confirmed via a live capture of an actual Claude Code
-      // request: a `role:'system'` message as messages[1], mis-mapped to `role:'assistant'`,
-      // reproduced a stream with output_tokens:1 and no content blocks at all).
-      const text = raw
-        .filter((b) => b.type === 'text')
-        .map((b) => (b as { text?: string }).text ?? '')
-        .join('\n')
-      if (text) messages.push({ role: 'system', content: text })
     } else {
       let text = ''
       const toolCalls: unknown[] = []
@@ -145,7 +227,7 @@ export function mapToOpenAI(req: AnthropicRequest): Record<string, unknown> {
   if (req.tools?.length) {
     oai.tools = req.tools.map((t) => ({
       type: 'function',
-      function: { name: t.name, description: t.description, parameters: t.input_schema },
+      function: { name: t.name, description: t.description, parameters: stripUnsupportedSchemaKeywords(t.input_schema) },
     }))
     const tc = req.tool_choice
     if (tc)
@@ -269,8 +351,12 @@ type OAIDelta = {
   }>
 }
 
-/** Final usage observed while translating a stream (B4 session stats). */
-export type StreamUsage = { inputTokens: number; outputTokens: number }
+/** Final usage observed while translating a stream (B4 session stats). `promptTps`/`genTps` are
+ *  the ENGINE's own per-phase rates (llama.cpp's `timings.prompt_per_second` /
+ *  `predicted_per_second`), passed through untouched — undefined when the engine reported none.
+ *  They exist here because prefill and decode are sequential phases: deriving either rate from
+ *  the request's total wall-clock understates it by however long the other phase took (ADR-300). */
+export type StreamUsage = { inputTokens: number; outputTokens: number; promptTps?: number; genTps?: number }
 
 /** Live per-request progress published to the engine card while translating a
  *  gateway stream. Mirrors the manager's LiveGen shape without importing it. */
@@ -291,6 +377,8 @@ export async function* streamToAnthropic(
   let outputTokens = 0
   let inputTokens = 0
   let cacheReadTokens = 0
+  let promptTps = 0
+  let genTps = 0
   let liveOut = 0 // running generated-token count for the live engine-card row
 
   yield sse('message_start', {
@@ -344,9 +432,16 @@ export async function* streamToAnthropic(
         if (usage?.prompt_tokens) inputTokens = usage.prompt_tokens
         // Cache-reused prompt tokens: current llama.cpp reports `cache_n`; older builds used
         // `prompt_n_reuse`. Accept either so cache_read_input_tokens isn't silently stuck at 0.
-        const timings = chunk.timings as { cache_n?: number; prompt_n_reuse?: number } | undefined
+        const timings = chunk.timings as {
+          cache_n?: number; prompt_n_reuse?: number; prompt_per_second?: number; predicted_per_second?: number
+        } | undefined
         const cacheN = timings?.cache_n ?? timings?.prompt_n_reuse
         if (cacheN != null) cacheReadTokens = cacheN
+        // Same object already being read for cache_n — the real per-phase rates were sitting right
+        // here unread, which is why a terminal-agent session's stats row had to derive them from
+        // wall-clock and got decode ~6x too low (ADR-300).
+        if (timings?.prompt_per_second) promptTps = timings.prompt_per_second
+        if (timings?.predicted_per_second) genTps = timings.predicted_per_second
 
         const choices = chunk.choices as Array<{ delta?: OAIDelta; finish_reason?: string | null }> | undefined
         if (!choices?.length) continue
@@ -450,7 +545,14 @@ export async function* streamToAnthropic(
     yield sse('message_stop', {})
     // Best-effort session stats (B4): hand off the final usage. Never throws.
     if (onUsage) {
-      try { onUsage({ inputTokens, outputTokens }) } catch { /* swallow */ }
+      try {
+        onUsage({
+          inputTokens,
+          outputTokens,
+          promptTps: promptTps > 0 ? promptTps : undefined,
+          genTps: genTps > 0 ? genTps : undefined,
+        })
+      } catch { /* swallow */ }
     }
   }
 }

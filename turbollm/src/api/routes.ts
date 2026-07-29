@@ -16,6 +16,7 @@ import { ProbeError, probe } from '../engines/probe'
 import { resolveServerBinary, suggestEngineName } from '../engines/scan'
 import { generateApiKey, isLocalRequest } from '../auth'
 import { enabledFeatures } from '../features'
+import { isTerminalBackendAvailable } from '../terminal/terminal-routes'
 import {
   LLAMA_BUILD,
   availableBackends,
@@ -111,6 +112,10 @@ export function registerApi(app: Hono, d: Deps): void {
       agentTasks: d.agentTasks?.list() ?? [],
       // In-app compile-from-source status (ADR-100): live phase + log tail while a build runs.
       engineBuild: d.build.get(),
+      // Whether this install can spawn a PTY at all (node-pty is an optional native dependency,
+      // so a healthy install may legitimately not have it). The Code agent picker reads this to
+      // decide whether a terminal-only agent is even offerable on this machine.
+      terminalAvailable: isTerminalBackendAvailable(),
       // ComfyUI GPU coordination: lets the UI explain a paused/unloaded engine.
       // Also expose the installed gate node version so the UI can prompt an upgrade.
       comfyui: (() => {
@@ -1238,8 +1243,17 @@ export function registerApi(app: Hono, d: Deps): void {
       // all under the global load lock so this can't race another load. Fire-and-forget:
       // the UI polls /status for the starting→running/error transition, so we return 202
       // immediately rather than blocking the HTTP request on a multi-second load.
-      void d.manager
-        .load(opts, { beforeStart: () => d.comfy?.freeComfyUIBeforeLoad() ?? Promise.resolve() })
+      //
+      // Wrapped in the router's own swap-serialization queue (same one route()/doLoad() use)
+      // so a concurrent auto-swap request (e.g. a terminal-agent session's own gateway
+      // traffic) can't independently decide "the primary is occupied mid-switch, evict it and
+      // load MY model instead" — it now waits for this manual switch to fully settle first.
+      // Without this, the two paths only shared the lower-level Manager.runExclusive gate,
+      // which prevents a double-SPAWN but not a second caller silently overriding which model
+      // ends up loaded — the model-router.ts withSwapLock doc comment has the full trace.
+      void d.modelRouter
+        .withSwapLock(() => d.manager.load(opts, { beforeStart: () => d.comfy?.freeComfyUIBeforeLoad() ?? Promise.resolve() }))
+        .then(() => d.modelRouter.markPrimaryLoaded())
         .catch((e) => console.warn(`engine load failed: ${e}`))
       d.store.update((x) => {
         x.lastLoaded = { modelKey: entry.key, engineId: active.id }
@@ -1258,9 +1272,11 @@ export function registerApi(app: Hono, d: Deps): void {
     }
     if (!modelPath) return err(c, 409, 'no_such_model', 'No model specified. Pick one from the Models screen.')
     const opts: StartOpts = { engine: active, model: deriveModel(modelPath, name, extra), modelPath, extraArgs: extra }
-    // Same single-chokepoint, fire-and-forget load as the resolved-model branch above.
-    void d.manager
-      .load(opts, { beforeStart: () => d.comfy?.freeComfyUIBeforeLoad() ?? Promise.resolve() })
+    // Same single-chokepoint, fire-and-forget, swap-lock-coordinated load as the
+    // resolved-model branch above.
+    void d.modelRouter
+      .withSwapLock(() => d.manager.load(opts, { beforeStart: () => d.comfy?.freeComfyUIBeforeLoad() ?? Promise.resolve() }))
+      .then(() => d.modelRouter.markPrimaryLoaded())
       .catch((e) => console.warn(`engine load failed: ${e}`))
     return c.json({ ok: true }, 202)
   })
@@ -1559,7 +1575,7 @@ export function registerApi(app: Hono, d: Deps): void {
       tavilyApiKey?: string
       search?: { provider?: string; tavilyApiKey?: string; kagiApiKey?: string; searxngUrl?: string }
       build?: { toolchainDirs?: string[] }
-      code?: { agentsMdProjectCandidates?: string[]; agentsMdGlobalCandidates?: string[] }
+      code?: { agentsMdProjectCandidates?: string[]; agentsMdGlobalCandidates?: string[]; defaultAgent?: string }
       toolPolicies?: Record<string, string>
       autoAllowAll?: boolean
       cloudDeploy?: { runpodTemplateId?: string }
@@ -1713,6 +1729,17 @@ export function registerApi(app: Hono, d: Deps): void {
       out(list)
     }
 
+    // Which coding agent new Code sessions launch with (config.ts's CodeConfig doc comment) —
+    // clean 400 on garbage rather than silently falling back at read time.
+    let defaultAgent: 'turbollm' | 'pi' | 'claude' | 'opencode' | undefined
+    if (b.code?.defaultAgent !== undefined) {
+      const v = b.code.defaultAgent
+      if (v !== 'turbollm' && v !== 'pi' && v !== 'claude' && v !== 'opencode') {
+        return err(c, 400, 'invalid_config_value', 'code.defaultAgent must be one of: turbollm, pi, claude, opencode.')
+      }
+      defaultAgent = v
+    }
+
     // Tool-call approval gate: global per-tool policy map. Validate every value is
     // one of 'ask' | 'allow' | 'deny' so a garbled patch gets a clean 400, not a
     // silently-dropped/garbage config.
@@ -1740,6 +1767,7 @@ export function registerApi(app: Hono, d: Deps): void {
       if (toolchainDirs !== undefined) cfg.build.toolchainDirs = toolchainDirs
       if (agentsMdProjectCandidates !== undefined) cfg.code.agentsMdProjectCandidates = agentsMdProjectCandidates
       if (agentsMdGlobalCandidates !== undefined) cfg.code.agentsMdGlobalCandidates = agentsMdGlobalCandidates
+      if (defaultAgent !== undefined) cfg.code.defaultAgent = defaultAgent
       if (toolPolicies !== undefined) cfg.tools.toolPolicies = toolPolicies
       if (b.autoAllowAll !== undefined) cfg.tools.autoAllowAll = !!b.autoAllowAll
       if (b.autoLoadOnStart !== undefined) cfg.autoLoadOnStart = !!b.autoLoadOnStart

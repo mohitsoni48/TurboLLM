@@ -10,6 +10,13 @@ import { describe, expect, it } from 'vitest'
 
 const CODE_SCREENS_DIR = join(import.meta.dirname, '.')
 
+// Files that legitimately use hex/functional colors. Empty — TerminalView.tsx used to need an
+// exception here (xterm.js's theme object can't take CSS variables directly), but it now reads
+// resolved --term-* token values via getComputedStyle at runtime instead of hardcoding hex, so
+// no file needs one anymore. Kept as a real (if currently empty) mechanism rather than removed
+// outright, since a genuinely unavoidable case may come up again.
+const STRAY_HEX_EXCEPTIONS = new Set<string>()
+
 // `#`-prefixed hex color literals (3/4/6/8 hex digits, word-boundaried so this doesn't false-hit
 // on things like URL fragments or non-color hex-looking tokens) and raw rgba()/hsla() function
 // calls — the two ways to bypass `var(--token)` and inline a color directly.
@@ -30,6 +37,8 @@ describe('Code screens: no stray hex/rgba/hsla outside the token system', () => 
   })
 
   for (const file of files) {
+    // Skip files with explicit exceptions (e.g., xterm.js theme objects need hex).
+    if (STRAY_HEX_EXCEPTIONS.has(file.split(/[\\/]/).pop()!.replace('.tsx', ''))) continue
     it(`${file.split(/[\\/]/).pop()} uses only var(--token) for color, no inline hex/rgba/hsla`, () => {
       const src = readFileSync(file, 'utf8')
       const hexMatch = src.match(HEX_PATTERN)

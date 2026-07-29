@@ -25,6 +25,63 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.9.1] - 2026-07-29
+
+**Run Claude Code itself inside a Code session, on your local model — plus Docker deployment for NVIDIA/AMD GPUs, and a batch of gateway fixes.**
+
+### Added
+- **Claude Code runs inside Code.** Pick `claude` as your Code agent (Settings → Code agent) and a
+  session opens it in a full-screen terminal on your local model, in your project folder. The
+  model picker, context ring, thinking-budget slider and stats row all keep working around it —
+  the CLI replaces the transcript, not the controls. This needs an optional native terminal
+  component; where it can't be installed, TurboLLM runs normally and simply doesn't offer the
+  agent.
+- **The CLI starts in the mode you picked.** Auto, Plan first, or Ask each step now carries over to
+  Claude Code's own permission mode instead of it always starting on its default.
+- **Terminal sessions survive a daemon restart.** Restarting TurboLLM no longer loses the
+  conversation — reopening the session resumes that exact conversation, not whichever one happened
+  to be most recent in the folder.
+- **The thinking-budget slider applies to the CLI live**, per request, with no restart.
+- **Switching models keeps your scrollback.** Choosing a different model drives the CLI's own
+  `/model` command instead of killing and relaunching the terminal.
+- **Docker deployment for NVIDIA (CUDA) and AMD (ROCm) GPUs** — ready-made `Dockerfile`s and
+  `docker-compose` configurations that run TurboLLM in an isolated container while still reaching
+  your GPU directly. Setup steps for both are in the README. (Thanks @ahmadteeb, #83.)
+
+### Changed
+- **The Code stats row is readable.** Each number is labelled (`Think 3.0k · Context 15% of 200.0k
+  · Last turn ↑36.6k ↓36 · 2.0 tok/s`) instead of one run-on string, and it's now the same
+  component whether you're using the built-in agent or a CLI.
+- **The terminal pane** got the same side margins as the bar beneath it, and no longer shows a
+  scrollbar over the CLI's own interface (wheel scrolling is unchanged).
+- **The Code agent picker offers `turbollm` and `claude` only.** `pi` and `opencode` are withdrawn
+  until their terminal integration is verified against a real binary — no half-working choices.
+
+### Fixed
+- **`400 Failed to initialize samplers: failed to parse grammar`** when using tools with some
+  models — certain validation keywords in a tool's schema (length/size/range limits) blew
+  llama.cpp's grammar limits and failed the *entire* request, not just the offending field.
+- **Requests rejected by models with strict chat templates** ("System message must be at the
+  beginning") — mid-conversation system messages are now folded into the leading one.
+- **Engine errors are reported as they really are.** A bad request, an incompatible model, an
+  overloaded engine and a crash used to arrive as the same generic 500 with no way to tell them
+  apart.
+- **Switching models while an agent was working could start a second engine** and load two models
+  at once.
+- **Android: GPU detection and the Engines tab.** GPU detection now works on Android, and the
+  Engines tab renders correctly there instead of breaking. (Thanks @ciroprogamer, #80.)
+
+### Discord
+- You can now run **Claude Code itself inside TurboLLM's Code tab**, driven by your local model —
+  in a real terminal, in your project folder, with the model picker and thinking-budget slider
+  still right there. It picks up the mode you chose, and survives a restart of TurboLLM.
+- Fixed the **`failed to parse grammar` error** that broke tool calls on some models, and requests
+  being rejected outright by models with strict chat templates.
+- Model errors now say what actually went wrong instead of a generic failure.
+- **TurboLLM now runs in Docker**, with ready-made NVIDIA (CUDA) and AMD (ROCm) setups that still
+  reach your GPU directly — thanks to @ahmadteeb. And on Android, GPU detection and the Engines
+  tab are fixed — thanks to @ciroprogamer.
+
 ## [1.9.0] - 2026-07-25
 
 **Code is now available to everyone by default, and can be exposed to other AI coding tools over MCP.**

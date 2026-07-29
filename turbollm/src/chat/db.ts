@@ -118,6 +118,10 @@ export interface AgentRun {
   repoRoot?: string
   /** The sidebar "branch" label captured at creation (git rev-parse of repoRoot). */
   repoBranch?: string
+  /** Which coding agent this session launches (config.ts's code.defaultAgent, snapshotted at
+   *  creation — code-routes.ts). 'turbollm' (or absent, for pre-existing rows) is the built-in
+   *  chat UI; the others launch full-screen inside the embedded terminal. */
+  codeAgent?: 'turbollm' | 'pi' | 'claude' | 'opencode'
   /** Whether the composer's "isolate in a worktree" tickbox was checked. */
   useWorktree?: boolean
   /** Captured worktree intent — stored, NOT acted on in Phase 1 (fast-follow). */
@@ -164,6 +168,13 @@ export interface AgentRun {
    *  only at the session's first successful turn, never again, so a later manual rename of the
    *  session sticks instead of reverting on the next completed turn. */
   titleAutoSynced?: boolean
+  // ── Terminal-agent auto-resume across a daemon restart (v37) ────────────────────────────
+  /** True once a terminal has been created for this session at least once. terminal-routes.ts
+   *  reads this BEFORE creating a new terminal to decide whether this is a genuinely first-ever
+   *  launch or a restart-reconnect (the in-memory TerminalManager/PTY died with the daemon, but
+   *  the session itself didn't) — the latter passes the agent's own continue/resume flag so the
+   *  CLI picks its interrupted conversation back up instead of starting a blank one. */
+  terminalLaunchedOnce?: boolean
 }
 
 /** One per-Hitman track-record row (spec 13 §12.3). */
@@ -475,7 +486,7 @@ export interface Message {
 }
 
 interface ConvRow { id: string; title: string; system_prompt: string; model_key: string; sampling: string; expert_mode: number; tool_policy: string | null; kind: string | null; folder_id: string | null; tool_overrides: string | null; agent_id: string | null; completed_at: string | null; read_scope: string | null; agent_mode: string | null; skill_ids: string | null; allowed_tools: string | null; preserve_thinking: number; created_at: string; updated_at: string }
-interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; agent_id: string | null; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null; archived_at: string | null; completion: string | null; repo_root: string | null; repo_branch: string | null; use_worktree: number | null; worktree_branch: string | null; worktree_base: string | null; lines_added: number | null; lines_removed: number | null; compaction_summary: string | null; compaction_upto_message_id: string | null; compaction_tokens_before: number | null; cleared_upto_message_id: string | null; reverted_from_message_id: string | null; title_auto_synced: number | null }
+interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; agent_id: string | null; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null; archived_at: string | null; completion: string | null; repo_root: string | null; repo_branch: string | null; use_worktree: number | null; worktree_branch: string | null; worktree_base: string | null; lines_added: number | null; lines_removed: number | null; compaction_summary: string | null; compaction_upto_message_id: string | null; compaction_tokens_before: number | null; cleared_upto_message_id: string | null; reverted_from_message_id: string | null; title_auto_synced: number | null; code_agent: string | null; terminal_launched_once: number | null }
 interface FolderRow { id: string; name: string; sort_order: number; created_at: string; updated_at: string }
 interface MsgRow  { id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string; reasoning: string; attachments: string; text_attachments: string | null; tool_calls: string | null; timeline: string | null; stats: string; model_key: string | null; research_meta: string | null; created_at: string; variant_group: string | null; is_active: number; branch_of: string | null; edited: number }
 
@@ -516,6 +527,7 @@ function rowToAgentRun(r: AgentRunRow): AgentRun {
     completion: (r.completion as AgentRun['completion']) ?? undefined,
     repoRoot: r.repo_root ?? undefined,
     repoBranch: r.repo_branch ?? undefined,
+    codeAgent: (r.code_agent as AgentRun['codeAgent']) ?? undefined,
     useWorktree: r.use_worktree === null ? undefined : r.use_worktree === 1,
     worktreeBranch: r.worktree_branch ?? undefined,
     worktreeBase: r.worktree_base ?? undefined,
@@ -527,6 +539,7 @@ function rowToAgentRun(r: AgentRunRow): AgentRun {
     clearedUpToMessageId: r.cleared_upto_message_id ?? undefined,
     revertedFromMessageId: r.reverted_from_message_id ?? undefined,
     titleAutoSynced: r.title_auto_synced === 1,
+    terminalLaunchedOnce: r.terminal_launched_once === 1,
   }
 }
 
@@ -938,6 +951,63 @@ export class ConversationStore {
         PRAGMA user_version = 34;
       `)
     }
+    // v35 (ADR-283, Code agent selector): which coding agent a session launches with
+    // (config.ts's code.defaultAgent, snapshotted at creation). Additive + nullable —
+    // existing rows get NULL, decoded as undefined (→ 'turbollm') in rowToAgentRun.
+    if (v < 35) {
+      if (!this.hasColumn('agent_runs', 'code_agent')) this.db.exec(`ALTER TABLE agent_runs ADD COLUMN code_agent TEXT;`)
+      this.db.exec(`PRAGMA user_version = 35;`)
+    }
+    // v36 (ADR-284, terminal-agent composer parity): api_usage rows gain a code_session_id
+    // (which Code session a gateway request belongs to, resolved from the session-scoped
+    // token — session-auth.ts) and duration_ms (elapsed wall-clock time of the request, so
+    // prompt/gen tokens-per-second can be computed the same way lastRealStats already is for
+    // chat sessions). Both additive + nullable — pre-existing rows (and any request whose
+    // token doesn't resolve to a Code session) simply have no session/timing to attribute.
+    if (v < 36) {
+      if (!this.hasColumn('api_usage', 'code_session_id')) this.db.exec(`ALTER TABLE api_usage ADD COLUMN code_session_id TEXT;`)
+      if (!this.hasColumn('api_usage', 'duration_ms')) this.db.exec(`ALTER TABLE api_usage ADD COLUMN duration_ms INTEGER;`)
+      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_api_usage_code_session ON api_usage(code_session_id, created_at);`)
+      this.db.exec(`PRAGMA user_version = 36;`)
+    }
+    // v37 (terminal-agent auto-resume across a daemon restart): whether a terminal has ever
+    // been created for this session — lets terminal-routes.ts tell a genuinely first-ever
+    // launch apart from a restart-reconnect (the in-memory PTY died with the daemon, the
+    // session didn't) and pass the CLI's own continue/resume flag on the latter. Additive +
+    // defaulted to 0 — every pre-existing row reads as "never launched", which just means its
+    // NEXT terminal open is treated as fresh (the same behavior as today), never wrongly
+    // resumed into a conversation that was never actually interrupted.
+    if (v < 37) {
+      if (!this.hasColumn('agent_runs', 'terminal_launched_once')) this.db.exec(`ALTER TABLE agent_runs ADD COLUMN terminal_launched_once INTEGER NOT NULL DEFAULT 0;`)
+      this.db.exec(`PRAGMA user_version = 37;`)
+    }
+    // v38 (one-time data fix, same day as v37): v37's terminal_launched_once meant "has a
+    // terminal been created before" and its next-launch flag was claude's --continue (resume
+    // the most recent conversation in this DIRECTORY). Found live within hours of shipping:
+    // --continue is ambiguous the moment two Code sessions share a repoRoot, so it was replaced
+    // with --session-id/--resume keyed on THIS session's own id — but any row already flagged
+    // true under the OLD scheme was never registered with the CLI under that exact id, so its
+    // next launch would send --resume <id-the-CLI-has-never-seen> and fail outright ("No
+    // conversation found with session ID: ..."). Reset unconditionally: every session's next
+    // terminal launch is treated as a fresh --session-id registration exactly once, then
+    // resumes correctly from then on — a strictly safe replay of v37's own default for rows
+    // that, in practice, only existed for a few hours before this fix landed.
+    if (v < 38) {
+      this.db.exec(`UPDATE agent_runs SET terminal_launched_once = 0;`)
+      this.db.exec(`PRAGMA user_version = 38;`)
+    }
+    // v39 (ADR-300): the engine's OWN per-phase rates, as llama.cpp measured them
+    // (`timings.prompt_per_second` / `timings.predicted_per_second`). v36 stored only a single
+    // `duration_ms` for the whole request and derived both rates from it, which cannot be right
+    // for either phase — prefill and decode run one after the other, so dividing each token count
+    // by the TOTAL duration understates both. Measured on a live claude session: 763 generated
+    // tokens over a 62 s request read as 12.3 tok/s while the engine's own decode rate was ~78.
+    // Additive + nullable: pre-existing rows keep the old derived approximation (below).
+    if (v < 39) {
+      if (!this.hasColumn('api_usage', 'prompt_tps')) this.db.exec(`ALTER TABLE api_usage ADD COLUMN prompt_tps REAL;`)
+      if (!this.hasColumn('api_usage', 'gen_tps')) this.db.exec(`ALTER TABLE api_usage ADD COLUMN gen_tps REAL;`)
+      this.db.exec(`PRAGMA user_version = 39;`)
+    }
   }
 
   listConversations(q?: string, kind: 'chat' | 'agent' | 'all' = 'all'): Conversation[] {
@@ -1297,11 +1367,18 @@ export class ConversationStore {
 
   /** Insert one completed gateway request (GitHub #71) — called from the two gateway entry
    *  points (gateway.ts) right where in-app chat already records into `messages`. Fully
-   *  additive/fail-safe: callers wrap this the same way `recordCompletion` is wrapped. */
-  recordApiUsage(rec: { source: ApiUsageSource; modelKey: string | null; promptTokens: number; genTokens: number }): void {
+   *  additive/fail-safe: callers wrap this the same way `recordCompletion` is wrapped.
+   *  `codeSessionId`/`durationMs` (ADR-284) are only populated for a terminal-agent session's
+   *  own token-identified traffic — undefined for every other gateway client, same as before. */
+  recordApiUsage(rec: { source: ApiUsageSource; modelKey: string | null; promptTokens: number; genTokens: number; codeSessionId?: string | null; durationMs?: number | null; promptTps?: number | null; genTps?: number | null }): void {
+    // `promptTps`/`genTps` (ADR-300) are the ENGINE's own measurements, straight from the
+    // llama.cpp response's `timings` — not anything computed here. Passing them through is the
+    // whole point: each phase gets its own real rate instead of both being divided by one
+    // wall-clock. Absent (an engine that reports no timings) → null, and the reader falls back.
+    const rate = (v: number | null | undefined) => (v != null && Number.isFinite(v) && v > 0 ? v : null)
     this.db.prepare(`
-      INSERT INTO api_usage (id, created_at, source, model_key, prompt_tokens, gen_tokens)
-      VALUES ($id, $createdAt, $source, $modelKey, $promptTokens, $genTokens)
+      INSERT INTO api_usage (id, created_at, source, model_key, prompt_tokens, gen_tokens, code_session_id, duration_ms, prompt_tps, gen_tps)
+      VALUES ($id, $createdAt, $source, $modelKey, $promptTokens, $genTokens, $codeSessionId, $durationMs, $promptTps, $genTps)
     `).run({
       $id: randomUUID(),
       $createdAt: new Date().toISOString(),
@@ -1309,7 +1386,41 @@ export class ConversationStore {
       $modelKey: rec.modelKey,
       $promptTokens: Math.max(0, Math.floor(rec.promptTokens) || 0),
       $genTokens: Math.max(0, Math.floor(rec.genTokens) || 0),
+      $codeSessionId: rec.codeSessionId ?? null,
+      $durationMs: rec.durationMs != null && Number.isFinite(rec.durationMs) ? Math.max(0, Math.floor(rec.durationMs)) : null,
+      $promptTps: rate(rec.promptTps),
+      $genTps: rate(rec.genTps),
     } as P)
+  }
+
+  /** Most recent completed gateway request attributed to a terminal-agent Code session
+   *  (ADR-284) — powers TerminalToolbar.tsx's composer-parity stats row the same way
+   *  `lastRealStats` already does for a 'turbollm' chat session's last turn. null when the
+   *  session has made no gateway requests yet (fresh session, or a non-terminal-agent one). */
+  getLastApiUsageForSession(codeSessionId: string): { promptTokens: number; genTokens: number; promptTps: number | null; genTps: number | null } | null {
+    const row = this.db.prepare(`
+      SELECT prompt_tokens, gen_tokens, duration_ms, prompt_tps, gen_tps FROM api_usage
+      WHERE code_session_id = $codeSessionId
+      ORDER BY created_at DESC LIMIT 1
+    `).get({ $codeSessionId: codeSessionId } as P) as unknown as { prompt_tokens: number; gen_tokens: number; duration_ms: number | null; prompt_tps: number | null; gen_tps: number | null } | undefined
+    if (!row) return null
+    // The engine's own per-phase rates when the row has them (ADR-300) — llama.cpp times prefill
+    // and decode separately and reports each, which is the only way either number can be right.
+    //
+    // The fallback below (both counts ÷ the request's TOTAL wall-clock) is what every row used to
+    // get, and it is wrong for both phases by construction: prefill and decode run one after the
+    // other, so neither occupies the full duration. Live measurement that started this: 763
+    // generated tokens on a 62 s claude request came out as 12.3 tok/s against a real decode rate
+    // of ~78. It is kept ONLY so pre-v39 rows still show something rather than nothing, and it is
+    // deliberately the lower-priority branch — a new row always carries the real rates unless the
+    // engine reported none.
+    const seconds = row.duration_ms != null && row.duration_ms > 0 ? row.duration_ms / 1000 : null
+    return {
+      promptTokens: row.prompt_tokens,
+      genTokens: row.gen_tokens,
+      promptTps: row.prompt_tps ?? (seconds ? row.prompt_tokens / seconds : null),
+      genTps: row.gen_tps ?? (seconds ? row.gen_tokens / seconds : null),
+    }
   }
 
   /** Gateway (external-client) token usage — see `ApiUsageStats`'s doc comment for why this
@@ -1568,13 +1679,13 @@ export class ConversationStore {
 
   // ── Agent run methods (v8 migration) ──────────────────────────────────────
 
-  createAgentRun(params: { convId: string; title: string; allowedTools: string[]; agentId?: string; repoRoot?: string; repoBranch?: string; useWorktree?: boolean; worktreeBranch?: string; worktreeBase?: string }): AgentRun {
+  createAgentRun(params: { convId: string; title: string; allowedTools: string[]; agentId?: string; repoRoot?: string; repoBranch?: string; useWorktree?: boolean; worktreeBranch?: string; worktreeBase?: string; codeAgent?: 'turbollm' | 'pi' | 'claude' | 'opencode' }): AgentRun {
     const id = randomUUID()
     const now = new Date().toISOString()
     const agentId = params.agentId ?? null
     // Code runs carry repo/worktree metadata (v28); background 'agent' runs pass none of it
     // and every code column is written NULL (byte-identical to the pre-v28 insert for them).
-    this.db.prepare(`INSERT INTO agent_runs (id,conv_id,title,status,allowed_tools,agent_id,repo_root,repo_branch,use_worktree,worktree_branch,worktree_base,lines_added,lines_removed,created_at,updated_at) VALUES ($id,$cid,$title,'queued',$at,$aid,$rr,$rb,$uw,$wb,$wbase,$la,$lr,$now,$now)`)
+    this.db.prepare(`INSERT INTO agent_runs (id,conv_id,title,status,allowed_tools,agent_id,repo_root,repo_branch,use_worktree,worktree_branch,worktree_base,lines_added,lines_removed,code_agent,created_at,updated_at) VALUES ($id,$cid,$title,'queued',$at,$aid,$rr,$rb,$uw,$wb,$wbase,$la,$lr,$ca,$now,$now)`)
       .run({
         $id: id, $cid: params.convId, $title: params.title, $at: JSON.stringify(params.allowedTools), $aid: agentId,
         $rr: params.repoRoot ?? null,
@@ -1586,6 +1697,7 @@ export class ConversationStore {
         // sidebar shows +0/-0 rather than a blank; a background 'agent' run leaves them NULL.
         $la: params.repoRoot !== undefined ? 0 : null,
         $lr: params.repoRoot !== undefined ? 0 : null,
+        $ca: params.codeAgent ?? null,
         $now: now,
       } as P)
     return this.getAgentRun(id)!
@@ -1606,7 +1718,7 @@ export class ConversationStore {
     return (this.db.prepare(`SELECT * FROM agent_runs ORDER BY updated_at DESC LIMIT 200`).all() as unknown as AgentRunRow[]).map(rowToAgentRun)
   }
 
-  updateAgentRun(id: string, patch: Partial<Pick<AgentRun, 'status' | 'error' | 'startedAt' | 'endedAt' | 'title' | 'compactionSummary' | 'compactionUpToMessageId' | 'compactionTokensBefore' | 'titleAutoSynced'>>): boolean {
+  updateAgentRun(id: string, patch: Partial<Pick<AgentRun, 'status' | 'error' | 'startedAt' | 'endedAt' | 'title' | 'compactionSummary' | 'compactionUpToMessageId' | 'compactionTokensBefore' | 'titleAutoSynced' | 'terminalLaunchedOnce'>>): boolean {
     const now = new Date().toISOString()
     const sets: string[] = ['updated_at = $now']
     const params: Record<string, SQLInputValue> = { $id: id, $now: now }
@@ -1619,6 +1731,7 @@ export class ConversationStore {
     if (patch.compactionUpToMessageId  !== undefined) { sets.push('compaction_upto_message_id = $cupto'); params.$cupto = patch.compactionUpToMessageId }
     if (patch.compactionTokensBefore   !== undefined) { sets.push('compaction_tokens_before = $ctok'); params.$ctok = patch.compactionTokensBefore }
     if (patch.titleAutoSynced          !== undefined) { sets.push('title_auto_synced = $tas'); params.$tas = patch.titleAutoSynced ? 1 : 0 }
+    if (patch.terminalLaunchedOnce     !== undefined) { sets.push('terminal_launched_once = $tlo'); params.$tlo = patch.terminalLaunchedOnce ? 1 : 0 }
     return ((this.db.prepare(`UPDATE agent_runs SET ${sets.join(', ')} WHERE id = $id`).run(params) as unknown) as Changes).changes > 0
   }
 

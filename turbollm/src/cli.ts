@@ -33,6 +33,8 @@ import { launchCli } from './cli-launch'
 import { writePidfile, removePidfile, stopDaemon, resolveDaemonPort } from './daemon-pid'
 import { runMcpServer } from './mcp-server'
 import { createApp } from './server'
+import { registerTerminalWs } from './terminal/terminal-routes'
+import { reapStaleTerminals, killTrackedTerminalsSync } from './terminal/terminal-manager'
 import { provisionTunnelApiKey } from './auth'
 import { TunnelManager, reapStaleTunnels, killTrackedTunnelsSync } from './tunnel/manager'
 import type { Deps } from './deps'
@@ -122,14 +124,34 @@ if (argv[0] === 'launch') {
     explicitPort,
     configuredDaemonPort(launchConfigPath),
   )
+  // Session-scoped auth token (terminal-routes.ts, session-auth.ts) — lets the gateway tell
+  // which Code session's terminal this launch belongs to, for the live thinking-budget
+  // override and usage-stat attribution. Undefined for a manually-run `turbollm launch`
+  // (falls back to the shared static AUTH_TOKEN, cli-launch.ts).
+  const authToken = argValue('--token', '') || undefined
   // Everything after `launch <cli>` is forwarded to the CLI, minus our own flags.
   const passthrough = argv.slice(2).filter(
     (a, i, arr) =>
       a !== '--port' && arr[i - 1] !== '--port' &&
       a !== '--model' && arr[i - 1] !== '--model' &&
-      a !== '--config' && arr[i - 1] !== '--config',
+      a !== '--config' && arr[i - 1] !== '--config' &&
+      a !== '--token' && arr[i - 1] !== '--token',
   )
-  const code = await launchCli(target, port, passthrough, undefined, modelKey)
+  const code = await launchCli(target, port, passthrough, undefined, modelKey, undefined, authToken)
+  // Tell the daemon the agent is done. The shell that ran us stays alive on purpose
+  // (`-NoExit`/`exec bash`, pty-session.ts), so from the daemon's side the PTY still looks like a
+  // running agent terminal — reattaching would hand the user a bare prompt with stale scrollback
+  // and never relaunch. This is the only place that reliably knows the agent exited. Best-effort
+  // and time-boxed: a failed report must never delay or block the CLI's own exit.
+  const codeSessionId = argValue('--session-id', '') || argValue('--resume', '')
+  if (codeSessionId) {
+    try {
+      await fetch(`http://127.0.0.1:${port}/api/v1/code/sessions/${codeSessionId}/terminal/agent-exited`, {
+        method: 'POST',
+        signal: AbortSignal.timeout(2000),
+      })
+    } catch { /* daemon gone or restarting — the terminal dies with it anyway */ }
+  }
   process.exit(code)
 }
 
@@ -223,6 +245,13 @@ if (reaped > 0) console.log(`reaped ${reaped} orphaned engine process(es) from a
 try {
   const reapedTunnels = reapStaleTunnels(store.dir())
   if (reapedTunnels > 0) console.log(`reaped ${reapedTunnels} orphaned tunnel process(es) from a previous run`)
+} catch { /* best-effort */ }
+// Same idea for terminal-agent CLI processes (claude/pi/opencode) orphaned by an unclean
+// previous shutdown — see terminal-manager.ts's pidfile-tracking header for why this
+// mattered in practice (found live: 11 leaked claude.exe processes after a day of testing).
+try {
+  const reapedTerminals = reapStaleTerminals(store.dir())
+  if (reapedTerminals > 0) console.log(`reaped ${reapedTerminals} orphaned terminal-agent process(es) from a previous run`)
 } catch { /* best-effort */ }
 
 const registry = new Registry(store)
@@ -362,7 +391,7 @@ let tunnelToken: string | null = null
 // 0.0.0.0 LAN switch is a conflicting bind), so retry EADDRINUSE for ~10s instead of
 // crashing — otherwise a restart leaves the user with NO daemon. `server` is mutable
 // so the restart handler below always closes the live instance.
-let server: ReturnType<typeof serve>
+let server!: ReturnType<typeof serve>
 let rebinding = false // suppress the full banner + browser-open during an in-place rebind
 let prevHost = host // remembered before a rebind so we can revert if the new bind fails
 let prevPort = port
@@ -442,6 +471,12 @@ function listen(attempt = 0): void {
   server = s
 }
 listen()
+
+// Register the terminal WebSocket upgrade handler on the raw HTTP server.
+// This intercepts /api/v1/code/terminal/ws upgrades before Hono's SPA fallback.
+// serve() returns ServerType (Http2Server | Server) from @hono/node-server,
+// but we only need the .on('upgrade', ...) interface which is common to both.
+registerTerminalWs(server as unknown as import('http').Server, deps)
 
 // In-place rebind (no full restart): re-point the HTTP listener at the host/port the
 // config now wants, keeping the engine, model, DB, and chat state alive. A LAN toggle
@@ -643,6 +678,10 @@ process.on('exit', () => {
   // Same last-resort net for a cloudflared tunnel — a leaked one keeps a PUBLIC URL
   // alive pointing at a port nothing may be serving anymore, worse than a leaked engine.
   try { killTrackedTunnelsSync(store.dir()) } catch { /* best-effort */ }
+  // Same last-resort net for terminal-agent CLI processes (claude/pi/opencode) — this was
+  // PREVIOUSLY MISSING entirely, the actual cause of leaked claude.exe processes found live
+  // in this repo (terminal-manager.ts's pidfile-tracking header has the full story).
+  try { killTrackedTerminalsSync(store.dir()) } catch { /* best-effort */ }
   // Best-effort pidfile cleanup — covers exits that bypass the signal handlers
   // (e.g. process.exit() called elsewhere). Graceful SIGTERM/SIGINT already
   // removed it above; this is a second-layer safety net.

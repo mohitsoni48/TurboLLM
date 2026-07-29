@@ -145,6 +145,231 @@ test('mapToOpenAI maps a mid-conversation role:"system" message to an OpenAI sys
   )
 })
 
+// ── mapToOpenAI folds every system-role text into ONE leading message ──────
+// Regression for a real bug hit live (2026-07-29): a mid-conversation role:'system' message
+// (fixed above to map correctly, not as 'assistant') was still emitted at its ORIGINAL position
+// in `messages` — after the top-level `system` field's own message and after any user/assistant
+// turns before it. That produced an array like [system, user, assistant, system, ...], which a
+// strict jinja chat template (Qwen3.6/Ornith) rejects outright with a real 400: `Jinja Exception:
+// System message must be at the beginning`. Every system-role text (the top-level `system` field
+// AND any mid-conversation role:'system' entries) must fold into exactly one message at index 0.
+test('mapToOpenAI folds a top-level system field + a mid-conversation system message into ONE leading system message', () => {
+  const oai = mapToOpenAI({
+    system: 'You are Claude Code.',
+    messages: [
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: 'hello' },
+      { role: 'system', content: [{ type: 'text', text: 'SessionStart hook additional context: ...' }] },
+      { role: 'user', content: 'do the thing' },
+    ],
+    max_tokens: 100,
+  })
+  const msgs = oai.messages as Array<{ role: string; content?: unknown }>
+  assert.equal(msgs.filter((m) => m.role === 'system').length, 1, 'exactly one system message must survive')
+  assert.equal(msgs[0].role, 'system', 'the system message must be first — the whole point of the fix')
+  assert.equal(msgs[0].content, 'You are Claude Code.\n\nSessionStart hook additional context: ...')
+  assert.deepEqual(
+    msgs.slice(1).map((m) => m.role),
+    ['user', 'assistant', 'user'],
+    'every other message keeps its original order and role, with the system entry removed from its old position',
+  )
+})
+
+test('mapToOpenAI: a mid-conversation system message with no top-level system field still ends up first', () => {
+  const oai = mapToOpenAI({
+    messages: [
+      { role: 'user', content: 'hi' },
+      { role: 'system', content: [{ type: 'text', text: 'hook context' }] },
+    ],
+    max_tokens: 100,
+  })
+  const msgs = oai.messages as Array<{ role: string; content?: unknown }>
+  assert.equal(msgs[0].role, 'system')
+  assert.equal(msgs[0].content, 'hook context')
+  assert.equal(msgs[1].role, 'user')
+})
+
+// ── mapToOpenAI strips JSON-Schema `format` from tool parameters ────────────
+// Regression for a real bug hit live (2026-07-29): a Notion MCP tool's deeply-nested rich_text
+// schema had a `date.start` field with `format: 'date'`. llama.cpp's JSON-schema-to-grammar
+// converter has a bug for that format — it emits regex-style `\d` escapes GBNF doesn't support,
+// which fails to parse and breaks tool-calling for the WHOLE request (a real 400: "Failed to
+// initialize samplers: failed to parse grammar"), not just that one field. `format` must be
+// stripped recursively — through nested `properties`, `items`, and `anyOf` — before forwarding
+// any tool schema to the engine.
+test('mapToOpenAI strips a top-level `format` keyword from a tool parameter schema', () => {
+  const oai = mapToOpenAI({
+    messages: [{ role: 'user', content: 'hi' }],
+    max_tokens: 100,
+    tools: [
+      {
+        name: 'set_date',
+        input_schema: { type: 'object', properties: { day: { type: 'string', format: 'date' } } },
+      },
+    ],
+  })
+  const tools = oai.tools as Array<{ function: { parameters: Record<string, unknown> } }>
+  const day = (tools[0].function.parameters.properties as Record<string, unknown>).day as Record<string, unknown>
+  assert.equal('format' in day, false, 'format must be stripped, not just ignored')
+  assert.equal(day.type, 'string', 'the rest of the schema must survive untouched')
+})
+
+test('mapToOpenAI strips `format` recursively through nested properties, arrays, and anyOf', () => {
+  const oai = mapToOpenAI({
+    messages: [{ role: 'user', content: 'hi' }],
+    max_tokens: 100,
+    tools: [
+      {
+        name: 'notion_create_comment',
+        input_schema: {
+          type: 'object',
+          properties: {
+            rich_text: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  mention: {
+                    anyOf: [
+                      { type: 'object', properties: { date: { type: 'object', properties: { start: { type: 'string', format: 'date' } } } } },
+                    ],
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    ],
+  })
+  // Walk the exact same nested path a real Notion tool schema has and confirm no `format`
+  // key survives anywhere in the tree — a JSON.stringify round-trip is the simplest whole-tree check.
+  const tools = oai.tools as Array<{ function: { parameters: unknown } }>
+  assert.equal(JSON.stringify(tools[0].function.parameters).includes('"format"'), false)
+})
+
+// ── mapToOpenAI ALSO strips `pattern` — the same failure class, a different keyword ────────
+// `pattern` is an arbitrary caller-supplied regex, compiled into GBNF the same way `format` is —
+// a strictly BIGGER risk than format's fixed conversions, since any construct a third-party
+// tool's regex happens to use can fail the same way, via a different tool/field each time.
+test('mapToOpenAI strips a `pattern` keyword from a tool parameter schema, nested or not', () => {
+  const oai = mapToOpenAI({
+    messages: [{ role: 'user', content: 'hi' }],
+    max_tokens: 100,
+    tools: [
+      {
+        name: 'set_phone',
+        input_schema: {
+          type: 'object',
+          properties: {
+            phone: { type: 'string', pattern: '^\\+?[0-9]{7,15}$' },
+            contact: { type: 'object', properties: { id: { type: 'string', pattern: '^[A-Z0-9]{8}$' } } },
+          },
+        },
+      },
+    ],
+  })
+  const tools = oai.tools as Array<{ function: { parameters: unknown } }>
+  const serialized = JSON.stringify(tools[0].function.parameters)
+  assert.equal(serialized.includes('"pattern"'), false, 'pattern must be stripped, nested or not')
+  assert.ok(serialized.includes('"phone"'), 'the rest of the schema must survive untouched')
+})
+
+// ── mapToOpenAI strips the numeric/length/count BOUND keywords too ──────────────────────────
+// A second, distinct grammar failure mode, root-caused from the engine's own dump of the failing
+// grammar: llama.cpp compiles bound keywords into GBNF `{m,n}` repetition operators and giant
+// digit-range rules, then refuses the grammar when rule-complexity × repetition trips its guard
+// ("number of rules that are going to be repeated multiplied by the new repetition exceeds sane
+// defaults"). The real failing request carried all three shapes asserted below.
+test('mapToOpenAI strips bound keywords that llama.cpp compiles into {m,n} repetitions', () => {
+  const oai = mapToOpenAI({
+    messages: [{ role: 'user', content: 'hi' }],
+    max_tokens: 100,
+    tools: [
+      {
+        name: 'sync_assets',
+        input_schema: {
+          type: 'object',
+          properties: {
+            // `maxItems: 255` → `(item){0,255}` in GBNF
+            assets: {
+              type: 'array',
+              maxItems: 255,
+              minItems: 1,
+              // `maxLength` → `char{1,255}`
+              items: { type: 'object', properties: { name: { type: 'string', minLength: 1, maxLength: 255 } } },
+            },
+            // `maximum: Number.MAX_SAFE_INTEGER` → ONE rule thousands of elements long
+            offset: { type: 'integer', minimum: 0, maximum: 9007199254740991 },
+            ratio: { type: 'number', exclusiveMinimum: 0, exclusiveMaximum: 1, multipleOf: 0.01 },
+          },
+        },
+      },
+    ],
+  })
+  const params = (oai.tools as Array<{ function: { parameters: unknown } }>)[0].function.parameters
+  const serialized = JSON.stringify(params)
+
+  for (const keyword of ['minLength', 'maxLength', 'minItems', 'maxItems', 'minimum', 'maximum', 'exclusiveMinimum', 'exclusiveMaximum', 'multipleOf']) {
+    assert.equal(serialized.includes(`"${keyword}"`), false, `${keyword} must be stripped, at any depth`)
+  }
+  // Structure — the part constrained decoding actually needs — must survive intact.
+  assert.ok(serialized.includes('"assets"') && serialized.includes('"offset"') && serialized.includes('"ratio"'))
+  assert.ok(serialized.includes('"array"') && serialized.includes('"integer"'), 'types must survive')
+  assert.ok(serialized.includes('"items"') && serialized.includes('"name"'), 'nested shape must survive')
+})
+
+// Pre-release review catch (PR #86): the strip matched by key at EVERY depth, so a tool parameter
+// whose NAME collides with a schema keyword was deleted along with the keyword. Claude Code's own
+// Grep tool takes a required parameter literally named `pattern`, so this fired constantly and
+// silently — the engine was handed a tool with no `pattern` argument that still required one.
+test('mapToOpenAI keeps tool PARAMETERS whose name collides with a schema keyword (pattern/format/maximum)', () => {
+  const oai = mapToOpenAI({
+    messages: [{ role: 'user', content: 'hi' }],
+    max_tokens: 100,
+    tools: [{
+      name: 'Grep',
+      input_schema: {
+        type: 'object',
+        properties: {
+          // Every one of these is a legitimate parameter NAME that is also a schema keyword.
+          pattern: { type: 'string', description: 'regex', maxLength: 2000 },
+          format: { type: 'string', enum: ['content', 'files'] },
+          maximum: { type: 'integer', minimum: 0 },
+          path: { type: 'string' },
+        },
+        required: ['pattern'],
+      },
+    }],
+  })
+  const params = (oai.tools as Array<{ function: { parameters: { properties: Record<string, unknown>; required: string[] } } }>)[0].function.parameters
+
+  assert.deepEqual(
+    Object.keys(params.properties).sort(),
+    ['format', 'maximum', 'path', 'pattern'],
+    'a parameter must never be dropped because its NAME matches a schema keyword',
+  )
+  // The schema must not contradict itself: everything `required` names still has to exist.
+  for (const name of params.required) {
+    assert.ok(name in params.properties, `required "${name}" must still be defined`)
+  }
+  // …while the bound keywords INSIDE those parameters' own schemas are still stripped.
+  const serialized = JSON.stringify(params)
+  assert.equal(serialized.includes('"maxLength"'), false, 'pattern.maxLength must still be stripped')
+  assert.equal(serialized.includes('"minimum"'), false, 'maximum.minimum must still be stripped')
+  assert.ok(serialized.includes('"enum"'), 'enum inside a keyword-named parameter still survives')
+})
+
+test('mapToOpenAI keeps `enum`, which constrains decoding without emitting any repetition', () => {
+  const oai = mapToOpenAI({
+    messages: [{ role: 'user', content: 'hi' }],
+    max_tokens: 100,
+    tools: [{ name: 'pick', input_schema: { type: 'object', properties: { mode: { type: 'string', enum: ['a', 'b'] } } } }],
+  })
+  const params = (oai.tools as Array<{ function: { parameters: unknown } }>)[0].function.parameters
+  assert.ok(JSON.stringify(params).includes('"enum"'), 'enum is alternation, not repetition — keep it')
+})
+
 // ── streamToAnthropic live progress ─────────────────────────────────────────
 
 /** Build a ReadableStream of OpenAI-style SSE bytes from raw line strings. */
@@ -190,6 +415,46 @@ test('streamToAnthropic publishes prefill % then token counts, and never forward
 
   // The actual text still streamed through as Anthropic text_delta events.
   assert.ok(blob.includes('Hello') && blob.includes('world'))
+})
+
+// ── streamToAnthropic: engine timings reach the usage callback (ADR-300) ─────
+//
+// This is the Claude Code path. It used to report tokens only, so everything downstream had to
+// derive tok/s by dividing by the request's total wall-clock — which counts the OTHER phase's
+// time against each rate and read decode ~6x low on a real agentic turn (763 tokens on a 62 s
+// request → 12.3 tok/s, against the engine's measured ~78).
+
+test('streamToAnthropic hands the engine\'s own prompt/gen rates to onUsage', async () => {
+  const upstream = sseStream([
+    'data: {"choices":[{"delta":{"content":"Hi"}}]}',
+    'data: {"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":152263,"completion_tokens":763},' +
+      '"timings":{"prompt_per_second":2900.5,"predicted_per_second":77.95}}',
+    'data: [DONE]',
+  ])
+  let usage: { inputTokens: number; outputTokens: number; promptTps?: number; genTps?: number } | null = null
+  for await (const _ of streamToAnthropic(upstream, 'test-model', 'msg_tps', (u) => { usage = u })) { /* drain */ }
+
+  assert.ok(usage, 'onUsage must fire')
+  const u = usage as unknown as { inputTokens: number; outputTokens: number; promptTps?: number; genTps?: number }
+  assert.equal(u.inputTokens, 152263)
+  assert.equal(u.outputTokens, 763)
+  assert.equal(u.promptTps, 2900.5)
+  assert.equal(u.genTps, 77.95)
+})
+
+test('streamToAnthropic reports no rates at all when the engine sent none — never a fabricated 0', async () => {
+  const upstream = sseStream([
+    'data: {"choices":[{"delta":{"content":"Hi"}}]}',
+    'data: {"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2}}',
+    'data: [DONE]',
+  ])
+  let usage: { promptTps?: number; genTps?: number } | null = null
+  for await (const _ of streamToAnthropic(upstream, 'test-model', 'msg_tps2', (u) => { usage = u })) { /* drain */ }
+
+  assert.ok(usage)
+  const u = usage as unknown as { promptTps?: number; genTps?: number }
+  assert.equal(u.promptTps, undefined)
+  assert.equal(u.genTps, undefined)
 })
 
 // ── streamToAnthropic usage mapping ─────────────────────────────────────────

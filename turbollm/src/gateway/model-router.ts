@@ -87,15 +87,46 @@ export class ModelRouter {
 
     // Need to load / swap. Serialise so concurrent requests for different models
     // queue rather than racing to start/stop the same engine simultaneously.
+    return this.withSwapLock(() => this.doLoad(entry))
+  }
+
+  /** Acquire the SAME swap-serialization queue `route()` uses, then run `fn` exclusively with
+   *  respect to any other swap (manual or auto). `route()` itself is just this wrapping
+   *  `doLoad()` — exposed publicly so a MANUAL model switch (routes.ts's `/api/v1/engine/start`,
+   *  which loads the primary manager directly, entirely outside this router) can coordinate too.
+   *
+   *  Why this was missing mattered in practice: the lower-level `Manager.runExclusive` static
+   *  gate already stops two loads from physically racing (no double-spawn), but it only
+   *  serialises EXECUTION order — it doesn't stop a router-triggered auto-swap (e.g. a
+   *  terminal-agent session's own gateway traffic) from independently deciding, mid-manual-
+   *  switch, "the primary is occupied, evict it and load MY model" (`evictChatLru()` picks
+   *  the primary as LRU whenever it's the only occupied slot, `'starting'`/`'stopping'`
+   *  included per ADR-285's `isOccupied()` fix). That decision would then queue behind the
+   *  manual switch at the `Manager` gate and win once it finally ran — so the model that ends
+   *  up loaded silently isn't the one the user just picked in the UI, which reads exactly like
+   *  "my switch reverted" even though nothing crashed or errored. Wrapping the manual switch in
+   *  this same queue means a concurrent auto-swap request now waits for the manual switch to
+   *  fully settle before it even re-checks "is the model I want already running" — so it either
+   *  fast-path no-ops (the manual switch happened to satisfy it) or proceeds cleanly AFTER,
+   *  never mid-flight. */
+  async withSwapLock<T>(fn: () => Promise<T>): Promise<T> {
     let unlock!: () => void
     const prev = this.swapChain
     this.swapChain = new Promise<void>(r => { unlock = r })
     try {
       await prev
-      return await this.doLoad(entry)
+      return await fn()
     } finally {
       unlock()
     }
+  }
+
+  /** A manual switch (routes.ts) always loads directly into the PRIMARY manager, never an
+   *  extra pool slot — so unlike `doLoad()`'s own bookkeeping, only `primaryLastUsed` needs
+   *  updating on success. Without this, a manual switch left the router's own LRU timestamp
+   *  stale, which could bias `evictChatLru()`'s choice on a later auto-swap. */
+  markPrimaryLoaded(): void {
+    this.primaryLastUsed = Date.now()
   }
 
   /** Every model key currently loaded (or loading) across the WHOLE pool — the primary
@@ -194,28 +225,42 @@ export class ModelRouter {
     return { target }
   }
 
-  /** Count of alive chat (non-embedding) slots. Embedding models don't consume
+  /** A slot counts as occupied while 'stopping' too, not just 'running'/'starting' —
+   *  a manual swap (routes.ts's /api/v1/engine/start, going straight to the primary
+   *  Manager, outside this router entirely) passes the primary through 'stopping' on
+   *  its way to the new model. A concurrent gateway request landing in that window
+   *  (e.g. a terminal-agent CLI's own request, racing a founder's manual model switch
+   *  in the UI) used to read the narrower running/starting-only check as "no slot is
+   *  occupied" and spin up a whole SECOND, independently-tracked Manager/llama-server
+   *  process — invisible to the primary manager's own status() and never cleaned up,
+   *  since nothing outside the router's own extraSlots map ever stops it. Found live:
+   *  a founder-reported "it loaded 2 models" during a manual switch while a terminal
+   *  session was open, confirmed via two concurrent llama-server.exe processes on
+   *  8081/8082 where only 8081 was known to /api/v1/status.  */
+  private isOccupied(state: string): boolean {
+    return state === 'running' || state === 'starting' || state === 'stopping'
+  }
+
+  /** Count of occupied chat (non-embedding) slots. Embedding models don't consume
    *  a keepN slot so chat models and embedding models can coexist independently. */
   private chatSlotCount(): number {
-    const isAlive = (s: string) => s === 'running' || s === 'starting'
     const ms = this.manager.status()
-    const primaryAlive = isAlive(ms.state)
+    const primaryAlive = this.isOccupied(ms.state)
     const primaryEmbed = primaryAlive && !!ms.model &&
       (this.scanner.get(ms.model.key)?.embedding ?? false)
     const extraChat = [...this.extraSlots.values()].filter(
-      s => isAlive(s.manager.status().state) &&
+      s => this.isOccupied(s.manager.status().state) &&
         !(this.scanner.get(s.modelKey)?.embedding ?? false),
     ).length
     return (primaryAlive && !primaryEmbed ? 1 : 0) + extraChat
   }
 
-  /** Evict the least-recently-used chat (non-embedding) slot. Embedding slots are
-   *  skipped; if every alive slot is an embedding model the true LRU is used as
-   *  a fallback so we never deadlock. */
+  /** Evict the least-recently-used occupied chat (non-embedding) slot. Embedding
+   *  slots are skipped; if every occupied slot is an embedding model the true LRU is
+   *  used as a fallback so we never deadlock. */
   private evictChatLru(): Manager {
-    const isAlive = (s: string) => s === 'running' || s === 'starting'
     const ms = this.manager.status()
-    const primaryAlive = isAlive(ms.state)
+    const primaryAlive = this.isOccupied(ms.state)
     const primaryEmbed = primaryAlive && !!ms.model &&
       (this.scanner.get(ms.model.key)?.embedding ?? false)
 
@@ -225,7 +270,7 @@ export class ModelRouter {
 
     for (const slot of this.extraSlots.values()) {
       const slotEmbed = this.scanner.get(slot.modelKey)?.embedding ?? false
-      if (isAlive(slot.manager.status().state) && !slotEmbed && slot.lastUsedMs < lruTime) {
+      if (this.isOccupied(slot.manager.status().state) && !slotEmbed && slot.lastUsedMs < lruTime) {
         lruTime = slot.lastUsedMs
         lruManager = slot.manager
         lruKey = slot.modelKey
@@ -238,7 +283,7 @@ export class ModelRouter {
       lruManager = this.manager
       lruKey = null
       for (const slot of this.extraSlots.values()) {
-        if (isAlive(slot.manager.status().state) && slot.lastUsedMs < lruTime) {
+        if (this.isOccupied(slot.manager.status().state) && slot.lastUsedMs < lruTime) {
           lruTime = slot.lastUsedMs
           lruManager = slot.manager
           lruKey = slot.modelKey
