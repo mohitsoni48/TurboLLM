@@ -30,26 +30,36 @@ async function body<T>(c: Context): Promise<T> { try { return await c.req.json()
 const require = createRequire(import.meta.url)
 
 // ── terminal-agent auto-resume across a daemon restart ──────────────────
-// The flag each supported agent's own CLI accepts to pick its last conversation back up in
-// the current directory, instead of starting a blank one. Only agents with a CONFIRMED flag are
-// listed — an agent absent here just starts fresh on every launch (today's behavior for all of
-// them), never a guess at unverified CLI syntax for a tool this session hasn't tested.
-const AGENT_CONTINUE_FLAG: Partial<Record<string, string>> = {
-  claude: '--continue',
+// REVISED (founder-reported live bug): the first version of this used claude's `--continue`
+// ("resume the most recent conversation in the CURRENT DIRECTORY"), which is ambiguous the
+// moment two Code sessions share a repoRoot — whichever session happened to relaunch later
+// would silently inherit whatever OTHER session's conversation was most recently active in
+// that folder, reported live as "randomly resuming old conversations". Fixed by keying
+// resumption on TurboLLM's OWN Code session id instead of directory-recency: `--session-id
+// <id>` on a genuinely first-ever launch REGISTERS that fixed id with the CLI; `--resume <id>`
+// on every later launch resumes that EXACT session, never anyone else's. TurboLLM's own
+// agent_run id is already a real UUID (randomUUID() at creation) — reused directly as the
+// CLI's session id, so no separate id-mapping table is needed; the existing row IS the map.
+// Only agents with CONFIRMED flag syntax are listed — an unlisted agent still starts fresh
+// every time (today's behavior for all of them) rather than guessing unverified CLI syntax.
+const AGENT_SESSION_ID_FLAGS: Partial<Record<string, { first: string; resume: string }>> = {
+  claude: { first: '--session-id', resume: '--resume' },
 }
 
 /** Pure/exported so the resume-flag decision is unit-testable without a live PTY/daemon (mirrors
- *  code-session.ts's codeEventToFrame pattern). A genuinely first-ever launch (`launchedOnce`
- *  false) always starts fresh; a later one passes the agent's own continue flag ONLY when one is
- *  confirmed for that agent — an unlisted agent still starts fresh rather than guessing syntax. */
+ *  code-session.ts's codeEventToFrame pattern). `sessionId` is always TurboLLM's own Code
+ *  session id (run.id) — passed as the CLI's OWN session id too, so "which conversation to
+ *  resume" is never ambiguous even when two Code sessions share a repoRoot. */
 export function buildTerminalLaunchCommand(
   agent: string,
   port: number,
   token: string,
+  sessionId: string,
   launchedOnce: boolean,
 ): string {
-  const continueFlag = launchedOnce ? AGENT_CONTINUE_FLAG[agent] : undefined
-  return `turbollm launch ${agent} --port ${port} --token ${token}${continueFlag ? ` ${continueFlag}` : ''}`
+  const flags = AGENT_SESSION_ID_FLAGS[agent]
+  const sessionArg = flags ? ` ${launchedOnce ? flags.resume : flags.first} ${sessionId}` : ''
+  return `turbollm launch ${agent} --port ${port} --token ${token}${sessionArg}`
 }
 
 // ── types ──────────────────────────────────────────────────────────────
@@ -139,11 +149,11 @@ export function registerTerminalRoutes(app: Hono, d: Deps): void {
       // still has cached — but even if it did, mint() returns the SAME token for this session.
       const token = sessionAuth.mint(run.id)
       // Auto-resume (found live: a daemon restart kills this terminal's PTY, but the
-      // conversation itself didn't end) — a genuinely first-ever launch starts fresh; any
-      // later one (the in-memory TerminalManager has no record, but the DB does) passes the
-      // agent's own continue flag so the CLI picks its interrupted conversation back up
-      // instead of the founder losing it entirely on every restart.
-      const launchCommand = buildTerminalLaunchCommand(agent, port, token, !!run.terminalLaunchedOnce)
+      // conversation itself didn't end) — a genuinely first-ever launch registers run.id as
+      // the CLI's OWN session id; any later one resumes that EXACT id, never "whatever this
+      // directory's most recent conversation happens to be" (see buildTerminalLaunchCommand's
+      // doc comment for the live bug that distinction fixes).
+      const launchCommand = buildTerminalLaunchCommand(agent, port, token, run.id, !!run.terminalLaunchedOnce)
       const terminalId = m.create(run.repoRoot, run.id, cols, rows, launchCommand)
       if (!run.terminalLaunchedOnce) d.db.updateAgentRun(run.id, { terminalLaunchedOnce: true })
       return c.json({ terminalId }, 201)

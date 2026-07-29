@@ -981,6 +981,21 @@ export class ConversationStore {
       if (!this.hasColumn('agent_runs', 'terminal_launched_once')) this.db.exec(`ALTER TABLE agent_runs ADD COLUMN terminal_launched_once INTEGER NOT NULL DEFAULT 0;`)
       this.db.exec(`PRAGMA user_version = 37;`)
     }
+    // v38 (one-time data fix, same day as v37): v37's terminal_launched_once meant "has a
+    // terminal been created before" and its next-launch flag was claude's --continue (resume
+    // the most recent conversation in this DIRECTORY). Found live within hours of shipping:
+    // --continue is ambiguous the moment two Code sessions share a repoRoot, so it was replaced
+    // with --session-id/--resume keyed on THIS session's own id — but any row already flagged
+    // true under the OLD scheme was never registered with the CLI under that exact id, so its
+    // next launch would send --resume <id-the-CLI-has-never-seen> and fail outright ("No
+    // conversation found with session ID: ..."). Reset unconditionally: every session's next
+    // terminal launch is treated as a fresh --session-id registration exactly once, then
+    // resumes correctly from then on — a strictly safe replay of v37's own default for rows
+    // that, in practice, only existed for a few hours before this fix landed.
+    if (v < 38) {
+      this.db.exec(`UPDATE agent_runs SET terminal_launched_once = 0;`)
+      this.db.exec(`PRAGMA user_version = 38;`)
+    }
   }
 
   listConversations(q?: string, kind: 'chat' | 'agent' | 'all' = 'all'): Conversation[] {
