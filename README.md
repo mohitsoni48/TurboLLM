@@ -656,6 +656,10 @@ and AMD ROCm GPUs.
 The Docker images provide an isolated environment while allowing TurboLLM to
 access your GPU directly for accelerated local LLM inference.
 
+> The `Dockerfile.*` and `docker-compose-*.yaml` files referenced below live in the
+> [GitHub repository](https://github.com/mohitsoni48/TurboLLM), not in the npm package —
+> clone the repo to use them.
+
 ---
 
 ### NVIDIA GPU (CUDA)
@@ -711,7 +715,9 @@ sudo reboot
 
 docker compose -f docker-compose-amd.yaml up -d
 ```
+
 ---
+
 ## Community
 
 Questions, ideas, and show-and-tell — join the [Discord](https://discord.gg/v6kRbV7nC).

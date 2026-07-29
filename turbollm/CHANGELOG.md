@@ -27,7 +27,7 @@ _Nothing yet._
 
 ## [1.9.1] - 2026-07-29
 
-**Run Claude Code itself inside a Code session, on your local model — plus a batch of gateway fixes found by doing exactly that.**
+**Run Claude Code itself inside a Code session, on your local model — plus Docker deployment for NVIDIA/AMD GPUs, and a batch of gateway fixes.**
 
 ### Added
 - **Claude Code runs inside Code.** Pick `claude` as your Code agent (Settings → Code agent) and a
@@ -44,6 +44,9 @@ _Nothing yet._
 - **The thinking-budget slider applies to the CLI live**, per request, with no restart.
 - **Switching models keeps your scrollback.** Choosing a different model drives the CLI's own
   `/model` command instead of killing and relaunching the terminal.
+- **Docker deployment for NVIDIA (CUDA) and AMD (ROCm) GPUs** — ready-made `Dockerfile`s and
+  `docker-compose` configurations that run TurboLLM in an isolated container while still reaching
+  your GPU directly. Setup steps for both are in the README. (Thanks @ahmadteeb, #83.)
 
 ### Changed
 - **The Code stats row is readable.** Each number is labelled (`Think 3.0k · Context 15% of 200.0k
@@ -65,6 +68,8 @@ _Nothing yet._
   apart.
 - **Switching models while an agent was working could start a second engine** and load two models
   at once.
+- **Android: GPU detection and the Engines tab.** GPU detection now works on Android, and the
+  Engines tab renders correctly there instead of breaking. (Thanks @ciroprogamer, #80.)
 
 ### Discord
 - You can now run **Claude Code itself inside TurboLLM's Code tab**, driven by your local model —
@@ -73,6 +78,9 @@ _Nothing yet._
 - Fixed the **`failed to parse grammar` error** that broke tool calls on some models, and requests
   being rejected outright by models with strict chat templates.
 - Model errors now say what actually went wrong instead of a generic failure.
+- **TurboLLM now runs in Docker**, with ready-made NVIDIA (CUDA) and AMD (ROCm) setups that still
+  reach your GPU directly — thanks to @ahmadteeb. And on Android, GPU detection and the Engines
+  tab are fixed — thanks to @ciroprogamer.
 
 ## [1.9.0] - 2026-07-25
 
