@@ -177,6 +177,21 @@ export function resolveEffectiveHistory(d: Deps, convId: string, sessionId: stri
 const PI_DEFAULT_RESERVE_TOKENS = 16384
 const PI_DEFAULT_KEEP_RECENT_TOKENS = 20000
 
+/** Per-response output ceiling declared to pi for the local model. Deliberately FIXED, and
+ *  deliberately NOT scaled to the loaded context window — which looks wrong at a glance, since the
+ *  default load profile caps ctx at `Math.min(nativeCtx, 8192)` (models/profile.ts), so this can
+ *  equal the whole context. Scaling it down would be a regression, not a fix.
+ *
+ *  pi consumes `model.maxTokens` in exactly one place — compaction — and only ever as the upper
+ *  half of a `Math.min` against a fraction of `reserveTokens`: `Math.min(0.8 * reserveTokens,
+ *  model.maxTokens)` for a summary, `0.5 *` for a turn-prefix summary. `reserveTokens` is already
+ *  scaled to the REAL context window by compactionSettingsFor above, so the effective budget is
+ *  correct on its own — at ctx 8192 it works out to 983 and this ceiling never binds; at ctx
+ *  200000 it binds at 8192 and usefully caps summary length. It never reaches the main assistant
+ *  turn, and llama.cpp clamps generation to the real remaining space regardless. Verified against
+ *  the installed pi SDK; see ADR-296. */
+const PI_MAX_OUTPUT_TOKENS = 8192
+
 /** Auto-compaction settings scaled to the REAL loaded model's context window instead of pi's
  *  hosted-model-sized defaults — reserve ~15% and keep-recent ~35% of `contextWindow` (leaving
  *  the other ~50% for the compaction summary, system prompt/skills, and the new turn), capped at
@@ -727,7 +742,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
         input: ['text'],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow,
-        maxTokens: 8192,
+        maxTokens: PI_MAX_OUTPUT_TOKENS,
         // qwen-chat-template thinking control matches how TurboLLM drives local chat models.
         compat: { supportsDeveloperRole: false, thinkingFormat: 'qwen-chat-template' },
       },
@@ -813,7 +828,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
         input: ['text'],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow,
-        maxTokens: 8192,
+        maxTokens: PI_MAX_OUTPUT_TOKENS,
         compat: { supportsDeveloperRole: false, thinkingFormat: 'qwen-chat-template' },
       }],
     })
@@ -828,7 +843,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
         releaseSkillGate()
         if (d.gate) skillHeldGate = await d.gate.acquire('bg', { signal })
         // Same stale-ceiling strip as the outer session's own hook above — this sub-session
-        // declares the identical maxTokens: 8192 and would otherwise forward it verbatim too.
+        // declares the identical PI_MAX_OUTPUT_TOKENS and would otherwise forward it verbatim too.
         const payload = { ...(event.payload as Record<string, unknown>) }
         delete payload.max_tokens
         delete payload.max_completion_tokens
@@ -981,7 +996,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
         input: ['text'],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow,
-        maxTokens: 8192,
+        maxTokens: PI_MAX_OUTPUT_TOKENS,
         compat: { supportsDeveloperRole: false, thinkingFormat: 'qwen-chat-template' },
       }],
     })
@@ -1938,7 +1953,7 @@ export async function compactCodeSession(params: CompactCodeParams): Promise<Com
       input: ['text'],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow,
-      maxTokens: 8192,
+      maxTokens: PI_MAX_OUTPUT_TOKENS,
       compat: { supportsDeveloperRole: false, thinkingFormat: 'qwen-chat-template' },
     }],
   })
@@ -1952,9 +1967,9 @@ export async function compactCodeSession(params: CompactCodeParams): Promise<Com
   if (entryTrack.length === 0) throw new Error('nothing_to_compact')
 
   // Same stale-ceiling strip as the main session's own before_provider_request hook — this
-  // compaction session declares the identical maxTokens: 8192, and runs precisely when history
-  // (hence prompt_tokens) is near the context limit, making the overflow this closes the most
-  // likely to hit here of any Code code path.
+  // compaction session declares the identical PI_MAX_OUTPUT_TOKENS, and runs precisely when
+  // history (hence prompt_tokens) is near the context limit, making the overflow this closes the
+  // most likely to hit here of any Code code path.
   const compactExtension = (pi: ExtensionAPI): void => {
     pi.on('before_provider_request', async (event) => {
       const payload = { ...(event.payload as Record<string, unknown>) }
@@ -2092,7 +2107,7 @@ export async function lookbackPreCompactionHistory(params: LookbackParams): Prom
       input: ['text'],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow,
-      maxTokens: 8192,
+      maxTokens: PI_MAX_OUTPUT_TOKENS,
       compat: { supportsDeveloperRole: false, thinkingFormat: 'qwen-chat-template' },
     }],
   })
