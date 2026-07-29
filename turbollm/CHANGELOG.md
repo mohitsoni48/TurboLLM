@@ -33,7 +33,9 @@ _Nothing yet._
 - **Claude Code runs inside Code.** Pick `claude` as your Code agent (Settings → Code agent) and a
   session opens it in a full-screen terminal on your local model, in your project folder. The
   model picker, context ring, thinking-budget slider and stats row all keep working around it —
-  the CLI replaces the transcript, not the controls.
+  the CLI replaces the transcript, not the controls. This needs an optional native terminal
+  component; where it can't be installed, TurboLLM runs normally and simply doesn't offer the
+  agent.
 - **The CLI starts in the mode you picked.** Auto, Plan first, or Ask each step now carries over to
   Claude Code's own permission mode instead of it always starting on its default.
 - **Terminal sessions survive a daemon restart.** Restarting TurboLLM no longer loses the
@@ -51,17 +53,8 @@ _Nothing yet._
   scrollbar over the CLI's own interface (wheel scrolling is unchanged).
 - **The Code agent picker offers `turbollm` and `claude` only.** `pi` and `opencode` are withdrawn
   until their terminal integration is verified against a real binary — no half-working choices.
-- **The terminal backend is now an optional install.** TurboLLM no longer fails to install if the
-  native terminal component can't be built for your platform — it's skipped, everything else works,
-  and the `claude` agent is simply not offered on that machine rather than appearing and then
-  failing when you open a session.
 
 ### Fixed
-- **Tokens/sec in Code with a CLI agent was wrong** — it reported end-to-end throughput, so
-  generation speed read roughly 6× lower than reality (12.3 tok/s where the engine was doing ~78).
-  It now reports the engine's own measured generation rate.
-- **The context percentage for a CLI session was frozen** at a value from an unrelated earlier
-  turn — sometimes days old. It now tracks the live conversation.
 - **`400 Failed to initialize samplers: failed to parse grammar`** when using tools with some
   models — certain validation keywords in a tool's schema (length/size/range limits) blew
   llama.cpp's grammar limits and failed the *entire* request, not just the offending field.
@@ -69,20 +62,14 @@ _Nothing yet._
   beginning") — mid-conversation system messages are now folded into the leading one.
 - **Engine errors are reported as they really are.** A bad request, an incompatible model, an
   overloaded engine and a crash used to arrive as the same generic 500 with no way to tell them
-  apart from a Code session.
+  apart.
 - **Switching models while an agent was working could start a second engine** and load two models
   at once.
-- **A terminal that went blank when switching sessions**, and one that stayed a dead end after the
-  agent exited — reopening now relaunches instead of showing a stale prompt.
-- **Terminal processes left running after an unclean shutdown** are now cleaned up on the next
-  start, and idle terminals are actually reaped (the cleanup had never run).
 
 ### Discord
 - You can now run **Claude Code itself inside TurboLLM's Code tab**, driven by your local model —
   in a real terminal, in your project folder, with the model picker and thinking-budget slider
   still right there. It picks up the mode you chose, and survives a restart of TurboLLM.
-- Fixed a **wrong tokens/sec** reading in Code — it was showing end-to-end throughput, about 6×
-  slower than your model was actually generating.
 - Fixed the **`failed to parse grammar` error** that broke tool calls on some models, and requests
   being rejected outright by models with strict chat templates.
 - Model errors now say what actually went wrong instead of a generic failure.
