@@ -87,15 +87,46 @@ export class ModelRouter {
 
     // Need to load / swap. Serialise so concurrent requests for different models
     // queue rather than racing to start/stop the same engine simultaneously.
+    return this.withSwapLock(() => this.doLoad(entry))
+  }
+
+  /** Acquire the SAME swap-serialization queue `route()` uses, then run `fn` exclusively with
+   *  respect to any other swap (manual or auto). `route()` itself is just this wrapping
+   *  `doLoad()` — exposed publicly so a MANUAL model switch (routes.ts's `/api/v1/engine/start`,
+   *  which loads the primary manager directly, entirely outside this router) can coordinate too.
+   *
+   *  Why this was missing mattered in practice: the lower-level `Manager.runExclusive` static
+   *  gate already stops two loads from physically racing (no double-spawn), but it only
+   *  serialises EXECUTION order — it doesn't stop a router-triggered auto-swap (e.g. a
+   *  terminal-agent session's own gateway traffic) from independently deciding, mid-manual-
+   *  switch, "the primary is occupied, evict it and load MY model" (`evictChatLru()` picks
+   *  the primary as LRU whenever it's the only occupied slot, `'starting'`/`'stopping'`
+   *  included per ADR-285's `isOccupied()` fix). That decision would then queue behind the
+   *  manual switch at the `Manager` gate and win once it finally ran — so the model that ends
+   *  up loaded silently isn't the one the user just picked in the UI, which reads exactly like
+   *  "my switch reverted" even though nothing crashed or errored. Wrapping the manual switch in
+   *  this same queue means a concurrent auto-swap request now waits for the manual switch to
+   *  fully settle before it even re-checks "is the model I want already running" — so it either
+   *  fast-path no-ops (the manual switch happened to satisfy it) or proceeds cleanly AFTER,
+   *  never mid-flight. */
+  async withSwapLock<T>(fn: () => Promise<T>): Promise<T> {
     let unlock!: () => void
     const prev = this.swapChain
     this.swapChain = new Promise<void>(r => { unlock = r })
     try {
       await prev
-      return await this.doLoad(entry)
+      return await fn()
     } finally {
       unlock()
     }
+  }
+
+  /** A manual switch (routes.ts) always loads directly into the PRIMARY manager, never an
+   *  extra pool slot — so unlike `doLoad()`'s own bookkeeping, only `primaryLastUsed` needs
+   *  updating on success. Without this, a manual switch left the router's own LRU timestamp
+   *  stale, which could bias `evictChatLru()`'s choice on a later auto-swap. */
+  markPrimaryLoaded(): void {
+    this.primaryLastUsed = Date.now()
   }
 
   /** Every model key currently loaded (or loading) across the WHOLE pool — the primary

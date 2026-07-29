@@ -1238,8 +1238,17 @@ export function registerApi(app: Hono, d: Deps): void {
       // all under the global load lock so this can't race another load. Fire-and-forget:
       // the UI polls /status for the starting→running/error transition, so we return 202
       // immediately rather than blocking the HTTP request on a multi-second load.
-      void d.manager
-        .load(opts, { beforeStart: () => d.comfy?.freeComfyUIBeforeLoad() ?? Promise.resolve() })
+      //
+      // Wrapped in the router's own swap-serialization queue (same one route()/doLoad() use)
+      // so a concurrent auto-swap request (e.g. a terminal-agent session's own gateway
+      // traffic) can't independently decide "the primary is occupied mid-switch, evict it and
+      // load MY model instead" — it now waits for this manual switch to fully settle first.
+      // Without this, the two paths only shared the lower-level Manager.runExclusive gate,
+      // which prevents a double-SPAWN but not a second caller silently overriding which model
+      // ends up loaded — the model-router.ts withSwapLock doc comment has the full trace.
+      void d.modelRouter
+        .withSwapLock(() => d.manager.load(opts, { beforeStart: () => d.comfy?.freeComfyUIBeforeLoad() ?? Promise.resolve() }))
+        .then(() => d.modelRouter.markPrimaryLoaded())
         .catch((e) => console.warn(`engine load failed: ${e}`))
       d.store.update((x) => {
         x.lastLoaded = { modelKey: entry.key, engineId: active.id }
@@ -1258,9 +1267,11 @@ export function registerApi(app: Hono, d: Deps): void {
     }
     if (!modelPath) return err(c, 409, 'no_such_model', 'No model specified. Pick one from the Models screen.')
     const opts: StartOpts = { engine: active, model: deriveModel(modelPath, name, extra), modelPath, extraArgs: extra }
-    // Same single-chokepoint, fire-and-forget load as the resolved-model branch above.
-    void d.manager
-      .load(opts, { beforeStart: () => d.comfy?.freeComfyUIBeforeLoad() ?? Promise.resolve() })
+    // Same single-chokepoint, fire-and-forget, swap-lock-coordinated load as the
+    // resolved-model branch above.
+    void d.modelRouter
+      .withSwapLock(() => d.manager.load(opts, { beforeStart: () => d.comfy?.freeComfyUIBeforeLoad() ?? Promise.resolve() }))
+      .then(() => d.modelRouter.markPrimaryLoaded())
       .catch((e) => console.warn(`engine load failed: ${e}`))
     return c.json({ ok: true }, 202)
   })
