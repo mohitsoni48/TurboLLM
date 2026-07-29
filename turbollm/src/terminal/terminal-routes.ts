@@ -45,7 +45,7 @@ function getManager(_d: Deps): TerminalManager {
     try {
       // Force the require here so tests can run without node-pty installed.
       require.resolve('node-pty')
-      terminalManager = new TerminalManager()
+      terminalManager = new TerminalManager(_d.store.dir())
     } catch {
       // node-pty not available
     }

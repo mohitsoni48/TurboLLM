@@ -10,8 +10,12 @@
 // unnecessary weight for testing listener bookkeeping. Same "reach into internals via a
 // narrow cast" pattern already used by model-router.test.ts for its own private state.
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
+import { mkdirSync, mkdtempSync, readdirSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { test } from 'node:test'
-import { TerminalManager } from './terminal-manager'
+import { TerminalManager, reapStaleTerminals, killTrackedTerminalsSync } from './terminal-manager'
 
 type Handler = { onData?: (data: string) => void; onClose?: () => void }
 
@@ -90,4 +94,97 @@ test('broadcast: onClose fans out to every attached listener', () => {
 
   assert.equal(closed1, true)
   assert.equal(closed2, true)
+})
+
+// ── Orphan-safety pidfile: reapStaleTerminals / killTrackedTerminalsSync ─────────────
+// Regression for a real, live bug: cli.ts's shutdown handlers (SIGINT/SIGTERM/SIGHUP, and
+// the sync 'exit' safety net) killed tracked engines and tunnels but never touched
+// terminal-agent PTYs at all — found live as 11 orphaned claude.exe + 6 orphaned
+// powershell.exe processes after a day of Code-terminal testing with repeated daemon
+// restarts. These pin the same owner-scoped pidfile contract engines/tunnels already have
+// (mirrors manager.reap.test.ts, minus the portAlive cross-check — a plain shell has no
+// meaningful port to verify against, same simplification tunnel/manager.ts already made).
+
+function spawnFakeShell(): Promise<{ pid: number; kill: () => void; waitExit: () => Promise<void> }> {
+  // A real, long-lived child process standing in for an orphaned terminal shell.
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 60000)'])
+  return new Promise((resolve, reject) => {
+    child.once('spawn', () => {
+      const exited = new Promise<void>((r) => child.once('exit', () => r()))
+      resolve({ pid: child.pid!, kill: () => child.kill('SIGKILL'), waitExit: () => exited })
+    })
+    child.once('error', reject)
+  })
+}
+
+function writeTerminalPidFile(dir: string, pid: number, owner?: number): void {
+  const run = join(dir, 'run')
+  mkdirSync(run, { recursive: true })
+  writeFileSync(join(run, `terminal-${pid}.pid`), JSON.stringify({ pid, ...(owner !== undefined ? { owner } : {}) }))
+}
+
+function terminalPidFiles(dir: string): string[] {
+  try {
+    return readdirSync(join(dir, 'run')).filter((n) => /^terminal-\d+\.pid$/.test(n))
+  } catch {
+    return []
+  }
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+test('reapStaleTerminals: reaps a tracked shell with no live owner, and clears its pidfile', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tllm-term-reap-'))
+  const shell = await spawnFakeShell()
+  try {
+    writeTerminalPidFile(dir, shell.pid) // no owner field — ownerless/legacy, must be reaped
+
+    const killed = reapStaleTerminals(dir)
+
+    assert.equal(killed, 1, 'should report one orphan killed')
+    await Promise.race([shell.waitExit(), sleep(5000)])
+    assert.throws(() => process.kill(shell.pid, 0), 'the orphaned shell should be dead')
+    assert.equal(terminalPidFiles(dir).length, 0, 'pidfile should be removed after reaping')
+  } finally {
+    shell.kill()
+  }
+})
+
+test('reapStaleTerminals: does NOT reap a shell still owned by a live daemon', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tllm-term-reap-'))
+  const shell = await spawnFakeShell()
+  try {
+    // owner = this (alive) test process — a live daemon manages this terminal; a starting
+    // daemon must leave it alone, or a restart-overlap would reap the incoming daemon's
+    // freshly-launched terminal.
+    writeTerminalPidFile(dir, shell.pid, process.pid)
+
+    const killed = reapStaleTerminals(dir)
+
+    assert.equal(killed, 0, 'a terminal owned by a live daemon must not be reaped')
+    assert.doesNotThrow(() => process.kill(shell.pid, 0), 'the shell should still be running')
+    assert.equal(terminalPidFiles(dir).length, 1, "the live owner's pidfile must be left in place")
+  } finally {
+    shell.kill()
+  }
+})
+
+test('killTrackedTerminalsSync: kills only shells owned by THIS process', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tllm-term-reap-'))
+  const owned = await spawnFakeShell()
+  const other = await spawnFakeShell()
+  try {
+    writeTerminalPidFile(dir, owned.pid, process.pid) // ours
+    writeTerminalPidFile(dir, other.pid, other.pid + 1_000_000) // some other (fake, alive-looking) owner
+
+    killTrackedTerminalsSync(dir)
+
+    await Promise.race([owned.waitExit(), sleep(5000)])
+    assert.throws(() => process.kill(owned.pid, 0), 'the owned shell should be dead')
+    assert.doesNotThrow(() => process.kill(other.pid, 0), "another daemon's shell must be left untouched")
+    assert.equal(terminalPidFiles(dir).length, 1, "only the owned pidfile should be removed")
+  } finally {
+    owned.kill()
+    other.kill()
+  }
 })

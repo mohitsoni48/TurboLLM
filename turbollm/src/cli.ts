@@ -34,6 +34,7 @@ import { writePidfile, removePidfile, stopDaemon, resolveDaemonPort } from './da
 import { runMcpServer } from './mcp-server'
 import { createApp } from './server'
 import { registerTerminalWs } from './terminal/terminal-routes'
+import { reapStaleTerminals, killTrackedTerminalsSync } from './terminal/terminal-manager'
 import { provisionTunnelApiKey } from './auth'
 import { TunnelManager, reapStaleTunnels, killTrackedTunnelsSync } from './tunnel/manager'
 import type { Deps } from './deps'
@@ -230,6 +231,13 @@ if (reaped > 0) console.log(`reaped ${reaped} orphaned engine process(es) from a
 try {
   const reapedTunnels = reapStaleTunnels(store.dir())
   if (reapedTunnels > 0) console.log(`reaped ${reapedTunnels} orphaned tunnel process(es) from a previous run`)
+} catch { /* best-effort */ }
+// Same idea for terminal-agent CLI processes (claude/pi/opencode) orphaned by an unclean
+// previous shutdown — see terminal-manager.ts's pidfile-tracking header for why this
+// mattered in practice (found live: 11 leaked claude.exe processes after a day of testing).
+try {
+  const reapedTerminals = reapStaleTerminals(store.dir())
+  if (reapedTerminals > 0) console.log(`reaped ${reapedTerminals} orphaned terminal-agent process(es) from a previous run`)
 } catch { /* best-effort */ }
 
 const registry = new Registry(store)
@@ -656,6 +664,10 @@ process.on('exit', () => {
   // Same last-resort net for a cloudflared tunnel — a leaked one keeps a PUBLIC URL
   // alive pointing at a port nothing may be serving anymore, worse than a leaked engine.
   try { killTrackedTunnelsSync(store.dir()) } catch { /* best-effort */ }
+  // Same last-resort net for terminal-agent CLI processes (claude/pi/opencode) — this was
+  // PREVIOUSLY MISSING entirely, the actual cause of leaked claude.exe processes found live
+  // in this repo (terminal-manager.ts's pidfile-tracking header has the full story).
+  try { killTrackedTerminalsSync(store.dir()) } catch { /* best-effort */ }
   // Best-effort pidfile cleanup — covers exits that bypass the signal handlers
   // (e.g. process.exit() called elsewhere). Graceful SIGTERM/SIGINT already
   // removed it above; this is a second-layer safety net.
