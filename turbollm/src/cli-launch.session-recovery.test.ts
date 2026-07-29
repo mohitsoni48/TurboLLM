@@ -10,17 +10,13 @@ import { test } from 'node:test'
 import { EventEmitter } from 'node:events'
 import { launchCli, swapSessionFlag } from './cli-launch.js'
 
-const CLAUDE_FLAGS = {
-  register: '--session-id',
-  resume: '--resume',
-  mismatch: ['no conversation found with session id', 'is already in use'],
-}
+const CLAUDE_FLAGS = { register: '--session-id', resume: '--resume' }
 const SESSION_ID = 'af4003a1-0cfb-461d-8c9e-4f2497c89214'
 
 interface CapturedSpawn { cmd: string; args: string[] }
 
-/** Fake spawn whose Nth child emits `stderr` then exits with `code`. */
-function makeSpawn(script: Array<{ stderr?: string; code: number }>): {
+/** Fake spawn whose Nth child exits with `code` (optionally via `signal`). */
+function makeSpawn(script: Array<{ code: number; signal?: string }>): {
   calls: CapturedSpawn[]
   fn: Parameters<typeof launchCli>[3]
 } {
@@ -28,14 +24,9 @@ function makeSpawn(script: Array<{ stderr?: string; code: number }>): {
   const fn: Parameters<typeof launchCli>[3] = (cmd, args) => {
     const step = script[calls.length] ?? { code: 0 }
     calls.push({ cmd, args })
-    const stderr = new EventEmitter()
     const child = new EventEmitter() as ReturnType<typeof import('node:child_process').spawn>
-    ;(child as { stderr?: unknown }).stderr = stderr
-    // Let launchCli attach its 'data'/'exit' listeners before anything fires.
-    setImmediate(() => {
-      if (step.stderr) stderr.emit('data', Buffer.from(step.stderr))
-      setImmediate(() => child.emit('exit', step.code, null))
-    })
+    // Let launchCli attach its 'exit' listener before anything fires.
+    setImmediate(() => child.emit('exit', step.signal ? null : step.code, step.signal ?? null))
     return child
   }
   return { calls, fn }
@@ -70,7 +61,7 @@ function captureOutput(): { err: string[]; banners: string[]; restore: () => voi
   return { err, banners, restore: () => { process.stdout.write = outW; process.stderr.write = errW } }
 }
 
-async function run(passthrough: string[], script: Array<{ stderr?: string; code: number }>) {
+async function run(passthrough: string[], script: Array<{ code: number; signal?: string }>) {
   const { calls, fn } = makeSpawn(script)
   const restoreFetch = stubFetch()
   const cap = captureOutput()
@@ -107,10 +98,7 @@ test('swapSessionFlag returns null when no session flag is present (hand-run `tu
 test('a dead --resume id relaunches as a fresh session under the SAME id', async () => {
   const { calls, code, banners } = await run(
     ['--resume', SESSION_ID],
-    [
-      { stderr: `No conversation found with session ID: ${SESSION_ID}\n`, code: 1 },
-      { code: 0 },
-    ],
+    [{ code: 1 }, { code: 0 }],
   )
   assert.equal(calls.length, 2, 'should retry exactly once')
   assert.deepEqual(calls[0].args, ['--resume', SESSION_ID])
@@ -122,10 +110,7 @@ test('a dead --resume id relaunches as a fresh session under the SAME id', async
 test('an already-registered --session-id relaunches as a resume of that id', async () => {
   const { calls, code, banners } = await run(
     ['--session-id', SESSION_ID],
-    [
-      { stderr: `Error: Session ID ${SESSION_ID} is already in use.\n`, code: 1 },
-      { code: 0 },
-    ],
+    [{ code: 1 }, { code: 0 }],
   )
   assert.equal(calls.length, 2)
   assert.deepEqual(calls[1].args, ['--resume', SESSION_ID])
@@ -136,13 +121,14 @@ test('an already-registered --session-id relaunches as a resume of that id', asy
   assert.doesNotMatch(banners, /starting a fresh one/)
 })
 
-test('an unrelated non-zero exit is NOT retried — a real error must not run twice or be masked', async () => {
-  const { calls, code } = await run(
-    ['--resume', SESSION_ID],
-    [{ stderr: 'Error: something else went wrong\n', code: 1 }],
-  )
-  assert.equal(calls.length, 1, 'no retry for a failure we did not cause')
-  assert.equal(code, 1, 'the real exit code is passed through')
+test('the retry happens at most once — a second failure surfaces the real exit code', async () => {
+  // The accepted cost of deciding on exit-code-and-speed instead of reading the CLI's stderr
+  // (which cannot be intercepted inside a ConPTY without aborting the process): an unrelated
+  // startup failure is attempted twice. It must still end with the genuine exit code, and must
+  // never loop.
+  const { calls, code } = await run(['--resume', SESSION_ID], [{ code: 1 }, { code: 1 }])
+  assert.equal(calls.length, 2, 'exactly one retry, never a loop')
+  assert.equal(code, 1, 'the real exit code is what the user ends up with')
 })
 
 test('a clean exit is never retried', async () => {
@@ -151,18 +137,12 @@ test('a clean exit is never retried', async () => {
   assert.equal(code, 0)
 })
 
-test('a launch with no session flag at all is spawned once, untouched', async () => {
-  const { calls } = await run([], [{ stderr: 'No conversation found with session ID: x\n', code: 1 }])
-  assert.equal(calls.length, 1, 'nothing to swap to, so nothing to retry')
+test('a signal (Ctrl-C) is never retried — the user quit on purpose', async () => {
+  const { calls } = await run(['--resume', SESSION_ID], [{ code: 0, signal: 'SIGINT' }])
+  assert.equal(calls.length, 1, 'quitting must not relaunch the agent')
 })
 
-test("the CLI's own stderr is forwarded verbatim, not swallowed by the recovery logic", async () => {
-  const { stderr } = await run(
-    ['--resume', SESSION_ID],
-    [{ stderr: `No conversation found with session ID: ${SESSION_ID}\n`, code: 1 }, { code: 0 }],
-  )
-  assert.ok(
-    stderr.includes(`No conversation found with session ID: ${SESSION_ID}`),
-    'the user must still see what the CLI actually said',
-  )
+test('a launch with no session flag at all is spawned once, untouched', async () => {
+  const { calls } = await run([], [{ code: 1 }])
+  assert.equal(calls.length, 1, 'nothing to swap to, so nothing to retry')
 })

@@ -138,6 +138,20 @@ if (argv[0] === 'launch') {
       a !== '--token' && arr[i - 1] !== '--token',
   )
   const code = await launchCli(target, port, passthrough, undefined, modelKey, undefined, authToken)
+  // Tell the daemon the agent is done. The shell that ran us stays alive on purpose
+  // (`-NoExit`/`exec bash`, pty-session.ts), so from the daemon's side the PTY still looks like a
+  // running agent terminal — reattaching would hand the user a bare prompt with stale scrollback
+  // and never relaunch. This is the only place that reliably knows the agent exited. Best-effort
+  // and time-boxed: a failed report must never delay or block the CLI's own exit.
+  const codeSessionId = argValue('--session-id', '') || argValue('--resume', '')
+  if (codeSessionId) {
+    try {
+      await fetch(`http://127.0.0.1:${port}/api/v1/code/sessions/${codeSessionId}/terminal/agent-exited`, {
+        method: 'POST',
+        signal: AbortSignal.timeout(2000),
+      })
+    } catch { /* daemon gone or restarting — the terminal dies with it anyway */ }
+  }
   process.exit(code)
 }
 

@@ -124,11 +124,20 @@ export function registerTerminalRoutes(app: Hono, d: Deps): void {
 
     const m = getManager(d)
     const existing = m.findByCodeSessionId(run.id)
-    if (existing) {
+    if (existing && !m.isAgentExited(existing)) {
       // Reattaching to an already-running terminal (remount/reconnect) — resize it to the
       // CURRENT viewport rather than leaving it at whatever size it was created with.
       m.resize(existing, cols, rows)
       return c.json({ terminalId: existing }, 200)
+    }
+    if (existing) {
+      // The agent CLI exited but the shell is still up (`-NoExit`/`exec bash`, pty-session.ts),
+      // so the PTY looks alive while the terminal is really a dead end. Reusing it hands the
+      // user a bare prompt with stale scrollback and NEVER relaunches — found live: one failed
+      // `--resume` stranded a Code session permanently, and every reopen redisplayed the same
+      // old error, making a already-shipped launch fix look like it had done nothing. Tear it
+      // down so the create path below spawns a real agent terminal.
+      m.kill(existing)
     }
     try {
       // Built here, server-side — the client never constructs or even sees this string; the
@@ -180,6 +189,18 @@ export function registerTerminalRoutes(app: Hono, d: Deps): void {
     // case) — a caller that kills-then-immediately-relaunches (model change, task 14)
     // shouldn't race an in-flight process-exit event.
     sessionAuth.revoke(run.id)
+    return c.json({ ok: true }, 200)
+  })
+
+  // ── agent CLI exited (reported by `turbollm launch` as it ends) ───────
+  // The daemon has no handle on the agent process itself — it spawns a SHELL and has the shell
+  // run `turbollm launch <agent>` as its startup command (pty-session.ts), so the only thing
+  // that reliably knows when the agent is done is that launch process. Marking it here means the
+  // next open recreates the terminal instead of reattaching to the leftover shell.
+  app.post('/api/v1/code/sessions/:sessionId/terminal/agent-exited', (c) => {
+    const run = d.db.getAgentRun(c.req.param('sessionId'))
+    if (!run) return err(c, 404, 'not_found', 'Session not found.')
+    getManager(d).markAgentExited(run.id)
     return c.json({ ok: true }, 200)
   })
 

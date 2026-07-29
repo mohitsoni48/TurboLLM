@@ -37,8 +37,6 @@ interface SessionFlags {
   register: string
   /** Flag that resumes an EXISTING conversation by id. */
   resume: string
-  /** Lowercased stderr substrings meaning "wrong flag for this id". */
-  mismatch: string[]
 }
 
 type PrepareResult = { ok: true } | { ok: false; message: string }
@@ -50,15 +48,11 @@ const SUPPORTED: Record<string, CliSpec> = {
     bin: 'claude',
     label: 'Claude Code',
     install: 'npm install -g @anthropic-ai/claude-code',
-    // Measured against the real CLI: both mismatches exit 1 with nothing on stdout and one of
-    // these lines on stderr, before any TUI paints or any model call is made.
+    // Measured against the real CLI: both mismatches exit 1 during startup, before any TUI
+    // paints or any model call is made.
     //   --session-id <existing> -> "Error: Session ID <uuid> is already in use."
     //   --resume     <unknown>  -> "No conversation found with session ID: <uuid>"
-    sessionFlags: {
-      register: '--session-id',
-      resume: '--resume',
-      mismatch: ['no conversation found with session id', 'is already in use'],
-    },
+    sessionFlags: { register: '--session-id', resume: '--resume' },
   },
   opencode: { bin: 'opencode', label: 'opencode', install: 'npm install -g opencode-ai', prepareConfig: prepareOpencode },
   kilo: { bin: 'kilo', label: 'Kilo Code', install: 'npm install -g @kilocode/cli', prepareConfig: prepareKilo },
@@ -78,11 +72,14 @@ interface ModelEntry {
   name: string
 }
 
-// Type-safe subset of spawn's return value that launchCli actually uses. `stderr` is optional
-// because test fakes hand back a bare EventEmitter — session recovery degrades to "no retry"
-// rather than throwing when it isn't there.
-type SpawnedChild = Pick<ReturnType<typeof spawn>, 'on'> & Partial<Pick<ReturnType<typeof spawn>, 'stderr'>>
-type SpawnLike = (cmd: string, args: string[], opts: Parameters<typeof spawn>[2]) => SpawnedChild
+// Type-safe subset of spawn's return value that launchCli actually uses. Only 'on' — the child's
+// stdio handles are inherited straight from this process and never intercepted (see
+// spawnWithSessionRecovery for what happened when they were).
+type SpawnLike = (
+  cmd: string,
+  args: string[],
+  opts: Parameters<typeof spawn>[2],
+) => Pick<ReturnType<typeof spawn>, 'on'>
 
 /** Fetch the current daemon status. Returns null on network error. */
 async function fetchStatus(base: string, _fetch: typeof fetch = fetch): Promise<DaemonStatus | null> {
@@ -657,10 +654,27 @@ export function swapSessionFlag(args: string[], flags: SessionFlags): string[] |
   return out
 }
 
-/** Spawn the CLI; if it dies immediately because the session flag didn't match the CLI's actual
- *  state, swap the flag and try once. Only that specific, self-identified failure retries — any
- *  other non-zero exit is passed straight through, so a genuine error is never masked or run
- *  twice. See CliSpec.sessionFlags for why the daemon can't just pick the right flag up front. */
+/** How quickly a launch must die for us to treat it as a session-flag mismatch. Both mismatches
+ *  fail during CLI startup (~4 s, measured) before any TUI paints or any model call is made, so
+ *  this is generous by an order of magnitude while staying far below any session a user actually
+ *  worked in. */
+const SESSION_MISMATCH_WINDOW_MS = 30_000
+
+/** Spawn the CLI; if it dies during startup because the session flag didn't match the CLI's
+ *  actual state, swap the flag and try once. See CliSpec.sessionFlags for why the daemon can't
+ *  just pick the right flag up front.
+ *
+ *  Deliberately decided on exit code + how fast it died, NOT by reading the CLI's stderr. Piping
+ *  stderr to match the CLI's own error text is more precise, and was the first implementation —
+ *  but inside a ConPTY (which is how every Code-session terminal runs it, pty-session.ts) that
+ *  pipe plus the immediately-following respawn aborts the process natively:
+ *  `Assertion failed: !(handle->flags & UV_HANDLE_CLOSING), file src\win\async.c` — killing the
+ *  retry outright. Nothing may come between the CLI and the real terminal handles.
+ *
+ *  The trade-off: a DIFFERENT startup failure (bad config, missing auth) now also gets retried
+ *  once with the other flag, so its error prints twice before surfacing. Accepted — the second
+ *  attempt still exits with the real code and shows the real message, and a duplicated error
+ *  beats a permanently stranded session. A signal (Ctrl-C) never retries. */
 async function spawnWithSessionRecovery(
   spec: CliSpec,
   args: string[],
@@ -669,26 +683,17 @@ async function spawnWithSessionRecovery(
 ): Promise<number> {
   const flags = spec.sessionFlags
   const retryArgs = flags ? swapSessionFlag(args, flags) : null
-  // No session flag in play — spawn normally so the CLI keeps the real stderr handle.
   if (!flags || !retryArgs) return await waitForChild(_spawn(spec.bin, args, opts), spec)
 
-  const child = _spawn(spec.bin, args, { ...opts, stdio: ['inherit', 'inherit', 'pipe'] })
-  let captured = ''
-  child.stderr?.on('data', (chunk: Buffer | string) => {
-    // Forward verbatim and immediately — the CLI's own output must reach the user unchanged.
-    process.stderr.write(chunk)
-    if (captured.length < 4096) captured += String(chunk)
-  })
-
-  const code = await waitForChild(child, spec)
-  const lower = captured.toLowerCase()
-  if (code === 0 || !flags.mismatch.some((m) => lower.includes(m))) return code
+  const startedAt = Date.now()
+  const first = await waitForChildExit(_spawn(spec.bin, args, opts), spec)
+  const diedDuringStartup = Date.now() - startedAt < SESSION_MISMATCH_WINDOW_MS
+  if (first.code === 0 || first.signal || !diedDuringStartup) return first.code
 
   // Say which way we're recovering — "starting a fresh one" would be a lie when the id turned
   // out to already exist and we're switching to resuming it.
-  const startingFresh = retryArgs.includes(flags.register)
   process.stdout.write(
-    startingFresh
+    retryArgs.includes(flags.register)
       ? `▸ That ${spec.label} session is gone — starting a fresh one.\n`
       : `▸ That ${spec.label} session already exists — resuming it.\n`,
   )
@@ -696,8 +701,17 @@ async function spawnWithSessionRecovery(
 }
 
 /** Resolve the child's exit code, reporting a friendly install hint on ENOENT. */
-function waitForChild(child: Pick<ReturnType<typeof spawn>, 'on'>, spec: CliSpec): Promise<number> {
-  return new Promise<number>((resolve) => {
+async function waitForChild(child: Pick<ReturnType<typeof spawn>, 'on'>, spec: CliSpec): Promise<number> {
+  return (await waitForChildExit(child, spec)).code
+}
+
+/** As waitForChild, but also reports the terminating signal — session recovery must never treat
+ *  a Ctrl-C as a failed launch worth retrying. */
+function waitForChildExit(
+  child: Pick<ReturnType<typeof spawn>, 'on'>,
+  spec: CliSpec,
+): Promise<{ code: number; signal: string | null }> {
+  return new Promise((resolve) => {
     child.on('error', (e: NodeJS.ErrnoException) => {
       if (e.code === 'ENOENT') {
         process.stderr.write(
@@ -706,8 +720,8 @@ function waitForChild(child: Pick<ReturnType<typeof spawn>, 'on'>, spec: CliSpec
       } else {
         process.stderr.write(`Failed to launch ${spec.label}: ${e.message}\n`)
       }
-      resolve(127)
+      resolve({ code: 127, signal: null })
     })
-    child.on('exit', (code, signal) => resolve(code ?? (signal ? 1 : 0)))
+    child.on('exit', (code, signal) => resolve({ code: code ?? (signal ? 1 : 0), signal: signal ?? null }))
   })
 }

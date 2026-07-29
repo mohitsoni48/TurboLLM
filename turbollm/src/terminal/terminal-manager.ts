@@ -128,6 +128,13 @@ export interface TerminalSessionInfo {
   rows: number
   /** When the session was created (ISO string). */
   createdAt: string
+  /** True once the launched agent CLI has exited, reported by `turbollm launch` itself as it
+   *  ends. The PTY is deliberately NOT dead at that point: the shell runs the launch command with
+   *  `-NoExit`/`exec bash` (pty-session.ts) so the user is left at a usable prompt. But the
+   *  terminal has stopped being an *agent* terminal, and reattaching to it hands back a shell
+   *  showing stale scrollback instead of relaunching — which is how a single failed launch used
+   *  to strand a Code session permanently. */
+  agentExited?: boolean
 }
 
 /** How often cleanupIdle() sweeps for terminals past their TTL. Independent of the TTL itself
@@ -294,6 +301,20 @@ export class TerminalManager {
       }
     }
     return null
+  }
+
+  /** Record that the agent CLI in this Code session's terminal has exited (see
+   *  TerminalSessionInfo.agentExited). No-op when the session has no live terminal. */
+  markAgentExited(codeSessionId: string): void {
+    const id = this.findByCodeSessionId(codeSessionId)
+    if (!id) return
+    const info = this.infoMap.get(id)
+    if (info) info.agentExited = true
+  }
+
+  /** Whether this terminal's agent CLI has exited, leaving only a bare shell behind. */
+  isAgentExited(terminalId: string): boolean {
+    return this.infoMap.get(terminalId)?.agentExited === true
   }
 
   /**

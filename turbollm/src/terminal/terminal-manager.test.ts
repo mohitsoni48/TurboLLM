@@ -48,22 +48,29 @@ function fakeSession(pid = 0) {
 
 type SeededManager = {
   sessions: Map<string, ReturnType<typeof fakeSession>>
-  infoMap: Map<string, { id: string; codeSessionId: string | null; cwd: string; cols: number; rows: number; createdAt: string }>
+  infoMap: Map<string, { id: string; codeSessionId: string | null; cwd: string; cols: number; rows: number; createdAt: string; agentExited?: boolean }>
   idleSince: Map<string, number>
   listeners: Map<string, Set<Handler>>
   registerWsListener: (id: string, h: Handler) => void
   unregisterWsListener: (id: string, h: Handler) => void
   cleanupIdle: (maxAgeMs?: number) => void
+  findByCodeSessionId: (codeSessionId: string) => string | null
+  markAgentExited: (codeSessionId: string) => void
+  isAgentExited: (terminalId: string) => boolean
 }
 
 function seededManager(): SeededManager {
   return new TerminalManager() as unknown as SeededManager
 }
 
-function seedTerminal(m: ReturnType<typeof seededManager>, id: string): ReturnType<typeof fakeSession> {
+function seedTerminal(
+  m: ReturnType<typeof seededManager>,
+  id: string,
+  codeSessionId: string | null = null,
+): ReturnType<typeof fakeSession> {
   const session = fakeSession()
   m.sessions.set(id, session as never)
-  m.infoMap.set(id, { id, codeSessionId: null, cwd: '/scratch', cols: 80, rows: 24, createdAt: new Date().toISOString() })
+  m.infoMap.set(id, { id, codeSessionId, cwd: '/scratch', cols: 80, rows: 24, createdAt: new Date().toISOString() })
   return session
 }
 
@@ -284,4 +291,49 @@ test('killTrackedTerminalsSync: kills only shells owned by THIS process', async 
     owned.kill()
     other.kill()
   }
+})
+
+// ── agentExited: the shell outliving the agent must not look like a live agent terminal ──────
+// pty-session.ts runs the launch command with `-NoExit` (Windows) / `exec bash` (POSIX) so the
+// user is left at a usable prompt when the agent quits. That means the PTY is still alive after
+// the agent dies, and findByCodeSessionId — which only checks isExited() — happily returns it.
+// Found live: one failed `--resume` left a Code session pinned to a bare PowerShell prompt, and
+// every reopen redisplayed the same stale error instead of relaunching, making an
+// already-deployed launch fix look like it had changed nothing.
+
+test('markAgentExited flags the Code session’s terminal, and only that one', () => {
+  const m = seededManager()
+  seedTerminal(m, 't1', 'sess-a')
+  seedTerminal(m, 't2', 'sess-b')
+
+  m.markAgentExited('sess-a')
+
+  assert.equal(m.isAgentExited('t1'), true)
+  assert.equal(m.isAgentExited('t2'), false, 'a sibling session must be untouched')
+})
+
+test('a terminal is not agent-exited until it is reported as such', () => {
+  const m = seededManager()
+  seedTerminal(m, 't1', 'sess-a')
+  assert.equal(m.isAgentExited('t1'), false)
+})
+
+test('the PTY stays findable after the agent exits — the shell is alive, so the route must decide', () => {
+  const m = seededManager()
+  const session = seedTerminal(m, 't1', 'sess-a')
+
+  m.markAgentExited('sess-a')
+
+  // Precisely the trap: the session has NOT exited, so the old reuse check passed and handed
+  // back a dead-end shell. findByCodeSessionId still finds it by design; isAgentExited is what
+  // lets the terminal route tear it down and relaunch instead of reattaching.
+  assert.equal(session.isExited(), false, 'the shell outlives the agent on purpose')
+  assert.equal(m.findByCodeSessionId('sess-a'), 't1')
+  assert.equal(m.isAgentExited('t1'), true, 'so reuse must be gated on this, not on isExited()')
+})
+
+test('markAgentExited on a session with no terminal is a no-op, not a throw', () => {
+  const m = seededManager()
+  assert.doesNotThrow(() => m.markAgentExited('nobody'))
+  assert.equal(m.isAgentExited('nobody'), false)
 })
