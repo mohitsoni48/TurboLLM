@@ -17,6 +17,8 @@ import {
   useStatus,
   useSysInfo,
   useTelemetryPreview,
+  useTelemetryLog,
+  useRegenerateMachineId,
   useAppUpdate,
 } from '../lib/queries'
 import { CopyButton } from '../components/ui/copy-button'
@@ -1214,7 +1216,61 @@ function PrivacySection({ level, setLevel }: { level: TelemetryLevel; setLevel: 
           </div>
         )}
       </div>
+
+      <SubmissionLog />
     </section>
+  )
+}
+
+/**
+ * The local submission log (ADR-299).
+ *
+ * The preview above shows what we *would* send; this shows what actually left
+ * the machine, verbatim. That distinction is the entire point — a preview is a
+ * claim, this is the receipt. Deliberately rendered as raw JSON rather than a
+ * friendly summary, because a summary is another claim the user would have to
+ * take on trust.
+ */
+function SubmissionLog() {
+  const [open, setOpen] = useState(false)
+  const logQ = useTelemetryLog(open)
+  const regenerate = useRegenerateMachineId()
+  const entries = logQ.data?.entries ?? []
+
+  return (
+    <div className="mt-3 border-t border-border pt-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <Button variant="outline" size="sm" onClick={() => setOpen((s) => !s)}>
+          {open ? 'Hide what was sent' : 'What was actually sent'}
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={regenerate.isPending}
+          onClick={() => regenerate.mutate()}
+        >
+          {regenerate.isPending ? 'Regenerating…' : 'New anonymous ID'}
+        </Button>
+      </div>
+
+      {open && (
+        <div className="mt-2">
+          <p className="mb-1 text-[12px] text-faint">
+            Every event this machine has transmitted, newest first, exactly as it was sent. If
+            something here surprises you, that is a bug — please report it.
+          </p>
+          {logQ.isFetching && entries.length === 0 ? (
+            <p className="text-[12px] text-muted">Reading log…</p>
+          ) : entries.length === 0 ? (
+            <p className="text-[12px] text-muted">Nothing has been sent from this machine.</p>
+          ) : (
+            <pre className="max-h-64 overflow-auto rounded-md border border-border bg-panel-2 p-2.5 font-mono text-[11px] text-muted">
+              {entries.map((e) => `${e.sentAt}  ${JSON.stringify(e.event)}`).join('\n')}
+            </pre>
+          )}
+        </div>
+      )}
+    </div>
   )
 }
 

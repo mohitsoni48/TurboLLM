@@ -24,6 +24,8 @@ import {
   getNetworkInfo,
   getSysInfo,
   getTelemetryPreview,
+  getTelemetryLog,
+  regenerateMachineId,
   cancelBackendDownload,
   cancelBench,
   saveBench,
@@ -523,6 +525,31 @@ export function useTelemetryPreview(level: TelemetryLevel | null) {
     enabled: !!level,
     retry: false,
     staleTime: Infinity,
+  })
+}
+
+/** The local submission log (ADR-299) — what ACTUALLY left this machine.
+ *  `staleTime: 0` because the whole point is that it reflects reality right
+ *  now; a cached view of "what we sent" would undermine the guarantee. */
+export function useTelemetryLog(enabled: boolean) {
+  return useQuery({
+    queryKey: ['telemetry-log'],
+    queryFn: getTelemetryLog,
+    enabled,
+    retry: false,
+    staleTime: 0,
+  })
+}
+
+/** Regenerate the anonymous machine id. Invalidates the log, which is now the
+ *  history of a machine id that no longer exists. */
+export function useRegenerateMachineId() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: regenerateMachineId,
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ['telemetry-log'] })
+    },
   })
 }
 
