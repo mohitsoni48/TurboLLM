@@ -2,6 +2,7 @@
 import { randomUUID } from 'node:crypto'
 import type { Context, Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
+import type { ContentfulStatusCode } from 'hono/utils/http-status'
 import type { Deps } from '../deps'
 import { clampMaxTokens } from '../config/config'
 import { engineModelAlias } from '../engines/compat'
@@ -32,6 +33,39 @@ function clientAbort(c: { req: { raw: Request } }): AbortController {
     else sig.addEventListener('abort', () => ac.abort(), { once: true })
   }
   return ac
+}
+
+/** Best-effort extraction of a structured error from a failed engine (llama.cpp-family) HTTP
+ *  response. These engines mirror the OpenAI `{error:{message,type}}` shape on failure; falls
+ *  back to the raw body (truncated) when it isn't JSON-shaped, so a crash page or a plain-text
+ *  panic still surfaces something readable instead of a blanket "Engine error." */
+async function describeEngineError(res: Response): Promise<{ message: string; type?: string }> {
+  const raw = await res.text().catch(() => '')
+  try {
+    const parsed = JSON.parse(raw) as { error?: { message?: string; type?: string } }
+    if (parsed.error?.message) return { message: parsed.error.message, type: parsed.error.type }
+  } catch { /* not JSON — fall through to raw */ }
+  return { message: raw.slice(0, 2000) || `Engine returned HTTP ${res.status}.` }
+}
+
+/** Map an engine's real HTTP status to the closest Anthropic error `type` (spec 06) when the
+ *  engine's own body didn't already carry one — lets Claude Code's own error handling react to
+ *  the actual failure class (bad request vs. overloaded vs. generic) instead of every distinct
+ *  cause surfacing identically as a hardcoded 'api_error'. */
+function anthropicErrorType(status: number): string {
+  if (status === 400) return 'invalid_request_error'
+  if (status === 404) return 'not_found_error'
+  if (status === 429) return 'rate_limit_error'
+  if (status === 503) return 'overloaded_error'
+  return 'api_error'
+}
+
+/** Hono's `c.json(body, status)` only accepts its own narrow `ContentfulStatusCode` union, not
+ *  a plain `number` — clamp an upstream engine's real status into a valid HTTP error range
+ *  first (it's always >= 400 here, called only from a `!res.ok` branch) so a malformed or
+ *  out-of-range status from a misbehaving engine can't crash response construction. */
+function asClientStatus(status: number): ContentfulStatusCode {
+  return (status >= 400 && status <= 599 ? status : 500) as ContentfulStatusCode
 }
 
 export function registerGateway(app: Hono, d: Deps): void {
@@ -125,18 +159,33 @@ export function registerGateway(app: Hono, d: Deps): void {
       })
     } catch (e) {
       d.manager.generationEnd()
+      const err = e as Error & { cause?: unknown }
+      const isAbort = err.name === 'AbortError' || ac.signal.aborted
+      const cause = err.cause instanceof Error ? `: ${err.cause.message}` : ''
       return c.json(
-        { type: 'error', error: { type: 'api_error', message: (e as Error).message || 'Engine error.' } },
+        {
+          type: 'error',
+          error: {
+            type: 'api_error',
+            message: isAbort
+              ? 'Client disconnected before the engine responded.'
+              : `${err.message || 'Engine unreachable.'}${cause}`,
+          },
+        },
         500,
       )
     }
 
     if (!res.ok || !res.body) {
       d.manager.generationEnd()
-      const text = await res.text().catch(() => '')
+      // Forward the engine's REAL status + whatever structured error it returned, instead of
+      // flattening every distinct failure (bad request, model incompatibility, overload, crash)
+      // to the same hardcoded 500/'api_error' — that flattening is what made bugs #1-#4 in a
+      // Code session all read identically from the terminal, with no way to tell them apart.
+      const { message, type } = await describeEngineError(res)
       return c.json(
-        { type: 'error', error: { type: 'api_error', message: text || 'Engine error.' } },
-        500,
+        { type: 'error', error: { type: type ?? anthropicErrorType(res.status), message } },
+        asClientStatus(res.status),
       )
     }
 
