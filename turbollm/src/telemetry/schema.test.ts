@@ -155,6 +155,14 @@ test('validateEvent: an unknown field inside the bench payload is rejected', () 
   assert.match(r.reason, /systemPrompt/)
 })
 
+test('validateEvent: an unmeasured vramMb (null) is accepted — BenchResult.vramMb is number|null', () => {
+  const e = benchEvent()
+  const payload = e.payload as { result: Record<string, unknown> }
+  payload.result.vramMb = null
+  const r = validateEvent(e)
+  assert.equal(r.ok, true, r.ok === false ? r.reason : '')
+})
+
 test('validateEvent: a non-numeric t/s is rejected', () => {
   const e = benchEvent()
   const payload = e.payload as { result: Record<string, unknown> }

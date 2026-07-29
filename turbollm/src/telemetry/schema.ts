@@ -98,7 +98,7 @@ function isSafeIdent(v: unknown): boolean {
  *  identifier, a number, or a boolean. Anything not listed cannot be sent. */
 type FieldSpec =
   | { enum: readonly string[]; optional?: boolean }
-  | { kind: 'ident' | 'number' | 'boolean'; optional?: boolean }
+  | { kind: 'ident' | 'number' | 'boolean'; optional?: boolean; nullable?: boolean }
 
 /** Nested object specs for `bench_result` (and any future structured event). */
 const BENCH_PAYLOAD: Record<string, Record<string, FieldSpec>> = {
@@ -123,7 +123,9 @@ const BENCH_PAYLOAD: Record<string, Record<string, FieldSpec>> = {
   result: {
     tps: { kind: 'number' },
     ttftMs: { kind: 'number' },
-    vramMb: { kind: 'number', optional: true },
+    // `null` is real data here: BenchResult.vramMb is `number | null`, meaning
+    // "we could not measure VRAM on this box" — distinct from "not reported".
+    vramMb: { kind: 'number', optional: true, nullable: true },
     outcome: { enum: OUTCOMES },
   },
 }
@@ -160,6 +162,7 @@ function checkFields(obj: unknown, spec: Record<string, FieldSpec>, path: string
       return `missing field: ${path}.${key}`
     }
     const where = `${path}.${key}`
+    if (v === null && !('enum' in field) && field.nullable) continue
     if ('enum' in field) {
       if (typeof v !== 'string' || !field.enum.includes(v)) return `invalid value for ${where}: ${String(v)}`
     } else if (field.kind === 'ident') {

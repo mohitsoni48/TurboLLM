@@ -9,8 +9,7 @@
 // anonymized bench_result event. Single active run; additive; fail-safe (a bad candidate is
 // recorded and the sweep continues).
 import { execFile } from 'node:child_process'
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { readFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { setModelProfile, getModelProfile, VRAM_HEADROOM_SPILL_MB, type BenchResult, type ConfigStore } from '../config/config'
 import type { Manager, StartOpts } from '../engines/manager'
@@ -21,6 +20,8 @@ import { deriveDefault, estimateVram, gpuBudgetMb, profileToArgs, resolveProfile
 import { getSysInfo, type SysInfo } from '../sysinfo/sysinfo'
 import type { HfClient } from '../hf/hf'
 import { inferRepoFromPath } from '../api/path-utils'
+import { enqueue } from '../telemetry/queue'
+import { TELEMETRY_SCHEMA_VERSION } from '../telemetry/schema'
 import {
   buildCardExtractionPrompt,
   hasAnySampling,
@@ -1125,7 +1126,8 @@ export class BenchRunner {
 
   /** Queue an anonymized bench_result telemetry event (spec 09 §3) — ONLY when
    *  telemetry is on. Built from whitelisted fields only (never prompts, paths,
-   *  tokens). No uploader (post-launch); just a queue file. Fully fail-safe. */
+   *  tokens). Validation, bounding and fail-safety live in `telemetry/queue`
+   *  (ADR-299); this method owns only the consent check and the payload shape. */
   private queueTelemetry(record: BenchResult, entry: ModelEntry, sys: SysInfo, appVersion: string, engineVersion: string): void {
     try {
       const cfg = this.store.snapshot()
@@ -1141,8 +1143,8 @@ export class BenchRunner {
         })
       }
 
-      const event = {
-        schema: 1,
+      enqueue(this.store.dir(), {
+        schema: TELEMETRY_SCHEMA_VERSION,
         event: 'bench_result',
         ts: record.ts,
         machineId,
@@ -1158,11 +1160,7 @@ export class BenchRunner {
           params: record.params,
           result: { tps: record.tps, ttftMs: record.ttftMs, vramMb: record.vramMb, outcome: 'ok' },
         },
-      }
-
-      const queueDir = join(this.store.dir(), 'telemetry', 'queue')
-      mkdirSync(queueDir, { recursive: true })
-      writeFileSync(join(queueDir, `${randomUUID()}.json`), JSON.stringify(event))
+      })
     } catch {
       // Telemetry is best-effort and offline-first: a failure to queue must never
       // surface to the user or abort the run (spec 09 §4).
