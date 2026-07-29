@@ -118,6 +118,23 @@ export function updateCodeSessionMode(id: string, mode: string): Promise<{ ok: t
   return req(`/api/v1/code/sessions/${encodeURIComponent(id)}/mode`, { method: 'PATCH', json: { mode } })
 }
 
+/** Sets the LIVE thinking-budget override for a terminal-agent session (pi/claude/opencode) —
+ *  gateway.ts injects it into every subsequent request the CLI sends, no restart involved. Only
+ *  meaningful for a terminal-agent session; a 'turbollm' session's thinking budget is a per-turn
+ *  argument sent with each message instead (startCodeRun), not something to PATCH here.
+ *  -1 = unlimited (clears any override), 0 = off, N>0 = a real token cap. */
+export function updateCodeSessionThinkingBudget(id: string, tokens: number): Promise<{ ok: true; tokens: number }> {
+  return req(`/api/v1/code/sessions/${encodeURIComponent(id)}/thinking-budget`, { method: 'PATCH', json: { tokens } })
+}
+
+/** Most recent gateway request TurboLLM has attributed to a terminal-agent session (ADR-284)
+ *  — the CLI drives its own requests directly, so this is the terminal-session equivalent of
+ *  a chat session's lastRealStats. `usage` is null (not an error) before the session's first
+ *  gateway request. */
+export function getCodeSessionLastUsage(id: string): Promise<{ usage: { promptTokens: number; genTokens: number; promptTps: number | null; genTps: number | null } | null }> {
+  return req(`/api/v1/code/sessions/${encodeURIComponent(id)}/last-usage`)
+}
+
 /** Renames a session's title — mirrors the chat conversation rename endpoint. */
 export function updateCodeSessionTitle(id: string, title: string): Promise<{ ok: true; title: string }> {
   return req(`/api/v1/code/sessions/${encodeURIComponent(id)}/title`, { method: 'PATCH', json: { title } })

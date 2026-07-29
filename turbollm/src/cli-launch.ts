@@ -34,6 +34,7 @@ const SUPPORTED: Record<string, CliSpec> = {
   kilo: { bin: 'kilo', label: 'Kilo Code', install: 'npm install -g @kilocode/cli', prepareConfig: prepareKilo },
   openclaw: { bin: 'openclaw', label: 'openclaw', install: 'npm install -g openclaw@latest', prepareConfig: prepareOpenclaw },
   hermes: { bin: 'hermes', label: 'Hermes Agent', install: 'npm install -g hermes-agent', prepareConfig: prepareHermes },
+  pi: { bin: 'pi', label: 'pi', install: 'npm install -g @earendil-works/pi-coding-agent', prepareConfig: preparePi },
 }
 
 interface DaemonStatus {
@@ -321,6 +322,53 @@ export async function prepareOpenclaw(base: string, apiKey: string, modelKey: st
   return { ok: true }
 }
 
+/** pi — the standalone `@earendil-works/pi-coding-agent` CLI (distinct from the pi SDK
+ *  TurboLLM's own Code feature embeds server-side). Custom providers are wired via two
+ *  files (schema confirmed against the package's own vendored docs, `docs/models.md` +
+ *  `docs/settings.md` — NOT yet live-verified against a real `pi` install, same caveat
+ *  ADR-158 already accepted for opencode/openclaw):
+ *   - `~/.pi/agent/models.json` — merge a `turbollm` OpenAI-compatible provider entry.
+ *   - `~/.pi/agent/settings.json` — set defaultProvider/defaultModel so `pi` starts
+ *     already selected on it, no manual `/model` picker needed.
+ *  Both go through the same tolerant-JSON merge (readConfigObject/stripJsonComments) as
+ *  opencode/kilo — never touch a config with comments or one that isn't already ours. */
+export async function preparePi(base: string, apiKey: string, modelKey: string, modelName: string, fs: ConfigFs = realFs): Promise<PrepareResult> {
+  const modelsPath = join(fs.home, '.pi', 'agent', 'models.json')
+  const modelsRead = await readConfigObject(fs, modelsPath)
+  if ('corrupt' in modelsRead) return corruptConfigError(modelsPath, 'pi')
+  const modelsCfg = modelsRead.obj
+  const providers = asObject(modelsCfg.providers)
+  if (!providers) return corruptConfigError(modelsPath, 'pi')
+  if (modelsRead.lenient) {
+    if (!providerAlreadyPointsHere(providers.turbollm, base)) return commentedConfigError(modelsPath, 'pi')
+  } else {
+    providers.turbollm = {
+      baseUrl: `${base}/v1`,
+      api: 'openai-completions',
+      apiKey,
+      models: [{ id: modelKey, name: modelName }],
+    }
+    modelsCfg.providers = providers
+    await fs.mkdir(dirname(modelsPath))
+    await fs.writeFile(modelsPath, JSON.stringify(modelsCfg, null, 2) + '\n')
+  }
+
+  const settingsPath = join(fs.home, '.pi', 'agent', 'settings.json')
+  const settingsRead = await readConfigObject(fs, settingsPath)
+  if ('corrupt' in settingsRead) return corruptConfigError(settingsPath, 'pi')
+  const settingsCfg = settingsRead.obj
+  if (settingsRead.lenient) {
+    return (settingsCfg.defaultProvider === 'turbollm' && settingsCfg.defaultModel === modelKey)
+      ? { ok: true }
+      : commentedConfigError(settingsPath, 'pi')
+  }
+  settingsCfg.defaultProvider = 'turbollm'
+  settingsCfg.defaultModel = modelKey
+  await fs.mkdir(dirname(settingsPath))
+  await fs.writeFile(settingsPath, JSON.stringify(settingsCfg, null, 2) + '\n')
+  return { ok: true }
+}
+
 /** Runs a CLI command to completion, resolving true on exit code 0. Deliberately spawned
  *  WITHOUT a shell: hermes (the only current caller) is a real, directly-executable binary
  *  on every platform (confirmed: a native .exe on Windows, not an npm-style .cmd shim), and
@@ -408,7 +456,12 @@ async function loadAndWait(
  *  `modelKey` — when provided, resolve + load that model before launching.
  *  `_spawn` is an optional injection point used by unit tests to capture the env
  *  passed to the child process without actually launching Claude Code.
- *  `_fetch` is an optional injection point used by unit tests to stub HTTP calls. */
+ *  `_fetch` is an optional injection point used by unit tests to stub HTTP calls.
+ *  `authToken` — when provided (embedded terminal launches, `--token`, cli.ts), used instead
+ *  of the shared static AUTH_TOKEN for the `claude` target's ANTHROPIC_AUTH_TOKEN, so the
+ *  gateway can tell this session's requests apart from any other concurrent terminal-agent
+ *  session (session-auth.ts). A manually-run `turbollm launch claude` omits it and keeps
+ *  today's shared-token behavior. */
 export async function launchCli(
   target: string,
   port: number,
@@ -416,6 +469,7 @@ export async function launchCli(
   _spawn: SpawnLike = spawn,
   modelKey?: string,
   _fetch: typeof fetch = fetch,
+  authToken?: string,
 ): Promise<number> {
   const spec = SUPPORTED[target]
   if (!target || !spec) {
@@ -535,8 +589,10 @@ export async function launchCli(
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     ANTHROPIC_BASE_URL: base,
-    // No auth is enforced on the local gateway; the CLI just needs a non-empty token.
-    ANTHROPIC_AUTH_TOKEN: AUTH_TOKEN,
+    // No auth is enforced on the local gateway; the CLI just needs a non-empty token. A
+    // session-scoped token (embedded terminal launches) takes priority over the shared static
+    // one so the gateway can attribute this session's requests correctly (session-auth.ts).
+    ANTHROPIC_AUTH_TOKEN: authToken ?? AUTH_TOKEN,
     // Local LLMs are 30–120 s per response — raise Claude Code's request timeout so it
     // doesn't abort mid-generation. 300 s (5 min) covers even the slowest local model.
     // Zero retries: retrying a slow local model cold-starts it again and makes things worse.

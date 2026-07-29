@@ -2,8 +2,8 @@ import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   archiveCodeSession, clearCodeSession, commitCodeSessionGit, deleteCodeSession, downloadCodeSessionExport,
-  getCodeSession, getCodeSessionCompareUrl, getCodeSessionGitStatus, getCodeStats, listCodeSessions,
-  pushCodeSessionGit, resumeCodeSession, updateCodeSessionMode, updateCodeSessionTitle,
+  getCodeSession, getCodeSessionCompareUrl, getCodeSessionGitStatus, getCodeSessionLastUsage, getCodeStats, listCodeSessions,
+  pushCodeSessionGit, resumeCodeSession, updateCodeSessionMode, updateCodeSessionThinkingBudget, updateCodeSessionTitle,
 } from './code-api'
 import type { CodeSessionFilter, CodeStatsRange } from './code-types'
 import { ApiError } from './api'
@@ -117,6 +117,30 @@ export function useUpdateCodeSessionMode() {
       void qc.invalidateQueries({ queryKey: codeKeys.detail(v.id) })
       void qc.invalidateQueries({ queryKey: ['code-sessions'] })
     },
+  })
+}
+
+/** Live thinking-budget override for a terminal-agent session — see code-api.ts's
+ *  updateCodeSessionThinkingBudget. No `code-sessions` list invalidation (unlike mode/title
+ *  above): this doesn't change anything the sidebar list displays. */
+export function useUpdateCodeSessionThinkingBudget() {
+  return useMutation({
+    mutationFn: (v: { id: string; tokens: number }) => updateCodeSessionThinkingBudget(v.id, v.tokens),
+  })
+}
+
+/** Polled while a terminal-agent session's TerminalToolbar is mounted — a chat session's
+ *  composer gets its token/tps footer "for free" from lastRealStats (the last persisted
+ *  turn); a terminal-agent session has no turn of its own to read that from, so this polls
+ *  the daemon's own record of the session's most recent gateway request instead (ADR-284).
+ *  `enabled` lets the caller only poll for terminal-agent sessions, never 'turbollm' ones. */
+export function useCodeSessionLastUsage(id: string | null, enabled: boolean) {
+  return useQuery({
+    queryKey: ['code-session-last-usage', id],
+    queryFn: () => getCodeSessionLastUsage(id!),
+    enabled: !!id && enabled,
+    refetchInterval: 4000,
+    refetchIntervalInBackground: false,
   })
 }
 

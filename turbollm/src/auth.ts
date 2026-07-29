@@ -66,8 +66,11 @@ export function provisionTunnelApiKey(d: Deps): string {
 }
 
 /** Pull the presented key from any of the accepted headers (spec 06 §5):
- *  the web-UI header, the Anthropic `x-api-key`, or `Authorization: Bearer`. */
-function presentedKey(c: Context): string {
+ *  the web-UI header, the Anthropic `x-api-key`, or `Authorization: Bearer`. Exported so
+ *  gateway.ts can resolve a terminal-agent session's own token (session-auth.ts) from the
+ *  SAME header set an Anthropic/OpenAI-protocol client actually sends it in, rather than a
+ *  second, driftable parse. */
+export function presentedKey(c: Context): string {
   const direct = c.req.header('X-TurboLLM-Auth') ?? c.req.header('x-api-key')
   if (direct && direct.trim()) return direct.trim()
   const authz = c.req.header('Authorization') ?? ''

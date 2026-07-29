@@ -90,3 +90,45 @@ test('loadedModelKeys: pool-only (primary stopped) still reports pool slots', ()
   ])
   assert.deepEqual([...r.loadedModelKeys()], ['qwen-7b'])
 })
+
+// ── chatSlotCount / evictChatLru: 'stopping' must count as occupied ──────────────
+// Regression for a real, live bug: a manual model swap (routes.ts's /api/v1/engine/start,
+// which calls the PRIMARY manager directly, bypassing this router) passes the primary
+// through a 'stopping' state on its way to the new model. A concurrent gateway request
+// (e.g. a terminal-agent CLI's own request) landing in that window used to see
+// chatSlotCount() read 0 (only running/starting counted as alive) even though a swap was
+// already in flight, concluded a slot was free, and spun up a whole SECOND, independently
+// tracked Manager/llama-server process — invisible to the primary's own status() and never
+// cleaned up. Confirmed live: two concurrent llama-server.exe processes after a manual
+// model switch with a terminal-agent session open, only one of which /api/v1/status knew
+// about. `chatSlotCount`/`evictChatLru` are private — reached via the same narrow cast
+// pattern used for extraSlots above rather than driving a real load() in a unit test.
+function privates(r: ModelRouter) {
+  return r as unknown as { chatSlotCount(): number; evictChatLru(): Manager }
+}
+
+test('chatSlotCount: a stopping primary still counts as an occupied slot', () => {
+  const r = router(fakeManager('stopping', 'llama-8b'), fakeStore({ keepN: 1 }))
+  assert.equal(privates(r).chatSlotCount(), 1)
+})
+
+test('chatSlotCount: stopping primary + keepN=1 means the pool is full (no room for a new slot)', () => {
+  const r = router(fakeManager('stopping', 'llama-8b'), fakeStore({ keepN: 1 }))
+  assert.equal(privates(r).chatSlotCount() < 1, false) // needsNewSlot's exact condition
+})
+
+test('evictChatLru: a stopping primary with no extra slots is returned as the LRU target (not skipped)', () => {
+  const primary = fakeManager('stopping', 'llama-8b')
+  const r = router(primary, fakeStore({ keepN: 1 }))
+  assert.equal(privates(r).evictChatLru(), primary)
+})
+
+test('evictChatLru: a stopping primary beats an idle-but-newer extra slot as LRU when the primary is older', () => {
+  const primary = fakeManager('stopping', 'llama-8b')
+  const r = router(primary, fakeStore({ keepN: 1 }), [
+    { manager: fakeManager('running', 'qwen-7b'), modelKey: 'qwen-7b', lastUsedMs: Date.now() },
+  ])
+  // primaryLastUsed defaults to 0 (older than the extra slot's fresh timestamp), so the
+  // primary — correctly counted as occupied even mid-'stopping' — is the true LRU here.
+  assert.equal(privates(r).evictChatLru(), primary)
+})

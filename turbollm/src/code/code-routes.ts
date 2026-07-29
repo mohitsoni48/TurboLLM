@@ -29,6 +29,7 @@ import { commitGitChanges, getGithubCompareUrl, getGitStatus, pushGitBranch } fr
 import { runShellCommand, shellContextText } from './code-shell'
 import { agentsMdPresence } from './persona'
 import type { CodeMode } from './persona'
+import { sessionAuth } from './session-auth'
 
 type S = 200 | 201 | 202 | 400 | 404 | 409 | 500
 function err(c: Context, s: S, code: string, msg: string) { return c.json({ error: { code, message: msg } }, s) }
@@ -107,6 +108,7 @@ function toSidebarRow(run: AgentRun) {
     running: undefined as boolean | undefined, // filled from CodeRunManager below when available
     createdAt: run.createdAt,
     repoRoot: run.repoRoot ?? '',
+    codeAgent: run.codeAgent ?? 'turbollm',
     error: run.error,
     archivedAt: run.archivedAt,
     clearedUpToMessageId: run.clearedUpToMessageId,
@@ -139,6 +141,9 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
     const conv = db.createConversation({ kind: 'code', modelKey: b.modelKey })
     // Record the per-session mode on the conversation (reuses the agent_mode column).
     db.setConversationMode(conv.id, mode)
+    // Snapshot the global "Code agent" default (config.ts's code.defaultAgent) onto this run —
+    // the ONE moment it's read; the session never re-reads it, same immutability as repoRoot.
+    const codeAgent = d.store.snapshot().code.defaultAgent
     const run = db.createAgentRun({
       convId: conv.id,
       title: task.slice(0, 60),
@@ -148,6 +153,7 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
       useWorktree: b.useWorktree,        // captured; NOT acted on in Phase 1 (fast-follow)
       worktreeBranch: b.worktreeBranch,  // captured; NOT acted on in Phase 1
       worktreeBase: b.worktreeBase,      // captured; NOT acted on in Phase 1
+      codeAgent,
     })
     // Seed the task as the first user message so re-opening the session shows it. Any attached
     // context-file paths are stored as textAttachments (shown as chips) — POST /messages folds
@@ -267,6 +273,40 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
     if (!VALID_MODES.has(mode)) return err(c, 400, 'invalid_input', 'mode must be one of: auto, plan, ask.')
     db.setConversationMode(run.convId, mode)
     return c.json({ ok: true, mode })
+  })
+
+  // ── thinking budget (terminal-agent sessions only, ADR-284) ────────────────────
+  // For a 'turbollm' session, thinking budget is a per-turn argument the composer sends with
+  // each message (CodeSessionScreen.tsx's startCodeRun call) — nothing to PATCH server-side.
+  // A terminal-agent session (pi/claude/opencode) has no such turn: the CLI drives its own
+  // requests directly against the gateway, so the composer's ThinkingBudgetSlider (rendered by
+  // TerminalToolbar.tsx) instead sets a LIVE override here that gateway.ts injects into every
+  // subsequent request for this session (session-auth.ts) — takes effect immediately, no CLI
+  // restart. -1/omitted = unlimited (no override forced), 0 = off, N>0 = a real token cap.
+  app.patch('/api/v1/code/sessions/:id/thinking-budget', async (c) => {
+    const id = c.req.param('id')
+    const run = db.getAgentRun(id)
+    if (!run) return err(c, 404, 'not_found', 'Session not found.')
+    const b = await body<{ tokens?: number }>(c)
+    const tokens = typeof b.tokens === 'number' && Number.isFinite(b.tokens) ? Math.floor(b.tokens) : -1
+    // -1 (unlimited) is stored as "no override" — sessionAuth's getThinkingBudgetForToken
+    // returning null already means "don't touch what the CLI sent", the exact same behavior.
+    sessionAuth.setThinkingBudget(run.id, tokens === -1 ? null : tokens)
+    return c.json({ ok: true, tokens })
+  })
+
+  // ── last gateway usage (terminal-agent sessions only, ADR-284) ──────────────────
+  // TerminalToolbar.tsx polls this for the same prompt/gen-token + t/s readout the chat
+  // composer's footer already shows from lastRealStats — a terminal-agent session has no
+  // per-turn message stats of its own (the CLI drives its own requests), so this reads the
+  // most recent api_usage row the gateway attributed to this session instead (gateway.ts,
+  // session-auth.ts). `usage: null` (not an error) whenever the session hasn't made a
+  // gateway request yet — a perfectly normal, common state right after opening the terminal.
+  app.get('/api/v1/code/sessions/:id/last-usage', (c) => {
+    const id = c.req.param('id')
+    const run = db.getAgentRun(id)
+    if (!run) return err(c, 404, 'not_found', 'Session not found.')
+    return c.json({ usage: db.getLastApiUsageForSession(run.id) })
   })
 
   // ── rename ─────────────────────────────────────────────────────────────────

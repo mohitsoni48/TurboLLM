@@ -56,6 +56,35 @@
   --diff-hunk-bg: color-mix(in srgb, var(--accent) 8%, transparent);
   --diff-add-bg: color-mix(in srgb, var(--ok) 10%, transparent);
   --diff-del-bg: color-mix(in srgb, var(--err) 10%, transparent);
+
+  /* -- Terminal ANSI palette (embedded terminal-agent sessions, TerminalView.tsx) --
+     Composed entirely from tokens that already flip between :root/.dark above --
+     one declaration self-adjusts per theme, same reasoning as the instruction and
+     diff tokens above, so no .dark override block is needed here either. xterm.js
+     does not resolve var()/color-mix() itself (its renderer parses actual color
+     values, not CSS custom properties), so TerminalView.tsx reads these via
+     getComputedStyle at mount and on every theme change rather than passing the
+     var() strings directly into its theme option. */
+  --term-bg: var(--panel);
+  --term-fg: var(--ink);
+  --term-cursor: var(--accent);
+  --term-selection: color-mix(in srgb, var(--accent) 30%, transparent);
+  --term-black: var(--panel-2);
+  --term-red: var(--err);
+  --term-green: var(--ok);
+  --term-yellow: var(--warn);
+  --term-blue: var(--info);
+  --term-magenta: var(--accent);
+  --term-cyan: color-mix(in srgb, var(--info) 50%, var(--ok) 50%);
+  --term-white: var(--muted);
+  --term-bright-black: var(--faint);
+  --term-bright-red: color-mix(in srgb, var(--err) 85%, var(--ink) 15%);
+  --term-bright-green: color-mix(in srgb, var(--ok) 85%, var(--ink) 15%);
+  --term-bright-yellow: color-mix(in srgb, var(--warn) 85%, var(--ink) 15%);
+  --term-bright-blue: color-mix(in srgb, var(--info) 85%, var(--ink) 15%);
+  --term-bright-magenta: var(--accent-hover);
+  --term-bright-cyan: color-mix(in srgb, var(--info) 65%, var(--ok) 35%);
+  --term-bright-white: var(--ink);
 }
 
 .dark {

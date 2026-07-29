@@ -1,15 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { ArrowDown, Diff, Download, Eraser, FolderOpen, GitBranch, MoreHorizontal, PanelLeft, Pencil, RotateCcw, Terminal as TerminalIcon } from 'lucide-react'
+import { ArrowDown, Diff, Download, Eraser, FolderOpen, GitBranch, MoreHorizontal, PanelLeft, Pencil, RotateCcw } from 'lucide-react'
 import { ApiError } from '../../lib/api'
 import { skillKeys, fetchSkills } from '../../lib/agent-api'
 import { useModelActions, useModels, useStatus } from '../../lib/queries'
 import { compactCodeSession, execShellCommand, revertCodeSession, sendCodeQueuedTurnNow, startCodeRun, steerOutcomeMessage, stopCodeSession } from '../../lib/code-api'
 import type { QueuedTurn, ShellRun, SteerKind } from '../../lib/code-types'
 import {
-  codeKeys, useClearCodeSession, useCodeSession, useCodeSessionRename, useExportCodeSession,
-  useResumeCodeSession, useUpdateCodeSessionMode,
+  codeKeys, useClearCodeSession, useCodeSession, useCodeSessionLastUsage, useCodeSessionRename,
+  useExportCodeSession, useResumeCodeSession, useUpdateCodeSessionMode, useUpdateCodeSessionThinkingBudget,
 } from '../../lib/code-queries'
 import { CodeSessionClient, type LiveState } from '../../lib/code-session-client'
 import { matchCodeCommand, pickerCodeCommands } from '../../lib/code-commands'
@@ -35,7 +35,8 @@ import { CodeResourcesHeader } from './CodeResourcesHeader'
 import { CodeGitDialog } from './CodeGitDialog'
 import { CodeTranscript, CodeTranscriptSkeleton, TodoChecklist } from './CodeTranscript'
 import { AGENT_MODES, type AgentModeId } from './code-mock'
-import { TerminalView } from './TerminalView'
+import { TerminalView, type TerminalViewHandle } from './TerminalView'
+import { TerminalToolbar } from './TerminalToolbar'
 
 /** The fixed prompt `/init` sends (ADR-258) — drives the agent to inspect the repo and author an
  *  AGENTS.md, which persona.ts's agentsMdBlock then picks up on every later turn. Sent as this
@@ -115,13 +116,49 @@ export function CodeSessionScreen() {
     engineState === 'stopping'
   const [settingsKey, setSettingsKey] = useState<string | null>(null)
   const [gitDialogOpen, setGitDialogOpen] = useState(false)
-  // Terminal view — when open, replaces transcript/composer with a full claude TUI.
-  const [terminalOpen, setTerminalOpen] = useState(false)
+  // A non-'turbollm' agent (config.ts's code.defaultAgent, snapshotted onto the session at
+  // creation) means this session is terminal-only for its whole lifetime — no manual toggle,
+  // no chat UI ever mounts for it. 'turbollm' (or the field being absent, for pre-existing
+  // sessions) keeps today's chat behavior unchanged.
+  const isTerminalSession = !!session?.codeAgent && session.codeAgent !== 'turbollm'
+  const lastUsageQ = useCodeSessionLastUsage(sessionId ?? null, isTerminalSession)
+  const lastUsage = lastUsageQ.data?.usage
   const exportMut = useExportCodeSession()
+  // Imperative handle onto the live TerminalView (terminal-agent sessions only) — lets
+  // handleLoadModel below drive the CLI's OWN `/model` command instead of killing and
+  // relaunching the whole terminal (a relaunch loses the entire scrollback/conversation for a
+  // switch the CLI can already do live). Confirmed LIVE against a real running session (not
+  // assumed from docs, which turned out to describe a DIFFERENT case — see below):
+  // `/model claude-<key>` sets the model IMMEDIATELY, no picker, no further interaction —
+  // Claude Code printed "Set model to <name> — TurboLLM and saved as your default for new
+  // sessions" the moment the command was sent. Claude Code's own docs say a direct `/model <id>`
+  // argument only bypasses the picker in non-interactive `-p` mode; that turned out to describe
+  // one-shot invocations only, not our case — a real, already-running interactive session DOES
+  // accept it directly too. `claude-<key>` is the SAME alias id the gateway already advertises
+  // via /v1/models (gateway.ts, ADR-158) — only present when gateway.autoSwap is on; if it is
+  // off, Claude Code will show its own "model not found" error in the terminal, same as if the
+  // user had mistyped it by hand.
+  const terminalViewRef = useRef<TerminalViewHandle>(null)
   const handleLoadModel = (key: string) => {
     modelActions.load.mutate(
       { key },
-      { onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not load model.') },
+      {
+        onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not load model.'),
+        onSuccess: () => {
+          if (isTerminalSession) {
+            if (session?.codeAgent === 'claude') {
+              // Verified direct-switch alias, this agent only (see comment above) — pi/opencode
+              // have their OWN /model pickers (per their own docs) but their direct-argument
+              // behavior hasn't been verified the same way, so fall through to the safer
+              // open-the-picker path for them instead of guessing at their exact syntax.
+              terminalViewRef.current?.sendCommand(`/model claude-${key}`)
+            } else {
+              terminalViewRef.current?.sendCommand('/model')
+              toast.info('Model loaded — pick it from the /model picker now open in the terminal.')
+            }
+          }
+        },
+      },
     )
   }
   const handleEject = () => {
@@ -145,14 +182,33 @@ export function CodeSessionScreen() {
     return global !== null ? Number(global) : -1
   }
   const [thinkingBudget, setThinkingBudgetState] = useState<number>(() => readThinkingBudget(sessionId ?? null))
+  const updateThinkingBudget = useUpdateCodeSessionThinkingBudget()
   const setThinkingBudget = (val: number) => {
     if (sessionId) localStorage.setItem(`tllm.thinkingBudget.${sessionId}`, String(val))
     setThinkingBudgetState(val)
+    // Terminal-agent sessions have no per-turn send call to attach this to — the CLI drives its
+    // own requests directly against the gateway, so this is a live, server-enforced override
+    // instead (session-auth.ts / gateway.ts), taking effect on the session's very next request.
+    if (isTerminalSession && sessionId) {
+      updateThinkingBudget.mutate(
+        { id: sessionId, tokens: val },
+        { onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not update thinking budget.') },
+      )
+    }
   }
   useEffect(() => {
     setThinkingBudgetState(readThinkingBudget(sessionId ?? null))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId])
+  // Sync the (localStorage-restored) budget to the backend once when a terminal-agent session
+  // opens — otherwise the gateway override would only start reflecting reality after the user
+  // actually touches the slider, even though a previously-saved non-default value is already
+  // showing in the UI.
+  useEffect(() => {
+    if (!isTerminalSession || !sessionId) return
+    updateThinkingBudget.mutate({ id: sessionId, tokens: readThinkingBudget(sessionId) })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isTerminalSession, sessionId])
 
   const [live, setLive] = useState<LiveState | null>(null)
   // The SERVER-side message queue's contents (tasks waiting behind the active run). Driven by
@@ -273,7 +329,12 @@ export function CodeSessionScreen() {
   useEffect(() => {
     if (!sessionId || !detailQ.isSuccess) return
     if (autoStartedRef.current === sessionId) return
-    const needsFirstRun = messages.length === 1 && messages[0]?.role === 'user' && !detailQ.data?.running
+    // Terminal-agent sessions have no daemon-owned "run" at all — the seeded first user message
+    // is just the session's title/prompt, and the actual work happens entirely inside the
+    // external CLI in the terminal. Without this guard, a terminal-agent session's very first
+    // load silently kicks off the built-in turbollm agent loop (real tool calls, real token
+    // spend) behind a UI that never even mounts a transcript to show it happened.
+    const needsFirstRun = !isTerminalSession && messages.length === 1 && messages[0]?.role === 'user' && !detailQ.data?.running
     if (needsFirstRun) {
       autoStartedRef.current = sessionId
       // Read directly rather than closing over `thinkingBudget` state: navigating between two
@@ -706,36 +767,53 @@ export function CodeSessionScreen() {
               </div>
             </>
           )}
-          {/* Terminal toggle — always visible; opens a full-screen claude TUI */}
-          {session && (
-            <Button
-              size="icon"
-              variant={terminalOpen ? 'default' : 'ghost'}
-              className="h-8 w-8 shrink-0"
-              onClick={() => setTerminalOpen((o) => !o)}
-              title={terminalOpen ? 'Close terminal' : 'Open terminal (runs claude CLI)'}
-            >
-              <TerminalIcon size={16} />
-            </Button>
-          )}
         </div>
 
-        {/* Loaded-resources header — shown only when terminal is NOT open */}
-        {!terminalOpen && session && !notFound && (
+        {/* Loaded-resources header — shown only for turbollm (chat) sessions */}
+        {!isTerminalSession && session && !notFound && (
           <CodeResourcesHeader
             skillCount={skillsQ.data?.length ?? 0}
             hasAgentsMd={detailQ.data?.hasAgentsMd ?? { project: false, global: false }}
           />
         )}
 
-        {/* Main content — either the full-screen claude TUI (terminalOpen) or the
-            normal transcript + composer view */}
-        {terminalOpen && session ? (
-          <TerminalView
-            sessionId={session.id}
-            // repoRoot is derived server-side from the Code session's AgentRun
-            onClose={() => setTerminalOpen(false)}
-          />
+        {/* Main content — a non-turbollm agent is full-screen terminal for its entire
+            lifetime (no chat UI ever mounts); 'turbollm' keeps the normal transcript +
+            composer view unchanged. */}
+        {isTerminalSession && session ? (
+          <>
+            <TerminalView
+              ref={terminalViewRef}
+              sessionId={session.id}
+              // repoRoot + the launch command are both resolved server-side from the
+              // session's AgentRun (terminal-routes.ts) — nothing terminal-specific to
+              // pass through here.
+              onClose={() => navigate('/workspace/code')}
+            />
+            {/* Composer-parity chrome (model / context / thinking / stats) — the SAME row
+                a turbollm chat session's composer shows, just without anything to type into
+                (the terminal above owns keyboard input). Keeps this in the exact screen
+                position the chat composer occupies so switching agents only changes what's
+                ABOVE this row. */}
+            <TerminalToolbar
+              models={allModels}
+              loadedKey={model?.key ?? null}
+              loadedName={model?.name ?? null}
+              modelPending={modelBusy}
+              ejecting={modelActions.eject.isPending}
+              onLoadModel={handleLoadModel}
+              onEjectModel={handleEject}
+              onModelSettings={(key) => setSettingsKey(key)}
+              ctxUsed={ctxUsed}
+              ctxMax={ctxMax}
+              thinkingBudget={thinkingBudget}
+              onThinkingBudgetChange={setThinkingBudget}
+              lastPromptTokens={lastUsage?.promptTokens}
+              lastGenTokens={lastUsage?.genTokens}
+              lastPromptTps={lastUsage?.promptTps ?? undefined}
+              lastGenTps={lastUsage?.genTps ?? undefined}
+            />
+          </>
         ) : (
           <>
             {/* Transcript — activity-log presentation (CodeTranscript.tsx), not

@@ -118,6 +118,10 @@ export interface AgentRun {
   repoRoot?: string
   /** The sidebar "branch" label captured at creation (git rev-parse of repoRoot). */
   repoBranch?: string
+  /** Which coding agent this session launches (config.ts's code.defaultAgent, snapshotted at
+   *  creation — code-routes.ts). 'turbollm' (or absent, for pre-existing rows) is the built-in
+   *  chat UI; the others launch full-screen inside the embedded terminal. */
+  codeAgent?: 'turbollm' | 'pi' | 'claude' | 'opencode'
   /** Whether the composer's "isolate in a worktree" tickbox was checked. */
   useWorktree?: boolean
   /** Captured worktree intent — stored, NOT acted on in Phase 1 (fast-follow). */
@@ -475,7 +479,7 @@ export interface Message {
 }
 
 interface ConvRow { id: string; title: string; system_prompt: string; model_key: string; sampling: string; expert_mode: number; tool_policy: string | null; kind: string | null; folder_id: string | null; tool_overrides: string | null; agent_id: string | null; completed_at: string | null; read_scope: string | null; agent_mode: string | null; skill_ids: string | null; allowed_tools: string | null; preserve_thinking: number; created_at: string; updated_at: string }
-interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; agent_id: string | null; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null; archived_at: string | null; completion: string | null; repo_root: string | null; repo_branch: string | null; use_worktree: number | null; worktree_branch: string | null; worktree_base: string | null; lines_added: number | null; lines_removed: number | null; compaction_summary: string | null; compaction_upto_message_id: string | null; compaction_tokens_before: number | null; cleared_upto_message_id: string | null; reverted_from_message_id: string | null; title_auto_synced: number | null }
+interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; agent_id: string | null; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null; archived_at: string | null; completion: string | null; repo_root: string | null; repo_branch: string | null; use_worktree: number | null; worktree_branch: string | null; worktree_base: string | null; lines_added: number | null; lines_removed: number | null; compaction_summary: string | null; compaction_upto_message_id: string | null; compaction_tokens_before: number | null; cleared_upto_message_id: string | null; reverted_from_message_id: string | null; title_auto_synced: number | null; code_agent: string | null }
 interface FolderRow { id: string; name: string; sort_order: number; created_at: string; updated_at: string }
 interface MsgRow  { id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string; reasoning: string; attachments: string; text_attachments: string | null; tool_calls: string | null; timeline: string | null; stats: string; model_key: string | null; research_meta: string | null; created_at: string; variant_group: string | null; is_active: number; branch_of: string | null; edited: number }
 
@@ -516,6 +520,7 @@ function rowToAgentRun(r: AgentRunRow): AgentRun {
     completion: (r.completion as AgentRun['completion']) ?? undefined,
     repoRoot: r.repo_root ?? undefined,
     repoBranch: r.repo_branch ?? undefined,
+    codeAgent: (r.code_agent as AgentRun['codeAgent']) ?? undefined,
     useWorktree: r.use_worktree === null ? undefined : r.use_worktree === 1,
     worktreeBranch: r.worktree_branch ?? undefined,
     worktreeBase: r.worktree_base ?? undefined,
@@ -938,6 +943,25 @@ export class ConversationStore {
         PRAGMA user_version = 34;
       `)
     }
+    // v35 (ADR-283, Code agent selector): which coding agent a session launches with
+    // (config.ts's code.defaultAgent, snapshotted at creation). Additive + nullable —
+    // existing rows get NULL, decoded as undefined (→ 'turbollm') in rowToAgentRun.
+    if (v < 35) {
+      if (!this.hasColumn('agent_runs', 'code_agent')) this.db.exec(`ALTER TABLE agent_runs ADD COLUMN code_agent TEXT;`)
+      this.db.exec(`PRAGMA user_version = 35;`)
+    }
+    // v36 (ADR-284, terminal-agent composer parity): api_usage rows gain a code_session_id
+    // (which Code session a gateway request belongs to, resolved from the session-scoped
+    // token — session-auth.ts) and duration_ms (elapsed wall-clock time of the request, so
+    // prompt/gen tokens-per-second can be computed the same way lastRealStats already is for
+    // chat sessions). Both additive + nullable — pre-existing rows (and any request whose
+    // token doesn't resolve to a Code session) simply have no session/timing to attribute.
+    if (v < 36) {
+      if (!this.hasColumn('api_usage', 'code_session_id')) this.db.exec(`ALTER TABLE api_usage ADD COLUMN code_session_id TEXT;`)
+      if (!this.hasColumn('api_usage', 'duration_ms')) this.db.exec(`ALTER TABLE api_usage ADD COLUMN duration_ms INTEGER;`)
+      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_api_usage_code_session ON api_usage(code_session_id, created_at);`)
+      this.db.exec(`PRAGMA user_version = 36;`)
+    }
   }
 
   listConversations(q?: string, kind: 'chat' | 'agent' | 'all' = 'all'): Conversation[] {
@@ -1297,11 +1321,13 @@ export class ConversationStore {
 
   /** Insert one completed gateway request (GitHub #71) — called from the two gateway entry
    *  points (gateway.ts) right where in-app chat already records into `messages`. Fully
-   *  additive/fail-safe: callers wrap this the same way `recordCompletion` is wrapped. */
-  recordApiUsage(rec: { source: ApiUsageSource; modelKey: string | null; promptTokens: number; genTokens: number }): void {
+   *  additive/fail-safe: callers wrap this the same way `recordCompletion` is wrapped.
+   *  `codeSessionId`/`durationMs` (ADR-284) are only populated for a terminal-agent session's
+   *  own token-identified traffic — undefined for every other gateway client, same as before. */
+  recordApiUsage(rec: { source: ApiUsageSource; modelKey: string | null; promptTokens: number; genTokens: number; codeSessionId?: string | null; durationMs?: number | null }): void {
     this.db.prepare(`
-      INSERT INTO api_usage (id, created_at, source, model_key, prompt_tokens, gen_tokens)
-      VALUES ($id, $createdAt, $source, $modelKey, $promptTokens, $genTokens)
+      INSERT INTO api_usage (id, created_at, source, model_key, prompt_tokens, gen_tokens, code_session_id, duration_ms)
+      VALUES ($id, $createdAt, $source, $modelKey, $promptTokens, $genTokens, $codeSessionId, $durationMs)
     `).run({
       $id: randomUUID(),
       $createdAt: new Date().toISOString(),
@@ -1309,7 +1335,33 @@ export class ConversationStore {
       $modelKey: rec.modelKey,
       $promptTokens: Math.max(0, Math.floor(rec.promptTokens) || 0),
       $genTokens: Math.max(0, Math.floor(rec.genTokens) || 0),
+      $codeSessionId: rec.codeSessionId ?? null,
+      $durationMs: rec.durationMs != null && Number.isFinite(rec.durationMs) ? Math.max(0, Math.floor(rec.durationMs)) : null,
     } as P)
+  }
+
+  /** Most recent completed gateway request attributed to a terminal-agent Code session
+   *  (ADR-284) — powers TerminalToolbar.tsx's composer-parity stats row the same way
+   *  `lastRealStats` already does for a 'turbollm' chat session's last turn. null when the
+   *  session has made no gateway requests yet (fresh session, or a non-terminal-agent one). */
+  getLastApiUsageForSession(codeSessionId: string): { promptTokens: number; genTokens: number; promptTps: number | null; genTps: number | null } | null {
+    const row = this.db.prepare(`
+      SELECT prompt_tokens, gen_tokens, duration_ms FROM api_usage
+      WHERE code_session_id = $codeSessionId
+      ORDER BY created_at DESC LIMIT 1
+    `).get({ $codeSessionId: codeSessionId } as P) as unknown as { prompt_tokens: number; gen_tokens: number; duration_ms: number | null } | undefined
+    if (!row) return null
+    const seconds = row.duration_ms != null && row.duration_ms > 0 ? row.duration_ms / 1000 : null
+    return {
+      promptTokens: row.prompt_tokens,
+      genTokens: row.gen_tokens,
+      // Prefill and generation share ONE measured duration (the request's total wall-clock
+      // time, not separately timed phases) — an approximation, same honest-estimate spirit as
+      // CodeSessionScreen's own ctxUsed live estimate, not a claim of precisely isolating the
+      // two phases.
+      promptTps: seconds ? row.prompt_tokens / seconds : null,
+      genTps: seconds ? row.gen_tokens / seconds : null,
+    }
   }
 
   /** Gateway (external-client) token usage — see `ApiUsageStats`'s doc comment for why this
@@ -1568,13 +1620,13 @@ export class ConversationStore {
 
   // ── Agent run methods (v8 migration) ──────────────────────────────────────
 
-  createAgentRun(params: { convId: string; title: string; allowedTools: string[]; agentId?: string; repoRoot?: string; repoBranch?: string; useWorktree?: boolean; worktreeBranch?: string; worktreeBase?: string }): AgentRun {
+  createAgentRun(params: { convId: string; title: string; allowedTools: string[]; agentId?: string; repoRoot?: string; repoBranch?: string; useWorktree?: boolean; worktreeBranch?: string; worktreeBase?: string; codeAgent?: 'turbollm' | 'pi' | 'claude' | 'opencode' }): AgentRun {
     const id = randomUUID()
     const now = new Date().toISOString()
     const agentId = params.agentId ?? null
     // Code runs carry repo/worktree metadata (v28); background 'agent' runs pass none of it
     // and every code column is written NULL (byte-identical to the pre-v28 insert for them).
-    this.db.prepare(`INSERT INTO agent_runs (id,conv_id,title,status,allowed_tools,agent_id,repo_root,repo_branch,use_worktree,worktree_branch,worktree_base,lines_added,lines_removed,created_at,updated_at) VALUES ($id,$cid,$title,'queued',$at,$aid,$rr,$rb,$uw,$wb,$wbase,$la,$lr,$now,$now)`)
+    this.db.prepare(`INSERT INTO agent_runs (id,conv_id,title,status,allowed_tools,agent_id,repo_root,repo_branch,use_worktree,worktree_branch,worktree_base,lines_added,lines_removed,code_agent,created_at,updated_at) VALUES ($id,$cid,$title,'queued',$at,$aid,$rr,$rb,$uw,$wb,$wbase,$la,$lr,$ca,$now,$now)`)
       .run({
         $id: id, $cid: params.convId, $title: params.title, $at: JSON.stringify(params.allowedTools), $aid: agentId,
         $rr: params.repoRoot ?? null,
@@ -1586,6 +1638,7 @@ export class ConversationStore {
         // sidebar shows +0/-0 rather than a blank; a background 'agent' run leaves them NULL.
         $la: params.repoRoot !== undefined ? 0 : null,
         $lr: params.repoRoot !== undefined ? 0 : null,
+        $ca: params.codeAgent ?? null,
         $now: now,
       } as P)
     return this.getAgentRun(id)!

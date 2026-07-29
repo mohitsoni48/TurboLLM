@@ -590,8 +590,9 @@ export type DaemonSettings = {
    *  conda-env / custom-path CUDA Toolkit + compiler are found. Not secret — echoed back. */
   build: { toolchainDirs: string[] }
   /** Code's AGENTS.md-style standing-context candidate lists (config.ts's CodeConfig) — tried
-   *  in order per side, first EXISTING file wins. Not secret — echoed back. */
-  code: { agentsMdProjectCandidates: string[]; agentsMdGlobalCandidates: string[] }
+   *  in order per side, first EXISTING file wins. Not secret — echoed back.
+   *  defaultAgent: which coding agent new Code sessions launch with (CodeAgentSection.tsx). */
+  code: { agentsMdProjectCandidates: string[]; agentsMdGlobalCandidates: string[]; defaultAgent: 'turbollm' | 'pi' | 'claude' | 'opencode' }
   /** Tool-call approval gate (F-025): per-tool default policy. Missing tools default
    *  to 'ask'. Keyed by tool name (e.g. 'run_code', 'mcp__server__tool'). */
   toolPolicies: Record<string, ToolPolicy>

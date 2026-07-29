@@ -1,11 +1,24 @@
 // Gateway: /v1/* OpenAI-compatible pass-through + Anthropic translation (spec 06).
 import { randomUUID } from 'node:crypto'
-import type { Hono } from 'hono'
+import type { Context, Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import type { Deps } from '../deps'
 import { clampMaxTokens } from '../config/config'
 import { engineModelAlias } from '../engines/compat'
+import { presentedKey } from '../auth'
+import { sessionAuth } from '../code/session-auth'
 import { mapToOpenAI, mapFromOpenAI, streamToAnthropic, type AnthropicRequest } from './anthropic'
+
+/** Resolve the Code session (if any) a gateway request belongs to, from the same token a
+ *  terminal-launched CLI carries as its ANTHROPIC_AUTH_TOKEN / OpenAI-compatible apiKey
+ *  (session-auth.ts, terminal-routes.ts). `codeSessionId` is null for the shared static token,
+ *  a manually-run `turbollm launch`, or any other client — those get no per-session
+ *  overrides/attribution. Returns `token` too so callers needn't re-parse headers to also look
+ *  up the thinking-budget override. */
+function resolveCodeSession(c: Context): { token: string; codeSessionId: string | null } {
+  const token = presentedKey(c)
+  return { token, codeSessionId: token ? sessionAuth.resolve(token) : null }
+}
 
 /** An AbortController that fires when the CLIENT disconnects (Claude Code cancels a
  *  turn, hits ESC, times out, or closes). Wiring its signal into the upstream engine
@@ -43,6 +56,22 @@ export function registerGateway(app: Hono, d: Deps): void {
     // when gateway.autoSwap is on (see /v1/models below), so routing here still honors the
     // user's global auto-swap preference like every other request.
     if (req.model?.startsWith('claude-')) req.model = req.model.slice(7)
+
+    // Terminal-agent thinking-budget override (ADR-284) — the composer's ThinkingBudgetSlider
+    // for a terminal-agent session (TerminalToolbar.tsx) has no text turn of its own to attach
+    // this to, so it's enforced here instead: whatever the daemon has stored for this session
+    // (session-auth.ts, set via PATCH .../thinking-budget) wins over whatever Claude Code itself
+    // sent, live, every request — no CLI restart involved. Only touches requests whose presented
+    // token resolves to a Code session with an override actually set; every other client
+    // (including a manually-run `turbollm launch claude`) is completely unaffected.
+    const { token: anthropicToken, codeSessionId: anthropicCodeSessionId } = resolveCodeSession(c)
+    if (anthropicCodeSessionId) {
+      const override = sessionAuth.getThinkingBudgetForToken(anthropicToken)
+      if (override !== null) {
+        req.thinking = override > 0 ? { type: 'enabled', budget_tokens: override } : undefined
+      }
+    }
+
     if (!req.max_tokens) {
       return c.json(
         { type: 'error', error: { type: 'invalid_request_error', message: 'max_tokens is required.' } },
@@ -81,6 +110,11 @@ export function registerGateway(app: Hono, d: Deps): void {
     // the engine's slots forever.
     const ac = clientAbort(c)
 
+    // For terminal-agent usage attribution/stats (ADR-284) — wall-clock request duration, the
+    // simplest signal available without touching streamToAnthropic's own callback shape (it
+    // doesn't currently surface the engine's per-request timings the way the OpenAI-shaped
+    // helpers below already do). An approximation, not a literally-measured prefill/gen split.
+    const requestStart = Date.now()
     let res: Response
     try {
       res = await fetch(`${target}/v1/chat/completions`, {
@@ -120,7 +154,10 @@ export function registerGateway(app: Hono, d: Deps): void {
             d.manager.recordCompletion({ inputTokens: u.inputTokens, outputTokens: u.outputTokens })
             // Durable counterpart to the ephemeral session counter above (GitHub #71) — the
             // session counter resets on engine restart and was never persisted/surfaced.
-            d.db.recordApiUsage({ source: 'anthropic', modelKey: req.model ?? null, promptTokens: u.inputTokens, genTokens: u.outputTokens })
+            d.db.recordApiUsage({
+              source: 'anthropic', modelKey: req.model ?? null, promptTokens: u.inputTokens, genTokens: u.outputTokens,
+              codeSessionId: anthropicCodeSessionId, durationMs: Date.now() - requestStart,
+            })
           } catch { /* swallow — stats are best-effort */ }
         },
         // Live per-request progress for the engine card (prefill % + token count),
@@ -147,7 +184,8 @@ export function registerGateway(app: Hono, d: Deps): void {
 
     try {
       const oaiRes = (await res.json()) as Record<string, unknown>
-      recordOpenAiUsage(d, oaiRes, 'anthropic', req.model ?? null) // session stats (B4) + durable #71 record, fail-safe
+      // session stats (B4) + durable #71 record, fail-safe
+      recordOpenAiUsage(d, oaiRes, 'anthropic', req.model ?? null, anthropicCodeSessionId, Date.now() - requestStart)
       return c.json(mapFromOpenAI(oaiRes, modelName))
     } finally {
       d.manager.generationEnd()
@@ -221,6 +259,7 @@ export function registerGateway(app: Hono, d: Deps): void {
     if (isChat) {
       try { parsedBody = (await c.req.json()) as Record<string, unknown> } catch { parsedBody = null }
     }
+    const { token: chatToken, codeSessionId: chatCodeSessionId } = resolveCodeSession(c)
 
     const requestedModel = isChat ? ((parsedBody?.model as string | undefined) ?? '') : ''
     const routeResult = await d.modelRouter.route(requestedModel)
@@ -255,6 +294,17 @@ export function registerGateway(app: Hono, d: Deps): void {
           const alias = engineModelAlias(d.registry.active()?.kind ?? '')
           if (alias) parsedBody.model = alias
         }
+        // Terminal-agent thinking-budget override (ADR-284) — OpenAI-protocol clients (pi/
+        // opencode via this passthrough) reach the same `thinking_budget_tokens` field the
+        // engine sampler reads directly (no Anthropic-shaped `thinking` object to translate,
+        // unlike /v1/messages above). Same session-scoped-token gate as that handler.
+        if (parsedBody && chatCodeSessionId) {
+          const override = sessionAuth.getThinkingBudgetForToken(chatToken)
+          if (override !== null) {
+            if (override > 0) parsedBody.thinking_budget_tokens = override
+            else delete parsedBody.thinking_budget_tokens
+          }
+        }
         // A streaming OpenAI response omits the final `usage` chunk unless the caller
         // opts in via `stream_options.include_usage` (standard OpenAI API behavior,
         // which llama.cpp's server mirrors) — without this, recordOpenAiStreamUsage
@@ -278,6 +328,7 @@ export function registerGateway(app: Hono, d: Deps): void {
     // when c.req.raw.signal.aborted is already true) escaped straight to Hono's default
     // error handler: a bodyless 500 with no diagnostic, and no client-facing error envelope
     // at all. Mirrors the /v1/messages handler's guard above.
+    const requestStart = Date.now()
     let res: Response
     try {
       res = await fetch(upstream, init)
@@ -315,8 +366,8 @@ export function registerGateway(app: Hono, d: Deps): void {
         // parser would silently see no matches and record nothing (GitHub #71: this
         // gap would have made external-client tracking wrong for a common case).
         const drain = parsedBody?.stream === true
-          ? recordOpenAiStreamUsage(d, b, 'openai', requestedModel || null)
-          : recordOpenAiJsonUsage(d, b, 'openai', requestedModel || null)
+          ? recordOpenAiStreamUsage(d, b, 'openai', requestedModel || null, chatCodeSessionId, requestStart)
+          : recordOpenAiJsonUsage(d, b, 'openai', requestedModel || null, chatCodeSessionId, requestStart)
         void drain.finally(() => d.manager.generationEnd())
         return new Response(a, { status: res.status, headers: res.headers })
       } catch {
@@ -332,8 +383,9 @@ export function registerGateway(app: Hono, d: Deps): void {
 
 /** Record usage from a non-streaming OpenAI completion. Fail-safe. Also persists a durable
  *  `api_usage` row (GitHub #71) — `source`/`modelKey` distinguish gateway (external-client)
- *  traffic from in-app chat, which records into `messages` instead. */
-function recordOpenAiUsage(d: Deps, oai: Record<string, unknown>, source: 'anthropic' | 'openai', modelKey: string | null): void {
+ *  traffic from in-app chat, which records into `messages` instead. `codeSessionId`/`durationMs`
+ *  (ADR-284) attribute this row to a terminal-agent session for TerminalToolbar.tsx's stats. */
+function recordOpenAiUsage(d: Deps, oai: Record<string, unknown>, source: 'anthropic' | 'openai', modelKey: string | null, codeSessionId: string | null = null, durationMs: number | null = null): void {
   try {
     const usage = oai.usage as { prompt_tokens?: number; completion_tokens?: number } | undefined
     const timings = oai.timings as { prompt_per_second?: number; predicted_per_second?: number } | undefined
@@ -343,26 +395,28 @@ function recordOpenAiUsage(d: Deps, oai: Record<string, unknown>, source: 'anthr
       promptTps: timings?.prompt_per_second,
       genTps: timings?.predicted_per_second,
     })
-    d.db.recordApiUsage({ source, modelKey, promptTokens: usage?.prompt_tokens ?? 0, genTokens: usage?.completion_tokens ?? 0 })
+    d.db.recordApiUsage({ source, modelKey, promptTokens: usage?.prompt_tokens ?? 0, genTokens: usage?.completion_tokens ?? 0, codeSessionId, durationMs })
   } catch { /* swallow — stats are best-effort */ }
 }
 
 /** Drain a teed copy of a NON-streaming OpenAI JSON body (a single response, not SSE) to
  *  record usage — the `/v1/*` pass-through's counterpart to `recordOpenAiStreamUsage` for
  *  requests where the caller didn't set `stream: true`. Never touches the client-facing
- *  stream; all errors are swallowed. */
-async function recordOpenAiJsonUsage(d: Deps, body: ReadableStream<Uint8Array>, source: 'anthropic' | 'openai', modelKey: string | null): Promise<void> {
+ *  stream; all errors are swallowed. `startedAt` (Date.now() at the ORIGINAL fetch call) —
+ *  duration is computed here, at true completion, not at the call site (which fires before
+ *  this drain even starts). */
+async function recordOpenAiJsonUsage(d: Deps, body: ReadableStream<Uint8Array>, source: 'anthropic' | 'openai', modelKey: string | null, codeSessionId: string | null = null, startedAt: number | null = null): Promise<void> {
   try {
     const text = await new Response(body).text()
     const oai = JSON.parse(text) as Record<string, unknown>
-    recordOpenAiUsage(d, oai, source, modelKey)
+    recordOpenAiUsage(d, oai, source, modelKey, codeSessionId, startedAt != null ? Date.now() - startedAt : null)
   } catch { /* swallow — stats are best-effort */ }
 }
 
 /** Drain a teed copy of a streaming OpenAI SSE body to record final usage (B4) plus a
  *  durable `api_usage` row (GitHub #71). Never touches the client-facing stream; all
- *  errors are swallowed. */
-async function recordOpenAiStreamUsage(d: Deps, body: ReadableStream<Uint8Array>, source: 'anthropic' | 'openai', modelKey: string | null): Promise<void> {
+ *  errors are swallowed. `startedAt` — see recordOpenAiJsonUsage's doc comment; same reason. */
+async function recordOpenAiStreamUsage(d: Deps, body: ReadableStream<Uint8Array>, source: 'anthropic' | 'openai', modelKey: string | null, codeSessionId: string | null = null, startedAt: number | null = null): Promise<void> {
   try {
     const reader = body.getReader()
     const dec = new TextDecoder()
@@ -402,6 +456,9 @@ async function recordOpenAiStreamUsage(d: Deps, body: ReadableStream<Uint8Array>
       }
     }
     d.manager.recordCompletion({ inputTokens: promptTokens, outputTokens: completionTokens, promptTps, genTps })
-    d.db.recordApiUsage({ source, modelKey, promptTokens, genTokens: completionTokens })
+    d.db.recordApiUsage({
+      source, modelKey, promptTokens, genTokens: completionTokens,
+      codeSessionId, durationMs: startedAt != null ? Date.now() - startedAt : null,
+    })
   } catch { /* swallow — stats are best-effort */ }
 }

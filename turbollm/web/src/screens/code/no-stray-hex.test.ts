@@ -10,10 +10,12 @@ import { describe, expect, it } from 'vitest'
 
 const CODE_SCREENS_DIR = join(import.meta.dirname, '.')
 
-// Files that legitimately use hex/functional colors (e.g., xterm.js theme objects can't use
-// CSS variables — the colors are baked into a JS object, not a CSS class). Each entry is a
-// simple name match against the basename.
-const STRAY_HEX_EXCEPTIONS = new Set(['TerminalView'])
+// Files that legitimately use hex/functional colors. Empty — TerminalView.tsx used to need an
+// exception here (xterm.js's theme object can't take CSS variables directly), but it now reads
+// resolved --term-* token values via getComputedStyle at runtime instead of hardcoding hex, so
+// no file needs one anymore. Kept as a real (if currently empty) mechanism rather than removed
+// outright, since a genuinely unavoidable case may come up again.
+const STRAY_HEX_EXCEPTIONS = new Set<string>()
 
 // `#`-prefixed hex color literals (3/4/6/8 hex digits, word-boundaried so this doesn't false-hit
 // on things like URL fragments or non-color hex-looking tokens) and raw rgba()/hsla() function

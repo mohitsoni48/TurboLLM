@@ -1,31 +1,69 @@
 // TerminalView — embeds xterm.js with the @xterm/addon-fit addon.
 //
-// The terminal replaces the transcript/composer view in CodeSessionScreen when
-// the user toggles "Terminal" in the header toolbar. It is a FULL-SCREEN claude TUI:
-// the terminal occupies the entire main area, with no split view.
+// Rendered full-bleed (no border, no header chrome — CodeSessionScreen's normal header +
+// composer shell surrounds it) by CodeSessionScreen for the entire lifetime of any session
+// whose codeAgent isn't 'turbollm' (code-types.ts), in place of CodeTranscript. There's no
+// separate toggle to open/close it — closing means leaving the session (Ctrl+D).
 //
 // The PTY output is raw bytes; the browser receives them as UTF-8 text over
-// WebSocket and renders them in a real xterm.js terminal emulator.
+// WebSocket and renders them in a real xterm.js terminal emulator. The shell spawned
+// server-side already runs `turbollm launch <agent>` as its OWN startup command
+// (terminal-routes.ts / pty-session.ts) — nothing is typed into it from here, so the
+// launch command itself is never visible, only its output.
+//
+// xterm.js is fit to its container BEFORE the PTY is even created (see the effect below) —
+// the daemon spawns the PTY at that real size from its very first byte. Creating the PTY
+// first and resizing afterward (the original version) let interactive TUIs — Claude Code's
+// especially, being Ink-based — paint their very first frame at the wrong width, which they
+// don't reliably recover from on a later resize: the symptom was overlapping/garbled text and
+// keystrokes landing at a corrupted cursor position that never reached the real input line.
 //
 // The WS listener is managed by `useTerminalConnection` which auto-reconnects.
 // Terminal input → WS send → PTY stdin. Terminal resize → WS send `\x1b[8;{rows};{cols}t`.
 //
-// All colors use CSS variables to pass the no-hex-color lint.
+// Colors: xterm can't resolve CSS var()/color-mix() itself (its renderer parses real color
+// values, not custom properties) — resolveTerminalTheme() below reads the actual computed
+// values of the --term-* tokens (index.css) instead of ever hardcoding a hex literal, so the
+// terminal always matches the app's current light/dark theme, live (see the MutationObserver
+// in the mount effect).
 
-import { useEffect, useRef, useCallback, useState } from 'react'
-import { Terminal } from '@xterm/xterm'
+import { useEffect, useImperativeHandle, useRef, useState, forwardRef } from 'react'
+import { Terminal, type ITheme } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
-import { TerminalState, useTerminalConnection, createTerminalForSession } from '../../lib/terminal-connection'
-import { Button } from '../../components/ui/button'
+import { useTerminalConnection, createTerminalForSession } from '../../lib/terminal-connection'
 import { toast } from '../../components/ui/sonner'
 
-// `turbollm launch claude` (not bare `claude`) — it resolves the running daemon's
-// port and wires ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN/ANTHROPIC_MODEL so Claude
-// Code actually talks to the locally loaded model instead of the cloud API
-// (cli-launch.ts's launchCli). Bare `claude` would silently hit api.anthropic.com.
-function getLaunchCommand(): string {
-  return 'turbollm launch claude'
+/** Reads the app's --term-* design tokens (index.css) as ACTUAL resolved colors — xterm's theme
+ *  option needs real values (hex/rgb/color-mix() output as computed by the browser), not the
+ *  var()/color-mix() source strings, which its own internal color parser doesn't understand.
+ *  Re-run on every theme change (the MutationObserver in the mount effect below), not just once
+ *  at mount, so switching light↔dark while a terminal is open updates it live. */
+function resolveTerminalTheme(): ITheme {
+  const style = getComputedStyle(document.documentElement)
+  const t = (name: string) => style.getPropertyValue(name).trim()
+  return {
+    background: t('--term-bg'),
+    foreground: t('--term-fg'),
+    cursor: t('--term-cursor'),
+    selectionBackground: t('--term-selection'),
+    black: t('--term-black'),
+    red: t('--term-red'),
+    green: t('--term-green'),
+    yellow: t('--term-yellow'),
+    blue: t('--term-blue'),
+    magenta: t('--term-magenta'),
+    cyan: t('--term-cyan'),
+    white: t('--term-white'),
+    brightBlack: t('--term-bright-black'),
+    brightRed: t('--term-bright-red'),
+    brightGreen: t('--term-bright-green'),
+    brightYellow: t('--term-bright-yellow'),
+    brightBlue: t('--term-bright-blue'),
+    brightMagenta: t('--term-bright-magenta'),
+    brightCyan: t('--term-bright-cyan'),
+    brightWhite: t('--term-bright-white'),
+  }
 }
 
 interface TerminalViewProps {
@@ -35,70 +73,53 @@ interface TerminalViewProps {
   onClose: () => void
 }
 
-export function TerminalView({ sessionId, onClose }: TerminalViewProps) {
+/** Imperative handle so CodeSessionScreen can drive the running CLI's OWN commands (e.g. `/model`
+ *  to switch models, `founder ask: avoid a relaunch`) without needing the terminal itself as a
+ *  prop-driven remount target. Deliberately narrow — this is for well-known, safe slash commands
+ *  the CLI itself interprets, not a general "type arbitrary text into someone's shell" API. */
+export interface TerminalViewHandle {
+  /** Sends `command` followed by Enter, exactly as if the user had typed it. */
+  sendCommand: (command: string) => void
+}
+
+export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(function TerminalView(
+  { sessionId, onClose },
+  ref,
+) {
   const containerRef = useRef<HTMLDivElement>(null)
   const terminalRef = useRef<Terminal | null>(null)
   const fitAddonRef = useRef<FitAddon | null>(null)
-  // Real state, NOT a ref — useTerminalConnection(terminalId, ...) reads this value at
-  // render time. A ref's mutation doesn't itself trigger a re-render, so if this were a
-  // ref (as it originally was), useTerminalConnection could stay permanently stuck on
-  // the `null` it saw during the FIRST render, and the WebSocket (and therefore the
-  // `turbollm launch claude` auto-launch) would never actually happen for any session
-  // that doesn't already have some OTHER reason to re-render after the create() call
-  // resolves. `created` (true only for a genuinely fresh HTTP-201 PTY, never a reused
-  // HTTP-200 one) travels alongside it so a reopen of an already-running terminal never
-  // resends the launch command into its live stdin.
-  const [terminal, setTerminal] = useState<{ id: string; created: boolean } | null>(null)
-  const [terminalState, setTerminalState] = useState<TerminalState>('disconnected')
-  const [claudeLaunched, setClaudeLaunched] = useState(false)
-  const [terminalReady, setTerminalReady] = useState(false)
+  const [terminalId, setTerminalId] = useState<string | null>(null)
+  // CodeSessionScreen passes `onClose={() => navigate(...)}` — a NEW function reference every
+  // render of that (frequently re-rendering, e.g. the 4s last-usage poll) screen. Reading it via
+  // a ref instead of putting it in the mount effect's deps below is what keeps that effect from
+  // re-running on every parent render — an earlier version had `onClose` in those deps, which
+  // tore the terminal down and reconnected the WebSocket on basically every render. Each
+  // teardown's disconnect() closes the socket with no explicit code, which the WebSocket API
+  // itself then reports back as close code 1005 — that's what a user actually SEES as "getting a
+  // 1005 error" on a terminal that (from the server's own perspective) never had anything wrong
+  // with it at all.
+  const onCloseRef = useRef(onClose)
+  onCloseRef.current = onClose
 
-  useEffect(() => {
-    let cancelled = false
-    void createTerminalForSession(sessionId).then((result) => {
-      if (cancelled) return
-      if (result) {
-        setTerminal({ id: result.terminalId, created: result.created })
-      } else {
-        toast.error('Could not create terminal session.')
-        onClose()
-      }
-    })
-    return () => { cancelled = true }
-  }, [sessionId, onClose])
-
-  // `sendRef` lets handleConnect reach the CURRENT `send` function even though
-  // it's defined (for readability, grouped with the launch-on-connect logic)
-  // before the useTerminalConnection() call below that produces `send`.
-  const sendRef = useRef<(data: string) => void>(() => {})
-
-  const handleConnect = useCallback(() => {
-    if (!claudeLaunched && terminal?.created) {
-      setClaudeLaunched(true)
-      // Must go over the WebSocket to the PTY (send), NOT terminalRef.current.write()
-      // — write() only renders text locally in xterm.js and never reaches the shell,
-      // so the launch command would sit on screen looking sent while nothing actually
-      // ran. `\r` alone (not `\r\n`) matches what a real Enter keypress sends.
-      setTimeout(() => {
-        sendRef.current(getLaunchCommand() + '\r')
-      }, 200)
-    }
-  }, [claudeLaunched, terminal?.created])
-
-  const { send, sendResize, ws } = useTerminalConnection(terminal?.id ?? null, {
-    onConnect: handleConnect,
+  const { send, sendResize, ws } = useTerminalConnection(terminalId, {
     onClose: (code, reason) => {
-      setTerminalState('disconnected')
       if (code !== 1000) {
         toast.warning(`Terminal connection closed: ${reason || code}`)
       }
     },
     onError: () => {
-      setTerminalState('error')
       toast.error('Terminal connection error.')
     },
   })
-  sendRef.current = send
+
+  // Lets CodeSessionScreen drive the CLI's own commands (e.g. `/model`, to switch models
+  // without a relaunch — the CLI reads its model from env vars at launch and has no live
+  // external model-switch API, but it DOES have its own interactive `/model` picker; sending
+  // that command opens it exactly as if the user had typed it themselves, no scrollback lost).
+  useImperativeHandle(ref, () => ({
+    sendCommand: (command: string) => send(`${command}\r`),
+  }), [send])
 
   // PTY output → xterm display. This is the OTHER half of the bridge — term.onData
   // (below) already sends keystrokes TO the PTY, but incoming WebSocket messages were
@@ -117,34 +138,13 @@ export function TerminalView({ sessionId, onClose }: TerminalViewProps) {
 
   useEffect(() => {
     if (!containerRef.current) return
-    if (terminalRef.current) return
+    setTerminalId(null)
 
     const term = new Terminal({
       cursorBlink: true,
       fontSize: 14,
       fontFamily: '"Cascadia Code", "JetBrains Mono", "Fira Code", menlo, monospace',
-      theme: {
-        background: 'var(--panel)',
-        foreground: 'var(--ink)',
-        cursor: 'var(--panel-highlight)',
-        selectionBackground: 'var(--muted)',
-        black: 'var(--muted)',
-        red: '#f7768e',
-        green: '#9ece6a',
-        yellow: '#e0af68',
-        blue: '#7aa2f7',
-        magenta: '#bb9af7',
-        cyan: '#7dcfff',
-        white: 'var(--ink)',
-        brightBlack: 'var(--panel-highlight)',
-        brightRed: '#ff7a93',
-        brightGreen: '#b9f27c',
-        brightYellow: '#ff9e64',
-        brightBlue: '#7da6ff',
-        brightMagenta: '#c0a8e8',
-        brightCyan: '#0db9d7',
-        brightWhite: '#acb0d0',
-      },
+      theme: resolveTerminalTheme(),
       allowProposedApi: true,
     })
 
@@ -155,6 +155,17 @@ export function TerminalView({ sessionId, onClose }: TerminalViewProps) {
     term.loadAddon(fitAddon)
     term.open(containerRef.current)
 
+    // Keep the terminal's colors in sync with the app's own light/dark toggle (stores/ui.ts
+    // flips a `dark` class on <html>; --term-* tokens in index.css are pure var()/color-mix()
+    // compositions of the SAME tokens that already flip per theme). xterm can't resolve CSS
+    // custom properties itself — its renderer parses real color values, not var() strings —
+    // so this re-reads getComputedStyle and pushes a fresh resolved theme into the LIVE
+    // terminal instance whenever the class actually changes, rather than only at mount.
+    const themeObserver = new MutationObserver(() => {
+      term.options.theme = resolveTerminalTheme()
+    })
+    themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] })
+
     term.onResize(({ cols, rows }) => {
       // A real PTY resize is an ioctl-level size change (node-pty's resize()), not
       // something achieved by writing an escape sequence into the shell's stdin — an
@@ -162,7 +173,8 @@ export function TerminalView({ sessionId, onClose }: TerminalViewProps) {
       // writes to the PTY's INPUT stream) and it corrupted the display: the shell
       // couldn't parse it as real input and echoed it back as literal garbage text.
       // sendResize goes over a separate binary WS frame the daemon routes to the
-      // actual resize() call instead.
+      // actual resize() call instead. A no-op before the WS connects (send/sendResize
+      // guard on the socket being open) — harmless for the very first, pre-creation fit.
       sendResize(cols, rows)
     })
 
@@ -172,96 +184,64 @@ export function TerminalView({ sessionId, onClose }: TerminalViewProps) {
 
     term.focus()
 
-    setTimeout(() => {
-      fitAddon.fit()
-      setTerminalReady(true)
-    }, 50)
+    let cancelled = false
+    let created = false
+    // ResizeObserver, not a single one-shot requestAnimationFrame: the container's flex layout
+    // doesn't necessarily reach its FINAL size on the very next paint — it can keep settling for
+    // a frame or two more as siblings (TerminalToolbar below, ADR-284) finish their own layout,
+    // web fonts finish loading, etc. A one-shot fit() that ran before that settled left the
+    // terminal visibly smaller than its actual available space (a real gap + the toolbar reading
+    // as a floating disconnected box below it, not the terminal's real bottom edge). A
+    // ResizeObserver fires once immediately on `observe()` with the CURRENT box size, and again
+    // on every subsequent real size change — so this single callback both handles the original
+    // "wait for real layout before creating the PTY" job AND keeps the terminal correctly sized
+    // for the rest of its life, replacing the old window-resize-only listener (which never
+    // caught anything except the OS window itself changing size).
+    const ro = new ResizeObserver(() => {
+      if (cancelled) return
+      try { fitAddon.fit() } catch { /* best-effort — container may be mid-teardown */ }
+      if (created) return // later calls: just re-fit (term.onResize above sends the new size)
+      created = true
+      // fit() above already applied the REAL size synchronously, so term.cols/term.rows are
+      // accurate by the time this fires — the whole point of creating the PTY here rather than
+      // resizing it after the fact (see module header).
+      void createTerminalForSession(sessionId, term.cols, term.rows).then((result) => {
+        if (cancelled) return
+        if (result && 'terminalId' in result) {
+          setTerminalId(result.terminalId)
+        } else {
+          toast.error(result ? `Could not create terminal session: ${result.error}` : 'Could not create terminal session.')
+          onCloseRef.current()
+        }
+      })
+    })
+    ro.observe(containerRef.current)
 
     return () => {
+      cancelled = true
+      ro.disconnect()
+      themeObserver.disconnect()
       term.dispose()
       terminalRef.current = null
       fitAddonRef.current = null
     }
-  }, [send, sendResize])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId, send, sendResize])
 
-  const handleResize = useCallback(() => {
-    if (fitAddonRef.current && terminalReady) {
-      try {
-        fitAddonRef.current.fit()
-      } catch {
-        /* best-effort fit */
-      }
-    }
-  }, [terminalReady])
-
-  useEffect(() => {
-    window.addEventListener('resize', handleResize)
-    return () => window.removeEventListener('resize', handleResize)
-  }, [handleResize])
-
-  // Keyboard shortcut: Ctrl+D to close terminal view.
+  // Keyboard shortcut: Ctrl+D to close terminal view. Also reads onCloseRef rather than
+  // depending on onClose directly, so this listener isn't torn down/re-added every render
+  // either (harmless on its own, but there's no reason for it to churn any more than the
+  // main effect above does).
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === 'd') {
         e.preventDefault()
-        onClose()
+        onCloseRef.current()
       }
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [onClose])
+  }, [])
 
-  const stateLabel = terminalState === 'connected'
-    ? 'Connected'
-    : terminalState === 'connecting'
-      ? 'Connecting…'
-      : terminalState === 'error'
-        ? 'Error'
-        : terminal
-          ? 'Disconnected'
-          : 'Initializing…'
-
-  return (
-    <div
-      className="flex min-h-0 flex-1 flex-col"
-      style={{ background: 'var(--panel)', color: 'var(--ink)' }}
-    >
-      {/* Terminal header bar */}
-      <div
-        className="flex shrink-0 items-center justify-between border-b px-3 py-1.5"
-        style={{ borderColor: 'var(--panel-border)' }}
-      >
-        <div className="flex items-center gap-2">
-          <span className="text-[11px] font-medium uppercase tracking-wider text-muted">
-            Terminal
-          </span>
-          <span
-            className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px]"
-            style={{
-              background: terminalState === 'connected' ? 'var(--panel-border)' : 'var(--muted)',
-              color: terminalState === 'connected' ? 'var(--ink)' : 'var(--muted)',
-            }}
-          >
-            <span
-              className="inline-block h-1.5 w-1.5 rounded-full"
-              style={{ background: terminalState === 'connected' ? 'var(--ink)' : 'var(--muted)' }}
-            />
-            {stateLabel}
-          </span>
-        </div>
-        <Button
-          size="sm"
-          variant="ghost"
-          onClick={onClose}
-          className="h-6 w-6 p-0"
-          title="Close terminal (Ctrl+D)"
-        >
-          ✕
-        </Button>
-      </div>
-
-      {/* Terminal container */}
-      <div ref={containerRef} className="min-h-0 flex-1 p-0" />
-    </div>
-  )
-}
+  return <div ref={containerRef} className="min-h-0 flex-1 p-0" style={{ background: 'var(--term-bg)' }} />
+})

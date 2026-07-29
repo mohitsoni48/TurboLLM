@@ -1559,7 +1559,7 @@ export function registerApi(app: Hono, d: Deps): void {
       tavilyApiKey?: string
       search?: { provider?: string; tavilyApiKey?: string; kagiApiKey?: string; searxngUrl?: string }
       build?: { toolchainDirs?: string[] }
-      code?: { agentsMdProjectCandidates?: string[]; agentsMdGlobalCandidates?: string[] }
+      code?: { agentsMdProjectCandidates?: string[]; agentsMdGlobalCandidates?: string[]; defaultAgent?: string }
       toolPolicies?: Record<string, string>
       autoAllowAll?: boolean
       cloudDeploy?: { runpodTemplateId?: string }
@@ -1713,6 +1713,17 @@ export function registerApi(app: Hono, d: Deps): void {
       out(list)
     }
 
+    // Which coding agent new Code sessions launch with (config.ts's CodeConfig doc comment) —
+    // clean 400 on garbage rather than silently falling back at read time.
+    let defaultAgent: 'turbollm' | 'pi' | 'claude' | 'opencode' | undefined
+    if (b.code?.defaultAgent !== undefined) {
+      const v = b.code.defaultAgent
+      if (v !== 'turbollm' && v !== 'pi' && v !== 'claude' && v !== 'opencode') {
+        return err(c, 400, 'invalid_config_value', 'code.defaultAgent must be one of: turbollm, pi, claude, opencode.')
+      }
+      defaultAgent = v
+    }
+
     // Tool-call approval gate: global per-tool policy map. Validate every value is
     // one of 'ask' | 'allow' | 'deny' so a garbled patch gets a clean 400, not a
     // silently-dropped/garbage config.
@@ -1740,6 +1751,7 @@ export function registerApi(app: Hono, d: Deps): void {
       if (toolchainDirs !== undefined) cfg.build.toolchainDirs = toolchainDirs
       if (agentsMdProjectCandidates !== undefined) cfg.code.agentsMdProjectCandidates = agentsMdProjectCandidates
       if (agentsMdGlobalCandidates !== undefined) cfg.code.agentsMdGlobalCandidates = agentsMdGlobalCandidates
+      if (defaultAgent !== undefined) cfg.code.defaultAgent = defaultAgent
       if (toolPolicies !== undefined) cfg.tools.toolPolicies = toolPolicies
       if (b.autoAllowAll !== undefined) cfg.tools.autoAllowAll = !!b.autoAllowAll
       if (b.autoLoadOnStart !== undefined) cfg.autoLoadOnStart = !!b.autoLoadOnStart

@@ -2,6 +2,12 @@
 
 export type CodeMode = 'auto' | 'plan' | 'ask'
 
+/** Which coding agent a session launches with (config.ts's code.defaultAgent, snapshotted
+ *  at creation). 'turbollm' is the built-in pi-SDK-backed chat UI (this file's CodeSession
+ *  rendered by CodeTranscript/CodeComposer as today); the others launch full-screen inside
+ *  the embedded terminal (TerminalView) instead — no chat UI at all for that session. */
+export type CodeAgent = 'turbollm' | 'pi' | 'claude' | 'opencode'
+
 export type SessionStatus = 'merged' | 'review' | 'done' | 'aborted'
 
 /** One row from GET /api/v1/code/sessions (sidebar list) or the `session` half of
@@ -18,6 +24,7 @@ export interface CodeSession {
   mode?: string
   createdAt: string
   repoRoot: string
+  codeAgent: CodeAgent
   error?: string
   /** Set when archived — hidden from the default (active) sidebar list. */
   archivedAt?: string

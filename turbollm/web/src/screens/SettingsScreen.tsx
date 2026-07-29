@@ -23,6 +23,7 @@ import { CopyButton } from '../components/ui/copy-button'
 import { ModelDirs } from './models/ModelDirs'
 import { ToolPermissionsSection } from './settings/ToolPermissionsSection'
 import { CodeContextSection } from './settings/CodeContextSection'
+import { CodeAgentSection } from './settings/CodeAgentSection'
 import { MemorySection } from './settings/MemorySection'
 import { ExperimentalSection } from './settings/ExperimentalSection'
 
@@ -615,6 +616,9 @@ export function SettingsScreen() {
 
               {/* Code's AGENTS.md-style standing-context candidate lists. */}
               <CodeContextSection />
+
+              {/* Which coding agent new Code sessions launch with. */}
+              <CodeAgentSection />
             </>
           )}
 

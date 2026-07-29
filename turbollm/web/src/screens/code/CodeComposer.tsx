@@ -105,17 +105,18 @@ function relativeToRoot(root: string, target: string): string {
 
 // ── Stats footer (ADR-262) ────────────────────────────────────────────────────
 //
-// Local, tiny formatters — deliberately NOT imported from ContextUsageRing.tsx's fmtTokens or
-// ThinkingBudgetSlider.tsx's formatBudget, since neither is exported and this task is scoped to
-// CodeComposer.tsx only (no edits to either sibling component). Same simple k/M convention as
-// ContextUsageRing's own fmtTokens for consistency across the app.
-function fmtCompactTokens(n: number): string {
+// Tiny formatters — deliberately NOT imported from ContextUsageRing.tsx's fmtTokens or
+// ThinkingBudgetSlider.tsx's formatBudget, since neither is exported. Same simple k/M convention
+// as ContextUsageRing's own fmtTokens for consistency across the app. Exported so TerminalToolbar.tsx
+// (the terminal-agent session composer-parity chrome) renders the exact same stats formatting
+// rather than a second, driftable copy.
+export function fmtCompactTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`
   return String(n)
 }
 
-function thinkingCompactLabel(budget: number): string {
+export function thinkingCompactLabel(budget: number): string {
   if (budget < 0) return 'Think: Unlimited'
   if (budget === 0) return 'Think: Off'
   return `Think: ${fmtCompactTokens(budget)}`

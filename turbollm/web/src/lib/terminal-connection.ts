@@ -7,7 +7,8 @@
 //   // On connected: calls conn.send(text) to write raw bytes to the PTY.
 
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { getAuthToken } from './api'
+import { authHeaders, getAuthToken } from './api'
+import { markCodeAuthNeeded, clearCodeAuthNeeded } from './auth-signal'
 
 export type TerminalState = 'connecting' | 'connected' | 'disconnected' | 'error'
 
@@ -79,7 +80,15 @@ export function useTerminalConnection(
       clearTimeout(reconnectTimerRef.current)
       reconnectTimerRef.current = null
     }
-    wsRef.current?.close()
+    // Explicit 1000 (normal closure) — WebSocket.close() with NO code sends no status code at
+    // all, and the WebSocket API then reports THIS SAME close back to our own onclose handler
+    // as code 1005 ("no status received"), even though the disconnect was entirely intentional
+    // (component unmount, session switch, etc.). TerminalView.tsx's onClose handler treats
+    // anything other than 1000 as a real failure and surfaces a toast — an unintentional-looking
+    // "1005 error" on a totally normal disconnect was a real, user-visible symptom of this,
+    // compounded by (now fixed separately) an effect that was tearing the connection down and
+    // reconnecting on nearly every parent re-render.
+    wsRef.current?.close(1000, 'client disconnect')
     wsRef.current = null
     setState('disconnected')
   }, [])
@@ -153,6 +162,9 @@ export function useTerminalConnection(
 
 /**
  * Create (or reuse an already-running) terminal session for a Code session.
+ * `cols`/`rows` MUST be the real, already-fitted xterm.js size (TerminalView fits before
+ * calling this) — the daemon spawns the PTY at exactly this size, never a default corrected
+ * by a later resize (see TerminalView.tsx's module header for why that mattered).
  * `created` is true only on a genuinely fresh PTY (HTTP 201) — the daemon returns
  * an existing active terminal (HTTP 200) when one already runs for this Code
  * session, so the caller (TerminalView) knows whether to auto-launch `claude`
@@ -161,19 +173,34 @@ export function useTerminalConnection(
  */
 export async function createTerminalForSession(
   sessionId: string,
+  cols: number,
+  rows: number,
   signal?: AbortSignal,
-): Promise<{ terminalId: string; created: boolean } | null> {
+): Promise<{ terminalId: string; created: boolean } | { error: string } | null> {
   try {
     const res = await fetch(`/api/v1/code/sessions/${encodeURIComponent(sessionId)}/terminal`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: JSON.stringify({ cols, rows }),
       signal,
     })
-    if (!res.ok) return null
+    // Same shared signal code-api.ts's req() marks on every Code 401 — Code always requires
+    // a key from a non-host device (auth.ts's codeAuth) independent of the rest of the app,
+    // and this call previously bypassed that mechanism entirely (see the header fix above),
+    // so a LAN/mobile client got a bare "could not create terminal session" instead of the
+    // app's normal key-prompt.
+    if (res.status === 401) markCodeAuthNeeded()
+    else if (res.ok) clearCodeAuthNeeded()
+    if (!res.ok) {
+      // Surface the server's actual reason (repo missing, node-pty unavailable, spawn
+      // failure, ...) instead of a generic "could not create" with nothing to go on.
+      const body = await res.json().catch(() => null) as { error?: { message?: string } } | null
+      return { error: body?.error?.message ?? `Terminal creation failed (${res.status}).` }
+    }
     const data = (await res.json()) as { terminalId: string }
     return { terminalId: data.terminalId, created: res.status === 201 }
-  } catch {
-    return null
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : 'Network error creating terminal session.' }
   }
 }
 
@@ -184,7 +211,7 @@ export async function killTerminalForSession(sessionId: string): Promise<void> {
   try {
     await fetch(`/api/v1/code/sessions/${encodeURIComponent(sessionId)}/terminal/kill`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
     })
   } catch {
     /* best-effort */

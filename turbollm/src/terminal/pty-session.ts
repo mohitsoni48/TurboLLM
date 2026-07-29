@@ -5,12 +5,14 @@
 // (claude CLI, vim, htop, etc.) render correctly.
 // The PTY is created in the caller-supplied `cwd` (the Code session's repoRoot).
 //
-// The `claude` CLI is NOT spawned directly — instead we spawn a shell and have it
-// run `claude`. This way we reuse the shell's environment (PATH, env vars, etc.)
-// and don't need platform-specific binary resolution.
-//
-// The caller writes the claude launch command into the PTY's stdin once, after
-// which all I/O flows through the PTY's stdin/stdout.
+// A target CLI (claude/pi/opencode/...) is NOT spawned directly — instead we spawn a
+// shell and have it run `turbollm launch <agent>` as its OWN startup command. This way
+// we reuse the shell's environment (PATH, env vars, etc.) and don't need platform-
+// specific binary resolution — AND the command is never typed as literal keystrokes the
+// shell would echo back: it's baked into the shell's own invocation (`-Command`/`-lc`),
+// so the very first thing visible in the terminal is the launch command's own output,
+// never the command text itself. When no launchCommand is given, the shell just starts
+// normally (interactive, no command), unchanged from earlier behavior.
 
 import { EventEmitter } from 'node:events'
 import { createRequire } from 'node:module'
@@ -34,6 +36,11 @@ function resolveWindowsShell(): string {
   return cachedWindowsShell
 }
 
+/** Cap on the in-memory scrollback buffer (bytes) — generous enough for a full-screen TUI
+ *  repaint history without unbounded growth for a long-lived session. Trimmed from the
+ *  FRONT (oldest first) once exceeded, same as any bounded scrollback. */
+const SCROLLBACK_CAP = 512 * 1024
+
 /** A single PTY session backed by node-pty. */
 export class PTYSession {
   private pty: ReturnType<typeof import('node-pty').spawn> | null = null
@@ -41,21 +48,34 @@ export class PTYSession {
   private exited = false
   private exitCode: number | null = null
   private processId: number | null = null
+  // Every byte the PTY has ever written, capped — replayed to a NEWLY connecting WebSocket
+  // client (terminal-manager.ts's registerWsListener) so a reconnect (tab reload, WS drop,
+  // navigating away and back) shows the terminal's actual current state instead of a blank
+  // screen until the next byte happens to arrive. xterm.js replaying the same escape
+  // sequences that produced the original screen reconstructs it correctly, the same way
+  // `tmux attach`/`screen -r` catch a reconnecting client up.
+  private scrollback = ''
 
-  /** Spawn a new PTY session. The caller should write the launch command (e.g.
-   *  `claude`) via `session.write()` after this returns. */
-  static spawn(cwd: string, rows = 24, cols = 80): PTYSession {
+  /** Spawn a new PTY session. When `launchCommand` is given, the shell runs it as its
+   *  own startup command (never typed into stdin — see the module header comment). */
+  static spawn(cwd: string, rows = 24, cols = 80, launchCommand?: string): PTYSession {
     const s = new PTYSession()
-    s.doSpawn(cwd, rows, cols)
+    s.doSpawn(cwd, rows, cols, launchCommand)
     return s
   }
 
-  private doSpawn(cwd: string, rows: number, cols: number): void {
+  private doSpawn(cwd: string, rows: number, cols: number, launchCommand?: string): void {
     const ptyModule = require('node-pty')
 
-    const shell = process.platform === 'win32' ? resolveWindowsShell() : 'bash'
+    const win32 = process.platform === 'win32'
+    const shell = win32 ? resolveWindowsShell() : 'bash'
+    // -NoExit / exec bash: run the command, then drop into a normal interactive shell
+    // once it exits (matches the plain-shell experience the terminal already had).
+    const args = launchCommand
+      ? (win32 ? ['-NoExit', '-Command', launchCommand] : ['-lc', `${launchCommand}; exec bash`])
+      : []
 
-    this.pty = ptyModule.spawn(shell, [], {
+    this.pty = ptyModule.spawn(shell, args, {
       name: 'xterm-256color',
       cols,
       rows,
@@ -72,6 +92,10 @@ export class PTYSession {
 
     // termPty is non-null here (captured from `this.pty!` above).
     termPty.onData((data: string) => {
+      this.scrollback += data
+      if (this.scrollback.length > SCROLLBACK_CAP) {
+        this.scrollback = this.scrollback.slice(this.scrollback.length - SCROLLBACK_CAP)
+      }
       this.emitter.emit('data', data)
     })
 
@@ -106,6 +130,9 @@ export class PTYSession {
   isExited(): boolean { return this.exited }
   getExitCode(): number | null { return this.exitCode }
   getPid(): number | null { return this.processId }
+  /** Everything written so far (capped, oldest trimmed) — replay this to a newly-attached
+   *  client before it starts receiving live `onData` output. */
+  getScrollback(): string { return this.scrollback }
 
   onData(cb: (data: string) => void): void { this.emitter.on('data', cb) }
   onExit(cb: (info: { exitCode: number | null; signal?: number }) => void): void { this.emitter.on('exit', cb) }

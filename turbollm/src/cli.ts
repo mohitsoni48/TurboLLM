@@ -123,14 +123,20 @@ if (argv[0] === 'launch') {
     explicitPort,
     configuredDaemonPort(launchConfigPath),
   )
+  // Session-scoped auth token (terminal-routes.ts, session-auth.ts) — lets the gateway tell
+  // which Code session's terminal this launch belongs to, for the live thinking-budget
+  // override and usage-stat attribution. Undefined for a manually-run `turbollm launch`
+  // (falls back to the shared static AUTH_TOKEN, cli-launch.ts).
+  const authToken = argValue('--token', '') || undefined
   // Everything after `launch <cli>` is forwarded to the CLI, minus our own flags.
   const passthrough = argv.slice(2).filter(
     (a, i, arr) =>
       a !== '--port' && arr[i - 1] !== '--port' &&
       a !== '--model' && arr[i - 1] !== '--model' &&
-      a !== '--config' && arr[i - 1] !== '--config',
+      a !== '--config' && arr[i - 1] !== '--config' &&
+      a !== '--token' && arr[i - 1] !== '--token',
   )
-  const code = await launchCli(target, port, passthrough, undefined, modelKey)
+  const code = await launchCli(target, port, passthrough, undefined, modelKey, undefined, authToken)
   process.exit(code)
 }
 

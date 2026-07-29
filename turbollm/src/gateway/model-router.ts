@@ -194,28 +194,42 @@ export class ModelRouter {
     return { target }
   }
 
-  /** Count of alive chat (non-embedding) slots. Embedding models don't consume
+  /** A slot counts as occupied while 'stopping' too, not just 'running'/'starting' —
+   *  a manual swap (routes.ts's /api/v1/engine/start, going straight to the primary
+   *  Manager, outside this router entirely) passes the primary through 'stopping' on
+   *  its way to the new model. A concurrent gateway request landing in that window
+   *  (e.g. a terminal-agent CLI's own request, racing a founder's manual model switch
+   *  in the UI) used to read the narrower running/starting-only check as "no slot is
+   *  occupied" and spin up a whole SECOND, independently-tracked Manager/llama-server
+   *  process — invisible to the primary manager's own status() and never cleaned up,
+   *  since nothing outside the router's own extraSlots map ever stops it. Found live:
+   *  a founder-reported "it loaded 2 models" during a manual switch while a terminal
+   *  session was open, confirmed via two concurrent llama-server.exe processes on
+   *  8081/8082 where only 8081 was known to /api/v1/status.  */
+  private isOccupied(state: string): boolean {
+    return state === 'running' || state === 'starting' || state === 'stopping'
+  }
+
+  /** Count of occupied chat (non-embedding) slots. Embedding models don't consume
    *  a keepN slot so chat models and embedding models can coexist independently. */
   private chatSlotCount(): number {
-    const isAlive = (s: string) => s === 'running' || s === 'starting'
     const ms = this.manager.status()
-    const primaryAlive = isAlive(ms.state)
+    const primaryAlive = this.isOccupied(ms.state)
     const primaryEmbed = primaryAlive && !!ms.model &&
       (this.scanner.get(ms.model.key)?.embedding ?? false)
     const extraChat = [...this.extraSlots.values()].filter(
-      s => isAlive(s.manager.status().state) &&
+      s => this.isOccupied(s.manager.status().state) &&
         !(this.scanner.get(s.modelKey)?.embedding ?? false),
     ).length
     return (primaryAlive && !primaryEmbed ? 1 : 0) + extraChat
   }
 
-  /** Evict the least-recently-used chat (non-embedding) slot. Embedding slots are
-   *  skipped; if every alive slot is an embedding model the true LRU is used as
-   *  a fallback so we never deadlock. */
+  /** Evict the least-recently-used occupied chat (non-embedding) slot. Embedding
+   *  slots are skipped; if every occupied slot is an embedding model the true LRU is
+   *  used as a fallback so we never deadlock. */
   private evictChatLru(): Manager {
-    const isAlive = (s: string) => s === 'running' || s === 'starting'
     const ms = this.manager.status()
-    const primaryAlive = isAlive(ms.state)
+    const primaryAlive = this.isOccupied(ms.state)
     const primaryEmbed = primaryAlive && !!ms.model &&
       (this.scanner.get(ms.model.key)?.embedding ?? false)
 
@@ -225,7 +239,7 @@ export class ModelRouter {
 
     for (const slot of this.extraSlots.values()) {
       const slotEmbed = this.scanner.get(slot.modelKey)?.embedding ?? false
-      if (isAlive(slot.manager.status().state) && !slotEmbed && slot.lastUsedMs < lruTime) {
+      if (this.isOccupied(slot.manager.status().state) && !slotEmbed && slot.lastUsedMs < lruTime) {
         lruTime = slot.lastUsedMs
         lruManager = slot.manager
         lruKey = slot.modelKey
@@ -238,7 +252,7 @@ export class ModelRouter {
       lruManager = this.manager
       lruKey = null
       for (const slot of this.extraSlots.values()) {
-        if (isAlive(slot.manager.status().state) && slot.lastUsedMs < lruTime) {
+        if (this.isOccupied(slot.manager.status().state) && slot.lastUsedMs < lruTime) {
           lruTime = slot.lastUsedMs
           lruManager = slot.manager
           lruKey = slot.modelKey

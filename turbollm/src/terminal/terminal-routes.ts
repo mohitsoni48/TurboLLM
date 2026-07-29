@@ -22,7 +22,10 @@ import type { Context, Hono } from 'hono'
 import type { Deps } from '../deps'
 import { createRequire } from 'node:module'
 import { isLocalUpgrade, verifyKeyValue } from '../auth'
+import { sessionAuth } from '../code/session-auth'
 import { TerminalManager } from './terminal-manager'
+
+async function body<T>(c: Context): Promise<T> { try { return await c.req.json() as T } catch { return {} as T } }
 
 const require = createRequire(import.meta.url)
 
@@ -72,15 +75,55 @@ export function registerTerminalRoutes(app: Hono, d: Deps): void {
     const run = d.db.getAgentRun(c.req.param('sessionId'))
     if (!run) return err(c, 404, 'not_found', 'Session not found.')
     if (!run.repoRoot) return err(c, 400, 'invalid_input', 'Session has no repo root.')
+    const agent = run.codeAgent ?? 'turbollm'
+    if (agent === 'turbollm') {
+      return err(c, 400, 'invalid_input', 'This session uses the built-in chat UI, not a terminal agent.')
+    }
+
+    // The caller (TerminalView) fits xterm.js BEFORE calling this, so the PTY is spawned at
+    // its real size from the very first byte the launch command writes — never a hardcoded
+    // default later corrected by a follow-up resize. A resize that arrives after a TUI's very
+    // first paint (Ink apps especially) can leave the display and the real PTY width out of
+    // sync permanently, which is what caused the garbled/overlapping render.
+    const b = await body<{ cols?: number; rows?: number }>(c)
+    const cols = typeof b.cols === 'number' && b.cols > 0 ? Math.floor(b.cols) : 80
+    const rows = typeof b.rows === 'number' && b.rows > 0 ? Math.floor(b.rows) : 24
 
     const m = getManager(d)
     const existing = m.findByCodeSessionId(run.id)
-    if (existing) return c.json({ terminalId: existing }, 200)
+    if (existing) {
+      // Reattaching to an already-running terminal (remount/reconnect) — resize it to the
+      // CURRENT viewport rather than leaving it at whatever size it was created with.
+      m.resize(existing, cols, rows)
+      return c.json({ terminalId: existing }, 200)
+    }
     try {
-      const terminalId = m.create(run.repoRoot, run.id)
+      // Built here, server-side — the client never constructs or even sees this string; the
+      // shell runs it as its own startup command (pty-session.ts), never typed into stdin.
+      // The daemon's OWN configured port (honors a --port override / in-place rebind), NOT
+      // the incoming request's Host/URL port — unlike a browser-facing origin (e.g.
+      // comfyui/install's own derivation), this spawns a LOCAL subprocess that must always
+      // reach the real daemon directly. Deriving it from the request would pick up a dev
+      // proxy's port instead (`npm run dev` in web/, :5173 → :6996) whenever the terminal is
+      // opened through that proxy, launching the CLI against a port nothing is listening on.
+      const port = d.store.snapshot().daemon.port
+      // Session-scoped token (not the shared static 'turbollm-local' every other launch target
+      // uses) — lets the gateway tell this session's requests apart from any other concurrently
+      // open terminal-agent session, for the thinking-budget override and usage-stat attribution
+      // (session-auth.ts). Idempotent: a remount/reconnect against an already-running terminal
+      // never reaches this branch (the `existing` check above returns early), so the CLI's
+      // already-running auth is never invalidated by a token that would differ from what it
+      // still has cached — but even if it did, mint() returns the SAME token for this session.
+      const token = sessionAuth.mint(run.id)
+      const launchCommand = `turbollm launch ${agent} --port ${port} --token ${token}`
+      const terminalId = m.create(run.repoRoot, run.id, cols, rows, launchCommand)
       return c.json({ terminalId }, 201)
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Failed to create terminal session.'
+      // Was previously swallowed here — the client got a generic toast with no way to diagnose
+      // *why* creation failed (wrong repoRoot, spawn failure, etc.) and neither did the server
+      // log. Surface the real cause server-side at minimum.
+      console.error('[terminal] create failed for session', run.id, ':', e)
       if (msg.includes('node-pty not available')) return err(c, 501, 'not_available', msg)
       return err(c, 500, 'create_failed', msg)
     }
@@ -93,6 +136,11 @@ export function registerTerminalRoutes(app: Hono, d: Deps): void {
     const m = getManager(d)
     const terminalId = m.findByCodeSessionId(run.id)
     if (terminalId) m.kill(terminalId)
+    // Revoke immediately here rather than relying solely on the PTY's async exit event
+    // (TerminalManager's own onExit handler also revokes, for the "CLI exited on its own"
+    // case) — a caller that kills-then-immediately-relaunches (model change, task 14)
+    // shouldn't race an in-flight process-exit event.
+    sessionAuth.revoke(run.id)
     return c.json({ ok: true }, 200)
   })
 
@@ -166,14 +214,18 @@ export function registerTerminalWs(server: import('http').Server, _d: Deps): voi
       return
     }
 
-    m.registerWsListener(terminalId, {
+    // Kept as a named const (not inlined into registerWsListener's call) so unregister below
+    // can pass back the SAME object reference — that's how the manager tells this tab's
+    // listener apart from any other tab's listener attached to the same terminal id.
+    const handler = {
       onData(data: string) {
         if (ws.readyState === WS_OPEN) { ws.send(data) }
       },
       onClose() {
         if (ws.readyState === WS_OPEN) { ws.close(1001, 'Terminal exited') }
       },
-    })
+    }
+    m.registerWsListener(terminalId, handler)
 
     ws.on('message', (data: Buffer | string, isBinary?: boolean) => {
       // Binary frame = resize control message ({ cols, rows } JSON), never terminal
@@ -192,7 +244,7 @@ export function registerTerminalWs(server: import('http').Server, _d: Deps): voi
       m.write(terminalId, input)
     })
 
-    ws.on('close', () => { m.unregisterWsListener(terminalId) })
-    ws.on('error', () => { m.unregisterWsListener(terminalId) })
+    ws.on('close', () => { m.unregisterWsListener(terminalId, handler) })
+    ws.on('error', () => { m.unregisterWsListener(terminalId, handler) })
   })
 }
