@@ -23,6 +23,103 @@ function privates(m: TerminalManager) {
   return m as unknown as { broadcast(id: string, fn: (h: Handler) => void): void; listeners: Map<string, Set<Handler>> }
 }
 
+// ── cleanupIdle TTL: a genuinely abandoned terminal is reaped; a viewed one never is ────────
+// Regression for a real gap: cleanupIdle() existed but was never actually scheduled anywhere (no
+// caller ran it on an interval), and even if it had been, it measured age since CREATION, not
+// since the last viewer disconnected — a terminal actively open for 6+ minutes would have
+// qualified for cleanup, while a genuinely abandoned one (every tab closed) never would have been
+// swept at all. Fixed: an idle clock that only runs while ZERO WebSocket listeners are attached,
+// self-scheduled inside the class. These tests seed sessions/infoMap/idleSince directly via the
+// same narrow-cast pattern as model-router.test.ts's extraSlots, rather than spawning a real PTY
+// (unnecessary weight for exercising this bookkeeping — same rationale as the file header above).
+
+/** Minimal fake PTYSession — just enough surface for kill()'s dispose()/getPid() calls and
+ *  registerWsListener's scrollback replay. */
+function fakeSession(pid = 0) {
+  let disposed = false
+  return {
+    dispose: () => { disposed = true },
+    getPid: () => pid,
+    isExited: () => disposed,
+    getScrollback: () => '',
+    wasDisposed: () => disposed,
+  }
+}
+
+type SeededManager = {
+  sessions: Map<string, ReturnType<typeof fakeSession>>
+  infoMap: Map<string, { id: string; codeSessionId: string | null; cwd: string; cols: number; rows: number; createdAt: string }>
+  idleSince: Map<string, number>
+  listeners: Map<string, Set<Handler>>
+  registerWsListener: (id: string, h: Handler) => void
+  unregisterWsListener: (id: string, h: Handler) => void
+  cleanupIdle: (maxAgeMs?: number) => void
+}
+
+function seededManager(): SeededManager {
+  return new TerminalManager() as unknown as SeededManager
+}
+
+function seedTerminal(m: ReturnType<typeof seededManager>, id: string): ReturnType<typeof fakeSession> {
+  const session = fakeSession()
+  m.sessions.set(id, session as never)
+  m.infoMap.set(id, { id, codeSessionId: null, cwd: '/scratch', cols: 80, rows: 24, createdAt: new Date().toISOString() })
+  return session
+}
+
+test('cleanupIdle: a terminal with an active listener is never killed, no matter its idle-clock state', () => {
+  const m = seededManager()
+  const session = seedTerminal(m, 't1')
+  const handler: Handler = { onData: () => {} }
+  m.registerWsListener('t1', handler as { onData: (d: string) => void })
+  // Force a stale-looking idle timestamp directly — simulates "somehow old" without waiting;
+  // registerWsListener already deleted the entry, so re-seed it to prove cleanupIdle still
+  // can't act on a currently-attached terminal even if idleSince were (incorrectly) present.
+  m.idleSince.set('t1', Date.now() - 1_000_000)
+
+  m.cleanupIdle(0)
+
+  assert.equal(session.wasDisposed(), false, 'a terminal with a live listener must survive cleanupIdle regardless of maxAgeMs')
+  assert.ok(m.infoMap.has('t1'))
+})
+
+test('cleanupIdle: switching away and back within the TTL never kills the terminal', () => {
+  const m = seededManager()
+  const session = seedTerminal(m, 't2')
+  const handler: Handler = { onData: () => {} }
+  m.registerWsListener('t2', handler as { onData: (d: string) => void })
+  m.unregisterWsListener('t2', handler) // navigate away — idle clock starts now
+  assert.ok(m.idleSince.has('t2'), 'idle clock must start the moment the last listener detaches')
+
+  m.registerWsListener('t2', handler as { onData: (d: string) => void }) // navigate back, well within the TTL
+  assert.equal(m.idleSince.has('t2'), false, 'reconnecting must clear the idle clock')
+
+  m.cleanupIdle(300_000)
+  assert.equal(session.wasDisposed(), false, 'a quick switch-away-and-back must never kill the CLI')
+})
+
+test('cleanupIdle: a terminal idle past maxAgeMs with no listener attached is killed', () => {
+  const m = seededManager()
+  const session = seedTerminal(m, 't3')
+  m.idleSince.set('t3', Date.now() - 400_000) // no listener ever attached in this test — genuinely abandoned
+
+  m.cleanupIdle(300_000)
+
+  assert.equal(session.wasDisposed(), true, 'a terminal idle well past the TTL with no viewer must be reaped')
+  assert.equal(m.infoMap.has('t3'), false)
+})
+
+test('cleanupIdle: a terminal idle for LESS than maxAgeMs is left alone', () => {
+  const m = seededManager()
+  const session = seedTerminal(m, 't4')
+  m.idleSince.set('t4', Date.now() - 1_000) // 1s idle, well under a 5-minute TTL
+
+  m.cleanupIdle(300_000)
+
+  assert.equal(session.wasDisposed(), false)
+  assert.ok(m.infoMap.has('t4'))
+})
+
 test('registerWsListener: two listeners on the same id both receive broadcast data', () => {
   const m = new TerminalManager()
   const received1: string[] = []

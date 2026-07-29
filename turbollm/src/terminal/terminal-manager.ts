@@ -130,14 +130,32 @@ export interface TerminalSessionInfo {
   createdAt: string
 }
 
+/** How often cleanupIdle() sweeps for terminals past their TTL. Independent of the TTL itself
+ *  (maxAgeMs) — this is just the polling cadence, short enough that a terminal is never left
+ *  running much past its actual TTL. */
+const IDLE_SWEEP_MS = 60_000
+
 export class TerminalManager {
   private sessions = new Map<string, PTYSession>()
   private infoMap = new Map<string, TerminalSessionInfo>()
+  /** When each terminal last had ZERO attached WebSocket listeners — the idle clock. Absent
+   *  entirely while at least one listener is attached (registerWsListener deletes the entry),
+   *  so an actively-viewed terminal is NEVER a cleanupIdle candidate no matter how old it is.
+   *  Seeded at create() too, so a terminal that's created but never actually connected to
+   *  (a client-side failure right after the create() response) still starts its idle clock
+   *  rather than living forever untracked. */
+  private idleSince = new Map<string, number>()
 
   /** `dataDir` — the daemon's own data directory (ConfigStore.dir()), for the orphan-safety
    *  pidfile tracking above. Terminal-manager unit tests never spawn a real PTY (see
    *  terminal-manager.test.ts's header), so an empty string is a safe default there. */
-  constructor(private dataDir: string = '') {}
+  constructor(private dataDir: string = '') {
+    // Found live: cleanupIdle() existed but was never actually scheduled anywhere — a genuinely
+    // abandoned terminal (every browser tab closed, nobody coming back) ran forever until the
+    // next daemon restart. Self-scheduled here, mirroring Manager's own watchdogTick pattern
+    // (engines/manager.ts) — unref()'d so it never keeps the process alive on its own.
+    setInterval(() => this.cleanupIdle(), IDLE_SWEEP_MS).unref()
+  }
 
   /**
    * Create a new terminal session.
@@ -178,6 +196,7 @@ export class TerminalManager {
       this.broadcast(id, (h) => h.onClose?.())
       this.sessions.delete(id)
       this.infoMap.delete(id)
+      this.idleSince.delete(id)
       if (shellPid) clearTerminalPid(this.dataDir, shellPid)
       // The CLI subprocess exited on its own (e.g. `exit` typed in-shell) rather than via the
       // kill endpoint below — revoke its session-scoped auth token here too, otherwise it only
@@ -194,6 +213,10 @@ export class TerminalManager {
       rows,
       createdAt: new Date().toISOString(),
     })
+    // Idle clock starts running immediately — cleared the moment a WebSocket actually attaches
+    // (registerWsListener). If nothing ever connects (a client-side failure right after this
+    // call returns), the terminal still ages out via cleanupIdle rather than living forever.
+    this.idleSince.set(id, Date.now())
 
     return id
   }
@@ -229,6 +252,7 @@ export class TerminalManager {
       session.dispose()
       this.sessions.delete(id)
       this.infoMap.delete(id)
+      this.idleSince.delete(id)
       // Also cleared by the onExit handler in create() once the process actually exits —
       // idempotent (force:true), so clearing eagerly here too just closes the window between
       // "we told it to die" and "it actually did" a little sooner.
@@ -273,15 +297,22 @@ export class TerminalManager {
   }
 
   /**
-   * Clean up idle sessions (older than the given age in ms).
+   * Kill any terminal that's had ZERO attached WebSocket listeners for longer than `maxAgeMs`
+   * (default 5 min) — e.g. every browser tab viewing it was closed/navigated away and nobody
+   * came back. Deliberately NOT based on the terminal's age since creation: switching between
+   * Chat and Code sessions (or between two Code sessions) must never kill a still-open CLI —
+   * only genuine, sustained abandonment does. A terminal with at least one listener currently
+   * attached is never a candidate, no matter how long it's been running.
    */
   cleanupIdle(maxAgeMs = 300_000): void {
     const now = Date.now()
-    for (const [id, info] of this.infoMap) {
-      const age = now - new Date(info.createdAt).getTime()
-      if (age > maxAgeMs) {
-        this.kill(id)
-      }
+    for (const [id, since] of this.idleSince) {
+      // Defense in depth: registerWsListener always clears idleSince the moment a viewer
+      // attaches, so this should never be true in practice — checked explicitly anyway so the
+      // "never kill something being watched" invariant doesn't depend on that bookkeeping
+      // staying perfectly in sync everywhere it's touched.
+      if ((this.listeners.get(id)?.size ?? 0) > 0) continue
+      if (now - since > maxAgeMs) this.kill(id)
     }
   }
 
@@ -326,6 +357,9 @@ export class TerminalManager {
       this.listeners.set(id, handlers)
     }
     handlers.add(handler)
+    // At least one live viewer again — stop the idle clock. Covers both a reconnect after a
+    // brief gap (switching Code sessions and back) and the very first connect after create().
+    this.idleSince.delete(id)
   }
 
   /**
@@ -337,6 +371,12 @@ export class TerminalManager {
     const handlers = this.listeners.get(id)
     if (!handlers) return
     handlers.delete(handler)
-    if (handlers.size === 0) this.listeners.delete(id)
+    if (handlers.size === 0) {
+      this.listeners.delete(id)
+      // No viewer left — start (or restart) the idle clock. Only cleanupIdle acts on this, and
+      // only after maxAgeMs of SUSTAINED absence — switching away and back well within that
+      // window (registerWsListener above) clears it again with no interruption to the CLI.
+      if (this.infoMap.has(id)) this.idleSince.set(id, Date.now())
+    }
   }
 }
