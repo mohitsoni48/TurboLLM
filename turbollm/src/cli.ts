@@ -38,6 +38,7 @@ import { TunnelManager, reapStaleTunnels, killTrackedTunnelsSync } from './tunne
 import type { Deps } from './deps'
 import { TELEMETRY_ENV } from './telemetry/disabled'
 import { Emitter } from './telemetry/emit'
+import { reportModelLoad } from './telemetry/first-load'
 import { flush } from './telemetry/uploader'
 
 // Stop child processes (the agent engine's shell tool, engine binaries, git,
@@ -257,9 +258,16 @@ const hashes = new HashStore(store.dir())
 const db = new ConversationStore(store.dir())
 const hf = new HfClient(() => store.snapshot().hf.token, version)
 // A completed download triggers a rescan so the new model shows up in the library.
+// Set once telemetry is constructed below — DownloadManager is built first, and
+// its onComplete hook already exists for the rescan, so we chain rather than
+// adding a second observer to the download layer.
+let downloadsCompleted: () => void = () => {}
 const downloads = new DownloadManager(
   store,
-  () => void scanner.rescan(),
+  () => {
+    void scanner.rescan()
+    downloadsCompleted()
+  },
   () => hf.authHeaders(),
   (repo, rfilename, rev) => hf.expandModelFiles(repo, rfilename, rev),
 )
@@ -296,6 +304,19 @@ deps.agentTasks = new AgentTaskState()
 const telemetry = new Emitter({ dataDir: store.dir(), store, version, os: getSysInfo().os })
 deps.telemetry = telemetry
 telemetry.dailyActive()
+// model_first_load (ADR-299): the single most valuable journey event — the only
+// signal separating "never tried" from "tried and it broke". Observed at
+// Manager's atomic swap point rather than at the two routes.ts call sites,
+// which fire load() without awaiting and so cannot see the outcome.
+manager.onLoadSettled = (ok, err) => reportModelLoad(store.dir(), telemetry, ok, err)
+// onboarding_step (ADR-299): where setup breaks. The 1-click build reports both
+// outcomes; downloads only expose a success hook (DownloadManager.onComplete
+// fires solely on completion), so a failed download is currently visible only
+// as the GAP between app_first_run and model_download — recorded as a known
+// limitation in TODO.md rather than papered over.
+build.onSettled = (ok) => telemetry.emit('onboarding_step', { step: 'engine_build', outcome: ok ? 'ok' : 'fail' })
+provision.onSettled = (ok) => telemetry.emit('onboarding_step', { step: 'engine_install', outcome: ok ? 'ok' : 'fail' })
+downloadsCompleted = () => telemetry.emit('onboarding_step', { step: 'model_download', outcome: 'ok' })
 // Deferred so a slow or failing disk cannot delay the listen socket; unref'd so
 // it never holds the process open (ADR-009: telemetry is not a failure mode).
 setTimeout(() => {

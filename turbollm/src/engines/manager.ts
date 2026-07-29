@@ -149,6 +149,10 @@ export class Manager {
   private child: ChildProcess | null = null
   private startedAt = 0
   private errInfo: ErrInfo | null = null
+  /** Optional observer for load outcomes, wired in cli.ts (ADR-299). Kept as a
+   *  plain callback so Manager has no telemetry dependency and tests need no
+   *  stub. A throwing observer must never break a load. */
+  onLoadSettled?: (ok: boolean, err: ErrInfo | null) => void
   private lastCommand: { cmd: string; args: string[] } | null = null
   private lastActivity = 0
   private logPathStr = ''
@@ -177,6 +181,12 @@ export class Manager {
         if (hooks?.beforeStart) await hooks.beforeStart()
         await this.startInternal(opts)
         await this.awaitNotStarting()
+        // Both routes.ts call sites fire load() without awaiting, so the outcome
+        // is not observable to the caller. Reporting it here — the single atomic
+        // swap entry point — is what makes any future call site instrumented for
+        // free. Manager stays telemetry-agnostic: it reports an outcome, and the
+        // consumer (wired in cli.ts) decides what that means.
+        this.reportLoad(this.state === 'running', this.errInfo)
       } catch (e) {
         // routes.ts fires load() without awaiting and only console.warns the rejection —
         // without this, a failed swap left `state` wherever it last was (often still
@@ -184,6 +194,7 @@ export class Manager {
         // anything went wrong or that a retry could help.
         this.state = 'error'
         this.errInfo = { code: 'load_failed', message: e instanceof Error ? e.message : String(e), exitCode: -1, logTail: [] }
+        this.reportLoad(false, this.errInfo)
         throw e
       }
     })
@@ -198,6 +209,16 @@ export class Manager {
       await this.startInternal(opts)
       await this.awaitNotStarting()
     })
+  }
+
+  /** Notify the load observer, swallowing anything it throws — an observer is
+   *  by definition not allowed to affect whether a model loaded. */
+  private reportLoad(ok: boolean, err: ErrInfo | null): void {
+    try {
+      this.onLoadSettled?.(ok, err)
+    } catch {
+      // observers are advisory only
+    }
   }
 
   /** Wait until the engine leaves the 'starting' state (→ running or error/stopped),

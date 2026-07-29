@@ -51,12 +51,28 @@ export class BuildState {
     if (this.s.log.length > LOG_TAIL) this.s.log.splice(0, this.s.log.length - LOG_TAIL)
   }
 
+  /** Optional observer for the terminal outcome, wired in cli.ts (ADR-299
+   *  `onboarding_step`). A plain callback so this module keeps no telemetry
+   *  dependency; the error STRING is deliberately not passed, because the only
+   *  consumer may never send free text. */
+  onSettled?: (ok: boolean) => void
+
   done(): void {
     // Keep the log visible but mark inactive + terminal so the UI can show "Built".
     this.s = { ...this.s, active: false, phase: 'done', error: null }
+    this.settle(true)
   }
 
   fail(error: string): void {
     this.s = { ...this.s, active: false, phase: 'error', error }
+    this.settle(false)
+  }
+
+  private settle(ok: boolean): void {
+    try {
+      this.onSettled?.(ok)
+    } catch {
+      // Observers are advisory — they must not affect a build's outcome.
+    }
   }
 }

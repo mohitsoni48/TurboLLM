@@ -46,14 +46,28 @@ export class Emitter {
     this.today = opts.today ?? (() => new Date().toISOString().slice(0, 10))
   }
 
+  /**
+   * Whether this event may be sent right now — kill switch, consent level, and
+   * the per-event level requirement.
+   *
+   * Public because the once-only helpers MUST consult it before spending a
+   * ledger claim. Claiming first would mean a user who browses the app before
+   * answering the consent card burns every `first_use` key while telemetry is
+   * off, and opting in afterwards would permanently lose the whole
+   * feature-discovery picture — the exact data this system exists to collect.
+   */
+  canSend(event: EventName): boolean {
+    if (telemetryDisabled()) return false
+    const level = this.o.store.snapshot().telemetry.level
+    if (level !== 'anon' && level !== 'full') return false
+    if (REQUIRES_FULL.has(event) && level !== 'full') return false
+    return true
+  }
+
   /** Emit one event. Silently does nothing whenever it must not send. */
   emit(event: EventName, payload?: Record<string, unknown>): void {
     try {
-      if (telemetryDisabled()) return
-
-      const level = this.o.store.snapshot().telemetry.level
-      if (level !== 'anon' && level !== 'full') return
-      if (REQUIRES_FULL.has(event) && level !== 'full') return
+      if (!this.canSend(event)) return
 
       enqueue(this.o.dataDir, {
         schema: TELEMETRY_SCHEMA_VERSION,
@@ -71,16 +85,19 @@ export class Emitter {
   /** Emit an event at most once for the lifetime of this install (e.g.
    *  `app_first_run`, which must count installs — not daemon starts). */
   once(event: EventName): void {
+    if (!this.canSend(event)) return
     if (this.claim(`once:${event}`)) this.emit(event)
   }
 
   /** Emit `feature_first_use` the first time a feature is touched, ever. */
   firstUse(feature: string): void {
+    if (!this.canSend('feature_first_use')) return
     if (this.claim(`first_use:${feature}`)) this.emit('feature_first_use', { feature })
   }
 
   /** Emit `daily_active` at most once per calendar day. */
   dailyActive(): void {
+    if (!this.canSend('daily_active')) return
     if (this.claim(`daily:${this.today()}`)) this.emit('daily_active')
   }
 

@@ -174,6 +174,39 @@ test('once: app_first_run fires exactly once, not on every daemon start', () => 
   }
 })
 
+test('firstUse: consent off does not SPEND the once-claim', () => {
+  // Otherwise a user who browses the app before answering the consent card
+  // burns every first_use key while telemetry is off, and opting in afterwards
+  // permanently loses the entire feature-discovery picture — the exact data
+  // ADR-299 exists to collect.
+  const dir = tempDir()
+  try {
+    makeEmitter(dir, 'off').emitter.firstUse('chat')
+    assert.deepEqual(names(dir), [])
+
+    makeEmitter(dir, 'anon').emitter.firstUse('chat')
+    assert.deepEqual(names(dir), ['feature_first_use'], 'still capturable after opting in')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('once: the kill switch does not spend the claim either', () => {
+  const dir = tempDir()
+  const prev = process.env[TELEMETRY_ENV]
+  process.env[TELEMETRY_ENV] = 'off'
+  try {
+    makeEmitter(dir, 'anon').emitter.once('app_first_run')
+    delete process.env[TELEMETRY_ENV]
+    makeEmitter(dir, 'anon').emitter.once('app_first_run')
+    assert.deepEqual(names(dir), ['app_first_run'])
+  } finally {
+    if (prev === undefined) delete process.env[TELEMETRY_ENV]
+    else process.env[TELEMETRY_ENV] = prev
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('emit: an unwritable data dir never throws', () => {
   const { emitter } = makeEmitter('\0invalid', 'anon')
   assert.doesNotThrow(() => emitter.emit('app_first_run'))
