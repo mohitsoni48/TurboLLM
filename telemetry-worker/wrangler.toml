@@ -13,14 +13,14 @@ routes = [{ pattern = "t.turbollm.dev/*", zone_name = "turbollm.dev" }]
 [[d1_databases]]
 binding = "DB"
 database_name = "turbollm-telemetry"
-database_id = "REPLACE_WITH_ID_FROM_wrangler_d1_create"
+database_id = "afeb3b94-b6ff-4d6f-9933-0d191bbbc633"
 
 # Rate-limit counters only. Keys are machine ids and TRUNCATED HASHES of IPs
 # with a 1-hour TTL — the IP itself is never stored, here or in D1.
 #   wrangler kv namespace create RL
 [[kv_namespaces]]
 binding = "RL"
-id = "REPLACE_WITH_ID_FROM_wrangler_kv_namespace_create"
+id = "a7b65fd92d9a43d38dd30b5604af944d"
 
 [observability]
 enabled = true
