@@ -86,6 +86,17 @@ export function availableBackends(tag = LLAMA_BUILD): BackendDef[] {
     // ROCm/SYCL only ship x64; drop them on arm64.
     return a === 'arm64' ? list.filter((b) => b.id === 'vulkan' || b.id === 'cpu') : list
   }
+  // Android (Termux): Node reports process.platform === 'android'. Upstream
+  // publishes NO prebuilt that runs on Android — the Ubuntu binaries are glibc
+  // and won't load against Android's bionic libc. Returning an empty list
+  // (instead of throwing) lets the Engines tab load: the backend picker is
+  // empty, the catalog cards are greyed out via supportedHere, and the user
+  // can still register a self-built llama-server via "Add your own engine".
+  // Throwing here used to 500 the /engines/backends + /engines/recommendation
+  // routes and leave the Engines tab stuck on a loading skeleton.
+  if (plat() === 'android') {
+    return []
+  }
   throw new Error(`unsupported platform: ${plat()}/${process.arch}`)
 }
 
