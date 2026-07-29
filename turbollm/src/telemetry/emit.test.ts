@@ -157,6 +157,23 @@ test('dailyActive: once per day, again the next day', () => {
   }
 })
 
+test('once: app_first_run fires exactly once, not on every daemon start', () => {
+  const dir = tempDir()
+  try {
+    const { emitter } = makeEmitter(dir, 'anon')
+    emitter.once('app_first_run')
+    emitter.once('app_first_run')
+    assert.equal(names(dir).length, 1)
+
+    // A fresh Emitter over the same data dir is a daemon restart.
+    const { emitter: restarted } = makeEmitter(dir, 'anon')
+    restarted.once('app_first_run')
+    assert.equal(names(dir).length, 1, 'still once after a restart')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('emit: an unwritable data dir never throws', () => {
   const { emitter } = makeEmitter('\0invalid', 'anon')
   assert.doesNotThrow(() => emitter.emit('app_first_run'))

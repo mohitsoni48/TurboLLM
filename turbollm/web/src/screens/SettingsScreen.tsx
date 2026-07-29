@@ -1157,17 +1157,23 @@ function PrivacySection({ level, setLevel }: { level: TelemetryLevel; setLevel: 
   const { data: preview, isFetching } = useTelemetryPreview(showPreview ? level : null)
 
   const options: { value: TelemetryLevel; label: string; desc: string }[] = [
-    { value: 'off', label: 'Off', desc: 'Send nothing. TurboLLM works fully offline.' },
-    { value: 'anon', label: 'Anonymous benchmarks', desc: 'Hardware specs, model name, settings, and speed — no prompts or files.' },
-    { value: 'full', label: 'Benchmarks + crash reports', desc: 'Adds error fingerprints, never your content.' },
+    // The Off copy is deliberately literal (ADR-299 Decision 5). Choosing Off
+    // sends ONE contentless ping recording that choice — no machine id, no
+    // hardware, no timestamp — and nothing else, ever. The previous wording
+    // ("Send nothing") became false when that ping shipped, and in a
+    // source-available client anyone can diff the claim against the code.
+    { value: 'off', label: 'Off', desc: 'Sends only your choice, once. Nothing else, ever.' },
+    { value: 'anon', label: 'Anonymous usage + benchmarks', desc: 'Which features you use, hardware specs, model name, settings, and speed — no prompts or files.' },
+    { value: 'full', label: 'Usage + benchmarks + crash reports', desc: 'Adds error fingerprints, never your content.' },
   ]
 
   return (
     <section className="rounded-lg border border-border bg-panel p-4">
       <h2 className="mb-1 text-[13px] font-semibold uppercase tracking-wide text-faint">Privacy &amp; telemetry</h2>
       <p className="mb-3 text-[12px] text-muted">
-        Opt-in only. Nothing is sent unless you choose a level above Off. Never sent: your
-        conversations, prompts, files, paths, or keys.
+        Opt-in only. Choosing a level records that choice once — beyond that, nothing is sent
+        unless you pick a level above Off. Never sent: your conversations, prompts, files,
+        paths, or keys.
       </p>
 
       <div className="flex flex-col gap-1">

@@ -37,6 +37,8 @@ import { provisionTunnelApiKey } from './auth'
 import { TunnelManager, reapStaleTunnels, killTrackedTunnelsSync } from './tunnel/manager'
 import type { Deps } from './deps'
 import { TELEMETRY_ENV } from './telemetry/disabled'
+import { Emitter } from './telemetry/emit'
+import { flush } from './telemetry/uploader'
 
 // Stop child processes (the agent engine's shell tool, engine binaries, git,
 // etc.) from flashing a console window on Windows when the daemon has no console
@@ -287,6 +289,19 @@ const appUpdates = new AppUpdateChecker(version)
 const deps: Deps = { store, registry, manager, scanner, hashes, db, provision, build, updates, appUpdates, hf, downloads, bench, modelRouter, comfy, tools: toolRegistry, version, startedAt }
 deps.gate = new GenerationGate()
 deps.agentTasks = new AgentTaskState()
+
+// Journey telemetry (ADR-299). Constructing it is unconditional and harmless —
+// the Emitter itself enforces consent and the kill switch, so there is no state
+// here that could leak if those checks were somehow skipped upstream.
+const telemetry = new Emitter({ dataDir: store.dir(), store, version, os: getSysInfo().os })
+deps.telemetry = telemetry
+telemetry.dailyActive()
+// Deferred so a slow or failing disk cannot delay the listen socket; unref'd so
+// it never holds the process open (ADR-009: telemetry is not a failure mode).
+setTimeout(() => {
+  telemetry.once('app_first_run')
+  void flush(store.dir(), store.snapshot().telemetry.level)
+}, 3_000).unref()
 // Cloud Launch (ADR-045/152): only wired when --tunnel is passed. Its mere presence
 // on Deps is what forces auth enforcement on tunneled traffic (see auth.ts lanAuth) —
 // absent entirely for the vast majority of runs that never asked for a tunnel.

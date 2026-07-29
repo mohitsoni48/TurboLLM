@@ -11,10 +11,9 @@
  * fail because of telemetry.
  */
 
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
-import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { enqueue } from './queue'
+import { claimOnce } from './ledger'
 import { telemetryDisabled } from './disabled'
 import { TELEMETRY_SCHEMA_VERSION, type EventName } from './schema'
 
@@ -69,6 +68,12 @@ export class Emitter {
     }
   }
 
+  /** Emit an event at most once for the lifetime of this install (e.g.
+   *  `app_first_run`, which must count installs — not daemon starts). */
+  once(event: EventName): void {
+    if (this.claim(`once:${event}`)) this.emit(event)
+  }
+
   /** Emit `feature_first_use` the first time a feature is touched, ever. */
   firstUse(feature: string): void {
     if (this.claim(`first_use:${feature}`)) this.emit('feature_first_use', { feature })
@@ -97,40 +102,9 @@ export class Emitter {
   }
 
   /** Record a once-only key. Returns whether THIS call claimed it (i.e. whether
-   *  the caller should go on to emit). Persisted, so it survives restarts. */
+   *  the caller should go on to emit). Shared with the consent ping so both
+   *  agree on what "once" means. */
   private claim(key: string): boolean {
-    try {
-      const ledger = this.readLedger()
-      if (ledger.includes(key)) return false
-      ledger.push(key)
-      this.writeLedger(ledger)
-      return true
-    } catch {
-      // If the ledger cannot be read or written we choose NOT to emit. Emitting
-      // would risk an unbounded duplicate stream from a machine whose disk is
-      // failing; skipping loses one data point.
-      return false
-    }
-  }
-
-  private ledgerPath(): string {
-    return join(this.o.dataDir, 'telemetry', 'ledger.json')
-  }
-
-  private readLedger(): string[] {
-    try {
-      const parsed: unknown = JSON.parse(readFileSync(this.ledgerPath(), 'utf8'))
-      return Array.isArray(parsed) ? (parsed.filter((k) => typeof k === 'string') as string[]) : []
-    } catch {
-      return []
-    }
-  }
-
-  private writeLedger(keys: string[]): void {
-    mkdirSync(join(this.o.dataDir, 'telemetry'), { recursive: true })
-    // Keep only recent daily keys — one per day would otherwise grow forever.
-    const dailies = keys.filter((k) => k.startsWith('daily:')).slice(-30)
-    const rest = keys.filter((k) => !k.startsWith('daily:'))
-    writeFileSync(this.ledgerPath(), JSON.stringify([...rest, ...dailies]))
+    return claimOnce(this.o.dataDir, key)
   }
 }

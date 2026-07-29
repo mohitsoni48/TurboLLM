@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { enqueue, readQueue } from './queue'
 import { flush, type Transport } from './uploader'
+import { readSentLog } from './log'
 
 function tempDir(): string {
   return mkdtempSync(join(tmpdir(), 'turbollm-uploader-'))
@@ -72,6 +73,36 @@ test('flush: a transport that throws is swallowed and the events survive', async
     await flush(dir, 'anon', transport) // must not reject
 
     assert.equal(readQueue(dir).length, 1)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('flush: a successful send is recorded in the submission log, verbatim', async () => {
+  const dir = tempDir()
+  try {
+    enqueue(dir, validEvent())
+    const { transport } = fakeTransport('ok')
+
+    await flush(dir, 'anon', transport)
+
+    const log = readSentLog(dir)
+    assert.equal(log.length, 1)
+    assert.equal((log[0].event as { event: string }).event, 'app_first_run')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('flush: a FAILED send is not recorded — the log means "actually transmitted"', async () => {
+  const dir = tempDir()
+  try {
+    enqueue(dir, validEvent())
+    const { transport } = fakeTransport('fail')
+
+    await flush(dir, 'anon', transport)
+
+    assert.deepEqual(readSentLog(dir), [])
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

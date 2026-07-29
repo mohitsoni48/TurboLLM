@@ -48,6 +48,23 @@ function validEvent(): Record<string, unknown> {
   }
 }
 
+test('GET /api/v1/telemetry/preview?level=off: discloses the one-time consent ping', async () => {
+  // This endpoint exists so a user can check our claims against reality, so it
+  // must not claim "nothing is sent" while the Off ping ships (ADR-299).
+  const dir = mkdtempSync(join(tmpdir(), 'turbollm-routes-'))
+  try {
+    const { app } = fakeApp(dir, { level: 'off', machineId: '' })
+    const res = await app.request('/api/v1/telemetry/preview?level=off')
+    const bodyJson = (await res.json()) as { sends: boolean; note: string; payload: unknown[] }
+
+    assert.equal(bodyJson.sends, true)
+    assert.deepEqual(bodyJson.payload, [{ schema: 1, event: 'consent_choice', level: 'off' }])
+    assert.doesNotMatch(bodyJson.note, /Nothing is collected or sent/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('POST /api/v1/telemetry/regenerate-id: replaces the machine id', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'turbollm-routes-'))
   try {

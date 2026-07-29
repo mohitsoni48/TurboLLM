@@ -15,6 +15,7 @@
  */
 
 import { readQueue, remove } from './queue'
+import { recordSent } from './log'
 
 /** The ingest endpoint. Public and openly documented — there is nothing secret
  *  about the URL, and pretending otherwise would be security theatre. */
@@ -48,8 +49,14 @@ export async function flush(dataDir: string, level: string, transport: Transport
     }
     if (queued.length === 0) return
 
-    const accepted = await transport(queued.map((q) => q.event))
-    if (accepted) for (const q of queued) remove(dataDir, q.file)
+    const events = queued.map((q) => q.event)
+    const accepted = await transport(events)
+    if (accepted) {
+      // Logged only on success — the submission log's value is that it records
+      // what actually left the machine, not what we tried to send.
+      recordSent(dataDir, events)
+      for (const q of queued) remove(dataDir, q.file)
+    }
   } catch {
     // Best-effort by contract: a telemetry failure is never the user's problem.
   }
