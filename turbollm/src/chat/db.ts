@@ -996,6 +996,18 @@ export class ConversationStore {
       this.db.exec(`UPDATE agent_runs SET terminal_launched_once = 0;`)
       this.db.exec(`PRAGMA user_version = 38;`)
     }
+    // v39 (ADR-300): the engine's OWN per-phase rates, as llama.cpp measured them
+    // (`timings.prompt_per_second` / `timings.predicted_per_second`). v36 stored only a single
+    // `duration_ms` for the whole request and derived both rates from it, which cannot be right
+    // for either phase — prefill and decode run one after the other, so dividing each token count
+    // by the TOTAL duration understates both. Measured on a live claude session: 763 generated
+    // tokens over a 62 s request read as 12.3 tok/s while the engine's own decode rate was ~78.
+    // Additive + nullable: pre-existing rows keep the old derived approximation (below).
+    if (v < 39) {
+      if (!this.hasColumn('api_usage', 'prompt_tps')) this.db.exec(`ALTER TABLE api_usage ADD COLUMN prompt_tps REAL;`)
+      if (!this.hasColumn('api_usage', 'gen_tps')) this.db.exec(`ALTER TABLE api_usage ADD COLUMN gen_tps REAL;`)
+      this.db.exec(`PRAGMA user_version = 39;`)
+    }
   }
 
   listConversations(q?: string, kind: 'chat' | 'agent' | 'all' = 'all'): Conversation[] {
@@ -1358,10 +1370,15 @@ export class ConversationStore {
    *  additive/fail-safe: callers wrap this the same way `recordCompletion` is wrapped.
    *  `codeSessionId`/`durationMs` (ADR-284) are only populated for a terminal-agent session's
    *  own token-identified traffic — undefined for every other gateway client, same as before. */
-  recordApiUsage(rec: { source: ApiUsageSource; modelKey: string | null; promptTokens: number; genTokens: number; codeSessionId?: string | null; durationMs?: number | null }): void {
+  recordApiUsage(rec: { source: ApiUsageSource; modelKey: string | null; promptTokens: number; genTokens: number; codeSessionId?: string | null; durationMs?: number | null; promptTps?: number | null; genTps?: number | null }): void {
+    // `promptTps`/`genTps` (ADR-300) are the ENGINE's own measurements, straight from the
+    // llama.cpp response's `timings` — not anything computed here. Passing them through is the
+    // whole point: each phase gets its own real rate instead of both being divided by one
+    // wall-clock. Absent (an engine that reports no timings) → null, and the reader falls back.
+    const rate = (v: number | null | undefined) => (v != null && Number.isFinite(v) && v > 0 ? v : null)
     this.db.prepare(`
-      INSERT INTO api_usage (id, created_at, source, model_key, prompt_tokens, gen_tokens, code_session_id, duration_ms)
-      VALUES ($id, $createdAt, $source, $modelKey, $promptTokens, $genTokens, $codeSessionId, $durationMs)
+      INSERT INTO api_usage (id, created_at, source, model_key, prompt_tokens, gen_tokens, code_session_id, duration_ms, prompt_tps, gen_tps)
+      VALUES ($id, $createdAt, $source, $modelKey, $promptTokens, $genTokens, $codeSessionId, $durationMs, $promptTps, $genTps)
     `).run({
       $id: randomUUID(),
       $createdAt: new Date().toISOString(),
@@ -1371,6 +1388,8 @@ export class ConversationStore {
       $genTokens: Math.max(0, Math.floor(rec.genTokens) || 0),
       $codeSessionId: rec.codeSessionId ?? null,
       $durationMs: rec.durationMs != null && Number.isFinite(rec.durationMs) ? Math.max(0, Math.floor(rec.durationMs)) : null,
+      $promptTps: rate(rec.promptTps),
+      $genTps: rate(rec.genTps),
     } as P)
   }
 
@@ -1380,21 +1399,27 @@ export class ConversationStore {
    *  session has made no gateway requests yet (fresh session, or a non-terminal-agent one). */
   getLastApiUsageForSession(codeSessionId: string): { promptTokens: number; genTokens: number; promptTps: number | null; genTps: number | null } | null {
     const row = this.db.prepare(`
-      SELECT prompt_tokens, gen_tokens, duration_ms FROM api_usage
+      SELECT prompt_tokens, gen_tokens, duration_ms, prompt_tps, gen_tps FROM api_usage
       WHERE code_session_id = $codeSessionId
       ORDER BY created_at DESC LIMIT 1
-    `).get({ $codeSessionId: codeSessionId } as P) as unknown as { prompt_tokens: number; gen_tokens: number; duration_ms: number | null } | undefined
+    `).get({ $codeSessionId: codeSessionId } as P) as unknown as { prompt_tokens: number; gen_tokens: number; duration_ms: number | null; prompt_tps: number | null; gen_tps: number | null } | undefined
     if (!row) return null
+    // The engine's own per-phase rates when the row has them (ADR-300) — llama.cpp times prefill
+    // and decode separately and reports each, which is the only way either number can be right.
+    //
+    // The fallback below (both counts ÷ the request's TOTAL wall-clock) is what every row used to
+    // get, and it is wrong for both phases by construction: prefill and decode run one after the
+    // other, so neither occupies the full duration. Live measurement that started this: 763
+    // generated tokens on a 62 s claude request came out as 12.3 tok/s against a real decode rate
+    // of ~78. It is kept ONLY so pre-v39 rows still show something rather than nothing, and it is
+    // deliberately the lower-priority branch — a new row always carries the real rates unless the
+    // engine reported none.
     const seconds = row.duration_ms != null && row.duration_ms > 0 ? row.duration_ms / 1000 : null
     return {
       promptTokens: row.prompt_tokens,
       genTokens: row.gen_tokens,
-      // Prefill and generation share ONE measured duration (the request's total wall-clock
-      // time, not separately timed phases) — an approximation, same honest-estimate spirit as
-      // CodeSessionScreen's own ctxUsed live estimate, not a claim of precisely isolating the
-      // two phases.
-      promptTps: seconds ? row.prompt_tokens / seconds : null,
-      genTps: seconds ? row.gen_tokens / seconds : null,
+      promptTps: row.prompt_tps ?? (seconds ? row.prompt_tokens / seconds : null),
+      genTps: row.gen_tps ?? (seconds ? row.gen_tokens / seconds : null),
     }
   }
 

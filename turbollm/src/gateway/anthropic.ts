@@ -326,8 +326,12 @@ type OAIDelta = {
   }>
 }
 
-/** Final usage observed while translating a stream (B4 session stats). */
-export type StreamUsage = { inputTokens: number; outputTokens: number }
+/** Final usage observed while translating a stream (B4 session stats). `promptTps`/`genTps` are
+ *  the ENGINE's own per-phase rates (llama.cpp's `timings.prompt_per_second` /
+ *  `predicted_per_second`), passed through untouched — undefined when the engine reported none.
+ *  They exist here because prefill and decode are sequential phases: deriving either rate from
+ *  the request's total wall-clock understates it by however long the other phase took (ADR-300). */
+export type StreamUsage = { inputTokens: number; outputTokens: number; promptTps?: number; genTps?: number }
 
 /** Live per-request progress published to the engine card while translating a
  *  gateway stream. Mirrors the manager's LiveGen shape without importing it. */
@@ -348,6 +352,8 @@ export async function* streamToAnthropic(
   let outputTokens = 0
   let inputTokens = 0
   let cacheReadTokens = 0
+  let promptTps = 0
+  let genTps = 0
   let liveOut = 0 // running generated-token count for the live engine-card row
 
   yield sse('message_start', {
@@ -401,9 +407,16 @@ export async function* streamToAnthropic(
         if (usage?.prompt_tokens) inputTokens = usage.prompt_tokens
         // Cache-reused prompt tokens: current llama.cpp reports `cache_n`; older builds used
         // `prompt_n_reuse`. Accept either so cache_read_input_tokens isn't silently stuck at 0.
-        const timings = chunk.timings as { cache_n?: number; prompt_n_reuse?: number } | undefined
+        const timings = chunk.timings as {
+          cache_n?: number; prompt_n_reuse?: number; prompt_per_second?: number; predicted_per_second?: number
+        } | undefined
         const cacheN = timings?.cache_n ?? timings?.prompt_n_reuse
         if (cacheN != null) cacheReadTokens = cacheN
+        // Same object already being read for cache_n — the real per-phase rates were sitting right
+        // here unread, which is why a terminal-agent session's stats row had to derive them from
+        // wall-clock and got decode ~6x too low (ADR-300).
+        if (timings?.prompt_per_second) promptTps = timings.prompt_per_second
+        if (timings?.predicted_per_second) genTps = timings.predicted_per_second
 
         const choices = chunk.choices as Array<{ delta?: OAIDelta; finish_reason?: string | null }> | undefined
         if (!choices?.length) continue
@@ -507,7 +520,14 @@ export async function* streamToAnthropic(
     yield sse('message_stop', {})
     // Best-effort session stats (B4): hand off the final usage. Never throws.
     if (onUsage) {
-      try { onUsage({ inputTokens, outputTokens }) } catch { /* swallow */ }
+      try {
+        onUsage({
+          inputTokens,
+          outputTokens,
+          promptTps: promptTps > 0 ? promptTps : undefined,
+          genTps: genTps > 0 ? genTps : undefined,
+        })
+      } catch { /* swallow */ }
     }
   }
 }

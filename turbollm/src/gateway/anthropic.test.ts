@@ -376,6 +376,46 @@ test('streamToAnthropic publishes prefill % then token counts, and never forward
   assert.ok(blob.includes('Hello') && blob.includes('world'))
 })
 
+// ── streamToAnthropic: engine timings reach the usage callback (ADR-300) ─────
+//
+// This is the Claude Code path. It used to report tokens only, so everything downstream had to
+// derive tok/s by dividing by the request's total wall-clock — which counts the OTHER phase's
+// time against each rate and read decode ~6x low on a real agentic turn (763 tokens on a 62 s
+// request → 12.3 tok/s, against the engine's measured ~78).
+
+test('streamToAnthropic hands the engine\'s own prompt/gen rates to onUsage', async () => {
+  const upstream = sseStream([
+    'data: {"choices":[{"delta":{"content":"Hi"}}]}',
+    'data: {"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":152263,"completion_tokens":763},' +
+      '"timings":{"prompt_per_second":2900.5,"predicted_per_second":77.95}}',
+    'data: [DONE]',
+  ])
+  let usage: { inputTokens: number; outputTokens: number; promptTps?: number; genTps?: number } | null = null
+  for await (const _ of streamToAnthropic(upstream, 'test-model', 'msg_tps', (u) => { usage = u })) { /* drain */ }
+
+  assert.ok(usage, 'onUsage must fire')
+  const u = usage as unknown as { inputTokens: number; outputTokens: number; promptTps?: number; genTps?: number }
+  assert.equal(u.inputTokens, 152263)
+  assert.equal(u.outputTokens, 763)
+  assert.equal(u.promptTps, 2900.5)
+  assert.equal(u.genTps, 77.95)
+})
+
+test('streamToAnthropic reports no rates at all when the engine sent none — never a fabricated 0', async () => {
+  const upstream = sseStream([
+    'data: {"choices":[{"delta":{"content":"Hi"}}]}',
+    'data: {"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2}}',
+    'data: [DONE]',
+  ])
+  let usage: { promptTps?: number; genTps?: number } | null = null
+  for await (const _ of streamToAnthropic(upstream, 'test-model', 'msg_tps2', (u) => { usage = u })) { /* drain */ }
+
+  assert.ok(usage)
+  const u = usage as unknown as { promptTps?: number; genTps?: number }
+  assert.equal(u.promptTps, undefined)
+  assert.equal(u.genTps, undefined)
+})
+
 // ── streamToAnthropic usage mapping ─────────────────────────────────────────
 
 async function cacheReadFromTimings(timingsJson: string): Promise<number> {

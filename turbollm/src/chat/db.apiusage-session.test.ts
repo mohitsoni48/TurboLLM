@@ -26,18 +26,61 @@ test('getLastApiUsageForSession: null for a session with no recorded usage yet',
   }
 })
 
-test('getLastApiUsageForSession: returns tokens + computed tps from prompt/gen tokens and duration', () => {
+test('getLastApiUsageForSession: reports the ENGINE\'s own per-phase rates, not anything derived from wall-clock (ADR-300)', () => {
+  const root = makeTmpRoot()
+  const db = new ConversationStore(root)
+  try {
+    // Shaped like a real agentic claude request: a big mostly-cached prompt, a short answer, and
+    // a long total wall-clock that is nearly all prefill. Deriving both rates from durationMs
+    // (what v36 did) gives 152263/62 ≈ 2456 prompt and 763/62 ≈ 12.3 gen — the second number is
+    // the one the founder correctly called wrong, against a real decode rate of ~78.
+    db.recordApiUsage({
+      source: 'anthropic', modelKey: 'm1', promptTokens: 152263, genTokens: 763,
+      codeSessionId: 'sess-1', durationMs: 62000,
+      promptTps: 2900.5, genTps: 77.95,
+    })
+    const usage = db.getLastApiUsageForSession('sess-1')
+    assert.ok(usage)
+    assert.equal(usage!.promptTokens, 152263)
+    assert.equal(usage!.genTokens, 763)
+    assert.equal(usage!.promptTps, 2900.5)
+    assert.equal(usage!.genTps, 77.95, 'the engine measured decode; the wall-clock derivation (12.3) must not win')
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('getLastApiUsageForSession: falls back to the wall-clock derivation only when the engine reported no timings', () => {
+  const root = makeTmpRoot()
+  const db = new ConversationStore(root)
+  try {
+    // Pre-v39 rows, and any engine that returns no `timings`, still show something rather than
+    // nothing — explicitly the lower-priority branch, and known to be an approximation for both
+    // phases (they run sequentially, so neither occupies the full duration).
+    db.recordApiUsage({
+      source: 'anthropic', modelKey: 'm1', promptTokens: 1000, genTokens: 200,
+      codeSessionId: 'sess-1b', durationMs: 2000, // 2s
+    })
+    const usage = db.getLastApiUsageForSession('sess-1b')
+    assert.equal(usage!.promptTps, 500)
+    assert.equal(usage!.genTps, 100)
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('getLastApiUsageForSession: a zero/negative engine rate is treated as "not reported", never stored as 0 tok/s', () => {
   const root = makeTmpRoot()
   const db = new ConversationStore(root)
   try {
     db.recordApiUsage({
       source: 'anthropic', modelKey: 'm1', promptTokens: 1000, genTokens: 200,
-      codeSessionId: 'sess-1', durationMs: 2000, // 2s → 500 prompt tok/s, 100 gen tok/s
+      codeSessionId: 'sess-1c', durationMs: 2000, promptTps: 0, genTps: 0,
     })
-    const usage = db.getLastApiUsageForSession('sess-1')
-    assert.ok(usage)
-    assert.equal(usage!.promptTokens, 1000)
-    assert.equal(usage!.genTokens, 200)
+    const usage = db.getLastApiUsageForSession('sess-1c')
+    // Falls through to the derivation rather than claiming the model ran at 0 tok/s.
     assert.equal(usage!.promptTps, 500)
     assert.equal(usage!.genTps, 100)
   } finally {

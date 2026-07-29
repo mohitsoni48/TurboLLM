@@ -200,12 +200,21 @@ export function registerGateway(app: Hono, d: Deps): void {
         msgId,
         (u) => {
           try {
-            d.manager.recordCompletion({ inputTokens: u.inputTokens, outputTokens: u.outputTokens })
+            // The engine's own per-phase rates now ride along (ADR-300). This path — Anthropic
+            // streaming, i.e. every Claude Code request — was the one place that passed NO
+            // timings at all, so the engine card fell back to whatever the last non-gateway
+            // request left behind and a terminal-agent session's stats row had to divide both
+            // token counts by one wall-clock, reading decode ~6x too low.
+            d.manager.recordCompletion({
+              inputTokens: u.inputTokens, outputTokens: u.outputTokens,
+              promptTps: u.promptTps, genTps: u.genTps,
+            })
             // Durable counterpart to the ephemeral session counter above (GitHub #71) — the
             // session counter resets on engine restart and was never persisted/surfaced.
             d.db.recordApiUsage({
               source: 'anthropic', modelKey: req.model ?? null, promptTokens: u.inputTokens, genTokens: u.outputTokens,
               codeSessionId: anthropicCodeSessionId, durationMs: Date.now() - requestStart,
+              promptTps: u.promptTps, genTps: u.genTps,
             })
           } catch { /* swallow — stats are best-effort */ }
         },
@@ -444,7 +453,13 @@ function recordOpenAiUsage(d: Deps, oai: Record<string, unknown>, source: 'anthr
       promptTps: timings?.prompt_per_second,
       genTps: timings?.predicted_per_second,
     })
-    d.db.recordApiUsage({ source, modelKey, promptTokens: usage?.prompt_tokens ?? 0, genTokens: usage?.completion_tokens ?? 0, codeSessionId, durationMs })
+    d.db.recordApiUsage({
+      source, modelKey, promptTokens: usage?.prompt_tokens ?? 0, genTokens: usage?.completion_tokens ?? 0,
+      codeSessionId, durationMs,
+      // Already extracted for the engine card two lines up; persisting them is what lets the
+      // stats row report the engine's real rates instead of deriving both from `durationMs`.
+      promptTps: timings?.prompt_per_second, genTps: timings?.predicted_per_second,
+    })
   } catch { /* swallow — stats are best-effort */ }
 }
 
@@ -508,6 +523,9 @@ async function recordOpenAiStreamUsage(d: Deps, body: ReadableStream<Uint8Array>
     d.db.recordApiUsage({
       source, modelKey, promptTokens, genTokens: completionTokens,
       codeSessionId, durationMs: startedAt != null ? Date.now() - startedAt : null,
+      // Accumulated from the stream's own `timings` above (0 when the engine reported none —
+      // recordApiUsage stores that as null, and the reader falls back to the old derivation).
+      promptTps, genTps,
     })
   } catch { /* swallow — stats are best-effort */ }
 }
