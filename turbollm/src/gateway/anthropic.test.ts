@@ -319,6 +319,47 @@ test('mapToOpenAI strips bound keywords that llama.cpp compiles into {m,n} repet
   assert.ok(serialized.includes('"items"') && serialized.includes('"name"'), 'nested shape must survive')
 })
 
+// Pre-release review catch (PR #86): the strip matched by key at EVERY depth, so a tool parameter
+// whose NAME collides with a schema keyword was deleted along with the keyword. Claude Code's own
+// Grep tool takes a required parameter literally named `pattern`, so this fired constantly and
+// silently — the engine was handed a tool with no `pattern` argument that still required one.
+test('mapToOpenAI keeps tool PARAMETERS whose name collides with a schema keyword (pattern/format/maximum)', () => {
+  const oai = mapToOpenAI({
+    messages: [{ role: 'user', content: 'hi' }],
+    max_tokens: 100,
+    tools: [{
+      name: 'Grep',
+      input_schema: {
+        type: 'object',
+        properties: {
+          // Every one of these is a legitimate parameter NAME that is also a schema keyword.
+          pattern: { type: 'string', description: 'regex', maxLength: 2000 },
+          format: { type: 'string', enum: ['content', 'files'] },
+          maximum: { type: 'integer', minimum: 0 },
+          path: { type: 'string' },
+        },
+        required: ['pattern'],
+      },
+    }],
+  })
+  const params = (oai.tools as Array<{ function: { parameters: { properties: Record<string, unknown>; required: string[] } } }>)[0].function.parameters
+
+  assert.deepEqual(
+    Object.keys(params.properties).sort(),
+    ['format', 'maximum', 'path', 'pattern'],
+    'a parameter must never be dropped because its NAME matches a schema keyword',
+  )
+  // The schema must not contradict itself: everything `required` names still has to exist.
+  for (const name of params.required) {
+    assert.ok(name in params.properties, `required "${name}" must still be defined`)
+  }
+  // …while the bound keywords INSIDE those parameters' own schemas are still stripped.
+  const serialized = JSON.stringify(params)
+  assert.equal(serialized.includes('"maxLength"'), false, 'pattern.maxLength must still be stripped')
+  assert.equal(serialized.includes('"minimum"'), false, 'maximum.minimum must still be stripped')
+  assert.ok(serialized.includes('"enum"'), 'enum inside a keyword-named parameter still survives')
+})
+
 test('mapToOpenAI keeps `enum`, which constrains decoding without emitting any repetition', () => {
   const oai = mapToOpenAI({
     messages: [{ role: 'user', content: 'hi' }],

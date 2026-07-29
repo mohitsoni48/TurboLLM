@@ -74,17 +74,42 @@ const UNSUPPORTED_SCHEMA_KEYWORDS = new Set([
   'multipleOf',
 ])
 
+/** Keys whose VALUE is a map of caller-chosen NAME -> schema, rather than a schema itself. Their
+ *  keys are parameter names and must never be filtered as though they were schema keywords.
+ *
+ *  Missing this distinction silently deleted tool parameters: the strip below matched by key at
+ *  every depth, so a tool with a parameter literally named `pattern` lost that parameter outright.
+ *  That is not hypothetical — Claude Code's own Grep tool takes a REQUIRED `pattern` argument, and
+ *  `format`/`maximum`/`minimum` are equally ordinary parameter names. Measured before the fix: a
+ *  Grep-shaped schema carrying {pattern, path, format, maximum} reached the engine as {path}
+ *  alone, while `required: ["pattern"]` still referenced the property that had just been removed —
+ *  an internally contradictory schema advertising a tool the model cannot correctly call. */
+const SCHEMA_NAME_MAP_KEYS = new Set(['properties', 'patternProperties', '$defs', 'definitions'])
+
 function stripUnsupportedSchemaKeywords(schema: unknown): unknown {
   if (Array.isArray(schema)) return schema.map(stripUnsupportedSchemaKeywords)
   if (schema && typeof schema === 'object') {
     const out: Record<string, unknown> = {}
     for (const [key, value] of Object.entries(schema as Record<string, unknown>)) {
       if (UNSUPPORTED_SCHEMA_KEYWORDS.has(key)) continue
-      out[key] = stripUnsupportedSchemaKeywords(value)
+      out[key] = SCHEMA_NAME_MAP_KEYS.has(key) ? stripSchemaNameMap(value) : stripUnsupportedSchemaKeywords(value)
     }
     return out
   }
   return schema
+}
+
+/** Recurse a name -> schema map: every NAME is kept verbatim (it's the caller's parameter name),
+ *  and each VALUE goes through the normal strip, so bound keywords INSIDE a parameter's own schema
+ *  are still removed — `properties: { pattern: { type: 'string', maxLength: 2000 } }` keeps the
+ *  `pattern` parameter and drops its `maxLength`. */
+function stripSchemaNameMap(map: unknown): unknown {
+  if (!map || typeof map !== 'object' || Array.isArray(map)) return stripUnsupportedSchemaKeywords(map)
+  const out: Record<string, unknown> = {}
+  for (const [name, sub] of Object.entries(map as Record<string, unknown>)) {
+    out[name] = stripUnsupportedSchemaKeywords(sub)
+  }
+  return out
 }
 
 export function mapToOpenAI(req: AnthropicRequest): Record<string, unknown> {
