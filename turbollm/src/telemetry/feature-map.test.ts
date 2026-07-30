@@ -8,6 +8,19 @@ test('featureForPath: maps each instrumented surface to its feature', () => {
   assert.equal(featureForPath('/api/v1/artifacts/abc'), 'artifacts')
   assert.equal(featureForPath('/api/v1/mcp/servers'), 'mcp')
   assert.equal(featureForPath('/api/v1/bench/run'), 'autotune')
+  assert.equal(featureForPath('/api/v1/comfyui/install'), 'image')
+  assert.equal(featureForPath('/api/v1/comfyui/uninstall'), 'image')
+})
+
+test('featureForPath: research is deliberately NOT mapped — there is no dedicated endpoint', () => {
+  // Found in pre-release review: 'research' is a real FEATURES enum value but
+  // was silently unmapped, reading as permanent zero adoption. Checked why:
+  // web_search is a TOOL invoked inside the chat/agent turn's request BODY —
+  // there is no separate /api/v1/research route at all, only /api/v1/chat
+  // traffic that may or may not have called the tool. Mapping it here would
+  // require inspecting the body, which this module's own doc comment says it
+  // never does — so it stays out on purpose, not by oversight.
+  assert.equal(featureForPath('/api/v1/research'), null)
 })
 
 test('featureForPath: uninstrumented routes map to nothing', () => {

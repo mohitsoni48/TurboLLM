@@ -23,13 +23,24 @@
  * exact signal this system exists to produce — worse than not measuring it.
  * Left out until a front-end-driven signal exists instead of this blanket
  * path heuristic (e.g. fired from Customize's own tab mount, or when a skill/
- * agent is actually invoked in a turn). */
+ * agent is actually invoked in a turn).
+ *
+ * `research` is ALSO deliberately absent — but for a different reason: there is
+ * no dedicated endpoint for it at all. `web_search` is a tool the agent invokes
+ * INSIDE a `/api/v1/chat` turn's request body, and this module's whole point is
+ * that only the path is ever inspected, never the body — so there is no path
+ * this table could map without breaking that guarantee. */
 const BY_SEGMENT: Record<string, string> = {
   chat: 'chat',
   code: 'code',
   artifacts: 'artifacts',
   mcp: 'mcp',
   bench: 'autotune',
+  // Covers install/uninstall (explicit user setup) AND acquire/release (pushed
+  // by ComfyUI's OWN gate node when an actual generation runs, not polled by
+  // our UI) — unlike skills/chat-agents, every hit here is real image-gen
+  // activity, not a side effect of an unrelated screen loading.
+  comfyui: 'image',
 }
 
 /** The feature a request belongs to, or null if it is not an instrumented
