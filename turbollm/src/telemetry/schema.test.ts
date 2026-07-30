@@ -9,7 +9,7 @@ function validEvent(over: Record<string, unknown> = {}): Record<string, unknown>
     event: 'app_first_run',
     ts: '2026-07-29T12:00:00.000Z',
     machineId: '00000000-0000-0000-0000-000000000000',
-    app: { version: '1.8.4', os: 'win32' },
+    app: { version: '1.8.4', os: 'win32/x64' },
     ...over,
   }
 }
@@ -98,7 +98,7 @@ function benchEvent(over: Record<string, unknown> = {}): Record<string, unknown>
     event: 'bench_result',
     ts: '2026-07-29T12:00:00.000Z',
     machineId: '00000000-0000-0000-0000-000000000000',
-    app: { version: '1.8.4', os: 'win32' },
+    app: { version: '1.8.4', os: 'win32/x64' },
     hw: {
       cpu: 'AMD Ryzen 9 7950X 16-Core Processor',
       ramMb: 65536,
@@ -173,9 +173,33 @@ test('validateEvent: a non-numeric t/s is rejected', () => {
 })
 
 test('validateEvent: app.version is a capped identifier, not a free string', () => {
-  const r = validateEvent(validEvent({ app: { version: 'x'.repeat(200), os: 'win32' } }))
+  const r = validateEvent(validEvent({ app: { version: 'x'.repeat(200), os: 'win32/x64' } }))
   assert.equal(r.ok, false)
   assert.match(r.reason, /app\.version/)
+})
+
+test('validateEvent: app.os accepts the REAL shape sysinfo.ts produces, not a fabricated fixture', () => {
+  // Found live: getSysInfo().os is `${process.platform}/${process.arch}` (sysinfo.ts),
+  // e.g. "win32/x64" or "darwin/arm64" — every unit test fixture in this file (including
+  // ones above) had hand-written 'win32' with no slash, so this was never exercised
+  // against the real value. Every real Emitter.emit() call embeds this string
+  // unconditionally, so before this test the real client could never successfully
+  // queue a single journey event on any platform — confirmed by running the actual
+  // daemon end-to-end and finding every event silently rejected at this exact field.
+  for (const os of ['win32/x64', 'darwin/arm64', 'linux/x64']) {
+    const r = validateEvent(validEvent({ app: { version: '1.9.0', os } }))
+    assert.equal(r.ok, true, r.ok === false ? `${os}: ${r.reason}` : '')
+  }
+})
+
+test('validateEvent: app.os still rejects a real path, despite now allowing a slash', () => {
+  // The platform/arch shape is exactly ONE slash between two short alnum tokens —
+  // narrow enough that a real filesystem path (multiple segments, dots, drive
+  // letters, backslashes) cannot pass through the same allowance.
+  for (const os of ['D:\\models\\private\\secret.gguf', '/home/mo/.ssh/id_rsa', 'win32/x64/extra', '../../etc/passwd']) {
+    const r = validateEvent(validEvent({ app: { version: '1.9.0', os } }))
+    assert.equal(r.ok, false, `expected ${os} to be rejected`)
+  }
 })
 
 test('validateEvent: a machineId that is not a plain uuid-shaped id is rejected', () => {

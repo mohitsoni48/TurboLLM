@@ -94,11 +94,31 @@ function isSafeIdent(v: unknown): boolean {
   return true
 }
 
+/**
+ * `app.os`, specifically — NOT a general identifier.
+ *
+ * `getSysInfo().os` (sysinfo.ts) is always `${process.platform}/${process.arch}`
+ * (e.g. "win32/x64", "darwin/arm64"), and every real `Emitter.emit()` call embeds
+ * it unconditionally. `isSafeIdent` forbids slashes — correctly, for the six
+ * `bench_result` fields where a slash could be part of a smuggled path — but
+ * `os` is never attacker- or user-influenceable: it comes straight from Node's
+ * own runtime introspection, not from a hardware string or a file. Found live,
+ * running the real daemon end-to-end: before this, EVERY journey event was
+ * silently rejected at this exact field, on every platform, always.
+ *
+ * Scoped narrowly rather than loosening `isSafeIdent` itself: exactly one slash
+ * between two short lowercase-alnum tokens. A real filesystem path (multiple
+ * segments, dots, drive letters, backslashes) cannot pass this.
+ */
+function isSafeOs(v: unknown): boolean {
+  return typeof v === 'string' && /^[a-z0-9]{1,32}\/[a-z0-9]{1,32}$/.test(v)
+}
+
 /** Payload field specs, per event. A field is a closed enum, a capped
  *  identifier, a number, or a boolean. Anything not listed cannot be sent. */
 type FieldSpec =
   | { enum: readonly string[]; optional?: boolean }
-  | { kind: 'ident' | 'number' | 'boolean'; optional?: boolean; nullable?: boolean }
+  | { kind: 'ident' | 'os' | 'number' | 'boolean'; optional?: boolean; nullable?: boolean }
 
 /** Nested object specs for `bench_result` (and any future structured event). */
 const BENCH_PAYLOAD: Record<string, Record<string, FieldSpec>> = {
@@ -167,6 +187,8 @@ function checkFields(obj: unknown, spec: Record<string, FieldSpec>, path: string
       if (typeof v !== 'string' || !field.enum.includes(v)) return `invalid value for ${where}: ${String(v)}`
     } else if (field.kind === 'ident') {
       if (!isSafeIdent(v)) return `invalid value for ${where}`
+    } else if (field.kind === 'os') {
+      if (!isSafeOs(v)) return `invalid value for ${where}`
     } else if (field.kind === 'number') {
       if (typeof v !== 'number' || !Number.isFinite(v)) return `invalid value for ${where}: ${String(v)}`
     } else if (typeof v !== 'boolean') {
@@ -264,7 +286,7 @@ export function validateEvent(raw: unknown): ValidationResult {
     return { ok: false, reason: 'missing or malformed field: machineId' }
   }
 
-  const appError = checkFields(e.app, { version: { kind: 'ident' }, os: { kind: 'ident' } }, 'app')
+  const appError = checkFields(e.app, { version: { kind: 'ident' }, os: { kind: 'os' } }, 'app')
   if (appError !== null) return { ok: false, reason: appError }
 
   if (e.event === 'bench_result') {

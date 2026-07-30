@@ -28,7 +28,7 @@ function makeEmitter(dir: string, level: string, today = '2026-07-29') {
     dataDir: dir,
     store: store as never,
     version: '1.9.0',
-    os: 'win32',
+    os: 'win32/x64',
     today: () => today,
   })
   return { emitter, store }
@@ -216,12 +216,12 @@ test('emit: mints a machineId lazily, and never while consent is off', () => {
   const dir = tempDir()
   try {
     const offStore = fakeStore('off', '')
-    const off = new Emitter({ dataDir: dir, store: offStore as never, version: '1.9.0', os: 'win32' })
+    const off = new Emitter({ dataDir: dir, store: offStore as never, version: '1.9.0', os: 'win32/x64' })
     off.emit('app_first_run')
     assert.equal(offStore.cfg.telemetry.machineId, '', 'no id generated while off')
 
     const onStore = fakeStore('anon', '')
-    const on = new Emitter({ dataDir: dir, store: onStore as never, version: '1.9.0', os: 'win32' })
+    const on = new Emitter({ dataDir: dir, store: onStore as never, version: '1.9.0', os: 'win32/x64' })
     on.emit('app_first_run')
     assert.match(onStore.cfg.telemetry.machineId, /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/)
   } finally {

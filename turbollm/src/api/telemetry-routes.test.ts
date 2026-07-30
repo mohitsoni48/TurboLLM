@@ -44,7 +44,7 @@ function validEvent(): Record<string, unknown> {
     event: 'app_first_run',
     ts: '2026-07-29T12:00:00.000Z',
     machineId: '11111111-1111-1111-1111-111111111111',
-    app: { version: '1.9.0', os: 'win32' },
+    app: { version: '1.9.0', os: 'win32/x64' },
   }
 }
 

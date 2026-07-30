@@ -17,7 +17,7 @@ function makeEmitter(dir: string, level = 'anon') {
     dataDir: dir,
     store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) } as never,
     version: '1.9.0',
-    os: 'win32',
+    os: 'win32/x64',
   })
 }
 

@@ -34,7 +34,7 @@ function validEvent(over: Record<string, unknown> = {}): Record<string, unknown>
     event: 'app_first_run',
     ts: '2026-07-29T12:00:00.000Z',
     machineId: '00000000-0000-0000-0000-000000000000',
-    app: { version: '1.9.0', os: 'win32' },
+    app: { version: '1.9.0', os: 'win32/x64' },
     ...over,
   }
 }
@@ -112,7 +112,7 @@ test('handleIngest: an implausible t/s is filtered out', async () => {
     event: 'bench_result',
     ts: '2026-07-29T12:00:00.000Z',
     machineId: '00000000-0000-0000-0000-000000000000',
-    app: { version: '1.9.0', os: 'win32' },
+    app: { version: '1.9.0', os: 'win32/x64' },
     hw: { cpu: 'CPU', ramMb: 65536, gpus: [{ name: 'RTX 5070 Ti', vramMb: 16384 }] },
     payload: {
       model: { name: 'Qwen3.6-35B', quant: 'Q4_K_M', sizeBytes: 21_000_000_000, arch: 'qwen3moe', moe: true },

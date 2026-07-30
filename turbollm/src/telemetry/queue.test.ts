@@ -15,7 +15,7 @@ function validEvent(over: Record<string, unknown> = {}): Record<string, unknown>
     event: 'app_first_run',
     ts: '2026-07-29T12:00:00.000Z',
     machineId: '00000000-0000-0000-0000-000000000000',
-    app: { version: '1.9.0', os: 'win32' },
+    app: { version: '1.9.0', os: 'win32/x64' },
     ...over,
   }
 }
