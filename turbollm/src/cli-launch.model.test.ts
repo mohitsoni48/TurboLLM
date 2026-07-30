@@ -24,13 +24,27 @@ function makeSpawn(): { calls: CapturedSpawn[]; fn: Parameters<typeof launchCli>
   return { calls, fn }
 }
 
-/** Silence process stdout/stderr writes during launchCli calls. */
+/** Silence launchCli's own banner output during a call, WITHOUT eating node:test's results.
+ *
+ *  This used to no-op process.stdout.write wholesale. Under the full suite stdout is the
+ *  V8-serialized channel the parent runner parses, and the reporter emits each test's result on a
+ *  later tick — by which point the NEXT test had already installed its no-op, so the write went
+ *  nowhere. This file has 12 tests and the runner counted 1. Measured, so the risk isn't
+ *  overstated: a deliberately failing test under the old helper still surfaced (`fail 1`), so this
+ *  was not silent-green. What it did lose was the file's own reported coverage — 11 of 12 results
+ *  dropped, which is what makes a whole file quietly stop pulling its weight.
+ *
+ *  launchCli's stdout writes all begin with '▸' (four call sites, cli-launch.ts), so swallowing
+ *  exactly those and forwarding everything else keeps the channel intact. stderr is not the
+ *  result channel, so it can still be dropped wholesale. */
 function silenceOutput(): () => void {
   const outW = process.stdout.write.bind(process.stdout)
   const errW = process.stderr.write.bind(process.stderr)
-  const noop = (() => true) as typeof process.stdout.write
-  process.stdout.write = noop
-  process.stderr.write = noop
+  process.stdout.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
+    if (String(chunk).startsWith('▸')) return true
+    return (outW as (...a: unknown[]) => boolean)(chunk, ...rest)
+  }) as typeof process.stdout.write
+  process.stderr.write = (() => true) as typeof process.stderr.write
   return () => {
     process.stdout.write = outW
     process.stderr.write = errW

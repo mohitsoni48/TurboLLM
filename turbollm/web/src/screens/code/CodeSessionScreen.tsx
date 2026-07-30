@@ -8,8 +8,8 @@ import { useModelActions, useModels, useStatus } from '../../lib/queries'
 import { compactCodeSession, execShellCommand, revertCodeSession, sendCodeQueuedTurnNow, startCodeRun, steerOutcomeMessage, stopCodeSession } from '../../lib/code-api'
 import type { QueuedTurn, ShellRun, SteerKind } from '../../lib/code-types'
 import {
-  codeKeys, useClearCodeSession, useCodeSession, useCodeSessionRename, useExportCodeSession,
-  useResumeCodeSession, useUpdateCodeSessionMode,
+  codeKeys, useClearCodeSession, useCodeSession, useCodeSessionLastUsage, useCodeSessionRename,
+  useExportCodeSession, useResumeCodeSession, useUpdateCodeSessionMode, useUpdateCodeSessionThinkingBudget,
 } from '../../lib/code-queries'
 import { CodeSessionClient, type LiveState } from '../../lib/code-session-client'
 import { matchCodeCommand, pickerCodeCommands } from '../../lib/code-commands'
@@ -35,6 +35,8 @@ import { CodeResourcesHeader } from './CodeResourcesHeader'
 import { CodeGitDialog } from './CodeGitDialog'
 import { CodeTranscript, CodeTranscriptSkeleton, TodoChecklist } from './CodeTranscript'
 import { AGENT_MODES, type AgentModeId } from './code-mock'
+import { TerminalView, type TerminalViewHandle } from './TerminalView'
+import { TerminalToolbar } from './TerminalToolbar'
 
 /** The fixed prompt `/init` sends (ADR-258) — drives the agent to inspect the repo and author an
  *  AGENTS.md, which persona.ts's agentsMdBlock then picks up on every later turn. Sent as this
@@ -114,11 +116,49 @@ export function CodeSessionScreen() {
     engineState === 'stopping'
   const [settingsKey, setSettingsKey] = useState<string | null>(null)
   const [gitDialogOpen, setGitDialogOpen] = useState(false)
+  // A non-'turbollm' agent (config.ts's code.defaultAgent, snapshotted onto the session at
+  // creation) means this session is terminal-only for its whole lifetime — no manual toggle,
+  // no chat UI ever mounts for it. 'turbollm' (or the field being absent, for pre-existing
+  // sessions) keeps today's chat behavior unchanged.
+  const isTerminalSession = !!session?.codeAgent && session.codeAgent !== 'turbollm'
+  const lastUsageQ = useCodeSessionLastUsage(sessionId ?? null, isTerminalSession)
+  const lastUsage = lastUsageQ.data?.usage
   const exportMut = useExportCodeSession()
+  // Imperative handle onto the live TerminalView (terminal-agent sessions only) — lets
+  // handleLoadModel below drive the CLI's OWN `/model` command instead of killing and
+  // relaunching the whole terminal (a relaunch loses the entire scrollback/conversation for a
+  // switch the CLI can already do live). Confirmed LIVE against a real running session (not
+  // assumed from docs, which turned out to describe a DIFFERENT case — see below):
+  // `/model claude-<key>` sets the model IMMEDIATELY, no picker, no further interaction —
+  // Claude Code printed "Set model to <name> — TurboLLM and saved as your default for new
+  // sessions" the moment the command was sent. Claude Code's own docs say a direct `/model <id>`
+  // argument only bypasses the picker in non-interactive `-p` mode; that turned out to describe
+  // one-shot invocations only, not our case — a real, already-running interactive session DOES
+  // accept it directly too. `claude-<key>` is the SAME alias id the gateway already advertises
+  // via /v1/models (gateway.ts, ADR-158) — only present when gateway.autoSwap is on; if it is
+  // off, Claude Code will show its own "model not found" error in the terminal, same as if the
+  // user had mistyped it by hand.
+  const terminalViewRef = useRef<TerminalViewHandle>(null)
   const handleLoadModel = (key: string) => {
     modelActions.load.mutate(
       { key },
-      { onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not load model.') },
+      {
+        onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not load model.'),
+        onSuccess: () => {
+          if (isTerminalSession) {
+            if (session?.codeAgent === 'claude') {
+              // Verified direct-switch alias, this agent only (see comment above) — pi/opencode
+              // have their OWN /model pickers (per their own docs) but their direct-argument
+              // behavior hasn't been verified the same way, so fall through to the safer
+              // open-the-picker path for them instead of guessing at their exact syntax.
+              terminalViewRef.current?.sendCommand(`/model claude-${key}`)
+            } else {
+              terminalViewRef.current?.sendCommand('/model')
+              toast.info('Model loaded — pick it from the /model picker now open in the terminal.')
+            }
+          }
+        },
+      },
     )
   }
   const handleEject = () => {
@@ -142,14 +182,33 @@ export function CodeSessionScreen() {
     return global !== null ? Number(global) : -1
   }
   const [thinkingBudget, setThinkingBudgetState] = useState<number>(() => readThinkingBudget(sessionId ?? null))
+  const updateThinkingBudget = useUpdateCodeSessionThinkingBudget()
   const setThinkingBudget = (val: number) => {
     if (sessionId) localStorage.setItem(`tllm.thinkingBudget.${sessionId}`, String(val))
     setThinkingBudgetState(val)
+    // Terminal-agent sessions have no per-turn send call to attach this to — the CLI drives its
+    // own requests directly against the gateway, so this is a live, server-enforced override
+    // instead (session-auth.ts / gateway.ts), taking effect on the session's very next request.
+    if (isTerminalSession && sessionId) {
+      updateThinkingBudget.mutate(
+        { id: sessionId, tokens: val },
+        { onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not update thinking budget.') },
+      )
+    }
   }
   useEffect(() => {
     setThinkingBudgetState(readThinkingBudget(sessionId ?? null))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId])
+  // Sync the (localStorage-restored) budget to the backend once when a terminal-agent session
+  // opens — otherwise the gateway override would only start reflecting reality after the user
+  // actually touches the slider, even though a previously-saved non-default value is already
+  // showing in the UI.
+  useEffect(() => {
+    if (!isTerminalSession || !sessionId) return
+    updateThinkingBudget.mutate({ id: sessionId, tokens: readThinkingBudget(sessionId) })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isTerminalSession, sessionId])
 
   const [live, setLive] = useState<LiveState | null>(null)
   // The SERVER-side message queue's contents (tasks waiting behind the active run). Driven by
@@ -270,7 +329,12 @@ export function CodeSessionScreen() {
   useEffect(() => {
     if (!sessionId || !detailQ.isSuccess) return
     if (autoStartedRef.current === sessionId) return
-    const needsFirstRun = messages.length === 1 && messages[0]?.role === 'user' && !detailQ.data?.running
+    // Terminal-agent sessions have no daemon-owned "run" at all — the seeded first user message
+    // is just the session's title/prompt, and the actual work happens entirely inside the
+    // external CLI in the terminal. Without this guard, a terminal-agent session's very first
+    // load silently kicks off the built-in turbollm agent loop (real tool calls, real token
+    // spend) behind a UI that never even mounts a transcript to show it happened.
+    const needsFirstRun = !isTerminalSession && messages.length === 1 && messages[0]?.role === 'user' && !detailQ.data?.running
     if (needsFirstRun) {
       autoStartedRef.current = sessionId
       // Read directly rather than closing over `thinkingBudget` state: navigating between two
@@ -705,160 +769,192 @@ export function CodeSessionScreen() {
           )}
         </div>
 
-        {/* Loaded-resources header (ADR-262) — a collapsible strip surfacing the AGENTS.md +
-            skills persona.ts loads server-side but the UI never showed. Fixed below the title bar
-            (not scrolling with the transcript) so it stays a glanceable resource indicator.
-            Deliberately no mode/model/context here — those have their single home in the composer
-            (ADR-262's no-duplication constraint). */}
-        {session && !notFound && (
+        {/* Loaded-resources header — shown only for turbollm (chat) sessions */}
+        {!isTerminalSession && session && !notFound && (
           <CodeResourcesHeader
             skillCount={skillsQ.data?.length ?? 0}
             hasAgentsMd={detailQ.data?.hasAgentsMd ?? { project: false, global: false }}
           />
         )}
 
-        {/* Transcript — activity-log presentation (CodeTranscript.tsx), not
-            chat's bubble stack. See that file's header comment for the full
-            rationale. */}
-        <div ref={scrollerRef} className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
-          <div className="flex w-full flex-col px-4 py-4 md:px-8 md:py-6">
-            {notFound && (
-              <div className="flex flex-col items-center gap-2 py-16 text-center">
-                <p className="text-[14px] text-muted">This session couldn&rsquo;t be found.</p>
-                <Button size="sm" variant="outline" onClick={() => navigate('/workspace/code')}>Back to Code</Button>
+        {/* Main content — a non-turbollm agent is full-screen terminal for its entire
+            lifetime (no chat UI ever mounts); 'turbollm' keeps the normal transcript +
+            composer view unchanged. */}
+        {isTerminalSession && session ? (
+          <>
+            <TerminalView
+              ref={terminalViewRef}
+              sessionId={session.id}
+              // repoRoot + the launch command are both resolved server-side from the
+              // session's AgentRun (terminal-routes.ts) — nothing terminal-specific to
+              // pass through here.
+              onClose={() => navigate('/workspace/code')}
+            />
+            {/* Composer-parity chrome (model / context / thinking / stats) — the SAME row
+                a turbollm chat session's composer shows, just without anything to type into
+                (the terminal above owns keyboard input). Keeps this in the exact screen
+                position the chat composer occupies so switching agents only changes what's
+                ABOVE this row. */}
+            <TerminalToolbar
+              agent={session.codeAgent}
+              models={allModels}
+              loadedKey={model?.key ?? null}
+              loadedName={model?.name ?? null}
+              modelPending={modelBusy}
+              ejecting={modelActions.eject.isPending}
+              onLoadModel={handleLoadModel}
+              onEjectModel={handleEject}
+              onModelSettings={(key) => setSettingsKey(key)}
+              // NOT the shared `ctxUsed` above — that one reads the last PERSISTED assistant
+              // message's stats, and a terminal-agent session never writes one: the CLI talks to
+              // the gateway directly, so nothing of its conversation lands in the code session's
+              // message store. The ring and footer were therefore showing whichever stale value
+              // happened to be sitting in this session's very first (pre-terminal) turn, frozen
+              // forever. Measured live on 2026-07-29 against the founder's own `claude` session:
+              // persisted message said 30,645 tokens / 15% (written two days earlier, and the
+              // number in the screenshot that prompted this fix) while the CLI's actual context
+              // at that moment was 98,259 / 49%. The last gateway request's prompt size IS this
+              // conversation's real current context — an Anthropic-style CLI resends the whole
+              // conversation every turn — and it's already polled for the footer's ↑ figure, so
+              // it costs nothing extra and is the same quantity `ctxUsed` means for a chat turn.
+              ctxUsed={lastUsage?.promptTokens ?? 0}
+              ctxMax={ctxMax}
+              thinkingBudget={thinkingBudget}
+              onThinkingBudgetChange={setThinkingBudget}
+              lastPromptTokens={lastUsage?.promptTokens}
+              lastGenTokens={lastUsage?.genTokens}
+              lastPromptTps={lastUsage?.promptTps ?? undefined}
+              lastGenTps={lastUsage?.genTps ?? undefined}
+            />
+          </>
+        ) : (
+          <>
+            {/* Transcript — activity-log presentation (CodeTranscript.tsx), not
+                chat's bubble stack. See that file's header comment for the full
+                rationale. */}
+            <div ref={scrollerRef} className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
+              <div className="flex w-full flex-col px-4 py-4 md:px-8 md:py-6">
+                {notFound && (
+                  <div className="flex flex-col items-center gap-2 py-16 text-center">
+                    <p className="text-[14px] text-muted">This session couldn&rsquo;t be found.</p>
+                    <Button size="sm" variant="outline" onClick={() => navigate('/workspace/code')}>Back to Code</Button>
+                  </div>
+                )}
+                {/* /clear banner */}
+                {!notFound && session?.clearedUpToMessageId && (
+                  <div className="mb-4 flex items-center gap-2 rounded-lg border border-border bg-panel-2 px-3 py-2 text-[12px] text-muted">
+                    <Eraser size={13} className="shrink-0 text-faint" />
+                    <span className="flex-1">Chat cleared — earlier messages hidden.</span>
+                    <button
+                      type="button"
+                      onClick={() => void runResume()}
+                      disabled={resumeMut.isPending}
+                      className="inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-1 font-medium text-ink transition-colors hover:bg-panel"
+                    >
+                      <RotateCcw size={12} /> Resume
+                    </button>
+                  </div>
+                )}
+                {/* Revert banner */}
+                {!notFound && session?.revertedFromMessageId && (
+                  <div className="mb-4 flex items-center gap-2 rounded-lg border border-border bg-panel-2 px-3 py-2 text-[12px] text-muted">
+                    <RotateCcw size={13} className="shrink-0 text-faint" />
+                    <span className="flex-1">Reverted to an earlier message — later messages hidden.</span>
+                    <button
+                      type="button"
+                      onClick={() => void runResume()}
+                      disabled={resumeMut.isPending}
+                      className="inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-1 font-medium text-ink transition-colors hover:bg-panel"
+                    >
+                      <RotateCcw size={12} /> Resume
+                    </button>
+                  </div>
+                )}
+                {initialLoading && <CodeTranscriptSkeleton />}
+                {!notFound && !initialLoading && (
+                  <CodeTranscript
+                    messages={transcriptMessages}
+                    liveAssistantId={live?.assistantId}
+                    live={live ? { timeline: live.timeline, reasoning: live.reasoning, compacting: live.compacting, retry: live.retry, prefill: live.prefill } : null}
+                    onRevert={live || queued.length > 0 ? undefined : openRevertConfirm}
+                    queued={queued}
+                    onSendNowQueued={(id) => void handleSendNow(id)}
+                    shellRuns={shellRuns}
+                  />
+                )}
+              </div>
+            </div>
+
+            {showScrollBtn && (
+              <button
+                type="button"
+                onClick={() => { userScrolledUp.current = false; scrollToBottom(true) }}
+                className="absolute bottom-28 left-1/2 -translate-x-1/2 flex items-center gap-1.5 rounded-full border border-border bg-panel px-3 py-1.5 text-[12px] text-muted shadow-[var(--shadow-1)] hover:text-ink"
+              >
+                <ArrowDown size={13} /> Jump to latest
+              </button>
+            )}
+
+            {sessionId && pendingApproval && (
+              <ToolApprovalBar key={pendingApproval.id} pending={pendingApproval} convId={session?.convId ?? ''} onResolved={() => {}} />
+            )}
+
+            {/* The live turn's plan — pinned above the composer */}
+            {!!live?.todos?.length && (
+              <div className="border-t border-border px-3 py-1.5 md:px-8">
+                <TodoChecklist todos={live.todos} />
               </div>
             )}
-            {/* /clear banner — the underlying messages are never deleted, so this is a
-                reminder + one-click undo, not a warning about lost data. */}
-            {!notFound && session?.clearedUpToMessageId && (
-              <div className="mb-4 flex items-center gap-2 rounded-lg border border-border bg-panel-2 px-3 py-2 text-[12px] text-muted">
-                <Eraser size={13} className="shrink-0 text-faint" />
-                <span className="flex-1">Chat cleared — earlier messages hidden.</span>
-                <button
-                  type="button"
-                  onClick={() => void runResume()}
-                  disabled={resumeMut.isPending}
-                  className="inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-1 font-medium text-ink transition-colors hover:bg-panel"
-                >
-                  <RotateCcw size={12} /> Resume
-                </button>
-              </div>
-            )}
-            {/* Revert banner — same non-destructive framing as /clear's: the reverted-from
-                message and everything after it are deactivated, never deleted (v33). */}
-            {!notFound && session?.revertedFromMessageId && (
-              <div className="mb-4 flex items-center gap-2 rounded-lg border border-border bg-panel-2 px-3 py-2 text-[12px] text-muted">
-                <RotateCcw size={13} className="shrink-0 text-faint" />
-                <span className="flex-1">Reverted to an earlier message — later messages hidden.</span>
-                <button
-                  type="button"
-                  onClick={() => void runResume()}
-                  disabled={resumeMut.isPending}
-                  className="inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-1 font-medium text-ink transition-colors hover:bg-panel"
-                >
-                  <RotateCcw size={12} /> Resume
-                </button>
-              </div>
-            )}
-            {initialLoading && <CodeTranscriptSkeleton />}
-            {!notFound && !initialLoading && (
-              <CodeTranscript
-                messages={transcriptMessages}
-                liveAssistantId={live?.assistantId}
-                live={live ? { timeline: live.timeline, reasoning: live.reasoning, compacting: live.compacting, retry: live.retry, prefill: live.prefill } : null}
-                onRevert={live || queued.length > 0 ? undefined : openRevertConfirm}
-                queued={queued}
-                onSendNowQueued={(id) => void handleSendNow(id)}
-                shellRuns={shellRuns}
+
+            {/* Composer — the SAME CodeComposer CodeHomeScreen.tsx renders */}
+            <div className="px-3 pb-3 md:px-8 md:pb-5">
+              <CodeComposer
+                inputRef={inputRef}
+                value={input}
+                onValueChange={setInput}
+                onSubmit={(kind) => void send(kind)}
+                placeholder={live ? 'Queue a follow-up…' : 'Send a follow-up…'}
+                textareaDisabled={manualCompacting}
+                mode={modeInfo}
+                onModeChange={handleModeChange}
+                models={allModels}
+                loadedKey={model?.key ?? null}
+                loadedName={model?.name ?? null}
+                modelPending={modelBusy}
+                ejecting={modelActions.eject.isPending}
+                onLoadModel={handleLoadModel}
+                onEjectModel={handleEject}
+                thinkingBudget={thinkingBudget}
+                onThinkingBudgetChange={setThinkingBudget}
+                onModelSettings={(key) => setSettingsKey(key)}
+                ctxUsed={ctxUsed}
+                ctxMax={ctxMax}
+                lastPromptTokens={lastRealStats?.promptTokens}
+                lastGenTokens={lastRealStats?.genTokens}
+                lastPromptTps={lastRealStats?.promptTps}
+                lastGenTps={lastRealStats?.tps}
+                live={!!live}
+                onStop={() => void handleStop()}
+                sendDisabled={!input.trim() || manualCompacting}
+                onAddContext={() => setContextBrowserOpen(true)}
+                contextFiles={contextFiles}
+                onRemoveContextFile={(p) => setContextFiles((cf) => cf.filter((x) => x !== p))}
+                slashCommands={[
+                  ...pickerCodeCommands({ cleared: !!(session?.clearedUpToMessageId || session?.revertedFromMessageId) }),
+                  ...(skillsQ.data ?? []).map((s) => ({ id: s.id, description: s.description })),
+                ]}
+                statusText={
+                  manualCompacting || live?.compacting
+                    ? 'Compacting conversation…'
+                    : live
+                      ? (queued.length ? `${queued.length} queued · Enter to queue another` : 'Running — Enter to queue a follow-up')
+                      : undefined
+                }
+                hintText="Enter to send · Shift+Enter for newline"
               />
-            )}
-          </div>
-        </div>
-
-        {showScrollBtn && (
-          <button
-            type="button"
-            onClick={() => { userScrolledUp.current = false; scrollToBottom(true) }}
-            className="absolute bottom-28 left-1/2 -translate-x-1/2 flex items-center gap-1.5 rounded-full border border-border bg-panel px-3 py-1.5 text-[12px] text-muted shadow-[var(--shadow-1)] hover:text-ink"
-          >
-            <ArrowDown size={13} /> Jump to latest
-          </button>
+            </div>
+          </>
         )}
-
-        {sessionId && pendingApproval && (
-          <ToolApprovalBar key={pendingApproval.id} pending={pendingApproval} convId={session?.convId ?? ''} onResolved={() => {}} />
-        )}
-
-        {/* The live turn's plan — pinned here, OUTSIDE the scrolling transcript above and
-            directly above the composer, so it never scrolls out of view mid-turn (founder
-            feedback, 2026-07-24: rendering it inline in the transcript, per the original #16
-            build, meant it scrolled away the moment there was enough reasoning/tool output to
-            push it off-screen — exactly wrong for something meant to stay visible as a reference
-            while the turn runs). Just a top border sets it off from the transcript above — the
-            old bordered-card + bg-panel-2 band read as a floating card next to the flat log
-            (founder feedback, 2026-07-24); flat now (ADR-262), so it reads as a pinned strip of
-            the same log, not a separate panel. */}
-        {!!live?.todos?.length && (
-          <div className="border-t border-border px-3 py-1.5 md:px-8">
-            <TodoChecklist todos={live.todos} />
-          </div>
-        )}
-
-        {/* Composer — the SAME CodeComposer CodeHomeScreen.tsx renders (no
-            `repo`: the repo is fixed for the session's lifetime). Mode and
-            model are both editable here too — see the handlers above. */}
-        <div className="px-3 pb-3 md:px-8 md:pb-5">
-          <CodeComposer
-            inputRef={inputRef}
-            value={input}
-            onValueChange={setInput}
-            onSubmit={(kind) => void send(kind)}
-            placeholder={live ? 'Queue a follow-up…' : 'Send a follow-up…'}
-            textareaDisabled={manualCompacting}
-            mode={modeInfo}
-            onModeChange={handleModeChange}
-            models={allModels}
-            loadedKey={model?.key ?? null}
-            loadedName={model?.name ?? null}
-            modelPending={modelBusy}
-            ejecting={modelActions.eject.isPending}
-            onLoadModel={handleLoadModel}
-            onEjectModel={handleEject}
-            thinkingBudget={thinkingBudget}
-            onThinkingBudgetChange={setThinkingBudget}
-            onModelSettings={(key) => setSettingsKey(key)}
-            ctxUsed={ctxUsed}
-            ctxMax={ctxMax}
-            lastPromptTokens={lastRealStats?.promptTokens}
-            lastGenTokens={lastRealStats?.genTokens}
-            lastPromptTps={lastRealStats?.promptTps}
-            lastGenTps={lastRealStats?.tps}
-            live={!!live}
-            onStop={() => void handleStop()}
-            sendDisabled={!input.trim() || manualCompacting}
-            onAddContext={() => setContextBrowserOpen(true)}
-            contextFiles={contextFiles}
-            onRemoveContextFile={(p) => setContextFiles((cf) => cf.filter((x) => x !== p))}
-            slashCommands={[
-              // Built-ins from the shared registry (code-commands.ts) — the same source send()
-              // parses against — then the dynamic skills appended after.
-              ...pickerCodeCommands({ cleared: !!(session?.clearedUpToMessageId || session?.revertedFromMessageId) }),
-              ...(skillsQ.data ?? []).map((s) => ({ id: s.id, description: s.description })),
-            ]}
-            // Prominent, accent-colored banner above the textarea for any real in-progress
-            // state (founder feedback, 2026-07-17: folding this into the tiny faint hint text
-            // below made an actual busy state — especially manual /compact, which disables the
-            // whole composer — too easy to miss). hintText stays reserved for the idle case.
-            statusText={
-              manualCompacting || live?.compacting
-                ? 'Compacting conversation…'
-                : live
-                  ? (queued.length ? `${queued.length} queued · Enter to queue another` : 'Running — Enter to queue a follow-up')
-                  : undefined
-            }
-            hintText="Enter to send · Shift+Enter for newline"
-          />
-        </div>
       </div>
       <ModelDetailDialog modelKey={settingsKey} onClose={() => setSettingsKey(null)} />
       {session && <CodeGitDialog sessionId={session.id} open={gitDialogOpen} onOpenChange={setGitDialogOpen} />}

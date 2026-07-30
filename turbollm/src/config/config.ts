@@ -261,6 +261,13 @@ export interface CodeConfig {
   /** Tried against the global TurboLLM data dir (~/.turbollm). Mirrors persona.ts's
    *  DEFAULT_AGENTS_MD_GLOBAL_CANDIDATES. */
   agentsMdGlobalCandidates: string[]
+  /** Which coding agent new Code sessions launch with. 'turbollm' is the built-in
+   *  pi-SDK-backed chat UI (unchanged); the others launch full-screen inside the
+   *  embedded terminal (turbollm launch <agent>, cli-launch.ts). Read ONCE at session
+   *  creation and stamped onto the AgentRun (code-routes.ts) — a session's agent never
+   *  changes after creation, same as repoRoot. Changing this only affects sessions
+   *  created afterward. */
+  defaultAgent: 'turbollm' | 'pi' | 'claude' | 'opencode'
 }
 /** Cloud Launch deploy-link settings (ADR-153, RunPod recipe). RunPod is the only
  *  provider for now — a user who has published their own RunPod Template (following
@@ -518,7 +525,7 @@ export function defaultConfig(): Config {
     customAgents: [],
     builtinAgentOverrides: {},
     build: { toolchainDirs: [] },
-    code: { agentsMdProjectCandidates: ['AGENTS.md', 'agents.md', 'CLAUDE.md'], agentsMdGlobalCandidates: ['agents.md', 'AGENTS.md', 'CLAUDE.md'] },
+    code: { agentsMdProjectCandidates: ['AGENTS.md', 'agents.md', 'CLAUDE.md'], agentsMdGlobalCandidates: ['agents.md', 'AGENTS.md', 'CLAUDE.md'], defaultAgent: 'turbollm' },
     cloudDeploy: { runpodTemplateId: '' },
   }
 }
@@ -854,9 +861,12 @@ function normalize(c: Config): void {
     const filtered = Array.isArray(v) ? v.filter((p): p is string => typeof p === 'string' && p.trim() !== '').map((p) => p.trim()) : []
     return filtered.length > 0 ? filtered : fallback
   }
+  const ALLOWED_AGENTS = new Set(['turbollm', 'pi', 'claude', 'opencode'])
   c.code = {
     agentsMdProjectCandidates: cleanCandidates(cc.agentsMdProjectCandidates, ['AGENTS.md', 'agents.md', 'CLAUDE.md']),
     agentsMdGlobalCandidates: cleanCandidates(cc.agentsMdGlobalCandidates, ['agents.md', 'AGENTS.md', 'CLAUDE.md']),
+    // Unrecognized/absent → 'turbollm' (the built-in chat UI), never a silently-broken terminal launch.
+    defaultAgent: ALLOWED_AGENTS.has(cc.defaultAgent as string) ? (cc.defaultAgent as CodeConfig['defaultAgent']) : 'turbollm',
   }
   // Cloud Launch deploy-link settings (ADR-153): absent in pre-ADR-153 configs → ''.
   const cd = (c.cloudDeploy ?? {}) as Partial<CloudDeployConfig>

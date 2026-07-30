@@ -259,23 +259,30 @@ describe('CodeComposer image paste', () => {
 })
 
 describe('CodeComposer real stats footer (ADR-262)', () => {
-  it('shows context %/max as real digits — genuinely new info, NOT a duplicate (ContextUsageRing never renders % as text)', () => {
+  // Format note (2026-07-29): the footer renders each stat as a separate label + value element
+  // (CodeStatsFooter.tsx) instead of one run-on monospace string, so these assert the pair rather
+  // than the old concatenations ('25%/100', 'Think: 4.0k').
+  it('shows context % and max as real digits — genuinely new info, NOT a duplicate (ContextUsageRing never renders % as text)', () => {
     render(<Harness ctxUsed={25} ctxMax={100} />)
-    expect(screen.getByText('25%/100')).toBeInTheDocument()
+    expect(screen.getByText('Context')).toBeInTheDocument()
+    expect(screen.getByText('25%')).toBeInTheDocument()
+    expect(screen.getByText('of 100')).toBeInTheDocument()
   })
 
   it('omits the context segment entirely when ctxMax is 0 (no NaN%, matches ContextUsageRing\'s own guard)', () => {
     render(<Harness ctxUsed={0} ctxMax={0} />)
-    expect(screen.queryByText(/%\//)).not.toBeInTheDocument()
+    expect(screen.queryByText('Context')).not.toBeInTheDocument()
+    expect(screen.queryByText(/^\d+%$/)).not.toBeInTheDocument()
   })
 
   it('shows a compact thinking-effort readout — genuinely new info (the Brain icon never shows the value as text)', () => {
     const { rerender } = render(<Harness thinkingBudget={-1} />)
-    expect(screen.getByText('Think: Unlimited')).toBeInTheDocument()
+    expect(screen.getByText('Think')).toBeInTheDocument()
+    expect(screen.getByText('Unlimited')).toBeInTheDocument()
     rerender(<Harness thinkingBudget={0} />)
-    expect(screen.getByText('Think: Off')).toBeInTheDocument()
+    expect(screen.getByText('Off')).toBeInTheDocument()
     rerender(<Harness thinkingBudget={4000} />)
-    expect(screen.getByText('Think: 4.0k')).toBeInTheDocument()
+    expect(screen.getByText('4.0k')).toBeInTheDocument()
   })
 
   it('does NOT duplicate mode (toolbar button only) or model name (ModelLoadMenu trigger only)', () => {
@@ -339,7 +346,7 @@ describe('CodeComposer real stats footer (ADR-262)', () => {
     render(<Harness textareaDisabled ctxUsed={25} ctxMax={100} />)
     expect(screen.queryByText('Enter to send')).not.toBeInTheDocument()
     // Stats stay put — this was the whole point of making the footer permanent.
-    expect(screen.getByText('25%/100')).toBeInTheDocument()
+    expect(screen.getByText('25%')).toBeInTheDocument()
   })
 
   it('keybind-hint honesty: the advertised "Enter to send" actually submits on Enter', async () => {

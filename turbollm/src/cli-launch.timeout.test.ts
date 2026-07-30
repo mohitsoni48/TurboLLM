@@ -37,17 +37,26 @@ function stubFetch(model = 'qwen3-8b'): () => void {
   return () => { globalThis.fetch = original }
 }
 
-/** Silence process stdout/stderr for the duration of a launchCli call. launchCli writes
- *  a "▸ Launching…" banner to stdout; under the full `node --test` suite each file runs in
- *  a subprocess whose stdout IS the V8-serialized result channel the parent runner parses,
- *  so raw writes corrupt that stream ("Unable to deserialize cloned data"). Capturing the
- *  writes keeps the channel clean and the test deterministic. */
+/** Silence launchCli's own banner output for the duration of a call. launchCli writes a
+ *  "▸ Launching…" banner to stdout; under the full `node --test` suite each file runs in a
+ *  subprocess whose stdout IS the V8-serialized result channel the parent runner parses, so raw
+ *  writes corrupt that stream ("Unable to deserialize cloned data").
+ *
+ *  But no-oping stdout wholesale (the previous approach) breaks the channel the other way: the
+ *  reporter emits each test's result on a later tick, by which point the next test has installed
+ *  its no-op, so results are swallowed and only the file's last test is reported — this file has
+ *  2 tests and the runner counted 1. Measured: an actual failure still surfaced under the old
+ *  helper, so this was lost coverage rather than silent green. launchCli's
+ *  stdout writes all begin with '▸' (cli-launch.ts), so swallow exactly those and forward the
+ *  rest. stderr is not the result channel and can still be dropped wholesale. */
 function silenceOutput(): () => void {
   const outW = process.stdout.write.bind(process.stdout)
   const errW = process.stderr.write.bind(process.stderr)
-  const noop = (() => true) as typeof process.stdout.write
-  process.stdout.write = noop
-  process.stderr.write = noop
+  process.stdout.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
+    if (String(chunk).startsWith('▸')) return true
+    return (outW as (...a: unknown[]) => boolean)(chunk, ...rest)
+  }) as typeof process.stdout.write
+  process.stderr.write = (() => true) as typeof process.stderr.write
   return () => {
     process.stdout.write = outW
     process.stderr.write = errW

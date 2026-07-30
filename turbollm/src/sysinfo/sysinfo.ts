@@ -11,6 +11,11 @@ export interface GpuInfo {
   name: string
   vramMb: number
   vendor: GpuVendor
+  /** True when `vramMb` is a slice of system RAM rather than dedicated VRAM — an APU's
+   *  carveout+GTT budget, Apple's unified memory, or an iGPU's shared-memory estimate. Such a
+   *  budget must never be *summed* with a discrete card's real VRAM (`detectHardware`), because
+   *  they are not two pools: the iGPU's share is the same RAM the box already has. ADR-306. */
+  unified?: boolean
 }
 export interface SysInfo {
   os: string
@@ -78,6 +83,19 @@ export function isIntegratedGpuName(name: string): boolean {
   // AMD APU iGPU branding ("Radeon(TM) Graphics", generic) vs. a discrete card, which
   // always carries an RX/PRO/Instinct/Vega-N model name.
   if (/radeon.*graphics/.test(n) && !/\b(rx|pro|instinct|vega\s*\d|firepro)\b/.test(n)) return true
+  // AMD's *numbered* APU iGPU branding, which carries no "Graphics" suffix and so misses the
+  // rule above: "Radeon 780M"/"Radeon 890M" (Phoenix→Strix Point) and "Radeon 8050S/8060S"
+  // (Strix Halo). Deliberately narrow, because the failure direction here is the dangerous one
+  // (an over-reported budget green-lights a load that then OOMs):
+  //   - only 3-digit numbers from 600 up, and 4-digit ones — AMD's low-end DISCRETE mobile line
+  //     stopped at "Radeon 520M/530M/540M/550M", so 5xx and below must stay excluded;
+  //   - older discrete mobile parts always carry a series prefix ("Radeon HD 6770M",
+  //     "Radeon R7 M340"), which breaks the `radeon`-then-digits adjacency this needs;
+  //   - the RX/PRO/Instinct/Vega-N exclusion above still applies ("Radeon RX 7600M XT",
+  //     "Radeon Pro 5600M" are discrete).
+  // On Linux this is only the FALLBACK — the authoritative APU check is KFD topology
+  // (see linuxAmdIsApu); it matters on boxes where amdkfd isn't loaded. ADR-304 / GitHub #85.
+  if (/radeon\s*(?:[6-9]\d{2}|\d{4})\s*[ms]\b/.test(n) && !/\b(rx|pro|instinct|vega\s*\d|firepro)\b/.test(n)) return true
   // Newest Intel Core Ultra generic branding — plain "Intel(R) Graphics" with no
   // qualifier at all (confirmed on a real Core Ultra 7 265K / Arrow Lake-S box).
   // Intel's only current discrete lineup is Arc-branded, so any other Intel name
@@ -121,7 +139,7 @@ function detectGpus(): GpuInfo[] {
       const out = execFileSync('system_profiler', ['SPDisplaysDataType'], { timeout: 8000 }).toString()
       const m = out.match(/Chipset Model:\s*(.+)/)
       if (m && /Apple/.test(out)) {
-        return [{ name: m[1].trim(), vramMb: Math.round((os.totalmem() / 1e6) * 0.65), vendor: 'apple' }]
+        return [{ name: m[1].trim(), vramMb: Math.round((os.totalmem() / 1e6) * 0.65), vendor: 'apple', unified: true }]
       }
     } catch {
       /* ignore */
@@ -178,10 +196,13 @@ function enumWindowsGpus(): GpuInfo[] {
       // red. Apply the same shared-memory heuristic used for Apple Silicon below,
       // scaled down (50% vs. 65%) to match Windows' more conservative default
       // "shared GPU memory" cap.
-      const vramMb = isIntegratedGpuName(nm)
+      const integrated = isIntegratedGpuName(nm)
+      const vramMb = integrated
         ? Math.round((os.totalmem() / 1e6) * 0.5)
         : bytes > 0 ? Math.round(bytes / 1e6) : 0
-      return { name: nm, vramMb, vendor: classifyVendor(nm) }
+      // `unified`: a shared-memory estimate must not be pooled with a discrete card of the same
+      // vendor (an Intel iGPU next to an Intel Arc dGPU is the live case here). ADR-306.
+      return { name: nm, vramMb, vendor: classifyVendor(nm), ...(integrated ? { unified: true } : {}) }
     })
     .filter((g) => g.name && g.vendor !== 'unknown')
 
@@ -315,25 +336,9 @@ function enumLinuxGpus(): GpuInfo[] {
         .trim()
         .split('\n')
         .filter(Boolean)
-        .map((line) => {
-          const vendor = classifyVendor(line)
-          const slot = line.trim().split(/\s+/)[0] ?? ''
-          const name = line.replace(/"/g, '').trim().slice(0, 80)
-          const sysfsVramMb = linuxVramMb(slot)
-          // sysfs's mem_info_vram_total only exists for amdgpu-driven cards (dedicated
-          // VRAM, or an APU's BIOS carveout) — Intel iGPUs / nouveau read 0 here, which
-          // means "no dedicated VRAM", not "no usable memory". Reporting that literal 0
-          // was making quant auto-selection always pick the smallest file and the fit
-          // check always show red, on hardware where the real constraint is different.
-          const vramMb = sysfsVramMb > 0
-            ? sysfsVramMb
-            : isIntegratedGpuName(name)
-              ? Math.round((os.totalmem() / 1e6) * 0.5)
-              : 0
-          return { name, vramMb, vendor }
-        })
-        .filter((g) => g.vendor !== 'unknown')
-        
+        .map((line) => linuxGpuFromLspci(line, linuxAmdgpuMem, linuxAmdIsApu, os.totalmem(), console.log))
+        .filter((g): g is GpuInfo => g !== null && g.vendor !== 'unknown')
+
       if (gpus.length) return gpus
     }
   } catch {
@@ -400,27 +405,203 @@ function makeVulkanGpu(name: string, deviceType: string): GpuInfo {
   const vramMb = integrated
     ? Math.round((os.totalmem() / 1e6) * 0.5)
     : 0
-  return { name, vramMb, vendor }
+  return { name, vramMb, vendor, ...(integrated ? { unified: true } : {}) }
 }
 
-// amdgpu exposes total VRAM in bytes via sysfs (incl. the BIOS carveout on
+/** One `lspci -mm` line, split into fields. Format:
+ *  `slot "class" "vendor" "device" [-rNN] [-pNN] "svendor" "sdevice"`. */
+export interface LspciEntry {
+  slot: string
+  deviceClass: string
+  vendor: string
+  device: string
+}
+
+/** Pure parser for a single `lspci -mm` line, split out for direct testing. Null when the line
+ *  doesn't have the expected shape (caller then keeps the old whole-line behaviour). */
+export function parseLspciMm(line: string): LspciEntry | null {
+  const slot = line.trim().split(/\s+/)[0] ?? ''
+  const fields = (line.match(/"[^"]*"/g) ?? []).map((f) => f.slice(1, -1).trim())
+  if (!slot || slot.includes('"') || fields.length < 3) return null
+  return { slot, deviceClass: fields[0], vendor: fields[1], device: fields[2] }
+}
+
+/** The whole per-adapter decision for one `lspci -mm` line — display name, vendor, and usable
+ *  VRAM budget — split out for direct testing behind two injected seams (`readMem` reads sysfs,
+ *  `isApu` reads KFD topology; production passes {@link linuxAmdgpuMem} / `linuxAmdIsApu`).
+ *  Returns null for a line that isn't a parseable adapter at all. */
+export function linuxGpuFromLspci(
+  line: string,
+  readMem: (pciSlot: string) => AmdgpuMem,
+  isApu: (pciSlot: string, label: string) => boolean,
+  totalRamBytes: number,
+  log: (msg: string) => void = () => {},
+): GpuInfo | null {
+  const entry = parseLspciMm(line)
+  const slot = entry?.slot ?? (line.trim().split(/\s+/)[0] ?? '')
+  if (!slot) return null
+  // Classify against vendor + device, never the device alone: "graphics" often lives in the
+  // device field while "intel" only appears in the vendor field (e.g. vendor "Intel Corporation"
+  // + device "3rd Gen Core processor Graphics Controller"), so splitting them would silently
+  // un-detect those iGPUs.
+  const label = entry ? `${entry.vendor} ${entry.device}` : line
+  // Display name: the device field alone. The whole raw lspci line used to be the name, which
+  // read as a PCI dump in Settings → Hardware ("c6:00.0 Display controller Advanced Micro
+  // Devices, Inc. [AMD/ATI] Strix Halo [Ra…" — GitHub #85's screenshot). GPU names are
+  // display/log-only (nothing branches on them), so this is safe. ADR-304.
+  // A device newer than the local pci.ids has no name there, and lspci prints a bare
+  // "Device 7550" — useless on its own, so keep the vendor in front of it (ADR-306).
+  const device = entry ? (/^device\s+[0-9a-f]{4}$/i.test(entry.device) ? `${entry.vendor} ${entry.device}` : entry.device) : ''
+  const name = entry ? device.slice(0, 80) : line.replace(/"/g, '').trim().slice(0, 80)
+  const vendor = classifyVendor(label)
+  const mem = readMem(slot)
+  // sysfs's mem_info_vram_total only exists for amdgpu-driven cards (dedicated
+  // VRAM, or an APU's BIOS carveout) — Intel iGPUs / nouveau read 0 here, which
+  // means "no dedicated VRAM", not "no usable memory". Reporting that literal 0
+  // was making quant auto-selection always pick the smallest file and the fit
+  // check always show red, on hardware where the real constraint is different.
+  let vramMb = mem.vramMb
+  let unified = false
+  if (mem.vramMb > 0 && vendor === 'amd' && mem.gttMb > 0 && isApu(slot, label)) {
+    // Unified-memory APU: the BIOS carveout alone is NOT the budget (GitHub #85).
+    vramMb = amdApuVramMb(mem.vramMb, mem.gttMb, totalRamBytes)
+    unified = true
+    log(`[sysinfo] amdgpu APU at ${slot}: vram=${mem.vramMb}MB + gtt=${mem.gttMb}MB → ${vramMb}MB usable`)
+  } else if (vramMb === 0 && isIntegratedGpuName(label)) {
+    vramMb = Math.round((totalRamBytes / 1e6) * 0.5)
+    unified = true
+  }
+  return { name, vramMb, vendor, ...(unified ? { unified: true } : {}) }
+}
+
+/** amdgpu's two memory pools for one adapter, in MB (0 = attribute absent/unreadable).
+ *  `vramMb` is dedicated VRAM — on an APU, just the small BIOS carveout. `gttMb` is the GTT
+ *  pool: how much system RAM the driver will let the GPU map. */
+export interface AmdgpuMem {
+  vramMb: number
+  gttMb: number
+}
+
+// amdgpu exposes both pool totals in bytes via sysfs (incl. the BIOS carveout on
 // APUs like Ryzen AI / Strix Halo); lspci carries no size. Each lspci -mm line
 // begins with the PCI slot (e.g. "c3:00.0"), whose sysfs node lives at
 // /sys/bus/pci/devices/<domain>:<slot> — lspci omits the "0000:" domain by
-// default, so try both forms. Intel iGPUs / nouveau lack the attribute → 0 (no
+// default, so try both forms. Intel iGPUs / nouveau lack the attributes → 0 (no
 // dedicated VRAM), preserving prior behaviour. Byte→MB uses the same /1e6 as
-// the nvidia/windows/apple branches.
-function linuxVramMb(pciSlot: string): number {
-  if (!pciSlot) return 0
+// the nvidia/windows/apple branches. Both reads come from the SAME device dir.
+function linuxAmdgpuMem(pciSlot: string): AmdgpuMem {
+  if (!pciSlot) return { vramMb: 0, gttMb: 0 }
   for (const dev of [`/sys/bus/pci/devices/0000:${pciSlot}`, `/sys/bus/pci/devices/${pciSlot}`]) {
-    try {
-      const bytes = parseInt(fs.readFileSync(`${dev}/mem_info_vram_total`, 'utf8').trim(), 10)
-      if (Number.isFinite(bytes) && bytes > 0) return Math.round(bytes / 1e6)
-    } catch {
-      /* no such device, or adapter exposes no VRAM (Intel iGPU, nouveau) */
-    }
+    const vram = readSysfsBytes(dev, 'mem_info_vram_total')
+    if (vram > 0) return { vramMb: Math.round(vram / 1e6), gttMb: Math.round(readSysfsBytes(dev, 'mem_info_gtt_total') / 1e6) }
   }
-  return 0
+  return { vramMb: 0, gttMb: 0 }
+}
+
+function readSysfsBytes(dir: string, attr: string): number {
+  try {
+    const bytes = parseInt(fs.readFileSync(`${dir}/${attr}`, 'utf8').trim(), 10)
+    return Number.isFinite(bytes) && bytes > 0 ? bytes : 0
+  } catch {
+    /* no such device, or the adapter doesn't expose this attribute */
+    return 0
+  }
+}
+
+/** The offload budget for a unified-memory AMD APU: the BIOS VRAM carveout PLUS the GTT pool.
+ *  On an APU both are the same physical RAM at the same bandwidth, so GTT is genuinely usable
+ *  for offload — which is why this must never be applied to a discrete card, where GTT is system
+ *  RAM reached across PCIe. GitHub #85: a Strix Halo box (131 GB RAM, 1 GiB carveout, 108 GiB
+ *  GTT) was reported as a 1.1 GB-VRAM GPU, so every model showed "will spill to system RAM" and
+ *  auto-tune had nothing that fit. The 90%-of-RAM cap is only a nonsense guard for a hand-set
+ *  `amdgpu.gttsize=`; the driver's own GTT limit is already a fraction of RAM, so it rarely binds.
+ *  ADR-304. */
+export function amdApuVramMb(vramMb: number, gttMb: number, totalRamBytes: number): number {
+  const cap = Math.round((totalRamBytes / 1e6) * 0.9)
+  return Math.max(vramMb, Math.min(vramMb + gttMb, cap))
+}
+
+/** One KFD topology node that has SIMDs (i.e. a GPU), and whether it is a *fused* node — one
+ *  the kernel attached to a CPU node, which only ever happens for an APU. */
+export interface KfdGpuNode {
+  domain: number
+  locationId: number
+  fused: boolean
+}
+
+/** Pure parser for `/sys/class/kfd/kfd/topology/nodes/N/properties` bodies, split out for direct
+ *  testing. Nodes with no SIMDs are plain CPU nodes and are skipped.
+ *
+ *  `fused` (SIMDs **and** CPU cores on one node) proves an APU but does **not** disprove one —
+ *  see {@link linuxAmdIsApu}. ADR-306 corrects ADR-304 here: `kfd_assign_gpu()` skips every
+ *  device with `cpu_cores_count` when placing a GPU (*"Discrete GPUs need their own topology
+ *  device list entries. Don't assign them to CPU/APU nodes."*), unconditionally since IOMMUv2 was
+ *  removed in 6.6. So on any current kernel even an APU's iGPU gets its own node reporting
+ *  `cpu_cores_count 0`, and only the old IOMMUv2 parts (Kaveri/Carrizo/Raven) ever fuse. */
+export function parseKfdNodes(propsTexts: string[]): KfdGpuNode[] {
+  const nodes: KfdGpuNode[] = []
+  for (const text of propsTexts) {
+    const prop = (key: string): number => {
+      const m = new RegExp(`^${key}\\s+(\\d+)\\s*$`, 'm').exec(text)
+      return m ? parseInt(m[1], 10) : 0
+    }
+    if (prop('simd_count') <= 0) continue // CPU-only node
+    nodes.push({ domain: prop('domain'), locationId: prop('location_id'), fused: prop('cpu_cores_count') > 0 })
+  }
+  return nodes
+}
+
+/** A PCI slot split into the two halves KFD keys a node by: the domain (PCI segment) and
+ *  `pci_dev_id()` = `(bus << 8) | (device << 3) | function`. Null when the slot isn't in lspci's
+ *  `[domain:]bus:device.function` form. Both halves matter: `location_id` alone is identical for
+ *  `0000:c6:00.0` and `0001:c6:00.0`, so a multi-segment box could match a discrete card against
+ *  an APU's node (ADR-306). */
+export function pciSlotToKfdIds(slot: string): { domain: number; locationId: number } | null {
+  const m = /^(?:([0-9a-f]{1,4}):)?([0-9a-f]{1,2}):([0-9a-f]{1,2})\.([0-7])$/i.exec(slot.trim())
+  if (!m) return null
+  return {
+    domain: m[1] === undefined ? 0 : parseInt(m[1], 16),
+    locationId: (parseInt(m[2], 16) << 8) | ((parseInt(m[3], 16) & 0x1f) << 3) | parseInt(m[4], 10),
+  }
+}
+
+/** Is this amdgpu adapter a unified-memory APU (so GTT counts toward the offload budget)?
+ *
+ *  **KFD may only ever answer YES, never NO** (ADR-306). A fused node proves an APU; the absence
+ *  of one proves nothing, because current kernels give every GPU its own node (see
+ *  {@link parseKfdNodes}). ADR-304 shipped this as `if (match) return match.apu`, which made
+ *  KFD's negative authoritative and vetoed the name heuristic — on the reporter's own Strix Halo
+ *  that turned the whole fix into a no-op. The name heuristic decides everything KFD can't, which
+ *  in practice is every APU newer than Raven. */
+function linuxAmdIsApu(pciSlot: string, label: string): boolean {
+  if (kfdReportsFusedNode(pciSlot)) return true
+  return isIntegratedGpuName(label)
+}
+
+/** True only when KFD positively identifies THIS adapter as a fused (APU) node, matched on both
+ *  PCI domain and location_id. Any other outcome — no amdkfd, no matching node, a non-fused node
+ *  — is "don't know", not "no". */
+function kfdReportsFusedNode(pciSlot: string): boolean {
+  const ids = pciSlotToKfdIds(pciSlot)
+  if (!ids) return false
+  return readKfdNodes().some((n) => n.domain === ids.domain && n.locationId === ids.locationId && n.fused)
+}
+
+function readKfdNodes(): KfdGpuNode[] {
+  const base = '/sys/class/kfd/kfd/topology/nodes'
+  try {
+    const texts: string[] = []
+    for (const entry of fs.readdirSync(base)) {
+      try {
+        texts.push(fs.readFileSync(`${base}/${entry}/properties`, 'utf8'))
+      } catch {
+        /* node disappeared between readdir and read */
+      }
+    }
+    return parseKfdNodes(texts)
+  } catch {
+    return [] // amdkfd not loaded (no ROCm-capable kernel module) — caller falls back
+  }
 }
 
 /** Android/Termux fallback for CPU model, as os.cpus() is often restricted or empty. */

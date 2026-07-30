@@ -22,6 +22,21 @@ interface CliSpec {
   // Config-file tools (opencode/kilo/openclaw) instead get this called once before spawn
   // to merge a local-gateway provider entry into the tool's own config file.
   prepareConfig?: (base: string, apiKey: string, modelKey: string, modelName: string) => Promise<PrepareResult>
+  // CLIs that accept a caller-chosen session id expose two mutually exclusive flags: one that
+  // REGISTERS a new id, one that RESUMES an existing one. Passing the wrong one is a hard,
+  // immediate failure — and the daemon genuinely cannot know which state the CLI is in, because
+  // `agent_runs.terminal_launched_once` is set optimistically the moment we build the launch
+  // command (terminal-routes.ts). A session the founder opened but never sent a message in was
+  // never persisted by the CLI, so the next launch resumes an id the CLI has never heard of.
+  // Both directions are fully recoverable by swapping the flag, so that's what we do.
+  sessionFlags?: SessionFlags
+}
+
+interface SessionFlags {
+  /** Flag that registers a caller-chosen id on a NEW conversation. */
+  register: string
+  /** Flag that resumes an EXISTING conversation by id. */
+  resume: string
 }
 
 type PrepareResult = { ok: true } | { ok: false; message: string }
@@ -29,11 +44,21 @@ type PrepareResult = { ok: true } | { ok: false; message: string }
 const AUTH_TOKEN = 'turbollm-local'
 
 const SUPPORTED: Record<string, CliSpec> = {
-  claude: { bin: 'claude', label: 'Claude Code', install: 'npm install -g @anthropic-ai/claude-code' },
+  claude: {
+    bin: 'claude',
+    label: 'Claude Code',
+    install: 'npm install -g @anthropic-ai/claude-code',
+    // Measured against the real CLI: both mismatches exit 1 during startup, before any TUI
+    // paints or any model call is made.
+    //   --session-id <existing> -> "Error: Session ID <uuid> is already in use."
+    //   --resume     <unknown>  -> "No conversation found with session ID: <uuid>"
+    sessionFlags: { register: '--session-id', resume: '--resume' },
+  },
   opencode: { bin: 'opencode', label: 'opencode', install: 'npm install -g opencode-ai', prepareConfig: prepareOpencode },
   kilo: { bin: 'kilo', label: 'Kilo Code', install: 'npm install -g @kilocode/cli', prepareConfig: prepareKilo },
   openclaw: { bin: 'openclaw', label: 'openclaw', install: 'npm install -g openclaw@latest', prepareConfig: prepareOpenclaw },
   hermes: { bin: 'hermes', label: 'Hermes Agent', install: 'npm install -g hermes-agent', prepareConfig: prepareHermes },
+  pi: { bin: 'pi', label: 'pi', install: 'npm install -g @earendil-works/pi-coding-agent', prepareConfig: preparePi },
 }
 
 interface DaemonStatus {
@@ -47,7 +72,9 @@ interface ModelEntry {
   name: string
 }
 
-// Type-safe subset of spawn's return value that launchCli actually uses.
+// Type-safe subset of spawn's return value that launchCli actually uses. Only 'on' — the child's
+// stdio handles are inherited straight from this process and never intercepted (see
+// spawnWithSessionRecovery for what happened when they were).
 type SpawnLike = (
   cmd: string,
   args: string[],
@@ -321,6 +348,53 @@ export async function prepareOpenclaw(base: string, apiKey: string, modelKey: st
   return { ok: true }
 }
 
+/** pi — the standalone `@earendil-works/pi-coding-agent` CLI (distinct from the pi SDK
+ *  TurboLLM's own Code feature embeds server-side). Custom providers are wired via two
+ *  files (schema confirmed against the package's own vendored docs, `docs/models.md` +
+ *  `docs/settings.md` — NOT yet live-verified against a real `pi` install, same caveat
+ *  ADR-158 already accepted for opencode/openclaw):
+ *   - `~/.pi/agent/models.json` — merge a `turbollm` OpenAI-compatible provider entry.
+ *   - `~/.pi/agent/settings.json` — set defaultProvider/defaultModel so `pi` starts
+ *     already selected on it, no manual `/model` picker needed.
+ *  Both go through the same tolerant-JSON merge (readConfigObject/stripJsonComments) as
+ *  opencode/kilo — never touch a config with comments or one that isn't already ours. */
+export async function preparePi(base: string, apiKey: string, modelKey: string, modelName: string, fs: ConfigFs = realFs): Promise<PrepareResult> {
+  const modelsPath = join(fs.home, '.pi', 'agent', 'models.json')
+  const modelsRead = await readConfigObject(fs, modelsPath)
+  if ('corrupt' in modelsRead) return corruptConfigError(modelsPath, 'pi')
+  const modelsCfg = modelsRead.obj
+  const providers = asObject(modelsCfg.providers)
+  if (!providers) return corruptConfigError(modelsPath, 'pi')
+  if (modelsRead.lenient) {
+    if (!providerAlreadyPointsHere(providers.turbollm, base)) return commentedConfigError(modelsPath, 'pi')
+  } else {
+    providers.turbollm = {
+      baseUrl: `${base}/v1`,
+      api: 'openai-completions',
+      apiKey,
+      models: [{ id: modelKey, name: modelName }],
+    }
+    modelsCfg.providers = providers
+    await fs.mkdir(dirname(modelsPath))
+    await fs.writeFile(modelsPath, JSON.stringify(modelsCfg, null, 2) + '\n')
+  }
+
+  const settingsPath = join(fs.home, '.pi', 'agent', 'settings.json')
+  const settingsRead = await readConfigObject(fs, settingsPath)
+  if ('corrupt' in settingsRead) return corruptConfigError(settingsPath, 'pi')
+  const settingsCfg = settingsRead.obj
+  if (settingsRead.lenient) {
+    return (settingsCfg.defaultProvider === 'turbollm' && settingsCfg.defaultModel === modelKey)
+      ? { ok: true }
+      : commentedConfigError(settingsPath, 'pi')
+  }
+  settingsCfg.defaultProvider = 'turbollm'
+  settingsCfg.defaultModel = modelKey
+  await fs.mkdir(dirname(settingsPath))
+  await fs.writeFile(settingsPath, JSON.stringify(settingsCfg, null, 2) + '\n')
+  return { ok: true }
+}
+
 /** Runs a CLI command to completion, resolving true on exit code 0. Deliberately spawned
  *  WITHOUT a shell: hermes (the only current caller) is a real, directly-executable binary
  *  on every platform (confirmed: a native .exe on Windows, not an npm-style .cmd shim), and
@@ -408,7 +482,12 @@ async function loadAndWait(
  *  `modelKey` — when provided, resolve + load that model before launching.
  *  `_spawn` is an optional injection point used by unit tests to capture the env
  *  passed to the child process without actually launching Claude Code.
- *  `_fetch` is an optional injection point used by unit tests to stub HTTP calls. */
+ *  `_fetch` is an optional injection point used by unit tests to stub HTTP calls.
+ *  `authToken` — when provided (embedded terminal launches, `--token`, cli.ts), used instead
+ *  of the shared static AUTH_TOKEN for the `claude` target's ANTHROPIC_AUTH_TOKEN, so the
+ *  gateway can tell this session's requests apart from any other concurrent terminal-agent
+ *  session (session-auth.ts). A manually-run `turbollm launch claude` omits it and keeps
+ *  today's shared-token behavior. */
 export async function launchCli(
   target: string,
   port: number,
@@ -416,6 +495,7 @@ export async function launchCli(
   _spawn: SpawnLike = spawn,
   modelKey?: string,
   _fetch: typeof fetch = fetch,
+  authToken?: string,
 ): Promise<number> {
   const spec = SUPPORTED[target]
   if (!target || !spec) {
@@ -524,19 +604,20 @@ export async function launchCli(
       process.stderr.write(prep.message + '\n')
       return 1
     }
-    const child = _spawn(spec.bin, passthrough, {
+    return await spawnWithSessionRecovery(spec, passthrough, {
       stdio: 'inherit',
       shell: process.platform === 'win32',
       env: process.env,
-    })
-    return await waitForChild(child, spec)
+    }, _spawn)
   }
 
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     ANTHROPIC_BASE_URL: base,
-    // No auth is enforced on the local gateway; the CLI just needs a non-empty token.
-    ANTHROPIC_AUTH_TOKEN: AUTH_TOKEN,
+    // No auth is enforced on the local gateway; the CLI just needs a non-empty token. A
+    // session-scoped token (embedded terminal launches) takes priority over the shared static
+    // one so the gateway can attribute this session's requests correctly (session-auth.ts).
+    ANTHROPIC_AUTH_TOKEN: authToken ?? AUTH_TOKEN,
     // Local LLMs are 30–120 s per response — raise Claude Code's request timeout so it
     // doesn't abort mid-generation. 300 s (5 min) covers even the slowest local model.
     // Zero retries: retrying a slow local model cold-starts it again and makes things worse.
@@ -554,19 +635,83 @@ export async function launchCli(
     CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: '1',
   }
 
-  const child = _spawn(spec.bin, passthrough, {
+  return await spawnWithSessionRecovery(spec, passthrough, {
     stdio: 'inherit',
     // On Windows the CLI is usually a `.cmd`/`.ps1` shim; a shell resolves it via PATHEXT.
     shell: process.platform === 'win32',
     env,
-  })
+  }, _spawn)
+}
 
-  return await waitForChild(child, spec)
+/** Swap a session flag for its complement, keeping the id argument in place — e.g.
+ *  `--resume <id>` ⇄ `--session-id <id>`. Returns null when args carry neither flag, which is
+ *  the normal case for a hand-run `turbollm launch claude`. */
+export function swapSessionFlag(args: string[], flags: SessionFlags): string[] | null {
+  const i = args.findIndex((a) => a === flags.resume || a === flags.register)
+  if (i === -1) return null
+  const out = [...args]
+  out[i] = out[i] === flags.resume ? flags.register : flags.resume
+  return out
+}
+
+/** How quickly a launch must die for us to treat it as a session-flag mismatch. Both mismatches
+ *  fail during CLI startup (~4 s, measured) before any TUI paints or any model call is made, so
+ *  this is generous by an order of magnitude while staying far below any session a user actually
+ *  worked in. */
+const SESSION_MISMATCH_WINDOW_MS = 30_000
+
+/** Spawn the CLI; if it dies during startup because the session flag didn't match the CLI's
+ *  actual state, swap the flag and try once. See CliSpec.sessionFlags for why the daemon can't
+ *  just pick the right flag up front.
+ *
+ *  Deliberately decided on exit code + how fast it died, NOT by reading the CLI's stderr. Piping
+ *  stderr to match the CLI's own error text is more precise, and was the first implementation —
+ *  but inside a ConPTY (which is how every Code-session terminal runs it, pty-session.ts) that
+ *  pipe plus the immediately-following respawn aborts the process natively:
+ *  `Assertion failed: !(handle->flags & UV_HANDLE_CLOSING), file src\win\async.c` — killing the
+ *  retry outright. Nothing may come between the CLI and the real terminal handles.
+ *
+ *  The trade-off: a DIFFERENT startup failure (bad config, missing auth) now also gets retried
+ *  once with the other flag, so its error prints twice before surfacing. Accepted — the second
+ *  attempt still exits with the real code and shows the real message, and a duplicated error
+ *  beats a permanently stranded session. A signal (Ctrl-C) never retries. */
+async function spawnWithSessionRecovery(
+  spec: CliSpec,
+  args: string[],
+  opts: Parameters<typeof spawn>[2],
+  _spawn: SpawnLike,
+): Promise<number> {
+  const flags = spec.sessionFlags
+  const retryArgs = flags ? swapSessionFlag(args, flags) : null
+  if (!flags || !retryArgs) return await waitForChild(_spawn(spec.bin, args, opts), spec)
+
+  const startedAt = Date.now()
+  const first = await waitForChildExit(_spawn(spec.bin, args, opts), spec)
+  const diedDuringStartup = Date.now() - startedAt < SESSION_MISMATCH_WINDOW_MS
+  if (first.code === 0 || first.signal || !diedDuringStartup) return first.code
+
+  // Say which way we're recovering — "starting a fresh one" would be a lie when the id turned
+  // out to already exist and we're switching to resuming it.
+  process.stdout.write(
+    retryArgs.includes(flags.register)
+      ? `▸ That ${spec.label} session is gone — starting a fresh one.\n`
+      : `▸ That ${spec.label} session already exists — resuming it.\n`,
+  )
+  return await waitForChild(_spawn(spec.bin, retryArgs, opts), spec)
 }
 
 /** Resolve the child's exit code, reporting a friendly install hint on ENOENT. */
-function waitForChild(child: Pick<ReturnType<typeof spawn>, 'on'>, spec: CliSpec): Promise<number> {
-  return new Promise<number>((resolve) => {
+async function waitForChild(child: Pick<ReturnType<typeof spawn>, 'on'>, spec: CliSpec): Promise<number> {
+  return (await waitForChildExit(child, spec)).code
+}
+
+/** As waitForChild, but also reports the terminating signal — session recovery must never treat
+ *  a Ctrl-C as a failed launch worth retrying. */
+function waitForChildExit(
+  child: Pick<ReturnType<typeof spawn>, 'on'>,
+  spec: CliSpec,
+): Promise<{ code: number; signal: string | null }> {
+  return new Promise((resolve) => {
     child.on('error', (e: NodeJS.ErrnoException) => {
       if (e.code === 'ENOENT') {
         process.stderr.write(
@@ -575,8 +720,8 @@ function waitForChild(child: Pick<ReturnType<typeof spawn>, 'on'>, spec: CliSpec
       } else {
         process.stderr.write(`Failed to launch ${spec.label}: ${e.message}\n`)
       }
-      resolve(127)
+      resolve({ code: 127, signal: null })
     })
-    child.on('exit', (code, signal) => resolve(code ?? (signal ? 1 : 0)))
+    child.on('exit', (code, signal) => resolve({ code: code ?? (signal ? 1 : 0), signal: signal ?? null }))
   })
 }

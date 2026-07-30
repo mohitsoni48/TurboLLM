@@ -16,6 +16,7 @@ const RUNNING_SESSION: CodeSession = {
   del: 3,
   createdAt: new Date().toISOString(),
   repoRoot: '/repo/turbollm',
+  codeAgent: 'turbollm',
   running: true,
 }
 
@@ -30,6 +31,7 @@ const IDLE_SESSION: CodeSession = {
   del: 1,
   createdAt: new Date().toISOString(),
   repoRoot: '/repo/turbollm',
+  codeAgent: 'turbollm',
   running: false,
 }
 

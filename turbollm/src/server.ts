@@ -12,6 +12,7 @@ import { registerCodeRoutes } from './code/code-routes'
 import type { Deps } from './deps'
 import { registerGateway } from './gateway/gateway'
 import { featureForPath } from './telemetry/feature-map'
+import { registerTerminalRoutes } from './terminal/terminal-routes'
 import { lanAuth, codeAuth } from './auth'
 
 // Reuse TCP connections for all engine and HF fetch calls. Without this, Node
@@ -82,6 +83,7 @@ export function createApp(d: Deps): Hono {
   registerChatAgentRoutes(app, d)
   registerAgentRoutes(app, d)
   registerCodeRoutes(app, d)
+  registerTerminalRoutes(app, d)
   registerGateway(app, d)
 
   // Embedded SPA with client-side-routing fallback (spec 08 §1).

@@ -6,7 +6,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { join } from 'node:path'
-import { prepareOpencode, prepareKilo, prepareOpenclaw, prepareHermes, realRunCommand, type ConfigFs, type RunCommand } from './cli-launch.js'
+import { prepareOpencode, prepareKilo, prepareOpenclaw, prepareHermes, preparePi, realRunCommand, type ConfigFs, type RunCommand } from './cli-launch.js'
 
 const HOME = '/home/tester'
 // Config paths are built with path.join, so they use the host's separator (backslash on
@@ -14,6 +14,8 @@ const HOME = '/home/tester'
 const opencodePath = join(HOME, '.config', 'opencode', 'opencode.json')
 const kiloPath = join(HOME, '.config', 'kilo', 'kilo.jsonc')
 const openclawPath = join(HOME, '.config', 'openclaw', 'openclaw.json')
+const piModelsPath = join(HOME, '.pi', 'agent', 'models.json')
+const piSettingsPath = join(HOME, '.pi', 'agent', 'settings.json')
 
 /** In-memory ConfigFs seeded with any pre-existing files. Records writes + mkdirs. */
 function memFs(seed: Record<string, string> = {}): ConfigFs & { files: Map<string, string>; mkdirs: string[] } {
@@ -177,6 +179,73 @@ test('prepareOpenclaw: refuses (not throws) when models/agents is not an object'
   const res = await prepareOpenclaw(BASE, TOKEN, 'k', 'M', fs)
   assert.equal(res.ok, false)
   assert.equal(fs.files.get(openclawPath), original, 'the unusual file must be left exactly as-is')
+})
+
+// ── pi (schema confirmed from its vendored docs, not yet live-verified — ADR-158 precedent) ──
+
+test('preparePi: writes a turbollm provider in models.json + defaultProvider/defaultModel in settings.json', async () => {
+  const fs = memFs()
+  const res = await preparePi(BASE, TOKEN, 'qwen3-8b', 'Qwen3 8B', fs)
+  assert.deepEqual(res, { ok: true })
+
+  const models = JSON.parse(fs.files.get(piModelsPath)!)
+  assert.deepEqual(models.providers.turbollm, {
+    baseUrl: `${BASE}/v1`,
+    api: 'openai-completions',
+    apiKey: TOKEN,
+    models: [{ id: 'qwen3-8b', name: 'Qwen3 8B' }],
+  })
+
+  const settings = JSON.parse(fs.files.get(piSettingsPath)!)
+  assert.equal(settings.defaultProvider, 'turbollm')
+  assert.equal(settings.defaultModel, 'qwen3-8b')
+})
+
+test('preparePi: preserves sibling providers and existing settings keys', async () => {
+  const fs = memFs({
+    [piModelsPath]: JSON.stringify({ providers: { ollama: { baseUrl: 'http://localhost:11434/v1' } } }),
+    [piSettingsPath]: JSON.stringify({ theme: 'dark' }),
+  })
+  const res = await preparePi(BASE, TOKEN, 'k', 'M', fs)
+  assert.deepEqual(res, { ok: true })
+
+  const models = JSON.parse(fs.files.get(piModelsPath)!)
+  assert.ok(models.providers.ollama, 'sibling provider preserved')
+  assert.ok(models.providers.turbollm, 'turbollm provider added')
+
+  const settings = JSON.parse(fs.files.get(piSettingsPath)!)
+  assert.equal(settings.theme, 'dark', 'unrelated existing setting untouched')
+  assert.equal(settings.defaultProvider, 'turbollm')
+})
+
+test('preparePi: refuses to overwrite an unparseable models.json or settings.json', async () => {
+  const badModels = memFs({ [piModelsPath]: 'not json {' })
+  const res1 = await preparePi(BASE, TOKEN, 'k', 'M', badModels)
+  assert.equal(res1.ok, false)
+  assert.equal(badModels.files.get(piModelsPath), 'not json {')
+
+  const badSettings = memFs({ [piSettingsPath]: 'not json {' })
+  const res2 = await preparePi(BASE, TOKEN, 'k', 'M', badSettings)
+  assert.equal(res2.ok, false)
+})
+
+test('preparePi: a commented models.json already pointed at us succeeds without rewriting; settings.json still gets written', async () => {
+  const original =
+    '{\n  // hand-written\n  "providers": { "turbollm": { "baseUrl": "' + BASE + '/v1" } }\n}'
+  const fs = memFs({ [piModelsPath]: original })
+  const res = await preparePi(BASE, TOKEN, 'k', 'M', fs)
+  assert.deepEqual(res, { ok: true })
+  assert.equal(fs.files.get(piModelsPath), original, 'already-correct commented file must be left byte-for-byte untouched')
+  const settings = JSON.parse(fs.files.get(piSettingsPath)!)
+  assert.equal(settings.defaultProvider, 'turbollm')
+})
+
+test('preparePi: a commented models.json NOT yet pointed at us fails without touching it', async () => {
+  const original = '{\n  // hand-written, no turbollm entry yet\n  "providers": { "ollama": {} }\n}'
+  const fs = memFs({ [piModelsPath]: original })
+  const res = await preparePi(BASE, TOKEN, 'k', 'M', fs)
+  assert.equal(res.ok, false)
+  assert.equal(fs.files.get(piModelsPath), original, 'must not rewrite a commented file even on failure')
 })
 
 // ── hermes (config driven via its own `config set`, verified against a live install) ──

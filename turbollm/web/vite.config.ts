@@ -8,7 +8,13 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
     proxy: {
-      '/api': 'http://127.0.0.1:6996',
+      // ws: true — without it, Vite's dev-server proxy only forwards plain HTTP requests
+      // under /api; a WebSocket upgrade (the embedded terminal's /api/v1/code/terminal/ws,
+      // terminal-routes.ts) never reaches the daemon at all when viewing the app through
+      // `npm run dev` (port 5173) instead of the built daemon UI on :6996 — the browser sees
+      // the connection close with no status (code 1005), even though the daemon's own WS
+      // handling is completely healthy.
+      '/api': { target: 'http://127.0.0.1:6996', ws: true },
       '/healthz': 'http://127.0.0.1:6996',
       '/v1': 'http://127.0.0.1:6996',
     },

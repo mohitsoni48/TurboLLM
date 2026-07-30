@@ -14,7 +14,8 @@ import { ThinkingBudgetSlider } from '../../components/ThinkingBudgetSlider'
 import { toast } from '../../components/ui/sonner'
 import { browseFs } from '../../lib/api'
 import type { ModelEntry } from '../../lib/types'
-import { cn, folderName } from '../../lib/utils'
+import { cn } from '../../lib/utils'
+import { CodeStatsFooter } from './CodeStatsFooter'
 import { ContextUsageRing } from './ContextUsageRing'
 import { AGENT_MODES, type AgentMode, type AgentModeId } from './code-mock'
 
@@ -101,24 +102,6 @@ function relativeToRoot(root: string, target: string): string {
   const r = norm(root)
   const t = norm(target)
   return t.startsWith(`${r}/`) ? t.slice(r.length + 1) : t
-}
-
-// ── Stats footer (ADR-262) ────────────────────────────────────────────────────
-//
-// Local, tiny formatters — deliberately NOT imported from ContextUsageRing.tsx's fmtTokens or
-// ThinkingBudgetSlider.tsx's formatBudget, since neither is exported and this task is scoped to
-// CodeComposer.tsx only (no edits to either sibling component). Same simple k/M convention as
-// ContextUsageRing's own fmtTokens for consistency across the app.
-function fmtCompactTokens(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`
-  return String(n)
-}
-
-function thinkingCompactLabel(budget: number): string {
-  if (budget < 0) return 'Think: Unlimited'
-  if (budget === 0) return 'Think: Off'
-  return `Think: ${fmtCompactTokens(budget)}`
 }
 
 // ── Image/screenshot paste (ADR-259) ─────────────────────────────────────────
@@ -918,41 +901,28 @@ export function CodeComposer({
           `flex-wrap` instead of the toolbar's own `overflow-x-auto` (flagged in the original audit
           as a narrow-phone workaround, not a pattern worth repeating): on a narrow viewport this
           wraps to a second line rather than clipping or requiring horizontal scroll.
-          `font-mono tabular-nums` on the stats segment specifically — genuinely data/stats
-          content, the same carve-out the context stat already established (ADR-252/262). */}
-      <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-0.5 px-1 text-[11px] text-faint">
-        <span className="inline-flex shrink-0 items-center gap-2 font-mono tabular-nums">
-          <span title={thinkingCompactLabel(thinkingBudget)}>{thinkingCompactLabel(thinkingBudget)}</span>
-          {ctxMax > 0 && (
-            <span title={`Context: ${ctxUsed.toLocaleString()} / ${ctxMax.toLocaleString()} tokens`}>
-              {Math.round(Math.min(1, ctxUsed / ctxMax) * 100)}%/{fmtCompactTokens(ctxMax)}
-            </span>
-          )}
-          {lastPromptTokens !== undefined && lastGenTokens !== undefined && (
-            <span title={`Last turn: ${lastPromptTokens.toLocaleString()} prompt` +
-              (lastPromptTps !== undefined ? ` (${lastPromptTps.toFixed(0)} tok/s prefill)` : '') +
-              `, ${lastGenTokens.toLocaleString()} generated` +
-              (lastGenTps !== undefined ? ` (${lastGenTps.toFixed(1)} tok/s)` : '')}>
-              &uarr;{fmtCompactTokens(lastPromptTokens)} &darr;{fmtCompactTokens(lastGenTokens)}
-              {lastGenTps !== undefined && ` · ${lastGenTps.toFixed(1)} t/s`}
-            </span>
-          )}
-        </span>
-        {!repo && (repoBranch || effectiveRepoRoot) && (
-          <span className="inline-flex min-w-0 shrink-0 items-center gap-1 truncate">
-            {repoBranch && <span className="truncate">{repoBranch}</span>}
-            {effectiveRepoRoot && <span className="truncate text-faint">{repoBranch ? ' · ' : ''}{folderName(effectiveRepoRoot)}</span>}
-          </span>
-        )}
-        <span className="ml-auto min-w-0 truncate">
-          {[
-            !textareaDisabled ? hintText : null,
-            !live && slashCommands.length > 0 ? '/ for commands' : null,
-            !live && effectiveRepoRoot ? '@ to mention a file' : null,
-            live ? 'Esc to stop' : null,
-          ].filter(Boolean).join(' · ')}
-        </span>
-      </div>
+          The strip itself now lives in CodeStatsFooter.tsx — the SAME component TerminalToolbar
+          renders, so a terminal-agent session's footer is literally this footer rather than a
+          hand-copied lookalike that has to be fixed twice (see that file's header for the
+          2026-07-29 legibility pass). Everything above about WHICH stats belong here is unchanged
+          by that move. */}
+      <CodeStatsFooter
+        thinkingBudget={thinkingBudget}
+        ctxUsed={ctxUsed}
+        ctxMax={ctxMax}
+        lastPromptTokens={lastPromptTokens}
+        lastGenTokens={lastGenTokens}
+        lastPromptTps={lastPromptTps}
+        lastGenTps={lastGenTps}
+        branch={!repo ? repoBranch : undefined}
+        cwd={!repo ? effectiveRepoRoot : undefined}
+        hint={[
+          !textareaDisabled ? hintText : null,
+          !live && slashCommands.length > 0 ? '/ for commands' : null,
+          !live && effectiveRepoRoot ? '@ to mention a file' : null,
+          live ? 'Esc to stop' : null,
+        ].filter(Boolean).join(' · ')}
+      />
     </div>
   )
 }
