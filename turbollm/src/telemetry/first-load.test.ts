@@ -29,7 +29,7 @@ test('reportModelLoad: a successful first load is reported once', () => {
   const dir = tempDir()
   try {
     const e = makeEmitter(dir)
-    reportModelLoad(dir, e, true, null)
+    reportModelLoad(dir, e, 'ok')
     const events = queued(dir)
 
     assert.equal(events.length, 1)
@@ -44,9 +44,9 @@ test('reportModelLoad: only the FIRST load is reported, not every subsequent one
   const dir = tempDir()
   try {
     const e = makeEmitter(dir)
-    reportModelLoad(dir, e, true, null)
-    reportModelLoad(dir, e, true, null)
-    reportModelLoad(dir, e, false, { code: 'readiness_timeout' })
+    reportModelLoad(dir, e, 'ok')
+    reportModelLoad(dir, e, 'ok')
+    reportModelLoad(dir, e, 'fail', 'timeout')
 
     assert.equal(queued(dir).length, 1, 'model_first_load means first, not every')
   } finally {
@@ -54,22 +54,17 @@ test('reportModelLoad: only the FIRST load is reported, not every subsequent one
   }
 })
 
-test('reportModelLoad: a failure carries an enum reason, never the raw error', () => {
+test('reportModelLoad: a failure carries the caller-classified enum reason', () => {
+  // Classification itself moved to the CALLER (Manager uses classifyLoadFailure
+  // on a raw error; bench.ts's auto-tune sweep uses a different classifier over
+  // aggregate candidate outcomes) — reportModelLoad only emits what it is given.
   const dir = tempDir()
   try {
     const e = makeEmitter(dir)
-    reportModelLoad(dir, e, false, {
-      code: 'model_load_failed',
-      message: 'CUDA error: out of memory loading D:/models/private/secret.gguf',
-      logTail: ['/home/mo/.ssh/id_rsa'],
-    })
+    reportModelLoad(dir, e, 'fail', 'oom')
 
     const [event] = queued(dir)
     assert.deepEqual(event.payload, { outcome: 'fail', failReason: 'oom' })
-    // The path and the key filename must not survive anywhere in the payload.
-    const serialised = JSON.stringify(event)
-    assert.doesNotMatch(serialised, /secret\.gguf/)
-    assert.doesNotMatch(serialised, /id_rsa/)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -82,9 +77,38 @@ test('reportModelLoad: a first FAILURE still counts as the first load', () => {
   const dir = tempDir()
   try {
     const e = makeEmitter(dir)
-    reportModelLoad(dir, e, false, { code: 'readiness_timeout' })
+    reportModelLoad(dir, e, 'fail', 'timeout')
     const [event] = queued(dir)
     assert.deepEqual(event.payload, { outcome: 'fail', failReason: 'timeout' })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('reportModelLoad: a cancelled first attempt is reported as cancelled, not fail', () => {
+  // A user who backs out of a sweep before any candidate committed is not the
+  // same signal as one whose load broke — conflating them (as the previous
+  // ok:boolean signature structurally forced) would misread a deliberate
+  // abandonment as a product defect, the same reasoning already applied to
+  // download outcomes.
+  const dir = tempDir()
+  try {
+    const e = makeEmitter(dir)
+    reportModelLoad(dir, e, 'cancelled')
+    const [event] = queued(dir)
+    assert.deepEqual(event.payload, { outcome: 'cancelled' })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('reportModelLoad: a cancelled attempt still claims the once-key', () => {
+  const dir = tempDir()
+  try {
+    const e = makeEmitter(dir)
+    reportModelLoad(dir, e, 'cancelled')
+    reportModelLoad(dir, e, 'ok')
+    assert.equal(queued(dir).length, 1, 'the cancelled attempt was still the first one')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -93,12 +117,12 @@ test('reportModelLoad: a first FAILURE still counts as the first load', () => {
 test('reportModelLoad: consent off means nothing is queued and the claim is not spent', () => {
   const dir = tempDir()
   try {
-    reportModelLoad(dir, makeEmitter(dir, 'off'), true, null)
+    reportModelLoad(dir, makeEmitter(dir, 'off'), 'ok')
     assert.equal(queued(dir).length, 0)
 
     // Turning telemetry on later must still capture the next first load —
     // otherwise opting in after setup would permanently lose this event.
-    reportModelLoad(dir, makeEmitter(dir, 'anon'), true, null)
+    reportModelLoad(dir, makeEmitter(dir, 'anon'), 'ok')
     assert.equal(queued(dir).length, 1)
   } finally {
     rmSync(dir, { recursive: true, force: true })
@@ -106,5 +130,5 @@ test('reportModelLoad: consent off means nothing is queued and the claim is not 
 })
 
 test('reportModelLoad: never throws', () => {
-  assert.doesNotThrow(() => reportModelLoad('\0bad', makeEmitter(tempDir()), true, null))
+  assert.doesNotThrow(() => reportModelLoad('\0bad', makeEmitter(tempDir()), 'ok'))
 })

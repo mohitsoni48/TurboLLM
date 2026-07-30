@@ -59,3 +59,32 @@ export function classifyLoadFailure(err: LoadError | null | undefined): string {
 
   return 'other'
 }
+
+/** One internal auto-tune search probe's outcome (a subset of
+ *  `BenchCandidate['outcome']` — only the fields this classifier needs, so
+ *  bench.ts's real candidate objects satisfy this structurally). */
+export interface BenchProbeOutcome {
+  outcome: 'ok' | 'timeout' | 'crash' | 'oom'
+}
+
+/**
+ * Classify why an auto-tune sweep ended without a usable profile.
+ *
+ * Distinct from {@link classifyLoadFailure} because bench.ts's failure signal
+ * is not one error — it is the AGGREGATE of several internal search probes
+ * (VRAM probe, t/s trial, card-sampling), each of which is individually
+ * *expected* to fail sometimes as part of normal binary search. There is no
+ * single raw error to run through the text-sniffing classifier above; there is
+ * only "here is what every attempted candidate did."
+ *
+ * OOM wins if present at all, matching the same precedence philosophy as
+ * `classifyLoadFailure`: it is the most actionable explanation, and a sweep
+ * that hit OOM on some candidates before running out of options is honestly
+ * described as memory-bound even if a couple of attempts merely timed out or
+ * crashed along the way.
+ */
+export function classifyBenchFailure(results: readonly BenchProbeOutcome[]): string {
+  if (results.some((r) => r.outcome === 'oom')) return 'oom'
+  if (results.some((r) => r.outcome === 'timeout')) return 'timeout'
+  return 'other'
+}

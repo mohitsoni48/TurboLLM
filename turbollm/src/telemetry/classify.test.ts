@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { classifyLoadFailure } from './classify'
+import { classifyLoadFailure, classifyBenchFailure } from './classify'
 import { FAIL_REASONS } from './schema'
 
 function err(over: Partial<{ code: string; message: string; logTail: string[] }> = {}) {
@@ -74,4 +74,31 @@ test('classifyLoadFailure: anything unrecognised is other, not a guess', () => {
 
 test('classifyLoadFailure: a null error still classifies', () => {
   assert.equal(classifyLoadFailure(null), 'other')
+})
+
+test('classifyBenchFailure: OOM wins when present, even alongside other outcomes', () => {
+  // Auto-tune's binary search is EXPECTED to hit OOM on some candidates before
+  // finding one that fits — OOM among the attempts is the dominant, actionable
+  // explanation for why the sweep as a whole failed, same precedence
+  // classifyLoadFailure already uses for a single raw error.
+  assert.equal(classifyBenchFailure([{ outcome: 'oom' }, { outcome: 'crash' }, { outcome: 'timeout' }]), 'oom')
+  assert.equal(classifyBenchFailure([{ outcome: 'oom' }]), 'oom')
+})
+
+test('classifyBenchFailure: timeout when present and no OOM', () => {
+  assert.equal(classifyBenchFailure([{ outcome: 'crash' }, { outcome: 'timeout' }]), 'timeout')
+})
+
+test('classifyBenchFailure: a crash-only sweep is other, not a guess', () => {
+  assert.equal(classifyBenchFailure([{ outcome: 'crash' }]), 'other')
+})
+
+test('classifyBenchFailure: no candidates at all is other', () => {
+  assert.equal(classifyBenchFailure([]), 'other')
+})
+
+test('classifyBenchFailure: always returns a value from the enum', () => {
+  for (const outcomes of [[{ outcome: 'oom' as const }], [{ outcome: 'crash' as const }], []]) {
+    assert.ok((FAIL_REASONS as readonly string[]).includes(classifyBenchFailure(outcomes)))
+  }
 })

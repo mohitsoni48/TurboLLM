@@ -39,6 +39,7 @@ import type { Deps } from './deps'
 import { TELEMETRY_ENV } from './telemetry/disabled'
 import { Emitter } from './telemetry/emit'
 import { reportModelLoad } from './telemetry/first-load'
+import { classifyLoadFailure } from './telemetry/classify'
 import { flush } from './telemetry/uploader'
 
 // Stop child processes (the agent engine's shell tool, engine binaries, git,
@@ -301,7 +302,15 @@ telemetry.dailyActive()
 // signal separating "never tried" from "tried and it broke". Observed at
 // Manager's atomic swap point rather than at the two routes.ts call sites,
 // which fire load() without awaiting and so cannot see the outcome.
-manager.onLoadSettled = (ok, err) => reportModelLoad(store.dir(), telemetry, ok, err)
+manager.onLoadSettled = (ok, err) =>
+  reportModelLoad(store.dir(), telemetry, ok ? 'ok' : 'fail', ok ? undefined : classifyLoadFailure(err))
+// Auto-tune's sweep is a SEPARATE path to a first load (Manager.start(), not
+// .load()) — a user whose first real model interaction is "let auto-tune find
+// the best settings" would otherwise never trigger model_first_load at all.
+// bench.ts reports its own outcome once the sweep concludes, since its internal
+// search probes are individually expected to fail sometimes and must not be
+// hooked the same way as a real load without corrupting the signal.
+bench.telemetry = telemetry
 // onboarding_step (ADR-299): where setup breaks. All three setup steps report
 // both outcomes; downloads additionally distinguish 'cancelled', because a user
 // who abandons a download deliberately is not the same signal as one whose
