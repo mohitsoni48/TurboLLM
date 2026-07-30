@@ -28,12 +28,47 @@ binding = "DB"
 database_name = "turbollm-telemetry"
 database_id = "afeb3b94-b6ff-4d6f-9933-0d191bbbc633"
 
-# Rate-limit counters only. Keys are machine ids and TRUNCATED HASHES of IPs
-# with a 1-hour TTL — the IP itself is never stored, here or in D1.
-#   wrangler kv namespace create RL
-[[kv_namespaces]]
-binding = "RL"
-id = "a7b65fd92d9a43d38dd30b5604af944d"
+# Rate limiting — Cloudflare's OWN documented guidance ruled out the first two
+# things tried here. KV: "not the correct product for rate-limiting" (KV is
+# eventually consistent; each key can only be written ~once/second) — a
+# hand-rolled KV get-then-put counter was unreliable under a real burst. Then
+# the native Rate Limiting binding, which Cloudflare's docs describe as
+# "permissive, eventually consistent, and intentionally designed to not be
+# used as an accurate accounting system": verified against the live deployed
+# Worker, 65 rapid requests to the same key (sequential, then fully
+# concurrent) were ALL accepted against a configured 20/60s limit, because it
+# caches counts per-isolate and syncs them asynchronously in the background —
+# a burst that lands on several isolates lets each one count from zero.
+#
+# A Durable Object is a single source of truth: `idFromName(key)` always
+# routes to the same object instance, and a Durable Object serializes every
+# request to itself, so the fixed-window counter in rate-limiter-do.ts cannot
+# race the way the native binding did. The cost is scale (~1000 req/s per
+# object) and an extra storage hop, both fine here — no single machineId or
+# IP should ever see traffic near that volume; the goal is "a flood stays
+# noisy, not expensive," not defending a payments API under active attack.
+#
+# One binding, not two: the DO is addressed by key (`idFromName`), so
+# `ip:<hash>` and `machine:<id>` keys are already namespaced apart within it —
+# a second binding would only duplicate that, not add safety.
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "RateLimiterDO"
+
+# `new_sqlite_classes`, not `new_classes`: the free Workers plan only allows
+# SQLite-backed Durable Object storage. The `state.storage.get/put` API used
+# in rate-limiter-do.ts is identical either way — this is a config-only fix.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RateLimiterDO"]
+
+# The old KV namespace (binding "RL", id a7b65fd9...) is no longer referenced
+# anywhere in this Worker. Left un-deleted deliberately — deleting a Cloudflare
+# resource is a one-way action outside this change's scope; it can be removed
+# by hand later (`wrangler kv namespace delete --namespace-id a7b65fd9...`)
+# once confirmed nothing else depends on it. Same for the native Rate Limiting
+# binding config removed above — it needed no separate resource, so removing
+# these lines was enough.
 
 [observability]
 enabled = true

@@ -13,35 +13,47 @@
  */
 
 import { handleIngest, type IngestDeps } from '../../turbollm/src/telemetry/ingest'
+import { RateLimiterDO } from './rate-limiter-do'
+
+export { RateLimiterDO }
+
+/** Structural Durable Object types. No `@cloudflare/workers-types` dependency
+ *  exists in this bare, package.json-less Worker (wrangler bundles it with
+ *  esbuild and does not typecheck), so these are plain structural types
+ *  rather than imported ones — accurate to the documented API either way. */
+interface DurableObjectId {}
+interface DurableObjectStub {
+  fetch(url: string): Promise<Response>
+}
+interface DurableObjectNamespace {
+  idFromName(name: string): DurableObjectId
+  get(id: DurableObjectId): DurableObjectStub
+}
 
 interface Env {
   DB: D1Database
-  RL: KVNamespace
+  RATE_LIMITER: DurableObjectNamespace
   POSTHOG_KEY?: string
   POSTHOG_HOST?: string
 }
 
-/** Events per hour, per machine and per IP-hash. Generous enough that a real
- *  install never notices; tight enough that a script is not free. */
-const PER_MACHINE_HOURLY = 120
-const PER_IP_HOURLY = 600
+const MACHINE_LIMIT = 20
+const IP_LIMIT = 100
+const PERIOD_SECONDS = 60
+
+async function checkLimit(ns: DurableObjectNamespace, key: string, limit: number): Promise<boolean> {
+  const stub = ns.get(ns.idFromName(key))
+  const res = await stub.fetch(`https://rate-limiter/?limit=${limit}&period=${PERIOD_SECONDS}`)
+  const { success } = (await res.json()) as { success: boolean }
+  return success
+}
 
 /** Hash the IP so the rate-limit key cannot be reversed into an address. The IP
- *  itself is never written anywhere — this is the only thing derived from it,
- *  and it lives in KV with a 1-hour TTL. */
+ *  itself is never written anywhere — this is the only thing derived from it. */
 async function ipKey(req: Request): Promise<string> {
   const ip = req.headers.get('cf-connecting-ip') ?? 'unknown'
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(ip))
   return [...new Uint8Array(digest)].slice(0, 8).map((b) => b.toString(16).padStart(2, '0')).join('')
-}
-
-/** Fixed-window counter in KV. Approximate by design: a window boundary is
- *  cheaper to accept than the coordination a precise limiter would need. */
-async function bump(kv: KVNamespace, key: string, limit: number): Promise<boolean> {
-  const current = Number((await kv.get(key)) ?? '0')
-  if (current >= limit) return false
-  await kv.put(key, String(current + 1), { expirationTtl: 3600 })
-  return true
 }
 
 function makeDeps(env: Env): IngestDeps {
@@ -49,15 +61,16 @@ function makeDeps(env: Env): IngestDeps {
     now: () => Date.now(),
 
     rateLimit: async (req, events) => {
-      const hour = Math.floor(Date.now() / 3_600_000)
-      if (!(await bump(env.RL, `ip:${await ipKey(req)}:${hour}`, PER_IP_HOURLY))) return false
+      const ipOk = await checkLimit(env.RATE_LIMITER, `ip:${await ipKey(req)}`, IP_LIMIT)
+      if (!ipOk) return false
 
       // consent_choice carries no machineId by design, so it is rate-limited by
       // IP alone. That is a known, accepted weakness (ADR-299 Decision 5): the
       // opt-out count it produces is directional, not exact.
       const ids = new Set(events.map((e) => e.machineId).filter((v): v is string => typeof v === 'string'))
       for (const id of ids) {
-        if (!(await bump(env.RL, `m:${id}:${hour}`, PER_MACHINE_HOURLY))) return false
+        const machineOk = await checkLimit(env.RATE_LIMITER, `machine:${id}`, MACHINE_LIMIT)
+        if (!machineOk) return false
       }
       return true
     },
