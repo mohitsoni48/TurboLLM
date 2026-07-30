@@ -61,7 +61,7 @@ test('v2→v3 migration wraps each flat profile into a single "*" entry', () => 
     const cfg = store.snapshot()
 
     assert.equal(cfg.version, SCHEMA_VERSION)
-    assert.equal(SCHEMA_VERSION, 3)
+    assert.equal(SCHEMA_VERSION, 4)
     // Each old profile is now a single ProfileEntry under '*', value preserved intact.
     const llamaEntry = cfg.modelProfiles['llama|q4|100'][ANY_ENGINE] as ProfileEntry
     assert.deepEqual(llamaEntry.profile, flatProfile({ ctx: 4096 }))
