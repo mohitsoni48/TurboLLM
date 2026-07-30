@@ -24,7 +24,10 @@ function AgentCard({ agent, isDefault, onOpen, onSetDefault, onReset }: {
         <div className="grid h-8 w-8 shrink-0 place-items-center rounded-lg" style={{ background: 'color-mix(in srgb, var(--accent) 14%, transparent)' }}>
           <Bot size={15} className="text-accent" />
         </div>
-        <span className="min-w-0 flex-1 truncate text-[14px] font-medium text-ink">{agent.name}</span>
+        {/* The name only competes with the two icon buttons for this row — the built-in/modified
+            badge lives in the footer instead (GitHub #84: with the badge here, every title on a
+            185px card collapsed to "De…"/"Bla…", so the cards were unidentifiable). */}
+        <span title={agent.name} className="min-w-0 flex-1 truncate text-[14px] font-medium text-ink">{agent.name}</span>
         <button
           type="button"
           title={isDefault ? 'Default agent for new chats' : 'Set as default agent'}
@@ -43,20 +46,29 @@ function AgentCard({ agent, isDefault, onOpen, onSetDefault, onReset }: {
             <RotateCcw size={13} />
           </button>
         )}
-        {agent.builtin && (
-          <span className="shrink-0 rounded-sm bg-panel-2 px-1.5 py-0.5 text-[10px] text-faint">
-            {agent.overridden ? 'modified' : 'built-in'}
-          </span>
-        )}
       </div>
       {agent.description && <p className="line-clamp-2 text-[12px] text-muted">{agent.description}</p>}
-      {(skillCount || toolCount) ? (
-        <p className="mt-auto flex items-center gap-1 truncate text-[11px] text-faint">
-          <Wrench size={10} />
-          {skillCount ? `${skillCount} skill${skillCount === 1 ? '' : 's'}` : null}
-          {skillCount && toolCount ? ' · ' : null}
-          {toolCount ? `${toolCount} tool${toolCount === 1 ? '' : 's'}` : null}
-        </p>
+      {(agent.builtin || skillCount || toolCount) ? (
+        <div className="mt-auto flex items-center gap-2">
+          {(skillCount || toolCount) ? (
+            // `truncate` has to sit on the text itself, not on this flex row: text-overflow
+            // doesn't apply to flex items, so a clamped row would hard-cut mid-glyph with no
+            // ellipsis. The row keeps min-w-0 so it can actually shrink.
+            <p className="flex min-w-0 items-center gap-1 text-[11px] text-faint">
+              <Wrench size={10} className="shrink-0" />
+              <span className="truncate">
+                {skillCount ? `${skillCount} skill${skillCount === 1 ? '' : 's'}` : null}
+                {skillCount && toolCount ? ' · ' : null}
+                {toolCount ? `${toolCount} tool${toolCount === 1 ? '' : 's'}` : null}
+              </span>
+            </p>
+          ) : null}
+          {agent.builtin && (
+            <span className="ml-auto shrink-0 rounded-sm bg-panel-2 px-1.5 py-0.5 text-[10px] text-faint">
+              {agent.overridden ? 'modified' : 'built-in'}
+            </span>
+          )}
+        </div>
       ) : null}
     </div>
   )
@@ -102,7 +114,9 @@ export function AgentsLibrary() {
       {loading ? (
         <p className="py-8 text-center text-[13px] text-faint">Loading…</p>
       ) : (
-        <div className="grid gap-2" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(185px, 1fr))' }}>
+        // 240px, not 185px: at 185 a card's title row had ~25px left for the name after the icon,
+        // the star and the badge, so nothing was readable (GitHub #84).
+        <div className="grid gap-2" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))' }}>
           {agents.map((agent) => (
             <AgentCard
               key={agent.id}
