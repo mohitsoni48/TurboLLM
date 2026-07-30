@@ -19,14 +19,21 @@ function SkillCard({ skill, onOpen }: { skill: Skill; onOpen: () => void }) {
         <div className="grid h-8 w-8 shrink-0 place-items-center rounded-lg" style={{ background: 'color-mix(in srgb, var(--accent) 14%, transparent)' }}>
           <Sparkles size={15} className="text-accent" />
         </div>
-        <span className="min-w-0 flex-1 truncate text-[14px] font-medium text-ink">{skill.name}</span>
-        {skill.builtin && <span className="shrink-0 rounded-sm bg-panel-2 px-1.5 py-0.5 text-[10px] text-faint">built-in</span>}
+        {/* Badge moved to the footer so the name owns this row — see AgentsLibrary (GitHub #84). */}
+        <span title={skill.name} className="min-w-0 flex-1 truncate text-[14px] font-medium text-ink">{skill.name}</span>
       </div>
       {skill.description && <p className="line-clamp-2 text-[12px] text-muted">{skill.description}</p>}
-      {skill.tools.length > 0 && (
-        <p className="mt-auto flex items-center gap-1 truncate text-[11px] text-faint">
-          <Wrench size={10} /> {skill.tools.join(', ')}
-        </p>
+      {(skill.builtin || skill.tools.length > 0) && (
+        <div className="mt-auto flex items-center gap-2">
+          {skill.tools.length > 0 && (
+            <p className="flex min-w-0 items-center gap-1 truncate text-[11px] text-faint" title={skill.tools.join(', ')}>
+              <Wrench size={10} className="shrink-0" /> {skill.tools.join(', ')}
+            </p>
+          )}
+          {skill.builtin && (
+            <span className="ml-auto shrink-0 rounded-sm bg-panel-2 px-1.5 py-0.5 text-[10px] text-faint">built-in</span>
+          )}
+        </div>
       )}
     </button>
   )
@@ -119,7 +126,8 @@ export function SkillsLibrary() {
           </Button>
         </div>
       ) : (
-        <div className="grid gap-2" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(185px, 1fr))' }}>
+        // 240px, not 185px — see AgentsLibrary (GitHub #84).
+        <div className="grid gap-2" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))' }}>
           {skills.map((sk) => (
             <SkillCard key={sk.id} skill={sk} onOpen={() => navigate(`/skills/${sk.id}`)} />
           ))}

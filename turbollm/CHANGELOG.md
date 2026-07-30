@@ -23,7 +23,19 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+- **AMD APUs with shared memory (Strix Halo, Ryzen AI, and friends) reported almost no VRAM.**
+  Only the small BIOS carveout was counted — a box with 108 GiB of GPU-shareable memory was
+  detected as having 1.1 GB — so every model warned it would "spill to system RAM", quant
+  auto-selection always picked the smallest file, and Auto-tune found nothing that fit. On these
+  chips the shared (GTT) pool is the same memory at the same speed as the carveout, so it now
+  counts toward the VRAM budget. Discrete cards are unaffected: their shared pool sits across
+  PCIe and is still excluded. (Thanks @PCAssistSoftware, #85.)
+- **Linux: the GPU name in Settings → Hardware** showed a raw PCI dump
+  (`c6:00.0 Display controller Advanced Micro Devices, Inc. …`) instead of the device name.
+- **Customize → Agents and Skills: card titles were cut off** ("De…", "Bla…"), so you couldn't
+  tell which agent was which. The cards are wider and the "built-in" badge no longer competes
+  with the name for the same row. (Thanks @PCAssistSoftware, #84.)
 
 ## [1.9.1] - 2026-07-29
 
