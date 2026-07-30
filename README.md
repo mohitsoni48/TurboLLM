@@ -99,7 +99,9 @@ TurboLLM does the opposite:
 - **🔀 A gateway that loads models for you.** Name any model in your API request and TurboLLM
   loads it on demand, keeping your favorites hot in a small pool — so an agent that hops between
   models just works, with nothing to pre-wire.
-- **🔒 Offline-first & private.** No account, no backend, no internet, **no telemetry.**
+- **🔒 Offline-first & private.** No account, no backend, no internet required. Telemetry is
+  **fully opt-in and off by default** — choose Off and nothing but that one-time choice is ever
+  sent, or opt in and see exactly what leaves your machine, verified in [Privacy](#privacy).
 
 ---
 
@@ -400,7 +402,8 @@ connected); **Remove** undoes it.
 <br/>
 
 - A **~7 MB npm package** on Node — no Electron, no bundled Chromium, no Python.
-- **Offline-first** — no account, no backend, no internet, no telemetry.
+- **Offline-first** — no account, no backend, no internet required. Telemetry is opt-in and off
+  by default; see [Privacy](#privacy).
 - **Windows · macOS · Linux**, with a CPU fallback when there's no GPU.
 
 </details>
@@ -581,8 +584,23 @@ Use `--config <file>` to point at an alternate config (its directory becomes the
 ## Privacy
 
 TurboLLM is **offline-first**: core local use needs no account, no backend, and no internet.
-**No analytics or telemetry are collected.** Your prompts, chats, files, and keys never leave
-your machine.
+
+**Your prompts, chats, files, and keys never leave your machine — regardless of your telemetry
+choice.** That's not a promise you have to take on faith: the client is source-available, so the
+claim is checkable against the actual code that ships.
+
+**Telemetry is opt-in, and off by default.** On first run you choose one of three levels, with no
+pre-selected option:
+
+- **Off** — sends only that one-time choice, nothing else, ever.
+- **Anonymous usage + benchmarks** — which features you use, your hardware, model names, and
+  measured speed. Never prompts, files, paths, or keys.
+- **+ Crash reports** — adds error fingerprints (never your content).
+
+You can preview the exact payload before anything is sent, and inspect a running log of every
+event this machine has *actually* transmitted, from **Settings → Privacy & telemetry**. For
+scripted or unattended use, `--no-telemetry` (or `TURBOLLM_TELEMETRY=off`) is a hard, one-way kill
+switch, independent of the saved level.
 
 ---
 
@@ -603,12 +621,13 @@ Marks reflect mid-2026; verify the moving rows against each tool's current docs.
 | Speculative decoding (draft / MTP) | ✅ | ✅ | ◐ env flag | ❌ |
 | Web UI from any LAN device | ✅ | ❌ | ❌ | ✅ |
 | **Lightweight** (no Electron / no Python) | ✅ npm | ❌ Electron | ✅ Go | ❌ Python |
-| Offline-first · **no telemetry** | ✅ verifiable (source-available) | ◐ closed app — not verifiable | ✅ | ✅ |
+| Offline-first · **opt-in, verifiable telemetry** | ✅ verifiable (source-available) | ◐ closed app — not verifiable | ✅ | ✅ |
 
 LM Studio and Ollama both added Anthropic `/v1/messages` endpoints in 2026, so the API rows are
 now parity — Claude Code works against any of them. TurboLLM's durable edges are **any engine
 including community forks**, **benchmark-based auto-tuning with a VRAM-fit verdict + measured t/s
-before you commit**, and **zero telemetry**.
+before you commit**, and **telemetry you can actually verify** — opt-in, off by default, and
+checkable against source-available code rather than taken on trust.
 
 Prefer Open WebUI's chat breadth? It works great pointed at TurboLLM's OpenAI endpoint.
 
