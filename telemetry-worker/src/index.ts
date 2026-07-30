@@ -74,12 +74,19 @@ function makeDeps(env: Env): IngestDeps {
           ),
         ),
       )
+      // Same reasoning as the PostHog log below: handleIngest swallows storage
+      // failures so a client is never told to retry into a struggling backend,
+      // which means a silently failing D1 is indistinguishable from a healthy one.
+      console.log(`d1: stored ${events.length}`)
     },
 
     forward: async (events) => {
-      if (!env.POSTHOG_KEY) return
+      if (!env.POSTHOG_KEY) {
+        console.log('posthog: skipped (no POSTHOG_KEY configured)')
+        return
+      }
       const host = env.POSTHOG_HOST ?? 'https://us.i.posthog.com'
-      await fetch(`${host}/batch/`, {
+      const res = await fetch(`${host}/batch/`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -93,6 +100,14 @@ function makeDeps(env: Env): IngestDeps {
           })),
         }),
       })
+
+      // Log the OUTCOME, always. handleIngest swallows whatever this throws so a
+      // vendor outage can never fail a client request — which is correct, but it
+      // also means a permanently broken fan-out looks exactly like a working one
+      // from outside. Without this line the only symptom is an empty PostHog and
+      // no way to tell why. Visible via `wrangler tail`; the key is never logged.
+      console.log(`posthog: ${res.status} host=${host} events=${events.length}`)
+      if (!res.ok) console.error(`posthog rejected the batch: ${res.status} ${await res.text()}`)
     },
   }
 }
