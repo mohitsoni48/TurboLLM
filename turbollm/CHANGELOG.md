@@ -23,6 +23,10 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [1.9.2] - 2026-07-30
+
 ### Fixed
 - **AMD APUs with shared memory (Strix Halo, Ryzen AI, and friends) reported almost no VRAM.**
   Only the small BIOS carveout was counted — a box with 108 GiB of GPU-shareable memory was
@@ -33,9 +37,19 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   PCIe and is still excluded. (Thanks @PCAssistSoftware, #85.)
 - **Linux: the GPU name in Settings → Hardware** showed a raw PCI dump
   (`c6:00.0 Display controller Advanced Micro Devices, Inc. …`) instead of the device name.
+- **An integrated GPU next to a graphics card from the same vendor inflated the VRAM estimate.**
+  The two were added together, but an integrated GPU's memory *is* your system RAM — so the
+  estimate double-counted it and could green-light a model far too big for the actual card. The
+  integrated GPU is now excluded whenever a real card is present, and still counted in full when
+  it's the only GPU you have.
 - **Customize → Agents and Skills: card titles were cut off** ("De…", "Bla…"), so you couldn't
   tell which agent was which. The cards are wider and the "built-in" badge no longer competes
   with the name for the same row. (Thanks @PCAssistSoftware, #84.)
+
+### Discord
+- Big one for AMD APU owners (Strix Halo, Ryzen AI): TurboLLM now sees the **full** shared GPU memory pool instead of just the tiny BIOS carve-out, so models stop warning they'll spill to system RAM and auto-tune finally has something that fits.
+- If you run an integrated GPU alongside a real graphics card, the VRAM estimate no longer double-counts your system RAM — no more "it said it would fit" surprises.
+- Customize → Agents and Skills: you can actually read the card titles now.
 
 ## [1.9.1] - 2026-07-29
 
