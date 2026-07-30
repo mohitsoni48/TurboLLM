@@ -21,7 +21,9 @@ export { RateLimiterDO }
  *  exists in this bare, package.json-less Worker (wrangler bundles it with
  *  esbuild and does not typecheck), so these are plain structural types
  *  rather than imported ones — accurate to the documented API either way. */
-interface DurableObjectId {}
+interface DurableObjectId {
+  readonly __brand: unique symbol
+}
 interface DurableObjectStub {
   fetch(url: string): Promise<Response>
 }
@@ -41,9 +43,17 @@ const MACHINE_LIMIT = 20
 const IP_LIMIT = 100
 const PERIOD_SECONDS = 60
 
-async function checkLimit(ns: DurableObjectNamespace, key: string, limit: number): Promise<boolean> {
+// A real client's queue caps at MAX_QUEUED_EVENTS=500 (queue.ts) and always
+// flushes one machine's own events, so a batch never legitimately carries
+// more than one machineId. More than a couple in one request is an attacker
+// packing many throwaway ids into a single batch to dodge the per-machine
+// tier entirely — each fresh id would otherwise start its own counter at
+// zero (found in pre-release review).
+const MAX_DISTINCT_MACHINE_IDS = 2
+
+async function checkLimit(ns: DurableObjectNamespace, key: string, limit: number, amount: number): Promise<boolean> {
   const stub = ns.get(ns.idFromName(key))
-  const res = await stub.fetch(`https://rate-limiter/?limit=${limit}&period=${PERIOD_SECONDS}`)
+  const res = await stub.fetch(`https://rate-limiter/?limit=${limit}&period=${PERIOD_SECONDS}&amount=${amount}`)
   const { success } = (await res.json()) as { success: boolean }
   return success
 }
@@ -61,18 +71,31 @@ function makeDeps(env: Env): IngestDeps {
     now: () => Date.now(),
 
     rateLimit: async (req, events) => {
-      const ipOk = await checkLimit(env.RATE_LIMITER, `ip:${await ipKey(req)}`, IP_LIMIT)
-      if (!ipOk) return false
+      try {
+        // Charge the full event count, not 1 per HTTP call — otherwise a
+        // large batch (up to MAX_BATCH) buys unlimited event volume for the
+        // price of a single request (found in pre-release review).
+        const ipOk = await checkLimit(env.RATE_LIMITER, `ip:${await ipKey(req)}`, IP_LIMIT, events.length)
+        if (!ipOk) return false
 
-      // consent_choice carries no machineId by design, so it is rate-limited by
-      // IP alone. That is a known, accepted weakness (ADR-299 Decision 5): the
-      // opt-out count it produces is directional, not exact.
-      const ids = new Set(events.map((e) => e.machineId).filter((v): v is string => typeof v === 'string'))
-      for (const id of ids) {
-        const machineOk = await checkLimit(env.RATE_LIMITER, `machine:${id}`, MACHINE_LIMIT)
-        if (!machineOk) return false
+        // consent_choice carries no machineId by design, so it is rate-limited
+        // by IP alone. That is a known, accepted weakness (ADR-299 Decision 5):
+        // the opt-out count it produces is directional, not exact.
+        const ids = new Set(events.map((e) => e.machineId).filter((v): v is string => typeof v === 'string'))
+        if (ids.size > MAX_DISTINCT_MACHINE_IDS) return false
+
+        for (const id of ids) {
+          const machineOk = await checkLimit(env.RATE_LIMITER, `machine:${id}`, MACHINE_LIMIT, events.length)
+          if (!machineOk) return false
+        }
+        return true
+      } catch (err) {
+        // A broken rate limiter must fail CLOSED deliberately, not become an
+        // uncaught Worker exception (found in pre-release review: this
+        // previously propagated all the way to an unhandled 500).
+        console.error(`rate limit check threw, failing closed: ${err instanceof Error ? err.message : String(err)}`)
+        return false
       }
-      return true
     },
 
     store: async (events) => {

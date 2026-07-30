@@ -3,9 +3,7 @@
 The receiving half of ADR-299. Accepts the anonymous telemetry the TurboLLM
 client sends, mirrors it to D1, and fans it out to PostHog.
 
-**Not deployed yet.** Everything here is written and unit-tested, but no
-Cloudflare or PostHog resource has been created — those need the founder's
-accounts.
+Deployed to `t.turbollm.dev` (custom domain) and `turbollm-telemetry.<account>.workers.dev`.
 
 ## Why the logic is not in this directory
 
@@ -28,7 +26,11 @@ public, and defence is:
 
 1. Strict schema allow-list — enum-only journey events; the six `bench_result`
    identifier fields are length/charset-capped.
-2. Rate limits per machine id and per truncated IP hash (IP never persisted).
+2. Rate limits per machine id and per truncated IP hash (IP never persisted),
+   backed by a Durable Object (`rate-limiter-do.ts`) so the limit is exact
+   rather than approximate — see the comment above `[[durable_objects.bindings]]`
+   in `wrangler.toml` for why two earlier approaches (KV, then Cloudflare's
+   native Rate Limiting binding) were tried and rejected.
 3. Plausibility filtering on benchmark rows.
 4. Defensive analysis downstream — dedupe, drop implausible event rates, report
    ranges rather than exact counts.
@@ -42,10 +44,13 @@ public disproof.
 ```bash
 wrangler d1 create turbollm-telemetry          # paste id into wrangler.toml
 wrangler d1 execute turbollm-telemetry --file=schema.sql
-wrangler kv namespace create RL                # paste id into wrangler.toml
 wrangler secret put POSTHOG_KEY
 wrangler deploy
 ```
+
+The `RATE_LIMITER` Durable Object binding and its `new_sqlite_classes`
+migration are already declared in `wrangler.toml` — `wrangler deploy` creates
+it, no separate `wrangler ... create` step needed (unlike D1/KV).
 
 Set an account spend cap first. A public unauthenticated endpoint should never
 be able to cost money — the anti-abuse design assumes a flood is noisy, not

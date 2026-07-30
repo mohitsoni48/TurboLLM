@@ -51,6 +51,17 @@ database_id = "afeb3b94-b6ff-4d6f-9933-0d191bbbc633"
 # One binding, not two: the DO is addressed by key (`idFromName`), so
 # `ip:<hash>` and `machine:<id>` keys are already namespaced apart within it —
 # a second binding would only duplicate that, not add safety.
+#
+# A second review pass (still pre-release) found the first DO cut had three
+# more holes, all fixed in index.ts / rate-limiter-do.ts: (1) both tiers were
+# charging 1 per HTTP request regardless of batch size, so one compliant IP
+# could push ~144M events/day within a 100-req/60s limit — now charged by
+# `events.length`; (2) an attacker could pack many throwaway machineIds into
+# one batch, since each fresh id starts its own counter at zero — now capped
+# at MAX_DISTINCT_MACHINE_IDS (index.ts) per request; (3) every key ever seen
+# created a Durable Object that was never cleaned up, which Cloudflare bills
+# until the data is removed — `rate-limiter-do.ts`'s `alarm()` now self-expires
+# idle keys the way the old KV version's `expirationTtl` did.
 [[durable_objects.bindings]]
 name = "RATE_LIMITER"
 class_name = "RateLimiterDO"
