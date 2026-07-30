@@ -1,8 +1,20 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { evaluateWindow, type RateLimitWindow } from './rate-limit-window'
+import { MAX_BATCH } from './ingest'
 
 const PERIOD_MS = 60_000
+
+// Mirrors telemetry-worker/src/index.ts's MACHINE_LIMIT/IP_LIMIT. A real
+// client's queue holds up to MAX_QUEUED_EVENTS=500 (queue.ts) and flushes it
+// all in one unbatched request (uploader.ts) — the limit must never be
+// smaller than that single legitimate worst case, or a machine catching up
+// after being offline deadlocks permanently: the first flush alone would
+// exceed the limit, and a rejected flush leaves events queued for retry, so
+// every future request fails the same way forever (found in pre-release
+// review, where the limits had stayed at their old request-scale values of
+// 20/100 after charging switched to `events.length`).
+const MACHINE_LIMIT = 1000
 
 test('evaluateWindow: a fresh key starts a window and succeeds', () => {
   const { next, success } = evaluateWindow(undefined, 1_000, PERIOD_MS, 1, 20)
@@ -67,4 +79,17 @@ test('evaluateWindow: a zero-event batch succeeds even against an already-exhaus
   const { next, success } = evaluateWindow(overLimit, 1_010, PERIOD_MS, 0, 20)
   assert.equal(success, true, 'nothing was actually requested, so there is nothing to reject')
   assert.equal(next, null)
+})
+
+test('evaluateWindow: a full legitimate queue-drain fits in one window under the real machine limit', () => {
+  const { success } = evaluateWindow(undefined, 1_000, PERIOD_MS, MAX_BATCH, MACHINE_LIMIT)
+  assert.equal(success, true, 'a machine catching up after being offline must not be deadlocked by its own first flush')
+})
+
+test('evaluateWindow: two full queue-drains in one window exactly fill it, a third overflows', () => {
+  const first = evaluateWindow(undefined, 1_000, PERIOD_MS, MAX_BATCH, MACHINE_LIMIT)
+  const second = evaluateWindow(first.next!, 1_030, PERIOD_MS, MAX_BATCH, MACHINE_LIMIT)
+  assert.equal(second.success, true, 'MACHINE_LIMIT is exactly 2x MAX_BATCH by design')
+  const third = evaluateWindow(second.next!, 1_040, PERIOD_MS, MAX_BATCH, MACHINE_LIMIT)
+  assert.equal(third.success, false)
 })

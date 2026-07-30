@@ -22,8 +22,10 @@ import { validateEvent } from './schema'
 /** Max events in one request. Matches `MAX_QUEUED_EVENTS` (queue.ts) exactly —
  *  a real client can never legitimately send more than its own queue holds, so
  *  any margin above that is pure headroom for an attacker, not a real client
- *  (found in pre-release review). */
-const MAX_BATCH = 500
+ *  (found in pre-release review). Exported so the Worker's rate-limit tiers
+ *  (telemetry-worker/src/index.ts) can be tested against the real worst-case
+ *  batch size rather than a hardcoded literal that could silently drift. */
+export const MAX_BATCH = 500
 
 /** Plausibility ceiling for tokens/sec. Nothing on consumer hardware is close;
  *  anything above it is a fabricated row, not a lucky benchmark. */

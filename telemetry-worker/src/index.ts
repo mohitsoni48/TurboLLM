@@ -39,8 +39,18 @@ interface Env {
   POSTHOG_HOST?: string
 }
 
-const MACHINE_LIMIT = 20
-const IP_LIMIT = 100
+// These were originally request-scale (20/100), from when every request cost
+// exactly 1 unit regardless of size. Once charging switched to `events.length`
+// (below), that stale scale became a deadlock: `uploader.ts` sends a client's
+// ENTIRE queue in one unbatched request (up to MAX_QUEUED_EVENTS=500), so a
+// machine catching up after being offline would exceed a limit of 20 on its
+// very first request, and since a rejected flush leaves events queued for
+// retry, every future request would fail the same way forever (found in
+// pre-release review). Both limits must clear MAX_BATCH (500, ingest.ts) so a
+// single legitimate worst-case flush always fits in one window; the
+// machine/IP ratio (1:5) is unchanged from the original request-scale design.
+const MACHINE_LIMIT = 1000
+const IP_LIMIT = 5000
 const PERIOD_SECONDS = 60
 
 // A real client's queue caps at MAX_QUEUED_EVENTS=500 (queue.ts) and always
@@ -74,8 +84,13 @@ function makeDeps(env: Env): IngestDeps {
       try {
         // Charge the full event count, not 1 per HTTP call — otherwise a
         // large batch (up to MAX_BATCH) buys unlimited event volume for the
-        // price of a single request (found in pre-release review).
-        const ipOk = await checkLimit(env.RATE_LIMITER, `ip:${await ipKey(req)}`, IP_LIMIT, events.length)
+        // price of a single request (found in pre-release review). The IP
+        // tier floors this at 1: an all-invalid batch validates to zero
+        // accepted events, and per rate-limit-window.ts that is a free pass
+        // (correct for the machine tier, which has no id to even charge) —
+        // but the IP tier's other job is bounding raw REQUEST frequency
+        // regardless of payload validity, so it must never charge 0.
+        const ipOk = await checkLimit(env.RATE_LIMITER, `ip:${await ipKey(req)}`, IP_LIMIT, Math.max(1, events.length))
         if (!ipOk) return false
 
         // consent_choice carries no machineId by design, so it is rate-limited
