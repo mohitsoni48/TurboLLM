@@ -178,6 +178,39 @@ test('validateEvent: app.version is a capped identifier, not a free string', () 
   assert.match(r.reason, /app\.version/)
 })
 
+test('validateEvent: a prototype-chain property cannot smuggle a free-form string through payload', () => {
+  // Found in Opus pre-release review: checkFields used `key in spec`, which
+  // walks Object.prototype — so 'toString'/'constructor'/'valueOf' passed the
+  // "known field" check and were then never validated, since the second loop
+  // only iterates the spec's OWN entries. Reproducing the exact review PoC.
+  const r = validateEvent(
+    validEvent({
+      event: 'feature_first_use',
+      payload: { feature: 'chat', toString: 'C:\\Users\\Owner\\secret\\prompt.txt ' + 'x'.repeat(400) },
+    }),
+  )
+  assert.equal(r.ok, false)
+  assert.match(r.reason, /toString/)
+})
+
+test('validateEvent: a prototype-chain property cannot smuggle a free-form string through app', () => {
+  const r = validateEvent(validEvent({ app: { version: '1.9.2', os: 'win32/x64', constructor: 'arbitrary' } }))
+  assert.equal(r.ok, false)
+  assert.match(r.reason, /constructor/)
+})
+
+test('validateEvent: a prototype-chain property cannot smuggle a free-form string through the bench payload', () => {
+  const e = benchEvent()
+  const p = e.payload as Record<string, unknown>
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- deliberately
+  // bypassing the compiler's own strict typing of the inherited method, since
+  // the whole point is proving an untyped attacker payload can do this.
+  ;(p as any).hasOwnProperty = 'smuggled'
+  const r = validateEvent(e)
+  assert.equal(r.ok, false)
+  assert.match(r.reason, /hasOwnProperty/)
+})
+
 test('validateEvent: app.os accepts the REAL shape sysinfo.ts produces, not a fabricated fixture', () => {
   // Found live: getSysInfo().os is `${process.platform}/${process.arch}` (sysinfo.ts),
   // e.g. "win32/x64" or "darwin/arm64" — every unit test fixture in this file (including
@@ -200,6 +233,33 @@ test('validateEvent: app.os still rejects a real path, despite now allowing a sl
     const r = validateEvent(validEvent({ app: { version: '1.9.0', os } }))
     assert.equal(r.ok, false, `expected ${os} to be rejected`)
   }
+})
+
+test('validateEvent: schema must exactly equal the current wire version', () => {
+  // Found in Opus pre-release review: 'schema' was in ENVELOPE_KEYS (so it rode
+  // through the top-level allow-list) but never actually checked — any value,
+  // any size, reached the Worker and D1/PostHog verbatim.
+  assert.equal(validateEvent(validEvent({ schema: 2 })).ok, false)
+  assert.equal(validateEvent(validEvent({ schema: 'z'.repeat(600) })).ok, false)
+  assert.equal(validateEvent(validEvent({ schema: 1 })).ok, true)
+})
+
+test('validateEvent: ts must be a bounded ISO-8601 timestamp, not an arbitrary object or string', () => {
+  // Same finding: 'ts' was allow-listed but never validated at all. Reproducing
+  // the review's exact PoC — a free-form path leaked through a nested field.
+  const withObjectTs = validEvent()
+  withObjectTs.ts = { leak: 'C:/Users/Owner/Documents/prompt.txt', big: 'y'.repeat(300) }
+  assert.equal(validateEvent(withObjectTs).ok, false)
+
+  assert.equal(validateEvent(validEvent({ ts: 'not a timestamp' })).ok, false)
+  assert.equal(validateEvent(validEvent({ ts: '2026-07-29T12:00:00.000Z' })).ok, true)
+})
+
+test('validateEvent: consent_choice with an oversized schema value is still rejected', () => {
+  // The finding's own example: the schema field was reachable even on
+  // consent_choice, the one event required to carry nothing attributable.
+  const r = validateEvent({ schema: 'q'.repeat(200), event: 'consent_choice', level: 'off' })
+  assert.equal(r.ok, false)
 })
 
 test('validateEvent: a machineId that is not a plain uuid-shaped id is rejected', () => {

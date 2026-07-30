@@ -173,7 +173,13 @@ function checkFields(obj: unknown, spec: Record<string, FieldSpec>, path: string
   const o = obj as Record<string, unknown>
 
   for (const key of Object.keys(o)) {
-    if (!(key in spec)) return `unknown field: ${path}.${key}`
+    // Object.prototype.hasOwnProperty, NOT `key in spec` — `in` walks the
+    // prototype chain, so 'toString'/'constructor'/'valueOf' etc. would pass
+    // as "known fields" here and then never be validated at all, since the
+    // loop below only iterates the spec's OWN entries (found in pre-release
+    // review). `spec` is always our own literal object, so this call can never
+    // itself fail on a missing hasOwnProperty.
+    if (!Object.prototype.hasOwnProperty.call(spec, key)) return `unknown field: ${path}.${key}`
   }
   for (const [key, field] of Object.entries(spec)) {
     const v = o[key]
@@ -223,7 +229,7 @@ function validatePayload(eventName: string, payload: unknown): string | null {
     }
     const p = payload as Record<string, unknown>
     for (const key of Object.keys(p)) {
-      if (!(key in BENCH_PAYLOAD)) return `unknown field: payload.${key}`
+      if (!Object.prototype.hasOwnProperty.call(BENCH_PAYLOAD, key)) return `unknown field: payload.${key}`
     }
     for (const [block, spec] of Object.entries(BENCH_PAYLOAD)) {
       const e = checkFields(p[block], spec, `payload.${block}`)
@@ -260,6 +266,16 @@ export function validateEvent(raw: unknown): ValidationResult {
     }
   }
 
+  // Found in pre-release review: `schema` and `ts` were both allow-listed in
+  // ENVELOPE_KEYS but never actually checked — any value, any size, on every
+  // event including `consent_choice`, reached D1/PostHog verbatim. `schema`
+  // applies to every event (checked here, before the consent_choice branch);
+  // `ts` is checked further below, only on the non-consent_choice path — it is
+  // already structurally BANNED on consent_choice by the loop just under this.
+  if (e.schema !== TELEMETRY_SCHEMA_VERSION) {
+    return { ok: false, reason: `invalid value for schema: ${String(e.schema)}` }
+  }
+
   // `consent_choice` is the one event with a different envelope, and the
   // difference is the whole point of it (ADR-299 Decision 5): it is the only
   // event a machine that chose Off ever sends, so it must carry NOTHING that
@@ -278,6 +294,13 @@ export function validateEvent(raw: unknown): ValidationResult {
   }
 
   if ('level' in e) return { ok: false, reason: 'level is only valid on consent_choice' }
+
+  // ISO-8601 as produced by `new Date().toISOString()` — the exact, only shape
+  // any real caller ever constructs. Bounded and fully anchored, so nothing
+  // else (an object, an oversized string, a malformed date) can pass.
+  if (typeof e.ts !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(e.ts)) {
+    return { ok: false, reason: 'missing or malformed field: ts' }
+  }
 
   // A uuid and nothing else. The machineId is the only per-install identifier
   // we hold, so it must not be usable as a smuggling channel for anything the
