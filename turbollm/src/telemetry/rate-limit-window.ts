@@ -14,6 +14,18 @@ export interface RateLimitWindow {
   windowStart: number
 }
 
+// Both must clear MAX_BATCH (ingest.ts): uploader.ts sends a client's ENTIRE
+// queue in one unbatched request, so a limit smaller than a single legitimate
+// worst-case flush deadlocks that client forever (a rejected flush leaves
+// events queued for retry, and every retry is the same size or larger).
+// MACHINE_LIMIT is exactly 2x MAX_BATCH; IP_LIMIT keeps the original 1:5
+// machine:IP ratio. Exported (not left as a duplicated literal in index.ts
+// and the test) so the two can never drift apart again the way the
+// request-scale limits (20/100) silently did after charging switched to
+// event count (found in pre-release review).
+export const MACHINE_LIMIT = 1000
+export const IP_LIMIT = 5000
+
 export interface RateLimitCheck {
   /** The window state to persist, or `null` if nothing should be written. */
   next: RateLimitWindow | null

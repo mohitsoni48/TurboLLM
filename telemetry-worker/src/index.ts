@@ -13,6 +13,7 @@
  */
 
 import { handleIngest, type IngestDeps } from '../../turbollm/src/telemetry/ingest'
+import { MACHINE_LIMIT, IP_LIMIT } from '../../turbollm/src/telemetry/rate-limit-window'
 import { RateLimiterDO } from './rate-limiter-do'
 
 export { RateLimiterDO }
@@ -39,18 +40,11 @@ interface Env {
   POSTHOG_HOST?: string
 }
 
-// These were originally request-scale (20/100), from when every request cost
-// exactly 1 unit regardless of size. Once charging switched to `events.length`
-// (below), that stale scale became a deadlock: `uploader.ts` sends a client's
-// ENTIRE queue in one unbatched request (up to MAX_QUEUED_EVENTS=500), so a
-// machine catching up after being offline would exceed a limit of 20 on its
-// very first request, and since a rejected flush leaves events queued for
-// retry, every future request would fail the same way forever (found in
-// pre-release review). Both limits must clear MAX_BATCH (500, ingest.ts) so a
-// single legitimate worst-case flush always fits in one window; the
-// machine/IP ratio (1:5) is unchanged from the original request-scale design.
-const MACHINE_LIMIT = 1000
-const IP_LIMIT = 5000
+// MACHINE_LIMIT / IP_LIMIT live in rate-limit-window.ts, not here — imported
+// rather than duplicated so they can't silently drift apart from the
+// regression test that pins them to MAX_BATCH the way the old request-scale
+// limits (20/100) drifted from reality once charging switched to event count
+// (found in pre-release review).
 const PERIOD_SECONDS = 60
 
 // A real client's queue caps at MAX_QUEUED_EVENTS=500 (queue.ts) and always
