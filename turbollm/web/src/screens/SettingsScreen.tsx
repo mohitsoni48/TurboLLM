@@ -1184,6 +1184,7 @@ function PrivacySection({ level, setLevel }: { level: TelemetryLevel; setLevel: 
             <input
               type="radio"
               name="telemetry"
+              value={o.value}
               checked={level === o.value}
               onChange={() => setLevel(o.value)}
               className="mt-0.5 h-4 w-4 accent-[var(--accent)]"

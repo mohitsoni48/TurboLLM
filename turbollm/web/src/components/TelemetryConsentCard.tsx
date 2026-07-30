@@ -64,6 +64,7 @@ export function TelemetryConsentCard() {
               <input
                 type="radio"
                 name="telemetry-consent"
+                value={o.value}
                 checked={choice === o.value}
                 onChange={() => setChoice(o.value)}
                 className="mt-0.5 h-4 w-4 accent-[var(--accent)]"
