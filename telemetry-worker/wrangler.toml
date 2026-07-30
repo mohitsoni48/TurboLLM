@@ -7,6 +7,14 @@ compatibility_date = "2026-07-01"
 # is a secret. Abuse is handled by validation + rate limiting, not obscurity.
 routes = [{ pattern = "t.turbollm.dev/*", zone_name = "turbollm.dev" }]
 
+# The workers.dev URL is kept enabled as a VERIFICATION path. The route above was
+# accepted by Cloudflare on first deploy, but `t.turbollm.dev` had no DNS record,
+# so it resolved to NXDOMAIN — a route can be bound to a hostname that does not
+# exist, which makes "deploy succeeded" a misleading signal on its own. This
+# gives a reachable URL that does not depend on DNS, so the pipeline can be
+# proven end-to-end independently of the custom domain.
+workers_dev = true
+
 # The owned raw mirror. Create with:
 #   wrangler d1 create turbollm-telemetry
 # then paste the returned database_id below and apply schema.sql.
