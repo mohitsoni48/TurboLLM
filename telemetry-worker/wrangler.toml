@@ -5,7 +5,12 @@ compatibility_date = "2026-07-01"
 # The public ingest endpoint. Public on purpose (ADR-299): a credential shipped
 # in a source-available client is not a credential, so we do not pretend the URL
 # is a secret. Abuse is handled by validation + rate limiting, not obscurity.
-routes = [{ pattern = "t.turbollm.dev/*", zone_name = "turbollm.dev" }]
+# `custom_domain` rather than a plain route: a plain route is ACCEPTED for a
+# hostname that has no DNS record, so the first deploy reported success while
+# every request returned NXDOMAIN. A custom domain provisions the proxied DNS
+# record as part of the deploy, which makes "deployed" and "reachable" the same
+# statement instead of two independent ones.
+routes = [{ pattern = "t.turbollm.dev", custom_domain = true }]
 
 # The workers.dev URL is kept enabled as a VERIFICATION path. The route above was
 # accepted by Cloudflare on first deploy, but `t.turbollm.dev` had no DNS record,
