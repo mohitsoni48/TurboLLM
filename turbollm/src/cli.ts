@@ -315,6 +315,16 @@ setTimeout(() => {
   telemetry.once('app_first_run')
   void flush(store.dir(), store.snapshot().telemetry.level)
 }, 3_000).unref()
+// Recurring flush (ADR-299) — found missing during live end-to-end testing, not
+// designed in from the start. Without this, the 3-second boot flush above is the
+// ONLY time this daemon ever drains the queue: events would enqueue correctly
+// for the entire life of the process but almost never actually reach the Worker,
+// since a real user's consent decision — and therefore any meaningful activity —
+// virtually always happens well after the 3-second mark. Every unit test passed
+// because they call flush() directly; nothing exercised the daemon's own
+// scheduling of it. Re-reads the level fresh on every tick (not the value at
+// startup), so a mid-session opt-out is honoured on the very next flush.
+setInterval(() => void flush(store.dir(), store.snapshot().telemetry.level), 5 * 60_000).unref()
 // Cloud Launch (ADR-045/152): only wired when --tunnel is passed. Its mere presence
 // on Deps is what forces auth enforcement on tunneled traffic (see auth.ts lanAuth) —
 // absent entirely for the vast majority of runs that never asked for a tunnel.
