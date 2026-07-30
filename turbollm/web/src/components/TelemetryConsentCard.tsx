@@ -77,6 +77,20 @@ export function TelemetryConsentCard() {
           ))}
         </div>
 
+        {/* Found in pre-release review: a failed save left the button silently
+            re-enabled with zero explanation. Every upgrading install reaches
+            this card via the v3→v4 migration, so a broken save here was a
+            silent, total lockout with no visible cause. This is the fix — NOT
+            a dismiss/Escape affordance, which stays deliberately absent (see
+            the module doc comment above): the bug was the silence, not the
+            requirement to choose. */}
+        {save.isError && (
+          <p className="mt-3 text-[12px] text-red-500" role="alert">
+            {save.error instanceof Error ? save.error.message : 'Something went wrong saving your choice.'}{' '}
+            Please try again.
+          </p>
+        )}
+
         <div className="mt-4 flex items-center justify-between">
           <span className="text-[11px] text-faint">You can change this any time in Settings.</span>
           {/* Disabled until a choice is made — there is no default to fall back
