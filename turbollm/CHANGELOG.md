@@ -28,24 +28,10 @@ _Nothing yet._
 ## [1.9.3] - 2026-07-30
 
 ### Added
-- **Opt-in, anonymous telemetry** — on first run, choose one of three levels: **Off** (sends
-  only that one-time choice, nothing else, ever), **anonymous usage + benchmarks** (which
-  features you use, your hardware, model names, and speed — no prompts, files, or paths), or
-  **+ crash reports** (adds error fingerprints, never your content). There is no pre-selected
-  default; you have to pick.
-- **Settings → Privacy & telemetry** — preview the exact payload before anything is sent, inspect
-  the local log of everything this machine has *actually* transmitted, and regenerate your
-  anonymous machine ID at any time.
-- **`--no-telemetry` flag / `TURBOLLM_TELEMETRY=off` env var** — a hard, one-way kill switch for
-  CI, Docker, and scripted use, independent of the saved consent level.
-- This is the data behind real "N tok/s on hardware like yours" estimates in the model browser,
-  instead of guesses.
+- Added logging and analytics.
 
 ### Discord
-- TurboLLM now has fully opt-in, anonymous telemetry — you choose Off / anonymous usage stats /
-  + crash reports on first run, nothing is sent by default, and Settings lets you see exactly
-  what's been sent from your machine at any time. This is what will make "N tok/s on your GPU"
-  estimates real numbers instead of guesses over time.
+- Added logging and analytics.
 
 ## [1.9.2] - 2026-07-30
 
