@@ -25,6 +25,14 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.9.3] - 2026-07-30
+
+### Added
+- Added logging and analytics.
+
+### Discord
+- Added logging and analytics.
+
 ## [1.9.2] - 2026-07-30
 
 ### Fixed

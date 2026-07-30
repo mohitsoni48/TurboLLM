@@ -62,5 +62,5 @@
     <text x="830" y="338" font-size="10.5" fill="#6b7280" text-anchor="middle">CUDA · ROCm · Metal · Vulkan</text>
   </g>
 
-  <text x="480" y="430" font-size="12.5" fill="#6b7280" text-anchor="middle">Offline-first · no account · no telemetry — the gateway stays stable while engines swap behind it (local now, your cloud box later).</text>
+  <text x="480" y="430" font-size="12.5" fill="#6b7280" text-anchor="middle">Offline-first · no account — the gateway stays stable while engines swap behind it (local now, your cloud box later).</text>
 </svg>

@@ -566,6 +566,9 @@ export type DaemonSettings = {
    *  Off = open/unauthenticated LAN access. */
   requireApiKey: boolean
   telemetryLevel: TelemetryLevel
+  /** Whether consent has ever been answered. False only before the first-run
+   *  choice (ADR-299) — telemetryLevel collapses that state to 'off'. */
+  telemetryDecided: boolean
   modelDefaults: ModelDefaults
   /** ComfyUI GPU coordination settings. */
   comfyui: ComfyUiSettings
@@ -727,6 +730,19 @@ export type TelemetryPreview = {
 
 export function getTelemetryPreview(level: TelemetryLevel): Promise<TelemetryPreview> {
   return request<TelemetryPreview>(`/api/v1/telemetry/preview?level=${encodeURIComponent(level)}`)
+}
+
+/** One entry in the local submission log (ADR-299): an event that ACTUALLY left
+ *  this machine, stored verbatim so it can be checked against our claims. */
+export type SentEntry = { sentAt: string; event: Record<string, unknown> }
+
+export function getTelemetryLog(): Promise<{ entries: SentEntry[] }> {
+  return request<{ entries: SentEntry[] }>('/api/v1/telemetry/log')
+}
+
+/** Mint a new anonymous machine id, discarding anything queued under the old one. */
+export function regenerateMachineId(): Promise<{ machineId: string }> {
+  return request<{ machineId: string }>('/api/v1/telemetry/regenerate-id', { method: 'POST' })
 }
 
 /** LAN network info (spec 08 §2): expose state, the reachable LAN URL, and whether

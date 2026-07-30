@@ -100,6 +100,21 @@ export class DownloadManager {
   private provenanceList: ProvenanceEntry[] = []
   private nextSeq = 0
 
+  /** Optional observer for a download's terminal outcome, wired in cli.ts
+   *  (ADR-299 `onboarding_step`). Separate from `onComplete`, which fires only
+   *  on success and exists to trigger a rescan — reusing it would have made a
+   *  failed download indistinguishable from one that never started. The error
+   *  string is deliberately not passed: the only consumer may never send text. */
+  onSettled?: (outcome: 'ok' | 'fail' | 'cancelled') => void
+
+  private settle(outcome: 'ok' | 'fail' | 'cancelled'): void {
+    try {
+      this.onSettled?.(outcome)
+    } catch {
+      // Observers are advisory — they must not affect a download.
+    }
+  }
+
   constructor(
     private store: ConfigStore,
     /** Called after a download completes so the model list picks up the new file. */
@@ -456,6 +471,7 @@ export class DownloadManager {
       } catch {
         /* scan trigger is best-effort */
       }
+      this.settle('ok')
     } catch (e) {
       this.controllers.delete(rec.id)
       rec.bytesPerSec = 0
@@ -469,6 +485,10 @@ export class DownloadManager {
         rec.error = e instanceof Error ? e.message : String(e)
       }
       this.persist()
+      // A user who abandons a download is a different signal from one whose
+      // download broke — 'cancelled' and 'fail' must not be conflated, or the
+      // onboarding funnel reads a deliberate choice as a product defect.
+      this.settle(rec.status === 'cancelled' ? 'cancelled' : 'fail')
     } finally {
       this.pump()
     }

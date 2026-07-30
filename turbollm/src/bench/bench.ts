@@ -9,8 +9,7 @@
 // anonymized bench_result event. Single active run; additive; fail-safe (a bad candidate is
 // recorded and the sweep continues).
 import { execFile } from 'node:child_process'
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { readFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { setModelProfile, getModelProfile, VRAM_HEADROOM_SPILL_MB, type BenchResult, type ConfigStore } from '../config/config'
 import type { Manager, StartOpts } from '../engines/manager'
@@ -21,6 +20,12 @@ import { deriveDefault, estimateVram, gpuBudgetMb, profileToArgs, resolveProfile
 import { getSysInfo, type SysInfo } from '../sysinfo/sysinfo'
 import type { HfClient } from '../hf/hf'
 import { inferRepoFromPath } from '../api/path-utils'
+import { enqueue } from '../telemetry/queue'
+import { TELEMETRY_SCHEMA_VERSION } from '../telemetry/schema'
+import { reportModelLoad } from '../telemetry/first-load'
+import { classifyBenchFailure } from '../telemetry/classify'
+import { telemetryDisabled } from '../telemetry/disabled'
+import type { Emitter } from '../telemetry/emit'
 import {
   buildCardExtractionPrompt,
   hasAnySampling,
@@ -199,6 +204,12 @@ export class BenchRunner {
     private hf: HfClient,
   ) {}
 
+  /** Journey telemetry (ADR-299 `model_first_load`). Set post-construction in
+   *  cli.ts, matching `Manager.onLoadSettled`'s wiring — the Emitter is built
+   *  after BenchRunner in the daemon's startup order. Absent under tests, which
+   *  construct BenchRunner directly and never exercise `run()`. */
+  telemetry?: Emitter
+
   /** Live state for GET /status. */
   status(): BenchState {
     return this.state
@@ -218,6 +229,15 @@ export class BenchRunner {
     if (!this.state.running) return
     this.cancelled = true
     this.abort?.abort()
+  }
+
+  /** Report `model_first_load` for a sweep's conclusion (ADR-299). A no-op when
+   *  no Emitter was injected (absent under tests, which never call `run()`).
+   *  Only the FIRST sweep's outcome across an install's lifetime is recorded —
+   *  see `reportModelLoad`'s own once-only claim — so a re-tune later on
+   *  cannot overwrite it. */
+  private reportFirstLoad(outcome: 'ok' | 'fail' | 'cancelled', failReason?: string): void {
+    if (this.telemetry) reportModelLoad(this.store.dir(), this.telemetry, outcome, failReason)
   }
 
   /** Stop the engine — force-killed immediately when the run is cancelled (the user is actively
@@ -404,6 +424,10 @@ export class BenchRunner {
       // results dialog or re-hold a profile the user just discarded: cancel() cleared winning +
       // result, but couldn't stop this still-running run. Re-check before committing the winner.
       if (this.cancelled) {
+        // A user who backs out of their FIRST sweep before a profile committed is
+        // not the same signal as one whose load broke — same reasoning already
+        // applied to download outcomes (ADR-299).
+        this.reportFirstLoad('cancelled')
         this.state = { running: false, modelKey, done: true, candidates: results }
         return
       }
@@ -417,6 +441,7 @@ export class BenchRunner {
       const kvAdvisory = kvSpeedAdvisory(best.cand.tps, profile.kvTypeK, caps.kvTypes)
       // Hold the winner instead of auto-saving — the UI shows a Save/Cancel results dialog and
       // persists via POST /bench/save only when the user clicks Save.
+      this.reportFirstLoad('ok')
       this.winning = { modelKey, profile, cand: best.cand, entry, sys, engineVersion: active?.version ?? '', engineId: active?.id ?? '' }
       this.logWinner = { params: best.cand.params, tps: best.cand.tps ?? 0, prefillTps: best.cand.prefillTps, ttftMs: best.cand.ttftMs ?? 0, vramMb: best.cand.vramMb }
       this.state = {
@@ -453,6 +478,14 @@ export class BenchRunner {
         : memoryBound
           ? `This model doesn't fit on your GPU at ${baseProfile.ctx.toLocaleString()} context — even with maximum CPU offload it ran out of VRAM. Lower the context length and try again.`
           : 'No candidate completed successfully.'
+      // A user who cancels the whole sweep before anything worked is not the
+      // same signal as one whose every attempt genuinely failed — the outcome
+      // here follows the same distinction as the cancel-during-extraction path
+      // above (ADR-299). classifyBenchFailure reasons over the AGGREGATE of
+      // every candidate this sweep tried, not one raw error: individual probes
+      // (VRAM probe, t/s trial) are expected to OOM/timeout as part of normal
+      // binary search, so only the sweep's overall conclusion is reported.
+      this.reportFirstLoad(this.cancelled ? 'cancelled' : 'fail', this.cancelled ? undefined : classifyBenchFailure(results))
       this.state = { running: false, modelKey, done: true, error: err, candidates: results }
     }
   }
@@ -1125,9 +1158,14 @@ export class BenchRunner {
 
   /** Queue an anonymized bench_result telemetry event (spec 09 §3) — ONLY when
    *  telemetry is on. Built from whitelisted fields only (never prompts, paths,
-   *  tokens). No uploader (post-launch); just a queue file. Fully fail-safe. */
+   *  tokens). Validation, bounding and fail-safety live in `telemetry/queue`
+   *  (ADR-299); this method owns only the consent check and the payload shape. */
   private queueTelemetry(record: BenchResult, entry: ModelEntry, sys: SysInfo, appVersion: string, engineVersion: string): void {
     try {
+      // The kill switch was missing here entirely before pre-release review —
+      // only emit.ts/consent.ts had checked it, so `--no-telemetry` did not stop
+      // bench telemetry at all. Checked before consent, same as everywhere else.
+      if (telemetryDisabled()) return
       const cfg = this.store.snapshot()
       const level = cfg.telemetry.level
       if (level !== 'anon' && level !== 'full') return // 'off' / 'unset' → write nothing (AC#4)
@@ -1141,8 +1179,8 @@ export class BenchRunner {
         })
       }
 
-      const event = {
-        schema: 1,
+      enqueue(this.store.dir(), {
+        schema: TELEMETRY_SCHEMA_VERSION,
         event: 'bench_result',
         ts: record.ts,
         machineId,
@@ -1158,11 +1196,7 @@ export class BenchRunner {
           params: record.params,
           result: { tps: record.tps, ttftMs: record.ttftMs, vramMb: record.vramMb, outcome: 'ok' },
         },
-      }
-
-      const queueDir = join(this.store.dir(), 'telemetry', 'queue')
-      mkdirSync(queueDir, { recursive: true })
-      writeFileSync(join(queueDir, `${randomUUID()}.json`), JSON.stringify(event))
+      })
     } catch {
       // Telemetry is best-effort and offline-first: a failure to queue must never
       // surface to the user or abort the run (spec 09 §4).

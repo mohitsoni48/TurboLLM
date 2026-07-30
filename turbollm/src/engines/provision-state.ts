@@ -31,11 +31,26 @@ export class ProvisionState {
     this.s.parts = parts
   }
 
+  /** Optional observer for the terminal outcome, wired in cli.ts (ADR-299
+   *  `onboarding_step`). The error string is deliberately not passed — the only
+   *  consumer may never transmit free text. */
+  onSettled?: (ok: boolean) => void
+
   done(): void {
     this.s = { active: false, phase: 'idle', backend: '', pct: 0, part: 1, parts: 1, error: null }
+    this.settle(true)
   }
 
   fail(error: string): void {
     this.s = { active: false, phase: 'error', backend: this.s.backend, pct: 0, part: 1, parts: 1, error }
+    this.settle(false)
+  }
+
+  private settle(ok: boolean): void {
+    try {
+      this.onSettled?.(ok)
+    } catch {
+      // Observers are advisory — they must not affect an engine install.
+    }
   }
 }

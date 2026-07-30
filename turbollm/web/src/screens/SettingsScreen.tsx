@@ -17,6 +17,8 @@ import {
   useStatus,
   useSysInfo,
   useTelemetryPreview,
+  useTelemetryLog,
+  useRegenerateMachineId,
   useAppUpdate,
 } from '../lib/queries'
 import { CopyButton } from '../components/ui/copy-button'
@@ -1161,17 +1163,23 @@ function PrivacySection({ level, setLevel }: { level: TelemetryLevel; setLevel: 
   const { data: preview, isFetching } = useTelemetryPreview(showPreview ? level : null)
 
   const options: { value: TelemetryLevel; label: string; desc: string }[] = [
-    { value: 'off', label: 'Off', desc: 'Send nothing. TurboLLM works fully offline.' },
-    { value: 'anon', label: 'Anonymous benchmarks', desc: 'Hardware specs, model name, settings, and speed — no prompts or files.' },
-    { value: 'full', label: 'Benchmarks + crash reports', desc: 'Adds error fingerprints, never your content.' },
+    // The Off copy is deliberately literal (ADR-299 Decision 5). Choosing Off
+    // sends ONE contentless ping recording that choice — no machine id, no
+    // hardware, no timestamp — and nothing else, ever. The previous wording
+    // ("Send nothing") became false when that ping shipped, and in a
+    // source-available client anyone can diff the claim against the code.
+    { value: 'off', label: 'Off', desc: 'Sends only your choice, once. Nothing else, ever.' },
+    { value: 'anon', label: 'Anonymous usage + benchmarks', desc: 'Which features you use, hardware specs, model name, settings, and speed — no prompts or files.' },
+    { value: 'full', label: 'Usage + benchmarks + crash reports', desc: 'Adds error fingerprints, never your content.' },
   ]
 
   return (
     <section className="rounded-lg border border-border bg-panel p-4">
       <h2 className="mb-1 text-[13px] font-semibold uppercase tracking-wide text-faint">Privacy &amp; telemetry</h2>
       <p className="mb-3 text-[12px] text-muted">
-        Opt-in only. Nothing is sent unless you choose a level above Off. Never sent: your
-        conversations, prompts, files, paths, or keys.
+        Opt-in only. Choosing a level records that choice once — beyond that, nothing is sent
+        unless you pick a level above Off. Never sent: your conversations, prompts, files,
+        paths, or keys.
       </p>
 
       <div className="flex flex-col gap-1">
@@ -1180,6 +1188,7 @@ function PrivacySection({ level, setLevel }: { level: TelemetryLevel; setLevel: 
             <input
               type="radio"
               name="telemetry"
+              value={o.value}
               checked={level === o.value}
               onChange={() => setLevel(o.value)}
               className="mt-0.5 h-4 w-4 accent-[var(--accent)]"
@@ -1212,7 +1221,61 @@ function PrivacySection({ level, setLevel }: { level: TelemetryLevel; setLevel: 
           </div>
         )}
       </div>
+
+      <SubmissionLog />
     </section>
+  )
+}
+
+/**
+ * The local submission log (ADR-299).
+ *
+ * The preview above shows what we *would* send; this shows what actually left
+ * the machine, verbatim. That distinction is the entire point — a preview is a
+ * claim, this is the receipt. Deliberately rendered as raw JSON rather than a
+ * friendly summary, because a summary is another claim the user would have to
+ * take on trust.
+ */
+function SubmissionLog() {
+  const [open, setOpen] = useState(false)
+  const logQ = useTelemetryLog(open)
+  const regenerate = useRegenerateMachineId()
+  const entries = logQ.data?.entries ?? []
+
+  return (
+    <div className="mt-3 border-t border-border pt-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <Button variant="outline" size="sm" onClick={() => setOpen((s) => !s)}>
+          {open ? 'Hide what was sent' : 'What was actually sent'}
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={regenerate.isPending}
+          onClick={() => regenerate.mutate()}
+        >
+          {regenerate.isPending ? 'Regenerating…' : 'New anonymous ID'}
+        </Button>
+      </div>
+
+      {open && (
+        <div className="mt-2">
+          <p className="mb-1 text-[12px] text-faint">
+            Every event this machine has transmitted, newest first, exactly as it was sent. If
+            something here surprises you, that is a bug — please report it.
+          </p>
+          {logQ.isFetching && entries.length === 0 ? (
+            <p className="text-[12px] text-muted">Reading log…</p>
+          ) : entries.length === 0 ? (
+            <p className="text-[12px] text-muted">Nothing has been sent from this machine.</p>
+          ) : (
+            <pre className="max-h-64 overflow-auto rounded-md border border-border bg-panel-2 p-2.5 font-mono text-[11px] text-muted">
+              {entries.map((e) => `${e.sentAt}  ${JSON.stringify(e.event)}`).join('\n')}
+            </pre>
+          )}
+        </div>
+      )}
+    </div>
   )
 }
 

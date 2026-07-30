@@ -1,0 +1,93 @@
+name = "turbollm-telemetry"
+main = "src/index.ts"
+compatibility_date = "2026-07-01"
+
+# The public ingest endpoint. Public on purpose (ADR-299): a credential shipped
+# in a source-available client is not a credential, so we do not pretend the URL
+# is a secret. Abuse is handled by validation + rate limiting, not obscurity.
+# `custom_domain` rather than a plain route: a plain route is ACCEPTED for a
+# hostname that has no DNS record, so the first deploy reported success while
+# every request returned NXDOMAIN. A custom domain provisions the proxied DNS
+# record as part of the deploy, which makes "deployed" and "reachable" the same
+# statement instead of two independent ones.
+routes = [{ pattern = "t.turbollm.dev", custom_domain = true }]
+
+# The workers.dev URL is kept enabled as a VERIFICATION path. The route above was
+# accepted by Cloudflare on first deploy, but `t.turbollm.dev` had no DNS record,
+# so it resolved to NXDOMAIN — a route can be bound to a hostname that does not
+# exist, which makes "deploy succeeded" a misleading signal on its own. This
+# gives a reachable URL that does not depend on DNS, so the pipeline can be
+# proven end-to-end independently of the custom domain.
+workers_dev = true
+
+# The owned raw mirror. Create with:
+#   wrangler d1 create turbollm-telemetry
+# then paste the returned database_id below and apply schema.sql.
+[[d1_databases]]
+binding = "DB"
+database_name = "turbollm-telemetry"
+database_id = "afeb3b94-b6ff-4d6f-9933-0d191bbbc633"
+
+# Rate limiting — Cloudflare's OWN documented guidance ruled out the first two
+# things tried here. KV: "not the correct product for rate-limiting" (KV is
+# eventually consistent; each key can only be written ~once/second) — a
+# hand-rolled KV get-then-put counter was unreliable under a real burst. Then
+# the native Rate Limiting binding, which Cloudflare's docs describe as
+# "permissive, eventually consistent, and intentionally designed to not be
+# used as an accurate accounting system": verified against the live deployed
+# Worker, 65 rapid requests to the same key (sequential, then fully
+# concurrent) were ALL accepted against a configured 20/60s limit, because it
+# caches counts per-isolate and syncs them asynchronously in the background —
+# a burst that lands on several isolates lets each one count from zero.
+#
+# A Durable Object is a single source of truth: `idFromName(key)` always
+# routes to the same object instance, and a Durable Object serializes every
+# request to itself, so the fixed-window counter in rate-limiter-do.ts cannot
+# race the way the native binding did. The cost is scale (~1000 req/s per
+# object) and an extra storage hop, both fine here — no single machineId or
+# IP should ever see traffic near that volume; the goal is "a flood stays
+# noisy, not expensive," not defending a payments API under active attack.
+#
+# One binding, not two: the DO is addressed by key (`idFromName`), so
+# `ip:<hash>` and `machine:<id>` keys are already namespaced apart within it —
+# a second binding would only duplicate that, not add safety.
+#
+# A second review pass (still pre-release) found the first DO cut had three
+# more holes, all fixed in index.ts / rate-limiter-do.ts: (1) both tiers were
+# charging 1 per HTTP request regardless of batch size, so one compliant IP
+# could push ~144M events/day within a 100-req/60s limit — now charged by
+# `events.length`; (2) an attacker could pack many throwaway machineIds into
+# one batch, since each fresh id starts its own counter at zero — now capped
+# at MAX_DISTINCT_MACHINE_IDS (index.ts) per request; (3) every key ever seen
+# created a Durable Object that was never cleaned up, which Cloudflare bills
+# until the data is removed — `rate-limiter-do.ts`'s `alarm()` now self-expires
+# idle keys the way the old KV version's `expirationTtl` did.
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "RateLimiterDO"
+
+# `new_sqlite_classes`, not `new_classes`: the free Workers plan only allows
+# SQLite-backed Durable Object storage. The `state.storage.get/put` API used
+# in rate-limiter-do.ts is identical either way — this is a config-only fix.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RateLimiterDO"]
+
+# The old KV namespace (binding "RL", id a7b65fd9...) is no longer referenced
+# anywhere in this Worker. Left un-deleted deliberately — deleting a Cloudflare
+# resource is a one-way action outside this change's scope; it can be removed
+# by hand later (`wrangler kv namespace delete --namespace-id a7b65fd9...`)
+# once confirmed nothing else depends on it. Same for the native Rate Limiting
+# binding config removed above — it needed no separate resource, so removing
+# these lines was enough.
+
+[observability]
+enabled = true
+
+# PostHog credentials are Worker SECRETS, never committed and never shipped:
+#   wrangler secret put POSTHOG_KEY
+#   wrangler secret put POSTHOG_HOST   # optional, defaults to us.i.posthog.com
+#
+# Before going live, set a spend cap on the account. A public unauthenticated
+# endpoint should never be able to cost money, and the whole anti-abuse design
+# assumes a flood is merely noisy rather than expensive.

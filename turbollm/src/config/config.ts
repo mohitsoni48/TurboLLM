@@ -7,7 +7,7 @@ import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync 
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
-export const SCHEMA_VERSION = 3
+export const SCHEMA_VERSION = 4
 
 /** VRAM headroom slider bounds (MB) for auto-tune's spill-safety margin (see
  *  {@link Config.vramHeadroomMb} and `bench.ts`'s `overHeadroom`). */
@@ -595,7 +595,7 @@ export class ConfigStore {
 
 // ---- migration & validation ---------------------------------------------
 
-function migrate(raw: Record<string, unknown>, _from: number): Config {
+function migrate(raw: Record<string, unknown>, from: number): Config {
   const cfg = defaultConfig()
   if (typeof raw.host === 'string') cfg.daemon.host = raw.host
   if (typeof raw.port === 'number') cfg.daemon.port = raw.port
@@ -629,6 +629,16 @@ function migrate(raw: Record<string, unknown>, _from: number): Config {
       ;(cfg as unknown as Record<string, unknown>)[k] = v
     }
   }
+  // v3→v4 (ADR-299): every pre-existing config already has telemetry.level stored as
+  // 'off', because normalizeTelemetryLevel() has coerced any missing/legacy value to
+  // 'off' since ADR-041 — and TELEMETRY_UI_ENABLED was false for this product's ENTIRE
+  // life until this release, so no human could ever have chosen 'off' through the UI.
+  // Without this, the first-run consent card (gated on level === 'unset') would never
+  // fire for a single existing install, capping the whole journey/funnel dataset to
+  // brand-new installs from this release onward. Gated on `_from < 4` (not merely "this
+  // is inside migrate()") so a future, unrelated v4→v5 migration cannot re-fire this and
+  // wipe out a REAL 'off' choice a user makes after this release.
+  if (from < 4 && cfg.telemetry.level === 'off') cfg.telemetry.level = 'unset'
   return cfg
 }
 

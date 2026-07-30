@@ -10,6 +10,7 @@ import { Shell } from './components/Shell'
 import { UnreachableOverlay } from './components/UnreachableOverlay'
 import { AuthGate } from './components/AuthGate'
 import { useStatus } from './lib/queries'
+import { TelemetryConsentCard } from './components/TelemetryConsentCard'
 import { ApiError, setAuthToken } from './lib/api'
 import { subscribeCodeAuthNeeded, isCodeAuthNeeded } from './lib/auth-signal'
 
@@ -82,6 +83,9 @@ export function App() {
 
   return (
     <TooltipProvider delayDuration={300}>
+      {/* First-run telemetry consent (ADR-299). Renders only while the choice
+          is genuinely unanswered, and self-gates on TELEMETRY_UI_ENABLED. */}
+      <TelemetryConsentCard />
       <Shell status={statusQ.data} online={online} version={version}>
         <Suspense fallback={<ScreenFallback />}>
           <Routes>

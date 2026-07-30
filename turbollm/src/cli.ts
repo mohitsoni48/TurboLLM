@@ -38,6 +38,11 @@ import { reapStaleTerminals, killTrackedTerminalsSync } from './terminal/termina
 import { provisionTunnelApiKey } from './auth'
 import { TunnelManager, reapStaleTunnels, killTrackedTunnelsSync } from './tunnel/manager'
 import type { Deps } from './deps'
+import { TELEMETRY_ENV } from './telemetry/disabled'
+import { Emitter } from './telemetry/emit'
+import { reportModelLoad } from './telemetry/first-load'
+import { classifyLoadFailure } from './telemetry/classify'
+import { flush } from './telemetry/uploader'
 
 // Stop child processes (the agent engine's shell tool, engine binaries, git,
 // etc.) from flashing a console window on Windows when the daemon has no console
@@ -95,6 +100,11 @@ function argValue(name: string, fallback: string): string {
   const i = process.argv.indexOf(name)
   return i >= 0 && i + 1 < process.argv.length ? process.argv[i + 1] : fallback
 }
+
+// `--no-telemetry` is expressed as the env var rather than a second code path,
+// so the flag and TURBOLLM_TELEMETRY can never disagree (ADR-299). Set before
+// anything reads it. One-way by design: it can only turn telemetry off.
+if (hasFlag('--no-telemetry')) process.env[TELEMETRY_ENV] = 'off'
 
 /** The daemon's configured port from config.json, falling back to the shipped
  *  default. Best-effort — a missing/invalid config yields the shipped default.
@@ -200,6 +210,9 @@ if (hasFlag('--help', '-h')) {
     `                 tunnel (Cloud Launch) — prints the public URL + a required\n` +
     `                 access token. For running TurboLLM on a rented cloud GPU box.\n` +
     `  --config <f>   Path to a custom config file\n` +
+    `  --no-telemetry Disable telemetry entirely, whatever this install's saved\n` +
+    `                 setting says (same as TURBOLLM_TELEMETRY=off). For CI,\n` +
+    `                 containers, and scripted daemons.\n` +
     `  --stop         Stop a running TurboLLM daemon and exit\n` +
     `  --help, -h     Show this help message\n\n` +
     `Examples:\n` +
@@ -307,6 +320,49 @@ const appUpdates = new AppUpdateChecker(version)
 const deps: Deps = { store, registry, manager, scanner, hashes, db, provision, build, updates, appUpdates, hf, downloads, bench, modelRouter, comfy, tools: toolRegistry, version, startedAt }
 deps.gate = new GenerationGate()
 deps.agentTasks = new AgentTaskState()
+
+// Journey telemetry (ADR-299). Constructing it is unconditional and harmless —
+// the Emitter itself enforces consent and the kill switch, so there is no state
+// here that could leak if those checks were somehow skipped upstream.
+const telemetry = new Emitter({ dataDir: store.dir(), store, version, os: getSysInfo().os })
+deps.telemetry = telemetry
+telemetry.dailyActive()
+// model_first_load (ADR-299): the single most valuable journey event — the only
+// signal separating "never tried" from "tried and it broke". Observed at
+// Manager's atomic swap point rather than at the two routes.ts call sites,
+// which fire load() without awaiting and so cannot see the outcome.
+manager.onLoadSettled = (ok, err) =>
+  reportModelLoad(store.dir(), telemetry, ok ? 'ok' : 'fail', ok ? undefined : classifyLoadFailure(err))
+// Auto-tune's sweep is a SEPARATE path to a first load (Manager.start(), not
+// .load()) — a user whose first real model interaction is "let auto-tune find
+// the best settings" would otherwise never trigger model_first_load at all.
+// bench.ts reports its own outcome once the sweep concludes, since its internal
+// search probes are individually expected to fail sometimes and must not be
+// hooked the same way as a real load without corrupting the signal.
+bench.telemetry = telemetry
+// onboarding_step (ADR-299): where setup breaks. All three setup steps report
+// both outcomes; downloads additionally distinguish 'cancelled', because a user
+// who abandons a download deliberately is not the same signal as one whose
+// download broke, and conflating them reads a choice as a product defect.
+build.onSettled = (ok) => telemetry.emit('onboarding_step', { step: 'engine_build', outcome: ok ? 'ok' : 'fail' })
+provision.onSettled = (ok) => telemetry.emit('onboarding_step', { step: 'engine_install', outcome: ok ? 'ok' : 'fail' })
+downloads.onSettled = (outcome) => telemetry.emit('onboarding_step', { step: 'model_download', outcome })
+// Deferred so a slow or failing disk cannot delay the listen socket; unref'd so
+// it never holds the process open (ADR-009: telemetry is not a failure mode).
+setTimeout(() => {
+  telemetry.once('app_first_run')
+  void flush(store.dir(), store.snapshot().telemetry.level)
+}, 3_000).unref()
+// Recurring flush (ADR-299) — found missing during live end-to-end testing, not
+// designed in from the start. Without this, the 3-second boot flush above is the
+// ONLY time this daemon ever drains the queue: events would enqueue correctly
+// for the entire life of the process but almost never actually reach the Worker,
+// since a real user's consent decision — and therefore any meaningful activity —
+// virtually always happens well after the 3-second mark. Every unit test passed
+// because they call flush() directly; nothing exercised the daemon's own
+// scheduling of it. Re-reads the level fresh on every tick (not the value at
+// startup), so a mid-session opt-out is honoured on the very next flush.
+setInterval(() => void flush(store.dir(), store.snapshot().telemetry.level), 5 * 60_000).unref()
 // Cloud Launch (ADR-045/152): only wired when --tunnel is passed. Its mere presence
 // on Deps is what forces auth enforcement on tunneled traffic (see auth.ts lanAuth) —
 // absent entirely for the vast majority of runs that never asked for a tunnel.

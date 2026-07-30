@@ -17,6 +17,7 @@ import type { ToolRegistry } from './tools/tool-registry'
 import type { GenerationGate } from './agents/gate'
 import type { TunnelManager } from './tunnel/manager'
 import type { AgentTaskState } from './agents/task-state'
+import type { Emitter } from './telemetry/emit'
 
 export interface Deps {
   store: ConfigStore
@@ -57,6 +58,9 @@ export interface Deps {
   /** Background agent-task registry (reviewer + skill distill). Surfaced via /status
    *  so the UI can show running bg tasks inline. Optional — absent under tests. */
   agentTasks?: AgentTaskState
+  /** Journey-event emitter (ADR-299). Optional — absent under tests, where the
+   *  middleware simply skips rather than every test needing to stub telemetry. */
+  telemetry?: Emitter
   version: string
   startedAt: number
   /** Re-exec the daemon so config changes (port, LAN bind) take effect (spec 08 §2).

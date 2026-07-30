@@ -55,6 +55,10 @@ import { DownloadError } from '../downloads/downloads'
 import { BenchError } from '../bench/bench'
 import { inferRepoFromPath } from './path-utils'
 import { screenshotArtifact, findChrome } from '../artifacts/screenshot'
+import { readQueue, remove as removeQueued } from '../telemetry/queue'
+import { sendConsentChoice } from '../telemetry/consent'
+import { readSentLog } from '../telemetry/log'
+import { TELEMETRY_SCHEMA_VERSION } from '../telemetry/schema'
 
 type Status = 200 | 201 | 202 | 400 | 401 | 403 | 404 | 409 | 500 | 501 | 503
 
@@ -1811,6 +1815,12 @@ export function registerApi(app: Hono, d: Deps): void {
       // without requiring a full daemon restart.
       await d.tools?.buildToolDefinitions()
     }
+    // Report the consent choice once, ever (ADR-299 Decision 5). This is the
+    // ONLY transmission a machine that chose Off ever makes, and the consent
+    // copy is written to say exactly that. Fire-and-forget: the settings save
+    // must not wait on, or fail because of, a network call.
+    if (telemetryLevel !== undefined) void sendConsentChoice(d.store.dir(), telemetryLevel)
+
     const after = d.store.snapshot().daemon
 
     // A LAN-bind or port change re-points the HTTP listener. Rather than a full daemon
@@ -1908,6 +1918,25 @@ export function registerApi(app: Hono, d: Deps): void {
     const raw = (c.req.query('level') ?? '').trim()
     const level = ['off', 'anon', 'full'].includes(raw) ? raw : 'off'
     return c.json(telemetryPreview(level, d.version))
+  })
+
+  // The local submission log (ADR-299): exactly what left this machine, stored
+  // verbatim. Every other privacy claim in the product is a sentence in a doc;
+  // this is the one that lets a user check those sentences for themselves.
+  app.get('/api/v1/telemetry/log', (c) => c.json({ entries: readSentLog(d.store.dir()) }))
+
+  // Regenerate the anonymous machine id (ADR-299). The data contract promises
+  // this UUID is "not tied to identity; regeneratable" — that promise needs a
+  // control behind it, not just a sentence in the docs. Anything already queued
+  // is discarded: it carries the OLD id, so uploading it after a regenerate
+  // would link the two ids together and defeat the point.
+  app.post('/api/v1/telemetry/regenerate-id', (c) => {
+    const machineId = randomUUID()
+    d.store.update((cfg) => {
+      cfg.telemetry.machineId = machineId
+    })
+    for (const q of readQueue(d.store.dir())) removeQueued(d.store.dir(), q.file)
+    return c.json({ machineId })
   })
 
   // ── network info (spec 08 §2): LAN expose state + the reachable LAN URL + whether
@@ -2283,6 +2312,13 @@ function settingsPayload(d: Deps) {
     lanBind: cfg.daemon.lanBind,
     requireApiKey: cfg.daemon.requireApiKey,
     telemetryLevel,
+    // Whether the user has ever actually answered (ADR-299 Decision 4).
+    // `telemetryLevel` above deliberately collapses the first-run 'unset'
+    // sentinel to 'off' so every consumer fails safe — but that also makes
+    // "never asked" indistinguishable from "chose Off", and the first-run
+    // consent card needs exactly that distinction. Hence a separate flag
+    // rather than leaking 'unset' into the level enum.
+    telemetryDecided: cfg.telemetry.level !== 'unset',
     modelDefaults: cfg.modelDefaults,
     comfyui: cfg.comfyui,
     gateway: cfg.gateway,
@@ -2326,7 +2362,16 @@ function settingsPayload(d: Deps) {
  *  by construction — only whitelisted fields are placed here. */
 function telemetryPreview(level: string, version: string) {
   if (level === 'off') {
-    return { level, sends: false, note: 'Telemetry is off. Nothing is collected or sent.', payload: null }
+    // Honest about the one exception (ADR-299 Decision 5): Off still reports the
+    // choice itself, once, with nothing attached. The preview shows that exact
+    // ping rather than claiming nothing is sent — this endpoint exists so the
+    // user can check our claims against reality, so it must not overstate them.
+    return {
+      level,
+      sends: true,
+      note: 'Telemetry is off. The only thing ever sent is this one-time record of your choice — no machine id, no hardware, no timestamp. Nothing else, ever.',
+      payload: [{ schema: TELEMETRY_SCHEMA_VERSION, event: 'consent_choice', level: 'off' }],
+    }
   }
   const sys = getSysInfo()
   const hw = {

@@ -11,6 +11,7 @@ import { registerAgentRoutes } from './agents/agent-routes'
 import { registerCodeRoutes } from './code/code-routes'
 import type { Deps } from './deps'
 import { registerGateway } from './gateway/gateway'
+import { featureForPath } from './telemetry/feature-map'
 import { registerTerminalRoutes } from './terminal/terminal-routes'
 import { lanAuth, codeAuth } from './auth'
 
@@ -64,6 +65,16 @@ export function createApp(d: Deps): Hono {
   // Code-specific gate (independent of requireApiKey — see auth.ts's codeAuth doc comment):
   // Code always needs a key from a non-host device, even when the rest of the app is open.
   app.use('/api/v1/code/*', codeAuth(d))
+
+  // Feature-discovery telemetry (ADR-299). Runs AFTER the auth gates above, so
+  // a request that was rejected never counts as the user discovering anything.
+  // Only the path is inspected — never the body, never the query string — and
+  // the emitter itself decides whether consent permits recording it.
+  app.use('*', async (c, next) => {
+    const feature = d.telemetry ? featureForPath(c.req.path) : null
+    if (feature !== null) d.telemetry?.firstUse(feature)
+    await next()
+  })
 
   app.get('/healthz', (c) => c.json({ status: 'ok', version: d.version }))
 
