@@ -24,6 +24,7 @@ import { enqueue } from '../telemetry/queue'
 import { TELEMETRY_SCHEMA_VERSION } from '../telemetry/schema'
 import { reportModelLoad } from '../telemetry/first-load'
 import { classifyBenchFailure } from '../telemetry/classify'
+import { telemetryDisabled } from '../telemetry/disabled'
 import type { Emitter } from '../telemetry/emit'
 import {
   buildCardExtractionPrompt,
@@ -1161,6 +1162,10 @@ export class BenchRunner {
    *  (ADR-299); this method owns only the consent check and the payload shape. */
   private queueTelemetry(record: BenchResult, entry: ModelEntry, sys: SysInfo, appVersion: string, engineVersion: string): void {
     try {
+      // The kill switch was missing here entirely before pre-release review —
+      // only emit.ts/consent.ts had checked it, so `--no-telemetry` did not stop
+      // bench telemetry at all. Checked before consent, same as everywhere else.
+      if (telemetryDisabled()) return
       const cfg = this.store.snapshot()
       const level = cfg.telemetry.level
       if (level !== 'anon' && level !== 'full') return // 'off' / 'unset' → write nothing (AC#4)

@@ -16,6 +16,7 @@
 
 import { readQueue, remove } from './queue'
 import { recordSent } from './log'
+import { telemetryDisabled } from './disabled'
 
 /** The ingest endpoint. Public and openly documented — there is nothing secret
  *  about the URL, and pretending otherwise would be security theatre. */
@@ -43,7 +44,11 @@ export async function flush(dataDir: string, level: string, transport: Transport
   try {
     const queued = readQueue(dataDir)
 
-    if (!mayTransmit(level)) {
+    // The kill switch overrides stored consent entirely — found missing here in
+    // pre-release review; only emit.ts/consent.ts had checked it. Treated
+    // exactly like consent being off: purge rather than preserve, so nothing
+    // sits on disk waiting for the flag to be removed later.
+    if (telemetryDisabled() || !mayTransmit(level)) {
       for (const q of queued) remove(dataDir, q.file)
       return
     }

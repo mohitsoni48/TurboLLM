@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { enqueue, readQueue } from './queue'
 import { flush, type Transport } from './uploader'
 import { readSentLog } from './log'
+import { TELEMETRY_ENV } from './disabled'
 
 function tempDir(): string {
   return mkdtempSync(join(tmpdir(), 'turbollm-uploader-'))
@@ -147,6 +148,48 @@ test('flush: consent unset also sends nothing — an undecided user has not opte
 
     assert.equal(sent.length, 0)
   } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('flush: the --no-telemetry kill switch overrides even a granted "anon" consent', async () => {
+  // Found in Opus pre-release review: flush() never checked telemetryDisabled()
+  // at all — only emit.ts and consent.ts honoured it. An install started with
+  // --no-telemetry but a stored consent of 'anon' would still upload anything
+  // already queued (e.g. by a bench run, which ALSO never checked it).
+  const dir = tempDir()
+  const prev = process.env[TELEMETRY_ENV]
+  process.env[TELEMETRY_ENV] = 'off'
+  try {
+    enqueue(dir, validEvent())
+    const { transport, sent } = fakeTransport('ok')
+
+    await flush(dir, 'anon', transport)
+
+    assert.equal(sent.length, 0, 'the kill switch must stop the send outright')
+  } finally {
+    if (prev === undefined) delete process.env[TELEMETRY_ENV]
+    else process.env[TELEMETRY_ENV] = prev
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('flush: the kill switch purges the queue too, same as consent being off', async () => {
+  // The switch must not leave events sitting on disk waiting for the flag to
+  // be removed later — matching the existing off/unset purge semantics exactly.
+  const dir = tempDir()
+  const prev = process.env[TELEMETRY_ENV]
+  process.env[TELEMETRY_ENV] = 'off'
+  try {
+    enqueue(dir, validEvent())
+    const { transport } = fakeTransport('ok')
+
+    await flush(dir, 'anon', transport)
+
+    assert.equal(readQueue(dir).length, 0)
+  } finally {
+    if (prev === undefined) delete process.env[TELEMETRY_ENV]
+    else process.env[TELEMETRY_ENV] = prev
     rmSync(dir, { recursive: true, force: true })
   }
 })
