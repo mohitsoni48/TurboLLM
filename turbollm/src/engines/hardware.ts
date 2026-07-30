@@ -23,7 +23,15 @@ export function detectHardware(info: SysInfo = getSysInfo()): HardwareProfile {
   const hasGpu = gpuVendor !== 'unknown' && info.gpus.length > 0
   // The headline GPU: prefer one matching the primary vendor (the dGPU that
   // drives backend selection), else fall back to the card with the most VRAM.
-  const ofVendor = info.gpus.filter((g) => g.vendor === gpuVendor)
+  const allOfVendor = info.gpus.filter((g) => g.vendor === gpuVendor)
+  // Drop shared-memory GPUs (an APU/iGPU whose "VRAM" is a slice of system RAM) as soon as the
+  // same vendor also has a real card. Those two budgets are not two pools — the iGPU's share is
+  // the same RAM the box already has — so summing them double-counts it. Left unguarded, an AMD
+  // APU (16 GB of GTT) next to an RX 7600M XT (8 GB) reported 24.7 GB and the fit check would
+  // green-light a ~24 GB model onto an 8 GB card. Same shape on Windows for an Intel iGPU beside
+  // an Intel Arc dGPU. Matches ADR-189's rule that an iGPU only counts when it's the only GPU.
+  // ADR-306.
+  const ofVendor = allOfVendor.some((g) => !g.unified) ? allOfVendor.filter((g) => !g.unified) : allOfVendor
   const pool = ofVendor.length ? ofVendor : info.gpus
   const headline = pool.reduce<(typeof pool)[number] | undefined>(
     (best, g) => (!best || g.vramMb > best.vramMb ? g : best),

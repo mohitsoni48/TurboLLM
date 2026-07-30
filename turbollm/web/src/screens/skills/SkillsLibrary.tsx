@@ -26,8 +26,9 @@ function SkillCard({ skill, onOpen }: { skill: Skill; onOpen: () => void }) {
       {(skill.builtin || skill.tools.length > 0) && (
         <div className="mt-auto flex items-center gap-2">
           {skill.tools.length > 0 && (
-            <p className="flex min-w-0 items-center gap-1 truncate text-[11px] text-faint" title={skill.tools.join(', ')}>
-              <Wrench size={10} className="shrink-0" /> {skill.tools.join(', ')}
+            // truncate on the text, not the flex row — see AgentsLibrary.
+            <p className="flex min-w-0 items-center gap-1 text-[11px] text-faint" title={skill.tools.join(', ')}>
+              <Wrench size={10} className="shrink-0" /> <span className="truncate">{skill.tools.join(', ')}</span>
             </p>
           )}
           {skill.builtin && (

@@ -51,11 +51,16 @@ function AgentCard({ agent, isDefault, onOpen, onSetDefault, onReset }: {
       {(agent.builtin || skillCount || toolCount) ? (
         <div className="mt-auto flex items-center gap-2">
           {(skillCount || toolCount) ? (
-            <p className="flex min-w-0 items-center gap-1 truncate text-[11px] text-faint">
+            // `truncate` has to sit on the text itself, not on this flex row: text-overflow
+            // doesn't apply to flex items, so a clamped row would hard-cut mid-glyph with no
+            // ellipsis. The row keeps min-w-0 so it can actually shrink.
+            <p className="flex min-w-0 items-center gap-1 text-[11px] text-faint">
               <Wrench size={10} className="shrink-0" />
-              {skillCount ? `${skillCount} skill${skillCount === 1 ? '' : 's'}` : null}
-              {skillCount && toolCount ? ' · ' : null}
-              {toolCount ? `${toolCount} tool${toolCount === 1 ? '' : 's'}` : null}
+              <span className="truncate">
+                {skillCount ? `${skillCount} skill${skillCount === 1 ? '' : 's'}` : null}
+                {skillCount && toolCount ? ' · ' : null}
+                {toolCount ? `${toolCount} tool${toolCount === 1 ? '' : 's'}` : null}
+              </span>
             </p>
           ) : null}
           {agent.builtin && (

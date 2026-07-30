@@ -7,7 +7,7 @@ import {
   parseLspciMm,
   amdApuVramMb,
   parseKfdNodes,
-  pciSlotToKfdLocationId,
+  pciSlotToKfdIds,
   linuxGpuFromLspci,
 } from './sysinfo'
 
@@ -207,21 +207,30 @@ const KFD_CPU_NODE = 'cpu_cores_count 32\nsimd_count 0\nlocation_id 0\ndomain 0\
 const KFD_APU_NODE = 'cpu_cores_count 32\nsimd_count 512\nmax_waves_per_simd 16\nlocation_id 50688\ndomain 0\n'
 const KFD_DGPU_NODE = 'cpu_cores_count 0\nsimd_count 448\nmax_waves_per_simd 32\nlocation_id 256\ndomain 0\n'
 
-test('parseKfdNodes: a fused CPU+SIMD node is an APU; a SIMD-only node is discrete', () => {
-  assert.deepEqual(parseKfdNodes([KFD_APU_NODE]), [{ locationId: 50688, apu: true }])
-  assert.deepEqual(parseKfdNodes([KFD_DGPU_NODE]), [{ locationId: 256, apu: false }])
+test('parseKfdNodes: a fused CPU+SIMD node is flagged; a SIMD-only node is not', () => {
+  assert.deepEqual(parseKfdNodes([KFD_APU_NODE]), [{ domain: 0, locationId: 50688, fused: true }])
+  assert.deepEqual(parseKfdNodes([KFD_DGPU_NODE]), [{ domain: 0, locationId: 256, fused: false }])
 })
 
 test('parseKfdNodes: CPU-only nodes (no SIMDs) are skipped', () => {
   assert.deepEqual(parseKfdNodes([KFD_CPU_NODE]), [])
-  assert.deepEqual(parseKfdNodes([KFD_CPU_NODE, KFD_DGPU_NODE]), [{ locationId: 256, apu: false }])
+  assert.deepEqual(parseKfdNodes([KFD_CPU_NODE, KFD_DGPU_NODE]), [{ domain: 0, locationId: 256, fused: false }])
+})
+
+test('parseKfdNodes: a modern APU node is NOT fused — the premise ADR-304 got wrong', () => {
+  // kfd_assign_gpu(): "Discrete GPUs need their own topology device list entries. Don't assign
+  // them to CPU/APU nodes." — `if (dev->node_props.cpu_cores_count) continue;`, unconditional
+  // since IOMMUv2 was removed in 6.6. So a current-kernel APU iGPU looks exactly like a discrete
+  // node here, and `fused: false` must therefore mean "don't know", never "not an APU".
+  const strixHaloNode = 'cpu_cores_count 0\nsimd_count 512\nlocation_id 50688\ndomain 0\n'
+  assert.deepEqual(parseKfdNodes([strixHaloNode]), [{ domain: 0, locationId: 50688, fused: false }])
 })
 
 test('parseKfdNodes: an APU box with a discrete card alongside it reports both', () => {
   const nodes = parseKfdNodes([KFD_CPU_NODE, KFD_APU_NODE, KFD_DGPU_NODE])
   assert.equal(nodes.length, 2)
-  assert.equal(nodes.filter((n) => n.apu).length, 1)
-  assert.equal(nodes.filter((n) => !n.apu).length, 1)
+  assert.equal(nodes.filter((n) => n.fused).length, 1)
+  assert.equal(nodes.filter((n) => !n.fused).length, 1)
 })
 
 test('parseKfdNodes: empty/garbage properties bodies are skipped, not crashed on', () => {
@@ -229,19 +238,26 @@ test('parseKfdNodes: empty/garbage properties bodies are skipped, not crashed on
   assert.deepEqual(parseKfdNodes(['', 'simd_count not-a-number\n', 'unrelated 5\n']), [])
 })
 
-test('pciSlotToKfdLocationId: matches the kernel pci_dev_id() encoding', () => {
+test('pciSlotToKfdIds: matches the kernel pci_dev_id() encoding', () => {
   // The reporter's slot: bus 0xc6, device 0, function 0 → (0xc6 << 8) = 50688, the location_id
   // in KFD_APU_NODE above.
-  assert.equal(pciSlotToKfdLocationId('c6:00.0'), 50688)
-  assert.equal(pciSlotToKfdLocationId('0000:c6:00.0'), 50688) // sysfs form, with the domain
-  assert.equal(pciSlotToKfdLocationId('01:00.0'), 256)
-  assert.equal(pciSlotToKfdLocationId('03:04.2'), 802) // (3 << 8) | (4 << 3) | 2
+  assert.deepEqual(pciSlotToKfdIds('c6:00.0'), { domain: 0, locationId: 50688 })
+  assert.deepEqual(pciSlotToKfdIds('0000:c6:00.0'), { domain: 0, locationId: 50688 }) // sysfs form
+  assert.deepEqual(pciSlotToKfdIds('01:00.0'), { domain: 0, locationId: 256 })
+  assert.deepEqual(pciSlotToKfdIds('03:04.2'), { domain: 0, locationId: 802 }) // (3 << 8) | (4 << 3) | 2
 })
 
-test('pciSlotToKfdLocationId: null for anything not a PCI slot', () => {
-  assert.equal(pciSlotToKfdLocationId(''), null)
-  assert.equal(pciSlotToKfdLocationId('not-a-slot'), null)
-  assert.equal(pciSlotToKfdLocationId('c6:00'), null)
+test('pciSlotToKfdIds: the PCI domain is kept, so segments cannot collide', () => {
+  // location_id alone is identical across segments — without the domain a discrete card in
+  // segment 1 would match an APU's node in segment 0 and wrongly inherit its GTT (ADR-306).
+  assert.deepEqual(pciSlotToKfdIds('0001:c6:00.0'), { domain: 1, locationId: 50688 })
+  assert.notDeepEqual(pciSlotToKfdIds('0001:c6:00.0'), pciSlotToKfdIds('0000:c6:00.0'))
+})
+
+test('pciSlotToKfdIds: null for anything not a PCI slot', () => {
+  assert.equal(pciSlotToKfdIds(''), null)
+  assert.equal(pciSlotToKfdIds('not-a-slot'), null)
+  assert.equal(pciSlotToKfdIds('c6:00'), null)
 })
 
 // ---- linuxGpuFromLspci: the end-to-end per-adapter decision, with sysfs + KFD injected. These
@@ -249,6 +265,8 @@ test('pciSlotToKfdLocationId: null for anything not a PCI slot', () => {
 
 const RAM_131GB = 131.2e9
 const STRIX_HALO_MEM = { vramMb: 1073, gttMb: 115_964 } // the reporter's carveout + GTT pool
+const RX_9070_LSPCI =
+  '03:00.0 "VGA compatible controller" "Advanced Micro Devices, Inc. [AMD/ATI]" "Navi 48 [Radeon RX 9070/9070 XT]" -rc0 "Sapphire Technology Limited" "Device e51a"'
 
 test('linuxGpuFromLspci: GitHub #85 — a Strix Halo APU reports its full unified-memory budget', () => {
   const gpu = linuxGpuFromLspci(STRIX_HALO_LSPCI, () => STRIX_HALO_MEM, () => true, RAM_131GB)
@@ -262,8 +280,7 @@ test('linuxGpuFromLspci: GitHub #85 — a Strix Halo APU reports its full unifie
 test('linuxGpuFromLspci: a DISCRETE AMD card never counts GTT toward VRAM', () => {
   // GTT for a discrete card is system RAM across PCIe — counting it would over-report a 16 GB
   // card as ~80 GB and green-light loads that OOM.
-  const line = '03:00.0 "VGA compatible controller" "Advanced Micro Devices, Inc. [AMD/ATI]" "Navi 48 [Radeon RX 9070/9070 XT]" -rc0 "Sapphire Technology Limited" "Device e51a"'
-  const gpu = linuxGpuFromLspci(line, () => ({ vramMb: 17_180, gttMb: 65_600 }), () => false, RAM_131GB)
+  const gpu = linuxGpuFromLspci(RX_9070_LSPCI, () => ({ vramMb: 17_180, gttMb: 65_600 }), () => false, RAM_131GB)
   assert.ok(gpu)
   assert.equal(gpu.vendor, 'amd')
   assert.equal(gpu.vramMb, 17_180)
@@ -287,6 +304,32 @@ test('linuxGpuFromLspci: an Intel iGPU (no amdgpu sysfs at all) keeps the 50%-of
   assert.equal(gpu.vendor, 'intel')
   assert.equal(gpu.name, '3rd Gen Core processor Graphics Controller')
   assert.equal(gpu.vramMb, 8000)
+})
+
+test('linuxGpuFromLspci: the APU budget is tagged unified so it is never pooled with a real card', () => {
+  const gpu = linuxGpuFromLspci(STRIX_HALO_LSPCI, () => STRIX_HALO_MEM, () => true, RAM_131GB)
+  assert.equal(gpu?.unified, true)
+  // A discrete card must NOT carry the flag, or detectHardware would drop it from the sum.
+  const dgpu = linuxGpuFromLspci(RX_9070_LSPCI, () => ({ vramMb: 17_180, gttMb: 65_600 }), () => false, RAM_131GB)
+  assert.equal(dgpu?.unified, undefined)
+})
+
+test('linuxGpuFromLspci: an unknown device keeps its vendor in the display name', () => {
+  // A card newer than the local pci.ids prints as a bare "Device 7550" — meaningless alone.
+  const line = '03:00.0 "VGA compatible controller" "Advanced Micro Devices, Inc. [AMD/ATI]" "Device 7550" -rc0 "Sapphire Technology Limited" "Device e51a"'
+  const gpu = linuxGpuFromLspci(line, () => ({ vramMb: 17_180, gttMb: 0 }), () => false, RAM_131GB)
+  assert.equal(gpu?.name, 'Advanced Micro Devices, Inc. [AMD/ATI] Device 7550')
+  assert.equal(gpu?.vendor, 'amd')
+})
+
+test('linuxGpuFromLspci: does not log unless the caller passes a logger', () => {
+  // The log is a real diagnostic in production (it is how the next APU report gets triaged), but
+  // it must not fire during unit tests — hence the injected no-op default.
+  const lines: string[] = []
+  linuxGpuFromLspci(STRIX_HALO_LSPCI, () => STRIX_HALO_MEM, () => true, RAM_131GB)
+  linuxGpuFromLspci(STRIX_HALO_LSPCI, () => STRIX_HALO_MEM, () => true, RAM_131GB, (m) => lines.push(m))
+  assert.equal(lines.length, 1)
+  assert.match(lines[0], /gtt=115964MB → 117037MB usable/)
 })
 
 test('linuxGpuFromLspci: a line that does not parse still yields the old whole-line behaviour', () => {

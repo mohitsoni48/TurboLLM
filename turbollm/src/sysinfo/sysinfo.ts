@@ -11,6 +11,11 @@ export interface GpuInfo {
   name: string
   vramMb: number
   vendor: GpuVendor
+  /** True when `vramMb` is a slice of system RAM rather than dedicated VRAM — an APU's
+   *  carveout+GTT budget, Apple's unified memory, or an iGPU's shared-memory estimate. Such a
+   *  budget must never be *summed* with a discrete card's real VRAM (`detectHardware`), because
+   *  they are not two pools: the iGPU's share is the same RAM the box already has. ADR-306. */
+  unified?: boolean
 }
 export interface SysInfo {
   os: string
@@ -134,7 +139,7 @@ function detectGpus(): GpuInfo[] {
       const out = execFileSync('system_profiler', ['SPDisplaysDataType'], { timeout: 8000 }).toString()
       const m = out.match(/Chipset Model:\s*(.+)/)
       if (m && /Apple/.test(out)) {
-        return [{ name: m[1].trim(), vramMb: Math.round((os.totalmem() / 1e6) * 0.65), vendor: 'apple' }]
+        return [{ name: m[1].trim(), vramMb: Math.round((os.totalmem() / 1e6) * 0.65), vendor: 'apple', unified: true }]
       }
     } catch {
       /* ignore */
@@ -191,10 +196,13 @@ function enumWindowsGpus(): GpuInfo[] {
       // red. Apply the same shared-memory heuristic used for Apple Silicon below,
       // scaled down (50% vs. 65%) to match Windows' more conservative default
       // "shared GPU memory" cap.
-      const vramMb = isIntegratedGpuName(nm)
+      const integrated = isIntegratedGpuName(nm)
+      const vramMb = integrated
         ? Math.round((os.totalmem() / 1e6) * 0.5)
         : bytes > 0 ? Math.round(bytes / 1e6) : 0
-      return { name: nm, vramMb, vendor: classifyVendor(nm) }
+      // `unified`: a shared-memory estimate must not be pooled with a discrete card of the same
+      // vendor (an Intel iGPU next to an Intel Arc dGPU is the live case here). ADR-306.
+      return { name: nm, vramMb, vendor: classifyVendor(nm), ...(integrated ? { unified: true } : {}) }
     })
     .filter((g) => g.name && g.vendor !== 'unknown')
 
@@ -328,7 +336,7 @@ function enumLinuxGpus(): GpuInfo[] {
         .trim()
         .split('\n')
         .filter(Boolean)
-        .map((line) => linuxGpuFromLspci(line, linuxAmdgpuMem, linuxAmdIsApu, os.totalmem()))
+        .map((line) => linuxGpuFromLspci(line, linuxAmdgpuMem, linuxAmdIsApu, os.totalmem(), console.log))
         .filter((g): g is GpuInfo => g !== null && g.vendor !== 'unknown')
 
       if (gpus.length) return gpus
@@ -397,7 +405,7 @@ function makeVulkanGpu(name: string, deviceType: string): GpuInfo {
   const vramMb = integrated
     ? Math.round((os.totalmem() / 1e6) * 0.5)
     : 0
-  return { name, vramMb, vendor }
+  return { name, vramMb, vendor, ...(integrated ? { unified: true } : {}) }
 }
 
 /** One `lspci -mm` line, split into fields. Format:
@@ -427,6 +435,7 @@ export function linuxGpuFromLspci(
   readMem: (pciSlot: string) => AmdgpuMem,
   isApu: (pciSlot: string, label: string) => boolean,
   totalRamBytes: number,
+  log: (msg: string) => void = () => {},
 ): GpuInfo | null {
   const entry = parseLspciMm(line)
   const slot = entry?.slot ?? (line.trim().split(/\s+/)[0] ?? '')
@@ -440,7 +449,10 @@ export function linuxGpuFromLspci(
   // read as a PCI dump in Settings → Hardware ("c6:00.0 Display controller Advanced Micro
   // Devices, Inc. [AMD/ATI] Strix Halo [Ra…" — GitHub #85's screenshot). GPU names are
   // display/log-only (nothing branches on them), so this is safe. ADR-304.
-  const name = entry ? entry.device.slice(0, 80) : line.replace(/"/g, '').trim().slice(0, 80)
+  // A device newer than the local pci.ids has no name there, and lspci prints a bare
+  // "Device 7550" — useless on its own, so keep the vendor in front of it (ADR-306).
+  const device = entry ? (/^device\s+[0-9a-f]{4}$/i.test(entry.device) ? `${entry.vendor} ${entry.device}` : entry.device) : ''
+  const name = entry ? device.slice(0, 80) : line.replace(/"/g, '').trim().slice(0, 80)
   const vendor = classifyVendor(label)
   const mem = readMem(slot)
   // sysfs's mem_info_vram_total only exists for amdgpu-driven cards (dedicated
@@ -449,14 +461,17 @@ export function linuxGpuFromLspci(
   // was making quant auto-selection always pick the smallest file and the fit
   // check always show red, on hardware where the real constraint is different.
   let vramMb = mem.vramMb
+  let unified = false
   if (mem.vramMb > 0 && vendor === 'amd' && mem.gttMb > 0 && isApu(slot, label)) {
     // Unified-memory APU: the BIOS carveout alone is NOT the budget (GitHub #85).
     vramMb = amdApuVramMb(mem.vramMb, mem.gttMb, totalRamBytes)
-    console.log(`[sysinfo] amdgpu APU at ${slot}: vram=${mem.vramMb}MB + gtt=${mem.gttMb}MB → ${vramMb}MB usable`)
-  } else if (vramMb === 0) {
-    vramMb = isIntegratedGpuName(label) ? Math.round((totalRamBytes / 1e6) * 0.5) : 0
+    unified = true
+    log(`[sysinfo] amdgpu APU at ${slot}: vram=${mem.vramMb}MB + gtt=${mem.gttMb}MB → ${vramMb}MB usable`)
+  } else if (vramMb === 0 && isIntegratedGpuName(label)) {
+    vramMb = Math.round((totalRamBytes / 1e6) * 0.5)
+    unified = true
   }
-  return { name, vramMb, vendor }
+  return { name, vramMb, vendor, ...(unified ? { unified: true } : {}) }
 }
 
 /** amdgpu's two memory pools for one adapter, in MB (0 = attribute absent/unreadable).
@@ -506,17 +521,23 @@ export function amdApuVramMb(vramMb: number, gttMb: number, totalRamBytes: numbe
   return Math.max(vramMb, Math.min(vramMb + gttMb, cap))
 }
 
-/** One KFD topology node that has SIMDs (i.e. a GPU), and whether it's a fused APU. */
+/** One KFD topology node that has SIMDs (i.e. a GPU), and whether it is a *fused* node — one
+ *  the kernel attached to a CPU node, which only ever happens for an APU. */
 export interface KfdGpuNode {
+  domain: number
   locationId: number
-  apu: boolean
+  fused: boolean
 }
 
 /** Pure parser for `/sys/class/kfd/kfd/topology/nodes/N/properties` bodies, split out for direct
- *  testing. A node reporting BOTH SIMDs and CPU cores is a fused device — this is ROCm's own
- *  definition of an APU (the kernel's `AMDGPU_IDS_FLAGS_FUSION`, which is otherwise only
- *  reachable via a DRM ioctl); a discrete GPU's node always reports `cpu_cores_count 0`. Nodes
- *  with no SIMDs are plain CPU nodes and are skipped. ADR-304. */
+ *  testing. Nodes with no SIMDs are plain CPU nodes and are skipped.
+ *
+ *  `fused` (SIMDs **and** CPU cores on one node) proves an APU but does **not** disprove one —
+ *  see {@link linuxAmdIsApu}. ADR-306 corrects ADR-304 here: `kfd_assign_gpu()` skips every
+ *  device with `cpu_cores_count` when placing a GPU (*"Discrete GPUs need their own topology
+ *  device list entries. Don't assign them to CPU/APU nodes."*), unconditionally since IOMMUv2 was
+ *  removed in 6.6. So on any current kernel even an APU's iGPU gets its own node reporting
+ *  `cpu_cores_count 0`, and only the old IOMMUv2 parts (Kaveri/Carrizo/Raven) ever fuse. */
 export function parseKfdNodes(propsTexts: string[]): KfdGpuNode[] {
   const nodes: KfdGpuNode[] = []
   for (const text of propsTexts) {
@@ -525,36 +546,45 @@ export function parseKfdNodes(propsTexts: string[]): KfdGpuNode[] {
       return m ? parseInt(m[1], 10) : 0
     }
     if (prop('simd_count') <= 0) continue // CPU-only node
-    nodes.push({ locationId: prop('location_id'), apu: prop('cpu_cores_count') > 0 })
+    nodes.push({ domain: prop('domain'), locationId: prop('location_id'), fused: prop('cpu_cores_count') > 0 })
   }
   return nodes
 }
 
-/** KFD's `location_id` for a PCI slot — the kernel stores `pci_dev_id()`, i.e.
- *  `(bus << 8) | (device << 3) | function`. Null when the slot isn't in lspci's
- *  `[domain:]bus:device.function` form. */
-export function pciSlotToKfdLocationId(slot: string): number | null {
-  const m = /^(?:[0-9a-f]{1,4}:)?([0-9a-f]{1,2}):([0-9a-f]{1,2})\.([0-7])$/i.exec(slot.trim())
+/** A PCI slot split into the two halves KFD keys a node by: the domain (PCI segment) and
+ *  `pci_dev_id()` = `(bus << 8) | (device << 3) | function`. Null when the slot isn't in lspci's
+ *  `[domain:]bus:device.function` form. Both halves matter: `location_id` alone is identical for
+ *  `0000:c6:00.0` and `0001:c6:00.0`, so a multi-segment box could match a discrete card against
+ *  an APU's node (ADR-306). */
+export function pciSlotToKfdIds(slot: string): { domain: number; locationId: number } | null {
+  const m = /^(?:([0-9a-f]{1,4}):)?([0-9a-f]{1,2}):([0-9a-f]{1,2})\.([0-7])$/i.exec(slot.trim())
   if (!m) return null
-  return (parseInt(m[1], 16) << 8) | ((parseInt(m[2], 16) & 0x1f) << 3) | parseInt(m[3], 10)
+  return {
+    domain: m[1] === undefined ? 0 : parseInt(m[1], 16),
+    locationId: (parseInt(m[2], 16) << 8) | ((parseInt(m[3], 16) & 0x1f) << 3) | parseInt(m[4], 10),
+  }
 }
 
 /** Is this amdgpu adapter a unified-memory APU (so GTT counts toward the offload budget)?
- *  KFD topology is authoritative when present; the GPU-name heuristic is the fallback for boxes
- *  where amdkfd isn't loaded. ADR-304. */
+ *
+ *  **KFD may only ever answer YES, never NO** (ADR-306). A fused node proves an APU; the absence
+ *  of one proves nothing, because current kernels give every GPU its own node (see
+ *  {@link parseKfdNodes}). ADR-304 shipped this as `if (match) return match.apu`, which made
+ *  KFD's negative authoritative and vetoed the name heuristic — on the reporter's own Strix Halo
+ *  that turned the whole fix into a no-op. The name heuristic decides everything KFD can't, which
+ *  in practice is every APU newer than Raven. */
 function linuxAmdIsApu(pciSlot: string, label: string): boolean {
-  const nodes = readKfdNodes()
-  if (nodes.length) {
-    const loc = pciSlotToKfdLocationId(pciSlot)
-    const match = loc === null ? undefined : nodes.find((n) => n.locationId === loc)
-    if (match) return match.apu
-    // No slot match (an unexpected location_id encoding, or a GPU amdkfd didn't enumerate): fall
-    // back on the topology's overall shape, which still answers this safely — an APU-only box has
-    // no discrete node at all. If ANY discrete node exists we can't tell which one this is, so
-    // defer to the name heuristic rather than risk inflating a discrete card's budget.
-    if (nodes.every((n) => n.apu)) return true
-  }
+  if (kfdReportsFusedNode(pciSlot)) return true
   return isIntegratedGpuName(label)
+}
+
+/** True only when KFD positively identifies THIS adapter as a fused (APU) node, matched on both
+ *  PCI domain and location_id. Any other outcome — no amdkfd, no matching node, a non-fused node
+ *  — is "don't know", not "no". */
+function kfdReportsFusedNode(pciSlot: string): boolean {
+  const ids = pciSlotToKfdIds(pciSlot)
+  if (!ids) return false
+  return readKfdNodes().some((n) => n.domain === ids.domain && n.locationId === ids.locationId && n.fused)
 }
 
 function readKfdNodes(): KfdGpuNode[] {

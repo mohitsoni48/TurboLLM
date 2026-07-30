@@ -78,3 +78,44 @@ test('detectHardware: an iGPU-only box still reports its own VRAM', () => {
   assert.equal(hw.gpuVendor, 'intel')
   assert.equal(hw.vramMb, 1024)
 })
+
+// The SAME-vendor version of the exclusion above, which the cross-vendor test never covered
+// (ADR-306). A shared-memory GPU's budget is a slice of system RAM, so summing it with a real
+// card double-counts that RAM — and over-reporting is the direction that OOMs at load time.
+test('detectHardware: an AMD APU is excluded from the sum when an AMD dGPU is present', () => {
+  const info: SysInfo = {
+    ...dualNvidia,
+    gpus: [
+      { name: 'Phoenix1 [Radeon 780M]', vramMb: 16512, vendor: 'amd', unified: true },
+      { name: 'Navi 33 [Radeon RX 7600M XT]', vramMb: 8192, vendor: 'amd' },
+    ],
+  }
+  const hw = detectHardware(info)
+  assert.equal(hw.gpuVendor, 'amd')
+  assert.equal(hw.vramMb, 8192, "the APU's system-RAM budget must not be pooled with the dGPU's real VRAM")
+  assert.equal(hw.gpuName, 'Navi 33 [Radeon RX 7600M XT]', 'the real card is the headline, not the iGPU')
+})
+
+test('detectHardware: an APU-only box keeps its full unified budget', () => {
+  // The other half of the rule: with no discrete card of the same vendor, the unified budget IS
+  // the budget — this is exactly the GitHub #85 Strix Halo case.
+  const info: SysInfo = {
+    ...dualNvidia,
+    gpus: [{ name: 'Strix Halo [Radeon 8050S / 8060S]', vramMb: 117037, vendor: 'amd', unified: true }],
+  }
+  const hw = detectHardware(info)
+  assert.equal(hw.gpuVendor, 'amd')
+  assert.equal(hw.vramMb, 117037)
+})
+
+test('detectHardware: two real cards of the same vendor still pool, as before', () => {
+  // Guard against the exclusion over-reaching: nothing here is unified, so nothing is dropped.
+  const info: SysInfo = {
+    ...dualNvidia,
+    gpus: [
+      { name: 'AMD Radeon RX 7900 XTX', vramMb: 24576, vendor: 'amd' },
+      { name: 'AMD Radeon RX 7900 XTX', vramMb: 24576, vendor: 'amd' },
+    ],
+  }
+  assert.equal(detectHardware(info).vramMb, 49152)
+})
