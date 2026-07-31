@@ -25,6 +25,15 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.9.5] - 2026-07-31
+
+### Fixed
+- llama.cpp-family engines now get 10 minutes to finish loading a model before TurboLLM gives up, instead of a flat 2 minutes — a large model that has to page in from disk (especially on unified-memory setups) could genuinely still be loading, not stuck.
+- When that load-timeout did fire, the error shown was a generic "the engine process exited unexpectedly" instead of the real reason ("didn't become ready in time") — fixed so the actual cause is always shown.
+
+### Discord
+- Fixed: large models now get more time to finish loading before TurboLLM gives up, and if a load genuinely times out you'll now see why instead of a generic error.
+
 ## [1.9.4] - 2026-07-31
 
 ### Fixed
