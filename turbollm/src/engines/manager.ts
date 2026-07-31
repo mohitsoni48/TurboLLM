@@ -222,11 +222,11 @@ export class Manager {
   }
 
   /** Wait until the engine leaves the 'starting' state (→ running or error/stopped),
-   *  bounded by the engine kind's readiness window plus a small grace. The internal
-   *  readiness loop flips the state and surfaces errors; this just keeps the load
-   *  gate held until that resolves. */
+   *  bounded by the readiness window plus a small grace. The internal readiness loop
+   *  flips the state and surfaces errors; this just keeps the load gate held until
+   *  that resolves. */
   private async awaitNotStarting(): Promise<void> {
-    const deadline = Date.now() + readinessTimeoutMs(this.opts?.engine.kind ?? 'llama-server') + 5_000
+    const deadline = Date.now() + READINESS_TIMEOUT_MS + 5_000
     while (this.state === 'starting' && Date.now() < deadline) await sleep(200)
   }
 
@@ -523,20 +523,28 @@ export class Manager {
     // the process dies. Without it the last line stays "...server is listening on
     // <port>" forever, contradicting the Error state shown above it (the reported bug).
     const cleanStop = this.state === 'stopping' || this.state === 'stopped'
+    // readiness() already recorded the real diagnosis (readiness_timeout) and SIGKILLed
+    // the process itself before this 'close' event fires — don't let the generic
+    // "exited unexpectedly" message from that kill's own aftermath clobber it (the
+    // reporter on GitHub #85 saw exactly that: a useless "exit -1" instead of "didn't
+    // become ready in time").
+    const timedOut = this.state === 'error' && this.errInfo?.code === 'readiness_timeout'
     try {
       logStream.write(
         cleanStop
           ? `\n[turbollm] engine stopped — the model is no longer loaded.\n`
-          : `\n[turbollm] engine process exited unexpectedly (exit ${code})` +
-              `${errMsg ? ` — ${errMsg}` : ''}. The model did NOT load / is no longer loaded.\n`,
+          : timedOut
+            ? `\n[turbollm] engine process killed after the readiness timeout above. The model did NOT load.\n`
+            : `\n[turbollm] engine process exited unexpectedly (exit ${code})` +
+                `${errMsg ? ` — ${errMsg}` : ''}. The model did NOT load / is no longer loaded.\n`,
       )
     } catch {
       /* best-effort marker */
     }
     logStream.end()
-    if (this.state === 'stopping' || this.state === 'stopped') {
+    if (cleanStop) {
       this.state = 'stopped'
-    } else {
+    } else if (!timedOut) {
       this.state = 'error'
       this.errInfo = {
         code: errMsg ? 'engine_spawn_failed' : 'engine_exited',
@@ -553,7 +561,7 @@ export class Manager {
 
   private async readiness(child: ChildProcess, port: number): Promise<void> {
     const kind = this.opts?.engine.kind ?? 'llama-server'
-    const deadline = Date.now() + readinessTimeoutMs(kind)
+    const deadline = Date.now() + READINESS_TIMEOUT_MS
     for (;;) {
       await sleep(500)
       if (this.child !== child || this.state !== 'starting') return
@@ -585,7 +593,7 @@ export class Manager {
           this.state = 'error'
           this.errInfo = {
             code: 'readiness_timeout',
-            message: `The model did not become ready within ${Math.round(readinessTimeoutMs(this.opts?.engine.kind ?? 'llama-server') / 1000)} seconds.`,
+            message: `The model did not become ready within ${Math.round(READINESS_TIMEOUT_MS / 1000)} seconds.`,
             exitCode: -1,
             logTail: readTail(this.logPathStr, 20),
           }
@@ -666,13 +674,13 @@ function engineCommand(opts: StartOpts, port: number, slotSavePath?: string): { 
   return { cmd: opts.engine.binPath, args: buildArgs(opts, port, slotSavePath) }
 }
 
-/** Readiness deadline by engine kind. Python engines cold-start far slower than
- *  llama.cpp: vLLM loads weights, compiles CUDA graphs, and warms up — routinely
- *  minutes for a large model — so it gets a longer window before we declare a
- *  readiness timeout. */
-function readinessTimeoutMs(kind: string): number {
-  return kind === 'vllm' || kind === 'sglang' ? 600_000 : 120_000
-}
+/** Readiness deadline, uniform across engine kinds. Used to be 120s for llama.cpp-family
+ *  engines vs. 600s for vLLM/SGLang (Python engines cold-start slower) — but 120s turned
+ *  out too short for llama.cpp too whenever a model file is large relative to available
+ *  RAM/VRAM and has to page in from disk (GitHub #85 / ADR-304/306/308: a 65GB file on a
+ *  Strix Halo APU still hadn't finished loading at 120s). Flat-bumped to 600s for every
+ *  kind rather than trying to model disk throughput. */
+const READINESS_TIMEOUT_MS = 600_000
 
 /** Environment for a spawned engine. For native engines (llama.cpp, koboldcpp, llamafile) on
  *  Linux, points `LD_LIBRARY_PATH` at the binary's own directory: a source build compiled
