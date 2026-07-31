@@ -862,7 +862,11 @@ export function ChatScreen() {
               {selectedAgent.name}
             </span>
           )}
-          {engineState === 'starting' && <span className="text-[12px] text-muted">Loading model…</span>}
+          {engineState === 'starting' && (
+            <span className="text-[12px] text-muted">
+              Loading model…{model?.loadElapsedMs != null && ` (${Math.round(model.loadElapsedMs / 1000)}s)`}
+            </span>
+          )}
           {engineState === 'stopping' && <span className="text-[12px] text-muted">Ejecting…</span>}
           {ready && (
             <div className="ml-auto hidden sm:flex">

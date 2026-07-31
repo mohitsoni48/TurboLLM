@@ -25,6 +25,15 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.9.4] - 2026-07-31
+
+### Fixed
+- A failed model load (readiness timeout, crash) now shows an error message and log excerpt wherever you are in the app — Chat, Code, anywhere. Previously that detail only ever appeared on the Engines screen, so a load that failed while you were chatting just went silent, with the "Loading model…" indicator disappearing and no explanation.
+- Chat's "Loading model…" indicator now shows elapsed seconds, so a slow-but-still-loading model doesn't look frozen.
+
+### Discord
+- Fixed: if a model load fails, TurboLLM now tells you exactly why (right in Chat/Code) instead of silently giving up with no explanation.
+
 ## [1.9.3] - 2026-07-30
 
 ### Added
