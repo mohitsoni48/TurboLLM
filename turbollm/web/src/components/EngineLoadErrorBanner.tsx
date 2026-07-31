@@ -1,9 +1,19 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { X } from 'lucide-react'
-import type { Status } from '../lib/types'
+import type { EngineError, Status } from '../lib/types'
 import { Button } from './ui/button'
 import { CopyButton } from './ui/copy-button'
+
+/** Every distinct `errInfo` the backend produces (`manager.ts` — `onTerminated`,
+ *  `readiness`'s timeout/model-load-failure branches) is a fresh object literal, so
+ *  content is the only stable identity across polls: `status` is re-fetched over HTTP
+ *  on every poll, which always yields a new JS object even for the SAME ongoing error —
+ *  comparing by reference would never match and the banner could never be dismissed. */
+function errorKey(error: EngineError | undefined): string | null {
+  if (!error) return null
+  return `${error.code}:${error.message}:${error.exitCode ?? ''}:${(error.logTail ?? []).join('\n')}`
+}
 
 /**
  * Global banner for a failed model load (`status.engine.state === 'error'`,
@@ -12,23 +22,23 @@ import { CopyButton } from './ui/copy-button'
  * moment the engine flipped to 'error' (readiness timeout, crash, etc) — the
  * error + log tail already existed on the backend (`EngineRuntime.error`) but
  * only the Engines screen's own status header ever displayed it. Mirrors that
- * block, rendered above every screen next to EngineProvisionBanner. Suppressed
- * on /engines itself, which already shows the same detail inline.
+ * block, rendered above every screen next to EngineProvisionBanner.
+ *
+ * Not suppressed on /engines: EngineStatusHeader there only renders while
+ * `activeEngine` is truthy (EnginesScreen.tsx), so route-based suppression could
+ * hide the only error surface in the same edge case it doesn't. A little visual
+ * overlap when both show the same error is the safer failure mode. Only the
+ * redundant "Open Engines" button hides there (cosmetic, no information lost).
  */
 export function EngineLoadErrorBanner({ status }: { status: Status | undefined }) {
-  const [dismissed, setDismissed] = useState(false)
+  const [dismissedKey, setDismissedKey] = useState<string | null>(null)
   const navigate = useNavigate()
   const { pathname } = useLocation()
   const state = status?.engine.state
   const error = status?.engine.error
+  const key = errorKey(error)
 
-  // Re-arm on the next attempt so a fresh failure isn't hidden by a stale dismissal
-  // from a previous one (e.g. user dismisses, retries, hits a different error).
-  useEffect(() => {
-    if (state !== 'error') setDismissed(false)
-  }, [state])
-
-  if (state !== 'error' || !error || dismissed || pathname.startsWith('/engines')) return null
+  if (state !== 'error' || !error || key === dismissedKey) return null
 
   return (
     <div
@@ -40,18 +50,20 @@ export function EngineLoadErrorBanner({ status }: { status: Status | undefined }
           Model load failed: {error.message}
           {error.exitCode != null && ` (exit ${error.exitCode})`}
         </span>
-        <Button
-          size="sm"
-          variant="outline"
-          className="h-6 px-2 text-[12px]"
-          onClick={() => navigate('/engines')}
-        >
-          Open Engines
-        </Button>
+        {!pathname.startsWith('/engines') && (
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-6 px-2 text-[12px]"
+            onClick={() => navigate('/engines')}
+          >
+            Open Engines
+          </Button>
+        )}
         <CopyButton text={(error.logTail ?? []).join('\n')} label="Copy log" size={13} />
         <button
           type="button"
-          onClick={() => setDismissed(true)}
+          onClick={() => setDismissedKey(key)}
           className="grid h-6 w-6 shrink-0 place-items-center rounded text-muted hover:text-ink"
           aria-label="Dismiss"
         >
