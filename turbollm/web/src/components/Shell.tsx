@@ -6,6 +6,7 @@ import type { Status } from '../lib/types'
 import { StateChip } from './StateChip'
 import { BoltMark } from './Logo'
 import { EngineProvisionBanner } from './EngineProvisionBanner'
+import { EngineLoadErrorBanner } from './EngineLoadErrorBanner'
 import {
   Tooltip,
   TooltipContent,
@@ -38,6 +39,7 @@ export function Shell({
       <NavRail status={status} online={online} version={version} className="hidden md:flex" />
       <div className="flex min-w-0 flex-1 flex-col">
         <EngineProvisionBanner status={status} />
+        <EngineLoadErrorBanner status={status} />
         <main className="min-h-0 flex-1 overflow-auto">{children}</main>
         <MobileNav />
       </div>
