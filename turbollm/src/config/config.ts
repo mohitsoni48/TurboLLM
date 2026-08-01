@@ -910,14 +910,19 @@ function normalize(c: Config): void {
 export type TelemetryLevel = 'off' | 'anon' | 'full'
 
 /** Coerce a stored telemetry level to a known value. Migrates the legacy 'benchmarks'
- *  label → 'anon' and the retired first-run sentinel 'unset' (no longer written anywhere
- *  since the consent card was removed — ADR-299 Decision 4 superseded 2026-08-01) → 'full';
- *  anything else unrecognized also → 'full', the default posture now that there is no
- *  consent card left to ask. Never throws (fail-safe on old/garbage config). */
+ *  label → 'anon'. Missing/absent (`undefined`) and the retired first-run sentinel 'unset'
+ *  (no longer written anywhere since the consent card was removed — ADR-299 Decision 4
+ *  superseded 2026-08-01) are KNOWN "no real choice was ever made" states → 'full', the new
+ *  default posture. Anything else unrecognized (corrupted JSON, an unexpected type, a value
+ *  from a future/foreign schema) fails CLOSED to 'off' instead — this field controls how much
+ *  leaves the machine, so garbage input must never silently escalate to maximum sharing
+ *  (found in the release-2 review: the original one-line catch-all `return 'full'` did exactly
+ *  that). Never throws either way (fail-safe on old/garbage config). */
 function normalizeTelemetryLevel(level: unknown): string {
   if (level === 'off' || level === 'anon' || level === 'full') return level
   if (level === 'benchmarks' || level === 'anonymous') return 'anon' // legacy spec label
-  return 'full'
+  if (level === undefined || level === null || level === 'unset') return 'full'
+  return 'off'
 }
 
 function validate(c: Config): void {

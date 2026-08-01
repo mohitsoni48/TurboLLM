@@ -42,6 +42,7 @@ import { TELEMETRY_ENV } from './telemetry/disabled'
 import { Emitter } from './telemetry/emit'
 import { reportModelLoad } from './telemetry/first-load'
 import { classifyLoadFailure } from './telemetry/classify'
+import { claimOnce } from './telemetry/ledger'
 import { flush } from './telemetry/uploader'
 
 // Stop child processes (the agent engine's shell tool, engine binaries, git,
@@ -340,9 +341,17 @@ manager.onLoadSettled = (ok, err) => {
   // defined it from the start, but nothing ever emitted it, so this step of the funnel was
   // structurally stuck at 0% no matter how far real users actually got (found 2026-08-01
   // auditing the funnel against real data; the comment below only ever wired "three setup
-  // steps"). Plain emit, matching engine_install/engine_build/model_download — not
-  // once-only, since a retried load after a failure is itself useful setup-funnel signal.
-  telemetry.emit('onboarding_step', { step: 'first_load', outcome })
+  // steps"). Once-only — UNLIKE the other three setup steps, which fire on their own
+  // infrequent action (install/build/download) — because Manager's swap point fires on
+  // EVERY model load, including the routine swap-on-demand that is this product's core
+  // gateway feature. Without the guard, an active user's ordinary usage would emit this
+  // "setup" event forever, misrepresenting the funnel and eating into the same per-machine
+  // rate budget the other onboarding_step events share (release-2 review finding). A first
+  // FAILURE still claims it, matching model_first_load's own "first outcome, whatever it
+  // is" semantics below.
+  if (claimOnce(store.dir(), 'once:onboarding_step:first_load')) {
+    telemetry.emit('onboarding_step', { step: 'first_load', outcome })
+  }
   reportModelLoad(store.dir(), telemetry, outcome, ok ? undefined : classifyLoadFailure(err))
 }
 // Auto-tune's sweep is a SEPARATE path to a first load (Manager.start(), not
@@ -352,11 +361,11 @@ manager.onLoadSettled = (ok, err) => {
 // search probes are individually expected to fail sometimes and must not be
 // hooked the same way as a real load without corrupting the signal.
 bench.telemetry = telemetry
-// onboarding_step (ADR-299): where setup breaks. All four setup steps report
-// both outcomes (first_load wired above, next to model_first_load); downloads
-// additionally distinguish 'cancelled', because a user who abandons a download
-// deliberately is not the same signal as one whose download broke, and
-// conflating them reads a choice as a product defect.
+// onboarding_step (ADR-299): where setup breaks. All four setup steps report both
+// outcomes (first_load wired above, next to model_first_load — once-only, unlike
+// the other three); downloads additionally distinguish 'cancelled', because a
+// user who abandons a download deliberately is not the same signal as one whose
+// download broke, and conflating them reads a choice as a product defect.
 build.onSettled = (ok) => telemetry.emit('onboarding_step', { step: 'engine_build', outcome: ok ? 'ok' : 'fail' })
 provision.onSettled = (ok) => telemetry.emit('onboarding_step', { step: 'engine_install', outcome: ok ? 'ok' : 'fail' })
 downloads.onSettled = (outcome) => telemetry.emit('onboarding_step', { step: 'model_download', outcome })

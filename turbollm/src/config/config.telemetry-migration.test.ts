@@ -74,6 +74,26 @@ test('v3→v4: the bump is ONE-SHOT — a real "off" choice made after migration
   }
 })
 
+test('normalizeTelemetryLevel: garbage/corrupted values fail CLOSED to "off", not "full" (release-2 review finding)', () => {
+  // This field controls how much data leaves the machine, so an unrecognized value
+  // (corrupted JSON, an unexpected type, a value from a future/foreign schema) must
+  // never silently escalate to the most permissive level. Only the KNOWN "no real
+  // choice was ever made" states (undefined/missing, the retired 'unset' sentinel)
+  // get the new full-by-default treatment — everything else stays fail-safe.
+  for (const garbage of [42, true, {}, [], 'something-unrecognized']) {
+    const path = tmpConfigPath()
+    try {
+      const cfg = { ...defaultConfig(), telemetry: { level: garbage as unknown as string, machineId: '' } }
+      writeFileSync(path, JSON.stringify(cfg))
+
+      const loaded = ConfigStore.load(path).snapshot()
+      assert.equal(loaded.telemetry.level, 'off', `garbage value ${JSON.stringify(garbage)} must fail closed`)
+    } finally {
+      cleanup(path)
+    }
+  }
+})
+
 test('v3→v4: an old config already at "anon" or "full" is never touched by the reset', () => {
   // Belt-and-suspenders: the reset must only ever act on 'off', never on real
   // engagement, even though no pre-existing config can currently hold these
