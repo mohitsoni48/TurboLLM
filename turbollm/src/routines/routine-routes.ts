@@ -2,7 +2,7 @@ import type { Hono } from 'hono'
 import type { Context } from 'hono'
 import type { Deps } from '../deps'
 import { computeNextFireTime } from './schedule'
-import type { ScheduleRule, RoutineFlavor } from './schema'
+import type { ScheduleRule, RoutineFlavor, Routine } from './schema'
 
 type Status = 200 | 201 | 400 | 404 | 409
 
@@ -26,6 +26,56 @@ interface RoutineBody {
   permissionMode?: 'auto' | 'plan' | 'ask'
 }
 
+function isInt(v: unknown): v is number {
+  return typeof v === 'number' && Number.isInteger(v)
+}
+
+/** Structural validation of the client-supplied `scheduleRule` JSON. Nothing downstream
+ *  (`computeNextFireTime`, the scheduler tick loop) re-checks these, so this is the only
+ *  layer standing between request JSON and the schedule math: an unrecognised `kind`
+ *  reaches `new Date(NaN).toISOString()` and throws a `RangeError` out of the handler
+ *  (a 500, which breaks the error-envelope convention), and `everyMs <= 0` yields a
+ *  routine whose `next_fire_at` is permanently in the past — it fires on every tick,
+ *  forever. Exported so both POST and PUT go through the identical check. */
+export function validateScheduleRule(rule: unknown): string | null {
+  if (!rule || typeof rule !== 'object' || Array.isArray(rule)) return 'scheduleRule must be an object.'
+  const r = rule as { kind?: unknown; everyMs?: unknown; hour?: unknown; minute?: unknown; daysOfWeek?: unknown }
+  if (r.kind !== 'interval' && r.kind !== 'daily' && r.kind !== 'weekly') {
+    return 'scheduleRule.kind must be "interval", "daily" or "weekly".'
+  }
+  if (r.kind === 'interval') {
+    if (typeof r.everyMs !== 'number' || !Number.isFinite(r.everyMs) || r.everyMs <= 0) {
+      return 'scheduleRule.everyMs must be a positive number of milliseconds.'
+    }
+    return null
+  }
+  if (!isInt(r.hour) || r.hour < 0 || r.hour > 23) return 'scheduleRule.hour must be an integer between 0 and 23.'
+  if (!isInt(r.minute) || r.minute < 0 || r.minute > 59) return 'scheduleRule.minute must be an integer between 0 and 59.'
+  if (r.kind === 'weekly') {
+    if (!Array.isArray(r.daysOfWeek) || r.daysOfWeek.length === 0) {
+      return 'scheduleRule.daysOfWeek must be a non-empty array of weekday numbers.'
+    }
+    if (!r.daysOfWeek.every((day) => isInt(day) && day >= 0 && day <= 6)) {
+      return 'scheduleRule.daysOfWeek entries must be integers between 0 (Sunday) and 6 (Saturday).'
+    }
+  }
+  return null
+}
+
+/** The field checks that apply identically on create and update. Neither `permission_mode`
+ *  nor `coding_agent` has a column-level CHECK constraint (unlike `flavor`/`status`), so
+ *  this is the only thing keeping junk out of two fields Phase 2 will branch on. */
+function validateCommonFields(b: RoutineBody): string | null {
+  if (b.permissionMode !== undefined && b.permissionMode !== 'auto' && b.permissionMode !== 'plan' && b.permissionMode !== 'ask') {
+    return 'permissionMode must be "auto", "plan" or "ask".'
+  }
+  if (b.codingAgent !== undefined && b.codingAgent !== 'pi' && b.codingAgent !== 'claude_cli') {
+    return 'codingAgent must be "pi" or "claude_cli".'
+  }
+  if (b.scheduleRule !== undefined) return validateScheduleRule(b.scheduleRule)
+  return null
+}
+
 function validateCreate(b: RoutineBody): string | null {
   if (b.flavor !== 'chat' && b.flavor !== 'code') return 'flavor must be "chat" or "code".'
   if (!b.prompt?.trim()) return 'prompt is required.'
@@ -35,7 +85,18 @@ function validateCreate(b: RoutineBody): string | null {
   if (b.flavor === 'chat' && !b.agentId?.trim()) return 'agentId is required for a chat-flavor routine.'
   if (b.flavor === 'code' && !b.workspacePath?.trim()) return 'workspacePath is required for a code-flavor routine.'
   if (b.flavor === 'code' && b.codingAgent !== 'pi' && b.codingAgent !== 'claude_cli') return 'codingAgent must be "pi" or "claude_cli" for a code-flavor routine.'
-  return null
+  return validateCommonFields(b)
+}
+
+/** Update-time counterpart of {@link validateCreate}. Only fields actually present in the
+ *  PUT body are checked; flavor-dependent invariants are re-checked against the routine's
+ *  CURRENT flavor (which PUT cannot change) rather than the request body alone. */
+function validateUpdate(b: RoutineBody, current: Routine): string | null {
+  if (b.prompt !== undefined && !b.prompt.trim()) return 'prompt cannot be empty.'
+  if (current.flavor === 'code' && b.workspacePath !== undefined && !b.workspacePath.trim()) {
+    return 'workspacePath cannot be empty for a code-flavor routine.'
+  }
+  return validateCommonFields(b)
 }
 
 export function registerRoutineRoutes(app: Hono, d: Deps): void {
@@ -76,8 +137,9 @@ export function registerRoutineRoutes(app: Hono, d: Deps): void {
   app.put('/api/v1/routines/:id', async (c) => {
     const routine = d.db.getRoutine(c.req.param('id'))
     if (!routine) return err(c, 404, 'not_found', 'Routine not found.')
-    const b = await body<Partial<RoutineBody>>(c)
-    if (b.prompt !== undefined && !b.prompt.trim()) return err(c, 400, 'invalid_routine', 'prompt cannot be empty.')
+    const b = await body<RoutineBody>(c)
+    const problem = validateUpdate(b, routine)
+    if (problem) return err(c, 400, 'invalid_routine', problem)
     const patch: Parameters<typeof d.db.updateRoutine>[1] = {}
     if (b.prompt !== undefined) patch.prompt = b.prompt.trim()
     if (b.scheduleDisplay !== undefined) patch.scheduleDisplay = b.scheduleDisplay.trim()
