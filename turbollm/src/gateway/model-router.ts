@@ -90,6 +90,21 @@ export class ModelRouter {
     return this.withSwapLock(() => this.doLoad(entry))
   }
 
+  /** Load `modelKey` unconditionally — used by a Routine's pinned-model swap (spec 20 §5), which
+   *  is an explicit per-routine decision made once at creation time and must NOT be silently
+   *  skipped just because the user's own, unrelated chat auto-swap preference
+   *  (`cfg.gateway.autoSwap`) happens to be off. Reuses every other piece of route()'s machinery
+   *  — LRU eviction, keepN pool, ComfyUI guard, swap serialization — by delegating straight to
+   *  the same withSwapLock()/doLoad() route() itself calls; only the autoSwap early-return is
+   *  skipped. Callers are responsible for their OWN idle-vs-busy decision before calling this
+   *  (see routines/model-swap.ts) — this method has no opinion on whether now is a safe time to
+   *  swap, only on HOW to swap once that's decided. */
+  async loadExplicit(modelKey: string): Promise<RouteResult> {
+    const entry = this.resolveEntry(modelKey)
+    if (!entry) return { status: 503, message: `No model matching '${modelKey}' found. Add one in TurboLLM.` }
+    return this.withSwapLock(() => this.doLoad(entry))
+  }
+
   /** Acquire the SAME swap-serialization queue `route()` uses, then run `fn` exclusively with
    *  respect to any other swap (manual or auto). `route()` itself is just this wrapping
    *  `doLoad()` — exposed publicly so a MANUAL model switch (routes.ts's `/api/v1/engine/start`,
