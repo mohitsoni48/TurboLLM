@@ -26,6 +26,7 @@ import { sessionAuth } from '../code/session-auth'
 import { claudePermissionModeChoices, resolveClaudePermissionMode } from './agent-modes'
 import { TerminalManager } from './terminal-manager'
 import { quotePtyShellArg } from '../util/shell-command'
+import { agentCwd } from '../code/worktree'
 
 async function body<T>(c: Context): Promise<T> { try { return await c.req.json() as T } catch { return {} as T } }
 
@@ -285,7 +286,10 @@ export function registerTerminalRoutes(app: Hono, d: Deps): void {
         mode,
         firstMessage,
       )
-      const terminalId = m.create(run.repoRoot, run.id, cols, rows, launchCommand)
+      // The session's worktree when it has one, else the repo itself (ADR-316) — the CLI must
+      // open in the same tree the in-app agent edits, or the two halves of one session would
+      // be looking at different checkouts.
+      const terminalId = m.create(agentCwd(run), run.id, cols, rows, launchCommand)
       if (!run.terminalLaunchedOnce) d.db.updateAgentRun(run.id, { terminalLaunchedOnce: true })
       return c.json({ terminalId }, 201)
     } catch (e) {

@@ -24,6 +24,7 @@ import type { AgentRun, Message } from '../chat/db'
 import { CodeRunManager, type SteerKind } from './code-run-manager'
 import { compactCodeSession, disposeLspClientsForConv } from './code-session'
 import { revertFileEdits } from './revert'
+import { agentCwd, createSessionWorktree, removeSessionWorktree } from './worktree'
 import { codeSessionExportFilename, serializeCodeSessionMarkdown } from './session-export'
 import { commitGitChanges, getGithubCompareUrl, getGitStatus, pushGitBranch } from './git-actions'
 import { runShellCommand, shellContextText } from './code-shell'
@@ -100,14 +101,21 @@ function toSidebarRow(run: AgentRun) {
     convId: run.convId,
     title: run.title,
     status: toSessionStatus(run.status),
-    branch: run.repoBranch ?? '',
+    // A worktree session's real branch is the one git created for it — `repoBranch` is only ever
+    // set for a session working directly in the repo, so without this the sidebar showed a blank
+    // branch for exactly the sessions that have a dedicated one (caught in end-to-end testing).
+    branch: run.worktreeBranch ?? run.repoBranch ?? '',
     when: relativeTime(run.createdAt),
     add: run.linesAdded ?? 0,
     del: run.linesRemoved ?? 0,
     mode: undefined as string | undefined, // filled from conv below when available
     running: undefined as boolean | undefined, // filled from CodeRunManager below when available
     createdAt: run.createdAt,
+    // `repoRoot` stays the PROJECT — that's what the user picked and what identifies the session.
+    // `worktreePath` is where the agent actually works; surfaced alongside rather than replacing
+    // it, so the UI can show both without either being a lie.
     repoRoot: run.repoRoot ?? '',
+    worktreePath: run.worktreePath ?? '',
     codeAgent: run.codeAgent ?? 'turbollm',
     error: run.error,
     archivedAt: run.archivedAt,
@@ -138,6 +146,27 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
     if (!task) return err(c, 400, 'invalid_input', 'A task description is required.')
     if (!VALID_MODES.has(mode)) return err(c, 400, 'invalid_input', 'mode must be one of: auto, plan, ask.')
 
+    // ── "Use worktree": actually create one (ADR-316) ─────────────────────────────────────
+    // Until now these three fields were stored and never read, so the toggle changed nothing and
+    // the agent edited the user's real working tree on the current branch — the precise outcome
+    // ticking the box is meant to prevent, failing silently. Created BEFORE the conversation row
+    // so a failure surfaces as a plain 400 on the create call, rather than leaving a half-made
+    // session behind that claims an isolation it doesn't have.
+    let worktreePath: string | undefined
+    let worktreeBranch = b.worktreeBranch
+    if (b.useWorktree) {
+      const created = await createSessionWorktree({
+        repoRoot,
+        branch: b.worktreeBranch || task,
+        base: b.worktreeBase,
+      })
+      if (!created.ok) return err(c, 400, created.code, created.message)
+      worktreePath = created.path
+      // The branch git actually used — findFreeBranchName may have suffixed a name that was
+      // already taken, and recording the requested one would mislabel the session forever.
+      worktreeBranch = created.branch
+    }
+
     const conv = db.createConversation({ kind: 'code', modelKey: b.modelKey })
     // Record the per-session mode on the conversation (reuses the agent_mode column).
     db.setConversationMode(conv.id, mode)
@@ -150,9 +179,13 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
       allowedTools: [],
       repoRoot,
       repoBranch: b.repoBranch,
-      useWorktree: b.useWorktree,        // captured; NOT acted on in Phase 1 (fast-follow)
-      worktreeBranch: b.worktreeBranch,  // captured; NOT acted on in Phase 1
-      worktreeBase: b.worktreeBase,      // captured; NOT acted on in Phase 1
+      useWorktree: b.useWorktree,
+      worktreeBranch,                    // the branch git actually created, not the one requested
+      worktreeBase: b.worktreeBase,
+      // Absent unless a worktree was really created above. `repoRoot` deliberately stays the BASE
+      // repository: it is what `git worktree remove` has to run from, and what the session should
+      // still show as its project. `agentCwd()` is the single place that picks between them.
+      worktreePath,
       codeAgent,
     })
     // Seed the task as the first user message so re-opening the session shows it. Any attached
@@ -220,7 +253,9 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
       // fed to the model". Both false when the session has no repoRoot.
       hasAgentsMd: run.repoRoot
         ? agentsMdPresence(
-          run.repoRoot,
+          // The worktree when there is one — that is the tree the model's prompt is built from,
+          // so "shown as loaded" must be resolved against the same directory persona.ts reads.
+          agentCwd(run),
           d.store.dir(),
           d.store.snapshot().code.agentsMdProjectCandidates,
           d.store.snapshot().code.agentsMdGlobalCandidates,
@@ -352,14 +387,28 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
   // Permanent — messages, the working doc, and the agent_run + conversation rows are all
   // gone (db.deleteCodeSession). Blocked while a run is active so a live turn never deletes
   // out from under itself; the client is expected to stop the run first (or the user retries).
-  app.delete('/api/v1/code/sessions/:id', (c) => {
+  app.delete('/api/v1/code/sessions/:id', async (c) => {
     const id = c.req.param('id')
     const run = db.getAgentRun(id)
     if (!run) return err(c, 404, 'not_found', 'Session not found.')
     if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop the current run before deleting this session.')
     disposeLspClientsForConv(run.convId)
+
+    // Clean up the session's worktree, but never at the cost of unmerged work. `git worktree
+    // remove` (deliberately without --force) refuses while the worktree has modified or untracked
+    // files, so uncommitted changes block removal and are reported instead of vanishing with the
+    // session. Committed work is safe either way — removing a worktree does not delete its branch.
+    let worktreeNote: string | undefined
+    if (run.worktreePath && run.repoRoot) {
+      const removed = await removeSessionWorktree(run.repoRoot, run.worktreePath)
+      if (!removed.ok) worktreeNote = removed.message
+    }
+
     db.deleteCodeSession(id)
-    return c.json({ ok: true })
+    // The session row is gone regardless — leaving it behind because a directory couldn't be
+    // cleaned would strand the user with an undeletable session. The note tells them what is
+    // still on disk and the exact command to finish the job.
+    return c.json(worktreeNote ? { ok: true, worktreeNote } : { ok: true })
   })
 
   // ── manual /compact ────────────────────────────────────────────────────────
@@ -388,7 +437,7 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
     const b = await body<{ instructions?: string }>(c)
     try {
       const result = await compactCodeSession({
-        d, convId: run.convId, sessionId: id, repoRoot: run.repoRoot,
+        d, convId: run.convId, sessionId: id, repoRoot: agentCwd(run),
         customInstructions: b.instructions?.trim() || undefined,
       })
       return c.json({ ok: true, ...result })
@@ -525,7 +574,7 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
       // real seq-ordered row range regardless of is_active — the same range deactivateMessagesFrom
       // itself operates on below.
       const rangeMessages = db.getMessagesFromIncludingInactive(run.convId, messageId)
-      const result = revertFileEdits(rangeMessages, run.repoRoot)
+      const result = revertFileEdits(rangeMessages, agentCwd(run))
       revertedFiles = result.reverted
       failedFiles = result.failed
     }
@@ -550,7 +599,7 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
     const run = db.getAgentRun(c.req.param('id'))
     if (!run) return err(c, 404, 'not_found', 'Session not found.')
     if (!run.repoRoot) return err(c, 400, 'invalid_input', 'Session has no repo root.')
-    const status = await getGitStatus(run.repoRoot)
+    const status = await getGitStatus(agentCwd(run))
     return c.json({ ok: true, status })
   })
 
@@ -570,7 +619,7 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
     if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop or wait for the current run before committing.')
     const b = await body<{ message?: string; files?: string[] }>(c)
     try {
-      const result = await commitGitChanges(run.repoRoot, b.message ?? '', b.files)
+      const result = await commitGitChanges(agentCwd(run), b.message ?? '', b.files)
       return c.json({ ok: true, ...result })
     } catch (e) {
       const message = e instanceof Error ? e.message : 'Commit failed.'
@@ -588,12 +637,12 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
     if (!run) return err(c, 404, 'not_found', 'Session not found.')
     if (!run.repoRoot) return err(c, 400, 'invalid_input', 'Session has no repo root.')
     if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop or wait for the current run before pushing.')
-    const result = await pushGitBranch(run.repoRoot)
+    const result = await pushGitBranch(agentCwd(run))
     if (!result.ok) {
       const status = result.reason === 'diverged' ? 409 : 400
       return err(c, status, result.reason, result.message)
     }
-    const compareUrl = await getGithubCompareUrl(run.repoRoot, result.branch)
+    const compareUrl = await getGithubCompareUrl(agentCwd(run), result.branch)
     return c.json({ ok: true, remote: result.remote, branch: result.branch, compareUrl })
   })
 
