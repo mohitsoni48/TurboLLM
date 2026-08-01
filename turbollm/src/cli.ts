@@ -647,6 +647,7 @@ deps.requestRestart = () => {
   if (restarting) return
   restarting = true
   updateScheduler.stop() // don't let an update tick fire mid-teardown
+  routineScheduler.stop() // don't let a routine tick fire mid-teardown
   comfy.stop() // don't let a tick reload a model mid-teardown
   let spawned = false
   const finish = () => {
@@ -757,6 +758,7 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
     // Remove pidfile on clean shutdown so `turbollm --stop` doesn't find a stale entry.
     try { removePidfile(store.dir()) } catch { /* best-effort */ }
     updateScheduler.stop()
+    routineScheduler.stop()
     comfy.stop()
     toolRegistry.disconnectAll()
     void Promise.all([manager.shutdown(), deps.tunnel?.shutdown() ?? Promise.resolve()]).finally(() => {
