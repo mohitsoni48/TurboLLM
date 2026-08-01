@@ -19,6 +19,7 @@
 //     `.turbollm/` is untracked, so it is not part of any branch, so a checkout of that branch
 //     never materialises it. Verified empirically, not reasoned about.
 import { spawn } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { appendFile, readFile, mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 
@@ -224,6 +225,13 @@ export type WorktreeRemoval =
  * Committed work is safe regardless: removing a worktree does not delete its branch (verified).
  */
 export async function removeSessionWorktree(repoRoot: string, worktreePath: string): Promise<WorktreeRemoval> {
+  // Nothing to remove is SUCCESS, not failure. Either directory can legitimately be gone by the
+  // time a session is deleted — the worktree removed with `git worktree remove` by hand, the whole
+  // project moved or deleted, an external drive unplugged. Reporting that as an error produced a
+  // raw `spawn git ENOENT` on the delete response (git cannot even start when its cwd is missing),
+  // which told the user nothing and made a perfectly successful delete look like it had failed.
+  if (!existsSync(worktreePath) || !existsSync(repoRoot)) return { ok: true }
+
   const r = await runGit(repoRoot, ['worktree', 'remove', worktreePath], 60_000)
   if (r.ok) return { ok: true }
 
