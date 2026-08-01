@@ -13,6 +13,7 @@ import { applyAgentGuidance } from './agent-guidance'
 import {
   extractSearchQuery,
   findServerTool,
+  isNestedSearchRequest,
   runWebSearchServerTool,
   serverToolMessage,
   serverToolSseEvents,
@@ -109,7 +110,11 @@ export function registerGateway(app: Hono, d: Deps): void {
     // Handled here, ahead of routing and max_tokens validation, because none of that applies: no
     // engine request is made, so a search works even with no model loaded and can't be refused by
     // a max_tokens cap that was never going to be spent.
-    const serverTool = findServerTool(req.tools)
+    // Gated on this being the CLI's own nested SEARCH call (the server tool is the request's ONLY
+    // tool), not merely on a web-search tool being present. Intercepting on presence alone hijacks
+    // an ordinary agentic turn that offers the model search alongside its real tools — it would be
+    // answered with raw results and never reach the model. Caught in pre-release review.
+    const serverTool = isNestedSearchRequest(req.tools) ? findServerTool(req.tools) : null
     if (serverTool?.kind === 'web_search') {
       const query = extractSearchQuery(req)
       const searchCfg = d.store.snapshot().tools.search

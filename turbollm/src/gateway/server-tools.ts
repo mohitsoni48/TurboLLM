@@ -75,6 +75,24 @@ export interface ServerToolSpec {
  *  better than treating it as "not a server tool at all". */
 const SERVER_TOOL_TYPE = /^(web_search|web_fetch)_\d{8}$/
 
+/** Whether this request is the CLI's own nested SEARCH call, rather than an ordinary agentic turn
+ *  that merely happens to declare a web-search server tool alongside its real tools.
+ *
+ *  The distinction was missed in the first version and caught in pre-release review: intercepting
+ *  on "a `web_search_*` tool is present" hijacks any request that declares one, answering it with
+ *  raw search results and never reaching the model at all. A client is entitled to offer the model
+ *  web search as ONE capability among many.
+ *
+ *  The nested call is unambiguous — read out of the shipped CLI, it is built as
+ *  `{ messages:[one user turn], tools:[the single server tool] }`. So the test is: the server tool
+ *  is the ONLY tool on the request. An agentic turn always carries client function tools too
+ *  (Read/Bash/Edit…), so it can never satisfy this, and the search request always does. */
+export function isNestedSearchRequest(tools: AnthropicRequest['tools']): boolean {
+  const all = tools ?? []
+  if (all.length !== 1) return false
+  return findServerTool(all) !== null
+}
+
 /** Find the first `web_search_*` / `web_fetch_*` server tool declared in a request, or null.
  *  A server tool is identified by its `type` — client function tools carry `input_schema` and no
  *  `type` at all, so the two can never be confused. */

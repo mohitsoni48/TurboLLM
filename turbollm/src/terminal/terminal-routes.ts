@@ -92,11 +92,31 @@ const AUTO_MODE_ALLOWED_TOOLS: Partial<Record<string, readonly string[]>> = {
  *  half-sent instruction is worse than a message the user can see was not sent. */
 export const MAX_SEEDED_MESSAGE_CHARS = 4000
 
+/** Characters that do not survive the trip to the CLI intact, so a message containing them is not
+ *  seeded at all.
+ *
+ *  Measured, not assumed (pre-release review, 2026-08-01). The launch command is parsed by
+ *  PowerShell before `turbollm launch` ever re-spawns the CLI, and PowerShell 5.1 does not escape
+ *  arguments correctly when it hands them to a native executable:
+ *    `rename "foo" to "bar"`  arrives as  `rename foo to bar`     (quotes silently eaten)
+ *    `look in C:\repo\`       arrives as  `look in C:\repo"`      (trailing \ becomes a quote)
+ *  Single-quoting the argument stops any INJECTION — that was verified separately across ten
+ *  hostile inputs, zero of which escaped — but it cannot stop this mangling, which happens inside
+ *  PowerShell's own native-argument marshalling.
+ *
+ *  Not seeding is the honest outcome: the user retypes the message (exactly the behaviour before
+ *  seeding existed), rather than the agent silently acting on a corrupted version of it. */
+const UNSEEDABLE = /["\u0000-\u001f]/
+
 /** Whether this message can be handed to the CLI as a launch argument. */
 export function canSeedFirstMessage(message: string, agent: string): boolean {
   if (agent !== 'claude') return false
   const trimmed = message.trim()
-  return trimmed.length > 0 && trimmed.length <= MAX_SEEDED_MESSAGE_CHARS
+  if (trimmed.length === 0 || trimmed.length > MAX_SEEDED_MESSAGE_CHARS) return false
+  if (UNSEEDABLE.test(trimmed)) return false
+  // A trailing backslash is mangled into a quote by the same marshalling.
+  if (trimmed.endsWith('\\')) return false
+  return true
 }
 
 /** Pure/exported so the resume-flag decision is unit-testable without a live PTY/daemon (mirrors
