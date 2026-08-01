@@ -8,7 +8,15 @@ type ABlock =
   | { type: 'text'; text: string }
   | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } }
   | { type: 'tool_use'; id: string; name: string; input: unknown }
-  | { type: 'tool_result'; tool_use_id: string; content: string | Array<{ type: string; text?: string }> }
+  // `is_error` is the client's own verdict on whether the call it was asked to make actually
+  // succeeded — set when the tool threw, when its preconditions failed (an `Edit` whose
+  // `old_string` wasn't found or wasn't unique, the single most common local-model tool
+  // failure), or when the user declined it at a permission prompt. Optional and absent on
+  // success, per the Anthropic API. It is not used in translation (OpenAI's `role:'tool'`
+  // message has no equivalent field) — it exists here because it is the ONLY signal the daemon
+  // ever gets about whether a terminal-agent CLI's edit really landed, which gateway.ts's
+  // coding-activity attribution correlates against before crediting anything.
+  | { type: 'tool_result'; tool_use_id: string; is_error?: boolean; content: string | Array<{ type: string; text?: string }> }
 // 'system' is undocumented but real: Claude Code injects hook context (e.g. SessionStart)
 // as a `role:'system'` entry directly into `messages`, not just via the top-level `system`
 // field — mapToOpenAI folds every one of these into a single leading system message (see there).
@@ -373,17 +381,33 @@ export type StreamUsage = { inputTokens: number; outputTokens: number; promptTps
  *  gateway stream. Mirrors the manager's LiveGen shape without importing it. */
 export type LiveProgress = { phase: 'prompt' | 'gen'; pct: number; outputTokens: number }
 
+/** One fully-reassembled tool call observed while translating a stream. The engine emits a call
+ *  as a RUN of deltas sharing one `tool_calls[].index` — the first carries `id`/`function.name`,
+ *  every later one only a fragment of `function.arguments` — so neither the name nor the parsed
+ *  input exists at any single point in the loop below; both have to be accumulated across the
+ *  whole run and finalised at the end. The `input_json_delta` chunks the client receives are the
+ *  raw fragments, deliberately forwarded unbuffered so the CLI can render a call as it arrives;
+ *  this type is the side-channel copy for observers that need the WHOLE call (gateway.ts's Code
+ *  session attribution — a terminal-launched CLI applies its edits in its own subprocess and
+ *  never reports back, so the request stream is the only place the daemon ever sees them). */
+export type StreamToolCall = { id: string; name: string; input: unknown }
+
 export async function* streamToAnthropic(
   oaiStream: ReadableStream<Uint8Array>,
   modelName: string,
   msgId: string,
   onUsage?: (u: StreamUsage) => void,
   onLive?: (p: LiveProgress) => void,
+  onToolCalls?: (calls: StreamToolCall[]) => void,
 ): AsyncGenerator<SseEvent> {
   let blockIdx = 0
   let inThinking = false
   let inText = false
   let activeToolIdx = -1
+  // Keyed by the engine's own `tool_calls[].index`, which is what groups a call's deltas
+  // together — NOT by blockIdx (that also advances for thinking/text blocks) and not by id
+  // (absent on every delta after the first).
+  const toolAcc = new Map<number, { id: string; name: string; args: string }>()
   let stopReason = 'end_turn'
   let outputTokens = 0
   let inputTokens = 0
@@ -498,6 +522,19 @@ export async function* streamToAnthropic(
             blockIdx++
           }
           for (const tc of delta.tool_calls) {
+            // Side-channel accumulation, kept strictly ahead of (and independent of) the block
+            // bookkeeping below so it can never perturb a single byte of the client's SSE output.
+            // `id`/`name` are only filled in when still empty: they arrive on the FIRST delta of
+            // a run and would be clobbered back to '' by the `?? ''` fallbacks on later ones.
+            let acc = toolAcc.get(tc.index)
+            if (!acc) {
+              acc = { id: '', name: '', args: '' }
+              toolAcc.set(tc.index, acc)
+            }
+            if (!acc.id && tc.id) acc.id = tc.id
+            if (!acc.name && tc.function?.name) acc.name = tc.function.name
+            if (tc.function?.arguments) acc.args += tc.function.arguments
+
             if (tc.index !== activeToolIdx) {
               if (activeToolIdx >= 0) {
                 yield cbStop(blockIdx)
@@ -564,6 +601,22 @@ export async function* streamToAnthropic(
           genTps: genTps > 0 ? genTps : undefined,
         })
       } catch { /* swallow */ }
+    }
+    // Best-effort observation of the turn's tool calls, finalised only here: an argument buffer
+    // is only valid JSON once its LAST fragment has arrived, so nothing can be parsed mid-loop.
+    // Fires on every completed stream, including one with no tool calls at all (an empty array)
+    // — the observer's job is "a real turn happened", of which the calls are only one part; a
+    // text-only reply must still reach it. A call whose buffer doesn't parse is dropped rather
+    // than thrown on: the client has already received that call verbatim as input_json_delta
+    // chunks and its own turn is unaffected by what an observer could or couldn't make of it.
+    if (onToolCalls) {
+      const calls: StreamToolCall[] = []
+      for (const acc of toolAcc.values()) {
+        try {
+          calls.push({ id: acc.id, name: acc.name, input: JSON.parse(acc.args) })
+        } catch { /* unparseable fragment run — skip this one call, keep the rest */ }
+      }
+      try { onToolCalls(calls) } catch { /* swallow */ }
     }
   }
 }

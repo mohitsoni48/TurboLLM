@@ -3,12 +3,14 @@ import { randomUUID } from 'node:crypto'
 import type { Context, Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import type { ContentfulStatusCode } from 'hono/utils/http-status'
+import { createPatch } from 'diff'
 import type { Deps } from '../deps'
+import type { ToolCallRecord } from '../chat/db'
 import { clampMaxTokens } from '../config/config'
 import { engineModelAlias } from '../engines/compat'
 import { presentedKey } from '../auth'
 import { sessionAuth } from '../code/session-auth'
-import { mapToOpenAI, mapFromOpenAI, streamToAnthropic, type AnthropicRequest } from './anthropic'
+import { mapToOpenAI, mapFromOpenAI, streamToAnthropic, type AnthropicRequest, type StreamToolCall } from './anthropic'
 import { applyAgentGuidance } from './agent-guidance'
 import {
   extractSearchQuery,
@@ -139,6 +141,12 @@ export function registerGateway(app: Hono, d: Deps): void {
     // (including a manually-run `turbollm launch claude`) is completely unaffected.
     const { token: anthropicToken, codeSessionId: anthropicCodeSessionId } = resolveCodeSession(c)
     if (anthropicCodeSessionId) {
+      // Coding-activity attribution, confirm half (see commitConfirmedCodeToolCalls): this
+      // request's own history is what tells the daemon whether the edits it watched the engine
+      // ask for on an earlier turn actually landed. Read here, before the request is touched in
+      // any way, so it happens for every real turn including ones that later fail to route or
+      // never reach the engine at all.
+      commitConfirmedCodeToolCalls(d, anthropicCodeSessionId, req)
       const override = sessionAuth.getThinkingBudgetForToken(anthropicToken)
       if (override !== null) {
         req.thinking = override > 0 ? { type: 'enabled', budget_tokens: override } : undefined
@@ -313,6 +321,12 @@ export function registerGateway(app: Hono, d: Deps): void {
         // Live per-request progress for the engine card (prefill % + token count),
         // so Claude Code traffic shows the same live row as in-app chat.
         (live) => { try { d.manager.setLiveGen(live) } catch { /* best-effort */ } },
+        // Coding-activity attribution for terminal-agent sessions — see
+        // observeCodeSessionTurn. Nothing to attribute for any other client.
+        (calls) => {
+          if (!anthropicCodeSessionId) return
+          try { observeCodeSessionTurn(d, anthropicCodeSessionId, calls) } catch { /* swallow */ }
+        },
       )
       // streamSSE flushes each chunk immediately through Node.js's HTTP layer.
       // Raw ReadableStream does not — chunks buffer until the response completes,
@@ -337,6 +351,16 @@ export function registerGateway(app: Hono, d: Deps): void {
       const oaiRes = (await res.json()) as Record<string, unknown>
       // session stats (B4) + durable #71 record, fail-safe
       recordOpenAiUsage(d, oaiRes, 'anthropic', req.model ?? null, anthropicCodeSessionId, Date.now() - requestStart)
+      // Same coding-activity attribution the streaming branch gets. A non-streaming turn has no
+      // per-delta reassembly to do — the engine already hands back whole `arguments` strings —
+      // but it must not be the one shape of terminal-agent turn that silently records nothing.
+      // Wrapped like the streaming branch's callback: `openAiToolCalls(oaiRes)` is evaluated as
+      // an ARGUMENT, i.e. before the callee's own try, so its containment has to live out here
+      // — this block has no catch of its own and a throw would reach the client as a bodyless
+      // 500 in place of a perfectly good answer the engine already produced.
+      if (anthropicCodeSessionId) {
+        try { observeCodeSessionTurn(d, anthropicCodeSessionId, openAiToolCalls(oaiRes)) } catch { /* swallow */ }
+      }
       return c.json(mapFromOpenAI(oaiRes, modelName))
     } finally {
       d.manager.generationEnd()
@@ -559,6 +583,201 @@ export function registerGateway(app: Hono, d: Deps): void {
     chatGateRelease?.()
     return new Response(res.body, { status: res.status, headers: res.headers })
   })
+}
+
+// ── Coding-activity attribution for terminal-agent sessions ─────────────────
+
+/** The only tool names that feed the Code launchpad's filesTouched/diff tiles. Claude Code sends
+ *  them PascalCase (`Edit`/`Write`/`MultiEdit`, confirmed against a real transcript), so matching
+ *  is case-insensitive; every other tool it has (Bash, Read, Grep, WebFetch, …) is deliberately
+ *  ignored, exactly as on the in-process pi path, where only edit/write records carry a path. */
+const CODE_ACTIVITY_TOOLS = new Set(['edit', 'write', 'multiedit'])
+
+/** Reassembled tool calls off a NON-streaming OpenAI completion — the flat counterpart to
+ *  streamToAnthropic's per-delta accumulation, for the same observer. An unparseable
+ *  `arguments` string drops that one call rather than the whole turn's worth. */
+function openAiToolCalls(oai: Record<string, unknown>): StreamToolCall[] {
+  const raw = (oai.choices as Array<{ message?: { tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: string } }> } }> | undefined)
+    ?.[0]?.message?.tool_calls
+  if (!Array.isArray(raw)) return []
+  const calls: StreamToolCall[] = []
+  for (const tc of raw) {
+    try {
+      calls.push({ id: tc.id ?? '', name: tc.function?.name ?? '', input: JSON.parse(tc.function?.arguments ?? '') })
+    } catch { /* skip this one call */ }
+  }
+  return calls
+}
+
+/** Above this combined `old_string.length + new_string.length`, an edit's unified diff is skipped
+ *  and the record kept diff-less. `createPatch` is Myers (O(N × D)) and fully SYNCHRONOUS on
+ *  Node's single thread, so a large enough edit stalls the WHOLE daemon for its duration — the
+ *  UI, engine-card polling, other Code sessions, every other gateway turn. Measured against this
+ *  repo's own `diff@9`: 22 KB of input → 22 ms, 69 KB → 168 ms, 140 KB → 653 ms, degrading
+ *  superlinearly past that. A "rewrite this whole block" Edit of that size fits comfortably
+ *  inside a 32k-token response budget (~4 chars/token), so it is reachable in ordinary use, not
+ *  a crafted input. Skipping costs only the "Diff shipped" contribution — the file still gets
+ *  its filesTouched credit, exactly as MultiEdit already does below. */
+const MAX_DIFF_INPUT_CHARS = 64 * 1024
+
+/** Edit/Write/MultiEdit calls a session's CLI has been TOLD to make but is not yet known to have
+ *  actually made, keyed `codeSessionId -> tool_use id -> record`.
+ *
+ *  Why they can't be credited on sight: the gateway sees a call the instant the ENGINE emits it —
+ *  before the CLI has run it, and before the user has been asked to permit it. Crediting there
+ *  counts files that were never modified and diffs that were declined or that failed outright
+ *  (an `Edit` whose `old_string` isn't found or isn't unique is the single most common local-model
+ *  tool failure, and the model then RETRIES, so the same logical change lands 2-4 times). Those
+ *  are precisely the two tiles this feature exists to populate, so an approximation there is worse
+ *  than nothing. The in-process pi path has never had this problem — it only records a
+ *  ToolCallRecord on a `tool_call` event whose status is already 'done'/'error'
+ *  (code-run-manager.ts) — and this path is deliberately built to match it.
+ *
+ *  The outcome IS observable, just one turn later: an Anthropic-protocol client resends the whole
+ *  conversation every request, so the request AFTER a tool_use carries that call's `tool_result`
+ *  block (with `is_error` when it failed or was declined). commitConfirmedCodeToolCalls below
+ *  reads it and commits only what really happened.
+ *
+ *  Pure in-memory and deliberately so, mirroring session-auth.ts: this is ephemeral state tied to
+ *  a live CLI subprocess whose worst-case loss is one turn of tile credit, and a daemon restart
+ *  has already killed the PTY that produced it. */
+const pendingCodeToolCalls = new Map<string, Map<string, ToolCallRecord>>()
+
+/** Ceiling on one session's un-confirmed records. In normal operation a turn's calls are all
+ *  resolved by the very next request, so this map holds a handful of entries at a time; the cap
+ *  only matters for calls whose result never arrives at all (the CLI is killed mid-turn, the
+ *  user abandons a permission prompt), which would otherwise sit here until the daemon restarts.
+ *  Oldest-first eviction, which is also age order — a record still unconfirmed after hundreds of
+ *  later calls is never going to be. */
+const MAX_PENDING_PER_SESSION = 256
+
+/** Observe a turn a Code session's terminal-launched CLI just took: stash its file-touching tool
+ *  calls as PENDING (see pendingCodeToolCalls — they are committed only once a later request
+ *  confirms the CLI really applied them) and mark the run shipped.
+ *
+ *  Why this lives in the gateway at all: a terminal session's CLI executes its own edits inside
+ *  its own subprocess and never reports them back, so nothing downstream of it can see them. The
+ *  gateway is the one component that does — it is the HTTP intermediary the CLI asks for every
+ *  token — and it already knows which session a request belongs to from the session-scoped bearer
+ *  token (resolveCodeSession). Without this, a terminal session moved none of the "Coding
+ *  activity" tiles no matter how much real work it did.
+ *
+ *  Two paths were considered and rejected before this one: the CLI's process-exit event (leaving
+ *  the terminal tab is Ctrl+D, which does NOT quit the CLI — see TerminalView.tsx and ADR-298 —
+ *  so it almost never fires in real use), and parsing Claude Code's own private on-disk JSONL
+ *  transcript (undocumented, third-party, single-agent-only, and outside our data directory).
+ *
+ *  Wholly best-effort: any failure here is swallowed, because this is a side observation of a
+ *  request whose actual job is to answer the CLI. */
+function observeCodeSessionTurn(d: Deps, codeSessionId: string, calls: StreamToolCall[]): void {
+  try {
+    const run = d.db.getAgentRun(codeSessionId)
+    if (!run) return
+
+    let pending = pendingCodeToolCalls.get(codeSessionId)
+    for (const call of calls) {
+      const name = call.name.toLowerCase()
+      if (!CODE_ACTIVITY_TOOLS.has(name)) continue
+      // Without an id there is no `tool_result` to ever match this against, so it could only be
+      // credited unconditionally — the exact thing the pending/confirm split exists to prevent.
+      // A real client always sends one; the protocol needs it to address the result back.
+      if (!call.id) continue
+      // `input` came off the wire as JSON — narrow every field rather than trusting the shape.
+      const input = (call.input ?? {}) as Record<string, unknown>
+      const path = typeof input.file_path === 'string' ? input.file_path : ''
+      if (!path) continue
+      let record: ToolCallRecord
+      if (name === 'write') {
+        // No diff: codeStats() counts diff lines for 'edit' only, and a whole-file write has no
+        // meaningful before-state here anyway. It still lands in filesTouched, which is the
+        // entirety of what a write contributes on the pi path too.
+        record = { id: call.id, name: 'write', args: { path } }
+      } else if (name === 'edit') {
+        const oldString = typeof input.old_string === 'string' ? input.old_string : ''
+        const newString = typeof input.new_string === 'string' ? input.new_string : ''
+        record = oldString.length + newString.length > MAX_DIFF_INPUT_CHARS
+          ? { id: call.id, name: 'edit', args: { path } } // see MAX_DIFF_INPUT_CHARS
+          : { id: call.id, name: 'edit', args: { path }, diff: createPatch(path, oldString, newString) }
+      } else {
+        // MultiEdit carries N independent {old_string,new_string} FRAGMENT pairs and no file
+        // content, so there is no honest way to reconstruct one unified diff from it — the
+        // fragments' line positions relative to each other are unknown. Recorded as an edit for
+        // filesTouched credit with the diff deliberately omitted: an omitted number is a gap in
+        // "Diff shipped", a fabricated one is a wrong number nobody can tell is wrong.
+        record = { id: call.id, name: 'edit', args: { path } }
+      }
+      if (!pending) {
+        pending = new Map<string, ToolCallRecord>()
+        pendingCodeToolCalls.set(codeSessionId, pending)
+      }
+      pending.set(call.id, record)
+    }
+    while (pending && pending.size > MAX_PENDING_PER_SESSION) {
+      const oldest = pending.keys().next().value
+      if (oldest === undefined) break
+      pending.delete(oldest)
+    }
+
+    // Optimistic, and deliberately so: observing ANY real turn on this session — even a
+    // text-only reply or a pure Bash/Read turn — is what marks it shipped. The alternative is
+    // waiting for a completion signal that in practice never arrives, because leaving the
+    // terminal tab does not quit the CLI (ADR-298), so the overwhelming majority of real
+    // sessions would stay 'queued' forever and never count toward "Tasks shipped". A run that
+    // is genuinely still going simply gets marked again on its next turn. Unlike the tool-call
+    // records above this needs no confirmation: the claim it makes is "this session did real
+    // work", which the turn itself already proves regardless of how any one call turned out.
+    //
+    // It also removes a second, quieter wrong: CodeRunManager.reconcileOnStartup force-marks
+    // every code run still 'queued'/'running' at daemon startup as 'interrupted'. A terminal
+    // session that never left 'queued' was being labelled interrupted on the next restart no
+    // matter how much work it had actually done.
+    d.db.updateAgentRun(run.id, { status: 'done', endedAt: new Date().toISOString() })
+  } catch { /* swallow — attribution is best-effort and must never affect the CLI's response */ }
+}
+
+/** Commit the pending records this INCOMING request proves the CLI actually applied, into the
+ *  same table the in-process pi agent writes (`messages.tool_calls`) — so codeStats() still needs
+ *  no knowledge that a second kind of agent exists.
+ *
+ *  An Anthropic-protocol client resends the entire conversation every turn, so a `tool_use` the
+ *  gateway stashed on turn N reappears here as a `tool_result` block carrying its verdict. A
+ *  result with `is_error: true` — the tool threw, its preconditions failed, or the user declined
+ *  it at a permission prompt — retires the pending record WITHOUT crediting it; anything else
+ *  commits it. Either way it leaves the pending map, so the same call can never be counted twice
+ *  no matter how many later requests replay the same history.
+ *
+ *  Runs on every request for a resolved Code session, ahead of anything that touches the engine,
+ *  and returns immediately when the session has nothing pending (the overwhelmingly common case
+ *  — no scan of a large conversation happens for a client that isn't mid-edit). Best-effort like
+ *  the rest of this feature: it must never affect the CLI's own response. */
+function commitConfirmedCodeToolCalls(d: Deps, codeSessionId: string, req: AnthropicRequest): void {
+  try {
+    const pending = pendingCodeToolCalls.get(codeSessionId)
+    if (!pending || pending.size === 0) return
+
+    const confirmed: ToolCallRecord[] = []
+    for (const msg of req.messages ?? []) {
+      const raw = msg.content
+      // Array.isArray rather than anthropic.ts's `typeof raw === 'string'` test: this runs before
+      // the request has been validated at all, and one malformed message must cost at most its own
+      // blocks, not throw out of the loop and strand the whole session's pending set.
+      if (!Array.isArray(raw)) continue
+      for (const block of raw) {
+        if (block.type !== 'tool_result') continue
+        const record = pending.get(block.tool_use_id)
+        if (!record) continue
+        pending.delete(block.tool_use_id)
+        if (block.is_error !== true) confirmed.push(record)
+      }
+    }
+    if (confirmed.length === 0) return
+
+    // Looked up only now, not on entry: a request that confirms nothing must cost this session
+    // no DB work at all, and a run row that has since disappeared simply drops the credit.
+    const run = d.db.getAgentRun(codeSessionId)
+    if (!run) return
+    d.db.addMessage(run.convId, 'assistant', '', { toolCalls: confirmed })
+  } catch { /* swallow — attribution is best-effort and must never affect the CLI's response */ }
 }
 
 // ── session-stats recording helpers (B4) ────────────────────────────────────

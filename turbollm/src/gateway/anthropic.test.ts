@@ -457,6 +457,125 @@ test('streamToAnthropic reports no rates at all when the engine sent none — ne
   assert.equal(u.genTps, undefined)
 })
 
+// ── streamToAnthropic tool-call observation (onToolCalls) ───────────────────
+//
+// The side channel gateway.ts uses to credit a terminal-agent Code session for the edits its CLI
+// makes: the CLI applies them inside its own subprocess and never reports back, so this stream is
+// the only place the daemon ever sees them. The engine splits one call across many deltas sharing
+// a `tool_calls[].index` — `id`/`function.name` only on the first, `function.arguments` in
+// fragments after it — so a call is only whole once the stream ends.
+
+test('streamToAnthropic reassembles a tool call whose arguments arrive across several deltas', async () => {
+  const upstream = sseStream([
+    'data: {"choices":[{"delta":{"content":"Editing that file."}}]}',
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"toolu_01","function":{"name":"Edit","arguments":"{\\"file_path\\":"}}]}}]}',
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"/repo/a.ts\\",\\"old_string\\":\\"let x = 1\\""}}]}}]}',
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":",\\"new_string\\":\\"const x = 2\\"}"}}]}}]}',
+    'data: {"choices":[{"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}',
+    'data: [DONE]',
+  ])
+
+  let calls: { id: string; name: string; input: unknown }[] | null = null
+  const events: { event: string; data: string }[] = []
+  for await (const evt of streamToAnthropic(upstream, 'test-model', 'msg_tools', undefined, undefined, (c) => { calls = c })) {
+    events.push(evt)
+  }
+
+  assert.ok(calls, 'onToolCalls must fire')
+  const observed = calls as unknown as { id: string; name: string; input: Record<string, string> }[]
+  assert.equal(observed.length, 1)
+  assert.equal(observed[0].id, 'toolu_01')
+  assert.equal(observed[0].name, 'Edit', 'the name arrives only on the FIRST delta of the run and must survive the later ones')
+  assert.deepEqual(observed[0].input, { file_path: '/repo/a.ts', old_string: 'let x = 1', new_string: 'const x = 2' })
+
+  // Observation only — the client's own stream must be byte-for-byte what it was before: one
+  // tool_use block started with the name, then the raw argument fragments as input_json_delta.
+  const starts = events.filter((e) => e.event === 'content_block_start').map((e) => JSON.parse(e.data) as { content_block: { type: string; name?: string; id?: string } })
+  assert.deepEqual(starts.map((s) => s.content_block.type), ['text', 'tool_use'])
+  assert.equal(starts[1].content_block.name, 'Edit')
+  const partials = events
+    .filter((e) => e.event === 'content_block_delta')
+    .map((e) => JSON.parse(e.data) as { delta: { type: string; partial_json?: string } })
+    .filter((d) => d.delta.type === 'input_json_delta')
+    .map((d) => d.delta.partial_json)
+  assert.equal(partials.length, 3, 'each argument fragment is still forwarded unbuffered as it arrives')
+  assert.equal(partials.join(''), '{"file_path":"/repo/a.ts","old_string":"let x = 1","new_string":"const x = 2"}')
+})
+
+test('streamToAnthropic keeps two tool calls in the same turn apart by their index', async () => {
+  const upstream = sseStream([
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"toolu_a","function":{"name":"Write","arguments":"{\\"file_path\\":\\"/repo/"}}]}}]}',
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"new.ts\\",\\"content\\":\\"hi\\"}"}}]}}]}',
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"toolu_b","function":{"name":"Bash","arguments":"{\\"command\\":"}}]}}]}',
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"\\"ls\\"}"}}]}}]}',
+    'data: {"choices":[{"finish_reason":"tool_calls"}]}',
+    'data: [DONE]',
+  ])
+
+  let calls: { id: string; name: string; input: unknown }[] | null = null
+  for await (const _ of streamToAnthropic(upstream, 'test-model', 'msg_tools2', undefined, undefined, (c) => { calls = c })) { /* drain */ }
+
+  const observed = calls as unknown as { id: string; name: string; input: Record<string, string> }[]
+  assert.deepEqual(observed.map((t) => [t.id, t.name]), [['toolu_a', 'Write'], ['toolu_b', 'Bash']])
+  assert.deepEqual(observed[0].input, { file_path: '/repo/new.ts', content: 'hi' })
+  assert.deepEqual(observed[1].input, { command: 'ls' })
+})
+
+// Fires with an EMPTY array rather than not firing at all: the observer's question is "did a real
+// turn happen on this session", of which the tool calls are only one part — a text-only reply
+// still counts (see observeCodeSessionTurn's optimistic 'done' marking).
+test('streamToAnthropic still fires onToolCalls, with an empty list, for a turn with no tool calls', async () => {
+  const upstream = sseStream([
+    'data: {"choices":[{"delta":{"content":"No tools needed."}}]}',
+    'data: {"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":3}}',
+    'data: [DONE]',
+  ])
+  let calls: unknown[] | null = null
+  for await (const _ of streamToAnthropic(upstream, 'test-model', 'msg_notools', undefined, undefined, (c) => { calls = c })) { /* drain */ }
+  assert.deepEqual(calls, [])
+})
+
+test('streamToAnthropic drops a tool call whose argument fragments never form valid JSON, keeping the rest', async () => {
+  const upstream = sseStream([
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"toolu_trunc","function":{"name":"Edit","arguments":"{\\"file_path\\":\\"/repo/a"}}]}}]}',
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"toolu_ok","function":{"name":"Write","arguments":"{\\"file_path\\":\\"/repo/b.ts\\"}"}}]}}]}',
+    'data: {"choices":[{"finish_reason":"tool_calls"}]}',
+    'data: [DONE]',
+  ])
+  let calls: { id: string }[] | null = null
+  for await (const _ of streamToAnthropic(upstream, 'test-model', 'msg_trunc', undefined, undefined, (c) => { calls = c })) { /* drain */ }
+  assert.deepEqual((calls as unknown as { id: string }[]).map((t) => t.id), ['toolu_ok'])
+})
+
+// The `if (!failed)` guard, from the observer's side. A stream that ERRORS (engine crash, model
+// evicted, connection cut) delivered only part of the turn, so its client never received the rest
+// of that tool call and never ran it — observing it anyway would credit an edit that provably
+// never happened. Throwing from `pull` rather than `controller.error()` (which resets the queue)
+// makes the already-enqueued, fully-formed call arrive first, so this pins the guard and not
+// merely the absence of data.
+test('streamToAnthropic does NOT fire onToolCalls when the stream fails mid-turn', async () => {
+  const enc = new TextEncoder()
+  const line = 'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"toolu_dead","function":{"name":"Edit","arguments":"{\\"file_path\\":\\"/repo/a.ts\\"}"}}]}}]}\n'
+  let sent = false
+  const upstream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (!sent) { sent = true; controller.enqueue(enc.encode(line)); return }
+      throw new Error('engine stopped mid-stream')
+    },
+  })
+
+  let fired = false
+  let usageFired = false
+  const events: { event: string; data: string }[] = []
+  for await (const evt of streamToAnthropic(upstream, 'test-model', 'msg_dead', () => { usageFired = true }, undefined, () => { fired = true })) {
+    events.push(evt)
+  }
+
+  assert.equal(fired, false, 'a half-received turn must never be observed as a completed one')
+  assert.equal(usageFired, false, 'nor recorded as usage')
+  assert.equal(events.at(-1)?.event, 'error', 'the client is told the engine stopped, in place of message_stop')
+})
+
 // ── streamToAnthropic usage mapping ─────────────────────────────────────────
 
 async function cacheReadFromTimings(timingsJson: string): Promise<number> {

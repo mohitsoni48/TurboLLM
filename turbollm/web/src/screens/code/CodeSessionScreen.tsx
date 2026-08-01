@@ -806,9 +806,13 @@ export function CodeSessionScreen() {
               onEjectModel={handleEject}
               onModelSettings={(key) => setSettingsKey(key)}
               // NOT the shared `ctxUsed` above — that one reads the last PERSISTED assistant
-              // message's stats, and a terminal-agent session never writes one: the CLI talks to
-              // the gateway directly, so nothing of its conversation lands in the code session's
-              // message store. The ring and footer were therefore showing whichever stale value
+              // message's stats, and a terminal-agent session never writes one carrying stats:
+              // the CLI talks to the gateway directly, so none of its conversational turns land
+              // in the code session's message store. (The gateway does write ONE narrow kind of
+              // message on its behalf — a stats-less record of the Edit/Write/MultiEdit calls it
+              // has confirmed the CLI applied, purely so the "Coding activity" tiles can count
+              // them; see gateway.ts's commitConfirmedCodeToolCalls. No text, no reasoning, and
+              // nothing this ring could read.) The ring and footer were therefore showing whichever stale value
               // happened to be sitting in this session's very first (pre-terminal) turn, frozen
               // forever. Measured live on 2026-07-29 against the founder's own `claude` session:
               // persisted message said 30,645 tokens / 15% (written two days earlier, and the
