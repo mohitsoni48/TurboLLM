@@ -124,6 +124,9 @@ export interface AgentRun {
   codeAgent?: 'turbollm' | 'pi' | 'claude' | 'opencode'
   /** Whether the composer's "isolate in a worktree" tickbox was checked. */
   useWorktree?: boolean
+  /** Absolute path of the git worktree this session actually runs in (ADR-316). Absent when the
+   *  session works directly in `repoRoot`. */
+  worktreePath?: string
   /** Captured worktree intent — stored, NOT acted on in Phase 1 (fast-follow). */
   worktreeBranch?: string
   /** Captured worktree intent — stored, NOT acted on in Phase 1 (fast-follow). */
@@ -486,7 +489,7 @@ export interface Message {
 }
 
 interface ConvRow { id: string; title: string; system_prompt: string; model_key: string; sampling: string; expert_mode: number; tool_policy: string | null; kind: string | null; folder_id: string | null; tool_overrides: string | null; agent_id: string | null; completed_at: string | null; read_scope: string | null; agent_mode: string | null; skill_ids: string | null; allowed_tools: string | null; preserve_thinking: number; created_at: string; updated_at: string }
-interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; agent_id: string | null; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null; archived_at: string | null; completion: string | null; repo_root: string | null; repo_branch: string | null; use_worktree: number | null; worktree_branch: string | null; worktree_base: string | null; lines_added: number | null; lines_removed: number | null; compaction_summary: string | null; compaction_upto_message_id: string | null; compaction_tokens_before: number | null; cleared_upto_message_id: string | null; reverted_from_message_id: string | null; title_auto_synced: number | null; code_agent: string | null; terminal_launched_once: number | null }
+interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; agent_id: string | null; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null; archived_at: string | null; completion: string | null; repo_root: string | null; repo_branch: string | null; use_worktree: number | null; worktree_branch: string | null; worktree_base: string | null; worktree_path: string | null; lines_added: number | null; lines_removed: number | null; compaction_summary: string | null; compaction_upto_message_id: string | null; compaction_tokens_before: number | null; cleared_upto_message_id: string | null; reverted_from_message_id: string | null; title_auto_synced: number | null; code_agent: string | null; terminal_launched_once: number | null }
 interface FolderRow { id: string; name: string; sort_order: number; created_at: string; updated_at: string }
 interface MsgRow  { id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string; reasoning: string; attachments: string; text_attachments: string | null; tool_calls: string | null; timeline: string | null; stats: string; model_key: string | null; research_meta: string | null; created_at: string; variant_group: string | null; is_active: number; branch_of: string | null; edited: number }
 
@@ -531,6 +534,7 @@ function rowToAgentRun(r: AgentRunRow): AgentRun {
     useWorktree: r.use_worktree === null ? undefined : r.use_worktree === 1,
     worktreeBranch: r.worktree_branch ?? undefined,
     worktreeBase: r.worktree_base ?? undefined,
+    worktreePath: r.worktree_path ?? undefined,
     linesAdded: r.lines_added ?? undefined,
     linesRemoved: r.lines_removed ?? undefined,
     compactionSummary: r.compaction_summary ?? undefined,
@@ -1007,6 +1011,17 @@ export class ConversationStore {
       if (!this.hasColumn('api_usage', 'prompt_tps')) this.db.exec(`ALTER TABLE api_usage ADD COLUMN prompt_tps REAL;`)
       if (!this.hasColumn('api_usage', 'gen_tps')) this.db.exec(`ALTER TABLE api_usage ADD COLUMN gen_tps REAL;`)
       this.db.exec(`PRAGMA user_version = 39;`)
+    }
+    // v40 (Code, real worktrees): the ABSOLUTE path of the git worktree a session actually runs
+    // in, when it was created with "Use worktree". Kept separate from `repo_root` rather than
+    // overwriting it: repo_root stays the base repository, which is what worktree removal has to
+    // run `git worktree remove` FROM, and what the UI should keep showing as the session's project.
+    // Null for every session that isn't using a worktree — including all existing rows, whose
+    // `use_worktree` intent was captured but never acted on (v28's comment), so they correctly
+    // decode as "no worktree" rather than claiming one that was never created.
+    if (v < 40) {
+      if (!this.hasColumn('agent_runs', 'worktree_path')) this.db.exec(`ALTER TABLE agent_runs ADD COLUMN worktree_path TEXT;`)
+      this.db.exec(`PRAGMA user_version = 40;`)
     }
   }
 
@@ -1679,13 +1694,13 @@ export class ConversationStore {
 
   // ── Agent run methods (v8 migration) ──────────────────────────────────────
 
-  createAgentRun(params: { convId: string; title: string; allowedTools: string[]; agentId?: string; repoRoot?: string; repoBranch?: string; useWorktree?: boolean; worktreeBranch?: string; worktreeBase?: string; codeAgent?: 'turbollm' | 'pi' | 'claude' | 'opencode' }): AgentRun {
+  createAgentRun(params: { convId: string; title: string; allowedTools: string[]; agentId?: string; repoRoot?: string; repoBranch?: string; useWorktree?: boolean; worktreeBranch?: string; worktreeBase?: string; worktreePath?: string; codeAgent?: 'turbollm' | 'pi' | 'claude' | 'opencode' }): AgentRun {
     const id = randomUUID()
     const now = new Date().toISOString()
     const agentId = params.agentId ?? null
     // Code runs carry repo/worktree metadata (v28); background 'agent' runs pass none of it
     // and every code column is written NULL (byte-identical to the pre-v28 insert for them).
-    this.db.prepare(`INSERT INTO agent_runs (id,conv_id,title,status,allowed_tools,agent_id,repo_root,repo_branch,use_worktree,worktree_branch,worktree_base,lines_added,lines_removed,code_agent,created_at,updated_at) VALUES ($id,$cid,$title,'queued',$at,$aid,$rr,$rb,$uw,$wb,$wbase,$la,$lr,$ca,$now,$now)`)
+    this.db.prepare(`INSERT INTO agent_runs (id,conv_id,title,status,allowed_tools,agent_id,repo_root,repo_branch,use_worktree,worktree_branch,worktree_base,worktree_path,lines_added,lines_removed,code_agent,created_at,updated_at) VALUES ($id,$cid,$title,'queued',$at,$aid,$rr,$rb,$uw,$wb,$wbase,$wpath,$la,$lr,$ca,$now,$now)`)
       .run({
         $id: id, $cid: params.convId, $title: params.title, $at: JSON.stringify(params.allowedTools), $aid: agentId,
         $rr: params.repoRoot ?? null,
@@ -1693,6 +1708,7 @@ export class ConversationStore {
         $uw: params.useWorktree === undefined ? null : (params.useWorktree ? 1 : 0),
         $wb: params.worktreeBranch ?? null,
         $wbase: params.worktreeBase ?? null,
+        $wpath: params.worktreePath ?? null,
         // Phase 1: diff stats are not computed yet — seed a code run's counters at 0 so the
         // sidebar shows +0/-0 rather than a blank; a background 'agent' run leaves them NULL.
         $la: params.repoRoot !== undefined ? 0 : null,
