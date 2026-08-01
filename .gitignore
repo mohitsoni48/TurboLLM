@@ -85,3 +85,7 @@ Thumbs.db
 
 # Ad-hoc screenshots dropped at repo root during debugging
 /dashboard-preview.png
+
+# Local-only agent/tooling scratch dirs — not product source
+/.agents/
+/wrapper/
