@@ -415,6 +415,31 @@ export class Manager {
     return [this.lastCommand.cmd, ...args].map(quote).join(' ')
   }
 
+  /** How many generations the RUNNING engine can genuinely serve at once, or null when that can't
+   *  be determined.
+   *
+   *  Read off the launch args rather than the saved profile on purpose: this must describe the
+   *  process that is actually running, not what config says the next launch would use — the two
+   *  diverge the moment a profile is edited while an engine is up.
+   *
+   *  null (not 1) when the engine advertises no `--parallel`: vLLM and mlx-lm do their own
+   *  continuous batching, and capping them at one concurrent request because we couldn't read a
+   *  flag would be a new restriction, not a safe default. Callers treat null as "unbounded".
+   *
+   *  Worth knowing when raising it: llama.cpp splits `-c` across the parallel sequences, so N
+   *  slots means roughly ctx/N each, and `slot-cache.ts` only keeps its persistent KV cache at
+   *  `--parallel 1` ("multi-stream splits the KV"). More concurrency genuinely costs context and
+   *  prompt-cache reuse; it is not free. */
+  parallelSlots(): number | null {
+    if (this.state !== 'running' && this.state !== 'starting') return null
+    const args = this.lastCommand?.args
+    if (!args) return null
+    const i = args.indexOf('--parallel')
+    if (i === -1 || i + 1 >= args.length) return null
+    const n = Number(args[i + 1])
+    return Number.isInteger(n) && n > 0 ? n : null
+  }
+
   status(): Status {
     const st: Status = { state: this.state, err: this.errInfo, port: this.port, pid: this.pid, model: null, loadElapsedMs: 0 }
     if ((this.state === 'running' || this.state === 'starting') && this.opts) {

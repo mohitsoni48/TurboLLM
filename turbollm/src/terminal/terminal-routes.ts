@@ -25,6 +25,7 @@ import { isLocalUpgrade, verifyKeyValue } from '../auth'
 import { sessionAuth } from '../code/session-auth'
 import { claudePermissionModeChoices, resolveClaudePermissionMode } from './agent-modes'
 import { TerminalManager } from './terminal-manager'
+import { quotePtyShellArg } from '../util/shell-command'
 
 async function body<T>(c: Context): Promise<T> { try { return await c.req.json() as T } catch { return {} as T } }
 
@@ -47,6 +48,57 @@ const AGENT_SESSION_ID_FLAGS: Partial<Record<string, { first: string; resume: st
   claude: { first: '--session-id', resume: '--resume' },
 }
 
+// ── Web tools are permission-gated, and "auto" did not cover them ───────────────────────
+// Measured live (founder-reported "web search fails"): with `--permission-mode acceptEdits`, a
+// terminal-agent turn asking for a web lookup came back
+// `permission_denials: [{tool_name:"WebSearch", tool_input:{query:"hono npm package latest
+// version"}}]` — the model composed a perfectly good search and the CLI refused to run it. Claude
+// Code's auto/acceptEdits modes auto-approve EDITS; a web read is not an edit, so it still wants a
+// prompt, and a Code session that is meant to run unattended has nobody to answer it.
+//
+// Scoped to auto only, and to these two tools only. Both are strictly READ-ONLY — they touch no
+// file and run no command — so pre-allowing them takes nothing away from the gates plan and ask
+// exist to enforce: every edit and every shell command still prompts exactly as before. Notably
+// this is NOT `bypassPermissions`, which would disable every check at once (the same reason
+// agent-modes.ts deliberately refuses to map any TurboLLM mode onto it).
+const AUTO_MODE_ALLOWED_TOOLS: Partial<Record<string, readonly string[]>> = {
+  claude: ['WebSearch', 'WebFetch'],
+}
+
+// ── Seeding the session's FIRST message (founder-reported, 2026-08-01) ────────────────────────
+// Symptom: in a fresh Code session with the Claude CLI selected, typing the first message opened
+// the CLI but the message never arrived — it had to be retyped.
+//
+// The first attempt at this POSTed the message to the gateway's own `/v1/messages`. That could
+// never have worked: `/v1/messages` is the MODEL API, and the CLI is a *client* of it, not a
+// server — it exposes nothing the daemon can push a turn into. So the POST ran a real generation
+// on the engine, returned the reply to the daemon's own `fetch`, threw it away, and left the CLI's
+// conversation untouched (while logging that it had succeeded).
+//
+// Claude Code takes an initial prompt as a positional argument — `claude [options] [prompt]`,
+// which "starts an interactive session by default". Verified against the real CLI in a real PTY:
+// the prompt is auto-SUBMITTED, not merely pre-filled (the model answered it and the context meter
+// moved). That makes the CLI itself responsible for delivery, so there is no readiness race to
+// lose — which a "write it to the PTY once the TUI looks ready" approach would have had, since the
+// launch can sit in a 180s model load first.
+//
+// Claude only: a positional prompt is that CLI's documented syntax, and passing one to an agent
+// whose syntax hasn't been verified is the same guess AGENT_SESSION_ID_FLAGS refuses to make.
+
+/** Upper bound on a seeded first message. Windows caps a command line near 8191 chars and this
+ *  one is nested inside another (`powershell -Command "turbollm launch … 'prompt'"`), so the
+ *  budget is shared. 4000 leaves ample room for the flags either side while covering any realistic
+ *  opening message. Over the cap the prompt is omitted rather than truncated — a silently
+ *  half-sent instruction is worse than a message the user can see was not sent. */
+export const MAX_SEEDED_MESSAGE_CHARS = 4000
+
+/** Whether this message can be handed to the CLI as a launch argument. */
+export function canSeedFirstMessage(message: string, agent: string): boolean {
+  if (agent !== 'claude') return false
+  const trimmed = message.trim()
+  return trimmed.length > 0 && trimmed.length <= MAX_SEEDED_MESSAGE_CHARS
+}
+
 /** Pure/exported so the resume-flag decision is unit-testable without a live PTY/daemon (mirrors
  *  code-session.ts's codeEventToFrame pattern). `sessionId` is always TurboLLM's own Code
  *  session id (run.id) — passed as the CLI's OWN session id too, so "which conversation to
@@ -57,7 +109,9 @@ const AGENT_SESSION_ID_FLAGS: Partial<Record<string, { first: string; resume: st
  *  it arrives as a string rather than being mapped here. Null/undefined appends nothing, so an
  *  agent with no confirmed mapping (everything except claude) launches exactly as before.
  *  Everything after `launch <agent>` that isn't one of our own flags is forwarded to the CLI
- *  verbatim by cli.ts's passthrough filter — `--permission-mode` included. */
+ *  verbatim by cli.ts's passthrough filter — `--permission-mode` included.
+ *
+ *  `firstMessage` seeds the CLI's opening turn — see the block comment above. */
 export function buildTerminalLaunchCommand(
   agent: string,
   port: number,
@@ -65,11 +119,28 @@ export function buildTerminalLaunchCommand(
   sessionId: string,
   launchedOnce: boolean,
   permissionMode?: string | null,
+  mode?: string | null,
+  firstMessage?: string | null,
 ): string {
   const flags = AGENT_SESSION_ID_FLAGS[agent]
   const sessionArg = flags ? ` ${launchedOnce ? flags.resume : flags.first} ${sessionId}` : ''
   const modeArg = permissionMode ? ` --permission-mode ${permissionMode}` : ''
-  return `turbollm launch ${agent} --port ${port} --token ${token}${sessionArg}${modeArg}`
+  const allowed = mode === 'auto' ? AUTO_MODE_ALLOWED_TOOLS[agent] : undefined
+  const allowedArg = allowed?.length ? ` --allowedTools ${allowed.join(',')}` : ''
+  // FIRST, before any flag, and quoted for the shell pty-session.ts spawns.
+  //
+  // Position is load-bearing, not stylistic: `--allowedTools, --allowed-tools <tools...>` is
+  // VARIADIC in the CLI's own `--help`, so it consumes every token that follows it. Placed at the
+  // end, the prompt was silently eaten as one more tool name and the session opened empty —
+  // measured, after the first version of this did exactly that (ctx stayed 0%, no turn ran).
+  // Leading it keeps it clear of that and of any future variadic option.
+  //
+  // Quoting matters more than usual here — this is arbitrary user prose reaching a command line,
+  // where an apostrophe in "don't" would otherwise terminate the string.
+  const promptArg = firstMessage && canSeedFirstMessage(firstMessage, agent)
+    ? ` ${quotePtyShellArg(firstMessage.trim())}`
+    : ''
+  return `turbollm launch ${agent}${promptArg} --port ${port} --token ${token}${sessionArg}${modeArg}${allowedArg}`
 }
 
 // ── types ──────────────────────────────────────────────────────────────
@@ -201,9 +272,18 @@ export function registerTerminalRoutes(app: Hono, d: Deps): void {
       // launch — a CLI can't be switched mid-session from out here.
       const mode = d.db.getConversation(run.convId)?.agentMode ?? 'auto'
       const permissionMode = resolveClaudePermissionMode(mode, await claudePermissionModeChoices())
+      // Seed the conversation's first user message as the CLI's opening prompt, so a fresh Code
+      // session doesn't open an empty CLI and make the user retype what they already sent. Only
+      // on a genuine first launch — a resume already has the turn in its own transcript, and
+      // re-sending it would duplicate it.
+      const firstMessage = !run.terminalLaunchedOnce
+        ? d.db.getConversation(run.convId, true)?.messages?.find((msg) => msg.role === 'user' && msg.isActive)?.content
+        : undefined
       const launchCommand = buildTerminalLaunchCommand(
         agent, port, token, run.id, !!run.terminalLaunchedOnce,
         agent === 'claude' ? permissionMode : null,
+        mode,
+        firstMessage,
       )
       const terminalId = m.create(run.repoRoot, run.id, cols, rows, launchCommand)
       if (!run.terminalLaunchedOnce) d.db.updateAgentRun(run.id, { terminalLaunchedOnce: true })

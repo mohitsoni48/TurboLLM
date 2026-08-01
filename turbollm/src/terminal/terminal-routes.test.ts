@@ -11,7 +11,8 @@
 // so it's testable without a live PTY/daemon (mirrors code-session.ts's codeEventToFrame).
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { buildTerminalLaunchCommand } from './terminal-routes'
+import { buildTerminalLaunchCommand, canSeedFirstMessage, MAX_SEEDED_MESSAGE_CHARS } from './terminal-routes'
+import { quotePtyShellArg } from '../util/shell-command'
 
 test('buildTerminalLaunchCommand: a genuinely first-ever launch registers this session\'s own id', () => {
   const cmd = buildTerminalLaunchCommand('claude', 6996, 'tok-123', 'session-abc', false)
@@ -72,4 +73,94 @@ test('buildTerminalLaunchCommand: no mode resolved means the flag is absent enti
     const cmd = buildTerminalLaunchCommand('claude', 6996, 'tok', 'sess', false, mode as string | null | undefined)
     assert.equal(cmd, 'turbollm launch claude --port 6996 --token tok --session-id sess')
   }
+})
+
+// ── read-only web tools are pre-allowed in auto mode (founder: "web search fails") ────────────
+// Measured live before this: with `--permission-mode acceptEdits`, a turn that needed a web
+// lookup came back `permission_denials: [{tool_name:"WebSearch", tool_input:{query:"hono npm
+// package latest version"}}]` — the model composed a good search and the CLI refused to run it,
+// because auto/acceptEdits auto-approves EDITS and a web read is not an edit. An unattended Code
+// session has nobody to answer that prompt.
+
+test('buildTerminalLaunchCommand: auto mode pre-allows the two read-only web tools', () => {
+  const cmd = buildTerminalLaunchCommand('claude', 6996, 'tok', 'sess', false, 'acceptEdits', 'auto')
+  assert.equal(
+    cmd,
+    'turbollm launch claude --port 6996 --token tok --session-id sess --permission-mode acceptEdits --allowedTools WebSearch,WebFetch',
+  )
+})
+
+test('buildTerminalLaunchCommand: plan and ask keep their approval gates untouched', () => {
+  // Deliberately auto-only. plan/ask exist to gate work, and silently pre-approving anything in
+  // them would be a security decision the founder never made — the same reasoning agent-modes.ts
+  // uses to refuse to map any mode onto `bypassPermissions`.
+  for (const mode of ['plan', 'ask']) {
+    const cmd = buildTerminalLaunchCommand('claude', 6996, 'tok', 'sess', false, mode, mode)
+    assert.ok(!cmd.includes('--allowedTools'), `${mode} must not pre-allow anything`)
+  }
+})
+
+test('buildTerminalLaunchCommand: only claude gets --allowedTools; other CLIs are unchanged', () => {
+  // The flag is Claude Code's own spelling. Passing it to a CLI whose syntax hasn't been verified
+  // is the same guess AGENT_SESSION_ID_FLAGS deliberately refuses to make — and a bad flag is a
+  // hard startup failure, not a degraded launch.
+  const cmd = buildTerminalLaunchCommand('opencode', 6996, 'tok', 'sess', false, null, 'auto')
+  assert.equal(cmd, 'turbollm launch opencode --port 6996 --token tok')
+})
+
+test('buildTerminalLaunchCommand: omitting the mode argument keeps the pre-change command exactly', () => {
+  // Every existing caller/test that never passed a mode must be byte-identical.
+  const cmd = buildTerminalLaunchCommand('claude', 6996, 'tok', 'sess', false, 'plan')
+  assert.ok(!cmd.includes('--allowedTools'))
+})
+
+// ── seeding the session's first message (founder-reported, 2026-08-01) ────────────────────────
+// Symptom: a fresh Code session on the Claude CLI opened the terminal but the first message never
+// arrived, so it had to be retyped. The prior attempt POSTed it to the gateway's /v1/messages,
+// which could not work — that is the MODEL API, and the CLI is a client of it, not a server. The
+// prompt is now handed to the CLI as its documented positional argument, which the real CLI
+// auto-SUBMITS (verified in a real PTY, not just from --help).
+
+test('buildTerminalLaunchCommand: the first message leads the command, as a quoted prompt', () => {
+  const cmd = buildTerminalLaunchCommand('claude', 6996, 'tok', 'sess', false, 'acceptEdits', 'auto', 'Hi')
+  // Must come BEFORE the flags: --allowedTools is variadic and would otherwise swallow it.
+  assert.ok(cmd.startsWith(`turbollm launch claude ${quotePtyShellArg('Hi')} --port `), cmd)
+  assert.ok(cmd.endsWith('--allowedTools WebSearch,WebFetch'), cmd)
+})
+
+test('buildTerminalLaunchCommand: an apostrophe in the message cannot break out of the quoting', () => {
+  // "don't" is an entirely ordinary thing to type, and it terminates a single-quoted string in
+  // both shells this command passes through.
+  const cmd = buildTerminalLaunchCommand('claude', 6996, 'tok', 'sess', false, null, null, "don't stop")
+  const expected = process.platform === 'win32' ? `'don''t stop'` : `'don'\\''t stop'`
+  assert.ok(cmd.includes(` ${expected} --port `), `${cmd}\nexpected to contain ${expected}`)
+})
+
+test('buildTerminalLaunchCommand: a RESUME never re-sends the first message', () => {
+  // The turn is already in the CLI's own transcript; re-seeding it would duplicate it. The route
+  // passes undefined on resume, so this pins that the flag itself is what suppresses it.
+  const cmd = buildTerminalLaunchCommand('claude', 6996, 'tok', 'sess', true, 'acceptEdits', 'auto', undefined)
+  assert.ok(cmd.endsWith('--allowedTools WebSearch,WebFetch'), cmd)
+})
+
+test('buildTerminalLaunchCommand: only claude is seeded — other CLIs take no positional prompt', () => {
+  // Same rule AGENT_SESSION_ID_FLAGS follows: never guess an unverified CLI's argument syntax.
+  const cmd = buildTerminalLaunchCommand('opencode', 6996, 'tok', 'sess', false, null, 'auto', 'Hi')
+  assert.equal(cmd, 'turbollm launch opencode --port 6996 --token tok')
+})
+
+test('canSeedFirstMessage: blank and over-long messages are skipped, not truncated', () => {
+  assert.equal(canSeedFirstMessage('Hi', 'claude'), true)
+  assert.equal(canSeedFirstMessage('   ', 'claude'), false, 'whitespace-only is not a message')
+  assert.equal(canSeedFirstMessage('', 'claude'), false)
+  assert.equal(canSeedFirstMessage('x'.repeat(MAX_SEEDED_MESSAGE_CHARS), 'claude'), true, 'exactly at the cap is fine')
+  // Truncating would send a half-instruction the user believes was delivered in full.
+  assert.equal(canSeedFirstMessage('x'.repeat(MAX_SEEDED_MESSAGE_CHARS + 1), 'claude'), false)
+})
+
+test('buildTerminalLaunchCommand: an over-long message is omitted rather than half-sent', () => {
+  const long = 'x'.repeat(MAX_SEEDED_MESSAGE_CHARS + 1)
+  const cmd = buildTerminalLaunchCommand('claude', 6996, 'tok', 'sess', false, 'acceptEdits', 'auto', long)
+  assert.ok(!cmd.includes('xxx'), 'no fragment of the message may leak into the command')
+  assert.ok(cmd.startsWith('turbollm launch claude --port '), cmd)
 })

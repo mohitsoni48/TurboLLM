@@ -224,8 +224,19 @@ export function mapToOpenAI(req: AnthropicRequest): Record<string, unknown> {
   if (req.top_p != null) oai.top_p = req.top_p
   if (req.top_k != null) oai.top_k = req.top_k
   if (req.stop_sequences?.length) oai.stop = req.stop_sequences
-  if (req.tools?.length) {
-    oai.tools = req.tools.map((t) => ({
+  // SERVER tools (`{type:'web_search_20260209', name:'web_search'}` and friends) are executed by
+  // the API PROVIDER, not by the model, and carry no `input_schema` at all. Forwarding one to the
+  // engine produced a function with `parameters: undefined` — a tool the model can see and "call"
+  // but that has no arguments and nothing behind it, which is exactly how Claude Code's WebSearch
+  // came back empty every time (gateway.ts intercepts `web_search_*` before this and answers it
+  // for real; anything else must simply not reach the engine). Identified by having a `type` and
+  // no `input_schema`, so a normal client function tool can never be caught by this.
+  const clientTools = (req.tools ?? []).filter((t) => {
+    const raw = t as unknown as { type?: string; input_schema?: unknown }
+    return !(typeof raw.type === 'string' && raw.input_schema == null)
+  })
+  if (clientTools.length) {
+    oai.tools = clientTools.map((t) => ({
       type: 'function',
       function: { name: t.name, description: t.description, parameters: stripUnsupportedSchemaKeywords(t.input_schema) },
     }))

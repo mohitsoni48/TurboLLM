@@ -318,7 +318,10 @@ const startedAt = Date.now()
 const appUpdates = new AppUpdateChecker(version)
 // `requestRestart` is attached after the server is created (it must close over it).
 const deps: Deps = { store, registry, manager, scanner, hashes, db, provision, build, updates, appUpdates, hf, downloads, bench, modelRouter, comfy, tools: toolRegistry, version, startedAt }
-deps.gate = new GenerationGate()
+// Sized to the RUNNING engine's own slot count, re-read on every admission (a model swap changes
+// it). `Infinity` when the engine advertises no `--parallel` — see Manager.parallelSlots() for why
+// that is not 1.
+deps.gate = new GenerationGate(() => manager.parallelSlots() ?? Infinity)
 deps.agentTasks = new AgentTaskState()
 
 // Journey telemetry (ADR-299). Constructing it is unconditional and harmless —
