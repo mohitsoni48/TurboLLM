@@ -107,7 +107,14 @@ function validateUpdate(b: RoutineBody, current: Routine): string | null {
  *  middleware here: `/api/v1/routines*` also serves chat routines, which stay on the
  *  baseline lanAuth gate — only the code-flavor requests are gated, hence a handler-level
  *  branch over the identical `isLocalRequest || verifyPresentedKey` check (the same shape
- *  terminal-routes.ts uses for its raw WebSocket upgrade, for the same reason). */
+ *  terminal-routes.ts uses for its raw WebSocket upgrade, for the same reason).
+ *
+ *  SPEC-GAP (00-conventions.md §8): scoped to create/update only, deliberately, not the whole
+ *  code-routine surface. A keyless LAN caller can still PUT /:id/confirm or /:id/resume on a
+ *  host-authored code routine (arming it), or DELETE one, or read its workspacePath via GET —
+ *  none of that executes anything in Phase 1 (there is no execution yet), but Phase 2 turns
+ *  `active` into real unattended code execution. Extending this gate to confirm/resume/delete/
+ *  the GETs is an open decision for whoever ships Phase 2's execution, not an oversight here. */
 function codeGateBlocks(c: Context, d: Deps): boolean {
   return !isLocalRequest(c, d) && !verifyPresentedKey(c, d)
 }

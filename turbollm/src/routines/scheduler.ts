@@ -19,7 +19,10 @@ export interface RoutineSchedulerDeps {
    *  routine in `inFlight` (or an equivalent "parked" set) until the user answers, or having
    *  the approval-resume REST endpoint drive the scheduler's own run tracking. Both are
    *  Phase-2 design decisions — spec 20 §5's concurrency rules land with real execution, not
-   *  here, where nothing can park. */
+   *  here, where nothing can park. Relatedly: the scheduler stamps `endedAt` on whatever
+   *  terminal status is returned, including 'needs_approval' — a parked run hasn't actually
+   *  ended, so Phase 2 will need to either special-case that write or treat `endedAt` as
+   *  "left the scheduler's hands" rather than "finished" for that one status. */
   runRoutine: (routine: Routine, run: RoutineRun) => Promise<RoutineRunStatus>
   tickIntervalMs?: number
 }
