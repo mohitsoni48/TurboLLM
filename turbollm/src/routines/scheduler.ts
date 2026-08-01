@@ -1,11 +1,26 @@
 import type { ConversationStore } from '../chat/db'
-import type { Routine } from './schema'
+import type { Routine, RoutineRun, RoutineRunStatus } from './schema'
 import { computeNextFireTime } from './schedule'
 
 export interface RoutineSchedulerDeps {
   store: ConversationStore
   now: () => Date
-  runRoutine: (routine: Routine) => Promise<void>
+  /** Executes one fire of `routine`. The scheduler has already created `run` (status
+   *  'running') and owns writing its terminal state, so an implementation only decides
+   *  WHICH terminal status the fire reached and may enrich the row (result, error,
+   *  pendingToolCall) along the way — it must not create a second row for the same fire.
+   *
+   *  SPEC-GAP: resolving to a terminal RoutineRunStatus makes the run-row lifecycle
+   *  structural, but it does NOT yet give 'needs_approval' correct concurrency semantics.
+   *  Today, once this promise settles with ANY terminal status the scheduler clears
+   *  `inFlight` and reschedules — so a Phase-2 run that parks awaiting a tool approval and
+   *  returns 'needs_approval' would let the next tick start a SECOND concurrent run for the
+   *  same routine while the first is still parked. Fixing that means either keeping a parked
+   *  routine in `inFlight` (or an equivalent "parked" set) until the user answers, or having
+   *  the approval-resume REST endpoint drive the scheduler's own run tracking. Both are
+   *  Phase-2 design decisions — spec 20 §5's concurrency rules land with real execution, not
+   *  here, where nothing can park. */
+  runRoutine: (routine: Routine, run: RoutineRun) => Promise<RoutineRunStatus>
   tickIntervalMs?: number
 }
 
@@ -60,6 +75,17 @@ export class RoutineScheduler {
         this.deps.store.updateRoutineRun(run.id, { status: 'skipped', skipReason: 'overlap', endedAt: now.toISOString() })
         continue
       }
+      // The scheduler creates the run row (see RoutineSchedulerDeps.runRoutine): one row per
+      // fire, written here, finalized below — never split with the injectee. Created BEFORE
+      // inFlight so a throw (e.g. an FK violation because the routine was deleted between
+      // listDueRoutines and now) can't strand the id in the set.
+      let run: RoutineRun
+      try {
+        run = this.deps.store.createRoutineRun({ routineId: r.id, configSnapshot: JSON.stringify(r) })
+      } catch (e) {
+        console.error(`[RoutineScheduler] could not open a run row for routine ${r.id}:`, e)
+        continue
+      }
       this.inFlight.add(r.id)
       // Reschedule in .finally() rather than here to get fixed-delay semantics: an interval
       // routine fires N ms after the previous run COMPLETES, not N ms after its original due
@@ -71,7 +97,9 @@ export class RoutineScheduler {
       // overlap even though this tick has rescheduled the routine, because inFlight still contains r.id.
       // .catch() is essential: if runRoutine rejects (Phase 2/3 real I/O), .finally() re-throws;
       // unhandled rejection crashes daemon without it. .catch() before .finally() ensures logged, not escaped.
-      void this.deps.runRoutine(r).finally(() => {
+      void this.deps.runRoutine(r, run).then((terminalStatus) => {
+        this.deps.store.updateRoutineRun(run.id, { status: terminalStatus, endedAt: this.deps.now().toISOString() })
+      }).finally(() => {
         this.inFlight.delete(r.id)
         this.flaggedOverlap.delete(r.id)
         // Re-read rather than reusing `r`: the routine may have been paused, edited or
@@ -86,6 +114,15 @@ export class RoutineScheduler {
         this.deps.store.updateRoutine(r.id, { nextFireAt: computeNextFireTime(current.scheduleRule, now).toISOString() })
       }).catch((err) => {
         console.error(`[RoutineScheduler] runRoutine failed for routine ${r.id}:`, err)
+        // A rejection is still a terminal outcome, and the scheduler owns the row — close it
+        // out here so a failed fire is never left advertising 'running' forever.
+        try {
+          this.deps.store.updateRoutineRun(run.id, {
+            status: 'errored',
+            error: err instanceof Error ? err.message : String(err),
+            endedAt: this.deps.now().toISOString(),
+          })
+        } catch { /* the DB may be closed mid-shutdown — the log above is the record */ }
       })
     }
   }

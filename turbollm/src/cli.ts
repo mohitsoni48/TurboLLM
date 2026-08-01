@@ -423,13 +423,13 @@ updateScheduler.start()
 const routineScheduler = new RoutineScheduler({
   store: db,
   now: () => new Date(),
-  runRoutine: async (routine) => {
-    const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  // The scheduler creates the run row and writes its terminal status/endedAt, so this
+  // stub only records WHY the fire didn't do anything and returns the outcome.
+  runRoutine: async (_routine, run) => {
     db.updateRoutineRun(run.id, {
-      status: 'errored',
       error: 'Routine execution is not implemented yet (Phase 1 ships scheduling only).',
-      endedAt: new Date().toISOString(),
     })
+    return 'errored'
   },
 })
 routineScheduler.start()
