@@ -566,9 +566,6 @@ export type DaemonSettings = {
    *  Off = open/unauthenticated LAN access. */
   requireApiKey: boolean
   telemetryLevel: TelemetryLevel
-  /** Whether consent has ever been answered. False only before the first-run
-   *  choice (ADR-299) — telemetryLevel collapses that state to 'off'. */
-  telemetryDecided: boolean
   modelDefaults: ModelDefaults
   /** ComfyUI GPU coordination settings. */
   comfyui: ComfyUiSettings

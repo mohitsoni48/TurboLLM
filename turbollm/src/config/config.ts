@@ -502,7 +502,7 @@ export function defaultConfig(): Config {
       autoMemoryEnabled: false,
       experimental: { memory: false, cloudDeploy: false },
     },
-    telemetry: { level: 'unset', machineId: '' },
+    telemetry: { level: 'full', machineId: '' },
     apiKeys: [],
     engines: [],
     customEngineSources: [],
@@ -629,16 +629,17 @@ function migrate(raw: Record<string, unknown>, from: number): Config {
       ;(cfg as unknown as Record<string, unknown>)[k] = v
     }
   }
-  // v3→v4 (ADR-299): every pre-existing config already has telemetry.level stored as
-  // 'off', because normalizeTelemetryLevel() has coerced any missing/legacy value to
-  // 'off' since ADR-041 — and TELEMETRY_UI_ENABLED was false for this product's ENTIRE
-  // life until this release, so no human could ever have chosen 'off' through the UI.
-  // Without this, the first-run consent card (gated on level === 'unset') would never
-  // fire for a single existing install, capping the whole journey/funnel dataset to
-  // brand-new installs from this release onward. Gated on `_from < 4` (not merely "this
-  // is inside migrate()") so a future, unrelated v4→v5 migration cannot re-fire this and
-  // wipe out a REAL 'off' choice a user makes after this release.
-  if (from < 4 && cfg.telemetry.level === 'off') cfg.telemetry.level = 'unset'
+  // v3→v4 (ADR-299, revised by the ADR-299-Decision-4 supersession on 2026-08-01): every
+  // pre-existing config already has telemetry.level stored as 'off', because
+  // normalizeTelemetryLevel() has coerced any missing/legacy value to 'off' since
+  // ADR-041 — and TELEMETRY_UI_ENABLED was false for this product's ENTIRE life until
+  // ADR-299 shipped, so no human could ever have chosen 'off' through the UI. That makes
+  // it a synthetic default, not a real choice, so it is bumped to the new default ('full')
+  // rather than left stuck opted-out forever with no consent card left to ever ask.
+  // Gated on `_from < 4` (not merely "this is inside migrate()") so a future, unrelated
+  // v4→v5 migration cannot re-fire this and overwrite a REAL 'off' choice a user makes
+  // after this release.
+  if (from < 4 && cfg.telemetry.level === 'off') cfg.telemetry.level = 'full'
   return cfg
 }
 
@@ -905,17 +906,22 @@ function normalize(c: Config): void {
   c.version = SCHEMA_VERSION
 }
 
-/** Telemetry consent levels exposed in the UI (spec 09 §3). The stored config may
- *  additionally hold the first-run sentinel 'unset' (drives the consent modal); it
- *  is preserved on disk but maps to 'off' when surfaced as a settings enum value. */
+/** Telemetry consent levels exposed in the UI (spec 09 §3). */
 export type TelemetryLevel = 'off' | 'anon' | 'full'
 
-/** Coerce a stored telemetry level to a known value. Preserves the first-run
- *  sentinel 'unset'; migrates the legacy 'benchmarks' label → 'anon'; anything
- *  unrecognized → 'off'. Never throws (fail-safe on old/garbage config). */
+/** Coerce a stored telemetry level to a known value. Migrates the legacy 'benchmarks'
+ *  label → 'anon'. Missing/absent (`undefined`) and the retired first-run sentinel 'unset'
+ *  (no longer written anywhere since the consent card was removed — ADR-299 Decision 4
+ *  superseded 2026-08-01) are KNOWN "no real choice was ever made" states → 'full', the new
+ *  default posture. Anything else unrecognized (corrupted JSON, an unexpected type, a value
+ *  from a future/foreign schema) fails CLOSED to 'off' instead — this field controls how much
+ *  leaves the machine, so garbage input must never silently escalate to maximum sharing
+ *  (found in the release-2 review: the original one-line catch-all `return 'full'` did exactly
+ *  that). Never throws either way (fail-safe on old/garbage config). */
 function normalizeTelemetryLevel(level: unknown): string {
-  if (level === 'unset' || level === 'off' || level === 'anon' || level === 'full') return level
+  if (level === 'off' || level === 'anon' || level === 'full') return level
   if (level === 'benchmarks' || level === 'anonymous') return 'anon' // legacy spec label
+  if (level === undefined || level === null || level === 'unset') return 'full'
   return 'off'
 }
 

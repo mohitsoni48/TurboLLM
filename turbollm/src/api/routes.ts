@@ -2300,9 +2300,7 @@ function modelDirsPayload(d: Deps): { dirs: string[]; primaryDir: string } {
   return { dirs: cfg.modelDirs, primaryDir }
 }
 
-/** The UI-exposed settings subset. Telemetry is surfaced as the 3-option enum;
- *  the stored first-run sentinel 'unset' maps to 'off' here (consent UX reads the
- *  raw value off /status separately). */
+/** The UI-exposed settings subset. Telemetry is surfaced as the 3-option enum. */
 function settingsPayload(d: Deps) {
   const cfg = d.store.snapshot()
   const lvl = cfg.telemetry.level
@@ -2319,13 +2317,6 @@ function settingsPayload(d: Deps) {
     lanBind: cfg.daemon.lanBind,
     requireApiKey: cfg.daemon.requireApiKey,
     telemetryLevel,
-    // Whether the user has ever actually answered (ADR-299 Decision 4).
-    // `telemetryLevel` above deliberately collapses the first-run 'unset'
-    // sentinel to 'off' so every consumer fails safe — but that also makes
-    // "never asked" indistinguishable from "chose Off", and the first-run
-    // consent card needs exactly that distinction. Hence a separate flag
-    // rather than leaking 'unset' into the level enum.
-    telemetryDecided: cfg.telemetry.level !== 'unset',
     modelDefaults: cfg.modelDefaults,
     comfyui: cfg.comfyui,
     gateway: cfg.gateway,

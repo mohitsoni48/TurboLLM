@@ -1156,7 +1156,7 @@ function HfTokenSection({ tokenSet, onSaved }: { tokenSet: boolean; onSaved: () 
   )
 }
 
-// ── Privacy & telemetry (spec 09 §5): opt-in consent, no transmission here ─────
+// ── Privacy & telemetry (spec 09 §5): on by default, changeable any time ──────
 
 function PrivacySection({ level, setLevel }: { level: TelemetryLevel; setLevel: (v: TelemetryLevel) => void }) {
   const [showPreview, setShowPreview] = useState(false)
@@ -1177,9 +1177,10 @@ function PrivacySection({ level, setLevel }: { level: TelemetryLevel; setLevel: 
     <section className="rounded-lg border border-border bg-panel p-4">
       <h2 className="mb-1 text-[13px] font-semibold uppercase tracking-wide text-faint">Privacy &amp; telemetry</h2>
       <p className="mb-3 text-[12px] text-muted">
-        Opt-in only. Choosing a level records that choice once — beyond that, nothing is sent
-        unless you pick a level above Off. Never sent: your conversations, prompts, files,
-        paths, or keys.
+        On by default (Usage + benchmarks + crash reports, below), so setup problems and
+        real-hardware speed get found and fixed. Change your level any time — switching to Off
+        records that one choice and nothing else, ever. Never sent: your conversations, prompts,
+        files, paths, or keys.
       </p>
 
       <div className="flex flex-col gap-1">

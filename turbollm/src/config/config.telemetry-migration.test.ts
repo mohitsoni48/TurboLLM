@@ -1,14 +1,14 @@
-// v3→v4 migration (ADR-299): every existing install already has telemetry.level
-// stored as 'off' on disk — not 'unset' — because normalizeTelemetryLevel() has
-// coerced any missing/legacy value to 'off' since ADR-041, and TELEMETRY_UI_ENABLED
-// was false for the product's entire life until this release, so no human could
-// ever have chosen 'off' through the UI. Without this migration, the first-run
-// consent card (gated on level === 'unset') would NEVER fire for a single existing
-// user — only brand-new installs from this release onward would ever be asked,
-// which would cap the whole journey/funnel dataset to future installs only.
+// v3→v4 migration (ADR-299, revised by the ADR-299-Decision-4 supersession on
+// 2026-08-01): every existing install already has telemetry.level stored as 'off'
+// on disk because normalizeTelemetryLevel() has coerced any missing/legacy value
+// to 'off' since ADR-041, and TELEMETRY_UI_ENABLED was false for the product's
+// entire life until ADR-299 shipped, so no human could ever have chosen 'off'
+// through the UI. That makes it a synthetic default, not a real choice — this
+// migration bumps it to the new default ('full') instead of leaving these
+// installs stuck opted-out forever with no consent card left to ever ask them.
 //
-// Verified against the maintainer's own live config before writing this: a real
-// ~/.turbollm/config.json from before this PR reads
+// Verified against the maintainer's own live config before writing the original
+// version of this test: a real ~/.turbollm/config.json from before that PR reads
 // `"telemetry": { "level": "off", "machineId": "" }`.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
@@ -30,7 +30,7 @@ test('SCHEMA_VERSION bumped for the telemetry-consent migration', () => {
   assert.equal(SCHEMA_VERSION, 4)
 })
 
-test('v3→v4: a pre-existing install\'s silently-defaulted "off" is reset to "unset"', () => {
+test('v3→v4: a pre-existing install\'s silently-defaulted "off" is bumped to "full"', () => {
   const path = tmpConfigPath()
   try {
     const v3 = {
@@ -43,34 +43,54 @@ test('v3→v4: a pre-existing install\'s silently-defaulted "off" is reset to "u
     const cfg = ConfigStore.load(path).snapshot()
 
     assert.equal(cfg.version, SCHEMA_VERSION)
-    assert.equal(cfg.telemetry.level, 'unset')
+    assert.equal(cfg.telemetry.level, 'full')
   } finally {
     cleanup(path)
   }
 })
 
-test('v3→v4: the reset is ONE-SHOT — a real "off" choice made after migration is never re-reset', () => {
+test('v3→v4: the bump is ONE-SHOT — a real "off" choice made after migration is never re-bumped', () => {
   const path = tmpConfigPath()
   try {
-    // First load: pre-existing install, migrates 'off' -> 'unset' and persists at v4.
+    // First load: pre-existing install, migrates 'off' -> 'full' and persists at v4.
     const v3 = { ...defaultConfig(), version: 3, telemetry: { level: 'off', machineId: '' } }
     writeFileSync(path, JSON.stringify(v3))
     ConfigStore.load(path)
 
-    // The user now sees the consent card for the first time and explicitly
-    // chooses Off. The file on disk is already at SCHEMA_VERSION, so this
-    // simulates the settings save that follows that real choice.
-    const afterConsent = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>
-    ;(afterConsent.telemetry as { level: string }).level = 'off'
-    writeFileSync(path, JSON.stringify(afterConsent))
+    // The user now visits Settings and explicitly chooses Off. The file on disk
+    // is already at SCHEMA_VERSION, so this simulates the settings save that
+    // follows that real choice.
+    const afterChoice = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>
+    ;(afterChoice.telemetry as { level: string }).level = 'off'
+    writeFileSync(path, JSON.stringify(afterChoice))
 
-    // A later load (e.g. next daemon start) must NOT flip this back to 'unset' —
+    // A later load (e.g. next daemon start) must NOT flip this back to 'full' —
     // migrate() only runs when version < SCHEMA_VERSION, and this file is already
-    // current, so the one-shot reset must not re-fire.
+    // current, so the one-shot bump must not re-fire.
     const cfg = ConfigStore.load(path).snapshot()
     assert.equal(cfg.telemetry.level, 'off')
   } finally {
     cleanup(path)
+  }
+})
+
+test('normalizeTelemetryLevel: garbage/corrupted values fail CLOSED to "off", not "full" (release-2 review finding)', () => {
+  // This field controls how much data leaves the machine, so an unrecognized value
+  // (corrupted JSON, an unexpected type, a value from a future/foreign schema) must
+  // never silently escalate to the most permissive level. Only the KNOWN "no real
+  // choice was ever made" states (undefined/missing, the retired 'unset' sentinel)
+  // get the new full-by-default treatment — everything else stays fail-safe.
+  for (const garbage of [42, true, {}, [], 'something-unrecognized']) {
+    const path = tmpConfigPath()
+    try {
+      const cfg = { ...defaultConfig(), telemetry: { level: garbage as unknown as string, machineId: '' } }
+      writeFileSync(path, JSON.stringify(cfg))
+
+      const loaded = ConfigStore.load(path).snapshot()
+      assert.equal(loaded.telemetry.level, 'off', `garbage value ${JSON.stringify(garbage)} must fail closed`)
+    } finally {
+      cleanup(path)
+    }
   }
 })
 
@@ -93,21 +113,21 @@ test('v3→v4: an old config already at "anon" or "full" is never touched by the
   }
 })
 
-test('v3→v4: a brand-new install (no file on disk) is untouched by the migration and defaults to "unset"', () => {
+test('v3→v4: a brand-new install (no file on disk) is untouched by the migration and defaults to "full"', () => {
   const path = tmpConfigPath() // path does not exist yet — no writeFileSync
   try {
     const cfg = ConfigStore.load(path).snapshot()
-    assert.equal(cfg.telemetry.level, 'unset')
+    assert.equal(cfg.telemetry.level, 'full')
     assert.equal(cfg.version, SCHEMA_VERSION)
   } finally {
     cleanup(path)
   }
 })
 
-test('v3→v4: an even older config (v2, no telemetry key at all) also gets "unset", not "off"', () => {
+test('v3→v4: an even older config (v2, no telemetry key at all) also gets "full", not "off"', () => {
   // The v2->v3 migration test fixture has no telemetry key at all. normalize()
   // would otherwise coerce a missing level straight to 'off' — this proves the
-  // v3->v4 reset applies to that path too, not just an explicit v3 'off'.
+  // new default applies to that path too, not just an explicit v3 'off'.
   const path = tmpConfigPath()
   try {
     const v2 = { ...defaultConfig(), version: 2 }
@@ -115,7 +135,7 @@ test('v3→v4: an even older config (v2, no telemetry key at all) also gets "uns
     writeFileSync(path, JSON.stringify(v2))
 
     const cfg = ConfigStore.load(path).snapshot()
-    assert.equal(cfg.telemetry.level, 'unset')
+    assert.equal(cfg.telemetry.level, 'full')
   } finally {
     cleanup(path)
   }

@@ -99,9 +99,10 @@ TurboLLM does the opposite:
 - **🔀 A gateway that loads models for you.** Name any model in your API request and TurboLLM
   loads it on demand, keeping your favorites hot in a small pool — so an agent that hops between
   models just works, with nothing to pre-wire.
-- **🔒 Offline-first & private.** No account, no backend, no internet required. Telemetry is
-  **fully opt-in and off by default** — choose Off and nothing but that one-time choice is ever
-  sent, or opt in and see exactly what leaves your machine, verified in [Privacy](#privacy).
+- **🔒 Offline-first & private.** No account, no backend, no internet required. Telemetry
+  **defaults to on** (usage + benchmarks + crash reports) so setup issues and real-hardware speed
+  get found — change your level any time in Settings, and see exactly what leaves your machine,
+  verified in [Privacy](#privacy).
 
 ---
 
@@ -402,8 +403,8 @@ connected); **Remove** undoes it.
 <br/>
 
 - A **~7 MB npm package** on Node — no Electron, no bundled Chromium, no Python.
-- **Offline-first** — no account, no backend, no internet required. Telemetry is opt-in and off
-  by default; see [Privacy](#privacy).
+- **Offline-first** — no account, no backend, no internet required. Telemetry defaults to on,
+  changeable any time; see [Privacy](#privacy).
 - **Windows · macOS · Linux**, with a CPU fallback when there's no GPU.
 
 </details>
@@ -589,18 +590,19 @@ TurboLLM is **offline-first**: core local use needs no account, no backend, and 
 choice.** That's not a promise you have to take on faith: the client is source-available, so the
 claim is checkable against the actual code that ships.
 
-**Telemetry is opt-in, and off by default.** On first run you choose one of three levels, with no
-pre-selected option:
+**Telemetry defaults to on** (Usage + benchmarks + crash reports), so setup problems and
+real-hardware speed get found and fixed — verifiable telemetry only helps if enough people are
+actually sending it. Change your level any time from **Settings → Privacy & telemetry**:
 
 - **Off** — sends only that one-time choice, nothing else, ever.
 - **Anonymous usage + benchmarks** — which features you use, your hardware, model names, and
   measured speed. Never prompts, files, paths, or keys.
-- **+ Crash reports** — adds error fingerprints (never your content).
+- **Usage + benchmarks + crash reports** (default) — adds error fingerprints (never your content).
 
 You can preview the exact payload before anything is sent, and inspect a running log of every
-event this machine has *actually* transmitted, from **Settings → Privacy & telemetry**. For
-scripted or unattended use, `--no-telemetry` (or `TURBOLLM_TELEMETRY=off`) is a hard, one-way kill
-switch, independent of the saved level.
+event this machine has *actually* transmitted, from the same Settings section. For scripted or
+unattended use, `--no-telemetry` (or `TURBOLLM_TELEMETRY=off`) is a hard, one-way kill switch,
+independent of the saved level.
 
 ---
 
@@ -621,13 +623,13 @@ Marks reflect mid-2026; verify the moving rows against each tool's current docs.
 | Speculative decoding (draft / MTP) | ✅ | ✅ | ◐ env flag | ❌ |
 | Web UI from any LAN device | ✅ | ❌ | ❌ | ✅ |
 | **Lightweight** (no Electron / no Python) | ✅ npm | ❌ Electron | ✅ Go | ❌ Python |
-| Offline-first · **opt-in, verifiable telemetry** | ✅ verifiable (source-available) | ◐ closed app — not verifiable | ✅ | ✅ |
+| Offline-first · **verifiable telemetry** (on by default) | ✅ verifiable (source-available) | ◐ closed app — not verifiable | ✅ | ✅ |
 
 LM Studio and Ollama both added Anthropic `/v1/messages` endpoints in 2026, so the API rows are
 now parity — Claude Code works against any of them. TurboLLM's durable edges are **any engine
 including community forks**, **benchmark-based auto-tuning with a VRAM-fit verdict + measured t/s
-before you commit**, and **telemetry you can actually verify** — opt-in, off by default, and
-checkable against source-available code rather than taken on trust.
+before you commit**, and **telemetry you can actually verify** — on by default, changeable any
+time, and checkable against source-available code rather than taken on trust.
 
 Prefer Open WebUI's chat breadth? It works great pointed at TurboLLM's OpenAI endpoint.
 
