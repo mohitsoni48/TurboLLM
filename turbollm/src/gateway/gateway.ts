@@ -9,6 +9,15 @@ import { engineModelAlias } from '../engines/compat'
 import { presentedKey } from '../auth'
 import { sessionAuth } from '../code/session-auth'
 import { mapToOpenAI, mapFromOpenAI, streamToAnthropic, type AnthropicRequest } from './anthropic'
+import { applyAgentGuidance } from './agent-guidance'
+import {
+  extractSearchQuery,
+  findServerTool,
+  isNestedSearchRequest,
+  runWebSearchServerTool,
+  serverToolMessage,
+  serverToolSseEvents,
+} from './server-tools'
 
 /** Resolve the Code session (if any) a gateway request belongs to, from the same token a
  *  terminal-launched CLI carries as its ANTHROPIC_AUTH_TOKEN / OpenAI-compatible apiKey
@@ -91,6 +100,36 @@ export function registerGateway(app: Hono, d: Deps): void {
     // user's global auto-swap preference like every other request.
     if (req.model?.startsWith('claude-')) req.model = req.model.slice(7)
 
+    // ── Anthropic SERVER-side tools (see server-tools.ts) ──────────────────────
+    // Claude Code's WebSearch executes by calling US back with a `web_search_*` server tool and
+    // reading `web_search_tool_result` blocks off the reply. We are the provider, so we run the
+    // search — TurboLLM's own configured provider, the same one the in-app agent uses. Before
+    // this, the server tool was forwarded to the engine as a function with no parameters and the
+    // CLI got `results: []` with no error: web search silently returned nothing, every time.
+    //
+    // Handled here, ahead of routing and max_tokens validation, because none of that applies: no
+    // engine request is made, so a search works even with no model loaded and can't be refused by
+    // a max_tokens cap that was never going to be spent.
+    // Gated on this being the CLI's own nested SEARCH call (the server tool is the request's ONLY
+    // tool), not merely on a web-search tool being present. Intercepting on presence alone hijacks
+    // an ordinary agentic turn that offers the model search alongside its real tools — it would be
+    // answered with raw results and never reach the model. Caught in pre-release review.
+    const serverTool = isNestedSearchRequest(req.tools) ? findServerTool(req.tools) : null
+    if (serverTool?.kind === 'web_search') {
+      const query = extractSearchQuery(req)
+      const searchCfg = d.store.snapshot().tools.search
+      const blocks = await runWebSearchServerTool(query, serverTool, searchCfg)
+      const searchModel = req.model ?? 'local'
+      if (req.stream) {
+        return streamSSE(c, async (stream) => {
+          for (const evt of serverToolSseEvents(searchModel, blocks)) {
+            await stream.writeSSE({ event: evt.event, data: evt.data })
+          }
+        })
+      }
+      return c.json(serverToolMessage(searchModel, blocks))
+    }
+
     // Terminal-agent thinking-budget override (ADR-284) — the composer's ThinkingBudgetSlider
     // for a terminal-agent session (TerminalToolbar.tsx) has no text turn of its own to attach
     // this to, so it's enforced here instead: whatever the daemon has stored for this session
@@ -128,11 +167,62 @@ export function registerGateway(app: Hono, d: Deps): void {
 
     const status = d.manager.status()
     const modelName = status.state === 'running' ? (status.model?.name ?? req.model ?? 'local') : (req.model ?? 'local')
+
+    // ── Agent behaviour scaffolding for external coding CLIs (see agent-guidance.ts) ──────
+    // Loop detection/breaking, search-on-repeated-failure, and version+docs-before-a-dependency
+    // all lived inside the in-process pi agent, so the terminal-agent CLI had none of them. They
+    // are reconstructed here from the request's own history and applied to `req` before
+    // translation. Gated on the request actually declaring tools: that is what distinguishes an
+    // agentic client from someone pointing a plain chat app at the gateway, who has no tool loop
+    // to break and did not ask for a coding agent's rules.
+    const guidance = req.tools?.length ? applyAgentGuidance(req) : null
+
     const oaiBody = mapToOpenAI(req)
+    // The hard half of the loop breaker. pi refuses to EXECUTE the repeated call; the gateway is
+    // not in an external CLI's execution path, so the equivalent lever is denying tool calls for
+    // this one reply — the model physically cannot emit the same call a seventh time and has to
+    // answer in text, which ends the loop.
+    if (guidance?.forceTextOnly) oaiBody.tool_choice = 'none'
     // mlx-lm / vLLM serve under a fixed alias and reject the client's model id; rewrite
     // the outbound field (routing above already used the original id). No-op for llama.cpp.
     const oaiAlias = engineModelAlias(d.registry.active()?.kind ?? '')
     if (oaiAlias) (oaiBody as Record<string, unknown>).model = oaiAlias
+
+    // ── Concurrency: never exceed the engine's own slot count ─────────────────
+    // Claude Code fans out background subagents, each of which is a full, independent request to
+    // this endpoint. Before this, gateway traffic did not touch the gate at all (only chat's
+    // autotitle, memory and the in-process pi agent did), so N subagents hit a `--parallel 1`
+    // llama-server together. That is worse than it sounds: the requests do not just queue, they
+    // evict each other's cached prompt prefix, so every one of them re-prefills from scratch —
+    // and each waits on a held-open HTTP connection that Claude Code's own 300s timeout is
+    // counting against.
+    //
+    // 'bg' priority: external agent traffic must yield to anything the user is waiting on
+    // in-app. The client's own abort signal is passed so a cancelled turn stops waiting
+    // immediately instead of holding its place in the queue.
+    // Queue timeout deliberately far above the client's own: `cli-launch.ts` sets
+    // ANTHROPIC_TIMEOUT to 300s, so in practice the CLIENT gives up first and its abort unqueues
+    // this wait cleanly. That makes the timeout a leak-detector (gate.ts's original purpose)
+    // rather than something a legitimately-queued subagent can trip.
+    let gateRelease: (() => void) | null = null
+    if (d.gate) {
+      try {
+        gateRelease = await d.gate.acquire('bg', { signal: c.req.raw.signal, timeoutMs: 600_000 })
+      } catch (e) {
+        // Never proceed un-slotted on failure — that would silently breach the very limit this
+        // exists to enforce, and intermittently, which is worse than a clean error.
+        const aborted = (e as Error).message === 'gate_acquire_aborted'
+        return c.json(
+          {
+            type: 'error',
+            error: aborted
+              ? { type: 'invalid_request_error', message: 'Client disconnected while queued for the engine.' }
+              : { type: 'overloaded_error', message: 'Timed out waiting for a free engine slot.' },
+          },
+          aborted ? 400 : 503,
+        )
+      }
+    }
 
     // Mark the completion in-flight so the engine card's live "Generating…"
     // indicator counts Claude-CLI (Anthropic-protocol) traffic too. Each branch
@@ -159,6 +249,7 @@ export function registerGateway(app: Hono, d: Deps): void {
       })
     } catch (e) {
       d.manager.generationEnd()
+      gateRelease?.()
       const err = e as Error & { cause?: unknown }
       const isAbort = err.name === 'AbortError' || ac.signal.aborted
       const cause = err.cause instanceof Error ? `: ${err.cause.message}` : ''
@@ -178,6 +269,7 @@ export function registerGateway(app: Hono, d: Deps): void {
 
     if (!res.ok || !res.body) {
       d.manager.generationEnd()
+      gateRelease?.()
       // Forward the engine's REAL status + whatever structured error it returned, instead of
       // flattening every distinct failure (bad request, model incompatibility, overload, crash)
       // to the same hardcoded 500/'api_error' — that flattening is what made bugs #1-#4 in a
@@ -236,6 +328,7 @@ export function registerGateway(app: Hono, d: Deps): void {
         } finally {
           ac.abort() // also tear down the upstream on normal completion / write error
           d.manager.generationEnd()
+          gateRelease?.()
         }
       })
     }
@@ -247,6 +340,7 @@ export function registerGateway(app: Hono, d: Deps): void {
       return c.json(mapFromOpenAI(oaiRes, modelName))
     } finally {
       d.manager.generationEnd()
+      gateRelease?.()
     }
   })
 
@@ -386,11 +480,33 @@ export function registerGateway(app: Hono, d: Deps): void {
     // when c.req.raw.signal.aborted is already true) escaped straight to Hono's default
     // error handler: a bodyless 500 with no diagnostic, and no client-facing error envelope
     // at all. Mirrors the /v1/messages handler's guard above.
+    // Same engine-slot limit the Anthropic handler enforces above, for OpenAI-protocol clients
+    // (opencode / kilo / pi / scripts) — they reach the identical single engine, so leaving this
+    // path ungated would just move the pile-up rather than remove it. Only chat completions: a
+    // /tokenize or /embeddings call isn't a generation and must never queue behind one.
+    let chatGateRelease: (() => void) | null = null
+    if (isChat && d.gate) {
+      try {
+        chatGateRelease = await d.gate.acquire('bg', { signal: c.req.raw.signal, timeoutMs: 600_000 })
+      } catch (e) {
+        const aborted = (e as Error).message === 'gate_acquire_aborted'
+        return c.json(
+          {
+            error: aborted
+              ? { message: 'Client disconnected while queued for the engine.', type: 'api_error', code: 'client_disconnected' }
+              : { message: 'Timed out waiting for a free engine slot.', type: 'api_error', code: 'engine_busy' },
+          },
+          aborted ? 400 : 503,
+        )
+      }
+    }
+
     const requestStart = Date.now()
     let res: Response
     try {
       res = await fetch(upstream, init)
     } catch (e) {
+      chatGateRelease?.()
       const err = e as Error & { cause?: unknown }
       const isAbort = err.name === 'AbortError' || ac.signal.aborted
       const cause = err.cause instanceof Error ? `: ${err.cause.message}` : ''
@@ -426,13 +542,21 @@ export function registerGateway(app: Hono, d: Deps): void {
         const drain = parsedBody?.stream === true
           ? recordOpenAiStreamUsage(d, b, 'openai', requestedModel || null, chatCodeSessionId, requestStart)
           : recordOpenAiJsonUsage(d, b, 'openai', requestedModel || null, chatCodeSessionId, requestStart)
-        void drain.finally(() => d.manager.generationEnd())
+        // Released when the teed copy finishes draining — i.e. when the engine has actually
+        // stopped generating, NOT when this handler returns. Returning the streaming Response
+        // hands bytes to the client while the engine is still busy, so releasing the slot here
+        // would let the next queued request in on top of a still-running generation.
+        void drain.finally(() => { d.manager.generationEnd(); chatGateRelease?.() })
         return new Response(a, { status: res.status, headers: res.headers })
       } catch {
+        chatGateRelease?.()
         return new Response(res.body, { status: res.status, headers: res.headers })
       }
     }
 
+    // Non-chat passthrough, or a chat response with no body to drain (an engine error) — nothing
+    // will ever call the drain's finally, so the slot has to be given back right here.
+    chatGateRelease?.()
     return new Response(res.body, { status: res.status, headers: res.headers })
   })
 }

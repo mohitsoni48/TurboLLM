@@ -90,6 +90,13 @@ export function registerApi(app: Hono, d: Deps): void {
     if (ms.err) engine.error = ms.err
     const launchCommand = d.manager.launchCommand()
     if (launchCommand) engine.launchCommand = launchCommand
+    // How many generations this engine can serve at once (llama.cpp's `--parallel N`). Consumed
+    // by `turbollm launch` to cap an agent CLI's own background-agent fan-out at what the engine
+    // can actually run — see cli-launch.ts. Omitted, not defaulted to 1, when the engine
+    // advertises no slot count: "unknown" and "exactly one" are different answers, and a client
+    // must not read the former as the latter.
+    const parallelSlots = d.manager.parallelSlots()
+    if (parallelSlots !== null) engine.parallelSlots = parallelSlots
     const model = ms.model
       ? { key: ms.model.key, name: ms.model.name, quant: ms.model.quant, ctx: ms.model.ctx, vision: ms.model.vision, loadElapsedMs: ms.loadElapsedMs }
       : null

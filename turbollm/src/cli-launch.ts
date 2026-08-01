@@ -13,6 +13,8 @@ import { spawn } from 'node:child_process'
 import { homedir } from 'node:os'
 import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { join, dirname } from 'node:path'
+import { buildShellCommand } from './util/shell-command'
+import { requiresShell, resolveExecutable } from './util/resolve-executable'
 
 interface CliSpec {
   bin: string
@@ -62,7 +64,7 @@ const SUPPORTED: Record<string, CliSpec> = {
 }
 
 interface DaemonStatus {
-  engine?: { state?: string }
+  engine?: { state?: string; parallelSlots?: number }
   model?: { name?: string; key?: string } | null
   lastLoaded?: { modelKey?: string } | null
 }
@@ -80,6 +82,42 @@ type SpawnLike = (
   args: string[],
   opts: Parameters<typeof spawn>[2],
 ) => Pick<ReturnType<typeof spawn>, 'on'>
+
+/** The real spawn used for launching a CLI. Keeps the (cmd, args, opts) shape so tests can inject
+ *  a stub and assert on the arguments.
+ *
+ *  Prefers spawning the RESOLVED executable with an args array and no shell. That is not a
+ *  micro-optimisation — it is the fix for a critical injection found in pre-release review
+ *  (2026-08-01): under `shell: true` the arguments have to be flattened onto a cmd.exe command
+ *  line, and cmd.exe does not honour the `\"` escape that CommandLineToArgvW does, so an argument
+ *  containing a double quote escapes its quoting and everything after it is parsed as shell
+ *  syntax. A Code session's first message — arbitrary user prose — reaches these arguments.
+ *  Measured over nine hostile inputs: shell path 1 injection + 1 corruption, no-shell path 0 and 0.
+ *  See util/resolve-executable.ts for the reproduction.
+ *
+ *  The shell is kept ONLY for a `.cmd`/`.bat` shim, which Node refuses to spawn without one
+ *  (EINVAL, a deliberate mitigation). Node 25's DEP0190 also forbids the args-array form together
+ *  with `shell: true`, so that residual path still builds one pre-quoted command line. */
+const realSpawn: SpawnLike = (cmd, args, opts) => {
+  if (!opts?.shell) return spawn(cmd, args, opts)
+
+  const resolved = resolveExecutable(cmd)
+  if (!requiresShell(resolved)) {
+    // The safe path: no shell parses this, so no quoting rules apply at all. Verified in a real
+    // ConPTY after the change — the CLI's TUI still paints in full colour, so dropping the shell
+    // does not put anything between the CLI and the terminal handles (ADR-293's constraint).
+    const { shell: _shell, ...rest } = opts
+    return spawn(resolved ?? cmd, args, rest)
+  }
+  // Residual shim path (`claude.cmd` from a global npm install), which cannot avoid cmd.exe.
+  // The `\"` weakness above is NOT reachable through it in the daemon-driven flow: the only
+  // argument here carrying arbitrary user prose is a Code session's seeded first message, and
+  // `canSeedFirstMessage` (terminal-routes.ts) refuses any message containing a double quote
+  // before it is ever put on a command line. Every other argument is one of our own flags, drawn
+  // from a fixed safe character set. A hand-run `turbollm launch claude "…"` can still pass a
+  // quote through, but that is the user's own shell invocation, not a privilege boundary.
+  return spawn(buildShellCommand(cmd, args), opts)
+}
 
 /** Fetch the current daemon status. Returns null on network error. */
 async function fetchStatus(base: string, _fetch: typeof fetch = fetch): Promise<DaemonStatus | null> {
@@ -475,6 +513,48 @@ async function loadAndWait(
   return false
 }
 
+// ── Don't inherit the PARENT agent session's identity (founder-reported, 2026-08-01) ──────────
+// Symptom, seen live in a Code terminal: the Claude CLI rendered all-white instead of its normal
+// colours, and reported "Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker".
+// Cause: the daemon happened to be started from INSIDE a Claude Code session, and `...process.env`
+// below hands the launched CLI every marker that session set on the daemon. The CLI then correctly
+// concludes it is a nested child of another agent run and degrades itself accordingly.
+//
+// This is not exotic: TurboLLM's users are people running coding agents, so starting the daemon
+// from within one is an ordinary thing to do, and the failure is silent and confusing when it
+// happens. A terminal-agent launch is a NEW, top-level session — it must never adopt another run's
+// identity.
+//
+// Deliberately a targeted list, NOT a blanket `CLAUDE_*` wipe. These are all markers that exist
+// only because the PARENT process was itself Claude Code / the Agent SDK; a user's own deliberate
+// settings (`CLAUDE_CODE_MAX_OUTPUT_TOKENS`, feature toggles, and the like) share the prefix and
+// must survive, since a hand-run `turbollm launch claude` from a normal shell is entitled to them.
+// `ANTHROPIC_API_KEY` is included for a different reason: we set our own `ANTHROPIC_AUTH_TOKEN`,
+// and an inherited key can take precedence over it — which would silently break the session-scoped
+// token the gateway uses for per-session overrides and usage attribution (session-auth.ts).
+const PARENT_AGENT_ENV_MARKERS = [
+  'CLAUDECODE',
+  'CLAUDE_CODE_CHILD_SESSION',
+  'CLAUDE_CODE_SESSION_ID',
+  'CLAUDE_CODE_HOST_SESSION_ID',
+  'CLAUDE_CODE_ENTRYPOINT',
+  'CLAUDE_CODE_EXECPATH',
+  'CLAUDE_CODE_OAUTH_SCOPES',
+  'CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH',
+  'CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH',
+  'CLAUDE_AGENT_SDK_VERSION',
+  'CLAUDE_PID',
+  'ANTHROPIC_API_KEY',
+]
+
+/** The environment a launched CLI should inherit: everything this process has, minus any marker
+ *  identifying the agent session that started the daemon. Exported for tests. */
+export function inheritedEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...base }
+  for (const key of PARENT_AGENT_ENV_MARKERS) delete env[key]
+  return env
+}
+
 /** Launch `target` CLI wired to the TurboLLM gateway on 127.0.0.1:<port>. Returns
  *  the child's exit code (or a non-zero code on a setup failure). Pure launcher —
  *  it never starts the daemon itself.
@@ -492,7 +572,7 @@ export async function launchCli(
   target: string,
   port: number,
   passthrough: string[],
-  _spawn: SpawnLike = spawn,
+  _spawn: SpawnLike = realSpawn,
   modelKey?: string,
   _fetch: typeof fetch = fetch,
   authToken?: string,
@@ -591,6 +671,9 @@ export async function launchCli(
   const model = status.model.name
   // Prefer the stable key over the display name — it's what the gateway routes on.
   const pinnedModel = status.model.key ?? model
+  // Absent when the engine advertises no slot count (vLLM/mlx-lm do their own batching) — in that
+  // case no cap is set and the CLI keeps its own default, rather than inventing a limit of 1.
+  const parallelSlots = status.engine?.parallelSlots
 
   const modelNote = modelKey ? `model: ${model}` : `using loaded model: ${model}`
   process.stdout.write(`▸ Launching ${spec.label} → TurboLLM  (${modelNote}, ${base})\n`)
@@ -607,12 +690,14 @@ export async function launchCli(
     return await spawnWithSessionRecovery(spec, passthrough, {
       stdio: 'inherit',
       shell: process.platform === 'win32',
-      env: process.env,
+      env: inheritedEnv(),
     }, _spawn)
   }
 
   const env: NodeJS.ProcessEnv = {
-    ...process.env,
+    // Parent-agent markers stripped first, so TurboLLM's own settings below (which include a
+    // CLAUDE_CODE_* flag we DO want) are applied on top and always survive.
+    ...inheritedEnv(),
     ANTHROPIC_BASE_URL: base,
     // No auth is enforced on the local gateway; the CLI just needs a non-empty token. A
     // session-scoped token (embedded terminal launches) takes priority over the shared static
@@ -633,6 +718,20 @@ export async function launchCli(
     // Opt into gateway model discovery: Claude Code queries our /v1/models at startup and
     // populates the /model picker with the local library (gateway synthesises the entries).
     CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: '1',
+    // Cap background-agent fan-out at what the engine can actually run concurrently.
+    //
+    // Claude Code spawns subagents in parallel, and each is a full, independent request to the
+    // gateway. Against a `--parallel 1` llama-server they don't merely queue — they evict each
+    // other's cached prompt prefix, so every one re-prefills from scratch, and each sits on a
+    // held-open connection counting against ANTHROPIC_TIMEOUT above. Telling the CLI the real
+    // number lets IT queue the rest, which is far better than having them all pile into the
+    // gateway and block there.
+    //
+    // The gateway enforces the same limit independently (gateway.ts acquires d.gate), so a CLI
+    // that ignores this — or one a user launched by hand — still cannot exceed the engine. This
+    // is the cooperative half: it makes the excess queue politely client-side instead of being
+    // held at the HTTP layer.
+    ...(parallelSlots ? { CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: String(parallelSlots) } : {}),
   }
 
   return await spawnWithSessionRecovery(spec, passthrough, {

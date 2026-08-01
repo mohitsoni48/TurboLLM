@@ -361,3 +361,63 @@ test('launchCli with --model: pins ANTHROPIC_MODEL to the resolved model', async
     unsilence()
   }
 })
+
+// ── engine slot count → the CLI's own background-agent cap ────────────────────────────────────
+// Claude Code fans out subagents in parallel and each is a full, independent gateway request.
+// Against a `--parallel 1` llama-server they don't merely queue — they evict each other's cached
+// prompt prefix, so every one re-prefills from scratch, and each holds a connection against
+// ANTHROPIC_TIMEOUT. Telling the CLI the real number lets IT queue the excess. The gateway
+// enforces the same ceiling independently, so this is the cooperative half, not the only guard.
+
+/** A status fetch that reports an engine slot count, which the real /api/v1/status now includes. */
+function fetchWithSlots(slots: number | undefined): typeof fetch {
+  const fn = async (input: string | URL | globalThis.Request): Promise<Response> => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+    if (url.includes('/api/v1/status')) {
+      const engine: Record<string, unknown> = { state: 'running' }
+      if (slots !== undefined) engine.parallelSlots = slots
+      return {
+        ok: true, status: 200,
+        json: async () => ({ engine, model: { key: MODELS[0].key, name: MODELS[0].name } }),
+      } as Response
+    }
+    return { ok: false, status: 404, json: async () => ({}) } as Response
+  }
+  return fn as unknown as typeof fetch
+}
+
+test('launchCli caps concurrent subagents at the engine\'s slot count', async () => {
+  const { calls, fn } = makeSpawn()
+  const unsilence = silenceOutput()
+  try {
+    await launchCli('claude', 6996, [], fn, undefined, fetchWithSlots(1))
+    assert.equal(calls[0].env['CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS'], '1')
+  } finally {
+    unsilence()
+  }
+})
+
+test('launchCli passes a multi-slot engine\'s real capacity through, not a hardcoded 1', async () => {
+  const { calls, fn } = makeSpawn()
+  const unsilence = silenceOutput()
+  try {
+    await launchCli('claude', 6996, [], fn, undefined, fetchWithSlots(4))
+    assert.equal(calls[0].env['CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS'], '4')
+  } finally {
+    unsilence()
+  }
+})
+
+test('launchCli sets NO cap when the engine advertises no slot count', async () => {
+  // vLLM / mlx-lm do their own continuous batching. Setting 1 here because we couldn't read a
+  // flag would be a brand-new restriction on those engines dressed up as a fix — the CLI must
+  // keep its own default instead.
+  const { calls, fn } = makeSpawn()
+  const unsilence = silenceOutput()
+  try {
+    await launchCli('claude', 6996, [], fn, undefined, fetchWithSlots(undefined))
+    assert.equal(calls[0].env['CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS'], undefined)
+  } finally {
+    unsilence()
+  }
+})

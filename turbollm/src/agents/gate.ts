@@ -5,7 +5,10 @@
 
 interface Waiter {
   priority: 'fg' | 'bg'
-  grant: (release: () => void) => void
+  /** Returns false when the waiter had already given up (aborted/timed out) and the caller must
+   *  NOT count a slot as taken. Needed once the gate admits more than one holder: `drain()` has to
+   *  know whether the slot it just reserved was actually handed to somebody. */
+  grant: (release: () => void) => boolean
   giveUp: (err: Error) => void
 }
 
@@ -18,8 +21,24 @@ interface Waiter {
 const DEFAULT_ACQUIRE_TIMEOUT_MS = 180_000
 
 export class GenerationGate {
-  private held = false
+  /** How many holders are inside the gate right now. Was a boolean (`held`) when the gate could
+   *  only ever admit one — see the constructor for why it counts now. */
+  private inFlight = 0
   private queue: Waiter[] = []
+
+  /**
+   * `capacity` is how many generations may run CONCURRENTLY, evaluated fresh on every admission
+   * decision rather than captured once — the answer changes when the user loads a different model,
+   * and a value read at daemon start would be wrong for the rest of the process's life.
+   *
+   * Defaults to `() => 1`, which is exactly the old boolean-mutex behaviour, so every existing
+   * caller is unaffected. In the real daemon it reports the loaded engine's own slot count
+   * (`Manager.parallelSlots()`, i.e. llama.cpp's `--parallel N`), and `Infinity` for an engine
+   * that doesn't advertise one — see cli.ts. Infinity is deliberate: an engine whose concurrency
+   * we cannot read (vLLM, mlx-lm) has its own batching, and inventing a limit of 1 for it would be
+   * a brand-new restriction dressed up as a bug fix.
+   */
+  constructor(private capacity: () => number = () => 1) {}
 
   /**
    * Acquire the gate. Resolves with a release function once granted.
@@ -44,8 +63,8 @@ export class GenerationGate {
    *      acquire() call gets this protection whether or not its caller passes a signal.
    */
   async acquire(priority: 'fg' | 'bg', opts?: { signal?: AbortSignal; timeoutMs?: number }): Promise<() => void> {
-    if (!this.held) {
-      this.held = true
+    if (this.inFlight < this.capacity()) {
+      this.inFlight++
       return this.makeRelease()
     }
     return new Promise<() => void>((resolvePromise, rejectPromise) => {
@@ -57,11 +76,12 @@ export class GenerationGate {
       const waiter: Waiter = {
         priority,
         grant: (release) => {
-          if (settled) return
+          if (settled) return false
           settled = true
           signal?.removeEventListener('abort', onAbort)
           clearTimeout(timer)
           resolvePromise(release)
+          return true
         },
         giveUp: (err) => {
           if (settled) return
@@ -100,11 +120,35 @@ export class GenerationGate {
   private makeRelease(): () => void {
     let released = false
     return () => {
-      if (released) return
+      if (released) return // idempotent: a double release must never free someone else's slot
       released = true
-      const next = this.queue.shift()
-      if (next) next.grant(this.makeRelease())
-      else this.held = false
+      this.inFlight--
+      this.drain()
     }
+  }
+
+  /** Hand freed slots to queued waiters, newest capacity honoured.
+   *
+   *  Loops rather than granting exactly one: capacity is dynamic, so a model swap to a
+   *  higher-slot engine can free several admissions at once, and a single release would otherwise
+   *  leak that headroom until the next unrelated release happened to come along.
+   *
+   *  A waiter that has already aborted or timed out normally removes itself from the queue, but it
+   *  is checked here too — `grant()` reporting false means no one took the slot, so the loop must
+   *  put it back rather than count a phantom holder. Getting that wrong would permanently shrink
+   *  effective capacity by one for the life of the daemon, which is precisely the class of leak
+   *  the acquire() timeout above exists to recover from. */
+  private drain(): void {
+    while (this.inFlight < this.capacity()) {
+      const next = this.queue.shift()
+      if (!next) return
+      this.inFlight++
+      if (!next.grant(this.makeRelease())) this.inFlight--
+    }
+  }
+
+  /** Live counters, for tests and diagnostics. */
+  stats(): { inFlight: number; queued: number; capacity: number } {
+    return { inFlight: this.inFlight, queued: this.queue.length, capacity: this.capacity() }
   }
 }

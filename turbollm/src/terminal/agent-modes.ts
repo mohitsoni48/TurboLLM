@@ -75,6 +75,8 @@ export type HelpRunner = () => Promise<string>
 
 const realHelpRunner: HelpRunner = async () => {
   const { spawn } = await import('node:child_process')
+  const { buildShellCommand } = await import('../util/shell-command')
+  const { requiresShell, resolveExecutable } = await import('../util/resolve-executable')
   return await new Promise<string>((resolve) => {
     let out = ''
     let settled = false
@@ -83,10 +85,20 @@ const realHelpRunner: HelpRunner = async () => {
       // `shell` on Windows for the same reason cli-launch.ts spawns the CLI that way: `claude` is
       // a PATHEXT shim there, not a directly-executable binary. Piping stdout is fine HERE — this
       // runs in the daemon, not inside the session's ConPTY, and nothing is respawned after it.
-      const child = spawn('claude', ['--help'], {
-        shell: process.platform === 'win32',
-        stdio: ['ignore', 'pipe', 'ignore'],
-      })
+      //
+      // Under a shell the command is passed as ONE pre-quoted string rather than as an args array:
+      // Node 25 deprecates the array form with `shell: true` (DEP0190), and the daemon printed
+      // that warning to its own stderr on every Code-session open. Without a shell the args array
+      // is correct and needs no quoting.
+      // Same rule as cli-launch.ts's realSpawn: resolve the binary and skip the shell whenever
+      // it is a real executable, falling back to a shell only for a .cmd/.bat shim (which Node
+      // refuses to spawn without one). These arguments are static and safe either way — this is
+      // for consistency, so there is ONE way the CLI gets spawned rather than two to audit.
+      const resolved = resolveExecutable('claude')
+      const stdio: ['ignore', 'pipe', 'ignore'] = ['ignore', 'pipe', 'ignore']
+      const child = requiresShell(resolved)
+        ? spawn(buildShellCommand('claude', ['--help']), { shell: true, stdio })
+        : spawn(resolved ?? 'claude', ['--help'], { stdio })
       const timer = setTimeout(() => { try { child.kill() } catch { /* already gone */ } ; done('') }, 5000)
       child.stdout?.on('data', (b: Buffer) => { out += b.toString('utf8') })
       child.on('error', () => { clearTimeout(timer); done('') })
