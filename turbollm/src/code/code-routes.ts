@@ -652,9 +652,9 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
     const run = db.getAgentRun(c.req.param('id'))
     if (!run) return err(c, 404, 'not_found', 'Session not found.')
     if (!run.repoRoot) return err(c, 400, 'invalid_input', 'Session has no repo root.')
-    const status = await getGitStatus(run.repoRoot)
+    const status = await getGitStatus(agentCwd(run))
     if (!status.isRepo || status.detached || !status.branch) return c.json({ ok: true, compareUrl: null })
-    const compareUrl = await getGithubCompareUrl(run.repoRoot, status.branch)
+    const compareUrl = await getGithubCompareUrl(agentCwd(run), status.branch)
     return c.json({ ok: true, compareUrl })
   })
 
@@ -679,7 +679,7 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
 
     let result
     try {
-      result = await runShellCommand(command, run.repoRoot, id)
+      result = await runShellCommand(command, agentCwd(run), id)
     } catch (e) {
       return err(c, 500, 'exec_failed', e instanceof Error ? e.message : 'Command failed to run.')
     }
@@ -778,7 +778,13 @@ export function registerCodeRoutes(app: Hono, d: Deps): void {
     // steer); 'followUp' (the default) queues a fresh turn exactly as before. `steered` tells the
     // caller which happened — the frontend renders an injected message inline instead of as a
     // pending "Queued" chip.
-    const enqueueParams = { convId: run.convId, repoRoot: run.repoRoot, task, userMsgId, thinkingBudget: b.thinkingBudget }
+    // agentCwd, NOT repoRoot. This is the site every ordinary turn goes through, and getting it
+    // wrong is what made the first version of this feature worse than not having it: the agent
+    // edited the user's real working tree while git status/commit/push pointed at the worktree, so
+    // commits silently did nothing while the repo went dirty. (The site fixed first was /compact —
+    // a different one.) Caught by the pre-release review gate, which is why worktrees were cut
+    // from v1.9.6 rather than shipped half-wired.
+    const enqueueParams = { convId: run.convId, repoRoot: agentCwd(run), task, userMsgId, thinkingBudget: b.thinkingBudget }
     if (kind === 'steer') {
       const { steered, queued } = await runs.steer(id, enqueueParams)
       return c.json({ ok: true, queued, steered, userMessageId: userMsgId }, 202)
