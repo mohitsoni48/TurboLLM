@@ -59,8 +59,16 @@ export class RoutineScheduler {
       // unhandled rejection crashes daemon without it. .catch() before .finally() ensures logged, not escaped.
       void this.deps.runRoutine(r).finally(() => {
         this.inFlight.delete(r.id)
+        // Re-read rather than reusing `r`: the routine may have been paused, edited or
+        // deleted while this fire was in flight. "paused" means "no scheduled next fire",
+        // so rescheduling unconditionally here would hand a paused routine a nextFireAt
+        // the user just cleared (and Phase 3's UI would render a next-run time for it).
+        // Deleted routines fall out the same way instead of issuing a 0-row UPDATE.
+        // The re-read rule is also the current one, so an edit mid-run isn't overwritten.
+        const current = this.deps.store.getRoutine(r.id)
+        if (current?.status !== 'active') return
         const now = this.deps.now()
-        this.deps.store.updateRoutine(r.id, { nextFireAt: computeNextFireTime(r.scheduleRule, now).toISOString() })
+        this.deps.store.updateRoutine(r.id, { nextFireAt: computeNextFireTime(current.scheduleRule, now).toISOString() })
       }).catch((err) => {
         console.error(`[RoutineScheduler] runRoutine failed for routine ${r.id}:`, err)
       })
