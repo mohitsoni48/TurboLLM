@@ -95,6 +95,10 @@ export function registerRoutineRoutes(app: Hono, d: Deps): void {
   app.put('/api/v1/routines/:id/pause', (c) => {
     const routine = d.db.getRoutine(c.req.param('id'))
     if (!routine) return err(c, 404, 'not_found', 'Routine not found.')
+    // Guarding on 'active' is what keeps /confirm the ONLY door into 'active': without it,
+    // pending_confirmation -> pause -> resume walks a never-confirmed routine straight to
+    // active, since /resume only checks for 'paused'.
+    if (routine.status !== 'active') return err(c, 409, 'not_active', 'Routine is not active.')
     return c.json(d.db.updateRoutine(routine.id, { status: 'paused', nextFireAt: null }))
   })
 
