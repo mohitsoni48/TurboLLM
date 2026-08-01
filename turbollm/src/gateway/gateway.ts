@@ -3,12 +3,14 @@ import { randomUUID } from 'node:crypto'
 import type { Context, Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import type { ContentfulStatusCode } from 'hono/utils/http-status'
+import { createPatch } from 'diff'
 import type { Deps } from '../deps'
+import type { ToolCallRecord } from '../chat/db'
 import { clampMaxTokens } from '../config/config'
 import { engineModelAlias } from '../engines/compat'
 import { presentedKey } from '../auth'
 import { sessionAuth } from '../code/session-auth'
-import { mapToOpenAI, mapFromOpenAI, streamToAnthropic, type AnthropicRequest } from './anthropic'
+import { mapToOpenAI, mapFromOpenAI, streamToAnthropic, type AnthropicRequest, type StreamToolCall } from './anthropic'
 import { applyAgentGuidance } from './agent-guidance'
 import {
   extractSearchQuery,
@@ -313,6 +315,12 @@ export function registerGateway(app: Hono, d: Deps): void {
         // Live per-request progress for the engine card (prefill % + token count),
         // so Claude Code traffic shows the same live row as in-app chat.
         (live) => { try { d.manager.setLiveGen(live) } catch { /* best-effort */ } },
+        // Coding-activity attribution for terminal-agent sessions — see
+        // recordCodeSessionToolCalls. Nothing to attribute for any other client.
+        (calls) => {
+          if (!anthropicCodeSessionId) return
+          try { recordCodeSessionToolCalls(d, anthropicCodeSessionId, calls) } catch { /* swallow */ }
+        },
       )
       // streamSSE flushes each chunk immediately through Node.js's HTTP layer.
       // Raw ReadableStream does not — chunks buffer until the response completes,
@@ -337,6 +345,10 @@ export function registerGateway(app: Hono, d: Deps): void {
       const oaiRes = (await res.json()) as Record<string, unknown>
       // session stats (B4) + durable #71 record, fail-safe
       recordOpenAiUsage(d, oaiRes, 'anthropic', req.model ?? null, anthropicCodeSessionId, Date.now() - requestStart)
+      // Same coding-activity attribution the streaming branch gets. A non-streaming turn has no
+      // per-delta reassembly to do — the engine already hands back whole `arguments` strings —
+      // but it must not be the one shape of terminal-agent turn that silently records nothing.
+      if (anthropicCodeSessionId) recordCodeSessionToolCalls(d, anthropicCodeSessionId, openAiToolCalls(oaiRes))
       return c.json(mapFromOpenAI(oaiRes, modelName))
     } finally {
       d.manager.generationEnd()
@@ -559,6 +571,96 @@ export function registerGateway(app: Hono, d: Deps): void {
     chatGateRelease?.()
     return new Response(res.body, { status: res.status, headers: res.headers })
   })
+}
+
+// ── Coding-activity attribution for terminal-agent sessions ─────────────────
+
+/** The only tool names that feed the Code launchpad's filesTouched/diff tiles. Claude Code sends
+ *  them PascalCase (`Edit`/`Write`/`MultiEdit`, confirmed against a real transcript), so matching
+ *  is case-insensitive; every other tool it has (Bash, Read, Grep, WebFetch, …) is deliberately
+ *  ignored, exactly as on the in-process pi path, where only edit/write records carry a path. */
+const CODE_ACTIVITY_TOOLS = new Set(['edit', 'write', 'multiedit'])
+
+/** Reassembled tool calls off a NON-streaming OpenAI completion — the flat counterpart to
+ *  streamToAnthropic's per-delta accumulation, for the same observer. An unparseable
+ *  `arguments` string drops that one call rather than the whole turn's worth. */
+function openAiToolCalls(oai: Record<string, unknown>): StreamToolCall[] {
+  const raw = (oai.choices as Array<{ message?: { tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: string } }> } }> | undefined)
+    ?.[0]?.message?.tool_calls
+  if (!Array.isArray(raw)) return []
+  const calls: StreamToolCall[] = []
+  for (const tc of raw) {
+    try {
+      calls.push({ id: tc.id ?? '', name: tc.function?.name ?? '', input: JSON.parse(tc.function?.arguments ?? '') })
+    } catch { /* skip this one call */ }
+  }
+  return calls
+}
+
+/** Credit a Code session for a turn its terminal-launched CLI just took, into the SAME two tables
+ *  the in-process pi agent writes (`messages.tool_calls` + `agent_runs.status`) — so codeStats()
+ *  needs no knowledge that a second kind of agent exists.
+ *
+ *  Why this lives in the gateway at all: a terminal session's CLI executes its own edits inside
+ *  its own subprocess and never reports them back, so nothing downstream of it can see them. The
+ *  gateway is the one component that does — it is the HTTP intermediary the CLI asks for every
+ *  token — and it already knows which session a request belongs to from the session-scoped bearer
+ *  token (resolveCodeSession). Without this, a terminal session moved none of the "Coding
+ *  activity" tiles no matter how much real work it did.
+ *
+ *  Two paths were considered and rejected before this one: the CLI's process-exit event (leaving
+ *  the terminal tab is Ctrl+D, which does NOT quit the CLI — see TerminalView.tsx and ADR-298 —
+ *  so it almost never fires in real use), and parsing Claude Code's own private on-disk JSONL
+ *  transcript (undocumented, third-party, single-agent-only, and outside our data directory).
+ *
+ *  Wholly best-effort: any failure here is swallowed, because this is a side observation of a
+ *  request whose actual job is to answer the CLI. */
+function recordCodeSessionToolCalls(d: Deps, codeSessionId: string, calls: StreamToolCall[]): void {
+  try {
+    const run = d.db.getAgentRun(codeSessionId)
+    if (!run) return
+
+    const records: ToolCallRecord[] = []
+    for (const call of calls) {
+      const name = call.name.toLowerCase()
+      if (!CODE_ACTIVITY_TOOLS.has(name)) continue
+      // `input` came off the wire as JSON — narrow every field rather than trusting the shape.
+      const input = (call.input ?? {}) as Record<string, unknown>
+      const path = typeof input.file_path === 'string' ? input.file_path : ''
+      if (!path) continue
+      if (name === 'write') {
+        // No diff: codeStats() counts diff lines for 'edit' only, and a whole-file write has no
+        // meaningful before-state here anyway. It still lands in filesTouched, which is the
+        // entirety of what a write contributes on the pi path too.
+        records.push({ id: call.id, name: 'write', args: { path } })
+      } else if (name === 'edit') {
+        const oldString = typeof input.old_string === 'string' ? input.old_string : ''
+        const newString = typeof input.new_string === 'string' ? input.new_string : ''
+        records.push({ id: call.id, name: 'edit', args: { path }, diff: createPatch(path, oldString, newString) })
+      } else {
+        // MultiEdit carries N independent {old_string,new_string} FRAGMENT pairs and no file
+        // content, so there is no honest way to reconstruct one unified diff from it — the
+        // fragments' line positions relative to each other are unknown. Recorded as an edit for
+        // filesTouched credit with the diff deliberately omitted: an omitted number is a gap in
+        // "Diff shipped", a fabricated one is a wrong number nobody can tell is wrong.
+        records.push({ id: call.id, name: 'edit', args: { path } })
+      }
+    }
+    if (records.length > 0) d.db.addMessage(run.convId, 'assistant', '', { toolCalls: records })
+
+    // Optimistic, and deliberately so: observing ANY real turn on this session — even a
+    // text-only reply or a pure Bash/Read turn — is what marks it shipped. The alternative is
+    // waiting for a completion signal that in practice never arrives, because leaving the
+    // terminal tab does not quit the CLI (ADR-298), so the overwhelming majority of real
+    // sessions would stay 'queued' forever and never count toward "Tasks shipped". A run that
+    // is genuinely still going simply gets marked again on its next turn.
+    //
+    // It also removes a second, quieter wrong: CodeRunManager.reconcileOnStartup force-marks
+    // every code run still 'queued'/'running' at daemon startup as 'interrupted'. A terminal
+    // session that never left 'queued' was being labelled interrupted on the next restart no
+    // matter how much work it had actually done.
+    d.db.updateAgentRun(run.id, { status: 'done', endedAt: new Date().toISOString() })
+  } catch { /* swallow — attribution is best-effort and must never affect the CLI's response */ }
 }
 
 // ── session-stats recording helpers (B4) ────────────────────────────────────
