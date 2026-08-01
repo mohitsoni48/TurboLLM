@@ -51,10 +51,18 @@ export class RoutineScheduler {
         continue
       }
       this.inFlight.add(r.id)
+      // Reschedule in .finally() to maintain fixed-delay semantics: interval-type routines fire
+      // N ms after completion (not N ms after original due time), preventing pile-up for slow routines.
+      // Overlap detection works via inFlight set (not database state) — a concurrent tick can detect
+      // overlap even though this tick has rescheduled the routine, because inFlight still contains r.id.
+      // .catch() is essential: if runRoutine rejects (Phase 2/3 real I/O), .finally() re-throws;
+      // unhandled rejection crashes daemon without it. .catch() before .finally() ensures logged, not escaped.
       void this.deps.runRoutine(r).finally(() => {
         this.inFlight.delete(r.id)
         const now = this.deps.now()
         this.deps.store.updateRoutine(r.id, { nextFireAt: computeNextFireTime(r.scheduleRule, now).toISOString() })
+      }).catch((err) => {
+        console.error(`[RoutineScheduler] runRoutine failed for routine ${r.id}:`, err)
       })
     }
   }
