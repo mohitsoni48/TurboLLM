@@ -19,10 +19,9 @@
  * over the real transport was confirmed present in D1, with a deliberately
  * poisoned event rejected at both the client and the edge.
  *
- * Turning this on reveals two surfaces: the Settings "Privacy & telemetry"
- * section, and the first-run consent card (which forces an explicit choice with
- * no pre-selected default). Nothing transmits until a user picks a level above
- * Off — except the one-time record of that choice itself, which the Off copy
- * states plainly (ADR-299 Decision 5).
+ * Turning this on reveals the Settings "Privacy & telemetry" section. There is no
+ * first-run consent card (removed 2026-08-01, superseding ADR-299 Decision 4):
+ * telemetry now defaults ON (`full`) for every install, and a user who wants to
+ * opt out or narrow the level changes it there, any time.
  */
 export const TELEMETRY_UI_ENABLED = true

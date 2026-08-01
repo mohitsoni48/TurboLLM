@@ -237,7 +237,12 @@ export class BenchRunner {
    *  see `reportModelLoad`'s own once-only claim — so a re-tune later on
    *  cannot overwrite it. */
   private reportFirstLoad(outcome: 'ok' | 'fail' | 'cancelled', failReason?: string): void {
-    if (this.telemetry) reportModelLoad(this.store.dir(), this.telemetry, outcome, failReason)
+    if (!this.telemetry) return
+    // onboarding_step (ADR-299): mirrors cli.ts's `onLoadSettled` wiring — auto-tune is a
+    // separate path to a first load and must feed the setup-funnel step too, not just the
+    // once-ever `model_first_load` milestone below (found 2026-08-01, see cli.ts).
+    this.telemetry.emit('onboarding_step', { step: 'first_load', outcome })
+    reportModelLoad(this.store.dir(), this.telemetry, outcome, failReason)
   }
 
   /** Stop the engine — force-killed immediately when the run is cancelled (the user is actively

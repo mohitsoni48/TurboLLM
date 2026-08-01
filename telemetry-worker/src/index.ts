@@ -112,7 +112,15 @@ function makeDeps(env: Env): IngestDeps {
       await env.DB.batch(
         events.map((e) =>
           stmt.bind(
-            new Date().toISOString(),
+            // The client's own `ts` (set at the moment the event actually happened,
+            // schema.ts:emit) — not server receipt time. Found 2026-08-01 auditing the
+            // onboarding funnel against real PostHog data: the daemon only flushes its
+            // local queue at two points (a 3s boot flush and a 5-min interval), so a
+            // backlog can be received well after the events inside it actually occurred,
+            // and out of their true order relative to events from other flushes. Falls
+            // back to receipt time only for `consent_choice`, the one event with no `ts`
+            // by design (schema.ts) — its ordering was never load-bearing.
+            typeof e.ts === 'string' ? e.ts : new Date().toISOString(),
             String(e.event),
             typeof e.machineId === 'string' ? e.machineId : null,
             JSON.stringify(e),
@@ -142,6 +150,14 @@ function makeDeps(env: Env): IngestDeps {
             // the consent ping countable without fabricating an identity.
             distinct_id: typeof e.machineId === 'string' ? e.machineId : 'anonymous',
             properties: e,
+            // Same reasoning as store() above: without this, PostHog stamps the event
+            // with ingestion time instead of when it actually happened, which silently
+            // breaks any funnel that requires strict step order (found 2026-08-01 — real
+            // users who had reached engine_build/model_download were showing as 0% past
+            // "Engine install" because their earlier steps were received out of order).
+            // `undefined` (consent_choice, which carries no `ts`) drops from the JSON body,
+            // so PostHog falls back to its own default of ingestion time, same as before.
+            timestamp: typeof e.ts === 'string' ? e.ts : undefined,
           })),
         }),
       })
