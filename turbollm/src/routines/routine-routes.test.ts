@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { Hono } from 'hono'
+import { createHash } from 'node:crypto'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -8,13 +9,37 @@ import { ConversationStore } from '../chat/db'
 import { registerRoutineRoutes } from './routine-routes'
 import type { Deps } from '../deps'
 
-function testApp(): { app: Hono; db: ConversationStore } {
+const RAW_KEY = 'tllm-TestKeyTestKeyTestKeyTestKeyTestKey1'
+const RAW_KEY_HASH = createHash('sha256').update(RAW_KEY).digest('hex')
+
+/** `lanBind` drives isLocalRequest (the code-flavor gate, I4): false = loopback-only bind,
+ *  which is always "local to the host", so the gate is a no-op — the default every
+ *  pre-existing test here relies on. Set it true to simulate a LAN-exposed daemon, where a
+ *  code-flavor routine must present a key. `hasKey` seeds RAW_KEY as a valid stored key. */
+function testApp(opts: { lanBind?: boolean; hasKey?: boolean } = {}): { app: Hono; db: ConversationStore } {
   const db = new ConversationStore(mkdtempSync(join(tmpdir(), 'routine-routes-test-')))
   const app = new Hono()
-  // routine-routes.ts only reads d.db — safe to stub the rest of Deps for this route-level test.
-  registerRoutineRoutes(app, { db } as unknown as Deps)
+  const apiKeys = opts.hasKey
+    ? [{ id: 'k1', name: 'test', hash: RAW_KEY_HASH, prefix: RAW_KEY.slice(0, 12), createdAt: '', lastUsedAt: null }]
+    : []
+  // routine-routes.ts reads d.db plus (for the code-flavor gate) d.store/d.tunnel via
+  // auth.ts — safe to stub the rest of Deps for this route-level test.
+  const d = {
+    db,
+    store: {
+      snapshot: () => ({ daemon: { lanBind: opts.lanBind ?? false, requireApiKey: false }, apiKeys }),
+      update: (fn: (cfg: { apiKeys: typeof apiKeys }) => void) => fn({ apiKeys }),
+    },
+  } as unknown as Deps
+  registerRoutineRoutes(app, d)
   return { app, db }
 }
+
+const CODE_ROUTINE = {
+  flavor: 'code', prompt: 'x', scheduleDisplay: 'd',
+  scheduleRule: { kind: 'interval', everyMs: 60_000 },
+  modelKey: 'm', workspacePath: 'D:/repo', codingAgent: 'pi',
+} as const
 
 test('POST /api/v1/routines creates a pending_confirmation routine', async () => {
   const { app } = testApp()
@@ -75,6 +100,70 @@ test('GET /api/v1/routines/:id/runs returns run history newest first', async () 
   assert.equal(res.status, 200)
   const runs = (await res.json()) as unknown[]
   assert.equal(runs.length, 1)
+})
+
+// ── Code-flavor auth gate (I4) ────────────────────────────────────────────────
+// A flavor:'code' routine schedules the same host-filesystem code execution that
+// /api/v1/code/* gates behind codeAuth, just unattended and on a timer, so the
+// create/update endpoints apply codeAuth's own decision inline for that flavor.
+// Chat routines stay on the baseline lanAuth gate only.
+
+test('POST of a code routine from a non-host device with no key is rejected', async () => {
+  const { app, db } = testApp({ lanBind: true })
+  const res = await app.request('/api/v1/routines', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(CODE_ROUTINE),
+  })
+  assert.equal(res.status, 401)
+  assert.equal(await errorCode(res), 'unauthorized')
+  assert.equal(db.listRoutines().length, 0)
+})
+
+test('POST of a chat routine from the same non-host device is NOT gated', async () => {
+  const { app } = testApp({ lanBind: true })
+  const res = await post(app, {})
+  assert.equal(res.status, 201)
+})
+
+test('POST of a code routine from a non-host device WITH a valid key succeeds', async () => {
+  const { app } = testApp({ lanBind: true, hasKey: true })
+  const res = await app.request('/api/v1/routines', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'X-TurboLLM-Auth': RAW_KEY },
+    body: JSON.stringify(CODE_ROUTINE),
+  })
+  assert.equal(res.status, 201)
+})
+
+test('POST of a code routine from the host (loopback-only bind) needs no key', async () => {
+  const { app } = testApp()
+  const res = await app.request('/api/v1/routines', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(CODE_ROUTINE),
+  })
+  assert.equal(res.status, 201)
+})
+
+test('PUT on an existing code routine from a non-host device with no key is rejected', async () => {
+  const { app, db } = testApp({ lanBind: true })
+  const created = db.createRoutine({
+    flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 },
+    modelKey: 'm', workspacePath: 'D:/repo', codingAgent: 'pi',
+  })
+  const res = await app.request(`/api/v1/routines/${created.id}`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ prompt: 'exfiltrate everything' }),
+  })
+  assert.equal(res.status, 401)
+  assert.equal(db.getRoutine(created.id)?.prompt, 'x')
+})
+
+test('PUT on a chat routine from the same non-host device is NOT gated', async () => {
+  const { app, db } = testApp({ lanBind: true })
+  const created = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', agentId: 'a' })
+  const res = await app.request(`/api/v1/routines/${created.id}`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ prompt: 'new' }),
+  })
+  assert.equal(res.status, 200)
+  assert.equal(db.getRoutine(created.id)?.prompt, 'new')
 })
 
 // ── Request validation (I1) ───────────────────────────────────────────────────

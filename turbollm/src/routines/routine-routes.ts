@@ -1,10 +1,11 @@
 import type { Hono } from 'hono'
 import type { Context } from 'hono'
 import type { Deps } from '../deps'
+import { isLocalRequest, verifyPresentedKey } from '../auth'
 import { computeNextFireTime } from './schedule'
 import type { ScheduleRule, RoutineFlavor, Routine } from './schema'
 
-type Status = 200 | 201 | 400 | 404 | 409
+type Status = 200 | 201 | 400 | 401 | 404 | 409
 
 function err(c: Context, status: Status, code: string, message: string) {
   return c.json({ error: { code, message } }, status)
@@ -99,6 +100,20 @@ function validateUpdate(b: RoutineBody, current: Routine): string | null {
   return validateCommonFields(b)
 }
 
+/** codeAuth's decision (auth.ts), applied inline instead of as middleware. `/api/v1/code/*`
+ *  is mounted behind `codeAuth` because it runs real bash/edit/write against the user's
+ *  filesystem; a `flavor: 'code'` routine schedules exactly that capability, unattended and
+ *  on a timer, so creating or editing one has to clear the same bar. It cannot be a mounted
+ *  middleware here: `/api/v1/routines*` also serves chat routines, which stay on the
+ *  baseline lanAuth gate — only the code-flavor requests are gated, hence a handler-level
+ *  branch over the identical `isLocalRequest || verifyPresentedKey` check (the same shape
+ *  terminal-routes.ts uses for its raw WebSocket upgrade, for the same reason). */
+function codeGateBlocks(c: Context, d: Deps): boolean {
+  return !isLocalRequest(c, d) && !verifyPresentedKey(c, d)
+}
+
+const CODE_GATE_MESSAGE = 'A valid API key is required to schedule a Code routine from a non-host device.'
+
 export function registerRoutineRoutes(app: Hono, d: Deps): void {
   app.get('/api/v1/routines', (c) => c.json(d.db.listRoutines()))
 
@@ -116,6 +131,8 @@ export function registerRoutineRoutes(app: Hono, d: Deps): void {
 
   app.post('/api/v1/routines', async (c) => {
     const b = await body<RoutineBody>(c)
+    // Auth before validation, so an ungated caller learns nothing about the request shape.
+    if (b.flavor === 'code' && codeGateBlocks(c, d)) return err(c, 401, 'unauthorized', CODE_GATE_MESSAGE)
     const problem = validateCreate(b)
     if (problem) return err(c, 400, 'invalid_routine', problem)
     const routine = d.db.createRoutine({
@@ -138,6 +155,11 @@ export function registerRoutineRoutes(app: Hono, d: Deps): void {
     const routine = d.db.getRoutine(c.req.param('id'))
     if (!routine) return err(c, 404, 'not_found', 'Routine not found.')
     const b = await body<RoutineBody>(c)
+    // PUT cannot change `flavor` today, so the stored one decides; `b.flavor` is checked too
+    // so this stays correct if a later phase ever makes the field mutable.
+    if ((routine.flavor === 'code' || b.flavor === 'code') && codeGateBlocks(c, d)) {
+      return err(c, 401, 'unauthorized', CODE_GATE_MESSAGE)
+    }
     const problem = validateUpdate(b, routine)
     if (problem) return err(c, 400, 'invalid_routine', problem)
     const patch: Parameters<typeof d.db.updateRoutine>[1] = {}
