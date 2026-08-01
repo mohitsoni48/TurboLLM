@@ -1,15 +1,16 @@
 {
   "name": "turbollm-desktop",
-  "version": "1.9.5",
+  "version": "1.9.7",
   "description": "TurboLLM Desktop — native window wrapper for the TurboLLM daemon",
   "main": "main.js",
   "license": "FSL-1.1-ALv2",
   "scripts": {
     "start": "electron .",
-    "package": "node bundle-and-package.js"
+    "prepare-daemon": "node prepare-daemon.js",
+    "package": "npm run prepare-daemon && electron-builder --config electron-builder.config.cjs"
   },
   "devDependencies": {
     "electron": "43.2.0",
-    "@electron/packager": "20.0.4"
+    "electron-builder": "^26.0.12"
   }
 }

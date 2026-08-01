@@ -10,29 +10,31 @@ const { existsSync } = require('fs')
 const PORT = process.env.TURBOLLM_PORT || 6996
 
 // ── Locate daemon files ───────────────────────────────────────────────────────
+// The daemon depends on node-pty (native addon, used by the terminal-agent PTY
+// feature) and node:sqlite. Both need to run under a REAL Node.js binary built
+// for the host platform/arch — Electron's own embedded Node (via
+// ELECTRON_RUN_AS_NODE) has a different ABI and would fail to load node-pty's
+// prebuilt binding. So the packaged app ships an actual node(.exe) copy
+// (electron-builder.config.cjs copies the CI runner's own Node binary in) and
+// a real `node_modules/` (built with `npm ci` on that same platform), not just
+// the bundled dist/cli.js in isolation.
 function getDaemonNode () {
-  // In the packaged app, process.resourcesPath points to <app>/resources/
-  // The Electron runtime has a built-in Node.js, but to run the daemon as a
-  // standalone Node process we need the actual node.exe. electron-packager
-  // doesn't bundle one, so we copy it from electron's resources or use
-  // the system path. For the packaged build, we'll use process.execPath
-  // which is TurboLLM.exe itself — it contains Node.js at runtime.
-  if (process.resourcesPath) {
-    const bundled = join(process.resourcesPath, 'node.exe')
-    if (existsSync(bundled)) return bundled
+  if (app.isPackaged) {
+    return join(process.resourcesPath, process.platform === 'win32' ? 'node.exe' : 'node')
   }
-  return process.execPath
+  // Dev (`npm start`): the developer running this has Node on PATH.
+  return 'node'
 }
 
 function getDaemonDir () {
-  // In the packaged app, daemon sits at <app>/resources/daemon/
-  if (process.resourcesPath) {
+  if (app.isPackaged) {
     const daemonDir = join(process.resourcesPath, 'daemon')
-    if (existsSync(join(daemonDir, 'cli.js'))) return daemonDir
+    if (existsSync(join(daemonDir, 'bin', 'turbollm.mjs'))) return daemonDir
+    return null
   }
-  // Dev fallback: turbollm/dist/ alongside this wrapper
-  const fallback = join(__dirname, '..', '..', 'turbollm', 'dist')
-  if (existsSync(join(fallback, 'cli.js'))) return fallback
+  // Dev fallback: turbollm/ is a sibling of wrapper/ at the repo root.
+  const fallback = join(__dirname, '..', 'turbollm')
+  if (existsSync(join(fallback, 'bin', 'turbollm.mjs'))) return fallback
   return null
 }
 
@@ -70,7 +72,7 @@ function launchDaemon () {
     )
   }
 
-  const cliPath = join(daemonDir, 'cli.js')
+  const cliPath = join(daemonDir, 'bin', 'turbollm.mjs')
 
   daemonProcess = spawn(node, [cliPath, '--port', String(PORT), '--addr', `127.0.0.1:${PORT}`], {
     cwd: daemonDir,
