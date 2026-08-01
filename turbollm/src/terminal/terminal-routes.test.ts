@@ -164,3 +164,40 @@ test('buildTerminalLaunchCommand: an over-long message is omitted rather than ha
   assert.ok(!cmd.includes('xxx'), 'no fragment of the message may leak into the command')
   assert.ok(cmd.startsWith('turbollm launch claude --port '), cmd)
 })
+
+// ── what may NOT be seeded (pre-release review, 2026-08-01) ──────────────────────────────────
+// The launch command is parsed by PowerShell before `turbollm launch` re-spawns the CLI, and
+// PowerShell 5.1 mangles native arguments: measured, `rename "foo" to "bar"` arrives as
+// `rename foo to bar` and `look in C:\repo\` arrives as `look in C:\repo"`. Single-quoting stops
+// INJECTION (verified across ten hostile inputs, none escaped) but cannot stop that mangling.
+// Not seeding is the honest outcome — the user retypes, rather than the agent acting on a
+// silently corrupted version of their instruction.
+
+test('canSeedFirstMessage: refuses a message containing a double quote', () => {
+  assert.equal(canSeedFirstMessage('rename "foo" to "bar"', 'claude'), false)
+  assert.equal(canSeedFirstMessage('rename foo to bar', 'claude'), true)
+})
+
+test('canSeedFirstMessage: refuses a message ending in a backslash', () => {
+  // A raw template literal cannot END in a backslash (it would escape the closing backtick), so
+  // the trailing-backslash case is written with an ordinary escaped string.
+  const BS = '\\'
+  assert.equal(canSeedFirstMessage(`look in C:${BS}repo${BS}`, 'claude'), false)
+  assert.equal(canSeedFirstMessage(`look in C:${BS}repo`, 'claude'), true, 'an interior backslash is fine')
+})
+
+test('canSeedFirstMessage: refuses control characters', () => {
+  assert.equal(canSeedFirstMessage('line one\nline two', 'claude'), false)
+  assert.equal(canSeedFirstMessage('tab\there', 'claude'), false)
+})
+
+test('buildTerminalLaunchCommand: an unseedable message is omitted, never mangled onto the line', () => {
+  const cmd = buildTerminalLaunchCommand('claude', 6996, 'tok', 'sess', false, 'acceptEdits', 'auto', 'rename "foo"')
+  assert.ok(!cmd.includes('rename'), 'no fragment of the message may reach the command line')
+  assert.ok(cmd.startsWith('turbollm launch claude --port '), cmd)
+})
+
+test('canSeedFirstMessage: an apostrophe is still fine — quoting handles it', () => {
+  // The common case must keep working; only the two genuinely unconveyable classes are refused.
+  assert.equal(canSeedFirstMessage("don't break this", 'claude'), true)
+})

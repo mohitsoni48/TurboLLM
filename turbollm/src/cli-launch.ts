@@ -14,6 +14,7 @@ import { homedir } from 'node:os'
 import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { join, dirname } from 'node:path'
 import { buildShellCommand } from './util/shell-command'
+import { requiresShell, resolveExecutable } from './util/resolve-executable'
 
 interface CliSpec {
   bin: string
@@ -83,18 +84,40 @@ type SpawnLike = (
 ) => Pick<ReturnType<typeof spawn>, 'on'>
 
 /** The real spawn used for launching a CLI. Keeps the (cmd, args, opts) shape so tests can inject
- *  a stub and assert on the arguments, but collapses to ONE pre-quoted command string when a shell
- *  is actually involved.
+ *  a stub and assert on the arguments.
  *
- *  Node 25 deprecates the args-array form with `shell: true` (DEP0190) — and `turbollm launch`
- *  printed that warning straight into the Code session's PTY, directly under its own "Launching
- *  Claude Code" banner, where it read as an unexplained error in the agent terminal. Quoting also
- *  fixes the real bug behind the warning: Node concatenates args with spaces and no quoting, so
- *  any argument containing a space was already being split in two before it reached the CLI. */
-const realSpawn: SpawnLike = (cmd, args, opts) =>
-  opts?.shell
-    ? spawn(buildShellCommand(cmd, args), opts)
-    : spawn(cmd, args, opts)
+ *  Prefers spawning the RESOLVED executable with an args array and no shell. That is not a
+ *  micro-optimisation — it is the fix for a critical injection found in pre-release review
+ *  (2026-08-01): under `shell: true` the arguments have to be flattened onto a cmd.exe command
+ *  line, and cmd.exe does not honour the `\"` escape that CommandLineToArgvW does, so an argument
+ *  containing a double quote escapes its quoting and everything after it is parsed as shell
+ *  syntax. A Code session's first message — arbitrary user prose — reaches these arguments.
+ *  Measured over nine hostile inputs: shell path 1 injection + 1 corruption, no-shell path 0 and 0.
+ *  See util/resolve-executable.ts for the reproduction.
+ *
+ *  The shell is kept ONLY for a `.cmd`/`.bat` shim, which Node refuses to spawn without one
+ *  (EINVAL, a deliberate mitigation). Node 25's DEP0190 also forbids the args-array form together
+ *  with `shell: true`, so that residual path still builds one pre-quoted command line. */
+const realSpawn: SpawnLike = (cmd, args, opts) => {
+  if (!opts?.shell) return spawn(cmd, args, opts)
+
+  const resolved = resolveExecutable(cmd)
+  if (!requiresShell(resolved)) {
+    // The safe path: no shell parses this, so no quoting rules apply at all. Verified in a real
+    // ConPTY after the change — the CLI's TUI still paints in full colour, so dropping the shell
+    // does not put anything between the CLI and the terminal handles (ADR-293's constraint).
+    const { shell: _shell, ...rest } = opts
+    return spawn(resolved ?? cmd, args, rest)
+  }
+  // Residual shim path (`claude.cmd` from a global npm install), which cannot avoid cmd.exe.
+  // The `\"` weakness above is NOT reachable through it in the daemon-driven flow: the only
+  // argument here carrying arbitrary user prose is a Code session's seeded first message, and
+  // `canSeedFirstMessage` (terminal-routes.ts) refuses any message containing a double quote
+  // before it is ever put on a command line. Every other argument is one of our own flags, drawn
+  // from a fixed safe character set. A hand-run `turbollm launch claude "…"` can still pass a
+  // quote through, but that is the user's own shell invocation, not a privilege boundary.
+  return spawn(buildShellCommand(cmd, args), opts)
+}
 
 /** Fetch the current daemon status. Returns null on network error. */
 async function fetchStatus(base: string, _fetch: typeof fetch = fetch): Promise<DaemonStatus | null> {
