@@ -124,13 +124,16 @@ function toSidebarRow(run: AgentRun) {
   }
 }
 
-export function registerCodeRoutes(app: Hono, d: Deps): void {
+export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager): void {
   const { db } = d
 
-  // The daemon-owned run registry for this app instance (one per createApp). Owns each Code
-  // run's AbortController + ring buffer, independent of any HTTP request. On startup, mark any
-  // run left 'running'/'queued' by a previous (now-dead) process as interrupted.
-  const runs = new CodeRunManager(d)
+  // The daemon-owned run registry for this app instance — either the shared instance a caller
+  // already constructed (cli.ts, so Routine execution and this UI observe the same sessions), or
+  // one built fresh here (every pre-existing test call site, unchanged). Owns each Code run's
+  // AbortController + ring buffer, independent of any HTTP request. Reconciled exactly once
+  // here, regardless of which path constructed it, since registerCodeRoutes itself only ever
+  // runs once per app instance.
+  const runs = codeRuns ?? new CodeRunManager(d)
   runs.reconcileOnStartup()
 
   // ── create a session ─────────────────────────────────────────────────────────

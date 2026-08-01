@@ -83,7 +83,7 @@ export function createApp(d: Deps): Hono {
   registerChatRoutes(app, d)
   registerChatAgentRoutes(app, d)
   registerAgentRoutes(app, d)
-  registerCodeRoutes(app, d)
+  registerCodeRoutes(app, d, d.codeRuns)
   registerTerminalRoutes(app, d)
   registerRoutineRoutes(app, d)
   registerGateway(app, d)
