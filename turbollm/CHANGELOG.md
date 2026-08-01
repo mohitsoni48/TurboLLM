@@ -25,6 +25,20 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.9.8] - 2026-08-02
+
+### Changed
+- **Telemetry now defaults to full (usage + benchmarks + crash reports) for every install, with no first-run prompt.** The forced choice card is gone — turning telemetry on is what makes the auto-tune speed estimates and setup-health data real instead of guesses, and the previous card meant almost no install ever completed it. Change your level any time from Settings → Privacy & telemetry; switching to Off still records only that one choice and nothing else, ever. Never sent: your conversations, prompts, files, paths, or keys.
+
+### Fixed
+- **A Code session whose project folder no longer exists now says so clearly, instead of "Cannot create process, error code: 267."** Reachable whenever a project is moved, renamed, deleted, an external drive gets unplugged, or a session's git worktree is removed by hand — the session also no longer looks stuck/undeletable afterward.
+- **The Code launchpad's stats (Sessions / Tasks shipped / Files touched / Diff shipped) now count edits made through the terminal-agent Claude CLI**, not just the in-app agent. A CLI session applies its own edits in a subprocess and never reported back, so real work through it was invisible to the dashboard no matter how much happened. Only edits actually confirmed applied are counted — a failed or declined edit, or a retry, is never double-credited.
+
+### Discord
+- Telemetry now defaults to on (usage + benchmarks + crash reports) instead of asking on first run — it's what makes the speed estimates and setup-health picture real. Change it any time in Settings → Privacy & telemetry; Off still means basically nothing leaves your machine.
+- Fixed: a Code session pointed at a deleted/moved project folder now gives a clear error instead of a cryptic Windows error code.
+- Fixed: the Code launchpad's stats now count edits made through the terminal `claude` CLI, not just the in-app agent.
+
 ## [1.9.7] - 2026-08-01
 
 ### Added
