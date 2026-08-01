@@ -48,6 +48,14 @@ import { waitForToolApproval } from '../tools/approval-gate'
 import { LspClient, type LspDiagnostic } from './lsp-client'
 import { lspSpecForPath, lspSpecForLanguage, SUPPORTED_LSP_LANGUAGES, type LspServerSpec } from './lsp-registry'
 
+/** How long any engine-gate acquire may sit QUEUED before giving up.
+ *
+ *  Shared by every acquire in this file and matched by the gateway's own (gateway.ts), so no
+ *  caller can be starved by a holder that is merely slow rather than stuck. gate.ts's timeout
+ *  exists to detect a LEAKED hold, not to bound a legitimate wait — and on a single-slot local
+ *  engine a legitimate wait is however long the request ahead of you takes to generate. */
+const GATE_QUEUE_TIMEOUT_MS = 600_000
+
 // A fabricated zero Usage for replayed history entries — pi requires the field on
 // AssistantMessage, but exact historical token counts don't matter for replay; pi recomputes
 // real usage for the actual new turn regardless.
@@ -786,7 +794,9 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     const skillExtension = (pi: ExtensionAPI): void => {
       pi.on('before_provider_request', async (event) => {
         releaseSkillGate()
-        if (d.gate) skillHeldGate = await d.gate.acquire('bg', { signal })
+        // Stays 'bg' — this is background sub-work, not the turn the user is watching — but takes
+        // the same queue ceiling, so a long holder ahead of it isn't reported as a failure.
+        if (d.gate) skillHeldGate = await d.gate.acquire('bg', { signal, timeoutMs: GATE_QUEUE_TIMEOUT_MS })
         // Same stale-ceiling strip as the outer session's own hook above — this sub-session
         // declares the identical PI_MAX_OUTPUT_TOKENS and would otherwise forward it verbatim too.
         const payload = { ...(event.payload as Record<string, unknown>) }
@@ -967,7 +977,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
         // 'bg' priority + subAc.signal: foreground Chat preempts, and a parent Stop / timeout gives
         // up a queued wait instead of hanging (see gate.ts). The parent isn't holding the gate here
         // (it released before executing this tool), so this acquire can't deadlock against it.
-        if (d.gate) subHeldGate = await d.gate.acquire('bg', { signal: subAc.signal })
+        if (d.gate) subHeldGate = await d.gate.acquire('bg', { signal: subAc.signal, timeoutMs: GATE_QUEUE_TIMEOUT_MS })
         const payload = { ...(event.payload as Record<string, unknown>) }
         delete payload.max_tokens
         delete payload.max_completion_tokens
@@ -1163,7 +1173,15 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       // stuck queue wait can actually be given up on. A genuinely stuck/leaked gate now rejects
       // (see gate.ts's own comment for the incident this fixed) rather than hanging the whole
       // turn forever with no way to cancel it.
-      if (d.gate) heldGate = await d.gate.acquire('bg', { signal })
+      // 'fg', not 'bg': this is the turn a user is sitting and waiting on. Until the gateway
+      // started acquiring the gate too (external agent traffic), NOTHING used 'fg' and the
+      // priority queue was dead code — so an external agent's queued requests and this turn were
+      // simply FIFO. Pre-release review flagged the consequence: a gateway holder may run for up
+      // to GATE_QUEUE_TIMEOUT_MS, which is longer than this acquire's old 180s default, so the
+      // user's own Code turn could hit `gate_acquire_timeout` and surface as a silent abort while
+      // background traffic proceeded. 'fg' puts it ahead of every queued 'bg' waiter, and the
+      // matching timeout stops a legitimately-long generation ahead of it from failing it.
+      if (d.gate) heldGate = await d.gate.acquire('fg', { signal, timeoutMs: GATE_QUEUE_TIMEOUT_MS })
       // Gate acquired, request is about to go out — begin polling /slots for prefill progress for
       // THIS round (stopped on first token / completion / response end / abort). Best-effort.
       startPrefillPoll()

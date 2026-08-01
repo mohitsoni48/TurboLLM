@@ -268,3 +268,92 @@ test('runGit: a failing command resolves rather than throwing', async () => {
     rmSync(root, { recursive: true, force: true })
   }
 })
+
+// ── every produced name must be a name git will actually accept ──────────────────────────────
+// Found in the manual review pass that substituted for a non-delivering review agent: the
+// trailing `[/.]` strip ran BEFORE the 80-char cap, so the cap could land mid-string and
+// re-expose a character git rejects at the end of a ref. A 79-character task description followed
+// by a `.` produced a branch git refuses outright — session creation would fail for nothing more
+// than a long description.
+//
+// Asserted against `git check-ref-format` rather than a regex of my own: the authority on what git
+// accepts is git, and a hand-written expectation is exactly what missed this the first time.
+test('sanitizeBranchName: output always passes git check-ref-format', async () => {
+  const cases = [
+    'a'.repeat(79) + '. and then some more words to push past the cap',
+    'a'.repeat(79) + '/ and then some more words to push past the cap',
+    'a'.repeat(79) + '- and then some more words to push past the cap',
+    'refactor the authentication module and split it into smaller files please',
+    'Add login page',
+    'fix: the thing~1',
+    '~^:?*[]',
+    'weird.lock',
+    '/leading/and/trailing/',
+    'a'.repeat(200),
+  ]
+  const root = await makeRepo()
+  try {
+    for (const raw of cases) {
+      const name = sanitizeBranchName(raw)
+      const r = await runGit(root, ['check-ref-format', '--branch', name])
+      assert.equal(r.ok, true, `git rejected ${JSON.stringify(name)} (from ${JSON.stringify(raw.slice(0, 40))}…): ${r.stderr.trim()}`)
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('sanitizeBranchName: a long name is capped without ending in a separator', () => {
+  const out = sanitizeBranchName('a'.repeat(79) + '. more')
+  assert.ok(out.length <= 80)
+  assert.ok(!/[-./]$/.test(out), `must not end in a separator, got ${JSON.stringify(out)}`)
+})
+
+// ── a directory that is already gone is SUCCESS, not failure ─────────────────────────────────
+// Founder-reported: deleting a session whose folder no longer existed returned
+// `worktreeNote: "spawn git ENOENT"` — git cannot even start when its cwd is missing. The delete
+// itself had succeeded, but the raw Node error on the response made it look like it had failed.
+// Nothing to remove is nothing to report.
+test('removeSessionWorktree: a worktree that no longer exists is a clean success', async () => {
+  const root = await makeRepo()
+  try {
+    const r = await createSessionWorktree({ repoRoot: root, branch: 'feature' })
+    assert.ok(r.ok)
+    if (!r.ok) return
+    // Someone removed it by hand, or deleted the folder.
+    rmSync(r.path, { recursive: true, force: true })
+
+    const removed = await removeSessionWorktree(root, r.path)
+    assert.equal(removed.ok, true, `expected success, got ${JSON.stringify(removed)}`)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('removeSessionWorktree: a base repo that no longer exists is also a clean success', async () => {
+  // The whole project moved or was deleted, or its drive is unplugged. There is nothing to clean
+  // and no way to run git — reporting `spawn git ENOENT` to the user helps nobody.
+  const root = await makeRepo()
+  const worktreePath = join(root, WORKTREES_SUBDIR, 'feature')
+  rmSync(root, { recursive: true, force: true })
+  const removed = await removeSessionWorktree(root, worktreePath)
+  assert.equal(removed.ok, true, `expected success, got ${JSON.stringify(removed)}`)
+})
+
+test('removeSessionWorktree: a DIRTY worktree is still refused — the guard did not weaken that', () => {
+  // Guarding on existence must not turn the "never destroy uncommitted work" rule into a no-op.
+  return (async () => {
+    const root = await makeRepo()
+    try {
+      const r = await createSessionWorktree({ repoRoot: root, branch: 'feature' })
+      assert.ok(r.ok)
+      if (!r.ok) return
+      writeFileSync(join(r.path, 'README.md'), 'unmerged work\n')
+      const removed = await removeSessionWorktree(root, r.path)
+      assert.equal(removed.ok, false)
+      if (!removed.ok) assert.equal(removed.code, 'dirty')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })()
+})

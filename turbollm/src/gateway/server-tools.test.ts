@@ -17,6 +17,7 @@ import {
   domainAllowed,
   extractSearchQuery,
   findServerTool,
+  isNestedSearchRequest,
   runWebSearchServerTool,
   serverToolMessage,
   serverToolSseEvents,
@@ -268,4 +269,32 @@ test('serverToolMessage: reports stop_reason end_turn and zero usage', () => {
   assert.equal(msg.stop_reason, 'end_turn')
   assert.deepEqual(msg.usage, { input_tokens: 0, output_tokens: 0 })
   assert.equal(msg.role, 'assistant')
+})
+
+// ── the interception must be scoped to the CLI's own nested search call ──────────────────────
+// Pre-release review (2026-08-01, HIGH): intercepting whenever a web_search server tool is
+// PRESENT hijacks any ordinary agentic turn that offers the model search alongside its real
+// tools — the turn would be answered with raw search results and never reach the model at all.
+
+test('isNestedSearchRequest: true for the CLI\'s nested call (the server tool is the only tool)', () => {
+  const yes = isNestedSearchRequest([
+    { type: 'web_search_20250305', name: 'web_search', max_uses: 8 },
+  ] as unknown as AnthropicRequest['tools'])
+  assert.equal(yes, true)
+})
+
+test('isNestedSearchRequest: FALSE for an agentic turn that merely offers search too', () => {
+  // The regression this locks: Read/Bash/WebSearch declared together is a normal turn.
+  const no = isNestedSearchRequest([
+    { name: 'Read', input_schema: { type: 'object' } },
+    { type: 'web_search_20260209', name: 'web_search' },
+    { name: 'Bash', input_schema: { type: 'object' } },
+  ] as unknown as AnthropicRequest['tools'])
+  assert.equal(no, false)
+})
+
+test('isNestedSearchRequest: false with no tools, and false for a lone client tool', () => {
+  assert.equal(isNestedSearchRequest(undefined), false)
+  assert.equal(isNestedSearchRequest([]), false)
+  assert.equal(isNestedSearchRequest([{ name: 'Read', input_schema: { type: 'object' } }]), false)
 })

@@ -20,6 +20,7 @@
 
 import type { Context, Hono } from 'hono'
 import type { Deps } from '../deps'
+import { existsSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { isLocalUpgrade, verifyKeyValue } from '../auth'
 import { sessionAuth } from '../code/session-auth'
@@ -93,11 +94,31 @@ const AUTO_MODE_ALLOWED_TOOLS: Partial<Record<string, readonly string[]>> = {
  *  half-sent instruction is worse than a message the user can see was not sent. */
 export const MAX_SEEDED_MESSAGE_CHARS = 4000
 
+/** Characters that do not survive the trip to the CLI intact, so a message containing them is not
+ *  seeded at all.
+ *
+ *  Measured, not assumed (pre-release review, 2026-08-01). The launch command is parsed by
+ *  PowerShell before `turbollm launch` ever re-spawns the CLI, and PowerShell 5.1 does not escape
+ *  arguments correctly when it hands them to a native executable:
+ *    `rename "foo" to "bar"`  arrives as  `rename foo to bar`     (quotes silently eaten)
+ *    `look in C:\repo\`       arrives as  `look in C:\repo"`      (trailing \ becomes a quote)
+ *  Single-quoting the argument stops any INJECTION — that was verified separately across ten
+ *  hostile inputs, zero of which escaped — but it cannot stop this mangling, which happens inside
+ *  PowerShell's own native-argument marshalling.
+ *
+ *  Not seeding is the honest outcome: the user retypes the message (exactly the behaviour before
+ *  seeding existed), rather than the agent silently acting on a corrupted version of it. */
+const UNSEEDABLE = /["\u0000-\u001f]/
+
 /** Whether this message can be handed to the CLI as a launch argument. */
 export function canSeedFirstMessage(message: string, agent: string): boolean {
   if (agent !== 'claude') return false
   const trimmed = message.trim()
-  return trimmed.length > 0 && trimmed.length <= MAX_SEEDED_MESSAGE_CHARS
+  if (trimmed.length === 0 || trimmed.length > MAX_SEEDED_MESSAGE_CHARS) return false
+  if (UNSEEDABLE.test(trimmed)) return false
+  // A trailing backslash is mangled into a quote by the same marshalling.
+  if (trimmed.endsWith('\\')) return false
+  return true
 }
 
 /** Pure/exported so the resume-flag decision is unit-testable without a live PTY/daemon (mirrors
@@ -218,6 +239,27 @@ export function registerTerminalRoutes(app: Hono, d: Deps): void {
       return err(c, 400, 'invalid_input', 'This session uses the built-in chat UI, not a terminal agent.')
     }
 
+    // The directory has to still exist, or node-pty's CreateProcess fails with a raw
+    // "Cannot create process, error code: 267" (ERROR_DIRECTORY) that says nothing about WHICH
+    // folder is missing or why — founder-reported. Genuinely reachable: the project can be moved,
+    // renamed or deleted, an external drive unplugged, or (now that worktrees exist) the session's
+    // worktree removed by hand with `git worktree remove`. Checked here rather than inside
+    // PTYSession so the answer is an actionable HTTP error instead of a spawn failure.
+    const cwd = agentCwd(run)
+    if (!existsSync(cwd)) {
+      const isWorktree = !!run.worktreePath && cwd === run.worktreePath
+      return err(
+        c, 400, 'cwd_missing',
+        isWorktree
+          ? `This session's worktree is gone: ${cwd}. It was probably removed outside TurboLLM ` +
+            `(\`git worktree remove\`, or deleting the folder). The session's branch and any commits ` +
+            `on it are unaffected — delete this session and start a new one on the same repo.`
+          : `This session's folder no longer exists: ${cwd}. It may have been moved, renamed or ` +
+            `deleted, or it lives on a drive that isn't connected. Reconnect or restore it, or ` +
+            `delete this session.`,
+      )
+    }
+
     // The caller (TerminalView) fits xterm.js BEFORE calling this, so the PTY is spawned at
     // its real size from the very first byte the launch command writes — never a hardcoded
     // default later corrected by a follow-up resize. A resize that arrives after a TUI's very
@@ -289,7 +331,7 @@ export function registerTerminalRoutes(app: Hono, d: Deps): void {
       // The session's worktree when it has one, else the repo itself (ADR-316) — the CLI must
       // open in the same tree the in-app agent edits, or the two halves of one session would
       // be looking at different checkouts.
-      const terminalId = m.create(agentCwd(run), run.id, cols, rows, launchCommand)
+      const terminalId = m.create(cwd, run.id, cols, rows, launchCommand)
       if (!run.terminalLaunchedOnce) d.db.updateAgentRun(run.id, { terminalLaunchedOnce: true })
       return c.json({ terminalId }, 201)
     } catch (e) {

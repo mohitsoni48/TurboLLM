@@ -25,6 +25,37 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.9.7] - 2026-08-01
+
+### Added
+- **"Use worktree" now creates a real, isolated git worktree.** Ticking it runs the session in its own checkout on its own branch at `<your-repo>/.turbollm/worktrees/<branch>`, so your actual checkout and current branch are never touched and `git status` in your repo stays clean while the agent works. Everything the session does happens in that worktree — the agent's edits, the `!command` shell escape, and the Commit / Push / diff actions. Deleting the session removes the worktree but never destroys work: if it still has uncommitted changes the removal is refused and you're given the exact command to finish, and committed work always survives because removing a worktree doesn't delete its branch. A branch name that's already taken is suffixed rather than reused, and a folder that isn't a git repository tells you so instead of silently working in it directly.
+
+### Fixed
+- **The "Use worktree" toggle previously did nothing at all.** It has been in the composer for several releases, described as "an isolated checkout on its own branch" — but nothing behind it was ever implemented, so the agent edited your real working tree on your current branch regardless. If you ticked it expecting your checkout to be protected, it wasn't. It now does what it always said it did.
+
+### Discord
+- "Use worktree" in Code now actually works. It had been in the composer for a while promising an isolated checkout on its own branch, but nothing behind it was implemented — the agent edited your real working tree regardless. Ticking it now runs the session in a genuine git worktree, so your own checkout and branch stay untouched.
+- Deleting a session cleans up its worktree, but never at the cost of unmerged work: uncommitted changes block the removal and tell you how to finish it, and committed work always survives on its branch.
+
+## [1.9.6] - 2026-08-01
+
+### Added
+- The Claude Code agent now follows the same working rules the in-app agent already did: it researches before it retries, looks up a package's current version and real documentation before adding a dependency, searches the web instead of guessing when something fails twice in a row, and gets stopped when it falls into a loop calling the same tool with the same arguments over and over.
+- A fresh Code session's first message is now sent to the Claude Code agent automatically — previously the terminal opened empty and you had to type your message a second time.
+- Background agents are now capped at the number of requests your engine can actually run at once, and the rest queue. Before, a fan-out of parallel agents all hit the engine together and evicted each other's cached prompt, so every one of them started over from scratch.
+
+### Fixed
+- **Web search in the Claude Code agent returned nothing at all, silently.** Every search came back empty with no error, so the agent quietly answered from memory instead — including for questions where it had explicitly decided it needed current information. Searches now return real, cited results.
+- Web search and page fetches are no longer blocked by a permission prompt in Auto mode, where there is nobody present to answer one. Plan and Ask still ask, exactly as before.
+- The Claude Code agent no longer starts up thinking it is a nested session of another agent when TurboLLM itself was launched from inside one — which turned its output plain white and silently disabled its transcript saving.
+- On Node 25, a `DeprecationWarning` was printed on every Code-session open — once into TurboLLM's own console and once directly into the Code terminal, where it read as an unexplained error. Fixed, along with the real bug behind it: arguments containing a space (or a `|`, which every TurboLLM model key contains) could be split apart before reaching the agent.
+
+### Discord
+- Web search in the Claude Code agent was silently returning nothing — every search came back empty with no error, so the agent quietly answered from memory. It now returns real, cited results.
+- Your first message in a new Code session is sent automatically instead of needing to be typed twice.
+- The Claude Code agent now follows the same rules the in-app agent does: research before retrying, check a package's real version and docs before adding it, and stop instead of looping on the same failing tool call.
+- Parallel background agents now queue to match what your engine can actually run, instead of all piling in at once and making each other slower.
+
 ## [1.9.5] - 2026-07-31
 
 ### Fixed
