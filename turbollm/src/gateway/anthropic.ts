@@ -8,7 +8,15 @@ type ABlock =
   | { type: 'text'; text: string }
   | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } }
   | { type: 'tool_use'; id: string; name: string; input: unknown }
-  | { type: 'tool_result'; tool_use_id: string; content: string | Array<{ type: string; text?: string }> }
+  // `is_error` is the client's own verdict on whether the call it was asked to make actually
+  // succeeded — set when the tool threw, when its preconditions failed (an `Edit` whose
+  // `old_string` wasn't found or wasn't unique, the single most common local-model tool
+  // failure), or when the user declined it at a permission prompt. Optional and absent on
+  // success, per the Anthropic API. It is not used in translation (OpenAI's `role:'tool'`
+  // message has no equivalent field) — it exists here because it is the ONLY signal the daemon
+  // ever gets about whether a terminal-agent CLI's edit really landed, which gateway.ts's
+  // coding-activity attribution correlates against before crediting anything.
+  | { type: 'tool_result'; tool_use_id: string; is_error?: boolean; content: string | Array<{ type: string; text?: string }> }
 // 'system' is undocumented but real: Claude Code injects hook context (e.g. SessionStart)
 // as a `role:'system'` entry directly into `messages`, not just via the top-level `system`
 // field — mapToOpenAI folds every one of these into a single leading system message (see there).

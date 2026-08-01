@@ -523,7 +523,7 @@ test('streamToAnthropic keeps two tool calls in the same turn apart by their ind
 
 // Fires with an EMPTY array rather than not firing at all: the observer's question is "did a real
 // turn happen on this session", of which the tool calls are only one part — a text-only reply
-// still counts (see recordCodeSessionToolCalls' optimistic 'done' marking).
+// still counts (see observeCodeSessionTurn's optimistic 'done' marking).
 test('streamToAnthropic still fires onToolCalls, with an empty list, for a turn with no tool calls', async () => {
   const upstream = sseStream([
     'data: {"choices":[{"delta":{"content":"No tools needed."}}]}',
@@ -545,6 +545,35 @@ test('streamToAnthropic drops a tool call whose argument fragments never form va
   let calls: { id: string }[] | null = null
   for await (const _ of streamToAnthropic(upstream, 'test-model', 'msg_trunc', undefined, undefined, (c) => { calls = c })) { /* drain */ }
   assert.deepEqual((calls as unknown as { id: string }[]).map((t) => t.id), ['toolu_ok'])
+})
+
+// The `if (!failed)` guard, from the observer's side. A stream that ERRORS (engine crash, model
+// evicted, connection cut) delivered only part of the turn, so its client never received the rest
+// of that tool call and never ran it — observing it anyway would credit an edit that provably
+// never happened. Throwing from `pull` rather than `controller.error()` (which resets the queue)
+// makes the already-enqueued, fully-formed call arrive first, so this pins the guard and not
+// merely the absence of data.
+test('streamToAnthropic does NOT fire onToolCalls when the stream fails mid-turn', async () => {
+  const enc = new TextEncoder()
+  const line = 'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"toolu_dead","function":{"name":"Edit","arguments":"{\\"file_path\\":\\"/repo/a.ts\\"}"}}]}}]}\n'
+  let sent = false
+  const upstream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (!sent) { sent = true; controller.enqueue(enc.encode(line)); return }
+      throw new Error('engine stopped mid-stream')
+    },
+  })
+
+  let fired = false
+  let usageFired = false
+  const events: { event: string; data: string }[] = []
+  for await (const evt of streamToAnthropic(upstream, 'test-model', 'msg_dead', () => { usageFired = true }, undefined, () => { fired = true })) {
+    events.push(evt)
+  }
+
+  assert.equal(fired, false, 'a half-received turn must never be observed as a completed one')
+  assert.equal(usageFired, false, 'nor recorded as usage')
+  assert.equal(events.at(-1)?.event, 'error', 'the client is told the engine stopped, in place of message_stop')
 })
 
 // ── streamToAnthropic usage mapping ─────────────────────────────────────────
