@@ -2,6 +2,7 @@
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
+import type { Routine, RoutineRun, RoutineFlavor, RoutineStatus, RoutineRunStatus, CodingAgentChoice, ScheduleRule } from '../routines/schema'
 
 export interface Conversation {
   id: string
@@ -547,6 +548,54 @@ function rowToAgentRun(r: AgentRunRow): AgentRun {
   }
 }
 
+interface RoutineRow {
+  id: string; flavor: string; status: string; prompt: string
+  schedule_display: string; schedule_rule: string; next_fire_at: string | null
+  model_key: string; agent_id: string | null; workspace_path: string | null
+  coding_agent: string | null; permission_mode: string | null
+  created_at: string; updated_at: string
+}
+
+function rowToRoutine(r: RoutineRow): Routine {
+  return {
+    id: r.id,
+    flavor: r.flavor as RoutineFlavor,
+    status: r.status as RoutineStatus,
+    prompt: r.prompt,
+    scheduleDisplay: r.schedule_display,
+    scheduleRule: JSON.parse(r.schedule_rule) as ScheduleRule,
+    nextFireAt: r.next_fire_at,
+    modelKey: r.model_key,
+    agentId: r.agent_id ?? undefined,
+    workspacePath: r.workspace_path ?? undefined,
+    codingAgent: (r.coding_agent as CodingAgentChoice | null) ?? undefined,
+    permissionMode: (r.permission_mode as Routine['permissionMode']) ?? undefined,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  }
+}
+
+interface RoutineRunRow {
+  id: string; routine_id: string; status: string; skip_reason: string | null
+  config_snapshot: string; pending_tool_call: string | null
+  result: string | null; error: string | null; started_at: string; ended_at: string | null
+}
+
+function rowToRoutineRun(r: RoutineRunRow): RoutineRun {
+  return {
+    id: r.id,
+    routineId: r.routine_id,
+    status: r.status as RoutineRunStatus,
+    skipReason: r.skip_reason ?? undefined,
+    configSnapshot: r.config_snapshot,
+    pendingToolCall: r.pending_tool_call ?? undefined,
+    result: r.result ?? undefined,
+    error: r.error ?? undefined,
+    startedAt: r.started_at,
+    endedAt: r.ended_at ?? undefined,
+  }
+}
+
 function rowToMsg(r: MsgRow): Message {
   const msg: Message = { id: r.id, convId: r.conv_id, seq: r.seq, role: r.role, content: r.content, reasoning: r.reasoning, attachments: safeJson(r.attachments) as string[], textAttachments: r.text_attachments ? safeJson(r.text_attachments) as string[] : [], toolCalls: r.tool_calls ? safeJson(r.tool_calls) as ToolCallRecord[] : [], stats: safeJson(r.stats) as Partial<MessageStats>, createdAt: r.created_at, variantGroup: r.variant_group, isActive: r.is_active !== 0, branchOf: r.branch_of, edited: r.edited === 1 }
   if (r.research_meta) msg.researchMeta = safeJson(r.research_meta) as ResearchMeta
@@ -1022,6 +1071,45 @@ export class ConversationStore {
     if (v < 40) {
       if (!this.hasColumn('agent_runs', 'worktree_path')) this.db.exec(`ALTER TABLE agent_runs ADD COLUMN worktree_path TEXT;`)
       this.db.exec(`PRAGMA user_version = 40;`)
+    }
+    // v41 (Routines, Phase 1 foundation): scheduled tasks (chat or code) that fire on a
+    // cron-like schedule. routine_runs cascades on routine delete (FK + ON DELETE CASCADE,
+    // relying on the `PRAGMA foreign_keys = ON` set above) — unlike agent_runs' explicit
+    // multi-table delete, a routine's runs have no other referents to clean up.
+    if (v < 41) {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS routines (
+          id TEXT PRIMARY KEY,
+          flavor TEXT NOT NULL CHECK (flavor IN ('chat','code')),
+          status TEXT NOT NULL DEFAULT 'pending_confirmation' CHECK (status IN ('pending_confirmation','active','paused')),
+          prompt TEXT NOT NULL,
+          schedule_display TEXT NOT NULL,
+          schedule_rule TEXT NOT NULL,
+          next_fire_at TEXT,
+          model_key TEXT NOT NULL,
+          agent_id TEXT,
+          workspace_path TEXT,
+          coding_agent TEXT,
+          permission_mode TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_routines_status_next_fire ON routines(status, next_fire_at);
+        CREATE TABLE IF NOT EXISTS routine_runs (
+          id TEXT PRIMARY KEY,
+          routine_id TEXT NOT NULL REFERENCES routines(id) ON DELETE CASCADE,
+          status TEXT NOT NULL CHECK (status IN ('running','ok','skipped','errored','needs_approval')),
+          skip_reason TEXT,
+          config_snapshot TEXT NOT NULL,
+          pending_tool_call TEXT,
+          result TEXT,
+          error TEXT,
+          started_at TEXT NOT NULL,
+          ended_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_routine_runs_routine ON routine_runs(routine_id, started_at);
+        PRAGMA user_version = 41;
+      `)
     }
   }
 
@@ -1749,6 +1837,118 @@ export class ConversationStore {
     if (patch.titleAutoSynced          !== undefined) { sets.push('title_auto_synced = $tas'); params.$tas = patch.titleAutoSynced ? 1 : 0 }
     if (patch.terminalLaunchedOnce     !== undefined) { sets.push('terminal_launched_once = $tlo'); params.$tlo = patch.terminalLaunchedOnce ? 1 : 0 }
     return ((this.db.prepare(`UPDATE agent_runs SET ${sets.join(', ')} WHERE id = $id`).run(params) as unknown) as Changes).changes > 0
+  }
+
+  // ── Routine methods (v41 migration) ─────────────────────────────────────────
+
+  createRoutine(params: {
+    flavor: RoutineFlavor; prompt: string; scheduleDisplay: string; scheduleRule: ScheduleRule
+    modelKey: string; agentId?: string; workspacePath?: string; codingAgent?: CodingAgentChoice
+    permissionMode?: Routine['permissionMode']
+  }): Routine {
+    const id = randomUUID()
+    const now = new Date().toISOString()
+    this.db.prepare(`
+      INSERT INTO routines (id, flavor, status, prompt, schedule_display, schedule_rule, next_fire_at,
+        model_key, agent_id, workspace_path, coding_agent, permission_mode, created_at, updated_at)
+      VALUES ($id, $flavor, 'pending_confirmation', $prompt, $scheduleDisplay, $scheduleRule, NULL,
+        $modelKey, $agentId, $workspacePath, $codingAgent, $permissionMode, $now, $now)
+    `).run({
+      $id: id, $flavor: params.flavor, $prompt: params.prompt,
+      $scheduleDisplay: params.scheduleDisplay, $scheduleRule: JSON.stringify(params.scheduleRule),
+      $modelKey: params.modelKey, $agentId: params.agentId ?? null, $workspacePath: params.workspacePath ?? null,
+      $codingAgent: params.codingAgent ?? null, $permissionMode: params.permissionMode ?? null, $now: now,
+    } as P)
+    return this.getRoutine(id)!
+  }
+
+  getRoutine(id: string): Routine | null {
+    const row = this.db.prepare('SELECT * FROM routines WHERE id = $id').get({ $id: id } as P) as unknown as RoutineRow | undefined
+    return row ? rowToRoutine(row) : null
+  }
+
+  listRoutines(): Routine[] {
+    return (this.db.prepare('SELECT * FROM routines ORDER BY created_at DESC').all() as unknown as RoutineRow[]).map(rowToRoutine)
+  }
+
+  listDueRoutines(nowIso: string): Routine[] {
+    const rows = this.db.prepare(
+      `SELECT * FROM routines WHERE status = 'active' AND next_fire_at IS NOT NULL AND next_fire_at <= $now`,
+    ).all({ $now: nowIso } as P) as unknown as RoutineRow[]
+    return rows.map(rowToRoutine)
+  }
+
+  confirmRoutine(id: string, nextFireAtIso: string): Routine | null {
+    this.db.prepare(
+      `UPDATE routines SET status = 'active', next_fire_at = $nextFireAt, updated_at = $now
+       WHERE id = $id AND status = 'pending_confirmation'`,
+    ).run({ $id: id, $nextFireAt: nextFireAtIso, $now: new Date().toISOString() } as P)
+    return this.getRoutine(id)
+  }
+
+  updateRoutine(
+    id: string,
+    patch: Partial<Pick<Routine, 'prompt' | 'scheduleDisplay' | 'scheduleRule' | 'nextFireAt' | 'modelKey' | 'workspacePath' | 'codingAgent' | 'permissionMode' | 'status'>>,
+  ): Routine | null {
+    const sets: string[] = []
+    const params: P = { $id: id } as P
+    if (patch.prompt !== undefined) { sets.push('prompt = $prompt'); params.$prompt = patch.prompt }
+    if (patch.scheduleDisplay !== undefined) { sets.push('schedule_display = $scheduleDisplay'); params.$scheduleDisplay = patch.scheduleDisplay }
+    if (patch.scheduleRule !== undefined) { sets.push('schedule_rule = $scheduleRule'); params.$scheduleRule = JSON.stringify(patch.scheduleRule) }
+    if (patch.nextFireAt !== undefined) { sets.push('next_fire_at = $nextFireAt'); params.$nextFireAt = patch.nextFireAt }
+    if (patch.modelKey !== undefined) { sets.push('model_key = $modelKey'); params.$modelKey = patch.modelKey }
+    if (patch.workspacePath !== undefined) { sets.push('workspace_path = $workspacePath'); params.$workspacePath = patch.workspacePath }
+    if (patch.codingAgent !== undefined) { sets.push('coding_agent = $codingAgent'); params.$codingAgent = patch.codingAgent }
+    if (patch.permissionMode !== undefined) { sets.push('permission_mode = $permissionMode'); params.$permissionMode = patch.permissionMode }
+    if (patch.status !== undefined) { sets.push('status = $status'); params.$status = patch.status }
+    if (sets.length === 0) return this.getRoutine(id)
+    sets.push('updated_at = $now')
+    params.$now = new Date().toISOString()
+    this.db.prepare(`UPDATE routines SET ${sets.join(', ')} WHERE id = $id`).run(params)
+    return this.getRoutine(id)
+  }
+
+  deleteRoutine(id: string): boolean {
+    return ((this.db.prepare('DELETE FROM routines WHERE id = $id').run({ $id: id } as P) as unknown) as Changes).changes > 0
+  }
+
+  createRoutineRun(params: { routineId: string; configSnapshot: string }): RoutineRun {
+    const id = randomUUID()
+    const now = new Date().toISOString()
+    this.db.prepare(
+      `INSERT INTO routine_runs (id, routine_id, status, config_snapshot, started_at)
+       VALUES ($id, $routineId, 'running', $configSnapshot, $now)`,
+    ).run({ $id: id, $routineId: params.routineId, $configSnapshot: params.configSnapshot, $now: now } as P)
+    return this.getRoutineRun(id)!
+  }
+
+  getRoutineRun(id: string): RoutineRun | null {
+    const row = this.db.prepare('SELECT * FROM routine_runs WHERE id = $id').get({ $id: id } as P) as unknown as RoutineRunRow | undefined
+    return row ? rowToRoutineRun(row) : null
+  }
+
+  listRoutineRuns(routineId: string): RoutineRun[] {
+    const rows = this.db.prepare(
+      'SELECT * FROM routine_runs WHERE routine_id = $routineId ORDER BY started_at DESC',
+    ).all({ $routineId: routineId } as P) as unknown as RoutineRunRow[]
+    return rows.map(rowToRoutineRun)
+  }
+
+  updateRoutineRun(
+    id: string,
+    patch: Partial<Pick<RoutineRun, 'status' | 'skipReason' | 'pendingToolCall' | 'result' | 'error' | 'endedAt'>>,
+  ): RoutineRun | null {
+    const sets: string[] = []
+    const params: P = { $id: id } as P
+    if (patch.status !== undefined) { sets.push('status = $status'); params.$status = patch.status }
+    if (patch.skipReason !== undefined) { sets.push('skip_reason = $skipReason'); params.$skipReason = patch.skipReason }
+    if (patch.pendingToolCall !== undefined) { sets.push('pending_tool_call = $pendingToolCall'); params.$pendingToolCall = patch.pendingToolCall }
+    if (patch.result !== undefined) { sets.push('result = $result'); params.$result = patch.result }
+    if (patch.error !== undefined) { sets.push('error = $error'); params.$error = patch.error }
+    if (patch.endedAt !== undefined) { sets.push('ended_at = $endedAt'); params.$endedAt = patch.endedAt }
+    if (sets.length === 0) return this.getRoutineRun(id)
+    this.db.prepare(`UPDATE routine_runs SET ${sets.join(', ')} WHERE id = $id`).run(params)
+    return this.getRoutineRun(id)
   }
 
   // ── Code session lifecycle (archive/delete/clear) ───────────────────────────
