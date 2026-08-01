@@ -96,7 +96,9 @@ export class RoutineScheduler {
       // Overlap detection works via inFlight set (not database state) — a concurrent tick can detect
       // overlap even though this tick has rescheduled the routine, because inFlight still contains r.id.
       // .catch() is essential: if runRoutine rejects (Phase 2/3 real I/O), .finally() re-throws;
-      // unhandled rejection crashes daemon without it. .catch() before .finally() ensures logged, not escaped.
+      // an unhandled rejection crashes the daemon without it. It sits LAST in the chain so it
+      // catches a rejecting runRoutine AND a throw from inside .then()/.finally() themselves
+      // (e.g. the DB being closed mid-run during shutdown) — nothing escapes.
       void this.deps.runRoutine(r, run).then((terminalStatus) => {
         this.deps.store.updateRoutineRun(run.id, { status: terminalStatus, endedAt: this.deps.now().toISOString() })
       }).finally(() => {
