@@ -1,0 +1,67 @@
+name: Desktop release
+
+# Fires when RELEASE.md's `gh release create` step publishes a release (not on
+# tag push — that would race the release object not existing yet for `gh
+# release upload` to attach to). Builds native installers on each installer's
+# own OS (a macOS dmg build must run on macOS) and uploads them onto that same
+# release as assets.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # Guard against this ever firing for a release that isn't this repo's own
+    # vX.Y.Z cut (RELEASE.md is the only thing that creates releases here).
+    if: startsWith(github.event.release.tag_name, 'v')
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_glob: dist/*.exe
+          - os: macos-latest
+            artifact_glob: dist/*.dmg
+          - os: ubuntu-latest
+            artifact_glob: dist/*.AppImage
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: turbollm/package-lock.json
+
+      - name: Install daemon dependencies
+        run: npm ci
+        working-directory: turbollm
+
+      - name: Build daemon + web UI
+        run: |
+          npm run build:web
+          npm run build
+        working-directory: turbollm
+
+      - name: Install desktop wrapper dependencies
+        run: npm ci
+        working-directory: wrapper
+
+      - name: Package installer
+        run: npm run package
+        working-directory: wrapper
+
+      - name: Upload installer to the release
+        shell: bash
+        working-directory: wrapper
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" ${{ matrix.artifact_glob }} --clobber
