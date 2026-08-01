@@ -20,6 +20,7 @@
 import type { Deps } from '../deps'
 import type { CustomChatAgent } from '../config/config'
 import type { Routine, RoutineRun } from './schema'
+import type { Conversation, Message } from '../chat/db'
 import { clampMaxTokens } from '../config/config'
 import { engineModelAlias } from '../engines/compat'
 import { executeToolCallWithApproval } from '../tools/execute-with-approval'
@@ -47,6 +48,41 @@ function buildInitialMessages(agent: CustomChatAgent, prompt: string): WireMessa
 
 function findAgent(d: Deps, routine: Routine): CustomChatAgent | undefined {
   return d.store.snapshot().customAgents.find((a) => a.id === routine.agentId)
+}
+
+/** Expands one persisted assistant Message that made tool calls into its wire form: the
+ *  model's own `tool_calls` request, followed by one `tool`-role reply per call. Each COMPLETED
+ *  round of `runChatRoundLoop` persists exactly one such Message (see there) — this is the
+ *  inverse operation, needed so a resumed run replays earlier rounds' real tool activity
+ *  instead of silently dropping it (fix for the "resume forgets round 1" finding: a run that
+ *  searched in round 1 then stalled in round 2 must resume still knowing it searched). */
+function toolCallsToWire(m: Message): WireMessage[] {
+  const out: WireMessage[] = [{
+    role: 'assistant', content: m.content || null,
+    tool_calls: m.toolCalls.map((tc) => ({ id: tc.id, type: 'function', function: { name: tc.name, arguments: JSON.stringify(tc.args) } })),
+  }]
+  for (const tc of m.toolCalls) {
+    out.push({ role: 'tool', content: tc.error ? `Error: ${tc.error}` : (tc.result ?? ''), tool_call_id: tc.id })
+  }
+  return out
+}
+
+/** Rebuilds the wire conversation for a resume from the conversation's OWN persisted history
+ *  (`conv.messages`), rather than re-deriving the user prompt from the Routine (that duplicated
+ *  the user turn — `runChatRoutine` already persisted it via `addMessage` before the loop ever
+ *  started, so replaying both `routine.prompt` AND `conv.messages` sent the same user turn
+ *  twice in a row, which strict-alternation chat templates reject outright). `conv.messages` is
+ *  returned in seq order (getConversation/getMessages), so this alone reconstructs the entire
+ *  prior conversation — including every completed round's real tool activity, once
+ *  `runChatRoundLoop` is persisting those (see toolCallsToWire). */
+function buildResumeMessages(agent: CustomChatAgent, conv: Conversation): WireMessage[] {
+  const messages: WireMessage[] = []
+  if (agent.systemPrompt) messages.push({ role: 'system', content: agent.systemPrompt })
+  for (const m of conv.messages ?? []) {
+    if (m.role === 'assistant' && m.toolCalls.length > 0) messages.push(...toolCallsToWire(m))
+    else messages.push({ role: m.role, content: m.content })
+  }
+  return messages
 }
 
 /** Runs one Chat Routine fire to completion (or a stall/error), starting a FRESH conversation
@@ -80,22 +116,43 @@ export async function resumeChatRoutine(
   const conv = d.db.getConversation(pending.convId, true)
   if (!conv) return { status: 'errored', error: "The routine's conversation no longer exists." }
 
-  const messages = buildInitialMessages(agent, routine.prompt)
-  for (const m of conv.messages ?? []) messages.push({ role: m.role, content: m.content })
+  // I2 fix: build history from conv.messages ALONE (it already contains the persisted user
+  // prompt from runChatRoutine) — do not ALSO push routine.prompt via buildInitialMessages,
+  // or the wire conversation gets two consecutive user turns in a row.
+  const messages = buildResumeMessages(agent, conv)
   messages.push({
     role: 'assistant', content: pending.assistantContent || null,
     tool_calls: [...pending.precedingCalls, pending.call].map((c) => ({ id: c.id, type: 'function', function: { name: c.name, arguments: JSON.stringify(c.args) } })),
   })
   for (const c of pending.precedingCalls) messages.push({ role: 'tool', content: c.result, tool_call_id: c.id })
 
+  // C1 fix: pending.call.name is, BY CONSTRUCTION, a tool NOT in agent.tools — that mismatch is
+  // exactly why this run stalled in the first place. Passing plain `agent.tools` here would make
+  // executeToolCallWithApproval's non-interactive branch re-block the very call a human just
+  // approved (agentAllowedTools?.includes(name) fails), silently downgrading "approve" to the
+  // same outcome as "deny" while still reporting {status:'ok'} once the model glosses over the
+  // "Blocked: ..." tool result it was fed. Extend the allow-list with just this one call for
+  // just this one already-approved execution — NOT for the rest of the resumed round loop below,
+  // which still gates any OTHER not-yet-approved tool the model might request via the unmodified
+  // agent.tools list.
   const approved = d.tools
     ? await executeToolCallWithApproval({
         tools: d.tools, sink: () => {}, convId: pending.convId, id: pending.call.id, name: pending.call.name, args: pending.call.args,
         globalPolicies: d.store.snapshot().tools.toolPolicies ?? {}, convOverrides: d.db.getToolOverrides(pending.convId),
-        signal, interactive: false, agentAllowedTools: agent.tools,
+        signal, interactive: false, agentAllowedTools: [...agent.tools, pending.call.name],
       })
     : { result: 'Error: no tool registry available.' }
   messages.push({ role: 'tool', content: approved.result, tool_call_id: pending.call.id })
+
+  // I1/I4 fix: this resumed round is now fully settled (every call it made — precedingCalls
+  // plus the just-approved one — has a real result). Persist it the same way a normal completed
+  // round does (see runChatRoundLoop), so the UI shows it and any LATER stall in this same
+  // resumed run still has it when conv.messages is rebuilt again.
+  const roundToolCalls: PendingRoutineToolCall['precedingCalls'] = [
+    ...pending.precedingCalls,
+    { id: pending.call.id, name: pending.call.name, args: pending.call.args, result: approved.result },
+  ]
+  d.db.addMessage(pending.convId, 'assistant', pending.assistantContent || '', { toolCalls: roundToolCalls })
 
   return runChatRoundLoop(d, run, agent, pending.convId, signal, { messages, toolLoop: new ToolLoopTracker(), iter: 0 })
 }
@@ -118,10 +175,21 @@ async function runChatRoundLoop(d: Deps, run: RoutineRun, agent: CustomChatAgent
     const cappedMax = clampMaxTokens(undefined, maxLimit)
     if (cappedMax != null) reqBody.max_tokens = cappedMax
 
-    const res = await fetch(`${target}/v1/chat/completions`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(reqBody), signal })
-    if (!res.ok) return { status: 'errored', error: `Engine returned ${res.status}.` }
-    const data = await res.json() as { choices?: Array<{ message?: { content?: string | null; tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }> } }> }
-    const message = data.choices?.[0]?.message
+    // I3 fix: a genuinely stuck model spends its time INSIDE this fetch, not between rounds —
+    // that's the realistic case the Task-2 wall-clock deadline exists to catch. Unwrapped, a
+    // mid-request abort throws AbortError (not the intended errored outcome below) and a
+    // connection failure throws an uncaught TypeError, so both must resolve through here instead
+    // of escaping the loop.
+    let message: { content?: string | null; tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }> } | undefined
+    try {
+      const res = await fetch(`${target}/v1/chat/completions`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(reqBody), signal })
+      if (!res.ok) return { status: 'errored', error: `Engine returned ${res.status}.` }
+      const data = await res.json() as { choices?: Array<{ message?: { content?: string | null; tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }> } }> }
+      message = data.choices?.[0]?.message
+    } catch (e) {
+      if (signal.aborted) return { status: 'errored', error: 'Routine run timed out or was cancelled.' }
+      return { status: 'errored', error: `Engine request failed: ${(e as Error).message}` }
+    }
     if (!message) return { status: 'errored', error: 'Engine returned no message.' }
 
     const toolCalls = message.tool_calls ?? []
@@ -165,6 +233,14 @@ async function runChatRoundLoop(d: Deps, run: RoutineRun, agent: CustomChatAgent
       precedingCalls.push({ id: tc.id, name: tc.function.name, args, result: executed.result })
       state.messages.push({ role: 'tool', content: executed.result, tool_call_id: tc.id })
     }
+
+    // I1/I4 fix: this round is fully settled — every call it made ran and has a real result
+    // (a stall or abort above returns before reaching here, so an incomplete/undecided round is
+    // never persisted). Without this, only the user prompt and the final answer ever reached the
+    // DB: the conversation view showed zero tool activity even when the run clearly did tool
+    // work, and a resume that rebuilds history from conv.messages (buildResumeMessages) would
+    // have no memory of any round before the one that stalled.
+    d.db.addMessage(convId, 'assistant', message.content ?? '', { toolCalls: precedingCalls })
   }
   return { status: 'errored', error: `Exceeded the ${MAX_TOOL_ITER}-round tool-call ceiling without finishing.` }
 }
