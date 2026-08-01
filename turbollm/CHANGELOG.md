@@ -25,6 +25,18 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.9.7] - 2026-08-01
+
+### Added
+- **"Use worktree" now creates a real, isolated git worktree.** Ticking it runs the session in its own checkout on its own branch at `<your-repo>/.turbollm/worktrees/<branch>`, so your actual checkout and current branch are never touched and `git status` in your repo stays clean while the agent works. Everything the session does happens in that worktree — the agent's edits, the `!command` shell escape, and the Commit / Push / diff actions. Deleting the session removes the worktree but never destroys work: if it still has uncommitted changes the removal is refused and you're given the exact command to finish, and committed work always survives because removing a worktree doesn't delete its branch. A branch name that's already taken is suffixed rather than reused, and a folder that isn't a git repository tells you so instead of silently working in it directly.
+
+### Fixed
+- **The "Use worktree" toggle previously did nothing at all.** It has been in the composer for several releases, described as "an isolated checkout on its own branch" — but nothing behind it was ever implemented, so the agent edited your real working tree on your current branch regardless. If you ticked it expecting your checkout to be protected, it wasn't. It now does what it always said it did.
+
+### Discord
+- "Use worktree" in Code now actually works. It had been in the composer for a while promising an isolated checkout on its own branch, but nothing behind it was implemented — the agent edited your real working tree regardless. Ticking it now runs the session in a genuine git worktree, so your own checkout and branch stay untouched.
+- Deleting a session cleans up its worktree, but never at the cost of unmerged work: uncommitted changes block the removal and tell you how to finish it, and committed work always survives on its branch.
+
 ## [1.9.6] - 2026-08-01
 
 ### Added
