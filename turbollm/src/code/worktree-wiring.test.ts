@@ -87,8 +87,21 @@ test('the PTY cwd uses agentCwd too — both agents must see the same tree', () 
   const terminal = readFileSync(join(HERE, '..', 'terminal', 'terminal-routes.ts'), 'utf8')
   const create = terminal.split('\n').find((l) => l.includes('m.create('))
   assert.ok(create, 'terminal creation call must still exist')
+
+  // Accept the value either inline or via a local assigned from agentCwd — an earlier version of
+  // this test matched the literal `agentCwd(run)` on the m.create line and failed the moment the
+  // call was legitimately refactored to hoist the value into a `cwd` variable (needed so the route
+  // can check the directory still exists before spawning). Resolving one level of indirection
+  // keeps the guard honest about what it actually cares about — where the directory COMES FROM —
+  // without breaking on a rename.
+  const firstArg = /m\.create\(\s*([A-Za-z0-9_.()]+)/.exec(create)?.[1] ?? ''
+  const derivedFromAgentCwd =
+    firstArg === 'agentCwd(run)' ||
+    new RegExp(`const\\s+${firstArg}\\s*=\\s*agentCwd\\(run\\)`).test(terminal)
+
   assert.ok(
-    create.includes('agentCwd(run)'),
-    `the CLI must open in the same tree the in-app agent edits, got:\n  ${create.trim()}`,
+    derivedFromAgentCwd,
+    `the CLI must open in the same tree the in-app agent edits — first argument to m.create() is ` +
+      `${JSON.stringify(firstArg)}, which is not agentCwd(run) nor assigned from it:\n  ${create.trim()}`,
   )
 })

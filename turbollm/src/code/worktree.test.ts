@@ -308,3 +308,52 @@ test('sanitizeBranchName: a long name is capped without ending in a separator', 
   assert.ok(out.length <= 80)
   assert.ok(!/[-./]$/.test(out), `must not end in a separator, got ${JSON.stringify(out)}`)
 })
+
+// ── a directory that is already gone is SUCCESS, not failure ─────────────────────────────────
+// Founder-reported: deleting a session whose folder no longer existed returned
+// `worktreeNote: "spawn git ENOENT"` — git cannot even start when its cwd is missing. The delete
+// itself had succeeded, but the raw Node error on the response made it look like it had failed.
+// Nothing to remove is nothing to report.
+test('removeSessionWorktree: a worktree that no longer exists is a clean success', async () => {
+  const root = await makeRepo()
+  try {
+    const r = await createSessionWorktree({ repoRoot: root, branch: 'feature' })
+    assert.ok(r.ok)
+    if (!r.ok) return
+    // Someone removed it by hand, or deleted the folder.
+    rmSync(r.path, { recursive: true, force: true })
+
+    const removed = await removeSessionWorktree(root, r.path)
+    assert.equal(removed.ok, true, `expected success, got ${JSON.stringify(removed)}`)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('removeSessionWorktree: a base repo that no longer exists is also a clean success', async () => {
+  // The whole project moved or was deleted, or its drive is unplugged. There is nothing to clean
+  // and no way to run git — reporting `spawn git ENOENT` to the user helps nobody.
+  const root = await makeRepo()
+  const worktreePath = join(root, WORKTREES_SUBDIR, 'feature')
+  rmSync(root, { recursive: true, force: true })
+  const removed = await removeSessionWorktree(root, worktreePath)
+  assert.equal(removed.ok, true, `expected success, got ${JSON.stringify(removed)}`)
+})
+
+test('removeSessionWorktree: a DIRTY worktree is still refused — the guard did not weaken that', () => {
+  // Guarding on existence must not turn the "never destroy uncommitted work" rule into a no-op.
+  return (async () => {
+    const root = await makeRepo()
+    try {
+      const r = await createSessionWorktree({ repoRoot: root, branch: 'feature' })
+      assert.ok(r.ok)
+      if (!r.ok) return
+      writeFileSync(join(r.path, 'README.md'), 'unmerged work\n')
+      const removed = await removeSessionWorktree(root, r.path)
+      assert.equal(removed.ok, false)
+      if (!removed.ok) assert.equal(removed.code, 'dirty')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })()
+})
