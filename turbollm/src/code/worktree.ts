@@ -85,11 +85,16 @@ export function sanitizeBranchName(raw: string): string {
     .replace(/[~^:?*[\]\\]/g, '')
     .replace(/\.\.+/g, '-')
     .replace(/\/+/g, '/')
-    .replace(/^[/.]+|[/.]+$/g, '')
+    .replace(/^[/.]+/, '')
     .replace(/\.lock$/, '')
     .replace(/-+/g, '-')
     .slice(0, 80)
-    .replace(/-+$/, '')
+    // Trailing `-`, `.` and `/` are stripped AFTER the length cap, not before it. Doing it first
+    // was a real bug: the cap can land mid-string and re-expose a character git rejects at the end
+    // of a ref. Verified against `git check-ref-format` — a 79-character task description followed
+    // by a `.` produced `aaa….`, which git refuses ("is not a valid branch name"), so creating the
+    // session failed outright for nothing more than a long description.
+    .replace(/[-./]+$/, '')
   return cleaned || 'turbollm-session'
 }
 

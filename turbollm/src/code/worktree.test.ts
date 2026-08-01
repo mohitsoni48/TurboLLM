@@ -268,3 +268,43 @@ test('runGit: a failing command resolves rather than throwing', async () => {
     rmSync(root, { recursive: true, force: true })
   }
 })
+
+// ── every produced name must be a name git will actually accept ──────────────────────────────
+// Found in the manual review pass that substituted for a non-delivering review agent: the
+// trailing `[/.]` strip ran BEFORE the 80-char cap, so the cap could land mid-string and
+// re-expose a character git rejects at the end of a ref. A 79-character task description followed
+// by a `.` produced a branch git refuses outright — session creation would fail for nothing more
+// than a long description.
+//
+// Asserted against `git check-ref-format` rather than a regex of my own: the authority on what git
+// accepts is git, and a hand-written expectation is exactly what missed this the first time.
+test('sanitizeBranchName: output always passes git check-ref-format', async () => {
+  const cases = [
+    'a'.repeat(79) + '. and then some more words to push past the cap',
+    'a'.repeat(79) + '/ and then some more words to push past the cap',
+    'a'.repeat(79) + '- and then some more words to push past the cap',
+    'refactor the authentication module and split it into smaller files please',
+    'Add login page',
+    'fix: the thing~1',
+    '~^:?*[]',
+    'weird.lock',
+    '/leading/and/trailing/',
+    'a'.repeat(200),
+  ]
+  const root = await makeRepo()
+  try {
+    for (const raw of cases) {
+      const name = sanitizeBranchName(raw)
+      const r = await runGit(root, ['check-ref-format', '--branch', name])
+      assert.equal(r.ok, true, `git rejected ${JSON.stringify(name)} (from ${JSON.stringify(raw.slice(0, 40))}…): ${r.stderr.trim()}`)
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('sanitizeBranchName: a long name is capped without ending in a separator', () => {
+  const out = sanitizeBranchName('a'.repeat(79) + '. more')
+  assert.ok(out.length <= 80)
+  assert.ok(!/[-./]$/.test(out), `must not end in a separator, got ${JSON.stringify(out)}`)
+})
