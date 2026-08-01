@@ -12,6 +12,7 @@ import { ProvisionState } from './engines/provision-state'
 import { BuildState } from './engines/build-state'
 import { UpdateChecker } from './engines/update'
 import { UpdateScheduler } from './engines/update-scheduler'
+import { RoutineScheduler } from './routines/scheduler'
 import { AppUpdateChecker } from './app-update'
 import { applyEngineUpdate } from './engines/update-apply'
 import { seedDefaultEngines } from './engines/seed'
@@ -415,6 +416,23 @@ const updateScheduler = new UpdateScheduler({
   },
 })
 updateScheduler.start()
+
+// Routine scheduler (Phase 1 of the Routine feature — scheduling only; execution
+// lands in Phase 2). Missed fires while the daemon was offline are skipped and
+// flagged, never backfilled.
+const routineScheduler = new RoutineScheduler({
+  store: db,
+  now: () => new Date(),
+  runRoutine: async (routine) => {
+    const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+    db.updateRoutineRun(run.id, {
+      status: 'errored',
+      error: 'Routine execution is not implemented yet (Phase 1 ships scheduling only).',
+      endedAt: new Date().toISOString(),
+    })
+  },
+})
+routineScheduler.start()
 
 // ── Resolve listen address ────────────────────────────────────────────────────
 const cfg = store.snapshot()
