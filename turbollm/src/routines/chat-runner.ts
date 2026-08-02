@@ -140,6 +140,10 @@ export async function resumeChatRoutine(
         tools: d.tools, sink: () => {}, convId: pending.convId, id: pending.call.id, name: pending.call.name, args: pending.call.args,
         globalPolicies: d.store.snapshot().tools.toolPolicies ?? {}, convOverrides: d.db.getToolOverrides(pending.convId),
         signal, interactive: false, agentAllowedTools: [...agent.tools, pending.call.name],
+        // Deliberate `false` (Phase 4 / C1), not an oversight: see runChatRoundLoop's identical
+        // call below. The human here approved ONE specific tool call, not a standing grant to
+        // author code-flavor routines, and there is still no HTTP request to authorize against.
+        isCodeAuthorized: false,
       })
     : { result: 'Error: no tool registry available.' }
   messages.push({ role: 'tool', content: approved.result, tool_call_id: pending.call.id })
@@ -228,6 +232,13 @@ async function runChatRoundLoop(d: Deps, run: RoutineRun, agent: CustomChatAgent
             tools: d.tools, sink: () => {}, convId, id: tc.id, name: tc.function.name, args,
             globalPolicies: d.store.snapshot().tools.toolPolicies ?? {}, convOverrides: d.db.getToolOverrides(convId),
             signal, interactive: false, agentAllowedTools: agent.tools,
+            // Deliberate `false` (Phase 4 / C1), not an oversight — and load-bearing, so do not
+            // "fix" it to true. A scheduled fire has NO inbound HTTP request, so there is nothing
+            // to run routine-routes.ts's codeGateBlocks against; and an unattended routine running
+            // on a timer must not be able to author FURTHER code-flavor routines (unsupervised
+            // scheduled code execution begetting more of itself) with no human in the loop.
+            // Chat-flavor create/update from a routine is unaffected — the flag only gates code.
+            isCodeAuthorized: false,
           })
         : { result: 'Error: no tool registry available.' }
       precedingCalls.push({ id: tc.id, name: tc.function.name, args, result: executed.result })

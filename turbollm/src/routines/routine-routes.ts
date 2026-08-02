@@ -124,8 +124,15 @@ export function validateUpdate(b: RoutineBody, current: Routine): string | null 
  *  host-authored code routine (arming it), or DELETE one, or read its workspacePath via GET —
  *  none of that executes anything in Phase 1 (there is no execution yet), but Phase 2 turns
  *  `active` into real unattended code execution. Extending this gate to confirm/resume/delete/
- *  the GETs is an open decision for whoever ships Phase 2's execution, not an oversight here. */
-function codeGateBlocks(c: Context, d: Deps): boolean {
+ *  the GETs is an open decision for whoever ships Phase 2's execution, not an oversight here.
+ *
+ *  Exported (Phase 4) so chat's tool surface enforces the IDENTICAL decision rather than a
+ *  hand-copied `isLocalRequest || verifyPresentedKey` that could silently drift from this one:
+ *  `POST /api/v1/conversations/:id/messages` is behind `lanAuth` only, so without it a keyless
+ *  LAN caller refused at the REST route could just ask the chat model to author the code routine
+ *  for them instead. chat-routes.ts inverts it (`!codeGateBlocks(c, d)`) into the
+ *  `isCodeAuthorized` boolean routine-tools.ts's executors take. */
+export function codeGateBlocks(c: Context, d: Deps): boolean {
   return !isLocalRequest(c, d) && !verifyPresentedKey(c, d)
 }
 
