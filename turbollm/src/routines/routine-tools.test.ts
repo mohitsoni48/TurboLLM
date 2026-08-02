@@ -672,6 +672,67 @@ test('execRunRoutineNow: running a routine does not itself change its stored sta
   assert.equal(JSON.stringify(store.getRoutine(r.id)), before)
 })
 
+// ── run_routine_now code-flavor gate (C1) ─────────────────────────────────
+// Mirrors POST /api/v1/routines/:id/run-now's own 401 (routine-routes.ts), which exists because a
+// manual trigger on a code routine runs real bash/edit/write immediately — strictly worse than the
+// already-gated create/update case, per that handler's own comment.
+
+test('execRunRoutineNow: a CODE routine is refused when isCodeAuthorized is omitted (fails closed)', async () => {
+  const store = freshStore()
+  const r = codeRoutine(store)
+  store.confirmRoutine(r.id, new Date().toISOString())
+  const out = await execRunRoutineNow({ routineId: r.id }, store, neverCalled)
+  assert.equal(out, `Error: ${CODE_GATE_MESSAGE}`)
+})
+
+test('execRunRoutineNow: a CODE routine is refused when isCodeAuthorized is explicitly false', async () => {
+  const store = freshStore()
+  const r = codeRoutine(store)
+  store.confirmRoutine(r.id, new Date().toISOString())
+  const out = await execRunRoutineNow({ routineId: r.id }, store, neverCalled, false)
+  assert.equal(out, `Error: ${CODE_GATE_MESSAGE}`)
+})
+
+test('execRunRoutineNow: a PAUSED code routine is refused too — confirmed-then-paused is still a live trigger', async () => {
+  const store = freshStore()
+  const r = codeRoutine(store)
+  store.confirmRoutine(r.id, new Date().toISOString())
+  store.updateRoutine(r.id, { status: 'paused', nextFireAt: null })
+  assert.equal(await execRunRoutineNow({ routineId: r.id }, store, neverCalled), `Error: ${CODE_GATE_MESSAGE}`)
+})
+
+/** Gate-before-validation, matching execCreateRoutine and the REST handler: an ungated caller must
+ *  not be able to distinguish a confirmed code routine from an unconfirmed one by the error text. */
+test('execRunRoutineNow: the gate fires BEFORE the pending_confirmation check, leaking no state', async () => {
+  const store = freshStore()
+  const r = codeRoutine(store) // still pending_confirmation
+  const out = await execRunRoutineNow({ routineId: r.id }, store, neverCalled)
+  assert.equal(out, `Error: ${CODE_GATE_MESSAGE}`)
+  assert.doesNotMatch(out, /pending confirmation/)
+})
+
+test('execRunRoutineNow: an authorized caller CAN trigger a code routine (the gate is not a blanket block)', async () => {
+  const store = freshStore()
+  const r = codeRoutine(store)
+  store.confirmRoutine(r.id, new Date().toISOString())
+  let calledWith: string | null = null
+  const out = await execRunRoutineNow({ routineId: r.id }, store, async (id) => { calledWith = id; return { ok: true as const } }, true)
+  assert.equal(calledWith, r.id)
+  assert.match(out, /running now/)
+})
+
+test('execRunRoutineNow: a CHAT routine is unaffected by isCodeAuthorized in every position', async () => {
+  for (const gate of [undefined, false, true] as const) {
+    const store = freshStore()
+    const r = chatRoutine(store)
+    store.confirmRoutine(r.id, new Date().toISOString())
+    let called = false
+    const out = await execRunRoutineNow({ routineId: r.id }, store, async () => { called = true; return { ok: true as const } }, gate)
+    assert.equal(called, true, `chat flavor must run with isCodeAuthorized=${String(gate)}`)
+    assert.match(out, /running now/)
+  }
+})
+
 // ── tool definitions (the model-facing contract) ──────────────────────────
 
 test('tool definitions expose exactly the five expected names', () => {

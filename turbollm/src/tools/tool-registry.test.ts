@@ -131,6 +131,57 @@ test('executeTool: update_routine on a stored CODE routine is refused unless isC
   assert.match(allowed, /^PREVIEW/, 'an authorized caller gets the normal two-phase preview')
 })
 
+// run_routine_now is the sharpest of the three gated tools: it reaches real unattended
+// bash/edit/write on the host IMMEDIATELY, with no pending_confirmation step in between, on any
+// routine a human ever confirmed (paused included). REST refuses it with 401 for an unauthorized
+// caller (routine-routes.ts's /run-now handler); the tool surface must refuse it identically, or a
+// keyless LAN caller can list_routines to find a code routine's id and fire it through chat.
+
+test('executeTool: run_routine_now on a CODE routine is REFUSED when the caller omits isCodeAuthorized', async () => {
+  const stored = fakeRoutine({ flavor: 'code', status: 'active', workspacePath: 'C:\\ws', codingAgent: 'pi' })
+  const runNow: RunRoutineNowFn = async () => { assert.fail('the scheduler must never be reached by an unauthorized caller') }
+  const reg = new ToolRegistry(EMPTY_TOOLS_CFG, fakeStore(stored), runNow)
+  const out = await reg.executeTool({ id: 't1', name: 'run_routine_now', args: { routineId: stored.id } })
+  assert.equal(out, `Error: ${CODE_GATE_MESSAGE}`, 'omitting the trust decision must fail closed')
+})
+
+test('executeTool: run_routine_now on a CODE routine is REFUSED when isCodeAuthorized is explicitly false', async () => {
+  const stored = fakeRoutine({ flavor: 'code', status: 'active', workspacePath: 'C:\\ws', codingAgent: 'pi' })
+  const runNow: RunRoutineNowFn = async () => { assert.fail('the scheduler must never be reached by an unauthorized caller') }
+  const reg = new ToolRegistry(EMPTY_TOOLS_CFG, fakeStore(stored), runNow)
+  const out = await reg.executeTool({ id: 't1', name: 'run_routine_now', args: { routineId: stored.id } }, false)
+  assert.equal(out, `Error: ${CODE_GATE_MESSAGE}`)
+})
+
+test('executeTool: run_routine_now on a PAUSED CODE routine is refused too — the reviewer\'s exact traced target', async () => {
+  const stored = fakeRoutine({ flavor: 'code', status: 'paused', workspacePath: 'C:\\ws', codingAgent: 'pi' })
+  const runNow: RunRoutineNowFn = async () => { assert.fail('a paused code routine must not be firable by an unauthorized caller either') }
+  const reg = new ToolRegistry(EMPTY_TOOLS_CFG, fakeStore(stored), runNow)
+  assert.equal(await reg.executeTool({ id: 't1', name: 'run_routine_now', args: { routineId: stored.id } }), `Error: ${CODE_GATE_MESSAGE}`)
+})
+
+test('executeTool: run_routine_now on a CODE routine is ALLOWED (real scheduler call) when isCodeAuthorized is true', async () => {
+  const stored = fakeRoutine({ flavor: 'code', status: 'active', workspacePath: 'C:\\ws', codingAgent: 'pi' })
+  let calledWith: string | null = null
+  const runNow: RunRoutineNowFn = async (id) => { calledWith = id; return { ok: true } }
+  const reg = new ToolRegistry(EMPTY_TOOLS_CFG, fakeStore(stored), runNow)
+  const out = await reg.executeTool({ id: 't1', name: 'run_routine_now', args: { routineId: stored.id } }, true)
+  assert.equal(calledWith, stored.id, 'an authorized caller reaches the real injected scheduler')
+  assert.match(out, /running now/)
+})
+
+test('executeTool: run_routine_now on a CHAT-flavor routine is unaffected by isCodeAuthorized', async () => {
+  const stored = fakeRoutine({ flavor: 'chat', status: 'active' })
+  for (const gate of [undefined, false, true] as const) {
+    let called = false
+    const runNow: RunRoutineNowFn = async () => { called = true; return { ok: true } }
+    const reg = new ToolRegistry(EMPTY_TOOLS_CFG, fakeStore(stored), runNow)
+    const out = await reg.executeTool({ id: 't1', name: 'run_routine_now', args: { routineId: stored.id } }, gate)
+    assert.equal(called, true, `chat flavor must run with isCodeAuthorized=${String(gate)}`)
+    assert.match(out, /running now/)
+  }
+})
+
 test('executeTool: isCodeAuthorized never affects a CHAT-flavor routine', async () => {
   const db = new ConversationStore(mkdtempSync(join(tmpdir(), 'tool-registry-chatflavor-')))
   const reg = new ToolRegistry(EMPTY_TOOLS_CFG, db)

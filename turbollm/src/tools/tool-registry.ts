@@ -120,9 +120,10 @@ export class ToolRegistry {
   /** Execute a single tool call. Returns the result string.
    *
    *  @param isCodeAuthorized The CALLER's per-request answer to "has this caller cleared the same
-   *  bar `codeAuth` enforces — host-local OR holding a valid API key?". Consulted only by
-   *  `create_routine`/`update_routine`, and only for CODE-flavor routines (see routine-tools.ts's
-   *  module header). It cannot be computed here: this registry is constructed ONCE for the
+   *  bar `codeAuth` enforces — host-local OR holding a valid API key?". Consulted by
+   *  `create_routine`/`update_routine`/`run_routine_now`, and only for CODE-flavor routines (see
+   *  routine-tools.ts's module header; `delete_routine`/`list_routines` are deliberately ungated
+   *  there, for REST parity). It cannot be computed here: this registry is constructed ONCE for the
    *  daemon's whole lifetime (cli.ts), while the answer is a property of one specific HTTP
    *  request. DEFAULTS TO FALSE so a caller that does not know about this gate — every pre-Phase-4
    *  call site, and any future one — blocks code-flavor authoring rather than silently permitting
@@ -161,7 +162,7 @@ export class ToolRegistry {
       if (name === 'delete_routine') return execDeleteRoutine(args, this.routines)
       if (name === 'run_routine_now') {
         if (!this.runRoutineNowFn) return 'Error: run_routine_now is not available in this build.'
-        return execRunRoutineNow(args, this.routines, this.runRoutineNowFn)
+        return execRunRoutineNow(args, this.routines, this.runRoutineNowFn, isCodeAuthorized)
       }
     }
 

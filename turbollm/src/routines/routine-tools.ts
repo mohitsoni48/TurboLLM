@@ -19,14 +19,20 @@
 // `execWebSearch` convention of surfacing failures as an `"Error: ..."` string the model can read
 // and correct, rather than an exception the tool loop has to catch.
 //
-// CODE-FLAVOR AUTHORIZATION (`isCodeAuthorized`, the 3rd parameter of execCreateRoutine and
-// execUpdateRoutine — READ THIS BEFORE WIRING THIS MODULE INTO ANYTHING):
-// `POST /api/v1/routines` and `PUT /api/v1/routines/:id` both refuse to create or edit a
-// CODE-flavor routine for a caller that is neither host-local nor holding a valid API key
+// CODE-FLAVOR AUTHORIZATION (`isCodeAuthorized` — the 3rd parameter of execCreateRoutine and
+// execUpdateRoutine, and the 4th of execRunRoutineNow — READ THIS BEFORE WIRING THIS MODULE INTO
+// ANYTHING). THREE tools consult it: create_routine, update_routine, run_routine_now.
+// `POST /api/v1/routines`, `PUT /api/v1/routines/:id` and `POST /api/v1/routines/:id/run-now` all
+// refuse to create, edit, or manually trigger a CODE-flavor routine for a caller that is neither
+// host-local nor holding a valid API key
 // (routine-routes.ts's `codeGateBlocks`). That is a stronger bar than the app-wide `lanAuth`,
 // which has an explicit "user opted into open LAN access" bypass (auth.ts's `bypassesAuth`) that
 // `codeAuth` deliberately does not. A code-flavor routine schedules unattended code execution on
-// the host on a timer, so authoring or editing one has to clear the same bar as the Code feature.
+// the host on a timer, so authoring, editing, or firing one has to clear the same bar as the Code
+// feature. run_routine_now is if anything the SHARPEST of the three, and routine-routes.ts's own
+// run-now handler says so in as many words: create lands in 'pending_confirmation' and still needs
+// a human, whereas a manual trigger runs real bash/edit/write IMMEDIATELY, against any routine a
+// human ever confirmed (paused included — only 'pending_confirmation' is off-limits).
 // These executors have no Hono `Context` and so CANNOT make that trust decision themselves — the
 // CALLER must, and pass the answer in. Obligations per surface:
 //   • Chat / ToolRegistry (Task 2/3): MUST compute it exactly as `codeGateBlocks` does —
@@ -44,7 +50,15 @@
 //     existence therefore already proves host-local-or-keyed.
 // The parameter DEFAULTS TO FALSE so that a caller who forgets it blocks code-flavor authoring
 // rather than silently permitting it — omission must fail closed, since the omission is exactly
-// the bug this guards against. Chat-flavor create/update is unaffected by it, in every case.
+// the bug this guards against. Chat-flavor create/update/run-now is unaffected by it, in all cases.
+//
+// `delete_routine` and `list_routines` are DELIBERATELY LEFT UNGATED (considered and accepted, not
+// missed): that is exact parity with the REST layer, where `DELETE /api/v1/routines/:id` and the
+// `GET`s carry no code-flavor gate either — an open decision already recorded in `codeGateBlocks`'s
+// own doc comment (routine-routes.ts) and owned there, not here. Gating them on this surface alone
+// would make chat STRICTER than REST for no security gain (a caller refused here would just call
+// the REST route), and would silently drift from the one decision both surfaces are meant to share.
+// If that REST decision is ever revisited, change it there first and mirror it here.
 import type { ConversationStore } from '../chat/db'
 import type { Routine, RoutineFlavor, ScheduleRule, CodingAgentChoice } from './schema'
 import { computeNextFireTime } from './schedule'
@@ -361,15 +375,25 @@ export const RUN_ROUTINE_NOW_TOOL = {
   },
 }
 
+/** @param isCodeAuthorized See {@link execCreateRoutine} and the module header. Consulted only when
+ *  the STORED routine is code-flavor, mirroring `POST /api/v1/routines/:id/run-now`'s own gate
+ *  (routine-routes.ts) one-for-one, including the SAME `CODE_GATE_MESSAGE` wording. DEFAULTS TO
+ *  FALSE (fail closed): a caller that forgets it can never trigger unattended host code execution.
+ *  Triggering a chat-flavor routine is unaffected by it. */
 export async function execRunRoutineNow(
   args: Record<string, unknown>,
   store: RoutineToolsStore,
   runNow: RunRoutineNowFn,
+  isCodeAuthorized = false,
 ): Promise<string> {
   const id = String(args.routineId ?? '').trim()
   if (!id) return 'Error: routineId is required.'
   const routine = store.getRoutine(id)
   if (!routine) return `Error: no routine with id "${id}".`
+  // Gate BEFORE the status check, matching execCreateRoutine's own gate-before-validation ordering
+  // (and the REST run-now handler's, which gates before RoutineScheduler.runNow's status logic):
+  // an ungated caller must learn nothing about the routine's state from the error it gets back.
+  if (routine.flavor === 'code' && !isCodeAuthorized) return `Error: ${CODE_GATE_MESSAGE}`
   // 'paused' is deliberately allowed, matching RoutineScheduler.runNow's own gate: only a routine
   // a human has never confirmed is off-limits to a manual trigger.
   if (routine.status === 'pending_confirmation') {

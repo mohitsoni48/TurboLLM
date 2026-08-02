@@ -19,7 +19,7 @@ import type { Deps } from '../deps'
 // is already reserved for stubbing the engine's own /v1/chat/completions calls.
 const AGENT = { id: 'agent-1', name: 'Researcher', description: '', systemPrompt: 'You research things.', skillIds: [], tools: ['run_code'] }
 
-function fakeDeps(overrides: Partial<{ customAgents: typeof AGENT[] }> = {}): { d: Deps; db: ConversationStore } {
+function fakeDeps(overrides: Partial<{ customAgents: typeof AGENT[]; tools: ToolRegistry }> = {}): { d: Deps; db: ConversationStore } {
   const db = new ConversationStore(mkdtempSync(join(tmpdir(), 'chat-runner-test-')))
   const d = {
     db,
@@ -32,7 +32,7 @@ function fakeDeps(overrides: Partial<{ customAgents: typeof AGENT[] }> = {}): { 
     // buildToolDefinitions() always sent an EMPTY tool list and every "tool executed"
     // assertion was actually asserting on execWebSearch's unavailable-tool error string, never
     // real execution. Tests below use run_code/fetch_url instead, which need no config.
-    tools: new ToolRegistry({ search: {}, sandbox: {}, mcpServers: [] } as never),
+    tools: overrides.tools ?? new ToolRegistry({ search: {}, sandbox: {}, mcpServers: [] } as never),
   } as unknown as Deps
   return { d, db }
 }
@@ -215,6 +215,61 @@ test("I1: resuming after a later-round stall still carries an earlier round's re
     // And exactly one user turn overall (I2 must hold here too).
     assert.equal(sent.filter((m) => m.role === 'user').length, 1)
   } finally { fetchStub2.restore() }
+})
+
+// ── Phase 4 / C1: an unattended run must NEVER claim code authorization ─────────────────────
+// Both executeToolCallWithApproval call sites in chat-runner.ts pass `isCodeAuthorized: false`
+// deliberately: a timer-fired run has no inbound HTTP request to run codeGateBlocks against, and
+// unattended code execution must not be able to author or fire MORE of itself. That choice was
+// pinned only by a comment — flipping either site to `true` left the whole suite green. These two
+// capture what actually reaches ToolRegistry.executeTool, so the flip is now a test failure.
+
+/** A ToolRegistry double recording executeTool's 2nd argument. buildToolDefinitions is stubbed to
+ *  the one tool the agent allows, since runChatRoundLoop calls it before the loop. */
+function capturingTools(toolName: string): { tools: ToolRegistry; seen: unknown[] } {
+  const seen: unknown[] = []
+  const tools = {
+    buildToolDefinitions: async () => [{ type: 'function', function: { name: toolName, description: '', parameters: {} } }],
+    executeTool: async (_call: unknown, isCodeAuthorized?: unknown) => { seen.push(isCodeAuthorized); return 'captured' },
+  } as unknown as ToolRegistry
+  return { tools, seen }
+}
+
+test('C1: runChatRoundLoop executes every tool call with isCodeAuthorized false', async () => {
+  const { tools, seen } = capturingTools('run_code')
+  const { d, db } = fakeDeps({ tools })
+  const r = routine(db)
+  const run = db.createRoutineRun({ routineId: r.id, configSnapshot: JSON.stringify(r) })
+  const fetchStub = stubFetch([
+    { choices: [{ message: { content: null, tool_calls: [{ id: 'c1', function: { name: 'run_code', arguments: '{"code":"return 1"}' } }] } }] },
+    { choices: [{ message: { content: 'done' } }] },
+  ])
+  try {
+    const outcome = await runChatRoutine(d, r, run, new AbortController().signal)
+    assert.equal(outcome.status, 'ok')
+    assert.deepStrictEqual(seen, [false], 'a scheduled, unattended run must never present itself as code-authorized')
+  } finally { fetchStub.restore() }
+})
+
+test('C1: resumeChatRoutine replays the just-approved call with isCodeAuthorized false', async () => {
+  const { tools, seen } = capturingTools('run_code')
+  const { d, db } = fakeDeps({ tools })
+  const r = routine(db)
+  const run = db.createRoutineRun({ routineId: r.id, configSnapshot: JSON.stringify(r) })
+  const conv = db.createConversation({ kind: 'agent', modelKey: 'm', systemPrompt: AGENT.systemPrompt, agentId: AGENT.id })
+  db.addMessage(conv.id, 'user', r.prompt)
+  const pending: PendingRoutineToolCall = {
+    convId: conv.id, assistantContent: '', precedingCalls: [],
+    call: { id: 'c1', name: 'create_routine', args: { flavor: 'code' } },
+  }
+  const fetchStub = stubFetch([{ choices: [{ message: { content: 'Resumed.' } }] }])
+  try {
+    const outcome = await resumeChatRoutine(d, r, run, pending, 'allow', new AbortController().signal)
+    assert.equal(outcome.status, 'ok')
+    // A human approving ONE stalled tool call is not a standing grant to author/fire code routines,
+    // and there is still no HTTP request to authorize against on this path.
+    assert.deepStrictEqual(seen, [false])
+  } finally { fetchStub.restore() }
 })
 
 // ── I3 regression: a mid-request failure/abort must resolve, never throw uncaught ───────────
