@@ -18,10 +18,37 @@
 // Every executor returns a plain string and never throws — matching builtin.ts's `execFetchUrl`/
 // `execWebSearch` convention of surfacing failures as an `"Error: ..."` string the model can read
 // and correct, rather than an exception the tool loop has to catch.
+//
+// CODE-FLAVOR AUTHORIZATION (`isCodeAuthorized`, the 3rd parameter of execCreateRoutine and
+// execUpdateRoutine — READ THIS BEFORE WIRING THIS MODULE INTO ANYTHING):
+// `POST /api/v1/routines` and `PUT /api/v1/routines/:id` both refuse to create or edit a
+// CODE-flavor routine for a caller that is neither host-local nor holding a valid API key
+// (routine-routes.ts's `codeGateBlocks`). That is a stronger bar than the app-wide `lanAuth`,
+// which has an explicit "user opted into open LAN access" bypass (auth.ts's `bypassesAuth`) that
+// `codeAuth` deliberately does not. A code-flavor routine schedules unattended code execution on
+// the host on a timer, so authoring or editing one has to clear the same bar as the Code feature.
+// These executors have no Hono `Context` and so CANNOT make that trust decision themselves — the
+// CALLER must, and pass the answer in. Obligations per surface:
+//   • Chat / ToolRegistry (Task 2/3): MUST compute it exactly as `codeGateBlocks` does —
+//     `isLocalRequest(c, d) || verifyPresentedKey(c, d)` for the HTTP request driving the tool
+//     loop — and thread it in. `POST /api/v1/chat` is behind `lanAuth` ONLY (server.ts:65;
+//     `codeAuth` is scoped to `/api/v1/code/*` at :68), so without this a keyless LAN caller who
+//     is blocked at the REST route could just ask the model to author the same code routine.
+//   • In-app Code / pi session (Task 4): may pass `true` unconditionally. Every entry point to a
+//     Code session is already behind `codeAuth`: `app.use('/api/v1/code/*', codeAuth(d))`
+//     (server.ts:68) is registered BEFORE `registerCodeRoutes` (:86), so session creation
+//     (`POST /api/v1/code/sessions`, code-routes.ts:140) and every subsequent turn
+//     (`POST /api/v1/code/sessions/:id/messages`, :737) are gated, and the one non-Hono path —
+//     the raw terminal WebSocket upgrade — applies the same check by hand
+//     (terminal-routes.ts:423-424, `isLocalUpgrade || verifyKeyValue`). A Code session's mere
+//     existence therefore already proves host-local-or-keyed.
+// The parameter DEFAULTS TO FALSE so that a caller who forgets it blocks code-flavor authoring
+// rather than silently permitting it — omission must fail closed, since the omission is exactly
+// the bug this guards against. Chat-flavor create/update is unaffected by it, in every case.
 import type { ConversationStore } from '../chat/db'
 import type { Routine, RoutineFlavor, ScheduleRule, CodingAgentChoice } from './schema'
 import { computeNextFireTime } from './schedule'
-import { validateCreate, validateUpdate, type RoutineBody } from './routine-routes'
+import { validateCreate, validateUpdate, CODE_GATE_MESSAGE, type RoutineBody } from './routine-routes'
 
 /** The narrow slice of ConversationStore these 5 tools touch. A real ConversationStore instance
  *  satisfies this structurally (TypeScript structural typing) — no adapter needed at the call
@@ -112,8 +139,22 @@ export const CREATE_ROUTINE_TOOL = {
 
 /** `async` by contract, not because it awaits anything today: `ToolRegistry.executeTool` awaits
  *  every executor uniformly, and keeping the signature Promise-returning means a later backing
- *  call (validation against a live model list, say) is not a breaking change. */
-export async function execCreateRoutine(args: Record<string, unknown>, store: RoutineToolsStore): Promise<string> {
+ *  call (validation against a live model list, say) is not a breaking change.
+ *
+ *  @param isCodeAuthorized Whether this caller has cleared the same bar `codeAuth` enforces —
+ *  host-local OR holding a valid API key. Consulted ONLY when `flavor` is `'code'`; a chat-flavor
+ *  create behaves identically whatever it is. DEFAULTS TO FALSE (fail closed): a caller that
+ *  forgets to pass it can never author a code routine. See the module header for how each calling
+ *  surface must compute it — Task 2/3 (chat) must mirror `routine-routes.ts`'s `codeGateBlocks`;
+ *  Task 4 (in-app Code session) may pass `true`, since `codeAuth` already gated the session. */
+export async function execCreateRoutine(
+  args: Record<string, unknown>,
+  store: RoutineToolsStore,
+  isCodeAuthorized = false,
+): Promise<string> {
+  // Gate BEFORE validation, exactly as POST /api/v1/routines does (routine-routes.ts:152), so an
+  // ungated caller learns nothing about the request shape from the error it gets back.
+  if (args.flavor === 'code' && !isCodeAuthorized) return `Error: ${CODE_GATE_MESSAGE}`
   const typeProblem = stringFieldProblem(args)
   if (typeProblem) return `Error: ${typeProblem}`
   const b = args as unknown as RoutineBody
@@ -191,11 +232,26 @@ const UPDATABLE_FIELDS = [
 ] as const
 type UpdatableField = (typeof UPDATABLE_FIELDS)[number]
 
-export function execUpdateRoutine(args: Record<string, unknown>, store: RoutineToolsStore): string {
+/** @param isCodeAuthorized See {@link execCreateRoutine} and the module header. Consulted only when
+ *  the STORED routine is code-flavor (or an incoming `flavor` says code, kept for symmetry with
+ *  `PUT /api/v1/routines/:id`, which checks both so it stays correct if flavor ever becomes
+ *  mutable). Also blocks the PREVIEW call, deliberately: the diff echoes the routine's stored
+ *  `workspacePath`, which the REST layer does not hand an ungated caller either. DEFAULTS TO FALSE
+ *  (fail closed). Updating a chat-flavor routine is unaffected by it. */
+export function execUpdateRoutine(
+  args: Record<string, unknown>,
+  store: RoutineToolsStore,
+  isCodeAuthorized = false,
+): string {
   const id = String(args.routineId ?? '').trim()
   if (!id) return 'Error: routineId is required.'
   const existing = store.getRoutine(id)
   if (!existing) return `Error: no routine with id "${id}".`
+  // Mirrors PUT /api/v1/routines/:id (routine-routes.ts:177-179), including checking both the
+  // stored flavor and any incoming one, and gating before validation.
+  if ((existing.flavor === 'code' || args.flavor === 'code') && !isCodeAuthorized) {
+    return `Error: ${CODE_GATE_MESSAGE}`
+  }
 
   const typeProblem = stringFieldProblem(args)
   if (typeProblem) return `Error: ${typeProblem}`
@@ -238,7 +294,12 @@ export function execUpdateRoutine(args: Record<string, unknown>, store: RoutineT
   if (patch.workspacePath !== undefined) storePatch.workspacePath = patch.workspacePath
   if (patch.codingAgent !== undefined) storePatch.codingAgent = patch.codingAgent
   if (patch.permissionMode !== undefined) storePatch.permissionMode = patch.permissionMode
-  store.updateRoutine(id, storePatch)
+  // The store's return value is the ONLY evidence the write landed. `getRoutine` above is a
+  // time-of-check; this is the time-of-use, and the row can vanish in between (a concurrent tool
+  // call in the same loop, the UI, a REST client). Reporting success unconditionally would tell
+  // the model — and through it the user — that a change was applied when it was not.
+  const updated = store.updateRoutine(id, storePatch)
+  if (!updated) return `Error: routine "${id}" no longer exists — nothing was updated.`
   return `Updated routine "${id}".`
 }
 
@@ -276,7 +337,9 @@ export function execDeleteRoutine(args: Record<string, unknown>, store: RoutineT
       'confirm: true to actually delete.'
   }
 
-  store.deleteRoutine(id)
+  // Same time-of-check/time-of-use window as execUpdateRoutine's mutation: `false` means the row
+  // was already gone, so the model must not be told this call deleted anything.
+  if (!store.deleteRoutine(id)) return `Error: routine "${id}" no longer exists — nothing was deleted.`
   return `Deleted routine "${id}" and its run history.`
 }
 

@@ -129,7 +129,9 @@ function codeGateBlocks(c: Context, d: Deps): boolean {
   return !isLocalRequest(c, d) && !verifyPresentedKey(c, d)
 }
 
-const CODE_GATE_MESSAGE = 'A valid API key is required to schedule a Code routine from a non-host device.'
+/** Exported (Phase 4) so `routine-tools.ts`'s code-flavor gate refuses with the IDENTICAL wording
+ *  this route does — one message for one security property, on both the REST and the tool surface. */
+export const CODE_GATE_MESSAGE = 'A valid API key is required to schedule a Code routine from a non-host device.'
 
 export function registerRoutineRoutes(app: Hono, d: Deps): void {
   app.get('/api/v1/routines', (c) => c.json(d.db.listRoutines()))

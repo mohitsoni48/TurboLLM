@@ -7,7 +7,9 @@ import { ConversationStore } from '../chat/db'
 import {
   execCreateRoutine, execListRoutines, execUpdateRoutine, execDeleteRoutine, execRunRoutineNow,
   CREATE_ROUTINE_TOOL, LIST_ROUTINES_TOOL, UPDATE_ROUTINE_TOOL, DELETE_ROUTINE_TOOL, RUN_ROUTINE_NOW_TOOL,
+  type RoutineToolsStore,
 } from './routine-tools'
+import { CODE_GATE_MESSAGE } from './routine-routes'
 
 function freshStore(): ConversationStore {
   return new ConversationStore(mkdtempSync(join(tmpdir(), 'routine-tools-test-')))
@@ -18,6 +20,29 @@ function chatRoutine(store: ConversationStore, prompt = 'x') {
     flavor: 'chat', prompt, scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 },
     modelKey: 'm', agentId: 'a',
   })
+}
+
+function codeRoutine(store: ConversationStore, prompt = 'x') {
+  return store.createRoutine({
+    flavor: 'code', prompt, scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 },
+    modelKey: 'm', workspacePath: 'D:\\repo', codingAgent: 'pi',
+  })
+}
+
+/** A RoutineToolsStore backed by the REAL store for every read, with the named mutation(s) swapped
+ *  out — the only way to reproduce the time-of-check/time-of-use race in I1, where `getRoutine`
+ *  legitimately succeeds and the row is gone by the time the write runs. Methods are bound rather
+ *  than spread: ConversationStore's are prototype methods, which a spread would drop. */
+function raceStore(store: ConversationStore, overrides: Partial<RoutineToolsStore>): RoutineToolsStore {
+  return {
+    createRoutine: store.createRoutine.bind(store),
+    getRoutine: store.getRoutine.bind(store),
+    listRoutines: store.listRoutines.bind(store),
+    updateRoutine: store.updateRoutine.bind(store),
+    deleteRoutine: store.deleteRoutine.bind(store),
+    listRoutineRuns: store.listRoutineRuns.bind(store),
+    ...overrides,
+  }
 }
 
 /** A runNow that fails the test if it is ever called — used to prove the preview/guard paths
@@ -47,7 +72,7 @@ test('execCreateRoutine: a valid code-flavor routine persists workspacePath/codi
     flavor: 'code', prompt: 'Run the tests', scheduleDisplay: 'Runs hourly',
     scheduleRule: { kind: 'interval', everyMs: 3_600_000 }, modelKey: 'm',
     workspacePath: 'D:\\repo', codingAgent: 'pi', permissionMode: 'plan',
-  }, store)
+  }, store, true)
   assert.match(msg, /pending_confirmation/)
   const [r] = store.listRoutines()
   assert.equal(r.flavor, 'code')
@@ -62,7 +87,7 @@ test('execCreateRoutine: code flavor missing workspacePath is rejected and nothi
   const msg = await execCreateRoutine({
     flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 },
     modelKey: 'm', codingAgent: 'pi',
-  }, store)
+  }, store, true)
   assert.match(msg, /^Error:/)
   assert.match(msg, /workspacePath/)
   assert.equal(store.listRoutines().length, 0)
@@ -146,6 +171,113 @@ test('execCreateRoutine: whitespace around prompt/scheduleDisplay/modelKey is tr
   assert.equal(r.modelKey, 'm')
 })
 
+// ── code-flavor authorization gate (C1) ───────────────────────────────────
+// The executor cannot make the trust decision itself (no Hono Context), so it takes the answer as
+// a parameter. These pin the two properties that matter: it fails CLOSED when the caller says no
+// or says nothing at all, and it is completely inert for chat-flavor routines.
+
+test('execCreateRoutine: a code-flavor create is REJECTED when the gate parameter is omitted (fails closed)', async () => {
+  const store = freshStore()
+  const msg = await execCreateRoutine({
+    flavor: 'code', prompt: 'Run the tests', scheduleDisplay: 'Runs hourly',
+    scheduleRule: { kind: 'interval', everyMs: 3_600_000 }, modelKey: 'm',
+    workspacePath: 'D:\\repo', codingAgent: 'pi',
+  }, store)
+  assert.equal(msg, `Error: ${CODE_GATE_MESSAGE}`, 'a caller that forgets the gate must not author a code routine')
+  assert.equal(store.listRoutines().length, 0, 'nothing may be created on the blocked path')
+})
+
+test('execCreateRoutine: a code-flavor create is REJECTED when the gate parameter is false', async () => {
+  const store = freshStore()
+  const msg = await execCreateRoutine({
+    flavor: 'code', prompt: 'Run the tests', scheduleDisplay: 'Runs hourly',
+    scheduleRule: { kind: 'interval', everyMs: 3_600_000 }, modelKey: 'm',
+    workspacePath: 'D:\\repo', codingAgent: 'pi',
+  }, store, false)
+  assert.equal(msg, `Error: ${CODE_GATE_MESSAGE}`)
+  assert.equal(store.listRoutines().length, 0)
+})
+
+/** Matches POST /api/v1/routines, which gates before it validates so an ungated caller learns
+ *  nothing about the request shape. */
+test('execCreateRoutine: the code gate fires BEFORE validation, so a blocked caller learns no request shape', async () => {
+  const store = freshStore()
+  const msg = await execCreateRoutine({ flavor: 'code', prompt: 'x' }, store, false)
+  assert.equal(msg, `Error: ${CODE_GATE_MESSAGE}`)
+  assert.doesNotMatch(msg, /workspacePath|codingAgent|scheduleRule|modelKey/)
+})
+
+test('execCreateRoutine: a chat-flavor create is unaffected by the gate parameter, whatever its value', async () => {
+  for (const gate of [undefined, false, true] as const) {
+    const store = freshStore()
+    const args = {
+      flavor: 'chat', prompt: 'Summarize my inbox', scheduleDisplay: 'd',
+      scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'a',
+    }
+    const msg = gate === undefined
+      ? await execCreateRoutine(args, store)
+      : await execCreateRoutine(args, store, gate)
+    assert.match(msg, /pending_confirmation/, `chat create must succeed with gate=${String(gate)}`)
+    assert.equal(store.listRoutines().length, 1)
+  }
+})
+
+test('execUpdateRoutine: updating a code-flavor routine is REJECTED when the gate parameter is omitted', () => {
+  const store = freshStore()
+  const r = codeRoutine(store, 'keep me')
+  const before = JSON.stringify(store.getRoutine(r.id))
+  const out = execUpdateRoutine({ routineId: r.id, prompt: 'new prompt', confirm: true }, store)
+  assert.equal(out, `Error: ${CODE_GATE_MESSAGE}`)
+  assert.equal(JSON.stringify(store.getRoutine(r.id)), before, 'the blocked path must mutate nothing')
+})
+
+test('execUpdateRoutine: updating a code-flavor routine is REJECTED when the gate parameter is false', () => {
+  const store = freshStore()
+  const r = codeRoutine(store, 'keep me')
+  const out = execUpdateRoutine({ routineId: r.id, prompt: 'new prompt', confirm: true }, store, false)
+  assert.equal(out, `Error: ${CODE_GATE_MESSAGE}`)
+  assert.equal(store.getRoutine(r.id)?.prompt, 'keep me')
+})
+
+/** The preview echoes the routine's stored workspacePath, which the REST layer does not hand an
+ *  ungated caller either — so the gate covers the read-shaped call too, not just the apply. */
+test('execUpdateRoutine: even a PREVIEW of a code-flavor routine is blocked when ungated', () => {
+  const store = freshStore()
+  const r = codeRoutine(store)
+  const out = execUpdateRoutine({ routineId: r.id, workspacePath: 'D:\\elsewhere' }, store, false)
+  assert.equal(out, `Error: ${CODE_GATE_MESSAGE}`)
+  assert.doesNotMatch(out, /D:\\repo/, 'the stored workspacePath must not leak to an ungated caller')
+})
+
+test('execUpdateRoutine: a code-flavor update IS applied when the gate parameter is true', () => {
+  const store = freshStore()
+  const r = codeRoutine(store, 'old prompt')
+  const out = execUpdateRoutine({ routineId: r.id, prompt: 'new prompt', confirm: true }, store, true)
+  assert.match(out, /Updated/)
+  assert.equal(store.getRoutine(r.id)?.prompt, 'new prompt')
+})
+
+/** Symmetry with PUT /api/v1/routines/:id, which checks the incoming flavor as well as the stored
+ *  one so the gate stays correct if a later phase ever makes `flavor` mutable. */
+test('execUpdateRoutine: an incoming flavor "code" is gated even when the STORED routine is chat', () => {
+  const store = freshStore()
+  const r = chatRoutine(store, 'keep me')
+  const out = execUpdateRoutine({ routineId: r.id, flavor: 'code', prompt: 'new prompt', confirm: true }, store, false)
+  assert.equal(out, `Error: ${CODE_GATE_MESSAGE}`)
+  assert.equal(store.getRoutine(r.id)?.prompt, 'keep me')
+})
+
+test('execUpdateRoutine: a chat-flavor update is unaffected by the gate parameter, whatever its value', () => {
+  for (const gate of [undefined, false, true] as const) {
+    const store = freshStore()
+    const r = chatRoutine(store, 'old prompt')
+    const args = { routineId: r.id, prompt: 'new prompt', confirm: true }
+    const out = gate === undefined ? execUpdateRoutine(args, store) : execUpdateRoutine(args, store, gate)
+    assert.match(out, /Updated/, `chat update must succeed with gate=${String(gate)}`)
+    assert.equal(store.getRoutine(r.id)?.prompt, 'new prompt')
+  }
+})
+
 // ── list_routines ─────────────────────────────────────────────────────────
 
 test('execListRoutines: empty store says so plainly', () => {
@@ -202,7 +334,7 @@ test('execUpdateRoutine: a preview call mutates no field of the stored routine a
     routineId: r.id, prompt: 'new prompt', scheduleDisplay: 'new display',
     scheduleRule: { kind: 'daily', hour: 6, minute: 30 }, modelKey: 'new-model',
     workspacePath: 'D:\\new', codingAgent: 'claude_cli', permissionMode: 'auto',
-  }, store)
+  }, store, true)
 
   assert.match(out, /PREVIEW/)
   assert.equal(JSON.stringify(store.getRoutine(r.id)), before, 'preview must not write anything')
@@ -284,7 +416,7 @@ test('execUpdateRoutine: an empty workspacePath on a code routine is rejected', 
     flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 },
     modelKey: 'm', workspacePath: 'D:\\repo', codingAgent: 'pi',
   })
-  const out = execUpdateRoutine({ routineId: r.id, workspacePath: '  ', confirm: true }, store)
+  const out = execUpdateRoutine({ routineId: r.id, workspacePath: '  ', confirm: true }, store, true)
   assert.match(out, /^Error:/)
   assert.match(out, /workspacePath/)
   assert.equal(store.getRoutine(r.id)?.workspacePath, 'D:\\repo')
@@ -344,6 +476,23 @@ test('execUpdateRoutine: cannot change status or nextFireAt (no back door into a
   const after = store.getRoutine(r.id)
   assert.equal(after?.status, 'pending_confirmation')
   assert.equal(after?.nextFireAt, null)
+})
+
+/** I1: the row is gone between the getRoutine check and the write. The executor must report the
+ *  store's actual answer, not assume its own earlier read still holds — the returned string is the
+ *  model's only signal, and a false "Updated" is relayed to the user as fact. */
+test('execUpdateRoutine: reports an Error when the store says the update did not land (TOCTOU race)', () => {
+  const real = freshStore()
+  const r = chatRoutine(real, 'old prompt')
+  let called = false
+  const store = raceStore(real, { updateRoutine: () => { called = true; return null } })
+
+  const out = execUpdateRoutine({ routineId: r.id, prompt: 'new prompt', confirm: true }, store)
+
+  assert.equal(called, true, 'the mutation really was attempted — this is not an early return')
+  assert.match(out, /^Error:/, 'a vanished row must not be reported as a successful update')
+  assert.match(out, /no longer exists/)
+  assert.doesNotMatch(out, /^Updated/)
 })
 
 test('execUpdateRoutine: unknown routineId is rejected', () => {
@@ -424,6 +573,21 @@ test('execDeleteRoutine: deleting one routine leaves the others alone', () => {
   execDeleteRoutine({ routineId: drop.id, confirm: true }, store)
   assert.equal(store.listRoutines().length, 1)
   assert.equal(store.getRoutine(keep.id)?.prompt, 'keep')
+})
+
+/** Delete's half of the I1 guard — `deleteRoutine` returning false means the row was already gone. */
+test('execDeleteRoutine: reports an Error when the store says nothing was deleted (TOCTOU race)', () => {
+  const real = freshStore()
+  const r = chatRoutine(real)
+  let called = false
+  const store = raceStore(real, { deleteRoutine: () => { called = true; return false } })
+
+  const out = execDeleteRoutine({ routineId: r.id, confirm: true }, store)
+
+  assert.equal(called, true, 'the delete really was attempted')
+  assert.match(out, /^Error:/, 'a no-op delete must not be reported as a successful one')
+  assert.match(out, /no longer exists/)
+  assert.doesNotMatch(out, /^Deleted/)
 })
 
 test('execDeleteRoutine: unknown routineId is rejected', () => {
