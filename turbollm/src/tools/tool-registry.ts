@@ -7,6 +7,11 @@ import {
 } from './builtin'
 import { searchConfigured } from './search-providers'
 import { createMcpClient, type IMcpClient } from './mcp-client'
+import {
+  CREATE_ROUTINE_TOOL, LIST_ROUTINES_TOOL, UPDATE_ROUTINE_TOOL, DELETE_ROUTINE_TOOL, RUN_ROUTINE_NOW_TOOL,
+  execCreateRoutine, execListRoutines, execUpdateRoutine, execDeleteRoutine, execRunRoutineNow,
+  type RoutineToolsStore, type RunRoutineNowFn,
+} from '../routines/routine-tools'
 
 export interface ToolDefinition {
   type: 'function'
@@ -26,9 +31,17 @@ export interface ToolCall {
 export class ToolRegistry {
   private toolsCfg: ToolsConfig
   private mcpClients = new Map<string, IMcpClient>()
+  private routines?: RoutineToolsStore
+  private runRoutineNowFn?: RunRoutineNowFn
 
-  constructor(toolsCfg: ToolsConfig) {
+  /** @param routines Injected once at boot (cli.ts passes `db` — a real ConversationStore
+   *  structurally satisfies RoutineToolsStore). Absent means the 5 routine tools simply do not
+   *  exist on this registry, which is what every test that constructs a bare ToolRegistry gets.
+   *  @param runRoutineNow Backs `run_routine_now` — cli.ts binds RoutineScheduler.runNow. */
+  constructor(toolsCfg: ToolsConfig, routines?: RoutineToolsStore, runRoutineNow?: RunRoutineNowFn) {
     this.toolsCfg = toolsCfg
+    this.routines = routines
+    this.runRoutineNowFn = runRoutineNow
   }
 
   /** Update config (called on settings change without restart). */
@@ -75,6 +88,14 @@ export class ToolRegistry {
     if (searchConfigured(this.toolsCfg.search)) defs.push(webSearchTool())
     defs.push(FETCH_URL_TOOL)
     defs.push(RUN_CODE_TOOL)
+    // Routine tools (Phase 4) — gated on whether a RoutineToolsStore was actually injected
+    // (production always injects one via cli.ts; tests that construct a bare ToolRegistry to
+    // exercise fetch_url/run_code/MCP behavior are unaffected). Persona scoping is NOT done
+    // here — it's the same downstream conv.allowedTools filter every other built-in already
+    // goes through (chat-routes.ts), identical to fetch_url/run_code/web_search.
+    if (this.routines) {
+      defs.push(CREATE_ROUTINE_TOOL, LIST_ROUTINES_TOOL, UPDATE_ROUTINE_TOOL, DELETE_ROUTINE_TOOL, RUN_ROUTINE_NOW_TOOL)
+    }
 
     // MCP tools from connected servers
     for (const client of this.mcpClients.values()) {
@@ -96,8 +117,18 @@ export class ToolRegistry {
     return defs
   }
 
-  /** Execute a single tool call. Returns the result string. */
-  async executeTool(call: ToolCall): Promise<string> {
+  /** Execute a single tool call. Returns the result string.
+   *
+   *  @param isCodeAuthorized The CALLER's per-request answer to "has this caller cleared the same
+   *  bar `codeAuth` enforces — host-local OR holding a valid API key?". Consulted only by
+   *  `create_routine`/`update_routine`, and only for CODE-flavor routines (see routine-tools.ts's
+   *  module header). It cannot be computed here: this registry is constructed ONCE for the
+   *  daemon's whole lifetime (cli.ts), while the answer is a property of one specific HTTP
+   *  request. DEFAULTS TO FALSE so a caller that does not know about this gate — every pre-Phase-4
+   *  call site, and any future one — blocks code-flavor authoring rather than silently permitting
+   *  it. Chat's live handler computes it with routine-routes.ts's own `codeGateBlocks`; a
+   *  scheduled routine's unattended tool loop deliberately leaves it false. */
+  async executeTool(call: ToolCall, isCodeAuthorized = false): Promise<string> {
     const name = call.name
     const args = call.args
 
@@ -120,6 +151,19 @@ export class ToolRegistry {
     // Built-in: run_code — approval gating happens upstream in execute-with-approval.ts
     // before executeTool is ever called, so run_code always executes here.
     if (name === 'run_code') return execRunCode(args)
+
+    // Routine tools (Phase 4) — the same shared executors chat and the in-app Code/pi session
+    // both reach (code-session.ts calls THIS method too, not a second implementation).
+    if (this.routines) {
+      if (name === 'create_routine') return execCreateRoutine(args, this.routines, isCodeAuthorized)
+      if (name === 'list_routines') return execListRoutines(args, this.routines)
+      if (name === 'update_routine') return execUpdateRoutine(args, this.routines, isCodeAuthorized)
+      if (name === 'delete_routine') return execDeleteRoutine(args, this.routines)
+      if (name === 'run_routine_now') {
+        if (!this.runRoutineNowFn) return 'Error: run_routine_now is not available in this build.'
+        return execRunRoutineNow(args, this.routines, this.runRoutineNowFn)
+      }
+    }
 
     // MCP tool: mcp__{serverId}__{toolName}
     const mcpMatch = name.match(/^mcp__([^_]+(?:_[^_]+)*)__(.+)$/)
