@@ -64,6 +64,10 @@ test(
       // exhaustively by cli-routine.test.ts; this test is about the real subprocess and the real
       // stream-json output.
       getLoadedModelKey: () => routine.modelKey,
+      // Production wires this to `engineIsIdle(manager)`; this test has no Manager of its own (it
+      // talks to an ALREADY-RUNNING daemon over HTTP), and the 'run' decision above means the value
+      // is never acted on — nothing here can swap a model.
+      getEngineIdle: () => true,
       loadExplicit: async () => ({ target: `http://127.0.0.1:${PORT}` }),
       now: () => new Date(),
       port: PORT,

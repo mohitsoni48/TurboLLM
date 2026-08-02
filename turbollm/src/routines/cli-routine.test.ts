@@ -56,6 +56,9 @@ function baseDeps(overrides: Partial<CliRoutineDeps> = {}): CliRoutineDeps {
     store: overrides.store ?? freshStore(),
     gate: overrides.gate ?? new GenerationGate(),
     getLoadedModelKey: overrides.getLoadedModelKey ?? (() => 'pinned-model'),
+    // Production wires this to `engineIsIdle(manager)`, i.e. `manager.sessionStats().activeRequests
+    // === 0`. `fakeManagerIdle()` below models that counter the way the real one behaves.
+    getEngineIdle: overrides.getEngineIdle ?? (() => true),
     loadExplicit: overrides.loadExplicit ?? (async () => ({ target: 'http://127.0.0.1:8081' })),
     now: overrides.now ?? (() => new Date('2026-08-01T10:00:00.000Z')),
     port: overrides.port ?? 6996,
@@ -71,6 +74,14 @@ function neverSpawns(): CliRoutineDeps['runProcess'] {
   return async () => {
     assert.fail('runProcess must not be called on this path')
   }
+}
+
+/** A `getEngineIdle` that models the real one: `engineIsIdle(manager)` returns
+ *  `manager.sessionStats().activeRequests === 0`, and `chat-routes.ts:800`'s `generationStart()`
+ *  is what increments that counter for a live in-app chat turn. So a streaming chat turn is
+ *  exactly `activeRequests = 1`. */
+function fakeManagerIdle(activeRequests: number): CliRoutineDeps['getEngineIdle'] {
+  return () => activeRequests === 0
 }
 
 // ── Happy path ────────────────────────────────────────────────────────────────────────────────
@@ -214,6 +225,66 @@ test('a multi-slot engine with a free slot counts as idle and swaps rather than 
   assert.deepEqual(loadCalls, ['pinned-model', 'some-other-model'])
 })
 
+test('C1: a live in-app chat turn counts as busy even though the gate reports a free slot', async () => {
+  // The regression this locks in: the main chat streaming turn calls `manager.generationStart()`
+  // (chat-routes.ts:800) and NEVER acquires the gate, so an untouched `new GenerationGate()` reads
+  // `{ inFlight: 0, capacity: 1 }` — idle — while a user is mid-stream. Deciding on `gate.stats()`
+  // alone would hot-swap the engine's model out from under that stream, which is the exact thing
+  // spec 20 §5 forbids. `getEngineIdle` (production: `engineIsIdle(manager)`) is what sees it.
+  const store = freshStore()
+  const routine = codeRoutine(store)
+  const gate = new GenerationGate() // untouched: nothing has ever acquired it
+  assert.deepEqual(gate.stats(), { inFlight: 0, queued: 0, capacity: 1 }, 'the gate alone would say idle')
+
+  const loadCalls: string[] = []
+  await runCliCodeRoutine(routine, baseDeps({
+    store,
+    gate,
+    getLoadedModelKey: () => 'some-other-model',
+    getEngineIdle: fakeManagerIdle(1), // a chat turn is streaming right now
+    loadExplicit: async (k) => { loadCalls.push(k); return { target: 'http://127.0.0.1:8081' } },
+    runProcess: neverSpawns(),
+  }))
+
+  const runs = store.listRoutineRuns(routine.id)
+  assert.equal(runs[0].status, 'skipped')
+  assert.equal(runs[0].skipReason, 'model_busy')
+  assert.deepEqual(loadCalls, [], 'the live foreground generation must never be preempted by a swap')
+})
+
+test('C1: an engine with capacity Infinity (no --parallel) still skips while a chat turn streams', async () => {
+  // cli.ts:327 builds the gate as `manager.parallelSlots() ?? Infinity`, and only llama.cpp emits
+  // `--parallel` — so on vLLM/mlx-lm/koboldcpp `inFlight < capacity` is unconditionally true and
+  // 'skip-busy' would be dead code if the gate were the only signal.
+  const store = freshStore()
+  const routine = codeRoutine(store)
+  const gate = new GenerationGate(() => Infinity)
+  assert.equal(gate.stats().capacity, Infinity)
+
+  await runCliCodeRoutine(routine, baseDeps({
+    store,
+    gate,
+    getLoadedModelKey: () => 'some-other-model',
+    getEngineIdle: fakeManagerIdle(1),
+    runProcess: neverSpawns(),
+  }))
+  assert.equal(store.listRoutineRuns(routine.id)[0].skipReason, 'model_busy')
+})
+
+test('C1: an idle manager AND a free gate slot is what actually allows the swap', async () => {
+  const store = freshStore()
+  const routine = codeRoutine(store)
+  const loadCalls: string[] = []
+  await runCliCodeRoutine(routine, baseDeps({
+    store,
+    getLoadedModelKey: () => 'some-other-model',
+    getEngineIdle: fakeManagerIdle(0),
+    loadExplicit: async (k) => { loadCalls.push(k); return { target: 'http://127.0.0.1:8081' } },
+  }))
+  assert.deepEqual(loadCalls, ['pinned-model', 'some-other-model'])
+  assert.equal(store.listRoutineRuns(routine.id)[0].status, 'ok')
+})
+
 test('a failed pinned-model load records errored, never spawns, and never restores', async () => {
   const store = freshStore()
   const routine = codeRoutine(store)
@@ -289,6 +360,37 @@ test('a restore that throws is swallowed and never overwrites the run outcome', 
   const runs = store.listRoutineRuns(routine.id)
   assert.equal(runs[0].status, 'ok', 'the real outcome must survive a failed restore')
   assert.equal(runs[0].result, 'done')
+})
+
+test('M6: a restore that RETURNS 503 is warned about, not silently discarded', async () => {
+  // The common restore failure: a model that has since gone missing is signalled by loadExplicit
+  // RETURNING `{ status: 503 }`, not by throwing. Discarding it left the engine parked on the
+  // routine's pinned model with nothing at all in the log.
+  const store = freshStore()
+  const routine = codeRoutine(store)
+  const warnings: string[] = []
+  const realWarn = console.warn
+  console.warn = (...a: unknown[]) => { warnings.push(a.map(String).join(' ')) }
+  try {
+    let call = 0
+    await runCliCodeRoutine(routine, baseDeps({
+      store,
+      getLoadedModelKey: () => 'some-other-model',
+      loadExplicit: async () => {
+        call += 1
+        if (call === 2) return { status: 503, message: "No model matching 'some-other-model' found." }
+        return { target: 'http://127.0.0.1:8081' }
+      },
+    }))
+  } finally {
+    console.warn = realWarn
+  }
+
+  assert.equal(warnings.length, 1, `expected exactly one restore warning, got ${JSON.stringify(warnings)}`)
+  assert.match(warnings[0], /failed to restore the previously-loaded model 'some-other-model'/)
+  assert.match(warnings[0], /No model matching/)
+  const runs = store.listRoutineRuns(routine.id)
+  assert.equal(runs[0].status, 'ok', 'a failed restore must not overwrite the run outcome')
 })
 
 // ── Subprocess outcomes ───────────────────────────────────────────────────────────────────────
@@ -372,7 +474,77 @@ test('a permissionModeChoices probe that rejects is contained the same way', asy
     permissionModeChoices: async () => { throw new Error('help probe failed') },
     runProcess: neverSpawns(),
   }))
-  assert.equal(store.listRoutineRuns(routine.id)[0].status, 'errored')
+  const runs = store.listRoutineRuns(routine.id)
+  assert.equal(runs[0].status, 'errored')
+  // Without this the test is vacuous: `neverSpawns()`'s own AssertionError would ALSO be caught by
+  // the orchestrator and recorded as 'errored', so a regression that reached runProcess on this
+  // path would still leave the status assertion above green. The message is what tells the two
+  // apart.
+  assert.match(runs[0].error ?? '', /help probe failed/)
+  assert.doesNotMatch(runs[0].error ?? '', /runProcess must not be called/)
+})
+
+// ── Exception safety: no path may strand a run row at 'running' (spec 20 §6) ──────────────────
+
+test('an isAvailable() probe that rejects terminates the run instead of stranding it at running', async () => {
+  // The availability check runs before the model decision; when it was outside the try, a throw
+  // here left the row at status 'running' with no endedAt, closed out in production only by the
+  // scheduler's own .catch() — luck, not this function's contract.
+  const store = freshStore()
+  const routine = codeRoutine(store)
+  await runCliCodeRoutine(routine, baseDeps({
+    store,
+    isAvailable: async () => { throw new Error('preflight probe exploded') },
+    runProcess: neverSpawns(),
+  }))
+  const runs = store.listRoutineRuns(routine.id)
+  assert.equal(runs[0].status, 'errored', 'a throwing precondition must still reach a terminal status')
+  assert.match(runs[0].error ?? '', /preflight probe exploded/)
+  assert.equal(runs[0].endedAt, '2026-08-01T10:00:00.000Z')
+})
+
+test('a loadExplicit() that THROWS on the swap path terminates the run rather than stranding it', async () => {
+  // loadExplicit is only contracted not to throw for a MISSING MODEL — its scanner.list() /
+  // store.snapshot() / getSysInfo() / store.update() calls are unguarded, so a real throw here is
+  // reachable. This is the path the reviewer reproduced sitting at 'running' forever.
+  const store = freshStore()
+  const routine = codeRoutine(store)
+  await runCliCodeRoutine(routine, baseDeps({
+    store,
+    getLoadedModelKey: () => 'some-other-model',
+    loadExplicit: async () => { throw new Error('scanner exploded') },
+    runProcess: neverSpawns(),
+  }))
+  const runs = store.listRoutineRuns(routine.id)
+  assert.equal(runs[0].status, 'errored')
+  assert.match(runs[0].error ?? '', /scanner exploded/)
+  assert.ok(runs[0].endedAt, 'a terminal row must always carry endedAt')
+})
+
+test('a swap that throws leaves previousModel unset, so the finally attempts no restore', async () => {
+  const store = freshStore()
+  const routine = codeRoutine(store)
+  const loadCalls: string[] = []
+  await runCliCodeRoutine(routine, baseDeps({
+    store,
+    getLoadedModelKey: () => 'some-other-model',
+    loadExplicit: async (k) => { loadCalls.push(k); throw new Error('scanner exploded') },
+    runProcess: neverSpawns(),
+  }))
+  assert.deepEqual(loadCalls, ['pinned-model'], 'a swap that never completed must not schedule a restore')
+})
+
+test('a getEngineIdle() that throws is contained too', async () => {
+  const store = freshStore()
+  const routine = codeRoutine(store)
+  await runCliCodeRoutine(routine, baseDeps({
+    store,
+    getEngineIdle: () => { throw new Error('manager stats unavailable') },
+    runProcess: neverSpawns(),
+  }))
+  const runs = store.listRoutineRuns(routine.id)
+  assert.equal(runs[0].status, 'errored')
+  assert.match(runs[0].error ?? '', /manager stats unavailable/)
 })
 
 // ── Output parsing (spec 20 §7: a clean exit is not task success) ─────────────────────────────

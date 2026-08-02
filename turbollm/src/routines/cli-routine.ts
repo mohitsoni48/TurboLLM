@@ -4,7 +4,7 @@
 // decision (see the gate design note below for why it cannot share that wrapper's blocking
 // gate acquisition), so `execute.ts` wires it as a top-level sibling branch instead.
 //
-// ── Design note: the busy-check reads `gate.stats()`, it NEVER calls `gate.acquire()` ─────────
+// ── Design note: the busy-check NEVER calls `gate.acquire()` ──────────────────────────────────
 // `GenerationGate.acquire()` is a QUEUEING mutex (`gate.ts:65-118`): a caller that can't be
 // admitted immediately waits in line until a slot frees. That is exactly wrong here. Spec 20 §5
 // requires a routine to SKIP immediately when the engine is busy rather than queue indefinitely
@@ -14,15 +14,35 @@
 // slot while waiting for its subprocess to get that same slot can never make progress. THAT
 // gateway-side acquisition is what actually satisfies "a CLI-flavor run participates in
 // GenerationGate at background priority" end-to-end; this orchestrator adds nothing on top.
-// So the model-conflict input is a plain, non-blocking snapshot (`{ inFlight, queued, capacity }`)
-// with `inFlight < capacity` read as idle. Deliberately racy — a foreground request can start
-// between this read and the `loadExplicit()` below — in the same way `update-scheduler.ts`'s
-// `decideAutoUpdate({ idle })` takes a plain boolean rather than a lock.
+// So every input to the model-conflict decision is a plain, non-blocking snapshot. Deliberately
+// racy — a foreground request can start between the read and the `loadExplicit()` below — in the
+// same way `update-scheduler.ts`'s `decideAutoUpdate({ idle })` takes a plain boolean, not a lock.
 //
-// Note this is NOT the same signal `model-swap.ts` (the Chat/pi path) uses: that one computes
-// `engineIdle` from `engineIsIdle(manager)` (Manager's own activeRequests counter). Both are
-// non-blocking reads of "is something generating right now", and they agree for a single-slot
-// engine; reconciling them into one helper is a documented follow-up, not this task's scope.
+// ── Design note: `engineIdle` is TWO signals AND-ed, and `getEngineIdle` is the load-bearing one ─
+// `gate.stats()` alone is NOT a sufficient busy-check, and an earlier version of this comment
+// wrongly claimed it agreed with `model-swap.ts`'s `engineIsIdle(manager)` for a single-slot
+// engine. It does not, at any slot count: the main in-app chat streaming turn calls
+// `manager.generationStart()` (`chat-routes.ts:800`) and never touches the gate at all (the only
+// `gate.acquire` in that file is the low-priority auto-title at `:1419`). Reading the gate alone
+// therefore reports a live foreground chat conversation as IDLE — and swapping the engine's model
+// out from under it is precisely what spec 20 §5 ("never preempt a live foreground generation")
+// exists to prevent. A second, independent hole: `cli.ts:327` builds the gate with
+// `manager.parallelSlots() ?? Infinity`, and only llama.cpp's arg builder emits `--parallel`
+// (`profile.ts:531`) — so on vLLM/mlx-lm/koboldcpp `capacity === Infinity` and `inFlight < capacity`
+// is unconditionally true, making 'skip-busy' dead code.
+//
+// So `engineIdle` comes primarily from `getEngineIdle()`, which production wires to the SAME
+// `engineIsIdle(manager)` (`update-scheduler.ts:31`) that `model-swap.ts:43` — the Chat/pi path —
+// already uses; that one reads `manager.sessionStats().activeRequests`, i.e. the counter
+// `chat-routes.ts:800` increments, so it DOES see the chat turn. The gate snapshot is kept AND-ed
+// on top (`getEngineIdle() && inFlight < capacity`) because the two signals observe overlapping but
+// non-identical work: the gate additionally sees queued/in-flight agent + gateway acquisitions
+// (`memory.ts`, `code-session.ts`, `gateway.ts`, `execute.ts`) that may not yet have reached
+// Manager's counter. AND-ing is conservative in the only direction that is safe here — every extra
+// "busy" reading costs at most a deferred routine (it fires again next tick), while every missed
+// one costs a killed foreground generation. This is the same bias `engineIsIdle`'s own doc states
+// ("when in doubt, busy") and the same shape as `decideAutoUpdate({ policy, hasUpdate, idle })`,
+// which likewise only proceeds when every input agrees.
 //
 // ── Design note: model restore, and the SPEC-GAP when nothing was loaded ──────────────────────
 // Per spec 20 §5, after a `swap-then-run` the previously-loaded model is restored once the run
@@ -56,6 +76,15 @@ export interface CliRoutineDeps {
    *  `manager.status().model?.key ?? null`. Kept as a thin function rather than the whole Manager
    *  so tests don't have to fake Manager's full surface. */
   getLoadedModelKey: () => string | null
+  /** Is the engine free to have its model swapped out right now? Wire this to
+   *  `engineIsIdle(manager)` (`engines/update-scheduler.ts`) — the SAME call `model-swap.ts:43`
+   *  makes for the Chat/pi path — and nothing else: it reads
+   *  `manager.sessionStats().activeRequests`, which is the only signal that observes the main
+   *  in-app chat stream (`chat-routes.ts:800`'s `manager.generationStart()`). Do NOT substitute a
+   *  `gate.stats()` read here; see this module's `engineIdle` design note for why that alone would
+   *  hot-swap the model out from under a live foreground chat turn. Kept as a thin function rather
+   *  than the whole Manager so tests don't have to fake Manager's full surface. */
+  getEngineIdle: () => boolean
   /** `ModelRouter.loadExplicit`, or an equivalent. Returns `{ target }` on success and
    *  `{ status: 503, message }` on failure — it does not throw for a missing model. */
   loadExplicit: (modelKey: string) => Promise<RouteResult>
@@ -101,38 +130,53 @@ export async function runCliCodeRoutine(routine: Routine, deps: CliRoutineDeps):
     deps.store.updateRoutineRun(run.id, { ...patch, endedAt: deps.now().toISOString() })
   }
 
-  // 1. Availability precondition (spec 20 §6) — checked BEFORE touching the model or the gate at
-  // all: there is no point deciding a swap for a CLI that cannot run anyway.
-  if (!(await deps.isAvailable())) {
-    finish({ status: 'skipped', skipReason: 'cli_unavailable' })
-    return
-  }
-
-  // 2. Model-conflict decision (spec 20 §5) — a non-blocking snapshot read, never an acquire().
-  // See this module's gate design note for why that distinction is load-bearing.
-  const pinnedModel = routine.modelKey
-  const currentlyLoaded = deps.getLoadedModelKey()
-  const { inFlight, capacity } = deps.gate.stats()
-  const action = decideModelAction({ pinnedModel, currentlyLoaded, engineIdle: inFlight < capacity })
-  if (action === 'skip-busy') {
-    finish({ status: 'skipped', skipReason: 'model_busy' })
-    return
-  }
-
+  // Declared OUTSIDE the try so the finally can see it on every exit path — including ones that
+  // throw before the swap ever happens, where it must still read `null` so no restore is attempted.
   let previousModel: string | null = null
-  if (action === 'swap-then-run') {
-    const swapResult = await deps.loadExplicit(pinnedModel)
-    if ('status' in swapResult) {
-      // The swap never happened, so there is nothing loaded-by-us to restore — same call the
-      // Chat/pi path makes for its own 'skip-load-failed' outcome (model-swap.ts:53).
-      finish({ status: 'errored', error: `Could not load pinned model '${pinnedModel}': ${swapResult.message}` })
+
+  // The exception boundary opens HERE, immediately after the run row exists, and covers the WHOLE
+  // body — availability probe, conflict decision, swap, spawn, parse. Anything narrower strands the
+  // row at 'running' with no `endedAt` when an earlier step throws: `deps.isAvailable()` is an
+  // injected seam, and `ModelRouter.loadExplicit` is only documented not to throw FOR A MISSING
+  // MODEL — its `scanner.list()`/`store.snapshot()`/`getSysInfo()`/`store.update()` calls are all
+  // unguarded (`model-router.ts:102-106`, `:217-239`). A stranded 'running' row is the one outcome
+  // spec 20 §6 rules out, and it must not depend on the caller happening to have its own `.catch()`.
+  try {
+    // 1. Availability precondition (spec 20 §6) — checked BEFORE touching the model or the gate at
+    // all: there is no point deciding a swap for a CLI that cannot run anyway.
+    if (!(await deps.isAvailable())) {
+      finish({ status: 'skipped', skipReason: 'cli_unavailable' })
       return
     }
-    // Only recorded AFTER a successful swap: a failed load must not schedule a restore.
-    previousModel = currentlyLoaded
-  }
 
-  try {
+    // 2. Model-conflict decision (spec 20 §5) — non-blocking snapshot reads, never an acquire().
+    // See this module's design notes for why that distinction is load-bearing, and why BOTH the
+    // Manager-level idle read and the gate snapshot have to agree before a swap is allowed.
+    const pinnedModel = routine.modelKey
+    const currentlyLoaded = deps.getLoadedModelKey()
+    const { inFlight, capacity } = deps.gate.stats()
+    const action = decideModelAction({
+      pinnedModel,
+      currentlyLoaded,
+      engineIdle: deps.getEngineIdle() && inFlight < capacity,
+    })
+    if (action === 'skip-busy') {
+      finish({ status: 'skipped', skipReason: 'model_busy' })
+      return
+    }
+
+    if (action === 'swap-then-run') {
+      const swapResult = await deps.loadExplicit(pinnedModel)
+      if ('status' in swapResult) {
+        // The swap never happened, so there is nothing loaded-by-us to restore — same call the
+        // Chat/pi path makes for its own 'skip-load-failed' outcome (model-swap.ts:53).
+        finish({ status: 'errored', error: `Could not load pinned model '${pinnedModel}': ${swapResult.message}` })
+        return
+      }
+      // Only recorded AFTER a successful swap: a failed load must not schedule a restore.
+      previousModel = currentlyLoaded
+    }
+
     // 3. Build the non-interactive invocation. A session-scoped token (session-auth.ts) gives this
     // run's gateway traffic the same clean per-session attribution a live terminal session gets.
     const token = sessionAuth.mint(run.id)
@@ -169,9 +213,12 @@ export async function runCliCodeRoutine(routine: Routine, deps: CliRoutineDeps):
     const parsed = parseClaudeCliStreamJson(result.stdout)
     finish(parsed.success ? { status: 'ok', result: parsed.resultText } : { status: 'errored', error: parsed.resultText })
   } catch (e) {
-    // `runClaudeCliProcess` contracts never to reject, but `runProcess` is an injected seam and
-    // `permissionModeChoices()`/`mint()` are their own code paths. Without this the run row would
-    // be left pinned at 'running' forever, which is the one outcome spec 20 §6 rules out.
+    // Every step above lands here: `isAvailable()`, `getLoadedModelKey()`, `gate.stats()`,
+    // `getEngineIdle()`, `loadExplicit()`, `mint()`, `permissionModeChoices()` and `runProcess()`
+    // are all injected seams or genuinely-throwing code paths (`runClaudeCliProcess` itself
+    // contracts never to reject, but the seam it is injected through carries no such promise).
+    // Without this the run row would be left pinned at 'running' forever, which is the one outcome
+    // spec 20 §6 rules out.
     finish({ status: 'errored', error: `claude CLI routine failed: ${e instanceof Error ? e.message : String(e)}` })
   } finally {
     // 6. Revoke the session-scoped token regardless of outcome — mirrors terminal-routes.ts's
@@ -183,7 +230,14 @@ export async function runCliCodeRoutine(routine: Routine, deps: CliRoutineDeps):
     // outcome with an unrelated error and leave the caller with no result at all.
     if (previousModel) {
       try {
-        await deps.loadExplicit(previousModel)
+        const restoreResult = await deps.loadExplicit(previousModel)
+        // A restore that RETURNS `{ status: 503 }` is the COMMON failure — a model that has since
+        // gone missing is exactly the case `loadExplicit` signals by returning rather than throwing
+        // (`model-router.ts:104`). Discarding it would leave the engine sitting on the routine's
+        // pinned model with nothing anywhere in the log. Same warn as the throw path, deliberately.
+        if ('status' in restoreResult) {
+          console.warn(`[routines] failed to restore the previously-loaded model '${previousModel}' after a CLI routine run: ${restoreResult.message}`)
+        }
       } catch (e) {
         console.warn(`[routines] failed to restore the previously-loaded model after a CLI routine run: ${e instanceof Error ? e.message : String(e)}`)
       }
