@@ -18,6 +18,7 @@ import type { Routine, RoutineRun } from './schema'
 import type { CodeMode } from '../code/persona'
 import { toolsForMode } from '../code/persona'
 import { stallRoutineRun, type PendingRoutineToolCall } from './approval'
+import { resolveToolApproval } from '../tools/approval-gate'
 
 export type CodeRunOutcome =
   | { status: 'ok'; result: string }
@@ -30,7 +31,10 @@ export async function runCodeRoutine(d: Deps, routine: Routine, run: RoutineRun,
   if (!routine.workspacePath) return { status: 'errored', error: 'This routine has no workspace path configured.' }
   if (!d.codeRuns) return { status: 'errored', error: 'Code execution is not available (codeRuns not wired).' }
 
-  const mode = (routine.permissionMode ?? 'auto') as CodeMode
+  // M3: Routine['permissionMode'] and CodeMode are the exact same literal union
+  // ('auto'|'plan'|'ask') — an explicit annotation lets the compiler verify that instead of an
+  // unchecked `as CodeMode` silently masking a future divergence between the two types.
+  const mode: CodeMode = routine.permissionMode ?? 'auto'
   const conv = d.db.createConversation({ kind: 'code', modelKey: routine.modelKey })
   d.db.setConversationMode(conv.id, mode)
   const agentRun = d.db.createAgentRun({ convId: conv.id, title: routine.prompt.slice(0, 60), allowedTools: toolsForMode(mode) ?? [], repoRoot: routine.workspacePath, codeAgent: 'pi' })
@@ -46,7 +50,16 @@ export async function runCodeRoutine(d: Deps, routine: Routine, run: RoutineRun,
 export async function resumeCodeRoutine(
   d: Deps, routine: Routine, run: RoutineRun, pending: PendingRoutineToolCall, decision: 'allow' | 'deny', signal: AbortSignal,
 ): Promise<CodeRunOutcome> {
-  if (decision === 'deny') return { status: 'errored', error: `Tool call "${pending.call.name}" denied by user.` }
+  if (decision === 'deny') {
+    // M2: clear the stall's resume point — leaving a stale pendingToolCall on an otherwise-
+    // terminal (denied) run lets a later reader mistake "already denied" for "still awaiting a
+    // decision". Status/error/endedAt are left to the caller (routine-routes.ts / the scheduler),
+    // matching this file's existing convention of never persisting terminal RoutineRun status
+    // itself (the 'ok' path below doesn't either) — this only clears the field this file itself
+    // owns writing (stallRoutineRun's own pendingToolCall column).
+    d.db.updateRoutineRun(run.id, { pendingToolCall: '' })
+    return { status: 'errored', error: `Tool call "${pending.call.name}" denied by user.` }
+  }
   if (!d.codeRuns) return { status: 'errored', error: 'Code execution is not available (codeRuns not wired).' }
 
   const sessionId = pending.sessionId ?? pending.convId
@@ -54,43 +67,93 @@ export async function resumeCodeRoutine(
   if (!agentRun) return { status: 'errored', error: "The routine's session no longer exists." }
   const conv = d.db.getConversation(pending.convId)
   if (!conv) return { status: 'errored', error: "The routine's conversation no longer exists." }
+  // M1: an empty repoRoot would silently become the containment root (isContainedFromRoot('', ''))
+  // rather than failing loudly — error out instead of falling back to ''.
+  const repoRoot = agentRun.repoRoot ?? routine.workspacePath
+  if (!repoRoot) return { status: 'errored', error: "The routine's session has no workspace path." }
 
-  // Bug found via tracing (not in the brief's original text): resuming ALWAYS starts a fresh
-  // continuation turn — a brand-new pi tool invocation with a brand-new toolCallId (see module
-  // comment). Under 'auto' mode that's harmless, since auto has no per-call approval gate at all
-  // (code-session.ts: "auto → containment only, no approval await"). But under 'ask' mode, EVERY
-  // mutating tool call — including the retried, already-approved one — passes through
-  // code-session.ts's own LIVE waitForToolApproval() gate (tools/approval-gate.ts), keyed by
-  // `${convId}:${toolCallId}`. Since the retry gets a brand-new toolCallId, there is no way to
-  // have pre-resolved its approval, and nothing here re-resolves it either — so leaving the
-  // continuation turn in 'ask' mode means the "approved" action hits the identical live gate
-  // again and immediately re-stalls, before it ever actually executes. The routine's own "allow"
-  // decision would never really unlock anything: an infinite stall→resume→re-stall loop, exactly
-  // the class of defect Task 6's sibling runner hit (its own "C1 fix" widens the tool allow-list
-  // for just the one approved call rather than re-gating it). The fix here is the same idea
-  // applied to a live-turn permission MODE instead of a static allow-list: widen just this one
-  // resumed continuation turn's conversation mode to 'auto' so the approved action actually runs.
-  // This never touches the routine's own configured permissionMode (routine.permissionMode is
-  // read fresh, unchanged, on the NEXT scheduled fire — runCodeRoutine always starts its own new
-  // conversation) and never widens anything beyond this single resume's conversation.
-  if (conv.agentMode === 'ask') d.db.setConversationMode(conv.id, 'auto')
+  // C1 fix (superseding an earlier, REJECTED fix that widened conv.agentMode to 'auto' for the
+  // whole resumed turn — reviewer found that unsafe: it granted the model unlimited unapproved
+  // access for the entire continuation turn, permanently, since nothing ever restored the mode
+  // afterward, and the session is visible/reusable via the live Code UI). The correct fix is a
+  // ONE-SHOT approval bypass keyed to the SPECIFIC approved call, leaving conv.agentMode
+  // untouched: resuming always starts a fresh continuation turn — a brand-new pi tool invocation
+  // with a brand-new toolCallId (see module comment) — so under 'ask' mode the retried call would
+  // otherwise hit code-session.ts's own live waitForToolApproval() gate (tools/approval-gate.ts)
+  // again, with a key nothing has pre-resolved, and re-stall before ever executing. Instead,
+  // driveCodeSession below watches for the awaiting_approval event whose name+args match this
+  // EXACT approved call and resolves just that one key via resolveToolApproval — once, fail-
+  // closed for anything else (a different tool, different args, or a repeat of the same call
+  // later in the turn all still take the normal durable-stall path). See this same idea in Task
+  // 6's sibling "C1 fix" (chat-runner.ts's resumeChatRoutine widening the allow-list for just the
+  // one approved call) — this is that pattern applied to a live per-call gate instead of a static
+  // allow-list.
+  const approvedCall = { name: pending.call.name, args: pending.call.args }
 
   const task = `[SYSTEM: resuming after approval. The tool call ${pending.call.name}(${JSON.stringify(pending.call.args)}) was approved by the user — proceed with it and continue the original task.]`
   const userMsg = d.db.addMessage(pending.convId, 'user', task)
-  return driveCodeSession(d, run, sessionId, pending.convId, agentRun.repoRoot ?? routine.workspacePath ?? '', task, userMsg.id, signal)
+  return driveCodeSession(d, run, sessionId, pending.convId, repoRoot, task, userMsg.id, signal, approvedCall)
 }
 
-async function driveCodeSession(d: Deps, run: RoutineRun, sessionId: string, convId: string, repoRoot: string, task: string, userMsgId: string, signal: AbortSignal): Promise<CodeRunOutcome> {
+/** Bounded retry for resolveToolApproval: the subscriber can observe the awaiting_approval event
+ *  a microtask or two BEFORE code-session.ts's own `await waitForToolApproval(key, signal)` call
+ *  has actually registered `key` in the gate's pending map — code-session.ts emits the sink event
+ *  FIRST (`await sink(...)`, an extra await/microtask hop even though the sink itself is
+ *  synchronous) and only calls waitForToolApproval on the NEXT line, so a live subscriber that
+ *  reacts to the sink's emit can genuinely race ahead of the registration. A bare one-shot
+ *  `resolveToolApproval` call would then find nothing pending and return false, silently losing
+ *  the approval. Retrying across a few real ticks (not just microtasks — the exact number of
+ *  microtask hops between the two calls isn't a contract this file should depend on) reliably
+ *  wins that race without meaningfully delaying a real routine run. */
+async function resolveApprovalWithRetry(convId: string, toolCallId: string, decision: 'allow' | 'deny', attempts = 20): Promise<boolean> {
+  const key = `${convId}:${toolCallId}`
+  for (let i = 0; i < attempts; i++) {
+    if (resolveToolApproval(key, decision)) return true
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+  }
+  return false
+}
+
+function sameArgs(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
+  return JSON.stringify(a) === JSON.stringify(b)
+}
+
+async function driveCodeSession(
+  d: Deps, run: RoutineRun, sessionId: string, convId: string, repoRoot: string, task: string, userMsgId: string, signal: AbortSignal,
+  approvedCall?: { name: string; args: Record<string, unknown> },
+): Promise<CodeRunOutcome> {
   const codeRuns = d.codeRuns!
   const onDeadline = () => codeRuns.stop(sessionId)
   signal.addEventListener('abort', onDeadline, { once: true })
   codeRuns.enqueue(sessionId, { convId, repoRoot, task, userMsgId })
 
+  // I1 fix: enqueue() may have QUEUED this turn behind a still-unwinding previous one (a stop()
+  // aborts pi's AbortController, but the actual pi/provider call can take real time — measured
+  // ~1.5s in a realistic scenario — to actually settle; CodeRunManager.pump()'s finally, which
+  // clears s.active and starts the next queued turn, only runs once that settles). Blindly
+  // reading the first event(s) from subscribe() in that case replays events that still belong to
+  // the turn we just stopped (including its own eventual terminal 'done'/aborted frame) — which
+  // this function would misread as ITS OWN outcome, discarding the freshly-queued (and not yet
+  // even started) approved work. Every event is therefore ignored until this turn's OWN 'meta'
+  // start frame is observed (CodeRunManager pushes exactly one, keyed by userMessageId, at the
+  // moment a turn actually begins) — true whether enqueue() started immediately or queued.
+  let sawOwnStart = false
+  let usedApprovalBypass = false
+
   try {
     for await (const ev of codeRuns.subscribe(sessionId, 0)) {
+      if (!sawOwnStart) {
+        if (ev.event === 'meta' && (ev.data as { userMessageId?: string }).userMessageId === userMsgId) sawOwnStart = true
+        continue
+      }
       if (ev.event === 'tool_call') {
         const data = ev.data as { id: string; name: string; args: Record<string, unknown>; status: string }
         if (data.status === 'awaiting_approval') {
+          if (approvedCall && !usedApprovalBypass && data.name === approvedCall.name && sameArgs(data.args, approvedCall.args)) {
+            usedApprovalBypass = true // one-shot: a later repeat of the same call is NOT auto-approved
+            if (await resolveApprovalWithRetry(convId, data.id, 'allow')) continue
+            // Lost the race even after retrying — fail closed, same as an unmatched call below.
+          }
           stallRoutineRun(d.db, run.id, { convId, sessionId, assistantContent: '', precedingCalls: [], call: { id: data.id, name: data.name, args: data.args } })
           codeRuns.stop(sessionId) // never hold the shared model/gate hostage for an unbounded human wait
           return { status: 'needs_approval' }

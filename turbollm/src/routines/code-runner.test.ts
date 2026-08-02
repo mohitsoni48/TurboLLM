@@ -10,7 +10,7 @@ import type { Routine } from './schema'
 import { parsePendingToolCall, type PendingRoutineToolCall } from './approval'
 import type { Deps } from '../deps'
 import type { CodeSessionRunner } from '../code/code-run-manager'
-import type { CodeMode } from '../code/persona'
+import { waitForToolApproval } from '../tools/approval-gate'
 
 function freshStore(): ConversationStore {
   return new ConversationStore(mkdtempSync(join(tmpdir(), 'code-runner-test-')))
@@ -114,7 +114,7 @@ test('resumeCodeRoutine on allow starts a fresh continuation turn on the same co
   assert.ok(messages.some((m) => m.role === 'user' && m.content.includes('bash')))
 })
 
-// ── Regression: 'ask'-mode resume must actually unblock the approved call ─────────────────
+// ── Regression: 'ask'-mode resume must unblock ONLY the approved call (C1) ────────────────
 //
 // Found via tracing, NOT in the brief's original spec: the module's own design note says
 // resuming ALWAYS starts a fresh continuation turn (a brand-new pi tool-call invocation with a
@@ -126,51 +126,126 @@ test('resumeCodeRoutine on allow starts a fresh continuation turn on the same co
 // `${convId}:${toolCallId}`. Since the retried call gets a BRAND NEW toolCallId, there is no way
 // to have pre-resolved its approval; leaving the continuation turn in 'ask' mode means the
 // "approved" action hits the identical gate again and re-stalls immediately, before it ever
-// executes — the routine's "allow" decision never actually unlocks anything, an infinite
-// stall-resume-restall loop. This mirrors Task 6's own "C1 fix" (chat-runner.ts resumeChatRoutine
-// widening agentAllowedTools for just the one approved call) for the in-app-pi flavor: the fix
-// widens the ONE resumed continuation turn's conversation mode to 'auto' (never touching the
-// routine's own configured permissionMode, and never affecting the NEXT scheduled fire, which
-// always starts its own fresh conversation via runCodeRoutine and reads routine.permissionMode
-// fresh again).
-test('resumeCodeRoutine on allow actually unblocks an ask-mode-gated call instead of re-stalling it', async () => {
+// executes — the routine's "allow" decision never actually unlocks anything.
+//
+// An EARLIER fix here widened conv.agentMode to 'auto' for the whole resumed turn — code review
+// (driving this file live with realistic fake runners) found that unsafe: bash has zero
+// containment in ANY mode, so widening the WHOLE turn meant an approved `bash "git status"`
+// could be followed, in the SAME ungated turn, by an unapproved `bash "rm -rf /important-dir"` —
+// and the mode was never restored afterward (a plain DB write, no finally/revert), so the
+// routine's own configured 'ask' policy stayed silently defeated forever, even for a human later
+// opening the same session in the live Code UI. The corrected fix (below) is a ONE-SHOT approval
+// bypass keyed to the SPECIFIC approved call — conv.agentMode is never touched. This test proves
+// the property that actually matters: the approved call executes for real, but a SECOND,
+// different mutating call the user was never asked about still durably re-stalls instead of
+// running, and the conversation's mode is provably unchanged throughout.
+test('resumeCodeRoutine on allow unblocks only the approved call — a different unapproved mutating call still durably stalls (C1)', async () => {
   const store = freshStore()
   const routine = codeRoutine(store, { permissionMode: 'ask' })
   const run = store.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
 
-  const capturedModes: CodeMode[] = []
-  let call = 0
+  const approvedArgs = { command: 'git status' }
+  const unapprovedArgs = { command: 'rm -rf /important-dir' }
+  const executed: string[] = []
+
+  // A fake runner that behaves like code-session.ts's own real ask-mode gate for a mutating
+  // tool: emit awaiting_approval, then actually await the REAL waitForToolApproval() (not a
+  // canned/scripted decision) — so this test exercises the real gate + resolveApprovalWithRetry
+  // race, not just a hand-picked event sequence.
+  let turnIndex = 0
+  let callSeq = 0
+  const plans: Array<Array<{ name: string; args: Record<string, unknown> }>> = [
+    [{ name: 'bash', args: approvedArgs }],                                          // turn 1 (original run): stalls here
+    [{ name: 'bash', args: approvedArgs }, { name: 'bash', args: unapprovedArgs }],   // turn 2 (resume): retried+approved, then a NEW unapproved call
+  ]
   const runner: CodeSessionRunner = (async (params) => {
-    capturedModes.push(params.mode)
-    call++
-    if (call === 1) {
-      // First turn: the model attempts a mutating call; 'ask' mode gates it (mirrors
-      // code-session.ts's real awaiting_approval emission for MUTATING_TOOLS under 'ask').
-      await params.sink({ event: 'tool_call', data: { id: 'c1', name: 'bash', args: { command: 'ls' }, status: 'awaiting_approval' } })
-      await new Promise<void>((resolve) => params.signal.addEventListener('abort', () => resolve(), { once: true }))
-      return { finalText: '', contextUsed: 0, contextMax: 0, aborted: true }
+    const plan = plans[turnIndex++] ?? []
+    for (const step of plan) {
+      const id = `c${++callSeq}`
+      if (params.mode === 'ask') {
+        await params.sink({ event: 'tool_call', data: { id, name: step.name, args: step.args, status: 'awaiting_approval' } })
+        const decision = await waitForToolApproval(`${params.convId}:${id}`, params.signal)
+        if (decision === 'deny') {
+          await params.sink({ event: 'tool_call', data: { id, name: step.name, args: step.args, status: 'error', result: 'denied by user' } })
+          return { finalText: '', contextUsed: 0, contextMax: 0, aborted: true }
+        }
+      }
+      executed.push(`${step.name}(${JSON.stringify(step.args)})`)
+      await params.sink({ event: 'tool_call', data: { id, name: step.name, args: step.args, status: 'done', result: 'ok' } })
     }
-    // Second turn (the resume's fresh continuation turn): if mode were still 'ask' here, a real
-    // pi agent retrying the SAME bash call would hit the identical live gate again with a new
-    // toolCallId and re-stall — nothing in this test simulates that re-stall explicitly because
-    // the point being verified is upstream of it: the continuation turn must not even be started
-    // in 'ask' mode in the first place.
     return { finalText: 'done', contextUsed: 0, contextMax: 0, aborted: false }
   }) as CodeSessionRunner
 
   const d = depsWith(store, runner)
   const outcome1 = await runCodeRoutine(d, routine, run, new AbortController().signal)
   assert.deepEqual(outcome1, { status: 'needs_approval' })
-  assert.equal(capturedModes[0], 'ask')
 
-  const reloaded = store.getRoutineRun(run.id)
-  const pending = parsePendingToolCall(reloaded?.pendingToolCall)
+  const pending = parsePendingToolCall(store.getRoutineRun(run.id)?.pendingToolCall)
   assert.ok(pending, 'expected a persisted pending tool call')
+  const modeBeforeResume = store.getConversation(pending!.convId)?.agentMode
+  assert.equal(modeBeforeResume, 'ask')
 
   const outcome2 = await resumeCodeRoutine(d, routine, run, pending!, 'allow', new AbortController().signal)
+
+  // (a) the approved call's result actually reached execution for real.
+  assert.ok(executed.includes(`bash(${JSON.stringify(approvedArgs)})`), 'the approved call should have actually executed')
+  // (b) the second, unapproved call did NOT execute, and instead caused a fresh durable stall.
+  assert.ok(!executed.includes(`bash(${JSON.stringify(unapprovedArgs)})`), 'the unapproved call must never execute')
+  assert.equal(outcome2.status, 'needs_approval')
+  const reloaded2 = store.getRoutineRun(run.id)
+  assert.match(reloaded2?.pendingToolCall ?? '', /rm -rf/)
+  // (c) conv.agentMode is unchanged from before the resume — the routine's 'ask' policy still
+  // applies to everything else, both for the rest of this run and for a human reopening the
+  // session live afterward.
+  assert.equal(store.getConversation(pending!.convId)?.agentMode, 'ask')
+})
+
+// ── Regression: a resume issued while the stalled turn is still unwinding must not read its
+// stale events (I1) ──────────────────────────────────────────────────────────────────────────
+//
+// Found via tracing: driveCodeSession's stall path calls CodeRunManager.stop(), which only
+// ABORTS the live turn's AbortController — the underlying pi/provider call can take real time to
+// actually settle (CodeRunManager.pump()'s finally, which clears the session's active turn and
+// starts the next QUEUED one, only runs once that settles). A resume issued before that unwind
+// finishes has its own turn merely QUEUED by enqueue() (see its {queued} return), and the very
+// next subscribe() call replays whatever is still buffered from the turn that was just
+// stopped — including that turn's own eventual terminal 'done'/aborted frame — which, before the
+// fix, this function would misread as ITS OWN outcome and return prematurely, silently
+// discarding the freshly-queued (and not-yet-even-started) approved work.
+test('resumeCodeRoutine does not mistake a still-unwinding previous stall for its own outcome (I1)', async () => {
+  const store = freshStore()
+  const routine = codeRoutine(store, { permissionMode: 'ask' })
+  const run = store.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+
+  const executed: string[] = []
+  let turn = 0
+  const runner: CodeSessionRunner = (async (params) => {
+    turn++
+    if (turn === 1) {
+      await params.sink({ event: 'tool_call', data: { id: 'c1', name: 'bash', args: { command: 'git status' }, status: 'awaiting_approval' } })
+      const decision = await waitForToolApproval(`${params.convId}:c1`, params.signal)
+      // Simulate the real, non-trivial time an aborted pi/provider call can take to actually
+      // unwind (a realistic scenario measured ~1.5s) — deliberately slower than the synchronous
+      // dispatch of resumeCodeRoutine() below, so the resume's enqueue() is GUARANTEED to still
+      // observe this turn active (queued: true), forcing the exact race this test targets.
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      return { finalText: '', contextUsed: 0, contextMax: 0, aborted: decision === 'deny' }
+    }
+    // turn 2: the resumed continuation turn — must actually run and be observed, not discarded.
+    executed.push('turn2-ran')
+    await params.sink({ event: 'tool_call', data: { id: 'c2', name: 'bash', args: { command: 'git status' }, status: 'done', result: 'ok' } })
+    return { finalText: 'done', contextUsed: 0, contextMax: 0, aborted: false }
+  }) as CodeSessionRunner
+
+  const d = depsWith(store, runner)
+  const outcome1 = await runCodeRoutine(d, routine, run, new AbortController().signal)
+  assert.deepEqual(outcome1, { status: 'needs_approval' })
+
+  const pending = parsePendingToolCall(store.getRoutineRun(run.id)?.pendingToolCall)
+  assert.ok(pending, 'expected a persisted pending tool call')
+
+  // Issued immediately — turn 1's 50ms unwind delay has NOT elapsed yet.
+  const outcome2 = await resumeCodeRoutine(d, routine, run, pending!, 'allow', new AbortController().signal)
   assert.equal(outcome2.status, 'ok')
-  // The bug: without the fix, capturedModes[1] would still read 'ask' (conv.agentMode was never
-  // widened), even though nothing re-resolves the live per-call approval gate for the brand-new
-  // toolCallId the retried call would get in a real pi run.
-  assert.equal(capturedModes[1], 'auto')
+  assert.ok(executed.includes('turn2-ran'), 'the resumed turn must actually have run, not been discarded')
 })
