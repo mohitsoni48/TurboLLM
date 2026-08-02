@@ -7,7 +7,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ConversationStore } from '../chat/db'
 import { registerRoutineRoutes } from './routine-routes'
+import { RoutineScheduler } from './scheduler'
+import { executeRoutine } from './execute'
 import type { Deps } from '../deps'
+import type { Manager } from '../engines/manager'
+import type { ModelRouter } from '../gateway/model-router'
+import type { GenerationGate } from '../agents/gate'
 
 const RAW_KEY = 'tllm-TestKeyTestKeyTestKeyTestKeyTestKey1'
 const RAW_KEY_HASH = createHash('sha256').update(RAW_KEY).digest('hex')
@@ -349,4 +354,182 @@ test('PUT /api/v1/routines/:id/pause on an active routine still succeeds and cle
   const paused = (await res.json()) as { status: string; nextFireAt: string | null }
   assert.equal(paused.status, 'paused')
   assert.equal(paused.nextFireAt, null)
+})
+
+// ── run-now / approve / deny (Task 9) ─────────────────────────────────────────
+
+test('POST /api/v1/routines/:id/run-now fires immediately via the shared scheduler', async () => {
+  const { db } = testApp()
+  const created = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', agentId: 'a' })
+  db.confirmRoutine(created.id, '2099-01-01T00:00:00.000Z')
+  const fired: string[] = []
+  const scheduler = new RoutineScheduler({ store: db, now: () => new Date(), runRoutine: async (r) => { fired.push(r.id); return 'ok' } })
+  const app2 = new Hono()
+  registerRoutineRoutes(app2, { db, routineScheduler: scheduler } as unknown as Deps)
+
+  const res = await app2.request(`/api/v1/routines/${created.id}/run-now`, { method: 'POST' })
+  assert.equal(res.status, 202)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(fired, [created.id])
+})
+
+test('POST /api/v1/routines/:id/run-now on a pending_confirmation routine returns 409', async () => {
+  const { db } = testApp()
+  const created = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', agentId: 'a' })
+  const scheduler = new RoutineScheduler({ store: db, now: () => new Date(), runRoutine: async () => 'ok' })
+  const app2 = new Hono()
+  registerRoutineRoutes(app2, { db, routineScheduler: scheduler } as unknown as Deps)
+  const res = await app2.request(`/api/v1/routines/${created.id}/run-now`, { method: 'POST' })
+  assert.equal(res.status, 409)
+})
+
+test('POST /api/v1/routines/:id/run-now returns 503 when no scheduler is wired', async () => {
+  const { app, db } = testApp()
+  const created = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', agentId: 'a' })
+  db.confirmRoutine(created.id, new Date().toISOString())
+  const res = await app.request(`/api/v1/routines/${created.id}/run-now`, { method: 'POST' })
+  assert.equal(res.status, 503)
+})
+
+test('POST /api/v1/routines/:id/run-now on an unknown routine returns 404', async () => {
+  const { db } = testApp()
+  const scheduler = new RoutineScheduler({ store: db, now: () => new Date(), runRoutine: async () => 'ok' })
+  const app2 = new Hono()
+  registerRoutineRoutes(app2, { db, routineScheduler: scheduler } as unknown as Deps)
+  const res = await app2.request('/api/v1/routines/missing/run-now', { method: 'POST' })
+  assert.equal(res.status, 404)
+})
+
+test('POST .../runs/:runId/approve on a run that is not needs_approval returns 409', async () => {
+  const { app, db } = testApp()
+  const created = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'a' })
+  const run = db.createRoutineRun({ routineId: created.id, configSnapshot: JSON.stringify(created) })
+  db.updateRoutineRun(run.id, { status: 'ok' })
+  const res = await app.request(`/api/v1/routines/${created.id}/runs/${run.id}/approve`, { method: 'POST' })
+  assert.equal(res.status, 409)
+})
+
+test('POST .../runs/:runId/deny on an unknown run returns 404', async () => {
+  const { app, db } = testApp()
+  const created = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'a' })
+  const res = await app.request(`/api/v1/routines/${created.id}/runs/missing-run/deny`, { method: 'POST' })
+  assert.equal(res.status, 404)
+})
+
+test('POST .../runs/:runId/approve on a run for a DIFFERENT routine returns 404 (id/runId must match)', async () => {
+  const { app, db } = testApp()
+  const created = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'a' })
+  const otherRoutine = db.createRoutine({ flavor: 'chat', prompt: 'y', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'a' })
+  const run = db.createRoutineRun({ routineId: otherRoutine.id, configSnapshot: JSON.stringify(otherRoutine) })
+  const res = await app.request(`/api/v1/routines/${created.id}/runs/${run.id}/approve`, { method: 'POST' })
+  assert.equal(res.status, 404)
+})
+
+// ── approve/deny release the scheduler's parked-routine guard (Task 9's double-fire fix) ──
+// scheduler.ts keeps a routine parked (in its `inFlight` set) once a fire resolves to
+// 'needs_approval', so a tick can't fire it again while parked. Only these two routes ever
+// resolve that stall (resumeRoutineRun is never called from the scheduler's own tick path), so
+// they are the only place that can release the guard — proven end-to-end here via the real
+// scheduler, not just by unit-testing releaseParked() in isolation.
+//
+// The stub `runRoutine` below parks the run WITHOUT a real pendingToolCall (unlike the actual
+// chat/code runners), so `resumeRoutineRun` itself fails with 'corrupt_pending_call' — a
+// PERMANENT failure (no future approve/deny could ever parse that pendingToolCall either), which
+// is exactly the case routine-routes.ts's `releaseParkedIfResolved` must still release, per the
+// task brief's "even a denied/failed resume must release the parked slot, or the routine would
+// be stuck unable to ever fire again."
+
+test('approve releases the scheduler-parked routine once resumeRoutineRun settles, even on failure', async () => {
+  const db = new ConversationStore(mkdtempSync(join(tmpdir(), 'routine-routes-test-')))
+  const app = new Hono()
+  const routine = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'a' })
+  db.confirmRoutine(routine.id, '2020-01-01T00:00:00.000Z')
+  const fired: string[] = []
+  const scheduler = new RoutineScheduler({
+    store: db, now: () => new Date(),
+    runRoutine: async (r) => { fired.push(r.id); return 'needs_approval' },
+  })
+  registerRoutineRoutes(app, { db, routineScheduler: scheduler } as unknown as Deps)
+
+  await scheduler.tick() // fires and parks — inFlight now holds the routine
+  await new Promise((resolve) => setImmediate(resolve))
+  const [run] = db.listRoutineRuns(routine.id)
+  assert.equal(run.status, 'needs_approval')
+  assert.deepEqual(fired, [routine.id])
+
+  // A second tick must not be able to fire it again while parked.
+  await scheduler.tick()
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(fired, [routine.id], 'still parked — no second fire')
+  assert.equal(db.listRoutineRuns(routine.id).filter((x) => x.skipReason === 'overlap').length, 1)
+
+  // /approve: resumeRoutineRun itself fails (this stub run has no parseable pendingToolCall),
+  // but the parked slot must still be released — this run can never be un-stalled either way.
+  const res = await app.request(`/api/v1/routines/${routine.id}/runs/${run.id}/approve`, { method: 'POST' })
+  assert.equal(res.status, 409)
+  assert.equal((await res.json() as { error: { code: string } }).error.code, 'corrupt_pending_call')
+
+  // Prove the release actually happened: winding next_fire_at back into the past and ticking
+  // again (on the SAME scheduler instance the route released) must fire it, with no new overlap.
+  db.updateRoutine(routine.id, { nextFireAt: '2020-01-01T00:00:00.000Z' })
+  await scheduler.tick()
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(fired, [routine.id, routine.id], 'the routine fires again after being released by /approve')
+  assert.equal(db.listRoutineRuns(routine.id).filter((x) => x.skipReason === 'overlap').length, 1, 'no NEW overlap row from this fire')
+})
+
+test('approve does NOT release the parked guard on a retryable resume failure (gate_timeout)', async () => {
+  const db = new ConversationStore(mkdtempSync(join(tmpdir(), 'routine-routes-test-')))
+  const app = new Hono()
+  const routine = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'agent-1' })
+  db.confirmRoutine(routine.id, '2020-01-01T00:00:00.000Z')
+
+  // Real execution Deps (mirrors execute.test.ts's fakeDeps) so the routine genuinely stalls
+  // through the real chat-runner with a parseable pendingToolCall, not a stub shortcut.
+  const manager = {
+    status: () => ({ state: 'running', model: { key: 'm' } }),
+    sessionStats: () => ({ activeRequests: 0 }),
+    target: () => 'http://engine.invalid.local:1',
+  } as unknown as Manager
+  const modelRouter = { loadExplicit: async () => ({ target: 'http://x' }) } as unknown as ModelRouter
+  const AGENT = { id: 'agent-1', name: 'A', description: '', systemPrompt: '', skillIds: [], tools: [] as string[] }
+  let gateShouldTimeOut = false
+  const gate = {
+    acquire: async () => {
+      if (gateShouldTimeOut) throw new Error('gate acquire timed out')
+      return () => {}
+    },
+  } as unknown as GenerationGate
+  const d = {
+    db, manager, modelRouter, gate,
+    registry: { active: () => ({ kind: 'llama-server' }) },
+    store: { snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }) },
+  } as unknown as Deps
+
+  const scheduler = new RoutineScheduler({ store: db, now: () => new Date(), runRoutine: (r, run) => executeRoutine(d, r, run) })
+  registerRoutineRoutes(app, { ...d, routineScheduler: scheduler } as unknown as Deps)
+
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    choices: [{ message: { content: null, tool_calls: [{ id: 'c1', function: { name: 'not_allowed_tool', arguments: '{}' } }] } }],
+  }), { status: 200 })) as typeof fetch
+  try {
+    await scheduler.tick() // fires and stalls for real — inFlight now holds the routine
+    await new Promise((resolve) => setImmediate(resolve))
+  } finally { globalThis.fetch = originalFetch }
+  const [run] = db.listRoutineRuns(routine.id)
+  assert.equal(run.status, 'needs_approval')
+
+  // Force the gate to time out on this specific resume attempt.
+  gateShouldTimeOut = true
+  const res = await app.request(`/api/v1/routines/${routine.id}/runs/${run.id}/approve`, { method: 'POST' })
+  assert.equal(res.status, 409)
+  assert.equal((await res.json() as { error: { code: string } }).error.code, 'gate_timeout')
+  assert.equal(db.getRoutineRun(run.id)?.status, 'needs_approval', 'claim reverted — legitimately retryable, not released')
+
+  // Prove the scheduler's guard is STILL in place: a tick must not be able to fire the routine
+  // again while this run sits there awaiting a retry of the SAME decision.
+  await scheduler.tick()
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(db.listRoutineRuns(routine.id).filter((x) => x.skipReason === 'overlap').length, 1, 'still guarded — a retryable failure must not release the parked slot')
 })

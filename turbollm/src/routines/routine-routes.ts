@@ -3,9 +3,10 @@ import type { Context } from 'hono'
 import type { Deps } from '../deps'
 import { isLocalRequest, verifyPresentedKey } from '../auth'
 import { computeNextFireTime } from './schedule'
-import type { ScheduleRule, RoutineFlavor, Routine } from './schema'
+import { resumeRoutineRun } from './execute'
+import type { ScheduleRule, RoutineFlavor, Routine, RoutineRun } from './schema'
 
-type Status = 200 | 201 | 400 | 401 | 404 | 409
+type Status = 200 | 201 | 400 | 401 | 404 | 409 | 503
 
 function err(c: Context, status: Status, code: string, message: string) {
   return c.json({ error: { code, message } }, status)
@@ -205,4 +206,75 @@ export function registerRoutineRoutes(app: Hono, d: Deps): void {
     if (!d.db.deleteRoutine(c.req.param('id'))) return err(c, 404, 'not_found', 'Routine not found.')
     return c.json({ ok: true })
   })
+
+  app.post('/api/v1/routines/:id/run-now', (c) => {
+    if (!d.routineScheduler) return err(c, 503, 'scheduler_unavailable', 'The routine scheduler is not running.')
+    const result = d.routineScheduler.runNow(c.req.param('id'))
+    if (!result.ok) {
+      if (result.reason === 'not_found') return err(c, 404, 'not_found', 'Routine not found.')
+      if (result.reason === 'not_confirmed') return err(c, 409, 'not_confirmed', 'Routine has not been confirmed yet.')
+      return err(c, 409, 'already_running', 'This routine already has a run in progress.')
+    }
+    return c.json({ ok: true }, 202)
+  })
+
+  app.post('/api/v1/routines/:id/runs/:runId/approve', async (c) => {
+    const run = d.db.getRoutineRun(c.req.param('runId'))
+    if (!run || run.routineId !== c.req.param('id')) return err(c, 404, 'not_found', 'Run not found.')
+    const result = await resumeRoutineRun(d, run, 'allow')
+    releaseParkedIfResolved(d, run, result)
+    if (!result.ok) return err(c, 409, result.code, result.message)
+    return c.json({ ok: true })
+  })
+
+  app.post('/api/v1/routines/:id/runs/:runId/deny', async (c) => {
+    const run = d.db.getRoutineRun(c.req.param('runId'))
+    if (!run || run.routineId !== c.req.param('id')) return err(c, 404, 'not_found', 'Run not found.')
+    const result = await resumeRoutineRun(d, run, 'deny')
+    releaseParkedIfResolved(d, run, result)
+    if (!result.ok) return err(c, 409, result.code, result.message)
+    return c.json({ ok: true })
+  })
+}
+
+type ResumeResult = Awaited<ReturnType<typeof resumeRoutineRun>>
+
+/** resumeRoutineRun's own failure codes that leave the run LEGITIMATELY still awaiting the SAME
+ *  decision — the generation gate timed out, or the model server was busy/failed to load. The
+ *  claim is reverted (execute.ts's `revertClaim`) back to 'needs_approval' specifically so the
+ *  user can just retry approving shortly; releasing the scheduler's parked guard here would let
+ *  a concurrent scheduled tick fire a SECOND run for the same routine while this one is still
+ *  sitting there un-decided — reintroducing the exact double-fire hazard this fix closes. */
+const RETRYABLE_RESUME_FAILURE_CODES = new Set(['gate_timeout', 'model_busy', 'model_unavailable'])
+
+/** Closes the double-fire hole scheduler.ts's own doc comment on `RoutineSchedulerDeps.
+ *  runRoutine` describes: a routine that stalls awaiting approval is kept in the scheduler's
+ *  `inFlight` set (see scheduler.ts) so a tick can't fire it again while parked, but nothing
+ *  else can ever clear that guard, since `resumeRoutineRun` (Task 8) is invoked directly by
+ *  this file's /approve and /deny handlers, never through the scheduler's own tick()/runRoutine
+ *  path. Called after EVERY resumeRoutineRun call (approve or deny), but it only actually
+ *  releases the scheduler's guard when the run has genuinely stopped needing a decision:
+ *
+ *  - A RETRYABLE failure (gate_timeout/model_busy/model_unavailable) leaves the SAME run
+ *    legitimately parked for a retry of the SAME decision — must NOT release, or a concurrent
+ *    scheduled tick could fire a second run for this routine while this one is still pending.
+ *  - Otherwise, a genuinely unrecoverable failure (e.g. 'corrupt_pending_call' — the pending
+ *    tool call can never be parsed, so no future approve/deny can ever resolve it) DOES need to
+ *    release, or the routine would be stuck unable to ever fire again — the concern the task
+ *    brief's "even a denied/failed resume must release the parked slot" flags.
+ *  - A successful resume (`result.ok`) that dispatched a real continuation can itself re-park
+ *    the run on a second/chained tool-call approval (chat-runner.ts/code-runner.ts's resume
+ *    paths, covered by their own tests) — re-read the run FRESH from the DB (never trust the
+ *    caller's possibly-stale `run` argument) and skip releasing when it did.
+ *
+ *  A no-op when there is no scheduler configured (route-level tests that don't wire one, or a
+ *  build where the scheduler never started). */
+function releaseParkedIfResolved(d: Deps, run: RoutineRun, result: ResumeResult): void {
+  if (!d.routineScheduler) return
+  if (!result.ok && RETRYABLE_RESUME_FAILURE_CODES.has(result.code)) return
+  if (result.ok) {
+    const fresh = d.db.getRoutineRun(run.id)
+    if (fresh?.status === 'needs_approval') return
+  }
+  d.routineScheduler.releaseParked(run.routineId)
 }
