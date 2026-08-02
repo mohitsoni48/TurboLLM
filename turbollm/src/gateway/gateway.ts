@@ -183,7 +183,12 @@ export function registerGateway(app: Hono, d: Deps): void {
     // translation. Gated on the request actually declaring tools: that is what distinguishes an
     // agentic client from someone pointing a plain chat app at the gateway, who has no tool loop
     // to break and did not ask for a coding agent's rules.
-    const guidance = req.tools?.length ? applyAgentGuidance(req) : null
+    // Real request origin (e.g. http://127.0.0.1:<port>), the same technique the /v1/* pass-through
+    // route below already uses (`new URL(c.req.url)`) — this is exactly the base URL the CLI itself
+    // is connected to, so the routine-creation hint (agent-guidance.ts) never names a wrong or
+    // placeholder port.
+    const requestOrigin = new URL(c.req.url).origin
+    const guidance = req.tools?.length ? applyAgentGuidance(req, requestOrigin) : null
 
     const oaiBody = mapToOpenAI(req)
     // The hard half of the loop breaker. pi refuses to EXECUTE the repeated call; the gateway is

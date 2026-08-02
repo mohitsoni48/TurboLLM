@@ -14,6 +14,7 @@ import {
   analyzeTurn,
   applyAgentGuidance,
   blindDependencyAdd,
+  routineGuidance,
   standingGuidance,
   trailingIdenticalCalls,
   trailingToolFailures,
@@ -216,4 +217,36 @@ test('applyAgentGuidance: a clean conversation gets rules but no nudges', () => 
   assert.deepEqual(g.nudges, [])
   assert.equal(g.forceTextOnly, false)
   assert.equal(g.system.length, 3)
+})
+
+// ── routine creation hint (Phase 4) ──────────────────────────────────────────
+
+test('routineGuidance: null when no base URL is known (never emits a broken curl target)', () => {
+  assert.equal(routineGuidance(undefined), null)
+})
+
+test('routineGuidance: names the real base URL and both the create and confirm endpoints', () => {
+  const g = routineGuidance('http://127.0.0.1:6996')
+  assert.match(g ?? '', /curl -X POST http:\/\/127\.0\.0\.1:6996\/api\/v1\/routines/)
+  assert.match(g ?? '', /confirm/)
+})
+
+test('standingGuidance: includes the routine hint when a base URL is supplied, even with NO web tools', () => {
+  // Independent of rules 4/5's `if (!search) return []` gate — a routine hint has nothing to do
+  // with web search, so it must not disappear just because the client declared no search tool.
+  const g = standingGuidance([{ name: 'Read', input_schema: {} }], undefined, 'http://127.0.0.1:6996')
+  assert.equal(g.length, 1)
+  assert.match(g[0], /curl -X POST http:\/\/127\.0\.0\.1:6996\/api\/v1\/routines/)
+})
+
+test('standingGuidance: still says nothing at all when NEITHER web tools NOR a base URL are known', () => {
+  // Exact pre-existing behavior preserved — the old test right above this one already asserts
+  // standingGuidance(tools) with no baseUrl stays [] when there's no search tool either.
+  assert.deepEqual(standingGuidance([{ name: 'Read', input_schema: {} }]), [])
+})
+
+test('applyAgentGuidance: threads a supplied base URL into the routine hint on the system prompt', () => {
+  const r = req([call('Read', { f: 1 }), toolResult('fine')])
+  applyAgentGuidance(r, 'http://127.0.0.1:6996')
+  assert.match(r.system as string, /curl -X POST http:\/\/127\.0\.0\.1:6996\/api\/v1\/routines/)
 })
