@@ -309,7 +309,17 @@ const comfy = new ComfyGuard(store, manager)
 // field in /v1/* requests and loads the matching model if not already running.
 const modelRouter = new ModelRouter(store, registry, manager, scanner, comfy)
 // Tool registry (v0.7.0): built-in tools + MCP host. Syncs MCP servers from config.
-const toolRegistry = new ToolRegistry(store.snapshot().tools)
+// Routine tools (Phase 4): `db` structurally satisfies RoutineToolsStore (createRoutine/
+// getRoutine/listRoutines/updateRoutine/deleteRoutine/listRoutineRuns all exist on
+// ConversationStore per Phase 1) — passed directly, no adapter needed.
+const toolRegistry = new ToolRegistry(store.snapshot().tools, db, async (routineId) =>
+  // The REAL backing, not a stub: Phase 2 shipped RoutineScheduler.runNow, the same in-process
+  // call POST /api/v1/routines/:id/run-now makes. `routineScheduler` is declared BELOW this line
+  // — referenced inside a closure that only ever runs after boot completes, so the TDZ is never
+  // hit. runNow is synchronous by design (00-conventions.md §3: never block a request); this
+  // arrow supplies the Promise shape RunRoutineNowFn asks for.
+  routineScheduler.runNow(routineId),
+)
 void (async () => {
   const cfg = store.snapshot()
   await toolRegistry.syncMcpServers(cfg.mcp.servers)
