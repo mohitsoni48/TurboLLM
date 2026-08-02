@@ -4,28 +4,19 @@
 // yet" stub) plus the approve/deny resume entry point routine-routes.ts's new endpoints
 // (Task 9) call into.
 //
-// VERIFIED SIGNATURE GAP (not silently papered over — see this task's own report for the full
-// writeup): this file's own plan describes `executeRoutine` as "the real
-// RoutineSchedulerDeps.runRoutine", but scheduler.ts's ACTUAL, already-shipped, already-tested
-// contract is `runRoutine: (routine: Routine, run: RoutineRun) => Promise<RoutineRunStatus>` —
-// the scheduler creates `run` itself in tick() BEFORE calling runRoutine, and owns writing its
-// terminal status/endedAt once the returned promise settles (scheduler.ts:81-106). `cli.ts`'s
-// current stub already matches that real contract (`runRoutine: async (_routine, run) => {...;
-// return 'errored' }`), not the `(routine) => Promise<void>` shape this plan assumed when this
-// task was written. `executeRoutine` below is `(d, routine) => Promise<void>` and creates its
-// OWN run row internally — exactly as THIS task's own brief specifies and as execute.test.ts
-// (also this task's own brief) verifies via `db.listRoutineRuns(routine.id)` with no run ever
-// passed in from outside. Both contracts cannot be satisfied by the same function: wiring
-// `runRoutine: (routine) => executeRoutine(deps, routine)` verbatim (as a later task's plan text
-// proposes) will not typecheck against scheduler.ts's real interface, and force-adapting it
-// (e.g. discarding the return value and hardcoding a terminal status) would leave the
-// scheduler's own pre-created run row stranded — the real result/error/pendingToolCall would
-// land on a SECOND row `executeRoutine` creates for the same fire. Reconciling this needs a
-// real design decision at the wiring call site (and possibly a scheduler.ts interface change),
-// which is out of this task's scope (this task only owns execute.ts/execute.test.ts) — flagged
-// here explicitly for whichever task wires this into cli.ts.
+// `executeRoutine`'s signature is `(d, routine, run) => Promise<RoutineRunStatus>`, matching
+// scheduler.ts's ACTUAL, already-shipped, already-tested `RoutineSchedulerDeps.runRoutine`
+// contract exactly (confirmed by reading scheduler.ts directly, not assumed): the scheduler
+// creates `run` itself in tick() BEFORE calling runRoutine(routine, run), and it is fine for the
+// scheduler's own generic `.then()` handler to redundantly write the SAME terminal
+// `{status, endedAt}` this file already wrote more specifically (with `skipReason`/`result`/
+// `error` fields the scheduler's handler doesn't know about) — updateRoutineRun's dynamic patch
+// only touches the fields present in a given call, so a second `{status, endedAt}` write never
+// clobbers an earlier, more specific one. This file therefore both writes the row's terminal
+// state itself (for the specific fields only it knows, e.g. skipReason) AND returns the
+// RoutineRunStatus it wrote, satisfying the caller's contract either way.
 import type { Deps } from '../deps'
-import type { Routine, RoutineRun } from './schema'
+import type { Routine, RoutineRun, RoutineRunStatus } from './schema'
 import { withPinnedModel, type ModelSwapOutcome } from './model-swap'
 import { createRunDeadline } from './runaway-guard'
 import { runChatRoutine, resumeChatRoutine, type ChatRunOutcome } from './chat-runner'
@@ -40,9 +31,9 @@ async function dispatchRoutine(d: Deps, routine: Routine, run: RoutineRun, signa
   // CLI-flavor Code Routines (codingAgent: 'claude_cli') land here once Phase 3
   // (docs/superpowers/plans/2026-08-01-routine-phase3-cli-execution.md) is implemented — that
   // plan's own Task 8 note says its `runCliCodeRoutine` is a fully self-contained orchestrator
-  // (own RoutineRun row, own model-conflict handling) and should NOT be nested inside this
-  // phase's withPinnedModel wrapper; wire it as its own top-level branch in executeRoutine below
-  // instead of inside this function.
+  // (own model-conflict handling) and should NOT be nested inside this phase's withPinnedModel
+  // wrapper; wire it as its own top-level branch in executeRoutine below instead of inside this
+  // function.
   return { status: 'errored', error: `Routine execution for flavor "${routine.flavor}"/codingAgent "${routine.codingAgent ?? 'none'}" is not implemented yet.` }
 }
 
@@ -51,36 +42,52 @@ async function dispatchResume(d: Deps, routine: Routine, run: RoutineRun, pendin
   return resumeCodeRoutine(d, routine, run, pending, decision, signal)
 }
 
-function finalizeOutcome(d: Deps, runId: string, outcome: RoutineOutcome): void {
-  if (outcome.status === 'needs_approval') return // already persisted by the runner itself (stallRoutineRun)
+/** Writes the run's terminal state for a dispatch outcome and returns the RoutineRunStatus it
+ *  wrote (or, for 'needs_approval', the status the runner itself already persisted via
+ *  stallRoutineRun — nothing to write here). */
+function finalizeOutcome(d: Deps, runId: string, outcome: RoutineOutcome): RoutineRunStatus {
+  if (outcome.status === 'needs_approval') return 'needs_approval' // already persisted by the runner itself (stallRoutineRun)
   const endedAt = new Date().toISOString()
-  if (outcome.status === 'ok') d.db.updateRoutineRun(runId, { status: 'ok', result: outcome.result, endedAt })
-  else d.db.updateRoutineRun(runId, { status: 'errored', error: outcome.error, endedAt })
+  if (outcome.status === 'ok') {
+    d.db.updateRoutineRun(runId, { status: 'ok', result: outcome.result, endedAt })
+    return 'ok'
+  }
+  d.db.updateRoutineRun(runId, { status: 'errored', error: outcome.error, endedAt })
+  return 'errored'
 }
 
-function finalizeSwapOutcome(d: Deps, runId: string, swap: ModelSwapOutcome): void {
-  if (swap.outcome === 'ran') return // finalizeOutcome already ran inside the wrapped fn()
+/** Writes the run's terminal state for a non-'ran' model-swap outcome and returns the
+ *  RoutineRunStatus it wrote. For 'ran', `finalizeOutcome` already wrote (or the runner itself
+ *  already stalled) inside the wrapped fn() — `ranStatus` is that already-computed value,
+ *  returned as-is. */
+function finalizeSwapOutcome(d: Deps, runId: string, swap: ModelSwapOutcome, ranStatus: RoutineRunStatus): RoutineRunStatus {
+  if (swap.outcome === 'ran') return ranStatus
   const endedAt = new Date().toISOString()
-  if (swap.outcome === 'skip-busy') d.db.updateRoutineRun(runId, { status: 'skipped', skipReason: 'model_busy', endedAt })
-  else d.db.updateRoutineRun(runId, { status: 'errored', error: swap.message, endedAt })
+  if (swap.outcome === 'skip-busy') {
+    d.db.updateRoutineRun(runId, { status: 'skipped', skipReason: 'model_busy', endedAt })
+    return 'skipped'
+  }
+  d.db.updateRoutineRun(runId, { status: 'errored', error: swap.message, endedAt })
+  return 'errored'
 }
 
-/** The real Chat/in-app-pi Routine executor (spec 20 §5). Creates the RoutineRun row, acquires
- *  GenerationGate at 'bg' priority (spec 20 §5: a routine never preempts foreground chat/Code),
- *  resolves the model-conflict decision, and dispatches to the flavor-specific runner. See this
- *  file's module comment for the verified gap between this signature and scheduler.ts's actual
- *  RoutineSchedulerDeps.runRoutine contract — whichever task wires this into cli.ts needs to
- *  design a real adapter, not assume the two are interchangeable. */
-export async function executeRoutine(d: Deps, routine: Routine): Promise<void> {
+/** The real Chat/in-app-pi Routine executor (spec 20 §5) — the real `RoutineSchedulerDeps.runRoutine`
+ *  (Phase 2), wired in cli.ts (Task 10). The scheduler has already created `run` (status
+ *  'running') before calling this; this function only decides which terminal RoutineRunStatus
+ *  the fire reached (writing its own more-specific fields — skipReason, result, error,
+ *  pendingToolCall — along the way) and returns it, matching scheduler.ts's own doc comment on
+ *  `RoutineSchedulerDeps.runRoutine` exactly. Acquires GenerationGate at 'bg' priority (spec 20
+ *  §5: a routine never preempts foreground chat/Code), resolves the model-conflict decision, and
+ *  dispatches to the flavor-specific runner. */
+export async function executeRoutine(d: Deps, routine: Routine, run: RoutineRun): Promise<RoutineRunStatus> {
   // CLI-flavor Code Routines: see dispatchRoutine's own comment — this is a deliberate top-level
-  // sibling branch, not nested in the swap/gate flow below, so it can own its own run row.
+  // sibling branch, not nested in the swap/gate flow below (Phase 3's runCliCodeRoutine will own
+  // its own model-conflict handling once it lands).
   if (routine.flavor === 'code' && routine.codingAgent === 'claude_cli') {
-    const run = d.db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
     d.db.updateRoutineRun(run.id, { status: 'errored', error: 'CLI-flavor Code Routine execution is not implemented yet (Phase 3).', endedAt: new Date().toISOString() })
-    return
+    return 'errored'
   }
 
-  const run = d.db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
   const deadline = createRunDeadline()
   try {
     let release: (() => void) | undefined
@@ -88,14 +95,15 @@ export async function executeRoutine(d: Deps, routine: Routine): Promise<void> {
       if (d.gate) release = await d.gate.acquire('bg', { signal: deadline.signal })
     } catch {
       d.db.updateRoutineRun(run.id, { status: 'skipped', skipReason: 'gate_timeout', endedAt: new Date().toISOString() })
-      return
+      return 'skipped'
     }
     try {
+      let ranStatus: RoutineRunStatus = 'errored'
       const swap = await withPinnedModel({ manager: d.manager, modelRouter: d.modelRouter }, routine.modelKey, async () => {
         const outcome = await dispatchRoutine(d, routine, run, deadline.signal)
-        finalizeOutcome(d, run.id, outcome)
+        ranStatus = finalizeOutcome(d, run.id, outcome)
       })
-      finalizeSwapOutcome(d, run.id, swap)
+      return finalizeSwapOutcome(d, run.id, swap, ranStatus)
     } finally {
       release?.()
     }
@@ -105,9 +113,11 @@ export async function executeRoutine(d: Deps, routine: Routine): Promise<void> {
 }
 
 /** Resume a stalled run after an approve/deny decision (routine-routes.ts's new .../approve and
- *  .../deny endpoints, Task 9). Re-derives the routine from the run's OWN configSnapshot — never
- *  the live Routine row — per spec 20 §6's "resumes with its original snapshot, not a later
- *  edit" rule.
+ *  .../deny endpoints, Task 9). Never called by scheduler.ts's tick()/runNow() — a standalone
+ *  entry point Task 9's REST routes call directly with a `run` they already fetched via
+ *  `d.db.getRoutineRun(...)`, hence its different (non-RoutineSchedulerDeps) shape. Re-derives
+ *  the routine from the run's OWN configSnapshot — never the live Routine row — per spec 20 §6's
+ *  "resumes with its original snapshot, not a later edit" rule.
  *
  *  Idempotency (verified real gap flagged by Task 7's own review, progress.md's "Task 7: minor
  *  (deferred)" entry: "resumeCodeRoutine's 'allow' path is not idempotent... flagged for Task
@@ -122,7 +132,8 @@ export async function executeRoutine(d: Deps, routine: Routine): Promise<void> {
  *  before any async work starts. A second concurrent call for the same run id then sees a
  *  non-'needs_approval' status and fails cleanly with 'not_stalled' instead of double-dispatching.
  *  If the claim is made but dispatch never actually runs (gate timeout, model busy, model load
- *  failed), the claim is reverted so the run can still be retried later. */
+ *  failed, or dispatch throwing outright), the claim is reverted so the run can still be retried
+ *  later. */
 export async function resumeRoutineRun(d: Deps, run: RoutineRun, decision: 'allow' | 'deny'): Promise<{ ok: true } | { ok: false; code: string; message: string }> {
   const current = d.db.getRoutineRun(run.id)
   if (!current || current.status !== 'needs_approval') return { ok: false, code: 'not_stalled', message: 'This run is not awaiting approval.' }
