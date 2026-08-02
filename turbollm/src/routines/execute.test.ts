@@ -6,14 +6,16 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ConversationStore } from '../chat/db'
 import { executeRoutine, resumeRoutineRun } from './execute'
+import { parsePendingToolCall } from './approval'
 import type { Deps } from '../deps'
 import type { Manager } from '../engines/manager'
 import type { ModelRouter } from '../gateway/model-router'
+import type { GenerationGate } from '../agents/gate'
 import type { RoutineRunStatus } from './schema'
 
 const AGENT = { id: 'agent-1', name: 'A', description: '', systemPrompt: '', skillIds: [], tools: [] as string[] }
 
-function fakeDeps(opts: { loadedKey: string | null; activeRequests?: number }): { d: Deps; db: ConversationStore; loadCalls: string[] } {
+function fakeDeps(opts: { loadedKey: string | null; activeRequests?: number; gate?: GenerationGate }): { d: Deps; db: ConversationStore; loadCalls: string[] } {
   const db = new ConversationStore(mkdtempSync(join(tmpdir(), 'execute-test-')))
   const loadCalls: string[] = []
   let current = opts.loadedKey
@@ -27,6 +29,7 @@ function fakeDeps(opts: { loadedKey: string | null; activeRequests?: number }): 
     db, manager, modelRouter,
     registry: { active: () => ({ kind: 'llama-server' }) },
     store: { snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }) },
+    gate: opts.gate,
   } as unknown as Deps
   return { d, db, loadCalls }
 }
@@ -102,6 +105,13 @@ test('a stalled (needs_approval) outcome is never overwritten by the orchestrato
   const runs = db.listRoutineRuns(routine.id)
   assert.equal(runs[0].status, 'needs_approval')
   assert.equal(status, 'needs_approval')
+  // M4 fix: the ONLY in-tree way to catch a regression where finalizeOutcome stops returning
+  // early for 'needs_approval' (and starts writing its own terminal state on top of what
+  // stallRoutineRun already persisted) is to check that nothing else got written — status alone
+  // doesn't prove that, since a wrongly-added write could still leave status untouched. endedAt
+  // is never set by stallRoutineRun, so it staying unset here proves the orchestrator wrote
+  // nothing of its own on this path.
+  assert.equal(runs[0].endedAt, undefined)
 })
 
 test('resumeRoutineRun rejects a run that is not currently needs_approval', async () => {
@@ -163,6 +173,54 @@ test("executeRoutine's return value always matches the RoutineRunStatus written 
   }
 })
 
+// I1 fix: every test above leaves d.gate undefined, so `if (d.gate)` is always false and the
+// entire GenerationGate acquire/release/timeout path — including the 'bg' priority literal that
+// IS spec 20 §5's "a routine never preempts foreground chat/Code" guarantee — was never actually
+// exercised. A regression that changed 'bg' to 'fg', dropped release?.(), or removed the
+// gate-timeout write would have shipped green. This test supplies a real (fake) gate.
+test("executeRoutine acquires the GenerationGate at 'bg' priority and releases it once the run completes", async () => {
+  let capturedPriority: string | undefined
+  let releaseCalled = false
+  const gate = {
+    acquire: async (priority: 'fg' | 'bg') => {
+      capturedPriority = priority
+      return () => { releaseCalled = true }
+    },
+  } as unknown as GenerationGate
+  const { d, db } = fakeDeps({ loadedKey: 'm', gate })
+  const routine = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'agent-1' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  const fetchStub = stubFetchOk()
+  let status: RoutineRunStatus
+  try {
+    status = await executeRoutine(d, routine, run)
+  } finally { fetchStub.restore() }
+  assert.equal(capturedPriority, 'bg')
+  assert.equal(releaseCalled, true)
+  assert.equal(status, 'ok')
+})
+
+// I1 fix (continued): the gate-acquire-timeout catch block — {status:'skipped',
+// skipReason:'gate_timeout'} plus never dispatching at all — also had zero coverage.
+test('a GenerationGate acquire timeout skips the run and never dispatches', async () => {
+  const gate = { acquire: async () => { throw new Error('gate acquire timed out') } } as unknown as GenerationGate
+  const { d, db } = fakeDeps({ loadedKey: 'm', gate })
+  const routine = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'agent-1' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  let fetchCalled = false
+  const original = globalThis.fetch
+  globalThis.fetch = (async () => { fetchCalled = true; return new Response('{}', { status: 200 }) }) as typeof fetch
+  let status: RoutineRunStatus
+  try {
+    status = await executeRoutine(d, routine, run)
+  } finally { globalThis.fetch = original }
+  const finalRun = db.getRoutineRun(run.id)!
+  assert.equal(finalRun.status, 'skipped')
+  assert.equal(finalRun.skipReason, 'gate_timeout')
+  assert.equal(status, 'skipped')
+  assert.equal(fetchCalled, false)
+})
+
 // Additional test beyond the brief's 5: verifies the idempotency guard added to
 // resumeRoutineRun (see execute.ts's doc comment on that function, and progress.md's Task 7
 // "minor (deferred)" finding this closes). Two concurrent resumeRoutineRun calls for the SAME
@@ -178,6 +236,7 @@ test('resumeRoutineRun guards against a double-dispatch on the same stalled run'
   } finally { stallStub.restore() }
   const stalledRun = db.getRoutineRun(run.id)!
   assert.equal(stalledRun.status, 'needs_approval')
+  const pending = parsePendingToolCall(stalledRun.pendingToolCall)!
 
   const okStub = stubFetchOk()
   let results: Array<{ ok: boolean; code?: string }>
@@ -193,11 +252,17 @@ test('resumeRoutineRun guards against a double-dispatch on the same stalled run'
   const rejected = results.find((r) => !r.ok) as { ok: false; code: string }
   assert.equal(rejected.code, 'not_stalled')
 
-  // Only one continuation turn should have actually run: the routine's chat conversation
-  // (created once by executeRoutine) should show exactly one final assistant answer from the
-  // resumed round, not two.
   const finalRun = db.getRoutineRun(stalledRun.id)!
   assert.equal(finalRun.status, 'ok')
+
+  // M4 fix: actually count messages instead of just asserting status — a genuinely
+  // double-dispatched resume would append TWO resumed rounds' worth of assistant messages (one
+  // tool-call round + one final-answer round, each) to the same conversation, i.e. 4 assistant
+  // rows instead of 2. This is what proves "only one continuation turn actually ran," not just
+  // "the run ended up ok" (which a double-dispatch could also produce, just wastefully).
+  const conv = d.db.getConversation(pending.convId, true)!
+  const assistantMessages = (conv.messages ?? []).filter((m) => m.role === 'assistant')
+  assert.equal(assistantMessages.length, 2, 'expected exactly one resumed round (tool-call message + final answer), not a double-dispatch')
 })
 
 // Additional test: if dispatch throws instead of resolving to an outcome (an unexpected error
