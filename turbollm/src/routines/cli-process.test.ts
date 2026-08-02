@@ -338,6 +338,79 @@ test('realSpawnCliProcess: resolution uses the env the CHILD runs under, not pro
   assert.deepEqual(seenEnv, { PATH: '/service/only/bin' })
 })
 
+// ── N3 / N4: the shell-path tripwire is an allow-list, and it covers the command too ─────────
+
+const shimDeps = (spawn: (cmd: string, args: string[] | null, opts: SpawnOptions) => CliChildProcess) => ({
+  spawn,
+  resolve: () => 'C:\\npm\\claude.cmd',
+  needsShell: () => true,
+})
+
+test('realSpawnCliProcess: newline and CR arguments are REFUSED, not silently mangled', () => {
+  // The old denylist (`/["%]/`) passed both. Driven through real cmd.exe by the re-reviewer, a
+  // newline TRUNCATED the argument (`a\necho pwned` arrived as `a`) and a CR was EATEN
+  // (`a\recho pwned` arrived as `aecho pwned`) — corrupted rather than refused.
+  for (const hostile of ['a\necho pwned', 'a\recho pwned', 'a\r\necho pwned']) {
+    const { calls, spawn } = recordingSpawn()
+    assert.throws(
+      () => realSpawnCliProcess('claude', ['-p', hostile], { cwd: '/repo', env: {} }, shimDeps(spawn)),
+      /refusing to build a shell command line/,
+      `expected ${JSON.stringify(hostile)} to be refused`,
+    )
+    assert.deepEqual(calls, [], 'nothing may be spawned once an argument is refused')
+  }
+})
+
+test('realSpawnCliProcess: the two characters the old denylist caught are still refused', () => {
+  for (const hostile of ['a" & echo pwned & rem "', 'a%USERPROFILE%b']) {
+    const { calls, spawn } = recordingSpawn()
+    assert.throws(
+      () => realSpawnCliProcess('claude', ['-p', hostile], { cwd: '/repo', env: {} }, shimDeps(spawn)),
+      /refusing to build a shell command line/,
+      `expected ${JSON.stringify(hostile)} to be refused`,
+    )
+    assert.deepEqual(calls, [])
+  }
+})
+
+test("realSpawnCliProcess: every argument TurboLLM actually passes clears the allow-list", () => {
+  // An allow-list is only safe to invert to if it admits the real vocabulary. These are every flag
+  // this module sends today plus every value resolveClaudePermissionMode (terminal/agent-modes.ts)
+  // can return, which Task 6 will thread through. A false refusal here is a failed scheduled run.
+  const { calls, spawn } = recordingSpawn()
+  realSpawnCliProcess(
+    'claude',
+    ['-p', '--output-format', 'stream-json', '--verbose', '--permission-mode', 'acceptEdits'],
+    { cwd: '/repo', env: {} },
+    shimDeps(spawn),
+  )
+  assert.equal(calls.length, 1, 'the real argument list must not be refused')
+  for (const mode of ['auto', 'acceptEdits', 'plan', 'manual', 'default']) {
+    const one = recordingSpawn()
+    realSpawnCliProcess('claude', ['--permission-mode', mode], { cwd: '/repo', env: {} }, shimDeps(one.spawn))
+    assert.equal(one.calls.length, 1, `permission mode ${mode} must not be refused`)
+  }
+})
+
+test('realSpawnCliProcess: the COMMAND is held to the same rule as the arguments', () => {
+  // buildShellCommand(cmd, args) interpolates `cmd` onto the same command line, so exempting it
+  // would leave one string on that line outside a guard whose point is to have no exemptions.
+  const { calls, spawn } = recordingSpawn()
+  assert.throws(
+    () => realSpawnCliProcess('claude" & echo pwned & rem "', ['-p'], { cwd: '/repo', env: {} }, shimDeps(spawn)),
+    /refusing to build a shell command line/,
+  )
+  assert.deepEqual(calls, [], 'nothing may be spawned once the command is refused')
+})
+
+test('realSpawnCliProcess: an ordinary executable PATH (spaces, backslashes) is not refused', () => {
+  // The flip side of N4: `cmd` is a path, not a flag, so the allow-list has to admit the shape of
+  // a real one — `C:\Program Files\nodejs\node.exe` is what this file's own tests pass through.
+  const { calls, spawn } = recordingSpawn()
+  realSpawnCliProcess('C:\\Program Files\\nodejs\\node.exe', ['-p'], { cwd: '/repo', env: {} }, shimDeps(spawn))
+  assert.equal(calls.length, 1)
+})
+
 // ── I1 / I3 / M4: settlement guarantees ──────────────────────────────────────────────────────
 
 test('trailing stdout flushed AFTER the child exits is still captured', async () => {

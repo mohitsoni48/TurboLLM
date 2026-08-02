@@ -20,11 +20,10 @@
 //     Error: Input must be provided either through stdin or as a prompt argument when using --print
 //
 // So the only strings that can still reach a shell command line are TurboLLM's OWN fixed flags
-// (`--output-format`, `stream-json`, …). To keep that true as Task 6 grows the argument list,
-// `assertShellSafeArg` refuses — rather than quotes — any shell-path argument containing `"` or
-// `%`, the two characters this repo has measured cmd.exe mishandling (quote-breakout above, and
-// `%VAR%` expanding inside double quotes, shell-command.ts:41-44). A refusal surfaces as an
-// ordinary failed run, not as an injection.
+// (`--output-format`, `stream-json`, …) and the command name itself. To keep that true as Task 6
+// grows the argument list, `assertShellSafeArg` refuses — rather than quotes — anything on that
+// command line that is not made entirely of characters this repo has measured `buildShellCommand`
+// round-tripping faithfully. A refusal surfaces as an ordinary failed run, not as an injection.
 //
 // The shell itself cannot be dropped entirely: Node refuses to spawn a `.cmd`/`.bat` without one
 // (EINVAL, deliberate mitigation — resolve-executable.ts:19-22), and `requiresShell(null)` keeps
@@ -114,14 +113,32 @@ export function killCliProcessTree(pid: number): void {
   }
 }
 
-/** cmd.exe mishandles exactly these two inside a double-quoted argument: `"` closes the quoted
- *  region (the C1 injection), and `%` still expands as `%VAR%` with no in-line escape. See the
- *  module comment — nothing TurboLLM puts in `args` contains either, so this is a tripwire for
- *  future arguments, never a filter applied to user prose (prose goes on stdin). */
-const SHELL_UNSAFE_ARG = /["%]/
+/** Characters a string may contain and still survive `buildShellCommand` byte-for-byte. An
+ *  ALLOW-LIST, deliberately, for the reason shell-command.ts:23-25 already states about its own
+ *  quoting decision: "a denylist that misses one character is a quoting bug".
+ *
+ *  The first version of this tripwire WAS a denylist — `/["%]/`, the two characters cmd.exe was
+ *  known to mishandle (`"` closes the quoted region, the C1 breakout; `%` expands as `%VAR%` even
+ *  inside double quotes, with no in-line escape, shell-command.ts:41-44). Re-review 2026-08-01 (N3)
+ *  drove seven metacharacters through the shipped shell branch on real cmd.exe and found two more
+ *  that PASSED the denylist and were then silently corrupted rather than refused: a newline
+ *  TRUNCATES the argument (`a\necho x` arrived as `a`, the rest gone) and a carriage return is
+ *  EATEN (`a\recho x` arrived as `aecho x`). Neither executed anything — but "quietly different
+ *  from what the caller asked for" is exactly the failure class an allow-list exists to prevent.
+ *
+ *  The set is shell-command.ts's `SAFE_UNQUOTED_WIN` minus `%`, plus a space. Backslash and space
+ *  are IN because `cmd` is held to this same rule (see realSpawnCliProcess) and a command is a
+ *  path: both are round-tripped faithfully — by `quoteWindowsArg`'s backslash-doubling rule on
+ *  Windows and by `quotePosixArg`'s single quotes on POSIX. Everything left out is either measured
+ *  broken (`"`, `%`, LF, CR) or simply never needed, and refusing it costs nothing: TurboLLM's
+ *  entire vocabulary here is `claude`, `-p`, `--output-format`, `stream-json`, `--verbose`,
+ *  `--permission-mode` and the values `resolveClaudePermissionMode` can return (`auto`,
+ *  `acceptEdits`, `plan`, `manual`, `default`) — all plain ASCII words. Prose never reaches here at
+ *  all; it goes on stdin (see the module comment's C1 section). */
+const SHELL_SAFE_ARG = /^[A-Za-z0-9_@+=:,./\\ -]+$/
 
 function assertShellSafeArg(arg: string): void {
-  if (SHELL_UNSAFE_ARG.test(arg)) {
+  if (!SHELL_SAFE_ARG.test(arg)) {
     throw new Error(
       `refusing to build a shell command line containing an unquotable argument: ${JSON.stringify(arg.slice(0, 80))}`,
     )
@@ -168,6 +185,12 @@ export function realSpawnCliProcess(
     windowsHide: true,
   }
   if (needsShell(resolved)) {
+    // `cmd` is interpolated onto the same command line as the args (`buildShellCommand(bin, args)`
+    // quotes `bin` with the identical function), so it is subject to the identical rule — a guard
+    // whose stated purpose is to have no exemptions cannot exempt the first token (re-review N4).
+    // `runClaudeCliProcess` hardcodes `'claude'`, but this function is exported and takes `cmd`
+    // from its caller.
+    assertShellSafeArg(cmd)
     for (const arg of args) assertShellSafeArg(arg)
     return rawSpawn(buildShellCommand(cmd, args), null, { ...base, shell: true })
   }
