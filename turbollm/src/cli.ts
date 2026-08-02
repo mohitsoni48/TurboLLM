@@ -403,10 +403,10 @@ if (tunnelRequested) deps.tunnel = new TunnelManager(store.dir())
 // daemon-owned session a live one is.
 deps.codeRuns = new CodeRunManager(deps)
 
-// Routine scheduler (Phase 2: real chat-flavor and in-app-pi code-flavor execution via
-// executeRoutine; CLI-flavor falls through to a clean "not implemented yet" errored run until
-// Phase 3 lands — see routines/execute.ts's own dispatchRoutine comment). Missed fires while the
-// daemon was offline are skipped and flagged, never backfilled (Phase 1).
+// Routine scheduler. executeRoutine covers every flavor now: chat and in-app-pi code (Phase 2)
+// plus terminal-`claude`-CLI code (Phase 3, dispatched to routines/cli-routine.ts as a top-level
+// sibling branch — see routines/execute.ts). Missed fires while the daemon was offline are
+// skipped and flagged, never backfilled (Phase 1).
 const routineScheduler = new RoutineScheduler({
   store: db,
   now: () => new Date(),

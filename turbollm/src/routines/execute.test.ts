@@ -5,7 +5,8 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ConversationStore } from '../chat/db'
-import { executeRoutine, resumeRoutineRun } from './execute'
+import { executeRoutine, resumeRoutineRun, runCliRoutineBranch } from './execute'
+import type { CliRoutineDeps } from './cli-routine'
 import { parsePendingToolCall } from './approval'
 import type { Deps } from '../deps'
 import type { Manager } from '../engines/manager'
@@ -28,7 +29,7 @@ function fakeDeps(opts: { loadedKey: string | null; activeRequests?: number; gat
   const d = {
     db, manager, modelRouter,
     registry: { active: () => ({ kind: 'llama-server' }) },
-    store: { snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }) },
+    store: { snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 }, daemon: { port: 6996 } }) },
     gate: opts.gate,
   } as unknown as Deps
   return { d, db, loadCalls }
@@ -82,15 +83,61 @@ test('different model loaded and busy: skips with skipReason model_busy, never c
   assert.equal(fetchCalled, false)
 })
 
-test('claude_cli codingAgent is a clean not-implemented-yet placeholder, not a crash', async () => {
-  const { d, db } = fakeDeps({ loadedKey: 'm' })
+// Phase 3, Task 8: what used to be the 'not implemented yet' placeholder here is now a real call
+// into cli-routine.ts's self-contained orchestrator. Asserted through runCliRoutineBranch's
+// `_runCli` seam because the real orchestrator's very first step probes the installed `claude`
+// binary — running it for real would spawn subprocesses and give a different answer on every
+// machine.
+test('claude_cli codingAgent: the CLI branch is wired with the right deps and reuses the scheduler-created run', async () => {
+  const gate = { stats: () => ({ inFlight: 0, queued: 0, capacity: 1 }) } as unknown as GenerationGate
+  const { d, db } = fakeDeps({ loadedKey: 'm', gate })
   const routine = db.createRoutine({ flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', workspacePath: '/repo', codingAgent: 'claude_cli' })
   const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
-  const status = await executeRoutine(d, routine, run)
-  const runs = db.listRoutineRuns(routine.id)
-  assert.equal(runs[0].status, 'errored')
-  assert.match(runs[0].error ?? '', /not implemented/)
-  assert.equal(status, 'errored')
+
+  let captured: CliRoutineDeps | undefined
+  const status = await runCliRoutineBranch(d, routine, run, async (_routine, deps) => {
+    captured = deps
+    // Stand in for the real orchestrator: write a terminal state of our own choosing, so the
+    // read-back below is proving the branch reports what the ORCHESTRATOR wrote (not a hardcoded
+    // status of its own).
+    deps.store.updateRoutineRun(deps.existingRun!.id, { status: 'skipped', skipReason: 'cli_unavailable', endedAt: new Date().toISOString() })
+  })
+
+  assert.equal(status, 'skipped', "must read the orchestrator's own terminal status back off the row")
+  assert.ok(captured)
+  // The scheduler-created run is reused — otherwise every fire would write TWO rows.
+  assert.equal(captured.existingRun, run)
+  assert.equal(db.listRoutineRuns(routine.id).length, 1)
+  assert.equal(captured.store, db)
+  assert.equal(captured.gate, gate, 'must reuse the Deps gate instance, never construct a new one')
+  assert.equal(captured.port, 6996)
+  assert.equal(captured.getLoadedModelKey(), 'm')
+})
+
+// The single most regression-prone wiring point on this branch: `getEngineIdle` must be
+// engineIsIdle(manager) — which reads manager.sessionStats().activeRequests, the ONLY signal that
+// observes the main in-app chat stream — and NOT a gate.stats() read. A gate-only busy-check
+// reports a live foreground chat as idle and would let a routine hot-swap the model out from under
+// it (spec 20 §5). The gate below deliberately says "totally free" so a gate-based implementation
+// would answer `true` here and fail.
+test('claude_cli codingAgent: getEngineIdle sees a live in-app chat turn that the gate cannot', async () => {
+  const freeGate = { stats: () => ({ inFlight: 0, queued: 0, capacity: 1 }) } as unknown as GenerationGate
+  const routineOf = (db: ConversationStore) => {
+    const routine = db.createRoutine({ flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', workspacePath: '/repo', codingAgent: 'claude_cli' })
+    return { routine, run: db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) }) }
+  }
+  const capture = async (activeRequests: number): Promise<boolean> => {
+    const { d, db } = fakeDeps({ loadedKey: 'm', activeRequests, gate: freeGate })
+    const { routine, run } = routineOf(db)
+    let idle: boolean | undefined
+    await runCliRoutineBranch(d, routine, run, async (_r, deps) => {
+      idle = deps.getEngineIdle()
+      deps.store.updateRoutineRun(run.id, { status: 'ok', endedAt: new Date().toISOString() })
+    })
+    return idle!
+  }
+  assert.equal(await capture(1), false, 'a streaming chat turn must read as BUSY even though the gate is free')
+  assert.equal(await capture(0), true)
 })
 
 test('a stalled (needs_approval) outcome is never overwritten by the orchestrator', async () => {
@@ -176,10 +223,12 @@ test("executeRoutine's return value always matches the RoutineRunStatus written 
     assert.equal(status, 'skipped')
     assert.equal(status, db.getRoutineRun(run.id)!.status)
   }
-  // errored (claude_cli placeholder)
+  // errored (agent deleted out from under the routine — reaches finalizeOutcome's errored path
+  // without any network call. Was the claude_cli placeholder until Phase 3's Task 8 replaced that
+  // branch with a real orchestrator call, which cannot run here without spawning a subprocess.)
   {
     const { d, db } = fakeDeps({ loadedKey: 'm' })
-    const routine = db.createRoutine({ flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', workspacePath: '/repo', codingAgent: 'claude_cli' })
+    const routine = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'deleted-agent' })
     const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
     const status = await executeRoutine(d, routine, run)
     assert.equal(status, 'errored')

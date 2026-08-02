@@ -22,18 +22,23 @@ import { createRunDeadline } from './runaway-guard'
 import { runChatRoutine, resumeChatRoutine, type ChatRunOutcome } from './chat-runner'
 import { runCodeRoutine, resumeCodeRoutine, type CodeRunOutcome } from './code-runner'
 import { parsePendingToolCall } from './approval'
+import { runCliCodeRoutine, type CliRoutineDeps } from './cli-routine'
+import { isClaudeCliAvailable } from './cli-preflight'
+import { realSpawnCliProcess, runClaudeCliProcess } from './cli-process'
+import { claudePermissionModeChoices } from '../terminal/agent-modes'
+import { engineIsIdle } from '../engines/update-scheduler'
+import type { GenerationGate } from '../agents/gate'
 
 type RoutineOutcome = ChatRunOutcome | CodeRunOutcome
 
 async function dispatchRoutine(d: Deps, routine: Routine, run: RoutineRun, signal: AbortSignal): Promise<RoutineOutcome> {
   if (routine.flavor === 'chat') return runChatRoutine(d, routine, run, signal)
   if (routine.flavor === 'code' && routine.codingAgent === 'pi') return runCodeRoutine(d, routine, run, signal)
-  // CLI-flavor Code Routines (codingAgent: 'claude_cli') land here once Phase 3
-  // (docs/superpowers/plans/2026-08-01-routine-phase3-cli-execution.md) is implemented — that
-  // plan's own Task 8 note says its `runCliCodeRoutine` is a fully self-contained orchestrator
-  // (own model-conflict handling) and should NOT be nested inside this phase's withPinnedModel
-  // wrapper; wire it as its own top-level branch in executeRoutine below instead of inside this
-  // function.
+  // CLI-flavor Code Routines (codingAgent: 'claude_cli') are deliberately NOT handled here:
+  // `runCliCodeRoutine` is a fully self-contained orchestrator (own model-conflict handling, own
+  // terminal-state writes) and must not be nested inside this phase's withPinnedModel wrapper or
+  // its blocking gate acquisition. It is wired as a top-level sibling branch in `executeRoutine`
+  // below (see `runCliRoutineBranch`), so this function is never reached for that combination.
   return { status: 'errored', error: `Routine execution for flavor "${routine.flavor}"/codingAgent "${routine.codingAgent ?? 'none'}" is not implemented yet.` }
 }
 
@@ -71,6 +76,63 @@ function finalizeSwapOutcome(d: Deps, runId: string, swap: ModelSwapOutcome, ran
   return 'errored'
 }
 
+/** The gate snapshot used by the CLI branch when no GenerationGate is wired at all (`Deps.gate` is
+ *  optional — absent under tests and in any embedder that doesn't build one). Reports "nothing in
+ *  flight, unbounded capacity", i.e. the gate half of cli-routine.ts's AND-ed busy-check simply
+ *  abstains; `getEngineIdle()` — the load-bearing half, which is what actually observes a live
+ *  foreground chat turn — still guards the swap on its own. This mirrors how the rest of this file
+ *  treats a missing gate (`if (d.gate)` below), and is never used when a real gate exists. */
+const ABSENT_GATE = { stats: () => ({ inFlight: 0, queued: 0, capacity: Infinity }) } as unknown as GenerationGate
+
+/** CLI-flavor Code Routines (`codingAgent: 'claude_cli'`, Phase 3). Builds `runCliCodeRoutine`'s
+ *  dependency bundle from the daemon's real `Deps` and returns the terminal status the run
+ *  actually reached.
+ *
+ *  Two things here are load-bearing and easy to get subtly wrong:
+ *   - `getEngineIdle` MUST be `engineIsIdle(d.manager)` (the same call model-swap.ts makes for the
+ *     Chat/pi path), NOT a `gate.stats()` read: only the Manager's `activeRequests` counter sees
+ *     the main in-app chat stream (`chat-routes.ts`'s `manager.generationStart()`), which never
+ *     touches the gate. Substituting the gate here would let a routine hot-swap the model out from
+ *     under a live foreground chat — exactly what spec 20 §5 forbids. cli-routine.ts's own
+ *     `getEngineIdle` doc comment states this requirement explicitly.
+ *   - `existingRun` MUST be the `run` the scheduler already created and handed to
+ *     `executeRoutine`; without it `runCliCodeRoutine` would create a SECOND row and every fire
+ *     would show up twice in the run history.
+ *
+ *  `runCliCodeRoutine` resolves to `void` and writes its own terminal state (with skipReason /
+ *  result / error fields only it knows), unlike the outcome-returning Chat/pi runners — so the
+ *  status is read back from the row to satisfy `executeRoutine`'s own return contract.
+ *
+ *  Exported, with `_runCli` as a default-parameter seam (same shape as cli-process.ts's `_spawn`/
+ *  `_killTree` and cli-preflight.ts's `run`), purely so this wiring can be asserted in a test
+ *  without spawning a real `claude` subprocess: the very first thing the real orchestrator does is
+ *  probe the installed CLI, so there is no other way to cover the branch deterministically. */
+export async function runCliRoutineBranch(
+  d: Deps,
+  routine: Routine,
+  run: RoutineRun,
+  _runCli: (routine: Routine, deps: CliRoutineDeps) => Promise<void> = runCliCodeRoutine,
+): Promise<RoutineRunStatus> {
+  const cliDeps: CliRoutineDeps = {
+    store: d.db,
+    gate: d.gate ?? ABSENT_GATE,
+    getLoadedModelKey: () => d.manager.status().model?.key ?? null,
+    getEngineIdle: () => engineIsIdle(d.manager),
+    loadExplicit: (modelKey) => d.modelRouter.loadExplicit(modelKey),
+    now: () => new Date(),
+    port: d.store.snapshot().daemon.port,
+    isAvailable: () => isClaudeCliAvailable(),
+    permissionModeChoices: () => claudePermissionModeChoices(),
+    runProcess: (args, opts) => runClaudeCliProcess(args, opts, realSpawnCliProcess),
+    existingRun: run,
+  }
+  await _runCli(routine, cliDeps)
+  // runCliCodeRoutine never throws (its own try/catch covers the whole body and always writes a
+  // terminal row), so a missing/still-'running' row here would be a genuine bug in it rather than
+  // an expected state — 'errored' is the honest fallback either way.
+  return d.db.getRoutineRun(run.id)?.status ?? 'errored'
+}
+
 /** The real Chat/in-app-pi Routine executor (spec 20 §5) — the real `RoutineSchedulerDeps.runRoutine`
  *  (Phase 2), wired in cli.ts (Task 10). The scheduler has already created `run` (status
  *  'running') before calling this; this function only decides which terminal RoutineRunStatus
@@ -80,12 +142,13 @@ function finalizeSwapOutcome(d: Deps, runId: string, swap: ModelSwapOutcome, ran
  *  §5: a routine never preempts foreground chat/Code), resolves the model-conflict decision, and
  *  dispatches to the flavor-specific runner. */
 export async function executeRoutine(d: Deps, routine: Routine, run: RoutineRun): Promise<RoutineRunStatus> {
-  // CLI-flavor Code Routines: see dispatchRoutine's own comment — this is a deliberate top-level
-  // sibling branch, not nested in the swap/gate flow below (Phase 3's runCliCodeRoutine will own
-  // its own model-conflict handling once it lands).
+  // CLI-flavor Code Routines: see dispatchRoutine's own comment — a deliberate top-level sibling
+  // branch that returns immediately, never nested in the swap/gate flow below, because
+  // runCliCodeRoutine owns its own model-conflict handling and must not sit inside a blocking
+  // gate acquisition (cli-routine.ts's "the busy-check NEVER calls gate.acquire()" design note
+  // explains the self-deadlock that would otherwise be possible against a single-slot engine).
   if (routine.flavor === 'code' && routine.codingAgent === 'claude_cli') {
-    d.db.updateRoutineRun(run.id, { status: 'errored', error: 'CLI-flavor Code Routine execution is not implemented yet (Phase 3).', endedAt: new Date().toISOString() })
-    return 'errored'
+    return runCliRoutineBranch(d, routine, run)
   }
 
   const deadline = createRunDeadline()
