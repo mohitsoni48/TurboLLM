@@ -10,6 +10,7 @@ import { activateVariant, getMessageVariants } from '../../lib/chat-api'
 import { Button } from '../../components/ui/button'
 import { CopyButton } from '../../components/ui/copy-button'
 import { ArtifactCard, isArtifactLang } from '../../components/ArtifactCard'
+import { isRoutineConfirmTool, RoutineConfirmToolCard } from '../../components/routines/RoutineConfirmToolCard'
 import { friendlyName } from '../../lib/tool-explain'
 
 // ── Thinking block ────────────────────────────────────────────────────────────
@@ -177,6 +178,10 @@ export const Markdown = memo(function Markdown({ children, streaming }: { childr
 type CardCall = {
   id: string
   name: string
+  /** The tool call's INPUT parameters, as the model sent them. Carried because the routine
+   *  confirm gate reads `args.routineId` off an `update_routine` call — see
+   *  RoutineConfirmToolCard.tsx. `LiveToolCall` already had this field; `CardCall` did not. */
+  args: Record<string, unknown>
   status: 'pending' | 'done' | 'error' | 'awaiting_approval'
   result?: string
   /** Code mode only — pi's edit tool real diff output (turbollm/src/code/code-session.ts). */
@@ -220,7 +225,7 @@ function ToolCallCard({ call }: { call: CardCall }) {
   const hasOutput = !!(call.result?.length) || hasDiff
   const awaitingApproval = call.status === 'awaiting_approval'
 
-  return (
+  const generic = (
     <div
       className="overflow-hidden rounded-lg border bg-panel-2"
       style={awaitingApproval ? { borderColor: 'var(--warn)', background: 'color-mix(in srgb, var(--warn) 6%, transparent)' } : { borderColor: 'var(--border)' }}
@@ -254,6 +259,16 @@ function ToolCallCard({ call }: { call: CardCall }) {
       )}
     </div>
   )
+
+  // Task 8: create_routine/update_routine get an inline confirm gate instead of the generic card.
+  // Branching AFTER every hook above has run, per this file's hooks-safety rule — and on the tool
+  // NAME only, which never changes for a given call, so the component type at this position is
+  // stable across the running→done transition. The wrapper owns every other decision (has the call
+  // finished? did it succeed? is the routine still fetchable?) and renders `generic` when the
+  // answer is no. `generic` is only an element description — building it costs nothing when the
+  // confirm card wins.
+  if (isRoutineConfirmTool(call.name)) return <RoutineConfirmToolCard call={call} fallback={generic} />
+  return generic
 }
 
 function ToolCallsPanel({ calls }: { calls: CardCall[] }) {
@@ -289,7 +304,7 @@ function InlineToolStep({ call }: { call: LiveToolCall }) {
   const hasDiff = !!call.diff?.trim()
   const hasOutput = !!call.result?.length || hasDiff
   const elapsed = useElapsedSeconds(pending)
-  return (
+  const generic = (
     <div className="my-1.5 overflow-hidden rounded-lg border border-border bg-panel-2">
       <button
         type="button"
@@ -320,6 +335,10 @@ function InlineToolStep({ call }: { call: LiveToolCall }) {
       )}
     </div>
   )
+
+  // Same Task 8 branch as ToolCallCard's, after every hook (including useElapsedSeconds) has run.
+  if (isRoutineConfirmTool(call.name)) return <RoutineConfirmToolCard call={call} fallback={generic} />
+  return generic
 }
 
 // ── F-021: Confidence badge ───────────────────────────────────────────────────
@@ -628,6 +647,9 @@ export function MessageBubble({
   const completedToolCalls: CardCall[] = (message.toolCalls ?? []).map((tc: ToolCallRecord) => ({
     id: tc.id,
     name: tc.name,
+    // `?? {}` because a record persisted before args were stored (or a hand-built test fixture)
+    // can arrive without them; the confirm gate then simply finds no routineId and stays generic.
+    args: tc.args ?? {},
     status: tc.error ? 'error' : 'done',
     result: tc.error ?? tc.result,
     diff: tc.diff,
