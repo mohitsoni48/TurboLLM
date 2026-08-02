@@ -16,7 +16,9 @@ async function body<T>(c: Context): Promise<T> {
   try { return (await c.req.json()) as T } catch { return {} as T }
 }
 
-interface RoutineBody {
+/** Exported (Phase 4) so `routine-tools.ts` can type its tool arguments against the exact same
+ *  request shape the REST layer accepts, rather than declaring a parallel copy that can drift. */
+export interface RoutineBody {
   flavor?: RoutineFlavor
   prompt?: string
   scheduleDisplay?: string
@@ -78,7 +80,9 @@ function validateCommonFields(b: RoutineBody): string | null {
   return null
 }
 
-function validateCreate(b: RoutineBody): string | null {
+/** Exported (Phase 4) so the `create_routine` tool executor runs the IDENTICAL create-time
+ *  validation this route does — flavor-dependent invariants included — instead of a second copy. */
+export function validateCreate(b: RoutineBody): string | null {
   if (b.flavor !== 'chat' && b.flavor !== 'code') return 'flavor must be "chat" or "code".'
   if (!b.prompt?.trim()) return 'prompt is required.'
   if (!b.scheduleDisplay?.trim()) return 'scheduleDisplay is required.'
@@ -92,8 +96,13 @@ function validateCreate(b: RoutineBody): string | null {
 
 /** Update-time counterpart of {@link validateCreate}. Only fields actually present in the
  *  PUT body are checked; flavor-dependent invariants are re-checked against the routine's
- *  CURRENT flavor (which PUT cannot change) rather than the request body alone. */
-function validateUpdate(b: RoutineBody, current: Routine): string | null {
+ *  CURRENT flavor (which PUT cannot change) rather than the request body alone.
+ *
+ *  Exported (Phase 4) for the same reason as {@link validateCreate}: the `update_routine` tool
+ *  executor applies the same patch this route does, so it must clear the same bar — notably
+ *  `validateCommonFields`'s `scheduleRule` check, without which a tool-supplied malformed rule
+ *  would reach `computeNextFireTime` and throw out of the scheduler tick. */
+export function validateUpdate(b: RoutineBody, current: Routine): string | null {
   if (b.prompt !== undefined && !b.prompt.trim()) return 'prompt cannot be empty.'
   if (current.flavor === 'code' && b.workspacePath !== undefined && !b.workspacePath.trim()) {
     return 'workspacePath cannot be empty for a code-flavor routine.'
