@@ -17,6 +17,7 @@ import { subscribeCodeAuthNeeded, isCodeAuthNeeded } from './lib/auth-signal'
 const WorkspaceScreen = lazy(() => import('./screens/WorkspaceScreen').then((m) => ({ default: m.WorkspaceScreen })))
 const CodeHomeScreen = lazy(() => import('./screens/code/CodeHomeScreen').then((m) => ({ default: m.CodeHomeScreen })))
 const CodeSessionScreen = lazy(() => import('./screens/code/CodeSessionScreen').then((m) => ({ default: m.CodeSessionScreen })))
+const RoutinesPanel = lazy(() => import('./screens/routines/RoutinesPanel').then((m) => ({ default: m.RoutinesPanel })))
 const ChatScreen = lazy(() => import('./screens/ChatScreen').then((m) => ({ default: m.ChatScreen })))
 const SkillEditPage = lazy(() => import('./screens/skills/SkillEditPage').then((m) => ({ default: m.SkillEditPage })))
 const AgentEditPage = lazy(() => import('./screens/agents/AgentEditPage').then((m) => ({ default: m.AgentEditPage })))
@@ -91,6 +92,12 @@ export function App() {
             {/* Code — Workspace's second mode, not a separate nav item. Generally available
                 (ADR-280) — no longer gated behind an experimental-feature flag. */}
             <Route path="/workspace/code" element={<CodeHomeScreen />} />
+            {/* Routines — Code mode's scheduled-task tab (spec 20 §2.1). Declared before the
+                :sessionId route for readability only: React Router ranks the static "routines"
+                segment above the dynamic one regardless of order. The create/detail routes
+                (/routines/new, /routines/:routineId) land with RoutineEditPage in a later task —
+                deliberately not wired here, so no dangling lazy import breaks the build. */}
+            <Route path="/workspace/code/routines" element={<RoutinesPanel />} />
             <Route path="/workspace/code/:sessionId" element={<CodeSessionScreen />} />
             {/* Back-compat: the old Workspace → Agent tab is gone; land on Chat instead. */}
             <Route path="/workspace/agent" element={<Navigate to="/workspace/chat" replace />} />

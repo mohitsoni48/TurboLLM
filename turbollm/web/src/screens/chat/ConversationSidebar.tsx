@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom'
-import { Archive, ArchiveRestore, ChevronDown, ChevronLeft, ChevronRight, Circle, Download, Folder as FolderIcon, FolderInput, FolderPlus, Loader2, MessageSquare, MessageSquarePlus, MoreHorizontal, Pencil, Plus, Search, SquareTerminal, Trash2 } from 'lucide-react'
+import { AlarmClock, Archive, ArchiveRestore, ChevronDown, ChevronLeft, ChevronRight, Circle, Download, Folder as FolderIcon, FolderInput, FolderPlus, Loader2, MessageSquare, MessageSquarePlus, MoreHorizontal, Pencil, Plus, Search, SquareTerminal, Trash2 } from 'lucide-react'
 import type { Conversation, Folder } from '../../lib/chat-types'
 import { useConversationMutations, useConversations, useFolders } from '../../lib/chat-queries'
 import { Button } from '../../components/ui/button'
@@ -586,7 +586,23 @@ export function ConversationSidebar({
           // Code mode: ONLY code sessions, flat (no section header — see
           // CodeSessionsList above) — never co-displayed with chat history
           // (that was the bug this replaced: both histories showing at once).
-          <CodeSessionsList q={debouncedQ} onRequestDelete={setPendingCodeDelete} />
+          // Pinned above them: Routines, a peer surface to the session list rather
+          // than an entry in it (spec 20 §2.1) — scheduled tasks aren't sessions.
+          <>
+            <Link
+              to="/workspace/code/routines"
+              aria-current={pathname.startsWith('/workspace/code/routines') ? 'page' : undefined}
+              className={cn(
+                'mx-2 mb-1 flex items-center gap-2 rounded-md px-2 py-1.5 text-[13px] transition-colors',
+                pathname.startsWith('/workspace/code/routines')
+                  ? 'bg-accent/12 text-accent'
+                  : 'text-muted hover:bg-panel hover:text-ink',
+              )}
+            >
+              <AlarmClock size={14} /> Routines
+            </Link>
+            <CodeSessionsList q={debouncedQ} onRequestDelete={setPendingCodeDelete} />
+          </>
         ) : (
           // Chat mode: ONLY chat folders/conversations — unchanged from how this
           // behaved before the Code section existed.
