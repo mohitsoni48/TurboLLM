@@ -140,6 +140,105 @@ test('claude_cli codingAgent: getEngineIdle sees a live in-app chat turn that th
   assert.equal(await capture(0), true)
 })
 
+// I1 (re-review): every claude_cli test above calls `runCliRoutineBranch` DIRECTLY, so the branch
+// BODY was covered but the DISPATCH CONDITION in executeRoutine was not — the reviewer replaced it
+// with `if (false)` and the whole 1891-test suite stayed green. These two tests drive
+// `executeRoutine` itself through its `_runCliBranch` seam, so a deleted/inverted condition or a
+// mistyped `codingAgent` literal fails loudly instead of silently routing every scheduled
+// CLI-flavor fire into dispatchRoutine's "is not implemented yet" error.
+test('executeRoutine routes a claude_cli Code Routine to the CLI branch and never reaches dispatchRoutine', async () => {
+  const { d, db } = fakeDeps({ loadedKey: 'm' })
+  const routine = db.createRoutine({ flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', workspacePath: '/repo', codingAgent: 'claude_cli' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+
+  let seen: { routine: typeof routine; run: typeof run } | undefined
+  const status = await executeRoutine(d, routine, run, async (_d, r, rn) => {
+    seen = { routine: r, run: rn }
+    return 'ok'
+  })
+
+  assert.ok(seen, 'the claude_cli dispatch condition must actually reach the CLI branch')
+  assert.equal(seen.routine, routine)
+  assert.equal(seen.run, run, 'the scheduler-created run row is handed straight through')
+  assert.equal(status, 'ok', "executeRoutine must return the CLI branch's status verbatim")
+  // dispatchRoutine was never reached: it would have written its 'not implemented yet' error via
+  // finalizeOutcome. The row is untouched because the seam here deliberately writes nothing.
+  const finalRun = db.getRoutineRun(run.id)!
+  assert.equal(finalRun.status, 'running')
+  assert.equal(finalRun.error, undefined)
+})
+
+test('executeRoutine does NOT route a codingAgent: pi Code Routine to the CLI branch', async () => {
+  const { d, db } = fakeDeps({ loadedKey: 'm' })
+  const routine = db.createRoutine({ flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', workspacePath: '/repo', codingAgent: 'pi' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+
+  let cliBranchCalled = false
+  const status = await executeRoutine(d, routine, run, async () => { cliBranchCalled = true; return 'ok' })
+
+  assert.equal(cliBranchCalled, false, 'the condition must be specific to claude_cli, not match every Code Routine')
+  assert.equal(status, 'errored')
+  // Proof it went through dispatchRoutine's in-app-pi runner instead (fakeDeps wires no codeRuns).
+  assert.match(db.getRoutineRun(run.id)!.error ?? '', /codeRuns not wired/)
+})
+
+// I2 (re-review): the CLI branch skips createRunDeadline() on purpose (gate self-deadlock), which
+// left it with NO wall-clock backstop at all. runCliCodeRoutine's very first await —
+// `deps.isAvailable()` -> cli-preflight -> cli-launch.ts's `realRunCommand` — has no timer and
+// settles only on the child's 'error'/'exit' events, so a wedged `claude --version` (reproduced
+// live by the reviewer) never settles. The stand-in below models exactly that: an orchestrator
+// call that never resolves. Without the Promise.race the run row stays 'running' with no endedAt
+// forever and the scheduler's inFlight guard for this routine never clears, so it silently stops
+// firing. The timeout is injected (25ms) so the bound is proven without a slow test.
+test('a hung claude_cli availability probe still drives the run to a terminal state within the wall-clock bound', async () => {
+  const { d, db } = fakeDeps({ loadedKey: 'm' })
+  const routine = db.createRoutine({ flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', workspacePath: '/repo', codingAgent: 'claude_cli' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+
+  const startedAt = Date.now()
+  const status = await runCliRoutineBranch(d, routine, run, () => new Promise<void>(() => { /* never settles: the wedged probe */ }), 25)
+  const elapsed = Date.now() - startedAt
+
+  assert.equal(status, 'errored')
+  assert.ok(elapsed < 5000, `must be bounded by the injected timeout, took ${elapsed}ms`)
+  const finalRun = db.getRoutineRun(run.id)!
+  assert.notEqual(finalRun.status, 'running', 'a stranded running row is the one outcome spec 20 §6 rules out')
+  assert.equal(finalRun.status, 'errored')
+  assert.ok(finalRun.endedAt, 'the terminal row must carry an endedAt so the run is genuinely finished')
+  assert.match(finalRun.error ?? '', /wall-clock limit/)
+})
+
+// I2 companion: losing the race must not clobber a real outcome the orchestrator wrote in the same
+// tick the timer fired — the read-back wins over the synthetic 'errored'.
+test('a race timeout still reports the orchestrator\'s own terminal status when it did write one', async () => {
+  const { d, db } = fakeDeps({ loadedKey: 'm' })
+  const routine = db.createRoutine({ flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', workspacePath: '/repo', codingAgent: 'claude_cli' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+
+  const status = await runCliRoutineBranch(d, routine, run, (_r, deps) => {
+    deps.store.updateRoutineRun(run.id, { status: 'ok', result: 'done', endedAt: new Date().toISOString() })
+    return new Promise<void>(() => { /* wrote its row, then wedged in its finally */ })
+  }, 25)
+
+  assert.equal(status, 'ok')
+  assert.equal(db.getRoutineRun(run.id)!.result, 'done')
+})
+
+// M1 (re-review): the read-back's `?? 'errored'` only caught a MISSING row, but 'running' is a
+// real RoutineRunStatus member — a still-running row was returned verbatim, and scheduler.ts's
+// writeTerminalStatus would then stamp {status:'running', endedAt}: a row that reads as perpetually
+// running yet carries an end time. Unreachable through the real orchestrator, which is exactly why
+// it needs a test of its own.
+test('runCliRoutineBranch reports errored, not running, when the orchestrator leaves the row unfinished', async () => {
+  const { d, db } = fakeDeps({ loadedKey: 'm' })
+  const routine = db.createRoutine({ flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', workspacePath: '/repo', codingAgent: 'claude_cli' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+
+  // Resolves normally (no race timeout) but writes nothing, so the row is still 'running'.
+  const status = await runCliRoutineBranch(d, routine, run, async () => { /* writes no terminal row */ })
+  assert.equal(status, 'errored', "a still-'running' row must fall back to 'errored', as the comment promises")
+})
+
 test('a stalled (needs_approval) outcome is never overwritten by the orchestrator', async () => {
   const { d, db } = fakeDeps({ loadedKey: 'm' })
   const routine = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'agent-1' })

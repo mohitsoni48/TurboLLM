@@ -18,7 +18,7 @@
 import type { Deps } from '../deps'
 import type { Routine, RoutineRun, RoutineRunStatus } from './schema'
 import { withPinnedModel, type ModelSwapOutcome } from './model-swap'
-import { createRunDeadline } from './runaway-guard'
+import { createRunDeadline, ROUTINE_RUN_TIMEOUT_MS } from './runaway-guard'
 import { runChatRoutine, resumeChatRoutine, type ChatRunOutcome } from './chat-runner'
 import { runCodeRoutine, resumeCodeRoutine, type CodeRunOutcome } from './code-runner'
 import { parsePendingToolCall } from './approval'
@@ -106,12 +106,15 @@ const ABSENT_GATE = { stats: () => ({ inFlight: 0, queued: 0, capacity: Infinity
  *  Exported, with `_runCli` as a default-parameter seam (same shape as cli-process.ts's `_spawn`/
  *  `_killTree` and cli-preflight.ts's `run`), purely so this wiring can be asserted in a test
  *  without spawning a real `claude` subprocess: the very first thing the real orchestrator does is
- *  probe the installed CLI, so there is no other way to cover the branch deterministically. */
+ *  probe the installed CLI, so there is no other way to cover the branch deterministically.
+ *  `_timeoutMs` is the same kind of seam for the wall-clock race below, so the timeout path can be
+ *  proven in milliseconds instead of ten minutes. */
 export async function runCliRoutineBranch(
   d: Deps,
   routine: Routine,
   run: RoutineRun,
   _runCli: (routine: Routine, deps: CliRoutineDeps) => Promise<void> = runCliCodeRoutine,
+  _timeoutMs: number = ROUTINE_RUN_TIMEOUT_MS,
 ): Promise<RoutineRunStatus> {
   const cliDeps: CliRoutineDeps = {
     store: d.db,
@@ -126,11 +129,45 @@ export async function runCliRoutineBranch(
     runProcess: (args, opts) => runClaudeCliProcess(args, opts, realSpawnCliProcess),
     existingRun: run,
   }
-  await _runCli(routine, cliDeps)
+  // Wall-clock ceiling (I2). This branch deliberately skips `createRunDeadline()` (see
+  // executeRoutine's comment: the self-deadlock fix), which also removed the ONLY wall-clock
+  // backstop on this path — and runCliCodeRoutine bounds its own SUBPROCESS
+  // (CLI_ROUTINE_TIMEOUT_MS, step 4) but not its pre-spawn probes. `deps.isAvailable()` — its very
+  // first await — bottoms out in cli-launch.ts's `realRunCommand`, which resolves only on the
+  // child's 'error'/'exit' events and has no timer at all: one wedged `claude --version` leaves
+  // this promise unsettled forever, which strands the run row at 'running' with no endedAt AND
+  // permanently pins the routine in scheduler.ts's `inFlight` set, so it silently never fires
+  // again. Racing here (rather than only timing out `realRunCommand`) restores the wall-clock
+  // ceiling spec 20 §6 requires for EVERY execution path, and covers any future unbounded await
+  // inside the orchestrator, not just today's probe.
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const TIMED_OUT = Symbol('cli_routine_timeout')
+  let raced: unknown
+  try {
+    raced = await Promise.race([
+      _runCli(routine, cliDeps),
+      new Promise<symbol>((resolve) => { timer = setTimeout(() => resolve(TIMED_OUT), _timeoutMs); timer.unref() }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+  if (raced === TIMED_OUT) {
+    // The orchestrator has no idea it was raced against and may still be running, so nothing else
+    // will ever write this row's terminal state — do it here, or losing the race just trades an
+    // unsettled promise for a permanently-'running' row. Read first: the orchestrator may have
+    // finished in the same tick the timer fired, and its own more specific outcome wins.
+    const timedOutStatus = d.db.getRoutineRun(run.id)?.status
+    if (timedOutStatus && timedOutStatus !== 'running') return timedOutStatus
+    d.db.updateRoutineRun(run.id, { status: 'errored', error: `claude CLI routine exceeded the ${_timeoutMs}ms wall-clock limit before reporting a result.`, endedAt: new Date().toISOString() })
+    return 'errored'
+  }
   // runCliCodeRoutine never throws (its own try/catch covers the whole body and always writes a
   // terminal row), so a missing/still-'running' row here would be a genuine bug in it rather than
-  // an expected state — 'errored' is the honest fallback either way.
-  return d.db.getRoutineRun(run.id)?.status ?? 'errored'
+  // an expected state — 'errored' is the honest fallback either way. M1: `?? 'errored'` alone only
+  // caught the MISSING row; 'running' is a real RoutineRunStatus member and would otherwise be
+  // returned verbatim, making scheduler.ts's writeTerminalStatus stamp `{status:'running', endedAt}`.
+  const status = d.db.getRoutineRun(run.id)?.status
+  return status && status !== 'running' ? status : 'errored'
 }
 
 /** The real Chat/in-app-pi Routine executor (spec 20 §5) — the real `RoutineSchedulerDeps.runRoutine`
@@ -140,15 +177,28 @@ export async function runCliRoutineBranch(
  *  pendingToolCall — along the way) and returns it, matching scheduler.ts's own doc comment on
  *  `RoutineSchedulerDeps.runRoutine` exactly. Acquires GenerationGate at 'bg' priority (spec 20
  *  §5: a routine never preempts foreground chat/Code), resolves the model-conflict decision, and
- *  dispatches to the flavor-specific runner. */
-export async function executeRoutine(d: Deps, routine: Routine, run: RoutineRun): Promise<RoutineRunStatus> {
+ *  dispatches to the flavor-specific runner.
+ *
+ *  `_runCliBranch` is a default-parameter seam (I1), same pattern as `runCliRoutineBranch`'s own
+ *  `_runCli` and cli-process.ts's `_spawn`/`_killTree`. It exists so the DISPATCH CONDITION itself
+ *  — not just the branch body — is testable: without it, a regression that inverted the condition
+ *  or mistyped the `codingAgent` literal would route every scheduled CLI-flavor fire to
+ *  dispatchRoutine's "not implemented yet" error and still ship a green suite. The production call
+ *  site (cli.ts's `runRoutine: (routine, run) => executeRoutine(deps, routine, run)`) passes three
+ *  arguments, so the default applies there. */
+export async function executeRoutine(
+  d: Deps,
+  routine: Routine,
+  run: RoutineRun,
+  _runCliBranch: typeof runCliRoutineBranch = runCliRoutineBranch,
+): Promise<RoutineRunStatus> {
   // CLI-flavor Code Routines: see dispatchRoutine's own comment — a deliberate top-level sibling
   // branch that returns immediately, never nested in the swap/gate flow below, because
   // runCliCodeRoutine owns its own model-conflict handling and must not sit inside a blocking
   // gate acquisition (cli-routine.ts's "the busy-check NEVER calls gate.acquire()" design note
   // explains the self-deadlock that would otherwise be possible against a single-slot engine).
   if (routine.flavor === 'code' && routine.codingAgent === 'claude_cli') {
-    return runCliRoutineBranch(d, routine, run)
+    return _runCliBranch(d, routine, run)
   }
 
   const deadline = createRunDeadline()
