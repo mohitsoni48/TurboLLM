@@ -10,6 +10,14 @@ function freshStore(): ConversationStore {
   return new ConversationStore(mkdtempSync(join(tmpdir(), 'routine-sched-test-')))
 }
 
+/** M1: the invariant that actually matters for the double-fire fix — not fire-counts or
+ *  skip-row-counts alone (which a first-cut review found could stay green even with two live
+ *  Critical regressions), but "at most one row is ever 'running' for a given routine at once." */
+function assertAtMostOneRunning(store: ConversationStore, routineId: string, message?: string): void {
+  const runningCount = store.listRoutineRuns(routineId).filter((run) => run.status === 'running').length
+  assert.ok(runningCount <= 1, message ?? `expected at most one 'running' row for routine ${routineId}, found ${runningCount}`)
+}
+
 test('tick fires a due routine exactly once and reschedules it', async () => {
   const store = freshStore()
   const r = store.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', agentId: 'a' })
@@ -281,6 +289,7 @@ test('a routine that parks on needs_approval is not fired again by a later tick 
   const [run] = store.listRoutineRuns(r.id)
   assert.equal(run.status, 'needs_approval')
   assert.equal(run.endedAt, undefined, 'a parked run has not actually ended')
+  assertAtMostOneRunning(store, r.id)
   // The routine's next_fire_at was never advanced while parked, so it is STILL "due" — proving
   // the guard is the inFlight set, not next_fire_at, exactly like the ordinary overlap case.
   await scheduler.tick()
@@ -291,9 +300,10 @@ test('a routine that parks on needs_approval is not fired again by a later tick 
   const overlapRuns = store.listRoutineRuns(r.id).filter((x) => x.skipReason === 'overlap')
   assert.equal(overlapRuns.length, 1)
   assert.equal(store.listRoutineRuns(r.id).length, 2, 'the parked run row plus exactly one overlap row')
+  assertAtMostOneRunning(store, r.id)
 })
 
-test('releaseParked lets a routine parked on needs_approval fire again', async () => {
+test('releaseParked(routineId, runId) lets a routine parked on needs_approval fire again', async () => {
   const store = freshStore()
   const r = store.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'a' })
   store.confirmRoutine(r.id, '2020-01-01T00:00:00.000Z')
@@ -307,9 +317,11 @@ test('releaseParked lets a routine parked on needs_approval fire again', async (
   await scheduler.tick()
   await flush()
   assert.deepEqual(fired, [r.id])
+  const [parkedRun] = store.listRoutineRuns(r.id)
   // Simulate what routine-routes.ts's /approve or /deny handler does once resumeRoutineRun
-  // has resolved the stall (the run is no longer 'needs_approval').
-  scheduler.releaseParked(r.id)
+  // has resolved the stall (the run is no longer 'needs_approval') — passing the SPECIFIC run
+  // id that parked the routine, per the run-scoped release contract.
+  scheduler.releaseParked(r.id, parkedRun.id)
   const released = store.getRoutine(r.id)
   assert.ok(released?.nextFireAt, 'release reschedules the routine like a normal completion would')
   assert.notEqual(released?.nextFireAt, '2020-01-01T00:00:00.000Z')
@@ -320,6 +332,7 @@ test('releaseParked lets a routine parked on needs_approval fire again', async (
   assert.deepEqual(fired, [r.id, r.id], 'the routine can fire again after being released')
   const overlapRuns = store.listRoutineRuns(r.id).filter((x) => x.skipReason === 'overlap')
   assert.equal(overlapRuns.length, 0, 'no spurious overlap row once properly released')
+  assertAtMostOneRunning(store, r.id)
 })
 
 test('releaseParked on a routine that is not currently parked is a safe no-op', () => {
@@ -328,7 +341,107 @@ test('releaseParked on a routine that is not currently parked is a safe no-op', 
   store.confirmRoutine(r.id, '2020-01-01T00:00:00.000Z')
   const before = store.getRoutine(r.id)
   const scheduler = new RoutineScheduler({ store, now: () => new Date(), runRoutine: async () => 'ok' })
-  scheduler.releaseParked(r.id) // never fired via this scheduler — must not throw or mutate anything
+  scheduler.releaseParked(r.id, 'some-run-id') // never fired via this scheduler — must not throw or mutate anything
   assert.deepEqual(store.getRoutine(r.id), before)
-  scheduler.releaseParked('totally-unknown-id') // must not throw even for a nonexistent routine
+  scheduler.releaseParked('totally-unknown-id', 'some-run-id') // must not throw even for a nonexistent routine
+})
+
+// ── C2 regression: releaseParked is RUN-scoped, not just routine-scoped ────────────────────
+// A live-execution review found that a routine-scoped-only check (`inFlight.has(routineId)`)
+// lets a stale, duplicate, or wrong-run approve/deny release the guard for a COMPLETELY
+// DIFFERENT, currently-parked fire of the same routine. These tests prove releaseParked ignores
+// a call naming the wrong run, and only releases when the run id actually matches what is
+// currently parked.
+
+test('releaseParked with the WRONG run id for a currently-parked routine is a no-op — the real parked fire stays guarded', async () => {
+  const store = freshStore()
+  const r = store.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'a' })
+  store.confirmRoutine(r.id, '2020-01-01T00:00:00.000Z')
+  const fired: string[] = []
+  const now = new Date('2026-08-01T10:00:00.000Z')
+  const scheduler = new RoutineScheduler({ store, now: () => now, runRoutine: async (routine) => { fired.push(routine.id); return 'needs_approval' } })
+  await scheduler.tick()
+  await flush()
+  const [parkedRun] = store.listRoutineRuns(r.id)
+  assert.equal(parkedRun.status, 'needs_approval')
+
+  // A stale/duplicate/wrong-run release attempt — e.g. a caller retrying approve on an OLD,
+  // already-resolved (or never-actually-parked) run id for the same routine.
+  scheduler.releaseParked(r.id, 'some-other-stale-run-id')
+
+  // The REAL parked fire must still be guarded: a later tick cannot fire the routine again.
+  await scheduler.tick()
+  await flush()
+  assert.deepEqual(fired, [r.id], 'the wrong-run release must not have freed the real parked fire')
+  assert.equal(store.listRoutineRuns(r.id).filter((x) => x.skipReason === 'overlap').length, 1)
+  assertAtMostOneRunning(store, r.id)
+
+  // Releasing with the CORRECT run id, though, does work.
+  scheduler.releaseParked(r.id, parkedRun.id)
+  store.updateRoutine(r.id, { nextFireAt: '2020-01-01T00:00:00.000Z' })
+  await scheduler.tick()
+  await flush()
+  assert.deepEqual(fired, [r.id, r.id], 'the correct-run release does free the routine to fire again')
+})
+
+test('a duplicate release with the SAME (already-released) run id is a safe no-op', async () => {
+  const store = freshStore()
+  const r = store.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'a' })
+  store.confirmRoutine(r.id, '2020-01-01T00:00:00.000Z')
+  let call = 0
+  const fired: string[] = []
+  const now = new Date('2026-08-01T10:00:00.000Z')
+  const scheduler = new RoutineScheduler({
+    store, now: () => now,
+    runRoutine: async (routine) => { fired.push(routine.id); call++; return call === 1 ? 'needs_approval' : 'ok' },
+  })
+  await scheduler.tick()
+  await flush()
+  const [parkedRun] = store.listRoutineRuns(r.id)
+  scheduler.releaseParked(r.id, parkedRun.id) // first release — succeeds
+  const afterFirstRelease = store.getRoutine(r.id)
+  scheduler.releaseParked(r.id, parkedRun.id) // duplicate release of the SAME run — must be a no-op
+  assert.deepEqual(store.getRoutine(r.id), afterFirstRelease, 'a duplicate release must not touch anything a second time')
+})
+
+// ── I1 regression: the parked guard must survive a daemon restart ─────────────────────────
+// The guard is in-memory only (`inFlight`/`parked`), so without reconciliation at start(), a
+// restart would silently lose it — letting a routine whose approval is still outstanding fire
+// again with zero protection. start() must repopulate the guard from the DB's still-correct
+// 'needs_approval' rows before the first tick or reconcileMissedRuns() can run.
+
+test('start() repopulates the parked guard from any run still needs_approval in the DB (restart survival)', async () => {
+  const store = freshStore()
+  const r = store.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'a' })
+  // Simulate a run that was parked before a restart: still 'needs_approval' in the DB, but no
+  // scheduler instance has ever tracked it (it's in-memory state is gone).
+  store.confirmRoutine(r.id, '2020-01-01T00:00:00.000Z')
+  const parkedRun = store.createRoutineRun({ routineId: r.id, configSnapshot: JSON.stringify(r) })
+  store.updateRoutineRun(parkedRun.id, { status: 'needs_approval' })
+
+  const fired: string[] = []
+  const scheduler = new RoutineScheduler({ store, now: () => new Date(), runRoutine: async (routine) => { fired.push(routine.id); return 'ok' }, tickIntervalMs: 3_600_000 })
+  try {
+    scheduler.start()
+    // reconcileMissedRuns() must not have treated the still-parked routine as "missed while
+    // offline" either — it should get neither a bogus offline-skip row nor a premature reschedule.
+    assert.equal(store.listRoutineRuns(r.id).filter((x) => x.skipReason === 'offline').length, 0)
+    assert.equal(store.getRoutine(r.id)?.nextFireAt, '2020-01-01T00:00:00.000Z', 'a parked routine\'s schedule must not be touched by reconcileMissedRuns()')
+
+    // The guard must be live: a tick must not be able to fire the routine while it's still
+    // (from the DB's perspective) parked.
+    await scheduler.tick()
+    await flush()
+    assert.deepEqual(fired, [], 'still parked post-restart — a tick must not fire it')
+    assert.equal(store.listRoutineRuns(r.id).filter((x) => x.skipReason === 'overlap').length, 1)
+
+    // Releasing with the correct (rediscovered) run id frees it again, same as any other park.
+    scheduler.releaseParked(r.id, parkedRun.id)
+    store.updateRoutine(r.id, { nextFireAt: '2020-01-01T00:00:00.000Z' })
+    await scheduler.tick()
+    await flush()
+    assert.deepEqual(fired, [r.id])
+  } finally {
+    scheduler.stop()
+  }
 })

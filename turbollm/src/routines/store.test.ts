@@ -68,3 +68,28 @@ test('updateRoutineRun updates status and endedAt', () => {
   assert.equal(updated?.status, 'ok')
   assert.equal(updated?.endedAt, '2026-08-01T00:00:00.000Z')
 })
+
+// listParkedRoutineRuns: added for RoutineScheduler.start()'s I1 fix (a live-execution review of
+// the Task 9 double-fire fix found the scheduler's parked guard is in-memory only and silently
+// lost across a restart) — this is what lets start() rediscover any run still 'needs_approval'.
+test('listParkedRoutineRuns returns only needs_approval rows, across all routines', () => {
+  const store = freshStore()
+  const r1 = store.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'a' })
+  const r2 = store.createRoutine({ flavor: 'chat', prompt: 'y', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'a' })
+  const parkedRun = store.createRoutineRun({ routineId: r1.id, configSnapshot: '{}' })
+  store.updateRoutineRun(parkedRun.id, { status: 'needs_approval' })
+  const okRun = store.createRoutineRun({ routineId: r2.id, configSnapshot: '{}' })
+  store.updateRoutineRun(okRun.id, { status: 'ok', endedAt: '2026-08-01T00:00:00.000Z' })
+
+  const parked = store.listParkedRoutineRuns()
+  assert.equal(parked.length, 1)
+  assert.equal(parked[0].id, parkedRun.id)
+  assert.equal(parked[0].routineId, r1.id)
+})
+
+test('listParkedRoutineRuns is empty when nothing is parked', () => {
+  const store = freshStore()
+  const r = store.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'a' })
+  store.createRoutineRun({ routineId: r.id, configSnapshot: '{}' })
+  assert.equal(store.listParkedRoutineRuns().length, 0)
+})

@@ -1934,6 +1934,20 @@ export class ConversationStore {
     return rows.map(rowToRoutineRun)
   }
 
+  /** Every run row currently parked awaiting an approval decision, across all routines.
+   *  RoutineScheduler's `inFlight`/`parked` guard (routines/scheduler.ts) is in-memory only, so
+   *  after a daemon restart it is silently empty even though these runs are still correctly
+   *  'needs_approval' in the DB — `RoutineScheduler.start()` calls this to repopulate its guard
+   *  BEFORE the first tick can fire a routine whose approval is still outstanding from before
+   *  the restart. Unindexed scan is fine here: 'needs_approval' rows are rare (one per routine
+   *  currently parked) and this only runs once, at startup. */
+  listParkedRoutineRuns(): RoutineRun[] {
+    const rows = this.db.prepare(
+      `SELECT * FROM routine_runs WHERE status = 'needs_approval'`,
+    ).all() as unknown as RoutineRunRow[]
+    return rows.map(rowToRoutineRun)
+  }
+
   updateRoutineRun(
     id: string,
     patch: Partial<Pick<RoutineRun, 'status' | 'skipReason' | 'pendingToolCall' | 'result' | 'error' | 'endedAt'>>,
