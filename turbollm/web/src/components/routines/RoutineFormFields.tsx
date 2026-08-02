@@ -16,6 +16,31 @@ const WEEKDAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
 const inputCls = 'w-full rounded-md border border-border bg-bg px-3 py-1.5 text-[13px] text-ink outline-none focus:border-accent placeholder:text-faint'
 const labelCls = 'text-[12px] font-medium text-muted'
 
+/** Switching flavor rewrites the draft so it carries ONLY the chosen flavor's fields, and so the
+ *  permission mode the form is about to DISPLAY is actually present on the draft.
+ *
+ *  Two defects live on this one transition:
+ *
+ *  1. Safety. The permission-mode select renders `draft.permissionMode ?? 'ask'`, i.e. it shows
+ *     "Ask before each tool call" as selected before the user has touched it. But
+ *     `emptyRoutineDraft()` never sets the field and `isRoutineDraftComplete` does not require
+ *     it, so the common path (pick Code, pick a workspace and a coding agent, never touch a
+ *     control that already looks set) persists `permissionMode: undefined` — and the backend
+ *     resolves that to `'auto'`, not `'ask'` (`src/routines/code-runner.ts`: `routine.permissionMode
+ *     ?? 'auto'`). The routine would then edit files and run commands unattended while the UI
+ *     that created it displayed the approval gate. Materialising the default here makes the
+ *     displayed mode and the executed mode the same value.
+ *  2. Dirty data. Only spreading `{ ...draft, flavor }` leaves the departing flavor's fields
+ *     behind, and `src/routines/routine-routes.ts` validates only the chosen flavor's required
+ *     field while persisting `agentId`/`workspacePath`/`codingAgent`/`permissionMode`
+ *     unconditionally — so a chat routine ends up stored with a phantom workspace path (and a
+ *     code routine with a phantom agentId), which then shows up as a phantom row in
+ *     RoutineConfirmCard's update diff. */
+function withFlavor(draft: RoutineDraft, flavor: RoutineDraft['flavor']): RoutineDraft {
+  if (flavor === 'chat') return { ...draft, flavor, workspacePath: undefined, codingAgent: undefined, permissionMode: undefined }
+  return { ...draft, flavor, agentId: undefined, permissionMode: draft.permissionMode ?? 'ask' }
+}
+
 /** The routine form's fields, and nothing else — fully controlled, with no submit, persist or
  *  validation logic of its own. Both surfaces that create/edit a routine embed this same
  *  component (the panel's create/edit page and the chat transcript's confirm card), so the
@@ -32,6 +57,15 @@ export function RoutineFormFields({ draft, onChange, disabled }: { draft: Routin
   const agentsQ = useChatAgents()
   const modelsQ = useModels()
   const models = modelsQ.data?.models ?? []
+  const agents = agentsQ.data ?? []
+  // A controlled <select> whose value matches no <option> falls back to the first one — here the
+  // placeholder — so the field would read as unset while the draft still holds a real value and
+  // `isRoutineDraftComplete` still returns true: an enabled Confirm next to an apparently empty
+  // required field, and an untouched submit silently re-persisting the invisible value. Happens
+  // on first paint of an edit form before the catalog query resolves, and permanently once a
+  // model/agent is deleted. Rendering the stored value as its own option keeps it visible.
+  const orphanModelKey = draft.modelKey && !models.some((m) => m.key === draft.modelKey) ? draft.modelKey : null
+  const orphanAgentId = draft.agentId && !agents.some((a) => a.id === draft.agentId) ? draft.agentId : null
   // Ids so each <label> actually points at its control — these are plain selects/inputs, not
   // wrapped controls, so without htmlFor a screen reader reads them as unlabelled.
   const uid = useId()
@@ -55,7 +89,7 @@ export function RoutineFormFields({ draft, onChange, disabled }: { draft: Routin
               type="button"
               disabled={disabled}
               aria-pressed={draft.flavor === f}
-              onClick={() => onChange({ ...draft, flavor: f })}
+              onClick={() => onChange(withFlavor(draft, f))}
               className={`rounded px-3 py-1.5 text-[13px] font-medium transition-colors ${draft.flavor === f ? 'bg-accent/12 text-accent' : 'text-muted hover:text-ink'}`}
             >
               {f === 'chat' ? 'Chat' : 'Code'}
@@ -80,6 +114,7 @@ export function RoutineFormFields({ draft, onChange, disabled }: { draft: Routin
         <label className={labelCls} htmlFor={id('model')}>Model</label>
         <select id={id('model')} disabled={disabled} className={inputCls} value={draft.modelKey} onChange={(e) => onChange({ ...draft, modelKey: e.target.value })}>
           <option value="">Choose a model…</option>
+          {orphanModelKey && <option value={orphanModelKey}>{orphanModelKey} (not in the current catalog)</option>}
           {models.map((m) => <option key={m.key} value={m.key}>{m.name}</option>)}
         </select>
       </div>
@@ -89,7 +124,8 @@ export function RoutineFormFields({ draft, onChange, disabled }: { draft: Routin
           <label className={labelCls} htmlFor={id('agent')}>Agent</label>
           <select id={id('agent')} disabled={disabled} className={inputCls} value={draft.agentId ?? ''} onChange={(e) => onChange({ ...draft, agentId: e.target.value || undefined })}>
             <option value="">Choose an agent…</option>
-            {(agentsQ.data ?? []).map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+            {orphanAgentId && <option value={orphanAgentId}>{orphanAgentId} (not in the current catalog)</option>}
+            {agents.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
           </select>
         </div>
       ) : (
