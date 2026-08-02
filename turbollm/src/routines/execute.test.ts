@@ -135,3 +135,28 @@ test('resumeRoutineRun guards against a double-dispatch on the same stalled run'
   const finalRun = db.getRoutineRun(stalledRun.id)!
   assert.equal(finalRun.status, 'ok')
 })
+
+// Additional test: if dispatch throws instead of resolving to an outcome (an unexpected error
+// from the underlying runner plumbing, not one of withPinnedModel's own known outcomes), the
+// claim resumeRoutineRun makes before dispatching must still be reverted — otherwise the run is
+// permanently stuck at 'running' with no way to ever retry it, which would be worse than the
+// pre-idempotency-fix behavior.
+test('resumeRoutineRun reverts its claim if dispatch throws instead of resolving', async () => {
+  const { d, db } = fakeDeps({ loadedKey: 'm' })
+  const routine = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'agent-1' })
+  const stallStub = stubFetchStall()
+  try {
+    await executeRoutine(d, routine)
+  } finally { stallStub.restore() }
+  const stalledRun = db.listRoutineRuns(routine.id)[0]
+  assert.equal(stalledRun.status, 'needs_approval')
+
+  // Force withPinnedModel (and therefore the whole dispatch) to throw instead of resolving.
+  ;(d as unknown as { manager: Manager }).manager = {
+    status: () => { throw new Error('engine exploded') },
+  } as unknown as Manager
+
+  await assert.rejects(() => resumeRoutineRun(d, stalledRun, 'allow'), /engine exploded/)
+  const reverted = db.getRoutineRun(stalledRun.id)!
+  assert.equal(reverted.status, 'needs_approval')
+})

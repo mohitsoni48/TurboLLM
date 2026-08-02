@@ -152,6 +152,13 @@ export async function resumeRoutineRun(d: Deps, run: RoutineRun, decision: 'allo
       if (swap.outcome === 'skip-busy') { revertClaim(); return { ok: false, code: 'model_busy', message: 'The model server is busy — try approving again shortly.' } }
       if (swap.outcome === 'skip-load-failed') { revertClaim(); return { ok: false, code: 'model_unavailable', message: swap.message } }
       return { ok: true }
+    } catch (e) {
+      // dispatchResume/withPinnedModel threw instead of resolving to an outcome (e.g. a
+      // genuinely unexpected error from the underlying subscribe()/fetch plumbing) — the claim
+      // above must still be undone, or this run is permanently stuck at 'running' with no way to
+      // ever retry it, which is strictly worse than the pre-claim behavior this fix replaces.
+      revertClaim()
+      throw e
     } finally {
       release?.()
     }
