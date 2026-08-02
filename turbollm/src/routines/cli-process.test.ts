@@ -279,6 +279,54 @@ test('an unquotable ARGUMENT on the shell branch is refused, not quoted', async 
   }
 })
 
+// N8: the two tests above both force the SHELL branch, which is only reachable where `claude` is a
+// `.cmd` shim. The DIRECT branch is the one that runs in production on a native-binary install, and
+// until now nothing in CI proved the prompt actually reaches a real process's stdin without a shell.
+test('a real subprocess on the DIRECT (no-shell) branch gets the prompt byte-exact on stdin', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'turbollm-cli-direct-'))
+  try {
+    const victim = join(dir, 'victim.cjs')
+    writeFileSync(
+      victim,
+      [
+        "let input = ''",
+        "process.stdin.setEncoding('utf8')",
+        "process.stdin.on('data', (c) => { input += c })",
+        "process.stdin.on('end', () => {",
+        "  process.stdout.write(JSON.stringify({ argv: process.argv.slice(2), stdin: input }))",
+        '})',
+        '',
+      ].join('\n'),
+    )
+    // The same hostile shape the shell-branch test uses, plus the newline and CR that cmd.exe
+    // mangles — none of it is special here, because no shell ever parses it.
+    const prompt = 'a" & echo pwned & rem "; echo pwned; #\nsecond line\rcarriage'
+    const spawnDirect: SpawnCliProcess = (_cmd, args, opts) =>
+      realSpawnCliProcess(process.execPath, args, opts, { needsShell: () => false })
+
+    const startedAt = Date.now()
+    const result = await runClaudeCliProcess(
+      [victim],
+      { cwd: dir, env: process.env, stdin: prompt, timeoutMs: 30_000 },
+      spawnDirect,
+      () => {},
+    )
+    const elapsed = Date.now() - startedAt
+
+    assert.equal(result.exitCode, 0)
+    assert.equal(result.timedOut, false)
+    const seen = JSON.parse(result.stdout) as { argv: string[]; stdin: string }
+    assert.deepEqual(seen.argv, [], 'the prompt must not reach the child as an argument')
+    assert.equal(seen.stdin, prompt, 'the prompt must arrive on stdin byte-for-byte')
+    // The fast path must not pay any part of a grace window: a clean exit settles on 'close'.
+    // Measured at ~40-60 ms; the bound exists to catch a regression that made it wait out
+    // EXIT_STDIO_GRACE_MS or CLI_KILL_GRACE_MS, not to police machine speed.
+    assert.ok(elapsed < 1000, `clean-exit fast path took ${elapsed}ms — a settlement window regressed`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 // ── M6: realSpawnCliProcess's own branch selection ───────────────────────────────────────────
 
 function recordingSpawn() {
