@@ -2,35 +2,63 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
-import { runClaudeCliProcess, type SpawnCliProcess } from './cli-process'
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import type { SpawnOptions } from 'node:child_process'
+import {
+  runClaudeCliProcess,
+  realSpawnCliProcess,
+  type CliChildProcess,
+  type SpawnCliProcess,
+} from './cli-process'
 
-/** A fake child process: EventEmitter + fake stdout/stderr streams + a killed() spy,
+/** A fake child process: EventEmitter + fake stdin/stdout/stderr streams + a killed() spy,
  *  matching the narrow shape runClaudeCliProcess actually touches. */
 function fakeChild() {
   const child = new EventEmitter() as EventEmitter & {
+    stdin: PassThrough
     stdout: PassThrough
     stderr: PassThrough
     pid: number
     kill: (signal?: NodeJS.Signals | number) => boolean
     killed: boolean
+    stdinWritten: string
+    stdinEnded: boolean
   }
+  child.stdin = new PassThrough()
   child.stdout = new PassThrough()
   child.stderr = new PassThrough()
+  child.stdinWritten = ''
+  child.stdinEnded = false
+  child.stdin.on('data', (b: Buffer) => { child.stdinWritten += b.toString('utf8') })
+  child.stdin.on('end', () => { child.stdinEnded = true })
   child.pid = 4242
   child.killed = false
   child.kill = () => { child.killed = true; return true }
   return child
 }
 
+/** Every test injects this. The default `_killTree` fires a REAL `taskkill /F /T /PID 4242` at
+ *  whatever unrelated process owns that pid on the developer's machine, and "the test happens to
+ *  finish before the timer" is not a defence (review finding I2). */
+function killSpy() {
+  const pids: number[] = []
+  const spy = (pid: number) => { pids.push(pid) }
+  return { pids, spy }
+}
+
 test('resolves with captured stdout/stderr and exit code on a clean exit', async () => {
   const child = fakeChild()
+  const { spy } = killSpy()
   const spawnCalls: Array<{ cmd: string; args: string[] }> = []
   const fakeSpawn: SpawnCliProcess = (cmd, args) => { spawnCalls.push({ cmd, args }); return child }
 
   const resultPromise = runClaudeCliProcess(
-    ['-p', 'hello', '--output-format', 'stream-json'],
-    { cwd: '/repo', env: {}, timeoutMs: 5000 },
+    ['-p', '--output-format', 'stream-json'],
+    { cwd: '/repo', env: {}, stdin: 'hello', timeoutMs: 5000 },
     fakeSpawn,
+    spy,
   )
   child.stdout.end('{"type":"result","is_error":false,"result":"hi"}\n')
   child.stderr.end('')
@@ -51,8 +79,8 @@ test('kills the process and reports timedOut once the wall-clock timeout elapses
   const killedTrees: number[] = []
 
   const resultPromise = runClaudeCliProcess(
-    ['-p', 'loop forever'],
-    { cwd: '/repo', env: {}, timeoutMs: 10 },
+    ['-p'],
+    { cwd: '/repo', env: {}, stdin: 'loop forever', timeoutMs: 10 },
     fakeSpawn,
     (pid) => { killedTrees.push(pid) },
   )
@@ -73,7 +101,7 @@ test('a process that exits normally is never killed and never swept', async () =
   const child = fakeChild()
   const killedTrees: number[] = []
   const resultPromise = runClaudeCliProcess(
-    ['-p', 'x'],
+    ['-p'],
     { cwd: '/repo', env: {}, timeoutMs: 5000 },
     () => child,
     (pid) => { killedTrees.push(pid) },
@@ -87,8 +115,9 @@ test('a process that exits normally is never killed and never swept', async () =
 
 test('resolves with a non-zero exit code and stderr captured on a real CLI failure', async () => {
   const child = fakeChild()
+  const { spy } = killSpy()
   const fakeSpawn: SpawnCliProcess = () => child
-  const resultPromise = runClaudeCliProcess(['-p', 'x'], { cwd: '/repo', env: {}, timeoutMs: 5000 }, fakeSpawn)
+  const resultPromise = runClaudeCliProcess(['-p'], { cwd: '/repo', env: {}, timeoutMs: 5000 }, fakeSpawn, spy)
   child.stdout.end('')
   child.stderr.end('Error: not authenticated\n')
   child.emit('exit', 1, null)
@@ -99,8 +128,9 @@ test('resolves with a non-zero exit code and stderr captured on a real CLI failu
 
 test('spawn errors (ENOENT — CLI vanished between preflight and fire) resolve, never reject', async () => {
   const child = fakeChild()
+  const { spy } = killSpy()
   const fakeSpawn: SpawnCliProcess = () => child
-  const resultPromise = runClaudeCliProcess(['-p', 'x'], { cwd: '/repo', env: {}, timeoutMs: 5000 }, fakeSpawn)
+  const resultPromise = runClaudeCliProcess(['-p'], { cwd: '/repo', env: {}, timeoutMs: 5000 }, fakeSpawn, spy)
   child.emit('error', Object.assign(new Error('spawn claude ENOENT'), { code: 'ENOENT' }))
   const result = await resultPromise
   assert.equal(result.exitCode, null)
@@ -108,14 +138,28 @@ test('spawn errors (ENOENT — CLI vanished between preflight and fire) resolve,
   assert.match(result.stderr, /ENOENT/)
 })
 
+test('a synchronous throw from spawn resolves too, rather than rejecting', async () => {
+  const { spy } = killSpy()
+  const result = await runClaudeCliProcess(
+    ['-p'],
+    { cwd: '/repo', env: {}, timeoutMs: 5000 },
+    () => { throw new Error('EINVAL cannot spawn a .cmd without a shell') },
+    spy,
+  )
+  assert.equal(result.exitCode, null)
+  assert.match(result.stderr, /EINVAL/)
+})
+
 test('passes cwd and env through to the spawn call unchanged', async () => {
   const child = fakeChild()
+  const { spy } = killSpy()
   let seen: { cwd: string; env: NodeJS.ProcessEnv } | null = null
   const fakeSpawn: SpawnCliProcess = (_cmd, _args, opts) => { seen = opts; return child }
   const resultPromise = runClaudeCliProcess(
-    ['-p', 'x'],
+    ['-p'],
     { cwd: '/some/repo', env: { ANTHROPIC_BASE_URL: 'http://127.0.0.1:6996' }, timeoutMs: 5000 },
     fakeSpawn,
+    spy,
   )
   child.emit('exit', 0, null)
   await resultPromise
@@ -124,10 +168,220 @@ test('passes cwd and env through to the spawn call unchanged', async () => {
 
 test('spawns the literal `claude` binary, never a shell string', async () => {
   const child = fakeChild()
+  const { spy } = killSpy()
   let cmd: string | null = null
   const fakeSpawn: SpawnCliProcess = (c) => { cmd = c; return child }
-  const resultPromise = runClaudeCliProcess(['-p', 'x'], { cwd: '/repo', env: {}, timeoutMs: 5000 }, fakeSpawn)
+  const resultPromise = runClaudeCliProcess(['-p'], { cwd: '/repo', env: {}, timeoutMs: 5000 }, fakeSpawn, spy)
   child.emit('exit', 0, null)
   await resultPromise
   assert.equal(cmd, 'claude')
+})
+
+// ── C1: the prompt never reaches a command line ──────────────────────────────────────────────
+
+test('the prompt is written to the child stdin and never appears in argv', async () => {
+  const child = fakeChild()
+  const { spy } = killSpy()
+  let seenArgs: string[] = []
+  const prompt = 'summarize the "Q3 report" & flag risks %USERPROFILE%'
+  const resultPromise = runClaudeCliProcess(
+    ['-p', '--output-format', 'stream-json'],
+    { cwd: '/repo', env: {}, stdin: prompt, timeoutMs: 5000 },
+    (_cmd, args) => { seenArgs = args; return child },
+    spy,
+  )
+  child.stdout.end('')
+  child.stderr.end('')
+  child.emit('exit', 0, null)
+  await resultPromise
+  await new Promise((r) => setImmediate(r))
+
+  assert.ok(!seenArgs.some((a) => a.includes('Q3')), `prompt leaked into argv: ${JSON.stringify(seenArgs)}`)
+  assert.equal(child.stdinWritten, prompt)
+  assert.equal(child.stdinEnded, true)
+})
+
+test('stdin is closed even when there is no prompt, so a reading child sees EOF', async () => {
+  const child = fakeChild()
+  const { spy } = killSpy()
+  const resultPromise = runClaudeCliProcess(['--version'], { cwd: '/repo', env: {}, timeoutMs: 5000 }, () => child, spy)
+  child.emit('exit', 0, null)
+  await resultPromise
+  await new Promise((r) => setImmediate(r))
+  assert.equal(child.stdinWritten, '')
+  assert.equal(child.stdinEnded, true)
+})
+
+test('a hostile prompt executes nothing even with the shell branch forced', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'turbollm-cli-inj-'))
+  try {
+    const victim = join(dir, 'victim.cjs')
+    const marker = join(dir, 'INJECTED.txt')
+    writeFileSync(
+      victim,
+      [
+        "let input = ''",
+        "process.stdin.setEncoding('utf8')",
+        "process.stdin.on('data', (c) => { input += c })",
+        "process.stdin.on('end', () => {",
+        "  process.stdout.write(JSON.stringify({ argv: process.argv.slice(2), stdin: input }))",
+        '})',
+        '',
+      ].join('\n'),
+    )
+    // Both shells' break-out payloads in one string: cmd.exe's `"` + `&` chain (the exact shape
+    // the reviewer proved executed) and a POSIX `'; ...; #` chain.
+    const hostile = `a" & echo pwned> ${marker} & rem "; echo pwned > ${marker}; #`
+    // `needsShell: () => true` forces the branch that is only naturally reachable on a machine
+    // where `claude` is an npm-installed `.cmd` shim.
+    const spawnThroughShell: SpawnCliProcess = (_cmd, args, opts) =>
+      realSpawnCliProcess(process.execPath, args, opts, { needsShell: () => true })
+
+    const result = await runClaudeCliProcess(
+      [victim],
+      { cwd: dir, env: process.env, stdin: hostile, timeoutMs: 30_000 },
+      spawnThroughShell,
+      () => {},
+    )
+
+    assert.equal(existsSync(marker), false, `INJECTION SUCCEEDED — marker file was created. stdout=${result.stdout}`)
+    const seen = JSON.parse(result.stdout) as { argv: string[]; stdin: string }
+    assert.deepEqual(seen.argv, [], 'the prompt must not reach the child as an argument')
+    assert.equal(seen.stdin, hostile, 'the prompt must arrive on stdin byte-for-byte')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('an unquotable ARGUMENT on the shell branch is refused, not quoted', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'turbollm-cli-inj-'))
+  try {
+    const victim = join(dir, 'victim.cjs')
+    const marker = join(dir, 'INJECTED.txt')
+    writeFileSync(victim, "process.stdout.write('ran')\n")
+    const hostile = `a" & echo pwned> ${marker} & rem "`
+    const spawnThroughShell: SpawnCliProcess = (_cmd, args, opts) =>
+      realSpawnCliProcess(process.execPath, args, opts, { needsShell: () => true })
+
+    const result = await runClaudeCliProcess(
+      [victim, hostile],
+      { cwd: dir, env: process.env, timeoutMs: 30_000 },
+      spawnThroughShell,
+      () => {},
+    )
+
+    assert.equal(existsSync(marker), false, 'INJECTION SUCCEEDED — marker file was created')
+    assert.equal(result.exitCode, null)
+    assert.equal(result.stdout, '', 'nothing should have run at all')
+    assert.match(result.stderr, /refusing to build a shell command line/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// ── M6: realSpawnCliProcess's own branch selection ───────────────────────────────────────────
+
+function recordingSpawn() {
+  const calls: Array<{ cmd: string; args: string[] | null; opts: SpawnOptions }> = []
+  const spawn = (cmd: string, args: string[] | null, opts: SpawnOptions): CliChildProcess => {
+    calls.push({ cmd, args, opts })
+    return fakeChild()
+  }
+  return { calls, spawn }
+}
+
+test('realSpawnCliProcess: a resolved native binary is spawned directly, with an args array', () => {
+  const { calls, spawn } = recordingSpawn()
+  realSpawnCliProcess('claude', ['-p'], { cwd: '/repo', env: { PATH: '/opt/bin' } }, {
+    spawn,
+    resolve: () => '/opt/bin/claude',
+    needsShell: () => false,
+  })
+  assert.equal(calls[0]?.cmd, '/opt/bin/claude')
+  assert.deepEqual(calls[0]?.args, ['-p'])
+  assert.equal(calls[0]?.opts.shell, undefined, 'no shell must be involved on the direct branch')
+  assert.deepEqual(calls[0]?.opts.stdio, ['pipe', 'pipe', 'pipe'])
+  assert.equal(calls[0]?.opts.windowsHide, true)
+  assert.equal(calls[0]?.opts.detached, process.platform !== 'win32', 'detached on POSIX only')
+})
+
+test('realSpawnCliProcess: a .cmd shim takes the shell branch as ONE quoted command string', () => {
+  const { calls, spawn } = recordingSpawn()
+  realSpawnCliProcess('claude', ['-p', '--output-format', 'stream-json'], { cwd: '/repo', env: {} }, {
+    spawn,
+    resolve: () => 'C:\\npm\\claude.cmd',
+    needsShell: () => true,
+  })
+  assert.equal(calls[0]?.args, null, 'an args array alongside shell:true is deprecated (DEP0190)')
+  assert.equal(calls[0]?.opts.shell, true)
+  assert.match(String(calls[0]?.cmd), /^claude -p --output-format stream-json$/)
+})
+
+test('realSpawnCliProcess: an unresolvable command still falls back to the raw command name', () => {
+  const { calls, spawn } = recordingSpawn()
+  realSpawnCliProcess('claude', ['-p'], { cwd: '/repo', env: {} }, {
+    spawn,
+    resolve: () => null,
+    needsShell: () => false,
+  })
+  assert.equal(calls[0]?.cmd, 'claude')
+})
+
+test('realSpawnCliProcess: resolution uses the env the CHILD runs under, not process.env', () => {
+  const { spawn } = recordingSpawn()
+  let seenEnv: NodeJS.ProcessEnv | undefined
+  realSpawnCliProcess('claude', [], { cwd: '/repo', env: { PATH: '/service/only/bin' } }, {
+    spawn,
+    resolve: (_cmd, env) => { seenEnv = env; return '/service/only/bin/claude' },
+    needsShell: () => false,
+  })
+  assert.deepEqual(seenEnv, { PATH: '/service/only/bin' })
+})
+
+// ── I1 / I3 / M4: settlement guarantees ──────────────────────────────────────────────────────
+
+test('trailing stdout flushed AFTER the child exits is still captured', async () => {
+  const child = fakeChild()
+  const { spy } = killSpy()
+  const resultPromise = runClaudeCliProcess(['-p'], { cwd: '/repo', env: {}, timeoutMs: 5000 }, () => child, spy)
+  // The pi#5303 shape: the parent exits while a descendant still holds the pipe, and the final
+  // `result` event only lands afterwards. Resolving on 'exit' alone would drop it.
+  child.emit('exit', 0, null)
+  await new Promise((r) => setTimeout(r, 20))
+  child.stdout.write('{"type":"result","is_error":false,"result":"late but real"}\n')
+  child.stdout.end()
+  child.stderr.end()
+
+  const result = await resultPromise
+  assert.equal(result.exitCode, 0)
+  assert.match(result.stdout, /late but real/)
+})
+
+test('the wall-clock timeout resolves even when the child NEVER reports exit', async () => {
+  const child = fakeChild() // never emits 'exit', never ends its pipes — an unkillable child
+  const { pids, spy } = killSpy()
+  const startedAt = Date.now()
+  const result = await runClaudeCliProcess(
+    ['-p'],
+    { cwd: '/repo', env: {}, timeoutMs: 20 },
+    () => child,
+    spy,
+  )
+  assert.equal(result.timedOut, true)
+  assert.equal(result.exitCode, null)
+  assert.deepEqual(pids, [4242])
+  assert.ok(Date.now() - startedAt < 5000, 'must not wait on a child that never cooperates')
+})
+
+test('a stream-level error (EPIPE) is recorded rather than thrown out of band', async () => {
+  const child = fakeChild()
+  const { spy } = killSpy()
+  const resultPromise = runClaudeCliProcess(['-p'], { cwd: '/repo', env: {}, timeoutMs: 5000 }, () => child, spy)
+  child.stdout.emit('error', new Error('EPIPE broken pipe'))
+  child.stderr.end('')
+  child.emit('exit', 0, null)
+
+  const result = await resultPromise
+  assert.equal(result.exitCode, 0)
+  assert.match(result.stderr, /EPIPE/)
 })

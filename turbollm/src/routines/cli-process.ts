@@ -1,11 +1,35 @@
 // Non-interactive `claude` CLI subprocess runner for a CLI-flavor Code Routine's scheduled
-// fire — spec 20 §1's "programmatic mode", never a PTY. Deliberately spawned WITHOUT a shell
-// unless the resolved binary requires one (a .cmd/.bat PATHEXT shim), same rule cli-launch.ts's
-// realSpawn and agent-modes.ts's realHelpRunner already follow, for the same reason: a shell
-// parses arguments differently than the OS's own CreateProcess/execve, and this codebase found a
-// real command-injection bug going the other way (cli-launch.ts:86-100). That matters more here
-// than almost anywhere else in the daemon: a routine's `-p` argument is its stored prompt —
-// arbitrary user prose, written once at creation time and replayed unattended on a schedule.
+// fire — spec 20 §1's "programmatic mode", never a PTY.
+//
+// ── The prompt never touches a command line (review 2026-08-01, C1) ──────────────────────────
+// A routine's prompt is arbitrary free text: accepted over HTTP at creation time
+// (`POST /api/v1/routines`), stored, and then replayed UNATTENDED on a schedule. The first
+// version of this module passed it as an argv element (`-p <prompt>`), which is safe on the
+// direct-spawn path but NOT on the shell path this module still needs for a `.cmd`/`.bat` shim:
+// `quoteWindowsArg` escapes for CommandLineToArgvW, and cmd.exe does not use that parser — it
+// reads `\"` as CLOSING the quoted region, so a prompt containing a double quote broke out and
+// executed chained commands (reproduced by the reviewer with a marker file; the same class of bug
+// resolve-executable.ts:5-22 documents).
+//
+// The fix removes the quoting surface instead of trying to quote better: the prompt is written to
+// the child's STDIN and is never an argument at all, on any platform, whether `claude` resolves to
+// a native binary or a shim. That is a first-class input channel for the CLI, not a trick — with
+// `--print` and no positional prompt the binary itself says so:
+//
+//     $ claude -p --output-format stream-json --verbose < /dev/null
+//     Error: Input must be provided either through stdin or as a prompt argument when using --print
+//
+// So the only strings that can still reach a shell command line are TurboLLM's OWN fixed flags
+// (`--output-format`, `stream-json`, …). To keep that true as Task 6 grows the argument list,
+// `assertShellSafeArg` refuses — rather than quotes — any shell-path argument containing `"` or
+// `%`, the two characters this repo has measured cmd.exe mishandling (quote-breakout above, and
+// `%VAR%` expanding inside double quotes, shell-command.ts:41-44). A refusal surfaces as an
+// ordinary failed run, not as an injection.
+//
+// The shell itself cannot be dropped entirely: Node refuses to spawn a `.cmd`/`.bat` without one
+// (EINVAL, deliberate mitigation — resolve-executable.ts:19-22), and `requiresShell(null)` keeps
+// the old shell behaviour when the command cannot be resolved at all. Both branches are covered by
+// the rules above.
 //
 // The kill-on-timeout path below is a deliberately SIMPLER cousin of robust-bash.ts's
 // killProcessTreeVerified — that function's escalating, WMI-based, verify-it-actually-died
@@ -14,12 +38,29 @@
 // CLI invocation has no such audience: best-effort kill is an acceptable bar here (the same
 // "fast path only" tier robust-bash.ts itself calls killProcessTreeFast), without the
 // verify+escalate tier.
-import { spawn, type StdioOptions } from 'node:child_process'
-import type { Readable } from 'node:stream'
+import { spawn, type SpawnOptions, type StdioOptions } from 'node:child_process'
+import type { Readable, Writable } from 'node:stream'
 import { resolveExecutable, requiresShell } from '../util/resolve-executable'
 import { buildShellCommand } from '../util/shell-command'
 
-export const CLI_ROUTINE_TIMEOUT_MS = 600_000 // 10 minutes — see this plan's Self-review notes.
+/** 10 minutes. Deliberately the same value as runaway-guard.ts's `ROUTINE_RUN_TIMEOUT_MS`, which
+ *  carries the reasoning for the number and is the ceiling the Chat-flavor path uses; the two are
+ *  still separate constants because this one bounds a subprocess and that one bounds an
+ *  AbortController, and collapsing them is a follow-up, not a silent import. */
+export const CLI_ROUTINE_TIMEOUT_MS = 600_000
+
+/** After the child exits, how long its stdout/stderr may stay idle before the result is taken as
+ *  complete. Same constant and same reason as robust-bash.ts's `EXIT_STDIO_GRACE_MS`: a detached
+ *  descendant can hold the pipes open past its parent's exit, so resolving on `'exit'` alone
+ *  truncates trailing output (here: the final `result` event), while waiting for `'close'` alone
+ *  hangs if that descendant never lets go. */
+const EXIT_STDIO_GRACE_MS = 100
+
+/** After the wall-clock timeout fires and the kill is issued, how long the child gets to report
+ *  its own exit before the promise resolves anyway. Spec 20 §6 asks for a HARD timeout: a child
+ *  the kill cannot touch (elevated, uninterruptible, or a shell whose real target the tree sweep
+ *  missed) must not be able to keep a RoutineRun pinned at `running` forever. */
+export const CLI_KILL_GRACE_MS = 1_000
 
 export interface CliProcessResult {
   exitCode: number | null
@@ -35,15 +76,17 @@ export interface CliProcessResult {
  *  looks equivalent but is not usable: `ChildProcess.on` is declared with a polymorphic `this`
  *  return, so picking it yields `(...) => ChildProcess` — a fake would have to BE a full
  *  ChildProcess (stdin, stdio, connected, exitCode, and 8 more) to satisfy the one method we
- *  call, which defeats the entire point of a narrow injection seam. Declaring `on` with the two
+ *  call, which defeats the entire point of a narrow injection seam. Declaring `on` with the
  *  events actually subscribed, returning `unknown`, keeps a real ChildProcess assignable while
  *  letting a plain EventEmitter stand in. */
 export interface CliChildProcess {
   pid?: number
+  stdin: Writable | null
   stdout: Readable | null
   stderr: Readable | null
   on(event: 'error', listener: (err: Error) => void): unknown
   on(event: 'exit', listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown
+  on(event: 'close', listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown
   kill(signal?: NodeJS.Signals | number): boolean
 }
 
@@ -71,31 +114,78 @@ export function killCliProcessTree(pid: number): void {
   }
 }
 
-export const realSpawnCliProcess: SpawnCliProcess = (cmd, args, opts) => {
-  const resolved = resolveExecutable(cmd)
+/** cmd.exe mishandles exactly these two inside a double-quoted argument: `"` closes the quoted
+ *  region (the C1 injection), and `%` still expands as `%VAR%` with no in-line escape. See the
+ *  module comment — nothing TurboLLM puts in `args` contains either, so this is a tripwire for
+ *  future arguments, never a filter applied to user prose (prose goes on stdin). */
+const SHELL_UNSAFE_ARG = /["%]/
+
+function assertShellSafeArg(arg: string): void {
+  if (SHELL_UNSAFE_ARG.test(arg)) {
+    throw new Error(
+      `refusing to build a shell command line containing an unquotable argument: ${JSON.stringify(arg.slice(0, 80))}`,
+    )
+  }
+}
+
+/** The two `spawn` overloads this module uses, as one injectable function: `args === null` selects
+ *  the single-command-string form `{ shell: true }` requires (passing an args array alongside
+ *  `shell: true` is deprecated — DEP0190, shell-command.ts:4-8). */
+type RawSpawn = (cmd: string, args: string[] | null, opts: SpawnOptions) => CliChildProcess
+
+const defaultRawSpawn: RawSpawn = (cmd, args, opts) => (args === null ? spawn(cmd, opts) : spawn(cmd, args, opts))
+
+/** Seams for `realSpawnCliProcess`'s own tests: the shell-vs-direct decision is security-relevant
+ *  (see C1 in the module comment) and its two branches are otherwise only reachable by having a
+ *  real `.cmd` shim on the running machine's PATH. */
+export interface RealSpawnDeps {
+  spawn?: RawSpawn
+  resolve?: (command: string, env?: NodeJS.ProcessEnv) => string | null
+  needsShell?: (resolvedPath: string | null) => boolean
+}
+
+export function realSpawnCliProcess(
+  cmd: string,
+  args: string[],
+  opts: { cwd: string; env: NodeJS.ProcessEnv },
+  deps: RealSpawnDeps = {},
+): CliChildProcess {
+  const rawSpawn = deps.spawn ?? defaultRawSpawn
+  const resolve = deps.resolve ?? resolveExecutable
+  const needsShell = deps.needsShell ?? requiresShell
+  // Resolved against the env the CHILD will actually run under, not the daemon's own: a service
+  // with a minimal PATH would otherwise resolve one binary form here and execute another.
+  const resolved = resolve(cmd, opts.env)
   // `detached` on POSIX only — same as robust-bash.ts:215. It is what gives the child its own
   // process group, which is the precondition for killCliProcessTree's group SIGKILL reaching the
   // tool subprocesses `claude` spawns rather than just `claude` itself.
-  const base = {
-    ...opts,
+  const base: SpawnOptions = {
+    cwd: opts.cwd,
+    env: opts.env,
     detached: process.platform !== 'win32',
-    stdio: ['ignore', 'pipe', 'pipe'] as StdioOptions,
+    // stdin is a PIPE, not 'ignore': it is how the prompt is delivered (module comment, C1).
+    stdio: ['pipe', 'pipe', 'pipe'] as StdioOptions,
     windowsHide: true,
   }
-  if (requiresShell(resolved)) {
-    return spawn(buildShellCommand(cmd, args), { ...base, shell: true })
+  if (needsShell(resolved)) {
+    for (const arg of args) assertShellSafeArg(arg)
+    return rawSpawn(buildShellCommand(cmd, args), null, { ...base, shell: true })
   }
-  return spawn(resolved ?? cmd, args, base)
+  return rawSpawn(resolved ?? cmd, args, base)
 }
 
-/** Spawn `claude` with `args`, capture stdout/stderr in full (a routine's response is never
- *  large enough to warrant streaming to disk), and enforce a hard wall-clock timeout — spec 20
- *  §6's runaway-protection requirement (the loop-detection half is already handled for free by
- *  the gateway, see this plan's Investigation findings §4).
+/** Spawn `claude` with `args`, write `opts.stdin` (the routine's prompt) to the child's stdin,
+ *  capture stdout/stderr in full (a routine's response is never large enough to warrant streaming
+ *  to disk), and enforce a hard wall-clock timeout — spec 20 §6's runaway-protection requirement.
+ *  Only the timeout half is this module's: the loop-detection half is handled upstream, by the
+ *  gateway the CLI is pointed at plus runaway-guard.ts's `ToolLoopTracker`.
  *
- *  Never rejects: a spawn failure (ENOENT, EACCES) resolves with `exitCode: null` and the error
- *  message appended to stderr, so the caller has exactly one outcome shape to record on the
- *  RoutineRun rather than a try/catch plus a result branch.
+ *  The prompt belongs in `opts.stdin` and must NOT be put in `args` — see the module comment's C1
+ *  section for why that is a security property and not a style preference.
+ *
+ *  Never rejects: a spawn failure (ENOENT, EACCES, or a refused shell argument) resolves with
+ *  `exitCode: null` and the error message appended to stderr, so the caller has exactly one
+ *  outcome shape to record on the RoutineRun rather than a try/catch plus a result branch.
  *
  *  `_killTree` is injectable for the same reason `_spawn` is, and it is NOT optional politeness:
  *  the OS-level sweep is fire-and-forget against a raw pid, so a test running against a FAKE child
@@ -104,17 +194,52 @@ export const realSpawnCliProcess: SpawnCliProcess = (cmd, args, opts) => {
  *  be swapped as a pair or the mock isn't actually a mock. */
 export function runClaudeCliProcess(
   args: string[],
-  opts: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs?: number },
+  opts: { cwd: string; env: NodeJS.ProcessEnv; stdin?: string; timeoutMs?: number },
   _spawn: SpawnCliProcess = realSpawnCliProcess,
   _killTree: (pid: number) => void = killCliProcessTree,
 ): Promise<CliProcessResult> {
   return new Promise((resolve) => {
     const timeoutMs = opts.timeoutMs ?? CLI_ROUTINE_TIMEOUT_MS
-    const child = _spawn('claude', args, { cwd: opts.cwd, env: opts.env })
     let stdout = ''
     let stderr = ''
     let timedOut = false
     let settled = false
+
+    let child: CliChildProcess
+    try {
+      child = _spawn('claude', args, { cwd: opts.cwd, env: opts.env })
+    } catch (e) {
+      // A synchronous spawn throw (EINVAL from Node's own .cmd guard, or assertShellSafeArg)
+      // takes the same shape as an async 'error' — the contract is "never rejects".
+      resolve({ exitCode: null, stdout, stderr: `${stderr}\n${(e as Error).message}`, timedOut })
+      return
+    }
+
+    let exited = false
+    let exitCode: number | null = null
+    let stdoutEnded = child.stdout === null
+    let stderrEnded = child.stderr === null
+    let graceTimer: ReturnType<typeof setTimeout> | undefined
+
+    const finish = () => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      if (graceTimer) clearTimeout(graceTimer)
+      child.stdout?.destroy()
+      child.stderr?.destroy()
+      resolve({ exitCode, stdout, stderr, timedOut })
+    }
+    /** Exit seen but a pipe still open: settle once the pipes have been idle this long, so a
+     *  descendant that never closes them cannot hold the run open (robust-bash.ts's shape). */
+    const armGrace = (ms: number) => {
+      if (graceTimer) clearTimeout(graceTimer)
+      graceTimer = setTimeout(finish, ms)
+    }
+    const finishIfDrained = () => {
+      if (!exited || settled) return
+      if (stdoutEnded && stderrEnded) finish()
+    }
 
     const timer = setTimeout(() => {
       timedOut = true
@@ -123,24 +248,48 @@ export function runClaudeCliProcess(
       // the tree sweep is a no-op (a fake child, or a POSIX child that never became a group leader).
       try { child.kill('SIGKILL') } catch { /* already dead */ }
       if (child.pid) _killTree(child.pid)
+      // Then settle regardless of whether the child cooperates: the kill is best-effort, so the
+      // promise must not depend on it landing (see CLI_KILL_GRACE_MS).
+      armGrace(CLI_KILL_GRACE_MS)
     }, timeoutMs)
 
-    child.stdout?.on('data', (b: Buffer) => { stdout += b.toString('utf8') })
-    child.stderr?.on('data', (b: Buffer) => { stderr += b.toString('utf8') })
+    child.stdout?.on('data', (b: Buffer) => { stdout += b.toString('utf8'); if (exited) armGrace(EXIT_STDIO_GRACE_MS) })
+    child.stderr?.on('data', (b: Buffer) => { stderr += b.toString('utf8'); if (exited) armGrace(EXIT_STDIO_GRACE_MS) })
+    child.stdout?.once('end', () => { stdoutEnded = true; finishIfDrained() })
+    child.stderr?.once('end', () => { stderrEnded = true; finishIfDrained() })
+    // A stream-level error (EPIPE on a killed child is the common one) would otherwise throw out
+    // of band with no handler attached. Record it and treat that pipe as finished — it will never
+    // emit 'end' now, and the run's outcome is decided by the child's exit, not by the pipe.
+    child.stdout?.on('error', (e: Error) => { stderr += `\n${e.message}`; stdoutEnded = true; finishIfDrained() })
+    child.stderr?.on('error', (e: Error) => { stderr += `\n${e.message}`; stderrEnded = true; finishIfDrained() })
+
+    // The prompt. Always end stdin, even when there is nothing to send, so a child that reads it
+    // sees EOF instead of blocking forever.
+    if (child.stdin) {
+      child.stdin.on('error', (e: Error) => { stderr += `\n${e.message}` })
+      child.stdin.end(opts.stdin ?? '')
+    }
 
     child.on('error', (e: Error) => {
       if (settled) return
-      settled = true
-      clearTimeout(timer)
       stderr += `\n${e.message}`
-      resolve({ exitCode: null, stdout, stderr, timedOut })
+      exitCode = null
+      finish()
     })
 
     child.on('exit', (code: number | null) => {
       if (settled) return
-      settled = true
-      clearTimeout(timer)
-      resolve({ exitCode: code, stdout, stderr, timedOut })
+      exited = true
+      exitCode = code
+      finishIfDrained()
+      if (!settled) armGrace(EXIT_STDIO_GRACE_MS)
+    })
+
+    // Both pipes closed AND the child gone: nothing further can arrive.
+    child.on('close', (code: number | null) => {
+      if (settled) return
+      if (!exited) exitCode = code
+      finish()
     })
   })
 }
