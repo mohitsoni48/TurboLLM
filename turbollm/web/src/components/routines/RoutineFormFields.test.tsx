@@ -35,9 +35,9 @@ function renderForm() {
   return render(<QueryClientProvider client={qc}><Harness /></QueryClientProvider>)
 }
 
-function renderControlled(draft: RoutineDraft, onChange: (d: RoutineDraft) => void, disabled?: boolean) {
+function renderControlled(draft: RoutineDraft, onChange: (d: RoutineDraft) => void, disabled?: boolean, lockFlavor?: boolean) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(<QueryClientProvider client={qc}><RoutineFormFields draft={draft} onChange={onChange} disabled={disabled} /></QueryClientProvider>)
+  return render(<QueryClientProvider client={qc}><RoutineFormFields draft={draft} onChange={onChange} disabled={disabled} lockFlavor={lockFlavor} /></QueryClientProvider>)
 }
 
 describe('RoutineFormFields', () => {
@@ -146,6 +146,39 @@ describe('RoutineFormFields — flavor toggle', () => {
     expect(next.workspacePath).toBeUndefined()
     expect(next.codingAgent).toBeUndefined()
     expect(next.permissionMode).toBeUndefined()
+  })
+})
+
+// M4 — `lockFlavor` must be surgical: PUT cannot change a routine's flavor, so any surface editing
+// an existing row has to take the toggle away WITHOUT taking the rest of the form away.
+describe('RoutineFormFields — lockFlavor', () => {
+  it('disables the flavor toggle and nothing else', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    renderControlled(emptyRoutineDraft(), onChange, undefined, true)
+    expect(screen.getByRole('button', { name: 'Chat' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Code' })).toBeDisabled()
+    // Every other control stays live — this is not `disabled`.
+    expect(screen.getByPlaceholderText(/What should this routine do/)).not.toBeDisabled()
+    expect(screen.getByLabelText('Model')).not.toBeDisabled()
+    expect(screen.getByLabelText('Agent')).not.toBeDisabled()
+    expect(screen.getByLabelText('Schedule')).not.toBeDisabled()
+    await user.type(screen.getByPlaceholderText(/What should this routine do/), 'x')
+    expect(onChange).toHaveBeenCalledWith({ ...emptyRoutineDraft(), prompt: 'x' })
+  })
+
+  it('explains itself rather than leaving two dead buttons', () => {
+    renderControlled(emptyRoutineDraft(), vi.fn(), undefined, true)
+    expect(screen.getByText(/flavor is fixed once it exists/i)).toBeInTheDocument()
+  })
+
+  it('leaves the toggle live by default, and says nothing', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    renderControlled(emptyRoutineDraft(), onChange)
+    expect(screen.queryByText(/flavor is fixed once it exists/i)).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Code' }))
+    expect((onChange.mock.calls[0][0] as RoutineDraft).flavor).toBe('code')
   })
 })
 

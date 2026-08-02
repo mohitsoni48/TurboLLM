@@ -51,8 +51,17 @@ function withFlavor(draft: RoutineDraft, flavor: RoutineDraft['flavor']): Routin
  *  hardcoded list. Models are offered unfiltered — deliberately not narrowed to
  *  `compatibleWithActiveEngine` the way the Code launchpad's picker is: a routine names a
  *  model for a run that happens later, under whichever engine is active then, so filtering on
- *  today's engine would hide valid choices. */
-export function RoutineFormFields({ draft, onChange, disabled }: { draft: RoutineDraft; onChange: (d: RoutineDraft) => void; disabled?: boolean }) {
+ *  today's engine would hide valid choices.
+ *
+ *  `lockFlavor` disables the Chat/Code toggle ALONE, leaving every other field editable —
+ *  distinct from `disabled`, which inerts the whole form. Any surface editing a routine that
+ *  already exists must set it: `PUT /api/v1/routines/:id` cannot change `flavor`
+ *  (routine-api.ts's `updateRoutine`; routine-routes.ts's `validateUpdate` re-checks
+ *  flavor-dependent invariants against the routine's CURRENT flavor). Left live, the toggle
+ *  swaps which fields the form collects, the embedding confirm card's diff advertises code-only
+ *  changes the flavor switch appears to justify, and the server persists those fields onto a
+ *  routine whose flavor never moved — a gate that describes something other than what happens. */
+export function RoutineFormFields({ draft, onChange, disabled, lockFlavor }: { draft: RoutineDraft; onChange: (d: RoutineDraft) => void; disabled?: boolean; lockFlavor?: boolean }) {
   const [browserOpen, setBrowserOpen] = useState(false)
   const agentsQ = useChatAgents()
   const modelsQ = useModels()
@@ -87,7 +96,7 @@ export function RoutineFormFields({ draft, onChange, disabled }: { draft: Routin
             <button
               key={f}
               type="button"
-              disabled={disabled}
+              disabled={disabled || lockFlavor}
               aria-pressed={draft.flavor === f}
               onClick={() => onChange(withFlavor(draft, f))}
               className={`rounded px-3 py-1.5 text-[13px] font-medium transition-colors ${draft.flavor === f ? 'bg-accent/12 text-accent' : 'text-muted hover:text-ink'}`}
@@ -96,6 +105,8 @@ export function RoutineFormFields({ draft, onChange, disabled }: { draft: Routin
             </button>
           ))}
         </div>
+        {/* Say why, rather than leaving two dead buttons the user has to guess about. */}
+        {lockFlavor && <span className="text-[11px] text-faint">A routine&apos;s flavor is fixed once it exists — editing cannot change it.</span>}
       </div>
 
       <div className="flex flex-col gap-1.5">

@@ -2,7 +2,7 @@ import { useRef, useState } from 'react'
 import { CheckCircle2, Pencil, X } from 'lucide-react'
 import { Button } from '../ui/button'
 import { toast } from '../ui/sonner'
-import { ApiError } from '../../lib/api'
+import { describeRoutineError } from '../../lib/routine-api'
 import { useRoutineMutations } from '../../lib/routine-queries'
 import { RoutineFormFields } from './RoutineFormFields'
 import { describeScheduleRule, isRoutineDraftComplete, routineToDraft, type RoutineDraft } from '../../lib/routine-form'
@@ -43,7 +43,9 @@ const FIELD_LABELS: { key: DiffKey; label: string }[] = [
  *  routine's CURRENT flavor), and worse, its code gate reads
  *  `(routine.flavor === 'code' || b.flavor === 'code')` — so sending `flavor: 'code'` in the body
  *  can raise a 401 on a routine the caller is otherwise allowed to edit. Omitting it keeps the
- *  patch to fields the server will actually apply. */
+ *  patch to fields the server will actually apply. Because the field is unpatchable, the inline
+ *  editor below also renders with `lockFlavor` — a toggle the server would ignore has no business
+ *  on a confirm gate. */
 function draftToPatch(d: RoutineDraft, scheduleDisplay: string): Partial<RoutineInput> {
   return {
     prompt: d.prompt,
@@ -55,20 +57,6 @@ function draftToPatch(d: RoutineDraft, scheduleDisplay: string): Partial<Routine
     codingAgent: d.codingAgent,
     permissionMode: d.permissionMode,
   }
-}
-
-/** Every write this card makes (confirm / update / delete) can answer 401 for a code-flavor
- *  routine from a non-host device — routine-api.ts's header comment names catching that status
- *  and toasting it as this surface's obligation, because a deliberate decision not to wire
- *  auth-signal.ts means no AuthGate ever appears: this toast is the ONLY auth feedback the user
- *  gets. Labelled explicitly rather than folded into the generic message so it reads as an
- *  authorization problem, not a transient failure the user should just retry. */
-function describeRoutineError(e: unknown, fallback: string): string {
-  if (e instanceof ApiError) {
-    if (e.status === 401) return `Not authorized: ${e.message}`
-    return e.message
-  }
-  return fallback
 }
 
 /** Old→new diff for an update_routine confirm card — spec 20 §3 item 4. Plain field list
@@ -100,18 +88,36 @@ function RoutineUpdateDiff({ previous, next }: { previous: Routine; next: Routin
  *  or it is orphaned in the database forever. For `update` nothing is persisted yet — Confirm is
  *  the `PUT /:id` itself, and Cancel makes NO request at all.
  *
- *  MOUNTING CONTRACT: this card seeds its editable draft from props ONCE (useState initialisers).
- *  A consumer that swaps which routine a mounted card is showing must give it a
- *  `key={routine.id}` so React remounts it; the mutation target is read straight from props on
- *  every call (see `routineId` below) so even a missed remount can never confirm or delete a
- *  different routine than the one on screen. */
+ *  MOUNTING CONTRACT — PROPS ARE THE SOURCE OF TRUTH. Nothing this card shows, gates on, or
+ *  writes is captured by a `useState` initialiser: the mutation target (`routineId`), the base
+ *  draft (`baseDraft`), the completeness gate and the diff are all re-derived from props on
+ *  every render. That is deliberate and it is the whole safety property — a `useState`
+ *  initialiser runs at mount only, so a re-render with new props would leave the card
+ *  displaying, gating and confirming the SUPERSEDED value. The live case is a consumer handing
+ *  a still-mounted card a revised proposal for the SAME routine (Task 8's transcript can replace
+ *  a tool-call record in place, so a corrected `update_routine` call reuses the routine id and
+ *  changes only the draft); that now flows through to the diff, the gate and the PUT body.
+ *
+ *  Exactly two pieces of local state sit on top, and both record an explicit USER ACTION rather
+ *  than a captured prop: `saved` (create mode — the server's reply to an inline-edit PUT) and
+ *  `edited` (the inline editor's overlay). Neither is cleared by a prop change, which is the one
+ *  thing `key={routine.id}` is still for: a consumer swapping which routine a mounted card shows
+ *  should pass it so the previous routine's half-finished inline edit is discarded (same for a
+ *  create↔update `mode` swap on one id). What `key` is NOT load-bearing for, and what holds
+ *  without it: the routine this card confirms, and the content it confirms, both track props. */
 export function RoutineConfirmCard(props: Props) {
   const [editing, setEditing] = useState(false)
   const [resolved, setResolved] = useState<'confirmed' | 'cancelled' | null>(null)
-  const [draft, setDraft] = useState<RoutineDraft>(props.mode === 'create' ? routineToDraft(props.routine) : props.draft)
   /** Create mode only: the server's copy after an inline edit was saved. Null until then, so the
    *  summary falls back to the routine prop. Deliberately NOT the source of the mutation id. */
   const [saved, setSaved] = useState<Routine | null>(null)
+  /** The inline editor's overlay, and the ONLY local copy of the draft. Null unless the user
+   *  opened "Edit inline" and changed something, so the card otherwise re-derives its draft from
+   *  props every render. "Cancel edit" clears it; a successful create-mode save clears it too
+   *  (the server's reply becomes the new base via `saved`). Mirrors what `saved` already does for
+   *  create mode's summary: a user-intent overlay layered on an always-fresh prop, never a
+   *  snapshot of that prop. */
+  const [edited, setEdited] = useState<RoutineDraft | null>(null)
   /** Synchronous re-entry guard. `mut.*.isPending` only flips after a React state update, so two
    *  clicks dispatched inside one tick would both pass an `isPending`-only check and fire two
    *  writes (two DELETEs, or a confirm racing a confirm). A ref changes in the same tick. */
@@ -119,9 +125,13 @@ export function RoutineConfirmCard(props: Props) {
   const mut = useRoutineMutations()
 
   const routineId = props.mode === 'create' ? props.routine.id : props.original.id
+  const base = props.mode === 'create' ? (saved ?? props.routine) : props.original
+  /** Recomputed from props on every render — see the MOUNTING CONTRACT above. In update mode the
+   *  proposal IS `props.draft`; in create mode the pending row itself is the proposal. */
+  const baseDraft: RoutineDraft = props.mode === 'create' ? routineToDraft(base) : props.draft
+  const draft = edited ?? baseDraft
   const complete = isRoutineDraftComplete(draft)
   const scheduleDisplay = describeScheduleRule(draft.scheduleRule)
-  const base = props.mode === 'create' ? (saved ?? props.routine) : props.original
   const effective: Routine =
     props.mode === 'create'
       ? base
@@ -150,7 +160,9 @@ export function RoutineConfirmCard(props: Props) {
       mut.update.mutate(
         { id: routineId, patch: draftToPatch(draft, scheduleDisplay) },
         {
-          onSuccess: (updated) => { setSaved(updated); setDraft(routineToDraft(updated)); setEditing(false) },
+          // Drop the overlay rather than reseeding it: `saved` becomes the new base, so the
+          // draft is once again derived, not captured.
+          onSuccess: (updated) => { setSaved(updated); setEdited(null); setEditing(false) },
           onError: (e) => toast.error(describeRoutineError(e, 'Could not save your edit.')),
           onSettled: () => { inFlight.current = false },
         },
@@ -193,12 +205,16 @@ export function RoutineConfirmCard(props: Props) {
     if (resolved || editing || inFlight.current) return
     if (props.mode === 'create') {
       inFlight.current = true
-      mut.remove.mutate(routineId, {
-        // Surfaced rather than swallowed: a failed delete (a 401 in particular) means the pending
-        // row is still there, and the user is the only one who can act on that.
-        onError: (e) => toast.error(describeRoutineError(e, 'Could not discard this routine.')),
-        onSettled: () => { inFlight.current = false },
-      })
+      // Deliberately NO per-call `onError` here. A failed delete must still be surfaced (the
+      // pending row is still in the database, and a 401 is this feature's only auth signal), but
+      // `props.onCancelled()` two lines down runs synchronously and a consumer that unmounts this
+      // card in response destroys the observer before the DELETE settles — TanStack Query v5 then
+      // skips per-`mutate` callbacks entirely. The toast therefore lives on the `remove` mutation
+      // definition (routine-queries.ts), which fires regardless of this component's lifetime;
+      // adding one back here would double-toast, since Query runs both levels. `onSettled` stays
+      // per-call: it only clears this component's own ref, and skipping it on a dead card is
+      // exactly right.
+      mut.remove.mutate(routineId, { onSettled: () => { inFlight.current = false } })
     }
     setResolved('cancelled')
     props.onCancelled()
@@ -210,9 +226,17 @@ export function RoutineConfirmCard(props: Props) {
 
       {editing ? (
         <div className="flex flex-col gap-3">
-          <RoutineFormFields draft={draft} onChange={setDraft} disabled={mut.update.isPending} />
+          {/* `lockFlavor` in BOTH modes, deliberately. Every write this card makes to an existing
+              row is a PUT, and PUT cannot change `flavor` (hence `draftToPatch` omitting it) —
+              that is as true of create mode's inline-edit save against the still
+              `pending_confirmation` row as it is of update mode's Confirm. Left live, the toggle
+              would let the user flip Chat→Code, watch the diff advertise workspace / coding-agent
+              / permission-mode changes, and get those fields persisted onto a routine the server
+              keeps at its original flavor: a gate describing something other than what happens.
+              Changing a routine's flavor means deleting it and creating a new one. */}
+          <RoutineFormFields draft={draft} onChange={setEdited} disabled={mut.update.isPending} lockFlavor />
           <div className="flex gap-1.5">
-            <Button size="sm" variant="outline" disabled={mut.update.isPending} onClick={() => { setDraft(props.mode === 'create' ? routineToDraft(saved ?? props.routine) : props.draft); setEditing(false) }}>
+            <Button size="sm" variant="outline" disabled={mut.update.isPending} onClick={() => { setEdited(null); setEditing(false) }}>
               Cancel edit
             </Button>
             <Button size="sm" onClick={saveEdit} disabled={!complete || mut.update.isPending}>Save changes</Button>

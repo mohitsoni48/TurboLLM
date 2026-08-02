@@ -1,7 +1,9 @@
 import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
+import { toast } from '../components/ui/sonner'
 import {
-  approveRoutineRun, confirmRoutine, createRoutine, deleteRoutine, denyRoutineRun, getRoutine,
-  listRoutineRuns, listRoutines, pauseRoutine, resumeRoutine, runRoutineNow, updateRoutine,
+  approveRoutineRun, confirmRoutine, createRoutine, deleteRoutine, denyRoutineRun,
+  describeRoutineError, getRoutine, listRoutineRuns, listRoutines, pauseRoutine, resumeRoutine,
+  runRoutineNow, updateRoutine,
 } from './routine-api'
 import type { Routine, RoutineInput, RoutineRun } from './routine-types'
 
@@ -80,7 +82,24 @@ export function useRoutineMutations() {
       mutationFn: (v: { id: string; patch: Partial<RoutineInput> }) => updateRoutine(v.id, v.patch),
       onSuccess: (_r, v) => { refreshList(); void qc.invalidateQueries({ queryKey: routineKeys.detail(v.id) }) },
     }),
-    remove: useMutation({ mutationFn: (id: string) => deleteRoutine(id), onSuccess: refreshList }),
+    /** The failure toast lives on the MUTATION DEFINITION, not on the caller's `mutate(..., {
+     *  onError })` options, and that placement is load-bearing. RoutineConfirmCard's Cancel fires
+     *  this DELETE and then synchronously calls `props.onCancelled()`; a consumer that reacts by
+     *  unmounting the card (a transcript card being replaced, a wizard step advancing) destroys
+     *  the MutationObserver before the request settles, and TanStack Query v5 skips per-`mutate`
+     *  callbacks once an observer has no listeners (`MutationObserver` guards its `mutateOptions`
+     *  dispatch on `hasListeners()`). `Mutation#execute` invokes THESE callbacks directly, with no
+     *  listener check, so they fire whether or not the card survived.
+     *
+     *  That matters precisely here: a failed discard leaves the routine sitting in the database as
+     *  an orphaned `pending_confirmation` row, and a 401 on this path is the only auth feedback
+     *  this feature ever produces (routine-api.ts's header comment). Callers must NOT add their
+     *  own `onError` toast on top — TanStack Query runs both levels, which would double-toast. */
+    remove: useMutation({
+      mutationFn: (id: string) => deleteRoutine(id),
+      onSuccess: refreshList,
+      onError: (e) => toast.error(describeRoutineError(e, 'Could not delete this routine.')),
+    }),
     confirm: useMutation({
       mutationFn: (id: string) => confirmRoutine(id),
       onSuccess: (_r, id) => { refreshList(); void qc.invalidateQueries({ queryKey: routineKeys.detail(id) }) },

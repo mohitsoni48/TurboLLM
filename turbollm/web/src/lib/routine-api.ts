@@ -16,6 +16,25 @@
 import { ApiError, authHeaders } from './api'
 import type { Routine, RoutineInput, RoutineRun } from './routine-types'
 
+/** Every routine write (create / update / confirm / delete / pause / resume / run-now /
+ *  approve / deny) can answer 401 for a code-flavor routine from a non-host device — this
+ *  module's header comment names catching that status and toasting it as the UI's obligation,
+ *  because the deliberate decision not to wire auth-signal.ts means no AuthGate ever appears:
+ *  that toast is the ONLY auth feedback the user gets. Labelled explicitly rather than folded
+ *  into the generic message so it reads as an authorization problem, not a transient failure
+ *  the user should just retry.
+ *
+ *  Lives here rather than in the one component that first needed it because the `remove`
+ *  mutation in routine-queries.ts toasts at the mutation level (see the comment there) and
+ *  must produce the identical wording. */
+export function describeRoutineError(e: unknown, fallback: string): string {
+  if (e instanceof ApiError) {
+    if (e.status === 401) return `Not authorized: ${e.message}`
+    return e.message
+  }
+  return fallback
+}
+
 async function req<T>(path: string, init?: RequestInit & { json?: unknown }): Promise<T> {
   const headers: Record<string, string> = { Accept: 'application/json', ...authHeaders(), ...((init?.headers as Record<string, string>) ?? {}) }
   let body = init?.body
