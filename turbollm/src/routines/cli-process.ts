@@ -58,7 +58,10 @@ const EXIT_STDIO_GRACE_MS = 100
 /** After the wall-clock timeout fires and the kill is issued, how long the child gets to report
  *  its own exit before the promise resolves anyway. Spec 20 §6 asks for a HARD timeout: a child
  *  the kill cannot touch (elevated, uninterruptible, or a shell whose real target the tree sweep
- *  missed) must not be able to keep a RoutineRun pinned at `running` forever. */
+ *  missed) must not be able to keep a RoutineRun pinned at `running` forever.
+ *
+ *  This is an ABSOLUTE ceiling, not a sliding window: total settlement is bounded by
+ *  `timeoutMs + CLI_KILL_GRACE_MS` no matter what the child does afterwards. See `armGrace`. */
 export const CLI_KILL_GRACE_MS = 1_000
 
 export interface CliProcessResult {
@@ -243,6 +246,10 @@ export function runClaudeCliProcess(
     let stdoutEnded = child.stdout === null
     let stderrEnded = child.stderr === null
     let graceTimer: ReturnType<typeof setTimeout> | undefined
+    /** Absolute wall-clock instant after which this promise MUST be settled, set exactly once, by
+     *  the wall-clock timer, and never moved afterwards. `undefined` until that timer fires — a run
+     *  that finishes on its own is not on a deadline at all. */
+    let hardDeadlineAt: number | undefined
 
     const finish = () => {
       if (settled) return
@@ -254,10 +261,25 @@ export function runClaudeCliProcess(
       resolve({ exitCode, stdout, stderr, timedOut })
     }
     /** Exit seen but a pipe still open: settle once the pipes have been idle this long, so a
-     *  descendant that never closes them cannot hold the run open (robust-bash.ts's shape). */
+     *  descendant that never closes them cannot hold the run open (robust-bash.ts's shape).
+     *
+     *  Every request is CLAMPED to what is left of `hardDeadlineAt`, and that is what makes spec
+     *  20 §6's timeout hard rather than soft (re-review 2026-08-01, N1). The window is re-armable
+     *  by the child — each post-exit chunk of stdout pushes it out another 100 ms — and the
+     *  wall-clock timer discharges its own responsibility into this same one timer, so before the
+     *  clamp a chatty detached descendant writing faster than the grace window kept the promise
+     *  pending forever: reproduced unsettled at 4000 ms with `timeoutMs: 300` against a claimed
+     *  1300 ms bound. That is precisely the pi#5303 shape the trailing-output fix above exists for,
+     *  turned from "output truncated" into "RoutineRun pinned at `running`, scheduler slot held,
+     *  for a child the daemon has already killed" — the exact outcome the timeout was raised to
+     *  prevent. Clamping (rather than a second timer) keeps ONE timer and covers every re-arm site
+     *  by construction, including ones added later. `robust-bash.ts:81` has the un-clamped shape and
+     *  is right to: it claims no wall-clock bound and its caller has an abort path. This module
+     *  claims one. */
     const armGrace = (ms: number) => {
+      const capped = hardDeadlineAt === undefined ? ms : Math.max(0, Math.min(ms, hardDeadlineAt - Date.now()))
       if (graceTimer) clearTimeout(graceTimer)
-      graceTimer = setTimeout(finish, ms)
+      graceTimer = setTimeout(finish, capped)
     }
     const finishIfDrained = () => {
       if (!exited || settled) return
@@ -272,7 +294,10 @@ export function runClaudeCliProcess(
       try { child.kill('SIGKILL') } catch { /* already dead */ }
       if (child.pid) _killTree(child.pid)
       // Then settle regardless of whether the child cooperates: the kill is best-effort, so the
-      // promise must not depend on it landing (see CLI_KILL_GRACE_MS).
+      // promise must not depend on it landing (see CLI_KILL_GRACE_MS). Stamping the deadline here
+      // — once, before the grace window is armed — is what stops the child re-arming its way past
+      // it; from now on `armGrace` can only ever shorten the remaining wait, never extend it.
+      hardDeadlineAt = Date.now() + CLI_KILL_GRACE_MS
       armGrace(CLI_KILL_GRACE_MS)
     }, timeoutMs)
 

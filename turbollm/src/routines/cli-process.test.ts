@@ -9,6 +9,7 @@ import type { SpawnOptions } from 'node:child_process'
 import {
   runClaudeCliProcess,
   realSpawnCliProcess,
+  CLI_KILL_GRACE_MS,
   type CliChildProcess,
   type SpawnCliProcess,
 } from './cli-process'
@@ -492,6 +493,39 @@ test('the wall-clock timeout resolves even when the child NEVER reports exit', a
   assert.equal(result.exitCode, null)
   assert.deepEqual(pids, [4242])
   assert.ok(Date.now() - startedAt < 5000, 'must not wait on a child that never cooperates')
+})
+
+// N1: the variant of the test above that the first fix round left broken. Settlement had been
+// handed off wholesale to the grace window, and the grace window is re-armable by the child, so a
+// descendant chattier than EXIT_STDIO_GRACE_MS pushed the deadline out forever — reproduced
+// unsettled at 4000 ms against a claimed 1300 ms bound.
+test('the wall-clock timeout is an ABSOLUTE ceiling that post-exit output cannot re-arm', async () => {
+  const child = fakeChild()
+  const { spy } = killSpy()
+  const timeoutMs = 100
+  // The pi#5303 shape again, but LOUD: the parent exits (or is killed) while a detached descendant
+  // holds stdout open and keeps writing. Every chunk used to buy another EXIT_STDIO_GRACE_MS.
+  const chatter = setInterval(() => { child.stdout.write('still here\n') }, 20)
+  try {
+    const startedAt = Date.now()
+    const resultPromise = runClaudeCliProcess(
+      ['-p'],
+      { cwd: '/repo', env: {}, timeoutMs },
+      () => child,
+      spy,
+    )
+    child.emit('exit', 0, null)
+    const result = await resultPromise
+    const elapsed = Date.now() - startedAt
+    assert.equal(result.timedOut, true)
+    assert.ok(
+      elapsed < timeoutMs + CLI_KILL_GRACE_MS + 500,
+      `settlement must be bounded by timeoutMs + CLI_KILL_GRACE_MS (${timeoutMs + CLI_KILL_GRACE_MS}ms), took ${elapsed}ms`,
+    )
+    assert.match(result.stdout, /still here/, 'output seen before the ceiling is still returned')
+  } finally {
+    clearInterval(chatter)
+  }
 })
 
 test('a stream-level error (EPIPE) is recorded rather than thrown out of band', async () => {
