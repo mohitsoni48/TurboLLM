@@ -45,6 +45,13 @@ import {
   isDependencyAddCommand,
 } from './agent-loop-rules'
 import { waitForToolApproval } from '../tools/approval-gate'
+import {
+  CREATE_ROUTINE_TOOL,
+  LIST_ROUTINES_TOOL,
+  UPDATE_ROUTINE_TOOL,
+  DELETE_ROUTINE_TOOL,
+  RUN_ROUTINE_NOW_TOOL,
+} from '../routines/routine-tools'
 import { LspClient, type LspDiagnostic } from './lsp-client'
 import { lspSpecForPath, lspSpecForLanguage, SUPPORTED_LSP_LANGUAGES, type LspServerSpec } from './lsp-registry'
 
@@ -1653,6 +1660,92 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
         }),
         async execute(toolCallId, params) {
           const text = await tools.executeTool({ id: toolCallId, name: 'run_code', args: params })
+          return { content: [{ type: 'text', text }], details: {} }
+        },
+      })
+
+      // Routine tools (Phase 4) — the SAME shared executor chat's ToolRegistry uses
+      // (tools.executeTool), not a second implementation. Registered unconditionally like
+      // web_search/fetch_url/run_code above: none of these touch the filesystem or this session's
+      // containment root, so plan mode's read-only guarantee over the workspace is unaffected, and
+      // update_routine/delete_routine's own `confirm: true` two-phase gate (routine-tools.ts)
+      // already stands in for Code's ask-mode approval. They're likewise NOT added to
+      // MUTATING_TOOLS for that reason.
+      //
+      // Every call passes isCodeAuthorized = true (executeTool's 2nd arg, which FAILS CLOSED to
+      // false — omitting it would leave a Code session unable to author or trigger a code-flavor
+      // routine at all). That's sound because the mere existence of a live Code session already
+      // proves the caller cleared the exact bar the routine tools' own gate enforces
+      // (`isLocalRequest(c, d) || verifyPresentedKey(c, d)` — auth.ts's codeAuth, lines 242-252):
+      //   • server.ts:68 mounts `app.use('/api/v1/code/*', codeAuth(d))` BEFORE
+      //     registerCodeRoutes (server.ts:86), so EVERY code route is behind it — including
+      //     session creation (POST /api/v1/code/sessions, code-routes.ts:140) AND every
+      //     subsequent turn (POST /api/v1/code/sessions/:id/messages, code-routes.ts:737). It is
+      //     re-checked per request, not just once at session creation.
+      //   • The raw WebSocket upgrade path (/api/v1/code/terminal/ws) bypasses Hono, so
+      //     terminal-routes.ts:423-424 re-applies the equivalent check by hand
+      //     (isLocalUpgrade + verifyKeyValue) — and it spawns a pty, never reaching this file.
+      //   • The stdio MCP server's delegate_code_task is not a bypass either: it calls back over
+      //     HTTP to /api/v1/code/* (mcp-server.ts:190), through the same middleware.
+      //   • The one non-HTTP entry into runCodeSession, routines/code-runner.ts, only ever fires
+      //     for an already-stored CODE-flavor routine — which could only have been authored by a
+      //     caller that itself cleared this gate, and then had to be confirmed by a human.
+      pi.registerTool({
+        name: 'create_routine',
+        label: 'Create routine',
+        description: CREATE_ROUTINE_TOOL.function.description,
+        promptSnippet: 'create_routine(...) - create a new scheduled routine (always starts pending confirmation)',
+        parameters: Unsafe<Record<string, unknown>>(CREATE_ROUTINE_TOOL.function.parameters as TSchema),
+        async execute(toolCallId, params) {
+          const text = await tools.executeTool({ id: toolCallId, name: 'create_routine', args: params }, true)
+          return { content: [{ type: 'text', text }], details: {} }
+        },
+      })
+      pi.registerTool({
+        name: 'list_routines',
+        label: 'List routines',
+        description: LIST_ROUTINES_TOOL.function.description,
+        promptSnippet: 'list_routines() - list every saved routine',
+        // Deviation from the plan's literal `Type.Object({})`: that infers `{}`, which is not
+        // assignable to executeTool's `args: Record<string, unknown>` (TS2322). Sourcing the
+        // no-arg schema from the tool const itself matches the other four AND keeps a single
+        // source of truth with the shape chat's own ToolRegistry advertises.
+        parameters: Unsafe<Record<string, unknown>>(LIST_ROUTINES_TOOL.function.parameters as TSchema),
+        async execute(toolCallId, params) {
+          const text = await tools.executeTool({ id: toolCallId, name: 'list_routines', args: params }, true)
+          return { content: [{ type: 'text', text }], details: {} }
+        },
+      })
+      pi.registerTool({
+        name: 'update_routine',
+        label: 'Update routine',
+        description: UPDATE_ROUTINE_TOOL.function.description,
+        promptSnippet: 'update_routine(routineId, ..., confirm) - preview, then apply, a change to a routine',
+        parameters: Unsafe<Record<string, unknown>>(UPDATE_ROUTINE_TOOL.function.parameters as TSchema),
+        async execute(toolCallId, params) {
+          const text = await tools.executeTool({ id: toolCallId, name: 'update_routine', args: params }, true)
+          return { content: [{ type: 'text', text }], details: {} }
+        },
+      })
+      pi.registerTool({
+        name: 'delete_routine',
+        label: 'Delete routine',
+        description: DELETE_ROUTINE_TOOL.function.description,
+        promptSnippet: 'delete_routine(routineId, confirm) - preview, then apply, deleting a routine',
+        parameters: Unsafe<Record<string, unknown>>(DELETE_ROUTINE_TOOL.function.parameters as TSchema),
+        async execute(toolCallId, params) {
+          const text = await tools.executeTool({ id: toolCallId, name: 'delete_routine', args: params }, true)
+          return { content: [{ type: 'text', text }], details: {} }
+        },
+      })
+      pi.registerTool({
+        name: 'run_routine_now',
+        label: 'Run routine now',
+        description: RUN_ROUTINE_NOW_TOOL.function.description,
+        promptSnippet: 'run_routine_now(routineId) - trigger an already-confirmed routine immediately',
+        parameters: Unsafe<Record<string, unknown>>(RUN_ROUTINE_NOW_TOOL.function.parameters as TSchema),
+        async execute(toolCallId, params) {
+          const text = await tools.executeTool({ id: toolCallId, name: 'run_routine_now', args: params }, true)
           return { content: [{ type: 'text', text }], details: {} }
         },
       })
