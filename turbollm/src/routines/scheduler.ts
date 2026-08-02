@@ -10,19 +10,19 @@ export interface RoutineSchedulerDeps {
    *  WHICH terminal status the fire reached and may enrich the row (result, error,
    *  pendingToolCall) along the way — it must not create a second row for the same fire.
    *
-   *  SPEC-GAP: resolving to a terminal RoutineRunStatus makes the run-row lifecycle
-   *  structural, but it does NOT yet give 'needs_approval' correct concurrency semantics.
-   *  Today, once this promise settles with ANY terminal status the scheduler clears
-   *  `inFlight` and reschedules — so a Phase-2 run that parks awaiting a tool approval and
-   *  returns 'needs_approval' would let the next tick start a SECOND concurrent run for the
-   *  same routine while the first is still parked. Fixing that means either keeping a parked
-   *  routine in `inFlight` (or an equivalent "parked" set) until the user answers, or having
-   *  the approval-resume REST endpoint drive the scheduler's own run tracking. Both are
-   *  Phase-2 design decisions — spec 20 §5's concurrency rules land with real execution, not
-   *  here, where nothing can park. Relatedly: the scheduler stamps `endedAt` on whatever
-   *  terminal status is returned, including 'needs_approval' — a parked run hasn't actually
-   *  ended, so Phase 2 will need to either special-case that write or treat `endedAt` as
-   *  "left the scheduler's hands" rather than "finished" for that one status. */
+   *  CONCURRENCY (formerly a SPEC-GAP, closed by Task 9): resolving to a terminal
+   *  RoutineRunStatus makes the run-row lifecycle structural, and 'needs_approval' now has
+   *  correct concurrency semantics too — see `tick()`'s `.then()`/`.finally()` handlers. A run
+   *  that parks awaiting a tool approval stays in `inFlight` (fix (a) from this doc comment's
+   *  earlier draft) instead of being cleared like every other terminal status, so the overlap
+   *  guard keeps protecting it from a second concurrent fire for as long as it is parked. The
+   *  routine is released back into circulation by `releaseParked()`, which `routine-routes.ts`'s
+   *  `/approve` and `/deny` handlers call once `resumeRoutineRun` (Task 8) settles AND the run's
+   *  fresh-read status is no longer 'needs_approval' (a resume can itself re-park the run on a
+   *  second/chained tool call, in which case it must stay parked, not be released). Relatedly,
+   *  the scheduler no longer stamps `endedAt` when the terminal status is 'needs_approval' — a
+   *  parked run hasn't actually ended, so writing `endedAt` there would misrepresent it as
+   *  closed in the run history. */
   runRoutine: (routine: Routine, run: RoutineRun) => Promise<RoutineRunStatus>
   tickIntervalMs?: number
 }
@@ -102,9 +102,20 @@ export class RoutineScheduler {
       // an unhandled rejection crashes the daemon without it. It sits LAST in the chain so it
       // catches a rejecting runRoutine AND a throw from inside .then()/.finally() themselves
       // (e.g. the DB being closed mid-run during shutdown) — nothing escapes.
+      //
+      // 'needs_approval' is deliberately NOT treated like the other four terminal statuses:
+      // the run is parked, not finished, so (1) `endedAt` is left unset — writing it would
+      // misrepresent a parked run as closed in the history — and (2) `parkedForApproval` tells
+      // .finally() below to leave this routine in `inFlight`/`flaggedOverlap` instead of
+      // clearing them, so the tick loop's overlap guard keeps protecting it from a second
+      // concurrent fire for as long as it stays parked. `releaseParked()` is the only way back
+      // out of that state (called by routine-routes.ts's /approve and /deny once the run is no
+      // longer 'needs_approval').
+      let parkedForApproval = false
       void this.deps.runRoutine(r, run).then((terminalStatus) => {
-        this.deps.store.updateRoutineRun(run.id, { status: terminalStatus, endedAt: this.deps.now().toISOString() })
+        parkedForApproval = this.writeTerminalStatus(run.id, terminalStatus)
       }).finally(() => {
+        if (parkedForApproval) return
         this.inFlight.delete(r.id)
         this.flaggedOverlap.delete(r.id)
         // Re-read rather than reusing `r`: the routine may have been paused, edited or
@@ -118,17 +129,97 @@ export class RoutineScheduler {
         const now = this.deps.now()
         this.deps.store.updateRoutine(r.id, { nextFireAt: computeNextFireTime(current.scheduleRule, now).toISOString() })
       }).catch((err) => {
-        console.error(`[RoutineScheduler] runRoutine failed for routine ${r.id}:`, err)
         // A rejection is still a terminal outcome, and the scheduler owns the row — close it
         // out here so a failed fire is never left advertising 'running' forever.
-        try {
-          this.deps.store.updateRoutineRun(run.id, {
-            status: 'errored',
-            error: err instanceof Error ? err.message : String(err),
-            endedAt: this.deps.now().toISOString(),
-          })
-        } catch { /* the DB may be closed mid-shutdown — the log above is the record */ }
+        this.writeErrored(run.id, r.id, err)
       })
     }
+  }
+
+  /** Writes a fire's terminal outcome to its run row. 'needs_approval' is the one status that
+   *  does NOT get `endedAt` — the run is parked, not finished (see `RoutineSchedulerDeps.
+   *  runRoutine`'s doc comment) — and the return value tells the caller whether that happened,
+   *  so it knows to leave the routine's `inFlight`/`flaggedOverlap` entries in place instead of
+   *  clearing them. Shared by `tick()` and `runNow()` so both fire paths behave identically. */
+  private writeTerminalStatus(runId: string, terminalStatus: RoutineRunStatus): boolean {
+    if (terminalStatus === 'needs_approval') {
+      this.deps.store.updateRoutineRun(runId, { status: terminalStatus })
+      return true
+    }
+    this.deps.store.updateRoutineRun(runId, { status: terminalStatus, endedAt: this.deps.now().toISOString() })
+    return false
+  }
+
+  /** Closes out a run row after its `runRoutine` promise rejected outright (as opposed to
+   *  resolving to 'errored') — a rejection is still a terminal outcome, and the scheduler owns
+   *  the row, so it must not be left advertising 'running' forever. Shared by `tick()` and
+   *  `runNow()`. */
+  private writeErrored(runId: string, routineId: string, err: unknown): void {
+    console.error(`[RoutineScheduler] runRoutine failed for routine ${routineId}:`, err)
+    try {
+      this.deps.store.updateRoutineRun(runId, {
+        status: 'errored',
+        error: err instanceof Error ? err.message : String(err),
+        endedAt: this.deps.now().toISOString(),
+      })
+    } catch { /* the DB may be closed mid-shutdown — the log above is the record */ }
+  }
+
+  /** Immediately fire a routine, bypassing its next_fire_at check, but through the SAME overlap
+   *  guard (`inFlight`) a normal tick uses, and calling the exact same injected `runRoutine` with
+   *  a freshly-created run row (mirroring tick()'s "one row per fire, created before inFlight"
+   *  pattern) — so whatever model-swap/skip-busy logic that function implements applies
+   *  identically here, and a manual trigger shows up in run history exactly like a scheduled one.
+   *  Returns synchronously (00-conventions.md §3: never block a request >10s) — the run itself
+   *  proceeds in the background exactly like a normal tick's fire. A run that parks awaiting
+   *  approval shares the same `inFlight` guard (and the same `releaseParked()` exit) a tick-fired
+   *  parked run does — nothing about the concurrency fix cares which path started the fire. */
+  runNow(routineId: string): { ok: true } | { ok: false; reason: 'not_found' | 'not_confirmed' | 'already_running' } {
+    const routine = this.deps.store.getRoutine(routineId)
+    if (!routine) return { ok: false, reason: 'not_found' }
+    if (routine.status === 'pending_confirmation') return { ok: false, reason: 'not_confirmed' }
+    if (this.inFlight.has(routine.id)) return { ok: false, reason: 'already_running' }
+    let run: RoutineRun
+    try {
+      run = this.deps.store.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+    } catch (e) {
+      console.error(`[RoutineScheduler] runNow could not open a run row for routine ${routine.id}:`, e)
+      return { ok: false, reason: 'not_found' }
+    }
+    this.inFlight.add(routine.id)
+    let parkedForApproval = false
+    void this.deps.runRoutine(routine, run).then((terminalStatus) => {
+      parkedForApproval = this.writeTerminalStatus(run.id, terminalStatus)
+    }).finally(() => {
+      if (parkedForApproval) return
+      this.inFlight.delete(routine.id)
+      this.flaggedOverlap.delete(routine.id)
+    }).catch((err) => {
+      this.writeErrored(run.id, routine.id, err)
+    })
+    return { ok: true }
+  }
+
+  /** Releases a routine from its "parked" state (see `RoutineSchedulerDeps.runRoutine`'s doc
+   *  comment) once its stalled run is no longer 'needs_approval' — i.e. it was approved and
+   *  ran to a genuine terminal status, denied, or failed to resume outright. Must be called
+   *  by whoever resolves the approval (routine-routes.ts's `/approve` and `/deny` handlers,
+   *  via `resumeRoutineRun`) — the scheduler has no other way to learn that a parked run's
+   *  fate was decided, since `resumeRoutineRun` is invoked directly by those REST routes and
+   *  never through `tick()`/`runRoutine`.
+   *
+   *  A no-op if `routineId` isn't currently parked (e.g. the run being approved/denied never
+   *  went through this scheduler, or was already released) — safe to call unconditionally.
+   *  Callers must NOT call this when the resume itself re-parked the run (a resumed run can
+   *  stall again on a second/chained tool-call approval): check the run's fresh status first
+   *  and only release when it has actually left 'needs_approval'. */
+  releaseParked(routineId: string): void {
+    if (!this.inFlight.has(routineId)) return
+    this.inFlight.delete(routineId)
+    this.flaggedOverlap.delete(routineId)
+    const current = this.deps.store.getRoutine(routineId)
+    if (current?.status !== 'active') return
+    const now = this.deps.now()
+    this.deps.store.updateRoutine(routineId, { nextFireAt: computeNextFireTime(current.scheduleRule, now).toISOString() })
   }
 }
