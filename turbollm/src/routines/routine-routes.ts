@@ -119,12 +119,20 @@ export function validateUpdate(b: RoutineBody, current: Routine): string | null 
  *  branch over the identical `isLocalRequest || verifyPresentedKey` check (the same shape
  *  terminal-routes.ts uses for its raw WebSocket upgrade, for the same reason).
  *
- *  SPEC-GAP (00-conventions.md §8): scoped to create/update only, deliberately, not the whole
- *  code-routine surface. A keyless LAN caller can still PUT /:id/confirm or /:id/resume on a
- *  host-authored code routine (arming it), or DELETE one, or read its workspacePath via GET —
- *  none of that executes anything in Phase 1 (there is no execution yet), but Phase 2 turns
- *  `active` into real unattended code execution. Extending this gate to confirm/resume/delete/
- *  the GETs is an open decision for whoever ships Phase 2's execution, not an oversight here.
+ *  SCOPE (was a SPEC-GAP, 00-conventions.md §8 — now CLOSED, X2). This gate used to cover
+ *  create/update only, and this comment deferred confirm/resume on one explicit condition:
+ *  "none of that executes anything in Phase 1 (there is no execution yet), but Phase 2 turns
+ *  `active` into real unattended code execution … an open decision for whoever ships Phase 2's
+ *  execution". That condition is no longer true — Phase 2/3 shipped execution (`execute.ts`,
+ *  wired into the scheduler with the real `executeRoutine` in `cli.ts`), and `scheduler.tick()`
+ *  fires every due `active` routine with NO authorization check of any kind. So arming a
+ *  host-authored code routine is now equivalent to firing it, delayed by at most one tick, and
+ *  the deferred decision is resolved: /confirm, /pause and /resume all carry the identical gate,
+ *  alongside POST /routines, PUT /:id, POST /:id/run-now and the run /approve + /deny pair.
+ *  Still deliberately ungated: DELETE /:id (destructive, but it executes nothing) and the GETs
+ *  (they disclose `workspacePath`; gating them is a separate, still-open decision — and if it is
+ *  ever taken, the 404-before-401 ordering here and in `routine-tools.ts` has to be flipped in
+ *  the same pass or the gating buys nothing, since the lookup itself is an existence oracle).
  *
  *  Exported (Phase 4) so chat's tool surface enforces the IDENTICAL decision rather than a
  *  hand-copied `isLocalRequest || verifyPresentedKey` that could silently drift from this one:
@@ -172,6 +180,11 @@ export function registerRoutineRoutes(app: Hono, d: Deps): void {
   app.put('/api/v1/routines/:id/confirm', (c) => {
     const routine = d.db.getRoutine(c.req.param('id'))
     if (!routine) return err(c, 404, 'not_found', 'Routine not found.')
+    // X2: /confirm is the door INTO 'active', and an active code routine is fired by the very
+    // next scheduler tick with no authorization check anywhere in scheduler.ts — so arming one is
+    // the same capability /run-now already gates, just deferred by up to DEFAULT_TICK_INTERVAL_MS.
+    // Same ordering as /run-now: 404 before 401, gate before the status check.
+    if (routine.flavor === 'code' && codeGateBlocks(c, d)) return err(c, 401, 'unauthorized', CODE_GATE_MESSAGE)
     if (routine.status !== 'pending_confirmation') return err(c, 409, 'not_pending', 'Routine is not awaiting confirmation.')
     const nextFireAt = computeNextFireTime(routine.scheduleRule, new Date()).toISOString()
     return c.json(d.db.confirmRoutine(routine.id, nextFireAt))
@@ -205,6 +218,12 @@ export function registerRoutineRoutes(app: Hono, d: Deps): void {
   app.put('/api/v1/routines/:id/pause', (c) => {
     const routine = d.db.getRoutine(c.req.param('id'))
     if (!routine) return err(c, 404, 'not_found', 'Routine not found.')
+    // X2: gated for symmetry, and because /pause is load-bearing for the "confirm is the only
+    // door into 'active'" invariant below — leaving the pause half of the pause/resume pair open
+    // to a keyless LAN caller would mean the state machine that guards arming is only half
+    // protected. It also stops an unauthenticated caller silently disabling a code routine the
+    // host is relying on. Same ordering as /run-now: 404 before 401, gate before the status check.
+    if (routine.flavor === 'code' && codeGateBlocks(c, d)) return err(c, 401, 'unauthorized', CODE_GATE_MESSAGE)
     // Guarding on 'active' is what keeps /confirm the ONLY door into 'active': without it,
     // pending_confirmation -> pause -> resume walks a never-confirmed routine straight to
     // active, since /resume only checks for 'paused'.
@@ -215,6 +234,9 @@ export function registerRoutineRoutes(app: Hono, d: Deps): void {
   app.put('/api/v1/routines/:id/resume', (c) => {
     const routine = d.db.getRoutine(c.req.param('id'))
     if (!routine) return err(c, 404, 'not_found', 'Routine not found.')
+    // X2: the second door into 'active', and the more realistic one — a host who set up a code
+    // routine and paused it leaves exactly the state this route re-arms. Same gate, same ordering.
+    if (routine.flavor === 'code' && codeGateBlocks(c, d)) return err(c, 401, 'unauthorized', CODE_GATE_MESSAGE)
     if (routine.status !== 'paused') return err(c, 409, 'not_paused', 'Routine is not paused.')
     const nextFireAt = computeNextFireTime(routine.scheduleRule, new Date()).toISOString()
     return c.json(d.db.updateRoutine(routine.id, { status: 'active', nextFireAt }))

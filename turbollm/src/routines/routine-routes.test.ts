@@ -6,7 +6,7 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ConversationStore } from '../chat/db'
-import { registerRoutineRoutes } from './routine-routes'
+import { registerRoutineRoutes, CODE_GATE_MESSAGE } from './routine-routes'
 import { RoutineScheduler } from './scheduler'
 import { executeRoutine } from './execute'
 import type { Deps } from '../deps'
@@ -627,6 +627,100 @@ test('POST .../runs/:runId/approve on a CHAT routine from a non-host device is N
   const res = await app.request(`/api/v1/routines/${routine.id}/runs/${run.id}/approve`, { method: 'POST' })
   // Not gated (401), but fails for an unrelated reason: this run has no real pendingToolCall.
   assert.notEqual(res.status, 401)
+})
+
+// ── X2: confirm/pause/resume must honor the same code-flavor auth gate ──────────────────────
+// The three state-machine routes were the last ungated door onto real unattended host execution:
+// scheduler.tick() fires every due `active` routine with no authorization check of its own, so
+// arming a host-authored code routine (confirm on a pending one, resume on a paused one) IS
+// execution, delayed by at most DEFAULT_TICK_INTERVAL_MS. /pause is gated with them because it is
+// the other half of the pause/resume pair the "confirm is the only door into active" invariant
+// rests on. codeGateBlocks' own doc comment deferred exactly this on the explicit condition that
+// Phase 2 had not shipped execution yet — cli.ts wiring the real executeRoutine into the scheduler
+// ended that condition, so the deferred decision is resolved here.
+//
+// `testApp({ lanBind: true })` + a request with no conn info = the threat model's caller exactly:
+// LAN-exposed daemon, requireApiKey off (so lanAuth waves them through), address not loopback,
+// no key presented.
+
+/** A confirmed-then-paused code routine — the realistic pre-state for the /resume attack. */
+function pausedCodeRoutine(db: ConversationStore) {
+  const routine = db.createRoutine({ ...CODE_ROUTINE })
+  db.confirmRoutine(routine.id, '2099-01-01T00:00:00.000Z')
+  db.updateRoutine(routine.id, { status: 'paused', nextFireAt: null })
+  return routine
+}
+
+async function assertCodeGated(res: Response) {
+  assert.equal(res.status, 401)
+  const bodyJson = (await res.json()) as { error: { message: string } }
+  assert.equal(bodyJson.error.message, CODE_GATE_MESSAGE)
+}
+
+test('PUT /:id/confirm on a code routine from a non-host device with no key is rejected (X2)', async () => {
+  const { app, db } = testApp({ lanBind: true })
+  const routine = db.createRoutine({ ...CODE_ROUTINE })
+  await assertCodeGated(await app.request(`/api/v1/routines/${routine.id}/confirm`, { method: 'PUT' }))
+  // Gated before any state change: it must still be un-armed, so no tick can ever fire it.
+  assert.equal(db.getRoutine(routine.id)?.status, 'pending_confirmation')
+  assert.equal(db.getRoutine(routine.id)?.nextFireAt, null)
+})
+
+test('PUT /:id/resume on a code routine from a non-host device with no key is rejected (X2)', async () => {
+  const { app, db } = testApp({ lanBind: true })
+  const routine = pausedCodeRoutine(db)
+  await assertCodeGated(await app.request(`/api/v1/routines/${routine.id}/resume`, { method: 'PUT' }))
+  assert.equal(db.getRoutine(routine.id)?.status, 'paused')
+  assert.equal(db.getRoutine(routine.id)?.nextFireAt, null)
+})
+
+test('PUT /:id/pause on a code routine from a non-host device with no key is rejected (X2)', async () => {
+  const { app, db } = testApp({ lanBind: true })
+  const routine = db.createRoutine({ ...CODE_ROUTINE })
+  db.confirmRoutine(routine.id, '2099-01-01T00:00:00.000Z')
+  await assertCodeGated(await app.request(`/api/v1/routines/${routine.id}/pause`, { method: 'PUT' }))
+  assert.equal(db.getRoutine(routine.id)?.status, 'active')
+})
+
+// Polarity controls. The gate must be scoped to code-flavor routines only — a chat routine's
+// whole state machine stays on the baseline lanAuth bar, exactly as before X2.
+
+test('PUT /:id/confirm on a CHAT routine from a non-host device is completely unaffected (X2)', async () => {
+  const { app, db } = testApp({ lanBind: true })
+  const routine = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', agentId: 'a' })
+  const res = await app.request(`/api/v1/routines/${routine.id}/confirm`, { method: 'PUT' })
+  assert.equal(res.status, 200)
+  assert.equal(((await res.json()) as { status: string }).status, 'active')
+})
+
+test('PUT /:id/pause on a CHAT routine from a non-host device is completely unaffected (X2)', async () => {
+  const { app, db } = testApp({ lanBind: true })
+  const routine = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', agentId: 'a' })
+  db.confirmRoutine(routine.id, '2099-01-01T00:00:00.000Z')
+  const res = await app.request(`/api/v1/routines/${routine.id}/pause`, { method: 'PUT' })
+  assert.equal(res.status, 200)
+  assert.equal(((await res.json()) as { status: string }).status, 'paused')
+})
+
+test('PUT /:id/resume on a CHAT routine from a non-host device is completely unaffected (X2)', async () => {
+  const { app, db } = testApp({ lanBind: true })
+  const routine = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', agentId: 'a' })
+  db.confirmRoutine(routine.id, '2099-01-01T00:00:00.000Z')
+  db.updateRoutine(routine.id, { status: 'paused', nextFireAt: null })
+  const res = await app.request(`/api/v1/routines/${routine.id}/resume`, { method: 'PUT' })
+  assert.equal(res.status, 200)
+  assert.equal(((await res.json()) as { status: string }).status, 'active')
+})
+
+// The host itself must not need a key for any of the three — the gate is about WHO is calling,
+// not about code routines being unmanageable.
+test('PUT /:id/confirm + /pause + /resume on a code routine from the host (loopback-only bind) need no key (X2)', async () => {
+  const { app, db } = testApp({ lanBind: false })
+  const routine = db.createRoutine({ ...CODE_ROUTINE })
+  assert.equal((await app.request(`/api/v1/routines/${routine.id}/confirm`, { method: 'PUT' })).status, 200)
+  assert.equal((await app.request(`/api/v1/routines/${routine.id}/pause`, { method: 'PUT' })).status, 200)
+  assert.equal((await app.request(`/api/v1/routines/${routine.id}/resume`, { method: 'PUT' })).status, 200)
+  assert.equal(db.getRoutine(routine.id)?.status, 'active')
 })
 
 // ── I3: an unhandled throw from resumeRoutineRun must not escape as a raw, unshaped 500 ────

@@ -81,8 +81,9 @@ test('executeTool: an unknown tool name is still reported the same way as before
 
 // ── code-flavor authorization threading (C1) ─────────────────────────────────
 // The whole point of executeTool's `isCodeAuthorized` parameter: it must reach
-// execCreateRoutine/execUpdateRoutine, and must fail CLOSED when the caller omits it. A
-// regression here silently reopens the gap routine-routes.ts's codeGateBlocks closes on REST.
+// execCreateRoutine/execUpdateRoutine/execRunRoutineNow, and must fail CLOSED when the caller
+// omits it. A regression here silently reopens the gap routine-routes.ts's codeGateBlocks
+// closes on REST.
 
 test('executeTool: create_routine with flavor "code" is REFUSED when the caller omits isCodeAuthorized', async () => {
   const reg = new ToolRegistry(EMPTY_TOOLS_CFG, fakeStore(null))

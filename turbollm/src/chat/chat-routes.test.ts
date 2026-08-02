@@ -11,10 +11,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Hono } from 'hono'
 import { stripThinkingBlocks, needsExtraPass } from './think-utils.js'
-import { recentTitleTurns, reportFirstChat } from './chat-routes.js'
+import { recentTitleTurns, reportFirstChat, chatCodeAuthorization } from './chat-routes.js'
 import { Emitter } from '../telemetry/emit.js'
 import { readQueue } from '../telemetry/queue.js'
-import { codeGateBlocks } from '../routines/routine-routes.js'
 import type { Deps } from '../deps.js'
 
 // ── stripThinkingBlocks ───────────────────────────────────────────────────────
@@ -251,13 +250,20 @@ test('reportFirstChat: no emitter (telemetry not wired) is a silent no-op', () =
 // ToolRegistry.executeTool → the routine executors' code-flavor gate. The SSE loop is far too
 // heavy to drive here, but the invariant that whole chain rests on is a pure per-request decision
 // and is directly testable: for the exact deployment the threat model names — LAN-exposed daemon
-// with the API key requirement OFF, keyless caller, non-loopback address — `!codeGateBlocks` must
-// be FALSE. If it is ever true there, gating the executors buys nothing. Same fake `Deps` shape
-// routine-routes.test.ts's own I2 run-now tests use, driven through a real Hono Context (the
+// with the API key requirement OFF, keyless caller, non-loopback address — `chatCodeAuthorization`
+// must be FALSE. If it is ever true there, gating the executors buys nothing. Same fake `Deps`
+// shape routine-routes.test.ts's own I2 run-now tests use, driven through a real Hono Context (the
 // decision reads getConnInfo, which no hand-rolled Context object can honestly supply).
+//
+// I1: these drive `chatCodeAuthorization` EXPORTED FROM chat-routes.ts — the exact function both
+// generation entry points call — not a re-derivation of `!codeGateBlocks(c, d)` against the import
+// from routine-routes.ts. That distinction is the whole fix: a reviewer previously restored the
+// full CRITICAL with a green suite by aliasing chat-routes.ts's `codeGateBlocks` import and
+// shadowing the name locally with `() => false`. Re-deriving the expression here measured the real
+// function while production measured the shadow; driving the real exported one cannot.
 
-/** Exposes `!codeGateBlocks(c, d)` — literally chat-routes.ts's own expression — over a one-route
- *  app, so the assertion runs against a REAL Hono Context rather than a stand-in. */
+/** Runs chat-routes.ts's own `chatCodeAuthorization` over a one-route app, so the assertion runs
+ *  against a REAL Hono Context rather than a stand-in. */
 function gateProbe(daemon: { lanBind: boolean; requireApiKey: boolean }, apiKeys: unknown[] = []) {
   const app = new Hono()
   const d = {
@@ -266,7 +272,7 @@ function gateProbe(daemon: { lanBind: boolean; requireApiKey: boolean }, apiKeys
       update: (fn: (cfg: { apiKeys: unknown[] }) => void) => fn({ apiKeys }),
     },
   } as unknown as Deps
-  app.get('/probe', (c) => c.json({ isCodeAuthorized: !codeGateBlocks(c, d) }))
+  app.get('/probe', (c) => c.json({ isCodeAuthorized: chatCodeAuthorization(c, d) }))
   return app
 }
 
@@ -307,20 +313,26 @@ test('C1 invariant: a loopback-only bind is code-authorized regardless of addres
   assert.equal(await probe(app, undefined), true)
 })
 
-// The tests above pin what codeGateBlocks DECIDES; they cannot pin that chat-routes.ts still ASKS
-// it — the two producers live inside the /messages and /continue SSE handlers, which need a live
-// engine, a stream and a full conversation to drive. That gap is real and was demonstrated: a
-// reviewer replaced chat-routes.ts:280 with `const isCodeAuthorized = true` and all 1974 tests
-// still passed. This is a structural assertion over the source text rather than a behavioural one
-// — deliberately, as the cheapest thing that actually fails on that exact edit. If the SSE loop
-// ever becomes drivable in a test, replace this with the behavioural version.
+// The tests above pin what chatCodeAuthorization DECIDES; they cannot pin that both SSE handlers
+// still ASK it — the two producers live inside the /messages and /continue handlers, which need a
+// live engine, a stream and a full conversation to drive. That gap is real and was demonstrated
+// twice: a reviewer replaced chat-routes.ts:280 with `const isCodeAuthorized = true` and the whole
+// suite stayed green. This is a structural assertion over the source text rather than a
+// behavioural one — deliberately, as the cheapest thing that actually fails on that exact edit.
+//
+// I1: it is a SUPPLEMENT now, not the primary defence. It pins only that both entry points call
+// the named function rather than re-inlining the expression; what that function RESOLVES TO is
+// pinned behaviourally by the five tests above, which drive the real export. The previous version
+// of this test was the only thing standing behind the decision, and it pinned the spelling of the
+// two producers while asserting nothing about what `codeGateBlocks` resolved to inside the module
+// — so an import-alias-plus-local-shadow refactor passed it with both producer lines untouched.
 test('C1 invariant: both chat generation entry points DERIVE isCodeAuthorized, never hardcode it', () => {
   const src = readFileSync(new URL('./chat-routes.ts', import.meta.url), 'utf8')
   const producers = src.match(/const isCodeAuthorized = .*/g) ?? []
   assert.equal(producers.length, 2, 'expected exactly two producers (POST /messages and POST /continue)')
   for (const line of producers) {
-    assert.equal(line, 'const isCodeAuthorized = !codeGateBlocks(c, d)',
-      'a chat generation entry point must derive the trust decision from routine-routes.ts\'s own gate')
+    assert.equal(line, 'const isCodeAuthorized = chatCodeAuthorization(c, d)',
+      'a chat generation entry point must call the exported, behaviourally-pinned decision function — never inline the expression, which puts it back out of the tests\' reach')
   }
   assert.doesNotMatch(src, /isCodeAuthorized\s*[:=]\s*true/, 'no chat path may assert code authorization by literal')
   assert.match(src, /isCodeAuthorized: ctx\.isCodeAuthorized/, 'the tool loop must forward the per-request value, not recompute or fake one')
