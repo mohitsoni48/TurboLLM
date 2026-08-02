@@ -77,6 +77,34 @@ test('a non-string result field is not passed through as a non-string', () => {
   assert.equal(parsed.resultText, '')
 })
 
+test('a non-string session_id is dropped rather than typed as a string', () => {
+  const parsed = parseClaudeCliStreamJson('{"type":"result","is_error":false,"result":"ok","session_id":{"id":7}}')
+  assert.equal(parsed.success, true)
+  assert.equal(parsed.sessionId, undefined)
+})
+
+test('a null session_id is dropped rather than passed through', () => {
+  const parsed = parseClaudeCliStreamJson('{"type":"result","is_error":false,"result":"ok","session_id":null}')
+  assert.equal(parsed.sessionId, undefined)
+})
+
+test('a STRING "true" is_error is a failure, not a success', () => {
+  const parsed = parseClaudeCliStreamJson('{"type":"result","is_error":"true","result":"boom"}')
+  assert.equal(parsed.success, false)
+  assert.equal(parsed.resultText, 'boom')
+})
+
+test('a non-boolean is_error of any shape fails closed', () => {
+  assert.equal(parseClaudeCliStreamJson('{"type":"result","is_error":1,"result":"x"}').success, false)
+  assert.equal(parseClaudeCliStreamJson('{"type":"result","is_error":null,"result":"x"}').success, false)
+})
+
+test('an absent is_error still reads as success', () => {
+  const parsed = parseClaudeCliStreamJson('{"type":"result","result":"ok"}')
+  assert.equal(parsed.success, true)
+  assert.equal(parsed.resultText, 'ok')
+})
+
 test('CRLF line endings (Windows CLI output) parse the same as LF', () => {
   const stdout = '{"type":"system","subtype":"init"}\r\n{"type":"result","is_error":false,"result":"ok"}\r\n'
   const parsed = parseClaudeCliStreamJson(stdout)
