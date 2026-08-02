@@ -13,6 +13,8 @@ import { BuildState } from './engines/build-state'
 import { UpdateChecker } from './engines/update'
 import { UpdateScheduler } from './engines/update-scheduler'
 import { RoutineScheduler } from './routines/scheduler'
+import { CodeRunManager } from './code/code-run-manager'
+import { executeRoutine } from './routines/execute'
 import { AppUpdateChecker } from './app-update'
 import { applyEngineUpdate } from './engines/update-apply'
 import { seedDefaultEngines } from './engines/seed'
@@ -394,6 +396,25 @@ setInterval(() => void flush(store.dir(), store.snapshot().telemetry.level), 5 *
 // absent entirely for the vast majority of runs that never asked for a tunnel.
 const tunnelRequested = hasFlag('--tunnel')
 if (tunnelRequested) deps.tunnel = new TunnelManager(store.dir())
+
+// Shared Code-session run registry (Task 5): the SAME instance backs both the live Code UI
+// routes (server.ts passes d.codeRuns into registerCodeRoutes) and in-app-pi Code Routine
+// execution (routines/code-runner.ts), so a routine's Code run is the same kind of observable
+// daemon-owned session a live one is.
+deps.codeRuns = new CodeRunManager(deps)
+
+// Routine scheduler (Phase 2: real chat-flavor and in-app-pi code-flavor execution via
+// executeRoutine; CLI-flavor falls through to a clean "not implemented yet" errored run until
+// Phase 3 lands — see routines/execute.ts's own dispatchRoutine comment). Missed fires while the
+// daemon was offline are skipped and flagged, never backfilled (Phase 1).
+const routineScheduler = new RoutineScheduler({
+  store: db,
+  now: () => new Date(),
+  runRoutine: (routine, run) => executeRoutine(deps, routine, run),
+})
+deps.routineScheduler = routineScheduler
+routineScheduler.start()
+
 const app = createApp(deps)
 
 // Warm the app-update cache shortly after boot (ADR-031: "once per daemon start") so the
@@ -416,23 +437,6 @@ const updateScheduler = new UpdateScheduler({
   },
 })
 updateScheduler.start()
-
-// Routine scheduler (Phase 1 of the Routine feature — scheduling only; execution
-// lands in Phase 2). Missed fires while the daemon was offline are skipped and
-// flagged, never backfilled.
-const routineScheduler = new RoutineScheduler({
-  store: db,
-  now: () => new Date(),
-  // The scheduler creates the run row and writes its terminal status/endedAt, so this
-  // stub only records WHY the fire didn't do anything and returns the outcome.
-  runRoutine: async (_routine, run) => {
-    db.updateRoutineRun(run.id, {
-      error: 'Routine execution is not implemented yet (Phase 1 ships scheduling only).',
-    })
-    return 'errored'
-  },
-})
-routineScheduler.start()
 
 // ── Resolve listen address ────────────────────────────────────────────────────
 const cfg = store.snapshot()
