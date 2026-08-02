@@ -123,6 +123,31 @@ test('resumeRoutineRun rejects a run that is not currently needs_approval', asyn
   assert.equal(result.ok, false)
 })
 
+// M2(c) / C2 item 4: a live-execution review of Task 9's double-fire fix found that a run whose
+// pendingToolCall can never be parsed used to stay at 'needs_approval' FOREVER (resumeRoutineRun
+// returned early without ever moving the row), which durably re-triggered the exact same
+// corrupt_pending_call failure on every retry and left routine-routes.ts's scheduler-release
+// logic with no way to ever tell the run was actually done.
+test('resumeRoutineRun moves a run with an unparseable pendingToolCall to a real terminal state, not stuck at needs_approval forever', async () => {
+  const { d, db } = fakeDeps({ loadedKey: 'm' })
+  const routine = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'agent-1' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  // needs_approval but no pendingToolCall at all — parsePendingToolCall(undefined) returns null.
+  db.updateRoutineRun(run.id, { status: 'needs_approval' })
+  const result = await resumeRoutineRun(d, db.getRoutineRun(run.id)!, 'allow')
+  assert.equal(result.ok, false)
+  if (!result.ok) assert.equal(result.code, 'corrupt_pending_call')
+  const final = db.getRoutineRun(run.id)!
+  assert.equal(final.status, 'errored')
+  assert.ok(final.endedAt, 'must be a real terminal state, not left at needs_approval indefinitely')
+  assert.match(final.error ?? '', /pending tool call could not be read/)
+
+  // A second retry against the SAME permanently-corrupt run must behave identically (idempotent,
+  // not throw), rather than assuming it's only ever hit once.
+  const secondAttempt = await resumeRoutineRun(d, db.getRoutineRun(run.id)!, 'allow')
+  assert.equal(secondAttempt.ok, false)
+})
+
 // Reconciliation with scheduler.ts's real RoutineSchedulerDeps.runRoutine contract
 // ((routine, run) => Promise<RoutineRunStatus>, scheduler owns run-row creation/finalization):
 // proves executeRoutine's RETURN VALUE — the property Task 10's `runRoutine: (routine, run) =>

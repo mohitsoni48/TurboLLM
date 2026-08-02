@@ -138,7 +138,19 @@ export async function resumeRoutineRun(d: Deps, run: RoutineRun, decision: 'allo
   const current = d.db.getRoutineRun(run.id)
   if (!current || current.status !== 'needs_approval') return { ok: false, code: 'not_stalled', message: 'This run is not awaiting approval.' }
   const pending = parsePendingToolCall(current.pendingToolCall)
-  if (!pending) return { ok: false, code: 'corrupt_pending_call', message: "This run's pending tool call could not be read." }
+  if (!pending) {
+    // Permanently unresolvable (verified real gap found by a live-execution review of Task 9's
+    // scheduler-side double-fire fix): no FUTURE approve/deny call could ever parse this
+    // pendingToolCall either, since it's the same corrupt column value every time. Leaving the
+    // row at 'needs_approval' would make it durably re-triggerable — every retry hits this exact
+    // branch forever — and would leave `routine-routes.ts`'s scheduler-guard release logic with
+    // no way to ever tell this run is done. Move it to a real terminal state instead. This point
+    // is reached before the claim below, so there's nothing to revert, and a concurrent duplicate
+    // call landing here too just performs the identical, idempotent write.
+    const message = "This run's pending tool call could not be read."
+    d.db.updateRoutineRun(current.id, { status: 'errored', error: message, endedAt: new Date().toISOString() })
+    return { ok: false, code: 'corrupt_pending_call', message }
+  }
   const routine = JSON.parse(current.configSnapshot) as Routine
 
   // Claim the run (see this function's doc comment) before any await — this is what makes a
