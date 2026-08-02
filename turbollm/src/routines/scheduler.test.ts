@@ -445,3 +445,48 @@ test('start() repopulates the parked guard from any run still needs_approval in 
     scheduler.stop()
   }
 })
+
+// N1 hardening: reconcileParkedRuns() must not adopt a parked row for a routine that is ALREADY
+// tracked as in-flight — otherwise a start()-after-start() (currently unreachable: cli.ts calls
+// start() exactly once and only stop()s right before process exit, so there is no start-after-
+// stop path today, but this is a two-line, zero-risk guard against a future soft-restart or
+// defensive re-call) could adopt a stale/orphan needs_approval row over a routine whose inFlight
+// entry actually belongs to a DIFFERENT, currently-running fire — letting a later /approve on the
+// adopted row release that live fire's guard out from under it.
+
+test('reconcileParkedRuns (via start()) does not adopt a parked row for a routine already tracked as in-flight (N1)', async () => {
+  const store = freshStore()
+  const r = store.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'a' })
+  store.confirmRoutine(r.id, '2020-01-01T00:00:00.000Z')
+  const scheduler = new RoutineScheduler({ store, now: () => new Date(), runRoutine: async () => 'needs_approval', tickIntervalMs: 3_600_000 })
+  try {
+    // Genuinely park the routine via a real tick — inFlight/parked now track `realRun` for r.id.
+    await scheduler.tick()
+    await flush()
+    const [realRun] = store.listRoutineRuns(r.id)
+    assert.equal(realRun.status, 'needs_approval')
+
+    // Seed a SECOND, orphan needs_approval row for the SAME routine directly in the DB —
+    // exactly the shape reconcileParkedRuns() would otherwise be free to "adopt" (last-row-wins)
+    // if it didn't check inFlight first.
+    const orphanRun = store.createRoutineRun({ routineId: r.id, configSnapshot: JSON.stringify(r) })
+    store.updateRoutineRun(orphanRun.id, { status: 'needs_approval' })
+
+    // Call start() while the scheduler is ALREADY tracking r.id as in-flight/parked on realRun —
+    // simulating the (currently unreachable) soft-restart/defensive-re-call scenario N1 guards.
+    scheduler.start()
+
+    // If reconcileParkedRuns() had adopted the orphan row (no inFlight check), this release
+    // would incorrectly succeed against the orphan id instead of leaving the real park alone.
+    scheduler.releaseParked(r.id, orphanRun.id)
+    assert.equal(store.getRoutine(r.id)?.nextFireAt, '2020-01-01T00:00:00.000Z', 'the orphan release must be a no-op — it was never adopted')
+
+    // The REAL parked run must still be the one tracked — releasing IT works normally.
+    scheduler.releaseParked(r.id, realRun.id)
+    const released = store.getRoutine(r.id)
+    assert.ok(released?.nextFireAt)
+    assert.notEqual(released?.nextFireAt, '2020-01-01T00:00:00.000Z', 'the real park must still be intact and releasable')
+  } finally {
+    scheduler.stop()
+  }
+})

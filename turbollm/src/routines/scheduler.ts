@@ -79,9 +79,21 @@ export class RoutineScheduler {
    *  is in-memory only, so a daemon restart silently drops it even though the DB still correctly
    *  shows a stalled run as 'needs_approval'. Without this, a restart would let a normal tick (or
    *  reconcileMissedRuns() itself, see the guard added there below) fire a routine again — or
-   *  wrongly reschedule it — while an old approval is still outstanding, with zero protection. */
+   *  wrongly reschedule it — while an old approval is still outstanding, with zero protection.
+   *
+   *  N1 hardening (latent, not reachable today — cli.ts calls start() exactly once and only
+   *  stop()s right before process exit, so there is no start-after-stop path currently): skip a
+   *  routine that is ALREADY in `inFlight` rather than adopting its parked row unconditionally.
+   *  At a genuine cold start `inFlight` is always empty, so this is a no-op today. But if start()
+   *  were ever called again on an already-running instance (a future soft-restart, or a
+   *  defensive re-call), adopting a parked row over a routine whose `inFlight` entry actually
+   *  belongs to a different, currently-running (non-parked) fire would let a later `/approve` on
+   *  the adopted row release that live fire's guard out from under it — the exact class of bug
+   *  this whole park/release mechanism exists to prevent. Also makes multi-row adoption for the
+   *  same routine id deterministic (first row wins), though that's not expected to occur. */
   private reconcileParkedRuns(): void {
     for (const run of this.deps.store.listParkedRoutineRuns()) {
+      if (this.inFlight.has(run.routineId)) continue
       this.inFlight.add(run.routineId)
       this.parked.set(run.routineId, run.id)
     }
