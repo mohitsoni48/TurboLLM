@@ -6,7 +6,7 @@ import { computeNextFireTime } from './schedule'
 import { resumeRoutineRun } from './execute'
 import type { ScheduleRule, RoutineFlavor, Routine, RoutineRun } from './schema'
 
-type Status = 200 | 201 | 400 | 401 | 404 | 409 | 503
+type Status = 200 | 201 | 400 | 401 | 404 | 409 | 500 | 503
 
 function err(c: Context, status: Status, code: string, message: string) {
   return c.json({ error: { code, message } }, status)
@@ -209,7 +209,15 @@ export function registerRoutineRoutes(app: Hono, d: Deps): void {
 
   app.post('/api/v1/routines/:id/run-now', (c) => {
     if (!d.routineScheduler) return err(c, 503, 'scheduler_unavailable', 'The routine scheduler is not running.')
-    const result = d.routineScheduler.runNow(c.req.param('id'))
+    // Fetch the routine ourselves (rather than letting RoutineScheduler.runNow's own lookup be
+    // the only one) so the code-flavor gate (I2 fix) can be applied before anything fires: a
+    // manual trigger on a flavor:'code' routine runs real bash/edit/write on demand, exactly the
+    // capability create/update already gate behind codeAuth — leaving run-now/approve/deny
+    // ungated would be strictly worse than the create/update case.
+    const routine = d.db.getRoutine(c.req.param('id'))
+    if (!routine) return err(c, 404, 'not_found', 'Routine not found.')
+    if (routine.flavor === 'code' && codeGateBlocks(c, d)) return err(c, 401, 'unauthorized', CODE_GATE_MESSAGE)
+    const result = d.routineScheduler.runNow(routine.id)
     if (!result.ok) {
       if (result.reason === 'not_found') return err(c, 404, 'not_found', 'Routine not found.')
       if (result.reason === 'not_confirmed') return err(c, 409, 'not_confirmed', 'Routine has not been confirmed yet.')
@@ -221,7 +229,17 @@ export function registerRoutineRoutes(app: Hono, d: Deps): void {
   app.post('/api/v1/routines/:id/runs/:runId/approve', async (c) => {
     const run = d.db.getRoutineRun(c.req.param('runId'))
     if (!run || run.routineId !== c.req.param('id')) return err(c, 404, 'not_found', 'Run not found.')
-    const result = await resumeRoutineRun(d, run, 'allow')
+    // routine_runs cascades on routine delete, so `run` existing guarantees its routine still
+    // does too — this is a live lookup (not the run's own configSnapshot) so it reflects the
+    // CURRENT flavor, matching create/update's gate.
+    const routine = d.db.getRoutine(run.routineId)
+    if (routine?.flavor === 'code' && codeGateBlocks(c, d)) return err(c, 401, 'unauthorized', CODE_GATE_MESSAGE)
+    let result: ResumeResult
+    try {
+      result = await resumeRoutineRun(d, run, 'allow')
+    } catch (e) {
+      return internalError(c, run.id, e)
+    }
     releaseParkedIfResolved(d, run, result)
     if (!result.ok) return err(c, 409, result.code, result.message)
     return c.json({ ok: true })
@@ -230,7 +248,14 @@ export function registerRoutineRoutes(app: Hono, d: Deps): void {
   app.post('/api/v1/routines/:id/runs/:runId/deny', async (c) => {
     const run = d.db.getRoutineRun(c.req.param('runId'))
     if (!run || run.routineId !== c.req.param('id')) return err(c, 404, 'not_found', 'Run not found.')
-    const result = await resumeRoutineRun(d, run, 'deny')
+    const routine = d.db.getRoutine(run.routineId)
+    if (routine?.flavor === 'code' && codeGateBlocks(c, d)) return err(c, 401, 'unauthorized', CODE_GATE_MESSAGE)
+    let result: ResumeResult
+    try {
+      result = await resumeRoutineRun(d, run, 'deny')
+    } catch (e) {
+      return internalError(c, run.id, e)
+    }
     releaseParkedIfResolved(d, run, result)
     if (!result.ok) return err(c, 409, result.code, result.message)
     return c.json({ ok: true })
@@ -239,42 +264,68 @@ export function registerRoutineRoutes(app: Hono, d: Deps): void {
 
 type ResumeResult = Awaited<ReturnType<typeof resumeRoutineRun>>
 
-/** resumeRoutineRun's own failure codes that leave the run LEGITIMATELY still awaiting the SAME
- *  decision — the generation gate timed out, or the model server was busy/failed to load. The
- *  claim is reverted (execute.ts's `revertClaim`) back to 'needs_approval' specifically so the
- *  user can just retry approving shortly; releasing the scheduler's parked guard here would let
- *  a concurrent scheduled tick fire a SECOND run for the same routine while this one is still
- *  sitting there un-decided — reintroducing the exact double-fire hazard this fix closes. */
-const RETRYABLE_RESUME_FAILURE_CODES = new Set(['gate_timeout', 'model_busy', 'model_unavailable'])
+/** I3 fix: resumeRoutineRun re-throws (after reverting its claim — see its own doc comment) on a
+ *  genuine internal error (e.g. an unexpected failure from the underlying runner plumbing), which
+ *  used to escape /approve and /deny as a raw, unshaped Hono 500 instead of this file's
+ *  `{error:{code,message}}` envelope convention every other route follows. The parked-guard
+ *  behavior on this path is already correct without any extra handling — the claim was reverted,
+ *  so the run is genuinely still 'needs_approval' and must stay parked, and `releaseParkedIfResolved`
+ *  is simply never called on this path (there's no `result` to evaluate). */
+function internalError(c: Context, runId: string, e: unknown) {
+  console.error(`[routine-routes] resumeRoutineRun threw for run ${runId}:`, e)
+  return err(c, 500, 'internal_error', e instanceof Error ? e.message : String(e))
+}
+
+/** resumeRoutineRun's own failure codes that leave the SAME run legitimately still awaiting a
+ *  decision, and must therefore NEVER release the scheduler's parked guard:
+ *
+ *  - 'not_stalled': the run wasn't 'needs_approval' when checked. This covers two cases the
+ *    return code alone can't distinguish — the run already resolved via a DIFFERENT call (in
+ *    which case THAT call already released, or will), or (the C1 regression a live-execution
+ *    review confirmed) a CONCURRENT call for the SAME run just claimed it and is still actively
+ *    resolving it. Either way, this call releasing is either redundant or actively wrong — never
+ *    releasing here is always safe: the actual resolver's own call handles the real release.
+ *  - 'gate_timeout' / 'model_busy' / 'model_unavailable': the claim is reverted (execute.ts's
+ *    `revertClaim`) back to 'needs_approval' specifically so the user can just retry approving
+ *    shortly — releasing here would let a concurrent scheduled tick fire a SECOND run for the
+ *    same routine while this one is still sitting there un-decided. */
+const NON_RELEASING_RESUME_FAILURE_CODES = new Set(['not_stalled', 'gate_timeout', 'model_busy', 'model_unavailable'])
 
 /** Closes the double-fire hole scheduler.ts's own doc comment on `RoutineSchedulerDeps.
  *  runRoutine` describes: a routine that stalls awaiting approval is kept in the scheduler's
- *  `inFlight` set (see scheduler.ts) so a tick can't fire it again while parked, but nothing
- *  else can ever clear that guard, since `resumeRoutineRun` (Task 8) is invoked directly by
- *  this file's /approve and /deny handlers, never through the scheduler's own tick()/runRoutine
- *  path. Called after EVERY resumeRoutineRun call (approve or deny), but it only actually
- *  releases the scheduler's guard when the run has genuinely stopped needing a decision:
+ *  `inFlight`/`parked` state (see scheduler.ts) so a tick can't fire it again while parked, but
+ *  nothing else can ever clear that guard, since `resumeRoutineRun` (Task 8) is invoked directly
+ *  by this file's /approve and /deny handlers, never through the scheduler's own tick()/runRoutine
+ *  path. Called after EVERY resumeRoutineRun call that actually returned (approve or deny), but it
+ *  only actually releases the scheduler's guard when `run.id` has genuinely stopped needing a
+ *  decision:
  *
- *  - A RETRYABLE failure (gate_timeout/model_busy/model_unavailable) leaves the SAME run
- *    legitimately parked for a retry of the SAME decision — must NOT release, or a concurrent
- *    scheduled tick could fire a second run for this routine while this one is still pending.
- *  - Otherwise, a genuinely unrecoverable failure (e.g. 'corrupt_pending_call' — the pending
- *    tool call can never be parsed, so no future approve/deny can ever resolve it) DOES need to
+ *  - A code in `NON_RELEASING_RESUME_FAILURE_CODES` leaves the SAME run legitimately parked
+ *    (see that set's own doc comment) — must NOT release.
+ *  - Otherwise, a genuinely unrecoverable failure (e.g. 'corrupt_pending_call') DOES need to
  *    release, or the routine would be stuck unable to ever fire again — the concern the task
- *    brief's "even a denied/failed resume must release the parked slot" flags.
+ *    brief's "even a denied/failed resume must release the parked slot" flags. (`execute.ts`'s
+ *    `resumeRoutineRun` now also moves a `corrupt_pending_call` run to a real terminal 'errored'
+ *    state instead of leaving it at 'needs_approval' forever, so this case no longer keeps
+ *    re-triggering on every retry either.)
  *  - A successful resume (`result.ok`) that dispatched a real continuation can itself re-park
  *    the run on a second/chained tool-call approval (chat-runner.ts/code-runner.ts's resume
  *    paths, covered by their own tests) — re-read the run FRESH from the DB (never trust the
  *    caller's possibly-stale `run` argument) and skip releasing when it did.
  *
+ *  Passes `run.id` (not just `run.routineId`) to `RoutineScheduler.releaseParked` — the guard is
+ *  RUN-scoped (see scheduler.ts), specifically so a stale, duplicate, or wrong-run approve/deny
+ *  can never release a DIFFERENT, currently-executing fire's guard (the C2 regression a
+ *  live-execution review confirmed against the routine-scoped-only first cut).
+ *
  *  A no-op when there is no scheduler configured (route-level tests that don't wire one, or a
  *  build where the scheduler never started). */
 function releaseParkedIfResolved(d: Deps, run: RoutineRun, result: ResumeResult): void {
   if (!d.routineScheduler) return
-  if (!result.ok && RETRYABLE_RESUME_FAILURE_CODES.has(result.code)) return
+  if (!result.ok && NON_RELEASING_RESUME_FAILURE_CODES.has(result.code)) return
   if (result.ok) {
     const fresh = d.db.getRoutineRun(run.id)
     if (fresh?.status === 'needs_approval') return
   }
-  d.routineScheduler.releaseParked(run.routineId)
+  d.routineScheduler.releaseParked(run.routineId, run.id)
 }

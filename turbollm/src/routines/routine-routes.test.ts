@@ -17,6 +17,14 @@ import type { GenerationGate } from '../agents/gate'
 const RAW_KEY = 'tllm-TestKeyTestKeyTestKeyTestKeyTestKey1'
 const RAW_KEY_HASH = createHash('sha256').update(RAW_KEY).digest('hex')
 
+/** M1: the invariant that actually matters for the double-fire fix (mirrors scheduler.test.ts's
+ *  own copy) — not fire-counts or skip-row-counts alone, but "at most one row is ever 'running'
+ *  for a given routine at once." */
+function assertAtMostOneRunning(db: ConversationStore, routineId: string, message?: string): void {
+  const runningCount = db.listRoutineRuns(routineId).filter((run) => run.status === 'running').length
+  assert.ok(runningCount <= 1, message ?? `expected at most one 'running' row for routine ${routineId}, found ${runningCount}`)
+}
+
 /** `lanBind` drives isLocalRequest (the code-flavor gate, I4): false = loopback-only bind,
  *  which is always "local to the host", so the gate is a no-op — the default every
  *  pre-existing test here relies on. Set it true to simulate a LAN-exposed daemon, where a
@@ -468,6 +476,12 @@ test('approve releases the scheduler-parked routine once resumeRoutineRun settle
   const res = await app.request(`/api/v1/routines/${routine.id}/runs/${run.id}/approve`, { method: 'POST' })
   assert.equal(res.status, 409)
   assert.equal((await res.json() as { error: { code: string } }).error.code, 'corrupt_pending_call')
+  // M2(c): the run itself must land in a REAL terminal state, not stay stuck at 'needs_approval'
+  // forever — otherwise every retry would re-trigger the exact same corrupt_pending_call path
+  // indefinitely, and the run would misrepresent itself as still-actionable in run history/UI.
+  const resolvedRun = db.getRoutineRun(run.id)!
+  assert.equal(resolvedRun.status, 'errored')
+  assert.ok(resolvedRun.endedAt)
 
   // Prove the release actually happened: winding next_fire_at back into the past and ticking
   // again (on the SAME scheduler instance the route released) must fire it, with no new overlap.
@@ -476,6 +490,7 @@ test('approve releases the scheduler-parked routine once resumeRoutineRun settle
   await new Promise((resolve) => setImmediate(resolve))
   assert.deepEqual(fired, [routine.id, routine.id], 'the routine fires again after being released by /approve')
   assert.equal(db.listRoutineRuns(routine.id).filter((x) => x.skipReason === 'overlap').length, 1, 'no NEW overlap row from this fire')
+  assertAtMostOneRunning(db, routine.id)
 })
 
 test('approve does NOT release the parked guard on a retryable resume failure (gate_timeout)', async () => {
@@ -532,4 +547,263 @@ test('approve does NOT release the parked guard on a retryable resume failure (g
   await scheduler.tick()
   await new Promise((resolve) => setImmediate(resolve))
   assert.equal(db.listRoutineRuns(routine.id).filter((x) => x.skipReason === 'overlap').length, 1, 'still guarded — a retryable failure must not release the parked slot')
+})
+
+// ── I2: run-now/approve/deny must honor the same code-flavor auth gate as create/update ────
+// codeGateBlocks' own doc comment used to flag this as "an open decision for whoever ships
+// Phase 2's execution" — run-now triggers real bash/edit/write on demand, and approve executes
+// a tool call the approval gate deliberately blocked, so both are strictly worse than the
+// already-gated create/update case if left ungated.
+
+test('POST /api/v1/routines/:id/run-now on a code routine from a non-host device with no key is rejected (I2)', async () => {
+  const db = new ConversationStore(mkdtempSync(join(tmpdir(), 'routine-routes-test-')))
+  const app = new Hono()
+  const apiKeys: unknown[] = []
+  const d = {
+    db,
+    store: {
+      snapshot: () => ({ daemon: { lanBind: true, requireApiKey: false }, apiKeys }),
+      update: (fn: (cfg: { apiKeys: typeof apiKeys }) => void) => fn({ apiKeys }),
+    },
+  } as unknown as Deps
+  const routine = db.createRoutine({
+    flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 },
+    modelKey: 'm', workspacePath: 'D:/repo', codingAgent: 'pi',
+  })
+  db.confirmRoutine(routine.id, '2099-01-01T00:00:00.000Z')
+  const scheduler = new RoutineScheduler({ store: db, now: () => new Date(), runRoutine: async () => 'ok' })
+  registerRoutineRoutes(app, { ...d, routineScheduler: scheduler } as unknown as Deps)
+  const res = await app.request(`/api/v1/routines/${routine.id}/run-now`, { method: 'POST' })
+  assert.equal(res.status, 401)
+})
+
+test('POST /api/v1/routines/:id/run-now on a code routine from the host (loopback-only bind) needs no key (I2)', async () => {
+  const db = new ConversationStore(mkdtempSync(join(tmpdir(), 'routine-routes-test-')))
+  const app = new Hono()
+  const d = { db, store: { snapshot: () => ({ daemon: { lanBind: false, requireApiKey: false }, apiKeys: [] }) } } as unknown as Deps
+  const routine = db.createRoutine({
+    flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 },
+    modelKey: 'm', workspacePath: 'D:/repo', codingAgent: 'pi',
+  })
+  db.confirmRoutine(routine.id, '2099-01-01T00:00:00.000Z')
+  const fired: string[] = []
+  const scheduler = new RoutineScheduler({ store: db, now: () => new Date(), runRoutine: async (r) => { fired.push(r.id); return 'ok' } })
+  registerRoutineRoutes(app, { ...d, routineScheduler: scheduler } as unknown as Deps)
+  const res = await app.request(`/api/v1/routines/${routine.id}/run-now`, { method: 'POST' })
+  assert.equal(res.status, 202)
+})
+
+test('POST .../runs/:runId/approve on a code routine from a non-host device with no key is rejected (I2)', async () => {
+  const { app, db } = testApp({ lanBind: true })
+  const routine = db.createRoutine({
+    flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 },
+    modelKey: 'm', workspacePath: 'D:/repo', codingAgent: 'pi',
+  })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  db.updateRoutineRun(run.id, { status: 'needs_approval' })
+  const res = await app.request(`/api/v1/routines/${routine.id}/runs/${run.id}/approve`, { method: 'POST' })
+  assert.equal(res.status, 401)
+  // Gated before resumeRoutineRun ever ran — the run must be untouched.
+  assert.equal(db.getRoutineRun(run.id)?.status, 'needs_approval')
+})
+
+test('POST .../runs/:runId/deny on a code routine from a non-host device with no key is rejected (I2)', async () => {
+  const { app, db } = testApp({ lanBind: true })
+  const routine = db.createRoutine({
+    flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 },
+    modelKey: 'm', workspacePath: 'D:/repo', codingAgent: 'pi',
+  })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  db.updateRoutineRun(run.id, { status: 'needs_approval' })
+  const res = await app.request(`/api/v1/routines/${routine.id}/runs/${run.id}/deny`, { method: 'POST' })
+  assert.equal(res.status, 401)
+})
+
+test('POST .../runs/:runId/approve on a CHAT routine from a non-host device is NOT gated (I2)', async () => {
+  const { app, db } = testApp({ lanBind: true })
+  const routine = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', agentId: 'a' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  db.updateRoutineRun(run.id, { status: 'needs_approval' })
+  const res = await app.request(`/api/v1/routines/${routine.id}/runs/${run.id}/approve`, { method: 'POST' })
+  // Not gated (401), but fails for an unrelated reason: this run has no real pendingToolCall.
+  assert.notEqual(res.status, 401)
+})
+
+// ── I3: an unhandled throw from resumeRoutineRun must not escape as a raw, unshaped 500 ────
+
+test('POST .../runs/:runId/approve returns a shaped 500 (not a raw crash) if resumeRoutineRun throws (I3)', async () => {
+  const db = new ConversationStore(mkdtempSync(join(tmpdir(), 'routine-routes-test-')))
+  const app = new Hono()
+  const routine = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'agent-1' })
+  db.confirmRoutine(routine.id, '2020-01-01T00:00:00.000Z')
+  const AGENT = { id: 'agent-1', name: 'A', description: '', systemPrompt: '', skillIds: [], tools: [] as string[] }
+  const workingManager = {
+    status: () => ({ state: 'running', model: { key: 'm' } }),
+    sessionStats: () => ({ activeRequests: 0 }),
+    target: () => 'http://engine.invalid.local:1',
+  } as unknown as Manager
+  const modelRouter = { loadExplicit: async () => ({ target: 'http://x' }) } as unknown as ModelRouter
+  const d = {
+    db, manager: workingManager, modelRouter,
+    registry: { active: () => ({ kind: 'llama-server' }) },
+    store: { snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }) },
+  } as unknown as Deps
+
+  // Genuinely stall via a real tool-call round so pendingToolCall is parseable.
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    choices: [{ message: { content: null, tool_calls: [{ id: 'c1', function: { name: 'not_allowed_tool', arguments: '{}' } }] } }],
+  }), { status: 200 })) as typeof fetch
+  try {
+    await executeRoutine(d, routine, run)
+  } finally { globalThis.fetch = originalFetch }
+  const stalled = db.getRoutineRun(run.id)!
+  assert.equal(stalled.status, 'needs_approval')
+
+  // Force dispatch to throw instead of resolving.
+  ;(d as unknown as { manager: Manager }).manager = { status: () => { throw new Error('engine exploded') } } as unknown as Manager
+  registerRoutineRoutes(app, d)
+
+  const res = await app.request(`/api/v1/routines/${routine.id}/runs/${stalled.id}/approve`, { method: 'POST' })
+  assert.equal(res.status, 500)
+  const responseBody = await res.json() as { error: { code: string; message: string } }
+  assert.equal(responseBody.error.code, 'internal_error')
+  assert.match(responseBody.error.message, /engine exploded/)
+  // The claim was reverted by resumeRoutineRun itself — the run is genuinely still
+  // 'needs_approval', not stuck at 'running' forever.
+  assert.equal(db.getRoutineRun(stalled.id)?.status, 'needs_approval')
+})
+
+// ── M2(a): two concurrent /approve calls on the SAME stalled run (C1 regression) ────────────
+// resumeRoutineRun's own idempotency claim makes exactly one of two concurrent calls win, but a
+// live-execution review found the LOSING call's fast 'not_stalled' result used to still release
+// the scheduler's parked guard while the WINNING call's dispatch was still executing — reopening
+// the double-fire hole through a race instead of a stale-run mixup. This proves the guard
+// survives for the whole duration of the winner's dispatch, not just "eventually settles right."
+
+test('two concurrent approve calls on the same stalled run: only one executes, and the guard survives the race (C1)', async () => {
+  const db = new ConversationStore(mkdtempSync(join(tmpdir(), 'routine-routes-test-')))
+  const app = new Hono()
+  const routine = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'agent-1' })
+  db.confirmRoutine(routine.id, '2020-01-01T00:00:00.000Z')
+
+  const manager = {
+    status: () => ({ state: 'running', model: { key: 'm' } }),
+    sessionStats: () => ({ activeRequests: 0 }),
+    target: () => 'http://engine.invalid.local:1',
+  } as unknown as Manager
+  const modelRouter = { loadExplicit: async () => ({ target: 'http://x' }) } as unknown as ModelRouter
+  const AGENT = { id: 'agent-1', name: 'A', description: '', systemPrompt: '', skillIds: [], tools: [] as string[] }
+  const gate = { acquire: async () => () => {} } as unknown as GenerationGate
+  const d = {
+    db, manager, modelRouter, gate,
+    registry: { active: () => ({ kind: 'llama-server' }) },
+    store: { snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }) },
+  } as unknown as Deps
+
+  const fired: string[] = []
+  const scheduler = new RoutineScheduler({ store: db, now: () => new Date(), runRoutine: (r, run) => { fired.push(r.id); return executeRoutine(d, r, run) } })
+  registerRoutineRoutes(app, { ...d, routineScheduler: scheduler } as unknown as Deps)
+
+  // Stall via a real tool-call round so pendingToolCall is genuinely parseable.
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    choices: [{ message: { content: null, tool_calls: [{ id: 'c1', function: { name: 'not_allowed_tool', arguments: '{}' } }] } }],
+  }), { status: 200 })) as typeof fetch
+  try {
+    await scheduler.tick()
+    await new Promise((resolve) => setImmediate(resolve))
+  } finally { globalThis.fetch = originalFetch }
+  const [run] = db.listRoutineRuns(routine.id)
+  assert.equal(run.status, 'needs_approval')
+  assert.deepEqual(fired, [routine.id])
+
+  // Make the (winning) resumed dispatch deliberately slow, so the loser's fast 'not_stalled'
+  // response — and its own releaseParkedIfResolved call — definitely lands while the winner is
+  // still executing.
+  let resolveSlowFetch!: () => void
+  const slowFetch = new Promise<void>((resolve) => { resolveSlowFetch = resolve })
+  globalThis.fetch = (async () => {
+    await slowFetch
+    return new Response(JSON.stringify({ choices: [{ message: { content: 'done' } }] }), { status: 200 })
+  }) as typeof fetch
+  try {
+    const call1 = app.request(`/api/v1/routines/${routine.id}/runs/${run.id}/approve`, { method: 'POST' })
+    const call2 = app.request(`/api/v1/routines/${routine.id}/runs/${run.id}/approve`, { method: 'POST' })
+    // Let the loser's synchronous-fast 'not_stalled' path (and its release attempt) run.
+    await new Promise((resolve) => setImmediate(resolve))
+    // While the winner's dispatch is STILL blocked on slowFetch, the routine must still read as
+    // guarded: a tick must not be able to start a fresh, third concurrent run for it.
+    await scheduler.tick()
+    assertAtMostOneRunning(db, routine.id, 'the loser\'s not_stalled result must not have released the guard mid-flight')
+    assert.deepEqual(fired, [routine.id], 'no NEW fire while the winner is still executing')
+
+    resolveSlowFetch()
+    const [res1, res2] = await Promise.all([call1, call2])
+    const statuses = [res1.status, res2.status].sort()
+    assert.deepEqual(statuses, [200, 409], 'exactly one call succeeds, the other fails cleanly')
+  } finally { globalThis.fetch = originalFetch }
+
+  // The routine must now be genuinely released by the winner — a later tick fires it cleanly.
+  await new Promise((resolve) => setImmediate(resolve))
+  db.updateRoutine(routine.id, { nextFireAt: '2020-01-01T00:00:00.000Z' })
+  globalThis.fetch = (async () => new Response(JSON.stringify({ choices: [{ message: { content: 'again' } }] }), { status: 200 })) as typeof fetch
+  try {
+    await scheduler.tick()
+    await new Promise((resolve) => setImmediate(resolve))
+  } finally { globalThis.fetch = originalFetch }
+  // Exactly the ONE overlap row from the mid-flight guard check above — this final tick must not
+  // add a second one, which is what "released cleanly" actually means here.
+  assert.equal(db.listRoutineRuns(routine.id).filter((x) => x.skipReason === 'overlap').length, 1, 'no NEW overlap row after release — just the one that proved the guard held mid-flight')
+})
+
+// ── M2(b): a stale/duplicate approve on an OLD run must not release a DIFFERENT live fire ──
+// (C2 regression, proven at the route/HTTP layer — the scheduler-level version lives in
+// scheduler.test.ts). Simulates a leftover 'needs_approval' row the scheduler never actually
+// parked (e.g. any orphaned historical state) coexisting with a genuinely live, currently-parked
+// fire of the SAME routine.
+
+test('a stale approve on an OLD needs_approval run does not release a DIFFERENT, currently-live parked fire (C2)', async () => {
+  const db = new ConversationStore(mkdtempSync(join(tmpdir(), 'routine-routes-test-')))
+  const app = new Hono()
+  const routine = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'a' })
+  db.confirmRoutine(routine.id, '2020-01-01T00:00:00.000Z')
+
+  // A leftover 'needs_approval' row the scheduler never tracked as parked (no pendingToolCall —
+  // permanently unresolvable, same shape a pre-fix corrupt_pending_call row would have had).
+  const staleRun = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  db.updateRoutineRun(staleRun.id, { status: 'needs_approval' })
+
+  const fired: string[] = []
+  const scheduler = new RoutineScheduler({ store: db, now: () => new Date(), runRoutine: async (r) => { fired.push(r.id); return 'needs_approval' } })
+  registerRoutineRoutes(app, { db, routineScheduler: scheduler } as unknown as Deps)
+
+  // A REAL fire happens and genuinely parks — this is the run the scheduler's guard belongs to.
+  await scheduler.tick()
+  await new Promise((resolve) => setImmediate(resolve))
+  const liveRun = db.listRoutineRuns(routine.id).find((r) => r.id !== staleRun.id)!
+  assert.equal(liveRun.status, 'needs_approval')
+
+  // A caller approves the STALE run (its pendingToolCall can't be parsed either) — must NOT
+  // release the guard the LIVE run is holding.
+  const staleRes = await app.request(`/api/v1/routines/${routine.id}/runs/${staleRun.id}/approve`, { method: 'POST' })
+  assert.equal(staleRes.status, 409)
+  assert.equal((await staleRes.json() as { error: { code: string } }).error.code, 'corrupt_pending_call')
+
+  // The live fire's guard must still be intact: a tick must not start a fresh concurrent run.
+  await scheduler.tick()
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(fired, [routine.id], 'still guarded — the stale approve must not have released the live parked run')
+  assert.equal(db.listRoutineRuns(routine.id).filter((x) => x.skipReason === 'overlap').length, 1)
+  assertAtMostOneRunning(db, routine.id)
+
+  // Approving the CORRECT (live) run does release it — same corrupt_pending_call path, but this
+  // time it's the run the scheduler actually has parked.
+  const liveRes = await app.request(`/api/v1/routines/${routine.id}/runs/${liveRun.id}/approve`, { method: 'POST' })
+  assert.equal(liveRes.status, 409)
+  db.updateRoutine(routine.id, { nextFireAt: '2020-01-01T00:00:00.000Z' })
+  await scheduler.tick()
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(fired, [routine.id, routine.id], 'released correctly — the routine can fire again')
 })
