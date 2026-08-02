@@ -8,6 +8,11 @@
 // baseline lanAuth gate. Marking on any 401 would be roughly right, but clearing on any 2xx (which
 // the code-api pairing requires) would let a successful chat-routine poll silently dismiss a
 // genuine Code auth prompt. Left out as a deliberate, documented judgment call.
+//
+// Consequence: a code-flavor 401 raises no AuthGate. Tasks 5/9/10 MUST catch
+// `ApiError.status === 401` on create/update/confirm/pause/resume/run-now/approve/deny and toast
+// `error.message` (the server sends `CODE_GATE_MESSAGE`), which is the only auth feedback this
+// surface will have. Each of those eight functions repeats the 401 in its own JSDoc below.
 import { ApiError, authHeaders } from './api'
 import type { Routine, RoutineInput, RoutineRun } from './routine-types'
 
@@ -39,7 +44,9 @@ export function createRoutine(input: RoutineInput): Promise<Routine> {
   return req('/api/v1/routines', { method: 'POST', json: input })
 }
 /** PUT cannot change `flavor`; every other RoutineInput field is patchable. Returns the updated
- *  routine (the route recomputes nextFireAt itself when an active routine's schedule changes). */
+ *  routine (the route recomputes nextFireAt itself when an active routine's schedule changes).
+ *  Throws ApiError 'unauthorized' (401) for a code-flavor routine from a non-host device without
+ *  a key (routine-routes.ts's codeGateBlocks). */
 export function updateRoutine(id: string, patch: Partial<RoutineInput>): Promise<Routine> {
   return req(`/api/v1/routines/${encodeURIComponent(id)}`, { method: 'PUT', json: patch })
 }
@@ -47,15 +54,20 @@ export function deleteRoutine(id: string): Promise<{ ok: true }> {
   return req(`/api/v1/routines/${encodeURIComponent(id)}`, { method: 'DELETE' })
 }
 /** The one door into 'active'. Throws ApiError 'not_pending' (409) if the routine was already
- *  confirmed. */
+ *  confirmed, or 'unauthorized' (401) for a code-flavor routine from a non-host device without
+ *  a key (routine-routes.ts's codeGateBlocks). */
 export function confirmRoutine(id: string): Promise<Routine> {
   return req(`/api/v1/routines/${encodeURIComponent(id)}/confirm`, { method: 'PUT' })
 }
-/** Throws ApiError 'not_active' (409) when the routine isn't currently active. */
+/** Throws ApiError 'not_active' (409) when the routine isn't currently active, or 'unauthorized'
+ *  (401) for a code-flavor routine from a non-host device without a key (routine-routes.ts's
+ *  codeGateBlocks). */
 export function pauseRoutine(id: string): Promise<Routine> {
   return req(`/api/v1/routines/${encodeURIComponent(id)}/pause`, { method: 'PUT' })
 }
-/** Throws ApiError 'not_paused' (409) when the routine isn't currently paused. */
+/** Throws ApiError 'not_paused' (409) when the routine isn't currently paused, or 'unauthorized'
+ *  (401) for a code-flavor routine from a non-host device without a key (routine-routes.ts's
+ *  codeGateBlocks). */
 export function resumeRoutine(id: string): Promise<Routine> {
   return req(`/api/v1/routines/${encodeURIComponent(id)}/resume`, { method: 'PUT' })
 }
@@ -70,7 +82,8 @@ export function listRoutineRuns(routineId: string): Promise<RoutineRun[]> {
  *  202, NOT the created run — the route hands off to `RoutineScheduler.runNow`, which dispatches
  *  asynchronously and has no run row to return yet. Callers that want the run must refetch
  *  {@link listRoutineRuns}. Throws ApiError 'scheduler_unavailable' (503), 'not_found' (404),
- *  'not_confirmed' (409), or 'already_running' (409). */
+ *  'not_confirmed' (409), 'already_running' (409), or 'unauthorized' (401) for a code-flavor
+ *  routine from a non-host device without a key (routine-routes.ts's codeGateBlocks). */
 export function runRoutineNow(id: string): Promise<{ ok: true }> {
   return req(`/api/v1/routines/${encodeURIComponent(id)}/run-now`, { method: 'POST' })
 }
@@ -79,14 +92,16 @@ export function runRoutineNow(id: string): Promise<{ ok: true }> {
  *  DRIFT FROM PLAN (verified against the shipped route): returns `{ ok: true }`, not the run —
  *  the route awaits `resumeRoutineRun`, which dispatches a continuation whose outcome isn't known
  *  when the response is written. Refetch {@link listRoutineRuns} for the new state. Throws
- *  ApiError 'not_found' (404), 'internal_error' (500), or a 409 carrying resumeRoutineRun's own
+ *  ApiError 'not_found' (404), 'internal_error' (500), a 409 carrying resumeRoutineRun's own
  *  code ('not_stalled' / 'gate_timeout' / 'model_busy' / 'model_unavailable' /
- *  'corrupt_pending_call'). */
+ *  'corrupt_pending_call'), or 'unauthorized' (401) for a code-flavor routine from a non-host
+ *  device without a key (routine-routes.ts's codeGateBlocks). */
 export function approveRoutineRun(routineId: string, runId: string): Promise<{ ok: true }> {
   return req(`/api/v1/routines/${encodeURIComponent(routineId)}/runs/${encodeURIComponent(runId)}/approve`, { method: 'POST' })
 }
 /** DENIES a stalled run's blocked tool call. Same response shape and failure codes as
- *  {@link approveRoutineRun}. */
+ *  {@link approveRoutineRun}, including 'unauthorized' (401) for a code-flavor routine from a
+ *  non-host device without a key (routine-routes.ts's codeGateBlocks). */
 export function denyRoutineRun(routineId: string, runId: string): Promise<{ ok: true }> {
   return req(`/api/v1/routines/${encodeURIComponent(routineId)}/runs/${encodeURIComponent(runId)}/deny`, { method: 'POST' })
 }

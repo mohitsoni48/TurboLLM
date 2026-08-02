@@ -12,6 +12,11 @@ describe('describeScheduleRule', () => {
   it('keeps minutes for an interval that is not a whole number of hours', () => {
     expect(describeScheduleRule({ kind: 'interval', everyMs: 90 * 60_000 })).toBe('Runs every 90 minutes')
   })
+  it('describes a sub-minute interval in seconds instead of rounding it to a wrong minute count', () => {
+    // A model calling create_routine can send any everyMs; Math.round(30_000 / 60_000) would
+    // render "1 minute" and 20_000 would render "0 minutes", then get persisted as scheduleDisplay.
+    expect(describeScheduleRule({ kind: 'interval', everyMs: 30_000 })).toBe('Runs every 30 seconds')
+  })
   it('describes a daily rule with 12-hour time formatting', () => {
     expect(describeScheduleRule({ kind: 'daily', hour: 9, minute: 0 })).toBe('Runs daily at 9:00 AM')
     expect(describeScheduleRule({ kind: 'daily', hour: 13, minute: 30 })).toBe('Runs daily at 1:30 PM')
@@ -48,6 +53,28 @@ describe('isRoutineDraftComplete', () => {
     expect(isRoutineDraftComplete({ ...d, scheduleRule: { kind: 'interval', everyMs: 0 } })).toBe(false)
     expect(isRoutineDraftComplete({ ...d, scheduleRule: { kind: 'interval', everyMs: -1 } })).toBe(false)
     expect(isRoutineDraftComplete({ ...d, scheduleRule: { kind: 'interval', everyMs: 60_000 } })).toBe(true)
+  })
+  it('a non-finite interval is incomplete — validateScheduleRule rejects it with a 400', () => {
+    const d = { ...emptyRoutineDraft(), prompt: 'x', modelKey: 'm', agentId: 'a' }
+    expect(isRoutineDraftComplete({ ...d, scheduleRule: { kind: 'interval', everyMs: Infinity } })).toBe(false)
+    expect(isRoutineDraftComplete({ ...d, scheduleRule: { kind: 'interval', everyMs: NaN } })).toBe(false)
+  })
+  it('an out-of-range or non-integer hour/minute is incomplete on daily and weekly rules', () => {
+    const d = { ...emptyRoutineDraft(), prompt: 'x', modelKey: 'm', agentId: 'a' }
+    expect(isRoutineDraftComplete({ ...d, scheduleRule: { kind: 'daily', hour: 24, minute: 0 } })).toBe(false)
+    expect(isRoutineDraftComplete({ ...d, scheduleRule: { kind: 'daily', hour: -1, minute: 0 } })).toBe(false)
+    expect(isRoutineDraftComplete({ ...d, scheduleRule: { kind: 'daily', hour: 9.5, minute: 0 } })).toBe(false)
+    expect(isRoutineDraftComplete({ ...d, scheduleRule: { kind: 'daily', hour: 9, minute: 60 } })).toBe(false)
+    expect(isRoutineDraftComplete({ ...d, scheduleRule: { kind: 'daily', hour: 9, minute: -1 } })).toBe(false)
+    expect(isRoutineDraftComplete({ ...d, scheduleRule: { kind: 'weekly', daysOfWeek: [1], hour: 24, minute: 0 } })).toBe(false)
+    expect(isRoutineDraftComplete({ ...d, scheduleRule: { kind: 'daily', hour: 23, minute: 59 } })).toBe(true)
+  })
+  it('a daysOfWeek entry outside 0-6 is incomplete even though the array is non-empty', () => {
+    const d = { ...emptyRoutineDraft(), prompt: 'x', modelKey: 'm', agentId: 'a' }
+    expect(isRoutineDraftComplete({ ...d, scheduleRule: { kind: 'weekly', daysOfWeek: [7], hour: 9, minute: 0 } })).toBe(false)
+    expect(isRoutineDraftComplete({ ...d, scheduleRule: { kind: 'weekly', daysOfWeek: [-1], hour: 9, minute: 0 } })).toBe(false)
+    expect(isRoutineDraftComplete({ ...d, scheduleRule: { kind: 'weekly', daysOfWeek: [1, 2.5], hour: 9, minute: 0 } })).toBe(false)
+    expect(isRoutineDraftComplete({ ...d, scheduleRule: { kind: 'weekly', daysOfWeek: [0, 6], hour: 9, minute: 0 } })).toBe(true)
   })
 })
 

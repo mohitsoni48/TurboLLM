@@ -27,4 +27,12 @@ describe('RoutineStatusBadge', () => {
       unmount()
     }
   })
+  it('falls back to a labelled, coloured pill for a status the frontend union does not know', () => {
+    // deriveRoutineDisplayStatus passes routine.status through unchanged, and that value comes
+    // off the wire — a backend-only new status must not render an unlabelled, uncoloured pill.
+    render(<RoutineStatusBadge status={'archived' as never} />)
+    const pill = screen.getByText('Unknown')
+    expect(pill).toBeInTheDocument()
+    expect(pill.querySelector('span')?.getAttribute('style')).toContain('var(--muted)')
+  })
 })
