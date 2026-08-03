@@ -7,11 +7,12 @@
 // (turbollm/src/routines/routine-tools.ts) never populates such a field and has no way to. Every
 // fixture below instead uses the EXACT strings those executors really return, so a regression in
 // the parsing/derivation this feature actually depends on fails here.
-import { render, screen } from '@testing-library/react'
+import { act, render, screen } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { MessageBubble } from './MessageBubble'
-import type { Message, ToolCallRecord } from '../../lib/chat-types'
+import { MessageBubble, StreamingBubble } from './MessageBubble'
+import type { LiveToolCall, Message, ToolCallRecord } from '../../lib/chat-types'
+import { routineKeys } from '../../lib/routine-queries'
 import type { Routine } from '../../lib/routine-types'
 
 // RoutineFormFields (reached through RoutineConfirmCard) pulls the agent/model lists; the confirm
@@ -48,11 +49,34 @@ function assistantMessage(toolCalls: ToolCallRecord[]): Message {
 
 function renderBubble(toolCalls: ToolCallRecord[]) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(
+  const utils = render(
     <QueryClientProvider client={qc}>
       <MessageBubble message={assistantMessage(toolCalls)} isLast={false} editingId={null} onEditSave={() => {}} onEditCancel={() => {}} />
     </QueryClientProvider>,
   )
+  // The client is returned so a test can simulate the routine changing UNDER a still-mounted card
+  // (the Routines panel's own confirm invalidates exactly this key — routine-queries.ts).
+  return { qc, ...utils }
+}
+
+/** The STREAMING half of the same surface: StreamingBubble → InlineToolStep → the same wrapper.
+ *  Needed because a live tool call can carry a `status` a persisted `ToolCallRecord` cannot —
+ *  MessageBubble's own mapping collapses every record to 'done'/'error' and rewrites `result` to
+ *  the error text, so an errored call PAIRED WITH a success-shaped result only exists here. */
+function renderStreaming(calls: LiveToolCall[]) {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  const utils = render(
+    <QueryClientProvider client={qc}>
+      <StreamingBubble
+        timeline={calls.map((call) => ({ kind: 'tool' as const, call }))}
+        reasoning=""
+        progress={null}
+        liveGenTps={0}
+        genTokens={0}
+      />
+    </QueryClientProvider>,
+  )
+  return { qc, ...utils }
 }
 
 /** What `friendlyName()` renders for these tool names in the generic card header — the marker that
@@ -126,6 +150,83 @@ describe('MessageBubble — create_routine confirm gate', () => {
     expect(screen.getByText(GENERIC.create)).toBeInTheDocument()
     expect(screen.queryByText('Confirm this new routine')).not.toBeInTheDocument()
   })
+
+  // ── H1: the gate must read the ROUTINE's current status, not just the tool call ─────────────
+  //
+  // Create-mode Cancel is a hard DELETE (RoutineConfirmCard.tsx) and DELETE /api/v1/routines/:id
+  // has no status guard, cascading to the run history. Offering it for a routine that is already
+  // live turns "dismiss this proposal" into "destroy a running scheduled job". The tool result
+  // says `pending_confirmation` forever; only the fetched routine knows the truth.
+  it.each(['active', 'paused'] as const)(
+    'never renders the create gate for a routine already in status %s (page reload / revisiting the turn)',
+    async (status) => {
+      getRoutineMock.mockResolvedValue(routine({ status }))
+      renderBubble([{ id: 'tc1', name: 'create_routine', args: {}, result: createdResult }])
+      expect(await screen.findByText(GENERIC.create)).toBeInTheDocument()
+      expect(screen.queryByText('Confirm this new routine')).not.toBeInTheDocument()
+      // The destructive control specifically: no Cancel-as-delete anywhere on this card.
+      expect(screen.queryByRole('button', { name: /Cancel/ })).not.toBeInTheDocument()
+      // The gate did run — this is a status refusal, not an accidental no-fetch.
+      expect(getRoutineMock).toHaveBeenCalledWith('r1')
+    },
+  )
+
+  // H1 route 1: the user confirms from the STILL-STREAMING card, the turn ends, StreamingBubble
+  // unmounts and MessageBubble mounts a FRESH card — RoutineConfirmCard's local `resolved` state
+  // died with the old tree, so only the status check can stop the gate reappearing.
+  it('does not re-offer the gate on the completed-message card after the streaming card confirmed it', async () => {
+    const { unmount } = renderStreaming([
+      { id: 'tc1', name: 'create_routine', args: {}, status: 'done', result: createdResult },
+    ])
+    expect(await screen.findByText('Confirm this new routine')).toBeInTheDocument()
+    unmount() // turn finished: the streaming tree (and its `resolved` state) is gone
+
+    getRoutineMock.mockResolvedValue(routine({ status: 'active' })) // …because Confirm landed
+    renderBubble([{ id: 'tc1', name: 'create_routine', args: {}, result: createdResult }])
+    expect(await screen.findByText(GENERIC.create)).toBeInTheDocument()
+    expect(screen.queryByText('Confirm this new routine')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Cancel/ })).not.toBeInTheDocument()
+  })
+
+  // H1 route 2: the user confirms the SAME routine from the Routines panel while this card is
+  // still mounted and unresolved. That mutation invalidates `routineKeys.detail(id)` — the very
+  // query this card reads — so the now-active routine flows straight back into it.
+  it('drops the gate when the routine goes active underneath a still-mounted card', async () => {
+    const { qc } = renderBubble([{ id: 'tc1', name: 'create_routine', args: {}, result: createdResult }])
+    expect(await screen.findByText('Confirm this new routine')).toBeInTheDocument()
+
+    getRoutineMock.mockResolvedValue(routine({ status: 'active' }))
+    await act(async () => { await qc.invalidateQueries({ queryKey: routineKeys.detail('r1') }) })
+
+    expect(await screen.findByText(GENERIC.create)).toBeInTheDocument()
+    expect(screen.queryByText('Confirm this new routine')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Cancel/ })).not.toBeInTheDocument()
+  })
+
+  // L1: the `^` anchor on CREATED_ROUTINE_RE is load-bearing — a result that merely CONTAINS the
+  // phrase (a tool loop prefixing its own note, a list/echo of an earlier action) is not a create
+  // this turn performed, and must not arm a delete button.
+  it('does not trigger the gate when the created-routine phrase is not at the START of the result', async () => {
+    renderBubble([{
+      id: 'tc1', name: 'create_routine', args: {},
+      result: `Earlier in this session: ${createdResult}`,
+    }])
+    expect(await screen.findByText(GENERIC.create)).toBeInTheDocument()
+    expect(screen.queryByText('Confirm this new routine')).not.toBeInTheDocument()
+    expect(getRoutineMock).not.toHaveBeenCalled()
+  })
+
+  // L2: the tool-call STATUS guard, pinned on its own. The result string here is the real success
+  // string and would match the regex outright, so this test fails if that guard is removed — the
+  // other "failed call" cases are blocked by `!result` or by the regex instead. Only the streaming
+  // surface can produce this pairing (see renderStreaming's comment).
+  it('does not render the gate for a FAILED call whose result would otherwise match', () => {
+    renderStreaming([{ id: 'tc1', name: 'create_routine', args: {}, status: 'error', result: createdResult }])
+    expect(screen.getByText(GENERIC.create)).toBeInTheDocument()
+    expect(screen.queryByText('Confirm this new routine')).not.toBeInTheDocument()
+    expect(screen.queryByText('Loading routine…')).not.toBeInTheDocument()
+    expect(getRoutineMock).not.toHaveBeenCalled()
+  })
 })
 
 describe('MessageBubble — update_routine confirm gate', () => {
@@ -191,6 +292,99 @@ describe('MessageBubble — update_routine confirm gate', () => {
     }])
     expect(await screen.findByText(GENERIC.update)).toBeInTheDocument()
     expect(screen.queryByText('Confirm this change')).not.toBeInTheDocument()
+  })
+
+  // ── M1: a preview the model already applied is history, not an outstanding request ──────────
+  //
+  // The successful two-phase flow ALWAYS leaves both records in the transcript. Left ungated, the
+  // earlier one keeps a live "Confirm this change" whose Cancel prints "Routine change cancelled."
+  // after the write landed, and whose Confirm would re-apply the old proposal over newer values.
+  it('renders the PREVIEW record as generic once a later confirm: true apply supersedes it', async () => {
+    renderBubble([
+      {
+        id: 'tc1', name: 'update_routine',
+        args: { routineId: 'r1', prompt: 'Summarize my inbox and Slack' },
+        result: previewResult,
+      },
+      {
+        id: 'tc2', name: 'update_routine',
+        args: { routineId: 'r1', prompt: 'Summarize my inbox and Slack', confirm: true },
+        result: 'Updated routine "r1".',
+      },
+    ])
+    // Both records render as plain generic cards; neither is an actionable gate.
+    expect(await screen.findAllByText(GENERIC.update)).toHaveLength(2)
+    expect(screen.queryByText('Confirm this change')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Confirm/ })).not.toBeInTheDocument()
+    expect(getRoutineMock).not.toHaveBeenCalled()
+  })
+
+  // The suppression is per-routine, not a blanket "any later apply kills every preview".
+  it('keeps the gate when the later apply targets a DIFFERENT routine', async () => {
+    getRoutineMock.mockResolvedValue(routine({ status: 'active' }))
+    renderBubble([
+      {
+        id: 'tc1', name: 'update_routine',
+        args: { routineId: 'r1', prompt: 'Summarize my inbox and Slack' },
+        result: previewResult,
+      },
+      {
+        id: 'tc2', name: 'update_routine',
+        args: { routineId: 'r2', prompt: 'Something else', confirm: true },
+        result: 'Updated routine "r2".',
+      },
+    ])
+    expect(await screen.findByText('Confirm this change')).toBeInTheDocument()
+    expect(getRoutineMock).toHaveBeenCalledWith('r1')
+  })
+
+  // ── M2: scheduleDisplay is a real tool field the draft layer cannot carry ───────────────────
+  //
+  // Rendering a gate here would show "No fields changed." for a change that WAS proposed, and
+  // Confirm would PUT the re-derived display instead of the model's. The generic card keeps the
+  // raw PREVIEW — which contains the actual proposed string — readable.
+  it('falls back to the generic card when scheduleDisplay is the ONLY field named', async () => {
+    renderBubble([{
+      id: 'tc1', name: 'update_routine',
+      args: { routineId: 'r1', scheduleDisplay: 'Runs weekdays at 9' },
+      result: 'PREVIEW (not applied) — call again with confirm: true to apply:\n' +
+        '  scheduleDisplay: "Runs daily at 9:00 AM" -> "Runs weekdays at 9"',
+    }])
+    expect(await screen.findByText(GENERIC.update)).toBeInTheDocument()
+    expect(screen.queryByText('Confirm this change')).not.toBeInTheDocument()
+    expect(screen.queryByText('No fields changed.')).not.toBeInTheDocument()
+    expect(getRoutineMock).not.toHaveBeenCalled()
+  })
+
+  // Named ALONGSIDE a real change it is the pre-existing acceptable case: the other field's diff
+  // is genuine, and the display shown is the one derived from the rule (what Confirm will PUT).
+  it('still renders the gate when scheduleDisplay accompanies a real, representable change', async () => {
+    getRoutineMock.mockResolvedValue(routine({ status: 'active' }))
+    renderBubble([{
+      id: 'tc1', name: 'update_routine',
+      args: { routineId: 'r1', scheduleDisplay: 'Half six every day', scheduleRule: { kind: 'daily', hour: 18, minute: 30 } },
+      result: 'PREVIEW (not applied) — call again with confirm: true to apply:\n' +
+        '  scheduleDisplay: "Runs daily at 9:00 AM" -> "Half six every day"',
+    }])
+    expect(await screen.findByText('Confirm this change')).toBeInTheDocument()
+    expect(screen.getByText('+ Runs daily at 6:30 PM')).toBeInTheDocument()
+  })
+
+  // L3: args come from a model, so every overlaid value is type-checked. A non-string `prompt`
+  // must be dropped rather than reaching the card — the draft stays the stored value and the rest
+  // of the proposal still renders.
+  it('ignores a non-string value for an overlayable field and renders the rest correctly', async () => {
+    getRoutineMock.mockResolvedValue(routine({ status: 'active' }))
+    renderBubble([{
+      id: 'tc1', name: 'update_routine',
+      args: { routineId: 'r1', prompt: 42, scheduleRule: { kind: 'daily', hour: 18, minute: 30 } },
+      result: previewResult,
+    }])
+    expect(await screen.findByText('Confirm this change')).toBeInTheDocument()
+    expect(screen.getByText('+ Runs daily at 6:30 PM')).toBeInTheDocument()
+    // The bogus value never reaches the card, and the stored prompt is kept intact.
+    expect(screen.queryByText(/42/)).not.toBeInTheDocument()
+    expect(screen.getByText(/Summarize my inbox/)).toBeInTheDocument()
   })
 })
 

@@ -71,6 +71,70 @@ interface ConfirmTarget {
   routineId: string
 }
 
+/** The `update_routine` parameters {@link applyUpdateArgs} can actually lay onto a `RoutineDraft`.
+ *  Exactly UPDATE_ROUTINE_TOOL's schema minus `routineId` (the target, not a change), `confirm`
+ *  (the apply flag) and `scheduleDisplay` — see {@link namesOnlyScheduleDisplay}. */
+const DRAFT_CARRIED_UPDATE_FIELDS = [
+  'prompt', 'scheduleRule', 'modelKey', 'workspacePath', 'codingAgent', 'permissionMode',
+] as const
+
+/** PURE. True when the model's update names `scheduleDisplay` and NOTHING ELSE the draft layer can
+ *  carry.
+ *
+ *  `scheduleDisplay` is a real, model-callable field of UPDATE_ROUTINE_TOOL, but `RoutineDraft` has
+ *  no slot for it (it is derived from `scheduleRule` by design, so the two can never drift) and
+ *  `RoutineConfirmCard` re-derives the display from the rule. So a display-only update would
+ *  reconstruct a draft identical to the stored routine and render a confirm gate reading
+ *  "No fields changed." while Confirm silently PUT the DERIVED display over the model's proposal —
+ *  the exact defect class Task 7 already fixed once for `agentId` ("the confirm gate would have
+ *  understated exactly the change the user is being asked to authorize", RoutineConfirmCard.tsx).
+ *  Falling back to the generic card instead keeps the raw PREVIEW string — which DOES contain the
+ *  real proposed value — readable in its expandable output view. That is strictly more honest than
+ *  a gate denying the change exists.
+ *
+ *  `scheduleDisplay` named ALONGSIDE other real changes still renders the card: the other fields'
+ *  diff is genuine, and showing the derived display there matches what the Routines panel does. */
+function namesOnlyScheduleDisplay(args: Record<string, unknown>): boolean {
+  if (typeof args.scheduleDisplay !== 'string') return false
+  return DRAFT_CARRIED_UPDATE_FIELDS.every((f) => args[f] === undefined)
+}
+
+/** PURE. True when the tool call at `index` is an `update_routine` PREVIEW whose change a LATER
+ *  `update_routine` call IN THE SAME MESSAGE already applied (`confirm: true`, same `routineId`).
+ *
+ *  The two-phase update protocol means a NORMAL, SUCCESSFUL update leaves TWO records in a
+ *  completed transcript: the preview, then the apply. {@link resolveConfirmTarget} correctly
+ *  refuses the apply record — but the preview record is still sitting right beside it, still
+ *  matches every condition, and would keep rendering an actionable "Confirm this change" whose
+ *  Cancel prints "Routine change cancelled." after the write has ALREADY landed. Its Confirm is
+ *  worse than useless too: after any later edit elsewhere it would re-apply the old proposal's
+ *  fields on top of the newer values.
+ *
+ *  This needs SIBLING context, which the wrapper (one call, no list) does not have — hence a pure
+ *  helper called from MessageBubble.tsx's `completedToolCalls` mapping, where the whole list is in
+ *  hand, with the answer threaded down as {@link RoutineConfirmToolCard}'s `superseded` prop.
+ *
+ *  Args-only, deliberately: a later apply that ERRORED also suppresses the preview. That direction
+ *  is the safe one (a stale gate is never rendered), and a model that already tried to apply has
+ *  moved past the point where this preview is the outstanding thing to authorize. */
+export function isSupersededUpdatePreview(
+  calls: readonly { name: string; args?: Record<string, unknown> }[],
+  index: number,
+): boolean {
+  const call = calls[index]
+  if (!call || call.name !== 'update_routine') return false
+  if (call.args?.confirm === true) return false // this IS an apply record, not a preview
+  const id = typeof call.args?.routineId === 'string' ? call.args.routineId.trim() : ''
+  if (!id) return false
+  return calls.slice(index + 1).some(
+    (later) =>
+      later.name === 'update_routine' &&
+      later.args?.confirm === true &&
+      typeof later.args?.routineId === 'string' &&
+      later.args.routineId.trim() === id,
+  )
+}
+
 /** PURE. What (if anything) this tool call should raise a confirm gate for.
  *
  *  Returns null — meaning "render the generic tool-call card" — for every case that is not a
@@ -85,7 +149,8 @@ interface ConfirmTarget {
  *     a human to authorize. Once the model has applied the change (`Updated routine "<id>".`) the
  *     write ALREADY HAPPENED — offering "Confirm this change" then would invite a redundant PUT,
  *     and its "Cancel" would tell the user nothing was persisted when in fact it was. An
- *     `Error: …` result fails this check too, for free. */
+ *     `Error: …` result fails this check too, for free;
+ *   • an update naming ONLY `scheduleDisplay` — see {@link namesOnlyScheduleDisplay}. */
 function resolveConfirmTarget(call: RoutineToolCall): ConfirmTarget | null {
   if (call.status !== 'done') return null
   const result = call.result
@@ -96,6 +161,7 @@ function resolveConfirmTarget(call: RoutineToolCall): ConfirmTarget | null {
   }
   if (call.name === 'update_routine') {
     if (!result.startsWith(UPDATE_PREVIEW_PREFIX)) return null
+    if (namesOnlyScheduleDisplay(call.args)) return null
     const id = typeof call.args.routineId === 'string' ? call.args.routineId.trim() : ''
     return id ? { mode: 'update', routineId: id } : null
   }
@@ -125,7 +191,8 @@ function parseScheduleRule(v: unknown): ScheduleRule | null {
  *
  *  The overlaid set is exactly UPDATE_ROUTINE_TOOL's parameters minus two, on purpose:
  *  `scheduleDisplay` (RoutineDraft has none — it is derived from `scheduleRule` at submit time, so
- *  the two can never drift) and `confirm` (the tool's own apply flag, not a routine field).
+ *  the two can never drift; when it is the ONLY field named, no gate is rendered at all, see
+ *  {@link namesOnlyScheduleDisplay}) and `confirm` (the tool's own apply flag, not a routine field).
  *  `agentId` and `flavor` are not overlaid because the tool schema does not expose them.
  *  Each value is type-checked before use: these come from a model, and a `prompt: 42` would
  *  otherwise reach the card as a non-string. */
@@ -166,9 +233,12 @@ function LoadingCard() {
  *
  *  Both callbacks are no-ops by design: RoutineConfirmCard renders its own terminal
  *  confirmed/cancelled state, and a chat transcript is an append-only log — a settled gate stays
- *  visible as the record of what was authorized. */
-export function RoutineConfirmToolCard({ call, fallback }: { call: RoutineToolCall; fallback: ReactNode }) {
-  const target = resolveConfirmTarget(call)
+ *  visible as the record of what was authorized.
+ *
+ *  @param superseded Sibling-context veto from the caller — see {@link isSupersededUpdatePreview}.
+ *    Applied before the target is resolved so a suppressed record issues no fetch either. */
+export function RoutineConfirmToolCard({ call, fallback, superseded }: { call: RoutineToolCall; fallback: ReactNode; superseded?: boolean }) {
+  const target = superseded ? null : resolveConfirmTarget(call)
   const routineQ = useRoutine(target?.routineId)
 
   if (!target) return <>{fallback}</>
@@ -182,6 +252,23 @@ export function RoutineConfirmToolCard({ call, fallback }: { call: RoutineToolCa
   // half-finished inline edit is user intent and must not survive the card being pointed at a
   // different routine (or mode).
   if (target.mode === 'create') {
+    // THE ROUTINE'S OWN CURRENT STATE, not just the tool call's. RoutineConfirmCard's create mode
+    // documents its precondition — "the routine passed in ALREADY EXISTS as a real
+    // `pending_confirmation` row" — and its Cancel is a hard DELETE that honours it: the pending
+    // row is real and must not be orphaned. But `DELETE /api/v1/routines/:id` has no status guard
+    // at all and `routine_runs` cascades, so on an ALREADY-CONFIRMED routine that same button
+    // silently destroys a live scheduled job plus its entire run history, with no undo and no
+    // AlertDialog on this path. The tool result alone cannot tell us: it is written once and
+    // persisted forever, while the routine moves on. Three no-user-error routes reach this —
+    // (1) confirming from the still-streaming card, whose local `resolved` state dies when
+    // StreamingBubble unmounts at end of turn and MessageBubble re-renders a FRESH card;
+    // (2) confirming the same routine from the Routines panel while this card is still mounted,
+    // whose mutation invalidation refetches the now-active routine straight into this card;
+    // (3) any page reload or conversation revisit, forever after.
+    // So gate on the fetched status. Falling back to the generic card is the minimal safe change
+    // and stays honest: the raw "Created routine …" string remains readable there, and the
+    // routine's real, current state is one click away in the Routines panel.
+    if (routine.status !== 'pending_confirmation') return <>{fallback}</>
     return (
       <RoutineConfirmCard
         key={`create:${routine.id}`}
