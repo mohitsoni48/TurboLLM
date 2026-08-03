@@ -12,6 +12,7 @@ import { AuthGate } from './components/AuthGate'
 import { useStatus } from './lib/queries'
 import { ApiError, setAuthToken } from './lib/api'
 import { subscribeCodeAuthNeeded, isCodeAuthNeeded } from './lib/auth-signal'
+import { useRoutineNotificationPoller } from './lib/notify-routine'
 
 // Route-level code splitting: each screen loads only when first navigated to.
 const WorkspaceScreen = lazy(() => import('./screens/WorkspaceScreen').then((m) => ({ default: m.WorkspaceScreen })))
@@ -46,6 +47,13 @@ function ScreenFallback() {
 export function App() {
   const statusQ = useStatus()
   const qc = useQueryClient()
+
+  // Best-effort browser notifications for routine results (spec 20 §7). Mounted here so it lives
+  // exactly once for the app's lifetime, independent of which route is showing. Reads the same
+  // query keys Shell's nav badge and the Routines panel already poll, so it costs no extra
+  // requests, and it is purely supplementary — the durable channel is the run history in the
+  // Routines panel, which works whether or not a notification ever fires.
+  useRoutineNotificationPoller()
 
   // Count consecutive failed polls; show the unreachable overlay after 3 (spec 08 §1).
   const [failCount, setFailCount] = useState(0)
