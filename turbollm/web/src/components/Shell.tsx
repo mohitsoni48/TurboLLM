@@ -3,6 +3,8 @@ import { Link, NavLink, useLocation, useNavigate } from 'react-router-dom'
 import { BarChart3, Boxes, Code2, Cpu, PanelsTopLeft, Puzzle, Settings2 } from 'lucide-react'
 import { cn } from '../lib/utils'
 import type { Status } from '../lib/types'
+import { useRoutinesWithLatestRun } from '../lib/routine-queries'
+import { deriveRoutineDisplayStatus } from '../lib/routine-status'
 import { StateChip } from './StateChip'
 import { BoltMark } from './Logo'
 import { EngineProvisionBanner } from './EngineProvisionBanner'
@@ -63,6 +65,23 @@ function NavRail({
   const engineState = status?.engine.state ?? 'stopped'
   const activeDownloads = status?.downloads.active ?? 0
 
+  // Routines parked at needs_approval (spec 20 §2.1). Read live on every render — nothing is
+  // latched — and `useRoutinesWithLatestRun` polls on its own (15s on both the routines list and
+  // each routine's runs), so this clears itself once an approval is answered from anywhere,
+  // including another tab. Counted through the SHARED `deriveRoutineDisplayStatus` rather than a
+  // raw `latestRun.status === 'needs_approval'` check, so the badge can never advertise an
+  // approval the Routines list itself doesn't surface: that helper's rule is that a non-active
+  // routine's own status wins, so a PAUSED routine with a stalled run reads "Paused" in the list
+  // and is deliberately not counted here either.
+  //
+  // SPEC-GAP (00-conventions.md §8): spec 20 §2.1 also wants a transient "just failed/completed"
+  // pulse. That needs either a backend seen/unseen flag or client-side timestamp diffing that the
+  // shipped types don't support, so this badge is the unambiguous needs-approval count only.
+  const { items: routineItems } = useRoutinesWithLatestRun()
+  const routinesNeedingAttention = routineItems.filter(
+    (it) => deriveRoutineDisplayStatus(it.routine, it.latestRun) === 'needs_approval',
+  ).length
+
   // Keyboard shortcuts: Ctrl+1–5 (or Cmd+1–5 on Mac) navigate to the
   // corresponding NAV item. Ignored when focus is in an editable element.
   useEffect(() => {
@@ -118,16 +137,24 @@ function NavRail({
       <ul className="flex flex-1 flex-col items-center gap-1 xl:w-full xl:items-stretch">
         {NAV.map(({ to, label, icon: Icon }) => {
           const isActive = pathname === to || pathname.startsWith(`${to}/`)
-          // Downloads indicator (ADR-039): count badge on the Models item while
-          // downloads are active. No badge when zero.
-          const badge = to === '/models' && activeDownloads > 0 ? activeDownloads : 0
+          // Count badge, one shared mechanism (ADR-039's downloads indicator, extended):
+          // Models counts active downloads, Workspace counts routines waiting on an approval.
+          // No badge when zero (or, defensively, negative — the `> 0` floor is what keeps a bad
+          // count out of the truthy `badge ?` label branches below).
+          const count =
+            to === '/models' ? activeDownloads
+            : to === '/workspace' ? routinesNeedingAttention
+            : 0
+          const badge = count > 0 ? count : 0
+          // Kept next to the count so the two can't drift apart when another entry is badged.
+          const badgeNoun = to === '/models' ? 'downloading' : 'needing attention'
           return (
             <li key={to}>
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Link
                     to={to}
-                    aria-label={badge ? `${label} (${badge} downloading)` : label}
+                    aria-label={badge ? `${label} (${badge} ${badgeNoun})` : label}
                     aria-current={isActive ? 'page' : undefined}
                     className={cn(
                       'relative flex h-10 w-10 items-center justify-center rounded-[var(--radius-md)] transition-colors',
@@ -164,7 +191,7 @@ function NavRail({
                 </TooltipTrigger>
                 {/* Hide tooltip at xl+ since label is already visible */}
                 <TooltipContent side="right" className="xl:hidden">
-                  {badge ? `${label} · ${badge} downloading` : label}
+                  {badge ? `${label} · ${badge} ${badgeNoun}` : label}
                 </TooltipContent>
               </Tooltip>
             </li>
