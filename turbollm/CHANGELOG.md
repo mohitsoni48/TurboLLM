@@ -25,7 +25,7 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
-## [1.9.10] - 2026-08-03
+## [1.9.9] - 2026-08-03
 
 ### Fixed
 - **Security: closed a sandbox escape in the `run_code` tool.** Code run through `run_code` could
@@ -43,20 +43,16 @@ _Nothing yet._
   llama.cpp/ROCm issue on unified-memory APUs is now automatically worked around for big enough
   models, matching the confirmed fix from the reporter — no more hand-editing "Extra command-line
   flags" to add it yourself.
-
-### Discord
-- Fixed a real sandbox-escape bug in the code-execution tool (`run_code`) — patched, no action needed beyond updating.
-- "Auto-fit MoE CPU offload" for big Mixture-of-Experts models actually does something now — previously it silently did nothing, which could crash a load that should've fit.
-- AMD Strix Halo / Ryzen AI users: the ROCm load-hang on large models is now auto-worked-around, no manual flag needed.
-
-## [1.9.9] - 2026-08-03
-
-### Fixed
 - The onboarding analytics funnel counted "building an engine from source" (an optional, manual,
   advanced-user action from the Engines screen) as a required setup step, which made it look like
   almost every install got stuck partway through setup — it didn't. That step is removed from the
   funnel, and a real "first message sent" step was added so onboarding is measured accurately.
   Internal analytics only; no visible app behavior changes.
+
+### Discord
+- Fixed a real sandbox-escape bug in the code-execution tool (`run_code`) — patched, no action needed beyond updating.
+- "Auto-fit MoE CPU offload" for big Mixture-of-Experts models actually does something now — previously it silently did nothing, which could crash a load that should've fit.
+- AMD Strix Halo / Ryzen AI users: the ROCm load-hang on large models is now auto-worked-around, no manual flag needed.
 
 ## [1.9.8] - 2026-08-02
 
