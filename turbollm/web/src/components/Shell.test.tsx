@@ -88,15 +88,16 @@ describe('Shell nav badge', () => {
     expect(screen.getByLabelText('Workspace (2 needing attention)')).toBeInTheDocument()
   })
 
-  /** The count goes through the shared `deriveRoutineDisplayStatus`, whose documented rule is that
-   *  a non-active routine's OWN status wins — a paused routine reads "Paused" in the list even if
-   *  its last run stalled, because nothing is scheduled to happen. The badge must agree with what
-   *  the Routines list actually shows; a badge advertising an approval the list never surfaces as
-   *  needs_approval would send the user hunting for a row that does not exist. */
-  it('does not count a paused routine whose last run stalled', () => {
+  /** The count reads the RAW run status, not `deriveRoutineDisplayStatus` — so a PAUSED routine
+   *  whose run is parked at needs_approval still counts. That state is reachable (`/pause` only
+   *  requires status 'active') and genuinely actionable: RoutinesPanel's row summary renders
+   *  "Stalled, needs approval", RoutineEditPage renders a working approval card off the same raw
+   *  read, and the notification poller fires for it. Deriving here would leave the user an OS
+   *  notification with no matching nav badge. Pinning it so nobody re-derives the count later. */
+  it('counts a paused routine whose last run is parked at needs_approval', () => {
     mockItems([{ routine: routine({ status: 'paused' }), latestRun: run() }])
     renderShell()
-    expect(screen.queryByLabelText(/Workspace \(\d+ needing attention\)/)).not.toBeInTheDocument()
+    expect(screen.getByLabelText('Workspace (1 needing attention)')).toBeInTheDocument()
   })
 
   /** The badge reads live query output on every render rather than latching anything, so a later

@@ -4,7 +4,6 @@ import { BarChart3, Boxes, Code2, Cpu, PanelsTopLeft, Puzzle, Settings2 } from '
 import { cn } from '../lib/utils'
 import type { Status } from '../lib/types'
 import { useRoutinesWithLatestRun } from '../lib/routine-queries'
-import { deriveRoutineDisplayStatus } from '../lib/routine-status'
 import { StateChip } from './StateChip'
 import { BoltMark } from './Logo'
 import { EngineProvisionBanner } from './EngineProvisionBanner'
@@ -68,18 +67,30 @@ function NavRail({
   // Routines parked at needs_approval (spec 20 §2.1). Read live on every render — nothing is
   // latched — and `useRoutinesWithLatestRun` polls on its own (15s on both the routines list and
   // each routine's runs), so this clears itself once an approval is answered from anywhere,
-  // including another tab. Counted through the SHARED `deriveRoutineDisplayStatus` rather than a
-  // raw `latestRun.status === 'needs_approval'` check, so the badge can never advertise an
-  // approval the Routines list itself doesn't surface: that helper's rule is that a non-active
-  // routine's own status wins, so a PAUSED routine with a stalled run reads "Paused" in the list
-  // and is deliberately not counted here either.
+  // including another tab.
+  //
+  // Counted off the RAW `latestRun.status`, deliberately NOT through `deriveRoutineDisplayStatus`.
+  // That helper answers a different question — "what does the status PILL read" — and its rule
+  // that a non-active routine's own status wins would drop a PAUSED routine whose run is parked.
+  // A parked run on a paused routine is genuinely actionable, and every other surface already
+  // treats it that way off the same raw read:
+  //   - RoutinesPanel's row summary (`lastRunSummary`) renders "Stalled, needs approval · <when>"
+  //     regardless of routine.status, so the row the badge points at really is there.
+  //   - RoutineEditPage computes `awaitingApproval` from the raw run status with no routine.status
+  //     gate, and renders a working RoutineApprovalCard — approve/deny function on a paused one.
+  //   - The notification poller (notify-routine.ts) diffs raw run status too, so it fires
+  //     "Routine needs approval" for exactly these runs; deriving here would leave the user an OS
+  //     notification with no nav-level affordance behind it.
+  // Pausing this state is reachable in production (`/pause` only requires status 'active'), and a
+  // parked run stays in the scheduler's inFlight set — blocking /run-now until approve/deny, not
+  // clearing on Resume — so it is the state that most needs the nudge, not least.
   //
   // SPEC-GAP (00-conventions.md §8): spec 20 §2.1 also wants a transient "just failed/completed"
   // pulse. That needs either a backend seen/unseen flag or client-side timestamp diffing that the
   // shipped types don't support, so this badge is the unambiguous needs-approval count only.
   const { items: routineItems } = useRoutinesWithLatestRun()
   const routinesNeedingAttention = routineItems.filter(
-    (it) => deriveRoutineDisplayStatus(it.routine, it.latestRun) === 'needs_approval',
+    (it) => it.latestRun?.status === 'needs_approval',
   ).length
 
   // Keyboard shortcuts: Ctrl+1–5 (or Cmd+1–5 on Mac) navigate to the
