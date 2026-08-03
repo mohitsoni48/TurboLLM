@@ -1,7 +1,14 @@
 import { defineConfig } from 'tsup'
 
 export default defineConfig({
-  entry: ['src/cli.ts'],
+  // run-code-worker is a second, independent entry point (not imported/bundled into cli.js) —
+  // execRunCode in builtin.ts spawns it as a real node:worker_threads Worker at runtime, which
+  // needs an actual file on disk beside the built cli.js, not something inlined into that bundle.
+  // Object form (not an array) so tsup names the output by these keys FLAT in dist/ — an array
+  // entry preserves each file's src/-relative subdirectory (dist/tools/run-code-worker.js),
+  // which would land one directory deeper than cli.js and break builtin.ts's same-directory
+  // `new URL('./run-code-worker.js', import.meta.url)` resolution at runtime.
+  entry: { cli: 'src/cli.ts', 'run-code-worker': 'src/tools/run-code-worker.ts' },
   format: ['esm'],
   clean: true,
   target: 'node22',

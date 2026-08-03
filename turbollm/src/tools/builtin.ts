@@ -1,7 +1,8 @@
 // Built-in tool definitions and execution (v0.7.0).
-// Tools: web_search (Tavily), fetch_url, run_code (Node vm sandbox).
-import { createContext, runInContext, type Context } from 'node:vm'
+// Tools: web_search (Tavily), fetch_url, run_code (Node vm sandbox, isolated in a worker thread).
+import { Worker } from 'node:worker_threads'
 import { checkSsrf } from './security.js'
+import { RUN_CODE_TIMEOUT_MS } from './run-code-sandbox.js'
 import { type SearchConfig } from './search-providers.js'
 import {
   ageInDays, aggregatorPenalty, currentnessMultiplier, freshnessSignal, officialDocsBoost,
@@ -537,118 +538,137 @@ export async function execFetchUrl(args: Record<string, unknown>): Promise<strin
 
 // ── Run code ─────────────────────────────────────────────────────────────
 //
-// SECURITY: `run_code` executes model-authored JavaScript in a Node `vm` context. The invariant
-// that makes this safe is simple to state and easy to violate by accident: nothing may cross from
-// the sandboxed context back into this (host) module except a value that is ALREADY a primitive
-// string/number/boolean/undefined the instant it leaves `runInContext`. Handing a sandbox-realm
-// value a HOST-realm function as an argument — even something as innocuous-looking as
-// `sandboxArray.map(String)` — is enough to escape: if the sandboxed script shadowed `.map` with
-// its own function, that call invokes SANDBOX code with the HOST's `String` as an argument, and
-// `String.constructor` is the HOST's real `Function` constructor. A function built via the host's
-// `Function` constructor closes over the HOST's global scope, so the sandboxed code ends up
-// holding the real `process` object — full `process.env` plus, via
-// `process.getBuiltinModule('child_process').execSync(...)`, arbitrary OS command execution as the
-// daemon's own user. (An earlier draft of this fix closed the injection side — no more host
-// globals copied into the sandbox object — but reopened exactly this on the read-back side via
-// `capturedArray.map(String)`. Caught in review before it shipped.)
+// The realm-escape prevention itself (the vm sandbox, and why every join/stringify step must run
+// inside it) lives in run-code-sandbox.ts, alongside the SECURITY comment explaining it — read
+// that first. This module's job is orchestration: run that logic inside a dedicated
+// node:worker_threads Worker rather than on the daemon's own main thread, so a script that hangs
+// or exhausts memory only takes down its own worker, and the host can always force it away.
 //
-// The fix below keeps every join, stringify, and message-coercion step running INSIDE the context
-// via `runInContext`, using that context's OWN `Array.prototype`/`JSON`/`String` invoked with
-// `.call`/`.apply` so a sandbox-owned array's shadowed `.map`/`.join`/`.toString` can never be
-// reached from host code — the only thing that ever crosses the boundary is a finished string.
-// `createContext({})` (an empty backing object) means nothing from this module's realm is ever
-// attached to the context in the first place; every standard global (Object/Array/Math/JSON/...)
-// the context has is its own, created fresh by `vm.createContext` for free.
+// `vm`'s `{ timeout }` option only interrupts *synchronous* execution. A microtask loop
+// (`Promise.resolve().then(loop)`) returns from its synchronous portion almost instantly, then
+// starves whichever event loop it's running on forever — if that were the daemon's own main
+// thread, the entire HTTP API and inference streaming would hang until a manual restart. An
+// allocation bomb can exhaust memory and crash the process outright before the 5s vm timeout ever
+// gets a chance to fire. Running the sandboxed script in its own Worker means both failure modes
+// are contained to that worker: `resourceLimits` bounds the V8 JS heap it can take down with it
+// (crashing only that worker, reported to us as an 'error'/'exit' event, not the daemon) — but
+// ONLY the JS heap; ArrayBuffer/typed-array/WebAssembly.Memory backing stores are external memory
+// `resourceLimits` does not cover, which is why run-code-sandbox.ts deletes those constructors
+// from the context outright rather than leaving them merely unbounded. A host-side watchdog timer
+// can also call `worker.terminate()` — which works from OUTSIDE the worker's thread, so it still
+// kills a worker whose own event loop is completely starved by microtasks, unlike an in-process
+// timeout that relies on the stuck thread cooperating.
 //
-// `vm` is still not a documented security boundary (per Node's own `vm` docs) — a sufficiently
-// sophisticated payload or a V8/Node bug could in principle still find a way out. `run_code` is
-// reachable only via a model's own tool call, never directly by network input, and its tool
-// description promises callers "No network, file, or process access" — this fix makes that true
-// against every known realm-escape vector. It does NOT bound CPU/memory: `{ timeout }` only stops
-// *synchronous* execution, so a microtask loop (`Promise.resolve().then(loop)`) or an allocation
-// bomb can still hang or crash the daemon process, and a thrown value with an infinitely-looping
-// `message` getter can hang the host thread outside any vm timeout. None of those reach `process`
-// or the filesystem, but out-of-process isolation (a `node:worker_threads` worker, which lets the
-// host forcibly `.terminate()` a script that hangs this way, rather than relying on `vm`'s
-// synchronous-only timeout) remains a deliberate follow-up for that class of denial-of-service.
+// The worker script itself (run-code-worker.ts) ships as its OWN tsup entry point (see
+// tsup.config.ts) so it exists as a real file next to the built cli.js — `new Worker` needs an
+// actual module to load, not something inlined into this bundle. WORKER_PATH below mirrors this
+// module's own extension (`.ts` under tsx in dev/test, `.js` once built) since both land in the
+// same directory relative to this file either way.
+const WORKER_EXT = import.meta.url.endsWith('.ts') ? '.ts' : '.js'
+const WORKER_PATH = new URL(`./run-code-worker${WORKER_EXT}`, import.meta.url)
 
-const RUN_CODE_TIMEOUT_MS = 5_000
-const RUN_CODE_SETUP_TIMEOUT_MS = 1_000 // fixed, non-attacker-controlled scripts — should be instant
+// Backstop only: the worker's own vm timeout (RUN_CODE_TIMEOUT_MS, inside run-code-sandbox.ts)
+// self-reports a graceful timeout error for synchronous hangs well before this fires. This exists
+// for what that can't catch — microtask starvation, a looping getter, anything that leaves the
+// worker's event loop unable to even send its own result back.
+const RUN_CODE_WATCHDOG_MS = RUN_CODE_TIMEOUT_MS + 1_000
 
-// Builds console.log/warn/error INSIDE the sandbox, appending to a plain array of strings on the
-// context's own global object. Never references anything from the host realm — every identifier
-// here (`globalThis`, `Array`, `String`) resolves against the CONTEXT's own intrinsics once this
-// script is executed via runInContext, not this module's. Uses `Array.prototype.map.call` (not
-// `arguments.map`) so a later shadow of `Array.prototype` can't affect logging.
-const RUN_CODE_CONSOLE_SETUP = `
-  globalThis.__out = [];
-  globalThis.console = {
-    log: function () { globalThis.__out.push(Array.prototype.map.call(arguments, String).join(' ')) },
-    error: function () { globalThis.__out.push('ERROR: ' + Array.prototype.map.call(arguments, String).join(' ')) },
-    warn: function () { globalThis.__out.push('WARN: ' + Array.prototype.map.call(arguments, String).join(' ')) },
-  };
-`
+// A real OS thread per call is itself a resource the OLD (synchronous, main-thread) implementation
+// never had to bound — one call could never overlap another in CPU time regardless, since a single
+// synchronous execRunCode blocked the whole process anyway. A flood of *concurrent* run_code calls
+// (across sessions/conversations, since a single turn's own tool calls are already sequential) can
+// now genuinely run in parallel threads, each paying real memory overhead beyond `resourceLimits`
+// itself. Capping concurrency bounds that without limiting any single script's own resourceLimits.
+const RUN_CODE_MAX_CONCURRENT_WORKERS = 4
+let activeRunCodeWorkers = 0
+const runCodeWaiters: Array<() => void> = []
 
-// Joins captured console output into one string, evaluated ENTIRELY inside the context: explicit
-// `Array.prototype.map/join.call(...)` bypasses whatever the script's own `.map`/`.join` own
-// properties on `globalThis.__out` might have been reassigned to, and `String` here resolves to
-// the context's own — never the host's. Only ever produces a plain string.
-const RUN_CODE_JOIN_OUTPUT = `
-  Array.isArray(globalThis.__out)
-    ? Array.prototype.join.call(Array.prototype.map.call(globalThis.__out, String), '\\n')
-    : ''
-`
+function acquireRunCodeSlot(): Promise<void> {
+  if (activeRunCodeWorkers < RUN_CODE_MAX_CONCURRENT_WORKERS) {
+    activeRunCodeWorkers++
+    return Promise.resolve()
+  }
+  return new Promise((resolve) => {
+    runCodeWaiters.push(() => {
+      activeRunCodeWorkers++
+      resolve()
+    })
+  })
+}
 
-export function execRunCode(args: Record<string, unknown>): string {
+function releaseRunCodeSlot(): void {
+  activeRunCodeWorkers--
+  runCodeWaiters.shift()?.()
+}
+
+export async function execRunCode(args: Record<string, unknown>): Promise<string> {
   const code = String(args.code ?? '').trim()
   if (!code) return 'Error: code is required.'
 
-  // An empty backing object — nothing from this module's realm is ever attached to it. Every
-  // standard global (Object/Array/Math/JSON/...) the context has is the context's own, created
-  // fresh by vm.createContext itself; none of it comes from the object passed in here.
-  const context: Context = createContext({})
+  await acquireRunCodeSlot()
 
-  let result: unknown
+  // Constructed OUTSIDE the Promise executor below, in its own try/catch: `new Worker(...)` can
+  // throw SYNCHRONOUSLY (e.g. `ERR_WORKER_INIT_FAILED` under memory/thread pressure), and if that
+  // happened inside the executor, the returned promise would simply reject with no `finish()`
+  // ever having run — meaning `releaseRunCodeSlot()` never fires, permanently holding one of the
+  // 4 concurrency slots. Enough of those and run_code deadlocks itself for the rest of the
+  // process's life. Handling the failure here instead keeps the "always resolve with a string,
+  // release the slot exactly once" contract intact even when the worker never gets created at all.
+  let worker: Worker
   try {
-    runInContext(RUN_CODE_CONSOLE_SETUP, context, { timeout: RUN_CODE_SETUP_TIMEOUT_MS })
-    // The user script's return value is stringified INSIDE this same runInContext call — same
-    // realm, same timeout — so a hostile toJSON/toString/getter on whatever it returns runs under
-    // RUN_CODE_TIMEOUT_MS like the rest of the script, and only a string or undefined ever
-    // crosses back to the host (never JSON.stringify'd or String()'d here on the host stack).
-    result = runInContext(
-      `(function(){
-        const __result = (function(){${code}})();
-        if (__result === undefined) return undefined;
-        if (typeof __result === 'string') return __result;
-        try { return JSON.stringify(__result, null, 2); }
-        catch (e) { try { return String(__result); } catch (e2) { return '[unstringifiable result]'; } }
-      })()`,
-      context,
-      { timeout: RUN_CODE_TIMEOUT_MS },
-    )
+    worker = new Worker(WORKER_PATH, {
+      workerData: { code },
+      // No environment/argv leak into the worker: the vm sandbox (run-code-sandbox.ts) is what
+      // actually keeps sandboxed code from ever seeing `process`, but if that boundary were ever
+      // defeated by a V8/Node bug, the worker's OWN real `process.env` — every secret/API key the
+      // daemon can see — would otherwise sit right there. Costs nothing legitimate: the sandboxed
+      // script never has ambient `process` access to read `env`/`argv` either way.
+      env: {},
+      argv: [],
+      // Bounds the V8 JS heap THIS script's vm context can allocate (vm.createContext shares the
+      // worker's own isolate, so these limits cover it) to a crash of just this worker, not the
+      // daemon process — confirmed for arrays/strings/objects, the allocation shapes the deleted
+      // ArrayBuffer/typed-array constructors (run-code-sandbox.ts) would otherwise let bypass this
+      // entirely as unbounded external memory. A BigInt-heavy allocation pattern can still exceed
+      // this nominal cap, since V8 doesn't charge all BigInt scratch space against the generational
+      // heap limits the same way; not a realm escape (still contained to this one worker), just a
+      // softer memory ceiling than the numbers imply.
+      resourceLimits: { maxOldGenerationSizeMb: 128, maxYoungGenerationSizeMb: 16 },
+    })
   } catch (e) {
-    let message = 'unknown error'
-    try {
-      message = String((e as Error)?.message ?? e)
-    } catch {
-      /* a hostile getter on the thrown value's own .message — fall back rather than propagate */
+    releaseRunCodeSlot()
+    return `Error: ${(e as Error).message}`
+  }
+
+  return new Promise<string>((resolve) => {
+    let settled = false
+    const finish = (value: string) => {
+      if (settled) return
+      settled = true
+      clearTimeout(watchdog)
+      resolve(value)
+      releaseRunCodeSlot()
+      void worker.terminate().catch(() => {
+        /* already exiting */
+      })
     }
-    return `Error: ${message}`
-  }
 
-  // Best-effort read-back of captured console output, joined entirely inside the context (see
-  // RUN_CODE_JOIN_OUTPUT) — a script that deleted, reassigned, or booby-trapped its own
-  // globalThis.__out only loses its own captured output, never anything belonging to the host.
-  let output = ''
-  try {
-    const joined = runInContext(RUN_CODE_JOIN_OUTPUT, context, { timeout: RUN_CODE_SETUP_TIMEOUT_MS })
-    if (typeof joined === 'string') output = joined
-  } catch {
-    /* best-effort only */
-  }
+    const watchdog = setTimeout(() => finish('Error: execution timed out'), RUN_CODE_WATCHDOG_MS)
 
-  const parts: string[] = []
-  if (output) parts.push(output)
-  if (typeof result === 'string') parts.push(result)
-  return parts.join('\n') || '(no output)'
+    // Deliberately NOT worker.removeAllListeners() after a resolve: an un-listened 'error' event
+    // on an EventEmitter becomes an uncaught exception that crashes the whole process, and that is
+    // strictly worse than a redundant, no-op finish() call from an .once listener firing after
+    // settled is already true. `.once` self-detaches on fire either way, so nothing leaks.
+    worker.once('message', (msg: unknown) => {
+      finish(typeof msg === 'string' ? msg : 'Error: worker returned a non-string result')
+    })
+    worker.once('error', (err: Error) => {
+      // Covers the resourceLimits-triggered OOM case above: Node reports it as a worker 'error'
+      // rather than crashing the process.
+      finish(`Error: ${err.message}`)
+    })
+    worker.once('exit', (exitCode: number) => {
+      if (!settled) finish(exitCode === 0 ? 'Error: worker exited unexpectedly' : `Error: worker exited with code ${exitCode}`)
+    })
+  })
 }

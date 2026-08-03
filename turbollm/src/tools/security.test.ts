@@ -63,7 +63,7 @@ test('execFetchUrl blocks localhost end-to-end', async () => {
 
 // ── run_code always executes (gating happens upstream) ───────────────────────────
 
-test('execRunCode executes normally', () => {
-  const result = execRunCode({ code: 'return 1 + 1' })
+test('execRunCode executes normally', async () => {
+  const result = await execRunCode({ code: 'return 1 + 1' })
   assert.strictEqual(result, '2')
 })
