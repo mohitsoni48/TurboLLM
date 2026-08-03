@@ -25,6 +25,15 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.9.9] - 2026-08-03
+
+### Fixed
+- The onboarding analytics funnel counted "building an engine from source" (an optional, manual,
+  advanced-user action from the Engines screen) as a required setup step, which made it look like
+  almost every install got stuck partway through setup — it didn't. That step is removed from the
+  funnel, and a real "first message sent" step was added so onboarding is measured accurately.
+  Internal analytics only; no visible app behavior changes.
+
 ## [1.9.8] - 2026-08-02
 
 ### Changed
