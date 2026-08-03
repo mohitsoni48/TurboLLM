@@ -6,8 +6,13 @@
 // pass with tool_choice:'none' and use that result as the final reply.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { stripThinkingBlocks, needsExtraPass } from './think-utils.js'
-import { recentTitleTurns } from './chat-routes.js'
+import { recentTitleTurns, reportFirstChat } from './chat-routes.js'
+import { Emitter } from '../telemetry/emit.js'
+import { readQueue } from '../telemetry/queue.js'
 
 // ── stripThinkingBlocks ───────────────────────────────────────────────────────
 
@@ -112,4 +117,98 @@ test('recentTitleTurns: a system message is excluded even when mixed in with rea
 
 test('recentTitleTurns: empty input yields empty output, no throw', () => {
   assert.deepEqual(recentTitleTurns([]), [])
+})
+
+// ── reportFirstChat (onboarding_step: first_chat, ADR-323) ────────────────────
+// Scaffolding mirrors telemetry/first-load.test.ts: a real temp data dir so the
+// once-only ledger is exercised for real, and a real Emitter over a stub config.
+
+function tempDir(): string {
+  return mkdtempSync(join(tmpdir(), 'turbollm-firstchat-'))
+}
+
+function makeEmitter(dir: string, level = 'anon'): Emitter {
+  const cfg = { telemetry: { level, machineId: '44444444-4444-4444-4444-444444444444' } }
+  return new Emitter({
+    dataDir: dir,
+    store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) } as never,
+    version: '1.9.9',
+    os: 'win32/x64',
+  })
+}
+
+function queued(dir: string): Record<string, unknown>[] {
+  return readQueue(dir).map((q) => q.event)
+}
+
+test('reportFirstChat: a completed generation reports first_chat as ok', () => {
+  const dir = tempDir()
+  try {
+    reportFirstChat(dir, makeEmitter(dir), false)
+    const events = queued(dir)
+
+    assert.equal(events.length, 1)
+    assert.equal(events[0].event, 'onboarding_step')
+    assert.deepEqual(events[0].payload, { step: 'first_chat', outcome: 'ok' })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('reportFirstChat: an aborted generation reports cancelled, not fail', () => {
+  const dir = tempDir()
+  try {
+    reportFirstChat(dir, makeEmitter(dir), true)
+    assert.deepEqual(queued(dir)[0].payload, { step: 'first_chat', outcome: 'cancelled' })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('reportFirstChat: fires exactly once across many generations, not on every reply', () => {
+  // This runs at the end of EVERY generation — without the ledger claim an active
+  // user's ordinary chatting would emit a "setup" event forever.
+  const dir = tempDir()
+  try {
+    const e = makeEmitter(dir)
+    reportFirstChat(dir, e, false)
+    reportFirstChat(dir, e, false)
+    reportFirstChat(dir, e, true)
+
+    assert.equal(queued(dir).length, 1, 'first_chat means first, not every')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('reportFirstChat: an aborted FIRST chat still claims the once-key', () => {
+  const dir = tempDir()
+  try {
+    const e = makeEmitter(dir)
+    reportFirstChat(dir, e, true)
+    reportFirstChat(dir, e, false)
+
+    const events = queued(dir)
+    assert.equal(events.length, 1, 'the aborted attempt was still the first one')
+    assert.deepEqual(events[0].payload, { step: 'first_chat', outcome: 'cancelled' })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('reportFirstChat: consent off queues nothing and does not spend the claim', () => {
+  const dir = tempDir()
+  try {
+    reportFirstChat(dir, makeEmitter(dir, 'off'), false)
+    assert.equal(queued(dir).length, 0)
+
+    reportFirstChat(dir, makeEmitter(dir, 'anon'), false)
+    assert.equal(queued(dir).length, 1, 'opting in later must still capture the next chat')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('reportFirstChat: no emitter (telemetry not wired) is a silent no-op', () => {
+  assert.doesNotThrow(() => reportFirstChat(tempDir(), undefined, false))
 })

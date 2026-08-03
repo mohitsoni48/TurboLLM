@@ -337,7 +337,8 @@ telemetry.dailyActive()
 // which fire load() without awaiting and so cannot see the outcome.
 manager.onLoadSettled = (ok, err) => {
   const outcome = ok ? 'ok' : 'fail'
-  // onboarding_step (ADR-299): the 4th and last setup step — ONBOARDING_STEPS (schema.ts)
+  // onboarding_step (ADR-299): the 3rd setup step (ADR-323 made first_chat the last) —
+  // ONBOARDING_STEPS (schema.ts)
   // defined it from the start, but nothing ever emitted it, so this step of the funnel was
   // structurally stuck at 0% no matter how far real users actually got (found 2026-08-01
   // auditing the funnel against real data; the comment below only ever wired "three setup
@@ -361,12 +362,14 @@ manager.onLoadSettled = (ok, err) => {
 // search probes are individually expected to fail sometimes and must not be
 // hooked the same way as a real load without corrupting the signal.
 bench.telemetry = telemetry
-// onboarding_step (ADR-299): where setup breaks. All four setup steps report both
-// outcomes (first_load wired above, next to model_first_load — once-only, unlike
-// the other three); downloads additionally distinguish 'cancelled', because a
-// user who abandons a download deliberately is not the same signal as one whose
-// download broke, and conflating them reads a choice as a product defect.
-build.onSettled = (ok) => telemetry.emit('onboarding_step', { step: 'engine_build', outcome: ok ? 'ok' : 'fail' })
+// onboarding_step (ADR-299): where setup breaks. The remaining two setup steps are
+// wired here (first_load above, next to model_first_load — once-only, unlike these;
+// first_chat in chat-routes.ts); downloads additionally distinguish 'cancelled',
+// because a user who abandons a download deliberately is not the same signal as one
+// whose download broke, and conflating them reads a choice as a product defect.
+// `build.onSettled` used to emit an `engine_build` step here (ADR-323 removed it):
+// seedDefaultEngines only ever calls provision, never build, so building from source
+// is a later manual action and was never part of the onboarding path it was measuring.
 provision.onSettled = (ok) => telemetry.emit('onboarding_step', { step: 'engine_install', outcome: ok ? 'ok' : 'fail' })
 downloads.onSettled = (outcome) => telemetry.emit('onboarding_step', { step: 'model_download', outcome })
 // Deferred so a slow or failing disk cannot delay the listen socket; unref'd so

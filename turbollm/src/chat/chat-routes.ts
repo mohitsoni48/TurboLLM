@@ -18,6 +18,8 @@ import { buildSaveSkillTool } from '../agents/agent-tools'
 import { SkillStore } from '../agents/skills'
 import { saveSkillFromConversation } from '../agents/skill-jobs'
 import { extractMemoryFacts } from './memory'
+import { claimOnce } from '../telemetry/ledger'
+import type { Emitter } from '../telemetry/emit'
 
 // Track in-flight abort controllers per conversation id.
 const inflight = new Map<string, AbortController>()
@@ -682,6 +684,28 @@ interface GenerationCtx {
  * tags, executes tool calls and loops (up to MAX_TOOL_ITER rounds), persists the final
  * message + stats, and fires auto-title. Shared by the messages and continue endpoints.
  */
+/**
+ * `onboarding_step: first_chat` (ADR-323) — the funnel's real success criterion.
+ *
+ * Once-only for the same reason `first_load` is: this fires on EVERY generation, and
+ * without the ledger claim an active user's ordinary chatting would emit a "setup"
+ * event forever. An aborted first reply reports 'cancelled' but still claims the key —
+ * a user who stops their very first generation did reach chat, and is a different
+ * signal from one who never got there (the same distinction downloads already draw).
+ *
+ * Extracted rather than inlined so the claim-once behaviour is testable without
+ * standing up a whole streaming generation. Never throws: `claimOnce` and
+ * `Emitter.emit` are both non-throwing by contract (ADR-009).
+ */
+export function reportFirstChat(dataDir: string, emitter: Emitter | undefined, aborted: boolean): void {
+  if (!emitter) return
+  // Consent is checked before the claim is spent, so chatting while telemetry is off
+  // does not silently burn the one chance to record this (see Emitter.canSend).
+  if (!emitter.canSend('onboarding_step')) return
+  if (!claimOnce(dataDir, 'once:onboarding_step:first_chat')) return
+  emitter.emit('onboarding_step', { step: 'first_chat', outcome: aborted ? 'cancelled' : 'ok' })
+}
+
 async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx): Promise<void> {
   const { db } = d
   const { convId, conv, assistantMsg, ms, target, ac, thinkingBudget } = ctx
@@ -1342,6 +1366,10 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
 
   db.updateMessage(assistantMsg.id, { content: fullContent, reasoning: fullReasoning, toolCalls: allToolCalls, stats, researchMeta })
   db.touchConversation(convId)
+  // onboarding_step (ADR-323): the last step of the funnel. Emitted here, at the point the
+  // reply is actually persisted, because that — not a model load — is the moment onboarding
+  // has genuinely succeeded.
+  reportFirstChat(d.store.dir(), d.telemetry, aborted)
 
   try {
     d.manager.recordCompletion({

@@ -42,8 +42,14 @@ export const FEATURES = [
   'chat', 'code', 'research', 'artifacts', 'mcp', 'agents', 'autotune', 'skills', 'image',
 ] as const
 
-/** Steps in the install → first-token journey (ADR-299 Decision 6). */
-export const ONBOARDING_STEPS = ['engine_install', 'engine_build', 'model_download', 'first_load'] as const
+/** Steps in the install → first-chat journey (ADR-299 Decision 6, amended by
+ *  ADR-323). `engine_build` was on this list originally but is not on the
+ *  automatic path at all: `seedDefaultEngines` only ever provisions a prebuilt
+ *  binary, and building from source is a later, manual, advanced-user action —
+ *  so the step read as near-total drop-off for the entire install base rather
+ *  than as a real signal. `first_chat` replaces it as the last step, because
+ *  "the model loaded" is one step short of the actual success criterion. */
+export const ONBOARDING_STEPS = ['engine_install', 'model_download', 'first_load', 'first_chat'] as const
 
 /** How a step or a load ended. */
 export const OUTCOMES = ['ok', 'fail', 'cancelled'] as const
