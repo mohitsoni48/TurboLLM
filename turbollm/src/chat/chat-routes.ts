@@ -18,6 +18,8 @@ import { buildSaveSkillTool } from '../agents/agent-tools'
 import { SkillStore } from '../agents/skills'
 import { saveSkillFromConversation } from '../agents/skill-jobs'
 import { extractMemoryFacts } from './memory'
+import { claimOnce } from '../telemetry/ledger'
+import type { Emitter } from '../telemetry/emit'
 
 // Track in-flight abort controllers per conversation id.
 const inflight = new Map<string, AbortController>()
@@ -682,6 +684,32 @@ interface GenerationCtx {
  * tags, executes tool calls and loops (up to MAX_TOOL_ITER rounds), persists the final
  * message + stats, and fires auto-title. Shared by the messages and continue endpoints.
  */
+/**
+ * `onboarding_step: first_chat` (ADR-323) — the funnel's real success criterion.
+ *
+ * Once-only for the same reason `first_load` is: this fires on EVERY generation, and
+ * without the ledger claim an active user's ordinary chatting would emit a "setup"
+ * event forever. A first reply that FAILS or is cancelled still claims the key —
+ * matching `reportModelLoad`'s "first outcome, whatever it is" semantics — because a
+ * user whose first attempt breaks or is abandoned still reached chat, and conflating
+ * that with "never tried" would hide exactly the drop-off this event exists to find.
+ * Classification is the caller's job (same division of labour as reportModelLoad):
+ * runGeneration has both an early engine-error return and a later thrown-error catch,
+ * and only the caller can tell those apart from a real success.
+ *
+ * Extracted rather than inlined so the claim-once behaviour is testable without
+ * standing up a whole streaming generation. Never throws: `claimOnce` and
+ * `Emitter.emit` are both non-throwing by contract (ADR-009).
+ */
+export function reportFirstChat(dataDir: string, emitter: Emitter | undefined, outcome: 'ok' | 'fail' | 'cancelled'): void {
+  if (!emitter) return
+  // Consent is checked before the claim is spent, so chatting while telemetry is off
+  // does not silently burn the one chance to record this (see Emitter.canSend).
+  if (!emitter.canSend('onboarding_step')) return
+  if (!claimOnce(dataDir, 'once:onboarding_step:first_chat')) return
+  emitter.emit('onboarding_step', { step: 'first_chat', outcome })
+}
+
 async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx): Promise<void> {
   const { db } = d
   const { convId, conv, assistantMsg, ms, target, ac, thinkingBudget } = ctx
@@ -795,6 +823,11 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
   let finalUsage: { prompt_tokens?: number; completion_tokens?: number; prompt_tokens_details?: { cached_tokens?: number } } = {}
   let finalTimings: Record<string, number> = {}
   let aborted = false
+  // Distinct from `aborted`: a thrown, non-AbortError exception mid-stream (e.g. the
+  // engine process died) is neither a success nor a user-initiated cancellation.
+  // `aborted` alone can't tell the two apart (both leave AbortError-only checks
+  // false/true respectively), and first_chat needs the real three-way split.
+  let engineFailed = false
   let liveOut = 0
 
   d.manager.generationStart()
@@ -891,6 +924,11 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
 
       if (!res.ok || !res.body) {
         await stream.writeSSE({ event: 'error', data: JSON.stringify({ code: 'engine_error', message: `Engine returned ${res.status}` }) })
+        // This return skips the normal end-of-generation code below (including
+        // reportFirstChat's usual call site) entirely — without this, a user whose
+        // very first chat attempt hits a bad engine response would never claim the
+        // once-only key at all, indistinguishable from "never tried."
+        reportFirstChat(d.store.dir(), d.telemetry, 'fail')
         return
       }
 
@@ -1270,6 +1308,7 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
     const isAbort = (e as Error)?.name === 'AbortError'
     aborted = isAbort
     if (!isAbort) {
+      engineFailed = true
       await stream.writeSSE({ event: 'error', data: JSON.stringify({ code: 'engine_stopped', message: (e as Error).message }) })
     }
   } finally {
@@ -1342,6 +1381,10 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
 
   db.updateMessage(assistantMsg.id, { content: fullContent, reasoning: fullReasoning, toolCalls: allToolCalls, stats, researchMeta })
   db.touchConversation(convId)
+  // onboarding_step (ADR-323): the last step of the funnel. Emitted here, at the point the
+  // reply is actually persisted, because that — not a model load — is the moment onboarding
+  // has genuinely succeeded.
+  reportFirstChat(d.store.dir(), d.telemetry, aborted ? 'cancelled' : engineFailed ? 'fail' : 'ok')
 
   try {
     d.manager.recordCompletion({

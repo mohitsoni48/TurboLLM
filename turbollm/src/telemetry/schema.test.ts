@@ -62,6 +62,24 @@ test('validateEvent: onboarding_step requires a known step and outcome', () => {
   assert.match(r.reason, /outcome/)
 })
 
+test('validateEvent: first_chat is a valid onboarding step, and reports ok/fail/cancelled', () => {
+  for (const outcome of ['ok', 'fail', 'cancelled']) {
+    assert.equal(
+      validateEvent(validEvent({ event: 'onboarding_step', payload: { step: 'first_chat', outcome } })).ok,
+      true,
+      `first_chat should accept outcome '${outcome}'`,
+    )
+  }
+})
+
+test('validateEvent: engine_build is no longer an onboarding step (ADR-323)', () => {
+  // Removed because seedDefaultEngines only ever provisions a prebuilt binary — the
+  // step measured a manual advanced-user action, so it read as near-total drop-off.
+  const r = validateEvent(validEvent({ event: 'onboarding_step', payload: { step: 'engine_build', outcome: 'ok' } }))
+  assert.equal(r.ok, false)
+  assert.match(r.reason, /step/)
+})
+
 test('validateEvent: model_first_load takes an optional enum failReason', () => {
   assert.equal(
     validateEvent(validEvent({ event: 'model_first_load', payload: { outcome: 'fail', failReason: 'oom' } })).ok,
