@@ -17,8 +17,27 @@ export function useRoutines() {
   return useQuery({ queryKey: routineKeys.list, queryFn: listRoutines, refetchInterval: 15000, refetchIntervalInBackground: false })
 }
 
+/** Polls on the same 15s cadence as {@link useRoutines}.
+ *
+ *  Added after Tasks 9–11 were built on the assumption that it already did. It did not, and
+ *  main.tsx sets `refetchOnWindowFocus: false` app-wide, so without a poll a mounted
+ *  `useRoutine` NEVER re-reads on its own — the only refresh was an explicit invalidation from a
+ *  mutation fired in the same tab. Three surfaces gate destructive or state-changing actions on
+ *  this query's `status`: the detail page's pause/resume/run-now row, its delete dialog, and the
+ *  chat transcript's create-mode confirm card, whose Cancel is a cascading DELETE and which
+ *  refuses to render at all unless the routine is still `pending_confirmation`. Each of those
+ *  checks is only as current as this query, so a routine confirmed, paused or deleted from
+ *  another tab or device left every one of them asserting a state that no longer existed, with no
+ *  mechanism to ever notice. Only `useRoutine` reads this key, so there is no second
+ *  `refetchInterval` for it to collapse against. */
 export function useRoutine(id: string | undefined) {
-  return useQuery({ queryKey: routineKeys.detail(id ?? ''), queryFn: () => getRoutine(id!), enabled: !!id })
+  return useQuery({
+    queryKey: routineKeys.detail(id ?? ''),
+    queryFn: () => getRoutine(id!),
+    enabled: !!id,
+    refetchInterval: 15000,
+    refetchIntervalInBackground: false,
+  })
 }
 
 export function useRoutineRuns(routineId: string | undefined) {
