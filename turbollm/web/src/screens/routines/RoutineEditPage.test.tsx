@@ -1,6 +1,6 @@
-import { render, screen, within } from '@testing-library/react'
+import { act, render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom'
+import { MemoryRouter, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { RoutineEditPage } from './RoutineEditPage'
@@ -28,6 +28,11 @@ vi.mock('../../components/ui/sonner', () => ({
  *  point, so a test can CHANGE them between renders and prove the page re-reads them rather than
  *  holding a copy. */
 let routineData: Routine | undefined
+/** Set instead of `routineData` when a test needs the detail query to answer DIFFERENTLY per
+ *  routine id — i.e. the real-navigation tests, where the whole point is that the page is looking
+ *  at a genuinely different routine after the route changes. `routineData` alone cannot express
+ *  that, because it is id-blind. */
+let routinesById: Record<string, Routine> | null = null
 let runsData: RoutineRun[] = []
 const queryState = { isLoading: false, isError: false }
 const routineRefetch = vi.fn()
@@ -45,7 +50,10 @@ vi.mock('../../lib/routine-queries', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../lib/routine-queries')>()
   return {
     ...actual,
-    useRoutine: () => ({ data: routineData, isLoading: queryState.isLoading, isError: queryState.isError, refetch: routineRefetch }),
+    useRoutine: (id?: string) => ({
+      data: routinesById ? (id ? routinesById[id] : undefined) : routineData,
+      isLoading: queryState.isLoading, isError: queryState.isError, refetch: routineRefetch,
+    }),
     useRoutineRuns: () => ({ data: runsData, isLoading: false, isError: false, refetch: vi.fn() }),
     useRoutineMutations: () => ({
       create: { mutate: createMutate, isPending: false },
@@ -107,6 +115,40 @@ function renderDetail(id = 'r1') {
   return render(detailTree(id))
 }
 
+/** Hands the live router's own `navigate` to the test. A REAL route change is the thing
+ *  `rerender(detailTree('r2'))` cannot do: `initialEntries` is consumed only at mount, so
+ *  re-rendering a fresh <MemoryRouter> leaves the mounted page's `useParams()` untouched. Calling
+ *  `navigate()` from inside the SAME router instance is what the app itself does, and models a
+ *  browser Back/Forward between two routine URLs — which is not a click on anything, so this is
+ *  deliberately a handle rather than a button (a button outside an open Radix modal is
+ *  `pointer-events: none` anyway, and would test the wrong thing). */
+let routerNavigate: ((to: string) => void) | null = null
+function NavHandle() {
+  routerNavigate = useNavigate()
+  return null
+}
+async function navigateTo(path: string) {
+  await act(async () => { routerNavigate?.(path) })
+}
+
+/** One mounted router that can walk between routine URLs. Both real routes are registered, in the
+ *  same order as App.tsx, so the `new` ↔ `:routineId` transition is exercisable too. */
+function routedTree(startPath = '/workspace/code/routines/r1') {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  return (
+    <QueryClientProvider client={qc}>
+      <MemoryRouter initialEntries={[startPath]}>
+        <Routes>
+          <Route path="/workspace/code/routines/new" element={<RoutineEditPage />} />
+          <Route path="/workspace/code/routines/:routineId" element={<RoutineEditPage />} />
+        </Routes>
+        <LocationProbe />
+        <NavHandle />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+}
+
 /** The page renders the Code-mode sidebar, which has its own "Active" session filter and its own
  *  buttons — scope status/badge assertions to the routine's own header row. */
 function headerRow(): HTMLElement {
@@ -115,6 +157,8 @@ function headerRow(): HTMLElement {
 
 beforeEach(() => {
   routineData = undefined
+  routinesById = null
+  routerNavigate = null
   runsData = []
   queryState.isLoading = false
   queryState.isError = false
@@ -298,6 +342,22 @@ describe('RoutineEditPage — existing-routine detail', () => {
     expect(within(headerRow()).getByText('Needs approval')).toBeInTheDocument()
   })
 
+  it('disables Run now while a run is parked awaiting approval — /run-now can only 409 there', () => {
+    routineData = activeRoutine()
+    runsData = [{
+      id: 'run1', routineId: 'r1', status: 'needs_approval', configSnapshot: '{}',
+      startedAt: '2026-08-01T09:00:00.000Z',
+      pendingToolCall: JSON.stringify({ convId: 'c1', assistantContent: '', precedingCalls: [], call: { id: 'x', name: 'run_shell', args: { command: 'ls' } } }),
+    }]
+    renderDetail()
+    // A parked run is not `running`, but it stays in RoutineScheduler.inFlight until approve/deny
+    // calls releaseParked — tick() and runNow() both skip the inFlight delete when a run parked,
+    // and reconcileParkedRuns() re-adds it at daemon start. So POST /run-now answers 409
+    // `already_running` for the whole time this card is on screen, and an enabled button would
+    // offer the user nothing but a failure toast.
+    expect(screen.getByRole('button', { name: /Run now/ })).toBeDisabled()
+  })
+
   it('shows a skeleton, not an error, while the routine is still loading', () => {
     queryState.isLoading = true
     const { container } = renderDetail()
@@ -383,7 +443,7 @@ describe('RoutineEditPage — every control reads the live routine, never a capt
     expect(routineRefetch).toHaveBeenCalled()
   })
 
-  it('the delete dialog describes the routine as it is NOW, including a run that starts while it is open', async () => {
+  it('re-reads the run list on every render, so an open delete dialog warns about a run that started after it opened', async () => {
     const user = userEvent.setup()
     routineData = activeRoutine()
     runsData = [{ id: 'run1', routineId: 'r1', status: 'ok', configSnapshot: '{}', startedAt: '2026-08-01T09:00:00.000Z' }]
@@ -401,22 +461,26 @@ describe('RoutineEditPage — every control reads the live routine, never a capt
     expect(screen.getByText(/A run is in progress right now/)).toBeInTheDocument()
   })
 
-  it('deletes the routine currently on screen, even after the live query swapped in a different one', async () => {
+  it("reads the routine's id at confirm-click time, not when the dialog was opened", async () => {
     const user = userEvent.setup()
     routineData = activeRoutine()
     const { rerender } = renderDetail()
     await user.click(screen.getByRole('button', { name: /Delete/ }))
 
-    // The routed id changed under the page (a redirect, a browser Back into a different routine)
-    // while the dialog was open. The DELETE must follow the routine the dialog is describing —
-    // which it does because both the description and the click handler read routineQ.data.
+    // NOT a routing change: `rerender(detailTree('r2'))` mounts a fresh <MemoryRouter>, whose
+    // `initialEntries` is consumed only at mount, so the already-mounted page's
+    // `useParams().routineId` stays 'r1'. What this drives is the detail query answering with a
+    // different object on the same mount — which proves the id the DELETE carries is re-read from
+    // routineQ.data at click time rather than captured when the dialog opened.
+    // A REAL `:routineId` change is a different scenario entirely, and the page now discards the
+    // dialog outright rather than retargeting it — see the real-navigation tests below.
     routineData = activeRoutine({ id: 'r2', prompt: 'Nightly backup' })
     rerender(detailTree('r2'))
     await user.click(screen.getByRole('button', { name: 'Delete routine' }))
     expect(removeMutate).toHaveBeenCalledWith('r2', expect.anything())
   })
 
-  it('diffs a proposed edit against the LIVE routine, not against the routine as it was when Edit was clicked', async () => {
+  it('re-derives the update diff on every render, against the routine as it stands now', async () => {
     const user = userEvent.setup()
     routineData = activeRoutine()
     const { rerender } = renderDetail()
@@ -433,5 +497,107 @@ describe('RoutineEditPage — every control reads the live routine, never a capt
     rerender(detailTree())
     expect(screen.getByText('− model-b')).toBeInTheDocument()
     expect(screen.getByText('+ model-a')).toBeInTheDocument()
+  })
+})
+
+// ── A REAL `:routineId` change, driven by the router's own navigate(). Every test above that
+//    talks about "the routed id changing" does not actually change it (initialEntries is a
+//    mount-time input); these do. The property under test is the opposite of the ones above: a
+//    control must read the LIVE routine, but the user's INTENT must not survive the routine it
+//    was given for. `/workspace/code/routines/:routineId` is one route pattern for every routine,
+//    so React reconciles the same component instance across the change and would otherwise keep
+//    every piece of that intent — which is why the page mounts under `key={routineId}`. ────────
+describe('RoutineEditPage — a real route change to a different routine discards page-local intent', () => {
+  const twoRoutines = () => ({
+    r1: activeRoutine(),
+    r2: activeRoutine({ id: 'r2', prompt: 'Nightly backup' }),
+  })
+
+  it('drops an OPEN delete confirmation instead of retargeting it at the new routine', async () => {
+    const user = userEvent.setup()
+    routinesById = twoRoutines()
+    render(routedTree())
+
+    await user.click(screen.getByRole('button', { name: /Delete/ }))
+    expect(screen.getByText('Delete this routine?')).toBeInTheDocument()
+    // Twice: the header row, and the dialog naming what it is about to delete.
+    expect(screen.getAllByText('Summarize my inbox')).toHaveLength(2)
+
+    // Browser Back/Forward between two routine URLs, an edited URL, any in-app cross-link. The
+    // consent the user gave was "delete Summarize my inbox"; DELETE has no status guard and
+    // cascades to the run history, so a dialog that stayed open here would hand that consent to
+    // a routine the user never selected.
+    await navigateTo('/workspace/code/routines/r2')
+
+    expect(screen.getByTestId('pathname')).toHaveTextContent('/workspace/code/routines/r2')
+    expect(screen.queryByText('Delete this routine?')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Delete routine' })).not.toBeInTheDocument()
+    expect(removeMutate).not.toHaveBeenCalled()
+    // …and what is on screen is a fresh, unopened view of the NEW routine.
+    expect(screen.getByText('Nightly backup')).toBeInTheDocument()
+    expect(screen.queryByText('Summarize my inbox')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Delete/ })).toBeInTheDocument()
+  })
+
+  it('drops a pending update confirm gate instead of re-aiming it at the new routine', async () => {
+    const user = userEvent.setup()
+    routinesById = twoRoutines()
+    render(routedTree())
+
+    await user.click(screen.getByRole('button', { name: 'Edit' }))
+    const promptBox = screen.getByPlaceholderText(/What should this routine do/)
+    await user.clear(promptBox)
+    await user.type(promptBox, 'HIJACKED')
+    await user.click(screen.getByRole('button', { name: 'Review change' }))
+    expect(screen.getByText('Confirm this change')).toBeInTheDocument()
+
+    // `draftToPatch` sends EVERY field, so a surviving `existingDraft` would put an unrequested
+    // gate on r2's page whose Confirm PUTs r1's prompt, schedule, model, agent and workspace over
+    // r2 wholesale.
+    await navigateTo('/workspace/code/routines/r2')
+
+    expect(screen.getByTestId('pathname')).toHaveTextContent('/workspace/code/routines/r2')
+    expect(screen.queryByText('Confirm this change')).not.toBeInTheDocument()
+    expect(screen.queryByText('+ HIJACKED')).not.toBeInTheDocument()
+    expect(updateMutate).not.toHaveBeenCalled()
+    expect(screen.getByText('Nightly backup')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Edit' })).toBeInTheDocument()
+  })
+
+  it('drops an open editor, landing on the new routine\'s detail view rather than its own form', async () => {
+    const user = userEvent.setup()
+    routinesById = twoRoutines()
+    render(routedTree())
+
+    await user.click(screen.getByRole('button', { name: 'Edit' }))
+    const promptBox = screen.getByPlaceholderText(/What should this routine do/)
+    await user.clear(promptBox)
+    await user.type(promptBox, 'HIJACKED')
+    expect(screen.getByRole('button', { name: 'Review change' })).toBeInTheDocument()
+
+    await navigateTo('/workspace/code/routines/r2')
+
+    expect(screen.queryByRole('button', { name: 'Review change' })).not.toBeInTheDocument()
+    expect(screen.queryByDisplayValue('HIJACKED')).not.toBeInTheDocument()
+    expect(screen.getByText('Nightly backup')).toBeInTheDocument()
+  })
+
+  it('discards a half-filled new-routine draft across new → :routineId → new', async () => {
+    const user = userEvent.setup()
+    routinesById = twoRoutines()
+    render(routedTree('/workspace/code/routines/new'))
+
+    await user.type(screen.getByPlaceholderText(/What should this routine do/), 'Draft for a routine I abandoned')
+    expect(screen.getByDisplayValue('Draft for a routine I abandoned')).toBeInTheDocument()
+
+    // `new` and `:routineId` are separate Route entries but the SAME element, so React reconciles
+    // across this transition too unless the key changes.
+    await navigateTo('/workspace/code/routines/r1')
+    expect(screen.getByText('Summarize my inbox')).toBeInTheDocument()
+    await navigateTo('/workspace/code/routines/new')
+
+    expect(screen.getByText('New routine')).toBeInTheDocument()
+    expect(screen.queryByDisplayValue('Draft for a routine I abandoned')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled()
   })
 })

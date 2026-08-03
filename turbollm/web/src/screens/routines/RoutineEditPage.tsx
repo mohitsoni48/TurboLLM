@@ -125,8 +125,11 @@ function CodeModeShell({ children }: { children: ReactNode }) {
  *  diffed against the LIVE routine, not against the routine as it was when Edit was clicked) and
  *  `deleteConfirmOpen` (a boolean; the dialog reads the routine itself fresh). `created` is the
  *  one snapshot, and it is superseded by the live query the moment that query resolves — see the
- *  create branch. */
-export function RoutineEditPage() {
+ *  create branch.
+ *
+ *  Mounted by `RoutineEditPage` below under a `key` derived from the routed id — see that
+ *  wrapper's comment for why nothing in here may be allowed to outlive a routine. */
+function RoutineEditPageInner() {
   const { routineId } = useParams<{ routineId: string }>()
   const navigate = useNavigate()
   const isNew = !routineId || routineId === 'new'
@@ -308,7 +311,15 @@ export function RoutineEditPage() {
               // /run-now accepts active AND paused routines (routine-routes.ts only refuses
               // 'not_confirmed'), so the plan's `status === 'active'` condition would have hidden
               // a manual trigger the backend genuinely supports on a paused routine.
-              <Button size="sm" variant="outline" disabled={mut.runNow.isPending || runningNow} onClick={() => mut.runNow.mutate(routine.id, { onError: failed('Could not start a run.') })}>
+              //
+              // `awaitingApproval` is part of the disabled condition because /run-now's 409
+              // `already_running` is driven by RoutineScheduler.inFlight, and a run parked at
+              // `needs_approval` STAYS in inFlight: tick() and runNow() both early-return out of
+              // the `.finally` that would delete it, and reconcileParkedRuns() re-adds parked
+              // routines at daemon start. Only approve/deny (via releaseParked) clears it. So a
+              // parked run is NOT `running` in the run list but /run-now still refuses it, and an
+              // enabled button here could only ever produce a failure toast.
+              <Button size="sm" variant="outline" disabled={mut.runNow.isPending || runningNow || awaitingApproval} onClick={() => mut.runNow.mutate(routine.id, { onError: failed('Could not start a run.') })}>
                 <RotateCw size={13} /> Run now
               </Button>
             )}
@@ -393,4 +404,29 @@ export function RoutineEditPage() {
       </div>
     </CodeModeShell>
   )
+}
+
+/** The page proper is `RoutineEditPageInner`; this wrapper exists only to give it a `key`.
+ *
+ *  `/workspace/code/routines/new` and `/workspace/code/routines/:routineId` are the SAME element
+ *  in App.tsx, and the detail route is one pattern for every routine — so React Router reconciles
+ *  the SAME component instance when the routed id changes from one routine to another (a browser
+ *  Back/Forward between two routine URLs, an edited URL, the create page's own "Open routine"
+ *  navigation, any future in-app cross-link). Nothing about that transition unmounts the page, so
+ *  without this key every piece of local state survives it — and every piece of local state on
+ *  this page encodes USER INTENT BOUND TO ONE ROUTINE: `deleteConfirmOpen` (a delete the user
+ *  authorized for routine A, whose confirm button would then fire an unguarded cascading DELETE
+ *  against routine B), `existingDraft`/`editingExisting` (A's authored field values, which
+ *  `draftToPatch` would PUT wholesale over B's prompt, schedule, model, agent and workspace),
+ *  plus `draft` and `created`. Every one of those correctly re-reads the LIVE routine when it
+ *  renders, so the retarget is *accurately described* on screen — which is precisely what makes
+ *  it dangerous rather than obviously broken: a confirmation is consent for a specific object,
+ *  and re-pointing it at a different one inverts what the user agreed to.
+ *
+ *  Keying on the routed id makes that structurally impossible instead of a rule to remember:
+ *  React unmounts and remounts on any identity change (including `new` ↔ a specific id), so state
+ *  added to this page later is discarded too, without anyone having to extend a reset effect. */
+export function RoutineEditPage() {
+  const { routineId } = useParams<{ routineId: string }>()
+  return <RoutineEditPageInner key={routineId ?? 'new'} />
 }
