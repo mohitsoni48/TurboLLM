@@ -321,9 +321,7 @@ export function ModelDetailDialog({
                 <>
                   {/* MoE models' GPU/CPU tradeoff is governed by nCpuMoe below, not ngl —
                       auto-tune's moeSearch never touches ngl for them either — so "Auto-fit GPU
-                      layers" has nothing meaningful to control here; hidden for MoE models. The
-                      slider still shows unconditionally for MoE (guarding against nglFit somehow
-                      being true with no UI path to turn it back off). */}
+                      layers" has nothing meaningful to control here; hidden for MoE models. */}
                   {!detail.moe && (
                     <Toggle
                       label="Auto-fit GPU layers"
@@ -332,7 +330,11 @@ export function ModelDetailDialog({
                       onChange={(v) => set('nglFit', v)}
                     />
                   )}
-                  {(!draft.nglFit || detail.moe) && (
+                  {/* For MoE, nCpuMoeFit now also suppresses -ngl on the backend (profileToArgs) —
+                      llama.cpp's own -fit aborts entirely if -ngl is explicit, so "Auto-fit MoE CPU
+                      offload" only actually engages -fit when -ngl is omitted too. Hide the slider
+                      whenever that's the active fit mode so it can't look like a live control. */}
+                  {(detail.moe ? !draft.nCpuMoeFit : !draft.nglFit) && (
                     <Slider label="GPU layers" hint={detail.blockCount > 0 ? `${detail.blockCount} total layers.` : 'All layers on GPU = max performance.'} value={draft.ngl} min={0} max={detail.blockCount > 0 ? detail.blockCount : 99} step={1} onChange={(v) => set('ngl', v)} fmt={(v) => (v >= (detail.blockCount > 0 ? detail.blockCount : 99) ? 'All' : String(v))} />
                   )}
                 </>

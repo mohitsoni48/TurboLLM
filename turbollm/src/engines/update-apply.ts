@@ -17,7 +17,6 @@ import type { Manager } from './manager'
 import type { ProvisionState } from './provision-state'
 import type { Registry } from './registry'
 import {
-  type BackendId,
   backendDefAt,
   backendDir,
   latestReleaseTag,
@@ -30,7 +29,7 @@ import { ensureVllmEnv } from './vllm'
 import { ensureKoboldcpp, koboldcppDir } from './koboldcpp'
 import { ensureLlamafile, llamafileDir } from './llamafile'
 import { primaryVendor } from '../sysinfo/sysinfo'
-import { tagFromManagedBinPath } from './update'
+import { backendIdFromBinPath, tagFromManagedBinPath } from './update'
 
 export interface UpdateApplyDeps {
   store: ConfigStore
@@ -62,7 +61,7 @@ export async function applyEngineUpdate(d: UpdateApplyDeps, engine: Engine, sign
 /** Official llama.cpp: download the real latest tag into its own dir, probe, then swap
  *  + GC the old. The old dir is only deleted AFTER the new one probes successfully. */
 async function applyLlamaCppUpdate(d: UpdateApplyDeps, engine: Engine, root: string, signal?: AbortSignal): Promise<void> {
-  const backendId = backendIdOf(engine.binPath)
+  const backendId = backendIdFromBinPath(engine.binPath)
   if (!backendId) throw new Error('Could not determine the GPU backend of this build.')
   const installedTag = tagFromManagedBinPath(engine.binPath)
   const latestTag = await latestReleaseTag(OFFICIAL_LLAMA_REPO, signal)
@@ -180,11 +179,6 @@ async function applyPipUpdate(d: UpdateApplyDeps, kind: 'mlx' | 'rapid-mlx' | 'v
     d.provision.fail(`Could not update ${PIP_ENGINE_LABEL[kind]}: ${msg(e)}`)
     throw e
   }
-}
-
-function backendIdOf(binPath: string): BackendId | null {
-  const m = /[\\/]engines[\\/]llama\.cpp-[^\\/]+?-(cuda|rocm|sycl|vulkan|metal|cpu)[\\/]/.exec(binPath)
-  return m ? (m[1] as BackendId) : null
 }
 
 function msg(e: unknown): string {

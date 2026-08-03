@@ -1240,7 +1240,7 @@ export function registerApi(app: Hono, d: Deps): void {
         const extraArgs =
           active.kind === 'koboldcpp'
             ? koboldcppProfileToArgs(profile, primaryVendor(sys), sys.gpus.length > 0)
-            : profileToArgs(profile, entry, active.capabilities, sys.cores)
+            : profileToArgs(profile, entry, active.capabilities, sys.cores, sys, active.binPath)
         opts = {
           engine: active,
           model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: profile.ctx, vision: entry.vision },

@@ -667,7 +667,7 @@ export class BenchRunner {
       engine: active,
       model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: profile.ctx, vision: entry.vision },
       modelPath: entry.path,
-      extraArgs: profileToArgs(profile, entry, caps, sys.cores),
+      extraArgs: profileToArgs(profile, entry, caps, sys.cores, sys, active.binPath),
     }
     try {
       await this.manager.start(opts)
@@ -776,7 +776,7 @@ export class BenchRunner {
       engine: active,
       model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: profile.ctx, vision: entry.vision },
       modelPath: entry.path,
-      extraArgs: profileToArgs(profile, entry, caps, sys.cores),
+      extraArgs: profileToArgs(profile, entry, caps, sys.cores, sys, active.binPath),
     }
 
     const vramBefore = await readGpuVramMb(sys)
@@ -1097,7 +1097,7 @@ export class BenchRunner {
       engine: active,
       model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: profile.ctx, vision: entry.vision },
       modelPath: entry.path,
-      extraArgs: profileToArgs(profile, entry, caps, sys.cores),
+      extraArgs: profileToArgs(profile, entry, caps, sys.cores, sys, active.binPath),
     }
     try {
       await this.manager.start(opts)

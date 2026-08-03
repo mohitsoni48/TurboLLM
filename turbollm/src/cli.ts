@@ -708,7 +708,7 @@ void (async () => {
         engine: active,
         model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: profile.ctx, vision: entry.vision },
         modelPath: entry.path,
-        extraArgs: profileToArgs(profile, entry, active.capabilities, sys.cores),
+        extraArgs: profileToArgs(profile, entry, active.capabilities, sys.cores, sys, active.binPath),
       }
     }
   } else if (cfg.devModel) {

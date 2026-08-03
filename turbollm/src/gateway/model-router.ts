@@ -339,7 +339,7 @@ export class ModelRouter {
     const extraArgs =
       engine.kind === 'koboldcpp'
         ? koboldcppProfileToArgs(profile, sys.gpus[0]?.vendor ?? 'unknown', sys.gpus.length > 0)
-        : profileToArgs(profile, entry, engine.capabilities, sys.cores)
+        : profileToArgs(profile, entry, engine.capabilities, sys.cores, sys, engine.binPath)
     return {
       engine,
       model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: profile.ctx, vision: entry.vision },
