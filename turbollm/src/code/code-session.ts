@@ -1634,8 +1634,12 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
 
       // run_code (founder decision, 2026-07-13: extend Chat's Customize-configured tools to
       // Code) — a sandboxed JS snippet runner with explicitly NO fs/network/process access
-      // (builtin.ts's own RUN_CODE_TOOL description). Genuinely inert, so registered
-      // unconditionally like web_search/fetch_url — no approval gate, every mode including plan.
+      // (builtin.ts's own RUN_CODE_TOOL description, and see builtin.ts's execRunCode comment for
+      // the realm-escape invariant that promise depends on). Registered unconditionally like
+      // web_search/fetch_url — no approval gate, every mode including plan — because it cannot
+      // reach the network, filesystem, or host process; it is NOT immune to hanging or crashing
+      // the daemon process via CPU/memory exhaustion (see builtin.ts), which is why that class of
+      // hardening is tracked as a follow-up rather than assumed here.
       // MCP tools below get the opposite treatment (ask-mode gated, excluded from plan) because,
       // unlike this, they're arbitrary external providers with no such safety guarantee.
       pi.registerTool({
