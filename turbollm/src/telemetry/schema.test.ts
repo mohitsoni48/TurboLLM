@@ -62,15 +62,14 @@ test('validateEvent: onboarding_step requires a known step and outcome', () => {
   assert.match(r.reason, /outcome/)
 })
 
-test('validateEvent: first_chat is a valid onboarding step, and can be cancelled', () => {
-  assert.equal(
-    validateEvent(validEvent({ event: 'onboarding_step', payload: { step: 'first_chat', outcome: 'ok' } })).ok,
-    true,
-  )
-  assert.equal(
-    validateEvent(validEvent({ event: 'onboarding_step', payload: { step: 'first_chat', outcome: 'cancelled' } })).ok,
-    true,
-  )
+test('validateEvent: first_chat is a valid onboarding step, and reports ok/fail/cancelled', () => {
+  for (const outcome of ['ok', 'fail', 'cancelled']) {
+    assert.equal(
+      validateEvent(validEvent({ event: 'onboarding_step', payload: { step: 'first_chat', outcome } })).ok,
+      true,
+      `first_chat should accept outcome '${outcome}'`,
+    )
+  }
 })
 
 test('validateEvent: engine_build is no longer an onboarding step (ADR-323)', () => {

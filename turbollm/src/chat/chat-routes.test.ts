@@ -144,7 +144,7 @@ function queued(dir: string): Record<string, unknown>[] {
 test('reportFirstChat: a completed generation reports first_chat as ok', () => {
   const dir = tempDir()
   try {
-    reportFirstChat(dir, makeEmitter(dir), false)
+    reportFirstChat(dir, makeEmitter(dir), 'ok')
     const events = queued(dir)
 
     assert.equal(events.length, 1)
@@ -158,8 +158,22 @@ test('reportFirstChat: a completed generation reports first_chat as ok', () => {
 test('reportFirstChat: an aborted generation reports cancelled, not fail', () => {
   const dir = tempDir()
   try {
-    reportFirstChat(dir, makeEmitter(dir), true)
+    reportFirstChat(dir, makeEmitter(dir), 'cancelled')
     assert.deepEqual(queued(dir)[0].payload, { step: 'first_chat', outcome: 'cancelled' })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('reportFirstChat: an engine error (early bad-response return, or a thrown mid-stream exception) reports fail', () => {
+  // The two real call sites that pass 'fail': runGeneration's early return on a
+  // non-ok engine response, and its catch block on a non-AbortError exception. A
+  // user whose first-ever attempt hits either must not read as either "ok" (silently
+  // wrong) or "never tried" (silently missing) — see the PR review that caught this.
+  const dir = tempDir()
+  try {
+    reportFirstChat(dir, makeEmitter(dir), 'fail')
+    assert.deepEqual(queued(dir)[0].payload, { step: 'first_chat', outcome: 'fail' })
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -171,9 +185,9 @@ test('reportFirstChat: fires exactly once across many generations, not on every 
   const dir = tempDir()
   try {
     const e = makeEmitter(dir)
-    reportFirstChat(dir, e, false)
-    reportFirstChat(dir, e, false)
-    reportFirstChat(dir, e, true)
+    reportFirstChat(dir, e, 'ok')
+    reportFirstChat(dir, e, 'ok')
+    reportFirstChat(dir, e, 'cancelled')
 
     assert.equal(queued(dir).length, 1, 'first_chat means first, not every')
   } finally {
@@ -185,8 +199,8 @@ test('reportFirstChat: an aborted FIRST chat still claims the once-key', () => {
   const dir = tempDir()
   try {
     const e = makeEmitter(dir)
-    reportFirstChat(dir, e, true)
-    reportFirstChat(dir, e, false)
+    reportFirstChat(dir, e, 'cancelled')
+    reportFirstChat(dir, e, 'ok')
 
     const events = queued(dir)
     assert.equal(events.length, 1, 'the aborted attempt was still the first one')
@@ -196,13 +210,28 @@ test('reportFirstChat: an aborted FIRST chat still claims the once-key', () => {
   }
 })
 
+test('reportFirstChat: a FAILED first chat still claims the once-key', () => {
+  const dir = tempDir()
+  try {
+    const e = makeEmitter(dir)
+    reportFirstChat(dir, e, 'fail')
+    reportFirstChat(dir, e, 'ok')
+
+    const events = queued(dir)
+    assert.equal(events.length, 1, 'the failed attempt was still the first one')
+    assert.deepEqual(events[0].payload, { step: 'first_chat', outcome: 'fail' })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('reportFirstChat: consent off queues nothing and does not spend the claim', () => {
   const dir = tempDir()
   try {
-    reportFirstChat(dir, makeEmitter(dir, 'off'), false)
+    reportFirstChat(dir, makeEmitter(dir, 'off'), 'ok')
     assert.equal(queued(dir).length, 0)
 
-    reportFirstChat(dir, makeEmitter(dir, 'anon'), false)
+    reportFirstChat(dir, makeEmitter(dir, 'anon'), 'ok')
     assert.equal(queued(dir).length, 1, 'opting in later must still capture the next chat')
   } finally {
     rmSync(dir, { recursive: true, force: true })
@@ -210,5 +239,5 @@ test('reportFirstChat: consent off queues nothing and does not spend the claim',
 })
 
 test('reportFirstChat: no emitter (telemetry not wired) is a silent no-op', () => {
-  assert.doesNotThrow(() => reportFirstChat(tempDir(), undefined, false))
+  assert.doesNotThrow(() => reportFirstChat(tempDir(), undefined, 'ok'))
 })
