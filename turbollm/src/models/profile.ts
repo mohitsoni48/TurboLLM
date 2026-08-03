@@ -2,6 +2,7 @@
 // estimation, and the profile->llama-server arg mapping (spec 05). This
 // productizes the hand-tuned models.json knowledge.
 import type { Capabilities, ModelDefaults } from '../config/config'
+import { backendIdFromBinPath } from '../engines/update'
 import type { SysInfo } from '../sysinfo/sysinfo'
 import type { ModelEntry } from './scanner'
 
@@ -99,7 +100,16 @@ export interface LoadProfile {
    *  simple N-experts-on-CPU count this app exposes (live-verified: it can fit MORE onto the GPU
    *  than a coarse fixed count would), so omitting the flag can genuinely do better than a manual
    *  number. Absent / false → unchanged existing behavior. Same engine-version assumption as
-   *  {@link nglFit} applies here too. */
+   *  {@link nglFit} applies here too.
+   *
+   *  **For MoE models this ALSO suppresses `-ngl`** (see {@link profileToArgs}) — found
+   *  2026-08-03 from a user-reported OOM crash: llama.cpp's `common_params_fit_params` (fit.cpp)
+   *  throws the instant `-ngl` is explicit, before it ever reaches the MoE tensor-placement step,
+   *  so leaving `-ngl` in place while only omitting `--n-cpu-moe` doesn't get a partial fit — it
+   *  gets NO fit. `-fit` aborts, and the engine falls through to loading `-ngl` layers (every
+   *  expert included) with zero MoE offload, an instant OOM on a VRAM-constrained card. Since the
+   *  UI already hides the ngl slider for MoE whenever this is on (see ModelDetailDialog.tsx), that
+   *  doesn't reintroduce the "dead slider" problem ADR-190 was guarding against. */
   nCpuMoeFit?: boolean
   parallel: number
   /** Pin this model's engine instance to a specific loopback port instead of the
@@ -503,10 +513,38 @@ export function resolveProfile(
   }
 }
 
+/** GitHub #85 / ADR-324: llama.cpp on ROCm hangs loading large models on AMD unified-memory
+ *  APUs (Strix Halo / gfx1151 confirmed; an open upstream llama.cpp/ROCm bug, not ours — see
+ *  decision-log ADR-310). --no-mmap is a workaround the reporter confirmed fixes it alone.
+ *  Upstream reports put the confirmed-safe ceiling at ~33GB and the confirmed-hang floor at
+ *  ~60GB; 30GB was chosen (deliberately, not derived) to start the workaround a bit before the
+ *  known-safe boundary rather than right at the edge of the unconfirmed 33-60GB gap. */
+const ROCM_APU_NOMMAP_MIN_BYTES = 30 * 1024 ** 3
+
+/** True when this load matches the GitHub #85 hang profile: a ROCm llama.cpp build (identified
+ *  from the managed install dir naming, {@link backendIdFromBinPath}) on an AMD unified-memory
+ *  GPU ({@link SysInfo.gpus}, ADR-310), loading a model at or above the threshold. `sys`/`binPath`
+ *  are optional so every existing caller (tests, bench.ts fixtures) keeps working unchanged when
+ *  it doesn't have them in scope — absence just means the gate never fires. */
+function isRocmUnifiedApuLoad(m: ModelEntry, sys: SysInfo | undefined, binPath: string | undefined): boolean {
+  if (!sys || !binPath) return false
+  if (m.sizeBytes < ROCM_APU_NOMMAP_MIN_BYTES) return false
+  if (backendIdFromBinPath(binPath) !== 'rocm') return false
+  return sys.gpus.some((g) => g.vendor === 'amd' && g.unified)
+}
+
 /** Map a profile to llama-server args (spec 05 §8). The manager injects
  *  -m/--host/--port/--metrics/--no-webui; this returns everything else.
- *  Flags absent from the engine's capabilities are skipped (graceful degrade). */
-export function profileToArgs(p: LoadProfile, m: ModelEntry, caps: Capabilities, cores = 0): string[] {
+ *  Flags absent from the engine's capabilities are skipped (graceful degrade).
+ *  `sys`/`binPath` are optional — only needed for the GitHub #85 ROCm+APU gate above. */
+export function profileToArgs(
+  p: LoadProfile,
+  m: ModelEntry,
+  caps: Capabilities,
+  cores = 0,
+  sys?: SysInfo,
+  binPath?: string,
+): string[] {
   const has = (flag: string) => caps.flags.length === 0 || caps.flags.includes(flag)
   const a: string[] = ['-c', String(p.ctx)]
   // nglFit: omit -ngl entirely so llama.cpp's own -fit logic picks the offload (see LoadProfile).
@@ -514,7 +552,16 @@ export function profileToArgs(p: LoadProfile, m: ModelEntry, caps: Capabilities,
   // layers" toggle and force-shows the plain slider for MoE (nCpuMoeFit is the real MoE
   // offload control), so honoring a stray nglFit:true here would silently make that slider a
   // no-op with no UI path to notice or undo it.
-  if ((!p.nglFit || m.moe) && p.ngl > 0) a.push('-ngl', String(p.ngl))
+  //
+  // For MoE, nCpuMoeFit ALSO suppresses -ngl (found from a user-reported OOM crash, see
+  // LoadProfile.nCpuMoeFit): llama.cpp's own -fit (fit.cpp `common_params_fit_params`) throws
+  // the instant -ngl is explicit, before it ever reaches the MoE tensor-placement step — it
+  // doesn't partially fit just --n-cpu-moe, it aborts the WHOLE pass. Leaving -ngl in place
+  // while only omitting --n-cpu-moe silently defeats the "Auto-fit MoE CPU offload" toggle:
+  // -fit aborts, and the engine falls through to loading -ngl layers — every expert included —
+  // with zero MoE offload, an instant CUDA OOM on a VRAM-constrained card.
+  const moeAutoFit = m.moe && p.nCpuMoeFit
+  if (!moeAutoFit && (!p.nglFit || m.moe) && p.ngl > 0) a.push('-ngl', String(p.ngl))
   // Multi-GPU split (ADR-054). Defaults are no-ops: 'layer' + empty tensorSplit +
   // mainGpu -1 emit nothing, preserving llama.cpp's built-in even split across GPUs.
   const g = p.gpu
@@ -635,6 +682,16 @@ export function profileToArgs(p: LoadProfile, m: ModelEntry, caps: Capabilities,
   if (m.embedding && has('--embeddings')) a.push('--embeddings')
   // Startup GBNF grammar constraint — only emitted when the user has set one.
   if (p.grammar && has('--grammar')) a.push('--grammar', p.grammar)
+  // GitHub #85 / ADR-324: skip if the user already added it themselves (e.g. copying the
+  // manual workaround from the issue) so it's never passed twice.
+  if (
+    isRocmUnifiedApuLoad(m, sys, binPath) &&
+    has('--no-mmap') &&
+    !p.extraArgs.includes('--no-mmap') &&
+    !p.extraArgs.includes('-dio')
+  ) {
+    a.push('--no-mmap')
+  }
   a.push(...p.extraArgs)
   return a
 }

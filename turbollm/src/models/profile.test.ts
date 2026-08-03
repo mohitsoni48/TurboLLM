@@ -58,6 +58,23 @@ test('profileToArgs: nCpuMoeFit omits --n-cpu-moe entirely, regardless of the st
   assert.equal(args.includes('--n-cpu-moe'), false)
 })
 
+test('profileToArgs: nCpuMoeFit on a MoE model ALSO omits -ngl (2026-08-03 OOM fix)', () => {
+  // llama.cpp's own -fit (fit.cpp `common_params_fit_params`) throws the instant -ngl is
+  // explicit, before it ever reaches the MoE tensor-placement step — leaving -ngl in place
+  // while only omitting --n-cpu-moe doesn't get a partial fit, it gets NO fit at all, and the
+  // engine falls through to loading -ngl layers (every expert included) with zero MoE offload.
+  const p = { ...deriveDefault(moeModel, sys), ngl: 43, nCpuMoe: 4, nCpuMoeFit: true }
+  const args = profileToArgs(p, moeModel, caps)
+  assert.equal(args.includes('-ngl'), false)
+  assert.equal(args.includes('--n-cpu-moe'), false)
+})
+
+test('profileToArgs: nCpuMoeFit false/absent on a MoE model keeps emitting -ngl (backward compat)', () => {
+  const p = { ...deriveDefault(moeModel, sys), ngl: 43, nCpuMoe: 4 }
+  const args = profileToArgs(p, moeModel, caps)
+  assert.deepEqual(args.slice(args.indexOf('-ngl'), args.indexOf('-ngl') + 2), ['-ngl', '43'])
+})
+
 test('profileToArgs: --n-cpu-moe never emitted for a non-MoE model even without nCpuMoeFit', () => {
   const p = { ...deriveDefault(denseModel, sys), nCpuMoe: 4 }
   const args = profileToArgs(p, denseModel, caps)

@@ -15,7 +15,7 @@
 // the tests exercise directly; checkUpdate/the scheduler are thin shells over them.
 
 import type { Engine } from '../config/config'
-import { latestCommitSha, latestReleaseTag } from './download'
+import { type BackendId, latestCommitSha, latestReleaseTag } from './download'
 
 // ─── Layer 1a: version/tag comparison (pure) ─────────────────────────────────
 
@@ -171,10 +171,11 @@ export function tagFromManagedBinPath(binPath: string): string {
 
 /** Extract the llama.cpp backend id (cuda/rocm/sycl/vulkan/metal/cpu) from a tag-keyed
  *  managed install dir path, or '' when the path isn't an official managed build. The
- *  rollback-safe update needs this to re-provision the SAME backend at the new tag. */
-export function backendIdFromBinPath(binPath: string): string {
+ *  rollback-safe update needs this to re-provision the SAME backend at the new tag;
+ *  the GitHub #85 ROCm+APU launch gate (profile.ts) reuses it to identify a ROCm build. */
+export function backendIdFromBinPath(binPath: string): BackendId | '' {
   const m = /[\\/]engines[\\/]llama\.cpp-[^\\/]+?-(cuda|rocm|sycl|vulkan|metal|cpu)[\\/]/.exec(binPath)
-  return m ? m[1] : ''
+  return m ? (m[1] as BackendId) : ''
 }
 
 /** Pull the first `b<number>` build tag out of a probed version string (forks embed

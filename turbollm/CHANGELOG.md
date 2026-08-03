@@ -25,6 +25,30 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.9.10] - 2026-08-03
+
+### Fixed
+- **Security: closed a sandbox escape in the `run_code` tool.** Code run through `run_code` could
+  reach the real host process (full environment variables, arbitrary command execution) by walking
+  from a shadowed built-in back to the host's own `Function`/`process` objects, instead of staying
+  contained in its sandbox. The sandbox now runs in its own isolated JS realm with no host objects
+  attached, in a separate worker thread with a hard memory/time ceiling, so a malicious or runaway
+  script can no longer escape, hang, or crash the daemon.
+- **"Auto-fit MoE CPU offload" now actually works.** This toggle (Model Detail panel, MoE models)
+  was silently a no-op since it shipped — turning it on didn't engage llama.cpp's own smarter
+  GPU/CPU placement the way it was supposed to, so a large MoE model could instantly run out of GPU
+  memory and fail to load instead of gracefully spilling extra experts to system RAM. Fixed at the
+  source: the toggle now genuinely hands the decision to llama.cpp.
+- **AMD APU (Strix Halo, Ryzen AI) + ROCm: large models no longer hang on load.** A known upstream
+  llama.cpp/ROCm issue on unified-memory APUs is now automatically worked around for big enough
+  models, matching the confirmed fix from the reporter — no more hand-editing "Extra command-line
+  flags" to add it yourself.
+
+### Discord
+- Fixed a real sandbox-escape bug in the code-execution tool (`run_code`) — patched, no action needed beyond updating.
+- "Auto-fit MoE CPU offload" for big Mixture-of-Experts models actually does something now — previously it silently did nothing, which could crash a load that should've fit.
+- AMD Strix Halo / Ryzen AI users: the ROCm load-hang on large models is now auto-worked-around, no manual flag needed.
+
 ## [1.9.9] - 2026-08-03
 
 ### Fixed

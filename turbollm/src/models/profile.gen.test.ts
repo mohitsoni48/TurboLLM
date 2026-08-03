@@ -383,3 +383,81 @@ test('prefers --draft-max/--draft-min when the engine reports both old and new n
   assert.ok(!args.includes('--spec-draft-n-max'))
   assert.ok(!args.includes('--spec-draft-n-min'))
 })
+
+// ── GitHub #85 / ADR-324: --no-mmap on ROCm + AMD unified-memory APU for large models ──
+
+const ROCM_BIN = '/home/u/.turbollm/engines/llama.cpp-b9608-rocm/llama-server'
+const VULKAN_BIN = '/home/u/.turbollm/engines/llama.cpp-b9608-vulkan/llama-server'
+const CUSTOM_BIN = '/home/u/my-own-build/llama-server' // not a managed install dir
+
+function amdApuSys(): SysInfo {
+  return {
+    os: 'linux/x64', cpu: 'test', cores: 16, ramMB: 131072,
+    gpus: [{ name: 'AMD Radeon Graphics', vramMb: 120000, vendor: 'amd', unified: true }],
+  }
+}
+
+const bigModel = () => model({ sizeBytes: 40_000_000_000 }) // 40GB, above the 30GB gate
+const smallModel = () => model({ sizeBytes: 20_000_000_000 }) // 20GB, below the 30GB gate
+
+test('emits --no-mmap for a large model on ROCm + AMD unified APU', () => {
+  const args = profileToArgs(base(), bigModel(), caps, 0, amdApuSys(), ROCM_BIN)
+  assert.ok(args.includes('--no-mmap'))
+})
+
+test('does not emit --no-mmap below the 30GB threshold', () => {
+  const args = profileToArgs(base(), smallModel(), caps, 0, amdApuSys(), ROCM_BIN)
+  assert.equal(args.includes('--no-mmap'), false)
+})
+
+test('does not emit --no-mmap on a non-unified (discrete) AMD GPU', () => {
+  const discreteAmd: SysInfo = {
+    os: 'linux/x64', cpu: 'test', cores: 16, ramMB: 32000,
+    gpus: [{ name: 'Radeon RX 7900', vramMb: 24000, vendor: 'amd', unified: false }],
+  }
+  const args = profileToArgs(base(), bigModel(), caps, 0, discreteAmd, ROCM_BIN)
+  assert.equal(args.includes('--no-mmap'), false)
+})
+
+test('does not emit --no-mmap on non-AMD unified memory (e.g. Apple)', () => {
+  const appleUnified: SysInfo = {
+    os: 'darwin/arm64', cpu: 'test', cores: 12, ramMB: 65536,
+    gpus: [{ name: 'Apple M-series', vramMb: 65536, vendor: 'apple', unified: true }],
+  }
+  const args = profileToArgs(base(), bigModel(), caps, 0, appleUnified, ROCM_BIN)
+  assert.equal(args.includes('--no-mmap'), false)
+})
+
+test('does not emit --no-mmap on the Vulkan build of the same hardware', () => {
+  const args = profileToArgs(base(), bigModel(), caps, 0, amdApuSys(), VULKAN_BIN)
+  assert.equal(args.includes('--no-mmap'), false)
+})
+
+test('does not emit --no-mmap for a custom (non-managed) engine build — backend unknown', () => {
+  const args = profileToArgs(base(), bigModel(), caps, 0, amdApuSys(), CUSTOM_BIN)
+  assert.equal(args.includes('--no-mmap'), false)
+})
+
+test('does not emit --no-mmap when sys/binPath are omitted (existing callers keep working)', () => {
+  const args = profileToArgs(base(), bigModel(), caps)
+  assert.equal(args.includes('--no-mmap'), false)
+})
+
+test('is gated by engine capability like every other flag', () => {
+  const noNoMmap = { kvTypes: [], flags: ['-c', '--parallel'] } // --no-mmap not advertised
+  const args = profileToArgs(base(), bigModel(), noNoMmap, 0, amdApuSys(), ROCM_BIN)
+  assert.equal(args.includes('--no-mmap'), false)
+})
+
+test('does not duplicate --no-mmap when the user already added it manually', () => {
+  const p = { ...base(), extraArgs: ['--no-mmap'] }
+  const args = profileToArgs(p, bigModel(), caps, 0, amdApuSys(), ROCM_BIN)
+  assert.equal(args.filter((a) => a === '--no-mmap').length, 1)
+})
+
+test('does not auto-add --no-mmap when the user already added -dio manually', () => {
+  const p = { ...base(), extraArgs: ['-dio'] }
+  const args = profileToArgs(p, bigModel(), caps, 0, amdApuSys(), ROCM_BIN)
+  assert.equal(args.includes('--no-mmap'), false)
+  assert.ok(args.includes('-dio'))
+})
