@@ -107,6 +107,19 @@ test('executeTool: run_routine_now without an injected callback reports a clear 
   assert.match(out, /^Error:/)
 })
 
+// Kill switch: matches create_routine's own experimental-flag gate, but for a routine that was
+// already armed before the flag was turned off — the "stop ALL routines from running" case
+// create-time gating alone does nothing for.
+test('executeTool: run_routine_now refuses with a clear error while the experimental flag getter reports false', async () => {
+  const routine = fakeRoutine()
+  let called = false
+  const runNow: RunRoutineNowFn = async () => { called = true; return { ok: true } }
+  const reg = new ToolRegistry(EMPTY_TOOLS_CFG, fakeStore(routine), runNow, undefined, undefined, () => false)
+  const out = await reg.executeTool({ id: 't1', name: 'run_routine_now', args: { routineId: routine.id } })
+  assert.equal(out, `Error: ${ROUTINES_DISABLED_MESSAGE}`)
+  assert.ok(!called, 'the injected runRoutineNow callback must never be reached while disabled')
+})
+
 test('executeTool: an unknown tool name is still reported the same way as before this phase', async () => {
   const reg = new ToolRegistry(EMPTY_TOOLS_CFG)
   const out = await reg.executeTool({ id: 't1', name: 'nonexistent', args: {} })

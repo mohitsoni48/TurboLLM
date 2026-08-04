@@ -270,6 +270,12 @@ export function registerRoutineRoutes(app: Hono, d: Deps): void {
   })
 
   app.post('/api/v1/routines/:id/run-now', (c) => {
+    // Kill switch: matches POST /api/v1/routines' own experimental-flag check — turning
+    // Routines off must stop an already-armed routine from being triggered manually too, not
+    // just block new ones from being created. RoutineScheduler.runNow() checks this same flag
+    // independently (the unattended tick() path never reaches this REST handler at all), so this
+    // is belt-and-suspenders rather than the only enforcement.
+    if (!d.store.snapshot().daemon.experimental.routines) return err(c, 403, 'routines_disabled', ROUTINES_DISABLED_MESSAGE)
     if (!d.routineScheduler) return err(c, 503, 'scheduler_unavailable', 'The routine scheduler is not running.')
     // Fetch the routine ourselves (rather than letting RoutineScheduler.runNow's own lookup be
     // the only one) so the code-flavor gate (I2 fix) can be applied before anything fires: a
@@ -283,6 +289,7 @@ export function registerRoutineRoutes(app: Hono, d: Deps): void {
     if (!result.ok) {
       if (result.reason === 'not_found') return err(c, 404, 'not_found', 'Routine not found.')
       if (result.reason === 'not_confirmed') return err(c, 409, 'not_confirmed', 'Routine has not been confirmed yet.')
+      if (result.reason === 'routines_disabled') return err(c, 403, 'routines_disabled', ROUTINES_DISABLED_MESSAGE)
       return err(c, 409, 'already_running', 'This routine already has a run in progress.')
     }
     return c.json({ ok: true }, 202)

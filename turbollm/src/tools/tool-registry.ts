@@ -212,6 +212,10 @@ export class ToolRegistry {
       if (name === 'update_routine') return execUpdateRoutine(args, this.routines, isCodeAuthorized)
       if (name === 'delete_routine') return execDeleteRoutine(args, this.routines)
       if (name === 'run_routine_now') {
+        // Same kill switch as create_routine — RoutineScheduler.runNow() (cli.ts's injected
+        // runRoutineNowFn) checks this same flag independently, so this is a clearer error
+        // message on this surface rather than the only enforcement.
+        if (!this.isRoutinesEnabled()) return `Error: ${ROUTINES_DISABLED_MESSAGE}`
         if (!this.runRoutineNowFn) return 'Error: run_routine_now is not available in this build.'
         return execRunRoutineNow(args, this.routines, this.runRoutineNowFn, isCodeAuthorized)
       }

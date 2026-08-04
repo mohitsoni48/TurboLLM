@@ -433,7 +433,7 @@ test('POST /api/v1/routines/:id/run-now fires immediately via the shared schedul
   const fired: string[] = []
   const scheduler = new RoutineScheduler({ store: db, now: () => new Date(), runRoutine: async (r) => { fired.push(r.id); return 'ok' } })
   const app2 = new Hono()
-  registerRoutineRoutes(app2, { db, routineScheduler: scheduler } as unknown as Deps)
+  registerRoutineRoutes(app2, { db, routineScheduler: scheduler, store: { snapshot: () => ({ daemon: { experimental: { routines: true } } }) } } as unknown as Deps)
 
   const res = await app2.request(`/api/v1/routines/${created.id}/run-now`, { method: 'POST' })
   assert.equal(res.status, 202)
@@ -446,9 +446,28 @@ test('POST /api/v1/routines/:id/run-now on a pending_confirmation routine return
   const created = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', agentId: 'a' })
   const scheduler = new RoutineScheduler({ store: db, now: () => new Date(), runRoutine: async () => 'ok' })
   const app2 = new Hono()
-  registerRoutineRoutes(app2, { db, routineScheduler: scheduler } as unknown as Deps)
+  registerRoutineRoutes(app2, { db, routineScheduler: scheduler, store: { snapshot: () => ({ daemon: { experimental: { routines: true } } }) } } as unknown as Deps)
   const res = await app2.request(`/api/v1/routines/${created.id}/run-now`, { method: 'POST' })
   assert.equal(res.status, 409)
+})
+
+// Kill switch: matches POST /api/v1/routines' own experimental-flag check, but for a routine
+// that was already armed BEFORE the flag was turned off — the scenario the create-time gate
+// alone does nothing for.
+test('POST /api/v1/routines/:id/run-now refuses to trigger an already-armed routine while experimental.routines is off', async () => {
+  const { db } = testApp({ routinesEnabled: false })
+  const created = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', agentId: 'a' })
+  db.confirmRoutine(created.id, '2099-01-01T00:00:00.000Z')
+  const fired: string[] = []
+  const scheduler = new RoutineScheduler({ store: db, now: () => new Date(), runRoutine: async (r) => { fired.push(r.id); return 'ok' } })
+  const app2 = new Hono()
+  registerRoutineRoutes(app2, { db, routineScheduler: scheduler, store: { snapshot: () => ({ daemon: { experimental: { routines: false } } }) } } as unknown as Deps)
+  const res = await app2.request(`/api/v1/routines/${created.id}/run-now`, { method: 'POST' })
+  assert.equal(res.status, 403)
+  const problem = (await res.json()) as { error: { code: string } }
+  assert.equal(problem.error.code, 'routines_disabled')
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(fired, [], 'nothing should have run')
 })
 
 test('POST /api/v1/routines/:id/run-now returns 503 when no scheduler is wired', async () => {
@@ -463,7 +482,7 @@ test('POST /api/v1/routines/:id/run-now on an unknown routine returns 404', asyn
   const { db } = testApp()
   const scheduler = new RoutineScheduler({ store: db, now: () => new Date(), runRoutine: async () => 'ok' })
   const app2 = new Hono()
-  registerRoutineRoutes(app2, { db, routineScheduler: scheduler } as unknown as Deps)
+  registerRoutineRoutes(app2, { db, routineScheduler: scheduler, store: { snapshot: () => ({ daemon: { experimental: { routines: true } } }) } } as unknown as Deps)
   const res = await app2.request('/api/v1/routines/missing/run-now', { method: 'POST' })
   assert.equal(res.status, 404)
 })
@@ -622,7 +641,7 @@ test('POST /api/v1/routines/:id/run-now on a code routine from a non-host device
   const d = {
     db,
     store: {
-      snapshot: () => ({ daemon: { lanBind: true, requireApiKey: false }, apiKeys }),
+      snapshot: () => ({ daemon: { lanBind: true, requireApiKey: false, experimental: { routines: true } }, apiKeys }),
       update: (fn: (cfg: { apiKeys: typeof apiKeys }) => void) => fn({ apiKeys }),
     },
   } as unknown as Deps
@@ -640,7 +659,7 @@ test('POST /api/v1/routines/:id/run-now on a code routine from a non-host device
 test('POST /api/v1/routines/:id/run-now on a code routine from the host (loopback-only bind) needs no key (I2)', async () => {
   const db = new ConversationStore(mkdtempSync(join(tmpdir(), 'routine-routes-test-')))
   const app = new Hono()
-  const d = { db, store: { snapshot: () => ({ daemon: { lanBind: false, requireApiKey: false }, apiKeys: [] }) } } as unknown as Deps
+  const d = { db, store: { snapshot: () => ({ daemon: { lanBind: false, requireApiKey: false, experimental: { routines: true } }, apiKeys: [] }) } } as unknown as Deps
   const routine = db.createRoutine({
     flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 },
     modelKey: 'm', workspacePath: 'D:/repo', codingAgent: 'pi',

@@ -434,6 +434,9 @@ const routineScheduler = new RoutineScheduler({
   store: db,
   now: () => new Date(),
   runRoutine: (routine, run) => executeRoutine(deps, routine, run),
+  // Kill switch (Settings → Experimental): a live getter, not a one-time snapshot, so flipping
+  // the flag takes effect on the very next tick with no daemon restart.
+  isRoutinesEnabled: () => store.snapshot().daemon.experimental.routines,
 })
 deps.routineScheduler = routineScheduler
 routineScheduler.start()

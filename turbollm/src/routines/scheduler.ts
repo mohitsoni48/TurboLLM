@@ -44,6 +44,17 @@ export interface RoutineSchedulerDeps {
    *  comment. */
   runRoutine: (routine: Routine, run: RoutineRun) => Promise<RoutineRunStatus>
   tickIntervalMs?: number
+  /** Live check for `daemon.experimental.routines` (config.ts) — a getter, not a snapshot value,
+   *  since Settings → Experimental can flip it without a restart. Consulted at the top of both
+   *  `tick()` and `runNow()` so turning the feature off is a genuine kill switch: no due routine
+   *  fires automatically, and a manual/tool-triggered run-now is refused too. Confirming, pausing,
+   *  resuming and editing a routine are all left alone — none of them execute anything by
+   *  themselves, and a routine armed while disabled simply sits there until the flag is back on,
+   *  the same as a routine that came due while the daemon was merely busy with a longer-running
+   *  fire (see `flaggedOverlap`'s doc comment for that same "stays due, fires on the next tick
+   *  that can take it" shape). Defaults to always-enabled so every pre-existing test/call site
+   *  that doesn't know about this experimental gate keeps its exact previous behavior. */
+  isRoutinesEnabled?: () => boolean
 }
 
 const DEFAULT_TICK_INTERVAL_MS = 30_000
@@ -118,6 +129,11 @@ export class RoutineScheduler {
   }
 
   async tick(): Promise<void> {
+    // Kill switch: while Routines is disabled, no due routine fires — not even a code-flavor one
+    // that was armed before the flag was turned off. `next_fire_at` is left untouched, so a
+    // routine that comes due mid-disable simply stays due and fires on the first tick after
+    // re-enabling, same "stays due until a tick can take it" shape as an overlapping fire.
+    if (this.deps.isRoutinesEnabled?.() === false) return
     const now = this.deps.now()
     for (const r of this.deps.store.listDueRoutines(now.toISOString())) {
       if (this.inFlight.has(r.id)) {
@@ -231,7 +247,8 @@ export class RoutineScheduler {
    *  proceeds in the background exactly like a normal tick's fire. A run that parks awaiting
    *  approval shares the same `inFlight` guard (and the same `releaseParked()` exit) a tick-fired
    *  parked run does — nothing about the concurrency fix cares which path started the fire. */
-  runNow(routineId: string): { ok: true } | { ok: false; reason: 'not_found' | 'not_confirmed' | 'already_running' } {
+  runNow(routineId: string): { ok: true } | { ok: false; reason: 'not_found' | 'not_confirmed' | 'already_running' | 'routines_disabled' } {
+    if (this.deps.isRoutinesEnabled?.() === false) return { ok: false, reason: 'routines_disabled' }
     const routine = this.deps.store.getRoutine(routineId)
     if (!routine) return { ok: false, reason: 'not_found' }
     if (routine.status === 'pending_confirmation') return { ok: false, reason: 'not_confirmed' }

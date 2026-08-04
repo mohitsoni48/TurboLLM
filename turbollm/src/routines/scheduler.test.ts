@@ -254,6 +254,61 @@ test('runNow rejects an unknown routine id', () => {
   assert.deepEqual(scheduler.runNow('missing'), { ok: false, reason: 'not_found' })
 })
 
+// Kill switch (Settings → Experimental, daemon.experimental.routines): turning Routines off must
+// stop an already-armed routine from firing, not just block new ones from being created —
+// covers both the unattended tick() path and a manual/tool-triggered run-now.
+test('tick does not fire a due routine while isRoutinesEnabled reports false', async () => {
+  const store = freshStore()
+  const r = store.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', agentId: 'a' })
+  store.confirmRoutine(r.id, '2020-01-01T00:00:00.000Z')
+  const fired: string[] = []
+  const now = new Date('2026-08-01T10:00:00.000Z')
+  const scheduler = new RoutineScheduler({
+    store, now: () => now, runRoutine: async (routine) => { fired.push(routine.id); return 'ok' },
+    isRoutinesEnabled: () => false,
+  })
+  await scheduler.tick()
+  await flush()
+  assert.deepEqual(fired, [], 'a due routine must not fire while the experimental flag is off')
+  assert.equal(store.listRoutineRuns(r.id).length, 0, 'no run row should be created either')
+})
+
+test('tick resumes firing due routines once isRoutinesEnabled reports true again', async () => {
+  const store = freshStore()
+  const r = store.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', agentId: 'a' })
+  store.confirmRoutine(r.id, '2020-01-01T00:00:00.000Z')
+  const fired: string[] = []
+  const now = new Date('2026-08-01T10:00:00.000Z')
+  let enabled = false
+  const scheduler = new RoutineScheduler({
+    store, now: () => now, runRoutine: async (routine) => { fired.push(routine.id); return 'ok' },
+    isRoutinesEnabled: () => enabled,
+  })
+  await scheduler.tick()
+  await flush()
+  assert.deepEqual(fired, [], 'disabled: nothing fires')
+  enabled = true
+  await scheduler.tick() // next_fire_at was never advanced while disabled, so the routine is still due
+  await flush()
+  assert.deepEqual(fired, [r.id], 'the same routine fires on the first tick after re-enabling')
+})
+
+test('runNow rejects with routines_disabled while isRoutinesEnabled reports false', () => {
+  const store = freshStore()
+  const r = store.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', agentId: 'a' })
+  store.confirmRoutine(r.id, '2099-01-01T00:00:00.000Z')
+  const scheduler = new RoutineScheduler({ store, now: () => new Date(), runRoutine: async () => 'ok', isRoutinesEnabled: () => false })
+  assert.deepEqual(scheduler.runNow(r.id), { ok: false, reason: 'routines_disabled' })
+})
+
+test('runNow is unaffected when isRoutinesEnabled is omitted (every pre-existing call site)', async () => {
+  const store = freshStore()
+  const r = store.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', agentId: 'a' })
+  store.confirmRoutine(r.id, '2099-01-01T00:00:00.000Z')
+  const scheduler = new RoutineScheduler({ store, now: () => new Date(), runRoutine: async () => 'ok' })
+  assert.deepEqual(scheduler.runNow(r.id), { ok: true })
+})
+
 test('runNow creates a run row, just like a normal tick fire, so a manual trigger shows up in run history', async () => {
   const store = freshStore()
   const r = store.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', agentId: 'a' })
