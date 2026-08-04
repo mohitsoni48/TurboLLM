@@ -207,6 +207,106 @@ test('once: the kill switch does not spend the claim either', () => {
   }
 })
 
+// ── error (telemetry-review follow-up — previously never wired to anything) ──
+
+test('error: requires full level, not just anon', () => {
+  const dir = tempDir()
+  try {
+    makeEmitter(dir, 'anon').emitter.error('engine_crash')
+    assert.deepEqual(names(dir), [], 'anon must not send crash diagnostics')
+
+    makeEmitter(dir, 'full').emitter.error('engine_crash')
+    assert.deepEqual(names(dir), ['error'])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('error: NOT once-only — every crash after the first is still real data', () => {
+  const dir = tempDir()
+  try {
+    const { emitter } = makeEmitter(dir, 'full')
+    emitter.error('engine_crash')
+    emitter.error('cuda_oom')
+    assert.equal(names(dir).length, 2, 'unlike firstUse/once, repeats must not be deduped')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// ── useFeature / flushDailyUsage (feature_used_daily, telemetry-review follow-up) ──
+
+test('useFeature: does not emit on first use — nothing to roll over yet', () => {
+  const dir = tempDir()
+  try {
+    const { emitter } = makeEmitter(dir, 'anon', '2026-07-29')
+    emitter.useFeature('chat')
+    emitter.useFeature('chat')
+    assert.deepEqual(names(dir), [], 'same-day usage has nothing to roll over until the day changes')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('useFeature: rolls over a bucketed count for the previous day once the day changes', () => {
+  const dir = tempDir()
+  try {
+    const { emitter } = makeEmitter(dir, 'anon', '2026-07-29')
+    for (let i = 0; i < 4; i++) emitter.useFeature('chat') // 4 uses on day 1
+
+    const { emitter: tomorrow } = makeEmitter(dir, 'anon', '2026-07-30')
+    tomorrow.useFeature('chat') // first use on day 2 triggers the rollover
+    const events = readQueue(dir).map((q) => q.event as { event: string; payload?: Record<string, unknown> })
+    const rolled = events.filter((e) => e.event === 'feature_used_daily')
+    assert.equal(rolled.length, 1)
+    assert.deepEqual(rolled[0].payload, { feature: 'chat', countBucket: '2-5' }, '4 uses buckets to 2-5, never the raw count')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('useFeature: consent off does not spend a count — same reasoning as firstUse', () => {
+  const dir = tempDir()
+  try {
+    makeEmitter(dir, 'off', '2026-07-29').emitter.useFeature('chat')
+    const { emitter: tomorrow } = makeEmitter(dir, 'anon', '2026-07-30')
+    tomorrow.useFeature('chat')
+    assert.deepEqual(names(dir), [], 'no usage was ever recorded while off, so there is nothing to roll over')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('flushDailyUsage: rolls over a feature used only on the last active day', () => {
+  const dir = tempDir()
+  try {
+    const { emitter } = makeEmitter(dir, 'anon', '2026-07-29')
+    emitter.useFeature('code')
+    emitter.useFeature('code')
+    assert.deepEqual(names(dir), [], 'nothing rolled over yet — code was never used again')
+
+    const { emitter: tomorrow } = makeEmitter(dir, 'anon', '2026-07-30')
+    tomorrow.flushDailyUsage()
+    const events = readQueue(dir).map((q) => q.event as { event: string; payload?: Record<string, unknown> })
+    const rolled = events.filter((e) => e.event === 'feature_used_daily')
+    assert.deepEqual(rolled[0].payload, { feature: 'code', countBucket: '2-5' })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('flushDailyUsage: nothing to flush on the same day is a no-op', () => {
+  const dir = tempDir()
+  try {
+    const { emitter } = makeEmitter(dir, 'anon', '2026-07-29')
+    emitter.useFeature('chat')
+    emitter.flushDailyUsage()
+    assert.deepEqual(names(dir), [])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('emit: an unwritable data dir never throws', () => {
   const { emitter } = makeEmitter('\0invalid', 'anon')
   assert.doesNotThrow(() => emitter.emit('app_first_run'))

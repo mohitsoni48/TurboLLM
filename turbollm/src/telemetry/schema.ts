@@ -60,6 +60,15 @@ export const FAIL_REASONS = [
   'oom', 'no_engine', 'bad_gguf', 'unsupported_arch', 'timeout', 'cancelled', 'other',
 ] as const
 
+/** Why provisioning a prebuilt engine failed (`onboarding_step: engine_install`
+ *  only — see `classifyProvisionFailure`). A separate enum from `FAIL_REASONS`:
+ *  installing an engine archive and loading a model fail in different ways
+ *  (network/asset/platform vs. oom/arch/corruption), so the two vocabularies
+ *  don't overlap much and shouldn't be merged into one. */
+export const PROVISION_FAIL_REASONS = [
+  'network', 'no_asset', 'unsupported_platform', 'disk_full', 'permission_denied', 'other',
+] as const
+
 /** Usage counts are bucketed, never raw: a raw count is a behavioural fingerprint. */
 export const COUNT_BUCKETS = ['1', '2-5', '6-20', '21-100', '100+'] as const
 
@@ -163,7 +172,14 @@ const HW_SPEC: Record<string, FieldSpec> = {
 }
 
 const PAYLOAD_SPECS: Record<string, Record<string, FieldSpec>> = {
-  onboarding_step: { step: { enum: ONBOARDING_STEPS }, outcome: { enum: OUTCOMES } },
+  // `failReason` is optional and, today, only ever sent for `step: 'engine_install'`
+  // (classified by `classifyProvisionFailure`, PROVISION_FAIL_REASONS) — mirrors
+  // `model_first_load.failReason`'s own "optional, only present on a real failure"
+  // shape. Not step-conditional at the schema level (this validator is flat per
+  // event name, not per payload value) — enforced by convention at the one call
+  // site that sends it (cli.ts's `provision.onSettled`), same as elsewhere in this
+  // file's payload specs.
+  onboarding_step: { step: { enum: ONBOARDING_STEPS }, outcome: { enum: OUTCOMES }, failReason: { enum: PROVISION_FAIL_REASONS, optional: true } },
   model_first_load: { outcome: { enum: OUTCOMES }, failReason: { enum: FAIL_REASONS, optional: true } },
   feature_first_use: { feature: { enum: FEATURES } },
   feature_used_daily: { feature: { enum: FEATURES }, countBucket: { enum: COUNT_BUCKETS } },

@@ -52,25 +52,36 @@ export class BuildState {
   }
 
   /** Optional observer for the terminal outcome, wired in cli.ts (ADR-299
-   *  `onboarding_step`). A plain callback so this module keeps no telemetry
-   *  dependency; the error STRING is deliberately not passed, because the only
-   *  consumer may never send free text. */
-  onSettled?: (ok: boolean) => void
+   *  `onboarding_step` / ADR-327 `error`). A plain callback so this module keeps
+   *  no telemetry dependency; the error STRING is deliberately never passed,
+   *  because the only consumer may never send free text. Three outcomes, not
+   *  two — `cancelled` is distinct from `fail` (PR #105 review finding): a
+   *  build the user deliberately aborted must not be reported as a crash. */
+  onSettled?: (outcome: 'ok' | 'fail' | 'cancelled') => void
 
   done(): void {
     // Keep the log visible but mark inactive + terminal so the UI can show "Built".
     this.s = { ...this.s, active: false, phase: 'done', error: null }
-    this.settle(true)
+    this.settle('ok')
   }
 
   fail(error: string): void {
     this.s = { ...this.s, active: false, phase: 'error', error }
-    this.settle(false)
+    this.settle('fail')
   }
 
-  private settle(ok: boolean): void {
+  /** A deliberate user cancellation. Same terminal UI shape as `fail()` (phase
+   *  'error', so the UI still shows the run ended and why) — only the observer
+   *  outcome differs. A cancel is a choice, not a failure, and must not be
+   *  reported as one. */
+  cancel(message: string): void {
+    this.s = { ...this.s, active: false, phase: 'error', error: message }
+    this.settle('cancelled')
+  }
+
+  private settle(outcome: 'ok' | 'fail' | 'cancelled'): void {
     try {
-      this.onSettled?.(ok)
+      this.onSettled?.(outcome)
     } catch {
       // Observers are advisory — they must not affect a build's outcome.
     }

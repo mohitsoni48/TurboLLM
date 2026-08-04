@@ -21,7 +21,10 @@ export interface LoadError {
 }
 
 /** Substrings that mean "we ran out of memory", across the backends we ship.
- *  Lowercased before matching. */
+ *  Lowercased before matching. Widened (telemetry-review follow-up) with more
+ *  vendor/runtime phrasings — `failReason: 'other'` was absorbing half of all
+ *  real failures, and these are legitimate, well-known error strings for the
+ *  backends this product actually ships, not guesses. */
 const OOM_SIGNS = [
   'out of memory',
   'outofmemory',
@@ -30,11 +33,39 @@ const OOM_SIGNS = [
   'memory allocation of size',
   'cudamalloc',
   'insufficient memory',
+  'not enough memory',
+  'unable to allocate',
+  'bad_alloc',
+  'out of vram',
+  'vram allocation failed',
+  'cuda_error_out_of_memory',
+  'resource_exhausted',
 ]
 
-const ARCH_SIGNS = ['unknown model architecture', 'unsupported model architecture', 'unsupported architecture']
+const ARCH_SIGNS = [
+  'unknown model architecture',
+  'unsupported model architecture',
+  'unsupported architecture',
+  'architecture not supported',
+  'unknown architecture',
+]
 
-const GGUF_SIGNS = ['invalid magic', 'error loading model', 'failed to load model', 'gguf_init', 'corrupt']
+/** Corruption/truncation signs — includes an incomplete or interrupted
+ *  download, which manifests as a gguf that fails to parse the same way a
+ *  genuinely corrupt one does. */
+const GGUF_SIGNS = [
+  'invalid magic',
+  'error loading model',
+  'failed to load model',
+  'gguf_init',
+  'corrupt',
+  'unexpected end of file',
+  'unexpectedly reached end of file',
+  'truncated',
+  'failed to read tensor',
+  'wrong number of tensors',
+  'tensor not found',
+]
 
 /** Classify a load failure. Never throws; never returns anything but an enum
  *  member. */
@@ -86,5 +117,73 @@ export interface BenchProbeOutcome {
 export function classifyBenchFailure(results: readonly BenchProbeOutcome[]): string {
   if (results.some((r) => r.outcome === 'oom')) return 'oom'
   if (results.some((r) => r.outcome === 'timeout')) return 'timeout'
+  return 'other'
+}
+
+/**
+ * Classify an engine failure into an `ERROR_FINGERPRINTS` member (`error`
+ * event, ADR-299 Decision 6 / the telemetry-review follow-up that added it).
+ *
+ * Distinct purpose from {@link classifyLoadFailure}: that function feeds the
+ * once-ever `model_first_load` milestone; this one feeds the ongoing `error`
+ * event, which is meant to fire every time an engine dies, not just on an
+ * install's first attempt. Reuses the same sign lists so the two classifiers
+ * cannot silently drift into disagreeing about what an OOM message looks like.
+ *
+ * `engine_crash` is the deliberate fallback for `engine_exited`/
+ * `engine_spawn_failed` codes with no more specific signal recognised — we DO
+ * know structurally that the process died, so `other` would under-describe it.
+ */
+export function classifyEngineErrorFingerprint(err: LoadError | null | undefined): string {
+  if (!err) return 'other'
+
+  if (err.code === 'readiness_timeout') return 'engine_start_timeout'
+  if (err.code === 'model_load_failed') return 'model_load_failed'
+
+  const haystack = [err.message ?? '', ...(err.logTail ?? [])].join('\n').toLowerCase()
+
+  if (OOM_SIGNS.some((s) => haystack.includes(s))) return 'cuda_oom'
+  if (ARCH_SIGNS.some((s) => haystack.includes(s))) return 'model_load_failed'
+  if (GGUF_SIGNS.some((s) => haystack.includes(s))) return 'model_load_failed'
+
+  if (err.code === 'engine_exited' || err.code === 'engine_spawn_failed') return 'engine_crash'
+  return 'other'
+}
+
+/** Substrings for provisioning (engine install) failures — a download/extract
+ *  of a prebuilt binary, distinct from both a model load and a from-source
+ *  build. Lowercased before matching. */
+const NETWORK_SIGNS = [
+  'enotfound', 'econnreset', 'econnrefused', 'etimedout', 'fetch failed',
+  'network', 'check your connection',
+]
+const NO_ASSET_SIGNS = ['404', 'no downloadable binary', 'no release asset', 'not found in']
+const UNSUPPORTED_PLATFORM_SIGNS = ['no prebuilt binary for this operating system', 'unsupported platform', 'unsupported architecture']
+const DISK_FULL_SIGNS = ['enospc', 'no space left']
+const PERMISSION_SIGNS = ['eacces', 'eperm', 'permission denied', 'access is denied']
+
+/**
+ * Classify why provisioning a prebuilt engine failed, into a
+ * `PROVISION_FAIL_REASONS` member (`onboarding_step: engine_install`,
+ * ADR-299 amended by the telemetry-review follow-up).
+ *
+ * Mirrors {@link classifyLoadFailure}'s boundary contract exactly: the input
+ * is `ProvisionState.fail()`'s free-form message (built from `Error#message`
+ * at call sites across `api/routes.ts`/`engines/seed.ts`/`engines/update-
+ * apply.ts`), the output is always an enum member, and classification happens
+ * INSIDE `ProvisionState` — never the raw string — so `onSettled` observers
+ * (telemetry included) still never see free text, preserving the invariant
+ * both `ProvisionState` and `BuildState` document on `onSettled`.
+ */
+export function classifyProvisionFailure(message: string | null | undefined): string {
+  if (!message) return 'other'
+  const haystack = message.toLowerCase()
+
+  if (UNSUPPORTED_PLATFORM_SIGNS.some((s) => haystack.includes(s))) return 'unsupported_platform'
+  if (NO_ASSET_SIGNS.some((s) => haystack.includes(s))) return 'no_asset'
+  if (DISK_FULL_SIGNS.some((s) => haystack.includes(s))) return 'disk_full'
+  if (PERMISSION_SIGNS.some((s) => haystack.includes(s))) return 'permission_denied'
+  if (NETWORK_SIGNS.some((s) => haystack.includes(s))) return 'network'
+
   return 'other'
 }
