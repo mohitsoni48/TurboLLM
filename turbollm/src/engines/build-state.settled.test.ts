@@ -58,3 +58,22 @@ test('ProvisionState.onSettled: reports both outcomes and survives a throwing ob
   }
   assert.doesNotThrow(() => q.done())
 })
+
+// failReason (telemetry-review follow-up): fail()'s raw string must be classified
+// BEFORE it reaches onSettled — the observer may never see free text (same
+// invariant the doc comment on onSettled states).
+test('ProvisionState.onSettled: fail() classifies the error into a failReason enum, never passes the raw string', () => {
+  const seen: Array<{ ok: boolean; failReason?: string }> = []
+  const p = new ProvisionState()
+  p.onSettled = (ok, failReason) => seen.push({ ok, failReason })
+  p.fail('404 fetching release asset')
+  assert.deepEqual(seen, [{ ok: false, failReason: 'no_asset' }])
+})
+
+test('ProvisionState.onSettled: done() reports ok with no failReason', () => {
+  const seen: Array<{ ok: boolean; failReason?: string }> = []
+  const p = new ProvisionState()
+  p.onSettled = (ok, failReason) => seen.push({ ok, failReason })
+  p.done()
+  assert.deepEqual(seen, [{ ok: true, failReason: undefined }])
+})

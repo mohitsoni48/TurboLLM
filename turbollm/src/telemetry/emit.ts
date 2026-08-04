@@ -16,6 +16,7 @@ import { enqueue } from './queue'
 import { claimOnce } from './ledger'
 import { telemetryDisabled } from './disabled'
 import { TELEMETRY_SCHEMA_VERSION, type EventName } from './schema'
+import { recordFeatureUse, flushStaleDailyUsage } from './daily-usage'
 
 /** Just enough of ConfigStore for the emitter — kept structural so tests need
  *  no real config file. */
@@ -99,6 +100,43 @@ export class Emitter {
   dailyActive(): void {
     if (!this.canSend('daily_active')) return
     if (this.claim(`daily:${this.today()}`)) this.emit('daily_active')
+  }
+
+  /**
+   * Count one use of `feature` toward today's tally, emitting a bucketed
+   * `feature_used_daily` for the previous day the moment the calendar day
+   * rolls over. Consent is checked BEFORE any count is recorded — same
+   * reasoning as `firstUse` above (see its doc comment): usage while
+   * telemetry is off must never silently contribute to a count reported
+   * after the user opts in later.
+   */
+  useFeature(feature: string): void {
+    if (!this.canSend('feature_used_daily')) return
+    const rolled = recordFeatureUse(this.o.dataDir, feature, this.today())
+    if (rolled) this.emit('feature_used_daily', { feature, countBucket: rolled.bucket })
+  }
+
+  /**
+   * Roll over any feature whose tally is from a day earlier than today.
+   * Called periodically (cli.ts, alongside the queue flush) so a feature
+   * used only on a user's LAST active day still gets reported, instead of
+   * waiting indefinitely for a next use of that same feature.
+   */
+  flushDailyUsage(): void {
+    if (!this.canSend('feature_used_daily')) return
+    for (const { feature, bucket } of flushStaleDailyUsage(this.o.dataDir, this.today())) {
+      this.emit('feature_used_daily', { feature, countBucket: bucket })
+    }
+  }
+
+  /**
+   * Emit `error` — full level only (`REQUIRES_FULL` above), and deliberately
+   * NOT once-only: unlike `model_first_load`'s single most-valuable-attempt
+   * signal, every crash after the first is still a real data point (ADR-299's
+   * "what is failing?" journey question, previously never wired to anything).
+   */
+  error(fingerprint: string): void {
+    this.emit('error', { fingerprint })
   }
 
   /**

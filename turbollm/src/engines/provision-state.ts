@@ -2,6 +2,8 @@
 // /api/v1/status so the web UI can show a download/extract progress bar.
 // Single in-process holder; provisioning runs once at startup.
 
+import { classifyProvisionFailure } from '../telemetry/classify'
+
 export interface ProvisionStatus {
   active: boolean
   phase: 'idle' | 'downloading' | 'extracting' | 'error'
@@ -32,9 +34,10 @@ export class ProvisionState {
   }
 
   /** Optional observer for the terminal outcome, wired in cli.ts (ADR-299
-   *  `onboarding_step`). The error string is deliberately not passed — the only
-   *  consumer may never transmit free text. */
-  onSettled?: (ok: boolean) => void
+   *  `onboarding_step`). The raw error STRING is deliberately never passed —
+   *  only `failReason`, a `classifyProvisionFailure` enum member, so the only
+   *  consumer still never sees free text even though it now learns *why*. */
+  onSettled?: (ok: boolean, failReason?: string) => void
 
   done(): void {
     this.s = { active: false, phase: 'idle', backend: '', pct: 0, part: 1, parts: 1, error: null }
@@ -43,12 +46,12 @@ export class ProvisionState {
 
   fail(error: string): void {
     this.s = { active: false, phase: 'error', backend: this.s.backend, pct: 0, part: 1, parts: 1, error }
-    this.settle(false)
+    this.settle(false, classifyProvisionFailure(error))
   }
 
-  private settle(ok: boolean): void {
+  private settle(ok: boolean, failReason?: string): void {
     try {
-      this.onSettled?.(ok)
+      this.onSettled?.(ok, failReason)
     } catch {
       // Observers are advisory — they must not affect an engine install.
     }

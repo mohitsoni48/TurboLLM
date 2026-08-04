@@ -67,13 +67,20 @@ export function createApp(d: Deps): Hono {
   // Code always needs a key from a non-host device, even when the rest of the app is open.
   app.use('/api/v1/code/*', codeAuth(d))
 
-  // Feature-discovery telemetry (ADR-299). Runs AFTER the auth gates above, so
-  // a request that was rejected never counts as the user discovering anything.
-  // Only the path is inspected — never the body, never the query string — and
-  // the emitter itself decides whether consent permits recording it.
+  // Feature-discovery + feature-engagement telemetry (ADR-299, the latter's
+  // wiring added by the telemetry-review follow-up). Runs AFTER the auth gates
+  // above, so a request that was rejected never counts as the user discovering
+  // or using anything. Only the path is inspected — never the body, never the
+  // query string — and the emitter itself decides whether consent permits
+  // recording it. `firstUse` answers "did they ever discover this feature";
+  // `useFeature` answers "are they still using it" — deliberately both, since
+  // discovery data alone can't tell a one-time click from real engagement.
   app.use('*', async (c, next) => {
     const feature = d.telemetry ? featureForPath(c.req.path) : null
-    if (feature !== null) d.telemetry?.firstUse(feature)
+    if (feature !== null) {
+      d.telemetry?.firstUse(feature)
+      d.telemetry?.useFeature(feature)
+    }
     await next()
   })
 

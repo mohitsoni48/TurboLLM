@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { classifyLoadFailure, classifyBenchFailure } from './classify'
-import { FAIL_REASONS } from './schema'
+import { classifyLoadFailure, classifyBenchFailure, classifyEngineErrorFingerprint, classifyProvisionFailure } from './classify'
+import { FAIL_REASONS, ERROR_FINGERPRINTS, PROVISION_FAIL_REASONS } from './schema'
 
 function err(over: Partial<{ code: string; message: string; logTail: string[] }> = {}) {
   return { code: 'load_failed', message: '', exitCode: 1, logTail: [], ...over }
@@ -101,4 +101,83 @@ test('classifyBenchFailure: always returns a value from the enum', () => {
   for (const outcomes of [[{ outcome: 'oom' as const }], [{ outcome: 'crash' as const }], []]) {
     assert.ok((FAIL_REASONS as readonly string[]).includes(classifyBenchFailure(outcomes)))
   }
+})
+
+test('classifyLoadFailure: recognises the widened OOM/arch/corruption phrasings (telemetry-review follow-up)', () => {
+  assert.equal(classifyLoadFailure(err({ message: 'std::bad_alloc' })), 'oom')
+  assert.equal(classifyLoadFailure(err({ message: 'RuntimeError: CUDA_ERROR_OUT_OF_MEMORY' })), 'oom')
+  assert.equal(classifyLoadFailure(err({ message: 'model architecture not supported: mamba2' })), 'unsupported_arch')
+  assert.equal(classifyLoadFailure(err({ message: 'unexpectedly reached end of file' })), 'bad_gguf')
+  assert.equal(classifyLoadFailure(err({ message: 'failed to read tensor blk.0.attn_q.weight' })), 'bad_gguf')
+})
+
+test('classifyEngineErrorFingerprint: always returns a value from the enum', () => {
+  const inputs = [
+    err({ message: 'CUDA error: out of memory' }),
+    err({ code: 'readiness_timeout' }),
+    err({ code: 'model_load_failed' }),
+    err({ code: 'engine_exited' }),
+    err({ code: 'engine_spawn_failed' }),
+    err({ message: 'something nobody has seen before' }),
+    null,
+  ]
+  for (const e of inputs) {
+    assert.ok(
+      (ERROR_FINGERPRINTS as readonly string[]).includes(classifyEngineErrorFingerprint(e)),
+      `classified value must be in the enum, got ${classifyEngineErrorFingerprint(e)}`,
+    )
+  }
+})
+
+test('classifyEngineErrorFingerprint: maps OOM, timeout, and python load failures to their own fingerprints', () => {
+  assert.equal(classifyEngineErrorFingerprint(err({ message: 'CUDA error: out of memory' })), 'cuda_oom')
+  assert.equal(classifyEngineErrorFingerprint(err({ code: 'readiness_timeout' })), 'engine_start_timeout')
+  assert.equal(classifyEngineErrorFingerprint(err({ code: 'model_load_failed', message: 'traceback...' })), 'model_load_failed')
+  assert.equal(classifyEngineErrorFingerprint(err({ message: 'invalid magic characters in gguf file' })), 'model_load_failed')
+})
+
+test('classifyEngineErrorFingerprint: an unexplained process exit is engine_crash, not other', () => {
+  // We DO know structurally that the process died — 'other' would under-describe it.
+  assert.equal(classifyEngineErrorFingerprint(err({ code: 'engine_exited', message: 'The engine process exited unexpectedly.' })), 'engine_crash')
+  assert.equal(classifyEngineErrorFingerprint(err({ code: 'engine_spawn_failed', message: 'ENOENT' })), 'engine_crash')
+})
+
+test('classifyEngineErrorFingerprint: a null error is other', () => {
+  assert.equal(classifyEngineErrorFingerprint(null), 'other')
+})
+
+test('classifyProvisionFailure: always returns a value from the enum', () => {
+  const inputs = [
+    'TurboQuant has no prebuilt binary for this operating system in its latest release.',
+    '404 fetching release asset',
+    'Could not download a default engine. Check your connection or add one manually.',
+    'ENOSPC: no space left on device',
+    'EACCES: permission denied',
+    'something nobody has seen before',
+    null,
+    undefined,
+  ]
+  for (const m of inputs) {
+    assert.ok(
+      (PROVISION_FAIL_REASONS as readonly string[]).includes(classifyProvisionFailure(m)),
+      `classified value must be in the enum, got ${classifyProvisionFailure(m)}`,
+    )
+  }
+})
+
+test('classifyProvisionFailure: recognises real messages seen at ProvisionState.fail() call sites', () => {
+  assert.equal(classifyProvisionFailure('TurboQuant has no prebuilt binary for this operating system in its latest release.'), 'unsupported_platform')
+  assert.equal(classifyProvisionFailure('KoboldCpp has no prebuilt binary for this operating system/architecture in its latest release.'), 'unsupported_platform')
+  assert.equal(classifyProvisionFailure('llamafile has no downloadable binary in its latest release.'), 'no_asset')
+  assert.equal(classifyProvisionFailure('404 fetching release asset'), 'no_asset')
+  assert.equal(classifyProvisionFailure('Could not download a default engine. Check your connection or add one manually.'), 'network')
+  assert.equal(classifyProvisionFailure('Could not install the vulkan engine: fetch failed'), 'network')
+  assert.equal(classifyProvisionFailure('Could not install the cuda engine: ENOSPC: no space left on device'), 'disk_full')
+  assert.equal(classifyProvisionFailure('Could not install the cuda engine: EACCES: permission denied'), 'permission_denied')
+})
+
+test('classifyProvisionFailure: an unrecognised or missing message is other, not a guess', () => {
+  assert.equal(classifyProvisionFailure('something nobody has seen before'), 'other')
+  assert.equal(classifyProvisionFailure(null), 'other')
+  assert.equal(classifyProvisionFailure(undefined), 'other')
 })

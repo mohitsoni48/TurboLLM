@@ -88,6 +88,43 @@ test('validateEvent: model_first_load takes an optional enum failReason', () => 
   assert.equal(validateEvent(validEvent({ event: 'model_first_load', payload: { outcome: 'ok' } })).ok, true)
 })
 
+test('validateEvent: onboarding_step takes an optional enum failReason (engine_install, telemetry-review follow-up)', () => {
+  assert.equal(
+    validateEvent(
+      validEvent({ event: 'onboarding_step', payload: { step: 'engine_install', outcome: 'fail', failReason: 'network' } }),
+    ).ok,
+    true,
+  )
+  assert.equal(
+    validateEvent(validEvent({ event: 'onboarding_step', payload: { step: 'engine_install', outcome: 'ok' } })).ok,
+    true,
+    'failReason is optional — an ok outcome need not carry one',
+  )
+  const r = validateEvent(
+    validEvent({ event: 'onboarding_step', payload: { step: 'engine_install', outcome: 'fail', failReason: 'oom' } }),
+  )
+  assert.equal(r.ok, false, "'oom' is a model-load reason, not a provisioning one — must not validate here")
+})
+
+test('validateEvent: error requires a known fingerprint', () => {
+  assert.equal(
+    validateEvent(validEvent({ event: 'error', payload: { fingerprint: 'engine_crash' } })).ok,
+    true,
+  )
+  const r = validateEvent(validEvent({ event: 'error', payload: { fingerprint: 'stack trace: at foo.ts:42' } }))
+  assert.equal(r.ok, false)
+  assert.match(r.reason, /fingerprint/)
+})
+
+test('validateEvent: feature_used_daily requires a known feature and a bucketed count, never a raw number', () => {
+  assert.equal(
+    validateEvent(validEvent({ event: 'feature_used_daily', payload: { feature: 'chat', countBucket: '6-20' } })).ok,
+    true,
+  )
+  const r = validateEvent(validEvent({ event: 'feature_used_daily', payload: { feature: 'chat', countBucket: 17 } }))
+  assert.equal(r.ok, false, 'a raw number must never validate as a countBucket')
+})
+
 test('validateEvent: model_first_load rejects a free-text failure message', () => {
   const r = validateEvent(
     validEvent({

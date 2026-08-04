@@ -46,7 +46,7 @@ import type { Deps } from './deps'
 import { TELEMETRY_ENV } from './telemetry/disabled'
 import { Emitter } from './telemetry/emit'
 import { reportModelLoad } from './telemetry/first-load'
-import { classifyLoadFailure } from './telemetry/classify'
+import { classifyLoadFailure, classifyEngineErrorFingerprint } from './telemetry/classify'
 import { claimOnce } from './telemetry/ledger'
 import { flush } from './telemetry/uploader'
 
@@ -380,6 +380,11 @@ manager.onLoadSettled = (ok, err) => {
     telemetry.emit('onboarding_step', { step: 'first_load', outcome })
   }
   reportModelLoad(store.dir(), telemetry, outcome, ok ? undefined : classifyLoadFailure(err))
+  // `error` (telemetry-review follow-up, previously never wired to anything):
+  // an ongoing crash signal, deliberately NOT once-only — every engine failure
+  // after the first is still real "what is failing?" data, unlike the
+  // once-ever model_first_load milestone above.
+  if (!ok) telemetry.error(classifyEngineErrorFingerprint(err))
 }
 // Auto-tune's sweep is a SEPARATE path to a first load (Manager.start(), not
 // .load()) — a user whose first real model interaction is "let auto-tune find
@@ -396,8 +401,27 @@ bench.telemetry = telemetry
 // `build.onSettled` used to emit an `engine_build` step here (ADR-323 removed it):
 // seedDefaultEngines only ever calls provision, never build, so building from source
 // is a later manual action and was never part of the onboarding path it was measuring.
-provision.onSettled = (ok) => telemetry.emit('onboarding_step', { step: 'engine_install', outcome: ok ? 'ok' : 'fail' })
-downloads.onSettled = (outcome) => telemetry.emit('onboarding_step', { step: 'model_download', outcome })
+// `failReason` (telemetry-review follow-up): ProvisionState now classifies its own
+// failure via `classifyProvisionFailure` before it ever reaches this observer — see
+// provision-state.ts's `fail()` — so this call site still never touches free text.
+provision.onSettled = (ok, failReason) =>
+  telemetry.emit('onboarding_step', { step: 'engine_install', outcome: ok ? 'ok' : 'fail', ...(failReason ? { failReason } : {}) })
+downloads.onSettled = (outcome) => {
+  telemetry.emit('onboarding_step', { step: 'model_download', outcome })
+  // `error` (telemetry-review follow-up): only one ERROR_FINGERPRINTS bucket exists
+  // for this ('download_failed'), so no text classification is needed here — a
+  // deliberate abandon (AbortError → 'cancelled') is a choice, not a failure, and
+  // must not count as one.
+  if (outcome === 'fail') telemetry.error('download_failed')
+}
+// `error` (telemetry-review follow-up): compiling an engine from source is a later,
+// manual, advanced-user action (ADR-323) — unlike engine_install/model_download it
+// was never part of the onboarding funnel, but a build failure is still a real
+// crash-adjacent signal worth the single 'build_failed' fingerprint. No onboarding_step
+// here, on purpose — see the ADR-323 comment above for why build isn't part of that funnel.
+build.onSettled = (ok) => {
+  if (!ok) telemetry.error('build_failed')
+}
 // Deferred so a slow or failing disk cannot delay the listen socket; unref'd so
 // it never holds the process open (ADR-009: telemetry is not a failure mode).
 setTimeout(() => {
@@ -414,6 +438,12 @@ setTimeout(() => {
 // scheduling of it. Re-reads the level fresh on every tick (not the value at
 // startup), so a mid-session opt-out is honoured on the very next flush.
 setInterval(() => void flush(store.dir(), store.snapshot().telemetry.level), 5 * 60_000).unref()
+// Daily-usage rollover (telemetry-review follow-up): rides the same interval as the
+// queue flush above. Without this, a feature used only on a user's LAST active day
+// would never roll over — `useFeature` only rolls a feature's tally over the next
+// time THAT SAME feature is used, which may never happen again for an install that
+// stops running. Same unref()/best-effort reasoning as the flush interval.
+setInterval(() => telemetry.flushDailyUsage(), 5 * 60_000).unref()
 // Cloud Launch (ADR-045/152): only wired when --tunnel is passed. Its mere presence
 // on Deps is what forces auth enforcement on tunneled traffic (see auth.ts lanAuth) —
 // absent entirely for the vast majority of runs that never asked for a tunnel.

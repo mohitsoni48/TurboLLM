@@ -249,6 +249,15 @@ export class BenchRunner {
       this.telemetry.emit('onboarding_step', { step: 'first_load', outcome })
     }
     reportModelLoad(this.store.dir(), this.telemetry, outcome, failReason)
+    // `error` (telemetry-review follow-up): mirrors cli.ts's onLoadSettled wiring —
+    // auto-tune is a separate path to a first load and must feed the ongoing crash
+    // signal too, not just the once-ever model_first_load milestone above. failReason
+    // here is a classifyBenchFailure() result ('oom'|'timeout'|'other'), a different
+    // vocabulary from classifyEngineErrorFingerprint's — mapped by hand since it's a
+    // small, fixed 3-way correspondence, not worth a shared classifier for.
+    if (outcome === 'fail') {
+      this.telemetry.error(failReason === 'oom' ? 'cuda_oom' : failReason === 'timeout' ? 'engine_start_timeout' : 'other')
+    }
   }
 
   /** Stop the engine — force-killed immediately when the run is cancelled (the user is actively
