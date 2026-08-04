@@ -579,6 +579,7 @@ interface RoutineRunRow {
   id: string; routine_id: string; status: string; skip_reason: string | null
   config_snapshot: string; pending_tool_call: string | null
   result: string | null; error: string | null; started_at: string; ended_at: string | null
+  conversation_id: string | null; code_session_id: string | null
 }
 
 function rowToRoutineRun(r: RoutineRunRow): RoutineRun {
@@ -593,6 +594,8 @@ function rowToRoutineRun(r: RoutineRunRow): RoutineRun {
     error: r.error ?? undefined,
     startedAt: r.started_at,
     endedAt: r.ended_at ?? undefined,
+    conversationId: r.conversation_id ?? undefined,
+    codeSessionId: r.code_session_id ?? undefined,
   }
 }
 
@@ -1110,6 +1113,17 @@ export class ConversationStore {
         CREATE INDEX IF NOT EXISTS idx_routine_runs_routine ON routine_runs(routine_id, started_at);
         PRAGMA user_version = 41;
       `)
+    }
+    // v42 (Routines: open a run as a real chat/Code session): a chat-flavor run already creates a
+    // full conversation (chat-runner.ts) and a code-flavor run already creates a full Code session
+    // (code-runner.ts) — both were previously un-lookup-able from the run row itself, so the only
+    // way to see what a run actually did was the flattened `result` text. Nullable/additive: every
+    // pre-existing run correctly decodes as "no linked session" (it genuinely has none — the id was
+    // never persisted), falling back to `result`.
+    if (v < 42) {
+      if (!this.hasColumn('routine_runs', 'conversation_id')) this.db.exec(`ALTER TABLE routine_runs ADD COLUMN conversation_id TEXT;`)
+      if (!this.hasColumn('routine_runs', 'code_session_id')) this.db.exec(`ALTER TABLE routine_runs ADD COLUMN code_session_id TEXT;`)
+      this.db.exec(`PRAGMA user_version = 42;`)
     }
   }
 
@@ -1950,7 +1964,7 @@ export class ConversationStore {
 
   updateRoutineRun(
     id: string,
-    patch: Partial<Pick<RoutineRun, 'status' | 'skipReason' | 'pendingToolCall' | 'result' | 'error' | 'endedAt'>>,
+    patch: Partial<Pick<RoutineRun, 'status' | 'skipReason' | 'pendingToolCall' | 'result' | 'error' | 'endedAt' | 'conversationId' | 'codeSessionId'>>,
   ): RoutineRun | null {
     const sets: string[] = []
     const params: P = { $id: id } as P
@@ -1960,6 +1974,8 @@ export class ConversationStore {
     if (patch.result !== undefined) { sets.push('result = $result'); params.$result = patch.result }
     if (patch.error !== undefined) { sets.push('error = $error'); params.$error = patch.error }
     if (patch.endedAt !== undefined) { sets.push('ended_at = $endedAt'); params.$endedAt = patch.endedAt }
+    if (patch.conversationId !== undefined) { sets.push('conversation_id = $conversationId'); params.$conversationId = patch.conversationId }
+    if (patch.codeSessionId !== undefined) { sets.push('code_session_id = $codeSessionId'); params.$codeSessionId = patch.codeSessionId }
     if (sets.length === 0) return this.getRoutineRun(id)
     this.db.prepare(`UPDATE routine_runs SET ${sets.join(', ')} WHERE id = $id`).run(params)
     return this.getRoutineRun(id)

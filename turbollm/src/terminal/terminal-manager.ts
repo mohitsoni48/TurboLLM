@@ -135,6 +135,13 @@ export interface TerminalSessionInfo {
    *  showing stale scrollback instead of relaunching — which is how a single failed launch used
    *  to strand a Code session permanently. */
   agentExited?: boolean
+  /** The launched agent CLI's own process exit code, when `turbollm launch` reported one
+   *  alongside `agentExited` (terminal-routes.ts's agent-exited endpoint) — undefined for any
+   *  older/other caller that doesn't send one, or before the agent has exited at all. Not used by
+   *  the terminal-agent UI itself (a human just watches the terminal); it exists so a caller that
+   *  spawned this terminal WITHOUT a human present (a scheduled claude_cli Routine fire,
+   *  cli-interactive-runner.ts) can tell success from failure without parsing rendered TUI text. */
+  exitCode?: number
 }
 
 /** How often cleanupIdle() sweeps for terminals past their TTL. Independent of the TTL itself
@@ -304,17 +311,27 @@ export class TerminalManager {
   }
 
   /** Record that the agent CLI in this Code session's terminal has exited (see
-   *  TerminalSessionInfo.agentExited). No-op when the session has no live terminal. */
-  markAgentExited(codeSessionId: string): void {
+   *  TerminalSessionInfo.agentExited). No-op when the session has no live terminal.
+   *  `exitCode` is optional (older/other callers may omit it) — see the field's own doc comment. */
+  markAgentExited(codeSessionId: string, exitCode?: number): void {
     const id = this.findByCodeSessionId(codeSessionId)
     if (!id) return
     const info = this.infoMap.get(id)
-    if (info) info.agentExited = true
+    if (info) {
+      info.agentExited = true
+      if (exitCode !== undefined) info.exitCode = exitCode
+    }
   }
 
   /** Whether this terminal's agent CLI has exited, leaving only a bare shell behind. */
   isAgentExited(terminalId: string): boolean {
     return this.infoMap.get(terminalId)?.agentExited === true
+  }
+
+  /** The exited agent CLI's own process exit code, if one was reported — see
+   *  TerminalSessionInfo.exitCode's own doc comment. */
+  getExitCode(terminalId: string): number | undefined {
+    return this.infoMap.get(terminalId)?.exitCode
   }
 
   /**

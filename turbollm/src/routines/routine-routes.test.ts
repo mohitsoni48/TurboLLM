@@ -29,20 +29,30 @@ function assertAtMostOneRunning(db: ConversationStore, routineId: string, messag
  *  which is always "local to the host", so the gate is a no-op — the default every
  *  pre-existing test here relies on. Set it true to simulate a LAN-exposed daemon, where a
  *  code-flavor routine must present a key. `hasKey` seeds RAW_KEY as a valid stored key. */
-function testApp(opts: { lanBind?: boolean; hasKey?: boolean } = {}): { app: Hono; db: ConversationStore } {
+function testApp(opts: { lanBind?: boolean; hasKey?: boolean; routinesEnabled?: boolean } = {}): { app: Hono; db: ConversationStore } {
   const db = new ConversationStore(mkdtempSync(join(tmpdir(), 'routine-routes-test-')))
   const app = new Hono()
   const apiKeys = opts.hasKey
     ? [{ id: 'k1', name: 'test', hash: RAW_KEY_HASH, prefix: RAW_KEY.slice(0, 12), createdAt: '', lastUsedAt: null }]
     : []
   // routine-routes.ts reads d.db plus (for the code-flavor gate) d.store/d.tunnel via
-  // auth.ts — safe to stub the rest of Deps for this route-level test.
+  // auth.ts — safe to stub the rest of Deps for this route-level test. `scanner` backs POST's
+  // modelKey-exists check — every 'm'/'qwen3-coder-32b' fixture in this file needs to be a real
+  // "model" here, or every create/update test would 400 on a check unrelated to what it's testing.
+  // `experimental.routines` defaults to true here (unlike production's off-by-default) so every
+  // pre-existing test in this file, which is exercising CRUD/scheduling behavior rather than the
+  // experimental gate itself, keeps working unchanged — the gate's own off-by-default behavior is
+  // covered by a dedicated test that passes `routinesEnabled: false` explicitly.
   const d = {
     db,
     store: {
-      snapshot: () => ({ daemon: { lanBind: opts.lanBind ?? false, requireApiKey: false }, apiKeys }),
+      snapshot: () => ({
+        daemon: { lanBind: opts.lanBind ?? false, requireApiKey: false, experimental: { routines: opts.routinesEnabled ?? true } },
+        apiKeys,
+      }),
       update: (fn: (cfg: { apiKeys: typeof apiKeys }) => void) => fn({ apiKeys }),
     },
+    scanner: { list: () => ({ models: [{ key: 'm', name: 'm' }, { key: 'qwen3-coder-32b', name: 'qwen3-coder-32b' }] }) },
   } as unknown as Deps
   registerRoutineRoutes(app, d)
   return { app, db }
@@ -68,6 +78,25 @@ test('POST /api/v1/routines creates a pending_confirmation routine', async () =>
   assert.equal(created.status, 'pending_confirmation')
 })
 
+// Routines is experimental, off by default (daemon.experimental.routines, config.ts) — this is
+// the REST-layer half of "hidden UI + can't be created from chat or code". Checked FIRST, before
+// even the code-flavor gate, so a disabled feature refuses a chat-flavor routine too, not just
+// code-flavor ones.
+test('POST /api/v1/routines refuses to create anything while experimental.routines is off', async () => {
+  const { app, db } = testApp({ routinesEnabled: false })
+  const res = await app.request('/api/v1/routines', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      flavor: 'chat', prompt: 'Summarize my inbox', scheduleDisplay: 'Runs daily at 9:00 AM',
+      scheduleRule: { kind: 'daily', hour: 9, minute: 0 }, modelKey: 'qwen3-coder-32b', agentId: 'agent-1',
+    }),
+  })
+  assert.equal(res.status, 403)
+  const problem = (await res.json()) as { error: { code: string } }
+  assert.equal(problem.error.code, 'routines_disabled')
+  assert.equal(db.listRoutines().length, 0, 'nothing should have been created')
+})
+
 test('POST /api/v1/routines rejects a code-flavor routine missing workspacePath', async () => {
   const { app } = testApp()
   const res = await app.request('/api/v1/routines', {
@@ -77,6 +106,37 @@ test('POST /api/v1/routines rejects a code-flavor routine missing workspacePath'
   assert.equal(res.status, 400)
   const problem = (await res.json()) as { error: { code: string } }
   assert.equal(problem.error.code, 'invalid_routine')
+})
+
+// A claude_cli session with no way to discover a real modelKey once created a routine with
+// modelKey: "gpt-4" — a real cloud model name, not anything in the library — which could never
+// fire successfully. This is the server-side backstop: reject it at create time instead.
+test('POST /api/v1/routines rejects a modelKey that is not in the real model library', async () => {
+  const { app } = testApp()
+  const res = await app.request('/api/v1/routines', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 },
+      modelKey: 'gpt-4', agentId: 'agent-1',
+    }),
+  })
+  assert.equal(res.status, 400)
+  const problem = (await res.json()) as { error: { code: string; message: string } }
+  assert.equal(problem.error.code, 'invalid_routine')
+  assert.match(problem.error.message, /not a model in TurboLLM's library/)
+  assert.match(problem.error.message, /list_models/)
+})
+
+test('POST /api/v1/routines accepts a modelKey that IS in the real model library', async () => {
+  const { app } = testApp()
+  const res = await app.request('/api/v1/routines', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 },
+      modelKey: 'm', agentId: 'agent-1',
+    }),
+  })
+  assert.equal(res.status, 201)
 })
 
 test('PUT /api/v1/routines/:id/confirm activates a pending routine and sets next_fire_at', async () => {

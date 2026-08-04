@@ -20,6 +20,7 @@
 
 import type { Context, Hono } from 'hono'
 import type { Deps } from '../deps'
+import type { AgentRun } from '../chat/db'
 import { existsSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { isLocalUpgrade, verifyKeyValue } from '../auth'
@@ -201,6 +202,81 @@ export function isTerminalBackendAvailable(): boolean {
   return backendAvailable
 }
 
+/** Same manager every REST/WS handler in this file uses — exported so a server-side caller that
+ *  isn't a Hono handler (cli-interactive-runner.ts, spawning a routine's live terminal at fire
+ *  time rather than waiting for a browser to open one) reaches the SAME PTY registry instead of
+ *  a second, disconnected instance. */
+export function getTerminalManager(d: Deps): TerminalManager {
+  return getManager(d)
+}
+
+export type CreateAgentTerminalResult =
+  | { ok: true; terminalId: string }
+  | { ok: false; status: 400 | 501 | 500; code: string; message: string }
+
+/** The "spawn a fresh terminal" core of `POST /api/v1/code/sessions/:sessionId/terminal`,
+ *  factored out so a server-side caller can start the SAME kind of terminal-agent session a
+ *  human clicking into a fresh Code session would, without a self-referential HTTP round-trip.
+ *
+ *  Deliberately excludes the REST route's reuse-existing/kill-stale-shell branches: those exist
+ *  for a session a human can reopen many times (remounting a tab, reconnecting a dropped WS).
+ *  A caller of this function is expected to be creating a terminal for a BRAND-NEW `run` that has
+ *  never had one before (routines: a fresh AgentRun per fire, never resumed) — reuse logic would
+ *  be dead code there, since `findByCodeSessionId` can only ever miss for an id nothing has seen.
+ *  The REST route still owns that prefix itself and calls this for the "actually create one" tail.
+ *
+ *  `mode`/`firstMessage` are passed explicitly rather than re-derived from the conversation (as
+ *  the REST route does for a human's session): a routine-created session's opening prompt IS its
+ *  `routine.prompt`, seeded on the one and only launch, never re-read from message history. */
+export async function createAgentTerminal(
+  d: Deps,
+  run: AgentRun,
+  opts: { cols?: number; rows?: number; mode?: string; firstMessage?: string } = {},
+): Promise<CreateAgentTerminalResult> {
+  if (!run.repoRoot) return { ok: false, status: 400, code: 'invalid_input', message: 'Session has no repo root.' }
+  const agent = run.codeAgent ?? 'turbollm'
+  if (agent === 'turbollm') {
+    return { ok: false, status: 400, code: 'invalid_input', message: 'This session uses the built-in chat UI, not a terminal agent.' }
+  }
+  const cwd = agentCwd(run)
+  if (!existsSync(cwd)) {
+    const isWorktree = !!run.worktreePath && cwd === run.worktreePath
+    return {
+      ok: false, status: 400, code: 'cwd_missing',
+      message: isWorktree
+        ? `This session's worktree is gone: ${cwd}. It was probably removed outside TurboLLM ` +
+          `(\`git worktree remove\`, or deleting the folder). The session's branch and any commits ` +
+          `on it are unaffected — delete this session and start a new one on the same repo.`
+        : `This session's folder no longer exists: ${cwd}. It may have been moved, renamed or ` +
+          `deleted, or it lives on a drive that isn't connected. Reconnect or restore it, or ` +
+          `delete this session.`,
+    }
+  }
+  const cols = opts.cols && opts.cols > 0 ? Math.floor(opts.cols) : 80
+  const rows = opts.rows && opts.rows > 0 ? Math.floor(opts.rows) : 24
+  const m = getManager(d)
+  try {
+    const port = d.store.snapshot().daemon.port
+    const token = sessionAuth.mint(run.id)
+    const mode = opts.mode ?? d.db.getConversation(run.convId)?.agentMode ?? 'auto'
+    const permissionMode = resolveClaudePermissionMode(mode, await claudePermissionModeChoices())
+    const launchCommand = buildTerminalLaunchCommand(
+      agent, port, token, run.id, !!run.terminalLaunchedOnce,
+      agent === 'claude' ? permissionMode : null,
+      mode,
+      opts.firstMessage,
+    )
+    const terminalId = m.create(cwd, run.id, cols, rows, launchCommand)
+    if (!run.terminalLaunchedOnce) d.db.updateAgentRun(run.id, { terminalLaunchedOnce: true })
+    return { ok: true, terminalId }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : 'Failed to create terminal session.'
+    console.error('[terminal] create failed for session', run.id, ':', e)
+    if (msg.includes('node-pty not available')) return { ok: false, status: 501, code: 'not_available', message: msg }
+    return { ok: false, status: 500, code: 'create_failed', message: msg }
+  }
+}
+
 function getManager(_d: Deps): TerminalManager {
   if (!terminalManager) {
     // Force the resolve here (via the shared check above) so tests can run without node-pty
@@ -286,63 +362,26 @@ export function registerTerminalRoutes(app: Hono, d: Deps): void {
       // down so the create path below spawns a real agent terminal.
       m.kill(existing)
     }
-    try {
-      // Built here, server-side — the client never constructs or even sees this string; the
-      // shell runs it as its own startup command (pty-session.ts), never typed into stdin.
-      // The daemon's OWN configured port (honors a --port override / in-place rebind), NOT
-      // the incoming request's Host/URL port — unlike a browser-facing origin (e.g.
-      // comfyui/install's own derivation), this spawns a LOCAL subprocess that must always
-      // reach the real daemon directly. Deriving it from the request would pick up a dev
-      // proxy's port instead (`npm run dev` in web/, :5173 → :6996) whenever the terminal is
-      // opened through that proxy, launching the CLI against a port nothing is listening on.
-      const port = d.store.snapshot().daemon.port
-      // Session-scoped token (not the shared static 'turbollm-local' every other launch target
-      // uses) — lets the gateway tell this session's requests apart from any other concurrently
-      // open terminal-agent session, for the thinking-budget override and usage-stat attribution
-      // (session-auth.ts). Idempotent: a remount/reconnect against an already-running terminal
-      // never reaches this branch (the `existing` check above returns early), so the CLI's
-      // already-running auth is never invalidated by a token that would differ from what it
-      // still has cached — but even if it did, mint() returns the SAME token for this session.
-      const token = sessionAuth.mint(run.id)
-      // Auto-resume (found live: a daemon restart kills this terminal's PTY, but the
-      // conversation itself didn't end) — a genuinely first-ever launch registers run.id as
-      // the CLI's OWN session id; any later one resumes that EXACT id, never "whatever this
-      // directory's most recent conversation happens to be" (see buildTerminalLaunchCommand's
-      // doc comment for the live bug that distinction fixes).
-      // Start the CLI in the mode this session was created with (auto/plan/ask), rather than
-      // whatever the CLI defaults to. The mode lives on the conversation (`agent_mode`, the same
-      // column PATCH .../mode writes), so a mode changed before reopening applies to the next
-      // launch — a CLI can't be switched mid-session from out here.
-      const mode = d.db.getConversation(run.convId)?.agentMode ?? 'auto'
-      const permissionMode = resolveClaudePermissionMode(mode, await claudePermissionModeChoices())
-      // Seed the conversation's first user message as the CLI's opening prompt, so a fresh Code
-      // session doesn't open an empty CLI and make the user retype what they already sent. Only
-      // on a genuine first launch — a resume already has the turn in its own transcript, and
-      // re-sending it would duplicate it.
-      const firstMessage = !run.terminalLaunchedOnce
-        ? d.db.getConversation(run.convId, true)?.messages?.find((msg) => msg.role === 'user' && msg.isActive)?.content
-        : undefined
-      const launchCommand = buildTerminalLaunchCommand(
-        agent, port, token, run.id, !!run.terminalLaunchedOnce,
-        agent === 'claude' ? permissionMode : null,
-        mode,
-        firstMessage,
-      )
-      // The session's worktree when it has one, else the repo itself (ADR-316) — the CLI must
-      // open in the same tree the in-app agent edits, or the two halves of one session would
-      // be looking at different checkouts.
-      const terminalId = m.create(cwd, run.id, cols, rows, launchCommand)
-      if (!run.terminalLaunchedOnce) d.db.updateAgentRun(run.id, { terminalLaunchedOnce: true })
-      return c.json({ terminalId }, 201)
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : 'Failed to create terminal session.'
-      // Was previously swallowed here — the client got a generic toast with no way to diagnose
-      // *why* creation failed (wrong repoRoot, spawn failure, etc.) and neither did the server
-      // log. Surface the real cause server-side at minimum.
-      console.error('[terminal] create failed for session', run.id, ':', e)
-      if (msg.includes('node-pty not available')) return err(c, 501, 'not_available', msg)
-      return err(c, 500, 'create_failed', msg)
-    }
+    // Auto-resume (found live: a daemon restart kills this terminal's PTY, but the
+    // conversation itself didn't end) — a genuinely first-ever launch registers run.id as
+    // the CLI's OWN session id; any later one resumes that EXACT id, never "whatever this
+    // directory's most recent conversation happens to be" (see buildTerminalLaunchCommand's
+    // doc comment for the live bug that distinction fixes). Start the CLI in the mode this
+    // session was created with (auto/plan/ask) — the mode lives on the conversation
+    // (`agent_mode`, the same column PATCH .../mode writes), so a mode changed before
+    // reopening applies to the next launch, since a CLI can't be switched mid-session from
+    // out here.
+    const mode = d.db.getConversation(run.convId)?.agentMode ?? 'auto'
+    // Seed the conversation's first user message as the CLI's opening prompt, so a fresh Code
+    // session doesn't open an empty CLI and make the user retype what they already sent. Only
+    // on a genuine first launch — a resume already has the turn in its own transcript, and
+    // re-sending it would duplicate it.
+    const firstMessage = !run.terminalLaunchedOnce
+      ? d.db.getConversation(run.convId, true)?.messages?.find((msg) => msg.role === 'user' && msg.isActive)?.content
+      : undefined
+    const result = await createAgentTerminal(d, run, { cols, rows, mode, firstMessage: firstMessage ?? undefined })
+    if (!result.ok) return err(c, result.status, result.code, result.message)
+    return c.json({ terminalId: result.terminalId }, 201)
   })
 
   // ── kill terminal for a Code session ──────────────────────────────────
@@ -365,10 +404,13 @@ export function registerTerminalRoutes(app: Hono, d: Deps): void {
   // run `turbollm launch <agent>` as its startup command (pty-session.ts), so the only thing
   // that reliably knows when the agent is done is that launch process. Marking it here means the
   // next open recreates the terminal instead of reattaching to the leftover shell.
-  app.post('/api/v1/code/sessions/:sessionId/terminal/agent-exited', (c) => {
+  app.post('/api/v1/code/sessions/:sessionId/terminal/agent-exited', async (c) => {
     const run = d.db.getAgentRun(c.req.param('sessionId'))
     if (!run) return err(c, 404, 'not_found', 'Session not found.')
-    getManager(d).markAgentExited(run.id)
+    // exitCode is optional (older callers send no body at all) — see TerminalSessionInfo.exitCode's
+    // own doc comment for who actually reads it (nothing in the terminal-agent UI itself does).
+    const { exitCode } = await body<{ exitCode?: number }>(c)
+    getManager(d).markAgentExited(run.id, typeof exitCode === 'number' ? exitCode : undefined)
     return c.json({ ok: true }, 200)
   })
 

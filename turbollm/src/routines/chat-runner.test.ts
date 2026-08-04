@@ -66,6 +66,44 @@ test('a final answer with no tool calls records status ok', async () => {
   } finally { fetchStub.restore() }
 })
 
+// Closes the gap where a run's real conversation existed in the DB but nothing pointed at it —
+// the routine's run history had no way to open it, only read the flattened `result` string back.
+test('runChatRoutine persists the run.conversationId it created, before the loop even finishes', async () => {
+  const { d, db } = fakeDeps()
+  const r = routine(db)
+  const run = db.createRoutineRun({ routineId: r.id, configSnapshot: JSON.stringify(r) })
+  assert.equal(run.conversationId, undefined, 'not set yet at run creation — the scheduler creates the row before dispatch')
+  const fetchStub = stubFetch([{ choices: [{ message: { content: 'All PRs are green.' } }] }])
+  try {
+    await runChatRoutine(d, r, run, new AbortController().signal)
+    const reloaded = db.getRoutineRun(run.id)
+    assert.ok(reloaded?.conversationId, 'expected a conversationId to be persisted on the run')
+    // The id genuinely resolves to a real, full conversation — not just an opaque string.
+    const conv = db.getConversation(reloaded!.conversationId!, true)
+    assert.ok(conv)
+    assert.equal(conv?.kind, 'agent')
+    assert.equal(conv?.messages?.[0]?.content, r.prompt)
+  } finally { fetchStub.restore() }
+})
+
+test('resumeChatRoutine reuses the SAME conversationId already on the run — a resume never creates a second conversation', async () => {
+  const { d, db } = fakeDeps()
+  const r = routine(db)
+  const run = db.createRoutineRun({ routineId: r.id, configSnapshot: JSON.stringify(r) })
+  const conv = db.createConversation({ kind: 'agent', modelKey: 'm', systemPrompt: AGENT.systemPrompt, agentId: AGENT.id })
+  db.addMessage(conv.id, 'user', r.prompt)
+  db.updateRoutineRun(run.id, { conversationId: conv.id })
+  const pending: PendingRoutineToolCall = {
+    convId: conv.id, assistantContent: '', precedingCalls: [],
+    call: { id: 'c1', name: 'run_code', args: { code: 'return 40+2' } },
+  }
+  const fetchStub = stubFetch([{ choices: [{ message: { content: 'Resumed and done.' } }] }])
+  try {
+    await resumeChatRoutine(d, r, run, pending, 'allow', new AbortController().signal)
+    assert.equal(db.getRoutineRun(run.id)?.conversationId, conv.id)
+  } finally { fetchStub.restore() }
+})
+
 test('a tool call within the allow-list actually executes (real result reaches the next round), and the loop continues to a final answer', async () => {
   const { d, db } = fakeDeps()
   const r = routine(db)

@@ -28,6 +28,8 @@ import { realSpawnCliProcess, runClaudeCliProcess } from './cli-process'
 import { claudePermissionModeChoices } from '../terminal/agent-modes'
 import { engineIsIdle } from '../engines/update-scheduler'
 import type { GenerationGate } from '../agents/gate'
+import { runCliInteractiveRoutine, type CliInteractiveDeps } from './cli-interactive-runner'
+import { createAgentTerminal, getTerminalManager } from '../terminal/terminal-routes'
 
 type RoutineOutcome = ChatRunOutcome | CodeRunOutcome
 
@@ -170,6 +172,67 @@ export async function runCliRoutineBranch(
   return status && status !== 'running' ? status : 'errored'
 }
 
+/** Kickoff-only bound for the interactive (live-terminal) CLI branch — see
+ *  cli-interactive-runner.ts's own header for the full design. Deliberately much shorter than
+ *  `runCliRoutineBranch`'s `_timeoutMs`: unlike the one-shot path, `runCliInteractiveRoutine`
+ *  itself never waits for the CLI to finish, only for the terminal to be spawned — completion is
+ *  a separate, later event (the agent-exited callback or `sweepInteractiveCliRuns`). If THIS
+ *  bound fires, kickoff itself is genuinely stuck (the same class of unbounded-await risk
+ *  `runCliRoutineBranch`'s own comment documents for its pre-spawn probes), not a routine still
+ *  legitimately awaiting a human. */
+const CLI_INTERACTIVE_KICKOFF_TIMEOUT_MS = 60_000
+
+/** Interactive (ask/plan) half of CLI-flavor Code Routine execution — see
+ *  cli-interactive-runner.ts's module header for why this is a separate path from
+ *  `runCliRoutineBranch`'s one-shot `-p` execution, which stays exactly as-is for `auto`.
+ *  Builds `CliInteractiveDeps` from the daemon's real `Deps`, wiring `createTerminal` to
+ *  terminal-routes.ts's `createAgentTerminal` (the exact function `POST
+ *  /api/v1/code/sessions/:sessionId/terminal` itself calls) so a routine's live terminal is
+ *  spawned the SAME way a human's would be, just eagerly and server-side. `_runInteractive` is a
+ *  default-parameter seam, same convention as `runCliRoutineBranch`'s `_runCli`. */
+export async function runCliInteractiveBranch(
+  d: Deps,
+  routine: Routine,
+  run: RoutineRun,
+  _runInteractive: (routine: Routine, run: RoutineRun, deps: CliInteractiveDeps) => Promise<RoutineRunStatus> = runCliInteractiveRoutine,
+  _timeoutMs: number = CLI_INTERACTIVE_KICKOFF_TIMEOUT_MS,
+): Promise<RoutineRunStatus> {
+  const tm = getTerminalManager(d)
+  const interactiveDeps: CliInteractiveDeps = {
+    store: d.db,
+    gate: d.gate ?? ABSENT_GATE,
+    getLoadedModelKey: () => d.manager.status().model?.key ?? null,
+    getEngineIdle: () => engineIsIdle(d.manager),
+    loadExplicit: (modelKey) => d.modelRouter.loadExplicit(modelKey),
+    now: () => new Date(),
+    isAvailable: () => isClaudeCliAvailable(),
+    createTerminal: (agentRun, opts) => createAgentTerminal(d, agentRun, opts),
+    isTerminalActive: (codeSessionId) => tm.isActive(codeSessionId),
+    isAgentExited: (codeSessionId) => tm.isAgentExited(codeSessionId),
+    getExitCode: (codeSessionId) => tm.getExitCode(codeSessionId),
+    killTerminal: (codeSessionId) => tm.kill(codeSessionId),
+    releaseParked: d.routineScheduler ? (routineId, runId) => d.routineScheduler!.releaseParked(routineId, runId) : undefined,
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const TIMED_OUT = Symbol('cli_interactive_kickoff_timeout')
+  let raced: unknown
+  try {
+    raced = await Promise.race([
+      _runInteractive(routine, run, interactiveDeps),
+      new Promise<symbol>((resolve) => { timer = setTimeout(() => resolve(TIMED_OUT), _timeoutMs); timer.unref() }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+  if (raced === TIMED_OUT) {
+    const timedOutStatus = d.db.getRoutineRun(run.id)?.status
+    if (timedOutStatus && timedOutStatus !== 'running') return timedOutStatus
+    d.db.updateRoutineRun(run.id, { status: 'errored', error: `Starting the interactive claude CLI session exceeded the ${_timeoutMs}ms kickoff limit.`, endedAt: new Date().toISOString() })
+    return 'errored'
+  }
+  return raced as RoutineRunStatus
+}
+
 /** The real Chat/in-app-pi Routine executor (spec 20 §5) — the real `RoutineSchedulerDeps.runRoutine`
  *  (Phase 2), wired in cli.ts (Task 10). The scheduler has already created `run` (status
  *  'running') before calling this; this function only decides which terminal RoutineRunStatus
@@ -191,13 +254,19 @@ export async function executeRoutine(
   routine: Routine,
   run: RoutineRun,
   _runCliBranch: typeof runCliRoutineBranch = runCliRoutineBranch,
+  _runCliInteractiveBranch: typeof runCliInteractiveBranch = runCliInteractiveBranch,
 ): Promise<RoutineRunStatus> {
   // CLI-flavor Code Routines: see dispatchRoutine's own comment — a deliberate top-level sibling
   // branch that returns immediately, never nested in the swap/gate flow below, because
   // runCliCodeRoutine owns its own model-conflict handling and must not sit inside a blocking
   // gate acquisition (cli-routine.ts's "the busy-check NEVER calls gate.acquire()" design note
   // explains the self-deadlock that would otherwise be possible against a single-slot engine).
+  // "auto" keeps the cheap, fully-automated one-shot `-p` path; "ask"/"plan" can actually hit a
+  // permission prompt, so those go through the live-terminal path instead (cli-interactive-runner.ts).
   if (routine.flavor === 'code' && routine.codingAgent === 'claude_cli') {
+    if (routine.permissionMode === 'ask' || routine.permissionMode === 'plan') {
+      return _runCliInteractiveBranch(d, routine, run)
+    }
     return _runCliBranch(d, routine, run)
   }
 

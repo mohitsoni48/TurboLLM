@@ -4,6 +4,7 @@ import { BarChart3, Boxes, Code2, Cpu, PanelsTopLeft, Puzzle, Settings2 } from '
 import { cn } from '../lib/utils'
 import type { Status } from '../lib/types'
 import { useRoutinesWithLatestRun } from '../lib/routine-queries'
+import { useSettings } from '../lib/queries'
 import { StateChip } from './StateChip'
 import { BoltMark } from './Logo'
 import { EngineProvisionBanner } from './EngineProvisionBanner'
@@ -88,10 +89,15 @@ function NavRail({
   // SPEC-GAP (00-conventions.md §8): spec 20 §2.1 also wants a transient "just failed/completed"
   // pulse. That needs either a backend seen/unseen flag or client-side timestamp diffing that the
   // shipped types don't support, so this badge is the unambiguous needs-approval count only.
-  const { items: routineItems } = useRoutinesWithLatestRun()
-  const routinesNeedingAttention = routineItems.filter(
-    (it) => it.latestRun?.status === 'needs_approval',
-  ).length
+  // Routines is experimental, off by default (Settings → Experimental) — while off, this badge
+  // must stop polling entirely, not just render as 0: `useRoutinesWithLatestRun` mounts
+  // unconditionally here regardless of route, and a hidden feature has no business fetching in
+  // the background.
+  const routinesEnabled = useSettings().query.data?.experimental?.routines ?? false
+  const { items: routineItems } = useRoutinesWithLatestRun(routinesEnabled)
+  const routinesNeedingAttention = routinesEnabled
+    ? routineItems.filter((it) => it.latestRun?.status === 'needs_approval').length
+    : 0
 
   // Keyboard shortcuts: Ctrl+1–5 (or Cmd+1–5 on Mac) navigate to the
   // corresponding NAV item. Ignored when focus is in an editable element.

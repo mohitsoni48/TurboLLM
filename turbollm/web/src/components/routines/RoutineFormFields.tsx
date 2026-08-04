@@ -126,7 +126,15 @@ export function RoutineFormFields({ draft, onChange, disabled, lockFlavor }: { d
         <select id={id('model')} disabled={disabled} className={inputCls} value={draft.modelKey} onChange={(e) => onChange({ ...draft, modelKey: e.target.value })}>
           <option value="">Choose a model…</option>
           {orphanModelKey && <option value={orphanModelKey}>{orphanModelKey} (not in the current catalog)</option>}
-          {models.map((m) => <option key={m.key} value={m.key}>{m.name}</option>)}
+          {/* Quant + dir, not just name: the catalog can hold several entries with the SAME
+              display name (different quant, or the same quant re-downloaded to a different
+              path) — without this an option like "Qwen3.6-35B-A3B" is ambiguous among 4+ real
+              choices. `title` carries the full file path for a hover tooltip. */}
+          {models.map((m) => (
+            <option key={m.key} value={m.key} title={m.path}>
+              {m.name} · {m.quant} — {m.dir}
+            </option>
+          ))}
         </select>
       </div>
 

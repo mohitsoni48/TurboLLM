@@ -5,8 +5,9 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ConversationStore } from '../chat/db'
-import { executeRoutine, resumeRoutineRun, runCliRoutineBranch } from './execute'
+import { executeRoutine, resumeRoutineRun, runCliRoutineBranch, runCliInteractiveBranch } from './execute'
 import type { CliRoutineDeps } from './cli-routine'
+import type { CliInteractiveDeps } from './cli-interactive-runner'
 import { parsePendingToolCall } from './approval'
 import type { Deps } from '../deps'
 import type { Manager } from '../engines/manager'
@@ -29,7 +30,14 @@ function fakeDeps(opts: { loadedKey: string | null; activeRequests?: number; gat
   const d = {
     db, manager, modelRouter,
     registry: { active: () => ({ kind: 'llama-server' }) },
-    store: { snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 }, daemon: { port: 6996 } }) },
+    store: {
+      snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 }, daemon: { port: 6996 } }),
+      // Only ever read by TerminalManager's constructor (orphan-safety pidfile dir) when
+      // runCliInteractiveBranch's `getTerminalManager(d)` builds the module singleton for the
+      // first time in this process — a real tmp dir keeps that harmless in tests that never
+      // actually spawn a PTY (they replace `_runInteractive` before it would be reached).
+      dir: () => mkdtempSync(join(tmpdir(), 'execute-test-terminals-')),
+    },
     gate: opts.gate,
   } as unknown as Deps
   return { d, db, loadCalls }
@@ -180,6 +188,100 @@ test('executeRoutine does NOT route a codingAgent: pi Code Routine to the CLI br
   assert.equal(status, 'errored')
   // Proof it went through dispatchRoutine's in-app-pi runner instead (fakeDeps wires no codeRuns).
   assert.match(db.getRoutineRun(run.id)!.error ?? '', /codeRuns not wired/)
+})
+
+// ── ask/plan dispatch: the interactive (live-terminal) branch, sibling to the CLI branch above ──
+// (cli-interactive-runner.ts). "auto" stays on the one-shot `-p` path (already covered above);
+// "ask"/"plan" can actually hit a permission prompt, so those route here instead.
+
+test('executeRoutine routes a claude_cli routine with permissionMode "ask" to the interactive branch, not the one-shot branch', async () => {
+  const { d, db } = fakeDeps({ loadedKey: 'm' })
+  const routine = db.createRoutine({ flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', workspacePath: '/repo', codingAgent: 'claude_cli', permissionMode: 'ask' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+
+  let cliBranchCalled = false
+  let interactiveSeen: { routine: typeof routine; run: typeof run } | undefined
+  const status = await executeRoutine(
+    d, routine, run,
+    async () => { cliBranchCalled = true; return 'ok' },
+    async (_d, r, rn) => { interactiveSeen = { routine: r, run: rn }; return 'needs_approval' },
+  )
+
+  assert.equal(cliBranchCalled, false, 'ask must never reach the one-shot non-interactive branch')
+  assert.ok(interactiveSeen, 'the interactive branch must actually be reached')
+  assert.equal(interactiveSeen.routine, routine)
+  assert.equal(interactiveSeen.run, run)
+  assert.equal(status, 'needs_approval')
+})
+
+test('executeRoutine routes a claude_cli routine with permissionMode "plan" to the interactive branch too', async () => {
+  const { d, db } = fakeDeps({ loadedKey: 'm' })
+  const routine = db.createRoutine({ flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', workspacePath: '/repo', codingAgent: 'claude_cli', permissionMode: 'plan' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+
+  let interactiveCalled = false
+  const status = await executeRoutine(
+    d, routine, run,
+    async () => { assert.fail('plan must not reach the one-shot branch'); return 'errored' },
+    async () => { interactiveCalled = true; return 'needs_approval' },
+  )
+  assert.equal(interactiveCalled, true)
+  assert.equal(status, 'needs_approval')
+})
+
+test('executeRoutine keeps permissionMode "auto" on the one-shot branch, never the interactive one', async () => {
+  const { d, db } = fakeDeps({ loadedKey: 'm' })
+  const routine = db.createRoutine({ flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', workspacePath: '/repo', codingAgent: 'claude_cli', permissionMode: 'auto' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+
+  let cliBranchCalled = false
+  const status = await executeRoutine(
+    d, routine, run,
+    async () => { cliBranchCalled = true; return 'ok' },
+    async () => { assert.fail('auto must not reach the interactive branch'); return 'errored' },
+  )
+  assert.equal(cliBranchCalled, true)
+  assert.equal(status, 'ok')
+})
+
+test('runCliInteractiveBranch is wired with the right deps and reuses the scheduler-created run', async () => {
+  const gate = { stats: () => ({ inFlight: 0, queued: 0, capacity: 1 }) } as unknown as GenerationGate
+  const { d, db } = fakeDeps({ loadedKey: 'm', gate })
+  const routine = db.createRoutine({ flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', workspacePath: '/repo', codingAgent: 'claude_cli', permissionMode: 'ask' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+
+  let captured: CliInteractiveDeps | undefined
+  const status = await runCliInteractiveBranch(d, routine, run, async (_routine, _run, deps) => {
+    captured = deps
+    // Stand in for the real orchestrator — never actually spawns a terminal (createTerminal is
+    // NOT called), so this test needs no real node-pty/TerminalManager behaviour, only its wiring.
+    deps.store.updateRoutineRun(run.id, { status: 'needs_approval' })
+    return 'needs_approval'
+  })
+
+  assert.equal(status, 'needs_approval', "must return the orchestrator's own status verbatim")
+  assert.ok(captured)
+  assert.equal(captured.store, db)
+  assert.equal(captured.gate, gate, 'must reuse the Deps gate instance, never construct a new one')
+  assert.equal(captured.getLoadedModelKey(), 'm')
+  assert.equal(db.listRoutineRuns(routine.id).length, 1, 'the scheduler-created run must be reused, not duplicated')
+})
+
+test('a hung interactive kickoff still drives the run to a terminal state within its (shorter) wall-clock bound', async () => {
+  const { d, db } = fakeDeps({ loadedKey: 'm' })
+  const routine = db.createRoutine({ flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', workspacePath: '/repo', codingAgent: 'claude_cli', permissionMode: 'ask' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+
+  const startedAt = Date.now()
+  const status = await runCliInteractiveBranch(d, routine, run, () => new Promise<never>(() => { /* never settles */ }), 25)
+  const elapsed = Date.now() - startedAt
+
+  assert.ok(elapsed < 2000, `expected the 25ms bound to win, took ${elapsed}ms`)
+  assert.equal(status, 'errored')
+  const finalRun = db.getRoutineRun(run.id)!
+  assert.equal(finalRun.status, 'errored')
+  assert.match(finalRun.error ?? '', /kickoff limit/)
+  assert.ok(finalRun.endedAt)
 })
 
 // I2 (re-review): the CLI branch skips createRunDeadline() on purpose (gate self-deadlock), which

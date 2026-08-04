@@ -38,6 +38,11 @@ export async function runCodeRoutine(d: Deps, routine: Routine, run: RoutineRun,
   const conv = d.db.createConversation({ kind: 'code', modelKey: routine.modelKey })
   d.db.setConversationMode(conv.id, mode)
   const agentRun = d.db.createAgentRun({ convId: conv.id, title: routine.prompt.slice(0, 60), allowedTools: toolsForMode(mode) ?? [], repoRoot: routine.workspacePath, codeAgent: 'pi' })
+  // Set once, at creation — never touched again by a resume, which reuses this SAME session.
+  // The session already appears in the normal Code sessions list on its own (conv.kind ===
+  // 'code'), same as any session started from the UI — this just lets the routine's own run
+  // history link straight to it without a lookup.
+  d.db.updateRoutineRun(run.id, { codeSessionId: agentRun.id })
   const userMsg = d.db.addMessage(conv.id, 'user', routine.prompt)
 
   return driveCodeSession(d, run, agentRun.id, conv.id, routine.workspacePath, routine.prompt, userMsg.id, signal)

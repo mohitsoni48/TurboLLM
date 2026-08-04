@@ -123,6 +123,15 @@ export interface ExperimentalFeatures {
    *  previously only reachable via the internal-only TURBOLLM_FEATURES=cloud-deploy env var,
    *  features.ts — this is now the primary, user-facing way to turn it on). */
   cloudDeploy: boolean
+  /** Master gate for the Routines feature — visibility AND behavior, same two-layer shape as
+   *  `memory`. When off (the default for every install, new or upgraded — Routines never shipped
+   *  outside this gate): the Routines mode tab/nav badge/routes do not render at all, and
+   *  `create_routine` refuses to create anything from chat, the in-app Code (pi) agent, the
+   *  external claude_cli MCP bridge, or a direct REST POST /api/v1/routines — regardless of who's
+   *  asking. Existing routine tools (list/update/delete/run_routine_now) and REST routes besides
+   *  create are left reachable, matching this file's existing "gate only what's asked" posture
+   *  (routine-routes.ts's own doc comments make the same call for delete_routine/list_routines). */
+  routines: boolean
 }
 export interface Telemetry {
   level: string
@@ -500,7 +509,7 @@ export function defaultConfig(): Config {
       theme: 'system',
       autoGenerateTitles: true,
       autoMemoryEnabled: false,
-      experimental: { memory: false, cloudDeploy: false },
+      experimental: { memory: false, cloudDeploy: false, routines: false },
     },
     telemetry: { level: 'full', machineId: '' },
     apiKeys: [],
@@ -882,10 +891,14 @@ function normalize(c: Config): void {
   // experimental status — an old config's stale `experimental.code` value (if any survives in
   // an on-disk config.json from before this change) is simply dropped here, not migrated,
   // since there's no longer a field for it to migrate into.
+  // `routines` (2026-08-04): unlike `memory`, Routines never shipped to any install outside this
+  // gate, so there is no pre-existing "already opted in" signal to migrate forward — every config,
+  // new or upgraded, defaults to false until a human flips it on in Settings → Experimental.
   const ex = (c.daemon.experimental ?? {}) as Partial<ExperimentalFeatures>
   c.daemon.experimental = {
     memory: ex.memory === true || c.daemon.autoMemoryEnabled === true,
     cloudDeploy: ex.cloudDeploy === true,
+    routines: ex.routines === true,
   }
   // Telemetry level (spec 09 §3): the UI exposes 'off' | 'anon' | 'full'. Migrate
   // legacy/unknown values safely → 'off' (the conservative, opt-in default).

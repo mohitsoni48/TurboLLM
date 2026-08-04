@@ -15,6 +15,8 @@ import { UpdateScheduler } from './engines/update-scheduler'
 import { RoutineScheduler } from './routines/scheduler'
 import { CodeRunManager } from './code/code-run-manager'
 import { executeRoutine } from './routines/execute'
+import { sweepInteractiveCliRuns, type CliInteractiveSweepDeps } from './routines/cli-interactive-runner'
+import { getTerminalManager } from './terminal/terminal-routes'
 import { AppUpdateChecker } from './app-update'
 import { applyEngineUpdate } from './engines/update-apply'
 import { seedDefaultEngines } from './engines/seed'
@@ -162,6 +164,8 @@ if (argv[0] === 'launch') {
     try {
       await fetch(`http://127.0.0.1:${port}/api/v1/code/sessions/${codeSessionId}/terminal/agent-exited`, {
         method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ exitCode: code }),
         signal: AbortSignal.timeout(2000),
       })
     } catch { /* daemon gone or restarting — the terminal dies with it anyway */ }
@@ -312,6 +316,9 @@ const modelRouter = new ModelRouter(store, registry, manager, scanner, comfy)
 // Routine tools (Phase 4): `db` structurally satisfies RoutineToolsStore (createRoutine/
 // getRoutine/listRoutines/updateRoutine/deleteRoutine/listRoutineRuns all exist on
 // ConversationStore per Phase 1) — passed directly, no adapter needed.
+// Agent tools: `store` structurally satisfies AgentToolsStore (snapshot/update over
+// customAgents) — same "pass the real store, no adapter" pattern.
+// Model tool: `scanner` structurally satisfies ModelToolsStore (list()) — same pattern again.
 const toolRegistry = new ToolRegistry(store.snapshot().tools, db, async (routineId) =>
   // The REAL backing, not a stub: Phase 2 shipped RoutineScheduler.runNow, the same in-process
   // call POST /api/v1/routines/:id/run-now makes. `routineScheduler` is declared BELOW this line
@@ -319,6 +326,12 @@ const toolRegistry = new ToolRegistry(store.snapshot().tools, db, async (routine
   // hit. runNow is synchronous by design (00-conventions.md §3: never block a request); this
   // arrow supplies the Promise shape RunRoutineNowFn asks for.
   routineScheduler.runNow(routineId),
+  store,
+  scanner,
+  // Routines is experimental, off by default (config.ts's `daemon.experimental.routines`) — a
+  // live getter, not a one-time snapshot, so flipping it in Settings → Experimental takes effect
+  // on the very next create_routine call with no daemon restart.
+  () => store.snapshot().daemon.experimental.routines,
 )
 void (async () => {
   const cfg = store.snapshot()
@@ -424,6 +437,26 @@ const routineScheduler = new RoutineScheduler({
 })
 deps.routineScheduler = routineScheduler
 routineScheduler.start()
+
+// Safety-net watchdog for the interactive (ask/plan) claude_cli routine path
+// (cli-interactive-runner.ts) — catches a parked run whose live terminal died without ever
+// reporting back (idle-killed, or this exact restart just now killed it), or that's been sitting
+// unanswered too long. Runs once immediately (a restart-orphaned run must not wait a full
+// interval to be caught) and then on a short interval, same shape as updateScheduler/
+// routineScheduler's own self-scheduled ticks.
+const cliInteractiveSweepDeps: CliInteractiveSweepDeps = {
+  store: db,
+  now: () => new Date(),
+  loadExplicit: (modelKey) => modelRouter.loadExplicit(modelKey),
+  isTerminalActive: (codeSessionId) => getTerminalManager(deps).isActive(codeSessionId),
+  isAgentExited: (codeSessionId) => getTerminalManager(deps).isAgentExited(codeSessionId),
+  getExitCode: (codeSessionId) => getTerminalManager(deps).getExitCode(codeSessionId),
+  killTerminal: (codeSessionId) => getTerminalManager(deps).kill(codeSessionId),
+  releaseParked: (routineId, runId) => routineScheduler.releaseParked(routineId, runId),
+}
+sweepInteractiveCliRuns(cliInteractiveSweepDeps)
+const cliInteractiveSweepTimer = setInterval(() => sweepInteractiveCliRuns(cliInteractiveSweepDeps), 30_000)
+cliInteractiveSweepTimer.unref()
 
 const app = createApp(deps)
 
@@ -662,6 +695,7 @@ deps.requestRestart = () => {
   restarting = true
   updateScheduler.stop() // don't let an update tick fire mid-teardown
   routineScheduler.stop() // don't let a routine tick fire mid-teardown
+  clearInterval(cliInteractiveSweepTimer)
   comfy.stop() // don't let a tick reload a model mid-teardown
   let spawned = false
   const finish = () => {
@@ -773,6 +807,7 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
     try { removePidfile(store.dir()) } catch { /* best-effort */ }
     updateScheduler.stop()
     routineScheduler.stop()
+    clearInterval(cliInteractiveSweepTimer)
     comfy.stop()
     toolRegistry.disconnectAll()
     void Promise.all([manager.shutdown(), deps.tunnel?.shutdown() ?? Promise.resolve()]).finally(() => {

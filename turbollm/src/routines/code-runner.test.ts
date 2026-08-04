@@ -67,6 +67,24 @@ test('a run that finishes cleanly records status ok with the final assistant tex
   assert.equal(outcome.status, 'ok')
 })
 
+// Closes the gap where a run's real Code session existed in the DB (visible on its own in the
+// normal Code sessions list, since it shares conv.kind === 'code') but the routine's own run
+// history had no way to link straight to it.
+test('runCodeRoutine persists the run.codeSessionId it created, and it resolves to a real session', async () => {
+  const store = freshStore()
+  const routine = codeRoutine(store)
+  const run = store.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  assert.equal(run.codeSessionId, undefined, 'not set yet at run creation')
+  const d = depsWith(store, fakeRunner([{ event: 'delta', data: { delta: 'done' } }]))
+
+  await runCodeRoutine(d, routine, run, new AbortController().signal)
+  const reloaded = store.getRoutineRun(run.id)
+  assert.ok(reloaded?.codeSessionId, 'expected a codeSessionId to be persisted on the run')
+  const agentRun = store.getAgentRun(reloaded!.codeSessionId!)
+  assert.ok(agentRun)
+  assert.equal(store.getConversation(agentRun!.convId)?.kind, 'code')
+})
+
 test('an awaiting_approval tool_call durably stalls the run and aborts the live turn', async () => {
   const store = freshStore()
   const routine = codeRoutine(store)

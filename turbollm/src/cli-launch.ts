@@ -183,6 +183,26 @@ const realFs: ConfigFs = {
   mkdir: async (p) => { await mkdir(p, { recursive: true }) },
 }
 
+/** The MCP config file `claude`'s own `--mcp-config` flag reads, pointing a launched session at
+ *  THIS daemon's own MCP bridge (mcp-server.ts) so it can reach create_routine/list_agents/etc.
+ *  — tools it otherwise has no way to even know exist: a claude_cli session is the REAL external
+ *  Claude Code CLI, never routed through ToolRegistry the way chat and the in-process 'pi' agent
+ *  are (mcp-server.ts's own module header has the full story — observed live, a claude_cli
+ *  session asked to "create a routine" improvised an OS-level cron job with its own Bash tool
+ *  instead, having no idea TurboLLM's Routines feature exists).
+ *
+ *  Regenerated on every launch rather than written once: content is fully determined by `port`,
+ *  cheap to overwrite, and a stale port left over from a previous daemon would otherwise point
+ *  the CLI at a server that no longer exists. */
+export async function writeClaudeMcpConfig(port: number, fs: ConfigFs = realFs): Promise<string> {
+  const dir = join(fs.home, '.turbollm')
+  await fs.mkdir(dir)
+  const path = join(dir, 'mcp-launch-config.json')
+  const config = { mcpServers: { turbollm: { command: 'npx', args: ['turbollm', 'mcp-server', '--port', String(port)] } } }
+  await fs.writeFile(path, JSON.stringify(config, null, 2))
+  return path
+}
+
 /** Strips `//` and `/* *\/` comments from JSONC/JSON5 text, tracking string literals
  *  (single- and double-quoted, with escapes) so a value like `"http://host/v1"` is never
  *  mistaken for a comment. Used only to DETECT what's already in a commented config —
@@ -576,6 +596,7 @@ export async function launchCli(
   modelKey?: string,
   _fetch: typeof fetch = fetch,
   authToken?: string,
+  _mcpFs: ConfigFs = realFs,
 ): Promise<number> {
   const spec = SUPPORTED[target]
   if (!target || !spec) {
@@ -734,7 +755,18 @@ export async function launchCli(
     ...(parallelSlots ? { CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: String(parallelSlots) } : {}),
   }
 
-  return await spawnWithSessionRecovery(spec, passthrough, {
+  // Give this claude launch its routine/agent tools via the daemon's own MCP bridge — see
+  // writeClaudeMcpConfig's doc comment for why. Best-effort: a filesystem hiccup here must not
+  // break the launch itself, only the (already-optional) extra tool access.
+  let args = passthrough
+  try {
+    const mcpConfigPath = await writeClaudeMcpConfig(port, _mcpFs)
+    args = [...passthrough, '--mcp-config', mcpConfigPath]
+  } catch (e) {
+    process.stderr.write(`Note: could not set up TurboLLM's routine/agent tools for this session (${e instanceof Error ? e.message : e}).\n`)
+  }
+
+  return await spawnWithSessionRecovery(spec, args, {
     stdio: 'inherit',
     // On Windows the CLI is usually a `.cmd`/`.ps1` shim; a shell resolves it via PATHEXT.
     shell: process.platform === 'win32',

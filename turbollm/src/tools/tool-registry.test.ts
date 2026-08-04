@@ -8,10 +8,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ToolRegistry } from './tool-registry'
 import type { RoutineToolsStore, RunRoutineNowFn } from '../routines/routine-tools'
-import { CODE_GATE_MESSAGE } from '../routines/routine-routes'
+import { CODE_GATE_MESSAGE, ROUTINES_DISABLED_MESSAGE } from '../routines/routine-routes'
 import type { Routine } from '../routines/schema'
-import type { ToolsConfig } from '../config/config'
+import type { ToolsConfig, CustomChatAgent } from '../config/config'
 import { ConversationStore } from '../chat/db'
+import type { AgentToolsStore } from '../chat/chat-agent-tools'
+import type { ModelToolsStore } from '../models/model-tools'
 
 const EMPTY_TOOLS_CFG = {} as ToolsConfig
 
@@ -47,6 +49,38 @@ test('buildToolDefinitions: includes all 5 routine tools once a RoutineToolsStor
   for (const n of ['create_routine', 'list_routines', 'update_routine', 'delete_routine', 'run_routine_now']) {
     assert.ok(names.includes(n), `expected ${n} in tool definitions`)
   }
+})
+
+// Routines is experimental, off by default (daemon.experimental.routines, config.ts) — the 6th
+// constructor param is a LIVE getter (cli.ts passes `() => store.snapshot().daemon.experimental.
+// routines`) so Settings → Experimental can flip it without a restart. Every other test in this
+// file omits the param entirely and must keep behaving exactly as before (default: enabled).
+test('buildToolDefinitions: omits only create_routine when the experimental flag getter reports false', async () => {
+  const reg = new ToolRegistry(EMPTY_TOOLS_CFG, fakeStore(null), undefined, undefined, undefined, () => false)
+  const defs = await reg.buildToolDefinitions()
+  const names = defs.map((d) => d.function.name)
+  assert.ok(!names.includes('create_routine'), 'create_routine must not be advertised while disabled')
+  for (const n of ['list_routines', 'update_routine', 'delete_routine', 'run_routine_now']) {
+    assert.ok(names.includes(n), `${n} should stay available — only creation is gated`)
+  }
+})
+
+test('executeTool: create_routine refuses with a clear error while the experimental flag getter reports false', async () => {
+  const reg = new ToolRegistry(EMPTY_TOOLS_CFG, fakeStore(null), undefined, undefined, undefined, () => false)
+  const out = await reg.executeTool({
+    id: 't1', name: 'create_routine',
+    args: { flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'a' },
+  })
+  assert.equal(out, `Error: ${ROUTINES_DISABLED_MESSAGE}`)
+})
+
+test('executeTool: create_routine succeeds when the experimental flag getter reports true', async () => {
+  const reg = new ToolRegistry(EMPTY_TOOLS_CFG, fakeStore(null), undefined, undefined, undefined, () => true)
+  const out = await reg.executeTool({
+    id: 't1', name: 'create_routine',
+    args: { flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'a' },
+  })
+  assert.match(out, /^Created routine/)
 })
 
 test('executeTool: routes create_routine/list_routines/update_routine/delete_routine to the routine store', async () => {
@@ -216,4 +250,93 @@ test('executeTool: create_routine against a REAL ConversationStore lands pending
   assert.equal(routines[0].status, 'pending_confirmation')
   // Whatever a real GET /api/v1/routines would return (routine-routes.ts calls the same
   // d.db.listRoutines()) — proving the tool-call path and the REST path see identical state.
+})
+
+// ── agent tools (list_agents/create_agent) ───────────────────────────────────
+// Closes the gap where a chat-flavor create_routine needed an agentId the model had no way to
+// discover or create on its own (see chat-agent-tools.ts's module header).
+
+function fakeAgentStore(initial: CustomChatAgent[] = []): AgentToolsStore {
+  let customAgents = initial
+  return {
+    snapshot: () => ({ customAgents }),
+    update: (fn) => {
+      const cfg = { customAgents: [...customAgents] }
+      fn(cfg)
+      customAgents = cfg.customAgents
+    },
+  }
+}
+
+test('buildToolDefinitions: omits list_agents/create_agent when no AgentToolsStore was injected', async () => {
+  const reg = new ToolRegistry(EMPTY_TOOLS_CFG)
+  const defs = await reg.buildToolDefinitions()
+  assert.ok(!defs.some((d) => d.function.name === 'list_agents'))
+  assert.ok(!defs.some((d) => d.function.name === 'create_agent'))
+})
+
+test('buildToolDefinitions: includes list_agents/create_agent once an AgentToolsStore is injected', async () => {
+  const reg = new ToolRegistry(EMPTY_TOOLS_CFG, undefined, undefined, fakeAgentStore())
+  const defs = await reg.buildToolDefinitions()
+  const names = defs.map((d) => d.function.name)
+  assert.ok(names.includes('list_agents'))
+  assert.ok(names.includes('create_agent'))
+})
+
+test('executeTool: list_agents/create_agent route to the injected agent store, unaffected by isCodeAuthorized', async () => {
+  const reg = new ToolRegistry(EMPTY_TOOLS_CFG, undefined, undefined, fakeAgentStore())
+  const empty = await reg.executeTool({ id: 't1', name: 'list_agents', args: {} })
+  assert.match(empty, /No custom agents/)
+
+  const created = await reg.executeTool({ id: 't2', name: 'create_agent', args: { name: 'Job Search Assistant' } })
+  assert.match(created, /^Created agent/)
+
+  const listed = await reg.executeTool({ id: 't3', name: 'list_agents', args: {} })
+  assert.match(listed, /Job Search Assistant/)
+})
+
+test('executeTool: create_routine can consume the agentId create_agent just returned, in one flow', async () => {
+  const db = new ConversationStore(mkdtempSync(join(tmpdir(), 'tool-registry-agentflow-')))
+  const reg = new ToolRegistry(EMPTY_TOOLS_CFG, db, undefined, fakeAgentStore())
+
+  const created = await reg.executeTool({ id: 't1', name: 'create_agent', args: { name: 'Job Search Assistant', tools: ['web_search'] } })
+  const agentId = created.match(/^Created agent (\S+)/)?.[1]
+  assert.ok(agentId, `expected an id in: ${created}`)
+
+  const routineOut = await reg.executeTool({
+    id: 't2', name: 'create_routine',
+    args: {
+      flavor: 'chat', prompt: 'Find Android jobs', scheduleDisplay: 'Runs every hour',
+      scheduleRule: { kind: 'interval', everyMs: 3_600_000 }, modelKey: 'm', agentId,
+    },
+  })
+  assert.match(routineOut, /pending_confirmation/)
+})
+
+// ── model tool (list_models) ──────────────────────────────────────────────────
+// Closes the gap where create_routine's modelKey needed a real compound id the model had no way
+// to discover — observed live, a caller with no list_models guessed "gpt-4" instead.
+
+function fakeModelStore(models: Array<{ key: string; name: string; quant: string; sizeLabel: string }> = []): ModelToolsStore {
+  return { list: () => ({ models }) }
+}
+
+test('buildToolDefinitions: omits list_models when no ModelToolsStore was injected', async () => {
+  const reg = new ToolRegistry(EMPTY_TOOLS_CFG)
+  const defs = await reg.buildToolDefinitions()
+  assert.ok(!defs.some((d) => d.function.name === 'list_models'))
+})
+
+test('buildToolDefinitions: includes list_models once a ModelToolsStore is injected', async () => {
+  const reg = new ToolRegistry(EMPTY_TOOLS_CFG, undefined, undefined, undefined, fakeModelStore())
+  const defs = await reg.buildToolDefinitions()
+  assert.ok(defs.some((d) => d.function.name === 'list_models'))
+})
+
+test('executeTool: list_models routes to the injected model store and returns the real compound key', async () => {
+  const reg = new ToolRegistry(EMPTY_TOOLS_CFG, undefined, undefined, undefined, fakeModelStore([
+    { key: 'gemma 4 26b a4b qat|Q4_0|14439362752', name: 'Gemma 4 26B A4B QAT', quant: 'Q4_0', sizeLabel: '26B-A4B' },
+  ]))
+  const out = await reg.executeTool({ id: 't1', name: 'list_models', args: {} })
+  assert.match(out, /gemma 4 26b a4b qat\|Q4_0\|14439362752/)
 })

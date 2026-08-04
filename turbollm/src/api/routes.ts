@@ -1590,7 +1590,7 @@ export function registerApi(app: Hono, d: Deps): void {
       toolPolicies?: Record<string, string>
       autoAllowAll?: boolean
       cloudDeploy?: { runpodTemplateId?: string }
-      experimental?: { memory?: boolean; cloudDeploy?: boolean }
+      experimental?: { memory?: boolean; cloudDeploy?: boolean; routines?: boolean }
     }>(c)
 
     const updates: Record<string, unknown> = {}
@@ -1795,6 +1795,7 @@ export function registerApi(app: Hono, d: Deps): void {
       // with (same reasoning as cloudDeploy's own per-field handling just above).
       if (b.experimental?.memory !== undefined) cfg.daemon.experimental.memory = !!b.experimental.memory
       if (b.experimental?.cloudDeploy !== undefined) cfg.daemon.experimental.cloudDeploy = !!b.experimental.cloudDeploy
+      if (b.experimental?.routines !== undefined) cfg.daemon.experimental.routines = !!b.experimental.routines
       // HF token (spec 10 §4): write-only. An explicit '' clears it. Never logged.
       if (b.hfToken !== undefined) cfg.hf.token = String(b.hfToken).trim()
       // Search provider config (F-020). All key/URL fields are write-only; '' clears them.

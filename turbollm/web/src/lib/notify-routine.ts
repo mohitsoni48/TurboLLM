@@ -82,9 +82,14 @@ export function diffNewlyTerminalRuns(items: RoutineWithLatestRun[], previouslyS
  *  browser notification would be most useful. Results that landed while away are announced on the
  *  next tick after the tab regains focus rather than in real time. Changing that would make three
  *  shared queries poll forever in every background tab, a cross-cutting cost well beyond this
- *  best-effort channel; the in-app run history stays authoritative either way. */
-export function useRoutineNotificationPoller(notify: NotifyRoutineResult = browserNotifyRoutineResult): void {
-  const { items } = useRoutinesWithLatestRun()
+ *  best-effort channel; the in-app run history stays authoritative either way.
+ *
+ *  @param enabled Default true. App.tsx passes `daemon.experimental.routines` (Settings →
+ *  Experimental) so this stops polling entirely while Routines is off — mounted unconditionally
+ *  at the app-shell level, it would otherwise keep fetching a feature the user has no way to see
+ *  or reach. */
+export function useRoutineNotificationPoller(notify: NotifyRoutineResult = browserNotifyRoutineResult, enabled = true): void {
+  const { items } = useRoutinesWithLatestRun(enabled)
   const seen = useRef(new Map<string, RoutineRun['status']>())
 
   useEffect(() => {

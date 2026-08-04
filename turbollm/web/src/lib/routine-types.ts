@@ -45,6 +45,13 @@ export interface RoutineRun {
   error?: string
   startedAt: string
   endedAt?: string
+  /** The real conversation this run created (chat flavor) — open it at /workspace/chat/:id for
+   *  the full transcript, exactly like any other chat. Undefined for code-flavor runs and for
+   *  runs that predate this field (they only ever have `result`). */
+  conversationId?: string
+  /** The real Code session this run created (code flavor) — open it at /workspace/code/:id.
+   *  Undefined for chat-flavor runs and for runs that predate this field. */
+  codeSessionId?: string
 }
 
 /** Body for POST /api/v1/routines and PUT /api/v1/routines/:id — the subset of Routine's

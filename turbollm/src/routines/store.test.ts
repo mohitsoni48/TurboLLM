@@ -72,6 +72,28 @@ test('updateRoutineRun updates status and endedAt', () => {
 // listParkedRoutineRuns: added for RoutineScheduler.start()'s I1 fix (a live-execution review of
 // the Task 9 double-fire fix found the scheduler's parked guard is in-memory only and silently
 // lost across a restart) — this is what lets start() rediscover any run still 'needs_approval'.
+test('a fresh run has no conversationId/codeSessionId, and updateRoutineRun can set either independently', () => {
+  const store = freshStore()
+  const r = store.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'a' })
+  const run = store.createRoutineRun({ routineId: r.id, configSnapshot: '{}' })
+  assert.equal(run.conversationId, undefined)
+  assert.equal(run.codeSessionId, undefined)
+
+  const withConv = store.updateRoutineRun(run.id, { conversationId: 'conv-1' })
+  assert.equal(withConv?.conversationId, 'conv-1')
+  assert.equal(withConv?.codeSessionId, undefined, 'setting one must not touch the other')
+
+  const withBoth = store.updateRoutineRun(run.id, { codeSessionId: 'sess-1' })
+  assert.equal(withBoth?.conversationId, 'conv-1', 'a later unrelated patch must not clobber an already-set field')
+  assert.equal(withBoth?.codeSessionId, 'sess-1')
+
+  // Round-trips through a fresh read too, not just the patch's own return value.
+  assert.deepEqual(
+    { conversationId: store.getRoutineRun(run.id)?.conversationId, codeSessionId: store.getRoutineRun(run.id)?.codeSessionId },
+    { conversationId: 'conv-1', codeSessionId: 'sess-1' },
+  )
+})
+
 test('listParkedRoutineRuns returns only needs_approval rows, across all routines', () => {
   const store = freshStore()
   const r1 = store.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'a' })

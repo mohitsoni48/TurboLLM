@@ -128,11 +128,24 @@ export const CREATE_ROUTINE_TOOL = {
       'user present. ALWAYS lands in "pending_confirmation" status: it is NOT active and will NEVER ' +
       'fire until a human explicitly confirms it (in the Routines panel). This tool cannot confirm a ' +
       'routine itself — after creating one, tell the user it needs their confirmation before it does ' +
-      'anything. flavor "chat" runs through the normal chat tool-loop (web_search/fetch_url/run_code/ ' +
-      'skills, no filesystem/shell access) and requires agentId (an existing Customize -> Agents ' +
-      'persona id). flavor "code" runs a coding agent against a workspace and requires workspacePath ' +
-      'and codingAgent. Schedule input is natural language on your side — YOU translate it into the ' +
-      'structured scheduleRule plus a human-readable scheduleDisplay that accurately describes it.',
+      'anything. BEFORE calling this tool, always ASK THE USER (do not silently assume or default) ' +
+      'which model this routine should run on and whether it should be a "chat" agent or a "code" ' +
+      'agent, unless the user has already stated both unambiguously in this conversation — call ' +
+      'list_models first if you need real modelKey options to offer. flavor "chat" runs through the ' +
+      'normal chat tool-loop (web_search/fetch_url/run_code/skills, no filesystem/shell access) and ' +
+      'requires agentId (an existing Customize -> Agents persona id). flavor "code" runs a coding ' +
+      'agent against a workspace and requires workspacePath and codingAgent. IF YOU ARE CURRENTLY ' +
+      'RUNNING AS A CODING AGENT INSIDE A WORKSPACE (a Code session, i.e. you can run bash/edit/write ' +
+      'right now) and the user chooses "code", ALWAYS set workspacePath to your OWN current working ' +
+      'directory by default — the routine should operate on the same workspace you are already in ' +
+      'unless the user explicitly names a different one. More generally, if the task needs that ' +
+      'workspace at all — running a build, a git operation, editing files, anything requiring ' +
+      'shell/file access — use flavor "code", never "chat": chat flavor cannot touch the filesystem ' +
+      'or run commands at all, so a workspace task created as chat will silently be unable to do what ' +
+      'was asked. Only use "chat" for tasks that genuinely need no file/shell access (web search, ' +
+      'summarizing, general assistance). Schedule input is natural language on your side — YOU ' +
+      'translate it into the structured scheduleRule plus a human-readable scheduleDisplay that ' +
+      'accurately describes it.',
     parameters: {
       type: 'object',
       properties: {
@@ -140,7 +153,7 @@ export const CREATE_ROUTINE_TOOL = {
         prompt: { type: 'string', description: 'The task to run, in the same words a user would ask it.' },
         scheduleDisplay: { type: 'string', description: 'Human-readable schedule, e.g. "Runs weekdays at 9:00 AM". Must accurately describe scheduleRule.' },
         scheduleRule: SCHEDULE_RULE_SCHEMA,
-        modelKey: { type: 'string', description: 'The model key to pin this routine to (same identifiers shown in the model dropdown).' },
+        modelKey: { type: 'string', description: 'One of TurboLLM\'s own model keys — a compound id (e.g. "gemma 4 26b a4b qat|Q4_0|14439362752"), never a generic name like "gpt-4" or "claude". Call list_models first if you don\'t already know a real one; never guess.' },
         agentId: { type: 'string', description: 'Required when flavor is "chat": an existing Customize -> Agents persona id.' },
         workspacePath: { type: 'string', description: 'Required when flavor is "code": absolute path to the workspace directory.' },
         codingAgent: { type: 'string', enum: ['pi', 'claude_cli'], description: 'Required when flavor is "code": which coding-agent implementation to pin.' },
@@ -160,11 +173,15 @@ export const CREATE_ROUTINE_TOOL = {
  *  create behaves identically whatever it is. DEFAULTS TO FALSE (fail closed): a caller that
  *  forgets to pass it can never author a code routine. See the module header for how each calling
  *  surface must compute it — Task 2/3 (chat) must mirror `routine-routes.ts`'s `codeGateBlocks`;
- *  Task 4 (in-app Code session) may pass `true`, since `codeAuth` already gated the session. */
+ *  Task 4 (in-app Code session) may pass `true`, since `codeAuth` already gated the session.
+ *
+ *  @param modelExists Optional — see {@link validateCreate}'s own doc comment. ToolRegistry passes
+ *  one only when a ModelToolsStore was injected; omitted, this validates exactly as before. */
 export async function execCreateRoutine(
   args: Record<string, unknown>,
   store: RoutineToolsStore,
   isCodeAuthorized = false,
+  modelExists?: (key: string) => boolean,
 ): Promise<string> {
   // Gate BEFORE validation, exactly as POST /api/v1/routines does (routine-routes.ts:152), so an
   // ungated caller learns nothing about the request shape from the error it gets back.
@@ -172,7 +189,7 @@ export async function execCreateRoutine(
   const typeProblem = stringFieldProblem(args)
   if (typeProblem) return `Error: ${typeProblem}`
   const b = args as unknown as RoutineBody
-  const problem = validateCreate(b)
+  const problem = validateCreate(b, modelExists)
   if (problem) return `Error: ${problem}`
   const routine = store.createRoutine({
     flavor: b.flavor as RoutineFlavor,

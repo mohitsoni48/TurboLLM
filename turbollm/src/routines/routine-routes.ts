@@ -6,7 +6,7 @@ import { computeNextFireTime } from './schedule'
 import { resumeRoutineRun } from './execute'
 import type { ScheduleRule, RoutineFlavor, Routine, RoutineRun } from './schema'
 
-type Status = 200 | 201 | 400 | 401 | 404 | 409 | 500 | 503
+type Status = 200 | 201 | 400 | 401 | 403 | 404 | 409 | 500 | 503
 
 function err(c: Context, status: Status, code: string, message: string) {
   return c.json({ error: { code, message } }, status)
@@ -81,13 +81,25 @@ function validateCommonFields(b: RoutineBody): string | null {
 }
 
 /** Exported (Phase 4) so the `create_routine` tool executor runs the IDENTICAL create-time
- *  validation this route does — flavor-dependent invariants included — instead of a second copy. */
-export function validateCreate(b: RoutineBody): string | null {
+ *  validation this route does — flavor-dependent invariants included — instead of a second copy.
+ *
+ *  @param modelExists Optional — checks `modelKey` against the real model library (this route
+ *  passes `d.scanner`-backed lookup; routine-tools.ts's execCreateRoutine passes one only when a
+ *  ModelToolsStore was injected). OMITTED means "don't check" rather than "reject everything",
+ *  so every existing caller/test that passes a placeholder key like 'm' keeps working unchanged —
+ *  this is additive, not a new hard requirement. Added after a live miss: a claude_cli session
+ *  with no way to discover a real modelKey created a routine with `modelKey: "gpt-4"` — a real
+ *  cloud model name, not anything in the library — which could never fire successfully; nothing
+ *  caught that until the scheduler's very first attempt to run it, silently, with no one watching. */
+export function validateCreate(b: RoutineBody, modelExists?: (key: string) => boolean): string | null {
   if (b.flavor !== 'chat' && b.flavor !== 'code') return 'flavor must be "chat" or "code".'
   if (!b.prompt?.trim()) return 'prompt is required.'
   if (!b.scheduleDisplay?.trim()) return 'scheduleDisplay is required.'
   if (!b.scheduleRule) return 'scheduleRule is required.'
   if (!b.modelKey?.trim()) return 'modelKey is required.'
+  if (modelExists && !modelExists(b.modelKey.trim())) {
+    return `modelKey "${b.modelKey.trim()}" is not a model in TurboLLM's library — call list_models (or check the Models screen) for a real one.`
+  }
   if (b.flavor === 'chat' && !b.agentId?.trim()) return 'agentId is required for a chat-flavor routine.'
   if (b.flavor === 'code' && !b.workspacePath?.trim()) return 'workspacePath is required for a code-flavor routine.'
   if (b.flavor === 'code' && b.codingAgent !== 'pi' && b.codingAgent !== 'claude_cli') return 'codingAgent must be "pi" or "claude_cli" for a code-flavor routine.'
@@ -148,6 +160,13 @@ export function codeGateBlocks(c: Context, d: Deps): boolean {
  *  this route does — one message for one security property, on both the REST and the tool surface. */
 export const CODE_GATE_MESSAGE = 'A valid API key is required to schedule a Code routine from a non-host device.'
 
+/** Routines is experimental, off by default (`daemon.experimental.routines`, config.ts) — the
+ *  same two-layer posture as Memory. Exported so routine-tools.ts's chat/in-app-Code create_routine
+ *  gate can refuse with the IDENTICAL wording this route does. Only `POST /api/v1/routines` checks
+ *  this: list/update/delete/run-now stay reachable for whatever routines already exist, matching
+ *  this file's existing "gate only what's asked" posture for the code-flavor gate above. */
+export const ROUTINES_DISABLED_MESSAGE = 'Routines is an experimental feature and is off by default — turn it on in Settings → Experimental first.'
+
 export function registerRoutineRoutes(app: Hono, d: Deps): void {
   app.get('/api/v1/routines', (c) => c.json(d.db.listRoutines()))
 
@@ -164,10 +183,13 @@ export function registerRoutineRoutes(app: Hono, d: Deps): void {
   })
 
   app.post('/api/v1/routines', async (c) => {
+    // Experimental gate first, before even reading the body's flavor — the feature being off
+    // means off for every flavor, not just a stronger version of the code-flavor gate below.
+    if (!d.store.snapshot().daemon.experimental.routines) return err(c, 403, 'routines_disabled', ROUTINES_DISABLED_MESSAGE)
     const b = await body<RoutineBody>(c)
     // Auth before validation, so an ungated caller learns nothing about the request shape.
     if (b.flavor === 'code' && codeGateBlocks(c, d)) return err(c, 401, 'unauthorized', CODE_GATE_MESSAGE)
-    const problem = validateCreate(b)
+    const problem = validateCreate(b, (key) => d.scanner.list().models.some((m) => m.key === key))
     if (problem) return err(c, 400, 'invalid_routine', problem)
     const routine = d.db.createRoutine({
       flavor: b.flavor!, prompt: b.prompt!.trim(), scheduleDisplay: b.scheduleDisplay!.trim(),

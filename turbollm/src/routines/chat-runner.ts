@@ -96,6 +96,10 @@ export async function runChatRoutine(d: Deps, routine: Routine, run: RoutineRun,
     kind: 'agent', modelKey: routine.modelKey, systemPrompt: agent.systemPrompt,
     skillIds: agent.skillIds, allowedTools: agent.tools, agentId: agent.id,
   })
+  // Set once, at creation — never touched again by a resume, which reuses this SAME conv.id.
+  // Lets the run be opened and interacted with as a real conversation, not just read back as a
+  // flattened `result` string.
+  d.db.updateRoutineRun(run.id, { conversationId: conv.id })
   d.db.addMessage(conv.id, 'user', routine.prompt)
 
   return runChatRoundLoop(d, run, agent, conv.id, signal, { messages: buildInitialMessages(agent, routine.prompt), toolLoop: new ToolLoopTracker(), iter: 0 })

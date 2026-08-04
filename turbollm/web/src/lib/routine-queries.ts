@@ -13,8 +13,12 @@ export const routineKeys = {
   runs: (id: string) => ['routine-runs', id] as const,
 }
 
-export function useRoutines() {
-  return useQuery({ queryKey: routineKeys.list, queryFn: listRoutines, refetchInterval: 15000, refetchIntervalInBackground: false })
+/** @param enabled Default true. Pass false while Routines is experimental and turned off
+ *  (`daemon.experimental.routines`) so a hidden feature doesn't keep polling in the background —
+ *  Shell.tsx's nav badge and the notification poller both mount unconditionally at the app-shell
+ *  level and need to stop fetching, not just stop rendering, when the flag is off. */
+export function useRoutines(enabled = true) {
+  return useQuery({ queryKey: routineKeys.list, queryFn: listRoutines, enabled, refetchInterval: 15000, refetchIntervalInBackground: false })
 }
 
 /** Polls on the same 15s cadence as {@link useRoutines}.
@@ -62,14 +66,14 @@ export interface RoutineWithLatestRun {
  *  index 0 really is the newest) — an N+1 query pattern, acceptable at the expected routine
  *  count (dozens, not thousands). Worth a real backend aggregate endpoint later; not built here
  *  since scope forbids adding backend code. */
-export function useRoutinesWithLatestRun() {
-  const routinesQ = useRoutines()
+export function useRoutinesWithLatestRun(enabled = true) {
+  const routinesQ = useRoutines(enabled)
   const routines = routinesQ.data ?? []
   const runsQ = useQueries({
     queries: routines.map((r) => ({
       queryKey: routineKeys.runs(r.id),
       queryFn: () => listRoutineRuns(r.id),
-      enabled: routinesQ.isSuccess,
+      enabled: enabled && routinesQ.isSuccess,
       refetchInterval: 15000,
       refetchIntervalInBackground: false,
     })),

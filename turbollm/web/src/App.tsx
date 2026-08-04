@@ -9,7 +9,8 @@ import { TooltipProvider } from './components/ui/tooltip'
 import { Shell } from './components/Shell'
 import { UnreachableOverlay } from './components/UnreachableOverlay'
 import { AuthGate } from './components/AuthGate'
-import { useStatus } from './lib/queries'
+import { useStatus, useSettings } from './lib/queries'
+import { TelemetryConsentCard } from './components/TelemetryConsentCard'
 import { ApiError, setAuthToken } from './lib/api'
 import { subscribeCodeAuthNeeded, isCodeAuthNeeded } from './lib/auth-signal'
 import { useRoutineNotificationPoller } from './lib/notify-routine'
@@ -48,12 +49,20 @@ export function App() {
   const statusQ = useStatus()
   const qc = useQueryClient()
 
+  // Routines is experimental, off by default (Settings → Experimental, config.ts's
+  // `daemon.experimental.routines`). `?? false` while settings hasn't loaded yet is the
+  // conservative default this whole gate is built around — the feature stays hidden until it's
+  // positively confirmed on, never flashes on during a loading state.
+  const settingsQ = useSettings().query
+  const routinesEnabled = settingsQ.data?.experimental?.routines ?? false
+
   // Best-effort browser notifications for routine results (spec 20 §7). Mounted here so it lives
   // exactly once for the app's lifetime, independent of which route is showing. Reads the same
   // query keys Shell's nav badge and the Routines panel already poll, so it costs no extra
   // requests, and it is purely supplementary — the durable channel is the run history in the
-  // Routines panel, which works whether or not a notification ever fires.
-  useRoutineNotificationPoller()
+  // Routines panel, which works whether or not a notification ever fires. Stops polling entirely
+  // while the experimental flag is off.
+  useRoutineNotificationPoller(undefined, routinesEnabled)
 
   // Count consecutive failed polls; show the unreachable overlay after 3 (spec 08 §1).
   const [failCount, setFailCount] = useState(0)
@@ -92,6 +101,9 @@ export function App() {
 
   return (
     <TooltipProvider delayDuration={300}>
+      {/* First-run telemetry consent (ADR-299). Renders only while the choice
+          is genuinely unanswered, and self-gates on TELEMETRY_UI_ENABLED. */}
+      <TelemetryConsentCard />
       <Shell status={statusQ.data} online={online} version={version}>
         <Suspense fallback={<ScreenFallback />}>
           <Routes>
@@ -101,15 +113,23 @@ export function App() {
             {/* Code — Workspace's second mode, not a separate nav item. Generally available
                 (ADR-280) — no longer gated behind an experimental-feature flag. */}
             <Route path="/workspace/code" element={<CodeHomeScreen />} />
-            {/* Routines — Code mode's scheduled-task tab (spec 20 §2.1). Declared before the
-                :sessionId route for readability only: React Router ranks the static "routines"
-                segment above the dynamic one regardless of order. `/routines/new` likewise ranks
-                above `/routines/:routineId`, so the create page is never swallowed by the
-                detail route. */}
-            <Route path="/workspace/code/routines" element={<RoutinesPanel />} />
-            <Route path="/workspace/code/routines/new" element={<RoutineEditPage />} />
-            <Route path="/workspace/code/routines/:routineId" element={<RoutineEditPage />} />
             <Route path="/workspace/code/:sessionId" element={<CodeSessionScreen />} />
+            {/* Routines — Workspace's THIRD mode (spec 20 §2.1), a peer of Chat/Code rather than
+                nested under Code — moved off /workspace/code/routines/* so the mode switch and
+                the URL agree about what's selected. `/routines/new` is declared before
+                `/routines/:routineId` for readability only: React Router ranks the static
+                "new" segment above the dynamic one regardless of declaration order, so the
+                create page is never swallowed by the detail route.
+                Experimental (Settings → Experimental), off by default: every one of these routes
+                bounces to Chat until `routinesEnabled` is true, same "hidden, not just unlinked"
+                treatment as ConversationSidebar's mode tab and Shell's nav badge — a bookmarked or
+                hand-typed URL must not be a backdoor around the flag. */}
+            <Route path="/workspace/routines" element={routinesEnabled ? <RoutinesPanel /> : <Navigate to="/workspace/chat" replace />} />
+            <Route path="/workspace/routines/new" element={routinesEnabled ? <RoutineEditPage /> : <Navigate to="/workspace/chat" replace />} />
+            <Route path="/workspace/routines/:routineId" element={routinesEnabled ? <RoutineEditPage /> : <Navigate to="/workspace/chat" replace />} />
+            {/* No back-compat redirect from /workspace/code/routines/* — this feature was built
+                and has lived entirely within this dev cycle, never shipped under the old path,
+                so there is nothing external pointing at it to preserve. */}
             {/* Back-compat: the old Workspace → Agent tab is gone; land on Chat instead. */}
             <Route path="/workspace/agent" element={<Navigate to="/workspace/chat" replace />} />
             <Route path="/workspace/agent/:convId" element={<Navigate to="/workspace/chat" replace />} />

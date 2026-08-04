@@ -11,7 +11,7 @@ vi.mock('../../lib/queries', async (importOriginal) => {
   return {
     ...actual,
     useChatAgents: () => ({ data: [{ id: 'agent-1', name: 'Research Agent', description: '', systemPrompt: '', skillIds: [], tools: [] }] }),
-    useModels: () => ({ data: { models: [{ key: 'model-a', name: 'Model A', compatibleWithActiveEngine: true }] } }),
+    useModels: () => ({ data: { models: [{ key: 'model-a', name: 'Model A', quant: 'Q4_0', dir: 'D:\\models\\model-a', path: 'D:\\models\\model-a\\model-a.gguf', compatibleWithActiveEngine: true }] } }),
   }
 })
 
@@ -55,7 +55,15 @@ describe('RoutineFormFields', () => {
   it('lists real agents and models from the query hooks, not hardcoded options', () => {
     renderForm()
     expect(screen.getByRole('option', { name: 'Research Agent' })).toBeInTheDocument()
-    expect(screen.getByRole('option', { name: 'Model A' })).toBeInTheDocument()
+    expect(screen.getByRole('option', { name: /Model A/ })).toBeInTheDocument()
+  })
+
+  it('disambiguates the model option with quant and directory, not just the (possibly duplicate) name', () => {
+    renderForm()
+    const option = screen.getByRole('option', { name: /Model A/ }) as HTMLOptionElement
+    expect(option.textContent).toContain('Q4_0')
+    expect(option.textContent).toContain('D:\\models\\model-a')
+    expect(option.title).toBe('D:\\models\\model-a\\model-a.gguf')
   })
 
   it('switching to a weekly schedule shows Mon–Fri picked by default, and lets a day be toggled off', async () => {

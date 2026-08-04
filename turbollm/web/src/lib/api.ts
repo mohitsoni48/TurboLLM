@@ -605,8 +605,9 @@ export type DaemonSettings = {
   cloudDeploy: { runpodTemplateId: string }
   /** Experimental feature flags (2026-07-14, Settings → Experimental). Off by default for
    *  new/distributed installs. Code used to be one of these — removed when it graduated to
-   *  generally available (ADR-280). */
-  experimental: { memory: boolean; cloudDeploy: boolean }
+   *  generally available (ADR-280). `routines` (2026-08-04) is the newest: Routines never shipped
+   *  outside this gate, so it defaults to off for every install, new or upgraded. */
+  experimental: { memory: boolean; cloudDeploy: boolean; routines: boolean }
 }
 
 /** Tool-call approval gate policy (mirrors turbollm/src/tools/tool-policy.ts). */

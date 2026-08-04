@@ -1690,17 +1690,25 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       //   • The one non-HTTP entry into runCodeSession, routines/code-runner.ts, only ever fires
       //     for an already-stored CODE-flavor routine — which could only have been authored by a
       //     caller that itself cleared this gate, and then had to be confirmed by a human.
-      pi.registerTool({
-        name: 'create_routine',
-        label: 'Create routine',
-        description: CREATE_ROUTINE_TOOL.function.description,
-        promptSnippet: 'create_routine(...) - create a new scheduled routine (always starts pending confirmation)',
-        parameters: Unsafe<Record<string, unknown>>(CREATE_ROUTINE_TOOL.function.parameters as TSchema),
-        async execute(toolCallId, params) {
-          const text = await tools.executeTool({ id: toolCallId, name: 'create_routine', args: params }, true)
-          return { content: [{ type: 'text', text }], details: {} }
-        },
-      })
+      // Routines is experimental, off by default (`daemon.experimental.routines`, config.ts).
+      // `tools.executeTool`'s own `create_routine` branch already refuses when the flag is off
+      // (tool-registry.ts) — this check is the extra step of not even telling the pi model the
+      // tool exists while it's off, matching buildToolDefinitions' identical omission on chat's
+      // own tool list. Checked live (not cached) since Settings → Experimental can flip it
+      // without a daemon restart, mid-session.
+      if (d.store.snapshot().daemon.experimental.routines) {
+        pi.registerTool({
+          name: 'create_routine',
+          label: 'Create routine',
+          description: CREATE_ROUTINE_TOOL.function.description,
+          promptSnippet: 'create_routine(...) - create a new scheduled routine (always starts pending confirmation)',
+          parameters: Unsafe<Record<string, unknown>>(CREATE_ROUTINE_TOOL.function.parameters as TSchema),
+          async execute(toolCallId, params) {
+            const text = await tools.executeTool({ id: toolCallId, name: 'create_routine', args: params }, true)
+            return { content: [{ type: 'text', text }], details: {} }
+          },
+        })
+      }
       pi.registerTool({
         name: 'list_routines',
         label: 'List routines',

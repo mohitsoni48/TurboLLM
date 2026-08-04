@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { AlarmClock, PanelLeft } from 'lucide-react'
+import { PanelLeft } from 'lucide-react'
 import { Button } from '../../components/ui/button'
 import { toast } from '../../components/ui/sonner'
 import { getPersonalization } from '../../lib/personas'
@@ -340,19 +340,12 @@ export function CodeHomeScreen() {
         >
           <PanelLeft size={16} />
         </Button>
-        {/* No Chat|Code mode switch here — the sidebar's pill (ConversationSidebar.tsx)
-            is the single place to switch modes; duplicating it in this header too
-            was redundant chrome. */}
-        {/* Routines — the launchpad is where Code mode is usually entered, so the
-            scheduled-task tab needs a door here too, not only in the sidebar. */}
-        <Button
-          size="sm"
-          variant="ghost"
-          onClick={() => navigate('/workspace/code/routines')}
-          className="ml-auto"
-        >
-          <AlarmClock size={14} /> Routines
-        </Button>
+        {/* No Chat|Code|Routines mode switch here — the sidebar's pill (ConversationSidebar.tsx)
+            is the single place to switch modes; duplicating it in this header too was
+            redundant chrome. Routines used to get its own shortcut button here specifically
+            because it was NOT one of the sidebar pill's options (just a link pinned above the
+            session list) — now that it's a real peer mode with its own tab in that same pill,
+            the same "no redundant chrome" reasoning above applies to it too. */}
       </div>
 
       {/* Scrollable content — mirrors ChatScreen's `scrollerRef` div exactly. No

@@ -103,6 +103,35 @@ test('execCreateRoutine: chat flavor missing agentId is rejected and nothing is 
   assert.equal(store.listRoutines().length, 0)
 })
 
+// modelExists is optional: omitted, every existing test in this file (all using placeholder
+// modelKeys like 'm') keeps passing unchanged.
+test('execCreateRoutine: modelExists omitted skips the check entirely', async () => {
+  const store = freshStore()
+  const msg = await execCreateRoutine({
+    flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'not-a-real-model', agentId: 'a',
+  }, store)
+  assert.doesNotMatch(msg, /^Error:/)
+})
+
+test('execCreateRoutine: modelExists provided rejects a modelKey it says doesn\'t exist, and nothing is created', async () => {
+  const store = freshStore()
+  const msg = await execCreateRoutine({
+    flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'gpt-4', agentId: 'a',
+  }, store, false, (key) => key === 'm')
+  assert.match(msg, /^Error:/)
+  assert.match(msg, /not a model in TurboLLM's library/)
+  assert.equal(store.listRoutines().length, 0)
+})
+
+test('execCreateRoutine: modelExists provided accepts a modelKey it confirms exists', async () => {
+  const store = freshStore()
+  const msg = await execCreateRoutine({
+    flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'a',
+  }, store, false, (key) => key === 'm')
+  assert.doesNotMatch(msg, /^Error:/)
+  assert.equal(store.listRoutines().length, 1)
+})
+
 test('execCreateRoutine: an unrecognized scheduleRule.kind is rejected and nothing is created', async () => {
   const store = freshStore()
   const msg = await execCreateRoutine({

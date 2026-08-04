@@ -14,6 +14,21 @@ vi.mock('../lib/routine-queries', async (importOriginal) => {
   return { ...actual, useRoutinesWithLatestRun: () => useRoutinesWithLatestRunMock() }
 })
 
+// Routines is experimental, off by default (Settings → Experimental) — Shell.tsx now reads
+// `daemon.experimental.routines` before it even asks `useRoutinesWithLatestRun` for a count, so
+// every pre-existing badge test here needs it reporting enabled to keep testing what it always
+// tested (the badge's OWN counting logic). The dedicated "hidden while off" behavior gets its own
+// describe block below instead of being folded into every existing case.
+const useSettingsMock = vi.fn()
+vi.mock('../lib/queries', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../lib/queries')>()
+  return { ...actual, useSettings: () => useSettingsMock() }
+})
+
+function mockSettings(routinesEnabled: boolean) {
+  useSettingsMock.mockReturnValue({ query: { data: { experimental: { routines: routinesEnabled } } } })
+}
+
 function routine(overrides: Partial<Routine> = {}): Routine {
   return {
     id: 'r1', flavor: 'chat', status: 'active', prompt: 'Summarize my inbox',
@@ -60,6 +75,8 @@ function statusWithDownloads(active: number): Status {
 beforeEach(() => {
   useRoutinesWithLatestRunMock.mockReset()
   mockItems([])
+  useSettingsMock.mockReset()
+  mockSettings(true)
 })
 
 describe('Shell nav badge', () => {
@@ -129,5 +146,20 @@ describe('Shell nav badge', () => {
     renderShell(statusWithDownloads(2))
     expect(screen.getByLabelText('Models (2 downloading)')).toBeInTheDocument()
     expect(screen.getByLabelText('Workspace (1 needing attention)')).toBeInTheDocument()
+  })
+
+  it('hides the badge while Routines is off in Settings → Experimental, even with a pending approval', () => {
+    mockSettings(false)
+    mockItems([{ routine: routine(), latestRun: run() }])
+    renderShell()
+    expect(screen.queryByLabelText(/Workspace \(\d+ needing attention\)/)).not.toBeInTheDocument()
+    expect(screen.getByLabelText('Workspace')).toBeInTheDocument()
+  })
+
+  it('hides the badge while settings has not loaded yet (conservative default)', () => {
+    useSettingsMock.mockReturnValue({ query: { data: undefined } })
+    mockItems([{ routine: routine(), latestRun: run() }])
+    renderShell()
+    expect(screen.queryByLabelText(/Workspace \(\d+ needing attention\)/)).not.toBeInTheDocument()
   })
 })

@@ -112,11 +112,28 @@ test('handleMcpRequest: initialize returns protocol version and serverInfo', asy
   assert.equal((res!.result as { serverInfo: { version: string } }).serverInfo.version, '1.2.3')
 })
 
-test('handleMcpRequest: tools/list advertises exactly the delegate tool', async () => {
+test('handleMcpRequest: tools/list advertises the delegate tool plus the routine/agent/model tools', async () => {
   const res = await handleMcpRequest({ jsonrpc: '2.0', id: 2, method: 'tools/list' }, BASE, '1.0.0')
-  const tools = (res!.result as { tools: Array<{ name: string }> }).tools
-  assert.equal(tools.length, 1)
-  assert.equal(tools[0].name, DELEGATE_TOOL_NAME)
+  const names = (res!.result as { tools: Array<{ name: string }> }).tools.map((t) => t.name)
+  assert.deepEqual(names, [DELEGATE_TOOL_NAME, 'list_routines', 'create_routine', 'list_agents', 'create_agent', 'list_models'])
+})
+
+test('handleMcpRequest: initialize surfaces server instructions steering "routine"/"agent" at TurboLLM\'s own tools', async () => {
+  const res = await handleMcpRequest({ jsonrpc: '2.0', id: 1, method: 'initialize' }, BASE, '1.0.0')
+  const instructions = (res!.result as { instructions: string }).instructions
+  assert.match(instructions, /TurboLLM Routine/)
+  assert.match(instructions, /NEVER cron/)
+})
+
+test('handleMcpRequest: create_routine/list_routines descriptions carry the same anti-cron warning', async () => {
+  const res = await handleMcpRequest({ jsonrpc: '2.0', id: 2, method: 'tools/list' }, BASE, '1.0.0')
+  const tools = (res!.result as { tools: Array<{ name: string; description: string }> }).tools
+  const byName = Object.fromEntries(tools.map((t) => [t.name, t.description]))
+  assert.match(byName.create_routine, /NEVER cron/)
+  assert.match(byName.list_routines, /NEVER cron/)
+  // Agent/model tools are unaffected — the warning is only noise there.
+  assert.doesNotMatch(byName.list_agents, /NEVER cron/)
+  assert.doesNotMatch(byName.list_models, /NEVER cron/)
 })
 
 test('handleMcpRequest: a notification (no id) returns null — nothing written to stdout', async () => {
@@ -171,4 +188,130 @@ test('handleMcpRequest: unknown method returns a JSON-RPC error', async () => {
   const res = await handleMcpRequest({ jsonrpc: '2.0', id: 7, method: 'bogus/method' }, BASE, '1.0.0')
   assert.ok(res!.error)
   assert.match(res!.error!.message, /Unknown method/)
+})
+
+// ── routine/agent tools ──────────────────────────────────────────────────────
+// A claude_cli Code session is the REAL external Claude Code CLI (cli-launch.ts), never routed
+// through ToolRegistry — these are its only way to reach TurboLLM's Routines feature at all.
+// Each mirrors its ToolRegistry counterpart's exact text contract (routine-tools.ts's
+// execListRoutines/execCreateRoutine, chat-agent-tools.ts's execListAgents/execCreateAgent).
+
+function toolCallReq(name: string, args?: Record<string, unknown>) {
+  return { jsonrpc: '2.0' as const, id: 10, method: 'tools/call', params: { name, arguments: args } }
+}
+
+test('list_routines: empty list says so instead of an empty bullet list', async () => {
+  const f = fakeFetch([() => json([])])
+  const res = await handleMcpRequest(toolCallReq('list_routines'), BASE, '1.0.0', f)
+  const result = res!.result as { content: Array<{ text: string }>; isError: boolean }
+  assert.equal(result.content[0].text, 'No routines exist yet.')
+  assert.equal(result.isError, false)
+})
+
+test('list_routines: formats id, status, flavor, schedule, and prompt — same shape as chat/pi\'s own list_routines', async () => {
+  const routine = { id: 'r1', status: 'active', flavor: 'chat', scheduleDisplay: 'Runs every hour', prompt: 'Find jobs' }
+  const f = fakeFetch([() => json([routine])])
+  const res = await handleMcpRequest(toolCallReq('list_routines'), BASE, '1.0.0', f)
+  const text = (res!.result as { content: Array<{ text: string }> }).content[0].text
+  assert.equal(text, '- r1 [active] chat — "Runs every hour" — Find jobs')
+})
+
+test('list_routines: a non-ok response surfaces the daemon\'s own error message, marked isError', async () => {
+  const f = fakeFetch([() => json({ error: { message: 'db locked' } }, 500)])
+  const res = await handleMcpRequest(toolCallReq('list_routines'), BASE, '1.0.0', f)
+  const result = res!.result as { content: Array<{ text: string }>; isError: boolean }
+  assert.equal(result.content[0].text, 'Error: db locked')
+  assert.equal(result.isError, true)
+})
+
+test('list_routines: a network failure reports unreachable, not an uncaught exception', async () => {
+  const f = (async () => { throw new Error('ECONNREFUSED') }) as typeof fetch
+  const res = await handleMcpRequest(toolCallReq('list_routines'), BASE, '1.0.0', f)
+  const text = (res!.result as { content: Array<{ text: string }> }).content[0].text
+  assert.match(text, /^Error: could not reach the TurboLLM daemon/)
+})
+
+const VALID_ROUTINE_ARGS = {
+  flavor: 'chat', prompt: 'Find Android jobs', scheduleDisplay: 'Runs every hour',
+  scheduleRule: { kind: 'interval', everyMs: 3_600_000 }, modelKey: 'm', agentId: 'agent-1',
+}
+
+test('create_routine: invalid args are rejected WITHOUT ever reaching the network', async () => {
+  let called = false
+  const f = (async () => { called = true; return json({}) }) as typeof fetch
+  const res = await handleMcpRequest(toolCallReq('create_routine', { flavor: 'chat' }), BASE, '1.0.0', f)
+  const result = res!.result as { content: Array<{ text: string }>; isError: boolean }
+  assert.match(result.content[0].text, /^Error:/)
+  assert.equal(result.isError, true)
+  assert.equal(called, false, 'validateCreate must short-circuit before any fetch')
+})
+
+test('create_routine: valid args land pending_confirmation, same message shape as chat/pi\'s create_routine', async () => {
+  const created = { id: 'r1', scheduleDisplay: VALID_ROUTINE_ARGS.scheduleDisplay, status: 'pending_confirmation' }
+  const f = fakeFetch([() => json(created, 201)])
+  const res = await handleMcpRequest(toolCallReq('create_routine', VALID_ROUTINE_ARGS), BASE, '1.0.0', f)
+  const result = res!.result as { content: Array<{ text: string }>; isError: boolean }
+  assert.match(result.content[0].text, /^Created routine "r1" \(Runs every hour\) in status "pending_confirmation"\./)
+  assert.match(result.content[0].text, /NOT run until a human confirms it/)
+  assert.equal(result.isError, false)
+})
+
+test('create_routine: a rejected create surfaces the daemon\'s error, marked isError', async () => {
+  const f = fakeFetch([() => json({ error: { message: 'agentId is required for a chat-flavor routine.' } }, 400)])
+  const res = await handleMcpRequest(toolCallReq('create_routine', VALID_ROUTINE_ARGS), BASE, '1.0.0', f)
+  const result = res!.result as { content: Array<{ text: string }>; isError: boolean }
+  assert.equal(result.content[0].text, 'Error: agentId is required for a chat-flavor routine.')
+  assert.equal(result.isError, true)
+})
+
+test('list_agents: empty list points at create_agent instead of showing nothing', async () => {
+  const f = fakeFetch([() => json([])])
+  const res = await handleMcpRequest(toolCallReq('list_agents'), BASE, '1.0.0', f)
+  const text = (res!.result as { content: Array<{ text: string }> }).content[0].text
+  assert.equal(text, 'No custom agents exist yet. Use create_agent to make one.')
+})
+
+test('list_agents: formats id, name, description, and tools', async () => {
+  const agent = { id: 'a1', name: 'Job Search', description: 'Finds jobs', tools: ['web_search', 'fetch_url'] }
+  const f = fakeFetch([() => json([agent])])
+  const res = await handleMcpRequest(toolCallReq('list_agents'), BASE, '1.0.0', f)
+  const text = (res!.result as { content: Array<{ text: string }> }).content[0].text
+  assert.equal(text, '- a1 "Job Search" — Finds jobs — tools: web_search, fetch_url')
+})
+
+test('create_agent: missing name is rejected without ever reaching the network', async () => {
+  let called = false
+  const f = (async () => { called = true; return json({}) }) as typeof fetch
+  const res = await handleMcpRequest(toolCallReq('create_agent', {}), BASE, '1.0.0', f)
+  const result = res!.result as { content: Array<{ text: string }>; isError: boolean }
+  assert.equal(result.content[0].text, 'Error: name is required.')
+  assert.equal(result.isError, true)
+  assert.equal(called, false)
+})
+
+test('create_agent: success echoes the created agent\'s id and name', async () => {
+  const created = { id: 'a1', name: 'Job Search Assistant' }
+  const f = fakeFetch([() => json(created, 201)])
+  const res = await handleMcpRequest(toolCallReq('create_agent', { name: 'Job Search Assistant' }), BASE, '1.0.0', f)
+  const text = (res!.result as { content: Array<{ text: string }> }).content[0].text
+  assert.equal(text, 'Created agent a1 "Job Search Assistant".')
+})
+
+// ── list_models ──────────────────────────────────────────────────────────────
+// Closes the exact gap that produced a real live miss: a claude_cli session with no way to
+// discover a real modelKey picked "gpt-4" for create_routine instead.
+
+test('list_models: empty library points at the Models screen instead of showing nothing', async () => {
+  const f = fakeFetch([() => json({ models: [] })])
+  const res = await handleMcpRequest(toolCallReq('list_models'), BASE, '1.0.0', f)
+  const text = (res!.result as { content: Array<{ text: string }> }).content[0].text
+  assert.equal(text, 'No models in the library yet — add one in TurboLLM\'s Models screen first.')
+})
+
+test('list_models: formats the exact compound modelKey, not a generic display name', async () => {
+  const model = { key: 'gemma 4 26b a4b qat|Q4_0|14439362752', name: 'Gemma 4 26B A4B QAT', quant: 'Q4_0', sizeLabel: '26B-A4B' }
+  const f = fakeFetch([() => json({ models: [model] })])
+  const res = await handleMcpRequest(toolCallReq('list_models'), BASE, '1.0.0', f)
+  const text = (res!.result as { content: Array<{ text: string }> }).content[0].text
+  assert.equal(text, '- gemma 4 26b a4b qat|Q4_0|14439362752 — Gemma 4 26B A4B QAT (Q4_0, 26B-A4B)')
 })
