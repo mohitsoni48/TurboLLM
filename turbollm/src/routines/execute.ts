@@ -148,7 +148,15 @@ export async function runCliRoutineBranch(
   try {
     raced = await Promise.race([
       _runCli(routine, cliDeps),
-      new Promise<symbol>((resolve) => { timer = setTimeout(() => resolve(TIMED_OUT), _timeoutMs); timer.unref() }),
+      // Deliberately NOT `.unref()`'d: this timer is the ONLY thing standing between a genuinely
+      // wedged orchestrator call and a run row stranded at 'running' forever (see this function's
+      // own comment above). Unref'ing it would let a shutdown-in-progress event loop decide "no
+      // ref'd work left" and exit before the timer ever fires, in which case NEITHER promise in
+      // this race would ever settle — the exact failure this timeout exists to prevent, and
+      // reproduced live by a bare/isolated invocation (no other ref'd handles keeping the loop
+      // alive) never firing the timer at all. Bounded by `_timeoutMs` either way, so this can only
+      // ever delay a shutdown by that much, never block it.
+      new Promise<symbol>((resolve) => { timer = setTimeout(() => resolve(TIMED_OUT), _timeoutMs) }),
     ])
   } finally {
     if (timer) clearTimeout(timer)
@@ -219,7 +227,11 @@ export async function runCliInteractiveBranch(
   try {
     raced = await Promise.race([
       _runInteractive(routine, run, interactiveDeps),
-      new Promise<symbol>((resolve) => { timer = setTimeout(() => resolve(TIMED_OUT), _timeoutMs); timer.unref() }),
+      // Deliberately NOT `.unref()`'d — see runCliRoutineBranch's identical timer above for why:
+      // unref'ing the one thing that can rescue a genuinely wedged kickoff risks it never firing
+      // at all if nothing else is keeping the event loop alive at that moment, which is exactly
+      // the failure this timeout exists to prevent. Bounded by `_timeoutMs`.
+      new Promise<symbol>((resolve) => { timer = setTimeout(() => resolve(TIMED_OUT), _timeoutMs) }),
     ])
   } finally {
     if (timer) clearTimeout(timer)
