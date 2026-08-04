@@ -31,7 +31,15 @@
  * that only the path is ever inspected, never the body — so there is no path
  * this table could map without breaking that guarantee. */
 const BY_SEGMENT: Record<string, string> = {
+  // `chat` (bare) only covers `/api/v1/chat/stop` — the Stop-generation button. Real
+  // chat traffic (sending a message, creating/loading a conversation) lives under
+  // `/api/v1/conversations/*` instead (PR #105 review finding: `chat` alone was
+  // silently under-counting the product's own core feature). `conversations` IS the
+  // chat feature's own primary data endpoint, not a foreign feature fetched as a side
+  // effect the way `/api/v1/skills`/`/api/v1/chat-agents` are (see the comment below) —
+  // so, unlike those two, mapping it here doesn't risk corrupting an unrelated signal.
   chat: 'chat',
+  conversations: 'chat',
   code: 'code',
   artifacts: 'artifacts',
   mcp: 'mcp',

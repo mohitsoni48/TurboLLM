@@ -594,7 +594,7 @@ export function registerApi(app: Hono, d: Deps): void {
           try { rmSync(buildRoot, { recursive: true, force: true }) } catch { /* best effort */ }
           if ((e as Error)?.name === 'AbortError') {
             d.build.log('Build cancelled.')
-            d.build.fail('Build cancelled.')
+            d.build.cancel('Build cancelled.')
           } else {
             // Friendlier message for the common "fork needs a GAS/MinGW assembler" case: some
             // forks (e.g. TurboQuant) enable the generic CMake `ASM` language, which on Windows
@@ -701,7 +701,7 @@ export function registerApi(app: Hono, d: Deps): void {
       } catch (e) {
         if ((e as Error)?.name === 'AbortError') {
           d.build.log('CUDA download cancelled.')
-          d.build.fail('CUDA download cancelled.')
+          d.build.cancel('CUDA download cancelled.')
         } else {
           d.build.fail(`Could not download CUDA: ${e instanceof Error ? e.message : String(e)}`)
         }

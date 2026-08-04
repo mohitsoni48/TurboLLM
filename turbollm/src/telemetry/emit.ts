@@ -16,7 +16,7 @@ import { enqueue } from './queue'
 import { claimOnce } from './ledger'
 import { telemetryDisabled } from './disabled'
 import { TELEMETRY_SCHEMA_VERSION, type EventName } from './schema'
-import { recordFeatureUse, flushStaleDailyUsage } from './daily-usage'
+import { recordFeatureUse, flushStaleDailyUsage, persistDailyUsage } from './daily-usage'
 
 /** Just enough of ConfigStore for the emitter — kept structural so tests need
  *  no real config file. */
@@ -117,16 +117,21 @@ export class Emitter {
   }
 
   /**
-   * Roll over any feature whose tally is from a day earlier than today.
-   * Called periodically (cli.ts, alongside the queue flush) so a feature
-   * used only on a user's LAST active day still gets reported, instead of
-   * waiting indefinitely for a next use of that same feature.
+   * Roll over any feature whose tally is from a day earlier than today, then
+   * persist whatever's left (today's still-in-progress counts) to disk.
+   * Called periodically (cli.ts, alongside the queue flush) for two reasons:
+   * a feature used only on a user's LAST active day still gets reported
+   * instead of waiting indefinitely for a next use that may never come, AND
+   * same-day counts — which `useFeature` only ever keeps in memory, to avoid
+   * a disk write on every matching API request — get a chance to survive a
+   * crash instead of living only until the next rollover.
    */
   flushDailyUsage(): void {
     if (!this.canSend('feature_used_daily')) return
     for (const { feature, bucket } of flushStaleDailyUsage(this.o.dataDir, this.today())) {
       this.emit('feature_used_daily', { feature, countBucket: bucket })
     }
+    persistDailyUsage(this.o.dataDir)
   }
 
   /**

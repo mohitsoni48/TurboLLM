@@ -419,8 +419,10 @@ downloads.onSettled = (outcome) => {
 // was never part of the onboarding funnel, but a build failure is still a real
 // crash-adjacent signal worth the single 'build_failed' fingerprint. No onboarding_step
 // here, on purpose — see the ADR-323 comment above for why build isn't part of that funnel.
-build.onSettled = (ok) => {
-  if (!ok) telemetry.error('build_failed')
+// 'cancelled' deliberately does NOT emit 'error' (PR #105 review finding) — a build
+// the user aborted themselves is a choice, not a crash.
+build.onSettled = (outcome) => {
+  if (outcome === 'fail') telemetry.error('build_failed')
 }
 // Deferred so a slow or failing disk cannot delay the listen socket; unref'd so
 // it never holds the process open (ADR-009: telemetry is not a failure mode).

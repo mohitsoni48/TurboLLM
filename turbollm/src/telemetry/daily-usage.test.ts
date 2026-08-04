@@ -3,7 +3,8 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { bucketCount, recordFeatureUse, flushStaleDailyUsage } from './daily-usage'
+import { readFileSync } from 'node:fs'
+import { bucketCount, recordFeatureUse, flushStaleDailyUsage, persistDailyUsage } from './daily-usage'
 
 function tempDir(): string {
   return mkdtempSync(join(tmpdir(), 'turbollm-daily-usage-'))
@@ -126,4 +127,38 @@ test('flushStaleDailyUsage: nothing recorded yet is a no-op', () => {
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+// persistDailyUsage (PR #105 review finding — hot-path fix): same-day counts are
+// in-memory only, to avoid a disk write on every matching API request. This is
+// the periodic-flush half that gets them onto disk before a possible crash.
+test('persistDailyUsage: writes today\'s in-progress (not yet rolled-over) count to disk', () => {
+  const dir = tempDir()
+  try {
+    recordFeatureUse(dir, 'chat', '2026-07-29')
+    recordFeatureUse(dir, 'chat', '2026-07-29')
+    recordFeatureUse(dir, 'chat', '2026-07-29')
+    // Nothing on disk yet — same-day increments never touch it.
+    assert.throws(() => readFileSync(dir + '/telemetry/daily-usage.json', 'utf8'))
+
+    persistDailyUsage(dir)
+    const onDisk = JSON.parse(readFileSync(dir + '/telemetry/daily-usage.json', 'utf8'))
+    assert.deepEqual(onDisk, { chat: { day: '2026-07-29', count: 3 } })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('persistDailyUsage: nothing recorded this process is a no-op, never throws', () => {
+  const dir = tempDir()
+  try {
+    assert.doesNotThrow(() => persistDailyUsage(dir))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('persistDailyUsage: never throws, even against an unwritable dataDir', () => {
+  recordFeatureUse('\0bad-persist', 'chat', '2026-07-29')
+  assert.doesNotThrow(() => persistDailyUsage('\0bad-persist'))
 })

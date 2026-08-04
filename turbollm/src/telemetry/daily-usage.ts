@@ -6,6 +6,18 @@
  * number — this module tracks the real per-day-per-feature count locally
  * (mirrors `ledger.ts`'s file-based, best-effort, never-throws shape) and
  * only a `COUNT_BUCKETS` bucket ever crosses into an emitted event.
+ *
+ * In-memory cache, not a disk round-trip per call (PR #105 review finding):
+ * `recordFeatureUse` runs on the feature-discovery middleware, which fires on
+ * EVERY matching API request — including the heaviest agentic-coding traffic
+ * this product is designed to serve. A synchronous read+write per request
+ * would double the disk I/O the pre-existing `firstUse`/`claimOnce` path
+ * already pays on that same hot path. Instead, same-day increments only touch
+ * an in-memory map; disk writes happen on a real rollover (at most once per
+ * feature per day) or via `persistDailyUsage`, called from the daemon's
+ * existing 5-minute telemetry flush interval (cli.ts) so a crash between
+ * flushes loses at most one interval's worth of counting — the same bounded
+ * risk ADR-009 already accepts for the queue flush.
  */
 
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
@@ -18,11 +30,16 @@ interface DailyCount {
 
 type DailyUsage = Record<string, DailyCount>
 
+/** Per-dataDir in-memory cache. Keyed by dataDir (not a singleton) so
+ *  multiple daemons/tests pointed at different data directories in the same
+ *  process never share state. */
+const cache = new Map<string, DailyUsage>()
+
 function usagePath(dataDir: string): string {
   return join(dataDir, 'telemetry', 'daily-usage.json')
 }
 
-function read(dataDir: string): DailyUsage {
+function readFromDisk(dataDir: string): DailyUsage {
   try {
     const parsed: unknown = JSON.parse(readFileSync(usagePath(dataDir), 'utf8'))
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return {}
@@ -32,9 +49,20 @@ function read(dataDir: string): DailyUsage {
   }
 }
 
-function write(dataDir: string, usage: DailyUsage): void {
+function writeToDisk(dataDir: string, usage: DailyUsage): void {
   mkdirSync(join(dataDir, 'telemetry'), { recursive: true })
   writeFileSync(usagePath(dataDir), JSON.stringify(usage))
+}
+
+/** The in-memory usage map for `dataDir`, hydrated from disk on first access
+ *  (once per process per dataDir — later calls are pure memory). */
+function loadCache(dataDir: string): DailyUsage {
+  let usage = cache.get(dataDir)
+  if (usage === undefined) {
+    usage = readFromDisk(dataDir)
+    cache.set(dataDir, usage)
+  }
+  return usage
 }
 
 /** Bucket a raw count into `COUNT_BUCKETS` (schema.ts) — the only shape of
@@ -53,6 +81,10 @@ export function bucketCount(n: number): string {
  * emits it); returns `null` when there is nothing to roll over yet — either
  * the first use ever, or still the same day as the last one.
  *
+ * Same-day increments are in-memory only (see module doc comment) — a
+ * rollover is the only case that persists to disk immediately, since it's
+ * inherently rare (at most once per feature per day).
+ *
  * Never throws (ADR-009): any read/write failure is swallowed and treated as
  * "nothing to roll over", the same failure philosophy as `ledger.ts`.
  */
@@ -62,24 +94,22 @@ export function recordFeatureUse(
   today: string,
 ): { day: string; bucket: string } | null {
   try {
-    const usage = read(dataDir)
+    const usage = loadCache(dataDir)
     const existing = usage[feature]
 
     if (existing === undefined) {
       usage[feature] = { day: today, count: 1 }
-      write(dataDir, usage)
       return null
     }
 
     if (existing.day === today) {
       usage[feature] = { day: today, count: existing.count + 1 }
-      write(dataDir, usage)
       return null
     }
 
     const rolled = { day: existing.day, bucket: bucketCount(existing.count) }
     usage[feature] = { day: today, count: 1 }
-    write(dataDir, usage)
+    writeToDisk(dataDir, usage)
     return rolled
   } catch {
     return null
@@ -97,7 +127,7 @@ export function flushStaleDailyUsage(
   today: string,
 ): Array<{ feature: string; day: string; bucket: string }> {
   try {
-    const usage = read(dataDir)
+    const usage = loadCache(dataDir)
     const rolled: Array<{ feature: string; day: string; bucket: string }> = []
     let changed = false
     for (const [feature, entry] of Object.entries(usage)) {
@@ -106,9 +136,27 @@ export function flushStaleDailyUsage(
       delete usage[feature]
       changed = true
     }
-    if (changed) write(dataDir, usage)
+    if (changed) writeToDisk(dataDir, usage)
     return rolled
   } catch {
     return []
+  }
+}
+
+/**
+ * Persist the current in-memory tally to disk as-is, without rolling
+ * anything over — the periodic-flush half of the hot-path fix (PR #105
+ * review): same-day counts otherwise only live in memory and would be lost
+ * on a crash between rollovers. Called from the same 5-minute interval as
+ * `flushStaleDailyUsage` (cli.ts), immediately after it, so a stale entry is
+ * rolled over first and only the fresh remainder gets written here.
+ */
+export function persistDailyUsage(dataDir: string): void {
+  try {
+    const usage = cache.get(dataDir)
+    if (usage === undefined) return // nothing recorded this process — nothing to persist
+    writeToDisk(dataDir, usage)
+  } catch {
+    // Best-effort by contract (ADR-009).
   }
 }

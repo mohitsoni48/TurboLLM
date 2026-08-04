@@ -3,13 +3,22 @@ import assert from 'node:assert/strict'
 import { featureForPath } from './feature-map'
 
 test('featureForPath: maps each instrumented surface to its feature', () => {
-  assert.equal(featureForPath('/api/v1/chat/send'), 'chat')
   assert.equal(featureForPath('/api/v1/code/sessions'), 'code')
   assert.equal(featureForPath('/api/v1/artifacts/abc'), 'artifacts')
   assert.equal(featureForPath('/api/v1/mcp/servers'), 'mcp')
   assert.equal(featureForPath('/api/v1/bench/run'), 'autotune')
   assert.equal(featureForPath('/api/v1/comfyui/install'), 'image')
   assert.equal(featureForPath('/api/v1/comfyui/uninstall'), 'image')
+})
+
+// PR #105 review finding: real chat traffic (send a message, create/load a
+// conversation) lives under /api/v1/conversations/*, not /api/v1/chat/* — the
+// latter only covers the Stop-generation button. Both must map to 'chat'.
+test('featureForPath: real chat traffic (conversations) maps to chat, not just the Stop button', () => {
+  assert.equal(featureForPath('/api/v1/conversations'), 'chat', 'listing conversations')
+  assert.equal(featureForPath('/api/v1/conversations/abc123/messages'), 'chat', 'sending a message')
+  assert.equal(featureForPath('/api/v1/conversations/abc123/continue'), 'chat', 'continuing a turn')
+  assert.equal(featureForPath('/api/v1/chat/stop'), 'chat', 'the Stop button, still mapped')
 })
 
 test('featureForPath: research is deliberately NOT mapped — there is no dedicated endpoint', () => {
