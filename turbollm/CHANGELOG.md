@@ -25,6 +25,30 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.10.1] - 2026-08-04
+
+### Added
+- Opt-in telemetry now reports **why** an engine install failed (network issue, no binary for
+  your OS/platform, disk full, permission denied) instead of just pass/fail — makes a stuck
+  install diagnosable instead of a silent dead end.
+- Two telemetry event types that were designed but never actually sent anything now report real
+  data (only relevant if you've opted into `full`): crash/failure signals, and a bucketed daily
+  usage count per feature (never a raw number).
+
+### Fixed
+- Chat usage telemetry was undercounting: it only recognized the Stop-generation button, not
+  actual message-sending or conversation activity. Only affects our own product-analytics
+  accuracy — no user-visible behavior changed.
+- Engine-load failure telemetry recognized fewer real out-of-memory/architecture/corruption
+  messages than it should have, so more failures than necessary were logged as an unhelpful
+  "other." Internal accuracy only.
+
+### Discord
+- Small internal update: fixed a telemetry accuracy bug (chat usage was being undercounted in
+  our own analytics) and turned on two previously-inert telemetry signals — crash reporting and
+  daily feature usage — for anyone on the `full` opt-in level. Nothing to do on your end, no
+  behavior change in the app itself.
+
 ## [1.10.0] - 2026-08-04
 
 ### Added
