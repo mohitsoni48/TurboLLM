@@ -25,6 +25,26 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.10.0] - 2026-08-04
+
+### Added
+- **Routines** — schedule a chat or Code task to run on its own, on a timer, with no one present.
+  Pick "chat" (runs through a Customize → Agents persona) or "code" (runs a coding agent —
+  in-app or the Claude Code CLI — against a real workspace) and a schedule (interval, daily, or
+  weekly); a new routine always lands in "pending confirmation" and never fires until you
+  explicitly confirm it in the Routines panel. From there, pause and resume it any time, trigger
+  it manually with "Run now," and review every past fire's full result, error, or live tool-call
+  approval in its run history — a routine that needs your OK mid-run (e.g. a Code routine about
+  to run a command) waits for you instead of guessing. Chat and Code agents can set one up for
+  you directly, describing the task in plain language.
+  **Experimental, off by default** — turn it on in Settings → Experimental → Routines. While off,
+  the whole feature stays out of the way: no Routines tab, no nav badge, and chat/Code both
+  refuse to create one. Turning it off later also stops anything already scheduled from firing,
+  not just new ones — a real off switch, not just a lock on the front door.
+
+### Discord
+- New, opt-in and still experimental: schedule a chat or Code task to run on its own on a timer — enable it in Settings → Experimental → Routines.
+
 ## [1.9.9] - 2026-08-03
 
 ### Fixed
