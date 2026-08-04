@@ -58,14 +58,20 @@ const INIT_AGENTS_PROMPT =
  *  starting a session doesn't feel like landing on a different app. A session
  *  starts with just its seeded task (one user message, no reply yet); this
  *  screen kicks off that first run automatically. */
-export function CodeSessionScreen() {
-  const { sessionId } = useParams<{ sessionId: string }>()
+export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: boolean; sessionIdOverride?: string } = {}) {
+  // `routeSessionId` is THIS component's own route param — only populated when it's mounted on
+  // /workspace/code/:sessionId. Embedded (Routines' 3-pane layout, RoutineEditPage.tsx) it renders
+  // under a completely different path, so useParams() has no sessionId at all and the caller
+  // supplies one via `sessionIdOverride` instead. `effectiveSessionId` is the value actually in
+  // effect and is what every hook/effect/request below reads — never the bare route param.
+  const { sessionId: routeSessionId } = useParams<{ sessionId: string }>()
+  const effectiveSessionId = sessionIdOverride ?? routeSessionId
   const navigate = useNavigate()
   const qc = useQueryClient()
   const { data: status } = useStatus()
   const isDesktop = useIsDesktop()
 
-  const detailQ = useCodeSession(sessionId ?? null)
+  const detailQ = useCodeSession(effectiveSessionId ?? null)
   const session = detailQ.data?.session
   const conversation = detailQ.data?.conversation
   // /clear now DEACTIVATES its messages server-side (is_active=0, v34/ADR-261), the same mechanism
@@ -84,19 +90,22 @@ export function CodeSessionScreen() {
   // the query refetch reconciles `session.mode` to match. Reset whenever the
   // session itself changes so a stale override never survives a navigation.
   const [modeOverride, setModeOverride] = useState<AgentModeId | null>(null)
-  useEffect(() => { setModeOverride(null); setShellRuns([]) }, [sessionId])
+  useEffect(() => { setModeOverride(null); setShellRuns([]) }, [effectiveSessionId])
 
   // Remember this as the last-opened Code session, so switching to Chat and back
-  // via the Workspace mode pill (ConversationSidebar.tsx) restores it.
-  useEffect(() => { if (sessionId) writeLastCodeSessionId(sessionId) }, [sessionId])
+  // via the Workspace mode pill (ConversationSidebar.tsx) restores it. Skipped when embedded —
+  // mirrors ChatScreen's own `!embedded` guard on writeLastChatConvId: an embedded routine-run
+  // view is not "the Code session you were in", and letting it win would make switching back to
+  // Code mode land on whatever routine run you last looked at.
+  useEffect(() => { if (!embedded && effectiveSessionId) writeLastCodeSessionId(effectiveSessionId) }, [embedded, effectiveSessionId])
   const modeId = modeOverride ?? (session?.mode as AgentModeId | undefined) ?? 'auto'
   const modeInfo = AGENT_MODES.find((m) => m.id === modeId) ?? AGENT_MODES[0]
   const updateMode = useUpdateCodeSessionMode()
   const handleModeChange = (m: typeof AGENT_MODES[number]) => {
-    if (!sessionId || m.id === modeId) return
+    if (!effectiveSessionId || m.id === modeId) return
     setModeOverride(m.id)
     updateMode.mutate(
-      { id: sessionId, mode: m.id },
+      { id: effectiveSessionId, mode: m.id },
       { onError: (e) => { setModeOverride(null); toast.error(e instanceof ApiError ? e.message : 'Could not change mode.') } },
     )
   }
@@ -121,7 +130,7 @@ export function CodeSessionScreen() {
   // no chat UI ever mounts for it. 'turbollm' (or the field being absent, for pre-existing
   // sessions) keeps today's chat behavior unchanged.
   const isTerminalSession = !!session?.codeAgent && session.codeAgent !== 'turbollm'
-  const lastUsageQ = useCodeSessionLastUsage(sessionId ?? null, isTerminalSession)
+  const lastUsageQ = useCodeSessionLastUsage(effectiveSessionId ?? null, isTerminalSession)
   const lastUsage = lastUsageQ.data?.usage
   const exportMut = useExportCodeSession()
   // Imperative handle onto the live TerminalView (terminal-agent sessions only) — lets
@@ -164,7 +173,7 @@ export function CodeSessionScreen() {
   const handleEject = () => {
     // Ejecting kills the whole engine — stop this session's own daemon-owned run first (so it
     // doesn't fail mid-engine-call), mirroring ChatScreen's handleEject aborting live chat gen.
-    if (sessionId) void stopCodeSession(sessionId).catch(() => {})
+    if (effectiveSessionId) void stopCodeSession(effectiveSessionId).catch(() => {})
     modelActions.eject.mutate(undefined, {
       onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not eject model.'),
     })
@@ -181,34 +190,34 @@ export function CodeSessionScreen() {
     const global = localStorage.getItem('tllm.thinkingBudget.default')
     return global !== null ? Number(global) : -1
   }
-  const [thinkingBudget, setThinkingBudgetState] = useState<number>(() => readThinkingBudget(sessionId ?? null))
+  const [thinkingBudget, setThinkingBudgetState] = useState<number>(() => readThinkingBudget(effectiveSessionId ?? null))
   const updateThinkingBudget = useUpdateCodeSessionThinkingBudget()
   const setThinkingBudget = (val: number) => {
-    if (sessionId) localStorage.setItem(`tllm.thinkingBudget.${sessionId}`, String(val))
+    if (effectiveSessionId) localStorage.setItem(`tllm.thinkingBudget.${effectiveSessionId}`, String(val))
     setThinkingBudgetState(val)
     // Terminal-agent sessions have no per-turn send call to attach this to — the CLI drives its
     // own requests directly against the gateway, so this is a live, server-enforced override
     // instead (session-auth.ts / gateway.ts), taking effect on the session's very next request.
-    if (isTerminalSession && sessionId) {
+    if (isTerminalSession && effectiveSessionId) {
       updateThinkingBudget.mutate(
-        { id: sessionId, tokens: val },
+        { id: effectiveSessionId, tokens: val },
         { onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not update thinking budget.') },
       )
     }
   }
   useEffect(() => {
-    setThinkingBudgetState(readThinkingBudget(sessionId ?? null))
+    setThinkingBudgetState(readThinkingBudget(effectiveSessionId ?? null))
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId])
+  }, [effectiveSessionId])
   // Sync the (localStorage-restored) budget to the backend once when a terminal-agent session
   // opens — otherwise the gateway override would only start reflecting reality after the user
   // actually touches the slider, even though a previously-saved non-default value is already
   // showing in the UI.
   useEffect(() => {
-    if (!isTerminalSession || !sessionId) return
-    updateThinkingBudget.mutate({ id: sessionId, tokens: readThinkingBudget(sessionId) })
+    if (!isTerminalSession || !effectiveSessionId) return
+    updateThinkingBudget.mutate({ id: effectiveSessionId, tokens: readThinkingBudget(effectiveSessionId) })
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isTerminalSession, sessionId])
+  }, [isTerminalSession, effectiveSessionId])
 
   const [live, setLive] = useState<LiveState | null>(null)
   // The SERVER-side message queue's contents (tasks waiting behind the active run). Driven by
@@ -289,25 +298,25 @@ export function CodeSessionScreen() {
   // and its abort() DETACHES without stopping the daemon-owned run. Declared BEFORE the auto-start
   // / reconnect-on-load effects so clientRef.current is populated by the time they run.
   useEffect(() => {
-    if (!sessionId) return
-    const client = new CodeSessionClient(sessionId, {
+    if (!effectiveSessionId) return
+    const client = new CodeSessionClient(effectiveSessionId, {
       onLive: setLive,
       onQueue: setQueued,
-      onTurnStart: () => { void qc.invalidateQueries({ queryKey: codeKeys.detail(sessionId) }) },
+      onTurnStart: () => { void qc.invalidateQueries({ queryKey: codeKeys.detail(effectiveSessionId) }) },
       onTurnDone: () => {
-        void qc.invalidateQueries({ queryKey: codeKeys.detail(sessionId) })
+        void qc.invalidateQueries({ queryKey: codeKeys.detail(effectiveSessionId) })
         void qc.invalidateQueries({ queryKey: ['code-sessions'] })
         void qc.invalidateQueries({ queryKey: ['code-stats'] })
         setTimeout(() => scrollToBottom(true), 80)
       },
       onTurnError: (message) => {
-        void qc.invalidateQueries({ queryKey: codeKeys.detail(sessionId) })
+        void qc.invalidateQueries({ queryKey: codeKeys.detail(effectiveSessionId) })
         void qc.invalidateQueries({ queryKey: ['code-sessions'] })
         void qc.invalidateQueries({ queryKey: ['code-stats'] })
         toast.error(message)
       },
       onIdle: () => {
-        void qc.invalidateQueries({ queryKey: codeKeys.detail(sessionId) })
+        void qc.invalidateQueries({ queryKey: codeKeys.detail(effectiveSessionId) })
         void qc.invalidateQueries({ queryKey: ['code-sessions'] })
       },
       onLostConnection: (silent) => { if (!silent) toast.error('Lost connection to the run.') },
@@ -321,14 +330,21 @@ export function CodeSessionScreen() {
       setLive(null)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId])
+  }, [effectiveSessionId])
 
   // Auto-start the first run of a freshly-created session (one seeded user message, no reply,
   // nothing live in the daemon). POST kicks it off server-side; then we connect to watch it.
   // Guarded by a ref so StrictMode double-invoke / refetches never fire it twice.
   useEffect(() => {
-    if (!sessionId || !detailQ.isSuccess) return
-    if (autoStartedRef.current === sessionId) return
+    // Embedded (Routines' 3-pane layout): a routine's OWN backend runner (code-runner.ts)
+    // already drives this session directly — it is never "freshly created and waiting for the
+    // frontend to kick it off" the way a brand-new Code-tab session is. Without this guard, an
+    // embedded run whose only persisted message is its seeded prompt (mid-run, or one that
+    // errored before an assistant reply landed) would look identical to `needsFirstRun` below
+    // and silently fire a SECOND real agent run just from being viewed.
+    if (embedded) return
+    if (!effectiveSessionId || !detailQ.isSuccess) return
+    if (autoStartedRef.current === effectiveSessionId) return
     // Terminal-agent sessions have no daemon-owned "run" at all — the seeded first user message
     // is just the session's title/prompt, and the actual work happens entirely inside the
     // external CLI in the terminal. Without this guard, a terminal-agent session's very first
@@ -336,28 +352,28 @@ export function CodeSessionScreen() {
     // spend) behind a UI that never even mounts a transcript to show it happened.
     const needsFirstRun = !isTerminalSession && messages.length === 1 && messages[0]?.role === 'user' && !detailQ.data?.running
     if (needsFirstRun) {
-      autoStartedRef.current = sessionId
+      autoStartedRef.current = effectiveSessionId
       // Read directly rather than closing over `thinkingBudget` state: navigating between two
       // already-visited sessions (no remount, only the :sessionId param changes) can run this
       // effect in the SAME commit as the sibling effect that resyncs `thinkingBudget` for the
       // new session — the state update from that effect hasn't applied yet, so the closure here
       // would still hold the PREVIOUS session's value. readThinkingBudget is a synchronous
       // localStorage read, immune to that ordering race.
-      void startCodeRun(sessionId, '', readThinkingBudget(sessionId))
-        .then(() => { void qc.invalidateQueries({ queryKey: codeKeys.detail(sessionId) }); clientRef.current?.connect() })
+      void startCodeRun(effectiveSessionId, '', readThinkingBudget(effectiveSessionId))
+        .then(() => { void qc.invalidateQueries({ queryKey: codeKeys.detail(effectiveSessionId) }); clientRef.current?.connect() })
         .catch((e) => { autoStartedRef.current = null; toast.error(e instanceof ApiError ? e.message : 'Could not start the run.') })
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, detailQ.isSuccess, messages.length])
+  }, [effectiveSessionId, detailQ.isSuccess, messages.length])
 
   // Reconnect on load: a session opened while a run is live in the daemon (closed the tab and
   // came back, reloaded, opened on another device) must ATTACH to that run — replaying its
   // buffered history and continuing live — instead of assuming a fresh page has nothing in flight.
   useEffect(() => {
-    if (!sessionId || !detailQ.isSuccess) return
+    if (!effectiveSessionId || !detailQ.isSuccess) return
     if (detailQ.data?.running && !clientRef.current?.isActive) clientRef.current?.connect()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, detailQ.isSuccess, detailQ.data?.running])
+  }, [effectiveSessionId, detailQ.isSuccess, detailQ.data?.running])
 
   // Seed the queued turns from the session detail on load, until the stream's own `queue` frames
   // take over as the live source of truth. (Rendered inline as cards at the transcript tail now,
@@ -365,7 +381,7 @@ export function CodeSessionScreen() {
   useEffect(() => {
     if (!clientRef.current?.isActive) setQueued(detailQ.data?.queued ?? [])
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, detailQ.data?.queued])
+  }, [effectiveSessionId, detailQ.data?.queued])
 
   // `/compact [focus instructions]` — a composer command, not a normal turn: it never reaches
   // startCodeRun/the daemon queue, just the dedicated compact endpoint. Case-insensitive,
@@ -399,15 +415,15 @@ export function CodeSessionScreen() {
   // non-streaming POST with no live state of its own until now.
   const [manualCompacting, setManualCompacting] = useState(false)
   const runCompact = async (text: string) => {
-    if (!sessionId) return
+    if (!effectiveSessionId) return
     // `text` is always a /compact input here (send() dispatched on it) — read its captured
     // argument (pi's customInstructions) back off the same registry pattern that matched it.
     const instructions = matchCodeCommand(text)?.match[1]?.trim() || undefined
     setInput('')
     setManualCompacting(true)
     try {
-      const result = await compactCodeSession(sessionId, instructions)
-      void qc.invalidateQueries({ queryKey: codeKeys.detail(sessionId) })
+      const result = await compactCodeSession(effectiveSessionId, instructions)
+      void qc.invalidateQueries({ queryKey: codeKeys.detail(effectiveSessionId) })
       toast.success(`Compacted — ${result.tokensBefore.toLocaleString()} tokens of history summarized.`)
     } catch (e) {
       setInput(text) // restore so the command isn't lost
@@ -424,10 +440,10 @@ export function CodeSessionScreen() {
   const clearMut = useClearCodeSession()
   const resumeMut = useResumeCodeSession()
   const runClear = async () => {
-    if (!sessionId) return
+    if (!effectiveSessionId) return
     setInput('')
     try {
-      await clearMut.mutateAsync(sessionId)
+      await clearMut.mutateAsync(effectiveSessionId)
       toast.success('Chat cleared — use /resume or the banner above to bring it back.')
     } catch (e) {
       if (e instanceof ApiError && e.code === 'nothing_to_clear') toast.info(e.message)
@@ -435,10 +451,10 @@ export function CodeSessionScreen() {
     }
   }
   const runResume = async () => {
-    if (!sessionId) return
+    if (!effectiveSessionId) return
     setInput('')
     try {
-      await resumeMut.mutateAsync(sessionId)
+      await resumeMut.mutateAsync(effectiveSessionId)
       toast.success('Chat resumed.')
     } catch (e) {
       if (e instanceof ApiError && e.code === 'not_cleared') toast.info(e.message)
@@ -459,10 +475,10 @@ export function CodeSessionScreen() {
     setPendingRevert({ messageId, hasFileEdits })
   }
   const runRevert = async (messageId: string, revertFiles: boolean) => {
-    if (!sessionId) return
+    if (!effectiveSessionId) return
     try {
-      const result = await revertCodeSession(sessionId, messageId, revertFiles)
-      void qc.invalidateQueries({ queryKey: codeKeys.detail(sessionId) })
+      const result = await revertCodeSession(effectiveSessionId, messageId, revertFiles)
+      void qc.invalidateQueries({ queryKey: codeKeys.detail(effectiveSessionId) })
       setInput(result.revertText)
       if (result.failedFiles.length) {
         toast.warning(`Reverted — ${result.failedFiles.length} file(s) couldn't be cleanly reverted (they may have drifted since).`)
@@ -482,14 +498,14 @@ export function CodeSessionScreen() {
   // is transcript-only: its result is held in ephemeral client state and never persisted or fed to
   // the model.
   const runShell = async (bang: string, command: string) => {
-    if (!sessionId || !command) return
+    if (!effectiveSessionId || !command) return
     const feedToModel = bang === '!'
     setInput('')
     userScrolledUp.current = false
     try {
-      const res = await execShellCommand(sessionId, command, feedToModel)
+      const res = await execShellCommand(effectiveSessionId, command, feedToModel)
       if (feedToModel) {
-        void qc.invalidateQueries({ queryKey: codeKeys.detail(sessionId) })
+        void qc.invalidateQueries({ queryKey: codeKeys.detail(effectiveSessionId) })
       } else {
         setShellRuns((r) => [...r, { id: `sh-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, command: res.command, output: res.output, exitCode: res.exitCode, timedOut: res.timedOut }])
       }
@@ -506,7 +522,7 @@ export function CodeSessionScreen() {
   // is being built separately in CodeComposer.tsx — this signature is the plumbing it calls into.
   const send = async (kind: SteerKind = 'followUp') => {
     const text = input.trim()
-    if (!text || !sessionId) return
+    if (!text || !effectiveSessionId) return
     // Built-in composer commands — matched against the ONE shared registry (code-commands.ts) that
     // also feeds the '/' picker's list, then dispatched by id. Most never reach startCodeRun (their
     // own endpoint / an instant client-side toggle); `/init` is the exception — a real agentic turn
@@ -545,11 +561,11 @@ export function CodeSessionScreen() {
     // run. Either way it's owned server-side, so a queued follow-up survives a disconnect. The
     // open stream reflects the result (a new `queue` frame, or the turn going live when it runs).
     try {
-      const res = await startCodeRun(sessionId, text, thinkingBudget, promptOverride, filesToSend, kind)
+      const res = await startCodeRun(effectiveSessionId, text, thinkingBudget, promptOverride, filesToSend, kind)
       // `steered` reports whether a steer actually injected into the live turn vs. was queued —
       // confirm the real outcome. followUp needs no toast: its queued card already shows inline.
       if (kind === 'steer') toast.success(steerOutcomeMessage(res.steered))
-      void qc.invalidateQueries({ queryKey: codeKeys.detail(sessionId) })
+      void qc.invalidateQueries({ queryKey: codeKeys.detail(effectiveSessionId) })
       clientRef.current?.connect()
     } catch (e) {
       setInput(text) // restore so the message isn't lost
@@ -559,11 +575,11 @@ export function CodeSessionScreen() {
   }
 
   const handleStop = async () => {
-    if (!sessionId) return
+    if (!effectiveSessionId) return
     // Stop the DAEMON's run + clear its server-side queue. The open stream will receive the
     // aborted turn's terminal frame and then end on its own — don't abort the stream here.
     setQueued([])
-    await stopCodeSession(sessionId).catch(() => {})
+    await stopCodeSession(effectiveSessionId).catch(() => {})
   }
 
   // "Send now" on a queued card: stops the active turn and promotes this one to run next,
@@ -571,8 +587,8 @@ export function CodeSessionScreen() {
   // here — the reordered queue comes back as a fresh `queue` SSE frame moments later, and
   // guessing the reorder client-side risks a flash of the wrong order if it doesn't match.
   const handleSendNow = async (userMsgId: string) => {
-    if (!sessionId) return
-    await sendCodeQueuedTurnNow(sessionId, userMsgId).catch(() => {})
+    if (!effectiveSessionId) return
+    await sendCodeQueuedTurnNow(effectiveSessionId, userMsgId).catch(() => {})
   }
 
   // At most one tool call awaits interactive approval at a time (ask mode's gate is
@@ -611,17 +627,20 @@ export function CodeSessionScreen() {
   // response lands. Skeleton matches the transcript's own rail shape (spec 11 §8: never a bare
   // spinner/blank void).
   const initialLoading = detailQ.isLoading && !detailQ.data
-  const generatingIds = useMemo(() => (live ? new Set([sessionId ?? '']) : new Set<string>()), [live, sessionId])
+  const generatingIds = useMemo(() => (live ? new Set([effectiveSessionId ?? '']) : new Set<string>()), [live, effectiveSessionId])
 
   return (
     <div className="flex h-full overflow-hidden">
-      {!isDesktop && mobileSidebarOpen && (
+      {/* Mobile: dim backdrop behind the drawer; tap to dismiss. Embedded mode (Routines' 3-pane
+          layout) never renders this own sidebar at all — the embedding page supplies its own. */}
+      {!embedded && !isDesktop && mobileSidebarOpen && (
         <div
           className="fixed inset-0 z-30 bg-black/40 md:hidden"
           onClick={() => setMobileSidebarOpen(false)}
           aria-hidden
         />
       )}
+      {!embedded && (
       <div
         ref={sidebarRef}
         className={cn(
@@ -644,13 +663,17 @@ export function CodeSessionScreen() {
           generatingIds={generatingIds}
         />
       </div>
-      {isDesktop && sidebarOpen && <SidebarResizeHandle sidebarRef={sidebarRef} onCommit={setSidebarWidth} />}
+      )}
+      {!embedded && isDesktop && sidebarOpen && <SidebarResizeHandle sidebarRef={sidebarRef} onCommit={setSidebarWidth} />}
 
       <div className="relative flex min-w-0 flex-1 flex-col">
         {/* Header — identity + run status only now; mode and context-usage moved
             into the composer toolbar below (see CodeComposer.tsx) so they read
             the same way in both the launchpad and an active session. */}
         <div className="flex h-12 shrink-0 items-center gap-1.5 border-b border-border px-3 md:gap-2 md:px-4">
+          {/* Mobile: open the history drawer (the sidebar is off-canvas below md). Not rendered
+              when embedded — there is no drawer of this component's own to open. */}
+          {!embedded && (
           <Button
             size="icon"
             variant="ghost"
@@ -661,6 +684,7 @@ export function CodeSessionScreen() {
           >
             <PanelLeft size={16} />
           </Button>
+          )}
           {session && (
             <>
               {rename.editing ? (
@@ -787,8 +811,11 @@ export function CodeSessionScreen() {
               sessionId={session.id}
               // repoRoot + the launch command are both resolved server-side from the
               // session's AgentRun (terminal-routes.ts) — nothing terminal-specific to
-              // pass through here.
-              onClose={() => navigate('/workspace/code')}
+              // pass through here. Embedded (Routines' 3-pane layout): there is no sibling
+              // Code sidebar to land on, and navigating would pull the whole app off the
+              // routine page the caller is looking at — closing the terminal view just does
+              // nothing instead, same as e.g. this page's own not-found button below.
+              onClose={embedded ? () => {} : () => navigate('/workspace/code')}
             />
             {/* Composer-parity chrome (model / context / thinking / stats) — the SAME row
                 a turbollm chat session's composer shows, just without anything to type into
@@ -841,7 +868,9 @@ export function CodeSessionScreen() {
                 {notFound && (
                   <div className="flex flex-col items-center gap-2 py-16 text-center">
                     <p className="text-[14px] text-muted">This session couldn&rsquo;t be found.</p>
-                    <Button size="sm" variant="outline" onClick={() => navigate('/workspace/code')}>Back to Code</Button>
+                    {/* Embedded (Routines' 3-pane layout): no sibling Code sidebar to land on —
+                        the routine page itself is already the way back. */}
+                    {!embedded && <Button size="sm" variant="outline" onClick={() => navigate('/workspace/code')}>Back to Code</Button>}
                   </div>
                 )}
                 {/* /clear banner */}
@@ -899,7 +928,7 @@ export function CodeSessionScreen() {
               </button>
             )}
 
-            {sessionId && pendingApproval && (
+            {effectiveSessionId && pendingApproval && (
               <ToolApprovalBar key={pendingApproval.id} pending={pendingApproval} convId={session?.convId ?? ''} onResolved={() => {}} />
             )}
 

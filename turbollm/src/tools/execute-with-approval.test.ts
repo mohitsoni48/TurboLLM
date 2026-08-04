@@ -92,6 +92,56 @@ test('explicit global "deny" wins even if the tool is in agentAllowedTools', asy
   assert.match(result, /Blocked.*Deny/)
 })
 
+// ── Phase 4 / C1: the isCodeAuthorized pass-through ─────────────────────────────────────────
+// This function makes no decision with isCodeAuthorized — it only hands it to
+// ToolRegistry.executeTool, which is where create_routine/update_routine/run_routine_now consult
+// it. That one line (`params.isCodeAuthorized ?? false`) is the entire link between chat's
+// per-request trust decision and the routine executors' gate, and nothing pinned it: deleting the
+// argument, or replacing it with a literal, left the whole suite green. These capture the value
+// executeTool actually received, so the pass-through itself is a test failure if it ever drifts.
+
+/** A ToolRegistry double that records the 2nd argument executeTool was called with. `unknown`
+ *  rather than `boolean` deliberately: an omitted argument must be observable as `undefined` here
+ *  and distinguishable from an explicit `false`, so the ?? default is being tested and not the
+ *  parameter default of some intermediate. */
+function capturingTools(): { tools: ToolRegistry; seen: unknown[] } {
+  const seen: unknown[] = []
+  const tools = {
+    executeTool: async (_call: ToolCall, isCodeAuthorized?: unknown) => { seen.push(isCodeAuthorized); return 'ok' },
+  } as unknown as ToolRegistry
+  return { tools, seen }
+}
+
+const passThroughBase = {
+  sink: () => {},
+  convId: 'c1',
+  id: 't1',
+  name: 'create_routine',
+  args: {},
+  globalPolicies: { create_routine: 'allow' as const },
+  convOverrides: {},
+  signal: new AbortController().signal,
+  interactive: false,
+}
+
+test('isCodeAuthorized pass-through: OMITTING it reaches executeTool as false (fails closed)', async () => {
+  const { tools, seen } = capturingTools()
+  await executeToolCallWithApproval({ ...passThroughBase, tools })
+  assert.deepStrictEqual(seen, [false], 'an omitted trust decision must arrive as an explicit false, never undefined')
+})
+
+test('isCodeAuthorized pass-through: an explicit false reaches executeTool as false', async () => {
+  const { tools, seen } = capturingTools()
+  await executeToolCallWithApproval({ ...passThroughBase, tools, isCodeAuthorized: false })
+  assert.deepStrictEqual(seen, [false])
+})
+
+test('isCodeAuthorized pass-through: an explicit true reaches executeTool as true (not swallowed)', async () => {
+  const { tools, seen } = capturingTools()
+  await executeToolCallWithApproval({ ...passThroughBase, tools, isCodeAuthorized: true })
+  assert.deepStrictEqual(seen, [true], 'a genuinely authorized caller must not be silently downgraded')
+})
+
 test('an "allow"-policy tool still executes for a background run with no agentAllowedTools needed', async () => {
   const { result, error } = await executeToolCallWithApproval({
     tools: fakeTools('42'),

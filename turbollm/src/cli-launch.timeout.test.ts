@@ -4,9 +4,18 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { EventEmitter } from 'node:events'
-import { launchCli } from './cli-launch.js'
+import { launchCli, type ConfigFs } from './cli-launch.js'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+// This file is about env vars only — a throwing fs keeps launchCli's (unrelated) MCP config
+// write out of the picture: no real disk I/O, and no --mcp-config appended to args.
+const NO_OP_FS: ConfigFs = {
+  home: '/unused',
+  readFile: async () => { throw new Error('not used by this test file') },
+  writeFile: async () => { throw new Error('not used by this test file') },
+  mkdir: async () => { throw new Error('not used by this test file') },
+}
 
 interface CapturedSpawn {
   cmd: string
@@ -70,7 +79,7 @@ test('launchCli passes ANTHROPIC_TIMEOUT=300000 to Claude Code spawn', async () 
   const restore = stubFetch()
   const unsilence = silenceOutput()
   try {
-    await launchCli('claude', 6996, [], fn)
+    await launchCli('claude', 6996, [], fn, undefined, undefined, undefined, NO_OP_FS)
   } finally {
     unsilence()
     restore()
@@ -88,7 +97,7 @@ test('launchCli passes ANTHROPIC_MAX_RETRIES=0 to Claude Code spawn', async () =
   const restore = stubFetch()
   const unsilence = silenceOutput()
   try {
-    await launchCli('claude', 6996, [], fn)
+    await launchCli('claude', 6996, [], fn, undefined, undefined, undefined, NO_OP_FS)
   } finally {
     unsilence()
     restore()

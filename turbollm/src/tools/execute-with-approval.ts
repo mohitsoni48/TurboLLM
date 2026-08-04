@@ -29,6 +29,14 @@ export async function executeToolCallWithApproval(params: {
    *  to use. A human already approved this list when setting up the agent, so it stands
    *  in for the interactive approval a background run can never get. */
   agentAllowedTools?: string[]
+  /** Phase 4 / C1: whether the caller driving this tool loop has cleared the same bar `codeAuth`
+   *  enforces (host-local OR a valid API key). Purely pass-through — this function makes no
+   *  decision with it; `ToolRegistry.executeTool` forwards it to create_routine/update_routine/
+   *  run_routine_now, the only tools that consult it, and only for code-flavor routines. OPTIONAL
+   *  and defaulting to false so a caller that does not supply it fails closed, matching
+   *  routine-tools.ts's own fail-closed philosophy. See each call site for how it computes (or
+   *  deliberately omits) it. */
+  isCodeAuthorized?: boolean
 }): Promise<{ result: string; error?: string }> {
   const { tools, sink, convId, id, name, args, globalPolicies, convOverrides, signal, interactive, agentAllowedTools, autoAllowAll } = params
 
@@ -72,7 +80,7 @@ export async function executeToolCallWithApproval(params: {
   let error: string | undefined
   try {
     const call: ToolCall = { id, name, args }
-    result = await tools.executeTool(call)
+    result = await tools.executeTool(call, params.isCodeAuthorized ?? false)
   } catch (e) {
     error = (e as Error).message
     result = `Error: ${error}`

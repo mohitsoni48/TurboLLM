@@ -1,4 +1,4 @@
-import { FlaskConical, Rocket, Brain } from 'lucide-react'
+import { FlaskConical, Rocket, Brain, AlarmClock } from 'lucide-react'
 import { useSettings } from '../../lib/queries'
 import { ApiError } from '../../lib/api'
 import { Badge } from '../../components/ui/badge'
@@ -49,10 +49,10 @@ function FeatureRow({
  *  (ADR-280), rather than staying an opt-in toggle. */
 export function ExperimentalSection() {
   const { query: settingsQ, save } = useSettings()
-  const experimental = settingsQ.data?.experimental ?? { memory: false, cloudDeploy: false }
+  const experimental = settingsQ.data?.experimental ?? { memory: false, cloudDeploy: false, routines: false }
   const busy = save.isPending
 
-  const setFlag = (key: 'memory' | 'cloudDeploy', value: boolean) => {
+  const setFlag = (key: 'memory' | 'cloudDeploy' | 'routines', value: boolean) => {
     save.mutate(
       { experimental: { [key]: value } },
       { onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not update experimental setting.') },
@@ -84,6 +84,14 @@ export function ExperimentalSection() {
         description="One-click deploy-link support for running TurboLLM on a rented RunPod GPU. Earliest-stage of the three — turning this on does not yet unlock a built UI."
         checked={experimental.cloudDeploy}
         onChange={(v) => setFlag('cloudDeploy', v)}
+        disabled={busy}
+      />
+      <FeatureRow
+        icon={AlarmClock}
+        title="Routines"
+        description="Scheduled tasks that fire automatically with no one present — chat or Code agents on a timer. Unlocks the Routines tab in Workspace and lets chat/Code create one when on."
+        checked={experimental.routines}
+        onChange={(v) => setFlag('routines', v)}
         disabled={busy}
       />
     </section>

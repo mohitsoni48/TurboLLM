@@ -239,3 +239,54 @@ test('withSwapLock: a manual switch blocks a concurrent auto-swap from racing th
   assert.ok('target' in result, `expected a successful RouteResult, got ${JSON.stringify(result)}`)
   assert.equal(hadConcurrentViolation(), false, 'no load() call should ever have started while another was still in flight')
 })
+
+// ── loadExplicit: autoSwap-independent pinned-model load (routine swaps) ────────
+test('loadExplicit loads the requested model even when autoSwap is globally disabled', async () => {
+  const scanner = {
+    get: (key: string) => (key === 'target' ? { key: 'target', name: 'target', format: 'gguf' as const, path: '/models/target.gguf', nativeCtx: 4096 } : undefined),
+    list: () => ({ models: [{ key: 'target', name: 'target', format: 'gguf' as const, path: '/models/target.gguf', nativeCtx: 4096 }] }),
+  } as unknown as import('../models/scanner').Scanner
+  let loadedWith: unknown = null
+  // status() must flip to 'running' once load() resolves — doLoad()'s own post-load readiness
+  // check reads status() again after awaiting load(), so a fixed 'stopped' mock (as if the
+  // engine never actually started) would make doLoad() report a 503 here regardless of what
+  // loadExplicit() does. Mirrors how this file's other Manager doubles (e.g. controllableManager)
+  // track state through a load.
+  let state: 'stopped' | 'running' = 'stopped'
+  const primary = {
+    status: () => ({ state, err: null, port: 0, pid: 0, model: null, loadElapsedMs: 0 }),
+    load: async (opts: unknown) => { loadedWith = opts; state = 'running' },
+    touch: () => {},
+    target: () => 'http://127.0.0.1:8081',
+  } as unknown as import('../engines/manager').Manager
+  // update() is required — doLoad() calls store.update() to record lastLoaded on success,
+  // matching this file's own fakeFullStore() convention above.
+  const store = {
+    snapshot: () => ({ gateway: { autoSwap: false, keepN: 1 }, modelProfiles: {} }),
+    update: (fn: (c: { lastLoaded?: unknown }) => void) => fn({}),
+  } as unknown as import('../config/config').ConfigStore
+  // capabilities is required by doLoad's buildOpts -> profileToArgs (reads caps.flags/caps.kvTypes)
+  // — matches this file's existing fakeEngine() helper (line ~151) rather than a bare {id, kind}.
+  const registry = { active: () => ({ id: 'e1', kind: 'llama-cpp', capabilities: { flags: [], kvTypes: [] } }) } as unknown as import('../engines/registry').Registry
+  const { ModelRouter } = await import('./model-router')
+  const r = new ModelRouter(store, registry, primary, scanner, undefined)
+
+  const result = await r.loadExplicit('target')
+
+  assert.equal('target' in result, true)
+  assert.ok(loadedWith, 'expected Manager.load to be called even though autoSwap is disabled')
+})
+
+test('loadExplicit reports 503 for an unknown model key without touching the manager', async () => {
+  const scanner = { get: () => undefined, list: () => ({ models: [] }) } as unknown as import('../models/scanner').Scanner
+  let loadCalled = false
+  const primary = { status: () => ({ state: 'stopped', model: null }), load: async () => { loadCalled = true } } as unknown as import('../engines/manager').Manager
+  const store = { snapshot: () => ({ gateway: { autoSwap: false, keepN: 1 } }) } as unknown as import('../config/config').ConfigStore
+  const registry = { active: () => ({ id: 'e1', kind: 'llama-cpp' }) } as unknown as import('../engines/registry').Registry
+  const { ModelRouter } = await import('./model-router')
+  const r = new ModelRouter(store, registry, primary, scanner, undefined)
+
+  const result = await r.loadExplicit('nonexistent')
+  assert.equal('status' in result && result.status, 503)
+  assert.equal(loadCalled, false)
+})

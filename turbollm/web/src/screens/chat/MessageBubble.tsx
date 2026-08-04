@@ -10,6 +10,7 @@ import { activateVariant, getMessageVariants } from '../../lib/chat-api'
 import { Button } from '../../components/ui/button'
 import { CopyButton } from '../../components/ui/copy-button'
 import { ArtifactCard, isArtifactLang } from '../../components/ArtifactCard'
+import { isRoutineConfirmTool, isSupersededUpdatePreview, RoutineConfirmToolCard } from '../../components/routines/RoutineConfirmToolCard'
 import { friendlyName } from '../../lib/tool-explain'
 
 // ── Thinking block ────────────────────────────────────────────────────────────
@@ -177,10 +178,18 @@ export const Markdown = memo(function Markdown({ children, streaming }: { childr
 type CardCall = {
   id: string
   name: string
+  /** The tool call's INPUT parameters, as the model sent them. Carried because the routine
+   *  confirm gate reads `args.routineId` off an `update_routine` call — see
+   *  RoutineConfirmToolCard.tsx. `LiveToolCall` already had this field; `CardCall` did not. */
+  args: Record<string, unknown>
   status: 'pending' | 'done' | 'error' | 'awaiting_approval'
   result?: string
   /** Code mode only — pi's edit tool real diff output (turbollm/src/code/code-session.ts). */
   diff?: string
+  /** Set only by the completed-message mapping below, which is the only place with SIBLING
+   *  context: this update_routine PREVIEW's change was already applied by a later call in the
+   *  same message, so its confirm gate must not render. See `isSupersededUpdatePreview`. */
+  supersededPreview?: boolean
 }
 
 // ── Diff view (Code mode) ───────────────────────────────────────────────────────
@@ -220,7 +229,7 @@ function ToolCallCard({ call }: { call: CardCall }) {
   const hasOutput = !!(call.result?.length) || hasDiff
   const awaitingApproval = call.status === 'awaiting_approval'
 
-  return (
+  const generic = (
     <div
       className="overflow-hidden rounded-lg border bg-panel-2"
       style={awaitingApproval ? { borderColor: 'var(--warn)', background: 'color-mix(in srgb, var(--warn) 6%, transparent)' } : { borderColor: 'var(--border)' }}
@@ -254,6 +263,16 @@ function ToolCallCard({ call }: { call: CardCall }) {
       )}
     </div>
   )
+
+  // Task 8: create_routine/update_routine get an inline confirm gate instead of the generic card.
+  // Branching AFTER every hook above has run, per this file's hooks-safety rule — and on the tool
+  // NAME only, which never changes for a given call, so the component type at this position is
+  // stable across the running→done transition. The wrapper owns every other decision (has the call
+  // finished? did it succeed? is the routine still fetchable?) and renders `generic` when the
+  // answer is no. `generic` is only an element description — building it costs nothing when the
+  // confirm card wins.
+  if (isRoutineConfirmTool(call.name)) return <RoutineConfirmToolCard call={call} fallback={generic} superseded={call.supersededPreview} />
+  return generic
 }
 
 function ToolCallsPanel({ calls }: { calls: CardCall[] }) {
@@ -283,13 +302,13 @@ function useElapsedSeconds(active: boolean): number {
 
 /** One tool call rendered inline in the streaming flow, with a live spinner +
  *  elapsed timer while it runs and an expandable result once it settles. */
-function InlineToolStep({ call }: { call: LiveToolCall }) {
+function InlineToolStep({ call, superseded }: { call: LiveToolCall; superseded?: boolean }) {
   const [expanded, setExpanded] = useState(false)
   const pending = call.status === 'pending'
   const hasDiff = !!call.diff?.trim()
   const hasOutput = !!call.result?.length || hasDiff
   const elapsed = useElapsedSeconds(pending)
-  return (
+  const generic = (
     <div className="my-1.5 overflow-hidden rounded-lg border border-border bg-panel-2">
       <button
         type="button"
@@ -320,6 +339,10 @@ function InlineToolStep({ call }: { call: LiveToolCall }) {
       )}
     </div>
   )
+
+  // Same Task 8 branch as ToolCallCard's, after every hook (including useElapsedSeconds) has run.
+  if (isRoutineConfirmTool(call.name)) return <RoutineConfirmToolCard call={call} fallback={generic} superseded={superseded} />
+  return generic
 }
 
 // ── F-021: Confidence badge ───────────────────────────────────────────────────
@@ -476,6 +499,12 @@ export function StreamingBubble({
   const hasTool = timeline.some((b) => b.kind === 'tool')
   const pendingTool = timeline.some((b) => b.kind === 'tool' && b.call.status === 'pending')
   const generating = liveGenTps > 0
+  // Same superseded-preview suppression the completed path applies, for the case where the model
+  // previews AND applies an update inside one streaming turn — both blocks are on screen at once.
+  const liveCalls = timeline.flatMap((b) => (b.kind === 'tool' ? [b.call] : []))
+  const supersededCallIds = new Set(
+    liveCalls.filter((_, i) => isSupersededUpdatePreview(liveCalls, i)).map((c) => c.id),
+  )
 
   return (
     <div className="min-w-0 pt-0.5">
@@ -488,7 +517,7 @@ export function StreamingBubble({
               ? <div key={i} className="prose-tllm text-[15px] leading-[1.7] text-ink"><Markdown streaming>{b.text}</Markdown></div>
               : null)
           : b.kind === 'tool'
-            ? <InlineToolStep key={b.call.id} call={b.call} />
+            ? <InlineToolStep key={b.call.id} call={b.call} superseded={supersededCallIds.has(b.call.id)} />
             : null, // 'turn' round-divider blocks are Code-only; chat never emits them
       )}
 
@@ -625,12 +654,20 @@ export function MessageBubble({
   }
 
   // Assistant
-  const completedToolCalls: CardCall[] = (message.toolCalls ?? []).map((tc: ToolCallRecord) => ({
+  const toolCallRecords = message.toolCalls ?? []
+  const completedToolCalls: CardCall[] = toolCallRecords.map((tc: ToolCallRecord, i: number) => ({
     id: tc.id,
     name: tc.name,
+    // `?? {}` because a record persisted before args were stored (or a hand-built test fixture)
+    // can arrive without them; the confirm gate then simply finds no routineId and stays generic.
+    args: tc.args ?? {},
     status: tc.error ? 'error' : 'done',
     result: tc.error ?? tc.result,
     diff: tc.diff,
+    // The two-phase update protocol leaves BOTH the preview and the apply in a finished
+    // transcript. This mapping is the only place that sees the whole list, so it is the only
+    // place that can tell the earlier record it has been superseded.
+    supersededPreview: isSupersededUpdatePreview(toolCallRecords, i),
   }))
   // A message with no content, no reasoning, and no tool calls has nothing to show — render
   // the same fallback card an aborted-empty finish already used, instead of leaving a blank

@@ -340,9 +340,12 @@ export function CodeHomeScreen() {
         >
           <PanelLeft size={16} />
         </Button>
-        {/* No Chat|Code mode switch here — the sidebar's pill (ConversationSidebar.tsx)
-            is the single place to switch modes; duplicating it in this header too
-            was redundant chrome. */}
+        {/* No Chat|Code|Routines mode switch here — the sidebar's pill (ConversationSidebar.tsx)
+            is the single place to switch modes; duplicating it in this header too was
+            redundant chrome. Routines used to get its own shortcut button here specifically
+            because it was NOT one of the sidebar pill's options (just a link pinned above the
+            session list) — now that it's a real peer mode with its own tab in that same pill,
+            the same "no redundant chrome" reasoning above applies to it too. */}
       </div>
 
       {/* Scrollable content — mirrors ChatScreen's `scrollerRef` div exactly. No

@@ -18,6 +18,7 @@ import type { GenerationGate } from './agents/gate'
 import type { TunnelManager } from './tunnel/manager'
 import type { AgentTaskState } from './agents/task-state'
 import type { Emitter } from './telemetry/emit'
+import type { CodeRunManager } from './code/code-run-manager'
 
 export interface Deps {
   store: ConfigStore
@@ -72,4 +73,14 @@ export interface Deps {
    *  restart — keeps the engine + model loaded. Used for LAN/port changes. Wired only
    *  in the real `serve()` entrypoint (cli.ts); absent under tests. */
   rebind?: () => void
+  /** The daemon-owned Code-session run registry (code-run-manager.ts), shared between the live
+   *  Code UI routes and Routine execution (this phase, Task 7) so a routine's in-app-pi run is
+   *  the SAME kind of observable session a live one is. Optional: only wired in the real
+   *  serve() entrypoint (cli.ts); absent under tests that don't exercise Code/Routines. */
+  codeRuns?: CodeRunManager
+  /** The live RoutineScheduler instance (Phase 1, turbollm/src/routines/scheduler.ts), exposed
+   *  so routine-routes.ts's POST .../run-now can trigger an immediate fire through the exact
+   *  same overlap guard a normal scheduled tick uses. Optional: only wired in the real serve()
+   *  entrypoint. */
+  routineScheduler?: import('./routines/scheduler').RoutineScheduler
 }

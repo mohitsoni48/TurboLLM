@@ -159,55 +159,92 @@ export function webToolNames(tools: AnthropicRequest['tools']): { search: string
   return { search, fetch }
 }
 
+/** The terminal-CLI's entire routine-feature scope (see the Phase 4 plan's "corrected design"):
+ *  no tool registration exists for this surface (server-tools.ts only answers a CLI's own nested
+ *  search call; the CLI brings its own fixed tool set) — so instead this tells the CLI its
+ *  generic Bash tool can create a routine directly over the REST API, and that creation always
+ *  requires a separate human confirm step. Returns null (never a placeholder URL) when the real
+ *  request origin isn't known — see analyzeTurn's caller in gateway.ts for where it comes from. */
+export function routineGuidance(baseUrl: string | undefined): string | null {
+  if (!baseUrl) return null
+  return (
+    'If the user asks you to schedule a recurring or one-off unattended task, you can create a ' +
+    `Routine directly: \`curl -X POST ${baseUrl}/api/v1/routines\` with a JSON body ` +
+    '(flavor, prompt, scheduleDisplay, scheduleRule, modelKey, and either agentId for a chat-flavor ' +
+    'routine or workspacePath+codingAgent for a code-flavor one). It ALWAYS lands in ' +
+    '"pending_confirmation" status and will not run until a human confirms it in the app\'s Routines ' +
+    `panel — a separate \`curl -X PUT ${baseUrl}/api/v1/routines/<id>/confirm\` call, which you should ` +
+    'NOT make yourself; tell the user it needs their confirmation.'
+  )
+}
+
 /** The standing behavioural rules, adapted to this client's tool names. Text is deliberately kept
  *  in lockstep with `persona.ts`'s antiFallbackGuidance/dependencyDisciplineGuidance so both
- *  agents are held to the SAME rules — if one is reworded, reword the other. Returns [] when the
- *  client declared no web tools, in which case rules 4 and 5 have nothing to call.
+ *  agents are held to the SAME rules — if one is reworded, reword the other. Rules 4 and 5 are
+ *  omitted when the client declared no web tools, since they would name a tool it cannot call;
+ *  the routine hint is independent of that and is gated only on `baseUrl` being known, so a
+ *  toolless client can still get [] while a client with a known origin and no search tool gets
+ *  exactly the routine hint.
  *
  *  `today` defaults to the SYSTEM date, read fresh on every call — a default parameter is
  *  re-evaluated per invocation, so a daemon left running for weeks never serves a date captured at
  *  module load (the exact staleness builtin.ts's `webSearchTool` comment warns about). UTC, matching
  *  builtin.ts's `todayIso()`: every other date in play — provider `published_date`, the `Retrieved:`
  *  stamp — is already UTC, and mixing in a local date would make those comparisons inconsistent.
- *  The parameter exists so tests can pin a value; nothing in production passes it. */
+ *  The parameter exists so tests can pin a value; nothing in production passes it.
+ *
+ *  `baseUrl` is the real origin the client is talking to, threaded down from the request itself
+ *  (gateway.ts). Optional, and omitting it reproduces this function's exact pre-routine behaviour. */
 export function standingGuidance(
   tools: AnthropicRequest['tools'],
   today = new Date().toISOString().slice(0, 10),
+  baseUrl?: string,
 ): string[] {
   const { search, fetch } = webToolNames(tools)
-  if (!search) return []
-  // Phrased as a verb applied to a caller-supplied object so each rule can name what it wants read
-  // (a search result, or a specific version's docs) without string-surgery on a shared sentence.
-  const read = (what: string) => (fetch ? `use ${fetch} to read ${what}` : `read ${what}`)
+  const rules: string[] = []
 
-  return [
-    // Observed live the first time rule 5 fired end-to-end: told to verify a package it had just
-    // installed, the model searched `zod npm latest version 2024` — it dated the query from
-    // training data and would have "confirmed" a version two years stale. builtin.ts already
-    // solves this for the in-app agent by stamping the date into the web_search tool's own
-    // DESCRIPTION, which is exactly where a model composes a query from; that lever doesn't exist
-    // here, because the tool schema belongs to the CLI, not to us. Stating the date as its own
-    // standing rule is the closest equivalent the gateway has.
-    `TODAY IS ${today}. Never put a year you remember into a search query — if a query needs a ` +
-      `year, it is ${today.slice(0, 4)}. Treat your own training data as potentially years out of date.`,
+  if (search) {
+    // Phrased as a verb applied to a caller-supplied object so each rule can name what it wants read
+    // (a search result, or a specific version's docs) without string-surgery on a shared sentence.
+    const read = (what: string) => (fetch ? `use ${fetch} to read ${what}` : `read ${what}`)
 
-    // Rule 4 — research the approach first / don't silently substitute an easier feature.
-    `When you fail at a task twice in a row (a build error, a failing test, an API that doesn't ` +
-      `behave as expected), do NOT quietly substitute an easier or different feature than what was ` +
-      `actually requested — that is a critical failure even if the substitute "works". Instead, call ` +
-      `${search} for the official documentation (and Stack Overflow or similar as a secondary source, ` +
-      `weighting official docs higher) on the exact error or API you are stuck on, ` +
-      `${read('the most relevant result')}, and retry the ORIGINAL task with what you learned.`,
+    rules.push(
+      // Observed live the first time rule 5 fired end-to-end: told to verify a package it had just
+      // installed, the model searched `zod npm latest version 2024` — it dated the query from
+      // training data and would have "confirmed" a version two years stale. builtin.ts already
+      // solves this for the in-app agent by stamping the date into the web_search tool's own
+      // DESCRIPTION, which is exactly where a model composes a query from; that lever doesn't exist
+      // here, because the tool schema belongs to the CLI, not to us. Stating the date as its own
+      // standing rule is the closest equivalent the gateway has.
+      `TODAY IS ${today}. Never put a year you remember into a search query — if a query needs a ` +
+        `year, it is ${today.slice(0, 4)}. Treat your own training data as potentially years out of date.`,
 
-    // Rule 5 — versions and docs before any new dependency.
-    `STRICT RULE, no exceptions: before adding ANY new dependency — a library, package, or SDK, on ` +
-      `ANY platform (npm/yarn/pnpm, pip/poetry, Gradle/Android, cargo, go modules, gems, composer, ` +
-      `anything) — you MUST first call ${search} to find its current LATEST version (never assume a ` +
-      `version from memory, it may be outdated), then ${read("that version's real official documentation")}. ` +
-      `Only after doing both should you write the dependency declaration or install command, and ` +
-      `implement against what you actually just read rather than remembered training knowledge, ` +
-      `which is frequently stale for fast-moving libraries.`,
-  ]
+      // Rule 4 — research the approach first / don't silently substitute an easier feature.
+      `When you fail at a task twice in a row (a build error, a failing test, an API that doesn't ` +
+        `behave as expected), do NOT quietly substitute an easier or different feature than what was ` +
+        `actually requested — that is a critical failure even if the substitute "works". Instead, call ` +
+        `${search} for the official documentation (and Stack Overflow or similar as a secondary source, ` +
+        `weighting official docs higher) on the exact error or API you are stuck on, ` +
+        `${read('the most relevant result')}, and retry the ORIGINAL task with what you learned.`,
+
+      // Rule 5 — versions and docs before any new dependency.
+      `STRICT RULE, no exceptions: before adding ANY new dependency — a library, package, or SDK, on ` +
+        `ANY platform (npm/yarn/pnpm, pip/poetry, Gradle/Android, cargo, go modules, gems, composer, ` +
+        `anything) — you MUST first call ${search} to find its current LATEST version (never assume a ` +
+        `version from memory, it may be outdated), then ${read("that version's real official documentation")}. ` +
+        `Only after doing both should you write the dependency declaration or install command, and ` +
+        `implement against what you actually just read rather than remembered training knowledge, ` +
+        `which is frequently stale for fast-moving libraries.`,
+    )
+  }
+
+  // Deliberately OUTSIDE the `search` gate above: whether the CLI can create a routine over the
+  // REST API has nothing to do with whether it declared a web-search tool, so this must not
+  // disappear alongside rules 4/5. Gated only on the request origin being known.
+  const routine = routineGuidance(baseUrl)
+  if (routine) rules.push(routine)
+
+  return rules
 }
 
 /** The result of inspecting one request. */
@@ -223,8 +260,11 @@ export interface TurnGuidance {
   forceTextOnly: boolean
 }
 
-/** Inspect a request and decide what scaffolding it needs. Pure — no I/O, no state. */
-export function analyzeTurn(req: AnthropicRequest): TurnGuidance {
+/** Inspect a request and decide what scaffolding it needs. Pure — no I/O, no state.
+ *
+ *  `baseUrl` is the real origin this request arrived on, used only by the routine hint; omitting
+ *  it yields byte-identical guidance to before that hint existed. */
+export function analyzeTurn(req: AnthropicRequest, baseUrl?: string): TurnGuidance {
   const nudges: string[] = []
   let forceTextOnly = false
 
@@ -277,7 +317,7 @@ export function analyzeTurn(req: AnthropicRequest): TurnGuidance {
     }
   }
 
-  return { system: standingGuidance(req.tools), nudges, forceTextOnly }
+  return { system: standingGuidance(req.tools, undefined, baseUrl), nudges, forceTextOnly }
 }
 
 /** Apply guidance to a request IN PLACE, immediately before it is translated for the engine.
@@ -289,8 +329,8 @@ export function analyzeTurn(req: AnthropicRequest): TurnGuidance {
  *  of the conversation is where a model actually acts on an instruction.
  *
  *  Returns the analysis so the caller can act on `forceTextOnly`. */
-export function applyAgentGuidance(req: AnthropicRequest): TurnGuidance {
-  const guidance = analyzeTurn(req)
+export function applyAgentGuidance(req: AnthropicRequest, baseUrl?: string): TurnGuidance {
+  const guidance = analyzeTurn(req, baseUrl)
 
   if (guidance.system.length > 0) {
     const text = guidance.system.join('\n\n')

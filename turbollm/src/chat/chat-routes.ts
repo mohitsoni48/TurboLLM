@@ -20,6 +20,23 @@ import { saveSkillFromConversation } from '../agents/skill-jobs'
 import { extractMemoryFacts } from './memory'
 import { claimOnce } from '../telemetry/ledger'
 import type { Emitter } from '../telemetry/emit'
+import { codeGateBlocks } from '../routines/routine-routes'
+
+/** The per-request code-routine trust decision. Exported ONLY so it can be behaviourally
+ *  pinned — both generation entry points must call this, never inline the expression.
+ *
+ *  I1: this used to be `!codeGateBlocks(c, d)` written out at both call sites, protected only by
+ *  a structural test asserting on this file's source text. A reviewer defeated that with a
+ *  vulnerability-preserving refactor — alias the import (`codeGateBlocks as codeGateBlocksStrict`)
+ *  and shadow the name locally with a `() => false` — which left both producer lines byte-identical
+ *  while making `isCodeAuthorized` unconditionally `true`, with the whole suite green. The five
+ *  behavioural tests could not catch it either: they imported `codeGateBlocks` straight from
+ *  `routine-routes.ts`, so they measured the real function while production measured the shadow.
+ *  Naming the decision and exporting it lets those tests drive THIS function, out of THIS module,
+ *  so any shadow/alias/rewrite of what it resolves to is a test failure rather than a green build. */
+export function chatCodeAuthorization(c: Context, d: Deps): boolean {
+  return !codeGateBlocks(c, d)
+}
 
 // Track in-flight abort controllers per conversation id.
 const inflight = new Map<string, AbortController>()
@@ -273,6 +290,14 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const ac = new AbortController()
     inflight.set(convId, ac)
 
+    // Phase 4 / C1: the code-flavor routine gate, decided HERE because this is the last point
+    // that still has the Hono Context. `chatCodeAuthorization` wraps routine-routes.ts's own
+    // `codeGateBlocks` — POST/PUT /api/v1/routines enforce the identical decision, so the chat
+    // tool surface cannot become a softer door onto it. This route is behind lanAuth only (which
+    // has an "open LAN" bypass codeAuth does not), so a keyless LAN caller must land on `false`
+    // here. Call the named function; never re-inline the expression (see its doc comment, I1).
+    const isCodeAuthorized = chatCodeAuthorization(c, d)
+
     return streamSSE(c, async (stream) => {
       stream.onAbort(() => { ac.abort(); inflight.delete(convId) })
 
@@ -304,7 +329,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
         : fullContent
       engineMessages.push({ role: 'user', content: userContent })
 
-      await runGeneration(d, stream, { convId, conv, engineMessages, assistantMsg, ms, target, ac, thinkingBudget: b.thinkingBudget ?? -1, userText: content })
+      await runGeneration(d, stream, { convId, conv, engineMessages, assistantMsg, ms, target, ac, thinkingBudget: b.thinkingBudget ?? -1, userText: content, isCodeAuthorized })
     })
   })
 
@@ -346,6 +371,10 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const ac = new AbortController()
     inflight.set(convId, ac)
 
+    // Same per-request code-routine gate as the /messages route above — a regenerated turn can
+    // emit tool calls too, so it must not be a softer door onto code-flavor routine authoring.
+    const isCodeAuthorized = chatCodeAuthorization(c, d)
+
     return streamSSE(c, async (stream) => {
       stream.onAbort(() => { ac.abort(); inflight.delete(convId) })
 
@@ -366,7 +395,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
         engineMessages.push({ role: m.role, content })
       }
 
-      await runGeneration(d, stream, { convId, conv, engineMessages, assistantMsg, ms, target, ac, thinkingBudget: b.thinkingBudget ?? -1 })
+      await runGeneration(d, stream, { convId, conv, engineMessages, assistantMsg, ms, target, ac, thinkingBudget: b.thinkingBudget ?? -1, isCodeAuthorized })
     })
   })
 
@@ -676,6 +705,12 @@ interface GenerationCtx {
    *  tool output) for this turn. Undefined on regenerate — no new user text exists there,
    *  so extraction is skipped by design (also avoids re-extracting already-scanned text). */
   userText?: string
+  /** Phase 4 / C1: whether THIS request's caller cleared the code-execution bar (host-local or a
+   *  valid API key), computed by the route handler — the only place a Hono `Context` exists — and
+   *  carried down here because runGeneration is Context-free by design. Forwarded verbatim to
+   *  executeToolCallWithApproval, which hands it to ToolRegistry.executeTool; only
+   *  create_routine/update_routine/run_routine_now read it, and only for code-flavor routines. */
+  isCodeAuthorized: boolean
 }
 
 /**
@@ -1119,6 +1154,9 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
               autoAllowAll: d.store.snapshot().tools.autoAllowAll ?? false,
               signal: ac.signal,
               interactive: true,
+              // The real per-request trust decision this handler's route computed from its Hono
+              // Context (see the `chatCodeAuthorization(c, d)` call sites) — never a hardcoded true.
+              isCodeAuthorized: ctx.isCodeAuthorized,
             })
             result = approved.result
             callError = approved.error

@@ -1,0 +1,741 @@
+import { act, render, screen, within } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { MemoryRouter, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { RoutineEditPage } from './RoutineEditPage'
+import { ApiError } from '../../lib/api'
+import type { Routine, RoutineRun } from '../../lib/routine-types'
+
+vi.mock('../../lib/queries', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../lib/queries')>()
+  return {
+    ...actual,
+    useChatAgents: () => ({ data: [{ id: 'agent-1', name: 'Research Agent', description: '', systemPrompt: '', skillIds: [], tools: [] }] }),
+    useModels: () => ({ data: { models: [{ key: 'model-a', name: 'Model A', compatibleWithActiveEngine: true }] } }),
+  }
+})
+
+// Real sonner needs a mounted <Toaster/> to be observable, and the 401 assertions below are
+// checking this feature's ONLY auth feedback (routine-api.ts's header comment).
+const toastError = vi.fn()
+const toastSuccess = vi.fn()
+vi.mock('../../components/ui/sonner', () => ({
+  toast: { error: (...a: unknown[]) => toastError(...a), success: (...a: unknown[]) => toastSuccess(...a), info: vi.fn(), warning: vi.fn() },
+}))
+
+// ChatScreen/CodeSessionScreen are the real, full-weight screens (model switcher, streaming,
+// terminal, PDF attachment support pulling in pdfjs-dist — which needs a DOMMatrix jsdom does
+// not provide) — RoutineEditPage embeds them verbatim (same components the standalone
+// /workspace/chat/:id and /workspace/code/:id routes render), so these tests stub them down to
+// "did the middle pane get the right embedded/override props", not re-test either screen's own
+// internals (which have no coverage of their own and are exercised live in the browser instead).
+vi.mock('../ChatScreen', () => ({
+  ChatScreen: ({ embedded, convIdOverride }: { embedded?: boolean; convIdOverride?: string }) => (
+    <div data-testid="embedded-chat">chat:{String(embedded)}:{convIdOverride}</div>
+  ),
+}))
+vi.mock('../code/CodeSessionScreen', () => ({
+  CodeSessionScreen: ({ embedded, sessionIdOverride }: { embedded?: boolean; sessionIdOverride?: string }) => (
+    <div data-testid="embedded-code">code:{String(embedded)}:{sessionIdOverride}</div>
+  ),
+}))
+
+/** Mutable holders so each test sets its own routine/runs before rendering — and, more to the
+ *  point, so a test can CHANGE them between renders and prove the page re-reads them rather than
+ *  holding a copy. */
+let routineData: Routine | undefined
+/** Set instead of `routineData` when a test needs the detail query to answer DIFFERENTLY per
+ *  routine id — i.e. the real-navigation tests, where the whole point is that the page is looking
+ *  at a genuinely different routine after the route changes. `routineData` alone cannot express
+ *  that, because it is id-blind. */
+let routinesById: Record<string, Routine> | null = null
+let runsData: RoutineRun[] = []
+const queryState = { isLoading: false, isError: false }
+const routineRefetch = vi.fn()
+const createMutate = vi.fn()
+const confirmMutate = vi.fn()
+const updateMutate = vi.fn()
+const removeMutate = vi.fn()
+const pauseMutate = vi.fn()
+const resumeMutate = vi.fn()
+const runNowMutate = vi.fn()
+const approveMutate = vi.fn()
+const denyMutate = vi.fn()
+
+vi.mock('../../lib/routine-queries', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../lib/routine-queries')>()
+  return {
+    ...actual,
+    useRoutine: (id?: string) => ({
+      data: routinesById ? (id ? routinesById[id] : undefined) : routineData,
+      isLoading: queryState.isLoading, isError: queryState.isError, refetch: routineRefetch,
+    }),
+    useRoutineRuns: () => ({ data: runsData, isLoading: false, isError: false, refetch: vi.fn() }),
+    useRoutineMutations: () => ({
+      create: { mutate: createMutate, isPending: false },
+      confirm: { mutate: confirmMutate, isPending: false },
+      update: { mutate: updateMutate, isPending: false },
+      remove: { mutate: removeMutate, isPending: false },
+      pause: { mutate: pauseMutate, isPending: false },
+      resume: { mutate: resumeMutate, isPending: false },
+      runNow: { mutate: runNowMutate, isPending: false },
+      approve: { mutate: approveMutate, isPending: false },
+      deny: { mutate: denyMutate, isPending: false },
+    }),
+  }
+})
+
+function LocationProbe() {
+  const { pathname } = useLocation()
+  return <span data-testid="pathname">{pathname}</span>
+}
+
+function pendingRoutine(overrides: Partial<Routine> = {}): Routine {
+  return {
+    id: 'r1', flavor: 'chat', status: 'pending_confirmation', prompt: 'Summarize my inbox',
+    scheduleDisplay: 'Runs daily at 9:00 AM', scheduleRule: { kind: 'daily', hour: 9, minute: 0 },
+    nextFireAt: null, modelKey: 'model-a', agentId: 'agent-1', createdAt: '', updatedAt: '', ...overrides,
+  }
+}
+function activeRoutine(overrides: Partial<Routine> = {}): Routine {
+  return pendingRoutine({ status: 'active', nextFireAt: '2026-08-02T09:00:00.000Z', ...overrides })
+}
+
+function newTree() {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  return (
+    <QueryClientProvider client={qc}>
+      <MemoryRouter initialEntries={['/workspace/routines/new']}>
+        <Routes><Route path="/workspace/routines/new" element={<RoutineEditPage />} /></Routes>
+        <LocationProbe />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+}
+function renderNew() {
+  return render(newTree())
+}
+
+function detailTree(id = 'r1') {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  return (
+    <QueryClientProvider client={qc}>
+      <MemoryRouter initialEntries={[`/workspace/routines/${id}`]}>
+        <Routes><Route path="/workspace/routines/:routineId" element={<RoutineEditPage />} /></Routes>
+        <LocationProbe />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+}
+function renderDetail(id = 'r1') {
+  return render(detailTree(id))
+}
+
+/** Hands the live router's own `navigate` to the test. A REAL route change is the thing
+ *  `rerender(detailTree('r2'))` cannot do: `initialEntries` is consumed only at mount, so
+ *  re-rendering a fresh <MemoryRouter> leaves the mounted page's `useParams()` untouched. Calling
+ *  `navigate()` from inside the SAME router instance is what the app itself does, and models a
+ *  browser Back/Forward between two routine URLs — which is not a click on anything, so this is
+ *  deliberately a handle rather than a button (a button outside an open Radix modal is
+ *  `pointer-events: none` anyway, and would test the wrong thing). */
+let routerNavigate: ((to: string) => void) | null = null
+function NavHandle() {
+  routerNavigate = useNavigate()
+  return null
+}
+async function navigateTo(path: string) {
+  await act(async () => { routerNavigate?.(path) })
+}
+
+/** One mounted router that can walk between routine URLs. Both real routes are registered, in the
+ *  same order as App.tsx, so the `new` ↔ `:routineId` transition is exercisable too. */
+function routedTree(startPath = '/workspace/routines/r1') {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  return (
+    <QueryClientProvider client={qc}>
+      <MemoryRouter initialEntries={[startPath]}>
+        <Routes>
+          <Route path="/workspace/routines/new" element={<RoutineEditPage />} />
+          <Route path="/workspace/routines/:routineId" element={<RoutineEditPage />} />
+        </Routes>
+        <LocationProbe />
+        <NavHandle />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+}
+
+/** The page renders the Code-mode sidebar, which has its own "Active" session filter and its own
+ *  buttons — scope status/badge assertions to the routine's own header row. */
+// The prompt title and the status badge / action buttons are now two separate rows (the right
+// panel's own header, above the Runs list) rather than one — go up to their shared parent.
+function headerRow(): HTMLElement {
+  return screen.getByText('Summarize my inbox').closest('div')!.parentElement as HTMLElement
+}
+
+beforeEach(() => {
+  routineData = undefined
+  routinesById = null
+  routerNavigate = null
+  runsData = []
+  queryState.isLoading = false
+  queryState.isError = false
+  routineRefetch.mockReset()
+  createMutate.mockReset(); confirmMutate.mockReset(); updateMutate.mockReset(); removeMutate.mockReset()
+  pauseMutate.mockReset(); resumeMutate.mockReset(); runNowMutate.mockReset()
+  approveMutate.mockReset(); denyMutate.mockReset()
+  toastError.mockReset(); toastSuccess.mockReset()
+})
+
+describe('RoutineEditPage — create flow', () => {
+  it('fills the form, creates a pending routine, then shows the confirm gate', async () => {
+    const user = userEvent.setup()
+    createMutate.mockImplementation((_input, opts) => opts.onSuccess(pendingRoutine()))
+    renderNew()
+
+    await user.type(screen.getByPlaceholderText(/What should this routine do/), 'Summarize my inbox')
+    await user.selectOptions(screen.getByDisplayValue('Choose a model…'), 'model-a')
+    await user.selectOptions(screen.getByDisplayValue('Choose an agent…'), 'agent-1')
+    await user.click(screen.getByRole('button', { name: 'Continue' }))
+
+    expect(createMutate).toHaveBeenCalledWith(
+      expect.objectContaining({ prompt: 'Summarize my inbox', modelKey: 'model-a', agentId: 'agent-1', flavor: 'chat', scheduleDisplay: 'Runs daily at 9:00 AM' }),
+      expect.anything(),
+    )
+    expect(await screen.findByText('Confirm this new routine')).toBeInTheDocument()
+  })
+
+  it('Continue stays disabled until every flavor-required field is filled', async () => {
+    const user = userEvent.setup()
+    renderNew()
+    expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled()
+    await user.type(screen.getByPlaceholderText(/What should this routine do/), 'Summarize my inbox')
+    await user.selectOptions(screen.getByDisplayValue('Choose a model…'), 'model-a')
+    // Agent still unset — a chat routine cannot be created without one (routine-routes.ts's
+    // validateCreate), so the button must not offer to try.
+    expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled()
+    await user.selectOptions(screen.getByDisplayValue('Choose an agent…'), 'agent-1')
+    expect(screen.getByRole('button', { name: 'Continue' })).not.toBeDisabled()
+  })
+
+  it('labels a 401 on create as an authorization problem, the only auth feedback this surface has', async () => {
+    const user = userEvent.setup()
+    createMutate.mockImplementation((_input, opts) => opts.onError(new ApiError('unauthorized', 'A valid API key is required to schedule a Code routine from a non-host device.', 401)))
+    renderNew()
+    await user.type(screen.getByPlaceholderText(/What should this routine do/), 'Do a thing')
+    await user.selectOptions(screen.getByDisplayValue('Choose a model…'), 'model-a')
+    await user.selectOptions(screen.getByDisplayValue('Choose an agent…'), 'agent-1')
+    await user.click(screen.getByRole('button', { name: 'Continue' }))
+    expect(toastError).toHaveBeenCalledWith('Not authorized: A valid API key is required to schedule a Code routine from a non-host device.')
+    // Still on the form, with the draft intact, so the user can retry after pasting a key.
+    expect(screen.getByRole('button', { name: 'Continue' })).toBeInTheDocument()
+  })
+
+  // ── "actual current state, not recorded state" ────────────────────────────────────────────
+  it('replaces the confirm gate with a settled state once the routine stops being pending_confirmation', async () => {
+    const user = userEvent.setup()
+    createMutate.mockImplementation((_input, opts) => opts.onSuccess(pendingRoutine()))
+    const { rerender } = renderNew()
+    await user.type(screen.getByPlaceholderText(/What should this routine do/), 'Summarize my inbox')
+    await user.selectOptions(screen.getByDisplayValue('Choose a model…'), 'model-a')
+    await user.selectOptions(screen.getByDisplayValue('Choose an agent…'), 'agent-1')
+    await user.click(screen.getByRole('button', { name: 'Continue' }))
+    expect(screen.getByText('Confirm this new routine')).toBeInTheDocument()
+
+    // The routine got confirmed elsewhere (another tab, the chat transcript's own confirm card)
+    // while this page sat open, and the detail query the page now runs against the created id
+    // returns an ACTIVE routine. This card's Cancel is a hard DELETE with cascade to the run
+    // history and DELETE has no status guard of any kind, so leaving it actionable turns
+    // "dismiss this proposal" into "silently destroy a live scheduled job".
+    routineData = activeRoutine()
+    rerender(newTree())
+    expect(screen.queryByText('Confirm this new routine')).not.toBeInTheDocument()
+    expect(screen.getByText(/no longer awaiting confirmation/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Cancel/ })).not.toBeInTheDocument()
+    expect(removeMutate).not.toHaveBeenCalled()
+  })
+})
+
+describe('RoutineEditPage — existing-routine detail', () => {
+  it('shows status badge, Pause for an active routine, and run history', () => {
+    routineData = activeRoutine()
+    runsData = [{ id: 'run1', routineId: 'r1', status: 'ok', configSnapshot: '{}', startedAt: '2026-08-01T09:00:00.000Z' }]
+    renderDetail()
+    expect(within(headerRow()).getByText('Active')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Pause/ })).toBeInTheDocument()
+    expect(screen.getByText(/Ran successfully/)).toBeInTheDocument()
+  })
+
+  // Closes the gap where a run's actual output (e.g. the job listings a chat-flavor routine
+  // found) was fetched but never shown anywhere. A run with neither conversationId nor
+  // codeSessionId (predates that field) falls back to the flattened result/error text, shown for
+  // whichever run is selected — no runs of any other kind here, so it's selected by default.
+  it('a legacy run (no conversationId/codeSessionId) shows its flattened result in the middle pane', () => {
+    routineData = activeRoutine()
+    runsData = [{
+      id: 'run1', routineId: 'r1', status: 'ok', configSnapshot: '{}',
+      startedAt: '2026-08-01T09:00:00.000Z', result: 'Found 3 Android developer roles today.',
+    }]
+    renderDetail()
+    expect(screen.getByText(/Found 3 Android developer roles/)).toBeInTheDocument()
+    expect(screen.queryByTestId('embedded-chat')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('embedded-code')).not.toBeInTheDocument()
+  })
+
+  // The whole point of Task 26 → this rebuild: a run with a real conversation/session is embedded
+  // in place — the SAME ChatScreen/CodeSessionScreen the standalone routes render, not a
+  // navigation away from the routine and not a read-only text dump of it.
+  it('a run with a conversationId embeds the real ChatScreen in place, not a navigation or a text dump', () => {
+    routineData = activeRoutine()
+    runsData = [{
+      id: 'run1', routineId: 'r1', status: 'ok', configSnapshot: '{}',
+      startedAt: '2026-08-01T09:00:00.000Z', result: 'Found 3 Android developer roles today.',
+      conversationId: 'conv-42',
+    }]
+    renderDetail()
+    expect(screen.getByTestId('embedded-chat')).toHaveTextContent('chat:true:conv-42')
+    // Still on the routine's own page — no navigation happened.
+    expect(screen.getByTestId('pathname')).toHaveTextContent('/workspace/routines/r1')
+    // Not the flattened-text fallback path — that's for runs with nothing real to open.
+    expect(screen.queryByText(/Found 3 Android developer roles/)).not.toBeInTheDocument()
+  })
+
+  it('a code-flavor run with a codeSessionId embeds the real CodeSessionScreen in place', () => {
+    routineData = activeRoutine({ flavor: 'code', workspacePath: 'C:/repo', codingAgent: 'pi' })
+    runsData = [{
+      id: 'run1', routineId: 'r1', status: 'ok', configSnapshot: '{}',
+      startedAt: '2026-08-01T09:00:00.000Z', result: 'done', codeSessionId: 'sess-7',
+    }]
+    renderDetail()
+    expect(screen.getByTestId('embedded-code')).toHaveTextContent('code:true:sess-7')
+    expect(screen.getByTestId('pathname')).toHaveTextContent('/workspace/routines/r1')
+  })
+
+  it('every run is a selectable row regardless of what it has to show, and clicking one switches the embedded pane', async () => {
+    const user = userEvent.setup()
+    routineData = activeRoutine()
+    runsData = [
+      // Newest first (listRoutineRuns' real ordering) — selected by default.
+      { id: 'run2', routineId: 'r1', status: 'errored', configSnapshot: '{}', startedAt: '2026-08-01T09:00:00.000Z', error: 'boom' },
+      { id: 'run1', routineId: 'r1', status: 'ok', configSnapshot: '{}', startedAt: '2026-08-01T08:00:00.000Z', conversationId: 'conv-1' },
+    ]
+    renderDetail()
+    const errored = screen.getByRole('button', { name: /Errored: boom/ })
+    const ok = screen.getByRole('button', { name: /Ran successfully/ })
+    // Defaults to the newest run (errored) — no linkable id, so the middle pane shows its text.
+    expect(errored).toHaveAttribute('aria-current', 'true')
+    expect(screen.getByText(/^Errored: boom/)).toBeInTheDocument()
+    expect(screen.queryByTestId('embedded-chat')).not.toBeInTheDocument()
+
+    await user.click(ok)
+    expect(ok).toHaveAttribute('aria-current', 'true')
+    expect(errored).not.toHaveAttribute('aria-current', 'true')
+    expect(screen.getByTestId('embedded-chat')).toHaveTextContent('chat:true:conv-1')
+  })
+
+  it('with no runs yet, the middle pane says so instead of showing nothing', () => {
+    routineData = activeRoutine()
+    runsData = []
+    renderDetail()
+    expect(screen.getAllByText(/No runs yet/).length).toBeGreaterThan(0)
+  })
+
+  it('Pause calls the pause mutation with the routine id', async () => {
+    const user = userEvent.setup()
+    routineData = activeRoutine()
+    renderDetail()
+    await user.click(screen.getByRole('button', { name: /Pause/ }))
+    expect(pauseMutate).toHaveBeenCalledWith('r1', expect.anything())
+  })
+
+  it('offers Resume (not Pause) for a paused routine, and still offers Run now', async () => {
+    const user = userEvent.setup()
+    routineData = activeRoutine({ status: 'paused', nextFireAt: null })
+    renderDetail()
+    expect(screen.queryByRole('button', { name: /Pause/ })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: /Resume/ }))
+    expect(resumeMutate).toHaveBeenCalledWith('r1', expect.anything())
+    // /run-now only refuses 'not_confirmed' (routine-routes.ts), so a paused routine can still be
+    // fired by hand.
+    await user.click(screen.getByRole('button', { name: /Run now/ }))
+    expect(runNowMutate).toHaveBeenCalledWith('r1', expect.anything())
+  })
+
+  // A routine reached via its OWN url (the sidebar list, a bookmark) rather than the ephemeral
+  // /new form or the original chat message — those were previously the ONLY two places this gate
+  // ever showed, so a routine an agent created via chat's create_routine tool had no way to be
+  // confirmed at all once you navigated away and came back to it here: this used to render the
+  // generic status-badge view (no Pause/Resume/Run-now, correctly, but also no way to confirm).
+  it('shows the SAME confirm gate (Confirm/Cancel/Edit inline) here as /new and the chat card do, for a routine reached via its own url', async () => {
+    const user = userEvent.setup()
+    routineData = pendingRoutine()
+    renderDetail()
+    // Not the old dead-end view: no status badge, no Pause/Resume/Run-now/Edit(-diff) buttons.
+    expect(screen.queryByText('Awaiting confirmation')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Pause/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Resume/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Run now/ })).not.toBeInTheDocument()
+    // The actual confirm gate, same as RoutineConfirmCard.test.tsx's own create-mode coverage.
+    const confirmBtn = screen.getByRole('button', { name: /^Confirm$/ })
+    expect(confirmBtn).not.toBeDisabled()
+    expect(screen.getByRole('button', { name: /^Cancel$/ })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Edit inline/ })).toBeInTheDocument()
+    await user.click(confirmBtn)
+    expect(confirmMutate).toHaveBeenCalledWith('r1', expect.anything())
+  })
+
+  it('Cancel on that gate discards the pending routine and navigates back to the routines list', async () => {
+    const user = userEvent.setup()
+    routineData = pendingRoutine()
+    renderDetail()
+    await user.click(screen.getByRole('button', { name: /^Cancel$/ }))
+    expect(removeMutate).toHaveBeenCalledWith('r1', expect.anything())
+    expect(screen.getByTestId('pathname')).toHaveTextContent('/workspace/routines')
+  })
+
+  it('editing a field and reviewing shows the update confirm gate with a diff, and Confirm calls update', async () => {
+    const user = userEvent.setup()
+    updateMutate.mockImplementation((_v, opts) => opts.onSuccess(activeRoutine({ prompt: 'New prompt' })))
+    routineData = activeRoutine()
+    renderDetail()
+
+    await user.click(screen.getByRole('button', { name: 'Edit' }))
+    const promptBox = screen.getByPlaceholderText(/What should this routine do/)
+    await user.clear(promptBox)
+    await user.type(promptBox, 'New prompt')
+    await user.click(screen.getByRole('button', { name: 'Review change' }))
+
+    expect(screen.getByText('Confirm this change')).toBeInTheDocument()
+    expect(screen.getByText('− Summarize my inbox')).toBeInTheDocument()
+    expect(screen.getByText('+ New prompt')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: /Confirm/ }))
+    expect(updateMutate).toHaveBeenCalledWith({ id: 'r1', patch: expect.objectContaining({ prompt: 'New prompt' }) }, expect.anything())
+  })
+
+  it('the inline edit form cannot change flavor — PUT can never apply it', async () => {
+    const user = userEvent.setup()
+    routineData = activeRoutine()
+    renderDetail()
+    await user.click(screen.getByRole('button', { name: 'Edit' }))
+    expect(screen.getByRole('button', { name: 'Code' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Chat' })).toBeDisabled()
+  })
+
+  it('Discard drops the proposed edit instead of leaving a confirm gate behind', async () => {
+    const user = userEvent.setup()
+    routineData = activeRoutine()
+    renderDetail()
+    await user.click(screen.getByRole('button', { name: 'Edit' }))
+    const promptBox = screen.getByPlaceholderText(/What should this routine do/)
+    await user.clear(promptBox)
+    await user.type(promptBox, 'Something else')
+    await user.click(screen.getByRole('button', { name: 'Discard' }))
+    expect(screen.queryByText('Confirm this change')).not.toBeInTheDocument()
+    expect(updateMutate).not.toHaveBeenCalled()
+  })
+
+  it('an edit that changes nothing raises no confirm gate', async () => {
+    const user = userEvent.setup()
+    routineData = activeRoutine()
+    renderDetail()
+    await user.click(screen.getByRole('button', { name: 'Edit' }))
+    await user.click(screen.getByRole('button', { name: 'Review change' }))
+    expect(screen.queryByText('Confirm this change')).not.toBeInTheDocument()
+  })
+
+  it('renders an approval card, not a plain summary row, for a needs_approval run', () => {
+    routineData = activeRoutine()
+    runsData = [{
+      id: 'run1', routineId: 'r1', status: 'needs_approval', configSnapshot: '{}',
+      startedAt: '2026-08-01T09:00:00.000Z',
+      pendingToolCall: JSON.stringify({ convId: 'c1', assistantContent: '', precedingCalls: [], call: { id: 'x', name: 'run_shell', args: { command: 'ls' } } }),
+    }]
+    renderDetail()
+    expect(screen.getByRole('button', { name: 'Approve' })).toBeInTheDocument()
+    expect(screen.getByText('run_shell')).toBeInTheDocument()
+    expect(within(headerRow()).getByText('Needs approval')).toBeInTheDocument()
+  })
+
+  // cli-interactive-runner.ts's live-terminal path for claude_cli ask/plan routines: the run
+  // parks at 'needs_approval' too, but with NO pendingToolCall (nothing structured to approve via
+  // a button — the human answers the CLI's own prompt directly in the embedded terminal). Showing
+  // RoutineApprovalCard here would offer Approve/Deny buttons that resumeRoutineRun can't actually
+  // resolve for a run like this.
+  it('a needs_approval run with no pendingToolCall (interactive claude_cli) renders as a plain selectable row, not an approval card', async () => {
+    const user = userEvent.setup()
+    routineData = activeRoutine({ flavor: 'code', codingAgent: 'claude_cli', permissionMode: 'ask', agentId: undefined, workspacePath: 'C:/repo' })
+    runsData = [{
+      id: 'run1', routineId: 'r1', status: 'needs_approval', configSnapshot: '{}',
+      startedAt: '2026-08-01T09:00:00.000Z', codeSessionId: 'cs1',
+    }]
+    renderDetail()
+    expect(screen.queryByRole('button', { name: 'Approve' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Deny' })).not.toBeInTheDocument()
+    const row = screen.getByRole('button', { name: /Needs approval/ })
+    await user.click(row)
+    // Selecting it opens the SAME embedded CodeSessionScreen any other code-flavor run does —
+    // the human interacts with the real interactive prompt there, not via a button here.
+    expect(screen.getByTestId('embedded-code')).toHaveTextContent('code:true:cs1')
+  })
+
+  it('disables Run now while a run is parked awaiting approval — /run-now can only 409 there', () => {
+    routineData = activeRoutine()
+    runsData = [{
+      id: 'run1', routineId: 'r1', status: 'needs_approval', configSnapshot: '{}',
+      startedAt: '2026-08-01T09:00:00.000Z',
+      pendingToolCall: JSON.stringify({ convId: 'c1', assistantContent: '', precedingCalls: [], call: { id: 'x', name: 'run_shell', args: { command: 'ls' } } }),
+    }]
+    renderDetail()
+    // A parked run is not `running`, but it stays in RoutineScheduler.inFlight until approve/deny
+    // calls releaseParked — tick() and runNow() both skip the inFlight delete when a run parked,
+    // and reconcileParkedRuns() re-adds it at daemon start. So POST /run-now answers 409
+    // `already_running` for the whole time this card is on screen, and an enabled button would
+    // offer the user nothing but a failure toast.
+    expect(screen.getByRole('button', { name: /Run now/ })).toBeDisabled()
+  })
+
+  it('shows a skeleton, not an error, while the routine is still loading', () => {
+    queryState.isLoading = true
+    const { container } = renderDetail()
+    expect(screen.queryByText('Could not load this routine.')).not.toBeInTheDocument()
+    expect(container.querySelectorAll('.tllm-pulse').length).toBeGreaterThan(0)
+  })
+
+  it('shows a retryable inline error when the routine cannot be read', async () => {
+    const user = userEvent.setup()
+    queryState.isError = true
+    renderDetail()
+    expect(screen.getByText('Could not load this routine.')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Retry' }))
+    expect(routineRefetch).toHaveBeenCalled()
+  })
+})
+
+describe('RoutineEditPage — delete', () => {
+  it('requires the AlertDialog confirmation before removing the routine', async () => {
+    const user = userEvent.setup()
+    removeMutate.mockImplementation((_id, opts) => opts.onSuccess({ ok: true }))
+    routineData = activeRoutine()
+    renderDetail()
+
+    await user.click(screen.getByRole('button', { name: /Delete/ }))
+    expect(removeMutate).not.toHaveBeenCalled() // dialog open, nothing deleted yet
+    expect(screen.getByText('Delete this routine?')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Delete routine' }))
+    expect(removeMutate).toHaveBeenCalledWith('r1', expect.anything())
+    expect(toastSuccess).toHaveBeenCalledWith('Routine deleted.')
+    expect(screen.getByTestId('pathname')).toHaveTextContent('/workspace/routines')
+  })
+
+  it('Cancel closes the dialog without deleting anything', async () => {
+    const user = userEvent.setup()
+    routineData = activeRoutine()
+    renderDetail()
+    await user.click(screen.getByRole('button', { name: /Delete/ }))
+    await user.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(removeMutate).not.toHaveBeenCalled()
+    expect(screen.queryByText('Delete this routine?')).not.toBeInTheDocument()
+  })
+
+  it('passes NO per-call onError — the failure toast is owned by the mutation definition', async () => {
+    const user = userEvent.setup()
+    routineData = activeRoutine()
+    renderDetail()
+    await user.click(screen.getByRole('button', { name: /Delete/ }))
+    await user.click(screen.getByRole('button', { name: 'Delete routine' }))
+    // routine-queries.ts's `remove` toasts at the mutation level precisely so a failed DELETE is
+    // still surfaced after this page navigates away. TanStack Query runs BOTH callback levels, so
+    // a per-call onError here would double-toast the same failure.
+    const opts = removeMutate.mock.calls[0][1] as Record<string, unknown>
+    expect(opts.onError).toBeUndefined()
+  })
+})
+
+// ── The defect class two prior components in this feature each shipped once: a control wired to
+//    a RECORDED copy of state instead of the ACTUAL CURRENT one. ─────────────────────────────
+describe('RoutineEditPage — every control reads the live routine, never a captured copy', () => {
+  it('swaps Pause for Resume when the live query reports the routine was paused elsewhere', () => {
+    routineData = activeRoutine()
+    const { rerender } = renderDetail()
+    expect(screen.getByRole('button', { name: /Pause/ })).toBeInTheDocument()
+
+    // Another tab paused it; the detail query's poll lands. No remount, no navigation — if the
+    // page had captured the routine in useState (the exact bug two sibling components shipped),
+    // this would still be offering Pause, and clicking it would 409.
+    routineData = activeRoutine({ status: 'paused', nextFireAt: null })
+    rerender(detailTree())
+    expect(screen.queryByRole('button', { name: /Pause/ })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Resume/ })).toBeInTheDocument()
+  })
+
+  it('a failed pause toasts and refetches, so a view that fell behind corrects itself', async () => {
+    const user = userEvent.setup()
+    pauseMutate.mockImplementation((_id, opts) => opts.onError(new ApiError('not_active', 'Routine is not active.', 409)))
+    routineData = activeRoutine()
+    renderDetail()
+    await user.click(screen.getByRole('button', { name: /Pause/ }))
+    expect(toastError).toHaveBeenCalledWith('Routine is not active.')
+    expect(routineRefetch).toHaveBeenCalled()
+  })
+
+  it('re-reads the run list on every render, so an open delete dialog warns about a run that started after it opened', async () => {
+    const user = userEvent.setup()
+    routineData = activeRoutine()
+    runsData = [{ id: 'run1', routineId: 'r1', status: 'ok', configSnapshot: '{}', startedAt: '2026-08-01T09:00:00.000Z' }]
+    const { rerender } = render(detailTree())
+    // Open the dialog against a quiet routine.
+    await user.click(screen.getByRole('button', { name: /Delete/ }))
+    expect(screen.getByText('Delete this routine?')).toBeInTheDocument()
+    expect(screen.queryByText(/A run is in progress right now/)).not.toBeInTheDocument()
+
+    // A scheduled fire starts while the dialog sits open. The confirm button is about to discard
+    // it, so the dialog has to say so — which it can only do by reading the live run list rather
+    // than a snapshot taken when the dialog opened.
+    runsData = [{ id: 'run2', routineId: 'r1', status: 'running', configSnapshot: '{}', startedAt: '2026-08-02T09:00:00.000Z' }, ...runsData]
+    rerender(detailTree())
+    expect(screen.getByText(/A run is in progress right now/)).toBeInTheDocument()
+  })
+
+  it("reads the routine's id at confirm-click time, not when the dialog was opened", async () => {
+    const user = userEvent.setup()
+    routineData = activeRoutine()
+    const { rerender } = renderDetail()
+    await user.click(screen.getByRole('button', { name: /Delete/ }))
+
+    // NOT a routing change: `rerender(detailTree('r2'))` mounts a fresh <MemoryRouter>, whose
+    // `initialEntries` is consumed only at mount, so the already-mounted page's
+    // `useParams().routineId` stays 'r1'. What this drives is the detail query answering with a
+    // different object on the same mount — which proves the id the DELETE carries is re-read from
+    // routineQ.data at click time rather than captured when the dialog opened.
+    // A REAL `:routineId` change is a different scenario entirely, and the page now discards the
+    // dialog outright rather than retargeting it — see the real-navigation tests below.
+    routineData = activeRoutine({ id: 'r2', prompt: 'Nightly backup' })
+    rerender(detailTree('r2'))
+    await user.click(screen.getByRole('button', { name: 'Delete routine' }))
+    expect(removeMutate).toHaveBeenCalledWith('r2', expect.anything())
+  })
+
+  it('re-derives the update diff on every render, against the routine as it stands now', async () => {
+    const user = userEvent.setup()
+    routineData = activeRoutine()
+    const { rerender } = renderDetail()
+    await user.click(screen.getByRole('button', { name: 'Edit' }))
+    const promptBox = screen.getByPlaceholderText(/What should this routine do/)
+    await user.clear(promptBox)
+    await user.type(promptBox, 'New prompt')
+    await user.click(screen.getByRole('button', { name: 'Review change' }))
+    expect(screen.getByText('− Summarize my inbox')).toBeInTheDocument()
+
+    // Someone else edited the model in the meantime. The gate must show what THIS change does to
+    // the routine as it stands now, not to the version this page happened to load first.
+    routineData = activeRoutine({ modelKey: 'model-b' })
+    rerender(detailTree())
+    expect(screen.getByText('− model-b')).toBeInTheDocument()
+    expect(screen.getByText('+ model-a')).toBeInTheDocument()
+  })
+})
+
+// ── A REAL `:routineId` change, driven by the router's own navigate(). Every test above that
+//    talks about "the routed id changing" does not actually change it (initialEntries is a
+//    mount-time input); these do. The property under test is the opposite of the ones above: a
+//    control must read the LIVE routine, but the user's INTENT must not survive the routine it
+//    was given for. `/workspace/routines/:routineId` is one route pattern for every routine,
+//    so React reconciles the same component instance across the change and would otherwise keep
+//    every piece of that intent — which is why the page mounts under `key={routineId}`. ────────
+describe('RoutineEditPage — a real route change to a different routine discards page-local intent', () => {
+  const twoRoutines = () => ({
+    r1: activeRoutine(),
+    r2: activeRoutine({ id: 'r2', prompt: 'Nightly backup' }),
+  })
+
+  it('drops an OPEN delete confirmation instead of retargeting it at the new routine', async () => {
+    const user = userEvent.setup()
+    routinesById = twoRoutines()
+    render(routedTree())
+
+    await user.click(screen.getByRole('button', { name: /Delete/ }))
+    expect(screen.getByText('Delete this routine?')).toBeInTheDocument()
+    // Twice: the header row, and the dialog naming what it is about to delete.
+    expect(screen.getAllByText('Summarize my inbox')).toHaveLength(2)
+
+    // Browser Back/Forward between two routine URLs, an edited URL, any in-app cross-link. The
+    // consent the user gave was "delete Summarize my inbox"; DELETE has no status guard and
+    // cascades to the run history, so a dialog that stayed open here would hand that consent to
+    // a routine the user never selected.
+    await navigateTo('/workspace/routines/r2')
+
+    expect(screen.getByTestId('pathname')).toHaveTextContent('/workspace/routines/r2')
+    expect(screen.queryByText('Delete this routine?')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Delete routine' })).not.toBeInTheDocument()
+    expect(removeMutate).not.toHaveBeenCalled()
+    // …and what is on screen is a fresh, unopened view of the NEW routine.
+    expect(screen.getByText('Nightly backup')).toBeInTheDocument()
+    expect(screen.queryByText('Summarize my inbox')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Delete/ })).toBeInTheDocument()
+  })
+
+  it('drops a pending update confirm gate instead of re-aiming it at the new routine', async () => {
+    const user = userEvent.setup()
+    routinesById = twoRoutines()
+    render(routedTree())
+
+    await user.click(screen.getByRole('button', { name: 'Edit' }))
+    const promptBox = screen.getByPlaceholderText(/What should this routine do/)
+    await user.clear(promptBox)
+    await user.type(promptBox, 'HIJACKED')
+    await user.click(screen.getByRole('button', { name: 'Review change' }))
+    expect(screen.getByText('Confirm this change')).toBeInTheDocument()
+
+    // `draftToPatch` sends EVERY field, so a surviving `existingDraft` would put an unrequested
+    // gate on r2's page whose Confirm PUTs r1's prompt, schedule, model, agent and workspace over
+    // r2 wholesale.
+    await navigateTo('/workspace/routines/r2')
+
+    expect(screen.getByTestId('pathname')).toHaveTextContent('/workspace/routines/r2')
+    expect(screen.queryByText('Confirm this change')).not.toBeInTheDocument()
+    expect(screen.queryByText('+ HIJACKED')).not.toBeInTheDocument()
+    expect(updateMutate).not.toHaveBeenCalled()
+    expect(screen.getByText('Nightly backup')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Edit' })).toBeInTheDocument()
+  })
+
+  it('drops an open editor, landing on the new routine\'s detail view rather than its own form', async () => {
+    const user = userEvent.setup()
+    routinesById = twoRoutines()
+    render(routedTree())
+
+    await user.click(screen.getByRole('button', { name: 'Edit' }))
+    const promptBox = screen.getByPlaceholderText(/What should this routine do/)
+    await user.clear(promptBox)
+    await user.type(promptBox, 'HIJACKED')
+    expect(screen.getByRole('button', { name: 'Review change' })).toBeInTheDocument()
+
+    await navigateTo('/workspace/routines/r2')
+
+    expect(screen.queryByRole('button', { name: 'Review change' })).not.toBeInTheDocument()
+    expect(screen.queryByDisplayValue('HIJACKED')).not.toBeInTheDocument()
+    expect(screen.getByText('Nightly backup')).toBeInTheDocument()
+  })
+
+  it('discards a half-filled new-routine draft across new → :routineId → new', async () => {
+    const user = userEvent.setup()
+    routinesById = twoRoutines()
+    render(routedTree('/workspace/routines/new'))
+
+    await user.type(screen.getByPlaceholderText(/What should this routine do/), 'Draft for a routine I abandoned')
+    expect(screen.getByDisplayValue('Draft for a routine I abandoned')).toBeInTheDocument()
+
+    // `new` and `:routineId` are separate Route entries but the SAME element, so React reconciles
+    // across this transition too unless the key changes.
+    await navigateTo('/workspace/routines/r1')
+    expect(screen.getByText('Summarize my inbox')).toBeInTheDocument()
+    await navigateTo('/workspace/routines/new')
+
+    expect(screen.getByText('New routine')).toBeInTheDocument()
+    expect(screen.queryByDisplayValue('Draft for a routine I abandoned')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled()
+  })
+})

@@ -19,7 +19,30 @@
 //     instead of a new npm package or a CLI-specific plugin manifest — the manifest/extension
 //     wrapper for a specific host (Claude Code plugin, Gemini CLI extension) is a thin config
 //     file pointing at this same command and can be added later without touching this module.
+//
+// Routine/agent tools (added later): a `claude_cli` Code session is the REAL external Claude
+// Code CLI (cli-launch.ts spawns it pointed at this daemon's gateway) — a genuinely separate
+// process with its own Read/Write/Bash toolset, never routed through ToolRegistry the way chat
+// and the in-process 'pi' agent are. Without this, a claude_cli session asked to "create a
+// routine" has no way to know TurboLLM's Routines feature exists at all, and (observed live)
+// improvises an OS-level cron job with its own Bash tool instead. list_routines/create_routine/
+// list_agents/create_agent close that gap the same way delegate_code_task closes "no way to
+// reach Code" — REST calls to the already-running daemon, not a second implementation.
+// Deliberately narrower than ToolRegistry's full routine surface: update_routine's whole safety
+// property in routine-tools.ts is its two-phase preview-then-confirm flow (a diff computed
+// against the LIVE routine, applied only on a second call with confirm:true) — reproducing that
+// faithfully through a stateless REST proxy is real additional work, not a proxy away. And
+// delete_routine/run_routine_now are both higher-stakes (an unattended cascading delete; an
+// immediate real bash/edit/write run) than what the reported problem — "it couldn't even create
+// one" — actually needs fixed. All three stay a deliberate follow-up, not an oversight.
 import { setTimeout as delay } from 'node:timers/promises'
+import { CREATE_ROUTINE_TOOL, LIST_ROUTINES_TOOL } from './routines/routine-tools'
+import { validateCreate, type RoutineBody } from './routines/routine-routes'
+import { LIST_AGENTS_TOOL, CREATE_AGENT_TOOL } from './chat/chat-agent-tools'
+import { LIST_MODELS_TOOL } from './models/model-tools'
+import type { Routine } from './routines/schema'
+import type { CustomChatAgent } from './config/config'
+import type { ModelEntry } from './models/scanner'
 
 export const DELEGATE_TOOL_NAME = 'delegate_code_task'
 
@@ -147,6 +170,138 @@ export async function delegateCodeTask(
   }
 }
 
+// ── Routine/agent tools ────────────────────────────────────────────────────────
+// Each mirrors its ToolRegistry counterpart's exact text contract (routine-tools.ts's
+// execListRoutines/execCreateRoutine, chat-agent-tools.ts's execListAgents/execCreateAgent) —
+// same success/error message shape — so a claude_cli session sees IDENTICAL output to what a
+// chat or pi session's tool call would produce, just reached over HTTP instead of a direct
+// store call (this process has no DB access of its own — see the module header).
+
+/** Adapts a ToolRegistry-shaped ToolDefinition ({type:'function', function:{...}}) into the MCP
+ *  tool-list shape ({name, description, inputSchema}) — same schema object, different envelope. */
+function toMcpTool(def: { function: { name: string; description?: string; parameters?: Record<string, unknown> } }) {
+  return {
+    name: def.function.name,
+    description: def.function.description ?? '',
+    inputSchema: def.function.parameters ?? { type: 'object', properties: {} },
+  }
+}
+
+/** Surfaced in the `initialize` response — an MCP client MAY fold this into the model's context
+ *  before it ever sees a user message (spec's own wording: "a hint... added to the system
+ *  prompt"). Not guaranteed to be honored by every host (tracked upstream as a real gap, e.g.
+ *  anthropics/claude-code#43749) — belt, not the only suspender: create_routine/list_routines'
+ *  own descriptions below carry the same warning, since a tool's description is the one part of
+ *  an MCP server every host reliably surfaces. Written after a live miss: a claude_cli session
+ *  asked in plain words to "create a routine" reached for its own Bash tool and wrote an OS-level
+ *  cron job instead — it had no reason to think "routine" meant anything but the word's normal
+ *  sense until told so explicitly. */
+const MCP_SERVER_INSTRUCTIONS =
+  'This server is TurboLLM\'s own app — not a generic scheduler integration. In this app, "a routine" ' +
+  'specifically means a TurboLLM Routine (list_routines/create_routine below), and "an agent" specifically ' +
+  'means a TurboLLM custom chat agent (list_agents/create_agent below). Whenever the user asks to schedule, ' +
+  'automate, or set up something to run on its own on a recurring basis, or uses the word "routine", use ' +
+  'these tools — NEVER cron, systemd timers, Windows Task Scheduler, or launchd: TurboLLM has no visibility ' +
+  'into those and nothing you write there will ever actually run through it.'
+
+/** create_routine/list_routines get the SAME anti-cron framing as MCP_SERVER_INSTRUCTIONS baked
+ *  directly into their own description, not just the initialize hint — a tool's own description
+ *  is the one part of an MCP server every host reliably shows the model, hint-honoring or not.
+ *  Deliberately NOT applied to CREATE_ROUTINE_TOOL/LIST_ROUTINES_TOOL themselves (the shared
+ *  objects chat/pi also use via ToolRegistry): those callers never had cron/Bash access to
+ *  reach for in the first place, so the warning would be pure noise on every OTHER surface this
+ *  same schema serves. */
+function withAntiCronFraming(def: Parameters<typeof toMcpTool>[0]) {
+  const mcp = toMcpTool(def)
+  return { ...mcp, description: `${MCP_SERVER_INSTRUCTIONS}\n\n${mcp.description}` }
+}
+
+const ROUTINE_TOOLS = [
+  withAntiCronFraming(LIST_ROUTINES_TOOL), withAntiCronFraming(CREATE_ROUTINE_TOOL),
+  toMcpTool(LIST_AGENTS_TOOL), toMcpTool(CREATE_AGENT_TOOL), toMcpTool(LIST_MODELS_TOOL),
+]
+
+async function listModelsText(baseUrl: string, fetchImpl: typeof fetch): Promise<string> {
+  let res: Response
+  try {
+    res = await fetchImpl(`${baseUrl}/api/v1/models`, { signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) })
+  } catch (e) {
+    return `Error: could not reach the TurboLLM daemon at ${baseUrl}. (${e instanceof Error ? e.message : e})`
+  }
+  if (!res.ok) return `Error: ${await describeHttpError(res)}`
+  const { models } = await res.json() as { models: ModelEntry[] }
+  if (models.length === 0) return 'No models in the library yet — add one in TurboLLM\'s Models screen first.'
+  return models.map((m) => `- ${m.key} — ${m.name} (${m.quant}, ${m.sizeLabel})`).join('\n')
+}
+
+async function listRoutinesText(baseUrl: string, fetchImpl: typeof fetch): Promise<string> {
+  let res: Response
+  try {
+    res = await fetchImpl(`${baseUrl}/api/v1/routines`, { signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) })
+  } catch (e) {
+    return `Error: could not reach the TurboLLM daemon at ${baseUrl}. (${e instanceof Error ? e.message : e})`
+  }
+  if (!res.ok) return `Error: ${await describeHttpError(res)}`
+  const routines = await res.json() as Routine[]
+  if (routines.length === 0) return 'No routines exist yet.'
+  return routines.map((r) => `- ${r.id} [${r.status}] ${r.flavor} — "${r.scheduleDisplay}" — ${r.prompt}`).join('\n')
+}
+
+/** Runs `validateCreate` — the SAME function POST /api/v1/routines itself calls — before ever
+ *  reaching the network, so a malformed call gets the identical message whether it's caught here
+ *  or at the route, not a second copy of the wording that can drift. */
+async function createRoutineText(baseUrl: string, args: Record<string, unknown>, fetchImpl: typeof fetch): Promise<string> {
+  const problem = validateCreate(args as unknown as RoutineBody)
+  if (problem) return `Error: ${problem}`
+  let res: Response
+  try {
+    res = await fetchImpl(`${baseUrl}/api/v1/routines`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+    })
+  } catch (e) {
+    return `Error: could not reach the TurboLLM daemon at ${baseUrl}. (${e instanceof Error ? e.message : e})`
+  }
+  if (!res.ok) return `Error: ${await describeHttpError(res)}`
+  const routine = await res.json() as Routine
+  return `Created routine "${routine.id}" (${routine.scheduleDisplay}) in status "pending_confirmation". ` +
+    'It will NOT run until a human confirms it in the Routines panel — tell the user to review and confirm it.'
+}
+
+async function listAgentsText(baseUrl: string, fetchImpl: typeof fetch): Promise<string> {
+  let res: Response
+  try {
+    res = await fetchImpl(`${baseUrl}/api/v1/chat-agents`, { signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) })
+  } catch (e) {
+    return `Error: could not reach the TurboLLM daemon at ${baseUrl}. (${e instanceof Error ? e.message : e})`
+  }
+  if (!res.ok) return `Error: ${await describeHttpError(res)}`
+  const agents = await res.json() as CustomChatAgent[]
+  if (agents.length === 0) return 'No custom agents exist yet. Use create_agent to make one.'
+  return agents.map((a) => `- ${a.id} "${a.name}" — ${a.description || '(no description)'} — tools: ${a.tools.join(', ') || '(none)'}`).join('\n')
+}
+
+async function createAgentText(baseUrl: string, args: Record<string, unknown>, fetchImpl: typeof fetch): Promise<string> {
+  const name = typeof args.name === 'string' ? args.name.trim() : ''
+  if (!name) return 'Error: name is required.'
+  let res: Response
+  try {
+    res = await fetchImpl(`${baseUrl}/api/v1/chat-agents`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...args, name }),
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+    })
+  } catch (e) {
+    return `Error: could not reach the TurboLLM daemon at ${baseUrl}. (${e instanceof Error ? e.message : e})`
+  }
+  if (!res.ok) return `Error: ${await describeHttpError(res)}`
+  const agent = await res.json() as CustomChatAgent
+  return `Created agent ${agent.id} "${agent.name}".`
+}
+
 // ── stdio JSON-RPC MCP server ────────────────────────────────────────────────
 // Mirrors the wire format `tools/mcp-client.ts` already speaks as a CLIENT (this project has
 // no MCP SDK dependency in either direction — hand-rolling stays consistent and adds zero deps).
@@ -177,23 +332,38 @@ export async function handleMcpRequest(
       case 'initialize':
         return {
           jsonrpc: '2.0', id: req.id,
-          result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'turbollm', version } },
+          result: {
+            protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'turbollm', version },
+            instructions: MCP_SERVER_INSTRUCTIONS,
+          },
         }
       case 'tools/list':
-        return { jsonrpc: '2.0', id: req.id, result: { tools: [DELEGATE_TOOL_SCHEMA] } }
+        return { jsonrpc: '2.0', id: req.id, result: { tools: [DELEGATE_TOOL_SCHEMA, ...ROUTINE_TOOLS] } }
       case 'tools/call': {
         const p = (req.params ?? {}) as { name?: string; arguments?: Record<string, unknown> }
-        if (p.name !== DELEGATE_TOOL_NAME) throw new Error(`Unknown tool: ${p.name}`)
         const args = p.arguments ?? {}
-        if (!isString(args.repoRoot) || !args.repoRoot.trim()) throw new Error('repoRoot is required')
-        if (!isString(args.task) || !args.task.trim()) throw new Error('task is required')
-        const result = await delegateCodeTask(baseUrl, {
-          repoRoot: args.repoRoot,
-          task: args.task,
-          mode: isString(args.mode) ? args.mode : undefined,
-          timeoutSeconds: typeof args.timeoutSeconds === 'number' ? args.timeoutSeconds : undefined,
-        }, fetchImpl)
-        return { jsonrpc: '2.0', id: req.id, result: { content: [{ type: 'text', text: result.text }], isError: !result.ok } }
+        if (p.name === DELEGATE_TOOL_NAME) {
+          if (!isString(args.repoRoot) || !args.repoRoot.trim()) throw new Error('repoRoot is required')
+          if (!isString(args.task) || !args.task.trim()) throw new Error('task is required')
+          const result = await delegateCodeTask(baseUrl, {
+            repoRoot: args.repoRoot,
+            task: args.task,
+            mode: isString(args.mode) ? args.mode : undefined,
+            timeoutSeconds: typeof args.timeoutSeconds === 'number' ? args.timeoutSeconds : undefined,
+          }, fetchImpl)
+          return { jsonrpc: '2.0', id: req.id, result: { content: [{ type: 'text', text: result.text }], isError: !result.ok } }
+        }
+        const textByTool: Record<string, () => Promise<string>> = {
+          list_routines: () => listRoutinesText(baseUrl, fetchImpl),
+          create_routine: () => createRoutineText(baseUrl, args, fetchImpl),
+          list_agents: () => listAgentsText(baseUrl, fetchImpl),
+          create_agent: () => createAgentText(baseUrl, args, fetchImpl),
+          list_models: () => listModelsText(baseUrl, fetchImpl),
+        }
+        const run = textByTool[p.name ?? '']
+        if (!run) throw new Error(`Unknown tool: ${p.name}`)
+        const text = await run()
+        return { jsonrpc: '2.0', id: req.id, result: { content: [{ type: 'text', text }], isError: text.startsWith('Error:') } }
       }
       default:
         throw new Error(`Unknown method: ${req.method}`)

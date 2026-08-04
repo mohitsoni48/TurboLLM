@@ -9,14 +9,17 @@ import { TooltipProvider } from './components/ui/tooltip'
 import { Shell } from './components/Shell'
 import { UnreachableOverlay } from './components/UnreachableOverlay'
 import { AuthGate } from './components/AuthGate'
-import { useStatus } from './lib/queries'
+import { useStatus, useSettings } from './lib/queries'
 import { ApiError, setAuthToken } from './lib/api'
 import { subscribeCodeAuthNeeded, isCodeAuthNeeded } from './lib/auth-signal'
+import { useRoutineNotificationPoller } from './lib/notify-routine'
 
 // Route-level code splitting: each screen loads only when first navigated to.
 const WorkspaceScreen = lazy(() => import('./screens/WorkspaceScreen').then((m) => ({ default: m.WorkspaceScreen })))
 const CodeHomeScreen = lazy(() => import('./screens/code/CodeHomeScreen').then((m) => ({ default: m.CodeHomeScreen })))
 const CodeSessionScreen = lazy(() => import('./screens/code/CodeSessionScreen').then((m) => ({ default: m.CodeSessionScreen })))
+const RoutinesPanel = lazy(() => import('./screens/routines/RoutinesPanel').then((m) => ({ default: m.RoutinesPanel })))
+const RoutineEditPage = lazy(() => import('./screens/routines/RoutineEditPage').then((m) => ({ default: m.RoutineEditPage })))
 const ChatScreen = lazy(() => import('./screens/ChatScreen').then((m) => ({ default: m.ChatScreen })))
 const SkillEditPage = lazy(() => import('./screens/skills/SkillEditPage').then((m) => ({ default: m.SkillEditPage })))
 const AgentEditPage = lazy(() => import('./screens/agents/AgentEditPage').then((m) => ({ default: m.AgentEditPage })))
@@ -44,6 +47,21 @@ function ScreenFallback() {
 export function App() {
   const statusQ = useStatus()
   const qc = useQueryClient()
+
+  // Routines is experimental, off by default (Settings → Experimental, config.ts's
+  // `daemon.experimental.routines`). `?? false` while settings hasn't loaded yet is the
+  // conservative default this whole gate is built around — the feature stays hidden until it's
+  // positively confirmed on, never flashes on during a loading state.
+  const settingsQ = useSettings().query
+  const routinesEnabled = settingsQ.data?.experimental?.routines ?? false
+
+  // Best-effort browser notifications for routine results (spec 20 §7). Mounted here so it lives
+  // exactly once for the app's lifetime, independent of which route is showing. Reads the same
+  // query keys Shell's nav badge and the Routines panel already poll, so it costs no extra
+  // requests, and it is purely supplementary — the durable channel is the run history in the
+  // Routines panel, which works whether or not a notification ever fires. Stops polling entirely
+  // while the experimental flag is off.
+  useRoutineNotificationPoller(undefined, routinesEnabled)
 
   // Count consecutive failed polls; show the unreachable overlay after 3 (spec 08 §1).
   const [failCount, setFailCount] = useState(0)
@@ -92,6 +110,22 @@ export function App() {
                 (ADR-280) — no longer gated behind an experimental-feature flag. */}
             <Route path="/workspace/code" element={<CodeHomeScreen />} />
             <Route path="/workspace/code/:sessionId" element={<CodeSessionScreen />} />
+            {/* Routines — Workspace's THIRD mode (spec 20 §2.1), a peer of Chat/Code rather than
+                nested under Code — moved off /workspace/code/routines/* so the mode switch and
+                the URL agree about what's selected. `/routines/new` is declared before
+                `/routines/:routineId` for readability only: React Router ranks the static
+                "new" segment above the dynamic one regardless of declaration order, so the
+                create page is never swallowed by the detail route.
+                Experimental (Settings → Experimental), off by default: every one of these routes
+                bounces to Chat until `routinesEnabled` is true, same "hidden, not just unlinked"
+                treatment as ConversationSidebar's mode tab and Shell's nav badge — a bookmarked or
+                hand-typed URL must not be a backdoor around the flag. */}
+            <Route path="/workspace/routines" element={routinesEnabled ? <RoutinesPanel /> : <Navigate to="/workspace/chat" replace />} />
+            <Route path="/workspace/routines/new" element={routinesEnabled ? <RoutineEditPage /> : <Navigate to="/workspace/chat" replace />} />
+            <Route path="/workspace/routines/:routineId" element={routinesEnabled ? <RoutineEditPage /> : <Navigate to="/workspace/chat" replace />} />
+            {/* No back-compat redirect from /workspace/code/routines/* — this feature was built
+                and has lived entirely within this dev cycle, never shipped under the old path,
+                so there is nothing external pointing at it to preserve. */}
             {/* Back-compat: the old Workspace → Agent tab is gone; land on Chat instead. */}
             <Route path="/workspace/agent" element={<Navigate to="/workspace/chat" replace />} />
             <Route path="/workspace/agent/:convId" element={<Navigate to="/workspace/chat" replace />} />

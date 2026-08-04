@@ -51,7 +51,7 @@ interface LiveState {
   timeline: LiveBlock[]
 }
 
-export function ChatScreen() {
+export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; convIdOverride?: string } = {}) {
   const { data: status } = useStatus()
   const model = status?.model
   const engineState = status?.engine.state
@@ -70,10 +70,18 @@ export function ChatScreen() {
   const [searchParams] = useSearchParams()
   const readonly = searchParams.get('readonly') === '1'
 
-  const [activeId, setActiveId] = useState<string | null>(routeConvId ?? null)
+  const [activeId, setActiveId] = useState<string | null>(convIdOverride ?? routeConvId ?? null)
+  // Embedded mode (Routines' 3-pane layout, RoutineEditPage.tsx): there is no route param to
+  // read a new value from when the caller switches which run is selected, only this prop — so
+  // re-seed activeId whenever it changes. Not needed outside embedded mode: the standalone
+  // /chat/:convId route unmounts and remounts a fresh ChatScreen on navigation instead (App.tsx's
+  // <Routes>), which already re-runs the initial useState above.
+  useEffect(() => { if (embedded && convIdOverride !== undefined) setActiveId(convIdOverride) }, [embedded, convIdOverride])
   // Remember this as the last-opened Chat conversation, so switching to Code and back
-  // via the Workspace mode pill (ConversationSidebar.tsx) restores it.
-  useEffect(() => { if (activeId) writeLastChatConvId(activeId) }, [activeId])
+  // via the Workspace mode pill (ConversationSidebar.tsx) restores it. Skipped when embedded —
+  // an embedded routine-run view is not "the chat you were in", and letting it win would make
+  // switching back to Chat mode land on whatever routine run you last looked at.
+  useEffect(() => { if (!embedded && activeId) writeLastChatConvId(activeId) }, [embedded, activeId])
   // streamFrom's async loop outlives the render that started it, so it needs the CURRENT
   // activeId (not the one closed over when the generation began) to tell whether a
   // 'done'/'error' event landed on the conversation the user is still looking at.
@@ -770,41 +778,44 @@ export function ChatScreen() {
           transition lives in the `tllm-chat-sidebar` CSS class (index.css), not inline,
           so it can be disabled globally while dragging (html.tllm-resizing) without
           fighting the resize handle's own per-pixel style mutation. */}
-      {/* Mobile: dim backdrop behind the drawer; tap to dismiss. */}
-      {!isDesktop && mobileSidebarOpen && (
+      {/* Mobile: dim backdrop behind the drawer; tap to dismiss. Embedded mode (Routines' 3-pane
+          layout) never renders this own sidebar at all — the embedding page supplies its own. */}
+      {!embedded && !isDesktop && mobileSidebarOpen && (
         <div
           className="fixed inset-0 z-30 bg-black/40 md:hidden"
           onClick={() => setMobileSidebarOpen(false)}
           aria-hidden
         />
       )}
-      <div
-        ref={sidebarRef}
-        className={cn(
-          'tllm-chat-sidebar',
-          isDesktop
-            ? sidebarOpen ? 'shrink-0' : 'w-10 shrink-0'
-            : cn(
-                'fixed inset-y-0 left-0 z-40 w-[84vw] max-w-[300px] shadow-[var(--shadow-2)]',
-                mobileSidebarOpen ? 'translate-x-0' : '-translate-x-full',
-              ),
-        )}
-        style={isDesktop && sidebarOpen ? { width: sidebarWidth } : undefined}
-      >
-        <ConversationSidebar
-          activeId={activeId}
-          onSelect={(id) => { handleSelect(id); if (!isDesktop) setMobileSidebarOpen(false) }}
-          onNew={() => { handleNew(); if (!isDesktop) setMobileSidebarOpen(false) }}
-          onImport={readonly ? undefined : () => importFileRef.current?.click()}
-          collapsed={isDesktop ? !sidebarOpen : false}
-          onToggle={isDesktop ? () => setSidebarOpen((o) => !o) : () => setMobileSidebarOpen(false)}
-          generating={!!live}
-          generatingIds={generatingIds}
-          recentlyCompletedIds={recentlyCompletedIds}
-          onDeleted={handleActiveDeleted}
-        />
-      </div>
-      {isDesktop && sidebarOpen && <SidebarResizeHandle sidebarRef={sidebarRef} onCommit={setSidebarWidth} />}
+      {!embedded && (
+        <div
+          ref={sidebarRef}
+          className={cn(
+            'tllm-chat-sidebar',
+            isDesktop
+              ? sidebarOpen ? 'shrink-0' : 'w-10 shrink-0'
+              : cn(
+                  'fixed inset-y-0 left-0 z-40 w-[84vw] max-w-[300px] shadow-[var(--shadow-2)]',
+                  mobileSidebarOpen ? 'translate-x-0' : '-translate-x-full',
+                ),
+          )}
+          style={isDesktop && sidebarOpen ? { width: sidebarWidth } : undefined}
+        >
+          <ConversationSidebar
+            activeId={activeId}
+            onSelect={(id) => { handleSelect(id); if (!isDesktop) setMobileSidebarOpen(false) }}
+            onNew={() => { handleNew(); if (!isDesktop) setMobileSidebarOpen(false) }}
+            onImport={readonly ? undefined : () => importFileRef.current?.click()}
+            collapsed={isDesktop ? !sidebarOpen : false}
+            onToggle={isDesktop ? () => setSidebarOpen((o) => !o) : () => setMobileSidebarOpen(false)}
+            generating={!!live}
+            generatingIds={generatingIds}
+            recentlyCompletedIds={recentlyCompletedIds}
+            onDeleted={handleActiveDeleted}
+          />
+        </div>
+      )}
+      {!embedded && isDesktop && sidebarOpen && <SidebarResizeHandle sidebarRef={sidebarRef} onCommit={setSidebarWidth} />}
 
       {/* Thread */}
       <div className="relative flex min-w-0 flex-1 flex-col">
@@ -819,7 +830,9 @@ export function ChatScreen() {
 
         {/* Chat header: model load/switch/eject (always available) */}
         <div className="flex h-12 shrink-0 items-center gap-1.5 border-b border-border px-3 md:gap-2 md:px-4">
-          {/* Mobile: open the conversation drawer (the sidebar is off-canvas below md). */}
+          {/* Mobile: open the conversation drawer (the sidebar is off-canvas below md). Not
+              rendered when embedded — there is no drawer of this component's own to open. */}
+          {!embedded && (
           <Button
             size="icon"
             variant="ghost"
@@ -830,6 +843,7 @@ export function ChatScreen() {
           >
             <PanelLeft size={16} />
           </Button>
+          )}
           <ModelLoadMenu
             models={allModels}
             loadedKey={model?.key ?? null}

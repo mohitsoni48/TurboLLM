@@ -8,9 +8,20 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { EventEmitter } from 'node:events'
-import { launchCli, swapSessionFlag } from './cli-launch.js'
+import { launchCli, swapSessionFlag, type ConfigFs } from './cli-launch.js'
 
 const CLAUDE_FLAGS = { register: '--session-id', resume: '--resume' }
+
+// This file's tests are entirely about the session-flag-swap-and-retry behavior, not the
+// (unrelated) MCP config launchCli also writes — a throwing fs keeps that write out of the
+// picture entirely (no real disk I/O, and no --mcp-config appended to `args`, so every
+// exact-equality assertion on the spawn args below stays exactly what it was written to check).
+const NO_OP_FS: ConfigFs = {
+  home: '/unused',
+  readFile: async () => { throw new Error('not used by this test file') },
+  writeFile: async () => { throw new Error('not used by this test file') },
+  mkdir: async () => { throw new Error('not used by this test file') },
+}
 const SESSION_ID = 'af4003a1-0cfb-461d-8c9e-4f2497c89214'
 
 interface CapturedSpawn { cmd: string; args: string[] }
@@ -67,7 +78,7 @@ async function run(passthrough: string[], script: Array<{ code: number; signal?:
   const cap = captureOutput()
   let code: number
   try {
-    code = await launchCli('claude', 6996, passthrough, fn)
+    code = await launchCli('claude', 6996, passthrough, fn, undefined, undefined, undefined, NO_OP_FS)
   } finally {
     cap.restore()
     restoreFetch()

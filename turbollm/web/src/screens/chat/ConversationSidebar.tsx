@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom'
-import { Archive, ArchiveRestore, ChevronDown, ChevronLeft, ChevronRight, Circle, Download, Folder as FolderIcon, FolderInput, FolderPlus, Loader2, MessageSquare, MessageSquarePlus, MoreHorizontal, Pencil, Plus, Search, SquareTerminal, Trash2 } from 'lucide-react'
+import { AlarmClock, Archive, ArchiveRestore, ChevronDown, ChevronLeft, ChevronRight, Circle, Download, Folder as FolderIcon, FolderInput, FolderPlus, Loader2, MessageSquare, MessageSquarePlus, MoreHorizontal, Pencil, Plus, Search, SquareTerminal, Trash2 } from 'lucide-react'
 import type { Conversation, Folder } from '../../lib/chat-types'
 import { useConversationMutations, useConversations, useFolders } from '../../lib/chat-queries'
 import { Button } from '../../components/ui/button'
@@ -29,6 +29,10 @@ import { Skeleton } from '../../components/ui/skeleton'
 import { useArchiveCodeSession, useCodeSessionRename, useCodeSessions, useDeleteCodeSession } from '../../lib/code-queries'
 import type { CodeSession, CodeSessionFilter, SessionStatus } from '../../lib/code-types'
 import { ApiError } from '../../lib/api'
+import { useRoutinesWithLatestRun, type RoutineWithLatestRun } from '../../lib/routine-queries'
+import { deriveRoutineDisplayStatus } from '../../lib/routine-status'
+import { RoutineStatusBadge } from '../../components/routines/RoutineStatusBadge'
+import { useSettings } from '../../lib/queries'
 
 /** localStorage key for the client-only "confirm before deleting a conversation"
  *  preference (mirrors SettingsScreen). Default ON when unset. */
@@ -256,6 +260,85 @@ function CodeSessionsList({ q, onRequestDelete }: { q: string; onRequestDelete: 
   )
 }
 
+// ── Routines list ────────────────────────────────────────────────────────────
+//
+// Same "search-filterable, click-to-open list" pattern as the chat/code lists above — Routines
+// is a real third Workspace mode now (spec 20 §2.1's own follow-up: it used to be a single link
+// pinned above the Code session list, which read as bolted onto Code mode rather than a peer of
+// it). Rendered flat, no section header, same reasoning as CodeSessionsList's own.
+
+function lastRunSummary(item: RoutineWithLatestRun): string {
+  const run = item.latestRun
+  if (!run) return item.routine.status === 'pending_confirmation' ? 'Awaiting confirmation' : 'Never run yet'
+  const when = new Date(run.startedAt).toLocaleString()
+  if (run.status === 'ok') return `Ran successfully · ${when}`
+  if (run.status === 'running') return `Running now · started ${when}`
+  if (run.status === 'needs_approval') return `Stalled, needs approval · ${when}`
+  if (run.status === 'skipped') return `Skipped${run.skipReason ? ` (${run.skipReason})` : ''} · ${when}`
+  return `Errored${run.error ? `: ${run.error}` : ''} · ${when}`
+}
+
+function RoutineSidebarItem({ item, active, onOpen }: { item: RoutineWithLatestRun; active: boolean; onOpen: () => void }) {
+  const { routine } = item
+  const status = deriveRoutineDisplayStatus(routine, item.latestRun)
+  return (
+    <div
+      onClick={onOpen}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => { if (e.key === 'Enter') onOpen() }}
+      className="flex cursor-pointer flex-col gap-1 rounded-md px-3 py-2 transition-colors"
+      style={{ background: active ? 'color-mix(in srgb, var(--accent) 10%, transparent)' : 'transparent' }}
+    >
+      <div className="flex min-w-0 items-center gap-1.5">
+        <span
+          className="min-w-0 flex-1 truncate text-[13px] font-medium text-ink"
+          style={{ color: active ? 'var(--accent)' : undefined }}
+        >
+          {routine.prompt}
+        </span>
+      </div>
+      <div className="flex items-center gap-1.5">
+        <RoutineStatusBadge status={status} />
+        <span className="min-w-0 truncate text-[11px] text-faint">{lastRunSummary(item)}</span>
+      </div>
+    </div>
+  )
+}
+
+function RoutinesList({ q }: { q: string }) {
+  const navigate = useNavigate()
+  const { routineId: activeRoutineId } = useParams<{ routineId?: string }>()
+  const { items, isLoading } = useRoutinesWithLatestRun()
+  const filtered = q.trim()
+    ? items.filter((it) => it.routine.prompt.toLowerCase().includes(q.trim().toLowerCase()))
+    : items
+
+  if (isLoading) {
+    return (
+      <>
+        <CodeSessionSkeletonRow />
+        <CodeSessionSkeletonRow />
+      </>
+    )
+  }
+  if (filtered.length === 0) {
+    return <p className="px-3 py-4 text-[12px] text-faint">{q.trim() ? 'No results.' : 'No routines yet.'}</p>
+  }
+  return (
+    <>
+      {filtered.map((item) => (
+        <RoutineSidebarItem
+          key={item.routine.id}
+          item={item}
+          active={item.routine.id === activeRoutineId}
+          onOpen={() => navigate(`/workspace/routines/${item.routine.id}`)}
+        />
+      ))}
+    </>
+  )
+}
+
 export function ConversationSidebar({
   activeId,
   onSelect,
@@ -292,17 +375,30 @@ export function ConversationSidebar({
   // Only set while viewing an actual Code session (/workspace/code/:sessionId) — used to tell
   // whether a deleted session was the one currently open, so we can navigate away from it.
   const { sessionId: activeCodeSessionId } = useParams<{ sessionId?: string }>()
-  // Workspace has two mutually-exclusive modes sharing this one sidebar column —
-  // Chat mode shows chat folders/conversations, Code mode shows code sessions,
-  // never both at once. Route is the single source of truth for which is active
-  // (kept in sync with the Chat|Code pill in CodeHomeScreen's own header).
-  const isCodeMode = pathname.startsWith('/workspace/code')
+  // Workspace has three mutually-exclusive modes sharing this one sidebar column — Chat mode
+  // shows chat folders/conversations, Code mode shows code sessions, Routines mode shows
+  // routines, never more than one at once. Route is the single source of truth for which is
+  // active. Routines lives at /workspace/routines/* (a peer path, not nested under
+  // /workspace/code/*), so this is a plain three-way switch — no exclusion logic needed.
+  const mode: 'chat' | 'code' | 'routines' = pathname.startsWith('/workspace/routines')
+    ? 'routines'
+    : pathname.startsWith('/workspace/code') ? 'code' : 'chat'
+  const isCodeMode = mode === 'code'
+  const isRoutinesMode = mode === 'routines'
+  // Routines is experimental, off by default (Settings → Experimental) — the mode tab itself is
+  // the "hidden" half of "hidden UI + can't be created from chat or code"; App.tsx's own gate on
+  // the /workspace/routines* routes is what stops a stale link or typed URL from reaching
+  // `isRoutinesMode` in the first place, so this file never needs to fall back out of it.
+  const routinesEnabled = useSettings().query.data?.experimental?.routines ?? false
   // Switching modes restores whatever conversation/session was last open in the OTHER
-  // mode, instead of always resetting to that mode's list/launchpad root.
+  // mode, instead of always resetting to that mode's list/launchpad root. Routines has no
+  // such memory yet — it always lands on the list, same as a first-ever visit to Chat/Code
+  // would if lastChatConvId/lastCodeSessionId were never set.
   const lastChatConvId = readLastChatConvId()
   const chatModeHref = lastChatConvId ? `/workspace/chat/${lastChatConvId}` : '/workspace/chat'
   const lastCodeSessionId = readLastCodeSessionId()
   const codeModeHref = lastCodeSessionId ? `/workspace/code/${lastCodeSessionId}` : '/workspace/code'
+  const routinesModeHref = '/workspace/routines'
   const [q, setQ] = useState('')
   const [debouncedQ, setDebouncedQ] = useState('')
   // Conversation queued for a confirmation dialog (null = dialog closed).
@@ -428,6 +524,20 @@ export function ConversationSidebar({
   // currently-generating conversation.
   const pendingIsActiveGenerating = !!pendingDelete && pendingDelete.id === activeId && !!generating
 
+  // Data-driven mode switch — was two copy-pasted Chat/Code blocks (one per render form,
+  // collapsed rail vs. expanded pill); adding Routines as a genuine third tab as a THIRD
+  // copy-pasted block would have kept the exact "looks bolted on" problem this fixes, just with
+  // one more repetition of it. `label` doubles as the accessible name AND the visible text.
+  const modeTabs: { mode: 'chat' | 'code' | 'routines'; href: string; label: string; icon: typeof MessageSquare }[] = [
+    { mode: 'chat', href: chatModeHref, label: 'Chat', icon: MessageSquare },
+    { mode: 'code', href: codeModeHref, label: 'Code', icon: SquareTerminal },
+    // Omitted entirely (not just disabled) while the experimental flag is off — see
+    // `routinesEnabled`'s own comment above.
+    ...(routinesEnabled ? [{ mode: 'routines' as const, href: routinesModeHref, label: 'Routines', icon: AlarmClock }] : []),
+  ]
+  const newLabel = mode === 'code' ? 'New session' : mode === 'routines' ? 'New routine' : 'New chat (Ctrl+N)'
+  const NewIcon = mode === 'chat' ? MessageSquarePlus : Plus
+
   if (collapsed) {
     return (
       <div className="flex h-full flex-col items-center gap-1 border-r border-border bg-panel-2 py-3">
@@ -436,41 +546,27 @@ export function ConversationSidebar({
             <ChevronRight size={15} />
           </Button>
         )}
-        {/* Mode switch (Chat|Code), collapsed-rail icon form — same active/inactive
-            treatment as the app's own NavRail (Shell.tsx), since these read as
-            nav-adjacent icons here rather than a horizontal pill. */}
-        <Link
-          to={chatModeHref}
-          title="Chat"
-          aria-current={!isCodeMode ? 'page' : undefined}
-          className={cn(
-            'grid h-7 w-7 place-items-center rounded-md transition-colors',
-            !isCodeMode ? 'bg-accent/12 text-accent' : 'text-muted hover:bg-panel hover:text-ink',
-          )}
-        >
-          <MessageSquare size={15} />
-        </Link>
-        <Link
-          to={codeModeHref}
-          title="Code (preview)"
-          aria-current={isCodeMode ? 'page' : undefined}
-          className={cn(
-            'grid h-7 w-7 place-items-center rounded-md transition-colors',
-            isCodeMode ? 'bg-accent/12 text-accent' : 'text-muted hover:bg-panel hover:text-ink',
-          )}
-        >
-          <SquareTerminal size={15} />
-        </Link>
-        <Button
-          size="icon"
-          variant="ghost"
-          onClick={onNew}
-          title={isCodeMode ? 'New session' : 'New chat (Ctrl+N)'}
-          className="h-7 w-7"
-        >
-          {isCodeMode ? <Plus size={15} /> : <MessageSquarePlus size={15} />}
+        {/* Mode switch (Chat|Code|Routines), collapsed-rail icon form — same active/inactive
+            treatment as the app's own NavRail (Shell.tsx), since these read as nav-adjacent
+            icons here rather than a horizontal pill. */}
+        {modeTabs.map(({ mode: m, href, label, icon: Icon }) => (
+          <Link
+            key={m}
+            to={href}
+            title={label}
+            aria-current={mode === m ? 'page' : undefined}
+            className={cn(
+              'grid h-7 w-7 place-items-center rounded-md transition-colors',
+              mode === m ? 'bg-accent/12 text-accent' : 'text-muted hover:bg-panel hover:text-ink',
+            )}
+          >
+            <Icon size={15} />
+          </Link>
+        ))}
+        <Button size="icon" variant="ghost" onClick={onNew} title={newLabel} className="h-7 w-7">
+          <NewIcon size={15} />
         </Button>
-        {!isCodeMode && onImport && (
+        {mode === 'chat' && onImport && (
           <Button size="icon" variant="ghost" onClick={onImport} title="Import chat (.turbollm-chat.json or OpenAI JSON)" className="h-7 w-7">
             <Download size={15} />
           </Button>
@@ -481,43 +577,31 @@ export function ConversationSidebar({
 
   return (
     <div className="flex h-full flex-col border-r border-border bg-panel-2">
-      {/* Mode switch (Chat|Code) — mirrors the pill in CodeHomeScreen's own header,
-          kept in sync via the route (isCodeMode above). Lets the user flip modes
-          from the sidebar itself, not just the main content header. This replaced
-          the old single-purpose "Code · preview" footer link. */}
+      {/* Mode switch (Chat|Code|Routines) — mirrors the pill in CodeHomeScreen's own header,
+          kept in sync via the route (`mode` above). Lets the user flip modes from the sidebar
+          itself, not just the main content header. This replaced the old single-purpose
+          "Code · preview" footer link. */}
       <div className="px-3 pt-3">
         <div className="flex overflow-hidden rounded-lg border border-border" role="group" aria-label="Workspace mode">
-          {isCodeMode ? (
-            <Link
-              to={chatModeHref}
-              className="flex flex-1 items-center justify-center gap-1.5 px-3 py-1.5 text-[12px] font-medium text-muted transition-colors hover:bg-panel hover:text-ink"
-            >
-              <MessageSquare size={13} /> Chat
-            </Link>
-          ) : (
-            <span
-              aria-current="page"
-              className="flex flex-1 items-center justify-center gap-1.5 px-3 py-1.5 text-[12px] font-medium"
-              style={{ background: 'var(--accent)', color: 'var(--on-accent)' }}
-            >
-              <MessageSquare size={13} /> Chat
-            </span>
-          )}
-          {isCodeMode ? (
-            <span
-              aria-current="page"
-              className="flex flex-1 items-center justify-center gap-1.5 px-3 py-1.5 text-[12px] font-medium"
-              style={{ background: 'var(--accent)', color: 'var(--on-accent)' }}
-            >
-              <SquareTerminal size={13} /> Code
-            </span>
-          ) : (
-            <Link
-              to={codeModeHref}
-              className="flex flex-1 items-center justify-center gap-1.5 px-3 py-1.5 text-[12px] font-medium text-muted transition-colors hover:bg-panel hover:text-ink"
-            >
-              <SquareTerminal size={13} /> Code
-            </Link>
+          {modeTabs.map(({ mode: m, href, label, icon: Icon }) =>
+            mode === m ? (
+              <span
+                key={m}
+                aria-current="page"
+                className="flex flex-1 items-center justify-center gap-1.5 px-3 py-1.5 text-[12px] font-medium"
+                style={{ background: 'var(--accent)', color: 'var(--on-accent)' }}
+              >
+                <Icon size={13} /> {label}
+              </span>
+            ) : (
+              <Link
+                key={m}
+                to={href}
+                className="flex flex-1 items-center justify-center gap-1.5 px-3 py-1.5 text-[12px] font-medium text-muted transition-colors hover:bg-panel hover:text-ink"
+              >
+                <Icon size={13} /> {label}
+              </Link>
+            ),
           )}
         </div>
       </div>
@@ -538,24 +622,25 @@ export function ConversationSidebar({
             className="h-7 pl-7 text-[12px]"
           />
         </div>
-        {/* New folder / Import are chat-specific actions — hidden in Code mode rather than
-            left dangling above a list they don't act on. New (chat/session) applies to both
-            modes — onNew is wired per-mode by whichever screen renders this sidebar. */}
+        {/* New folder / Import are chat-only actions — hidden in Code and Routines modes
+            rather than left dangling above a list they don't act on. New (chat/session/routine)
+            applies to all three modes — onNew is wired per-mode by whichever screen renders
+            this sidebar. */}
         <Button
           size="icon"
           variant="ghost"
           onClick={onNew}
-          title={isCodeMode ? 'New session' : 'New chat (Ctrl+N)'}
+          title={newLabel}
           className="h-7 w-7 shrink-0"
         >
-          {isCodeMode ? <Plus size={15} /> : <MessageSquarePlus size={15} />}
+          <NewIcon size={15} />
         </Button>
-        {!isCodeMode && (
+        {mode === 'chat' && (
           <Button size="icon" variant="ghost" onClick={() => { setAddingFolder(true); setNewFolderName('') }} title="New folder" className="h-7 w-7 shrink-0">
             <FolderPlus size={15} />
           </Button>
         )}
-        {!isCodeMode && onImport && (
+        {mode === 'chat' && onImport && (
           <Button size="icon" variant="ghost" onClick={onImport} title="Import chat (.turbollm-chat.json or OpenAI JSON)" className="h-7 w-7 shrink-0">
             <Download size={15} />
           </Button>
@@ -563,7 +648,7 @@ export function ConversationSidebar({
       </div>
 
       {/* Inline "new folder" name input — mirrors the conversation-rename inline UX. */}
-      {!isCodeMode && addingFolder && (
+      {mode === 'chat' && addingFolder && (
         <div className="flex items-center gap-2 px-3 pb-2">
           <FolderIcon size={13} className="shrink-0 text-faint" />
           <input
@@ -582,7 +667,12 @@ export function ConversationSidebar({
       )}
 
       <div className="flex-1 overflow-y-auto px-1 pb-2">
-        {isCodeMode ? (
+        {isRoutinesMode ? (
+          // Routines mode: ONLY routines, flat (no section header, same reasoning as the code
+          // list's own). No longer a link pinned above the Code session list (spec 20 §2.1's
+          // follow-up) — Routines is a peer mode now, with its own list here.
+          <RoutinesList q={debouncedQ} />
+        ) : isCodeMode ? (
           // Code mode: ONLY code sessions, flat (no section header — see
           // CodeSessionsList above) — never co-displayed with chat history
           // (that was the bug this replaced: both histories showing at once).

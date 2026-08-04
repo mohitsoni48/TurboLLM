@@ -7,6 +7,16 @@ import {
 } from './builtin'
 import { searchConfigured } from './search-providers'
 import { createMcpClient, type IMcpClient } from './mcp-client'
+import {
+  CREATE_ROUTINE_TOOL, LIST_ROUTINES_TOOL, UPDATE_ROUTINE_TOOL, DELETE_ROUTINE_TOOL, RUN_ROUTINE_NOW_TOOL,
+  execCreateRoutine, execListRoutines, execUpdateRoutine, execDeleteRoutine, execRunRoutineNow,
+  type RoutineToolsStore, type RunRoutineNowFn,
+} from '../routines/routine-tools'
+import { ROUTINES_DISABLED_MESSAGE } from '../routines/routine-routes'
+import {
+  LIST_AGENTS_TOOL, CREATE_AGENT_TOOL, execListAgents, execCreateAgent, type AgentToolsStore,
+} from '../chat/chat-agent-tools'
+import { LIST_MODELS_TOOL, execListModels, type ModelToolsStore } from '../models/model-tools'
 
 export interface ToolDefinition {
   type: 'function'
@@ -26,9 +36,40 @@ export interface ToolCall {
 export class ToolRegistry {
   private toolsCfg: ToolsConfig
   private mcpClients = new Map<string, IMcpClient>()
+  private routines?: RoutineToolsStore
+  private runRoutineNowFn?: RunRoutineNowFn
+  private agents?: AgentToolsStore
+  private models?: ModelToolsStore
+  private isRoutinesEnabled: () => boolean
 
-  constructor(toolsCfg: ToolsConfig) {
+  /** @param routines Injected once at boot (cli.ts passes `db` — a real ConversationStore
+   *  structurally satisfies RoutineToolsStore). Absent means the 5 routine tools simply do not
+   *  exist on this registry, which is what every test that constructs a bare ToolRegistry gets.
+   *  @param runRoutineNow Backs `run_routine_now` — cli.ts binds RoutineScheduler.runNow.
+   *  @param agents Injected once at boot (cli.ts passes `store` — a real ConfigStore structurally
+   *  satisfies AgentToolsStore). Absent means list_agents/create_agent simply do not exist,
+   *  same "no store, no tools" convention as `routines`.
+   *  @param models Injected once at boot (cli.ts passes `scanner` — a real Scanner structurally
+   *  satisfies ModelToolsStore). Absent means list_models simply does not exist, same convention.
+   *  @param routinesEnabled Live check for `daemon.experimental.routines` (config.ts) — a getter,
+   *  not a snapshot value, since Settings → Experimental can flip it without a restart and this
+   *  registry is constructed once for the daemon's whole lifetime. Consulted ONLY for
+   *  `create_routine` (both here and in the in-app Code/pi session, which reaches this same
+   *  `create_routine` branch via `executeTool` — code-session.ts registers the tool
+   *  unconditionally and always calls through here). list_routines/update_routine/delete_routine/
+   *  run_routine_now stay unaffected, mirroring `ROUTINES_DISABLED_MESSAGE`'s own doc comment.
+   *  Defaults to always-enabled so every pre-existing test/call site that doesn't know about this
+   *  experimental gate keeps its exact previous behavior. */
+  constructor(
+    toolsCfg: ToolsConfig, routines?: RoutineToolsStore, runRoutineNow?: RunRoutineNowFn,
+    agents?: AgentToolsStore, models?: ModelToolsStore, routinesEnabled?: () => boolean,
+  ) {
     this.toolsCfg = toolsCfg
+    this.routines = routines
+    this.runRoutineNowFn = runRoutineNow
+    this.agents = agents
+    this.models = models
+    this.isRoutinesEnabled = routinesEnabled ?? (() => true)
   }
 
   /** Update config (called on settings change without restart). */
@@ -75,6 +116,29 @@ export class ToolRegistry {
     if (searchConfigured(this.toolsCfg.search)) defs.push(webSearchTool())
     defs.push(FETCH_URL_TOOL)
     defs.push(RUN_CODE_TOOL)
+    // Routine tools (Phase 4) — gated on whether a RoutineToolsStore was actually injected
+    // (production always injects one via cli.ts; tests that construct a bare ToolRegistry to
+    // exercise fetch_url/run_code/MCP behavior are unaffected). Persona scoping is NOT done
+    // here — it's the same downstream conv.allowedTools filter every other built-in already
+    // goes through (chat-routes.ts), identical to fetch_url/run_code/web_search.
+    if (this.routines) {
+      // create_routine alone is withheld from the model entirely while the experimental flag is
+      // off — not just an error when called — so a model never even attempts to author one.
+      if (this.isRoutinesEnabled()) defs.push(CREATE_ROUTINE_TOOL)
+      defs.push(LIST_ROUTINES_TOOL, UPDATE_ROUTINE_TOOL, DELETE_ROUTINE_TOOL, RUN_ROUTINE_NOW_TOOL)
+    }
+    // Agent tools (Customize -> Agents) — lets a chat-flavor create_routine call be preceded by
+    // list_agents/create_agent in the SAME turn, with no human needing to open Customize first.
+    if (this.agents) {
+      defs.push(LIST_AGENTS_TOOL, CREATE_AGENT_TOOL)
+    }
+    // Model tool — lets create_routine's modelKey be looked up instead of guessed. Real modelKeys
+    // are compound ids (e.g. "gemma 4 26b a4b qat|Q4_0|14439362752"); without this, a model has no
+    // data to work from and reaches for a generic cloud-model name like "gpt-4" or "claude" — a
+    // routine created with a nonexistent modelKey can never fire successfully.
+    if (this.models) {
+      defs.push(LIST_MODELS_TOOL)
+    }
 
     // MCP tools from connected servers
     for (const client of this.mcpClients.values()) {
@@ -96,8 +160,19 @@ export class ToolRegistry {
     return defs
   }
 
-  /** Execute a single tool call. Returns the result string. */
-  async executeTool(call: ToolCall): Promise<string> {
+  /** Execute a single tool call. Returns the result string.
+   *
+   *  @param isCodeAuthorized The CALLER's per-request answer to "has this caller cleared the same
+   *  bar `codeAuth` enforces — host-local OR holding a valid API key?". Consulted by
+   *  `create_routine`/`update_routine`/`run_routine_now`, and only for CODE-flavor routines (see
+   *  routine-tools.ts's module header; `delete_routine`/`list_routines` are deliberately ungated
+   *  there, for REST parity). It cannot be computed here: this registry is constructed ONCE for the
+   *  daemon's whole lifetime (cli.ts), while the answer is a property of one specific HTTP
+   *  request. DEFAULTS TO FALSE so a caller that does not know about this gate — every pre-Phase-4
+   *  call site, and any future one — blocks code-flavor authoring rather than silently permitting
+   *  it. Chat's live handler computes it with routine-routes.ts's own `codeGateBlocks`; a
+   *  scheduled routine's unattended tool loop deliberately leaves it false. */
+  async executeTool(call: ToolCall, isCodeAuthorized = false): Promise<string> {
     const name = call.name
     const args = call.args
 
@@ -120,6 +195,45 @@ export class ToolRegistry {
     // Built-in: run_code — approval gating happens upstream in execute-with-approval.ts
     // before executeTool is ever called, so run_code always executes here.
     if (name === 'run_code') return execRunCode(args)
+
+    // Routine tools (Phase 4) — the same shared executors chat and the in-app Code/pi session
+    // both reach (code-session.ts calls THIS method too, not a second implementation).
+    if (this.routines) {
+      if (name === 'create_routine') {
+        // Experimental gate first, exactly like POST /api/v1/routines (routine-routes.ts) checks
+        // it before even the code-flavor gate — off means off for every flavor, on every surface
+        // that reaches this branch (chat's own tool loop AND the in-app Code/pi session, which
+        // both call executeTool with name: 'create_routine').
+        if (!this.isRoutinesEnabled()) return `Error: ${ROUTINES_DISABLED_MESSAGE}`
+        const modelExists = this.models ? (key: string) => this.models!.list().models.some((m) => m.key === key) : undefined
+        return execCreateRoutine(args, this.routines, isCodeAuthorized, modelExists)
+      }
+      if (name === 'list_routines') return execListRoutines(args, this.routines)
+      if (name === 'update_routine') return execUpdateRoutine(args, this.routines, isCodeAuthorized)
+      if (name === 'delete_routine') return execDeleteRoutine(args, this.routines)
+      if (name === 'run_routine_now') {
+        // Same kill switch as create_routine — RoutineScheduler.runNow() (cli.ts's injected
+        // runRoutineNowFn) checks this same flag independently, so this is a clearer error
+        // message on this surface rather than the only enforcement.
+        if (!this.isRoutinesEnabled()) return `Error: ${ROUTINES_DISABLED_MESSAGE}`
+        if (!this.runRoutineNowFn) return 'Error: run_routine_now is not available in this build.'
+        return execRunRoutineNow(args, this.routines, this.runRoutineNowFn, isCodeAuthorized)
+      }
+    }
+
+    // Agent tools (Customize -> Agents) — unlike the routine tools, ungated: see
+    // chat-agent-tools.ts's module header for why a CustomChatAgent carries no more risk than the
+    // model composing a longer reply.
+    if (this.agents) {
+      if (name === 'list_agents') return execListAgents(args, this.agents)
+      if (name === 'create_agent') return execCreateAgent(args, this.agents)
+    }
+
+    // Model tool — read-only, no gating needed (same reasoning as list_agents: it only ever
+    // reveals what's already visible in the Models screen).
+    if (this.models) {
+      if (name === 'list_models') return execListModels(args, this.models)
+    }
 
     // MCP tool: mcp__{serverId}__{toolName}
     const mcpMatch = name.match(/^mcp__([^_]+(?:_[^_]+)*)__(.+)$/)
