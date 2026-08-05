@@ -103,32 +103,23 @@ test('validateEvent: ui_daily requires screen plus both volume counters', () => 
   assert.equal(missingCounts.ok, false)
 })
 
-test('validateEvent: onboarding_step requires a known step and outcome', () => {
-  assert.equal(
-    validateEvent(validEvent({ event: 'onboarding_step', payload: { step: 'model_download', outcome: 'ok' } })).ok,
-    true,
-  )
-  const r = validateEvent(validEvent({ event: 'onboarding_step', payload: { step: 'model_download' } }))
+test('validateEvent: onboarding_step no longer exists (spec 23 §4, Phase 7) — the whole event is gone, not just its steps', () => {
+  const r = validateEvent(validEvent({ event: 'onboarding_step', payload: { step: 'model_download', outcome: 'ok' } }))
   assert.equal(r.ok, false)
-  assert.match(r.reason, /outcome/)
+  assert.match(r.reason, /event/)
 })
 
-test('validateEvent: first_chat is a valid onboarding step, and reports ok/fail/cancelled', () => {
+test('validateEvent: model_downloaded requires a known outcome, reporting ok/fail/cancelled (promoted out of onboarding_step)', () => {
   for (const outcome of ['ok', 'fail', 'cancelled']) {
     assert.equal(
-      validateEvent(validEvent({ event: 'onboarding_step', payload: { step: 'first_chat', outcome } })).ok,
+      validateEvent(validEvent({ event: 'model_downloaded', payload: { outcome } })).ok,
       true,
-      `first_chat should accept outcome '${outcome}'`,
+      `model_downloaded should accept outcome '${outcome}'`,
     )
   }
-})
-
-test('validateEvent: engine_build is no longer an onboarding step (ADR-323)', () => {
-  // Removed because seedDefaultEngines only ever provisions a prebuilt binary — the
-  // step measured a manual advanced-user action, so it read as near-total drop-off.
-  const r = validateEvent(validEvent({ event: 'onboarding_step', payload: { step: 'engine_build', outcome: 'ok' } }))
+  const r = validateEvent(validEvent({ event: 'model_downloaded', payload: {} }))
   assert.equal(r.ok, false)
-  assert.match(r.reason, /step/)
+  assert.match(r.reason, /outcome/)
 })
 
 test('validateEvent: model_first_load takes an optional enum failReason', () => {
@@ -139,21 +130,17 @@ test('validateEvent: model_first_load takes an optional enum failReason', () => 
   assert.equal(validateEvent(validEvent({ event: 'model_first_load', payload: { outcome: 'ok' } })).ok, true)
 })
 
-test('validateEvent: onboarding_step takes an optional enum failReason (engine_install, telemetry-review follow-up)', () => {
+test('validateEvent: engine_installed takes an optional enum failReason (promoted out of onboarding_step: engine_install)', () => {
   assert.equal(
-    validateEvent(
-      validEvent({ event: 'onboarding_step', payload: { step: 'engine_install', outcome: 'fail', failReason: 'network' } }),
-    ).ok,
+    validateEvent(validEvent({ event: 'engine_installed', payload: { outcome: 'fail', failReason: 'network' } })).ok,
     true,
   )
   assert.equal(
-    validateEvent(validEvent({ event: 'onboarding_step', payload: { step: 'engine_install', outcome: 'ok' } })).ok,
+    validateEvent(validEvent({ event: 'engine_installed', payload: { outcome: 'ok' } })).ok,
     true,
     'failReason is optional — an ok outcome need not carry one',
   )
-  const r = validateEvent(
-    validEvent({ event: 'onboarding_step', payload: { step: 'engine_install', outcome: 'fail', failReason: 'oom' } }),
-  )
+  const r = validateEvent(validEvent({ event: 'engine_installed', payload: { outcome: 'fail', failReason: 'oom' } }))
   assert.equal(r.ok, false, "'oom' is a model-load reason, not a provisioning one — must not validate here")
 })
 

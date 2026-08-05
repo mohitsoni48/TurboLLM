@@ -11,8 +11,8 @@
  */
 
 import { appFirstRun, dailyActive } from './lifecycle'
-import { onboardingStep } from './onboarding'
-import { modelFirstLoad, modelLoad } from './model'
+import { modelFirstLoad, modelLoad, modelDownloaded } from './model'
+import { engineInstalled } from './engine'
 import { featureFirstUse, featureUsedDaily } from './feature'
 import { errorEvent, consentChoice } from './meta'
 import { benchResult } from './perf'
@@ -24,9 +24,10 @@ import { uiAction, uiDaily } from './ui'
 export const REGISTRY = {
   app_first_run: appFirstRun,
   daily_active: dailyActive,
-  onboarding_step: onboardingStep,
   model_first_load: modelFirstLoad,
   model_load: modelLoad,
+  engine_installed: engineInstalled,
+  model_downloaded: modelDownloaded,
   feature_first_use: featureFirstUse,
   feature_used_daily: featureUsedDaily,
   error: errorEvent,
@@ -47,9 +48,10 @@ export const EVENT_NAMES = Object.keys(REGISTRY) as EventName[]
 export {
   appFirstRun,
   dailyActive,
-  onboardingStep,
   modelFirstLoad,
   modelLoad,
+  modelDownloaded,
+  engineInstalled,
   featureFirstUse,
   featureUsedDaily,
   errorEvent,

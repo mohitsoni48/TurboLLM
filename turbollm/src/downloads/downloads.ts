@@ -100,11 +100,13 @@ export class DownloadManager {
   private provenanceList: ProvenanceEntry[] = []
   private nextSeq = 0
 
-  /** Optional observer for a download's terminal outcome, wired in cli.ts
-   *  (ADR-299 `onboarding_step`). Separate from `onComplete`, which fires only
-   *  on success and exists to trigger a rescan — reusing it would have made a
-   *  failed download indistinguishable from one that never started. The error
-   *  string is deliberately not passed: the only consumer may never send text. */
+  /** Optional observer for a download's terminal outcome, wired in cli.ts to
+   *  the `model_downloaded` event (spec 23 §4 — promoted out of
+   *  `onboarding_step: model_download`). Separate from `onComplete`, which
+   *  fires only on success and exists to trigger a rescan — reusing it would
+   *  have made a failed download indistinguishable from one that never
+   *  started. The error string is deliberately not passed: the only consumer
+   *  may never send text. */
   onSettled?: (outcome: 'ok' | 'fail' | 'cancelled') => void
 
   private settle(outcome: 'ok' | 'fail' | 'cancelled'): void {

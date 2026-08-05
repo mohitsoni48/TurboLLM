@@ -11,12 +11,6 @@
  *  a repo name or a chat title can never be expressed as one of these. */
 export const FEATURES = ['chat', 'code', 'research', 'artifacts', 'mcp', 'agents', 'autotune', 'skills', 'image'] as const
 
-/** Steps in the install → first-chat journey (ADR-299 Decision 6, amended by
- *  ADR-323). Retired entirely in spec 23 §4 — onboarding becomes a PostHog
- *  funnel derived from real events instead of steps inside one event — but
- *  kept alive here until that migration (Phase 7) actually ships. */
-export const ONBOARDING_STEPS = ['engine_install', 'model_download', 'first_load', 'first_chat'] as const
-
 /** How a step or a load ended. */
 export const OUTCOMES = ['ok', 'fail', 'cancelled'] as const
 

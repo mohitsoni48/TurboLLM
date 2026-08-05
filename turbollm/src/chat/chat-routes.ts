@@ -18,8 +18,6 @@ import { buildSaveSkillTool } from '../agents/agent-tools'
 import { SkillStore } from '../agents/skills'
 import { saveSkillFromConversation } from '../agents/skill-jobs'
 import { extractMemoryFacts } from './memory'
-import { claimOnce } from '../telemetry/ledger'
-import type { Emitter } from '../telemetry/emit'
 import { codeGateBlocks } from '../routines/routine-routes'
 import { emitBenchResult } from '../telemetry/runtime/typed-emit'
 import { buildBenchResultConfig } from '../telemetry/events/perf'
@@ -726,33 +724,6 @@ interface GenerationCtx {
  * tags, executes tool calls and loops (up to MAX_TOOL_ITER rounds), persists the final
  * message + stats, and fires auto-title. Shared by the messages and continue endpoints.
  */
-/**
- * `onboarding_step: first_chat` (ADR-323) — the funnel's real success criterion.
- *
- * Once-only for the same reason `first_load` is: this fires on EVERY generation, and
- * without the ledger claim an active user's ordinary chatting would emit a "setup"
- * event forever. A first reply that FAILS or is cancelled still claims the key —
- * the same "first outcome, whatever it is" semantics `model_load`'s own once-per-
- * install-derived signal relies on (spec 23 §4: onboarding's "first load" step is
- * now just the first `model_load` per machine, not a bespoke once-only event) —
- * because a user whose first attempt breaks or is abandoned still reached chat, and
- * conflating that with "never tried" would hide exactly the drop-off this event
- * exists to find. Classification is the caller's job: runGeneration has both an
- * early engine-error return and a later thrown-error catch, and only the caller can
- * tell those apart from a real success.
- *
- * Extracted rather than inlined so the claim-once behaviour is testable without
- * standing up a whole streaming generation. Never throws: `claimOnce` and
- * `Emitter.emit` are both non-throwing by contract (ADR-009).
- */
-export function reportFirstChat(dataDir: string, emitter: Emitter | undefined, outcome: 'ok' | 'fail' | 'cancelled'): void {
-  if (!emitter) return
-  // Consent is checked before the claim is spent, so chatting while telemetry is off
-  // does not silently burn the one chance to record this (see Emitter.canSend).
-  if (!emitter.canSend('onboarding_step')) return
-  if (!claimOnce(dataDir, 'once:onboarding_step:first_chat')) return
-  emitter.emit('onboarding_step', { step: 'first_chat', outcome })
-}
 
 /**
  * `bench_result{source:'chat'}` (spec 23 §3.7, ADR-333, founder-directed
@@ -1014,11 +985,6 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
 
       if (!res.ok || !res.body) {
         await stream.writeSSE({ event: 'error', data: JSON.stringify({ code: 'engine_error', message: `Engine returned ${res.status}` }) })
-        // This return skips the normal end-of-generation code below (including
-        // reportFirstChat's usual call site) entirely — without this, a user whose
-        // very first chat attempt hits a bad engine response would never claim the
-        // once-only key at all, indistinguishable from "never tried."
-        reportFirstChat(d.store.dir(), d.telemetry, 'fail')
         return
       }
 
@@ -1474,10 +1440,6 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
 
   db.updateMessage(assistantMsg.id, { content: fullContent, reasoning: fullReasoning, toolCalls: allToolCalls, stats, researchMeta })
   db.touchConversation(convId)
-  // onboarding_step (ADR-323): the last step of the funnel. Emitted here, at the point the
-  // reply is actually persisted, because that — not a model load — is the moment onboarding
-  // has genuinely succeeded.
-  reportFirstChat(d.store.dir(), d.telemetry, aborted ? 'cancelled' : engineFailed ? 'fail' : 'ok')
   if (!aborted && !engineFailed && ms.model) reportChatBenchResult(d, ms.model, stats)
 
   try {

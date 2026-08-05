@@ -51,12 +51,14 @@ export class BuildState {
     if (this.s.log.length > LOG_TAIL) this.s.log.splice(0, this.s.log.length - LOG_TAIL)
   }
 
-  /** Optional observer for the terminal outcome, wired in cli.ts (ADR-299
-   *  `onboarding_step` / ADR-327 `error`). A plain callback so this module keeps
-   *  no telemetry dependency; the error STRING is deliberately never passed,
-   *  because the only consumer may never send free text. Three outcomes, not
-   *  two — `cancelled` is distinct from `fail` (PR #105 review finding): a
-   *  build the user deliberately aborted must not be reported as a crash. */
+  /** Optional observer for the terminal outcome, wired in cli.ts to the `error`
+   *  event (ADR-327) — building from source was never part of the onboarding
+   *  funnel (ADR-323), so there is no funnel-step event here, only the ongoing
+   *  crash signal. A plain callback so this module keeps no telemetry
+   *  dependency; the error STRING is deliberately never passed, because the
+   *  only consumer may never send free text. Three outcomes, not two —
+   *  `cancelled` is distinct from `fail` (PR #105 review finding): a build the
+   *  user deliberately aborted must not be reported as a crash. */
   onSettled?: (outcome: 'ok' | 'fail' | 'cancelled') => void
 
   done(): void {

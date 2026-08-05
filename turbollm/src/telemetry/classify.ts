@@ -14,11 +14,12 @@
  * exist. OOM is therefore checked first.
  */
 
-import type { FAIL_REASONS } from './core/enums'
+import type { FAIL_REASONS, PROVISION_FAIL_REASONS } from './core/enums'
 import type { HARNESSES } from './events/gateway'
 
 type FailReason = (typeof FAIL_REASONS)[number]
 type Harness = (typeof HARNESSES)[number]
+type ProvisionFailReason = (typeof PROVISION_FAIL_REASONS)[number]
 
 export interface LoadError {
   code?: string
@@ -213,8 +214,9 @@ export function classifyHarness(userAgent: string | null | undefined): Harness {
 
 /**
  * Classify why provisioning a prebuilt engine failed, into a
- * `PROVISION_FAIL_REASONS` member (`onboarding_step: engine_install`,
- * ADR-299 amended by the telemetry-review follow-up).
+ * `PROVISION_FAIL_REASONS` member (the `engine_installed` event, spec 23 §4 —
+ * promoted out of `onboarding_step: engine_install`, ADR-299 amended by the
+ * telemetry-review follow-up).
  *
  * Mirrors {@link classifyLoadFailure}'s boundary contract exactly: the input
  * is `ProvisionState.fail()`'s free-form message (built from `Error#message`
@@ -224,7 +226,7 @@ export function classifyHarness(userAgent: string | null | undefined): Harness {
  * (telemetry included) still never see free text, preserving the invariant
  * both `ProvisionState` and `BuildState` document on `onSettled`.
  */
-export function classifyProvisionFailure(message: string | null | undefined): string {
+export function classifyProvisionFailure(message: string | null | undefined): ProvisionFailReason {
   if (!message) return 'other'
   const haystack = message.toLowerCase()
 
