@@ -201,7 +201,7 @@ const TURBOLLM_KNOWLEDGE =
   '**Prism** (Windows / Linux / macOS — GGUF):\n' +
   'llama.cpp fork tuned for 1-2 bit ternary/Bonsai models. Build-from-source only (guided walkthrough) — no one-click install, even though upstream publishes prebuilts.\n\n' +
   '**BeeLlama.cpp** (Windows / Linux / macOS — GGUF):\n' +
-  'llama.cpp fork adding variance-normalized KV-cache quantization (KVarN: `kvarn2`…`kvarn8`, set via `--cache-type-k`/`-v`), a KV precision tail, and adaptive DFlash speculative decoding. Build-from-source only. The KVarN types aren\'t in the auto-tune sweep yet — set them via the custom/raw flags field.\n\n' +
+  'llama.cpp fork adding variance-normalized KV-cache quantization (KVarN: `kvarn2`…`kvarn8`, set via `--cache-type-k`/`-v`), a KV precision tail, and adaptive DFlash speculative decoding. Build-from-source only. The KVarN types show up directly in the KV cache type dropdown (auto-discovered from the build\'s own --help output) but aren\'t in the auto-tune sweep yet — pick one manually.\n\n' +
 
   '## Gateway\n\n' +
   'TurboLLM at `http://localhost:6996` exposes:\n' +

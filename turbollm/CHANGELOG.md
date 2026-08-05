@@ -25,6 +25,18 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.10.2] - 2026-08-05
+
+### Added
+- KV-cache quantization types are now discovered automatically from each engine's own `--help`
+  output, instead of being hardcoded for one specific fork. Concretely: BeeLlama.cpp's KVarN cache
+  types (`kvarn2`…`kvarn8`) now show up correctly in the KV cache type dropdown and work when
+  loading a model — and any future fork's custom KV-cache types will too, without needing an app
+  update.
+
+### Discord
+- KV-cache types now show up automatically for any engine fork instead of only one — if you use BeeLlama.cpp or another fork with custom KV-cache quant types, they'll now appear in the KV cache type dropdown out of the box.
+
 ## [1.10.1] - 2026-08-04
 
 ### Added

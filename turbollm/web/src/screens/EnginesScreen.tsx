@@ -331,7 +331,7 @@ const ENGINE_META: Record<string, EngineMeta> = {
       'KV precision tail keeps recent tokens exact, cheaply',
       'Adaptive DFlash speculative decoding',
     ],
-    cons: ['Solo maintainer, fast churn (v0.4.0 dropped TurboQuant/TCQ)', 'No install endpoint yet — build from source', 'KVarN types need the raw flags field, not auto-tune yet'],
+    cons: ['Solo maintainer, fast churn (v0.4.0 dropped TurboQuant/TCQ)', 'No install endpoint yet — build from source', 'KVarN types are manual-pick only, not in the auto-tune sweep yet'],
   },
 }
 
