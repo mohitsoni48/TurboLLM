@@ -1591,6 +1591,151 @@ export class ConversationStore {
     }
   }
 
+  /**
+   * A single UTC-comparable `[start, end)` window for `chat_daily`/`gateway_daily`/
+   * `code_daily` (spec 23 §3.4/3.5/3.8, ADR-333) — read-only aggregations over
+   * tables that already durably record everything needed, computed once at
+   * day-rollover rather than accumulated in memory (unlike `feature_used_daily`,
+   * which has no backing table to query and genuinely needs `runtime/rollup.ts`'s
+   * accumulator). `dayIso` is a `YYYY-MM-DD` local-calendar-day key, matching
+   * `dayKey()`'s own convention above.
+   */
+  private dayWindow(dayIso: string): { start: string; end: string } {
+    const [y, m, d] = dayIso.split('-').map(Number)
+    return {
+      start: new Date(y, m - 1, d).toISOString(),
+      end: new Date(y, m - 1, d + 1).toISOString(),
+    }
+  }
+
+  /** `chat_daily`'s config block (spec 23 §3.4) for the local calendar day `dayIso`.
+   *  `toolCalls` sums `json_array_length(tool_calls)` rather than counting messages
+   *  that merely HAVE a tool call, so a message with 3 calls in one turn counts as 3.
+   *  `regenerates` counts deactivated variant-group siblings — each one is a message
+   *  a real regenerate action superseded (see the `variant_group`/`is_active`
+   *  migration note above). `stops` reads `stats.aborted`, the same flag the chat UI
+   *  itself uses to render a stopped reply. Median is computed in JS — SQLite has no
+   *  built-in median aggregate, and pulling one row per touched conversation is cheap
+   *  (a real day's conversation count is nowhere near enough to matter). */
+  chatDailyStats(dayIso: string): {
+    conversations: number; messages: number; maxMessagesInConversation: number
+    medianMessagesInConversation: number; distinctModels: number; toolCalls: number
+    regenerates: number; stops: number
+  } {
+    const { start, end } = this.dayWindow(dayIso)
+    const rows = this.db.prepare(`
+      SELECT conv_id, model_key, tool_calls, stats FROM messages
+      WHERE created_at >= ? AND created_at < ? AND is_active = 1
+    `).all(start, end) as unknown as { conv_id: string; model_key: string | null; tool_calls: string | null; stats: string }[]
+
+    const perConv = new Map<string, number>()
+    const models = new Set<string>()
+    let toolCalls = 0
+    let stops = 0
+    for (const r of rows) {
+      perConv.set(r.conv_id, (perConv.get(r.conv_id) ?? 0) + 1)
+      if (r.model_key) models.add(r.model_key)
+      if (r.tool_calls) {
+        try {
+          const parsed: unknown = JSON.parse(r.tool_calls)
+          if (Array.isArray(parsed)) toolCalls += parsed.length
+        } catch {
+          // malformed tool_calls JSON — skip rather than crash a periodic rollup
+        }
+      }
+      try {
+        const s: unknown = JSON.parse(r.stats)
+        if (typeof s === 'object' && s !== null && (s as { aborted?: unknown }).aborted === true) stops++
+      } catch {
+        // malformed stats JSON — same treatment
+      }
+    }
+
+    const counts = [...perConv.values()].sort((a, b) => a - b)
+    const median = counts.length === 0 ? 0
+      : counts.length % 2 === 1 ? counts[(counts.length - 1) / 2]
+      : (counts[counts.length / 2 - 1] + counts[counts.length / 2]) / 2
+
+    const regenerates = (this.db.prepare(`
+      SELECT COUNT(*) AS n FROM messages
+      WHERE created_at >= ? AND created_at < ? AND variant_group IS NOT NULL AND is_active = 0
+    `).get(start, end) as unknown as { n: number }).n
+
+    return {
+      conversations: perConv.size,
+      messages: rows.length,
+      maxMessagesInConversation: counts.length === 0 ? 0 : counts[counts.length - 1],
+      medianMessagesInConversation: median,
+      distinctModels: models.size,
+      toolCalls,
+      regenerates,
+      stops,
+    }
+  }
+
+  /** `gateway_daily`'s config block (spec 23 §3.5) for the local calendar day
+   *  `dayIso`, grouped by `source` (protocol) — a read-only aggregation over the
+   *  ALREADY-INDEXED `api_usage` table, so this adds no write to the gateway's own
+   *  hot request path. Grouped by harness too once Phase 5's client-detection
+   *  ships; until then every row reports `harness: 'unknown'` rather than waiting
+   *  on that phase to start collecting protocol-level volume at all. */
+  gatewayDailyStats(dayIso: string): { protocol: ApiUsageSource; requests: number; promptTokens: number; genTokens: number; distinctModels: number }[] {
+    const { start, end } = this.dayWindow(dayIso)
+    const rows = this.db.prepare(`
+      SELECT source, model_key, prompt_tokens, gen_tokens FROM api_usage
+      WHERE created_at >= ? AND created_at < ?
+    `).all(start, end) as unknown as { source: ApiUsageSource; model_key: string | null; prompt_tokens: number; gen_tokens: number }[]
+
+    const bySource = new Map<ApiUsageSource, { requests: number; promptTokens: number; genTokens: number; models: Set<string> }>()
+    for (const r of rows) {
+      const t = bySource.get(r.source) ?? { requests: 0, promptTokens: 0, genTokens: 0, models: new Set<string>() }
+      t.requests++
+      t.promptTokens += r.prompt_tokens
+      t.genTokens += r.gen_tokens
+      if (r.model_key) t.models.add(r.model_key)
+      bySource.set(r.source, t)
+    }
+
+    return [...bySource.entries()].map(([protocol, t]) => ({
+      protocol, requests: t.requests, promptTokens: t.promptTokens, genTokens: t.genTokens, distinctModels: t.models.size,
+    }))
+  }
+
+  /** `code_daily`'s config block (spec 23 §3.6) for the local calendar day `dayIso`
+   *  — `sessions`/`turns`/`toolCalls` only. `toolApprovals`/`toolDenials`/
+   *  `compactions`/`worktreeSessions` need new instrumentation inside
+   *  `code-session.ts` itself (no table records per-call approval decisions or
+   *  compaction events today) and are a deliberate, tracked follow-up (TODO.md)
+   *  rather than fabricated here. `agent_runs` is a Code session (`codeStats`'s own
+   *  precedent for this join); `turns` counts assistant replies within one, the same
+   *  unit `chatDailyStats` counts for regular chat. */
+  codeDailyStats(dayIso: string): { sessions: number; turns: number; toolCalls: number } {
+    const { start, end } = this.dayWindow(dayIso)
+    const sessions = (this.db.prepare(`
+      SELECT COUNT(*) AS n FROM agent_runs ar JOIN conversations c ON c.id = ar.conv_id
+      WHERE c.kind = 'code' AND ar.created_at >= ? AND ar.created_at < ?
+    `).get(start, end) as unknown as { n: number }).n
+
+    const rows = this.db.prepare(`
+      SELECT m.tool_calls FROM messages m JOIN conversations c ON c.id = m.conv_id
+      WHERE c.kind = 'code' AND m.role = 'assistant' AND m.is_active = 1
+        AND m.created_at >= ? AND m.created_at < ?
+    `).all(start, end) as unknown as { tool_calls: string | null }[]
+
+    let toolCalls = 0
+    for (const r of rows) {
+      if (!r.tool_calls) continue
+      try {
+        const parsed: unknown = JSON.parse(r.tool_calls)
+        if (Array.isArray(parsed)) toolCalls += parsed.length
+      } catch {
+        // malformed tool_calls JSON — skip rather than crash a periodic rollup
+      }
+    }
+
+    return { sessions, turns: rows.length, toolCalls }
+  }
+
   /** Code launchpad's "Coding activity" stats — real numbers, replacing code-mock.ts's
    *  CODE_STATS/mockSessionDays (which were always fake). Mirrors tokenUsageStats' own
    *  day-bucket/streak/range pattern closely (dayKey/addDays are the same shared helpers) —
