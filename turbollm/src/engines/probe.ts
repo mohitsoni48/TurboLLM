@@ -221,15 +221,31 @@ export function parseEnumList(blockText: string): string[] {
  *  probe. */
 export function classifyFlag(flagName: string, helpText: string): FlagInfo {
   const escaped = flagName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const re = new RegExp(`${escaped}\\s+(\\S+)\\b([\\s\\S]{0,400}?)(?=\\n\\s*\\(default|\\n\\s{2,}-[a-zA-Z]|\\n\\n|$)`, 'i')
+  // Boundary widened (C1): a next-flag line can start at ANY indent 0-8 (real llama.cpp prints
+  // many flags flush-left at column 0, not just indented) — was previously indent-only, which let
+  // one flag's enum block bleed into the next flag's classification.
+  // Gap-width discrimination (C2): llama.cpp separates a flag from its placeholder by exactly one
+  // space, and jumps straight into the description column with 2+ spaces when there's no
+  // placeholder at all — that gap width is a much more reliable "does this flag take a value"
+  // signal than the placeholder's letter case (real placeholders are often lowercase/symbolic:
+  // `<0...100>`, `lo-hi`, `{pca,mean}`). `( *)` (zero-or-more, not one-or-more) so a bare flag at
+  // true end-of-line with zero trailing spaces still matches instead of falling through to `!m`.
+  const re = new RegExp(`${escaped}( *)(\\S+)?([\\s\\S]{0,400}?)(?=\\n\\s*\\(default|\\n {0,8}-{1,2}[a-zA-Z]|\\n\\n|$)`, 'i')
   const m = re.exec(helpText)
   if (!m) return { name: flagName, kind: 'valued' }
-  const placeholder = m[1]
-  const block = m[2] ?? ''
-  const enumValues = parseEnumList(block)
+  const gap = m[1] ?? ''
+  const placeholder = m[2] ?? ''
+  const block = m[3] ?? ''
+  // I3: feed the placeholder token into the enum search too, not just the block — a bracket enum
+  // written directly after the flag (e.g. `--spec-type [none|draft|nextn]  ...`) lands entirely
+  // inside `placeholder` (no internal whitespace for `\S+` to stop at), not `block`.
+  const enumValues = parseEnumList(placeholder + '\n' + block)
   if (enumValues.length > 0) return { name: flagName, kind: 'enum', enumValues }
-  if (/^[A-Z][A-Z0-9_]*$/.test(placeholder)) return { name: flagName, kind: 'valued' }
-  return { name: flagName, kind: 'boolean' }
+  // gap !== 1 (either 0 — bare flag, nothing follows at all — or 2+ — straight into prose, no
+  // placeholder) or no placeholder captured at all → boolean. Only a single-space gap followed by
+  // a real placeholder token is a value-taking flag with no detected enum.
+  if (gap.length !== 1 || !placeholder) return { name: flagName, kind: 'boolean' }
+  return { name: flagName, kind: 'valued' }
 }
 
 function firstNonEmptyLine(s: string): string {

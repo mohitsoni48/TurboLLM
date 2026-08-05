@@ -48,7 +48,12 @@ function loadModeForEngine(engineKind: string | undefined): LoadMode {
  *  authoritative list as of spec 22 (ADR-328). Includes `--ctx-size`, the long-form alias of the
  *  `-c` flag the "Context length" slider already emits (profile.ts:549) — routes.ts:2561 treats
  *  `-c`/`--ctx-size` as synonyms elsewhere, and a probed engine that documents the long form would
- *  otherwise surface as a second, independent control for the same setting. */
+ *  otherwise surface as a second, independent control for the same setting. Also includes
+ *  `--gpu-layers`/`--n-gpu-layers` (long-form aliases of `-ngl`, the "GPU layers" slider,
+ *  profile.ts:564) and `--temperature` (long-form alias of `--temp`, the "Temperature" slider,
+ *  profile.ts:663) for the same reason — without these, a probed engine documenting the long
+ *  form surfaces a duplicate control whose manually-set value silently wins at launch while the
+ *  slider shows stale state. */
 const MODELED_FLAGS = new Set([
   '--split-mode', '--tensor-split', '--main-gpu', '--parallel', '--kv-unified', '--n-cpu-moe',
   '--cache-type-k', '--cache-type-v', '--flash-attn', '--no-kv-offload', '--threads', '--threads-batch',
@@ -57,6 +62,7 @@ const MODELED_FLAGS = new Set([
   '--spec-draft-n-max', '--draft-min', '--spec-draft-n-min', '--temp', '--top-p', '--top-k', '--min-p',
   '--repeat-penalty', '--presence-penalty', '--frequency-penalty', '--n-keep', '--rope-scaling',
   '--rope-freq-base', '--rope-freq-scale', '--embeddings', '--grammar', '--no-mmap', '--ctx-size',
+  '--gpu-layers', '--n-gpu-layers', '--temperature',
 ])
 
 /** Flags the daemon sets itself when spawning the engine (turbollm/src/engines/manager.ts) —
@@ -68,8 +74,10 @@ const MODELED_FLAGS = new Set([
  *  prefix. `--slot-save-path` is the highest-risk of the three: it's a *valued* flag (the KV
  *  prompt-cache persistence path), and since `extraArgs` is appended last, a user setting it via
  *  the generic control here would silently override the daemon's own managed path and break
- *  slot-cache restore with no visible error. */
-const DAEMON_OWNED_FLAGS = new Set(['-m', '--host', '--port', '--metrics', '--no-webui', '--slot-save-path'])
+ *  slot-cache restore with no visible error. `--model` is `-m`'s documented long-form alias
+ *  (llama.cpp: `-m, --model FNAME`) — included for the same reason: left out, a user could
+ *  silently override which model the running engine actually loads via the generic control. */
+const DAEMON_OWNED_FLAGS = new Set(['-m', '--model', '--host', '--port', '--metrics', '--no-webui', '--slot-save-path'])
 
 /** Reads a flag's current value out of extraArgs: '' for a bare boolean flag present with no
  *  following value, the value string for `--flag value`, or undefined if the flag isn't set. */
@@ -653,7 +661,7 @@ export function ModelDetailDialog({
               <>
                 <SectionTitle>Custom flags</SectionTitle>
                 <Section>
-                  <Row label="Extra command-line flags" hint="Appended to the launch command last, so they can override anything above. e.g. --something value">
+                  <Row label="Extra command-line flags" hint="Appended to the launch command last, so they can override anything above. Add the flag and its value as two separate entries — e.g. type --something, press Enter, type value, press Enter.">
                     <div className="w-full" />
                   </Row>
                   <ChipListInput

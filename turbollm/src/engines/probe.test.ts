@@ -145,3 +145,36 @@ test('classifyFlag: ambiguous text (placeholder present but no real enum) degrad
 test('classifyFlag: a flag absent from the help text at all degrades to "valued", never throws', () => {
   assert.deepEqual(classifyFlag('--totally-unknown', 'no mention of it anywhere\n'), { name: '--totally-unknown', kind: 'valued' })
 })
+
+// ---- classifyFlag: C1/C2/I3 regression fixtures (final-review findings) -------------------
+
+test('classifyFlag: a flag whose block boundary is a FLUSH-LEFT (column 0) next flag, not indented', () => {
+  const help =
+    `--cache-type-k TYPE\n` +
+    `                                        allowed values: f32, f16, bf16\n` +
+    `                                        (default: f16)\n` +
+    `--no-host\n` +
+    `                                        disable host header validation\n`
+  const info = classifyFlag('--no-host', help)
+  assert.equal(info.kind, 'boolean')
+  assert.equal(info.enumValues, undefined)
+})
+
+test('classifyFlag: a bracket enum written directly after the flag, no "allowed values:" label', () => {
+  const help = `--spec-type [none|draft|nextn]         which speculative decoding mode to use\n`
+  const info = classifyFlag('--spec-type', help)
+  assert.equal(info.kind, 'enum')
+  assert.deepEqual(info.enumValues, ['none', 'draft', 'nextn'])
+})
+
+test('classifyFlag: a lowercase/symbolic placeholder that is NOT ALL-CAPS is still classified valued, not boolean', () => {
+  const help = `--rope-scale <0...100>                 RoPE scaling factor\n`
+  const info = classifyFlag('--rope-scale', help)
+  assert.equal(info.kind, 'valued')
+})
+
+test('classifyFlag: a bare boolean flag at true end-of-line (zero trailing spaces before newline) is still boolean', () => {
+  const help = `--no-mmproj\nsome other line\n`
+  const info = classifyFlag('--no-mmproj', help)
+  assert.equal(info.kind, 'boolean')
+})
