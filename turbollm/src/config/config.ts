@@ -23,9 +23,23 @@ export const VRAM_HEADROOM_DEFAULT_MB = 1024
  *  before. The Settings slider snaps straight from {@link VRAM_HEADROOM_MIN_MB} to this value. */
 export const VRAM_HEADROOM_SPILL_MB = 0
 
+export interface FlagInfo {
+  name: string
+  kind: 'enum' | 'boolean' | 'valued'
+  enumValues?: string[]
+}
+
 export interface Capabilities {
   kvTypes: string[]
   flags: string[]
+  /** One entry per probed flag, capturing its inferred argument shape (drives the generic
+   *  "Advanced parameters" UI, spec 22). Optional: absent for engine kinds that never go
+   *  through probe.ts's --help scrape (mlx/rapid-mlx/vllm/sglang, which register with a
+   *  hand-written `{ kvTypes: [], flags: [] }` literal — see api/routes.ts) and for engines
+   *  registered by a daemon predating this field (backfilled by the next reprobe — see
+   *  registry.ts's isStaleCapabilities). Treat undefined as "nothing to show yet", never an
+   *  error. */
+  flagInfo?: FlagInfo[]
 }
 /** Per-engine auto-update policy (ADR-085, Phase 6). Default 'notify' (badge the UI;
  *  never auto-apply). 'off' = ignore; 'auto' = apply a found update when the engine is idle. */

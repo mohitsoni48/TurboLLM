@@ -1,7 +1,7 @@
 // Capability-flag extraction from --help output (GitHub #43 regression).
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { extractFlags, detectKvTypes } from './probe'
+import { extractFlags, detectKvTypes, parseEnumList, classifyFlag } from './probe'
 
 test('captures a normally-documented flag', () => {
   const help = `--cache-type-k TYPE     KV cache data type for K\n--parallel N            number of parallel sequences\n`
@@ -76,4 +76,72 @@ test('detectKvTypes: -draft/-first/-last sibling flags never confused for the ma
     `--cache-type-k TYPE         KV cache data type for K (default: f16)\n`
   const kvTypes = detectKvTypes(help, true)
   assert.ok(!kvTypes.includes('turbo4'), 'the -draft flag\'s text must not leak turbo4 into the main enum')
+})
+
+test('detectKvTypes: BeeLlama-shaped fork — kvarn2-8 discovered with ZERO BeeLlama-specific code (generic path)', () => {
+  const help =
+    `-ctk,  --cache-type-k TYPE              KV cache data type for K\n` +
+    `                                        allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1,\n` +
+    `                                        kvarn2, kvarn3, kvarn4, kvarn5, kvarn6, kvarn7, kvarn8\n` +
+    `                                        (default: f16)\n` +
+    `-ctv,  --cache-type-v TYPE              KV cache data type for V\n`
+  const kvTypes = detectKvTypes(help, true)
+  for (const t of ['kvarn2', 'kvarn3', 'kvarn4', 'kvarn5', 'kvarn6', 'kvarn7', 'kvarn8']) assert.ok(kvTypes.includes(t), `expected ${t} in ${kvTypes}`)
+  assert.ok(kvTypes.includes('f16')) // base KNOWN_KV set still present
+})
+
+// ---- parseEnumList: generic "allowed values: a, b, c" / "[a|b|c]" extraction --------------
+
+test('parseEnumList: extracts a comma-separated "allowed values:" list, including a wrapped line', () => {
+  const block =
+    `\n                                        allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1,\n` +
+    `                                        kvarn2, kvarn3, kvarn4, kvarn5, kvarn6, kvarn7, kvarn8`
+  const values = parseEnumList(block)
+  assert.deepEqual(values, ['f32', 'f16', 'bf16', 'q8_0', 'q4_0', 'q4_1', 'iq4_nl', 'q5_0', 'q5_1', 'kvarn2', 'kvarn3', 'kvarn4', 'kvarn5', 'kvarn6', 'kvarn7', 'kvarn8'])
+})
+
+test('parseEnumList: extracts a bracket/pipe list when there is no "allowed values:" phrase', () => {
+  assert.deepEqual(parseEnumList('  [none|draft-mtp|nextn]  which speculative mode to use'), ['none', 'draft-mtp', 'nextn'])
+})
+
+test('parseEnumList: a single bracketed word is NOT treated as an enum (needs 2+ values)', () => {
+  assert.deepEqual(parseEnumList('an experimental [beta] flag'), [])
+})
+
+test('parseEnumList: no list of any kind → empty', () => {
+  assert.deepEqual(parseEnumList('KV cache data type for K (default: f16)'), [])
+})
+
+// ---- classifyFlag: generic per-flag kind detection (enum/boolean/valued) -------------------
+
+test('classifyFlag: BeeLlama-shaped --cache-type-k resolves kvarn2-8 via the generic path (no hardcoding)', () => {
+  const help =
+    `-ctk,  --cache-type-k TYPE              KV cache data type for K\n` +
+    `                                        allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1,\n` +
+    `                                        kvarn2, kvarn3, kvarn4, kvarn5, kvarn6, kvarn7, kvarn8\n` +
+    `                                        (default: f16)\n` +
+    `-ctv,  --cache-type-v TYPE              KV cache data type for V\n`
+  const info = classifyFlag('--cache-type-k', help)
+  assert.equal(info.kind, 'enum')
+  assert.ok(info.enumValues?.includes('kvarn2'))
+  assert.ok(info.enumValues?.includes('kvarn8'))
+})
+
+test('classifyFlag: a flag with an ALL-CAPS placeholder and no enum list is "valued"', () => {
+  const help = `--threads N                            number of threads to use during generation\n`
+  assert.deepEqual(classifyFlag('--threads', help), { name: '--threads', kind: 'valued' })
+})
+
+test('classifyFlag: a flag with no placeholder (runs straight into lowercase prose) is "boolean"', () => {
+  const help = `--jinja                                use jinja templating for the chat template\n`
+  assert.deepEqual(classifyFlag('--jinja', help), { name: '--jinja', kind: 'boolean' })
+})
+
+test('classifyFlag: ambiguous text (placeholder present but no real enum) degrades to "valued", never throws', () => {
+  const help = `--some-flag TYPE   an experimental [beta] flag\n`
+  assert.deepEqual(classifyFlag('--some-flag', help), { name: '--some-flag', kind: 'valued' })
+})
+
+test('classifyFlag: a flag absent from the help text at all degrades to "valued", never throws', () => {
+  assert.deepEqual(classifyFlag('--totally-unknown', 'no mention of it anywhere\n'), { name: '--totally-unknown', kind: 'valued' })
 })

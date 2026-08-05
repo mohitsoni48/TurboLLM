@@ -3,10 +3,11 @@
 import { execFile } from 'node:child_process'
 import { closeSync, existsSync, openSync, readSync, statSync } from 'node:fs'
 import { dirname } from 'node:path'
+import type { FlagInfo } from '../config/config'
 
 export interface ProbeResult {
   version: string
-  capabilities: { kvTypes: string[]; flags: string[] }
+  capabilities: { kvTypes: string[]; flags: string[]; flagInfo: FlagInfo[] }
 }
 
 export class ProbeError extends Error {
@@ -100,6 +101,7 @@ export async function probe(bin: string): Promise<ProbeResult> {
 
   const flags = extractFlags(h.out)
   const kvTypes = detectKvTypes(h.out, flags.includes('--cache-type-k'))
+  const flagInfo = flags.map((f) => classifyFlag(f, h.out))
 
   // Capture the accepted `--spec-type` enum values (e.g. `none,draft-mtp,nextn`)
   // as `spec-type:<value>` pseudo-flags. The enum differs by engine — official
@@ -118,7 +120,7 @@ export async function probe(bin: string): Promise<ProbeResult> {
     }
   }
 
-  return { version, capabilities: { kvTypes, flags: [...new Set(flags)].sort() } }
+  return { version, capabilities: { kvTypes, flags: [...new Set(flags)].sort(), flagInfo } }
 }
 
 type BinFormat = 'pe' | 'elf' | 'macho' | 'unknown'
@@ -182,11 +184,52 @@ export function extractFlags(helpText: string): string[] {
  *  turbo2, turbo3, turbo4") and ik_llama.cpp's (no such list near --cache-type-k at all). */
 export function detectKvTypes(helpText: string, hasCacheTypeFlag: boolean): string[] {
   const kvTypes = hasCacheTypeFlag ? [...KNOWN_KV] : ['f16']
-  const kvFlagBlock = /--cache-type-k\s+\S+\b([\s\S]{0,400}?)(?=\n\s*\(default|\n\s{2,}-[a-zA-Z]|\n\n|$)/i.exec(helpText)
-  if (kvFlagBlock) {
-    for (const t of ['turbo2', 'turbo3', 'turbo4']) if (kvFlagBlock[1].includes(t) && !kvTypes.includes(t)) kvTypes.push(t)
+  const cacheTypeK = classifyFlag('--cache-type-k', helpText)
+  if (cacheTypeK.kind === 'enum') {
+    for (const extra of cacheTypeK.enumValues ?? []) if (!kvTypes.includes(extra)) kvTypes.push(extra)
   }
   return kvTypes
+}
+
+/** Parses a comma/pipe-separated list of accepted values out of a flag's own help block.
+ *  Tries llama.cpp's own convention first ("allowed values: a, b, c", which may wrap onto a
+ *  continuation line — see the KV-cache fixtures in probe.test.ts), then falls back to a
+ *  bracket/pipe group (some forks print `[none|draft-mtp|nextn]` instead). Requires 2+ clean
+ *  alphanumeric tokens to count as a real enum — a single bracketed word (e.g. "[beta]") is
+ *  prose, not a value list, and would otherwise false-positive. Returns [] when nothing
+ *  matches; NEVER guesses beyond what's actually printed. */
+export function parseEnumList(blockText: string): string[] {
+  const labeled = /allowed values:\s*([\s\S]+)/i.exec(blockText)
+  const bracketed = /\[([^\]\n]+)\]/.exec(blockText)
+  const raw = labeled?.[1] ?? bracketed?.[1]
+  if (!raw) return []
+  const values = raw
+    .split(/[,|]/)
+    .map((s) => s.trim())
+    .filter((s) => /^[a-z][a-z0-9_-]*$/i.test(s))
+  return values.length >= 2 ? values : []
+}
+
+/** Classifies a probed flag's argument shape from its own --help block: 'enum' (a detected
+ *  value list — drives a dropdown), 'boolean' (no argument — drives a checkbox), or 'valued'
+ *  (takes an argument but no enum was found — drives a free-text input). Reuses the exact
+ *  block-scoping boundary already proven in detectKvTypes (stop at the next flag line, a
+ *  "(default" continuation, or a blank line) so a sibling flag's text — e.g.
+ *  --cache-type-k-draft leaking into --cache-type-k — can't cross-contaminate. Best-effort by
+ *  design (spec 22 §4): --help formatting is inconsistent across forks, so anything ambiguous
+ *  or unparseable degrades to 'valued' — the safe default that never hides a flag or blocks a
+ *  probe. */
+export function classifyFlag(flagName: string, helpText: string): FlagInfo {
+  const escaped = flagName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const re = new RegExp(`${escaped}\\s+(\\S+)\\b([\\s\\S]{0,400}?)(?=\\n\\s*\\(default|\\n\\s{2,}-[a-zA-Z]|\\n\\n|$)`, 'i')
+  const m = re.exec(helpText)
+  if (!m) return { name: flagName, kind: 'valued' }
+  const placeholder = m[1]
+  const block = m[2] ?? ''
+  const enumValues = parseEnumList(block)
+  if (enumValues.length > 0) return { name: flagName, kind: 'enum', enumValues }
+  if (/^[A-Z][A-Z0-9_]*$/.test(placeholder)) return { name: flagName, kind: 'valued' }
+  return { name: flagName, kind: 'boolean' }
 }
 
 function firstNonEmptyLine(s: string): string {
