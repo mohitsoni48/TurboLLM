@@ -31,3 +31,25 @@ jobs:
       - name: Unit tests
         run: npm test
         working-directory: turbollm
+
+  telemetry-schema-hash:
+    name: Telemetry schema/Worker drift gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # ADR-331/333: the telemetry Worker inlines turbollm/src/telemetry/schema.ts
+      # at `wrangler deploy` time, so its live validator is whatever that file
+      # looked like at the LAST deploy — not at this commit. A schema change that
+      # ships without a redeploy is silently rejected at the edge with no error
+      # anywhere (this exact gap lost every `first_chat` event for two days).
+      # This check is the mechanical enforcement: it fails the build the moment
+      # schema.ts and the committed deployed-hash disagree. No dependency
+      # install needed — the script only uses Node's built-in fs/crypto.
+      - name: Verify the telemetry Worker matches this schema
+        run: node telemetry-worker/scripts/schema-hash.mjs check

@@ -17,7 +17,7 @@
  * defensive analysis downstream.
  */
 
-import { validateEvent } from './schema'
+import { structuralSanityCheck, validateEvent } from './schema'
 
 /** Max events in one request. Matches `MAX_QUEUED_EVENTS` (queue.ts) exactly —
  *  a real client can never legitimately send more than its own queue holds, so
@@ -31,6 +31,22 @@ export const MAX_BATCH = 500
  *  anything above it is a fabricated row, not a lucky benchmark. */
 const MAX_PLAUSIBLE_TPS = 100_000
 
+/** Bound on one event's serialized size before it may be quarantined
+ *  (ADR-331/333). A real event — even `bench_result` with its `hw.gpus[]`
+ *  block — measures under 700 bytes; this leaves ~6x headroom for schema
+ *  growth while still bounding worst-case quarantine storage cost regardless
+ *  of what a future schema adds. An event over this cap is hard-rejected, the
+ *  same as a structurally invalid one, never quarantined. */
+const MAX_EVENT_BYTES = 4096
+
+export interface QuarantinedEvent {
+  /** The raw, unvalidated event exactly as received. */
+  raw: Record<string, unknown>
+  /** Why `validateEvent` rejected it — for triage after a redeploy, not
+   *  shown to any client. */
+  reason: string
+}
+
 export interface IngestDeps {
   now: () => number
   /** Returns whether this caller may proceed. Keyed on machineId + IP hash by
@@ -41,6 +57,14 @@ export interface IngestDeps {
   store: (events: Record<string, unknown>[]) => Promise<void>
   /** Product-analytics fan-out (PostHog). */
   forward: (events: Record<string, unknown>[]) => Promise<void>
+  /** An event that failed `validateEvent` but passed `structuralSanityCheck`
+   *  and the size cap — plausibly real data from a schema this Worker's
+   *  deployed snapshot hasn't caught up to yet (ADR-331), not something to
+   *  destroy. A separate D1 table, never forwarded to PostHog, replayable
+   *  after the Worker is redeployed. This is the fix for the exact failure
+   *  mode that lost every `first_chat` event for two days: the same
+   *  rejection that used to vanish is now recoverable. */
+  quarantine: (rows: QuarantinedEvent[]) => Promise<void>
 }
 
 /** Reject rows that are well-formed but cannot be true. Cheap, and it keeps the
@@ -68,9 +92,29 @@ export async function handleIngest(req: Request, d: IngestDeps): Promise<Respons
   // Validate first so the rate limiter sees the real machineId rather than
   // whatever an attacker claimed in an unvalidated field.
   const accepted: Record<string, unknown>[] = []
+  const quarantined: QuarantinedEvent[] = []
   for (const raw of body) {
+    // Oversized regardless of shape — hard reject, never quarantined. Bounds
+    // worst-case quarantine storage no matter what a future schema adds.
+    if (JSON.stringify(raw).length > MAX_EVENT_BYTES) continue
+
+    // Fails a check that must hold forever (not an object, an unsafe event
+    // name shape, or the consent_choice privacy invariant) — malformed or
+    // hostile, not schema drift. Hard reject.
+    if (!structuralSanityCheck(raw).ok) continue
+
     const result = validateEvent(raw)
-    if (result.ok && plausible(result.event)) accepted.push(result.event)
+    if (result.ok) {
+      if (plausible(result.event)) accepted.push(result.event)
+      // Implausible (e.g. a fabricated tps): well-formed but not schema
+      // drift, so dropped outright rather than quarantined.
+      continue
+    }
+
+    // Passed every check above but still failed validateEvent — most likely
+    // an event name, field, or enum value this Worker's deployed schema
+    // snapshot doesn't know about yet (ADR-331). Quarantine, don't destroy.
+    quarantined.push({ raw: raw as Record<string, unknown>, reason: result.reason })
   }
 
   if (!(await d.rateLimit(req, accepted))) {
@@ -92,7 +136,17 @@ export async function handleIngest(req: Request, d: IngestDeps): Promise<Respons
     }
   }
 
-  // Always 202, whatever was dropped. Reporting which events failed validation
-  // would hand a prober a free oracle for mapping the allow-list.
+  if (quarantined.length > 0) {
+    try {
+      await d.quarantine(quarantined)
+    } catch {
+      // swallowed deliberately, same reasoning as store() above
+    }
+  }
+
+  // Always 202, whatever was dropped or quarantined. Reporting which events
+  // failed validation would hand a prober a free oracle for mapping the
+  // allow-list — the client stays blind either way; only the Worker's own
+  // logs and the quarantine table itself carry that information now.
   return new Response(null, { status: 202 })
 }

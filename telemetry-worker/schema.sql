@@ -30,3 +30,28 @@ CREATE INDEX IF NOT EXISTS idx_events_name_time ON events (event, received_at);
 
 -- No IP column, no user column, no session column. There is nothing here to
 -- join against an identity, which is what makes the consent copy true.
+
+-- The never-silent-drop fix (ADR-331/333). Everything `validateEvent` rejects
+-- for an ALLOW-LIST reason (unknown event name, unknown field, invalid enum
+-- value) but that still passes `structuralSanityCheck` — meaning it is
+-- plausibly real data from a schema this Worker's deployed snapshot hasn't
+-- caught up to yet, not something malformed or hostile — lands here instead
+-- of being destroyed. Never forwarded to PostHog. Replayable by hand after a
+-- redeploy: re-POST the `raw` column's contents once `validateEvent` accepts
+-- them. `first_chat` and `failReason` (ADR-331) would have landed here for
+-- the two days the Worker was stale, instead of vanishing with no record at
+-- all — that is the entire point of this table.
+CREATE TABLE IF NOT EXISTS quarantine (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  received_at TEXT NOT NULL,
+  -- Nullable: `structuralSanityCheck` only requires a plausible identifier
+  -- shape, not membership in EVENT_NAMES, so this is exactly the raw string
+  -- the client sent, kept for triage even if it never resolves to a real name.
+  event_name  TEXT,
+  reason      TEXT NOT NULL,
+  machine_id  TEXT,
+  raw         TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_quarantine_time ON quarantine (received_at);
+CREATE INDEX IF NOT EXISTS idx_quarantine_event ON quarantine (event_name, received_at);

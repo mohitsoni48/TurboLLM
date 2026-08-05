@@ -346,3 +346,79 @@ export function validateEvent(raw: unknown): ValidationResult {
 
   return { ok: true, event: e }
 }
+
+export type SanityResult = { ok: true } | { ok: false; reason: string }
+
+/** How deep `structuralSanityCheck`'s string scan will recurse before giving
+ *  up and treating the value as unsafe. Every real event nests at most two
+ *  levels (`payload.block.field`); this bounds a pathologically deep but
+ *  small-total-size payload designed to dodge `MAX_EVENT_BYTES`. */
+const MAX_SANITY_DEPTH = 6
+
+/** True if any string anywhere in `v` exceeds `MAX_IDENT_LEN` — the SAME cap
+ *  `isSafeIdent` already enforces for the six `bench_result` fields that are
+ *  today's only free-text-shaped values, and the one this pipeline already
+ *  trusts enough to forward to PostHog. No field in the current schema is
+ *  ever valid above it, so this rejects nothing a real event would send —
+ *  its only job is closing a hole `structuralSanityCheck` would otherwise
+ *  leave open: an unrecognized field name (which it deliberately does not
+ *  check, so real schema drift keeps working) is not a license for an
+ *  unrecognized field VALUE of unbounded length. */
+function hasOversizedString(v: unknown, depth = 0): boolean {
+  if (depth > MAX_SANITY_DEPTH) return true
+  if (typeof v === 'string') return v.length > MAX_IDENT_LEN
+  if (Array.isArray(v)) return v.some((x) => hasOversizedString(x, depth + 1))
+  if (v !== null && typeof v === 'object') return Object.values(v).some((x) => hasOversizedString(x, depth + 1))
+  return false
+}
+
+/**
+ * A coarser, permanent check — the shape of an event that must hold true
+ * FOREVER, independent of `EVENT_NAMES`/`PAYLOAD_SPECS`/any enum in this file
+ * (ADR-331, ADR-333). It exists to answer one question for the Worker: when
+ * `validateEvent` rejects something, is that because the event is malformed
+ * or hostile, or merely because this Worker's deployed schema snapshot is
+ * older or newer than the client's (in which case it should be quarantined,
+ * not destroyed — see `telemetry-worker/src/index.ts`)?
+ *
+ * ADR-331: the Worker inlines this file at deploy time, so its allow-list can
+ * fall behind the client's by design (a schema change ships in the daemon
+ * long before anyone remembers to `wrangler deploy`). `first_chat` and
+ * `failReason` were both rejected for weeks by an out-of-date Worker and
+ * silently destroyed. This function is deliberately narrower than
+ * `validateEvent` — it does not know any event name, field name, or enum
+ * value — so it keeps working unmodified no matter how the schema evolves,
+ * and a real future event always passes it.
+ *
+ * Two invariants enforced here are hard rejects, never quarantine-eligible,
+ * because a quarantine table is still our own storage:
+ *  - `consent_choice` must carry nothing attributable (ADR-299 Decision 5).
+ *    Quarantining a violation would still turn an anonymous opt-out ping into
+ *    an attributable record, defeating the entire point of the event.
+ *  - No string anywhere may exceed `MAX_IDENT_LEN` (`hasOversizedString`
+ *    above) — otherwise an unrecognized field name would be a free pass for
+ *    an unbounded-length value, including a real one accidentally attached
+ *    by a client bug rather than a hostile request.
+ */
+export function structuralSanityCheck(raw: unknown): SanityResult {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return { ok: false, reason: 'event must be an object' }
+  }
+  const e = raw as Record<string, unknown>
+
+  if (typeof e.event !== 'string' || !/^[a-z][a-z0-9_]{0,63}$/.test(e.event)) {
+    return { ok: false, reason: 'event name must be a short lowercase identifier' }
+  }
+
+  if (e.event === 'consent_choice') {
+    for (const banned of ['machineId', 'app', 'hw', 'ts', 'payload']) {
+      if (banned in e) return { ok: false, reason: `consent_choice must not carry ${banned}` }
+    }
+  }
+
+  if (hasOversizedString(e)) {
+    return { ok: false, reason: 'a string value is too long to be a quarantine candidate' }
+  }
+
+  return { ok: true }
+}

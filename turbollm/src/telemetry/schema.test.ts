@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { validateEvent } from './schema'
+import { EVENT_NAMES, MAX_IDENT_LEN, structuralSanityCheck, validateEvent } from './schema'
 
 /** A minimal well-formed journey event — the shape ADR-299 Decision 6 defines. */
 function validEvent(over: Record<string, unknown> = {}): Record<string, unknown> {
@@ -366,4 +366,81 @@ test('validateEvent: error carries an enum fingerprint, never log text', () => {
   )
   assert.equal(r.ok, false)
   assert.match(r.reason, /fingerprint/)
+})
+
+// structuralSanityCheck (ADR-331/333) — the coarse, permanent gate the Worker
+// uses to decide "quarantine this" vs "destroy this" when validateEvent
+// itself rejects an event. Every one of these cases must keep passing no
+// matter how EVENT_NAMES/PAYLOAD_SPECS evolve, since that is the entire point
+// of the function: it must never need to change alongside the schema.
+
+test('structuralSanityCheck: rejects a non-object', () => {
+  assert.equal(structuralSanityCheck('not an event').ok, false)
+  assert.equal(structuralSanityCheck(null).ok, false)
+  assert.equal(structuralSanityCheck([1, 2, 3]).ok, false)
+})
+
+test('structuralSanityCheck: accepts every current real event name, unchanged forever', () => {
+  for (const event of EVENT_NAMES) {
+    const r = structuralSanityCheck({ event })
+    assert.equal(r.ok, true, r.ok === false ? `${event}: ${r.reason}` : '')
+  }
+})
+
+test('structuralSanityCheck: accepts an event name this schema has never heard of — the whole point', () => {
+  // The exact shape of the bug this exists to fix: a client on a newer schema
+  // sends an event name an older deployed Worker does not recognise yet.
+  const r = structuralSanityCheck({ event: 'model_load', schema: 2, payload: { quant: 'Q4_K_M' } })
+  assert.equal(r.ok, true, r.ok === false ? r.reason : '')
+})
+
+test('structuralSanityCheck: rejects an event name shaped to abuse the check itself', () => {
+  assert.equal(structuralSanityCheck({ event: 'x'.repeat(200) }).ok, false)
+  assert.equal(structuralSanityCheck({ event: 'Not-Lowercase' }).ok, false)
+  assert.equal(structuralSanityCheck({ event: '' }).ok, false)
+  assert.equal(structuralSanityCheck({ event: 123 }).ok, false)
+})
+
+test('structuralSanityCheck: consent_choice may never carry anything attributable — hard invariant, not quarantine-eligible', () => {
+  assert.equal(structuralSanityCheck({ event: 'consent_choice', level: 'off' }).ok, true)
+  for (const banned of ['machineId', 'app', 'hw', 'ts', 'payload']) {
+    const r = structuralSanityCheck({ event: 'consent_choice', level: 'off', [banned]: 'x' })
+    assert.equal(r.ok, false, `consent_choice carrying ${banned} must never pass, even for quarantine`)
+  }
+})
+
+test('structuralSanityCheck: a future field with a normal-length value passes, so real drift is never blocked', () => {
+  const r = structuralSanityCheck({
+    event: 'model_load',
+    payload: { quant: 'Q4_K_M', kvTypeK: 'q8_0', aBrandNewFieldThisSchemaDoesNotKnowAbout: 'gpu_offload_partial' },
+  })
+  assert.equal(r.ok, true, r.ok === false ? r.reason : '')
+})
+
+test('structuralSanityCheck: rejects a string long enough to be a smuggled prompt or path, even under an unrecognized field name', () => {
+  const r = structuralSanityCheck({
+    event: 'app_first_run',
+    prompt: 'x'.repeat(MAX_IDENT_LEN + 1),
+  })
+  assert.equal(r.ok, false)
+})
+
+test('structuralSanityCheck: accepts a string right at the existing bench_result identifier cap', () => {
+  const r = structuralSanityCheck({ event: 'bench_result', payload: { model: { name: 'x'.repeat(MAX_IDENT_LEN) } } })
+  assert.equal(r.ok, true, r.ok === false ? r.reason : '')
+})
+
+test('structuralSanityCheck: the oversized-string scan reaches nested objects and arrays alike', () => {
+  const nested = structuralSanityCheck({
+    event: 'bench_result',
+    hw: { gpus: [{ name: 'fine' }, { name: 'x'.repeat(MAX_IDENT_LEN + 1) }] },
+  })
+  assert.equal(nested.ok, false)
+})
+
+test('structuralSanityCheck: a pathologically deep small payload is treated as unsafe rather than recursing unbounded', () => {
+  let deep: Record<string, unknown> = { leaf: 'x' }
+  for (let i = 0; i < 20; i++) deep = { nested: deep }
+  const r = structuralSanityCheck({ event: 'app_first_run', payload: deep })
+  assert.equal(r.ok, false)
 })
