@@ -42,64 +42,6 @@ function loadModeForEngine(engineKind: string | undefined): LoadMode {
   }
 }
 
-/** Flags `profileToArgs` (turbollm/src/models/profile.ts) already hand-models with a dedicated
- *  structured control — must be excluded from the generic "Advanced parameters" section so a
- *  flag never gets two conflicting controls. Keep in sync with profileToArgs; this is the
- *  authoritative list as of spec 22 (ADR-328). Includes `--ctx-size`, the long-form alias of the
- *  `-c` flag the "Context length" slider already emits (profile.ts:549) — routes.ts:2561 treats
- *  `-c`/`--ctx-size` as synonyms elsewhere, and a probed engine that documents the long form would
- *  otherwise surface as a second, independent control for the same setting. Also includes
- *  `--gpu-layers`/`--n-gpu-layers` (long-form aliases of `-ngl`, the "GPU layers" slider,
- *  profile.ts:564) and `--temperature` (long-form alias of `--temp`, the "Temperature" slider,
- *  profile.ts:663) for the same reason — without these, a probed engine documenting the long
- *  form surfaces a duplicate control whose manually-set value silently wins at launch while the
- *  slider shows stale state. */
-const MODELED_FLAGS = new Set([
-  '--split-mode', '--tensor-split', '--main-gpu', '--parallel', '--kv-unified', '--n-cpu-moe',
-  '--cache-type-k', '--cache-type-v', '--flash-attn', '--no-kv-offload', '--threads', '--threads-batch',
-  '--batch-size', '--ubatch-size', '--mmproj', '--no-mmproj-offload', '--image-max-tokens', '--cache-reuse',
-  '--jinja', '--chat-template-file', '--spec-type', '--mtp-head', '--model-draft', '--draft-max',
-  '--spec-draft-n-max', '--draft-min', '--spec-draft-n-min', '--temp', '--top-p', '--top-k', '--min-p',
-  '--repeat-penalty', '--presence-penalty', '--frequency-penalty', '--n-keep', '--rope-scaling',
-  '--rope-freq-base', '--rope-freq-scale', '--embeddings', '--grammar', '--no-mmap', '--ctx-size',
-  '--gpu-layers', '--n-gpu-layers', '--temperature',
-])
-
-/** Flags the daemon sets itself when spawning the engine (turbollm/src/engines/manager.ts) —
- *  must NEVER be offered as a generic user-editable control, since overriding them generically
- *  could break the daemon's ability to manage the process (port collision, wrong bind host,
- *  wrong model path). Confirmed from manager.ts:777's `['-m', opts.modelPath, '--host',
- *  '127.0.0.1', '--port', String(port)]` launch prefix, plus `--metrics`/`--no-webui`/
- *  `--slot-save-path`, which manager.ts:779-783 pushes conditionally a few lines below that
- *  prefix. `--slot-save-path` is the highest-risk of the three: it's a *valued* flag (the KV
- *  prompt-cache persistence path), and since `extraArgs` is appended last, a user setting it via
- *  the generic control here would silently override the daemon's own managed path and break
- *  slot-cache restore with no visible error. `--model` is `-m`'s documented long-form alias
- *  (llama.cpp: `-m, --model FNAME`) — included for the same reason: left out, a user could
- *  silently override which model the running engine actually loads via the generic control. */
-const DAEMON_OWNED_FLAGS = new Set(['-m', '--model', '--host', '--port', '--metrics', '--no-webui', '--slot-save-path'])
-
-/** Reads a flag's current value out of extraArgs: '' for a bare boolean flag present with no
- *  following value, the value string for `--flag value`, or undefined if the flag isn't set. */
-function extraArgValue(extraArgs: string[], flagName: string): string | undefined {
-  const i = extraArgs.indexOf(flagName)
-  if (i === -1) return undefined
-  const next = extraArgs[i + 1]
-  return next !== undefined && !next.startsWith('--') ? next : ''
-}
-
-/** Sets, updates, or removes a flag in extraArgs, preserving every other entry's position.
- *  value === undefined removes the flag entirely; '' sets it as a bare boolean (no argument);
- *  anything else sets `--flag value`. */
-function setExtraArg(extraArgs: string[], flagName: string, value: string | undefined): string[] {
-  const i = extraArgs.indexOf(flagName)
-  const next = i === -1 ? undefined : extraArgs[i + 1]
-  const consumedNext = i !== -1 && next !== undefined && !next.startsWith('--')
-  const without = i === -1 ? extraArgs : [...extraArgs.slice(0, i), ...extraArgs.slice(i + (consumedNext ? 2 : 1))]
-  if (value === undefined) return without
-  return value === '' ? [...without, flagName] : [...without, flagName, value]
-}
-
 export function ModelDetailDialog({
   modelKey,
   onClose,
@@ -164,9 +106,6 @@ export function ModelDetailDialog({
   // (spec 05 §8). MTP is a Gemma-4 feature; NextN is a Qwen3 feature; draft works
   // with any model (separate small draft GGUF).
   const flags = activeEngine?.capabilities.flags ?? []
-  const advancedFlags = (activeEngine?.capabilities.flagInfo ?? []).filter(
-    (f) => !MODELED_FLAGS.has(f.name) && !DAEMON_OWNED_FLAGS.has(f.name),
-  )
   const hasFlag = (f: string) => flags.length === 0 || flags.includes(f)
   // Whether the engine accepts a given `--spec-type` value (probe captures these
   // as `spec-type:<value>`). Official llama.cpp lacks `nextn`; forks may add it.
@@ -616,46 +555,6 @@ export function ModelDetailDialog({
               </Section>
             )}
             </>)}
-
-            {(isLlamaCpp || isVllm) && advancedFlags.length > 0 && draft && (
-              <>
-                <SectionTitle>Advanced parameters</SectionTitle>
-                <Section>
-                  {advancedFlags.map((f) => (
-                    <Row
-                      key={f.name}
-                      label={f.name}
-                      hint={f.kind === 'enum' ? `Detected values: ${(f.enumValues ?? []).join(', ')}` : undefined}
-                    >
-                      {f.kind === 'enum' && (
-                        <Select
-                          value={extraArgValue(draft.extraArgs, f.name) ?? ''}
-                          options={['', ...(f.enumValues ?? [])]}
-                          onChange={(v) => set('extraArgs', setExtraArg(draft.extraArgs, f.name, v === '' ? undefined : v))}
-                        />
-                      )}
-                      {f.kind === 'boolean' && (
-                        <input
-                          type="checkbox"
-                          checked={draft.extraArgs.includes(f.name)}
-                          onChange={(e) => set('extraArgs', setExtraArg(draft.extraArgs, f.name, e.target.checked ? '' : undefined))}
-                          className="h-4 w-4 shrink-0 accent-[var(--accent)]"
-                        />
-                      )}
-                      {f.kind === 'valued' && (
-                        <input
-                          type="text"
-                          value={extraArgValue(draft.extraArgs, f.name) ?? ''}
-                          onChange={(e) => set('extraArgs', setExtraArg(draft.extraArgs, f.name, e.target.value === '' ? undefined : e.target.value))}
-                          placeholder="value"
-                          className="w-32 rounded-md border border-border bg-bg px-2 py-1 text-right font-mono text-[12px] text-ink outline-none placeholder:text-faint"
-                        />
-                      )}
-                    </Row>
-                  ))}
-                </Section>
-              </>
-            )}
 
             {(isLlamaCpp || isVllm) && (
               <>
