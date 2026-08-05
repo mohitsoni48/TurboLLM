@@ -45,6 +45,22 @@ const events = [
   envelope('daily_active'),
   envelope('onboarding_step', { payload: { step: 'model_download', outcome: 'ok' } }),
   envelope('model_first_load', { payload: { outcome: 'ok' } }),
+  envelope('model_load', {
+    payload: {
+      outcome: 'ok',
+      trigger: 'manual',
+      model: { name: 'canary-model', quant: 'Q4_K_M', arch: 'llama', sizeBytes: 1, moe: false, nativeCtx: 8192 },
+      engine: { kind: 'llama-server', isCustom: false },
+      params: {
+        ctx: 8192, ngl: 1, nglFit: false, nCpuMoe: 0, nCpuMoeFit: false,
+        kvTypeK: 'q8_0', kvTypeV: 'q8_0', kvUnified: true, kvOffload: true,
+        flashAttn: 'auto', parallel: 1, threads: 1, threadsBatch: 1, cacheReuse: 0,
+        speculative: 'off', contextOverflow: 'shift', nKeep: 0, ropeScalingType: 'none',
+        useJinja: true, hasGrammar: false, hasExtraArgs: false, multiGpu: false, gpuCount: 1,
+      },
+      fit: { estimatedVramMb: 1 },
+    },
+  }),
   envelope('feature_first_use', { payload: { feature: 'chat' } }),
   envelope('feature_used_daily', { payload: { feature: 'chat', countBucket: '1' } }),
   envelope('error', { payload: { fingerprint: 'engine_crash' } }),
@@ -58,25 +74,6 @@ const events = [
     },
   }),
 ]
-
-console.log(`canary: posting ${events.length} events to ${ENDPOINT}`)
-const res = await fetch(ENDPOINT, {
-  method: 'POST',
-  headers: { 'content-type': 'application/json' },
-  body: JSON.stringify(events),
-})
-if (res.status !== 202) {
-  console.error(`canary: FAIL — expected 202, got ${res.status}`)
-  process.exit(1)
-}
-
-// D1 writes are awaited inside handleIngest before it responds, but this
-// query goes through a separate connection (wrangler's own D1 API client),
-// not the same request — a short wait absorbs any read-replica lag rather
-// than risking a false failure on an otherwise-healthy deploy.
-await new Promise((r) => setTimeout(r, 5000))
-
-const sql = `SELECT event FROM events WHERE machine_id = '${CANARY_MACHINE_ID}' AND received_at > datetime('now', '-2 minutes')`
 
 // `--file` sidesteps shell-quoting but ALSO changes what wrangler returns —
 // for a file it reports execution stats ("Rows read", "Database size"), not
@@ -93,23 +90,64 @@ const sql = `SELECT event FROM events WHERE machine_id = '${CANARY_MACHINE_ID}' 
 // the whole thing in double quotes is unambiguous to both cmd.exe and bash,
 // and every other interpolated value here is a fixed internal constant, not
 // external input, so there is nothing to escape defensively.
-const npx = process.platform === 'win32' ? 'npx.cmd' : 'npx'
-const raw = execSync(`${npx} wrangler d1 execute ${DB_NAME} --remote --json --command "${sql}"`, {
-  cwd: join(HERE, '..'),
-  encoding: 'utf8',
-})
-const rows = JSON.parse(raw)[0].results
-const landed = new Set(rows.map((r) => r.event))
-const expected = new Set(events.map((e) => e.event))
-
-const missing = [...expected].filter((e) => !landed.has(e))
-if (missing.length > 0) {
-  console.error(`canary: FAIL — these events never reached D1: ${missing.join(', ')}`)
-  console.error('This is the exact ADR-331 failure mode: check whether the deployed Worker actually')
-  console.error('matches HEAD (npm run hash:check), and whether any of these were quarantined instead')
-  console.error(`of accepted (SELECT * FROM quarantine WHERE machine_id = '${CANARY_MACHINE_ID}').`)
-  process.exit(1)
+function queryLanded() {
+  const npx = process.platform === 'win32' ? 'npx.cmd' : 'npx'
+  const sql = `SELECT event FROM events WHERE machine_id = '${CANARY_MACHINE_ID}' AND received_at > datetime('now', '-5 minutes')`
+  const raw = execSync(`${npx} wrangler d1 execute ${DB_NAME} --remote --json --command "${sql}"`, {
+    cwd: join(HERE, '..'),
+    encoding: 'utf8',
+  })
+  return new Set(JSON.parse(raw)[0].results.map((r) => r.event))
 }
 
-console.log(`canary: PASS — all ${expected.size} events landed in D1`)
-console.log(`canary: remember these are synthetic — filter machineId='${CANARY_MACHINE_ID}' or app.version='${CANARY_VERSION}' out of any real analysis`)
+const expected = new Set(events.map((e) => e.event))
+
+// A fresh `wrangler deploy` is not instantly live on every edge node — found
+// live 2026-08-05, right after Phase 2 shipped `model_load`: the first
+// canary run immediately post-deploy quarantined it with "unknown event
+// name", and re-running the exact same script unchanged 30 seconds later
+// passed clean. Not a code bug — Cloudflare's own global rollout lag. Retry
+// with backoff rather than trusting a single attempt, since a deploy script
+// that cries wolf on its own propagation delay trains people to ignore it.
+const MAX_ATTEMPTS = 4
+for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+  console.log(`canary: attempt ${attempt}/${MAX_ATTEMPTS} — posting ${events.length} events to ${ENDPOINT}`)
+  const res = await fetch(ENDPOINT, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    // Fresh timestamps each attempt, not the first attempt's frozen array —
+    // an identical resend is harmless (D1 has no uniqueness constraint here
+    // and these are already synthetic/excluded rows), and a fresh `ts` keeps
+    // the "-5 minutes" query window honestly reflecting when THIS attempt ran.
+    body: JSON.stringify(events.map((e) => ({ ...e, ts: new Date().toISOString() }))),
+  })
+  if (res.status !== 202) {
+    console.error(`canary: FAIL — expected 202, got ${res.status}`)
+    process.exit(1)
+  }
+
+  // D1 writes are awaited inside handleIngest before it responds, but this
+  // query goes through a separate connection (wrangler's own D1 API client),
+  // not the same request — a wait absorbs read-replica lag on top of
+  // whatever's left of the edge-propagation delay above.
+  await new Promise((r) => setTimeout(r, 5000))
+
+  const landed = queryLanded()
+  const missing = [...expected].filter((e) => !landed.has(e))
+  if (missing.length === 0) {
+    console.log(`canary: PASS — all ${expected.size} events landed in D1${attempt > 1 ? ` (attempt ${attempt})` : ''}`)
+    console.log(`canary: remember these are synthetic — filter machineId='${CANARY_MACHINE_ID}' or app.version='${CANARY_VERSION}' out of any real analysis`)
+    process.exit(0)
+  }
+
+  if (attempt === MAX_ATTEMPTS) {
+    console.error(`canary: FAIL after ${MAX_ATTEMPTS} attempts — these events never reached D1: ${missing.join(', ')}`)
+    console.error('This is the exact ADR-331 failure mode: check whether the deployed Worker actually')
+    console.error('matches HEAD (npm run hash:check), and whether any of these were quarantined instead')
+    console.error(`of accepted (SELECT * FROM quarantine WHERE machine_id = '${CANARY_MACHINE_ID}').`)
+    process.exit(1)
+  }
+
+  console.log(`canary: ${missing.join(', ')} missing on attempt ${attempt} — retrying (edge propagation can lag briefly after deploy)`)
+  await new Promise((r) => setTimeout(r, 10_000))
+}

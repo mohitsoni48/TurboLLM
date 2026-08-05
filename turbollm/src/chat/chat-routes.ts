@@ -725,12 +725,14 @@ interface GenerationCtx {
  * Once-only for the same reason `first_load` is: this fires on EVERY generation, and
  * without the ledger claim an active user's ordinary chatting would emit a "setup"
  * event forever. A first reply that FAILS or is cancelled still claims the key —
- * matching `reportModelLoad`'s "first outcome, whatever it is" semantics — because a
- * user whose first attempt breaks or is abandoned still reached chat, and conflating
- * that with "never tried" would hide exactly the drop-off this event exists to find.
- * Classification is the caller's job (same division of labour as reportModelLoad):
- * runGeneration has both an early engine-error return and a later thrown-error catch,
- * and only the caller can tell those apart from a real success.
+ * the same "first outcome, whatever it is" semantics `model_load`'s own once-per-
+ * install-derived signal relies on (spec 23 §4: onboarding's "first load" step is
+ * now just the first `model_load` per machine, not a bespoke once-only event) —
+ * because a user whose first attempt breaks or is abandoned still reached chat, and
+ * conflating that with "never tried" would hide exactly the drop-off this event
+ * exists to find. Classification is the caller's job: runGeneration has both an
+ * early engine-error return and a later thrown-error catch, and only the caller can
+ * tell those apart from a real success.
  *
  * Extracted rather than inlined so the claim-once behaviour is testable without
  * standing up a whole streaming generation. Never throws: `claimOnce` and

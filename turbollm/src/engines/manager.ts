@@ -6,6 +6,7 @@ import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rm
 import { createConnection, createServer } from 'node:net'
 import { dirname, join } from 'node:path'
 import type { ConfigStore, Engine } from '../config/config'
+import type { LoadProfile } from '../models/profile'
 import { mlxServerCommand } from './mlx'
 import { rapidMlxServerCommand } from './rapid-mlx'
 import { koboldcppServerCommand } from './koboldcpp'
@@ -40,6 +41,18 @@ export interface StartOpts {
   /** Per-model pinned port (LoadProfile.port), engine-agnostic. Tried first by
    *  allocPort(); falls back to the normal 8081+ walk if unset or already taken. */
   preferredPort?: number
+  /** The resolved config this load was built from, when the caller has one
+   *  (routes.ts's load route, cli.ts's startup resume, model-router.ts's
+   *  gateway switch — all resolve a real `LoadProfile` before calling
+   *  `load()`). Absent for the transitional dev-model fallback path, which
+   *  has no profile at all. Purely additive and telemetry-only (`model_load`,
+   *  ADR-333/spec 23 §3.3) — nothing in `Manager` itself reads this; `extraArgs`
+   *  remains the only thing that actually reaches the spawned process. */
+  profile?: LoadProfile
+  /** Who initiated this load — set by the caller, since `Manager` itself has
+   *  no way to distinguish a UI click from a gateway auto-switch from a
+   *  startup resume. Telemetry-only, same as `profile`. */
+  trigger?: 'manual' | 'gateway_switch' | 'resume'
 }
 export interface Status {
   state: State
@@ -151,8 +164,15 @@ export class Manager {
   private errInfo: ErrInfo | null = null
   /** Optional observer for load outcomes, wired in cli.ts (ADR-299). Kept as a
    *  plain callback so Manager has no telemetry dependency and tests need no
-   *  stub. A throwing observer must never break a load. */
-  onLoadSettled?: (ok: boolean, err: ErrInfo | null) => void
+   *  stub. A throwing observer must never break a load. `opts` is the exact
+   *  `StartOpts` this attempt was called with (spec 23 §3.3's `model_load`
+   *  needs the resolved config) — passed explicitly by the caller rather than
+   *  read off `this.opts`, because `this.opts` is only assigned partway
+   *  through `startInternal()`; an early preflight failure (vLLM/SGLang
+   *  unsupported) returns before reaching that assignment and would otherwise
+   *  report the PREVIOUS load's config for a failure that has nothing to do
+   *  with it. */
+  onLoadSettled?: (ok: boolean, err: ErrInfo | null, opts: StartOpts) => void
   private lastCommand: { cmd: string; args: string[] } | null = null
   private lastActivity = 0
   private logPathStr = ''
@@ -186,7 +206,7 @@ export class Manager {
         // swap entry point — is what makes any future call site instrumented for
         // free. Manager stays telemetry-agnostic: it reports an outcome, and the
         // consumer (wired in cli.ts) decides what that means.
-        this.reportLoad(this.state === 'running', this.errInfo)
+        this.reportLoad(this.state === 'running', this.errInfo, opts)
       } catch (e) {
         // routes.ts fires load() without awaiting and only console.warns the rejection —
         // without this, a failed swap left `state` wherever it last was (often still
@@ -194,7 +214,7 @@ export class Manager {
         // anything went wrong or that a retry could help.
         this.state = 'error'
         this.errInfo = { code: 'load_failed', message: e instanceof Error ? e.message : String(e), exitCode: -1, logTail: [] }
-        this.reportLoad(false, this.errInfo)
+        this.reportLoad(false, this.errInfo, opts)
         throw e
       }
     })
@@ -212,10 +232,13 @@ export class Manager {
   }
 
   /** Notify the load observer, swallowing anything it throws — an observer is
-   *  by definition not allowed to affect whether a model loaded. */
-  private reportLoad(ok: boolean, err: ErrInfo | null): void {
+   *  by definition not allowed to affect whether a model loaded. `opts` is
+   *  passed through from the call site's own local parameter, not read off
+   *  `this.opts` — see {@link onLoadSettled}'s doc comment for why that
+   *  distinction matters for an early preflight failure. */
+  private reportLoad(ok: boolean, err: ErrInfo | null, opts: StartOpts): void {
     try {
-      this.onLoadSettled?.(ok, err)
+      this.onLoadSettled?.(ok, err, opts)
     } catch {
       // observers are advisory only
     }

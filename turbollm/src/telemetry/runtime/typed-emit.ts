@@ -41,10 +41,10 @@ export function emit<const Name extends EventName, const Payload extends Record<
 
 /**
  * Emit a lifecycle:'once' event with no payload (`app_first_run`-shaped).
- * For 'once-with-payload' (`model_first_load`-shaped — the once-ness must
- * survive even a FAILED first attempt) see the event's own dedicated
- * report function (e.g. `first-load.ts`'s `reportModelLoad`), which claims
- * the ledger key itself before calling {@link emit} — that decision is
+ * For 'once-with-payload' (a milestone whose once-ness must survive even a
+ * FAILED first attempt — `model_first_load`'s now-retired shape, see
+ * `events/model.ts`) see the event's own dedicated report function, which
+ * claims the ledger key itself before calling {@link emit} — that decision is
  * specific enough per event (what counts as "the first attempt"?) that a
  * generic wrapper would either be wrong for some future event or need as
  * many options as just writing the three lines directly.

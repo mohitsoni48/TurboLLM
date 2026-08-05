@@ -22,11 +22,12 @@ import type { HfClient } from '../hf/hf'
 import { inferRepoFromPath } from '../api/path-utils'
 import { enqueue } from '../telemetry/queue'
 import { TELEMETRY_SCHEMA_VERSION } from '../telemetry/schema'
-import { reportModelLoad } from '../telemetry/first-load'
 import { classifyBenchFailure } from '../telemetry/classify'
 import { claimOnce } from '../telemetry/ledger'
 import { telemetryDisabled } from '../telemetry/disabled'
 import type { Emitter } from '../telemetry/emit'
+import { emit } from '../telemetry/runtime/typed-emit'
+import { modelLoad, buildModelLoadConfig } from '../telemetry/events/model'
 import {
   buildCardExtractionPrompt,
   hasAnySampling,
@@ -232,23 +233,43 @@ export class BenchRunner {
     this.abort?.abort()
   }
 
-  /** Report `model_first_load` for a sweep's conclusion (ADR-299). A no-op when
-   *  no Emitter was injected (absent under tests, which never call `run()`).
-   *  Only the FIRST sweep's outcome across an install's lifetime is recorded —
-   *  see `reportModelLoad`'s own once-only claim — so a re-tune later on
-   *  cannot overwrite it. */
-  private reportFirstLoad(outcome: 'ok' | 'fail' | 'cancelled', failReason?: string): void {
+  /** Report a sweep's conclusion (ADR-299; `model_load` config capture is
+   *  spec 23 §3.3 / ADR-333). A no-op when no Emitter was injected (absent
+   *  under tests, which never call `run()`). `profile`/`entry`/`engine` are
+   *  each optional and reported ONLY together — see `model_load`'s own
+   *  "absent together, never fabricated partially" contract
+   *  (`events/model.ts`) — since a cancel-during-extraction has no winning
+   *  candidate to report a config for at all. */
+  private reportFirstLoad(
+    outcome: 'ok' | 'fail' | 'cancelled',
+    failReason?: 'oom' | 'timeout' | 'other',
+    config?: { profile: LoadProfile; entry: ModelEntry; engine: Engine; sys: SysInfo },
+  ): void {
     if (!this.telemetry) return
     // onboarding_step (ADR-299): mirrors cli.ts's `onLoadSettled` wiring — auto-tune is a
     // separate path to a first load and must feed the setup-funnel step too, not just the
     // once-ever `model_first_load` milestone below (found 2026-08-01, see cli.ts). Once-only,
     // same reasoning as cli.ts: this method runs on every sweep a user ever kicks off, not
     // just the first, so an unguarded emit would misrepresent ongoing auto-tune usage as
-    // repeated "setup" (release-2 review finding).
+    // repeated "setup" (release-2 review finding). Retired alongside onboarding_step itself
+    // in a later pass (spec 23 §4).
     if (claimOnce(this.store.dir(), 'once:onboarding_step:first_load')) {
       this.telemetry.emit('onboarding_step', { step: 'first_load', outcome })
     }
-    reportModelLoad(this.store.dir(), this.telemetry, outcome, failReason)
+    // model_load (spec 23 §3.3): fires on EVERY sweep, not just the first
+    // (model_first_load, retired here — see cli.ts's identical retirement and
+    // its comment for why).
+    if (config) {
+      const vram = estimateVram(config.profile, config.entry, config.sys)
+      emit(this.telemetry, modelLoad, {
+        outcome,
+        ...(failReason ? { failReason } : {}),
+        trigger: 'autotune',
+        ...buildModelLoadConfig(config.entry, config.profile, config.engine, vram),
+      })
+    } else {
+      emit(this.telemetry, modelLoad, { outcome, ...(failReason ? { failReason } : {}), trigger: 'autotune' })
+    }
     // `error` (telemetry-review follow-up): mirrors cli.ts's onLoadSettled wiring —
     // auto-tune is a separate path to a first load and must feed the ongoing crash
     // signal too, not just the once-ever model_first_load milestone above. failReason
@@ -461,7 +482,7 @@ export class BenchRunner {
       const kvAdvisory = kvSpeedAdvisory(best.cand.tps, profile.kvTypeK, caps.kvTypes)
       // Hold the winner instead of auto-saving — the UI shows a Save/Cancel results dialog and
       // persists via POST /bench/save only when the user clicks Save.
-      this.reportFirstLoad('ok')
+      this.reportFirstLoad('ok', undefined, active ? { profile, entry, engine: active, sys } : undefined)
       this.winning = { modelKey, profile, cand: best.cand, entry, sys, engineVersion: active?.version ?? '', engineId: active?.id ?? '' }
       this.logWinner = { params: best.cand.params, tps: best.cand.tps ?? 0, prefillTps: best.cand.prefillTps, ttftMs: best.cand.ttftMs ?? 0, vramMb: best.cand.vramMb }
       this.state = {
@@ -505,7 +526,11 @@ export class BenchRunner {
       // every candidate this sweep tried, not one raw error: individual probes
       // (VRAM probe, t/s trial) are expected to OOM/timeout as part of normal
       // binary search, so only the sweep's overall conclusion is reported.
-      this.reportFirstLoad(this.cancelled ? 'cancelled' : 'fail', this.cancelled ? undefined : classifyBenchFailure(results))
+      this.reportFirstLoad(
+        this.cancelled ? 'cancelled' : 'fail',
+        this.cancelled ? undefined : classifyBenchFailure(results),
+        active ? { profile: baseProfile, entry, engine: active, sys } : undefined,
+      )
       this.state = { running: false, modelKey, done: true, error: err, candidates: results }
     }
   }
