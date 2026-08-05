@@ -83,7 +83,12 @@ test('checkDailyQueryRollups: once the day rolls over, emits chat_daily, code_da
     assert.deepEqual(chatEvent?.payload, chatStats)
     const codeEvent = queued.find((q) => q.event === 'code_daily')
     assert.deepEqual(codeEvent?.payload, codeStats)
-    const gatewayEvents = queued.filter((q) => q.event === 'gateway_daily').map((q) => q.payload)
+    // Sorted before comparing: queue file names are `<epoch-ms>-<uuid>.json`, so two events
+    // queued within the same millisecond (as these are, emitted back to back in one synchronous
+    // loop) tie-break on a random UUID — readQueue's emission order is not guaranteed here.
+    const gatewayEvents = queued.filter((q) => q.event === 'gateway_daily')
+      .map((q) => q.payload as { protocol: string })
+      .sort((a, b) => a.protocol.localeCompare(b.protocol))
     assert.deepEqual(gatewayEvents, [
       { harness: 'unknown', protocol: 'anthropic', requests: 5, promptTokens: 100, genTokens: 50, distinctModels: 1 },
       { harness: 'unknown', protocol: 'openai', requests: 2, promptTokens: 20, genTokens: 10, distinctModels: 1 },
@@ -92,6 +97,42 @@ test('checkDailyQueryRollups: once the day rolls over, emits chat_daily, code_da
     // A third call the SAME day must not re-emit — only a real boundary crossing does.
     checkDailyQueryRollups(dir, db, telemetry, () => today)
     assert.equal(readQueue(dir).length, 4, 'no new events queued for a same-day repeat call')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('checkDailyQueryRollups: passes through a real classified harness value, and coerces anything not in HARNESSES to unknown', () => {
+  const dir = tempDir()
+  try {
+    const telemetry = makeEmitter(dir)
+    const gatewayStats = [
+      { protocol: 'anthropic', harness: 'claude_code', requests: 5, promptTokens: 100, genTokens: 50, distinctModels: 1 },
+      // A hand-edited DB or a future direct writer producing a value outside HARNESSES must
+      // still satisfy PayloadOf<>'s literal-enum type and never reach the Worker unvalidated —
+      // this is what the HARNESS_SET membership check in daily-query-rollups.ts guards.
+      { protocol: 'openai', harness: 'not-a-real-harness', requests: 1, promptTokens: 5, genTokens: 2, distinctModels: 1 },
+    ]
+    const db = fakeDb({ conversations: 0 }, gatewayStats, { sessions: 0 })
+
+    let today = '2026-08-05'
+    checkDailyQueryRollups(dir, db, telemetry, () => today)
+    today = '2026-08-06'
+    checkDailyQueryRollups(dir, db, telemetry, () => today)
+
+    const gatewayEvents = readQueue(dir)
+      .map((q) => q.event as { event: string; payload: { harness: string; protocol: string } })
+      .filter((q) => q.event === 'gateway_daily')
+      .map((q) => q.payload)
+    assert.deepEqual(
+      gatewayEvents.find((p) => p.protocol === 'anthropic'),
+      { protocol: 'anthropic', harness: 'claude_code', requests: 5, promptTokens: 100, genTokens: 50, distinctModels: 1 },
+    )
+    assert.equal(
+      gatewayEvents.find((p) => p.protocol === 'openai')?.harness,
+      'unknown',
+      'an unrecognized harness string must never reach emit() as-is',
+    )
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

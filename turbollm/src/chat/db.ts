@@ -1125,6 +1125,16 @@ export class ConversationStore {
       if (!this.hasColumn('routine_runs', 'code_session_id')) this.db.exec(`ALTER TABLE routine_runs ADD COLUMN code_session_id TEXT;`)
       this.db.exec(`PRAGMA user_version = 42;`)
     }
+    // v43 (spec 23 §3.5, telemetry Phase 5): which coding-tool CLI made this gateway request,
+    // classified from its User-Agent header (classify.ts's classifyHarness) at the two gateway
+    // entry points (gateway.ts) — the gateway read zero request headers before this. Additive +
+    // nullable: every pre-existing row simply has no header to have classified, and reads as
+    // 'unknown' (gatewayDailyStats' own fallback), the same bucket a genuinely unrecognized
+    // client falls into going forward.
+    if (v < 43) {
+      if (!this.hasColumn('api_usage', 'harness')) this.db.exec(`ALTER TABLE api_usage ADD COLUMN harness TEXT;`)
+      this.db.exec(`PRAGMA user_version = 43;`)
+    }
   }
 
   listConversations(q?: string, kind: 'chat' | 'agent' | 'all' = 'all'): Conversation[] {
@@ -1487,15 +1497,15 @@ export class ConversationStore {
    *  additive/fail-safe: callers wrap this the same way `recordCompletion` is wrapped.
    *  `codeSessionId`/`durationMs` (ADR-284) are only populated for a terminal-agent session's
    *  own token-identified traffic — undefined for every other gateway client, same as before. */
-  recordApiUsage(rec: { source: ApiUsageSource; modelKey: string | null; promptTokens: number; genTokens: number; codeSessionId?: string | null; durationMs?: number | null; promptTps?: number | null; genTps?: number | null }): void {
+  recordApiUsage(rec: { source: ApiUsageSource; modelKey: string | null; promptTokens: number; genTokens: number; codeSessionId?: string | null; durationMs?: number | null; promptTps?: number | null; genTps?: number | null; harness?: string | null }): void {
     // `promptTps`/`genTps` (ADR-300) are the ENGINE's own measurements, straight from the
     // llama.cpp response's `timings` — not anything computed here. Passing them through is the
     // whole point: each phase gets its own real rate instead of both being divided by one
     // wall-clock. Absent (an engine that reports no timings) → null, and the reader falls back.
     const rate = (v: number | null | undefined) => (v != null && Number.isFinite(v) && v > 0 ? v : null)
     this.db.prepare(`
-      INSERT INTO api_usage (id, created_at, source, model_key, prompt_tokens, gen_tokens, code_session_id, duration_ms, prompt_tps, gen_tps)
-      VALUES ($id, $createdAt, $source, $modelKey, $promptTokens, $genTokens, $codeSessionId, $durationMs, $promptTps, $genTps)
+      INSERT INTO api_usage (id, created_at, source, model_key, prompt_tokens, gen_tokens, code_session_id, duration_ms, prompt_tps, gen_tps, harness)
+      VALUES ($id, $createdAt, $source, $modelKey, $promptTokens, $genTokens, $codeSessionId, $durationMs, $promptTps, $genTps, $harness)
     `).run({
       $id: randomUUID(),
       $createdAt: new Date().toISOString(),
@@ -1507,6 +1517,7 @@ export class ConversationStore {
       $durationMs: rec.durationMs != null && Number.isFinite(rec.durationMs) ? Math.max(0, Math.floor(rec.durationMs)) : null,
       $promptTps: rate(rec.promptTps),
       $genTps: rate(rec.genTps),
+      $harness: rec.harness ?? null,
     } as P)
   }
 
@@ -1679,25 +1690,31 @@ export class ConversationStore {
    *  hot request path. Grouped by harness too once Phase 5's client-detection
    *  ships; until then every row reports `harness: 'unknown'` rather than waiting
    *  on that phase to start collecting protocol-level volume at all. */
-  gatewayDailyStats(dayIso: string): { protocol: ApiUsageSource; requests: number; promptTokens: number; genTokens: number; distinctModels: number }[] {
+  /** Grouped by (protocol, harness) — spec 23 §3.5, telemetry Phase 5. Pre-Phase-5 rows (and
+   *  any client the gateway didn't classify) have `harness IS NULL`, which reads as `'unknown'`
+   *  here rather than a distinct group of its own — that's the same bucket a genuinely
+   *  unrecognized live client falls into, so the two cases don't need telling apart downstream. */
+  gatewayDailyStats(dayIso: string): { protocol: ApiUsageSource; harness: string; requests: number; promptTokens: number; genTokens: number; distinctModels: number }[] {
     const { start, end } = this.dayWindow(dayIso)
     const rows = this.db.prepare(`
-      SELECT source, model_key, prompt_tokens, gen_tokens FROM api_usage
+      SELECT source, model_key, harness, prompt_tokens, gen_tokens FROM api_usage
       WHERE created_at >= ? AND created_at < ?
-    `).all(start, end) as unknown as { source: ApiUsageSource; model_key: string | null; prompt_tokens: number; gen_tokens: number }[]
+    `).all(start, end) as unknown as { source: ApiUsageSource; model_key: string | null; harness: string | null; prompt_tokens: number; gen_tokens: number }[]
 
-    const bySource = new Map<ApiUsageSource, { requests: number; promptTokens: number; genTokens: number; models: Set<string> }>()
+    const byGroup = new Map<string, { protocol: ApiUsageSource; harness: string; requests: number; promptTokens: number; genTokens: number; models: Set<string> }>()
     for (const r of rows) {
-      const t = bySource.get(r.source) ?? { requests: 0, promptTokens: 0, genTokens: 0, models: new Set<string>() }
+      const harness = r.harness ?? 'unknown'
+      const key = `${r.source} ${harness}`
+      const t = byGroup.get(key) ?? { protocol: r.source, harness, requests: 0, promptTokens: 0, genTokens: 0, models: new Set<string>() }
       t.requests++
       t.promptTokens += r.prompt_tokens
       t.genTokens += r.gen_tokens
       if (r.model_key) t.models.add(r.model_key)
-      bySource.set(r.source, t)
+      byGroup.set(key, t)
     }
 
-    return [...bySource.entries()].map(([protocol, t]) => ({
-      protocol, requests: t.requests, promptTokens: t.promptTokens, genTokens: t.genTokens, distinctModels: t.models.size,
+    return [...byGroup.values()].map((t) => ({
+      protocol: t.protocol, harness: t.harness, requests: t.requests, promptTokens: t.promptTokens, genTokens: t.genTokens, distinctModels: t.models.size,
     }))
   }
 

@@ -17,7 +17,7 @@ import { featureFirstUse, featureUsedDaily } from './feature'
 import { errorEvent, consentChoice } from './meta'
 import { benchResult } from './perf'
 import { chatDaily } from './chat'
-import { gatewayDaily } from './gateway'
+import { gatewayDaily, harnessFirstSeen } from './gateway'
 import { codeDaily } from './code'
 
 export const REGISTRY = {
@@ -33,6 +33,7 @@ export const REGISTRY = {
   bench_result: benchResult,
   chat_daily: chatDaily,
   gateway_daily: gatewayDaily,
+  harness_first_seen: harnessFirstSeen,
   code_daily: codeDaily,
 } as const
 
@@ -53,5 +54,6 @@ export {
   benchResult,
   chatDaily,
   gatewayDaily,
+  harnessFirstSeen,
   codeDaily,
 }

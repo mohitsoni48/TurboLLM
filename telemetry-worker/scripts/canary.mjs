@@ -81,8 +81,9 @@ const events = [
     },
   }),
   envelope('gateway_daily', {
-    payload: { harness: 'unknown', protocol: 'anthropic', requests: 1, promptTokens: 1, genTokens: 1, distinctModels: 1 },
+    payload: { harness: 'claude_code', protocol: 'anthropic', requests: 1, promptTokens: 1, genTokens: 1, distinctModels: 1 },
   }),
+  envelope('harness_first_seen', { payload: { harness: 'claude_code', protocol: 'anthropic' } }),
   envelope('code_daily', { payload: { sessions: 1, turns: 1, toolCalls: 0 } }),
 ]
 

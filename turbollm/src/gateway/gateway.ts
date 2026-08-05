@@ -10,6 +10,7 @@ import { clampMaxTokens } from '../config/config'
 import { engineModelAlias } from '../engines/compat'
 import { presentedKey } from '../auth'
 import { sessionAuth } from '../code/session-auth'
+import { classifyHarness } from '../telemetry/classify'
 import { mapToOpenAI, mapFromOpenAI, streamToAnthropic, type AnthropicRequest, type StreamToolCall } from './anthropic'
 import { applyAgentGuidance } from './agent-guidance'
 import {
@@ -30,6 +31,18 @@ import {
 function resolveCodeSession(c: Context): { token: string; codeSessionId: string | null } {
   const token = presentedKey(c)
   return { token, codeSessionId: token ? sessionAuth.resolve(token) : null }
+}
+
+/** Classify this request's client from its `User-Agent` header (spec 23 §3.5, Phase 5:
+ *  the gateway read zero request headers before this) and report `harness_first_seen`
+ *  as a side effect — one read per request, shared by both gateway entry points, so
+ *  every code path that resolves a harness also contributes to that once-per-value
+ *  ledger. `d.telemetry` is optional (tests / a middleware stub), and this must never
+ *  affect the actual request, hence the swallow. */
+function resolveHarness(c: Context, d: Deps, protocol: 'anthropic' | 'openai'): string {
+  const harness = classifyHarness(c.req.header('user-agent'))
+  try { d.telemetry?.harnessFirstSeen(harness, protocol) } catch { /* best-effort */ }
+  return harness
 }
 
 /** An AbortController that fires when the CLIENT disconnects (Claude Code cancels a
@@ -140,6 +153,7 @@ export function registerGateway(app: Hono, d: Deps): void {
     // token resolves to a Code session with an override actually set; every other client
     // (including a manually-run `turbollm launch claude`) is completely unaffected.
     const { token: anthropicToken, codeSessionId: anthropicCodeSessionId } = resolveCodeSession(c)
+    const anthropicHarness = resolveHarness(c, d, 'anthropic')
     if (anthropicCodeSessionId) {
       // Coding-activity attribution, confirm half (see commitConfirmedCodeToolCalls): this
       // request's own history is what tells the daemon whether the edits it watched the engine
@@ -319,7 +333,7 @@ export function registerGateway(app: Hono, d: Deps): void {
             d.db.recordApiUsage({
               source: 'anthropic', modelKey: req.model ?? null, promptTokens: u.inputTokens, genTokens: u.outputTokens,
               codeSessionId: anthropicCodeSessionId, durationMs: Date.now() - requestStart,
-              promptTps: u.promptTps, genTps: u.genTps,
+              promptTps: u.promptTps, genTps: u.genTps, harness: anthropicHarness,
             })
           } catch { /* swallow — stats are best-effort */ }
         },
@@ -355,7 +369,7 @@ export function registerGateway(app: Hono, d: Deps): void {
     try {
       const oaiRes = (await res.json()) as Record<string, unknown>
       // session stats (B4) + durable #71 record, fail-safe
-      recordOpenAiUsage(d, oaiRes, 'anthropic', req.model ?? null, anthropicCodeSessionId, Date.now() - requestStart)
+      recordOpenAiUsage(d, oaiRes, 'anthropic', req.model ?? null, anthropicCodeSessionId, Date.now() - requestStart, anthropicHarness)
       // Same coding-activity attribution the streaming branch gets. A non-streaming turn has no
       // per-delta reassembly to do — the engine already hands back whole `arguments` strings —
       // but it must not be the one shape of terminal-agent turn that silently records nothing.
@@ -441,6 +455,7 @@ export function registerGateway(app: Hono, d: Deps): void {
       try { parsedBody = (await c.req.json()) as Record<string, unknown> } catch { parsedBody = null }
     }
     const { token: chatToken, codeSessionId: chatCodeSessionId } = resolveCodeSession(c)
+    const chatHarness = resolveHarness(c, d, 'openai')
 
     const requestedModel = isChat ? ((parsedBody?.model as string | undefined) ?? '') : ''
     const routeResult = await d.modelRouter.route(requestedModel)
@@ -569,8 +584,8 @@ export function registerGateway(app: Hono, d: Deps): void {
         // parser would silently see no matches and record nothing (GitHub #71: this
         // gap would have made external-client tracking wrong for a common case).
         const drain = parsedBody?.stream === true
-          ? recordOpenAiStreamUsage(d, b, 'openai', requestedModel || null, chatCodeSessionId, requestStart)
-          : recordOpenAiJsonUsage(d, b, 'openai', requestedModel || null, chatCodeSessionId, requestStart)
+          ? recordOpenAiStreamUsage(d, b, 'openai', requestedModel || null, chatCodeSessionId, requestStart, chatHarness)
+          : recordOpenAiJsonUsage(d, b, 'openai', requestedModel || null, chatCodeSessionId, requestStart, chatHarness)
         // Released when the teed copy finishes draining — i.e. when the engine has actually
         // stopped generating, NOT when this handler returns. Returning the streaming Response
         // hands bytes to the client while the engine is still busy, so releasing the slot here
@@ -791,7 +806,7 @@ function commitConfirmedCodeToolCalls(d: Deps, codeSessionId: string, req: Anthr
  *  `api_usage` row (GitHub #71) — `source`/`modelKey` distinguish gateway (external-client)
  *  traffic from in-app chat, which records into `messages` instead. `codeSessionId`/`durationMs`
  *  (ADR-284) attribute this row to a terminal-agent session for TerminalToolbar.tsx's stats. */
-function recordOpenAiUsage(d: Deps, oai: Record<string, unknown>, source: 'anthropic' | 'openai', modelKey: string | null, codeSessionId: string | null = null, durationMs: number | null = null): void {
+function recordOpenAiUsage(d: Deps, oai: Record<string, unknown>, source: 'anthropic' | 'openai', modelKey: string | null, codeSessionId: string | null = null, durationMs: number | null = null, harness: string | null = null): void {
   try {
     const usage = oai.usage as { prompt_tokens?: number; completion_tokens?: number } | undefined
     const timings = oai.timings as { prompt_per_second?: number; predicted_per_second?: number } | undefined
@@ -803,7 +818,7 @@ function recordOpenAiUsage(d: Deps, oai: Record<string, unknown>, source: 'anthr
     })
     d.db.recordApiUsage({
       source, modelKey, promptTokens: usage?.prompt_tokens ?? 0, genTokens: usage?.completion_tokens ?? 0,
-      codeSessionId, durationMs,
+      codeSessionId, durationMs, harness,
       // Already extracted for the engine card two lines up; persisting them is what lets the
       // stats row report the engine's real rates instead of deriving both from `durationMs`.
       promptTps: timings?.prompt_per_second, genTps: timings?.predicted_per_second,
@@ -817,18 +832,18 @@ function recordOpenAiUsage(d: Deps, oai: Record<string, unknown>, source: 'anthr
  *  stream; all errors are swallowed. `startedAt` (Date.now() at the ORIGINAL fetch call) —
  *  duration is computed here, at true completion, not at the call site (which fires before
  *  this drain even starts). */
-async function recordOpenAiJsonUsage(d: Deps, body: ReadableStream<Uint8Array>, source: 'anthropic' | 'openai', modelKey: string | null, codeSessionId: string | null = null, startedAt: number | null = null): Promise<void> {
+async function recordOpenAiJsonUsage(d: Deps, body: ReadableStream<Uint8Array>, source: 'anthropic' | 'openai', modelKey: string | null, codeSessionId: string | null = null, startedAt: number | null = null, harness: string | null = null): Promise<void> {
   try {
     const text = await new Response(body).text()
     const oai = JSON.parse(text) as Record<string, unknown>
-    recordOpenAiUsage(d, oai, source, modelKey, codeSessionId, startedAt != null ? Date.now() - startedAt : null)
+    recordOpenAiUsage(d, oai, source, modelKey, codeSessionId, startedAt != null ? Date.now() - startedAt : null, harness)
   } catch { /* swallow — stats are best-effort */ }
 }
 
 /** Drain a teed copy of a streaming OpenAI SSE body to record final usage (B4) plus a
  *  durable `api_usage` row (GitHub #71). Never touches the client-facing stream; all
  *  errors are swallowed. `startedAt` — see recordOpenAiJsonUsage's doc comment; same reason. */
-async function recordOpenAiStreamUsage(d: Deps, body: ReadableStream<Uint8Array>, source: 'anthropic' | 'openai', modelKey: string | null, codeSessionId: string | null = null, startedAt: number | null = null): Promise<void> {
+async function recordOpenAiStreamUsage(d: Deps, body: ReadableStream<Uint8Array>, source: 'anthropic' | 'openai', modelKey: string | null, codeSessionId: string | null = null, startedAt: number | null = null, harness: string | null = null): Promise<void> {
   try {
     const reader = body.getReader()
     const dec = new TextDecoder()
@@ -870,7 +885,7 @@ async function recordOpenAiStreamUsage(d: Deps, body: ReadableStream<Uint8Array>
     d.manager.recordCompletion({ inputTokens: promptTokens, outputTokens: completionTokens, promptTps, genTps })
     d.db.recordApiUsage({
       source, modelKey, promptTokens, genTokens: completionTokens,
-      codeSessionId, durationMs: startedAt != null ? Date.now() - startedAt : null,
+      codeSessionId, durationMs: startedAt != null ? Date.now() - startedAt : null, harness,
       // Accumulated from the stream's own `timings` above (0 when the engine reported none —
       // recordApiUsage stores that as null, and the reader falls back to the old derivation).
       promptTps, genTps,

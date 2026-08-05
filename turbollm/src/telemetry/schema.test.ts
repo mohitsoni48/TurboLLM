@@ -52,6 +52,35 @@ test('validateEvent: app_first_run carries no payload at all', () => {
   assert.match(r.reason, /no payload/)
 })
 
+test('validateEvent: harness_first_seen requires a known harness and protocol (spec 23 §3.5, Phase 5)', () => {
+  assert.equal(
+    validateEvent(validEvent({ event: 'harness_first_seen', payload: { harness: 'claude_code', protocol: 'anthropic' } })).ok,
+    true,
+  )
+  const missingProtocol = validateEvent(validEvent({ event: 'harness_first_seen', payload: { harness: 'claude_code' } }))
+  assert.equal(missingProtocol.ok, false)
+  assert.match(missingProtocol.reason, /protocol/)
+
+  const madeUpHarness = validateEvent(validEvent({ event: 'harness_first_seen', payload: { harness: 'some-other-tool', protocol: 'anthropic' } }))
+  assert.equal(madeUpHarness.ok, false)
+  assert.match(madeUpHarness.reason, /harness/)
+})
+
+test('validateEvent: gateway_daily requires harness alongside protocol/volume fields', () => {
+  const r = validateEvent(validEvent({
+    event: 'gateway_daily',
+    payload: { harness: 'opencode', protocol: 'openai', requests: 3, promptTokens: 100, genTokens: 50, distinctModels: 1 },
+  }))
+  assert.equal(r.ok, true, r.ok === false ? r.reason : '')
+
+  const missingHarness = validateEvent(validEvent({
+    event: 'gateway_daily',
+    payload: { protocol: 'openai', requests: 3, promptTokens: 100, genTokens: 50, distinctModels: 1 },
+  }))
+  assert.equal(missingHarness.ok, false)
+  assert.match(missingHarness.reason, /harness/)
+})
+
 test('validateEvent: onboarding_step requires a known step and outcome', () => {
   assert.equal(
     validateEvent(validEvent({ event: 'onboarding_step', payload: { step: 'model_download', outcome: 'ok' } })).ok,

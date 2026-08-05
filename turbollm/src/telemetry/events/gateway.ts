@@ -2,12 +2,12 @@
  *  aggregation over the existing `api_usage` table (`ConversationStore.
  *  gatewayDailyStats`) — no new write on the gateway's own hot request path.
  *
- *  `harness` is defined here as the real closed enum spec 23 §3.5 wants, but
- *  Phase 3 cannot populate it yet: the gateway reads zero request headers
- *  today, so every row emits `'unknown'` until Phase 5's client-detection
- *  work ships. Shipping the field now, even unpopulated, means Phase 5 only
- *  has to enrich an existing event rather than introduce a new one and lose
- *  whatever protocol-level volume history had already accumulated.
+ *  `harness` is classified from the request's `User-Agent` header
+ *  (`classify.ts`'s `classifyHarness`, Phase 5) at the two gateway entry
+ *  points (`gateway.ts`) and persisted onto `api_usage.harness`, so this
+ *  daily rollup and `harness_first_seen` below both read a real per-client
+ *  value instead of the `'unknown'` placeholder every row emitted before
+ *  Phase 5 shipped (the gateway read zero request headers until then).
  *
  *  `errors` (spec 23 §3.5's original sketch) is not included: `api_usage`
  *  has no outcome/error column today, so there is nothing to aggregate
@@ -26,7 +26,7 @@ export const gatewayDaily = defineEvent({
   since: 2,
   consent: 'full',
   lifecycle: 'daily-rollup',
-  description: "Yesterday's gateway request volume for this machine, grouped by protocol (and harness once Phase 5 ships client detection).",
+  description: "Yesterday's gateway request volume for this machine, grouped by protocol and harness.",
   payload: {
     harness: f.enum(HARNESSES),
     protocol: f.enum(['anthropic', 'openai']),
@@ -34,5 +34,24 @@ export const gatewayDaily = defineEvent({
     promptTokens: f.int(),
     genTokens: f.int(),
     distinctModels: f.int(),
+  },
+})
+
+/** The first time this machine's gateway is ever seen talking to a given
+ *  harness (spec 23 §3.5) — parametrized once-per-value, the same shape as
+ *  `feature_first_use` but keyed on `harness` instead of a feature name
+ *  (`Emitter.harnessFirstSeen`). Fires even for `'unknown'`: per spec Gap C's
+ *  own fallback plan, real-world `unknown` volume is the intended signal for
+ *  which client `classifyHarness` still needs to learn to recognise, not
+ *  something to suppress. */
+export const harnessFirstSeen = defineEvent({
+  name: 'harness_first_seen',
+  since: 2,
+  consent: 'full',
+  lifecycle: 'once-by-key',
+  description: 'The first time this machine is seen talking to the gateway via a given harness.',
+  payload: {
+    harness: f.enum(HARNESSES),
+    protocol: f.enum(['anthropic', 'openai']),
   },
 })

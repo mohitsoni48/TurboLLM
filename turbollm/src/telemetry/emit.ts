@@ -15,7 +15,7 @@ import { randomUUID } from 'node:crypto'
 import { enqueue } from './queue'
 import { claimOnce } from './ledger'
 import { telemetryDisabled } from './disabled'
-import { TELEMETRY_SCHEMA_VERSION, type EventName } from './schema'
+import { TELEMETRY_SCHEMA_VERSION, REGISTRY, type EventName } from './schema'
 import { recordFeatureUse, flushStaleDailyUsage, persistDailyUsage } from './daily-usage'
 
 /** Just enough of ConfigStore for the emitter — kept structural so tests need
@@ -34,9 +34,20 @@ export interface EmitterOpts {
   today?: () => string
 }
 
-/** Events that require the `full` level. Crash diagnostics are the extra step a
- *  user opts into separately; `anon` must not send them. */
-const REQUIRES_FULL = new Set<EventName>(['error'])
+/** Events that require the `full` level, DERIVED from each event's own declared
+ *  `consent` (registry, not a hand-maintained list) — deliberately, after finding
+ *  this was a literal `Set(['error'])` that predates the registry (ADR-299
+ *  Decision 6, before `model_load`/`gateway_daily`/`chat_daily`/`code_daily`/
+ *  `harness_first_seen` existed) and was never extended when those events were
+ *  added with `consent: 'full'` in their own schema. That gap meant an `anon`
+ *  install's machine would have sent model identity, harness identity, and
+ *  daily-rollup detail anyway — exactly the leak spec 23 §6's "consent levels"
+ *  open question worried about, silently unenforced. Deriving from `REGISTRY`
+ *  is the same fix the whole registry redesign exists to generalize: one
+ *  source of truth, not a second list someone has to remember to update. */
+const REQUIRES_FULL = new Set<EventName>(
+  (Object.keys(REGISTRY) as EventName[]).filter((name) => REGISTRY[name].consent === 'full'),
+)
 
 export class Emitter {
   private readonly o: EmitterOpts
@@ -128,6 +139,15 @@ export class Emitter {
   dailyActive(): void {
     if (!this.canSend('daily_active')) return
     if (this.claim(`daily:${this.today()}`)) this.emit('daily_active')
+  }
+
+  /** Emit `harness_first_seen` the first time THIS harness value is ever seen
+   *  on this machine's gateway (spec 23 §3.5) — same parametrized-once shape
+   *  as {@link firstUse}, keyed on the harness rather than a feature name.
+   *  Fires even for `'unknown'` — see `events/gateway.ts`'s doc comment for why. */
+  harnessFirstSeen(harness: string, protocol: 'anthropic' | 'openai'): void {
+    if (!this.canSend('harness_first_seen')) return
+    if (this.claim(`harness:${harness}`)) this.emit('harness_first_seen', { harness, protocol })
   }
 
   /**
