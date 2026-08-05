@@ -45,7 +45,10 @@ function loadModeForEngine(engineKind: string | undefined): LoadMode {
 /** Flags `profileToArgs` (turbollm/src/models/profile.ts) already hand-models with a dedicated
  *  structured control — must be excluded from the generic "Advanced parameters" section so a
  *  flag never gets two conflicting controls. Keep in sync with profileToArgs; this is the
- *  authoritative list as of spec 22 (ADR-328). */
+ *  authoritative list as of spec 22 (ADR-328). Includes `--ctx-size`, the long-form alias of the
+ *  `-c` flag the "Context length" slider already emits (profile.ts:549) — routes.ts:2561 treats
+ *  `-c`/`--ctx-size` as synonyms elsewhere, and a probed engine that documents the long form would
+ *  otherwise surface as a second, independent control for the same setting. */
 const MODELED_FLAGS = new Set([
   '--split-mode', '--tensor-split', '--main-gpu', '--parallel', '--kv-unified', '--n-cpu-moe',
   '--cache-type-k', '--cache-type-v', '--flash-attn', '--no-kv-offload', '--threads', '--threads-batch',
@@ -53,15 +56,20 @@ const MODELED_FLAGS = new Set([
   '--jinja', '--chat-template-file', '--spec-type', '--mtp-head', '--model-draft', '--draft-max',
   '--spec-draft-n-max', '--draft-min', '--spec-draft-n-min', '--temp', '--top-p', '--top-k', '--min-p',
   '--repeat-penalty', '--presence-penalty', '--frequency-penalty', '--n-keep', '--rope-scaling',
-  '--rope-freq-base', '--rope-freq-scale', '--embeddings', '--grammar', '--no-mmap',
+  '--rope-freq-base', '--rope-freq-scale', '--embeddings', '--grammar', '--no-mmap', '--ctx-size',
 ])
 
 /** Flags the daemon sets itself when spawning the engine (turbollm/src/engines/manager.ts) —
  *  must NEVER be offered as a generic user-editable control, since overriding them generically
  *  could break the daemon's ability to manage the process (port collision, wrong bind host,
  *  wrong model path). Confirmed from manager.ts:777's `['-m', opts.modelPath, '--host',
- *  '127.0.0.1', '--port', String(port)]` launch prefix. */
-const DAEMON_OWNED_FLAGS = new Set(['-m', '--host', '--port'])
+ *  '127.0.0.1', '--port', String(port)]` launch prefix, plus `--metrics`/`--no-webui`/
+ *  `--slot-save-path`, which manager.ts:779-783 pushes conditionally a few lines below that
+ *  prefix. `--slot-save-path` is the highest-risk of the three: it's a *valued* flag (the KV
+ *  prompt-cache persistence path), and since `extraArgs` is appended last, a user setting it via
+ *  the generic control here would silently override the daemon's own managed path and break
+ *  slot-cache restore with no visible error. */
+const DAEMON_OWNED_FLAGS = new Set(['-m', '--host', '--port', '--metrics', '--no-webui', '--slot-save-path'])
 
 /** Reads a flag's current value out of extraArgs: '' for a bare boolean flag present with no
  *  following value, the value string for `--flag value`, or undefined if the flag isn't set. */
