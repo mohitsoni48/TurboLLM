@@ -21,6 +21,13 @@ import { extractMemoryFacts } from './memory'
 import { claimOnce } from '../telemetry/ledger'
 import type { Emitter } from '../telemetry/emit'
 import { codeGateBlocks } from '../routines/routine-routes'
+import { emitBenchResult } from '../telemetry/runtime/typed-emit'
+import { buildBenchResultConfig } from '../telemetry/events/perf'
+import { shouldEmitBenchResult, benchRateLimitKey, MIN_GEN_TOKENS_FOR_BENCH } from '../telemetry/runtime/bench-rate-limit'
+import { resolveProfile, type LoadProfile } from '../models/profile'
+import type { ModelInfo } from '../engines/manager'
+import { getModelProfile } from '../config/config'
+import { getSysInfo } from '../sysinfo/sysinfo'
 
 /** The per-request code-routine trust decision. Exported ONLY so it can be behaviourally
  *  pinned — both generation entry points must call this, never inline the expression.
@@ -747,6 +754,52 @@ export function reportFirstChat(dataDir: string, emitter: Emitter | undefined, o
   emitter.emit('onboarding_step', { step: 'first_chat', outcome })
 }
 
+/**
+ * `bench_result{source:'chat'}` (spec 23 §3.7, ADR-333, founder-directed
+ * 2026-08-05): a real chat reply's own measured t/s, alongside the
+ * synthetic autotune sweep bench_result already sent. llama.cpp's own
+ * `predicted_per_second` is measured on EVERY generation already (`stats.tps`
+ * above) — this only wires it to leave the machine, subject to the same
+ * rate limit and short-run floor every real-run source shares
+ * (`bench-rate-limit.ts`).
+ *
+ * Best-effort by contract (ADR-009): a lookup miss (model swapped mid-turn,
+ * scanner not yet caught up) or any other failure here must never surface
+ * to the user or affect the chat response already streamed.
+ */
+function reportChatBenchResult(d: Deps, ms: ModelInfo, stats: Partial<MessageStats>): void {
+  try {
+    if (!d.telemetry?.canSend('bench_result')) return
+    if (stats.tps === undefined || stats.genTokens === undefined || stats.genTokens < MIN_GEN_TOKENS_FOR_BENCH) return
+
+    const entry = d.scanner.get(ms.key)
+    const engine = d.registry.active()
+    if (!entry || !engine) return
+
+    const cfg = d.store.snapshot()
+    const saved = getModelProfile(cfg, entry.key, engine.id) as Partial<LoadProfile> | undefined
+    const profile = resolveProfile(entry, getSysInfo(), saved, undefined, cfg.modelDefaults)
+
+    const key = benchRateLimitKey(entry.key, entry.quant, profile.ctx, profile.ngl, profile.nCpuMoe, profile.kvTypeK, 'chat')
+    if (!shouldEmitBenchResult(d.store.dir(), key)) return
+
+    const config = buildBenchResultConfig(entry, profile, engine.version, getSysInfo())
+    emitBenchResult(
+      d.telemetry,
+      {
+        source: 'chat',
+        model: config.model,
+        engine: config.engine,
+        params: config.params,
+        result: { tps: stats.tps, ttftMs: stats.ttftMs ?? 0, vramMb: null, outcome: 'ok' },
+      },
+      config.hw,
+    )
+  } catch {
+    // Best-effort by contract (ADR-009).
+  }
+}
+
 async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx): Promise<void> {
   const { db } = d
   const { convId, conv, assistantMsg, ms, target, ac, thinkingBudget } = ctx
@@ -1425,6 +1478,7 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
   // reply is actually persisted, because that — not a model load — is the moment onboarding
   // has genuinely succeeded.
   reportFirstChat(d.store.dir(), d.telemetry, aborted ? 'cancelled' : engineFailed ? 'fail' : 'ok')
+  if (!aborted && !engineFailed && ms.model) reportChatBenchResult(d, ms.model, stats)
 
   try {
     d.manager.recordCompletion({

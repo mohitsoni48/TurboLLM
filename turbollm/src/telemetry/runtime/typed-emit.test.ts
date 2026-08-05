@@ -7,7 +7,7 @@ import { Emitter } from '../emit'
 import { readQueue } from '../queue'
 import { errorEvent } from '../events/meta'
 import { appFirstRun } from '../events/lifecycle'
-import { emit, emitOnce } from './typed-emit'
+import { emit, emitOnce, emitBenchResult } from './typed-emit'
 
 function tempDir(): string {
   return mkdtempSync(join(tmpdir(), 'turbollm-typed-emit-'))
@@ -55,6 +55,30 @@ test('emitOnce: delegates to Emitter.once — fires once, a second call is a no-
     emitOnce(emitter, appFirstRun)
     emitOnce(emitter, appFirstRun)
     assert.deepEqual(names(dir), ['app_first_run'], 'the ledger claim, not this wrapper, enforces once-ness')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('emitBenchResult: type-checked payload AND hw both reach the queue — the one event Emitter.emit() cannot carry at all', () => {
+  const dir = tempDir()
+  try {
+    const emitter = makeEmitter(dir, 'anon')
+    emitBenchResult(
+      emitter,
+      {
+        source: 'chat',
+        model: { name: 'Test Model', quant: 'Q4_K_M', arch: 'llama', sizeBytes: 1, moe: false },
+        engine: { version: 'b1234' },
+        params: { ctx: 8192, ngl: 99, nCpuMoe: 0, parallel: 1, kvTypeK: 'q8_0', flashAttn: 'auto' },
+        result: { tps: 42, ttftMs: 100, vramMb: null, outcome: 'ok' },
+      },
+      { cpu: 'Test CPU', ramMb: 65536, gpus: [{ name: 'Test GPU', vramMb: 16384 }] },
+    )
+    const queued = readQueue(dir)
+    assert.equal(queued.length, 1)
+    assert.equal((queued[0].event.payload as { source: string }).source, 'chat')
+    assert.deepEqual(queued[0].event.hw, { cpu: 'Test CPU', ramMb: 65536, gpus: [{ name: 'Test GPU', vramMb: 16384 }] })
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

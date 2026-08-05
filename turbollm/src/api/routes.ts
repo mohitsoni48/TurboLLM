@@ -2394,6 +2394,7 @@ function telemetryPreview(level: string, version: string) {
     app: { version, os: sys.os },
     hw,
     payload: {
+      source: 'chat',
       model: { name: 'Qwen3.6-35B', quant: 'Q4_K_M', sizeBytes: 21_000_000_000, arch: 'qwen3moe', moe: true },
       engine: { version: 'b1234' },
       params: { ctx: 8192, ngl: 99, nCpuMoe: 0, parallel: 1, kvTypeK: 'q8_0', flashAttn: 'auto' },

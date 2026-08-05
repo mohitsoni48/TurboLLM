@@ -328,3 +328,36 @@ test('emit: mints a machineId lazily, and never while consent is off', () => {
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+const FULL_BENCH_PAYLOAD = {
+  source: 'chat',
+  model: { name: 'Test Model', quant: 'Q4_K_M', arch: 'llama', sizeBytes: 1, moe: false },
+  engine: { version: 'b1234' },
+  params: { ctx: 8192, ngl: 99, nCpuMoe: 0, parallel: 1, kvTypeK: 'q8_0', flashAttn: 'auto' },
+  result: { tps: 42, ttftMs: 100, vramMb: null, outcome: 'ok' },
+}
+
+test('emitWithExtra: attaches the extra block alongside payload — the only way to carry bench_result.hw at all', () => {
+  const dir = tempDir()
+  try {
+    const { emitter } = makeEmitter(dir, 'anon')
+    emitter.emitWithExtra('bench_result', FULL_BENCH_PAYLOAD, 'hw', { cpu: 'Test CPU', ramMb: 65536, gpus: [] })
+    const queued = readQueue(dir)
+    assert.equal(queued.length, 1)
+    assert.deepEqual(queued[0].event.payload, FULL_BENCH_PAYLOAD)
+    assert.deepEqual(queued[0].event.hw, { cpu: 'Test CPU', ramMb: 65536, gpus: [] })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('emitWithExtra: still respects consent and the kill switch, exactly like emit()', () => {
+  const dir = tempDir()
+  try {
+    const { emitter } = makeEmitter(dir, 'off')
+    emitter.emitWithExtra('bench_result', FULL_BENCH_PAYLOAD, 'hw', { cpu: 'x', ramMb: 1, gpus: [] })
+    assert.deepEqual(names(dir), [], 'off must block emitWithExtra exactly as it blocks emit')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

@@ -83,6 +83,34 @@ export class Emitter {
     }
   }
 
+  /**
+   * Like {@link emit}, but also attaches a second top-level envelope block
+   * beside `payload` — the only shape `bench_result`'s `hw` field needs
+   * (`extraEnvelopeBlock`, `core/types.ts`). Before this existed, the only
+   * way to send an `hw`-bearing event was `bench.ts`'s `queueTelemetry`
+   * bypassing `Emitter` entirely and hand-duplicating machineId-minting —
+   * this gives any future `hw`-shaped (or similarly-shaped) event a real way
+   * to reuse the same consent/kill-switch/machineId machinery every other
+   * event already gets, instead of a second copy of it.
+   */
+  emitWithExtra(event: EventName, payload: Record<string, unknown> | undefined, extraKey: string, extraValue: unknown): void {
+    try {
+      if (!this.canSend(event)) return
+
+      enqueue(this.o.dataDir, {
+        schema: TELEMETRY_SCHEMA_VERSION,
+        event,
+        ts: new Date().toISOString(),
+        machineId: this.machineId(),
+        app: { version: this.o.version, os: this.o.os },
+        [extraKey]: extraValue,
+        ...(payload === undefined ? {} : { payload }),
+      })
+    } catch {
+      // Best-effort by contract.
+    }
+  }
+
   /** Emit an event at most once for the lifetime of this install (e.g.
    *  `app_first_run`, which must count installs — not daemon starts). */
   once(event: EventName): void {

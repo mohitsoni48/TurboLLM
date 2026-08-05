@@ -160,6 +160,7 @@ function benchEvent(over: Record<string, unknown> = {}): Record<string, unknown>
       gpus: [{ name: 'NVIDIA GeForce RTX 5070 Ti', vramMb: 16384 }],
     },
     payload: {
+      source: 'autotune',
       model: { name: 'Qwen3.6-35B-A22B', quant: 'Q4_K_M', sizeBytes: 21_000_000_000, arch: 'qwen3moe', moe: true },
       engine: { version: 'b1234' },
       params: { ctx: 8192, ngl: 99, nCpuMoe: 0, parallel: 1, kvTypeK: 'q8_0', flashAttn: 'auto' },
@@ -168,6 +169,29 @@ function benchEvent(over: Record<string, unknown> = {}): Record<string, unknown>
     ...over,
   }
 }
+
+test('validateEvent: bench_result requires a real source — autotune|chat|gateway|code', () => {
+  const r = validateEvent(benchEvent({ payload: { ...(benchEvent().payload as object), source: undefined } }))
+  assert.equal(r.ok, false)
+  assert.match(r.reason, /source/)
+})
+
+test('validateEvent: bench_result accepts every real source value, from every real trigger', () => {
+  for (const source of ['autotune', 'chat', 'gateway', 'code']) {
+    const e = benchEvent()
+    ;(e.payload as Record<string, unknown>).source = source
+    const r = validateEvent(e)
+    assert.equal(r.ok, true, r.ok === false ? `${source}: ${r.reason}` : '')
+  }
+})
+
+test('validateEvent: bench_result rejects a source outside the closed enum', () => {
+  const e = benchEvent()
+  ;(e.payload as Record<string, unknown>).source = 'made_up_source'
+  const r = validateEvent(e)
+  assert.equal(r.ok, false)
+  assert.match(r.reason, /source/)
+})
 
 test('validateEvent: accepts the bench_result shape bench.ts already produces', () => {
   const r = validateEvent(benchEvent())
