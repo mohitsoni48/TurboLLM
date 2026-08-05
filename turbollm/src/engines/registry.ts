@@ -420,9 +420,10 @@ export function isStaleCapabilities(flags: string[], flagInfo: FlagInfo[] | unde
   if (['--draft-max', '--draft-min', '--draft', '--draft-n', '--draft-n-min'].some((f) => flags.includes(f))) return true
   // Case 3 (spec 22, ADR-328): a probe from before `flagInfo` existed carries no
   // structured per-flag metadata at all — reprobe once to backfill it, so the generic
-  // KV-type detection and the Advanced Parameters UI reach already-registered engines
-  // without a manual re-add. `[]` (probed the new way, nothing extra to report) is NOT
-  // stale; only `undefined` (never probed the new way) is.
+  // KV-type detection (kvTypes) reaches already-registered engines without a manual
+  // re-add. (flagInfo itself is reserved for the Advanced Parameters UI, not currently
+  // rendered — see config.ts's Capabilities.flagInfo doc comment.) `[]` (probed the new
+  // way, nothing extra to report) is NOT stale; only `undefined` (never probed) is.
   if (flagInfo === undefined) return true
   return false
 }

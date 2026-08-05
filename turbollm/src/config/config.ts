@@ -32,11 +32,13 @@ export interface FlagInfo {
 export interface Capabilities {
   kvTypes: string[]
   flags: string[]
-  /** One entry per probed flag, capturing its inferred argument shape (drives the generic
-   *  "Advanced parameters" UI, spec 22). Optional: absent for engine kinds that never go
-   *  through probe.ts's --help scrape (mlx/rapid-mlx/vllm/sglang, which register with a
-   *  hand-written `{ kvTypes: [], flags: [] }` literal — see api/routes.ts) and for engines
-   *  registered by a daemon predating this field (backfilled by the next reprobe — see
+  /** One entry per probed flag, capturing its inferred argument shape. Reserved for a generic
+   *  "Advanced parameters" UI (spec 22) — built, then removed after live testing found it
+   *  overwhelming for a real engine's ~300 probed flags (v1.10.2); no current consumer renders
+   *  this, but it still backs `kvTypes`'s generic derivation. Optional: absent for engine kinds
+   *  that never go through probe.ts's --help scrape (mlx/rapid-mlx/vllm/sglang, which register
+   *  with a hand-written `{ kvTypes: [], flags: [] }` literal — see api/routes.ts) and for
+   *  engines registered by a daemon predating this field (backfilled by the next reprobe — see
    *  registry.ts's isStaleCapabilities). Treat undefined as "nothing to show yet", never an
    *  error. */
   flagInfo?: FlagInfo[]
