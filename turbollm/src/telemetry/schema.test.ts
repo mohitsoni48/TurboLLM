@@ -81,6 +81,28 @@ test('validateEvent: gateway_daily requires harness alongside protocol/volume fi
   assert.match(missingHarness.reason, /harness/)
 })
 
+test('validateEvent: ui_action requires a known screen and action (spec 23 §3.8, Phase 6)', () => {
+  assert.equal(
+    validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'engines', action: 'install_engine' } })).ok,
+    true,
+  )
+  const madeUpAction = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'engines', action: 'delete_everything' } }))
+  assert.equal(madeUpAction.ok, false)
+  assert.match(madeUpAction.reason, /action/)
+
+  const madeUpScreen = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'not-a-real-screen', action: 'install_engine' } }))
+  assert.equal(madeUpScreen.ok, false)
+  assert.match(madeUpScreen.reason, /screen/)
+})
+
+test('validateEvent: ui_daily requires screen plus both volume counters', () => {
+  const r = validateEvent(validEvent({ event: 'ui_daily', payload: { screen: 'engines', actions: 5, distinctActions: 3 } }))
+  assert.equal(r.ok, true, r.ok === false ? r.reason : '')
+
+  const missingCounts = validateEvent(validEvent({ event: 'ui_daily', payload: { screen: 'engines' } }))
+  assert.equal(missingCounts.ok, false)
+})
+
 test('validateEvent: onboarding_step requires a known step and outcome', () => {
   assert.equal(
     validateEvent(validEvent({ event: 'onboarding_step', payload: { step: 'model_download', outcome: 'ok' } })).ok,

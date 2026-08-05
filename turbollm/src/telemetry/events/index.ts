@@ -19,6 +19,7 @@ import { benchResult } from './perf'
 import { chatDaily } from './chat'
 import { gatewayDaily, harnessFirstSeen } from './gateway'
 import { codeDaily } from './code'
+import { uiAction, uiDaily } from './ui'
 
 export const REGISTRY = {
   app_first_run: appFirstRun,
@@ -35,6 +36,8 @@ export const REGISTRY = {
   gateway_daily: gatewayDaily,
   harness_first_seen: harnessFirstSeen,
   code_daily: codeDaily,
+  ui_action: uiAction,
+  ui_daily: uiDaily,
 } as const
 
 export type EventName = keyof typeof REGISTRY
@@ -56,4 +59,6 @@ export {
   gatewayDaily,
   harnessFirstSeen,
   codeDaily,
+  uiAction,
+  uiDaily,
 }

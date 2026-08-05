@@ -17,6 +17,7 @@ import { claimOnce } from './ledger'
 import { telemetryDisabled } from './disabled'
 import { TELEMETRY_SCHEMA_VERSION, REGISTRY, type EventName } from './schema'
 import { recordFeatureUse, flushStaleDailyUsage, persistDailyUsage } from './daily-usage'
+import { recordUiAction, flushStaleUiUsage, persistUiDailyUsage } from './runtime/ui-daily-usage'
 
 /** Just enough of ConfigStore for the emitter — kept structural so tests need
  *  no real config file. */
@@ -180,6 +181,37 @@ export class Emitter {
       this.emit('feature_used_daily', { feature, countBucket: bucket })
     }
     persistDailyUsage(this.o.dataDir)
+  }
+
+  /**
+   * Record one UI click (`ui_action`, spec 23 §3.8) and emit `ui_daily` the
+   * moment its screen's calendar day rolls over — the click-stream analogue of
+   * `useFeature`/`feature_used_daily`. Consent is checked BEFORE any count is
+   * recorded, same reasoning as `useFeature`'s own doc comment: usage while
+   * telemetry is off must never silently contribute to a count reported after
+   * the user opts in later.
+   */
+  uiAction(screen: string, action: string): void {
+    if (!this.canSend('ui_action')) return
+    this.emit('ui_action', { screen, action })
+    const rolled = recordUiAction(this.o.dataDir, screen, action, this.today())
+    if (rolled) this.emit('ui_daily', { screen, actions: rolled.actions, distinctActions: rolled.distinctActions })
+  }
+
+  /**
+   * Roll over any screen whose UI-click tally is from a day earlier than
+   * today, then persist whatever's left (today's still-in-progress counts) to
+   * disk. Called periodically (cli.ts, alongside `flushDailyUsage`) for the
+   * same two reasons: a screen used only on a user's LAST active day still
+   * gets reported, and same-day counts (in-memory only) get a chance to
+   * survive a crash instead of living only until the next rollover.
+   */
+  flushUiDailyUsage(): void {
+    if (!this.canSend('ui_daily')) return
+    for (const { screen, actions, distinctActions } of flushStaleUiUsage(this.o.dataDir, this.today())) {
+      this.emit('ui_daily', { screen, actions, distinctActions })
+    }
+    persistUiDailyUsage(this.o.dataDir)
   }
 
   /**

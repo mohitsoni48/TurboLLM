@@ -107,6 +107,16 @@ function safeJson(text: string): unknown {
   }
 }
 
+// ── Telemetry (spec 23 §3.8) ─────────────────────────────────────────────────
+/** Fire-and-forget UI click tracking. Never awaited by callers and never lets a tracking
+ *  failure surface — a click must always do its real job even if the daemon is unreachable
+ *  or telemetry is off (the daemon-side gate, Emitter.canSend, is the actual consent check;
+ *  this just gets the click there). `screen`/`action` are validated server-side against the
+ *  closed enums (`events/ui.ts`) — an unrecognized value is silently dropped, not thrown. */
+export function track(screen: string, action: string): void {
+  void request('/api/v1/telemetry/ui', { method: 'POST', json: { screen, action } }).catch(() => {})
+}
+
 // ── Status ───────────────────────────────────────────────────────────────────
 export function getStatus(): Promise<Status> {
   return request<Status>('/api/v1/status')

@@ -470,6 +470,9 @@ setInterval(() => void flush(store.dir(), store.snapshot().telemetry.level), 5 *
 // time THAT SAME feature is used, which may never happen again for an install that
 // stops running. Same unref()/best-effort reasoning as the flush interval.
 setInterval(() => telemetry.flushDailyUsage(), 5 * 60_000).unref()
+// ui_daily (spec 23 §3.8): same in-memory-accumulator/periodic-flush shape as
+// feature_used_daily above, just keyed on screen instead of feature.
+setInterval(() => telemetry.flushUiDailyUsage(), 5 * 60_000).unref()
 // chat_daily/gateway_daily/code_daily (spec 23 §3.4-3.6, ADR-333): same rollover
 // reasoning as flushDailyUsage above, but these three are read-only queries over
 // tables that already durably record everything needed (see
