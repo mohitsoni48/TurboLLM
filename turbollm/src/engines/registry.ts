@@ -370,6 +370,14 @@ export class Registry {
    *  NextN/MTP gating has the data it needs without a manual re-probe. */
   async ensureProbed(): Promise<void> {
     for (const e of this.list().engines) {
+      // Only 'llama-server'-kind engines go through probe.ts's --help scrape at all
+      // (mlx/rapid-mlx/vllm/sglang register with a hand-written, permanently-flagInfo-less
+      // capabilities literal — see addMlx/addRapidMlx/addVllm/addSglang in api/routes.ts).
+      // Without this guard, Case 3 below would mark those engines stale on every startup and
+      // reprobe() would run --version/--help against a non-llama-server binary (e.g. a Python
+      // venv interpreter for mlx/vllm), which succeeds and silently overwrites that engine's
+      // version/capabilities with garbage instead of failing loudly.
+      if (e.kind !== 'llama-server') continue
       if (e.version && !isStaleCapabilities(e.capabilities.flags, e.capabilities.flagInfo)) continue
       try {
         await this.reprobe(e.id)
