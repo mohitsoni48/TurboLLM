@@ -2417,21 +2417,65 @@ function telemetryPreview(level: string, version: string) {
   }
   const events: unknown[] = [benchEvent]
   if (level === 'full') {
+    // Representative, not exhaustive (this preview has always been "illustrative only" —
+    // see this function's own history) — but these four are the categories spec 23 §6a's
+    // privacy audit found undisclosed by the OLD wording (interaction-level UI tracking,
+    // connected third-party tool identity, and the resolved load config), so they are the
+    // ones that must appear here, not a token one-of-each across all 16 registered events.
     events.push({
-      schema: 1,
-      event: 'crash_report',
+      schema: TELEMETRY_SCHEMA_VERSION,
+      event: 'error',
       ts: new Date().toISOString(),
       machineId: '00000000-0000-0000-0000-000000000000',
       app: { version, os: sys.os },
-      hw,
-      // Error fingerprint only — exit code + first matching error line, never full logs.
-      payload: { engineExitCode: 1, errorFingerprint: 'CUDA error: out of memory' },
+      // Error fingerprint only — a closed enum member, never the raw message or a log line.
+      payload: { fingerprint: 'cuda_oom' },
+    })
+    events.push({
+      schema: TELEMETRY_SCHEMA_VERSION,
+      event: 'model_load',
+      ts: new Date().toISOString(),
+      machineId: '00000000-0000-0000-0000-000000000000',
+      app: { version, os: sys.os },
+      payload: {
+        outcome: 'ok',
+        trigger: 'manual',
+        model: { name: 'Qwen3.6-35B', quant: 'Q4_K_M', arch: 'qwen3moe', sizeBytes: 21_000_000_000, moe: true, nativeCtx: 262144 },
+        engine: { kind: 'llama-server', isCustom: false },
+        params: {
+          ctx: 32768, ngl: 99, nglFit: true, nCpuMoe: 0, nCpuMoeFit: false, kvTypeK: 'q8_0', kvTypeV: 'q8_0',
+          kvUnified: true, kvOffload: true, flashAttn: 'auto', parallel: 1, threads: 8, threadsBatch: 8,
+          cacheReuse: 256, speculative: 'off', contextOverflow: 'shift', nKeep: 0, ropeScalingType: 'none',
+          useJinja: true, hasGrammar: false, hasExtraArgs: false, multiGpu: false, gpuCount: 1,
+        },
+        fit: { estimatedVramMb: 15800 },
+      },
+    })
+    events.push({
+      schema: TELEMETRY_SCHEMA_VERSION,
+      event: 'harness_first_seen',
+      ts: new Date().toISOString(),
+      machineId: '00000000-0000-0000-0000-000000000000',
+      app: { version, os: sys.os },
+      // Which connected coding tool (e.g. Claude Code, opencode) is talking to the gateway —
+      // never which files, projects, or prompts it sent.
+      payload: { harness: 'claude_code', protocol: 'anthropic' },
+    })
+    events.push({
+      schema: TELEMETRY_SCHEMA_VERSION,
+      event: 'ui_action',
+      ts: new Date().toISOString(),
+      machineId: '00000000-0000-0000-0000-000000000000',
+      app: { version, os: sys.os },
+      // Which screen + button, from a fixed closed enum — never a click's surrounding
+      // content, coordinates, or timing.
+      payload: { screen: 'engines', action: 'install_engine' },
     })
   }
   const note =
     level === 'anon'
       ? 'Anonymized hardware + benchmark speed only. No prompts, paths, identifiers, or keys.'
-      : 'Anonymous benchmarks plus crash/error fingerprints. Still no prompts, paths, or content.'
+      : 'Adds error fingerprints, the resolved config behind a benchmark, which connected coding tool (if any) is talking to the gateway, and which screens/buttons you use. Still no prompts, paths, files, or content.'
   return { level, sends: true, note, payload: events }
 }
 

@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { readQueue } from './queue'
 import { TELEMETRY_ENV } from './disabled'
 import { Emitter } from './emit'
+import { EVENT_NAMES } from './schema'
 
 function tempDir(): string {
   return mkdtempSync(join(tmpdir(), 'turbollm-emit-'))
@@ -60,6 +61,26 @@ test('emit: queues nothing when consent is off', () => {
   }
 })
 
+test('canSend: off is absolutely silent — every registered event, not just the ones with a dedicated off-test (spec 23 §6a mandatory condition)', () => {
+  const dir = tempDir()
+  try {
+    const { emitter } = makeEmitter(dir, 'off')
+    // Iterates EVENT_NAMES (derived from REGISTRY) rather than a hand-picked list, so a
+    // future event added to the registry is covered automatically — the exact kind of
+    // hand-maintained-parallel-list drift this whole redesign exists to eliminate.
+    // consent_choice is the one deliberate exception: its Off ping is sent through a
+    // separate bespoke path (consent.ts) that never calls canSend at all, by design
+    // (it is the one thing an opted-out machine still sends) — canSend rejecting it
+    // here too is consistent, not a gap, since nothing in this product ever routes
+    // consent_choice through Emitter.emit/canSend either way.
+    for (const name of EVENT_NAMES) {
+      assert.equal(emitter.canSend(name), false, `${name} must never be sendable while consent is off`)
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('emit: queues nothing when consent is unset — undecided is not consent', () => {
   const dir = tempDir()
   try {
@@ -79,6 +100,22 @@ test('emit: the kill switch beats stored consent', () => {
     const { emitter } = makeEmitter(dir, 'full')
     emitter.emit('app_first_run')
     assert.deepEqual(names(dir), [])
+  } finally {
+    if (prev === undefined) delete process.env[TELEMETRY_ENV]
+    else process.env[TELEMETRY_ENV] = prev
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('canSend: --no-telemetry / TURBOLLM_TELEMETRY=off is a hard kill switch for every registered event, even at full consent (spec 23 SS6a)', () => {
+  const dir = tempDir()
+  const prev = process.env[TELEMETRY_ENV]
+  process.env[TELEMETRY_ENV] = 'off'
+  try {
+    const { emitter } = makeEmitter(dir, 'full')
+    for (const name of EVENT_NAMES) {
+      assert.equal(emitter.canSend(name), false, `${name} must never be sendable under the kill switch, even at full consent`)
+    }
   } finally {
     if (prev === undefined) delete process.env[TELEMETRY_ENV]
     else process.env[TELEMETRY_ENV] = prev

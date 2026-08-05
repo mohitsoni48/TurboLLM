@@ -89,6 +89,24 @@ test('POST /api/v1/telemetry/regenerate-id: replaces the machine id', async () =
   }
 })
 
+test('GET /api/v1/telemetry/preview?level=full: renders the categories spec 23 §6a found undisclosed (interaction tracking, connected-tool identity, resolved load config)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'turbollm-routes-'))
+  try {
+    const { app } = fakeApp(dir, { level: 'full', machineId: '11111111-1111-1111-1111-111111111111' })
+    const res = await app.request('/api/v1/telemetry/preview?level=full')
+    const bodyJson = (await res.json()) as { note: string; payload: Array<{ event: string }> }
+
+    const names = bodyJson.payload.map((e) => e.event)
+    assert.ok(names.includes('error'), 'the old "crash_report" name never existed as a real event')
+    assert.ok(names.includes('model_load'), 'the resolved config behind a benchmark must be shown')
+    assert.ok(names.includes('harness_first_seen'), 'connected coding-tool identity must be shown')
+    assert.ok(names.includes('ui_action'), 'interaction-level click tracking must be shown')
+    assert.doesNotMatch(bodyJson.note, /crash\/error fingerprints\. Still no prompts, paths, or content\.$/, 'the note text must mention the new categories too, not just the old two')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 // ── POST /api/v1/telemetry/ui (spec 23 §3.8, Phase 6) ───────────────────────
 
 test('POST /api/v1/telemetry/ui: a valid screen/action reaches the queue as ui_action, and always 202s', async () => {
