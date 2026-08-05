@@ -148,16 +148,53 @@ test('classifyFlag: a flag absent from the help text at all degrades to "valued"
 
 // ---- classifyFlag: C1/C2/I3 regression fixtures (final-review findings) -------------------
 
+// The enum-bearing block must come AFTER the flag under test: classifyFlag only ever scans
+// FORWARD from its own match, so the earlier shape of this fixture (enum block first) could not
+// reproduce the bleed-forward bug at all and passed against the pre-fix code too.
 test('classifyFlag: a flag whose block boundary is a FLUSH-LEFT (column 0) next flag, not indented', () => {
   const help =
-    `--cache-type-k TYPE\n` +
-    `                                        allowed values: f32, f16, bf16\n` +
-    `                                        (default: f16)\n` +
     `--no-host\n` +
-    `                                        disable host header validation\n`
+    `--cache-type-k TYPE\n` +
+    `                                        allowed values: f32, f16, bf16, turbo4\n` +
+    `                                        (default: f16)\n`
   const info = classifyFlag('--no-host', help)
   assert.equal(info.kind, 'boolean')
   assert.equal(info.enumValues, undefined)
+})
+
+test('classifyFlag: a next-flag line indented past 8 columns still terminates the PRECEDING flag\'s block (ik_llama.cpp indents 176 real flag lines at column 9)', () => {
+  const help =
+    `--no-host\n` +
+    `         --cache-type-k TYPE\n` +
+    `                                        allowed values: f32, f16, bf16, turbo4\n`
+  const info = classifyFlag('--no-host', help)
+  assert.equal(info.kind, 'boolean')
+  assert.equal(info.enumValues, undefined)
+})
+
+test('classifyFlag: a multi-alias comma list on one line resolves the REAL trailing placeholder, not "boolean" from the comma after the first alias', () => {
+  const help = `-n,    --predict, --n-predict N        number of tokens to predict (default: -1, -1 = infinity)\n`
+  assert.deepEqual(classifyFlag('--predict', help), { name: '--predict', kind: 'valued' })
+  assert.deepEqual(classifyFlag('--n-predict', help), { name: '--n-predict', kind: 'valued' })
+})
+
+test('classifyFlag: a flag that is a literal PREFIX of an earlier, unrelated sibling flag is not classified from the sibling\'s text', () => {
+  // Real llama.cpp --help is grouped by section, not sorted, so --chat-template-kwargs really
+  // does print before --chat-template.
+  const help =
+    `--chat-template-kwargs STRING          sets additional params for the json template parser\n` +
+    `--chat-template JINJA_TEMPLATE         set custom jinja chat template\n`
+  assert.equal(classifyFlag('--chat-template', help).kind, 'valued')
+})
+
+test('classifyFlag: a flag named inside ANOTHER flag\'s description prose is not mistaken for its own definition', () => {
+  // Real ik_llama.cpp: --in-prefix-bos's description quotes `--in-prefix`, and that mention
+  // appears BEFORE the real --in-prefix definition line.
+  const help =
+    `         --in-prefix-bos          prefix BOS to user inputs, preceding the \`--in-prefix\` string\n` +
+    `         --in-prefix STRING       string to prefix user inputs with (default: empty)\n` +
+    `         --in-suffix STRING       string to suffix after user inputs with (default: empty)\n`
+  assert.equal(classifyFlag('--in-prefix', help).kind, 'valued')
 })
 
 test('classifyFlag: a bracket enum written directly after the flag, no "allowed values:" label', () => {

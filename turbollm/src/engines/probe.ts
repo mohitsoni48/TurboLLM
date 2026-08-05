@@ -221,16 +221,40 @@ export function parseEnumList(blockText: string): string[] {
  *  probe. */
 export function classifyFlag(flagName: string, helpText: string): FlagInfo {
   const escaped = flagName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  // Boundary widened (C1): a next-flag line can start at ANY indent 0-8 (real llama.cpp prints
-  // many flags flush-left at column 0, not just indented) — was previously indent-only, which let
-  // one flag's enum block bleed into the next flag's classification.
   // Gap-width discrimination (C2): llama.cpp separates a flag from its placeholder by exactly one
   // space, and jumps straight into the description column with 2+ spaces when there's no
   // placeholder at all — that gap width is a much more reliable "does this flag take a value"
   // signal than the placeholder's letter case (real placeholders are often lowercase/symbolic:
   // `<0...100>`, `lo-hi`, `{pca,mean}`). `( *)` (zero-or-more, not one-or-more) so a bare flag at
   // true end-of-line with zero trailing spaces still matches instead of falling through to `!m`.
-  const re = new RegExp(`${escaped}( *)(\\S+)?([\\s\\S]{0,400}?)(?=\\n\\s*\\(default|\\n {0,8}-{1,2}[a-zA-Z]|\\n\\n|$)`, 'i')
+  //
+  // The match is anchored to the start of a flag-DEFINITION line — `(?:^|\n)[ \t]*` plus an
+  // optional run of comma-separated leading aliases — rather than to any occurrence of the flag
+  // name. Three real-output failures make that anchoring load-bearing:
+  //   N1: llama.cpp documents multi-alias flags on one line ("-n,    --predict, --n-predict N").
+  //       The trailing `(?:[ \t]*,[ \t]*ALIAS)*` run consumes the *remaining* aliases so the
+  //       gap/placeholder capture lands on the real trailing placeholder, instead of reading the
+  //       comma right after `--predict` as "nothing follows, must be boolean".
+  //   N2: `(?![-a-zA-Z0-9])` stops the name matching as a literal PREFIX of a longer sibling
+  //       (`--chat-template` inside `--chat-template-kwargs`). Real --help is grouped by section,
+  //       not sorted, so the longer sibling can appear FIRST and leftmost-match-wins would
+  //       otherwise derive the wrong flag's classification.
+  //   prose: a flag is also named inside other flags' description text (ik_llama documents
+  //       `--in-prefix-bos` as "preceding the `--in-prefix` string"). A bare negative lookahead
+  //       does NOT exclude that — a backtick/quote/period passes it — so without the line anchor
+  //       the classifier reads a prose mention as the definition and calls a valued flag boolean.
+  // The block-boundary's next-flag indent is unbounded (`[ \t]*`, not a 0-8 space cap) because
+  // real forks indent flag lines further than 8 columns — ik_llama.cpp has 176 lines at column 9
+  // (N3), and an uncapped indent is still safe: description/prose continuation lines don't start
+  // with `-{1,2}[a-zA-Z]` at any indent.
+  const ALIAS = '-{1,2}[a-zA-Z][a-zA-Z0-9-]*'
+  const re = new RegExp(
+    `(?:^|\\n)[ \\t]*(?:${ALIAS}[ \\t]*,[ \\t]*)*` +
+      `${escaped}(?![-a-zA-Z0-9])(?:[ \\t]*,[ \\t]*${ALIAS})*` +
+      `( *)(\\S+)?([\\s\\S]{0,400}?)` +
+      `(?=\\n\\s*\\(default|\\n[ \\t]*${ALIAS}|\\n\\n|$)`,
+    'i',
+  )
   const m = re.exec(helpText)
   if (!m) return { name: flagName, kind: 'valued' }
   const gap = m[1] ?? ''
