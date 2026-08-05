@@ -471,7 +471,7 @@ const ALL: CatalogEngine[] = [
     platforms: ['win32', 'darwin', 'linux'],
     support: 'experimental',
     installEndpoint: '',
-    note: "Upstream publishes prebuilt binaries, but TurboLLM builds from source here. The KVarN cache types (kvarn2...kvarn8, set via --cache-type-k/-v) aren't in the auto-tune sweep yet — use the custom/raw flags field to set them manually.",
+    note: "Upstream publishes prebuilt binaries, but TurboLLM builds from source here. The KVarN cache types (kvarn2...kvarn8, set via --cache-type-k/-v) show up directly in the KV cache type dropdown, but aren't in the auto-tune sweep yet — pick one manually.",
     variants: [
       {
         id: 'beellama-source',

@@ -204,10 +204,17 @@ export type ComfyRuntime = {
   currentVersion: number
 }
 
+export type FlagInfo = {
+  name: string
+  kind: 'enum' | 'boolean' | 'valued'
+  enumValues?: string[]
+}
+
 /** A registered engine (GET /api/v1/engines, config §3 shape). */
 export type EngineCapabilities = {
   kvTypes: string[]
   flags: string[]
+  flagInfo?: FlagInfo[]
 }
 
 export type Engine = {

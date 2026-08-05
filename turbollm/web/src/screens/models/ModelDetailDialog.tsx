@@ -560,7 +560,7 @@ export function ModelDetailDialog({
               <>
                 <SectionTitle>Custom flags</SectionTitle>
                 <Section>
-                  <Row label="Extra command-line flags" hint="Appended to the launch command last, so they can override anything above. e.g. --something value">
+                  <Row label="Extra command-line flags" hint="Appended to the launch command last, so they can override anything above. Add the flag and its value as two separate entries — e.g. type --something, press Enter, type value, press Enter.">
                     <div className="w-full" />
                   </Row>
                   <ChipListInput

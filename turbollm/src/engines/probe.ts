@@ -3,10 +3,11 @@
 import { execFile } from 'node:child_process'
 import { closeSync, existsSync, openSync, readSync, statSync } from 'node:fs'
 import { dirname } from 'node:path'
+import type { FlagInfo } from '../config/config'
 
 export interface ProbeResult {
   version: string
-  capabilities: { kvTypes: string[]; flags: string[] }
+  capabilities: { kvTypes: string[]; flags: string[]; flagInfo: FlagInfo[] }
 }
 
 export class ProbeError extends Error {
@@ -100,6 +101,7 @@ export async function probe(bin: string): Promise<ProbeResult> {
 
   const flags = extractFlags(h.out)
   const kvTypes = detectKvTypes(h.out, flags.includes('--cache-type-k'))
+  const flagInfo = flags.map((f) => classifyFlag(f, h.out))
 
   // Capture the accepted `--spec-type` enum values (e.g. `none,draft-mtp,nextn`)
   // as `spec-type:<value>` pseudo-flags. The enum differs by engine — official
@@ -118,7 +120,7 @@ export async function probe(bin: string): Promise<ProbeResult> {
     }
   }
 
-  return { version, capabilities: { kvTypes, flags: [...new Set(flags)].sort() } }
+  return { version, capabilities: { kvTypes, flags: [...new Set(flags)].sort(), flagInfo } }
 }
 
 type BinFormat = 'pe' | 'elf' | 'macho' | 'unknown'
@@ -182,11 +184,92 @@ export function extractFlags(helpText: string): string[] {
  *  turbo2, turbo3, turbo4") and ik_llama.cpp's (no such list near --cache-type-k at all). */
 export function detectKvTypes(helpText: string, hasCacheTypeFlag: boolean): string[] {
   const kvTypes = hasCacheTypeFlag ? [...KNOWN_KV] : ['f16']
-  const kvFlagBlock = /--cache-type-k\s+\S+\b([\s\S]{0,400}?)(?=\n\s*\(default|\n\s{2,}-[a-zA-Z]|\n\n|$)/i.exec(helpText)
-  if (kvFlagBlock) {
-    for (const t of ['turbo2', 'turbo3', 'turbo4']) if (kvFlagBlock[1].includes(t) && !kvTypes.includes(t)) kvTypes.push(t)
+  const cacheTypeK = classifyFlag('--cache-type-k', helpText)
+  if (cacheTypeK.kind === 'enum') {
+    for (const extra of cacheTypeK.enumValues ?? []) if (!kvTypes.includes(extra)) kvTypes.push(extra)
   }
   return kvTypes
+}
+
+/** Parses a comma/pipe-separated list of accepted values out of a flag's own help block.
+ *  Tries llama.cpp's own convention first ("allowed values: a, b, c", which may wrap onto a
+ *  continuation line — see the KV-cache fixtures in probe.test.ts), then falls back to a
+ *  bracket/pipe group (some forks print `[none|draft-mtp|nextn]` instead). Requires 2+ clean
+ *  alphanumeric tokens to count as a real enum — a single bracketed word (e.g. "[beta]") is
+ *  prose, not a value list, and would otherwise false-positive. Returns [] when nothing
+ *  matches; NEVER guesses beyond what's actually printed. */
+export function parseEnumList(blockText: string): string[] {
+  const labeled = /allowed values:\s*([\s\S]+)/i.exec(blockText)
+  const bracketed = /\[([^\]\n]+)\]/.exec(blockText)
+  const raw = labeled?.[1] ?? bracketed?.[1]
+  if (!raw) return []
+  const values = raw
+    .split(/[,|]/)
+    .map((s) => s.trim())
+    .filter((s) => /^[a-z][a-z0-9_-]*$/i.test(s))
+  return values.length >= 2 ? values : []
+}
+
+/** Classifies a probed flag's argument shape from its own --help block: 'enum' (a detected
+ *  value list — drives a dropdown), 'boolean' (no argument — drives a checkbox), or 'valued'
+ *  (takes an argument but no enum was found — drives a free-text input). Reuses the exact
+ *  block-scoping boundary already proven in detectKvTypes (stop at the next flag line, a
+ *  "(default" continuation, or a blank line) so a sibling flag's text — e.g.
+ *  --cache-type-k-draft leaking into --cache-type-k — can't cross-contaminate. Best-effort by
+ *  design (spec 22 §4): --help formatting is inconsistent across forks, so anything ambiguous
+ *  or unparseable degrades to 'valued' — the safe default that never hides a flag or blocks a
+ *  probe. */
+export function classifyFlag(flagName: string, helpText: string): FlagInfo {
+  const escaped = flagName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  // Gap-width discrimination (C2): llama.cpp separates a flag from its placeholder by exactly one
+  // space, and jumps straight into the description column with 2+ spaces when there's no
+  // placeholder at all — that gap width is a much more reliable "does this flag take a value"
+  // signal than the placeholder's letter case (real placeholders are often lowercase/symbolic:
+  // `<0...100>`, `lo-hi`, `{pca,mean}`). `( *)` (zero-or-more, not one-or-more) so a bare flag at
+  // true end-of-line with zero trailing spaces still matches instead of falling through to `!m`.
+  //
+  // The match is anchored to the start of a flag-DEFINITION line — `(?:^|\n)[ \t]*` plus an
+  // optional run of comma-separated leading aliases — rather than to any occurrence of the flag
+  // name. Three real-output failures make that anchoring load-bearing:
+  //   N1: llama.cpp documents multi-alias flags on one line ("-n,    --predict, --n-predict N").
+  //       The trailing `(?:[ \t]*,[ \t]*ALIAS)*` run consumes the *remaining* aliases so the
+  //       gap/placeholder capture lands on the real trailing placeholder, instead of reading the
+  //       comma right after `--predict` as "nothing follows, must be boolean".
+  //   N2: `(?![-a-zA-Z0-9])` stops the name matching as a literal PREFIX of a longer sibling
+  //       (`--chat-template` inside `--chat-template-kwargs`). Real --help is grouped by section,
+  //       not sorted, so the longer sibling can appear FIRST and leftmost-match-wins would
+  //       otherwise derive the wrong flag's classification.
+  //   prose: a flag is also named inside other flags' description text (ik_llama documents
+  //       `--in-prefix-bos` as "preceding the `--in-prefix` string"). A bare negative lookahead
+  //       does NOT exclude that — a backtick/quote/period passes it — so without the line anchor
+  //       the classifier reads a prose mention as the definition and calls a valued flag boolean.
+  // The block-boundary's next-flag indent is unbounded (`[ \t]*`, not a 0-8 space cap) because
+  // real forks indent flag lines further than 8 columns — ik_llama.cpp has 176 lines at column 9
+  // (N3), and an uncapped indent is still safe: description/prose continuation lines don't start
+  // with `-{1,2}[a-zA-Z]` at any indent.
+  const ALIAS = '-{1,2}[a-zA-Z][a-zA-Z0-9-]*'
+  const re = new RegExp(
+    `(?:^|\\n)[ \\t]*(?:${ALIAS}[ \\t]*,[ \\t]*)*` +
+      `${escaped}(?![-a-zA-Z0-9])(?:[ \\t]*,[ \\t]*${ALIAS})*` +
+      `( *)(\\S+)?([\\s\\S]{0,400}?)` +
+      `(?=\\n\\s*\\(default|\\n[ \\t]*${ALIAS}|\\n\\n|$)`,
+    'i',
+  )
+  const m = re.exec(helpText)
+  if (!m) return { name: flagName, kind: 'valued' }
+  const gap = m[1] ?? ''
+  const placeholder = m[2] ?? ''
+  const block = m[3] ?? ''
+  // I3: feed the placeholder token into the enum search too, not just the block — a bracket enum
+  // written directly after the flag (e.g. `--spec-type [none|draft|nextn]  ...`) lands entirely
+  // inside `placeholder` (no internal whitespace for `\S+` to stop at), not `block`.
+  const enumValues = parseEnumList(placeholder + '\n' + block)
+  if (enumValues.length > 0) return { name: flagName, kind: 'enum', enumValues }
+  // gap !== 1 (either 0 — bare flag, nothing follows at all — or 2+ — straight into prose, no
+  // placeholder) or no placeholder captured at all → boolean. Only a single-space gap followed by
+  // a real placeholder token is a value-taking flag with no detected enum.
+  if (gap.length !== 1 || !placeholder) return { name: flagName, kind: 'boolean' }
+  return { name: flagName, kind: 'valued' }
 }
 
 function firstNonEmptyLine(s: string): string {

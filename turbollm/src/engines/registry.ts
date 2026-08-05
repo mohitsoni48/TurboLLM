@@ -2,7 +2,7 @@
 // enforced by the API layer using the Manager's live state.
 import { existsSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
-import { ConfigStore, CustomEngineSource, Engine, UpdatePolicy, ValueError, findEngine } from '../config/config'
+import { ConfigStore, CustomEngineSource, Engine, FlagInfo, UpdatePolicy, ValueError, findEngine } from '../config/config'
 import { probe } from './probe'
 import { normRepoUrl } from './build-runner'
 
@@ -370,7 +370,15 @@ export class Registry {
    *  NextN/MTP gating has the data it needs without a manual re-probe. */
   async ensureProbed(): Promise<void> {
     for (const e of this.list().engines) {
-      if (e.version && !isStaleCapabilities(e.capabilities.flags)) continue
+      // Only 'llama-server'-kind engines go through probe.ts's --help scrape at all
+      // (mlx/rapid-mlx/vllm/sglang register with a hand-written, permanently-flagInfo-less
+      // capabilities literal — see addMlx/addRapidMlx/addVllm/addSglang in api/routes.ts).
+      // Without this guard, Case 3 below would mark those engines stale on every startup and
+      // reprobe() would run --version/--help against a non-llama-server binary (e.g. a Python
+      // venv interpreter for mlx/vllm), which succeeds and silently overwrites that engine's
+      // version/capabilities with garbage instead of failing loudly.
+      if (e.kind !== 'llama-server') continue
+      if (e.version && !isStaleCapabilities(e.capabilities.flags, e.capabilities.flagInfo)) continue
       try {
         await this.reprobe(e.id)
       } catch {
@@ -397,7 +405,7 @@ export function customSourceKey(s: { sourceRepo?: string; sourceBranch?: string;
  *  "re-probe" by hand. Checked at every startup (ensureProbed) so the fix in probe.ts
  *  actually reaches engines that were added before it existed — installing a new
  *  TurboLLM build alone does NOT retroactively fix already-cached capability data. */
-export function isStaleCapabilities(flags: string[]): boolean {
+export function isStaleCapabilities(flags: string[], flagInfo: FlagInfo[] | undefined): boolean {
   // Case 1 (pre-existing): `--spec-type` was captured but its accepted enum values
   // (`spec-type:<value>`) weren't — an older probe that predates that extraction.
   if (flags.includes('--spec-type') && !flags.some((f) => f.startsWith('spec-type:'))) return true
@@ -410,5 +418,12 @@ export function isStaleCapabilities(flags: string[]): boolean {
   // an idempotent no-op here (the flags stay present either way), so this is safe
   // to check unconditionally.
   if (['--draft-max', '--draft-min', '--draft', '--draft-n', '--draft-n-min'].some((f) => flags.includes(f))) return true
+  // Case 3 (spec 22, ADR-328): a probe from before `flagInfo` existed carries no
+  // structured per-flag metadata at all — reprobe once to backfill it, so the generic
+  // KV-type detection (kvTypes) reaches already-registered engines without a manual
+  // re-add. (flagInfo itself is reserved for the Advanced Parameters UI, not currently
+  // rendered — see config.ts's Capabilities.flagInfo doc comment.) `[]` (probed the new
+  // way, nothing extra to report) is NOT stale; only `undefined` (never probed) is.
+  if (flagInfo === undefined) return true
   return false
 }
