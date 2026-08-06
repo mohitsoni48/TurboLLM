@@ -234,6 +234,18 @@ test('validateEvent: ui_action accepts the Phase 6k ModelDetailDialog batch acti
   }
 })
 
+test('validateEvent: ui_action accepts the Phase 6l BuildGuideDialog batch actions', () => {
+  const actions = [
+    'remove_build_search_dir', 'add_build_search_dir', 'recheck_build_prereqs',
+    'copy_build_commands', 'close_build_guide', 'open_manual_build_handoff', 'start_engine_build',
+    'dismiss_build_success', 'cancel_engine_build', 'download_cuda_toolkit',
+  ]
+  for (const action of actions) {
+    const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'engines', action } }))
+    assert.equal(r.ok, true, r.ok === false ? `engines/${action}: ${r.reason}` : '')
+  }
+})
+
 test('validateEvent: ui_daily requires screen plus both volume counters', () => {
   const r = validateEvent(validEvent({ event: 'ui_daily', payload: { screen: 'engines', actions: 5, distinctActions: 3 } }))
   assert.equal(r.ok, true, r.ok === false ? r.reason : '')

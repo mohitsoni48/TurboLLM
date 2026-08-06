@@ -172,7 +172,13 @@ export const SCREENS = [
  *  `onValueChange`, so they never matched the grep selector at all — a real, larger blind spot
  *  than the usual overcounting the batch-2 note describes, left as-is for the same reason: the
  *  raw counts are directional estimates, not a coverage guarantee, and going beyond what the
- *  selector catches is out of scope for a per-file batch. */
+ *  selector catches is out of scope for a per-file batch.
+ *
+ *  Batch 12 (Phase 6l): `screens/engines/BuildGuideDialog.tsx` — 10 raw matches, 10 new
+ *  distinct actions, no skips. `dismiss_build_success` (the post-build "Done" button on the
+ *  celebratory success screen) is kept separate from `close_build_guide` (the dialog's plain
+ *  "Close") — one confirms a completed build was seen, the other abandons the dialog with no
+ *  build having happened, a real difference worth keeping visible. */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -222,6 +228,10 @@ export const UI_ACTIONS = [
   'save_model_settings', 'reset_model_settings', 'dismiss_autotune_result', 'save_autotune_result',
   'cancel_autotune', 'start_autotune', 'reset_model_setting_field', 'set_model_setting_option',
   'remove_model_setting_chip',
+
+  'remove_build_search_dir', 'add_build_search_dir', 'recheck_build_prereqs',
+  'copy_build_commands', 'close_build_guide', 'open_manual_build_handoff', 'start_engine_build',
+  'dismiss_build_success', 'cancel_engine_build', 'download_cuda_toolkit',
 ] as const
 
 export const uiAction = defineEvent({
