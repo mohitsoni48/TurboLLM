@@ -11,6 +11,7 @@ import {
   X,
   XCircle,
 } from 'lucide-react'
+import { track } from '../../lib/api'
 import { useBuild, useBuildPrereqs, useSettings, useStatus, useSysInfo } from '../../lib/queries'
 import type { BuildPrereqTool, EngineBuild } from '../../lib/types'
 import { Button } from '../../components/ui/button'
@@ -305,7 +306,7 @@ export function BuildGuideDialog({
                     />
                     <button
                       type="button"
-                      onClick={() => setDraftDirs(dirs.filter((_, j) => j !== i))}
+                      onClick={() => { track('engines', 'remove_build_search_dir'); setDraftDirs(dirs.filter((_, j) => j !== i)) }}
                       className="shrink-0 rounded-md p-1 text-faint hover:text-ink"
                       aria-label="Remove folder"
                     >
@@ -316,14 +317,14 @@ export function BuildGuideDialog({
                 <div className="flex items-center justify-between">
                   <button
                     type="button"
-                    onClick={() => setDraftDirs([...dirs, ''])}
+                    onClick={() => { track('engines', 'add_build_search_dir'); setDraftDirs([...dirs, '']) }}
                     className="inline-flex items-center gap-1 text-[12px] text-muted hover:text-ink"
                   >
                     <Plus size={13} /> Add folder
                   </button>
                   <button
                     type="button"
-                    onClick={() => void recheck()}
+                    onClick={() => { track('engines', 'recheck_build_prereqs'); void recheck() }}
                     disabled={settings.save.isPending || prereqsQ.isFetching}
                     className="inline-flex items-center gap-1 text-[12px] text-accent hover:underline disabled:opacity-50"
                   >
@@ -361,7 +362,7 @@ export function BuildGuideDialog({
                   </p>
                   <button
                     type="button"
-                    onClick={copy}
+                    onClick={() => { track('engines', 'copy_build_commands'); copy() }}
                     className="inline-flex items-center gap-1 text-[12px] text-muted hover:text-ink"
                   >
                     {copied ? <CheckCircle2 size={13} style={{ color: 'var(--ok)' }} /> : <Copy size={13} />}
@@ -377,15 +378,15 @@ export function BuildGuideDialog({
         )}
 
         <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
+          <Button variant="outline" onClick={() => { track('engines', 'close_build_guide'); onOpenChange(false) }}>
             Close
           </Button>
           {supported !== false && (
             <>
-              <Button variant="outline" onClick={() => setAddOpen(true)} disabled={prereqsQ.isLoading || buildActive}>
+              <Button variant="outline" onClick={() => { track('engines', 'open_manual_build_handoff'); setAddOpen(true) }} disabled={prereqsQ.isLoading || buildActive}>
                 I&apos;ve built it
               </Button>
-              <Button onClick={startBuild} disabled={!canBuild}>
+              <Button onClick={() => { track('engines', 'start_engine_build'); startBuild() }} disabled={!canBuild}>
                 <Hammer size={15} className="mr-1.5" />
                 {buildActive ? 'Building…' : actionLabel}
               </Button>
@@ -455,7 +456,7 @@ function BuildProgress({
             {build.log.join('\n')}
           </pre>
         </details>
-        <Button onClick={onClose} className="mt-1">Done</Button>
+        <Button onClick={() => { track('engines', 'dismiss_build_success'); onClose() }} className="mt-1">Done</Button>
       </div>
     )
   }
@@ -472,7 +473,7 @@ function BuildProgress({
         )}
         <span className="text-ink">{PHASE_LABEL[build.phase]}</span>
         {build.active && (
-          <button type="button" onClick={onCancel} className="ml-auto text-[12px] text-faint hover:text-ink">
+          <button type="button" onClick={() => { track('engines', 'cancel_engine_build'); onCancel() }} className="ml-auto text-[12px] text-faint hover:text-ink">
             Cancel
           </button>
         )}
@@ -507,7 +508,7 @@ function PrereqRow({ tool, onDownload }: { tool: BuildPrereqTool; onDownload?: (
           {onDownload && (
             <button
               type="button"
-              onClick={onDownload}
+              onClick={() => { track('engines', 'download_cuda_toolkit'); onDownload() }}
               className="inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[12px] font-medium transition-colors hover:opacity-80"
               style={{ background: 'color-mix(in srgb, var(--accent) 15%, transparent)', color: 'var(--accent)' }}
             >
