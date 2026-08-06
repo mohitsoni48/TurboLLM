@@ -5,7 +5,7 @@ import { Button } from '../../components/ui/button'
 import { toast } from '../../components/ui/sonner'
 import { cn } from '../../lib/utils'
 import { useCodeSessionCompareUrl, useCodeSessionGitStatus, useCommitCodeSessionGit, usePushCodeSessionGit } from '../../lib/code-queries'
-import { ApiError } from '../../lib/api'
+import { ApiError, track } from '../../lib/api'
 import type { PushGitReason, PushGitResult } from '../../lib/code-types'
 
 /** Every rejection reason `pushGitBranch` (git-actions.ts) can return, mapped to a clear,
@@ -68,6 +68,7 @@ export function CodeGitDialog({
   const allSelected = deselected.size === 0
 
   const handleCommit = () => {
+    track('code', 'commit_code_git')
     const trimmed = message.trim()
     if (!trimmed) { toast.error('A commit message is required.'); return }
     const filesArg = allSelected ? undefined : files.map((f) => f.path).filter((p) => !deselected.has(p))
@@ -85,6 +86,7 @@ export function CodeGitDialog({
   }
 
   const handlePush = () => {
+    track('code', 'push_code_git')
     setPushResult(null)
     pushMut.mutate(sessionId, {
       onSuccess: (r) => {
@@ -217,7 +219,7 @@ export function CodeGitDialog({
         )}
 
         <DialogFooter>
-          <Button variant="ghost" size="sm" onClick={() => onOpenChange(false)}>Close</Button>
+          <Button variant="ghost" size="sm" onClick={() => { track('code', 'close_code_git_dialog'); onOpenChange(false) }}>Close</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
