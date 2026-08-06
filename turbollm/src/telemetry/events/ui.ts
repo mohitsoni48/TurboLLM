@@ -345,7 +345,17 @@ export const SCREENS = [
  *  ...draft, workspacePath: p })`), not skipped, because THIS is the caller-level call site
  *  that Batch 19's `FsBrowser.tsx` itself deliberately left untracked (its shared `choose()`
  *  relays into whichever caller supplies `onSelect` — tracking belongs at the caller, exactly
- *  like every other `FsBrowser` embedding this session). */
+ *  like every other `FsBrowser` embedding this session).
+ *
+ *  Batch 29 (Phase 6cc): `screens/models/ModelDirs.tsx` — 3 raw matches, ZERO new actions.
+ *  This is the OLD paste-an-absolute-path panel embedded in `SettingsScreen.tsx`;
+ *  `ModelsScreen.tsx`'s own `ModelFoldersDialog` (its doc comment: "replacing the old
+ *  paste-an-absolute-path panel that sat above the model list") is a newer, dialog-based
+ *  second UI over the exact same three mutations (`setPrimaryDir`/`removeDir`/`addDir`) —
+ *  same "second UI, same real objects" pattern as Batch 18's `ManagedEngines.tsx`. All three
+ *  reuse Batch 3's `set_primary_model_dir`/`remove_model_dir`/`add_model_dir`, tagged `models`
+ *  (this file's own directory identity, same reasoning as Batch 22/28's `routines` tag) rather
+ *  than `settings` (the screen it happens to be embedded in here). */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
