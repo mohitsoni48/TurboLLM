@@ -3,7 +3,7 @@ import { respondToolApproval } from '../../lib/chat-api'
 import { describeToolCall, friendlyName } from '../../lib/tool-explain'
 import { Button } from '../../components/ui/button'
 import { toast } from '../../components/ui/sonner'
-import { ApiError } from '../../lib/api'
+import { ApiError, track } from '../../lib/api'
 import type { LiveToolCall } from '../../lib/chat-types'
 
 type Decision = 'allow' | 'deny' | 'allow_chat' | 'always_allow'
@@ -53,16 +53,16 @@ export function ToolApprovalBar({
       </div>
       <p className="mt-0.5 text-[12px] text-muted">{describeToolCall(pending.name, pending.args)}</p>
       <div className="mt-2 flex flex-wrap gap-1.5">
-        <Button size="sm" variant="outline" disabled={submitting} onClick={() => void respond('deny')}>
+        <Button size="sm" variant="outline" disabled={submitting} onClick={() => { track('chat', 'deny_tool_call'); void respond('deny') }}>
           Deny
         </Button>
-        <Button size="sm" disabled={submitting} onClick={() => void respond('allow')}>
+        <Button size="sm" disabled={submitting} onClick={() => { track('chat', 'allow_tool_call'); void respond('allow') }}>
           Allow
         </Button>
-        <Button size="sm" variant="outline" disabled={submitting} onClick={() => void respond('allow_chat')}>
+        <Button size="sm" variant="outline" disabled={submitting} onClick={() => { track('chat', 'allow_tool_call_for_chat'); void respond('allow_chat') }}>
           Allow for this chat
         </Button>
-        <Button size="sm" variant="outline" disabled={submitting} onClick={() => void respond('always_allow')}>
+        <Button size="sm" variant="outline" disabled={submitting} onClick={() => { track('chat', 'always_allow_tool_call'); void respond('always_allow') }}>
           Always Allow
         </Button>
       </div>
