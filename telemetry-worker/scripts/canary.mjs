@@ -73,6 +73,16 @@ const events = [
       result: { tps: 1, ttftMs: 1, vramMb: 1, outcome: 'ok' },
     },
   }),
+  envelope('chat_daily', {
+    payload: {
+      conversations: 1, messages: 1, maxMessagesInConversation: 1, medianMessagesInConversation: 1,
+      distinctModels: 1, toolCalls: 0, regenerates: 0, stops: 0,
+    },
+  }),
+  envelope('gateway_daily', {
+    payload: { harness: 'unknown', protocol: 'anthropic', requests: 1, promptTokens: 1, genTokens: 1, distinctModels: 1 },
+  }),
+  envelope('code_daily', { payload: { sessions: 1, turns: 1, toolCalls: 0 } }),
 ]
 
 // `--file` sidesteps shell-quoting but ALSO changes what wrangler returns —

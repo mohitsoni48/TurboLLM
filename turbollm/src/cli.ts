@@ -50,6 +50,7 @@ import { claimOnce } from './telemetry/ledger'
 import { flush } from './telemetry/uploader'
 import { emit } from './telemetry/runtime/typed-emit'
 import { modelLoad, buildModelLoadConfig } from './telemetry/events/model'
+import { checkDailyQueryRollups } from './telemetry/runtime/daily-query-rollups'
 
 // Stop child processes (the agent engine's shell tool, engine binaries, git,
 // etc.) from flashing a console window on Windows when the daemon has no console
@@ -469,6 +470,12 @@ setInterval(() => void flush(store.dir(), store.snapshot().telemetry.level), 5 *
 // time THAT SAME feature is used, which may never happen again for an install that
 // stops running. Same unref()/best-effort reasoning as the flush interval.
 setInterval(() => telemetry.flushDailyUsage(), 5 * 60_000).unref()
+// chat_daily/gateway_daily/code_daily (spec 23 §3.4-3.6, ADR-333): same rollover
+// reasoning as flushDailyUsage above, but these three are read-only queries over
+// tables that already durably record everything needed (see
+// daily-query-rollups.ts) rather than an in-memory accumulator, so there is no
+// separate "persist what's in progress" call to also wire here.
+setInterval(() => checkDailyQueryRollups(store.dir(), db, telemetry), 5 * 60_000).unref()
 // Cloud Launch (ADR-045/152): only wired when --tunnel is passed. Its mere presence
 // on Deps is what forces auth enforcement on tunneled traffic (see auth.ts lanAuth) —
 // absent entirely for the vast majority of runs that never asked for a tunnel.

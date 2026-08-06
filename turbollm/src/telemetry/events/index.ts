@@ -16,6 +16,9 @@ import { modelFirstLoad, modelLoad } from './model'
 import { featureFirstUse, featureUsedDaily } from './feature'
 import { errorEvent, consentChoice } from './meta'
 import { benchResult } from './perf'
+import { chatDaily } from './chat'
+import { gatewayDaily } from './gateway'
+import { codeDaily } from './code'
 
 export const REGISTRY = {
   app_first_run: appFirstRun,
@@ -28,6 +31,9 @@ export const REGISTRY = {
   error: errorEvent,
   consent_choice: consentChoice,
   bench_result: benchResult,
+  chat_daily: chatDaily,
+  gateway_daily: gatewayDaily,
+  code_daily: codeDaily,
 } as const
 
 export type EventName = keyof typeof REGISTRY
@@ -45,4 +51,7 @@ export {
   errorEvent,
   consentChoice,
   benchResult,
+  chatDaily,
+  gatewayDaily,
+  codeDaily,
 }
