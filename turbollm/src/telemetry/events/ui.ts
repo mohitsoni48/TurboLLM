@@ -85,7 +85,20 @@ export const SCREENS = [
  *  GitHub #52 comment), a real behavioral difference worth keeping visible as
  *  `save_edited_message` vs. `save_edited_reply`. `regenerate_message` folds the error-state
  *  fallback's inline "Regenerate" link with the normal hover action — both call the identical
- *  `onRegenerate` prop. */
+ *  `onRegenerate` prop.
+ *
+ *  Batch 7 (Phase 6g): `screens/ChatScreen.tsx` — 19 raw matches, 13 new distinct actions (plus
+ *  `toggle_sidebar_collapsed` reused for this file's own mobile hamburger/backdrop, same as
+ *  Batch 5). Two skips: the sidebar's `onSelect` prop relays into `ConversationSidebar`, which
+ *  already tracks internally (Batch 2); and the clipboard-fallback modal's inner
+ *  `e.stopPropagation()` guard. Two folds: the import-mismatch and import-error banners' close
+ *  buttons share `dismiss_import_banner` (same dismiss affordance, different message); the
+ *  clipboard-modal's backdrop click and its explicit × button share `dismiss_clipboard_modal`
+ *  for the same reason. `send_message`/`stop_generation` are tracked despite being this
+ *  screen's highest-frequency clicks — the founder's "every clickable element" instruction
+ *  draws no volume exception, and `ui_daily`'s per-screen rollup exists precisely to keep
+ *  aggregate volume bounded regardless of how often any one action fires (same reasoning
+ *  `chat_daily` already applies to actual message counts). */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -114,6 +127,10 @@ export const UI_ACTIONS = [
   'toggle_thinking_block', 'toggle_tool_call_detail', 'toggle_source_row', 'toggle_sources_panel',
   'open_edit_message', 'cancel_edit_message', 'save_edited_message', 'save_edited_reply',
   'delete_message', 'regenerate_message', 'switch_message_variant',
+
+  'open_model_settings', 'copy_chat_link', 'copy_chat_debug_info', 'export_chat',
+  'dismiss_import_banner', 'use_suggested_prompt', 'scroll_to_latest', 'dismiss_clipboard_modal',
+  'select_skill_from_picker', 'remove_attachment', 'attach_file', 'stop_generation', 'send_message',
 ] as const
 
 export const uiAction = defineEvent({
