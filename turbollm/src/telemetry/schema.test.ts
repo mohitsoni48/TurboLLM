@@ -149,6 +149,18 @@ test('validateEvent: ui_action accepts the Phase 6d CustomizeScreen batch action
   }
 })
 
+test('validateEvent: ui_action accepts the Phase 6e RoutineEditPage batch actions', () => {
+  const actions = [
+    'toggle_sidebar_collapsed', 'open_routine', 'back_to_routines', 'create_routine',
+    'edit_routine', 'discard_routine_edit', 'review_routine_edit', 'pause_routine',
+    'resume_routine', 'run_routine_now', 'delete_routine', 'select_routine_run',
+  ]
+  for (const action of actions) {
+    const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'routines', action } }))
+    assert.equal(r.ok, true, r.ok === false ? `routines/${action}: ${r.reason}` : '')
+  }
+})
+
 test('validateEvent: ui_daily requires screen plus both volume counters', () => {
   const r = validateEvent(validEvent({ event: 'ui_daily', payload: { screen: 'engines', actions: 5, distinctActions: 3 } }))
   assert.equal(r.ok, true, r.ok === false ? r.reason : '')

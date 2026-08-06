@@ -55,7 +55,22 @@ export const SCREENS = [
  *  update) stay distinguishable regardless of which button triggered them. `window.confirm`
  *  (not the app's own AlertDialog) still gates the one destructive action here
  *  (`delete_mcp_server`) — tracked after the confirm check passes, same "track the real
- *  outcome, not the request" rule as every prior batch's confirm dialogs. */
+ *  outcome, not the request" rule as every prior batch's confirm dialogs.
+ *
+ *  Batch 5 (Phase 6e): `screens/routines/RoutineEditPage.tsx` — 19 raw matches, 10 new
+ *  distinct actions (plus 2 reused: `toggle_sidebar_collapsed`/`open_routine`, already in the
+ *  enum from Batches 1-2 and semantically the same action here even though this file's mobile
+ *  hamburger/backdrop and "Open routine" CTA are physically different controls). Two skips:
+ *  the sidebar's `onSelect`/`onNew` props relay straight into `ConversationSidebar`, whose own
+ *  row/button handlers already call `track()` internally before invoking them (Batch 2) — a
+ *  second call here would double-count; and the Delete icon button only opens the confirm
+ *  dialog (`setDeleteConfirmOpen(true)`), so per the "track the outcome, not the request" rule
+ *  `delete_routine` is tracked at the `AlertDialogAction` that actually fires the DELETE, not
+ *  here. All four `goBack` call sites (create-form's chevron and Cancel, the error state's
+ *  "Back to routines", the detail view's chevron) fold into one `back_to_routines` tracked
+ *  once inside `goBack` itself, mirroring Batch 1's `update_engine`. The two run-selection
+ *  buttons (a stalled run needing approval vs. a normal run row) fold into one
+ *  `select_routine_run`, same reasoning. */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -76,6 +91,10 @@ export const UI_ACTIONS = [
   'add_manual_mcp_server', 'update_mcp_server', 'cancel_mcp_edit', 'select_builtin_search',
   'save_builtin_search', 'switch_mcp_tab', 'filter_mcp_category', 'select_mcp_catalog_entry',
   'edit_mcp_server', 'delete_mcp_server', 'open_manual_mcp_form',
+
+  'back_to_routines', 'create_routine', 'edit_routine', 'discard_routine_edit',
+  'review_routine_edit', 'pause_routine', 'resume_routine', 'run_routine_now',
+  'delete_routine', 'select_routine_run',
 ] as const
 
 export const uiAction = defineEvent({

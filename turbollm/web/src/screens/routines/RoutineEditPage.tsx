@@ -8,6 +8,7 @@ import { Button } from '../../components/ui/button'
 import { Skeleton } from '../../components/ui/skeleton'
 import { InlineError } from '../../components/common'
 import { toast } from '../../components/ui/sonner'
+import { track } from '../../lib/api'
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
   AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
@@ -76,7 +77,7 @@ function RoutinesModeShell({ children }: { children: ReactNode }) {
   return (
     <div className="flex h-full overflow-hidden">
       {!isDesktop && mobileSidebarOpen && (
-        <div className="fixed inset-0 z-30 bg-black/40 md:hidden" onClick={() => setMobileSidebarOpen(false)} aria-hidden />
+        <div className="fixed inset-0 z-30 bg-black/40 md:hidden" onClick={() => { track('routines', 'toggle_sidebar_collapsed'); setMobileSidebarOpen(false) }} aria-hidden />
       )}
       <div
         ref={sidebarRef}
@@ -103,7 +104,7 @@ function RoutinesModeShell({ children }: { children: ReactNode }) {
 
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <div className="flex h-12 shrink-0 items-center gap-1.5 border-b border-border px-3 md:gap-3 md:px-8">
-          <Button size="icon" variant="ghost" className="h-8 w-8 shrink-0 md:hidden" onClick={() => setMobileSidebarOpen(true)} title="History" aria-label="Open sidebar">
+          <Button size="icon" variant="ghost" className="h-8 w-8 shrink-0 md:hidden" onClick={() => { track('routines', 'toggle_sidebar_collapsed'); setMobileSidebarOpen(true) }} title="History" aria-label="Open sidebar">
             <PanelLeft size={16} />
           </Button>
         </div>
@@ -136,7 +137,10 @@ function RoutineEditPageInner() {
   const { routineId } = useParams<{ routineId: string }>()
   const navigate = useNavigate()
   const isNew = !routineId || routineId === 'new'
-  const goBack = () => navigate('/workspace/routines')
+  // Also passed below as RoutineConfirmCard's `onCancelled` prop — when that file gets its own
+  // instrumentation batch, its Cancel button must NOT get a second track() call, this one already
+  // fires back_to_routines for it.
+  const goBack = () => { track('routines', 'back_to_routines'); navigate('/workspace/routines') }
 
   const [draft, setDraft] = useState<RoutineDraft>(emptyRoutineDraft())
   const [created, setCreated] = useState<Routine | null>(null)
@@ -189,7 +193,7 @@ function RoutineEditPageInner() {
           <RoutinesModeShell>
             <div className="flex w-full max-w-2xl flex-col items-start gap-3 px-4 py-6 md:px-8">
               <p className="text-[13px] text-muted">This routine is no longer awaiting confirmation.</p>
-              <Button size="sm" onClick={() => navigate(`/workspace/routines/${current.id}`)}>Open routine</Button>
+              <Button size="sm" onClick={() => { track('routines', 'open_routine'); navigate(`/workspace/routines/${current.id}`) }}>Open routine</Button>
             </div>
           </RoutinesModeShell>
         )
@@ -227,6 +231,7 @@ function RoutineEditPageInner() {
                 // `disabled` is the second line of defence, not the first — same shape as the
                 // confirm card's own gate.
                 if (!complete || createInFlight.current) return
+                track('routines', 'create_routine')
                 createInFlight.current = true
                 mut.create.mutate(
                   { ...draft, scheduleDisplay: describeScheduleRule(draft.scheduleRule) },
@@ -303,8 +308,8 @@ function RoutineEditPageInner() {
             {/* DEVIATION: the plan's "Back" only closed the editor, leaving the proposed edit
                 behind — so the confirm gate popped up anyway on a screen the user had just backed
                 out of. Discarding is what backing out of an edit means. */}
-            <Button size="sm" variant="outline" onClick={() => { setExistingDraft(null); setEditingExisting(false) }}>Discard</Button>
-            <Button size="sm" onClick={() => setEditingExisting(false)}>Review change</Button>
+            <Button size="sm" variant="outline" onClick={() => { track('routines', 'discard_routine_edit'); setExistingDraft(null); setEditingExisting(false) }}>Discard</Button>
+            <Button size="sm" onClick={() => { track('routines', 'review_routine_edit'); setEditingExisting(false) }}>Review change</Button>
           </div>
         </div>
       </RoutinesModeShell>
@@ -355,18 +360,18 @@ function RoutineEditPageInner() {
           <div className="flex flex-wrap items-center gap-2">
             <RoutineStatusBadge status={status} />
             <div className="ml-auto flex flex-wrap gap-1.5">
-              <Button size="sm" variant="outline" onClick={() => { setExistingDraft(persistedDraft); setEditingExisting(true) }}>Edit</Button>
+              <Button size="sm" variant="outline" onClick={() => { track('routines', 'edit_routine'); setExistingDraft(persistedDraft); setEditingExisting(true) }}>Edit</Button>
               {/* Gated on the LIVE routine's status, re-read every render — never on a captured
                   copy. A view that has fallen behind can still show the wrong button for a moment
                   (the detail query polls rather than streaming), but the server is the real gate:
                   /pause 409s unless the routine is active and /resume 409s unless it is paused,
                   and `failed()` refetches so the row corrects itself instead of staying wrong. */}
               {routine.status === 'active' ? (
-                <Button size="sm" variant="outline" disabled={mut.pause.isPending} onClick={() => mut.pause.mutate(routine.id, { onError: failed('Could not pause this routine.') })} title="Pause" aria-label="Pause">
+                <Button size="sm" variant="outline" disabled={mut.pause.isPending} onClick={() => { track('routines', 'pause_routine'); mut.pause.mutate(routine.id, { onError: failed('Could not pause this routine.') }) }} title="Pause" aria-label="Pause">
                   <Pause size={13} />
                 </Button>
               ) : routine.status === 'paused' ? (
-                <Button size="sm" variant="outline" disabled={mut.resume.isPending} onClick={() => mut.resume.mutate(routine.id, { onError: failed('Could not resume this routine.') })} title="Resume" aria-label="Resume">
+                <Button size="sm" variant="outline" disabled={mut.resume.isPending} onClick={() => { track('routines', 'resume_routine'); mut.resume.mutate(routine.id, { onError: failed('Could not resume this routine.') }) }} title="Resume" aria-label="Resume">
                   <Play size={13} />
                 </Button>
               ) : null}
@@ -381,7 +386,7 @@ function RoutineEditPageInner() {
                   parked routines at daemon start. Only approve/deny (via releaseParked) clears
                   it. So a parked run is NOT `running` in the run list but /run-now still
                   refuses it, and an enabled button here could only ever produce a failure toast. */}
-              <Button size="sm" variant="outline" disabled={mut.runNow.isPending || runningNow || awaitingApproval} onClick={() => mut.runNow.mutate(routine.id, { onError: failed('Could not start a run.') })} title="Run now" aria-label="Run now">
+              <Button size="sm" variant="outline" disabled={mut.runNow.isPending || runningNow || awaitingApproval} onClick={() => { track('routines', 'run_routine_now'); mut.runNow.mutate(routine.id, { onError: failed('Could not start a run.') }) }} title="Run now" aria-label="Run now">
                 <RotateCw size={13} />
               </Button>
               <Button size="sm" variant="outline" onClick={() => setDeleteConfirmOpen(true)} title="Delete" aria-label="Delete">
@@ -435,7 +440,7 @@ function RoutineEditPageInner() {
                               'rounded-md border px-3 py-1.5 text-left text-[12px]',
                               selectedRun?.id === run.id ? 'border-accent bg-accent/12 text-accent' : 'border-border bg-panel text-muted hover:bg-panel-2',
                             )}
-                            onClick={() => setSelectedRunId(run.id)}
+                            onClick={() => { track('routines', 'select_routine_run'); setSelectedRunId(run.id) }}
                           >
                             View the stalled conversation →
                           </button>
@@ -452,7 +457,7 @@ function RoutineEditPageInner() {
                         'rounded-md border px-3 py-2 text-left text-[13px] break-words',
                         isSelected ? 'border-accent bg-accent/12 text-accent' : 'border-border bg-panel text-ink hover:bg-panel-2',
                       )}
-                      onClick={() => setSelectedRunId(run.id)}
+                      onClick={() => { track('routines', 'select_routine_run'); setSelectedRunId(run.id) }}
                       aria-current={isSelected ? 'true' : undefined}
                     >
                       {runSummaryLine(run)}
@@ -494,8 +499,11 @@ function RoutineEditPageInner() {
                 // (routine-queries.ts), and TanStack Query runs BOTH levels — adding one here
                 // would double-toast. That placement is also what keeps a failed DELETE audible
                 // after this page navigates away on success.
+                track('routines', 'delete_routine')
                 mut.remove.mutate(routine.id, {
-                  onSuccess: () => { toast.success('Routine deleted.'); goBack() },
+                  // Not goBack(): that also tracks back_to_routines, which would conflate a
+                  // manual "back" click with this redirect-after-delete.
+                  onSuccess: () => { toast.success('Routine deleted.'); navigate('/workspace/routines') },
                 })
               }}
             >
