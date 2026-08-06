@@ -133,6 +133,31 @@ function makeDeps(env: Env): IngestDeps {
       console.log(`d1: stored ${events.length}`)
     },
 
+    quarantine: async (rows) => {
+      const receivedAt = new Date().toISOString()
+      const stmt = env.DB.prepare(
+        'INSERT INTO quarantine (received_at, event_name, reason, machine_id, raw) VALUES (?, ?, ?, ?, ?)',
+      )
+      await env.DB.batch(
+        rows.map((r) =>
+          stmt.bind(
+            receivedAt,
+            typeof r.raw.event === 'string' ? r.raw.event : null,
+            r.reason,
+            typeof r.raw.machineId === 'string' ? r.raw.machineId : null,
+            JSON.stringify(r.raw),
+          ),
+        ),
+      )
+      // Same reasoning as the D1/PostHog logs below: handleIngest swallows this
+      // failing so a client is never told to retry, which means a silently
+      // failing quarantine write is otherwise indistinguishable from a healthy
+      // one. This line, plus a `count(*)` against the table itself, is the
+      // rejection-visibility half of ADR-333's G4 — the client stays as blind
+      // as before (still a flat 202), but we are not.
+      console.log(`quarantine: stored ${rows.length}`)
+    },
+
     forward: async (events) => {
       if (!env.POSTHOG_KEY) {
         console.log('posthog: skipped (no POSTHOG_KEY configured)')

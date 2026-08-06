@@ -5,7 +5,7 @@
 // that guarantee rot unnoticed.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { handleIngest, type IngestDeps } from './ingest'
+import { handleIngest, type IngestDeps, type QuarantinedEvent } from './ingest'
 
 function deps(over: Partial<IngestDeps> = {}): IngestDeps {
   const rows: unknown[][] = []
@@ -16,6 +16,7 @@ function deps(over: Partial<IngestDeps> = {}): IngestDeps {
       rows.push(events)
     },
     forward: async () => {},
+    quarantine: async () => {},
     ...over,
   }
 }
@@ -61,24 +62,86 @@ test('handleIngest: rejects a body that is not an array', async () => {
   assert.equal(res.status, 400)
 })
 
-test('handleIngest: drops invalid events but keeps the valid ones in the same batch', async () => {
+test('handleIngest: an unrecognized-but-plausible event is quarantined, and does not block the rest of the batch from storing', async () => {
   const stored: unknown[][] = []
   const res = await handleIngest(
     post([validEvent(), validEvent({ prompt: 'secret' }), validEvent({ event: 'daily_active' })]),
     deps({ store: async (e) => void stored.push(e) }),
   )
   assert.equal(res.status, 202)
-  assert.equal(stored[0].length, 2, 'the poisoned event is dropped, the batch is not')
+  assert.equal(stored[0].length, 2, 'the quarantined event is routed elsewhere, the batch is not blocked')
 })
 
-test('handleIngest: a batch of entirely invalid events stores nothing', async () => {
-  let called = false
+test('handleIngest: a batch of entirely quarantine-eligible events stores nothing, but is not destroyed either', async () => {
+  let storeCalled = false
+  const quarantined: QuarantinedEvent[] = []
   const res = await handleIngest(
     post([validEvent({ prompt: 'secret' })]),
-    deps({ store: async () => void (called = true) }),
+    deps({ store: async () => void (storeCalled = true), quarantine: async (rows) => void quarantined.push(...rows) }),
   )
   assert.equal(res.status, 202, 'still 202 — we do not tell a prober what passed')
-  assert.equal(called, false)
+  assert.equal(storeCalled, false)
+  assert.equal(quarantined.length, 1, 'unrecognized-but-plausible fields (ADR-331: this is exactly what failReason looked like) are recoverable, not gone')
+  assert.match(quarantined[0].reason, /prompt/)
+})
+
+test('handleIngest: an enum value from a newer schema version is quarantined, not destroyed (the exact ADR-331 shape — first_chat, before this schema knew about it)', async () => {
+  const quarantined: QuarantinedEvent[] = []
+  const res = await handleIngest(
+    // A step name this Worker's deployed schema doesn't recognise yet — exactly
+    // what 'first_chat' looked like to the Worker before it was redeployed.
+    post([validEvent({ event: 'onboarding_step', payload: { step: 'onboarding_complete', outcome: 'ok' } })]),
+    deps({ quarantine: async (rows) => void quarantined.push(...rows) }),
+  )
+  assert.equal(res.status, 202)
+  assert.equal(quarantined.length, 1)
+})
+
+test('handleIngest: a genuinely malformed event (fails structural sanity) is hard-rejected, never quarantined', async () => {
+  const quarantined: QuarantinedEvent[] = []
+  const res = await handleIngest(
+    post([{ schema: 1, event: 'consent_choice', level: 'off', machineId: '00000000-0000-0000-0000-000000000000' }]),
+    deps({ quarantine: async (rows) => void quarantined.push(...rows) }),
+  )
+  assert.equal(res.status, 202)
+  assert.equal(quarantined.length, 0, 'the one absolute privacy invariant must never land anywhere, not even quarantine')
+})
+
+test('handleIngest: an oversized string smuggled through an unrecognized field is hard-rejected, never quarantined', async () => {
+  const quarantined: QuarantinedEvent[] = []
+  const res = await handleIngest(
+    post([validEvent({ prompt: 'x'.repeat(200) })]),
+    deps({ quarantine: async (rows) => void quarantined.push(...rows) }),
+  )
+  assert.equal(res.status, 202)
+  assert.equal(quarantined.length, 0, 'an unrecognized field name is not a license for an unbounded-length value')
+})
+
+test('handleIngest: an oversized event is hard-rejected before any classification, regardless of shape', async () => {
+  const quarantined: QuarantinedEvent[] = []
+  const stored: unknown[][] = []
+  const res = await handleIngest(
+    post([validEvent({ event: 'daily_active', junk: 'y'.repeat(5000) })]),
+    deps({
+      store: async (e) => void stored.push(e),
+      quarantine: async (rows) => void quarantined.push(...rows),
+    }),
+  )
+  assert.equal(res.status, 202)
+  assert.equal(stored.length, 0)
+  assert.equal(quarantined.length, 0)
+})
+
+test('handleIngest: a quarantine failure still returns 202 and never throws, same as a storage failure', async () => {
+  const res = await handleIngest(
+    post([validEvent({ prompt: 'secret' })]),
+    deps({
+      quarantine: async () => {
+        throw new Error('D1 down')
+      },
+    }),
+  )
+  assert.equal(res.status, 202)
 })
 
 test('handleIngest: an oversized batch is rejected outright', async () => {

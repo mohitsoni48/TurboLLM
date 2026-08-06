@@ -1,0 +1,11 @@
+{
+  "name": "turbollm-telemetry-worker",
+  "private": true,
+  "scripts": {
+    "deploy": "npx wrangler deploy && node scripts/schema-hash.mjs write && node scripts/canary.mjs",
+    "hash:check": "node scripts/schema-hash.mjs check",
+    "hash:write": "node scripts/schema-hash.mjs write",
+    "canary": "node scripts/canary.mjs",
+    "db:migrate": "npx wrangler d1 execute turbollm-telemetry --remote --file=schema.sql"
+  }
+}
