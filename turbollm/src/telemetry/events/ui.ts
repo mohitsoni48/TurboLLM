@@ -213,7 +213,13 @@ export const SCREENS = [
  *  choose step's own link, so it reuses `browse_new_engine_binary` rather than getting a new
  *  name for the same effect from a different step. `select_new_engine_path` is tracked at the
  *  shared `FsBrowser`'s own `onSelect` call site (this file's real DOM click, driving the
- *  scan), same as every other batch's `FsBrowser` usage. */
+ *  scan), same as every other batch's `FsBrowser` usage.
+ *
+ *  Batch 16 (Phase 6p): `screens/skills/SkillEditPage.tsx` — 7 raw matches, 4 new distinct
+ *  actions, 1 skip. Structurally identical to Batch 13's `AgentEditPage.tsx`: all three
+ *  `goBack` call sites fold into `back_to_skills`, and the inline delete-confirm row's opening
+ *  link is skipped in favor of tracking `delete_skill` at the confirm row's own button, same
+ *  "track the outcome, not the request" reasoning. */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -275,6 +281,8 @@ export const UI_ACTIONS = [
 
   'browse_new_engine_folder', 'browse_new_engine_binary', 'cancel_add_engine',
   'back_to_add_engine_choose', 'submit_new_engine', 'select_new_engine_path',
+
+  'back_to_skills', 'save_skill', 'delete_skill', 'cancel_delete_skill',
 ] as const
 
 export const uiAction = defineEvent({

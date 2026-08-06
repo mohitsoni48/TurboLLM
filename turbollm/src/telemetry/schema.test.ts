@@ -276,6 +276,14 @@ test('validateEvent: ui_action accepts the Phase 6o AddEngineDialog batch action
   }
 })
 
+test('validateEvent: ui_action accepts the Phase 6p SkillEditPage batch actions', () => {
+  const actions = ['back_to_skills', 'save_skill', 'delete_skill', 'cancel_delete_skill']
+  for (const action of actions) {
+    const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'skills', action } }))
+    assert.equal(r.ok, true, r.ok === false ? `skills/${action}: ${r.reason}` : '')
+  }
+})
+
 test('validateEvent: ui_daily requires screen plus both volume counters', () => {
   const r = validateEvent(validEvent({ event: 'ui_daily', payload: { screen: 'engines', actions: 5, distinctActions: 3 } }))
   assert.equal(r.ok, true, r.ok === false ? r.reason : '')
