@@ -385,7 +385,15 @@ export const SCREENS = [
  *  prop threaded from each caller and reuses `load_model`/`eject_model`/
  *  `open_model_load_settings` tagged dynamically per embedding, the same "same action, screen
  *  reflects wherever the click really happened" pattern `toggle_sidebar_collapsed` already
- *  established across chat/code/routines. */
+ *  established across chat/code/routines.
+ *
+ *  Batch 33 (Phase 6gg): `screens/models/DownloadsPanel.tsx` — 3 raw matches, 3 new distinct
+ *  actions, no skips, tagged `models` (its only embedding, `DiscoverTab.tsx`). All three live
+ *  inside the local `DownloadRow` component, whose `onCancel`/`onRemove`/`onResume` props are
+ *  supplied inline in the SAME file by `DownloadsPanel` itself (the real `mut.*.mutate()`
+ *  calls) — same "local component, same file" pattern as `CandidateList`/`AgentCard`, tracked
+ *  at the real click. Distinct from `download_hf_model`/`download_hf_quant` (Batch 17), which
+ *  cover STARTING a download, not managing one already in flight. */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -476,6 +484,8 @@ export const UI_ACTIONS = [
   'add_context_candidate', 'remove_context_candidate', 'save_context_candidates',
 
   'commit_code_git', 'push_code_git', 'close_code_git_dialog',
+
+  'resume_download', 'cancel_download', 'remove_download',
 ] as const
 
 export const uiAction = defineEvent({
