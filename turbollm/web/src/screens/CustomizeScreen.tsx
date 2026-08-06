@@ -5,7 +5,7 @@ import { ScreenHeader } from '../components/common'
 import { Button } from '../components/ui/button'
 import { toast } from '../components/ui/sonner'
 import { useMcpMutations, useSettings } from '../lib/queries'
-import { ApiError } from '../lib/api'
+import { ApiError, track } from '../lib/api'
 import type { McpServer, DaemonSettings, DaemonSettingsPatch } from '../lib/api'
 import { CLOUD_MCPS, LOCAL_MCPS, CLOUD_CATS, LOCAL_CATS, BUILTIN_SEARCH } from '../lib/mcp-catalog'
 import type { CloudEntry, LocalEntry, BuiltinSearchEntry } from '../lib/mcp-catalog'
@@ -41,7 +41,7 @@ export function CustomizeScreen() {
           <button
             key={id}
             type="button"
-            onClick={() => setTab(id)}
+            onClick={() => { track('customize', 'switch_customize_tab'); setTab(id) }}
             className={cn(
               'flex items-center gap-1.5 rounded px-3 py-1.5 text-[13px] font-medium transition-colors',
               activeTab === id ? 'bg-accent/12 text-accent' : 'text-muted hover:text-ink',
@@ -213,7 +213,7 @@ function McpCloudPanel({ entry, apiKey, onApiKeyChange, onClose, onConnect, busy
           <BrandCircle name={entry.name} color={entry.color} iconSlug={entry.iconSlug} />
           <span className="text-[13px] font-medium text-ink">Connect {entry.name}</span>
         </div>
-        <button type="button" onClick={onClose} className="rounded p-1 text-faint transition-colors hover:text-ink">
+        <button type="button" onClick={() => { track('customize', 'close_mcp_panel'); onClose() }} className="rounded p-1 text-faint transition-colors hover:text-ink">
           <X size={13} />
         </button>
       </div>
@@ -239,7 +239,7 @@ function McpCloudPanel({ entry, apiKey, onApiKeyChange, onClose, onConnect, busy
         </p>
       )}
 
-      <Button size="sm" onClick={onConnect} disabled={busy || (needsKey && !apiKey.trim())}>
+      <Button size="sm" onClick={() => { track('customize', 'connect_mcp_server'); onConnect() }} disabled={busy || (needsKey && !apiKey.trim())}>
         {busy && <Loader2 size={13} className="animate-spin" />}
         Add server
       </Button>
@@ -261,7 +261,7 @@ function McpLocalPanel({ entry, extraArg, onExtraArgChange, envs, onEnvChange, o
           <BrandCircle name={entry.name} color={nameColor(entry.name)} iconSlug={entry.iconSlug} />
           <span className="text-[13px] font-medium text-ink">Add {entry.name}</span>
         </div>
-        <button type="button" onClick={onClose} className="rounded p-1 text-faint transition-colors hover:text-ink">
+        <button type="button" onClick={() => { track('customize', 'close_mcp_panel'); onClose() }} className="rounded p-1 text-faint transition-colors hover:text-ink">
           <X size={13} />
         </button>
       </div>
@@ -301,7 +301,7 @@ function McpLocalPanel({ entry, extraArg, onExtraArgChange, envs, onEnvChange, o
         </p>
       )}
 
-      <Button size="sm" onClick={onAdd} disabled={busy || !canAdd}>
+      <Button size="sm" onClick={() => { track('customize', 'add_local_mcp_server'); onAdd() }} disabled={busy || !canAdd}>
         {busy && <Loader2 size={13} className="animate-spin" />}
         Add server
       </Button>
@@ -365,6 +365,7 @@ function McpSection({ servers, search }: { servers: McpServer[]; search: DaemonS
     if (payload.transport === 'stdio' && !payload.command) return void toast.error('Command is required.')
     if (payload.transport === 'sse' && !payload.url) return void toast.error('URL is required.')
     const isEdit = view === 'edit' && editingId
+    track('customize', isEdit ? 'update_mcp_server' : 'add_manual_mcp_server')
     const opts = {
       onSuccess: () => { toast.success(isEdit ? 'MCP server updated' : 'MCP server added'); setView('marketplace'); setEditingId(null) },
       onError: (e: unknown) => toast.error(e instanceof ApiError ? e.message : 'Could not save server.'),
@@ -376,6 +377,7 @@ function McpSection({ servers, search }: { servers: McpServer[]; search: DaemonS
   const handleDelete = (id: string, name: string) => {
     // eslint-disable-next-line no-alert
     if (!window.confirm(`Remove MCP server "${name}"?`)) return
+    track('customize', 'delete_mcp_server')
     mut.remove.mutate(id, { onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not remove server.') })
   }
 
@@ -526,7 +528,7 @@ function McpSection({ servers, search }: { servers: McpServer[]; search: DaemonS
               {busy && <Loader2 size={13} className="animate-spin" />}
               Update
             </Button>
-            <Button variant="outline" size="sm" onClick={() => { setView('marketplace'); setEditingId(null) }}>Cancel</Button>
+            <Button variant="outline" size="sm" onClick={() => { track('customize', 'cancel_mcp_edit'); setView('marketplace'); setEditingId(null) }}>Cancel</Button>
           </div>
         </div>
       )}
@@ -534,7 +536,7 @@ function McpSection({ servers, search }: { servers: McpServer[]; search: DaemonS
       {view === 'manual' && (
         <div className="flex flex-col gap-3 rounded-lg border border-border bg-panel-2 p-3">
           <div className="flex items-center gap-2">
-            <button type="button" onClick={() => setView('marketplace')}
+            <button type="button" onClick={() => { track('customize', 'cancel_mcp_edit'); setView('marketplace') }}
               className="rounded p-1 text-faint transition-colors hover:text-ink">
               <ArrowLeft size={13} />
             </button>
@@ -546,7 +548,7 @@ function McpSection({ servers, search }: { servers: McpServer[]; search: DaemonS
               {busy && <Loader2 size={13} className="animate-spin" />}
               Add
             </Button>
-            <Button variant="outline" size="sm" onClick={() => setView('marketplace')}>Cancel</Button>
+            <Button variant="outline" size="sm" onClick={() => { track('customize', 'cancel_mcp_edit'); setView('marketplace') }}>Cancel</Button>
           </div>
         </div>
       )}
@@ -564,7 +566,7 @@ function McpSection({ servers, search }: { servers: McpServer[]; search: DaemonS
                 const isActive = search.provider === b.id && searchConfigured
                 const isOpen = selectedBuiltin === b.id
                 return (
-                  <button key={b.id} type="button" onClick={() => selectBuiltin(isOpen ? null : b.id)}
+                  <button key={b.id} type="button" onClick={() => { track('customize', 'select_builtin_search'); selectBuiltin(isOpen ? null : b.id) }}
                     className="flex items-center gap-2 rounded-lg border bg-panel px-2.5 py-1.5 text-left transition-colors hover:bg-bg"
                     style={{ borderColor: isOpen ? 'var(--accent)' : isActive ? 'color-mix(in srgb, var(--ok) 50%, transparent)' : 'var(--border)' }}>
                     <BrandCircle name={b.name} color={nameColor(b.name)} iconSlug={b.iconSlug} />
@@ -588,7 +590,7 @@ function McpSection({ servers, search }: { servers: McpServer[]; search: DaemonS
                       <BrandCircle name={entry.name} color={nameColor(entry.name)} iconSlug={entry.iconSlug} />
                       <span className="text-[13px] font-medium text-ink">Configure {entry.name}</span>
                     </div>
-                    <button type="button" onClick={() => selectBuiltin(null)} className="rounded p-1 text-faint transition-colors hover:text-ink">
+                    <button type="button" onClick={() => { track('customize', 'select_builtin_search'); selectBuiltin(null) }} className="rounded p-1 text-faint transition-colors hover:text-ink">
                       <X size={13} />
                     </button>
                   </div>
@@ -611,7 +613,7 @@ function McpSection({ servers, search }: { servers: McpServer[]; search: DaemonS
                     </div>
                   )}
 
-                  <Button size="sm" onClick={() => saveSearch(entry.id, searchSecret)} disabled={!searchSecret.trim()}>
+                  <Button size="sm" onClick={() => { track('customize', 'save_builtin_search'); saveSearch(entry.id, searchSecret) }} disabled={!searchSecret.trim()}>
                     Save &amp; make active
                   </Button>
                 </div>
@@ -621,7 +623,7 @@ function McpSection({ servers, search }: { servers: McpServer[]; search: DaemonS
 
           <div className="mb-3 inline-flex rounded-md border border-border p-0.5">
             {(['cloud', 'local', 'connected'] as const).map((t) => (
-              <button key={t} type="button" onClick={() => switchTab(t)}
+              <button key={t} type="button" onClick={() => { track('customize', 'switch_mcp_tab'); switchTab(t) }}
                 className={`rounded px-3 py-1 text-[13px] capitalize transition-colors ${tab === t ? 'bg-bg text-ink' : 'text-muted hover:text-ink'}`}>
                 {t === 'connected' ? `Connected${servers.length > 0 ? ` (${servers.length})` : ''}` : t === 'cloud' ? 'Cloud' : 'Local'}
               </button>
@@ -632,7 +634,7 @@ function McpSection({ servers, search }: { servers: McpServer[]; search: DaemonS
             <>
               <div className="mb-3 flex flex-wrap gap-1.5">
                 {cats.map((cat) => (
-                  <button key={cat} type="button" onClick={() => { setActiveCat(cat); selectCard(null) }}
+                  <button key={cat} type="button" onClick={() => { track('customize', 'filter_mcp_category'); setActiveCat(cat); selectCard(null) }}
                     className="rounded-full px-2.5 py-0.5 text-[11px] font-medium transition-colors"
                     style={activeCat === cat
                       ? { background: 'var(--accent)', color: 'var(--on-accent)' }
@@ -647,7 +649,7 @@ function McpSection({ servers, search }: { servers: McpServer[]; search: DaemonS
                   <McpCard key={entry.id} entry={entry} tab={tab as 'cloud' | 'local'}
                     isSelected={selectedId === entry.id}
                     isConnected={isCatalogConnected(entry)}
-                    onSelect={() => selectCard(selectedId === entry.id ? null : entry.id)} />
+                    onSelect={() => { track('customize', 'select_mcp_catalog_entry'); selectCard(selectedId === entry.id ? null : entry.id) }} />
                 ))}
               </div>
 
@@ -685,7 +687,7 @@ function McpSection({ servers, search }: { servers: McpServer[]; search: DaemonS
                           <div className="mt-0.5 text-[10px] text-faint">Web search</div>
                         </div>
                       </div>
-                      <button type="button" onClick={() => selectBuiltin(activeBuiltin.id)}
+                      <button type="button" onClick={() => { track('customize', 'select_builtin_search'); selectBuiltin(activeBuiltin.id) }}
                         className="mt-1 self-start text-[12px] text-muted transition-colors hover:text-ink">
                         Manage
                       </button>
@@ -719,7 +721,7 @@ function McpSection({ servers, search }: { servers: McpServer[]; search: DaemonS
                           <span className="text-[11px]">{s.enabled ? 'Enabled' : 'Disabled'}</span>
                         </label>
                         <div className="ml-auto flex gap-1">
-                          <button type="button" onClick={() => openEdit(s)} title="Edit"
+                          <button type="button" onClick={() => { track('customize', 'edit_mcp_server'); openEdit(s) }} title="Edit"
                             className="rounded p-1 text-faint transition-colors hover:bg-bg hover:text-ink">
                             <Pencil size={12} />
                           </button>
@@ -737,7 +739,7 @@ function McpSection({ servers, search }: { servers: McpServer[]; search: DaemonS
           )}
 
           <button type="button"
-            onClick={() => { setView('manual'); setForm(emptyMcpForm()); setEditingId(null) }}
+            onClick={() => { track('customize', 'open_manual_mcp_form'); setView('manual'); setForm(emptyMcpForm()); setEditingId(null) }}
             className="mt-4 flex items-center gap-1 text-[12px] text-faint transition-colors hover:text-ink">
             Add server manually <ChevronRight size={11} />
           </button>
