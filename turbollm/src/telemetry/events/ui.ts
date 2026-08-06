@@ -240,7 +240,22 @@ export const SCREENS = [
  *  one skip is the Delete menu item, which only opens the confirm dialog
  *  (`setDeleteTarget(...)`) — `delete_engine` is tracked at the `AlertDialogAction` that
  *  actually fires the delete, same "track the outcome, not the request" rule as every prior
- *  batch's confirm dialogs. */
+ *  batch's confirm dialogs.
+ *
+ *  Batch 19 (Phase 6s): `screens/engines/FsBrowser.tsx` — 6 raw matches, 5 new distinct
+ *  actions. Screen tagged `engines` (the file's own directory-implied identity, same
+ *  reasoning as Batch 11's `ModelDetailDialog`) even though every caller across chat/code/
+ *  models/engines embeds this same dialog. Two of the six matches are skipped, one fully and
+ *  one partially, for the SAME reason Batch 10/14 skipped `CodeComposer`'s `onSubmit`: this
+ *  dialog's `choose(p)` calls the CALLER-supplied `onSelect` prop, which every existing caller
+ *  already tracks at its own call site (`add_model_dir`, `add_code_context_file`,
+ *  `select_code_repo`, `select_new_engine_path`, etc.) — tracking here too would double-count.
+ *  The "Select this folder" button (always routes through `choose`) is fully skipped; the file
+ *  list's row click is a single ternary handler (`e.isDir ? setPath(...) : choose(...)`) so
+ *  only its directory branch is tracked, as `open_fs_folder` — its file-select branch stays
+ *  untracked for the same double-count reason. `navigate_fs_up`/`navigate_fs_to_path`/
+ *  `refresh_fs_browser`/`cancel_fs_browser` are genuinely local to this dialog (no caller
+ *  callback involved) and are tracked normally. */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -307,6 +322,9 @@ export const UI_ACTIONS = [
 
   'load_hf_quant', 'download_hf_quant', 'select_hf_quant', 'download_hf_model',
   'search_hf_from_error', 'retry_hf_repo_load',
+
+  'navigate_fs_up', 'navigate_fs_to_path', 'refresh_fs_browser', 'open_fs_folder',
+  'cancel_fs_browser',
 ] as const
 
 export const uiAction = defineEvent({

@@ -295,6 +295,17 @@ test('validateEvent: ui_action accepts the Phase 6q HfRepoDialog batch actions',
   }
 })
 
+test('validateEvent: ui_action accepts the Phase 6s FsBrowser batch actions', () => {
+  const actions = [
+    'navigate_fs_up', 'navigate_fs_to_path', 'refresh_fs_browser', 'open_fs_folder',
+    'cancel_fs_browser',
+  ]
+  for (const action of actions) {
+    const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'engines', action } }))
+    assert.equal(r.ok, true, r.ok === false ? `engines/${action}: ${r.reason}` : '')
+  }
+})
+
 test('validateEvent: ui_daily requires screen plus both volume counters', () => {
   const r = validateEvent(validEvent({ event: 'ui_daily', payload: { screen: 'engines', actions: 5, distinctActions: 3 } }))
   assert.equal(r.ok, true, r.ok === false ? r.reason : '')
