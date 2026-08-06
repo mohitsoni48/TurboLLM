@@ -2,6 +2,7 @@ import { useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { AlarmClock, PanelLeft, Plus } from 'lucide-react'
 import { Button } from '../../components/ui/button'
+import { track } from '../../lib/api'
 import { EmptyState } from '../../components/common'
 import { cn } from '../../lib/utils'
 import { useIsDesktop } from '../../lib/useIsDesktop'
@@ -31,7 +32,7 @@ export function RoutinesPanel() {
   return (
     <div className="flex h-full overflow-hidden">
       {!isDesktop && mobileSidebarOpen && (
-        <div className="fixed inset-0 z-30 bg-black/40 md:hidden" onClick={() => setMobileSidebarOpen(false)} aria-hidden />
+        <div className="fixed inset-0 z-30 bg-black/40 md:hidden" onClick={() => { track('routines', 'toggle_sidebar_collapsed'); setMobileSidebarOpen(false) }} aria-hidden />
       )}
       <div
         ref={sidebarRef}
@@ -65,7 +66,7 @@ export function RoutinesPanel() {
             size="icon"
             variant="ghost"
             className="h-8 w-8 shrink-0 md:hidden"
-            onClick={() => setMobileSidebarOpen(true)}
+            onClick={() => { track('routines', 'toggle_sidebar_collapsed'); setMobileSidebarOpen(true) }}
             title="History"
             aria-label="Open sidebar"
           >
@@ -77,7 +78,7 @@ export function RoutinesPanel() {
           <EmptyState
             icon={<AlarmClock size={28} />}
             message="Select a routine from the sidebar, or create one to run a task automatically on a schedule — chat or code, no one needs to be watching."
-            action={<Button size="sm" onClick={() => navigate('/workspace/routines/new')}><Plus size={14} /> New routine</Button>}
+            action={<Button size="sm" onClick={() => { track('routines', 'new_routine'); navigate('/workspace/routines/new') }}><Plus size={14} /> New routine</Button>}
           />
         </div>
       </div>
