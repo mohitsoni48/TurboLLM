@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from 'react'
 import { FolderPlus, Star, X } from 'lucide-react'
-import { ApiError } from '../../lib/api'
+import { ApiError, track } from '../../lib/api'
 import { useModelMutations } from '../../lib/queries'
 import { Button } from '../../components/ui/button'
 import { Input } from '../../components/ui/input'
@@ -20,6 +20,7 @@ export function ModelDirs({
   const add = () => {
     const dir = value.trim()
     if (!dir) return
+    track('models', 'add_model_dir')
     mut.addDir.mutate(dir, { onSuccess: () => setValue('') })
   }
 
@@ -38,7 +39,7 @@ export function ModelDirs({
                 ) : (
                   <button
                     type="button"
-                    onClick={() => mut.setPrimaryDir.mutate(d)}
+                    onClick={() => { track('models', 'set_primary_model_dir'); mut.setPrimaryDir.mutate(d) }}
                     disabled={mut.setPrimaryDir.isPending}
                     title="Downloads and imports will land in this folder"
                     className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-faint opacity-0 transition-opacity hover:text-ink focus:opacity-100 group-hover/dir:opacity-100"
@@ -50,7 +51,7 @@ export function ModelDirs({
                 <button
                   type="button"
                   aria-label={`Remove ${d}`}
-                  onClick={() => mut.removeDir.mutate(d)}
+                  onClick={() => { track('models', 'remove_model_dir'); mut.removeDir.mutate(d) }}
                   className="rounded p-1 text-muted transition-colors hover:text-ink"
                 >
                   <X size={14} />
