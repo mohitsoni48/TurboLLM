@@ -117,7 +117,17 @@ export const SCREENS = [
  *  (`runRevert(id, false)` vs `runRevert(id, true)`) split into `revert_code_chat` vs
  *  `revert_code_chat_and_files` — a real behavioral difference (whether file edits are also
  *  discarded), same reasoning as Batch 6's edit-save split; the file-edits-free single-button
- *  case calls the same `runRevert(id, false)` and folds into `revert_code_chat`. */
+ *  case calls the same `runRevert(id, false)` and folds into `revert_code_chat`.
+ *
+ *  Batch 9 (Phase 6i): `screens/SettingsScreen.tsx` — 16 raw matches, 14 new distinct actions,
+ *  no skips. Three ComfyUI-gate buttons (the update-available banner's "Update node", the
+ *  utility row's "Reinstall / update", and the initial "Install gate") all call the exact same
+ *  local `doInstall(path)` with only the path source differing — tracked once inside
+ *  `doInstall` itself as `install_comfyui_gate`, same "shared action across entry points"
+ *  pattern as Batch 1's `update_engine`. `save_hf_token` covers both the "Save token" and
+ *  "Clear token" labels of the same button (`handleSaveToken` branches purely on whether the
+ *  field is empty, same mutation either way) — unlike Batch 6's edit-save split, there is no
+ *  real behavioral fork here worth preserving in the data. */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -153,6 +163,11 @@ export const UI_ACTIONS = [
 
   'export_code_session', 'open_code_git_dialog', 'back_to_code', 'resume_code_session',
   'send_code_message', 'add_code_context_file', 'revert_code_chat', 'revert_code_chat_and_files',
+
+  'switch_settings_tab', 'set_theme', 'save_settings', 'install_comfyui_gate',
+  'uninstall_comfyui_gate', 'test_hf_token', 'save_hf_token', 'toggle_telemetry_preview',
+  'toggle_submission_log', 'regenerate_machine_id', 'restart_daemon', 'dismiss_restart_overlay',
+  'reload_after_restart', 'save_personalization',
 ] as const
 
 export const uiAction = defineEvent({
