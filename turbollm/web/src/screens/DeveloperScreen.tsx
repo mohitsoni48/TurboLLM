@@ -119,7 +119,7 @@ function ConnectionPanel() {
           <div className="text-[11px] text-muted">Server URL</div>
           <code className="font-mono text-[13px] text-ink">{serverUrl}</code>
         </div>
-        <CopyButton text={serverUrl} />
+        <CopyButton text={serverUrl} screen="developer" />
       </div>
 
       {/* API keys — needed for access from another device (or when a key is required). */}
@@ -148,7 +148,7 @@ function ConnectionPanel() {
                 </p>
                 <div className="flex items-center gap-2 rounded border border-border bg-bg px-2 py-1.5">
                   <code className="min-w-0 flex-1 break-all font-mono text-[12px] text-ink">{justCreated}</code>
-                  <CopyButton text={justCreated} />
+                  <CopyButton text={justCreated} screen="developer" />
                 </div>
               </div>
             )}
@@ -291,7 +291,7 @@ function SnippetBlock({ step }: { step: ConnectStep }) {
         <pre className="overflow-x-auto whitespace-pre-wrap break-all px-3 py-2 pr-10 font-mono text-[12px] leading-relaxed text-ink">
           {step.snippet}
         </pre>
-        <CopyButton text={step.snippet} className="absolute right-2 top-2" />
+        <CopyButton text={step.snippet} className="absolute right-2 top-2" screen="developer" />
       </div>
     </div>
   )
@@ -397,7 +397,7 @@ function ApiReferenceSection() {
               </span>
               <span className="min-w-0 flex-1 truncate font-mono text-[13px] text-ink">{path}</span>
               <span className="hidden shrink-0 text-[11px] text-muted sm:block">{desc}</span>
-              <CopyButton text={`${BASE}${path}`} />
+              <CopyButton text={`${BASE}${path}`} screen="developer" />
             </div>
           ))}
         </div>

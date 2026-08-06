@@ -450,7 +450,7 @@ function CodeInstructionEntry({
         <p className="whitespace-pre-wrap text-[14px] leading-relaxed text-ink">{content}</p>
       </div>
       <div className="hover-actions flex items-center gap-0.5 px-0.5">
-        <CopyButton text={content} size={12} />
+        <CopyButton text={content} size={12} screen="code" />
         {onRevert && (
           <button
             type="button"
@@ -579,7 +579,7 @@ function CodeCommentary({ content, streaming }: { content: string; streaming?: b
       </div>
       {!streaming && (
         <div className="hover-actions">
-          <CopyButton text={content} size={12} />
+          <CopyButton text={content} size={12} screen="code" />
         </div>
       )}
     </div>

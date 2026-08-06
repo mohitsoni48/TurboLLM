@@ -61,7 +61,7 @@ export function EngineLoadErrorBanner({ status }: { status: Status | undefined }
             Open Engines
           </Button>
         )}
-        <CopyButton text={(error.logTail ?? []).join('\n')} label="Copy log" size={13} />
+        <CopyButton text={(error.logTail ?? []).join('\n')} label="Copy log" size={13} screen="engines" />
         <button
           type="button"
           onClick={() => { track('engines', 'dismiss_engine_error_banner'); setDismissedKey(key) }}

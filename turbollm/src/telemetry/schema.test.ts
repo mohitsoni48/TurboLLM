@@ -440,6 +440,19 @@ test('validateEvent: ui_action accepts the Phase 6kk batch actions (12 small fil
   }
 })
 
+test('validateEvent: ui_action accepts the Phase 6ll batch actions (copy-button.tsx, InlineError) -- closes the Phase 6 backlog', () => {
+  const screens = ['engines', 'models', 'developer', 'settings', 'code', 'chat']
+  for (const screen of screens) {
+    const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen, action: 'copy_button_click' } }))
+    assert.equal(r.ok, true, r.ok === false ? `${screen}/copy_button_click: ${r.reason}` : '')
+  }
+  const retryScreens = ['tokens', 'models', 'routines', 'engines']
+  for (const screen of retryScreens) {
+    const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen, action: 'retry_failed_load' } }))
+    assert.equal(r.ok, true, r.ok === false ? `${screen}/retry_failed_load: ${r.reason}` : '')
+  }
+})
+
 test('validateEvent: ui_action accepts the Phase 6ee CodeGitDialog batch actions', () => {
   const actions = ['commit_code_git', 'push_code_git', 'close_code_git_dialog']
   for (const action of actions) {

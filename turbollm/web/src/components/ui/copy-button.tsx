@@ -1,20 +1,24 @@
 import { useState } from 'react'
 import { Check, Copy } from 'lucide-react'
+import { track } from '../../lib/api'
 
 export function CopyButton({
   text,
   label,
   size = 13,
   className,
+  screen,
 }: {
   text: string
   label?: string
   size?: number
   className?: string
+  screen: 'engines' | 'models' | 'developer' | 'settings' | 'code' | 'chat'
 }) {
   const [copied, setCopied] = useState(false)
 
   const handle = () => {
+    track(screen, 'copy_button_click')
     void navigator.clipboard.writeText(text).then(() => {
       setCopied(true)
       setTimeout(() => setCopied(false), 1500)

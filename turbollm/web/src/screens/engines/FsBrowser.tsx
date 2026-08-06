@@ -133,6 +133,7 @@ export function FsBrowser({
           <InlineError
             message={error instanceof ApiError ? error.message : 'Could not read that folder.'}
             onRetry={() => void refetch()}
+            screen="engines"
             className="mt-3"
           />
         ) : (

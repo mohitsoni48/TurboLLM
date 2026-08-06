@@ -177,7 +177,7 @@ export function AddEngineDialog({
               <p className="text-[12px] text-faint">
                 Works with: ik_llama.cpp · TurboQuant · llama.cpp builds · any fork
               </p>
-              {error && <InlineError message={error} />}
+              {error && <InlineError message={error} screen="engines" />}
             </div>
 
             <DialogFooter>
@@ -225,7 +225,7 @@ export function AddEngineDialog({
                 <span className="text-[13px] font-medium text-ink">Name</span>
                 <Input value={name} onChange={(e) => setName(e.target.value)} autoFocus />
                 <span className="text-[12px] text-muted">Any label you choose — shown in the engine list.</span>
-                {nameError && <InlineError message={nameError} />}
+                {nameError && <InlineError message={nameError} screen="engines" />}
               </label>
 
               <div className="flex flex-col gap-1.5">
@@ -250,7 +250,7 @@ export function AddEngineDialog({
                 </span>
               </label>
 
-              {error && <InlineError message={error} />}
+              {error && <InlineError message={error} screen="engines" />}
             </div>
 
             <DialogFooter>

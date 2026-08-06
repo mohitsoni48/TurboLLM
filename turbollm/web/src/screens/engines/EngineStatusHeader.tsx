@@ -116,7 +116,7 @@ export function EngineStatusHeader({
               {error.message}
               {error.exitCode != null && ` (exit ${error.exitCode})`}
             </span>
-            <CopyButton text={(error?.logTail ?? []).join('\n')} label="Copy" size={14} />
+            <CopyButton text={(error?.logTail ?? []).join('\n')} label="Copy" size={14} screen="engines" />
           </div>
           <pre
             className="max-h-48 overflow-auto rounded-md px-3 py-2 font-mono text-[12px] leading-[1.5]"

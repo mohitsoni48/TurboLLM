@@ -258,7 +258,7 @@ function RoutineEditPageInner() {
     return (
       <RoutinesModeShell>
         <div className="flex flex-col gap-3 px-4 py-6 md:px-8">
-          <InlineError message="Could not load this routine." onRetry={() => void routineQ.refetch()} />
+          <InlineError message="Could not load this routine." onRetry={() => void routineQ.refetch()} screen="routines" />
           <Button size="sm" variant="outline" onClick={goBack} className="self-start">Back to routines</Button>
         </div>
       </RoutinesModeShell>
