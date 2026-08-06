@@ -423,6 +423,7 @@ export function EnginesScreen() {
           <InlineError
             message={enginesQ.error instanceof ApiError ? enginesQ.error.message : 'Could not load engines.'}
             onRetry={() => void enginesQ.refetch()}
+            screen="engines"
           />
         ) : (
           <EngineGallery

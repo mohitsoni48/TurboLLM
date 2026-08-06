@@ -532,7 +532,7 @@ export function ModelDetailDialog({
                 </Row>
                 {detail.loaded && statusQ.data?.engine.launchCommand && (
                   <Row label="Launch command" hint="The exact command TurboLLM spawned this model with.">
-                    <CopyButton text={statusQ.data.engine.launchCommand} label="Copy" size={14} />
+                    <CopyButton text={statusQ.data.engine.launchCommand} label="Copy" size={14} screen="models" />
                   </Row>
                 )}
                 <Row label="RoPE scaling" hint="Extend context beyond the model's trained limit. 'none' = model native.">

@@ -152,7 +152,7 @@ export const Markdown = memo(function Markdown({ children, streaming }: { childr
             <div className="relative my-2 overflow-hidden rounded-md border border-border bg-[var(--code-bg)]">
               <div className="flex items-center justify-between border-b border-border bg-panel-2 px-3 py-1 font-mono text-[12px] text-muted">
                 <span>{lang}</span>
-                <CopyButton text={childrenToString(children)} size={12} />
+                <CopyButton text={childrenToString(children)} size={12} screen="chat" />
               </div>
               <div className="overflow-x-auto overscroll-x-contain" onScroll={e => e.stopPropagation()}>
                 <code className={`${className ?? ''} block p-3 font-mono text-[13px] leading-relaxed whitespace-pre`} {...props}>{children}</code>
@@ -643,7 +643,7 @@ export function MessageBubble({
             <div className="flex items-center gap-0.5">
               {convId && message.variantGroup && <VariantSwitcher convId={convId} message={message} />}
               <div className="hover-actions flex items-center gap-0.5">
-                <CopyButton text={message.content} className="rounded p-1 hover:bg-panel-2" />
+                <CopyButton text={message.content} className="rounded p-1 hover:bg-panel-2" screen="chat" />
                 {onEdit && <ActionBtn icon={<Pencil size={12} />}  label="Edit"   onClick={() => { track('chat', 'open_edit_message'); setEditDraft(message.content); onEdit(message) }} />}
                 {onDelete && <ActionBtn icon={<Trash2 size={12} />} label="Delete" onClick={() => { track('chat', 'delete_message'); onDelete(message) }} destructive />}
               </div>
@@ -744,7 +744,7 @@ export function MessageBubble({
                 rendered all four buttons underneath regardless, which is the "block" the
                 follow-up report was pointing at. Delete/Regenerate stay: both are genuinely
                 useful on a failed/empty message. */}
-            {!hasError && <CopyButton text={message.content} className="rounded p-1 hover:bg-panel-2" />}
+            {!hasError && <CopyButton text={message.content} className="rounded p-1 hover:bg-panel-2" screen="chat" />}
             {!hasError && onEdit && <ActionBtn icon={<Pencil size={12} />} label="Edit" onClick={() => { track('chat', 'open_edit_message'); setEditDraft(message.content); onEdit(message) }} />}
             {isLast && onRegenerate && <ActionBtn icon={<RefreshCw size={12} />} label="Regenerate" onClick={() => { track('chat', 'regenerate_message'); onRegenerate() }} />}
             {onDelete && <ActionBtn icon={<Trash2 size={12} />} label="Delete" onClick={() => { track('chat', 'delete_message'); onDelete(message) }} destructive />}

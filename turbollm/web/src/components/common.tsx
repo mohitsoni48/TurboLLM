@@ -1,17 +1,23 @@
 import type { ReactNode } from 'react'
 import { AlertTriangle } from 'lucide-react'
 import { cn } from '../lib/utils'
+import { track } from '../lib/api'
 import { Button } from './ui/button'
 
-/** Inline error alert with optional retry (spec 11 §8). */
+/** Inline error alert with optional retry (spec 11 §8). `screen` is required whenever
+ *  `onRetry` is passed (the Retry button only renders then) — TypeScript can't express that
+ *  conditional requirement cleanly here, so it's just always required; callers with no retry
+ *  pass whichever screen they're on anyway, harmlessly unused. */
 export function InlineError({
   message,
   onRetry,
   className,
+  screen,
 }: {
   message: string
   onRetry?: () => void
   className?: string
+  screen: 'tokens' | 'models' | 'routines' | 'engines'
 }) {
   return (
     <div
@@ -29,7 +35,7 @@ export function InlineError({
       <AlertTriangle size={16} style={{ color: 'var(--err)' }} className="mt-0.5 shrink-0" />
       <div className="flex-1">{message}</div>
       {onRetry && (
-        <Button size="sm" variant="outline" onClick={onRetry}>
+        <Button size="sm" variant="outline" onClick={() => { track(screen, 'retry_failed_load'); onRetry() }}>
           Retry
         </Button>
       )}

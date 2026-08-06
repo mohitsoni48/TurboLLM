@@ -1559,7 +1559,7 @@ function AboutSection() {
           <div className="text-[12px] text-muted">Update from your terminal:</div>
           <div className="flex items-center justify-between gap-2 rounded-md border border-border bg-bg px-2.5 py-1.5">
             <code className="select-all font-mono text-[12px] text-ink">{APP_UPDATE_COMMAND}</code>
-            <CopyButton text={APP_UPDATE_COMMAND} />
+            <CopyButton text={APP_UPDATE_COMMAND} screen="settings" />
           </div>
         </div>
       ) : update?.latest && !update.hasUpdate ? (

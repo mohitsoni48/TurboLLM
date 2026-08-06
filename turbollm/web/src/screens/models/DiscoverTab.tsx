@@ -134,11 +134,13 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
               <InlineError
                 message="Hugging Face is unreachable — check your connection."
                 onRetry={() => searchQ.refetch()}
+                screen="models"
               />
             ) : searchQ.isError ? (
               <InlineError
                 message={searchQ.error instanceof ApiError ? searchQ.error.message : 'Search failed.'}
                 onRetry={() => searchQ.refetch()}
+                screen="models"
               />
             ) : results.length === 0 ? (
               <EmptyState

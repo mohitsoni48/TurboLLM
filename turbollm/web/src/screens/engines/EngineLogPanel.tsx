@@ -89,7 +89,7 @@ export function EngineLogPanel({
               <Switch checked={autoScroll} onCheckedChange={(v) => { track('engines', 'toggle_engine_log_autoscroll'); setAutoScroll(v) }} />
               Auto-scroll
             </label>
-            <CopyButton text={lines.join('\n')} label="Copy all" size={14} />
+            <CopyButton text={lines.join('\n')} label="Copy all" size={14} screen="engines" />
           </div>
         )}
       </div>

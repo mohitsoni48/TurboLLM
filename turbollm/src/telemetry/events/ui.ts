@@ -495,7 +495,31 @@ export const SCREENS = [
  *    nav link.
  *  - `components/AuthGate.tsx` — tagged `developer` (API keys are managed under the Developer
  *    screen, even though this gate itself renders outside any screen route on a 401).
- *    `submit_auth_key` for the "Connect" button. */
+ *    `submit_auth_key` for the "Connect" button.
+ *
+ *  Batch 38 (Phase 6ll): the last two files in the backlog — both cross-screen shared UI
+ *  primitives whose real surface area is their CALL SITES, not the files themselves. THIS
+ *  CLOSES OUT THE ENTIRE PHASE 6 BACKLOG (spec 23 §3.8) — every clickable element across the
+ *  app now fires a `track()` call.
+ *  - `components/ui/copy-button.tsx` — 1 new action, `copy_button_click`, folding every
+ *    copy-to-clipboard button app-wide into one action (same "same local function, different
+ *    param source" reasoning as `download_artifact`/`install_comfyui_gate` — copying IS
+ *    copying, regardless of what text). Takes a new required `screen` prop (same pattern as
+ *    Batch 32's `ModelLoadMenu`), threaded through all 14 real call sites across 6 screens:
+ *    `EngineLoadErrorBanner`/`EngineStatusHeader`/`EngineLogPanel` (`engines`),
+ *    `ModelDetailDialog` (`models`), `DeveloperScreen` ×4 (`developer`), `SettingsScreen`
+ *    (`settings`), `CodeTranscript` ×2 (`code`), `MessageBubble` ×3 (`chat`).
+ *  - `components/common.tsx`'s `InlineError` — 1 new action, `retry_failed_load`, for its
+ *    Retry button (only rendered when `onRetry` is supplied). Also takes a required `screen`
+ *    prop, threaded through all 10 call sites — 7 where the Retry button actually renders
+ *    (`TokensScreen`/`ModelsScreen`/`RoutineEditPage`/`DiscoverTab` ×2/`EnginesScreen`/
+ *    `FsBrowser`) and 3 where it's plumbed but inert (`AddEngineDialog` ×3, which never pass
+ *    `onRetry` — no button, no click, the prop is just there for a consistent required-prop
+ *    signature rather than a conditional type). `FsBrowser`'s own embedding varies by CALLER
+ *    (routines/models/engines/code all open it) — its internal scan-error retry is tagged
+ *    `engines` as the single most representative context rather than threading a second prop
+ *    through FsBrowser's own many callers for one inline error message; a reasonable
+ *    approximation, called out here rather than silently picked. */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -610,6 +634,8 @@ export const UI_ACTIONS = [
   'switch_token_tab', 'switch_token_range',
   'open_engines_from_nav_chip',
   'submit_auth_key',
+
+  'copy_button_click', 'retry_failed_load',
 ] as const
 
 export const uiAction = defineEvent({

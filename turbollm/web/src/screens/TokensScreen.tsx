@@ -167,7 +167,7 @@ export function TokensScreen() {
       )}
 
       {isError && !isLoading && (
-        <InlineError message="Couldn't load token usage." onRetry={() => void refetch()} />
+        <InlineError message="Couldn't load token usage." onRetry={() => void refetch()} screen="tokens" />
       )}
 
       {!isLoading && !isError && data && isEmpty && (

@@ -403,7 +403,7 @@ function LibraryTab({
           ))}
         </div>
       ) : modelsQ.isError ? (
-        <InlineError message="Could not load models." onRetry={() => modelsQ.refetch()} />
+        <InlineError message="Could not load models." onRetry={() => modelsQ.refetch()} screen="models" />
       ) : models.length === 0 ? (
         <EmptyState
           icon={<Boxes size={24} />}
