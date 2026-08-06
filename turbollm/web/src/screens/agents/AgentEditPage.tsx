@@ -4,7 +4,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { ChevronLeft, ChevronRight, RotateCcw, Trash2 } from 'lucide-react'
 import { Button } from '../../components/ui/button'
 import { toast } from '../../components/ui/sonner'
-import { ApiError } from '../../lib/api'
+import { ApiError, track } from '../../lib/api'
 import { fetchAvailableTools } from '../../lib/chat-api'
 import { fetchSkills, skillKeys } from '../../lib/agent-api'
 import { useBuiltinAgentOverrideMutations, useBuiltinAgentOverrides, useChatAgentMutations, useChatAgents } from '../../lib/queries'
@@ -78,7 +78,7 @@ function ToolGroupRow({ group, selected, onToggleAll, onToggleOne }: {
     <div className="rounded-md border border-border">
       <div className="flex items-center gap-2 px-2.5 py-2">
         <input ref={checkboxRef} type="checkbox" checked={allChecked} onChange={() => onToggleAll(names, !allChecked)} />
-        <button type="button" onClick={() => setOpen((o) => !o)} className="flex flex-1 items-center gap-1.5 text-left text-[13px] text-ink">
+        <button type="button" onClick={() => { track('agents', 'toggle_agent_tool_group'); setOpen((o) => !o) }} className="flex flex-1 items-center gap-1.5 text-left text-[13px] text-ink">
           <ChevronRight size={12} className={cn('shrink-0 text-faint transition-transform', open && 'rotate-90')} />
           {group.label}
           <span className="text-[11px] text-faint">({checkedCount}/{names.length})</span>
@@ -173,7 +173,7 @@ export function AgentEditPage() {
     setHydrated(true)
   }
 
-  const goBack = () => navigate('/customize')
+  const goBack = () => { track('agents', 'back_to_agents'); navigate('/customize') }
 
   const toggleSkill = (id: string) =>
     setForm((f) => ({ ...f, skillIds: f.skillIds.includes(id) ? f.skillIds.filter((s) => s !== id) : [...f.skillIds, id] }))
@@ -241,12 +241,12 @@ export function AgentEditPage() {
         </span>
         <div className="ml-auto flex items-center gap-2">
           {isBuiltin && (
-            <Button size="sm" variant="outline" onClick={handleReset} disabled={overrideMut.reset.isPending}>
+            <Button size="sm" variant="outline" onClick={() => { track('agents', 'reset_agent_to_default'); handleReset() }} disabled={overrideMut.reset.isPending}>
               <RotateCcw size={13} /> Reset to default
             </Button>
           )}
           <Button size="sm" variant="outline" onClick={goBack}>Cancel</Button>
-          <Button size="sm" onClick={handleSave} disabled={saving || !form.name.trim()}>
+          <Button size="sm" onClick={() => { track('agents', 'save_agent'); handleSave() }} disabled={saving || !form.name.trim()}>
             {saving ? 'Saving…' : 'Save'}
           </Button>
         </div>
@@ -294,7 +294,7 @@ export function AgentEditPage() {
             <button
               key={t}
               type="button"
-              onClick={() => setFormTab(t)}
+              onClick={() => { track('agents', 'switch_agent_form_tab'); setFormTab(t) }}
               className={cn(
                 'rounded px-3 py-1.5 text-[13px] font-medium transition-colors',
                 formTab === t ? 'bg-accent/12 text-accent' : 'text-muted hover:text-ink',
@@ -334,8 +334,8 @@ export function AgentEditPage() {
         deleteConfirm ? (
           <div className="flex items-center gap-2 self-start rounded-md border border-border bg-panel p-2 text-[12px]">
             <span className="flex-1 text-muted">Delete this agent?</span>
-            <button type="button" onClick={handleDelete} className="rounded px-2 py-1 text-[color:var(--err)] hover:bg-[color:color-mix(in_srgb,var(--err)_12%,transparent)]">Delete</button>
-            <button type="button" onClick={() => setDeleteConfirm(false)} className="rounded px-2 py-1 text-faint hover:text-ink">Cancel</button>
+            <button type="button" onClick={() => { track('agents', 'delete_agent'); handleDelete() }} className="rounded px-2 py-1 text-[color:var(--err)] hover:bg-[color:color-mix(in_srgb,var(--err)_12%,transparent)]">Delete</button>
+            <button type="button" onClick={() => { track('agents', 'cancel_delete_agent'); setDeleteConfirm(false) }} className="rounded px-2 py-1 text-faint hover:text-ink">Cancel</button>
           </div>
         ) : (
           <button type="button" onClick={() => setDeleteConfirm(true)} className="flex items-center gap-1.5 self-start text-[12px] text-faint hover:text-[color:var(--err)]">
