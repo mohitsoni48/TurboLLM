@@ -12,6 +12,7 @@ import { CopyButton } from '../../components/ui/copy-button'
 import { ArtifactCard, isArtifactLang } from '../../components/ArtifactCard'
 import { isRoutineConfirmTool, isSupersededUpdatePreview, RoutineConfirmToolCard } from '../../components/routines/RoutineConfirmToolCard'
 import { friendlyName } from '../../lib/tool-explain'
+import { track } from '../../lib/api'
 
 // ── Thinking block ────────────────────────────────────────────────────────────
 
@@ -38,7 +39,7 @@ function ThinkingBlock({ reasoning, thinkMs, streaming, showThinking = true }: {
     <div className="mb-3 rounded-lg border border-border bg-panel-2">
       <button
         type="button"
-        onClick={() => setOpen((o) => !o)}
+        onClick={() => { track('chat', 'toggle_thinking_block'); setOpen((o) => !o) }}
         className="flex w-full items-center gap-1.5 px-3 py-2 text-[12px] font-medium text-muted hover:text-ink"
       >
         <ChevronDown size={13} className={open ? 'rotate-180 transition-transform' : 'transition-transform'} />
@@ -236,7 +237,7 @@ function ToolCallCard({ call }: { call: CardCall }) {
     >
       <button
         type="button"
-        onClick={() => hasOutput && setExpanded((e) => !e)}
+        onClick={() => { if (hasOutput) { track('chat', 'toggle_tool_call_detail'); setExpanded((e) => !e) } }}
         className="flex w-full items-center gap-2 px-3 py-1.5 text-left"
         style={{ cursor: hasOutput ? 'pointer' : 'default' }}
       >
@@ -312,7 +313,7 @@ function InlineToolStep({ call, superseded }: { call: LiveToolCall; superseded?:
     <div className="my-1.5 overflow-hidden rounded-lg border border-border bg-panel-2">
       <button
         type="button"
-        onClick={() => hasOutput && setExpanded((e) => !e)}
+        onClick={() => { if (hasOutput) { track('chat', 'toggle_tool_call_detail'); setExpanded((e) => !e) } }}
         className="flex w-full items-center gap-2 px-3 py-1.5 text-left"
         style={{ cursor: hasOutput ? 'pointer' : 'default' }}
       >
@@ -374,7 +375,7 @@ function SourceRow({ source, idx }: { source: ResearchSource; idx: number }) {
     <div className="rounded border border-border bg-panel-2 overflow-hidden">
       <button
         type="button"
-        onClick={() => setOpen((o) => !o)}
+        onClick={() => { track('chat', 'toggle_source_row'); setOpen((o) => !o) }}
         className="flex w-full items-start gap-2 px-3 py-1.5 text-left text-[12px]"
       >
         <span className="shrink-0 font-mono text-faint">{idx + 1}.</span>
@@ -415,7 +416,7 @@ function SourcesPanel({ meta }: { meta: ResearchMeta }) {
     <div className="mt-2">
       <button
         type="button"
-        onClick={() => setOpen((o) => !o)}
+        onClick={() => { track('chat', 'toggle_sources_panel'); setOpen((o) => !o) }}
         className="flex items-center gap-1 text-[12px] text-muted hover:text-ink"
       >
         {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
@@ -614,8 +615,8 @@ export function MessageBubble({
                 }}
               />
               <div className="mt-1.5 flex gap-1.5 justify-end">
-                <Button size="sm" variant="ghost" onClick={onEditCancel}>Cancel</Button>
-                <Button size="sm" onClick={() => onEditSave(editDraft)}>Save & Resend</Button>
+                <Button size="sm" variant="ghost" onClick={() => { track('chat', 'cancel_edit_message'); onEditCancel() }}>Cancel</Button>
+                <Button size="sm" onClick={() => { track('chat', 'save_edited_message'); onEditSave(editDraft) }}>Save & Resend</Button>
               </div>
             </div>
           ) : (
@@ -643,8 +644,8 @@ export function MessageBubble({
               {convId && message.variantGroup && <VariantSwitcher convId={convId} message={message} />}
               <div className="hover-actions flex items-center gap-0.5">
                 <CopyButton text={message.content} className="rounded p-1 hover:bg-panel-2" />
-                {onEdit && <ActionBtn icon={<Pencil size={12} />}  label="Edit"   onClick={() => { setEditDraft(message.content); onEdit(message) }} />}
-                {onDelete && <ActionBtn icon={<Trash2 size={12} />} label="Delete" onClick={() => onDelete(message)} destructive />}
+                {onEdit && <ActionBtn icon={<Pencil size={12} />}  label="Edit"   onClick={() => { track('chat', 'open_edit_message'); setEditDraft(message.content); onEdit(message) }} />}
+                {onDelete && <ActionBtn icon={<Trash2 size={12} />} label="Delete" onClick={() => { track('chat', 'delete_message'); onDelete(message) }} destructive />}
               </div>
             </div>
           )}
@@ -701,16 +702,16 @@ export function MessageBubble({
             }}
           />
           <div className="mt-1.5 flex gap-1.5">
-            <Button size="sm" variant="ghost" onClick={onEditCancel}>Cancel</Button>
+            <Button size="sm" variant="ghost" onClick={() => { track('chat', 'cancel_edit_message'); onEditCancel() }}>Cancel</Button>
             {/* GitHub #52: unlike a user-message edit, this only fixes the reply's own
                 text in place — it doesn't resend or trigger a new generation. */}
-            <Button size="sm" onClick={() => onEditSave(editDraft)}>Save</Button>
+            <Button size="sm" onClick={() => { track('chat', 'save_edited_reply'); onEditSave(editDraft) }}>Save</Button>
           </div>
         </div>
       ) : hasError ? (
         <div className="rounded-lg border px-4 py-3 text-[13px]" style={{ borderColor: 'var(--err)', color: 'var(--err)', background: 'color-mix(in srgb, var(--err) 10%, transparent)' }}>
           {message.stats.aborted ? 'Generation failed or was stopped.' : 'This message is empty.'}
-          {isLast && onRegenerate && <button type="button" className="ml-3 underline" onClick={onRegenerate}>Regenerate</button>}
+          {isLast && onRegenerate && <button type="button" className="ml-3 underline" onClick={() => { track('chat', 'regenerate_message'); onRegenerate() }}>Regenerate</button>}
         </div>
       ) : (
         <div className="prose-tllm text-[15px] leading-[1.7] text-ink">
@@ -744,9 +745,9 @@ export function MessageBubble({
                 follow-up report was pointing at. Delete/Regenerate stay: both are genuinely
                 useful on a failed/empty message. */}
             {!hasError && <CopyButton text={message.content} className="rounded p-1 hover:bg-panel-2" />}
-            {!hasError && onEdit && <ActionBtn icon={<Pencil size={12} />} label="Edit" onClick={() => { setEditDraft(message.content); onEdit(message) }} />}
-            {isLast && onRegenerate && <ActionBtn icon={<RefreshCw size={12} />} label="Regenerate" onClick={onRegenerate} />}
-            {onDelete && <ActionBtn icon={<Trash2 size={12} />} label="Delete" onClick={() => onDelete(message)} destructive />}
+            {!hasError && onEdit && <ActionBtn icon={<Pencil size={12} />} label="Edit" onClick={() => { track('chat', 'open_edit_message'); setEditDraft(message.content); onEdit(message) }} />}
+            {isLast && onRegenerate && <ActionBtn icon={<RefreshCw size={12} />} label="Regenerate" onClick={() => { track('chat', 'regenerate_message'); onRegenerate() }} />}
+            {onDelete && <ActionBtn icon={<Trash2 size={12} />} label="Delete" onClick={() => { track('chat', 'delete_message'); onDelete(message) }} destructive />}
           </div>
         </div>
       )}
@@ -786,7 +787,7 @@ function VariantSwitcher({ convId, message }: { convId: string; message: Message
       <button
         type="button"
         disabled={switching || index <= 0}
-        onClick={() => go(variants[index - 1].id)}
+        onClick={() => { track('chat', 'switch_message_variant'); go(variants[index - 1].id) }}
         className="grid h-5 w-5 place-items-center rounded hover:bg-panel-2 disabled:pointer-events-none disabled:opacity-30"
         title="Previous version"
       >
@@ -796,7 +797,7 @@ function VariantSwitcher({ convId, message }: { convId: string; message: Message
       <button
         type="button"
         disabled={switching || index >= variants.length - 1}
-        onClick={() => go(variants[index + 1].id)}
+        onClick={() => { track('chat', 'switch_message_variant'); go(variants[index + 1].id) }}
         className="grid h-5 w-5 place-items-center rounded hover:bg-panel-2 disabled:pointer-events-none disabled:opacity-30"
         title="Next version"
       >

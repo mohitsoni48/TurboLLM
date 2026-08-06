@@ -70,7 +70,22 @@ export const SCREENS = [
  *  "Back to routines", the detail view's chevron) fold into one `back_to_routines` tracked
  *  once inside `goBack` itself, mirroring Batch 1's `update_engine`. The two run-selection
  *  buttons (a stalled run needing approval vs. a normal run row) fold into one
- *  `select_routine_run`, same reasoning. */
+ *  `select_routine_run`, same reasoning.
+ *
+ *  Batch 6 (Phase 6f): `screens/chat/MessageBubble.tsx` — 19 raw matches, 11 new distinct
+ *  actions. One skip is the exact `FilterChip`/`McpCard` shape again: `ActionBtn`'s own
+ *  generic `onClick={onClick}` relay — the real action is tracked at each of its 5 call sites
+ *  (Edit/Delete/Regenerate on both message roles), not inside the shared component. The other
+ *  skip is a genuine `e.stopPropagation()` guard on a source link. Several folds across the
+ *  user/assistant message halves, which duplicate the same controls for both roles: opening
+ *  edit mode (`open_edit_message`), cancelling it (`cancel_edit_message`) and deleting
+ *  (`delete_message`) are the same action regardless of role, so one name covers both. Saving
+ *  an edit is NOT folded the same way — a user-message save resends and triggers a new
+ *  generation, an assistant-message save only fixes the reply's text in place (this file's own
+ *  GitHub #52 comment), a real behavioral difference worth keeping visible as
+ *  `save_edited_message` vs. `save_edited_reply`. `regenerate_message` folds the error-state
+ *  fallback's inline "Regenerate" link with the normal hover action — both call the identical
+ *  `onRegenerate` prop. */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -95,6 +110,10 @@ export const UI_ACTIONS = [
   'back_to_routines', 'create_routine', 'edit_routine', 'discard_routine_edit',
   'review_routine_edit', 'pause_routine', 'resume_routine', 'run_routine_now',
   'delete_routine', 'select_routine_run',
+
+  'toggle_thinking_block', 'toggle_tool_call_detail', 'toggle_source_row', 'toggle_sources_panel',
+  'open_edit_message', 'cancel_edit_message', 'save_edited_message', 'save_edited_reply',
+  'delete_message', 'regenerate_message', 'switch_message_variant',
 ] as const
 
 export const uiAction = defineEvent({
