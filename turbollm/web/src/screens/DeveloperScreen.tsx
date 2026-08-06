@@ -7,7 +7,7 @@ import { ScreenHeader } from '../components/common'
 import { Button } from '../components/ui/button'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../components/ui/collapsible'
 import { useApiKeys, useNetworkInfo } from '../lib/queries'
-import { ApiError, getConnect, type ConnectStep, type NetworkInfo } from '../lib/api'
+import { ApiError, getConnect, track, type ConnectStep, type NetworkInfo } from '../lib/api'
 import { toast } from '../components/ui/sonner'
 import { cn } from '../lib/utils'
 
@@ -167,7 +167,7 @@ function ConnectionPanel() {
                     </div>
                     <button
                       type="button"
-                      onClick={() => handleRevoke(k.id, k.prefix)}
+                      onClick={() => { track('developer', 'revoke_api_key'); handleRevoke(k.id, k.prefix) }}
                       className="rounded p-1 text-faint transition-colors hover:text-err"
                       title="Revoke key"
                     >
@@ -186,7 +186,7 @@ function ConnectionPanel() {
                 className="flex-1 rounded-md border border-border bg-bg px-2.5 py-1.5 text-[13px] text-ink outline-none placeholder:text-faint focus:border-[color:var(--accent)]"
                 onKeyDown={(e) => e.key === 'Enter' && handleCreate()}
               />
-              <Button size="sm" onClick={handleCreate} disabled={!newName.trim() || create.isPending}>
+              <Button size="sm" onClick={() => { track('developer', 'create_api_key'); handleCreate() }} disabled={!newName.trim() || create.isPending}>
                 <Plus size={13} />
                 {create.isPending ? 'Creating…' : 'New key'}
               </Button>
@@ -243,7 +243,7 @@ function AppCard({ cli, selected, onSelect }: { cli: Cli; selected: boolean; onS
   return (
     <button
       type="button"
-      onClick={onSelect}
+      onClick={() => { track('developer', 'select_connect_cli'); onSelect() }}
       className="flex items-center gap-2.5 rounded-[10px] border bg-panel px-3 py-2.5 text-left transition-colors hover:border-[color:var(--accent)]"
       style={{ borderColor: selected ? 'var(--accent)' : 'var(--border)', borderWidth: selected ? 2 : 1 }}
     >
