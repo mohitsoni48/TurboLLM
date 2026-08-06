@@ -221,6 +221,19 @@ test('validateEvent: ui_action accepts the Phase 6j CodeComposer batch actions',
   }
 })
 
+test('validateEvent: ui_action accepts the Phase 6k ModelDetailDialog batch actions', () => {
+  const actions = [
+    'view_model_hf_repo', 'toggle_model_advanced_settings', 'load_model_with_settings',
+    'save_model_settings', 'reset_model_settings', 'dismiss_autotune_result', 'save_autotune_result',
+    'cancel_autotune', 'start_autotune', 'reset_model_setting_field', 'set_model_setting_option',
+    'remove_model_setting_chip',
+  ]
+  for (const action of actions) {
+    const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'models', action } }))
+    assert.equal(r.ok, true, r.ok === false ? `models/${action}: ${r.reason}` : '')
+  }
+})
+
 test('validateEvent: ui_daily requires screen plus both volume counters', () => {
   const r = validateEvent(validEvent({ event: 'ui_daily', payload: { screen: 'engines', actions: 5, distinctActions: 3 } }))
   assert.equal(r.ok, true, r.ok === false ? r.reason : '')
