@@ -136,6 +136,19 @@ test('validateEvent: ui_action accepts the Phase 6c ModelsScreen batch actions',
   }
 })
 
+test('validateEvent: ui_action accepts the Phase 6d CustomizeScreen batch actions', () => {
+  const actions = [
+    'switch_customize_tab', 'close_mcp_panel', 'connect_mcp_server', 'add_local_mcp_server',
+    'add_manual_mcp_server', 'update_mcp_server', 'cancel_mcp_edit', 'select_builtin_search',
+    'save_builtin_search', 'switch_mcp_tab', 'filter_mcp_category', 'select_mcp_catalog_entry',
+    'edit_mcp_server', 'delete_mcp_server', 'open_manual_mcp_form',
+  ]
+  for (const action of actions) {
+    const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'customize', action } }))
+    assert.equal(r.ok, true, r.ok === false ? `customize/${action}: ${r.reason}` : '')
+  }
+})
+
 test('validateEvent: ui_daily requires screen plus both volume counters', () => {
   const r = validateEvent(validEvent({ event: 'ui_daily', payload: { screen: 'engines', actions: 5, distinctActions: 3 } }))
   assert.equal(r.ok, true, r.ok === false ? r.reason : '')

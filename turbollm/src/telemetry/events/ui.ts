@@ -46,7 +46,16 @@ export const SCREENS = [
  *  already tracks — tracking inside the shared component would double-count every filter
  *  click). Model deletion always goes through a confirm dialog here (no "skip confirm"
  *  setting like chat's), so it is tracked once at the dialog's confirm action, not at the
- *  menu item that merely opens it. */
+ *  menu item that merely opens it.
+ *
+ *  Batch 4 (Phase 6d): `CustomizeScreen.tsx` — 21 raw matches, 15 distinct actions. Same
+ *  add-vs-update fold as `handleSubmit` sharing one function for both the manual-add form
+ *  and the edit form: tracked once inside `handleSubmit` with the action resolved from its
+ *  own `isEdit` branch, rather than at each button, so the two real outcomes (create vs.
+ *  update) stay distinguishable regardless of which button triggered them. `window.confirm`
+ *  (not the app's own AlertDialog) still gates the one destructive action here
+ *  (`delete_mcp_server`) — tracked after the confirm check passes, same "track the real
+ *  outcome, not the request" rule as every prior batch's confirm dialogs. */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -62,6 +71,11 @@ export const UI_ACTIONS = [
   'select_model_quant', 'eject_model', 'load_model', 'open_model_load_settings', 'pin_model',
   'find_model_quants', 'delete_model', 'set_primary_model_dir', 'remove_model_dir',
   'browse_model_dir', 'add_model_dir',
+
+  'switch_customize_tab', 'close_mcp_panel', 'connect_mcp_server', 'add_local_mcp_server',
+  'add_manual_mcp_server', 'update_mcp_server', 'cancel_mcp_edit', 'select_builtin_search',
+  'save_builtin_search', 'switch_mcp_tab', 'filter_mcp_category', 'select_mcp_catalog_entry',
+  'edit_mcp_server', 'delete_mcp_server', 'open_manual_mcp_form',
 ] as const
 
 export const uiAction = defineEvent({
