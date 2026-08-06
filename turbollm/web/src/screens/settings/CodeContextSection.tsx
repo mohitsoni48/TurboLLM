@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { ChevronRight, FileText, Plus, X } from 'lucide-react'
 import { useSettings } from '../../lib/queries'
-import { ApiError } from '../../lib/api'
+import { ApiError, track } from '../../lib/api'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../../components/ui/collapsible'
 import { toast } from '../../components/ui/sonner'
 import { cn } from '../../lib/utils'
@@ -26,6 +26,7 @@ function CandidateList({ label, hint, placeholder, candidates, saving, onSave }:
   const dirty = draft !== null && JSON.stringify(cleaned) !== JSON.stringify(candidates)
 
   const save = () => {
+    track('settings', 'save_context_candidates')
     onSave(cleaned)
     setDraft(null)
   }
@@ -50,7 +51,7 @@ function CandidateList({ label, hint, placeholder, candidates, saving, onSave }:
             />
             <button
               type="button"
-              onClick={() => setDraft(rows.filter((_, j) => j !== i))}
+              onClick={() => { track('settings', 'remove_context_candidate'); setDraft(rows.filter((_, j) => j !== i)) }}
               className="shrink-0 rounded-md p-1 text-faint hover:text-ink"
               aria-label={`Remove candidate ${i + 1}`}
             >
@@ -61,7 +62,7 @@ function CandidateList({ label, hint, placeholder, candidates, saving, onSave }:
         <div className="flex items-center justify-between">
           <button
             type="button"
-            onClick={() => setDraft([...rows, ''])}
+            onClick={() => { track('settings', 'add_context_candidate'); setDraft([...rows, '']) }}
             className="inline-flex items-center gap-1 text-[12px] text-muted hover:text-ink"
           >
             <Plus size={13} /> Add candidate

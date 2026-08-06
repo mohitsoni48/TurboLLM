@@ -355,7 +355,20 @@ export const SCREENS = [
  *  same "second UI, same real objects" pattern as Batch 18's `ManagedEngines.tsx`. All three
  *  reuse Batch 3's `set_primary_model_dir`/`remove_model_dir`/`add_model_dir`, tagged `models`
  *  (this file's own directory identity, same reasoning as Batch 22/28's `routines` tag) rather
- *  than `settings` (the screen it happens to be embedded in here). */
+ *  than `settings` (the screen it happens to be embedded in here).
+ *
+ *  Batch 30 (Phase 6dd): `screens/settings/CodeContextSection.tsx` — 3 raw matches, 3 new
+ *  distinct actions, no skips, tagged `settings` (its only embedding). All three live inside
+ *  the shared `CandidateList` component, tracked at its own real clicks — same "track inside
+ *  the reusable component" rule as `SkillCard`/`AgentCard`/`AppCard` — even though it's
+ *  instantiated twice (the project-file list and the global-file list). Not split into
+ *  per-list action variants: unlike Batch 12's `dismiss_build_success`/`close_build_guide`
+ *  split (a real behavioral difference), editing the project list vs. the global list is the
+ *  identical action on the identical component with no behavioral difference, only a different
+ *  target list — `add_context_candidate`/`remove_context_candidate` cover both instantiations,
+ *  `save_context_candidates` likewise (`add_code_context_file`, Batch 8, names an unrelated
+ *  action — attaching a file to a live Code session's context — not this file's
+ *  AGENTS.md-candidate-list editor). */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -442,6 +455,8 @@ export const UI_ACTIONS = [
   'revoke_api_key', 'create_api_key', 'select_connect_cli',
 
   'set_routine_flavor', 'browse_routine_workspace', 'toggle_routine_weekday', 'select_routine_workspace',
+
+  'add_context_candidate', 'remove_context_candidate', 'save_context_candidates',
 ] as const
 
 export const uiAction = defineEvent({
