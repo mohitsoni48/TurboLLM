@@ -255,7 +255,15 @@ export const SCREENS = [
  *  only its directory branch is tracked, as `open_fs_folder` — its file-select branch stays
  *  untracked for the same double-count reason. `navigate_fs_up`/`navigate_fs_to_path`/
  *  `refresh_fs_browser`/`cancel_fs_browser` are genuinely local to this dialog (no caller
- *  callback involved) and are tracked normally. */
+ *  callback involved) and are tracked normally.
+ *
+ *  Batch 20 (Phase 6t): `screens/skills/SkillsLibrary.tsx` — 5 raw matches, 4 new distinct
+ *  actions, no skips. `SkillCard`'s `onClick={onOpen}` is tracked inside the card itself
+ *  (`open_skill`) rather than at its one call site — same reasoning as Batch 17's
+ *  `QuantDropdown`: a same-file local component with a single instantiation, so there's no
+ *  double-count risk tracking at the real DOM click. `create_skill` folds the header's "New
+ *  skill" button with the empty-state's "Create your first skill" — both navigate to the
+ *  identical `/skills/new` route. */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -325,6 +333,8 @@ export const UI_ACTIONS = [
 
   'navigate_fs_up', 'navigate_fs_to_path', 'refresh_fs_browser', 'open_fs_folder',
   'cancel_fs_browser',
+
+  'open_skill', 'upload_skill_file', 'create_skill', 'learn_skill_from_folder',
 ] as const
 
 export const uiAction = defineEvent({

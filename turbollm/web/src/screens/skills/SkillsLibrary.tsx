@@ -4,7 +4,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { FolderInput, Plus, Sparkles, Upload, Wrench } from 'lucide-react'
 import { Button } from '../../components/ui/button'
 import { toast } from '../../components/ui/sonner'
-import { ApiError } from '../../lib/api'
+import { ApiError, track } from '../../lib/api'
 import { fetchSkills, importSkillText, learnFromFolder, skillKeys } from '../../lib/agent-api'
 import type { Skill } from '../../lib/agent-types'
 
@@ -12,7 +12,7 @@ function SkillCard({ skill, onOpen }: { skill: Skill; onOpen: () => void }) {
   return (
     <button
       type="button"
-      onClick={onOpen}
+      onClick={() => { track('skills', 'open_skill'); onOpen() }}
       className="flex flex-col gap-2 rounded-xl border border-border bg-panel px-4 py-3.5 text-left transition-colors hover:border-accent hover:bg-panel-2"
     >
       <div className="flex items-center gap-2">
@@ -87,10 +87,10 @@ export function SkillsLibrary() {
         </div>
         <div className="flex shrink-0 items-center gap-2">
           <input ref={uploadRef} type="file" accept=".md,text/markdown" hidden onChange={(e) => void handleUpload(e)} />
-          <Button size="sm" variant="outline" onClick={() => uploadRef.current?.click()}>
+          <Button size="sm" variant="outline" onClick={() => { track('skills', 'upload_skill_file'); uploadRef.current?.click() }}>
             <Upload size={14} /> Upload SKILL.md
           </Button>
-          <Button size="sm" onClick={() => navigate('/skills/new')}>
+          <Button size="sm" onClick={() => { track('skills', 'create_skill'); navigate('/skills/new') }}>
             <Plus size={14} /> New skill
           </Button>
         </div>
@@ -109,7 +109,7 @@ export function SkillsLibrary() {
             onChange={(e) => setFolder(e.target.value)}
             onKeyDown={(e) => { if (e.key === 'Enter') void handleLearn() }}
           />
-          <Button size="sm" variant="outline" disabled={learning || !folder.trim()} onClick={() => void handleLearn()}>
+          <Button size="sm" variant="outline" disabled={learning || !folder.trim()} onClick={() => { track('skills', 'learn_skill_from_folder'); void handleLearn() }}>
             Learn
           </Button>
         </div>
@@ -122,7 +122,7 @@ export function SkillsLibrary() {
         <div className="flex flex-col items-center gap-3 py-10">
           <Sparkles size={28} className="text-faint" />
           <p className="text-[13px] text-muted">No skills yet.</p>
-          <Button size="sm" variant="outline" onClick={() => navigate('/skills/new')}>
+          <Button size="sm" variant="outline" onClick={() => { track('skills', 'create_skill'); navigate('/skills/new') }}>
             <Plus size={14} /> Create your first skill
           </Button>
         </div>
