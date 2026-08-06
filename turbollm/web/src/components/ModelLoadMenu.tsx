@@ -1,6 +1,7 @@
 import { Check, ChevronDown, CircleSlash, Cpu, Loader2, SlidersHorizontal, Star } from 'lucide-react'
 import type { ModelEntry } from '../lib/types'
 import { usePinnedModels } from '../lib/usePinnedModels'
+import { track } from '../lib/api'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -25,6 +26,7 @@ export function ModelLoadMenu({
   onEject,
   onSettings,
   align = 'start',
+  screen,
 }: {
   models: ModelEntry[]
   loadedKey?: string | null
@@ -35,6 +37,7 @@ export function ModelLoadMenu({
   onEject: () => void
   onSettings?: (key: string) => void
   align?: 'start' | 'end'
+  screen: 'chat' | 'code'
 }) {
   const { isPinned } = usePinnedModels()
   // Pinned models float to the top (same convention as the library list in ModelsScreen),
@@ -77,8 +80,8 @@ export function ModelLoadMenu({
               tabIndex={-1}
               className="flex cursor-pointer select-none items-center gap-2 rounded-sm px-2 py-1.5 text-[13px] outline-none hover:bg-panel-2 focus:bg-panel-2"
               onClick={(e) => {
-                if (e.altKey && onSettings) { onSettings(m.key); return }
-                if (!active) onLoad(m.key)
+                if (e.altKey && onSettings) { track(screen, 'open_model_load_settings'); onSettings(m.key); return }
+                if (!active) { track(screen, 'load_model'); onLoad(m.key) }
               }}
             >
               <span className="flex h-4 w-4 shrink-0 items-center justify-center">
@@ -91,6 +94,7 @@ export function ModelLoadMenu({
                   type="button"
                   onClick={(e) => {
                     e.stopPropagation()
+                    track(screen, 'open_model_load_settings')
                     onSettings(m.key)
                   }}
                   className="grid h-6 w-6 shrink-0 place-items-center rounded text-faint transition-colors hover:bg-panel hover:text-ink"
@@ -109,7 +113,7 @@ export function ModelLoadMenu({
         {loadedKey && (
           <>
             <DropdownMenuSeparator />
-            <DropdownMenuItem onSelect={onEject} style={{ color: 'var(--err)' }}>
+            <DropdownMenuItem onSelect={() => { track(screen, 'eject_model'); onEject() }} style={{ color: 'var(--err)' }}>
               <CircleSlash size={14} /> Eject model
             </DropdownMenuItem>
           </>

@@ -853,6 +853,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
             onLoad={handleLoadModel}
             onEject={handleEject}
             onSettings={(key) => setSettingsKey(key)}
+            screen="chat"
           />
           {model && (
             <Button

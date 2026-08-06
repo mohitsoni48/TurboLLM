@@ -823,6 +823,7 @@ export function CodeComposer({
             onEject={onEjectModel}
             onSettings={onModelSettings}
             align="end"
+            screen="code"
           />
           {live ? (
             // Mid-run: Stop controls the live run; when there's text to submit, TWO send actions
