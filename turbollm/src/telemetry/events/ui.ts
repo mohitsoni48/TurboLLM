@@ -227,7 +227,20 @@ export const SCREENS = [
  *  click is `QuantDropdown`'s own `DropdownMenuItem`, tracked there as `select_hf_quant`, not
  *  at the pass-through prop. `download_hf_model` (the safetensors/MLX-family whole-repo
  *  download, `MlxRepoBody`) is kept distinct from `download_hf_quant` (the GGUF single-file
- *  download) — genuinely different downloads, not just two labels on the same button. */
+ *  download) — genuinely different downloads, not just two labels on the same button.
+ *
+ *  Batch 18 (Phase 6r): `screens/engines/ManagedEngines.tsx`'s `LlamaCppBackendRows` — 7 raw
+ *  matches, ZERO new actions. This component is a second, flat-list UI (rendered inside
+ *  `EnginesScreen.tsx`'s catalog) for managing the exact same official llama.cpp backend
+ *  variants Batch 1 already covers — Download/Update/Enable/Disable/set-policy/Delete here are
+ *  the identical underlying mutations as `EnginesScreen.tsx`'s own `EngineCard` buttons, just a
+ *  different physical control for the same action, so every one of them reuses Batch 1's
+ *  `install_engine`/`update_engine`/`enable_engine`/`disable_engine`/
+ *  `set_engine_update_policy`/`delete_engine` rather than inventing near-duplicate names. The
+ *  one skip is the Delete menu item, which only opens the confirm dialog
+ *  (`setDeleteTarget(...)`) — `delete_engine` is tracked at the `AlertDialogAction` that
+ *  actually fires the delete, same "track the outcome, not the request" rule as every prior
+ *  batch's confirm dialogs. */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
