@@ -25,6 +25,18 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.10.4] - 2026-08-06
+
+### Fixed
+- Auto-tune could recommend **zero** CPU offload for a MoE model that clearly needed some — on
+  some engine builds (confirmed on BeeLlama.cpp) this silently spilled the model into system RAM
+  instead of failing loudly, so auto-tune's own "0 experts on CPU" search step could look like it
+  fit when it actually didn't. The offload count is now always passed explicitly to the engine,
+  including zero, closing the ambiguity that let this happen.
+
+### Discord
+- Fixed a real auto-tune bug: it could occasionally recommend zero CPU offload for a MoE model that needed some, which silently tanked performance instead of erroring. Re-run Auto-Tune if a model has felt slower than it should since your last tune.
+
 ## [1.10.3] - 2026-08-06
 
 ### Changed
