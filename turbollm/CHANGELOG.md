@@ -25,6 +25,29 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.10.3] - 2026-08-06
+
+### Changed
+- If you've opted into the "Full" telemetry level, it now also reports which screens/buttons you
+  interact with (click-level, no content — e.g. "Engines screen, install button") and which
+  external coding-tool client is connecting to your local API (e.g. Claude Code, Cursor), on top
+  of the model/feature usage it already reported. The "Anonymous" and "Off" levels are unaffected.
+  Settings → Privacy → "Preview what we send" always shows the exact current payload for your
+  level, and the README documents the full breakdown.
+- Cleared 13 of 15 known dependency security advisories via routine updates (2 remain, both
+  blocked on upstream releases not yet available).
+
+### Fixed
+- "Rename" and "Re-probe" are back for custom (git-built) engines on the Engines screen. A
+  screen redesign several releases back had silently dropped these buttons from view even though
+  renaming/re-probing kept working correctly underneath — they're now wired into the engine card
+  again.
+
+### Discord
+- Fixed: "Rename" and "Re-probe" for your own custom-built engines, which had quietly stopped showing up a while back — they're back on the Engines screen.
+- Cleared 13 known security advisories in our dependencies under the hood — nothing for you to do.
+- If you've opted into full telemetry: it now also reports which screens/buttons you use and which coding-tool client connects to your API (Claude Code, Cursor, etc.), so we can see what's actually getting used. Totally optional — check exactly what's sent anytime in Settings → Privacy.
+
 ## [1.10.2] - 2026-08-05
 
 ### Added

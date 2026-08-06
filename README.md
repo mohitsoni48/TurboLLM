@@ -597,7 +597,12 @@ actually sending it. Change your level any time from **Settings → Privacy & te
 - **Off** — sends only that one-time choice, nothing else, ever.
 - **Anonymous usage + benchmarks** — which features you use, your hardware, model names, and
   measured speed. Never prompts, files, paths, or keys.
-- **Usage + benchmarks + crash reports** (default) — adds error fingerprints (never your content).
+- **Usage + benchmarks + crash reports** (default) — adds error fingerprints (never your content),
+  the resolved model config behind a load or benchmark (context length, quantization, GPU
+  offload — never anything that could identify a specific file), which coding tool is connected to
+  the local API (e.g. Claude Code, opencode — never which files, projects, or prompts it sends),
+  daily volume counts (chats, messages per chat, API requests — never their content), and which
+  screens and buttons you use (never their content or your cursor position).
 
 You can preview the exact payload before anything is sent, and inspect a running log of every
 event this machine has *actually* transmitted, from the same Settings section. For scripted or
