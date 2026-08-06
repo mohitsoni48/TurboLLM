@@ -314,6 +314,14 @@ test('validateEvent: ui_action accepts the Phase 6t SkillsLibrary batch actions'
   }
 })
 
+test('validateEvent: ui_action accepts the Phase 6u CodeTranscript batch actions', () => {
+  const actions = ['toggle_code_tool_detail', 'send_queued_code_message']
+  for (const action of actions) {
+    const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'code', action } }))
+    assert.equal(r.ok, true, r.ok === false ? `code/${action}: ${r.reason}` : '')
+  }
+})
+
 test('validateEvent: ui_daily requires screen plus both volume counters', () => {
   const r = validateEvent(validEvent({ event: 'ui_daily', payload: { screen: 'engines', actions: 5, distinctActions: 3 } }))
   assert.equal(r.ok, true, r.ok === false ? r.reason : '')

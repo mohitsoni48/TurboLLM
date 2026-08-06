@@ -263,7 +263,18 @@ export const SCREENS = [
  *  `QuantDropdown`: a same-file local component with a single instantiation, so there's no
  *  double-count risk tracking at the real DOM click. `create_skill` folds the header's "New
  *  skill" button with the empty-state's "Create your first skill" — both navigate to the
- *  identical `/skills/new` route. */
+ *  identical `/skills/new` route.
+ *
+ *  Batch 21 (Phase 6u): `screens/code/CodeTranscript.tsx` — 5 raw matches, 2 new distinct
+ *  actions, 1 skip. `toggle_code_tool_detail` folds `CodeToolLine`'s single-call expand/collapse
+ *  with `CodeToolGroup`'s grouped-bash-run expand/collapse — same conceptual action at two
+ *  granularities. The reasoning-block toggle reuses Batch 6's `toggle_thinking_block` across
+ *  screens (chat/code render the same underlying concept in different transcript styles), same
+ *  cross-screen reuse as `toggle_sidebar_collapsed`/`scroll_to_latest`. The skip is
+ *  `CodeInstructionEntry`'s "Revert to this message" — it only opens the confirm dialog
+ *  (`openRevertConfirm`, wired from `CodeSessionScreen.tsx`); the confirmed outcome is already
+ *  tracked as `revert_code_chat`/`revert_code_chat_and_files` at Batch 8's `AlertDialogAction`
+ *  buttons, so tracking the opening click too would count the same revert twice. */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -335,6 +346,8 @@ export const UI_ACTIONS = [
   'cancel_fs_browser',
 
   'open_skill', 'upload_skill_file', 'create_skill', 'learn_skill_from_folder',
+
+  'toggle_code_tool_detail', 'send_queued_code_message',
 ] as const
 
 export const uiAction = defineEvent({

@@ -25,6 +25,7 @@ import type { RetryState } from '../../lib/code-session-client'
 import { useDisplayPref } from '../../lib/code-display-prefs'
 import type { LiveBlock } from '../../lib/live-timeline'
 import { friendlyName } from '../../lib/tool-explain'
+import { track } from '../../lib/api'
 import { cn } from '../../lib/utils'
 import { CopyButton } from '../../components/ui/copy-button'
 import { Skeleton } from '../../components/ui/skeleton'
@@ -271,7 +272,7 @@ function CodeToolLine({ call }: { call: NormalizedCall }) {
     <div>
       <button
         type="button"
-        onClick={() => hasOutput && setExpanded((e) => !e)}
+        onClick={() => { if (hasOutput) { track('code', 'toggle_code_tool_detail'); setExpanded((e) => !e) } }}
         disabled={!hasOutput}
         title={toolTooltip(call.name, label)}
         className="flex w-full items-center gap-2 rounded px-1 py-0.5 text-left transition-colors hover:bg-panel-2 disabled:cursor-default disabled:hover:bg-transparent"
@@ -366,7 +367,7 @@ function CodeToolGroup({ lead, calls }: { lead: string; calls: NormalizedCall[] 
     <div>
       <button
         type="button"
-        onClick={() => setExpanded((e) => !e)}
+        onClick={() => { track('code', 'toggle_code_tool_detail'); setExpanded((e) => !e) }}
         title="Runs shell commands — may read or write anywhere"
         className="flex w-full items-center gap-2 rounded px-1 py-0.5 text-left transition-colors hover:bg-panel-2"
       >
@@ -522,7 +523,7 @@ function CodeQueuedEntry({ task, kind, onSendNow }: { task: string; kind: SteerK
           <div className="mt-1 flex items-center justify-end">
             <button
               type="button"
-              onClick={onSendNow}
+              onClick={() => { track('code', 'send_queued_code_message'); onSendNow() }}
               title="Send now — stop the current run and run this one next"
               className="inline-flex items-center gap-1 rounded p-1 text-[11px] font-medium text-faint transition-colors hover:text-ink"
             >
@@ -547,7 +548,7 @@ function CodeReasoning({ reasoning, streaming }: { reasoning: string; streaming?
     <div>
       <button
         type="button"
-        onClick={() => setOpen((o) => !o)}
+        onClick={() => { track('code', 'toggle_thinking_block'); setOpen((o) => !o) }}
         className="flex w-full items-center gap-1.5 rounded px-1 py-0.5 text-left font-mono text-[11px] text-muted transition-colors hover:text-ink"
       >
         {streaming ? 'reasoning…' : 'reasoning'}
