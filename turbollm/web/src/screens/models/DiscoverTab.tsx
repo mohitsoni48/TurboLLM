@@ -9,7 +9,7 @@
 
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject } from 'react'
 import { Link2, Lock, Search } from 'lucide-react'
-import { ApiError } from '../../lib/api'
+import { ApiError, track } from '../../lib/api'
 import { useHfSearch } from '../../lib/queries'
 import type { HfSearchItem, HfSortOption } from '../../lib/types'
 import { EmptyState, InlineError } from '../../components/common'
@@ -109,7 +109,7 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
             </div>
             <button
               type="button"
-              onClick={() => setImportOpen(true)}
+              onClick={() => { track('models', 'open_import_url_dialog'); setImportOpen(true) }}
               title="Import from URL"
               className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-border bg-transparent p-2 text-ink transition-colors hover:bg-panel-2"
             >
@@ -263,7 +263,7 @@ function ListRow({
   return (
     <button
       type="button"
-      onClick={onSelect}
+      onClick={() => { track('models', 'select_discover_result'); onSelect() }}
       className="flex shrink-0 items-start gap-2.5 rounded-lg border px-3 py-2.5 text-left transition-colors"
       style={{
         borderColor: selected ? 'var(--accent)' : 'transparent',

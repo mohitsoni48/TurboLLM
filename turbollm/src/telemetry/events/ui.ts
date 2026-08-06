@@ -293,7 +293,16 @@ export const SCREENS = [
  *  for Code) — its mobile sidebar backdrop/hamburger reuse `toggle_sidebar_collapsed` (Batch
  *  5), its "New routine" empty-state button reuses `new_routine` (Batch 2, `ConversationSidebar`'s
  *  own "+ New" button in routines mode — same route, same effect), and the sidebar's `onSelect`
- *  is the usual `ConversationSidebar` relay skip. */
+ *  is the usual `ConversationSidebar` relay skip.
+ *
+ *  Batch 24 (Phase 6x): `screens/models/DiscoverTab.tsx` — 4 raw matches, 2 new distinct
+ *  actions, 2 skips. `select_discover_result` is tracked at the real DOM click —
+ *  `ListRow`'s own `onClick={onSelect}` — not at either of the two pass-through layers above
+ *  it (`ResultListRow`'s `onSelect={onSelect}` forwarding straight through, and
+ *  `DiscoverTab`'s own `onSelect={() => setSelectedRepo(r.repo)}` prop supply): all three
+ *  raw-match the grep selector for what is structurally ONE click, so only the innermost real
+ *  button gets tracked, same "track at the real DOM click, not the relay" rule as every prior
+ *  local-component case (`QuantDropdown`, `SkillCard`). */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -370,6 +379,8 @@ export const UI_ACTIONS = [
 
   'cancel_routine_confirm_edit', 'save_routine_confirm_edit', 'edit_routine_confirm',
   'cancel_routine_confirm', 'confirm_routine',
+
+  'open_import_url_dialog', 'select_discover_result',
 ] as const
 
 export const uiAction = defineEvent({

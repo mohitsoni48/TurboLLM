@@ -333,6 +333,14 @@ test('validateEvent: ui_action accepts the Phase 6v RoutineConfirmCard batch act
   }
 })
 
+test('validateEvent: ui_action accepts the Phase 6x DiscoverTab batch actions', () => {
+  const actions = ['open_import_url_dialog', 'select_discover_result']
+  for (const action of actions) {
+    const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'models', action } }))
+    assert.equal(r.ok, true, r.ok === false ? `models/${action}: ${r.reason}` : '')
+  }
+})
+
 test('validateEvent: ui_daily requires screen plus both volume counters', () => {
   const r = validateEvent(validEvent({ event: 'ui_daily', payload: { screen: 'engines', actions: 5, distinctActions: 3 } }))
   assert.equal(r.ok, true, r.ok === false ? r.reason : '')
