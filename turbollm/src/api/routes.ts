@@ -1217,11 +1217,15 @@ export function registerApi(app: Hono, d: Deps): void {
         // --max-model-len/--gpu-memory-utilization/--dtype/…) built via vllmProfileToArgs,
         // plus the multi-GPU shard count (ADR-054) mapped to --tensor-parallel-size below.
         const savedProfile = getModelProfile(cfg, entry.key, active.id) as Partial<LoadProfile> | undefined
+        // Resolved once regardless of engine kind (mlx's own arg-building doesn't need
+        // it, but `model_load` telemetry — spec 23 §3.3 — wants the same full-config
+        // shape for every engine, not just vLLM).
+        const profile = resolveProfile(entry, sys, savedProfile, b.profileOverrides, cfg.modelDefaults)
         const extraArgs =
           active.kind === 'mlx'
             ? mlxSamplingArgs(savedProfile?.sampling)
             : active.kind === 'vllm'
-              ? vllmProfileToArgs(resolveProfile(entry, sys, savedProfile, b.profileOverrides, cfg.modelDefaults), entry.nativeCtx)
+              ? vllmProfileToArgs(profile, entry.nativeCtx)
               : []
         opts = {
           engine: active,
@@ -1230,6 +1234,8 @@ export function registerApi(app: Hono, d: Deps): void {
           extraArgs,
           tensorParallelSize: savedProfile?.gpu?.tensorParallelSize,
           preferredPort: savedProfile?.port,
+          profile,
+          trigger: 'manual',
         }
       } else {
         const saved = getModelProfile(cfg, entry.key, active.id) as Partial<LoadProfile> | undefined
@@ -1247,6 +1253,8 @@ export function registerApi(app: Hono, d: Deps): void {
           modelPath: entry.path,
           extraArgs,
           preferredPort: profile.port,
+          profile,
+          trigger: 'manual',
         }
       }
       // Single chokepoint (rule 3): load() stops the current model, runs the reverse

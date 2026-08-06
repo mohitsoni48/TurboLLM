@@ -12,7 +12,7 @@
 
 import { appFirstRun, dailyActive } from './lifecycle'
 import { onboardingStep } from './onboarding'
-import { modelFirstLoad } from './model'
+import { modelFirstLoad, modelLoad } from './model'
 import { featureFirstUse, featureUsedDaily } from './feature'
 import { errorEvent, consentChoice } from './meta'
 import { benchResult } from './perf'
@@ -22,6 +22,7 @@ export const REGISTRY = {
   daily_active: dailyActive,
   onboarding_step: onboardingStep,
   model_first_load: modelFirstLoad,
+  model_load: modelLoad,
   feature_first_use: featureFirstUse,
   feature_used_daily: featureUsedDaily,
   error: errorEvent,
@@ -38,6 +39,7 @@ export {
   dailyActive,
   onboardingStep,
   modelFirstLoad,
+  modelLoad,
   featureFirstUse,
   featureUsedDaily,
   errorEvent,

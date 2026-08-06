@@ -24,7 +24,7 @@ import { engineAcceptsFormat } from './engines/compat'
 import { Scanner } from './models/scanner'
 import { seedDefaultModelDir } from './models/hf-cache'
 import { HashStore } from './models/hashes'
-import { resolveProfile, profileToArgs, type LoadProfile } from './models/profile'
+import { resolveProfile, profileToArgs, estimateVram, type LoadProfile } from './models/profile'
 import { getSysInfo } from './sysinfo/sysinfo'
 import { ConversationStore } from './chat/db'
 import { HfClient } from './hf/hf'
@@ -45,10 +45,11 @@ import { TunnelManager, reapStaleTunnels, killTrackedTunnelsSync } from './tunne
 import type { Deps } from './deps'
 import { TELEMETRY_ENV } from './telemetry/disabled'
 import { Emitter } from './telemetry/emit'
-import { reportModelLoad } from './telemetry/first-load'
 import { classifyLoadFailure, classifyEngineErrorFingerprint } from './telemetry/classify'
 import { claimOnce } from './telemetry/ledger'
 import { flush } from './telemetry/uploader'
+import { emit } from './telemetry/runtime/typed-emit'
+import { modelLoad, buildModelLoadConfig } from './telemetry/events/model'
 
 // Stop child processes (the agent engine's shell tool, engine binaries, git,
 // etc.) from flashing a console window on Windows when the daemon has no console
@@ -361,7 +362,7 @@ telemetry.dailyActive()
 // signal separating "never tried" from "tried and it broke". Observed at
 // Manager's atomic swap point rather than at the two routes.ts call sites,
 // which fire load() without awaiting and so cannot see the outcome.
-manager.onLoadSettled = (ok, err) => {
+manager.onLoadSettled = (ok, err, opts) => {
   const outcome = ok ? 'ok' : 'fail'
   // onboarding_step (ADR-299): the 3rd setup step (ADR-323 made first_chat the last) —
   // ONBOARDING_STEPS (schema.ts)
@@ -373,17 +374,39 @@ manager.onLoadSettled = (ok, err) => {
   // EVERY model load, including the routine swap-on-demand that is this product's core
   // gateway feature. Without the guard, an active user's ordinary usage would emit this
   // "setup" event forever, misrepresenting the funnel and eating into the same per-machine
-  // rate budget the other onboarding_step events share (release-2 review finding). A first
-  // FAILURE still claims it, matching model_first_load's own "first outcome, whatever it
-  // is" semantics below.
+  // rate budget the other onboarding_step events share (release-2 review finding). Retired
+  // alongside onboarding_step itself in a later pass (spec 23 §4) — this file is still where
+  // it lives until then.
   if (claimOnce(store.dir(), 'once:onboarding_step:first_load')) {
     telemetry.emit('onboarding_step', { step: 'first_load', outcome })
   }
-  reportModelLoad(store.dir(), telemetry, outcome, ok ? undefined : classifyLoadFailure(err))
+  // model_load (spec 23 §3.3, ADR-333): fires on EVERY load, not just the first
+  // (model_first_load, retired here — the funnel's "first load" is now derivable
+  // as the first model_load per machine, matching the "journey derived from real
+  // events" principle the whole redesign is built on, spec 23 §4). Config is
+  // included only when a real model entry + resolved profile were both available
+  // — the transitional dev-model fallback path has neither, and a partial/
+  // fabricated config would be worse than an honestly absent one.
+  const entry = scanner.get(opts.model.key)
+  if (entry && opts.profile) {
+    const vram = estimateVram(opts.profile, entry, getSysInfo())
+    emit(telemetry, modelLoad, {
+      outcome,
+      ...(ok ? {} : { failReason: classifyLoadFailure(err) }),
+      trigger: opts.trigger ?? 'manual',
+      ...buildModelLoadConfig(entry, opts.profile, opts.engine, vram),
+    })
+  } else {
+    emit(telemetry, modelLoad, {
+      outcome,
+      ...(ok ? {} : { failReason: classifyLoadFailure(err) }),
+      trigger: opts.trigger ?? 'manual',
+    })
+  }
   // `error` (telemetry-review follow-up, previously never wired to anything):
   // an ongoing crash signal, deliberately NOT once-only — every engine failure
-  // after the first is still real "what is failing?" data, unlike the
-  // once-ever model_first_load milestone above.
+  // after the first is still real "what is failing?" data, unlike a once-ever
+  // milestone.
   if (!ok) telemetry.error(classifyEngineErrorFingerprint(err))
 }
 // Auto-tune's sweep is a SEPARATE path to a first load (Manager.start(), not
@@ -802,6 +825,7 @@ void (async () => {
         model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: entry.nativeCtx, vision: entry.vision },
         modelPath: entry.path,
         extraArgs: [],
+        trigger: 'resume',
       }
     } else {
       const saved = getModelProfile(cfg, entry.key, active.id) as Partial<LoadProfile> | undefined
@@ -811,6 +835,8 @@ void (async () => {
         model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: profile.ctx, vision: entry.vision },
         modelPath: entry.path,
         extraArgs: profileToArgs(profile, entry, active.capabilities, sys.cores, sys, active.binPath),
+        profile,
+        trigger: 'resume',
       }
     }
   } else if (cfg.devModel) {
@@ -819,6 +845,7 @@ void (async () => {
       model: { key: cfg.devModel.modelPath, name: cfg.devModel.label, quant: '', ctx: 0, vision: false },
       modelPath: cfg.devModel.modelPath,
       extraArgs: cfg.devModel.extraArgs,
+      trigger: 'resume',
     }
   }
   if (opts) {

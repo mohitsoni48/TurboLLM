@@ -331,6 +331,10 @@ export class ModelRouter {
     const sys = getSysInfo()
     if (entry.format !== 'gguf') {
       const savedProfile = getModelProfile(cfg, entry.key, engine.id) as Partial<LoadProfile> | undefined
+      // Resolved once regardless of engine kind — see routes.ts's identical load
+      // route for why (model_load telemetry, spec 23 §3.3, wants the same
+      // full-config shape whichever engine actually ends up loading).
+      const profile = resolveProfile(entry, sys, savedProfile, undefined, cfg.modelDefaults)
       return {
         engine,
         model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: entry.nativeCtx, vision: entry.vision },
@@ -340,9 +344,11 @@ export class ModelRouter {
           engine.kind === 'mlx'
             ? mlxSamplingArgs(savedProfile?.sampling)
             : engine.kind === 'vllm'
-              ? vllmProfileToArgs(resolveProfile(entry, sys, savedProfile, undefined, cfg.modelDefaults), entry.nativeCtx)
+              ? vllmProfileToArgs(profile, entry.nativeCtx)
               : [],
         tensorParallelSize: savedProfile?.gpu?.tensorParallelSize,
+        profile,
+        trigger: 'gateway_switch',
       }
     }
     const saved = getModelProfile(cfg, entry.key, engine.id) as Partial<LoadProfile> | undefined
@@ -360,6 +366,8 @@ export class ModelRouter {
       model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: profile.ctx, vision: entry.vision },
       modelPath: entry.path,
       extraArgs,
+      profile,
+      trigger: 'gateway_switch',
     }
   }
 

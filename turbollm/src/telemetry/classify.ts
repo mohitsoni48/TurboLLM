@@ -14,6 +14,10 @@
  * exist. OOM is therefore checked first.
  */
 
+import type { FAIL_REASONS } from './core/enums'
+
+type FailReason = (typeof FAIL_REASONS)[number]
+
 export interface LoadError {
   code?: string
   message?: string
@@ -69,7 +73,7 @@ const GGUF_SIGNS = [
 
 /** Classify a load failure. Never throws; never returns anything but an enum
  *  member. */
-export function classifyLoadFailure(err: LoadError | null | undefined): string {
+export function classifyLoadFailure(err: LoadError | null | undefined): FailReason {
   if (!err) return 'other'
 
   // Structured codes are trustworthy — prefer them over text sniffing, except
@@ -114,7 +118,7 @@ export interface BenchProbeOutcome {
  * described as memory-bound even if a couple of attempts merely timed out or
  * crashed along the way.
  */
-export function classifyBenchFailure(results: readonly BenchProbeOutcome[]): string {
+export function classifyBenchFailure(results: readonly BenchProbeOutcome[]): 'oom' | 'timeout' | 'other' {
   if (results.some((r) => r.outcome === 'oom')) return 'oom'
   if (results.some((r) => r.outcome === 'timeout')) return 'timeout'
   return 'other'
