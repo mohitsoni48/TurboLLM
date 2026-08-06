@@ -286,7 +286,14 @@ export const SCREENS = [
  *  only if a button were a bare passthrough to `onCancelled` with no logic of its own, whereas
  *  `cancel()` has real behavior first (a DELETE in create mode) before calling it, so
  *  `cancel_routine_confirm` is a genuinely distinct, more specific action layered on top of
- *  whatever the caller's `onCancelled` does — not a duplicate of it. */
+ *  whatever the caller's `onCancelled` does — not a duplicate of it.
+ *
+ *  Batch 23 (Phase 6w): `screens/routines/RoutinesPanel.tsx` — 4 raw matches, ZERO new
+ *  actions. This is Routines mode's bare landing state (same role `CodeHomeScreen.tsx` plays
+ *  for Code) — its mobile sidebar backdrop/hamburger reuse `toggle_sidebar_collapsed` (Batch
+ *  5), its "New routine" empty-state button reuses `new_routine` (Batch 2, `ConversationSidebar`'s
+ *  own "+ New" button in routines mode — same route, same effect), and the sidebar's `onSelect`
+ *  is the usual `ConversationSidebar` relay skip. */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
