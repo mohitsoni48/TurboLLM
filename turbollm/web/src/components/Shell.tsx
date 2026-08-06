@@ -5,6 +5,7 @@ import { cn } from '../lib/utils'
 import type { Status } from '../lib/types'
 import { useRoutinesWithLatestRun } from '../lib/routine-queries'
 import { useSettings } from '../lib/queries'
+import { track } from '../lib/api'
 import { StateChip } from './StateChip'
 import { BoltMark } from './Logo'
 import { EngineProvisionBanner } from './EngineProvisionBanner'
@@ -224,7 +225,7 @@ function NavRail({
           <TooltipTrigger asChild>
             <button
               type="button"
-              onClick={() => navigate('/engines')}
+              onClick={() => { track('engines', 'open_engines_from_nav_chip'); navigate('/engines') }}
               aria-label={`Engine: ${engineState} — open Engines`}
               className="flex items-center justify-center rounded-full transition-colors xl:justify-start"
             >

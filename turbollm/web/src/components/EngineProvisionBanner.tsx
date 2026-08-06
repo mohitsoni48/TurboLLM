@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { Download, X } from 'lucide-react'
 import type { Status } from '../lib/types'
 import { useBackendInstall } from '../lib/queries'
+import { track } from '../lib/api'
 import { Button } from './ui/button'
 
 // llama.cpp GPU-backend ids (ADR-024/025). Anything else in `provision.backend`
@@ -41,7 +42,7 @@ export function EngineProvisionBanner({ status }: { status: Status | undefined }
         <span className="flex-1">{p.error ?? 'Could not set up the default engine.'}</span>
         <button
           type="button"
-          onClick={() => setDismissedError(true)}
+          onClick={() => { track('engines', 'dismiss_engine_provision_error'); setDismissedError(true) }}
           className="grid h-6 w-6 place-items-center rounded text-muted hover:text-ink"
           aria-label="Dismiss"
         >
@@ -72,7 +73,7 @@ export function EngineProvisionBanner({ status }: { status: Status | undefined }
           size="sm"
           variant="ghost"
           className="h-6 px-2 text-[12px]"
-          onClick={() => cancel.mutate()}
+          onClick={() => { track('engines', 'cancel_engine_provision'); cancel.mutate() }}
           disabled={cancel.isPending}
         >
           <X size={13} /> Cancel

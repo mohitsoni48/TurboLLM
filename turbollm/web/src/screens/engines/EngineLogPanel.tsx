@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { ChevronRight } from 'lucide-react'
-import { engineLogStreamUrl, getEngineLogs } from '../../lib/api'
+import { engineLogStreamUrl, getEngineLogs, track } from '../../lib/api'
 import { cn } from '../../lib/utils'
 import { CopyButton } from '../../components/ui/copy-button'
 import { Switch } from '../../components/ui/switch'
@@ -86,7 +86,7 @@ export function EngineLogPanel({
         {open && (
           <div className="flex items-center gap-3">
             <label className="flex items-center gap-1.5 text-[12px] text-muted">
-              <Switch checked={autoScroll} onCheckedChange={setAutoScroll} />
+              <Switch checked={autoScroll} onCheckedChange={(v) => { track('engines', 'toggle_engine_log_autoscroll'); setAutoScroll(v) }} />
               Auto-scroll
             </label>
             <CopyButton text={lines.join('\n')} label="Copy all" size={14} />

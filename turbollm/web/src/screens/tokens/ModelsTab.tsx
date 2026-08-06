@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import type { DailyModelBreakdown, ModelUsage } from '../../lib/types'
+import { track } from '../../lib/api'
 import { DailyBarChart } from './DailyBarChart'
 
 const INITIAL_VISIBLE = 6
@@ -67,7 +68,7 @@ export function ModelsTab({
         {hiddenCount > 0 && (
           <button
             type="button"
-            onClick={() => setExpanded(true)}
+            onClick={() => { track('tokens', 'show_more_token_models'); setExpanded(true) }}
             className="px-2 py-1 text-left text-[12px] text-accent hover:underline"
           >
             Show {hiddenCount} more

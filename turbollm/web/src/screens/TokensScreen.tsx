@@ -3,6 +3,7 @@ import { BarChart3 } from 'lucide-react'
 import { EmptyState, InlineError, ScreenHeader } from '../components/common'
 import { Skeleton } from '../components/ui/skeleton'
 import { useTokenUsage } from '../lib/queries'
+import { track } from '../lib/api'
 import type { TokenUsageRange } from '../lib/types'
 import { ActivityHeatmap } from './tokens/ActivityHeatmap'
 import { ModelsTab } from './tokens/ModelsTab'
@@ -178,7 +179,7 @@ export function TokensScreen() {
           <div className="flex flex-wrap items-center justify-between gap-3">
             <Segmented
               value={tab}
-              onChange={setTab}
+              onChange={(v) => { track('tokens', 'switch_token_tab'); setTab(v) }}
               options={[
                 { value: 'overview', label: 'Overview' },
                 { value: 'models', label: 'Models' },
@@ -187,7 +188,7 @@ export function TokensScreen() {
             />
             <Segmented
               value={range}
-              onChange={setRange}
+              onChange={(v) => { track('tokens', 'switch_token_range'); setRange(v) }}
               options={[{ value: 'all', label: 'All' }, { value: '30d', label: '30d' }, { value: '7d', label: '7d' }]}
             />
           </div>

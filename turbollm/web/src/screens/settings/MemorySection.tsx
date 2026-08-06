@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { Brain, ChevronRight, Trash2 } from 'lucide-react'
 import { useSettings } from '../../lib/queries'
 import { useMemoryFacts, useMemoryFactMutations } from '../../lib/chat-queries'
-import { ApiError } from '../../lib/api'
+import { ApiError, track } from '../../lib/api'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../../components/ui/collapsible'
 import { Badge } from '../../components/ui/badge'
 import { toast } from '../../components/ui/sonner'
@@ -87,7 +87,7 @@ export function MemorySection() {
                 <button
                   type="button"
                   title="Delete"
-                  onClick={() => remove.mutate(f.id)}
+                  onClick={() => { track('settings', 'delete_memory_fact'); remove.mutate(f.id) }}
                   disabled={remove.isPending}
                   className="shrink-0 rounded p-1 transition-colors hover:bg-bg disabled:opacity-60"
                   style={{ color: 'var(--err)' }}

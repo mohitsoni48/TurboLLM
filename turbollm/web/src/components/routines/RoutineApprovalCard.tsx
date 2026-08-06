@@ -3,6 +3,7 @@ import { HelpCircle } from 'lucide-react'
 import { Button } from '../ui/button'
 import { toast } from '../ui/sonner'
 import { describeRoutineError } from '../../lib/routine-api'
+import { track } from '../../lib/api'
 import { useRoutineMutations } from '../../lib/routine-queries'
 import type { RoutineRun } from '../../lib/routine-types'
 
@@ -137,6 +138,7 @@ export function RoutineApprovalCard({ routineId, run }: { routineId: string; run
 
   const respond = (action: 'approve' | 'deny') => {
     if (inFlight.current) return
+    track('routines', action === 'approve' ? 'approve_routine_tool_call' : 'deny_routine_tool_call')
     inFlight.current = true
     setSubmitted({ forCall: pendingKey, action })
     const mutation = action === 'approve' ? mut.approve : mut.deny

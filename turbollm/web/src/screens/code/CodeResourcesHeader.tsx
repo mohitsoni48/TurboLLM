@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { ChevronDown, ChevronRight, FileText, Sparkles } from 'lucide-react'
+import { track } from '../../lib/api'
 
 export interface CodeResourcesHeaderProps {
   /** How many skills are available to the session — the shared SkillStore catalog (every one is
@@ -31,7 +32,7 @@ export function CodeResourcesHeader({ skillCount, hasAgentsMd }: CodeResourcesHe
     <div className="shrink-0 border-b border-border text-[11px] text-muted">
       <button
         type="button"
-        onClick={() => setExpanded((v) => !v)}
+        onClick={() => { track('code', 'toggle_code_resources_header'); setExpanded((v) => !v) }}
         aria-expanded={expanded}
         aria-label="Loaded resources"
         className="flex w-full items-center gap-2 px-4 py-1.5 transition-colors hover:text-ink md:px-8"
