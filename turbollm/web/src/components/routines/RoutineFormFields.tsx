@@ -2,6 +2,7 @@ import { useId, useState } from 'react'
 import type { RoutineDraft } from '../../lib/routine-form'
 import { useChatAgents, useModels } from '../../lib/queries'
 import { FsBrowser } from '../../screens/engines/FsBrowser'
+import { track } from '../../lib/api'
 
 const CODING_AGENT_OPTIONS: { value: 'pi' | 'claude_cli'; label: string }[] = [
   { value: 'pi', label: 'In-app pi engine' },
@@ -98,7 +99,7 @@ export function RoutineFormFields({ draft, onChange, disabled, lockFlavor }: { d
               type="button"
               disabled={disabled || lockFlavor}
               aria-pressed={draft.flavor === f}
-              onClick={() => onChange(withFlavor(draft, f))}
+              onClick={() => { track('routines', 'set_routine_flavor'); onChange(withFlavor(draft, f)) }}
               className={`rounded px-3 py-1.5 text-[13px] font-medium transition-colors ${draft.flavor === f ? 'bg-accent/12 text-accent' : 'text-muted hover:text-ink'}`}
             >
               {f === 'chat' ? 'Chat' : 'Code'}
@@ -153,7 +154,7 @@ export function RoutineFormFields({ draft, onChange, disabled, lockFlavor }: { d
             <label className={labelCls} htmlFor={id('workspace')}>Workspace</label>
             <div className="flex gap-2">
               <input id={id('workspace')} disabled={disabled} readOnly className={inputCls} placeholder="No workspace chosen" value={draft.workspacePath ?? ''} />
-              <button type="button" disabled={disabled} onClick={() => setBrowserOpen(true)} className="shrink-0 rounded-md border border-border px-3 py-1.5 text-[13px] text-ink hover:bg-panel-2">
+              <button type="button" disabled={disabled} onClick={() => { track('routines', 'browse_routine_workspace'); setBrowserOpen(true) }} className="shrink-0 rounded-md border border-border px-3 py-1.5 text-[13px] text-ink hover:bg-panel-2">
                 Browse…
               </button>
             </div>
@@ -243,7 +244,7 @@ export function RoutineFormFields({ draft, onChange, disabled, lockFlavor }: { d
                       type="button"
                       disabled={disabled}
                       aria-pressed={on}
-                      onClick={() => onChange({ ...draft, scheduleRule: { ...weekly, daysOfWeek: on ? weekly.daysOfWeek.filter((d) => d !== i) : [...weekly.daysOfWeek, i] } })}
+                      onClick={() => { track('routines', 'toggle_routine_weekday'); onChange({ ...draft, scheduleRule: { ...weekly, daysOfWeek: on ? weekly.daysOfWeek.filter((d) => d !== i) : [...weekly.daysOfWeek, i] } }) }}
                       className={`h-7 w-9 rounded text-[11px] font-medium transition-colors ${on ? 'bg-accent/12 text-accent' : 'text-muted hover:bg-panel-2'}`}
                     >
                       {label}
@@ -259,7 +260,7 @@ export function RoutineFormFields({ draft, onChange, disabled, lockFlavor }: { d
       <FsBrowser
         open={browserOpen}
         onOpenChange={setBrowserOpen}
-        onSelect={(p) => { onChange({ ...draft, workspacePath: p }); setBrowserOpen(false) }}
+        onSelect={(p) => { track('routines', 'select_routine_workspace'); onChange({ ...draft, workspacePath: p }); setBrowserOpen(false) }}
         mode="folder"
         title="Choose a workspace"
         description="Pick the project folder this routine's Code runs will work in."

@@ -334,7 +334,18 @@ export const SCREENS = [
  *  supply, same "track at the real DOM click, not the relay" rule as every prior local-component
  *  case, even though `AppCard` here has multiple instantiations (one per CLI in the grid) rather
  *  than the usual single-instance case — the reasoning still holds since there's only one real
- *  click per row regardless of how many rows exist. */
+ *  click per row regardless of how many rows exist.
+ *
+ *  Batch 28 (Phase 6bb): `components/routines/RoutineFormFields.tsx` — 4 raw matches, 4 new
+ *  distinct actions, no skips. Screen tagged `routines` (its own directory's identity) even
+ *  though it also embeds inline in the chat transcript's confirm card (the file's own doc
+ *  comment: "Both surfaces that create/edit a routine embed this same component"), same
+ *  cross-embedded reasoning as `RoutineConfirmCard`. `select_routine_workspace` is tracked at
+ *  this file's own `<FsBrowser onSelect={...}>` call site (the real mutation — `onChange({
+ *  ...draft, workspacePath: p })`), not skipped, because THIS is the caller-level call site
+ *  that Batch 19's `FsBrowser.tsx` itself deliberately left untracked (its shared `choose()`
+ *  relays into whichever caller supplies `onSelect` — tracking belongs at the caller, exactly
+ *  like every other `FsBrowser` embedding this session). */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -419,6 +430,8 @@ export const UI_ACTIONS = [
   'open_agent_card', 'set_default_agent', 'new_agent',
 
   'revoke_api_key', 'create_api_key', 'select_connect_cli',
+
+  'set_routine_flavor', 'browse_routine_workspace', 'toggle_routine_weekday', 'select_routine_workspace',
 ] as const
 
 export const uiAction = defineEvent({
