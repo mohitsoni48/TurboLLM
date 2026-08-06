@@ -7,6 +7,7 @@ import { CheckCircle2, Download, RotateCw, X } from 'lucide-react'
 import { useDownloads, useDownloadMutations } from '../../lib/queries'
 import type { DownloadRecord } from '../../lib/types'
 import { Button } from '../../components/ui/button'
+import { track } from '../../lib/api'
 
 export function DownloadsPanel() {
   const dlQ = useDownloads()
@@ -87,7 +88,7 @@ function DownloadRow({
           <Button
             size="sm"
             variant="outline"
-            onClick={onResume}
+            onClick={() => { track('models', 'resume_download'); onResume() }}
             disabled={resuming}
             title="Resume from where it left off"
           >
@@ -99,7 +100,7 @@ function DownloadRow({
           <Button
             size="sm"
             variant="outline"
-            onClick={onCancel}
+            onClick={() => { track('models', 'cancel_download'); onCancel() }}
             disabled={cancelling}
             title="Cancel download"
           >
@@ -111,7 +112,7 @@ function DownloadRow({
           <button
             type="button"
             aria-label="Remove from list"
-            onClick={onRemove}
+            onClick={() => { track('models', 'remove_download'); onRemove() }}
             className="rounded p-1 text-muted transition-colors hover:text-ink"
           >
             <X size={14} />

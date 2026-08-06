@@ -381,6 +381,14 @@ test('validateEvent: ui_action accepts the Phase 6dd CodeContextSection batch ac
   }
 })
 
+test('validateEvent: ui_action accepts the Phase 6gg DownloadsPanel batch actions', () => {
+  const actions = ['resume_download', 'cancel_download', 'remove_download']
+  for (const action of actions) {
+    const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'models', action } }))
+    assert.equal(r.ok, true, r.ok === false ? `models/${action}: ${r.reason}` : '')
+  }
+})
+
 test('validateEvent: ui_action accepts the Phase 6ee CodeGitDialog batch actions', () => {
   const actions = ['commit_code_git', 'push_code_git', 'close_code_git_dialog']
   for (const action of actions) {
