@@ -12,7 +12,7 @@ import {
 import { ModelLoadMenu } from '../../components/ModelLoadMenu'
 import { ThinkingBudgetSlider } from '../../components/ThinkingBudgetSlider'
 import { toast } from '../../components/ui/sonner'
-import { browseFs } from '../../lib/api'
+import { browseFs, track } from '../../lib/api'
 import type { ModelEntry } from '../../lib/types'
 import { cn } from '../../lib/utils'
 import { CodeStatsFooter } from './CodeStatsFooter'
@@ -285,6 +285,7 @@ export function CodeComposer({
   useEffect(() => { setSlashPickerIndex(0) }, [slashQuery, slashPickerOpen])
 
   const selectSlashCommand = (cmd: { id: string }) => {
+    track('code', 'select_code_slash_command')
     onValueChange(`/${cmd.id} `)
   }
 
@@ -356,6 +357,7 @@ export function CodeComposer({
   const pendingCaretRef = useRef<number | null>(null)
   const selectMention = (f: MentionFile) => {
     if (mentionStart === -1) return
+    track('code', 'select_code_file_mention')
     const before = value.slice(0, mentionStart)
     const after = value.slice(caret)
     const inserted = `@${f.rel} `
@@ -517,14 +519,14 @@ export function CodeComposer({
                     <DropdownMenuItem disabled>No recent repos yet</DropdownMenuItem>
                   )}
                   {repo.recentRepos.map((p) => (
-                    <DropdownMenuItem key={p} onSelect={() => repo.onChoose(p)}>
+                    <DropdownMenuItem key={p} onSelect={() => { track('code', 'select_code_repo'); repo.onChoose(p) }}>
                       <FolderGit2 size={13} className="text-muted" />
                       <span className="min-w-0 flex-1 truncate" title={p}>{p.split(/[\\/]/).filter(Boolean).pop() || p}</span>
                       {p === repo.repoPath && <Check size={13} className="shrink-0 text-accent" />}
                     </DropdownMenuItem>
                   ))}
                   <DropdownMenuSeparator />
-                  <DropdownMenuItem onSelect={repo.onBrowse}>
+                  <DropdownMenuItem onSelect={() => { track('code', 'browse_code_repo'); repo.onBrowse() }}>
                     <FolderOpen size={13} className="text-muted" />
                     <span className="flex-1">Browse…</span>
                   </DropdownMenuItem>
@@ -623,7 +625,7 @@ export function CodeComposer({
                         <DropdownMenuItem disabled>{repo.currentBranch || 'No branches found'}</DropdownMenuItem>
                       )}
                       {repo.repoBranches.map((b) => (
-                        <DropdownMenuItem key={b} onSelect={() => repo.onBaseBranchChange(b)}>
+                        <DropdownMenuItem key={b} onSelect={() => { track('code', 'select_code_base_branch'); repo.onBaseBranchChange(b) }}>
                           <GitBranch size={13} className="text-muted" />
                           <span className="flex-1">{b}</span>
                           {b === repo.currentBranch && <span className="text-[11px] text-faint">current</span>}
@@ -657,7 +659,7 @@ export function CodeComposer({
                 {onRemoveContextFile && (
                   <button
                     type="button"
-                    onClick={() => onRemoveContextFile(p)}
+                    onClick={() => { track('code', 'remove_code_context_file'); onRemoveContextFile(p) }}
                     aria-label={`Remove ${p}`}
                     className="shrink-0 text-faint transition-colors hover:text-ink"
                   >
@@ -685,7 +687,7 @@ export function CodeComposer({
                 <span className="max-w-[120px] truncate">{img.name}</span>
                 <button
                   type="button"
-                  onClick={() => removeImage(img.id)}
+                  onClick={() => { track('code', 'remove_code_image'); removeImage(img.id) }}
                   aria-label={`Remove ${img.name}`}
                   className="shrink-0 text-faint transition-colors hover:text-ink"
                 >
@@ -782,7 +784,7 @@ export function CodeComposer({
               {AGENT_MODES.map((m) => {
                 const Icon = MODE_ICONS[m.id]
                 return (
-                  <DropdownMenuItem key={m.id} onSelect={() => onModeChange(m)}>
+                  <DropdownMenuItem key={m.id} onSelect={() => { track('code', 'set_code_mode'); onModeChange(m) }}>
                     <Icon size={13} className="mt-0.5 self-start text-muted" />
                     {/* Label inherits DropdownMenuItem's base text-sm (14px) — the house
                         convention (ModelLoadMenu, EngineRow leave it unstyled too).
@@ -800,7 +802,7 @@ export function CodeComposer({
           {onAddContext && (
             <button
               type="button"
-              onClick={onAddContext}
+              onClick={() => { track('code', 'open_code_context_browser'); onAddContext() }}
               title="Add context — files, folders, or URLs"
               aria-label="Add context"
               className="grid h-8 w-8 shrink-0 place-items-center rounded-md text-muted transition-colors hover:bg-panel-2 hover:text-ink"
@@ -832,6 +834,10 @@ export function CodeComposer({
             <>
               {!sendDisabled && (
                 <>
+                  {/* handleSubmit calls the caller-supplied onSubmit prop, which
+                      CodeSessionScreen already tracks as send_code_message at its own
+                      assignment site — tracking here too would double-count. Not tracked
+                      here; see the Batch 10 doc comment in telemetry/events/ui.ts. */}
                   <Button
                     size="icon"
                     variant="outline"
@@ -853,11 +859,12 @@ export function CodeComposer({
                   </Button>
                 </>
               )}
-              <Button size="icon" variant="outline" className="h-8 w-8 shrink-0" onClick={onStop} aria-label="Stop this run" title="Stop this run">
+              <Button size="icon" variant="outline" className="h-8 w-8 shrink-0" onClick={() => { track('code', 'stop_code_generation'); onStop?.() }} aria-label="Stop this run" title="Stop this run">
                 <Square size={15} />
               </Button>
             </>
           ) : (
+            // Same as steer/follow-up above: onSubmit is already tracked by the caller.
             <Button size="icon" className="h-8 w-8 shrink-0" onClick={() => handleSubmit()} disabled={sendDisabled} aria-label="Send">
               <SendHorizontal size={15} />
             </Button>

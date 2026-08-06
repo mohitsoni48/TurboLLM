@@ -127,7 +127,32 @@ export const SCREENS = [
  *  pattern as Batch 1's `update_engine`. `save_hf_token` covers both the "Save token" and
  *  "Clear token" labels of the same button (`handleSaveToken` branches purely on whether the
  *  field is empty, same mutation either way) — unlike Batch 6's edit-save split, there is no
- *  real behavioral fork here worth preserving in the data. */
+ *  real behavioral fork here worth preserving in the data.
+ *
+ *  Batch 10 (Phase 6j): `screens/code/CodeComposer.tsx` — 14 raw matches, 10 new distinct
+ *  actions, 4 skips. `CodeComposer` is ONE component rendered by both `CodeHomeScreen.tsx`
+ *  (pre-session, `onSubmit={() => void send()}`, not yet instrumented) and
+ *  `CodeSessionScreen.tsx` (mid-session, Batch 8 already tracks `send_code_message` at its own
+ *  `onSubmit={...}` assignment) — its internal Send/steer/follow-up buttons all call
+ *  `handleSubmit`, which calls the SAME `onSubmit` prop. Tracking here would double-count for
+ *  `CodeSessionScreen` while `CodeHomeScreen` stays silently uncovered either way, so — same
+ *  "track at the specific call site that supplies the real value" rule as `ModelsScreen`'s
+ *  `FsBrowser` usage — all three submit buttons are skipped here. **Note for whoever
+ *  instruments `CodeHomeScreen.tsx`**: track `send_code_message` at its own
+ *  `onSubmit={() => void send()}` line, mirroring `CodeSessionScreen.tsx`, NOT inside this
+ *  file. The Stop button (`onStop`) has no such conflict — neither caller's own `onStop={...}`
+ *  assignment matches the grep selector (`onStop=` isn't one of its five patterns), so this
+ *  file's button is the only real click site for it; tracked here as `stop_code_generation`.
+ *  The fourth skip is the textarea's own `onSelect` — caret-position tracking for the
+ *  `@`-mention popover, not a discrete action, same category as Batch 8's `onValueChange` skip.
+ *  `select_code_repo`/`browse_code_repo`/`select_code_base_branch`/`set_code_mode` are tracked
+ *  here (not deferred) because their real DOM click sites live only in this shared file — both
+ *  callers merely supply the `repo`/`onModeChange` props consumed here, they render no
+ *  competing UI of their own for these. `open_code_context_browser` is a previously-invisible
+ *  action: `onAddContext=` never matched the grep selector in either caller's own file, so this
+ *  is the first time the button that OPENS the context-file browser gets tracked at all
+ *  (distinct from `add_code_context_file`, Batch 8's action for actually SELECTING a file once
+ *  the browser is open). */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -168,6 +193,10 @@ export const UI_ACTIONS = [
   'uninstall_comfyui_gate', 'test_hf_token', 'save_hf_token', 'toggle_telemetry_preview',
   'toggle_submission_log', 'regenerate_machine_id', 'restart_daemon', 'dismiss_restart_overlay',
   'reload_after_restart', 'save_personalization',
+
+  'select_code_slash_command', 'select_code_file_mention', 'select_code_repo', 'browse_code_repo',
+  'select_code_base_branch', 'remove_code_context_file', 'remove_code_image', 'set_code_mode',
+  'open_code_context_browser', 'stop_code_generation',
 ] as const
 
 export const uiAction = defineEvent({
