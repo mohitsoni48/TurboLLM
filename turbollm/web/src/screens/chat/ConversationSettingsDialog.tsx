@@ -14,7 +14,7 @@ import { Switch } from '../../components/ui/switch'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../../components/ui/collapsible'
 import { useConversationMutations } from '../../lib/chat-queries'
 import type { Conversation } from '../../lib/chat-types'
-import { ApiError } from '../../lib/api'
+import { ApiError, track } from '../../lib/api'
 import { toast } from '../../components/ui/sonner'
 import { skillKeys, fetchSkills } from '../../lib/agent-api'
 import { cn } from '../../lib/utils'
@@ -118,9 +118,10 @@ export function ConversationSettingsDialog({
   const setValue = (field: string, val: number) =>
     setSampling((prev) => ({ ...prev, [field]: val }))
 
-  const resetSampling = () => setSampling({})
+  const resetSampling = () => { track('chat', 'reset_thread_sampling'); setSampling({}) }
 
   const save = () => {
+    track('chat', 'save_thread_settings')
     if (!conv) {
       // Draft mode: nothing to PATCH yet — just commit the local draft state.
       draft?.onChange({ systemPrompt, sampling, skillIds, preserveThinking })
@@ -299,7 +300,7 @@ export function ConversationSettingsDialog({
                 Resend the model's past reasoning on later turns, not just its final answers — uses more tokens per request.
               </span>
             </span>
-            <Switch checked={preserveThinking} onCheckedChange={setPreserveThinking} />
+            <Switch checked={preserveThinking} onCheckedChange={(v) => { track('chat', 'toggle_preserve_thinking'); setPreserveThinking(v) }} />
           </div>
         </div>
 

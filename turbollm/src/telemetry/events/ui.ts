@@ -393,7 +393,18 @@ export const SCREENS = [
  *  supplied inline in the SAME file by `DownloadsPanel` itself (the real `mut.*.mutate()`
  *  calls) — same "local component, same file" pattern as `CandidateList`/`AgentCard`, tracked
  *  at the real click. Distinct from `download_hf_model`/`download_hf_quant` (Batch 17), which
- *  cover STARTING a download, not managing one already in flight. */
+ *  cover STARTING a download, not managing one already in flight.
+ *
+ *  Batch 34 (Phase 6hh): `screens/chat/ConversationSettingsDialog.tsx` — 3 raw matches, 3 new
+ *  distinct actions, no skips, tagged `chat` (its only embedding). `reset_thread_sampling` and
+ *  `save_thread_settings` are kept distinct from Batch 11's `reset_model_settings`/
+ *  `save_model_settings` — those act on a MODEL's own load settings, these act on a per-THREAD
+ *  sampling-override map (temperature/top_p/top_k/min_p for this conversation only) plus
+ *  system prompt/skills/preserveThinking — genuinely different real objects, not the same
+ *  action reused across screens. `toggle_preserve_thinking` covers the Switch (GitHub #52).
+ *  The skills-picker checkboxes (`toggleSkill`/`toggleAllSkills`) use plain `onChange` on
+ *  native `<input type="checkbox">`, not `onCheckedChange`/`onClick` — outside this batch's
+ *  raw-match grep pattern, same scope boundary every other batch has used. */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -486,6 +497,8 @@ export const UI_ACTIONS = [
   'commit_code_git', 'push_code_git', 'close_code_git_dialog',
 
   'resume_download', 'cancel_download', 'remove_download',
+
+  'reset_thread_sampling', 'toggle_preserve_thinking', 'save_thread_settings',
 ] as const
 
 export const uiAction = defineEvent({

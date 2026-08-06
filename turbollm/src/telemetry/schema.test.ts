@@ -389,6 +389,14 @@ test('validateEvent: ui_action accepts the Phase 6gg DownloadsPanel batch action
   }
 })
 
+test('validateEvent: ui_action accepts the Phase 6hh ConversationSettingsDialog batch actions', () => {
+  const actions = ['reset_thread_sampling', 'toggle_preserve_thinking', 'save_thread_settings']
+  for (const action of actions) {
+    const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'chat', action } }))
+    assert.equal(r.ok, true, r.ok === false ? `chat/${action}: ${r.reason}` : '')
+  }
+})
+
 test('validateEvent: ui_action accepts the Phase 6ee CodeGitDialog batch actions', () => {
   const actions = ['commit_code_git', 'push_code_git', 'close_code_git_dialog']
   for (const action of actions) {
