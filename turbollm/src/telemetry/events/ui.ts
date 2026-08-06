@@ -219,7 +219,15 @@ export const SCREENS = [
  *  actions, 1 skip. Structurally identical to Batch 13's `AgentEditPage.tsx`: all three
  *  `goBack` call sites fold into `back_to_skills`, and the inline delete-confirm row's opening
  *  link is skipped in favor of tracking `delete_skill` at the confirm row's own button, same
- *  "track the outcome, not the request" reasoning. */
+ *  "track the outcome, not the request" reasoning.
+ *
+ *  Batch 17 (Phase 6q): `screens/models/HfRepoDialog.tsx` — 7 raw matches, 6 new distinct
+ *  actions, 1 skip. The one skip is `QuantDropdown`'s `onSelect` prop, wired at its call site
+ *  (`onSelect={setSelected}`) to a LOCAL component defined later in the same file — the real
+ *  click is `QuantDropdown`'s own `DropdownMenuItem`, tracked there as `select_hf_quant`, not
+ *  at the pass-through prop. `download_hf_model` (the safetensors/MLX-family whole-repo
+ *  download, `MlxRepoBody`) is kept distinct from `download_hf_quant` (the GGUF single-file
+ *  download) — genuinely different downloads, not just two labels on the same button. */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -283,6 +291,9 @@ export const UI_ACTIONS = [
   'back_to_add_engine_choose', 'submit_new_engine', 'select_new_engine_path',
 
   'back_to_skills', 'save_skill', 'delete_skill', 'cancel_delete_skill',
+
+  'load_hf_quant', 'download_hf_quant', 'select_hf_quant', 'download_hf_model',
+  'search_hf_from_error', 'retry_hf_repo_load',
 ] as const
 
 export const uiAction = defineEvent({

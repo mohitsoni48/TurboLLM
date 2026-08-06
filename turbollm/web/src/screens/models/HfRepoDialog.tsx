@@ -16,7 +16,7 @@ import remarkGfm from 'remark-gfm'
 import rehypeRaw from 'rehype-raw'
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize'
 import { ChevronDown, Download, ExternalLink, Lock, Zap } from 'lucide-react'
-import { ApiError } from '../../lib/api'
+import { ApiError, track } from '../../lib/api'
 import { useDownloadMutations, useHfRepo, useModelActions, useStatus, useSysInfo } from '../../lib/queries'
 import type { FitVerdict, HfRepoFile } from '../../lib/types'
 import { Button } from '../../components/ui/button'
@@ -274,14 +274,14 @@ export function HfRepoContent({
           {/* Primary action */}
           <div className="flex items-center gap-2">
             {selectedIsLocal && selectedFile?.localKey ? (
-              <Button className="flex-1" onClick={onLoad} disabled={actions.load.isPending}>
+              <Button className="flex-1" onClick={() => { track('models', 'load_hf_quant'); onLoad() }} disabled={actions.load.isPending}>
                 <Zap size={14} />
                 Load
               </Button>
             ) : (
               <Button
                 className="flex-1"
-                onClick={onDownload}
+                onClick={() => { track('models', 'download_hf_quant'); onDownload() }}
                 disabled={blockedByGate || dlMut.enqueue.isPending || !selectedFile}
               >
                 <Download size={14} />
@@ -357,7 +357,7 @@ function QuantDropdown({
         className="max-h-72 w-[var(--radix-dropdown-menu-trigger-width)] overflow-y-auto"
       >
         {files.map((f) => (
-          <DropdownMenuItem key={f.name} onSelect={() => onSelect(f.name)} className="justify-between gap-2">
+          <DropdownMenuItem key={f.name} onSelect={() => { track('models', 'select_hf_quant'); onSelect(f.name) }} className="justify-between gap-2">
             <span className="flex min-w-0 items-center gap-2">
               <FitDot fit={fileFit(f.sizeBytes, vramMb)} />
               <span className="truncate">
@@ -522,7 +522,7 @@ function MlxRepoBody({
         </span>
       </div>
 
-      <Button className="w-full" onClick={onDownload} disabled={detail.gated || isPending}>
+      <Button className="w-full" onClick={() => { track('models', 'download_hf_model'); onDownload() }} disabled={detail.gated || isPending}>
         <Download size={14} />
         {isPending ? 'Queuing…' : btnLabel}
       </Button>
@@ -550,9 +550,9 @@ function UnreachableOrError({ error, onRetry, onSearch }: { error: unknown; onRe
       </p>
       <div className="flex items-center gap-2">
         {notFound && onSearch && (
-          <Button size="sm" onClick={onSearch}>Search Hugging Face</Button>
+          <Button size="sm" onClick={() => { track('models', 'search_hf_from_error'); onSearch() }}>Search Hugging Face</Button>
         )}
-        <Button size="sm" variant="outline" onClick={onRetry}>Retry</Button>
+        <Button size="sm" variant="outline" onClick={() => { track('models', 'retry_hf_repo_load'); onRetry() }}>Retry</Button>
       </div>
     </div>
   )
