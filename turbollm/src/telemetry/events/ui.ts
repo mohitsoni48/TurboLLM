@@ -319,7 +319,14 @@ export const SCREENS = [
  *  different trust decisions worth keeping distinguishable in the data — same reasoning as
  *  Batch 8's chat-vs-chat+files revert split. Screen tagged `chat` (its own directory) even
  *  though it also renders inline in Code mode (`CodeSessionScreen.tsx`), same cross-embedded
- *  reasoning as `MessageBubble`/`RoutineConfirmCard`. */
+ *  reasoning as `MessageBubble`/`RoutineConfirmCard`.
+ *
+ *  Batch 26 (Phase 6z): `screens/agents/AgentsLibrary.tsx` — 4 raw matches, 3 new distinct
+ *  actions, no skips. `AgentCard`'s own click (`open_agent_card`) is tracked inside the
+ *  card, same local-component reasoning as `SkillCard`. Its "Reset to default" icon reuses
+ *  Batch 13's `reset_agent_to_default` (`AgentEditPage.tsx`) — both call the identical
+ *  `useBuiltinAgentOverrideMutations().reset` mutation, just from a different surface (the
+ *  library grid's own reset icon vs. the edit page's "Reset to default" button). */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -400,6 +407,8 @@ export const UI_ACTIONS = [
   'open_import_url_dialog', 'select_discover_result',
 
   'deny_tool_call', 'allow_tool_call', 'allow_tool_call_for_chat', 'always_allow_tool_call',
+
+  'open_agent_card', 'set_default_agent', 'new_agent',
 ] as const
 
 export const uiAction = defineEvent({

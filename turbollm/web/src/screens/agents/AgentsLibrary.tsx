@@ -5,7 +5,7 @@ import { Button } from '../../components/ui/button'
 import { toast } from '../../components/ui/sonner'
 import { useBuiltinAgentOverrideMutations, useBuiltinAgentOverrides, useChatAgents } from '../../lib/queries'
 import { resolveAgents, getDefaultAgentId, setDefaultAgentId, type ResolvedAgent } from '../../lib/personas'
-import { ApiError } from '../../lib/api'
+import { ApiError, track } from '../../lib/api'
 
 function AgentCard({ agent, isDefault, onOpen, onSetDefault, onReset }: {
   agent: ResolvedAgent; isDefault: boolean; onOpen: () => void; onSetDefault: () => void; onReset: () => void
@@ -16,7 +16,7 @@ function AgentCard({ agent, isDefault, onOpen, onSetDefault, onReset }: {
     <div
       role="button"
       tabIndex={0}
-      onClick={onOpen}
+      onClick={() => { track('agents', 'open_agent_card'); onOpen() }}
       onKeyDown={(e) => { if (e.key === 'Enter') onOpen() }}
       className="flex flex-col gap-2 rounded-xl border border-border bg-panel px-4 py-3.5 text-left transition-colors hover:border-accent hover:bg-panel-2"
     >
@@ -31,7 +31,7 @@ function AgentCard({ agent, isDefault, onOpen, onSetDefault, onReset }: {
         <button
           type="button"
           title={isDefault ? 'Default agent for new chats' : 'Set as default agent'}
-          onClick={(e) => { e.stopPropagation(); onSetDefault() }}
+          onClick={(e) => { e.stopPropagation(); track('agents', 'set_default_agent'); onSetDefault() }}
           className="shrink-0 rounded p-0.5 text-faint transition-colors hover:text-accent"
         >
           <Star size={14} className={isDefault ? 'fill-current text-accent' : undefined} />
@@ -40,7 +40,7 @@ function AgentCard({ agent, isDefault, onOpen, onSetDefault, onReset }: {
           <button
             type="button"
             title="Reset to default"
-            onClick={(e) => { e.stopPropagation(); onReset() }}
+            onClick={(e) => { e.stopPropagation(); track('agents', 'reset_agent_to_default'); onReset() }}
             className="shrink-0 rounded p-0.5 text-faint transition-colors hover:text-accent"
           >
             <RotateCcw size={13} />
@@ -106,7 +106,7 @@ export function AgentsLibrary() {
             Pick one when starting a new chat. Built-in agents can be edited in place (Reset restores the default) — or create your own with a custom system prompt and a skill/tool allow-list.
           </p>
         </div>
-        <Button size="sm" onClick={() => navigate('/agents/new')} className="shrink-0">
+        <Button size="sm" onClick={() => { track('agents', 'new_agent'); navigate('/agents/new') }} className="shrink-0">
           <Plus size={14} /> New agent
         </Button>
       </div>
