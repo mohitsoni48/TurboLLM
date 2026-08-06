@@ -302,7 +302,24 @@ export const SCREENS = [
  *  `DiscoverTab`'s own `onSelect={() => setSelectedRepo(r.repo)}` prop supply): all three
  *  raw-match the grep selector for what is structurally ONE click, so only the innermost real
  *  button gets tracked, same "track at the real DOM click, not the relay" rule as every prior
- *  local-component case (`QuantDropdown`, `SkillCard`). */
+ *  local-component case (`QuantDropdown`, `SkillCard`).
+ *
+ *  Batch 25 (Phase 6y): `screens/engines/EngineRow.tsx` — SKIPPED, not instrumented.
+ *  Verified (`grep -rn "EngineRow"` across both `web/src` and `src`) that this component is
+ *  exported but never imported or rendered anywhere in the app — dead code present since the
+ *  original MVP commit, not a recent regression. Instrumenting an unreachable component would
+ *  add `UI_ACTIONS` enum values that can never fire in production, which is worse than no
+ *  coverage at all for a founder who explicitly does not want "wrong/half data." Flagged
+ *  separately for its own cleanup pass (delete or wire up) rather than fixed inline here, since
+ *  that's out of scope for a telemetry-instrumentation batch. `screens/chat/ToolApprovalBar.tsx`
+ *  — 4 raw matches, 4 new distinct actions, no skips, folded into the same batch since
+ *  `EngineRow.tsx` needed no code change. All four buttons call the same shared `respond(decision)`
+ *  function with a different `Decision` value each; each is tracked as its own action rather than
+ *  one generic "responded" action, since deny/allow/allow-for-chat/always-allow are materially
+ *  different trust decisions worth keeping distinguishable in the data — same reasoning as
+ *  Batch 8's chat-vs-chat+files revert split. Screen tagged `chat` (its own directory) even
+ *  though it also renders inline in Code mode (`CodeSessionScreen.tsx`), same cross-embedded
+ *  reasoning as `MessageBubble`/`RoutineConfirmCard`. */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -381,6 +398,8 @@ export const UI_ACTIONS = [
   'cancel_routine_confirm', 'confirm_routine',
 
   'open_import_url_dialog', 'select_discover_result',
+
+  'deny_tool_call', 'allow_tool_call', 'allow_tool_call_for_chat', 'always_allow_tool_call',
 ] as const
 
 export const uiAction = defineEvent({

@@ -341,6 +341,14 @@ test('validateEvent: ui_action accepts the Phase 6x DiscoverTab batch actions', 
   }
 })
 
+test('validateEvent: ui_action accepts the Phase 6y ToolApprovalBar batch actions', () => {
+  const actions = ['deny_tool_call', 'allow_tool_call', 'allow_tool_call_for_chat', 'always_allow_tool_call']
+  for (const action of actions) {
+    const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'chat', action } }))
+    assert.equal(r.ok, true, r.ok === false ? `chat/${action}: ${r.reason}` : '')
+  }
+})
+
 test('validateEvent: ui_daily requires screen plus both volume counters', () => {
   const r = validateEvent(validEvent({ event: 'ui_daily', payload: { screen: 'engines', actions: 5, distinctActions: 3 } }))
   assert.equal(r.ok, true, r.ok === false ? r.reason : '')
