@@ -374,7 +374,18 @@ export const SCREENS = [
  *  actions, no skips, tagged `code` (its only embedding, `CodeSessionScreen.tsx`'s Git action).
  *  `close_code_git_dialog` follows the established "a dialog's own dismissal is tracked, not
  *  skipped" precedent (`close_build_guide`, `close_mcp_panel`) rather than being folded into
- *  anything else. */
+ *  anything else.
+ *
+ *  Batch 32 (Phase 6ff): `components/ModelLoadMenu.tsx` — 3 raw matches, ZERO new actions. The
+ *  Chat/Code header's model dropdown is a second UI over the exact same three real objects as
+ *  `ModelsScreen.tsx`'s own list-row buttons (Batch 3) — loading, ejecting, and opening
+ *  pre-load settings for a model — same "second UI, same real objects" pattern as Batch 18/29.
+ *  Unlike those two (single reuse-screen each), this component has no screen of its own — it's
+ *  embedded in both `ChatScreen.tsx` and `CodeComposer.tsx` — so it takes an explicit `screen`
+ *  prop threaded from each caller and reuses `load_model`/`eject_model`/
+ *  `open_model_load_settings` tagged dynamically per embedding, the same "same action, screen
+ *  reflects wherever the click really happened" pattern `toggle_sidebar_collapsed` already
+ *  established across chat/code/routines. */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',

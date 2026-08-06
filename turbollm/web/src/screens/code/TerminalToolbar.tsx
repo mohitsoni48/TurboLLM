@@ -85,6 +85,7 @@ export function TerminalToolbar({
           onEject={onEjectModel}
           onSettings={onModelSettings}
           align="end"
+          screen="code"
         />
       </div>
       <CodeStatsFooter
