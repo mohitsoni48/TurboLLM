@@ -185,6 +185,17 @@ test('validateEvent: ui_action accepts the Phase 6g ChatScreen batch actions', (
   }
 })
 
+test('validateEvent: ui_action accepts the Phase 6h CodeSessionScreen batch actions', () => {
+  const actions = [
+    'export_code_session', 'open_code_git_dialog', 'back_to_code', 'resume_code_session',
+    'send_code_message', 'add_code_context_file', 'revert_code_chat', 'revert_code_chat_and_files',
+  ]
+  for (const action of actions) {
+    const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'code', action } }))
+    assert.equal(r.ok, true, r.ok === false ? `code/${action}: ${r.reason}` : '')
+  }
+})
+
 test('validateEvent: ui_daily requires screen plus both volume counters', () => {
   const r = validateEvent(validEvent({ event: 'ui_daily', payload: { screen: 'engines', actions: 5, distinctActions: 3 } }))
   assert.equal(r.ok, true, r.ok === false ? r.reason : '')
