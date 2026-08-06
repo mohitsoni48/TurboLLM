@@ -326,7 +326,15 @@ export const SCREENS = [
  *  card, same local-component reasoning as `SkillCard`. Its "Reset to default" icon reuses
  *  Batch 13's `reset_agent_to_default` (`AgentEditPage.tsx`) — both call the identical
  *  `useBuiltinAgentOverrideMutations().reset` mutation, just from a different surface (the
- *  library grid's own reset icon vs. the edit page's "Reset to default" button). */
+ *  library grid's own reset icon vs. the edit page's "Reset to default" button).
+ *
+ *  Batch 27 (Phase 6aa): `screens/DeveloperScreen.tsx` — 4 raw matches, 3 new distinct
+ *  actions, 1 skip. `select_connect_cli` is tracked inside `AppCard`'s own `onClick={onSelect}`
+ *  — the real DOM click — not at `ConnectSection`'s `onSelect={() => setSelected(c.id)}` prop
+ *  supply, same "track at the real DOM click, not the relay" rule as every prior local-component
+ *  case, even though `AppCard` here has multiple instantiations (one per CLI in the grid) rather
+ *  than the usual single-instance case — the reasoning still holds since there's only one real
+ *  click per row regardless of how many rows exist. */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -409,6 +417,8 @@ export const UI_ACTIONS = [
   'deny_tool_call', 'allow_tool_call', 'allow_tool_call_for_chat', 'always_allow_tool_call',
 
   'open_agent_card', 'set_default_agent', 'new_agent',
+
+  'revoke_api_key', 'create_api_key', 'select_connect_cli',
 ] as const
 
 export const uiAction = defineEvent({
