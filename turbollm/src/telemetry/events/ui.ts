@@ -98,7 +98,26 @@ export const SCREENS = [
  *  screen's highest-frequency clicks — the founder's "every clickable element" instruction
  *  draws no volume exception, and `ui_daily`'s per-screen rollup exists precisely to keep
  *  aggregate volume bounded regardless of how often any one action fires (same reasoning
- *  `chat_daily` already applies to actual message counts). */
+ *  `chat_daily` already applies to actual message counts).
+ *
+ *  Batch 8 (Phase 6h): `screens/code/CodeSessionScreen.tsx` — 16 raw matches, 8 new distinct
+ *  actions (plus 3 reused: `toggle_sidebar_collapsed`, `rename_code_session` from Batch 2, and
+ *  `scroll_to_latest` from Batch 7 — Code mode's "Jump to latest" is the identical action on a
+ *  different screen). Two skips: the same `ConversationSidebar` `onSelect` relay as every other
+ *  batch that embeds it, and `CodeComposer`'s `onValueChange={setInput}` — a controlled-input
+ *  keystroke sync, not a discrete click, the same category ChatScreen's textarea `onChange`
+ *  was never grepped/tracked either. Two call sites are NOT skipped despite also being props
+ *  passed to a child component (`CodeComposer`'s `onSubmit`, `FsBrowser`'s `onSelect`):
+ *  ModelsScreen's Batch 3 precedent (`add_model_dir`, tracked at the call site supplying
+ *  `FsBrowser` its value, not inside the shared dialog) tracks at the site that performs the
+ *  real mutation, and both of these do — `onSubmit` calls `send(kind)`, `onSelect` calls
+ *  `setContextFiles`. **Note for whoever instruments `CodeComposer.tsx` below**: its own Send
+ *  button almost certainly calls this same `onSubmit` prop — that click must NOT get a second
+ *  `track()` call, `send_code_message` already fires here. The revert dialog's two real outcomes
+ *  (`runRevert(id, false)` vs `runRevert(id, true)`) split into `revert_code_chat` vs
+ *  `revert_code_chat_and_files` — a real behavioral difference (whether file edits are also
+ *  discarded), same reasoning as Batch 6's edit-save split; the file-edits-free single-button
+ *  case calls the same `runRevert(id, false)` and folds into `revert_code_chat`. */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -131,6 +150,9 @@ export const UI_ACTIONS = [
   'open_model_settings', 'copy_chat_link', 'copy_chat_debug_info', 'export_chat',
   'dismiss_import_banner', 'use_suggested_prompt', 'scroll_to_latest', 'dismiss_clipboard_modal',
   'select_skill_from_picker', 'remove_attachment', 'attach_file', 'stop_generation', 'send_message',
+
+  'export_code_session', 'open_code_git_dialog', 'back_to_code', 'resume_code_session',
+  'send_code_message', 'add_code_context_file', 'revert_code_chat', 'revert_code_chat_and_files',
 ] as const
 
 export const uiAction = defineEvent({

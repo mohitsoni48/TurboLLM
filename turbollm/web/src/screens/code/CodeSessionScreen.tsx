@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowDown, Diff, Download, Eraser, FolderOpen, GitBranch, MoreHorizontal, PanelLeft, Pencil, RotateCcw } from 'lucide-react'
-import { ApiError } from '../../lib/api'
+import { ApiError, track } from '../../lib/api'
 import { skillKeys, fetchSkills } from '../../lib/agent-api'
 import { useModelActions, useModels, useStatus } from '../../lib/queries'
 import { compactCodeSession, execShellCommand, revertCodeSession, sendCodeQueuedTurnNow, startCodeRun, steerOutcomeMessage, stopCodeSession } from '../../lib/code-api'
@@ -636,7 +636,7 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
       {!embedded && !isDesktop && mobileSidebarOpen && (
         <div
           className="fixed inset-0 z-30 bg-black/40 md:hidden"
-          onClick={() => setMobileSidebarOpen(false)}
+          onClick={() => { track('code', 'toggle_sidebar_collapsed'); setMobileSidebarOpen(false) }}
           aria-hidden
         />
       )}
@@ -678,7 +678,7 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
             size="icon"
             variant="ghost"
             className="h-8 w-8 shrink-0 md:hidden"
-            onClick={() => setMobileSidebarOpen(true)}
+            onClick={() => { track('code', 'toggle_sidebar_collapsed'); setMobileSidebarOpen(true) }}
             title="History"
             aria-label="Open sidebar"
           >
@@ -708,7 +708,7 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
               {!rename.editing && (
                 <button
                   type="button"
-                  onClick={rename.start}
+                  onClick={() => { track('code', 'rename_code_session'); rename.start() }}
                   className="shrink-0 rounded p-1 text-faint transition-colors hover:text-ink"
                   aria-label="Rename session"
                   title="Rename session"
@@ -779,11 +779,11 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
                   <DropdownMenuContent align="end">
                     <DropdownMenuItem
                       disabled={exportMut.isPending}
-                      onSelect={() => exportMut.mutate(session.id)}
+                      onSelect={() => { track('code', 'export_code_session'); exportMut.mutate(session.id) }}
                     >
                       <Download size={13} /> {exportMut.isPending ? 'Exporting…' : 'Export'}
                     </DropdownMenuItem>
-                    <DropdownMenuItem onSelect={() => setGitDialogOpen(true)}>
+                    <DropdownMenuItem onSelect={() => { track('code', 'open_code_git_dialog'); setGitDialogOpen(true) }}>
                       <GitBranch size={13} /> Git…
                     </DropdownMenuItem>
                   </DropdownMenuContent>
@@ -870,7 +870,7 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
                     <p className="text-[14px] text-muted">This session couldn&rsquo;t be found.</p>
                     {/* Embedded (Routines' 3-pane layout): no sibling Code sidebar to land on —
                         the routine page itself is already the way back. */}
-                    {!embedded && <Button size="sm" variant="outline" onClick={() => navigate('/workspace/code')}>Back to Code</Button>}
+                    {!embedded && <Button size="sm" variant="outline" onClick={() => { track('code', 'back_to_code'); navigate('/workspace/code') }}>Back to Code</Button>}
                   </div>
                 )}
                 {/* /clear banner */}
@@ -880,7 +880,7 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
                     <span className="flex-1">Chat cleared — earlier messages hidden.</span>
                     <button
                       type="button"
-                      onClick={() => void runResume()}
+                      onClick={() => { track('code', 'resume_code_session'); void runResume() }}
                       disabled={resumeMut.isPending}
                       className="inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-1 font-medium text-ink transition-colors hover:bg-panel"
                     >
@@ -895,7 +895,7 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
                     <span className="flex-1">Reverted to an earlier message — later messages hidden.</span>
                     <button
                       type="button"
-                      onClick={() => void runResume()}
+                      onClick={() => { track('code', 'resume_code_session'); void runResume() }}
                       disabled={resumeMut.isPending}
                       className="inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-1 font-medium text-ink transition-colors hover:bg-panel"
                     >
@@ -921,7 +921,7 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
             {showScrollBtn && (
               <button
                 type="button"
-                onClick={() => { userScrolledUp.current = false; scrollToBottom(true) }}
+                onClick={() => { track('code', 'scroll_to_latest'); userScrolledUp.current = false; scrollToBottom(true) }}
                 className="absolute bottom-28 left-1/2 -translate-x-1/2 flex items-center gap-1.5 rounded-full border border-border bg-panel px-3 py-1.5 text-[12px] text-muted shadow-[var(--shadow-1)] hover:text-ink"
               >
                 <ArrowDown size={13} /> Jump to latest
@@ -945,7 +945,9 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
                 inputRef={inputRef}
                 value={input}
                 onValueChange={setInput}
-                onSubmit={(kind) => void send(kind)}
+                // CodeComposer's own Send button calls this same prop — its future
+                // instrumentation batch must NOT add a second track() call there.
+                onSubmit={(kind) => { track('code', 'send_code_message'); void send(kind) }}
                 placeholder={live ? 'Queue a follow-up…' : 'Send a follow-up…'}
                 textareaDisabled={manualCompacting}
                 mode={modeInfo}
@@ -994,7 +996,7 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
       <FsBrowser
         open={contextBrowserOpen}
         onOpenChange={setContextBrowserOpen}
-        onSelect={(p) => setContextFiles((cf) => (cf.includes(p) ? cf : [...cf, p]))}
+        onSelect={(p) => { track('code', 'add_code_context_file'); setContextFiles((cf) => (cf.includes(p) ? cf : [...cf, p])) }}
         mode="file"
         startPath={session?.repoRoot}
         title="Add context"
@@ -1019,16 +1021,16 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
               <>
                 <AlertDialogAction
                   className={cn(buttonVariants({ variant: 'outline' }))}
-                  onClick={() => { const id = pendingRevert?.messageId; if (id) void runRevert(id, false) }}
+                  onClick={() => { track('code', 'revert_code_chat'); const id = pendingRevert?.messageId; if (id) void runRevert(id, false) }}
                 >
                   Chat only
                 </AlertDialogAction>
-                <AlertDialogAction onClick={() => { const id = pendingRevert?.messageId; if (id) void runRevert(id, true) }}>
+                <AlertDialogAction onClick={() => { track('code', 'revert_code_chat_and_files'); const id = pendingRevert?.messageId; if (id) void runRevert(id, true) }}>
                   Chat + files
                 </AlertDialogAction>
               </>
             ) : (
-              <AlertDialogAction onClick={() => { const id = pendingRevert?.messageId; if (id) void runRevert(id, false) }}>
+              <AlertDialogAction onClick={() => { track('code', 'revert_code_chat'); const id = pendingRevert?.messageId; if (id) void runRevert(id, false) }}>
                 Revert
               </AlertDialogAction>
             )}
