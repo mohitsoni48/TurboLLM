@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { GitBranch } from 'lucide-react'
 import { Button } from '../../components/ui/button'
 import { Input } from '../../components/ui/input'
+import { track } from '../../lib/api'
 import {
   Dialog,
   DialogContent,
@@ -70,8 +71,8 @@ export function CustomBuildDialog() {
           </div>
 
           <DialogFooter>
-            <Button variant="outline" onClick={() => setFormOpen(false)}>Cancel</Button>
-            <Button onClick={() => { setFormOpen(false); setBuildOpen(true) }} disabled={!canContinue}>
+            <Button variant="outline" onClick={() => { track('engines', 'cancel_custom_build_dialog'); setFormOpen(false) }}>Cancel</Button>
+            <Button onClick={() => { track('engines', 'continue_custom_build_dialog'); setFormOpen(false); setBuildOpen(true) }} disabled={!canContinue}>
               Continue
             </Button>
           </DialogFooter>

@@ -413,7 +413,36 @@ export const SCREENS = [
  *  `install_comfyui_gate` — rather than splitting per format the way Batch 17 split
  *  `download_hf_model`/`download_hf_quant`, since those cover genuinely different DOWNLOAD
  *  SCOPES (whole repo vs. one file) while these are just export-format variants of the same
- *  single artifact. */
+ *  single artifact.
+ *
+ *  Batch 36 (Phase 6jj): four small files (2 raw matches each, 8 total) shipped together as
+ *  one PR — the remaining backlog is entirely 1-2 handler files, so batching several trivial,
+ *  mutually-independent files per PR avoids repeating a full deploy/verify/PR cycle 18 times
+ *  for files this small, while every file still gets its own classification below and its own
+ *  live-verify:
+ *  - `screens/settings/ToolPermissionsSection.tsx` — 2 new actions, no skips, tagged
+ *    `settings` (its only embedding). `toggle_auto_allow_tools` and `set_tool_policy` are
+ *    persistent per-tool/global CONFIG, genuinely different from Batch 25's
+ *    `allow_tool_call`/`deny_tool_call`/etc., which are live, per-INSTANCE approval decisions
+ *    on one in-flight tool call in a running chat.
+ *  - `screens/models/ImportUrlDialog.tsx` — 2 new actions, no skips, tagged `models` (its only
+ *    embedding, `DiscoverTab.tsx`). `close_import_url_dialog` follows the established "a
+ *    dialog's own dismissal is tracked" precedent. `import_model_url` covers the submit button
+ *    for BOTH its real outcomes (enqueuing a direct download vs. routing to the repo's quant
+ *    picker) — unlike Batch 8's revert-dialog split, the downstream `model_downloaded` event
+ *    already distinguishes whether a download actually happened, so forking this click by
+ *    outcome adds no analytics value the click itself doesn't already provide.
+ *  - `screens/engines/EngineStatusHeader.tsx` — 1 new action, 1 reuse, no skips, tagged
+ *    `engines`. `onStop` calls the exact same `useModelActions().eject` mutation as Batch 3's
+ *    `eject_model` — a THIRD UI surface for the identical real object (after `ModelsScreen`
+ *    and Batch 32's `ModelLoadMenu`), so it reuses `eject_model` rather than inventing a
+ *    duplicate. `restart_engine` is new — distinct from the unrelated `restart_daemon` (that
+ *    restarts the whole TurboLLM process, not one llama-server engine).
+ *  - `screens/engines/CustomBuildDialog.tsx` — 2 new actions, no skips, tagged `engines`.
+ *    `cancel_custom_build_dialog` and `continue_custom_build_dialog` are this self-service
+ *    "Add via git repo" pre-form's own steps (ADR-183/184) — distinct from Batch 12's
+ *    `BuildGuideDialog.tsx` actions, which cover the guide dialog THIS form hands off into,
+ *    not this form itself. */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -510,6 +539,11 @@ export const UI_ACTIONS = [
   'reset_thread_sampling', 'toggle_preserve_thinking', 'save_thread_settings',
 
   'toggle_artifact_interactive', 'toggle_artifact_fit', 'download_artifact',
+
+  'toggle_auto_allow_tools', 'set_tool_policy',
+  'close_import_url_dialog', 'import_model_url',
+  'restart_engine',
+  'cancel_custom_build_dialog', 'continue_custom_build_dialog',
 ] as const
 
 export const uiAction = defineEvent({
