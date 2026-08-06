@@ -246,6 +246,17 @@ test('validateEvent: ui_action accepts the Phase 6l BuildGuideDialog batch actio
   }
 })
 
+test('validateEvent: ui_action accepts the Phase 6m AgentEditPage batch actions', () => {
+  const actions = [
+    'toggle_agent_tool_group', 'back_to_agents', 'reset_agent_to_default', 'save_agent',
+    'switch_agent_form_tab', 'delete_agent', 'cancel_delete_agent',
+  ]
+  for (const action of actions) {
+    const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'agents', action } }))
+    assert.equal(r.ok, true, r.ok === false ? `agents/${action}: ${r.reason}` : '')
+  }
+})
+
 test('validateEvent: ui_daily requires screen plus both volume counters', () => {
   const r = validateEvent(validEvent({ event: 'ui_daily', payload: { screen: 'engines', actions: 5, distinctActions: 3 } }))
   assert.equal(r.ok, true, r.ok === false ? r.reason : '')

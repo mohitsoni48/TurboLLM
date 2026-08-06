@@ -178,7 +178,19 @@ export const SCREENS = [
  *  distinct actions, no skips. `dismiss_build_success` (the post-build "Done" button on the
  *  celebratory success screen) is kept separate from `close_build_guide` (the dialog's plain
  *  "Close") — one confirms a completed build was seen, the other abandons the dialog with no
- *  build having happened, a real difference worth keeping visible. */
+ *  build having happened, a real difference worth keeping visible.
+ *
+ *  Batch 13 (Phase 6m): `screens/agents/AgentEditPage.tsx` — 10 raw matches, 7 new distinct
+ *  actions, 1 skip. All three `goBack` call sites (the error state's "Back to agents", the
+ *  header chevron, and the header's own "Cancel" button) call the exact same function with the
+ *  exact same effect (navigate to `/customize`, no side effect), so they fold into one
+ *  `back_to_agents` tracked once inside `goBack` itself — same pattern as Batch 5's
+ *  `back_to_routines`. The inline delete-confirm row's "Delete agent" link only opens the
+ *  confirm row (`setDeleteConfirm(true)`); per the "track the outcome, not the request" rule,
+ *  it is skipped in favor of tracking `delete_agent` at the confirm row's own "Delete" button.
+ *  Its "Cancel" (`setDeleteConfirm(false)`, dismissing the inline row without navigating) is
+ *  tracked separately as `cancel_delete_agent` — a different action from `back_to_agents`,
+ *  since it doesn't leave the page. */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -232,6 +244,9 @@ export const UI_ACTIONS = [
   'remove_build_search_dir', 'add_build_search_dir', 'recheck_build_prereqs',
   'copy_build_commands', 'close_build_guide', 'open_manual_build_handoff', 'start_engine_build',
   'dismiss_build_success', 'cancel_engine_build', 'download_cuda_toolkit',
+
+  'toggle_agent_tool_group', 'back_to_agents', 'reset_agent_to_default', 'save_agent',
+  'switch_agent_form_tab', 'delete_agent', 'cancel_delete_agent',
 ] as const
 
 export const uiAction = defineEvent({
