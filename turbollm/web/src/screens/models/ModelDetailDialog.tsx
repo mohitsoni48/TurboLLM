@@ -1,6 +1,6 @@
 ﻿import { useEffect, useMemo, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
 import { ChevronDown, ExternalLink, Gauge, RotateCcw, Save, X, Zap } from 'lucide-react'
-import { ApiError } from '../../lib/api'
+import { ApiError, track } from '../../lib/api'
 import { useBenchActions, useBenchState, useEngines, useModelActions, useModelDetail, useStatus } from '../../lib/queries'
 import type { CardSampling, LoadProfile, SysGpu } from '../../lib/types'
 import { defaultGpu, defaultVllm } from '../../lib/types'
@@ -228,7 +228,7 @@ export function ModelDetailDialog({
           {detail?.sourceRepo && onViewRepo && (
             <button
               type="button"
-              onClick={() => onViewRepo(detail.sourceRepo!)}
+              onClick={() => { track('models', 'view_model_hf_repo'); onViewRepo(detail.sourceRepo!) }}
               className="mt-1 inline-flex w-fit items-center gap-1 text-[12px] font-medium text-accent hover:underline"
               title={`View ${detail.sourceRepo} on Hugging Face`}
             >
@@ -499,7 +499,7 @@ export function ModelDetailDialog({
             )}
 
             {isLlamaCpp && (<>
-            <button type="button" onClick={() => setAdvanced((a) => !a)} className="flex items-center gap-1 text-[13px] font-medium text-muted hover:text-ink">
+            <button type="button" onClick={() => { track('models', 'toggle_model_advanced_settings'); setAdvanced((a) => !a) }} className="flex items-center gap-1 text-[13px] font-medium text-muted hover:text-ink">
               <ChevronDown size={14} className={advanced ? 'rotate-180 transition-transform' : 'transition-transform'} />
               Advanced
             </button>
@@ -591,6 +591,7 @@ export function ModelDetailDialog({
               <Button
                 className="flex-1"
                 onClick={() => {
+                  track('models', 'load_model_with_settings')
                   // Sequence: persist (when remembering) → then (re)load. Firing both
                   // at once raced the profile write against the reload. The reload
                   // surfaces failures via toast — otherwise a bad param silently stops
@@ -619,11 +620,11 @@ export function ModelDetailDialog({
                 <Zap size={14} />
                 {detail.loaded ? 'Reload' : 'Load model'}
               </Button>
-              <Button variant="outline" onClick={() => actions.save.mutate({ key: detail.key, profile: draft, engineId: activeEngine?.id ?? '*' })} disabled={actions.save.isPending} title="Save without reloading">
+              <Button variant="outline" onClick={() => { track('models', 'save_model_settings'); actions.save.mutate({ key: detail.key, profile: draft, engineId: activeEngine?.id ?? '*' }) }} disabled={actions.save.isPending} title="Save without reloading">
                 <Save size={14} />
                 Save
               </Button>
-              <Button variant="ghost" onClick={() => actions.reset.mutate({ key: detail.key, engineId: activeEngine?.id ?? '*' })} disabled={actions.reset.isPending} title="Reset to defaults">
+              <Button variant="ghost" onClick={() => { track('models', 'reset_model_settings'); actions.reset.mutate({ key: detail.key, engineId: activeEngine?.id ?? '*' }) }} disabled={actions.reset.isPending} title="Reset to defaults">
                 <RotateCcw size={14} />
               </Button>
             </div>
@@ -816,8 +817,8 @@ function AutoTuneResultDialog({
             <input type="checkbox" checked={downloadLog} onChange={(e) => setDownloadLog(e.target.checked)} className="h-3.5 w-3.5 accent-[var(--accent)]" />
             Download run log
           </label>
-          <AlertDialogCancel onClick={onCancel}>Cancel</AlertDialogCancel>
-          <AlertDialogAction onClick={() => onSave(downloadLog)}>Save</AlertDialogAction>
+          <AlertDialogCancel onClick={() => { track('models', 'dismiss_autotune_result'); onCancel() }}>Cancel</AlertDialogCancel>
+          <AlertDialogAction onClick={() => { track('models', 'save_autotune_result'); onSave(downloadLog) }}>Save</AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>
@@ -872,7 +873,7 @@ function AutoTune({
               <Gauge size={14} className="animate-pulse" style={{ color: 'var(--accent)' }} />
               Auto-tuning…
             </div>
-            <Button variant="outline" onClick={onCancel}>
+            <Button variant="outline" onClick={() => { track('models', 'cancel_autotune'); onCancel() }}>
               <X size={14} />
               Cancel
             </Button>
@@ -896,7 +897,7 @@ function AutoTune({
                   : 'Measures real speed on your hardware and saves the fastest settings (~3 min).'}
               </p>
             </div>
-            <Button variant="outline" onClick={onStart} disabled={pending}>
+            <Button variant="outline" onClick={() => { track('models', 'start_autotune'); onStart() }} disabled={pending}>
               <Zap size={14} />
               {loaded ? 'Stop & benchmark' : 'Auto-tune'}
             </Button>
@@ -985,7 +986,7 @@ function DefaultableNumberInput({ value, placeholder, min, max, step = 1, onChan
         className="w-20 rounded-md border border-border bg-bg px-2 py-1 text-right text-[13px] text-ink outline-none placeholder:text-faint"
       />
       {value !== undefined && (
-        <button type="button" onClick={() => onChange(undefined)} className="shrink-0 text-faint hover:text-ink" title="Reset to default">×</button>
+        <button type="button" onClick={() => { track('models', 'reset_model_setting_field'); onChange(undefined) }} className="shrink-0 text-faint hover:text-ink" title="Reset to default">×</button>
       )}
     </div>
   )
@@ -1008,7 +1009,7 @@ function Segmented({ value, options, onChange }: { value: string; options: strin
         <button
           key={o}
           type="button"
-          onClick={() => onChange(o)}
+          onClick={() => { track('models', 'set_model_setting_option'); onChange(o) }}
           className="px-2.5 py-1 text-[12px] capitalize transition-colors"
           style={{ background: value === o ? 'var(--accent)' : 'transparent', color: value === o ? 'var(--on-accent)' : 'var(--muted)' }}
         >
@@ -1102,7 +1103,7 @@ function SpecSegmented({ value, options, onChange }: {
         <button
           key={o}
           type="button"
-          onClick={() => onChange(o)}
+          onClick={() => { track('models', 'set_model_setting_option'); onChange(o) }}
           className="px-2.5 py-1 text-[12px] transition-colors"
           style={{ background: value === o ? 'var(--accent)' : 'transparent', color: value === o ? 'var(--on-accent)' : 'var(--muted)' }}
         >
@@ -1148,7 +1149,7 @@ function ChipListInput({ value, onChange, placeholder = 'Add another…', emptyP
           {value.map((s) => (
             <span key={s} className="flex items-center gap-0.5 rounded border border-border bg-panel-2 px-1.5 py-0.5 font-mono text-[11px] text-ink">
               {s}
-              <button type="button" onClick={() => onChange(value.filter((v) => v !== s))} className="ml-0.5 text-muted hover:text-[var(--err)]">×</button>
+              <button type="button" onClick={() => { track('models', 'remove_model_setting_chip'); onChange(value.filter((v) => v !== s)) }} className="ml-0.5 text-muted hover:text-[var(--err)]">×</button>
             </span>
           ))}
         </div>

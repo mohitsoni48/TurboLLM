@@ -152,7 +152,27 @@ export const SCREENS = [
  *  action: `onAddContext=` never matched the grep selector in either caller's own file, so this
  *  is the first time the button that OPENS the context-file browser gets tracked at all
  *  (distinct from `add_code_context_file`, Batch 8's action for actually SELECTING a file once
- *  the browser is open). */
+ *  the browser is open).
+ *
+ *  Batch 11 (Phase 6k): `screens/models/ModelDetailDialog.tsx` — 13 raw matches, 12 new
+ *  distinct actions, no skips. Screen tagged `models` throughout even though this dialog opens
+ *  from chat/code too (`onModelSettings` callers) — same reasoning as Batch 6's `MessageBubble`:
+ *  the dialog's own identity is what it's about, not wherever it happens to be embedded.
+ *  `load_model_with_settings` is deliberately its own action, not folded into Batch 3's
+ *  `load_model` (`ModelsScreen`'s card button) — that one loads with saved/default settings,
+ *  this one loads with whatever is currently in the (possibly just-edited) draft, a real
+ *  difference in what gets sent to the engine. `set_model_setting_option` folds two visually
+ *  distinct but structurally identical generic picker components (`Segmented`, `SpecSegmented`)
+ *  used for several unrelated settings fields (split mode, RoPE scaling, speculative decoding
+ *  strategy) — same reasoning as folding `FilterChip`/`ActionBtn`'s generic relays elsewhere,
+ *  just applied to a picker instead of a plain button. `reset_model_setting_field`/
+ *  `remove_model_setting_chip` are similarly generic across whichever specific field a
+ *  `DefaultableNumberInput`/`ChipListInput` happens to back. Most of this dialog's controls
+ *  (`Toggle`, `Slider`) take a plain `onChange` prop rather than `onCheckedChange`/
+ *  `onValueChange`, so they never matched the grep selector at all — a real, larger blind spot
+ *  than the usual overcounting the batch-2 note describes, left as-is for the same reason: the
+ *  raw counts are directional estimates, not a coverage guarantee, and going beyond what the
+ *  selector catches is out of scope for a per-file batch. */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -197,6 +217,11 @@ export const UI_ACTIONS = [
   'select_code_slash_command', 'select_code_file_mention', 'select_code_repo', 'browse_code_repo',
   'select_code_base_branch', 'remove_code_context_file', 'remove_code_image', 'set_code_mode',
   'open_code_context_browser', 'stop_code_generation',
+
+  'view_model_hf_repo', 'toggle_model_advanced_settings', 'load_model_with_settings',
+  'save_model_settings', 'reset_model_settings', 'dismiss_autotune_result', 'save_autotune_result',
+  'cancel_autotune', 'start_autotune', 'reset_model_setting_field', 'set_model_setting_option',
+  'remove_model_setting_chip',
 ] as const
 
 export const uiAction = defineEvent({
