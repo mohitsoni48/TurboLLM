@@ -173,6 +173,18 @@ test('validateEvent: ui_action accepts the Phase 6f MessageBubble batch actions'
   }
 })
 
+test('validateEvent: ui_action accepts the Phase 6g ChatScreen batch actions', () => {
+  const actions = [
+    'open_model_settings', 'copy_chat_link', 'copy_chat_debug_info', 'export_chat',
+    'dismiss_import_banner', 'use_suggested_prompt', 'scroll_to_latest', 'dismiss_clipboard_modal',
+    'select_skill_from_picker', 'remove_attachment', 'attach_file', 'stop_generation', 'send_message',
+  ]
+  for (const action of actions) {
+    const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'chat', action } }))
+    assert.equal(r.ok, true, r.ok === false ? `chat/${action}: ${r.reason}` : '')
+  }
+})
+
 test('validateEvent: ui_daily requires screen plus both volume counters', () => {
   const r = validateEvent(validEvent({ event: 'ui_daily', payload: { screen: 'engines', actions: 5, distinctActions: 3 } }))
   assert.equal(r.ok, true, r.ok === false ? r.reason : '')

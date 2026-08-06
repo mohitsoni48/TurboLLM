@@ -7,7 +7,7 @@ import { useConversation, useConversationMutations } from '../lib/chat-queries'
 import { useBuiltinAgentOverrides, useChatAgents, useEngines, useModelActions, useModelDetail, useModels, useSettings, useStatus } from '../lib/queries'
 import type { ChatSseEvent, Conversation, LiveToolCall, Message } from '../lib/chat-types'
 import { appendTextDelta, upsertToolCall, type LiveBlock } from '../lib/live-timeline'
-import { ApiError, downloadChatExport, getDebugSnapshot, getShareUrl, importChat } from '../lib/api'
+import { ApiError, downloadChatExport, getDebugSnapshot, getShareUrl, importChat, track } from '../lib/api'
 import { Button } from '../components/ui/button'
 import {
   DropdownMenu,
@@ -783,7 +783,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
       {!embedded && !isDesktop && mobileSidebarOpen && (
         <div
           className="fixed inset-0 z-30 bg-black/40 md:hidden"
-          onClick={() => setMobileSidebarOpen(false)}
+          onClick={() => { track('chat', 'toggle_sidebar_collapsed'); setMobileSidebarOpen(false) }}
           aria-hidden
         />
       )}
@@ -837,7 +837,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
             size="icon"
             variant="ghost"
             className="h-8 w-8 shrink-0 md:hidden"
-            onClick={() => setMobileSidebarOpen(true)}
+            onClick={() => { track('chat', 'toggle_sidebar_collapsed'); setMobileSidebarOpen(true) }}
             title="Conversations"
             aria-label="Open conversations"
           >
@@ -859,7 +859,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
               size="icon"
               variant="ghost"
               className="h-8 w-8"
-              onClick={() => setSettingsKey(model.key)}
+              onClick={() => { track('chat', 'open_model_settings'); setSettingsKey(model.key) }}
               title="Model settings — change on the fly"
             >
               <SlidersHorizontal size={15} />
@@ -902,16 +902,16 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="min-w-[180px]">
-                <DropdownMenuItem className="text-[13px]" onSelect={() => void handleCopyLink()}>
+                <DropdownMenuItem className="text-[13px]" onSelect={() => { track('chat', 'copy_chat_link'); void handleCopyLink() }}>
                   <Copy size={13} className="text-muted" />
                   Copy link (LAN)
                 </DropdownMenuItem>
-                <DropdownMenuItem className="text-[13px]" onSelect={() => void handleCopyDebugInfo()}>
+                <DropdownMenuItem className="text-[13px]" onSelect={() => { track('chat', 'copy_chat_debug_info'); void handleCopyDebugInfo() }}>
                   <Copy size={13} className="text-muted" />
                   Copy debug info
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
-                <DropdownMenuItem className="text-[13px]" onSelect={handleExportChat}>
+                <DropdownMenuItem className="text-[13px]" onSelect={() => { track('chat', 'export_chat'); handleExportChat() }}>
                   <Download size={13} className="text-muted" />
                   Export chat
                 </DropdownMenuItem>
@@ -942,7 +942,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                   <span className="font-mono">{importModelMismatch}</span> is not available on this machine.
                   The chat was imported — select a different model to continue.
                 </span>
-                <button type="button" onClick={() => setImportModelMismatch(null)} className="shrink-0 text-faint hover:text-ink"><X size={13} /></button>
+                <button type="button" onClick={() => { track('chat', 'dismiss_import_banner'); setImportModelMismatch(null) }} className="shrink-0 text-faint hover:text-ink"><X size={13} /></button>
               </div>
             )}
 
@@ -950,7 +950,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
             {importError && (
               <div className="mb-2 flex items-start gap-2 rounded-md border border-[color:var(--err)] bg-[color-mix(in_srgb,var(--err)_8%,transparent)] px-3 py-2 text-[13px]">
                 <span className="flex-1 text-[color:var(--err)]">{importError}</span>
-                <button type="button" onClick={() => setImportError(null)} className="shrink-0 text-faint hover:text-ink"><X size={13} /></button>
+                <button type="button" onClick={() => { track('chat', 'dismiss_import_banner'); setImportError(null) }} className="shrink-0 text-faint hover:text-ink"><X size={13} /></button>
               </div>
             )}
 
@@ -966,7 +966,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                         <button
                           key={s}
                           type="button"
-                          onClick={() => { setInput(s); setTimeout(() => inputRef.current?.focus(), 0) }}
+                          onClick={() => { track('chat', 'use_suggested_prompt'); setInput(s); setTimeout(() => inputRef.current?.focus(), 0) }}
                           className="rounded-full border border-border px-4 py-1.5 text-[13px] text-muted hover:border-accent hover:text-ink transition-colors"
                         >
                           {s}
@@ -1020,7 +1020,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
         {showScrollBtn && live && (
           <button
             type="button"
-            onClick={() => { userScrolledUp.current = false; scrollToBottom(true) }}
+            onClick={() => { track('chat', 'scroll_to_latest'); userScrolledUp.current = false; scrollToBottom(true) }}
             className="absolute bottom-28 left-1/2 -translate-x-1/2 flex animate-[tllm-rise-in_150ms_ease-out] items-center gap-1.5 rounded-full border border-border bg-panel px-3 py-1.5 text-[13px] text-muted shadow-[var(--shadow-2)] transition-colors hover:text-ink motion-reduce:animate-none"
           >
             <ArrowDown size={13} /> Jump to latest
@@ -1029,11 +1029,11 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
 
         {/* Clipboard fallback modal (F-023): shown when navigator.clipboard is unavailable */}
         {clipboardFallback && (
-          <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => setClipboardFallback(null)}>
+          <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => { track('chat', 'dismiss_clipboard_modal'); setClipboardFallback(null) }}>
             <div className="mx-4 w-full max-w-lg rounded-lg border border-border bg-panel p-4 shadow-[var(--shadow-2)]" onClick={(e) => e.stopPropagation()}>
               <div className="mb-2 flex items-center justify-between">
                 <span className="text-[13px] font-medium text-ink">{clipboardFallback.title}</span>
-                <button type="button" onClick={() => setClipboardFallback(null)} className="text-faint hover:text-ink"><X size={14} /></button>
+                <button type="button" onClick={() => { track('chat', 'dismiss_clipboard_modal'); setClipboardFallback(null) }} className="text-faint hover:text-ink"><X size={14} /></button>
               </div>
               <textarea
                 readOnly
@@ -1066,7 +1066,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                   <button
                     key={s.id}
                     type="button"
-                    onClick={() => selectSkill(s)}
+                    onClick={() => { track('chat', 'select_skill_from_picker'); selectSkill(s) }}
                     className={cn(
                       'flex w-full flex-col items-start gap-0.5 px-3 py-2 text-left text-[13px]',
                       i === skillPickerIndex ? 'bg-panel-2' : 'hover:bg-panel-2',
@@ -1088,7 +1088,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                         ? <img src={a.dataUrl} className="h-8 w-8 rounded object-cover" alt="" />
                         : <span className="text-muted">{a.file.name}</span>
                       }
-                      <button type="button" onClick={() => setAttachments((prev) => prev.filter((_, j) => j !== i))} className="text-faint hover:text-err">
+                      <button type="button" onClick={() => { track('chat', 'remove_attachment'); setAttachments((prev) => prev.filter((_, j) => j !== i)) }} className="text-faint hover:text-err">
                         <X size={11} />
                       </button>
                     </div>
@@ -1099,7 +1099,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
               <div className="flex items-end gap-2 p-2">
                 <button
                   type="button"
-                  onClick={() => fileInputRef.current?.click()}
+                  onClick={() => { track('chat', 'attach_file'); fileInputRef.current?.click() }}
                   disabled={!ready || !!live}
                   className="grid h-9 w-9 shrink-0 place-items-center rounded-md hover:bg-panel-2 disabled:opacity-40"
                   title="Attach image or document"
@@ -1146,11 +1146,11 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                   }}
                 />
                 {live ? (
-                  <Button size="icon" variant="outline" onClick={() => void handleStop()} title="Stop generation (Esc)">
+                  <Button size="icon" variant="outline" onClick={() => { track('chat', 'stop_generation'); void handleStop() }} title="Stop generation (Esc)">
                     <Square size={15} />
                   </Button>
                 ) : (
-                  <Button size="icon" onClick={() => void send()} disabled={!ready || (!input.trim() && attachments.length === 0) || !!editingId} aria-label="Send">
+                  <Button size="icon" onClick={() => { track('chat', 'send_message'); void send() }} disabled={!ready || (!input.trim() && attachments.length === 0) || !!editingId} aria-label="Send">
                     <SendHorizontal size={15} />
                   </Button>
                 )}
