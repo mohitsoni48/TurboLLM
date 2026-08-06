@@ -52,6 +52,42 @@ test('profileToArgs: emits --n-cpu-moe by default on an MoE model', () => {
   assert.deepEqual(args.slice(args.indexOf('--n-cpu-moe'), args.indexOf('--n-cpu-moe') + 2), ['--n-cpu-moe', '4'])
 })
 
+test('profileToArgs: still emits --n-cpu-moe 0 explicitly when -ngl is also explicit, not just omits it (BeeLlama fit-abort regression)', () => {
+  // Omitting --n-cpu-moe at nCpuMoe=0 used to be treated as equivalent to passing 0, since
+  // mainline llama.cpp defaults to zero MoE CPU-offload anyway. But whenever -ngl is ALSO
+  // explicit (p.ngl > 0, same gate as the -ngl push itself), BeeLlama.cpp's fork runs its own
+  // implicit fit-placement pass whenever --n-cpu-moe is absent — which then aborts because -ngl
+  // is already pinned ("n_gpu_layers already set by user to N, abort", live-reproduced
+  // 2026-08-06) and falls through to loading every expert on GPU with no real offload, silently
+  // spilling to system RAM. Auto-tune's own nCpuMoe=0 search candidate hit this exact path.
+  // Passing --n-cpu-moe 0 explicitly (like every other tested value) avoids the ambiguity
+  // outright.
+  const p = { ...deriveDefault(moeModel, sys), ngl: 99, nCpuMoe: 0 }
+  const args = profileToArgs(p, moeModel, caps)
+  assert.deepEqual(args.slice(args.indexOf('--n-cpu-moe'), args.indexOf('--n-cpu-moe') + 2), ['--n-cpu-moe', '0'])
+})
+
+test('profileToArgs: nCpuMoe=0 stays omitted when ngl=0 too — no -ngl to collide with', () => {
+  // ngl=0 means -ngl itself is never emitted (gated on p.ngl > 0, same as -ngl's own push), so
+  // there's no explicit -ngl on the command line for an absent --n-cpu-moe to collide with. This
+  // is the real shape of a CPU-only box (deriveDefault sets ngl: 0 with no GPU) or a user
+  // manually dragging the still-visible MoE ngl slider to 0 — forcing --n-cpu-moe 0 here would
+  // needlessly suppress a fit pass that runs cleanly on its own.
+  const p = { ...deriveDefault(moeModel, sys), ngl: 0, nCpuMoe: 0 }
+  const args = profileToArgs(p, moeModel, caps)
+  assert.equal(args.includes('--n-cpu-moe'), false)
+})
+
+test('profileToArgs: --n-cpu-moe stays gated by engine capability even at nCpuMoe=0', () => {
+  // The capability gate (has('--n-cpu-moe')) must still win over the new always-explicit-at-0
+  // behavior — an engine whose probed --help genuinely lacks --n-cpu-moe must never receive it,
+  // at any value, same as every other flag in this function.
+  const limited: Capabilities = { kvTypes: [], flags: ['-ngl', '--parallel'] }
+  const p = { ...deriveDefault(moeModel, sys), ngl: 99, nCpuMoe: 0 }
+  const args = profileToArgs(p, moeModel, limited)
+  assert.equal(args.includes('--n-cpu-moe'), false)
+})
+
 test('profileToArgs: nCpuMoeFit omits --n-cpu-moe entirely, regardless of the stale value', () => {
   const p = { ...deriveDefault(moeModel, sys), nCpuMoe: 4, nCpuMoeFit: true }
   const args = profileToArgs(p, moeModel, caps)

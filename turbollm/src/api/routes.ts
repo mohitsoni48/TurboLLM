@@ -1549,6 +1549,14 @@ export function registerApi(app: Hono, d: Deps): void {
         return err(c, 400, 'invalid_profile_value', 'gpu.tensorParallelSize must be an integer ≥ 1.')
       }
     }
+    // profileToArgs now emits --n-cpu-moe explicitly at every value including 0 (2026-08-06
+    // fix) instead of silently omitting it when falsy — a stored `null`/non-number would
+    // previously just get skipped, but now becomes a literal `--n-cpu-moe null` on the launch
+    // command line. Reject it here at the boundary rather than let it reach the engine. A
+    // genuinely absent key (older client, dense-model-only save) is still allowed through.
+    if (p.nCpuMoe !== undefined && (typeof p.nCpuMoe !== 'number' || !Number.isFinite(p.nCpuMoe) || p.nCpuMoe < 0)) {
+      return err(c, 400, 'invalid_profile_value', 'nCpuMoe must be a non-negative number.')
+    }
     // Per-engine profile (issue #35): save into the slot for the engine the client is
     // editing (?engine=<id>), falling back to the active engine, then the '*' fallback.
     const engineId = c.req.query('engine') || d.registry.active()?.id || '*'

@@ -578,7 +578,19 @@ export function profileToArgs(
   if (has('--parallel')) a.push('--parallel', String(p.parallel))
   if (p.parallel > 1 && p.kvUnified && has('--kv-unified')) a.push('--kv-unified')
   // nCpuMoeFit: omit --n-cpu-moe so -fit's finer-grained MoE offload strategy decides instead.
-  if (m.moe && !p.nCpuMoeFit && p.nCpuMoe > 0 && has('--n-cpu-moe')) a.push('--n-cpu-moe', String(p.nCpuMoe))
+  // Outside auto-fit, pass it explicitly whenever -ngl is ALSO explicit (p.ngl > 0 — the same
+  // gate as the -ngl push above) — including 0 — found 2026-08-06 from a live BeeLlama.cpp repro:
+  // omitting --n-cpu-moe (on the old assumption that "0" and "absent" are equivalent) while -ngl
+  // is explicit leaves it ambiguous whether the engine should auto-fit its own placement or use
+  // exactly 0 CPU offload. BeeLlama's fork runs an implicit fit pass whenever --n-cpu-moe is
+  // absent, which then aborts on seeing -ngl already pinned ("n_gpu_layers already set by user to
+  // N, abort") and falls through to loading every expert on GPU with no real offload — silently
+  // spilling to system RAM instead of erroring, so auto-tune's own nCpuMoe=0 search candidate can
+  // look like it fits when it doesn't. Gating on p.ngl > 0 (not unconditional) matters: when ngl
+  // is 0 (a CPU-only box, or a user dragging the still-visible MoE ngl slider to 0) there's no
+  // -ngl on the command line to collide with, so forcing --n-cpu-moe 0 there would needlessly
+  // suppress a fit pass that runs cleanly on its own.
+  if (m.moe && !p.nCpuMoeFit && p.ngl > 0 && has('--n-cpu-moe')) a.push('--n-cpu-moe', String(p.nCpuMoe))
   // Emit a non-default KV cache type only when the engine supports the VALUE, not just
   // the --cache-type-k FLAG: e.g. TurboQuant's turbo2/3/4 must NOT leak into a standard
   // llama.cpp / llamafile engine (which has the flag but rejects the value → launch fails).
