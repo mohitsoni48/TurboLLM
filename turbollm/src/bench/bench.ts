@@ -23,7 +23,6 @@ import { inferRepoFromPath } from '../api/path-utils'
 import { enqueue } from '../telemetry/queue'
 import { TELEMETRY_SCHEMA_VERSION } from '../telemetry/schema'
 import { classifyBenchFailure } from '../telemetry/classify'
-import { claimOnce } from '../telemetry/ledger'
 import { telemetryDisabled } from '../telemetry/disabled'
 import type { Emitter } from '../telemetry/emit'
 import { emit } from '../telemetry/runtime/typed-emit'
@@ -246,16 +245,6 @@ export class BenchRunner {
     config?: { profile: LoadProfile; entry: ModelEntry; engine: Engine; sys: SysInfo },
   ): void {
     if (!this.telemetry) return
-    // onboarding_step (ADR-299): mirrors cli.ts's `onLoadSettled` wiring — auto-tune is a
-    // separate path to a first load and must feed the setup-funnel step too, not just the
-    // once-ever `model_first_load` milestone below (found 2026-08-01, see cli.ts). Once-only,
-    // same reasoning as cli.ts: this method runs on every sweep a user ever kicks off, not
-    // just the first, so an unguarded emit would misrepresent ongoing auto-tune usage as
-    // repeated "setup" (release-2 review finding). Retired alongside onboarding_step itself
-    // in a later pass (spec 23 §4).
-    if (claimOnce(this.store.dir(), 'once:onboarding_step:first_load')) {
-      this.telemetry.emit('onboarding_step', { step: 'first_load', outcome })
-    }
     // model_load (spec 23 §3.3): fires on EVERY sweep, not just the first
     // (model_first_load, retired here — see cli.ts's identical retirement and
     // its comment for why).

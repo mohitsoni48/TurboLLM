@@ -3,6 +3,9 @@
 // Single in-process holder; provisioning runs once at startup.
 
 import { classifyProvisionFailure } from '../telemetry/classify'
+import type { PROVISION_FAIL_REASONS } from '../telemetry/core/enums'
+
+type ProvisionFailReason = (typeof PROVISION_FAIL_REASONS)[number]
 
 export interface ProvisionStatus {
   active: boolean
@@ -33,11 +36,12 @@ export class ProvisionState {
     this.s.parts = parts
   }
 
-  /** Optional observer for the terminal outcome, wired in cli.ts (ADR-299
-   *  `onboarding_step`). The raw error STRING is deliberately never passed —
-   *  only `failReason`, a `classifyProvisionFailure` enum member, so the only
-   *  consumer still never sees free text even though it now learns *why*. */
-  onSettled?: (ok: boolean, failReason?: string) => void
+  /** Optional observer for the terminal outcome, wired in cli.ts to the
+   *  `engine_installed` event (spec 23 §4). The raw error STRING is
+   *  deliberately never passed — only `failReason`, a `classifyProvisionFailure`
+   *  enum member, so the only consumer still never sees free text even though
+   *  it now learns *why*. */
+  onSettled?: (ok: boolean, failReason?: ProvisionFailReason) => void
 
   done(): void {
     this.s = { active: false, phase: 'idle', backend: '', pct: 0, part: 1, parts: 1, error: null }
@@ -49,7 +53,7 @@ export class ProvisionState {
     this.settle(false, classifyProvisionFailure(error))
   }
 
-  private settle(ok: boolean, failReason?: string): void {
+  private settle(ok: boolean, failReason?: ProvisionFailReason): void {
     try {
       this.onSettled?.(ok, failReason)
     } catch {

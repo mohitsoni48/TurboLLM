@@ -27,6 +27,23 @@ export const modelFirstLoad = defineEvent({
   },
 })
 
+/** One model download settled (spec 23 §4, ADR-333) — promoted out of
+ *  `onboarding_step`'s `step: 'model_download'` into its own first-class
+ *  event when `onboarding_step` was deleted (Phase 7). `cancelled` is a
+ *  deliberate abandon (`downloads.ts`'s own `AbortError` handling), never
+ *  conflated with a genuine failure — the same distinction onboarding_step
+ *  already made. */
+export const modelDownloaded = defineEvent({
+  name: 'model_downloaded',
+  since: 2,
+  consent: 'anon',
+  lifecycle: 'per-action',
+  description: 'One model download settled (success, failure, or a deliberate cancel).',
+  payload: {
+    outcome: f.enum(OUTCOMES),
+  },
+})
+
 /** Who initiated a load. `gateway_switch` and `resume`/`manual` all funnel
  *  through `Manager.onLoadSettled` (cli.ts); `autotune` is reported directly
  *  by `bench.ts`, since an auto-tune sweep calls `Manager.start()` — a

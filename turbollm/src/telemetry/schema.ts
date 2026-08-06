@@ -24,7 +24,7 @@
 import { checkFields, structuralSanityCheck as coreStructuralSanityCheck, validateExtraBlock, validatePayload } from './core/validate'
 import { f } from './core/define'
 import type { EventDef } from './core/types'
-import { CONSENT_LEVELS, ERROR_FINGERPRINTS, FAIL_REASONS, ONBOARDING_STEPS, OUTCOMES, PROVISION_FAIL_REASONS } from './core/enums'
+import { CONSENT_LEVELS, ERROR_FINGERPRINTS, FAIL_REASONS, OUTCOMES, PROVISION_FAIL_REASONS } from './core/enums'
 import { EVENT_NAMES, REGISTRY, type EventName } from './events/index'
 
 /** Wire-format version. Bump only for a breaking payload change. */
@@ -38,7 +38,7 @@ export { EVENT_NAMES, REGISTRY }
 // authoritative source is `core/enums.ts` — see it for the full list this
 // file doesn't need to re-export because nothing outside `events/*.ts`
 // references them.
-export { CONSENT_LEVELS, ERROR_FINGERPRINTS, FAIL_REASONS, ONBOARDING_STEPS, OUTCOMES, PROVISION_FAIL_REASONS }
+export { CONSENT_LEVELS, ERROR_FINGERPRINTS, FAIL_REASONS, OUTCOMES, PROVISION_FAIL_REASONS }
 
 export { MAX_IDENT_LEN } from './core/validate'
 

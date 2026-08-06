@@ -43,8 +43,9 @@ function envelope(event, extra = {}) {
 const events = [
   envelope('app_first_run'),
   envelope('daily_active'),
-  envelope('onboarding_step', { payload: { step: 'model_download', outcome: 'ok' } }),
   envelope('model_first_load', { payload: { outcome: 'ok' } }),
+  envelope('engine_installed', { payload: { outcome: 'ok' } }),
+  envelope('model_downloaded', { payload: { outcome: 'ok' } }),
   envelope('model_load', {
     payload: {
       outcome: 'ok',
