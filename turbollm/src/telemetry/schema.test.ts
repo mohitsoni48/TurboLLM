@@ -284,6 +284,17 @@ test('validateEvent: ui_action accepts the Phase 6p SkillEditPage batch actions'
   }
 })
 
+test('validateEvent: ui_action accepts the Phase 6q HfRepoDialog batch actions', () => {
+  const actions = [
+    'load_hf_quant', 'download_hf_quant', 'select_hf_quant', 'download_hf_model',
+    'search_hf_from_error', 'retry_hf_repo_load',
+  ]
+  for (const action of actions) {
+    const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'models', action } }))
+    assert.equal(r.ok, true, r.ok === false ? `models/${action}: ${r.reason}` : '')
+  }
+})
+
 test('validateEvent: ui_daily requires screen plus both volume counters', () => {
   const r = validateEvent(validEvent({ event: 'ui_daily', payload: { screen: 'engines', actions: 5, distinctActions: 3 } }))
   assert.equal(r.ok, true, r.ok === false ? r.reason : '')
