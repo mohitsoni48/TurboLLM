@@ -373,6 +373,14 @@ test('validateEvent: ui_action accepts the Phase 6bb RoutineFormFields batch act
   }
 })
 
+test('validateEvent: ui_action accepts the Phase 6dd CodeContextSection batch actions', () => {
+  const actions = ['add_context_candidate', 'remove_context_candidate', 'save_context_candidates']
+  for (const action of actions) {
+    const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'settings', action } }))
+    assert.equal(r.ok, true, r.ok === false ? `settings/${action}: ${r.reason}` : '')
+  }
+})
+
 test('validateEvent: ui_daily requires screen plus both volume counters', () => {
   const r = validateEvent(validEvent({ event: 'ui_daily', payload: { screen: 'engines', actions: 5, distinctActions: 3 } }))
   assert.equal(r.ok, true, r.ok === false ? r.reason : '')
