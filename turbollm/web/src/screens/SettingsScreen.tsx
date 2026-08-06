@@ -29,7 +29,7 @@ import { CodeAgentSection } from './settings/CodeAgentSection'
 import { MemorySection } from './settings/MemorySection'
 import { ExperimentalSection } from './settings/ExperimentalSection'
 
-import { ApiError, type TelemetryLevel } from '../lib/api'
+import { ApiError, track, type TelemetryLevel } from '../lib/api'
 import { TELEMETRY_UI_ENABLED } from '../lib/flags'
 import { toast } from '../components/ui/sonner'
 
@@ -308,7 +308,7 @@ export function SettingsScreen() {
               <button
                 key={id}
                 type="button"
-                onClick={() => setActiveCat(id)}
+                onClick={() => { track('settings', 'switch_settings_tab'); setActiveCat(id) }}
                 className={cn(
                   'flex shrink-0 items-center gap-2 whitespace-nowrap rounded-md px-3 py-2 text-left text-[13px] font-medium transition-colors md:w-full',
                   activeCat === id ? 'bg-accent/12 text-accent' : 'text-muted hover:text-ink',
@@ -342,7 +342,7 @@ export function SettingsScreen() {
                       <button
                         key={value}
                         type="button"
-                        onClick={() => setTheme(value)}
+                        onClick={() => { track('settings', 'set_theme'); setTheme(value) }}
                         className="flex items-center gap-1.5 px-3 py-2 text-[13px] transition-colors"
                         style={{
                           background: theme === value ? 'var(--accent)' : 'transparent',
@@ -676,7 +676,7 @@ export function SettingsScreen() {
           {dirty && (
             <div className="sticky bottom-0 -mx-4 mt-2 flex items-center justify-between border-t border-border bg-panel px-4 py-3 md:-mx-6 md:px-6">
               <span className="text-[13px] text-muted">Unsaved changes</span>
-              <Button onClick={handleSave} disabled={save.isPending || settingsQ.isLoading}>
+              <Button onClick={() => { track('settings', 'save_settings'); handleSave() }} disabled={save.isPending || settingsQ.isLoading}>
                 <Save size={14} />
                 {save.isPending ? 'Saving…' : 'Save settings'}
               </Button>
@@ -725,6 +725,7 @@ function ComfyUiSection({
       toast.error('Enter the path to your ComfyUI folder first.')
       return
     }
+    track('settings', 'install_comfyui_gate')
     install.mutate(p.trim(), {
       onSuccess: (r) => {
         toast.success(`Gate installed at ${r.path}. ${r.note ?? ''}`.trim())
@@ -734,6 +735,7 @@ function ComfyUiSection({
     })
   }
   const doUninstall = () => {
+    track('settings', 'uninstall_comfyui_gate')
     uninstall.mutate(undefined, {
       onSuccess: () => toast.success('ComfyUI gate removed.'),
       onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not remove the gate node.'),
@@ -1128,10 +1130,10 @@ function HfTokenSection({ tokenSet, onSaved }: { tokenSet: boolean; onSaved: () 
           className="flex-1 rounded-md border border-border bg-bg px-2 py-1.5 font-mono text-[13px] text-ink outline-none"
         />
         <div className="flex items-center gap-2">
-          <Button variant="outline" size="sm" onClick={runTest} disabled={!token.trim() || test.isPending}>
+          <Button variant="outline" size="sm" onClick={() => { track('settings', 'test_hf_token'); runTest() }} disabled={!token.trim() || test.isPending}>
             {test.isPending ? <Loader2 size={13} className="animate-spin" /> : 'Test'}
           </Button>
-          <Button size="sm" onClick={handleSaveToken} disabled={save.isPending || settingsQ.isFetching}>
+          <Button size="sm" onClick={() => { track('settings', 'save_hf_token'); handleSaveToken() }} disabled={save.isPending || settingsQ.isFetching}>
             {token.trim() ? 'Save token' : 'Clear token'}
           </Button>
         </div>
@@ -1203,7 +1205,7 @@ function PrivacySection({ level, setLevel }: { level: TelemetryLevel; setLevel: 
       </div>
 
       <div className="mt-3 border-t border-border pt-3">
-        <Button variant="outline" size="sm" onClick={() => setShowPreview((s) => !s)}>
+        <Button variant="outline" size="sm" onClick={() => { track('settings', 'toggle_telemetry_preview'); setShowPreview((s) => !s) }}>
           {showPreview ? 'Hide preview' : 'Preview what we send'}
         </Button>
         {showPreview && (
@@ -1246,14 +1248,14 @@ function SubmissionLog() {
   return (
     <div className="mt-3 border-t border-border pt-3">
       <div className="flex flex-wrap items-center gap-2">
-        <Button variant="outline" size="sm" onClick={() => setOpen((s) => !s)}>
+        <Button variant="outline" size="sm" onClick={() => { track('settings', 'toggle_submission_log'); setOpen((s) => !s) }}>
           {open ? 'Hide what was sent' : 'What was actually sent'}
         </Button>
         <Button
           variant="outline"
           size="sm"
           disabled={regenerate.isPending}
-          onClick={() => regenerate.mutate()}
+          onClick={() => { track('settings', 'regenerate_machine_id'); regenerate.mutate() }}
         >
           {regenerate.isPending ? 'Regenerating…' : 'New anonymous ID'}
         </Button>
@@ -1295,7 +1297,7 @@ function AdvancedSection({ onRestart }: { onRestart: () => void }) {
           <div className="text-[14px] font-medium text-ink">Restart daemon</div>
           <div className="text-[12px] text-muted">Stops the engine, then re-launches the daemon process</div>
         </div>
-        <Button variant="outline" size="sm" onClick={onRestart}>
+        <Button variant="outline" size="sm" onClick={() => { track('settings', 'restart_daemon'); onRestart() }}>
           <RefreshCw size={13} />
           Restart daemon
         </Button>
@@ -1382,10 +1384,10 @@ function RestartOverlay({ onDismiss }: { onDismiss: () => void }) {
               started TurboLLM.
             </div>
             <div className="mt-1 flex gap-2">
-              <Button variant="outline" size="sm" onClick={onDismiss}>
+              <Button variant="outline" size="sm" onClick={() => { track('settings', 'dismiss_restart_overlay'); onDismiss() }}>
                 Dismiss
               </Button>
-              <Button size="sm" onClick={() => window.location.reload()}>
+              <Button size="sm" onClick={() => { track('settings', 'reload_after_restart'); window.location.reload() }}>
                 Reload now
               </Button>
             </div>
@@ -1505,7 +1507,7 @@ function PersonalizationSection() {
         </div>
 
         <div className="flex justify-end">
-          <Button onClick={handleSave} size="sm">
+          <Button onClick={() => { track('settings', 'save_personalization'); handleSave() }} size="sm">
             {saved ? <><Check size={13} /> Saved</> : <><Save size={13} /> Save personalization</>}
           </Button>
         </div>
