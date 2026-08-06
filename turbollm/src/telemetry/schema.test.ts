@@ -95,6 +95,34 @@ test('validateEvent: ui_action requires a known screen and action (spec 23 §3.8
   assert.match(madeUpScreen.reason, /screen/)
 })
 
+test('validateEvent: ui_action accepts the Phase 6b ConversationSidebar batch actions, across their real screens', () => {
+  const cases: Array<[string, string]> = [
+    ['chat', 'open_conversation'],
+    ['chat', 'rename_conversation'],
+    ['chat', 'delete_conversation'],
+    ['chat', 'move_conversation_to_folder'],
+    ['chat', 'new_folder'],
+    ['chat', 'rename_folder'],
+    ['chat', 'delete_folder'],
+    ['chat', 'import_chat'],
+    ['chat', 'new_chat'],
+    ['code', 'open_code_session'],
+    ['code', 'rename_code_session'],
+    ['code', 'archive_code_session'],
+    ['code', 'delete_code_session'],
+    ['code', 'filter_code_sessions'],
+    ['code', 'new_code_session'],
+    ['code', 'toggle_sidebar_collapsed'],
+    ['routines', 'open_routine'],
+    ['routines', 'new_routine'],
+    ['routines', 'toggle_sidebar_collapsed'],
+  ]
+  for (const [screen, action] of cases) {
+    const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen, action } }))
+    assert.equal(r.ok, true, r.ok === false ? `${screen}/${action}: ${r.reason}` : '')
+  }
+})
+
 test('validateEvent: ui_daily requires screen plus both volume counters', () => {
   const r = validateEvent(validEvent({ event: 'ui_daily', payload: { screen: 'engines', actions: 5, distinctActions: 3 } }))
   assert.equal(r.ok, true, r.ok === false ? r.reason : '')

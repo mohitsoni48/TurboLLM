@@ -28,7 +28,7 @@ import { cn, folderName, readLastChatConvId, readLastCodeSessionId } from '../..
 import { Skeleton } from '../../components/ui/skeleton'
 import { useArchiveCodeSession, useCodeSessionRename, useCodeSessions, useDeleteCodeSession } from '../../lib/code-queries'
 import type { CodeSession, CodeSessionFilter, SessionStatus } from '../../lib/code-types'
-import { ApiError } from '../../lib/api'
+import { ApiError, track } from '../../lib/api'
 import { useRoutinesWithLatestRun, type RoutineWithLatestRun } from '../../lib/routine-queries'
 import { deriveRoutineDisplayStatus } from '../../lib/routine-status'
 import { RoutineStatusBadge } from '../../components/routines/RoutineStatusBadge'
@@ -97,6 +97,7 @@ function CodeSessionItem({
   const archiveMut = useArchiveCodeSession()
   const archived = !!session.archivedAt
   const toggleArchive = () => {
+    track('code', 'archive_code_session')
     archiveMut.mutate(
       { id: session.id, archived: !archived },
       {
@@ -105,12 +106,13 @@ function CodeSessionItem({
       },
     )
   }
+  const open = () => { track('code', 'open_code_session'); onOpen() }
   return (
     <div
-      onClick={() => !rename.editing && onOpen()}
+      onClick={() => !rename.editing && open()}
       role="button"
       tabIndex={0}
-      onKeyDown={(e) => { if (e.key === 'Enter' && !rename.editing) onOpen() }}
+      onKeyDown={(e) => { if (e.key === 'Enter' && !rename.editing) open() }}
       className="group relative flex cursor-pointer flex-col gap-0.5 rounded-md px-3 py-2 transition-colors"
       style={{ background: active ? 'color-mix(in srgb, var(--accent) 10%, transparent)' : 'transparent' }}
     >
@@ -178,7 +180,7 @@ function CodeSessionItem({
               </button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
-              <DropdownMenuItem onSelect={() => rename.start()}>
+              <DropdownMenuItem onSelect={() => { track('code', 'rename_code_session'); rename.start() }}>
                 <Pencil size={13} /> Rename
               </DropdownMenuItem>
               <DropdownMenuItem onSelect={toggleArchive}>
@@ -223,7 +225,7 @@ function CodeSessionsList({ q, onRequestDelete }: { q: string; onRequestDelete: 
             <button
               key={o.value}
               type="button"
-              onClick={() => setFilter(o.value)}
+              onClick={() => { track('code', 'filter_code_sessions'); setFilter(o.value) }}
               className="px-2.5 py-1 font-medium transition-colors"
               style={{
                 background: filter === o.value ? 'var(--accent)' : 'transparent',
@@ -281,12 +283,13 @@ function lastRunSummary(item: RoutineWithLatestRun): string {
 function RoutineSidebarItem({ item, active, onOpen }: { item: RoutineWithLatestRun; active: boolean; onOpen: () => void }) {
   const { routine } = item
   const status = deriveRoutineDisplayStatus(routine, item.latestRun)
+  const open = () => { track('routines', 'open_routine'); onOpen() }
   return (
     <div
-      onClick={onOpen}
+      onClick={open}
       role="button"
       tabIndex={0}
-      onKeyDown={(e) => { if (e.key === 'Enter') onOpen() }}
+      onKeyDown={(e) => { if (e.key === 'Enter') open() }}
       className="flex cursor-pointer flex-col gap-1 rounded-md px-3 py-2 transition-colors"
       style={{ background: active ? 'color-mix(in srgb, var(--accent) 10%, transparent)' : 'transparent' }}
     >
@@ -411,6 +414,7 @@ export function ConversationSidebar({
   const [pendingCodeDelete, setPendingCodeDelete] = useState<CodeSession | null>(null)
   const deleteCodeMut = useDeleteCodeSession()
   const doDeleteCodeSession = (session: CodeSession) => {
+    track('code', 'delete_code_session')
     const wasActive = session.id === activeCodeSessionId
     deleteCodeMut.mutate(session.id, {
       onSuccess: () => {
@@ -478,6 +482,7 @@ export function ConversationSidebar({
   // Actually delete a conversation. If it was the active one, tell the parent so
   // it can close/clear the now-dangling reference.
   const doDelete = (conv: Conversation) => {
+    track('chat', 'delete_conversation')
     const wasActive = conv.id === activeId
     mut.remove.mutate(conv.id, {
       onSuccess: () => {
@@ -514,6 +519,7 @@ export function ConversationSidebar({
   }
 
   const doDeleteFolder = (folder: Folder) => {
+    track('chat', 'delete_folder')
     mut.deleteFolder.mutate(folder.id, {
       onSuccess: () => { toast.success('Folder deleted') },
       onError: () => { toast.error('Could not delete folder.') },
@@ -537,12 +543,18 @@ export function ConversationSidebar({
   ]
   const newLabel = mode === 'code' ? 'New session' : mode === 'routines' ? 'New routine' : 'New chat (Ctrl+N)'
   const NewIcon = mode === 'chat' ? MessageSquarePlus : Plus
+  // One shared action per mode rather than a single generic "new" — the founder wants
+  // chat/code/routine creation volume distinguishable, not folded into one bucket.
+  const newAction = mode === 'code' ? 'new_code_session' : mode === 'routines' ? 'new_routine' : 'new_chat'
+  const trackNew = () => { track(mode, newAction); onNew() }
+  const trackToggle = () => { track(mode, 'toggle_sidebar_collapsed'); onToggle?.() }
+  const trackImport = () => { track('chat', 'import_chat'); onImport?.() }
 
   if (collapsed) {
     return (
       <div className="flex h-full flex-col items-center gap-1 border-r border-border bg-panel-2 py-3">
         {onToggle && (
-          <Button size="icon" variant="ghost" onClick={onToggle} title="Expand sidebar" className="h-7 w-7">
+          <Button size="icon" variant="ghost" onClick={trackToggle} title="Expand sidebar" className="h-7 w-7">
             <ChevronRight size={15} />
           </Button>
         )}
@@ -563,11 +575,11 @@ export function ConversationSidebar({
             <Icon size={15} />
           </Link>
         ))}
-        <Button size="icon" variant="ghost" onClick={onNew} title={newLabel} className="h-7 w-7">
+        <Button size="icon" variant="ghost" onClick={trackNew} title={newLabel} className="h-7 w-7">
           <NewIcon size={15} />
         </Button>
         {mode === 'chat' && onImport && (
-          <Button size="icon" variant="ghost" onClick={onImport} title="Import chat (.turbollm-chat.json or OpenAI JSON)" className="h-7 w-7">
+          <Button size="icon" variant="ghost" onClick={trackImport} title="Import chat (.turbollm-chat.json or OpenAI JSON)" className="h-7 w-7">
             <Download size={15} />
           </Button>
         )}
@@ -608,7 +620,7 @@ export function ConversationSidebar({
 
       <div className="flex items-center gap-2 px-3 pb-3 pt-2">
         {onToggle && (
-          <Button size="icon" variant="ghost" onClick={onToggle} title="Collapse sidebar" className="h-7 w-7 shrink-0">
+          <Button size="icon" variant="ghost" onClick={trackToggle} title="Collapse sidebar" className="h-7 w-7 shrink-0">
             <ChevronLeft size={15} />
           </Button>
         )}
@@ -629,19 +641,19 @@ export function ConversationSidebar({
         <Button
           size="icon"
           variant="ghost"
-          onClick={onNew}
+          onClick={trackNew}
           title={newLabel}
           className="h-7 w-7 shrink-0"
         >
           <NewIcon size={15} />
         </Button>
         {mode === 'chat' && (
-          <Button size="icon" variant="ghost" onClick={() => { setAddingFolder(true); setNewFolderName('') }} title="New folder" className="h-7 w-7 shrink-0">
+          <Button size="icon" variant="ghost" onClick={() => { track('chat', 'new_folder'); setAddingFolder(true); setNewFolderName('') }} title="New folder" className="h-7 w-7 shrink-0">
             <FolderPlus size={15} />
           </Button>
         )}
         {mode === 'chat' && onImport && (
-          <Button size="icon" variant="ghost" onClick={onImport} title="Import chat (.turbollm-chat.json or OpenAI JSON)" className="h-7 w-7 shrink-0">
+          <Button size="icon" variant="ghost" onClick={trackImport} title="Import chat (.turbollm-chat.json or OpenAI JSON)" className="h-7 w-7 shrink-0">
             <Download size={15} />
           </Button>
         )}
@@ -919,7 +931,7 @@ function FolderSection({
               </button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
-              <DropdownMenuItem onSelect={() => { setDraft(folder.name); setEditing(true) }}>
+              <DropdownMenuItem onSelect={() => { track('chat', 'rename_folder'); setDraft(folder.name); setEditing(true) }}>
                 <Pencil size={13} /> Rename
               </DropdownMenuItem>
               <DropdownMenuItem destructive onSelect={onRequestDelete}>
@@ -992,9 +1004,10 @@ function ConvItem({
     )
   }
 
+  const open = () => { track('chat', 'open_conversation'); onSelect(conv.id) }
   return (
     <div
-      onClick={() => !editing && onSelect(conv.id)}
+      onClick={() => !editing && open()}
       className="group relative flex cursor-pointer flex-col gap-0.5 rounded-md px-3 py-2 transition-colors"
       style={{ background: active ? 'color-mix(in srgb, var(--accent) 10%, transparent)' : 'transparent' }}
     >
@@ -1047,7 +1060,7 @@ function ConvItem({
                 <DropdownMenuItem
                   key={f.id}
                   disabled={f.id === conv.folderId}
-                  onSelect={() => onMove(conv, f.id)}
+                  onSelect={() => { track('chat', 'move_conversation_to_folder'); onMove(conv, f.id) }}
                 >
                   <FolderIcon size={13} /> {f.name}
                 </DropdownMenuItem>
@@ -1055,7 +1068,7 @@ function ConvItem({
               {conv.folderId && (
                 <>
                   {folders.length > 0 && <DropdownMenuSeparator />}
-                  <DropdownMenuItem onSelect={() => onMove(conv, null)}>
+                  <DropdownMenuItem onSelect={() => { track('chat', 'move_conversation_to_folder'); onMove(conv, null) }}>
                     Uncategorized
                   </DropdownMenuItem>
                 </>
@@ -1064,7 +1077,7 @@ function ConvItem({
           </DropdownMenu>
           <button
             type="button"
-            onClick={(e) => { e.stopPropagation(); setDraft(conv.title); setEditing(true) }}
+            onClick={(e) => { e.stopPropagation(); track('chat', 'rename_conversation'); setDraft(conv.title); setEditing(true) }}
             className="rounded p-1 text-faint transition-colors hover:text-ink"
             title="Rename conversation"
           >
