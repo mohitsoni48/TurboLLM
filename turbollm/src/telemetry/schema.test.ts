@@ -405,6 +405,20 @@ test('validateEvent: ui_action accepts the Phase 6ii ArtifactCard batch actions'
   }
 })
 
+test('validateEvent: ui_action accepts the Phase 6jj batch actions (4 small files)', () => {
+  const byScreen: Record<string, string[]> = {
+    settings: ['toggle_auto_allow_tools', 'set_tool_policy'],
+    models: ['close_import_url_dialog', 'import_model_url'],
+    engines: ['restart_engine', 'cancel_custom_build_dialog', 'continue_custom_build_dialog'],
+  }
+  for (const [screen, actions] of Object.entries(byScreen)) {
+    for (const action of actions) {
+      const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen, action } }))
+      assert.equal(r.ok, true, r.ok === false ? `${screen}/${action}: ${r.reason}` : '')
+    }
+  }
+})
+
 test('validateEvent: ui_action accepts the Phase 6ee CodeGitDialog batch actions', () => {
   const actions = ['commit_code_git', 'push_code_git', 'close_code_git_dialog']
   for (const action of actions) {

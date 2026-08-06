@@ -2,7 +2,7 @@ import { useQuery } from '@tanstack/react-query'
 import { useState } from 'react'
 import { ChevronRight, ShieldCheck } from 'lucide-react'
 import { useSettings } from '../../lib/queries'
-import { ApiError, type ToolPolicy } from '../../lib/api'
+import { ApiError, track, type ToolPolicy } from '../../lib/api'
 import { fetchAvailableTools } from '../../lib/chat-api'
 import { friendlyName } from '../../lib/tool-explain'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../../components/ui/collapsible'
@@ -27,6 +27,7 @@ export function ToolPermissionsSection() {
   const autoAllowAll = settingsQ.data?.autoAllowAll ?? false
 
   const setPolicy = (name: string, value: ToolPolicy) => {
+    track('settings', 'set_tool_policy')
     save.mutate(
       { toolPolicies: { ...policies, [name]: value } },
       { onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not update tool permission.') },
@@ -34,6 +35,7 @@ export function ToolPermissionsSection() {
   }
 
   const setAutoAllowAll = (value: boolean) => {
+    track('settings', 'toggle_auto_allow_tools')
     save.mutate(
       { autoAllowAll: value },
       { onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not update tool permission.') },

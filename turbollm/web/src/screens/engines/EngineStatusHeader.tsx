@@ -1,7 +1,7 @@
 import { CircleSlash, RotateCw } from 'lucide-react'
 import type { EngineStats, LiveGeneration, Status } from '../../lib/types'
 import { useEngineMutations, useModelActions } from '../../lib/queries'
-import { ApiError } from '../../lib/api'
+import { ApiError, track } from '../../lib/api'
 import { Button } from '../../components/ui/button'
 import { StateChip } from '../../components/StateChip'
 import { CopyButton } from '../../components/ui/copy-button'
@@ -31,15 +31,19 @@ export function EngineStatusHeader({
   const canStop = state === 'running' || state === 'starting'
   const canRestart = state === 'running' || state === 'error'
 
-  const onStop = () =>
+  const onStop = () => {
+    track('engines', 'eject_model')
     actions.eject.mutate(undefined, {
       onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not stop the engine.'),
     })
+  }
 
-  const onRestart = () =>
+  const onRestart = () => {
+    track('engines', 'restart_engine')
     mut.restart.mutate(undefined, {
       onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not restart the engine.'),
     })
+  }
 
 
   const body = (

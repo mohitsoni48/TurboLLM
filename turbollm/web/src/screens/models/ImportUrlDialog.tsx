@@ -5,7 +5,7 @@
 
 import { useEffect, useMemo, useState } from 'react'
 import { Link2 } from 'lucide-react'
-import { ApiError } from '../../lib/api'
+import { ApiError, track } from '../../lib/api'
 import { useDownloadMutations } from '../../lib/queries'
 import { Button } from '../../components/ui/button'
 import { Input } from '../../components/ui/input'
@@ -128,6 +128,7 @@ export function ImportUrlDialog({
   }
 
   const submit = () => {
+    track('models', 'import_model_url')
     if (repoTarget) {
       onOpenRepo?.(repoTarget)
       close()
@@ -210,7 +211,7 @@ export function ImportUrlDialog({
         </div>
 
         <div className="mt-4 flex justify-end gap-2">
-          <Button variant="outline" onClick={close}>Cancel</Button>
+          <Button variant="outline" onClick={() => { track('models', 'close_import_url_dialog'); close() }}>Cancel</Button>
           <Button onClick={submit} disabled={!valid || mut.enqueue.isPending}>
             <Link2 size={14} />
             {mut.enqueue.isPending ? 'Adding…' : repoTarget ? 'Open' : 'Import'}
