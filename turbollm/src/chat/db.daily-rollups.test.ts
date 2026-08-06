@@ -110,6 +110,42 @@ test('gatewayDailyStats: groups by protocol (source), sums tokens, counts distin
   assert.equal(openai?.requests, 1)
 })
 
+test('gatewayDailyStats: rows with no harness column value group as unknown, not their own row per request', () => {
+  const store = makeStore()
+  store.recordApiUsage({ source: 'anthropic', modelKey: 'model-a', promptTokens: 100, genTokens: 50 })
+  store.recordApiUsage({ source: 'anthropic', modelKey: 'model-a', promptTokens: 100, genTokens: 50 })
+
+  const rows = store.gatewayDailyStats(today())
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0].harness, 'unknown')
+  assert.equal(rows[0].requests, 2)
+})
+
+test('gatewayDailyStats: groups by (protocol, harness) — spec 23 §3.5, telemetry Phase 5', () => {
+  const store = makeStore()
+  store.recordApiUsage({ source: 'anthropic', modelKey: 'model-a', promptTokens: 100, genTokens: 50, harness: 'claude_code' })
+  store.recordApiUsage({ source: 'anthropic', modelKey: 'model-b', promptTokens: 200, genTokens: 20, harness: 'claude_code' })
+  store.recordApiUsage({ source: 'openai', modelKey: 'model-a', promptTokens: 10, genTokens: 5, harness: 'opencode' })
+  store.recordApiUsage({ source: 'openai', modelKey: 'model-a', promptTokens: 30, genTokens: 15, harness: 'cline' })
+
+  const rows = store.gatewayDailyStats(today())
+  assert.equal(rows.length, 3, 'claude_code/anthropic, opencode/openai, and cline/openai are three distinct groups')
+
+  const claude = rows.find((r) => r.harness === 'claude_code')
+  assert.equal(claude?.protocol, 'anthropic')
+  assert.equal(claude?.requests, 2)
+  assert.equal(claude?.promptTokens, 300)
+  assert.equal(claude?.distinctModels, 2)
+
+  const opencode = rows.find((r) => r.harness === 'opencode')
+  assert.equal(opencode?.requests, 1)
+  assert.equal(opencode?.promptTokens, 10)
+
+  const cline = rows.find((r) => r.harness === 'cline')
+  assert.equal(cline?.requests, 1)
+  assert.equal(cline?.promptTokens, 30)
+})
+
 test('codeDailyStats: no code sessions today → all zeros', () => {
   const store = makeStore()
   assert.deepEqual(store.codeDailyStats(today()), { sessions: 0, turns: 0, toolCalls: 0 })

@@ -101,6 +101,30 @@ test('emit: error events require the full level, not merely anon', () => {
   }
 })
 
+test('emit: every schema-declared consent:"full" event is actually blocked at anon, not just error (regression)', () => {
+  // Found while building Phase 5: REQUIRES_FULL was a literal Set(['error']) that predated the
+  // registry and was never extended when model_load/gateway_daily/chat_daily/code_daily/
+  // harness_first_seen were added with consent:'full' in their own schema — so an anon install
+  // would have sent model identity, harness identity, and daily-rollup detail anyway, contrary
+  // to the published privacy contract. Now derived from the registry instead of a hand list.
+  const dir = tempDir()
+  try {
+    const { emitter } = makeEmitter(dir, 'anon')
+    emitter.emit('model_load', { outcome: 'ok', trigger: 'manual' })
+    emitter.emit('gateway_daily', { harness: 'claude_code', protocol: 'anthropic', requests: 1, promptTokens: 1, genTokens: 1, distinctModels: 1 })
+    emitter.emit('chat_daily', { conversations: 1, messages: 1, maxMessagesInConversation: 1, medianMessagesInConversation: 1, distinctModels: 1, toolCalls: 0, regenerates: 0, stops: 0 })
+    emitter.emit('code_daily', { sessions: 1, turns: 1, toolCalls: 0 })
+    emitter.emit('harness_first_seen', { harness: 'claude_code', protocol: 'anthropic' })
+    assert.deepEqual(names(dir), [], 'every consent:"full" event must be blocked at anon')
+
+    const { emitter: full } = makeEmitter(dir, 'full')
+    full.emit('model_load', { outcome: 'ok', trigger: 'manual' })
+    assert.deepEqual(names(dir), ['model_load'], 'the same event sends once consent is actually full')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('emit: a payload the schema rejects is dropped rather than queued', () => {
   const dir = tempDir()
   try {
@@ -136,6 +160,47 @@ test('firstUse: distinct features each emit once', () => {
     emitter.firstUse('chat')
     emitter.firstUse('code')
     assert.equal(names(dir).length, 2)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// ── harnessFirstSeen (spec 23 §3.5, Phase 5) ────────────────────────────────
+
+test('harnessFirstSeen: emits once per harness value, and stays deduped across a restart', () => {
+  const dir = tempDir()
+  try {
+    const { emitter } = makeEmitter(dir, 'full')
+    emitter.harnessFirstSeen('claude_code', 'anthropic')
+    emitter.harnessFirstSeen('claude_code', 'anthropic')
+    assert.deepEqual(names(dir), ['harness_first_seen'], 'second call for the same harness is a no-op')
+
+    const { emitter: restarted } = makeEmitter(dir, 'full')
+    restarted.harnessFirstSeen('claude_code', 'anthropic')
+    assert.equal(names(dir).length, 1, 'ledger survives restart')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('harnessFirstSeen: distinct harness values, including unknown, each emit once', () => {
+  const dir = tempDir()
+  try {
+    const { emitter } = makeEmitter(dir, 'full')
+    emitter.harnessFirstSeen('claude_code', 'anthropic')
+    emitter.harnessFirstSeen('opencode', 'openai')
+    emitter.harnessFirstSeen('unknown', 'openai')
+    assert.equal(names(dir).length, 3, 'unknown is a real, trackable value, not suppressed')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('harnessFirstSeen: requires full consent — anon must not leak harness identity', () => {
+  const dir = tempDir()
+  try {
+    makeEmitter(dir, 'anon').emitter.harnessFirstSeen('claude_code', 'anthropic')
+    assert.deepEqual(names(dir), [], 'anon must never send harness identity')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

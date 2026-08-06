@@ -18,8 +18,10 @@ import type { Emitter } from '../emit'
 import { emit } from './typed-emit'
 import { DailyRollup } from './rollup'
 import { chatDaily } from '../events/chat'
-import { gatewayDaily } from '../events/gateway'
+import { gatewayDaily, HARNESSES } from '../events/gateway'
 import { codeDaily } from '../events/code'
+
+const HARNESS_SET: ReadonlySet<string> = new Set(HARNESSES)
 
 /**
  * Check whether the calendar day has rolled over since the last call, and if
@@ -64,8 +66,11 @@ export function checkDailyQueryRollups(
   emit(telemetry, codeDaily, code)
 
   for (const g of db.gatewayDailyStats(day)) {
-    // Phase 5 (not built yet) is what turns this into a real per-client
-    // breakdown — see events/gateway.ts's own doc comment.
-    emit(telemetry, gatewayDaily, { harness: 'unknown', ...g })
+    // db.ts stores whatever classifyHarness() produced (always a HARNESSES member) plus
+    // 'unknown' for pre-Phase-5/unclassified rows — this membership check is defense-in-depth
+    // against a hand-edited DB or a future direct writer, not an expected runtime path, and is
+    // what lets `harness` below satisfy PayloadOf<>'s literal-enum type at all.
+    const harness = HARNESS_SET.has(g.harness) ? (g.harness as (typeof HARNESSES)[number]) : 'unknown'
+    emit(telemetry, gatewayDaily, { ...g, harness })
   }
 }

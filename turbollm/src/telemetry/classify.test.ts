@@ -1,7 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { classifyLoadFailure, classifyBenchFailure, classifyEngineErrorFingerprint, classifyProvisionFailure } from './classify'
+import { classifyLoadFailure, classifyBenchFailure, classifyEngineErrorFingerprint, classifyProvisionFailure, classifyHarness } from './classify'
 import { FAIL_REASONS, ERROR_FINGERPRINTS, PROVISION_FAIL_REASONS } from './schema'
+import { HARNESSES } from './events/gateway'
 
 function err(over: Partial<{ code: string; message: string; logTail: string[] }> = {}) {
   return { code: 'load_failed', message: '', exitCode: 1, logTail: [], ...over }
@@ -180,4 +181,49 @@ test('classifyProvisionFailure: an unrecognised or missing message is other, not
   assert.equal(classifyProvisionFailure('something nobody has seen before'), 'other')
   assert.equal(classifyProvisionFailure(null), 'other')
   assert.equal(classifyProvisionFailure(undefined), 'other')
+})
+
+test('classifyHarness: no header is unknown, not a guess', () => {
+  assert.equal(classifyHarness(undefined), 'unknown')
+  assert.equal(classifyHarness(null), 'unknown')
+  assert.equal(classifyHarness(''), 'unknown')
+})
+
+test("classifyHarness: Claude Code's real UA prefix (spec 23 §3.5) maps to claude_code", () => {
+  assert.equal(classifyHarness('claude-cli/1.2.3'), 'claude_code')
+})
+
+test('classifyHarness: is case-insensitive', () => {
+  assert.equal(classifyHarness('Claude-CLI/1.2.3'), 'claude_code')
+})
+
+test('classifyHarness: recognises each documented CLI by its own name/library signature', () => {
+  assert.equal(classifyHarness('opencode/0.1.0'), 'opencode')
+  assert.equal(classifyHarness('KiloCode/1.0'), 'kilo')
+  assert.equal(classifyHarness('hermes-agent/2.0'), 'hermes')
+  assert.equal(classifyHarness('openclaw/1.0'), 'openclaw')
+  assert.equal(classifyHarness('pi-coding-agent/1.0'), 'pi')
+  assert.equal(classifyHarness('cline/3.0'), 'cline')
+  assert.equal(classifyHarness('Roo-Code/1.0'), 'roo')
+  assert.equal(classifyHarness('cursor/1.0'), 'cursor')
+  // aider shells out through Python's litellm package — litellm/x.y.z is that
+  // library's own default User-Agent, not a guess at aider's.
+  assert.equal(classifyHarness('litellm/1.50.0'), 'aider')
+  assert.equal(classifyHarness('Zed/0.150.0'), 'zed')
+  assert.equal(classifyHarness('vscode-restclient'), 'vscode')
+})
+
+test('classifyHarness: an unrecognised client is other, not a guess', () => {
+  assert.equal(classifyHarness('curl/8.0.1'), 'other')
+  assert.equal(classifyHarness('PostmanRuntime/7.36.0'), 'other')
+})
+
+test('classifyHarness: always returns a value from the enum, for arbitrary/hostile input', () => {
+  const inputs = ['', 'x'.repeat(5000), '<script>alert(1)</script>', ' ', 'CLAUDE-CLI/']
+  for (const ua of inputs) {
+    assert.ok(
+      (HARNESSES as readonly string[]).includes(classifyHarness(ua)),
+      `classified value must be in the enum, got ${classifyHarness(ua)}`,
+    )
+  }
 })
