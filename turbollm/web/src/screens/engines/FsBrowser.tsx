@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { ArrowRight, ArrowUp, Check, File as FileIcon, Folder, RotateCw } from 'lucide-react'
-import { ApiError } from '../../lib/api'
+import { ApiError, track } from '../../lib/api'
 import { useFsBrowse } from '../../lib/queries'
 import { truncateMiddle } from '../../lib/utils'
 import { Button } from '../../components/ui/button'
@@ -93,7 +93,7 @@ export function FsBrowser({
           <Button
             variant="outline"
             size="iconSm"
-            onClick={() => data?.parent != null && setPath(data.parent)}
+            onClick={() => { if (data?.parent != null) { track('engines', 'navigate_fs_up'); setPath(data.parent) } }}
             disabled={!data || data.parent == null || isFetching}
             aria-label="Up one folder"
           >
@@ -111,7 +111,7 @@ export function FsBrowser({
           <Button
             variant="outline"
             size="iconSm"
-            onClick={go}
+            onClick={() => { track('engines', 'navigate_fs_to_path'); go() }}
             disabled={!pathInput.trim() || isFetching}
             aria-label="Go to path"
             title="Go to this path"
@@ -121,7 +121,7 @@ export function FsBrowser({
           <Button
             variant="outline"
             size="iconSm"
-            onClick={() => void refetch()}
+            onClick={() => { track('engines', 'refresh_fs_browser'); void refetch() }}
             disabled={isFetching}
             aria-label="Refresh"
           >
@@ -149,7 +149,7 @@ export function FsBrowser({
                   <button
                     type="button"
                     disabled={inert}
-                    onClick={() => (e.isDir ? setPath(e.path) : choose(e.path))}
+                    onClick={() => { if (e.isDir) { track('engines', 'open_fs_folder'); setPath(e.path) } else { choose(e.path) } }}
                     className={
                       'flex w-full items-center gap-2.5 px-3 py-2 text-left text-[13px] text-ink ' +
                       (inert ? 'cursor-default text-faint' : 'hover:bg-panel-2')
@@ -170,7 +170,7 @@ export function FsBrowser({
         )}
 
         <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
+          <Button variant="outline" onClick={() => { track('engines', 'cancel_fs_browser'); onOpenChange(false) }}>
             Cancel
           </Button>
           {mode !== 'file' && (
