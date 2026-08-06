@@ -274,7 +274,19 @@ export const SCREENS = [
  *  `CodeInstructionEntry`'s "Revert to this message" — it only opens the confirm dialog
  *  (`openRevertConfirm`, wired from `CodeSessionScreen.tsx`); the confirmed outcome is already
  *  tracked as `revert_code_chat`/`revert_code_chat_and_files` at Batch 8's `AlertDialogAction`
- *  buttons, so tracking the opening click too would count the same revert twice. */
+ *  buttons, so tracking the opening click too would count the same revert twice.
+ *
+ *  Batch 22 (Phase 6v): `components/routines/RoutineConfirmCard.tsx` — 5 raw matches, 5 new
+ *  distinct actions, no skips. Screen tagged `routines` (its own directory's identity) even
+ *  though it also renders inline in the chat transcript (`MessageBubble.tsx`'s tool-call
+ *  cards) — same reasoning as every other cross-embedded shared component this session.
+ *  `cancel_routine_confirm`'s own `cancel()` function calls `props.onCancelled()`, which
+ *  `RoutineEditPage.tsx` wires to its own `goBack` (already firing `back_to_routines`, Batch
+ *  5) — this is NOT the double-count case the Batch 5 note warned about: that note applies
+ *  only if a button were a bare passthrough to `onCancelled` with no logic of its own, whereas
+ *  `cancel()` has real behavior first (a DELETE in create mode) before calling it, so
+ *  `cancel_routine_confirm` is a genuinely distinct, more specific action layered on top of
+ *  whatever the caller's `onCancelled` does — not a duplicate of it. */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -348,6 +360,9 @@ export const UI_ACTIONS = [
   'open_skill', 'upload_skill_file', 'create_skill', 'learn_skill_from_folder',
 
   'toggle_code_tool_detail', 'send_queued_code_message',
+
+  'cancel_routine_confirm_edit', 'save_routine_confirm_edit', 'edit_routine_confirm',
+  'cancel_routine_confirm', 'confirm_routine',
 ] as const
 
 export const uiAction = defineEvent({

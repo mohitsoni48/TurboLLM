@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react'
 import { CheckCircle2, Pencil, X } from 'lucide-react'
 import { Button } from '../ui/button'
+import { track } from '../../lib/api'
 import { toast } from '../ui/sonner'
 import { describeRoutineError } from '../../lib/routine-api'
 import { useRoutineMutations } from '../../lib/routine-queries'
@@ -236,10 +237,10 @@ export function RoutineConfirmCard(props: Props) {
               Changing a routine's flavor means deleting it and creating a new one. */}
           <RoutineFormFields draft={draft} onChange={setEdited} disabled={mut.update.isPending} lockFlavor />
           <div className="flex gap-1.5">
-            <Button size="sm" variant="outline" disabled={mut.update.isPending} onClick={() => { setEdited(null); setEditing(false) }}>
+            <Button size="sm" variant="outline" disabled={mut.update.isPending} onClick={() => { track('routines', 'cancel_routine_confirm_edit'); setEdited(null); setEditing(false) }}>
               Cancel edit
             </Button>
-            <Button size="sm" onClick={saveEdit} disabled={!complete || mut.update.isPending}>Save changes</Button>
+            <Button size="sm" onClick={() => { track('routines', 'save_routine_confirm_edit'); saveEdit() }} disabled={!complete || mut.update.isPending}>Save changes</Button>
           </div>
         </div>
       ) : (
@@ -264,9 +265,9 @@ export function RoutineConfirmCard(props: Props) {
           click, keyboard-activate or dispatch an event at until the edit is closed. */}
       {!editing && (
         <div className="mt-3 flex flex-wrap gap-1.5">
-          <Button size="sm" variant="outline" onClick={() => setEditing(true)}><Pencil size={13} /> Edit inline</Button>
-          <Button size="sm" variant="outline" onClick={cancel} disabled={mut.remove.isPending}><X size={13} /> Cancel</Button>
-          <Button size="sm" onClick={confirm} disabled={!complete || mut.confirm.isPending || mut.update.isPending}>
+          <Button size="sm" variant="outline" onClick={() => { track('routines', 'edit_routine_confirm'); setEditing(true) }}><Pencil size={13} /> Edit inline</Button>
+          <Button size="sm" variant="outline" onClick={() => { track('routines', 'cancel_routine_confirm'); cancel() }} disabled={mut.remove.isPending}><X size={13} /> Cancel</Button>
+          <Button size="sm" onClick={() => { track('routines', 'confirm_routine'); confirm() }} disabled={!complete || mut.confirm.isPending || mut.update.isPending}>
             <CheckCircle2 size={13} /> Confirm
           </Button>
         </div>
