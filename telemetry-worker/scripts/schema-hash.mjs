@@ -17,23 +17,56 @@
 // Deliberately a raw file hash, not a hash of some derived "meaning" of the
 // schema (e.g. only the exported enums). A byte-for-byte hash can never
 // produce a false negative — any change that could possibly affect
-// `validateEvent`'s behaviour changes the file, so it always trips the gate.
-// The cost is the inverse: a comment-only edit also trips it, forcing a
-// deploy for zero behavioural change. That's an intentional trade — a
-// slightly-too-eager gate that redeploys the Worker as a no-op is cheap; a
-// gate that ever misses a real drift is the exact bug this exists to prevent.
+// `validateEvent`'s behaviour changes some file in this set, so it always
+// trips the gate. The cost is the inverse: a comment-only edit also trips
+// it, forcing a deploy for zero behavioural change. That's an intentional
+// trade — a slightly-too-eager gate that redeploys the Worker as a no-op is
+// cheap; a gate that ever misses a real drift is the exact bug this exists
+// to prevent.
+//
+// Hashes the WHOLE `telemetry/` source tree (every .ts file, tests
+// excluded), not just schema.ts. Spec 24/ADR-333 (Phase 1) split what used
+// to be one file into `schema.ts` (thin assembly) + `core/*.ts` (generic
+// validator) + `events/*.ts` (the actual event definitions) — the Worker's
+// bundle now transitively includes all of them via schema.ts's imports, so
+// hashing schema.ts alone would silently stop catching a change to e.g.
+// `events/model.ts`'s enum values, which is exactly the class of drift this
+// gate exists to catch. `runtime/*.ts` (client-only: the typed emit helpers,
+// the daily-rollup accumulator) is deliberately included too even though the
+// Worker never imports it — a safe superset costs an occasional no-op
+// redeploy, which is the accepted trade-off stated above.
 
 import { createHash } from 'node:crypto'
-import { readFileSync, writeFileSync } from 'node:fs'
+import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { dirname, join } from 'node:path'
+import { dirname, join, relative } from 'node:path'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
-const SCHEMA_PATH = join(HERE, '..', '..', 'turbollm', 'src', 'telemetry', 'schema.ts')
+const TELEMETRY_DIR = join(HERE, '..', '..', 'turbollm', 'src', 'telemetry')
 const HASH_PATH = join(HERE, '..', 'deployed.schema.sha256')
 
+function collectSourceFiles(dir) {
+  const out = []
+  for (const entry of readdirSync(dir)) {
+    const full = join(dir, entry)
+    if (statSync(full).isDirectory()) {
+      out.push(...collectSourceFiles(full))
+    } else if (entry.endsWith('.ts') && !entry.endsWith('.test.ts')) {
+      out.push(full)
+    }
+  }
+  return out
+}
+
 function currentHash() {
-  return createHash('sha256').update(readFileSync(SCHEMA_PATH)).digest('hex')
+  const files = collectSourceFiles(TELEMETRY_DIR).sort((a, b) => relative(TELEMETRY_DIR, a).localeCompare(relative(TELEMETRY_DIR, b)))
+  const hash = createHash('sha256')
+  for (const file of files) {
+    hash.update(relative(TELEMETRY_DIR, file).replace(/\\/g, '/'))
+    hash.update('\0')
+    hash.update(readFileSync(file))
+  }
+  return hash.digest('hex')
 }
 
 const mode = process.argv[2]
