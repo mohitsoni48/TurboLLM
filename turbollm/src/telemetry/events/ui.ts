@@ -26,14 +26,30 @@ export const SCREENS = [
   'workspace', 'developer', 'routines', 'agents', 'skills',
 ] as const
 
-/** First batch instrumented (Phase 6a): `EnginesScreen.tsx` + its `EngineCard`/
- *  `CustomEngineCard` sub-components — 18 handler sites, 11 distinct actions (several
- *  handlers share an action across surfaces, e.g. the inline "Update" button and the
- *  overflow menu's "Update now" both fire `update_engine`). */
+/** Batch 1 (Phase 6a): `EnginesScreen.tsx` + its `EngineCard`/`CustomEngineCard`
+ *  sub-components — 18 handler sites, 11 distinct actions (several handlers share an
+ *  action across surfaces, e.g. the inline "Update" button and the overflow menu's
+ *  "Update now" both fire `update_engine`).
+ *
+ *  Batch 2 (Phase 6b): `ConversationSidebar.tsx` — 33 raw `onClick`/`onSelect` matches,
+ *  of which 6 are `e.stopPropagation()`-only guards (no user-observable action distinct
+ *  from the real handler they protect) and 4 are `onSelect={onSelect}`-shaped prop
+ *  forwarding to a child component, not a DOM/menu-item handler at all — neither kind
+ *  gets its own action. The remaining sites map to 18 distinct actions; several deletes
+ *  are tracked once inside the shared `doDelete*` function rather than at each UI entry
+ *  point, since the same delete can be reached both through a confirmation dialog AND
+ *  (when the user has turned confirmation off in Settings) directly — one call site
+ *  correctly covers both paths instead of missing the un-confirmed one. */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
   'toggle_manage_builds', 'open_build_guide', 'open_rebuild_guide',
+
+  'open_conversation', 'rename_conversation', 'delete_conversation', 'move_conversation_to_folder',
+  'new_folder', 'rename_folder', 'delete_folder',
+  'open_code_session', 'rename_code_session', 'archive_code_session', 'delete_code_session', 'filter_code_sessions',
+  'open_routine',
+  'toggle_sidebar_collapsed', 'new_chat', 'new_code_session', 'new_routine', 'import_chat',
 ] as const
 
 export const uiAction = defineEvent({
