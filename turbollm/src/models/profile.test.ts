@@ -52,6 +52,20 @@ test('profileToArgs: emits --n-cpu-moe by default on an MoE model', () => {
   assert.deepEqual(args.slice(args.indexOf('--n-cpu-moe'), args.indexOf('--n-cpu-moe') + 2), ['--n-cpu-moe', '4'])
 })
 
+test('profileToArgs: still emits --n-cpu-moe 0 explicitly, not just omits it (BeeLlama fit-abort regression)', () => {
+  // Omitting --n-cpu-moe at nCpuMoe=0 used to be treated as equivalent to passing 0, since
+  // mainline llama.cpp defaults to zero MoE CPU-offload anyway. But -ngl is ALWAYS emitted
+  // alongside it (see the -ngl block above), and BeeLlama.cpp's fork runs its own implicit
+  // fit-placement pass whenever --n-cpu-moe is absent — which then aborts because -ngl is
+  // already pinned ("n_gpu_layers already set by user to N, abort", live-reproduced 2026-08-06)
+  // and falls through to loading every expert on GPU with no real offload, silently spilling to
+  // system RAM. Auto-tune's own nCpuMoe=0 search candidate hit this exact path. Passing
+  // --n-cpu-moe 0 explicitly (like every other tested value) avoids the ambiguity outright.
+  const p = { ...deriveDefault(moeModel, sys), ngl: 99, nCpuMoe: 0 }
+  const args = profileToArgs(p, moeModel, caps)
+  assert.deepEqual(args.slice(args.indexOf('--n-cpu-moe'), args.indexOf('--n-cpu-moe') + 2), ['--n-cpu-moe', '0'])
+})
+
 test('profileToArgs: nCpuMoeFit omits --n-cpu-moe entirely, regardless of the stale value', () => {
   const p = { ...deriveDefault(moeModel, sys), nCpuMoe: 4, nCpuMoeFit: true }
   const args = profileToArgs(p, moeModel, caps)
