@@ -8,7 +8,7 @@ import {
   useUpdatePolicyMutation,
   useStatus,
 } from '../../lib/queries'
-import { ApiError } from '../../lib/api'
+import { ApiError, track } from '../../lib/api'
 import type { EngineUpdateStatus, UpdatePolicy } from '../../lib/types'
 import { Badge } from '../../components/ui/badge'
 import { Button } from '../../components/ui/button'
@@ -111,6 +111,7 @@ export function LlamaCppBackendRows({ filter }: { filter?: 'recommended' | 'othe
 
   const setPolicy = (engineId: string, policy: UpdatePolicy, label: string) => {
     if (!engineId) return
+    track('engines', 'set_engine_update_policy')
     policyMut.mutate(
       { id: engineId, policy },
       {
@@ -126,28 +127,35 @@ export function LlamaCppBackendRows({ filter }: { filter?: 'recommended' | 'othe
 
   const gpu = data.gpus[0]?.name
 
-  const download = (id: string) =>
+  const download = (id: string) => {
+    track('engines', 'install_engine')
     install.backend.mutate(id, {
       onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not download backend.'),
     })
+  }
 
-  const doEnable = (id: string) =>
+  const doEnable = (id: string) => {
+    track('engines', 'enable_engine')
     install.enableBackend.mutate(id, {
       onSuccess: () => toast.success('Backend enabled'),
       onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not enable backend.'),
     })
+  }
 
   // Disable = unregister from registry only (keep files on disk).
   // engineId is the registry entry id; remove() unregisters without touching disk.
-  const doDisable = (engineId: string, label: string) =>
+  const doDisable = (engineId: string, label: string) => {
+    track('engines', 'disable_engine')
     engineMutForDisable.remove.mutate(engineId, {
       onSuccess: () => toast.success(`${label} disabled`),
       onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not disable backend.'),
     })
+  }
 
   // Update: the daemon reports 'already latest' when the pinned build is present (no download),
   // otherwise it provisions the newer build (progress shows via the engineProvision channel).
-  const doUpdate = (id: string) =>
+  const doUpdate = (id: string) => {
+    track('engines', 'update_engine')
     install.updateBackend.mutate(id, {
       onSuccess: (res) =>
         res?.alreadyLatest
@@ -155,9 +163,11 @@ export function LlamaCppBackendRows({ filter }: { filter?: 'recommended' | 'othe
           : toast.success('Downloading the latest build…'),
       onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not update backend.'),
     })
+  }
 
   // Delete = remove files from disk via the backend delete endpoint. backend id (e.g. 'cuda').
-  const doDelete = (id: string) =>
+  const doDelete = (id: string) => {
+    track('engines', 'delete_engine')
     install.remove.mutate(id, {
       onSuccess: () => {
         toast.success(`${deleteTarget?.label ?? 'Backend'} deleted`)
@@ -168,6 +178,7 @@ export function LlamaCppBackendRows({ filter }: { filter?: 'recommended' | 'othe
         toast.error(e instanceof ApiError ? e.message : 'Could not delete backend.')
       },
     })
+  }
 
   const rows = data.backends.filter((b) =>
     filter === 'recommended' ? b.recommended : filter === 'others' ? !b.recommended : true,
