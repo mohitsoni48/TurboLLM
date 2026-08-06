@@ -20,6 +20,7 @@
 import type { Emitter } from '../emit'
 import type { EventDef, PayloadOf, FieldSpec } from '../core/types'
 import type { EventName } from '../schema'
+import { benchResult } from '../events/perf'
 
 type PayloadArg<Payload extends Record<string, FieldSpec> | undefined> = Payload extends undefined
   ? []
@@ -51,4 +52,22 @@ export function emit<const Name extends EventName, const Payload extends Record<
  */
 export function emitOnce<const Name extends EventName>(emitter: Emitter, def: EventDef<Name, undefined>): void {
   emitter.once(def.name)
+}
+
+/**
+ * Emit `bench_result` specifically — the one event with an
+ * `extraEnvelopeBlock` (`hw`, `core/types.ts`), which `Emitter.emit()`
+ * cannot carry at all. A dedicated typed wrapper rather than a generic
+ * "any event with an extra block" mechanism, matching `extraEnvelopeBlock`'s
+ * own doc comment: it is deliberately not a general escape hatch, and
+ * building generic machinery for a single consumer would be exactly the
+ * premature abstraction this redesign's field builders were built to avoid
+ * elsewhere.
+ */
+export function emitBenchResult(
+  emitter: Emitter,
+  payload: PayloadOf<NonNullable<(typeof benchResult)['payload']>>,
+  hw: PayloadOf<NonNullable<(typeof benchResult)['extraEnvelopeBlock']>['shape']>,
+): void {
+  emitter.emitWithExtra(benchResult.name, payload as unknown as Record<string, unknown>, 'hw', hw)
 }

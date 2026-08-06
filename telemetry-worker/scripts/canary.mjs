@@ -67,6 +67,7 @@ const events = [
   envelope('bench_result', {
     hw: { cpu: 'canary-cpu', ramMb: 65536, gpus: [{ name: 'canary-gpu', vramMb: 16384 }] },
     payload: {
+      source: 'autotune',
       model: { name: 'canary-model', quant: 'Q4_K_M', sizeBytes: 1, arch: 'llama', moe: false },
       engine: { version: 'canary' },
       params: { ctx: 8192, ngl: 1, nCpuMoe: 0, parallel: 1, kvTypeK: 'q8_0', flashAttn: 'auto' },

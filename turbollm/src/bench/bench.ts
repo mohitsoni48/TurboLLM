@@ -1236,6 +1236,7 @@ export class BenchRunner {
           gpus: sys.gpus.map((g) => ({ name: g.name, vramMb: g.vramMb })),
         },
         payload: {
+          source: 'autotune',
           model: { name: entry.name, quant: entry.quant, sizeBytes: entry.sizeBytes, arch: entry.arch, moe: entry.moe },
           engine: { version: engineVersion },
           params: record.params,
