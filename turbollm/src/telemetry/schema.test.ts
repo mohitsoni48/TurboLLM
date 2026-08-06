@@ -209,6 +209,18 @@ test('validateEvent: ui_action accepts the Phase 6i SettingsScreen batch actions
   }
 })
 
+test('validateEvent: ui_action accepts the Phase 6j CodeComposer batch actions', () => {
+  const actions = [
+    'select_code_slash_command', 'select_code_file_mention', 'select_code_repo', 'browse_code_repo',
+    'select_code_base_branch', 'remove_code_context_file', 'remove_code_image', 'set_code_mode',
+    'open_code_context_browser', 'stop_code_generation',
+  ]
+  for (const action of actions) {
+    const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'code', action } }))
+    assert.equal(r.ok, true, r.ok === false ? `code/${action}: ${r.reason}` : '')
+  }
+})
+
 test('validateEvent: ui_daily requires screen plus both volume counters', () => {
   const r = validateEvent(validEvent({ event: 'ui_daily', payload: { screen: 'engines', actions: 5, distinctActions: 3 } }))
   assert.equal(r.ok, true, r.ok === false ? r.reason : '')
