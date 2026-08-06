@@ -11,6 +11,7 @@ import { join } from 'node:path'
 import { registerApi } from './routes'
 import type { Deps } from '../deps'
 import { enqueue, readQueue } from '../telemetry/queue'
+import { Emitter } from '../telemetry/emit'
 
 type FakeConfig = {
   daemon: { lanBind: boolean; requireApiKey: boolean; port: number }
@@ -18,21 +19,26 @@ type FakeConfig = {
   telemetry: { level: string; machineId: string }
 }
 
-function fakeApp(dataDir: string, telemetry: { level: string; machineId: string }) {
+function fakeApp(dataDir: string, telemetry: { level: string; machineId: string }, opts?: { withEmitter?: boolean }) {
   const cfg: FakeConfig = {
     daemon: { lanBind: false, requireApiKey: false, port: 6996 },
     apiKeys: [],
     telemetry,
   }
   const app = new Hono()
+  const store = {
+    snapshot: () => cfg,
+    update: (fn: (c: FakeConfig) => void) => fn(cfg),
+    dir: () => dataDir,
+  }
   const d = {
     version: 'test',
-    store: {
-      snapshot: () => cfg,
-      update: (fn: (c: FakeConfig) => void) => fn(cfg),
-      dir: () => dataDir,
-    },
+    store,
     manager: { status: () => ({ state: 'stopped', model: null }) },
+    // Real Emitter (not a stub) when a test needs actual consent/queue behaviour —
+    // ui_action's route is a thin forwarder, so proving it works means proving the
+    // real gate it forwards into, not a mock that would just echo back "called".
+    ...(opts?.withEmitter ? { telemetry: new Emitter({ dataDir, store: store as never, version: 'test', os: 'win32/x64' }) } : {}),
   } as unknown as Deps
   registerApi(app, d)
   return { app, cfg }
@@ -78,6 +84,88 @@ test('POST /api/v1/telemetry/regenerate-id: replaces the machine id', async () =
     assert.notEqual(bodyJson.machineId, old)
     assert.match(bodyJson.machineId, /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/)
     assert.equal(cfg.telemetry.machineId, bodyJson.machineId, 'persisted, not just returned')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// ── POST /api/v1/telemetry/ui (spec 23 §3.8, Phase 6) ───────────────────────
+
+test('POST /api/v1/telemetry/ui: a valid screen/action reaches the queue as ui_action, and always 202s', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'turbollm-routes-'))
+  try {
+    const { app } = fakeApp(dir, { level: 'full', machineId: '11111111-1111-1111-1111-111111111111' }, { withEmitter: true })
+    const res = await app.request('/api/v1/telemetry/ui', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ screen: 'engines', action: 'install_engine' }),
+    })
+    assert.equal(res.status, 202)
+
+    const queued = readQueue(dir).map((q) => q.event as { event: string; payload: unknown })
+    assert.deepEqual(queued.find((q) => q.event === 'ui_action')?.payload, { screen: 'engines', action: 'install_engine' })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('POST /api/v1/telemetry/ui: an unrecognized screen/action is silently dropped, not thrown, and still 202s', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'turbollm-routes-'))
+  try {
+    const { app } = fakeApp(dir, { level: 'full', machineId: '11111111-1111-1111-1111-111111111111' }, { withEmitter: true })
+    const res = await app.request('/api/v1/telemetry/ui', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ screen: 'engines', action: 'not-a-real-action' }),
+    })
+    assert.equal(res.status, 202, 'ADR-299 anti-probing: never reveal validation outcome via status')
+    assert.deepEqual(readQueue(dir), [])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('POST /api/v1/telemetry/ui: anon consent must not send a click — ui_action/ui_daily are full-only', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'turbollm-routes-'))
+  try {
+    const { app } = fakeApp(dir, { level: 'anon', machineId: '11111111-1111-1111-1111-111111111111' }, { withEmitter: true })
+    await app.request('/api/v1/telemetry/ui', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ screen: 'engines', action: 'install_engine' }),
+    })
+    assert.deepEqual(readQueue(dir), [])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('POST /api/v1/telemetry/ui: a missing screen or action is a no-op, not a 500', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'turbollm-routes-'))
+  try {
+    const { app } = fakeApp(dir, { level: 'full', machineId: '11111111-1111-1111-1111-111111111111' }, { withEmitter: true })
+    const res = await app.request('/api/v1/telemetry/ui', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ screen: 'engines' }),
+    })
+    assert.equal(res.status, 202)
+    assert.deepEqual(readQueue(dir), [])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('POST /api/v1/telemetry/ui: no telemetry on Deps (real daemon shape before wiring) never 500s', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'turbollm-routes-'))
+  try {
+    const { app } = fakeApp(dir, { level: 'full', machineId: '11111111-1111-1111-1111-111111111111' })
+    const res = await app.request('/api/v1/telemetry/ui', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ screen: 'engines', action: 'install_engine' }),
+    })
+    assert.equal(res.status, 202)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

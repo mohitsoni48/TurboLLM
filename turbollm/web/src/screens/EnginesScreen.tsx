@@ -36,7 +36,7 @@ import {
   useSysInfo,
   useUpdatePolicyMutation,
 } from '../lib/queries'
-import { ApiError } from '../lib/api'
+import { ApiError, track } from '../lib/api'
 import { primaryVendorSummary } from '../lib/vram'
 import type {
   CatalogEngine,
@@ -521,7 +521,10 @@ function EngineHeaderBar({
   }
   const selectGroup = (g: EngineGroup) => {
     const target = memberToActivate(g, activeEngine?.id ?? null)
-    if (target) activate(target.id)
+    if (target) {
+      track('engines', 'switch_engine')
+      activate(target.id)
+    }
   }
 
   return (
@@ -603,7 +606,7 @@ function EngineHeaderBar({
                     Build
                   </div>
                   {activeGroup.members.map((m) => (
-                    <DropdownMenuItem key={m.id} onSelect={() => activate(m.id)} className="flex items-center gap-2">
+                    <DropdownMenuItem key={m.id} onSelect={() => { track('engines', 'switch_engine_build'); activate(m.id) }} className="flex items-center gap-2">
                       <span className="flex h-4 w-4 shrink-0 items-center justify-center">
                         {m.id === activeEngine?.id && <Check size={14} className="text-accent" />}
                       </span>
@@ -623,7 +626,7 @@ function EngineHeaderBar({
           {showRebuildChip && (
             <button
               type="button"
-              onClick={() => setRebuildOpen(true)}
+              onClick={() => { track('engines', 'open_rebuild_guide'); setRebuildOpen(true) }}
               className="inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[11px] font-medium transition-colors hover:opacity-80"
               style={{ background: 'color-mix(in srgb, var(--accent) 15%, transparent)', color: 'var(--accent)' }}
             >
@@ -746,11 +749,13 @@ function EngineGallery({
   const doInstall = (e: CatalogEngine) => {
     const m = installFor(e)
     if (!m) return
+    track('engines', 'install_engine')
     m.mutate(undefined, {
       onError: (err) => toast.error(err instanceof ApiError ? err.message : `Could not install ${e.name}.`),
     })
   }
   const doEnable = (e: CatalogEngine) => {
+    track('engines', 'enable_engine')
     if (e.sourceBuilt && e.sourceBinPath) {
       engineMut.add.mutate(
         { binPath: e.sourceBinPath, name: e.name, sourceRepo: e.homepage, sourceBranch: e.sourceBranch || undefined },
@@ -771,6 +776,7 @@ function EngineGallery({
   const doDisable = (e: CatalogEngine) => {
     const id = registryEngineId(e)
     if (!id) { toast.error(`Could not find the installed ${e.name} engine.`); return }
+    track('engines', 'disable_engine')
     engineMut.remove.mutate(id, {
       onSuccess: () => toast.success(`${e.name} disabled`),
       onError: (err) => toast.error(err instanceof ApiError ? err.message : `Could not disable ${e.name}.`),
@@ -779,6 +785,7 @@ function EngineGallery({
   const doUpdate = (e: CatalogEngine) => {
     const m = updateFor(e)
     if (!m) return
+    track('engines', 'update_engine')
     m.mutate(undefined, {
       onSuccess: () => toast.success(`Updating ${e.name} to the latest release…`),
       onError: (err) => toast.error(err instanceof ApiError ? err.message : `Could not update ${e.name}.`),
@@ -787,6 +794,7 @@ function EngineGallery({
   const setPolicy = (e: CatalogEngine, policy: UpdatePolicy) => {
     const id = registryEngineId(e)
     if (!id) { toast.error(`Could not find the installed ${e.name} engine.`); return }
+    track('engines', 'set_engine_update_policy')
     policyMut.mutate(
       { id, policy },
       { onError: (err) => toast.error(err instanceof ApiError ? err.message : 'Could not change auto-update.') },
@@ -803,6 +811,7 @@ function EngineGallery({
   // lookup needed, unlike a catalog engine (which has to be re-matched via binPath/sourceRepo
   // conventions since it has no single fixed id of its own).
   const doDisableCustom = (eng: Engine) => {
+    track('engines', 'disable_engine')
     engineMut.disableCustom.mutate(eng.id, {
       onSuccess: () => toast.success(`${eng.name} disabled`),
       onError: (err) => toast.error(err instanceof ApiError ? err.message : `Could not disable ${eng.name}.`),
@@ -811,6 +820,7 @@ function EngineGallery({
   // Enable re-registers using the SAME identity that was remembered (recordCustomSource) —
   // instant, no rebuild, exactly like a catalog engine's sourceBuilt Enable.
   const doEnableCustom = (source: CustomEngineSource) => {
+    track('engines', 'enable_engine')
     engineMut.add.mutate(
       { name: source.name, binPath: source.binPath, sourceRepo: source.sourceRepo, sourceBranch: source.sourceBranch, sourceCommit: source.sourceCommit },
       {
@@ -819,7 +829,11 @@ function EngineGallery({
       },
     )
   }
+  // Not routed through the shared delete confirmation dialog (a "remembered but not
+  // registered" source has nothing on disk to warn about) — still a real deletion of the
+  // remembered engine, so it shares `delete_engine` rather than needing its own action.
   const doForgetCustom = (source: CustomEngineSource) => {
+    track('engines', 'delete_engine')
     engineMut.forgetCustomSource.mutate(customSourceKey(source), {
       onSuccess: () => toast.success(`${source.name} removed`),
       onError: (err) => toast.error(err instanceof ApiError ? err.message : `Could not remove ${source.name}.`),
@@ -827,6 +841,7 @@ function EngineGallery({
   }
   const doDelete = () => {
     if (!deleteTarget) return
+    track('engines', 'delete_engine')
     engineMut.purge.mutate(deleteTarget.registryId, {
       onSuccess: () => {
         toast.success(`${deleteTarget.name} deleted`)
@@ -1112,7 +1127,7 @@ function EngineCard({
 
         <div className="flex shrink-0 items-center gap-2">
           {isLlama ? (
-            <Button size="sm" variant="outline" onClick={() => setBuildsOpen((v) => !v)}>
+            <Button size="sm" variant="outline" onClick={() => { track('engines', 'toggle_manage_builds'); setBuildsOpen((v) => !v) }}>
               <Layers size={13} /> Manage GPU builds
               <ChevronDown size={13} className="transition-transform" style={{ transform: buildsOpen ? 'rotate(180deg)' : 'none' }} />
             </Button>
@@ -1133,7 +1148,7 @@ function EngineCard({
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end">
                   {sourceBuilt ? (
-                    <DropdownMenuItem onSelect={() => setRebuildOpen(true)} disabled={anyPending}>
+                    <DropdownMenuItem onSelect={() => { track('engines', 'open_rebuild_guide'); setRebuildOpen(true) }} disabled={anyPending}>
                       <RefreshCw size={14} /> {updateStatus?.hasUpdate ? 'Rebuild (new commit)' : 'Rebuild'}
                     </DropdownMenuItem>
                   ) : (
@@ -1191,7 +1206,7 @@ function EngineCard({
               <Button
                 size="sm"
                 variant="outline"
-                onClick={() => setGuideOpen(true)}
+                onClick={() => { track('engines', 'open_build_guide'); setGuideOpen(true) }}
                 title="No prebuilt binary — build it from source with a guided walkthrough."
               >
                 <Wrench size={13} /> Build from source
@@ -1300,7 +1315,7 @@ function CustomEngineCard({
           </span>
         )}
         {sourceRepo && (
-          <Button size="sm" variant="outline" disabled={anyPending} onClick={() => setRebuildOpen(true)}>
+          <Button size="sm" variant="outline" disabled={anyPending} onClick={() => { track('engines', 'open_rebuild_guide'); setRebuildOpen(true) }}>
             <RefreshCw size={13} /> Rebuild
           </Button>
         )}

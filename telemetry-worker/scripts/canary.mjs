@@ -85,6 +85,8 @@ const events = [
   }),
   envelope('harness_first_seen', { payload: { harness: 'claude_code', protocol: 'anthropic' } }),
   envelope('code_daily', { payload: { sessions: 1, turns: 1, toolCalls: 0 } }),
+  envelope('ui_action', { payload: { screen: 'engines', action: 'install_engine' } }),
+  envelope('ui_daily', { payload: { screen: 'engines', actions: 1, distinctActions: 1 } }),
 ]
 
 // `--file` sidesteps shell-quoting but ALSO changes what wrangler returns —

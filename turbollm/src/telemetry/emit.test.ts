@@ -372,6 +372,93 @@ test('flushDailyUsage: nothing to flush on the same day is a no-op', () => {
   }
 })
 
+// ── uiAction / flushUiDailyUsage (ui_action + ui_daily, spec 23 §3.8) ───────
+
+test('uiAction: emits ui_action on every call — unlike useFeature, a click is not deduped', () => {
+  const dir = tempDir()
+  try {
+    const { emitter } = makeEmitter(dir, 'full', '2026-08-05')
+    emitter.uiAction('engines', 'install_engine')
+    emitter.uiAction('engines', 'install_engine')
+    const events = readQueue(dir).map((q) => q.event as { event: string })
+    assert.equal(events.filter((e) => e.event === 'ui_action').length, 2)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('uiAction: requires full consent — anon must not leak click identity', () => {
+  const dir = tempDir()
+  try {
+    makeEmitter(dir, 'anon').emitter.uiAction('engines', 'install_engine')
+    assert.deepEqual(names(dir), [])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('uiAction: rolls over ui_daily for the previous day once the calendar day changes', () => {
+  const dir = tempDir()
+  try {
+    const { emitter } = makeEmitter(dir, 'full', '2026-08-05')
+    emitter.uiAction('engines', 'install_engine')
+    emitter.uiAction('engines', 'enable_engine')
+    emitter.uiAction('engines', 'install_engine') // 3 actions, 2 distinct, on day 1
+
+    const { emitter: tomorrow } = makeEmitter(dir, 'full', '2026-08-06')
+    tomorrow.uiAction('engines', 'update_engine') // first click on day 2 triggers the rollover
+    const events = readQueue(dir).map((q) => q.event as { event: string; payload?: Record<string, unknown> })
+    const rolled = events.find((e) => e.event === 'ui_daily')
+    assert.deepEqual(rolled?.payload, { screen: 'engines', actions: 3, distinctActions: 2 })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('uiAction: consent off does not spend a count — same reasoning as useFeature', () => {
+  const dir = tempDir()
+  try {
+    makeEmitter(dir, 'off', '2026-08-05').emitter.uiAction('engines', 'install_engine')
+    const { emitter: tomorrow } = makeEmitter(dir, 'full', '2026-08-06')
+    tomorrow.uiAction('engines', 'install_engine')
+    // Only the day-2 click can possibly roll anything over; day-1 usage was never recorded.
+    const events = readQueue(dir).map((q) => q.event as { event: string })
+    assert.deepEqual(events.filter((e) => e.event === 'ui_daily'), [])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('flushUiDailyUsage: rolls over a screen used only on the last active day', () => {
+  const dir = tempDir()
+  try {
+    const { emitter } = makeEmitter(dir, 'full', '2026-08-05')
+    emitter.uiAction('engines', 'install_engine')
+    emitter.uiAction('engines', 'install_engine')
+    assert.deepEqual(names(dir).filter((n) => n === 'ui_daily'), [], 'nothing rolled over yet — engines was never clicked again')
+
+    const { emitter: tomorrow } = makeEmitter(dir, 'full', '2026-08-06')
+    tomorrow.flushUiDailyUsage()
+    const events = readQueue(dir).map((q) => q.event as { event: string; payload?: Record<string, unknown> })
+    const rolled = events.find((e) => e.event === 'ui_daily')
+    assert.deepEqual(rolled?.payload, { screen: 'engines', actions: 2, distinctActions: 1 })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('flushUiDailyUsage: nothing to flush on the same day is a no-op', () => {
+  const dir = tempDir()
+  try {
+    const { emitter } = makeEmitter(dir, 'full', '2026-08-05')
+    emitter.uiAction('engines', 'install_engine')
+    emitter.flushUiDailyUsage()
+    assert.deepEqual(names(dir).filter((n) => n === 'ui_daily'), [])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('emit: an unwritable data dir never throws', () => {
   const { emitter } = makeEmitter('\0invalid', 'anon')
   assert.doesNotThrow(() => emitter.emit('app_first_run'))

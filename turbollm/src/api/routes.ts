@@ -1941,6 +1941,20 @@ export function registerApi(app: Hono, d: Deps): void {
   // this is the one that lets a user check those sentences for themselves.
   app.get('/api/v1/telemetry/log', (c) => c.json({ entries: readSentLog(d.store.dir()) }))
 
+  // ui_action (spec 23 §3.8): a UI click is only ever seen by the browser, so this route
+  // is the only way to get it into the same consent/kill-switch/queue pipeline every other
+  // event already goes through — Emitter.uiAction does the actual gating/validation/dedup;
+  // this route is a thin, best-effort forwarder. Always 202 regardless of whether telemetry
+  // actually accepted it (ADR-299's anti-probing opacity — same reasoning the ingest Worker
+  // itself already applies to every event, not something new invented here).
+  app.post('/api/v1/telemetry/ui', async (c) => {
+    const b = await body<{ screen?: string; action?: string }>(c)
+    try {
+      if (b.screen && b.action) d.telemetry?.uiAction(b.screen, b.action)
+    } catch { /* best-effort */ }
+    return c.json({ ok: true }, 202)
+  })
+
   // Regenerate the anonymous machine id (ADR-299). The data contract promises
   // this UUID is "not tied to identity; regeneratable" — that promise needs a
   // control behind it, not just a sentence in the docs. Anything already queued
