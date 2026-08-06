@@ -19,7 +19,7 @@ import {
   X,
   Zap,
 } from 'lucide-react'
-import { ApiError, deleteModel } from '../lib/api'
+import { ApiError, deleteModel, track } from '../lib/api'
 import { queryKeys, useModelActions, useModelDirs, useModelMutations, useModels, useStatus } from '../lib/queries'
 import { usePinnedModels } from '../lib/usePinnedModels'
 import type { ModelEntry } from '../lib/types'
@@ -160,6 +160,7 @@ export function ModelsScreen() {
   const onConfirmDelete = () => {
     const m = confirmDelete
     if (!m) return
+    track('models', 'delete_model')
     del.mutate(m.key, {
       onSuccess: () => {
         toast.success(`Deleted ${m.name}`)
@@ -194,7 +195,7 @@ export function ModelsScreen() {
           <button
             key={t}
             type="button"
-            onClick={() => setTab(t)}
+            onClick={() => { track('models', 'switch_models_tab'); setTab(t) }}
             className="-mb-px border-b-2 px-3 py-2 text-[13px] font-medium capitalize transition-colors"
             style={{
               borderColor: tab === t ? 'var(--accent)' : 'transparent',
@@ -334,6 +335,9 @@ function LibraryTab({
   // Below md the wide six-column table would push its Load button ~350px off-screen,
   // so each model renders as a stacked card instead. Desktop keeps the aligned table.
   const isDesktop = useIsDesktop()
+  const trackFilter = (f: Filter) => { track('models', 'filter_models'); setFilter(f) }
+  const trackOpenFolders = () => { track('models', 'open_model_folders'); openFolders() }
+  const trackRescan = () => { track('models', 'rescan_models'); rescan() }
 
   return (
     <>
@@ -353,22 +357,22 @@ function LibraryTab({
         )}
         {hasModels && (
           <div className="flex flex-wrap items-center gap-1.5">
-            <FilterChip active={filter === 'all'} onClick={() => setFilter('all')}>
+            <FilterChip active={filter === 'all'} onClick={() => trackFilter('all')}>
               All {models.length}
             </FilterChip>
             {facets.map((f) => (
-              <FilterChip key={f.id} active={filter === f.id} onClick={() => setFilter(f.id)}>
+              <FilterChip key={f.id} active={filter === f.id} onClick={() => trackFilter(f.id)}>
                 {f.label} {f.count}
               </FilterChip>
             ))}
           </div>
         )}
         <div className="ml-auto flex items-center gap-1.5">
-          <Button variant="outline" size="sm" onClick={openFolders}>
+          <Button variant="outline" size="sm" onClick={trackOpenFolders}>
             <FolderPlus size={14} />
             Folders{dirs.length ? ` · ${dirs.length}` : ''}
           </Button>
-          <Button variant="outline" size="sm" onClick={rescan} disabled={scanning}>
+          <Button variant="outline" size="sm" onClick={trackRescan} disabled={scanning}>
             <RefreshCw size={14} className={scanning ? 'tllm-pulse' : ''} />
             {scanning ? 'Scanning…' : 'Rescan'}
           </Button>
@@ -384,7 +388,7 @@ function LibraryTab({
           </span>
           <button
             type="button"
-            onClick={() => setShowIncompatible(!showIncompatible)}
+            onClick={() => { track('models', 'toggle_incompatible_models'); setShowIncompatible(!showIncompatible) }}
             className="shrink-0 font-medium text-accent hover:underline"
           >
             {showIncompatible ? 'Show compatible only' : 'Show all'}
@@ -412,7 +416,7 @@ function LibraryTab({
           }
           action={
             dirs.length === 0 ? (
-              <Button size="sm" onClick={openFolders}>
+              <Button size="sm" onClick={trackOpenFolders}>
                 <FolderPlus size={14} /> Add a folder
               </Button>
             ) : undefined
@@ -590,7 +594,7 @@ function ModelRow({
           {variants.length} quants
         </div>
         {variants.map((v) => (
-          <DropdownMenuItem key={v.key} onSelect={() => setSelKey(v.key)} className="flex items-center gap-2">
+          <DropdownMenuItem key={v.key} onSelect={() => { track('models', 'select_model_quant'); setSelKey(v.key) }} className="flex items-center gap-2">
             <span className="flex h-4 w-4 shrink-0 items-center justify-center">
               {v.key === m.key && <Check size={14} className="text-accent" />}
             </span>
@@ -608,14 +612,14 @@ function ModelRow({
   const actionButtons = (
     <>
       {loaded ? (
-        <Button size="sm" onClick={onEject} disabled={ejecting} title="Eject model (stop the engine)">
+        <Button size="sm" onClick={() => { track('models', 'eject_model'); onEject() }} disabled={ejecting} title="Eject model (stop the engine)">
           <CircleSlash size={14} />
           Eject
         </Button>
       ) : (
         <Button
           size="sm"
-          onClick={() => onLoad(m.key)}
+          onClick={() => { track('models', 'load_model'); onLoad(m.key) }}
           disabled={!loadable || !compatible || busy}
           title={
             !loadable
@@ -631,7 +635,7 @@ function ModelRow({
       )}
       <button
         type="button"
-        onClick={() => onTune(m.key)}
+        onClick={() => { track('models', 'open_model_load_settings'); onTune(m.key) }}
         disabled={!loadable}
         aria-label="Load settings"
         title="Load settings"
@@ -647,15 +651,15 @@ function ModelRow({
           <MoreHorizontal size={16} />
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">
-          <DropdownMenuItem onSelect={() => togglePinned(m.key)}>
+          <DropdownMenuItem onSelect={() => { track('models', 'pin_model'); togglePinned(m.key) }}>
             <Star size={14} /> {pinned ? 'Unpin' : 'Pin to top'}
           </DropdownMenuItem>
           {m.incomplete && (
-            <DropdownMenuItem onSelect={() => onDiscover(m)}>
+            <DropdownMenuItem onSelect={() => { track('models', 'find_model_quants'); onDiscover(m) }}>
               <Download size={14} /> Re-download missing parts…
             </DropdownMenuItem>
           )}
-          <DropdownMenuItem onSelect={() => onDiscover(m)}>
+          <DropdownMenuItem onSelect={() => { track('models', 'find_model_quants'); onDiscover(m) }}>
             <PackageSearch size={14} /> Find other quants…
           </DropdownMenuItem>
           <DropdownMenuSeparator />
@@ -752,7 +756,7 @@ function ModelFoldersDialog({
                   ) : (
                     <button
                       type="button"
-                      onClick={() => mut.setPrimaryDir.mutate(d)}
+                      onClick={() => { track('models', 'set_primary_model_dir'); mut.setPrimaryDir.mutate(d) }}
                       disabled={mut.setPrimaryDir.isPending}
                       title="Downloads and imports will land in this folder"
                       className="flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-faint transition-colors hover:text-ink"
@@ -763,7 +767,7 @@ function ModelFoldersDialog({
                   <button
                     type="button"
                     aria-label={`Remove ${d}`}
-                    onClick={() => mut.removeDir.mutate(d)}
+                    onClick={() => { track('models', 'remove_model_dir'); mut.removeDir.mutate(d) }}
                     className="shrink-0 rounded p-1 text-muted transition-colors hover:text-ink"
                   >
                     <X size={14} />
@@ -775,7 +779,7 @@ function ModelFoldersDialog({
         )}
 
         <div>
-          <Button size="sm" variant="outline" onClick={() => setBrowse(true)} disabled={mut.addDir.isPending}>
+          <Button size="sm" variant="outline" onClick={() => { track('models', 'browse_model_dir'); setBrowse(true) }} disabled={mut.addDir.isPending}>
             <FolderPlus size={14} /> Add folder…
           </Button>
           {addError && <p className="mt-2 text-[12px]" style={{ color: 'var(--err)' }}>{addError}</p>}
@@ -788,6 +792,7 @@ function ModelFoldersDialog({
           description="Open the folder that holds your GGUF models — on any drive — then click Select this folder."
           onOpenChange={setBrowse}
           onSelect={(p) => {
+            track('models', 'add_model_dir')
             setBrowse(false)
             mut.addDir.mutate(p)
           }}

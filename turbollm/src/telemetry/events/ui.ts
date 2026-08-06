@@ -39,7 +39,14 @@ export const SCREENS = [
  *  are tracked once inside the shared `doDelete*` function rather than at each UI entry
  *  point, since the same delete can be reached both through a confirmation dialog AND
  *  (when the user has turned confirmation off in Settings) directly — one call site
- *  correctly covers both paths instead of missing the un-confirmed one. */
+ *  correctly covers both paths instead of missing the un-confirmed one.
+ *
+ *  Batch 3 (Phase 6c): `ModelsScreen.tsx` — 21 raw matches, 1 plumbing (`FilterChip`'s own
+ *  generic `onClick={onClick}`, which just relays whichever specific filter the call site
+ *  already tracks — tracking inside the shared component would double-count every filter
+ *  click). Model deletion always goes through a confirm dialog here (no "skip confirm"
+ *  setting like chat's), so it is tracked once at the dialog's confirm action, not at the
+ *  menu item that merely opens it. */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -50,6 +57,11 @@ export const UI_ACTIONS = [
   'open_code_session', 'rename_code_session', 'archive_code_session', 'delete_code_session', 'filter_code_sessions',
   'open_routine',
   'toggle_sidebar_collapsed', 'new_chat', 'new_code_session', 'new_routine', 'import_chat',
+
+  'switch_models_tab', 'filter_models', 'open_model_folders', 'rescan_models', 'toggle_incompatible_models',
+  'select_model_quant', 'eject_model', 'load_model', 'open_model_load_settings', 'pin_model',
+  'find_model_quants', 'delete_model', 'set_primary_model_dir', 'remove_model_dir',
+  'browse_model_dir', 'add_model_dir',
 ] as const
 
 export const uiAction = defineEvent({
