@@ -190,7 +190,21 @@ export const SCREENS = [
  *  it is skipped in favor of tracking `delete_agent` at the confirm row's own "Delete" button.
  *  Its "Cancel" (`setDeleteConfirm(false)`, dismissing the inline row without navigating) is
  *  tracked separately as `cancel_delete_agent` — a different action from `back_to_agents`,
- *  since it doesn't leave the page. */
+ *  since it doesn't leave the page.
+ *
+ *  Batch 14 (Phase 6n): `screens/code/CodeHomeScreen.tsx` — 9 raw matches, 2 new distinct
+ *  actions, 5 reused, 2 skips. This is the file the Batch 10 note pointed at: its
+ *  `onSubmit={() => void send()}` is the ONE `CodeComposer` caller that was never tracked
+ *  anywhere — tracked here, finally, as `send_code_message`, the same action
+ *  `CodeSessionScreen.tsx` already uses (Batch 8), closing the coverage gap Batch 10 flagged.
+ *  The two `FsBrowser` instances here reuse existing actions rather than inventing new ones:
+ *  choosing a repo via "Browse…" is the same real effect (`chooseRepo`) as picking one from the
+ *  recent-repos dropdown that `CodeComposer` itself already tracks as `select_code_repo` (Batch
+ *  10) — same state change, different entry point, same "shared action across entry points"
+ *  reasoning as every prior batch's folds; the context-file browser reuses
+ *  `add_code_context_file` (Batch 8) for the identical reason. Skips: the sidebar's `onSelect`
+ *  relay (Batch 2 already tracks it) and `CodeComposer`'s `onValueChange` keystroke sync (same
+ *  category as every prior batch's). */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -247,6 +261,8 @@ export const UI_ACTIONS = [
 
   'toggle_agent_tool_group', 'back_to_agents', 'reset_agent_to_default', 'save_agent',
   'switch_agent_form_tab', 'delete_agent', 'cancel_delete_agent',
+
+  'switch_code_stats_range', 'use_starter_task',
 ] as const
 
 export const uiAction = defineEvent({

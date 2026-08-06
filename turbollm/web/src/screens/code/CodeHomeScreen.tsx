@@ -6,7 +6,7 @@ import { toast } from '../../components/ui/sonner'
 import { getPersonalization } from '../../lib/personas'
 import { useIsDesktop } from '../../lib/useIsDesktop'
 import { cn, formatDiff } from '../../lib/utils'
-import { ApiError } from '../../lib/api'
+import { ApiError, track } from '../../lib/api'
 import { useGitBranch, useModelActions, useModels, useStatus } from '../../lib/queries'
 import { createCodeSession } from '../../lib/code-api'
 import { useCodeStats } from '../../lib/code-queries'
@@ -96,7 +96,7 @@ function Segmented<T extends string>({
         <button
           key={o.value}
           type="button"
-          onClick={() => onChange(o.value)}
+          onClick={() => { track('code', 'switch_code_stats_range'); onChange(o.value) }}
           className="px-3 py-1.5 text-[12px] font-medium transition-colors"
           style={{
             background: value === o.value ? 'var(--accent)' : 'transparent',
@@ -291,7 +291,7 @@ export function CodeHomeScreen() {
       {!isDesktop && mobileSidebarOpen && (
         <div
           className="fixed inset-0 z-30 bg-black/40 md:hidden"
-          onClick={() => setMobileSidebarOpen(false)}
+          onClick={() => { track('code', 'toggle_sidebar_collapsed'); setMobileSidebarOpen(false) }}
           aria-hidden
         />
       )}
@@ -334,7 +334,7 @@ export function CodeHomeScreen() {
           size="icon"
           variant="ghost"
           className="h-8 w-8 shrink-0 md:hidden"
-          onClick={() => setMobileSidebarOpen(true)}
+          onClick={() => { track('code', 'toggle_sidebar_collapsed'); setMobileSidebarOpen(true) }}
           title="History"
           aria-label="Open sidebar"
         >
@@ -415,7 +415,7 @@ export function CodeHomeScreen() {
             <button
               key={t}
               type="button"
-              onClick={() => fillTask(t)}
+              onClick={() => { track('code', 'use_starter_task'); fillTask(t) }}
               className="rounded-full border border-border bg-panel px-3 py-1.5 text-[12px] text-muted transition-all hover:-translate-y-px hover:border-[color:var(--accent)] hover:text-ink"
             >
               {t}
@@ -427,7 +427,7 @@ export function CodeHomeScreen() {
           inputRef={inputRef}
           value={input}
           onValueChange={setInput}
-          onSubmit={() => void send()}
+          onSubmit={() => { track('code', 'send_code_message'); void send() }}
           placeholder="Describe a task or ask a question…"
           repo={{
             repoPath,
@@ -472,7 +472,7 @@ export function CodeHomeScreen() {
     <FsBrowser
       open={browserOpen}
       onOpenChange={setBrowserOpen}
-      onSelect={chooseRepo}
+      onSelect={(p) => { track('code', 'select_code_repo'); chooseRepo(p) }}
       mode="folder"
       title="Choose a repository"
       description="Open the project folder you want the agent to work in, then click Select this folder."
@@ -480,7 +480,7 @@ export function CodeHomeScreen() {
     <FsBrowser
       open={contextBrowserOpen}
       onOpenChange={setContextBrowserOpen}
-      onSelect={(p) => setContextFiles((cf) => (cf.includes(p) ? cf : [...cf, p]))}
+      onSelect={(p) => { track('code', 'add_code_context_file'); setContextFiles((cf) => (cf.includes(p) ? cf : [...cf, p])) }}
       mode="file"
       startPath={repoPath ?? undefined}
       title="Add context"
