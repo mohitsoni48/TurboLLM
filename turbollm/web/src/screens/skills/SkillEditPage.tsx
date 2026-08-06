@@ -4,7 +4,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { ChevronLeft, Trash2 } from 'lucide-react'
 import { Button } from '../../components/ui/button'
 import { toast } from '../../components/ui/sonner'
-import { ApiError } from '../../lib/api'
+import { ApiError, track } from '../../lib/api'
 import { fetchSkills, saveSkill, deleteSkill, skillKeys } from '../../lib/agent-api'
 import type { Skill } from '../../lib/agent-types'
 
@@ -48,7 +48,7 @@ export function SkillEditPage() {
     setHydrated(true)
   }
 
-  const goBack = () => navigate('/customize?tab=skills')
+  const goBack = () => { track('skills', 'back_to_skills'); navigate('/customize?tab=skills') }
 
   const setName = (name: string) =>
     setForm((f) => ({ ...f, name, id: isNew && !idEdited ? slugify(name) : f.id }))
@@ -110,7 +110,7 @@ export function SkillEditPage() {
         <div className="ml-auto flex items-center gap-2">
           <Button size="sm" variant="outline" onClick={goBack}>{readOnly ? 'Back' : 'Cancel'}</Button>
           {!readOnly && (
-            <Button size="sm" onClick={() => void handleSave()} disabled={saving || !form.name.trim()}>
+            <Button size="sm" onClick={() => { track('skills', 'save_skill'); void handleSave() }} disabled={saving || !form.name.trim()}>
               {saving ? 'Saving…' : 'Save'}
             </Button>
           )}
@@ -188,8 +188,8 @@ export function SkillEditPage() {
         deleteConfirm ? (
           <div className="flex items-center gap-2 self-start rounded-md border border-border bg-panel p-2 text-[12px]">
             <span className="flex-1 text-muted">Delete this skill?</span>
-            <button type="button" onClick={() => void handleDelete()} className="rounded px-2 py-1 text-[color:var(--err)] hover:bg-[color:color-mix(in_srgb,var(--err)_12%,transparent)]">Delete</button>
-            <button type="button" onClick={() => setDeleteConfirm(false)} className="rounded px-2 py-1 text-faint hover:text-ink">Cancel</button>
+            <button type="button" onClick={() => { track('skills', 'delete_skill'); void handleDelete() }} className="rounded px-2 py-1 text-[color:var(--err)] hover:bg-[color:color-mix(in_srgb,var(--err)_12%,transparent)]">Delete</button>
+            <button type="button" onClick={() => { track('skills', 'cancel_delete_skill'); setDeleteConfirm(false) }} className="rounded px-2 py-1 text-faint hover:text-ink">Cancel</button>
           </div>
         ) : (
           <button type="button" onClick={() => setDeleteConfirm(true)} className="flex items-center gap-1.5 self-start text-[12px] text-faint hover:text-[color:var(--err)]">
