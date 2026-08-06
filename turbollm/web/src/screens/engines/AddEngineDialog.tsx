@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { ArrowLeft, CheckCircle2, FolderOpen, Loader2, Plus, SearchX } from 'lucide-react'
-import { ApiError } from '../../lib/api'
+import { ApiError, track } from '../../lib/api'
 import { useEngineMutations, useEngineScan } from '../../lib/queries'
 import type { EngineScanResult } from '../../lib/types'
 import { Button } from '../../components/ui/button'
@@ -164,12 +164,12 @@ export function AddEngineDialog({
             </DialogHeader>
 
             <div className="flex flex-col gap-3">
-              <Button onClick={() => setBrowse('folder')} className="w-full">
+              <Button onClick={() => { track('engines', 'browse_new_engine_folder'); setBrowse('folder') }} className="w-full">
                 <FolderOpen size={16} /> Choose folder…
               </Button>
               <button
                 type="button"
-                onClick={() => setBrowse('file')}
+                onClick={() => { track('engines', 'browse_new_engine_binary'); setBrowse('file') }}
                 className="text-[12px] text-muted underline-offset-2 hover:text-ink hover:underline"
               >
                 or pick the binary directly
@@ -181,7 +181,7 @@ export function AddEngineDialog({
             </div>
 
             <DialogFooter>
-              <Button variant="outline" onClick={() => setOpen(false)}>
+              <Button variant="outline" onClick={() => { track('engines', 'cancel_add_engine'); setOpen(false) }}>
                 Cancel
               </Button>
             </DialogFooter>
@@ -254,10 +254,10 @@ export function AddEngineDialog({
             </div>
 
             <DialogFooter>
-              <Button variant="outline" onClick={() => setStep('choose')} disabled={add.isPending}>
+              <Button variant="outline" onClick={() => { track('engines', 'back_to_add_engine_choose'); setStep('choose') }} disabled={add.isPending}>
                 <ArrowLeft size={16} /> Back
               </Button>
-              <Button onClick={submit} disabled={name.trim().length === 0 || add.isPending}>
+              <Button onClick={() => { track('engines', 'submit_new_engine'); submit() }} disabled={name.trim().length === 0 || add.isPending}>
                 {add.isPending ? 'Adding…' : 'Add engine'}
               </Button>
             </DialogFooter>
@@ -277,10 +277,10 @@ export function AddEngineDialog({
               </span>
             </div>
             <DialogFooter>
-              <Button variant="outline" onClick={() => setStep('choose')}>
+              <Button variant="outline" onClick={() => { track('engines', 'back_to_add_engine_choose'); setStep('choose') }}>
                 <ArrowLeft size={16} /> Back
               </Button>
-              <Button onClick={() => setBrowse('file')}>Pick the binary directly</Button>
+              <Button onClick={() => { track('engines', 'browse_new_engine_binary'); setBrowse('file') }}>Pick the binary directly</Button>
             </DialogFooter>
           </>
         )}
@@ -293,6 +293,7 @@ export function AddEngineDialog({
             if (!o) setBrowse(null)
           }}
           onSelect={(p) => {
+            track('engines', 'select_new_engine_path')
             setBrowse(null)
             runScan(p)
           }}

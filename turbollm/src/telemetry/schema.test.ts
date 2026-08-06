@@ -265,6 +265,17 @@ test('validateEvent: ui_action accepts the Phase 6n CodeHomeScreen batch actions
   }
 })
 
+test('validateEvent: ui_action accepts the Phase 6o AddEngineDialog batch actions', () => {
+  const actions = [
+    'browse_new_engine_folder', 'browse_new_engine_binary', 'cancel_add_engine',
+    'back_to_add_engine_choose', 'submit_new_engine', 'select_new_engine_path',
+  ]
+  for (const action of actions) {
+    const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'engines', action } }))
+    assert.equal(r.ok, true, r.ok === false ? `engines/${action}: ${r.reason}` : '')
+  }
+})
+
 test('validateEvent: ui_daily requires screen plus both volume counters', () => {
   const r = validateEvent(validEvent({ event: 'ui_daily', payload: { screen: 'engines', actions: 5, distinctActions: 3 } }))
   assert.equal(r.ok, true, r.ok === false ? r.reason : '')
