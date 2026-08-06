@@ -17,6 +17,7 @@ import {
   MoreHorizontal,
   Network,
   Package,
+  Pencil,
   RefreshCw,
   Rocket,
   Server,
@@ -54,6 +55,7 @@ import { ScreenHeader, InlineError } from '../components/common'
 import { StateChip } from '../components/StateChip'
 import { Badge } from '../components/ui/badge'
 import { Button } from '../components/ui/button'
+import { Input } from '../components/ui/input'
 import { Skeleton } from '../components/ui/skeleton'
 import { toast } from '../components/ui/sonner'
 import {
@@ -925,6 +927,7 @@ function EngineGallery({
           {customEngines.map((eng) => (
             <CustomEngineCard
               key={eng.id}
+              id={eng.id}
               name={eng.name}
               binPath={eng.binPath}
               version={eng.version}
@@ -1262,9 +1265,12 @@ function EngineCard({
 
 /** One custom (non-catalog) engine — either currently live (`disabled: false`) or remembered
  *  but not registered (`disabled: true`, from backend customEngineSources). Gives a custom
- *  engine the SAME lifecycle actions a catalog card gets (Rebuild/Disable/Enable/Delete),
- *  not just a name + a single Delete button (GitHub: "treated as an outsider"). */
+ *  engine the SAME lifecycle actions a catalog card gets (Rebuild/Disable/Enable/Delete/
+ *  Rename/Re-probe), not just a name + a single Delete button (GitHub: "treated as an
+ *  outsider"). Rename/Re-probe need a live registry id, so they're hidden for a
+ *  disabled/remembered source. */
 function CustomEngineCard({
+  id,
   name,
   binPath,
   version,
@@ -1278,6 +1284,7 @@ function CustomEngineCard({
   onEnable,
   onDelete,
 }: {
+  id?: string
   name: string
   binPath: string
   version?: string
@@ -1292,13 +1299,63 @@ function CustomEngineCard({
   onDelete: () => void
 }) {
   const [rebuildOpen, setRebuildOpen] = useState(false)
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(name)
+  const engineMut = useEngineMutations()
+
+  useEffect(() => setDraft(name), [name])
+
+  const commitRename = () => {
+    const trimmed = draft.trim()
+    setEditing(false)
+    if (!id || !trimmed || trimmed === name) {
+      setDraft(name)
+      return
+    }
+    engineMut.rename.mutate(
+      { id, name: trimmed },
+      {
+        onSuccess: () => toast.success('Engine renamed'),
+        onError: (err) => {
+          setDraft(name)
+          toast.error(err instanceof ApiError ? err.message : 'Could not rename engine.')
+        },
+      },
+    )
+  }
+
+  const onReprobe = () => {
+    if (!id) return
+    engineMut.reprobe.mutate(id, {
+      onSuccess: () => toast.success('Engine re-probed'),
+      onError: (err) => toast.error(err instanceof ApiError ? err.message : 'Could not re-probe engine.'),
+    })
+  }
+
   return (
     <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border bg-panel px-4 py-3">
       <div className="flex min-w-0 items-center gap-2">
         <Wrench size={15} className="shrink-0 text-accent" />
         <div className="min-w-0">
           <div className="flex items-center gap-2">
-            <span className="truncate text-sm font-medium text-ink">{name}</span>
+            {editing ? (
+              <Input
+                value={draft}
+                autoFocus
+                onChange={(e) => setDraft(e.target.value)}
+                onBlur={commitRename}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') commitRename()
+                  if (e.key === 'Escape') {
+                    setDraft(name)
+                    setEditing(false)
+                  }
+                }}
+                className="h-7 max-w-[200px]"
+              />
+            ) : (
+              <span className="truncate text-sm font-medium text-ink">{name}</span>
+            )}
             <Badge>Custom</Badge>
             {disabled && <Badge variant="mono">Disabled</Badge>}
           </div>
@@ -1330,6 +1387,25 @@ function CustomEngineCard({
           <Button variant="outline" size="sm" disabled={anyPending} onClick={onDisable}>
             Disable
           </Button>
+        )}
+        {id && (
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              aria-label={`More actions for ${name}`}
+              disabled={anyPending}
+              className="grid h-8 w-8 shrink-0 place-items-center rounded-md text-muted hover:bg-panel-2 hover:text-ink disabled:opacity-50"
+            >
+              <MoreHorizontal size={16} />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem onSelect={() => { setDraft(name); setEditing(true) }}>
+                <Pencil size={14} /> Rename
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={onReprobe} disabled={engineMut.reprobe.isPending}>
+                <RefreshCw size={14} /> Re-probe
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         )}
         <Button variant="outline" size="sm" onClick={onDelete}>
           {disabled ? 'Remove' : 'Delete'}
