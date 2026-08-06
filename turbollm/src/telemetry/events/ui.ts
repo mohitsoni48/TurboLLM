@@ -368,7 +368,13 @@ export const SCREENS = [
  *  target list — `add_context_candidate`/`remove_context_candidate` cover both instantiations,
  *  `save_context_candidates` likewise (`add_code_context_file`, Batch 8, names an unrelated
  *  action — attaching a file to a live Code session's context — not this file's
- *  AGENTS.md-candidate-list editor). */
+ *  AGENTS.md-candidate-list editor).
+ *
+ *  Batch 31 (Phase 6ee): `screens/code/CodeGitDialog.tsx` — 3 raw matches, 3 new distinct
+ *  actions, no skips, tagged `code` (its only embedding, `CodeSessionScreen.tsx`'s Git action).
+ *  `close_code_git_dialog` follows the established "a dialog's own dismissal is tracked, not
+ *  skipped" precedent (`close_build_guide`, `close_mcp_panel`) rather than being folded into
+ *  anything else. */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -457,6 +463,8 @@ export const UI_ACTIONS = [
   'set_routine_flavor', 'browse_routine_workspace', 'toggle_routine_weekday', 'select_routine_workspace',
 
   'add_context_candidate', 'remove_context_candidate', 'save_context_candidates',
+
+  'commit_code_git', 'push_code_git', 'close_code_git_dialog',
 ] as const
 
 export const uiAction = defineEvent({
