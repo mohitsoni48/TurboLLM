@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import { Download, Loader2, ChevronDown, Maximize2, Minimize2 } from 'lucide-react'
 import { toast } from 'sonner'
 import { cn } from '../lib/utils'
+import { track } from '../lib/api'
 import { useUiStore, resolveDark } from '../stores/ui'
 import {
   DropdownMenu,
@@ -929,7 +930,7 @@ export function ArtifactCard({ lang, code }: ArtifactCardProps) {
             {type === 'text/html' && (
               <button
                 type="button"
-                onClick={() => setInteractive((v) => !v)}
+                onClick={() => { track('chat', 'toggle_artifact_interactive'); setInteractive((v) => !v) }}
                 title={interactive ? 'Switch to static render' : 'Switch to interactive mode'}
                 className="rounded px-1.5 py-0.5 text-[11px] text-faint transition-colors hover:text-ink"
               >
@@ -939,7 +940,7 @@ export function ArtifactCard({ lang, code }: ArtifactCardProps) {
             <button
               type="button"
               title={fitMode === 'height' ? 'Expand to full width' : 'Fit to screen height'}
-              onClick={() => setFitMode((m) => (m === 'height' ? 'width' : 'height'))}
+              onClick={() => { track('chat', 'toggle_artifact_fit'); setFitMode((m) => (m === 'height' ? 'width' : 'height')) }}
               className="rounded p-1 text-faint transition-colors hover:text-ink"
             >
               {fitMode === 'height' ? <Maximize2 size={12} /> : <Minimize2 size={12} />}
@@ -957,7 +958,7 @@ export function ArtifactCard({ lang, code }: ArtifactCardProps) {
                   <DropdownMenuItem
                     key={f}
                     className="text-[12px]"
-                    onSelect={() => void download(f)}
+                    onSelect={() => { track('chat', 'download_artifact'); void download(f) }}
                   >
                     {FMT_LABEL[f]}
                     {f === 'gif' && <span className="ml-1 text-[10px] text-faint">animation</span>}

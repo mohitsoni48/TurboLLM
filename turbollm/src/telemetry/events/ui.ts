@@ -404,7 +404,16 @@ export const SCREENS = [
  *  action reused across screens. `toggle_preserve_thinking` covers the Switch (GitHub #52).
  *  The skills-picker checkboxes (`toggleSkill`/`toggleAllSkills`) use plain `onChange` on
  *  native `<input type="checkbox">`, not `onCheckedChange`/`onClick` — outside this batch's
- *  raw-match grep pattern, same scope boundary every other batch has used. */
+ *  raw-match grep pattern, same scope boundary every other batch has used.
+ *
+ *  Batch 35 (Phase 6ii): `components/ArtifactCard.tsx` — 3 raw matches, 3 new distinct
+ *  actions, no skips, tagged `chat` (its only embedding, `MessageBubble.tsx`, not rendered in
+ *  `CodeTranscript.tsx`). `download_artifact` folds every export format (png/svg/gif/html)
+ *  into one action — same "same local function, different param source" pattern as Batch 9's
+ *  `install_comfyui_gate` — rather than splitting per format the way Batch 17 split
+ *  `download_hf_model`/`download_hf_quant`, since those cover genuinely different DOWNLOAD
+ *  SCOPES (whole repo vs. one file) while these are just export-format variants of the same
+ *  single artifact. */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -499,6 +508,8 @@ export const UI_ACTIONS = [
   'resume_download', 'cancel_download', 'remove_download',
 
   'reset_thread_sampling', 'toggle_preserve_thinking', 'save_thread_settings',
+
+  'toggle_artifact_interactive', 'toggle_artifact_fit', 'download_artifact',
 ] as const
 
 export const uiAction = defineEvent({

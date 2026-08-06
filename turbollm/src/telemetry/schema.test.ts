@@ -397,6 +397,14 @@ test('validateEvent: ui_action accepts the Phase 6hh ConversationSettingsDialog 
   }
 })
 
+test('validateEvent: ui_action accepts the Phase 6ii ArtifactCard batch actions', () => {
+  const actions = ['toggle_artifact_interactive', 'toggle_artifact_fit', 'download_artifact']
+  for (const action of actions) {
+    const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'chat', action } }))
+    assert.equal(r.ok, true, r.ok === false ? `chat/${action}: ${r.reason}` : '')
+  }
+})
+
 test('validateEvent: ui_action accepts the Phase 6ee CodeGitDialog batch actions', () => {
   const actions = ['commit_code_git', 'push_code_git', 'close_code_git_dialog']
   for (const action of actions) {
