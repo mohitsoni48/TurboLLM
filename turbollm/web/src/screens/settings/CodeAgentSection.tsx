@@ -1,6 +1,6 @@
 import { Check, ChevronDown, Terminal } from 'lucide-react'
 import { useSettings, useStatus } from '../../lib/queries'
-import { ApiError } from '../../lib/api'
+import { ApiError, track } from '../../lib/api'
 import { toast } from '../../components/ui/sonner'
 import { cn } from '../../lib/utils'
 import {
@@ -85,6 +85,7 @@ export function CodeAgentSection() {
               key={agent.id}
               onSelect={() => {
                 if (agent.id === current) return
+                track('settings', 'set_default_code_agent')
                 save.mutate({ code: { defaultAgent: agent.id } }, { onError })
               }}
               className="flex items-start justify-between gap-2"

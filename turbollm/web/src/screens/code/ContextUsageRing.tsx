@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '../../components/ui/sheet'
+import { track } from '../../lib/api'
 
 // ── Context usage ring ────────────────────────────────────────────────────────
 //
@@ -66,7 +67,7 @@ export function ContextUsageRing({ used, max }: { used: number; max: number }) {
     <>
       <button
         type="button"
-        onClick={() => setOpen(true)}
+        onClick={() => { track('code', 'open_context_usage_detail'); setOpen(true) }}
         title={`Context: ${used.toLocaleString()} / ${max.toLocaleString()} tokens · ${pctDisplay}%`}
         aria-label={`Context usage, ${pctDisplay} percent — open details`}
         className="grid h-8 w-8 shrink-0 place-items-center rounded-md transition-colors hover:bg-panel-2"

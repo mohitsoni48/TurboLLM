@@ -442,7 +442,60 @@ export const SCREENS = [
  *    `cancel_custom_build_dialog` and `continue_custom_build_dialog` are this self-service
  *    "Add via git repo" pre-form's own steps (ADR-183/184) — distinct from Batch 12's
  *    `BuildGuideDialog.tsx` actions, which cover the guide dialog THIS form hands off into,
- *    not this form itself. */
+ *    not this form itself.
+ *
+ *  Batch 37 (Phase 6kk): twelve single/simple-embedding files (16 raw matches, 16 new
+ *  actions) shipped together — the last of the backlog with a single, unambiguous screen
+ *  each. Two cross-screen shared primitives (`components/ui/copy-button.tsx`,
+ *  `components/common.tsx`'s `InlineError`) are deliberately NOT in this batch — their
+ *  fan-out across a dozen call sites each is its own batch (37) below.
+ *  - `components/routines/RoutineApprovalCard.tsx` — tagged `routines` (its only embedding,
+ *    `RoutineEditPage.tsx`). `approve_routine_tool_call`/`deny_routine_tool_call` are the
+ *    ROUTINE-run equivalent of Batch 25's `allow_tool_call`/`deny_tool_call` — a different
+ *    real object (a parked routine run's blocked call, not a live chat's in-flight one), same
+ *    reasoning as Batch 34 keeping thread-sampling distinct from model-settings actions.
+ *  - `components/EngineProvisionBanner.tsx` and `components/EngineLoadErrorBanner.tsx` — both
+ *    render globally from `Shell.tsx` (visible on every screen), tagged `engines` by
+ *    conceptual identity (what they're ABOUT) rather than wherever the user happens to be
+ *    standing — same reasoning as Batch 6's `MessageBubble`/Batch 11's `ModelDetailDialog`.
+ *    `cancel_engine_provision` is a distinct real mutation (`useBackendInstall().cancel`,
+ *    the default-engine auto-provision flow, ADR-024) from Batch 12's `cancel_engine_build`
+ *    (a custom SOURCE build, ADR-089/100) — not a reuse.
+ *  - `screens/tokens/ModelsTab.tsx` — tagged `tokens` (`TokensScreen.tsx` only).
+ *    `show_more_token_models` for the "Show N more" expand button.
+ *  - `screens/settings/MemorySection.tsx` — tagged `settings`. `delete_memory_fact` for the
+ *    per-fact delete button — the master enable/disable toggle is a native
+ *    `<input type="checkbox" onChange=...>`, outside this batch's raw-match grep pattern,
+ *    same scope boundary as Batch 34's skills checkboxes.
+ *  - `screens/engines/EngineLogPanel.tsx` — tagged `engines` (its only real embedding,
+ *    `EnginesScreen.tsx` — the other textual match of its name, in `CodeTranscript.tsx`, is
+ *    just a comment referencing its log-color convention, not an import).
+ *    `toggle_engine_log_autoscroll` for the auto-scroll Switch.
+ *  - `screens/settings/CodeAgentSection.tsx` — tagged `settings`. `set_default_code_agent`
+ *    for the agent picker.
+ *  - `screens/code/ContextUsageRing.tsx` — tagged `code` (all three embeddings —
+ *    `TerminalToolbar`/`CodeComposer`/`CodeStatsFooter` — are Code-only).
+ *    `open_context_usage_detail` for the ring button that opens the detail sheet.
+ *  - `screens/code/CodeResourcesHeader.tsx` — tagged `code` (`CodeSessionScreen.tsx` only).
+ *    `toggle_code_resources_header` for the collapsible trigger.
+ *  - `screens/TokensScreen.tsx` — tagged `tokens`. The one raw match (`onClick=`) is inside
+ *    this file's own local `Segmented` component, instantiated twice for two SEMANTICALLY
+ *    DIFFERENT purposes (switching the overview/models/api tab vs. switching the date range)
+ *    — unlike `CandidateList`/`DownloadRow`'s same-action-both-instantiations case, folding
+ *    these into one action would erase a real distinction, and `Segmented` itself has no way
+ *    to know which purpose it's serving. So tracking is NOT inside `Segmented`'s own click —
+ *    it's at the two caller-supplied `onChange={...}` props in `TokensScreen` itself (still
+ *    the same file, just the outer component instead of the inner one), as
+ *    `switch_token_tab`/`switch_token_range`.
+ *  - `components/Shell.tsx` — tagged `engines` for this one action (by destination, not by
+ *    Shell's own — nonexistent — screen identity): `open_engines_from_nav_chip`, the engine
+ *    state chip at the bottom of the nav rail. Every other nav item is a plain `<Link>` with
+ *    no handler of its own (React Router's own navigation, not a raw match) — this chip alone
+ *    uses an explicit `onClick`+`navigate` because it is styled as a status indicator, not a
+ *    nav link.
+ *  - `components/AuthGate.tsx` — tagged `developer` (API keys are managed under the Developer
+ *    screen, even though this gate itself renders outside any screen route on a 401).
+ *    `submit_auth_key` for the "Connect" button. */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -544,6 +597,19 @@ export const UI_ACTIONS = [
   'close_import_url_dialog', 'import_model_url',
   'restart_engine',
   'cancel_custom_build_dialog', 'continue_custom_build_dialog',
+
+  'approve_routine_tool_call', 'deny_routine_tool_call',
+  'dismiss_engine_provision_error', 'cancel_engine_provision',
+  'open_engines_from_error_banner', 'dismiss_engine_error_banner',
+  'show_more_token_models',
+  'delete_memory_fact',
+  'toggle_engine_log_autoscroll',
+  'set_default_code_agent',
+  'open_context_usage_detail',
+  'toggle_code_resources_header',
+  'switch_token_tab', 'switch_token_range',
+  'open_engines_from_nav_chip',
+  'submit_auth_key',
 ] as const
 
 export const uiAction = defineEvent({

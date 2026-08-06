@@ -4,6 +4,7 @@ import { X } from 'lucide-react'
 import type { EngineError, Status } from '../lib/types'
 import { Button } from './ui/button'
 import { CopyButton } from './ui/copy-button'
+import { track } from '../lib/api'
 
 /** Every distinct `errInfo` the backend produces (`manager.ts` — `onTerminated`,
  *  `readiness`'s timeout/model-load-failure branches) is a fresh object literal, so
@@ -55,7 +56,7 @@ export function EngineLoadErrorBanner({ status }: { status: Status | undefined }
             size="sm"
             variant="outline"
             className="h-6 px-2 text-[12px]"
-            onClick={() => navigate('/engines')}
+            onClick={() => { track('engines', 'open_engines_from_error_banner'); navigate('/engines') }}
           >
             Open Engines
           </Button>
@@ -63,7 +64,7 @@ export function EngineLoadErrorBanner({ status }: { status: Status | undefined }
         <CopyButton text={(error.logTail ?? []).join('\n')} label="Copy log" size={13} />
         <button
           type="button"
-          onClick={() => setDismissedKey(key)}
+          onClick={() => { track('engines', 'dismiss_engine_error_banner'); setDismissedKey(key) }}
           className="grid h-6 w-6 shrink-0 place-items-center rounded text-muted hover:text-ink"
           aria-label="Dismiss"
         >

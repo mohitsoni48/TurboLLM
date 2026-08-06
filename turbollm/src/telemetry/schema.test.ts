@@ -419,6 +419,27 @@ test('validateEvent: ui_action accepts the Phase 6jj batch actions (4 small file
   }
 })
 
+test('validateEvent: ui_action accepts the Phase 6kk batch actions (12 small files)', () => {
+  const byScreen: Record<string, string[]> = {
+    routines: ['approve_routine_tool_call', 'deny_routine_tool_call'],
+    engines: [
+      'dismiss_engine_provision_error', 'cancel_engine_provision',
+      'open_engines_from_error_banner', 'dismiss_engine_error_banner',
+      'toggle_engine_log_autoscroll', 'open_engines_from_nav_chip',
+    ],
+    tokens: ['show_more_token_models', 'switch_token_tab', 'switch_token_range'],
+    settings: ['delete_memory_fact', 'set_default_code_agent'],
+    code: ['open_context_usage_detail', 'toggle_code_resources_header'],
+    developer: ['submit_auth_key'],
+  }
+  for (const [screen, actions] of Object.entries(byScreen)) {
+    for (const action of actions) {
+      const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen, action } }))
+      assert.equal(r.ok, true, r.ok === false ? `${screen}/${action}: ${r.reason}` : '')
+    }
+  }
+})
+
 test('validateEvent: ui_action accepts the Phase 6ee CodeGitDialog batch actions', () => {
   const actions = ['commit_code_git', 'push_code_git', 'close_code_git_dialog']
   for (const action of actions) {

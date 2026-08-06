@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { KeyRound } from 'lucide-react'
 import { Button } from './ui/button'
 import { Input } from './ui/input'
+import { track } from '../lib/api'
 
 /** Shown when the daemon answers 401 — i.e. it's exposed on the LAN and this client
  *  has no (or a stale) API key. Lets the user paste a key; the parent stores it and
@@ -13,6 +14,7 @@ export function AuthGate({ onConnect }: { onConnect: (key: string) => void }) {
   const submit = () => {
     const k = key.trim()
     if (!k) return
+    track('developer', 'submit_auth_key')
     setSubmitted(true)
     onConnect(k)
   }
