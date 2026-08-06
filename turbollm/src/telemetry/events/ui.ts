@@ -204,7 +204,16 @@ export const SCREENS = [
  *  reasoning as every prior batch's folds; the context-file browser reuses
  *  `add_code_context_file` (Batch 8) for the identical reason. Skips: the sidebar's `onSelect`
  *  relay (Batch 2 already tracks it) and `CodeComposer`'s `onValueChange` keystroke sync (same
- *  category as every prior batch's). */
+ *  category as every prior batch's).
+ *
+ *  Batch 15 (Phase 6o): `screens/engines/AddEngineDialog.tsx` — 8 raw matches, 6 new distinct
+ *  actions, no skips. The confirm step's "Back" and the not-found step's "Back" both call the
+ *  identical `setStep('choose')`, so they fold into one `back_to_add_engine_choose`; the
+ *  not-found step's "Pick the binary directly" calls the identical `setBrowse('file')` as the
+ *  choose step's own link, so it reuses `browse_new_engine_binary` rather than getting a new
+ *  name for the same effect from a different step. `select_new_engine_path` is tracked at the
+ *  shared `FsBrowser`'s own `onSelect` call site (this file's real DOM click, driving the
+ *  scan), same as every other batch's `FsBrowser` usage. */
 export const UI_ACTIONS = [
   'install_engine', 'enable_engine', 'disable_engine', 'update_engine', 'delete_engine',
   'switch_engine', 'switch_engine_build', 'set_engine_update_policy',
@@ -263,6 +272,9 @@ export const UI_ACTIONS = [
   'switch_agent_form_tab', 'delete_agent', 'cancel_delete_agent',
 
   'switch_code_stats_range', 'use_starter_task',
+
+  'browse_new_engine_folder', 'browse_new_engine_binary', 'cancel_add_engine',
+  'back_to_add_engine_choose', 'submit_new_engine', 'select_new_engine_path',
 ] as const
 
 export const uiAction = defineEvent({
