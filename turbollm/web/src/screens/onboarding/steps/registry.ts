@@ -1,0 +1,64 @@
+/** The ordered step list — the single source of truth (spec 25 §4).
+ *
+ *  To add a step: add one `defineStep` below, in position. Nothing else in
+ *  this module changes; `deriveSteps`, the skip-coverage test and the
+ *  progress indicator all read this array. */
+
+import { defineStep, type StepDescriptor } from './define'
+
+export const REGISTRY: readonly StepDescriptor[] = [
+  defineStep({
+    id: 'welcome',
+    title: 'Welcome',
+    appliesTo: () => true,
+  }),
+  defineStep({
+    id: 'profile',
+    title: 'How will you use TurboLLM?',
+    appliesTo: () => true,
+  }),
+  defineStep({
+    id: 'model',
+    title: 'Choose a model',
+    appliesTo: () => true,
+  }),
+  defineStep({
+    // Fills otherwise-dead download time; pointless once the bytes have landed.
+    id: 'personalize',
+    title: 'Personalize',
+    appliesTo: (c) => !c.downloadDone,
+  }),
+  defineStep({
+    // Casual has no profile-specific step. Pro's engine picker also only
+    // makes sense while something is downloading.
+    id: 'profile-extra',
+    title: 'Set up your workflow',
+    appliesTo: (c) => !c.downloadDone && c.profile !== null && c.profile !== 'casual',
+  }),
+  defineStep({
+    id: 'load',
+    title: 'Loading your model',
+    appliesTo: () => true,
+  }),
+  defineStep({
+    id: 'payoff',
+    title: 'Try it',
+    appliesTo: () => true,
+  }),
+  defineStep({
+    // Auto-tune is offered only after the payoff, and NEVER on T0 — a
+    // hardware override that outranks profile (§6.2).
+    id: 'tune-offer',
+    title: 'Make it faster',
+    appliesTo: (c) => !c.isT0 && (c.profile === 'enthusiast' || c.profile === 'pro' || c.profile === 'developer'),
+  }),
+  defineStep({
+    id: 'done',
+    title: "You're set up",
+    appliesTo: () => true,
+  }),
+]
+
+export type StepId = (typeof REGISTRY)[number]['id']
+
+export const STEP_IDS: readonly string[] = REGISTRY.map((s) => s.id)
