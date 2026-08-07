@@ -131,7 +131,7 @@ export function updateCodeSessionThinkingBudget(id: string, tokens: number): Pro
  *  — the CLI drives its own requests directly, so this is the terminal-session equivalent of
  *  a chat session's lastRealStats. `usage` is null (not an error) before the session's first
  *  gateway request. */
-export function getCodeSessionLastUsage(id: string): Promise<{ usage: { promptTokens: number; genTokens: number; promptTps: number | null; genTps: number | null } | null }> {
+export function getCodeSessionLastUsage(id: string): Promise<{ usage: { ctxUsed: number; promptTokens: number; genTokens: number; promptTps: number | null; genTps: number | null } | null }> {
   return req(`/api/v1/code/sessions/${encodeURIComponent(id)}/last-usage`)
 }
 

@@ -467,6 +467,14 @@ export async function* streamToAnthropic(
   try {
     outer: while (true) {
       const readPromise = reader.read()
+      // Attach a handler at creation time, unconditionally — the `remaining === 0` shortcut
+      // below can `yield` a ping without ever calling `waitOrPing` (the only place that used to
+      // attach one), leaving `readPromise` unhandled while the generator is suspended at that
+      // `yield`. If the upstream errors during that window, Node reports an unhandledRejection
+      // for a path this function already handles correctly one line down. This `.catch` only
+      // marks the promise handled for that purpose; `await readPromise` below still throws
+      // normally into the surrounding try/catch.
+      readPromise.catch(() => {})
       // Race against the REMAINING time on the fixed schedule, not a fresh full interval each
       // time — a naive "race against pingIntervalMs on every read" (the first version of this
       // fix) looked correct in isolation and passed against a mocked stream, but measured FALSE

@@ -1532,13 +1532,12 @@ export class ConversationStore {
     } as P)
   }
 
-  /** The session's own largest completed gateway request (ADR-284, revised — founder-reported
-   *  "ctx fill jumps between full and empty in the same session") — powers TerminalToolbar.tsx's
-   *  composer-parity stats row and its Context ring the same way `lastRealStats` already does for
-   *  a 'turbollm' chat session's last turn. null when the session has made no gateway requests yet
-   *  (fresh session, or a non-terminal-agent one).
+  /** The session's own gateway-request stats (ADR-284, revised twice — founder-reported "ctx
+   *  fill jumps between full and empty in the same session", then a review pass on that same fix
+   *  catching that it had gone on to freeze the LAST-TURN stats too). Two different questions,
+   *  two different rows:
    *
-   *  Deliberately the MAX prompt_tokens row, not literally the most-recently-INSERTED one. Every
+   *  `ctxUsed` is the MAX prompt_tokens row, not literally the most-recently-INSERTED one. Every
    *  request a real `claude` CLI process makes — the main conversation's own turn AND every
    *  parallel Task-tool sub-agent it spawns — shares the SAME code_session_id: `resolveCodeSession`
    *  (gateway.ts) derives it purely from the bearer token, and the CLI mints exactly one token
@@ -1549,20 +1548,31 @@ export class ConversationStore {
    *  with no change to the actual conversation in between. The MAX is the honest answer to "how
    *  full has this session's context gotten" — a real Claude Code CLI resends the whole
    *  conversation every turn, so its size only grows within one continuous conversation, and a
-   *  sub-agent (always smaller) can never legitimately raise that high-water mark.
+   *  sub-agent (always smaller) can never legitimately raise that high-water mark. Trade-off,
+   *  accepted: after a real `/clear` inside the CLI (invisible to the daemon — a terminal-agent
+   *  session's turns are never persisted here, see ADR-297), this keeps reporting the pre-clear
+   *  high-water mark until the new conversation grows past it. A temporarily-stale-high ring
+   *  reading after a rare, deliberate user action beats an unpredictable full/empty flicker on
+   *  every ordinary agentic turn with sub-agents.
    *
-   *  Trade-off, accepted: after a real `/clear` inside the CLI (invisible to the daemon — a
-   *  terminal-agent session's turns are never persisted here, see ADR-297), this keeps reporting
-   *  the pre-clear high-water mark until the new conversation grows past it. A temporarily-stale-
-   *  high reading after a rare, deliberate user action beats an unpredictable full/empty flicker
-   *  on every ordinary agentic turn with sub-agents. */
-  getLastApiUsageForSession(codeSessionId: string): { promptTokens: number; genTokens: number; promptTps: number | null; genTps: number | null } | null {
+   *  `promptTokens`/`genTokens`/`promptTps`/`genTps` are the temporally-LAST row instead — these
+   *  power TerminalToolbar.tsx's composer-parity stats row, which reads as "your last turn", not
+   *  "session high-water mark". Sharing the MAX row here (the original version of this fix) meant
+   *  a sub-agent call landing after the real turn hid its own genTokens/tps behind the earlier,
+   *  larger turn's numbers, and after a `/clear` these froze at the pre-clear turn's numbers
+   *  forever, same failure shape as the ctxUsed bug this method was written to fix in the first
+   *  place. null when the session has made no gateway requests yet (fresh session, or a
+   *  non-terminal-agent one). */
+  getLastApiUsageForSession(codeSessionId: string): { ctxUsed: number; promptTokens: number; genTokens: number; promptTps: number | null; genTps: number | null } | null {
     const row = this.db.prepare(`
       SELECT prompt_tokens, gen_tokens, duration_ms, prompt_tps, gen_tps FROM api_usage
       WHERE code_session_id = $codeSessionId
-      ORDER BY prompt_tokens DESC, created_at DESC LIMIT 1
+      ORDER BY created_at DESC LIMIT 1
     `).get({ $codeSessionId: codeSessionId } as P) as unknown as { prompt_tokens: number; gen_tokens: number; duration_ms: number | null; prompt_tps: number | null; gen_tps: number | null } | undefined
     if (!row) return null
+    const ctxUsed = (this.db.prepare(`
+      SELECT MAX(prompt_tokens) as maxPromptTokens FROM api_usage WHERE code_session_id = $codeSessionId
+    `).get({ $codeSessionId: codeSessionId } as P) as unknown as { maxPromptTokens: number }).maxPromptTokens
     // The engine's own per-phase rates when the row has them (ADR-300) — llama.cpp times prefill
     // and decode separately and reports each, which is the only way either number can be right.
     //
@@ -1575,6 +1585,7 @@ export class ConversationStore {
     // engine reported none.
     const seconds = row.duration_ms != null && row.duration_ms > 0 ? row.duration_ms / 1000 : null
     return {
+      ctxUsed,
       promptTokens: row.prompt_tokens,
       genTokens: row.gen_tokens,
       promptTps: row.prompt_tps ?? (seconds ? row.prompt_tokens / seconds : null),
