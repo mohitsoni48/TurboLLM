@@ -20,6 +20,7 @@ import { RoutineStatusBadge } from '../../components/routines/RoutineStatusBadge
 import { describeRoutineError } from '../../lib/routine-api'
 import { describeScheduleRule, emptyRoutineDraft, isRoutineDraftComplete, routineToDraft, type RoutineDraft } from '../../lib/routine-form'
 import { useRoutine, useRoutineMutations, useRoutineRuns } from '../../lib/routine-queries'
+import { useWorkspaceSidebarOpen } from '../../lib/workspace-sidebar'
 import { deriveRoutineDisplayStatus } from '../../lib/routine-status'
 import type { Routine, RoutineRun, ScheduleRule } from '../../lib/routine-types'
 import { cn } from '../../lib/utils'
@@ -69,7 +70,7 @@ function draftsEqual(a: RoutineDraft, b: RoutineDraft): boolean {
 function RoutinesModeShell({ children }: { children: ReactNode }) {
   const navigate = useNavigate()
   const isDesktop = useIsDesktop()
-  const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [sidebarOpen, setSidebarOpen] = useWorkspaceSidebarOpen()
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
   const [sidebarWidth, setSidebarWidth] = useState(() => Math.min(Math.max(readSavedSidebarWidth(), SIDEBAR_MIN_W), sidebarMaxW()))
   const sidebarRef = useRef<HTMLDivElement>(null)

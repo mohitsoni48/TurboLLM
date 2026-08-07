@@ -8,6 +8,7 @@ import { useBuiltinAgentOverrides, useChatAgents, useEngines, useModelActions, u
 import type { ChatSseEvent, Conversation, LiveToolCall, Message } from '../lib/chat-types'
 import { appendTextDelta, upsertToolCall, type LiveBlock } from '../lib/live-timeline'
 import { ApiError, downloadChatExport, getDebugSnapshot, getShareUrl, importChat, track } from '../lib/api'
+import { useWorkspaceSidebarOpen } from '../lib/workspace-sidebar'
 import { Button } from '../components/ui/button'
 import {
   DropdownMenu,
@@ -99,7 +100,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   const [editingId, setEditingId] = useState<string | null>(null)
   const [settingsKey, setSettingsKey] = useState<string | null>(null)
   const [showScrollBtn, setShowScrollBtn] = useState(false)
-  const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [sidebarOpen, setSidebarOpen] = useWorkspaceSidebarOpen()
   // Below md the sidebar is an off-canvas drawer, hidden until opened from the header.
   const isDesktop = useIsDesktop()
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)

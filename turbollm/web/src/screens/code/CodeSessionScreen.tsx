@@ -14,6 +14,7 @@ import {
 import { CodeSessionClient, type LiveState } from '../../lib/code-session-client'
 import { matchCodeCommand, pickerCodeCommands } from '../../lib/code-commands'
 import { toggleDisplayPref } from '../../lib/code-display-prefs'
+import { useWorkspaceSidebarOpen } from '../../lib/workspace-sidebar'
 import { Button, buttonVariants } from '../../components/ui/button'
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
@@ -261,7 +262,7 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
   const userScrolledUp = useRef(false)
   const [showScrollBtn, setShowScrollBtn] = useState(false)
 
-  const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [sidebarOpen, setSidebarOpen] = useWorkspaceSidebarOpen()
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
   const [sidebarWidth, setSidebarWidth] = useState(() => Math.min(Math.max(readSavedSidebarWidth(), SIDEBAR_MIN_W), sidebarMaxW()))
   const sidebarRef = useRef<HTMLDivElement>(null)

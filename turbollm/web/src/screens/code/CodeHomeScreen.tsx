@@ -10,6 +10,7 @@ import { ApiError, track } from '../../lib/api'
 import { useGitBranch, useModelActions, useModels, useStatus } from '../../lib/queries'
 import { createCodeSession } from '../../lib/code-api'
 import { useCodeStats } from '../../lib/code-queries'
+import { useWorkspaceSidebarOpen } from '../../lib/workspace-sidebar'
 import type { CodeStatsRange } from '../../lib/code-types'
 import { ConversationSidebar } from '../chat/ConversationSidebar'
 import { readSavedSidebarWidth, SIDEBAR_MIN_W, sidebarMaxW, SidebarResizeHandle } from '../chat/SidebarResizeHandle'
@@ -195,7 +196,7 @@ export function CodeHomeScreen() {
   // Sidebar column — same collapse/resize state shape as ChatScreen.tsx (shared
   // constants/handle via SidebarResizeHandle.tsx) so the two modes feel like one
   // continuous surface, not two independently-behaving screens.
-  const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [sidebarOpen, setSidebarOpen] = useWorkspaceSidebarOpen()
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
   const [sidebarWidth, setSidebarWidth] = useState(() => Math.min(Math.max(readSavedSidebarWidth(), SIDEBAR_MIN_W), sidebarMaxW()))
   const sidebarRef = useRef<HTMLDivElement>(null)
