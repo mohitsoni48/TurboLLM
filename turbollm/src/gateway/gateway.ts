@@ -11,7 +11,7 @@ import { engineModelAlias } from '../engines/compat'
 import { presentedKey } from '../auth'
 import { sessionAuth } from '../code/session-auth'
 import { classifyHarness } from '../telemetry/classify'
-import { mapToOpenAI, mapFromOpenAI, streamToAnthropic, messageStartEvent, pingWhilePending, type AnthropicRequest, type StreamToolCall } from './anthropic'
+import { mapToOpenAI, mapFromOpenAI, streamToAnthropic, messageStartEvent, pingWhilePending, DEFAULT_PING_INTERVAL_MS, type AnthropicRequest, type StreamToolCall } from './anthropic'
 import { applyAgentGuidance } from './agent-guidance'
 import {
   extractSearchQuery,
@@ -92,9 +92,13 @@ function asClientStatus(status: number): ContentfulStatusCode {
   return (status >= 400 && status <= 599 ? status : 500) as ContentfulStatusCode
 }
 
-/** Classifies a `d.gate.acquire()` failure into one {status, type, message} shape shared by
- *  both the streaming (SSE `error` event, ADR-347) and non-streaming (JSON error response) call
- *  sites, so the two paths can't silently drift in wording or classification. */
+/** Classifies a `d.gate.acquire()` failure into one {status, type, message} shape shared by both
+ *  the streaming (SSE `error` event, ADR-347 — `status` unused there, a stream is always 200 by
+ *  the time it can fail this way) and non-streaming (JSON error response, where `status` is what
+ *  the client actually sees) call sites, so `type`/`message` wording can't silently drift between
+ *  them. The gate-acquire and fetch() SEQUENCES themselves remain two separate copies (streaming
+ *  needs to open the SSE connection before either call; non-streaming doesn't) — this only
+ *  centralizes how a failure from either gets described. */
 function classifyGateError(e: unknown): { status: ContentfulStatusCode; type: string; message: string } {
   const aborted = (e as Error).message === 'gate_acquire_aborted'
   return aborted
@@ -116,7 +120,18 @@ function classifyFetchError(e: unknown, ac: AbortController): { status: Contentf
   }
 }
 
-export function registerGateway(app: Hono, d: Deps): void {
+/** Test-only overrides for values otherwise hardcoded below (ADR-347 review follow-up) — the
+ *  600s gate-acquire timeout and the 10s ping cadence can't otherwise be exercised by a fast
+ *  unit test without either sleeping for real or never observing a ping/timeout at all. Omit in
+ *  production; `registerGateway(app, d)` behaves exactly as before. */
+export interface GatewayOptions {
+  pingIntervalMs?: number
+  gateAcquireTimeoutMs?: number
+}
+
+export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): void {
+  const pingIntervalMs = opts.pingIntervalMs ?? DEFAULT_PING_INTERVAL_MS
+  const gateAcquireTimeoutMs = opts.gateAcquireTimeoutMs ?? 600_000
   // ── POST /v1/messages — Anthropic translation (spec 06 §2) ───────────────
 
   app.post('/v1/messages', async (c) => {
@@ -279,120 +294,139 @@ export function registerGateway(app: Hono, d: Deps): void {
         // nothing keeps waiting on a connection nobody will read the response of.
         stream.onAbort(() => ac.abort())
         const ping = () => stream.writeSSE({ event: 'ping', data: JSON.stringify({ type: 'ping' }) })
+        // Outer catch-all: everything expected already writes its own well-formed SSE `error`
+        // event and returns below — this only exists for whatever ISN'T expected (this callback
+        // now does real work: gate/fetch/JSON, any of which could throw something new later). Not
+        // using streamSSE's own `onError` third argument (hono/streaming): it unconditionally
+        // ALSO writes its own `data: e.message` frame afterward — a bare string, not the
+        // `{type:'error', error:{...}}` shape an Anthropic-protocol client expects — so passing
+        // both would send two error events, one malformed.
         try {
-          await stream.writeSSE(messageStartEvent(msgId, modelName))
+          try {
+            await stream.writeSSE(messageStartEvent(msgId, modelName))
 
-          if (d.gate) {
+            if (d.gate) {
+              try {
+                // Never proceed un-slotted on failure — that would silently breach the very
+                // limit this exists to enforce, and intermittently, which is worse than a clean
+                // error. onOrphan: if the client is already gone by the time a slot grants (a
+                // ping write failed first, below), the grant must still be released rather than
+                // silently leaked — an un-drained release permanently shrinks the daemon's
+                // effective engine concurrency by one for its whole remaining life (review-caught,
+                // ADR-347 follow-up).
+                gateRelease = await pingWhilePending(
+                  d.gate.acquire('bg', { signal: c.req.raw.signal, timeoutMs: gateAcquireTimeoutMs }),
+                  ping,
+                  pingIntervalMs,
+                  (release) => release(),
+                )
+              } catch (e) {
+                const { type, message } = classifyGateError(e)
+                await stream.writeSSE({ event: 'error', data: JSON.stringify({ type: 'error', error: { type, message } }) })
+                return
+              }
+            }
+
+            // Mark the completion in-flight so the engine card's live "Generating…" indicator
+            // counts Claude-CLI (Anthropic-protocol) traffic too — paired with generationEnd in
+            // the outer finally below (generationStarted guards it: never call generationEnd for
+            // a start that never happened, e.g. a gate timeout above).
+            d.manager.generationStart()
+            generationStarted = true
+
+            // For terminal-agent usage attribution/stats (ADR-284) — wall-clock request
+            // duration, the simplest signal available without touching streamToAnthropic's own
+            // callback shape (it doesn't currently surface the engine's per-request timings the
+            // way the OpenAI-shaped helpers below already do). An approximation, not a
+            // literally-measured prefill/gen split.
+            const requestStart = Date.now()
+            let res: Response
             try {
-              // Never proceed un-slotted on failure — that would silently breach the very
-              // limit this exists to enforce, and intermittently, which is worse than a clean
-              // error.
-              gateRelease = await pingWhilePending(
-                d.gate.acquire('bg', { signal: c.req.raw.signal, timeoutMs: 600_000 }),
+              res = await pingWhilePending(
+                fetch(`${target}/v1/chat/completions`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(oaiBody),
+                  signal: ac.signal,
+                }),
                 ping,
+                pingIntervalMs,
+                // No onOrphan: an orphaned Response has nothing to release — its body is simply
+                // never read and gets garbage-collected, unlike gate.acquire()'s grant above.
               )
             } catch (e) {
-              const { type, message } = classifyGateError(e)
+              const { type, message } = classifyFetchError(e, ac)
               await stream.writeSSE({ event: 'error', data: JSON.stringify({ type: 'error', error: { type, message } }) })
               return
             }
-          }
 
-          // Mark the completion in-flight so the engine card's live "Generating…" indicator
-          // counts Claude-CLI (Anthropic-protocol) traffic too — paired with generationEnd in
-          // the outer finally below (generationStarted guards it: never call generationEnd for
-          // a start that never happened, e.g. a gate timeout above).
-          d.manager.generationStart()
-          generationStarted = true
+            if (!res.ok || !res.body) {
+              // Forward the engine's REAL status + whatever structured error it returned,
+              // instead of flattening every distinct failure (bad request, model
+              // incompatibility, overload, crash) to the same hardcoded 'api_error' — that
+              // flattening is what made bugs #1-#4 in a Code session all read identically from
+              // the terminal, with no way to tell them apart.
+              const { message, type } = await describeEngineError(res)
+              await stream.writeSSE({
+                event: 'error',
+                data: JSON.stringify({ type: 'error', error: { type: type ?? anthropicErrorType(res.status), message } }),
+              })
+              return
+            }
 
-          // For terminal-agent usage attribution/stats (ADR-284) — wall-clock request
-          // duration, the simplest signal available without touching streamToAnthropic's own
-          // callback shape (it doesn't currently surface the engine's per-request timings the
-          // way the OpenAI-shaped helpers below already do). An approximation, not a
-          // literally-measured prefill/gen split.
-          const requestStart = Date.now()
-          let res: Response
-          try {
-            res = await pingWhilePending(
-              fetch(`${target}/v1/chat/completions`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(oaiBody),
-                signal: ac.signal,
-              }),
-              ping,
-            )
-          } catch (e) {
-            const { type, message } = classifyFetchError(e, ac)
-            await stream.writeSSE({ event: 'error', data: JSON.stringify({ type: 'error', error: { type, message } }) })
-            return
-          }
-
-          if (!res.ok || !res.body) {
-            // Forward the engine's REAL status + whatever structured error it returned,
-            // instead of flattening every distinct failure (bad request, model
-            // incompatibility, overload, crash) to the same hardcoded 'api_error' — that
-            // flattening is what made bugs #1-#4 in a Code session all read identically from
-            // the terminal, with no way to tell them apart.
-            const { message, type } = await describeEngineError(res)
-            await stream.writeSSE({
-              event: 'error',
-              data: JSON.stringify({ type: 'error', error: { type: type ?? anthropicErrorType(res.status), message } }),
+            // Record session stats (B4) from the final usage the generator observes.
+            // Fail-safe: the callback is only invoked best-effort and swallows nothing
+            // that affects the client stream.
+            const gen = streamToAnthropic(res.body, modelName, msgId, {
+              onUsage: (u) => {
+                try {
+                  // The engine's own per-phase rates now ride along (ADR-300). This path —
+                  // Anthropic streaming, i.e. every Claude Code request — was the one place
+                  // that passed NO timings at all, so the engine card fell back to whatever the
+                  // last non-gateway request left behind and a terminal-agent session's stats
+                  // row had to divide both token counts by one wall-clock, reading decode ~6x
+                  // too low.
+                  d.manager.recordCompletion({
+                    inputTokens: u.inputTokens, outputTokens: u.outputTokens,
+                    promptTps: u.promptTps, genTps: u.genTps,
+                  })
+                  // Durable counterpart to the ephemeral session counter above (GitHub #71) —
+                  // the session counter resets on engine restart and was never
+                  // persisted/surfaced.
+                  d.db.recordApiUsage({
+                    source: 'anthropic', modelKey: req.model ?? null, promptTokens: u.inputTokens, genTokens: u.outputTokens,
+                    codeSessionId: anthropicCodeSessionId, durationMs: Date.now() - requestStart,
+                    promptTps: u.promptTps, genTps: u.genTps, harness: anthropicHarness,
+                  })
+                } catch { /* swallow — stats are best-effort */ }
+              },
+              // Live per-request progress for the engine card (prefill % + token count),
+              // so Claude Code traffic shows the same live row as in-app chat.
+              onLive: (live) => { try { d.manager.setLiveGen(live) } catch { /* best-effort */ } },
+              // Coding-activity attribution for terminal-agent sessions — see
+              // observeCodeSessionTurn. Nothing to attribute for any other client.
+              onToolCalls: (calls) => {
+                if (!anthropicCodeSessionId) return
+                try { observeCodeSessionTurn(d, anthropicCodeSessionId, calls) } catch { /* swallow */ }
+              },
+              skipMessageStart: true, // already sent above, before the queue wait
             })
-            return
+            // streamSSE flushes each chunk immediately through Node.js's HTTP layer.
+            // Raw ReadableStream does not — chunks buffer until the response completes,
+            // which makes Claude CLI (and any Anthropic-protocol client) appear "slow".
+            for await (const evt of gen) {
+              await stream.writeSSE({ event: evt.event, data: evt.data })
+            }
+          } finally {
+            ac.abort() // also tear down the upstream on normal completion / write error
+            if (generationStarted) d.manager.generationEnd()
+            gateRelease?.()
           }
-
-          // Record session stats (B4) from the final usage the generator observes.
-          // Fail-safe: the callback is only invoked best-effort and swallows nothing
-          // that affects the client stream.
-          const gen = streamToAnthropic(
-            res.body,
-            modelName,
-            msgId,
-            (u) => {
-              try {
-                // The engine's own per-phase rates now ride along (ADR-300). This path —
-                // Anthropic streaming, i.e. every Claude Code request — was the one place
-                // that passed NO timings at all, so the engine card fell back to whatever the
-                // last non-gateway request left behind and a terminal-agent session's stats
-                // row had to divide both token counts by one wall-clock, reading decode ~6x
-                // too low.
-                d.manager.recordCompletion({
-                  inputTokens: u.inputTokens, outputTokens: u.outputTokens,
-                  promptTps: u.promptTps, genTps: u.genTps,
-                })
-                // Durable counterpart to the ephemeral session counter above (GitHub #71) —
-                // the session counter resets on engine restart and was never
-                // persisted/surfaced.
-                d.db.recordApiUsage({
-                  source: 'anthropic', modelKey: req.model ?? null, promptTokens: u.inputTokens, genTokens: u.outputTokens,
-                  codeSessionId: anthropicCodeSessionId, durationMs: Date.now() - requestStart,
-                  promptTps: u.promptTps, genTps: u.genTps, harness: anthropicHarness,
-                })
-              } catch { /* swallow — stats are best-effort */ }
-            },
-            // Live per-request progress for the engine card (prefill % + token count),
-            // so Claude Code traffic shows the same live row as in-app chat.
-            (live) => { try { d.manager.setLiveGen(live) } catch { /* best-effort */ } },
-            // Coding-activity attribution for terminal-agent sessions — see
-            // observeCodeSessionTurn. Nothing to attribute for any other client.
-            (calls) => {
-              if (!anthropicCodeSessionId) return
-              try { observeCodeSessionTurn(d, anthropicCodeSessionId, calls) } catch { /* swallow */ }
-            },
-            undefined,
-            true, // skipMessageStart — already sent above, before the queue wait
-          )
-          // streamSSE flushes each chunk immediately through Node.js's HTTP layer.
-          // Raw ReadableStream does not — chunks buffer until the response completes,
-          // which makes Claude CLI (and any Anthropic-protocol client) appear "slow".
-          for await (const evt of gen) {
-            await stream.writeSSE({ event: evt.event, data: evt.data })
-          }
-        } finally {
-          ac.abort() // also tear down the upstream on normal completion / write error
-          if (generationStarted) d.manager.generationEnd()
-          gateRelease?.()
+        } catch (e) {
+          await stream.writeSSE({
+            event: 'error',
+            data: JSON.stringify({ type: 'error', error: { type: 'api_error', message: (e as Error)?.message || 'Internal gateway error.' } }),
+          }).catch(() => {})
         }
       })
     }
@@ -402,7 +436,7 @@ export function registerGateway(app: Hono, d: Deps): void {
     let gateRelease: (() => void) | null = null
     if (d.gate) {
       try {
-        gateRelease = await d.gate.acquire('bg', { signal: c.req.raw.signal, timeoutMs: 600_000 })
+        gateRelease = await d.gate.acquire('bg', { signal: c.req.raw.signal, timeoutMs: gateAcquireTimeoutMs })
       } catch (e) {
         const { status, type, message } = classifyGateError(e)
         return c.json({ type: 'error', error: { type, message } }, status)

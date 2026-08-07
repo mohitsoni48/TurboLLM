@@ -426,11 +426,22 @@ export function waitOrPing(pending: Promise<unknown>, ms: number): Promise<'data
  *  the engine had already accepted the request. Same fixed-cadence-from-start reasoning: a
  *  schedule that resets on every settle-check would starve under a `pending` that itself emits
  *  frequent progress, though callers here don't have that failure mode today. Resolves/rejects
- *  exactly as `pending` does; `emitPing` fires each time the deadline elapses first. */
+ *  exactly as `pending` does; `emitPing` fires each time the deadline elapses first.
+ *
+ *  `onOrphan`, if given, fires if `emitPing` itself throws (the client connection is gone, so the
+ *  wait can't usefully continue) and `pending` goes on to resolve anyway — e.g. gateway.ts's
+ *  `d.gate.acquire()` grants an engine slot to a caller who has already given up. Rethrowing
+ *  immediately here would silently ABANDON that grant: nothing would ever call the returned
+ *  release function, permanently shrinking the daemon's effective concurrency by one for its
+ *  whole remaining life (GenerationGate's own `drain()` doc comment calls out exactly this
+ *  failure class). `onOrphan` lets the caller drain whatever `pending` eventually produces
+ *  instead (review-caught, ADR-347 follow-up) — omit it for a `pending` with nothing to drain
+ *  (e.g. a plain `fetch()`, where an orphaned Response can just be garbage-collected). */
 export async function pingWhilePending<T>(
   pending: Promise<T>,
   emitPing: () => Promise<void> | void,
   pingIntervalMs: number = DEFAULT_PING_INTERVAL_MS,
+  onOrphan?: (value: T) => void,
 ): Promise<T> {
   pending.catch(() => {}) // same unhandled-rejection guard as the loop below — see anthropic.ts:481-492's comment
   let nextPingAt = Date.now() + pingIntervalMs
@@ -438,7 +449,12 @@ export async function pingWhilePending<T>(
     const remaining = Math.max(0, nextPingAt - Date.now())
     const outcome = remaining === 0 ? 'ping' : await waitOrPing(pending, remaining)
     if (outcome === 'ping') {
-      await emitPing()
+      try {
+        await emitPing()
+      } catch (e) {
+        if (onOrphan) pending.then(onOrphan).catch(() => {})
+        throw e
+      }
       nextPingAt = Date.now() + pingIntervalMs
       continue
     }
@@ -467,19 +483,24 @@ export function messageStartEvent(msgId: string, modelName: string): SseEvent {
   })
 }
 
+export interface StreamToAnthropicOptions {
+  onUsage?: (u: StreamUsage) => void
+  onLive?: (p: LiveProgress) => void
+  onToolCalls?: (calls: StreamToolCall[]) => void
+  pingIntervalMs?: number
+  /** Set when the caller already sent messageStartEvent() itself (gateway.ts, ADR-347) before
+   *  this generator was even constructed — e.g. right when the client's SSE connection opens,
+   *  ahead of queueing for an engine slot. Emitting it again here would send message_start twice. */
+  skipMessageStart?: boolean
+}
+
 export async function* streamToAnthropic(
   oaiStream: ReadableStream<Uint8Array>,
   modelName: string,
   msgId: string,
-  onUsage?: (u: StreamUsage) => void,
-  onLive?: (p: LiveProgress) => void,
-  onToolCalls?: (calls: StreamToolCall[]) => void,
-  pingIntervalMs: number = DEFAULT_PING_INTERVAL_MS,
-  // Set when the caller already sent messageStartEvent() itself (gateway.ts, ADR-347) before
-  // this generator was even constructed — e.g. right when the client's SSE connection opens,
-  // ahead of queueing for an engine slot. Emitting it again here would send message_start twice.
-  skipMessageStart: boolean = false,
+  opts: StreamToAnthropicOptions = {},
 ): AsyncGenerator<SseEvent> {
+  const { onUsage, onLive, onToolCalls, pingIntervalMs = DEFAULT_PING_INTERVAL_MS, skipMessageStart = false } = opts
   let blockIdx = 0
   let inThinking = false
   let inText = false
