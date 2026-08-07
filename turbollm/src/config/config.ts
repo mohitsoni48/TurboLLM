@@ -436,10 +436,15 @@ export interface Config {
   devModel?: DevModel
   /** Onboarding progress (spec 25 §3, ADR-338). Absent on pre-v1.11 configs;
    *  `normalizeOnboarding` supplies the default, so no migration step is needed. */
+  /** Persisted onboarding progress. Deliberately a loose structural shape rather than an import of
+   *  `OnboardingState` — config.ts is the low-level store and must not depend on a feature module.
+   *  The nulls are real: `profile` and `completedAt` are null until the user picks a profile and
+   *  finishes, and `normalizeOnboarding` (onboarding/state.ts) re-validates whatever is read back,
+   *  so a hand-edited config degrades to the safe default instead of failing a daemon boot. */
   onboarding?: {
     status?: string
-    profile?: string
-    completedAt?: number
+    profile?: string | null
+    completedAt?: number | null
     schemaVersion?: number
   }
 }

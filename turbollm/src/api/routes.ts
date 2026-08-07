@@ -59,6 +59,7 @@ import { readQueue, remove as removeQueued } from '../telemetry/queue'
 import { sendConsentChoice } from '../telemetry/consent'
 import { readSentLog } from '../telemetry/log'
 import { TELEMETRY_SCHEMA_VERSION } from '../telemetry/schema'
+import { registerOnboardingRoutes } from './onboarding-routes'
 
 type Status = 200 | 201 | 202 | 400 | 401 | 403 | 404 | 409 | 500 | 501 | 503
 
@@ -2256,6 +2257,9 @@ export function registerApi(app: Hono, d: Deps): void {
 
     return c.json(buildConnectSnippets(cli, base, apiKey, modelName, modelKey))
   })
+
+  // ---- onboarding (spec 25 §9.2) ----
+  registerOnboardingRoutes(app, { store: d.store })
 }
 
 /** Overlay the live-dynamic flags (loaded, hasProfile) and tiered t/s (lastTps,

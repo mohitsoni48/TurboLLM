@@ -41,8 +41,15 @@ export const BLESSED: readonly BlessedEntry[] = [
 
   // ── role: coder — Developer only. MoE ≤16 GB (experts spill to RAM), dense above. ──
   { id: 'C-LOW-A', role: 'coder', repo: 'unsloth/Qwen3.6-35B-A3B-GGUF', file: 'Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf', bytes: 12_290_628_576, minVramMb: 8 * GB, maxVramMb: 12 * GB, minSystemRamMb: null },
-  { id: 'C-LOW-B', role: 'coder', repo: 'unsloth/Qwen3.6-35B-A3B-GGUF', file: 'Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf', bytes: 16_845_511_648, minVramMb: 12 * GB, maxVramMb: 16 * GB, minSystemRamMb: 32 * GB },
-  { id: 'C-T3', role: 'coder', repo: 'unsloth/Qwen3.6-27B-GGUF', file: 'Qwen3.6-27B-Q4_K_M.gguf', bytes: 16_817_244_384, minVramMb: 16 * GB, maxVramMb: 24 * GB, minSystemRamMb: null },
+  // The 16 GB edge is INCLUSIVE toward the MoE side, hence `16 * GB + 1` against `fits()`'s
+  // half-open [min, max) bands. Spec 25 §5.4 splits the coder family at "≤ 16 GB VRAM → 35B-A3B"
+  // vs "> 16 GB → 27B", and §7 states it outright: "a 16 GB card with 16 GB system RAM must
+  // resolve to C-LOW-A, never C-LOW-B" — which requires a 16 GB card to reach the MoE family in
+  // the first place. With a plain `16 * GB` max, exactly 16 GB fell through to C-T3 and got the
+  // DENSE 27B at 15.66 GiB on a 16 GB card with no RAM guard behind it. This is the one edge the
+  // founder specified explicitly, so it is pinned by a boundary test.
+  { id: 'C-LOW-B', role: 'coder', repo: 'unsloth/Qwen3.6-35B-A3B-GGUF', file: 'Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf', bytes: 16_845_511_648, minVramMb: 12 * GB, maxVramMb: 16 * GB + 1, minSystemRamMb: 32 * GB },
+  { id: 'C-T3', role: 'coder', repo: 'unsloth/Qwen3.6-27B-GGUF', file: 'Qwen3.6-27B-Q4_K_M.gguf', bytes: 16_817_244_384, minVramMb: 16 * GB + 1, maxVramMb: 24 * GB, minSystemRamMb: null },
   { id: 'C-T4', role: 'coder', repo: 'unsloth/Qwen3.6-27B-GGUF', file: 'Qwen3.6-27B-Q5_K_M.gguf', bytes: 19_509_790_944, minVramMb: 24 * GB, maxVramMb: null, minSystemRamMb: null },
 
   // ── T0 — CPU-only / <4 GB. E4B is ~4B EFFECTIVE params, viable when
