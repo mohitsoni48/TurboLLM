@@ -65,9 +65,45 @@ const SUPPORTED: Record<string, CliSpec> = {
 
 interface DaemonStatus {
   engine?: { state?: string; parallelSlots?: number }
-  model?: { name?: string; key?: string } | null
+  model?: { name?: string; key?: string; ctx?: number } | null
   lastLoaded?: { modelKey?: string } | null
 }
+
+// Claude Code CLI's own documented range for CLAUDE_CODE_AUTO_COMPACT_WINDOW (env-vars docs,
+// "Set the auto-compact window"): a plain token count from 100_000 to 1_000_000 — the env var
+// form accepts no smaller/larger value, no `k`/`M` suffix. Below this floor there is no
+// documented way to shrink the window further; see clampAutoCompactWindow's own doc comment.
+const CLAUDE_AUTO_COMPACT_WINDOW_MIN = 100_000
+const CLAUDE_AUTO_COMPACT_WINDOW_MAX = 1_000_000
+
+/** Claude Code auto-compacts once the conversation reaches "the model's context limit" — its
+ *  OWN belief about that limit, not the real engine's. For an unrecognized custom model behind a
+ *  custom ANTHROPIC_BASE_URL, Claude Code has no way to learn the real number (confirmed against
+ *  the CLI's own docs, 2026-08 — no env var declares a custom model's context window; only the
+ *  AUTO_COMPACT_WINDOW/PCT_OVERRIDE pair below tune WHEN it compacts, never WHAT it believes the
+ *  window is) and falls back to a generic assumption (the same 200K a stock Sonnet/Opus session
+ *  without extended context uses). A local model's REAL context is very often far smaller — 8K–
+ *  32K is common on consumer GPUs (see code-session.ts's own compactionSettingsFor comment) — so
+ *  the CLI keeps resending an ever-growing conversation nowhere near ITS assumed 80%-of-200K
+ *  danger zone while llama.cpp's real, much smaller n_ctx quietly overflows underneath it: the
+ *  CLI never sees "getting full", it just gets a hard error once the real engine runs out of
+ *  room. Pinning CLAUDE_CODE_AUTO_COMPACT_WINDOW to the REAL loaded ctx fixes this outright for
+ *  any local setup with ctx >= 100_000 (this repo's own docs describe several: 200K builds are
+ *  common), and meaningfully tightens the over-generous 200K-assumed default for everything down
+ *  to the documented 100_000 floor. Below that floor (an 8K/16K/32K local model) there is no
+ *  further, smaller value the CLI's env var accepts — this is a genuine, confirmed limit of the
+ *  real `claude` binary today, not something TurboLLM can compensate for from outside it. */
+export function clampAutoCompactWindow(ctx: number): number {
+  return Math.min(CLAUDE_AUTO_COMPACT_WINDOW_MAX, Math.max(CLAUDE_AUTO_COMPACT_WINDOW_MIN, Math.round(ctx)))
+}
+
+/** How full CLAUDE_CODE_AUTO_COMPACT_WINDOW is allowed to get before Claude Code compacts
+ *  (CLAUDE_AUTOCOMPACT_PCT_OVERRIDE, 1-100 — can only LOWER the CLI's own default, never raise
+ *  it). 80 matches this codebase's own established auto-compact convention for the exact same
+ *  kind of feature (ADR-132's "/compact auto-fires at 80% of the live context window", the
+ *  in-app pi-based Code session's own compactionSettingsFor) — one consistent number across both
+ *  surfaces rather than an arbitrary different one here. */
+export const CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = '80'
 
 interface ModelEntry {
   key: string
@@ -739,6 +775,15 @@ export async function launchCli(
     // Opt into gateway model discovery: Claude Code queries our /v1/models at startup and
     // populates the /model picker with the local library (gateway synthesises the entries).
     CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: '1',
+    // Founder-reported: the ctx-fill display "jumps between full and empty" and the CLI "never
+    // auto-compacts at 80%, always reaches 100% and fails". The second half is Claude Code
+    // assuming a generic ~200K context window for our unrecognized model id and only compacting
+    // near THAT — see clampAutoCompactWindow's own doc comment for the full root cause and its
+    // documented [100_000, 1_000_000] floor/ceiling. Only set when the daemon actually reports a
+    // real ctx (status.model.ctx) — an absent/zero value means "don't know", and guessing a
+    // window here would be worse than leaving the CLI's own generic default in place.
+    ...(status.model?.ctx ? { CLAUDE_CODE_AUTO_COMPACT_WINDOW: String(clampAutoCompactWindow(status.model.ctx)) } : {}),
+    CLAUDE_AUTOCOMPACT_PCT_OVERRIDE,
     // Cap background-agent fan-out at what the engine can actually run concurrently.
     //
     // Claude Code spawns subagents in parallel, and each is a full, independent request to the

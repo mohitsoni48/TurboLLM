@@ -1135,6 +1135,17 @@ export class ConversationStore {
       if (!this.hasColumn('api_usage', 'harness')) this.db.exec(`ALTER TABLE api_usage ADD COLUMN harness TEXT;`)
       this.db.exec(`PRAGMA user_version = 43;`)
     }
+    // v44 (founder-reported: a terminal-agent session's ctx-fill ring jumped between full and
+    // empty within the same session): getLastApiUsageForSession now picks the row with the
+    // MAX prompt_tokens for the session instead of literally the most-recently-inserted one —
+    // see that method's own doc comment for the full root cause (Task-tool sub-agent requests
+    // share the main turn's code_session_id, and a smaller sub-agent row finishing after the
+    // real turn used to silently win). This index serves that new query pattern the same way
+    // idx_api_usage_code_session (v36) served the old ORDER BY created_at.
+    if (v < 44) {
+      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_api_usage_code_session_tokens ON api_usage(code_session_id, prompt_tokens);`)
+      this.db.exec(`PRAGMA user_version = 44;`)
+    }
   }
 
   listConversations(q?: string, kind: 'chat' | 'agent' | 'all' = 'all'): Conversation[] {
@@ -1521,15 +1532,35 @@ export class ConversationStore {
     } as P)
   }
 
-  /** Most recent completed gateway request attributed to a terminal-agent Code session
-   *  (ADR-284) — powers TerminalToolbar.tsx's composer-parity stats row the same way
-   *  `lastRealStats` already does for a 'turbollm' chat session's last turn. null when the
-   *  session has made no gateway requests yet (fresh session, or a non-terminal-agent one). */
+  /** The session's own largest completed gateway request (ADR-284, revised — founder-reported
+   *  "ctx fill jumps between full and empty in the same session") — powers TerminalToolbar.tsx's
+   *  composer-parity stats row and its Context ring the same way `lastRealStats` already does for
+   *  a 'turbollm' chat session's last turn. null when the session has made no gateway requests yet
+   *  (fresh session, or a non-terminal-agent one).
+   *
+   *  Deliberately the MAX prompt_tokens row, not literally the most-recently-INSERTED one. Every
+   *  request a real `claude` CLI process makes — the main conversation's own turn AND every
+   *  parallel Task-tool sub-agent it spawns — shares the SAME code_session_id: `resolveCodeSession`
+   *  (gateway.ts) derives it purely from the bearer token, and the CLI mints exactly one token
+   *  (ANTHROPIC_AUTH_TOKEN, set once at launch) for its whole process, sub-agents included. A
+   *  sub-agent's own prompt is a small, isolated sub-task — nothing like the full resent
+   *  conversation — so whichever of the two finishes last used to decide what the ring showed:
+   *  the real, large, ever-growing main-turn prompt one poll, a tiny sub-agent prompt the next,
+   *  with no change to the actual conversation in between. The MAX is the honest answer to "how
+   *  full has this session's context gotten" — a real Claude Code CLI resends the whole
+   *  conversation every turn, so its size only grows within one continuous conversation, and a
+   *  sub-agent (always smaller) can never legitimately raise that high-water mark.
+   *
+   *  Trade-off, accepted: after a real `/clear` inside the CLI (invisible to the daemon — a
+   *  terminal-agent session's turns are never persisted here, see ADR-297), this keeps reporting
+   *  the pre-clear high-water mark until the new conversation grows past it. A temporarily-stale-
+   *  high reading after a rare, deliberate user action beats an unpredictable full/empty flicker
+   *  on every ordinary agentic turn with sub-agents. */
   getLastApiUsageForSession(codeSessionId: string): { promptTokens: number; genTokens: number; promptTps: number | null; genTps: number | null } | null {
     const row = this.db.prepare(`
       SELECT prompt_tokens, gen_tokens, duration_ms, prompt_tps, gen_tps FROM api_usage
       WHERE code_session_id = $codeSessionId
-      ORDER BY created_at DESC LIMIT 1
+      ORDER BY prompt_tokens DESC, created_at DESC LIMIT 1
     `).get({ $codeSessionId: codeSessionId } as P) as unknown as { prompt_tokens: number; gen_tokens: number; duration_ms: number | null; prompt_tps: number | null; gen_tps: number | null } | undefined
     if (!row) return null
     // The engine's own per-phase rates when the row has them (ADR-300) — llama.cpp times prefill

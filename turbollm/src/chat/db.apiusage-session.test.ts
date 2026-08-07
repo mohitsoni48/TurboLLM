@@ -104,14 +104,49 @@ test('getLastApiUsageForSession: null tps when no duration was recorded (e.g. An
   }
 })
 
-test('getLastApiUsageForSession: only ever returns the MOST RECENT row for that session', () => {
+test('getLastApiUsageForSession: a later, larger row wins over an earlier, smaller one', () => {
   const root = makeTmpRoot()
   const db = new ConversationStore(root)
   try {
     db.recordApiUsage({ source: 'anthropic', modelKey: 'm1', promptTokens: 100, genTokens: 10, codeSessionId: 'sess-3', durationMs: 1000 })
     db.recordApiUsage({ source: 'anthropic', modelKey: 'm1', promptTokens: 200, genTokens: 20, codeSessionId: 'sess-3', durationMs: 1000 })
     const usage = db.getLastApiUsageForSession('sess-3')
-    assert.equal(usage!.promptTokens, 200, 'must be the second (later) row, not the first')
+    assert.equal(usage!.promptTokens, 200, 'must be the second (later, larger) row, not the first')
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('getLastApiUsageForSession: a smaller row recorded AFTER a larger one does not override it (ctx-fill flicker fix)', () => {
+  const root = makeTmpRoot()
+  const db = new ConversationStore(root)
+  try {
+    // Shaped like a real terminal-agent session: the main conversation's own turn (large,
+    // ever-growing prompt) followed by a parallel Task-tool sub-agent call the CLI spawned for a
+    // small, isolated sub-task — both share the SAME code_session_id (resolveCodeSession keys
+    // purely off the CLI's one ANTHROPIC_AUTH_TOKEN), and the sub-agent's own request happens to
+    // finish and get recorded second. Before this fix, "most recent row wins" made the Context
+    // ring flicker down to the sub-agent's tiny prompt size every time this ordering occurred,
+    // even though the real conversation never shrank.
+    db.recordApiUsage({ source: 'anthropic', modelKey: 'm1', promptTokens: 98259, genTokens: 400, codeSessionId: 'sess-3b', durationMs: 5000 })
+    db.recordApiUsage({ source: 'anthropic', modelKey: 'm1', promptTokens: 1200, genTokens: 30, codeSessionId: 'sess-3b', durationMs: 500 })
+    const usage = db.getLastApiUsageForSession('sess-3b')
+    assert.equal(usage!.promptTokens, 98259, 'the real, larger main-turn prompt must win over the later, smaller sub-agent call')
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('getLastApiUsageForSession: ties on prompt_tokens break toward the more recent row', () => {
+  const root = makeTmpRoot()
+  const db = new ConversationStore(root)
+  try {
+    db.recordApiUsage({ source: 'anthropic', modelKey: 'm1', promptTokens: 500, genTokens: 10, codeSessionId: 'sess-3c', durationMs: 1000, promptTps: 111 })
+    db.recordApiUsage({ source: 'anthropic', modelKey: 'm1', promptTokens: 500, genTokens: 20, codeSessionId: 'sess-3c', durationMs: 1000, promptTps: 222 })
+    const usage = db.getLastApiUsageForSession('sess-3c')
+    assert.equal(usage!.promptTps, 222, 'the more recent of two equal-sized rows must win')
   } finally {
     db.close()
     rmSync(root, { recursive: true, force: true })
