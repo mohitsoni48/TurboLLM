@@ -1844,8 +1844,14 @@ const WDDM_SHARED_PS =
  *  as it did before spill detection existed. A language-independent lookup (counter index via the
  *  Perflib registry tables) was attempted and needs elevation, so it is left as follow-up rather
  *  than guessed at. */
+/** Latches once the counter proves unreadable on this machine, so a box that cannot resolve it
+ *  (localized Windows, PowerShell blocked by policy) does not re-attempt on every probe — a sweep
+ *  reads this twice per candidate, and the answer cannot change within a run. Only the UNSUPPORTED
+ *  verdict is cached; readings never are, since each one must reflect the load just performed. */
+let wddmSharedUnsupported = false
+
 function readWddmSharedMb(): Promise<number | null> {
-  if (process.platform !== 'win32') return Promise.resolve(null)
+  if (process.platform !== 'win32' || wddmSharedUnsupported) return Promise.resolve(null)
   return new Promise((resolve) => {
     try {
       execFile(
@@ -1853,12 +1859,20 @@ function readWddmSharedMb(): Promise<number | null> {
         ['-NoProfile', '-NonInteractive', '-Command', WDDM_SHARED_PS],
         { timeout: 10_000, windowsHide: true },
         (err, stdout) => {
-          if (err || !stdout) return resolve(null)
+          if (err || !stdout) {
+            wddmSharedUnsupported = true
+            return resolve(null)
+          }
           const mb = parseFloat(stdout.trim())
-          resolve(Number.isFinite(mb) && mb >= 0 ? Math.round(mb) : null)
+          if (!Number.isFinite(mb) || mb < 0) {
+            wddmSharedUnsupported = true
+            return resolve(null)
+          }
+          resolve(Math.round(mb))
         },
       )
     } catch {
+      wddmSharedUnsupported = true
       resolve(null)
     }
   })
