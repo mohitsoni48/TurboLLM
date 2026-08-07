@@ -25,6 +25,44 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.10.5] - 2026-08-07
+
+### Fixed
+- **Terminal-agent (`turbollm launch claude`) context meter could flicker between full and
+  empty**, and **auto-compact could fail to fire at all** for a local model. Parallel Task-tool
+  sub-agent calls share the same session as the main conversation turn, and the smaller sub-agent
+  request could momentarily overwrite the Context ring with a much smaller number even though the
+  real conversation hadn't shrunk — the ring now always reflects the session's largest request,
+  not just the most recent one. Separately, the CLI now gets the real loaded model's context
+  window passed explicitly, so it compacts against your actual local context instead of assuming
+  a generic ~200K.
+- **A multi-line first message could silently never reach the `claude` CLI** in a fresh Code
+  session — since the composer's own hint text says "Shift+Enter for newline," a multi-line task
+  description is the normal case, and it was being dropped instead of seeded, leaving the terminal
+  open with no indication anything was wrong. Line breaks are now folded into the seeded command
+  instead of disqualifying the whole message.
+- **Local-model requests could show Claude Code's "Waiting for API response, retrying in `<n>`
+  minutes" banner even though the model was actively working** — during a slow prefill on a large
+  or uncached prompt, and while queued behind another request on a single-slot engine (e.g. a
+  Task-tool sub-agent fan-out). The gateway now sends periodic keep-alive signals the whole time a
+  request is waiting on the engine, so Claude Code's own idle-connection watchdog no longer
+  mistakes real local-model work for a stalled connection.
+- **The Workspace nav item always opened a brand-new chat**, even if you had a specific Code
+  session or Routines panel open — navigating away (e.g. to Usage) and back now returns to exactly
+  where you left off, for the current session.
+- **The Workspace sidebar's collapsed/expanded state reset every time you switched screens** —
+  collapsing it in a Code session and navigating elsewhere would re-expand it. It now stays exactly
+  as you left it for the rest of the session.
+
+### Discord
+- Fixed a couple of real annoyances: the terminal-agent context meter could flicker or fail to
+  auto-compact, a multi-line first message could silently vanish instead of starting your session,
+  and Claude Code could show a false "Waiting for API response" banner while your local model was
+  still genuinely working (including while queued behind another request).
+- The Workspace nav item now remembers exactly where you were — the Code session or Routines panel
+  you had open — instead of always landing on a new chat, and the sidebar's collapsed/expanded
+  state now sticks for the rest of your session.
+
 ## [1.10.4] - 2026-08-06
 
 ### Fixed
