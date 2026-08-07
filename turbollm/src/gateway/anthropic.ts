@@ -392,6 +392,32 @@ export type LiveProgress = { phase: 'prompt' | 'gen'; pct: number; outputTokens:
  *  never reports back, so the request stream is the only place the daemon ever sees them). */
 export type StreamToolCall = { id: string; name: string; input: unknown }
 
+// ── Keep-alive pings during a slow prefill (founder-reported: "Waiting for API response,
+// retrying in <n> minutes") ─────────────────────────────────────────────────────────────────
+// Claude Code's own idle-stream watchdog shows that banner (and eventually retries the whole
+// request) once 20 SECONDS pass with no bytes at all on the response stream — confirmed against
+// the CLI's own docs/issue reports, not assumed. The real Anthropic API avoids this by sending
+// periodic `event: ping` SSE frames during long-running turns; this gateway sent NONE, so any
+// local-model prefill over 20s (common — a large or uncached prompt on consumer hardware
+// routinely takes tens of seconds before the first output token) looked identical to a stalled
+// connection from the CLI's point of view, even though the engine was working the whole time.
+// Comfortably under the 20s threshold so a ping always lands well before the watchdog fires.
+export const DEFAULT_PING_INTERVAL_MS = 10_000
+
+/** Resolves `'data'` once `pending` settles (success OR failure — a rejection is surfaced by the
+ *  caller's own subsequent `await pending`, not swallowed here), or `'ping'` after `ms` if it
+ *  hasn't settled yet. Pure/exported so the keep-alive decision is unit-testable without a real
+ *  slow stream. Never leaks its timer: cleared on whichever path resolves first. */
+export function waitOrPing(pending: Promise<unknown>, ms: number): Promise<'data' | 'ping'> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve('ping'), ms)
+    pending.then(
+      () => { clearTimeout(timer); resolve('data') },
+      () => { clearTimeout(timer); resolve('data') },
+    )
+  })
+}
+
 export async function* streamToAnthropic(
   oaiStream: ReadableStream<Uint8Array>,
   modelName: string,
@@ -399,6 +425,7 @@ export async function* streamToAnthropic(
   onUsage?: (u: StreamUsage) => void,
   onLive?: (p: LiveProgress) => void,
   onToolCalls?: (calls: StreamToolCall[]) => void,
+  pingIntervalMs: number = DEFAULT_PING_INTERVAL_MS,
 ): AsyncGenerator<SseEvent> {
   let blockIdx = 0
   let inThinking = false
@@ -436,7 +463,11 @@ export async function* streamToAnthropic(
 
   try {
     outer: while (true) {
-      const { done, value } = await reader.read()
+      const readPromise = reader.read()
+      while ((await waitOrPing(readPromise, pingIntervalMs)) === 'ping') {
+        yield sse('ping', {})
+      }
+      const { done, value } = await readPromise
       if (done) break
       buf += dec.decode(value, { stream: true })
       const lines = buf.split('\n')

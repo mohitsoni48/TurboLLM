@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { clampMaxTokens } from '../config/config'
-import { mapToOpenAI, streamToAnthropic, type LiveProgress } from './anthropic'
+import { mapToOpenAI, streamToAnthropic, waitOrPing, type LiveProgress } from './anthropic'
 
 // ── clampMaxTokens ──────────────────────────────────────────────────────────
 
@@ -626,4 +626,75 @@ test('streamToAnthropic emits cache_read_input_tokens: 0 when no timings field',
   assert.equal(parsed.usage.output_tokens, 30)
   assert.equal(parsed.usage.input_tokens, 80)
   assert.equal(parsed.usage.cache_read_input_tokens, 0)
+})
+
+// ── keep-alive pings during a slow prefill (founder-reported: Claude Code shows "Waiting for
+// API response, retrying in <n> minutes" while the model is still in prefill) ───────────────
+//
+// Claude Code's own idle-stream watchdog fires once 20s pass with no bytes at all on the
+// response stream. This gateway sent nothing until the engine's first real chunk, so any
+// local-model prefill over 20s (routine on a large/uncached prompt on consumer hardware) looked
+// identical to a stalled connection — even though the engine was working the whole time.
+
+test('waitOrPing: resolves "data" once the pending promise settles well within the window', async () => {
+  const pending = Promise.resolve('ok')
+  assert.equal(await waitOrPing(pending, 50), 'data')
+})
+
+test('waitOrPing: resolves "ping" when the pending promise has not settled by the deadline', async () => {
+  const pending = new Promise((resolve) => setTimeout(() => resolve('ok'), 200))
+  assert.equal(await waitOrPing(pending, 10), 'ping')
+})
+
+test('waitOrPing: a pending promise that eventually REJECTS still resolves "data", not a throw', async () => {
+  const pending = Promise.reject(new Error('engine crashed'))
+  // Prevent Node's own unhandled-rejection reporting for this deliberately-rejected promise —
+  // waitOrPing attaches its own handler, but the original `pending` reference is also awaited
+  // by real callers afterward (streamToAnthropic re-awaits it to surface the real error).
+  pending.catch(() => { /* the real caller's job, not this assertion's */ })
+  assert.equal(await waitOrPing(pending, 50), 'data')
+})
+
+test('streamToAnthropic emits ping frames while the upstream stalls, before any real data arrives', async () => {
+  const enc = new TextEncoder()
+  const upstream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      // Simulates a slow local-model prefill: nothing at all for a stretch longer than several
+      // ping intervals, then the real turn arrives.
+      setTimeout(() => {
+        controller.enqueue(enc.encode('data: {"choices":[{"delta":{"content":"Hi"}}]}\n'))
+        controller.enqueue(enc.encode('data: {"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2}}\n'))
+        controller.enqueue(enc.encode('data: [DONE]\n'))
+        controller.close()
+      }, 65)
+    },
+  })
+
+  const events: { event: string; data: string }[] = []
+  // A short interval (20ms) so the test stays fast while still observing several pings during
+  // the simulated 65ms stall.
+  for await (const evt of streamToAnthropic(upstream, 'test-model', 'msg_ping', undefined, undefined, undefined, 20)) {
+    events.push(evt)
+  }
+
+  const pings = events.filter((e) => e.event === 'ping')
+  assert.ok(pings.length >= 2, `expected several ping frames during the stall, got ${pings.length}`)
+  for (const p of pings) assert.deepEqual(JSON.parse(p.data), { type: 'ping' })
+  // The real turn still streamed through normally after the stall ended.
+  const blob = events.map((e) => e.data).join('\n')
+  assert.ok(blob.includes('Hi'))
+  assert.equal(events.at(-1)?.event, 'message_stop')
+})
+
+test('streamToAnthropic emits NO ping frames on an ordinary fast turn', async () => {
+  const upstream = sseStream([
+    'data: {"choices":[{"delta":{"content":"Hello"}}]}',
+    'data: {"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2}}',
+    'data: [DONE]',
+  ])
+  const events: { event: string; data: string }[] = []
+  for await (const evt of streamToAnthropic(upstream, 'test-model', 'msg_fast', undefined, undefined, undefined, 10_000)) {
+    events.push(evt)
+  }
+  assert.equal(events.filter((e) => e.event === 'ping').length, 0)
 })
