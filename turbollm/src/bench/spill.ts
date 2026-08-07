@@ -38,13 +38,19 @@ export interface ResidencySample {
   vramMb: number | null
 }
 
-/** Shortfall below which a candidate is NOT called spilling. Measurement noise across
- *  repeated probes of the same config ran ~1-6 MiB, while the smallest real spill step
- *  observed was 185.7 MiB, so this sits an order of magnitude above the noise and well
- *  below any true spill. Deliberately absolute rather than a fraction of the slope:
- *  a fraction would scale with expert size and could exceed a real spill on models
- *  with very large per-step costs. */
-export const SPILL_TOLERANCE_MB = 64
+/** Shortfall below which a candidate is NOT called spilling (founder call, 2026-08-07).
+ *
+ *  A small amount of host-backed memory is normal, not a spill: the OS reported a constant
+ *  285.3 MiB of "shared" GPU memory on this adapter even for configs with gigabytes of VRAM
+ *  free, i.e. driver/staging overhead rather than model weights displaced to system RAM.
+ *  512 clears that baseline with margin.
+ *
+ *  This is deliberately ONE HALF of the rule. On its own a 512 MiB allowance would wave through
+ *  configs that are technically-not-spilling but have no room left for the deep-prefill compute
+ *  buffer (measured: nCpuMoe=12 spills nothing, has 566 MiB free, and still crashes at depth).
+ *  The other half — requiring free VRAM above headroom + this allowance — lives in
+ *  `probeVerdict` (bench.ts). Neither check is sufficient alone. */
+export const SPILL_TOLERANCE_MB = 512
 
 /** MiB of GPU residency gained per ONE-unit DECREASE of the knob (for nCpuMoe: moving
  *  one more expert onto the GPU; for ngl the caller passes the negated knob so the

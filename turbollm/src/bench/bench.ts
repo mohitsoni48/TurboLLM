@@ -665,16 +665,29 @@ export class BenchRunner {
     //
     // Costs two extra load-only probes (~20s each). That is cheap against the 10-minute per-test
     // timeout a single mis-selected spilling candidate burns.
-    // Anchor SPACING matters as much as anchor placement. Slope error is (reading noise / gap),
-    // and that error is then multiplied by the extrapolation distance — predicting from maxN down
-    // to the middle of the range can be 25+ steps. With a 2-step gap and the ~6 MiB of per-reading
-    // noise observed live, the slope carries ~4.2 MiB of error, which compounds to ~118 MiB over 28
-    // steps — ABOVE SPILL_TOLERANCE_MB, i.e. enough to invent a spill that isn't there and shove the
-    // search toward maximum CPU offload. A proportional gap divides that error by the gap and keeps
-    // the compounded error well inside the tolerance, while staying in the high-CPU-offload region
-    // where residency is low and spill is least likely.
-    const anchorGap = Math.max(2, Math.round(maxN / 4))
-    const anchorPoints = maxN - anchorGap >= 0 ? [maxN, maxN - anchorGap] : [maxN]
+    // Anchor PLACEMENT and SPACING both matter.
+    //
+    // SPACING: slope error is (reading noise / gap) and is then multiplied by the extrapolation
+    // distance, which can be 20+ steps. A proportional gap divides that error by the gap.
+    //
+    // PLACEMENT: never anchor on nCpuMoe = maxN. That is the degenerate endpoint — EVERY expert on
+    // CPU — and it does not sit on the same line as the rest of the range. Measured live 2026-08-07
+    // on Qwen3.6-35B-A3B (maxN=40): the 40→30 segment reads 269.6 MB/expert while 30→25, 25→22 and
+    // 22→20 all read exactly 262.0. Anchoring across that endpoint inflated the slope by 2.9%,
+    // which compounded over 20 steps into a 76 MB shortfall at nCpuMoe=20 — a FALSE spill verdict on
+    // a config with 2.5 GB of VRAM free, which drove the search rightward into 21-40 and produced a
+    // badly over-conservative answer. `denseSearch` already skips ngl=0 for exactly this reason;
+    // maxN is the MoE analogue of that degenerate endpoint and needs the same guard.
+    //
+    // So both anchors are INTERIOR points in the low-residency (high CPU offload) region: far enough
+    // from maxN to be on the linear trend, far enough from 0 to be nowhere near saturation.
+    const anchorGap = Math.max(2, Math.round(maxN / 5))
+    const anchorHi = maxN - anchorGap
+    const anchorLo = maxN - 2 * anchorGap
+    // Both must be real interior points; otherwise skip calibration and fail open (spill detection
+    // sits out, search behaves exactly as before). Small models that can't satisfy this generally
+    // fit comfortably anyway.
+    const anchorPoints = anchorLo >= 1 && anchorHi < maxN ? [anchorHi, anchorLo] : []
     const anchors: ResidencySample[] = []
     for (const n of anchorPoints) {
       if (this.cancelled || Date.now() > this.deadline) break
@@ -772,12 +785,13 @@ export class BenchRunner {
       let current = found
       while (current.cand.params.nCpuMoe > 0 && !this.cancelled && Date.now() <= this.deadline) {
         const spillN = current.cand.params.nCpuMoe - 1
-        const prev = { tps: current.cand.tps as number, prefillTps: current.cand.prefillTps }
-        const prevLabel = `${prev.tps.toFixed(1)} tok/s (prefill ${prev.prefillTps !== null ? prev.prefillTps.toFixed(1) : 'n/a'} tok/s)`
+        const prev = { ttftMs: current.cand.ttftMs, tps: current.cand.tps }
+        const prevTtf = ttfMs(prev)
+        const prevLabel = prevTtf !== null ? `${(prevTtf / 1000).toFixed(1)}s to ${TTF_OUTPUT_TOKENS} tokens` : 'an unmeasurable result'
         this.emit(`nCpuMoe=${current.cand.params.nCpuMoe} measured ${prevLabel} — trying VRAM-spill nCpuMoe=${spillN}`)
         const spillFound = await this.benchAt(entry, sys, { ...base, nCpuMoe: spillN }, caps, results, `nCpuMoe=${spillN} (VRAM-spill hill-climb)`)
         if (!spillImproves(prev, spillFound?.cand ?? null)) {
-          this.emit(`nCpuMoe=${spillN} spill did not improve on ${prevLabel} (generation or prefill speed decreased) — stopping climb, keeping nCpuMoe=${current.cand.params.nCpuMoe}`)
+          this.emit(`nCpuMoe=${spillN} did not beat ${prevLabel} — stopping climb, keeping nCpuMoe=${current.cand.params.nCpuMoe}`)
           break
         }
         current = spillFound as { cand: BenchCandidate; profile: LoadProfile }
@@ -1631,7 +1645,19 @@ export function probeVerdict(
   if (isSpilling(predictedMb, probe.vramAbsMb)) {
     return { decision: 'offload-more', reason: 'spill', shortfallMb: (predictedMb as number) - (probe.vramAbsMb as number) }
   }
-  if (overHeadroom(probe.vramAbsMb, budgetMb, headroomMb)) return { decision: 'offload-more', reason: 'headroom' }
+  // Free VRAM below the user's configured headroom → too tight, offload more.
+  //
+  // NOTE (founder correction, 2026-08-07): headroom + SPILL_TOLERANCE_MB is a rejection ceiling,
+  // NOT an acceptance floor. Free VRAM ABOVE that bar does not mean "good", it means "there is
+  // still room to move more experts onto the GPU" — which the binary search already acts on by
+  // accepting and searching leftward. An earlier revision required free > headroom + allowance to
+  // accept, which inverted the rule: it rejected every config INSIDE the ideal window and settled
+  // on one above it (measured: it chose nCpuMoe=14 at 953 MiB free while rejecting 13 at 695 and
+  // 12 at 497, both of which are in-window AND measurably faster — 25.8 s and 26.7 s versus 31.9 s
+  // on time-to-answer). The ideal config has free VRAM BETWEEN headroom and headroom+allowance.
+  if (overHeadroom(probe.vramAbsMb, budgetMb, headroomMb)) {
+    return { decision: 'offload-more', reason: 'headroom' }
+  }
   if (probe.outcome === 'ok') return { decision: 'fits' }
   return { decision: 'offload-more', reason: 'failed' } // crash / timeout → treat as memory pressure
 }
@@ -1695,25 +1721,38 @@ export function betterBySpeed(
   return at < bt
 }
 
-/** MoE VRAM-spill hill-climb decision (founder-directed, 2026-07-17; extended same day, after live
- *  testing, to also guard prefill speed): should auto-tune keep moving another MoE expert onto the
- *  GPU past the safe-headroom point? Stops (keeping the previous, better step) the instant EITHER
- *  generation t/s OR prefill t/s decreases — a spill that trades away prompt-processing speed for
- *  a small generation gain (or vice versa) isn't a real win. A failed candidate (null, or any
- *  non-'ok' outcome) is never treated as an improvement. A candidate with no prefill reading is
- *  treated the same as a decrease (fail-safe: this feature already trades away a real safety
- *  margin for speed, so an unverifiable metric should never wave a spill step through) — but a
- *  missing reading on the PREVIOUS step (nothing to compare against) just skips the prefill check
- *  rather than blocking on it. No tie band here (unlike `betterBySpeed`): this is a
- *  one-directional search for "still climbing", not a final-winner comparison. */
+/** MoE VRAM-spill hill-climb decision (founder-directed, 2026-07-17): should auto-tune keep moving
+ *  another MoE expert onto the GPU past the safe-headroom point? Runs ONLY under the explicit
+ *  VRAM_HEADROOM_SPILL_MB opt-in, and it is the sanctioned way to explore past the
+ *  SPILL_TOLERANCE_MB allowance — the default search stops at the allowance precisely so this
+ *  aggressive path stays opt-in (founder call, 2026-08-07).
+ *
+ *  Judged on {@link ttfMs} (founder call, 2026-08-07), the same objective as `betterBySpeed`,
+ *  replacing the old "neither generation NOR prefill may decrease" pair of tests. Those two axes
+ *  move in OPPOSITE directions here — pushing experts onto the GPU raises generation while spill
+ *  drags prefill down — so requiring both to hold up rejected steps that were genuinely faster
+ *  overall. One combined number resolves that correctly.
+ *
+ *  Why this needs to keep measuring rather than trusting a threshold: measured on a 16 GB card at
+ *  200k ctx, time-to-answer improves smoothly from nCpuMoe=14 (31.9 s) down through 10 (24.9 s) to
+ *  5 (19.8 s) — and then falls off a CLIFF to 431 s at nCpuMoe=3, where prefill collapses from
+ *  2400 to 80 tok/s. There is no load-time signal that predicts where that cliff sits; only a
+ *  measured step does.
+ *
+ *  No tie band (unlike `betterBySpeed`): this is a one-directional "still climbing?" test, not a
+ *  final-winner comparison, so an equal step stops the climb and keeps the safer config. */
 export function spillImproves(
-  previous: { tps: number; prefillTps: number | null },
-  candidate: { outcome: BenchCandidate['outcome']; tps: number | null; prefillTps: number | null } | null,
+  previous: { ttftMs: number | null; tps: number | null },
+  candidate: { outcome: BenchCandidate['outcome']; ttftMs: number | null; tps: number | null } | null,
 ): boolean {
-  if (!candidate || candidate.outcome !== 'ok' || candidate.tps === null) return false
-  if (candidate.tps < previous.tps) return false
-  if (previous.prefillTps !== null && (candidate.prefillTps === null || candidate.prefillTps < previous.prefillTps)) return false
-  return true
+  if (!candidate || candidate.outcome !== 'ok') return false
+  const next = ttfMs(candidate)
+  const prev = ttfMs(previous)
+  // Fail-safe on an unmeasurable step, in EITHER direction: this feature deliberately trades away
+  // the user's configured safety margin for speed, so a step that cannot be shown to be faster must
+  // never be waved through. A failed candidate (oom/crash/timeout) is likewise never an improvement.
+  if (next === null || prev === null) return false
+  return next < prev
 }
 
 /** Bytes per cached element for a KV-cache type (defaults to f16's 2 for unknown types). Note:

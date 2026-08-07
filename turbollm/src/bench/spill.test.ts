@@ -141,39 +141,89 @@ function worstCaseShortfall(gap: number, distance: number): number {
   return spillMb(predicted, actualTrue)
 }
 
-test('calibration: a 2-step anchor gap fabricates spill over a long extrapolation (the defect)', () => {
-  // 28 steps out, a 2-step gap compounds noise past the tolerance — a false positive.
-  assert.ok(worstCaseShortfall(2, 28) > SPILL_TOLERANCE_MB,
-    `expected the narrow gap to exceed tolerance, got ${worstCaseShortfall(2, 28).toFixed(1)} MiB`)
+test('calibration: a wider anchor gap yields a materially more accurate slope', () => {
+  // The reason the shipped code uses a proportional gap. Slope error is (noise / gap), so a
+  // 10-step gap is ~5x more precise than a 2-step one. With the 512 MiB allowance neither error
+  // crosses the spill threshold on this model any more, but accuracy still matters: a model with
+  // much larger per-step cost would scale these errors up proportionally.
+  const narrow = worstCaseShortfall(2, 28)
+  const wide = worstCaseShortfall(10, 28)
+  assert.ok(wide < narrow / 3, `wide gap should be far more accurate: narrow=${narrow.toFixed(1)} wide=${wide.toFixed(1)}`)
 })
 
-test('calibration: the shipped proportional gap keeps noise well inside the tolerance', () => {
-  // maxN=40 -> gap = round(40/4) = 10. Same 28-step extrapolation, no false spill.
-  const shortfall = worstCaseShortfall(10, 28)
-  assert.ok(shortfall < SPILL_TOLERANCE_MB,
-    `noise alone must not read as spill, got ${shortfall.toFixed(1)} MiB`)
+test('calibration: noise alone never reads as spill at the shipped allowance', () => {
+  assert.ok(worstCaseShortfall(10, 28) < SPILL_TOLERANCE_MB)
+  // Even the old narrow gap is now inside the allowance — the 512 MiB threshold subsumes this
+  // class of error entirely. Recorded so nobody re-derives the narrow-gap panic later.
+  assert.ok(worstCaseShortfall(2, 28) < SPILL_TOLERANCE_MB)
 })
 
-test('calibration: a real spill is still caught with the wider gap (no loss of sensitivity)', () => {
-  // The smallest real spill measured was 185.7 MiB. It must still clear the tolerance even
-  // stacked against worst-case calibration noise working to hide it.
+test('calibration: a real spill is still caught, with noise working to hide it', () => {
+  // 698 MiB — the spill measured at nCpuMoe=9 — must clear the allowance even when the slope is
+  // under-estimated by worst-case noise (which shrinks the predicted residency and hides spill).
   const hiAnchor = { knob: 40, vramMb: BASE + NOISE }
-  const loAnchor = { knob: 30, vramMb: BASE + TRUE_SLOPE * 10 - NOISE } // under-estimates slope
+  const loAnchor = { knob: 30, vramMb: BASE + TRUE_SLOPE * 10 - NOISE }
   const slope = residencySlope([hiAnchor, loAnchor])!
   const predicted = predictResidencyMb(hiAnchor, slope, 12)
-  const actualSpilling = BASE + TRUE_SLOPE * 28 - 185.7
-  assert.ok(spillMb(predicted, actualSpilling) > SPILL_TOLERANCE_MB, 'a real 185.7 MiB spill must still be detected')
+  const actualSpilling = BASE + TRUE_SLOPE * 28 - 698
+  assert.ok(spillMb(predicted, actualSpilling) > SPILL_TOLERANCE_MB, 'a real 698 MiB spill must still be detected')
+})
+
+// ---- degenerate-endpoint hazard (found by LIVE testing, 2026-08-07) ----------
+//
+// Measured on the founder's box during the first live run of spill detection, same
+// model/ctx/engine as above. The endpoint nCpuMoe=40 (EVERY expert on CPU) does not lie
+// on the same line as the rest of the range: the 40->30 segment reads 269.6 MB/expert
+// while 30->25, 25->22 and 22->20 all read exactly 262.0. Calibrating across that endpoint
+// inflated the slope by 2.9%, which compounded over 20 steps into a false spill verdict on
+// nCpuMoe=20 -- a config with 2.5 GB of VRAM free -- and drove the search into 21-40.
+//
+// The unit tests could not have caught this: they were built from a single run's data that
+// never probed the endpoint. Only driving the real search surfaced it.
+const LIVE = { 40: 8462, 30: 11158, 25: 12468, 22: 13254, 21: 13514, 20: 13778 } as const
+
+test('live data: interior segments agree on 262.0 MB/expert; only the endpoint segment disagrees', () => {
+  // Residency RISES as nCpuMoe falls, so the gain per expert is (lower-knob reading - higher-knob).
+  assert.ok(Math.abs((LIVE[25] - LIVE[30]) / 5 - 262.0) < 0.5, '30->25')
+  assert.ok(Math.abs((LIVE[22] - LIVE[25]) / 3 - 262.0) < 0.5, '25->22')
+  assert.ok(Math.abs((LIVE[20] - LIVE[22]) / 2 - 262.0) < 0.5, '22->20')
+  // The outlier — this is the one the old anchor placement calibrated on.
+  assert.ok(Math.abs((LIVE[30] - LIVE[40]) / 10 - 269.6) < 0.5, '40->30 is the outlier')
+})
+
+test('REGRESSION: anchoring on the degenerate endpoint corrupts the slope', () => {
+  // Exactly what shipped and failed live: anchors [40, 30]. The endpoint is off the line, so the
+  // slope comes out 269.6 instead of the true 262.0 and every downstream prediction runs high.
+  const slope = residencySlope([{ knob: 40, vramMb: LIVE[40] }, { knob: 30, vramMb: LIVE[30] }])!
+  assert.ok(Math.abs(slope - 269.6) < 0.5, `corrupted slope, got ${slope}`)
+  const predicted = predictResidencyMb({ knob: 40, vramMb: LIVE[40] }, slope, 20)
+  // 76 MiB of phantom shortfall on a config with ~2.5 GB free. Under the 512 MiB allowance this
+  // no longer flips the verdict, but at the 64 MiB tolerance originally shipped it DID — which is
+  // how the live run was driven into the wrong half of the range.
+  const phantom = spillMb(predicted, LIVE[20])
+  assert.ok(phantom > 64 && phantom < 100, `expected ~76 MiB of phantom shortfall, got ${phantom.toFixed(1)}`)
+})
+
+test('interior anchors recover the true slope and predict the config exactly', () => {
+  // The shipped fix: both anchors interior, away from maxN.
+  const slope = residencySlope([{ knob: 30, vramMb: LIVE[30] }, { knob: 25, vramMb: LIVE[25] }])!
+  assert.ok(Math.abs(slope - 262.0) < 0.5, `expected 262.0, got ${slope}`)
+  const predicted = predictResidencyMb({ knob: 30, vramMb: LIVE[30] }, slope, 20)
+  assert.equal(isSpilling(predicted, LIVE[20]), false, 'healthy config must not be flagged')
+  assert.ok(Math.abs(predicted - LIVE[20]) < 5, `prediction should land on the measurement, got ${predicted}`)
 })
 
 // ---- isSpilling: the decision the search actually makes ----------------------
 
-test('isSpilling: separates every measured config correctly at the shipped tolerance', () => {
+test('isSpilling: flags configs whose spill exceeds the 512 MiB allowance', () => {
   const slope = residencySlope([at(20), at(18), at(16), at(14)])!
   const verdict = (knob: number) => isSpilling(predictResidencyMb(at(20), slope, knob), at(knob).vramMb)
-  // Unsaturated — must NOT be flagged, or the search needlessly gives up GPU residency.
-  for (const knob of [18, 16, 14, 12]) assert.equal(verdict(knob), false, `nCpuMoe=${knob} flagged as spilling`)
-  // Spilling — must be flagged, including nCpuMoe=11 whose absolute VRAM looks like a fit.
-  for (const knob of [11, 10, 9, 3, 0]) assert.equal(verdict(knob), true, `nCpuMoe=${knob} missed`)
+  // Not spilling at all, or only within the allowance — isSpilling must stay quiet. Note 11 and 10
+  // DO spill (185.7 / 441.2 MiB) but under the allowance; they are rejected by the free-VRAM term
+  // in probeVerdict instead. This function is deliberately only half the rule.
+  for (const knob of [18, 16, 14, 12, 11, 10]) assert.equal(verdict(knob), false, `nCpuMoe=${knob} flagged`)
+  // Unambiguous spill, far past the allowance.
+  for (const knob of [9, 3, 0]) assert.equal(verdict(knob), true, `nCpuMoe=${knob} missed`)
 })
 
 test('isSpilling: unknown VRAM never claims a spill (matches overHeadroom fail-open contract)', () => {

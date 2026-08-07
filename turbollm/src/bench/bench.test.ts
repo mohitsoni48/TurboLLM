@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { pickKvQuants, betterBySpeed, ttfMs, TTF_OUTPUT_TOKENS, probeVerdict, spillImproves, kvSpeedAdvisory, parseRocmVramUsed, benchPromptTokens, buildBenchMessages } from './bench'
+import { pickKvQuants, betterBySpeed, ttfMs, TTF_OUTPUT_TOKENS, probeVerdict, overHeadroom, spillImproves, kvSpeedAdvisory, parseRocmVramUsed, benchPromptTokens, buildBenchMessages } from './bench'
 import { residencySlope, predictResidencyMb } from './spill'
 
 // ---- pickKvQuants: quality-preserving KV sweep, base-first ------------------
@@ -114,9 +114,11 @@ test('betterBySpeed: an exact tie keeps the incumbent rather than churning the w
 // Qwen3.6-35B-A3B IQ3_XXS @ ctx 200704, 2026-08-07. Values for 4 and 1 come from the
 // daemon's own bench probes (nvidia-smi); the rest from per-adapter perf counters.
 const VRAM_AT: Record<number, number> = {
-  20: 13640.9, 18: 14164.9, 16: 14688.9, 14: 15212.9, 12: 15736.9,
+  20: 13640.9, 18: 14164.9, 16: 14688.9, 14: 15212.9, 13: 15474.9, 12: 15736.9,
   11: 15813.2, 10: 15819.7, 9: 15826.2, 4: 15790.0, 3: 15823.2, 1: 15782.0, 0: 15828.6,
 }
+// nCpuMoe=13 was never probed directly; it sits exactly on the measured 262.0 MiB/expert line
+// between 14 and 12, both of which WERE measured. Marked so nobody mistakes it for a reading.
 const BUDGET_MB = 16303
 const HEADROOM_MB = 375 // the founder's configured value
 
@@ -138,26 +140,71 @@ function runSearch(maxN: number, withSpill: boolean): number | null {
   return bestN
 }
 
-test('search converges on the no-spill boundary (nCpuMoe=12), not the spilling floor', () => {
-  assert.equal(runSearch(40, true), 12)
+test('search drives to the lowest in-window config (nCpuMoe=10), not the first one it finds', () => {
+  // headroom + allowance is a REJECTION CEILING, not an acceptance floor (founder correction):
+  // free VRAM above it means there is still room to move experts onto the GPU, so the search must
+  // keep going left. The ideal config has free VRAM BETWEEN headroom (375) and headroom+512 (887).
+  // Here that bottoms out at nCpuMoe=10: 483 MiB free (in window) and 441 MiB spill (under the
+  // 512 allowance). nCpuMoe=9 is rejected — 696.7 MiB of spill clears the allowance.
+  assert.equal(runSearch(40, true), 10)
 })
 
-test('REGRESSION: without the spill input the same search walks to nCpuMoe=0 — the reported bug', () => {
-  // Every probe from 9 downward reads BELOW the 15928 MiB fit line (16303 - 375), so the
-  // fit check alone calls each one a clean fit and the search keeps taking GPU residency it
-  // never actually gets. nCpuMoe=0 then times out for real. This is precisely what the
-  // founder observed, and it is why fit alone is insufficient.
-  assert.equal(runSearch(40, false), 0)
+test('KNOWN GAP: the lowest in-window config is NOT the fastest — measured, not theorised', () => {
+  // Time-to-answer is unimodal in offload, so the fit/spill boundary is not the speed peak.
+  // Measured at equal prompt depth on the founder's box: nCpuMoe=13 -> 25.8s, 12 -> 26.7s,
+  // 14 -> 31.9s. Performance DEGRADES below 13, yet the window rule alone bottoms out at 10.
+  // Bounding the region is therefore necessary but not sufficient; picking the winner inside it
+  // needs real measurement (this is what ADR-072's deleted confirmPeak() did). Recorded here so
+  // the gap is not mistaken for correct behaviour.
+  const TTF_AT: Record<number, number> = { 14: 31.9, 13: 25.8, 12: 26.7 }
+  const fastest = Object.entries(TTF_AT).sort((a, b) => a[1] - b[1])[0][0]
+  assert.equal(fastest, '13', 'the measured optimum')
+  assert.notEqual(runSearch(40, true), 13, 'the window rule alone does not land on it')
 })
 
-test('probeVerdict: spill is checked BEFORE fit, because a spilling config passes the fit check', () => {
-  // nCpuMoe=11: 15813.2 MiB is under the 15928 fit line, yet 186 MiB is in host memory.
+test('REGRESSION: the original bug — plain fit check alone walks to nCpuMoe=0', () => {
+  // Reproduces the pre-fix logic exactly: raw overHeadroom at the user's bare 375 MiB headroom,
+  // with no spill input and no compute-buffer margin. Every probe from 9 down reads below the
+  // 15928 MiB line, so each looks like a clean fit and the search takes residency it never gets.
+  let lo = 0, hi = 40, bestN: number | null = null
+  while (lo <= hi) {
+    const mid = Math.floor((lo + hi) / 2)
+    const v = VRAM_AT[mid]
+    if (v === undefined) throw new Error(`test gap: no measurement for nCpuMoe=${mid}`)
+    if (!overHeadroom(v, BUDGET_MB, HEADROOM_MB)) { bestN = mid; hi = mid - 1 } else { lo = mid + 1 }
+  }
+  assert.equal(bestN, 0, 'the reported bug')
+})
+
+test('the spill input is what halts the search — the headroom check alone does not', () => {
+  // Without spill, every probe from 9 downward still reads under the 15928 MiB headroom line, so
+  // the search runs all the way to nCpuMoe=0: the originally reported bug. Spill is the guard that
+  // stops it at the allowance.
+  assert.equal(runSearch(40, false), 0, 'headroom alone → the original bug')
+  assert.equal(runSearch(40, true), 10, 'with spill → stops at the allowance')
+})
+
+test('probeVerdict: spill is checked BEFORE the fit test, so the reason reported is the real one', () => {
+  // nCpuMoe=9 spills 696.7 MiB (over the 512 allowance) AND is over the fit line. Both would
+  // reject it; ordering decides which reason the user sees, and "spilling" is the true cause.
+  const predicted = predictResidencyMb({ knob: 20, vramMb: VRAM_AT[20] }, 262.0, 9)
+  const v = probeVerdict({ outcome: 'ok', vramAbsMb: VRAM_AT[9] }, predicted, BUDGET_MB, HEADROOM_MB)
+  assert.equal(v.decision === 'offload-more' && v.reason, 'spill')
+})
+
+test('probeVerdict: a config spilling UNDER the allowance is ACCEPTED when free VRAM clears headroom', () => {
+  // nCpuMoe=11 spills 185.7 MiB — under the 512 allowance — and leaves 490 MiB free, which clears
+  // the 375 MiB headroom. That is squarely inside the ideal window, so it is a legitimate candidate.
+  // An earlier revision rejected exactly this case by treating headroom+allowance as a floor.
   const predicted = predictResidencyMb({ knob: 20, vramMb: VRAM_AT[20] }, 262.0, 11)
-  const withSpillInput = probeVerdict({ outcome: 'ok', vramAbsMb: VRAM_AT[11] }, predicted, BUDGET_MB, HEADROOM_MB)
-  assert.equal(withSpillInput.decision, 'offload-more')
-  assert.equal(withSpillInput.decision === 'offload-more' && withSpillInput.reason, 'spill')
-  // Same probe, no spill input → the old (wrong) answer.
-  assert.equal(probeVerdict({ outcome: 'ok', vramAbsMb: VRAM_AT[11] }, null, BUDGET_MB, HEADROOM_MB).decision, 'fits')
+  const v = probeVerdict({ outcome: 'ok', vramAbsMb: VRAM_AT[11] }, predicted, BUDGET_MB, HEADROOM_MB)
+  assert.equal(v.decision, 'fits')
+})
+
+test('probeVerdict: free VRAM below the configured headroom is rejected', () => {
+  // 16000 MiB used on a 16303 MiB card leaves 303 MiB — under the 375 MiB headroom, so too tight.
+  const v = probeVerdict({ outcome: 'ok', vramAbsMb: 16000 }, 16000, BUDGET_MB, HEADROOM_MB)
+  assert.equal(v.decision === 'offload-more' && v.reason, 'headroom')
 })
 
 test('dense direction: negating the knob makes HIGHER ngl predict MORE residency', () => {
@@ -201,41 +248,58 @@ test('probeVerdict: unreadable VRAM on a Mac/Intel box behaves exactly as before
 // ---- spillImproves: MoE VRAM-spill hill-climb decision (founder-directed, 2026-07-17; extended
 // same day to also guard prefill speed) ----------------------------------------------------------
 
-test('spillImproves: both generation and prefill hold up (no decrease) — keeps climbing', () => {
-  assert.equal(spillImproves({ tps: 20, prefillTps: 900 }, { outcome: 'ok', tps: 22, prefillTps: 950 }), true)
-  // Equal counts as "not decreased", not just a strict increase.
-  assert.equal(spillImproves({ tps: 20, prefillTps: 900 }, { outcome: 'ok', tps: 20, prefillTps: 900 }), true)
+// Founder call 2026-08-07: the default search stops at SPILL_TOLERANCE_MB, and this opt-in
+// hill-climb (VRAM_HEADROOM_SPILL_MB) is the sanctioned way to explore past it — so it must use the
+// same time-to-answer objective as the rest of the search. It previously required that NEITHER
+// generation NOR prefill decrease, which is wrong here: those axes move in OPPOSITE directions when
+// spilling, so that rule rejected steps that were genuinely faster overall.
+//
+// Values are REAL, from the measured curve on the founder's box (16 GB, 200k ctx), converted to a
+// 26.5k-token prompt. Time-to-answer improves smoothly down to nCpuMoe=5, then falls off a cliff.
+const step = (prefillTps: number, gen: number) => ({ ttftMs: (26500 / prefillTps) * 1000, tps: gen })
+const N8 = step(2067.3, 106.0)   // 22.3 s
+const N5 = step(2400.4, 114.5)   // 19.8 s
+const N3 = step(79.9, 10.1)      // 431.1 s — past the cliff
+
+test('spillImproves: keeps climbing while time-to-answer falls (n=8 → n=5)', () => {
+  assert.equal(spillImproves(N8, { outcome: 'ok', ...N5 }), true)
 })
 
-test('spillImproves: generation t/s decreases — stops the climb even if prefill improved', () => {
-  assert.equal(spillImproves({ tps: 20, prefillTps: 900 }, { outcome: 'ok', tps: 19.9, prefillTps: 1200 }), false)
+test('spillImproves: stops dead at the measured cliff (n=5 → n=3, 19.8s → 431s)', () => {
+  assert.equal(spillImproves(N5, { outcome: 'ok', ...N3 }), false)
 })
 
-test('spillImproves: prefill decreases — stops the climb even if generation t/s improved', () => {
-  assert.equal(spillImproves({ tps: 20, prefillTps: 900 }, { outcome: 'ok', tps: 25, prefillTps: 899 }), false)
+test('spillImproves: a step that trades prefill for generation and WINS is now allowed', () => {
+  // The behaviour change. Generation 100→130 but prefill 2000→1900: the old "neither may decrease"
+  // rule rejected this outright, yet time-to-answer improves. Rejecting it left real speed on the
+  // table, which is why the objective became one combined number.
+  const prev = step(2000, 100)
+  const cand = step(1900, 130)
+  assert.ok(ttfMs(cand)! < ttfMs(prev)!, 'the candidate really is faster overall')
+  assert.ok(cand.tps > prev.tps && cand.ttftMs > prev.ttftMs, 'and it really does trade prefill for generation')
+  assert.equal(spillImproves(prev, { outcome: 'ok', ...cand }), true)
 })
 
-test('spillImproves: a candidate with no prefill reading is treated as a decrease (fail-safe)', () => {
-  assert.equal(spillImproves({ tps: 20, prefillTps: 900 }, { outcome: 'ok', tps: 25, prefillTps: null }), false)
+test('spillImproves: an equal step stops the climb — no tie band, keep the safer config', () => {
+  assert.equal(spillImproves(N5, { outcome: 'ok', ...N5 }), false)
 })
 
-test('spillImproves: the PREVIOUS step having no prefill reading skips the prefill check entirely', () => {
-  assert.equal(spillImproves({ tps: 20, prefillTps: null }, { outcome: 'ok', tps: 22, prefillTps: null }), true)
-  assert.equal(spillImproves({ tps: 20, prefillTps: null }, { outcome: 'ok', tps: 22, prefillTps: 5 }), true)
-})
-
-test('spillImproves: a failed spill step (oom/crash/timeout) is never "an increase"', () => {
-  assert.equal(spillImproves({ tps: 20, prefillTps: 900 }, { outcome: 'oom', tps: null, prefillTps: null }), false)
-  assert.equal(spillImproves({ tps: 20, prefillTps: 900 }, { outcome: 'crash', tps: null, prefillTps: null }), false)
-  assert.equal(spillImproves({ tps: 20, prefillTps: 900 }, { outcome: 'timeout', tps: null, prefillTps: null }), false)
+test('spillImproves: a failed spill step (oom/crash/timeout) is never an improvement', () => {
+  for (const outcome of ['oom', 'crash', 'timeout'] as const) {
+    assert.equal(spillImproves(N5, { outcome, ttftMs: null, tps: null }), false)
+  }
 })
 
 test('spillImproves: null candidate (benchAt itself returned null) stops the climb', () => {
-  assert.equal(spillImproves({ tps: 20, prefillTps: 900 }, null), false)
+  assert.equal(spillImproves(N5, null), false)
 })
 
-test('spillImproves: an "ok" outcome with a null tps (shouldn\'t happen, but defensively) stops the climb', () => {
-  assert.equal(spillImproves({ tps: 20, prefillTps: 900 }, { outcome: 'ok', tps: null, prefillTps: 950 }), false)
+test('spillImproves: an unmeasurable step never climbs, in either direction (fail-safe)', () => {
+  // This path trades away the user's configured safety margin, so a step that cannot be SHOWN
+  // faster must never be waved through — whether the candidate or the baseline is the blind one.
+  assert.equal(spillImproves(N5, { outcome: 'ok', ttftMs: 11040, tps: null }), false)
+  assert.equal(spillImproves(N5, { outcome: 'ok', ttftMs: null, tps: 114.5 }), false)
+  assert.equal(spillImproves({ ttftMs: null, tps: null }, { outcome: 'ok', ...N5 }), false)
 })
 
 // ---- kvSpeedAdvisory: ADR-219 — auto-tune no longer picks the KV type, just notes when a
