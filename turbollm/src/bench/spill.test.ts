@@ -13,7 +13,7 @@
 // against the run's own linear fit CAN.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { residencySlope, predictResidencyMb, spillMb, isSpilling, SPILL_TOLERANCE_MB } from './spill'
+import { residencySlope, predictResidencyMb, spillMb, isSpilling, slopeImplausible, SPILL_TOLERANCE_MB, MIN_PLAUSIBLE_SLOPE_FRACTION } from './spill'
 
 // Measured dedicated VRAM (MiB) per nCpuMoe. Perfectly linear from 20 down to 12,
 // then it saturates at the card ceiling and stops responding.
@@ -211,6 +211,48 @@ test('interior anchors recover the true slope and predict the config exactly', (
   const predicted = predictResidencyMb({ knob: 30, vramMb: LIVE[30] }, slope, 20)
   assert.equal(isSpilling(predicted, LIVE[20]), false, 'healthy config must not be flagged')
   assert.ok(Math.abs(predicted - LIVE[20]) < 5, `prediction should land on the measurement, got ${predicted}`)
+})
+
+// ---- slopeImplausible: catching a calibration taken across saturated anchors --
+//
+// Found live 2026-08-07 on Ling-3.0-flash (39227328000 bytes, 42 blocks, q8_0 @ 131k ctx) on the
+// same 16 GB card. The model is far larger than VRAM, so BOTH calibration anchors were already
+// spilling — nCpuMoe=26 read 15754 MiB with only 549 MiB free. The delta between two capped
+// readings measures what FIT, not what was requested, so the slope came out 378.5 MB/expert against
+// a ~934 MB per-block average. Every prediction built on it under-reported spill by ~12x, and a
+// config carrying 4419 MiB of REAL spill (measured via the OS counter) scored 358 MiB and was
+// accepted. Under-reporting is the dangerous direction: a badly-spilling config reads as fine.
+const LING_BYTES = 39227328000
+const LING_BLOCKS = 42
+const QWEN_BYTES = 13211155424
+const QWEN_BLOCKS = 40
+
+test('slopeImplausible: flags the Ling calibration that let 4.4 GB of spill through', () => {
+  // 39227 MB / 42 = 934 MB per block; measured 378.5 is 40% of that.
+  assert.equal(slopeImplausible(378.5, LING_BYTES, LING_BLOCKS), true)
+})
+
+test('slopeImplausible: does NOT flag the healthy Qwen calibration', () => {
+  // 13211 MB / 40 = 330 MB per block; the true measured slope 262.0 is 79% of that. A block holds
+  // attention weights that never move with the offload knob, so a healthy slope is always BELOW the
+  // per-block average — this is a floor test, not an equality test.
+  assert.equal(slopeImplausible(262.0, QWEN_BYTES, QWEN_BLOCKS), false)
+})
+
+test('slopeImplausible: claims nothing when the model geometry is unknown', () => {
+  // No size or no block count → no expectation to test against, so never assert implausibility.
+  assert.equal(slopeImplausible(1, 0, LING_BLOCKS), false)
+  assert.equal(slopeImplausible(1, LING_BYTES, 0), false)
+})
+
+test('slopeImplausible: the threshold separates the two real cases with margin on both sides', () => {
+  const lingPerBlock = LING_BYTES / 1e6 / LING_BLOCKS
+  const qwenPerBlock = QWEN_BYTES / 1e6 / QWEN_BLOCKS
+  assert.ok(378.5 / lingPerBlock < MIN_PLAUSIBLE_SLOPE_FRACTION, 'Ling is below the floor')
+  assert.ok(262.0 / qwenPerBlock > MIN_PLAUSIBLE_SLOPE_FRACTION, 'Qwen is above it')
+  // And not marginally: 40% vs 79%, with the threshold at 50%.
+  assert.ok(Math.abs(378.5 / lingPerBlock - 0.405) < 0.02)
+  assert.ok(Math.abs(262.0 / qwenPerBlock - 0.793) < 0.02)
 })
 
 // ---- isSpilling: the decision the search actually makes ----------------------

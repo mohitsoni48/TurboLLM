@@ -17,7 +17,7 @@ import type { Registry } from '../engines/registry'
 import type { Engine } from '../config/config'
 import type { Scanner, ModelEntry } from '../models/scanner'
 import { deriveDefault, estimateVram, gpuBudgetMb, profileToArgs, resolveProfile, type GpuProfile, type LoadProfile } from '../models/profile'
-import { isSpilling, predictResidencyMb, residencySlope, type ResidencySample } from './spill'
+import { isSpilling, predictResidencyMb, residencySlope, slopeImplausible, type ResidencySample } from './spill'
 import { getSysInfo, type SysInfo } from '../sysinfo/sysinfo'
 import type { HfClient } from '../hf/hf'
 import { inferRepoFromPath } from '../api/path-utils'
@@ -581,10 +581,18 @@ export class BenchRunner {
           anchors.push({ knob: -n, vramMb: probe.vramAbsMb })
         }
       }
-      const slope = residencySlope(anchors)
+      let slope = residencySlope(anchors)
       const ref = anchors.filter((a): a is { knob: number; vramMb: number } => a.vramMb !== null).sort((a, b) => b.knob - a.knob)[0]
+      // Same geometry sanity-check as moeSearch — see the long note there. A model far larger than
+      // VRAM can saturate the calibration probes themselves, producing a slope that under-reports
+      // spill on every later prediction.
+      if (slope !== null && slopeImplausible(slope, entry.sizeBytes, entry.blockCount)) {
+        const perBlockMb = Math.round(entry.sizeBytes / 1e6 / entry.blockCount)
+        this.emit(`spill detection disabled: calibrated ${slope.toFixed(1)} MB/layer is implausibly low for this model (~${perBlockMb} MB per block) — the calibration probes are themselves spilling. Searching on fit alone.`)
+        slope = null
+      }
       if (slope !== null && ref) this.emit(`spill detection calibrated: ${slope.toFixed(1)} MB of GPU residency per layer`)
-      else this.emit('spill detection unavailable on this GPU (no VRAM readings) — searching on fit alone')
+      else this.emit('spill detection unavailable on this GPU (no usable calibration) — searching on fit alone')
 
       let lo = 0, hi = hi0
       bestNgl = null
@@ -697,9 +705,21 @@ export class BenchRunner {
       await this.settleGpu(sys)
       anchors.push({ knob: n, vramMb: probe.vramAbsMb })
     }
-    const slope = residencySlope(anchors)
+    let slope = residencySlope(anchors)
     // Reference = the lowest-residency anchor that actually produced a reading.
     const ref = anchors.filter((a): a is { knob: number; vramMb: number } => a.vramMb !== null).sort((a, b) => b.knob - a.knob)[0]
+    // Sanity-check the slope against the model's own geometry. On a model much larger than VRAM the
+    // anchors themselves can already be spilling, in which case the delta between them measures only
+    // what FIT, not what was requested — and every prediction built on it under-reports spill, which
+    // is the dangerous direction. Measured live on Ling-3.0-flash (39 GB / 42 blocks, ~934 MB per
+    // block) on a 16 GB card: the anchors landed at 15754 MB with 549 MB free, calibration came out
+    // at 378.5 MB/expert (40% of plausible), and a config carrying 4419 MB of real spill was accepted
+    // because the corrupted ruler scored it at 358 MB.
+    if (slope !== null && slopeImplausible(slope, entry.sizeBytes, entry.blockCount)) {
+      const perBlockMb = Math.round(entry.sizeBytes / 1e6 / entry.blockCount)
+      this.emit(`spill detection disabled: calibrated ${slope.toFixed(1)} MB/expert is implausibly low for this model (~${perBlockMb} MB per block) — the calibration probes are themselves spilling, so the slope only measures what fit. Searching on fit alone.`)
+      slope = null
+    }
     if (slope === null || !ref) {
       // No usable slope (unreadable VRAM — a Mac/Metal or Intel box, or a failed CLI call). Spill
       // detection sits out entirely and the search behaves exactly as it did before. Failing OPEN

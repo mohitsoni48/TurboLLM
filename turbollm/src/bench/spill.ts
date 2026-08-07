@@ -81,6 +81,32 @@ export function residencySlope(samples: ResidencySample[]): number | null {
   return best
 }
 
+/** Lower bound on a believable per-step slope, as a fraction of the model's average per-block
+ *  weight (`sizeBytes / blockCount`). Below this the calibration is assumed to have been taken
+ *  across already-saturated anchors and must not be trusted.
+ *
+ *  Measured basis: on Qwen3.6-35B-A3B the true slope was 262.0 MB against a 330 MB per-block
+ *  average — 79%, comfortably above. On Ling-3.0-flash (39 GB across 42 blocks, 934 MB per block)
+ *  a saturated pair of anchors produced 378.5 MB — 40%, and every prediction built on it
+ *  under-reported spill by ~12x, letting a config with 4419 MB of real spill be accepted.
+ *  0.5 separates those two cases with margin on both sides. The per-block average is a CEILING on
+ *  the true per-expert cost (a block holds attention weights too, which never move with the expert
+ *  offload knob), so a healthy slope always lands below 1.0 — this is a floor test, not equality. */
+export const MIN_PLAUSIBLE_SLOPE_FRACTION = 0.5
+
+/** True when a measured slope is too small to be real for this model, which means the calibration
+ *  anchors were themselves saturated and the slope reflects only what FIT rather than what was
+ *  requested. Callers must discard such a slope: predictions built on it under-report spill, which
+ *  is the dangerous direction (a badly-spilling config reads as fine).
+ *
+ *  Returns false when the model geometry is unknown — no size or no block count means no expectation
+ *  to test against, so nothing is claimed. */
+export function slopeImplausible(slopeMbPerStep: number, sizeBytes: number, blockCount: number): boolean {
+  if (!(sizeBytes > 0) || !(blockCount > 0)) return false
+  const perBlockMb = sizeBytes / 1e6 / blockCount
+  return slopeMbPerStep < perBlockMb * MIN_PLAUSIBLE_SLOPE_FRACTION
+}
+
 /** Residency this candidate SHOULD occupy if nothing spills, extrapolated from a
  *  reference sample along `slope`. The reference should come from the low-residency
  *  end of the search (the samples least likely to be saturated). */
