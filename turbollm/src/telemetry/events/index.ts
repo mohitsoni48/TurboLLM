@@ -20,6 +20,7 @@ import { chatDaily } from './chat'
 import { gatewayDaily, harnessFirstSeen } from './gateway'
 import { codeDaily } from './code'
 import { uiAction, uiDaily } from './ui'
+import { onboardingProfile, onboardingRecovery } from './onboarding'
 
 export const REGISTRY = {
   app_first_run: appFirstRun,
@@ -39,6 +40,8 @@ export const REGISTRY = {
   code_daily: codeDaily,
   ui_action: uiAction,
   ui_daily: uiDaily,
+  onboarding_profile: onboardingProfile,
+  onboarding_recovery: onboardingRecovery,
 } as const
 
 export type EventName = keyof typeof REGISTRY
@@ -63,4 +66,6 @@ export {
   codeDaily,
   uiAction,
   uiDaily,
+  onboardingProfile,
+  onboardingRecovery,
 }
