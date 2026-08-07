@@ -434,6 +434,14 @@ export interface Config {
   /** Cloud Launch deploy-link settings (ADR-153). */
   cloudDeploy: CloudDeployConfig
   devModel?: DevModel
+  /** Onboarding progress (spec 25 §3, ADR-338). Absent on pre-v1.11 configs;
+   *  `normalizeOnboarding` supplies the default, so no migration step is needed. */
+  onboarding?: {
+    status?: string
+    profile?: string
+    completedAt?: number
+    schemaVersion?: number
+  }
 }
 
 export class ValueError extends Error {
