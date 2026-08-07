@@ -3,9 +3,8 @@
  *  value (`UI_ACTIONS`) plus one `track(screen, action)` call site.
  *
  *  `SCREENS` is spec 23's list, corrected against the actual frontend (`web/src/screens/`):
- *  `onboarding` was dropped — no such screen exists in this codebase today (onboarding_step,
- *  the EVENT, is a separate thing being retired in Phase 7; there is no onboarding UI to
- *  attribute a click to). Everything else matches a real top-level screen file.
+ *  spec 25 added the `onboarding` screen (the wizard's 9-step flow). Everything else
+ *  matches a real top-level screen file.
  *
  *  `UI_ACTIONS` is intentionally NOT the full ~361-handler set yet — spec 23 §3.8 itself
  *  recommends landing this schema first, then instrumenting the 361 call sites in per-screen
@@ -23,7 +22,7 @@ import { defineEvent, f } from '../core/define'
 
 export const SCREENS = [
   'chat', 'models', 'engines', 'code', 'customize', 'settings', 'tokens',
-  'workspace', 'developer', 'routines', 'agents', 'skills',
+  'workspace', 'developer', 'routines', 'agents', 'skills', 'onboarding',
 ] as const
 
 /** Batch 1 (Phase 6a): `EnginesScreen.tsx` + its `EngineCard`/`CustomEngineCard`
@@ -636,6 +635,15 @@ export const UI_ACTIONS = [
   'submit_auth_key',
 
   'copy_button_click', 'retry_failed_load',
+
+  // Batch 7 (spec 25): the onboarding wizard. One skip action per registry
+  // step — where people bail is the entire diagnostic value of the funnel.
+  'skip_onboarding_welcome', 'skip_onboarding_profile', 'skip_onboarding_model',
+  'skip_onboarding_personalize', 'skip_onboarding_profile_extra', 'skip_onboarding_load',
+  'skip_onboarding_payoff', 'skip_onboarding_tune_offer', 'skip_onboarding_done',
+  'choose_profile', 'start_model_download', 'use_existing_models', 'open_discover_handoff',
+  'pick_different_model', 'accept_autotune', 'decline_autotune', 'finish_onboarding',
+  'resume_onboarding', 'dismiss_finish_banner', 'take_recovery_action',
 ] as const
 
 export const uiAction = defineEvent({
