@@ -632,13 +632,30 @@ export class BenchRunner {
     }
 
     if (bestN === null) return null
-    let found = await this.benchAt(entry, sys, { ...base, nCpuMoe: bestN }, caps, results, `nCpuMoe=${bestN}`)
-    // Same Phase-1-vs-Phase-2 VRAM gap as denseSearch — back off (more CPU experts, less VRAM) one
+    // The Phase-1 probe is load-only (no generation) — it can report "ok" for an nCpuMoe that
+    // then genuinely crashes/faults during the real Phase-2 bench (e.g. prefill-gate catching a
+    // compute spill the VRAM-only probe never exercised — see ADR-337 for the original "probe ok,
+    // real bench doesn't" gap this class of failure belongs to). benchAt returns null for any
+    // non-'ok' outcome, and previously that null was never retried — the search just gave up with
+    // no winner even when the very next nCpuMoe (already probed "ok" with headroom to spare in
+    // Phase 1) was never actually bench-tested. Walk forward (more CPU experts, less GPU pressure)
+    // until something benches clean or maxN is exhausted, mirroring the direction the binary search
+    // itself already uses for "too much on GPU".
+    let found: { cand: BenchCandidate; profile: LoadProfile } | null = null
+    let foundN = bestN
+    for (let n = bestN; n <= maxN; n++) {
+      const label = n === bestN ? `nCpuMoe=${n}` : `nCpuMoe=${n} (crash backoff)`
+      found = await this.benchAt(entry, sys, { ...base, nCpuMoe: n }, caps, results, label)
+      if (found) { foundN = n; break }
+      if (n < maxN) this.emit(`nCpuMoe=${n} failed to bench (${results[results.length - 1]?.outcome ?? 'crash'}) — retrying at nCpuMoe=${n + 1}`)
+      if (this.cancelled || Date.now() > this.deadline) break
+    }
+    // Same Phase-1-vs-Phase-2 VRAM gap as above — back off (more CPU experts, less VRAM) one
     // step if the real measured run blew through headroom (ADR-217).
-    if (found && overHeadroom(found.cand.vramAbsMb, budgetMb, headroomMb) && bestN < maxN) {
-      this.emit(`nCpuMoe=${bestN} exceeded headroom after generation (${found.cand.vramAbsMb} MB) — retrying at nCpuMoe=${bestN + 1}`)
-      const safer = await this.benchAt(entry, sys, { ...base, nCpuMoe: bestN + 1 }, caps, results, `nCpuMoe=${bestN + 1} (headroom backoff)`)
-      if (safer) found = safer
+    if (found && overHeadroom(found.cand.vramAbsMb, budgetMb, headroomMb) && foundN < maxN) {
+      this.emit(`nCpuMoe=${foundN} exceeded headroom after generation (${found.cand.vramAbsMb} MB) — retrying at nCpuMoe=${foundN + 1}`)
+      const safer = await this.benchAt(entry, sys, { ...base, nCpuMoe: foundN + 1 }, caps, results, `nCpuMoe=${foundN + 1} (headroom backoff)`)
+      if (safer) { found = safer; foundN = foundN + 1 }
     }
     // VRAM-spill hill-climb (founder-directed, 2026-07-17) — ONLY when the user has explicitly
     // opted in via VRAM_HEADROOM_SPILL_MB (0, Settings → Engine → Advanced). At any real headroom
