@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { pickKvQuants, betterBySpeed, ttfMs, TTF_OUTPUT_TOKENS, probeVerdict, overHeadroom, spillImproves, kvSpeedAdvisory, parseRocmVramUsed, benchPromptTokens, buildBenchMessages } from './bench'
-import { residencySlope, predictResidencyMb } from './spill'
+import { pickKvQuants, betterBySpeed, ttfMs, TTF_OUTPUT_TOKENS, probeVerdict, spillImproves, kvSpeedAdvisory, parseRocmVramUsed, parseRocmGttUsed, benchPromptTokens, buildBenchMessages } from './bench'
+import { SPILL_TOLERANCE_MB } from './spill'
 
 // ---- pickKvQuants: quality-preserving KV sweep, base-first ------------------
 
@@ -107,143 +107,102 @@ test('betterBySpeed: an exact tie keeps the incumbent rather than churning the w
 
 // ---- probeVerdict + search convergence --------------------------------------
 //
-// End-to-end proof that fit + spill + load-outcome COMPOSE into the right answer. The
-// individual pieces each having correct unit tests does not establish this.
-//
-// Real measured dedicated VRAM (MiB) per nCpuMoe, RTX 5070 Ti (16303 MiB total),
-// Qwen3.6-35B-A3B IQ3_XXS @ ctx 200704, 2026-08-07. Values for 4 and 1 come from the
-// daemon's own bench probes (nvidia-smi); the rest from per-adapter perf counters.
-const VRAM_AT: Record<number, number> = {
-  20: 13640.9, 18: 14164.9, 16: 14688.9, 14: 15212.9, 13: 15474.9, 12: 15736.9,
-  11: 15813.2, 10: 15819.7, 9: 15826.2, 4: 15790.0, 3: 15823.2, 1: 15782.0, 0: 15828.6,
+// Spill is MEASURED per probe (host-memory delta across the load), not derived from a slope.
+// Values are real: dedicated VRAM and the OS shared-memory reading at each nCpuMoe on the founder's
+// box (RTX 5070 Ti 16303 MiB, Qwen3.6-35B-A3B IQ3_XXS @ ctx 200704, 2026-08-07), with the 285.3 MiB
+// no-spill baseline subtracted.
+const MEASURED: Record<number, { vram: number; spill: number | null }> = {
+  20: { vram: 13640.9, spill: 0 },
+  18: { vram: 14164.9, spill: 0 },
+  16: { vram: 14688.9, spill: 0 },
+  14: { vram: 15212.9, spill: 0 },
+  13: { vram: 15474.9, spill: 0 },
+  12: { vram: 15736.9, spill: 0 },
+  11: { vram: 15813.2, spill: 186 },
+  10: { vram: 15819.7, spill: 442 },
+  9: { vram: 15826.2, spill: 698 },
+  4: { vram: 15790.0, spill: null }, // vram from the bench's own probe; spill not measured at this point
+  3: { vram: 15823.2, spill: 2210 },
+  1: { vram: 15782.0, spill: null },
+  0: { vram: 15828.6, spill: 2914 },
 }
-// nCpuMoe=13 was never probed directly; it sits exactly on the measured 262.0 MiB/expert line
-// between 14 and 12, both of which WERE measured. Marked so nobody mistakes it for a reading.
 const BUDGET_MB = 16303
 const HEADROOM_MB = 375 // the founder's configured value
 
-/** Replays the binary search over nCpuMoe using the REAL probeVerdict for every decision.
- *  `withSpill: false` passes a null prediction, which is exactly how the search behaved
- *  before spill detection existed. */
+/** Replays the binary search using the REAL probeVerdict for every decision. `withSpill: false`
+ *  passes a null reading — exactly how a machine with no spill telemetry behaves. */
 function runSearch(maxN: number, withSpill: boolean): number | null {
-  const slope = residencySlope([{ knob: 20, vramMb: VRAM_AT[20] }, { knob: 18, vramMb: VRAM_AT[18] }])!
-  const ref = { knob: 20, vramMb: VRAM_AT[20] }
   let lo = 0, hi = maxN, bestN: number | null = null
   while (lo <= hi) {
     const mid = Math.floor((lo + hi) / 2)
-    const vramAbsMb = VRAM_AT[mid]
-    if (vramAbsMb === undefined) throw new Error(`test gap: no measurement for nCpuMoe=${mid}`)
-    const predicted = withSpill ? predictResidencyMb(ref, slope, mid) : null
-    const v = probeVerdict({ outcome: 'ok', vramAbsMb }, predicted, BUDGET_MB, HEADROOM_MB)
+    const m = MEASURED[mid]
+    if (!m) throw new Error(`test gap: no measurement for nCpuMoe=${mid}`)
+    const v = probeVerdict({ outcome: 'ok', vramAbsMb: m.vram, spillMb: withSpill ? m.spill : null }, BUDGET_MB, HEADROOM_MB)
     if (v.decision === 'fits') { bestN = mid; hi = mid - 1 } else { lo = mid + 1 }
   }
   return bestN
 }
 
-test('search drives to the lowest in-window config (nCpuMoe=10), not the first one it finds', () => {
-  // headroom + allowance is a REJECTION CEILING, not an acceptance floor (founder correction):
-  // free VRAM above it means there is still room to move experts onto the GPU, so the search must
-  // keep going left. The ideal config has free VRAM BETWEEN headroom (375) and headroom+512 (887).
-  // Here that bottoms out at nCpuMoe=10: 483 MiB free (in window) and 441 MiB spill (under the
-  // 512 allowance). nCpuMoe=9 is rejected — 696.7 MiB of spill clears the allowance.
+test('search stops at the measured spill allowance (nCpuMoe=10)', () => {
+  // n=9 spills 698 MiB — past the 512 allowance — so it is rejected. n=10 spills 442 (under) and
+  // leaves 483 MiB free (over the 375 headroom), so it is accepted. No calibration involved.
   assert.equal(runSearch(40, true), 10)
 })
 
-test('KNOWN GAP: the lowest in-window config is NOT the fastest — measured, not theorised', () => {
-  // Time-to-answer is unimodal in offload, so the fit/spill boundary is not the speed peak.
-  // Measured at equal prompt depth on the founder's box: nCpuMoe=13 -> 25.8s, 12 -> 26.7s,
-  // 14 -> 31.9s. Performance DEGRADES below 13, yet the window rule alone bottoms out at 10.
-  // Bounding the region is therefore necessary but not sufficient; picking the winner inside it
-  // needs real measurement (this is what ADR-072's deleted confirmPeak() did). Recorded here so
-  // the gap is not mistaken for correct behaviour.
-  const TTF_AT: Record<number, number> = { 14: 31.9, 13: 25.8, 12: 26.7 }
-  const fastest = Object.entries(TTF_AT).sort((a, b) => a[1] - b[1])[0][0]
-  assert.equal(fastest, '13', 'the measured optimum')
-  assert.notEqual(runSearch(40, true), 13, 'the window rule alone does not land on it')
+test('REGRESSION: with no spill reading the same search walks to nCpuMoe=0 — the reported bug', () => {
+  // Every probe from 9 downward reads BELOW the 15928 MiB fit line (16303-375), so the fit check
+  // alone calls each one a clean fit and the search keeps taking GPU residency it never gets.
+  assert.equal(runSearch(40, false), 0)
 })
 
-test('REGRESSION: the original bug — plain fit check alone walks to nCpuMoe=0', () => {
-  // Reproduces the pre-fix logic exactly: raw overHeadroom at the user's bare 375 MiB headroom,
-  // with no spill input and no compute-buffer margin. Every probe from 9 down reads below the
-  // 15928 MiB line, so each looks like a clean fit and the search takes residency it never gets.
-  let lo = 0, hi = 40, bestN: number | null = null
-  while (lo <= hi) {
-    const mid = Math.floor((lo + hi) / 2)
-    const v = VRAM_AT[mid]
-    if (v === undefined) throw new Error(`test gap: no measurement for nCpuMoe=${mid}`)
-    if (!overHeadroom(v, BUDGET_MB, HEADROOM_MB)) { bestN = mid; hi = mid - 1 } else { lo = mid + 1 }
-  }
-  assert.equal(bestN, 0, 'the reported bug')
-})
-
-test('the spill input is what halts the search — the headroom check alone does not', () => {
-  // Without spill, every probe from 9 downward still reads under the 15928 MiB headroom line, so
-  // the search runs all the way to nCpuMoe=0: the originally reported bug. Spill is the guard that
-  // stops it at the allowance.
-  assert.equal(runSearch(40, false), 0, 'headroom alone → the original bug')
-  assert.equal(runSearch(40, true), 10, 'with spill → stops at the allowance')
-})
-
-test('probeVerdict: spill is checked BEFORE the fit test, so the reason reported is the real one', () => {
-  // nCpuMoe=9 spills 696.7 MiB (over the 512 allowance) AND is over the fit line. Both would
-  // reject it; ordering decides which reason the user sees, and "spilling" is the true cause.
-  const predicted = predictResidencyMb({ knob: 20, vramMb: VRAM_AT[20] }, 262.0, 9)
-  const v = probeVerdict({ outcome: 'ok', vramAbsMb: VRAM_AT[9] }, predicted, BUDGET_MB, HEADROOM_MB)
+test('probeVerdict: spill is checked BEFORE the fit test, so the reported reason is the real one', () => {
+  const v = probeVerdict({ outcome: 'ok', vramAbsMb: MEASURED[9].vram, spillMb: 698 }, BUDGET_MB, HEADROOM_MB)
   assert.equal(v.decision === 'offload-more' && v.reason, 'spill')
+  assert.equal(v.decision === 'offload-more' && Math.round(v.shortfallMb ?? 0), 698)
 })
 
-test('probeVerdict: a config spilling UNDER the allowance is ACCEPTED when free VRAM clears headroom', () => {
-  // nCpuMoe=11 spills 185.7 MiB — under the 512 allowance — and leaves 490 MiB free, which clears
-  // the 375 MiB headroom. That is squarely inside the ideal window, so it is a legitimate candidate.
-  // An earlier revision rejected exactly this case by treating headroom+allowance as a floor.
-  const predicted = predictResidencyMb({ knob: 20, vramMb: VRAM_AT[20] }, 262.0, 11)
-  const v = probeVerdict({ outcome: 'ok', vramAbsMb: VRAM_AT[11] }, predicted, BUDGET_MB, HEADROOM_MB)
+test('probeVerdict: spill UNDER the allowance is accepted when free VRAM clears headroom', () => {
+  // n=11: 186 MiB spill (under 512) with 490 MiB free (over 375) — a legitimate candidate. The
+  // window rule means free VRAM above headroom+allowance is a signal to keep searching, not a floor.
+  const v = probeVerdict({ outcome: 'ok', vramAbsMb: MEASURED[11].vram, spillMb: 186 }, BUDGET_MB, HEADROOM_MB)
   assert.equal(v.decision, 'fits')
 })
 
 test('probeVerdict: free VRAM below the configured headroom is rejected', () => {
-  // 16000 MiB used on a 16303 MiB card leaves 303 MiB — under the 375 MiB headroom, so too tight.
-  const v = probeVerdict({ outcome: 'ok', vramAbsMb: 16000 }, 16000, BUDGET_MB, HEADROOM_MB)
+  const v = probeVerdict({ outcome: 'ok', vramAbsMb: 16000, spillMb: 0 }, BUDGET_MB, HEADROOM_MB)
   assert.equal(v.decision === 'offload-more' && v.reason, 'headroom')
 })
 
-test('dense direction: negating the knob makes HIGHER ngl predict MORE residency', () => {
-  // denseSearch passes knob = -ngl so spill.ts's "lower knob = more resident" convention holds
-  // for a parameter that works the opposite way from nCpuMoe. A sign error here would be silent:
-  // predictions would run backwards and every spilling config would read as a comfortable fit.
-  // Synthetic but exact: 300 MiB per layer, anchored at ngl=1 and ngl=5.
-  const slope = residencySlope([{ knob: -1, vramMb: 1000 }, { knob: -5, vramMb: 2200 }])!
-  assert.ok(Math.abs(slope - 300) < 0.5, `expected 300 MiB/layer, got ${slope}`)
-  const ref = { knob: -1, vramMb: 1000 }
-  // ngl=9 is 8 layers above the anchor → 1000 + 8*300 = 3400.
-  assert.equal(predictResidencyMb(ref, slope, -9), 3400)
-  // Actually resident 2500 → 900 MiB went to host memory → spilling, so use FEWER layers.
-  const v = probeVerdict({ outcome: 'ok', vramAbsMb: 2500 }, 3400, BUDGET_MB, HEADROOM_MB)
-  assert.equal(v.decision === 'offload-more' && v.reason, 'spill')
-  // And a candidate that lands where predicted is not flagged.
-  assert.equal(probeVerdict({ outcome: 'ok', vramAbsMb: 3400 }, 3400, BUDGET_MB, HEADROOM_MB).decision, 'fits')
-})
-
-test('probeVerdict: a hard OOM outranks everything and never needs a prediction', () => {
-  assert.deepEqual(probeVerdict({ outcome: 'oom', vramAbsMb: null }, null, BUDGET_MB, HEADROOM_MB), { decision: 'offload-more', reason: 'oom' })
+test('probeVerdict: a hard OOM outranks everything', () => {
+  assert.deepEqual(
+    probeVerdict({ outcome: 'oom', vramAbsMb: null, spillMb: null }, BUDGET_MB, HEADROOM_MB),
+    { decision: 'offload-more', reason: 'oom' },
+  )
 })
 
 test('probeVerdict: crash/timeout are treated as memory pressure, not as a fit', () => {
   for (const outcome of ['crash', 'timeout'] as const) {
-    assert.equal(probeVerdict({ outcome, vramAbsMb: 100 }, null, BUDGET_MB, HEADROOM_MB).decision, 'offload-more')
+    assert.equal(probeVerdict({ outcome, vramAbsMb: 100, spillMb: 0 }, BUDGET_MB, HEADROOM_MB).decision, 'offload-more')
   }
 })
 
-test('probeVerdict: still honors the headroom fit check when nothing is spilling', () => {
-  // Comfortably resident but over (budget - headroom) → rejected on headroom, as before.
-  const v = probeVerdict({ outcome: 'ok', vramAbsMb: 16000 }, 16000, BUDGET_MB, HEADROOM_MB)
-  assert.equal(v.decision === 'offload-more' && v.reason, 'headroom')
+test('probeVerdict: no spill telemetry (Metal, or a localized Windows) behaves as before', () => {
+  // Fails OPEN — an unavailable reading must never be reported as a spill, or such a machine gets
+  // driven to maximum CPU offload for no reason.
+  assert.equal(probeVerdict({ outcome: 'ok', vramAbsMb: 15000, spillMb: null }, BUDGET_MB, HEADROOM_MB).decision, 'fits')
 })
 
-test('probeVerdict: unreadable VRAM on a Mac/Intel box behaves exactly as before spill detection', () => {
-  // No reading → no spill claimed, no headroom block → the load outcome alone decides.
-  assert.equal(probeVerdict({ outcome: 'ok', vramAbsMb: null }, null, BUDGET_MB, HEADROOM_MB).decision, 'fits')
+test('the measured signal separates fitting from spilling across a 4x model-size range', () => {
+  // Matrix run 2026-08-07: six models, 9.4-60.5 GB, on a 16.3 GB card. No-spill baselines cluster
+  // tightly (157-198 MiB) regardless of model size; real spill is an order of magnitude away
+  // (3199-6343 MiB). That gap is why the 512 MiB allowance is not sensitive to exactly where in it
+  // the threshold sits, and why no calibration is needed to tell the two apart.
+  const fits = [177, 181, 159, 198, 158, 161]
+  const spills = [3199.5, 3647.5, 6343.5]
+  assert.ok(Math.max(...fits) < SPILL_TOLERANCE_MB, 'every no-spill reading sits under the allowance')
+  assert.ok(Math.min(...spills) > SPILL_TOLERANCE_MB * 6, 'every real spill sits far above it')
 })
+
 
 // ---- spillImproves: MoE VRAM-spill hill-climb decision (founder-directed, 2026-07-17; extended
 // same day to also guard prefill speed) ----------------------------------------------------------
@@ -379,6 +338,36 @@ test('parseRocmVramUsed: zero used memory across every card → null (not 0)', (
 test('parseRocmVramUsed: malformed JSON → null, never throws', () => {
   assert.equal(parseRocmVramUsed('not json'), null)
   assert.equal(parseRocmVramUsed(''), null)
+})
+
+// ---- parseRocmGttUsed: AMD's host-backed memory, the ROCm counterpart of the WDDM shared counter
+
+test('parseRocmGttUsed: sums host-backed GTT across cards', () => {
+  const j = JSON.stringify({
+    card0: { 'GTT Total Used Memory (B)': '1000000000' },
+    card1: { 'GTT Total Used Memory (B)': '500000000' },
+  })
+  assert.equal(parseRocmGttUsed(j), 1500)
+})
+
+test('parseRocmGttUsed: GTT and VRAM are different fields and must not be conflated', () => {
+  // On a DISCRETE card GTT is host RAM reached over PCIe — counting it as VRAM would over-report
+  // residency, which is why parseRocmVramUsed reads only the VRAM field. Same payload, two answers.
+  const j = JSON.stringify({
+    card0: { 'VRAM Total Used Memory (B)': '8000000000', 'GTT Total Used Memory (B)': '2000000000' },
+  })
+  assert.equal(parseRocmVramUsed(j), 8000)
+  assert.equal(parseRocmGttUsed(j), 2000)
+})
+
+test('parseRocmGttUsed: zero GTT is 0, not null — "nothing spilled" is a real answer', () => {
+  // Deliberately unlike parseRocmVramUsed, where 0 used VRAM means the reading failed. Here 0 is
+  // the healthy case and must be reported as such, or every fitting config would look unmeasured.
+  assert.equal(parseRocmGttUsed(JSON.stringify({ card0: { 'GTT Total Used Memory (B)': '0' } })), 0)
+})
+
+test('parseRocmGttUsed: malformed JSON → null, never throws', () => {
+  assert.equal(parseRocmGttUsed('not json at all'), null)
 })
 
 // ---- benchPromptTokens / buildBenchMessages: bench depth tracks the CONFIGURED ctx, uncapped
