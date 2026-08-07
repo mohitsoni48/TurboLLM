@@ -689,35 +689,57 @@ export class BenchRunner {
     //
     // So both anchors are INTERIOR points in the low-residency (high CPU offload) region: far enough
     // from maxN to be on the linear trend, far enough from 0 to be nowhere near saturation.
-    const anchorGap = Math.max(2, Math.round(maxN / 5))
-    const anchorHi = maxN - anchorGap
-    const anchorLo = maxN - 2 * anchorGap
-    // Both must be real interior points; otherwise skip calibration and fail open (spill detection
-    // sits out, search behaves exactly as before). Small models that can't satisfy this generally
-    // fit comfortably anyway.
-    const anchorPoints = anchorLo >= 1 && anchorHi < maxN ? [anchorHi, anchorLo] : []
-    const anchors: ResidencySample[] = []
-    for (const n of anchorPoints) {
-      if (this.cancelled || Date.now() > this.deadline) break
+    // On a model much larger than VRAM the anchors can THEMSELVES be spilling, and the delta
+    // between two capped readings measures only what FIT rather than what was requested. Measured
+    // live on Ling-3.0-flash (39 GB / 42 blocks, ~934 MB per block) on a 16 GB card: anchors landed
+    // at 15754 MB with 549 MB free, calibration came out at 378.5 MB/expert (40% of plausible), and
+    // a config carrying 4419 MB of real spill was accepted because the corrupted ruler scored it at
+    // 358 MB.
+    //
+    // The answer is to RE-DERIVE the slope, not to discard it. Discarding is actively worse: on that
+    // same run the corrupted slope still rejected nCpuMoe=21/23/24 and pushed the search up to 25,
+    // whereas with no slope at all every reading sits under the fit line and the search dives to ~0,
+    // leaving the crash-backoff to climb ~30 failed benches instead of 5. So on an implausible slope
+    // we halve the gap — moving both anchors toward maxN, where VRAM is genuinely free — and retry.
+    // Already-probed knobs are reused, so a retry usually costs ONE extra probe (~20 s).
+    const probedAnchors = new Map<number, number | null>()
+    const probeAnchor = async (n: number): Promise<number | null> => {
+      const cached = probedAnchors.get(n)
+      if (cached !== undefined) return cached
       this.state = { ...this.state, step: `KV ${base.kvTypeK}: calibrating spill detection (nCpuMoe=${n})…`, candidates: results }
-      const probe = await this.probeVram(entry, sys, { ...base, nCpuMoe: n }, caps)
-      this.pushProbe(results, base, 'nCpuMoe', n, probe)
+      const p = await this.probeVram(entry, sys, { ...base, nCpuMoe: n }, caps)
+      this.pushProbe(results, base, 'nCpuMoe', n, p)
       await this.settleGpu(sys)
-      anchors.push({ knob: n, vramMb: probe.vramAbsMb })
+      probedAnchors.set(n, p.vramAbsMb)
+      return p.vramAbsMb
     }
-    let slope = residencySlope(anchors)
-    // Reference = the lowest-residency anchor that actually produced a reading.
-    const ref = anchors.filter((a): a is { knob: number; vramMb: number } => a.vramMb !== null).sort((a, b) => b.knob - a.knob)[0]
-    // Sanity-check the slope against the model's own geometry. On a model much larger than VRAM the
-    // anchors themselves can already be spilling, in which case the delta between them measures only
-    // what FIT, not what was requested — and every prediction built on it under-reports spill, which
-    // is the dangerous direction. Measured live on Ling-3.0-flash (39 GB / 42 blocks, ~934 MB per
-    // block) on a 16 GB card: the anchors landed at 15754 MB with 549 MB free, calibration came out
-    // at 378.5 MB/expert (40% of plausible), and a config carrying 4419 MB of real spill was accepted
-    // because the corrupted ruler scored it at 358 MB.
-    if (slope !== null && slopeImplausible(slope, entry.sizeBytes, entry.blockCount)) {
+
+    let slope: number | null = null
+    let ref: { knob: number; vramMb: number } | undefined
+    let anchorGap = Math.max(2, Math.round(maxN / 5))
+    for (let attempt = 0; attempt < 3 && !this.cancelled && Date.now() <= this.deadline; attempt++) {
+      const anchorHi = maxN - anchorGap
+      const anchorLo = maxN - 2 * anchorGap
+      // Both must be real interior points — never maxN itself (a degenerate endpoint off the line)
+      // and never below 1. Models too small to satisfy this fit comfortably anyway.
+      if (anchorLo < 1) break
+      const anchors: ResidencySample[] = [
+        { knob: anchorHi, vramMb: await probeAnchor(anchorHi) },
+        { knob: anchorLo, vramMb: await probeAnchor(anchorLo) },
+      ]
+      slope = residencySlope(anchors)
+      ref = anchors.filter((a): a is { knob: number; vramMb: number } => a.vramMb !== null).sort((a, b) => b.knob - a.knob)[0]
+      if (slope === null || !ref) break
+      if (!slopeImplausible(slope, entry.sizeBytes, entry.blockCount)) break // trustworthy — done
       const perBlockMb = Math.round(entry.sizeBytes / 1e6 / entry.blockCount)
-      this.emit(`spill detection disabled: calibrated ${slope.toFixed(1)} MB/expert is implausibly low for this model (~${perBlockMb} MB per block) — the calibration probes are themselves spilling, so the slope only measures what fit. Searching on fit alone.`)
+      const nextGap = Math.floor(anchorGap / 2)
+      if (nextGap < 2) {
+        this.emit(`spill detection unavailable: calibration keeps landing on probes that are themselves spilling (last ${slope.toFixed(1)} MB/expert vs ~${perBlockMb} MB per block) — searching on fit alone`)
+        slope = null
+        break
+      }
+      this.emit(`calibration at nCpuMoe=${anchorHi}/${anchorLo} gave ${slope.toFixed(1)} MB/expert — implausibly low for ~${perBlockMb} MB per block, so those probes are themselves spilling; re-anchoring closer to nCpuMoe=${maxN}`)
+      anchorGap = nextGap
       slope = null
     }
     if (slope === null || !ref) {
