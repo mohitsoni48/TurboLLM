@@ -6,6 +6,7 @@ import type { Status } from '../lib/types'
 import { useRoutinesWithLatestRun } from '../lib/routine-queries'
 import { useSettings } from '../lib/queries'
 import { track } from '../lib/api'
+import { rememberWorkspacePath, resolveNavTarget } from '../lib/workspace-nav'
 import { StateChip } from './StateChip'
 import { BoltMark } from './Logo'
 import { EngineProvisionBanner } from './EngineProvisionBanner'
@@ -66,6 +67,13 @@ function NavRail({
   const engineState = status?.engine.state ?? 'stopped'
   const activeDownloads = status?.downloads.active ?? 0
 
+  // Record the current /workspace/* sub-route (Chat conversation, Code session, or Routines) so
+  // the Workspace nav item can return here later instead of always landing on a new chat — see
+  // workspace-nav.ts's own header comment for the founder-reported bug this fixes.
+  useEffect(() => {
+    rememberWorkspacePath(pathname)
+  }, [pathname])
+
   // Routines parked at needs_approval (spec 20 §2.1). Read live on every render — nothing is
   // latched — and `useRoutinesWithLatestRun` polls on its own (15s on both the routines list and
   // each routine's runs), so this clears itself once an approval is answered from anywhere,
@@ -117,7 +125,7 @@ function NavRail({
       const editable = (document.activeElement as HTMLElement | null)?.isContentEditable
       if (tag === 'INPUT' || tag === 'TEXTAREA' || editable) return
       e.preventDefault()
-      navigate(NAV[idx].to)
+      navigate(resolveNavTarget(NAV[idx].to))
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
@@ -171,7 +179,7 @@ function NavRail({
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Link
-                    to={to}
+                    to={resolveNavTarget(to)}
                     aria-label={badge ? `${label} (${badge} ${badgeNoun})` : label}
                     aria-current={isActive ? 'page' : undefined}
                     className={cn(
@@ -248,23 +256,30 @@ function NavRail({
 }
 
 function MobileNav() {
+  // Computed manually off the STATIC `to` (same as NavRail above), not left to NavLink's own
+  // `isActive` — that matches against the `to` PROP, which for Workspace is now a moving target
+  // (resolveNavTarget's remembered sub-route). A NavLink-computed isActive would go stale the
+  // moment the user is on a DIFFERENT Workspace sub-route than whichever one happens to be
+  // remembered right now, reading "not active" while genuinely inside Workspace.
+  const { pathname } = useLocation()
   return (
     <nav className="flex shrink-0 border-t border-border bg-panel-2 md:hidden">
-      {NAV.map(({ to, label, icon: Icon }) => (
-        <NavLink
-          key={to}
-          to={to}
-          className={({ isActive }: { isActive: boolean }) =>
-            cn(
+      {NAV.map(({ to, label, icon: Icon }) => {
+        const isActive = pathname === to || pathname.startsWith(`${to}/`)
+        return (
+          <NavLink
+            key={to}
+            to={resolveNavTarget(to)}
+            className={cn(
               'flex flex-1 flex-col items-center justify-center gap-1 py-2 text-[10px] transition-colors',
               isActive ? 'text-accent' : 'text-muted',
-            )
-          }
-        >
-          <Icon size={20} />
-          <span>{label}</span>
-        </NavLink>
-      ))}
+            )}
+          >
+            <Icon size={20} />
+            <span>{label}</span>
+          </NavLink>
+        )
+      })}
     </nav>
   )
 }
