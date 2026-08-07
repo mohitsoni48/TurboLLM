@@ -418,6 +418,55 @@ export function waitOrPing(pending: Promise<unknown>, ms: number): Promise<'data
   })
 }
 
+/** Generalizes streamToAnthropic's own fixed-schedule ping loop (see the ADR-342 postmortem
+ *  below) to ANY long-running wait, not just a stream read — gateway.ts uses this to keep a
+ *  client's connection alive while queued for an engine slot (up to 600s, ADR-347) and while
+ *  waiting on `fetch()` to the engine, both of which are just as silent to the client as a slow
+ *  prefill and were invisible to the original ping fix, which only covered the read loop AFTER
+ *  the engine had already accepted the request. Same fixed-cadence-from-start reasoning: a
+ *  schedule that resets on every settle-check would starve under a `pending` that itself emits
+ *  frequent progress, though callers here don't have that failure mode today. Resolves/rejects
+ *  exactly as `pending` does; `emitPing` fires each time the deadline elapses first. */
+export async function pingWhilePending<T>(
+  pending: Promise<T>,
+  emitPing: () => Promise<void> | void,
+  pingIntervalMs: number = DEFAULT_PING_INTERVAL_MS,
+): Promise<T> {
+  pending.catch(() => {}) // same unhandled-rejection guard as the loop below — see anthropic.ts:481-492's comment
+  let nextPingAt = Date.now() + pingIntervalMs
+  while (true) {
+    const remaining = Math.max(0, nextPingAt - Date.now())
+    const outcome = remaining === 0 ? 'ping' : await waitOrPing(pending, remaining)
+    if (outcome === 'ping') {
+      await emitPing()
+      nextPingAt = Date.now() + pingIntervalMs
+      continue
+    }
+    return pending
+  }
+}
+
+/** The `message_start` event streamToAnthropic normally yields first, extracted so gateway.ts
+ *  can send it the moment it opens the client's SSE connection — before queueing for an engine
+ *  slot — instead of only once the engine has actually accepted the request. Real Anthropic
+ *  behavior: message_start marks the request being ACCEPTED, not generation starting; waiting
+ *  for engine bytes to send it would reintroduce exactly the silent gap ADR-347 exists to close.
+ *  Paired with streamToAnthropic's `skipMessageStart` so it's never sent twice. */
+export function messageStartEvent(msgId: string, modelName: string): SseEvent {
+  return sse('message_start', {
+    message: {
+      id: msgId,
+      type: 'message',
+      role: 'assistant',
+      content: [],
+      model: modelName,
+      stop_reason: null,
+      stop_sequence: null,
+      usage: { input_tokens: 0, output_tokens: 1 },
+    },
+  })
+}
+
 export async function* streamToAnthropic(
   oaiStream: ReadableStream<Uint8Array>,
   modelName: string,
@@ -426,6 +475,10 @@ export async function* streamToAnthropic(
   onLive?: (p: LiveProgress) => void,
   onToolCalls?: (calls: StreamToolCall[]) => void,
   pingIntervalMs: number = DEFAULT_PING_INTERVAL_MS,
+  // Set when the caller already sent messageStartEvent() itself (gateway.ts, ADR-347) before
+  // this generator was even constructed — e.g. right when the client's SSE connection opens,
+  // ahead of queueing for an engine slot. Emitting it again here would send message_start twice.
+  skipMessageStart: boolean = false,
 ): AsyncGenerator<SseEvent> {
   let blockIdx = 0
   let inThinking = false
@@ -443,18 +496,7 @@ export async function* streamToAnthropic(
   let genTps = 0
   let liveOut = 0 // running generated-token count for the live engine-card row
 
-  yield sse('message_start', {
-    message: {
-      id: msgId,
-      type: 'message',
-      role: 'assistant',
-      content: [],
-      model: modelName,
-      stop_reason: null,
-      stop_sequence: null,
-      usage: { input_tokens: 0, output_tokens: 1 },
-    },
-  })
+  if (!skipMessageStart) yield messageStartEvent(msgId, modelName)
 
   const reader = oaiStream.getReader()
   const dec = new TextDecoder()

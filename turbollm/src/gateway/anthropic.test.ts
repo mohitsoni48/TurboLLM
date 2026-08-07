@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { clampMaxTokens } from '../config/config'
-import { mapToOpenAI, streamToAnthropic, waitOrPing, type LiveProgress } from './anthropic'
+import { mapToOpenAI, streamToAnthropic, waitOrPing, pingWhilePending, messageStartEvent, type LiveProgress } from './anthropic'
 
 // ── clampMaxTokens ──────────────────────────────────────────────────────────
 
@@ -653,6 +653,71 @@ test('waitOrPing: a pending promise that eventually REJECTS still resolves "data
   // by real callers afterward (streamToAnthropic re-awaits it to surface the real error).
   pending.catch(() => { /* the real caller's job, not this assertion's */ })
   assert.equal(await waitOrPing(pending, 50), 'data')
+})
+
+// ── pingWhilePending (ADR-347: generalizes the same fixed-schedule ping loop to gateway.ts's
+// engine-slot queue wait and fetch() call, not just streamToAnthropic's own read loop — a
+// queued Task-tool sub-agent is exactly as silent to the client as a slow prefill was) ────────
+
+test('pingWhilePending: resolves to the pending value with no pings when it settles well within the window', async () => {
+  let pings = 0
+  const result = await pingWhilePending(Promise.resolve('ok'), () => { pings++ }, 50)
+  assert.equal(result, 'ok')
+  assert.equal(pings, 0)
+})
+
+test('pingWhilePending: pings on a fixed schedule while genuinely queued, then resolves once it settles', async () => {
+  let pings = 0
+  const pending = new Promise((resolve) => setTimeout(() => resolve('granted'), 90))
+  const result = await pingWhilePending(pending, () => { pings++ }, 20)
+  assert.equal(result, 'granted')
+  // ~90ms of waiting on a 20ms cadence must produce multiple pings — a lower bound, not an exact
+  // count, to avoid the same timer-jitter flakiness the streamToAnthropic ping tests avoid too.
+  assert.ok(pings >= 2, `expected multiple pings while queued, got ${pings}`)
+})
+
+test('pingWhilePending: propagates a rejection (e.g. a gate timeout) rather than swallowing it', async () => {
+  const pending = Promise.reject(new Error('gate_acquire_timeout'))
+  await assert.rejects(() => pingWhilePending(pending, () => {}, 50), /gate_acquire_timeout/)
+})
+
+test('pingWhilePending: emitPing errors do not stop the wait from eventually resolving', async () => {
+  const pending = new Promise((resolve) => setTimeout(() => resolve('ok'), 45))
+  let attempts = 0
+  const result = await pingWhilePending(pending, () => { attempts++; throw new Error('client write failed') }, 20)
+    .catch((e: Error) => e.message)
+  // A throwing emitPing rejects the whole wait immediately (the SSE write itself failed, so the
+  // connection is gone) rather than silently continuing to poll a dead connection.
+  assert.equal(result, 'client write failed')
+  assert.ok(attempts >= 1)
+})
+
+test('messageStartEvent: same shape streamToAnthropic used to yield inline, for gateway.ts to send ahead of the queue wait (ADR-347)', () => {
+  const evt = messageStartEvent('msg_abc123', 'local-model')
+  assert.equal(evt.event, 'message_start')
+  const parsed = JSON.parse(evt.data) as { type: string; message: { id: string; role: string; model: string; content: unknown[] } }
+  assert.equal(parsed.type, 'message_start')
+  assert.equal(parsed.message.id, 'msg_abc123')
+  assert.equal(parsed.message.role, 'assistant')
+  assert.equal(parsed.message.model, 'local-model')
+  assert.deepEqual(parsed.message.content, [])
+})
+
+test('streamToAnthropic: skipMessageStart omits the event the caller already sent itself', async () => {
+  const enc = new TextEncoder()
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(enc.encode('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'))
+      controller.enqueue(enc.encode('data: [DONE]\n\n'))
+      controller.close()
+    },
+  })
+  const events = []
+  for await (const evt of streamToAnthropic(stream, 'local-model', 'msg_1', undefined, undefined, undefined, undefined, true)) {
+    events.push(evt.event)
+  }
+  assert.ok(!events.includes('message_start'), 'message_start must not be sent twice')
+  assert.ok(events.includes('content_block_start'), 'the real content must still stream normally')
 })
 
 test('streamToAnthropic emits ping frames while the upstream stalls, before any real data arrives', async () => {
