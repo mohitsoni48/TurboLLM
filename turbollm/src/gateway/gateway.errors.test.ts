@@ -182,3 +182,138 @@ test('POST /v1/messages with an already-aborted client signal reports a clear di
   const body = (await res.json()) as { error?: { message: string; type: string } }
   assert.equal(body.error?.message, 'Client disconnected before the engine responded.')
 })
+
+// ── /v1/messages streaming (stream: true) — same four failure classes as above, but the
+// response is already committed as a 200 SSE stream by the time any of these can be detected
+// (ADR-347), so the failure surfaces as a mid-stream `error` event instead of a JSON response with
+// a real status code. Review-caught gap: every case above used `stream: false`, so this behavior
+// change for the ONLY request shape Claude Code actually sends (it always streams) had zero
+// coverage. These tests document the accepted tradeoff explicitly, not just assert it's unchanged.
+
+const streamingMessagesBody = JSON.stringify({ model: 'qwen3-8b|Q4|123', messages: [], max_tokens: 100, stream: true })
+
+/** Reads SSE `{event, data}` frames off a Response body as they arrive — same shape as
+ *  gateway.queue-ping.test.ts's own reader, duplicated locally rather than shared across test
+ *  files (matching this suite's existing per-file `withFakeEngine`/`fakeDeps` convention). */
+function sseEventReader(body: ReadableStream<Uint8Array>) {
+  const reader = body.getReader()
+  const dec = new TextDecoder()
+  let buf = ''
+  return {
+    async next(): Promise<{ event: string; data: string } | null> {
+      while (true) {
+        const frameEnd = buf.indexOf('\n\n')
+        if (frameEnd !== -1) {
+          const frame = buf.slice(0, frameEnd)
+          buf = buf.slice(frameEnd + 2)
+          const event = frame.match(/^event: (.+)$/m)?.[1] ?? ''
+          const data = frame.match(/^data: (.*)$/m)?.[1] ?? ''
+          return { event, data }
+        }
+        const { done, value } = await reader.read()
+        if (done) return null
+        buf += dec.decode(value, { stream: true })
+      }
+    },
+  }
+}
+
+async function firstNonPingEvent(body: ReadableStream<Uint8Array>): Promise<{ event: string; data: string }> {
+  const events = sseEventReader(body)
+  for (;;) {
+    const evt = await events.next()
+    assert.ok(evt, 'stream ended before a non-ping event arrived')
+    if (evt!.event !== 'message_start' && evt!.event !== 'ping') return evt!
+  }
+}
+
+test('POST /v1/messages (streaming) forwards the engine\'s real error as an SSE event on a 200, not a 400 JSON response', async () => {
+  const engine = await withFakeEngine((_req, res) => {
+    res.writeHead(400, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ error: { message: 'the request exceeds the available context size', type: 'invalid_request_error' } }))
+  })
+  try {
+    const app = new Hono()
+    registerGateway(app, fakeDeps(engine.url))
+    const res = await app.request('/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: streamingMessagesBody,
+    })
+    assert.equal(res.status, 200, 'a streaming response is always 200 once the SSE connection has opened')
+    assert.ok(res.body)
+    const evt = await firstNonPingEvent(res.body!)
+    assert.equal(evt.event, 'error')
+    const parsed = JSON.parse(evt.data) as { error: { type: string; message: string } }
+    assert.equal(parsed.error.type, 'invalid_request_error')
+    assert.equal(parsed.error.message, 'the request exceeds the available context size')
+  } finally {
+    await engine.close()
+  }
+})
+
+test('POST /v1/messages (streaming) falls back to raw text + a status-mapped type in the SSE error event when the engine body is not JSON', async () => {
+  const engine = await withFakeEngine((_req, res) => {
+    res.writeHead(503, { 'Content-Type': 'text/plain' })
+    res.end('CUDA out of memory')
+  })
+  try {
+    const app = new Hono()
+    registerGateway(app, fakeDeps(engine.url))
+    const res = await app.request('/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: streamingMessagesBody,
+    })
+    assert.equal(res.status, 200)
+    assert.ok(res.body)
+    const evt = await firstNonPingEvent(res.body!)
+    assert.equal(evt.event, 'error')
+    const parsed = JSON.parse(evt.data) as { error: { type: string; message: string } }
+    assert.equal(parsed.error.type, 'overloaded_error')
+    assert.equal(parsed.error.message, 'CUDA out of memory')
+  } finally {
+    await engine.close()
+  }
+})
+
+test('POST /v1/messages (streaming) reports an SSE error event, not a bodyless 500, when the engine fetch throws', async () => {
+  const app = new Hono()
+  registerGateway(app, fakeDeps()) // default fakeDeps target is genuinely unreachable
+
+  const res = await app.request('/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: streamingMessagesBody,
+  })
+
+  assert.equal(res.status, 200)
+  assert.ok(res.body)
+  const evt = await firstNonPingEvent(res.body!)
+  assert.equal(evt.event, 'error')
+  const parsed = JSON.parse(evt.data) as { error: { type: string; message: string } }
+  assert.equal(parsed.error.type, 'api_error')
+  assert.ok(parsed.error.message.length > 0, 'message must not be empty')
+})
+
+test('POST /v1/messages (streaming) with an already-aborted client signal reports a clear disconnect message as an SSE event', async () => {
+  const app = new Hono()
+  registerGateway(app, fakeDeps())
+
+  const ac = new AbortController()
+  ac.abort() // simulate the client having already disconnected before the fetch fires
+
+  const res = await app.request('/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: streamingMessagesBody,
+    signal: ac.signal,
+  })
+
+  assert.equal(res.status, 200)
+  assert.ok(res.body)
+  const evt = await firstNonPingEvent(res.body!)
+  assert.equal(evt.event, 'error')
+  const parsed = JSON.parse(evt.data) as { error: { type: string; message: string } }
+  assert.equal(parsed.error.message, 'Client disconnected before the engine responded.')
+})

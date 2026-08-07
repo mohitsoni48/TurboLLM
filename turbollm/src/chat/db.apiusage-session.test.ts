@@ -104,14 +104,58 @@ test('getLastApiUsageForSession: null tps when no duration was recorded (e.g. An
   }
 })
 
-test('getLastApiUsageForSession: only ever returns the MOST RECENT row for that session', () => {
+test('getLastApiUsageForSession: a later, larger row wins as both ctxUsed and the last-turn stats', () => {
   const root = makeTmpRoot()
   const db = new ConversationStore(root)
   try {
     db.recordApiUsage({ source: 'anthropic', modelKey: 'm1', promptTokens: 100, genTokens: 10, codeSessionId: 'sess-3', durationMs: 1000 })
     db.recordApiUsage({ source: 'anthropic', modelKey: 'm1', promptTokens: 200, genTokens: 20, codeSessionId: 'sess-3', durationMs: 1000 })
     const usage = db.getLastApiUsageForSession('sess-3')
-    assert.equal(usage!.promptTokens, 200, 'must be the second (later) row, not the first')
+    assert.equal(usage!.ctxUsed, 200, 'the ring must reflect the larger row')
+    assert.equal(usage!.promptTokens, 200, 'must be the second (later, larger) row, not the first')
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('getLastApiUsageForSession: ctxUsed (ring) and last-turn stats are two different rows when a smaller request lands after a bigger one (ctx-fill flicker fix, review-caught follow-up)', () => {
+  const root = makeTmpRoot()
+  const db = new ConversationStore(root)
+  try {
+    // Shaped like a real terminal-agent session: the main conversation's own turn (large,
+    // ever-growing prompt) followed by a parallel Task-tool sub-agent call the CLI spawned for a
+    // small, isolated sub-task — both share the SAME code_session_id (resolveCodeSession keys
+    // purely off the CLI's one ANTHROPIC_AUTH_TOKEN), and the sub-agent's own request happens to
+    // finish and get recorded second. Before the original fix, "most recent row wins" made the
+    // Context ring flicker down to the sub-agent's tiny prompt size every time this ordering
+    // occurred, even though the real conversation never shrank. That fix then shipped a second
+    // bug (caught in review before tagging): it made EVERY field — including genTokens/tps, which
+    // describe the actual last turn, not the session high-water mark — pin to the bigger row too,
+    // so the sub-agent's own real stats never showed and, after a `/clear`, would freeze forever.
+    db.recordApiUsage({ source: 'anthropic', modelKey: 'm1', promptTokens: 98259, genTokens: 400, codeSessionId: 'sess-3b', durationMs: 5000, promptTps: 5000, genTps: 50 })
+    db.recordApiUsage({ source: 'anthropic', modelKey: 'm1', promptTokens: 1200, genTokens: 30, codeSessionId: 'sess-3b', durationMs: 500, promptTps: 3000, genTps: 60 })
+    const usage = db.getLastApiUsageForSession('sess-3b')
+    assert.equal(usage!.ctxUsed, 98259, 'the ring must keep the real, larger main-turn prompt, not drop to the later sub-agent call')
+    assert.equal(usage!.promptTokens, 1200, 'the last-turn stat must be the ACTUAL last request, the sub-agent call')
+    assert.equal(usage!.genTokens, 30, 'same — must not borrow the earlier, bigger turn\'s gen count')
+    assert.equal(usage!.promptTps, 3000)
+    assert.equal(usage!.genTps, 60)
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('getLastApiUsageForSession: ties on prompt_tokens still resolve the last-turn stats to the more recent row', () => {
+  const root = makeTmpRoot()
+  const db = new ConversationStore(root)
+  try {
+    db.recordApiUsage({ source: 'anthropic', modelKey: 'm1', promptTokens: 500, genTokens: 10, codeSessionId: 'sess-3c', durationMs: 1000, promptTps: 111 })
+    db.recordApiUsage({ source: 'anthropic', modelKey: 'm1', promptTokens: 500, genTokens: 20, codeSessionId: 'sess-3c', durationMs: 1000, promptTps: 222 })
+    const usage = db.getLastApiUsageForSession('sess-3c')
+    assert.equal(usage!.ctxUsed, 500)
+    assert.equal(usage!.promptTps, 222, 'the more recent of two equal-sized rows must win')
   } finally {
     db.close()
     rmSync(root, { recursive: true, force: true })

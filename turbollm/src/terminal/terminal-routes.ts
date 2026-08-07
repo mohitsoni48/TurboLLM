@@ -95,8 +95,8 @@ const AUTO_MODE_ALLOWED_TOOLS: Partial<Record<string, readonly string[]>> = {
  *  half-sent instruction is worse than a message the user can see was not sent. */
 export const MAX_SEEDED_MESSAGE_CHARS = 4000
 
-/** Characters that do not survive the trip to the CLI intact, so a message containing them is not
- *  seeded at all.
+/** Characters that do not survive the trip to the CLI intact even after normalization (below), so
+ *  a message containing one is not seeded at all.
  *
  *  Measured, not assumed (pre-release review, 2026-08-01). The launch command is parsed by
  *  PowerShell before `turbollm launch` ever re-spawns the CLI, and PowerShell 5.1 does not escape
@@ -108,17 +108,40 @@ export const MAX_SEEDED_MESSAGE_CHARS = 4000
  *  PowerShell's own native-argument marshalling.
  *
  *  Not seeding is the honest outcome: the user retypes the message (exactly the behaviour before
- *  seeding existed), rather than the agent silently acting on a corrupted version of it. */
-const UNSEEDABLE = /["\u0000-\u001f]/
+ *  seeding existed), rather than the agent silently acting on a corrupted version of it.
+ *
+ *  Deliberately narrower than "every C0 control code" (founder-reported, 2026-08-07: a fresh
+ *  Code session's first message silently never reached the CLI). The composer's own hint text
+ *  advertises "Shift+Enter for newline", so a multi-line task description is the NORMAL case, not
+ *  an edge case — and the original `\u0000-\u001f` range caught `\n`/`\r`/`\t` right along with
+ *  the genuinely dangerous control bytes, so almost any multi-sentence task silently produced an
+ *  empty terminal. Line breaks and tabs are folded to spaces by `normalizeSeededMessage` instead
+ *  of being rejected — measured safe (they cannot smuggle a `"` or a trailing `\` past the fold).
+ *  What's still blocked here is the genuine remainder: a literal quote, and any other non-
+ *  printable control byte (NUL, ESC, …) that has no safe single-line form and could otherwise
+ *  inject a terminal escape sequence once it reaches the PTY. */
+const UNSEEDABLE = /["\u0000-\u0008\u000b\u000c\u000e-\u001f]/
 
-/** Whether this message can be handed to the CLI as a launch argument. */
+/** Fold a message's own line breaks and tabs into plain spaces before it crosses the PowerShell
+ *  `-Command "…"` boundary — see UNSEEDABLE's own comment for why a literal one can't survive
+ *  that trip today. Collapses a run of them to ONE space (so a blank line between paragraphs
+ *  doesn't read as a stutter) and re-trims the result, since folding can expose new leading/
+ *  trailing whitespace (e.g. a message ending in `\n`). Pure/exported so both the eligibility
+ *  check and the actual quoted text agree on exactly what "the message" is. */
+export function normalizeSeededMessage(message: string): string {
+  return message.replace(/[\r\n\t]+/g, ' ').trim()
+}
+
+/** Whether this message can be handed to the CLI as a launch argument. Tests the NORMALIZED text
+ *  (line breaks/tabs already folded) — a message that's only "unseedable" because of a newline is
+ *  seedable once folded; `MAX_SEEDED_MESSAGE_CHARS` and UNSEEDABLE both apply to that same text. */
 export function canSeedFirstMessage(message: string, agent: string): boolean {
   if (agent !== 'claude') return false
-  const trimmed = message.trim()
-  if (trimmed.length === 0 || trimmed.length > MAX_SEEDED_MESSAGE_CHARS) return false
-  if (UNSEEDABLE.test(trimmed)) return false
+  const normalized = normalizeSeededMessage(message)
+  if (normalized.length === 0 || normalized.length > MAX_SEEDED_MESSAGE_CHARS) return false
+  if (UNSEEDABLE.test(normalized)) return false
   // A trailing backslash is mangled into a quote by the same marshalling.
-  if (trimmed.endsWith('\\')) return false
+  if (normalized.endsWith('\\')) return false
   return true
 }
 
@@ -161,7 +184,7 @@ export function buildTerminalLaunchCommand(
   // Quoting matters more than usual here — this is arbitrary user prose reaching a command line,
   // where an apostrophe in "don't" would otherwise terminate the string.
   const promptArg = firstMessage && canSeedFirstMessage(firstMessage, agent)
-    ? ` ${quotePtyShellArg(firstMessage.trim())}`
+    ? ` ${quotePtyShellArg(normalizeSeededMessage(firstMessage))}`
     : ''
   return `turbollm launch ${agent}${promptArg} --port ${port} --token ${token}${sessionArg}${modeArg}${allowedArg}`
 }

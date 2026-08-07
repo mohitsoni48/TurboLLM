@@ -14,6 +14,7 @@ import {
 import { CodeSessionClient, type LiveState } from '../../lib/code-session-client'
 import { matchCodeCommand, pickerCodeCommands } from '../../lib/code-commands'
 import { toggleDisplayPref } from '../../lib/code-display-prefs'
+import { useWorkspaceSidebarOpen } from '../../lib/workspace-sidebar'
 import { Button, buttonVariants } from '../../components/ui/button'
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
@@ -261,7 +262,7 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
   const userScrolledUp = useRef(false)
   const [showScrollBtn, setShowScrollBtn] = useState(false)
 
-  const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [sidebarOpen, setSidebarOpen] = useWorkspaceSidebarOpen()
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
   const [sidebarWidth, setSidebarWidth] = useState(() => Math.min(Math.max(readSavedSidebarWidth(), SIDEBAR_MIN_W), sidebarMaxW()))
   const sidebarRef = useRef<HTMLDivElement>(null)
@@ -844,11 +845,14 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
               // forever. Measured live on 2026-07-29 against the founder's own `claude` session:
               // persisted message said 30,645 tokens / 15% (written two days earlier, and the
               // number in the screenshot that prompted this fix) while the CLI's actual context
-              // at that moment was 98,259 / 49%. The last gateway request's prompt size IS this
-              // conversation's real current context — an Anthropic-style CLI resends the whole
-              // conversation every turn — and it's already polled for the footer's ↑ figure, so
-              // it costs nothing extra and is the same quantity `ctxUsed` means for a chat turn.
-              ctxUsed={lastUsage?.promptTokens ?? 0}
+              // at that moment was 98,259 / 49%. The session's largest gateway request's prompt
+              // size IS this conversation's real current context — an Anthropic-style CLI resends
+              // the whole conversation every turn. `ctxUsed` here is deliberately a DIFFERENT
+              // field from `lastPromptTokens` below (db.ts's getLastApiUsageForSession splits
+              // them): this one is the session high-water mark, that one is literally the last
+              // gateway request's own stats — a parallel Task-tool sub-agent call can be the most
+              // recent request without being the biggest one.
+              ctxUsed={lastUsage?.ctxUsed ?? 0}
               ctxMax={ctxMax}
               thinkingBudget={thinkingBudget}
               onThinkingBudgetChange={setThinkingBudget}

@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { EventEmitter } from 'node:events'
-import { launchCli } from './cli-launch.js'
+import { launchCli, clampAutoCompactWindow } from './cli-launch.js'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -417,6 +417,89 @@ test('launchCli sets NO cap when the engine advertises no slot count', async () 
   try {
     await launchCli('claude', 6996, [], fn, undefined, fetchWithSlots(undefined))
     assert.equal(calls[0].env['CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS'], undefined)
+  } finally {
+    unsilence()
+  }
+})
+
+// ── CLAUDE_CODE_AUTO_COMPACT_WINDOW / CLAUDE_AUTOCOMPACT_PCT_OVERRIDE ──────────────────────────
+// Founder-reported: the terminal-agent `claude` CLI "never auto-compacts at 80%, always reaches
+// 100% and fails". Root cause (Claude Code's own docs, code-window#set-the-auto-compact-window):
+// with no override, the CLI compacts only once the conversation nears "the model's context
+// limit" — its OWN generic ~200K assumption for an unrecognized model, not the real, often much
+// smaller local ctx. Pinning CLAUDE_CODE_AUTO_COMPACT_WINDOW to the real loaded ctx (clamped to
+// the CLI's own documented [100_000, 1_000_000] range) fixes this for ctx >= 100K and tightens
+// the over-generous default below that; CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80 matches this
+// codebase's own established 80%-of-window convention (ADR-132).
+
+test('clampAutoCompactWindow: passes a value already inside the documented range through unchanged', () => {
+  assert.equal(clampAutoCompactWindow(200_000), 200_000)
+})
+
+test('clampAutoCompactWindow: floors at 100_000 for a small local context (e.g. 8K/32K)', () => {
+  assert.equal(clampAutoCompactWindow(8192), 100_000)
+  assert.equal(clampAutoCompactWindow(32768), 100_000)
+})
+
+test('clampAutoCompactWindow: ceilings at 1_000_000 for a very large context', () => {
+  assert.equal(clampAutoCompactWindow(2_000_000), 1_000_000)
+})
+
+test('clampAutoCompactWindow: rounds a non-integer ctx to the nearest whole token count', () => {
+  assert.equal(clampAutoCompactWindow(131_072.4), 131_072)
+})
+
+/** A status fetch that reports a real loaded-model ctx, mirroring fetchWithSlots above. */
+function fetchWithCtx(ctx: number | undefined): typeof fetch {
+  const fn = async (input: string | URL | globalThis.Request): Promise<Response> => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+    if (url.includes('/api/v1/status')) {
+      const model: Record<string, unknown> = { key: MODELS[0].key, name: MODELS[0].name }
+      if (ctx !== undefined) model.ctx = ctx
+      return {
+        ok: true, status: 200,
+        json: async () => ({ engine: { state: 'running' }, model }),
+      } as Response
+    }
+    return { ok: false, status: 404, json: async () => ({}) } as Response
+  }
+  return fn as unknown as typeof fetch
+}
+
+test('launchCli pins CLAUDE_CODE_AUTO_COMPACT_WINDOW to the real loaded ctx and sets the 80% override', async () => {
+  const { calls, fn } = makeSpawn()
+  const unsilence = silenceOutput()
+  try {
+    await launchCli('claude', 6996, [], fn, undefined, fetchWithCtx(200_000))
+    assert.equal(calls[0].env['CLAUDE_CODE_AUTO_COMPACT_WINDOW'], '200000')
+    assert.equal(calls[0].env['CLAUDE_AUTOCOMPACT_PCT_OVERRIDE'], '80')
+  } finally {
+    unsilence()
+  }
+})
+
+test('launchCli clamps CLAUDE_CODE_AUTO_COMPACT_WINDOW to the CLI-documented 100_000 floor for a small local ctx', async () => {
+  const { calls, fn } = makeSpawn()
+  const unsilence = silenceOutput()
+  try {
+    await launchCli('claude', 6996, [], fn, undefined, fetchWithCtx(8192))
+    assert.equal(calls[0].env['CLAUDE_CODE_AUTO_COMPACT_WINDOW'], '100000')
+  } finally {
+    unsilence()
+  }
+})
+
+test('launchCli sets NO CLAUDE_CODE_AUTO_COMPACT_WINDOW when the daemon reports no real ctx', async () => {
+  // Absent/zero ctx means "don't know" — guessing a window here would be worse than leaving the
+  // CLI's own generic default in place.
+  const { calls, fn } = makeSpawn()
+  const unsilence = silenceOutput()
+  try {
+    await launchCli('claude', 6996, [], fn, undefined, fetchWithCtx(undefined))
+    assert.equal(calls[0].env['CLAUDE_CODE_AUTO_COMPACT_WINDOW'], undefined)
+    // The 80% override is independent of knowing ctx — it only ever lowers the CLI's own
+    // threshold within whatever window it ends up using, so it's always safe to set.
+    assert.equal(calls[0].env['CLAUDE_AUTOCOMPACT_PCT_OVERRIDE'], '80')
   } finally {
     unsilence()
   }

@@ -392,14 +392,115 @@ export type LiveProgress = { phase: 'prompt' | 'gen'; pct: number; outputTokens:
  *  never reports back, so the request stream is the only place the daemon ever sees them). */
 export type StreamToolCall = { id: string; name: string; input: unknown }
 
+// ── Keep-alive pings during a slow prefill (founder-reported: "Waiting for API response,
+// retrying in <n> minutes") ─────────────────────────────────────────────────────────────────
+// Claude Code's own idle-stream watchdog shows that banner (and eventually retries the whole
+// request) once 20 SECONDS pass with no bytes at all on the response stream — confirmed against
+// the CLI's own docs/issue reports, not assumed. The real Anthropic API avoids this by sending
+// periodic `event: ping` SSE frames during long-running turns; this gateway sent NONE, so any
+// local-model prefill over 20s (common — a large or uncached prompt on consumer hardware
+// routinely takes tens of seconds before the first output token) looked identical to a stalled
+// connection from the CLI's point of view, even though the engine was working the whole time.
+// Comfortably under the 20s threshold so a ping always lands well before the watchdog fires.
+export const DEFAULT_PING_INTERVAL_MS = 10_000
+
+/** Resolves `'data'` once `pending` settles (success OR failure — a rejection is surfaced by the
+ *  caller's own subsequent `await pending`, not swallowed here), or `'ping'` after `ms` if it
+ *  hasn't settled yet. Pure/exported so the keep-alive decision is unit-testable without a real
+ *  slow stream. Never leaks its timer: cleared on whichever path resolves first. */
+export function waitOrPing(pending: Promise<unknown>, ms: number): Promise<'data' | 'ping'> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve('ping'), ms)
+    pending.then(
+      () => { clearTimeout(timer); resolve('data') },
+      () => { clearTimeout(timer); resolve('data') },
+    )
+  })
+}
+
+/** Generalizes streamToAnthropic's own fixed-schedule ping loop (see the ADR-342 postmortem
+ *  below) to ANY long-running wait, not just a stream read — gateway.ts uses this to keep a
+ *  client's connection alive while queued for an engine slot (up to 600s, ADR-347) and while
+ *  waiting on `fetch()` to the engine, both of which are just as silent to the client as a slow
+ *  prefill and were invisible to the original ping fix, which only covered the read loop AFTER
+ *  the engine had already accepted the request. Same fixed-cadence-from-start reasoning: a
+ *  schedule that resets on every settle-check would starve under a `pending` that itself emits
+ *  frequent progress, though callers here don't have that failure mode today. Resolves/rejects
+ *  exactly as `pending` does; `emitPing` fires each time the deadline elapses first.
+ *
+ *  `onOrphan`, if given, fires if `emitPing` itself throws (the client connection is gone, so the
+ *  wait can't usefully continue) and `pending` goes on to resolve anyway — e.g. gateway.ts's
+ *  `d.gate.acquire()` grants an engine slot to a caller who has already given up. Rethrowing
+ *  immediately here would silently ABANDON that grant: nothing would ever call the returned
+ *  release function, permanently shrinking the daemon's effective concurrency by one for its
+ *  whole remaining life (GenerationGate's own `drain()` doc comment calls out exactly this
+ *  failure class). `onOrphan` lets the caller drain whatever `pending` eventually produces
+ *  instead (review-caught, ADR-347 follow-up) — omit it for a `pending` with nothing to drain
+ *  (e.g. a plain `fetch()`, where an orphaned Response can just be garbage-collected). */
+export async function pingWhilePending<T>(
+  pending: Promise<T>,
+  emitPing: () => Promise<void> | void,
+  pingIntervalMs: number = DEFAULT_PING_INTERVAL_MS,
+  onOrphan?: (value: T) => void,
+): Promise<T> {
+  pending.catch(() => {}) // same unhandled-rejection guard as the loop below — see anthropic.ts:481-492's comment
+  let nextPingAt = Date.now() + pingIntervalMs
+  while (true) {
+    const remaining = Math.max(0, nextPingAt - Date.now())
+    const outcome = remaining === 0 ? 'ping' : await waitOrPing(pending, remaining)
+    if (outcome === 'ping') {
+      try {
+        await emitPing()
+      } catch (e) {
+        if (onOrphan) pending.then(onOrphan).catch(() => {})
+        throw e
+      }
+      nextPingAt = Date.now() + pingIntervalMs
+      continue
+    }
+    return pending
+  }
+}
+
+/** The `message_start` event streamToAnthropic normally yields first, extracted so gateway.ts
+ *  can send it the moment it opens the client's SSE connection — before queueing for an engine
+ *  slot — instead of only once the engine has actually accepted the request. Real Anthropic
+ *  behavior: message_start marks the request being ACCEPTED, not generation starting; waiting
+ *  for engine bytes to send it would reintroduce exactly the silent gap ADR-347 exists to close.
+ *  Paired with streamToAnthropic's `skipMessageStart` so it's never sent twice. */
+export function messageStartEvent(msgId: string, modelName: string): SseEvent {
+  return sse('message_start', {
+    message: {
+      id: msgId,
+      type: 'message',
+      role: 'assistant',
+      content: [],
+      model: modelName,
+      stop_reason: null,
+      stop_sequence: null,
+      usage: { input_tokens: 0, output_tokens: 1 },
+    },
+  })
+}
+
+export interface StreamToAnthropicOptions {
+  onUsage?: (u: StreamUsage) => void
+  onLive?: (p: LiveProgress) => void
+  onToolCalls?: (calls: StreamToolCall[]) => void
+  pingIntervalMs?: number
+  /** Set when the caller already sent messageStartEvent() itself (gateway.ts, ADR-347) before
+   *  this generator was even constructed — e.g. right when the client's SSE connection opens,
+   *  ahead of queueing for an engine slot. Emitting it again here would send message_start twice. */
+  skipMessageStart?: boolean
+}
+
 export async function* streamToAnthropic(
   oaiStream: ReadableStream<Uint8Array>,
   modelName: string,
   msgId: string,
-  onUsage?: (u: StreamUsage) => void,
-  onLive?: (p: LiveProgress) => void,
-  onToolCalls?: (calls: StreamToolCall[]) => void,
+  opts: StreamToAnthropicOptions = {},
 ): AsyncGenerator<SseEvent> {
+  const { onUsage, onLive, onToolCalls, pingIntervalMs = DEFAULT_PING_INTERVAL_MS, skipMessageStart = false } = opts
   let blockIdx = 0
   let inThinking = false
   let inText = false
@@ -416,27 +517,51 @@ export async function* streamToAnthropic(
   let genTps = 0
   let liveOut = 0 // running generated-token count for the live engine-card row
 
-  yield sse('message_start', {
-    message: {
-      id: msgId,
-      type: 'message',
-      role: 'assistant',
-      content: [],
-      model: modelName,
-      stop_reason: null,
-      stop_sequence: null,
-      usage: { input_tokens: 0, output_tokens: 1 },
-    },
-  })
+  if (!skipMessageStart) yield messageStartEvent(msgId, modelName)
 
   const reader = oaiStream.getReader()
   const dec = new TextDecoder()
   let buf = ''
   let failed = false
+  // Fixed cadence from stream start, NOT reset on every `reader.read()` resolution — see the
+  // ADR-342 postmortem below for why that distinction is load-bearing.
+  let nextPingAt = Date.now() + pingIntervalMs
 
   try {
     outer: while (true) {
-      const { done, value } = await reader.read()
+      const readPromise = reader.read()
+      // Attach a handler at creation time, unconditionally — the `remaining === 0` shortcut
+      // below can `yield` a ping without ever calling `waitOrPing` (the only place that used to
+      // attach one), leaving `readPromise` unhandled while the generator is suspended at that
+      // `yield`. If the upstream errors during that window, Node reports an unhandledRejection
+      // for a path this function already handles correctly one line down. This `.catch` only
+      // marks the promise handled for that purpose; `await readPromise` below still throws
+      // normally into the surrounding try/catch.
+      readPromise.catch(() => {})
+      // Race against the REMAINING time on the fixed schedule, not a fresh full interval each
+      // time — a naive "race against pingIntervalMs on every read" (the first version of this
+      // fix) looked correct in isolation and passed against a mocked stream, but measured FALSE
+      // against the real engine: llama-server streams a `prompt_progress` chunk roughly every
+      // few hundred ms throughout the whole prefill (return_progress: true, above) — each one
+      // resolves `reader.read()` almost instantly, restarting the race before the ping timer
+      // could ever fire, even though NONE of those chunks are forwarded to the client (they're
+      // swallowed below, `onLive` only) — so the CLIENT still saw total silence for the entire
+      // prefill. Live-verified: a 25s real prefill against a loaded 35B model produced zero
+      // pings under the per-read-reset version. This fixed-schedule version fires on schedule
+      // regardless of how many progress-only reads resolve in between.
+      let result: Awaited<ReturnType<typeof reader.read>>
+      while (true) {
+        const remaining = Math.max(0, nextPingAt - Date.now())
+        const outcome = remaining === 0 ? 'ping' : await waitOrPing(readPromise, remaining)
+        if (outcome === 'ping') {
+          yield sse('ping', {})
+          nextPingAt = Date.now() + pingIntervalMs
+          continue
+        }
+        result = await readPromise
+        break
+      }
+      const { done, value } = result
       if (done) break
       buf += dec.decode(value, { stream: true })
       const lines = buf.split('\n')

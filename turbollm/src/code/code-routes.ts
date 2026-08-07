@@ -337,9 +337,11 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
   // TerminalToolbar.tsx polls this for the same prompt/gen-token + t/s readout the chat
   // composer's footer already shows from lastRealStats — a terminal-agent session has no
   // per-turn message stats of its own (the CLI drives its own requests), so this reads the
-  // most recent api_usage row the gateway attributed to this session instead (gateway.ts,
-  // session-auth.ts). `usage: null` (not an error) whenever the session hasn't made a
-  // gateway request yet — a perfectly normal, common state right after opening the terminal.
+  // api_usage rows the gateway attributed to this session instead (gateway.ts, session-auth.ts):
+  // `ctxUsed` from the largest, `promptTokens`/`genTokens`/`*Tps` from the most recent — see
+  // getLastApiUsageForSession's doc comment for why those are two different rows. `usage: null`
+  // (not an error) whenever the session hasn't made a gateway request yet — a perfectly normal,
+  // common state right after opening the terminal.
   app.get('/api/v1/code/sessions/:id/last-usage', (c) => {
     const id = c.req.param('id')
     const run = db.getAgentRun(id)

@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { clampMaxTokens } from '../config/config'
-import { mapToOpenAI, streamToAnthropic, type LiveProgress } from './anthropic'
+import { mapToOpenAI, streamToAnthropic, waitOrPing, pingWhilePending, messageStartEvent, type LiveProgress } from './anthropic'
 
 // ── clampMaxTokens ──────────────────────────────────────────────────────────
 
@@ -395,7 +395,7 @@ test('streamToAnthropic publishes prefill % then token counts, and never forward
 
   const live: LiveProgress[] = []
   const events: { event: string; data: string }[] = []
-  for await (const evt of streamToAnthropic(upstream, 'test-model', 'msg_1', undefined, (p) => live.push(p))) {
+  for await (const evt of streamToAnthropic(upstream, 'test-model', 'msg_1', { onLive: (p) => live.push(p) })) {
     events.push(evt)
   }
 
@@ -432,7 +432,7 @@ test('streamToAnthropic hands the engine\'s own prompt/gen rates to onUsage', as
     'data: [DONE]',
   ])
   let usage: { inputTokens: number; outputTokens: number; promptTps?: number; genTps?: number } | null = null
-  for await (const _ of streamToAnthropic(upstream, 'test-model', 'msg_tps', (u) => { usage = u })) { /* drain */ }
+  for await (const _ of streamToAnthropic(upstream, 'test-model', 'msg_tps', { onUsage: (u) => { usage = u } })) { /* drain */ }
 
   assert.ok(usage, 'onUsage must fire')
   const u = usage as unknown as { inputTokens: number; outputTokens: number; promptTps?: number; genTps?: number }
@@ -449,7 +449,7 @@ test('streamToAnthropic reports no rates at all when the engine sent none — ne
     'data: [DONE]',
   ])
   let usage: { promptTps?: number; genTps?: number } | null = null
-  for await (const _ of streamToAnthropic(upstream, 'test-model', 'msg_tps2', (u) => { usage = u })) { /* drain */ }
+  for await (const _ of streamToAnthropic(upstream, 'test-model', 'msg_tps2', { onUsage: (u) => { usage = u } })) { /* drain */ }
 
   assert.ok(usage)
   const u = usage as unknown as { promptTps?: number; genTps?: number }
@@ -477,7 +477,7 @@ test('streamToAnthropic reassembles a tool call whose arguments arrive across se
 
   let calls: { id: string; name: string; input: unknown }[] | null = null
   const events: { event: string; data: string }[] = []
-  for await (const evt of streamToAnthropic(upstream, 'test-model', 'msg_tools', undefined, undefined, (c) => { calls = c })) {
+  for await (const evt of streamToAnthropic(upstream, 'test-model', 'msg_tools', { onToolCalls: (c) => { calls = c } })) {
     events.push(evt)
   }
 
@@ -513,7 +513,7 @@ test('streamToAnthropic keeps two tool calls in the same turn apart by their ind
   ])
 
   let calls: { id: string; name: string; input: unknown }[] | null = null
-  for await (const _ of streamToAnthropic(upstream, 'test-model', 'msg_tools2', undefined, undefined, (c) => { calls = c })) { /* drain */ }
+  for await (const _ of streamToAnthropic(upstream, 'test-model', 'msg_tools2', { onToolCalls: (c) => { calls = c } })) { /* drain */ }
 
   const observed = calls as unknown as { id: string; name: string; input: Record<string, string> }[]
   assert.deepEqual(observed.map((t) => [t.id, t.name]), [['toolu_a', 'Write'], ['toolu_b', 'Bash']])
@@ -531,7 +531,7 @@ test('streamToAnthropic still fires onToolCalls, with an empty list, for a turn 
     'data: [DONE]',
   ])
   let calls: unknown[] | null = null
-  for await (const _ of streamToAnthropic(upstream, 'test-model', 'msg_notools', undefined, undefined, (c) => { calls = c })) { /* drain */ }
+  for await (const _ of streamToAnthropic(upstream, 'test-model', 'msg_notools', { onToolCalls: (c) => { calls = c } })) { /* drain */ }
   assert.deepEqual(calls, [])
 })
 
@@ -543,7 +543,7 @@ test('streamToAnthropic drops a tool call whose argument fragments never form va
     'data: [DONE]',
   ])
   let calls: { id: string }[] | null = null
-  for await (const _ of streamToAnthropic(upstream, 'test-model', 'msg_trunc', undefined, undefined, (c) => { calls = c })) { /* drain */ }
+  for await (const _ of streamToAnthropic(upstream, 'test-model', 'msg_trunc', { onToolCalls: (c) => { calls = c } })) { /* drain */ }
   assert.deepEqual((calls as unknown as { id: string }[]).map((t) => t.id), ['toolu_ok'])
 })
 
@@ -567,7 +567,7 @@ test('streamToAnthropic does NOT fire onToolCalls when the stream fails mid-turn
   let fired = false
   let usageFired = false
   const events: { event: string; data: string }[] = []
-  for await (const evt of streamToAnthropic(upstream, 'test-model', 'msg_dead', () => { usageFired = true }, undefined, () => { fired = true })) {
+  for await (const evt of streamToAnthropic(upstream, 'test-model', 'msg_dead', { onUsage: () => { usageFired = true }, onToolCalls: () => { fired = true } })) {
     events.push(evt)
   }
 
@@ -626,4 +626,197 @@ test('streamToAnthropic emits cache_read_input_tokens: 0 when no timings field',
   assert.equal(parsed.usage.output_tokens, 30)
   assert.equal(parsed.usage.input_tokens, 80)
   assert.equal(parsed.usage.cache_read_input_tokens, 0)
+})
+
+// ── keep-alive pings during a slow prefill (founder-reported: Claude Code shows "Waiting for
+// API response, retrying in <n> minutes" while the model is still in prefill) ───────────────
+//
+// Claude Code's own idle-stream watchdog fires once 20s pass with no bytes at all on the
+// response stream. This gateway sent nothing until the engine's first real chunk, so any
+// local-model prefill over 20s (routine on a large/uncached prompt on consumer hardware) looked
+// identical to a stalled connection — even though the engine was working the whole time.
+
+test('waitOrPing: resolves "data" once the pending promise settles well within the window', async () => {
+  const pending = Promise.resolve('ok')
+  assert.equal(await waitOrPing(pending, 50), 'data')
+})
+
+test('waitOrPing: resolves "ping" when the pending promise has not settled by the deadline', async () => {
+  const pending = new Promise((resolve) => setTimeout(() => resolve('ok'), 200))
+  assert.equal(await waitOrPing(pending, 10), 'ping')
+})
+
+test('waitOrPing: a pending promise that eventually REJECTS still resolves "data", not a throw', async () => {
+  const pending = Promise.reject(new Error('engine crashed'))
+  // Prevent Node's own unhandled-rejection reporting for this deliberately-rejected promise —
+  // waitOrPing attaches its own handler, but the original `pending` reference is also awaited
+  // by real callers afterward (streamToAnthropic re-awaits it to surface the real error).
+  pending.catch(() => { /* the real caller's job, not this assertion's */ })
+  assert.equal(await waitOrPing(pending, 50), 'data')
+})
+
+// ── pingWhilePending (ADR-347: generalizes the same fixed-schedule ping loop to gateway.ts's
+// engine-slot queue wait and fetch() call, not just streamToAnthropic's own read loop — a
+// queued Task-tool sub-agent is exactly as silent to the client as a slow prefill was) ────────
+
+test('pingWhilePending: resolves to the pending value with no pings when it settles well within the window', async () => {
+  let pings = 0
+  const result = await pingWhilePending(Promise.resolve('ok'), () => { pings++ }, 50)
+  assert.equal(result, 'ok')
+  assert.equal(pings, 0)
+})
+
+test('pingWhilePending: pings on a fixed schedule while genuinely queued, then resolves once it settles', async () => {
+  let pings = 0
+  const pending = new Promise((resolve) => setTimeout(() => resolve('granted'), 90))
+  const result = await pingWhilePending(pending, () => { pings++ }, 20)
+  assert.equal(result, 'granted')
+  // ~90ms of waiting on a 20ms cadence must produce multiple pings — a lower bound, not an exact
+  // count, to avoid the same timer-jitter flakiness the streamToAnthropic ping tests avoid too.
+  assert.ok(pings >= 2, `expected multiple pings while queued, got ${pings}`)
+})
+
+test('pingWhilePending: propagates a rejection (e.g. a gate timeout) rather than swallowing it', async () => {
+  const pending = Promise.reject(new Error('gate_acquire_timeout'))
+  await assert.rejects(() => pingWhilePending(pending, () => {}, 50), /gate_acquire_timeout/)
+})
+
+test('pingWhilePending: a throwing emitPing rejects the whole wait immediately (the connection is gone)', async () => {
+  const pending = new Promise((resolve) => setTimeout(() => resolve('ok'), 45))
+  let attempts = 0
+  const result = await pingWhilePending(pending, () => { attempts++; throw new Error('client write failed') }, 20)
+    .catch((e: Error) => e.message)
+  // A throwing emitPing rejects the whole wait immediately (the SSE write itself failed, so the
+  // connection is gone) rather than silently continuing to poll a dead connection.
+  assert.equal(result, 'client write failed')
+  assert.ok(attempts >= 1)
+})
+
+test('pingWhilePending: a resource `pending` resolves to is drained via onOrphan when emitPing fails first (review-caught leak, ADR-347)', async () => {
+  // Mirrors gateway.ts's real shape: `pending` is a GenerationGate.acquire() that eventually
+  // GRANTS a release function, but the client connection died first (emitPing threw) so nothing
+  // else will ever call it. Without onOrphan, that grant is silently abandoned — permanently
+  // shrinking the daemon's effective engine-slot capacity by one for its whole remaining life.
+  let released = false
+  const release = () => { released = true }
+  const pending = new Promise<() => void>((resolve) => setTimeout(() => resolve(release), 45))
+  await assert.rejects(
+    () => pingWhilePending(pending, () => { throw new Error('client gone') }, 20, (rel) => rel()),
+    /client gone/,
+  )
+  // The grant lands ~45ms after the ping failure at ~20ms — wait past it before asserting.
+  await new Promise((r) => setTimeout(r, 40))
+  assert.equal(released, true, 'the orphaned release must still be called, not leaked')
+})
+
+test('messageStartEvent: same shape streamToAnthropic used to yield inline, for gateway.ts to send ahead of the queue wait (ADR-347)', () => {
+  const evt = messageStartEvent('msg_abc123', 'local-model')
+  assert.equal(evt.event, 'message_start')
+  const parsed = JSON.parse(evt.data) as { type: string; message: { id: string; role: string; model: string; content: unknown[] } }
+  assert.equal(parsed.type, 'message_start')
+  assert.equal(parsed.message.id, 'msg_abc123')
+  assert.equal(parsed.message.role, 'assistant')
+  assert.equal(parsed.message.model, 'local-model')
+  assert.deepEqual(parsed.message.content, [])
+})
+
+test('streamToAnthropic: skipMessageStart omits the event the caller already sent itself', async () => {
+  const enc = new TextEncoder()
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(enc.encode('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'))
+      controller.enqueue(enc.encode('data: [DONE]\n\n'))
+      controller.close()
+    },
+  })
+  const events = []
+  for await (const evt of streamToAnthropic(stream, 'local-model', 'msg_1', { skipMessageStart: true })) {
+    events.push(evt.event)
+  }
+  assert.ok(!events.includes('message_start'), 'message_start must not be sent twice')
+  assert.ok(events.includes('content_block_start'), 'the real content must still stream normally')
+})
+
+test('streamToAnthropic emits ping frames while the upstream stalls, before any real data arrives', async () => {
+  const enc = new TextEncoder()
+  const upstream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      // Simulates a slow local-model prefill: nothing at all for a stretch longer than several
+      // ping intervals, then the real turn arrives.
+      setTimeout(() => {
+        controller.enqueue(enc.encode('data: {"choices":[{"delta":{"content":"Hi"}}]}\n'))
+        controller.enqueue(enc.encode('data: {"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2}}\n'))
+        controller.enqueue(enc.encode('data: [DONE]\n'))
+        controller.close()
+      }, 65)
+    },
+  })
+
+  const events: { event: string; data: string }[] = []
+  // A short interval (20ms) so the test stays fast while still observing several pings during
+  // the simulated 65ms stall.
+  for await (const evt of streamToAnthropic(upstream, 'test-model', 'msg_ping', { pingIntervalMs: 20 })) {
+    events.push(evt)
+  }
+
+  const pings = events.filter((e) => e.event === 'ping')
+  assert.ok(pings.length >= 2, `expected several ping frames during the stall, got ${pings.length}`)
+  for (const p of pings) assert.deepEqual(JSON.parse(p.data), { type: 'ping' })
+  // The real turn still streamed through normally after the stall ended.
+  const blob = events.map((e) => e.data).join('\n')
+  assert.ok(blob.includes('Hi'))
+  assert.equal(events.at(-1)?.event, 'message_stop')
+})
+
+test('streamToAnthropic still pings on schedule when the upstream sends frequent progress-only chunks (real bug, live-verified)', async () => {
+  // The FIRST version of this fix raced a fresh full interval against reader.read() on every
+  // iteration, which passed a mocked single-delay stream but measured FALSE against the real
+  // engine: llama-server streams a `prompt_progress` chunk every few hundred ms throughout
+  // prefill, each one resolving `reader.read()` almost instantly and restarting the race before
+  // the ping timer could ever fire — even though none of those chunks reach the client (they're
+  // consumed for `onLive` only, never forwarded). This simulates exactly that: many small,
+  // fast-resolving, content-free reads spanning well longer than the ping interval.
+  const enc = new TextEncoder()
+  let sent = 0
+  const TOTAL_CHUNKS = 12
+  const CHUNK_GAP_MS = 6 // fast — each read resolves well within the ping interval
+  const upstream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (sent < TOTAL_CHUNKS) {
+        await new Promise((r) => setTimeout(r, CHUNK_GAP_MS))
+        controller.enqueue(enc.encode(`data: {"prompt_progress":{"processed":${sent + 1},"total":${TOTAL_CHUNKS}}}\n`))
+        sent++
+        return
+      }
+      controller.enqueue(enc.encode('data: {"choices":[{"delta":{"content":"Hi"}}]}\n'))
+      controller.enqueue(enc.encode('data: {"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2}}\n'))
+      controller.enqueue(enc.encode('data: [DONE]\n'))
+      controller.close()
+    },
+  })
+
+  const events: { event: string; data: string }[] = []
+  // 12 chunks * 6ms ≈ 72ms of progress-only traffic; a 20ms ping interval should still fire
+  // multiple times across that span if the schedule is truly fixed rather than reset per-read.
+  for await (const evt of streamToAnthropic(upstream, 'test-model', 'msg_ping2', { pingIntervalMs: 20 })) {
+    events.push(evt)
+  }
+
+  const pings = events.filter((e) => e.event === 'ping')
+  assert.ok(pings.length >= 2, `expected pings despite frequent progress-only reads, got ${pings.length}`)
+  const blob = events.map((e) => e.data).join('\n')
+  assert.ok(blob.includes('Hi'), 'the real turn still streamed through after the progress-only run')
+})
+
+test('streamToAnthropic emits NO ping frames on an ordinary fast turn', async () => {
+  const upstream = sseStream([
+    'data: {"choices":[{"delta":{"content":"Hello"}}]}',
+    'data: {"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2}}',
+    'data: [DONE]',
+  ])
+  const events: { event: string; data: string }[] = []
+  for await (const evt of streamToAnthropic(upstream, 'test-model', 'msg_fast', { pingIntervalMs: 10_000 })) {
+    events.push(evt)
+  }
+  assert.equal(events.filter((e) => e.event === 'ping').length, 0)
 })

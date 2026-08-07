@@ -8,6 +8,7 @@ import { cn } from '../../lib/utils'
 import { useIsDesktop } from '../../lib/useIsDesktop'
 import { ConversationSidebar } from '../chat/ConversationSidebar'
 import { readSavedSidebarWidth, SIDEBAR_MIN_W, sidebarMaxW, SidebarResizeHandle } from '../chat/SidebarResizeHandle'
+import { useWorkspaceSidebarOpen } from '../../lib/workspace-sidebar'
 
 /** Workspace's Routines mode with nothing selected — `/workspace/routines`. The list itself now
  *  lives in ConversationSidebar.tsx (a real peer of the Chat conversation list and Code session
@@ -24,7 +25,7 @@ import { readSavedSidebarWidth, SIDEBAR_MIN_W, sidebarMaxW, SidebarResizeHandle 
 export function RoutinesPanel() {
   const navigate = useNavigate()
   const isDesktop = useIsDesktop()
-  const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [sidebarOpen, setSidebarOpen] = useWorkspaceSidebarOpen()
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
   const [sidebarWidth, setSidebarWidth] = useState(() => Math.min(Math.max(readSavedSidebarWidth(), SIDEBAR_MIN_W), sidebarMaxW()))
   const sidebarRef = useRef<HTMLDivElement>(null)

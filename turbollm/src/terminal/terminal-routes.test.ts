@@ -11,7 +11,7 @@
 // so it's testable without a live PTY/daemon (mirrors code-session.ts's codeEventToFrame).
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { buildTerminalLaunchCommand, canSeedFirstMessage, MAX_SEEDED_MESSAGE_CHARS } from './terminal-routes'
+import { buildTerminalLaunchCommand, canSeedFirstMessage, normalizeSeededMessage, MAX_SEEDED_MESSAGE_CHARS } from './terminal-routes'
 import { quotePtyShellArg } from '../util/shell-command'
 
 test('buildTerminalLaunchCommand: a genuinely first-ever launch registers this session\'s own id', () => {
@@ -186,9 +186,35 @@ test('canSeedFirstMessage: refuses a message ending in a backslash', () => {
   assert.equal(canSeedFirstMessage(`look in C:${BS}repo`, 'claude'), true, 'an interior backslash is fine')
 })
 
-test('canSeedFirstMessage: refuses control characters', () => {
-  assert.equal(canSeedFirstMessage('line one\nline two', 'claude'), false)
-  assert.equal(canSeedFirstMessage('tab\there', 'claude'), false)
+// Founder-reported, 2026-08-07: a fresh Code session's first message silently never reached the
+// CLI. Root cause: the composer's own hint text advertises "Shift+Enter for newline", so a
+// multi-line task description is the NORMAL case — but the ORIGINAL UNSEEDABLE range (every
+// control byte from U+0000 through U+001F) refused newline/CR/tab right along with the genuinely
+// dangerous control bytes, so almost any multi-sentence task silently produced an empty terminal.
+// Line breaks/tabs are now folded to spaces instead of being rejected.
+
+test('canSeedFirstMessage: a message containing newlines or tabs is now seedable (folded, not rejected)', () => {
+  assert.equal(canSeedFirstMessage('line one\nline two', 'claude'), true)
+  assert.equal(canSeedFirstMessage('tab\there', 'claude'), true)
+  assert.equal(canSeedFirstMessage('para one\r\n\r\npara two', 'claude'), true, 'CRLF and blank lines fold too')
+})
+
+test('canSeedFirstMessage: still refuses a genuinely dangerous control byte (not just any control byte)', () => {
+  assert.equal(canSeedFirstMessage('drop a bell\x07here', 'claude'), false)
+  assert.equal(canSeedFirstMessage('nul\x00byte', 'claude'), false)
+})
+
+test('normalizeSeededMessage: folds line breaks and tabs to single spaces and re-trims', () => {
+  assert.equal(normalizeSeededMessage('line one\nline two'), 'line one line two')
+  assert.equal(normalizeSeededMessage('tab\there'), 'tab here')
+  assert.equal(normalizeSeededMessage('para one\n\npara two'), 'para one para two', 'a run of breaks collapses to ONE space, not a stutter')
+  assert.equal(normalizeSeededMessage('trailing newline\n'), 'trailing newline', 'folding can expose new trailing whitespace — must still trim')
+})
+
+test('buildTerminalLaunchCommand: a multi-line first message reaches the CLI as one folded, quoted line', () => {
+  const cmd = buildTerminalLaunchCommand('claude', 6996, 'tok', 'sess', false, undefined, 'auto', 'fix the bug\nand add a test')
+  assert.ok(cmd.includes(quotePtyShellArg('fix the bug and add a test')), cmd)
+  assert.ok(!cmd.includes('\n'), 'the launch command itself must never contain a literal newline')
 })
 
 test('buildTerminalLaunchCommand: an unseedable message is omitted, never mangled onto the line', () => {
