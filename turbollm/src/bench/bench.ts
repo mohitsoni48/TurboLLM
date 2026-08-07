@@ -563,10 +563,15 @@ export class BenchRunner {
       // Anchors deliberately skip ngl=0: with no layers on the GPU the KV cache and compute buffers
       // live on the host too, so a 0→N step measures that discontinuity rather than the per-layer
       // cost, producing a slope that is wrong for every later prediction.
+      // Proportional gap for the same reason as moeSearch (see the note there): slope error is
+      // (reading noise / gap) and gets multiplied by the extrapolation distance, which here runs
+      // from ngl=1 up to blockCount. A fixed 4-step gap left ~65 MiB of compounded error over 31
+      // steps — close enough to SPILL_TOLERANCE_MB to risk a fabricated spill verdict.
+      const anchorGap = Math.max(2, Math.round(hi0 / 4))
       const loAnchor = 1
-      const hiAnchor = Math.min(5, hi0)
+      const hiAnchor = loAnchor + anchorGap
       const anchors: ResidencySample[] = []
-      if (hi0 >= 2 && hiAnchor > loAnchor) {
+      if (hi0 >= hiAnchor) {
         for (const n of [loAnchor, hiAnchor]) {
           if (this.cancelled || Date.now() > this.deadline) break
           this.state = { ...this.state, step: `KV ${base.kvTypeK}: calibrating spill detection (ngl=${n})…`, candidates: results }
@@ -660,7 +665,16 @@ export class BenchRunner {
     //
     // Costs two extra load-only probes (~20s each). That is cheap against the 10-minute per-test
     // timeout a single mis-selected spilling candidate burns.
-    const anchorPoints = maxN >= 2 ? [maxN, maxN - 2] : [maxN]
+    // Anchor SPACING matters as much as anchor placement. Slope error is (reading noise / gap),
+    // and that error is then multiplied by the extrapolation distance — predicting from maxN down
+    // to the middle of the range can be 25+ steps. With a 2-step gap and the ~6 MiB of per-reading
+    // noise observed live, the slope carries ~4.2 MiB of error, which compounds to ~118 MiB over 28
+    // steps — ABOVE SPILL_TOLERANCE_MB, i.e. enough to invent a spill that isn't there and shove the
+    // search toward maximum CPU offload. A proportional gap divides that error by the gap and keeps
+    // the compounded error well inside the tolerance, while staying in the high-CPU-offload region
+    // where residency is low and spill is least likely.
+    const anchorGap = Math.max(2, Math.round(maxN / 4))
+    const anchorPoints = maxN - anchorGap >= 0 ? [maxN, maxN - anchorGap] : [maxN]
     const anchors: ResidencySample[] = []
     for (const n of anchorPoints) {
       if (this.cancelled || Date.now() > this.deadline) break

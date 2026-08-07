@@ -13,7 +13,7 @@
 // against the run's own linear fit CAN.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { residencySlope, predictResidencyMb, spillMb, isSpilling } from './spill'
+import { residencySlope, predictResidencyMb, spillMb, isSpilling, SPILL_TOLERANCE_MB } from './spill'
 
 // Measured dedicated VRAM (MiB) per nCpuMoe. Perfectly linear from 20 down to 12,
 // then it saturates at the card ceiling and stops responding.
@@ -115,6 +115,54 @@ test('spillMb: a candidate short of prediction reports that shortfall as spill',
 
 test('spillMb: floors at 0 when actual EXCEEDS prediction (a conservative fit, not negative spill)', () => {
   assert.equal(spillMb(14000, 15000), 0)
+})
+
+// ---- calibration-gap robustness ---------------------------------------------
+//
+// Slope error is (reading noise / anchor gap), and it is then MULTIPLIED by the
+// extrapolation distance. Too narrow a gap therefore fabricates spill on a config that
+// is perfectly fine — which would drive the search to maximum CPU offload, a worse
+// regression than the bug spill detection exists to fix. Per-reading noise of ~6 MiB is
+// what repeated probes of the same config actually showed on the founder's box.
+const NOISE = 6
+const TRUE_SLOPE = 262
+const BASE = 8400 // residency at maxN (every expert on CPU)
+
+/** Worst-case-noise spill reading for a candidate `distance` steps below the reference,
+ *  calibrated from two anchors `gap` apart. Noise is signed to maximally OVER-estimate the
+ *  slope (anchors spread apart) and to make the candidate read low — the combination most
+ *  likely to invent a spill. */
+function worstCaseShortfall(gap: number, distance: number): number {
+  const hiAnchor = { knob: 40, vramMb: BASE - NOISE }
+  const loAnchor = { knob: 40 - gap, vramMb: BASE + TRUE_SLOPE * gap + NOISE }
+  const slope = residencySlope([hiAnchor, loAnchor])!
+  const predicted = predictResidencyMb(hiAnchor, slope, 40 - distance)
+  const actualTrue = BASE + TRUE_SLOPE * distance - NOISE // real, not spilling, read low
+  return spillMb(predicted, actualTrue)
+}
+
+test('calibration: a 2-step anchor gap fabricates spill over a long extrapolation (the defect)', () => {
+  // 28 steps out, a 2-step gap compounds noise past the tolerance — a false positive.
+  assert.ok(worstCaseShortfall(2, 28) > SPILL_TOLERANCE_MB,
+    `expected the narrow gap to exceed tolerance, got ${worstCaseShortfall(2, 28).toFixed(1)} MiB`)
+})
+
+test('calibration: the shipped proportional gap keeps noise well inside the tolerance', () => {
+  // maxN=40 -> gap = round(40/4) = 10. Same 28-step extrapolation, no false spill.
+  const shortfall = worstCaseShortfall(10, 28)
+  assert.ok(shortfall < SPILL_TOLERANCE_MB,
+    `noise alone must not read as spill, got ${shortfall.toFixed(1)} MiB`)
+})
+
+test('calibration: a real spill is still caught with the wider gap (no loss of sensitivity)', () => {
+  // The smallest real spill measured was 185.7 MiB. It must still clear the tolerance even
+  // stacked against worst-case calibration noise working to hide it.
+  const hiAnchor = { knob: 40, vramMb: BASE + NOISE }
+  const loAnchor = { knob: 30, vramMb: BASE + TRUE_SLOPE * 10 - NOISE } // under-estimates slope
+  const slope = residencySlope([hiAnchor, loAnchor])!
+  const predicted = predictResidencyMb(hiAnchor, slope, 12)
+  const actualSpilling = BASE + TRUE_SLOPE * 28 - 185.7
+  assert.ok(spillMb(predicted, actualSpilling) > SPILL_TOLERANCE_MB, 'a real 185.7 MiB spill must still be detected')
 })
 
 // ---- isSpilling: the decision the search actually makes ----------------------
