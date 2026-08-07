@@ -460,14 +460,37 @@ export async function* streamToAnthropic(
   const dec = new TextDecoder()
   let buf = ''
   let failed = false
+  // Fixed cadence from stream start, NOT reset on every `reader.read()` resolution — see the
+  // ADR-342 postmortem below for why that distinction is load-bearing.
+  let nextPingAt = Date.now() + pingIntervalMs
 
   try {
     outer: while (true) {
       const readPromise = reader.read()
-      while ((await waitOrPing(readPromise, pingIntervalMs)) === 'ping') {
-        yield sse('ping', {})
+      // Race against the REMAINING time on the fixed schedule, not a fresh full interval each
+      // time — a naive "race against pingIntervalMs on every read" (the first version of this
+      // fix) looked correct in isolation and passed against a mocked stream, but measured FALSE
+      // against the real engine: llama-server streams a `prompt_progress` chunk roughly every
+      // few hundred ms throughout the whole prefill (return_progress: true, above) — each one
+      // resolves `reader.read()` almost instantly, restarting the race before the ping timer
+      // could ever fire, even though NONE of those chunks are forwarded to the client (they're
+      // swallowed below, `onLive` only) — so the CLIENT still saw total silence for the entire
+      // prefill. Live-verified: a 25s real prefill against a loaded 35B model produced zero
+      // pings under the per-read-reset version. This fixed-schedule version fires on schedule
+      // regardless of how many progress-only reads resolve in between.
+      let result: Awaited<ReturnType<typeof reader.read>>
+      while (true) {
+        const remaining = Math.max(0, nextPingAt - Date.now())
+        const outcome = remaining === 0 ? 'ping' : await waitOrPing(readPromise, remaining)
+        if (outcome === 'ping') {
+          yield sse('ping', {})
+          nextPingAt = Date.now() + pingIntervalMs
+          continue
+        }
+        result = await readPromise
+        break
       }
-      const { done, value } = await readPromise
+      const { done, value } = result
       if (done) break
       buf += dec.decode(value, { stream: true })
       const lines = buf.split('\n')

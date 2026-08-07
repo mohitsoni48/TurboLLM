@@ -686,6 +686,46 @@ test('streamToAnthropic emits ping frames while the upstream stalls, before any 
   assert.equal(events.at(-1)?.event, 'message_stop')
 })
 
+test('streamToAnthropic still pings on schedule when the upstream sends frequent progress-only chunks (real bug, live-verified)', async () => {
+  // The FIRST version of this fix raced a fresh full interval against reader.read() on every
+  // iteration, which passed a mocked single-delay stream but measured FALSE against the real
+  // engine: llama-server streams a `prompt_progress` chunk every few hundred ms throughout
+  // prefill, each one resolving `reader.read()` almost instantly and restarting the race before
+  // the ping timer could ever fire — even though none of those chunks reach the client (they're
+  // consumed for `onLive` only, never forwarded). This simulates exactly that: many small,
+  // fast-resolving, content-free reads spanning well longer than the ping interval.
+  const enc = new TextEncoder()
+  let sent = 0
+  const TOTAL_CHUNKS = 12
+  const CHUNK_GAP_MS = 6 // fast — each read resolves well within the ping interval
+  const upstream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (sent < TOTAL_CHUNKS) {
+        await new Promise((r) => setTimeout(r, CHUNK_GAP_MS))
+        controller.enqueue(enc.encode(`data: {"prompt_progress":{"processed":${sent + 1},"total":${TOTAL_CHUNKS}}}\n`))
+        sent++
+        return
+      }
+      controller.enqueue(enc.encode('data: {"choices":[{"delta":{"content":"Hi"}}]}\n'))
+      controller.enqueue(enc.encode('data: {"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2}}\n'))
+      controller.enqueue(enc.encode('data: [DONE]\n'))
+      controller.close()
+    },
+  })
+
+  const events: { event: string; data: string }[] = []
+  // 12 chunks * 6ms ≈ 72ms of progress-only traffic; a 20ms ping interval should still fire
+  // multiple times across that span if the schedule is truly fixed rather than reset per-read.
+  for await (const evt of streamToAnthropic(upstream, 'test-model', 'msg_ping2', undefined, undefined, undefined, 20)) {
+    events.push(evt)
+  }
+
+  const pings = events.filter((e) => e.event === 'ping')
+  assert.ok(pings.length >= 2, `expected pings despite frequent progress-only reads, got ${pings.length}`)
+  const blob = events.map((e) => e.data).join('\n')
+  assert.ok(blob.includes('Hi'), 'the real turn still streamed through after the progress-only run')
+})
+
 test('streamToAnthropic emits NO ping frames on an ordinary fast turn', async () => {
   const upstream = sseStream([
     'data: {"choices":[{"delta":{"content":"Hello"}}]}',
