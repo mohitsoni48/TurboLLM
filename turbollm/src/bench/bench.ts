@@ -65,6 +65,14 @@ export interface BenchCandidate {
   /** ABSOLUTE GPU VRAM in use while this candidate ran, MB. Drives the ≤1 GB-headroom gate, which
    *  needs the true total (not the delta) to know how much free VRAM is actually left. */
   vramAbsMb: number | null
+  /** Host-backed ("spilled") GPU memory this candidate used during the REAL measured run, MB.
+   *
+   *  Distinct from the Phase-1 probe's reading and not redundant with it: the probe loads the model
+   *  but never generates, so it cannot see the compute buffers a real prefill allocates. A config
+   *  can therefore clear the probe's spill check and still spill once it is actually used — the
+   *  same Phase-1-vs-Phase-2 gap ADR-217 found for VRAM, which is why that gap already has a
+   *  headroom backoff. Null when the platform exposes no spill figure. */
+  spillMb: number | null
 }
 
 export interface BenchLogEntry {
@@ -582,6 +590,14 @@ export class BenchRunner {
     // Phase 2 (the actual timed run) can allocate more VRAM than Phase 1's load-only probe did
     // (lazy cuBLAS/graph-capture scratch buffers) — re-validate against the REAL post-generation
     // VRAM and back off one layer if it silently blew through the user's headroom (ADR-217).
+    // Same two ways the real run can invalidate a probe-accepted config as in moeSearch: exceeding
+    // the VRAM headroom, or SPILLING once prefill allocates its compute buffers (invisible to a
+    // load-only probe). Back off one layer for either.
+    if (found && isSpilling(found.cand.spillMb) && bestNgl > 0) {
+      this.emit(`ngl=${bestNgl} spilled ${Math.round(found.cand.spillMb as number)} MB once actually generating (the load-only probe could not see this) — retrying at ngl=${bestNgl - 1}`)
+      const safer = await this.benchAt(entry, sys, { ...base, ngl: bestNgl - 1 }, caps, results, `ngl=${bestNgl - 1} (spill backoff)`)
+      if (safer) { found = safer; bestNgl = bestNgl - 1 }
+    }
     if (found && overHeadroom(found.cand.vramAbsMb, budgetMb, headroomMb) && bestNgl > 0) {
       this.emit(`ngl=${bestNgl} exceeded headroom after generation (${found.cand.vramAbsMb} MB) — retrying at ngl=${bestNgl - 1}`)
       const safer = await this.benchAt(entry, sys, { ...base, ngl: bestNgl - 1 }, caps, results, `ngl=${bestNgl - 1} (headroom backoff)`)
@@ -703,6 +719,14 @@ export class BenchRunner {
     }
     // Same Phase-1-vs-Phase-2 VRAM gap as above — back off (more CPU experts, less VRAM) one
     // step if the real measured run blew through headroom (ADR-217).
+    // Two ways the real run can invalidate a config the load-only probe accepted: it can exceed the
+    // VRAM headroom (ADR-217), or it can SPILL once prefill allocates its compute buffers — which
+    // the probe cannot see, because it never generates. Back off one step for either.
+    if (found && isSpilling(found.cand.spillMb) && foundN < maxN) {
+      this.emit(`nCpuMoe=${foundN} spilled ${Math.round(found.cand.spillMb as number)} MB once actually generating (the load-only probe could not see this) — retrying at nCpuMoe=${foundN + 1}`)
+      const safer = await this.benchAt(entry, sys, { ...base, nCpuMoe: foundN + 1 }, caps, results, `nCpuMoe=${foundN + 1} (spill backoff)`)
+      if (safer) { found = safer; foundN = foundN + 1 }
+    }
     if (found && overHeadroom(found.cand.vramAbsMb, budgetMb, headroomMb) && foundN < maxN) {
       this.emit(`nCpuMoe=${foundN} exceeded headroom after generation (${found.cand.vramAbsMb} MB) — retrying at nCpuMoe=${foundN + 1}`)
       const safer = await this.benchAt(entry, sys, { ...base, nCpuMoe: foundN + 1 }, caps, results, `nCpuMoe=${foundN + 1} (headroom backoff)`)
@@ -790,7 +814,7 @@ export class BenchRunner {
     base: LoadProfile,
     knob: 'ngl' | 'nCpuMoe',
     value: number,
-    probe: { outcome: BenchCandidate['outcome']; vramAbsMb: number | null },
+    probe: { outcome: BenchCandidate['outcome']; vramAbsMb: number | null; spillMb: number | null },
   ): void {
     const probeCand: BenchCandidate = {
       label: `probe ${knob}=${value}`,
@@ -808,6 +832,7 @@ export class BenchRunner {
       ttftMs: null,
       vramMb: null,
       vramAbsMb: probe.vramAbsMb,
+      spillMb: probe.spillMb,
     }
     results.push(probeCand)
     this.emit(`${probeCand.label} → ${probe.outcome}${probe.vramAbsMb != null ? ` (${probe.vramAbsMb} MB)` : ''}`, probeCand)
@@ -854,7 +879,7 @@ export class BenchRunner {
       kvTypeK: profile.kvTypeK,
       flashAttn: profile.flashAttn,
     }
-    const fail = (outcome: BenchCandidate['outcome']): BenchCandidate => ({ label, params, outcome, tps: null, prefillTps: null, ttftMs: null, vramMb: null, vramAbsMb: null })
+    const fail = (outcome: BenchCandidate['outcome']): BenchCandidate => ({ label, params, outcome, tps: null, prefillTps: null, ttftMs: null, vramMb: null, vramAbsMb: null, spillMb: null })
     // Live sub-phase progress so each (possibly multi-minute) trial isn't a silent wait.
     const phase = (p: string) => { this.state = { ...this.state, step: `${stepPrefix} — ${p}` } }
 
@@ -879,6 +904,7 @@ export class BenchRunner {
     }
 
     const vramBefore = await readGpuVramMb(sys)
+    const sharedBefore = await readGpuSharedMb(sys)
     phase('loading model…')
     try {
       await this.manager.start(opts)
@@ -916,11 +942,14 @@ export class BenchRunner {
     phase('measuring t/s…')
     const measured = await this.runChatWatched(target, benchMessages, 128, remaining(), logPath)
     const vramAfter = await readGpuVramMb(sys)
+    // Read spill BEFORE stopping the engine — this is the real-run figure the Phase-1 probe cannot
+    // see, since the probe never generates and so never allocates the prefill compute buffers.
+    const sharedAfter = await readGpuSharedMb(sys)
     await this.stopEngine()
 
     if ('fault' in measured) return fail(measured.fault)
     const vramMb = vramBefore !== null && vramAfter !== null ? Math.max(0, vramAfter - vramBefore) : vramAfter
-    return { label, params, outcome: 'ok', tps: measured.tps, prefillTps: measured.prefillTps, ttftMs: measured.ttftMs, vramMb, vramAbsMb: vramAfter }
+    return { label, params, outcome: 'ok', tps: measured.tps, prefillTps: measured.prefillTps, ttftMs: measured.ttftMs, vramMb, vramAbsMb: vramAfter, spillMb: spillMb(sharedBefore, sharedAfter) }
   }
 
   /** Poll the manager state until the engine is running, the readiness window
@@ -1859,20 +1888,27 @@ function readWddmSharedMb(): Promise<number | null> {
         ['-NoProfile', '-NonInteractive', '-Command', WDDM_SHARED_PS],
         { timeout: 10_000, windowsHide: true },
         (err, stdout) => {
-          if (err || !stdout) {
-            wddmSharedUnsupported = true
+          if (err) {
+            // ONLY latch on definitive unavailability. A timeout (err.killed) is transient and must
+            // NOT latch: this runs immediately around a model load, when the machine is under peak
+            // I/O and memory pressure and a slow PowerShell start is entirely plausible. The daemon
+            // is long-lived, so latching on that would silently disable spill detection until
+            // restart — reverting to exactly the fit-only behaviour this release exists to fix.
+            // A missing interpreter (ENOENT) or the script's own `exit 1` (counter unresolvable) are
+            // permanent for this process and worth latching.
+            if (!err.killed) wddmSharedUnsupported = true
             return resolve(null)
           }
-          const mb = parseFloat(stdout.trim())
+          const mb = parseFloat((stdout || '').trim())
           if (!Number.isFinite(mb) || mb < 0) {
-            wddmSharedUnsupported = true
+            wddmSharedUnsupported = true // ran fine but produced nothing parseable → not available here
             return resolve(null)
           }
           resolve(Math.round(mb))
         },
       )
     } catch {
-      wddmSharedUnsupported = true
+      wddmSharedUnsupported = true // could not spawn at all
       resolve(null)
     }
   })
