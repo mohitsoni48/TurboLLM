@@ -1,0 +1,24 @@
+# Test-only image (spec 25 §10.3). NOT a distribution image — see
+# Dockerfile.nvidia / Dockerfile.amd for those. Differences that matter:
+#   * CPU-only: tests never load a real model, so no CUDA/ROCm layer.
+#   * ~/.turbollm is a tmpfs (see docker-compose.test.yaml) — config, DB and
+#     engines are destroyed on stop. That IS the reset mechanism.
+#   * No ports are published. Playwright runs INSIDE the container, so nothing
+#     binds on the host: it cannot collide with a real daemon on 6996 and
+#     cannot violate the 6996/6997-only rule.
+FROM node:22-bookworm
+
+WORKDIR /src
+COPY turbollm/package*.json ./
+COPY turbollm/web/package*.json ./web/
+RUN npm ci && cd web && npm ci
+COPY turbollm/ ./
+RUN npm run build:web && npm run build
+
+# Playwright + its browser, in-container so the E2E never touches the host.
+RUN npx --yes playwright@1.48.0 install --with-deps chromium
+
+COPY test/fixtures/ /fixtures/
+
+ENV TURBOLLM_TEST=1
+CMD ["node", "/fixtures/entrypoint.mjs"]

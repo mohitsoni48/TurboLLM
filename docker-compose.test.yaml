@@ -1,0 +1,18 @@
+# E2E harness (spec 25 §10.3). Deliberately has NO `ports:` block.
+services:
+  turbollm-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    image: turbollm-test:latest
+    container_name: turbollm-test
+    # The whole point: a wipeable data dir that is NOT a second host data
+    # directory. Destroyed when the container stops, every run starts clean.
+    tmpfs:
+      - /root/.turbollm:size=512m
+    environment:
+      # Selects an injected failure; unset means the happy path.
+      - FIXTURE_MODE=
+      # Point the daemon's HF + engine-asset fetches at the in-container fixture.
+      - TURBOLLM_HF_BASE=http://127.0.0.1:8080
+    # No ports. No volumes. Nothing escapes the container.
