@@ -647,8 +647,16 @@ export class BenchRunner {
       const label = n === bestN ? `nCpuMoe=${n}` : `nCpuMoe=${n} (crash backoff)`
       found = await this.benchAt(entry, sys, { ...base, nCpuMoe: n }, caps, results, label)
       if (found) { foundN = n; break }
+      // Check cancel/deadline BEFORE announcing a retry: a run stopped here (the Cancel button,
+      // or a model load / engine stop-restart, which all call cancel()) would otherwise leave the
+      // log ending on a "retrying at nCpuMoe=N+1" it never keeps — which reads as the backoff
+      // silently dying rather than the run being stopped from outside.
+      const stopped = this.cancelled || Date.now() > this.deadline
+      if (stopped) {
+        this.emit(`nCpuMoe=${n} failed to bench (${results[results.length - 1]?.outcome ?? 'crash'}) — run ${this.cancelled ? 'cancelled' : 'out of time budget'}, stopping`)
+        break
+      }
       if (n < maxN) this.emit(`nCpuMoe=${n} failed to bench (${results[results.length - 1]?.outcome ?? 'crash'}) — retrying at nCpuMoe=${n + 1}`)
-      if (this.cancelled || Date.now() > this.deadline) break
     }
     // Same Phase-1-vs-Phase-2 VRAM gap as above — back off (more CPU experts, less VRAM) one
     // step if the real measured run blew through headroom (ADR-217).
