@@ -25,6 +25,41 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.10.6] - 2026-08-07
+
+### Fixed
+
+- **Auto-tune no longer picks a configuration that secretly runs from system RAM.** When a model
+  doesn't fit on your GPU, the driver doesn't fail — it quietly keeps the overflow in system memory,
+  and the reported VRAM usage stops changing once the card is full. Auto-tune was reading only that
+  number, so those configurations looked like a clean fit, and the search kept pushing more onto the
+  GPU until it landed on one that crawled, timed out, or crashed. It now measures how much memory a
+  configuration actually pushes into system RAM and rejects the ones that spill. On a 40 GB model
+  and a 16 GB card, the offload settings that looked identical by VRAM turned out to differ by
+  8.8 GB of hidden spill.
+- **Auto-tune no longer gives up when its chosen configuration fails.** If the benchmark run
+  crashed or timed out, the whole sweep ended with no result at all. It now steps back to the next
+  safer setting and keeps going, so a run returns a working configuration instead of nothing.
+
+### Changed
+
+- **Auto-tune now picks the winner by how quickly you get a complete answer**, combining
+  prompt-processing and generation speed, rather than by generation speed alone. Generation speed
+  keeps improving as more of a model is forced onto the GPU — including past the point where it
+  starts spilling — so optimising for it alone favoured settings that were slower in real use. On a
+  32 GB model the newly-chosen setting finishes a turn 24% sooner than the old one.
+- Auto-tune runs are also shorter, since detecting a bad configuration no longer requires waiting
+  out a full benchmark.
+
+### Discord
+
+- Auto-tune could pick GPU settings that silently ran part of your model from system RAM — slow, and
+  sometimes crashing. It now measures that directly and avoids those settings.
+- It also picks the setting that gets you a complete answer fastest, instead of just the one with the
+  highest raw generation speed. On one 32 GB model that's 24% quicker per turn.
+- If a setting fails while being tested, auto-tune now falls back to the next safe one instead of
+  ending with no result.
+
 ## [1.10.5] - 2026-08-07
 
 ### Fixed

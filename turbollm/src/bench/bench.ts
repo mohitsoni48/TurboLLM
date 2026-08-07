@@ -17,6 +17,7 @@ import type { Registry } from '../engines/registry'
 import type { Engine } from '../config/config'
 import type { Scanner, ModelEntry } from '../models/scanner'
 import { deriveDefault, estimateVram, gpuBudgetMb, profileToArgs, resolveProfile, type GpuProfile, type LoadProfile } from '../models/profile'
+import { isSpilling, spillMb } from './spill'
 import { getSysInfo, type SysInfo } from '../sysinfo/sysinfo'
 import type { HfClient } from '../hf/hf'
 import { inferRepoFromPath } from '../api/path-utils'
@@ -64,6 +65,14 @@ export interface BenchCandidate {
   /** ABSOLUTE GPU VRAM in use while this candidate ran, MB. Drives the ≤1 GB-headroom gate, which
    *  needs the true total (not the delta) to know how much free VRAM is actually left. */
   vramAbsMb: number | null
+  /** Host-backed ("spilled") GPU memory this candidate used during the REAL measured run, MB.
+   *
+   *  Distinct from the Phase-1 probe's reading and not redundant with it: the probe loads the model
+   *  but never generates, so it cannot see the compute buffers a real prefill allocates. A config
+   *  can therefore clear the probe's spill check and still spill once it is actually used — the
+   *  same Phase-1-vs-Phase-2 gap ADR-217 found for VRAM, which is why that gap already has a
+   *  headroom backoff. Null when the platform exposes no spill figure. */
+  spillMb: number | null
 }
 
 export interface BenchLogEntry {
@@ -159,9 +168,8 @@ const QUALITY_KV = ['f16', 'q8_0', 'turbo4']
 // "shared GPU memory" (sysmem over PCIe), which silently tanks generation. The search treats a
 // candidate that uses more than (total − headroom) as "too much on GPU" and offloads further.
 // User-configurable (Settings → Engine → VRAM headroom); see Config.vramHeadroomMb.
-// Output-t/s tie band for the speed objective: when two configs are within this relative margin
-// on generation speed, the one with faster prefill wins (best prefill AND t/s, not just t/s).
-const OUTPUT_TIE = 0.05
+// (The old OUTPUT_TIE band is gone with the generation-primary objective it served — the speed
+// objective is now a single scalar, `ttfMs`, so there is nothing to tie-break. See TTF_OUTPUT_TOKENS.)
 // Bytes per cached element by KV-cache type — used only to order candidates by size (largest =
 // most VRAM, smallest = least) so calibration probes the two extremes. Mirrors llama.cpp's types.
 const KV_BYTES: Record<string, number> = {
@@ -554,6 +562,8 @@ export class BenchRunner {
     if (sys.gpus.length > 0) {
       // Binary search ngl ∈ [0, blockCount] for the HIGHEST that loads with enough headroom VRAM.
       const hi0 = entry.blockCount > 0 ? entry.blockCount : 99
+
+      // Spill is measured per probe (see moeSearch and spill.ts) — no calibration phase.
       let lo = 0, hi = hi0
       bestNgl = null
       while (lo <= hi && !this.cancelled && Date.now() <= this.deadline) {
@@ -562,11 +572,15 @@ export class BenchRunner {
         const probe = await this.probeVram(entry, sys, { ...base, ngl: mid }, caps)
         this.pushProbe(results, base, 'ngl', mid, probe)
         await this.settleGpu(sys)
-        if (probe.outcome === 'ok' && !overHeadroom(probe.vramAbsMb, budgetMb, headroomMb)) {
-          bestNgl = mid // fits with headroom → record, try MORE GPU layers
+        const verdict = probeVerdict(probe, budgetMb, headroomMb)
+        if (verdict.decision === 'fits') {
+          bestNgl = mid // fits with headroom AND isn't spilling → record, try MORE GPU layers
           lo = mid + 1
         } else {
-          hi = mid - 1 // oom / over-headroom / crash → fewer GPU layers
+          if (verdict.reason === 'spill') {
+            this.emit(`ngl=${mid} spilling ${Math.round(verdict.shortfallMb ?? 0)} MB to system RAM — using fewer GPU layers`)
+          }
+          hi = mid - 1 // oom / spill / over-headroom / crash → fewer GPU layers
         }
       }
     }
@@ -576,6 +590,14 @@ export class BenchRunner {
     // Phase 2 (the actual timed run) can allocate more VRAM than Phase 1's load-only probe did
     // (lazy cuBLAS/graph-capture scratch buffers) — re-validate against the REAL post-generation
     // VRAM and back off one layer if it silently blew through the user's headroom (ADR-217).
+    // Same two ways the real run can invalidate a probe-accepted config as in moeSearch: exceeding
+    // the VRAM headroom, or SPILLING once prefill allocates its compute buffers (invisible to a
+    // load-only probe). Back off one layer for either.
+    if (found && isSpilling(found.cand.spillMb) && bestNgl > 0) {
+      this.emit(`ngl=${bestNgl} spilled ${Math.round(found.cand.spillMb as number)} MB once actually generating (the load-only probe could not see this) — retrying at ngl=${bestNgl - 1}`)
+      const safer = await this.benchAt(entry, sys, { ...base, ngl: bestNgl - 1 }, caps, results, `ngl=${bestNgl - 1} (spill backoff)`)
+      if (safer) { found = safer; bestNgl = bestNgl - 1 }
+    }
     if (found && overHeadroom(found.cand.vramAbsMb, budgetMb, headroomMb) && bestNgl > 0) {
       this.emit(`ngl=${bestNgl} exceeded headroom after generation (${found.cand.vramAbsMb} MB) — retrying at ngl=${bestNgl - 1}`)
       const safer = await this.benchAt(entry, sys, { ...base, ngl: bestNgl - 1 }, caps, results, `ngl=${bestNgl - 1} (headroom backoff)`)
@@ -612,6 +634,41 @@ export class BenchRunner {
     const maxN = entry.blockCount > 0 ? entry.blockCount : (derived.nCpuMoe || 0)
     // VRAM budget for THIS split (one card for single-GPU 'none', summed pool otherwise) — see denseSearch.
     const budgetMb = gpuBudgetMb(sys, base)
+    // --- SPILL CALIBRATION (ADR-348 follow-up) -------------------------------------------------
+    // Absolute VRAM alone cannot tell "fits" from "spilling": once the driver falls back to host
+    // memory the reading pins at the card ceiling and stops responding to placement entirely
+    // (measured: nCpuMoe 0/3/9 all read 15823-15828 MiB while spilling 2914/2210/698 MiB). So the
+    // search gets a SECOND input — how much of the residency this candidate should have gained
+    // failed to land in VRAM. See spill.ts.
+    //
+    // The slope must be calibrated from the LOW-RESIDENCY end (maximum CPU offload), where spill is
+    // least likely. This is load-bearing, not incidental: a slope derived from already-saturated
+    // probes is near-zero (measured 6.5 MiB across a step whose true cost was 262 MiB), which would
+    // under-predict residency and mask the very spill this exists to detect. The binary search's own
+    // probes cannot be reused for this — it jumps straight from the midpoint into the saturated
+    // region, so no two of its samples are reliably both unsaturated.
+    //
+    // Costs two extra load-only probes (~20s each). That is cheap against the 10-minute per-test
+    // timeout a single mis-selected spilling candidate burns.
+    // Anchor PLACEMENT and SPACING both matter.
+    //
+    // SPACING: slope error is (reading noise / gap) and is then multiplied by the extrapolation
+    // distance, which can be 20+ steps. A proportional gap divides that error by the gap.
+    //
+    // PLACEMENT: never anchor on nCpuMoe = maxN. That is the degenerate endpoint — EVERY expert on
+    // CPU — and it does not sit on the same line as the rest of the range. Measured live 2026-08-07
+    // on Qwen3.6-35B-A3B (maxN=40): the 40→30 segment reads 269.6 MB/expert while 30→25, 25→22 and
+    // 22→20 all read exactly 262.0. Anchoring across that endpoint inflated the slope by 2.9%,
+    // which compounded over 20 steps into a 76 MB shortfall at nCpuMoe=20 — a FALSE spill verdict on
+    // a config with 2.5 GB of VRAM free, which drove the search rightward into 21-40 and produced a
+    // badly over-conservative answer. `denseSearch` already skips ngl=0 for exactly this reason;
+    // maxN is the MoE analogue of that degenerate endpoint and needs the same guard.
+    //
+    // So both anchors are INTERIOR points in the low-residency (high CPU offload) region: far enough
+    // from maxN to be on the linear trend, far enough from 0 to be nowhere near saturation.
+    // Spill is MEASURED per probe (probeVram returns the host-memory delta across the load), so
+    // there is no calibration phase here at all — no anchors, no slope, no extrapolation, and two
+    // fewer probes per sweep. See spill.ts for why derivation was removed.
     let lo = 0, hi = maxN
     let bestN: number | null = null
 
@@ -621,24 +678,59 @@ export class BenchRunner {
       const probe = await this.probeVram(entry, sys, { ...base, nCpuMoe: mid }, caps)
       this.pushProbe(results, base, 'nCpuMoe', mid, probe)
       await this.settleGpu(sys)
-      if (probe.outcome === 'oom' || overHeadroom(probe.vramAbsMb, budgetMb, headroomMb)) {
-        lo = mid + 1 // too much on GPU → more CPU experts to free VRAM / restore the headroom
-      } else if (probe.outcome === 'ok') {
-        bestN = mid // fits with headroom → record, try FEWER CPU experts (more on GPU)
+      const verdict = probeVerdict(probe, budgetMb, headroomMb)
+      if (verdict.decision === 'fits') {
+        bestN = mid // fits with headroom AND isn't spilling → record, try FEWER CPU experts
         hi = mid - 1
       } else {
-        lo = mid + 1 // crash / timeout → treat as memory pressure
+        if (verdict.reason === 'spill') {
+          this.emit(`nCpuMoe=${mid} spilling ${Math.round(verdict.shortfallMb ?? 0)} MB to system RAM — offloading more`)
+        }
+        lo = mid + 1 // too much on GPU → more CPU experts to free VRAM / restore the headroom
       }
     }
 
     if (bestN === null) return null
-    let found = await this.benchAt(entry, sys, { ...base, nCpuMoe: bestN }, caps, results, `nCpuMoe=${bestN}`)
-    // Same Phase-1-vs-Phase-2 VRAM gap as denseSearch — back off (more CPU experts, less VRAM) one
+    // The Phase-1 probe is load-only (no generation) — it can report "ok" for an nCpuMoe that
+    // then genuinely crashes/faults during the real Phase-2 bench (e.g. prefill-gate catching a
+    // compute spill the VRAM-only probe never exercised — see ADR-337 for the original "probe ok,
+    // real bench doesn't" gap this class of failure belongs to). benchAt returns null for any
+    // non-'ok' outcome, and previously that null was never retried — the search just gave up with
+    // no winner even when the very next nCpuMoe (already probed "ok" with headroom to spare in
+    // Phase 1) was never actually bench-tested. Walk forward (more CPU experts, less GPU pressure)
+    // until something benches clean or maxN is exhausted, mirroring the direction the binary search
+    // itself already uses for "too much on GPU".
+    let found: { cand: BenchCandidate; profile: LoadProfile } | null = null
+    let foundN = bestN
+    for (let n = bestN; n <= maxN; n++) {
+      const label = n === bestN ? `nCpuMoe=${n}` : `nCpuMoe=${n} (crash backoff)`
+      found = await this.benchAt(entry, sys, { ...base, nCpuMoe: n }, caps, results, label)
+      if (found) { foundN = n; break }
+      // Check cancel/deadline BEFORE announcing a retry: a run stopped here (the Cancel button,
+      // or a model load / engine stop-restart, which all call cancel()) would otherwise leave the
+      // log ending on a "retrying at nCpuMoe=N+1" it never keeps — which reads as the backoff
+      // silently dying rather than the run being stopped from outside.
+      const stopped = this.cancelled || Date.now() > this.deadline
+      if (stopped) {
+        this.emit(`nCpuMoe=${n} failed to bench (${results[results.length - 1]?.outcome ?? 'crash'}) — run ${this.cancelled ? 'cancelled' : 'out of time budget'}, stopping`)
+        break
+      }
+      if (n < maxN) this.emit(`nCpuMoe=${n} failed to bench (${results[results.length - 1]?.outcome ?? 'crash'}) — retrying at nCpuMoe=${n + 1}`)
+    }
+    // Same Phase-1-vs-Phase-2 VRAM gap as above — back off (more CPU experts, less VRAM) one
     // step if the real measured run blew through headroom (ADR-217).
-    if (found && overHeadroom(found.cand.vramAbsMb, budgetMb, headroomMb) && bestN < maxN) {
-      this.emit(`nCpuMoe=${bestN} exceeded headroom after generation (${found.cand.vramAbsMb} MB) — retrying at nCpuMoe=${bestN + 1}`)
-      const safer = await this.benchAt(entry, sys, { ...base, nCpuMoe: bestN + 1 }, caps, results, `nCpuMoe=${bestN + 1} (headroom backoff)`)
-      if (safer) found = safer
+    // Two ways the real run can invalidate a config the load-only probe accepted: it can exceed the
+    // VRAM headroom (ADR-217), or it can SPILL once prefill allocates its compute buffers — which
+    // the probe cannot see, because it never generates. Back off one step for either.
+    if (found && isSpilling(found.cand.spillMb) && foundN < maxN) {
+      this.emit(`nCpuMoe=${foundN} spilled ${Math.round(found.cand.spillMb as number)} MB once actually generating (the load-only probe could not see this) — retrying at nCpuMoe=${foundN + 1}`)
+      const safer = await this.benchAt(entry, sys, { ...base, nCpuMoe: foundN + 1 }, caps, results, `nCpuMoe=${foundN + 1} (spill backoff)`)
+      if (safer) { found = safer; foundN = foundN + 1 }
+    }
+    if (found && overHeadroom(found.cand.vramAbsMb, budgetMb, headroomMb) && foundN < maxN) {
+      this.emit(`nCpuMoe=${foundN} exceeded headroom after generation (${found.cand.vramAbsMb} MB) — retrying at nCpuMoe=${foundN + 1}`)
+      const safer = await this.benchAt(entry, sys, { ...base, nCpuMoe: foundN + 1 }, caps, results, `nCpuMoe=${foundN + 1} (headroom backoff)`)
+      if (safer) { found = safer; foundN = foundN + 1 }
     }
     // VRAM-spill hill-climb (founder-directed, 2026-07-17) — ONLY when the user has explicitly
     // opted in via VRAM_HEADROOM_SPILL_MB (0, Settings → Engine → Advanced). At any real headroom
@@ -656,12 +748,13 @@ export class BenchRunner {
       let current = found
       while (current.cand.params.nCpuMoe > 0 && !this.cancelled && Date.now() <= this.deadline) {
         const spillN = current.cand.params.nCpuMoe - 1
-        const prev = { tps: current.cand.tps as number, prefillTps: current.cand.prefillTps }
-        const prevLabel = `${prev.tps.toFixed(1)} tok/s (prefill ${prev.prefillTps !== null ? prev.prefillTps.toFixed(1) : 'n/a'} tok/s)`
+        const prev = { ttftMs: current.cand.ttftMs, tps: current.cand.tps }
+        const prevTtf = ttfMs(prev)
+        const prevLabel = prevTtf !== null ? `${(prevTtf / 1000).toFixed(1)}s to ${TTF_OUTPUT_TOKENS} tokens` : 'an unmeasurable result'
         this.emit(`nCpuMoe=${current.cand.params.nCpuMoe} measured ${prevLabel} — trying VRAM-spill nCpuMoe=${spillN}`)
         const spillFound = await this.benchAt(entry, sys, { ...base, nCpuMoe: spillN }, caps, results, `nCpuMoe=${spillN} (VRAM-spill hill-climb)`)
         if (!spillImproves(prev, spillFound?.cand ?? null)) {
-          this.emit(`nCpuMoe=${spillN} spill did not improve on ${prevLabel} (generation or prefill speed decreased) — stopping climb, keeping nCpuMoe=${current.cand.params.nCpuMoe}`)
+          this.emit(`nCpuMoe=${spillN} did not beat ${prevLabel} — stopping climb, keeping nCpuMoe=${current.cand.params.nCpuMoe}`)
           break
         }
         current = spillFound as { cand: BenchCandidate; profile: LoadProfile }
@@ -682,9 +775,9 @@ export class BenchRunner {
     sys: SysInfo,
     profile: LoadProfile,
     caps: Engine['capabilities'],
-  ): Promise<{ outcome: 'ok' | 'timeout' | 'crash' | 'oom'; vramAbsMb: number | null }> {
+  ): Promise<{ outcome: 'ok' | 'timeout' | 'crash' | 'oom'; vramAbsMb: number | null; spillMb: number | null }> {
     const active = this.registry.active()
-    if (!active) return { outcome: 'crash', vramAbsMb: null }
+    if (!active) return { outcome: 'crash', vramAbsMb: null, spillMb: null }
     const testDeadline = Math.min(Date.now() + READY_TIMEOUT_MS + 5_000, this.deadline)
     const opts: StartOpts = {
       engine: active,
@@ -692,19 +785,26 @@ export class BenchRunner {
       modelPath: entry.path,
       extraArgs: profileToArgs(profile, entry, caps, sys.cores, sys, active.binPath),
     }
+    // Baseline BEFORE the load. Spill is the delta, so whatever the desktop/compositor already
+    // holds in shared memory cancels out — that can be gigabytes on a box whose display shares the
+    // GPU, and assuming a fixed baseline would be wrong there (measured 157-198 MB across models on
+    // a dedicated card, far higher with a display attached).
+    const sharedBefore = await readGpuSharedMb(sys)
     try {
       await this.manager.start(opts)
     } catch {
-      return { outcome: 'crash', vramAbsMb: null }
+      return { outcome: 'crash', vramAbsMb: null, spillMb: null }
     }
     const outcome = await this.awaitReady(testDeadline)
     let vramAbsMb: number | null = null
+    let spill: number | null = null
     if (outcome === 'ok') {
-      await sleep(800) // let the allocator settle so the VRAM reading is final
+      await sleep(800) // let the allocator settle so the readings are final
       vramAbsMb = await readGpuVramMb(sys)
+      spill = spillMb(sharedBefore, await readGpuSharedMb(sys))
     }
     await this.stopEngine()
-    return { outcome, vramAbsMb }
+    return { outcome, vramAbsMb, spillMb: spill }
   }
 
   /** Record a VRAM-probe trial in the candidate list (tps/prefill are null — nothing was generated;
@@ -714,7 +814,7 @@ export class BenchRunner {
     base: LoadProfile,
     knob: 'ngl' | 'nCpuMoe',
     value: number,
-    probe: { outcome: BenchCandidate['outcome']; vramAbsMb: number | null },
+    probe: { outcome: BenchCandidate['outcome']; vramAbsMb: number | null; spillMb: number | null },
   ): void {
     const probeCand: BenchCandidate = {
       label: `probe ${knob}=${value}`,
@@ -732,6 +832,7 @@ export class BenchRunner {
       ttftMs: null,
       vramMb: null,
       vramAbsMb: probe.vramAbsMb,
+      spillMb: probe.spillMb,
     }
     results.push(probeCand)
     this.emit(`${probeCand.label} → ${probe.outcome}${probe.vramAbsMb != null ? ` (${probe.vramAbsMb} MB)` : ''}`, probeCand)
@@ -778,7 +879,7 @@ export class BenchRunner {
       kvTypeK: profile.kvTypeK,
       flashAttn: profile.flashAttn,
     }
-    const fail = (outcome: BenchCandidate['outcome']): BenchCandidate => ({ label, params, outcome, tps: null, prefillTps: null, ttftMs: null, vramMb: null, vramAbsMb: null })
+    const fail = (outcome: BenchCandidate['outcome']): BenchCandidate => ({ label, params, outcome, tps: null, prefillTps: null, ttftMs: null, vramMb: null, vramAbsMb: null, spillMb: null })
     // Live sub-phase progress so each (possibly multi-minute) trial isn't a silent wait.
     const phase = (p: string) => { this.state = { ...this.state, step: `${stepPrefix} — ${p}` } }
 
@@ -803,6 +904,7 @@ export class BenchRunner {
     }
 
     const vramBefore = await readGpuVramMb(sys)
+    const sharedBefore = await readGpuSharedMb(sys)
     phase('loading model…')
     try {
       await this.manager.start(opts)
@@ -840,11 +942,14 @@ export class BenchRunner {
     phase('measuring t/s…')
     const measured = await this.runChatWatched(target, benchMessages, 128, remaining(), logPath)
     const vramAfter = await readGpuVramMb(sys)
+    // Read spill BEFORE stopping the engine — this is the real-run figure the Phase-1 probe cannot
+    // see, since the probe never generates and so never allocates the prefill compute buffers.
+    const sharedAfter = await readGpuSharedMb(sys)
     await this.stopEngine()
 
     if ('fault' in measured) return fail(measured.fault)
     const vramMb = vramBefore !== null && vramAfter !== null ? Math.max(0, vramAfter - vramBefore) : vramAfter
-    return { label, params, outcome: 'ok', tps: measured.tps, prefillTps: measured.prefillTps, ttftMs: measured.ttftMs, vramMb, vramAbsMb: vramAfter }
+    return { label, params, outcome: 'ok', tps: measured.tps, prefillTps: measured.prefillTps, ttftMs: measured.ttftMs, vramMb, vramAbsMb: vramAfter, spillMb: spillMb(sharedBefore, sharedAfter) }
   }
 
   /** Poll the manager state until the engine is running, the readiness window
@@ -1488,41 +1593,140 @@ export function pickKvQuants(baseKv: string, kvTypes: string[]): string[] {
   return out
 }
 
-/** Speed objective ("best prefill AND t/s"): generation t/s is primary; when two configs are within
- *  OUTPUT_TIE of each other on generation t/s, the one with faster prefill wins. Returns true when
- *  `a` beats `b`. */
-export function betterBySpeed(
-  a: { tps: number | null; prefillTps: number | null },
-  b: { tps: number | null; prefillTps: number | null },
-): boolean {
-  const at = a.tps ?? 0
-  const bt = b.tps ?? 0
-  if (bt <= 0) return at > 0
-  const rel = (at - bt) / bt
-  if (rel > OUTPUT_TIE) return true
-  if (rel < -OUTPUT_TIE) return false
-  return (a.prefillTps ?? 0) > (b.prefillTps ?? 0)
+/** Why the offload search rejected a probe, or that it accepted it. Extracted as a pure function
+ *  so the composed decision — fit AND spill AND load outcome — is testable without a GPU; the
+ *  individual pieces being correct does not prove they compose to the right answer. */
+export type ProbeVerdict =
+  | { decision: 'fits' }
+  | { decision: 'offload-more'; reason: 'oom' | 'spill' | 'headroom' | 'failed'; shortfallMb?: number }
+
+/** The binary search's per-probe decision. `offload-more` means move more experts/layers to the
+ *  CPU (search rightward); `fits` means this candidate is viable, so try keeping more on the GPU.
+ *
+ *  Order matters: a hard OOM is checked first (unambiguous), then SPILL, then the headroom fit
+ *  check. Spill must precede the fit check because a spilling candidate frequently PASSES the fit
+ *  check — that is the entire bug this exists to close (measured: nCpuMoe=11 read 15813 MiB against
+ *  a 15928 MiB fit line, so `overHeadroom` called it a clean fit while 186 MiB sat in host memory).
+ *
+ *  `predictedMb` null (no calibrated slope, or unreadable VRAM) simply skips the spill test — the
+ *  search then behaves exactly as it did before spill detection existed. */
+export function probeVerdict(
+  probe: { outcome: BenchCandidate['outcome']; vramAbsMb: number | null; spillMb: number | null },
+  budgetMb: number,
+  headroomMb: number,
+): ProbeVerdict {
+  if (probe.outcome === 'oom') return { decision: 'offload-more', reason: 'oom' }
+  if (isSpilling(probe.spillMb)) {
+    return { decision: 'offload-more', reason: 'spill', shortfallMb: probe.spillMb as number }
+  }
+  // Free VRAM below the user's configured headroom → too tight, offload more.
+  //
+  // NOTE (founder correction, 2026-08-07): headroom + SPILL_TOLERANCE_MB is a rejection ceiling,
+  // NOT an acceptance floor. Free VRAM ABOVE that bar does not mean "good", it means "there is
+  // still room to move more experts onto the GPU" — which the binary search already acts on by
+  // accepting and searching leftward. An earlier revision required free > headroom + allowance to
+  // accept, which inverted the rule: it rejected every config INSIDE the ideal window and settled
+  // on one above it (measured: it chose nCpuMoe=14 at 953 MiB free while rejecting 13 at 695 and
+  // 12 at 497, both of which are in-window AND measurably faster — 25.8 s and 26.7 s versus 31.9 s
+  // on time-to-answer). The ideal config has free VRAM BETWEEN headroom and headroom+allowance.
+  if (overHeadroom(probe.vramAbsMb, budgetMb, headroomMb)) {
+    return { decision: 'offload-more', reason: 'headroom' }
+  }
+  if (probe.outcome === 'ok') return { decision: 'fits' }
+  return { decision: 'offload-more', reason: 'failed' } // crash / timeout → treat as memory pressure
 }
 
-/** MoE VRAM-spill hill-climb decision (founder-directed, 2026-07-17; extended same day, after live
- *  testing, to also guard prefill speed): should auto-tune keep moving another MoE expert onto the
- *  GPU past the safe-headroom point? Stops (keeping the previous, better step) the instant EITHER
- *  generation t/s OR prefill t/s decreases — a spill that trades away prompt-processing speed for
- *  a small generation gain (or vice versa) isn't a real win. A failed candidate (null, or any
- *  non-'ok' outcome) is never treated as an improvement. A candidate with no prefill reading is
- *  treated the same as a decrease (fail-safe: this feature already trades away a real safety
- *  margin for speed, so an unverifiable metric should never wave a spill step through) — but a
- *  missing reading on the PREVIOUS step (nothing to compare against) just skips the prefill check
- *  rather than blocking on it. No tie band here (unlike `betterBySpeed`): this is a
- *  one-directional search for "still climbing", not a final-winner comparison. */
-export function spillImproves(
-  previous: { tps: number; prefillTps: number | null },
-  candidate: { outcome: BenchCandidate['outcome']; tps: number | null; prefillTps: number | null } | null,
+/** Representative output length (tokens) for the {@link ttfMs} objective — "how long until the
+ *  user has a complete answer", not "how long until the first token".
+ *
+ *  Founder call, 2026-08-07, and it is a REAL product lever, not a cosmetic constant. Measured on
+ *  a 20k-token prompt, two configs of the same model: nCpuMoe=3 (prefill 767 / gen 135 t/s) versus
+ *  nCpuMoe=16 (prefill 1450 / gen 87.5 t/s). Which one "wins" depends entirely on this number —
+ *  n=16 leads by 1.80x at 100 output tokens, 1.33x at 1000, and LOSES beyond the ~3056-token
+ *  crossover where generation throughput starts to dominate prefill.
+ *
+ *  1000 is chosen because TurboLLM's real workload is coding/agentic turns through the gateway,
+ *  which routinely emit 1000+ tokens; at 100 the metric is ~95% prefill and effectively stops
+ *  measuring generation at all. Raising this above ~3000 would swing the objective back toward
+ *  VRAM-spilling configs (which trade prefill for generation), so change it deliberately. */
+export const TTF_OUTPUT_TOKENS = 1000
+
+/** Time in ms to deliver `outputTokens` of a real answer: measured time-to-first-token (which is
+ *  dominated by prefill) plus generation time for the rest. This is the auto-tune objective —
+ *  a single number combining BOTH axes, replacing the old "generation t/s primary, prefill only as
+ *  a 5% tie-break" scoring.
+ *
+ *  Why the change (founder call, 2026-08-07): the old objective is generation-dominant, so it
+ *  preferred a config that spilled 2.5 GB of VRAM (nCpuMoe=3: 135 gen / 767 prefill) over one that
+ *  spilled nothing (nCpuMoe=16: 87.5 gen / 1450 prefill) purely on its 54% generation lead — while
+ *  the second is 1.33x faster to actually finish a turn, because at real context depth prefill
+ *  dominates. Optimizing generation t/s alone systematically selects toward VRAM spill.
+ *
+ *  Lower is better. Returns null when it cannot be computed, so callers never silently rank an
+ *  unmeasured candidate.
+ *
+ *  CAVEAT, deliberately not hidden: `tps` is measured over a short (128-token) request, and real
+ *  generation slows as the KV cache fills, so extrapolating it to `outputTokens` slightly
+ *  OVER-estimates throughput. It biases every candidate in the same direction, so the ranking
+ *  holds, but the absolute milliseconds are optimistic. Comparing `ttftMs` across candidates is
+ *  only valid within a single run, where every candidate saw the same bench prompt. */
+export function ttfMs(
+  c: { ttftMs: number | null; tps: number | null },
+  outputTokens: number = TTF_OUTPUT_TOKENS,
+): number | null {
+  if (c.ttftMs === null || c.tps === null || c.tps <= 0) return null
+  return c.ttftMs + (outputTokens / c.tps) * 1000
+}
+
+/** Speed objective: the config that delivers a full answer soonest wins (lowest {@link ttfMs}).
+ *  Returns true when `a` beats `b`.
+ *
+ *  A candidate whose TTF cannot be computed (no reading) always loses to one that can, and never
+ *  wins on a technicality; two uncomputable candidates compare false. An exact tie keeps the
+ *  incumbent (`b`) rather than churning the winner. */
+export function betterBySpeed(
+  a: { ttftMs: number | null; tps: number | null },
+  b: { ttftMs: number | null; tps: number | null },
 ): boolean {
-  if (!candidate || candidate.outcome !== 'ok' || candidate.tps === null) return false
-  if (candidate.tps < previous.tps) return false
-  if (previous.prefillTps !== null && (candidate.prefillTps === null || candidate.prefillTps < previous.prefillTps)) return false
-  return true
+  const at = ttfMs(a)
+  const bt = ttfMs(b)
+  if (at === null) return false
+  if (bt === null) return true
+  return at < bt
+}
+
+/** MoE VRAM-spill hill-climb decision (founder-directed, 2026-07-17): should auto-tune keep moving
+ *  another MoE expert onto the GPU past the safe-headroom point? Runs ONLY under the explicit
+ *  VRAM_HEADROOM_SPILL_MB opt-in, and it is the sanctioned way to explore past the
+ *  SPILL_TOLERANCE_MB allowance — the default search stops at the allowance precisely so this
+ *  aggressive path stays opt-in (founder call, 2026-08-07).
+ *
+ *  Judged on {@link ttfMs} (founder call, 2026-08-07), the same objective as `betterBySpeed`,
+ *  replacing the old "neither generation NOR prefill may decrease" pair of tests. Those two axes
+ *  move in OPPOSITE directions here — pushing experts onto the GPU raises generation while spill
+ *  drags prefill down — so requiring both to hold up rejected steps that were genuinely faster
+ *  overall. One combined number resolves that correctly.
+ *
+ *  Why this needs to keep measuring rather than trusting a threshold: measured on a 16 GB card at
+ *  200k ctx, time-to-answer improves smoothly from nCpuMoe=14 (31.9 s) down through 10 (24.9 s) to
+ *  5 (19.8 s) — and then falls off a CLIFF to 431 s at nCpuMoe=3, where prefill collapses from
+ *  2400 to 80 tok/s. There is no load-time signal that predicts where that cliff sits; only a
+ *  measured step does.
+ *
+ *  No tie band (unlike `betterBySpeed`): this is a one-directional "still climbing?" test, not a
+ *  final-winner comparison, so an equal step stops the climb and keeps the safer config. */
+export function spillImproves(
+  previous: { ttftMs: number | null; tps: number | null },
+  candidate: { outcome: BenchCandidate['outcome']; ttftMs: number | null; tps: number | null } | null,
+): boolean {
+  if (!candidate || candidate.outcome !== 'ok') return false
+  const next = ttfMs(candidate)
+  const prev = ttfMs(previous)
+  // Fail-safe on an unmeasurable step, in EITHER direction: this feature deliberately trades away
+  // the user's configured safety margin for speed, so a step that cannot be shown to be faster must
+  // never be waved through. A failed candidate (oom/crash/timeout) is likewise never an improvement.
+  if (next === null || prev === null) return false
+  return next < prev
 }
 
 /** Bytes per cached element for a KV-cache type (defaults to f16's 2 for unknown types). Note:
@@ -1647,6 +1851,115 @@ async function readGpuVramMb(sys: SysInfo): Promise<number | null> {
   const nv = await readNvidiaVramMb()
   if (nv !== null) return nv
   if (sys.gpus.some((g) => g.vendor === 'amd')) return readRocmVramMb()
+  return null
+}
+
+/** Sums host-backed ("shared") GPU memory across every adapter and prints it in MB. Summing rather
+ *  than identifying a specific card is deliberate: callers take a DELTA across a model load, so
+ *  static desktop/compositor usage cancels out and no adapter matching is needed. */
+const WDDM_SHARED_PS =
+  "$s=(Get-Counter '\\GPU Adapter Memory(*)\\Shared Usage' -ErrorAction SilentlyContinue).CounterSamples;" +
+  'if(-not $s){exit 1};' +
+  '[math]::Round((($s|Measure-Object CookedValue -Sum).Sum)/1MB,1)'
+
+/** Total host-backed GPU memory in MB via Windows' WDDM performance counters. These are an OS-level
+ *  facility, not a vendor one, so this covers NVIDIA, AMD and Intel adapters alike on Windows —
+ *  which is precisely where silent host-memory fallback happens (Linux CUDA hard-fails instead, and
+ *  that surfaces through the existing OOM path).
+ *
+ *  Null on non-Windows, or when the counter cannot be resolved — never throws. KNOWN LIMITATION:
+ *  performance-counter names are localized, so this English path may not resolve on a non-English
+ *  Windows install. That is a safe failure: `isSpilling` fails open, and the search behaves exactly
+ *  as it did before spill detection existed. A language-independent lookup (counter index via the
+ *  Perflib registry tables) was attempted and needs elevation, so it is left as follow-up rather
+ *  than guessed at. */
+/** Latches once the counter proves unreadable on this machine, so a box that cannot resolve it
+ *  (localized Windows, PowerShell blocked by policy) does not re-attempt on every probe — a sweep
+ *  reads this twice per candidate, and the answer cannot change within a run. Only the UNSUPPORTED
+ *  verdict is cached; readings never are, since each one must reflect the load just performed. */
+let wddmSharedUnsupported = false
+
+function readWddmSharedMb(): Promise<number | null> {
+  if (process.platform !== 'win32' || wddmSharedUnsupported) return Promise.resolve(null)
+  return new Promise((resolve) => {
+    try {
+      execFile(
+        'powershell',
+        ['-NoProfile', '-NonInteractive', '-Command', WDDM_SHARED_PS],
+        { timeout: 10_000, windowsHide: true },
+        (err, stdout) => {
+          if (err) {
+            // ONLY latch on definitive unavailability. A timeout (err.killed) is transient and must
+            // NOT latch: this runs immediately around a model load, when the machine is under peak
+            // I/O and memory pressure and a slow PowerShell start is entirely plausible. The daemon
+            // is long-lived, so latching on that would silently disable spill detection until
+            // restart — reverting to exactly the fit-only behaviour this release exists to fix.
+            // A missing interpreter (ENOENT) or the script's own `exit 1` (counter unresolvable) are
+            // permanent for this process and worth latching.
+            if (!err.killed) wddmSharedUnsupported = true
+            return resolve(null)
+          }
+          const mb = parseFloat((stdout || '').trim())
+          if (!Number.isFinite(mb) || mb < 0) {
+            wddmSharedUnsupported = true // ran fine but produced nothing parseable → not available here
+            return resolve(null)
+          }
+          resolve(Math.round(mb))
+        },
+      )
+    } catch {
+      wddmSharedUnsupported = true // could not spawn at all
+      resolve(null)
+    }
+  })
+}
+
+/** Pure parser for `rocm-smi --showmeminfo gtt --json`, split out for direct testing. GTT is the
+ *  Graphics Translation Table — host memory the GPU reaches over PCIe, i.e. AMD's equivalent of the
+ *  spilled region. Sums "GTT Total Used Memory (B)" across every card. Null on unparseable JSON.
+ *
+ *  Note this is the counterpart to {@link parseRocmVramUsed}, which reads VRAM and must NOT include
+ *  GTT — counting host memory as VRAM would over-report residency on a discrete card. */
+export function parseRocmGttUsed(memJson: string): number | null {
+  try {
+    const mem = JSON.parse(memJson) as Record<string, Record<string, string>>
+    let total = 0
+    for (const fields of Object.values(mem)) {
+      const usedKey = Object.keys(fields).find((k) => /GTT Total Used Memory/i.test(k))
+      total += usedKey ? parseInt(String(fields[usedKey]).trim(), 10) || 0 : 0
+    }
+    return Number.isFinite(total) ? Math.round(total / 1e6) : null
+  } catch {
+    return null
+  }
+}
+
+/** Best-effort AMD host-backed (GTT) memory in MB via rocm-smi. Null when rocm-smi is absent or
+ *  unparseable — never throws. */
+function readRocmGttMb(): Promise<number | null> {
+  return new Promise((resolve) => {
+    try {
+      execFile('rocm-smi', ['--showmeminfo', 'gtt', '--json'], { timeout: 8000, windowsHide: true }, (err, stdout) => {
+        if (err || !stdout) return resolve(null)
+        resolve(parseRocmGttUsed(stdout))
+      })
+    } catch {
+      resolve(null)
+    }
+  })
+}
+
+/** Host-backed GPU memory in MB, or null where the platform exposes no such accounting.
+ *
+ *  Windows first, unconditionally: its WDDM counters are vendor-neutral and cover every adapter.
+ *  Otherwise AMD/ROCm reports GTT directly. Linux+NVIDIA intentionally returns null — CUDA there
+ *  does not silently fall back to host memory, it fails the allocation, which the existing OOM
+ *  detection already handles. Apple/Metal returns null too: unified memory has no discrete VRAM for
+ *  anything to spill OUT of, and auto-tune does not run on MLX at all (bench.ts refuses that kind). */
+async function readGpuSharedMb(sys: SysInfo): Promise<number | null> {
+  const win = await readWddmSharedMb()
+  if (win !== null) return win
+  if (sys.gpus.some((g) => g.vendor === 'amd')) return readRocmGttMb()
   return null
 }
 
