@@ -9,7 +9,9 @@ import {
   parseKfdNodes,
   pciSlotToKfdIds,
   linuxGpuFromLspci,
+  amdApuOnly,
 } from './sysinfo'
+import type { SysInfo } from './sysinfo'
 
 // rocm-smi --showmeminfo vram --json output for an RX 7900 XTX (24GB). The WMI
 // AdapterRAM fallback would cap this at ~4GB; rocm-smi reports the true total.
@@ -99,6 +101,29 @@ test('isIntegratedGpuName: discrete AMD cards are NOT integrated', () => {
   assert.equal(isIntegratedGpuName('AMD Radeon RX 7900 XTX'), false)
   assert.equal(isIntegratedGpuName('AMD Radeon PRO W7900'), false)
   assert.equal(isIntegratedGpuName('AMD Instinct MI300X'), false)
+})
+
+// GitHub #103: recommendBackendId needs to know when the ONLY AMD adapter present is an
+// APU/iGPU (ROCm doesn't support most of these on Windows), so it can skip ROCm for Vulkan.
+const sysWith = (...gpus: SysInfo['gpus']): SysInfo => ({ os: 'win32/x64', cpu: 'test', cores: 8, ramMB: 32000, gpus })
+
+test('amdApuOnly: true for a single AMD iGPU (e.g. Radeon 860M)', () => {
+  assert.equal(amdApuOnly(sysWith({ name: 'AMD Radeon 860M', vramMb: 16000, vendor: 'amd', unified: true })), true)
+})
+
+test('amdApuOnly: false when a discrete AMD GPU is present', () => {
+  assert.equal(amdApuOnly(sysWith({ name: 'AMD Radeon RX 7900 XTX', vramMb: 24000, vendor: 'amd' })), false)
+})
+
+test('amdApuOnly: false when an AMD iGPU sits alongside a discrete AMD GPU', () => {
+  assert.equal(amdApuOnly(sysWith(
+    { name: 'AMD Radeon 780M', vramMb: 16000, vendor: 'amd', unified: true },
+    { name: 'AMD Radeon RX 7900 XTX', vramMb: 24000, vendor: 'amd' },
+  )), false)
+})
+
+test('amdApuOnly: false when there is no AMD adapter at all', () => {
+  assert.equal(amdApuOnly(sysWith({ name: 'NVIDIA RTX 5070 Ti', vramMb: 16000, vendor: 'nvidia' })), false)
 })
 
 test('isIntegratedGpuName: NVIDIA and unrelated names are NOT integrated', () => {
