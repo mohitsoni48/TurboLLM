@@ -34,6 +34,20 @@ const GB = 1024
 
 export const BLESSED: readonly BlessedEntry[] = [
   // ── role: general — Casual, Enthusiast. Dense 12B; quant is the tier knob. ──
+  //
+  // THE 16 GB EDGE IS DELIBERATELY ASYMMETRIC BETWEEN ROLES — do not "harmonise" these.
+  //   general: 16 GB is DENSE-side (G-T3, `minVramMb: 16 * GB`, spec 25 §5.4 "16–24 GB → Q5_K_M")
+  //   coder:   16 GB is MoE-side   (C-LOW-B, `maxVramMb: 16 * GB + 1`, §5.4 "≤ 16 GB → 35B-A3B")
+  //
+  // The roles are doing different things at that boundary, which is why the same number resolves
+  // two ways. `general` scales QUANT within one model (gemma-4-12b throughout), so the edge only
+  // picks a slightly larger quant — Q5_K_M is 7.84 GiB on a 16 GB card, nowhere near the limit, and
+  // which side 16 GB lands on is close to immaterial. `coder` SWITCHES MODEL FAMILIES there — MoE
+  // 35B-A3B below, dense 27B above — so the edge decides whether experts spill to RAM at all, and
+  // §7 pins it: "a 16 GB card with 16 GB system RAM must resolve to C-LOW-A, never C-LOW-B".
+  //
+  // (§5.2's "the two tables must not disagree on that edge" note is about the 32 GB Apple *unified*
+  // boundary, not this one — it does not require these two to match.)
   { id: 'G-T1', role: 'general', repo: 'unsloth/gemma-4-12b-it-GGUF', file: 'gemma-4-12b-it-UD-Q3_K_XL.gguf', bytes: 6_022_684_480, minVramMb: 4 * GB, maxVramMb: 8 * GB, minSystemRamMb: null },
   { id: 'G-T2', role: 'general', repo: 'unsloth/gemma-4-12b-it-GGUF', file: 'gemma-4-12b-it-Q4_K_M.gguf', bytes: 7_121_861_440, minVramMb: 8 * GB, maxVramMb: 16 * GB, minSystemRamMb: null },
   { id: 'G-T3', role: 'general', repo: 'unsloth/gemma-4-12b-it-GGUF', file: 'gemma-4-12b-it-Q5_K_M.gguf', bytes: 8_413_576_000, minVramMb: 16 * GB, maxVramMb: 24 * GB, minSystemRamMb: null },
