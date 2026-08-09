@@ -11,10 +11,13 @@ fixture.on('error', (err) => {
   process.stderr.write(`fixture bind warning: ${err.message}\n`)
 })
 
-// Start the daemon (already built inside the image)
+// Start the daemon (already built inside the image). The real tsup output is
+// dist/cli.js (see turbollm/package.json's "build" script) — dist/index.js
+// does not exist and this line never actually started a daemon until fixed.
 const { spawn } = await import('node:child_process')
-const daemon = spawn('node', ['dist/index.js'], {
+const daemon = spawn('node', ['dist/cli.js', '--no-open'], {
   stdio: ['ignore', 'pipe', 'pipe'],
+  cwd: '/src',
   env: { ...process.env, FIXTURE_MODE: process.env.FIXTURE_MODE ?? 'happy' },
 })
 

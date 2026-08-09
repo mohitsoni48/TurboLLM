@@ -45,6 +45,11 @@ export default defineConfig({
     exclude: [
       '**/node_modules/**',
       '**/e2e/**',
+      // Docker-only Playwright suite (spec 25 §10.3) — a sibling of e2e/, not
+      // nested under it, so the OTHER playwright config (testDir: './e2e',
+      // which spins up a vite dev server on 5173) never also collects it: this
+      // suite assumes the real daemon on 6996, not a dev-server proxy.
+      '**/e2e-onboarding/**',
       'src/lib/engine-groups.test.ts',
       'src/lib/personas.test.ts',
       'src/lib/tool-explain.test.ts',

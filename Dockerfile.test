@@ -6,18 +6,34 @@
 #   * No ports are published. Playwright runs INSIDE the container, so nothing
 #     binds on the host: it cannot collide with a real daemon on 6996 and
 #     cannot violate the 6996/6997-only rule.
+#   * Bundling happens on the HOST, not in this container — `npm run
+#     build:web && npm run build` OOM-crashed (exit 134) here at 1.9 GiB,
+#     which is what this Docker Desktop VM has. Vite/rollup + tsup bundling
+#     is the expensive step; `npm ci` (installing already-built packages) is
+#     I/O-bound and fine at this memory budget, so that part stays
+#     in-container. Run `npm run build:web && npm run build` in `turbollm/`
+#     on the host before building this image — matches Dockerfile.nvidia's
+#     own build stage, just executed outside Docker instead of inside it.
+#     `node_modules` is deliberately NOT copied from the host: on a Windows
+#     host it would carry Windows-compiled native bindings into this Linux
+#     image, so it is always installed fresh in-container instead.
 FROM node:22-bookworm
 
 WORKDIR /src
 COPY turbollm/package*.json ./
-COPY turbollm/web/package*.json ./web/
-RUN npm ci && cd web && npm ci
-COPY turbollm/ ./
-RUN npm run build:web && npm run build
+RUN npm ci
+COPY turbollm/dist ./dist
+COPY turbollm/bin ./bin
 
 # Playwright + its browser, in-container so the E2E never touches the host.
-RUN npx --yes playwright@1.48.0 install --with-deps chromium
+# @playwright/test itself lives in web/'s devDependencies; install just that
+# one package here rather than a full `web/ npm ci` (the app's own web
+# dependencies are already baked into dist/webdist and are not needed again).
+RUN npm install --no-save @playwright/test@1.48.0 \
+    && npx --yes playwright@1.48.0 install --with-deps chromium
 
+COPY turbollm/web/e2e-onboarding ./e2e-onboarding
+COPY turbollm/web/playwright.docker.config.ts ./playwright.docker.config.ts
 COPY test/fixtures/ /fixtures/
 
 ENV TURBOLLM_TEST=1
