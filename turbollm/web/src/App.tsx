@@ -46,17 +46,27 @@ function ScreenFallback() {
   )
 }
 
-/** Onboarding entry predicate (spec 25 §3): redirects EVERY route to
- *  `/onboarding` while it is unfinished AND the install has never once loaded
- *  a model successfully — `everLoadedModel` is server-authoritative (set only
- *  from a real successful load in `cli.ts`, never client-settable), so this
- *  cannot be tricked into re-showing the wizard by a stale local flag.
+/** Onboarding entry predicate (spec 25 §3): redirects to `/onboarding` while
+ *  it is unfinished AND the install has never once loaded a model
+ *  successfully — `everLoadedModel` is server-authoritative (set only from a
+ *  real successful load in `cli.ts`, never client-settable), so this cannot
+ *  be tricked into re-showing the wizard by a stale local flag.
  *  While the query hasn't resolved yet, default to NOT redirecting — the same
  *  conservative-default convention `routinesEnabled` already uses above,
- *  so a slow first poll never flashes the wizard over a returning user's app. */
+ *  so a slow first poll never flashes the wizard over a returning user's app.
+ *
+ *  `/models` is exempt. Caught by the E2E suite, not by typecheck or unit
+ *  tests: ModelStep sends the user to `/models` from several DESIGNED,
+ *  in-wizard exits — Pro's Discover handoff (ADR-338 Decision 6b, "the only
+ *  branch that leaves the wizard by design"), "use models I already have",
+ *  and "pick a different model". A blanket redirect bounced every one of
+ *  those straight back to `/onboarding` before the user ever saw Discover —
+ *  `onboarding.status` legitimately stays `pending` for all of them, since
+ *  visiting Discover is part of finishing the wizard, not leaving it. */
 function OnboardingGate({ shouldOnboard, children }: { shouldOnboard: boolean; children: ReactNode }) {
   const location = useLocation()
-  if (shouldOnboard && location.pathname !== '/onboarding') {
+  const exempt = location.pathname === '/onboarding' || location.pathname === '/models'
+  if (shouldOnboard && !exempt) {
     return <Navigate to="/onboarding" replace />
   }
   return <>{children}</>

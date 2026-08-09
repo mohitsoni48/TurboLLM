@@ -3,7 +3,8 @@
  *  This file owns ONLY step-sequencing state — it wraps Plan 1's already-tested
  *  pure `reduce`/`deriveSteps` (`screens/onboarding/machine.ts`) in a reducer,
  *  and persists the two durable facts (`status`, `profile`) through the real
- *  `/api/v1/onboarding` route (Task 7), never `localStorage`. It does NOT fetch
+ *  `/api/v1/onboarding` route (Task 7) — see the localStorage note below for
+ *  the one narrow exception. It does NOT fetch
  *  the model recommendation or poll download/load state — those are each
  *  step's own concern via `useOnboardingRecommendation` and the existing
  *  downloads/status queries, patched back in via `patchCtx`.
@@ -15,12 +16,24 @@
  *  multiple-sources-of-truth failure this rewrite exists to remove.
  *
  *  Does NOT reach into `src/onboarding/state.ts` — that is a daemon module;
- *  the web bundle mirrors only what it needs via `onboarding-api.ts`'s DTOs. */
+ *  the web bundle mirrors only what it needs via `onboarding-api.ts`'s DTOs.
+ *
+ *  ONE deliberate exception to "the server holds status/profile, nothing
+ *  else is durable" (spec 25 §9.3): the current step ID is cached in
+ *  `localStorage` under a single dedicated key, purely so a closed tab
+ *  resumes at the same STEP, not just the same profile (acceptance
+ *  criterion 5). This is pure client-side UI position — it never gates the
+ *  funnel and a stale/missing value degrades safely through `resumeAt`'s
+ *  existing fallback — so it does not need the tamper-resistance a
+ *  server-owned fact would. Profile and completion status are still never
+ *  read from or written to `localStorage` anywhere in this file. */
 
-import { createContext, useCallback, useContext, useEffect, useMemo, useReducer, type ReactNode } from 'react'
-import { deriveSteps, reduce, type MachineState } from '../../screens/onboarding/machine'
+import { createContext, useCallback, useContext, useEffect, useMemo, useReducer, useRef, type ReactNode } from 'react'
+import { deriveSteps, reduce } from '../../screens/onboarding/machine'
 import type { ProfileId, StepContext, StepDescriptor } from '../../screens/onboarding/steps/define'
 import { useOnboardingState, useSetOnboardingState } from '../onboarding-queries'
+
+const STEP_ID_STORAGE_KEY = 'tllm.onboarding.currentStepId'
 
 const INITIAL_CTX: StepContext = {
   profile: null,
@@ -28,8 +41,6 @@ const INITIAL_CTX: StepContext = {
   isT0: false,
   recommendationKind: null,
 }
-
-const INITIAL_STATE: MachineState = { currentId: null, ctx: INITIAL_CTX }
 
 export interface UseOnboardingMachineResult {
   ctx: StepContext
@@ -52,28 +63,58 @@ export interface UseOnboardingMachineResult {
   completeOnboarding: () => void
 }
 
+function readSavedStepId(): string | null {
+  try {
+    return localStorage.getItem(STEP_ID_STORAGE_KEY)
+  } catch {
+    return null
+  }
+}
+
 function useOnboardingMachineState(): UseOnboardingMachineResult {
-  const [state, dispatch] = useReducer(reduce, INITIAL_STATE)
+  const [state, dispatch] = useReducer(
+    reduce,
+    undefined,
+    () => ({ currentId: readSavedStepId(), ctx: INITIAL_CTX }),
+  )
   const onboardingQuery = useOnboardingState()
   const setOnboarding = useSetOnboardingState()
 
-  // Land on the first applicable step once, on mount. Reuses `reduce`'s own
-  // 'ctx' case (which calls the tested `resumeAt`) rather than duplicating it.
+  // No saved position at all (a genuinely fresh visit) — land on the first
+  // applicable step immediately rather than waiting on the server query.
   useEffect(() => {
-    dispatch({ type: 'ctx', patch: {} })
+    if (state.currentId === null) dispatch({ type: 'ctx', patch: {} })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Hydrate the previously-chosen profile from server truth exactly once,
-  // when it first arrives — a later server refetch must not clobber a
-  // profile the user is actively changing in this session.
-  const serverProfile = onboardingQuery.data?.profile ?? null
+  // Re-validate against real server truth exactly once, when the query
+  // settles — fires even when `profile` is null. That "even when null" is
+  // required, not incidental: a saved step that NEEDS a profile
+  // (`profile-extra`) and turns out to have none would otherwise never be
+  // re-checked, leaving `currentStep` permanently unresolvable — a blank
+  // screen — instead of `resumeAt`'s existing fallback correctly bumping it
+  // back to the first applicable step. Firing on every settle, not just
+  // truthy profiles, is what closes that gap.
+  const hydratedRef = useRef(false)
   useEffect(() => {
-    if (serverProfile && state.ctx.profile === null) {
-      dispatch({ type: 'ctx', patch: { profile: serverProfile } })
-    }
+    if (!onboardingQuery.isSuccess || hydratedRef.current) return
+    hydratedRef.current = true
+    dispatch({ type: 'ctx', patch: { profile: onboardingQuery.data.profile } })
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [serverProfile])
+  }, [onboardingQuery.isSuccess])
+
+  // Persist step POSITION only (never status/profile — those stay
+  // server-owned via setOnboarding above) so a closed tab reopens on the
+  // same step, not just with the same profile (spec 25 acceptance
+  // criterion 5).
+  useEffect(() => {
+    try {
+      if (state.currentId) localStorage.setItem(STEP_ID_STORAGE_KEY, state.currentId)
+      else localStorage.removeItem(STEP_ID_STORAGE_KEY)
+    } catch {
+      // best-effort — a UI-position cache is not worth failing over
+    }
+  }, [state.currentId])
 
   const steps = useMemo(() => deriveSteps(state.ctx), [state.ctx])
   const currentStepIndex = useMemo(
@@ -87,9 +128,14 @@ function useOnboardingMachineState(): UseOnboardingMachineResult {
   const goToStep = useCallback((id: string) => dispatch({ type: 'goto', id }), [])
   const patchCtx = useCallback((patch: Partial<StepContext>) => dispatch({ type: 'ctx', patch }), [])
 
+  const clearSavedStepId = () => {
+    try { localStorage.removeItem(STEP_ID_STORAGE_KEY) } catch { /* best-effort */ }
+  }
+
   const skip = useCallback(() => {
     dispatch({ type: 'skip' })
     setOnboarding.mutate({ status: 'skipped' })
+    clearSavedStepId()
   }, [setOnboarding])
 
   const setProfile = useCallback(
@@ -102,6 +148,7 @@ function useOnboardingMachineState(): UseOnboardingMachineResult {
 
   const completeOnboarding = useCallback(() => {
     setOnboarding.mutate({ status: 'completed' })
+    clearSavedStepId()
   }, [setOnboarding])
 
   return {
