@@ -446,6 +446,7 @@ export interface Config {
     profile?: string | null
     completedAt?: number | null
     schemaVersion?: number
+    everLoadedModel?: boolean
   }
 }
 

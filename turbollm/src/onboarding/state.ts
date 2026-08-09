@@ -15,6 +15,13 @@ export interface OnboardingState {
   profile: ProfileId | null
   completedAt: number | null
   schemaVersion: number
+  /** Server-authoritative, set ONLY from a real successful model load
+   *  (`cli.ts`'s `manager.onLoadSettled`, ok=true) — never client-settable via
+   *  the PUT route (see `applyOnboardingPatch`, which ignores this field on
+   *  any incoming patch). Drives the App.tsx entry predicate (spec 25 §3): an
+   *  install that has ever loaded a model successfully never sees the wizard
+   *  again, even if `status` is still `pending`. */
+  everLoadedModel: boolean
 }
 
 function asRecord(v: unknown): Record<string, unknown> {
@@ -33,5 +40,6 @@ export function normalizeOnboarding(raw: unknown): OnboardingState {
     : null
   const completedAt = typeof r.completedAt === 'number' ? r.completedAt : null
   const schemaVersion = typeof r.schemaVersion === 'number' ? r.schemaVersion : ONBOARDING_SCHEMA_VERSION
-  return { status, profile, completedAt, schemaVersion }
+  const everLoadedModel = r.everLoadedModel === true
+  return { status, profile, completedAt, schemaVersion, everLoadedModel }
 }
