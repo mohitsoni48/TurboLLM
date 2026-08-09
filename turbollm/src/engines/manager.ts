@@ -201,6 +201,17 @@ export class Manager {
         if (hooks?.beforeStart) await hooks.beforeStart()
         await this.startInternal(opts)
         await this.awaitNotStarting()
+        // GitHub report (Qwen3.6-35B-A3B): the multimodal projector can fail to load even with
+        // the model's own correct, official mmproj — see mmprojFallbackOpts's doc comment. Retry
+        // ONCE, text-only, instead of leaving a model that could otherwise run fine unloaded.
+        if (this.state === 'error' && this.errInfo) {
+          const fallback = mmprojFallbackOpts(opts, this.errInfo)
+          if (fallback) {
+            const note = mmprojFallbackNote(this.errInfo)
+            await this.startInternal(fallback, note)
+            await this.awaitNotStarting()
+          }
+        }
         // Both routes.ts call sites fire load() without awaiting, so the outcome
         // is not observable to the caller. Reporting it here — the single atomic
         // swap entry point — is what makes any future call site instrumented for
@@ -253,7 +264,7 @@ export class Manager {
     while (this.state === 'starting' && Date.now() < deadline) await sleep(200)
   }
 
-  private async startInternal(opts: StartOpts): Promise<void> {
+  private async startInternal(opts: StartOpts, retryNote?: string): Promise<void> {
     if (this.state === 'starting' || this.state === 'running' || this.state === 'stopping') {
       throw new BusyError()
     }
@@ -293,6 +304,7 @@ export class Manager {
       `[turbollm] starting engine "${opts.engine.name}" on internal port ${port} ` +
         `(127.0.0.1 only — the engine's own port, NOT the TurboLLM app/UI port).\n`,
     )
+    if (retryNote) logStream.write(retryNote)
 
     // KV prompt-cache persistence (F-014): when ComfyUI coordination + the opt-in are on
     // and this is a llama.cpp engine whose caps allow the flag, point llama-server at the
@@ -1037,6 +1049,53 @@ function killPidTree(pid: number): void {
   } else {
     try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
   }
+}
+
+/** Strips `--mmproj <path>` and `--no-mmproj-offload` — the two flags profileToArgs adds
+ *  when (and only when) `p.useMmproj` is true — without touching anything else. Used to
+ *  retry a load as if useMmproj were false, without persisting that to the saved profile
+ *  (useMmproj is intentionally self-healing to the model's own vision capability — see
+ *  profile.ts's resolve() comment — so a permanent false would just get overwritten). */
+export function stripMmprojArgs(args: string[]): string[] {
+  const out: string[] = []
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--mmproj') { i++; continue } // also skip its path value
+    if (args[i] === '--no-mmproj-offload') continue
+    out.push(args[i])
+  }
+  return out
+}
+
+/** GitHub report (2026-08): Qwen3.6-35B-A3B fails to load with its own correct, official
+ *  mmproj — llama.cpp error `mismatch between text model (n_embd = 2048) and mmproj
+ *  (n_embd = 5120)`, hinting "wrong mmproj". It isn't: this is a confirmed, still-open
+ *  upstream bug (ggml-org/llama.cpp#20899, auto-closed stale rather than fixed) in the
+ *  `qwen35moe`/`qwen3moe` + `qwen3vl_merger` compatibility check specifically — other
+ *  reporters hit the identical crash with the identical model. TurboLLM can't validate
+ *  mmproj/model compatibility itself without reimplementing (and inheriting the bugs of)
+ *  llama.cpp's own internal check, so instead of leaving an otherwise-loadable model
+ *  unloaded, retry the FIRST load attempt once without --mmproj when it dies with a
+ *  multimodal-load failure. Self-limiting: `fallback`'s own extraArgs carry no --mmproj,
+ *  so a second failure (of any kind) just surfaces normally — no further retry, no loop. */
+export function mmprojFallbackOpts(opts: StartOpts, err: ErrInfo): StartOpts | null {
+  if (!opts.extraArgs.includes('--mmproj')) return null
+  if (!/failed to load multimodal model/i.test(err.logTail.join('\n'))) return null
+  return { ...opts, extraArgs: stripMmprojArgs(opts.extraArgs) }
+}
+
+/** The log note written at the top of the fallback attempt's (freshly truncated) log —
+ *  carries the original crash's key lines forward so the user isn't left staring at a
+ *  clean-looking retry log with no explanation for why vision silently isn't available. */
+export function mmprojFallbackNote(err: ErrInfo): string {
+  const relevant = err.logTail.filter((l) => /mismatch between text model|failed to load multimodal model|mtmd_init_from_file/i.test(l))
+  const summary = (relevant.length ? relevant : err.logTail.slice(-3)).join('\n')
+  return (
+    `[turbollm] the multimodal projector failed to load on the first attempt:\n${summary}\n` +
+    `[turbollm] retrying once without --mmproj (text-only). This can happen even with the ` +
+    `model's own correct, official mmproj file on some architectures due to open llama.cpp ` +
+    `bugs (e.g. github.com/ggml-org/llama.cpp/issues/20899 for Qwen3.6-35B-A3B) — not ` +
+    `necessarily a wrong or corrupt file on your end. Vision won't be available this session.\n\n`
+  )
 }
 
 function readTail(path: string, n: number): string[] {
