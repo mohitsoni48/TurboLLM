@@ -17,6 +17,15 @@ describe('deriveSteps', () => {
     expect(deriveSteps(ctx({ profile: 'casual' })).map((s) => s.id)).not.toContain('profile-extra')
   })
 
+  it('enthusiast never gets profile-extra either — their only extra content is tune-offer', () => {
+    expect(deriveSteps(ctx({ profile: 'enthusiast' })).map((s) => s.id)).not.toContain('profile-extra')
+  })
+
+  it('developer and pro DO get profile-extra while a download is in flight', () => {
+    expect(deriveSteps(ctx({ profile: 'developer' })).map((s) => s.id)).toContain('profile-extra')
+    expect(deriveSteps(ctx({ profile: 'pro' })).map((s) => s.id)).toContain('profile-extra')
+  })
+
   it('suppresses the auto-tune offer on T0 for EVERY profile, including pro', () => {
     for (const profile of ['casual', 'developer', 'enthusiast', 'pro'] as const) {
       const ids = deriveSteps(ctx({ profile, isT0: true })).map((s) => s.id)

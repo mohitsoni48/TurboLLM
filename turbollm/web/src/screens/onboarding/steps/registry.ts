@@ -29,11 +29,14 @@ export const REGISTRY: readonly StepDescriptor[] = [
     appliesTo: (c) => !c.downloadDone,
   }),
   defineStep({
-    // Casual has no profile-specific step. Pro's engine picker also only
-    // makes sense while something is downloading.
+    // Only Developer (tool permissions + endpoint) and Pro (engine picker)
+    // have anything to configure here. Casual has no profile-specific step.
+    // Enthusiast's only profile-specific content is the auto-tune intro,
+    // which is the separate `tune-offer` step later in the sequence — this
+    // step must NOT apply to Enthusiast, or there is nothing to render.
     id: 'profile-extra',
     title: 'Set up your workflow',
-    appliesTo: (c) => !c.downloadDone && c.profile !== null && c.profile !== 'casual',
+    appliesTo: (c) => !c.downloadDone && (c.profile === 'developer' || c.profile === 'pro'),
   }),
   defineStep({
     id: 'load',
