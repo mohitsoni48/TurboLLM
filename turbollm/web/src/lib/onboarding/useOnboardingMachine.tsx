@@ -40,6 +40,9 @@ const INITIAL_CTX: StepContext = {
   downloadDone: false,
   isT0: false,
   recommendationKind: null,
+  expectedModelKey: null,
+  payoffDestination: null,
+  loadCompletedOnce: false,
 }
 
 export interface UseOnboardingMachineResult {
@@ -50,7 +53,11 @@ export interface UseOnboardingMachineResult {
   totalSteps: number
   advance: () => void
   goBack: () => void
-  skip: () => void
+  /** Resolves only once the server has actually recorded status='skipped' —
+   *  await this before navigating anywhere afterward, or App.tsx's
+   *  OnboardingGate can read the still-stale cached status and bounce the
+   *  new route straight back to /onboarding. */
+  skip: () => Promise<void>
   goToStep: (id: string) => void
   /** Feeds a real signal (download finished, hardware tier known, …) back into
    *  the sequencing context. The only way steps become applicable/inapplicable
@@ -60,7 +67,9 @@ export interface UseOnboardingMachineResult {
    *  `deriveSteps` re-derives immediately) and the server (Task 7's PUT), so a
    *  closed tab resumes with the same profile. */
   setProfile: (profile: ProfileId) => void
-  completeOnboarding: () => void
+  /** Resolves only once the server has actually recorded status='completed' —
+   *  same reason as `skip`'s note above. Always await before navigating. */
+  completeOnboarding: () => Promise<void>
 }
 
 function readSavedStepId(): string | null {
@@ -132,9 +141,21 @@ function useOnboardingMachineState(): UseOnboardingMachineResult {
     try { localStorage.removeItem(STEP_ID_STORAGE_KEY) } catch { /* best-effort */ }
   }
 
-  const skip = useCallback(() => {
+  // Both skip() and completeOnboarding() are awaited by their callers before
+  // navigating anywhere. Found by a real click-through, not by any test:
+  // `.mutate()` is fire-and-forget, so a caller that fires the mutation and
+  // immediately calls navigate() races the query cache update. App.tsx's
+  // OnboardingGate reads the STALE cached status ('pending') at that instant,
+  // bounces the new route straight back to /onboarding, and by the time the
+  // mutation actually resolves the user is looking at OnboardingScreen's own
+  // "already done" effect, which hardcodes its destination to
+  // /workspace/chat — silently overriding wherever the user actually meant
+  // to go (a Developer's Code session, in the reported case). `.mutateAsync`
+  // resolves only after `onSuccess` has already updated the cache, so
+  // awaiting it before navigating closes the race.
+  const skip = useCallback(async () => {
     dispatch({ type: 'skip' })
-    setOnboarding.mutate({ status: 'skipped' })
+    await setOnboarding.mutateAsync({ status: 'skipped' })
     clearSavedStepId()
   }, [setOnboarding])
 
@@ -146,8 +167,8 @@ function useOnboardingMachineState(): UseOnboardingMachineResult {
     [patchCtx, setOnboarding],
   )
 
-  const completeOnboarding = useCallback(() => {
-    setOnboarding.mutate({ status: 'completed' })
+  const completeOnboarding = useCallback(async () => {
+    await setOnboarding.mutateAsync({ status: 'completed' })
     clearSavedStepId()
   }, [setOnboarding])
 

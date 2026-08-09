@@ -21,6 +21,28 @@ export interface StepContext {
   /** CPU-only or <4 GB VRAM. Suppresses auto-tune for ALL profiles (§6.2). */
   isT0: boolean
   recommendationKind: 'entry' | 'discover' | 'hf-search' | null
+  /** The model key LoadStep should treat as "the one this run is waiting
+   *  for". Set directly by a step that already knows the exact key with no
+   *  download to match against (ModelStep's "use a model I already have"
+   *  path). Null when LoadStep should fall back to matching a finished
+   *  download instead. Added after an adversarial QA pass found LoadStep
+   *  advancing the instant ANY model was already loaded in the engine — a
+   *  leftover from prior use, unrelated to what this run actually requested. */
+  expectedModelKey: string | null
+  /** True once LoadStep has auto-advanced past load for this session — never
+   *  reset. Without this, pressing Back from Payoff (a normal interaction,
+   *  not an edge case, now that Payoff no longer exits the wizard
+   *  immediately) landed on Load, which re-ran its own "the expected model
+   *  is already loaded" check and instantly auto-advanced forward again —
+   *  Back appeared to silently do nothing. Found by adversarial QA. */
+  loadCompletedOnce: boolean
+  /** Where Payoff's real conversation/Code session landed. Done is the step
+   *  that actually completes onboarding and performs the final navigation —
+   *  it needs to know the destination Payoff already created. Added after
+   *  the same QA pass found Payoff completing onboarding and navigating
+   *  directly, which raced OnboardingScreen's own "already done" redirect
+   *  and skipped tune-offer/done entirely, for every profile. */
+  payoffDestination: { kind: 'chat' | 'code'; id: string } | null
 }
 
 export interface StepDescriptor {

@@ -16,7 +16,7 @@ describe('step registry', () => {
   })
 
   it('welcome and payoff apply to every profile', () => {
-    const ctx = { profile: 'casual' as const, downloadDone: false, isT0: false, recommendationKind: 'entry' as const }
+    const ctx = { profile: 'casual' as const, downloadDone: false, isT0: false, recommendationKind: 'entry' as const, expectedModelKey: null, payoffDestination: null, loadCompletedOnce: false }
     expect(REGISTRY.find((s) => s.id === 'welcome')!.appliesTo(ctx)).toBe(true)
     expect(REGISTRY.find((s) => s.id === 'payoff')!.appliesTo(ctx)).toBe(true)
   })

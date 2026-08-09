@@ -67,7 +67,7 @@ export default function TuneOfferStep({ onContinue, onSkip }: StepComponentProps
           Continue
         </button>
         <button type="button" onClick={onSkip} className="text-sm text-faint hover:text-muted transition-colors">
-          Skip this
+          Skip onboarding
         </button>
       </div>
     </div>

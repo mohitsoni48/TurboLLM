@@ -1,8 +1,10 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Compass, Download, ExternalLink, HardDrive, Loader2, Sparkles } from 'lucide-react'
+import { Check, Compass, Download, ExternalLink, HardDrive, Loader2, Sparkles } from 'lucide-react'
 import { useOnboardingRecommendation } from '../../../lib/onboarding-queries'
-import { enqueueDownload } from '../../../lib/api'
+import { useModels } from '../../../lib/queries'
+import { enqueueDownload, loadModel } from '../../../lib/api'
+import { useOnboardingMachine } from '../../../lib/onboarding/useOnboardingMachine'
 import type { StepComponentProps } from '../OnboardingScreen'
 
 const GB = 1024 ** 3
@@ -14,9 +16,36 @@ const GB = 1024 ** 3
  *  already have" / browse Discover themselves. */
 export default function ModelStep({ onContinue, ctx }: StepComponentProps) {
   const navigate = useNavigate()
+  const { patchCtx } = useOnboardingMachine()
   const recommendationQuery = useOnboardingRecommendation(ctx.profile)
+  const modelsQuery = useModels()
   const [starting, setStarting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [selectedKey, setSelectedKey] = useState('')
+  const [usingExisting, setUsingExisting] = useState(false)
+
+  const existingModels = modelsQuery.data?.models ?? []
+
+  const useExisting = async () => {
+    const entry = existingModels.find((m) => m.key === selectedKey)
+    if (!entry) return
+    setUsingExisting(true)
+    setError(null)
+    try {
+      // No download to wait for — mark it done immediately so the
+      // download-shadow steps (personalize/profile-extra) drop out, then
+      // trigger the real load right here. LoadStep's own "watch Status.model"
+      // effect advances once it lands. `expectedModelKey` is required, not
+      // optional: without it, LoadStep advanced the instant ANY model was
+      // already loaded (a leftover from prior use), found by adversarial QA.
+      patchCtx({ downloadDone: true, expectedModelKey: entry.key })
+      await loadModel(entry.key)
+      onContinue()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Could not load that model.')
+      setUsingExisting(false)
+    }
+  }
 
   if (ctx.profile === 'pro') {
     return (
@@ -118,22 +147,38 @@ export default function ModelStep({ onContinue, ctx }: StepComponentProps) {
         </div>
       )}
 
-      <button
-        type="button"
-        onClick={() => {
-          onContinue()
-          navigate('/models?tab=library')
-        }}
-        className="w-full flex items-center gap-3 p-3 rounded-lg border border-border bg-panel hover:border-accent/30 hover:bg-panel-2 transition-colors text-left"
-      >
-        <div className="flex-shrink-0 p-2 rounded bg-accent/5">
-          <HardDrive size={14} className="text-accent" />
+      {existingModels.length > 0 && (
+        <div className="bg-panel-2 border border-border rounded-xl p-5 space-y-3">
+          <div className="flex items-center gap-2">
+            <HardDrive size={16} className="text-muted" />
+            <h4 className="text-sm font-semibold text-ink">Use a model I already have</h4>
+          </div>
+          <select
+            value={selectedKey}
+            onChange={(e) => setSelectedKey(e.target.value)}
+            className="w-full rounded-lg border border-border bg-panel px-3 py-2 text-sm text-ink outline-none focus:border-accent transition-colors"
+          >
+            <option value="" disabled>
+              Choose a model…
+            </option>
+            {existingModels.map((m) => (
+              <option key={m.key} value={m.key}>
+                {m.name} · {m.quant} · {m.sizeLabel}
+              </option>
+            ))}
+          </select>
+          {error && <p className="text-xs text-red-400">{error}</p>}
+          <button
+            type="button"
+            onClick={useExisting}
+            disabled={!selectedKey || usingExisting}
+            className="w-full inline-flex items-center justify-center gap-2 rounded-lg border border-border bg-panel py-2.5 px-4 text-sm font-medium text-ink hover:border-accent/50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+          >
+            {usingExisting ? <Loader2 size={14} className="animate-spin" /> : <Check size={14} />}
+            {usingExisting ? 'Loading…' : 'Use this model'}
+          </button>
         </div>
-        <div>
-          <span className="text-sm text-ink">Use models I already have</span>
-          <p className="text-xs text-muted mt-0.5">Reuse what's already on this machine.</p>
-        </div>
-      </button>
+      )}
 
       <button
         type="button"

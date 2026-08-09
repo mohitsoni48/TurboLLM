@@ -18,7 +18,7 @@ import type { StepComponentProps } from '../OnboardingScreen'
  *  `recovery.ts` already models. Wiring that needs a small server-side
  *  addition (surfacing `classifyLoadFailure`'s result on `Status`), tracked as
  *  follow-up rather than invented here. */
-export default function LoadStep({ onSkip, ctx }: StepComponentProps) {
+export default function LoadStep({ onContinue, onSkip, ctx }: StepComponentProps) {
   const navigate = useNavigate()
   const { advance, patchCtx } = useOnboardingMachine()
   const downloadsQuery = useDownloads()
@@ -49,13 +49,51 @@ export default function LoadStep({ onSkip, ctx }: StepComponentProps) {
     loadModel(matchedEntry.key).catch(() => setLoadFailed(true))
   }, [matchedEntry, loadTriggered])
 
+  // The specific key this run is actually waiting for — from ctx directly
+  // when a step already knows it (ModelStep's "use existing model" path, no
+  // download to match against), else from the download match above. Found by
+  // an adversarial QA pass: without requiring a match, this effect advanced
+  // the instant ANY model was already loaded in the engine — a leftover from
+  // prior use, unrelated to what this run actually requested — while a
+  // genuinely-requested download was still only ~6% complete in the
+  // background.
+  const expectedKey = ctx.expectedModelKey ?? matchedEntry?.key ?? null
   const loadedModel = statusQuery.data?.model
+
+  // Second bug the re-verification pass found: a reload resets `ctx` to
+  // INITIAL_CTX (only `currentStepId` survives, by this file's own deliberate
+  // design — see useOnboardingMachine.tsx's header comment), but restores
+  // `currentStepId` to 'load' from localStorage regardless. That combination
+  // — landing on Load with `expectedModelKey` wiped and no download to match
+  // either — can ONLY happen post-reload; during a normal in-session flow
+  // ModelStep always sets one or the other before ever navigating here. When
+  // it happens, `expectedKey` above is permanently null, so `isLoaded` could
+  // never become true even though the daemon confirmed the model loaded
+  // successfully and stayed running — the user was stuck on this screen
+  // forever with only "Skip onboarding" (full exit) or Back available.
+  // Trusting `Status.model` in exactly this no-trail-left case is an honest,
+  // narrower version of the "any model counts" behaviour bug #3 removed:
+  // it only engages when there is nothing left to compare against, never
+  // when a real expectation or download is actually in flight.
+  const resumedWithNoTrail = !ctx.expectedModelKey && !activeDownload && !finishedDownload
+  const isLoaded = Boolean(
+    loadedModel && ((expectedKey && loadedModel.key === expectedKey) || resumedWithNoTrail),
+  )
+
+  // Auto-advance only the FIRST time this session reaches a genuinely loaded
+  // model — gated on ctx.loadCompletedOnce, which lives in the shared machine
+  // context and survives this component remounting. Without it, pressing
+  // "← Back" from Payoff (a normal interaction now that Payoff no longer
+  // exits the wizard immediately) landed here, re-ran this exact check,
+  // found the same model still loaded, and instantly bounced forward again —
+  // Back appeared to do nothing. Found by adversarial QA.
   useEffect(() => {
-    if (loadedModel && !advancedRef.current) {
+    if (isLoaded && !advancedRef.current && !ctx.loadCompletedOnce) {
       advancedRef.current = true
+      patchCtx({ loadCompletedOnce: true })
       advance()
     }
-  }, [loadedModel, advance])
+  }, [isLoaded, ctx.loadCompletedOnce, advance, patchCtx])
 
   if (loadFailed) {
     return (
@@ -127,9 +165,24 @@ export default function LoadStep({ onSkip, ctx }: StepComponentProps) {
         </div>
       </div>
 
-      <div className="flex items-center justify-end pt-2">
+      <div className="flex items-center justify-between pt-2">
+        {isLoaded ? (
+          // Only reachable via Back after loadCompletedOnce is already true
+          // (the effect above already advanced past this once) — a manual
+          // way forward so the user is never stranded on a step that no
+          // longer auto-advances.
+          <button
+            type="button"
+            onClick={onContinue}
+            className="rounded-lg border border-accent bg-accent/10 text-accent px-4 py-2 text-sm font-medium hover:bg-accent/20 transition-colors"
+          >
+            Continue
+          </button>
+        ) : (
+          <span />
+        )}
         <button type="button" onClick={onSkip} className="text-sm text-faint hover:text-muted transition-colors">
-          Skip this
+          Skip onboarding
         </button>
       </div>
     </div>

@@ -1,5 +1,6 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useMemo, useState, type CSSProperties, type ReactNode } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import {
   AlertTriangle,
   Boxes,
@@ -109,7 +110,17 @@ export function ModelsScreen() {
       ? status?.model?.key
       : undefined
 
-  const [tab, setTab] = useState<Tab>('library')
+  // Reads the `tab` query param on mount so links like `/models?tab=discover`
+  // (onboarding's Pro Discover handoff and its "pick a different model"
+  // escape hatches) actually land on Discover, not the default Library.
+  // Found by adversarial QA: the URL correctly changed to
+  // `?tab=discover`, but `useState<Tab>('library')` never read it, so
+  // Library stayed the rendered tab regardless. One-time read on mount, not
+  // a synced-forever URL state — matches this component's existing pattern
+  // of `onDiscover` calling `setTab('discover')` as a plain internal
+  // transition, not a URL-driven one.
+  const [searchParams] = useSearchParams()
+  const [tab, setTab] = useState<Tab>(searchParams.get('tab') === 'discover' ? 'discover' : 'library')
   const [filter, setFilter] = useState<Filter>('all')
   const [search, setSearch] = useState('')
   const [showIncompatible, setShowIncompatible] = useState(false)

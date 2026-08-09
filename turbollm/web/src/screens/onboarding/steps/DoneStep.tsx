@@ -1,13 +1,25 @@
 import { DoorOpen, ExternalLink, Rocket, Sparkles } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
+import { useOnboardingMachine } from '../../../lib/onboarding/useOnboardingMachine'
 import type { OnboardingCtx } from '../../../lib/onboarding/types'
 
 /** Step 7 — Done (spec 25 §4). "You're set up" plus profile-appropriate next
  *  links. No share-link feature: there is no app-level share URL in a
  *  single-user local product (the per-conversation LAN share link is a
- *  different, existing feature and out of scope here). */
+ *  different, existing feature and out of scope here).
+ *
+ *  This is now the ONLY step that calls `completeOnboarding()` and performs
+ *  the final navigation — PayoffStep just advances into the sequence (see
+ *  its own header comment for why). An adversarial QA pass found the
+ *  previous version's buttons never called `completeOnboarding()` at all:
+ *  `onboarding.status` stayed 'pending' forever even after the user believed
+ *  they'd finished, and "Launch TurboLLM →" was wired to `onContinue`
+ *  (`advance()`), which no-ops on the last step — the button visibly did
+ *  nothing. Every action below now finishes onboarding for real before
+ *  navigating, using the REAL destination Payoff already created
+ *  (`ctx.payoffDestination`) rather than a generic route with no id. */
 export default function DoneStep({
-  onContinue,
+  onContinue: _onContinue,
   ctx,
 }: {
   onContinue: () => void
@@ -15,6 +27,18 @@ export default function DoneStep({
   ctx: OnboardingCtx
 }) {
   const navigate = useNavigate()
+  const { completeOnboarding } = useOnboardingMachine()
+
+  const openDestination = async () => {
+    await completeOnboarding()
+    const dest = ctx.payoffDestination
+    navigate(dest ? `/workspace/${dest.kind}/${dest.id}` : '/workspace/chat')
+  }
+
+  const openModels = async () => {
+    await completeOnboarding()
+    navigate('/models')
+  }
 
   const actions = [
     {
@@ -24,19 +48,13 @@ export default function DoneStep({
         ctx.profile === 'developer'
           ? 'Start your first Code session right now'
           : 'Start using your model right now',
-      onClick: () => {
-        onContinue()
-        navigate(ctx.profile === 'developer' ? '/workspace/code' : '/workspace/chat')
-      },
+      onClick: openDestination,
     },
     {
       icon: Rocket,
       text: 'Explore models',
       desc: 'Browse and download more models any time',
-      onClick: () => {
-        onContinue()
-        navigate('/models')
-      },
+      onClick: openModels,
     },
     {
       icon: ExternalLink,
@@ -82,7 +100,7 @@ export default function DoneStep({
         <span className="text-xs text-faint">You can change your profile any time in Settings</span>
         <button
           type="button"
-          onClick={onContinue}
+          onClick={openDestination}
           className="rounded-lg border border-border bg-panel px-4 py-2 text-sm text-muted hover:border-accent/50 hover:text-ink transition-colors"
         >
           Launch TurboLLM →

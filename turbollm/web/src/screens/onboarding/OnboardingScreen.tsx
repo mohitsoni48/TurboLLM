@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { OnboardingMachineProvider, useOnboardingMachine } from '../../lib/onboarding/useOnboardingMachine'
 import { useOnboardingRecommendation, useOnboardingState } from '../../lib/onboarding-queries'
@@ -70,12 +70,29 @@ function OnboardingScreenInner() {
 
   // Defense in depth beyond App.tsx's entry predicate: a direct deep-link to
   // /onboarding after the wizard is already done must not re-show it.
+  //
+  // Fires ONLY on the query's first settle, not reactively on every status
+  // change — an adversarial QA pass found that reacting to every change made
+  // this race PayoffStep's own navigate(). Both are triggered by the exact
+  // same event (Payoff's completeOnboarding() mutation resolving), so there
+  // is no reliable ordering between "this effect redirects to a hardcoded
+  // /workspace/chat" and "PayoffStep navigates to the real destination it
+  // just created" — awaiting the mutation before navigating (tried first)
+  // does not fix it, because this effect can still fire on the same cache
+  // update. Scoping it to the INITIAL settle only removes the conflict: it
+  // still catches a genuine deep-link to an already-finished install, but
+  // no longer fires mid-session while the wizard's own steps are driving
+  // navigation themselves.
+  const initialCompletionCheckDone = useRef(false)
   useEffect(() => {
-    const status = onboardingQuery.data?.status
+    if (initialCompletionCheckDone.current) return
+    if (!onboardingQuery.isSuccess) return
+    initialCompletionCheckDone.current = true
+    const status = onboardingQuery.data.status
     if (status === 'completed' || status === 'skipped') {
       navigate('/workspace/chat', { replace: true })
     }
-  }, [onboardingQuery.data?.status, navigate])
+  }, [onboardingQuery.isSuccess, onboardingQuery.data, navigate])
 
   // Feed the real hardware tier back into the sequencing context once known —
   // this is what makes the T0 auto-tune suppression (spec 25 §6.2) and the
@@ -95,7 +112,15 @@ function OnboardingScreenInner() {
   const StepComponent = STEP_COMPONENTS[currentStep.id]
 
   return (
-    <div className="min-h-screen flex flex-col items-center justify-center bg-panel-1">
+    // h-screen + overflow-y-auto, not min-h-screen: the app shell locks
+    // body/html overflow globally (every other screen manages its own
+    // internal scroll region), so a taller-than-viewport min-h-screen div
+    // here has nowhere to scroll — confirmed by an adversarial QA pass: with
+    // 24 real models populating the "use existing model" list, the page grew
+    // to 954px against a 720px viewport with no way to reach the bottom
+    // "I don't need onboarding" link. This div now creates its own bounded,
+    // scrollable region regardless of the shell's lock.
+    <div className="h-screen overflow-y-auto flex flex-col items-center justify-center bg-panel-1">
       <div className="fixed top-0 left-0 w-full bg-panel border-b border-border z-20">
         <div className="h-8 px-6 flex items-center gap-4">
           <div className="flex-1 h-1.5 rounded-full bg-muted overflow-hidden">
@@ -126,7 +151,7 @@ function OnboardingScreenInner() {
               onClick={skip}
               className="text-[13px] text-faint hover:text-ink transition-colors"
             >
-              Skip this step
+              Skip onboarding
             </button>
           </div>
 

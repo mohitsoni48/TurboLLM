@@ -4,7 +4,7 @@ import { STEP_IDS } from './steps/registry'
 import type { StepContext } from './steps/define'
 
 const ctx = (p: Partial<StepContext> = {}): StepContext =>
-  ({ profile: 'casual', downloadDone: false, isT0: false, recommendationKind: 'entry', ...p })
+  ({ profile: 'casual', downloadDone: false, isT0: false, recommendationKind: 'entry', expectedModelKey: null, payoffDestination: null, loadCompletedOnce: false, ...p })
 
 describe('deriveSteps', () => {
   it('drops the download-shadow steps once the model is present', () => {
