@@ -1,8 +1,9 @@
-import { lazy, Suspense, useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { lazy, Suspense, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react'
 import {
   Navigate,
   Route,
   Routes,
+  useLocation,
 } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
 import { TooltipProvider } from './components/ui/tooltip'
@@ -10,6 +11,7 @@ import { Shell } from './components/Shell'
 import { UnreachableOverlay } from './components/UnreachableOverlay'
 import { AuthGate } from './components/AuthGate'
 import { useStatus, useSettings } from './lib/queries'
+import { useOnboardingState } from './lib/onboarding-queries'
 import { ApiError, setAuthToken } from './lib/api'
 import { subscribeCodeAuthNeeded, isCodeAuthNeeded } from './lib/auth-signal'
 import { useRoutineNotificationPoller } from './lib/notify-routine'
@@ -29,6 +31,7 @@ const EnginesScreen = lazy(() => import('./screens/EnginesScreen').then((m) => (
 const DeveloperScreen = lazy(() => import('./screens/DeveloperScreen').then((m) => ({ default: m.DeveloperScreen })))
 const CustomizeScreen = lazy(() => import('./screens/CustomizeScreen').then((m) => ({ default: m.CustomizeScreen })))
 const SettingsScreen = lazy(() => import('./screens/SettingsScreen').then((m) => ({ default: m.SettingsScreen })))
+const OnboardingScreen = lazy(() => import('./screens/onboarding/OnboardingScreen').then((m) => ({ default: m.OnboardingScreen })))
 
 /** Minimal centered loader shown while a route chunk is fetching. */
 function ScreenFallback() {
@@ -43,10 +46,31 @@ function ScreenFallback() {
   )
 }
 
+/** Onboarding entry predicate (spec 25 §3): redirects EVERY route to
+ *  `/onboarding` while it is unfinished AND the install has never once loaded
+ *  a model successfully — `everLoadedModel` is server-authoritative (set only
+ *  from a real successful load in `cli.ts`, never client-settable), so this
+ *  cannot be tricked into re-showing the wizard by a stale local flag.
+ *  While the query hasn't resolved yet, default to NOT redirecting — the same
+ *  conservative-default convention `routinesEnabled` already uses above,
+ *  so a slow first poll never flashes the wizard over a returning user's app. */
+function OnboardingGate({ shouldOnboard, children }: { shouldOnboard: boolean; children: ReactNode }) {
+  const location = useLocation()
+  if (shouldOnboard && location.pathname !== '/onboarding') {
+    return <Navigate to="/onboarding" replace />
+  }
+  return <>{children}</>
+}
+
 
 export function App() {
   const statusQ = useStatus()
   const qc = useQueryClient()
+  const onboardingQ = useOnboardingState()
+  const shouldOnboard =
+    onboardingQ.data !== undefined &&
+    onboardingQ.data.status === 'pending' &&
+    !onboardingQ.data.everLoadedModel
 
   // Routines is experimental, off by default (Settings → Experimental, config.ts's
   // `daemon.experimental.routines`). `?? false` while settings hasn't loaded yet is the
@@ -102,7 +126,9 @@ export function App() {
     <TooltipProvider delayDuration={300}>
       <Shell status={statusQ.data} online={online} version={version}>
         <Suspense fallback={<ScreenFallback />}>
+          <OnboardingGate shouldOnboard={shouldOnboard}>
           <Routes>
+            <Route path="/onboarding" element={<OnboardingScreen />} />
             <Route path="/workspace" element={<Navigate to="/workspace/chat" replace />} />
             <Route path="/workspace/chat" element={<WorkspaceScreen />} />
             <Route path="/workspace/chat/:convId" element={<WorkspaceScreen />} />
@@ -145,6 +171,7 @@ export function App() {
             <Route path="/settings" element={<SettingsScreen />} />
             <Route path="*" element={<Navigate to="/workspace/chat" replace />} />
           </Routes>
+          </OnboardingGate>
         </Suspense>
       </Shell>
       {authLatched && (
