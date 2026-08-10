@@ -204,20 +204,35 @@ export class Manager {
         // GitHub report (Qwen3.6-35B-A3B): the multimodal projector can fail to load even with
         // the model's own correct, official mmproj — see mmprojFallbackOpts's doc comment. Retry
         // ONCE, text-only, instead of leaving a model that could otherwise run fine unloaded.
+        let effectiveOpts = opts
         if (this.state === 'error' && this.errInfo) {
           const fallback = mmprojFallbackOpts(opts, this.errInfo)
           if (fallback) {
+            // readiness()'s timeout path sets state='error' and fires child.kill() WITHOUT
+            // awaiting the process's actual exit — awaitNotStarting() only waits for state to
+            // leave 'starting', which happens the instant the kill is ISSUED, not once it's
+            // landed. Racing the fallback spawn against that in-flight kill could leave two
+            // engine processes alive at once (double VRAM allocation, violating the "at most
+            // one load in flight" invariant above) and orphans the first child's pid file +
+            // log stream, since onTerminated() no-ops once `this.child` no longer matches.
+            // `this.exited` resolves exactly when the first child's onTerminated() finishes —
+            // waiting on it here (already-resolved in the common immediate-crash case, so
+            // effectively free) guarantees that cleanup has fully run before anything new spawns.
+            await this.waitForExit(this.exited)
             const note = mmprojFallbackNote(this.errInfo)
             await this.startInternal(fallback, note)
             await this.awaitNotStarting()
+            effectiveOpts = fallback
           }
         }
         // Both routes.ts call sites fire load() without awaiting, so the outcome
         // is not observable to the caller. Reporting it here — the single atomic
         // swap entry point — is what makes any future call site instrumented for
         // free. Manager stays telemetry-agnostic: it reports an outcome, and the
-        // consumer (wired in cli.ts) decides what that means.
-        this.reportLoad(this.state === 'running', this.errInfo, opts)
+        // consumer (wired in cli.ts) decides what that means. Uses effectiveOpts (the
+        // fallback's, when one ran and the retry is what actually ended up loaded/failed)
+        // so a successful text-only fallback isn't misreported as a load "with mmproj".
+        this.reportLoad(this.state === 'running', this.errInfo, effectiveOpts)
       } catch (e) {
         // routes.ts fires load() without awaiting and only console.warns the rejection —
         // without this, a failed swap left `state` wherever it last was (often still
@@ -1076,11 +1091,16 @@ export function stripMmprojArgs(args: string[]): string[] {
  *  llama.cpp's own internal check, so instead of leaving an otherwise-loadable model
  *  unloaded, retry the FIRST load attempt once without --mmproj when it dies with a
  *  multimodal-load failure. Self-limiting: `fallback`'s own extraArgs carry no --mmproj,
- *  so a second failure (of any kind) just surfaces normally — no further retry, no loop. */
+ *  so a second failure (of any kind) just surfaces normally — no further retry, no loop.
+ *  `model.vision` is forced false too — the retry genuinely has no projector attached, and
+ *  `status().model` / the reported load's `opts.model` both come straight from whatever
+ *  StartOpts actually got spawned (see `startInternal`'s `this.opts = opts`), so leaving
+ *  vision `true` here would misreport a text-only session as vision-capable everywhere
+ *  downstream that reads it (the UI's engine card, `model_load` telemetry, etc). */
 export function mmprojFallbackOpts(opts: StartOpts, err: ErrInfo): StartOpts | null {
   if (!opts.extraArgs.includes('--mmproj')) return null
   if (!/failed to load multimodal model/i.test(err.logTail.join('\n'))) return null
-  return { ...opts, extraArgs: stripMmprojArgs(opts.extraArgs) }
+  return { ...opts, extraArgs: stripMmprojArgs(opts.extraArgs), model: { ...opts.model, vision: false } }
 }
 
 /** The log note written at the top of the fallback attempt's (freshly truncated) log —

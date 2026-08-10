@@ -55,6 +55,15 @@ test('mmprojFallbackOpts returns a retry with --mmproj stripped on a multimodal 
   assert.equal(fallback.modelPath, '/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf')
 })
 
+test('mmprojFallbackOpts marks the retry model as non-vision — status()/reportLoad both read opts.model straight through', () => {
+  const fallback = mmprojFallbackOpts(opts(['-m', 'x.gguf', '--mmproj', 'mmproj.gguf']), err(MISMATCH_LOG))
+  assert.ok(fallback)
+  assert.equal(fallback.model.vision, false)
+  // Only vision changes — the rest of the model descriptor (name/quant/ctx) is untouched.
+  assert.equal(fallback.model.name, 'Qwen3.6-35B-A3B')
+  assert.equal(fallback.model.quant, 'Q4_K_M')
+})
+
 test('mmprojFallbackOpts returns null when the load had no --mmproj to begin with', () => {
   assert.equal(mmprojFallbackOpts(opts(['-m', 'x.gguf']), err(MISMATCH_LOG)), null)
 })
