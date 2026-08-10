@@ -25,6 +25,7 @@ function fakeDeps(target = 'http://engine.invalid.local:1'): Deps {
     manager: {
       status: () => ({ state: 'stopped', model: null }),
       target: () => target,
+      currentOpts: () => null,
       generationStart: () => {},
       generationEnd: () => {},
     },

@@ -501,9 +501,9 @@ function MlxRepoBody({
 }) {
   const totalBytes = detail.files.reduce((s, f) => s + f.sizeBytes, 0)
   const fit = fileFit(totalBytes, vramMb)
-  const isMlxFamily = engineKind === 'mlx' || engineKind === 'rapid-mlx'
+  const isMlxFamily = engineKind === 'mlx' || engineKind === 'rapid-mlx' || engineKind === 'mlx-vlm'
   const description = isMlxFamily
-    ? 'MLX model — runs on Apple Silicon via mlx-lm. Downloads as a directory of safetensors weights.'
+    ? 'MLX model — runs on Apple Silicon via MLX. Downloads as a directory of safetensors weights.'
     : engineKind === 'vllm'
       ? 'HuggingFace model — runs via vLLM. Downloads as a directory of safetensors weights.'
       : 'Safetensors model — downloads as a directory of weight files.'

@@ -584,6 +584,7 @@ test('approve does NOT release the parked guard on a retryable resume failure (g
     status: () => ({ state: 'running', model: { key: 'm' } }),
     sessionStats: () => ({ activeRequests: 0 }),
     target: () => 'http://engine.invalid.local:1',
+    currentOpts: () => null,
   } as unknown as Manager
   const modelRouter = { loadExplicit: async () => ({ target: 'http://x' }) } as unknown as ModelRouter
   const AGENT = { id: 'agent-1', name: 'A', description: '', systemPrompt: '', skillIds: [], tools: [] as string[] }
@@ -814,6 +815,7 @@ test('POST .../runs/:runId/approve returns a shaped 500 (not a raw crash) if res
     status: () => ({ state: 'running', model: { key: 'm' } }),
     sessionStats: () => ({ activeRequests: 0 }),
     target: () => 'http://engine.invalid.local:1',
+    currentOpts: () => null,
   } as unknown as Manager
   const modelRouter = { loadExplicit: async () => ({ target: 'http://x' }) } as unknown as ModelRouter
   const d = {
@@ -865,6 +867,7 @@ test('two concurrent approve calls on the same stalled run: only one executes, a
     status: () => ({ state: 'running', model: { key: 'm' } }),
     sessionStats: () => ({ activeRequests: 0 }),
     target: () => 'http://engine.invalid.local:1',
+    currentOpts: () => null,
   } as unknown as Manager
   const modelRouter = { loadExplicit: async () => ({ target: 'http://x' }) } as unknown as ModelRouter
   const AGENT = { id: 'agent-1', name: 'A', description: '', systemPrompt: '', skillIds: [], tools: [] as string[] }

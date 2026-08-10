@@ -464,8 +464,8 @@ switch between CUDA / ROCm / Metal / SYCL / Vulkan / CPU at any time (it downloa
 you choose, LM Studio-style).
 
 **Engine types.** **llama.cpp / GGUF**, **KoboldCpp** and **llamafile** (GGUF, every OS),
-**MLX** (macOS), and **vLLM** (Linux + NVIDIA) are all first-class engine kinds — install from
-the curated catalog, pick the right one per model, and switch from a single dropdown.
+**MLX** and **MLX-VLM** (macOS), and **vLLM** (Linux + NVIDIA) are all first-class engine kinds —
+install from the curated catalog, pick the right one per model, and switch from a single dropdown.
 
 **Fully supervised.** Every engine runs under a real state machine: health-gated readiness,
 graceful stop, an **idle auto-stop** watchdog, and **live logs + clear error surfacing** in

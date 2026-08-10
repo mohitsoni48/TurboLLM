@@ -22,6 +22,7 @@ function fakeDeps(): Deps {
     manager: {
       status: () => ({ state: 'running', model: { name: 'Qwen3 8B', key: 'qwen3-8b|Q4|123' } }),
       target: () => 'http://engine.invalid.local:1',
+      currentOpts: () => null,
       generationStart: () => {},
       generationEnd: () => {},
     },

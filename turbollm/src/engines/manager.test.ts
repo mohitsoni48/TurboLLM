@@ -29,7 +29,7 @@ test('needsShellWrapper: false for llamafile on Windows (native MZ/PE header alr
 })
 
 test('needsShellWrapper: false for every other engine kind', () => {
-  for (const kind of ['llama-server', 'mlx', 'rapid-mlx', 'vllm', 'sglang', 'koboldcpp']) {
+  for (const kind of ['llama-server', 'mlx', 'rapid-mlx', 'mlx-vlm', 'vllm', 'sglang', 'koboldcpp']) {
     assert.equal(needsShellWrapper(kind), false, `expected ${kind} to not need a shell wrapper`)
   }
 })

@@ -929,7 +929,7 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
       toolIter++
 
       const reqBody: Record<string, unknown> = {
-        model: engineModelAlias(d.registry.active()?.kind ?? '') ?? ms.model!.key,
+        model: engineModelAlias(d.registry.active()?.kind ?? '', d.manager.currentOpts()?.modelPath) ?? ms.model!.key,
         messages: iterMessages,
         stream: true,
         stream_options: { include_usage: true },
@@ -1265,7 +1265,7 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
       console.log('[chat] BUG-001: final content is empty after stripping think blocks — making extra pass with tool_choice:none')
       iterMessages.push({ role: 'user', content: 'Please now write your final answer based on what you found.' })
       const reqBody: Record<string, unknown> = {
-        model: engineModelAlias(d.registry.active()?.kind ?? '') ?? ms.model!.key,
+        model: engineModelAlias(d.registry.active()?.kind ?? '', d.manager.currentOpts()?.modelPath) ?? ms.model!.key,
         messages: iterMessages,
         stream: true,
         stream_options: { include_usage: true },
@@ -1522,7 +1522,7 @@ async function autoTitle(
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: engineModelAlias(d.registry.active()?.kind ?? '') ?? ms.model?.key,
+          model: engineModelAlias(d.registry.active()?.kind ?? '', d.manager.currentOpts()?.modelPath) ?? ms.model?.key,
           messages: titleMessages,
           stream: false,
           temperature: 0.3,

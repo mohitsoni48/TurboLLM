@@ -44,6 +44,8 @@ test('engineGroupKey maps pip engines to their kind', () => {
   assert.equal(engineGroupKey(mlx), 'mlx')
   assert.equal(engineGroupKey(eng({ id: 'v', kind: 'vllm' })), 'vllm')
   assert.equal(engineGroupKey(eng({ id: 'k', kind: 'koboldcpp' })), 'koboldcpp')
+  assert.equal(engineGroupKey(eng({ id: 'rm', kind: 'rapid-mlx' })), 'rapid-mlx')
+  assert.equal(engineGroupKey(eng({ id: 'mv', kind: 'mlx-vlm' })), 'mlx-vlm')
 })
 
 test('engineGroupKey detects TurboQuant by path', () => {

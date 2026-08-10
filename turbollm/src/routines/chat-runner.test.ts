@@ -19,13 +19,17 @@ import type { Deps } from '../deps'
 // is already reserved for stubbing the engine's own /v1/chat/completions calls.
 const AGENT = { id: 'agent-1', name: 'Researcher', description: '', systemPrompt: 'You research things.', skillIds: [], tools: ['run_code'] }
 
-function fakeDeps(overrides: Partial<{ customAgents: typeof AGENT[]; tools: ToolRegistry }> = {}): { d: Deps; db: ConversationStore } {
+function fakeDeps(overrides: Partial<{ customAgents: typeof AGENT[]; tools: ToolRegistry; engineKind: string; modelPath: string | null }> = {}): { d: Deps; db: ConversationStore } {
   const db = new ConversationStore(mkdtempSync(join(tmpdir(), 'chat-runner-test-')))
   const d = {
     db,
     store: { snapshot: () => ({ customAgents: overrides.customAgents ?? [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }) },
-    manager: { status: () => ({ state: 'running', model: { key: 'm', name: 'm', quant: '', ctx: 8192, vision: false } }), target: () => 'http://engine.invalid.local:1' },
-    registry: { active: () => ({ kind: 'llama-server' }) },
+    manager: {
+      status: () => ({ state: 'running', model: { key: 'm', name: 'm', quant: '', ctx: 8192, vision: false } }),
+      target: () => 'http://engine.invalid.local:1',
+      currentOpts: () => (overrides.modelPath !== undefined ? { modelPath: overrides.modelPath } : null),
+    },
+    registry: { active: () => ({ kind: overrides.engineKind ?? 'llama-server' }) },
     // search: {} deliberately left unconfigured (searchConfigured() is false) — web_search is
     // NOT offered here on purpose. A real reviewer caught this in the original suite: every
     // test used web_search as its "allowed" tool while leaving search unconfigured, so
@@ -54,6 +58,35 @@ function routine(store: ConversationStore, overrides: Partial<Routine> = {}): Ro
   const r = store.createRoutine({ flavor: 'chat', prompt: 'Summarize my open PRs', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'agent-1' })
   return store.updateRoutine(r.id, overrides as never) ?? r
 }
+
+// Load-bearing for mlx-vlm: engineModelAlias('mlx-vlm', modelPath) only does the right thing if
+// the real currently-loaded model path actually reaches the outgoing request body. This is the
+// call-site-threading test the pure-function engineModelAlias unit tests (compat.test.ts) can't
+// cover — it exercises the real chat-runner.ts wiring: registry.active().kind → engineModelAlias
+// → manager.currentOpts()?.modelPath → request body's `model` field.
+test('runChatRoutine sends manager.currentOpts().modelPath as the request model for mlx-vlm, not the internal key', async () => {
+  const { d, db } = fakeDeps({ engineKind: 'mlx-vlm', modelPath: '/models/qwen2-vl-7b-mlx' })
+  const r = routine(db)
+  const run = db.createRoutineRun({ routineId: r.id, configSnapshot: JSON.stringify(r) })
+  const fetchStub = stubFetch([{ choices: [{ message: { content: 'All PRs are green.' } }] }])
+  try {
+    await runChatRoutine(d, r, run, new AbortController().signal)
+    assert.equal(fetchStub.calls[0].model, '/models/qwen2-vl-7b-mlx')
+  } finally { fetchStub.restore() }
+})
+
+// Sibling case: with no modelPath available (engine not actually running / not yet threaded),
+// mlx-vlm must fall back to TurboLLM's own key rather than sending null/undefined as the model.
+test('runChatRoutine falls back to the routine model key for mlx-vlm when no modelPath is available', async () => {
+  const { d, db } = fakeDeps({ engineKind: 'mlx-vlm', modelPath: null })
+  const r = routine(db)
+  const run = db.createRoutineRun({ routineId: r.id, configSnapshot: JSON.stringify(r) })
+  const fetchStub = stubFetch([{ choices: [{ message: { content: 'All PRs are green.' } }] }])
+  try {
+    await runChatRoutine(d, r, run, new AbortController().signal)
+    assert.equal(fetchStub.calls[0].model, 'm')
+  } finally { fetchStub.restore() }
+})
 
 test('a final answer with no tool calls records status ok', async () => {
   const { d, db } = fakeDeps()
