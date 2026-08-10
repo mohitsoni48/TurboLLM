@@ -193,6 +193,11 @@ export class Manager {
    *  model that simply fails to load — callers read status() for the running/error
    *  outcome. */
   async load(opts: StartOpts, hooks?: { beforeStart?: () => Promise<void> }): Promise<void> {
+    // Declared outside the try so the catch block below also reports whichever opts were
+    // actually last attempted — a throw from the fallback's own startInternal() must not
+    // fall back to reporting the original (mmproj-attached) opts, same defect class this
+    // whole fallback mechanism exists to fix.
+    let effectiveOpts = opts
     await Manager.runExclusive(async () => {
       try {
         if (this.state === 'running' || this.state === 'starting' || this.state === 'stopping') {
@@ -204,10 +209,12 @@ export class Manager {
         // GitHub report (Qwen3.6-35B-A3B): the multimodal projector can fail to load even with
         // the model's own correct, official mmproj — see mmprojFallbackOpts's doc comment. Retry
         // ONCE, text-only, instead of leaving a model that could otherwise run fine unloaded.
-        let effectiveOpts = opts
         if (this.state === 'error' && this.errInfo) {
           const fallback = mmprojFallbackOpts(opts, this.errInfo)
           if (fallback) {
+            // Computed from the pre-crash errInfo, before the await below can let a fresh
+            // onTerminated() overwrite it.
+            const note = mmprojFallbackNote(this.errInfo)
             // readiness()'s timeout path sets state='error' and fires child.kill() WITHOUT
             // awaiting the process's actual exit — awaitNotStarting() only waits for state to
             // leave 'starting', which happens the instant the kill is ISSUED, not once it's
@@ -219,10 +226,11 @@ export class Manager {
             // waiting on it here (already-resolved in the common immediate-crash case, so
             // effectively free) guarantees that cleanup has fully run before anything new spawns.
             await this.waitForExit(this.exited)
-            const note = mmprojFallbackNote(this.errInfo)
+            // Set BEFORE the spawn (not after) so a throw out of startInternal() below is
+            // still attributed to the config that actually threw, not the original one.
+            effectiveOpts = fallback
             await this.startInternal(fallback, note)
             await this.awaitNotStarting()
-            effectiveOpts = fallback
           }
         }
         // Both routes.ts call sites fire load() without awaiting, so the outcome
@@ -240,7 +248,7 @@ export class Manager {
         // anything went wrong or that a retry could help.
         this.state = 'error'
         this.errInfo = { code: 'load_failed', message: e instanceof Error ? e.message : String(e), exitCode: -1, logTail: [] }
-        this.reportLoad(false, this.errInfo, opts)
+        this.reportLoad(false, this.errInfo, effectiveOpts)
         throw e
       }
     })
@@ -1096,11 +1104,22 @@ export function stripMmprojArgs(args: string[]): string[] {
  *  `status().model` / the reported load's `opts.model` both come straight from whatever
  *  StartOpts actually got spawned (see `startInternal`'s `this.opts = opts`), so leaving
  *  vision `true` here would misreport a text-only session as vision-capable everywhere
- *  downstream that reads it (the UI's engine card, `model_load` telemetry, etc). */
+ *  downstream that reads it (the UI's engine card, `model_load` telemetry, etc) — including,
+ *  usefully, `slot-cache.ts`'s `cacheEligible()`, which excludes vision models only because
+ *  a multimodal slot-save 501s; a fallback session has no projector, so it's genuinely
+ *  eligible now, not just falsely marked so. `profile.useMmproj` is cleared too so the SAME
+ *  claim doesn't resurface if a future consumer starts reading `opts.profile` for reporting
+ *  (nothing does yet — `buildModelLoadConfig` has no mmproj field — but `extraArgs`/`model`
+ *  and `profile` disagreeing about what ran is exactly the class of bug this exists to fix). */
 export function mmprojFallbackOpts(opts: StartOpts, err: ErrInfo): StartOpts | null {
   if (!opts.extraArgs.includes('--mmproj')) return null
   if (!/failed to load multimodal model/i.test(err.logTail.join('\n'))) return null
-  return { ...opts, extraArgs: stripMmprojArgs(opts.extraArgs), model: { ...opts.model, vision: false } }
+  return {
+    ...opts,
+    extraArgs: stripMmprojArgs(opts.extraArgs),
+    model: { ...opts.model, vision: false },
+    profile: opts.profile ? { ...opts.profile, useMmproj: false } : opts.profile,
+  }
 }
 
 /** The log note written at the top of the fallback attempt's (freshly truncated) log —
