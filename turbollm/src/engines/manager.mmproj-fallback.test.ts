@@ -55,6 +55,28 @@ test('mmprojFallbackOpts returns a retry with --mmproj stripped on a multimodal 
   assert.equal(fallback.modelPath, '/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf')
 })
 
+test('mmprojFallbackOpts marks the retry model as non-vision — status()/reportLoad both read opts.model straight through', () => {
+  const fallback = mmprojFallbackOpts(opts(['-m', 'x.gguf', '--mmproj', 'mmproj.gguf']), err(MISMATCH_LOG))
+  assert.ok(fallback)
+  assert.equal(fallback.model.vision, false)
+  // Only vision changes — the rest of the model descriptor (name/quant/ctx) is untouched.
+  assert.equal(fallback.model.name, 'Qwen3.6-35B-A3B')
+  assert.equal(fallback.model.quant, 'Q4_K_M')
+})
+
+test('mmprojFallbackOpts also clears profile.useMmproj, when a profile is present', () => {
+  const withProfile: StartOpts = { ...opts(['-m', 'x.gguf', '--mmproj', 'mmproj.gguf']), profile: { useMmproj: true } as StartOpts['profile'] }
+  const fallback = mmprojFallbackOpts(withProfile, err(MISMATCH_LOG))
+  assert.ok(fallback)
+  assert.equal(fallback.profile?.useMmproj, false)
+})
+
+test('mmprojFallbackOpts leaves profile untouched (undefined) when the original opts had none', () => {
+  const fallback = mmprojFallbackOpts(opts(['-m', 'x.gguf', '--mmproj', 'mmproj.gguf']), err(MISMATCH_LOG))
+  assert.ok(fallback)
+  assert.equal(fallback.profile, undefined)
+})
+
 test('mmprojFallbackOpts returns null when the load had no --mmproj to begin with', () => {
   assert.equal(mmprojFallbackOpts(opts(['-m', 'x.gguf']), err(MISMATCH_LOG)), null)
 })

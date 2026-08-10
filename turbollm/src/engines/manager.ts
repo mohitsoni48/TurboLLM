@@ -193,6 +193,11 @@ export class Manager {
    *  model that simply fails to load — callers read status() for the running/error
    *  outcome. */
   async load(opts: StartOpts, hooks?: { beforeStart?: () => Promise<void> }): Promise<void> {
+    // Declared outside the try so the catch block below also reports whichever opts were
+    // actually last attempted — a throw from the fallback's own startInternal() must not
+    // fall back to reporting the original (mmproj-attached) opts, same defect class this
+    // whole fallback mechanism exists to fix.
+    let effectiveOpts = opts
     await Manager.runExclusive(async () => {
       try {
         if (this.state === 'running' || this.state === 'starting' || this.state === 'stopping') {
@@ -207,7 +212,23 @@ export class Manager {
         if (this.state === 'error' && this.errInfo) {
           const fallback = mmprojFallbackOpts(opts, this.errInfo)
           if (fallback) {
+            // Computed from the pre-crash errInfo, before the await below can let a fresh
+            // onTerminated() overwrite it.
             const note = mmprojFallbackNote(this.errInfo)
+            // readiness()'s timeout path sets state='error' and fires child.kill() WITHOUT
+            // awaiting the process's actual exit — awaitNotStarting() only waits for state to
+            // leave 'starting', which happens the instant the kill is ISSUED, not once it's
+            // landed. Racing the fallback spawn against that in-flight kill could leave two
+            // engine processes alive at once (double VRAM allocation, violating the "at most
+            // one load in flight" invariant above) and orphans the first child's pid file +
+            // log stream, since onTerminated() no-ops once `this.child` no longer matches.
+            // `this.exited` resolves exactly when the first child's onTerminated() finishes —
+            // waiting on it here (already-resolved in the common immediate-crash case, so
+            // effectively free) guarantees that cleanup has fully run before anything new spawns.
+            await this.waitForExit(this.exited)
+            // Set BEFORE the spawn (not after) so a throw out of startInternal() below is
+            // still attributed to the config that actually threw, not the original one.
+            effectiveOpts = fallback
             await this.startInternal(fallback, note)
             await this.awaitNotStarting()
           }
@@ -216,8 +237,10 @@ export class Manager {
         // is not observable to the caller. Reporting it here — the single atomic
         // swap entry point — is what makes any future call site instrumented for
         // free. Manager stays telemetry-agnostic: it reports an outcome, and the
-        // consumer (wired in cli.ts) decides what that means.
-        this.reportLoad(this.state === 'running', this.errInfo, opts)
+        // consumer (wired in cli.ts) decides what that means. Uses effectiveOpts (the
+        // fallback's, when one ran and the retry is what actually ended up loaded/failed)
+        // so a successful text-only fallback isn't misreported as a load "with mmproj".
+        this.reportLoad(this.state === 'running', this.errInfo, effectiveOpts)
       } catch (e) {
         // routes.ts fires load() without awaiting and only console.warns the rejection —
         // without this, a failed swap left `state` wherever it last was (often still
@@ -225,7 +248,7 @@ export class Manager {
         // anything went wrong or that a retry could help.
         this.state = 'error'
         this.errInfo = { code: 'load_failed', message: e instanceof Error ? e.message : String(e), exitCode: -1, logTail: [] }
-        this.reportLoad(false, this.errInfo, opts)
+        this.reportLoad(false, this.errInfo, effectiveOpts)
         throw e
       }
     })
@@ -1076,11 +1099,27 @@ export function stripMmprojArgs(args: string[]): string[] {
  *  llama.cpp's own internal check, so instead of leaving an otherwise-loadable model
  *  unloaded, retry the FIRST load attempt once without --mmproj when it dies with a
  *  multimodal-load failure. Self-limiting: `fallback`'s own extraArgs carry no --mmproj,
- *  so a second failure (of any kind) just surfaces normally — no further retry, no loop. */
+ *  so a second failure (of any kind) just surfaces normally — no further retry, no loop.
+ *  `model.vision` is forced false too — the retry genuinely has no projector attached, and
+ *  `status().model` / the reported load's `opts.model` both come straight from whatever
+ *  StartOpts actually got spawned (see `startInternal`'s `this.opts = opts`), so leaving
+ *  vision `true` here would misreport a text-only session as vision-capable everywhere
+ *  downstream that reads it (the UI's engine card, `model_load` telemetry, etc) — including,
+ *  usefully, `slot-cache.ts`'s `cacheEligible()`, which excludes vision models only because
+ *  a multimodal slot-save 501s; a fallback session has no projector, so it's genuinely
+ *  eligible now, not just falsely marked so. `profile.useMmproj` is cleared too so the SAME
+ *  claim doesn't resurface if a future consumer starts reading `opts.profile` for reporting
+ *  (nothing does yet — `buildModelLoadConfig` has no mmproj field — but `extraArgs`/`model`
+ *  and `profile` disagreeing about what ran is exactly the class of bug this exists to fix). */
 export function mmprojFallbackOpts(opts: StartOpts, err: ErrInfo): StartOpts | null {
   if (!opts.extraArgs.includes('--mmproj')) return null
   if (!/failed to load multimodal model/i.test(err.logTail.join('\n'))) return null
-  return { ...opts, extraArgs: stripMmprojArgs(opts.extraArgs) }
+  return {
+    ...opts,
+    extraArgs: stripMmprojArgs(opts.extraArgs),
+    model: { ...opts.model, vision: false },
+    profile: opts.profile ? { ...opts.profile, useMmproj: false } : opts.profile,
+  }
 }
 
 /** The log note written at the top of the fallback attempt's (freshly truncated) log —
