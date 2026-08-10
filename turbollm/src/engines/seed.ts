@@ -4,7 +4,7 @@
 // No-ops if any engine is already configured. Never throws.
 import type { Registry } from './registry'
 import type { ProvisionState } from './provision-state'
-import { getSysInfo, primaryVendor } from '../sysinfo/sysinfo'
+import { amdApuOnly, getSysInfo, primaryVendor } from '../sysinfo/sysinfo'
 import { LLAMA_BUILD, fallbackChain, provisionBackend, recommendBackendId, type BackendId, type ProvisionProgress } from './download'
 
 const VALID_BACKENDS: BackendId[] = ['cuda', 'rocm', 'sycl', 'vulkan', 'metal', 'cpu']
@@ -30,7 +30,9 @@ export async function seedDefaultEngines(
 
   let chain
   try {
-    const recommended = forced && VALID_BACKENDS.includes(forced) ? forced : recommendBackendId(vendor, hasGpu, tag)
+    const recommended = forced && VALID_BACKENDS.includes(forced)
+      ? forced
+      : recommendBackendId(vendor, hasGpu, tag, amdApuOnly(sys))
     chain = fallbackChain(recommended, tag)
     if (forced) {
       console.log(`seed: TURBOLLM_SEED_BACKEND=${forced} → backend ${recommended} (skipping live GPU detection)`)

@@ -49,7 +49,7 @@ import { recommendEngines } from '../engines/recommend'
 import { engineAcceptsFormat, engineRejectsAudioModel } from '../engines/compat'
 import { ScannerError, type ModelEntry } from '../models/scanner'
 import { estimateVram, type LoadProfile, profileToArgs, resolveProfile, vllmProfileToArgs } from '../models/profile'
-import { getSysInfo, primaryVendor } from '../sysinfo/sysinfo'
+import { amdApuOnly, getSysInfo, primaryVendor } from '../sysinfo/sysinfo'
 import { HfError, type HfSortOption } from '../hf/hf'
 import { DownloadError } from '../downloads/downloads'
 import { BenchError } from '../bench/bench'
@@ -194,7 +194,7 @@ export function registerApi(app: Hono, d: Deps): void {
   app.get('/api/v1/engines/backends', (c) => {
     const sys = getSysInfo()
     const vendor = primaryVendor(sys)
-    const recommended = recommendBackendId(vendor, sys.gpus.length > 0)
+    const recommended = recommendBackendId(vendor, sys.gpus.length > 0, undefined, amdApuOnly(sys))
     const root = join(d.store.dir(), 'engines')
     const active = d.registry.active()
     const regEngines = d.registry.list().engines
@@ -246,10 +246,17 @@ export function registerApi(app: Hono, d: Deps): void {
     const root = join(d.store.dir(), 'engines')
     // First-install only: seed the pinned LLAMA_BUILD. When ANY build of this backend is
     // already on disk (tag-agnostic — an update may have de-pinned it off LLAMA_BUILD,
-    // ADR-085), this is a no-op so we never re-download a working install. The real upstream
-    // check is the Update path's job, which resolves the REAL latest tag honestly.
+    // ADR-085), this is a no-op download-wise so we never re-download a working install. The
+    // real upstream check is the Update path's job, which resolves the REAL latest tag honestly.
+    // GitHub #102: "Disable" only unregisters the engine (files stay on disk, ManagedEngines.tsx),
+    // so a disabled backend hits exactly this branch — re-register + activate it here too, or
+    // "Download" on a disabled backend silently does nothing forever (the binary is already
+    // there, so there was never anything to actually download).
     const existing = installedBackendBuild(root, def.id)
     if (existing) {
+      let eng = d.registry.list().engines.find((e) => e.binPath === existing.bin)
+      if (!eng) eng = (await d.registry.add(`llama.cpp ${existing.tag} (${def.id})`, existing.bin)).engine
+      d.registry.activate(eng.id)
       return c.json({ accepted: false, alreadyInstalled: true, build: existing.tag })
     }
     { const busy = engineWorkBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }

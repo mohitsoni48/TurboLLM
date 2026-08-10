@@ -3,7 +3,7 @@
 // used by turboquantAssetUrl to pick the right release asset per OS.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { scoreAsset, pickReleaseAsset } from './download'
+import { scoreAsset, pickReleaseAsset, recommendBackendId } from './download'
 import type { ReleaseAsset } from './download'
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
@@ -168,5 +168,24 @@ test('pickReleaseAsset returns Windows asset for win32/x64', () => {
   ]
   const result = pickReleaseAsset(assets, 'win32', 'x64')
   assert.equal(result?.name, 'llama-win-x64.zip')
+})
+
+// ─── recommendBackendId ─────────────────────────────────────────────────────
+// GitHub #103: turbollm always defaulted an AMD GPU to ROCm when a ROCm prebuilt exists for
+// this platform, even on AMD APUs/iGPUs (e.g. Radeon 860M) that ROCm doesn't support on
+// Windows — Vulkan should win there instead. Runs on the CI machine's real platform (both
+// win32 and linux ship a rocm + vulkan prebuilt), skipped elsewhere.
+const hasRocmAndVulkan = process.platform === 'win32' || process.platform === 'linux'
+
+test('recommendBackendId: AMD with a discrete GPU still picks ROCm', { skip: !hasRocmAndVulkan && 'requires a platform with both rocm and vulkan prebuilts' }, () => {
+  assert.equal(recommendBackendId('amd', true, undefined, false), 'rocm')
+})
+
+test('recommendBackendId: AMD APU-only (amdApuOnly=true) skips ROCm for Vulkan', { skip: !hasRocmAndVulkan && 'requires a platform with both rocm and vulkan prebuilts' }, () => {
+  assert.equal(recommendBackendId('amd', true, undefined, true), 'vulkan')
+})
+
+test('recommendBackendId: amdApuOnly is irrelevant to other vendors', { skip: process.platform !== 'win32' && 'requires a platform with a CUDA prebuilt (win32 only — no Linux CUDA prebuilt upstream)' }, () => {
+  assert.equal(recommendBackendId('nvidia', true, undefined, true), 'cuda')
 })
 

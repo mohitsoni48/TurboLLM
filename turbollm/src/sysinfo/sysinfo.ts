@@ -50,6 +50,15 @@ export function primaryVendor(info: SysInfo = getSysInfo()): GpuVendor {
   return best
 }
 
+/** True when every detected AMD adapter is integrated (an APU iGPU, `unified: true`) —
+ *  i.e. there's no discrete AMD card to fall back on. Used by backend selection (GitHub
+ *  #103) to avoid defaulting an AMD APU box to ROCm, which doesn't support most integrated
+ *  Radeon graphics. False when there's no AMD adapter at all, or at least one is discrete. */
+export function amdApuOnly(info: SysInfo = getSysInfo()): boolean {
+  const amd = info.gpus.filter((g) => g.vendor === 'amd')
+  return amd.length > 0 && amd.every((g) => g.unified)
+}
+
 export function classifyVendor(name: string): GpuVendor {
   const n = name.toLowerCase()
   if (/nvidia|geforce|rtx|gtx|quadro|tesla/.test(n)) return 'nvidia'

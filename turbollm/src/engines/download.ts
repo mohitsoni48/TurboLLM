@@ -100,8 +100,19 @@ export function availableBackends(tag = LLAMA_BUILD): BackendDef[] {
   throw new Error(`unsupported platform: ${plat()}/${process.arch}`)
 }
 
-/** The fastest backend for the detected GPU vendor. */
-export function recommendBackendId(vendor: GpuVendor, hasGpu: boolean, tag = LLAMA_BUILD): BackendId {
+/** The fastest backend for the detected GPU vendor. `amdApuOnly` — true when every detected
+ *  AMD adapter is an integrated GPU (GitHub #103: e.g. Radeon 860M / other Ryzen AI APUs) —
+ *  skips ROCm even when a ROCm build exists for this platform. ROCm's Windows/Linux support
+ *  matrix already excludes most discrete consumer Radeon cards (see enumWindowsGpus's rocm-smi
+ *  comment); it excludes integrated Radeon graphics even more consistently, so defaulting an
+ *  APU-only box to ROCm reliably picks a backend that can't load a model at all. Vulkan always
+ *  works there. Ignored (irrelevant) when a discrete AMD GPU is present. */
+export function recommendBackendId(
+  vendor: GpuVendor,
+  hasGpu: boolean,
+  tag = LLAMA_BUILD,
+  amdApuOnly = false,
+): BackendId {
   const ids = new Set(availableBackends(tag).map((b) => b.id))
   if (plat() === 'darwin') return 'metal'
   if (!hasGpu) return 'cpu'
@@ -111,7 +122,7 @@ export function recommendBackendId(vendor: GpuVendor, hasGpu: boolean, tag = LLA
       pick = ids.has('cuda') ? 'cuda' : 'vulkan' // no Linux CUDA prebuilt
       break
     case 'amd':
-      pick = ids.has('rocm') ? 'rocm' : 'vulkan'
+      pick = !amdApuOnly && ids.has('rocm') ? 'rocm' : 'vulkan'
       break
     case 'intel':
       pick = ids.has('sycl') ? 'sycl' : 'vulkan'
