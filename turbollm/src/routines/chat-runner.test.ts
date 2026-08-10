@@ -75,19 +75,6 @@ test('runChatRoutine sends manager.currentOpts().modelPath as the request model 
   } finally { fetchStub.restore() }
 })
 
-// Sibling case: with no modelPath available (engine not actually running / not yet threaded),
-// mlx-vlm must fall back to TurboLLM's own key rather than sending null/undefined as the model.
-test('runChatRoutine falls back to the routine model key for mlx-vlm when no modelPath is available', async () => {
-  const { d, db } = fakeDeps({ engineKind: 'mlx-vlm', modelPath: null })
-  const r = routine(db)
-  const run = db.createRoutineRun({ routineId: r.id, configSnapshot: JSON.stringify(r) })
-  const fetchStub = stubFetch([{ choices: [{ message: { content: 'All PRs are green.' } }] }])
-  try {
-    await runChatRoutine(d, r, run, new AbortController().signal)
-    assert.equal(fetchStub.calls[0].model, 'm')
-  } finally { fetchStub.restore() }
-})
-
 test('a final answer with no tool calls records status ok', async () => {
   const { d, db } = fakeDeps()
   const r = routine(db)

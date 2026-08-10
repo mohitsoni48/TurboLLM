@@ -265,7 +265,11 @@ const ALL: CatalogEngine[] = [
       'macOS (Apple Silicon) only. Loads the same MLX-format model directories as the MLX engine. ' +
       'Some architectures (e.g. Qwen-VL, SmolVLM) additionally need torch + torchvision, which are ' +
       'not installed automatically. If a model fails to load with a "missing image processor" ' +
-      'error, run: uv pip install --python <this engine\'s venv>/bin/python torch torchvision.',
+      'error, run: uv pip install --python <this engine\'s venv>/bin/python torch torchvision. ' +
+      'Tool/function calling is architecture-dependent: mlx-vlm only turns a `tools` array into ' +
+      'real tool calls for the handful of chat templates it has a matching parser for. Other ' +
+      'models accept the request without error but never call a tool (confirmed live on ' +
+      'Qwen2.5-VL: its own /health reports "loaded_tool_parser": null).',
     variants: [
       {
         id: 'mlx-vlm',

@@ -779,8 +779,11 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
   const convS = conv.sampling ?? {}
   const engineKind = d.registry.active()?.kind ?? ''
   // BUG-006: vLLM and SGLang reject `repeat_penalty` (the llama.cpp name) and require
-  // `repetition_penalty` — the OpenAI-spec name. Map per engine kind.
-  const repeatPenaltyKey = (engineKind === 'vllm' || engineKind === 'sglang') ? 'repetition_penalty' : 'repeat_penalty'
+  // `repetition_penalty` — the OpenAI-spec name. mlx-vlm's request schema (server/schemas.py)
+  // only declares `repetition_penalty` too — `repeat_penalty` isn't rejected (the schema
+  // allows extra fields) but is silently ignored, a no-op. Map per engine kind.
+  const repeatPenaltyKey =
+    (engineKind === 'vllm' || engineKind === 'sglang' || engineKind === 'mlx-vlm') ? 'repetition_penalty' : 'repeat_penalty'
   const SAMPLING_KEYS: Record<string, string> = {
     temp: 'temperature', topP: 'top_p', topK: 'top_k', minP: 'min_p',
     repeatPenalty: repeatPenaltyKey, presencePenalty: 'presence_penalty',
@@ -959,7 +962,11 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
       // --enable-auto-tool-choice and --tool-call-parser to be set" — unless the
       // server was launched with those flags (which we don't, and no built-in parser
       // matches Gemma's tool format). Sending tools there breaks ALL vLLM chat, so we
-      // skip them. llama.cpp/forks accept them; mlx-lm ignores them harmlessly.
+      // skip them. llama.cpp/forks accept them; mlx-lm ignores them harmlessly. mlx-vlm
+      // also accepts them without erroring, but whether a tool call actually comes back
+      // depends on the loaded model's chat template matching one of mlx-vlm's built-in
+      // tool parsers (see the MLX-VLM catalog note) — not a crash risk, just a
+      // per-architecture no-op some of the time.
       const toolsSupported = engineKind !== 'vllm' && engineKind !== 'sglang' && toolDefs.length > 0
       if (toolsSupported) reqBody.tools = toolDefs
       // Force web_search on the first two iterations when the conversation has a

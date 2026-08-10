@@ -1229,11 +1229,17 @@ export function registerApi(app: Hono, d: Deps): void {
       }
       if (entry.audio && engineRejectsAudioModel(active.kind)) {
         const engineLabel = active.kind === 'mlx-vlm' ? 'MLX-VLM' : 'Rapid-MLX'
+        // Rapid-MLX: confirmed live, reproduced end to end (see engineRejectsAudioModel's
+        // docblock). MLX-VLM: same underlying mlx_vlm sanitizer bug, but excluded here
+        // precautionarily from reading the source, not a fresh live reproduction — say so
+        // rather than stating it as flatly settled. Either way, plain MLX (mlx-lm) never
+        // attempts VLM/audio loading, so it's a safe fallback recommendation for both.
+        const certainty = active.kind === 'mlx-vlm' ? 'is expected to fail' : 'fails'
         return err(
           c,
           409,
           'engine_model_mismatch',
-          `${engineLabel} cannot load models with an audio tower — the audio encoder is unsupported by an upstream mlx-vlm bug in the sanitizer for these architectures.`,
+          `${engineLabel} cannot load models with an audio tower — the audio encoder ${certainty} due to an upstream mlx-vlm bug in the sanitizer for these architectures. Switch to the MLX engine instead.`,
         )
       }
       let opts: StartOpts

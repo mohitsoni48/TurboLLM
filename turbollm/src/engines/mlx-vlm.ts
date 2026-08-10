@@ -104,15 +104,27 @@ export async function probeMlxVlm(python: string): Promise<string> {
  * engine loads).
  *
  * Passed as `--model`, which mlx_vlm.server treats as a *preload* hint only (it sets
- * MLX_VLM_PRELOAD_MODEL and loads it once in the background after the HTTP socket
- * binds) — NOT a fixed serving alias. Unlike mlx-lm/vLLM (fixed `default_model`
- * alias) and Rapid-MLX (fixed `default` alias), mlx-vlm's OpenAI endpoint resolves
- * the request body's `model` field as a real model path/repo id on every request
- * (verified live: it's passed straight to `get_cached_model(model_path, ...)`,
- * cached by `(model_path, adapter_path, model_kind)`). So callers must send this
- * same `model` value in the request body's `model` field — see engineModelAlias()
- * in compat.ts, which returns the actual model path for `mlx-vlm` rather than a
- * fixed alias.
+ * MLX_VLM_PRELOAD_MODEL) — NOT a fixed serving alias. This preload runs synchronously
+ * inside the ASGI `lifespan` startup handler (a plain, un-awaited `get_cached_model()`
+ * call before the `yield`), which uvicorn blocks on before it starts accepting HTTP
+ * connections at all (confirmed live: log order is "Waiting for application startup"
+ * → "Language model ready" → "Application startup complete" → "Uvicorn running on
+ * ..."; a bad `--model` path makes the whole process exit with "Application startup
+ * failed. Exiting." instead of ever binding the port). So unlike the request-time
+ * lazy-load path below, a `--model` preload failure can never be observed as a false
+ * "ready" — /health only starts answering once the preload has actually succeeded.
+ *
+ * Unlike mlx-lm/vLLM (fixed `default_model` alias) and Rapid-MLX (fixed `default`
+ * alias), mlx-vlm's OpenAI endpoint additionally resolves the request body's `model`
+ * field as a real model path/repo id on every request (verified live: it's passed
+ * straight to `get_cached_model(model_path, ...)`, cached by `(model_path,
+ * adapter_path, model_kind)`). A request naming a path other than the one preloaded
+ * loads it lazily inside that request handler — ungated by /health, same
+ * unobservable-until-it-fails surface as other request-time load failures (e.g. the
+ * LLaVA `patch_size: null` crash). Callers must send the preloaded `model` value in
+ * the request body's `model` field to stay on the fast, already-loaded path — see
+ * engineModelAlias() in compat.ts, which returns the actual model path for `mlx-vlm`
+ * rather than a fixed alias.
  *
  * No sampling-args builder exists (unlike mlx-lm's mlxSamplingArgs): mlx_vlm.server
  * --help exposes no --temp/--top-p/--top-k/--min-p flags — sampling is

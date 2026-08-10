@@ -614,11 +614,17 @@ export class Manager {
     for (;;) {
       await sleep(500)
       if (this.child !== child || this.state !== 'starting') return
-      // Python engines (mlx/vllm) load the model in a background thread AFTER the HTTP
-      // socket binds, so /v1/models answers 200 even when the load crashed — which would
-      // otherwise flip us to "running" and then hang every request forever on a dead
-      // generation thread. Detect a fatal load-failure traceback in the log and surface
-      // it as an engine error instead. (Checked before probeReady so we win the race.)
+      // mlx/vllm load the model in a background thread AFTER the HTTP socket binds, so
+      // /v1/models answers 200 even when the load crashed — which would otherwise flip
+      // us to "running" and then hang every request forever on a dead generation
+      // thread. mlx-vlm's own --model preload is actually synchronous (blocks the ASGI
+      // lifespan startup, so the socket never even binds on a preload failure — see
+      // mlxVlmServerCommand's docblock) and a plain process exit already surfaces via
+      // the exit handler above with a generic message; we still check it here because
+      // this path additionally recovers the real traceback line (e.g. "Failed to load
+      // model: ...") for a much more useful error than "exited unexpectedly". Detect a
+      // fatal load-failure traceback in the log and surface it as an engine error
+      // instead. (Checked before probeReady so we win the race.)
       if (kind === 'mlx' || kind === 'rapid-mlx' || kind === 'mlx-vlm' || kind === 'vllm' || kind === 'sglang') {
         const loadErr = detectPyLoadFailure(readTail(this.logPathStr, 200))
         if (loadErr) {
