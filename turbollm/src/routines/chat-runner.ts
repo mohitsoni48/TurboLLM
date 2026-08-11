@@ -178,7 +178,12 @@ async function runChatRoundLoop(d: Deps, run: RoutineRun, agent: CustomChatAgent
     state.iter++
     if (signal.aborted) return { status: 'errored', error: 'Routine run timed out or was cancelled.' }
 
-    const reqBody: Record<string, unknown> = { model: engineModelAlias(engineKind) ?? ms.model.key, messages: state.messages, stream: false }
+    // `?? ms.model.key` is a should-never-happen fallback for mlx-vlm: the `state !== 'running'`
+    // guard above already implies `currentOpts()` is set, so engineModelAlias('mlx-vlm', ...)
+    // always resolves a real path here. If it were ever hit, TurboLLM's internal display-name
+    // key would go out as the `model` field and mlx_vlm.server would 400 with a clear "Failed to
+    // load model" error rather than silently misbehaving — acceptable as a last-resort guard.
+    const reqBody: Record<string, unknown> = { model: engineModelAlias(engineKind, d.manager.currentOpts()?.modelPath) ?? ms.model.key, messages: state.messages, stream: false }
     if (baseToolDefs.length) reqBody.tools = baseToolDefs
     const cappedMax = clampMaxTokens(undefined, maxLimit)
     if (cappedMax != null) reqBody.max_tokens = cappedMax

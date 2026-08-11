@@ -23,7 +23,15 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+- **MLX-VLM engine** (macOS Apple Silicon only, pip). Vision-language models on Apple's MLX
+  framework — Qwen-VL, Gemma vision variants, LLaVA, and more — via an OpenAI-compatible
+  `mlx_vlm.server`. No context/GPU-layer/KV knobs to set at load time; sampling is
+  per-conversation only, same as Rapid-MLX.
+
+### Discord
+- **MLX-VLM is now a supported engine** — run vision-language models (Qwen-VL, Gemma vision,
+  LLaVA, and more) locally on Apple Silicon with one-click install, no compiling required.
 
 ## [1.10.7] - 2026-08-11
 

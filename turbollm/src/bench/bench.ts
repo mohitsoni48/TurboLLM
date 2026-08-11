@@ -340,11 +340,13 @@ export class BenchRunner {
     }
     const active = this.registry.active()
     if (!active) throw new BenchError('no_active_engine', 'Register and select an engine first.')
-    // Auto-tune sweeps llama.cpp LoadProfile flags (profileToArgs). MLX has no such
-    // flags; KoboldCpp uses a DIFFERENT flag dialect (koboldcppProfileToArgs), so the
-    // swept llama.cpp flags wouldn't apply. Both are unsupported. llamafile runs
-    // llama.cpp's server with the same flags, so it auto-tunes like llama-server.
-    if (active.kind === 'mlx' || active.kind === 'rapid-mlx' || active.kind === 'koboldcpp') {
+    // Auto-tune sweeps llama.cpp LoadProfile flags (profileToArgs). None of the MLX
+    // family (mlx / rapid-mlx / mlx-vlm) has such flags — all are per-request-only,
+    // no launch-time tuning surface; KoboldCpp uses a DIFFERENT flag dialect
+    // (koboldcppProfileToArgs), so the swept llama.cpp flags wouldn't apply either.
+    // All four are unsupported. llamafile runs llama.cpp's server with the same
+    // flags, so it auto-tunes like llama-server.
+    if (active.kind === 'mlx' || active.kind === 'rapid-mlx' || active.kind === 'mlx-vlm' || active.kind === 'koboldcpp') {
       throw new BenchError('unsupported_model', 'Auto-tune supports llama.cpp / llamafile (GGUF) engines only.')
     }
     const entry = this.scanner.get(modelKey)

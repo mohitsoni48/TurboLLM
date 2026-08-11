@@ -250,6 +250,39 @@ const ALL: CatalogEngine[] = [
     ],
   },
   {
+    id: 'mlx-vlm',
+    name: 'MLX-VLM',
+    kind: 'mlx-vlm',
+    description:
+      'Vision-language models (Qwen-VL, Gemma vision, LLaVA, SmolVLM, and others) on Apple Silicon via MLX, with an OpenAI-compatible server.',
+    provision: 'pip',
+    homepage: 'https://github.com/Blaizzy/mlx-vlm',
+    repo: 'Blaizzy/mlx-vlm',
+    platforms: ['darwin'],
+    support: 'experimental',
+    installEndpoint: '/api/v1/engines/mlx-vlm',
+    note:
+      'macOS (Apple Silicon) only. Loads the same MLX-format model directories as the MLX engine. ' +
+      'Some architectures (e.g. Qwen-VL, SmolVLM) additionally need torch + torchvision, which are ' +
+      'not installed automatically. If a model fails to load with a "missing image processor" ' +
+      'error, run: uv pip install --python <this engine\'s venv>/bin/python torch torchvision. ' +
+      'Tool/function calling is architecture-dependent: mlx-vlm only turns a `tools` array into ' +
+      'real tool calls for the handful of chat templates it has a matching parser for. Other ' +
+      'models accept the request without error but never call a tool (confirmed live on ' +
+      'Qwen2.5-VL: its own /health reports "loaded_tool_parser": null).',
+    variants: [
+      {
+        id: 'mlx-vlm',
+        label: 'Apple Metal',
+        repo: 'Blaizzy/mlx-vlm',
+        requires: { platform: ['darwin'], gpuVendor: ['apple'] },
+        stability: 'experimental',
+        speed: 'fast',
+        hasPrebuilt: true,
+      },
+    ],
+  },
+  {
     id: 'sglang',
     name: 'SGLang',
     kind: 'sglang',

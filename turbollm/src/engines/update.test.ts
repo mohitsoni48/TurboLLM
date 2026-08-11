@@ -179,6 +179,11 @@ test('resolveUpdateSource: mlx/vllm → PyPI package + stripped version', () => 
     ref: 'vllm',
     installed: '0.11.2',
   })
+  assert.deepEqual(resolveUpdateSource(eng({ kind: 'mlx-vlm', version: 'mlx-vlm 0.6.4' })), {
+    source: 'pip',
+    ref: 'mlx-vlm',
+    installed: '0.6.4',
+  })
 })
 
 test('resolveUpdateSource: koboldcpp/llamafile → GitHub repo + stored tag (Phase 4)', () => {

@@ -47,6 +47,7 @@ function fakeDeps(target: string, gate: GenerationGate | undefined, dbCalls: unk
     manager: {
       status: () => ({ state: 'stopped', model: null }),
       target: () => target,
+      currentOpts: () => null,
       generationStart: () => {},
       generationEnd: () => {},
       recordCompletion: () => {},

@@ -249,9 +249,11 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
     // this one reply — the model physically cannot emit the same call a seventh time and has to
     // answer in text, which ends the loop.
     if (guidance?.forceTextOnly) oaiBody.tool_choice = 'none'
-    // mlx-lm / vLLM serve under a fixed alias and reject the client's model id; rewrite
-    // the outbound field (routing above already used the original id). No-op for llama.cpp.
-    const oaiAlias = engineModelAlias(d.registry.active()?.kind ?? '')
+    // mlx-lm / vLLM serve under a fixed alias and reject the client's model id; mlx-vlm
+    // instead requires the real currently-loaded model path in the field. Either way,
+    // rewrite the outbound field (routing above already used the original id). No-op
+    // for llama.cpp and its forks, which ignore the field entirely.
+    const oaiAlias = engineModelAlias(d.registry.active()?.kind ?? '', d.manager.currentOpts()?.modelPath)
     if (oaiAlias) (oaiBody as Record<string, unknown>).model = oaiAlias
 
     // ── Concurrency: never exceed the engine's own slot count ─────────────────
@@ -593,9 +595,10 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
           parsedBody.max_tokens = clampMaxTokens(parsedBody.max_tokens as number | undefined, maxLimit)
         }
         // Rewrite the outbound model id for engines that serve under a fixed alias
-        // (mlx-lm / vLLM). Routing above already used the caller's original id.
+        // (mlx-lm / vLLM) or that require the real loaded model path (mlx-vlm).
+        // Routing above already used the caller's original id.
         if (parsedBody) {
-          const alias = engineModelAlias(d.registry.active()?.kind ?? '')
+          const alias = engineModelAlias(d.registry.active()?.kind ?? '', d.manager.currentOpts()?.modelPath)
           if (alias) parsedBody.model = alias
         }
         // Terminal-agent thinking-budget override (ADR-284) — OpenAI-protocol clients (pi/

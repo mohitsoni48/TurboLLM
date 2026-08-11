@@ -16,12 +16,14 @@ export type ModelFormat = 'gguf' | 'mlx'
  *   - KoboldCpp (kind 'koboldcpp') → GGUF (it wraps llama.cpp)
  *   - MLX (kind 'mlx') → MLX-format safetensors directories
  *   - Rapid-MLX (kind 'rapid-mlx') → the same MLX-format directories as the MLX engine
+ *   - MLX-VLM (kind 'mlx-vlm') → the same MLX-format directories, for vision-language models
  *   - vLLM (kind 'vllm') → HF safetensors directories — the same on-disk shape the
  *     scanner tags 'mlx' (config.json + *.safetensors + tokenizer)
  */
 export function engineAcceptsFormat(engineKind: string, format: ModelFormat): boolean {
   if (engineKind === 'mlx') return format === 'mlx'
   if (engineKind === 'rapid-mlx') return format === 'mlx'
+  if (engineKind === 'mlx-vlm') return format === 'mlx'
   if (engineKind === 'vllm') return format === 'mlx'
   // llama-server / forks, llamafile, koboldcpp — all GGUF.
   return format === 'gguf'
@@ -38,9 +40,17 @@ export function engineAcceptsFormat(engineKind: string, format: ModelFormat): bo
  * The plain MLX engine (`mlx-lm`) never attempts VLM/audio loading at all, so it's
  * unaffected — only Rapid-MLX is excluded here. Vision-only models (no audio_config)
  * are NOT excluded; only the confirmed-broken audio path is.
+ *
+ * MLX-VLM (kind 'mlx-vlm') is excluded here PRECAUTIONARILY, not on a fresh live
+ * reproduction: it's the very same `mlx_vlm` package Rapid-MLX vendors, and the
+ * gemma3n/gemma4 audio-tower source (including the same `sanitize()` transpose) is
+ * still present at the currently-pinned version — but this was verified by reading
+ * the installed package's source, not by loading a live audio-tower model end to end.
+ * Treat this exclusion as untested-but-likely-still-broken; remove it if a future
+ * mlx-vlm release fixes the underlying bug and someone reverifies live.
  */
 export function engineRejectsAudioModel(engineKind: string): boolean {
-  return engineKind === 'rapid-mlx'
+  return engineKind === 'rapid-mlx' || engineKind === 'mlx-vlm'
 }
 
 /**
@@ -58,11 +68,24 @@ export function engineRejectsAudioModel(engineKind: string): boolean {
  * "default", always accepted for whatever model is currently serving regardless of what
  * was passed on the command line. Returns null when the engine ignores the field and the
  * original value should be kept.
+ *
+ * MLX-VLM is a THIRD shape, distinct from both of the above: it neither ignores the
+ * field nor accepts a fixed alias — it resolves `model` as a real, load-bearing model
+ * path/repo id on every request (verified live: passed straight to
+ * `get_cached_model(model_path, ...)`, cached by `(model_path, adapter_path, kind)`,
+ * loaded on demand if not already cached). There is no fixed literal that works
+ * regardless of which model is loaded, so callers must pass the actual local model
+ * directory path — the same value used to launch the engine (`StartOpts.modelPath` /
+ * `Manager.currentOpts()?.modelPath`), NOT TurboLLM's internal display-name `model.key`.
+ * That's why this function takes an optional `modelPath` — every call site must thread
+ * it through for the 'mlx-vlm' case (falls back to null, same as an unrecognized/ignoring
+ * engine, if the caller has none available).
  */
 export const ENGINE_MODEL_ALIAS = 'default_model'
 export const RAPID_MLX_MODEL_ALIAS = 'default'
-export function engineModelAlias(engineKind: string): string | null {
+export function engineModelAlias(engineKind: string, modelPath?: string | null): string | null {
   if (engineKind === 'rapid-mlx') return RAPID_MLX_MODEL_ALIAS
+  if (engineKind === 'mlx-vlm') return modelPath ?? null
   return engineKind === 'mlx' || engineKind === 'vllm' || engineKind === 'sglang' ? ENGINE_MODEL_ALIAS : null
 }
 

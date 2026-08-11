@@ -9,6 +9,7 @@ import type { ConfigStore, Engine } from '../config/config'
 import type { LoadProfile } from '../models/profile'
 import { mlxServerCommand } from './mlx'
 import { rapidMlxServerCommand } from './rapid-mlx'
+import { mlxVlmServerCommand } from './mlx-vlm'
 import { koboldcppServerCommand } from './koboldcpp'
 import { llamafileServerCommand } from './llamafile'
 import { slotCacheDir } from './slot-cache'
@@ -648,12 +649,18 @@ export class Manager {
     for (;;) {
       await sleep(500)
       if (this.child !== child || this.state !== 'starting') return
-      // Python engines (mlx/vllm) load the model in a background thread AFTER the HTTP
-      // socket binds, so /v1/models answers 200 even when the load crashed — which would
-      // otherwise flip us to "running" and then hang every request forever on a dead
-      // generation thread. Detect a fatal load-failure traceback in the log and surface
-      // it as an engine error instead. (Checked before probeReady so we win the race.)
-      if (kind === 'mlx' || kind === 'rapid-mlx' || kind === 'vllm' || kind === 'sglang') {
+      // mlx/vllm load the model in a background thread AFTER the HTTP socket binds, so
+      // /v1/models answers 200 even when the load crashed — which would otherwise flip
+      // us to "running" and then hang every request forever on a dead generation
+      // thread. mlx-vlm's own --model preload is actually synchronous (blocks the ASGI
+      // lifespan startup, so the socket never even binds on a preload failure — see
+      // mlxVlmServerCommand's docblock) and a plain process exit already surfaces via
+      // the exit handler above with a generic message; we still check it here because
+      // this path additionally recovers the real traceback line (e.g. "Failed to load
+      // model: ...") for a much more useful error than "exited unexpectedly". Detect a
+      // fatal load-failure traceback in the log and surface it as an engine error
+      // instead. (Checked before probeReady so we win the race.)
+      if (kind === 'mlx' || kind === 'rapid-mlx' || kind === 'mlx-vlm' || kind === 'vllm' || kind === 'sglang') {
         const loadErr = detectPyLoadFailure(readTail(this.logPathStr, 200))
         if (loadErr) {
           if (this.child === child && this.state === 'starting') {
@@ -731,6 +738,12 @@ function engineCommand(opts: StartOpts, port: number, slotSavePath?: string): { 
     // it has no launch-time sampling flags to pass (per-request only, vLLM-style).
     return rapidMlxServerCommand(opts.engine.binPath, opts.modelPath, port, '127.0.0.1')
   }
+  if (opts.engine.kind === 'mlx-vlm') {
+    // MLX-VLM: run the mlx_vlm.server OpenAI server via the provisioned venv python.
+    // No launch-time sampling flags exist (per-request only, like Rapid-MLX/vLLM) —
+    // opts.extraArgs is never used here.
+    return mlxVlmServerCommand(opts.engine.binPath, opts.modelPath, port, '127.0.0.1')
+  }
   if (opts.engine.kind === 'vllm') {
     // vLLM: run the OpenAI server via the provisioned venv python. modelPath is an
     // HF repo id or a local safetensors dir; llama.cpp LoadProfile flags don't apply,
@@ -781,7 +794,7 @@ const READINESS_TIMEOUT_MS = 600_000
  *     `/v1/models` (which calls huggingface_hub `scan_cache_dir()`) doesn't crash with
  *     CacheNotFound when `~/.cache/huggingface/hub` is absent. */
 function pyEngineEnv(kind: string, dataDir: string, binPath: string): NodeJS.ProcessEnv | undefined {
-  if (kind !== 'mlx' && kind !== 'rapid-mlx' && kind !== 'vllm' && kind !== 'sglang') {
+  if (kind !== 'mlx' && kind !== 'rapid-mlx' && kind !== 'mlx-vlm' && kind !== 'vllm' && kind !== 'sglang') {
     if (process.platform === 'win32') return undefined
     const dir = dirname(binPath)
     // Append the existing value only if it's non-empty — glibc's dynamic linker treats an

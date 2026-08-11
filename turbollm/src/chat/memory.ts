@@ -83,7 +83,7 @@ export async function extractMemoryFacts(d: Deps, convId: string, userText: stri
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: engineModelAlias(d.registry.active()?.kind ?? '') ?? ms.model?.key,
+          model: engineModelAlias(d.registry.active()?.kind ?? '', d.manager.currentOpts()?.modelPath) ?? ms.model?.key,
           messages: [{ role: 'user', content: extractionPrompt(userText) }],
           stream: false,
           temperature: 0.2,

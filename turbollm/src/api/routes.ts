@@ -36,6 +36,7 @@ import {
 import type { BackendId } from '../engines/download'
 import { ensureMlxEnv, mlxSamplingArgs } from '../engines/mlx'
 import { ensureRapidMlxEnv } from '../engines/rapid-mlx'
+import { ensureMlxVlmEnv } from '../engines/mlx-vlm'
 import { ensureVllmEnv } from '../engines/vllm'
 import { ensureSglangEnv } from '../engines/sglang'
 import { ensureKoboldcpp, koboldcppBinPath, koboldcppDir, koboldcppProfileToArgs } from '../engines/koboldcpp'
@@ -449,6 +450,30 @@ export function registerApi(app: Hono, d: Deps): void {
     return c.json({ accepted: true, engine: 'rapid-mlx' }, 202)
   })
 
+  // Provision the MLX-VLM engine (macOS-only): uv → venv → mlx-vlm, then register as a
+  // kind='mlx-vlm' engine. 202 + progress via /status. ?update=1 upgrades to the latest
+  // release (passes --upgrade to uv pip install). Mirrors the MLX/Rapid-MLX endpoints above.
+  app.post('/api/v1/engines/mlx-vlm', (c) => {
+    if (process.platform !== 'darwin') {
+      return err(c, 409, 'unsupported_platform', 'MLX-VLM is only available on macOS (Apple Silicon).')
+    }
+    { const busy = engineWorkBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
+    const root = join(d.store.dir(), 'engines')
+    const upgrade = c.req.query('update') === '1'
+    void (async () => {
+      try {
+        d.provision.start('mlx-vlm')
+        const rt = await ensureMlxVlmEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), upgrade)
+        const eng = d.registry.addMlxVlm(`MLX-VLM (${rt.version})`, rt.python, rt.version)
+        d.registry.activate(eng.id)
+        d.provision.done()
+      } catch (e) {
+        d.provision.fail(`Could not install MLX-VLM: ${e instanceof Error ? e.message : e}`)
+      }
+    })()
+    return c.json({ accepted: true, engine: 'mlx-vlm' }, 202)
+  })
+
   // Engine catalog (ADR-044): the hardcoded, browsable list of installable
   // engines for this platform. Per-entry `installed` is disk-based (files exist);
   // `enabled` is registry-based (a registered engine entry exists for this kind).
@@ -460,7 +485,7 @@ export function registerApi(app: Hono, d: Deps): void {
       let enabled: boolean | undefined
       if (e.provision === 'pip') {
         // pip engines: installed = venv python exists on disk; enabled = registered in registry.
-        // Every pip catalog id names its own venv subdir 1:1 (mlx/rapid-mlx/vllm/sglang).
+        // Every pip catalog id names its own venv subdir 1:1 (mlx/rapid-mlx/mlx-vlm/vllm/sglang).
         const pyPath = join(enginesRoot, e.id, 'venv',
           process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python')
         installed = existsSync(pyPath)
@@ -1211,11 +1236,18 @@ export function registerApi(app: Hono, d: Deps): void {
         return err(c, 409, 'engine_model_mismatch', formatMismatchMessage(active.kind, entry.format))
       }
       if (entry.audio && engineRejectsAudioModel(active.kind)) {
+        const engineLabel = active.kind === 'mlx-vlm' ? 'MLX-VLM' : 'Rapid-MLX'
+        // Rapid-MLX: confirmed live, reproduced end to end (see engineRejectsAudioModel's
+        // docblock). MLX-VLM: same underlying mlx_vlm sanitizer bug, but excluded here
+        // precautionarily from reading the source, not a fresh live reproduction — say so
+        // rather than stating it as flatly settled. Either way, plain MLX (mlx-lm) never
+        // attempts VLM/audio loading, so it's a safe fallback recommendation for both.
+        const certainty = active.kind === 'mlx-vlm' ? 'is expected to fail' : 'fails'
         return err(
           c,
           409,
           'engine_model_mismatch',
-          'Rapid-MLX cannot load models with an audio tower (a confirmed upstream mlx-vlm bug) — switch to the MLX engine instead.',
+          `${engineLabel} cannot load models with an audio tower — the audio encoder ${certainty} due to an upstream mlx-vlm bug in the sanitizer for these architectures. Switch to the MLX engine instead.`,
         )
       }
       let opts: StartOpts
@@ -2322,6 +2354,8 @@ function formatMismatchMessage(engineKind: string, format: 'gguf' | 'mlx'): stri
     return 'The active engine is MLX — pick a safetensors model, or switch to a llama.cpp engine for GGUF.'
   if (engineKind === 'rapid-mlx')
     return 'The active engine is Rapid-MLX — pick a safetensors model, or switch to a llama.cpp engine for GGUF.'
+  if (engineKind === 'mlx-vlm')
+    return 'The active engine is MLX-VLM — pick a safetensors model, or switch to a llama.cpp engine for GGUF.'
   if (engineKind === 'vllm')
     return 'The active engine is vLLM — pick a safetensors / HF model, or switch to a llama.cpp engine for GGUF.'
   // llama.cpp / fork active, model is a safetensors dir.
@@ -2583,6 +2617,7 @@ function regErr(c: Context, e: unknown) {
  *   - pip kind='mlx'        → engines/mlx/venv (and its uv sibling stays; we only
  *                             wipe the venv that holds the package)
  *   - pip kind='rapid-mlx'  → engines/rapid-mlx/venv
+ *   - pip kind='mlx-vlm'    → engines/mlx-vlm/venv
  *   - pip kind='vllm'       → engines/vllm/venv
  *   - TurboQuant fork       → engines/turboquant (detected by its binPath pattern)
  *   - llama.cpp backends    → engines/llama.cpp-{tag}-{id} (via DELETE /backends/:id)
@@ -2603,6 +2638,11 @@ function engineInstallDir(eng: Engine, enginesRoot: string): string | null {
   // pip: rapid-mlx venv
   if (eng.kind === 'rapid-mlx') {
     const d = join(enginesRoot, 'rapid-mlx', 'venv')
+    return inside(d) ? d : null
+  }
+  // pip: mlx-vlm venv
+  if (eng.kind === 'mlx-vlm') {
+    const d = join(enginesRoot, 'mlx-vlm', 'venv')
     return inside(d) ? d : null
   }
   // pip: vllm venv

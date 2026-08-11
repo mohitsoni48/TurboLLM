@@ -35,6 +35,7 @@ function fakeDeps(telemetry: Emitter): { deps: Deps; recorded: Array<Record<stri
     manager: {
       status: () => ({ state: 'running', model: { name: 'Qwen3 8B', key: 'qwen3-8b|Q4|123' } }),
       target: () => 'http://engine.invalid.local:1',
+      currentOpts: () => null,
       generationStart: () => {},
       generationEnd: () => {},
       recordCompletion: () => {},

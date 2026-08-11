@@ -25,6 +25,7 @@ function fakeDeps(opts: { loadedKey: string | null; activeRequests?: number; gat
     status: () => ({ state: 'running', model: current ? { key: current } : null }),
     sessionStats: () => ({ activeRequests: opts.activeRequests ?? 0 }),
     target: () => 'http://engine.invalid.local:1',
+    currentOpts: () => null,
   } as unknown as Manager
   const modelRouter = { loadExplicit: async (key: string) => { loadCalls.push(key); current = key; return { target: 'http://x' } } } as unknown as ModelRouter
   const d = {

@@ -190,6 +190,10 @@ export function installRapidMlx(): Promise<{ accepted: true; engine: 'rapid-mlx'
   return request('/api/v1/engines/rapid-mlx', { method: 'POST', json: {} })
 }
 
+export function installMlxVlm(): Promise<{ accepted: true; engine: 'mlx-vlm' }> {
+  return request('/api/v1/engines/mlx-vlm', { method: 'POST', json: {} })
+}
+
 export function getEngineCatalog(): Promise<EngineCatalog> {
   return request<EngineCatalog>('/api/v1/engines/catalog')
 }
@@ -332,6 +336,11 @@ export function updateMlx(): Promise<{ accepted: true; engine: 'mlx' }> {
 /** Update (upgrade) the Rapid-MLX engine to the latest release (passes --upgrade to uv pip install). */
 export function updateRapidMlx(): Promise<{ accepted: true; engine: 'rapid-mlx' }> {
   return request('/api/v1/engines/rapid-mlx?update=1', { method: 'POST', json: {} })
+}
+
+/** Update (upgrade) the MLX-VLM engine to the latest release (passes --upgrade to uv pip install). */
+export function updateMlxVlm(): Promise<{ accepted: true; engine: 'mlx-vlm' }> {
+  return request('/api/v1/engines/mlx-vlm?update=1', { method: 'POST', json: {} })
 }
 
 /** Update (re-download latest release) the TurboQuant engine. */

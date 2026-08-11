@@ -6,6 +6,7 @@ import {
   ChevronDown,
   Cpu,
   Download,
+  Eye,
   ExternalLink,
   Feather,
   Flame,
@@ -106,6 +107,7 @@ const isOfficialLlama = (binPath: string) => /[\\/]engines[\\/]llama\.cpp-/.test
  *  showed the wrong catalog card as active. */
 export function catalogIdFor(e: Engine): string {
   if (e.kind === 'mlx') return 'mlx'
+  if (e.kind === 'mlx-vlm') return 'mlx-vlm'
   if (e.kind === 'vllm') return 'vllm'
   if (e.kind === 'koboldcpp') return 'koboldcpp'
   if (e.kind === 'llamafile') return 'llamafile'
@@ -121,6 +123,7 @@ export function catalogIdFor(e: Engine): string {
 function buildContextFor(e: Engine, backends: EngineBackends | undefined): string {
   if (e.kind === 'mlx') return 'MLX · Apple Metal'
   if (e.kind === 'rapid-mlx') return 'Rapid-MLX · Apple Metal'
+  if (e.kind === 'mlx-vlm') return 'MLX-VLM · Apple Metal'
   if (e.kind === 'vllm') return 'vLLM'
   if (e.kind === 'koboldcpp') return 'KoboldCpp'
   if (e.kind === 'llamafile') return 'llamafile'
@@ -264,6 +267,18 @@ const ENGINE_META: Record<string, EngineMeta> = {
       '17 tool-call parsers with recovery',
     ],
     cons: ['macOS Apple Silicon only', 'MLX-format models only, no GGUF', 'Beta; single-maintainer project'],
+  },
+  'mlx-vlm': {
+    icon: Eye,
+    tagline: 'Vision-language models on Apple Silicon',
+    format: 'MLX',
+    pros: [
+      'Qwen-VL, Gemma vision, LLaVA and more',
+      "Built on Apple's optimized MLX framework",
+      'Ships an OpenAI-compatible mlx_vlm.server',
+      'One-line install, no compiling',
+    ],
+    cons: ['macOS Apple Silicon only', 'Some architectures need extra deps (torch)', 'Experimental; single-maintainer project'],
   },
   nexa: {
     icon: Cpu,
@@ -709,12 +724,14 @@ function EngineGallery({
     install.vllm.isPending ||
     install.mlx.isPending ||
     install.rapidMlx.isPending ||
+    install.mlxVlm.isPending ||
     install.turboquant.isPending ||
     install.koboldcpp.isPending ||
     install.llamafile.isPending ||
     install.updateVllm.isPending ||
     install.updateMlx.isPending ||
     install.updateRapidMlx.isPending ||
+    install.updateMlxVlm.isPending ||
     install.updateTurboquant.isPending ||
     install.updateKoboldcpp.isPending ||
     install.updateLlamafile.isPending ||
@@ -727,6 +744,7 @@ function EngineGallery({
     if (e.installEndpoint === '/api/v1/engines/vllm') return install.vllm
     if (e.installEndpoint === '/api/v1/engines/mlx') return install.mlx
     if (e.installEndpoint === '/api/v1/engines/rapid-mlx') return install.rapidMlx
+    if (e.installEndpoint === '/api/v1/engines/mlx-vlm') return install.mlxVlm
     if (e.installEndpoint === '/api/v1/engines/turboquant') return install.turboquant
     if (e.installEndpoint === '/api/v1/engines/koboldcpp') return install.koboldcpp
     if (e.installEndpoint === '/api/v1/engines/llamafile') return install.llamafile
@@ -736,6 +754,7 @@ function EngineGallery({
     if (e.installEndpoint === '/api/v1/engines/vllm') return install.updateVllm
     if (e.installEndpoint === '/api/v1/engines/mlx') return install.updateMlx
     if (e.installEndpoint === '/api/v1/engines/rapid-mlx') return install.updateRapidMlx
+    if (e.installEndpoint === '/api/v1/engines/mlx-vlm') return install.updateMlxVlm
     if (e.installEndpoint === '/api/v1/engines/turboquant') return install.updateTurboquant
     if (e.installEndpoint === '/api/v1/engines/koboldcpp') return install.updateKoboldcpp
     if (e.installEndpoint === '/api/v1/engines/llamafile') return install.updateLlamafile

@@ -31,7 +31,7 @@ async function distill(d: Deps, material: string): Promise<DistilledSkill> {
   const ms = d.manager.status()
   const target = d.manager.target()
   if (ms.state !== 'running' || !ms.model || !target) return { name: null, description: null, procedure: null }
-  const model = engineModelAlias(d.registry.active()?.kind ?? '') ?? ms.model.key
+  const model = engineModelAlias(d.registry.active()?.kind ?? '', d.manager.currentOpts()?.modelPath) ?? ms.model.key
   try {
     const res = await fetch(`${target}/v1/chat/completions`, {
       method: 'POST',

@@ -57,7 +57,7 @@ const SORT_PARAM: Record<Exclude<HfSortOption, 'best-match'>, string> = {
  *  - vllm / anything else                                                     → no filter (all HF repos)
  *  Shared by `searchModels` and `browseModels` so the two never drift apart. */
 function libraryFilterFor(engineKind?: string): string {
-  if (engineKind === 'mlx' || engineKind === 'rapid-mlx') return 'filter=mlx&'
+  if (engineKind === 'mlx' || engineKind === 'rapid-mlx' || engineKind === 'mlx-vlm') return 'filter=mlx&'
   if (engineKind === 'vllm') return ''
   return 'filter=gguf&'
 }

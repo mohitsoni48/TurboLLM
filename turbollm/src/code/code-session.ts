@@ -625,7 +625,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
   // The model id the engine expects: an engine may expose an alias (e.g. vLLM) instead of
   // TurboLLM's model key — mirror exactly how chat-routes resolves it.
   const engineKind = d.registry.active()?.kind ?? ''
-  const modelId = engineModelAlias(engineKind) ?? ms.model.key
+  const modelId = engineModelAlias(engineKind, d.manager.currentOpts()?.modelPath) ?? ms.model.key
   // REAL context window from the loaded model (plan §3, point 3) — never a hardcoded 32768.
   const contextWindow = ms.model.ctx > 0 ? ms.model.ctx : 8192
   // Captured once here (rather than re-read as `ms.model.name` at each registration site)
@@ -1999,7 +1999,7 @@ export async function compactCodeSession(params: CompactCodeParams): Promise<Com
   const target = d.manager.target()
   if (!target) throw new Error('model_not_loaded')
   const engineKind = d.registry.active()?.kind ?? ''
-  const modelId = engineModelAlias(engineKind) ?? ms.model.key
+  const modelId = engineModelAlias(engineKind, d.manager.currentOpts()?.modelPath) ?? ms.model.key
   const contextWindow = ms.model.ctx > 0 ? ms.model.ctx : 8192
 
   const { summaryText, messages: effectiveMessages } = resolveEffectiveHistory(d, convId, sessionId)
@@ -2150,7 +2150,7 @@ export async function lookbackPreCompactionHistory(params: LookbackParams): Prom
   const target = d.manager.target()
   if (!target) throw new Error('model_not_loaded')
   const engineKind = d.registry.active()?.kind ?? ''
-  const modelId = engineModelAlias(engineKind) ?? ms.model.key
+  const modelId = engineModelAlias(engineKind, d.manager.currentOpts()?.modelPath) ?? ms.model.key
   const contextWindow = ms.model.ctx > 0 ? ms.model.ctx : 8192
 
   // Everything up to and including the cut, from the FULL (never-deactivated-by-compaction) DB

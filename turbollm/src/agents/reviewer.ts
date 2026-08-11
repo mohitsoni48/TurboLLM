@@ -37,7 +37,7 @@ export async function reviewConversation(
   if (ms.state !== 'running' || !ms.model || !target) return { lesson: null, evidence: null }
 
   const convoText = transcript.map((m) => `${m.role.toUpperCase()}: ${m.content}`).join('\n').slice(0, 24_000)
-  const model = engineModelAlias(d.registry.active()?.kind ?? '') ?? ms.model.key
+  const model = engineModelAlias(d.registry.active()?.kind ?? '', d.manager.currentOpts()?.modelPath) ?? ms.model.key
 
   try {
     const res = await fetch(`${target}/v1/chat/completions`, {
