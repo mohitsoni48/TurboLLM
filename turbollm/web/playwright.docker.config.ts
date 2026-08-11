@@ -10,6 +10,12 @@ import { defineConfig, devices } from '@playwright/test'
 export default defineConfig({
   testDir: './e2e-onboarding',
   fullyParallel: false, // shared tmpfs ~/.turbollm — tests must not race each other
+  // `fullyParallel: false` alone only serializes tests WITHIN one file — Playwright still
+  // defaults to multiple WORKERS across separate spec files, which is exactly a second race
+  // on the same shared daemon/tmpfs. Invisible while wizard.spec.ts was the only file; adding
+  // deep-flow.spec.ts immediately produced cross-file interference (DOM-detached timeouts,
+  // navigation assertions racing another file's page.goto). One worker for the whole run.
+  workers: 1,
   retries: 0,
   reporter: 'list',
   use: {

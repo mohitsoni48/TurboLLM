@@ -17,7 +17,26 @@
 #     `node_modules` is deliberately NOT copied from the host: on a Windows
 #     host it would carry Windows-compiled native bindings into this Linux
 #     image, so it is always installed fresh in-container instead.
+#   * libvulkan1/libgomp1 (matching Dockerfile.nvidia's own runtime deps):
+#     without them, a real llama.cpp engine binary downloaded and extracted
+#     during onboarding's automatic engine-provision step fails to even run
+#     `--version`/`--help` — the daemon reports this generically as "check
+#     your connection," which reads as a network problem but is actually a
+#     missing-shared-library one. Found live in a manually-driven onboarding
+#     test session (outbound HTTPS from inside the container was confirmed
+#     working the whole time). Still CPU-only, no CUDA/GPU layer — that is a
+#     deliberate scope choice, not something these two packages change.
+#   * These two packages are necessary but were NOT sufficient on their own:
+#     the actual root cause of engine-execution failures turned out to be
+#     Docker's tmpfs defaulting to `noexec`, which blocks execve on anything
+#     extracted into ~/.turbollm regardless of file permission bits (EACCES,
+#     even with correct rwxr-xr-x). See docker-compose.test.yaml's `,exec`
+#     tmpfs option — that's the actual fix; these packages just cover real
+#     (separate) missing shared libraries the binary also needs.
 FROM node:22-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl ca-certificates libvulkan1 libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
 COPY turbollm/package*.json ./
@@ -35,6 +54,11 @@ RUN npm install --no-save @playwright/test@1.48.0 \
 COPY turbollm/web/e2e-onboarding ./e2e-onboarding
 COPY turbollm/web/playwright.docker.config.ts ./playwright.docker.config.ts
 COPY test/fixtures/ /fixtures/
+# COPY from a Windows host never carries the exec bit — probe.ts execFiles this
+# stub directly (no `node` prefix), so without +x every E2E test that reaches
+# Load/TuneOffer/Payoff would fail at the "point at your own engine binary"
+# registration step with a real, but misleading, "binary not executable" error.
+RUN chmod +x /fixtures/stub-llama-server.mjs
 
 ENV TURBOLLM_TEST=1
 CMD ["node", "/fixtures/entrypoint.mjs"]

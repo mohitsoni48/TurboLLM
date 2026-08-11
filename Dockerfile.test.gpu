@@ -1,0 +1,46 @@
+# GPU-enabled variant of Dockerfile.test, for a HUMAN manually clicking
+# through onboarding with real hardware detection and a real engine load —
+# NOT used by the automated Playwright suite, which stays on the lightweight
+# CPU-only Dockerfile.test (docker-compose.test.yaml still points there).
+#
+# Differences from Dockerfile.test:
+#   * Base is nvidia/cuda:12.6.3-runtime-ubuntu22.04 (matches Dockerfile.nvidia's
+#     real runtime stage) instead of plain node:22-bookworm, with Node 22
+#     installed via NodeSource on top — CUDA base images don't ship Node.
+#   * Requires `docker run --gpus all` (NVIDIA Container Toolkit / Docker
+#     Desktop's WSL2 GPU passthrough) to actually see a GPU inside.
+#   * Deliberately does NOT pre-provision an engine at build time the way
+#     Dockerfile.nvidia does (Docker builds can't see the host GPU anyway,
+#     hence that Dockerfile's own TURBOLLM_SEED_BACKEND=vulkan build-time
+#     workaround) — provisioning here happens LIVE, driven by onboarding's
+#     own WelcomeStep, since watching that actually work is the point of
+#     using this image instead of the CPU-only one.
+#
+# Everything else — tmpfs config reset, fixture HF server, TURBOLLM_LAN_BIND
+# opt-in for host reachability — is identical to Dockerfile.test; see its
+# header comment for that reasoning.
+FROM nvidia/cuda:12.6.3-runtime-ubuntu22.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl ca-certificates libvulkan1 libgomp1 \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY turbollm/package*.json ./
+RUN npm ci
+COPY turbollm/dist ./dist
+COPY turbollm/bin ./bin
+
+# Playwright + its browser — not the primary use case for this image (that's
+# a human in a real browser), but cheap to keep available/consistent with
+# Dockerfile.test.
+RUN npm install --no-save @playwright/test@1.48.0 \
+    && npx --yes playwright@1.48.0 install --with-deps chromium
+
+COPY turbollm/web/e2e-onboarding ./e2e-onboarding
+COPY turbollm/web/playwright.docker.config.ts ./playwright.docker.config.ts
+COPY test/fixtures/ /fixtures/
+
+ENV TURBOLLM_TEST=1
+CMD ["node", "/fixtures/entrypoint.mjs"]

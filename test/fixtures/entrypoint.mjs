@@ -14,8 +14,21 @@ fixture.on('error', (err) => {
 // Start the daemon (already built inside the image). The real tsup output is
 // dist/cli.js (see turbollm/package.json's "build" script) — dist/index.js
 // does not exist and this line never actually started a daemon until fixed.
+//
+// Default bind is loopback-only (the container's own default config, since
+// there is nothing seeding daemon.lanBind=true the way the distribution
+// Dockerfiles do) — correct for the automated Playwright suite, which runs
+// INSIDE this same container and never crosses the Docker NAT boundary.
+// Set TURBOLLM_LAN_BIND=1 to additionally pass --addr 0.0.0.0:6996 for a
+// manual `docker run -p 6996:6996 ...` session: Docker's port forwarding
+// cannot deliver host-side connections to a loopback-bound listener, so a
+// bare loopback bind here otherwise accepts the TCP handshake at the
+// docker-proxy layer and then silently hangs/empty-replies past it. Still
+// port 6996 either way — this widens the bind interface, not the port.
 const { spawn } = await import('node:child_process')
-const daemon = spawn('node', ['dist/cli.js', '--no-open'], {
+const daemonArgs = ['dist/cli.js', '--no-open']
+if (process.env.TURBOLLM_LAN_BIND === '1') daemonArgs.push('--addr', '0.0.0.0:6996')
+const daemon = spawn('node', daemonArgs, {
   stdio: ['ignore', 'pipe', 'pipe'],
   cwd: '/src',
   env: { ...process.env, FIXTURE_MODE: process.env.FIXTURE_MODE ?? 'happy' },

@@ -8,8 +8,19 @@ services:
     container_name: turbollm-test
     # The whole point: a wipeable data dir that is NOT a second host data
     # directory. Destroyed when the container stops, every run starts clean.
+    # `exec` matters: Docker's tmpfs defaults to noexec, which silently blocks
+    # any engine binary downloaded/extracted into this dir from ever running
+    # (EACCES on execve despite correct rwxr-xr-x bits — found live via a
+    # manually-driven GPU test container, see Dockerfile.test.gpu's history).
+    # Size: downloads.ts's assertDisk() pre-check compares free space against the
+    # blessed catalog's DECLARED size (e.g. ~4.6 GB for the T0 Gemma-4-E4B entry),
+    # not against what the fixture HF server actually serves (a ~1 KB fake file) —
+    # 512m 400'd every real ModelStep download attempt before it ever reached the
+    # fixture. This is tmpfs (RAM), not disk, and stays near-empty regardless of
+    # the size limit since the served bytes are tiny — 20g only raises the ceiling
+    # the check compares against, generously covering the largest blessed entry.
     tmpfs:
-      - /root/.turbollm:size=512m
+      - /root/.turbollm:size=20g,exec
     environment:
       # Selects an injected failure; unset means the happy path.
       - FIXTURE_MODE=
