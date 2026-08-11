@@ -9,7 +9,7 @@ import type { OnboardingCtx } from '../../../lib/onboarding/types'
 // not the "did save() actually resolve before navigating" ordering itself — that needs
 // mocked, controllable promises, not a real daemon round trip.
 
-const settingsMock = vi.hoisted(() => ({ data: undefined as { code?: { defaultAgent: string } } | undefined }))
+const settingsMock = vi.hoisted(() => ({ data: undefined as { code?: { defaultAgent?: string } } | undefined }))
 const statusMock = vi.hoisted(() => ({ data: undefined as { terminalAvailable?: boolean } | undefined }))
 const saveMock = vi.hoisted(() => ({ isPending: false, mutateAsync: vi.fn().mockResolvedValue(undefined) }))
 const completeOnboardingMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined))
@@ -40,19 +40,29 @@ function renderPayoff(ctx: Partial<OnboardingCtx> = {}) {
   render(<PayoffStep onContinue={vi.fn()} onSkip={vi.fn()} ctx={{ ...baseCtx, ...ctx }} />)
 }
 
-describe('PayoffStep — Developer hands off to the real Code launchpad, never fabricates a session', () => {
+describe('PayoffStep — Developer coding-agent picker seeds from the real server default', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    settingsMock.data = { code: { defaultAgent: 'turbollm' } }
     statusMock.data = { terminalAvailable: true }
   })
 
-  it('defaults to claude when a terminal backend is available — the founder-requested default', () => {
+  it('defaults to claude on a fresh install with no stored agent preference yet — the founder-requested default', () => {
+    settingsMock.data = { code: {} } // no defaultAgent recorded — genuinely fresh
     renderPayoff()
     expect(screen.getByLabelText('Coding agent')).toHaveValue('claude')
   })
 
+  it('seeds from the actual stored preference on a returning install — does not always force claude', () => {
+    // Found by an Opus release-review pass: the picker used to start hardcoded 'claude'
+    // regardless of what the server already had, contradicting this file's own "never
+    // clobbers a returning user's own preference" comment.
+    settingsMock.data = { code: { defaultAgent: 'turbollm' } }
+    renderPayoff()
+    expect(screen.getByLabelText('Coding agent')).toHaveValue('turbollm')
+  })
+
   it('is hidden entirely when this install has no terminal backend (ADR-239) — falls back to turbollm silently', async () => {
+    settingsMock.data = { code: { defaultAgent: 'turbollm' } }
     statusMock.data = { terminalAvailable: false }
     renderPayoff()
     expect(screen.queryByLabelText('Coding agent')).toBeNull()
@@ -60,18 +70,26 @@ describe('PayoffStep — Developer hands off to the real Code launchpad, never f
     await user.click(screen.getByRole('button', { name: 'Open Code' }))
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith('/workspace/code'))
     // No agent picker shown → effectiveAgent falls back to the first offered agent
-    // (turbollm) — never silently sends 'claude' to a session that can't launch it.
-    expect(saveMock.mutateAsync).not.toHaveBeenCalled() // already 'turbollm', nothing to change
+    // (turbollm), which already matches the server default — nothing to save.
+    expect(saveMock.mutateAsync).not.toHaveBeenCalled()
   })
 
   it('is not shown at all for non-Developer profiles', () => {
+    settingsMock.data = { code: { defaultAgent: 'turbollm' } }
     renderPayoff({ profile: 'casual' })
     expect(screen.queryByLabelText('Coding agent')).toBeNull()
     expect(screen.getByRole('button', { name: 'Start chatting' })).toBeInTheDocument()
   })
+})
 
-  it('saves the picked agent as the server default BEFORE navigating to Code, only when it actually changed', async () => {
-    // settingsQ starts at 'turbollm'; picker defaults to 'claude' → a real change.
+describe('PayoffStep — Developer hands off to the real Code launchpad, never fabricates a session', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    statusMock.data = { terminalAvailable: true }
+  })
+
+  it('saves the seeded claude default as the server default BEFORE navigating, on a genuinely fresh install', async () => {
+    settingsMock.data = { code: {} } // no defaultAgent yet → seeded 'claude' really is a change
     const user = userEvent.setup()
     renderPayoff()
     const callOrder: string[] = []
@@ -85,8 +103,8 @@ describe('PayoffStep — Developer hands off to the real Code launchpad, never f
     expect(callOrder).toEqual(['save', 'navigate'])
   })
 
-  it('does NOT call save() when the picked agent already matches the server default', async () => {
-    settingsMock.data = { code: { defaultAgent: 'claude' } } // already claude, matching the picker's default
+  it('does NOT call save() when the seeded/stored agent already matches — no pointless write', async () => {
+    settingsMock.data = { code: { defaultAgent: 'claude' } }
     const user = userEvent.setup()
     renderPayoff()
     await user.click(screen.getByRole('button', { name: 'Open Code' }))
@@ -94,14 +112,15 @@ describe('PayoffStep — Developer hands off to the real Code launchpad, never f
     expect(saveMock.mutateAsync).not.toHaveBeenCalled()
   })
 
-  it('respects an explicit agent selection over the default', async () => {
+  it('respects an explicit agent selection over the seeded default, and saves it', async () => {
+    settingsMock.data = { code: { defaultAgent: 'claude' } } // seeds picker to 'claude'
     const user = userEvent.setup()
     renderPayoff()
+    expect(screen.getByLabelText('Coding agent')).toHaveValue('claude')
     await user.selectOptions(screen.getByLabelText('Coding agent'), 'turbollm')
     await user.click(screen.getByRole('button', { name: 'Open Code' }))
     await waitFor(() => expect(navigateMock).toHaveBeenCalled())
-    // Already 'turbollm' server-side (beforeEach default) — no save needed.
-    expect(saveMock.mutateAsync).not.toHaveBeenCalled()
+    expect(saveMock.mutateAsync).toHaveBeenCalledWith({ code: { defaultAgent: 'turbollm' } })
   })
 
   it('never creates a Code session itself — hands off to the real launchpad instead, no repo or task guessed', async () => {
@@ -109,6 +128,7 @@ describe('PayoffStep — Developer hands off to the real Code launchpad, never f
     // '.', task: '<canned string>'}) directly, guessing a repo path and a task nobody
     // asked for. It must not call any session-creation API at all — only navigate to
     // the real picker.
+    settingsMock.data = { code: { defaultAgent: 'claude' } }
     const user = userEvent.setup()
     renderPayoff()
     await user.click(screen.getByRole('button', { name: 'Open Code' }))
@@ -119,6 +139,7 @@ describe('PayoffStep — Developer hands off to the real Code launchpad, never f
   })
 
   it('completes onboarding and navigates straight to the Code launchpad in one click — no intermediate "done" screen', async () => {
+    settingsMock.data = { code: { defaultAgent: 'claude' } }
     const user = userEvent.setup()
     renderPayoff()
     await user.click(screen.getByRole('button', { name: 'Open Code' }))
@@ -129,6 +150,7 @@ describe('PayoffStep — Developer hands off to the real Code launchpad, never f
   })
 
   it('never completes onboarding or navigates when saving the picked agent fails — stays put with a retryable error', async () => {
+    settingsMock.data = { code: {} } // no defaultAgent yet → save is attempted
     saveMock.mutateAsync.mockRejectedValue(new Error('boom'))
     const user = userEvent.setup()
     renderPayoff()
@@ -155,11 +177,50 @@ describe('PayoffStep — non-developer profiles', () => {
     expect(completeOnboardingMock).toHaveBeenCalledTimes(1)
   })
 
-  it('exploring models or visiting the site also completes onboarding first', async () => {
+  it('exploring models completes onboarding first, then navigates', async () => {
     const user = userEvent.setup()
     renderPayoff({ profile: 'casual' })
     await user.click(screen.getByRole('button', { name: 'Explore models' }))
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith('/models'))
     expect(completeOnboardingMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('surfaces an error rather than silently no-opping when completing onboarding fails', async () => {
+    // Found by an Opus release-review pass: this and "Visit turbollm.dev" had no error
+    // handling at all — a rejected completeOnboarding() was an unhandled rejection and a
+    // button that silently did nothing. Fresh render (not reusing the success-path
+    // instance above) — the in-flight guard never resets after a successful click, same as
+    // the primary "start" button's own `startedRef`, since a successful click normally
+    // navigates the component away entirely.
+    completeOnboardingMock.mockRejectedValueOnce(new Error('boom'))
+    const user = userEvent.setup()
+    renderPayoff({ profile: 'casual' })
+    await user.click(screen.getByRole('button', { name: 'Explore models' }))
+    await waitFor(() => expect(screen.getByText('boom')).toBeInTheDocument())
+    expect(navigateMock).not.toHaveBeenCalled()
+  })
+
+  it('visiting the site opens the tab synchronously — before completeOnboarding is even called — so it is never popup-blocked', async () => {
+    // Found by an Opus release-review pass: `window.open` only survives the popup blocker
+    // inside the synchronous task derived from the click gesture — calling it AFTER an
+    // `await completeOnboarding()` loses that gesture and gets silently blocked. This
+    // regressed working behavior from the deleted DoneStep, which opened the tab
+    // synchronously. Captured directly inside window.open's own mock (not via a shared
+    // array racing an async boundary) — how many times completeOnboarding has been called
+    // AT THE INSTANT open() runs is the real proof of ordering.
+    let completeCallsWhenOpened = -1
+    const openMock = vi.spyOn(window, 'open').mockImplementation(() => {
+      completeCallsWhenOpened = completeOnboardingMock.mock.calls.length
+      return null
+    })
+
+    const user = userEvent.setup()
+    renderPayoff({ profile: 'casual' })
+    await user.click(screen.getByRole('button', { name: 'Visit turbollm.dev' }))
+
+    expect(openMock).toHaveBeenCalledWith('https://turbollm.dev', '_blank', 'noopener,noreferrer')
+    expect(completeCallsWhenOpened).toBe(0)
+    await waitFor(() => expect(completeOnboardingMock).toHaveBeenCalledTimes(1))
+    openMock.mockRestore()
   })
 })

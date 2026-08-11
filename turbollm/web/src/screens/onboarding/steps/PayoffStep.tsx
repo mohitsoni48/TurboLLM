@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { ExternalLink, Loader2, Rocket, Sparkles, Terminal } from 'lucide-react'
 import { createConversation } from '../../../lib/chat-api'
@@ -58,7 +58,25 @@ export default function PayoffStep({ ctx }: StepComponentProps) {
   // the built-in only when this install genuinely has no terminal backend to run it in.
   const terminalAvailable = statusQ.data?.terminalAvailable !== false
   const agents = availableCodeAgents(terminalAvailable)
-  const [selectedAgent, setSelectedAgent] = useState<CodeAgent>('claude')
+  const [selectedAgent, setSelectedAgentState] = useState<CodeAgent>('claude')
+  // Seed from the server's ACTUAL default once it's known, unless the user has already
+  // touched the picker — otherwise a returning user with a real preference (e.g.
+  // 'turbollm') sees the picker default to 'claude' and then has that preference silently
+  // overwritten below, exactly the clobber this file's own "never clobbers a returning
+  // user's own preference" comment claimed didn't happen. Found by an Opus release-review
+  // pass: `selectedAgent` started hardcoded 'claude', so the "only writes when changing"
+  // check below was always comparing against the wrong baseline. A genuinely fresh install
+  // (no `defaultAgent` recorded yet) still lands on 'claude', matching the founder's ask.
+  const userPickedAgentRef = useRef(false)
+  useEffect(() => {
+    if (userPickedAgentRef.current) return
+    const serverDefault = settingsQ.data?.code?.defaultAgent as CodeAgent | undefined
+    if (serverDefault) setSelectedAgentState(serverDefault)
+  }, [settingsQ.data])
+  const setSelectedAgent = (agent: CodeAgent) => {
+    userPickedAgentRef.current = true
+    setSelectedAgentState(agent)
+  }
   const effectiveAgent = agents.some((a) => a.id === selectedAgent) ? selectedAgent : (agents[0]?.id ?? 'turbollm')
 
   const start = async () => {
@@ -95,14 +113,40 @@ export default function PayoffStep({ ctx }: StepComponentProps) {
     }
   }
 
+  // Shared with `start`'s own double-click guard in spirit (see its comment) but kept as
+  // a separate ref: these two buttons are mutually exclusive with each other and with the
+  // primary action, not synchronized to `starting`/`startedRef` above.
+  const secondaryStartedRef = useRef(false)
+
   const exploreModels = async () => {
-    await completeOnboarding()
-    navigate('/models')
+    if (secondaryStartedRef.current) return
+    secondaryStartedRef.current = true
+    try {
+      await completeOnboarding()
+      navigate('/models')
+    } catch (e) {
+      // Found by an Opus release-review pass: this and `visitSite` below had no error
+      // handling at all — a rejected completeOnboarding() (daemon hiccup, auth expiry)
+      // was an unhandled promise rejection and a button that silently did nothing.
+      setError(e instanceof Error ? e.message : 'Could not finish onboarding — try again.')
+      secondaryStartedRef.current = false
+    }
   }
 
-  const visitSite = async () => {
-    await completeOnboarding()
-    window.open('https://turbollm.dev', '_blank')
+  const visitSite = () => {
+    if (secondaryStartedRef.current) return
+    secondaryStartedRef.current = true
+    // Opens SYNCHRONOUSLY, inside the click handler's own call stack — `window.open` only
+    // survives the popup blocker within the user-gesture window, which an `await` before
+    // it consumes. Found by an Opus release-review pass: this regressed working behavior
+    // from the deleted DoneStep, which called `window.open` synchronously in its own
+    // onClick — after the merge, `completeOnboarding()`'s real network round trip ran
+    // first, so the popup blocker silently ate the tab. `noopener` also drops the
+    // reverse-tabnabbing handle the opened page would otherwise get back into this app.
+    window.open('https://turbollm.dev', '_blank', 'noopener,noreferrer')
+    completeOnboarding()
+      .catch((e) => setError(e instanceof Error ? e.message : 'Could not finish onboarding — try again.'))
+      .finally(() => { secondaryStartedRef.current = false })
   }
 
   return (

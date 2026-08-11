@@ -2,8 +2,8 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Check, Compass, Download, ExternalLink, HardDrive, Loader2, Sparkles } from 'lucide-react'
 import { useOnboardingRecommendation } from '../../../lib/onboarding-queries'
-import { useModels } from '../../../lib/queries'
-import { enqueueDownload, loadModel, track } from '../../../lib/api'
+import { useDownloadMutations, useModels } from '../../../lib/queries'
+import { loadModel, track } from '../../../lib/api'
 import { useOnboardingMachine } from '../../../lib/onboarding/useOnboardingMachine'
 import type { StepComponentProps } from '../OnboardingScreen'
 
@@ -19,6 +19,7 @@ export default function ModelStep({ onContinue, ctx }: StepComponentProps) {
   const { patchCtx } = useOnboardingMachine()
   const recommendationQuery = useOnboardingRecommendation(ctx.profile)
   const modelsQuery = useModels()
+  const downloadMutations = useDownloadMutations()
   const [starting, setStarting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [selectedKey, setSelectedKey] = useState('')
@@ -82,7 +83,13 @@ export default function ModelStep({ onContinue, ctx }: StepComponentProps) {
       // token." Found live by adversarial QA: the blessed entry's own "Download this" was
       // silently pulling the vision projector alongside every recommended model, since
       // enqueue()'s expansion has no per-caller opt-out by default.
-      const { downloads } = await enqueueDownload({ repo: entry.repo, rfilename: entry.file, excludeMmproj: true })
+      //
+      // The MUTATION, not the raw `enqueueDownload()` API call directly: found by an Opus
+      // release-review pass, live-traced — the raw call never invalidates the downloads
+      // query cache, so LoadStep can mount on the very next render still seeing the
+      // pre-download empty list. `useDownloadMutations().enqueue`'s `onSuccess: invalidate`
+      // refreshes downloads/models/status immediately, closing that window.
+      const { downloads } = await downloadMutations.enqueue.mutateAsync({ repo: entry.repo, rfilename: entry.file, excludeMmproj: true })
       // Stamp the specific download record LoadStep should wait for — its eventual model
       // key isn't known yet (the file doesn't exist to scan), unlike `expectedModelKey`
       // below, so this is a download ID instead. Without it, LoadStep's fallback ("the

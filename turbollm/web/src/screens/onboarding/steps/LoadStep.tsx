@@ -126,7 +126,17 @@ export default function LoadStep({ onContinue, ctx }: StepComponentProps) {
   // narrower version of the "any model counts" behaviour bug #3 removed:
   // it only engages when there is nothing left to compare against, never
   // when a real expectation or download is actually in flight.
-  const resumedWithNoTrail = !ctx.expectedModelKey && !activeDownload && !finishedDownload && !erroredDownload
+  // `!ctx.expectedDownloadId` too: if ModelStep's real download flow stamped one, we are
+  // DEFINITELY waiting on something even if the (possibly still-stale) downloads cache
+  // hasn't caught up yet — "nothing to load" is never the right read in that case. Found
+  // by an Opus release-review pass, live-traced: `ModelStep.startDownload()`'s raw
+  // `enqueueDownload()` call doesn't invalidate the downloads query cache, so on the very
+  // next render `relevantDownloads` can still reflect the pre-download empty list, making
+  // this condition true for up to the ~2s until App.tsx's poll catches up — a full-screen
+  // "Nothing to load yet" flash immediately after the user clicks Download, on the primary
+  // happy path. See ModelStep.tsx's own fix (switched to the invalidating mutation) for the
+  // other half of this.
+  const resumedWithNoTrail = !ctx.expectedModelKey && !ctx.expectedDownloadId && !activeDownload && !finishedDownload && !erroredDownload
   const isLoaded = Boolean(
     loadedModel && ((expectedKey && loadedModel.key === expectedKey) || resumedWithNoTrail),
   )

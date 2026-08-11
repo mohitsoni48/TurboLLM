@@ -41,6 +41,12 @@ RUN npm install --no-save @playwright/test@1.48.0 \
 COPY turbollm/web/e2e-onboarding ./e2e-onboarding
 COPY turbollm/web/playwright.docker.config.ts ./playwright.docker.config.ts
 COPY test/fixtures/ /fixtures/
+# Same fix Dockerfile.test needed, for the same reason (see its own comment): a COPY from
+# a Windows host never carries the exec bit, and probe.ts execFiles this stub directly —
+# missed here originally (found by an Opus release-review pass), which meant every E2E
+# test that reaches Load/TuneOffer/Payoff on THIS image would fail at engine registration
+# with a misleading "binary not executable" error.
+RUN chmod +x /fixtures/stub-llama-server.mjs
 
 ENV TURBOLLM_TEST=1
 CMD ["node", "/fixtures/entrypoint.mjs"]
