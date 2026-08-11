@@ -32,6 +32,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useReducer,
 import { deriveSteps, reduce } from '../../screens/onboarding/machine'
 import type { ProfileId, StepContext, StepDescriptor } from '../../screens/onboarding/steps/define'
 import { useOnboardingState, useSetOnboardingState } from '../onboarding-queries'
+import { track } from '../api'
 
 const STEP_ID_STORAGE_KEY = 'tllm.onboarding.currentStepId'
 
@@ -41,7 +42,7 @@ const INITIAL_CTX: StepContext = {
   isT0: false,
   recommendationKind: null,
   expectedModelKey: null,
-  payoffDestination: null,
+  expectedDownloadId: null,
   loadCompletedOnce: false,
 }
 
@@ -168,6 +169,9 @@ function useOnboardingMachineState(): UseOnboardingMachineResult {
   )
 
   const completeOnboarding = useCallback(async () => {
+    // ui.ts's UI_ACTIONS already reserves 'finish_onboarding' (spec 25); wired here so it
+    // fires once regardless of WHICH PayoffStep action the user actually clicked.
+    track('onboarding', 'finish_onboarding')
     await setOnboarding.mutateAsync({ status: 'completed' })
     clearSavedStepId()
   }, [setOnboarding])

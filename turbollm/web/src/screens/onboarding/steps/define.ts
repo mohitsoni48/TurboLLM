@@ -29,6 +29,19 @@ export interface StepContext {
    *  advancing the instant ANY model was already loaded in the engine — a
    *  leftover from prior use, unrelated to what this run actually requested. */
   expectedModelKey: string | null
+  /** The id of the specific download record LoadStep should wait for — set by
+   *  ModelStep's real "Download this" path (`startDownload()`) right after
+   *  `enqueueDownload()` returns, since the model's eventual key isn't known
+   *  until the file exists and gets scanned (unlike `expectedModelKey`, which
+   *  IS known upfront for the "use a model I already have" path). Null when
+   *  LoadStep should fall back to matching the most-recent finished download
+   *  instead (the "use existing" path, or a post-reload resume with no trail
+   *  left). Added after `matchedEntry`'s "most recent .done record in the
+   *  WHOLE history" heuristic was found live to match an older, unrelated,
+   *  already-loaded model while a genuinely new download from THIS run was
+   *  still in flight — the wizard advanced instantly to a model that had
+   *  nothing to do with what the user just started downloading. */
+  expectedDownloadId: string | null
   /** True once LoadStep has auto-advanced past load for this session — never
    *  reset. Without this, pressing Back from Payoff (a normal interaction,
    *  not an edge case, now that Payoff no longer exits the wizard
@@ -36,13 +49,6 @@ export interface StepContext {
    *  is already loaded" check and instantly auto-advanced forward again —
    *  Back appeared to silently do nothing. Found by adversarial QA. */
   loadCompletedOnce: boolean
-  /** Where Payoff's real conversation/Code session landed. Done is the step
-   *  that actually completes onboarding and performs the final navigation —
-   *  it needs to know the destination Payoff already created. Added after
-   *  the same QA pass found Payoff completing onboarding and navigating
-   *  directly, which raced OnboardingScreen's own "already done" redirect
-   *  and skipped tune-offer/done entirely, for every profile. */
-  payoffDestination: { kind: 'chat' | 'code'; id: string } | null
 }
 
 export interface StepDescriptor {
