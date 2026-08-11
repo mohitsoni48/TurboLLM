@@ -640,7 +640,7 @@ export const UI_ACTIONS = [
   // step — where people bail is the entire diagnostic value of the funnel.
   'skip_onboarding_welcome', 'skip_onboarding_profile', 'skip_onboarding_model',
   'skip_onboarding_personalize', 'skip_onboarding_profile_extra', 'skip_onboarding_load',
-  'skip_onboarding_payoff', 'skip_onboarding_tune_offer', 'skip_onboarding_done',
+  'skip_onboarding_payoff', 'skip_onboarding_tune_offer',
   'choose_profile', 'start_model_download', 'use_existing_models', 'open_discover_handoff',
   'pick_different_model', 'accept_autotune', 'decline_autotune', 'finish_onboarding',
   'resume_onboarding', 'dismiss_finish_banner', 'take_recovery_action',

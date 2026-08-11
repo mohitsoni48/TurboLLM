@@ -151,6 +151,18 @@ export class Emitter {
     if (this.claim(`harness:${harness}`)) this.emit('harness_first_seen', { harness, protocol })
   }
 
+  /** Emit `onboarding_profile` the first time this install ever picks an onboarding
+   *  persona (spec 25 §8.2, ADR-338 Decision 8) — the cohorting key the whole derived
+   *  funnel breaks down by, so it must fire exactly once per install regardless of how
+   *  many times the user changes their profile afterward in Settings. Same
+   *  once-with-payload shape as {@link harnessFirstSeen}: `once()` only covers the
+   *  no-payload case, so this claims the ledger key itself before emitting, per
+   *  typed-emit.ts's own doc comment on why that's a dedicated method, not a generic one. */
+  onboardingProfileChosen(profile: string): void {
+    if (!this.canSend('onboarding_profile')) return
+    if (this.claim('once:onboarding_profile')) this.emit('onboarding_profile', { profile })
+  }
+
   /**
    * Count one use of `feature` toward today's tally, emitting a bucketed
    * `feature_used_daily` for the previous day the moment the calendar day

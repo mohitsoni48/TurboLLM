@@ -80,6 +80,12 @@ export interface EnqueueInput {
   /** Subdirectory under the primary model dir for the downloaded file. Used for
    *  MLX models whose component files must all land in the same directory. */
   subdir?: string
+  /** Drop any `mmproj`-flagged file the expansion would otherwise pull alongside the chosen
+   *  GGUF (spec 25 §5.4 / ADR-338 Decision 6: "never pull mmproj-*.gguf — pure added download
+   *  before first token"). Onboarding's blessed-catalog downloads are the only caller that
+   *  sets this; Discover's own manual picks are unaffected — a user who explicitly browses
+   *  and downloads a vision model there is choosing that, unlike onboarding's automatic pick. */
+  excludeMmproj?: boolean
 }
 
 export class DownloadError extends Error {
@@ -224,6 +230,7 @@ export class DownloadManager {
 
     const targets = files
       .map((f) => ({ f, dest: join(destDir, basename(f.rfilename)) }))
+      .filter(({ f }) => !(input.excludeMmproj && f.mmproj))
       .filter(({ f, dest }) => {
         // An in-flight/queued job already owns this exact file — never enqueue a second
         // writer for the same .part (double-click, or two quants sharing one mmproj).
@@ -615,18 +622,36 @@ function safePathname(u: string): string {
   }
 }
 
+/** Where real HF resolve URLs are built/parsed against. Overridable ONLY via
+ *  `TURBOLLM_HF_BASE` (set exclusively by docker-compose.test.yaml's E2E harness, never in
+ *  production) so the Docker E2E suite's fixture HF server (test/fixtures/hf-server.mjs) is
+ *  what "the real download and provision code paths run end to end against" — its own
+ *  words. Found live: the env var was declared in the compose file and documented as doing
+ *  this, but nothing in this file ever actually read it — every ModelStep "Download this"
+ *  in that supposedly-isolated container was silently pulling real multi-GB files from
+ *  real huggingface.co the entire time, which is both a real-network dependency the
+ *  harness's own header comment explicitly disclaims and, at the tiny tmpfs sizes involved,
+ *  functionally guaranteed to time out. */
+function hfBaseUrl(): string {
+  const override = process.env.TURBOLLM_HF_BASE?.trim()
+  return override ? override.replace(/\/+$/, '') : 'https://huggingface.co'
+}
+
 /** Recognise an HF resolve URL and pull out the repo + revision + repo-relative file
- *  path: `https://huggingface.co/<owner>/<repo>/resolve/<rev>/<path…>.gguf`. Segments are
- *  URL-decoded (so a `%20` in the path becomes a real space). Returns null for any non-HF
- *  host or a URL that isn't a .gguf resolve link, so those stay raw imports. */
+ *  path: `<hfBaseUrl()>/<owner>/<repo>/resolve/<rev>/<path…>.gguf`. Segments are
+ *  URL-decoded (so a `%20` in the path becomes a real space). Returns null for any host that
+ *  isn't the configured HF base or a URL that isn't a .gguf resolve link, so those stay raw
+ *  imports. */
 function parseHfResolveUrl(u: string): { repo: string; rev: string; rfilename: string } | null {
   let parsed: URL
+  let base: URL
   try {
     parsed = new URL(u)
+    base = new URL(hfBaseUrl())
   } catch {
     return null
   }
-  if (parsed.hostname !== 'huggingface.co') return null
+  if (parsed.hostname !== base.hostname) return null
   const parts = parsed.pathname.split('/').filter(Boolean)
   const ri = parts.indexOf('resolve')
   // Need owner/repo before `resolve`, then a revision, then at least one path segment.
@@ -645,7 +670,7 @@ function parseHfResolveUrl(u: string): { repo: string; rev: string; rfilename: s
  *  space or `#` in a filename survives) while leaving the `/` separators intact. */
 function hfResolveUrl(repo: string, rev: string, rfilename: string): string {
   const enc = (p: string) => p.split('/').map(encodeURIComponent).join('/')
-  return `https://huggingface.co/${enc(repo)}/resolve/${encodeURIComponent(rev)}/${enc(rfilename)}`
+  return `${hfBaseUrl()}/${enc(repo)}/resolve/${encodeURIComponent(rev)}/${enc(rfilename)}`
 }
 
 /** Sanitise an HF repo id (`owner/name`) into a safe relative subdirectory: forward

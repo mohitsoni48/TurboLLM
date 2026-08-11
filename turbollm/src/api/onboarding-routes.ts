@@ -18,6 +18,7 @@ import {
 import { recommend, type HardwareFacts } from '../onboarding/recommend'
 import { getSysInfo } from '../sysinfo/sysinfo'
 import type { ConfigStore } from '../config/config'
+import type { Emitter } from '../telemetry/emit'
 
 export interface OnboardingPatch {
   status?: string
@@ -70,7 +71,7 @@ export function applyOnboardingPatch(
 
 export function registerOnboardingRoutes(
   app: Hono,
-  deps: { store: ConfigStore },
+  deps: { store: ConfigStore; telemetry?: Emitter },
 ): void {
   app.get('/api/v1/onboarding', (c) => c.json(normalizeOnboarding(deps.store.snapshot().onboarding)))
 
@@ -79,6 +80,11 @@ export function registerOnboardingRoutes(
     const current = normalizeOnboarding(deps.store.snapshot().onboarding)
     const next = applyOnboardingPatch(current, body, Date.now())
     deps.store.update((cfg) => { cfg.onboarding = next })
+    // spec 25 §8.2 / ADR-338 Decision 8, wired by ADR-350: the cohorting key the whole
+    // derived funnel breaks down by. Guarded once-ever inside the Emitter itself, so
+    // calling this on every PUT that carries a profile (not just the very first) is
+    // safe — a returning user changing their profile in Settings never double-counts.
+    if (next.profile) deps.telemetry?.onboardingProfileChosen(next.profile)
     return c.json(next)
   })
 

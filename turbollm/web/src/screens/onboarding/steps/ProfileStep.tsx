@@ -1,5 +1,6 @@
 import { Code, Rocket, Sparkles, User, Users } from 'lucide-react'
 import { useOnboardingMachine } from '../../../lib/onboarding/useOnboardingMachine'
+import { track } from '../../../lib/api'
 import type { ProfileId } from '../../../lib/onboarding/types'
 import type { StepComponentProps } from '../OnboardingScreen'
 
@@ -61,7 +62,7 @@ export default function ProfileStep({ onContinue, ctx }: StepComponentProps) {
                   ? 'border-accent bg-accent/5 hover:bg-accent/10'
                   : 'border-border bg-panel hover:border-accent/30 hover:bg-panel-2'
               }`}
-              onClick={() => setProfile(profile.id)}
+              onClick={() => { track('onboarding', 'choose_profile'); setProfile(profile.id) }}
               role="radio"
               aria-checked={selected}
             >

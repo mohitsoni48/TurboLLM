@@ -2129,7 +2129,7 @@ export function registerApi(app: Hono, d: Deps): void {
 
   // Enqueue from an HF repo file {repo, rfilename} OR a raw URL {url}. 202.
   app.post('/api/v1/downloads', async (c) => {
-    const b = await body<{ repo?: string; rfilename?: string; url?: string; size?: number; sha256?: string; subdir?: string }>(c)
+    const b = await body<{ repo?: string; rfilename?: string; url?: string; size?: number; sha256?: string; subdir?: string; excludeMmproj?: boolean }>(c)
     try {
       // One request may fan out into several files (split shards + a shared mmproj) —
       // return every record created so the UI reflects the full queued set.
@@ -2259,7 +2259,7 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   // ---- onboarding (spec 25 §9.2) ----
-  registerOnboardingRoutes(app, { store: d.store })
+  registerOnboardingRoutes(app, { store: d.store, telemetry: d.telemetry })
 }
 
 /** Overlay the live-dynamic flags (loaded, hasProfile) and tiered t/s (lastTps,

@@ -841,6 +841,10 @@ export function enqueueDownload(input: {
   size?: number
   sha256?: string
   subdir?: string
+  /** Onboarding-only (spec 25 §5.4 / ADR-338 Decision 6): drop the shared mmproj vision
+   *  projector a blessed catalog GGUF would otherwise expand into — "never pull mmproj-*.gguf
+   *  — pure added download before first token." Discover's own manual picks never set this. */
+  excludeMmproj?: boolean
 }): Promise<{ downloads: DownloadRecord[] }> {
   return request<{ downloads: DownloadRecord[] }>('/api/v1/downloads', { method: 'POST', json: input })
 }
