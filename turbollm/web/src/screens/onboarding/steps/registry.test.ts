@@ -16,8 +16,30 @@ describe('step registry', () => {
   })
 
   it('welcome and payoff apply to every profile', () => {
-    const ctx = { profile: 'casual' as const, downloadDone: false, isT0: false, recommendationKind: 'entry' as const, expectedModelKey: null, payoffDestination: null, loadCompletedOnce: false }
+    const ctx = { profile: 'casual' as const, downloadDone: false, isT0: false, recommendationKind: 'entry' as const, expectedModelKey: null, expectedDownloadId: null, loadCompletedOnce: false }
     expect(REGISTRY.find((s) => s.id === 'welcome')!.appliesTo(ctx)).toBe(true)
     expect(REGISTRY.find((s) => s.id === 'payoff')!.appliesTo(ctx)).toBe(true)
+  })
+
+  // Founder-reported live: auto-tune must be offered BEFORE the user tries chat/Code, not
+  // after — tuning the config before proving it works, not after. Regression-guards the
+  // registry ORDER directly (not just membership), for every profile tune-offer applies to.
+  it('tune-offer comes before payoff whenever both apply (non-T0)', () => {
+    for (const profile of ['developer', 'enthusiast', 'pro'] as const) {
+      const ctx = { profile, downloadDone: true, isT0: false, recommendationKind: 'entry' as const, expectedModelKey: null, expectedDownloadId: null, loadCompletedOnce: false }
+      const ids = REGISTRY.filter((s) => s.appliesTo(ctx)).map((s) => s.id)
+      const tuneIdx = ids.indexOf('tune-offer')
+      const payoffIdx = ids.indexOf('payoff')
+      expect(tuneIdx, `${profile}: tune-offer must apply`).toBeGreaterThanOrEqual(0)
+      expect(payoffIdx, `${profile}: payoff must apply`).toBeGreaterThanOrEqual(0)
+      expect(tuneIdx, `${profile}: tune-offer must precede payoff`).toBeLessThan(payoffIdx)
+    }
+  })
+
+  it('tune-offer never applies on T0 hardware, for any profile', () => {
+    for (const profile of ['casual', 'developer', 'enthusiast', 'pro'] as const) {
+      const ctx = { profile, downloadDone: true, isT0: true, recommendationKind: 'entry' as const, expectedModelKey: null, expectedDownloadId: null, loadCompletedOnce: false }
+      expect(REGISTRY.find((s) => s.id === 'tune-offer')!.appliesTo(ctx), profile).toBe(false)
+    }
   })
 })

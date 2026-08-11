@@ -1,31 +1,46 @@
 import { useRef, useState } from 'react'
-import { Loader2, Sparkles, Terminal } from 'lucide-react'
+import { useNavigate } from 'react-router-dom'
+import { ExternalLink, Loader2, Rocket, Sparkles, Terminal } from 'lucide-react'
 import { createConversation } from '../../../lib/chat-api'
-import { createCodeSession } from '../../../lib/code-api'
+import { availableCodeAgents, type CodeAgent } from '../../../lib/code-types'
+import { useSettings, useStatus } from '../../../lib/queries'
 import { useOnboardingMachine } from '../../../lib/onboarding/useOnboardingMachine'
 import type { StepComponentProps } from '../OnboardingScreen'
 
-/** Step 6 — Payoff (spec 25 §4). Creates a REAL conversation (Casual/
- *  Enthusiast) or a REAL Code session (Developer) — proving generation
- *  actually works — then ADVANCES into the rest of the wizard sequence
- *  (tune-offer / done), the same as every other step. It does NOT complete
- *  onboarding or navigate away itself.
+/** Step 6 — Payoff (spec 25 §4, last step). Creates a REAL conversation
+ *  (Casual/Enthusiast) — proving generation actually works — or, for
+ *  Developer, saves the picked coding-agent default and hands off to the
+ *  real Code launchpad (`CodeHomeScreen`, `/workspace/code`) where the user
+ *  picks their OWN repo, model, and task. Either way: completes onboarding
+ *  and navigates straight there, one click.
  *
- *  An adversarial QA pass found the previous version doing both of those
- *  directly: it called completeOnboarding() then navigate() to the new
- *  conversation/session. That raced OnboardingScreen's own "already done"
- *  redirect effect — both fire off the exact same underlying event (the
- *  mutation resolving) — and whichever navigate() call won, the wizard's
- *  tune-offer/done steps became permanently unreachable for every profile,
- *  and a Developer's "Open Code" click landed on plain /workspace/chat with
- *  no id. Awaiting the mutation before navigating did NOT fix it, because
- *  the race is structural, not a timing gap.
+ *  Developer used to auto-create a Code session directly from here with a
+ *  hardcoded `repoRoot: '.'` and a canned task string, never asking which
+ *  repo the user actually meant — reported directly, live: "which repo?
+ *  which path? ... I told you to open code welcome screen that is already
+ *  built where user can select repo." `repoRoot: '.'` resolves against the
+ *  DAEMON's own working directory, not anything the user chose — on a real
+ *  install that's `~/.turbollm` or wherever the process launched from, never
+ *  a real code repo. `CodeHomeScreen` already exists, is fully built (repo
+ *  picker via `FsBrowser`, model picker, agent mode, task composer) and is
+ *  exactly what a first-time Developer should land on. This step's job is
+ *  now only to set them up for it (agent default) and get them there.
  *
- *  The real destination is stashed in ctx.payoffDestination; Done is the
- *  step that actually calls completeOnboarding() and performs the final
- *  navigation, once the user has seen the rest of the sequence. */
-export default function PayoffStep({ onContinue, ctx }: StepComponentProps) {
-  const { patchCtx } = useOnboardingMachine()
+ *  Used to be two steps: this one created the conversation/session and only
+ *  ADVANCED into a separate "You're set up" step, which then had to
+ *  complete onboarding and navigate for real. That split existed to dodge a
+ *  race with `OnboardingScreenInner`'s "already done" redirect effect — but
+ *  that effect is now scoped to fire only once, on the query's FIRST
+ *  settle (see its own comment), so it can never fire again once the user
+ *  has manually navigated this deep into the wizard. The race is gone, and
+ *  the split just meant clicking "Start chatting" landed on ANOTHER whole
+ *  screen instead of actually chatting — reported directly: "abrupt,
+ *  combine them." Merged back into one step, one click. */
+export default function PayoffStep({ ctx }: StepComponentProps) {
+  const navigate = useNavigate()
+  const { completeOnboarding } = useOnboardingMachine()
+  const statusQ = useStatus()
+  const { query: settingsQ, save: saveSettings } = useSettings()
   const [starting, setStarting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   // Synchronous guard: `starting` is React state, so its re-render (and the
@@ -37,30 +52,42 @@ export default function PayoffStep({ onContinue, ctx }: StepComponentProps) {
 
   const isDeveloper = ctx.profile === 'developer'
 
+  // Same gating CodeAgentSection uses (ADR-239: don't offer an agent that isn't confirmed
+  // working on this install). Defaults to 'claude' per the founder's explicit ask — a first
+  // Code session should show off the real CLI, not the built-in chat UI — falling back to
+  // the built-in only when this install genuinely has no terminal backend to run it in.
+  const terminalAvailable = statusQ.data?.terminalAvailable !== false
+  const agents = availableCodeAgents(terminalAvailable)
+  const [selectedAgent, setSelectedAgent] = useState<CodeAgent>('claude')
+  const effectiveAgent = agents.some((a) => a.id === selectedAgent) ? selectedAgent : (agents[0]?.id ?? 'turbollm')
+
   const start = async () => {
     if (startedRef.current) return
     startedRef.current = true
     setStarting(true)
     setError(null)
     try {
+      let dest: string
       if (isDeveloper) {
-        // createCodeSession() returns BOTH sessionId and convId — every real
-        // Code API (messages, stream, export, git) keys off sessionId, and so
-        // does the /workspace/code/:sessionId route itself. The re-verification
-        // pass caught this: grabbing convId here landed on a URL CodeSessionScreen
-        // couldn't resolve ("This session couldn't be found"), even though the
-        // session had genuinely been created.
-        const { sessionId } = await createCodeSession({
-          repoRoot: '.',
-          mode: 'auto',
-          task: 'Give me a short tour of this repository and suggest one good first thing to try.',
-        })
-        patchCtx({ payoffDestination: { kind: 'code', id: sessionId } })
+        // The agent is a session-creation-time snapshot of the SERVER's default
+        // (config.ts's code.defaultAgent, code-routes.ts) — there is no per-session
+        // override in the create call itself, so picking a different agent here means
+        // setting that default first and letting the session snapshot pick it up, same
+        // as Settings' own CodeAgentSection does. Only writes it when it's actually
+        // changing, so this never clobbers a returning user's own preference for no reason.
+        if (settingsQ.data && settingsQ.data.code?.defaultAgent !== effectiveAgent) {
+          await saveSettings.mutateAsync({ code: { defaultAgent: effectiveAgent } })
+        }
+        // No session created here — CodeHomeScreen is the real repo/model/task picker
+        // (FsBrowser folder picker, model picker, agent mode, composer). Creating one
+        // ourselves meant guessing a repo path and a task nobody asked for.
+        dest = '/workspace/code'
       } else {
         const conv = await createConversation({ title: 'Welcome to TurboLLM' })
-        patchCtx({ payoffDestination: { kind: 'chat', id: conv.id } })
+        dest = `/workspace/chat/${conv.id}`
       }
-      onContinue()
+      await completeOnboarding()
+      navigate(dest)
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Could not start it — try again.')
       setStarting(false)
@@ -68,19 +95,44 @@ export default function PayoffStep({ onContinue, ctx }: StepComponentProps) {
     }
   }
 
+  const exploreModels = async () => {
+    await completeOnboarding()
+    navigate('/models')
+  }
+
+  const visitSite = async () => {
+    await completeOnboarding()
+    window.open('https://turbollm.dev', '_blank')
+  }
+
   return (
     <div className="space-y-6 text-center">
       <div className="flex items-center justify-center gap-3 mb-2">
-        {isDeveloper ? <Terminal size={20} className="text-accent" /> : <Sparkles size={20} className="text-accent" />}
-        <h3 className="text-lg font-semibold text-ink">
-          {isDeveloper ? 'Try your first Code session' : 'Try it'}
-        </h3>
+        <Sparkles size={28} className="text-accent" />
+        <h3 className="text-xl font-semibold text-ink">You're set up</h3>
       </div>
       <p className="text-sm text-muted mb-6">
         {isDeveloper
-          ? "Your model is ready — let's point it at this repo."
-          : "Your model is ready. Let's start a real conversation."}
+          ? "Your model is ready. Head to Code to pick a repository and start your first task."
+          : 'Your model is ready. Start a real conversation to see it in action.'}
       </p>
+
+      {isDeveloper && agents.length > 1 && (
+        <div className="flex items-center justify-center gap-2 mb-2">
+          <label htmlFor="payoff-agent" className="text-xs text-muted">Coding agent</label>
+          <select
+            id="payoff-agent"
+            value={effectiveAgent}
+            onChange={(e) => setSelectedAgent(e.target.value as CodeAgent)}
+            disabled={starting}
+            className="rounded-md border border-border bg-panel px-2 py-1.5 text-sm text-ink outline-none focus:border-accent transition-colors disabled:opacity-40"
+          >
+            {agents.map((a) => (
+              <option key={a.id} value={a.id}>{a.label}</option>
+            ))}
+          </select>
+        </div>
+      )}
 
       {error && <p className="text-xs text-red-400">{error}</p>}
 
@@ -90,9 +142,20 @@ export default function PayoffStep({ onContinue, ctx }: StepComponentProps) {
         disabled={starting}
         className="inline-flex items-center gap-2 rounded-lg border border-accent bg-accent/10 text-accent py-2.5 px-5 text-sm font-medium hover:bg-accent/20 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
       >
-        {starting ? <Loader2 size={14} className="animate-spin" /> : null}
+        {starting ? <Loader2 size={14} className="animate-spin" /> : isDeveloper ? <Terminal size={14} /> : null}
         {starting ? 'Starting…' : isDeveloper ? 'Open Code' : 'Start chatting'}
       </button>
+
+      <div className="flex items-center justify-center gap-5 pt-2 text-sm">
+        <button type="button" onClick={exploreModels} className="inline-flex items-center gap-1.5 text-muted hover:text-ink transition-colors">
+          <Rocket size={14} />
+          Explore models
+        </button>
+        <button type="button" onClick={visitSite} className="inline-flex items-center gap-1.5 text-muted hover:text-ink transition-colors">
+          <ExternalLink size={14} />
+          Visit turbollm.dev
+        </button>
+      </div>
     </div>
   )
 }

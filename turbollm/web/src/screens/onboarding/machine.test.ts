@@ -4,7 +4,7 @@ import { STEP_IDS } from './steps/registry'
 import type { StepContext } from './steps/define'
 
 const ctx = (p: Partial<StepContext> = {}): StepContext =>
-  ({ profile: 'casual', downloadDone: false, isT0: false, recommendationKind: 'entry', expectedModelKey: null, payoffDestination: null, loadCompletedOnce: false, ...p })
+  ({ profile: 'casual', downloadDone: false, isT0: false, recommendationKind: 'entry', expectedModelKey: null, expectedDownloadId: null, loadCompletedOnce: false, ...p })
 
 describe('deriveSteps', () => {
   it('drops the download-shadow steps once the model is present', () => {
@@ -33,10 +33,10 @@ describe('deriveSteps', () => {
     }
   })
 
-  it('always yields at least welcome and done', () => {
+  it('always yields at least welcome and payoff', () => {
     const ids = deriveSteps(ctx({ profile: null })).map((s) => s.id)
     expect(ids).toContain('welcome')
-    expect(ids).toContain('done')
+    expect(ids).toContain('payoff')
   })
 })
 
@@ -49,8 +49,8 @@ describe('reduce', () => {
   })
 
   it('next at the last step is a no-op rather than an out-of-range id', () => {
-    const s = reduce({ currentId: 'done', ctx: ctx() }, { type: 'next' })
-    expect(s.currentId).toBe('done')
+    const s = reduce({ currentId: 'payoff', ctx: ctx() }, { type: 'next' })
+    expect(s.currentId).toBe('payoff')
   })
 
   it('a ctx patch that removes the current step relocates to a valid step', () => {

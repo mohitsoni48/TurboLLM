@@ -12,7 +12,7 @@ import { REGISTRY, STEP_IDS } from './registry'
 const TRACKED_SKIPS = [
   'skip_onboarding_welcome', 'skip_onboarding_profile', 'skip_onboarding_model',
   'skip_onboarding_personalize', 'skip_onboarding_profile_extra', 'skip_onboarding_load',
-  'skip_onboarding_payoff', 'skip_onboarding_tune_offer', 'skip_onboarding_done',
+  'skip_onboarding_payoff', 'skip_onboarding_tune_offer',
 ] as const
 
 const actionFor = (id: string) => `skip_onboarding_${id.replace(/-/g, '_')}`

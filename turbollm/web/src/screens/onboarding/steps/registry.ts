@@ -44,20 +44,24 @@ export const REGISTRY: readonly StepDescriptor[] = [
     appliesTo: () => true,
   }),
   defineStep({
-    id: 'payoff',
-    title: 'Try it',
-    appliesTo: () => true,
-  }),
-  defineStep({
-    // Auto-tune is offered only after the payoff, and NEVER on T0 — a
-    // hardware override that outranks profile (§6.2).
+    // Auto-tune is offered right after Load, BEFORE the payoff — tune the config
+    // before proving it works, not after (founder-reported ordering; an
+    // auto-tune run always leaves the engine stopped when it finishes, so
+    // TuneOfferStep itself reloads the model before handing off to Payoff).
+    // NEVER on T0 — a hardware override that outranks profile (§6.2).
     id: 'tune-offer',
     title: 'Make it faster',
     appliesTo: (c) => !c.isT0 && (c.profile === 'enthusiast' || c.profile === 'pro' || c.profile === 'developer'),
   }),
   defineStep({
-    id: 'done',
-    title: "You're set up",
+    // Last step — creates the real conversation/Code session AND completes
+    // onboarding AND navigates there, all from one click. Used to be two
+    // steps (this one, then a separate "done" step that actually finished
+    // up); merged after a reported abrupt-feeling extra screen between
+    // "Start chatting" and actually chatting — see PayoffStep's own header
+    // comment for why the split existed and why it's safe to remove now.
+    id: 'payoff',
+    title: 'Try it',
     appliesTo: () => true,
   }),
 ]

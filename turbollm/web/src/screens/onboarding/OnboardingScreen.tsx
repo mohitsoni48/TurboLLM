@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { OnboardingMachineProvider, useOnboardingMachine } from '../../lib/onboarding/useOnboardingMachine'
 import { useOnboardingRecommendation, useOnboardingState } from '../../lib/onboarding-queries'
+import { track } from '../../lib/api'
 import type { OnboardingCtx } from '../../lib/onboarding/types'
 import type { StepDescriptor } from './steps/define'
 
@@ -13,7 +14,6 @@ import ProfileExtraStep from './steps/ProfileExtraStep'
 import LoadStep from './steps/LoadStep'
 import PayoffStep from './steps/PayoffStep'
 import TuneOfferStep from './steps/TuneOfferStep'
-import DoneStep from './steps/DoneStep'
 
 // Quoted keys throughout — 'profile-extra'/'tune-offer' are not valid bare
 // identifiers, and an unquoted use here is what made this file fail to parse
@@ -27,7 +27,6 @@ const STEP_COMPONENTS: Record<StepDescriptor['id'], React.ComponentType<StepComp
   load: LoadStep,
   payoff: PayoffStep,
   'tune-offer': TuneOfferStep,
-  done: DoneStep,
 }
 
 const STEP_SUBTITLE: Record<StepDescriptor['id'], string> = {
@@ -39,7 +38,6 @@ const STEP_SUBTITLE: Record<StepDescriptor['id'], string> = {
   load: 'Loading your model.',
   payoff: "Let's see it in action.",
   'tune-offer': 'Want to make it faster?',
-  done: 'All set!',
 }
 
 export interface StepComponentProps {
@@ -111,6 +109,26 @@ function OnboardingScreenInner() {
 
   const StepComponent = STEP_COMPONENTS[currentStep.id]
 
+  // `skip()` only persists status='skipped' server-side (mirrors PayoffStep's own
+  // completeOnboarding-then-navigate pattern) — it does NOT navigate. Once it resolves,
+  // `currentStep` derives to null and this component renders nothing at all (see the
+  // early return above), stranding the user on a blank /onboarding forever. The ONLY
+  // other navigate-away path is the `initialCompletionCheckDone` effect above, and it is
+  // deliberately scoped to fire ONCE, on the query's FIRST settle — which already
+  // happened with status='pending' before the user ever clicked Skip, so it can never
+  // catch this. Found live: a real click on "I don't need onboarding" left the status
+  // genuinely flipped to 'skipped' server-side while the page just sat there blank.
+  const handleSkip = async () => {
+    // ADR-338 Decision 6c: "every step's skip is tracked with the step it fired from,
+    // because *where* people bail is the whole diagnostic value" — one ui_action per
+    // registered step (`skip_onboarding_<id>`, ui.ts's UI_ACTIONS), captured before
+    // `skip()` clears currentStep. Wired by ADR-350 — the schema predates this call
+    // site by days; nothing ever actually fired it until now.
+    track('onboarding', `skip_onboarding_${currentStep.id.replace(/-/g, '_')}`)
+    await skip()
+    navigate('/workspace/chat', { replace: true })
+  }
+
   return (
     // h-screen + overflow-y-auto, not min-h-screen: the app shell locks
     // body/html overflow globally (every other screen manages its own
@@ -120,7 +138,17 @@ function OnboardingScreenInner() {
     // to 954px against a 720px viewport with no way to reach the bottom
     // "I don't need onboarding" link. This div now creates its own bounded,
     // scrollable region regardless of the shell's lock.
-    <div className="h-screen overflow-y-auto flex flex-col items-center justify-center bg-panel-1">
+    //
+    // justify-start, not justify-center: found live, a second and worse half of the
+    // same class of bug that fix was aimed at. `justify-center` on an overflowing
+    // flex+overflow-y-auto container pushes the TOP of tall content into negative
+    // scroll space — scrollTop is clamped to >= 0, so a browser can never scroll UP
+    // far enough to reach it. On the Profile step (4 cards; content 902px vs a 720px
+    // viewport) this left "← Back" permanently unreachable — not a scroll timing
+    // issue, a genuine layout dead zone regardless of how long you wait or retry.
+    // justify-start + the inner wrapper's own `py-16 md:py-20` still centers short
+    // content comfortably; it just stops silently eating the top of tall content.
+    <div className="h-screen overflow-y-auto flex flex-col items-center justify-start bg-panel-1">
       <div className="fixed top-0 left-0 w-full bg-panel border-b border-border z-20">
         <div className="h-8 px-6 flex items-center gap-4">
           <div className="flex-1 h-1.5 rounded-full bg-muted overflow-hidden">
@@ -148,7 +176,7 @@ function OnboardingScreenInner() {
             </button>
             <button
               type="button"
-              onClick={skip}
+              onClick={handleSkip}
               className="text-[13px] text-faint hover:text-ink transition-colors"
             >
               Skip onboarding
@@ -161,14 +189,14 @@ function OnboardingScreenInner() {
           </div>
 
           <div className="mb-6">
-            <StepComponent onContinue={advance} onSkip={skip} ctx={machine.ctx} />
+            <StepComponent onContinue={advance} onSkip={handleSkip} ctx={machine.ctx} />
           </div>
         </div>
 
         <div className="mt-8 text-center">
           <button
             type="button"
-            onClick={skip}
+            onClick={handleSkip}
             className="text-sm text-faint underline underline-offset-4 hover:text-muted"
           >
             I don't need onboarding
