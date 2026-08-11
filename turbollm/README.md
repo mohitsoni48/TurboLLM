@@ -427,10 +427,14 @@ turbollm
 1. Detects your GPU and **downloads a matching `llama-server` build** (CUDA for NVIDIA, ROCm
    for AMD, Metal for Apple, SYCL for Intel, Vulkan otherwise — with a CPU fallback).
 2. Starts on <http://127.0.0.1:6996> and opens your browser.
-3. Drops you on the **Chat** screen, ready to load a model.
+3. Walks you through a short **setup wizard**: pick how you'll use it (casual chat, coding,
+   tinkering, or pro), get a model recommended for your actual hardware (or bring your own),
+   watch it download and load for real, and try it — before landing in **Chat** or **Code**.
+   Skippable from any step, and safe to close mid-download — reopen `/onboarding` any time
+   from **Models** to pick up where you left off.
 
-Then open **Models**, download or pick a GGUF, click **Load**, and start chatting. Stop the
-daemon any time with **Ctrl+C**.
+After that (or any time later), open **Models**, download or pick a GGUF, click **Load**, and
+start chatting. Stop the daemon any time with **Ctrl+C**.
 
 ---
 

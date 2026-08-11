@@ -1,7 +1,9 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useMemo, useState, type CSSProperties, type ReactNode } from 'react'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import {
   AlertTriangle,
+  ArrowRight,
   Boxes,
   Check,
   ChevronDown,
@@ -21,6 +23,7 @@ import {
 } from 'lucide-react'
 import { ApiError, deleteModel, track } from '../lib/api'
 import { queryKeys, useModelActions, useModelDirs, useModelMutations, useModels, useStatus } from '../lib/queries'
+import { useOnboardingState } from '../lib/onboarding-queries'
 import { usePinnedModels } from '../lib/usePinnedModels'
 import type { ModelEntry } from '../lib/types'
 import { cn } from '../lib/utils'
@@ -91,6 +94,21 @@ function groupModels(models: ModelEntry[], isPinned: (key: string) => boolean): 
 }
 
 export function ModelsScreen() {
+  const navigate = useNavigate()
+  // Onboarding's Discover handoff (Pro, "pick a different model", "nothing fits this
+  // machine") sends the user here mid-wizard. App.tsx's own resume-poller only catches
+  // a download's downloading→done transition — found live by adversarial QA: a user who
+  // just browses without downloading, cancels, or hits a download error is left here with
+  // no onboarding chrome at all (no "X of 7", no way back except typing /onboarding by
+  // hand), while onboarding.status stays 'pending' server-side. This banner is the general
+  // fallback that covers every one of those paths, not just the one App.tsx already
+  // handles: it shows whenever onboarding is still genuinely unfinished, however the user
+  // got here.
+  const onboardingQ = useOnboardingState()
+  const stillOnboarding =
+    onboardingQ.data !== undefined &&
+    onboardingQ.data.status === 'pending' &&
+    !onboardingQ.data.everLoadedModel
   const modelsQ = useModels()
   const dirsQ = useModelDirs()
   const mut = useModelMutations()
@@ -109,7 +127,17 @@ export function ModelsScreen() {
       ? status?.model?.key
       : undefined
 
-  const [tab, setTab] = useState<Tab>('library')
+  // Reads the `tab` query param on mount so links like `/models?tab=discover`
+  // (onboarding's Pro Discover handoff and its "pick a different model"
+  // escape hatches) actually land on Discover, not the default Library.
+  // Found by adversarial QA: the URL correctly changed to
+  // `?tab=discover`, but `useState<Tab>('library')` never read it, so
+  // Library stayed the rendered tab regardless. One-time read on mount, not
+  // a synced-forever URL state — matches this component's existing pattern
+  // of `onDiscover` calling `setTab('discover')` as a plain internal
+  // transition, not a URL-driven one.
+  const [searchParams] = useSearchParams()
+  const [tab, setTab] = useState<Tab>(searchParams.get('tab') === 'discover' ? 'discover' : 'library')
   const [filter, setFilter] = useState<Filter>('all')
   const [search, setSearch] = useState('')
   const [showIncompatible, setShowIncompatible] = useState(false)
@@ -189,6 +217,22 @@ export function ModelsScreen() {
             : 'Find and download GGUF models from Hugging Face, or import any direct .gguf URL.'
         }
       />
+
+      {stillOnboarding && (
+        <button
+          type="button"
+          onClick={() => { track('onboarding', 'resume_onboarding'); navigate('/onboarding') }}
+          className="mb-5 flex w-full items-center justify-between gap-3 rounded-lg border border-accent/40 bg-accent/5 px-4 py-3 text-left transition-colors hover:bg-accent/10"
+        >
+          <span className="text-sm text-ink">
+            <span className="font-medium">Setup isn't finished yet</span> — pick or download a
+            model here, then jump back to finish getting started.
+          </span>
+          <span className="flex flex-shrink-0 items-center gap-1 text-sm font-medium text-accent">
+            Resume setup <ArrowRight size={14} />
+          </span>
+        </button>
+      )}
 
       <div className="mb-5 flex items-center gap-1 border-b border-border">
         {(['library', 'discover'] as Tab[]).map((t) => (

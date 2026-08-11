@@ -59,6 +59,7 @@ import { readQueue, remove as removeQueued } from '../telemetry/queue'
 import { sendConsentChoice } from '../telemetry/consent'
 import { readSentLog } from '../telemetry/log'
 import { TELEMETRY_SCHEMA_VERSION } from '../telemetry/schema'
+import { registerOnboardingRoutes } from './onboarding-routes'
 
 type Status = 200 | 201 | 202 | 400 | 401 | 403 | 404 | 409 | 500 | 501 | 503
 
@@ -2135,7 +2136,7 @@ export function registerApi(app: Hono, d: Deps): void {
 
   // Enqueue from an HF repo file {repo, rfilename} OR a raw URL {url}. 202.
   app.post('/api/v1/downloads', async (c) => {
-    const b = await body<{ repo?: string; rfilename?: string; url?: string; size?: number; sha256?: string; subdir?: string }>(c)
+    const b = await body<{ repo?: string; rfilename?: string; url?: string; size?: number; sha256?: string; subdir?: string; excludeMmproj?: boolean }>(c)
     try {
       // One request may fan out into several files (split shards + a shared mmproj) —
       // return every record created so the UI reflects the full queued set.
@@ -2263,6 +2264,9 @@ export function registerApi(app: Hono, d: Deps): void {
 
     return c.json(buildConnectSnippets(cli, base, apiKey, modelName, modelKey))
   })
+
+  // ---- onboarding (spec 25 §9.2) ----
+  registerOnboardingRoutes(app, { store: d.store, telemetry: d.telemetry })
 }
 
 /** Overlay the live-dynamic flags (loaded, hasProfile) and tiered t/s (lastTps,

@@ -9,24 +9,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '../../components/ui/dropdown-menu'
-import type { CodeAgent } from '../../lib/code-types'
-
-// `pi` and `opencode` are deliberately NOT offered right now. Both are still supported end to end
-// (cli-launch.ts, the CodeAgent type, and any session already created with one keeps working) —
-// they're withdrawn from the picker until their terminal integration is actually verified against
-// a real binary, rather than shipping a choice that half-works. Re-adding them is this list plus
-// nothing else. Same rule as the engine catalog: don't offer what isn't confirmed (ADR-239).
-//
-// `needsTerminal` marks an agent that can only run inside a PTY. `node-pty` is an OPTIONAL
-// dependency — it's a native module, and a failed build must not fail the install for everyone —
-// so npm skips it silently when no prebuild fits the platform/ABI, and a perfectly healthy install
-// can have no way to spawn a terminal at all. Those agents are hidden there rather than offered
-// and then failing at session-open, which is the same ADR-239 rule applied per machine instead of
-// per catalog.
-const ALL_AGENTS: Array<{ id: CodeAgent; label: string; description: string; needsTerminal?: boolean }> = [
-  { id: 'turbollm', label: 'turbollm', description: 'The built-in chat agent — uses whatever model TurboLLM has loaded.' },
-  { id: 'claude', label: 'claude', description: 'Launches inside a full-screen terminal (turbollm launch claude).', needsTerminal: true },
-]
+import { availableCodeAgents, CODE_AGENTS } from '../../lib/code-types'
 
 /** Which coding agent NEW Code sessions launch with. Read once, at session creation
  *  (code-routes.ts) — changing this only affects sessions created afterward; an
@@ -38,7 +21,7 @@ export function CodeAgentSection() {
   // daemon predates this flag, and every such build had node-pty as a hard dependency — so
   // treating "unknown" as available is the accurate reading, not an optimistic one.
   const terminalAvailable = statusQ.data?.terminalAvailable !== false
-  const agents = ALL_AGENTS.filter((a) => !a.needsTerminal || terminalAvailable)
+  const agents = availableCodeAgents(terminalAvailable)
   const current = settingsQ.data?.code?.defaultAgent ?? 'turbollm'
   // A stored agent that isn't in the offered list — someone who picked pi/opencode before they
   // were withdrawn, or `claude` on a machine whose terminal backend didn't install — must still be
@@ -48,7 +31,7 @@ export function CodeAgentSection() {
   const selected = agents.find((a) => a.id === current) ?? {
     id: current,
     label: current,
-    description: ALL_AGENTS.some((a) => a.id === current && a.needsTerminal) && !terminalAvailable
+    description: CODE_AGENTS.some((a) => a.id === current && a.needsTerminal) && !terminalAvailable
       ? 'Needs a terminal, which this install does not have — choose one below to change it.'
       : 'No longer offered — choose one below to change it.',
   }

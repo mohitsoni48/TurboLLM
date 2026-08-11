@@ -51,6 +51,7 @@ import { emit } from './telemetry/runtime/typed-emit'
 import { modelLoad, modelDownloaded, buildModelLoadConfig } from './telemetry/events/model'
 import { engineInstalled } from './telemetry/events/engine'
 import { checkDailyQueryRollups } from './telemetry/runtime/daily-query-rollups'
+import { markEverLoadedModel } from './api/onboarding-routes'
 
 // Stop child processes (the agent engine's shell tool, engine binaries, git,
 // etc.) from flashing a console window on Windows when the daemon has no console
@@ -365,6 +366,10 @@ telemetry.dailyActive()
 // which fire load() without awaiting and so cannot see the outcome.
 manager.onLoadSettled = (ok, err, opts) => {
   const outcome = ok ? 'ok' : 'fail'
+  // The onboarding entry predicate (spec 25 §3): once ANY load has ever
+  // succeeded, the wizard never shows again, regardless of `onboarding.status`.
+  // A no-op past the first success (markEverLoadedModel checks before writing).
+  if (ok) markEverLoadedModel(store)
   // model_load (spec 23 §3.3, ADR-333): fires on EVERY load, not just the first
   // (model_first_load, retired here — the funnel's "first load" is now derivable
   // as the first model_load per machine, matching the "journey derived from real

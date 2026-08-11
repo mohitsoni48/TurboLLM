@@ -872,3 +872,20 @@ test('structuralSanityCheck: a pathologically deep small payload is treated as u
   const r = structuralSanityCheck({ event: 'app_first_run', payload: deep })
   assert.equal(r.ok, false)
 })
+
+// Task 9: the onboarding screen now exists (spec 25, ADR-338)
+test('validateEvent: ui_action accepts the Phase 7 Onboarding screen actions', () => {
+  const actions = [
+    'skip_onboarding_welcome', 'skip_onboarding_profile', 'skip_onboarding_model',
+    'skip_onboarding_personalize', 'skip_onboarding_profile_extra', 'skip_onboarding_load',
+    'skip_onboarding_payoff', 'skip_onboarding_tune_offer',
+    'choose_profile', 'start_model_download', 'use_existing_models',
+    'open_discover_handoff', 'pick_different_model', 'accept_autotune',
+    'decline_autotune', 'finish_onboarding', 'resume_onboarding',
+    'dismiss_finish_banner', 'take_recovery_action',
+  ]
+  for (const action of actions) {
+    const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'onboarding', action } }))
+    assert.equal(r.ok, true, r.ok === false ? `onboarding/${action}: ${r.reason}` : '')
+  }
+})

@@ -90,6 +90,82 @@ test('enqueue: HF repo file expands into shards + mmproj under <owner>/<name>', 
   }
 })
 
+test('enqueue: excludeMmproj drops the projector the expansion would otherwise pull in', async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const expand = async (): Promise<HfModelFiles> => ({
+      dir: '',
+      files: [
+        { rfilename: 'model.gguf', size: 10, sha256: 's1', mmproj: false },
+        { rfilename: 'mmproj-F16.gguf', size: 5, sha256: 'p', mmproj: true },
+      ],
+    })
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), expand)
+    // Onboarding's blessed-catalog download is the real caller of this flag (ModelStep.tsx).
+    const recs = await dm.enqueue({ repo: 'owner/repo', rfilename: 'model.gguf', excludeMmproj: true })
+
+    assert.deepEqual(recs.map((r) => r.name), ['model.gguf'])
+    assert.equal(dm.list().some((r) => r.name.includes('mmproj')), false)
+  } finally {
+    restore()
+  }
+})
+
+test('enqueue: excludeMmproj is opt-in — Discover downloads (the flag omitted) still get the projector', async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const expand = async (): Promise<HfModelFiles> => ({
+      dir: '',
+      files: [
+        { rfilename: 'model.gguf', size: 10, sha256: 's1', mmproj: false },
+        { rfilename: 'mmproj-F16.gguf', size: 5, sha256: 'p', mmproj: true },
+      ],
+    })
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), expand)
+    const recs = await dm.enqueue({ repo: 'owner/repo', rfilename: 'model.gguf' })
+
+    assert.deepEqual(recs.map((r) => r.name).sort(), ['mmproj-F16.gguf', 'model.gguf'])
+  } finally {
+    restore()
+  }
+})
+
+test('enqueue: TURBOLLM_HF_BASE (E2E harness only) redirects the built resolve URL', async () => {
+  const restoreFetch = stubFetch()
+  const prevEnv = process.env.TURBOLLM_HF_BASE
+  process.env.TURBOLLM_HF_BASE = 'http://127.0.0.1:8080/'
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+    const recs = await dm.enqueue({ repo: 'owner/repo', rfilename: 'model.gguf', size: 10 })
+    assert.equal(recs.length, 1)
+    // Trailing slash on the override is stripped, not doubled into the path.
+    assert.equal(recs[0].url, 'http://127.0.0.1:8080/owner/repo/resolve/main/model.gguf')
+  } finally {
+    restoreFetch()
+    if (prevEnv === undefined) delete process.env.TURBOLLM_HF_BASE
+    else process.env.TURBOLLM_HF_BASE = prevEnv
+  }
+})
+
+test('enqueue: absent TURBOLLM_HF_BASE builds a real huggingface.co URL', async () => {
+  const restoreFetch = stubFetch()
+  const prevEnv = process.env.TURBOLLM_HF_BASE
+  delete process.env.TURBOLLM_HF_BASE
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+    const recs = await dm.enqueue({ repo: 'owner/repo', rfilename: 'model.gguf', size: 10 })
+    assert.equal(recs[0].url, 'https://huggingface.co/owner/repo/resolve/main/model.gguf')
+  } finally {
+    restoreFetch()
+    if (prevEnv === undefined) delete process.env.TURBOLLM_HF_BASE
+    else process.env.TURBOLLM_HF_BASE = prevEnv
+  }
+})
+
 test('enqueue: a per-quant subfolder is preserved under <owner>/<name>/<dir>', async () => {
   const restore = stubFetch()
   try {

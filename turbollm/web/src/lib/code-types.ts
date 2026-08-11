@@ -8,6 +8,24 @@ export type CodeMode = 'auto' | 'plan' | 'ask'
  *  the embedded terminal (TerminalView) instead — no chat UI at all for that session. */
 export type CodeAgent = 'turbollm' | 'pi' | 'claude' | 'opencode'
 
+/** The single source of truth for which agents are actually offered anywhere in the app
+ *  (Settings' CodeAgentSection, onboarding's PayoffStep agent picker) — shared so the two
+ *  pickers can never drift. `pi` and `opencode` are deliberately withheld: both are still
+ *  supported end to end (cli-launch.ts, this type, any session already created with one
+ *  keeps working), just not offered until their terminal integration is verified against a
+ *  real binary rather than shipping a choice that half-works (ADR-239). `terminalAvailable`
+ *  filters out `claude` (needs a PTY via the optional native `node-pty` dependency, which
+ *  npm silently skips when no prebuild fits — a perfectly healthy install can have no
+ *  terminal backend at all) rather than offering it and failing at session-open. */
+export const CODE_AGENTS: ReadonlyArray<{ id: CodeAgent; label: string; description: string; needsTerminal?: boolean }> = [
+  { id: 'turbollm', label: 'turbollm', description: 'The built-in chat agent — uses whatever model TurboLLM has loaded.' },
+  { id: 'claude', label: 'claude', description: 'Launches inside a full-screen terminal (turbollm launch claude).', needsTerminal: true },
+]
+
+export function availableCodeAgents(terminalAvailable: boolean): typeof CODE_AGENTS {
+  return CODE_AGENTS.filter((a) => !a.needsTerminal || terminalAvailable)
+}
+
 export type SessionStatus = 'merged' | 'review' | 'done' | 'aborted'
 
 /** One row from GET /api/v1/code/sessions (sidebar list) or the `session` half of

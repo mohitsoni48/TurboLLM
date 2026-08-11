@@ -8,3 +8,13 @@ deploy
 *.bat
 *.cmd
 lib
+
+# Dockerfile.test builds turbollm/dist on the HOST first, then COPYs it in,
+# rather than bundling in-container (that OOM-crashed the 1.9 GiB test VM —
+# see Dockerfile.test's header comment). Everything else stays excluded:
+# node_modules is still always installed fresh in-container (a host
+# node_modules would carry host-OS native bindings into a Linux image), and
+# the other Dockerfiles' own multi-stage builds are unaffected since they
+# never reference the host's turbollm/dist at all.
+!turbollm/dist
+!turbollm/dist/**

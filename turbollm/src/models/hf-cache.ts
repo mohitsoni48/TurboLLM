@@ -7,7 +7,7 @@
 //   else                   → ~/.cache/huggingface/hub
 // Pure-ish: reads env + home only, never touches the filesystem. Injectable for
 // tests.
-import { existsSync } from 'node:fs'
+import { existsSync, mkdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { ConfigStore } from '../config/config'
@@ -28,20 +28,52 @@ export function hfHubCacheDir(env: HfCacheEnv = process.env, home: string = home
   return join(home, '.cache', 'huggingface', 'hub')
 }
 
-/** First-run seed (ADR-092): when no model directories are configured AND the HF hub
- *  cache exists on disk, adopt it as the primary so pre-existing HF models show up
- *  immediately. One-time only — never overrides a user who already has dirs. Triggers
- *  a background rescan. Never throws (a missing dir just skips). */
+/** Which directory `seedDefaultModelDir` should adopt, and why — kept pure and
+ *  separate from the side-effecting parts (fs writes, config mutation, rescan)
+ *  so the decision itself is unit-testable without a real ConfigStore/Scanner.
+ *
+ *  Found live in an isolated onboarding test: a genuinely fresh machine with no
+ *  prior `huggingface-cli`/`transformers` use has no HF hub cache to adopt
+ *  either — ADR-092's original logic left `modelDirs` empty forever in that
+ *  case, so the very first download attempt failed immediately with "Add a
+ *  model folder in Settings before downloading," on a screen that has no
+ *  Settings link. `dataDir/models` (an existing HF cache is still preferred,
+ *  in case one exists to recover) is the fallback so downloads always have
+ *  somewhere to land. */
+export function resolveDefaultModelDir(
+  hfCacheExists: boolean,
+  hfCacheDir: string,
+  dataDir: string,
+): { dir: string; reason: 'hf-cache' | 'fresh-install' } {
+  if (hfCacheExists) return { dir: hfCacheDir, reason: 'hf-cache' }
+  return { dir: join(dataDir, 'models'), reason: 'fresh-install' }
+}
+
+/** First-run seed (ADR-092, extended): when no model directories are configured,
+ *  adopt the HF hub cache if one already exists (pre-existing HF models show up
+ *  immediately — the original ADR-092 behaviour), else create and adopt
+ *  `<dataDir>/models` so a genuinely fresh install still has somewhere for its
+ *  first download to land. One-time only — never overrides a user who already
+ *  has dirs. Triggers a background rescan either way. Never throws (best-effort). */
 export function seedDefaultModelDir(store: ConfigStore, scanner: Scanner): void {
   try {
     if (store.snapshot().modelDirs.length > 0) return
-    const dir = hfHubCacheDir()
-    if (!existsSync(dir)) return
+
+    const hfCacheDir = hfHubCacheDir()
+    const { dir, reason } = resolveDefaultModelDir(existsSync(hfCacheDir), hfCacheDir, store.dir())
+
+    if (reason === 'fresh-install') mkdirSync(dir, { recursive: true })
+
     store.update((c) => {
       c.modelDirs = [dir]
       c.primaryModelDir = dir
     })
-    console.log(`seed: adopted HuggingFace hub cache as the default model folder (${dir})`)
+
+    console.log(
+      reason === 'hf-cache'
+        ? `seed: adopted HuggingFace hub cache as the default model folder (${dir})`
+        : `seed: created a default model folder (${dir}) — no existing HuggingFace cache found`,
+    )
     void scanner.rescan()
   } catch {
     /* best-effort — never block startup over the model-dir seed */

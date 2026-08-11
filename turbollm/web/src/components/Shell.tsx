@@ -38,14 +38,20 @@ export function Shell({
   version: string
   children: ReactNode
 }) {
+  // The wizard is a full-screen, linear flow (spec 25 §4) — every nav link is an
+  // escape hatch the founder never asked for here, and "Skip onboarding" /
+  // "I don't need onboarding" already cover leaving on purpose. Found live: the
+  // rail rendered right alongside the wizard, letting a click wander off to
+  // Models/Settings/etc. mid-flow with no wizard-side awareness of the detour.
+  const onOnboarding = useLocation().pathname === '/onboarding'
   return (
     <div className="app-shell flex h-full">
-      <NavRail status={status} online={online} version={version} className="hidden md:flex" />
+      {!onOnboarding && <NavRail status={status} online={online} version={version} className="hidden md:flex" />}
       <div className="flex min-w-0 flex-1 flex-col">
         <EngineProvisionBanner status={status} />
         <EngineLoadErrorBanner status={status} />
         <main className="min-h-0 flex-1 overflow-auto">{children}</main>
-        <MobileNav />
+        {!onOnboarding && <MobileNav />}
       </div>
     </div>
   )

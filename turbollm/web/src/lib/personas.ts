@@ -19,6 +19,15 @@ const TURBOLLM_KNOWLEDGE =
 
   '## Screens\n\n' +
 
+  '**Onboarding** (`/onboarding` — a fresh install lands here automatically instead of Chat; already-finished installs never see it again) — a short guided setup wizard.\n' +
+  '- **Pick a profile**: Casual (chat, no setup), Developer (coding help — gets its own follow-up steps), Enthusiast (bigger models, tuning, experimental features), or Pro (max control — picks its own model/quant/engine, no recommendation card).\n' +
+  '- **Model step**: for Casual/Developer/Enthusiast, a model is recommended based on your actual detected hardware (VRAM, system RAM) — one click downloads it (checksum-verified, vision projector deliberately excluded to keep the download minimal). Everyone (including Pro) can also pick from models already on disk, or hand off to the real Hugging Face Discover tab and come back — the wizard resumes wherever it left off.\n' +
+  '- **Load step**: shows real download/load progress and advances automatically once the model is actually running — never a fake progress bar.\n' +
+  '- **Auto-tune offer** (Enthusiast/Developer/Pro, skipped entirely on hardware too small to benefit): optionally runs a real benchmark sweep before the payoff step, so the first real use is already tuned.\n' +
+  '- **Payoff**: Casual/Enthusiast start a real conversation; Developer saves their picked coding-agent default (turbollm or claude) and is handed to the real Code launchpad (repo picker, model picker, task composer) to start their first task — never a fabricated session. One click completes setup and lands you there.\n' +
+  '- **Skip any time** — a top-bar button and a plain link on every single step, never a confirmation dialog, and never destructive to a download or install already in progress.\n' +
+  '- **Resumable**: closing the tab mid-wizard picks back up at the same step; a banner on the Models screen offers to resume setup from anywhere if it was left unfinished.\n\n' +
+
   '**Chat** — main screen. Sidebar lists all conversations (threads), organized into\n' +
   '  **folders** (create/rename/delete via the sidebar\'s folder controls; move a conversation\n' +
   '  in/out via its "Move to folder" menu). Deleting a folder never deletes the conversations\n' +

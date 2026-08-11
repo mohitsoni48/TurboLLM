@@ -1,15 +1,18 @@
-import { lazy, Suspense, useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { lazy, Suspense, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react'
 import {
   Navigate,
   Route,
   Routes,
+  useLocation,
+  useNavigate,
 } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
 import { TooltipProvider } from './components/ui/tooltip'
 import { Shell } from './components/Shell'
 import { UnreachableOverlay } from './components/UnreachableOverlay'
 import { AuthGate } from './components/AuthGate'
-import { useStatus, useSettings } from './lib/queries'
+import { useStatus, useSettings, useDownloads } from './lib/queries'
+import { useOnboardingState } from './lib/onboarding-queries'
 import { ApiError, setAuthToken } from './lib/api'
 import { subscribeCodeAuthNeeded, isCodeAuthNeeded } from './lib/auth-signal'
 import { useRoutineNotificationPoller } from './lib/notify-routine'
@@ -29,6 +32,7 @@ const EnginesScreen = lazy(() => import('./screens/EnginesScreen').then((m) => (
 const DeveloperScreen = lazy(() => import('./screens/DeveloperScreen').then((m) => ({ default: m.DeveloperScreen })))
 const CustomizeScreen = lazy(() => import('./screens/CustomizeScreen').then((m) => ({ default: m.CustomizeScreen })))
 const SettingsScreen = lazy(() => import('./screens/SettingsScreen').then((m) => ({ default: m.SettingsScreen })))
+const OnboardingScreen = lazy(() => import('./screens/onboarding/OnboardingScreen').then((m) => ({ default: m.OnboardingScreen })))
 
 /** Minimal centered loader shown while a route chunk is fetching. */
 function ScreenFallback() {
@@ -43,10 +47,90 @@ function ScreenFallback() {
   )
 }
 
+/** Onboarding entry predicate (spec 25 §3): redirects to `/onboarding` while
+ *  it is unfinished AND the install has never once loaded a model
+ *  successfully — `everLoadedModel` is server-authoritative (set only from a
+ *  real successful load in `cli.ts`, never client-settable), so this cannot
+ *  be tricked into re-showing the wizard by a stale local flag.
+ *  While the query hasn't resolved yet, default to NOT redirecting — the same
+ *  conservative-default convention `routinesEnabled` already uses above,
+ *  so a slow first poll never flashes the wizard over a returning user's app.
+ *
+ *  `/models` is exempt. Caught by the E2E suite, not by typecheck or unit
+ *  tests: ModelStep sends the user to `/models` from several DESIGNED,
+ *  in-wizard exits — Pro's Discover handoff (ADR-338 Decision 6b, "the only
+ *  branch that leaves the wizard by design"), "use models I already have",
+ *  and "pick a different model". A blanket redirect bounced every one of
+ *  those straight back to `/onboarding` before the user ever saw Discover —
+ *  `onboarding.status` legitimately stays `pending` for all of them, since
+ *  visiting Discover is part of finishing the wizard, not leaving it. */
+function OnboardingGate({ shouldOnboard, children }: { shouldOnboard: boolean; children: ReactNode }) {
+  const location = useLocation()
+  const exempt = location.pathname === '/onboarding' || location.pathname === '/models'
+  if (shouldOnboard && !exempt) {
+    return <Navigate to="/onboarding" replace />
+  }
+  return <>{children}</>
+}
+
+/** ModelStep's Discover handoff (Pro, "pick a different model", "nothing fits this
+ *  machine") sends the user to `/models?tab=discover` by design — the `/models`
+ *  exemption above is exactly what lets that happen without bouncing straight back.
+ *  But nothing then brings them back once they've actually started (and finished) a
+ *  download there — found live: the download completed with no next action, leaving
+ *  onboarding stranded mid-wizard. Watches for a download's `downloading`→`done`
+ *  transition (not just "a done download exists", which would also fire on stale rows
+ *  from a completely unrelated earlier session) and returns to `/onboarding` only while
+ *  genuinely still mid-wizard and away from it. The wizard's own machine resumes from
+ *  whatever step it saved to localStorage before the handoff — LoadStep matches the
+ *  finished download on its own (see its header comment), no extra plumbing needed here. */
+function useResumeOnboardingAfterDiscoverDownload(shouldOnboard: boolean) {
+  const location = useLocation()
+  const navigate = useNavigate()
+  // `useDownloads()`'s own refetchInterval is tuned for DownloadsPanel's live progress bar —
+  // it self-disables the moment nothing is 'downloading'/'queued', INCLUDING "nothing has
+  // started yet." A small/fast download (or, found live, a raw API enqueue with no network
+  // latency) can go directly from nonexistent straight to 'done' between two polls, so this
+  // watcher needs its OWN unconditional poll — otherwise it may never observe the completion
+  // at all, not just miss the transient 'active' state.
+  const downloadsQ = useDownloads()
+  useEffect(() => {
+    if (!shouldOnboard) return
+    const id = setInterval(() => void downloadsQ.refetch(), 2000)
+    return () => clearInterval(id)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [shouldOnboard])
+
+  // Baseline, not transition-from-active: seeded with whatever is ALREADY 'done' on the
+  // first observation (so a pre-existing completed download never fires this on mount),
+  // then anything that becomes 'done' AFTER that baseline counts as "just finished" —
+  // regardless of whether an 'active' state was ever actually observed for it.
+  const seenDoneIds = useRef<Set<string> | null>(null)
+  useEffect(() => {
+    const downloads = downloadsQ.data?.downloads
+    if (!downloads) return
+    const doneIds = downloads.filter((d) => d.status === 'done').map((d) => d.id)
+    if (seenDoneIds.current === null) {
+      seenDoneIds.current = new Set(doneIds)
+      return
+    }
+    const justFinished = doneIds.some((id) => !seenDoneIds.current!.has(id))
+    for (const id of doneIds) seenDoneIds.current.add(id)
+    if (justFinished && shouldOnboard && location.pathname !== '/onboarding') {
+      navigate('/onboarding')
+    }
+  }, [downloadsQ.data, shouldOnboard, location.pathname, navigate])
+}
 
 export function App() {
   const statusQ = useStatus()
   const qc = useQueryClient()
+  const onboardingQ = useOnboardingState()
+  const shouldOnboard =
+    onboardingQ.data !== undefined &&
+    onboardingQ.data.status === 'pending' &&
+    !onboardingQ.data.everLoadedModel
+  useResumeOnboardingAfterDiscoverDownload(shouldOnboard)
 
   // Routines is experimental, off by default (Settings → Experimental, config.ts's
   // `daemon.experimental.routines`). `?? false` while settings hasn't loaded yet is the
@@ -102,7 +186,9 @@ export function App() {
     <TooltipProvider delayDuration={300}>
       <Shell status={statusQ.data} online={online} version={version}>
         <Suspense fallback={<ScreenFallback />}>
+          <OnboardingGate shouldOnboard={shouldOnboard}>
           <Routes>
+            <Route path="/onboarding" element={<OnboardingScreen />} />
             <Route path="/workspace" element={<Navigate to="/workspace/chat" replace />} />
             <Route path="/workspace/chat" element={<WorkspaceScreen />} />
             <Route path="/workspace/chat/:convId" element={<WorkspaceScreen />} />
@@ -145,6 +231,7 @@ export function App() {
             <Route path="/settings" element={<SettingsScreen />} />
             <Route path="*" element={<Navigate to="/workspace/chat" replace />} />
           </Routes>
+          </OnboardingGate>
         </Suspense>
       </Shell>
       {authLatched && (

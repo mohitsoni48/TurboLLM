@@ -25,6 +25,34 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.10.7] - 2026-08-11
+
+### Added
+
+- **A first-run setup wizard.** A fresh install now walks you through a short guided flow
+  instead of dropping you on an empty Chat screen: pick how you'll use TurboLLM (casual chat,
+  coding, tinkering, or full manual control), get a model recommended for your actual detected
+  hardware — or bring your own from a folder you already have — watch it download and load for
+  real, optionally auto-tune it, and try a real conversation or Code session before you're
+  handed off. Skippable from every single step (top bar and a plain link, never a "are you
+  sure?" dialog), safe to close mid-download, and resumable any time from a banner on the
+  Models screen.
+- **Developer profile hands off to the real Code launchpad** — pick "Developer" and your first
+  "Open Code" click lands you on the same repo/model/task picker the Code section already has,
+  not a mystery pre-made session.
+
+### Changed
+
+- The app nav is hidden while the setup wizard is open, and restored once you finish or skip it.
+
+### Discord
+
+- First run now walks you through picking a profile, getting a model recommended for your
+  actual hardware, and trying a real conversation — instead of dropping you on an empty chat
+  screen with no guidance.
+- Skip it from any step if you'd rather set things up yourself; nothing you do in the wizard
+  is ever destructive to work already in progress.
+
 ## [1.10.6] - 2026-08-07
 
 ### Fixed
