@@ -82,11 +82,17 @@ interface CacheRow {
   meta: GgufMeta
 }
 
-// Bump when GgufMeta gains a field so on-disk caches re-parse (see loadCache).
+// Bump when GgufMeta gains a field, OR when parseGguf's interpretation of an existing
+// field changes, so on-disk caches re-parse (see loadCache) instead of replaying a stale
+// value.
 // 4: attention-layout fields (sliding window / hybrid-SSM layout, ADR-223) — rows cached
 // by an older build predate the new keys, so re-parsing is what makes the improved KV
 // estimate actually apply to already-scanned models instead of only to new ones.
-const CACHE_VERSION = 4
+// 5: general.name now rejects known storage-format placeholder values (issue #165) —
+// without this bump, a model already in the cache with a bogus cached name (e.g. an APEX
+// GGUF's literal "Safetensors") keeps replaying it forever, since entryFor() only calls
+// parseGguf() again when size/mtime changed.
+const CACHE_VERSION = 5
 
 /** Optional attention-layout metadata the GGUF parser surfaces (ADR-223).
  *

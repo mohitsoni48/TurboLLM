@@ -656,9 +656,10 @@ export class Manager {
       // lifespan startup, so the socket never even binds on a preload failure — see
       // mlxVlmServerCommand's docblock) and a plain process exit already surfaces via
       // the exit handler above with a generic message; we still check it here because
-      // this path additionally recovers the real traceback line (e.g. "Failed to load
-      // model: ...") for a much more useful error than "exited unexpectedly". Detect a
-      // fatal load-failure traceback in the log and surface it as an engine error
+      // this path additionally recovers a real traceback line — when the crash trips one
+      // of detectPyLoadFailure's gate patterns; a bare "Failed to load model: ..." line on
+      // its own does not — for a much more useful error than "exited unexpectedly". Detect
+      // a fatal load-failure traceback in the log and surface it as an engine error
       // instead. (Checked before probeReady so we win the race.)
       if (kind === 'mlx' || kind === 'rapid-mlx' || kind === 'mlx-vlm' || kind === 'vllm' || kind === 'sglang') {
         const loadErr = detectPyLoadFailure(readTail(this.logPathStr, 200))
