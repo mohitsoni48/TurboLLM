@@ -91,6 +91,14 @@ const FTYPE: Record<number, string> = {
   28: 'IQ4_XS', 30: 'BF16',
 }
 
+// general.name values that are a storage-format word, not an actual model name — some
+// conversion pipelines fall back to the source checkpoint directory's name when the HF
+// config has none, and that directory is sometimes just a generic staging folder (e.g.
+// apex-quant's GGUFs all declare general.name "Safetensors" — issue #165). No real model
+// is named after its own file format, so treat these as if the key were absent and let
+// the caller fall back to the filename instead.
+const BOGUS_GENERAL_NAMES = new Set(['safetensors', 'gguf', 'pytorch', 'pytorch_model', 'bin', 'checkpoint', 'onnx'])
+
 // GGUF value types.
 const T_UINT8 = 0, T_INT8 = 1, T_UINT16 = 2, T_INT16 = 3, T_UINT32 = 4, T_INT32 = 5,
   T_FLOAT32 = 6, T_BOOL = 7, T_STRING = 8, T_ARRAY = 9, T_UINT64 = 10, T_INT64 = 11,
@@ -267,7 +275,10 @@ export function parseGguf(path: string): GgufMeta {
       const key = r.str()
       const t = r.u32()
       if (key === 'general.architecture') m.arch = String(readScalar(r, t))
-      else if (key === 'general.name') m.name = String(readScalar(r, t))
+      else if (key === 'general.name') {
+        const v = String(readScalar(r, t))
+        if (!BOGUS_GENERAL_NAMES.has(v.toLowerCase())) m.name = v
+      }
       else if (key === 'general.file_type') m.quant = FTYPE[Number(readScalar(r, t))] ?? ''
       else if (key === 'general.size_label') m.sizeLabel = String(readScalar(r, t))
       else if (key.endsWith('.context_length')) m.nativeCtx = readNumberOrMax(r, t)
@@ -329,8 +340,15 @@ export function parseGguf(path: string): GgufMeta {
   }
 }
 
-/** Best-effort quant from a filename token when general.file_type is absent/unknown. */
+/** Best-effort quant from a filename token when general.file_type is absent/unknown.
+ *  Also recognizes APEX (localai-org/apex-quant, issue #165) mixed-precision MoE quants,
+ *  which don't use llama.cpp's IQ-/Q-_K naming — just a tier word (optionally imatrix-
+ *  calibrated, prefixed "I-") after "APEX" in the filename, e.g.
+ *  "Qwen3.6-35B-A3B-APEX-MTP-I-Quality.gguf" → "APEX-I-QUALITY". */
 export function quantFromName(filename: string): string {
   const m = filename.match(/(I?Q\d[A-Z0-9_]*|BF16|F16|F32)/i)
-  return m ? m[1].toUpperCase() : '?'
+  if (m) return m[1].toUpperCase()
+  const apex = filename.match(/APEX(?:-[A-Za-z0-9]+){0,3}?-(I-)?(NANO|MINI|COMPACT|BALANCED|QUALITY)(?=\.|$|-)/i)
+  if (apex) return `APEX-${apex[1] ? 'I-' : ''}${apex[2].toUpperCase()}`
+  return '?'
 }
