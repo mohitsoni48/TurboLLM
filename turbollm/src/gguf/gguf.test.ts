@@ -7,7 +7,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { parseGguf } from './gguf'
+import { parseGguf, quantFromName } from './gguf'
 
 const T_UINT32 = 4
 const T_BOOL = 7
@@ -308,4 +308,64 @@ test('a plain dense model reports no attention-layout metadata at all', () => {
       assert.equal(meta.nativeCtx, 8192)
     },
   )
+})
+
+// ---- general.name bogus-value guard (issue #165) ------------------------------------
+// apex-quant's GGUFs all declare general.name "Safetensors" — apparently a leftover
+// staging-directory name from its conversion pipeline, not the model name. Confirmed
+// against a real download: mudler/Qwen3.6-35B-A3B-APEX-MTP-GGUF's I-Nano file has
+// general.name "Safetensors" while general.file_type correctly reads IQ2_XXS.
+
+test('a known storage-format word in general.name is treated as absent', () => {
+  withGgufFile(
+    [
+      ['general.architecture', 'qwen35moe'],
+      ['general.name', 'Safetensors'],
+    ],
+    (path) => {
+      assert.equal(parseGguf(path).name, '', 'caller falls back to the filename instead')
+    },
+  )
+})
+
+test('general.name guard is case-insensitive and covers the other known container words', () => {
+  for (const bogus of ['GGUF', 'PyTorch', 'pytorch_model', 'BIN', 'Checkpoint', 'onnx']) {
+    withGgufFile([['general.name', bogus]], (path) => {
+      assert.equal(parseGguf(path).name, '', `"${bogus}" must be rejected`)
+    })
+  }
+})
+
+test('a real model name that merely contains a format word as a substring survives', () => {
+  // The guard matches the full value, not a substring — must not reject legitimate names.
+  withGgufFile([['general.name', 'Safetensors Finetune 7B']], (path) => {
+    assert.equal(parseGguf(path).name, 'Safetensors Finetune 7B')
+  })
+})
+
+// ---- quantFromName (issue #165) ------------------------------------------------------
+
+test('quantFromName still recognizes standard llama.cpp quant tokens', () => {
+  assert.equal(quantFromName('llama-3-8b-instruct-Q4_K_M.gguf'), 'Q4_K_M')
+  assert.equal(quantFromName('model-IQ3_XS.gguf'), 'IQ3_XS')
+  assert.equal(quantFromName('model-F16.gguf'), 'F16')
+})
+
+test('quantFromName recognizes APEX mixed-precision MoE tiers', () => {
+  // Real filenames from mudler/Qwen3.6-35B-A3B-APEX-MTP-GGUF.
+  assert.equal(quantFromName('Qwen3.6-35B-A3B-APEX-MTP-Balanced.gguf'), 'APEX-BALANCED')
+  assert.equal(quantFromName('Qwen3.6-35B-A3B-APEX-MTP-Compact.gguf'), 'APEX-COMPACT')
+  assert.equal(quantFromName('Qwen3.6-35B-A3B-APEX-MTP-I-Balanced.gguf'), 'APEX-I-BALANCED')
+  assert.equal(quantFromName('Qwen3.6-35B-A3B-APEX-MTP-I-Compact.gguf'), 'APEX-I-COMPACT')
+  assert.equal(quantFromName('Qwen3.6-35B-A3B-APEX-MTP-I-Mini.gguf'), 'APEX-I-MINI')
+  assert.equal(quantFromName('Qwen3.6-35B-A3B-APEX-MTP-I-Nano.gguf'), 'APEX-I-NANO')
+  assert.equal(quantFromName('Qwen3.6-35B-A3B-APEX-MTP-I-Quality.gguf'), 'APEX-I-QUALITY')
+  assert.equal(quantFromName('Qwen3.6-35B-A3B-APEX-MTP-Quality.gguf'), 'APEX-QUALITY')
+  // The apex-quant project's own doc-style naming (no extra infix token).
+  assert.equal(quantFromName('model-apex-i-quality.gguf'), 'APEX-I-QUALITY')
+  assert.equal(quantFromName('model-apex-mini.gguf'), 'APEX-MINI')
+})
+
+test('quantFromName falls back to "?" when nothing recognizable is present', () => {
+  assert.equal(quantFromName('random-model-name.gguf'), '?')
 })
