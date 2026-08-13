@@ -196,6 +196,8 @@ const TURBOLLM_KNOWLEDGE =
   'Google\'s TurboQuant quantization engine — fork of llama.cpp for turbo-quantized models. Same llama-server interface as llama.cpp. Adds KV types `turbo3` and `turbo4`. On Windows: prebuilt has a UCRT defect; build from source with the in-app build tool.\n\n' +
   '**MLX** (macOS Apple Silicon only):\n' +
   'Loads MLX-format safetensors from HuggingFace or local dirs. KV/ctx controls hidden (dynamic sizing). If a model fails to load, TurboLLM detects the traceback instead of hanging and shows `model_load_failed`. Incomplete MLX shards show a re-download button.\n\n' +
+  '**MLX-VLM** (macOS Apple Silicon only, pip):\n' +
+  'Vision-language models on MLX — Qwen-VL, Gemma vision variants, LLaVA, and more — via `mlx_vlm.server`, a separate pip package, uv-provisioned into its own venv. No context/GPU-layer/KV knobs to set at load time, and no sampling-arg flags either (`mlx_vlm.server` has none) — sampling is per-conversation only, same as MLX.\n\n' +
   '**vLLM** (Linux / WSL2 only):\n' +
   'High-throughput engine for safetensors. Requires the vLLM venv (provisioned in-app). Hard dependency on `uvloop` (POSIX-only) — on Windows it fails immediately with a clear message directing the user to WSL2/Linux.\n\n' +
 

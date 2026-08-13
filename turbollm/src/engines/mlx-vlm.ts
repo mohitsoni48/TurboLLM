@@ -17,8 +17,8 @@
 // it's a large (multi-hundred-MB+) dependency that most mlx-vlm model families don't
 // need, and bundling it unconditionally would bloat every install for a subset of
 // architectures. If a user hits this error, the fix is a one-off
-// `uv pip install --python <this venv>/bin/python torch torchvision` into the venv
-// at `<root>/mlx-vlm/venv`.
+// `<bootstrapped uv binary> pip install --python <root>/mlx-vlm/venv/bin/python torch
+// torchvision` — see catalog.ts's mlx-vlm `note` for the user-facing version of this.
 import { existsSync, rmSync } from 'node:fs'
 import { execFile } from 'node:child_process'
 import { join } from 'node:path'

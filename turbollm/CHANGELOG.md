@@ -23,15 +23,31 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
+### Nothing yet.
+
+## [1.10.8] - 2026-08-13
+
 ### Added
 - **MLX-VLM engine** (macOS Apple Silicon only, pip). Vision-language models on Apple's MLX
   framework — Qwen-VL, Gemma vision variants, LLaVA, and more — via an OpenAI-compatible
   `mlx_vlm.server`. No context/GPU-layer/KV knobs to set at load time; sampling is
   per-conversation only, same as Rapid-MLX.
 
+### Fixed
+- **APEX quantized GGUFs (localai-org/apex-quant) are now detected correctly.** These models
+  were showing up with the model name literally displayed as "Safetensors" (confirmed: the
+  files declare that string in a metadata field that isn't actually the model name — apparently
+  a leftover from their conversion pipeline), and their quant tier wasn't recognized on the
+  Discover tab. The name now falls back to the filename, and APEX's tier names (Nano / Mini /
+  Compact / Balanced / Quality, optionally imatrix-calibrated) are recognized directly. If you
+  already had an APEX model downloaded and tuned/pinned under its old "Safetensors" name, its
+  saved load profile and pin won't carry over to the corrected name — re-run Auto-Tune once
+  after updating. (#165)
+
 ### Discord
 - **MLX-VLM is now a supported engine** — run vision-language models (Qwen-VL, Gemma vision,
   LLaVA, and more) locally on Apple Silicon with one-click install, no compiling required.
+- **Fixed APEX quantized models** showing up with the wrong name and an unrecognized quant tier.
 
 ## [1.10.7] - 2026-08-11
 
