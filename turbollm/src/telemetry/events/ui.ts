@@ -568,6 +568,8 @@ export const UI_ACTIONS = [
   'save_model_settings', 'reset_model_settings', 'dismiss_autotune_result', 'save_autotune_result',
   'cancel_autotune', 'start_autotune', 'reset_model_setting_field', 'set_model_setting_option',
   'remove_model_setting_chip',
+  // Model load presets (ADR-353).
+  'apply_model_preset', 'create_model_preset', 'rename_model_preset', 'delete_model_preset',
 
   'remove_build_search_dir', 'add_build_search_dir', 'recheck_build_prereqs',
   'copy_build_commands', 'close_build_guide', 'open_manual_build_handoff', 'start_engine_build',
