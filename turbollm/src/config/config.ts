@@ -1211,6 +1211,17 @@ export const ANY_ENGINE = '*'
  *  undefined if the model has no saved profile on any engine. The single read seam every
  *  caller routes through instead of indexing `cfg.modelProfiles[key]` directly. */
 export function getModelProfile(cfg: Config, modelKey: string, engineId: string): unknown {
+  // Pinned preset (ADR-353 D4) outranks the saved per-engine profiles — but ONLY when its
+  // engine matches. The engine check is load-bearing: engines keep independent tunes per model
+  // (issue #35), so a preset tuned on ONE engine must not shadow another engine's profile —
+  // auto-tune seeds its search from this function and needs "this engine's own" profile.
+  // A pin pointing at a deleted preset, or at a preset for another engine, falls straight
+  // through to the logic below. `?? {}` guards hand-built Configs that skip normalize().
+  const pinnedId = (cfg.lastPresetId ?? {})[modelKey]
+  if (pinnedId) {
+    const pinned = (cfg.modelPresets ?? {})[modelKey]?.find((p) => p.id === pinnedId)
+    if (pinned && (pinned.engineId === '' || pinned.engineId === engineId)) return pinned.profile
+  }
   const byEngine = cfg.modelProfiles[modelKey]
   if (!byEngine) return undefined
   const exact = byEngine[engineId]

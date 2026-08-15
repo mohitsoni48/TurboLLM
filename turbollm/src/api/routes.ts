@@ -1602,6 +1602,9 @@ export function registerApi(app: Hono, d: Deps): void {
     const engineId = c.req.query('engine') || d.registry.active()?.id || '*'
     d.store.update((cfg) => {
       setModelProfile(cfg, key, engineId, p)
+      // An explicit manual save means "this is my config now" and supersedes the pin. Without
+      // this the save silently does nothing: it writes modelProfiles, but reads return the pin.
+      if (cfg.lastPresetId[key]) delete cfg.lastPresetId[key]
     })
     return c.json(p)
   })
@@ -1613,6 +1616,9 @@ export function registerApi(app: Hono, d: Deps): void {
     const engineId = c.req.query('engine') || d.registry.active()?.id || '*'
     d.store.update((cfg) => {
       deleteModelProfile(cfg, key, engineId)
+      // Deliberate asymmetry: reset is per-engine, lastPresetId is per-model — a reset must not
+      // leave a stale pin shadowing the result.
+      if (cfg.lastPresetId[key]) delete cfg.lastPresetId[key]
     })
     return c.json({ ok: true })
   })

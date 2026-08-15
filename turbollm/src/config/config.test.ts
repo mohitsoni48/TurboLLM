@@ -327,6 +327,84 @@ test('preset seeding: a model with saved profiles but no presets gets one preset
   }
 })
 
+test('getModelProfile: a pinned preset wins for its engine, falls through for others', () => {
+  const cfg = defaultConfig()
+  const engineA = 'aaaa'
+  const engineB = 'bbbb'
+  cfg.modelProfiles = {
+    'm|q4|1': {
+      [engineA]: { profile: flatProfile({ ctx: 4096 }), updatedAt: '2026-01-01T00:00:00.000Z' },
+      [engineB]: { profile: flatProfile({ ctx: 16384 }), updatedAt: '2026-02-01T00:00:00.000Z' },
+    },
+  }
+  cfg.modelPresets = {
+    'm|q4|1': [
+      {
+        id: 'p-1',
+        name: 'Fast 4k',
+        engineId: engineA,
+        profile: flatProfile({ ctx: 4096, marker: 'preset' }),
+        updatedAt: '2026-03-01T00:00:00.000Z',
+        origin: 'manual',
+      },
+    ],
+  }
+  cfg.lastPresetId = { 'm|q4|1': 'p-1' }
+
+  // Engine A: the pinned preset's profile wins over engine A's own saved slot.
+  assert.deepEqual(getModelProfile(cfg, 'm|q4|1', engineA), flatProfile({ ctx: 4096, marker: 'preset' }))
+  // Engine B: the pin does NOT shadow another engine's profile — engine B's own slot wins.
+  assert.equal((getModelProfile(cfg, 'm|q4|1', engineB) as { ctx: number }).ctx, 16384)
+  // An engine with no slot of its own: still the per-engine fallback (engine B, most recent),
+  // not the pinned preset.
+  assert.equal((getModelProfile(cfg, 'm|q4|1', 'cccc') as { ctx: number }).ctx, 16384)
+})
+
+test('getModelProfile: a preset with engineId "" (any engine) wins for every engine', () => {
+  const cfg = defaultConfig()
+  cfg.modelProfiles = {
+    'm|q4|1': {
+      aaaa: { profile: flatProfile({ ctx: 4096 }), updatedAt: '2026-01-01T00:00:00.000Z' },
+      bbbb: { profile: flatProfile({ ctx: 16384 }), updatedAt: '2026-02-01T00:00:00.000Z' },
+    },
+  }
+  cfg.modelPresets = {
+    'm|q4|1': [
+      {
+        id: 'p-any',
+        name: 'Any engine',
+        engineId: '',
+        profile: flatProfile({ marker: 'preset-any' }),
+        updatedAt: '2026-03-01T00:00:00.000Z',
+        origin: 'manual',
+      },
+    ],
+  }
+  cfg.lastPresetId = { 'm|q4|1': 'p-any' }
+
+  for (const engineId of ['aaaa', 'bbbb', 'cccc']) {
+    assert.deepEqual(getModelProfile(cfg, 'm|q4|1', engineId), flatProfile({ marker: 'preset-any' }))
+  }
+})
+
+test('getModelProfile: a dangling pin (preset deleted) falls through to the pre-feature value', () => {
+  const cfg = defaultConfig()
+  const engineA = 'aaaa'
+  cfg.modelProfiles = {
+    'm|q4|1': {
+      [engineA]: { profile: flatProfile({ ctx: 4096 }), updatedAt: '2026-01-01T00:00:00.000Z' },
+    },
+  }
+  // Pin points at a preset that no longer exists (e.g. deleted via the API).
+  cfg.lastPresetId = { 'm|q4|1': 'gone' }
+  cfg.modelPresets = { 'm|q4|1': [] }
+  // AND a pin with no lastPresetId entry at all — both must behave exactly as pre-feature.
+  assert.equal((getModelProfile(cfg, 'm|q4|1', engineA) as { ctx: number }).ctx, 4096)
+  delete cfg.lastPresetId['m|q4|1']
+  assert.equal((getModelProfile(cfg, 'm|q4|1', engineA) as { ctx: number }).ctx, 4096)
+  assert.equal(getModelProfile(cfg, 'nope|q4|1', engineA), undefined)
+})
+
 test('preset seeding: a present-but-empty presets array is NOT re-seeded', () => {
   const path = tmpConfigPath()
   try {
