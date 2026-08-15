@@ -7,6 +7,7 @@ import { Agent, setGlobalDispatcher } from 'undici'
 import { registerApi } from './api/routes'
 import { registerChatRoutes } from './chat/chat-routes'
 import { registerChatAgentRoutes } from './chat/chat-agent-routes'
+import { registerPresetRoutes } from './api/preset-routes'
 import { registerAgentRoutes } from './agents/agent-routes'
 import { registerCodeRoutes } from './code/code-routes'
 import type { Deps } from './deps'
@@ -89,6 +90,7 @@ export function createApp(d: Deps): Hono {
   registerApi(app, d)
   registerChatRoutes(app, d)
   registerChatAgentRoutes(app, d)
+  registerPresetRoutes(app, d)
   registerAgentRoutes(app, d)
   registerCodeRoutes(app, d, d.codeRuns)
   registerTerminalRoutes(app, d)
