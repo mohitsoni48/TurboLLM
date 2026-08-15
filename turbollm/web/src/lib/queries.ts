@@ -220,6 +220,9 @@ export function useBenchActions() {
       onSuccess: (_d, _v) => {
         invalidate()
         void qc.invalidateQueries({ queryKey: ['model'] })
+        // Auto-tune mints a preset and pins it server-side (bench.ts persistBest), so the
+        // preset list and its pin are both stale after a save.
+        void qc.invalidateQueries({ queryKey: ['model-presets'] })
       },
     }),
   }
@@ -639,6 +642,9 @@ export function useModelActions() {
         invalidate()
         // Prefix-match ['model', key] invalidates every engine variant of the detail query.
         void qc.invalidateQueries({ queryKey: ['model', v.key] })
+        // A save can clear the pin server-side, and the presets panel derives its selection
+        // from that pin — refetch it or the dropdown keeps showing a preset as applied.
+        void qc.invalidateQueries({ queryKey: modelPresetKeys.forModel(v.key) })
       },
     }),
     reset: useMutation({
@@ -646,6 +652,7 @@ export function useModelActions() {
       onSuccess: (_d, v) => {
         invalidate()
         void qc.invalidateQueries({ queryKey: ['model', v.key] })
+        void qc.invalidateQueries({ queryKey: modelPresetKeys.forModel(v.key) })
       },
     }),
     load: useMutation({
@@ -696,7 +703,9 @@ export const modelPresetKeys = {
   forModel: (key: string) => ['model-presets', key] as const,
 }
 
-export function useModelPresets(modelKey: string | null): UseQueryResult<ModelPreset[]> {
+export function useModelPresets(
+  modelKey: string | null,
+): UseQueryResult<{ presets: ModelPreset[]; pinnedId: string | null }> {
   return useQuery({
     queryKey: modelPresetKeys.forModel(modelKey ?? ''),
     queryFn: () => fetchModelPresets(modelKey as string),

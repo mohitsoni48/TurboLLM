@@ -1,7 +1,7 @@
 // Model load preset HTTP routes (ADR-353). A preset is a named saved load-config for one
 // modelKey — many per model, versus the single per-(model, engine) profile in modelProfiles.
 // Conversations never see presets; the pin (cfg.lastPresetId) is what getModelProfile consults.
-//   GET    /api/v1/models/:key/presets            — list ModelPreset[], newest updatedAt first
+//   GET    /api/v1/models/:key/presets            — { presets, pinnedId }, newest updatedAt first
 //   POST   /api/v1/models/:key/presets            — create {name, engineId?, profile} → 201
 //   PUT    /api/v1/models/:key/presets/:id        — update {name?, engineId?, profile?}
 //   DELETE /api/v1/models/:key/presets/:id        — delete (keeps the array; clears a matching pin)
@@ -10,6 +10,7 @@ import type { Hono } from 'hono'
 import { randomUUID } from 'node:crypto'
 import type { Deps } from '../deps'
 import { MODEL_PRESET_CAP, type ModelPreset } from '../config/config'
+import { validateLoadProfileFields } from './profile-validate'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function err(c: any, status: number, code: string, message: string) {
@@ -21,29 +22,34 @@ async function body<T>(c: any): Promise<T> {
   try { return (await c.req.json()) as T } catch { return {} as T }
 }
 
-// A preset's profile is a LoadProfile — a plain JSON object. Arrays and scalars are rejected
-// at the boundary: a scalar profile would pass normalize() (profile is `unknown`) and then
-// break every consumer that indexes into it.
-function isProfileObject(v: unknown): v is Record<string, unknown> {
-  return typeof v === 'object' && v !== null && !Array.isArray(v)
-}
-
 export function registerPresetRoutes(app: Hono, d: Deps): void {
+  // Returns the pin alongside the list. The client cannot know which preset is active otherwise,
+  // and a dropdown that always opens on "No preset applied" is actively misleading: the pin is
+  // what getModelProfile serves on the next load.
   app.get('/api/v1/models/:key/presets', (c) => {
     const key = decodeURIComponent(c.req.param('key'))
-    const presets = d.store.snapshot().modelPresets[key] ?? []
-    return c.json([...presets].sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0)))
+    const snap = d.store.snapshot()
+    const presets = snap.modelPresets[key] ?? []
+    return c.json({
+      presets: [...presets].sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0)),
+      pinnedId: snap.lastPresetId[key] ?? null,
+    })
   })
 
   app.post('/api/v1/models/:key/presets', async (c) => {
     const key = decodeURIComponent(c.req.param('key'))
+    // Same model-existence guard PUT /models/:key/profile applies — without it any client can
+    // write presets under unlimited arbitrary keys into config.json.
+    if (!d.scanner.get(key)) return err(c, 404, 'no_such_model', 'No model with that key.')
     const b = await body<Partial<ModelPreset>>(c)
     if (typeof b.name !== 'string' || !b.name.trim()) {
       return err(c, 400, 'invalid_config_value', 'name is required.')
     }
-    if (!isProfileObject(b.profile)) {
-      return err(c, 400, 'invalid_config_value', 'profile must be a JSON object.')
-    }
+    // Field-level validation, not just shape: a pinned preset's profile is handed verbatim to
+    // profileToArgs, so a bad field here becomes a broken engine command line and every later
+    // load of that model fails. Must match PUT /models/:key/profile exactly.
+    const invalid = validateLoadProfileFields(b.profile, { requireCtx: true })
+    if (invalid) return err(c, 400, 'invalid_config_value', invalid)
     // Cap pre-check BEFORE store.update — update() runs validate() and throws, so a cap
     // breach here would be a 500. The cap is PER MODEL.
     if ((d.store.snapshot().modelPresets[key] ?? []).length >= MODEL_PRESET_CAP) {
@@ -72,13 +78,21 @@ export function registerPresetRoutes(app: Hono, d: Deps): void {
     if (b.name !== undefined && (typeof b.name !== 'string' || !b.name.trim())) {
       return err(c, 400, 'invalid_config_value', 'name must be a non-empty string.')
     }
-    if (b.profile !== undefined && !isProfileObject(b.profile)) {
-      return err(c, 400, 'invalid_config_value', 'profile must be a JSON object.')
+    if (b.profile !== undefined) {
+      // Partial-tolerant: a patch may omit ctx, but whatever it DOES set must be loadable.
+      const bad = validateLoadProfileFields(b.profile, { requireCtx: false })
+      if (bad) return err(c, 400, 'invalid_config_value', bad)
     }
+    // The 404 pre-check above happened before `await body()` yielded the event loop, so a delete
+    // for this same id can land in between. Track whether the preset still existed at write time
+    // and 404 rather than returning 200 with an empty body (which makes the client's res.json()
+    // throw a parse error instead of showing "Preset not found").
+    let stillExists = false
     d.store.update((cfg) => {
       const arr = cfg.modelPresets[key] ?? []
       const i = arr.findIndex((p) => p.id === id)
       if (i === -1) return
+      stillExists = true
       const p = arr[i]
       if (b.name !== undefined) p.name = b.name.trim()
       if (typeof b.engineId === 'string') p.engineId = b.engineId
@@ -89,7 +103,10 @@ export function registerPresetRoutes(app: Hono, d: Deps): void {
         p.updatedAt = new Date().toISOString()
       }
     })
-    return c.json((d.store.snapshot().modelPresets[key] ?? []).find((p) => p.id === id)!)
+    if (!stillExists) return err(c, 404, 'not_found', 'Preset not found.')
+    const updated = (d.store.snapshot().modelPresets[key] ?? []).find((p) => p.id === id)
+    if (!updated) return err(c, 404, 'not_found', 'Preset not found.')
+    return c.json(updated)
   })
 
   app.delete('/api/v1/models/:key/presets/:id', (c) => {
