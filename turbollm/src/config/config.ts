@@ -1152,11 +1152,20 @@ export function prunePresets(cfg: Config, modelKey: string): void {
   )
   let cur = excess.size === 0 ? arr : arr.filter((p) => !excess.has(p.id))
 
-  // Rule 4.
+  // Rule 4. Note this can remove a MANUAL preset — a save the user made by hand — because an
+  // over-cap array makes validate() throw and would then break every unrelated config write.
+  // That trade is deliberate, but it must never be silent: losing your own saved config with no
+  // feedback is worse than the log line being noisy.
   while (cur.length > MODEL_PRESET_CAP) {
     const candidates = cur.filter((p) => p.id !== pinnedId).sort(byOldest)
     if (candidates.length === 0) break
-    cur = cur.filter((p) => p.id !== candidates[0].id)
+    const victim = candidates[0]
+    if (victim.origin === 'manual') {
+      console.warn(
+        `[presets] model "${modelKey}" is at the ${MODEL_PRESET_CAP}-preset cap — deleting your oldest saved preset "${victim.name}" (${victim.updatedAt}) to make room. Delete some presets to stop this.`,
+      )
+    }
+    cur = cur.filter((p) => p.id !== victim.id)
   }
 
   if (cur.length > MODEL_PRESET_CAP) {

@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
+﻿import { useEffect, useMemo, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
 import { ChevronDown, ExternalLink, Gauge, MoreHorizontal, RotateCcw, Save, X, Zap } from 'lucide-react'
 import { ApiError, track } from '../../lib/api'
 import { useBenchActions, useBenchState, useEngines, useModelActions, useModelDetail, useModelPresetMutations, useModelPresets, useStatus } from '../../lib/queries'
@@ -68,18 +68,15 @@ function PresetsPanel({
   draft,
   onApplyPreset,
   activeEngineId,
-  save,
-  reset,
 }: {
   modelKey: string
   draft: LoadProfile
   onApplyPreset: (profile: Partial<LoadProfile>) => void
   activeEngineId?: string
-  save: { isPending: boolean; isSuccess: boolean }
-  reset: { isPending: boolean; isSuccess: boolean }
 }) {
   const presetsQ = useModelPresets(modelKey)
-  const presets = presetsQ.data ?? []
+  const presets = presetsQ.data?.presets ?? []
+  const pinnedId = presetsQ.data?.pinnedId ?? null
   const m = useModelPresetMutations(modelKey)
   const enginesQ = useEngines()
   const engineName = (id: string) => enginesQ.data?.engines.find((e) => e.id === id)?.name ?? id
@@ -91,26 +88,15 @@ function PresetsPanel({
   const [nameValue, setNameValue] = useState('')
   const [deleteTarget, setDeleteTarget] = useState<ModelPreset | null>(null)
 
-  // A successful profile save or reset clears the pin server-side — drop the local
-  // "applied" selection so the dropdown never asserts a state that no longer exists.
-  // Watch the pending→settled transition of each mutation (isSuccess tells success
-  // apart from error; a failed save must NOT clear the selection).
-  const savePending = useRef(false)
+  // The selection MIRRORS the server pin rather than being tracked independently. `selectedId`
+  // used to start null on every mount and no endpoint returned the pin, so the dropdown read
+  // "No preset applied" every time the panel opened — even though that pin is exactly what
+  // getModelProfile serves on the next load. Deriving it from the pin also removes the need to
+  // guess when to clear: a profile save/reset that drops the pin, an auto-tune that sets one, or
+  // a delete of the pinned preset all invalidate this query and flow through here.
   useEffect(() => {
-    if (save.isPending) savePending.current = true
-    else if (savePending.current) {
-      savePending.current = false
-      if (save.isSuccess) setSelectedId(null)
-    }
-  }, [save.isPending, save.isSuccess])
-  const resetPending = useRef(false)
-  useEffect(() => {
-    if (reset.isPending) resetPending.current = true
-    else if (resetPending.current) {
-      resetPending.current = false
-      if (reset.isSuccess) setSelectedId(null)
-    }
-  }, [reset.isPending, reset.isSuccess])
+    setSelectedId(pinnedId)
+  }, [pinnedId])
 
   const selected = presets.find((p) => p.id === selectedId) ?? null
   const mismatch = !!selected && selected.engineId !== '' && selected.engineId !== activeEngineId
@@ -141,6 +127,9 @@ function PresetsPanel({
   const confirmName = () => {
     const name = nameValue.trim()
     if (!name || !nameDialog) return
+    // The Enter path keeps the dialog open until the mutation settles, so two quick presses
+    // would fire two POSTs and create two identically-named presets (only ids are unique).
+    if (m.create.isPending || m.update.isPending) return
     if (nameDialog.mode === 'save') {
       track('models', 'create_model_preset')
       m.create.mutate(
@@ -266,7 +255,12 @@ function PresetsPanel({
           />
           <AlertDialogFooter>
             <AlertDialogCancel onClick={() => setNameDialog(null)}>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={confirmName}>{nameDialog?.mode === 'save' ? 'Save' : 'Rename'}</AlertDialogAction>
+            <AlertDialogAction
+              onClick={(e) => { e.preventDefault(); confirmName() }}
+              disabled={m.create.isPending || m.update.isPending}
+            >
+              {nameDialog?.mode === 'save' ? 'Save' : 'Rename'}
+            </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
@@ -492,8 +486,6 @@ export function ModelDetailDialog({
               draft={draft}
               onApplyPreset={(profile) => setDraft((d) => (d ? mergePresetIntoDraft(d, profile) : d))}
               activeEngineId={activeEngine?.id}
-              save={actions.save}
-              reset={actions.reset}
             />
 
             {fit && (

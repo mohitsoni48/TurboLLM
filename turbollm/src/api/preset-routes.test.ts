@@ -18,6 +18,8 @@ function fakeApp(cfg: Config): Hono {
       snapshot: () => cfg,
       update: (fn: (c: Config) => void) => fn(cfg),
     },
+    // The create route guards on model existence, like PUT /models/:key/profile does.
+    scanner: { get: (k: string) => (k === KEY ? { key: KEY } : undefined) },
   } as unknown as Deps
   registerPresetRoutes(app, d)
   return app
@@ -27,7 +29,7 @@ test('GET /presets: empty for a model with none', async () => {
   const app = fakeApp(defaultConfig())
   const res = await app.request(`/api/v1/models/${KEY}/presets`)
   assert.equal(res.status, 200)
-  assert.deepEqual(await res.json(), [])
+  assert.deepEqual(await res.json(), { presets: [], pinnedId: null })
 })
 
 test('GET /presets: newest updatedAt first', async () => {
@@ -38,8 +40,13 @@ test('GET /presets: newest updatedAt first', async () => {
       { id: 'new', name: 'New', engineId: '', profile: {}, updatedAt: '2026-02-01T00:00:00.000Z', origin: 'autotune' },
     ],
   }
+  cfg.lastPresetId = { [KEY]: 'old' }
   const res = await fakeApp(cfg).request(`/api/v1/models/${KEY}/presets`)
-  assert.deepEqual(((await res.json()) as Array<{ id: string }>).map((p) => p.id), ['new', 'old'])
+  const body = (await res.json()) as { presets: Array<{ id: string }>; pinnedId: string | null }
+  assert.deepEqual(body.presets.map((p) => p.id), ['new', 'old'])
+  // The pin has to reach the client: without it the dropdown cannot show which preset is
+  // active, even though the pin is exactly what getModelProfile serves on the next load.
+  assert.equal(body.pinnedId, 'old')
 })
 
 test('POST /presets: create → 201 with a minted id, origin manual, engineId defaulting to ""', async () => {
@@ -99,7 +106,7 @@ test('POST /presets: past the per-model cap → 400 too_many_presets, NOT a 500'
       id: `p-${i}`,
       name: `Preset ${i}`,
       engineId: '',
-      profile: {},
+      profile: { ctx: 4096 },
       updatedAt: `2026-01-01T00:00:${String(i).padStart(2, '0')}.000Z`,
       origin: 'manual' as const,
     })),
@@ -107,7 +114,7 @@ test('POST /presets: past the per-model cap → 400 too_many_presets, NOT a 500'
   const res = await fakeApp(cfg).request(`/api/v1/models/${KEY}/presets`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: 'One too many', profile: {} }),
+    body: JSON.stringify({ name: 'One too many', profile: { ctx: 4096 } }),
   })
   assert.equal(res.status, 400)
   assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'too_many_presets')
@@ -228,4 +235,37 @@ test('POST /presets/:id/apply: unknown id → 404 and no pin written', async () 
   const res = await fakeApp(cfg).request(`/api/v1/models/${KEY}/presets/nope/apply`, { method: 'POST' })
   assert.equal(res.status, 404)
   assert.equal(cfg.lastPresetId?.[KEY], undefined)
+})
+
+test('POST /presets: an unknown model key → 404 (matches PUT /models/:key/profile)', async () => {
+  const res = await fakeApp(defaultConfig()).request('/api/v1/models/nope%7Cq4%7C1/presets', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'x', profile: { ctx: 4096 } }),
+  })
+  assert.equal(res.status, 404)
+  assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'no_such_model')
+})
+
+test('POST /presets: bad profile FIELDS are rejected, not just bad shape', async () => {
+  // A pinned preset's profile goes verbatim to profileToArgs. Accepting these here would let a
+  // preset be pinned that makes the model unloadable until the pin is cleared by hand.
+  const app = fakeApp(defaultConfig())
+  const bad: Array<Record<string, unknown>> = [
+    { ctx: 1 },
+    { ctx: 4096, nCpuMoe: null },
+    { ctx: 4096, ngl: -1 },
+    { ctx: 4096, gpu: { splitMode: 'nonsense', tensorSplit: [], mainGpu: 0, tensorParallelSize: 1 } },
+    { ctx: 4096, gpu: { splitMode: 'layer', tensorSplit: 'not-an-array', mainGpu: 0, tensorParallelSize: 1 } },
+    { ctx: 4096, gpu: { splitMode: 'layer', tensorSplit: [], mainGpu: -99, tensorParallelSize: 1 } },
+    { ctx: 4096, gpu: { splitMode: 'layer', tensorSplit: [], mainGpu: 0, tensorParallelSize: 0 } },
+  ]
+  for (const profile of bad) {
+    const res = await app.request(`/api/v1/models/${KEY}/presets`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Bad fields', profile }),
+    })
+    assert.equal(res.status, 400, `expected 400 for ${JSON.stringify(profile)}`)
+  }
 })

@@ -483,8 +483,10 @@ export function resetModelProfile(key: string, engineId: string): Promise<{ ok: 
 
 // ── Model load presets (ADR-353) ─────────────────────────────────────────────
 /** List a model's presets, newest updatedAt first. */
-export function fetchModelPresets(modelKey: string): Promise<ModelPreset[]> {
-  return request<ModelPreset[]>(`/api/v1/models/${encodeURIComponent(modelKey)}/presets`)
+export function fetchModelPresets(modelKey: string): Promise<{ presets: ModelPreset[]; pinnedId: string | null }> {
+  return request<{ presets: ModelPreset[]; pinnedId: string | null }>(
+    `/api/v1/models/${encodeURIComponent(modelKey)}/presets`,
+  )
 }
 
 /** Create a preset from the current draft. 400 `too_many_presets` at the per-model cap. */

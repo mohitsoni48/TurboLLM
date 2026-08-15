@@ -55,6 +55,7 @@ import { HfError, type HfSortOption } from '../hf/hf'
 import { DownloadError } from '../downloads/downloads'
 import { BenchError } from '../bench/bench'
 import { inferRepoFromPath } from './path-utils'
+import { validateLoadProfileFields, profilesEqual } from './profile-validate'
 import { screenshotArtifact, findChrome } from '../artifacts/screenshot'
 import { readQueue, remove as removeQueued } from '../telemetry/queue'
 import { sendConsentChoice } from '../telemetry/consent'
@@ -1569,42 +1570,30 @@ export function registerApi(app: Hono, d: Deps): void {
     const e = d.scanner.get(key)
     if (!e) return err(c, 404, 'no_such_model', 'No model with that key.')
     const p = await body<LoadProfile>(c)
-    if (!p || typeof p.ctx !== 'number' || p.ctx < 256) {
-      return err(c, 400, 'invalid_profile_value', 'ctx must be at least 256.')
-    }
-    // Multi-GPU split settings (ADR-054). Validate only when present so older clients
-    // that omit `gpu` still save cleanly.
-    if (p.gpu) {
-      const g = p.gpu
-      if (!['layer', 'row', 'none'].includes(g.splitMode)) {
-        return err(c, 400, 'invalid_profile_value', 'gpu.splitMode must be layer, row, or none.')
-      }
-      if (!Array.isArray(g.tensorSplit) || g.tensorSplit.some((n) => typeof n !== 'number' || !(n >= 0))) {
-        return err(c, 400, 'invalid_profile_value', 'gpu.tensorSplit must be an array of non-negative numbers.')
-      }
-      if (!Number.isInteger(g.mainGpu) || g.mainGpu < -1) {
-        return err(c, 400, 'invalid_profile_value', 'gpu.mainGpu must be an integer ≥ -1.')
-      }
-      if (!Number.isInteger(g.tensorParallelSize) || g.tensorParallelSize < 1) {
-        return err(c, 400, 'invalid_profile_value', 'gpu.tensorParallelSize must be an integer ≥ 1.')
-      }
-    }
-    // profileToArgs now emits --n-cpu-moe explicitly at every value including 0 (2026-08-06
-    // fix) instead of silently omitting it when falsy — a stored `null`/non-number would
-    // previously just get skipped, but now becomes a literal `--n-cpu-moe null` on the launch
-    // command line. Reject it here at the boundary rather than let it reach the engine. A
-    // genuinely absent key (older client, dense-model-only save) is still allowed through.
-    if (p.nCpuMoe !== undefined && (typeof p.nCpuMoe !== 'number' || !Number.isFinite(p.nCpuMoe) || p.nCpuMoe < 0)) {
-      return err(c, 400, 'invalid_profile_value', 'nCpuMoe must be a non-negative number.')
-    }
+    // Field validation lives in profile-validate.ts because the preset routes are a SECOND way
+    // into the same storage and must reject exactly the same things (ADR-353) — a bad field here
+    // reaches profileToArgs and the engine command line.
+    const invalid = validateLoadProfileFields(p, { requireCtx: true })
+    if (invalid) return err(c, 400, 'invalid_profile_value', invalid)
     // Per-engine profile (issue #35): save into the slot for the engine the client is
     // editing (?engine=<id>), falling back to the active engine, then the '*' fallback.
     const engineId = c.req.query('engine') || d.registry.active()?.id || '*'
     d.store.update((cfg) => {
       setModelProfile(cfg, key, engineId, p)
-      // An explicit manual save means "this is my config now" and supersedes the pin. Without
-      // this the save silently does nothing: it writes modelProfiles, but reads return the pin.
-      if (cfg.lastPresetId[key]) delete cfg.lastPresetId[key]
+      // An explicit manual save that CHANGES something supersedes the pin: PUT writes
+      // modelProfiles, but getModelProfile returns the pin first, so a stale pin makes the save
+      // look like it did nothing. Two exceptions, both found in review:
+      //  - A save identical to the pinned preset is not a divergence. "Remember these settings"
+      //    is ON by default and fires exactly this save on the draft the preset just filled in —
+      //    unpinning there silently broke "your pick is remembered and auto-applied next load".
+      //  - The pin is per-MODEL, this save is per-ENGINE. Clearing a pin belonging to a DIFFERENT
+      //    engine drops that engine's tune for an edit unrelated to it (issue #35's contract).
+      const pinnedId = cfg.lastPresetId[key]
+      if (pinnedId) {
+        const pinned = (cfg.modelPresets[key] ?? []).find((x) => x.id === pinnedId)
+        const thisEngine = !pinned || pinned.engineId === '' || pinned.engineId === engineId
+        if (thisEngine && !(pinned && profilesEqual(pinned.profile, p))) delete cfg.lastPresetId[key]
+      }
     })
     return c.json(p)
   })
@@ -1616,9 +1605,14 @@ export function registerApi(app: Hono, d: Deps): void {
     const engineId = c.req.query('engine') || d.registry.active()?.id || '*'
     d.store.update((cfg) => {
       deleteModelProfile(cfg, key, engineId)
-      // Deliberate asymmetry: reset is per-engine, lastPresetId is per-model — a reset must not
-      // leave a stale pin shadowing the result.
-      if (cfg.lastPresetId[key]) delete cfg.lastPresetId[key]
+      // A reset must not leave a stale pin shadowing the result — but only for the engine being
+      // reset. The pin is per-MODEL and this reset is per-ENGINE, so clearing a pin that belongs
+      // to a different engine would drop that engine's tune for an unrelated action (issue #35).
+      const pinnedId = cfg.lastPresetId[key]
+      if (pinnedId) {
+        const pinned = (cfg.modelPresets[key] ?? []).find((x) => x.id === pinnedId)
+        if (!pinned || pinned.engineId === '' || pinned.engineId === engineId) delete cfg.lastPresetId[key]
+      }
     })
     return c.json({ ok: true })
   })
