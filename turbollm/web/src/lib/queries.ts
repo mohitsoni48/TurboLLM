@@ -90,6 +90,11 @@ import {
   addChatAgent,
   updateChatAgent,
   deleteChatAgent,
+  fetchModelPresets,
+  createModelPreset,
+  updateModelPreset,
+  deleteModelPreset,
+  applyModelPreset,
   fetchBuiltinAgentOverrides,
   saveBuiltinAgentOverride,
   resetBuiltinAgentOverride,
@@ -124,6 +129,7 @@ import type {
   LoadProfile,
   ModelDetail,
   ModelDirs,
+  ModelPreset,
   ModelsList,
   Status,
   TokenUsageStats,
@@ -681,6 +687,45 @@ export function useChatAgentMutations() {
     add: useMutation({ mutationFn: (a: Omit<CustomAgent, 'id'>) => addChatAgent(a), onSuccess: refresh }),
     update: useMutation({ mutationFn: ({ id, patch }: { id: string; patch: Partial<Omit<CustomAgent, 'id'>> }) => updateChatAgent(id, patch), onSuccess: refresh }),
     remove: useMutation({ mutationFn: (id: string) => deleteChatAgent(id), onSuccess: refresh }),
+  }
+}
+
+// ── Model load presets (ADR-353) ─────────────────────────────────────────────
+
+export const modelPresetKeys = {
+  forModel: (key: string) => ['model-presets', key] as const,
+}
+
+export function useModelPresets(modelKey: string | null): UseQueryResult<ModelPreset[]> {
+  return useQuery({
+    queryKey: modelPresetKeys.forModel(modelKey ?? ''),
+    queryFn: () => fetchModelPresets(modelKey as string),
+    enabled: !!modelKey,
+    staleTime: 0,
+  })
+}
+
+export function useModelPresetMutations(modelKey: string) {
+  const qc = useQueryClient()
+  const refresh = () => {
+    void qc.invalidateQueries({ queryKey: modelPresetKeys.forModel(modelKey) })
+    // /apply and delete change what GET /models/:key returns (the pinned preset outranks the
+    // saved profiles) — without the second invalidation an applied preset silently reverts on
+    // the next refetch.
+    void qc.invalidateQueries({ queryKey: ['model', modelKey] })
+  }
+  return {
+    create: useMutation({
+      mutationFn: (p: { name: string; engineId?: string; profile: Partial<LoadProfile> }) => createModelPreset(modelKey, p),
+      onSuccess: refresh,
+    }),
+    update: useMutation({
+      mutationFn: ({ id, patch }: { id: string; patch: { name?: string; engineId?: string; profile?: Partial<LoadProfile> } }) =>
+        updateModelPreset(modelKey, id, patch),
+      onSuccess: refresh,
+    }),
+    remove: useMutation({ mutationFn: (id: string) => deleteModelPreset(modelKey, id), onSuccess: refresh }),
+    apply: useMutation({ mutationFn: (id: string) => applyModelPreset(modelKey, id), onSuccess: refresh }),
   }
 }
 
