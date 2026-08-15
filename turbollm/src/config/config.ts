@@ -778,13 +778,20 @@ function normalize(c: Config): void {
       ([, e]) => !!e && typeof e === 'object' && typeof e.updatedAt === 'string' && e.profile !== undefined,
     )
     if (entries.length === 0) continue
-    // Naming: one slot → "Saved". Several → "Saved (<engine name>)" using Engine.name VERBATIM
-    // (it is a full build label — do not prettify), falling back to "Saved" for the reserved
-    // ANY_ENGINE slot or an engine that no longer exists. Duplicates get " (2)", " (3)"…
+    // Naming. One slot → "Saved". Several → qualify each one so they can be told apart in the
+    // dropdown, because a list of "Saved", "Saved (2)", "Saved (3)" is useless for choosing:
+    //   - engine still installed → "Saved (<engine name>)", using Engine.name VERBATIM (it is a
+    //     full build label — do not prettify).
+    //   - reserved ANY_ENGINE slot, or an engine since UNINSTALLED → fall back to the profile's
+    //     own save date, "Saved (YYYY-MM-DD)". A date is what the user actually has to go on
+    //     once the engine that produced it is gone; an engine id would be noise. Uninstalled
+    //     engines are the COMMON case on a machine that churns through builds, not an edge case.
+    //   - anything still colliding after that (two slots saved the same day) → " (2)", " (3)"…
     const seen = new Map<string, number>()
     c.modelPresets[modelKey] = entries.map(([engineId, entry]) => {
       const engine = engineId === ANY_ENGINE ? undefined : c.engines.find((e) => e.id === engineId)
-      const base = entries.length === 1 || !engine ? 'Saved' : `Saved (${engine.name})`
+      const qualifier = engine ? engine.name : entry.updatedAt.slice(0, 10)
+      const base = entries.length === 1 ? 'Saved' : `Saved (${qualifier})`
       const n = (seen.get(base) ?? 0) + 1
       seen.set(base, n)
       return {

@@ -330,6 +330,78 @@ test('preset seeding: a model with saved profiles but no presets gets one preset
   }
 })
 
+test('preset seeding: slots whose engine is UNINSTALLED are named by save date, not "Saved (2)"', () => {
+  // The real-world shape on a machine that churns through engine builds: a model carries
+  // several profile slots whose engines have since been removed. Naming them all plain
+  // "Saved" and disambiguating with (2)/(3) leaves the dropdown unusable — you cannot tell
+  // which is which. Each falls back to its own save date instead.
+  const path = tmpConfigPath()
+  try {
+    const live = 'live-engine-id'
+    const gone1 = 'uninstalled-engine-1'
+    const gone2 = 'uninstalled-engine-2'
+    const v4 = {
+      ...defaultConfig(),
+      engines: [
+        {
+          id: live,
+          name: 'Prism',
+          binPath: '/opt/prism-server',
+          kind: 'llama-server',
+          version: 'b1',
+          capabilities: { kvTypes: ['f16'], flags: [] },
+          addedAt: '2026-01-01T00:00:00.000Z',
+        },
+      ],
+      modelProfiles: {
+        'g|q4|1': {
+          [ANY_ENGINE]: { profile: flatProfile({ ctx: 1024 }), updatedAt: '2026-05-01T00:00:00.000Z' },
+          [live]: { profile: flatProfile({ ctx: 2048 }), updatedAt: '2026-06-01T00:00:00.000Z' },
+          [gone1]: { profile: flatProfile({ ctx: 4096 }), updatedAt: '2026-07-01T00:00:00.000Z' },
+          [gone2]: { profile: flatProfile({ ctx: 8192 }), updatedAt: '2026-08-01T00:00:00.000Z' },
+        },
+      },
+    }
+    writeFileSync(path, JSON.stringify(v4))
+
+    const seeded = ConfigStore.load(path).snapshot().modelPresets['g|q4|1'] ?? []
+    assert.deepEqual(seeded.map((p) => p.name), [
+      'Saved (2026-05-01)',   // ANY_ENGINE slot → its own date
+      'Saved (Prism)',        // engine still installed → its verbatim build label
+      'Saved (2026-07-01)',   // engine uninstalled → date, NOT "Saved (2)"
+      'Saved (2026-08-01)',
+    ])
+    // Every name is distinct — that is the whole point.
+    assert.equal(new Set(seeded.map((p) => p.name)).size, seeded.length)
+    // The ANY_ENGINE slot still normalizes its engineId to '' (matches any engine on read).
+    assert.equal(seeded[0].engineId, '')
+    assert.equal(seeded[1].engineId, live)
+  } finally {
+    cleanup(path)
+  }
+})
+
+test('preset seeding: two slots saved the SAME day still disambiguate with a numeric suffix', () => {
+  const path = tmpConfigPath()
+  try {
+    const v4 = {
+      ...defaultConfig(),
+      engines: [],
+      modelProfiles: {
+        'h|q4|1': {
+          'gone-a': { profile: flatProfile({ ctx: 1024 }), updatedAt: '2026-08-01T09:00:00.000Z' },
+          'gone-b': { profile: flatProfile({ ctx: 2048 }), updatedAt: '2026-08-01T18:00:00.000Z' },
+        },
+      },
+    }
+    writeFileSync(path, JSON.stringify(v4))
+    const seeded = ConfigStore.load(path).snapshot().modelPresets['h|q4|1'] ?? []
+    assert.deepEqual(seeded.map((p) => p.name), ['Saved (2026-08-01)', 'Saved (2026-08-01) (2)'])
+  } finally {
+    cleanup(path)
+  }
+})
+
 test('getModelProfile: a pinned preset wins for its engine, falls through for others', () => {
   const cfg = defaultConfig()
   const engineA = 'aaaa'
