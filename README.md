@@ -222,6 +222,15 @@ the detail:
 - **Saved per-model profiles, per engine** — tune once per (model, engine) pair, so
   switching engines (or between two installs of the same engine, e.g. a fork) never
   overwrites another engine's tuning for the same model.
+- **Named load presets, many per model** — keep "max speed 32k" *and* "200k long context"
+  side by side instead of the second tune overwriting the first. Pick one from the Model
+  Detail panel to fill the load parameters (it's remembered and auto-applied on the next
+  load), **Save as…** captures the current settings, and rename/delete live in the ⋯ menu.
+  **Auto-tune mints a preset every time you save one** — named `Auto-tune <date>` and badged
+  with its measured tok/s — so every tune becomes browsable, restorable history rather than
+  a one-slot overwrite. The ten newest auto-tune presets are kept; your own saves are never
+  pruned. Existing profiles carry over as presets automatically, and a model with no presets
+  behaves exactly as before.
 - **Configurable VRAM headroom** (Settings → Models & loading → Advanced, 300 MB–2 GB, default
   1 GB) — tell auto-tune how much VRAM to keep free for other GPU workloads instead of a fixed margin.
   Drag it to 0 to opt into an experimental **MoE "VRAM-spill" search** — auto-tune keeps pushing more
