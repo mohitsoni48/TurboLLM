@@ -376,6 +376,21 @@ export interface ProfileEntry {
   profile: unknown
   updatedAt: string
 }
+/** A named saved load-config for a model (ADR-353). Many per modelKey, versus the single
+ *  per-(model, engine) ProfileEntry in Config.modelProfiles. `profile` is `unknown`
+ *  deliberately: config.ts must not import LoadProfile from models/profile.ts, which imports
+ *  from this file. Consumers cast, exactly as every ProfileEntry.profile call site does. */
+export interface ModelPreset {
+  id: string
+  name: string
+  /** Engine this preset was tuned on; '' = any engine. */
+  engineId: string
+  profile: unknown
+  updatedAt: string
+  origin: 'manual' | 'autotune'
+  /** tok/s measured by the auto-tune run that minted this (origin === 'autotune'). */
+  benchTps?: number
+}
 export interface Config {
   version: number
   daemon: Daemon
@@ -400,6 +415,13 @@ export interface Config {
    *  profile into a single entry under the reserved engineId `'*'` (see {@link normalize}).
    *  `profile` values are still `unknown` (validated/shaped elsewhere as {@link LoadProfile}). */
   modelProfiles: Record<string, Record<string, ProfileEntry>>
+  /** Named model load presets (ADR-353): modelKey → presets. Complements modelProfiles, which
+   *  stays, keeps being written, and remains the fallback — zero presets ⇒ behaviour identical
+   *  to pre-feature. Seeded from modelProfiles on load; accumulates as auto-tune mints. */
+  modelPresets: Record<string, ModelPreset[]>
+  /** Pinned preset per model (ADR-353 D4): modelKey → preset id. Cleared by a manual profile
+   *  save, a profile reset, and deleting the pinned preset. */
+  lastPresetId: Record<string, string>
   /** Persisted auto-tune results keyed by modelKey (spec 09 §1, 01 §4). Additive;
    *  absent in old configs → normalize seeds {}. Never throws on load. */
   benchResults: Record<string, BenchResult>
@@ -549,6 +571,8 @@ export function defaultConfig(): Config {
     modelDirs: [],
     primaryModelDir: '',
     modelProfiles: {},
+    modelPresets: {},
+    lastPresetId: {},
     benchResults: {},
     vramHeadroomMb: VRAM_HEADROOM_DEFAULT_MB,
     lastLoaded: { modelKey: '', engineId: '' },
@@ -869,6 +893,41 @@ function normalize(c: Config): void {
         tools: Array.isArray(a.tools) ? a.tools.filter((t): t is string => typeof t === 'string') : [],
       }))
     : []
+  // Model load presets (ADR-353): absent in pre-feature configs → {}. Defensively filter to
+  // well-shaped entries rather than throwing on a hand-edited config. Arrays are KEPT even when
+  // they filter down to EMPTY — a present-but-empty array means "already seeded" to the seed
+  // migration, and dropping the key would resurrect deleted presets on the next load.
+  c.modelPresets ??= {}
+  const cleanedPresets: Record<string, ModelPreset[]> = {}
+  for (const [modelKey, rawArr] of Object.entries(c.modelPresets as Record<string, unknown>)) {
+    if (!Array.isArray(rawArr)) continue
+    cleanedPresets[modelKey] = rawArr
+      .filter((p): p is ModelPreset =>
+        !!p && typeof p === 'object' &&
+        typeof (p as ModelPreset).id === 'string' && typeof (p as ModelPreset).name === 'string' &&
+        typeof (p as ModelPreset).engineId === 'string' &&
+        typeof (p as ModelPreset).updatedAt === 'string' &&
+        ((p as ModelPreset).origin === 'manual' || (p as ModelPreset).origin === 'autotune'))
+      .map((p) => ({
+        id: p.id,
+        name: p.name,
+        engineId: p.engineId,
+        profile: p.profile,
+        updatedAt: p.updatedAt,
+        origin: p.origin,
+        ...(typeof p.benchTps === 'number' && Number.isFinite(p.benchTps) ? { benchTps: p.benchTps } : {}),
+      }))
+  }
+  c.modelPresets = cleanedPresets
+  // Pins: keep only those that still resolve to a surviving preset of the same model.
+  c.lastPresetId ??= {}
+  const cleanedPins: Record<string, string> = {}
+  for (const [modelKey, pin] of Object.entries(c.lastPresetId as Record<string, unknown>)) {
+    if (typeof pin !== 'string' || !pin) continue
+    if (!(cleanedPresets[modelKey] ?? []).some((p) => p.id === pin)) continue
+    cleanedPins[modelKey] = pin
+  }
+  c.lastPresetId = cleanedPins
   // Built-in agent overrides (Customize → Agents "Edit" + Reset): absent in
   // pre-feature configs → {}. Filter to well-shaped entries.
   const rawOverrides = (c.builtinAgentOverrides ?? {}) as Record<string, unknown>
@@ -1007,9 +1066,29 @@ function validate(c: Config): void {
   // an agent's filesystem scope or break the run manager's lookups.
   validateAgents(c)
   validateCustomAgents(c)
+  validateModelPresets(c)
 }
 
 /** Custom chat agents (Customize → Agents): unique non-empty ids/names, capped list. */
+/** Preset cap is PER MODEL — at most this many in any one modelKey's array. (customAgents is a
+ *  flat list so its cap is global; modelPresets is a Record<string, ModelPreset[]>.) */
+export const MODEL_PRESET_CAP = 50
+
+function validateModelPresets(c: Config): void {
+  for (const [modelKey, presets] of Object.entries(c.modelPresets)) {
+    if (presets.length > MODEL_PRESET_CAP) {
+      throw new ValueError('modelPresets', `preset limit reached (${MODEL_PRESET_CAP})`)
+    }
+    const ids = new Set<string>()
+    for (const p of presets) {
+      if (!p.id.trim()) throw new ValueError('modelPresets', `preset for model "${modelKey}" needs a non-empty id`)
+      if (ids.has(p.id)) throw new ValueError('modelPresets', `duplicate preset id "${p.id}" for model "${modelKey}"`)
+      ids.add(p.id)
+      if (!p.name.trim()) throw new ValueError('modelPresets', `preset "${p.id}" for model "${modelKey}" needs a non-empty name`)
+    }
+  }
+}
+
 const CUSTOM_AGENT_CAP = 50
 function validateCustomAgents(c: Config): void {
   const ids = new Set<string>()
