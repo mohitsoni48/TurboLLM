@@ -376,6 +376,21 @@ export interface ProfileEntry {
   profile: unknown
   updatedAt: string
 }
+/** A named saved load-config for a model (ADR-353). Many per modelKey, versus the single
+ *  per-(model, engine) ProfileEntry in Config.modelProfiles. `profile` is `unknown`
+ *  deliberately: config.ts must not import LoadProfile from models/profile.ts, which imports
+ *  from this file. Consumers cast, exactly as every ProfileEntry.profile call site does. */
+export interface ModelPreset {
+  id: string
+  name: string
+  /** Engine this preset was tuned on; '' = any engine. */
+  engineId: string
+  profile: unknown
+  updatedAt: string
+  origin: 'manual' | 'autotune'
+  /** tok/s measured by the auto-tune run that minted this (origin === 'autotune'). */
+  benchTps?: number
+}
 export interface Config {
   version: number
   daemon: Daemon
@@ -400,6 +415,13 @@ export interface Config {
    *  profile into a single entry under the reserved engineId `'*'` (see {@link normalize}).
    *  `profile` values are still `unknown` (validated/shaped elsewhere as {@link LoadProfile}). */
   modelProfiles: Record<string, Record<string, ProfileEntry>>
+  /** Named model load presets (ADR-353): modelKey → presets. Complements modelProfiles, which
+   *  stays, keeps being written, and remains the fallback — zero presets ⇒ behaviour identical
+   *  to pre-feature. Seeded from modelProfiles on load; accumulates as auto-tune mints. */
+  modelPresets: Record<string, ModelPreset[]>
+  /** Pinned preset per model (ADR-353 D4): modelKey → preset id. Cleared by a manual profile
+   *  save, a profile reset, and deleting the pinned preset. */
+  lastPresetId: Record<string, string>
   /** Persisted auto-tune results keyed by modelKey (spec 09 §1, 01 §4). Additive;
    *  absent in old configs → normalize seeds {}. Never throws on load. */
   benchResults: Record<string, BenchResult>
@@ -549,6 +571,8 @@ export function defaultConfig(): Config {
     modelDirs: [],
     primaryModelDir: '',
     modelProfiles: {},
+    modelPresets: {},
+    lastPresetId: {},
     benchResults: {},
     vramHeadroomMb: VRAM_HEADROOM_DEFAULT_MB,
     lastLoaded: { modelKey: '', engineId: '' },
@@ -742,6 +766,44 @@ function normalize(c: Config): void {
       c.modelProfiles[modelKey] = { '*': { profile: val, updatedAt: new Date().toISOString() } }
     }
   }
+  // Seed modelPresets from modelProfiles (ADR-353): a model with saved profile slots but no
+  // presets yet gets one preset per engine slot, so an upgrade never loses the user's tunes.
+  // Idempotent — a present array (EVEN AN EMPTY ONE) means "already seeded", so this never
+  // re-mints. modelProfiles is only READ here: never deleted, never modified.
+  c.modelPresets ??= {}
+  for (const [modelKey, byEngineRaw] of Object.entries(c.modelProfiles)) {
+    if (Array.isArray((c.modelPresets as Record<string, unknown>)[modelKey])) continue
+    if (!byEngineRaw || typeof byEngineRaw !== 'object') continue
+    const entries = Object.entries(byEngineRaw as Record<string, ProfileEntry>).filter(
+      ([, e]) => !!e && typeof e === 'object' && typeof e.updatedAt === 'string' && e.profile !== undefined,
+    )
+    if (entries.length === 0) continue
+    // Naming. One slot → "Saved". Several → qualify each one so they can be told apart in the
+    // dropdown, because a list of "Saved", "Saved (2)", "Saved (3)" is useless for choosing:
+    //   - engine still installed → "Saved (<engine name>)", using Engine.name VERBATIM (it is a
+    //     full build label — do not prettify).
+    //   - reserved ANY_ENGINE slot, or an engine since UNINSTALLED → fall back to the profile's
+    //     own save date, "Saved (YYYY-MM-DD)". A date is what the user actually has to go on
+    //     once the engine that produced it is gone; an engine id would be noise. Uninstalled
+    //     engines are the COMMON case on a machine that churns through builds, not an edge case.
+    //   - anything still colliding after that (two slots saved the same day) → " (2)", " (3)"…
+    const seen = new Map<string, number>()
+    c.modelPresets[modelKey] = entries.map(([engineId, entry]) => {
+      const engine = engineId === ANY_ENGINE ? undefined : c.engines.find((e) => e.id === engineId)
+      const qualifier = engine ? engine.name : entry.updatedAt.slice(0, 10)
+      const base = entries.length === 1 ? 'Saved' : `Saved (${qualifier})`
+      const n = (seen.get(base) ?? 0) + 1
+      seen.set(base, n)
+      return {
+        id: randomUUID(),
+        name: n > 1 ? `${base} (${n})` : base,
+        engineId: engineId === ANY_ENGINE ? '' : engineId,
+        profile: entry.profile,
+        updatedAt: entry.updatedAt,
+        origin: 'manual' as const,
+      }
+    })
+  }
   // Persisted auto-tune results (spec 09 §1): absent in pre-bench configs → {}.
   c.benchResults ??= {}
   // VRAM headroom slider: absent/garbage (pre-feature config, or a stale out-of-range
@@ -869,6 +931,41 @@ function normalize(c: Config): void {
         tools: Array.isArray(a.tools) ? a.tools.filter((t): t is string => typeof t === 'string') : [],
       }))
     : []
+  // Model load presets (ADR-353): absent in pre-feature configs → {}. Defensively filter to
+  // well-shaped entries rather than throwing on a hand-edited config. Arrays are KEPT even when
+  // they filter down to EMPTY — a present-but-empty array means "already seeded" to the seed
+  // migration, and dropping the key would resurrect deleted presets on the next load.
+  c.modelPresets ??= {}
+  const cleanedPresets: Record<string, ModelPreset[]> = {}
+  for (const [modelKey, rawArr] of Object.entries(c.modelPresets as Record<string, unknown>)) {
+    if (!Array.isArray(rawArr)) continue
+    cleanedPresets[modelKey] = rawArr
+      .filter((p): p is ModelPreset =>
+        !!p && typeof p === 'object' &&
+        typeof (p as ModelPreset).id === 'string' && typeof (p as ModelPreset).name === 'string' &&
+        typeof (p as ModelPreset).engineId === 'string' &&
+        typeof (p as ModelPreset).updatedAt === 'string' &&
+        ((p as ModelPreset).origin === 'manual' || (p as ModelPreset).origin === 'autotune'))
+      .map((p) => ({
+        id: p.id,
+        name: p.name,
+        engineId: p.engineId,
+        profile: p.profile,
+        updatedAt: p.updatedAt,
+        origin: p.origin,
+        ...(typeof p.benchTps === 'number' && Number.isFinite(p.benchTps) ? { benchTps: p.benchTps } : {}),
+      }))
+  }
+  c.modelPresets = cleanedPresets
+  // Pins: keep only those that still resolve to a surviving preset of the same model.
+  c.lastPresetId ??= {}
+  const cleanedPins: Record<string, string> = {}
+  for (const [modelKey, pin] of Object.entries(c.lastPresetId as Record<string, unknown>)) {
+    if (typeof pin !== 'string' || !pin) continue
+    if (!(cleanedPresets[modelKey] ?? []).some((p) => p.id === pin)) continue
+    cleanedPins[modelKey] = pin
+  }
+  c.lastPresetId = cleanedPins
   // Built-in agent overrides (Customize → Agents "Edit" + Reset): absent in
   // pre-feature configs → {}. Filter to well-shaped entries.
   const rawOverrides = (c.builtinAgentOverrides ?? {}) as Record<string, unknown>
@@ -1007,6 +1104,72 @@ function validate(c: Config): void {
   // an agent's filesystem scope or break the run manager's lookups.
   validateAgents(c)
   validateCustomAgents(c)
+  validateModelPresets(c)
+}
+
+/** Preset cap is PER MODEL — at most this many in any one modelKey's array. (customAgents is a
+ *  flat list so its cap is global; modelPresets is a Record<string, ModelPreset[]>.) */
+export const MODEL_PRESET_CAP = 50
+
+function validateModelPresets(c: Config): void {
+  for (const [modelKey, presets] of Object.entries(c.modelPresets)) {
+    if (presets.length > MODEL_PRESET_CAP) {
+      throw new ValueError('modelPresets', `preset limit reached (${MODEL_PRESET_CAP})`)
+    }
+    const ids = new Set<string>()
+    for (const p of presets) {
+      if (!p.id.trim()) throw new ValueError('modelPresets', `preset for model "${modelKey}" needs a non-empty id`)
+      if (ids.has(p.id)) throw new ValueError('modelPresets', `duplicate preset id "${p.id}" for model "${modelKey}"`)
+      ids.add(p.id)
+      if (!p.name.trim()) throw new ValueError('modelPresets', `preset "${p.id}" for model "${modelKey}" needs a non-empty name`)
+    }
+  }
+}
+
+/** Retention for auto-tune-minted presets (ADR-353). Called by bench.ts right after pushing a
+ *  freshly minted preset. Rules, in order:
+ *    1. Keep the newest AUTOTUNE_PRESET_RETENTION unpinned `autotune` presets; prune older.
+ *    2. Never prune `manual` presets — those are the user's own saves.
+ *    3. Never prune the pinned preset.
+ *    4. Cap fallback: if 1–3 still leave the array over the per-model cap, prune the OLDEST
+ *       NON-PINNED preset of ANY origin, repeatedly. Rule 2 yields to the cap, because
+ *       validate() throws on an over-cap config and would break every unrelated settings write.
+ *  If the cap cannot be met without removing the pinned preset, it UNDOES the mint instead
+ *  (drops the just-pushed last element and its pin), warns, and returns. Never throws. */
+export const AUTOTUNE_PRESET_RETENTION = 10
+export function prunePresets(cfg: Config, modelKey: string): void {
+  const arr = cfg.modelPresets[modelKey]
+  if (!Array.isArray(arr) || arr.length === 0) return
+  const pinnedId = (cfg.lastPresetId ?? {})[modelKey]
+
+  const byOldest = (a: ModelPreset, b: ModelPreset) =>
+    a.updatedAt < b.updatedAt ? -1 : a.updatedAt > b.updatedAt ? 1 : 0
+
+  // Rules 1–3.
+  const ranked = arr.filter((p) => p.origin === 'autotune' && p.id !== pinnedId).sort(byOldest)
+  const excess = new Set(
+    ranked.slice(0, Math.max(0, ranked.length - AUTOTUNE_PRESET_RETENTION)).map((p) => p.id),
+  )
+  let cur = excess.size === 0 ? arr : arr.filter((p) => !excess.has(p.id))
+
+  // Rule 4.
+  while (cur.length > MODEL_PRESET_CAP) {
+    const candidates = cur.filter((p) => p.id !== pinnedId).sort(byOldest)
+    if (candidates.length === 0) break
+    cur = cur.filter((p) => p.id !== candidates[0].id)
+  }
+
+  if (cur.length > MODEL_PRESET_CAP) {
+    // Nothing removable — undo the mint rather than break the pin.
+    if (arr[arr.length - 1].id === pinnedId) delete cfg.lastPresetId[modelKey]
+    cfg.modelPresets[modelKey] = arr.slice(0, -1)
+    console.warn(
+      `[presets] model "${modelKey}" is at the ${MODEL_PRESET_CAP}-preset cap with nothing prunable — the auto-tune mint was skipped; the tuned profile was still saved`,
+    )
+    return
+  }
+  if (cur.length === arr.length) return
+  cfg.modelPresets[modelKey] = cur
 }
 
 /** Custom chat agents (Customize → Agents): unique non-empty ids/names, capped list. */
@@ -1101,6 +1264,17 @@ export const ANY_ENGINE = '*'
  *  undefined if the model has no saved profile on any engine. The single read seam every
  *  caller routes through instead of indexing `cfg.modelProfiles[key]` directly. */
 export function getModelProfile(cfg: Config, modelKey: string, engineId: string): unknown {
+  // Pinned preset (ADR-353 D4) outranks the saved per-engine profiles — but ONLY when its
+  // engine matches. The engine check is load-bearing: engines keep independent tunes per model
+  // (issue #35), so a preset tuned on ONE engine must not shadow another engine's profile —
+  // auto-tune seeds its search from this function and needs "this engine's own" profile.
+  // A pin pointing at a deleted preset, or at a preset for another engine, falls straight
+  // through to the logic below. `?? {}` guards hand-built Configs that skip normalize().
+  const pinnedId = (cfg.lastPresetId ?? {})[modelKey]
+  if (pinnedId) {
+    const pinned = (cfg.modelPresets ?? {})[modelKey]?.find((p) => p.id === pinnedId)
+    if (pinned && (pinned.engineId === '' || pinned.engineId === engineId)) return pinned.profile
+  }
   const byEngine = cfg.modelProfiles[modelKey]
   if (!byEngine) return undefined
   const exact = byEngine[engineId]

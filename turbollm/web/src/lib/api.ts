@@ -24,6 +24,7 @@ import type {
   LoadProfile,
   ModelDetail,
   ModelDirs,
+  ModelPreset,
   ModelsList,
   Status,
   AppUpdate,
@@ -478,6 +479,38 @@ export function resetModelProfile(key: string, engineId: string): Promise<{ ok: 
     method: 'POST',
     json: {},
   })
+}
+
+// ── Model load presets (ADR-353) ─────────────────────────────────────────────
+/** List a model's presets, newest updatedAt first. */
+export function fetchModelPresets(modelKey: string): Promise<ModelPreset[]> {
+  return request<ModelPreset[]>(`/api/v1/models/${encodeURIComponent(modelKey)}/presets`)
+}
+
+/** Create a preset from the current draft. 400 `too_many_presets` at the per-model cap. */
+export function createModelPreset(
+  modelKey: string,
+  preset: { name: string; engineId?: string; profile: Partial<LoadProfile> },
+): Promise<ModelPreset> {
+  return request<ModelPreset>(`/api/v1/models/${encodeURIComponent(modelKey)}/presets`, { method: 'POST', json: preset })
+}
+
+/** Update a preset. Only a `profile` change re-stamps updatedAt (retention pruning keys off it). */
+export function updateModelPreset(
+  modelKey: string,
+  id: string,
+  patch: { name?: string; engineId?: string; profile?: Partial<LoadProfile> },
+): Promise<ModelPreset> {
+  return request<ModelPreset>(`/api/v1/models/${encodeURIComponent(modelKey)}/presets/${id}`, { method: 'PUT', json: patch })
+}
+
+export function deleteModelPreset(modelKey: string, id: string): Promise<{ ok: true }> {
+  return request<{ ok: true }>(`/api/v1/models/${encodeURIComponent(modelKey)}/presets/${id}`, { method: 'DELETE' })
+}
+
+/** Pin a preset so the next load uses it (getModelProfile consults the pin). */
+export function applyModelPreset(modelKey: string, id: string): Promise<ModelPreset> {
+  return request<ModelPreset>(`/api/v1/models/${encodeURIComponent(modelKey)}/presets/${id}/apply`, { method: 'POST', json: {} })
 }
 
 /** Load a model by key, optionally with one-off profile overrides (spec 05 §7). */

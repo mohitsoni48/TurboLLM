@@ -25,6 +25,28 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ### Nothing yet.
 
+## [1.11.0] - 2026-08-15
+
+### Added
+- **Model load presets.** Each model can now keep many named load-configs instead of one —
+  tune for "max speed 32k", then for "200k context", and both survive. In the Model Detail
+  panel, pick a preset from the dropdown, **Save as…** captures the current settings, and the
+  ⋯ menu renames or deletes. Auto-tune mints a preset on every save (named `Auto-tune <date>`,
+  badged with the measured tok/s), pinned so the next load uses that tune; retention keeps the
+  ten newest auto-tune presets and never prunes your manual saves. Existing saved profiles are
+  seeded as presets on first load, so an upgrade loses no tunes; deleting every preset restores
+  exact pre-feature behaviour.
+- A preset records the engine it was tuned on. If you pick one that belongs to a different
+  engine than the one currently active, the panel says so and the preset is not applied to
+  that engine's own saved tuning — switch engines first.
+
+### Discord
+- **Presets are here.** Your models can now keep as many named load configs as you want —
+  "max speed", "long context", whatever — instead of each new tune wiping the last one.
+- **Auto-tune now builds you a history.** Every tune you save becomes a preset tagged with
+  its measured tok/s, so you can go back to the one that worked last week.
+- Nothing to migrate: your existing tuning shows up as a preset automatically.
+
 ## [1.10.8] - 2026-08-13
 
 ### Added

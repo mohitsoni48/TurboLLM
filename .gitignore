@@ -66,9 +66,11 @@ Thumbs.db
 
 # Internal product/business/strategy material — kept LOCAL ONLY, never published.
 # The repo is/will be public; these are not for distribution. (Purged from history
-# 2026-06-13.) CLAUDE.md / RESOURCES.md hold internal strategy + dev-box setup.
+# 2026-06-13.) CLAUDE.md / RESOURCES.md hold internal strategy + dev-box setup;
+# AGENTS.md holds the internal coding-agent rules + the dogfooding workflow.
 /docs/
 /CLAUDE.md
+/AGENTS.md
 /RESOURCES.md
 
 # local-only test/marketing notes — never ship in the public repo

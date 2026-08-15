@@ -18,12 +18,15 @@ import { join } from 'node:path'
 import {
   ANY_ENGINE,
   ConfigStore,
+  MODEL_PRESET_CAP,
   SCHEMA_VERSION,
   defaultConfig,
   deleteModelProfile,
   getModelProfile,
+  prunePresets,
   setModelProfile,
   type Config,
+  type ModelPreset,
   type ProfileEntry,
 } from './config'
 
@@ -244,4 +247,363 @@ test('bug #35 scenario: two engines for one model keep independent profiles; unk
   assert.equal((getModelProfile(cfg, 'm|q4|1', vulkan) as { ctx: number }).ctx, 16384)
   // A third, untuned engine falls back to whichever was saved most recently (vulkan).
   assert.equal((getModelProfile(cfg, 'm|q4|1', 'mlx-engine-id') as { ctx: number }).ctx, 16384)
+})
+
+test('preset seeding: a model with saved profiles but no presets gets one preset per engine slot', () => {
+  const path = tmpConfigPath()
+  try {
+    const engineA = 'aaaa-aaaa-aaaa-aaaa-aaaa-aaaa-aaaa-aaaa'
+    const engineB = 'bbbb-bbbb-bbbb-bbbb-bbbb-bbbb-bbbb-bbbb'
+    const profiles = {
+      'm|q4|1': {
+        [engineA]: { profile: flatProfile({ ctx: 4096 }), updatedAt: '2026-01-01T00:00:00.000Z' },
+        [engineB]: { profile: flatProfile({ ctx: 16384 }), updatedAt: '2026-02-01T00:00:00.000Z' },
+      },
+      's|q4|1': {
+        [ANY_ENGINE]: { profile: flatProfile({ ctx: 8192 }), updatedAt: '2026-03-01T00:00:00.000Z' },
+      },
+    }
+    const v4 = {
+      ...defaultConfig(),
+      engines: [
+        {
+          id: engineA,
+          name: 'llama.cpp',
+          binPath: '/opt/llama-server',
+          kind: 'llama-server',
+          version: 'b1234',
+          capabilities: { kvTypes: ['f16', 'q8_0'], flags: [] },
+          addedAt: '2026-01-01T00:00:00.000Z',
+        },
+        {
+          id: engineB,
+          name: 'ik_llama.cpp (TurboQuant)',
+          binPath: '/opt/ik-llama-server',
+          kind: 'llama-server',
+          version: 'b5678',
+          capabilities: { kvTypes: ['f16'], flags: [] },
+          addedAt: '2026-01-02T00:00:00.000Z',
+        },
+      ],
+      modelProfiles: profiles,
+    }
+    writeFileSync(path, JSON.stringify(v4))
+
+    // First load seeds one preset per engine slot, named from the engine VERBATIM.
+    const store = ConfigStore.load(path)
+    const cfg = store.snapshot()
+    const seededM = cfg.modelPresets['m|q4|1'] ?? []
+    assert.equal(seededM.length, 2)
+    assert.deepEqual(
+      seededM.map((p) => p.name),
+      ['Saved (llama.cpp)', 'Saved (ik_llama.cpp (TurboQuant))'],
+    )
+    assert.deepEqual(
+      seededM.map((p) => p.engineId),
+      [engineA, engineB],
+    )
+    assert.equal(seededM.every((p) => p.origin === 'manual'), true)
+    assert.deepEqual(seededM[0].profile, flatProfile({ ctx: 4096 }))
+    assert.equal(seededM[0].updatedAt, '2026-01-01T00:00:00.000Z')
+    assert.deepEqual(seededM[1].profile, flatProfile({ ctx: 16384 }))
+    assert.equal(seededM[1].updatedAt, '2026-02-01T00:00:00.000Z')
+    // A single ANY_ENGINE slot seeds as 'Saved' with engineId '' (any engine).
+    const seededS = cfg.modelPresets['s|q4|1'] ?? []
+    assert.equal(seededS.length, 1)
+    assert.equal(seededS[0].name, 'Saved')
+    assert.equal(seededS[0].engineId, '')
+    assert.deepEqual(seededS[0].profile, flatProfile({ ctx: 8192 }))
+
+    // Second load: a present array means "already seeded" — no duplicates, ids stable.
+    const cfg2 = ConfigStore.load(path).snapshot()
+    assert.equal((cfg2.modelPresets['m|q4|1'] ?? []).length, 2)
+    assert.equal((cfg2.modelPresets['s|q4|1'] ?? []).length, 1)
+    assert.deepEqual(
+      (cfg2.modelPresets['m|q4|1'] ?? []).map((p) => p.id),
+      seededM.map((p) => p.id),
+    )
+    // modelProfiles is only READ by the seeding: still present, untouched.
+    assert.deepEqual(cfg2.modelProfiles, profiles)
+    assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')).modelProfiles, profiles)
+  } finally {
+    cleanup(path)
+  }
+})
+
+test('preset seeding: slots whose engine is UNINSTALLED are named by save date, not "Saved (2)"', () => {
+  // The real-world shape on a machine that churns through engine builds: a model carries
+  // several profile slots whose engines have since been removed. Naming them all plain
+  // "Saved" and disambiguating with (2)/(3) leaves the dropdown unusable — you cannot tell
+  // which is which. Each falls back to its own save date instead.
+  const path = tmpConfigPath()
+  try {
+    const live = 'live-engine-id'
+    const gone1 = 'uninstalled-engine-1'
+    const gone2 = 'uninstalled-engine-2'
+    const v4 = {
+      ...defaultConfig(),
+      engines: [
+        {
+          id: live,
+          name: 'Prism',
+          binPath: '/opt/prism-server',
+          kind: 'llama-server',
+          version: 'b1',
+          capabilities: { kvTypes: ['f16'], flags: [] },
+          addedAt: '2026-01-01T00:00:00.000Z',
+        },
+      ],
+      modelProfiles: {
+        'g|q4|1': {
+          [ANY_ENGINE]: { profile: flatProfile({ ctx: 1024 }), updatedAt: '2026-05-01T00:00:00.000Z' },
+          [live]: { profile: flatProfile({ ctx: 2048 }), updatedAt: '2026-06-01T00:00:00.000Z' },
+          [gone1]: { profile: flatProfile({ ctx: 4096 }), updatedAt: '2026-07-01T00:00:00.000Z' },
+          [gone2]: { profile: flatProfile({ ctx: 8192 }), updatedAt: '2026-08-01T00:00:00.000Z' },
+        },
+      },
+    }
+    writeFileSync(path, JSON.stringify(v4))
+
+    const seeded = ConfigStore.load(path).snapshot().modelPresets['g|q4|1'] ?? []
+    assert.deepEqual(seeded.map((p) => p.name), [
+      'Saved (2026-05-01)',   // ANY_ENGINE slot → its own date
+      'Saved (Prism)',        // engine still installed → its verbatim build label
+      'Saved (2026-07-01)',   // engine uninstalled → date, NOT "Saved (2)"
+      'Saved (2026-08-01)',
+    ])
+    // Every name is distinct — that is the whole point.
+    assert.equal(new Set(seeded.map((p) => p.name)).size, seeded.length)
+    // The ANY_ENGINE slot still normalizes its engineId to '' (matches any engine on read).
+    assert.equal(seeded[0].engineId, '')
+    assert.equal(seeded[1].engineId, live)
+  } finally {
+    cleanup(path)
+  }
+})
+
+test('preset seeding: two slots saved the SAME day still disambiguate with a numeric suffix', () => {
+  const path = tmpConfigPath()
+  try {
+    const v4 = {
+      ...defaultConfig(),
+      engines: [],
+      modelProfiles: {
+        'h|q4|1': {
+          'gone-a': { profile: flatProfile({ ctx: 1024 }), updatedAt: '2026-08-01T09:00:00.000Z' },
+          'gone-b': { profile: flatProfile({ ctx: 2048 }), updatedAt: '2026-08-01T18:00:00.000Z' },
+        },
+      },
+    }
+    writeFileSync(path, JSON.stringify(v4))
+    const seeded = ConfigStore.load(path).snapshot().modelPresets['h|q4|1'] ?? []
+    assert.deepEqual(seeded.map((p) => p.name), ['Saved (2026-08-01)', 'Saved (2026-08-01) (2)'])
+  } finally {
+    cleanup(path)
+  }
+})
+
+test('getModelProfile: a pinned preset wins for its engine, falls through for others', () => {
+  const cfg = defaultConfig()
+  const engineA = 'aaaa'
+  const engineB = 'bbbb'
+  cfg.modelProfiles = {
+    'm|q4|1': {
+      [engineA]: { profile: flatProfile({ ctx: 4096 }), updatedAt: '2026-01-01T00:00:00.000Z' },
+      [engineB]: { profile: flatProfile({ ctx: 16384 }), updatedAt: '2026-02-01T00:00:00.000Z' },
+    },
+  }
+  cfg.modelPresets = {
+    'm|q4|1': [
+      {
+        id: 'p-1',
+        name: 'Fast 4k',
+        engineId: engineA,
+        profile: flatProfile({ ctx: 4096, marker: 'preset' }),
+        updatedAt: '2026-03-01T00:00:00.000Z',
+        origin: 'manual',
+      },
+    ],
+  }
+  cfg.lastPresetId = { 'm|q4|1': 'p-1' }
+
+  // Engine A: the pinned preset's profile wins over engine A's own saved slot.
+  assert.deepEqual(getModelProfile(cfg, 'm|q4|1', engineA), flatProfile({ ctx: 4096, marker: 'preset' }))
+  // Engine B: the pin does NOT shadow another engine's profile — engine B's own slot wins.
+  assert.equal((getModelProfile(cfg, 'm|q4|1', engineB) as { ctx: number }).ctx, 16384)
+  // An engine with no slot of its own: still the per-engine fallback (engine B, most recent),
+  // not the pinned preset.
+  assert.equal((getModelProfile(cfg, 'm|q4|1', 'cccc') as { ctx: number }).ctx, 16384)
+})
+
+test('getModelProfile: a preset with engineId "" (any engine) wins for every engine', () => {
+  const cfg = defaultConfig()
+  cfg.modelProfiles = {
+    'm|q4|1': {
+      aaaa: { profile: flatProfile({ ctx: 4096 }), updatedAt: '2026-01-01T00:00:00.000Z' },
+      bbbb: { profile: flatProfile({ ctx: 16384 }), updatedAt: '2026-02-01T00:00:00.000Z' },
+    },
+  }
+  cfg.modelPresets = {
+    'm|q4|1': [
+      {
+        id: 'p-any',
+        name: 'Any engine',
+        engineId: '',
+        profile: flatProfile({ marker: 'preset-any' }),
+        updatedAt: '2026-03-01T00:00:00.000Z',
+        origin: 'manual',
+      },
+    ],
+  }
+  cfg.lastPresetId = { 'm|q4|1': 'p-any' }
+
+  for (const engineId of ['aaaa', 'bbbb', 'cccc']) {
+    assert.deepEqual(getModelProfile(cfg, 'm|q4|1', engineId), flatProfile({ marker: 'preset-any' }))
+  }
+})
+
+test('getModelProfile: a dangling pin (preset deleted) falls through to the pre-feature value', () => {
+  const cfg = defaultConfig()
+  const engineA = 'aaaa'
+  cfg.modelProfiles = {
+    'm|q4|1': {
+      [engineA]: { profile: flatProfile({ ctx: 4096 }), updatedAt: '2026-01-01T00:00:00.000Z' },
+    },
+  }
+  // Pin points at a preset that no longer exists (e.g. deleted via the API).
+  cfg.lastPresetId = { 'm|q4|1': 'gone' }
+  cfg.modelPresets = { 'm|q4|1': [] }
+  // AND a pin with no lastPresetId entry at all — both must behave exactly as pre-feature.
+  assert.equal((getModelProfile(cfg, 'm|q4|1', engineA) as { ctx: number }).ctx, 4096)
+  delete cfg.lastPresetId['m|q4|1']
+  assert.equal((getModelProfile(cfg, 'm|q4|1', engineA) as { ctx: number }).ctx, 4096)
+  assert.equal(getModelProfile(cfg, 'nope|q4|1', engineA), undefined)
+})
+
+// prunePresets tests: in-memory Configs only — no auto-tune involved.
+function mkPreset(id: string, over: Partial<ModelPreset> = {}): ModelPreset {
+  return {
+    id,
+    name: id,
+    engineId: '',
+    profile: { ctx: 4096 },
+    updatedAt: '2026-01-01T00:00:00.000Z',
+    origin: 'autotune',
+    ...over,
+  }
+}
+
+test('prunePresets: 11 autotune + 2 manual, one manual pinned → oldest autotune pruned, manuals + pinned survive', () => {
+  const cfg = defaultConfig()
+  const presets = [
+    mkPreset('at-0', { origin: 'autotune', updatedAt: '2026-01-01T00:00:00.000Z' }),
+    mkPreset('at-1', { origin: 'autotune', updatedAt: '2026-01-02T00:00:00.000Z' }),
+    mkPreset('at-2', { origin: 'autotune', updatedAt: '2026-01-03T00:00:00.000Z' }),
+    mkPreset('at-3', { origin: 'autotune', updatedAt: '2026-01-04T00:00:00.000Z' }),
+    mkPreset('at-4', { origin: 'autotune', updatedAt: '2026-01-05T00:00:00.000Z' }),
+    mkPreset('at-5', { origin: 'autotune', updatedAt: '2026-01-06T00:00:00.000Z' }),
+    mkPreset('at-6', { origin: 'autotune', updatedAt: '2026-01-07T00:00:00.000Z' }),
+    mkPreset('at-7', { origin: 'autotune', updatedAt: '2026-01-08T00:00:00.000Z' }),
+    mkPreset('at-8', { origin: 'autotune', updatedAt: '2026-01-09T00:00:00.000Z' }),
+    mkPreset('at-9', { origin: 'autotune', updatedAt: '2026-01-10T00:00:00.000Z' }),
+    mkPreset('at-10', { origin: 'autotune', updatedAt: '2026-01-11T00:00:00.000Z' }),
+    mkPreset('mn-0', { origin: 'manual', updatedAt: '2026-01-01T12:00:00.000Z' }),
+    mkPreset('mn-1', { origin: 'manual', updatedAt: '2026-01-12T00:00:00.000Z' }),
+  ]
+  cfg.modelPresets = { 'm|q4|1': presets }
+  cfg.lastPresetId = { 'm|q4|1': 'mn-0' }
+
+  prunePresets(cfg, 'm|q4|1')
+  const ids = (cfg.modelPresets['m|q4|1'] ?? []).map((p) => p.id)
+  assert.equal(ids.includes('at-0'), false) // the oldest autotune is pruned
+  assert.equal(ids.length, 12)
+  assert.equal(ids.includes('mn-0'), true) // both manuals survive
+  assert.equal(ids.includes('mn-1'), true)
+  assert.equal(ids.includes('at-10'), true) // newest autotune survives
+})
+
+test('prunePresets: a pinned autotune older than the cutoff still survives', () => {
+  const cfg = defaultConfig()
+  const presets = Array.from({ length: 12 }, (_, i) =>
+    mkPreset(`at-${i}`, { origin: 'autotune', updatedAt: `2026-01-${String(i + 1).padStart(2, '0')}T00:00:00.000Z` }),
+  )
+  cfg.modelPresets = { 'm|q4|1': presets }
+  cfg.lastPresetId = { 'm|q4|1': 'at-0' } // the OLDEST autotune is pinned
+
+  prunePresets(cfg, 'm|q4|1')
+  const ids = (cfg.modelPresets['m|q4|1'] ?? []).map((p) => p.id)
+  assert.equal(ids.includes('at-0'), true) // pinned beats the retention cutoff
+  assert.equal(ids.includes('at-1'), false) // the next-oldest unpinned autotune is pruned instead
+  assert.equal(ids.length, 11)
+})
+
+test('prunePresets: at the per-model cap, the oldest NON-PINNED preset of ANY origin is pruned', () => {
+  const cfg = defaultConfig()
+  const manual = (i: number, updatedAt: string): ModelPreset => mkPreset(`mn-${i}`, { origin: 'manual', updatedAt })
+  const at = (i: number, updatedAt: string): ModelPreset => mkPreset(`at-${i}`, { origin: 'autotune', updatedAt })
+  const presets: ModelPreset[] = [
+    manual(0, '2026-01-01T00:00:00.000Z'), // oldest overall — a manual
+    at(0, '2026-01-02T00:00:00.000Z'),
+  ]
+  for (let i = 1; i < 50; i += 1) presets.push(manual(i, `2026-01-01T00:${String(i).padStart(2, '0')}:00.000Z`))
+  assert.equal(presets.length, MODEL_PRESET_CAP + 1)
+  cfg.modelPresets = { 'm|q4|1': presets }
+  cfg.lastPresetId = { 'm|q4|1': 'mn-49' } // pin the newest
+
+  prunePresets(cfg, 'm|q4|1')
+  const ids = (cfg.modelPresets['m|q4|1'] ?? []).map((p) => p.id)
+  assert.equal(ids.length, MODEL_PRESET_CAP)
+  assert.equal(ids.includes('mn-0'), false) // the cap prunes a manual — rule 2 yields to the cap
+  assert.equal(ids.includes('mn-49'), true) // the pinned one survives
+  assert.equal(ids.includes('at-0'), true)
+})
+
+test('prunePresets: nothing prunable at the cap → the last element is dropped, the pin is cleared, no throw', () => {
+  const cfg = defaultConfig()
+  // A hand-built config where every preset shares the pinned id: rule 4 has no non-pinned
+  // candidate to prune, so the mint is undone instead of breaking the pin.
+  const presets = Array.from({ length: MODEL_PRESET_CAP + 1 }, (_, i) =>
+    mkPreset('dup', { updatedAt: `2026-01-01T00:00:${String(i).padStart(2, '0')}.000Z`, origin: 'manual' }),
+  )
+  cfg.modelPresets = { 'm|q4|1': presets }
+  cfg.lastPresetId = { 'm|q4|1': 'dup' }
+
+  assert.doesNotThrow(() => prunePresets(cfg, 'm|q4|1'))
+  assert.equal((cfg.modelPresets['m|q4|1'] ?? []).length, MODEL_PRESET_CAP)
+  assert.equal(cfg.lastPresetId['m|q4|1'], undefined) // the pin was undone with the mint
+})
+
+test('prunePresets: an already-compliant array is left unchanged', () => {
+  const cfg = defaultConfig()
+  const presets = [
+    mkPreset('at-0', { origin: 'autotune', updatedAt: '2026-01-01T00:00:00.000Z' }),
+    mkPreset('at-1', { origin: 'autotune', updatedAt: '2026-01-02T00:00:00.000Z' }),
+    mkPreset('mn-0', { origin: 'manual', updatedAt: '2026-01-03T00:00:00.000Z' }),
+  ]
+  cfg.modelPresets = { 'm|q4|1': presets }
+  cfg.lastPresetId = { 'm|q4|1': 'mn-0' }
+
+  prunePresets(cfg, 'm|q4|1')
+  assert.equal(cfg.modelPresets['m|q4|1'], presets) // same reference — not even re-assigned
+})
+
+test('preset seeding: a present-but-empty presets array is NOT re-seeded', () => {
+  const path = tmpConfigPath()
+  try {
+    const v4 = {
+      ...defaultConfig(),
+      modelProfiles: {
+        'x|q4|1': { [ANY_ENGINE]: { profile: flatProfile(), updatedAt: '2026-01-01T00:00:00.000Z' } },
+      },
+      modelPresets: { 'x|q4|1': [] },
+    }
+    writeFileSync(path, JSON.stringify(v4))
+
+    const cfg = ConfigStore.load(path).snapshot()
+    assert.deepEqual(cfg.modelPresets['x|q4|1'], [])
+    // And it stays empty on a second load too.
+    assert.deepEqual(ConfigStore.load(path).snapshot().modelPresets['x|q4|1'], [])
+  } finally {
+    cleanup(path)
+  }
 })

@@ -668,6 +668,21 @@ export type LoadProfile = {
   tunedBy?: string
 }
 
+/** A named saved load-config for a model (ADR-353). Mirrors the backend's ModelPreset;
+ *  `profile` is `Partial<LoadProfile>` here since presets saved by older builds may be
+ *  missing newer fields — the dialog deep-merges them onto the current draft. */
+export type ModelPreset = {
+  id: string
+  name: string
+  /** Engine this preset was tuned on; '' = any engine. */
+  engineId: string
+  profile: Partial<LoadProfile>
+  updatedAt: string
+  origin: 'manual' | 'autotune'
+  /** tok/s measured by the auto-tune run that minted this (origin === 'autotune'). */
+  benchTps?: number
+}
+
 export type GpuProfile = {
   /** llama.cpp --split-mode */
   splitMode: 'layer' | 'row' | 'none'

@@ -227,6 +227,8 @@ test('validateEvent: ui_action accepts the Phase 6k ModelDetailDialog batch acti
     'save_model_settings', 'reset_model_settings', 'dismiss_autotune_result', 'save_autotune_result',
     'cancel_autotune', 'start_autotune', 'reset_model_setting_field', 'set_model_setting_option',
     'remove_model_setting_chip',
+    // Model load presets (ADR-353).
+    'apply_model_preset', 'create_model_preset', 'rename_model_preset', 'delete_model_preset',
   ]
   for (const action of actions) {
     const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'models', action } }))

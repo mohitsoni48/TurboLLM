@@ -1,8 +1,9 @@
-﻿import { useEffect, useMemo, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
-import { ChevronDown, ExternalLink, Gauge, RotateCcw, Save, X, Zap } from 'lucide-react'
+﻿import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
+import { ChevronDown, ExternalLink, Gauge, MoreHorizontal, RotateCcw, Save, X, Zap } from 'lucide-react'
 import { ApiError, track } from '../../lib/api'
-import { useBenchActions, useBenchState, useEngines, useModelActions, useModelDetail, useStatus } from '../../lib/queries'
-import type { CardSampling, LoadProfile, SysGpu } from '../../lib/types'
+import { useBenchActions, useBenchState, useEngines, useModelActions, useModelDetail, useModelPresetMutations, useModelPresets, useStatus } from '../../lib/queries'
+import type { CardSampling, LoadProfile, ModelPreset, SysGpu } from '../../lib/types'
+import { Input } from '../../components/ui/input'
 import { defaultGpu, defaultVllm } from '../../lib/types'
 import { estimateVram, gpuBudgetMb } from '../../lib/vram'
 import { Button } from '../../components/ui/button'
@@ -42,6 +43,235 @@ function loadModeForEngine(engineKind: string | undefined): LoadMode {
     default:
       return 'none'
   }
+}
+
+/** Deep-merges a preset's stored profile onto the current draft. The nested merge is
+ *  load-bearing: a preset saved by an older build may be missing fields inside sampling/gpu/vllm,
+ *  and a shallow spread would replace a whole nested object — leaving controls that read
+ *  draft.sampling.frequencyPenalty facing undefined and white-screening the dialog. */
+function mergePresetIntoDraft(draft: LoadProfile, profile: Partial<LoadProfile> | undefined): LoadProfile {
+  const over = profile ?? {}
+  return {
+    ...draft,
+    ...over,
+    sampling: { ...draft.sampling, ...(over.sampling ?? {}) },
+    gpu: { ...draft.gpu, ...(over.gpu ?? {}) },
+    vllm: { ...draft.vllm, ...(over.vllm ?? {}) },
+  }
+}
+
+// ── Presets panel (ADR-353) ───────────────────────────────────────────────────
+// Named load configs per model. Selecting a preset pins it (POST /apply) and merges it
+// into the draft — it does NOT load; the Load button stays the only thing that loads.
+function PresetsPanel({
+  modelKey,
+  draft,
+  onApplyPreset,
+  activeEngineId,
+  save,
+  reset,
+}: {
+  modelKey: string
+  draft: LoadProfile
+  onApplyPreset: (profile: Partial<LoadProfile>) => void
+  activeEngineId?: string
+  save: { isPending: boolean; isSuccess: boolean }
+  reset: { isPending: boolean; isSuccess: boolean }
+}) {
+  const presetsQ = useModelPresets(modelKey)
+  const presets = presetsQ.data ?? []
+  const m = useModelPresetMutations(modelKey)
+  const enginesQ = useEngines()
+  const engineName = (id: string) => enginesQ.data?.engines.find((e) => e.id === id)?.name ?? id
+
+  const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [open, setOpen] = useState(false)
+  const [menuId, setMenuId] = useState<string | null>(null)
+  const [nameDialog, setNameDialog] = useState<{ mode: 'save' | 'rename'; presetId?: string } | null>(null)
+  const [nameValue, setNameValue] = useState('')
+  const [deleteTarget, setDeleteTarget] = useState<ModelPreset | null>(null)
+
+  // A successful profile save or reset clears the pin server-side — drop the local
+  // "applied" selection so the dropdown never asserts a state that no longer exists.
+  // Watch the pending→settled transition of each mutation (isSuccess tells success
+  // apart from error; a failed save must NOT clear the selection).
+  const savePending = useRef(false)
+  useEffect(() => {
+    if (save.isPending) savePending.current = true
+    else if (savePending.current) {
+      savePending.current = false
+      if (save.isSuccess) setSelectedId(null)
+    }
+  }, [save.isPending, save.isSuccess])
+  const resetPending = useRef(false)
+  useEffect(() => {
+    if (reset.isPending) resetPending.current = true
+    else if (resetPending.current) {
+      resetPending.current = false
+      if (reset.isSuccess) setSelectedId(null)
+    }
+  }, [reset.isPending, reset.isSuccess])
+
+  const selected = presets.find((p) => p.id === selectedId) ?? null
+  const mismatch = !!selected && selected.engineId !== '' && selected.engineId !== activeEngineId
+
+  const select = (p: ModelPreset) => {
+    setOpen(false)
+    setMenuId(null)
+    track('models', 'apply_model_preset')
+    m.apply.mutate(p.id, {
+      onError: (e) => {
+        setSelectedId(null)
+        toast.error(e instanceof ApiError ? e.message : 'Could not apply preset.')
+      },
+    })
+    setSelectedId(p.id)
+    onApplyPreset(p.profile)
+  }
+
+  const openSaveAs = () => {
+    setNameValue('')
+    setNameDialog({ mode: 'save' })
+  }
+  const openRename = (p: ModelPreset) => {
+    setMenuId(null)
+    setNameValue(p.name)
+    setNameDialog({ mode: 'rename', presetId: p.id })
+  }
+  const confirmName = () => {
+    const name = nameValue.trim()
+    if (!name || !nameDialog) return
+    if (nameDialog.mode === 'save') {
+      track('models', 'create_model_preset')
+      m.create.mutate(
+        { name, engineId: activeEngineId ?? '', profile: draft },
+        {
+          onSuccess: () => setNameDialog(null),
+          onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not save preset.'),
+        },
+      )
+    } else {
+      track('models', 'rename_model_preset')
+      m.update.mutate(
+        { id: nameDialog.presetId ?? '', patch: { name } },
+        {
+          onSuccess: () => setNameDialog(null),
+          onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not rename preset.'),
+        },
+      )
+    }
+  }
+
+  const confirmDelete = () => {
+    const t = deleteTarget
+    if (!t) return
+    track('models', 'delete_model_preset')
+    m.remove.mutate(t.id, {
+      onSuccess: () => {
+        if (selectedId === t.id) setSelectedId(null)
+        setDeleteTarget(null)
+      },
+      onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not delete preset.'),
+    })
+  }
+
+  return (
+    <>
+      <div className="rounded-md border border-border bg-panel-2 px-3 py-2.5">
+        <div className="mb-2 flex items-center justify-between gap-2">
+          <span className="text-[12px] font-medium text-muted">Presets</span>
+          <button type="button" onClick={openSaveAs} className="text-[12px] font-medium text-accent hover:underline" title="Capture the current settings as a new preset">
+            Save as…
+          </button>
+        </div>
+        <button
+          type="button"
+          onClick={() => setOpen((o) => !o)}
+          className="flex w-full items-center justify-between gap-2 rounded-md border border-border bg-bg px-2 py-1.5 text-[13px] text-ink"
+        >
+          <span className="truncate">{selected ? selected.name : 'No preset applied'}</span>
+          <ChevronDown size={14} className={open ? 'rotate-180 transition-transform' : 'transition-transform'} />
+        </button>
+        {open && (
+          <div className="mt-1 flex flex-col gap-0.5">
+            {presets.length === 0 && (
+              <div className="px-2 py-1.5 text-[12px] text-faint">No presets yet — Save as… captures the current settings.</div>
+            )}
+            {presets.map((p) => (
+              <div key={p.id} className="group flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => select(p)}
+                  className="flex-1 rounded-md px-2 py-1 text-left text-[13px] text-ink hover:bg-bg"
+                >
+                  <span className="flex items-center gap-1.5">
+                    <span className="truncate">{p.name}</span>
+                    {p.origin === 'autotune' && p.benchTps != null && (
+                      <span className="shrink-0 rounded bg-panel px-1 py-px text-[10px] font-medium text-muted">{p.benchTps.toFixed(1)} tok/s</span>
+                    )}
+                  </span>
+                  <span className="block text-[11px] text-faint">{p.engineId ? `Tuned on ${engineName(p.engineId)}` : 'Any engine'}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMenuId(menuId === p.id ? null : p.id)}
+                  className="rounded-md p-1 text-faint opacity-0 hover:bg-bg hover:text-ink group-hover:opacity-100"
+                  title="Rename or delete"
+                >
+                  <MoreHorizontal size={14} />
+                </button>
+                {menuId === p.id && (
+                  <div className="flex shrink-0 gap-1">
+                    <button type="button" onClick={() => openRename(p)} className="rounded-md px-1.5 py-1 text-[11px] text-muted hover:bg-bg">Rename</button>
+                    <button type="button" onClick={() => setDeleteTarget(p)} className="rounded-md px-1.5 py-1 text-[11px] text-[color:var(--err)] hover:bg-bg">Delete</button>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+        {mismatch && selected && (
+          <p className="mt-1.5 text-[11px] text-faint">
+            Tuned on {engineName(selected.engineId)}{activeEngineId ? ` — the active engine is ${engineName(activeEngineId)}` : ''}.
+          </p>
+        )}
+      </div>
+
+      {/* Save-as and Rename share one dialog — only the title and initial value differ. */}
+      <AlertDialog open={!!nameDialog} onOpenChange={(o) => { if (!o) setNameDialog(null) }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{nameDialog?.mode === 'save' ? 'Save preset' : 'Rename preset'}</AlertDialogTitle>
+            <AlertDialogDescription>Name this load config.</AlertDialogDescription>
+          </AlertDialogHeader>
+          <Input
+            value={nameValue}
+            onChange={(e) => setNameValue(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') confirmName() }}
+            placeholder="Preset name"
+            autoFocus
+          />
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={() => setNameDialog(null)}>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={confirmName}>{nameDialog?.mode === 'save' ? 'Save' : 'Rename'}</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog open={!!deleteTarget} onOpenChange={(o) => { if (!o) setDeleteTarget(null) }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete preset</AlertDialogTitle>
+            <AlertDialogDescription>Delete “{deleteTarget?.name}” from this model?</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={() => setDeleteTarget(null)}>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={confirmDelete}>Delete</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
+  )
 }
 
 export function ModelDetailDialog({
@@ -244,6 +474,15 @@ export function ModelDetailDialog({
           <div className="py-10 text-center text-[13px] text-muted">Loading…</div>
         ) : (
           <div className="flex flex-col gap-4">
+            <PresetsPanel
+              modelKey={detail.key}
+              draft={draft}
+              onApplyPreset={(profile) => setDraft((d) => (d ? mergePresetIntoDraft(d, profile) : d))}
+              activeEngineId={activeEngine?.id}
+              save={actions.save}
+              reset={actions.reset}
+            />
+
             {fit && (
               (draft.nglFit || draft.nCpuMoeFit) ? (
                 <div className="rounded-md border border-border bg-panel-2 px-3 py-2 text-[12px] text-muted">
