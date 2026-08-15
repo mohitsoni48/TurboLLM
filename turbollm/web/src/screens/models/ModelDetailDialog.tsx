@@ -146,7 +146,20 @@ function PresetsPanel({
       m.create.mutate(
         { name, engineId: activeEngineId ?? '', profile: draft },
         {
-          onSuccess: () => setNameDialog(null),
+          // A just-saved preset IS the panel's current settings, so it becomes the active one —
+          // selected in the dropdown AND pinned server-side. Without the pin this desyncs: the
+          // dropdown would read "No preset applied" right after saving, and the next non-UI load
+          // (gateway auto-swap, `turbollm launch --model`) would ignore what was just saved,
+          // because POST /presets deliberately only creates — /apply is what pins.
+          onSuccess: (created) => {
+            setNameDialog(null)
+            setSelectedId(created.id)
+            m.apply.mutate(created.id, {
+              // Creation succeeded; only the pin failed. Drop the selection so the dropdown does
+              // not claim an active preset the server has no pin for.
+              onError: () => setSelectedId(null),
+            })
+          },
           onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not save preset.'),
         },
       )
