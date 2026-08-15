@@ -1100,7 +1100,6 @@ function validate(c: Config): void {
   validateModelPresets(c)
 }
 
-/** Custom chat agents (Customize → Agents): unique non-empty ids/names, capped list. */
 /** Preset cap is PER MODEL — at most this many in any one modelKey's array. (customAgents is a
  *  flat list so its cap is global; modelPresets is a Record<string, ModelPreset[]>.) */
 export const MODEL_PRESET_CAP = 50
@@ -1166,6 +1165,7 @@ export function prunePresets(cfg: Config, modelKey: string): void {
   cfg.modelPresets[modelKey] = cur
 }
 
+/** Custom chat agents (Customize → Agents): unique non-empty ids/names, capped list. */
 const CUSTOM_AGENT_CAP = 50
 function validateCustomAgents(c: Config): void {
   const ids = new Set<string>()
