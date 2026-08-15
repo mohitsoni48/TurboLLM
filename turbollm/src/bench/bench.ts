@@ -11,7 +11,7 @@
 import { execFile } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
-import { setModelProfile, getModelProfile, VRAM_HEADROOM_SPILL_MB, type BenchResult, type ConfigStore } from '../config/config'
+import { prunePresets, setModelProfile, getModelProfile, VRAM_HEADROOM_SPILL_MB, type BenchResult, type ConfigStore, type ModelPreset } from '../config/config'
 import type { Manager, StartOpts } from '../engines/manager'
 import type { Registry } from '../engines/registry'
 import type { Engine } from '../config/config'
@@ -1293,6 +1293,26 @@ export class BenchRunner {
       // persist into that engine's slot only. No active engine (engineId '') → '*' fallback.
       setModelProfile(cfg, modelKey, engineId || '*', tuned)
       cfg.benchResults[modelKey] = record
+      // Mint a preset from the tuned profile (ADR-353 D3) and pin it, so the next load uses this
+      // tune. Same update callback ⇒ profile + preset + pin persist atomically.
+      const presets = (cfg.modelPresets[modelKey] ??= [])
+      const used = new Set(presets.map((p) => p.name))
+      const base = `Auto-tune ${new Date().toISOString().slice(0, 10)}`
+      let name = base
+      for (let n = 2; used.has(name); n += 1) name = `${base} (${n})`
+      const minted: ModelPreset = {
+        id: randomUUID(),
+        name,
+        engineId: engineId || '',
+        profile: tuned,
+        updatedAt: new Date().toISOString(),
+        origin: 'autotune',
+        benchTps: record.tps,
+      }
+      presets.push(minted)
+      ;(cfg.lastPresetId ??= {})[modelKey] = minted.id
+      // Retention AFTER the mint, including the cap fallback — prunePresets never throws.
+      prunePresets(cfg, modelKey)
     })
     return record
   }
