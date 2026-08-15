@@ -18,12 +18,15 @@ import { join } from 'node:path'
 import {
   ANY_ENGINE,
   ConfigStore,
+  MODEL_PRESET_CAP,
   SCHEMA_VERSION,
   defaultConfig,
   deleteModelProfile,
   getModelProfile,
+  prunePresets,
   setModelProfile,
   type Config,
+  type ModelPreset,
   type ProfileEntry,
 } from './config'
 
@@ -403,6 +406,113 @@ test('getModelProfile: a dangling pin (preset deleted) falls through to the pre-
   delete cfg.lastPresetId['m|q4|1']
   assert.equal((getModelProfile(cfg, 'm|q4|1', engineA) as { ctx: number }).ctx, 4096)
   assert.equal(getModelProfile(cfg, 'nope|q4|1', engineA), undefined)
+})
+
+// prunePresets tests: in-memory Configs only — no auto-tune involved.
+function mkPreset(id: string, over: Partial<ModelPreset> = {}): ModelPreset {
+  return {
+    id,
+    name: id,
+    engineId: '',
+    profile: { ctx: 4096 },
+    updatedAt: '2026-01-01T00:00:00.000Z',
+    origin: 'autotune',
+    ...over,
+  }
+}
+
+test('prunePresets: 11 autotune + 2 manual, one manual pinned → oldest autotune pruned, manuals + pinned survive', () => {
+  const cfg = defaultConfig()
+  const presets = [
+    mkPreset('at-0', { origin: 'autotune', updatedAt: '2026-01-01T00:00:00.000Z' }),
+    mkPreset('at-1', { origin: 'autotune', updatedAt: '2026-01-02T00:00:00.000Z' }),
+    mkPreset('at-2', { origin: 'autotune', updatedAt: '2026-01-03T00:00:00.000Z' }),
+    mkPreset('at-3', { origin: 'autotune', updatedAt: '2026-01-04T00:00:00.000Z' }),
+    mkPreset('at-4', { origin: 'autotune', updatedAt: '2026-01-05T00:00:00.000Z' }),
+    mkPreset('at-5', { origin: 'autotune', updatedAt: '2026-01-06T00:00:00.000Z' }),
+    mkPreset('at-6', { origin: 'autotune', updatedAt: '2026-01-07T00:00:00.000Z' }),
+    mkPreset('at-7', { origin: 'autotune', updatedAt: '2026-01-08T00:00:00.000Z' }),
+    mkPreset('at-8', { origin: 'autotune', updatedAt: '2026-01-09T00:00:00.000Z' }),
+    mkPreset('at-9', { origin: 'autotune', updatedAt: '2026-01-10T00:00:00.000Z' }),
+    mkPreset('at-10', { origin: 'autotune', updatedAt: '2026-01-11T00:00:00.000Z' }),
+    mkPreset('mn-0', { origin: 'manual', updatedAt: '2026-01-01T12:00:00.000Z' }),
+    mkPreset('mn-1', { origin: 'manual', updatedAt: '2026-01-12T00:00:00.000Z' }),
+  ]
+  cfg.modelPresets = { 'm|q4|1': presets }
+  cfg.lastPresetId = { 'm|q4|1': 'mn-0' }
+
+  prunePresets(cfg, 'm|q4|1')
+  const ids = (cfg.modelPresets['m|q4|1'] ?? []).map((p) => p.id)
+  assert.equal(ids.includes('at-0'), false) // the oldest autotune is pruned
+  assert.equal(ids.length, 12)
+  assert.equal(ids.includes('mn-0'), true) // both manuals survive
+  assert.equal(ids.includes('mn-1'), true)
+  assert.equal(ids.includes('at-10'), true) // newest autotune survives
+})
+
+test('prunePresets: a pinned autotune older than the cutoff still survives', () => {
+  const cfg = defaultConfig()
+  const presets = Array.from({ length: 12 }, (_, i) =>
+    mkPreset(`at-${i}`, { origin: 'autotune', updatedAt: `2026-01-${String(i + 1).padStart(2, '0')}T00:00:00.000Z` }),
+  )
+  cfg.modelPresets = { 'm|q4|1': presets }
+  cfg.lastPresetId = { 'm|q4|1': 'at-0' } // the OLDEST autotune is pinned
+
+  prunePresets(cfg, 'm|q4|1')
+  const ids = (cfg.modelPresets['m|q4|1'] ?? []).map((p) => p.id)
+  assert.equal(ids.includes('at-0'), true) // pinned beats the retention cutoff
+  assert.equal(ids.includes('at-1'), false) // the next-oldest unpinned autotune is pruned instead
+  assert.equal(ids.length, 11)
+})
+
+test('prunePresets: at the per-model cap, the oldest NON-PINNED preset of ANY origin is pruned', () => {
+  const cfg = defaultConfig()
+  const manual = (i: number, updatedAt: string): ModelPreset => mkPreset(`mn-${i}`, { origin: 'manual', updatedAt })
+  const at = (i: number, updatedAt: string): ModelPreset => mkPreset(`at-${i}`, { origin: 'autotune', updatedAt })
+  const presets: ModelPreset[] = [
+    manual(0, '2026-01-01T00:00:00.000Z'), // oldest overall — a manual
+    at(0, '2026-01-02T00:00:00.000Z'),
+  ]
+  for (let i = 1; i < 50; i += 1) presets.push(manual(i, `2026-01-01T00:${String(i).padStart(2, '0')}:00.000Z`))
+  assert.equal(presets.length, MODEL_PRESET_CAP + 1)
+  cfg.modelPresets = { 'm|q4|1': presets }
+  cfg.lastPresetId = { 'm|q4|1': 'mn-49' } // pin the newest
+
+  prunePresets(cfg, 'm|q4|1')
+  const ids = (cfg.modelPresets['m|q4|1'] ?? []).map((p) => p.id)
+  assert.equal(ids.length, MODEL_PRESET_CAP)
+  assert.equal(ids.includes('mn-0'), false) // the cap prunes a manual — rule 2 yields to the cap
+  assert.equal(ids.includes('mn-49'), true) // the pinned one survives
+  assert.equal(ids.includes('at-0'), true)
+})
+
+test('prunePresets: nothing prunable at the cap → the last element is dropped, the pin is cleared, no throw', () => {
+  const cfg = defaultConfig()
+  // A hand-built config where every preset shares the pinned id: rule 4 has no non-pinned
+  // candidate to prune, so the mint is undone instead of breaking the pin.
+  const presets = Array.from({ length: MODEL_PRESET_CAP + 1 }, (_, i) =>
+    mkPreset('dup', { updatedAt: `2026-01-01T00:00:${String(i).padStart(2, '0')}.000Z`, origin: 'manual' }),
+  )
+  cfg.modelPresets = { 'm|q4|1': presets }
+  cfg.lastPresetId = { 'm|q4|1': 'dup' }
+
+  assert.doesNotThrow(() => prunePresets(cfg, 'm|q4|1'))
+  assert.equal((cfg.modelPresets['m|q4|1'] ?? []).length, MODEL_PRESET_CAP)
+  assert.equal(cfg.lastPresetId['m|q4|1'], undefined) // the pin was undone with the mint
+})
+
+test('prunePresets: an already-compliant array is left unchanged', () => {
+  const cfg = defaultConfig()
+  const presets = [
+    mkPreset('at-0', { origin: 'autotune', updatedAt: '2026-01-01T00:00:00.000Z' }),
+    mkPreset('at-1', { origin: 'autotune', updatedAt: '2026-01-02T00:00:00.000Z' }),
+    mkPreset('mn-0', { origin: 'manual', updatedAt: '2026-01-03T00:00:00.000Z' }),
+  ]
+  cfg.modelPresets = { 'm|q4|1': presets }
+  cfg.lastPresetId = { 'm|q4|1': 'mn-0' }
+
+  prunePresets(cfg, 'm|q4|1')
+  assert.equal(cfg.modelPresets['m|q4|1'], presets) // same reference — not even re-assigned
 })
 
 test('preset seeding: a present-but-empty presets array is NOT re-seeded', () => {

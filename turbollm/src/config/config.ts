@@ -1120,6 +1120,52 @@ function validateModelPresets(c: Config): void {
   }
 }
 
+/** Retention for auto-tune-minted presets (ADR-353). Called by bench.ts right after pushing a
+ *  freshly minted preset. Rules, in order:
+ *    1. Keep the newest AUTOTUNE_PRESET_RETENTION unpinned `autotune` presets; prune older.
+ *    2. Never prune `manual` presets — those are the user's own saves.
+ *    3. Never prune the pinned preset.
+ *    4. Cap fallback: if 1–3 still leave the array over the per-model cap, prune the OLDEST
+ *       NON-PINNED preset of ANY origin, repeatedly. Rule 2 yields to the cap, because
+ *       validate() throws on an over-cap config and would break every unrelated settings write.
+ *  If the cap cannot be met without removing the pinned preset, it UNDOES the mint instead
+ *  (drops the just-pushed last element and its pin), warns, and returns. Never throws. */
+export const AUTOTUNE_PRESET_RETENTION = 10
+export function prunePresets(cfg: Config, modelKey: string): void {
+  const arr = cfg.modelPresets[modelKey]
+  if (!Array.isArray(arr) || arr.length === 0) return
+  const pinnedId = (cfg.lastPresetId ?? {})[modelKey]
+
+  const byOldest = (a: ModelPreset, b: ModelPreset) =>
+    a.updatedAt < b.updatedAt ? -1 : a.updatedAt > b.updatedAt ? 1 : 0
+
+  // Rules 1–3.
+  const ranked = arr.filter((p) => p.origin === 'autotune' && p.id !== pinnedId).sort(byOldest)
+  const excess = new Set(
+    ranked.slice(0, Math.max(0, ranked.length - AUTOTUNE_PRESET_RETENTION)).map((p) => p.id),
+  )
+  let cur = excess.size === 0 ? arr : arr.filter((p) => !excess.has(p.id))
+
+  // Rule 4.
+  while (cur.length > MODEL_PRESET_CAP) {
+    const candidates = cur.filter((p) => p.id !== pinnedId).sort(byOldest)
+    if (candidates.length === 0) break
+    cur = cur.filter((p) => p.id !== candidates[0].id)
+  }
+
+  if (cur.length > MODEL_PRESET_CAP) {
+    // Nothing removable — undo the mint rather than break the pin.
+    if (arr[arr.length - 1].id === pinnedId) delete cfg.lastPresetId[modelKey]
+    cfg.modelPresets[modelKey] = arr.slice(0, -1)
+    console.warn(
+      `[presets] model "${modelKey}" is at the ${MODEL_PRESET_CAP}-preset cap with nothing prunable — the auto-tune mint was skipped; the tuned profile was still saved`,
+    )
+    return
+  }
+  if (cur.length === arr.length) return
+  cfg.modelPresets[modelKey] = cur
+}
+
 const CUSTOM_AGENT_CAP = 50
 function validateCustomAgents(c: Config): void {
   const ids = new Set<string>()
