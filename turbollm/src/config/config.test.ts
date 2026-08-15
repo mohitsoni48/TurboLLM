@@ -245,3 +245,105 @@ test('bug #35 scenario: two engines for one model keep independent profiles; unk
   // A third, untuned engine falls back to whichever was saved most recently (vulkan).
   assert.equal((getModelProfile(cfg, 'm|q4|1', 'mlx-engine-id') as { ctx: number }).ctx, 16384)
 })
+
+test('preset seeding: a model with saved profiles but no presets gets one preset per engine slot', () => {
+  const path = tmpConfigPath()
+  try {
+    const engineA = 'aaaa-aaaa-aaaa-aaaa-aaaa-aaaa-aaaa-aaaa'
+    const engineB = 'bbbb-bbbb-bbbb-bbbb-bbbb-bbbb-bbbb-bbbb'
+    const profiles = {
+      'm|q4|1': {
+        [engineA]: { profile: flatProfile({ ctx: 4096 }), updatedAt: '2026-01-01T00:00:00.000Z' },
+        [engineB]: { profile: flatProfile({ ctx: 16384 }), updatedAt: '2026-02-01T00:00:00.000Z' },
+      },
+      's|q4|1': {
+        [ANY_ENGINE]: { profile: flatProfile({ ctx: 8192 }), updatedAt: '2026-03-01T00:00:00.000Z' },
+      },
+    }
+    const v4 = {
+      ...defaultConfig(),
+      engines: [
+        {
+          id: engineA,
+          name: 'llama.cpp',
+          binPath: '/opt/llama-server',
+          kind: 'llama-server',
+          version: 'b1234',
+          capabilities: { kvTypes: ['f16', 'q8_0'], flags: [] },
+          addedAt: '2026-01-01T00:00:00.000Z',
+        },
+        {
+          id: engineB,
+          name: 'ik_llama.cpp (TurboQuant)',
+          binPath: '/opt/ik-llama-server',
+          kind: 'llama-server',
+          version: 'b5678',
+          capabilities: { kvTypes: ['f16'], flags: [] },
+          addedAt: '2026-01-02T00:00:00.000Z',
+        },
+      ],
+      modelProfiles: profiles,
+    }
+    writeFileSync(path, JSON.stringify(v4))
+
+    // First load seeds one preset per engine slot, named from the engine VERBATIM.
+    const store = ConfigStore.load(path)
+    const cfg = store.snapshot()
+    const seededM = cfg.modelPresets['m|q4|1'] ?? []
+    assert.equal(seededM.length, 2)
+    assert.deepEqual(
+      seededM.map((p) => p.name),
+      ['Saved (llama.cpp)', 'Saved (ik_llama.cpp (TurboQuant))'],
+    )
+    assert.deepEqual(
+      seededM.map((p) => p.engineId),
+      [engineA, engineB],
+    )
+    assert.equal(seededM.every((p) => p.origin === 'manual'), true)
+    assert.deepEqual(seededM[0].profile, flatProfile({ ctx: 4096 }))
+    assert.equal(seededM[0].updatedAt, '2026-01-01T00:00:00.000Z')
+    assert.deepEqual(seededM[1].profile, flatProfile({ ctx: 16384 }))
+    assert.equal(seededM[1].updatedAt, '2026-02-01T00:00:00.000Z')
+    // A single ANY_ENGINE slot seeds as 'Saved' with engineId '' (any engine).
+    const seededS = cfg.modelPresets['s|q4|1'] ?? []
+    assert.equal(seededS.length, 1)
+    assert.equal(seededS[0].name, 'Saved')
+    assert.equal(seededS[0].engineId, '')
+    assert.deepEqual(seededS[0].profile, flatProfile({ ctx: 8192 }))
+
+    // Second load: a present array means "already seeded" — no duplicates, ids stable.
+    const cfg2 = ConfigStore.load(path).snapshot()
+    assert.equal((cfg2.modelPresets['m|q4|1'] ?? []).length, 2)
+    assert.equal((cfg2.modelPresets['s|q4|1'] ?? []).length, 1)
+    assert.deepEqual(
+      (cfg2.modelPresets['m|q4|1'] ?? []).map((p) => p.id),
+      seededM.map((p) => p.id),
+    )
+    // modelProfiles is only READ by the seeding: still present, untouched.
+    assert.deepEqual(cfg2.modelProfiles, profiles)
+    assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')).modelProfiles, profiles)
+  } finally {
+    cleanup(path)
+  }
+})
+
+test('preset seeding: a present-but-empty presets array is NOT re-seeded', () => {
+  const path = tmpConfigPath()
+  try {
+    const v4 = {
+      ...defaultConfig(),
+      modelProfiles: {
+        'x|q4|1': { [ANY_ENGINE]: { profile: flatProfile(), updatedAt: '2026-01-01T00:00:00.000Z' } },
+      },
+      modelPresets: { 'x|q4|1': [] },
+    }
+    writeFileSync(path, JSON.stringify(v4))
+
+    const cfg = ConfigStore.load(path).snapshot()
+    assert.deepEqual(cfg.modelPresets['x|q4|1'], [])
+    // And it stays empty on a second load too.
+    assert.deepEqual(ConfigStore.load(path).snapshot().modelPresets['x|q4|1'], [])
+  } finally {
+    cleanup(path)
+  }
+})

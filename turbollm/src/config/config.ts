@@ -766,6 +766,37 @@ function normalize(c: Config): void {
       c.modelProfiles[modelKey] = { '*': { profile: val, updatedAt: new Date().toISOString() } }
     }
   }
+  // Seed modelPresets from modelProfiles (ADR-353): a model with saved profile slots but no
+  // presets yet gets one preset per engine slot, so an upgrade never loses the user's tunes.
+  // Idempotent — a present array (EVEN AN EMPTY ONE) means "already seeded", so this never
+  // re-mints. modelProfiles is only READ here: never deleted, never modified.
+  c.modelPresets ??= {}
+  for (const [modelKey, byEngineRaw] of Object.entries(c.modelProfiles)) {
+    if (Array.isArray((c.modelPresets as Record<string, unknown>)[modelKey])) continue
+    if (!byEngineRaw || typeof byEngineRaw !== 'object') continue
+    const entries = Object.entries(byEngineRaw as Record<string, ProfileEntry>).filter(
+      ([, e]) => !!e && typeof e === 'object' && typeof e.updatedAt === 'string' && e.profile !== undefined,
+    )
+    if (entries.length === 0) continue
+    // Naming: one slot → "Saved". Several → "Saved (<engine name>)" using Engine.name VERBATIM
+    // (it is a full build label — do not prettify), falling back to "Saved" for the reserved
+    // ANY_ENGINE slot or an engine that no longer exists. Duplicates get " (2)", " (3)"…
+    const seen = new Map<string, number>()
+    c.modelPresets[modelKey] = entries.map(([engineId, entry]) => {
+      const engine = engineId === ANY_ENGINE ? undefined : c.engines.find((e) => e.id === engineId)
+      const base = entries.length === 1 || !engine ? 'Saved' : `Saved (${engine.name})`
+      const n = (seen.get(base) ?? 0) + 1
+      seen.set(base, n)
+      return {
+        id: randomUUID(),
+        name: n > 1 ? `${base} (${n})` : base,
+        engineId: engineId === ANY_ENGINE ? '' : engineId,
+        profile: entry.profile,
+        updatedAt: entry.updatedAt,
+        origin: 'manual' as const,
+      }
+    })
+  }
   // Persisted auto-tune results (spec 09 §1): absent in pre-bench configs → {}.
   c.benchResults ??= {}
   // VRAM headroom slider: absent/garbage (pre-feature config, or a stale out-of-range
