@@ -2,7 +2,7 @@
 // headers, group split/mmproj files, and expose a rich model list. Path-cached.
 import { existsSync, lstatSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
-import type { ConfigStore } from '../config/config'
+import { migrateModelKey, type ConfigStore } from '../config/config'
 import { GgufError, type GgufMeta, parseGguf, quantFromName } from '../gguf/gguf'
 
 export interface ModelEntry {
@@ -203,6 +203,9 @@ export class Scanner {
   private lastScanAt = ''
   private cache = new Map<string, CacheRow>()
   private cachePath: string
+  // [legacyKey, key] pairs discovered during the CURRENT rescan — see the comment in `entryFor`
+  // for why these are batched into one config write instead of applied as they're found.
+  private pendingKeyMigrations: Array<[string, string]> = []
 
   constructor(private store: ConfigStore) {
     this.cachePath = join(store.dir(), 'models-cache.json')
@@ -272,11 +275,17 @@ export class Scanner {
         if (existsSync(d)) walk(d, scan)
         await tick()
       }
+      this.pendingKeyMigrations = []
       const gguf = await this.build(scan.ggufs)
       const mlx = scan.mlxDirs.map((dir) => mlxEntryFor(dir))
       this.entries = [...gguf, ...mlx].sort((a, b) => a.name.localeCompare(b.name))
       this.lastScanAt = new Date().toISOString()
       this.saveCache()
+      // One config write for the whole scan (see `entryFor`), not one per affected model.
+      if (this.pendingKeyMigrations.length > 0) {
+        const pairs = this.pendingKeyMigrations
+        this.store.update((cfg) => { for (const [oldKey, newKey] of pairs) migrateModelKey(cfg, oldKey, newKey) })
+      }
     } finally {
       this.scanning = false
     }
@@ -372,13 +381,44 @@ export class Scanner {
     }
 
     const fileName = basename(path)
-    const quant = meta?.quant || quantFromName(fileName)
+    // Filename wins over the GGUF's own `general.file_type` when it parses (issue: Q2/IQ2 dynamic
+    // quants reporting as Q4). That metadata field is llama.cpp's own single-enum summary of a
+    // model's tensor quant types, and for mixed/dynamic quantizations (unsloth's "UD" line, which
+    // deliberately varies bit-width per tensor to hit a size target) it is computed by MOST-COMMON
+    // TENSOR, not by byte size — so a file whose few, huge, size-dominant tensors were pushed down
+    // to 2-bit to shrink it can still report Q4_K_S/Q4_K_M, because the many small attention/norm
+    // tensors kept at 4-bit outnumber them. Verified live 2026-08-16: `Qwen3.8-27B-UD-IQ2_M.gguf`
+    // (10.3 GB — a 2-bit-class file) read `general.file_type` = 14 (Q4_K_S); same for
+    // `Muse-Glimmer-30B-UD-Q2_K_XL.gguf` reading 15 (Q4_K_M) — both silently misrepresenting a
+    // 2-bit model as 4-bit, the one number users actually rely on to judge output quality.
+    // Filename is trustworthy here for the same reason `BOGUS_GENERAL_NAMES` already distrusts a
+    // different metadata field below: every quantizer in the ecosystem (llama.cpp's own `quantize`,
+    // bartowski, mradermacher, unsloth, …) names its output after the real quant, because that
+    // filename IS the tool's own record of what it produced — nobody hand-renames a GGUF to a
+    // different quant label. Checked against the full local catalog (26 GGUFs, 7 disagreements):
+    // 5 were the filename carrying MORE information than metadata at the same bit-width (e.g.
+    // "Q4_K_XL" vs "Q4_K_M" — unsloth's own recipe label, not a lie), and the other 2 were exactly
+    // this bug. Zero cases favored metadata.
+    const quant = quantFromName(fileName) !== '?' ? quantFromName(fileName) : meta?.quant || '?'
     const name = meta?.name || cleanName(fileName)
     const vision = mmprojPath !== null
     const arch = meta?.arch ?? 'unknown'
+    const key = `${name.toLowerCase()}|${quant}|${sizeBytes}`
+
+    // The key this same file would have gotten under the PRE-fix precedence (metadata trusted
+    // over filename) — if that differs, any profile/preset/bench-result a user saved before the
+    // fix landed is sitting under the old key and needs to move. See `migrateModelKey`.
+    const legacyQuant = meta?.quant || quantFromName(fileName)
+    const legacyKey = `${name.toLowerCase()}|${legacyQuant}|${sizeBytes}`
+    // Queued, not applied here: this runs once per file on EVERY scan (a rescan can fire on every
+    // file-watch tick), and `ConfigStore.update` clones + validates + writes the whole config to
+    // disk. Batching every candidate from this scan into one `update()` call in `rescan()` keeps
+    // that cost to once per scan instead of once per affected model — `migrateModelKey` itself is
+    // a cheap no-op once there is nothing left under `legacyKey` to move.
+    if (legacyKey !== key) this.pendingKeyMigrations.push([legacyKey, key])
 
     return {
-      key: `${name.toLowerCase()}|${quant}|${sizeBytes}`,
+      key,
       name,
       path,
       dir,
