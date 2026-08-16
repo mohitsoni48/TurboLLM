@@ -369,3 +369,29 @@ test('quantFromName recognizes APEX mixed-precision MoE tiers', () => {
 test('quantFromName falls back to "?" when nothing recognizable is present', () => {
   assert.equal(quantFromName('random-model-name.gguf'), '?')
 })
+
+// ---- quantFromName delimiter-anchoring + last-match (2026-08-16 review of scanner.ts's dynamic-
+// quant fix) — this function is now TRUSTED OVER metadata on a mismatch, so a false positive here
+// no longer gets harmlessly shadowed; it becomes the label users see. All three cases below were
+// verified live against the unanchored, first-match version this replaced. ------------------------
+
+test('quantFromName does not read a quant token out of ordinary filename text', () => {
+  // "seq2seq" contains "q2se" — the old unanchored regex matched it as "Q2SEQ". The real quant,
+  // "Q8_0", is delimited on both sides and must win instead.
+  assert.equal(quantFromName('flan-t5-seq2seq-base-Q8_0.gguf'), 'Q8_0')
+  // A release/date token that happens to read as Q<digit> — the old regex took "Q4" from "2025Q4".
+  assert.equal(quantFromName('model-2025Q4-release-Q8_0.gguf'), 'Q8_0')
+})
+
+test('quantFromName takes the LAST anchored match — a naming-convention prefix can also anchor', () => {
+  // "Q2.5" here is a Qwen2.5-family finetune naming convention, not a quant — and it DOES satisfy
+  // the delimiter anchor (string start, then "."), so anchoring alone isn't enough. The real quant
+  // token is the one every quantizer convention places at the end, right before the extension.
+  assert.equal(quantFromName('Q2.5-Veltha-14B-Q4_K_M.gguf'), 'Q4_K_M')
+})
+
+test('quantFromName: anchoring does not break split-file or dot-separated real quant tokens', () => {
+  assert.equal(quantFromName('model-Q4_K_XL-00001-of-00002.gguf'), 'Q4_K_XL')
+  assert.equal(quantFromName('model.Q5_K_M.gguf'), 'Q5_K_M')
+  assert.equal(quantFromName('model-q4_0.gguf'), 'Q4_0')
+})
