@@ -35,6 +35,7 @@ import type { TextContent, ToolCall as PiToolCall, Usage } from '@earendil-works
 import type { Deps } from '../deps'
 import type { Message as DbMessage } from '../chat/db'
 import { engineModelAlias } from '../engines/compat'
+import type { ReasoningEffort } from '../chat/reasoning-effort'
 import { SkillStore, type Skill } from '../agents/skills'
 import { isContainedFromRoot } from './containment'
 import { buildAppendPrompt, toolsForMode, type CodeMode } from './persona'
@@ -301,6 +302,10 @@ export interface RunCodeParams {
    *  (`thinking_budget_tokens`) as chat's own thinkingBudget (chat-routes.ts). Applied via
    *  the before_provider_request hook below since pi makes its own provider HTTP calls. */
   thinkingBudget: number
+  /** Qwen3.8's chat-template reasoning_effort control — independent of thinkingBudget, same
+   *  semantics as chat-routes.ts's GenerationCtx.reasoningEffort. Undefined = don't send the
+   *  field. Already validated (parseReasoningEffort) by the caller. */
+  reasoningEffort: ReasoningEffort | undefined
   /** The user's task text (first prompt of the run). */
   task: string
   /** Fires when the HTTP request is aborted / the run is stopped. */
@@ -615,7 +620,7 @@ export function pickPrefillProgress(slots: unknown): PrefillProgress | null {
  * Resolves when the pi agentic loop settles (or the run is aborted).
  */
 export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResult> {
-  const { d, convId, sessionId, repoRoot, mode, thinkingBudget, task: rawTask, signal, sink } = params
+  const { d, convId, sessionId, repoRoot, mode, thinkingBudget, reasoningEffort, task: rawTask, signal, sink } = params
 
   const ms = d.manager.status()
   if (ms.state !== 'running' || !ms.model) throw new Error('model_not_loaded')
@@ -1211,6 +1216,23 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
           ...payload,
           thinking_budget_tokens: 0,
           chat_template_kwargs: { ...(payload.chat_template_kwargs as Record<string, unknown> ?? {}), enable_thinking: false },
+        }
+      }
+      // Independent of thinkingBudget above (same as chat-routes.ts's runGeneration) — only
+      // set when the caller passed a value that survived parseReasoningEffort. 'off' collapses
+      // onto the exact same fields as thinkingBudget===0 above (see reasoning-effort.ts).
+      if (reasoningEffort === 'off') {
+        return {
+          ...payload,
+          thinking_budget_tokens: 0,
+          chat_template_kwargs: { ...(payload.chat_template_kwargs as Record<string, unknown> ?? {}), enable_thinking: false },
+        }
+      }
+      if (reasoningEffort) {
+        return {
+          ...payload,
+          ...(thinkingBudget > 0 ? { thinking_budget_tokens: thinkingBudget } : {}),
+          chat_template_kwargs: { ...(payload.chat_template_kwargs as Record<string, unknown> ?? {}), reasoning_effort: reasoningEffort },
         }
       }
       if (thinkingBudget > 0) {

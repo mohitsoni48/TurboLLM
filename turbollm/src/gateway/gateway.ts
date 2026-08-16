@@ -244,6 +244,20 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
     const guidance = req.tools?.length ? applyAgentGuidance(req, requestOrigin) : null
 
     const oaiBody = mapToOpenAI(req)
+    // Terminal-agent reasoning-effort override (same mechanism as the thinking-budget one
+    // above) — no equivalent field exists on the Anthropic-shaped `req`/mapToOpenAI, so this
+    // is injected into the already-mapped OpenAI-shaped body's chat_template_kwargs instead.
+    if (anthropicCodeSessionId) {
+      const effortOverride = sessionAuth.getReasoningEffortForToken(anthropicToken)
+      // 'off' collapses onto enable_thinking/thinking_budget_tokens instead of the literal
+      // string "off" — see reasoning-effort.ts.
+      if (effortOverride === 'off') {
+        oaiBody.thinking_budget_tokens = 0
+        oaiBody.chat_template_kwargs = { ...(oaiBody.chat_template_kwargs as Record<string, unknown> ?? {}), enable_thinking: false }
+      } else if (effortOverride !== null) {
+        oaiBody.chat_template_kwargs = { ...(oaiBody.chat_template_kwargs as Record<string, unknown> ?? {}), reasoning_effort: effortOverride }
+      }
+    }
     // The hard half of the loop breaker. pi refuses to EXECUTE the repeated call; the gateway is
     // not in an external CLI's execution path, so the equivalent lever is denying tool calls for
     // this one reply — the model physically cannot emit the same call a seventh time and has to
@@ -610,6 +624,15 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
           if (override !== null) {
             if (override > 0) parsedBody.thinking_budget_tokens = override
             else delete parsedBody.thinking_budget_tokens
+          }
+          // Same override mechanism, for reasoning_effort — see session-auth.ts. 'off'
+          // collapses onto enable_thinking/thinking_budget_tokens (reasoning-effort.ts).
+          const effortOverride = sessionAuth.getReasoningEffortForToken(chatToken)
+          if (effortOverride === 'off') {
+            parsedBody.thinking_budget_tokens = 0
+            parsedBody.chat_template_kwargs = { ...(parsedBody.chat_template_kwargs as Record<string, unknown> ?? {}), enable_thinking: false }
+          } else if (effortOverride !== null) {
+            parsedBody.chat_template_kwargs = { ...(parsedBody.chat_template_kwargs as Record<string, unknown> ?? {}), reasoning_effort: effortOverride }
           }
         }
         // A streaming OpenAI response omits the final `usage` chunk unless the caller

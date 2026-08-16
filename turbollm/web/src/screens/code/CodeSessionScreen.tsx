@@ -10,7 +10,9 @@ import type { QueuedTurn, ShellRun, SteerKind } from '../../lib/code-types'
 import {
   codeKeys, useClearCodeSession, useCodeSession, useCodeSessionLastUsage, useCodeSessionRename,
   useExportCodeSession, useResumeCodeSession, useUpdateCodeSessionMode, useUpdateCodeSessionThinkingBudget,
+  useUpdateCodeSessionReasoningEffort,
 } from '../../lib/code-queries'
+import { DEFAULT_REASONING_EFFORT, type ReasoningEffort } from '../../components/ReasoningEffortSelect'
 import { CodeSessionClient, type LiveState } from '../../lib/code-session-client'
 import { matchCodeCommand, pickerCodeCommands } from '../../lib/code-commands'
 import { toggleDisplayPref } from '../../lib/code-display-prefs'
@@ -220,6 +222,38 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isTerminalSession, effectiveSessionId])
 
+  // Reasoning effort (Qwen3.8) — same per-session/global persistence + terminal-session live-
+  // override shape as thinkingBudget above, but independent (see ChatScreen.tsx).
+  const readReasoningEffort = (sid: string | null): ReasoningEffort => {
+    if (sid) {
+      const perSession = localStorage.getItem(`tllm.reasoningEffort.${sid}`)
+      if (perSession === 'off' || perSession === 'low' || perSession === 'medium' || perSession === 'xhigh') return perSession
+    }
+    const global = localStorage.getItem('tllm.reasoningEffort.default')
+    return global === 'off' || global === 'low' || global === 'medium' || global === 'xhigh' ? global : DEFAULT_REASONING_EFFORT
+  }
+  const [reasoningEffort, setReasoningEffortState] = useState<ReasoningEffort>(() => readReasoningEffort(effectiveSessionId ?? null))
+  const updateReasoningEffort = useUpdateCodeSessionReasoningEffort()
+  const setReasoningEffort = (val: ReasoningEffort) => {
+    if (effectiveSessionId) localStorage.setItem(`tllm.reasoningEffort.${effectiveSessionId}`, val)
+    setReasoningEffortState(val)
+    if (isTerminalSession && effectiveSessionId) {
+      updateReasoningEffort.mutate(
+        { id: effectiveSessionId, effort: val },
+        { onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not update reasoning effort.') },
+      )
+    }
+  }
+  useEffect(() => {
+    setReasoningEffortState(readReasoningEffort(effectiveSessionId ?? null))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [effectiveSessionId])
+  useEffect(() => {
+    if (!isTerminalSession || !effectiveSessionId) return
+    updateReasoningEffort.mutate({ id: effectiveSessionId, effort: readReasoningEffort(effectiveSessionId) })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isTerminalSession, effectiveSessionId])
+
   const [live, setLive] = useState<LiveState | null>(null)
   // The SERVER-side message queue's contents (tasks waiting behind the active run). Driven by
   // the daemon — `queue` SSE frames while streaming, plus the session detail on load — NOT
@@ -360,7 +394,7 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
       // new session — the state update from that effect hasn't applied yet, so the closure here
       // would still hold the PREVIOUS session's value. readThinkingBudget is a synchronous
       // localStorage read, immune to that ordering race.
-      void startCodeRun(effectiveSessionId, '', readThinkingBudget(effectiveSessionId))
+      void startCodeRun(effectiveSessionId, '', readThinkingBudget(effectiveSessionId), undefined, undefined, undefined, readReasoningEffort(effectiveSessionId))
         .then(() => { void qc.invalidateQueries({ queryKey: codeKeys.detail(effectiveSessionId) }); clientRef.current?.connect() })
         .catch((e) => { autoStartedRef.current = null; toast.error(e instanceof ApiError ? e.message : 'Could not start the run.') })
     }
@@ -562,7 +596,7 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
     // run. Either way it's owned server-side, so a queued follow-up survives a disconnect. The
     // open stream reflects the result (a new `queue` frame, or the turn going live when it runs).
     try {
-      const res = await startCodeRun(effectiveSessionId, text, thinkingBudget, promptOverride, filesToSend, kind)
+      const res = await startCodeRun(effectiveSessionId, text, thinkingBudget, promptOverride, filesToSend, kind, reasoningEffort)
       // `steered` reports whether a steer actually injected into the live turn vs. was queued —
       // confirm the real outcome. followUp needs no toast: its queued card already shows inline.
       if (kind === 'steer') toast.success(steerOutcomeMessage(res.steered))
@@ -856,6 +890,8 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
               ctxMax={ctxMax}
               thinkingBudget={thinkingBudget}
               onThinkingBudgetChange={setThinkingBudget}
+              reasoningEffort={reasoningEffort}
+              onReasoningEffortChange={setReasoningEffort}
               lastPromptTokens={lastUsage?.promptTokens}
               lastGenTokens={lastUsage?.genTokens}
               lastPromptTps={lastUsage?.promptTps ?? undefined}
@@ -965,6 +1001,8 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
                 onEjectModel={handleEject}
                 thinkingBudget={thinkingBudget}
                 onThinkingBudgetChange={setThinkingBudget}
+                reasoningEffort={reasoningEffort}
+                onReasoningEffortChange={setReasoningEffort}
                 onModelSettings={(key) => setSettingsKey(key)}
                 ctxUsed={ctxUsed}
                 ctxMax={ctxMax}

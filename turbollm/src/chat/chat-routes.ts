@@ -7,6 +7,7 @@ import { clampMaxTokens } from '../config/config'
 import { engineModelAlias } from '../engines/compat'
 import { feedChunk, flushState, initParseState } from './parser'
 import { needsExtraPass } from './think-utils'
+import { parseReasoningEffort, type ReasoningEffort } from './reasoning-effort'
 
 import type { ClaimVerdict, ConversationStore, MessageStats, ResearchMeta, ResearchSource, ToolCallRecord } from './db'
 import { checkReply } from '../tools/research-referee.js'
@@ -265,7 +266,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
   app.post('/api/v1/conversations/:id/messages', async (c) => {
     const convId = c.req.param('id')
-    const b = await body<{ content?: string; images?: string[]; docContext?: string; textAttachments?: string[]; thinkingBudget?: number }>(c)
+    const b = await body<{ content?: string; images?: string[]; docContext?: string; textAttachments?: string[]; thinkingBudget?: number; reasoningEffort?: string }>(c)
     const content = (b.content ?? '').trim()
     const images = b.images ?? []
     const textAttachments = b.textAttachments ?? []
@@ -334,7 +335,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
         : fullContent
       engineMessages.push({ role: 'user', content: userContent })
 
-      await runGeneration(d, stream, { convId, conv, engineMessages, assistantMsg, ms, target, ac, thinkingBudget: b.thinkingBudget ?? -1, userText: content, isCodeAuthorized })
+      await runGeneration(d, stream, { convId, conv, engineMessages, assistantMsg, ms, target, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), userText: content, isCodeAuthorized })
     })
   })
 
@@ -343,7 +344,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
   app.post('/api/v1/conversations/:id/continue', async (c) => {
     const convId = c.req.param('id')
-    const b = await body<{ thinkingBudget?: number }>(c)
+    const b = await body<{ thinkingBudget?: number; reasoningEffort?: string }>(c)
 
     const conv = db.getConversation(convId, true)
     if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
@@ -400,7 +401,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
         engineMessages.push({ role: m.role, content })
       }
 
-      await runGeneration(d, stream, { convId, conv, engineMessages, assistantMsg, ms, target, ac, thinkingBudget: b.thinkingBudget ?? -1, isCodeAuthorized })
+      await runGeneration(d, stream, { convId, conv, engineMessages, assistantMsg, ms, target, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), isCodeAuthorized })
     })
   })
 
@@ -706,6 +707,11 @@ interface GenerationCtx {
    *  `thinking_budget_tokens` (0 additionally sets `chat_template_kwargs.enable_thinking:
    *  false`, mirroring the params autoTitle uses). */
   thinkingBudget: number
+  /** Qwen3.8's chat-template reasoning_effort control (low/medium/xhigh) — independent of
+   *  thinkingBudget (see ReasoningEffortSelect.tsx). Undefined = don't send the field at
+   *  all, which is also what an unrecognized/absent client value parses to
+   *  (parseReasoningEffort), so a bad value never reaches the engine. */
+  reasoningEffort: ReasoningEffort | undefined
   /** Release 3, auto-memory: the clean, just-typed user text (never docContext/attachments/
    *  tool output) for this turn. Undefined on regenerate — no new user text exists there,
    *  so extraction is skipped by design (also avoids re-extracting already-scanned text). */
@@ -773,7 +779,7 @@ function reportChatBenchResult(d: Deps, ms: ModelInfo, stats: Partial<MessageSta
 
 async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx): Promise<void> {
   const { db } = d
-  const { convId, conv, assistantMsg, ms, target, ac, thinkingBudget } = ctx
+  const { convId, conv, assistantMsg, ms, target, ac, thinkingBudget, reasoningEffort } = ctx
 
   // Map conversation sampling overrides (camelCase) to the engine's snake_case names.
   const convS = conv.sampling ?? {}
@@ -955,6 +961,19 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
         reqBody.thinking_budget_tokens = thinkingBudget
       }
       if (conv.preserveThinking) templateKwargs.preserve_thinking = true
+      // Independent of thinkingBudget/enable_thinking above — only sent when the caller
+      // passed a value that survived parseReasoningEffort (chat-routes.ts's body parsing),
+      // so a client typo or an unsupported model can never make it into a request the
+      // engine's chat template would raise_exception on. 'off' is this control's own way of
+      // disabling thinking (see reasoning-effort.ts) — never forwarded as literal
+      // reasoning_effort:"off"; it collapses onto the exact same fields thinkingBudget===0
+      // above already sets.
+      if (reasoningEffort === 'off') {
+        reqBody.thinking_budget_tokens = 0
+        templateKwargs.enable_thinking = false
+      } else if (reasoningEffort) {
+        templateKwargs.reasoning_effort = reasoningEffort
+      }
       if (Object.keys(templateKwargs).length) reqBody.chat_template_kwargs = templateKwargs
       // Attach tools only to engines whose OpenAI server accepts a `tools` array as
       // passthrough. vLLM is strict: a `tools` array (which defaults tool_choice to
@@ -1296,6 +1315,19 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
         reqBody.thinking_budget_tokens = thinkingBudget
       }
       if (conv.preserveThinking) templateKwargs.preserve_thinking = true
+      // Independent of thinkingBudget/enable_thinking above — only sent when the caller
+      // passed a value that survived parseReasoningEffort (chat-routes.ts's body parsing),
+      // so a client typo or an unsupported model can never make it into a request the
+      // engine's chat template would raise_exception on. 'off' is this control's own way of
+      // disabling thinking (see reasoning-effort.ts) — never forwarded as literal
+      // reasoning_effort:"off"; it collapses onto the exact same fields thinkingBudget===0
+      // above already sets.
+      if (reasoningEffort === 'off') {
+        reqBody.thinking_budget_tokens = 0
+        templateKwargs.enable_thinking = false
+      } else if (reasoningEffort) {
+        templateKwargs.reasoning_effort = reasoningEffort
+      }
       if (Object.keys(templateKwargs).length) reqBody.chat_template_kwargs = templateKwargs
 
       const res = await fetch(`${target}/v1/chat/completions`, {

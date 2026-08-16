@@ -22,6 +22,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { skillKeys, fetchSkills } from '../lib/agent-api'
 import { cn, writeLastChatConvId } from '../lib/utils'
 import { ThinkingBudgetSlider } from '../components/ThinkingBudgetSlider'
+import { DEFAULT_REASONING_EFFORT, ReasoningEffortSelect, type ReasoningEffort } from '../components/ReasoningEffortSelect'
 import { MessageBubble, StreamingBubble } from './chat/MessageBubble'
 import { ToolApprovalBar } from './chat/ToolApprovalBar'
 import { ContextMeter } from './chat/ContextMeter'
@@ -132,6 +133,24 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   const setThinkingBudget = (val: number) => {
     if (activeId) localStorage.setItem(`tllm.thinkingBudget.${activeId}`, String(val))
     setThinkingBudgetState(val)
+  }
+
+  // Reasoning effort (Qwen3.8) — same per-conv/global persistence shape as thinkingBudget
+  // above, but a DIFFERENT and independent control (see ReasoningEffortSelect.tsx): only
+  // shown, and only ever sent, when the loaded model's chat template actually supports it
+  // (ModelEntry.reasoningEffort, computed below from loadedEntry).
+  const readReasoningEffort = (convId: string | null): ReasoningEffort => {
+    if (convId) {
+      const perConv = localStorage.getItem(`tllm.reasoningEffort.${convId}`)
+      if (perConv === 'off' || perConv === 'low' || perConv === 'medium' || perConv === 'xhigh') return perConv
+    }
+    const global = localStorage.getItem('tllm.reasoningEffort.default')
+    return global === 'off' || global === 'low' || global === 'medium' || global === 'xhigh' ? global : DEFAULT_REASONING_EFFORT
+  }
+  const [reasoningEffort, setReasoningEffortState] = useState<ReasoningEffort>(() => readReasoningEffort(null))
+  const setReasoningEffort = (val: ReasoningEffort) => {
+    if (activeId) localStorage.setItem(`tllm.reasoningEffort.${activeId}`, val)
+    setReasoningEffortState(val)
   }
 
   // Agent — per-conversation, defaults to the default set in Customize → Agents.
@@ -248,6 +267,9 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // llama.cpp, safetensors under MLX/vLLM. Keeps the chat model menu from listing
   // models that would 409 on load.
   const allModels = (modelsQ.data?.models ?? []).filter((m) => m.compatibleWithActiveEngine)
+  // Gates ReasoningEffortSelect vs ThinkingBudgetSlider below — `status.model` (LoadedModel)
+  // is a slim subset without capability flags, so look the full ModelEntry up by key.
+  const loadedModelSupportsReasoningEffort = (modelsQ.data?.models ?? []).find((m) => m.key === model?.key)?.reasoningEffort ?? false
   const modelBusy =
     modelActions.load.isPending ||
     modelActions.eject.isPending ||
@@ -362,9 +384,10 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     return () => window.removeEventListener('keydown', handler)
   })
 
-  // Sync thinking budget when conversation changes.
+  // Sync thinking budget / reasoning effort when conversation changes.
   useEffect(() => {
     setThinkingBudgetState(readThinkingBudget(activeId))
+    setReasoningEffortState(readReasoningEffort(activeId))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeId])
 
@@ -711,7 +734,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
       abortRefs.current[convId] = ac
 
       const textAttachmentNames = textAttachments.map((a) => a.file.name)
-      await streamFrom(convId, sendMessage(convId, text, ac.signal, images, docContext, textAttachmentNames, thinkingBudget))
+      await streamFrom(convId, sendMessage(convId, text, ac.signal, images, docContext, textAttachmentNames, thinkingBudget, reasoningEffort))
     } catch (e) {
       if (convId) clearLive(convId)
       if ((e as Error)?.name !== 'AbortError') {
@@ -734,7 +757,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
         if (isUserMessage && engineState === 'running' && model) {
           const ac = new AbortController()
           abortRefs.current[activeId] = ac
-          void streamFrom(activeId, continueConversation(activeId, ac.signal, thinkingBudget))
+          void streamFrom(activeId, continueConversation(activeId, ac.signal, thinkingBudget, reasoningEffort))
         }
       },
       onError: () => toast.error('Could not edit message.'),
@@ -747,7 +770,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     await mut.regenerate.mutateAsync(activeId).catch(() => {})
     const ac = new AbortController()
     abortRefs.current[activeId] = ac
-    void streamFrom(activeId, continueConversation(activeId, ac.signal, thinkingBudget))
+    void streamFrom(activeId, continueConversation(activeId, ac.signal, thinkingBudget, reasoningEffort))
   }
 
   const handleDelete = (m: Message) => {
@@ -868,7 +891,11 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
             </Button>
           )}
           <ConversationSettingsDialog conv={conv} draft={draft} modelSampling={modelSampling} />
-          <ThinkingBudgetSlider value={thinkingBudget} onChange={setThinkingBudget} />
+          {loadedModelSupportsReasoningEffort ? (
+            <ReasoningEffortSelect value={reasoningEffort} onChange={setReasoningEffort} />
+          ) : (
+            <ThinkingBudgetSlider value={thinkingBudget} onChange={setThinkingBudget} />
+          )}
           {activeId && selectedAgent && (
             <span
               title={selectedAgent.description}

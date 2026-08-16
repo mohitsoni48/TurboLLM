@@ -98,6 +98,48 @@ test('neither embedded nor standalone chat template → hasChatTemplate=false', 
   }
 })
 
+// reasoningEffort: same per-file substring check as the GGUF path (gguf.ts's
+// GgufMeta.reasoningEffort) — never inferred from model_type/arch.
+
+test('reasoning_effort branch embedded in tokenizer_config.json chat_template → reasoningEffort=true', () => {
+  const dir = makeTmpDir()
+  try {
+    setupMlxDir(dir, [])
+    writeFileSync(
+      join(dir, 'tokenizer_config.json'),
+      JSON.stringify({ chat_template: "{%- set e = reasoning_effort|default('xhigh') %}" }),
+    )
+    assert.equal(mlxEntryFor(dir).reasoningEffort, true)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('reasoning_effort branch in a standalone chat_template.jinja → reasoningEffort=true', () => {
+  const dir = makeTmpDir()
+  try {
+    setupMlxDir(dir, [])
+    writeFileSync(join(dir, 'tokenizer_config.json'), JSON.stringify({ tokenizer_class: 'GPT2Tokenizer' }))
+    writeFileSync(join(dir, 'chat_template.jinja'), "{%- set e = reasoning_effort|default('xhigh') %}")
+    assert.equal(mlxEntryFor(dir).reasoningEffort, true)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('chat template present but without a reasoning_effort branch → reasoningEffort=false', () => {
+  const dir = makeTmpDir()
+  try {
+    setupMlxDir(dir, [])
+    writeFileSync(join(dir, 'tokenizer_config.json'), JSON.stringify({ chat_template: '{{ messages }}' }))
+    const entry = mlxEntryFor(dir)
+    assert.equal(entry.hasChatTemplate, true)
+    assert.equal(entry.reasoningEffort, false)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 // Regression: MLX-format models always reported vision=false regardless of config.json,
 // unlike GGUF (which detects vision via a paired mmproj file) — so a genuinely
 // vision-capable MLX model (e.g. gemma4, which has both vision_config and audio_config)

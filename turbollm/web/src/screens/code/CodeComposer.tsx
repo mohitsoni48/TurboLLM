@@ -11,6 +11,7 @@ import {
 } from '../../components/ui/dropdown-menu'
 import { ModelLoadMenu } from '../../components/ModelLoadMenu'
 import { ThinkingBudgetSlider } from '../../components/ThinkingBudgetSlider'
+import { ReasoningEffortSelect, type ReasoningEffort } from '../../components/ReasoningEffortSelect'
 import { toast } from '../../components/ui/sonner'
 import { browseFs, track } from '../../lib/api'
 import type { ModelEntry } from '../../lib/types'
@@ -222,6 +223,12 @@ export interface CodeComposerProps {
    *  this session's turns via code-session.ts's before_provider_request hook. */
   thinkingBudget: number
   onThinkingBudgetChange: (v: number) => void
+  /** Qwen3.8's chat-template reasoning_effort control — independent of thinkingBudget above.
+   *  Whether to show this control instead of the slider is decided INSIDE this component from
+   *  `models`/`loadedKey` (ModelEntry.reasoningEffort), not a separate prop, so callers can't
+   *  drift out of sync with what's actually loaded. */
+  reasoningEffort: ReasoningEffort
+  onReasoningEffortChange: (v: ReasoningEffort) => void
 
   /** The session's checked-out branch — mid-session only (CodeSessionScreen, which has no
    *  `repo` prop). Powers the stats footer's branch readout (ADR-262); omit entirely to render
@@ -267,10 +274,13 @@ export function CodeComposer({
   models, loadedKey, loadedName, modelPending, ejecting, onLoadModel, onEjectModel, onModelSettings,
   ctxUsed, ctxMax, live, onStop, sendDisabled,
   onAddContext, contextFiles, onRemoveContextFile, hintText, statusText, slashCommands = [],
-  thinkingBudget, onThinkingBudgetChange, onImagesChange, lastPromptTokens, lastGenTokens,
+  thinkingBudget, onThinkingBudgetChange, reasoningEffort, onReasoningEffortChange, onImagesChange, lastPromptTokens, lastGenTokens,
   lastPromptTps, lastGenTps,
 }: CodeComposerProps) {
   const ModeIcon = MODE_ICONS[mode.id]
+  // Same derivation ChatScreen.tsx uses: `loadedKey` alone carries no capability flags, so
+  // look the full ModelEntry up in the models list already passed for ModelLoadMenu.
+  const loadedModelSupportsReasoningEffort = models.find((m) => m.key === loadedKey)?.reasoningEffort ?? false
 
   // '/' picker — only while the WHOLE input is still just the slash + a partial command name
   // (same match shape as ChatScreen's skill picker), so it never re-opens over a longer message
@@ -812,7 +822,11 @@ export function CodeComposer({
           )}
           <div className="flex-1" />
           <ContextUsageRing used={ctxUsed} max={ctxMax} />
-          <ThinkingBudgetSlider value={thinkingBudget} onChange={onThinkingBudgetChange} />
+          {loadedModelSupportsReasoningEffort ? (
+            <ReasoningEffortSelect value={reasoningEffort} onChange={onReasoningEffortChange} />
+          ) : (
+            <ThinkingBudgetSlider value={thinkingBudget} onChange={onThinkingBudgetChange} />
+          )}
           <ModelLoadMenu
             models={models}
             loadedKey={loadedKey}
@@ -916,6 +930,7 @@ export function CodeComposer({
           by that move. */}
       <CodeStatsFooter
         thinkingBudget={thinkingBudget}
+        reasoningEffort={loadedModelSupportsReasoningEffort ? reasoningEffort : undefined}
         ctxUsed={ctxUsed}
         ctxMax={ctxMax}
         lastPromptTokens={lastPromptTokens}

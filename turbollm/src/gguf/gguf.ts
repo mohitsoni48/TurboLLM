@@ -37,6 +37,17 @@ export interface GgufMeta {
    *  multi-token-prediction head (self-speculative decoding). 0 = none. */
   nextnLayers: number
   hasChatTemplate: boolean
+  /** True when the embedded `tokenizer.chat_template` Jinja source itself branches on a
+   *  `reasoning_effort` variable (Qwen3.8's low/medium/xhigh reasoning-depth control).
+   *  NOT implied by `arch` — verified live that other GGUFs sharing the same arch label
+   *  (e.g. "qwen35") do not carry this branch, so detection must read the actual template
+   *  text per file. A raw substring check, not a real Jinja parse: cheap, and a false
+   *  positive here just offers a control the model happens to ignore, while a false
+   *  negative only hides the control — neither corrupts a request the way sending an
+   *  unsupported `reasoning_effort` value would (the template `raise_exception`s on any
+   *  value outside low/medium/xhigh, so callers must never send one without checking this
+   *  flag first). */
+  reasoningEffort: boolean
 
   // ---- Attention layout (optional; all absent-by-default) --------------------------
   // Most GGUFs (plain llama/mistral/qwen2-style dense attention) declare none of the
@@ -307,7 +318,11 @@ export function parseGguf(path: string): GgufMeta {
       else if (key.endsWith('.nextn_predict_layers')) m.nextnLayers = readNumberOrMax(r, t)
       else if (key === 'tokenizer.chat_template') {
         m.hasChatTemplate = true
-        skipValue(r, t)
+        // A single string value (spec 04 §3) — cheap to materialize (tens of KB at most)
+        // and read for capability flags, unlike the vocab/merges arrays this parser
+        // otherwise skips without materializing.
+        const template = t === T_STRING ? String(readScalar(r, t)) : (skipValue(r, t), '')
+        if (template.includes('reasoning_effort')) m.reasoningEffort = true
       } else {
         skipValue(r, t)
       }
@@ -326,6 +341,7 @@ export function parseGguf(path: string): GgufMeta {
       expertCount: m.expertCount ?? 0,
       nextnLayers: m.nextnLayers ?? 0,
       hasChatTemplate: m.hasChatTemplate ?? false,
+      reasoningEffort: m.reasoningEffort ?? false,
       slidingWindow: m.slidingWindow ?? 0,
       slidingWindowPattern: m.slidingWindowPattern ?? [],
       headDimSwa: keyLengthSwa ?? valueLengthSwa ?? 0,

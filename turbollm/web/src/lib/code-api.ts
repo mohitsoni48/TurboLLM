@@ -8,6 +8,7 @@ import type {
 } from './code-types'
 import { ApiError, authHeaders } from './api'
 import { markCodeAuthNeeded, clearCodeAuthNeeded } from './auth-signal'
+import { DEFAULT_REASONING_EFFORT, type ReasoningEffort } from '../components/ReasoningEffortSelect'
 
 async function req<T>(path: string, init?: RequestInit & { json?: unknown }): Promise<T> {
   const headers: Record<string, string> = { Accept: 'application/json', ...authHeaders(), ...((init?.headers as Record<string, string>) ?? {}) }
@@ -127,6 +128,13 @@ export function updateCodeSessionThinkingBudget(id: string, tokens: number): Pro
   return req(`/api/v1/code/sessions/${encodeURIComponent(id)}/thinking-budget`, { method: 'PATCH', json: { tokens } })
 }
 
+/** Same live-override mechanism as updateCodeSessionThinkingBudget, for Qwen3.8's independent
+ *  reasoning_effort control — only meaningful for a terminal-agent session whose loaded model
+ *  supports it (ModelEntry.reasoningEffort). */
+export function updateCodeSessionReasoningEffort(id: string, effort: ReasoningEffort): Promise<{ ok: true; effort: ReasoningEffort | null }> {
+  return req(`/api/v1/code/sessions/${encodeURIComponent(id)}/reasoning-effort`, { method: 'PATCH', json: { effort } })
+}
+
 /** Most recent gateway request TurboLLM has attributed to a terminal-agent session (ADR-284)
  *  — the CLI drives its own requests directly, so this is the terminal-session equivalent of
  *  a chat session's lastRealStats. `usage` is null (not an error) before the session's first
@@ -169,12 +177,14 @@ export async function startCodeRun(
   promptOverride?: string,
   contextFiles?: string[],
   kind?: SteerKind,
+  reasoningEffort?: ReasoningEffort,
 ): Promise<CodeSendMessageResponse> {
   const body: CodeSendMessageBody = {
     content: content || undefined,
     promptOverride: promptOverride || undefined,
     contextFiles: contextFiles?.length ? contextFiles : undefined,
     thinkingBudget: thinkingBudget !== undefined && thinkingBudget !== -1 ? thinkingBudget : undefined,
+    reasoningEffort: reasoningEffort !== undefined && reasoningEffort !== DEFAULT_REASONING_EFFORT ? reasoningEffort : undefined,
     kind,
   }
   return req(`/api/v1/code/sessions/${encodeURIComponent(sessionId)}/messages`, { method: 'POST', json: body })

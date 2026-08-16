@@ -26,6 +26,7 @@ import { TerminalSquare } from 'lucide-react'
 import { ContextUsageRing } from './ContextUsageRing'
 import { ModelLoadMenu } from '../../components/ModelLoadMenu'
 import { ThinkingBudgetSlider } from '../../components/ThinkingBudgetSlider'
+import { ReasoningEffortSelect, type ReasoningEffort } from '../../components/ReasoningEffortSelect'
 import { CodeStatsFooter } from './CodeStatsFooter'
 import type { ModelEntry } from '../../lib/types'
 
@@ -47,6 +48,9 @@ export interface TerminalToolbarProps {
 
   thinkingBudget: number
   onThinkingBudgetChange: (v: number) => void
+  /** Same capability-gated swap as CodeComposer.tsx — decided here from `models`/`loadedKey`. */
+  reasoningEffort: ReasoningEffort
+  onReasoningEffortChange: (v: ReasoningEffort) => void
 
   /** Most recent completed gateway turn for this session (last-usage polling,
    *  CodeSessionScreen) — undefined renders no token segment, same rule CodeComposer's
@@ -59,9 +63,10 @@ export interface TerminalToolbarProps {
 
 export function TerminalToolbar({
   agent, models, loadedKey, loadedName, modelPending, ejecting, onLoadModel, onEjectModel, onModelSettings,
-  ctxUsed, ctxMax, thinkingBudget, onThinkingBudgetChange,
+  ctxUsed, ctxMax, thinkingBudget, onThinkingBudgetChange, reasoningEffort, onReasoningEffortChange,
   lastPromptTokens, lastGenTokens, lastPromptTps, lastGenTps,
 }: TerminalToolbarProps) {
+  const loadedModelSupportsReasoningEffort = models.find((m) => m.key === loadedKey)?.reasoningEffort ?? false
   return (
     <div className="border-t border-border px-3 pb-3 pt-2 md:px-8 md:pb-5">
       <div className="flex items-center gap-1 overflow-x-auto rounded-xl border border-border bg-panel px-2.5 py-2">
@@ -74,7 +79,11 @@ export function TerminalToolbar({
         </span>
         <div className="flex-1" />
         <ContextUsageRing used={ctxUsed} max={ctxMax} />
-        <ThinkingBudgetSlider value={thinkingBudget} onChange={onThinkingBudgetChange} />
+        {loadedModelSupportsReasoningEffort ? (
+          <ReasoningEffortSelect value={reasoningEffort} onChange={onReasoningEffortChange} />
+        ) : (
+          <ThinkingBudgetSlider value={thinkingBudget} onChange={onThinkingBudgetChange} />
+        )}
         <ModelLoadMenu
           models={models}
           loadedKey={loadedKey}
@@ -90,6 +99,7 @@ export function TerminalToolbar({
       </div>
       <CodeStatsFooter
         thinkingBudget={thinkingBudget}
+        reasoningEffort={loadedModelSupportsReasoningEffort ? reasoningEffort : undefined}
         ctxUsed={ctxUsed}
         ctxMax={ctxMax}
         lastPromptTokens={lastPromptTokens}

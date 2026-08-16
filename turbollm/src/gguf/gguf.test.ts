@@ -310,6 +310,47 @@ test('a plain dense model reports no attention-layout metadata at all', () => {
   )
 })
 
+// ---- reasoningEffort (Qwen3.8's low/medium/xhigh chat-template control) -------------
+// Detection is a substring check on the actual chat_template text, never on `arch` —
+// verified live against real GGUFs that other files sharing the same arch label
+// ("qwen35") do not carry this branch.
+
+test('chat_template containing a reasoning_effort branch sets reasoningEffort=true', () => {
+  withGgufFile(
+    [
+      ['general.architecture', 'qwen35'],
+      ['tokenizer.chat_template', "{%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}"],
+    ],
+    (path) => {
+      const meta = parseGguf(path)
+      assert.equal(meta.reasoningEffort, true)
+      assert.equal(meta.hasChatTemplate, true)
+    },
+  )
+})
+
+test('chat_template without reasoning_effort sets reasoningEffort=false (same arch label)', () => {
+  withGgufFile(
+    [
+      ['general.architecture', 'qwen35'],
+      ['tokenizer.chat_template', '{%- if enable_thinking is undefined or enable_thinking is true %}...{%- endif %}'],
+    ],
+    (path) => {
+      const meta = parseGguf(path)
+      assert.equal(meta.reasoningEffort, false)
+      assert.equal(meta.hasChatTemplate, true)
+    },
+  )
+})
+
+test('no chat_template at all leaves both flags false', () => {
+  withGgufFile([['general.architecture', 'llama']], (path) => {
+    const meta = parseGguf(path)
+    assert.equal(meta.hasChatTemplate, false)
+    assert.equal(meta.reasoningEffort, false)
+  })
+})
+
 // ---- general.name bogus-value guard (issue #165) ------------------------------------
 // apex-quant's GGUFs all declare general.name "Safetensors" — apparently a leftover
 // staging-directory name from its conversion pipeline, not the model name. Confirmed

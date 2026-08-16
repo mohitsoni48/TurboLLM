@@ -3,9 +3,10 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   archiveCodeSession, clearCodeSession, commitCodeSessionGit, deleteCodeSession, downloadCodeSessionExport,
   getCodeSession, getCodeSessionCompareUrl, getCodeSessionGitStatus, getCodeSessionLastUsage, getCodeStats, listCodeSessions,
-  pushCodeSessionGit, resumeCodeSession, updateCodeSessionMode, updateCodeSessionThinkingBudget, updateCodeSessionTitle,
+  pushCodeSessionGit, resumeCodeSession, updateCodeSessionMode, updateCodeSessionThinkingBudget, updateCodeSessionReasoningEffort, updateCodeSessionTitle,
 } from './code-api'
 import type { CodeSessionFilter, CodeStatsRange } from './code-types'
+import type { ReasoningEffort } from '../components/ReasoningEffortSelect'
 import { ApiError } from './api'
 import { toast } from '../components/ui/sonner'
 
@@ -126,6 +127,13 @@ export function useUpdateCodeSessionMode() {
 export function useUpdateCodeSessionThinkingBudget() {
   return useMutation({
     mutationFn: (v: { id: string; tokens: number }) => updateCodeSessionThinkingBudget(v.id, v.tokens),
+  })
+}
+
+/** Same live-override mechanism as useUpdateCodeSessionThinkingBudget, for reasoning_effort. */
+export function useUpdateCodeSessionReasoningEffort() {
+  return useMutation({
+    mutationFn: (v: { id: string; effort: ReasoningEffort }) => updateCodeSessionReasoningEffort(v.id, v.effort),
   })
 }
 
