@@ -17,7 +17,7 @@ import type { Registry } from '../engines/registry'
 import type { Engine } from '../config/config'
 import type { Scanner, ModelEntry } from '../models/scanner'
 import { deriveDefault, estimateVram, gpuBudgetMb, profileToArgs, resolveProfile, type GpuProfile, type LoadProfile } from '../models/profile'
-import { isSpilling, spillMb } from './spill'
+import { isSpilling, spillFloor, spillMb } from './spill'
 import { getSysInfo, type SysInfo } from '../sysinfo/sysinfo'
 import type { HfClient } from '../hf/hf'
 import { inferRepoFromPath } from '../api/path-utils'
@@ -560,6 +560,13 @@ export class BenchRunner {
     // edge. Computed unconditionally (0 on a CPU-only box) so the Phase-2 re-check below can reuse
     // it too (ADR-217) — `overHeadroom` treats a ≤0 budget as "never over".
     const budgetMb = gpuBudgetMb(sys, base)
+    // Host memory this config pins regardless of offload, measured from the probes below.
+    let spillFloorMb: number | null = null
+    // True when budgetMb/vramAbsMb below are a multi-GPU SUM (a layer/row split across >1 card)
+    // rather than one card's own numbers — the proximity/floor corroboration is unsound there
+    // (see spill.ts's `isSpilling` doc: a card can be individually saturated and demoting while
+    // the pool still reads roomy), so it falls back to the pre-fix tolerance-only check.
+    const pooled = sys.gpus.length > 1 && base.gpu.splitMode !== 'none'
 
     if (sys.gpus.length > 0) {
       // Binary search ngl ∈ [0, blockCount] for the HIGHEST that loads with enough headroom VRAM.
@@ -574,7 +581,10 @@ export class BenchRunner {
         const probe = await this.probeVram(entry, sys, { ...base, ngl: mid }, caps)
         this.pushProbe(results, base, 'ngl', mid, probe)
         await this.settleGpu(sys)
-        const verdict = probeVerdict(probe, budgetMb, headroomMb)
+        // Learn this config's fixed host-memory cost from probes that had VRAM to spare, so the
+        // near-the-ceiling candidate the search is heading for isn't rejected for it (see spillFloor).
+        spillFloorMb = spillFloor(spillFloorMb, probe.spillMb, probe.vramAbsMb, budgetMb, pooled)
+        const verdict = probeVerdict(probe, budgetMb, headroomMb, spillFloorMb, pooled)
         if (verdict.decision === 'fits') {
           bestNgl = mid // fits with headroom AND isn't spilling → record, try MORE GPU layers
           lo = mid + 1
@@ -595,7 +605,7 @@ export class BenchRunner {
     // Same two ways the real run can invalidate a probe-accepted config as in moeSearch: exceeding
     // the VRAM headroom, or SPILLING once prefill allocates its compute buffers (invisible to a
     // load-only probe). Back off one layer for either.
-    if (found && isSpilling(found.cand.spillMb) && bestNgl > 0) {
+    if (found && isSpilling(found.cand.spillMb, found.cand.vramAbsMb, budgetMb, spillFloorMb, pooled) && bestNgl > 0) {
       this.emit(`ngl=${bestNgl} spilled ${Math.round(found.cand.spillMb as number)} MB once actually generating (the load-only probe could not see this) — retrying at ngl=${bestNgl - 1}`)
       const safer = await this.benchAt(entry, sys, { ...base, ngl: bestNgl - 1 }, caps, results, `ngl=${bestNgl - 1} (spill backoff)`)
       if (safer) { found = safer; bestNgl = bestNgl - 1 }
@@ -673,6 +683,11 @@ export class BenchRunner {
     // fewer probes per sweep. See spill.ts for why derivation was removed.
     let lo = 0, hi = maxN
     let bestN: number | null = null
+    // Host memory this config pins regardless of offload, measured from the probes below.
+    let spillFloorMb: number | null = null
+    // See denseSearch's identical line — proximity/floor corroboration is unsound once
+    // budgetMb/vramAbsMb are a multi-GPU sum, so a pooled split falls back to tolerance-only.
+    const pooled = sys.gpus.length > 1 && base.gpu.splitMode !== 'none'
 
     while (lo <= hi && !this.cancelled && Date.now() <= this.deadline) {
       const mid = Math.floor((lo + hi) / 2)
@@ -680,7 +695,10 @@ export class BenchRunner {
       const probe = await this.probeVram(entry, sys, { ...base, nCpuMoe: mid }, caps)
       this.pushProbe(results, base, 'nCpuMoe', mid, probe)
       await this.settleGpu(sys)
-      const verdict = probeVerdict(probe, budgetMb, headroomMb)
+      // Learn this config's fixed host-memory cost from probes that had VRAM to spare, so the
+      // near-the-ceiling candidate the search is heading for isn't rejected for it (see spillFloor).
+      spillFloorMb = spillFloor(spillFloorMb, probe.spillMb, probe.vramAbsMb, budgetMb, pooled)
+      const verdict = probeVerdict(probe, budgetMb, headroomMb, spillFloorMb, pooled)
       if (verdict.decision === 'fits') {
         bestN = mid // fits with headroom AND isn't spilling → record, try FEWER CPU experts
         hi = mid - 1
@@ -724,7 +742,7 @@ export class BenchRunner {
     // Two ways the real run can invalidate a config the load-only probe accepted: it can exceed the
     // VRAM headroom (ADR-217), or it can SPILL once prefill allocates its compute buffers — which
     // the probe cannot see, because it never generates. Back off one step for either.
-    if (found && isSpilling(found.cand.spillMb) && foundN < maxN) {
+    if (found && isSpilling(found.cand.spillMb, found.cand.vramAbsMb, budgetMb, spillFloorMb, pooled) && foundN < maxN) {
       this.emit(`nCpuMoe=${foundN} spilled ${Math.round(found.cand.spillMb as number)} MB once actually generating (the load-only probe could not see this) — retrying at nCpuMoe=${foundN + 1}`)
       const safer = await this.benchAt(entry, sys, { ...base, nCpuMoe: foundN + 1 }, caps, results, `nCpuMoe=${foundN + 1} (spill backoff)`)
       if (safer) { found = safer; foundN = foundN + 1 }
@@ -1636,9 +1654,15 @@ export function probeVerdict(
   probe: { outcome: BenchCandidate['outcome']; vramAbsMb: number | null; spillMb: number | null },
   budgetMb: number,
   headroomMb: number,
+  /** Host memory this config pins at ANY offload, learned from earlier probes — see `spillFloor`.
+   *  Null (the default) means nothing has been measured yet and nothing is subtracted. */
+  spillFloorMb: number | null = null,
+  /** True when `budgetMb`/`probe.vramAbsMb` are a multi-GPU SUM rather than one card's own
+   *  numbers — see `isSpilling`'s `pooled` doc for why the corroboration must be skipped there. */
+  pooled = false,
 ): ProbeVerdict {
   if (probe.outcome === 'oom') return { decision: 'offload-more', reason: 'oom' }
-  if (isSpilling(probe.spillMb)) {
+  if (isSpilling(probe.spillMb, probe.vramAbsMb, budgetMb, spillFloorMb, pooled)) {
     return { decision: 'offload-more', reason: 'spill', shortfallMb: probe.spillMb as number }
   }
   // Free VRAM below the user's configured headroom → too tight, offload more.

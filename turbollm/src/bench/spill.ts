@@ -60,13 +60,126 @@ export function spillMb(baselineSharedMb: number | null, loadedSharedMb: number 
   return Math.max(0, loadedSharedMb - baselineSharedMb)
 }
 
-/** The decision the search makes. Fails OPEN — an unavailable reading returns false rather than
- *  true, matching `overHeadroom`'s existing "unknown VRAM never blocks" contract (bench.ts).
- *  Claiming a spill we did not measure would drive a machine with no spill telemetry (Apple Metal,
- *  or a Windows install where the counter cannot be resolved) toward maximum CPU offload for no
- *  reason — a worse failure than not detecting spill at all. Those machines simply behave as they
- *  did before spill detection existed. */
-export function isSpilling(spill: number | null): boolean {
+/** How close to its own capacity the GPU must be before host-backed memory is credible as SPILL.
+ *
+ *  Spill means the driver DEMOTED an allocation it could not fit — and WDDM only does that once
+ *  dedicated memory is exhausted. So a load that puts memory on the host while the card still has
+ *  gigabytes free did not spill; it pinned host memory ON PURPOSE, and no amount of extra CPU
+ *  offload will ever remove it.
+ *
+ *  Measured 2026-08-15 on the same RTX 5070 Ti (16303 MiB), Qwen3.8-27B Q3_K_S @ ctx 71168:
+ *  turning NextN on adds 416 MB of shared usage (178 -> 594) because llama.cpp builds a second
+ *  MTP draft context whose host-side buffers are pinned into GPU-visible memory. That 594 clears
+ *  {@link SPILL_TOLERANCE_MB} at EVERY offload — dead flat across ngl 0-32 while dedicated VRAM
+ *  swung 2601-11877 MiB — so the search rejected all six probes and auto-tune finished with no
+ *  winner at all ("No candidate completed successfully"). NextN is only the case that surfaced it;
+ *  any engine or fork that pins host buffers lands in the same trap, which is why the guard is
+ *  stated in terms of the physics rather than special-cased to speculative decoding.
+ *
+ *  1024 sits in a wide empty gap, so its exact value is not load-bearing: every real spill in the
+ *  matrix above was read with used-VRAM pinned within 490 MB of the ceiling (that pinning IS the
+ *  post-demotion behaviour this module documents), while the NextN floor sat 6322 MB below it. */
+export const SPILL_PROXIMITY_MB = 1024
+
+/** Ceiling on the floor `spillFloor` will accumulate — bounds a single noisy roomy probe from
+ *  permanently masking real spill for the rest of a sweep.
+ *
+ *  `spillFloor`'s reading is *machine-wide* shared-memory usage (deliberate — see `spillMb` — so
+ *  static desktop/compositor usage cancels out of the delta). That also means another process
+ *  allocating shared memory during exactly one roomy probe's window inflates that probe's spill
+ *  reading, and if it happens to be the SMALLEST roomy reading seen (`spillFloor` takes the min),
+ *  it becomes the floor — silently, since a probe can't tell "noise" from "this config's real
+ *  fixed cost". Pre-fix that noise cost one self-correcting false positive on the next probe;
+ *  post-fix, uncapped, it would become a false NEGATIVE that survives into the post-bench backoff
+ *  check too. Every measured real cause of a floor is far below this: NextN's was 416 MB, the
+ *  smallest genuine spill in this module's own matrix is 698 MB — 2048 clears the former with
+ *  headroom while still being far under the latter, so a real spill can never hide behind it. */
+export const SPILL_FLOOR_CAP_MB = 2048
+
+/** The decision the search makes: is this candidate's host-backed memory DISPLACED WEIGHTS (real
+ *  spill — offload more) or a fixed cost of the configuration (leave the search alone)?
+ *
+ *  Two conditions, both required. The reading must clear {@link SPILL_TOLERANCE_MB}, and the card
+ *  must actually be near enough to full for demotion to be the explanation — see
+ *  {@link SPILL_PROXIMITY_MB}. Without the second condition a config-fixed pinned allocation is
+ *  indistinguishable from spill, and because it is fixed, the search's only response (offload more)
+ *  never reduces it — so every candidate is rejected and the sweep returns nothing.
+ *
+ *  Fails OPEN — an unavailable reading returns false rather than true, matching `overHeadroom`'s
+ *  existing "unknown VRAM never blocks" contract (bench.ts). Claiming a spill we did not measure
+ *  would drive a machine with no spill telemetry (Apple Metal, or a Windows install where the
+ *  counter cannot be resolved) toward maximum CPU offload for no reason — a worse failure than not
+ *  detecting spill at all. Those machines simply behave as they did before spill detection existed.
+ *
+ *  The corroboration itself fails CLOSED, the other way round: an unknown `vramAbsMb` or a zero
+ *  `budgetMb` cannot rule a spill out, so the verdict falls back to the tolerance alone — exactly
+ *  the behaviour that shipped before this check existed.
+ *
+ *  MULTI-GPU: gated OFF entirely by `pooled` below — see that parameter's doc for why the
+ *  corroboration is unsound, not just imprecise, once `vramAbsMb`/`budgetMb` are a summed pool.
+ *
+ *  @param vramAbsMb ABSOLUTE GPU VRAM in use for this candidate, MB (null when unreadable).
+ *  @param budgetMb  The VRAM budget for this split — see `gpuBudgetMb`. 0 when there is no GPU.
+ *  @param pooled    True when `vramAbsMb`/`budgetMb` are summed across more than one GPU (a
+ *    layer/row split) rather than one card's own numbers. Disables BOTH the proximity check and
+ *    the floor: on a pool, a card can be individually saturated and actively demoting — the
+ *    exact condition this function exists to catch — while the SUM still reads as roomy, because
+ *    the other card(s) have room. Verified live against this module's own functions on a 2x16 GB
+ *    layer split (2026-08-16 review): `isSpilling(3000, 23828, 32606, null, false)` (a card
+ *    genuinely spilling 3000 MB while the pool sits 8778 MB under budget) returned `false` when
+ *    the pooled check ran — and the floor accumulator is worse, since it would then take that
+ *    real spill as this config's "fixed cost" and use it to discount every later candidate too,
+ *    including ones sitting right at the pool's own ceiling. Fixing this for real needs a
+ *    per-adapter reading (the WDDM counter is per-LUID; `readGpuSharedMb`/`readGpuVramMb` sum it
+ *    away) — until then, `pooled: true` just falls back to the tolerance-only check that shipped
+ *    before this module existed, on exactly the configurations single-GPU testing never covers. */
+export function isSpilling(
+  spill: number | null,
+  vramAbsMb: number | null,
+  budgetMb: number,
+  floorMb: number | null = null,
+  pooled = false,
+): boolean {
   if (spill === null) return false
-  return spill > SPILL_TOLERANCE_MB
+  const floor = pooled ? 0 : Math.min(floorMb ?? 0, SPILL_FLOOR_CAP_MB)
+  if (spill - floor <= SPILL_TOLERANCE_MB) return false
+  if (!pooled && vramAbsMb !== null && budgetMb > 0 && vramAbsMb < budgetMb - SPILL_PROXIMITY_MB) return false
+  return true
+}
+
+/** Accumulate the sweep's measured FLOOR — the host-backed memory this configuration pins no matter
+ *  where the offload knob sits — from probes the search is already doing. Free: no extra loads.
+ *
+ *  A probe only qualifies when its VRAM sits further than {@link SPILL_PROXIMITY_MB} below the
+ *  budget. At that distance the card demonstrably had room, so whatever it put in host memory it
+ *  put there ON PURPOSE — which makes that reading a direct measurement of the fixed cost, and the
+ *  smallest such reading the tightest bound on it.
+ *
+ *  WHY THIS IS NEEDED ON TOP OF THE PROXIMITY RULE. Proximity alone protects a candidate only while
+ *  it is far from the ceiling; the config the search actually WANTS is the one packed right up
+ *  against it, where proximity necessarily stops discriminating. Measured live 2026-08-15, the run
+ *  that proved the proximity rule works: the sweep found ngl=55 (15282 MiB of 16303 — inside the
+ *  proximity window by 3 MB), read the same ~594 MB NextN floor as 552, called it spill, and backed
+ *  off to ngl=54 — which benched **4.31 t/s against 55's 5.74**. Auto-tune completed and then
+ *  handed back a config 25% slower than the one it had already measured. Subtracting the floor
+ *  (594, from the probes at 9672/13682/14626 MiB) leaves 0 and the backoff never fires.
+ *
+ *  Null floor ⇒ no qualifying probe ran (CPU-only box, unreadable counter, or every probe sat near
+ *  the ceiling) ⇒ {@link isSpilling} subtracts nothing and behaves exactly as it does without this.
+ *
+ *  `pooled: true` never learns anything (returns `floorMb` unchanged) — see {@link isSpilling}'s
+ *  `pooled` doc: on a multi-GPU pool, a "roomy" probe can be a genuinely spilling card sitting
+ *  next to an empty one, and learning a floor from that would make the mistake worse, not better,
+ *  since it then discounts every later candidate by however much that card was really spilling. */
+export function spillFloor(
+  floorMb: number | null,
+  spill: number | null,
+  vramAbsMb: number | null,
+  budgetMb: number,
+  pooled = false,
+): number | null {
+  if (pooled || spill === null || vramAbsMb === null || budgetMb <= 0) return floorMb
+  if (vramAbsMb >= budgetMb - SPILL_PROXIMITY_MB) return floorMb // too close to the ceiling to prove anything
+  const learned = floorMb === null ? spill : Math.min(floorMb, spill)
+  return Math.min(learned, SPILL_FLOOR_CAP_MB)
 }
