@@ -8,11 +8,13 @@
 // Pure in-memory: this is ephemeral runtime state tied to a live CLI subprocess — a daemon
 // restart already kills the PTY, so there's nothing here worth persisting to disk.
 import { randomBytes } from 'node:crypto'
+import type { ReasoningEffort } from '../chat/reasoning-effort'
 
 export class SessionAuthRegistry {
   private sessionToToken = new Map<string, string>()
   private tokenToSession = new Map<string, string>()
   private sessionThinkingBudget = new Map<string, number>()
+  private sessionReasoningEffort = new Map<string, ReasoningEffort>()
 
   /** Mint a token for a Code session — idempotent: returns the SAME token on every call for a
    *  given session (a reconnect/remount must never invalidate the CLI's already-running auth). */
@@ -55,6 +57,22 @@ export class SessionAuthRegistry {
     const sessionId = this.tokenToSession.get(token)
     if (!sessionId) return null
     return this.sessionThinkingBudget.get(sessionId) ?? null
+  }
+
+  /** Same override mechanism as setThinkingBudget, for reasoning_effort — see that method's
+   *  doc comment. Already validated by the caller (parseReasoningEffort); this registry never
+   *  re-validates, same as setThinkingBudget trusts its own caller's int coercion. */
+  setReasoningEffort(codeSessionId: string, effort: ReasoningEffort | null): void {
+    if (effort === null) this.sessionReasoningEffort.delete(codeSessionId)
+    else this.sessionReasoningEffort.set(codeSessionId, effort)
+  }
+
+  /** The reasoning-effort override for whichever session `token` belongs to, or null when the
+   *  token is unrecognized or no override has been set. */
+  getReasoningEffortForToken(token: string): ReasoningEffort | null {
+    const sessionId = this.tokenToSession.get(token)
+    if (!sessionId) return null
+    return this.sessionReasoningEffort.get(sessionId) ?? null
   }
 }
 

@@ -1,5 +1,6 @@
 import type { Conversation, Folder, Message, ChatSseEvent, MemoryFact } from './chat-types'
 import { ApiError, authHeaders } from './api'
+import { DEFAULT_REASONING_EFFORT, type ReasoningEffort } from '../components/ReasoningEffortSelect'
 
 async function req<T>(path: string, init?: RequestInit & { json?: unknown }): Promise<T> {
   const headers: Record<string, string> = { Accept: 'application/json', ...authHeaders(), ...((init?.headers as Record<string, string>) ?? {}) }
@@ -133,11 +134,12 @@ export async function* sendMessage(
   docContext?: string,
   textAttachments?: string[],
   thinkingBudget?: number,
+  reasoningEffort?: ReasoningEffort,
 ): AsyncGenerator<ChatSseEvent> {
   const res = await fetch(`/api/v1/conversations/${encodeURIComponent(convId)}/messages`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ content, images: images?.length ? images : undefined, docContext: docContext || undefined, textAttachments: textAttachments?.length ? textAttachments : undefined, thinkingBudget: thinkingBudget !== undefined && thinkingBudget !== -1 ? thinkingBudget : undefined }),
+    body: JSON.stringify({ content, images: images?.length ? images : undefined, docContext: docContext || undefined, textAttachments: textAttachments?.length ? textAttachments : undefined, thinkingBudget: thinkingBudget !== undefined && thinkingBudget !== -1 ? thinkingBudget : undefined, reasoningEffort: reasoningEffort !== undefined && reasoningEffort !== DEFAULT_REASONING_EFFORT ? reasoningEffort : undefined }),
     signal,
   })
   if (!res.ok || !res.body) {
@@ -183,11 +185,12 @@ export async function* continueConversation(
   convId: string,
   signal: AbortSignal,
   thinkingBudget?: number,
+  reasoningEffort?: ReasoningEffort,
 ): AsyncGenerator<ChatSseEvent> {
   const res = await fetch(`/api/v1/conversations/${encodeURIComponent(convId)}/continue`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ thinkingBudget: thinkingBudget !== undefined && thinkingBudget !== -1 ? thinkingBudget : undefined }),
+    body: JSON.stringify({ thinkingBudget: thinkingBudget !== undefined && thinkingBudget !== -1 ? thinkingBudget : undefined, reasoningEffort: reasoningEffort !== undefined && reasoningEffort !== DEFAULT_REASONING_EFFORT ? reasoningEffort : undefined }),
     signal,
   })
   if (!res.ok || !res.body) {

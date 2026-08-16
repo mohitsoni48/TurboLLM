@@ -1,5 +1,6 @@
 import { Fragment, type ReactNode } from 'react'
 import { folderName } from '../../lib/utils'
+import { reasoningEffortLabel, type ReasoningEffort } from '../../components/ReasoningEffortSelect'
 
 // ── Code stats footer ────────────────────────────────────────────────────────
 //
@@ -77,6 +78,10 @@ function Divider() {
 
 export interface CodeStatsFooterProps {
   thinkingBudget: number
+  /** When set (the loaded model supports it — ModelEntry.reasoningEffort), replaces the
+   *  "Think" stat with a "Reasoning" one so the footer reports whichever control is actually
+   *  live for this model instead of an unused/stale thinkingBudget value. */
+  reasoningEffort?: ReasoningEffort
   ctxUsed: number
   ctxMax: number
   /** Most recent completed turn. `undefined` renders no segment at all rather than a misleading
@@ -96,14 +101,16 @@ export interface CodeStatsFooterProps {
 }
 
 export function CodeStatsFooter({
-  thinkingBudget, ctxUsed, ctxMax,
+  thinkingBudget, reasoningEffort, ctxUsed, ctxMax,
   lastPromptTokens, lastGenTokens, lastPromptTps, lastGenTps,
   branch, cwd, hint,
 }: CodeStatsFooterProps) {
   const pct = ctxMax > 0 ? Math.round(Math.min(1, ctxUsed / ctxMax) * 100) : 0
 
   const groups: ReactNode[] = [
-    <Stat key="think" label="Think" value={thinkingValue(thinkingBudget)} title={thinkingTitle(thinkingBudget)} />,
+    reasoningEffort
+      ? <Stat key="think" label="Reasoning" value={reasoningEffortLabel(reasoningEffort)} title={`Reasoning effort: ${reasoningEffortLabel(reasoningEffort)}`} />
+      : <Stat key="think" label="Think" value={thinkingValue(thinkingBudget)} title={thinkingTitle(thinkingBudget)} />,
   ]
 
   if (ctxMax > 0) {

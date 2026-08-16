@@ -496,6 +496,10 @@ export type ModelEntry = {
   audio: boolean
   mmprojPath: string | null
   hasChatTemplate: boolean
+  /** True when the model's chat template supports a `reasoning_effort` control
+   *  (low/medium/xhigh) — Qwen3.8's reasoning-depth control. Composers gate the
+   *  ReasoningEffortSelect vs ThinkingBudgetSlider choice on this flag. */
+  reasoningEffort: boolean
   /** True when the model is an embedding model (BERT-family or embed filename pattern).
    *  Activates --embeddings at startup so /v1/embeddings is available. */
   embedding: boolean

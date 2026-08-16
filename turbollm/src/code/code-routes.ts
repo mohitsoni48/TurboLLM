@@ -22,6 +22,7 @@ import { streamSSE } from 'hono/streaming'
 import type { Deps } from '../deps'
 import type { AgentRun, Message } from '../chat/db'
 import { CodeRunManager, type SteerKind } from './code-run-manager'
+import { parseReasoningEffort } from '../chat/reasoning-effort'
 import { compactCodeSession, disposeLspClientsForConv } from './code-session'
 import { revertFileEdits } from './revert'
 import { agentCwd, createSessionWorktree, removeSessionWorktree } from './worktree'
@@ -331,6 +332,21 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     // returning null already means "don't touch what the CLI sent", the exact same behavior.
     sessionAuth.setThinkingBudget(run.id, tokens === -1 ? null : tokens)
     return c.json({ ok: true, tokens })
+  })
+
+  // ── reasoning effort (terminal-agent sessions only) ─────────────────────────────
+  // Same live-override mechanism as /thinking-budget above, for Qwen3.8's independent
+  // reasoning_effort control (see ReasoningEffortSelect.tsx / session-auth.ts). Absent or
+  // unrecognized clears the override (parseReasoningEffort never lets an invalid string reach
+  // sessionAuth, since gateway.ts injects this verbatim into chat_template_kwargs).
+  app.patch('/api/v1/code/sessions/:id/reasoning-effort', async (c) => {
+    const id = c.req.param('id')
+    const run = db.getAgentRun(id)
+    if (!run) return err(c, 404, 'not_found', 'Session not found.')
+    const b = await body<{ effort?: string }>(c)
+    const effort = parseReasoningEffort(b.effort) ?? null
+    sessionAuth.setReasoningEffort(run.id, effort)
+    return c.json({ ok: true, effort })
   })
 
   // ── last gateway usage (terminal-agent sessions only, ADR-284) ──────────────────
@@ -738,7 +754,7 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
   // that is how a follow-up submitted mid-run survives a disconnect and still fires in order.
   app.post('/api/v1/code/sessions/:id/messages', async (c) => {
     const id = c.req.param('id')
-    const b = await body<{ content?: string; promptOverride?: string; contextFiles?: string[]; thinkingBudget?: number; kind?: string }>(c)
+    const b = await body<{ content?: string; promptOverride?: string; contextFiles?: string[]; thinkingBudget?: number; reasoningEffort?: string; kind?: string }>(c)
     // How to deliver this message when a run is already active (Phase 1, ADR-246): 'steer'
     // redirects the CURRENTLY ACTIVE turn, 'followUp' queues a fresh turn behind it. Anything
     // else — including the field being omitted by the not-yet-updated frontend — defaults to
@@ -789,7 +805,7 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     // commits silently did nothing while the repo went dirty. (The site fixed first was /compact —
     // a different one.) Caught by the pre-release review gate, which is why worktrees were cut
     // from v1.9.6 rather than shipped half-wired.
-    const enqueueParams = { convId: run.convId, repoRoot: agentCwd(run), task, userMsgId, thinkingBudget: b.thinkingBudget }
+    const enqueueParams = { convId: run.convId, repoRoot: agentCwd(run), task, userMsgId, thinkingBudget: b.thinkingBudget, reasoningEffort: parseReasoningEffort(b.reasoningEffort) }
     if (kind === 'steer') {
       const { steered, queued } = await runs.steer(id, enqueueParams)
       return c.json({ ok: true, queued, steered, userMessageId: userMsgId }, 202)

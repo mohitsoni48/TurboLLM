@@ -65,6 +65,14 @@ export interface ModelEntry {
    *  the vision projector's VRAM contribution instead of a flat guess. */
   mmprojSizeBytes: number
   hasChatTemplate: boolean
+  /** True when the model's chat template itself supports a `reasoning_effort` control
+   *  (low/medium/xhigh) — see GgufMeta.reasoningEffort. Detected per-file (never from
+   *  `arch`), for both GGUF (embedded tokenizer.chat_template) and MLX (tokenizer_config.json
+   *  / standalone chat_template.jinja). Callers that expose a reasoning-effort UI must gate
+   *  it on this flag: sending the field to a model whose template doesn't check it is a
+   *  silent no-op, but a model whose template raises on an unrecognized effort value is
+   *  a separate, real risk this flag exists to prevent triggering. */
+  reasoningEffort: boolean
   /** True for embedding models (BERT-family arch or known embed filename patterns).
    *  Passed to llama-server as --embeddings to activate /v1/embeddings. */
   embedding: boolean
@@ -92,7 +100,10 @@ interface CacheRow {
 // without this bump, a model already in the cache with a bogus cached name (e.g. an APEX
 // GGUF's literal "Safetensors") keeps replaying it forever, since entryFor() only calls
 // parseGguf() again when size/mtime changed.
-const CACHE_VERSION = 5
+// 6: reasoningEffort (Qwen3.8's low/medium/xhigh chat-template reasoning-depth control) —
+// a row cached by an older build predates the field and would otherwise replay `false`
+// forever for a model that genuinely supports it.
+const CACHE_VERSION = 6
 
 /** Optional attention-layout metadata the GGUF parser surfaces (ADR-223).
  *
@@ -442,6 +453,7 @@ export class Scanner {
       mmprojPath: vision ? mmprojPath : null,
       mmprojSizeBytes: vision ? mmprojSizeBytes : 0,
       hasChatTemplate: meta?.hasChatTemplate ?? false,
+      reasoningEffort: meta?.reasoningEffort ?? false,
       embedding: isEmbeddingModel(arch, fileName),
       incomplete,
       parseError,
@@ -599,6 +611,7 @@ export function mlxEntryFor(dir: string): ModelEntry {
   let sizeBytes = 0
   let mtimeMs = 0
   let hasChatTemplate = false
+  let reasoningEffort = false
   try {
     for (const n of readdirSync(dir)) {
       const lower = n.toLowerCase()
@@ -609,12 +622,17 @@ export function mlxEntryFor(dir: string): ModelEntry {
       }
     }
     const tc = join(dir, 'tokenizer_config.json')
+    const tcText = existsSync(tc) ? readFileSync(tc, 'utf8') : ''
     // Modern HF repos ship the chat template as a standalone `chat_template.jinja` file
     // (mlx-lm/transformers both read it) rather than embedded in tokenizer_config.json —
     // either location counts.
-    hasChatTemplate =
-      (existsSync(tc) && readFileSync(tc, 'utf8').includes('chat_template')) ||
-      existsSync(join(dir, 'chat_template.jinja'))
+    const jinjaPath = join(dir, 'chat_template.jinja')
+    const jinjaText = existsSync(jinjaPath) ? readFileSync(jinjaPath, 'utf8') : ''
+    hasChatTemplate = tcText.includes('chat_template') || jinjaText !== ''
+    // Same per-file substring check as the GGUF path (GgufMeta.reasoningEffort) — never
+    // inferred from arch/model_type, since sibling models of the same family routinely
+    // don't carry this template branch.
+    reasoningEffort = tcText.includes('reasoning_effort') || jinjaText.includes('reasoning_effort')
   } catch {
     /* best effort */
   }
@@ -665,6 +683,7 @@ export function mlxEntryFor(dir: string): ModelEntry {
     mmprojPath: null,
     mmprojSizeBytes: 0,
     hasChatTemplate,
+    reasoningEffort,
     embedding: isEmbeddingModel(arch, basename(dir)),
     incomplete,
     parseError,

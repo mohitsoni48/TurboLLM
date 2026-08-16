@@ -29,6 +29,7 @@ import type { ToolCallRecord, MessageTimelineBlock } from '../chat/db'
 import { autoTitleFromConversation } from '../chat/chat-routes'
 import { runCodeSession, type SteerHandle, type TodoItem } from './code-session'
 import type { CodeMode } from './persona'
+import type { ReasoningEffort } from '../chat/reasoning-effort'
 
 /** How a new message submitted while a run is active should be delivered (Phase 1, ADR-246):
  *  `'steer'` interrupts and redirects the CURRENTLY ACTIVE turn (pi's session.steer), `'followUp'`
@@ -93,6 +94,8 @@ interface PendingTurn {
   userMsgId: string
   /** -1 = unlimited (default), 0 = off, N>0 = a real token cap — see RunCodeParams.thinkingBudget. */
   thinkingBudget: number
+  /** See RunCodeParams.reasoningEffort. Undefined = don't send the field. */
+  reasoningEffort: ReasoningEffort | undefined
   /** What the caller requested for this message — recorded even for a queued entry so the UI can
    *  distinguish a steer that fell back to the queue from a plain follow-up (see SteerKind). */
   kind: SteerKind
@@ -195,10 +198,10 @@ export class CodeRunManager {
    *
    * `queued` is true when the turn had to wait (a run was already active), false when it started.
    */
-  enqueue(sessionId: string, params: { convId: string; repoRoot: string; task: string; userMsgId: string; thinkingBudget?: number; kind?: SteerKind }): { queued: boolean } {
+  enqueue(sessionId: string, params: { convId: string; repoRoot: string; task: string; userMsgId: string; thinkingBudget?: number; reasoningEffort?: ReasoningEffort; kind?: SteerKind }): { queued: boolean } {
     const s = this.ensure(sessionId, params.convId, params.repoRoot)
     const willQueue = s.active !== null
-    s.queue.push({ task: params.task, userMsgId: params.userMsgId, thinkingBudget: params.thinkingBudget ?? -1, kind: params.kind ?? 'followUp' })
+    s.queue.push({ task: params.task, userMsgId: params.userMsgId, thinkingBudget: params.thinkingBudget ?? -1, reasoningEffort: params.reasoningEffort, kind: params.kind ?? 'followUp' })
     this.emitQueue(sessionId)
     void this.pump(sessionId)
     return { queued: willQueue }
@@ -220,7 +223,7 @@ export class CodeRunManager {
    */
   async steer(
     sessionId: string,
-    params: { convId: string; repoRoot: string; task: string; userMsgId: string; thinkingBudget?: number },
+    params: { convId: string; repoRoot: string; task: string; userMsgId: string; thinkingBudget?: number; reasoningEffort?: ReasoningEffort },
   ): Promise<{ steered: boolean; queued: boolean }> {
     const active = this.sessions.get(sessionId)?.active
     if (active?.steer) {
@@ -366,6 +369,7 @@ export class CodeRunManager {
         repoRoot: s.repoRoot,
         mode,
         thinkingBudget: turn.thinkingBudget,
+        reasoningEffort: turn.reasoningEffort,
         task: turn.task,
         signal: ac.signal,
         sink,

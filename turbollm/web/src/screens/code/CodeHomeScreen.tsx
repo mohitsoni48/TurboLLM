@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { PanelLeft } from 'lucide-react'
 import { Button } from '../../components/ui/button'
+import { DEFAULT_REASONING_EFFORT, type ReasoningEffort } from '../../components/ReasoningEffortSelect'
 import { toast } from '../../components/ui/sonner'
 import { getPersonalization } from '../../lib/personas'
 import { useIsDesktop } from '../../lib/useIsDesktop'
@@ -182,6 +183,16 @@ export function CodeHomeScreen() {
   const setThinkingBudget = (val: number) => {
     localStorage.setItem('tllm.thinkingBudget.default', String(val))
     setThinkingBudgetState(val)
+  }
+  // Reasoning effort (Qwen3.8) — same global-default-only shape as thinkingBudget above; see
+  // ChatScreen.tsx for why this is a separate, independent control.
+  const [reasoningEffort, setReasoningEffortState] = useState<ReasoningEffort>(() => {
+    const v = localStorage.getItem('tllm.reasoningEffort.default')
+    return v === 'off' || v === 'low' || v === 'medium' || v === 'xhigh' ? v : DEFAULT_REASONING_EFFORT
+  })
+  const setReasoningEffort = (val: ReasoningEffort) => {
+    localStorage.setItem('tllm.reasoningEffort.default', val)
+    setReasoningEffortState(val)
   }
   const [submitting, setSubmitting] = useState(false)
   // Worktree tick — off by default: the simple case is running right in the
@@ -458,6 +469,8 @@ export function CodeHomeScreen() {
           onEjectModel={handleEject}
           thinkingBudget={thinkingBudget}
           onThinkingBudgetChange={setThinkingBudget}
+          reasoningEffort={reasoningEffort}
+          onReasoningEffortChange={setReasoningEffort}
           onModelSettings={(key) => setSettingsKey(key)}
           ctxUsed={0}
           ctxMax={model?.ctx ?? 0}

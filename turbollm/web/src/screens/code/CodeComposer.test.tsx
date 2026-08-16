@@ -112,6 +112,8 @@ function Harness({
       hintText="Enter to send"
       thinkingBudget={thinkingBudget}
       onThinkingBudgetChange={() => {}}
+      reasoningEffort="xhigh"
+      onReasoningEffortChange={() => {}}
       onImagesChange={onImagesChange}
       slashCommands={slashCommands}
       lastPromptTokens={lastPromptTokens}
@@ -409,6 +411,8 @@ describe('CodeComposer steer/queue send affordance (ADR-246)', () => {
       hintText: 'Enter to send',
       thinkingBudget: -1,
       onThinkingBudgetChange: () => {},
+      reasoningEffort: 'xhigh',
+      onReasoningEffortChange: () => {},
       onStop: () => {},
       ...overrides,
     }

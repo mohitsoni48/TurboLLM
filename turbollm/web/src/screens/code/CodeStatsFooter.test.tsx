@@ -78,6 +78,8 @@ describe('TerminalToolbar (the CLI variant of the same chrome)', () => {
         onLoadModel={() => {}}
         onEjectModel={() => {}}
         onThinkingBudgetChange={() => {}}
+        reasoningEffort="xhigh"
+        onReasoningEffortChange={() => {}}
         {...FULL}
       />,
     )

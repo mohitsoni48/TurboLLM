@@ -293,6 +293,9 @@ the detail:
   from Settings → Memory, and turning the toggle off stops new chats from seeing it immediately.
 - **Thinking-budget control** — a graduated slider, not just on/off: cap reasoning to a specific
   token count, disable it entirely, or leave it unlimited. Works in Chat and Code alike.
+- **Reasoning-effort control** for models whose own chat template supports it (e.g. Qwen3.8) —
+  an Off/Low/Medium/xhigh slider swaps in automatically in place of the thinking-budget one,
+  detected per model.
 
 </details>
 

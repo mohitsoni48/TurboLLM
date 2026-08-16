@@ -110,6 +110,7 @@ export interface CodeSendMessageBody {
   promptOverride?: string
   contextFiles?: string[]
   thinkingBudget?: number
+  reasoningEffort?: string
   /** Delivery mode when a run is already active — 'steer' redirects the live turn, 'followUp'
    *  (default) queues behind it. Omitted = 'followUp'. */
   kind?: SteerKind
