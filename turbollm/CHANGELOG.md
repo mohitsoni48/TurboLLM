@@ -25,6 +25,28 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ### Nothing yet.
 
+## [1.11.1] - 2026-08-16
+
+### Added
+- **Reasoning-effort control for models that support it (e.g. Qwen3.8).** Some models take a
+  `low`/`medium`/`xhigh` reasoning-depth hint baked into their own chat template, distinct from
+  the existing thinking-budget slider. TurboLLM now detects this per model and, when present,
+  swaps the thinking-budget slider for a new Off/Low/Medium/xhigh reasoning-effort slider in
+  both the Chat and Code composers — including terminal-agent (external CLI) sessions.
+
+### Fixed
+- **Quant label showing roughly double the real bit-width for some dynamic ("UD") quants.**
+  A handful of mixed-precision GGUFs (e.g. unsloth's UD quants) displayed a metadata-derived
+  label like `Q4_K_S` when the file was actually 2-bit — the model list now trusts the
+  filename's own quant token when it's readable, falling back to metadata only when it isn't.
+- **Auto-tune could report "no candidate completed successfully" on some multi-GPU setups
+  with NextN enabled.** A fixed memory allocation for NextN's draft context was being
+  misread as VRAM spill on multi-GPU pools, rejecting every otherwise-valid candidate.
+
+### Discord
+- Fixed a couple of auto-tune/model-list rough edges (mislabeled dynamic quants, a multi-GPU + NextN auto-tune false alarm).
+- Qwen3.8 and similar models now get their own reasoning-effort slider (Off/Low/Medium/xhigh) instead of the generic thinking-budget one.
+
 ## [1.11.0] - 2026-08-15
 
 ### Added
