@@ -81,6 +81,21 @@ export function spillMb(baselineSharedMb: number | null, loadedSharedMb: number 
  *  post-demotion behaviour this module documents), while the NextN floor sat 6322 MB below it. */
 export const SPILL_PROXIMITY_MB = 1024
 
+/** Ceiling on the floor `spillFloor` will accumulate — bounds a single noisy roomy probe from
+ *  permanently masking real spill for the rest of a sweep.
+ *
+ *  `spillFloor`'s reading is *machine-wide* shared-memory usage (deliberate — see `spillMb` — so
+ *  static desktop/compositor usage cancels out of the delta). That also means another process
+ *  allocating shared memory during exactly one roomy probe's window inflates that probe's spill
+ *  reading, and if it happens to be the SMALLEST roomy reading seen (`spillFloor` takes the min),
+ *  it becomes the floor — silently, since a probe can't tell "noise" from "this config's real
+ *  fixed cost". Pre-fix that noise cost one self-correcting false positive on the next probe;
+ *  post-fix, uncapped, it would become a false NEGATIVE that survives into the post-bench backoff
+ *  check too. Every measured real cause of a floor is far below this: NextN's was 416 MB, the
+ *  smallest genuine spill in this module's own matrix is 698 MB — 2048 clears the former with
+ *  headroom while still being far under the latter, so a real spill can never hide behind it. */
+export const SPILL_FLOOR_CAP_MB = 2048
+
 /** The decision the search makes: is this candidate's host-backed memory DISPLACED WEIGHTS (real
  *  spill — offload more) or a fixed cost of the configuration (leave the search alone)?
  *
@@ -100,23 +115,35 @@ export const SPILL_PROXIMITY_MB = 1024
  *  `budgetMb` cannot rule a spill out, so the verdict falls back to the tolerance alone — exactly
  *  the behaviour that shipped before this check existed.
  *
- *  KNOWN LIMITATION (multi-GPU): both figures are summed across cards, so one saturated card
- *  spilling while another sits half-empty can read as "plenty of room" and have its spill
- *  discounted. A layer split balances residency across cards, which makes that lopsided case
- *  unlikely rather than impossible; closing it properly needs a per-adapter reading, which the
- *  WDDM counter can give (it is per-LUID) but `readGpuSharedMb` currently sums away.
+ *  MULTI-GPU: gated OFF entirely by `pooled` below — see that parameter's doc for why the
+ *  corroboration is unsound, not just imprecise, once `vramAbsMb`/`budgetMb` are a summed pool.
  *
  *  @param vramAbsMb ABSOLUTE GPU VRAM in use for this candidate, MB (null when unreadable).
- *  @param budgetMb  The VRAM budget for this split — see `gpuBudgetMb`. 0 when there is no GPU. */
+ *  @param budgetMb  The VRAM budget for this split — see `gpuBudgetMb`. 0 when there is no GPU.
+ *  @param pooled    True when `vramAbsMb`/`budgetMb` are summed across more than one GPU (a
+ *    layer/row split) rather than one card's own numbers. Disables BOTH the proximity check and
+ *    the floor: on a pool, a card can be individually saturated and actively demoting — the
+ *    exact condition this function exists to catch — while the SUM still reads as roomy, because
+ *    the other card(s) have room. Verified live against this module's own functions on a 2x16 GB
+ *    layer split (2026-08-16 review): `isSpilling(3000, 23828, 32606, null, false)` (a card
+ *    genuinely spilling 3000 MB while the pool sits 8778 MB under budget) returned `false` when
+ *    the pooled check ran — and the floor accumulator is worse, since it would then take that
+ *    real spill as this config's "fixed cost" and use it to discount every later candidate too,
+ *    including ones sitting right at the pool's own ceiling. Fixing this for real needs a
+ *    per-adapter reading (the WDDM counter is per-LUID; `readGpuSharedMb`/`readGpuVramMb` sum it
+ *    away) — until then, `pooled: true` just falls back to the tolerance-only check that shipped
+ *    before this module existed, on exactly the configurations single-GPU testing never covers. */
 export function isSpilling(
   spill: number | null,
   vramAbsMb: number | null,
   budgetMb: number,
   floorMb: number | null = null,
+  pooled = false,
 ): boolean {
   if (spill === null) return false
-  if (spill - (floorMb ?? 0) <= SPILL_TOLERANCE_MB) return false
-  if (vramAbsMb !== null && budgetMb > 0 && vramAbsMb < budgetMb - SPILL_PROXIMITY_MB) return false
+  const floor = pooled ? 0 : Math.min(floorMb ?? 0, SPILL_FLOOR_CAP_MB)
+  if (spill - floor <= SPILL_TOLERANCE_MB) return false
+  if (!pooled && vramAbsMb !== null && budgetMb > 0 && vramAbsMb < budgetMb - SPILL_PROXIMITY_MB) return false
   return true
 }
 
@@ -138,14 +165,21 @@ export function isSpilling(
  *  (594, from the probes at 9672/13682/14626 MiB) leaves 0 and the backoff never fires.
  *
  *  Null floor ⇒ no qualifying probe ran (CPU-only box, unreadable counter, or every probe sat near
- *  the ceiling) ⇒ {@link isSpilling} subtracts nothing and behaves exactly as it does without this. */
+ *  the ceiling) ⇒ {@link isSpilling} subtracts nothing and behaves exactly as it does without this.
+ *
+ *  `pooled: true` never learns anything (returns `floorMb` unchanged) — see {@link isSpilling}'s
+ *  `pooled` doc: on a multi-GPU pool, a "roomy" probe can be a genuinely spilling card sitting
+ *  next to an empty one, and learning a floor from that would make the mistake worse, not better,
+ *  since it then discounts every later candidate by however much that card was really spilling. */
 export function spillFloor(
   floorMb: number | null,
   spill: number | null,
   vramAbsMb: number | null,
   budgetMb: number,
+  pooled = false,
 ): number | null {
-  if (spill === null || vramAbsMb === null || budgetMb <= 0) return floorMb
+  if (pooled || spill === null || vramAbsMb === null || budgetMb <= 0) return floorMb
   if (vramAbsMb >= budgetMb - SPILL_PROXIMITY_MB) return floorMb // too close to the ceiling to prove anything
-  return floorMb === null ? spill : Math.min(floorMb, spill)
+  const learned = floorMb === null ? spill : Math.min(floorMb, spill)
+  return Math.min(learned, SPILL_FLOOR_CAP_MB)
 }

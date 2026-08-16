@@ -11,7 +11,7 @@
 // that pinned that machinery are gone with it; what remains pins the measurement.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { spillMb, isSpilling, spillFloor, SPILL_TOLERANCE_MB, SPILL_PROXIMITY_MB } from './spill'
+import { spillMb, isSpilling, spillFloor, SPILL_TOLERANCE_MB, SPILL_PROXIMITY_MB, SPILL_FLOOR_CAP_MB } from './spill'
 
 // The founder's card, used by every case below that needs a budget.
 const CARD = 16303
@@ -198,4 +198,62 @@ test('the baseline is NOT a constant, which is why it is measured rather than as
   assert.ok(Math.max(...observed) - Math.min(...observed) > 100, 'baseline genuinely varies')
   // All of them still sit under the allowance, so none is mistaken for spill.
   for (const b of observed) assert.equal(isSpilling(b, SATURATED, CARD), false)
+})
+
+// ---- pooled (multi-GPU): the corroboration is unsound on a summed pool, so it's disabled -----
+// From independent Opus review of this fix, 2026-08-16: on a multi-GPU layer split, vramAbsMb and
+// budgetMb are both summed across cards. A card can be individually saturated and genuinely
+// demoting to host memory while the SUMMED pool still reads as roomy, because another card has
+// room — the exact case the corroboration exists to distinguish, made unrecoverable by the sum.
+
+test('isSpilling: pooled=true skips proximity — a real spill is not exempted just because the POOL has room', () => {
+  // 2x16 GB layer split, budget=32606. Card 0 saturated and actively demoting 3000 MB; card 1 has
+  // 8000 MiB free. Pool reads 23828/32606 — 8778 MB "free", comfortably outside the 1024 MB
+  // proximity window — so the unpooled check would exempt a real, measured spill.
+  assert.equal(isSpilling(3000, 23828, 32606), false, 'sanity: unpooled DOES get fooled by the sum')
+  assert.equal(isSpilling(3000, 23828, 32606, null, true), true, 'pooled: falls back to tolerance, catches it')
+})
+
+test('spillFloor: pooled=true never learns — a roomy-looking pool must not teach a floor from a spilling card', () => {
+  // Same scenario: without the guard this genuinely-spilling probe becomes the "fixed cost" and
+  // is then subtracted from every later candidate too, including ones actually at the pool ceiling.
+  assert.equal(spillFloor(null, 3000, 23828, 32606, true), null, 'pooled: nothing learned')
+  // Sanity: unpooled DOES learn from it — capped at SPILL_FLOOR_CAP_MB (2048), not the raw 3000,
+  // since that cap applies regardless of pooling (see the floor-cap tests below).
+  assert.equal(spillFloor(null, 3000, 23828, 32606, false), SPILL_FLOOR_CAP_MB)
+})
+
+test('pooled=true still catches an unambiguous spill (both cards at the sum ceiling)', () => {
+  // Not exercising the multi-GPU gap here — the pool itself is over tolerance with no free room
+  // anywhere, so pooled and unpooled must agree: this is real spill either way.
+  assert.equal(isSpilling(2914, 32000, 32606, null, true), true)
+  assert.equal(isSpilling(2914, 32000, 32606, null, false), true)
+})
+
+test('pooled=true is the default-off path — single-GPU callers are unaffected', () => {
+  // Every test above this point calls isSpilling/spillFloor with pooled defaulted (false) and
+  // still passes unmodified — the parameter is additive, not a behavior change for the hardware
+  // this module was built and validated on.
+  assert.equal(isSpilling(594, 9672, CARD), false)
+  assert.equal(spillFloor(null, 607, 9672, CARD), 607)
+})
+
+// ---- SPILL_FLOOR_CAP_MB: one noisy roomy probe must not permanently mask real spill -----------
+
+test('spillFloor: capped so a spuriously-inflated roomy reading cannot become an unbounded floor', () => {
+  // Some OTHER process allocates a large chunk of shared memory during exactly one roomy probe's
+  // window — spillFloor has no way to tell that apart from a real fixed cost, but the cap bounds
+  // the damage: no floor can ever exceed SPILL_FLOOR_CAP_MB (2048), which sits comfortably under
+  // every real spill this module has ever measured (smallest: 698 MB) while clearing every real
+  // fixed cost seen so far (NextN: 416 MB) with room to spare.
+  const noisy = spillFloor(null, 5000, 9000, CARD) // e.g. another app burst-allocated during this probe
+  assert.equal(noisy, SPILL_FLOOR_CAP_MB)
+  // A real spill well above the cap is still caught — the cap doesn't just relabel a huge floor
+  // as "safe", it stops that floor from ever being trusted enough to clear a genuine spill.
+  assert.equal(isSpilling(6343.5, SATURATED, CARD, noisy), true)
+})
+
+test('spillFloor: the cap does not interfere with real, sane floors', () => {
+  assert.equal(spillFloor(null, 416, 9672, CARD), 416)
+  assert.equal(spillFloor(416, 594, 14626, CARD), 416)
 })
