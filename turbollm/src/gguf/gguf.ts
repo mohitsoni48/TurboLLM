@@ -340,14 +340,30 @@ export function parseGguf(path: string): GgufMeta {
   }
 }
 
-/** Best-effort quant from a filename token when general.file_type is absent/unknown.
- *  Also recognizes APEX (localai-org/apex-quant, issue #165) mixed-precision MoE quants,
- *  which don't use llama.cpp's IQ-/Q-_K naming — just a tier word (optionally imatrix-
- *  calibrated, prefixed "I-") after "APEX" in the filename, e.g.
- *  "Qwen3.6-35B-A3B-APEX-MTP-I-Quality.gguf" → "APEX-I-QUALITY". */
+/** Best-effort quant from a filename token when `general.file_type` is absent/unreliable — also
+ *  the token this scanner now TRUSTS OVER metadata for a mismatched dynamic quant (2026-08-16, see
+ *  `scanner.ts`'s `entryFor`), so a false positive here is no longer harmlessly shadowed by
+ *  metadata; it becomes the displayed label. Two requirements exist because of that:
+ *
+ *  1. DELIMITER-ANCHORED, not a bare substring search. An unanchored match reads a quant token out
+ *     of ordinary filename text that merely CONTAINS a Q-then-digit run: "seq2seq" in
+ *     "flan-t5-seq2seq-base-Q8_0.gguf" matched "Q2SEQ"; "2025Q4-release" matched a date as "Q4";
+ *     both verified live (2026-08-16 review). Requiring a `-`/`_`/`.`/space (or a string edge) on
+ *     BOTH sides of the token closes this without narrowing what real quant filenames look like —
+ *     every quantizer already delimits the token that way.
+ *  2. LAST match, not first. A real Qwen2.5-family model name can itself read as a quant token —
+ *     "Q2.5-Veltha-14B-Q4_K_M.gguf" anchors on BOTH "Q2" (the naming prefix) and "Q4_K_M" (the
+ *     real quant, right before the extension). Every quantizer convention puts the actual quant
+ *     token at the END of the filename (immediately before `.gguf` or a split suffix), so the
+ *     last anchored match is the one to trust — confirmed against this codebase's whole existing
+ *     corpus (issue #165's APEX names, this scanner's own UD-prefixed fixtures) with no case where
+ *     taking the last match picks the wrong token. */
 export function quantFromName(filename: string): string {
-  const m = filename.match(/(I?Q\d[A-Z0-9_]*|BF16|F16|F32)/i)
-  if (m) return m[1].toUpperCase()
+  const matches = [...filename.matchAll(/(?:^|[-_. ])(I?Q\d(?:_[A-Za-z0-9]+)*|BF16|F16|F32)(?=$|[-_. ])/gi)]
+  if (matches.length > 0) return matches[matches.length - 1][1].toUpperCase()
+  // APEX (localai-org/apex-quant, issue #165) mixed-precision MoE quants don't use llama.cpp's
+  // IQ-/Q-_K naming at all — just a tier word (optionally imatrix-calibrated, prefixed "I-") after
+  // "APEX" in the filename, e.g. "Qwen3.6-35B-A3B-APEX-MTP-I-Quality.gguf" → "APEX-I-QUALITY".
   const apex = filename.match(/APEX(?:-[A-Za-z0-9]+){0,3}?-(I-)?(NANO|MINI|COMPACT|BALANCED|QUALITY)(?=\.|$|-)/i)
   if (apex) return `APEX-${apex[1] ? 'I-' : ''}${apex[2].toUpperCase()}`
   return '?'

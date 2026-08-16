@@ -23,6 +23,7 @@ import {
   defaultConfig,
   deleteModelProfile,
   getModelProfile,
+  migrateModelKey,
   prunePresets,
   setModelProfile,
   type Config,
@@ -606,4 +607,77 @@ test('preset seeding: a present-but-empty presets array is NOT re-seeded', () =>
   } finally {
     cleanup(path)
   }
+})
+
+// ---- migrateModelKey (2026-08-16) -----------------------------------------------------------
+// The scanner's `key` embeds its derived quant label (`name|quant|sizeBytes`), so correcting how
+// that label is derived (filename beats a misleading `general.file_type`, e.g. unsloth's dynamic
+// quants reporting Q4_K_S/Q4_K_M for a 2-bit file) changes the key for every model it affects.
+// Everything a user already saved under the old key — a tuned profile, a named preset, a pin, a
+// measured bench result — must move with it, not vanish.
+
+test('migrateModelKey moves every section keyed on the old model key', () => {
+  const cfg = defaultConfig()
+  const oldKey = 'qwen3.8-27b|Q4_K_S|10319907904'
+  const newKey = 'qwen3.8-27b|IQ2_M|10319907904'
+  setModelProfile(cfg, oldKey, 'engine-a', flatProfile({ ctx: 200000 }))
+  const preset: ModelPreset = {
+    id: 'p1', name: 'Saved', engineId: 'engine-a', profile: flatProfile(),
+    updatedAt: '2026-08-15T00:00:00.000Z', origin: 'manual',
+  }
+  cfg.modelPresets[oldKey] = [preset]
+  cfg.lastPresetId[oldKey] = 'p1'
+  cfg.benchResults[oldKey] = { modelKey: oldKey, tps: 41.65, ttftMs: 18797, vramMb: 15328, params: { ctx: 8192, ngl: 99, nCpuMoe: 0, parallel: 1, kvTypeK: 'q8_0', flashAttn: 'on' }, ts: '2026-08-15T09:51:16.751Z' }
+  cfg.lastLoaded = { modelKey: oldKey, engineId: 'engine-a' }
+
+  const moved = migrateModelKey(cfg, oldKey, newKey)
+  assert.equal(moved, true)
+
+  // Old key is gone everywhere.
+  assert.equal(cfg.modelProfiles[oldKey], undefined)
+  assert.equal(cfg.modelPresets[oldKey], undefined)
+  assert.equal(cfg.lastPresetId[oldKey], undefined)
+  assert.equal(cfg.benchResults[oldKey], undefined)
+
+  // New key carries everything, unchanged in content.
+  assert.equal((cfg.modelProfiles[newKey]['engine-a'].profile as { ctx: number }).ctx, 200000)
+  assert.equal(cfg.modelPresets[newKey][0].id, 'p1')
+  assert.equal(cfg.lastPresetId[newKey], 'p1')
+  assert.equal(cfg.benchResults[newKey].tps, 41.65)
+  // The bench result's own embedded modelKey field is re-stamped too, not left pointing at a
+  // key that no longer exists anywhere else in the config.
+  assert.equal(cfg.benchResults[newKey].modelKey, newKey)
+  assert.equal(cfg.lastLoaded.modelKey, newKey)
+})
+
+test('migrateModelKey is a no-op — and reports false — when nothing was ever saved under the old key', () => {
+  const cfg = defaultConfig()
+  const moved = migrateModelKey(cfg, 'never-saved|Q4_K_S|123', 'never-saved|IQ2_M|123')
+  assert.equal(moved, false)
+  assert.deepEqual(cfg, defaultConfig())
+})
+
+test('migrateModelKey never clobbers data that already exists under the new key', () => {
+  const cfg = defaultConfig()
+  const oldKey = 'm|Q4_K_S|1'
+  const newKey = 'm|IQ2_M|1'
+  setModelProfile(cfg, oldKey, 'e', flatProfile({ ctx: 111 }))
+  setModelProfile(cfg, newKey, 'e', flatProfile({ ctx: 222 })) // already-correct data, hypothetically
+  cfg.benchResults[oldKey] = { modelKey: oldKey, tps: 1, ttftMs: 1, vramMb: 1, params: { ctx: 8192, ngl: 99, nCpuMoe: 0, parallel: 1, kvTypeK: 'q8_0', flashAttn: 'on' }, ts: 't' }
+  cfg.benchResults[newKey] = { modelKey: newKey, tps: 999, ttftMs: 1, vramMb: 1, params: { ctx: 8192, ngl: 99, nCpuMoe: 0, parallel: 1, kvTypeK: 'q8_0', flashAttn: 'on' }, ts: 't2' }
+
+  migrateModelKey(cfg, oldKey, newKey)
+
+  // newKey's pre-existing data survives untouched...
+  assert.equal((cfg.modelProfiles[newKey].e.profile as { ctx: number }).ctx, 222)
+  assert.equal(cfg.benchResults[newKey].tps, 999)
+  // ...and oldKey's now-orphaned data is simply left in place rather than overwriting it.
+  assert.equal((cfg.modelProfiles[oldKey].e.profile as { ctx: number }).ctx, 111)
+})
+
+test('migrateModelKey: renaming to the same key is a no-op', () => {
+  const cfg = defaultConfig()
+  setModelProfile(cfg, 'm|q4|1', 'e', flatProfile())
+  const moved = migrateModelKey(cfg, 'm|q4|1', 'm|q4|1')
+  assert.equal(moved, false)
 })

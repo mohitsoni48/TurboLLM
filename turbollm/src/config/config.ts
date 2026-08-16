@@ -1306,6 +1306,50 @@ export function setModelProfile(cfg: Config, modelKey: string, engineId: string,
   ;(cfg.modelProfiles[modelKey] ??= {})[engineId] = { profile, updatedAt: new Date().toISOString() }
 }
 
+/** Move every piece of state keyed on `oldKey` to `newKey` — profiles, presets, the preset pin,
+ *  the bench result, and `lastLoaded` — and returns whether anything actually moved.
+ *
+ *  Exists for one reason: `modelKey` embeds the scanner's derived quant label
+ *  (`name|quant|sizeBytes`), so fixing how that label is derived changes the key for any model
+ *  the fix affects — silently orphaning every tuned profile, named preset, and measured bench
+ *  result a user already saved under the old, mislabeled key (2026-08-16: `general.file_type`
+ *  reporting Q4_K_S/Q4_K_M for GGUFs that were actually 2-bit — see `quantFromName` callers).
+ *  A user who already ran auto-tune and saved a preset should not lose it just because the label
+ *  it was keyed on got more accurate.
+ *
+ *  `newKey` is left untouched wherever it already has data — this only ever runs against a key
+ *  that was, by construction, unreachable before the fix that computes it landed, so a real
+ *  collision would mean something else migrated first; never clobber that. */
+export function migrateModelKey(cfg: Config, oldKey: string, newKey: string): boolean {
+  if (oldKey === newKey) return false
+  let moved = false
+  if (cfg.modelProfiles[oldKey] && !cfg.modelProfiles[newKey]) {
+    cfg.modelProfiles[newKey] = cfg.modelProfiles[oldKey]
+    delete cfg.modelProfiles[oldKey]
+    moved = true
+  }
+  if (cfg.modelPresets[oldKey] && !cfg.modelPresets[newKey]) {
+    cfg.modelPresets[newKey] = cfg.modelPresets[oldKey]
+    delete cfg.modelPresets[oldKey]
+    moved = true
+  }
+  if (cfg.lastPresetId[oldKey] && !cfg.lastPresetId[newKey]) {
+    cfg.lastPresetId[newKey] = cfg.lastPresetId[oldKey]
+    delete cfg.lastPresetId[oldKey]
+    moved = true
+  }
+  if (cfg.benchResults[oldKey] && !cfg.benchResults[newKey]) {
+    cfg.benchResults[newKey] = { ...cfg.benchResults[oldKey], modelKey: newKey }
+    delete cfg.benchResults[oldKey]
+    moved = true
+  }
+  if (cfg.lastLoaded.modelKey === oldKey) {
+    cfg.lastLoaded = { ...cfg.lastLoaded, modelKey: newKey }
+    moved = true
+  }
+  return moved
+}
+
 /** Delete a model's saved profile for one engine only (issue #35). Prunes the per-model
  *  map when its last slot is removed so `hasProfile`-style emptiness checks stay accurate. */
 export function deleteModelProfile(cfg: Config, modelKey: string, engineId: string): void {
