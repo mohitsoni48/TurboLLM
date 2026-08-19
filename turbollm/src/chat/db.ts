@@ -3,6 +3,7 @@ import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import type { Routine, RoutineRun, RoutineFlavor, RoutineStatus, RoutineRunStatus, CodingAgentChoice, ScheduleRule } from '../routines/schema'
+import { SqliteChatStore } from './store/sqlite-chat-store.js'
 
 export interface Conversation {
   id: string
@@ -610,6 +611,20 @@ interface Changes { changes: number }
 
 export class ConversationStore {
   private db: DatabaseSync
+
+  private _chatStore?: SqliteChatStore
+
+  /** The raw handle, so the pluggable ChatStore can run over the SAME connection and
+   *  tables rather than opening a second one (WAL + locking would bite otherwise).
+   *  Phase 1 amendment 1: SqliteChatStore sits ALONGSIDE this class, not beneath it. */
+  get handle(): DatabaseSync { return this.db }
+
+  /** Lazily constructed so `new ConversationStore(dir)` stays cheap and so the
+   *  migration in the constructor has already run before any store touches a table. */
+  get chatStore(): SqliteChatStore {
+    if (!this._chatStore) this._chatStore = new SqliteChatStore(this.db)
+    return this._chatStore
+  }
 
   constructor(dataDir: string) {
     this.db = new DatabaseSync(join(dataDir, 'turbollm.db'))
