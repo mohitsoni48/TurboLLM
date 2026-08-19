@@ -116,8 +116,7 @@ export class SqliteChatStore implements ChatStore {
       } as P)
     const made = this.chatById(id)
     if (!made) throw new StoreError('contract_violation', 'createChat: row vanished immediately after insert')
-    // A brand-new chat reads more naturally as version 1 than as an epoch millisecond.
-    return { ...made, version: 1 }
+    return made
   }
 
   async getChat(s: Scope, id: string): Promise<Chat | null> {

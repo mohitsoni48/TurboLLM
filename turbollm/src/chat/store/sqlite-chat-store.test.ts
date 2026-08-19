@@ -44,7 +44,12 @@ test('createChat returns a fully populated Chat', async () => {
     assert.equal(c.owner, 'default')
     assert.equal(c.messageCount, 0)
     assert.equal(c.lastMessageAt, null)
-    assert.equal(c.version, 1)
+    // version is derived from updated_at (Phase 1 has no version column), so it's a
+    // positive epoch-millis token, not the literal 1 — and it must match what a
+    // fresh read of the same row computes.
+    assert.ok(typeof c.version === 'number' && c.version > 0)
+    const fetched = await store.getChat(LOCAL_SCOPE, c.id)
+    assert.equal(c.version, fetched?.version)
     assert.ok(c.createdAt)
   } finally {
     cleanup()
@@ -131,6 +136,21 @@ test('updateChat applies a patch and bumps version', async () => {
     assert.equal(updated?.title, 'After')
     assert.notEqual(updated?.version, c.version)
     assert.equal(await store.updateChat(LOCAL_SCOPE, 'nope', { title: 'X' }), null)
+  } finally {
+    cleanup()
+  }
+})
+
+test('updateChat succeeds when ifVersion is exactly the version createChat just returned', async () => {
+  // Regression test: createChat used to cosmetically override its returned version to
+  // the literal 1, while every other read (chatById/getChat/updateChat) derives version
+  // from updated_at — so the most natural caller pattern (create, then update passing
+  // the version you were just handed) threw version_conflict 100% of the time.
+  const { store, cleanup } = makeStore()
+  try {
+    const c = await store.createChat(LOCAL_SCOPE, { title: 'Fresh' })
+    const updated = await store.updateChat(LOCAL_SCOPE, c.id, { title: 'Edited' }, c.version)
+    assert.equal(updated?.title, 'Edited')
   } finally {
     cleanup()
   }
