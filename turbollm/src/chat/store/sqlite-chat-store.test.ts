@@ -73,3 +73,93 @@ test('a chat created through ConversationStore is visible through ChatStore', as
     cleanup()
   }
 })
+
+test('listChats returns newest-first and paginates by cursor without gaps or repeats', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    const titles = ['a', 'b', 'c', 'd', 'e']
+    for (const t of titles) await store.createChat(LOCAL_SCOPE, { title: t })
+
+    const first = await store.listChats(LOCAL_SCOPE, { limit: 2 })
+    assert.equal(first.data.length, 2)
+    assert.equal(first.hasMore, true)
+    assert.ok(first.nextCursor)
+
+    const second = await store.listChats(LOCAL_SCOPE, { limit: 2, cursor: first.nextCursor! })
+    const third = await store.listChats(LOCAL_SCOPE, { limit: 2, cursor: second.nextCursor! })
+
+    const seen = [...first.data, ...second.data, ...third.data].map((c) => c.title)
+    assert.equal(seen.length, 5)
+    assert.equal(new Set(seen).size, 5, 'no chat appears on two pages')
+    assert.equal(third.hasMore, false)
+    assert.equal(third.nextCursor, null)
+  } finally {
+    cleanup()
+  }
+})
+
+test('listChats honours the search capability over title', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    await store.createChat(LOCAL_SCOPE, { title: 'Quarterly analysis' })
+    await store.createChat(LOCAL_SCOPE, { title: 'Grocery list' })
+    const hits = await store.listChats(LOCAL_SCOPE, { q: 'quarter' })
+    assert.equal(hits.data.length, 1)
+    assert.equal(hits.data[0].title, 'Quarterly analysis')
+  } finally {
+    cleanup()
+  }
+})
+
+test('listChats rejects a malformed cursor rather than silently returning page one', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    await assert.rejects(
+      () => store.listChats(LOCAL_SCOPE, { cursor: 'not-base64-json' }),
+      /invalid_cursor|contract_violation/,
+    )
+  } finally {
+    cleanup()
+  }
+})
+
+test('updateChat applies a patch and bumps version', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    const c = await store.createChat(LOCAL_SCOPE, { title: 'Before' })
+    const updated = await store.updateChat(LOCAL_SCOPE, c.id, { title: 'After' })
+    assert.equal(updated?.title, 'After')
+    assert.notEqual(updated?.version, c.version)
+    assert.equal(await store.updateChat(LOCAL_SCOPE, 'nope', { title: 'X' }), null)
+  } finally {
+    cleanup()
+  }
+})
+
+test('updateChat with a stale ifVersion throws version_conflict', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    const c = await store.createChat(LOCAL_SCOPE, { title: 'Guarded' })
+    const fresh = await store.updateChat(LOCAL_SCOPE, c.id, { title: 'First' })
+    await assert.rejects(
+      () => store.updateChat(LOCAL_SCOPE, c.id, { title: 'Second' }, (fresh!.version) - 1000),
+      /version_conflict/,
+    )
+  } finally {
+    cleanup()
+  }
+})
+
+test('deleteChat removes the chat and cascades to its messages', async () => {
+  const { store, conv, cleanup } = makeStore()
+  try {
+    const c = await store.createChat(LOCAL_SCOPE, { title: 'Doomed' })
+    conv.addMessage(c.id, 'user', 'hello')
+    assert.equal(await store.deleteChat(LOCAL_SCOPE, c.id), true)
+    assert.equal(await store.getChat(LOCAL_SCOPE, c.id), null)
+    assert.equal(conv.getMessages(c.id).length, 0)
+    assert.equal(await store.deleteChat(LOCAL_SCOPE, c.id), false)
+  } finally {
+    cleanup()
+  }
+})
