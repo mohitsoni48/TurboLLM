@@ -401,10 +401,11 @@ export const LOCAL_MCPS: LocalEntry[] = [
     name: 'MCP Web Engine',
     cat: 'Search',
     desc: 'Privacy-first, self-hostable & SSRF-hardened web search engine and scraper for AI agents.',
-    cmd: 'npx -y mcp-web-engine',
+    cmd: 'uvx mcp-web-engine',
+    uvx: true,
+    argNote: 'Requires a running SearXNG instance.',
     envs: [
-      { key: 'SEARXNG_URL', desc: 'SearXNG meta-search endpoint (default: http://127.0.0.1:8082)', required: false },
-      { key: 'PORT', desc: 'HTTP/SSE server port (default: 5050)', required: false },
+      { key: 'SEARXNG_URL', desc: 'SearXNG meta-search endpoint (default: http://127.0.0.1:8082/search)', required: false },
     ],
   },
 ]
