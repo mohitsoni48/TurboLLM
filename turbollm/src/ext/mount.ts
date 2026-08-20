@@ -20,6 +20,9 @@ import { registerExtRunRoutes, type RunDeps } from './routes.runs.js'
 import { IdempotencyStore } from './idempotency.js'
 import { TenantLimiter, DEFAULT_MAX_IN_FLIGHT_PER_TENANT, DEFAULT_REQUESTS_PER_MINUTE_PER_TENANT } from './limits.js'
 import { AuditLog } from './audit.js'
+import { buildOpenApiDocument } from './openapi.js'
+
+const BASE = '/api/ext/v1'
 
 export interface ExtDeps {
   idempotency: IdempotencyStore
@@ -43,5 +46,12 @@ export function mountExtApi(app: Hono, d: Deps, runs: PublicRunManager, rd: RunD
   }
   registerExtChatRoutes(app, d, ext)
   registerExtRunRoutes(app, d, runs, rd, ext)
+  // The document a client reads to discover the schema in the first place (Phase 4 Task 4).
+  // Registered after the chat/run routes purely for source-order clarity — Hono matches this
+  // against the SAME `${BASE}/*` request-id/auth/rate-limit middleware already registered above
+  // regardless of where this specific handler sits, so it is a live member of the mounted
+  // surface exactly like every other route here (still subject to that shared middleware
+  // stack), just with no `requireScope` call — see EXT_ROUTES' own entry for why.
+  app.get(`${BASE}/openapi.json`, (c) => c.json(buildOpenApiDocument(d.version)))
   return ext
 }
