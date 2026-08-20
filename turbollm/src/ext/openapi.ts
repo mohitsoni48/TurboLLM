@@ -38,18 +38,32 @@ export interface RouteSpec {
   responseSchema?: string
   /** SSE endpoints document `text/event-stream` alongside `application/json` (spec §5.1, §6.3). */
   sse?: boolean
+  /** A second possible success response, for the one route whose response shape depends on
+   *  request BODY content rather than just the `Accept` header (which `sse` already covers).
+   *  `POST /chats/:id/messages` is the sole user: `generate:false` returns this entry's primary
+   *  `responseSchema` (`Message`, 201); `generate` omitted or `true` — the default, and the case
+   *  spec §5.1 calls "the one endpoint that matters" — forwards internally to
+   *  `POST .../messages/generate` and returns THIS shape instead. Documenting only the primary
+   *  response would describe the minority code path and silently omit the majority one. */
+  altResponse?: { status: string; description: string; schema: string; sse?: boolean }
   errors: string[]
 }
 
-const CHAT_ERRORS = ['auth', 'not_found', 'invalid_request']
-const WRITE_ERRORS = [...CHAT_ERRORS, 'conflict', 'capacity', 'storage']
+// Every route on this surface sits behind routes.chats.ts's blanket per-tenant rate limiter
+// (`app.use(BASE/*, ...)`, registered ahead of every route including ones added later by
+// routes.runs.ts and mount.ts) — spec §5.4 confirms read AND write traffic is rate limited, so
+// `capacity` belongs in the shared read-error set, not just the write one.
+const CHAT_ERRORS = ['auth', 'not_found', 'invalid_request', 'capacity']
+const WRITE_ERRORS = [...CHAT_ERRORS, 'conflict', 'storage']
 
 export const EXT_ROUTES: RouteSpec[] = [
   // ── routes.chats.ts ───────────────────────────────────────────────────────────────────────
   {
     method: 'GET', path: '/capabilities',
     summary: 'Store capabilities, limits, and model info.',
-    responseSchema: 'Capabilities', errors: ['auth'],
+    // No `requireScope` call, but still behind the blanket extAuth (401) and per-tenant rate
+    // limiter (429) middleware routes.chats.ts registers ahead of every route on this surface.
+    responseSchema: 'Capabilities', errors: ['auth', 'capacity'],
   },
   {
     method: 'GET', path: '/chats',
@@ -85,9 +99,20 @@ export const EXT_ROUTES: RouteSpec[] = [
   },
   {
     method: 'POST', path: '/chats/:id/messages',
-    summary: 'Append a message, and by default start a run (generate: false to skip).',
+    summary: 'Append a message. Default (generate omitted or true): forwards to POST .../messages/generate and starts a run. generate:false: append only, no run.',
     scope: 'chats:write', audited: 'message.create',
-    requestSchema: 'MessageInput', responseSchema: 'Message', errors: WRITE_ERRORS,
+    requestSchema: 'MessageInput', responseSchema: 'Message',
+    // The DEFAULT path (generate omitted or true — spec §5.1's "the one endpoint that
+    // matters") never returns `Message`/201 at all: routes.chats.ts forwards the request
+    // verbatim to POST .../messages/generate (via `app.fetch`) and relays THAT response —
+    // `Run`/202 as JSON, or an SSE stream, per Accept. `Message`/201 above is accurate only for
+    // the explicit `generate:false` case. `engine` (context_overflow) is reachable here too,
+    // since it originates in the forwarded route.
+    altResponse: {
+      status: '202', schema: 'Run', sse: true,
+      description: 'Default (generate omitted or true): identical to calling POST .../messages/generate directly — the async Run (JSON) or an SSE stream, per Accept (spec §5.1).',
+    },
+    errors: [...WRITE_ERRORS, 'engine'],
   },
   {
     method: 'GET', path: '/messages/:id',
@@ -143,8 +168,13 @@ export const EXT_ROUTES: RouteSpec[] = [
   // ── this task ─────────────────────────────────────────────────────────────────────────────
   {
     method: 'GET', path: '/openapi.json',
-    summary: 'This OpenAPI 3.1 document. A client needs the schema before it can know what a key authorizes.',
-    responseSchema: 'OpenApiDocument', errors: [],
+    summary: 'This OpenAPI 3.1 document.',
+    // Registered under the same `/api/ext/v1/*` prefix as every other route (mount.ts), so it
+    // is subject to the same blanket extAuth (401) and per-tenant rate limiter (429) middleware
+    // today — NOT keyless. (Whether it should eventually be made keyless, so an integrator can
+    // read the schema before it has a key, is a real but separate product decision — see this
+    // task's report — not something this manifest entry should misrepresent in the meantime.)
+    responseSchema: 'OpenApiDocument', errors: ['auth', 'capacity'],
   },
 ]
 
@@ -429,15 +459,31 @@ function buildOperation(route: RouteSpec): JsonSchema {
     successResponse = { description: 'No content.' }
   }
 
+  const responses: Record<string, JsonSchema> = {
+    [successStatus]: successResponse,
+    ...errorResponses(route.errors),
+  }
+
+  // A second, genuinely distinct success response for a route whose shape depends on request
+  // BODY content (see RouteSpec.altResponse's own doc comment — currently just
+  // POST /chats/:id/messages, whose default path forwards to and mirrors .../messages/generate).
+  if (route.altResponse) {
+    const alt = route.altResponse
+    responses[alt.status] = {
+      description: alt.description,
+      content: {
+        'application/json': { schema: { $ref: `#/components/schemas/${alt.schema}` } },
+        ...(alt.sse ? sseContent : {}),
+      },
+    }
+  }
+
   const operation: JsonSchema = {
     operationId: operationIdFor(route),
     summary: route.summary,
     ...(route.scope ? { 'x-required-scope': route.scope } : {}),
     ...(route.audited ? { 'x-audited-action': route.audited } : {}),
-    responses: {
-      [successStatus]: successResponse,
-      ...errorResponses(route.errors),
-    },
+    responses,
   }
 
   if (route.requestSchema) {
