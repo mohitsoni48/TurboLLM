@@ -65,10 +65,14 @@ export class RingBuffer {
   private events: BufferedEvent[] = []
   private nextSeq = 0
 
+  /** `cap` is how many recent events are retained for replay. Defaults to BUFFER_CAP so the
+   *  Code path is unchanged; the public API passes its own (spec 27 §6.3). */
+  constructor(private readonly cap: number = BUFFER_CAP) {}
+
   push(event: string, data: unknown): BufferedEvent {
     const ev: BufferedEvent = { seq: this.nextSeq++, event, data }
     this.events.push(ev)
-    if (this.events.length > BUFFER_CAP) this.events.shift()
+    if (this.events.length > this.cap) this.events.shift()
     return ev
   }
 
