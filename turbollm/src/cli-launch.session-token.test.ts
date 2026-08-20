@@ -480,3 +480,61 @@ test('opencode: a user\'s OWN providers survive in the inline config, just not i
   assert.deepEqual(parsed.provider.anthropic, { options: { apiKey: 'theirs' } })
   assert.deepEqual(parsed.enabled_providers, ['turbollm'])
 })
+
+// ── Pre-release review fixes (PR #176) ─────────────────────────────────────────────────────────
+
+test('a prototype-chain key is NOT a launch target', async () => {
+  // SUPPORTED is a plain object literal, so `SUPPORTED['constructor']` resolved up the chain to a
+  // truthy value: cliSpecInfo returned `{bin: undefined, …}` instead of null, and the caller then
+  // threw a TypeError out of `spec.install.split(…)` — an HTTP 500 from a security-adjacent route.
+  const { cliSpecInfo, cliBin } = await import('./cli-launch.js')
+  for (const key of ['constructor', '__proto__', 'toString', 'hasOwnProperty']) {
+    assert.equal(cliSpecInfo(key), null, `cliSpecInfo("${key}") must be null`)
+    assert.equal(cliBin(key), null, `cliBin("${key}") must be null`)
+  }
+  // ...and a real target still resolves.
+  assert.equal(cliBin('claude'), 'claude')
+})
+
+test('a SYNC never rewrites the user\'s own default provider/model; a LAUNCH still does', async () => {
+  // A model load in the TurboLLM UI must not flip the defaults of a `pi` the user runs by hand
+  // against their own account. Only an explicit `turbollm launch` may pin.
+  const launched = memFs()
+  await preparePi('http://127.0.0.1:6996', STATIC_TOKEN, 'mykey', 'MyModel', launched, 32768, LIBRARY, true)
+  const afterLaunch = JSON.parse(launched.files.get(join(HOME, '.pi', 'agent', 'settings.json'))!)
+  assert.equal(afterLaunch.defaultProvider, 'turbollm', 'an explicit launch DOES pin')
+  assert.equal(afterLaunch.defaultModel, 'mykey')
+
+  const synced = memFs({
+    [join(HOME, '.pi', 'agent', 'settings.json')]: JSON.stringify({ defaultProvider: 'anthropic', defaultModel: 'theirs' }),
+  })
+  await preparePi('http://127.0.0.1:6996', STATIC_TOKEN, 'mykey', 'MyModel', synced, 32768, LIBRARY, false)
+  const afterSync = JSON.parse(synced.files.get(join(HOME, '.pi', 'agent', 'settings.json'))!)
+  assert.equal(afterSync.defaultProvider, 'anthropic', 'a sync must leave their provider alone')
+  assert.equal(afterSync.defaultModel, 'theirs')
+})
+
+test('a SYNC skips a harness the user has never wired to TurboLLM', async () => {
+  // Without this the post-load sync CREATED config files for all five config-file harnesses,
+  // including ones never installed — and hermes' variant spawns a process to do it.
+  const { syncHarnessModelConfig } = await import('./cli-launch.js')
+  const fs = memFs()   // empty home: nothing has ever been launched
+  const res = await syncHarnessModelConfig('pi', {
+    port: 6996, pinnedModel: 'mykey', modelName: 'MyModel', modelCtx: 32768, models: LIBRARY,
+  }, fs)
+  assert.deepEqual(res, { ok: true })
+  assert.equal(fs.files.size, 0, `a sync must not invent config files: wrote ${[...fs.files.keys()]}`)
+})
+
+test('a SYNC DOES refresh a harness that was previously launched', async () => {
+  const fs = memFs()
+  // Simulate one real launch, which is what puts a `turbollm` provider on disk...
+  await preparePi('http://127.0.0.1:6996', STATIC_TOKEN, 'old', 'Old', fs, 1000, [], true)
+  const { syncHarnessModelConfig } = await import('./cli-launch.js')
+  await syncHarnessModelConfig('pi', {
+    port: 6996, pinnedModel: 'mykey', modelName: 'MyModel', modelCtx: 32768, models: LIBRARY,
+  }, fs)
+  const models = JSON.parse(fs.files.get(join(HOME, '.pi', 'agent', 'models.json'))!).providers.turbollm.models
+  assert.ok(models.length > 1, 'the refreshed config carries the whole library')
+  assert.equal(models.find((m: { id: string }) => m.id === 'mykey').contextWindow, 32768)
+})

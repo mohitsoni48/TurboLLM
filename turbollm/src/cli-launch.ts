@@ -52,6 +52,10 @@ export interface LaunchContext {
    *  claude showed all of them. Empty when the library couldn't be fetched, in which case each
    *  harness's config keeps whatever it already had. */
   models: ModelEntry[]
+  /** False for a background SYNC (a model load), true for an explicit `turbollm launch`. A sync
+   *  refreshes model metadata only; it must never rewrite the user's own default provider/model in
+   *  a third-party tool's config, because they did not ask for that by loading a model. */
+  pinDefaults?: boolean
   /** Filesystem seam, so an `env` hook that has to READ the user's own config (opencode) is unit
    *  testable against an in-memory fs instead of the real home directory. */
   fs: ConfigFs
@@ -146,8 +150,8 @@ const SUPPORTED: Record<string, CliSpec> = {
     // MCP travels inside OPENCODE_CONFIG_CONTENT's own `mcp` key (above), not as a flag — opencode
     // has no `--mcp-config` equivalent (`opencode --help`, 1.18.9).
   },
-  kilo: { bin: 'kilo', label: 'Kilo Code', install: 'npm install -g @kilocode/cli', prepareConfig: (ctx, apiKey) => prepareKilo(ctx.base, apiKey, ctx.pinnedModel, ctx.modelName, ctx.fs, ctx.modelCtx, ctx.models) },
-  openclaw: { bin: 'openclaw', label: 'openclaw', install: 'npm install -g openclaw@latest', prepareConfig: (ctx, apiKey) => prepareOpenclaw(ctx.base, apiKey, ctx.pinnedModel, ctx.modelName, ctx.fs) },
+  kilo: { bin: 'kilo', label: 'Kilo Code', install: 'npm install -g @kilocode/cli', prepareConfig: (ctx, apiKey) => prepareKilo(ctx.base, apiKey, ctx.pinnedModel, ctx.modelName, ctx.fs, ctx.modelCtx, ctx.models, ctx.pinDefaults ?? true) },
+  openclaw: { bin: 'openclaw', label: 'openclaw', install: 'npm install -g openclaw@latest', prepareConfig: (ctx, apiKey) => prepareOpenclaw(ctx.base, apiKey, ctx.pinnedModel, ctx.modelName, ctx.fs, ctx.pinDefaults ?? true) },
   // hermes' 5th parameter is a RunCommand, not a ConfigFs — its config is YAML and is written by
   // shelling out to `hermes config set` rather than by touching the filesystem here, so it has no
   // fs seam to thread and the argument is deliberately dropped.
@@ -161,7 +165,7 @@ const SUPPORTED: Record<string, CliSpec> = {
     bin: 'pi',
     label: 'pi',
     install: 'npm install -g @earendil-works/pi-coding-agent',
-    prepareConfig: (ctx, apiKey) => preparePi(ctx.base, apiKey, ctx.pinnedModel, ctx.modelName, ctx.fs, ctx.modelCtx, ctx.models),
+    prepareConfig: (ctx, apiKey) => preparePi(ctx.base, apiKey, ctx.pinnedModel, ctx.modelName, ctx.fs, ctx.modelCtx, ctx.models, ctx.pinDefaults ?? true),
     // `--session-id <id>` is documented as "Use exact project session ID, CREATING IT IF MISSING"
     // (`pi --help`, 0.84.2) — one flag registers *and* resumes. So pi deliberately has NO
     // sessionFlags: there is no register/resume pair to mismatch, and therefore nothing for
@@ -181,13 +185,18 @@ const SUPPORTED: Record<string, CliSpec> = {
  *  claude/opencode/pi, but `kilo`→`kilo` and `hermes`→`hermes` are the only reason that reads as a
  *  rule, and `deepseek`→`dsh` would break it the moment it is added. */
 export function cliBin(target: string): string | null {
-  return SUPPORTED[target]?.bin ?? null
+  return Object.hasOwn(SUPPORTED, target) ? SUPPORTED[target].bin : null
 }
 
 /** The binary, display label and install command for a launch target, or null when unsupported.
  *  Exported so the UI can tell the user WHICH command installs a harness it found missing, without
  *  keeping a second copy of that string that could drift from the one the launcher prints. */
 export function cliSpecInfo(target: string): { bin: string; label: string; install: string } | null {
+  // `Object.hasOwn`, not a truthiness check: SUPPORTED is a plain object literal, so
+  // `SUPPORTED['constructor']` (or 'toString', '__proto__') resolves up the PROTOTYPE CHAIN to a
+  // truthy value, so this returned `{bin: undefined, …}` instead of null — which then threw a
+  // TypeError out of installAgent's `spec.install.split(…)` and surfaced as an HTTP 500.
+  if (!Object.hasOwn(SUPPORTED, target)) return null
   const spec = SUPPORTED[target]
   return spec ? { bin: spec.bin, label: spec.label, install: spec.install } : null
 }
@@ -576,7 +585,7 @@ export async function prepareOpencode(base: string, apiKey: string, modelKey: st
  *  "Expected object"). Its real config file is `kilo.jsonc` (JSONC — comments allowed),
  *  confirmed against the live install, NOT `kilo.json`. Merge the `turbollm` provider
  *  and set it as the default via the top-level `model` string. */
-export async function prepareKilo(base: string, apiKey: string, modelKey: string, modelName: string, fs: ConfigFs = realFs, modelCtx?: number, models: ModelEntry[] = []): Promise<PrepareResult> {
+export async function prepareKilo(base: string, apiKey: string, modelKey: string, modelName: string, fs: ConfigFs = realFs, modelCtx?: number, models: ModelEntry[] = [], pinDefaults = true): Promise<PrepareResult> {
   const path = join(fs.home, '.config', 'kilo', 'kilo.jsonc')
   const read = await readConfigObject(fs, path)
   if ('corrupt' in read) return corruptConfigError(path, 'Kilo Code')
@@ -603,7 +612,7 @@ export async function prepareKilo(base: string, apiKey: string, modelKey: string
   // provider/model key selects the default model kilo boots with (format: provider/mapKey) — so
   // this must be the KEY now that the map is keyed by key. It was `modelName`, which stopped
   // resolving the moment the map stopped being name-keyed.
-  cfg.model = `turbollm/${modelKey}`
+  if (pinDefaults) cfg.model = `turbollm/${modelKey}`
   await fs.mkdir(dirname(path))
   await fs.writeFile(path, JSON.stringify(cfg, null, 2) + '\n')
   return { ok: true }
@@ -614,7 +623,7 @@ export async function prepareKilo(base: string, apiKey: string, modelKey: string
  *  CLI isn't installed on this box to verify empirically, so the path is assumed.
  *  We write plain JSON (valid JSON5); JSON5-only files are handled on the READ side
  *  by refusing to overwrite an unparseable file. */
-export async function prepareOpenclaw(base: string, apiKey: string, modelKey: string, modelName: string, fs: ConfigFs = realFs): Promise<PrepareResult> {
+export async function prepareOpenclaw(base: string, apiKey: string, modelKey: string, modelName: string, fs: ConfigFs = realFs, pinDefaults = true): Promise<PrepareResult> {
   const path = join(fs.home, '.config', 'openclaw', 'openclaw.json')
   const read = await readConfigObject(fs, path)
   if ('corrupt' in read) return corruptConfigError(path, 'openclaw')
@@ -635,7 +644,7 @@ export async function prepareOpenclaw(base: string, apiKey: string, modelKey: st
   }
   models.providers = providers
   cfg.models = models
-  defaults.model = { primary: `turbollm/${modelKey}` }
+  if (pinDefaults) defaults.model = { primary: `turbollm/${modelKey}` }
   agents.defaults = defaults
   cfg.agents = agents
   await fs.mkdir(dirname(path))
@@ -674,7 +683,7 @@ function piModelEntries(
  *     already selected on it, no manual `/model` picker needed.
  *  Both go through the same tolerant-JSON merge (readConfigObject/stripJsonComments) as
  *  opencode/kilo — never touch a config with comments or one that isn't already ours. */
-export async function preparePi(base: string, apiKey: string, modelKey: string, modelName: string, fs: ConfigFs = realFs, contextWindow?: number, models: ModelEntry[] = []): Promise<PrepareResult> {
+export async function preparePi(base: string, apiKey: string, modelKey: string, modelName: string, fs: ConfigFs = realFs, contextWindow?: number, models: ModelEntry[] = [], pinDefaults = true): Promise<PrepareResult> {
   const modelsPath = join(fs.home, '.pi', 'agent', 'models.json')
   const modelsRead = await readConfigObject(fs, modelsPath)
   if ('corrupt' in modelsRead) return corruptConfigError(modelsPath, 'pi')
@@ -722,8 +731,13 @@ export async function preparePi(base: string, apiKey: string, modelKey: string, 
       ? { ok: true }
       : commentedConfigError(settingsPath, 'pi')
   }
-  settingsCfg.defaultProvider = 'turbollm'
-  settingsCfg.defaultModel = modelKey
+  // Only at an explicit launch. A model load in the TurboLLM UI must not silently flip the default
+  // provider of a `pi` the user runs by hand against their own account — the same rule
+  // prepareOpencode already states for `cfg.model`, applied here after review flagged the asymmetry.
+  if (pinDefaults) {
+    settingsCfg.defaultProvider = 'turbollm'
+    settingsCfg.defaultModel = modelKey
+  }
   await fs.mkdir(dirname(settingsPath))
   await fs.writeFile(settingsPath, JSON.stringify(settingsCfg, null, 2) + '\n')
   return { ok: true }
@@ -1057,6 +1071,32 @@ export function inheritedEnv(base: NodeJS.ProcessEnv = process.env, extra: reado
 export const CONFIG_FILE_HARNESSES: readonly string[] =
   Object.keys(SUPPORTED).filter((k) => !!SUPPORTED[k].prepareConfig)
 
+/** Whether this harness's own config already contains a `turbollm` provider — i.e. the user has
+ *  launched it through TurboLLM at least once, so refreshing that entry is maintenance of something
+ *  they opted into rather than a new file invented on their behalf.
+ *
+ *  Deliberately a read of the REAL config path per harness. hermes always answers false: its config
+ *  is YAML written by shelling out to `hermes config set`, so there is nothing cheap to read and a
+ *  probe would mean spawning a process on every model load. It is refreshed at launch instead. */
+async function isAlreadyWired(target: string, port: number, fs: ConfigFs): Promise<boolean> {
+  const base = `http://127.0.0.1:${port}`
+  const paths: Record<string, string> = {
+    opencode: join(fs.home, '.config', 'opencode', 'opencode.json'),
+    kilo: join(fs.home, '.config', 'kilo', 'kilo.jsonc'),
+    openclaw: join(fs.home, '.config', 'openclaw', 'openclaw.json'),
+    pi: join(fs.home, '.pi', 'agent', 'models.json'),
+  }
+  const path = paths[target]
+  if (!path) return false
+  const read = await readConfigObject(fs, path)
+  if ('corrupt' in read) return false
+  const cfg = read.obj
+  const direct = asObject(cfg.provider)?.turbollm
+  const nested = asObject(asObject(cfg.models)?.providers ?? {})?.turbollm
+  const piShape = (asObject(cfg.providers) ?? {}).turbollm
+  return providerAlreadyPointsHere(direct ?? nested ?? piShape, base)
+}
+
 /** Rewrite a harness's DURABLE config for the model that is loaded RIGHT NOW.
  *
  *  ── Why this exists (founder-reported live, 2026-08-19) ────────────────────────────────────────
@@ -1079,8 +1119,19 @@ export async function syncHarnessModelConfig(
   opts: { port: number; pinnedModel: string; modelName: string; modelCtx?: number; models: ModelEntry[] },
   fs: ConfigFs = realFs,
 ): Promise<PrepareResult> {
-  const spec = SUPPORTED[target]
+  const spec = Object.hasOwn(SUPPORTED, target) ? SUPPORTED[target] : undefined
   if (!spec?.prepareConfig) return { ok: true } // claude and friends carry no config file — nothing to sync
+
+  // ── Only refresh a harness the user has ALREADY wired to TurboLLM ───────────────────────────
+  // A sync runs on EVERY model load, from any path. Without this gate it created and rewrote config
+  // files for all five config-file harnesses — including ones the user has never installed and
+  // never launched — and `prepareHermes` even spawns `hermes config set` to do it. That is
+  // unconsented mutation of another tool's settings as a side effect of loading a model.
+  //
+  // "Already wired" is a fact on disk: the harness's own config carries a `turbollm` provider,
+  // which only a previous `turbollm launch` puts there. A harness the user has never launched is
+  // left completely untouched, and starts being synced the moment they do launch it once.
+  if (!(await isAlreadyWired(target, opts.port, fs))) return { ok: true }
   const base = `http://127.0.0.1:${opts.port}`
   return await spec.prepareConfig(
     {
@@ -1093,6 +1144,8 @@ export async function syncHarnessModelConfig(
       modelName: opts.modelName,
       modelCtx: opts.modelCtx,
       models: opts.models,
+      // A sync refreshes model metadata only — see LaunchContext.pinDefaults.
+      pinDefaults: false,
       fs,
     },
     AUTH_TOKEN,

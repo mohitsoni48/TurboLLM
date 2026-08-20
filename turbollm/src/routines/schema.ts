@@ -32,7 +32,10 @@ export type TerminalCodingAgent = keyof typeof TERMINAL_CODE_AGENT
 /** Whether this routine's coding agent runs as an external CLI in a PTY (as opposed to the in-app
  *  pi engine). Narrows, so callers get the mapping for free. */
 export function isTerminalCodingAgent(a: CodingAgentChoice | undefined): a is TerminalCodingAgent {
-  return a !== undefined && a in TERMINAL_CODE_AGENT
+  // `Object.hasOwn`, not `in`: `in` walks the prototype chain, so 'constructor'/'toString' would
+  // narrow to TerminalCodingAgent. Only reachable from a stored DB value today (the REST and tool
+  // validators both gate on CODING_AGENT_CHOICES), but the correct check is the same length.
+  return a !== undefined && Object.hasOwn(TERMINAL_CODE_AGENT, a)
 }
 
 /** Every value the REST/tool layers accept for `codingAgent` — one list, so a new harness cannot be

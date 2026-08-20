@@ -133,20 +133,13 @@ export function getAgentAvailability(): Promise<{ agents: AgentAvailability[] }>
   return request<{ agents: AgentAvailability[] }>('/api/v1/code/agents')
 }
 
-/** Re-stamp a harness's config file with the model that is loaded RIGHT NOW.
- *
- *  Must be awaited BEFORE telling the harness to switch: its config is otherwise the one written at
- *  launch, in which every model except the launch-time one carries its NATIVE context max rather
- *  than the window the engine actually loaded. Never throws for the caller's purposes — a config we
- *  cannot safely rewrite returns `{ok:false}` with a reason rather than failing the model load. */
-export function syncCodeAgentConfig(id: string): Promise<{ ok: boolean; message?: string }> {
-  return request<{ ok: boolean; message?: string }>(`/api/v1/code/agents/${encodeURIComponent(id)}/sync-config`, { method: 'POST' })
-}
-
 /** Run a harness's own registered install command. The caller picks only WHICH agent — never the
  *  command — so no arbitrary command can be reached from the client. */
 export function installCodeAgent(id: string): Promise<{ ok: true }> {
-  return request<{ ok: true }>(`/api/v1/code/agents/${encodeURIComponent(id)}/install`, { method: 'POST' })
+  // `json: {}` is load-bearing, not decoration: it sets Content-Type, which the daemon now REQUIRES
+  // on this route so the request is CORS-non-simple and gets preflighted. Without it a bare POST
+  // from any website would reach the handler (see the route's own comment).
+  return request<{ ok: true }>(`/api/v1/code/agents/${encodeURIComponent(id)}/install`, { method: 'POST', json: {} })
 }
 
 /** Live running-session stats (B4) ride on the status payload — surfaced from the

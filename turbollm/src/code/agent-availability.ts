@@ -68,30 +68,52 @@ export type InstallResult = { ok: true } | { ok: false; message: string }
  *
  *  `npm` itself is a `.cmd` shim on Windows, which Node refuses to spawn without a shell, so that
  *  one case resolves the shim explicitly instead of reaching for `shell: true`. */
+/** One install per agent id at a time. Without it a page could hold hundreds of concurrent npm
+ *  processes open (each up to `timeoutMs`), which is a trivial local resource-exhaustion vector. */
+const installsInFlight = new Set<string>()
+
 export async function installAgent(
   id: string,
   _spawn: typeof spawn = spawn,
   timeoutMs = 180_000,
 ): Promise<InstallResult> {
+  // Restricted to the ids the picker actually OFFERS, not everything in the launcher registry —
+  // `cliSpecInfo` also knows kilo/openclaw/hermes, which no UI surfaces, so accepting them widened
+  // the reachable install set for no benefit.
+  if (!(TERMINAL_AGENT_IDS as readonly string[]).includes(id)) {
+    return { ok: false, message: `Unknown coding agent "${id}".` }
+  }
   const spec = cliSpecInfo(id)
   if (!spec) return { ok: false, message: `Unknown coding agent "${id}".` }
+  if (installsInFlight.has(id)) return { ok: false, message: `An install of "${id}" is already running.` }
 
   const parts = spec.install.split(/\s+/).filter(Boolean)
   if (parts.length < 2) return { ok: false, message: `No install command is registered for "${id}".` }
   const [bin, ...args] = parts
 
   const { resolveExecutable, requiresShell } = await import('../util/resolve-executable')
+  const { buildShellCommand } = await import('../util/shell-command')
   const resolved = resolveExecutable(bin)
-  // Windows npm is `npm.cmd`; Node cannot spawn a .cmd directly. Falling back to the bare name
-  // lets libuv do its own PATHEXT lookup, which is the pre-existing behaviour for that case.
-  const cmd = resolved && !requiresShell(resolved) ? resolved : (resolved ?? bin)
+  const needsShell = requiresShell(resolved)
 
+  installsInFlight.add(id)
   return await new Promise<InstallResult>((resolve) => {
     let stderr = ''
     let settled = false
-    const done = (r: InstallResult) => { if (!settled) { settled = true; invalidateAvailabilityCache(); resolve(r) } }
+    const done = (r: InstallResult) => { if (!settled) { settled = true; installsInFlight.delete(id); invalidateAvailabilityCache(); resolve(r) } }
     try {
-      const child = _spawn(cmd, args, { stdio: ['ignore', 'ignore', 'pipe'], shell: requiresShell(resolved) })
+      // Same call shape as cli-launch.ts's realRunCommand, and for the same reason. The previous
+      // version passed an ARGS ARRAY together with `shell: true`, which Node joins with plain
+      // spaces and no quoting (DEP0190) — so a resolved path containing a space broke apart.
+      // Measured on this machine, where the official Node installer puts npm at
+      // "C:/Program Files/nodejs/npm.cmd" (a path containing a space):
+      //     'C:Program' is not recognized as an internal or external command
+      // i.e. the Install button failed 100% of the time on a default Windows install. The shell is
+      // needed at all only for a .cmd/.bat shim, which Node refuses to spawn without one;
+      // `buildShellCommand` quotes each argument, which is what makes that path safe.
+      const child = needsShell
+        ? _spawn(buildShellCommand(bin, args), { stdio: ['ignore', 'ignore', 'pipe'], shell: true })
+        : _spawn(resolved ?? bin, args, { stdio: ['ignore', 'ignore', 'pipe'] })
       const timer = setTimeout(() => {
         try { child.kill() } catch { /* already gone */ }
         done({ ok: false, message: `"${spec.install}" did not finish within ${Math.round(timeoutMs / 1000)}s.` })

@@ -30,7 +30,6 @@ import { codeSessionExportFilename, serializeCodeSessionMarkdown } from './sessi
 import { commitGitChanges, getGithubCompareUrl, getGitStatus, pushGitBranch } from './git-actions'
 import { runShellCommand, shellContextText } from './code-shell'
 import { agentAvailability, installAgent } from './agent-availability'
-import { syncHarnessModelConfig } from '../cli-launch'
 import { agentsMdPresence } from './persona'
 import type { CodeMode } from './persona'
 import { sessionAuth } from './session-auth'
@@ -216,30 +215,19 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
   // chooses only WHICH known agent id — never the command itself — so there is no path from a
   // request body to an arbitrary shell command.
   app.post('/api/v1/code/agents/:id/install', async (c) => {
+    // ── Require a NON-SIMPLE request (hostile-review finding) ────────────────────────────────
+    // Hono's `cors()` only SETS response headers; for a non-OPTIONS request it calls next()
+    // unconditionally, and auth.ts's loopback carve-out lets any request from the user's own
+    // machine through. A `fetch(url,{method:'POST'})` with no body sets no Content-Type, making it
+    // a CORS-SIMPLE request — no preflight — so any website the user happened to be visiting could
+    // fire `npm install -g <pkg>` (and its postinstall scripts) with no interaction. Requiring a
+    // JSON content-type forces a preflight, which the origin allowlist then fails.
+    if (!(c.req.header('content-type') ?? '').toLowerCase().includes('application/json')) {
+      return err(c, 400, 'unsupported_media_type', 'This endpoint requires Content-Type: application/json.')
+    }
     const id = c.req.param('id')
     const result = await installAgent(id)
     if (!result.ok) return err(c, 400, 'install_failed', result.message)
-    return c.json({ ok: true }, 200)
-  })
-
-  // ── re-stamp a harness's config with the CURRENTLY loaded model ───────────────────────────
-  // Called by the Code toolbar right after it loads a model, BEFORE it sends the harness's own
-  // switch command. Without it the harness reads a config written at launch, where every model
-  // except the launch-time one carries its NATIVE max rather than the ctx the engine actually
-  // loaded — founder-reported as pi showing "262k" for a model loaded at ~196k.
-  app.post('/api/v1/code/agents/:id/sync-config', async (c) => {
-    const st = d.manager.status()
-    if (st.state !== 'running' || !st.model?.key) return err(c, 409, 'no_model_loaded', 'No model is loaded.')
-    const result = await syncHarnessModelConfig(c.req.param('id'), {
-      port: d.store.snapshot().daemon.port,
-      pinnedModel: st.model.key,
-      modelName: st.model.name ?? st.model.key,
-      modelCtx: st.model.ctx,
-      models: d.scanner.list().models,
-    })
-    // Best-effort by design: a config we cannot safely rewrite (a commented file) must not turn a
-    // successful model load into a failed one. The harness keeps its previous, still-valid config.
-    if (!result.ok) return c.json({ ok: false, message: result.message }, 200)
     return c.json({ ok: true }, 200)
   })
 

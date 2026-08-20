@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowDown, Diff, Download, Eraser, FolderOpen, GitBranch, MoreHorizontal, PanelLeft, Pencil, RotateCcw } from 'lucide-react'
-import { ApiError, syncCodeAgentConfig, track } from '../../lib/api'
+import { ApiError, track } from '../../lib/api'
 import { skillKeys, fetchSkills } from '../../lib/agent-api'
 import { useModelActions, useModels, useStatus } from '../../lib/queries'
 import { compactCodeSession, execShellCommand, revertCodeSession, sendCodeQueuedTurnNow, startCodeRun, steerOutcomeMessage, stopCodeSession } from '../../lib/code-api'
@@ -208,17 +208,8 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
       { key },
       {
         onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not load model.'),
-        onSuccess: async () => {
+        onSuccess: () => {
           if (isTerminalSession) {
-            // Re-stamp the harness's config with the model that was JUST loaded, before telling it
-            // to switch. Its config was written at launch, where every model except the launch-time
-            // one carries its NATIVE context max — so without this the harness switches to the right
-            // model but believes the wrong context window (founder-reported: "262k" for a model
-            // loaded at ~196k). Best-effort: a config that can't be rewritten must not turn a
-            // successful load into an error, so this never blocks the switch below.
-            if (session?.codeAgent) {
-              try { await syncCodeAgentConfig(session.codeAgent) } catch { /* keep the previous config */ }
-            }
             const direct = session?.codeAgent ? DIRECT_MODEL_SWITCH[session.codeAgent]?.(key) : undefined
             const picker = session?.codeAgent ? PICKER_MODEL_SWITCH[session.codeAgent] : undefined
             if (direct) {
