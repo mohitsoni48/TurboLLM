@@ -4,13 +4,26 @@
 // path-agnostic, so this middleware must opt OUT explicitly — inheriting it would leave the
 // public API unauthenticated to anything on the machine or the LAN.
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { test } from 'node:test'
 import { Hono } from 'hono'
 import { extAuth, resolveTenantFromKey } from './auth.js'
 
+// Stored keys hold only a SHA-256 hash of the raw value (never the raw value itself, see
+// ../auth.ts's hashKey/generateApiKey/verifyKeyValue) — mirroring that here, the same way
+// src/auth.test.ts's RAW_KEY/RAW_KEY_HASH does, is what makes these tests actually exercise
+// the real matching path instead of a shape that coincidentally bypassed it.
 function depsWith(keys: Array<{ key: string; tenant?: string; scopes?: string[] }>) {
   return {
-    store: { snapshot: () => ({ apiKeys: keys.map((k) => ({ ...k, hash: k.key, prefix: k.key.slice(0, 8) })) }) },
+    store: {
+      snapshot: () => ({
+        apiKeys: keys.map(({ key, ...rest }) => ({
+          ...rest,
+          hash: createHash('sha256').update(key).digest('hex'),
+          prefix: key.slice(0, 8),
+        })),
+      }),
+    },
   } as never
 }
 

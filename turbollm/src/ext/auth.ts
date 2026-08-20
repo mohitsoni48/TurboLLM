@@ -10,6 +10,7 @@ import type { MiddlewareHandler } from 'hono'
 import type { Context } from 'hono'
 import type { Deps } from '../deps.js'
 import type { Scope } from '../chat/store/types.js'
+import { hashKey } from '../auth.js'
 import { extError } from './errors.js'
 
 // Hono resolves `c.get`/`c.set` key types against this global map whenever the app instance
@@ -27,15 +28,17 @@ const ALL_SCOPES = ['chats:read', 'chats:write', 'runs:write']
 
 export interface ResolvedKey { tenant: string; scopes: string[] }
 
-/** Match a presented key against the configured keys. Legacy keys (no `tenant`) are `local`
- *  with all scopes, so nothing that works today stops working. */
+/** Match a presented key against the configured keys. Stored keys hold only a SHA-256 hash
+ *  (never the raw value, see ../auth.ts), so the presented key is hashed with the SAME
+ *  derivation (`hashKey`) before comparison — comparing the raw value against the hash, as an
+ *  earlier version of this function did, would reject every real key unconditionally. Legacy
+ *  keys (no `tenant`) are `local` with all scopes, so nothing that works today stops working. */
 export function resolveTenantFromKey(presented: string, d: Deps): ResolvedKey | null {
   if (!presented) return null
+  const hash = hashKey(presented)
   const keys = d.store.snapshot().apiKeys ?? []
-  for (const k of keys) {
-    const record = k as { hash?: string; key?: string; tenant?: string; scopes?: string[] }
-    const stored = record.hash ?? record.key
-    if (!stored || stored !== presented) continue
+  for (const record of keys) {
+    if (!record.hash || record.hash !== hash) continue
     return { tenant: record.tenant ?? 'local', scopes: record.scopes ?? ALL_SCOPES }
   }
   return null
