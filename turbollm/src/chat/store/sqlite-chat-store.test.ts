@@ -360,6 +360,23 @@ test('metadata and status now round-trip', async () => {
   }
 })
 
+test('updateChat can actually change a chat\'s metadata', async () => {
+  // Review finding: updateChat's SET clause wired title/systemPrompt/model/sampling
+  // but not metadata, so a metadata-only patch looked successful (a Chat came back)
+  // while silently never touching the row. This pins that metadata patches land.
+  const { store, cleanup } = makeStore()
+  try {
+    const c = await store.createChat(ACME, { title: 'meta patch', metadata: { app: 'a' } })
+    assert.equal((await store.getChat(ACME, c.id))?.metadata.app, 'a')
+
+    const updated = await store.updateChat(ACME, c.id, { metadata: { app: 'b' } })
+    assert.equal(updated?.metadata.app, 'b')
+    assert.equal((await store.getChat(ACME, c.id))?.metadata.app, 'b')
+  } finally {
+    cleanup()
+  }
+})
+
 test('a stale ifVersion on updateMessage is rejected after a real version bump', async () => {
   // Regression check for the Phase 1 lost-update bug: Message.version used to be derived
   // from the immutable created_at column, so it never changed across updates and a stale

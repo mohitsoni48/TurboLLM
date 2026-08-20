@@ -230,6 +230,7 @@ export class SqliteChatStore implements ChatStore {
     if (patch.systemPrompt !== undefined) { sets.push('system_prompt = $sp');  params.$sp   = patch.systemPrompt }
     if (patch.model !== undefined)        { sets.push('model_key = $mk');      params.$mk   = patch.model }
     if (patch.sampling !== undefined)     { sets.push('sampling = $samp');     params.$samp = JSON.stringify(patch.sampling) }
+    if (patch.metadata !== undefined)     { sets.push('metadata = $meta');     params.$meta = JSON.stringify(patch.metadata) }
 
     this.db.prepare(`UPDATE conversations SET ${sets.join(', ')} WHERE id = $id AND tenant = $tenant AND owner = $owner`).run(params as P)
     return this.chatById(s, id)
