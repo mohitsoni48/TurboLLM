@@ -48,23 +48,59 @@
 // execute allow-policy tools only; anything resolving to ask is treated as deny").
 import type { Deps } from '../deps.js'
 import type { EmitSink } from '../chat/emit-sink.js'
-import type { Chat, ChatMessage } from '../chat/store/types.js'
+import type { ChatStore } from '../chat/store/chat-store.js'
+import type { Chat, ChatMessage, Scope } from '../chat/store/types.js'
 import type { RunDeps } from './routes.runs.js'
 import { withCurrentDate } from '../chat/chat-routes.js'
 import { engineModelAlias } from '../engines/compat.js'
 import { clampMaxTokens } from '../config/config.js'
 import { executeToolCallWithApproval } from '../tools/execute-with-approval.js'
+import { initParseState, feedChunk, flushState, type ParseState } from '../chat/parser.js'
 
 /** Mirrors chat-routes.ts's own MAX_TOOL_ITER / chat-runner.ts's identical constant — a
  *  ceiling, not a target. Ordinary chats finish in 1 round; this only bounds a runaway loop. */
 const MAX_TOOL_ITER = 16
-/** How much prior chat history to fold into the engine request. Mirrors the internal route's
- *  practical bound; a public chat is not expected to run unbounded context per turn. */
-const MAX_HISTORY = 200
+/** Per-page size when walking chat history (see `loadFullHistory`). This is NOT a cap on how
+ *  much history is sent to the engine — `SqliteChatStore.listMessages` internally clamps any
+ *  requested `limit` to 200 regardless (`clampLimit` in sqlite-chat-store.ts), so raising this
+ *  number would do nothing; `loadFullHistory` pages past it instead. Overridable for tests. */
+const DEFAULT_PAGE_SIZE = 200
+/** Guards a misbehaving adapter (`hasMore` stuck `true` forever) from looping without bound —
+ *  1000 pages at the max real page size is 200,000 messages, far beyond any realistic chat. */
+const MAX_PAGES = 1000
 
 interface WireMessage { role: string; content: unknown; tool_calls?: unknown; tool_call_id?: string }
 
 interface ToolCallRecord { id: string; name: string; args: Record<string, unknown>; result?: string; error?: string }
+
+/** Loads the ENTIRE message history for a chat, paging forward via `cursor` until
+ *  `hasMore` is false — matching `runGeneration`'s own genuinely unbounded history source
+ *  (`db.getConversation(convId, true).messages`, no limit at all).
+ *
+ *  CRITICAL FIX (post-review): a single `listMessages(scope, chatId, {limit: N})` call with no
+ *  cursor is NOT "the first N messages of history" in the sense a caller might assume — it is
+ *  the OLDEST page (`SqliteChatStore.listMessages` runs `WHERE seq > 0 ORDER BY seq ASC LIMIT
+ *  $lim`). Once a chat has more total messages than one page, the just-persisted user message
+ *  and assistant placeholder for THIS turn — the highest `seq` values — fall entirely outside
+ *  that first page and silently vanish from what the engine sees, with the run still reporting
+ *  status:'complete'. Raising the page size does not fix this either:
+ *  `SqliteChatStore.listMessages` clamps any requested `limit` to 200 regardless
+ *  (`clampLimit`) — pagination is the only correct fix. Exported so the pagination behavior
+ *  itself can be exercised directly in a test without needing hundreds of real messages
+ *  (see generation.test.ts, which overrides `pageSize` down to force multiple pages). */
+export async function loadFullHistory(
+  chatStore: ChatStore, scope: Scope, chatId: string, pageSize = DEFAULT_PAGE_SIZE,
+): Promise<ChatMessage[]> {
+  const all: ChatMessage[] = []
+  let cursor: string | undefined
+  for (let guard = 0; guard < MAX_PAGES; guard++) {
+    const page = await chatStore.listMessages(scope, chatId, { cursor, limit: pageSize })
+    all.push(...page.data)
+    if (!page.hasMore || !page.nextCursor) break
+    cursor = page.nextCursor
+  }
+  return all
+}
 
 /** The minimal per-turn context a public-API generation needs, built from the PUBLIC `Chat` DTO
  *  the route already confirmed exists (`d.chatStore.getChat`) — never from `d.db.getConversation`
@@ -197,6 +233,13 @@ async function runGenerationLoop(d: Deps, ctx: GenerationCtx, emit: EmitSink, si
     let roundContent = ''
     let finishReason = ''
     const pendingToolCalls = new Map<number, { id: string; name: string; argsBuffer: string }>()
+    // Per-round parse state (reset each round, matching chat-routes.ts's own convention) for
+    // stripping inline reasoning markup — `<think>...</think>` and the gpt-oss
+    // `<|channel|>analysis...<|end|>` format — out of plain `content` and re-routing it into
+    // `reasoning`. Models/engines that emit reasoning via the dedicated `reasoning_content`/
+    // `reasoning` delta field (handled separately below) never touch this; this only matters
+    // for engines that inline reasoning into `content` instead.
+    let parseState: ParseState = initParseState()
 
     const cancelReader = () => void reader.cancel()
     if (signal.aborted) cancelReader()
@@ -245,16 +288,39 @@ async function runGenerationLoop(d: Deps, ctx: GenerationCtx, emit: EmitSink, si
             continue
           }
 
-          const content = delta.content ?? ''
-          if (content) {
-            roundContent += content
-            hooks.onDelta(content)
-            await emit({ event: 'delta', data: { delta: content } })
+          const rawContent = delta.content ?? ''
+          if (rawContent) {
+            const { state: nextState, events: parseEvents } = feedChunk(parseState, rawContent)
+            parseState = nextState
+            for (const ev of parseEvents) {
+              if (ev.type === 'reasoning') {
+                hooks.onReasoning(ev.text)
+                await emit({ event: 'reasoning', data: { delta: ev.text } })
+              } else {
+                roundContent += ev.text
+                hooks.onDelta(ev.text)
+                await emit({ event: 'delta', data: { delta: ev.text } })
+              }
+            }
           }
         }
       }
     } finally {
       signal.removeEventListener('abort', cancelReader)
+    }
+
+    // Flush any remaining lookahead buffer at end-of-stream (e.g. a partial `<think>` tag
+    // that never got a chance to resolve because the round ended mid-buffer) — mirrors
+    // chat-routes.ts's identical end-of-round flush.
+    for (const ev of flushState(parseState)) {
+      if (ev.type === 'reasoning') {
+        hooks.onReasoning(ev.text)
+        await emit({ event: 'reasoning', data: { delta: ev.text } })
+      } else {
+        roundContent += ev.text
+        hooks.onDelta(ev.text)
+        await emit({ event: 'delta', data: { delta: ev.text } })
+      }
     }
 
     if (signal.aborted) return
@@ -328,11 +394,12 @@ export function createMakeBody(d: Deps): RunDeps['makeBody'] {
       const chat = await d.chatStore.getChat(scope, chatId)
       if (!chat) throw new Error(`Chat ${chatId} no longer exists.`)
 
-      const page = await d.chatStore.listMessages(scope, chatId, { limit: MAX_HISTORY })
-      // The placeholder assistant message (this turn) is excluded by id — everything else,
-      // including the just-persisted user turn, stays in seq order (mirrors chat-routes.ts's
-      // own `allMsgs = conv.messages.filter(m => m.id !== assistantMsg.id)`).
-      const engineHistory = page.data.filter((m) => m.id !== messageId)
+      // Full history, not one capped page (see loadFullHistory's own doc comment for the bug
+      // this fixes). The placeholder assistant message (this turn) is excluded by id —
+      // everything else, including the just-persisted user turn, stays in seq order (mirrors
+      // chat-routes.ts's own `allMsgs = conv.messages.filter(m => m.id !== assistantMsg.id)`).
+      const fullHistory = await loadFullHistory(d.chatStore, scope, chatId)
+      const engineHistory = fullHistory.filter((m) => m.id !== messageId)
       const ctx = buildGenerationCtx(chat, engineHistory)
 
       release = d.gate ? await d.gate.acquire('bg', { signal }) : null
