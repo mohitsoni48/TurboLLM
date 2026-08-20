@@ -95,3 +95,24 @@ test('capability methods are scoped like everything else', async () => {
     cleanup()
   }
 })
+
+test('moveChatToFolder rejects a folder id that does not exist in the caller\'s scope', async () => {
+  const { conv, store, cleanup } = make()
+  try {
+    const other = { tenant: 'globex', owner: 'u1' }
+    const foreignFolder = await store.createFolder(other, 'Their folder')
+    const c = await store.createChat(S, { title: 'Mine' })
+
+    const folderIdOf = () => (conv.handle.prepare('SELECT folder_id FROM conversations WHERE id = ?').get(c.id) as { folder_id: string | null }).folder_id
+
+    // A folder from a different tenant must be rejected, not silently written.
+    assert.equal(await store.moveChatToFolder(S, c.id, foreignFolder.id), false)
+    assert.equal(folderIdOf(), null)
+
+    // A folder id that does not exist anywhere must be rejected too.
+    assert.equal(await store.moveChatToFolder(S, c.id, 'does-not-exist'), false)
+    assert.equal(folderIdOf(), null)
+  } finally {
+    cleanup()
+  }
+})

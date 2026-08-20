@@ -95,7 +95,17 @@ export function folderMethods(db: DatabaseSync) {
       return r.changes > 0
     },
 
+    /** Mirrors ConversationStore.moveConversationToFolder's guard (db.ts, pinned by
+     *  folders.test.ts): a non-null folderId must actually exist IN THIS SCOPE before it
+     *  gets written into conversations.folder_id. Without this check the UPDATE below is
+     *  correctly scoped on the conversation row but would happily accept an arbitrary or
+     *  cross-tenant folder id and report success. */
     async moveChatToFolder(s: Scope, chatId: string, folderId: string | null): Promise<boolean> {
+      if (folderId !== null) {
+        const exists = db.prepare(`SELECT 1 FROM folders WHERE id = $f AND tenant = $t AND owner = $o`)
+          .get({ $f: folderId, $t: s.tenant, $o: s.owner } as P)
+        if (!exists) return false
+      }
       const r = db.prepare(`UPDATE conversations SET folder_id = $f, updated_at = $now WHERE id = $id AND tenant = $t AND owner = $o`)
         .run({ $id: chatId, $f: folderId, $now: new Date().toISOString(), $t: s.tenant, $o: s.owner } as P) as unknown as Changes
       return r.changes > 0
