@@ -1161,6 +1161,30 @@ export class ConversationStore {
       this.db.exec(`CREATE INDEX IF NOT EXISTS idx_api_usage_code_session_tokens ON api_usage(code_session_id, prompt_tokens);`)
       this.db.exec(`PRAGMA user_version = 44;`)
     }
+    if (v < 45) {
+      // Spec 27 §9.1: tenancy for the public chat API. Every column is NOT NULL with a
+      // DEFAULT, so this is a metadata-only ALTER in SQLite and existing rows land in the
+      // local scope untouched. hasColumn guards each ADD because this branch's ladder has
+      // been renumbered before and a stored user_version can lag behind reality.
+      if (!this.hasColumn('conversations', 'tenant'))   this.db.exec(`ALTER TABLE conversations ADD COLUMN tenant TEXT NOT NULL DEFAULT 'local';`)
+      if (!this.hasColumn('conversations', 'owner'))    this.db.exec(`ALTER TABLE conversations ADD COLUMN owner TEXT NOT NULL DEFAULT 'default';`)
+      if (!this.hasColumn('conversations', 'version'))  this.db.exec(`ALTER TABLE conversations ADD COLUMN version INTEGER NOT NULL DEFAULT 1;`)
+      if (!this.hasColumn('conversations', 'metadata')) this.db.exec(`ALTER TABLE conversations ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}';`)
+
+      if (!this.hasColumn('messages', 'tenant'))   this.db.exec(`ALTER TABLE messages ADD COLUMN tenant TEXT NOT NULL DEFAULT 'local';`)
+      if (!this.hasColumn('messages', 'owner'))    this.db.exec(`ALTER TABLE messages ADD COLUMN owner TEXT NOT NULL DEFAULT 'default';`)
+      if (!this.hasColumn('messages', 'status'))   this.db.exec(`ALTER TABLE messages ADD COLUMN status TEXT NOT NULL DEFAULT 'complete';`)
+      if (!this.hasColumn('messages', 'version'))  this.db.exec(`ALTER TABLE messages ADD COLUMN version INTEGER NOT NULL DEFAULT 1;`)
+      if (!this.hasColumn('messages', 'metadata')) this.db.exec(`ALTER TABLE messages ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}';`)
+
+      // The three indexes spec 27 §4.1 requires of every adapter. Unlike the ADD COLUMNs
+      // these DO scan, so a large messages table takes a moment on first open after upgrade.
+      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_conv_scope_updated ON conversations(tenant, owner, updated_at DESC);`)
+      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_msg_scope_chat_seq ON messages(tenant, owner, conv_id, seq);`)
+      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_msg_variant ON messages(tenant, conv_id, variant_group);`)
+
+      this.db.exec(`PRAGMA user_version = 45;`)
+    }
   }
 
   listConversations(q?: string, kind: 'chat' | 'agent' | 'all' = 'all'): Conversation[] {
