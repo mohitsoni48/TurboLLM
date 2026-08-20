@@ -95,6 +95,17 @@ export function TerminalToolbar({
           onSettings={onModelSettings}
           align="end"
           screen="code"
+          // opencode's model can only be chosen from inside its OWN picker: its `model.list`
+          // command takes no argument (read out of the 1.18 binary), so there is no way to set a
+          // model from here — the control could only ever open its picker and leave the choosing to
+          // the user, which reads as "the dropdown doesn't work". Blocking it with a reason is the
+          // honest version of that, and its own `/models` picker is already filtered to TurboLLM's
+          // models (cli-launch.ts's enabled_providers), so nothing is lost by sending them there.
+          blockedReason={
+            agent === 'opencode'
+              ? 'opencode picks its own model — press / then "models" in the terminal below. Its list already shows only TurboLLM models.'
+              : undefined
+          }
         />
       </div>
       <CodeStatsFooter

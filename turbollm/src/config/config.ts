@@ -1272,6 +1272,25 @@ export const ANY_ENGINE = '*'
  *  the simplest fallback that doesn't require identifying any engine specially). Returns
  *  undefined if the model has no saved profile on any engine. The single read seam every
  *  caller routes through instead of indexing `cfg.modelProfiles[key]` directly. */
+/** The context window a model would ACTUALLY be loaded with, from its saved profile/preset for
+ *  `engineId` — as opposed to its `nativeCtx`, which is only the ceiling its metadata allows.
+ *  Undefined when it has no profile for that engine.
+ *
+ *  Lives here, beside `getModelProfile`, because TWO consumers need the identical answer and they
+ *  drifted the first time it was written in only one of them: the models API overlay (for the UI and
+ *  for `turbollm launch`, which reads models over HTTP) and the daemon's post-load harness-config
+ *  sync (which reads raw scanner entries and so saw no such field). The sync then overwrote the
+ *  launcher's correct value with `nativeCtx` on every load — measured live: pi advertised 131072 for
+ *  `gpt-oss-120b` while its profile configures 32256. One function, one answer.
+ *
+ *  A harness that believes a 4x-too-large window does not merely display a wrong number: it fills
+ *  the context past what the engine actually allocated and the turn dies on a hard engine error. */
+export function resolveConfiguredCtx(cfg: Config, modelKey: string, engineId: string): number | undefined {
+  if (!engineId) return undefined
+  const profile = getModelProfile(cfg, modelKey, engineId) as { ctx?: number } | undefined
+  return typeof profile?.ctx === 'number' && profile.ctx > 0 ? profile.ctx : undefined
+}
+
 export function getModelProfile(cfg: Config, modelKey: string, engineId: string): unknown {
   // Pinned preset (ADR-353 D4) outranks the saved per-engine profiles — but ONLY when its
   // engine matches. The engine check is load-bearing: engines keep independent tunes per model

@@ -7,7 +7,7 @@ import { basename, dirname, join, resolve } from 'node:path'
 import { GATE_VERSION, gateNodeSource } from '../comfyui/gate-template'
 import { randomUUID } from 'node:crypto'
 import { homedir, networkInterfaces } from 'node:os'
-import { ValueError, getModelProfile, setModelProfile, deleteModelProfile, VRAM_HEADROOM_MIN_MB, VRAM_HEADROOM_MAX_MB, VRAM_HEADROOM_SPILL_MB, type ApiKey, type Engine, type McpServer } from '../config/config'
+import { ValueError, getModelProfile, resolveConfiguredCtx, setModelProfile, deleteModelProfile, VRAM_HEADROOM_MIN_MB, VRAM_HEADROOM_MAX_MB, VRAM_HEADROOM_SPILL_MB, type ApiKey, type Engine, type McpServer } from '../config/config'
 import type { Deps } from '../deps'
 import { type ModelInfo, type StartOpts } from '../engines/manager'
 import { abortAllInFlightChats } from '../chat/chat-routes'
@@ -2343,7 +2343,16 @@ function overlayModel(e: ModelEntry, d: Deps, lastTpsMap?: Map<string, number>) 
   // Per-engine profiles (issue #35): profiles[e.key] is now an { engineId → profile } map;
   // "has a saved profile" for the model-list badge means it has at least one engine slot.
   const hasProfile = !!profiles[e.key] && Object.keys(profiles[e.key]).length > 0
-  return { ...e, loaded, hasProfile, lastTps, liveTps, benchTps, compatibleWithActiveEngine, sourceRepo }
+  // The context window this model would ACTUALLY be loaded with, from its saved profile/preset for
+  // the active engine — as opposed to `nativeCtx`, which is only the maximum its metadata allows.
+  //
+  // Exposed for the config-file coding harnesses (pi/opencode/kilo), whose model pickers can only
+  // show what TurboLLM writes into their config. Without this they had to fall back to `nativeCtx`
+  // for every model except the one currently loaded, so a 262144-native model configured at 163328
+  // advertised the wrong window until it happened to be loaded. Undefined when the model has no
+  // profile for this engine — the caller then falls back to nativeCtx, which is the honest answer.
+  const configuredCtx = resolveConfiguredCtx(snap, e.key, active?.id ?? '')
+  return { ...e, loaded, hasProfile, configuredCtx, lastTps, liveTps, benchTps, compatibleWithActiveEngine, sourceRepo }
 }
 
 // ---- helpers ----

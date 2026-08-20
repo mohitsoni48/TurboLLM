@@ -15,10 +15,20 @@ const saveMock = vi.hoisted(() => ({ isPending: false, mutateAsync: vi.fn().mock
 const completeOnboardingMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined))
 const navigateMock = vi.hoisted(() => vi.fn())
 const createConversationMock = vi.hoisted(() => vi.fn())
+/** Which harnesses are installed. Defaults to "all installed" so every pre-existing test in this
+ *  file keeps exercising the behaviour it was written for; the gating tests set it explicitly. */
+const availabilityMock = vi.hoisted(() => ({
+  data: { agents: [
+    { id: 'claude', installed: true, installCommand: 'npm install -g @anthropic-ai/claude-code' },
+    { id: 'pi', installed: true, installCommand: 'npm install -g @earendil-works/pi-coding-agent' },
+    { id: 'opencode', installed: true, installCommand: 'npm install -g opencode-ai' },
+  ] },
+}))
 
 vi.mock('../../../lib/queries', () => ({
   useSettings: () => ({ query: settingsMock, save: saveMock }),
   useStatus: () => statusMock,
+  useAgentAvailability: () => availabilityMock,
 }))
 vi.mock('../../../lib/chat-api', () => ({ createConversation: createConversationMock }))
 vi.mock('../../../lib/onboarding/useOnboardingMachine', () => ({
@@ -62,6 +72,11 @@ describe('PayoffStep — Developer coding-agent picker seeds from the real serve
   })
 
   it('is hidden entirely when this install has no terminal backend (ADR-239) — falls back to turbollm silently', async () => {
+    // Restored to its original assertion. Every non-turbollm agent is PTY-backed (code-types.ts's
+    // CODE_AGENTS), so with no terminal backend `availableCodeAgents(false)` leaves exactly one
+    // option and there is nothing to pick — the picker must not render at all. An intermediate draft
+    // rewrote this test to expect a visible picker, to accommodate marking pi `needsTerminal: false`;
+    // that flag was wrong, so the test goes back to encoding the rule instead of the bug.
     settingsMock.data = { code: { defaultAgent: 'turbollm' } }
     statusMock.data = { terminalAvailable: false }
     renderPayoff()
@@ -222,5 +237,43 @@ describe('PayoffStep — non-developer profiles', () => {
     expect(completeCallsWhenOpened).toBe(0)
     await waitFor(() => expect(completeOnboardingMock).toHaveBeenCalledTimes(1))
     openMock.mockRestore()
+  })
+})
+
+describe('PayoffStep — an uninstalled harness is visible but not selectable', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    statusMock.data = { terminalAvailable: true }
+    settingsMock.data = { code: { defaultAgent: 'turbollm' } }
+  })
+
+  it('marks a missing CLI as not installed and disables its option', () => {
+    // The live failure this prevents: picking `pi` opened a terminal that printed "pi is not
+    // installed or not on your PATH" and then sat there dead.
+    availabilityMock.data = { agents: [
+      { id: 'claude', installed: true, installCommand: 'x' },
+      { id: 'pi', installed: false, installCommand: 'npm install -g @earendil-works/pi-coding-agent' },
+      { id: 'opencode', installed: true, installCommand: 'x' },
+    ] }
+    renderPayoff()
+    const piOption = screen.getByRole('option', { name: /^pi — not installed$/ }) as HTMLOptionElement
+    expect(piOption.disabled).toBe(true)
+    // ...and an installed one stays selectable.
+    expect((screen.getByRole('option', { name: 'claude' }) as HTMLOptionElement).disabled).toBe(false)
+  })
+
+  it('treats an UNKNOWN availability answer as installed, so the picker is never locked', () => {
+    // An older daemon has no such endpoint; blocking selection on a missing answer would make the
+    // picker unusable rather than safe.
+    availabilityMock.data = undefined as unknown as { agents: { id: string; installed: boolean; installCommand: string }[] }
+    renderPayoff()
+    for (const name of ['turbollm', 'claude', 'pi', 'opencode']) {
+      expect((screen.getByRole('option', { name }) as HTMLOptionElement).disabled).toBe(false)
+    }
+    availabilityMock.data = { agents: [
+      { id: 'claude', installed: true, installCommand: 'x' },
+      { id: 'pi', installed: true, installCommand: 'x' },
+      { id: 'opencode', installed: true, installCommand: 'x' },
+    ] }
   })
 })

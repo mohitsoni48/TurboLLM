@@ -15,11 +15,20 @@ import { CodeAgentSection } from './CodeAgentSection'
 
 const settingsMock = vi.hoisted(() => ({ data: undefined as unknown }))
 const statusMock = vi.hoisted(() => ({ data: undefined as unknown }))
+const availabilityMock = vi.hoisted(() => ({
+  data: { agents: [
+    { id: 'claude', installed: true, installCommand: 'npm install -g @anthropic-ai/claude-code' },
+    { id: 'pi', installed: true, installCommand: 'npm install -g @earendil-works/pi-coding-agent' },
+    { id: 'opencode', installed: true, installCommand: 'npm install -g opencode-ai' },
+  ] },
+  refetch: vi.fn().mockResolvedValue(undefined),
+}))
 const saveMock = vi.hoisted(() => ({ isPending: false, mutate: vi.fn() }))
 
 vi.mock('../../lib/queries', () => ({
   useSettings: () => ({ query: settingsMock, save: saveMock }),
   useStatus: () => statusMock,
+  useAgentAvailability: () => availabilityMock,
 }))
 
 function renderSection() {

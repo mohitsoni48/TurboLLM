@@ -110,6 +110,7 @@ import {
   type BuiltinAgentOverride,
   type SysInfo,
   type TelemetryLevel,
+  getAgentAvailability,
 } from './api'
 import type {
   BenchState,
@@ -149,7 +150,20 @@ export const queryKeys = {
   models: ['models'] as const,
   modelDirs: ['modeldirs'] as const,
   downloads: ['downloads'] as const,
+  agentAvailability: ['agent-availability'] as const,
   tokenUsage: (range: TokenUsageRange) => ['token-usage', range] as const,
+}
+
+/** Which terminal-agent CLIs are installed. Refetched on window focus so installing one in a
+ *  terminal outside TurboLLM is picked up without a reload; the daemon caches the probe briefly so
+ *  this staying live costs almost nothing. */
+export function useAgentAvailability() {
+  return useQuery({
+    queryKey: queryKeys.agentAvailability,
+    queryFn: getAgentAvailability,
+    staleTime: 5_000,
+    refetchOnWindowFocus: true,
+  })
 }
 
 /** Status poll every 2s, paused when the tab is hidden (spec 00 §4). Polls at 1s

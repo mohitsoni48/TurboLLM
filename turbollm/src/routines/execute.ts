@@ -23,13 +23,23 @@ import { runChatRoutine, resumeChatRoutine, type ChatRunOutcome } from './chat-r
 import { runCodeRoutine, resumeCodeRoutine, type CodeRunOutcome } from './code-runner'
 import { parsePendingToolCall } from './approval'
 import { runCliCodeRoutine, type CliRoutineDeps } from './cli-routine'
-import { isClaudeCliAvailable } from './cli-preflight'
+import { isCliAvailable, isClaudeCliAvailable } from './cli-preflight'
+import { cliBin } from '../cli-launch'
+import { isTerminalCodingAgent, TERMINAL_CODE_AGENT } from './schema'
+
 import { realSpawnCliProcess, runClaudeCliProcess } from './cli-process'
 import { claudePermissionModeChoices } from '../terminal/agent-modes'
 import { engineIsIdle } from '../engines/update-scheduler'
 import type { GenerationGate } from '../agents/gate'
 import { runCliInteractiveRoutine, type CliInteractiveDeps } from './cli-interactive-runner'
 import { createAgentTerminal, getTerminalManager } from '../terminal/terminal-routes'
+
+/** The binary a terminal-harness routine needs installed. Falls back to `claude` for a routine with
+ *  no terminal harness set, which is the only value that could reach here before this existed. */
+function terminalHarnessBin(routine: Routine): string {
+  if (!isTerminalCodingAgent(routine.codingAgent)) return 'claude'
+  return cliBin(TERMINAL_CODE_AGENT[routine.codingAgent]) ?? 'claude'
+}
 
 type RoutineOutcome = ChatRunOutcome | CodeRunOutcome
 
@@ -213,7 +223,10 @@ export async function runCliInteractiveBranch(
     getEngineIdle: () => engineIsIdle(d.manager),
     loadExplicit: (modelKey) => d.modelRouter.loadExplicit(modelKey),
     now: () => new Date(),
-    isAvailable: () => isClaudeCliAvailable(),
+    // Probe the binary THIS routine actually needs — the interactive path now serves every terminal
+    // harness, so a hardcoded `claude --version` would report "not installed" for a machine that has
+    // opencode but no claude (and vice versa).
+    isAvailable: () => isCliAvailable(terminalHarnessBin(routine)),
     createTerminal: (agentRun, opts) => createAgentTerminal(d, agentRun, opts),
     isTerminalActive: (codeSessionId) => tm.isActive(codeSessionId),
     isAgentExited: (codeSessionId) => tm.isAgentExited(codeSessionId),
@@ -275,11 +288,24 @@ export async function executeRoutine(
   // explains the self-deadlock that would otherwise be possible against a single-slot engine).
   // "auto" keeps the cheap, fully-automated one-shot `-p` path; "ask"/"plan" can actually hit a
   // permission prompt, so those go through the live-terminal path instead (cli-interactive-runner.ts).
-  if (routine.flavor === 'code' && routine.codingAgent === 'claude_cli') {
+  if (routine.flavor === 'code' && isTerminalCodingAgent(routine.codingAgent)) {
     if (routine.permissionMode === 'ask' || routine.permissionMode === 'plan') {
       return _runCliInteractiveBranch(d, routine, run)
     }
-    return _runCliBranch(d, routine, run)
+    // The one-shot `-p --output-format stream-json` path is claude-ONLY, and deliberately so: it
+    // depends on parsing that CLI's specific stream-json event schema (cli-output.ts), which was
+    // read off a real transcript rather than guessed. `pi -p --mode json` and `opencode run
+    // --format json` both exist (probed) but their event schemas have NOT been captured yet, and a
+    // parser written from an assumed schema would silently report every run as empty.
+    //
+    // So a non-claude terminal harness in `auto` runs through the LIVE-TERMINAL path instead. That
+    // is a real, working unattended run — auto mode is exactly the mode that needs no human — and
+    // completion is still detected by the agent-exited callback. The only thing given up is
+    // structured capture of the run's output text, which is strictly better than a parser that
+    // fabricates it. Switching a harness to the cheaper one-shot path is then just a matter of
+    // capturing its real JSON transcript and adding a parser.
+    if (routine.codingAgent === 'claude_cli') return _runCliBranch(d, routine, run)
+    return _runCliInteractiveBranch(d, routine, run)
   }
 
   const deadline = createRunDeadline()

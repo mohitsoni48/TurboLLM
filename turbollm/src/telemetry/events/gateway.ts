@@ -19,6 +19,10 @@ import { defineEvent, f } from '../core/define'
 export const HARNESSES = [
   'claude_code', 'opencode', 'kilo', 'hermes', 'openclaw', 'pi', 'continue',
   'cline', 'zed', 'vscode', 'cursor', 'aider', 'roo', 'turbollm_ui', 'other', 'unknown',
+  // DeepSeek Harness (`@deepseek-ai/dsh`, MIT, first published 2026-08-13). Appended rather than
+  // inserted in place: this list's ORDER is part of the event schema, so slotting a new value in
+  // the middle would silently reinterpret every already-collected row.
+  'deepseek',
 ] as const
 
 export const gatewayDaily = defineEvent({

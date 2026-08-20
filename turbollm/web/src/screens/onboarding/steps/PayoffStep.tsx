@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import { ExternalLink, Loader2, Rocket, Sparkles, Terminal } from 'lucide-react'
 import { createConversation } from '../../../lib/chat-api'
 import { availableCodeAgents, type CodeAgent } from '../../../lib/code-types'
-import { useSettings, useStatus } from '../../../lib/queries'
+import { useAgentAvailability, useSettings, useStatus } from '../../../lib/queries'
 import { useOnboardingMachine } from '../../../lib/onboarding/useOnboardingMachine'
 import type { StepComponentProps } from '../OnboardingScreen'
 
@@ -58,6 +58,11 @@ export default function PayoffStep({ ctx }: StepComponentProps) {
   // the built-in only when this install genuinely has no terminal backend to run it in.
   const terminalAvailable = statusQ.data?.terminalAvailable !== false
   const agents = availableCodeAgents(terminalAvailable)
+  // Unknown (still loading, or an older daemon with no such endpoint) counts as installed, so a
+  // missing answer never locks the picker — same reading `terminalAvailable` uses.
+  const agentAvailabilityQ = useAgentAvailability()
+  const isInstalled = (id: string) =>
+    id === 'turbollm' || (agentAvailabilityQ.data?.agents.find((a) => a.id === id)?.installed ?? true)
   const [selectedAgent, setSelectedAgentState] = useState<CodeAgent>('claude')
   // Seed from the server's ACTUAL default once it's known, unless the user has already
   // touched the picker — otherwise a returning user with a real preference (e.g.
@@ -171,9 +176,18 @@ export default function PayoffStep({ ctx }: StepComponentProps) {
             disabled={starting}
             className="rounded-md border border-border bg-panel px-2 py-1.5 text-sm text-ink outline-none focus:border-accent transition-colors disabled:opacity-40"
           >
-            {agents.map((a) => (
-              <option key={a.id} value={a.id}>{a.label}</option>
-            ))}
+            {agents.map((a) => {
+              // An uninstalled harness stays VISIBLE but unselectable, so onboarding shows what
+              // TurboLLM supports without letting someone pick a session that would open a dead
+              // terminal. There is no install button here on purpose — onboarding should not stall
+              // on a multi-minute `npm i -g`; Settings → Code agent is where it can be installed.
+              const installed = isInstalled(a.id)
+              return (
+                <option key={a.id} value={a.id} disabled={!installed}>
+                  {installed ? a.label : `${a.label} — not installed`}
+                </option>
+              )
+            })}
           </select>
         </div>
       )}

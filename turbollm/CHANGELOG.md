@@ -25,6 +25,53 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ### Nothing yet.
 
+## [1.11.2] - 2026-08-20
+
+### Added
+
+- **`pi` and `opencode` join `claude` in the Code agent picker.** Either runs full-screen in the
+  embedded terminal, wired to whatever model TurboLLM has loaded, and both were verified against a
+  real install rather than assumed — session resumption, permission modes (auto/plan/ask), the
+  opening message, and the per-session token are each built from flags read out of the CLI's own
+  help. Choose one in Settings → Code agent.
+- **A missing coding CLI now offers to install itself.** The picker shows every supported agent and
+  says which are not installed yet, with an Install button, instead of letting you pick one and
+  discovering it is missing when the session opens.
+- **Every coding CLI gets the same behavioural rules `claude` had.** Loop detection and breaking,
+  searching the web after repeated failures, checking a package's real current version before
+  adding it, and knowing that TurboLLM Routines exist — these lived only on the Anthropic protocol,
+  so only `claude` received them. They now apply to every OpenAI-protocol tool, including `kilo`,
+  `openclaw`, `hermes` and your own scripts.
+- **Coding activity from any CLI now reaches the Code dashboard** — files touched and diff lines,
+  previously `claude`-only.
+- **Your whole model library appears in each CLI's own model picker**, each entry carrying the
+  context window it will actually load with rather than the maximum its file allows. A model
+  configured for 32K no longer tells the CLI it has 131K, which is what caused a coding session to
+  run past the real window and fail mid-task.
+- **Routines can run on `opencode` or `pi` as well as `claude`.**
+
+### Changed
+
+- **A coding CLI launched by TurboLLM no longer inherits your cloud API keys.** A session started
+  through TurboLLM is a local-model session; inheriting `OPENAI_API_KEY`/`GEMINI_API_KEY` meant a
+  tool could quietly run a turn against a paid cloud provider, and buried your own models under
+  dozens of cloud ones in its picker. An `opencode` session is likewise offered only TurboLLM's
+  models.
+
+### Fixed
+
+- **`turbollm launch opencode|kilo|openclaw|hermes|pi` failed on Windows** with "is not installed or
+  not on your PATH", even when the tool was installed. npm installs three files per command and
+  TurboLLM picked the one Windows cannot execute. `claude` was unaffected, as it ships a real
+  executable.
+
+### Discord
+- pi and opencode now sit alongside claude in the Code agent picker — pick one in Settings and it runs full-screen in the terminal, using whatever model you have loaded.
+- Not installed yet? The picker now tells you, and installs it for you.
+- Every coding CLI now gets the same smart behaviour claude had: breaking out of loops, looking things up when it gets stuck, and checking a package's real version before using it.
+- A CLI launched from TurboLLM no longer sees your cloud API keys, so it can't quietly bill a turn to a paid provider — and its model list shows your models, not a wall of cloud ones.
+
+
 ## [1.11.1] - 2026-08-16
 
 ### Added
