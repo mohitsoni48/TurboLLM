@@ -12,7 +12,8 @@ import { presentedKey } from '../auth'
 import { sessionAuth } from '../code/session-auth'
 import { classifyHarness } from '../telemetry/classify'
 import { mapToOpenAI, mapFromOpenAI, streamToAnthropic, messageStartEvent, pingWhilePending, DEFAULT_PING_INTERVAL_MS, type AnthropicRequest, type StreamToolCall } from './anthropic'
-import { applyAgentGuidance } from './agent-guidance'
+import { analyzeTurn, applyAgentGuidance } from './agent-guidance'
+import { appendNudges, appendSystemRules, declaresTools, openAiRequestView } from './openai-guidance'
 import {
   extractSearchQuery,
   findServerTool,
@@ -581,6 +582,27 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
     const { token: chatToken, codeSessionId: chatCodeSessionId } = resolveCodeSession(c)
     const chatHarness = resolveHarness(c, d, 'openai')
 
+    // ── Agent scaffolding + coding-activity attribution for OPENAI-protocol harnesses ──────────
+    // Everything below this comment used to exist only on /v1/messages, i.e. only for `claude`.
+    // The split was never by agent — it was by PROTOCOL, so `pi`/`opencode`/DeepSeek Harness/
+    // `kilo`/`openclaw`/`hermes` and every plain script silently ran without loop breaking,
+    // search-on-repeated-failure, dependency discipline, the routine hint, or a tool-call
+    // timeline. One adapter (openai-guidance.ts) reuses the SAME rules rather than forking them.
+    //
+    // `chatGuidance` is computed here (before the body is mutated below) but applied inside the
+    // isChat body-rewrite block, so a non-chat passthrough pays nothing at all.
+    const chatView = isChat && parsedBody ? openAiRequestView(parsedBody) : null
+    if (chatView && chatCodeSessionId) {
+      // Confirm half of coding-activity attribution — the view's `tool_result` blocks are exactly
+      // what this reads, so no second adapter is needed. Runs before the request is touched, for
+      // the same reason as the Anthropic handler: it must happen for every real turn, including
+      // ones that later fail to route or never reach the engine.
+      commitConfirmedCodeToolCalls(d, chatCodeSessionId, chatView)
+    }
+    const chatGuidance = chatView && parsedBody && declaresTools(parsedBody)
+      ? analyzeTurn(chatView, new URL(c.req.url).origin)
+      : null
+
     const requestedModel = isChat ? ((parsedBody?.model as string | undefined) ?? '') : ''
     const routeResult = await d.modelRouter.route(requestedModel)
     if ('status' in routeResult) {
@@ -634,6 +656,18 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
           } else if (effortOverride !== null) {
             parsedBody.chat_template_kwargs = { ...(parsedBody.chat_template_kwargs as Record<string, unknown> ?? {}), reasoning_effort: effortOverride }
           }
+        }
+        // Apply the scaffolding computed above. Standing rules go on the system message (stable
+        // for the whole session → the engine's reusable prompt prefix is unaffected after turn
+        // one); situational nudges go on the trailing user/tool turn, where they cost no prefix
+        // reuse and where the model actually acts on them. Same division as the Anthropic path.
+        if (parsedBody && chatGuidance) {
+          appendSystemRules(parsedBody, chatGuidance.system)
+          appendNudges(parsedBody, chatGuidance.nudges)
+          // The hard half of the loop breaker: at LOOP_ABORT_AFTER the model physically cannot
+          // emit the same call again and has to answer in text, which ends the loop. `'none'` is
+          // the OpenAI spelling of the Anthropic path's identical `oaiBody.tool_choice = 'none'`.
+          if (chatGuidance.forceTextOnly) parsedBody.tool_choice = 'none'
         }
         // A streaming OpenAI response omits the final `usage` chunk unless the caller
         // opts in via `stream_options.include_usage` (standard OpenAI API behavior,
@@ -774,6 +808,59 @@ function openAiToolCalls(oai: Record<string, unknown>): StreamToolCall[] {
  *  its filesTouched credit, exactly as MultiEdit already does below. */
 const MAX_DIFF_INPUT_CHARS = 64 * 1024
 
+/** The file an edit/write tool call targets, across every harness's own spelling.
+ *
+ *  ── Why this is not just `file_path` (hostile-QA finding, 2026-08-18) ──────────────────────────
+ *  `file_path` is CLAUDE CODE's spelling and nothing else's. Read off the installed binaries:
+ *    claude    `file_path`   (PascalCase tools: Edit/Write/MultiEdit)
+ *    pi 0.84   `path`        (`dist/core/tools/edit.js`, `write.js`: `Type.Object({ path: … })`)
+ *    opencode  `filePath`    (its edit tool: `Struct({ filePath: String… })`)
+ *  Because this read `file_path` only, EVERY pi and opencode call fell through the `if (!path)
+ *  continue` guard: nothing was ever added to `pendingCodeToolCalls`, so the tool-call timeline and
+ *  the launchpad's filesTouched / "Diff shipped" tiles stayed empty for both harnesses while the run
+ *  was still optimistically marked done. The whole point of porting attribution to the OpenAI path
+ *  was those tiles, so the feature was dead on arrival for the two harnesses it was built for.
+ *
+ *  Order is claude-first only because it is the highest-traffic client; the spellings are disjoint,
+ *  so precedence never actually decides anything. */
+function editedPath(input: Record<string, unknown>): string {
+  for (const key of ['file_path', 'filePath', 'path']) {
+    const v = input[key]
+    if (typeof v === 'string' && v) return v
+  }
+  return ''
+}
+
+/** The before/after text of a single-file edit, across each harness's spelling.
+ *
+ *  claude   `old_string` / `new_string`
+ *  opencode `oldString`  / `newString`
+ *  pi       an `edits: [{ oldText, newText }]` ARRAY — several replacements in one call, which is
+ *           structurally MultiEdit rather than Edit. Exactly one element can be rendered as a
+ *           unified diff honestly; for several, the fragments' line positions relative to each other
+ *           are unknown, so this returns empty and the caller records the edit WITHOUT a diff. That
+ *           mirrors the existing MultiEdit branch below: the file still gets filesTouched credit, and
+ *           an omitted number beats a fabricated one nobody can tell is wrong. */
+function editStrings(input: Record<string, unknown>): { oldString: string; newString: string } {
+  const str = (v: unknown) => (typeof v === 'string' ? v : '')
+  const edits = input.edits
+  if (Array.isArray(edits)) {
+    if (edits.length !== 1) return { oldString: '', newString: '' }
+    const e = (edits[0] ?? {}) as Record<string, unknown>
+    return { oldString: str(e.oldText ?? e.old_string ?? e.oldString), newString: str(e.newText ?? e.new_string ?? e.newString) }
+  }
+  return {
+    oldString: str(input.old_string ?? input.oldString),
+    newString: str(input.new_string ?? input.newString),
+  }
+}
+
+/** Test-only re-exports. These two functions decide whether ANY work is attributed for a harness,
+ *  and reading the wrong field name silently zeroes the whole feature — so they are tested directly
+ *  rather than only through a full streaming request. */
+export const editedPathForTest = editedPath
+export const editStringsForTest = editStrings
+
 /** Edit/Write/MultiEdit calls a session's CLI has been TOLD to make but is not yet known to have
  *  actually made, keyed `codeSessionId -> tool_use id -> record`.
  *
@@ -838,7 +925,7 @@ function observeCodeSessionTurn(d: Deps, codeSessionId: string, calls: StreamToo
       if (!call.id) continue
       // `input` came off the wire as JSON — narrow every field rather than trusting the shape.
       const input = (call.input ?? {}) as Record<string, unknown>
-      const path = typeof input.file_path === 'string' ? input.file_path : ''
+      const path = editedPath(input)
       if (!path) continue
       let record: ToolCallRecord
       if (name === 'write') {
@@ -847,8 +934,7 @@ function observeCodeSessionTurn(d: Deps, codeSessionId: string, calls: StreamToo
         // entirety of what a write contributes on the pi path too.
         record = { id: call.id, name: 'write', args: { path } }
       } else if (name === 'edit') {
-        const oldString = typeof input.old_string === 'string' ? input.old_string : ''
-        const newString = typeof input.new_string === 'string' ? input.new_string : ''
+        const { oldString, newString } = editStrings(input)
         record = oldString.length + newString.length > MAX_DIFF_INPUT_CHARS
           ? { id: call.id, name: 'edit', args: { path } } // see MAX_DIFF_INPUT_CHARS
           : { id: call.id, name: 'edit', args: { path }, diff: createPatch(path, oldString, newString) }
@@ -971,7 +1057,52 @@ async function recordOpenAiJsonUsage(d: Deps, body: ReadableStream<Uint8Array>, 
     const text = await new Response(body).text()
     const oai = JSON.parse(text) as Record<string, unknown>
     recordOpenAiUsage(d, oai, source, modelKey, codeSessionId, startedAt != null ? Date.now() - startedAt : null, harness)
+    // Observe half of coding-activity attribution for OPENAI-protocol harnesses — the counterpart
+    // to the Anthropic handler's own observeCodeSessionTurn call. Reuses `openAiToolCalls`, which
+    // already existed for that path's OpenAI-shaped responses; nothing is forked.
+    if (codeSessionId) {
+      try { observeCodeSessionTurn(d, codeSessionId, openAiToolCalls(oai)) } catch { /* swallow */ }
+    }
   } catch { /* swallow — stats are best-effort */ }
+}
+
+/** Reassemble tool calls from an OpenAI SSE stream's `choices[0].delta.tool_calls[]` fragments.
+ *
+ *  OpenAI streams a tool call in pieces: the first delta for a given `index` carries `id` and
+ *  `function.name`, and every later delta for that same index appends a slice of
+ *  `function.arguments` — so a single call's JSON arrives split across many chunks and must be
+ *  concatenated before it can be parsed. Keyed by `index` (not `id`, which only appears once).
+ *
+ *  Mirrors streamToAnthropic's per-delta accumulation, which does the same job for the Anthropic
+ *  path; kept separate because this one never has to emit Anthropic SSE events, only collect. */
+class StreamingToolCallAccumulator {
+  private byIndex = new Map<number, { id: string; name: string; args: string }>()
+
+  observe(chunk: Record<string, unknown>): void {
+    const deltas = (chunk.choices as Array<{ delta?: { tool_calls?: Array<Record<string, unknown>> } }> | undefined)
+      ?.[0]?.delta?.tool_calls
+    if (!Array.isArray(deltas)) return
+    for (const d of deltas) {
+      const index = typeof d.index === 'number' ? d.index : 0
+      const entry = this.byIndex.get(index) ?? { id: '', name: '', args: '' }
+      if (typeof d.id === 'string' && d.id) entry.id = d.id
+      const fn = (d.function ?? {}) as { name?: unknown; arguments?: unknown }
+      if (typeof fn.name === 'string' && fn.name) entry.name = fn.name
+      if (typeof fn.arguments === 'string') entry.args += fn.arguments
+      this.byIndex.set(index, entry)
+    }
+  }
+
+  /** The completed calls, in stream order. A call whose accumulated `arguments` never became valid
+   *  JSON is dropped — one bad call, not the whole turn (same rule as `openAiToolCalls`). */
+  calls(): StreamToolCall[] {
+    const out: StreamToolCall[] = []
+    for (const [, entry] of [...this.byIndex.entries()].sort((a, b) => a[0] - b[0])) {
+      if (!entry.name) continue
+      try { out.push({ id: entry.id, name: entry.name, input: JSON.parse(entry.args) }) } catch { /* skip */ }
+    }
+    return out
+  }
 }
 
 /** Drain a teed copy of a streaming OpenAI SSE body to record final usage (B4) plus a
@@ -987,6 +1118,8 @@ async function recordOpenAiStreamUsage(d: Deps, body: ReadableStream<Uint8Array>
     let promptTps = 0
     let genTps = 0
     let liveOut = 0 // running generated-token count for the live engine-card row
+    // Only allocated for a resolved Code session — a plain script's stream pays nothing.
+    const toolCalls = codeSessionId ? new StreamingToolCallAccumulator() : null
     for (;;) {
       const { done, value } = await reader.read()
       if (done) break
@@ -1014,7 +1147,11 @@ async function recordOpenAiStreamUsage(d: Deps, body: ReadableStream<Uint8Array>
         if (delta && (delta.content || delta.reasoning_content)) {
           try { d.manager.setLiveGen({ phase: 'gen', pct: 0, outputTokens: ++liveOut }) } catch { /* best-effort */ }
         }
+        toolCalls?.observe(chunk)
       }
+    }
+    if (codeSessionId && toolCalls) {
+      try { observeCodeSessionTurn(d, codeSessionId, toolCalls.calls()) } catch { /* swallow */ }
     }
     d.manager.recordCompletion({ inputTokens: promptTokens, outputTokens: completionTokens, promptTps, genTps })
     d.db.recordApiUsage({

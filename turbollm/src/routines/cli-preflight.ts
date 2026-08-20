@@ -19,6 +19,14 @@
 // keeps the probe free of any shell-quoting surface.
 import { realRunCommand, type RunCommand } from '../cli-launch'
 
+/** `<bin> --version` — the cheapest "is it installed" probe, per harness. Every CLI TurboLLM can
+ *  launch supports it (verified: claude 2.1.232, pi 0.82.1, opencode 1.18.9 all exit 0 and print a
+ *  version), so this needs no per-harness special-casing. */
+export async function isCliAvailable(bin: string, run: RunCommand = realRunCommand): Promise<boolean> {
+  return run(bin, ['--version'])
+}
+
+/** Back-compat alias for the claude-only call sites. Prefer `isCliAvailable(bin)`. */
 export async function isClaudeCliAvailable(run: RunCommand = realRunCommand): Promise<boolean> {
-  return run('claude', ['--version'])
+  return isCliAvailable('claude', run)
 }

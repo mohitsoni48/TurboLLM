@@ -123,6 +123,32 @@ export function getStatus(): Promise<Status> {
   return request<Status>('/api/v1/status')
 }
 
+// ── Coding-agent availability ────────────────────────────────────────────────
+/** Whether each terminal-agent CLI is actually installed on this machine, and the command that
+ *  installs it. Label/description deliberately are NOT here — those live in code-types.ts's
+ *  CODE_AGENTS so that copy has exactly one owner. */
+export type AgentAvailability = { id: string; installed: boolean; installCommand: string }
+
+export function getAgentAvailability(): Promise<{ agents: AgentAvailability[] }> {
+  return request<{ agents: AgentAvailability[] }>('/api/v1/code/agents')
+}
+
+/** Re-stamp a harness's config file with the model that is loaded RIGHT NOW.
+ *
+ *  Must be awaited BEFORE telling the harness to switch: its config is otherwise the one written at
+ *  launch, in which every model except the launch-time one carries its NATIVE context max rather
+ *  than the window the engine actually loaded. Never throws for the caller's purposes — a config we
+ *  cannot safely rewrite returns `{ok:false}` with a reason rather than failing the model load. */
+export function syncCodeAgentConfig(id: string): Promise<{ ok: boolean; message?: string }> {
+  return request<{ ok: boolean; message?: string }>(`/api/v1/code/agents/${encodeURIComponent(id)}/sync-config`, { method: 'POST' })
+}
+
+/** Run a harness's own registered install command. The caller picks only WHICH agent — never the
+ *  command — so no arbitrary command can be reached from the client. */
+export function installCodeAgent(id: string): Promise<{ ok: true }> {
+  return request<{ ok: true }>(`/api/v1/code/agents/${encodeURIComponent(id)}/install`, { method: 'POST' })
+}
+
 /** Live running-session stats (B4) ride on the status payload — surfaced from the
  *  status poll rather than a separate endpoint. Re-exported for convenience. */
 export type { EngineStats } from './types'

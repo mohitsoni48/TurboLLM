@@ -79,7 +79,10 @@ interface TerminalViewProps {
  *  the CLI itself interprets, not a general "type arbitrary text into someone's shell" API. */
 export interface TerminalViewHandle {
   /** Sends `command` followed by Enter, exactly as if the user had typed it. */
-  sendCommand: (command: string) => void
+  /** Type a command into the live TUI and submit it. `confirmAutocomplete` sends a SECOND Enter
+   *  shortly after — required by a harness whose slash-command input pops an autocomplete dropdown
+   *  that CONSUMES the first Enter to accept the highlighted suggestion. See its caller. */
+  sendCommand: (command: string, opts?: { confirmAutocomplete?: boolean }) => void
 }
 
 export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(function TerminalView(
@@ -125,7 +128,24 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
   // external model-switch API, but it DOES have its own interactive `/model` picker; sending
   // that command opens it exactly as if the user had typed it themselves, no scrollback lost).
   useImperativeHandle(ref, () => ({
-    sendCommand: (command: string) => send(`${command}\r`),
+    sendCommand: (command: string, opts?: { confirmAutocomplete?: boolean }) => {
+      send(`${command}\r`)
+      // ── The second Enter (founder-reported; measured in a real PTY, 2026-08-19) ───────────────
+      // opencode pops an autocomplete dropdown as soon as a slash command is typed, and its first
+      // Enter ACCEPTS the highlighted suggestion instead of submitting the line — so a single `\r`
+      // left `/models` sitting in the input and the picker never opened at all. Measured directly:
+      //   one Enter  -> picker open FALSE
+      //   two Enters -> picker open TRUE
+      //
+      // Opt-IN per call rather than always-on: where the first Enter already submits, a second
+      // would send an empty line to the agent. Only used for a BARE command — typing an argument
+      // dismisses the dropdown, which is why claude's `/model claude-<key>` and pi's
+      // `/model turbollm/<key>` have always worked with one.
+      //
+      // The delay lets the TUI process the first keypress and repaint; both in one write can be
+      // read as a single paste by some line editors.
+      if (opts?.confirmAutocomplete) setTimeout(() => send('\r'), 250)
+    },
   }), [send])
 
   useEffect(() => {

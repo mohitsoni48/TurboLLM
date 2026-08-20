@@ -6,9 +6,15 @@
 // loaded, it auto-loads the last-used model (or the first available one). With --model
 // it resolves and loads a specific model by key/name before launching.
 //
-// Two wiring styles: Anthropic-protocol tools (claude) get ANTHROPIC_* env vars at
-// spawn time; config-file tools (opencode/kilo/openclaw) get a `turbollm` provider
-// merged into their own config file (prepareConfig) before spawning.
+// Wiring is per-harness DATA, not per-harness branches — see CliSpec/LaunchContext:
+//   - `prepareConfig` merges a durable `turbollm` provider into the harness's own config file
+//     (opencode/kilo/openclaw/pi/hermes), so a later bare `opencode` stays wired. Always keyed to
+//     the SHARED static token: that file outlives the launch and is shared between sessions.
+//   - `env` / `args` carry everything PER-LAUNCH, including the session-scoped auth token. This
+//     split is what lets two concurrent Code sessions on the same harness keep separate identities
+//     at the gateway (session-auth.ts) instead of racing on one global config file.
+//   - `mcpArgs` points the harness at the daemon's own MCP bridge, for harnesses with a confirmed
+//     flag for it (claude). opencode carries the same bridge inside its inline config instead.
 import { spawn } from 'node:child_process'
 import { homedir } from 'node:os'
 import { readFile, writeFile, mkdir } from 'node:fs/promises'
@@ -16,14 +22,81 @@ import { join, dirname } from 'node:path'
 import { buildShellCommand } from './util/shell-command'
 import { requiresShell, resolveExecutable } from './util/resolve-executable'
 
+/** Everything a harness might need to wire itself to this daemon, resolved once per launch and
+ *  handed to every per-harness hook on {@link CliSpec}. Exists so adding a harness is a data entry
+ *  rather than another `if (target === 'x')` branch in launchCli. */
+export interface LaunchContext {
+  /** `http://127.0.0.1:<port>` — the gateway origin. */
+  base: string
+  port: number
+  /** The token this launch should present. **Session-scoped** for an embedded-terminal launch
+   *  (so the gateway can resolve it back to a Code session and apply that session's thinking
+   *  budget / reasoning effort, and attribute its usage — session-auth.ts); the shared static
+   *  token for a hand-run `turbollm launch <cli>`. */
+  authToken: string
+  /** The loaded model's stable key — what the gateway routes on. */
+  pinnedModel: string
+  /** The loaded model's display name. */
+  modelName: string
+  /** The loaded model's REAL context window, or undefined when the daemon reports none. */
+  modelCtx?: number
+  /** Engine slot count, or undefined when the engine does its own batching (vLLM/mlx-lm). */
+  parallelSlots?: number
+  /** The WHOLE model library, not just the loaded model.
+   *
+   *  Why it must be the whole library: claude gets a real model picker for free — the gateway
+   *  advertises every model on `/v1/models` and `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY` tells
+   *  Claude Code to read it. Config-file harnesses have no such discovery channel: they can only see
+   *  what we WRITE into their config. Writing only the loaded model (as this did originally) left
+   *  `/model` in pi showing a single entry — founder-reported as "I can't see turbollm models" — while
+   *  claude showed all of them. Empty when the library couldn't be fetched, in which case each
+   *  harness's config keeps whatever it already had. */
+  models: ModelEntry[]
+  /** Filesystem seam, so an `env` hook that has to READ the user's own config (opencode) is unit
+   *  testable against an in-memory fs instead of the real home directory. */
+  fs: ConfigFs
+}
+
 interface CliSpec {
   bin: string
   label: string
   install: string
   // Anthropic-protocol tools (today: claude) get ANTHROPIC_* env vars set at spawn time.
-  // Config-file tools (opencode/kilo/openclaw) instead get this called once before spawn
+  // Config-file tools (opencode/kilo/openclaw/pi) instead get this called once before spawn
   // to merge a local-gateway provider entry into the tool's own config file.
-  prepareConfig?: (base: string, apiKey: string, modelKey: string, modelName: string) => Promise<PrepareResult>
+  //
+  // `fs` is threaded through from launchCli's own injected seam. It MUST be — without it these
+  // implementations silently fell back to their `realFs` default, so any test that drove
+  // `launchCli` with a config-file target wrote to the REAL home directory instead of its in-memory
+  // fs. Found exactly that way: a new unit test quietly rewrote this machine's own
+  // `~/.pi/agent/models.json` and `~/.config/opencode/opencode.json` with a stub model name.
+  //
+  // Takes the resolved LaunchContext (not loose positional params) so a harness can wire the
+  // things that only become known at launch — above all the REAL context window, without which
+  // every harness silently assumes its own default (pi: 128000, measured live as a founder-visible
+  // "128K" on a 200K model).
+  //
+  // `apiKey` is passed separately and is deliberately the SHARED static token, never
+  // `ctx.authToken`: this writes a durable file that outlives the launch (see launchCli).
+  prepareConfig?: (ctx: LaunchContext, apiKey: string) => Promise<PrepareResult>
+  /** Extra environment this harness needs, merged on top of {@link inheritedEnv}. Keep the
+   *  per-harness wiring here rather than in launchCli — see LaunchContext. */
+  env?: (ctx: LaunchContext) => Promise<NodeJS.ProcessEnv> | NodeJS.ProcessEnv
+  /** Extra CLI arguments this harness needs, appended after the caller's passthrough.
+   *
+   *  This is where a **per-session credential** belongs for a harness that accepts one as a flag
+   *  (pi's `--api-key`): a token is per-process state, and writing it into the harness's SHARED
+   *  global config file would let two concurrent Code sessions race, last writer winning, each
+   *  silently adopting the other's identity at the gateway. */
+  args?: (ctx: LaunchContext) => string[]
+  /** Extra env markers to strip beyond {@link PARENT_AGENT_ENV_MARKERS} — anything that would make
+   *  THIS harness believe it is a nested child of another agent run. Probe before filling in;
+   *  an empty/absent list must mean "probed, none found", not "never looked". */
+  parentEnvMarkers?: readonly string[]
+  /** How this harness is told about TurboLLM's own MCP bridge (mcp-server.ts), which is the only
+   *  way it can learn that Routines/Agents exist at all. Absent = no verified mechanism, so
+   *  nothing is passed (rather than a guessed flag, which is a hard startup failure — ADR-293). */
+  mcpArgs?: (configPath: string) => string[]
   // CLIs that accept a caller-chosen session id expose two mutually exclusive flags: one that
   // REGISTERS a new id, one that RESUMES an existing one. Passing the wrong one is a hard,
   // immediate failure — and the daemon genuinely cannot know which state the CLI is in, because
@@ -55,12 +128,68 @@ const SUPPORTED: Record<string, CliSpec> = {
     //   --session-id <existing> -> "Error: Session ID <uuid> is already in use."
     //   --resume     <unknown>  -> "No conversation found with session ID: <uuid>"
     sessionFlags: { register: '--session-id', resume: '--resume' },
+    env: claudeEnv,
+    mcpArgs: (configPath) => ['--mcp-config', configPath],
   },
-  opencode: { bin: 'opencode', label: 'opencode', install: 'npm install -g opencode-ai', prepareConfig: prepareOpencode },
-  kilo: { bin: 'kilo', label: 'Kilo Code', install: 'npm install -g @kilocode/cli', prepareConfig: prepareKilo },
-  openclaw: { bin: 'openclaw', label: 'openclaw', install: 'npm install -g openclaw@latest', prepareConfig: prepareOpenclaw },
-  hermes: { bin: 'hermes', label: 'Hermes Agent', install: 'npm install -g hermes-agent', prepareConfig: prepareHermes },
-  pi: { bin: 'pi', label: 'pi', install: 'npm install -g @earendil-works/pi-coding-agent', prepareConfig: preparePi },
+  opencode: {
+    bin: 'opencode',
+    label: 'opencode',
+    install: 'npm install -g opencode-ai',
+    // Still merged into the user's own config file, so a hand-run `turbollm launch opencode` (and
+    // any later bare `opencode`) stays wired. The per-SESSION token travels by env instead — see
+    // buildOpencodeConfigContent for why the file is the wrong place for it.
+    prepareConfig: (ctx, apiKey) => prepareOpencode(ctx.base, apiKey, ctx.pinnedModel, ctx.modelName, ctx.fs, ctx.modelCtx, ctx.models),
+    env: async (ctx) => {
+      const content = await buildOpencodeConfigContent(ctx.base, ctx.authToken, ctx.pinnedModel, ctx.modelName, ctx.port, ctx.fs, ctx.modelCtx, ctx.models)
+      return content ? { OPENCODE_CONFIG_CONTENT: content } : {}
+    },
+    // MCP travels inside OPENCODE_CONFIG_CONTENT's own `mcp` key (above), not as a flag — opencode
+    // has no `--mcp-config` equivalent (`opencode --help`, 1.18.9).
+  },
+  kilo: { bin: 'kilo', label: 'Kilo Code', install: 'npm install -g @kilocode/cli', prepareConfig: (ctx, apiKey) => prepareKilo(ctx.base, apiKey, ctx.pinnedModel, ctx.modelName, ctx.fs, ctx.modelCtx, ctx.models) },
+  openclaw: { bin: 'openclaw', label: 'openclaw', install: 'npm install -g openclaw@latest', prepareConfig: (ctx, apiKey) => prepareOpenclaw(ctx.base, apiKey, ctx.pinnedModel, ctx.modelName, ctx.fs) },
+  // hermes' 5th parameter is a RunCommand, not a ConfigFs — its config is YAML and is written by
+  // shelling out to `hermes config set` rather than by touching the filesystem here, so it has no
+  // fs seam to thread and the argument is deliberately dropped.
+  hermes: {
+    bin: 'hermes',
+    label: 'Hermes Agent',
+    install: 'npm install -g hermes-agent',
+    prepareConfig: (ctx, apiKey) => prepareHermes(ctx.base, apiKey, ctx.pinnedModel, ctx.modelName),
+  },
+  pi: {
+    bin: 'pi',
+    label: 'pi',
+    install: 'npm install -g @earendil-works/pi-coding-agent',
+    prepareConfig: (ctx, apiKey) => preparePi(ctx.base, apiKey, ctx.pinnedModel, ctx.modelName, ctx.fs, ctx.modelCtx, ctx.models),
+    // `--session-id <id>` is documented as "Use exact project session ID, CREATING IT IF MISSING"
+    // (`pi --help`, 0.84.2) — one flag registers *and* resumes. So pi deliberately has NO
+    // sessionFlags: there is no register/resume pair to mismatch, and therefore nothing for
+    // spawnWithSessionRecovery to recover from. terminal-routes.ts passes the single flag.
+    args: piArgs,
+    // pi discovers MCP through its own extension system (`pi install`), which is not a flag we can
+    // set per launch. It does not need one for the routine/agent gap this exists to close: the
+    // gateway already tells every OpenAI-protocol client how to create a Routine over REST
+    // (agent-guidance.ts's routineGuidance), which is the same information writeClaudeMcpConfig
+    // exists to deliver to claude. Deliberately no mcpArgs.
+  },
+}
+
+/** The executable name for a launch target, or null when the target isn't supported. Exported so
+ *  callers that need to PROBE a harness (routines' install preflight) ask this registry rather than
+ *  assuming the target id and the binary name are the same string — they happen to match today for
+ *  claude/opencode/pi, but `kilo`→`kilo` and `hermes`→`hermes` are the only reason that reads as a
+ *  rule, and `deepseek`→`dsh` would break it the moment it is added. */
+export function cliBin(target: string): string | null {
+  return SUPPORTED[target]?.bin ?? null
+}
+
+/** The binary, display label and install command for a launch target, or null when unsupported.
+ *  Exported so the UI can tell the user WHICH command installs a harness it found missing, without
+ *  keeping a second copy of that string that could drift from the one the launcher prints. */
+export function cliSpecInfo(target: string): { bin: string; label: string; install: string } | null {
+  const spec = SUPPORTED[target]
+  return spec ? { bin: spec.bin, label: spec.label, install: spec.install } : null
 }
 
 interface DaemonStatus {
@@ -105,9 +234,30 @@ export function clampAutoCompactWindow(ctx: number): number {
  *  surfaces rather than an arbitrary different one here. */
 export const CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = '80'
 
-interface ModelEntry {
+export interface ModelEntry {
   key: string
   name: string
+  /** The model's own maximum context from its GGUF metadata — a ceiling, not what it will load with. */
+  nativeCtx?: number
+  /** The context window this model would ACTUALLY be loaded with, from its saved profile/preset for
+   *  the active engine (`/api/v1/models`). This is the right per-model answer for a harness's
+   *  picker: `nativeCtx` is merely the maximum the file allows, so a 262144-native model configured
+   *  at 163328 advertised the wrong window until it happened to be the loaded one. Undefined when
+   *  the model has no saved profile, where nativeCtx is the honest remaining answer. */
+  configuredCtx?: number
+}
+
+/** The context window to advertise for one model, best-known first:
+ *   1. `loadedCtx` — only for the model that is loaded RIGHT NOW. Authoritative: auto-tune or a
+ *      VRAM-pressure fallback can land somewhere other than the saved profile asked for.
+ *   2. `configuredCtx` — its saved profile for the active engine: what it WOULD load with. Correct
+ *      for every model without needing it loaded first, which is the point.
+ *   3. `nativeCtx` — the metadata ceiling. Only an upper bound, but better than silence.
+ *   4. undefined — omit the field entirely and let the harness use its own default, rather than
+ *      inventing a number. */
+function advertisedCtx(m: ModelEntry, isLoaded: boolean, loadedCtx?: number): number | undefined {
+  if (isLoaded && loadedCtx) return loadedCtx
+  return m.configuredCtx ?? m.nativeCtx
 }
 
 // Type-safe subset of spawn's return value that launchCli actually uses. Only 'on' — the child's
@@ -352,10 +502,49 @@ function corruptConfigError(path: string, label: string): PrepareResult {
   }
 }
 
+/** The `models` map entry the opencode STACK needs for our provider — used by opencode AND
+ *  kilo, which is built on that stack and uses the identical shape (verified: kilo's own bundled
+ *  `models-snapshot.json` entries carry the same `id` / `name` / `limit:{context,output}` fields).
+ *
+ *  `limit` is where opencode learns the model's real context window; its schema requires BOTH
+ *  `context` and `output` (opencode.ai/config.json). Only `context` is a MEASURED value — the window
+ *  the engine actually loaded. `output` has no daemon-reported equivalent, so it is a generous UPPER
+ *  BOUND rather than a guess at the true figure: the gateway's own `modelDefaults.maxTokens` cap and
+ *  the engine both clamp generation independently, so a high value here can only fail to bind, never
+ *  truncate a reply that would otherwise have completed.
+ *
+ *  Omitted entirely when the daemon reports no ctx — opencode's own default beats a made-up number.
+ *  Same rule preparePi follows for `contextWindow`. */
+function stackModelEntry(id: string, name: string, modelCtx?: number): Record<string, unknown> {
+  const entry: Record<string, unknown> = { id, name }
+  if (modelCtx) entry.limit = { context: modelCtx, output: Math.min(32768, Math.max(4096, Math.floor(modelCtx / 8))) }
+  return entry
+}
+
+/** The whole library as an opencode-stack `models` MAP, same reasoning as piModelEntries — a config-file
+ *  harness can only offer what we write, so writing one model left the picker with one entry.
+ *
+ *  Keyed by the model KEY rather than its display name: keys are unique by construction and are what
+ *  the gateway routes on, whereas two library entries can share a name (the same model at two
+ *  quantisations). `name` carries the human-readable label, which opencode's schema supports. */
+function stackModelMap(
+  models: ModelEntry[],
+  loadedKey: string,
+  loadedName: string,
+  loadedCtx?: number,
+): Record<string, unknown> {
+  if (models.length === 0) return { [loadedKey]: stackModelEntry(loadedKey, loadedName, loadedCtx) }
+  const out: Record<string, unknown> = {}
+  for (const m of models) {
+    out[m.key] = stackModelEntry(m.key, m.name, advertisedCtx(m, m.key === loadedKey, loadedCtx))
+  }
+  return out
+}
+
 /** opencode — merge a `turbollm` provider into ~/.config/opencode/opencode.json,
  *  preserving every sibling provider the user already configured. Shape mirrors
  *  buildConnectSnippets (routes.ts) so both surfaces stay in lockstep. */
-export async function prepareOpencode(base: string, apiKey: string, _modelKey: string, modelName: string, fs: ConfigFs = realFs): Promise<PrepareResult> {
+export async function prepareOpencode(base: string, apiKey: string, modelKey: string, modelName: string, fs: ConfigFs = realFs, modelCtx?: number, models: ModelEntry[] = []): Promise<PrepareResult> {
   const path = join(fs.home, '.config', 'opencode', 'opencode.json')
   const read = await readConfigObject(fs, path)
   if ('corrupt' in read) return corruptConfigError(path, 'opencode')
@@ -369,9 +558,14 @@ export async function prepareOpencode(base: string, apiKey: string, _modelKey: s
   provider.turbollm = {
     npm: '@ai-sdk/openai-compatible',
     options: { baseURL: `${base}/v1`, apiKey },
-    models: { [modelName]: { id: modelName } },
+    models: stackModelMap(models, modelKey, modelName, modelCtx),
   }
   cfg.provider = provider
+  // Deliberately does NOT pin `cfg.model` here, unlike prepareKilo/prepareOpenclaw. This is the
+  // user's OWN durable config: overwriting their default model would hijack a hand-run `opencode`
+  // that has nothing to do with TurboLLM, and this file's own test pins that unrelated top-level
+  // keys stay untouched. A daemon-launched session gets its pin from the per-process inline config
+  // instead (buildOpencodeConfigContent) — the right scope for a per-launch choice.
   await fs.mkdir(dirname(path))
   await fs.writeFile(path, JSON.stringify(cfg, null, 2) + '\n')
   return { ok: true }
@@ -382,7 +576,7 @@ export async function prepareOpencode(base: string, apiKey: string, _modelKey: s
  *  "Expected object"). Its real config file is `kilo.jsonc` (JSONC — comments allowed),
  *  confirmed against the live install, NOT `kilo.json`. Merge the `turbollm` provider
  *  and set it as the default via the top-level `model` string. */
-export async function prepareKilo(base: string, apiKey: string, _modelKey: string, modelName: string, fs: ConfigFs = realFs): Promise<PrepareResult> {
+export async function prepareKilo(base: string, apiKey: string, modelKey: string, modelName: string, fs: ConfigFs = realFs, modelCtx?: number, models: ModelEntry[] = []): Promise<PrepareResult> {
   const path = join(fs.home, '.config', 'kilo', 'kilo.jsonc')
   const read = await readConfigObject(fs, path)
   if ('corrupt' in read) return corruptConfigError(path, 'Kilo Code')
@@ -398,11 +592,18 @@ export async function prepareKilo(base: string, apiKey: string, _modelKey: strin
   provider.turbollm = {
     npm: '@ai-sdk/openai-compatible',
     options: { baseURL: `${base}/v1`, apiKey },
-    models: { [modelName]: { id: modelName } },
+    // Same treatment as opencode, and for the same two reasons. (1) The WHOLE library, so kilo's
+    // model picker is a real picker rather than a single row — a config-file harness can only offer
+    // what we write. (2) Keyed by model KEY, not display name: this library really does contain
+    // collisions (`qwen3.6-35b-a3b` at four quantisations on the founder's box), which a name-keyed
+    // map silently collapsed into ONE entry, and the key is what the gateway routes on anyway.
+    models: stackModelMap(models, modelKey, modelName, modelCtx),
   }
   cfg.provider = provider
-  // provider/model key selects the default model kilo boots with (format: provider/mapKey).
-  cfg.model = `turbollm/${modelName}`
+  // provider/model key selects the default model kilo boots with (format: provider/mapKey) — so
+  // this must be the KEY now that the map is keyed by key. It was `modelName`, which stopped
+  // resolving the moment the map stopped being name-keyed.
+  cfg.model = `turbollm/${modelKey}`
   await fs.mkdir(dirname(path))
   await fs.writeFile(path, JSON.stringify(cfg, null, 2) + '\n')
   return { ok: true }
@@ -442,6 +643,27 @@ export async function prepareOpenclaw(base: string, apiKey: string, modelKey: st
   return { ok: true }
 }
 
+/** Every library model as a pi `models` entry, with the LOADED one carrying its real loaded context
+ *  window and the rest their native maximum.
+ *
+ *  The distinction matters: a load profile routinely caps ctx well below a model's native maximum
+ *  (a 262144-native model loaded at 32768), so the loaded model's true window is the one the daemon
+ *  reports, not its metadata. For every other model we have no loaded figure — `nativeCtx` is the
+ *  honest best estimate, and it is corrected the moment that model becomes the loaded one.
+ *
+ *  Falls back to just the loaded model when the library couldn't be fetched, so a network hiccup
+ *  degrades to the previous behaviour rather than writing an empty picker. */
+function piModelEntries(
+  models: ModelEntry[],
+  loadedKey: string,
+  loadedName: string,
+  loadedCtx?: number,
+): Array<Record<string, unknown>> {
+  const entry = (key: string, name: string, ctx?: number) => ({ id: key, name, ...(ctx ? { contextWindow: ctx } : {}) })
+  if (models.length === 0) return [entry(loadedKey, loadedName, loadedCtx)]
+  return models.map((m) => entry(m.key, m.name, advertisedCtx(m, m.key === loadedKey, loadedCtx)))
+}
+
 /** pi — the standalone `@earendil-works/pi-coding-agent` CLI (distinct from the pi SDK
  *  TurboLLM's own Code feature embeds server-side). Custom providers are wired via two
  *  files (schema confirmed against the package's own vendored docs, `docs/models.md` +
@@ -452,7 +674,7 @@ export async function prepareOpenclaw(base: string, apiKey: string, modelKey: st
  *     already selected on it, no manual `/model` picker needed.
  *  Both go through the same tolerant-JSON merge (readConfigObject/stripJsonComments) as
  *  opencode/kilo — never touch a config with comments or one that isn't already ours. */
-export async function preparePi(base: string, apiKey: string, modelKey: string, modelName: string, fs: ConfigFs = realFs): Promise<PrepareResult> {
+export async function preparePi(base: string, apiKey: string, modelKey: string, modelName: string, fs: ConfigFs = realFs, contextWindow?: number, models: ModelEntry[] = []): Promise<PrepareResult> {
   const modelsPath = join(fs.home, '.pi', 'agent', 'models.json')
   const modelsRead = await readConfigObject(fs, modelsPath)
   if ('corrupt' in modelsRead) return corruptConfigError(modelsPath, 'pi')
@@ -466,7 +688,25 @@ export async function preparePi(base: string, apiKey: string, modelKey: string, 
       baseUrl: `${base}/v1`,
       api: 'openai-completions',
       apiKey,
-      models: [{ id: modelKey, name: modelName }],
+      // `contextWindow` is REQUIRED for correctness, not decoration. pi defaults it to 128000
+      // (its own documented default, `docs/models.md`), and that default is both displayed to the
+      // user and used to decide when to auto-compact:
+      //     contextTokens > contextWindow - reserveTokens        (docs/compaction.md)
+      // So on a model loaded with a 200K window pi showed "128K" (founder-reported live) AND would
+      // have compacted far too early; on a model loaded with 8K it would never compact and would
+      // overflow the real engine instead — the same class of bug ADR-341 fixed for claude via
+      // CLAUDE_CODE_AUTO_COMPACT_WINDOW. Setting the real number fixes the display and the
+      // compaction trigger together.
+      //
+      // Omitted (not guessed) when the daemon reports no ctx: pi's own default is a better answer
+      // than a number we made up. `maxTokens` is deliberately left at pi's default too — the daemon
+      // reports no max-output figure, and inventing one could truncate real replies.
+      //
+      // EVERY model in the library is listed, not just the loaded one — that is what makes pi's
+      // `/model` picker a real picker (it re-reads this file each time it opens, docs/models.md).
+      // Selecting a different one just sends a different model id to the gateway, which auto-swaps
+      // exactly as it does for claude's own picker.
+      models: piModelEntries(models, modelKey, modelName, contextWindow),
     }
     modelsCfg.providers = providers
     await fs.mkdir(dirname(modelsPath))
@@ -489,6 +729,150 @@ export async function preparePi(base: string, apiKey: string, modelKey: string, 
   return { ok: true }
 }
 
+// ── Per-harness wiring (CliSpec.env / .args) ────────────────────────────────────
+//
+// Each harness reaches TurboLLM by a different route, and — critically — each needs a way to carry
+// a PER-SESSION token without writing it into a shared global config file. See CliSpec.args.
+
+/** claude — Anthropic-protocol env wiring. Moved here verbatim from launchCli's body when the
+ *  launcher became spec-driven; every value's reasoning lives on its own comment below and none of
+ *  it changed. */
+function claudeEnv(ctx: LaunchContext): NodeJS.ProcessEnv {
+  return {
+    ANTHROPIC_BASE_URL: ctx.base,
+    // No auth is enforced on the local gateway; the CLI just needs a non-empty token. A
+    // session-scoped token (embedded terminal launches) takes priority over the shared static
+    // one so the gateway can attribute this session's requests correctly (session-auth.ts).
+    ANTHROPIC_AUTH_TOKEN: ctx.authToken,
+    // Local LLMs are 30–120 s per response — raise Claude Code's request timeout so it
+    // doesn't abort mid-generation. 300 s (5 min) covers even the slowest local model.
+    // Zero retries: retrying a slow local model cold-starts it again and makes things worse.
+    ANTHROPIC_TIMEOUT: '300000',
+    ANTHROPIC_MAX_RETRIES: '0',
+    // Always pin the loaded model's id (key preferred). Claude Code uses the model string
+    // for real client-side bookkeeping even behind a custom base URL — the status line,
+    // `/status`, and context-window / auto-compact sizing all read it — and never validates
+    // it against a cloud catalog when ANTHROPIC_BASE_URL is custom.
+    ANTHROPIC_MODEL: ctx.pinnedModel,
+    // Opt into gateway model discovery: Claude Code queries our /v1/models at startup and
+    // populates the /model picker with the local library (gateway synthesises the entries).
+    CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: '1',
+    // See clampAutoCompactWindow's doc comment for the root cause and its documented
+    // [100_000, 1_000_000] floor/ceiling. Only set when the daemon actually reports a real ctx —
+    // an absent/zero value means "don't know", and guessing a window would be worse than leaving
+    // the CLI's own generic default in place.
+    ...(ctx.modelCtx ? { CLAUDE_CODE_AUTO_COMPACT_WINDOW: String(clampAutoCompactWindow(ctx.modelCtx)) } : {}),
+    CLAUDE_AUTOCOMPACT_PCT_OVERRIDE,
+    // Cap background-agent fan-out at what the engine can actually run concurrently. The gateway
+    // enforces the same limit independently (gateway.ts acquires d.gate), so a CLI that ignores
+    // this still cannot exceed the engine; this is the cooperative half, which makes the excess
+    // queue politely client-side instead of being held at the HTTP layer.
+    ...(ctx.parallelSlots ? { CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: String(ctx.parallelSlots) } : {}),
+  }
+}
+
+/** opencode — the complete config this launch should run with, as a JSON string for
+ *  `OPENCODE_CONFIG_CONTENT` ("inline json config content", confirmed in `opencode --help` on
+ *  1.18.9).
+ *
+ *  ── Why an env var and not just the config file ────────────────────────────────────────────────
+ *  `prepareOpencode` writes the `turbollm` provider into the user's own
+ *  `~/.config/opencode/opencode.json`, which is right for a hand-run launch: the provider entry is
+ *  durable, shared, and not secret. But it is the WRONG place for a per-session auth token — the
+ *  path is global, so two concurrent Code sessions would race on it and the last writer would win,
+ *  leaving one session silently presenting the other's identity to the gateway (and therefore
+ *  getting the other session's thinking budget and usage attribution). An env var is per-process,
+ *  so each session's token stays its own.
+ *
+ *  ── Why it starts from the user's real config ──────────────────────────────────────────────────
+ *  Built by MERGING onto whatever the user already has, so an inline config can't silently drop
+ *  their other providers, agents, or MCP servers. A happy side effect: because this is only ever
+ *  read and never written back, a config containing COMMENTS is no longer a problem at all — the
+ *  reason `prepareOpencode` has to refuse those is that rewriting the file would delete them.
+ *  Returns null only when the file doesn't parse even leniently, where the honest move is to leave
+ *  opencode to read its own file and report its own error. */
+export async function buildOpencodeConfigContent(
+  base: string,
+  apiKey: string,
+  modelKey: string,
+  modelName: string,
+  /** Daemon port for the MCP bridge command, or null to add no `mcp` entry at all. */
+  mcpPort: number | null,
+  fs: ConfigFs = realFs,
+  /** The REAL loaded context window — see opencodeModelEntry. */
+  modelCtx?: number,
+  /** The whole library, so opencode's picker offers every model — see opencodeModelMap. */
+  models: ModelEntry[] = [],
+): Promise<string | null> {
+  const path = join(fs.home, '.config', 'opencode', 'opencode.json')
+  const read = await readConfigObject(fs, path)
+  if ('corrupt' in read) return null
+  const cfg = read.obj
+  const provider = asObject(cfg.provider)
+  if (!provider) return null
+  provider.turbollm = {
+    npm: '@ai-sdk/openai-compatible',
+    options: { baseURL: `${base}/v1`, apiKey },
+    models: stackModelMap(models, modelKey, modelName, modelCtx),
+  }
+  cfg.provider = provider
+  // ── Show ONLY TurboLLM's models in this session's picker (founder-reported, 2026-08-19) ───────
+  // `/models` opened onto opencode's OWN hosted providers — "OpenCode Zen" (Nemotron, DeepSeek V4,
+  // Laguna, Hy3, MiMo…) and Google — with the 26 local models pushed below them, so picking the
+  // obvious first entry switched to a CLOUD model and TurboLLM appeared not to change anything.
+  //
+  // Note this is a DIFFERENT mechanism from the credential leak fixed for pi: OpenCode Zen is
+  // opencode's own built-in free service and needs none of the user's keys, so stripping
+  // OPENAI_API_KEY/GEMINI_API_KEY cannot remove it. Read out of the 1.18 binary, opencode filters
+  // providers with `if ((enabled ? enabled.has(id) : true) && !disabled.has(id))` — so
+  // `enabled_providers` is an ALLOWLIST, and naming ours makes it the only one. Preferred over
+  // `disabled_providers` precisely because it is an allowlist: a provider opencode adds in a later
+  // release cannot reappear in a local-only session.
+  //
+  // Inline config ONLY, never the durable file — a hand-run `opencode` keeps every provider the
+  // user configured. Going through `turbollm launch` is the statement that this session is local.
+  cfg.enabled_providers = ['turbollm']
+  // Pin the model TurboLLM actually has loaded, the same way prepareKilo/prepareOpenclaw do.
+  // opencode was the ONLY harness whose model was never pinned by anything — no flag, no config key
+  // — so a session booted on whatever opencode itself last selected, potentially a cloud provider
+  // with no credentials. `provider/model` is opencode's documented top-level `model` format.
+  cfg.model = `turbollm/${modelKey}`
+  // TurboLLM's own MCP bridge, so this session can reach create_routine/list_agents/etc. The key
+  // shape mirrors what `opencode mcp` manages: a local server is `{type:'local', command:[…]}`.
+  if (mcpPort !== null) {
+    const mcp = asObject(cfg.mcp)
+    if (mcp) {
+      mcp.turbollm = { type: 'local', command: ['npx', 'turbollm', 'mcp-server', '--port', String(mcpPort)], enabled: true }
+      cfg.mcp = mcp
+    }
+  }
+  return JSON.stringify(cfg)
+}
+
+/** pi — the per-session token as a real CLI flag, plus the provider/model it applies to.
+ *
+ *  `--api-key <key>` is the per-process seam that keeps a session-scoped secret out of the SHARED
+ *  `~/.pi/agent/models.json` (see CliSpec.args). But it cannot be passed ALONE — measured live,
+ *  2026-08-18, on a real launch:
+ *
+ *      Error: --api-key requires a model to be specified via --model, --provider/--model, or --models
+ *
+ *  which killed the session at startup. A key with no model is ambiguous to pi: it has no way to
+ *  know WHICH provider the credential is for. `preparePi` does write defaultProvider/defaultModel
+ *  into settings.json, but those defaults are evidently not consulted for this check.
+ *
+ *  So the provider and model are named explicitly. Verified against pi 0.84.2 — with all three
+ *  flags the `turbollm` provider registers and the model is listed
+ *  (`pi --provider turbollm --model <key> --api-key <tok> --list-models` exits 0 and shows it).
+ *
+ *  `ctx.pinnedModel` is a TurboLLM model key, which contains `|` (e.g.
+ *  `qwen3.6-35b-a3b|IQ3_XXS|13211155424`) — a PIPE to cmd.exe, and pi takes the shell path on
+ *  Windows because it resolves to `pi.cmd`. That is safe here only because `buildShellCommand`
+ *  quotes every argument that is not in its strict safe-character allow-list, and `|` is not in it. */
+function piArgs(ctx: LaunchContext): string[] {
+  return ['--provider', 'turbollm', '--model', ctx.pinnedModel, '--api-key', ctx.authToken]
+}
+
 /** Runs a CLI command to completion, resolving true on exit code 0. Deliberately spawned
  *  WITHOUT a shell: hermes (the only current caller) is a real, directly-executable binary
  *  on every platform (confirmed: a native .exe on Windows, not an npm-style .cmd shim), and
@@ -499,7 +883,22 @@ export type RunCommand = (bin: string, args: string[]) => Promise<boolean>
 
 export const realRunCommand: RunCommand = (bin, args) =>
   new Promise<boolean>((resolve) => {
-    const child = spawn(bin, args, { stdio: 'ignore' })
+    // Resolve first, exactly as realSpawn does, instead of handing `spawn` a bare name.
+    //
+    // A bare `spawn('pi', ['--version'])` FAILS on Windows even when pi is installed: libuv's own
+    // PATHEXT lookup lands on `pi.cmd`, and Node refuses to spawn a `.cmd` without a shell (EINVAL,
+    // a deliberate mitigation). The probe therefore reported "not installed" for every npm-shim CLI
+    // — measured live: the availability endpoint said pi and opencode were missing while both were
+    // on PATH and launchable. `claude` masked this for months by shipping a real `claude.exe`.
+    //
+    // The shell is used ONLY for that shim case, and the command is built by `buildShellCommand`,
+    // which quotes each argument — so this keeps the property the no-shell choice was originally
+    // protecting: our own model keys contain `|`, which cmd.exe would otherwise read as a pipe.
+    // Quoting is what makes that safe, not the absence of a shell.
+    const resolved = resolveExecutable(bin)
+    const child = requiresShell(resolved)
+      ? spawn(buildShellCommand(bin, args), { shell: true, stdio: 'ignore' })
+      : spawn(resolved ?? bin, args, { stdio: 'ignore' })
     child.on('error', () => resolve(false))
     child.on('exit', (code) => resolve(code === 0))
   })
@@ -600,15 +999,104 @@ const PARENT_AGENT_ENV_MARKERS = [
   'CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH',
   'CLAUDE_AGENT_SDK_VERSION',
   'CLAUDE_PID',
+  // ── Cloud-provider credentials (founder-reported live, 2026-08-18) ──────────────────────────
+  // Symptom: pi's `/model` picker listed 38 OpenAI and 22 Google models alongside the 26 TurboLLM
+  // ones. Root-caused by measurement, not guesswork — `~/.pi/agent/auth.json` was EMPTY, but the
+  // daemon's environment carried the founder's own `OPENAI_API_KEY` and `GEMINI_API_KEY`, and pi
+  // treats an env key as auth for its built-in providers (`pi --help`: "--api-key … (defaults to
+  // env vars)"; docs/models.md: unauthed models "load but stay unavailable in /model"). Proven by
+  // running the real binary both ways:
+  //     pi --list-models                              -> 38 openai, 22 google, 26 turbollm
+  //     env -u OPENAI_API_KEY -u GEMINI_API_KEY …     -> 26 turbollm, nothing else
+  //
+  // Stripping them is a correctness fix, not tidying. `turbollm launch <cli>` exists to point a
+  // harness at the LOCAL model on this daemon's gateway; a harness that can still see a paid cloud
+  // provider can silently run turns against it — billing the user and sending their code off-box
+  // for a session they explicitly chose a local model for. Same reasoning that already strips
+  // ANTHROPIC_API_KEY below, applied to the rest of the field.
+  //
+  // A user who genuinely wants a harness on their cloud keys runs that harness directly; going
+  // through `turbollm launch` is the statement that this session is local.
+  'OPENAI_API_KEY',
+  'GEMINI_API_KEY',
+  'GOOGLE_API_KEY',
+  'GOOGLE_GENERATIVE_AI_API_KEY',
+  'AZURE_OPENAI_API_KEY',
+  'XAI_API_KEY',
+  'GROQ_API_KEY',
+  'MISTRAL_API_KEY',
+  'DEEPSEEK_API_KEY',
+  'OPENROUTER_API_KEY',
+  'TOGETHER_API_KEY',
+  'FIREWORKS_API_KEY',
+  'PERPLEXITY_API_KEY',
+  'CEREBRAS_API_KEY',
   'ANTHROPIC_API_KEY',
 ]
 
 /** The environment a launched CLI should inherit: everything this process has, minus any marker
- *  identifying the agent session that started the daemon. Exported for tests. */
-export function inheritedEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+ *  identifying the agent session that started the daemon. Exported for tests.
+ *
+ *  `extra` adds a harness's OWN nested-session markers (CliSpec.parentEnvMarkers) on top of the
+ *  shared list. The shared list applies to every harness, not just claude: the daemon being started
+ *  from inside a Claude Code session is what puts those markers on `process.env` in the first
+ *  place, and `ANTHROPIC_API_KEY` in particular must not leak into ANY harness that might prefer it
+ *  over the credential TurboLLM supplies. */
+export function inheritedEnv(base: NodeJS.ProcessEnv = process.env, extra: readonly string[] = []): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base }
   for (const key of PARENT_AGENT_ENV_MARKERS) delete env[key]
+  for (const key of extra) delete env[key]
   return env
+}
+
+/** Every launch target whose model list lives in a CONFIG FILE we write, so each must be
+ *  re-stamped when the loaded model changes (see syncHarnessModelConfig). Derived from the registry
+ *  rather than hand-listed, so a harness added to SUPPORTED with a `prepareConfig` is covered
+ *  automatically instead of silently going stale. `claude` is absent because it has no config file —
+ *  it learns its context window from an env var set at spawn. */
+export const CONFIG_FILE_HARNESSES: readonly string[] =
+  Object.keys(SUPPORTED).filter((k) => !!SUPPORTED[k].prepareConfig)
+
+/** Rewrite a harness's DURABLE config for the model that is loaded RIGHT NOW.
+ *
+ *  ── Why this exists (founder-reported live, 2026-08-19) ────────────────────────────────────────
+ *  `prepareConfig` runs once, at launch. It stamps the real loaded context window onto whichever
+ *  model was loaded THEN, and every other model gets its native maximum. Switch models mid-session
+ *  and the harness re-reads a file that still describes the old state: measured on the founder's box,
+ *  `qwen3.6-35b-a3b` (loaded at launch) correctly carried 200704 while the newly-loaded
+ *  `qwen3.8-27b|Q3_K_S` showed 262144 — its native max, not the 200704 the engine had actually
+ *  loaded it with. The reported symptom was pi displaying "262k" for a model loaded at ~196k.
+ *
+ *  Re-running the same `prepareConfig` with fresh status closes that. pi re-reads `models.json`
+ *  every time `/model` opens (docs/models.md), so the corrected window is picked up with no restart.
+ *
+ *  ⚠️ Does NOT help a RUNNING opencode session: that one reads its config from the
+ *  `OPENCODE_CONFIG_CONTENT` env var, fixed at spawn time, so its ctx stays as of launch until the
+ *  terminal is relaunched. Rewriting the durable file still fixes the next launch and any hand-run
+ *  `opencode`, which is why it is not skipped. */
+export async function syncHarnessModelConfig(
+  target: string,
+  opts: { port: number; pinnedModel: string; modelName: string; modelCtx?: number; models: ModelEntry[] },
+  fs: ConfigFs = realFs,
+): Promise<PrepareResult> {
+  const spec = SUPPORTED[target]
+  if (!spec?.prepareConfig) return { ok: true } // claude and friends carry no config file — nothing to sync
+  const base = `http://127.0.0.1:${opts.port}`
+  return await spec.prepareConfig(
+    {
+      base,
+      port: opts.port,
+      // The DURABLE file always carries the shared static token, never a session-scoped one — same
+      // rule launchCli follows, and for the same reason (this file outlives the launch).
+      authToken: AUTH_TOKEN,
+      pinnedModel: opts.pinnedModel,
+      modelName: opts.modelName,
+      modelCtx: opts.modelCtx,
+      models: opts.models,
+      fs,
+    },
+    AUTH_TOKEN,
+  )
 }
 
 /** Launch `target` CLI wired to the TurboLLM gateway on 127.0.0.1:<port>. Returns
@@ -735,80 +1223,67 @@ export async function launchCli(
   const modelNote = modelKey ? `model: ${model}` : `using loaded model: ${model}`
   process.stdout.write(`▸ Launching ${spec.label} → TurboLLM  (${modelNote}, ${base})\n`)
 
-  // Config-file tools (opencode/kilo/openclaw): merge a `turbollm` provider into the
-  // tool's own config BEFORE spawning, then spawn with a clean env (no ANTHROPIC_* —
-  // those are meaningless to non-Anthropic-protocol tools).
+  // The whole library, for the harnesses whose model picker can only offer what we write into their
+  // config (see LaunchContext.models). Best-effort: `fetchModels` already returns [] on any network
+  // error, and every consumer falls back to the loaded model alone, so a hiccup degrades the picker
+  // rather than failing the launch. Cheap — it is one loopback request.
+  const libraryModels = spec.prepareConfig ? await fetchModels(base, _fetch) : []
+
+  // Everything a per-harness hook needs, resolved once.
+  const launchCtx: LaunchContext = {
+    base,
+    port,
+    // A session-scoped token (embedded terminal launches) takes priority over the shared static
+    // one, for EVERY harness — not just claude. Before this, the config-file branch below passed
+    // the static AUTH_TOKEN unconditionally and dropped `authToken` on the floor, so the gateway
+    // could not resolve an opencode/pi session back to its Code session and that session silently
+    // lost its thinking-budget override, its reasoning-effort override, its usage attribution and
+    // its tool-call timeline (session-auth.ts + gateway.ts).
+    authToken: authToken ?? AUTH_TOKEN,
+    pinnedModel,
+    modelName: model,
+    modelCtx: status.model?.ctx,
+    parallelSlots,
+    models: libraryModels,
+    fs: _mcpFs,
+  }
+
+  // Config-file tools (opencode/kilo/openclaw/pi/hermes): merge a `turbollm` provider into the
+  // tool's own config BEFORE spawning. Deliberately still keyed to the STATIC token: this file is
+  // durable, shared, and outlives the launch (a later bare `opencode` must stay wired), so a
+  // session-scoped secret must never be written into it. Per-session credentials travel via
+  // `spec.env`/`spec.args` instead.
   if (spec.prepareConfig) {
-    const prep = await spec.prepareConfig(base, AUTH_TOKEN, pinnedModel, model)
+    const prep = await spec.prepareConfig(launchCtx, AUTH_TOKEN)
     if (!prep.ok) {
       process.stderr.write(prep.message + '\n')
       return 1
     }
-    return await spawnWithSessionRecovery(spec, passthrough, {
-      stdio: 'inherit',
-      shell: process.platform === 'win32',
-      env: inheritedEnv(),
-    }, _spawn)
   }
 
+  // Per-harness environment. `inheritedEnv` strips parent-agent markers FIRST, so the harness's
+  // own settings (which for claude include a CLAUDE_CODE_* flag we DO want) are applied on top and
+  // always survive. A harness with no `env` hook gets a clean inherited environment — exactly what
+  // the config-file tools already got before this became spec-driven.
   const env: NodeJS.ProcessEnv = {
-    // Parent-agent markers stripped first, so TurboLLM's own settings below (which include a
-    // CLAUDE_CODE_* flag we DO want) are applied on top and always survive.
-    ...inheritedEnv(),
-    ANTHROPIC_BASE_URL: base,
-    // No auth is enforced on the local gateway; the CLI just needs a non-empty token. A
-    // session-scoped token (embedded terminal launches) takes priority over the shared static
-    // one so the gateway can attribute this session's requests correctly (session-auth.ts).
-    ANTHROPIC_AUTH_TOKEN: authToken ?? AUTH_TOKEN,
-    // Local LLMs are 30–120 s per response — raise Claude Code's request timeout so it
-    // doesn't abort mid-generation. 300 s (5 min) covers even the slowest local model.
-    // Zero retries: retrying a slow local model cold-starts it again and makes things worse.
-    ANTHROPIC_TIMEOUT: '300000',
-    ANTHROPIC_MAX_RETRIES: '0',
-    // Always pin the loaded model's id (key preferred). Claude Code uses the model string
-    // for real client-side bookkeeping even behind a custom base URL — the status line,
-    // `/status`, and context-window / auto-compact sizing all read it — and never validates
-    // it against a cloud catalog when ANTHROPIC_BASE_URL is custom. Pinning to whatever's
-    // actually loaded is therefore safe and fixes those surfaces from silently assuming a
-    // wrong cloud default.
-    ANTHROPIC_MODEL: pinnedModel,
-    // Opt into gateway model discovery: Claude Code queries our /v1/models at startup and
-    // populates the /model picker with the local library (gateway synthesises the entries).
-    CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: '1',
-    // Founder-reported: the ctx-fill display "jumps between full and empty" and the CLI "never
-    // auto-compacts at 80%, always reaches 100% and fails". The second half is Claude Code
-    // assuming a generic ~200K context window for our unrecognized model id and only compacting
-    // near THAT — see clampAutoCompactWindow's own doc comment for the full root cause and its
-    // documented [100_000, 1_000_000] floor/ceiling. Only set when the daemon actually reports a
-    // real ctx (status.model.ctx) — an absent/zero value means "don't know", and guessing a
-    // window here would be worse than leaving the CLI's own generic default in place.
-    ...(status.model?.ctx ? { CLAUDE_CODE_AUTO_COMPACT_WINDOW: String(clampAutoCompactWindow(status.model.ctx)) } : {}),
-    CLAUDE_AUTOCOMPACT_PCT_OVERRIDE,
-    // Cap background-agent fan-out at what the engine can actually run concurrently.
-    //
-    // Claude Code spawns subagents in parallel, and each is a full, independent request to the
-    // gateway. Against a `--parallel 1` llama-server they don't merely queue — they evict each
-    // other's cached prompt prefix, so every one re-prefills from scratch, and each sits on a
-    // held-open connection counting against ANTHROPIC_TIMEOUT above. Telling the CLI the real
-    // number lets IT queue the rest, which is far better than having them all pile into the
-    // gateway and block there.
-    //
-    // The gateway enforces the same limit independently (gateway.ts acquires d.gate), so a CLI
-    // that ignores this — or one a user launched by hand — still cannot exceed the engine. This
-    // is the cooperative half: it makes the excess queue politely client-side instead of being
-    // held at the HTTP layer.
-    ...(parallelSlots ? { CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: String(parallelSlots) } : {}),
+    ...inheritedEnv(process.env, spec.parentEnvMarkers),
+    ...(await spec.env?.(launchCtx) ?? {}),
   }
 
-  // Give this claude launch its routine/agent tools via the daemon's own MCP bridge — see
-  // writeClaudeMcpConfig's doc comment for why. Best-effort: a filesystem hiccup here must not
-  // break the launch itself, only the (already-optional) extra tool access.
-  let args = passthrough
-  try {
-    const mcpConfigPath = await writeClaudeMcpConfig(port, _mcpFs)
-    args = [...passthrough, '--mcp-config', mcpConfigPath]
-  } catch (e) {
-    process.stderr.write(`Note: could not set up TurboLLM's routine/agent tools for this session (${e instanceof Error ? e.message : e}).\n`)
+  // Give this launch its routine/agent tools via the daemon's own MCP bridge — see
+  // writeClaudeMcpConfig's doc comment for why. Only for a harness with a CONFIRMED flag for it
+  // (CliSpec.mcpArgs): opencode instead carries the same bridge inside OPENCODE_CONFIG_CONTENT, and
+  // pi reaches the same information through the gateway's own routine guidance. Best-effort — a
+  // filesystem hiccup here must not break the launch itself, only the (already-optional) extra
+  // tool access.
+  let args = spec.args ? [...passthrough, ...spec.args(launchCtx)] : passthrough
+  if (spec.mcpArgs) {
+    try {
+      const mcpConfigPath = await writeClaudeMcpConfig(port, _mcpFs)
+      args = [...args, ...spec.mcpArgs(mcpConfigPath)]
+    } catch (e) {
+      process.stderr.write(`Note: could not set up TurboLLM's routine/agent tools for this session (${e instanceof Error ? e.message : e}).\n`)
+    }
   }
 
   return await spawnWithSessionRecovery(spec, args, {

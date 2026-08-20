@@ -2,11 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowDown, Diff, Download, Eraser, FolderOpen, GitBranch, MoreHorizontal, PanelLeft, Pencil, RotateCcw } from 'lucide-react'
-import { ApiError, track } from '../../lib/api'
+import { ApiError, syncCodeAgentConfig, track } from '../../lib/api'
 import { skillKeys, fetchSkills } from '../../lib/agent-api'
 import { useModelActions, useModels, useStatus } from '../../lib/queries'
 import { compactCodeSession, execShellCommand, revertCodeSession, sendCodeQueuedTurnNow, startCodeRun, steerOutcomeMessage, stopCodeSession } from '../../lib/code-api'
-import type { QueuedTurn, ShellRun, SteerKind } from '../../lib/code-types'
+import type { CodeAgent, QueuedTurn, ShellRun, SteerKind } from '../../lib/code-types'
 import {
   codeKeys, useClearCodeSession, useCodeSession, useCodeSessionLastUsage, useCodeSessionRename,
   useExportCodeSession, useResumeCodeSession, useUpdateCodeSessionMode, useUpdateCodeSessionThinkingBudget,
@@ -61,6 +61,58 @@ const INIT_AGENTS_PROMPT =
  *  starting a session doesn't feel like landing on a different app. A session
  *  starts with just its seeded task (one user message, no reply yet); this
  *  screen kicks off that first run automatically. */
+/** Harnesses with a VERIFIED in-TUI command that switches the model on a live session, keyed by
+ *  `codeAgent`. Data rather than an `if (codeAgent === 'claude')` branch, so adding a harness is one
+ *  entry — but an entry may only be added once the command has been confirmed against a REAL
+ *  running session of that harness, which is how claude's was established (see handleLoadModel).
+ *
+ *  Deliberately empty for pi and opencode: both have their own `/model` pickers per their docs, but
+ *  neither's direct-argument behaviour has been confirmed the same way, and sending a guessed slash
+ *  command into a live session is exactly the kind of unverified-syntax gamble ADR-293 exists to
+ *  prevent. A missing entry degrades to a truthful toast, not a wrong keystroke. */
+const DIRECT_MODEL_SWITCH: Partial<Record<CodeAgent, (modelKey: string) => string | null>> = {
+  claude: (key) => `/model claude-${key}`,
+  // pi DOES take a direct argument — its own command declares
+  // `{ name: "model", argumentHint: "<provider/model>" }`, and its argument-completion builder emits
+  // values of exactly `${provider}/${id}`, i.e. `turbollm/<our model key>`. (This table originally
+  // said pi had "no verified direct-switch syntax". That was never checked — the command definition
+  // states it plainly.)
+  //
+  // Returns null — falling through to the PICKER — when the key contains WHITESPACE. A slash command
+  // is split on spaces, so `/model turbollm/gemma 4 26b a4b qat|Q4_0|…` would be read as the argument
+  // `turbollm/gemma` plus stray tokens, and would either fail or, worse, match some other model. Ten
+  // of the twenty-six models in the founder's own library have spaces in their key, so this is the
+  // common case, not a corner. Those open the picker (already filtered to TurboLLM's own models);
+  // the rest switch in one step.
+  pi: (key) => (/\s/.test(key) ? null : `/model turbollm/${key}`),
+}
+
+/** Harnesses whose in-TUI model PICKER can be opened by command, for the ones with no verified
+ *  direct-switch syntax. One keystroke short of a direct switch, but it puts the user in front of
+ *  the real list instead of leaving them to find it — and unlike a direct switch it cannot pass a
+ *  wrong argument, because the harness itself renders the choices.
+ *
+ *  Both entries are verified against the real thing, not assumed:
+ *   - pi       `docs/usage.md`: "| `/model` | Switch models |", and it re-reads its provider config
+ *              each time the picker opens, so a model TurboLLM just loaded is already listed.
+ *   - opencode read out of the 1.18.9 binary itself:
+ *              `{name:"model.list", title:"Switch model", slashName:"models", slashAliases:["mo"]}`
+ *              — note the plural `/models`, NOT `/model`. Its `run:()=>{…}` takes no argument, so a
+ *              direct-switch form like claude's `/model claude-<key>` does not exist; the picker is
+ *              the only route, which is exactly what this table is for. (opencode was left out of
+ *              this table at first on the grounds that its commands "weren't verified" — that was an
+ *              unchecked assumption, not a finding; the binary answers the question directly.) */
+const PICKER_MODEL_SWITCH: Partial<Record<CodeAgent, string>> = {
+  pi: '/model',
+  // opencode is deliberately NOT here. Its `model.list` command takes no argument, so the best
+  // this could ever do is OPEN its picker and leave the choosing to the user — which is precisely
+  // what read as "the dropdown isn't changing the model". TerminalToolbar blocks the control for
+  // opencode with an explanation instead (its `blockedReason`), so this path is never reached for
+  // it. Automating the picker (open it, type a name, Enter) was considered and REJECTED: a fuzzy
+  // match landing on the wrong row would silently switch the user to a model they did not choose,
+  // which is worse than not offering the control at all.
+}
+
 export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: boolean; sessionIdOverride?: string } = {}) {
   // `routeSessionId` is THIS component's own route param — only populated when it's mounted on
   // /workspace/code/:sessionId. Embedded (Routines' 3-pane layout, RoutineEditPage.tsx) it renders
@@ -156,17 +208,36 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
       { key },
       {
         onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not load model.'),
-        onSuccess: () => {
+        onSuccess: async () => {
           if (isTerminalSession) {
-            if (session?.codeAgent === 'claude') {
-              // Verified direct-switch alias, this agent only (see comment above) — pi/opencode
-              // have their OWN /model pickers (per their own docs) but their direct-argument
-              // behavior hasn't been verified the same way, so fall through to the safer
-              // open-the-picker path for them instead of guessing at their exact syntax.
-              terminalViewRef.current?.sendCommand(`/model claude-${key}`)
+            // Re-stamp the harness's config with the model that was JUST loaded, before telling it
+            // to switch. Its config was written at launch, where every model except the launch-time
+            // one carries its NATIVE context max — so without this the harness switches to the right
+            // model but believes the wrong context window (founder-reported: "262k" for a model
+            // loaded at ~196k). Best-effort: a config that can't be rewritten must not turn a
+            // successful load into an error, so this never blocks the switch below.
+            if (session?.codeAgent) {
+              try { await syncCodeAgentConfig(session.codeAgent) } catch { /* keep the previous config */ }
+            }
+            const direct = session?.codeAgent ? DIRECT_MODEL_SWITCH[session.codeAgent]?.(key) : undefined
+            const picker = session?.codeAgent ? PICKER_MODEL_SWITCH[session.codeAgent] : undefined
+            if (direct) {
+              terminalViewRef.current?.sendCommand(direct)
+            } else if (picker) {
+              // A BARE slash command (no argument) leaves opencode's autocomplete dropdown open,
+              // and its first Enter is consumed accepting the suggestion — so the command needs a
+              // second Enter to actually run. Measured in a real PTY: without it the picker never
+              // opened, which is exactly the founder-reported "model picker is not changing the
+              // model". Safe to key off the absence of an argument: a command WITH one dismisses
+              // the dropdown, which is why the direct-switch forms never needed this.
+              terminalViewRef.current?.sendCommand(picker, { confirmAutocomplete: !picker.includes(' ') })
+              toast.info('Model loaded — pick it from the picker now open in the terminal.')
             } else {
-              terminalViewRef.current?.sendCommand('/model')
-              toast.info('Model loaded — pick it from the /model picker now open in the terminal.')
+              // No verified in-TUI switch command for this harness, so nothing is SENT — typing a
+              // guessed slash command into someone's session would at best print "unknown command"
+              // while this toast claimed a picker had opened. The model really is loaded, so the
+              // honest thing is to say so and let the user switch inside the harness itself.
+              toast.info(`Model loaded. Switch to it inside ${session?.codeAgent ?? 'the agent'} to use it for the next turn.`)
             }
           }
         },

@@ -1,4 +1,5 @@
 import type { CodingAgentChoice, Routine, RoutineFlavor, RoutinePermissionMode, ScheduleRule } from './routine-types'
+import { CODING_AGENT_CHOICES } from './routine-types'
 
 /** The panel form's working state. Deliberately has no `scheduleDisplay`: that string is derived
  *  from `scheduleRule` by {@link describeScheduleRule} at submit time, so the two can never drift
@@ -85,5 +86,5 @@ export function isRoutineDraftComplete(d: RoutineDraft): boolean {
     }
   }
   if (d.flavor === 'chat') return !!d.agentId?.trim()
-  return !!d.workspacePath?.trim() && (d.codingAgent === 'pi' || d.codingAgent === 'claude_cli')
+  return !!d.workspacePath?.trim() && !!d.codingAgent && CODING_AGENT_CHOICES.includes(d.codingAgent)
 }

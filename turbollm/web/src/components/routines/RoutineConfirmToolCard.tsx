@@ -40,7 +40,8 @@ import { Loader2 } from 'lucide-react'
 import { RoutineConfirmCard } from './RoutineConfirmCard'
 import { useRoutine } from '../../lib/routine-queries'
 import { routineToDraft, type RoutineDraft } from '../../lib/routine-form'
-import type { ScheduleRule } from '../../lib/routine-types'
+import type { CodingAgentChoice, ScheduleRule } from '../../lib/routine-types'
+import { CODING_AGENT_CHOICES } from '../../lib/routine-types'
 
 /** The slice of `ToolCallRecord`/`LiveToolCall` this card reads. Structural, so both satisfy it
  *  without an adapter — and narrow, so it cannot quietly grow a dependency on a field only one of
@@ -201,7 +202,11 @@ export function applyUpdateArgs(base: RoutineDraft, args: Record<string, unknown
   if (typeof args.prompt === 'string') next.prompt = args.prompt
   if (typeof args.modelKey === 'string') next.modelKey = args.modelKey
   if (typeof args.workspacePath === 'string') next.workspacePath = args.workspacePath
-  if (args.codingAgent === 'pi' || args.codingAgent === 'claude_cli') next.codingAgent = args.codingAgent
+  // Membership test against the shared list rather than a hand-written chain — a new harness added
+  // to routine-types.ts must not need a fifth `||` here to survive the passthrough.
+  if (typeof args.codingAgent === 'string' && (CODING_AGENT_CHOICES as readonly string[]).includes(args.codingAgent)) {
+    next.codingAgent = args.codingAgent as CodingAgentChoice
+  }
   if (args.permissionMode === 'auto' || args.permissionMode === 'plan' || args.permissionMode === 'ask') {
     next.permissionMode = args.permissionMode
   }

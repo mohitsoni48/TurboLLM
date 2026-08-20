@@ -65,9 +65,25 @@ export function resolveExecutable(
     ? (env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean).map((e) => e.toLowerCase())
     : ['']
 
+  // An explicit extension is honoured as-is; only an extension-less command gets PATHEXT applied.
+  //
+  // ── The bare name is NOT a candidate on Windows (founder-reported, 2026-08-18) ──────────────
+  // Symptom: a Code session on `pi` died instantly with "pi is not installed or not on your PATH",
+  // followed by a ConPTY abort (`Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)`), even
+  // though pi WAS installed and `C:\Users\<u>\AppData\Roaming\npm` was on PATH.
+  //
+  // Cause: npm installs THREE files per global bin — an extension-less Unix shell script (`pi`),
+  // plus `pi.cmd` and `pi.ps1`. Listing `base` first meant the extension-less shim won, and
+  // `isExecutableFile` returns true for ANY file on Windows (there is no x-bit), so it looked like
+  // a hit. `requiresShell` then saw no extension, concluded "real executable, no shell needed", and
+  // spawned a bash script as a Windows process — ENOENT, every time. `pi.cmd`, sitting right beside
+  // it and perfectly launchable, was never tried.
+  //
+  // Windows only executes files whose extension is in PATHEXT, so on win32 an extension-less
+  // command must resolve ONLY through PATHEXT. `claude` was unaffected purely because it ships a
+  // real `claude.exe`, which is why this survived until pi/opencode became launchable.
   const candidates = (base: string): string[] =>
-    // An explicit extension is honoured as-is; only an extension-less command gets PATHEXT applied.
-    extname(base) ? [base] : [base, ...exts.map((e) => base + e)]
+    extname(base) ? [base] : win32 ? exts.map((e) => base + e) : [base]
 
   // An absolute or explicitly-relative command is not looked up on PATH — same as the OS.
   if (isAbsolute(command) || command.startsWith('./') || command.startsWith('.\\')) {

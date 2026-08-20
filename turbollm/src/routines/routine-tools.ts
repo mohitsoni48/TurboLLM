@@ -61,6 +61,7 @@
 // If that REST decision is ever revisited, change it there first and mirror it here.
 import type { ConversationStore } from '../chat/db'
 import type { Routine, RoutineFlavor, ScheduleRule, CodingAgentChoice } from './schema'
+import { CODING_AGENT_CHOICES } from './schema'
 import { computeNextFireTime } from './schedule'
 import { validateCreate, validateUpdate, CODE_GATE_MESSAGE, type RoutineBody } from './routine-routes'
 
@@ -156,7 +157,10 @@ export const CREATE_ROUTINE_TOOL = {
         modelKey: { type: 'string', description: 'One of TurboLLM\'s own model keys — a compound id (e.g. "gemma 4 26b a4b qat|Q4_0|14439362752"), never a generic name like "gpt-4" or "claude". Call list_models first if you don\'t already know a real one; never guess.' },
         agentId: { type: 'string', description: 'Required when flavor is "chat": an existing Customize -> Agents persona id.' },
         workspacePath: { type: 'string', description: 'Required when flavor is "code": absolute path to the workspace directory.' },
-        codingAgent: { type: 'string', enum: ['pi', 'claude_cli'], description: 'Required when flavor is "code": which coding-agent implementation to pin.' },
+        // Driven off schema.ts's list, not a second hand-maintained copy: this enum is what a MODEL
+        // is allowed to pass, so a copy left behind makes the new harnesses unreachable from chat
+        // and from the MCP bridge even after every REST validator accepts them.
+        codingAgent: { type: 'string', enum: [...CODING_AGENT_CHOICES], description: 'Required when flavor is "code": which coding-agent implementation to pin. "pi" is the in-app engine; the *_cli values launch that CLI in a terminal.' },
         permissionMode: { type: 'string', enum: ['auto', 'plan', 'ask'], description: 'Optional, code flavor only: Code\'s permission mode for this routine\'s runs.' },
       },
       required: ['flavor', 'prompt', 'scheduleDisplay', 'scheduleRule', 'modelKey'],
@@ -246,7 +250,7 @@ export const UPDATE_ROUTINE_TOOL = {
         scheduleRule: SCHEDULE_RULE_SCHEMA,
         modelKey: { type: 'string' },
         workspacePath: { type: 'string' },
-        codingAgent: { type: 'string', enum: ['pi', 'claude_cli'] },
+        codingAgent: { type: 'string', enum: [...CODING_AGENT_CHOICES] },
         permissionMode: { type: 'string', enum: ['auto', 'plan', 'ask'] },
         confirm: { type: 'boolean', description: 'Must be true to actually apply the change. Omit or pass false to preview the diff only.' },
       },

@@ -29,6 +29,8 @@ import { agentCwd, createSessionWorktree, removeSessionWorktree } from './worktr
 import { codeSessionExportFilename, serializeCodeSessionMarkdown } from './session-export'
 import { commitGitChanges, getGithubCompareUrl, getGitStatus, pushGitBranch } from './git-actions'
 import { runShellCommand, shellContextText } from './code-shell'
+import { agentAvailability, installAgent } from './agent-availability'
+import { syncHarnessModelConfig } from '../cli-launch'
 import { agentsMdPresence } from './persona'
 import type { CodeMode } from './persona'
 import { sessionAuth } from './session-auth'
@@ -201,6 +203,46 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
 
   // ── launchpad "Coding activity" stats ─────────────────────────────────────────
   // Real numbers (db.ts's codeStats) — replaces code-mock.ts's always-fake CODE_STATS.
+  // ── which terminal-agent CLIs are installed on this machine ───────────────────────────────
+  // Reported rather than guessed at, so the picker can refuse to select a harness that would only
+  // fail at session-open (founder-reported live: choosing `pi` opened a terminal that immediately
+  // printed "pi is not installed or not on your PATH" and then sat there dead). Deliberately does
+  // NOT send label/description: those live in the frontend's own CODE_AGENTS, and duplicating them
+  // here would give the same copy two owners.
+  app.get('/api/v1/code/agents', async (c) => c.json({ agents: await agentAvailability() }))
+
+  // ── install a missing terminal-agent CLI ──────────────────────────────────────────────────
+  // Runs that harness's own registered install command (cli-launch.ts's SUPPORTED). The client
+  // chooses only WHICH known agent id — never the command itself — so there is no path from a
+  // request body to an arbitrary shell command.
+  app.post('/api/v1/code/agents/:id/install', async (c) => {
+    const id = c.req.param('id')
+    const result = await installAgent(id)
+    if (!result.ok) return err(c, 400, 'install_failed', result.message)
+    return c.json({ ok: true }, 200)
+  })
+
+  // ── re-stamp a harness's config with the CURRENTLY loaded model ───────────────────────────
+  // Called by the Code toolbar right after it loads a model, BEFORE it sends the harness's own
+  // switch command. Without it the harness reads a config written at launch, where every model
+  // except the launch-time one carries its NATIVE max rather than the ctx the engine actually
+  // loaded — founder-reported as pi showing "262k" for a model loaded at ~196k.
+  app.post('/api/v1/code/agents/:id/sync-config', async (c) => {
+    const st = d.manager.status()
+    if (st.state !== 'running' || !st.model?.key) return err(c, 409, 'no_model_loaded', 'No model is loaded.')
+    const result = await syncHarnessModelConfig(c.req.param('id'), {
+      port: d.store.snapshot().daemon.port,
+      pinnedModel: st.model.key,
+      modelName: st.model.name ?? st.model.key,
+      modelCtx: st.model.ctx,
+      models: d.scanner.list().models,
+    })
+    // Best-effort by design: a config we cannot safely rewrite (a commented file) must not turn a
+    // successful model load into a failed one. The harness keeps its previous, still-valid config.
+    if (!result.ok) return c.json({ ok: false, message: result.message }, 200)
+    return c.json({ ok: true }, 200)
+  })
+
   app.get('/api/v1/code/stats', (c) => {
     const q = c.req.query('range')
     const range = q === '30d' || q === '7d' ? q : 'all'

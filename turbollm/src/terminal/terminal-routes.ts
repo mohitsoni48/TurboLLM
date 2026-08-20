@@ -25,7 +25,7 @@ import { existsSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { isLocalUpgrade, verifyKeyValue } from '../auth'
 import { sessionAuth } from '../code/session-auth'
-import { claudePermissionModeChoices, resolveClaudePermissionMode } from './agent-modes'
+import { claudePermissionModeChoices, permissionModeArgs } from './agent-modes'
 import { TerminalManager } from './terminal-manager'
 import { quotePtyShellArg } from '../util/shell-command'
 import { agentCwd } from '../code/worktree'
@@ -47,8 +47,36 @@ const require = createRequire(import.meta.url)
 // CLI's session id, so no separate id-mapping table is needed; the existing row IS the map.
 // Only agents with CONFIRMED flag syntax are listed — an unlisted agent still starts fresh
 // every time (today's behavior for all of them) rather than guessing unverified CLI syntax.
-const AGENT_SESSION_ID_FLAGS: Partial<Record<string, { first: string; resume: string }>> = {
-  claude: { first: '--session-id', resume: '--resume' },
+// Three shapes exist among real harnesses, so this is a tagged union rather than a flag pair:
+//
+//   'pair'   claude 2.1.232 — two mutually exclusive flags, and passing the wrong one is a hard
+//            startup failure. cli-launch.ts's spawnWithSessionRecovery swaps them on a fast death.
+//   'single' pi 0.84.2 — `--session-id <id>` is documented as "Use exact project session ID,
+//            CREATING IT IF MISSING". One flag both registers and resumes, so there is nothing to
+//            mismatch and no recovery needed. Strictly better than claude's arrangement.
+//   absent   opencode 1.18.9 — offers NO way to register a caller-chosen id. `-s/--session` is
+//            "session id to continue", and `opencode session` exposes only `list` and `delete`
+//            (probed) — there is no create. Its ids are its own, not our run.id.
+//            Deliberately NOT falling back to `-c/--continue`: that resumes "the last session"
+//            by directory recency, which is the exact ambiguity ADR-293 fixed — two Code sessions
+//            sharing a repoRoot would silently steal each other's conversation. So an opencode
+//            session starts fresh after a daemon restart. That is a real, measured limitation, and
+//            a fresh session is far better than the wrong one.
+type SessionIdFlags =
+  | { kind: 'pair'; first: string; resume: string }
+  | { kind: 'single'; flag: string }
+
+const AGENT_SESSION_ID_FLAGS: Partial<Record<string, SessionIdFlags>> = {
+  claude: { kind: 'pair', first: '--session-id', resume: '--resume' },
+  pi: { kind: 'single', flag: '--session-id' },
+}
+
+/** The session-id argument for this launch, or '' when the harness supports none. */
+function sessionIdArg(agent: string, sessionId: string, launchedOnce: boolean): string {
+  const flags = AGENT_SESSION_ID_FLAGS[agent]
+  if (!flags) return ''
+  if (flags.kind === 'single') return ` ${flags.flag} ${sessionId}`
+  return ` ${launchedOnce ? flags.resume : flags.first} ${sessionId}`
 }
 
 // ── Web tools are permission-gated, and "auto" did not cover them ───────────────────────
@@ -64,8 +92,29 @@ const AGENT_SESSION_ID_FLAGS: Partial<Record<string, { first: string; resume: st
 // exist to enforce: every edit and every shell command still prompts exactly as before. Notably
 // this is NOT `bypassPermissions`, which would disable every check at once (the same reason
 // agent-modes.ts deliberately refuses to map any TurboLLM mode onto it).
+// Per harness, because the tool NAMES differ and a wrong one is either ignored or a hard error:
+//   claude 2.1.232 — PascalCase `WebSearch`/`WebFetch`, passed via variadic `--allowedTools`.
+//   opencode 1.18.9 — lowercase permission strings (`websearch`, `webfetch`), and its `--auto`
+//     already auto-approves everything not explicitly denied, so there is nothing left to
+//     pre-allow: an extra list would be redundant at best. Deliberately absent.
+//   pi 0.84.2 — has no permission gate to pre-allow past (see agent-modes.ts's piModeArgs), and
+//     its `--tools` is an ALLOWLIST that would *restrict* pi to only those two tools if passed.
+//     Passing it here would be actively harmful. Deliberately absent.
 const AUTO_MODE_ALLOWED_TOOLS: Partial<Record<string, readonly string[]>> = {
   claude: ['WebSearch', 'WebFetch'],
+}
+
+/** How a harness takes an opening prompt on its own command line.
+ *   - 'positional' — claude 2.1.232 (`claude [options] [prompt]`) and pi 0.84.2
+ *     (`pi [options] [@files...] [messages...]`), both auto-SUBMIT it.
+ *   - 'flag'       — opencode 1.18.9's TUI takes `--prompt <string>`, which is safer than a
+ *     positional because it can never be swallowed by a preceding variadic option.
+ *   - absent       — no verified mechanism; the message is not seeded and the user retypes it,
+ *     exactly as before seeding existed. */
+const AGENT_PROMPT_STYLE: Partial<Record<string, 'positional' | 'flag'>> = {
+  claude: 'positional',
+  pi: 'positional',
+  opencode: 'flag',
 }
 
 // ── Seeding the session's FIRST message (founder-reported, 2026-08-01) ────────────────────────
@@ -136,7 +185,12 @@ export function normalizeSeededMessage(message: string): string {
  *  (line breaks/tabs already folded) — a message that's only "unseedable" because of a newline is
  *  seedable once folded; `MAX_SEEDED_MESSAGE_CHARS` and UNSEEDABLE both apply to that same text. */
 export function canSeedFirstMessage(message: string, agent: string): boolean {
-  if (agent !== 'claude') return false
+  // Gated on the harness having a VERIFIED way to take an opening prompt (AGENT_PROMPT_STYLE), not
+  // on it being claude. The character restrictions below still apply to every harness without
+  // exception: the mangling they guard against happens in the `powershell -Command "…"` wrapper
+  // pty-session.ts spawns, OUTSIDE the CLI, so it is identical no matter which CLI is inside — even
+  // for opencode, whose `--prompt` flag is otherwise the safest of the three.
+  if (!AGENT_PROMPT_STYLE[agent]) return false
   const normalized = normalizeSeededMessage(message)
   if (normalized.length === 0 || normalized.length > MAX_SEEDED_MESSAGE_CHARS) return false
   if (UNSEEDABLE.test(normalized)) return false
@@ -150,10 +204,12 @@ export function canSeedFirstMessage(message: string, agent: string): boolean {
  *  session id (run.id) — passed as the CLI's OWN session id too, so "which conversation to
  *  resume" is never ambiguous even when two Code sessions share a repoRoot.
  *
- *  `permissionMode` carries the session's TurboLLM mode (auto/plan/ask) across to the CLI's own
- *  permission mode — already resolved to a value THIS CLI accepts by agent-modes.ts, which is why
- *  it arrives as a string rather than being mapped here. Null/undefined appends nothing, so an
- *  agent with no confirmed mapping (everything except claude) launches exactly as before.
+ *  `permissionMode` carries the session's TurboLLM mode (auto/plan/ask) across to the CLI's own —
+ *  already resolved by agent-modes.ts's `permissionModeArgs` into the FULL argument text this
+ *  harness needs (`--permission-mode auto`, `--auto`, `--agent plan`, `--exclude-tools edit,write`),
+ *  which is why it arrives as an opaque string rather than being mapped here: the harnesses do not
+ *  share a flag shape. Null/undefined appends nothing, so an agent with no confirmed mapping
+ *  launches in its own default, exactly as before.
  *  Everything after `launch <agent>` that isn't one of our own flags is forwarded to the CLI
  *  verbatim by cli.ts's passthrough filter — `--permission-mode` included.
  *
@@ -168,25 +224,34 @@ export function buildTerminalLaunchCommand(
   mode?: string | null,
   firstMessage?: string | null,
 ): string {
-  const flags = AGENT_SESSION_ID_FLAGS[agent]
-  const sessionArg = flags ? ` ${launchedOnce ? flags.resume : flags.first} ${sessionId}` : ''
-  const modeArg = permissionMode ? ` --permission-mode ${permissionMode}` : ''
+  const sessionArg = sessionIdArg(agent, sessionId, launchedOnce)
+  // `permissionMode` now arrives as the harness's ALREADY-RESOLVED argument list (agent-modes.ts's
+  // permissionModeArgs), because the harnesses do not share a flag shape — claude takes
+  // `--permission-mode <value>`, opencode takes a bare `--auto` or a different flag entirely
+  // (`--agent plan`), and pi takes `--exclude-tools <list>`. Joining a pre-resolved list here is
+  // what lets all three be expressed without a branch per harness.
+  const modeArg = permissionMode ? ` ${permissionMode}` : ''
   const allowed = mode === 'auto' ? AUTO_MODE_ALLOWED_TOOLS[agent] : undefined
   const allowedArg = allowed?.length ? ` --allowedTools ${allowed.join(',')}` : ''
-  // FIRST, before any flag, and quoted for the shell pty-session.ts spawns.
-  //
-  // Position is load-bearing, not stylistic: `--allowedTools, --allowed-tools <tools...>` is
-  // VARIADIC in the CLI's own `--help`, so it consumes every token that follows it. Placed at the
-  // end, the prompt was silently eaten as one more tool name and the session opened empty —
-  // measured, after the first version of this did exactly that (ctx stayed 0%, no turn ran).
-  // Leading it keeps it clear of that and of any future variadic option.
-  //
   // Quoting matters more than usual here — this is arbitrary user prose reaching a command line,
   // where an apostrophe in "don't" would otherwise terminate the string.
-  const promptArg = firstMessage && canSeedFirstMessage(firstMessage, agent)
-    ? ` ${quotePtyShellArg(normalizeSeededMessage(firstMessage))}`
-    : ''
-  return `turbollm launch ${agent}${promptArg} --port ${port} --token ${token}${sessionArg}${modeArg}${allowedArg}`
+  const seedable = firstMessage && canSeedFirstMessage(firstMessage, agent)
+  const quotedPrompt = seedable ? quotePtyShellArg(normalizeSeededMessage(firstMessage)) : ''
+  // A POSITIONAL prompt goes FIRST, before any flag. Position is load-bearing, not stylistic:
+  // `--allowedTools, --allowed-tools <tools...>` is VARIADIC in claude's own `--help`, so it
+  // consumes every token that follows it. Placed at the end, the prompt was silently eaten as one
+  // more tool name and the session opened empty — measured, after the first version of this did
+  // exactly that (ctx stayed 0%, no turn ran). Leading it keeps it clear of that and of any future
+  // variadic option. A FLAG-style prompt (opencode's `--prompt`) is immune to that by construction,
+  // so it is appended at the end where it reads naturally.
+  const style = AGENT_PROMPT_STYLE[agent]
+  const leadingPrompt = seedable && style === 'positional' ? ` ${quotedPrompt}` : ''
+  const trailingPrompt = seedable && style === 'flag' ? ` --prompt ${quotedPrompt}` : ''
+  // `--code-session-id` is OUR id, always passed, and is what the launcher reports back on exit
+  // (cli.ts). It is deliberately separate from `sessionArg`, which is the HARNESS's own session flag
+  // and does not exist for every harness — keying the exit report off that left opencode sessions
+  // permanently stranded. cli.ts filters this flag out of the passthrough, so no harness ever sees it.
+  return `turbollm launch ${agent}${leadingPrompt} --port ${port} --token ${token} --code-session-id ${sessionId}${sessionArg}${modeArg}${allowedArg}${trailingPrompt}`
 }
 
 // ── types ──────────────────────────────────────────────────────────────
@@ -282,10 +347,12 @@ export async function createAgentTerminal(
     const port = d.store.snapshot().daemon.port
     const token = sessionAuth.mint(run.id)
     const mode = opts.mode ?? d.db.getConversation(run.convId)?.agentMode ?? 'auto'
-    const permissionMode = resolveClaudePermissionMode(mode, await claudePermissionModeChoices())
+    // Only claude's mapping needs the `--help` probe (its accepted value list changed across
+    // versions); every other harness's mapping is static, so it is not paid for them.
+    const modeArgs = permissionModeArgs(agent, mode, agent === 'claude' ? await claudePermissionModeChoices() : [])
     const launchCommand = buildTerminalLaunchCommand(
       agent, port, token, run.id, !!run.terminalLaunchedOnce,
-      agent === 'claude' ? permissionMode : null,
+      modeArgs.length > 0 ? modeArgs.join(' ') : null,
       mode,
       opts.firstMessage,
     )

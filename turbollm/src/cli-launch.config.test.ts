@@ -45,10 +45,14 @@ test('prepareOpencode: writes a turbollm provider on a fresh (absent) config', a
   assert.deepEqual(res, { ok: true })
 
   const cfg = JSON.parse(fs.files.get(opencodePath)!)
+  // Keyed by the model KEY, with the display name alongside — NOT keyed by the name as this
+  // originally was. Two library entries can share a name (the same model at two quantisations),
+  // which silently collided into one picker entry, and the key is what the gateway actually routes
+  // on (`/v1/models` advertises keys, and resolveModelKey matches an exact key first).
   assert.deepEqual(cfg.provider.turbollm, {
     npm: '@ai-sdk/openai-compatible',
     options: { baseURL: `${BASE}/v1`, apiKey: TOKEN },
-    models: { 'Qwen3 8B': { id: 'Qwen3 8B' } },
+    models: { 'qwen3-8b': { id: 'qwen3-8b', name: 'Qwen3 8B' } },
   })
 })
 
@@ -113,9 +117,29 @@ test('prepareKilo: writes opencode-shaped provider + a default model string', as
 
   const cfg = JSON.parse(fs.files.get(kiloPath)!)
   // kilo rejects an array-form `models` (empirically: "Expected object") — must be an object map.
-  assert.deepEqual(cfg.provider.turbollm.models, { 'Qwen3 8B': { id: 'Qwen3 8B' } })
+  // Keyed by model KEY with the display name alongside, exactly as prepareOpencode does: this test
+  // used to pin the NAME as the key, which is the bug. A real library contains name collisions (the
+  // same model at four quantisations), and a name-keyed map silently collapsed them into one picker
+  // row; the key is also what the gateway routes on. Verified applicable to kilo specifically —
+  // its own bundled models-snapshot.json entries carry the same id/name/limit shape as opencode's.
+  assert.deepEqual(cfg.provider.turbollm.models, { 'qwen3-8b': { id: 'qwen3-8b', name: 'Qwen3 8B' } })
   assert.equal(cfg.provider.turbollm.npm, '@ai-sdk/openai-compatible')
-  assert.equal(cfg.model, 'turbollm/Qwen3 8B', 'default model is provider/mapKey')
+  assert.equal(cfg.model, 'turbollm/qwen3-8b', 'default model is provider/mapKey — so it must be the KEY')
+})
+
+test('prepareKilo: writes the WHOLE library, so its picker is a real picker', async () => {
+  // Same fix as opencode: a config-file harness can only offer what we write, and writing one entry
+  // left a one-row picker.
+  const fs = memFs()
+  await prepareKilo(BASE, TOKEN, 'b|Q4|2', 'Model B', fs, 32768, [
+    { key: 'a|Q4|1', name: 'Model A', nativeCtx: 262144 },
+    { key: 'b|Q4|2', name: 'Model B', nativeCtx: 262144 },
+  ])
+  const cfg = JSON.parse(fs.files.get(kiloPath)!)
+  assert.deepEqual(Object.keys(cfg.provider.turbollm.models), ['a|Q4|1', 'b|Q4|2'])
+  assert.equal(cfg.provider.turbollm.models['b|Q4|2'].limit.context, 32768, 'loaded model: real loaded ctx')
+  assert.equal(cfg.provider.turbollm.models['a|Q4|1'].limit.context, 262144, 'others: native ctx')
+  assert.equal(cfg.model, 'turbollm/b|Q4|2')
 })
 
 test('prepareKilo: a real-shaped kilo.jsonc (comments, already wired to us) succeeds without rewriting', async () => {
