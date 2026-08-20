@@ -1,8 +1,13 @@
 // turbollm/src/ext/idempotency.test.ts
 //
-// IdempotencyStore (spec 27 §7.6). The commit point under test elsewhere (routes.runs.ts) is
-// run creation, before the engine is touched — these tests cover the store's own contract in
-// isolation: replay, tenant scoping, and TTL expiry.
+// IdempotencyStore (spec 27 §7.6). These tests cover the store's own contract in isolation:
+// replay, tenant scoping, and TTL expiry. The commit-point property itself — that the store is
+// written at creation, before the engine is touched, so a retry during a long generation
+// reattaches instead of starting a second run — is exercised at the route level, where the
+// store is actually wired in: `routes.runs.test.ts` ("a duplicate Idempotency-Key on the
+// generate path reattaches to the same run instead of starting a second one") and
+// `routes.chats.test.ts` ("a duplicate Idempotency-Key on POST /chats returns the same chat
+// rather than creating a second one").
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { IdempotencyStore } from './idempotency.js'

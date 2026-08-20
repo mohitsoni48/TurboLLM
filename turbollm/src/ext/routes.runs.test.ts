@@ -13,11 +13,14 @@ import { ChatStoreRouter } from '../chat/store/router.js'
 import { hashKey } from '../auth.js'
 import { PublicRunManager } from './run-manager.js'
 import { registerExtChatRoutes } from './routes.chats.js'
-import { registerExtRunRoutes } from './routes.runs.js'
+import { registerExtRunRoutes, type ExtRouteDeps } from './routes.runs.js'
+import { IdempotencyStore } from './idempotency.js'
+import { TenantLimiter } from './limits.js'
 
 const ACME = 'Bearer tllm-ext-acme'
+const GLOBEX = 'Bearer tllm-ext-globex'
 
-function harness(bodyFactory?: () => Promise<{ status: 'complete' | 'aborted' }>) {
+function harness(bodyFactory?: () => Promise<{ status: 'complete' | 'aborted' }>, ext?: ExtRouteDeps) {
   const dir = mkdtempSync(join(tmpdir(), 'turbollm-ext-runs-'))
   const conv = new ConversationStore(dir)
   const d = {
@@ -25,19 +28,22 @@ function harness(bodyFactory?: () => Promise<{ status: 'complete' | 'aborted' }>
     // resolveTenantFromKey (ext/auth.ts) hashes the presented key with the real SHA-256
     // derivation before comparing (see routes.chats.test.ts's identical convention) — stored
     // keys hold only the hash, never the raw value, so the fixture must too.
-    store: { snapshot: () => ({ apiKeys: [{ hash: hashKey('tllm-ext-acme'), tenant: 'acme' }] }) },
+    store: { snapshot: () => ({ apiKeys: [
+      { hash: hashKey('tllm-ext-acme'), tenant: 'acme' },
+      { hash: hashKey('tllm-ext-globex'), tenant: 'globex' },
+    ] }) },
     manager: { status: () => ({ state: 'running', model: 'test-model' }), target: () => 'http://127.0.0.1:9999' },
   } as never
   const runs = new PublicRunManager()
   const app = new Hono()
-  registerExtChatRoutes(app, d)
+  registerExtChatRoutes(app, d, ext)
   registerExtRunRoutes(app, d, runs, {
     makeBody: () => async ({ emit }) => {
       await emit({ event: 'delta', data: { content: 'hello' } })
       await emit({ event: 'delta', data: { content: ' world' } })
       return bodyFactory ? await bodyFactory() : { status: 'complete' as const }
     },
-  })
+  }, ext)
   return { app, runs, cleanup: () => { conv.close(); rmSync(dir, { recursive: true, force: true }) } }
 }
 
@@ -47,8 +53,8 @@ const post = (auth: string, b: unknown, accept = 'application/json') => ({
   body: JSON.stringify(b),
 })
 
-async function newChat(app: Hono) {
-  const res = await app.request('/api/ext/v1/chats', post(ACME, { title: 'Run', owner: 'u1' }))
+async function newChat(app: Hono, auth = ACME) {
+  const res = await app.request('/api/ext/v1/chats', post(auth, { title: 'Run', owner: 'u1' }))
   return (await res.json() as { id: string }).id
 }
 
@@ -215,6 +221,131 @@ test('dropping the SSE connection does not abort the run', async () => {
     release!()
     await runs.settled(run.id)
     assert.equal(runs.get(run.id)?.status, 'complete', 'the run must finish normally — the dropped stream must not abort it')
+  } finally {
+    cleanup()
+  }
+})
+
+// Idempotency (spec 27 §7.6), fix round: the generate path is the other commit point the spec
+// names. The commit happens at run CREATION (immediately after `runs.start()`, before the
+// injected body's own engine work runs) — a retry landing anywhere after that point must
+// reattach to the SAME run instead of persisting a second user/assistant pair or starting a
+// second generation. A key is opt-in: no header behaves exactly as every other test in this
+// file already covers.
+test('a duplicate Idempotency-Key on the generate path reattaches to the same run instead of starting a second one', async () => {
+  const { app, runs, cleanup } = harness()
+  try {
+    const chatId = await newChat(app)
+    const genPost = (content: string) => ({
+      method: 'POST',
+      headers: { Authorization: ACME, 'Content-Type': 'application/json', 'Idempotency-Key': 'ik-gen-1' },
+      body: JSON.stringify({ role: 'user', content, owner: 'u1' }),
+    })
+
+    const first = await app.request(`/api/ext/v1/chats/${chatId}/messages`, genPost('hi'))
+    assert.equal(first.status, 202)
+    const run1 = await first.json() as { id: string }
+    await runs.settled(run1.id)
+
+    // Retry with the SAME key but DIFFERENT content — proving this reattaches rather than
+    // starting a fresh generation from the new body.
+    const second = await app.request(`/api/ext/v1/chats/${chatId}/messages`, genPost('hi again'))
+    assert.equal(second.status, 202)
+    const run2 = await second.json() as { id: string }
+    assert.equal(run2.id, run1.id, 'the replay must reattach to the SAME run, not start a new one')
+
+    const list = await app.request(`/api/ext/v1/chats/${chatId}/messages?owner=u1`, { headers: { Authorization: ACME } })
+    const page = await list.json() as { data: Array<{ role: string }> }
+    assert.deepEqual(page.data.map((m) => m.role), ['user', 'assistant'], 'the replay must not persist a second user/assistant pair')
+  } finally {
+    cleanup()
+  }
+})
+
+test('a duplicate Idempotency-Key still works when the retry asks for SSE the first request did not', async () => {
+  const { app, runs, cleanup } = harness()
+  try {
+    const chatId = await newChat(app)
+    const first = await app.request(`/api/ext/v1/chats/${chatId}/messages`, {
+      method: 'POST',
+      headers: { Authorization: ACME, 'Content-Type': 'application/json', 'Idempotency-Key': 'ik-gen-2' },
+      body: JSON.stringify({ role: 'user', content: 'hi', owner: 'u1' }),
+    })
+    const run1 = await first.json() as { id: string }
+    await runs.settled(run1.id)
+
+    const replay = await app.request(`/api/ext/v1/chats/${chatId}/messages`, {
+      method: 'POST',
+      headers: { Authorization: ACME, 'Content-Type': 'application/json', Accept: 'text/event-stream', 'Idempotency-Key': 'ik-gen-2' },
+      body: JSON.stringify({ role: 'user', content: 'hi', owner: 'u1' }),
+    })
+    assert.equal(replay.status, 200)
+    assert.match(replay.headers.get('Content-Type') ?? '', /text\/event-stream/)
+    const text = await replay.text()
+    assert.match(text, new RegExp(`"run_id":"${run1.id}"`), 'the replayed stream reattaches to the original run')
+    assert.match(text, /event: done/, 'a replay of an already-finished run still delivers its terminal frame')
+  } finally {
+    cleanup()
+  }
+})
+
+test('a stale Idempotency-Key whose run has already been pruned is refused rather than silently re-run', async () => {
+  const { app, runs, cleanup } = harness()
+  try {
+    const chatId = await newChat(app)
+    const first = await app.request(`/api/ext/v1/chats/${chatId}/messages`, {
+      method: 'POST',
+      headers: { Authorization: ACME, 'Content-Type': 'application/json', 'Idempotency-Key': 'ik-gen-3' },
+      body: JSON.stringify({ role: 'user', content: 'hi', owner: 'u1' }),
+    })
+    const run1 = await first.json() as { id: string }
+    await runs.settled(run1.id)
+    // A couple of ticks so `endedAt` is strictly in the past relative to `prune`'s own
+    // `Date.now()` read (prune's comparison is a strict `<`, so same-millisecond timestamps
+    // would NOT be pruned) — then simulate the run registry having already retired this run.
+    await new Promise((r) => setTimeout(r, 5))
+    runs.prune(0)
+
+    const replay = await app.request(`/api/ext/v1/chats/${chatId}/messages`, {
+      method: 'POST',
+      headers: { Authorization: ACME, 'Content-Type': 'application/json', 'Idempotency-Key': 'ik-gen-3' },
+      body: JSON.stringify({ role: 'user', content: 'hi', owner: 'u1' }),
+    })
+    assert.equal(replay.status, 409)
+    assert.equal((await replay.json() as { error: { code: string } }).error.code, 'idempotency_replay_expired')
+  } finally {
+    cleanup()
+  }
+})
+
+test('a tenant that exceeds its configured in-flight limit gets 429 on the generate endpoint, while a different tenant is unaffected', async () => {
+  let release: () => void
+  const gate = new Promise<void>((r) => { release = r })
+  const ext: ExtRouteDeps = { idempotency: new IdempotencyStore(), limiter: new TenantLimiter({ maxInFlight: 1, ratePerMinute: 1000 }) }
+  const { app, runs, cleanup } = harness(async () => { await gate; return { status: 'complete' as const } }, ext)
+  try {
+    const chatA = await newChat(app)
+    const chatB = await newChat(app)
+
+    const first = await app.request(`/api/ext/v1/chats/${chatA}/messages`, post(ACME, { role: 'user', content: 'one', owner: 'u1' }))
+    assert.equal(first.status, 202, 'the first generation for this tenant is admitted')
+    const run1 = await first.json() as { id: string }
+
+    // A DIFFERENT chat, SAME tenant — this must be capped by the per-TENANT limiter, not the
+    // route's own per-CHAT `inflight` map (which would only refuse a second run on chatA).
+    const second = await app.request(`/api/ext/v1/chats/${chatB}/messages`, post(ACME, { role: 'user', content: 'two', owner: 'u1' }))
+    assert.equal(second.status, 429, 'a second CONCURRENT generation for the same tenant (different chat) is refused')
+    assert.equal((await second.json() as { error: { code: string } }).error.code, 'rate_limited')
+
+    const chatBMessages = await (await app.request(`/api/ext/v1/chats/${chatB}/messages?owner=u1`, { headers: { Authorization: ACME } })).json() as { data: unknown[] }
+    assert.equal(chatBMessages.data.length, 0, 'a refused generation must not leave a dangling user/assistant message pair')
+
+    const chatC = await newChat(app, GLOBEX)
+    const other = await app.request(`/api/ext/v1/chats/${chatC}/messages`, post(GLOBEX, { role: 'user', content: 'hi', owner: 'u1' }))
+    assert.equal(other.status, 202, 'a different tenant is unaffected by acme being at its own in-flight cap')
+
+    release!()
+    await runs.settled(run1.id)
   } finally {
     cleanup()
   }

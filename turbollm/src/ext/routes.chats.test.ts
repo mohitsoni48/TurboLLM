@@ -7,7 +7,9 @@ import { join } from 'node:path'
 import { Hono } from 'hono'
 import { ConversationStore } from '../chat/db.js'
 import { ChatStoreRouter } from '../chat/store/router.js'
-import { registerExtChatRoutes } from './routes.chats.js'
+import { registerExtChatRoutes, type ExtRouteDeps } from './routes.chats.js'
+import { IdempotencyStore } from './idempotency.js'
+import { TenantLimiter } from './limits.js'
 
 const ACME = 'Bearer tllm-ext-acme'
 const GLOBEX = 'Bearer tllm-ext-globex'
@@ -20,7 +22,7 @@ function keyHash(bearer: string): string {
   return createHash('sha256').update(bearer.slice('Bearer '.length)).digest('hex')
 }
 
-function harness() {
+function harness(ext?: ExtRouteDeps) {
   const dir = mkdtempSync(join(tmpdir(), 'turbollm-ext-routes-'))
   const conv = new ConversationStore(dir)
   // Both tenants are served by the same SQLite store here; scoping is what keeps them apart.
@@ -32,7 +34,7 @@ function harness() {
     ] }) },
   } as never
   const app = new Hono()
-  registerExtChatRoutes(app, d)
+  registerExtChatRoutes(app, d, ext)
   return { app, cleanup: () => { conv.close(); rmSync(dir, { recursive: true, force: true }) } }
 }
 
@@ -205,3 +207,75 @@ for (const [label, req] of [
     }
   })
 }
+
+// Idempotency (spec 27 §7.6), fix round: POST /chats is one of the two commit points the spec
+// names. A key is opt-in (a request with no header behaves exactly as before, covered by
+// "create and fetch a chat" above) — these cover the header actually being present.
+test('a duplicate Idempotency-Key on POST /chats returns the same chat rather than creating a second one', async () => {
+  const { app, cleanup } = harness()
+  try {
+    const post = (title: string) => ({
+      method: 'POST',
+      headers: { Authorization: ACME, 'Content-Type': 'application/json', 'Idempotency-Key': 'ik-chat-1' },
+      body: JSON.stringify({ title, owner: 'u1' }),
+    })
+    const first = await app.request('/api/ext/v1/chats', post('Hello'))
+    assert.equal(first.status, 201)
+    const firstBody = await first.json() as { id: string; title: string }
+
+    // A retry with the SAME key but a DIFFERENT body — proving the replay returns the frozen
+    // original result rather than re-running createChat with the new content.
+    const second = await app.request('/api/ext/v1/chats', post('A different title'))
+    assert.equal(second.status, 201)
+    const secondBody = await second.json() as { id: string; title: string }
+    assert.equal(secondBody.id, firstBody.id, 'the replay must return the SAME chat, not a new one')
+    assert.equal(secondBody.title, firstBody.title, 'the replay returns the ORIGINAL result, not a re-execution')
+
+    const list = await app.request('/api/ext/v1/chats?owner=u1', { headers: { Authorization: ACME } })
+    const page = await list.json() as { data: unknown[] }
+    assert.equal(page.data.length, 1, 'only one chat was actually created')
+  } finally {
+    cleanup()
+  }
+})
+
+test('a fresh Idempotency-Key on POST /chats still creates a genuinely new chat', async () => {
+  const { app, cleanup } = harness()
+  try {
+    const post = (key: string) => ({
+      method: 'POST',
+      headers: { Authorization: ACME, 'Content-Type': 'application/json', 'Idempotency-Key': key },
+      body: JSON.stringify({ title: 'X', owner: 'u1' }),
+    })
+    const first = await (await app.request('/api/ext/v1/chats', post('ik-a'))).json() as { id: string }
+    const second = await (await app.request('/api/ext/v1/chats', post('ik-b'))).json() as { id: string }
+    assert.notEqual(first.id, second.id, 'a different key must not be treated as a replay')
+  } finally {
+    cleanup()
+  }
+})
+
+test('a tenant that exceeds its configured request rate gets 429, while a different tenant is unaffected', async () => {
+  const ext: ExtRouteDeps = { idempotency: new IdempotencyStore(), limiter: new TenantLimiter({ maxInFlight: 100, ratePerMinute: 2 }) }
+  const { app, cleanup } = harness(ext)
+  try {
+    const post = (auth: string, title: string) => ({
+      method: 'POST',
+      headers: { Authorization: auth, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title, owner: 'u1' }),
+    })
+    const first = await app.request('/api/ext/v1/chats', post(ACME, 'One'))
+    const second = await app.request('/api/ext/v1/chats', post(ACME, 'Two'))
+    assert.equal(first.status, 201)
+    assert.equal(second.status, 201)
+
+    const third = await app.request('/api/ext/v1/chats', post(ACME, 'Three'))
+    assert.equal(third.status, 429, 'a third request within the same minute exceeds the configured budget')
+    assert.equal((await third.json() as { error: { code: string } }).error.code, 'rate_limited')
+
+    const otherTenant = await app.request('/api/ext/v1/chats', post(GLOBEX, 'Unaffected'))
+    assert.equal(otherTenant.status, 201, 'a different tenant is unaffected by acme exhausting its own budget')
+  } finally {
+    cleanup()
+  }
+})

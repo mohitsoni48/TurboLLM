@@ -9,6 +9,8 @@ import type { Deps } from '../deps.js'
 import { extAuth, requireScope, scopeFor } from './auth.js'
 import { extError, mapStoreError } from './errors.js'
 import { parseInclude, toChatDTO, toMessageDTO } from './dto.js'
+import { IdempotencyStore } from './idempotency.js'
+import { TenantLimiter, DEFAULT_MAX_IN_FLIGHT_PER_TENANT, DEFAULT_REQUESTS_PER_MINUTE_PER_TENANT } from './limits.js'
 
 const BASE = '/api/ext/v1'
 
@@ -16,8 +18,39 @@ async function body<T>(c: { req: { json(): Promise<unknown> } }): Promise<Partia
   try { return (await c.req.json()) as Partial<T> } catch { return {} }
 }
 
-export function registerExtChatRoutes(app: Hono, d: Deps): void {
+export interface ExtRouteDeps {
+  idempotency: IdempotencyStore
+  limiter: TenantLimiter
+}
+
+/** `ext` is optional so every pre-existing test/caller that constructs this route set without
+ *  it (mount.ts always supplies a shared instance in production; only ad-hoc test harnesses
+ *  omit it) keeps compiling and behaving exactly as before — a private, generously-capped
+ *  instance is created here as the fallback rather than making callers thread it through for
+ *  tests that don't care about idempotency or rate limiting at all. */
+export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps): void {
+  const idempotency = ext?.idempotency ?? new IdempotencyStore()
+  const limiter = ext?.limiter ?? new TenantLimiter({
+    maxInFlight: DEFAULT_MAX_IN_FLIGHT_PER_TENANT,
+    ratePerMinute: DEFAULT_REQUESTS_PER_MINUTE_PER_TENANT,
+  })
+
   app.use(`${BASE}/*`, extAuth(d))
+  // Per-tenant request budget (spec 27 §8.4) covering the WHOLE surface, including routes
+  // registered later by registerExtRunRoutes — Hono matches `app.use` middleware by path
+  // pattern against every route under it regardless of which function registered the route,
+  // as long as this runs before the app starts serving (mount.ts always registers chat routes
+  // first). Runs after extAuth so `extTenant` is already resolved; a request that failed auth
+  // never counts against the tenant's budget (there is no tenant to charge it to).
+  app.use(`${BASE}/*`, async (c, next) => {
+    const tenant = c.get('extTenant') as string
+    if (!limiter.tryRequest(tenant)) {
+      return extError(c, 'capacity', 'rate_limited',
+        'Too many requests for this tenant. Slow down and retry shortly.',
+        { status: 429, retryable: true, retryAfterMs: 60_000 })
+    }
+    await next()
+  })
 
   app.get(`${BASE}/capabilities`, (c) => c.json({
     capabilities: d.chatStore.capabilities,
@@ -40,12 +73,31 @@ export function registerExtChatRoutes(app: Hono, d: Deps): void {
 
   app.post(`${BASE}/chats`, requireScope('chats:write'), async (c) => {
     const b = await body<{ title: string; model: string; system_prompt: string; sampling: Record<string, unknown>; metadata: Record<string, unknown>; owner: string }>(c)
+    const tenant = c.get('extTenant') as string
+    const idempotencyKey = c.req.header('Idempotency-Key')?.trim() || undefined
+
+    // Idempotent replay (spec §7.6): a cached key means THIS chat was already created by an
+    // earlier attempt of the same request — return that frozen result rather than creating a
+    // second chat. Checked before any store write, so a retry never even reaches createChat.
+    if (idempotencyKey) {
+      const cached = idempotency.lookup(tenant, idempotencyKey)
+      if (cached) return c.json(cached, 201)
+    }
+
     try {
       const chat = await d.chatStore.createChat(scopeFor(c, b.owner), {
         title: b.title, model: b.model, systemPrompt: b.system_prompt,
         sampling: b.sampling, metadata: b.metadata,
       })
-      return c.json(toChatDTO(chat), 201)
+      const dto = toChatDTO(chat)
+      // Commit point is immediately after creation succeeds (spec §7.6) — there is no engine
+      // work in chat creation at all, so "before the engine is touched" is satisfied trivially;
+      // what matters is that this runs before returning, so a race between two identical
+      // concurrent retries still can't both observe a miss (the second's `createChat` may still
+      // create a duplicate chat under a true race — see idempotency.ts's own residual-window
+      // note — but a SEQUENTIAL retry, the actual reported failure mode, is fully covered).
+      if (idempotencyKey) idempotency.remember(tenant, idempotencyKey, dto)
+      return c.json(dto, 201)
     } catch (e) {
       const m = mapStoreError(e)
       return extError(c, m.type, m.code, m.message, { status: m.status, retryable: m.retryable })

@@ -108,10 +108,15 @@ export function createApp(d: Deps): Hono {
   // codebase for background sweeps (cli.ts's routineScheduler/cliInteractiveSweepTimer):
   // unref'd so a pending tick can never keep the process alive on its own.
   const extRuns = new PublicRunManager({ orphanTimeoutMs: 5 * 60_000 })
-  mountExtApi(app, d, extRuns, { makeBody: createMakeBody(d) })
+  const ext = mountExtApi(app, d, extRuns, { makeBody: createMakeBody(d) })
   const extRunsReaper = setInterval(() => {
     extRuns.reapOrphans()
     extRuns.prune(60 * 60_000)
+    // Idempotency entries outlive individual runs on purpose (24h default TTL vs the 1h run
+    // prune above) — see routes.runs.ts's `idempotency_replay_expired` handling for how a
+    // replay of an already-pruned run fails closed instead of double-generating. Still needs
+    // its own bound, so expired entries don't accumulate forever.
+    ext?.idempotency.prune()
   }, 30_000)
   extRunsReaper.unref()
 

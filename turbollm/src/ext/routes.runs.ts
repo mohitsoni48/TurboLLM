@@ -9,12 +9,14 @@
 // releasing before the terminal write keeps adapter I/O outside the gate hold (§8.2). Note that
 // steps 4/6/7 happen INSIDE the injected run body (generation.ts in production; the tests here
 // inject a fake body) — this route never touches `d.gate` itself.
-import type { Hono } from 'hono'
+import type { Hono, Context } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import type { Deps } from '../deps.js'
 import { requireScope, scopeFor } from './auth.js'
 import { extError, mapStoreError } from './errors.js'
 import { PublicRunManager, type PublicRun, type RunBody } from './run-manager.js'
+import { IdempotencyStore } from './idempotency.js'
+import { TenantLimiter, DEFAULT_MAX_IN_FLIGHT_PER_TENANT, DEFAULT_REQUESTS_PER_MINUTE_PER_TENANT } from './limits.js'
 
 const BASE = '/api/ext/v1'
 
@@ -23,6 +25,17 @@ export interface RunDeps {
   makeBody: (args: { chatId: string; messageId: string; scope: { tenant: string; owner: string } }) => RunBody
 }
 
+export interface ExtRouteDeps {
+  idempotency: IdempotencyStore
+  limiter: TenantLimiter
+}
+
+/** What the idempotency store remembers for the generate path: enough to REATTACH to the
+ *  already-created run, not a frozen response body — the true "result" of a generation is live
+ *  and possibly still streaming, so a replay reconnects to the same run rather than replaying a
+ *  stale snapshot (see the replay branch in the route below). */
+interface GenerateReplay { runId: string; userMessageId: string; messageId: string }
+
 function toRunDTO(r: PublicRun): Record<string, unknown> {
   return {
     id: r.id, chat_id: r.chatId, message_id: r.messageId, status: r.status,
@@ -30,15 +43,75 @@ function toRunDTO(r: PublicRun): Record<string, unknown> {
   }
 }
 
-export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager, rd: RunDeps): void {
+/** Emits the same `run` frame + live/replayed event stream a fresh SSE request gets, or the same
+ *  202 JSON envelope — shared by both the just-created path and the idempotent-replay path so
+ *  a retry that reattaches is indistinguishable on the wire from a client that reconnected on
+ *  its own via GET .../stream. `fromSeq` lets a replay attempt a full-history replay (seq 0);
+ *  `runs.canReplayFrom` is checked first so a replay that has aged out of the ring buffer fails
+ *  with the same documented `replay_window_exceeded` conflict the dedicated reconnect endpoint
+ *  already uses, instead of silently starting mid-stream or hanging. */
+function respondWithRun(
+  c: Context, runs: PublicRunManager, run: PublicRun, userMsgId: string, assistantMsgId: string,
+) {
+  if ((c.req.header('Accept') ?? '').includes('text/event-stream')) {
+    if (!runs.canReplayFrom(run.id, 0)) {
+      return extError(c, 'conflict', 'replay_window_exceeded',
+        'That cursor has aged out of the replay buffer. Re-read the message, then attach at the run current event_seq.')
+    }
+    return streamSSE(c, async (stream) => {
+      const sub = runs.subscribe(run.id, 0)
+      stream.onAbort(() => { sub.close() })   // dropping the stream must NOT abort the run
+      await stream.writeSSE({
+        event: 'run',
+        data: JSON.stringify({ run_id: run.id, user_message_id: userMsgId, message_id: assistantMsgId, event_seq: 0 }),
+      })
+      for await (const ev of sub) {
+        await stream.writeSSE({ id: String(ev.seq), event: ev.event, data: JSON.stringify(ev.data) })
+      }
+    })
+  }
+  return c.json(toRunDTO(run), 202)
+}
+
+/** `ext` is optional for the same reason `routes.chats.ts`'s is: pre-existing test harnesses
+ *  that construct this route set directly (without going through mount.ts) keep compiling and
+ *  behaving exactly as before, with a private, generously-capped fallback instance. */
+export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager, rd: RunDeps, ext?: ExtRouteDeps): void {
   /** One active run per chat, mirroring the internal `inflight` 409. */
   const inflight = new Map<string, string>()
+  const idempotency = ext?.idempotency ?? new IdempotencyStore()
+  const limiter = ext?.limiter ?? new TenantLimiter({
+    maxInFlight: DEFAULT_MAX_IN_FLIGHT_PER_TENANT,
+    ratePerMinute: DEFAULT_REQUESTS_PER_MINUTE_PER_TENANT,
+  })
 
   app.post(`${BASE}/chats/:id/messages/generate`, requireScope('runs:write'), async (c) => {
     const chatId = c.req.param('id')
     const b = await c.req.json().catch(() => ({})) as { role?: 'user'; content?: string; owner?: string }
     const scope = scopeFor(c, b.owner)
     const content = (b.content ?? '').trim()
+    const idempotencyKey = c.req.header('Idempotency-Key')?.trim() || undefined
+
+    // Idempotent replay (spec §7.6), checked before ANY validation/persistence/limiter charge —
+    // a cached key means a run for this exact request already exists, so we reattach to THAT
+    // run instead of re-running any of the checks below.
+    if (idempotencyKey) {
+      const cached = idempotency.lookup(scope.tenant, idempotencyKey) as GenerateReplay | null
+      if (cached) {
+        const existing = runs.get(cached.runId)
+        if (!existing || existing.tenant !== scope.tenant) {
+          // PublicRunManager.prune() (server.ts, ~1h) retires ended runs well before the
+          // idempotency entry's own TTL (24h default) expires — a replay CAN legitimately
+          // outlive the run it points to. Failing closed here is deliberate: silently falling
+          // through to create a fresh run would be the exact double-send this exists to
+          // prevent, so an aged-out replay is refused rather than risked.
+          return extError(c, 'conflict', 'idempotency_replay_expired',
+            'The original run for this Idempotency-Key is no longer available to replay. If you intend to send a new message, retry with a new Idempotency-Key.',
+            { status: 409, retryable: false })
+        }
+        return respondWithRun(c, runs, existing, cached.userMessageId, cached.messageId)
+      }
+    }
 
     if (!content) return extError(c, 'invalid_request', 'invalid_input', 'Type a message or attach a file.', { param: 'content' })
 
@@ -54,6 +127,14 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
       return extError(c, 'conflict', 'model_not_loaded', 'Load a model first.', { retryable: true })
     }
 
+    // Per-tenant concurrency cap (spec 27 §8.4), checked BEFORE any persistence — a refusal
+    // here must leave nothing dangling: no user turn, no assistant placeholder, no run.
+    if (!limiter.tryAcquire(scope.tenant)) {
+      return extError(c, 'capacity', 'rate_limited',
+        'Too many concurrent generations for this tenant. Wait for one to finish and retry.',
+        { status: 429, retryable: true, retryAfterMs: 5_000 })
+    }
+
     // 2. Persist BEFORE the engine is touched. A failed write here costs no GPU time and
     //    leaves the caller with nothing dangling.
     let userMsgId: string
@@ -64,6 +145,7 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
       userMsgId = user.id
       assistantMsgId = placeholder.id
     } catch (e) {
+      limiter.release(scope.tenant)
       const m = mapStoreError(e)
       return extError(c, m.type, m.code, m.message, { status: m.status, retryable: m.retryable })
     }
@@ -72,23 +154,19 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
       scope, chatId, messageId: assistantMsgId,
       body: rd.makeBody({ chatId, messageId: assistantMsgId, scope }),
     })
+    // Commit point: immediately after the run is created, BEFORE any engine work starts (spec
+    // §7.6 — this is the property that matters most for this whole feature). `runs.start()` has
+    // already returned a live `PublicRun` at this line; the injected body's own first engine
+    // fetch is still at least one microtask away. A retry that lands anywhere after this line
+    // finds this entry and reattaches via the branch above instead of starting a second run.
+    if (idempotencyKey) idempotency.remember(scope.tenant, idempotencyKey, { runId: run.id, userMessageId: userMsgId, messageId: assistantMsgId } satisfies GenerateReplay)
     inflight.set(chatId, run.id)
-    void runs.settled(run.id).finally(() => { inflight.delete(chatId) })
+    // Released when the run actually SETTLES, not when this HTTP response is sent — the route
+    // itself never blocks on generation, so this is fire-and-forget off the manager's own
+    // completion signal (Task 3's `runs.settled`).
+    void runs.settled(run.id).finally(() => { inflight.delete(chatId); limiter.release(scope.tenant) })
 
-    if ((c.req.header('Accept') ?? '').includes('text/event-stream')) {
-      return streamSSE(c, async (stream) => {
-        const sub = runs.subscribe(run.id, 0)
-        stream.onAbort(() => { sub.close() })   // dropping the stream must NOT abort the run
-        await stream.writeSSE({
-          event: 'run',
-          data: JSON.stringify({ run_id: run.id, user_message_id: userMsgId, message_id: assistantMsgId, event_seq: 0 }),
-        })
-        for await (const ev of sub) {
-          await stream.writeSSE({ id: String(ev.seq), event: ev.event, data: JSON.stringify(ev.data) })
-        }
-      })
-    }
-    return c.json(toRunDTO(run), 202)
+    return respondWithRun(c, runs, run, userMsgId, assistantMsgId)
   })
 
   app.get(`${BASE}/runs`, requireScope('chats:read'), (c) =>
