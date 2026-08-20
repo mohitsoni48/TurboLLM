@@ -14,6 +14,7 @@ import { streamSSE } from 'hono/streaming'
 import type { Deps } from '../deps.js'
 import { requireScope, scopeFor } from './auth.js'
 import { extError, mapStoreError } from './errors.js'
+import { checkContextFits } from './context-limit.js'
 import { PublicRunManager, type PublicRun, type RunBody } from './run-manager.js'
 import { IdempotencyStore } from './idempotency.js'
 import { TenantLimiter, DEFAULT_MAX_IN_FLIGHT_PER_TENANT, DEFAULT_REQUESTS_PER_MINUTE_PER_TENANT } from './limits.js'
@@ -140,6 +141,20 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
     const ms = d.manager.status()
     if (ms.state !== 'running' || !ms.model) {
       return extError(c, 'conflict', 'model_not_loaded', 'Load a model first.', { retryable: true })
+    }
+
+    // Context-window check (spec 27 §7.2), checked BEFORE any persistence and BEFORE the
+    // limiter charges the tenant's concurrency slot — a request that cannot possibly generate
+    // must not leave a user turn, a dangling assistant placeholder, or a held rate-limit slot
+    // behind. v1 REFUSES an over-long history rather than silently truncating it: silent
+    // truncation would mean the model answering from a history the integrator believes it sent.
+    const history = await d.chatStore.listMessages(scope, chatId, { limit: 200 })
+    const prospective = [...history.data.map((m) => ({ role: m.role, content: m.content })), { role: 'user', content }]
+    const fit = checkContextFits(d, prospective)
+    if (!fit.fits) {
+      return extError(c, 'engine', 'context_overflow',
+        `This conversation is about ${fit.estimated} tokens, which exceeds the loaded model's ${fit.limit}-token window. Start a new chat or load a longer-context model.`,
+        { status: 409 })
     }
 
     // Per-tenant concurrency cap (spec 27 §8.4), checked BEFORE any persistence — a refusal
