@@ -78,3 +78,50 @@ test('the api key is sent as a bearer token and never in a query string', async 
   assert.equal(seenAuth, 'Bearer secret-key')
   assert.ok(!seenUrl.includes('secret-key'), 'a key in a URL leaks into logs and referrers')
 })
+
+test('send() throws ApiError instead of silently yielding nothing on a pre-stream error', async () => {
+  const client = new TurboLLMChat({
+    baseUrl: 'http://x/api/ext/v1', apiKey: 'k',
+    fetch: (async () => new Response(
+      JSON.stringify({ error: { type: 'conflict', code: 'model_not_loaded', message: 'Load a model first.', retryable: true } }),
+      { status: 409, headers: { 'Content-Type': 'application/json' } },
+    )) as unknown as typeof fetch,
+  })
+  const stream = client.send('c1', { content: 'hi', owner: 'u1' })
+  await assert.rejects(
+    async () => { for await (const _ of stream) { /* should never get here */ } },
+    (e: Error & { code?: string }) => { assert.equal(e.code, 'model_not_loaded'); return true },
+  )
+})
+
+test('resume() reconciles past the replay window via runs.get()', async () => {
+  let call = 0
+  const fakeFetch: typeof fetch = (async (url: string) => {
+    call++
+    const u = String(url)
+    if (u.includes('/stream')) {
+      if (call === 1) {
+        return new Response(
+          JSON.stringify({ error: { type: 'conflict', code: 'replay_window_exceeded', message: 'aged out', retryable: false } }),
+          { status: 409, headers: { 'Content-Type': 'application/json' } },
+        )
+      }
+      return new Response(
+        'id: 101\nevent: delta\ndata: {"content":"resumed"}\n\n' +
+        'id: 102\nevent: done\ndata: {"status":"complete"}\n\n',
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+      )
+    }
+    return new Response(
+      JSON.stringify({ id: 'run_1', chat_id: 'c1', message_id: 'm1', status: 'streaming', event_seq: 100, error: null, created_at: 't', ended_at: null }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    )
+  }) as unknown as typeof fetch
+
+  const client = new TurboLLMChat({ baseUrl: 'http://x/api/ext/v1', apiKey: 'k', fetch: fakeFetch })
+  const resumed = await client.resume('run_1', 5)
+  const seen: string[] = []
+  for await (const ev of resumed) seen.push(ev.event)
+  assert.deepEqual(seen, ['delta', 'done'])
+  assert.equal(resumed.lastEventSeq, 102)
+})

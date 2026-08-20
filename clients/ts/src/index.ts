@@ -99,7 +99,11 @@ export interface Run {
   message_id: string
   status: RunStatus
   event_seq: number
-  error: ExtErrorBody | null
+  // Narrower than the full error envelope (`ExtErrorBody`) on purpose: the server's
+  // `PublicRun.error` (`run-manager.ts`) only ever populates `type`/`code`/`message` — never
+  // `param`/`request_id`/`retryable`/`retry_after_ms`. Typing this as the full `ExtErrorBody`
+  // would let `if (run.error?.retryable) …` compile and silently always be falsy.
+  error: Pick<ExtErrorBody, 'type' | 'code' | 'message'> | null
   created_at: string
   ended_at: string | null
 }
@@ -269,6 +273,23 @@ export class RunStream implements AsyncIterable<ExtEvent> {
 
   async *[Symbol.asyncIterator](): AsyncIterator<ExtEvent> {
     const res = await this.body
+
+    // A request can be rejected BEFORE the server ever enters SSE mode — `invalid_input`,
+    // `generation_in_flight`, `model_not_loaded`, `replay_window_exceeded`, `rate_limited`,
+    // `context_overflow`, `not_found` are all plain JSON `{ error: {...} } bodies via
+    // `extError`, regardless of the `Accept: text/event-stream` header this client sent
+    // (spec 27 §7.2; `respondWithRun` only reaches `streamSSE(...)` after every one of those
+    // checks passes). Without this check, a one-line JSON error blob has no `\n\n` separator,
+    // gets silently swallowed by the frame parser at end-of-stream, and `send()` — spec's "the
+    // one endpoint that matters" — would complete with zero events and no exception instead of
+    // throwing. Treat any non-2xx response as a request failure, exactly like `request()` does
+    // for JSON calls, before ever touching `res.body` as an SSE stream.
+    if (!res.ok) {
+      let parsed: { error?: Partial<ExtErrorBody> } | undefined
+      try { parsed = (await res.json()) as { error?: Partial<ExtErrorBody> } } catch { parsed = undefined }
+      throw new ApiError(res.status, parsed?.error)
+    }
+
     const reader = res.body?.getReader()
 
     if (!reader) {
