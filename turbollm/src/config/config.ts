@@ -480,6 +480,9 @@ export interface Config {
     schemaVersion?: number
     everLoadedModel?: boolean
   }
+  /** External chat API (spec 27). Off by default — this surface exposes tenant data and
+   *  must be an explicit opt-in, never something a version bump switches on. */
+  api?: { ext?: { enabled: boolean; maxInFlightPerTenant?: number; requestsPerMinutePerTenant?: number } }
 }
 
 export class ValueError extends Error {
@@ -1057,6 +1060,11 @@ function normalize(c: Config): void {
   // Pluggable chat storage (spec 27 §4.5): absent/malformed in pre-this-feature configs
   // → { kind: 'sqlite' }, so an old config file keeps behaving exactly as before.
   if (!c.chatStore || typeof c.chatStore !== 'object') c.chatStore = { kind: 'sqlite' }
+  // External chat API (spec 27 §4/§10): absent in pre-this-feature configs → disabled. Never
+  // flips an existing config's `enabled` — only seeds the block when it's missing entirely, so
+  // a version bump alone can never turn this surface on for someone who never opted in.
+  if (!c.api) c.api = {}
+  if (!c.api.ext) c.api.ext = { enabled: false }
   c.version = SCHEMA_VERSION
 }
 

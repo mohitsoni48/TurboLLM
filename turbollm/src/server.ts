@@ -16,6 +16,9 @@ import { featureForPath } from './telemetry/feature-map'
 import { registerTerminalRoutes } from './terminal/terminal-routes'
 import { registerRoutineRoutes } from './routines/routine-routes'
 import { lanAuth, codeAuth } from './auth'
+import { mountExtApi } from './ext/mount'
+import { PublicRunManager } from './ext/run-manager'
+import { createMakeBody } from './ext/generation'
 
 // Reuse TCP connections for all engine and HF fetch calls. Without this, Node
 // opens a new connection per request — ~5–20 ms of extra latency every Claude
@@ -96,6 +99,21 @@ export function createApp(d: Deps): Hono {
   registerTerminalRoutes(app, d)
   registerRoutineRoutes(app, d)
   registerGateway(app, d)
+
+  // External chat API (spec 27) — flag-gated off by default (config.ts's `api.ext.enabled`);
+  // mountExtApi registers nothing at all when the flag is off, so this is a true no-op for
+  // every existing install until an operator opts in. `extRuns` is a fresh, process-lifetime
+  // registry — public runs do not survive a restart (spec 27 §6.4), so there is nothing to
+  // resume here. The reaper/prune tick mirrors the pattern already used elsewhere in this
+  // codebase for background sweeps (cli.ts's routineScheduler/cliInteractiveSweepTimer):
+  // unref'd so a pending tick can never keep the process alive on its own.
+  const extRuns = new PublicRunManager({ orphanTimeoutMs: 5 * 60_000 })
+  mountExtApi(app, d, extRuns, { makeBody: createMakeBody(d) })
+  const extRunsReaper = setInterval(() => {
+    extRuns.reapOrphans()
+    extRuns.prune(60 * 60_000)
+  }, 30_000)
+  extRunsReaper.unref()
 
   // Embedded SPA with client-side-routing fallback (spec 08 §1).
   app.get('/*', (c) => {
