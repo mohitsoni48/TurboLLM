@@ -1,0 +1,84 @@
+// The public error envelope (spec 27 §7.1). `type` is a FROZEN nine-value set an integrator
+// switches on; `code` is open, so a new failure mode is describable without a major version.
+import { randomUUID } from 'node:crypto'
+import type { Context } from 'hono'
+import type { ContentfulStatusCode } from 'hono/utils/http-status'
+import { StoreError } from '../chat/store/chat-store.js'
+
+export const EXT_ERROR_TYPES = [
+  'invalid_request', 'auth', 'not_found', 'conflict',
+  'capacity', 'engine', 'storage', 'unsupported', 'internal',
+] as const
+
+export type ExtErrorType = (typeof EXT_ERROR_TYPES)[number]
+
+export interface MappedError {
+  status: number
+  type: ExtErrorType
+  code: string
+  message: string
+  retryable: boolean
+}
+
+export function requestId(): string {
+  return `req_${randomUUID()}`
+}
+
+export function extError(
+  c: Context,
+  type: ExtErrorType,
+  code: string,
+  message: string,
+  opts?: { status?: number; retryable?: boolean; retryAfterMs?: number; param?: string },
+) {
+  const status = opts?.status ?? defaultStatus(type)
+  const id = requestId()
+  if (opts?.retryAfterMs) c.header('Retry-After', String(Math.ceil(opts.retryAfterMs / 1000)))
+  return c.json({
+    error: {
+      type, code, message,
+      ...(opts?.param ? { param: opts.param } : {}),
+      request_id: id,
+      retryable: opts?.retryable ?? false,
+      ...(opts?.retryAfterMs ? { retry_after_ms: opts.retryAfterMs } : {}),
+    },
+  }, status as ContentfulStatusCode)
+}
+
+function defaultStatus(type: ExtErrorType): number {
+  switch (type) {
+    case 'invalid_request': return 400
+    case 'auth': return 401
+    case 'not_found': return 404
+    case 'conflict': return 409
+    case 'capacity': return 503
+    case 'engine': return 502
+    case 'storage': return 503
+    case 'unsupported': return 501
+    case 'internal': return 500
+  }
+}
+
+/** Translate a store failure into the public catalogue (spec 27 §7.2). An error that is not a
+ *  StoreError is deliberately flattened to a generic `internal` — a raw message could carry
+ *  SQL, filesystem paths, or another tenant's ids. */
+export function mapStoreError(e: unknown): MappedError {
+  if (e instanceof StoreError) {
+    switch (e.code) {
+      case 'not_found':
+        return { status: 404, type: 'not_found', code: 'not_found', message: 'Not found.', retryable: false }
+      case 'version_conflict':
+        return { status: 409, type: 'conflict', code: 'version_conflict', message: e.message, retryable: true }
+      case 'not_supported':
+        return { status: 501, type: 'unsupported', code: 'not_supported', message: e.message, retryable: false }
+      case 'invalid_scope':
+        return { status: 400, type: 'invalid_request', code: 'invalid_scope', message: e.message, retryable: false }
+      case 'contract_violation':
+        return { status: 500, type: 'storage', code: 'storage_contract_violation', message: 'The configured chat store returned data that violates the store contract.', retryable: false }
+    }
+  }
+  return {
+    status: 500, type: 'internal', code: 'internal',
+    message: 'An unexpected error occurred.', retryable: false,
+  }
+}
