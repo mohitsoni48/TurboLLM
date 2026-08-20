@@ -93,7 +93,11 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
   })
   const audit = ext?.audit ?? new AuditLog(d.db)
 
-  app.post(`${BASE}/chats/:id/messages/generate`, requireScope('runs:write'), auditMiddleware(audit, 'run.start'), async (c) => {
+  // auditMiddleware is registered BEFORE requireScope (here and on /runs/:id/cancel below) —
+  // see routes.chats.ts's identical comment on why: `requireScope` returns early without
+  // calling `next()` on a scope refusal, so an `auditMiddleware` registered after it would
+  // never run for that refusal.
+  app.post(`${BASE}/chats/:id/messages/generate`, auditMiddleware(audit, 'run.start'), requireScope('runs:write'), async (c) => {
     const chatId = c.req.param('id')
     const b = await c.req.json().catch(() => ({})) as { role?: 'user'; content?: string; owner?: string }
     const scope = scopeFor(c, b.owner)
@@ -117,6 +121,9 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
             'The original run for this Idempotency-Key is no longer available to replay. If you intend to send a new message, retry with a new Idempotency-Key.',
             { status: 409, retryable: false })
         }
+        // The real run id — this route's own `:id` param names the CHAT, not the run, and a
+        // replay reattaches to an EXISTING run rather than starting a new one.
+        c.set('auditTargetId', existing.id)
         return respondWithRun(c, runs, existing, cached.userMessageId, cached.messageId)
       }
     }
@@ -162,6 +169,8 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
       scope, chatId, messageId: assistantMsgId,
       body: rd.makeBody({ chatId, messageId: assistantMsgId, scope }),
     })
+    // The real created run id — again, this route's `:id` param names the CHAT, not the run.
+    c.set('auditTargetId', run.id)
     // Commit point: immediately after the run is created, BEFORE any engine work starts (spec
     // §7.6 — this is the property that matters most for this whole feature). `runs.start()` has
     // already returned a live `PublicRun` at this line; the injected body's own first engine
@@ -204,7 +213,7 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
     })
   })
 
-  app.post(`${BASE}/runs/:id/cancel`, requireScope('runs:write'), auditMiddleware(audit, 'run.cancel'), (c) => {
+  app.post(`${BASE}/runs/:id/cancel`, auditMiddleware(audit, 'run.cancel'), requireScope('runs:write'), (c) => {
     const run = runs.get(c.req.param('id'))
     if (!run || run.tenant !== c.get('extTenant')) return extError(c, 'not_found', 'not_found', 'Not found.')
     const cancelled = runs.cancel(run.id)

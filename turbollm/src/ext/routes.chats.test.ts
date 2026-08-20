@@ -10,9 +10,13 @@ import { ChatStoreRouter } from '../chat/store/router.js'
 import { registerExtChatRoutes, type ExtRouteDeps } from './routes.chats.js'
 import { IdempotencyStore } from './idempotency.js'
 import { TenantLimiter } from './limits.js'
+import { AuditLog } from './audit.js'
 
 const ACME = 'Bearer tllm-ext-acme'
 const GLOBEX = 'Bearer tllm-ext-globex'
+// A key scoped to chats:read ONLY — for the scope-refusal-still-gets-audited coverage below.
+// Distinct from ACME/GLOBEX so it never affects any other test in this file.
+const ACME_READONLY = 'Bearer tllm-ext-acme-readonly'
 
 // resolveTenantFromKey (ext/auth.ts) always hashes the presented key with the real SHA-256
 // derivation (hashKey) before comparing — stored keys hold only a hash, never the raw value
@@ -32,11 +36,12 @@ function harness(ext?: ExtRouteDeps) {
     store: { snapshot: () => ({ apiKeys: [
       { hash: keyHash(ACME), tenant: 'acme' },
       { hash: keyHash(GLOBEX), tenant: 'globex' },
+      { hash: keyHash(ACME_READONLY), tenant: 'acme', scopes: ['chats:read'] },
     ] }) },
   } as never
   const app = new Hono()
   registerExtChatRoutes(app, d, ext)
-  return { app, cleanup: () => { conv.close(); rmSync(dir, { recursive: true, force: true }) } }
+  return { app, db: conv, cleanup: () => { conv.close(); rmSync(dir, { recursive: true, force: true }) } }
 }
 
 // ChatStoreRouter.pick() throws StoreError('not_supported', ...) SYNCHRONOUSLY-then-rejected
@@ -252,6 +257,114 @@ test('a fresh Idempotency-Key on POST /chats still creates a genuinely new chat'
     const first = await (await app.request('/api/ext/v1/chats', post('ik-a'))).json() as { id: string }
     const second = await (await app.request('/api/ext/v1/chats', post('ik-b'))).json() as { id: string }
     assert.notEqual(first.id, second.id, 'a different key must not be treated as a replay')
+  } finally {
+    cleanup()
+  }
+})
+
+// The audit-log fix round (task-2-report.md's "Fix report" section): three defects a live
+// review surfaced in the first pass — a refused mutation producing zero audit rows (scope
+// refusal here, the blanket rate-limit refusal below), and create actions recording the wrong
+// (or no) target id. `GET /api/ext/v1/audit` is the black-box way to check these: it's the
+// same read path an integrator would use, so these tests exercise the real wire shape rather
+// than reaching into AuditLog internals.
+async function auditRows(app: Hono, auth = ACME): Promise<Array<{ action: string; target_id: string | null; status: number; request_id: string }>> {
+  const res = await app.request('/api/ext/v1/audit', { headers: { Authorization: auth } })
+  assert.equal(res.status, 200)
+  return (await res.json() as { data: Array<{ action: string; target_id: string | null; status: number; request_id: string }> }).data
+}
+
+test('a 403 scope-refusal on a mutating route still produces an audit row with the real refused status', async () => {
+  const { app, cleanup } = harness()
+  try {
+    const res = await app.request('/api/ext/v1/chats', {
+      method: 'POST',
+      headers: { Authorization: ACME_READONLY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'Should be refused', owner: 'u1' }),
+    })
+    assert.equal(res.status, 403, 'a chats:read-only key must not be able to create a chat')
+
+    const rows = await auditRows(app)
+    assert.equal(rows.length, 1, 'the refused attempt itself must be recorded')
+    assert.equal(rows[0].action, 'chat.create')
+    assert.equal(rows[0].status, 403, 'the row must carry the REAL refused status, not a 2xx')
+  } finally {
+    cleanup()
+  }
+})
+
+test('chat.create and message.create audit rows carry the real created resource id', async () => {
+  const { app, cleanup } = harness()
+  try {
+    const made = await app.request('/api/ext/v1/chats', json(ACME, { title: 'Audited', owner: 'u1' }))
+    const chat = await made.json() as { id: string }
+
+    const msgRes = await app.request(`/api/ext/v1/chats/${chat.id}/messages`,
+      json(ACME, { role: 'user', content: 'hi', owner: 'u1', generate: false }))
+    const msg = await msgRes.json() as { id: string }
+    assert.notEqual(msg.id, chat.id, 'sanity: the message id must differ from its parent chat id')
+
+    const rows = await auditRows(app)
+    const createRow = rows.find((r) => r.action === 'chat.create')
+    const messageRow = rows.find((r) => r.action === 'message.create')
+    assert.ok(createRow, 'expected a chat.create row')
+    assert.ok(messageRow, 'expected a message.create row')
+    assert.equal(createRow!.target_id, chat.id, 'chat.create must name the chat it actually created, not null')
+    assert.equal(messageRow!.target_id, msg.id, 'message.create must name the MESSAGE it created, not the parent chat')
+  } finally {
+    cleanup()
+  }
+})
+
+test('an audited row carries a real request id, never "unknown"', async () => {
+  const { app, cleanup } = harness()
+  try {
+    await app.request('/api/ext/v1/chats', json(ACME, { title: 'X', owner: 'u1' }))
+    const rows = await auditRows(app)
+    assert.equal(rows.length, 1)
+    assert.notEqual(rows[0].request_id, 'unknown')
+    assert.ok(rows[0].request_id.length > 0)
+  } finally {
+    cleanup()
+  }
+})
+
+test('an inbound X-Request-Id is honored and shows up on the audit row for that request', async () => {
+  const { app, cleanup } = harness()
+  try {
+    await app.request('/api/ext/v1/chats', {
+      method: 'POST',
+      headers: { Authorization: ACME, 'Content-Type': 'application/json', 'X-Request-Id': 'req_from_client' },
+      body: JSON.stringify({ title: 'X', owner: 'u1' }),
+    })
+    const rows = await auditRows(app)
+    assert.equal(rows.length, 1)
+    assert.equal(rows[0].request_id, 'req_from_client', 'the CLIENT-supplied request id must be the one recorded')
+  } finally {
+    cleanup()
+  }
+})
+
+test('a rate-limited mutation (the blanket per-tenant budget) still produces an audit row', async () => {
+  const ext: ExtRouteDeps = { idempotency: new IdempotencyStore(), limiter: new TenantLimiter({ maxInFlight: 100, ratePerMinute: 1 }) }
+  const { app, db, cleanup } = harness(ext)
+  try {
+    const post = (title: string) => json(ACME, { title, owner: 'u1' })
+    const first = await app.request('/api/ext/v1/chats', post('One'))
+    assert.equal(first.status, 201, 'consumes the one-per-minute budget')
+
+    const second = await app.request('/api/ext/v1/chats', post('Two'))
+    assert.equal(second.status, 429, 'the budget is exhausted, before any route-specific middleware runs')
+
+    // Read directly from the store rather than via GET /audit — that read endpoint is ITSELF
+    // subject to the very same blanket per-tenant budget this test is deliberately exhausting
+    // (a ratePerMinute:1 tenant has nothing left for a third call, audit read included).
+    const rows = new AuditLog(db).list('acme', {})
+    // One row for the successful create, one for the refused second attempt.
+    assert.equal(rows.length, 2)
+    const refusal = rows.find((r) => r.status === 429)
+    assert.ok(refusal, 'the blanket rate-limit refusal must still be recorded')
+    assert.equal(refusal!.action, 'request.rate_limited')
   } finally {
     cleanup()
   }

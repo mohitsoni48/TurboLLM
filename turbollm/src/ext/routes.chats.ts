@@ -5,13 +5,14 @@
 // never from the request — and every not-found path returns 404, not 403, so one tenant
 // can never use status codes to probe whether another tenant's id exists (spec 27 §7.2).
 import type { Hono } from 'hono'
+import { requestId as requestIdMiddleware } from 'hono/request-id'
 import type { Deps } from '../deps.js'
 import { extAuth, requireScope, scopeFor } from './auth.js'
-import { extError, mapStoreError } from './errors.js'
+import { extError, mapStoreError, requestId as makeRequestId } from './errors.js'
 import { parseInclude, toChatDTO, toMessageDTO } from './dto.js'
 import { IdempotencyStore } from './idempotency.js'
 import { TenantLimiter, DEFAULT_MAX_IN_FLIGHT_PER_TENANT, DEFAULT_REQUESTS_PER_MINUTE_PER_TENANT } from './limits.js'
-import { AuditLog, auditMiddleware, toAuditDTO } from './audit.js'
+import { AuditLog, auditMiddleware, recordRateLimitRefusal, toAuditDTO } from './audit.js'
 
 const BASE = '/api/ext/v1'
 /** Operation tag for `IdempotencyStore` (see idempotency.ts's own header comment on why this
@@ -45,6 +46,16 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps): v
   })
   const audit = ext?.audit ?? new AuditLog(d.db)
 
+  // Request-id FIRST — ahead of extAuth, rate-limiting, and every route. Honors an inbound
+  // `X-Request-Id` request header when the caller sends one (validated: non-empty, ≤255
+  // chars, `\w`/`-`/`=` only — matching hono/request-id's own validation), otherwise
+  // generates one in the same `req_<uuid>` shape errors.ts's error envelope already uses, so
+  // one id can correlate a support report across an error RESPONSE and an audit trail ROW for
+  // the exact same request. `auditMiddleware`/`recordRateLimitRefusal` (audit.ts) both read it
+  // via `c.get('requestId')` — never from a response header, which is one-way (the client's
+  // OWN request id would never be picked up that way) and was never actually set by anything
+  // in this codebase in the first place.
+  app.use(`${BASE}/*`, requestIdMiddleware({ generator: () => makeRequestId() }))
   app.use(`${BASE}/*`, extAuth(d))
   // Per-tenant request budget (spec 27 §8.4) covering the WHOLE surface, including routes
   // registered later by registerExtRunRoutes — Hono matches `app.use` middleware by path
@@ -52,9 +63,18 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps): v
   // as long as this runs before the app starts serving (mount.ts always registers chat routes
   // first). Runs after extAuth so `extTenant` is already resolved; a request that failed auth
   // never counts against the tenant's budget (there is no tenant to charge it to).
+  //
+  // This is a BLANKET `app.use`, so it runs ahead of every route-specific middleware —
+  // including `auditMiddleware`, no matter how that is ordered on any individual route. A 429
+  // refused here would otherwise vanish from the audit trail entirely (confirmed live: a
+  // tenant with an exhausted budget got the expected 429, and the audit log came back empty),
+  // so this records the refusal itself via `recordRateLimitRefusal` before returning it —
+  // passing `429` explicitly rather than reading `c.res.status` (see that function's own doc
+  // comment on why `c.res` isn't populated yet at this point in the middleware).
   app.use(`${BASE}/*`, async (c, next) => {
     const tenant = c.get('extTenant') as string
     if (!limiter.tryRequest(tenant)) {
+      await recordRateLimitRefusal(audit, c, 429)
       return extError(c, 'capacity', 'rate_limited',
         'Too many requests for this tenant. Slow down and retry shortly.',
         { status: 429, retryable: true, retryAfterMs: 60_000 })
@@ -81,7 +101,14 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps): v
     }
   })
 
-  app.post(`${BASE}/chats`, requireScope('chats:write'), auditMiddleware(audit, 'chat.create'), async (c) => {
+  // auditMiddleware is registered BEFORE requireScope on every mutating route (here and
+  // below) — not after, as an earlier version of this file had it. `requireScope` returns
+  // early via `extError` (no `next()` call) when the key lacks the scope, so an `auditMiddleware`
+  // registered AFTER it would simply never run for a scope refusal — confirmed live: a
+  // `chats:read`-only key POSTing here got the expected 403, and the audit log came back
+  // empty. `auditMiddleware` already runs `next()` first and records the REAL final status
+  // (see its own doc comment), so putting it first here still correctly captures the 403.
+  app.post(`${BASE}/chats`, auditMiddleware(audit, 'chat.create'), requireScope('chats:write'), async (c) => {
     const b = await body<{ title: string; model: string; system_prompt: string; sampling: Record<string, unknown>; metadata: Record<string, unknown>; owner: string }>(c)
     const tenant = c.get('extTenant') as string
     const idempotencyKey = c.req.header('Idempotency-Key')?.trim() || undefined
@@ -90,8 +117,14 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps): v
     // earlier attempt of the same request — return that frozen result rather than creating a
     // second chat. Checked before any store write, so a retry never even reaches createChat.
     if (idempotencyKey) {
-      const cached = idempotency.lookup(tenant, IDEMPOTENCY_OP, idempotencyKey)
-      if (cached) return c.json(cached, 201)
+      const cached = idempotency.lookup(tenant, IDEMPOTENCY_OP, idempotencyKey) as { id?: string } | null
+      if (cached) {
+        // Route has no `:id` param to fall back on (this is POST /chats) — without this, the
+        // audit row for a replay would carry a null targetId even though the real chat id is
+        // sitting right here in the cached DTO.
+        if (cached.id) c.set('auditTargetId', cached.id)
+        return c.json(cached, 201)
+      }
     }
 
     try {
@@ -99,6 +132,9 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps): v
         title: b.title, model: b.model, systemPrompt: b.system_prompt,
         sampling: b.sampling, metadata: b.metadata,
       })
+      // The real created-resource id, for auditMiddleware — POST /chats has no `:id` route
+      // param at all, so without this every chat.create audit row would carry targetId: null.
+      c.set('auditTargetId', chat.id)
       const dto = toChatDTO(chat)
       // Commit point is immediately after creation succeeds (spec §7.6) — there is no engine
       // work in chat creation at all, so "before the engine is touched" is satisfied trivially;
@@ -126,7 +162,7 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps): v
     }
   })
 
-  app.patch(`${BASE}/chats/:id`, requireScope('chats:write'), auditMiddleware(audit, 'chat.update'), async (c) => {
+  app.patch(`${BASE}/chats/:id`, auditMiddleware(audit, 'chat.update'), requireScope('chats:write'), async (c) => {
     const b = await body<{ title: string; system_prompt: string; sampling: Record<string, unknown>; metadata: Record<string, unknown>; owner: string; if_version: number }>(c)
     try {
       const chat = await d.chatStore.updateChat(
@@ -142,7 +178,7 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps): v
     }
   })
 
-  app.delete(`${BASE}/chats/:id`, requireScope('chats:write'), auditMiddleware(audit, 'chat.delete'), async (c) => {
+  app.delete(`${BASE}/chats/:id`, auditMiddleware(audit, 'chat.delete'), requireScope('chats:write'), async (c) => {
     try {
       const gone = await d.chatStore.deleteChat(scopeFor(c, c.req.query('owner')), c.req.param('id'))
       if (!gone) return extError(c, 'not_found', 'not_found', 'Not found.')
@@ -167,7 +203,7 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps): v
     }
   })
 
-  app.post(`${BASE}/chats/:id/messages`, requireScope('chats:write'), auditMiddleware(audit, 'message.create'), async (c) => {
+  app.post(`${BASE}/chats/:id/messages`, auditMiddleware(audit, 'message.create'), requireScope('chats:write'), async (c) => {
     const b = await body<{ role: 'user' | 'assistant'; content: string; reasoning: string; owner: string; generate: boolean }>(c)
     const content = (b.content ?? '').trim()
     if (!content) return extError(c, 'invalid_request', 'invalid_input', 'Type a message or attach a file.', { param: 'content' })
@@ -176,6 +212,9 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps): v
         const msg = await d.chatStore.addMessage(scopeFor(c, b.owner), c.req.param('id'), {
           role: b.role ?? 'user', content, reasoning: b.reasoning,
         })
+        // The real created message id — this route's own `:id` param names the CHAT, not the
+        // message just created, so without this the audit row would point at the parent.
+        c.set('auditTargetId', msg.id)
         return c.json(toMessageDTO(msg, parseInclude(c.req.query('include'))), 201)
       } catch (e) {
         const m = mapStoreError(e)
@@ -204,7 +243,7 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps): v
     }
   })
 
-  app.patch(`${BASE}/messages/:id`, requireScope('chats:write'), auditMiddleware(audit, 'message.update'), async (c) => {
+  app.patch(`${BASE}/messages/:id`, auditMiddleware(audit, 'message.update'), requireScope('chats:write'), async (c) => {
     const b = await body<{ content: string; metadata: Record<string, unknown>; owner: string; if_version: number }>(c)
     try {
       const msg = await d.chatStore.updateMessage(
@@ -220,7 +259,7 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps): v
     }
   })
 
-  app.delete(`${BASE}/messages/:id`, requireScope('chats:write'), auditMiddleware(audit, 'message.delete'), async (c) => {
+  app.delete(`${BASE}/messages/:id`, auditMiddleware(audit, 'message.delete'), requireScope('chats:write'), async (c) => {
     try {
       const gone = await d.chatStore.deleteMessage(scopeFor(c, c.req.query('owner')), c.req.param('id'))
       if (!gone) return extError(c, 'not_found', 'not_found', 'Not found.')

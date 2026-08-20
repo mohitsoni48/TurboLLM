@@ -8,13 +8,33 @@
 // every conversation, defeating the tenancy boundary it exists to police.
 import { randomUUID } from 'node:crypto'
 import type { Context, MiddlewareHandler } from 'hono'
+// Side-effect-only type import: pulls in hono/request-id's own `declare module 'hono' {
+// interface ContextVariableMap { requestId: string } }` augmentation so `c.get('requestId')`
+// below is typed, regardless of whether some OTHER file in the program happens to import the
+// runtime middleware first. routes.chats.ts is the one that actually mounts it (see that
+// file's own comment on WHY it must run ahead of extAuth/rate-limiting/every route).
+import type {} from 'hono/request-id'
 import type { ConversationStore } from '../chat/db.js'
+
+// Same declaration-merging pattern auth.ts uses for `extTenant`/`extScopes`: a handler that
+// creates something sets this on the way out (`c.set('auditTargetId', chat.id)`) so
+// `auditMiddleware` can record the ACTUAL created resource's id instead of guessing from the
+// route's own `:id` param — which for a `POST /chats` or `POST .../messages` create route
+// either doesn't exist or names the PARENT, not the thing that was just created.
+declare module 'hono' {
+  interface ContextVariableMap {
+    auditTargetId: string
+  }
+}
 
 export interface AuditEntry {
   tenant: string
   owner: string
   /** Dotted verb: chat.create | chat.update | chat.delete | message.create |
-   *  message.update | message.delete | run.start | run.cancel */
+   *  message.update | message.delete | run.start | run.cancel — plus the one sentinel value
+   *  `request.rate_limited`, used ONLY by `recordRateLimitRefusal` below for a mutation
+   *  rejected by the blanket per-tenant budget before any route-specific handler (and so
+   *  before the specific verb it was headed for) was ever reached. */
   action: string
   targetId: string | null
   requestId: string
@@ -114,8 +134,18 @@ async function ownerOf(c: Context): Promise<string> {
  *  call site (routes.chats.ts / routes.runs.ts) rather than inferred from the path — the two
  *  are 1:1 with the dotted verbs in `AuditEntry`'s doc comment, and passing it explicitly
  *  means there is no path-regex to keep in sync as routes change. Runs `next()` FIRST so the
- *  recorded status reflects what the client actually received, including error responses —
- *  an attempted-but-refused mutation (404, 409, ...) is itself worth recording. */
+ *  recorded status reflects what the client actually received, including error responses — an
+ *  attempted-but-refused mutation (403 insufficient_scope, 404, 409, ...) is itself worth
+ *  recording, which is also WHY this must be registered as the OUTERMOST wrapper on each
+ *  route — ahead of `requireScope`, not after it (see routes.chats.ts/routes.runs.ts's own
+ *  comments on this ordering, and mount.ts's blanket rate-limit middleware for the one refusal
+ *  path that can't be fixed by per-route ordering at all, since it runs before ANY route -
+ *  specific middleware).
+ *
+ *  `targetId` prefers `c.get('auditTargetId')` — set by the handler itself right before it
+ *  returns, when the handler just CREATED something the route's own `:id` param can't name
+ *  (`POST /chats`, `POST .../messages`, `POST .../generate`) — falling back to the route's
+ *  `:id` param for every route that already names its target that way (update/delete/cancel). */
 export function auditMiddleware(audit: AuditLog, action: string): MiddlewareHandler {
   return async (c, next) => {
     await next()
@@ -126,10 +156,42 @@ export function auditMiddleware(audit: AuditLog, action: string): MiddlewareHand
       tenant,
       owner: await ownerOf(c),
       action,
-      targetId: c.req.param('id') ?? null,
-      requestId: c.res.headers.get('X-Request-Id') ?? 'unknown',
+      targetId: (c.get('auditTargetId') as string | undefined) ?? c.req.param('id') ?? null,
+      requestId: (c.get('requestId') as string | undefined) ?? 'unknown',
       status: c.res.status,
       keyPrefix: keyPrefixFrom(c),
     })
   }
+}
+
+/** The blanket per-tenant request-budget middleware (routes.chats.ts) runs BEFORE any
+ *  route-specific middleware at all — including a reordered `auditMiddleware` — so a 429
+ *  refusal there never reaches it, and there is no route-specific `action` string to use
+ *  either (no route has matched yet). Records the refusal directly from that middleware
+ *  instead, under the `request.rate_limited` sentinel action. Gated by `shouldAudit` exactly
+ *  like `auditMiddleware` itself: the budget covers read traffic too (limits.ts's own comment
+ *  on why), but only mutations belong in the trail.
+ *
+ *  `status` is a required, EXPLICIT parameter rather than read off `c.res.status` — unlike
+ *  `auditMiddleware` above (which reads `c.res` only after `await next()` has let Hono's own
+ *  dispatch loop assign it from the downstream return value), this fires from inside the SAME
+ *  middleware that is about to construct and return the error response. `c.json()`/`extError`
+ *  build a `Response` object directly; they do not write it onto `c.res` themselves — only
+ *  Hono's `compose()` does that, by assigning the HANDLER'S RETURN VALUE after the handler
+ *  resolves. Called before that return, `c.res` would still reflect whatever it was already
+ *  (typically an unset default), not the 429 about to be sent — reading it here would silently
+ *  record the wrong status. */
+export async function recordRateLimitRefusal(audit: AuditLog, c: Context, status: number): Promise<void> {
+  if (!audit.shouldAudit(c.req.method)) return
+  const tenant = c.get('extTenant') as string | undefined
+  if (!tenant) return
+  audit.record({
+    tenant,
+    owner: await ownerOf(c),
+    action: 'request.rate_limited',
+    targetId: c.req.param('id') ?? null,
+    requestId: (c.get('requestId') as string | undefined) ?? 'unknown',
+    status,
+    keyPrefix: keyPrefixFrom(c),
+  })
 }

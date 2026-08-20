@@ -2,6 +2,10 @@
 // switches on; `code` is open, so a new failure mode is describable without a major version.
 import { randomUUID } from 'node:crypto'
 import type { Context } from 'hono'
+// Side-effect-only type import — see audit.ts's identical one for why: pulls in
+// hono/request-id's `declare module 'hono' { interface ContextVariableMap { requestId:
+// string } }` augmentation so `c.get('requestId')` below is typed.
+import type {} from 'hono/request-id'
 import type { ContentfulStatusCode } from 'hono/utils/http-status'
 import { StoreError } from '../chat/store/chat-store.js'
 
@@ -32,7 +36,12 @@ export function extError(
   opts?: { status?: number; retryable?: boolean; retryAfterMs?: number; param?: string },
 ) {
   const status = opts?.status ?? defaultStatus(type)
-  const id = requestId()
+  // Prefer the id hono/request-id already resolved for this request (routes.chats.ts mounts
+  // it ahead of everything else on /api/ext/v1/*, honoring an inbound X-Request-Id or
+  // generating one) — that's what lets a support report correlate this error response with
+  // the audit trail row auditMiddleware records for the SAME request (audit.ts). Falls back to
+  // a fresh id only if extError is ever reached from somewhere that middleware doesn't cover.
+  const id = (c.get('requestId') as string | undefined) ?? requestId()
   if (opts?.retryAfterMs) c.header('Retry-After', String(Math.ceil(opts.retryAfterMs / 1000)))
   return c.json({
     error: {

@@ -16,6 +16,7 @@ import { registerExtChatRoutes } from './routes.chats.js'
 import { registerExtRunRoutes, type ExtRouteDeps } from './routes.runs.js'
 import { IdempotencyStore } from './idempotency.js'
 import { TenantLimiter } from './limits.js'
+import { AuditLog } from './audit.js'
 
 const ACME = 'Bearer tllm-ext-acme'
 const GLOBEX = 'Bearer tllm-ext-globex'
@@ -45,7 +46,7 @@ function harness(bodyFactory?: () => Promise<{ status: 'complete' | 'aborted' }>
       return bodyFactory ? await bodyFactory() : { status: 'complete' as const }
     },
   }, ext)
-  return { app, runs, cleanup: () => { conv.close(); rmSync(dir, { recursive: true, force: true }) } }
+  return { app, runs, db: conv, cleanup: () => { conv.close(); rmSync(dir, { recursive: true, force: true }) } }
 }
 
 const post = (auth: string, b: unknown, accept = 'application/json') => ({
@@ -76,6 +77,27 @@ test('JSON mode returns 202 with a run and persists both messages first', async 
     // both exist independently of whether generation succeeded.
     const list = await (await app.request(`/api/ext/v1/chats/${chatId}/messages?owner=u1`, { headers: { Authorization: ACME } })).json() as { data: Array<{ role: string }> }
     assert.deepEqual(list.data.map((m) => m.role), ['user', 'assistant'])
+  } finally {
+    cleanup()
+  }
+})
+
+test('run.start audit rows carry the real created run id, not the parent chat id', async () => {
+  const { app, runs, db, cleanup } = harness()
+  try {
+    const chatId = await newChat(app)
+    const res = await app.request(`/api/ext/v1/chats/${chatId}/messages`,
+      post(ACME, { role: 'user', content: 'hi', owner: 'u1' }))
+    const run = await res.json() as { id: string }
+    assert.notEqual(run.id, chatId, 'sanity: the run id must differ from the chat id')
+    await runs.settled(run.id)
+
+    // Direct store read (see routes.chats.test.ts's identical rationale): this route registers
+    // its OWN AuditLog fallback since no `ext.audit` was threaded through by this harness call.
+    const rows = new AuditLog(db).list('acme', {})
+    const startRow = rows.find((r) => r.action === 'run.start')
+    assert.ok(startRow, 'expected a run.start row')
+    assert.equal(startRow!.targetId, run.id, 'run.start must name the RUN it created, not the parent chat')
   } finally {
     cleanup()
   }
