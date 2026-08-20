@@ -24,6 +24,41 @@ export interface PublicRun {
   endedAt: string | null
 }
 
+/** The persistence port a durable run store must satisfy (spec 27 §6.4). An interface, not
+ *  `ConversationStore` itself, so this file stays unit-testable without a real DB. `status` is
+ *  typed as the wider `string` here — the same shape `ConversationStore.ExtRunRecord` returns —
+ *  because the DB layer stores run status as an opaque column; `PublicRunManager` is the one
+ *  place that knows the closed set of `RunStatus` values and narrows on the way in. */
+export interface RunRecordStore {
+  upsertExtRun(r: PublicRun): void
+  getExtRun(id: string): RunRecordRow | null
+  listExtRuns(tenant: string, limit?: number): RunRecordRow[]
+  markStreamingExtRunsFailed(code: string, message: string): number
+}
+
+/** What comes back out of the durable store — same fields as {@link PublicRun}, but `status`
+ *  is unnarrowed (a plain DB column), matching `ConversationStore.ExtRunRecord`. */
+export interface RunRecordRow {
+  id: string
+  chatId: string
+  messageId: string
+  tenant: string
+  owner: string
+  status: string
+  eventSeq: number
+  error: { type: string; code: string; message: string } | null
+  createdAt: string
+  endedAt: string | null
+}
+
+/** `RunRecordRow.status` only ever holds one of the closed set of `RunStatus` values — every
+ *  write path (`upsertExtRun` from a `PublicRun`, `markStreamingExtRunsFailed`'s hardcoded
+ *  `'failed'`) originates from this file. Narrowing here, once, keeps that assumption in a
+ *  single place instead of scattered `as RunStatus` casts. */
+function rowToRun(r: RunRecordRow): PublicRun {
+  return { ...r, status: r.status as RunStatus }
+}
+
 /** What the manager drives. Returns the terminal status; may throw, which becomes `failed`. */
 export type RunBody = (args: {
   emit: EmitSink
@@ -48,10 +83,14 @@ export class PublicRunManager {
   private runs = new Map<string, RunState>()
   private readonly bufferCap: number
   private readonly orphanTimeoutMs: number
+  /** Optional write-through persistence (spec 27 §6.4). Undefined ⇒ purely in-memory, same
+   *  behavior as Phase 3 — every `this.db?.` call below is then simply a no-op. */
+  private readonly db?: RunRecordStore
 
-  constructor(opts?: { bufferCap?: number; orphanTimeoutMs?: number }) {
+  constructor(opts?: { bufferCap?: number; orphanTimeoutMs?: number; db?: RunRecordStore }) {
     this.bufferCap = opts?.bufferCap ?? DEFAULT_BUFFER_CAP
     this.orphanTimeoutMs = opts?.orphanTimeoutMs ?? DEFAULT_ORPHAN_TIMEOUT_MS
+    this.db = opts?.db
   }
 
   start(params: { scope: Scope; chatId: string; messageId: string; body: RunBody }): PublicRun {
@@ -72,6 +111,10 @@ export class PublicRunManager {
       createdAt: new Date().toISOString(),
       endedAt: null,
     }
+    // Written synchronously, before the body has taken its first `await` — so the row exists
+    // in the DB even for a run whose settlement this process never gets to observe (e.g. the
+    // caller doesn't await `settled()` before the process ends).
+    this.db?.upsertExtRun(run)
 
     const emit: EmitSink = (ev) => {
       const buffered = buffer.push(ev.event, ev.data)
@@ -88,15 +131,21 @@ export class PublicRunManager {
 
     state.settled = (async () => {
       run.status = 'streaming'
+      this.db?.upsertExtRun(run)
       try {
         const outcome = await params.body({ emit, signal: ac.signal })
         run.status = ac.signal.aborted ? 'aborted' : outcome.status
+        this.db?.upsertExtRun(run)
       } catch (e) {
         run.status = ac.signal.aborted ? 'aborted' : 'failed'
         run.error = { type: 'engine', code: 'engine_error', message: (e as Error).message }
         emit({ event: 'error', data: run.error })
+        this.db?.upsertExtRun(run)
       } finally {
         run.endedAt = new Date().toISOString()
+        // eventSeq is flushed with the status transitions only, matching the checkpointing
+        // discipline the adapter path uses — not per event, which would be one write per token.
+        this.db?.upsertExtRun(run)
         // The terminal frame is pushed to the buffer BEFORE 'idle', so subscribeToBuffer's
         // documented invariant delivers it to every attached client before ending them.
         emit({ event: 'done', data: { run_id: run.id, status: run.status, message_id: run.messageId } })
@@ -109,11 +158,19 @@ export class PublicRunManager {
   }
 
   get(id: string): PublicRun | null {
-    return this.runs.get(id)?.run ?? null
+    const inMemory = this.runs.get(id)?.run
+    if (inMemory) return inMemory
+    const row = this.db?.getExtRun(id)
+    return row ? rowToRun(row) : null
   }
 
   list(tenant: string): PublicRun[] {
-    return [...this.runs.values()].filter((s) => s.run.tenant === tenant).map((s) => s.run)
+    const inMemory = [...this.runs.values()].filter((s) => s.run.tenant === tenant).map((s) => s.run)
+    if (!this.db) return inMemory
+    const seen = new Set(inMemory.map((r) => r.id))
+    // In-memory copy wins on id collision — it is fresher than whatever was last flushed.
+    const persisted = this.db.listExtRuns(tenant).filter((r) => !seen.has(r.id)).map(rowToRun)
+    return [...inMemory, ...persisted]
   }
 
   /** Resolves when the run's body has settled. Test and shutdown helper. */
@@ -218,16 +275,23 @@ export class PublicRunManager {
     }
   }
 
-  /** Runs do not survive a restart (spec 27 §6.4) — nothing is in memory to resume. Any run
-   *  row still marked streaming from a previous process is closed out as failed. */
+  /** Runs do not RESUME across a restart (spec 27 §6.4) — nothing in-process survives to pick
+   *  a run back up. What DOES survive is the record: any row a previous process left
+   *  `queued`/`streaming` in the DB (this process's own in-memory map is always empty at
+   *  construction, so that part of the sweep below is a formality for the common case, but is
+   *  kept for the rare instance where a caller reconciles a manager that already has runs) is
+   *  closed out here as `failed`/`daemon_restarted`, so a client that reconnects gets an honest
+   *  answer instead of a 404 that looks like the run never existed. */
   reconcileOnStartup(): void {
     for (const s of this.runs.values()) {
       if (!s.run.endedAt) {
         s.run.status = 'failed'
         s.run.error = { type: 'engine', code: 'daemon_restarted', message: 'The daemon restarted while this run was streaming.' }
         s.run.endedAt = new Date().toISOString()
+        this.db?.upsertExtRun(s.run)
       }
     }
+    this.db?.markStreamingExtRunsFailed('daemon_restarted', 'The daemon restarted while this run was streaming.')
   }
 
   /** Drop terminal runs older than `maxAgeMs` so the map cannot grow without bound. */
