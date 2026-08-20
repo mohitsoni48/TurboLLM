@@ -27,6 +27,7 @@ function harness(ext?: ExtRouteDeps) {
   const conv = new ConversationStore(dir)
   // Both tenants are served by the same SQLite store here; scoping is what keeps them apart.
   const d = {
+    db: conv,
     chatStore: new ChatStoreRouter(conv.chatStore, conv.chatStore),
     store: { snapshot: () => ({ apiKeys: [
       { hash: keyHash(ACME), tenant: 'acme' },
@@ -48,6 +49,7 @@ function harnessNoAdapter() {
   const dir = mkdtempSync(join(tmpdir(), 'turbollm-ext-routes-noadapter-'))
   const conv = new ConversationStore(dir)
   const d = {
+    db: conv,
     chatStore: new ChatStoreRouter(conv.chatStore, null),
     store: { snapshot: () => ({ apiKeys: [
       { hash: keyHash(ACME), tenant: 'acme' },

@@ -24,6 +24,7 @@ function harness(bodyFactory?: () => Promise<{ status: 'complete' | 'aborted' }>
   const dir = mkdtempSync(join(tmpdir(), 'turbollm-ext-runs-'))
   const conv = new ConversationStore(dir)
   const d = {
+    db: conv,
     chatStore: new ChatStoreRouter(conv.chatStore, conv.chatStore),
     // resolveTenantFromKey (ext/auth.ts) hashes the presented key with the real SHA-256
     // derivation before comparing (see routes.chats.test.ts's identical convention) — stored

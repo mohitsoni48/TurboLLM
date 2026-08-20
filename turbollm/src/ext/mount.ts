@@ -19,10 +19,12 @@ import { registerExtChatRoutes } from './routes.chats.js'
 import { registerExtRunRoutes, type RunDeps } from './routes.runs.js'
 import { IdempotencyStore } from './idempotency.js'
 import { TenantLimiter, DEFAULT_MAX_IN_FLIGHT_PER_TENANT, DEFAULT_REQUESTS_PER_MINUTE_PER_TENANT } from './limits.js'
+import { AuditLog } from './audit.js'
 
 export interface ExtDeps {
   idempotency: IdempotencyStore
   limiter: TenantLimiter
+  audit: AuditLog
 }
 
 export function mountExtApi(app: Hono, d: Deps, runs: PublicRunManager, rd: RunDeps): ExtDeps | null {
@@ -34,6 +36,10 @@ export function mountExtApi(app: Hono, d: Deps, runs: PublicRunManager, rd: RunD
       maxInFlight: cfg.maxInFlightPerTenant ?? DEFAULT_MAX_IN_FLIGHT_PER_TENANT,
       ratePerMinute: cfg.requestsPerMinutePerTenant ?? DEFAULT_REQUESTS_PER_MINUTE_PER_TENANT,
     }),
+    // Shared with BOTH route registrars (same reasoning as idempotency/limiter above): one
+    // AuditLog per mounted app, over the SAME ConversationStore connection, so a chat mutation
+    // and a run mutation for the same tenant land in the same table via the same instance.
+    audit: new AuditLog(d.db),
   }
   registerExtChatRoutes(app, d, ext)
   registerExtRunRoutes(app, d, runs, rd, ext)

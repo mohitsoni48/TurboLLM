@@ -17,6 +17,7 @@ import { extError, mapStoreError } from './errors.js'
 import { PublicRunManager, type PublicRun, type RunBody } from './run-manager.js'
 import { IdempotencyStore } from './idempotency.js'
 import { TenantLimiter, DEFAULT_MAX_IN_FLIGHT_PER_TENANT, DEFAULT_REQUESTS_PER_MINUTE_PER_TENANT } from './limits.js'
+import { AuditLog, auditMiddleware } from './audit.js'
 
 const BASE = '/api/ext/v1'
 /** Operation tag for `IdempotencyStore` (see idempotency.ts's own header comment): the store is
@@ -33,6 +34,7 @@ export interface RunDeps {
 export interface ExtRouteDeps {
   idempotency: IdempotencyStore
   limiter: TenantLimiter
+  audit?: AuditLog
 }
 
 /** What the idempotency store remembers for the generate path: enough to REATTACH to the
@@ -89,8 +91,9 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
     maxInFlight: DEFAULT_MAX_IN_FLIGHT_PER_TENANT,
     ratePerMinute: DEFAULT_REQUESTS_PER_MINUTE_PER_TENANT,
   })
+  const audit = ext?.audit ?? new AuditLog(d.db)
 
-  app.post(`${BASE}/chats/:id/messages/generate`, requireScope('runs:write'), async (c) => {
+  app.post(`${BASE}/chats/:id/messages/generate`, requireScope('runs:write'), auditMiddleware(audit, 'run.start'), async (c) => {
     const chatId = c.req.param('id')
     const b = await c.req.json().catch(() => ({})) as { role?: 'user'; content?: string; owner?: string }
     const scope = scopeFor(c, b.owner)
@@ -201,7 +204,7 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
     })
   })
 
-  app.post(`${BASE}/runs/:id/cancel`, requireScope('runs:write'), (c) => {
+  app.post(`${BASE}/runs/:id/cancel`, requireScope('runs:write'), auditMiddleware(audit, 'run.cancel'), (c) => {
     const run = runs.get(c.req.param('id'))
     if (!run || run.tenant !== c.get('extTenant')) return extError(c, 'not_found', 'not_found', 'Not found.')
     const cancelled = runs.cancel(run.id)

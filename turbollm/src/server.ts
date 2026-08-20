@@ -19,6 +19,7 @@ import { lanAuth, codeAuth } from './auth'
 import { mountExtApi } from './ext/mount'
 import { PublicRunManager } from './ext/run-manager'
 import { createMakeBody } from './ext/generation'
+import { DEFAULT_AUDIT_RETENTION_DAYS } from './ext/audit'
 
 // Reuse TCP connections for all engine and HF fetch calls. Without this, Node
 // opens a new connection per request — ~5–20 ms of extra latency every Claude
@@ -117,6 +118,10 @@ export function createApp(d: Deps): Hono {
     // replay of an already-pruned run fails closed instead of double-generating. Still needs
     // its own bound, so expired entries don't accumulate forever.
     ext?.idempotency.prune()
+    // The audit trail (spec 27 §10) outlives both of the above by design — "who did what" is
+    // exactly the record an operator wants to still have after a run has aged out of the
+    // reaper above — but it still needs its own bound so ext_audit doesn't grow forever.
+    ext?.audit.prune(DEFAULT_AUDIT_RETENTION_DAYS)
   }, 30_000)
   extRunsReaper.unref()
 

@@ -11,6 +11,7 @@ import { extError, mapStoreError } from './errors.js'
 import { parseInclude, toChatDTO, toMessageDTO } from './dto.js'
 import { IdempotencyStore } from './idempotency.js'
 import { TenantLimiter, DEFAULT_MAX_IN_FLIGHT_PER_TENANT, DEFAULT_REQUESTS_PER_MINUTE_PER_TENANT } from './limits.js'
+import { AuditLog, auditMiddleware, toAuditDTO } from './audit.js'
 
 const BASE = '/api/ext/v1'
 /** Operation tag for `IdempotencyStore` (see idempotency.ts's own header comment on why this
@@ -26,19 +27,23 @@ async function body<T>(c: { req: { json(): Promise<unknown> } }): Promise<Partia
 export interface ExtRouteDeps {
   idempotency: IdempotencyStore
   limiter: TenantLimiter
+  audit?: AuditLog
 }
 
 /** `ext` is optional so every pre-existing test/caller that constructs this route set without
  *  it (mount.ts always supplies a shared instance in production; only ad-hoc test harnesses
  *  omit it) keeps compiling and behaving exactly as before — a private, generously-capped
  *  instance is created here as the fallback rather than making callers thread it through for
- *  tests that don't care about idempotency or rate limiting at all. */
+ *  tests that don't care about idempotency or rate limiting at all. `audit` similarly falls
+ *  back to a private instance over the SAME connection (`d.db`) rather than forcing every
+ *  ad-hoc test harness to construct one just to compile. */
 export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps): void {
   const idempotency = ext?.idempotency ?? new IdempotencyStore()
   const limiter = ext?.limiter ?? new TenantLimiter({
     maxInFlight: DEFAULT_MAX_IN_FLIGHT_PER_TENANT,
     ratePerMinute: DEFAULT_REQUESTS_PER_MINUTE_PER_TENANT,
   })
+  const audit = ext?.audit ?? new AuditLog(d.db)
 
   app.use(`${BASE}/*`, extAuth(d))
   // Per-tenant request budget (spec 27 §8.4) covering the WHOLE surface, including routes
@@ -76,7 +81,7 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps): v
     }
   })
 
-  app.post(`${BASE}/chats`, requireScope('chats:write'), async (c) => {
+  app.post(`${BASE}/chats`, requireScope('chats:write'), auditMiddleware(audit, 'chat.create'), async (c) => {
     const b = await body<{ title: string; model: string; system_prompt: string; sampling: Record<string, unknown>; metadata: Record<string, unknown>; owner: string }>(c)
     const tenant = c.get('extTenant') as string
     const idempotencyKey = c.req.header('Idempotency-Key')?.trim() || undefined
@@ -121,7 +126,7 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps): v
     }
   })
 
-  app.patch(`${BASE}/chats/:id`, requireScope('chats:write'), async (c) => {
+  app.patch(`${BASE}/chats/:id`, requireScope('chats:write'), auditMiddleware(audit, 'chat.update'), async (c) => {
     const b = await body<{ title: string; system_prompt: string; sampling: Record<string, unknown>; metadata: Record<string, unknown>; owner: string; if_version: number }>(c)
     try {
       const chat = await d.chatStore.updateChat(
@@ -137,7 +142,7 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps): v
     }
   })
 
-  app.delete(`${BASE}/chats/:id`, requireScope('chats:write'), async (c) => {
+  app.delete(`${BASE}/chats/:id`, requireScope('chats:write'), auditMiddleware(audit, 'chat.delete'), async (c) => {
     try {
       const gone = await d.chatStore.deleteChat(scopeFor(c, c.req.query('owner')), c.req.param('id'))
       if (!gone) return extError(c, 'not_found', 'not_found', 'Not found.')
@@ -162,7 +167,7 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps): v
     }
   })
 
-  app.post(`${BASE}/chats/:id/messages`, requireScope('chats:write'), async (c) => {
+  app.post(`${BASE}/chats/:id/messages`, requireScope('chats:write'), auditMiddleware(audit, 'message.create'), async (c) => {
     const b = await body<{ role: 'user' | 'assistant'; content: string; reasoning: string; owner: string; generate: boolean }>(c)
     const content = (b.content ?? '').trim()
     if (!content) return extError(c, 'invalid_request', 'invalid_input', 'Type a message or attach a file.', { param: 'content' })
@@ -199,7 +204,7 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps): v
     }
   })
 
-  app.patch(`${BASE}/messages/:id`, requireScope('chats:write'), async (c) => {
+  app.patch(`${BASE}/messages/:id`, requireScope('chats:write'), auditMiddleware(audit, 'message.update'), async (c) => {
     const b = await body<{ content: string; metadata: Record<string, unknown>; owner: string; if_version: number }>(c)
     try {
       const msg = await d.chatStore.updateMessage(
@@ -215,7 +220,7 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps): v
     }
   })
 
-  app.delete(`${BASE}/messages/:id`, requireScope('chats:write'), async (c) => {
+  app.delete(`${BASE}/messages/:id`, requireScope('chats:write'), auditMiddleware(audit, 'message.delete'), async (c) => {
     try {
       const gone = await d.chatStore.deleteMessage(scopeFor(c, c.req.query('owner')), c.req.param('id'))
       if (!gone) return extError(c, 'not_found', 'not_found', 'Not found.')
@@ -224,5 +229,15 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps): v
       const m = mapStoreError(e)
       return extError(c, m.type, m.code, m.message, { status: m.status, retryable: m.retryable })
     }
+  })
+
+  // The tenant's own audit trail (spec 27 §10). Read-only — never audited itself
+  // (auditMiddleware is not attached here) — and scoped to `extTenant` exactly like every
+  // other read on this surface, so one tenant can never see another's mutation history.
+  app.get(`${BASE}/audit`, requireScope('chats:read'), (c) => {
+    const tenant = c.get('extTenant') as string
+    const limit = c.req.query('limit') ? Number(c.req.query('limit')) : undefined
+    const rows = audit.list(tenant, { limit, since: c.req.query('since') })
+    return c.json({ data: rows.map(toAuditDTO) })
   })
 }

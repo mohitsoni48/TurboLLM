@@ -1241,6 +1241,26 @@ export class ConversationStore {
       `)
       this.db.exec(`PRAGMA user_version = 47;`)
     }
+    if (v < 48) {
+      // Audit trail for tenant-scoped mutations (spec 27 §10). There is deliberately NO
+      // content column: the log records THAT a chat or message changed, never what was said.
+      // A content-carrying audit log is a second, unscoped copy of every conversation.
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS ext_audit (
+          id TEXT PRIMARY KEY,
+          tenant TEXT NOT NULL,
+          owner TEXT NOT NULL,
+          action TEXT NOT NULL,
+          target_id TEXT,
+          request_id TEXT NOT NULL,
+          status INTEGER NOT NULL,
+          key_prefix TEXT NOT NULL,
+          at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ext_audit_tenant_at ON ext_audit(tenant, at DESC);
+      `)
+      this.db.exec(`PRAGMA user_version = 48;`)
+    }
   }
 
   listConversations(q?: string, kind: 'chat' | 'agent' | 'all' = 'all'): Conversation[] {
