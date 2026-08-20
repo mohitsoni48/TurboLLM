@@ -8,7 +8,8 @@
 // statement) — an unscoped query here would let one tenant read or clobber another's rows.
 import { randomUUID } from 'node:crypto'
 import type { DatabaseSync, SQLInputValue } from 'node:sqlite'
-import { StoreError, type ChatStore, type StoreCapabilities } from './chat-store.js'
+import { branchingMethods, folderMethods } from './capabilities.js'
+import { StoreError, type BranchingStore, type ChatStore, type FolderStore, type StoreCapabilities } from './chat-store.js'
 import type {
   Chat, ChatInput, ChatMessage, ChatPatch, ListOpts, MessageInput, MessagePatch, MessageStatus, Page, Scope,
 } from './types.js'
@@ -87,12 +88,29 @@ function decodeSeqCursor(raw: string): number {
 
 interface Changes { changes: number }
 
-export class SqliteChatStore implements ChatStore {
+export class SqliteChatStore implements ChatStore, FolderStore, BranchingStore {
   readonly capabilities: StoreCapabilities = {
     branching: true, folders: true, search: true, batch: false,
   }
 
-  constructor(private readonly db: DatabaseSync) {}
+  // Mixed in from ./capabilities.js in the constructor.
+  declare listFolders: FolderStore['listFolders']
+  declare getFolder: FolderStore['getFolder']
+  declare createFolder: FolderStore['createFolder']
+  declare renameFolder: FolderStore['renameFolder']
+  declare deleteFolder: FolderStore['deleteFolder']
+  declare moveChatToFolder: FolderStore['moveChatToFolder']
+  declare getMessageVariants: BranchingStore['getMessageVariants']
+  declare setActiveVariant: BranchingStore['setActiveVariant']
+  declare deactivateMessage: BranchingStore['deactivateMessage']
+  declare deactivateMessagesFrom: BranchingStore['deactivateMessagesFrom']
+  declare reactivateMessagesFrom: BranchingStore['reactivateMessagesFrom']
+  declare freezeTail: BranchingStore['freezeTail']
+  declare restoreTail: BranchingStore['restoreTail']
+
+  constructor(private readonly db: DatabaseSync) {
+    Object.assign(this, folderMethods(db), branchingMethods(db))
+  }
 
   private rowToChat(r: ConvRow, messageCount: number, lastMessageAt: string | null): Chat {
     return {

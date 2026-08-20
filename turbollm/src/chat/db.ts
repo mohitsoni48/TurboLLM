@@ -1185,6 +1185,19 @@ export class ConversationStore {
 
       this.db.exec(`PRAGMA user_version = 45;`)
     }
+    if (v < 46) {
+      // Phase 2 Task 4: folder scoping for the FolderStore capability group (spec 27
+      // §4.2). Deliberately a NEW block rather than an extension of v45 above — v45 has
+      // already run (and bumped user_version to 45) on every database that has been
+      // opened since Task 1 landed, so an edit to that block would never execute again
+      // on any of those databases and the folders columns would silently never appear.
+      // hasColumn-guarded for the same reason as every other ALTER here: this ladder has
+      // been renumbered before and a stored user_version can lag behind reality.
+      if (!this.hasColumn('folders', 'tenant')) this.db.exec(`ALTER TABLE folders ADD COLUMN tenant TEXT NOT NULL DEFAULT 'local';`)
+      if (!this.hasColumn('folders', 'owner'))  this.db.exec(`ALTER TABLE folders ADD COLUMN owner TEXT NOT NULL DEFAULT 'default';`)
+      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_folders_scope ON folders(tenant, owner, sort_order);`)
+      this.db.exec(`PRAGMA user_version = 46;`)
+    }
   }
 
   listConversations(q?: string, kind: 'chat' | 'agent' | 'all' = 'all'): Conversation[] {
