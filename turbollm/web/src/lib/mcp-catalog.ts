@@ -405,7 +405,7 @@ export const LOCAL_MCPS: LocalEntry[] = [
     uvx: true,
     argNote: 'Requires a running SearXNG instance.',
     envs: [
-      { key: 'SEARXNG_URL', desc: 'SearXNG meta-search endpoint (default: http://127.0.0.1:8082/search)', required: false },
+      { key: 'SEARXNG_URL', desc: 'SearXNG meta-search endpoint (default: http://127.0.0.1:8082/search)', required: true },
     ],
   },
 ]
