@@ -13,6 +13,11 @@ import { IdempotencyStore } from './idempotency.js'
 import { TenantLimiter, DEFAULT_MAX_IN_FLIGHT_PER_TENANT, DEFAULT_REQUESTS_PER_MINUTE_PER_TENANT } from './limits.js'
 
 const BASE = '/api/ext/v1'
+/** Operation tag for `IdempotencyStore` (see idempotency.ts's own header comment on why this
+ *  exists): the store is shared with routes.runs.ts's `'runs:generate'`, so this tag is what
+ *  keeps a reused `Idempotency-Key` value from colliding across the two genuinely different
+ *  operations. */
+const IDEMPOTENCY_OP = 'chats:create'
 
 async function body<T>(c: { req: { json(): Promise<unknown> } }): Promise<Partial<T>> {
   try { return (await c.req.json()) as Partial<T> } catch { return {} }
@@ -80,7 +85,7 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps): v
     // earlier attempt of the same request — return that frozen result rather than creating a
     // second chat. Checked before any store write, so a retry never even reaches createChat.
     if (idempotencyKey) {
-      const cached = idempotency.lookup(tenant, idempotencyKey)
+      const cached = idempotency.lookup(tenant, IDEMPOTENCY_OP, idempotencyKey)
       if (cached) return c.json(cached, 201)
     }
 
@@ -96,7 +101,7 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps): v
       // concurrent retries still can't both observe a miss (the second's `createChat` may still
       // create a duplicate chat under a true race — see idempotency.ts's own residual-window
       // note — but a SEQUENTIAL retry, the actual reported failure mode, is fully covered).
-      if (idempotencyKey) idempotency.remember(tenant, idempotencyKey, dto)
+      if (idempotencyKey) idempotency.remember(tenant, IDEMPOTENCY_OP, idempotencyKey, dto)
       return c.json(dto, 201)
     } catch (e) {
       const m = mapStoreError(e)

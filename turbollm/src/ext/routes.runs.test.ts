@@ -350,3 +350,40 @@ test('a tenant that exceeds its configured in-flight limit gets 429 on the gener
     cleanup()
   }
 })
+
+// Regression test for a real bug the re-review caught by direct reproduction: mount.ts hands
+// ONE shared IdempotencyStore instance to both routes.chats.ts and routes.runs.ts. Before the
+// store namespaced its keys by operation, a tenant reusing the identical Idempotency-Key value
+// across a POST /chats call and a later, genuinely different POST .../messages/generate call —
+// a plausible client pattern ("create the chat and send the first message" as one logical
+// idempotent action) — made the generate route deserialize the cached ChatDTO as a
+// GenerateReplay, get `undefined` back for `runId`, and fail closed with a false
+// `409 idempotency_replay_expired` on a request that had never actually been attempted before.
+test('a chat-creation Idempotency-Key does not collide with a generate call reusing the same key value', async () => {
+  const ext: ExtRouteDeps = { idempotency: new IdempotencyStore(), limiter: new TenantLimiter({ maxInFlight: 100, ratePerMinute: 1000 }) }
+  const { app, runs, cleanup } = harness(undefined, ext)
+  try {
+    const sharedKey = 'shared-key-123'
+    const chatRes = await app.request('/api/ext/v1/chats', {
+      method: 'POST',
+      headers: { Authorization: ACME, 'Content-Type': 'application/json', 'Idempotency-Key': sharedKey },
+      body: JSON.stringify({ title: 'Chat', owner: 'u1' }),
+    })
+    assert.equal(chatRes.status, 201)
+    const chat = await chatRes.json() as { id: string }
+
+    // Reusing the SAME Idempotency-Key VALUE for a genuinely different operation (generate, not
+    // chat-create) must be treated as a fresh request, never as a replay of the chat-creation call.
+    const genRes = await app.request(`/api/ext/v1/chats/${chat.id}/messages`, {
+      method: 'POST',
+      headers: { Authorization: ACME, 'Content-Type': 'application/json', 'Idempotency-Key': sharedKey },
+      body: JSON.stringify({ role: 'user', content: 'hi', owner: 'u1' }),
+    })
+    assert.equal(genRes.status, 202, 'a genuinely new generate request must not be rejected as a collision with an unrelated chat-creation call')
+    const run = await genRes.json() as { id: string }
+    assert.ok(run.id, 'a real run must have actually been started')
+    await runs.settled(run.id)
+  } finally {
+    cleanup()
+  }
+})

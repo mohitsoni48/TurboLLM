@@ -7,6 +7,18 @@
 // Residual window, stated rather than hidden: the message persists to the integrator's store
 // and the key persists here, with no shared transaction. A crash between them leaves a replay
 // that appends a duplicate user message — visible, and never a lost message.
+//
+// `op` (fix round 2): a single store instance is shared across every idempotent endpoint
+// (mount.ts hands the same instance to both routes.chats.ts and routes.runs.ts), and an
+// integrator's `Idempotency-Key` header is just a client-chosen string — nothing stops the
+// SAME value being reused across two genuinely different operations (a client that treats
+// "create a chat, then send the first message" as one logical idempotent action is a plausible
+// pattern, not a misuse). Without an operation tag baked into the key, that reuse is a real
+// cross-endpoint collision: a POST /chats replay and a POST .../messages/generate replay would
+// read and write the exact same entry, so the generate call would deserialize a ChatDTO as if
+// it were a run pointer and fail closed on a request that was never actually attempted before.
+// Namespacing by `op` at the store level (not left to each call site to remember to prefix)
+// makes that collision structurally impossible for this and any future caller.
 interface Entry { value: unknown; at: number }
 
 const DEFAULT_TTL_MS = 24 * 60 * 60_000
@@ -19,17 +31,18 @@ export class IdempotencyStore {
     this.ttlMs = opts?.ttlMs ?? DEFAULT_TTL_MS
   }
 
-  private key(tenant: string, key: string): string { return `${tenant} ${key}` }
+  private key(tenant: string, op: string, key: string): string { return `${tenant} ${op} ${key}` }
 
-  lookup(tenant: string, key: string): unknown | null {
-    const e = this.entries.get(this.key(tenant, key))
+  lookup(tenant: string, op: string, key: string): unknown | null {
+    const k = this.key(tenant, op, key)
+    const e = this.entries.get(k)
     if (!e) return null
-    if (Date.now() - e.at > this.ttlMs) { this.entries.delete(this.key(tenant, key)); return null }
+    if (Date.now() - e.at > this.ttlMs) { this.entries.delete(k); return null }
     return e.value
   }
 
-  remember<T>(tenant: string, key: string, value: T): T {
-    this.entries.set(this.key(tenant, key), { value, at: Date.now() })
+  remember<T>(tenant: string, op: string, key: string, value: T): T {
+    this.entries.set(this.key(tenant, op, key), { value, at: Date.now() })
     return value
   }
 

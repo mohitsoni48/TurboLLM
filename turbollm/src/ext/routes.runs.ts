@@ -19,6 +19,11 @@ import { IdempotencyStore } from './idempotency.js'
 import { TenantLimiter, DEFAULT_MAX_IN_FLIGHT_PER_TENANT, DEFAULT_REQUESTS_PER_MINUTE_PER_TENANT } from './limits.js'
 
 const BASE = '/api/ext/v1'
+/** Operation tag for `IdempotencyStore` (see idempotency.ts's own header comment): the store is
+ *  shared with routes.chats.ts's `'chats:create'`, so this tag is what keeps a reused
+ *  `Idempotency-Key` value from colliding across the two genuinely different operations — e.g.
+ *  a client that reuses one key across "create the chat" and "send the first message". */
+const IDEMPOTENCY_OP = 'runs:generate'
 
 export interface RunDeps {
   /** Builds the body the manager drives. Injected so route tests need no model. */
@@ -96,7 +101,7 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
     // a cached key means a run for this exact request already exists, so we reattach to THAT
     // run instead of re-running any of the checks below.
     if (idempotencyKey) {
-      const cached = idempotency.lookup(scope.tenant, idempotencyKey) as GenerateReplay | null
+      const cached = idempotency.lookup(scope.tenant, IDEMPOTENCY_OP, idempotencyKey) as GenerateReplay | null
       if (cached) {
         const existing = runs.get(cached.runId)
         if (!existing || existing.tenant !== scope.tenant) {
@@ -159,7 +164,7 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
     // already returned a live `PublicRun` at this line; the injected body's own first engine
     // fetch is still at least one microtask away. A retry that lands anywhere after this line
     // finds this entry and reattaches via the branch above instead of starting a second run.
-    if (idempotencyKey) idempotency.remember(scope.tenant, idempotencyKey, { runId: run.id, userMessageId: userMsgId, messageId: assistantMsgId } satisfies GenerateReplay)
+    if (idempotencyKey) idempotency.remember(scope.tenant, IDEMPOTENCY_OP, idempotencyKey, { runId: run.id, userMessageId: userMsgId, messageId: assistantMsgId } satisfies GenerateReplay)
     inflight.set(chatId, run.id)
     // Released when the run actually SETTLES, not when this HTTP response is sent — the route
     // itself never blocks on generation, so this is fire-and-forget off the manager's own
