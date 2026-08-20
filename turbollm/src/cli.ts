@@ -27,6 +27,7 @@ import { HashStore } from './models/hashes'
 import { resolveProfile, profileToArgs, estimateVram, type LoadProfile } from './models/profile'
 import { getSysInfo } from './sysinfo/sysinfo'
 import { ConversationStore } from './chat/db'
+import { buildChatStore } from './chat/store/startup'
 import { HfClient } from './hf/hf'
 import { DownloadManager } from './downloads/downloads'
 import { BenchRunner } from './bench/bench'
@@ -346,8 +347,20 @@ const startedAt = Date.now()
 // the version we're running? Informational only — npm does the upgrade. The route serves
 // this cache offline-first; the startup check below warms it so the chip is ready.
 const appUpdates = new AppUpdateChecker(version)
+// Pluggable chat storage (spec 27 §4.5): compose the tenant-dispatching router here. A
+// misconfigured adapter must stop the daemon with a message the operator can act on —
+// never surface later as mysterious per-request failures, and never silently fall back
+// to SQLite for tenants the operator configured to go elsewhere.
+let chatStore
+try {
+  chatStore = await buildChatStore(store.snapshot().chatStore, db.chatStore, store.dir())
+} catch (e) {
+  console.error(`[fatal] ${(e as Error).message}`)
+  console.error('[fatal] Fix `chatStore` in config.json, or set { "kind": "sqlite" }, then restart.')
+  process.exit(1)
+}
 // `requestRestart` is attached after the server is created (it must close over it).
-const deps: Deps = { store, registry, manager, scanner, hashes, db, chatStore: db.chatStore, provision, build, updates, appUpdates, hf, downloads, bench, modelRouter, comfy, tools: toolRegistry, version, startedAt }
+const deps: Deps = { store, registry, manager, scanner, hashes, db, chatStore, provision, build, updates, appUpdates, hf, downloads, bench, modelRouter, comfy, tools: toolRegistry, version, startedAt }
 // Sized to the RUNNING engine's own slot count, re-read on every admission (a model swap changes
 // it). `Infinity` when the engine advertises no `--parallel` — see Manager.parallelSlots() for why
 // that is not 1.
