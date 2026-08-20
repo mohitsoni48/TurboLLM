@@ -183,3 +183,98 @@ test('deleteChat removes the chat and cascades to its messages', async () => {
     cleanup()
   }
 })
+
+test('addMessage allocates seq from 1 and maintains chat counters', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    const c = await store.createChat(LOCAL_SCOPE, { title: 'Counting' })
+    const m1 = await store.addMessage(LOCAL_SCOPE, c.id, { role: 'user', content: 'one' })
+    const m2 = await store.addMessage(LOCAL_SCOPE, c.id, { role: 'assistant', content: 'two' })
+    assert.equal(m1.seq, 1)
+    assert.equal(m2.seq, 2)
+    assert.equal(m1.status, 'complete')
+
+    const after = await store.getChat(LOCAL_SCOPE, c.id)
+    assert.equal(after?.messageCount, 2)
+    assert.ok(after?.lastMessageAt)
+  } finally {
+    cleanup()
+  }
+})
+
+test('addMessage allocates seq atomically under concurrent appends', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    const c = await store.createChat(LOCAL_SCOPE, { title: 'Race' })
+    const made = await Promise.all(
+      Array.from({ length: 20 }, (_, i) =>
+        store.addMessage(LOCAL_SCOPE, c.id, { role: 'user', content: `m${i}` })),
+    )
+    const seqs = made.map((m) => m.seq).sort((a, b) => a - b)
+    assert.deepEqual(seqs, Array.from({ length: 20 }, (_, i) => i + 1),
+      'every append got a distinct, gapless seq')
+  } finally {
+    cleanup()
+  }
+})
+
+test('addMessage to a missing chat throws not_found rather than orphaning a row', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    await assert.rejects(
+      () => store.addMessage(LOCAL_SCOPE, 'no-such-chat', { role: 'user', content: 'x' }),
+      /not_found/,
+    )
+  } finally {
+    cleanup()
+  }
+})
+
+test('listMessages paginates in seq order', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    const c = await store.createChat(LOCAL_SCOPE, { title: 'Paged' })
+    for (let i = 0; i < 5; i++) await store.addMessage(LOCAL_SCOPE, c.id, { role: 'user', content: `m${i}` })
+
+    const p1 = await store.listMessages(LOCAL_SCOPE, c.id, { limit: 2 })
+    assert.deepEqual(p1.data.map((m) => m.seq), [1, 2])
+    const p2 = await store.listMessages(LOCAL_SCOPE, c.id, { limit: 2, cursor: p1.nextCursor! })
+    assert.deepEqual(p2.data.map((m) => m.seq), [3, 4])
+    const p3 = await store.listMessages(LOCAL_SCOPE, c.id, { limit: 2, cursor: p2.nextCursor! })
+    assert.deepEqual(p3.data.map((m) => m.seq), [5])
+    assert.equal(p3.hasMore, false)
+  } finally {
+    cleanup()
+  }
+})
+
+test('updateMessage patches content and flags edited; getLastMessage tracks the tail', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    const c = await store.createChat(LOCAL_SCOPE, { title: 'Edit' })
+    const m = await store.addMessage(LOCAL_SCOPE, c.id, { role: 'user', content: 'before' })
+    const patched = await store.updateMessage(LOCAL_SCOPE, m.id, { content: 'after', edited: true })
+    assert.equal(patched?.content, 'after')
+    assert.equal(patched?.edited, true)
+
+    await store.addMessage(LOCAL_SCOPE, c.id, { role: 'assistant', content: 'tail' })
+    assert.equal((await store.getLastMessage(LOCAL_SCOPE, c.id))?.content, 'tail')
+    assert.equal(await store.updateMessage(LOCAL_SCOPE, 'nope', { content: 'x' }), null)
+  } finally {
+    cleanup()
+  }
+})
+
+test('deleteMessage removes only its own row', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    const c = await store.createChat(LOCAL_SCOPE, { title: 'Del' })
+    const a = await store.addMessage(LOCAL_SCOPE, c.id, { role: 'user', content: 'keep' })
+    const b = await store.addMessage(LOCAL_SCOPE, c.id, { role: 'user', content: 'drop' })
+    assert.equal(await store.deleteMessage(LOCAL_SCOPE, b.id), true)
+    assert.equal(await store.getMessage(LOCAL_SCOPE, b.id), null)
+    assert.equal((await store.getMessage(LOCAL_SCOPE, a.id))?.content, 'keep')
+  } finally {
+    cleanup()
+  }
+})

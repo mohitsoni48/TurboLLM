@@ -18,12 +18,26 @@ interface ConvRow {
   created_at: string; updated_at: string
 }
 
+interface MsgRow {
+  id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string
+  reasoning: string; attachments: string; tool_calls: string | null; stats: string
+  created_at: string; is_active: number; edited: number
+}
+
 function safeJson(s: string | null): Record<string, unknown> {
   if (!s) return {}
   try {
     const v = JSON.parse(s) as unknown
     return typeof v === 'object' && v !== null ? (v as Record<string, unknown>) : {}
   } catch { return {} }
+}
+
+function safeArray(s: string | null): unknown[] {
+  if (!s) return []
+  try {
+    const v = JSON.parse(s) as unknown
+    return Array.isArray(v) ? v : []
+  } catch { return [] }
 }
 
 interface ChatCursor { u: string; i: string }
@@ -49,6 +63,22 @@ function decodeCursor(raw: string): ChatCursor {
 function clampLimit(n?: number): number {
   if (!n || n < 1) return 50
   return Math.min(n, 200)
+}
+
+function encodeSeqCursor(seq: number): string {
+  return Buffer.from(JSON.stringify({ s: seq }), 'utf8').toString('base64url')
+}
+
+function decodeSeqCursor(raw: string): number {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8'))
+  } catch {
+    throw new StoreError('contract_violation', 'invalid_cursor: not decodable')
+  }
+  const c = parsed as { s?: unknown }
+  if (typeof c?.s !== 'number') throw new StoreError('contract_violation', 'invalid_cursor: wrong shape')
+  return c.s
 }
 
 interface Changes { changes: number }
@@ -89,6 +119,29 @@ export class SqliteChatStore implements ChatStore {
       version: Date.parse(r.updated_at) || 1,
       createdAt: r.created_at,
       updatedAt: r.updated_at,
+    }
+  }
+
+  /** `status` and `version` have no columns in Phase 1. Every row written by the
+   *  existing UI path is a finished message, so it maps to 'complete'; Phase 2 adds the
+   *  real column for the run machinery. `version` derives from created_at for the same
+   *  reason as Chat.version. */
+  private rowToMessage(r: MsgRow): ChatMessage {
+    return {
+      id: r.id,
+      chatId: r.conv_id,
+      seq: r.seq,
+      role: r.role,
+      content: r.content,
+      status: 'complete',
+      version: Date.parse(r.created_at) || 1,
+      createdAt: r.created_at,
+      edited: r.edited === 1,
+      reasoning: r.reasoning ?? '',
+      attachments: safeArray(r.attachments) as string[],
+      toolCalls: safeArray(r.tool_calls),
+      usage: safeJson(r.stats),
+      metadata: {},
     }
   }
 
@@ -198,11 +251,112 @@ export class SqliteChatStore implements ChatStore {
     return r.changes > 0
   }
 
-  // Message methods land in Task 5.
-  async addMessage(_s: Scope, _c: string, _i: MessageInput): Promise<ChatMessage> { throw new StoreError('not_supported', 'addMessage: Task 5') }
-  async getMessage(_s: Scope, _i: string): Promise<ChatMessage | null> { throw new StoreError('not_supported', 'getMessage: Task 5') }
-  async listMessages(_s: Scope, _c: string, _o: ListOpts): Promise<Page<ChatMessage>> { throw new StoreError('not_supported', 'listMessages: Task 5') }
-  async updateMessage(_s: Scope, _i: string, _p: MessagePatch, _v?: number): Promise<ChatMessage | null> { throw new StoreError('not_supported', 'updateMessage: Task 5') }
-  async deleteMessage(_s: Scope, _i: string): Promise<boolean> { throw new StoreError('not_supported', 'deleteMessage: Task 5') }
-  async getLastMessage(_s: Scope, _c: string): Promise<ChatMessage | null> { throw new StoreError('not_supported', 'getLastMessage: Task 5') }
+  async addMessage(s: Scope, chatId: string, input: MessageInput): Promise<ChatMessage> {
+    this.guard(s)
+    const id = randomUUID()
+    const now = new Date().toISOString()
+
+    // Atomic seq allocation (spec 27 §4.2). ConversationStore.addMessage does the same
+    // MAX(seq)+1 read OUTSIDE a transaction, so two concurrent appends there can collide;
+    // the adapter contract forbids that, so this path wraps both statements.
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const exists = this.db.prepare(`SELECT 1 AS ok FROM conversations WHERE id = $id`)
+        .get({ $id: chatId } as P) as unknown as { ok: number } | undefined
+      if (!exists) throw new StoreError('not_found', `not_found: chat ${chatId}`)
+
+      const { ms } = this.db.prepare(`SELECT COALESCE(MAX(seq),0) AS ms FROM messages WHERE conv_id = $id`)
+        .get({ $id: chatId } as P) as unknown as { ms: number }
+
+      this.db.prepare(`INSERT INTO messages (id,conv_id,seq,role,content,reasoning,attachments,tool_calls,stats,created_at,is_active,edited) VALUES ($id,$cid,$seq,$role,$content,$reasoning,$att,$tc,$stats,$now,1,0)`)
+        .run({
+          $id: id, $cid: chatId, $seq: ms + 1, $role: input.role, $content: input.content,
+          $reasoning: input.reasoning ?? '',
+          $att: JSON.stringify(input.attachments ?? []),
+          $tc: input.toolCalls?.length ? JSON.stringify(input.toolCalls) : null,
+          $stats: JSON.stringify(input.usage ?? {}),
+          $now: now,
+        } as P)
+
+      // Counter maintenance rides inside the same transaction (spec 27 §4.2), so there is
+      // no separate touch call and listChats never needs an N+1 recount.
+      this.db.prepare(`UPDATE conversations SET updated_at = $now WHERE id = $id`)
+        .run({ $id: chatId, $now: now } as P)
+
+      this.db.exec('COMMIT')
+    } catch (e) {
+      this.db.exec('ROLLBACK')
+      throw e
+    }
+
+    const made = this.messageById(id)
+    if (!made) throw new StoreError('contract_violation', 'addMessage: row vanished after commit')
+    return made
+  }
+
+  private messageById(id: string): ChatMessage | null {
+    const row = this.db.prepare(`SELECT * FROM messages WHERE id = $id`).get({ $id: id } as P) as unknown as MsgRow | undefined
+    return row ? this.rowToMessage(row) : null
+  }
+
+  async getMessage(s: Scope, id: string): Promise<ChatMessage | null> {
+    this.guard(s)
+    return this.messageById(id)
+  }
+
+  async listMessages(s: Scope, chatId: string, opts: ListOpts): Promise<Page<ChatMessage>> {
+    this.guard(s)
+    const limit = clampLimit(opts.limit)
+    const params: Record<string, SQLInputValue> = { $cid: chatId, $lim: limit + 1 }
+    let afterSeq = 0
+    if (opts.cursor) { afterSeq = decodeSeqCursor(opts.cursor) }
+    params.$seq = afterSeq
+
+    const rows = this.db.prepare(
+      `SELECT * FROM messages WHERE conv_id = $cid AND is_active = 1 AND seq > $seq ORDER BY seq ASC LIMIT $lim`,
+    ).all(params as P) as unknown as MsgRow[]
+
+    const hasMore = rows.length > limit
+    const page = hasMore ? rows.slice(0, limit) : rows
+    const tail = page[page.length - 1]
+    return {
+      data: page.map((r) => this.rowToMessage(r)),
+      hasMore,
+      nextCursor: hasMore && tail ? encodeSeqCursor(tail.seq) : null,
+    }
+  }
+
+  async updateMessage(s: Scope, id: string, patch: MessagePatch, ifVersion?: number): Promise<ChatMessage | null> {
+    this.guard(s)
+    const current = this.messageById(id)
+    if (!current) return null
+    if (ifVersion !== undefined && ifVersion !== current.version) {
+      throw new StoreError('version_conflict', `version_conflict: message ${id} is at ${current.version}, caller held ${ifVersion}`)
+    }
+
+    const sets: string[] = []
+    const params: Record<string, SQLInputValue> = { $id: id }
+    if (patch.content   !== undefined) { sets.push('content = $c');     params.$c  = patch.content }
+    if (patch.reasoning !== undefined) { sets.push('reasoning = $r');   params.$r  = patch.reasoning }
+    if (patch.toolCalls !== undefined) { sets.push('tool_calls = $tc'); params.$tc = JSON.stringify(patch.toolCalls) }
+    if (patch.usage     !== undefined) { sets.push('stats = $st');      params.$st = JSON.stringify(patch.usage) }
+    if (patch.edited    !== undefined) { sets.push('edited = $e');      params.$e  = patch.edited ? 1 : 0 }
+    if (!sets.length) return current
+
+    this.db.prepare(`UPDATE messages SET ${sets.join(', ')} WHERE id = $id`).run(params as P)
+    return this.messageById(id)
+  }
+
+  async deleteMessage(s: Scope, id: string): Promise<boolean> {
+    this.guard(s)
+    const r = this.db.prepare(`DELETE FROM messages WHERE id = $id`).run({ $id: id } as P) as unknown as Changes
+    return r.changes > 0
+  }
+
+  async getLastMessage(s: Scope, chatId: string): Promise<ChatMessage | null> {
+    this.guard(s)
+    const row = this.db.prepare(`SELECT * FROM messages WHERE conv_id = $cid AND is_active = 1 ORDER BY seq DESC LIMIT 1`)
+      .get({ $cid: chatId } as P) as unknown as MsgRow | undefined
+    return row ? this.rowToMessage(row) : null
+  }
 }
