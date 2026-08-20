@@ -40,12 +40,23 @@ def gpus_snapshot():
         rows.append({"gpu": int(idx), "mem_mb": int(mem), "util": int(util)})
     return rows
 
+def fmt_gpu(g):
+    """The split strategy, spelled out. Omitting this made `configs match` a lie: bench and chat
+    can pick DIFFERENT splitMode/mainGpu for the same ctx/ngl/nCpuMoe and still compare equal,
+    which hides the very mismatch this script exists to catch (pickSplitStrategies weighs
+    single-GPU against a layer-split, and a layer-split pays a PCIe tax at every layer
+    boundary)."""
+    if not g: return "split=(none reported)"
+    ts = g.get("tensorSplit") or []
+    return (f"split={g.get('splitMode')} mainGpu={g.get('mainGpu')}"
+            + (f" tensorSplit={ts}" if ts else ""))
+
 def fmt_params(p):
     if not p: return "(none)"
     ngl = "fit" if p.get("nglFit") else p.get("ngl")
     ncm = "fit" if p.get("nCpuMoeFit") else p.get("nCpuMoe")
     return (f"ctx={p.get('ctx')} ngl={ngl} nCpuMoe={ncm} parallel={p.get('parallel')} "
-            f"kvTypeK={p.get('kvTypeK')} flashAttn={p.get('flashAttn')}")
+            f"kvTypeK={p.get('kvTypeK')} flashAttn={p.get('flashAttn')} {fmt_gpu(p.get('gpu'))}")
 
 def ensure_idle(base, timeout=90):
     """Auto-tune 409s while a model is loaded or a bench is running (single-server guard). Clear
