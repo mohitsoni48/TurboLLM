@@ -36,6 +36,26 @@ function harness() {
   return { app, cleanup: () => { conv.close(); rmSync(dir, { recursive: true, force: true }) } }
 }
 
+// ChatStoreRouter.pick() throws StoreError('not_supported', ...) SYNCHRONOUSLY-then-rejected
+// for ANY method call on a non-local tenant when no adapter is configured (router.test.ts:
+// "with no adapter configured, a non-local tenant is refused rather than silently served
+// locally") — a real production configuration, not a hypothetical. A handler that calls the
+// store without a try/catch lets that rejection escape as an uncaught exception, which Hono
+// turns into a bare, non-JSON 500 — exactly the regression this harness exercises.
+function harnessNoAdapter() {
+  const dir = mkdtempSync(join(tmpdir(), 'turbollm-ext-routes-noadapter-'))
+  const conv = new ConversationStore(dir)
+  const d = {
+    chatStore: new ChatStoreRouter(conv.chatStore, null),
+    store: { snapshot: () => ({ apiKeys: [
+      { hash: keyHash(ACME), tenant: 'acme' },
+    ] }) },
+  } as never
+  const app = new Hono()
+  registerExtChatRoutes(app, d)
+  return { app, cleanup: () => { conv.close(); rmSync(dir, { recursive: true, force: true }) } }
+}
+
 const json = (auth: string, body?: unknown) => ({
   method: body ? 'POST' : 'GET',
   headers: { Authorization: auth, 'Content-Type': 'application/json' },
@@ -147,3 +167,41 @@ test('an empty message with no attachment is a 400 invalid_input', async () => {
     cleanup()
   }
 })
+
+// Regression test for a live-reproduced bug: with no adapter configured, ChatStoreRouter
+// throws StoreError('not_supported', ...) for a non-local tenant on EVERY method — including
+// the four routes (GET/DELETE chats, GET/DELETE messages) that, before this fix, called the
+// store directly with no try/catch. That let the rejection escape Hono's handler and fall
+// through to the framework's bare, non-JSON 500 — a shape no integrator's error-envelope
+// parser can read. Each of the four must instead surface the same JSON error envelope every
+// other route in this file already produces.
+for (const [label, req] of [
+  ['GET /chats/:id', () => ({ method: 'GET', path: '/api/ext/v1/chats/some-id?owner=u1' })],
+  ['DELETE /chats/:id', () => ({ method: 'DELETE', path: '/api/ext/v1/chats/some-id?owner=u1' })],
+  ['GET /messages/:id', () => ({ method: 'GET', path: '/api/ext/v1/messages/some-id?owner=u1' })],
+  ['DELETE /messages/:id', () => ({ method: 'DELETE', path: '/api/ext/v1/messages/some-id?owner=u1' })],
+] as const) {
+  test(`${label} on a tenant with no adapter surfaces a JSON error envelope, not a bare 500`, async () => {
+    const { app, cleanup } = harnessNoAdapter()
+    try {
+      const { method, path } = req()
+      const res = await app.request(path, { method, headers: { Authorization: ACME } })
+      // The response body MUST be parseable JSON with the standard envelope shape — this is
+      // exactly what an integrator's client does, and exactly what crashed before the fix.
+      const text = await res.text()
+      let parsed: { error?: { type?: unknown; code?: unknown; request_id?: unknown; retryable?: unknown } }
+      try {
+        parsed = JSON.parse(text)
+      } catch {
+        assert.fail(`response body is not JSON (bare framework error?): ${text.slice(0, 200)}`)
+      }
+      assert.ok(res.status >= 400, 'a store failure must not report success')
+      assert.equal(typeof parsed.error?.type, 'string')
+      assert.equal(typeof parsed.error?.code, 'string')
+      assert.equal(typeof parsed.error?.request_id, 'string')
+      assert.equal(typeof parsed.error?.retryable, 'boolean')
+    } finally {
+      cleanup()
+    }
+  })
+}

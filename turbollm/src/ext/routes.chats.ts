@@ -53,10 +53,15 @@ export function registerExtChatRoutes(app: Hono, d: Deps): void {
   })
 
   app.get(`${BASE}/chats/:id`, requireScope('chats:read'), async (c) => {
-    const chat = await d.chatStore.getChat(scopeFor(c, c.req.query('owner')), c.req.param('id'))
-    // 404 rather than 403 for another tenant's chat: a 403 confirms the id exists (spec §7.2).
-    if (!chat) return extError(c, 'not_found', 'not_found', 'Not found.')
-    return c.json(toChatDTO(chat))
+    try {
+      const chat = await d.chatStore.getChat(scopeFor(c, c.req.query('owner')), c.req.param('id'))
+      // 404 rather than 403 for another tenant's chat: a 403 confirms the id exists (spec §7.2).
+      if (!chat) return extError(c, 'not_found', 'not_found', 'Not found.')
+      return c.json(toChatDTO(chat))
+    } catch (e) {
+      const m = mapStoreError(e)
+      return extError(c, m.type, m.code, m.message, { status: m.status, retryable: m.retryable })
+    }
   })
 
   app.patch(`${BASE}/chats/:id`, requireScope('chats:write'), async (c) => {
@@ -76,9 +81,14 @@ export function registerExtChatRoutes(app: Hono, d: Deps): void {
   })
 
   app.delete(`${BASE}/chats/:id`, requireScope('chats:write'), async (c) => {
-    const gone = await d.chatStore.deleteChat(scopeFor(c, c.req.query('owner')), c.req.param('id'))
-    if (!gone) return extError(c, 'not_found', 'not_found', 'Not found.')
-    return c.body(null, 204)
+    try {
+      const gone = await d.chatStore.deleteChat(scopeFor(c, c.req.query('owner')), c.req.param('id'))
+      if (!gone) return extError(c, 'not_found', 'not_found', 'Not found.')
+      return c.body(null, 204)
+    } catch (e) {
+      const m = mapStoreError(e)
+      return extError(c, m.type, m.code, m.message, { status: m.status, retryable: m.retryable })
+    }
   })
 
   app.get(`${BASE}/chats/:id/messages`, requireScope('chats:read'), async (c) => {
@@ -115,9 +125,14 @@ export function registerExtChatRoutes(app: Hono, d: Deps): void {
   })
 
   app.get(`${BASE}/messages/:id`, requireScope('chats:read'), async (c) => {
-    const msg = await d.chatStore.getMessage(scopeFor(c, c.req.query('owner')), c.req.param('id'))
-    if (!msg) return extError(c, 'not_found', 'not_found', 'Not found.')
-    return c.json(toMessageDTO(msg, parseInclude(c.req.query('include'))))
+    try {
+      const msg = await d.chatStore.getMessage(scopeFor(c, c.req.query('owner')), c.req.param('id'))
+      if (!msg) return extError(c, 'not_found', 'not_found', 'Not found.')
+      return c.json(toMessageDTO(msg, parseInclude(c.req.query('include'))))
+    } catch (e) {
+      const m = mapStoreError(e)
+      return extError(c, m.type, m.code, m.message, { status: m.status, retryable: m.retryable })
+    }
   })
 
   app.patch(`${BASE}/messages/:id`, requireScope('chats:write'), async (c) => {
@@ -137,8 +152,13 @@ export function registerExtChatRoutes(app: Hono, d: Deps): void {
   })
 
   app.delete(`${BASE}/messages/:id`, requireScope('chats:write'), async (c) => {
-    const gone = await d.chatStore.deleteMessage(scopeFor(c, c.req.query('owner')), c.req.param('id'))
-    if (!gone) return extError(c, 'not_found', 'not_found', 'Not found.')
-    return c.body(null, 204)
+    try {
+      const gone = await d.chatStore.deleteMessage(scopeFor(c, c.req.query('owner')), c.req.param('id'))
+      if (!gone) return extError(c, 'not_found', 'not_found', 'Not found.')
+      return c.body(null, 204)
+    } catch (e) {
+      const m = mapStoreError(e)
+      return extError(c, m.type, m.code, m.message, { status: m.status, retryable: m.retryable })
+    }
   })
 }
