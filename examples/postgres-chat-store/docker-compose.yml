@@ -1,0 +1,20 @@
+# Local Postgres for the conformance run (see README.md's "Run it" section).
+# `schema.sql` is mounted into Postgres's own docker-entrypoint-initdb.d, so it
+# applies automatically the first time the container initializes its data
+# directory — no separate migration step for this example.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: turbollm
+      POSTGRES_PASSWORD: turbollm
+      POSTGRES_DB: turbollm_chat_example
+    ports:
+      - '5432:5432'
+    volumes:
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U turbollm -d turbollm_chat_example']
+      interval: 2s
+      timeout: 3s
+      retries: 15
