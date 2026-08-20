@@ -172,6 +172,12 @@ export interface ApiKey {
   prefix: string
   createdAt: string
   lastUsedAt: string | null
+  /** Which tenant this key authenticates (spec 27 §10). Absent on keys minted before the
+   *  external API existed — those are treated as `local`, preserving their behavior exactly. */
+  tenant?: string
+  /** Coarse permissions: 'chats:read' | 'chats:write' | 'runs:write'. Absent ⇒ all three,
+   *  so existing keys keep working unchanged. */
+  scopes?: string[]
 }
 export interface LastLoaded {
   modelKey: string
