@@ -103,12 +103,18 @@ export function createApp(d: Deps): Hono {
 
   // External chat API (spec 27) — flag-gated off by default (config.ts's `api.ext.enabled`);
   // mountExtApi registers nothing at all when the flag is off, so this is a true no-op for
-  // every existing install until an operator opts in. `extRuns` is a fresh, process-lifetime
-  // registry — public runs do not survive a restart (spec 27 §6.4), so there is nothing to
-  // resume here. The reaper/prune tick mirrors the pattern already used elsewhere in this
-  // codebase for background sweeps (cli.ts's routineScheduler/cliInteractiveSweepTimer):
-  // unref'd so a pending tick can never keep the process alive on its own.
-  const extRuns = new PublicRunManager({ orphanTimeoutMs: 5 * 60_000 })
+  // every existing install until an operator opts in. Runs do not RESUME across a restart
+  // (spec 27 §6.4) — an in-flight generation is gone with the process either way — but the
+  // RECORD must survive, so a client that reconnects after a daemon bounce gets an honest
+  // `failed`/`daemon_restarted` answer instead of a 404 that looks like the run never
+  // existed. `db: d.db` is what makes `extRuns.reconcileOnStartup()` below operate on the
+  // real, persisted `ext_runs` table rather than an always-empty in-memory map (Phase 4
+  // Task 1's whole reason for existing). The reaper/prune tick mirrors the pattern already
+  // used elsewhere in this codebase for background sweeps (cli.ts's
+  // routineScheduler/cliInteractiveSweepTimer): unref'd so a pending tick can never keep the
+  // process alive on its own.
+  const extRuns = new PublicRunManager({ orphanTimeoutMs: 5 * 60_000, db: d.db })
+  extRuns.reconcileOnStartup()
   const ext = mountExtApi(app, d, extRuns, { makeBody: createMakeBody(d) })
   const extRunsReaper = setInterval(() => {
     extRuns.reapOrphans()
