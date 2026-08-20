@@ -137,3 +137,19 @@ test('polling counts as liveness, so a poll-only client is never reaped', async 
   release!()
   await runs.settled(run.id)
 })
+
+test('a subscriber that disconnects via the iterator\'s own return() (for-await break) is still counted as departed', async () => {
+  const runs = new PublicRunManager({ orphanTimeoutMs: 20 })
+  let release: () => void
+  const gate = new Promise<void>((r) => { release = r })
+  const run = runs.start({ scope: SCOPE, chatId: 'c1', messageId: 'm1', body: fakeBody(3, gate) })
+
+  const sub = runs.subscribe(run.id, 0)
+  const iterator = sub[Symbol.asyncIterator]()
+  await iterator.return?.()               // what `for await (const ev of sub) { ...; break }` invokes
+
+  await new Promise((r) => setTimeout(r, 60))
+  runs.reapOrphans()
+  assert.equal(runs.get(run.id)?.status, 'aborted', 'the abandoned subscriber must not pin the run open')
+  release!()
+})

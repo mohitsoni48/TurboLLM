@@ -58,6 +58,7 @@ export class PublicRunManager {
     const id = `run_${randomUUID()}`
     const buffer = new RingBuffer(this.bufferCap)
     const emitter = new EventEmitter()
+    emitter.setMaxListeners(0) // unbounded: many clients may reconnect/poll one run
     const ac = new AbortController()
     const run: PublicRun = {
       id,
@@ -167,11 +168,40 @@ export class PublicRunManager {
       replayFloor: 0,
       idleAtStart: s.run.endedAt !== null,
     })
-    const close = sub.close
+
+    let departed = false
+    /** Decrement the subscriber count exactly once, however this subscription stops being
+     *  watched — an explicit close(), a `for await (...) { break }` (which invokes the async
+     *  iterator's own return(), NOT our close()), or plain exhaustion (next() resolving
+     *  done:true). Whichever happens first wins; later calls are no-ops. Never touches the run's
+     *  AbortController — only reapOrphans() decides whether an unwatched run gets aborted. */
+    const departOnce = () => {
+      if (departed) return
+      departed = true
+      s.subscribers = Math.max(0, s.subscribers - 1)
+      s.lastSeen = Date.now()
+    }
+
+    // subscribeToBuffer's own iterator is what actually holds the replay/live-tail state; we
+    // grab it once and wrap every way a caller can stop consuming it, rather than only wrapping
+    // the Subscription's close() (which a for-await loop never calls on early exit).
+    const iter = sub[Symbol.asyncIterator]()
+
     return {
-      ...sub,
-      [Symbol.asyncIterator]: sub[Symbol.asyncIterator].bind(sub),
-      close: () => { s.subscribers = Math.max(0, s.subscribers - 1); s.lastSeen = Date.now(); close() },
+      close: () => { departOnce(); sub.close() },
+      [Symbol.asyncIterator]() {
+        return {
+          async next() {
+            const r = await iter.next()
+            if (r.done) departOnce()
+            return r
+          },
+          async return() {
+            departOnce()
+            return (await iter.return?.()) ?? { value: undefined as never, done: true as const }
+          },
+        }
+      },
     }
   }
 
