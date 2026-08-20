@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto'
 import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
+import type { ChatStoreConfig } from '../chat/store/load-adapter.js'
 
 export const SCHEMA_VERSION = 4
 
@@ -396,6 +397,9 @@ export interface Config {
   daemon: Daemon
   telemetry: Telemetry
   apiKeys: ApiKey[]
+  /** Where non-local tenants' chats are stored (spec 27 §4.3/§4.5). `tenant='local'` —
+   *  TurboLLM's own UI — is ALWAYS served by SQLite regardless of this setting. */
+  chatStore: ChatStoreConfig
   engines: Engine[]
   /** Custom (non-catalog) engine identities, kept across Disable — see {@link CustomEngineSource}. */
   customEngineSources: CustomEngineSource[]
@@ -565,6 +569,7 @@ export function defaultConfig(): Config {
     },
     telemetry: { level: 'full', machineId: '' },
     apiKeys: [],
+    chatStore: { kind: 'sqlite' },
     engines: [],
     customEngineSources: [],
     activeEngineId: '',
@@ -1043,6 +1048,9 @@ function normalize(c: Config): void {
   // A primary that no longer exists in modelDirs (folder removed/renamed) falls
   // back to the effective default (first dir) — reset rather than throw.
   if (c.primaryModelDir && !c.modelDirs.includes(c.primaryModelDir)) c.primaryModelDir = ''
+  // Pluggable chat storage (spec 27 §4.5): absent/malformed in pre-this-feature configs
+  // → { kind: 'sqlite' }, so an old config file keeps behaving exactly as before.
+  if (!c.chatStore || typeof c.chatStore !== 'object') c.chatStore = { kind: 'sqlite' }
   c.version = SCHEMA_VERSION
 }
 
