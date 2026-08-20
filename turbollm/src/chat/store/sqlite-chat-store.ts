@@ -2,25 +2,29 @@
 //
 // Runs on the SAME DatabaseSync handle as ConversationStore and reads/writes the SAME
 // `conversations` / `messages` rows, so a chat created here is visible in the web UI and
-// vice versa. Phase 1 adds no columns: fields the public model has but the schema does
-// not (status, version, metadata) are derived — see the notes on each.
+// vice versa. Phase 2 (spec 27 §9.1) adds real tenant/owner/version/metadata/status
+// columns, so every statement below is scoped with `AND tenant = $t AND owner = $o`
+// (or the differently-named equivalent where `$t` already means something else in that
+// statement) — an unscoped query here would let one tenant read or clobber another's rows.
 import { randomUUID } from 'node:crypto'
 import type { DatabaseSync, SQLInputValue } from 'node:sqlite'
 import { StoreError, type ChatStore, type StoreCapabilities } from './chat-store.js'
 import type {
-  Chat, ChatInput, ChatMessage, ChatPatch, ListOpts, MessageInput, MessagePatch, Page, Scope,
+  Chat, ChatInput, ChatMessage, ChatPatch, ListOpts, MessageInput, MessagePatch, MessageStatus, Page, Scope,
 } from './types.js'
 
 type P = Record<string, SQLInputValue>
 
 interface ConvRow {
   id: string; title: string; system_prompt: string; model_key: string; sampling: string
+  tenant: string; owner: string; metadata: string; version: number
   created_at: string; updated_at: string
 }
 
 interface MsgRow {
   id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string
   reasoning: string; attachments: string; tool_calls: string | null; stats: string
+  tenant: string; owner: string; status: string; version: number; metadata: string
   created_at: string; is_active: number; edited: number
 }
 
@@ -90,42 +94,23 @@ export class SqliteChatStore implements ChatStore {
 
   constructor(private readonly db: DatabaseSync) {}
 
-  /** Phase 1 has no tenant/owner columns, so scoping cannot be enforced yet. Rather than
-   *  silently ignore a security-bearing argument, refuse anything but the local scope —
-   *  Phase 2 adds the columns and replaces this with a real WHERE clause. */
-  private guard(s: Scope): void {
-    if (s.tenant !== 'local' || s.owner !== 'default') {
-      throw new StoreError(
-        'invalid_scope',
-        `invalid_scope: tenancy lands in Phase 2; only {tenant:'local',owner:'default'} is servable, got {tenant:'${s.tenant}',owner:'${s.owner}'}`,
-      )
-    }
-  }
-
-  /** `version` has no column in Phase 1. Deriving it from updated_at gives a token that
-   *  changes on every write, which is exactly what optimistic concurrency needs; Phase 2
-   *  replaces it with a real monotonic counter. */
   private rowToChat(r: ConvRow, messageCount: number, lastMessageAt: string | null): Chat {
     return {
       id: r.id,
-      owner: 'default',
+      owner: r.owner,
       title: r.title,
       model: r.model_key,
       systemPrompt: r.system_prompt,
       sampling: safeJson(r.sampling),
-      metadata: {},
+      metadata: safeJson(r.metadata),
       messageCount,
       lastMessageAt,
-      version: Date.parse(r.updated_at) || 1,
+      version: r.version,
       createdAt: r.created_at,
       updatedAt: r.updated_at,
     }
   }
 
-  /** `status` and `version` have no columns in Phase 1. Every row written by the
-   *  existing UI path is a finished message, so it maps to 'complete'; Phase 2 adds the
-   *  real column for the run machinery. `version` derives from created_at for the same
-   *  reason as Chat.version. */
   private rowToMessage(r: MsgRow): ChatMessage {
     return {
       id: r.id,
@@ -133,48 +118,53 @@ export class SqliteChatStore implements ChatStore {
       seq: r.seq,
       role: r.role,
       content: r.content,
-      status: 'complete',
-      version: Date.parse(r.created_at) || 1,
+      status: r.status as MessageStatus,
+      version: r.version,
       createdAt: r.created_at,
       edited: r.edited === 1,
       reasoning: r.reasoning ?? '',
       attachments: safeArray(r.attachments) as string[],
       toolCalls: safeArray(r.tool_calls),
       usage: safeJson(r.stats),
-      metadata: {},
+      metadata: safeJson(r.metadata),
     }
   }
 
-  private chatById(id: string): Chat | null {
-    const row = this.db.prepare(`SELECT id,title,system_prompt,model_key,sampling,created_at,updated_at FROM conversations WHERE id = $id`)
-      .get({ $id: id } as P) as unknown as ConvRow | undefined
+  private chatById(s: Scope, id: string): Chat | null {
+    const row = this.db.prepare(
+      `SELECT id,title,system_prompt,model_key,sampling,metadata,version,tenant,owner,created_at,updated_at
+       FROM conversations WHERE id = $id AND tenant = $t AND owner = $o`,
+    ).get({ $id: id, $t: s.tenant, $o: s.owner } as P) as unknown as ConvRow | undefined
     if (!row) return null
-    const agg = this.db.prepare(`SELECT COUNT(*) AS n, MAX(created_at) AS last FROM messages WHERE conv_id = $id AND is_active = 1`)
-      .get({ $id: id } as P) as unknown as { n: number; last: string | null }
+    const agg = this.db.prepare(
+      `SELECT COUNT(*) AS n, MAX(created_at) AS last FROM messages
+       WHERE conv_id = $id AND tenant = $t AND owner = $o AND is_active = 1`,
+    ).get({ $id: id, $t: s.tenant, $o: s.owner } as P) as unknown as { n: number; last: string | null }
     return this.rowToChat(row, agg.n, agg.last)
   }
 
   async createChat(s: Scope, input: ChatInput): Promise<Chat> {
-    this.guard(s)
     const id = randomUUID()
     const now = new Date().toISOString()
-    this.db.prepare(`INSERT INTO conversations (id,title,system_prompt,model_key,sampling,expert_mode,kind,preserve_thinking,created_at,updated_at) VALUES ($id,$t,$sp,$mk,$samp,0,'chat',1,$now,$now)`)
+    this.db.prepare(`INSERT INTO conversations (id,title,system_prompt,model_key,sampling,expert_mode,kind,preserve_thinking,tenant,owner,metadata,version,created_at,updated_at) VALUES ($id,$t,$sp,$mk,$samp,0,'chat',1,$tenant,$owner,$meta,1,$now,$now)`)
       .run({
         $id: id,
         $t: input.title ?? 'New chat',
         $sp: input.systemPrompt ?? '',
         $mk: input.model ?? '',
         $samp: JSON.stringify(input.sampling ?? {}),
+        $tenant: s.tenant,
+        $owner: s.owner,
+        $meta: JSON.stringify(input.metadata ?? {}),
         $now: now,
       } as P)
-    const made = this.chatById(id)
+    const made = this.chatById(s, id)
     if (!made) throw new StoreError('contract_violation', 'createChat: row vanished immediately after insert')
     return made
   }
 
   async getChat(s: Scope, id: string): Promise<Chat | null> {
-    this.guard(s)
-    return this.chatById(id)
+    return this.chatById(s, id)
   }
 
   async health(): Promise<{ ok: boolean; detail?: string }> {
@@ -190,10 +180,9 @@ export class SqliteChatStore implements ChatStore {
   async close(): Promise<void> {}
 
   async listChats(s: Scope, opts: ListOpts): Promise<Page<Chat>> {
-    this.guard(s)
     const limit = clampLimit(opts.limit)
-    const where: string[] = [`kind = 'chat'`]
-    const params: Record<string, SQLInputValue> = { $lim: limit + 1 }
+    const where: string[] = [`kind = 'chat'`, `tenant = $t`, `owner = $o`]
+    const params: Record<string, SQLInputValue> = { $lim: limit + 1, $t: s.tenant, $o: s.owner }
 
     if (opts.q) { where.push(`title LIKE $q`); params.$q = `%${opts.q}%` }
     if (opts.cursor) {
@@ -205,15 +194,17 @@ export class SqliteChatStore implements ChatStore {
     }
 
     const rows = this.db.prepare(
-      `SELECT id,title,system_prompt,model_key,sampling,created_at,updated_at FROM conversations
+      `SELECT id,title,system_prompt,model_key,sampling,metadata,version,tenant,owner,created_at,updated_at FROM conversations
        WHERE ${where.join(' AND ')} ORDER BY updated_at DESC, id DESC LIMIT $lim`,
     ).all(params as P) as unknown as ConvRow[]
 
     const hasMore = rows.length > limit
     const page = hasMore ? rows.slice(0, limit) : rows
     const data = page.map((r) => {
-      const agg = this.db.prepare(`SELECT COUNT(*) AS n, MAX(created_at) AS last FROM messages WHERE conv_id = $id AND is_active = 1`)
-        .get({ $id: r.id } as P) as unknown as { n: number; last: string | null }
+      const agg = this.db.prepare(
+        `SELECT COUNT(*) AS n, MAX(created_at) AS last FROM messages
+         WHERE conv_id = $id AND tenant = $t AND owner = $o AND is_active = 1`,
+      ).get({ $id: r.id, $t: s.tenant, $o: s.owner } as P) as unknown as { n: number; last: string | null }
       return this.rowToChat(r, agg.n, agg.last)
     })
     const tail = page[page.length - 1]
@@ -225,34 +216,34 @@ export class SqliteChatStore implements ChatStore {
   }
 
   async updateChat(s: Scope, id: string, patch: ChatPatch, ifVersion?: number): Promise<Chat | null> {
-    this.guard(s)
-    const current = this.chatById(id)
+    const current = this.chatById(s, id)
     if (!current) return null
     if (ifVersion !== undefined && ifVersion !== current.version) {
       throw new StoreError('version_conflict', `version_conflict: chat ${id} is at ${current.version}, caller held ${ifVersion}`)
     }
 
-    const sets = ['updated_at = $now']
-    const params: Record<string, SQLInputValue> = { $id: id, $now: new Date().toISOString() }
+    const sets = ['updated_at = $now', 'version = version + 1']
+    const params: Record<string, SQLInputValue> = {
+      $id: id, $now: new Date().toISOString(), $tenant: s.tenant, $owner: s.owner,
+    }
     if (patch.title !== undefined)        { sets.push('title = $t');           params.$t    = patch.title }
     if (patch.systemPrompt !== undefined) { sets.push('system_prompt = $sp');  params.$sp   = patch.systemPrompt }
     if (patch.model !== undefined)        { sets.push('model_key = $mk');      params.$mk   = patch.model }
     if (patch.sampling !== undefined)     { sets.push('sampling = $samp');     params.$samp = JSON.stringify(patch.sampling) }
 
-    this.db.prepare(`UPDATE conversations SET ${sets.join(', ')} WHERE id = $id`).run(params as P)
-    return this.chatById(id)
+    this.db.prepare(`UPDATE conversations SET ${sets.join(', ')} WHERE id = $id AND tenant = $tenant AND owner = $owner`).run(params as P)
+    return this.chatById(s, id)
   }
 
   async deleteChat(s: Scope, id: string): Promise<boolean> {
-    this.guard(s)
     // messages.conv_id is ON DELETE CASCADE and the migration sets PRAGMA foreign_keys=ON,
     // so the message rows go with the conversation.
-    const r = this.db.prepare(`DELETE FROM conversations WHERE id = $id`).run({ $id: id } as P) as unknown as Changes
+    const r = this.db.prepare(`DELETE FROM conversations WHERE id = $id AND tenant = $t AND owner = $o`)
+      .run({ $id: id, $t: s.tenant, $o: s.owner } as P) as unknown as Changes
     return r.changes > 0
   }
 
   async addMessage(s: Scope, chatId: string, input: MessageInput): Promise<ChatMessage> {
-    this.guard(s)
     const id = randomUUID()
     const now = new Date().toISOString()
 
@@ -261,27 +252,30 @@ export class SqliteChatStore implements ChatStore {
     // the adapter contract forbids that, so this path wraps both statements.
     this.db.exec('BEGIN IMMEDIATE')
     try {
-      const exists = this.db.prepare(`SELECT 1 AS ok FROM conversations WHERE id = $id`)
-        .get({ $id: chatId } as P) as unknown as { ok: number } | undefined
+      const exists = this.db.prepare(`SELECT 1 AS ok FROM conversations WHERE id = $id AND tenant = $t AND owner = $o`)
+        .get({ $id: chatId, $t: s.tenant, $o: s.owner } as P) as unknown as { ok: number } | undefined
       if (!exists) throw new StoreError('not_found', `not_found: chat ${chatId}`)
 
-      const { ms } = this.db.prepare(`SELECT COALESCE(MAX(seq),0) AS ms FROM messages WHERE conv_id = $id`)
-        .get({ $id: chatId } as P) as unknown as { ms: number }
+      const { ms } = this.db.prepare(`SELECT COALESCE(MAX(seq),0) AS ms FROM messages WHERE conv_id = $id AND tenant = $t AND owner = $o`)
+        .get({ $id: chatId, $t: s.tenant, $o: s.owner } as P) as unknown as { ms: number }
 
-      this.db.prepare(`INSERT INTO messages (id,conv_id,seq,role,content,reasoning,attachments,tool_calls,stats,created_at,is_active,edited) VALUES ($id,$cid,$seq,$role,$content,$reasoning,$att,$tc,$stats,$now,1,0)`)
+      this.db.prepare(`INSERT INTO messages (id,conv_id,seq,role,content,reasoning,attachments,tool_calls,stats,tenant,owner,status,version,metadata,created_at,is_active,edited) VALUES ($id,$cid,$seq,$role,$content,$reasoning,$att,$tc,$stats,$t,$o,$status,1,$meta,$now,1,0)`)
         .run({
           $id: id, $cid: chatId, $seq: ms + 1, $role: input.role, $content: input.content,
           $reasoning: input.reasoning ?? '',
           $att: JSON.stringify(input.attachments ?? []),
           $tc: input.toolCalls?.length ? JSON.stringify(input.toolCalls) : null,
           $stats: JSON.stringify(input.usage ?? {}),
+          $t: s.tenant, $o: s.owner,
+          $status: input.status ?? 'complete',
+          $meta: JSON.stringify(input.metadata ?? {}),
           $now: now,
         } as P)
 
       // Counter maintenance rides inside the same transaction (spec 27 §4.2), so there is
       // no separate touch call and listChats never needs an N+1 recount.
-      this.db.prepare(`UPDATE conversations SET updated_at = $now WHERE id = $id`)
-        .run({ $id: chatId, $now: now } as P)
+      this.db.prepare(`UPDATE conversations SET updated_at = $now WHERE id = $id AND tenant = $t AND owner = $o`)
+        .run({ $id: chatId, $now: now, $t: s.tenant, $o: s.owner } as P)
 
       this.db.exec('COMMIT')
     } catch (e) {
@@ -289,31 +283,30 @@ export class SqliteChatStore implements ChatStore {
       throw e
     }
 
-    const made = this.messageById(id)
+    const made = this.messageById(s, id)
     if (!made) throw new StoreError('contract_violation', 'addMessage: row vanished after commit')
     return made
   }
 
-  private messageById(id: string): ChatMessage | null {
-    const row = this.db.prepare(`SELECT * FROM messages WHERE id = $id`).get({ $id: id } as P) as unknown as MsgRow | undefined
+  private messageById(s: Scope, id: string): ChatMessage | null {
+    const row = this.db.prepare(`SELECT * FROM messages WHERE id = $id AND tenant = $t AND owner = $o`)
+      .get({ $id: id, $t: s.tenant, $o: s.owner } as P) as unknown as MsgRow | undefined
     return row ? this.rowToMessage(row) : null
   }
 
   async getMessage(s: Scope, id: string): Promise<ChatMessage | null> {
-    this.guard(s)
-    return this.messageById(id)
+    return this.messageById(s, id)
   }
 
   async listMessages(s: Scope, chatId: string, opts: ListOpts): Promise<Page<ChatMessage>> {
-    this.guard(s)
     const limit = clampLimit(opts.limit)
-    const params: Record<string, SQLInputValue> = { $cid: chatId, $lim: limit + 1 }
+    const params: Record<string, SQLInputValue> = { $cid: chatId, $lim: limit + 1, $t: s.tenant, $o: s.owner }
     let afterSeq = 0
     if (opts.cursor) { afterSeq = decodeSeqCursor(opts.cursor) }
     params.$seq = afterSeq
 
     const rows = this.db.prepare(
-      `SELECT * FROM messages WHERE conv_id = $cid AND is_active = 1 AND seq > $seq ORDER BY seq ASC LIMIT $lim`,
+      `SELECT * FROM messages WHERE conv_id = $cid AND tenant = $t AND owner = $o AND is_active = 1 AND seq > $seq ORDER BY seq ASC LIMIT $lim`,
     ).all(params as P) as unknown as MsgRow[]
 
     const hasMore = rows.length > limit
@@ -327,36 +320,38 @@ export class SqliteChatStore implements ChatStore {
   }
 
   async updateMessage(s: Scope, id: string, patch: MessagePatch, ifVersion?: number): Promise<ChatMessage | null> {
-    this.guard(s)
-    const current = this.messageById(id)
+    const current = this.messageById(s, id)
     if (!current) return null
     if (ifVersion !== undefined && ifVersion !== current.version) {
       throw new StoreError('version_conflict', `version_conflict: message ${id} is at ${current.version}, caller held ${ifVersion}`)
     }
 
     const sets: string[] = []
-    const params: Record<string, SQLInputValue> = { $id: id }
+    const params: Record<string, SQLInputValue> = { $id: id, $t: s.tenant, $o: s.owner }
     if (patch.content   !== undefined) { sets.push('content = $c');     params.$c  = patch.content }
     if (patch.reasoning !== undefined) { sets.push('reasoning = $r');   params.$r  = patch.reasoning }
     if (patch.toolCalls !== undefined) { sets.push('tool_calls = $tc'); params.$tc = JSON.stringify(patch.toolCalls) }
     if (patch.usage     !== undefined) { sets.push('stats = $st');      params.$st = JSON.stringify(patch.usage) }
     if (patch.edited    !== undefined) { sets.push('edited = $e');      params.$e  = patch.edited ? 1 : 0 }
+    if (patch.status    !== undefined) { sets.push('status = $status'); params.$status = patch.status }
+    if (patch.metadata  !== undefined) { sets.push('metadata = $meta'); params.$meta = JSON.stringify(patch.metadata) }
     if (!sets.length) return current
+    sets.push('version = version + 1')
 
-    this.db.prepare(`UPDATE messages SET ${sets.join(', ')} WHERE id = $id`).run(params as P)
-    return this.messageById(id)
+    this.db.prepare(`UPDATE messages SET ${sets.join(', ')} WHERE id = $id AND tenant = $t AND owner = $o`).run(params as P)
+    return this.messageById(s, id)
   }
 
   async deleteMessage(s: Scope, id: string): Promise<boolean> {
-    this.guard(s)
-    const r = this.db.prepare(`DELETE FROM messages WHERE id = $id`).run({ $id: id } as P) as unknown as Changes
+    const r = this.db.prepare(`DELETE FROM messages WHERE id = $id AND tenant = $t AND owner = $o`)
+      .run({ $id: id, $t: s.tenant, $o: s.owner } as P) as unknown as Changes
     return r.changes > 0
   }
 
   async getLastMessage(s: Scope, chatId: string): Promise<ChatMessage | null> {
-    this.guard(s)
-    const row = this.db.prepare(`SELECT * FROM messages WHERE conv_id = $cid AND is_active = 1 ORDER BY seq DESC LIMIT 1`)
-      .get({ $cid: chatId } as P) as unknown as MsgRow | undefined
+    const row = this.db.prepare(
+      `SELECT * FROM messages WHERE conv_id = $cid AND tenant = $t AND owner = $o AND is_active = 1 ORDER BY seq DESC LIMIT 1`,
+    ).get({ $cid: chatId, $t: s.tenant, $o: s.owner } as P) as unknown as MsgRow | undefined
     return row ? this.rowToMessage(row) : null
   }
 }

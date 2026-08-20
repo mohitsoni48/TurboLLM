@@ -22,18 +22,6 @@ function makeStore(): { store: SqliteChatStore; conv: ConversationStore; cleanup
   }
 }
 
-test('rejects any scope other than local/default while tenancy is inert', async () => {
-  const { store, cleanup } = makeStore()
-  try {
-    await assert.rejects(
-      () => store.createChat({ tenant: 'acme', owner: 'u1' }, { title: 'X' }),
-      /invalid_scope/,
-    )
-  } finally {
-    cleanup()
-  }
-})
-
 test('createChat returns a fully populated Chat', async () => {
   const { store, cleanup } = makeStore()
   try {
@@ -274,6 +262,124 @@ test('deleteMessage removes only its own row', async () => {
     assert.equal(await store.deleteMessage(LOCAL_SCOPE, b.id), true)
     assert.equal(await store.getMessage(LOCAL_SCOPE, b.id), null)
     assert.equal((await store.getMessage(LOCAL_SCOPE, a.id))?.content, 'keep')
+  } finally {
+    cleanup()
+  }
+})
+
+const ACME = { tenant: 'acme', owner: 'u1' }
+const ACME_OTHER = { tenant: 'acme', owner: 'u2' }
+const GLOBEX = { tenant: 'globex', owner: 'u1' }
+
+test('a chat is invisible to another tenant', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    const mine = await store.createChat(ACME, { title: 'Acme secret' })
+    assert.equal(await store.getChat(GLOBEX, mine.id), null)
+    assert.equal((await store.listChats(GLOBEX, {})).data.length, 0)
+  } finally {
+    cleanup()
+  }
+})
+
+test('a chat is invisible to another owner inside the same tenant', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    const mine = await store.createChat(ACME, { title: 'U1 only' })
+    assert.equal(await store.getChat(ACME_OTHER, mine.id), null)
+    assert.equal((await store.listChats(ACME_OTHER, {})).data.length, 0)
+  } finally {
+    cleanup()
+  }
+})
+
+test('cross-scope writes cannot mutate or delete another scope rows', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    const mine = await store.createChat(ACME, { title: 'Untouchable' })
+    assert.equal(await store.updateChat(GLOBEX, mine.id, { title: 'hijacked' }), null)
+    assert.equal(await store.deleteChat(GLOBEX, mine.id), false)
+    assert.equal((await store.getChat(ACME, mine.id))?.title, 'Untouchable')
+  } finally {
+    cleanup()
+  }
+})
+
+test('messages are scoped too, and cannot be appended across scopes', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    const mine = await store.createChat(ACME, { title: 'Scoped msgs' })
+    const m = await store.addMessage(ACME, mine.id, { role: 'user', content: 'private' })
+    assert.equal(await store.getMessage(GLOBEX, m.id), null)
+    await assert.rejects(
+      () => store.addMessage(GLOBEX, mine.id, { role: 'user', content: 'intruder' }),
+      /not_found/,
+    )
+  } finally {
+    cleanup()
+  }
+})
+
+test('the local scope still sees rows written by ConversationStore', async () => {
+  const { store, conv, cleanup } = makeStore()
+  try {
+    const legacy = conv.createConversation({ title: 'UI chat' })
+    assert.equal((await store.getChat(LOCAL_SCOPE, legacy.id))?.title, 'UI chat')
+    assert.equal(await store.getChat(ACME, legacy.id), null)
+  } finally {
+    cleanup()
+  }
+})
+
+test('version is a real stored counter that increments on each update', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    const c = await store.createChat(ACME, { title: 'v' })
+    assert.equal(c.version, 1)
+    const a = await store.updateChat(ACME, c.id, { title: 'v2' })
+    assert.equal(a?.version, 2)
+    const b = await store.updateChat(ACME, c.id, { title: 'v3' })
+    assert.equal(b?.version, 3)
+  } finally {
+    cleanup()
+  }
+})
+
+test('metadata and status now round-trip', async () => {
+  const { store, cleanup } = makeStore()
+  try {
+    const c = await store.createChat(ACME, { title: 'meta', metadata: { app: 'x' } })
+    assert.equal((await store.getChat(ACME, c.id))?.metadata.app, 'x')
+
+    const m = await store.addMessage(ACME, c.id, { role: 'assistant', content: '', status: 'streaming' })
+    assert.equal(m.status, 'streaming')
+    const done = await store.updateMessage(ACME, m.id, { content: 'final', status: 'complete' })
+    assert.equal(done?.status, 'complete')
+  } finally {
+    cleanup()
+  }
+})
+
+test('a stale ifVersion on updateMessage is rejected after a real version bump', async () => {
+  // Regression check for the Phase 1 lost-update bug: Message.version used to be derived
+  // from the immutable created_at column, so it never changed across updates and a stale
+  // ifVersion was silently accepted. With a real version column bumped on every write,
+  // the second call here must see a version that has already moved past what it holds.
+  const { store, cleanup } = makeStore()
+  try {
+    const c = await store.createChat(ACME, { title: 'race' })
+    const m = await store.addMessage(ACME, c.id, { role: 'user', content: 'v1' })
+    const staleVersion = m.version
+
+    const first = await store.updateMessage(ACME, m.id, { content: 'v2' }, staleVersion)
+    assert.equal(first?.content, 'v2')
+    assert.notEqual(first?.version, staleVersion)
+
+    await assert.rejects(
+      () => store.updateMessage(ACME, m.id, { content: 'v3' }, staleVersion),
+      /version_conflict/,
+    )
+    assert.equal((await store.getMessage(ACME, m.id))?.content, 'v2')
   } finally {
     cleanup()
   }
