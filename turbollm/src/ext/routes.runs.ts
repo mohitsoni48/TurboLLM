@@ -15,6 +15,7 @@ import type { Deps } from '../deps.js'
 import { requireScope, scopeFor } from './auth.js'
 import { extError, mapStoreError } from './errors.js'
 import { checkContextFits } from './context-limit.js'
+import { loadFullHistory, buildGenerationCtx } from './generation.js'
 import { PublicRunManager, type PublicRun, type RunBody } from './run-manager.js'
 import { IdempotencyStore } from './idempotency.js'
 import { TenantLimiter, DEFAULT_MAX_IN_FLIGHT_PER_TENANT, DEFAULT_REQUESTS_PER_MINUTE_PER_TENANT } from './limits.js'
@@ -148,8 +149,19 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
     // must not leave a user turn, a dangling assistant placeholder, or a held rate-limit slot
     // behind. v1 REFUSES an over-long history rather than silently truncating it: silent
     // truncation would mean the model answering from a history the integrator believes it sent.
-    const history = await d.chatStore.listMessages(scope, chatId, { limit: 200 })
-    const prospective = [...history.data.map((m) => ({ role: m.role, content: m.content })), { role: 'user', content }]
+    // Reuses generation.ts's `loadFullHistory` (pages via cursor until exhausted) and
+    // `buildGenerationCtx` (prepends the system prompt, folds prior `reasoning` into `<think>`
+    // blocks) — the SAME assembly the real generation path hands the engine moments later. A
+    // single capped `listMessages(scope, chatId, { limit: 200 })` call would silently return only
+    // the OLDEST page once a chat passes 200 stored messages (`SqliteChatStore.clampLimit`),
+    // letting this check pass a conversation whose true full history overflows the window — see
+    // `loadFullHistory`'s own header comment for the exact failure mode this avoids.
+    const history = await loadFullHistory(d.chatStore, scope, chatId)
+    const ctx = buildGenerationCtx(chat, history)
+    const prospective = [
+      ...ctx.engineMessages.map((m) => ({ role: m.role, content: String(m.content ?? '') })),
+      { role: 'user', content },
+    ]
     const fit = checkContextFits(d, prospective)
     if (!fit.fits) {
       return extError(c, 'engine', 'context_overflow',

@@ -14,6 +14,7 @@ import { hashKey } from '../auth.js'
 import { PublicRunManager } from './run-manager.js'
 import { registerExtChatRoutes } from './routes.chats.js'
 import { registerExtRunRoutes, type ExtRouteDeps } from './routes.runs.js'
+import { loadFullHistory } from './generation.js'
 import { IdempotencyStore } from './idempotency.js'
 import { TenantLimiter } from './limits.js'
 import { AuditLog } from './audit.js'
@@ -21,12 +22,21 @@ import { AuditLog } from './audit.js'
 const ACME = 'Bearer tllm-ext-acme'
 const GLOBEX = 'Bearer tllm-ext-globex'
 
-function harness(bodyFactory?: () => Promise<{ status: 'complete' | 'aborted' }>, ext?: ExtRouteDeps) {
+/** Defaults to a `contextSize`-less status (permissive — see context-limit.ts), matching every
+ *  pre-existing test in this file. Task 3's re-review added the `managerStatus` override so a
+ *  handful of new tests can exercise a REAL (small) context window without disturbing any of the
+ *  others, which all rely on the check being a no-op. */
+function harness(
+  bodyFactory?: () => Promise<{ status: 'complete' | 'aborted' }>,
+  ext?: ExtRouteDeps,
+  managerStatus?: () => { state: string; model: string | null; contextSize?: number },
+) {
   const dir = mkdtempSync(join(tmpdir(), 'turbollm-ext-runs-'))
   const conv = new ConversationStore(dir)
+  const chatStore = new ChatStoreRouter(conv.chatStore, conv.chatStore)
   const d = {
     db: conv,
-    chatStore: new ChatStoreRouter(conv.chatStore, conv.chatStore),
+    chatStore,
     // resolveTenantFromKey (ext/auth.ts) hashes the presented key with the real SHA-256
     // derivation before comparing (see routes.chats.test.ts's identical convention) — stored
     // keys hold only the hash, never the raw value, so the fixture must too.
@@ -34,7 +44,10 @@ function harness(bodyFactory?: () => Promise<{ status: 'complete' | 'aborted' }>
       { hash: hashKey('tllm-ext-acme'), tenant: 'acme' },
       { hash: hashKey('tllm-ext-globex'), tenant: 'globex' },
     ] }) },
-    manager: { status: () => ({ state: 'running', model: 'test-model' }), target: () => 'http://127.0.0.1:9999' },
+    manager: {
+      status: managerStatus ?? (() => ({ state: 'running', model: 'test-model' })),
+      target: () => 'http://127.0.0.1:9999',
+    },
   } as never
   const runs = new PublicRunManager()
   const app = new Hono()
@@ -46,7 +59,7 @@ function harness(bodyFactory?: () => Promise<{ status: 'complete' | 'aborted' }>
       return bodyFactory ? await bodyFactory() : { status: 'complete' as const }
     },
   }, ext)
-  return { app, runs, db: conv, cleanup: () => { conv.close(); rmSync(dir, { recursive: true, force: true }) } }
+  return { app, runs, db: conv, chatStore, cleanup: () => { conv.close(); rmSync(dir, { recursive: true, force: true }) } }
 }
 
 const post = (auth: string, b: unknown, accept = 'application/json') => ({
@@ -406,6 +419,73 @@ test('a chat-creation Idempotency-Key does not collide with a generate call reus
     const run = await genRes.json() as { id: string }
     assert.ok(run.id, 'a real run must have actually been started')
     await runs.settled(run.id)
+  } finally {
+    cleanup()
+  }
+})
+
+// Task 3 re-review, Important finding #1: every other test in this file uses a `manager.status()`
+// that never reports `contextSize`, so `checkContextFits` is a guaranteed no-op everywhere above —
+// none of them actually exercise a real refusal through the HTTP route. This is that missing
+// end-to-end case: a genuinely small window, a prompt long enough to overflow it, and — the single
+// most safety-critical property this feature exists for — proof that the refusal happens before
+// ANY persistence, not after.
+test('an over-long prospective history is refused with context_overflow, and nothing is persisted', async () => {
+  const smallWindow = () => ({ state: 'running', model: 'test-model', contextSize: 1000 })
+  const { app, cleanup } = harness(undefined, undefined, smallWindow)
+  try {
+    const chatId = await newChat(app)
+    const res = await app.request(`/api/ext/v1/chats/${chatId}/messages`,
+      post(ACME, { role: 'user', content: 'x'.repeat(4000), owner: 'u1' }))
+    assert.equal(res.status, 409)
+    assert.equal((await res.json() as { error: { code: string } }).error.code, 'context_overflow')
+
+    const list = await (await app.request(`/api/ext/v1/chats/${chatId}/messages?owner=u1`, { headers: { Authorization: ACME } })).json() as { data: unknown[] }
+    assert.equal(list.data.length, 0, 'a refused generation must not leave a dangling user/assistant message pair')
+  } finally {
+    cleanup()
+  }
+})
+
+// Task 3 re-review, Critical finding: the ORIGINAL implementation built `prospective` from a
+// single un-cursored `listMessages(scope, chatId, { limit: 200 })` call. `SqliteChatStore` orders
+// that call `seq ASC` and hard-caps `limit` at 200 (clampLimit) — so for any chat past 200 stored
+// messages that call returns only the OLDEST page, and everything after message #200 (potentially
+// the bulk of the conversation's real token weight) was invisible to the check. This seeds 200
+// short "filler" messages (well under the window on their own — exactly what the old single-page
+// call would have seen and nothing more), then 55 further, longer messages tacked onto the END of
+// the conversation. The true full-history total overflows the window; the first-200-only view
+// would not have. The fix (reusing generation.ts's `loadFullHistory`, which pages via cursor until
+// exhausted) must see the true total, not just the first page.
+test('an overflow that only shows up past message #200 is still caught (full-history paging, not a single capped page)', async () => {
+  const midWindow = () => ({ state: 'running', model: 'test-model', contextSize: 2000 })
+  const { app, chatStore, cleanup } = harness(undefined, undefined, midWindow)
+  try {
+    const chatId = await newChat(app)
+    const scope = { tenant: 'acme', owner: 'u1' }
+
+    // First 200 messages: short filler (~3 estimated tokens each, ~600 total) — precisely what a
+    // single un-cursored `listMessages(..., { limit: 200 })` call would return, and nothing more.
+    for (let i = 0; i < 200; i++) {
+      await chatStore.addMessage(scope, chatId, { role: 'user', content: 'hi' })
+    }
+    // 55 more messages AFTER that first page (~60 estimated tokens each, ~3300 total) — long
+    // enough that the TRUE full-history total (~3900) overflows the 2000-token window, even
+    // though the first 200 messages alone (~600) would not have.
+    for (let i = 0; i < 55; i++) {
+      await chatStore.addMessage(scope, chatId, { role: 'user', content: 'x'.repeat(200) })
+    }
+
+    const res = await app.request(`/api/ext/v1/chats/${chatId}/messages`,
+      post(ACME, { role: 'user', content: 'one more', owner: 'u1' }))
+    assert.equal(res.status, 409, 'the true full history overflows even though the first 200 messages alone would not')
+    assert.equal((await res.json() as { error: { code: string } }).error.code, 'context_overflow')
+
+    // No user/assistant pair was added on top of the 255 seeded messages — the refusal happened
+    // before persistence even for a chat this large. Counted via the same full-history pager the
+    // fix itself uses, since the public GET .../messages endpoint caps any single page at 200.
+    const after = await loadFullHistory(chatStore, scope, chatId)
+    assert.equal(after.length, 255, 'the refusal must not add a user/assistant pair on top of the seeded history')
   } finally {
     cleanup()
   }
