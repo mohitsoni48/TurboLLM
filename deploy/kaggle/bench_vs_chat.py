@@ -233,8 +233,19 @@ def main():
               f"(TTFT {ttft_ms:.0f} ms, {n} tokens)")
     print(f"\n  winner params : {fmt_params(winner['params'])}")
     print(f"  loaded params : {fmt_params(loaded)}")
-    same = fmt_params(winner['params']) == fmt_params(loaded)
-    print(f"  configs match : {'YES' if same else 'NO  <-- mismatch is the likely cause'}")
+    # The winner record carries no gpu block at all (BenchCandidate.params has no `gpu` field),
+    # so the split strategy that actually won is unrecorded and CANNOT be compared against what
+    # chat loaded. Report that as unknown rather than as a mismatch — calling it a mismatch would
+    # invent a cause, and calling it a match (what this script did before the gpu fields were
+    # printed) hides that pickSplitStrategies had a choice to make here at all.
+    if not (winner['params'] or {}).get('gpu'):
+        rest = lambda p: fmt_params(p).rsplit(' split=', 1)[0]
+        agree = rest(winner['params']) == rest(loaded)
+        print(f"  configs match : {'YES' if agree else 'NO'} on ctx/ngl/nCpuMoe/parallel/kv/flashAttn; "
+              f"split UNKNOWN — the bench winner record has no gpu block")
+    else:
+        same = fmt_params(winner['params']) == fmt_params(loaded)
+        print(f"  configs match : {'YES' if same else 'NO  <-- mismatch is the likely cause'}")
     print("\n  per-GPU peak during chat (both should be non-zero on a dual-GPU load):")
     for gpu in sorted(peaks):
         print(f"    GPU {gpu}: mem {peaks[gpu]['mem_mb']} MiB, util {peaks[gpu]['util']}%")
