@@ -120,8 +120,15 @@ export function registerExtChatRoutes(app: Hono, d: Deps): void {
         return extError(c, m.type, m.code, m.message, { status: m.status, retryable: m.retryable })
       }
     }
-    // Generating path: Task 7.
-    return extError(c, 'unsupported', 'not_supported', 'Generation lands in Task 7.')
+    // Generating path: forward to the dedicated run route (routes.runs.ts) so both share this
+    // same content validator instead of duplicating it. That route re-derives scope from the
+    // forwarded Authorization header — never from this request's already-resolved scope — so
+    // its own tenant/owner checks stay the single source of truth.
+    return app.fetch(new Request(new URL(`${BASE}/chats/${c.req.param('id')}/messages/generate`, c.req.url), {
+      method: 'POST',
+      headers: c.req.raw.headers,
+      body: JSON.stringify({ ...b, content }),
+    }))
   })
 
   app.get(`${BASE}/messages/:id`, requireScope('chats:read'), async (c) => {

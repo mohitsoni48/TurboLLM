@@ -1,0 +1,375 @@
+// turbollm/src/ext/generation.ts
+//
+// The production generation body for the public API's send/stream route (spec 27 §5, §6, §8).
+// `routes.runs.ts` only knows the injected `RunDeps.makeBody` seam; this file is the one place
+// that wires it to a real engine call. It is NOT independently unit-tested (there is no model to
+// test against in this task) — its contract is exercised only through the interface routes.runs.ts
+// depends on, per the route tests (which inject a fake `makeBody`). It must compile cleanly and
+// match the design below.
+//
+// ── Why this does NOT call chat-routes.ts's runGeneration() ────────────────────────────────────
+// The brief's own Step 4 sketch assumes `runGeneration` is an importable, reusable core. Three
+// confirmed facts about the real function rule that out, not just as a style preference:
+//
+//  1. COMPILE BLOCKER: `runGeneration` and its `GenerationCtx` type are both unexported (private
+//     to chat-routes.ts). There is nothing to import.
+//  2. DATA LOSS for any real deployment: `runGeneration`'s terminal persistence
+//     (`db.updateMessage(assistantMsg.id, ...)`, `db.touchConversation`, the `db.getMessage(...)!`
+//     that builds its own 'done' payload) all write straight to `d.db` — the LOCAL
+//     ConversationStore — with NO awareness of `d.chatStore` at all. `d.chatStore` only serves
+//     'local' tenant chats from that same handle; every other tenant is served either by a
+//     `not_supported` error (default config, no adapter — see chat/store/load-adapter.ts:
+//     `kind:'sqlite'` resolves the adapter to `null`) or, in any real multi-tenant deployment, by
+//     a genuinely separate adapter store. Either way `assistantMsg.id` (a public ChatMessage id)
+//     was never written into `d.db`'s tables, so `db.updateMessage` silently affects 0 rows and
+//     the public assistant message would never leave status:'streaming'. This is the exact same
+//     shape of trap the task brief already flagged for `d.db.getConversation()` — just on the
+//     WRITE side, and not something a synthetic `ctx` can route around, since it's hardcoded
+//     inside runGeneration's own body.
+//  3. HANG risk: runGeneration's one call to `executeToolCallWithApproval` hardcodes
+//     `interactive: true` unconditionally — there is no ctx field that reaches it. Every tool
+//     defaults to 'ask' policy unless explicitly configured (tools/tool-policy.ts's own doc
+//     comment), so routing a public run through it would, by default, hang forever on the first
+//     tool call waiting on `waitForToolApproval` (tools/approval-gate.ts has no timeout) — an
+//     approval endpoint no external caller can ever reach.
+//
+// This is exactly the problem routines/chat-runner.ts already solved for a different detached
+// caller (Chat Routines), and its own header comment says as much: "NOT a reuse of
+// chat-routes.ts's runGeneration(): that function is hard-coupled to a live Hono SSE
+// StreamHandle... and has no live client to stream to here." That file built its own loop
+// instead of forcing a fit into the shared one; this file follows the same precedent, adding
+// real SSE streaming (chat-runner.ts's own loop is deliberately non-streaming — "nobody is
+// watching deltas live" — which does not hold for the public API's live SSE/JSON modes).
+//
+// Tool execution reuses `executeToolCallWithApproval` (tools/execute-with-approval.ts) directly
+// — the exact function chat-runner.ts already reuses for the identical non-interactive-caller
+// problem — with `interactive: false` and an empty `agentAllowedTools`. An 'ask'-policy tool
+// resolves as an instant "Blocked" deny in that branch, never a wait (spec 27 §5.1: "public runs
+// execute allow-policy tools only; anything resolving to ask is treated as deny").
+import type { Deps } from '../deps.js'
+import type { EmitSink } from '../chat/emit-sink.js'
+import type { Chat, ChatMessage } from '../chat/store/types.js'
+import type { RunDeps } from './routes.runs.js'
+import { withCurrentDate } from '../chat/chat-routes.js'
+import { engineModelAlias } from '../engines/compat.js'
+import { clampMaxTokens } from '../config/config.js'
+import { executeToolCallWithApproval } from '../tools/execute-with-approval.js'
+
+/** Mirrors chat-routes.ts's own MAX_TOOL_ITER / chat-runner.ts's identical constant — a
+ *  ceiling, not a target. Ordinary chats finish in 1 round; this only bounds a runaway loop. */
+const MAX_TOOL_ITER = 16
+/** How much prior chat history to fold into the engine request. Mirrors the internal route's
+ *  practical bound; a public chat is not expected to run unbounded context per turn. */
+const MAX_HISTORY = 200
+
+interface WireMessage { role: string; content: unknown; tool_calls?: unknown; tool_call_id?: string }
+
+interface ToolCallRecord { id: string; name: string; args: Record<string, unknown>; result?: string; error?: string }
+
+/** The minimal per-turn context a public-API generation needs, built from the PUBLIC `Chat` DTO
+ *  the route already confirmed exists (`d.chatStore.getChat`) — never from `d.db.getConversation`
+ *  (see file header, point 2). Intentionally thin: the public `Chat` type has no fields for the
+ *  UI-only concepts chat-routes.ts's internal `Conversation` carries (agentId, skillIds,
+ *  expertMode, readScope, toolOverrides, agentMode, force_web_search-style toolPolicy) — public
+ *  chats simply don't have them, and public runs get no per-conversation override machinery
+ *  (spec 27 §5.1), so there is nothing to synthesize for those fields. */
+export interface GenerationCtx {
+  chat: Chat
+  engineMessages: WireMessage[]
+}
+
+/** Builds the wire message array: the chat's own system prompt (with the same live-date
+ *  substitution real turns get, via chat-routes.ts's exported `withCurrentDate`), then its prior
+ *  history in seq order, already including this turn's just-persisted user message (the route
+ *  persists user-then-placeholder before starting the run, and the caller here filters out only
+ *  the placeholder by id — see `createMakeBody`). Folds a prior assistant turn's `reasoning` back
+ *  in as a `<think>` block exactly as chat-routes.ts's own resend logic does — `preserveThinking`
+ *  is always on here, matching `ConversationStore.createConversation`'s own default for new chats
+ *  (there is no per-chat toggle in the public API). */
+export function buildGenerationCtx(chat: Chat, engineHistory: ChatMessage[]): GenerationCtx {
+  const engineMessages: WireMessage[] = []
+  if (chat.systemPrompt) engineMessages.push({ role: 'system', content: withCurrentDate(chat.systemPrompt) })
+  for (const m of engineHistory) {
+    const content = (m.role === 'assistant' && m.reasoning?.trim())
+      ? `<think>\n${m.reasoning}\n</think>\n\n${m.content}`
+      : m.content
+    engineMessages.push({ role: m.role, content })
+  }
+  return { chat, engineMessages }
+}
+
+const SAMPLING_KEYS: Record<string, string> = {
+  temp: 'temperature', topP: 'top_p', topK: 'top_k', minP: 'min_p',
+  presencePenalty: 'presence_penalty', frequencyPenalty: 'frequency_penalty',
+}
+
+/** Same camelCase → engine snake_case mapping chat-routes.ts's runGeneration applies to
+ *  `conv.sampling`, applied here to the public `Chat.sampling` passthrough field. */
+function mapSampling(sampling: Record<string, unknown>, repeatPenaltyKey: string): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  for (const [camel, snake] of Object.entries(SAMPLING_KEYS)) {
+    if (camel in sampling) out[snake] = sampling[camel]
+  }
+  if ('repeatPenalty' in sampling) out[repeatPenaltyKey] = sampling.repeatPenalty
+  for (const [k, v] of Object.entries(sampling)) {
+    if (!(k in SAMPLING_KEYS) && k !== 'repeatPenalty' && k !== 'stop') out[k] = v
+  }
+  return out
+}
+
+interface LoopHooks {
+  onDelta: (text: string) => void
+  onReasoning: (text: string) => void
+  onError: (message: string) => void
+  onToolCall: (tc: ToolCallRecord) => void
+}
+
+/** Drives the engine for one turn, including any tool-call rounds, streaming deltas/reasoning
+ *  out via `emit` as they arrive and reporting the final outcome via `hooks`. Never throws for an
+ *  engine-side failure (mirrors runGeneration's own contract of "swallow, emit 'error',
+ *  finish") — `hooks.onError` is the sole failure signal, so the caller decides what a failure
+ *  means for the run's terminal status. Only a genuinely unexpected exception outside the
+ *  fetch/stream handling would propagate. */
+async function runGenerationLoop(d: Deps, ctx: GenerationCtx, emit: EmitSink, signal: AbortSignal, hooks: LoopHooks): Promise<void> {
+  const ms = d.manager.status()
+  const target = d.manager.target()
+  if (ms.state !== 'running' || !ms.model || !target) {
+    hooks.onError('No model loaded.')
+    return
+  }
+  const loadedModel = ms.model
+
+  const engineKind = d.registry.active()?.kind ?? ''
+  // BUG-006 (chat-routes.ts): vLLM/SGLang/mlx-vlm require the OpenAI-spec `repetition_penalty`
+  // name, not llama.cpp's `repeat_penalty`. Same mapping, same reason.
+  const repeatPenaltyKey = (engineKind === 'vllm' || engineKind === 'sglang' || engineKind === 'mlx-vlm') ? 'repetition_penalty' : 'repeat_penalty'
+  const sampling = ctx.chat.sampling ?? {}
+  const samplingOverride = mapSampling(sampling, repeatPenaltyKey)
+  const stopStrings = Array.isArray(sampling.stop) ? sampling.stop as string[] : undefined
+  const maxLimit = d.store.snapshot().modelDefaults.maxTokens ?? 0
+
+  // vLLM is strict about a `tools` array defaulting tool_choice to "auto" unless launched with
+  // --enable-auto-tool-choice (chat-routes.ts's own BUG note) — same engine-kind gate here.
+  const toolDefs = d.tools ? await d.tools.buildToolDefinitions() : []
+  const toolsSupported = engineKind !== 'vllm' && engineKind !== 'sglang' && toolDefs.length > 0
+
+  const messages: WireMessage[] = ctx.engineMessages.map((m) => ({ role: m.role, content: m.content }))
+
+  let iter = 0
+  let finishedCleanly = false
+  while (iter < MAX_TOOL_ITER) {
+    iter++
+    if (signal.aborted) return
+
+    const reqBody: Record<string, unknown> = {
+      model: engineModelAlias(engineKind, d.manager.currentOpts()?.modelPath) ?? loadedModel.key,
+      messages, stream: true, stream_options: { include_usage: true },
+      ...samplingOverride,
+    }
+    if (stopStrings?.length) reqBody.stop = stopStrings
+    const cappedMax = clampMaxTokens(reqBody.max_tokens as number | undefined, maxLimit)
+    if (cappedMax != null) reqBody.max_tokens = cappedMax
+    else delete reqBody.max_tokens
+    if (toolsSupported) reqBody.tools = toolDefs
+
+    let res: Response
+    try {
+      res = await fetch(`${target}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(reqBody),
+        signal,
+        duplex: 'half',
+      })
+    } catch (e) {
+      if (signal.aborted) return
+      hooks.onError(`Engine request failed: ${(e as Error).message}`)
+      return
+    }
+    if (!res.ok || !res.body) {
+      hooks.onError(`Engine returned ${res.status}`)
+      return
+    }
+
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    let buf = ''
+    let roundContent = ''
+    let finishReason = ''
+    const pendingToolCalls = new Map<number, { id: string; name: string; argsBuffer: string }>()
+
+    const cancelReader = () => void reader.cancel()
+    if (signal.aborted) cancelReader()
+    else signal.addEventListener('abort', cancelReader, { once: true })
+
+    try {
+      readLoop: while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += decoder.decode(value, { stream: true })
+        const lines = buf.split('\n')
+        buf = lines.pop() ?? ''
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          const raw = line.slice(6).trim()
+          if (raw === '[DONE]') break readLoop
+
+          let chunk: Record<string, unknown>
+          try { chunk = JSON.parse(raw) as Record<string, unknown> } catch { continue }
+
+          const choices = chunk.choices as Array<{
+            delta?: { content?: string; reasoning_content?: string; reasoning?: string; tool_calls?: Array<{ index: number; id?: string; function?: { name?: string; arguments?: string } }> }
+            finish_reason?: string
+          }> | undefined
+          if (!choices?.length) continue
+
+          if (choices[0].finish_reason) finishReason = choices[0].finish_reason
+          const delta = choices[0].delta ?? {}
+
+          if (delta.tool_calls?.length) {
+            for (const tc of delta.tool_calls) {
+              if (!pendingToolCalls.has(tc.index)) pendingToolCalls.set(tc.index, { id: '', name: '', argsBuffer: '' })
+              const entry = pendingToolCalls.get(tc.index)!
+              if (tc.id && !entry.id) entry.id = tc.id
+              if (tc.function?.name && !entry.name) entry.name = tc.function.name
+              if (tc.function?.arguments) entry.argsBuffer += tc.function.arguments
+            }
+            continue
+          }
+
+          const rc = delta.reasoning_content ?? delta.reasoning
+          if (rc) {
+            hooks.onReasoning(rc)
+            await emit({ event: 'reasoning', data: { delta: rc } })
+            continue
+          }
+
+          const content = delta.content ?? ''
+          if (content) {
+            roundContent += content
+            hooks.onDelta(content)
+            await emit({ event: 'delta', data: { delta: content } })
+          }
+        }
+      }
+    } finally {
+      signal.removeEventListener('abort', cancelReader)
+    }
+
+    if (signal.aborted) return
+
+    if ((finishReason === 'tool_calls' || pendingToolCalls.size > 0) && d.tools) {
+      const calls = [...pendingToolCalls.values()]
+      messages.push({
+        role: 'assistant',
+        content: roundContent || null,
+        tool_calls: calls.map((tc) => ({ id: tc.id, type: 'function', function: { name: tc.name, arguments: tc.argsBuffer } })),
+      })
+
+      for (const tc of calls) {
+        let args: Record<string, unknown>
+        try { args = JSON.parse(tc.argsBuffer || '{}') as Record<string, unknown> } catch { args = {} }
+
+        // Public runs execute allow-policy tools only (spec 27 §5.1). `interactive: false` +
+        // an empty `agentAllowedTools` means an 'ask'-policy tool (the default for anything not
+        // explicitly configured — tool-policy.ts) resolves as an instant "Blocked" deny inside
+        // executeToolCallWithApproval, never a wait on `waitForToolApproval` — there is no
+        // interactive approval endpoint an external caller could ever reach.
+        const approved = await executeToolCallWithApproval({
+          tools: d.tools,
+          sink: emit,
+          convId: ctx.chat.id,
+          id: tc.id,
+          name: tc.name,
+          args,
+          globalPolicies: d.store.snapshot().tools.toolPolicies ?? {},
+          convOverrides: {}, // public chats carry no per-conversation override machinery (§5.1)
+          autoAllowAll: d.store.snapshot().tools.autoAllowAll ?? false,
+          signal,
+          interactive: false,
+          agentAllowedTools: [],
+          isCodeAuthorized: false, // no HTTP request to authorize against here (§5.1) — fail closed
+        })
+        hooks.onToolCall({ id: tc.id, name: tc.name, args, result: approved.error ? undefined : approved.result, error: approved.error })
+        messages.push({ role: 'tool', content: approved.result, tool_call_id: tc.id })
+      }
+      continue
+    }
+
+    finishedCleanly = true
+    break
+  }
+
+  if (!finishedCleanly && !signal.aborted) {
+    hooks.onError(`Exceeded the ${MAX_TOOL_ITER}-round tool-call ceiling without finishing.`)
+  }
+}
+
+/** Builds the real `RunDeps.makeBody` the send/stream route drives (routes.runs.ts). Persist-
+ *  then-generate and the 404/409 checks already happened in the route before this is ever
+ *  called — this only has to run the turn and land a terminal write, in this order:
+ *    read chat + history (adapter I/O, no gate) → acquire gate('bg') → generationStart →
+ *    engine loop (only "engine work" the gate should hold) → generationEnd → release gate →
+ *    terminal chatStore.updateMessage (adapter I/O, after release, per the standing invariant
+ *    that the gate never wraps adapter I/O).
+ *  The terminal write always runs, on every exit path (success, engine failure, abort, or an
+ *  early exception before the loop even starts) — so the assistant placeholder never sits stuck
+ *  at status:'streaming' forever. */
+export function createMakeBody(d: Deps): RunDeps['makeBody'] {
+  return ({ chatId, messageId, scope }) => async ({ emit, signal }) => {
+    let finalContent = ''
+    let finalReasoning = ''
+    const toolCalls: ToolCallRecord[] = []
+    let errorMessage: string | undefined
+    let release: (() => void) | null = null
+
+    try {
+      const chat = await d.chatStore.getChat(scope, chatId)
+      if (!chat) throw new Error(`Chat ${chatId} no longer exists.`)
+
+      const page = await d.chatStore.listMessages(scope, chatId, { limit: MAX_HISTORY })
+      // The placeholder assistant message (this turn) is excluded by id — everything else,
+      // including the just-persisted user turn, stays in seq order (mirrors chat-routes.ts's
+      // own `allMsgs = conv.messages.filter(m => m.id !== assistantMsg.id)`).
+      const engineHistory = page.data.filter((m) => m.id !== messageId)
+      const ctx = buildGenerationCtx(chat, engineHistory)
+
+      release = d.gate ? await d.gate.acquire('bg', { signal }) : null
+      d.manager.generationStart()
+      try {
+        await runGenerationLoop(d, ctx, emit, signal, {
+          onDelta: (t) => { finalContent += t },
+          onReasoning: (t) => { finalReasoning += t },
+          onError: (m) => { errorMessage = m },
+          onToolCall: (tc) => toolCalls.push(tc),
+        })
+      } finally {
+        d.manager.generationEnd()
+      }
+    } catch (e) {
+      if (!signal.aborted) errorMessage = errorMessage ?? (e as Error).message
+    } finally {
+      // Released BEFORE the terminal write below — the gate wraps engine work only, never
+      // adapter I/O (standing invariant, spec 27 §8.2).
+      release?.()
+    }
+
+    const aborted = signal.aborted
+    const status = aborted ? 'aborted' as const : errorMessage ? 'failed' as const : 'complete' as const
+    await d.chatStore.updateMessage(scope, messageId, {
+      content: finalContent,
+      reasoning: finalReasoning,
+      toolCalls,
+      status,
+    }).catch(() => {
+      // Best-effort: the run's own status (PublicRunManager) is authoritative for the caller
+      // regardless of whether this write lands — a version conflict here (e.g. a concurrent
+      // edit) must never mask the real outcome of the generation itself.
+    })
+
+    if (aborted) return { status: 'aborted' }
+    if (errorMessage) throw new Error(errorMessage)
+    return { status: 'complete' }
+  }
+}
