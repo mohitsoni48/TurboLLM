@@ -27,18 +27,19 @@ import { isCliAvailable, isClaudeCliAvailable } from './cli-preflight'
 import { cliBin } from '../cli-launch'
 import { isTerminalCodingAgent, TERMINAL_CODE_AGENT } from './schema'
 
-/** The binary a terminal-harness routine needs installed. Falls back to `claude` for a routine with
- *  no terminal harness set, which is the only value that could reach here before this existed. */
-function terminalHarnessBin(routine: Routine): string {
-  if (!isTerminalCodingAgent(routine.codingAgent)) return 'claude'
-  return cliBin(TERMINAL_CODE_AGENT[routine.codingAgent]) ?? 'claude'
-}
 import { realSpawnCliProcess, runClaudeCliProcess } from './cli-process'
 import { claudePermissionModeChoices } from '../terminal/agent-modes'
 import { engineIsIdle } from '../engines/update-scheduler'
 import type { GenerationGate } from '../agents/gate'
 import { runCliInteractiveRoutine, type CliInteractiveDeps } from './cli-interactive-runner'
 import { createAgentTerminal, getTerminalManager } from '../terminal/terminal-routes'
+
+/** The binary a terminal-harness routine needs installed. Falls back to `claude` for a routine with
+ *  no terminal harness set, which is the only value that could reach here before this existed. */
+function terminalHarnessBin(routine: Routine): string {
+  if (!isTerminalCodingAgent(routine.codingAgent)) return 'claude'
+  return cliBin(TERMINAL_CODE_AGENT[routine.codingAgent]) ?? 'claude'
+}
 
 type RoutineOutcome = ChatRunOutcome | CodeRunOutcome
 

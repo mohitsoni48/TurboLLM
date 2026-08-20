@@ -591,7 +591,12 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
     //
     // `chatGuidance` is computed here (before the body is mutated below) but applied inside the
     // isChat body-rewrite block, so a non-chat passthrough pays nothing at all.
-    const chatView = isChat && parsedBody ? openAiRequestView(parsedBody) : null
+    // Built ONLY when something will actually read it. The view walks every message and JSON.parses
+    // every historical tool call's `arguments`, synchronously on the daemon's single thread, once
+    // per turn and growing with the conversation — pure waste for a plain chat client with no tools
+    // and no Code session, which is exactly when both consumers below skip it.
+    const chatNeedsView = isChat && !!parsedBody && (!!chatCodeSessionId || declaresTools(parsedBody))
+    const chatView = chatNeedsView && parsedBody ? openAiRequestView(parsedBody) : null
     if (chatView && chatCodeSessionId) {
       // Confirm half of coding-activity attribution — the view's `tool_result` blocks are exactly
       // what this reads, so no second adapter is needed. Runs before the request is touched, for
@@ -600,7 +605,7 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
       commitConfirmedCodeToolCalls(d, chatCodeSessionId, chatView)
     }
     const chatGuidance = chatView && parsedBody && declaresTools(parsedBody)
-      ? analyzeTurn(chatView, new URL(c.req.url).origin)
+      ? analyzeTurn(chatView, url.origin)
       : null
 
     const requestedModel = isChat ? ((parsedBody?.model as string | undefined) ?? '') : ''
@@ -1082,11 +1087,11 @@ class StreamingToolCallAccumulator {
     const deltas = (chunk.choices as Array<{ delta?: { tool_calls?: Array<Record<string, unknown>> } }> | undefined)
       ?.[0]?.delta?.tool_calls
     if (!Array.isArray(deltas)) return
-    for (const d of deltas) {
-      const index = typeof d.index === 'number' ? d.index : 0
+    for (const delta of deltas) {
+      const index = typeof delta.index === 'number' ? delta.index : 0
       const entry = this.byIndex.get(index) ?? { id: '', name: '', args: '' }
-      if (typeof d.id === 'string' && d.id) entry.id = d.id
-      const fn = (d.function ?? {}) as { name?: unknown; arguments?: unknown }
+      if (typeof delta.id === 'string' && delta.id) entry.id = delta.id
+      const fn = (delta.function ?? {}) as { name?: unknown; arguments?: unknown }
       if (typeof fn.name === 'string' && fn.name) entry.name = fn.name
       if (typeof fn.arguments === 'string') entry.args += fn.arguments
       this.byIndex.set(index, entry)

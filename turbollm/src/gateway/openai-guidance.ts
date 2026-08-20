@@ -36,13 +36,19 @@ import type { AnthropicRequest } from './anthropic'
  *  both are cheap to honour and unambiguous when they appear.
  *
  *  Absent those, the fallback is this deliberately NARROW anchored match on the result text. It is
- *  a heuristic and is documented as one rather than presented as a protocol fact — but the failure
- *  modes are graceful in both directions, which is what makes a heuristic acceptable here:
+ *  a heuristic and is documented as one rather than presented as a protocol fact. Its failure modes:
  *    - false POSITIVE → one extra nudge telling the model to read the docs before retrying. That is
  *      advice, not an action; the worst case is a slightly longer prompt.
- *    - false NEGATIVE → rule 3 does not fire for that turn, i.e. exactly today's behaviour.
- *  Neither can corrupt a turn, block a tool, or mis-credit an edit — attribution treats "not known
- *  to have failed" as success only for CREDITING, and an uncredited edit is the safe direction.
+ *    - false NEGATIVE → rule 3 does not fire for that turn, AND — the part an earlier version of
+ *      this comment WRONGLY claimed was impossible — the edit IS credited, because
+ *      `commitConfirmedCodeToolCalls` credits on `is_error !== true`. A failed edit whose text does
+ *      not match below therefore inflates filesTouched / "Diff shipped" and can attach a diff for a
+ *      change that never landed. Cosmetic (stats only, no protocol or data effect), but real.
+ *
+ *  Inverting it — crediting only on an explicit `is_error: false` — was considered and REJECTED:
+ *  neither pi nor opencode sends that field at all, so nothing would ever be credited and the tiles
+ *  would go back to reading zero, which is the bug this path exists to fix. Broadening the patterns
+ *  is the lever that actually helps, so known real-world failure text is matched explicitly below.
  *
  *  Anchored at the start, and a generic failure WORD must be followed by a separator (`:`, `-`,
  *  `!`, or a bracketed code) rather than merely a word boundary. A word boundary alone was the
@@ -53,6 +59,22 @@ import type { AnthropicRequest } from './anthropic'
  *  anything but a failure ("Traceback", "permission denied", "ENOENT") need no separator. */
 const TOOL_ERROR_TEXT =
   /^\s*(?:(?:error|exception|fatal|failed|failure)\s*(?:\[[^\]]*\])?\s*[:\-–—!]|traceback\b|permission denied|command not found|no such file or directory|enoent\b|econnrefused\b)/i
+
+/** Failure text that does NOT lead with a generic error word, matched anywhere in the result.
+ *  These are the real messages the supported harnesses emit for the single most common local-model
+ *  tool failure — an edit whose target text was not found or not unique — which the anchored
+ *  pattern above misses entirely, silently crediting the edit. Deliberately specific: each is a
+ *  phrase a successful result has no reason to contain. */
+const TOOL_ERROR_PHRASES = [
+  'was not found in the file',
+  'not found in file',
+  'oldstring not found',
+  'old_string not found',
+  'appears multiple times',
+  'is not unique',
+  'no changes were made',
+  'file has not been read yet',
+]
 
 /** Flatten an OpenAI message `content` (string, or an array of content parts) to plain text.
  *  Only text is recovered — an image part contributes nothing, which is correct here: every
@@ -76,7 +98,10 @@ function contentText(content: unknown): string {
 export function toolMessageIsError(msg: Record<string, unknown>): boolean {
   if (typeof msg.is_error === 'boolean') return msg.is_error
   if (typeof msg.error === 'boolean') return msg.error
-  return TOOL_ERROR_TEXT.test(contentText(msg.content))
+  const text = contentText(msg.content)
+  if (TOOL_ERROR_TEXT.test(text)) return true
+  const lower = text.toLowerCase()
+  return TOOL_ERROR_PHRASES.some((phrase) => lower.includes(phrase))
 }
 
 /** An `AnthropicRequest`-shaped view of an OpenAI chat-completions body, faithful in exactly the
