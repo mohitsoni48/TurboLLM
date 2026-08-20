@@ -26,7 +26,7 @@ ENGINE_BIN="$ENGINE_DIR/build/bin/llama-server"
 MODELS_DIR="$WORK/models"
 WEB_STAMP="$WORK/.webdist-commit"
 TQ_REPO="https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant"  # default branch = feature/turboquant-kv-cache
-MODEL_REPO="unsloth/Qwen3.6-27B-MTP-GGUF"
+MODEL_REPO="${TURBOLLM_MODEL_REPO:-unsloth/Qwen3.6-27B-MTP-GGUF}"      # override to bench a different model
 MODEL_FILE="${TURBOLLM_MODEL_FILE:-Qwen3.6-27B-Q4_K_M.gguf}"           # ~17GB, fits across 2×T4 (30GB)
 BUILD_JOBS="${TURBOLLM_BUILD_JOBS:-2}"                                 # cap parallelism — unbounded -j OOMs Kaggle's ~29GB
 

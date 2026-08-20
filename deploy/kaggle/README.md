@@ -40,6 +40,33 @@ that actually uses the T4s here — so `setup.sh` compiles the **TurboQuant** ll
 Cell 3 prints the public `*.trycloudflare.com` URL and the **Token** required to open it.
 Loopback API calls from inside the notebook need no token.
 
+## Headless runs via the Kaggle CLI
+
+The UI flow above needs a human to click through the GUI. For an unattended, reproducible run
+(and for CI), push the notebook as a **batch kernel** instead:
+
+```bash
+pip install kaggle
+kaggle auth login      # OAuth in the browser — no API token file to manage
+kaggle kernels push -p deploy/kaggle --accelerator NvidiaTeslaT4
+kaggle kernels status  sonijisons/<slug>
+kaggle kernels output  sonijisons/<slug> -p out    # the full run log
+```
+
+Two things worth knowing:
+
+- **`--accelerator NvidiaTeslaT4` pins the dual-T4 shape.** `kernel-metadata.json`'s
+  `enable_gpu` is a bare boolean and cannot request *two* cards, which is why the notebook
+  tells you to set the accelerator by hand in the UI. The CLI flag can — a pushed run comes up
+  with `Tesla T4 ×2` — so a batch run needs no UI visit at all. (Valid shapes:
+  `NvidiaTeslaT4`, `NvidiaTeslaP100`, `Tpu1VmV38`.)
+- **The kernel slug comes from the `title`, not the `id`.** A title of `TurboLLM probe (shape
+  + disk)` pushes to `…/turbollm-probe-shape-disk`, and `status`/`output` against the `id`
+  fail with a confusing *permission denied*. Keep `title` and `id` the same string.
+
+A batch kernel has no interactive GUI, so a headless notebook should end by running
+`bench_vs_chat.py` and printing its result rather than opening a tunnel.
+
 ## The dev loop
 
 When a fix is pushed to the branch, on Kaggle just:
@@ -88,6 +115,9 @@ and re-run the script.
 ## Notes / knobs
 
 - `TURBOLLM_MODEL_FILE` — override the GGUF (default `Qwen3.6-27B-Q4_K_M.gguf`; `Q5_K_M` also available).
+- `TURBOLLM_MODEL_REPO` — override the HF repo the GGUF comes from (default `unsloth/Qwen3.6-27B-MTP-GGUF`).
+- `TURBOLLM_EXTRA_MODEL_DIRS` — extra `:`-separated model dirs for `serve.sh` to register. Use
+  this to keep a big GGUF off the 19.5 GB `/kaggle/working` quota — `/tmp` has ~1 TB free.
 - `TURBOLLM_BUILD_JOBS` — compile parallelism (default `2`; raising it risks OOM on Kaggle's ~29 GB).
 - Kaggle GPU sessions are time-limited (and quota'd ~30 h/week); the ~20-40 min first build eats into that. `setup.sh` is idempotent, so re-runs skip the build + model download.
 - `/kaggle/working` persists within a session; the TurboQuant binary + model live there so a `serve.sh restart` is instant.
