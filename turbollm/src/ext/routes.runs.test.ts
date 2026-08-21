@@ -155,7 +155,7 @@ test('run.start audit rows carry the real created run id, not the parent chat id
 
     // Direct store read (see routes.chats.test.ts's identical rationale): this route registers
     // its OWN AuditLog fallback since no `ext.audit` was threaded through by this harness call.
-    const rows = new AuditLog(db).list('acme', {})
+    const rows = new AuditLog(db).list('acme', 'u1', {})
     const startRow = rows.find((r) => r.action === 'run.start')
     assert.ok(startRow, 'expected a run.start row')
     assert.equal(startRow!.targetId, run.id, 'run.start must name the RUN it created, not the parent chat')

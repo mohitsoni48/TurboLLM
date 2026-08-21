@@ -20,7 +20,7 @@ test('a mutation is recorded with actor, action, target and request id', () => {
       tenant: 'acme', owner: 'u1', action: 'chat.create', targetId: 'chat_1',
       requestId: 'req_1', status: 201, keyPrefix: 'tllm-ext',
     })
-    const rows = audit.list('acme', {})
+    const rows = audit.list('acme', 'u1', {})
     assert.equal(rows.length, 1)
     assert.equal(rows[0].action, 'chat.create')
     assert.equal(rows[0].targetId, 'chat_1')
@@ -36,8 +36,31 @@ test('the log is tenant-scoped', () => {
   try {
     audit.record({ tenant: 'acme', owner: 'u1', action: 'chat.delete', targetId: 'c1', requestId: 'r1', status: 204, keyPrefix: 'k' })
     audit.record({ tenant: 'globex', owner: 'u1', action: 'chat.delete', targetId: 'c2', requestId: 'r2', status: 204, keyPrefix: 'k' })
-    assert.equal(audit.list('acme', {}).length, 1)
-    assert.equal(audit.list('globex', {})[0].targetId, 'c2')
+    assert.equal(audit.list('acme', 'u1', {}).length, 1)
+    assert.equal(audit.list('globex', 'u1', {})[0].targetId, 'c2')
+  } finally {
+    cleanup()
+  }
+})
+
+// Final-review security recheck: audit.list() had no owner parameter at all — the one read on
+// this whole surface that broke the otherwise-universal tenant+owner scoping convention,
+// live-reproduced as a real cross-owner leak (an audited owner's identity + real resource ids,
+// chaining with the caller-supplied-owner design into full cross-owner content disclosure via
+// the ordinary chat/message read routes). Mirrors the tenant-scoping test above, but for owner
+// within the SAME tenant, which is the dimension that was actually missing.
+test('the log is owner-scoped within a tenant, not just tenant-scoped', () => {
+  const { audit, cleanup } = make()
+  try {
+    audit.record({ tenant: 'acme', owner: 'owner-a', action: 'chat.create', targetId: 'chat-a', requestId: 'r1', status: 201, keyPrefix: 'k' })
+    audit.record({ tenant: 'acme', owner: 'owner-b', action: 'chat.create', targetId: 'chat-b', requestId: 'r2', status: 201, keyPrefix: 'k' })
+    const asOwnerA = audit.list('acme', 'owner-a', {})
+    assert.equal(asOwnerA.length, 1)
+    assert.equal(asOwnerA[0].targetId, 'chat-a')
+    assert.equal(asOwnerA[0].owner, 'owner-a')
+    const asOwnerB = audit.list('acme', 'owner-b', {})
+    assert.equal(asOwnerB.length, 1)
+    assert.equal(asOwnerB[0].targetId, 'chat-b')
   } finally {
     cleanup()
   }
@@ -79,7 +102,7 @@ test('prune drops entries older than the retention window', () => {
     db.handle.prepare(`INSERT INTO ext_audit (id,tenant,owner,action,target_id,request_id,status,key_prefix,at) VALUES ('a','acme','u1','chat.create','c1','r1',201,'k',$at)`).run({ $at: old })
     audit.record({ tenant: 'acme', owner: 'u1', action: 'chat.create', targetId: 'c2', requestId: 'r2', status: 201, keyPrefix: 'k' })
     audit.prune(30)
-    const rows = audit.list('acme', {})
+    const rows = audit.list('acme', 'u1', {})
     assert.equal(rows.length, 1)
     assert.equal(rows[0].targetId, 'c2')
   } finally {

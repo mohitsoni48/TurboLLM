@@ -424,8 +424,14 @@ test('a same-tenant, different-owner replay of an Idempotency-Key on POST /chats
 // (or no) target id. `GET /api/ext/v1/audit` is the black-box way to check these: it's the
 // same read path an integrator would use, so these tests exercise the real wire shape rather
 // than reaching into AuditLog internals.
-async function auditRows(app: Hono, auth = ACME): Promise<Array<{ action: string; target_id: string | null; status: number; request_id: string }>> {
-  const res = await app.request('/api/ext/v1/audit', { headers: { Authorization: auth } })
+//
+// `owner` defaults to 'u1' — matching every existing caller's mutations below, which all create
+// resources under `owner: 'u1'` — since the audit read is now owner-scoped like every other read
+// on this surface (final-review security recheck: this was the one route that wasn't, live-
+// reproduced as a cross-owner leak). Reading with no `?owner=` used to return the whole tenant's
+// rows regardless of who created them; now it correctly returns only the caller's own.
+async function auditRows(app: Hono, auth = ACME, owner = 'u1'): Promise<Array<{ action: string; target_id: string | null; status: number; request_id: string }>> {
+  const res = await app.request(`/api/ext/v1/audit?owner=${owner}`, { headers: { Authorization: auth } })
   assert.equal(res.status, 200)
   return (await res.json() as { data: Array<{ action: string; target_id: string | null; status: number; request_id: string }> }).data
 }
@@ -515,7 +521,7 @@ test('a rate-limited mutation (the blanket per-tenant budget) still produces an 
     // Read directly from the store rather than via GET /audit — that read endpoint is ITSELF
     // subject to the very same blanket per-tenant budget this test is deliberately exhausting
     // (a ratePerMinute:1 tenant has nothing left for a third call, audit read included).
-    const rows = new AuditLog(db).list('acme', {})
+    const rows = new AuditLog(db).list('acme', 'u1', {})
     // One row for the successful create, one for the refused second attempt.
     assert.equal(rows.length, 2)
     const refusal = rows.find((r) => r.status === 429)

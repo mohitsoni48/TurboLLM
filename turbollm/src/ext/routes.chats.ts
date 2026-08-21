@@ -484,10 +484,14 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
   // The tenant's own audit trail (spec 27 §10). Read-only — never audited itself
   // (auditMiddleware is not attached here) — and scoped to `extTenant` exactly like every
   // other read on this surface, so one tenant can never see another's mutation history.
+  // Owner-scoped like every other read on this surface (final-review security recheck: this
+  // route was the one exception — tenant-only — live-reproduced as a real cross-owner leak of
+  // every owner's identity + real resource ids, chaining with the caller-supplied-owner design
+  // into full cross-owner chat/message content disclosure via the ordinary read routes).
   app.get(`${BASE}/audit`, requireScope('chats:read'), (c) => {
-    const tenant = c.get('extTenant') as string
+    const scope = scopeFor(c, c.req.query('owner'))
     const limit = c.req.query('limit') ? Number(c.req.query('limit')) : undefined
-    const rows = audit.list(tenant, { limit, since: c.req.query('since') })
+    const rows = audit.list(scope.tenant, scope.owner, { limit, since: c.req.query('since') })
     return c.json({ data: rows.map(toAuditDTO) })
   })
 }

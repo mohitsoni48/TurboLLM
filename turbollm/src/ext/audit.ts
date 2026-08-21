@@ -71,11 +71,16 @@ export class AuditLog {
     })
   }
 
-  list(tenant: string, opts: { limit?: number; since?: string }): AuditRow[] {
+  // `owner` is a required parameter, not optional — every other read on this surface (chats,
+  // messages, runs, the idempotency replay check) is scoped by tenant AND owner via `scopeFor`;
+  // this was the one exception (final-review security recheck, live-reproduced as a real
+  // cross-owner leak — same class as C1/N1 — chaining with the caller-supplied-owner design
+  // into full cross-owner chat/message content disclosure via harvested owner ids + chat ids).
+  list(tenant: string, owner: string, opts: { limit?: number; since?: string }): AuditRow[] {
     const rows = this.db.handle.prepare(
-      `SELECT * FROM ext_audit WHERE tenant = $t AND ($since IS NULL OR at >= $since)
+      `SELECT * FROM ext_audit WHERE tenant = $t AND owner = $o AND ($since IS NULL OR at >= $since)
        ORDER BY at DESC LIMIT $l`,
-    ).all({ $t: tenant, $since: opts.since ?? null, $l: opts.limit ?? 200 }) as unknown as Array<{
+    ).all({ $t: tenant, $o: owner, $since: opts.since ?? null, $l: opts.limit ?? 200 }) as unknown as Array<{
       id: string; tenant: string; owner: string; action: string; target_id: string | null
       request_id: string; status: number; key_prefix: string; at: string
     }>
