@@ -7,6 +7,8 @@ import {
   listLinks,
   mintLink,
   patchLink,
+  revokeInbound,
+  type ApiKeyId,
   type InboundLink,
   type LinkCapability,
   type LinkRecord,
@@ -14,7 +16,7 @@ import {
   type MintedLink,
 } from '../../lib/link-api'
 import { LINK_CAPABILITIES, LINK_PRESETS } from '../../lib/link-constants'
-import { ApiError, track } from '../../lib/api'
+import { ApiError, getSettings, saveSettings, track } from '../../lib/api'
 import { Button } from '../../components/ui/button'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../../components/ui/collapsible'
 import { CopyButton } from '../../components/ui/copy-button'
@@ -104,6 +106,63 @@ export function TurboLinkSection() {
   )
 }
 
+/** What a linked peer displays for THIS machine. Persisted as `daemon.machineName`.
+ *  Blank is a legal value and means "use the OS hostname" — the daemon resolves that at
+ *  handshake time, so the placeholder promises a hostname rather than inventing a name
+ *  here. Before this field existed nothing ever wrote `machineName`, so every host in
+ *  the world answered with the same constant "TurboLLM" and a peer with two links saw
+ *  two identical rows. */
+function MachineNameField() {
+  const [value, setValue] = useState<string | null>(null)
+  const [saved, setSaved] = useState('')
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    void getSettings()
+      .then((s) => { setValue(s.machineName ?? ''); setSaved(s.machineName ?? '') })
+      .catch(() => setValue(''))
+  }, [])
+
+  const dirty = value !== null && value.trim() !== saved
+  const doSave = () => {
+    if (value === null || !dirty) return
+    setSaving(true)
+    track('settings', 'set_machine_name')
+    void saveSettings({ machineName: value.trim() })
+      .then((s) => { setSaved(s.machineName ?? ''); setValue(s.machineName ?? '') })
+      .catch((e) => toast.error(e instanceof ApiError ? e.message : 'Could not save the machine name.'))
+      .finally(() => setSaving(false))
+  }
+
+  return (
+    <div className="flex flex-col gap-1">
+      <label className="text-[12px] text-muted" htmlFor="turbo-link-machine-name">
+        Machine name (what linked peers call this machine)
+      </label>
+      <div className="flex items-center gap-2">
+        <input
+          id="turbo-link-machine-name"
+          type="text"
+          value={value ?? ''}
+          disabled={value === null}
+          onChange={(e) => setValue(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') doSave() }}
+          placeholder="Leave blank to use this computer's hostname"
+          spellCheck={false}
+          autoComplete="off"
+          className="flex-1 rounded-md border border-border bg-bg px-2 py-1.5 text-[13px] text-ink outline-none"
+        />
+        {dirty && (
+          <Button size="sm" variant="outline" onClick={doSave} disabled={saving}>
+            {saving ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
+            Save
+          </Button>
+        )}
+      </div>
+    </div>
+  )
+}
+
 // ── Host panel: mint a link for another machine, and see who is linked in ───────────
 
 function HostPanel({
@@ -148,7 +207,15 @@ function HostPanel({
     track('settings', 'mint_link')
     try {
       const modelList = models.split(',').map((m) => m.trim()).filter(Boolean)
-      const result = await mintLink({ name: name.trim(), capabilities: activeCaps, models: modelList.length ? modelList : undefined })
+      const result = await mintLink({
+        name: name.trim(),
+        capabilities: activeCaps,
+        models: modelList.length ? modelList : undefined,
+        // Reporting-only (the grant is `capabilities`), but it must be SENT or the
+        // server's `preset` telemetry dimension is always absent. A custom selection
+        // has no preset name, so it is omitted rather than mislabelled.
+        preset: customize ? undefined : preset,
+      })
       setMinted(result)
       setName('')
       setModels('')
@@ -160,10 +227,13 @@ function HostPanel({
     }
   }
 
-  const doRevoke = (id: string) => {
+  // An inbound link is an API KEY with a grant, so revoking it deletes the key
+  // (/api/v1/keys/:id). It is NOT a peer-side link record — calling deleteLink here
+  // returned {ok:true}, refetched an unchanged list, and left the peer's token working.
+  const doRevoke = (id: ApiKeyId) => {
     setRevokingId(id)
     track('settings', 'revoke_inbound_link')
-    void deleteLink(id)
+    void revokeInbound(id)
       .then(() => onRevoked())
       .catch((e) => toast.error(e instanceof ApiError ? e.message : 'Could not revoke this link.'))
       .finally(() => setRevokingId(null))
@@ -172,6 +242,8 @@ function HostPanel({
   return (
     <div className="flex flex-col gap-4">
       <div className="text-[13px] font-medium text-ink">This machine</div>
+
+      <MachineNameField />
 
       <div className="flex flex-col gap-2">
         <input
@@ -330,7 +402,7 @@ function PeerPanel({ links, onChanged }: { links: LinkRecord[] | null; onChanged
           type="text"
           value={linkString}
           onChange={(e) => setLinkString(e.target.value)}
-          placeholder="Paste a link string (tllm-link-…)"
+          placeholder="Paste a link string (tllink_…)"
           spellCheck={false}
           autoComplete="off"
           onKeyDown={(e) => { if (e.key === 'Enter') void doAdd() }}
@@ -371,6 +443,18 @@ function LinkRow({ link, onChanged }: { link: LinkRecord; onChanged: () => void 
       .finally(() => setSaving(false))
   }
 
+  // Clearing the latched anti-hijack warning is an explicit act, never a side effect of a
+  // poll: the record already adopted the new machineId, so until a human confirms it, this
+  // link may be pointing at a stranger's daemon.
+  const doAcknowledge = () => {
+    setSaving(true)
+    track('settings', 'ack_link_machine_change')
+    void patchLink(link.id, { acknowledgeMachineChange: true })
+      .then(() => onChanged())
+      .catch((e) => toast.error(e instanceof ApiError ? e.message : 'Could not update this link.'))
+      .finally(() => setSaving(false))
+  }
+
   const doRemove = () => {
     setRemoving(true)
     track('settings', 'remove_link')
@@ -398,6 +482,22 @@ function LinkRow({ link, onChanged }: { link: LinkRecord; onChanged: () => void 
           {removing ? <Loader2 size={14} className="animate-spin" /> : <Trash2 size={14} />}
         </button>
       </div>
+
+      {link.machineIdChanged && (
+        <div
+          className="mt-2 flex flex-wrap items-center gap-2 rounded-md border p-2"
+          style={{ borderColor: 'color-mix(in srgb, var(--warn) 40%, var(--border))', background: 'color-mix(in srgb, var(--warn) 8%, transparent)' }}
+        >
+          <span className="inline-flex items-center gap-1.5 text-[12px]" style={{ color: 'var(--warn)' }}>
+            <AlertTriangle size={13} />
+            This URL now answers as a different machine than the one you linked.
+          </span>
+          <Button size="sm" variant="outline" onClick={doAcknowledge} disabled={saving}>
+            {saving ? <Loader2 size={13} className="animate-spin" /> : <Check size={13} />}
+            This is the right machine
+          </Button>
+        </div>
+      )}
 
       {link.grantedCapabilities.length > 0 && (
         <div className="mt-2 flex flex-wrap gap-1">

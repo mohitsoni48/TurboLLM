@@ -59,6 +59,15 @@ export type { LinkCapability } from './link-constants'
  *  into one "offline" — each carries its own actionable `lastError` on the record. */
 export type LinkStatus = 'unknown' | 'online' | 'unreachable' | 'revoked' | 'incompatible'
 
+/** Two ids, two namespaces, and until these brands existed both were `string`, so
+ *  TypeScript happily let the host panel's "Revoke" button pass an `InboundLink.id`
+ *  (an API-KEY id) to `deleteLink`, which deletes a peer-side LINK RECORD. The request
+ *  succeeded, the UI reported success, and the key it was supposed to revoke kept
+ *  working forever. The brands are erased at runtime — they exist purely so that
+ *  mistake is a compile error rather than a silent no-op. */
+export type ApiKeyId = string & { readonly __brand: 'ApiKeyId' }
+export type LinkRecordId = string & { readonly __brand: 'LinkRecordId' }
+
 /** This machine's record of a host it has linked to (GET /api/v1/links,
  *  POST /api/v1/links, PATCH /api/v1/links/:id). `grantedCapabilities` is what the
  *  host reported at handshake — render capability chips from this, never from a guess.
@@ -69,12 +78,15 @@ export type LinkStatus = 'unknown' | 'online' | 'unreachable' | 'revoked' | 'inc
  *  link to the browser, so this type mirrors what's actually on the wire, not the
  *  server's full internal record. */
 export interface LinkRecord {
-  id: string
+  id: LinkRecordId
   name: string
   /** Editable — a Kaggle host hands back a new tunnel URL every session, so relinking
    *  is PATCH baseUrl, not delete-and-recreate. */
   baseUrl: string
   machineId: string | null
+  /** Latched anti-hijack flag: this URL answered as a DIFFERENT machine than the one
+   *  linked. Stays true until the user acknowledges it — never cleared by a poll. */
+  machineIdChanged: boolean
   grantedCapabilities: LinkCapability[]
   linkApiVersion: number | null
   status: LinkStatus
@@ -87,7 +99,9 @@ export interface LinkRecord {
 /** One machine that has linked TO this one (GET /api/v1/links/inbound), derived from
  *  a granted API key. */
 export interface InboundLink {
-  id: string
+  /** The API KEY's id — revoking one is `revokeInbound`, i.e. DELETE /api/v1/keys/:id.
+   *  NOT a `LinkRecordId`; see the brand types above for why that distinction is typed. */
+  id: ApiKeyId
   name: string
   capabilities: LinkCapability[]
   models: string[] | null
@@ -95,17 +109,24 @@ export interface InboundLink {
   lastUsedAt: string | null
 }
 
-/** Result of minting a scoped token for another machine. `token`/`linkString` are
- *  revealed exactly once — only the hash is stored server-side, so they can never be
- *  re-shown after this response. */
+/** Result of minting a scoped token for another machine. `linkString` is revealed exactly
+ *  once — only the hash is stored server-side, so it can never be re-shown after this
+ *  response. There is deliberately no separate `token` field: it carried a second copy of
+ *  the same one-time secret and nothing read it. */
 export interface MintedLink {
-  keyId: string
-  token: string
+  keyId: ApiKeyId
   linkString: string
 }
 
-/** Host side: mint a scoped token for another machine. */
-export function mintLink(input: { name: string; capabilities: LinkCapability[]; models?: string[] }): Promise<MintedLink> {
+/** Host side: mint a scoped token for another machine. `preset` is reporting-only — the
+ *  grant is whatever `capabilities` says — but it must be sent, or the telemetry dimension
+ *  the server validates and emits can never be populated. */
+export function mintLink(input: {
+  name: string
+  capabilities: LinkCapability[]
+  models?: string[]
+  preset?: string
+}): Promise<MintedLink> {
   return request<MintedLink>('/api/v1/links/mint', { method: 'POST', json: input })
 }
 
@@ -124,12 +145,28 @@ export function addLink(linkString: string): Promise<LinkRecord> {
   return request<{ link: LinkRecord }>('/api/v1/links', { method: 'POST', json: { linkString } }).then((r) => r.link)
 }
 
-/** Peer side: edit a link's base URL and/or name — the Kaggle relink path — and re-probe. */
-export function patchLink(id: string, patch: { baseUrl?: string; name?: string }): Promise<LinkRecord> {
+/** Peer side: edit a link's base URL and/or name — the Kaggle relink path — and re-probe.
+ *  `acknowledgeMachineChange` is the only thing that clears the latched machineId warning. */
+export function patchLink(
+  id: LinkRecordId,
+  patch: { baseUrl?: string; name?: string; acknowledgeMachineChange?: boolean },
+): Promise<LinkRecord> {
   return request<{ link: LinkRecord }>(`/api/v1/links/${encodeURIComponent(id)}`, { method: 'PATCH', json: patch }).then((r) => r.link)
 }
 
-/** Peer side: remove a link. */
-export function deleteLink(id: string): Promise<{ ok: true }> {
+/** Peer side: remove a link RECORD — this machine forgetting a host it linked to.
+ *  It does NOT revoke anything on the host; use {@link revokeInbound} for that. */
+export function deleteLink(id: LinkRecordId): Promise<{ ok: true }> {
   return request<{ ok: true }>(`/api/v1/links/${encodeURIComponent(id)}`, { method: 'DELETE' })
+}
+
+/** Host side: revoke a machine's access to THIS one, by deleting the granted API key.
+ *
+ *  This is `/api/v1/keys/:id`, not `/api/v1/links/:id`: an inbound link IS an API key
+ *  with a grant (link-admin-routes.ts's `inbound` derives it from `cfg.apiKeys`), while
+ *  `/api/v1/links` filters `cfg.links`, the records for hosts this machine links OUT to.
+ *  Sending an ApiKey id to the links route returned `{ok:true}` while touching nothing —
+ *  the shipped bug this function exists to make untypeable. */
+export function revokeInbound(id: ApiKeyId): Promise<{ ok: true }> {
+  return request<{ ok: true }>(`/api/v1/keys/${encodeURIComponent(id)}`, { method: 'DELETE' })
 }

@@ -622,6 +622,9 @@ export type DaemonSettings = {
   /** Listen port (spec 08 §2). Takes effect on the next daemon restart. */
   port: number
   theme: string
+  /** Human-readable name this machine reports to a Turbo Link peer (ADR-376). Empty
+   *  means "use the OS hostname" — the daemon resolves the fallback, never the browser. */
+  machineName: string
   autoGenerateTitles: boolean
   /** Release 3: background extraction of durable facts from the user's own chat messages,
    *  injected into future new conversations. Off by default (opt-in trust surface). */
