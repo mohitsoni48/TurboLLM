@@ -646,7 +646,7 @@ export function ModelDetailDialog({
 
             {isLlamaCpp && (
             <Section>
-              <Row label="Parallel slots">
+              <Row label="Parallel requests">
                 <NumberInput value={draft.parallel} min={1} max={16} onChange={(v) => set('parallel', v)} />
               </Row>
               <Row label="K cache type" hint="turbo* are TurboQuant-fork exclusive.">
@@ -1034,7 +1034,7 @@ function AutoTuneResultDialog({
                   <ConfigRow label="Context length" value={`${result.params.ctx.toLocaleString()} tok`} />
                   <ConfigRow label="KV cache type" value={result.params.kvTypeK} />
                   <ConfigRow label="Flash attention" value={result.params.flashAttn} />
-                  {result.params.parallel > 1 && <ConfigRow label="Parallel slots" value={result.params.parallel} />}
+                  {result.params.parallel > 1 && <ConfigRow label="Parallel requests" value={result.params.parallel} />}
 
                   <ConfigSection title="Sampling" />
                   {s ? (
