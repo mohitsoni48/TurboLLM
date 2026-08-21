@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Hono } from 'hono'
-import { registerGateway } from './gateway'
+import { gatewayV1Handler, registerGateway } from './gateway'
 import type { Deps } from '../deps'
 
 const REMOTE = { linkId: 'lnk1', baseUrl: 'https://rig.trycloudflare.com', token: 'tllm-hostsecret', modelKey: 'Qwen3' }
@@ -109,7 +109,11 @@ test('/v1/messages on a remote route reaches the façade with the link token', a
 })
 
 // ── Invariant 6, at the gateway: the host must not keep generating into a dead socket.
-test('aborting the inbound request aborts the upstream request to the host', async () => {
+//
+// Run against BOTH proxy sites. They are separate code paths with separate fetch calls
+// (`callUpstream()` in the /v1/messages handler, `proxyStream(...)` in gatewayV1Handler), and
+// covering only one is precisely how the other ships broken.
+async function assertAbortPropagates(path: string, body: Record<string, unknown>): Promise<void> {
   const app = new Hono()
   registerGateway(app, fakeDeps())
   let upstreamAborted = false
@@ -121,10 +125,10 @@ test('aborting the inbound request aborts the upstream request to the host', asy
   }))
   const ac = new AbortController()
   try {
-    const p = Promise.resolve(app.request(new Request('http://local.test/v1/chat/completions', {
+    const p = Promise.resolve(app.request(new Request(`http://local.test${path}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'Rig/Qwen3', messages: [{ role: 'user', content: 'hi' }] }),
+      body: JSON.stringify(body),
       signal: ac.signal,
     }))).catch(() => undefined)
     await seen
@@ -137,4 +141,68 @@ test('aborting the inbound request aborts the upstream request to the host', asy
   // ac.signal, so without this the assertion below could pass while the link path leaked.
   assert.equal(f.calls[0].url, 'https://rig.trycloudflare.com/api/link/v1/chat/completions')
   assert.equal(upstreamAborted, true)
+}
+
+test('aborting the inbound request aborts the upstream request to the host (/v1/chat/completions)', async () => {
+  await assertAbortPropagates('/v1/chat/completions', { model: 'Rig/Qwen3', messages: [{ role: 'user', content: 'hi' }] })
+})
+
+test('aborting the inbound request aborts the upstream request to the host (/v1/messages)', async () => {
+  await assertAbortPropagates('/v1/messages', { model: 'Rig/Qwen3', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] })
+})
+
+// ── ADR-376: "Rejected — links that chain." ────────────────────────────────────────────────
+// A peer sees a host's LOCAL models only. The host runs this same handler behind its façade,
+// so without an explicit guard it would relay a third machine's id onward on its own token.
+
+/** The host's façade mount, as link-routes.ts spells it (minus the capability middleware,
+ *  which is not what is under test here). */
+function facadeApp(deps: Deps): Hono {
+  const app = new Hono()
+  app.post('/api/link/v1/chat/completions', (c) =>
+    gatewayV1Handler(c, deps, { pathname: '/v1/chat/completions', origin: 'link' }))
+  return app
+}
+
+test('a third machine\'s id through the façade is a typed error, and never relays onward', async () => {
+  const f = captureFetch(async () => jsonCompletion())
+  let res: Response
+  try {
+    res = await facadeApp(fakeDeps()).request('http://host.test/api/link/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'ThirdBox/Qwen3', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+  } finally {
+    f.restore()
+  }
+  assert.equal(res.status, 400)
+  const body = await res.json() as { error: { code: string; message: string } }
+  assert.equal(body.error.code, 'link_chaining_unsupported')
+  assert.match(body.error.message, /only its own local models/)
+  // The whole point of a TYPED error over `remote = undefined`: clearing it would leave the id
+  // merely unresolved and drop it into local resolution, answering the peer with the HOST's
+  // own model — wrong weights, no error. Zero outbound calls proves neither happened: nothing
+  // was relayed to the third machine AND nothing reached a local engine.
+  assert.equal(f.calls.length, 0)
+})
+
+test('the same id on the PUBLIC mount still resolves remotely — the guard is façade-only', async () => {
+  const app = new Hono()
+  registerGateway(app, fakeDeps())
+  const f = captureFetch(async () => jsonCompletion())
+  let res: Response
+  try {
+    res = await app.request('http://local.test/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'ThirdBox/Qwen3', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+  } finally {
+    f.restore()
+  }
+  assert.equal(res.status, 200)
+  assert.equal(f.calls.length, 1)
+  assert.equal(f.calls[0].url, 'https://rig.trycloudflare.com/api/link/v1/chat/completions')
+  assert.equal(f.calls[0].headers.get('X-TurboLLM-Auth'), 'tllm-hostsecret')
 })

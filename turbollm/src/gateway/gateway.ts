@@ -685,6 +685,33 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   /** Turbo Link (ADR-376) — see the identical binding in the /v1/messages handler above. */
   const remote = routeResult.remote
 
+  // ── Links do not chain (ADR-376, "Rejected — links that chain") ───────────────────────
+  // This function is mounted TWICE: publicly at /v1/*, and behind the host's own façade
+  // (link-routes.ts, `origin: 'link'`). Without this guard, a peer sending
+  // `model: "ThirdBox/Qwen3"` to a host that itself has a link named ThirdBox would be
+  // relayed onward by the host — using the HOST's link token, on the host's authority.
+  // Capability sets would compose transitively in ways nobody can audit; a peer sees a
+  // host's LOCAL models only.
+  //
+  // Deliberately a typed error rather than `remote = undefined`. Clearing it would make the
+  // qualified id merely unresolved, which falls through to local resolution — and that is
+  // exactly the invariant-5 hazard the router's guard exists to prevent: the peer would be
+  // silently answered by the HOST's local model, wrong weights and no error at all.
+  if (remote && opts.origin === 'link') {
+    return c.json(
+      {
+        error: {
+          message:
+            `'${requestedModel}' names a machine linked to this one. A linked machine serves ` +
+            `only its own local models — link it directly instead.`,
+          type: 'invalid_request_error',
+          code: 'link_chaining_unsupported',
+        },
+      },
+      400,
+    )
+  }
+
   // Local: the caller's whole header set, minus `host`. Remote: an ALLOWLIST (invariant 7).
   // The peer's clients authenticate to THIS machine; their credential is meaningless on the
   // host and forwarding it would hand another box a secret it was never issued. The link
