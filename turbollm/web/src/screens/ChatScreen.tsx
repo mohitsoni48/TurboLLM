@@ -29,8 +29,8 @@ import { ContextMeter } from './chat/ContextMeter'
 import { ConversationSidebar } from './chat/ConversationSidebar'
 import { readSavedSidebarWidth, SIDEBAR_MIN_W, sidebarMaxW, SidebarResizeHandle } from './chat/SidebarResizeHandle'
 import { ModelLoadMenu } from '../components/ModelLoadMenu'
-import { useLinks, useRemoteModels } from '../lib/link-queries'
-import { findRemoteChoice, selectModel } from '../lib/remote-models'
+import { useLinks, useLinkStatus, useRemoteModels } from '../lib/link-queries'
+import { describeRemoteHost, findRemoteChoice, selectModel } from '../lib/remote-models'
 import { ModelDetailDialog } from './models/ModelDetailDialog'
 import { ConversationSettingsDialog, type ConversationSettingsDraft } from './chat/ConversationSettingsDialog'
 import { useUiStore } from '../stores/ui'
@@ -293,6 +293,14 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // silently stops being a selection — the same rule the catalog enforces server-side:
   // a listed-but-unusable model is worse than an absent one.
   const activeRemoteId = remoteChoice?.id ?? null
+  // Stats parity (spec §5.4, final-review I-5): the HOST's own engine state, read over the
+  // link and rendered from the host's own `/api/v1/status` shape. Only polled while a chat
+  // is actually pointed at that machine. A soft read — a host that dropped is reported by
+  // the send itself, loudly and by name, not by an error banner on the header.
+  const remoteStatusQ = useLinkStatus(remoteChoice?.linkId ?? null)
+  const remoteHostState = activeRemoteId
+    ? (remoteStatusQ.data ? describeRemoteHost(remoteStatusQ.data) : remoteStatusQ.isError ? 'not answering' : null)
+    : null
   // Gates ReasoningEffortSelect vs ThinkingBudgetSlider below — `status.model` (LoadedModel)
   // is a slim subset without capability flags, so look the full ModelEntry up by key.
   const loadedModelSupportsReasoningEffort = (modelsQ.data?.models ?? []).find((m) => m.key === model?.key)?.reasoningEffort ?? false
@@ -959,7 +967,15 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
               Loading model…{model?.loadElapsedMs != null && ` (${Math.round(model.loadElapsedMs / 1000)}s)`}
             </span>
           )}
-          {engineState === 'stopping' && <span className="text-[12px] text-muted">Ejecting…</span>}
+          {engineState === 'stopping' && !activeRemoteId && <span className="text-[12px] text-muted">Ejecting…</span>}
+          {remoteChoice && remoteHostState && (
+            <span
+              className="hidden text-[12px] text-muted sm:inline"
+              title={`Live state of ${remoteChoice.machine}, read over the link`}
+            >
+              {remoteChoice.machine}: {remoteHostState}
+            </span>
+          )}
           {ready && (
             <div className="ml-auto hidden sm:flex">
               <ContextMeter ctxUsed={ctxUsed} ctxMax={ctxMax} />

@@ -192,13 +192,15 @@ export function findRemoteChoice(
   id: string,
   links: LinkRecord[],
   remote: RemoteModelRow[],
-): { id: string; name: string; machine: string } | undefined {
+): { id: string; linkId: string; name: string; machine: string } | undefined {
   for (const link of links) {
     if (link.status !== 'online') continue
     for (const row of remote) {
       if (row.linkId !== link.id) continue
       if (formatRemoteId(link.name, row.model.key) !== id) continue
-      return { id, name: row.model.name, machine: link.name }
+      // `linkId`, not just the name: it is what addresses the host's live-status route,
+      // and it survives a rename where the name does not.
+      return { id, linkId: link.id, name: row.model.name, machine: link.name }
     }
   }
   return undefined
@@ -207,7 +209,7 @@ export function findRemoteChoice(
 /** What picking `id` in the model menu MEANS. */
 export type ModelSelection =
   /** Another machine already has this model up. Route to it — no engine action at all. */
-  | { kind: 'remote'; id: string; name: string; machine: string }
+  | { kind: 'remote'; id: string; linkId: string; name: string; machine: string }
   /** This machine's own library. Load it, and stop routing to any machine. */
   | { kind: 'local'; key: string }
 
@@ -227,4 +229,22 @@ export function selectModel(
 ): ModelSelection {
   const hit = findRemoteChoice(id, links, remote)
   return hit ? { kind: 'remote', ...hit } : { kind: 'local', key: id }
+}
+
+/** One line of a linked host's live state, for the chat header (spec §5.4, final-review
+ *  I-5). Reads the host's OWN status shape — `LinkClient.status()` re-exports
+ *  `buildModelStatus` untranslated — so a field added there needs no second model here.
+ *
+ *  Deliberately says what the machine is DOING, not merely whether it is up: "generating"
+ *  is the state that explains a slow first token, and it is exactly what the peer had no
+ *  way to see while `LinkClient.status()` sat unwired. */
+export function describeRemoteHost(status: {
+  engine?: { state?: string }
+  model?: { name?: string } | null
+  liveGeneration?: unknown
+}): string {
+  const state = status.engine?.state ?? 'unknown'
+  if (state !== 'running') return state === 'stopped' ? 'idle' : state
+  if (status.liveGeneration) return `generating · ${status.model?.name ?? 'model'}`
+  return `ready · ${status.model?.name ?? 'model'}`
 }

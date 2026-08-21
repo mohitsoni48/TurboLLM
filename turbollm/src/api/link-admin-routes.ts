@@ -55,6 +55,40 @@ export function registerLinkAdminRoutes(
   app.post('/api/v1/links/mint', async (c) => {
     const denied = gate(c, MINT)
     if (denied) return denied
+    // ── A capability grant is only a boundary if there IS a boundary (final-review I-2) ──
+    // On the documented open-LAN posture (lanBind on, requireApiKey off), `bypassesAuth`
+    // (auth.ts) waves LAN traffic through before any credential is examined. A peer on that
+    // LAN can POST straight to this machine's PUBLIC /v1/chat/completions and reach the full
+    // auto-swap path — loading and evicting models — without presenting the link token at
+    // all, so `verifyKeyValue`'s grant refusal never runs and "Inference only" is a label
+    // rather than a limit.
+    //
+    // Refused rather than warned: a token that silently means nothing is worse than one that
+    // was never minted, and the remedy is one switch away.
+    //
+    // Checked AFTER `hostGate`, which stays the first word on credential management: an
+    // unauthenticated open-LAN caller must keep getting its 403 rather than a message
+    // explaining the machine's posture to a stranger. This gate is for the person who DID
+    // clear that bar — the owner, at the keyboard — and it is the one that actually decides
+    // the mint, since hostGate lets a local caller straight through in this posture.
+    //
+    // With `lanBind` off there is no open LAN to close (a tunneled request always enforces
+    // regardless of requireApiKey, see bypassesAuth), so this never fires there.
+    const daemon = d.store.snapshot().daemon
+    if (daemon.lanBind && daemon.requireApiKey !== true) {
+      return c.json(
+        {
+          error: {
+            code: 'open_lan',
+            message:
+              'Turn on Settings → Network → "Require an API key" before minting a Turbo Link ' +
+              'token. This machine is currently open on the local network, so any device on ' +
+              'it can already use these models directly and the link limits would not be enforced.',
+          },
+        },
+        409,
+      )
+    }
     const body = await c.req.json().catch(() => null) as
       { name?: string; capabilities?: string[]; models?: unknown; preset?: string } | null
     const name = body?.name?.trim()
@@ -293,6 +327,45 @@ export function registerLinkAdminRoutes(
     await probe(id)
     const stored = current(id)
     return c.json({ link: stored ? redactLink(stored) : null })
+  })
+
+  /** Peer side: one linked host's LIVE engine/model stats (spec §5.4).
+   *
+   *  The last unwired half of the stats-parity claim (final-review I-5): `LinkClient.status()`
+   *  and the host's `GET /api/link/v1/status` both existed and nothing called them, so
+   *  nothing in the peer UI ever read a host's state. Mounted here rather than polled on the
+   *  daemon's heartbeat deliberately — this is a live number with exactly one consumer (a
+   *  chat pointed at that machine), so it is fetched while that view is open and not at all
+   *  otherwise. Nothing in the local request path depends on it.
+   *
+   *  The payload is the host's own `buildModelStatus` output, handed back untranslated: any
+   *  reshaping here would be exactly the divergence §5.4 forbids. It carries no host
+   *  filesystem detail — `launchCommand` and `engine.error`'s log tail are structurally
+   *  absent from that builder (status-view.ts).
+   *
+   *  A host that cannot be reached, or a token without `models:use`, is a typed 503 — never
+   *  an empty-but-successful body, which would render as "the machine is idle". */
+  app.get('/api/v1/links/:id/status', async (c) => {
+    const denied = gate(c, VIEW)
+    if (denied) return denied
+    const rec = current(c.req.param('id'))
+    if (!rec) return c.json({ error: { code: 'not_found', message: 'No such link.' } }, 404)
+    const probe = await new LinkClient(rec, { fetchImpl }).status()
+    if (probe.kind !== 'status') {
+      const forbidden = probe.kind === 'http' && probe.status === 403
+      return c.json(
+        {
+          error: {
+            code: forbidden ? 'forbidden' : 'unavailable',
+            message: forbidden
+              ? `${rec.name} did not grant this machine permission to watch its models.`
+              : `${rec.name} did not answer.`,
+          },
+        },
+        503,
+      )
+    }
+    return c.json({ status: probe.status })
   })
 
   app.delete('/api/v1/links/:id', (c) => {

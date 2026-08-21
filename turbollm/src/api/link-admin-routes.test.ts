@@ -635,3 +635,106 @@ test('PATCH refuses a name another link already answers to', async () => {
   assert.equal(res.status, 400)
   assert.notEqual(links[1].name.toLowerCase(), links[0].name.toLowerCase())
 })
+
+// ── The peer can finally READ a host's live state (final-review I-5) ───────────────────
+// `LinkClient.status()` and the host's GET /api/link/v1/status both existed and nothing
+// called either, so the phase's "live t/s and context-meter parity" claim rested on code
+// with no consumer. This is that consumer.
+
+const HOST_STATUS = {
+  engine: { id: 'e1', name: 'llama.cpp', kind: 'llama.cpp', state: 'running', port: 8081, pid: 4242 },
+  model: { key: 'qwen3-35b', name: 'Qwen3 35B', quant: 'Q4_K_M', ctx: 262144, vision: false },
+  engineStats: { tps: 42 },
+  liveGeneration: { phase: 'gen', pct: 0, outputTokens: 7 },
+}
+
+test("GET /api/v1/links/:id/status returns the host's own status shape, untranslated", async () => {
+  const responder = async (url: string) => new Response(
+    JSON.stringify(String(url).endsWith('/hello')
+      ? { machineId: 'm1', machineName: 'rig', appVersion: '1', linkApiVersions: [1], capabilities: ['models:use'] }
+      : HOST_STATUS),
+    { status: 200, headers: { 'content-type': 'application/json' } },
+  )
+  const { app, cfg } = mkApp(responder as unknown as typeof fetch)
+  await app.request('/api/v1/links', json({ linkString: encodeLinkString('http://h:6996', 'tllm-a') }))
+  const id = (cfg.links as { id: string }[])[0].id
+  const res = await app.request(`/api/v1/links/${id}/status`)
+  assert.equal(res.status, 200)
+  const body = await res.json() as { status: typeof HOST_STATUS }
+  assert.deepEqual(body.status, HOST_STATUS)
+  // No host filesystem detail crosses: the shared builder has no launchCommand and no
+  // engine.error log tail, so neither can appear here.
+  const text = JSON.stringify(body)
+  assert.ok(!text.includes('launchCommand'))
+  assert.ok(!text.includes('logTail'))
+})
+
+test('a host that does not answer is a typed 503 naming it, never an empty success', async () => {
+  // An empty-but-200 body renders as "the machine is idle", which sends the user
+  // debugging the wrong box.
+  const { app, cfg } = mkApp(async () => { throw new TypeError('fetch failed') })
+  await app.request('/api/v1/links', json({ linkString: encodeLinkString('http://dead:6996', 'tllm-a') }))
+  const id = (cfg.links as { id: string }[])[0].id
+  const res = await app.request(`/api/v1/links/${id}/status`)
+  assert.equal(res.status, 503)
+  const body = await res.json() as { error: { code: string; message: string } }
+  assert.equal(body.error.code, 'unavailable')
+  assert.match(body.error.message, /did not answer/)
+})
+
+test("a token without models:use is reported as a permission problem, not a dead host", async () => {
+  const responder = async (url: string) => (String(url).endsWith('/hello')
+    ? new Response(
+        JSON.stringify({ machineId: 'm1', machineName: 'rig', appVersion: '1', linkApiVersions: [1], capabilities: [] }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      )
+    : new Response('{}', { status: 403, headers: { 'content-type': 'application/json' } }))
+  const { app, cfg } = mkApp(responder as unknown as typeof fetch)
+  await app.request('/api/v1/links', json({ linkString: encodeLinkString('http://h:6996', 'tllm-a') }))
+  const id = (cfg.links as { id: string }[])[0].id
+  const res = await app.request(`/api/v1/links/${id}/status`)
+  assert.equal(res.status, 503)
+  assert.equal((await res.json() as { error: { code: string } }).error.code, 'forbidden')
+})
+
+test('an unknown link id is a 404, not a probe of nothing', async () => {
+  const { app } = mkApp()
+  assert.equal((await app.request('/api/v1/links/nope/status')).status, 404)
+})
+
+// ── A grant is only a boundary if there IS a boundary (final-review I-2) ───────────────
+// On lanBind + requireApiKey off, `bypassesAuth` waves LAN traffic through before any
+// credential is examined, so a peer reaches this machine's PUBLIC /v1/chat/completions —
+// full auto-swap path, loading and evicting models — without presenting the link token at
+// all. The grant refusal never runs, and "Inference only" is a label rather than a limit.
+
+/** Hono env shaped like @hono/node-server's, so `getConnInfo` sees a loopback caller —
+ *  i.e. the OWNER at the keyboard, who clears `hostGate` even on an open LAN. That is the
+ *  only caller for whom the open-LAN mint gate is the deciding check. */
+const LOOPBACK_ENV = { incoming: { socket: { remoteAddress: '127.0.0.1' } } } as never
+
+test('minting is refused while this machine is open on the LAN', async () => {
+  const { app, cfg } = mkApp(undefined, undefined, { lanBind: true, requireApiKey: false })
+  const res = await app.request('/api/v1/links/mint', json({ name: 'laptop', capabilities: ['models:use'] }), LOOPBACK_ENV)
+  assert.equal(res.status, 409)
+  const body = await res.json() as { error: { code: string; message: string } }
+  assert.equal(body.error.code, 'open_lan')
+  // Actionable, and it names the switch — the settings UI surfaces this sentence verbatim.
+  assert.match(body.error.message, /Require an API key/)
+  // A token that silently means nothing is worse than one that was never minted.
+  assert.equal((cfg.apiKeys as unknown[]).length, 0)
+})
+
+test('minting works again once a key is required', async () => {
+  const { app, cfg } = mkApp(undefined, undefined, { lanBind: true, requireApiKey: true })
+  assert.equal((await app.request('/api/v1/links/mint', json({ name: 'laptop', capabilities: ['models:use'] }), LOOPBACK_ENV)).status, 200)
+  assert.equal((cfg.apiKeys as unknown[]).length, 1)
+})
+
+test('a loopback-only daemon can still mint — there is no open LAN to close', async () => {
+  // With lanBind off nothing reaches this box from another machine except through a
+  // tunnel, and a tunneled request always enforces (bypassesAuth ignores requireApiKey
+  // for it). The gate would be pure friction here.
+  const { app } = mkApp(undefined, undefined, { lanBind: false, requireApiKey: false })
+  assert.equal((await app.request('/api/v1/links/mint', json({ name: 'laptop', capabilities: ['models:use'] }))).status, 200)
+})

@@ -172,12 +172,3 @@ export function redactDownload(rec: {
   }
 }
 
-/** The peer-side view model for one link, shared by the backend and the web helpers so
- *  both agree on one shape. A strict subset of `LinkRecord` — never carries `token`. */
-export interface LinkSummary {
-  id: string
-  name: string
-  status: LinkStatus
-  grantedCapabilities: LinkCapability[]
-  lastError: string | null
-}

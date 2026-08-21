@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { findRemoteChoice, groupModelChoices, selectModel, type RemoteModelRow } from './remote-models'
+import { describeRemoteHost, findRemoteChoice, groupModelChoices, selectModel, type RemoteModelRow } from './remote-models'
 import type { LinkRecord } from './link-api'
 import type { ModelEntry } from './types'
 
@@ -210,7 +210,7 @@ describe('findRemoteChoice', () => {
 
   it('resolves the qualified id the dropdown emits', () => {
     const hit = findRemoteChoice('workstation/qwen3-35b', [onlineLink], rows)
-    expect(hit).toEqual({ id: 'workstation/qwen3-35b', name: 'Qwen3 35B', machine: 'workstation' })
+    expect(hit).toEqual({ id: 'workstation/qwen3-35b', linkId: 'l1', name: 'Qwen3 35B', machine: 'workstation' })
   })
 
   it('leaves a LOCAL key that happens to contain a slash alone', () => {
@@ -240,7 +240,7 @@ describe('selectModel: what a pick in the chat menu actually does', () => {
     // The shipped bug: this id went to POST /api/v1/engine/start, which aborts every
     // in-flight generation in every conversation before it even looks the key up.
     expect(selectModel('workstation/qwen3-35b', [onlineLink], rows)).toEqual({
-      kind: 'remote', id: 'workstation/qwen3-35b', name: 'Qwen3 35B', machine: 'workstation',
+      kind: 'remote', id: 'workstation/qwen3-35b', linkId: 'l1', name: 'Qwen3 35B', machine: 'workstation',
     })
   })
 
@@ -255,5 +255,20 @@ describe('selectModel: what a pick in the chat menu actually does', () => {
   it('a model on a machine that dropped is not routable — it falls back to a local load', () => {
     const offline = { ...onlineLink, status: 'unreachable' } as unknown as LinkRecord
     expect(selectModel('workstation/qwen3-35b', [offline], rows).kind).toBe('local')
+  })
+})
+
+describe('describeRemoteHost: the peer finally reads a host\'s live state (I-5)', () => {
+  it('says what the machine is DOING, not just that it is up', () => {
+    expect(describeRemoteHost({ engine: { state: 'running' }, model: { name: 'Qwen3 35B' }, liveGeneration: { phase: 'gen' } }))
+      .toBe('generating · Qwen3 35B')
+    expect(describeRemoteHost({ engine: { state: 'running' }, model: { name: 'Qwen3 35B' }, liveGeneration: null }))
+      .toBe('ready · Qwen3 35B')
+  })
+
+  it('a stopped host reads as idle, and any other state is reported as itself', () => {
+    expect(describeRemoteHost({ engine: { state: 'stopped' }, model: null })).toBe('idle')
+    expect(describeRemoteHost({ engine: { state: 'error' }, model: null })).toBe('error')
+    expect(describeRemoteHost({})).toBe('unknown')
   })
 })

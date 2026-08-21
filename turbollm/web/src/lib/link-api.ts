@@ -152,6 +152,26 @@ export function listRemoteModels(): Promise<RemoteModelRow[]> {
   return request<{ models: RemoteModelRow[] }>('/api/v1/links/models').then((r) => r.models)
 }
 
+/** One linked host's LIVE engine/model state (GET /api/v1/links/:id/status).
+ *
+ *  The host's OWN `/api/v1/status` model-stat subset, handed back untranslated (spec §5.4)
+ *  — the peer renders it with the components it already uses for its own engine card.
+ *  Structurally carries no host filesystem detail: `launchCommand` and the engine error's
+ *  log tail are absent from the shared builder, not stripped from it. */
+export interface RemoteStatus {
+  engine: { id: string; name: string; kind: string; state: string; port: number | null; pid: number | null; parallelSlots?: number }
+  model: { key: string; name: string; quant: string | null; ctx: number | null; vision: boolean } | null
+  engineStats: unknown
+  liveGeneration: unknown
+}
+
+/** Peer side: what a linked machine is doing right now. A host that cannot be reached, or
+ *  a token without `models:use`, is a typed 503 (ApiError) — never an empty success, which
+ *  would render as "the machine is idle". */
+export function getLinkStatus(id: LinkRecordId): Promise<RemoteStatus> {
+  return request<{ status: RemoteStatus }>(`/api/v1/links/${encodeURIComponent(id)}/status`).then((r) => r.status)
+}
+
 /** Peer side: add a link from a pasted link string. A junk string is a 400 (ApiError). */
 export function addLink(linkString: string): Promise<LinkRecord> {
   return request<{ link: LinkRecord }>('/api/v1/links', { method: 'POST', json: { linkString } }).then((r) => r.link)
