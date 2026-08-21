@@ -19,6 +19,7 @@ import type { TunnelManager } from './tunnel/manager'
 import type { AgentTaskState } from './agents/task-state'
 import type { Emitter } from './telemetry/emit'
 import type { CodeRunManager } from './code/code-run-manager'
+import type { LinkManager } from './link/link-manager'
 
 export interface Deps {
   store: ConfigStore
@@ -83,4 +84,7 @@ export interface Deps {
    *  same overlap guard a normal scheduled tick uses. Optional: only wired in the real serve()
    *  entrypoint. */
   routineScheduler?: import('./routines/scheduler').RoutineScheduler
+  /** Turbo Link peer-side poll loop (ADR-376). Optional — absent under tests; only
+   *  wired in the real serve() entrypoint, same convention as tunnel/gate/comfy. */
+  links?: LinkManager
 }

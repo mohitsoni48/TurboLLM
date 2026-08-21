@@ -42,6 +42,7 @@ import { registerTerminalWs } from './terminal/terminal-routes'
 import { reapStaleTerminals, killTrackedTerminalsSync } from './terminal/terminal-manager'
 import { provisionTunnelApiKey } from './auth'
 import { TunnelManager, reapStaleTunnels, killTrackedTunnelsSync } from './tunnel/manager'
+import { LinkManager } from './link/link-manager'
 import type { Deps } from './deps'
 import { TELEMETRY_ENV } from './telemetry/disabled'
 import { Emitter } from './telemetry/emit'
@@ -548,6 +549,15 @@ const routineScheduler = new RoutineScheduler({
 })
 deps.routineScheduler = routineScheduler
 routineScheduler.start()
+
+// Turbo Link (ADR-376): peer-side poll loop over every linked host. Construction and
+// start() only need `deps.store`, not the bound socket, so — same convention as
+// codeRuns/routineScheduler just above — this runs before createApp(deps) rather than
+// after listen(); nothing here binds a port or touches the network beyond the outbound
+// hello probes that start() immediately kicks off (LinkClient is timeout-bounded and
+// never throws, so a bad/unreachable link cannot block startup).
+deps.links = new LinkManager(deps)
+deps.links.start()
 
 // Safety-net watchdog for the interactive (ask/plan) claude_cli routine path
 // (cli-interactive-runner.ts) — catches a parked run whose live terminal died without ever
