@@ -41,6 +41,8 @@ function mkDeps(keys: ApiKey[], opts: { busy?: boolean; loaded?: string | null }
     registry: { active: () => ({ kind: 'llama.cpp' }) },
     modelRouter: {
       route: async (m: string) => { h.routed.push(m); return { target: 'http://engine.local' } },
+      // This box has no links of its own, so nothing a peer asks for can be a second hop.
+      resolveRemoteTarget: () => undefined,
     },
     manager: {
       status: () => ({ state: 'running', model: loaded ? { key: loaded } : null }),
@@ -154,4 +156,50 @@ test("a peer's own request does NOT count as the owner's local activity", async 
   assert.equal((await post(d, 'tllm-a', LOADED)).status, 200)
   const res = await post(d, 'tllm-a', COLD)
   assert.equal(res.status, 200, 'still wakeable after a peer request')
+})
+
+// ── Chaining is refused with the RIGHT reason, before any gate that could mislead ────────
+// Final-review M-3: the authoritative refusal lives in gatewayV1Handler, but it ran AFTER
+// the wake gate, so a models:use-only peer asking for a third machine got 503
+// `model_not_loaded` — "this link may not load it" — when the true answer is that no link
+// can serve it at all. Different remedies, so the wrong code sends the user to fix the
+// wrong thing.
+
+/** A host that itself has a link named ThirdBox — the only configuration where chaining
+ *  is even reachable. `resolveRemoteTarget` is the SAME resolution the router uses; the
+ *  route must never grow a second copy of parseRemoteId + linkByName. */
+function chainedDeps(caps: string[]): Deps {
+  const { d } = mkDeps([key('tllm-a', caps)])
+  ;(d as unknown as { modelRouter: Record<string, unknown> }).modelRouter.resolveRemoteTarget =
+    (id: string) => (id.startsWith('ThirdBox/')
+      ? { target: 'https://third.box', remote: { linkId: 'l3', baseUrl: 'https://third.box', token: 't', modelKey: 'Qwen3' } }
+      : undefined)
+  return d
+}
+
+test("a second hop is refused as chaining, not as 'this link may not load it'", async () => {
+  const d = chainedDeps(['models:use'])
+  const res = await post(d, 'tllm-a', 'ThirdBox/Qwen3')
+  assert.equal(res.status, 400)
+  assert.equal(await errorCode(res), 'link_chaining_unsupported')
+  // Nothing was relayed onward, and nothing reached a local engine either.
+  assert.equal(upstream, null)
+})
+
+test('a wake-capable peer on a busy host gets the same chaining answer, not host_busy', async () => {
+  const { d: base } = mkDeps([key('tllm-a', ['models:use', 'models:wake'])], { busy: true })
+  ;(base as unknown as { modelRouter: Record<string, unknown> }).modelRouter.resolveRemoteTarget =
+    (id: string) => (id.startsWith('ThirdBox/') ? { target: 'https://third.box', remote: { linkId: 'l3', baseUrl: 'https://third.box', token: 't', modelKey: 'Q' } } : undefined)
+  const res = await post(base, 'tllm-a', 'ThirdBox/Qwen3')
+  assert.equal(res.status, 400)
+  assert.equal(await errorCode(res), 'link_chaining_unsupported')
+})
+
+test('a LOCAL model key containing a slash is untouched by the chaining guard', async () => {
+  // The guard must key on "names a machine I link to", never on "looks qualified" —
+  // `unsloth/Qwen3-GGUF` is an ordinary local model key.
+  const d = chainedDeps(['models:use', 'models:load'])
+  const res = await post(d, 'tllm-a', 'unsloth/Qwen3-GGUF')
+  assert.equal(res.status, 200)
+  assert.ok(upstream, 'reached the engine')
 })

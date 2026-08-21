@@ -345,6 +345,25 @@ export class ModelRouter {
     return lruManager
   }
 
+  /** PUBLIC view of `resolveRemote` — "does this id name a linked machine, and if so what
+   *  is the outcome?" — with no local resolution, no auto-swap and no side effects.
+   *
+   *  Exists so every other surface that must treat a qualified id as remote reuses THIS
+   *  resolution instead of growing its own. Two already do:
+   *   - in-app chat (chat/chat-upstream.ts), which must not hand a qualified id to the
+   *     LOCAL engine loader; and
+   *   - the host façade's chaining refusal (link/link-routes.ts), which has to recognise a
+   *     second-hop id before its wake gate answers with a misleading reason.
+   *  Three findings in this feature came from two implementations of one idea drifting
+   *  apart, so this is deliberately one function with two callers rather than three
+   *  copies of `parseRemoteId` + `linkByName`.
+   *
+   *  `undefined` means "not remote" — including the real case of a LOCAL model key that
+   *  happens to contain a slash (`unsloth/Qwen3-GGUF`), which must keep resolving locally. */
+  resolveRemoteTarget(requestedModel: string): RouteResult | undefined {
+    return this.resolveRemote(requestedModel)
+  }
+
   /** Resolve a qualified id, or return undefined to let local resolution proceed.
    *
    *  Returns undefined ONLY when the id does not name a known linked machine — which

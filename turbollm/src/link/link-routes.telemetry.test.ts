@@ -76,7 +76,7 @@ function hostDeps(keys: ApiKey[], telemetry?: Emitter): Deps {
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }) },
     db: { recordApiUsage: () => {} },
     registry: { active: () => ({ kind: 'llama.cpp' }) },
-    modelRouter: { route: async () => ({ target: 'http://engine.local' }) },
+    modelRouter: { route: async () => ({ target: 'http://engine.local' }), resolveRemoteTarget: () => undefined },
     manager: {
       status: () => ({ state: 'running', model: { key: LOADED } }),
       target: () => 'http://engine.local',

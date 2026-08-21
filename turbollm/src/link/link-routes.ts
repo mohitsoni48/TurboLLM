@@ -330,6 +330,27 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
       return c.json({ error: { code: 'forbidden', message: `This link may not use '${requested}'.` } }, 403)
     }
 
+    // ── Links do not chain, and say so FIRST (final-review M-3) ──────────────────────────
+    // `gatewayV1Handler` carries the authoritative refusal, but it runs after the wake gate
+    // below, so a `models:use`-only peer asking for `ThirdBox/model` used to get 503
+    // `model_not_loaded` — "this link may not load it" — when the real answer is that no
+    // link can serve it at all. Same typed error, same code, decided before any gate that
+    // could give a misleading reason. Never `remote = undefined`: clearing it would make
+    // the qualified id merely unresolved, which falls through to LOCAL resolution.
+    if (requested && d.modelRouter.resolveRemoteTarget(requested)) {
+      return c.json(
+        {
+          error: {
+            message:
+              `'${requested}' names a machine linked to this one. A linked machine serves ` +
+              `only its own local models — link it directly instead.`,
+            code: 'link_chaining_unsupported',
+          },
+        },
+        400,
+      )
+    }
+
     // Wake gating (spec §5.5). The idle judgement lives HERE because only the host can
     // make it. A peer with models:use but not models:wake may use what is already up;
     // anything else is a TYPED 503 the peer renders as "in use locally", never a

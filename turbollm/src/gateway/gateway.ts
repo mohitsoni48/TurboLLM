@@ -330,6 +330,26 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
      *  which credential, or which abort signal a remote request uses. `ac.signal` is the
      *  same client-abort chain the local path already used, so invariant 6 (a client
      *  disconnect must reach the generator) holds identically across the link. */
+    /** False for a federated request: THIS machine did not run the tokens, so none of its
+     *  local bookkeeping may be written from them (final-review I-1 and I-4).
+     *
+     *  Three separate ledgers hang off this one flag, and all three were wrong before:
+     *   - `d.manager.generationStart/setLiveGen/recordCompletion` — the peer's engine card
+     *     read "Generating…" while its own engine was idle or stopped, its session t/s
+     *     averages were contaminated with another machine's numbers, and (because
+     *     `hostIdleState` reads `sessionStats().activeRequests`) a peer that is ALSO a host
+     *     to a third machine marked itself busy while merely proxying, blocking that third
+     *     machine's legitimate wake.
+     *   - `d.db.recordApiUsage` — the rows behind `db.gatewayDailyStats`, which
+     *     `telemetry/runtime/daily-query-rollups.ts` emits as `gateway_daily`. The host
+     *     records the same generation behind its façade through the same code, so every
+     *     federated generation's requests and tokens landed on BOTH machines' rollup.
+     *   - the `inference_served` event, already correct (host-only, link-routes.ts).
+     *
+     *  Spec §5.4's answer for the peer's own UI is the host's `/api/link/v1/status`, read
+     *  over the link — never the peer writing the host's figures into its local manager. */
+    const localAccounting = !remote
+
     const callUpstream = (): Promise<Response> => {
       const body = JSON.stringify(oaiBody)
       if (remote) {
@@ -374,7 +394,13 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
           try {
             await stream.writeSSE(messageStartEvent(msgId, modelName))
 
-            if (d.gate) {
+            // A REMOTE generation touches no local engine, so it must not take one of this
+            // machine's engine slots (final-review I-3). `d.gate` is sized to the LOCAL
+            // engine's `--parallel` count; on a laptop with a `--parallel 1` model loaded,
+            // gating remote traffic here serialises the workstation's GPU behind the
+            // laptop's own work and, worst case, times out after 600 s while the host sits
+            // idle — the exact configuration Turbo Link exists for.
+            if (d.gate && !remote) {
               try {
                 // Never proceed un-slotted on failure — that would silently breach the very
                 // limit this exists to enforce, and intermittently, which is worse than a clean
@@ -400,8 +426,12 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
             // counts Claude-CLI (Anthropic-protocol) traffic too — paired with generationEnd in
             // the outer finally below (generationStarted guards it: never call generationEnd for
             // a start that never happened, e.g. a gate timeout above).
-            d.manager.generationStart()
-            generationStarted = true
+            // Remote: this machine's engine is not generating anything — see the
+            // `localAccounting` note above `callUpstream`.
+            if (localAccounting) {
+              d.manager.generationStart()
+              generationStarted = true
+            }
 
             // For terminal-agent usage attribution/stats (ADR-284) — wall-clock request
             // duration, the simplest signal available without touching streamToAnthropic's own
@@ -443,6 +473,7 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
             // that affects the client stream.
             const gen = streamToAnthropic(res.body, modelName, msgId, {
               onUsage: (u) => {
+                if (!localAccounting) return
                 try {
                   // The engine's own per-phase rates now ride along (ADR-300). This path —
                   // Anthropic streaming, i.e. every Claude Code request — was the one place
@@ -466,7 +497,10 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
               },
               // Live per-request progress for the engine card (prefill % + token count),
               // so Claude Code traffic shows the same live row as in-app chat.
-              onLive: (live) => { try { d.manager.setLiveGen(live) } catch { /* best-effort */ } },
+              onLive: (live) => {
+                if (!localAccounting) return
+                try { d.manager.setLiveGen(live) } catch { /* best-effort */ }
+              },
               // Coding-activity attribution for terminal-agent sessions — see
               // observeCodeSessionTurn. Nothing to attribute for any other client.
               onToolCalls: (calls) => {
@@ -498,7 +532,8 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
     // ── Non-streaming: the client just waits for one whole response, so there's no
     // idle-connection watchdog to defeat — keeps the original un-pinged gate/fetch sequence. ──
     let gateRelease: (() => void) | null = null
-    if (d.gate) {
+    // Local engine slots are for local work only — see the streaming branch (I-3).
+    if (d.gate && localAccounting) {
       try {
         gateRelease = await d.gate.acquire('bg', { signal: c.req.raw.signal, timeoutMs: gateAcquireTimeoutMs })
       } catch (e) {
@@ -507,20 +542,23 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
       }
     }
 
-    d.manager.generationStart()
+    // Paired with `endLocalGeneration` below so a remote request never starts, and never
+    // ends, a generation on this machine's own manager (I-4).
+    if (localAccounting) d.manager.generationStart()
+    const endLocalGeneration = () => { if (localAccounting) d.manager.generationEnd() }
     const requestStart = Date.now()
     let res: Response
     try {
       res = await callUpstream()
     } catch (e) {
-      d.manager.generationEnd()
+      endLocalGeneration()
       gateRelease?.()
       const { status, type, message } = classifyFetchError(e, ac)
       return c.json({ type: 'error', error: { type, message } }, status)
     }
 
     if (!res.ok || !res.body) {
-      d.manager.generationEnd()
+      endLocalGeneration()
       gateRelease?.()
       // Forward the engine's REAL status + whatever structured error it returned, instead of
       // flattening every distinct failure (bad request, model incompatibility, overload, crash)
@@ -535,8 +573,12 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
 
     try {
       const oaiRes = (await res.json()) as Record<string, unknown>
-      // session stats (B4) + durable #71 record, fail-safe
-      recordOpenAiUsage(d, oaiRes, 'anthropic', req.model ?? null, anthropicCodeSessionId, Date.now() - requestStart, anthropicHarness)
+      // session stats (B4) + durable #71 record, fail-safe. Skipped for a remote answer:
+      // the host already recorded this generation behind its façade, and recording it here
+      // too is what double-counted every federated generation in `gateway_daily` (I-1).
+      if (localAccounting) {
+        recordOpenAiUsage(d, oaiRes, 'anthropic', req.model ?? null, anthropicCodeSessionId, Date.now() - requestStart, anthropicHarness)
+      }
       // Same coding-activity attribution the streaming branch gets. A non-streaming turn has no
       // per-delta reassembly to do — the engine already hands back whole `arguments` strings —
       // but it must not be the one shape of terminal-agent turn that silently records nothing.
@@ -549,7 +591,7 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
       }
       return c.json(mapFromOpenAI(oaiRes, modelName))
     } finally {
-      d.manager.generationEnd()
+      endLocalGeneration()
       gateRelease?.()
     }
   })
@@ -748,7 +790,17 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   // The peer's clients authenticate to THIS machine; their credential is meaningless on the
   // host and forwarding it would hand another box a secret it was never issued. The link
   // token replaces it, and is added nowhere else.
-  const remotePath = pathname + url.search
+  // A link serves CHAT only, and only a chat request ever resolves a remote target:
+  // `requestedModel` is read from the body for `/v1/chat/completions` alone, so every other
+  // verb routes with an empty id and can never reach the remote branch below. (Final-review
+  // M-2 supposed `/v1/embeddings` with a qualified id would proxy to the façade and 404;
+  // it does not — it is passed through to the LOCAL engine, exactly as before Turbo Link.)
+  //
+  // The query string is dropped for a remote request (M-5), for the same reason the header
+  // set is an allowlist: a caller that passes a credential as a query parameter would
+  // otherwise have it forwarded verbatim to another machine. Nothing on the façade's chat
+  // route reads a query parameter.
+  const remotePath = remote ? pathname : pathname + url.search
   // Local branch only — the remote branch derives the façade URL inside proxyStream, so there
   // is exactly one place that knows how a link URL is spelled.
   const upstream = target + remotePath
@@ -840,7 +892,10 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   // path ungated would just move the pile-up rather than remove it. Only chat completions: a
   // /tokenize or /embeddings call isn't a generation and must never queue behind one.
   let chatGateRelease: (() => void) | null = null
-  if (isChat && d.gate) {
+  // `!remote` (I-3): the gate is sized to the LOCAL engine's `--parallel` count, and a
+  // federated generation touches no local engine. Gating it here throttles the other
+  // machine's GPU behind this one's work — on a `--parallel 1` laptop, serially.
+  if (isChat && d.gate && !remote) {
     try {
       chatGateRelease = await d.gate.acquire('bg', { signal: c.req.raw.signal, timeoutMs: 600_000 })
     } catch (e) {
@@ -887,7 +942,11 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   // Best-effort session-stats recording (B4) for OpenAI chat completions, fully
   // fail-safe and non-intrusive: tee the body so the client still gets the exact
   // upstream stream/bytes unchanged while we sniff usage off the copy.
-  if (res.ok && res.body && isChat) {
+  // `!remote` (I-1, I-4): the HOST recorded this generation behind its façade — through
+  // this very function — so recording it again here double-counts every federated
+  // generation in `gateway_daily`, and `generationStart()` would light up this machine's
+  // engine card (and its `hostIdleState`) for work its own engine is not doing.
+  if (res.ok && res.body && isChat && !remote) {
     try {
       const [a, b] = res.body.tee()
       // Mark in-flight + publish live token count to the engine card while the teed
@@ -917,6 +976,25 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   // Non-chat passthrough, or a chat response with no body to drain (an engine error) — nothing
   // will ever call the drain's finally, so the slot has to be given back right here.
   chatGateRelease?.()
+  // ── No host filesystem detail crosses the façade (final-review M-6) ───────────────────
+  // llama.cpp's error JSON routinely embeds absolute model and binary paths, and this line
+  // relayed the engine's body unchanged. Locally that is the user's own machine and the
+  // detail is useful; behind the façade (`origin: 'link'`) it is another box's disk layout
+  // crossing a machine boundary. The STATUS is preserved, so the peer still classifies the
+  // failure — only the host's free text is withheld, exactly as `linkDownloadErr` and
+  // `status-view.ts` already do for their surfaces.
+  if (opts.origin === 'link' && !res.ok) {
+    return c.json(
+      {
+        error: {
+          message: "The host's engine could not complete the request.",
+          type: 'api_error',
+          code: 'engine_error',
+        },
+      },
+      asClientStatus(res.status),
+    )
+  }
   return new Response(res.body, { status: res.status, headers: res.headers })
 }
 
