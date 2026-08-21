@@ -140,6 +140,28 @@ Three things worth keeping:
   CPU experts to 16, reaching 22.9 GB resident and 5.82 t/s (+17%). Below 16 it OOMs — 36.9 GB
   has a hard floor in 30 GB of VRAM.
 
+Verified fix (2x T4, same model, full daemon auto-tune, `bench_vs_chat.py --ctx 8192`):
+
+| | before | after |
+|---|---:|---:|
+| nCpuMoe chosen | 24 | **10** |
+| tensor-split | (llama.cpp even) | **[25, 15]** derived |
+| GPU0 / GPU1 | 1707 / 14693 MiB | **14879 / 12757 MiB** |
+| resident | 16.4 GB (53% of pool) | **27.6 GB (90%)** |
+| auto-tune | 12.4 t/s | 22.1 t/s |
+| chat | 4.3 t/s | **10.0 t/s** |
+
+The search direction is the tell. Before, it probed 20 -> 30 -> 25 -> 22 -> 23 -> 24, walking
+RIGHT into ever more CPU offload because every probe near the top of the pool looked like it was
+spilling. After, it probes 20 -> 9 -> 14 -> 11 -> 10: nCpuMoe=20 now FITS, because the layers are
+placed by bytes and GPU1 no longer saturates while GPU0 idles, so the search descends instead of
+retreating. That also beat the best hand-swept config in the table above (5.82 t/s) by 72% — the
+tuner reached a config the even split had made unreachable at any setting.
+
+Note the auto-tune vs chat gap (22.1 vs 10.0, 45%) survives the fix — both numbers roughly
+doubled but the ratio did not move. That gap reproduces on a SINGLE card too, so it is a separate
+bug and not a dual-GPU one.
+
 The tuner cannot currently reach that config: `pickSplitStrategies` offers only {single-GPU,
 the profile's existing split} and never a rebalanced `tensorSplit`, so the offload search runs
 against the default even split and is structurally capped near 16 GB resident. Unlocking the
