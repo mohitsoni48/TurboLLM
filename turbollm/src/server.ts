@@ -17,7 +17,7 @@ import { featureForPath } from './telemetry/feature-map'
 import { registerTerminalRoutes } from './terminal/terminal-routes'
 import { registerRoutineRoutes } from './routines/routine-routes'
 import { lanAuth, codeAuth } from './auth'
-import { registerLinkApi } from './link/link-routes'
+import { registerLinkApi, registerLinkAuth } from './link/link-routes'
 
 // Reuse TCP connections for all engine and HF fetch calls. Without this, Node
 // opens a new connection per request — ~5–20 ms of extra latency every Claude
@@ -70,10 +70,12 @@ export function createApp(d: Deps): Hono {
   // Code always needs a key from a non-host device, even when the rest of the app is open.
   app.use('/api/v1/code/*', codeAuth(d))
 
-  // Turbo Link façade (ADR-376). MUST come after lanAuth so an ordinary LAN request is
-  // still subject to the normal gate, and it carries its own inverted gate internally —
-  // linkAuth exempts nothing, including loopback (spec §3.3).
-  registerLinkApi(app, d)
+  // Turbo Link's own gate (ADR-376). MUST come after lanAuth so an ordinary LAN request is
+  // still subject to the normal gate; it is an INVERSION of lanAuth and exempts nothing,
+  // including loopback (spec §3.3). Registered here, above the telemetry middleware, so a
+  // rejected peer never counts as feature usage — the façade's HANDLERS are registered
+  // below it instead (see registerLinkApi).
+  registerLinkAuth(app, d)
 
   // Feature-discovery + feature-engagement telemetry (ADR-299, the latter's
   // wiring added by the telemetry-review follow-up). Runs AFTER the auth gates
@@ -91,6 +93,17 @@ export function createApp(d: Deps): Hono {
     }
     await next()
   })
+
+  // Turbo Link façade HANDLERS (ADR-376) — gate already registered above.
+  //
+  // These must come after the feature-telemetry middleware directly above. Hono composes
+  // matching handlers in registration order, so a route handler that returns without
+  // calling next() short-circuits every middleware registered later: registered above the
+  // telemetry middleware, `POST /api/link/v1/hello` never reached it, and the `link`
+  // feature was recorded for exactly one case — a 404 on a path the façade does not serve.
+  // A metric that fires only on failures is worse than none. Every future façade route
+  // inherits this ordering, so keep the registration here.
+  registerLinkApi(app, d, { authAlreadyRegistered: true })
 
   app.get('/healthz', (c) => c.json({ status: 'ok', version: d.version }))
 

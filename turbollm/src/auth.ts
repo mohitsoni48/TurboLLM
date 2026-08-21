@@ -130,6 +130,26 @@ export function isLocalRequest(c: Context, d: Deps): boolean {
   return isLoopback(c) === true
 }
 
+/** The gate every CREDENTIAL-MANAGEMENT route must carry: host-only while the LAN is open
+ *  and unauthenticated (lanBind on, requireApiKey off), unrestricted once a key is required.
+ *
+ *  lanAuth's `bypassesAuth` deliberately lets that lanBind-on/requireApiKey-off combination
+ *  through with NO credential at all (spec 06 §5's "opted into open LAN access"), which is
+ *  fine for chat/models but would let any device that can merely load the page mint itself a
+ *  durable key — a real self-escalation, since that key keeps working even after
+ *  requireApiKey is later turned on. Once requireApiKey IS on, a non-host caller only reaches
+ *  the handler at all by having already presented a valid key (lanAuth ran first), so
+ *  self-service key management from another device is fine then.
+ *
+ *  Lives here rather than inside `registerApi` so `/api/v1/keys`, `/api/v1/connect/:cli` and
+ *  Turbo Link's `/api/v1/links*` (ADR-376) share ONE predicate — the v1.9.0 pre-release
+ *  review found this gate missing on `DELETE /api/v1/keys/:id`, and the phase-1 Turbo Link
+ *  review found it missing again on `POST /api/v1/links/mint`, both because it was a private
+ *  local function nothing new could reuse. */
+export function hostGate(c: Context, d: Deps): boolean {
+  return isLocalRequest(c, d) || d.store.snapshot().daemon.requireApiKey === true
+}
+
 /** Same decision as {@link isLocalRequest}, for the one surface that has no Hono `Context`:
  *  the raw `http.Server` 'upgrade' event a WebSocket handshake arrives on (registerTerminalWs).
  *  Takes the remote address and headers directly instead of pulling them off a Context. */

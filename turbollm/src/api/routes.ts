@@ -14,7 +14,7 @@ import { abortAllInFlightChats } from '../chat/chat-routes'
 import { NameTakenError, NotFoundError, customSourceKey } from '../engines/registry'
 import { ProbeError, probe } from '../engines/probe'
 import { resolveServerBinary, suggestEngineName } from '../engines/scan'
-import { generateApiKey, isLocalRequest } from '../auth'
+import { generateApiKey, hostGate, isLocalRequest } from '../auth'
 import { enabledFeatures } from '../features'
 import { isTerminalBackendAvailable } from '../terminal/terminal-routes'
 import {
@@ -1627,6 +1627,7 @@ export function registerApi(app: Hono, d: Deps): void {
       idleTtlMinutes?: number
       port?: number
       theme?: string
+      machineName?: string
       autoGenerateTitles?: boolean
       autoMemoryEnabled?: boolean
       openBrowserOnStart?: boolean
@@ -1668,6 +1669,11 @@ export function registerApi(app: Hono, d: Deps): void {
       if (!['system', 'light', 'dark'].includes(b.theme)) return err(c, 400, 'invalid_config_value', 'theme must be system, light, or dark.')
       updates.theme = b.theme
     }
+    // Turbo Link machine name (ADR-376): what a linked peer displays for this box. '' is a
+    // legal value meaning "fall back to the OS hostname" (link-routes.ts resolves it), so
+    // this is a clear, not an error. Capped so a peer's list can't be defaced by a
+    // kilobyte-long name.
+    if (b.machineName !== undefined) updates.machineName = String(b.machineName).trim().slice(0, 64)
     if (b.autoGenerateTitles !== undefined) updates.autoGenerateTitles = !!b.autoGenerateTitles
     if (b.autoMemoryEnabled !== undefined) updates.autoMemoryEnabled = !!b.autoMemoryEnabled
     if (b.openBrowserOnStart !== undefined) updates.openBrowserOnStart = !!b.openBrowserOnStart
@@ -2198,16 +2204,11 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   // ── API keys (spec 06 §5) ────────────────────────────────────────────────
-  // Host-only while the LAN is open and unauthenticated (lanBind on, requireApiKey off):
-  // lanAuth's bypassesAuth deliberately lets that combination through with NO credential at
-  // all (spec 06 §5's "opted into open LAN access"), which is fine for chat/models but would
-  // let any device that can merely load the page list key names or mint itself a durable
-  // `tllm-...` key with zero credential — a real self-escalation (that key keeps working even
-  // after requireApiKey is later turned on), not just an info leak. Once requireApiKey IS on,
-  // a non-host caller only reaches this handler at all by already having presented a valid key
-  // (lanAuth ran first), so self-service key management from another device is fine then.
+  // Host-only while the LAN is open and unauthenticated — see auth.ts's `hostGate` for the
+  // full rationale. It lives there, not here, so Turbo Link's credential routes
+  // (link-admin-routes.ts) share the one predicate instead of re-deriving it (ADR-376).
   function keysHostGate(c: Context): boolean {
-    return isLocalRequest(c, d) || d.store.snapshot().daemon.requireApiKey
+    return hostGate(c, d)
   }
 
   app.get('/api/v1/keys', (c) => {
@@ -2394,6 +2395,10 @@ function settingsPayload(d: Deps) {
     idleTtlMinutes: cfg.daemon.idleTtlMinutes,
     port: cfg.daemon.port,
     theme: cfg.daemon.theme,
+    // Turbo Link (ADR-376): what this box calls itself to a linked peer. Echoed raw —
+    // '' means "not set", and link-routes.ts resolves that to the OS hostname at
+    // handshake time. Not a secret.
+    machineName: cfg.daemon.machineName ?? '',
     autoGenerateTitles: cfg.daemon.autoGenerateTitles,
     autoMemoryEnabled: cfg.daemon.autoMemoryEnabled,
     openBrowserOnStart: cfg.daemon.openBrowserOnStart,

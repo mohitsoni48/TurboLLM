@@ -11,8 +11,10 @@ import { Emitter } from '../telemetry/emit'
 import { readQueue } from '../telemetry/queue'
 import type { Deps } from '../deps'
 
-function mkApp(fetchImpl?: typeof fetch, telemetry?: Emitter) {
-  const cfg: Record<string, unknown> = { apiKeys: [], links: [], daemon: { port: 6996 } }
+function mkApp(fetchImpl?: typeof fetch, telemetry?: Emitter, daemon?: Record<string, unknown>) {
+  const cfg: Record<string, unknown> = {
+    apiKeys: [], links: [], daemon: { port: 6996, ...daemon },
+  }
   const d = {
     version: '1.11.2',
     store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
@@ -46,23 +48,38 @@ test('mint creates a granted key and reveals the raw token exactly once', async 
   const { app, cfg } = mkApp()
   const res = await app.request('/api/v1/links/mint', json({ name: 'laptop', capabilities: ['models:use'] }))
   assert.equal(res.status, 200)
-  const body = await res.json() as { token: string; linkString: string }
-  assert.ok(body.token.startsWith('tllm-'))
+  const body = await res.json() as { linkString: string }
+  const token = decodeLinkString(body.linkString)!.token
+  assert.ok(token.startsWith('tllm-'))
   const keys = cfg.apiKeys as { name: string; grant: { capabilities: string[] }; hash: string }[]
   assert.equal(keys.length, 1)
   assert.deepEqual(keys[0].grant.capabilities, ['models:use'])
   // Only the hash is persisted — the raw token can never be re-shown, same rule as
   // every other key in the product.
-  assert.ok(!JSON.stringify(cfg.apiKeys).includes(body.token))
+  assert.ok(!JSON.stringify(cfg.apiKeys).includes(token))
+})
+
+test('mint reveals the raw token in ONE field only — linkString, never a second copy', async () => {
+  const { app } = mkApp()
+  const res = await app.request('/api/v1/links/mint', json({ name: 'laptop', capabilities: ['models:use'] }))
+  const body = await res.json() as Record<string, unknown>
+  const token = decodeLinkString(body.linkString as string)!.token
+  // The one-time reveal surface is exactly one field. A `token` sibling was a second
+  // copy of the same secret on the wire that no caller ever read.
+  assert.deepEqual(Object.keys(body).sort(), ['keyId', 'linkString'])
+  for (const [k, v] of Object.entries(body)) {
+    if (k !== 'linkString') assert.ok(!String(v).includes(token), `${k} must not carry the raw token`)
+  }
 })
 
 test('the minted link string decodes back to a usable url and token', async () => {
   const { app } = mkApp()
   const body = await (await app.request('/api/v1/links/mint',
-    json({ name: 'laptop', capabilities: ['models:use'] }))).json() as { token: string; linkString: string }
+    json({ name: 'laptop', capabilities: ['models:use'] }))).json() as { linkString: string }
   const decoded = decodeLinkString(body.linkString)
   assert.ok(decoded)
-  assert.equal(decoded!.token, body.token)
+  assert.ok(decoded!.token.startsWith('tllm-'))
+  assert.ok(decoded!.baseUrl.startsWith('http'))
 })
 
 test('mint refuses an unknown capability instead of storing it', async () => {
@@ -392,4 +409,117 @@ test('adding a link with no telemetry deps is a no-op, not a crash', async () =>
   const { app } = mkApp(async () => { throw new TypeError('fetch failed') })
   const res = await app.request('/api/v1/links', json({ linkString: encodeLinkString('http://dead:6996', 'tllm-abc') }))
   assert.equal(res.status, 200)
+})
+
+// ── Host gate (ADR-376 final review, C-1) ───────────────────────────────────────────
+//
+// The attack: lanBind=true + requireApiKey=false is the documented "open LAN" posture,
+// and `lanAuth`'s bypassesAuth lets ANY non-tunneled caller through it with no credential
+// at all. Ungated, POST /api/v1/links/mint then handed that stranger a real, permanent
+// ApiKey — one that keeps working after the user later turns requireApiKey ON. That is
+// the exact self-escalation `keysHostGate` was added to stop on POST /api/v1/keys.
+//
+// `app.request()` provides no connection info, so `isLoopback` cannot determine an
+// address and fails CLOSED while LAN-exposed — i.e. these requests are treated as the
+// remote stranger they represent, the same convention as keys-network.test.ts.
+const OPEN_LAN = { lanBind: true, requireApiKey: false }
+const LOCKED_LAN = { lanBind: true, requireApiKey: true }
+
+const GATED_ROUTES: { label: string; path: string; init?: RequestInit }[] = [
+  { label: 'POST /api/v1/links/mint', path: '/api/v1/links/mint', init: json({ name: 'x', capabilities: ['models:use'] }) },
+  { label: 'GET /api/v1/links/inbound', path: '/api/v1/links/inbound' },
+  { label: 'GET /api/v1/links', path: '/api/v1/links' },
+  { label: 'POST /api/v1/links', path: '/api/v1/links', init: json({ linkString: encodeLinkString('http://h:6996', 'tllm-abc') }) },
+  { label: 'PATCH /api/v1/links/:id', path: '/api/v1/links/some-id', init: { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: '{"name":"x"}' } },
+  { label: 'DELETE /api/v1/links/:id', path: '/api/v1/links/some-id', init: { method: 'DELETE' } },
+]
+
+for (const route of GATED_ROUTES) {
+  test(`${route.label} refuses an unauthenticated open-LAN caller`, async () => {
+    const { app, cfg } = mkApp(undefined, undefined, OPEN_LAN)
+    const res = await app.request(route.path, route.init)
+    assert.equal(res.status, 403)
+    const body = await res.json() as { error: { code: string } }
+    assert.equal(body.error.code, 'forbidden')
+    // The critical half: nothing was created. A 403 that still minted a key would be
+    // the same escalation with a worse status code.
+    assert.deepEqual(cfg.apiKeys, [])
+    assert.deepEqual(cfg.links, [])
+  })
+
+  test(`${route.label} is allowed once "Require an API key" is on (lanAuth verified the key first)`, async () => {
+    const { app } = mkApp(async () => { throw new TypeError('fetch failed') }, undefined, LOCKED_LAN)
+    const res = await app.request(route.path, route.init)
+    assert.notEqual(res.status, 403)
+  })
+}
+
+test('an open-LAN stranger cannot mint a key that would outlive the open-LAN posture', async () => {
+  const { app, cfg } = mkApp(undefined, undefined, OPEN_LAN)
+  await app.request('/api/v1/links/mint', json({ name: 'attacker', capabilities: [...LINK_PRESETS.full] }))
+  // The whole point of the gate: no durable credential exists to keep working after the
+  // user turns requireApiKey on.
+  assert.equal((cfg.apiKeys as unknown[]).length, 0)
+})
+
+// ── Probe must not clobber a user-set name (final review, I-3) ───────────────────────
+
+const helloWith = (name: string, machineId: () => string) => async () => new Response(JSON.stringify({
+  machineId: machineId(), machineName: name, appVersion: '1.11.2',
+  linkApiVersions: [1], capabilities: ['models:use'],
+}), { status: 200, headers: { 'content-type': 'application/json' } })
+
+test('PATCH { name } survives the re-probe instead of being reverted by the host', async () => {
+  const { app, cfg } = mkApp(helloWith('TurboLLM', () => 'm1'))
+  await app.request('/api/v1/links', json({ linkString: encodeLinkString('http://h:6996', 'tllm-abc') }))
+  const id = (cfg.links as { id: string }[])[0].id
+  const res = await app.request(`/api/v1/links/${id}`, {
+    method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: 'kaggle box' }),
+  })
+  const body = await res.json() as { link: { name: string } }
+  assert.equal(body.link.name, 'kaggle box')
+  assert.equal((cfg.links as { name: string }[])[0].name, 'kaggle box')
+})
+
+test('the FIRST handshake still seeds the name from the host, so a link is not left named after its URL', async () => {
+  const { app, cfg } = mkApp(helloWith('workstation', () => 'm1'))
+  await app.request('/api/v1/links', json({ linkString: encodeLinkString('http://h:6996', 'tllm-abc') }))
+  assert.equal((cfg.links as { name: string }[])[0].name, 'workstation')
+})
+
+// ── The machineId-change latch (final review, I-5) ───────────────────────────────────
+
+test('a machineId change latches into machineIdChanged and a later good probe does NOT clear it', async () => {
+  let machine = 'm1'
+  const { app, cfg } = mkApp(helloWith('workstation', () => machine))
+  await app.request('/api/v1/links', json({ linkString: encodeLinkString('http://h:6996', 'tllm-abc') }))
+  const id = (cfg.links as { id: string }[])[0].id
+
+  machine = 'stranger'
+  await app.request(`/api/v1/links/${id}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: '{}' })
+  assert.equal((cfg.links as { machineIdChanged?: boolean }[])[0].machineIdChanged, true)
+
+  // The bug this replaces: the next successful probe saw machineId already adopted and
+  // wiped the warning, so the anti-hijack signal lived for at most one poll interval.
+  const again = await app.request(`/api/v1/links/${id}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: '{}' })
+  const body = await again.json() as { link: { machineIdChanged: boolean; lastError: string | null } }
+  assert.equal(body.link.machineIdChanged, true)
+  assert.ok(body.link.lastError?.includes('different machine'))
+})
+
+test('only an explicit acknowledgement clears the machineId latch', async () => {
+  let machine = 'm1'
+  const { app, cfg } = mkApp(helloWith('workstation', () => machine))
+  await app.request('/api/v1/links', json({ linkString: encodeLinkString('http://h:6996', 'tllm-abc') }))
+  const id = (cfg.links as { id: string }[])[0].id
+  machine = 'stranger'
+  await app.request(`/api/v1/links/${id}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: '{}' })
+
+  const res = await app.request(`/api/v1/links/${id}`, {
+    method: 'PATCH', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ acknowledgeMachineChange: true }),
+  })
+  const body = await res.json() as { link: { machineIdChanged: boolean; lastError: string | null } }
+  assert.equal(body.link.machineIdChanged, false)
+  assert.equal(body.link.lastError, null)
 })

@@ -7,6 +7,24 @@ import { linkStatusChanged } from '../telemetry/events/link'
 
 const DEFAULT_INTERVAL_MS = 15_000
 
+/** Did this probe change anything worth a `config.json` rewrite? Every field of
+ *  `LinkRecord` EXCEPT `lastSeenAt` — which is a heartbeat, not state — plus the fields
+ *  only a user edits (`name`, `baseUrl`), because `applyProbeResult` can rename a link on
+ *  its first handshake. */
+function durableChange(before: LinkRecord, after: LinkRecord): boolean {
+  return (
+    before.status !== after.status ||
+    before.machineId !== after.machineId ||
+    (before.machineIdChanged ?? false) !== (after.machineIdChanged ?? false) ||
+    before.linkApiVersion !== after.linkApiVersion ||
+    before.lastError !== after.lastError ||
+    before.name !== after.name ||
+    before.baseUrl !== after.baseUrl ||
+    before.grantedCapabilities.length !== after.grantedCapabilities.length ||
+    before.grantedCapabilities.some((cap, i) => cap !== after.grantedCapabilities[i])
+  )
+}
+
 /** Owns the peer's poll loop over every linked host.
  *
  *  Design invariant 3 (spec §4.4): a link going down must NEVER degrade local operation.
@@ -17,6 +35,9 @@ const DEFAULT_INTERVAL_MS = 15_000
  *    - nothing in the local request path ever awaits this class. */
 export class LinkManager {
   private timer: NodeJS.Timeout | undefined
+  /** In-memory heartbeat: the `lastSeenAt` of a probe that changed NOTHING else.
+   *  See `probeOnce` for why it does not go to disk. */
+  private readonly heartbeats = new Map<string, string>()
   private readonly intervalMs: number
   private readonly fetchImpl: typeof fetch | undefined
 
@@ -50,17 +71,45 @@ export class LinkManager {
     await Promise.allSettled(this.list().map((l) => this.probeOnce(l.id)))
   }
 
+  /** Freshest known contact time for a link — the persisted value, or a newer in-memory
+   *  heartbeat from a poll that was not worth a disk write. */
+  lastSeenAt(id: string): string | null {
+    return this.heartbeats.get(id) ?? this.get(id)?.lastSeenAt ?? null
+  }
+
   async probeOnce(id: string): Promise<void> {
     const rec = this.get(id)
     if (!rec) return
     const fromStatus = rec.status
     const probe = await new LinkClient(rec, { fetchImpl: this.fetchImpl }).hello()
 
-    this.d.store.update((cfg) => {
-      const l = (cfg.links ?? []).find((x) => x.id === id)
-      if (!l) return
-      applyProbeResult(l, probe)
-    })
+    // Persist ONLY when the probe actually changed something durable.
+    //
+    // `ConfigStore.update` has no dirty check: it structuredClones the whole config,
+    // validates it, then writeFileSync + renameSync the entire file — synchronously, on
+    // the thread that also serves inference. `applyProbeResult` stamps a fresh
+    // `lastSeenAt` on every successful probe, so an unconditional update meant one full
+    // config rewrite per link per 15 s tick, forever: ~5.8k/day with one link, ~17k with
+    // three, none of them carrying new information. Phase 2 routes every inference
+    // request and every progress poll through this same path, so the answer has to be
+    // "only durable state goes to disk", not "it is only 15 seconds".
+    //
+    // The decision is made by running the SAME `applyProbeResult` against a copy — never
+    // a second, hand-written notion of what a probe changes, which is exactly the drift
+    // Ruling 7 closed.
+    const next: LinkRecord = { ...rec, grantedCapabilities: [...rec.grantedCapabilities] }
+    applyProbeResult(next, probe)
+    if (durableChange(rec, next)) {
+      this.heartbeats.delete(id)
+      this.d.store.update((cfg) => {
+        const l = (cfg.links ?? []).find((x) => x.id === id)
+        if (!l) return
+        applyProbeResult(l, probe)
+      })
+    } else if (next.lastSeenAt && next.lastSeenAt !== rec.lastSeenAt) {
+      // Nothing but the heartbeat moved — keep it in memory (see `lastSeenAt`).
+      this.heartbeats.set(id, next.lastSeenAt)
+    }
 
     // Telemetry (ADR-376 Task 11): from/to status only — never baseUrl, hostname, or
     // token. Only fires on an actual transition, not on every poll tick (most polls

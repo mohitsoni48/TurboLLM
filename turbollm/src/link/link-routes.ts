@@ -1,5 +1,6 @@
 import type { Hono } from 'hono'
 import { randomUUID } from 'node:crypto'
+import { hostname } from 'node:os'
 import type { Deps } from '../deps'
 import type { ApiKey } from '../config/config'
 import { linkAuth } from './link-auth'
@@ -25,6 +26,36 @@ export function machineId(d: Deps): string {
   return id
 }
 
+/** What this box calls itself to a peer.
+ *
+ *  `daemon.machineName` is the user's own choice (Settings → Turbo Link). When it is unset
+ *  — which it is on every existing install, since nothing wrote the field before this —
+ *  fall back to the OS HOSTNAME rather than the literal string "TurboLLM": every host
+ *  answering with an identical constant makes the peer's "Linked machines" list, and
+ *  `describeStatus`'s deliberately machine-naming copy, useless the moment there are two
+ *  links. `os.hostname()` is cross-platform and needs no configuration; the constant
+ *  survives only as a last resort for the (theoretical) empty-hostname case. */
+export function resolveMachineName(configured: string | undefined): string {
+  const chosen = configured?.trim()
+  if (chosen) return chosen
+  try {
+    return hostname().trim() || 'TurboLLM'
+  } catch {
+    return 'TurboLLM'
+  }
+}
+
+/** Mount ONLY the façade's gate. Split out from `registerLinkApi` so `createApp` can put
+ *  the gate before the feature-telemetry middleware and the handlers after it: telemetry
+ *  must not count a request that was rejected, and a handler registered BEFORE the
+ *  telemetry middleware short-circuits it entirely (Hono composes in registration order),
+ *  which is why the `link` feature previously only ever recorded 404s. Callers that do not
+ *  care about that ordering — every test, and any future embedder — get both from
+ *  `registerLinkApi` in one call, unchanged. */
+export function registerLinkAuth(app: Hono, d: Deps): void {
+  ;(app as unknown as Hono<LinkEnv>).use('/api/link/v1/*', linkAuth(d))
+}
+
 /** Mount the Turbo Link façade (ADR-376).
  *
  *  Deliberately NARROW and explicitly versioned: this is the contract two
@@ -33,9 +64,9 @@ export function machineId(d: Deps): string {
  *  becomes a fork that drifts from the internal API it mirrors.
  *
  *  Register AFTER lanAuth in server.ts. linkAuth then exempts nothing (spec §3.3). */
-export function registerLinkApi(app: Hono, d: Deps): void {
+export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegistered?: boolean }): void {
   const linkApp = app as unknown as Hono<LinkEnv>
-  linkApp.use('/api/link/v1/*', linkAuth(d))
+  if (!opts?.authAlreadyRegistered) registerLinkAuth(app, d)
 
   linkApp.post('/api/link/v1/hello', (c) => {
     const key = c.get('linkKey')
@@ -46,7 +77,7 @@ export function registerLinkApi(app: Hono, d: Deps): void {
     const daemon = d.store.snapshot().daemon as { machineName?: string }
     const body: HelloResponse = {
       machineId: machineId(d),
-      machineName: daemon.machineName || 'TurboLLM',
+      machineName: resolveMachineName(daemon.machineName),
       appVersion: d.version,
       linkApiVersions: [...LINK_API_VERSIONS],
       capabilities,

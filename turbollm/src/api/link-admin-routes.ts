@@ -1,7 +1,8 @@
 import type { Hono } from 'hono'
 import { randomUUID } from 'node:crypto'
 import { networkInterfaces } from 'node:os'
-import { generateApiKey } from '../auth'
+import { generateApiKey, hostGate } from '../auth'
+import type { Context } from 'hono'
 import type { Deps } from '../deps'
 import { applyProbeResult } from '../link/apply-probe'
 import { LinkClient } from '../link/link-client'
@@ -22,8 +23,37 @@ export function registerLinkAdminRoutes(
 ): void {
   const fetchImpl = opts?.fetchImpl
 
+  /** EVERY route in this file is credential management and therefore carries the same
+   *  host gate as `/api/v1/keys` (auth.ts's `hostGate`).
+   *
+   *  Without it, on the documented open-LAN posture (lanBind=true, requireApiKey=false)
+   *  `lanAuth` lets an unauthenticated stranger through, and `POST /api/v1/links/mint`
+   *  would hand them a real, permanent `ApiKey` — one that keeps working after the user
+   *  later turns `requireApiKey` ON. That is exactly the self-escalation `keysHostGate`
+   *  was added to stop on `POST /api/v1/keys`; this surface is a second door into the
+   *  same room. `inbound` leaks every grant's shape, `GET /api/v1/links` leaks the
+   *  baseUrl of every machine this box links to, and PATCH/DELETE let a stranger
+   *  re-point or destroy those links. */
+  function gate(c: Context, what: string) {
+    if (hostGate(c, d)) return null
+    return c.json(
+      {
+        error: {
+          code: 'forbidden',
+          message: `${what} from this machine until "Require an API key" is turned on.`,
+        },
+      },
+      403,
+    )
+  }
+  const MINT = 'Turbo Link tokens can only be minted'
+  const VIEW = 'Turbo Link details are only visible'
+  const MANAGE = 'Linked machines can only be managed'
+
   // ── Host side: mint a scoped token for another machine.
   app.post('/api/v1/links/mint', async (c) => {
+    const denied = gate(c, MINT)
+    if (denied) return denied
     const body = await c.req.json().catch(() => null) as
       { name?: string; capabilities?: string[]; models?: unknown; preset?: string } | null
     const name = body?.name?.trim()
@@ -96,12 +126,18 @@ export function registerLinkAdminRoutes(
       emit(d.telemetry, linkMinted, { capabilityCount: caps.length, ...(preset ? { preset } : {}) })
     }
 
-    // Revealed ONCE — only the hash is stored, same rule as every other key.
-    return c.json({ keyId, token: full, linkString: encodeLinkString(baseUrl, full) })
+    // Revealed ONCE — only the hash is stored, same rule as every other key. The raw
+    // token is returned ONLY inside `linkString` (which is what the user copies): a
+    // separate `token` field would be a second copy of the same one-time secret on the
+    // wire, in the response body, and in whatever the browser does with it — for a
+    // field no caller reads.
+    return c.json({ keyId, linkString: encodeLinkString(baseUrl, full) })
   })
 
   // ── Host side: who is linked to me.
   app.get('/api/v1/links/inbound', (c) => {
+    const denied = gate(c, VIEW)
+    if (denied) return denied
     const keys = d.store.snapshot().apiKeys.filter((k) => k.grant)
     return c.json({
       inbound: keys.map((k) => ({
@@ -117,11 +153,23 @@ export function registerLinkAdminRoutes(
 
   // ── Peer side: list all links (settings UI's "linked machines" panel).
   app.get('/api/v1/links', (c) => {
-    return c.json({ links: (d.store.snapshot().links ?? []).map(redactLink) })
+    const denied = gate(c, VIEW)
+    if (denied) return denied
+    // `lastSeenAt` is overlaid from LinkManager when it holds a newer heartbeat: an
+    // unchanged link's contact time deliberately stays in memory rather than triggering a
+    // full config rewrite every 15 s (see link-manager.ts), so the stored value can lag.
+    return c.json({
+      links: (d.store.snapshot().links ?? []).map((l) => {
+        const seen = d.links?.lastSeenAt(l.id)
+        return seen ? { ...redactLink(l), lastSeenAt: seen } : redactLink(l)
+      }),
+    })
   })
 
   // ── Peer side: add / edit / remove a link.
   app.post('/api/v1/links', async (c) => {
+    const denied = gate(c, MANAGE)
+    if (denied) return denied
     const body = await c.req.json().catch(() => null) as { linkString?: string } | null
     const decoded = decodeLinkString(body?.linkString ?? '')
     if (!decoded) {
@@ -136,6 +184,7 @@ export function registerLinkAdminRoutes(
       baseUrl: decoded.baseUrl,
       token: decoded.token,
       machineId: null,
+      machineIdChanged: false,
       grantedCapabilities: [],
       linkApiVersion: null,
       status: 'unknown',
@@ -161,8 +210,11 @@ export function registerLinkAdminRoutes(
   })
 
   app.patch('/api/v1/links/:id', async (c) => {
+    const denied = gate(c, MANAGE)
+    if (denied) return denied
     const id = c.req.param('id')
-    const body = await c.req.json().catch(() => null) as { baseUrl?: string; name?: string } | null
+    const body = await c.req.json().catch(() => null) as
+      { baseUrl?: string; name?: string; acknowledgeMachineChange?: boolean } | null
     if (!current(id)) return c.json({ error: { code: 'not_found', message: 'No such link.' } }, 404)
     if (body?.baseUrl) {
       try {
@@ -177,6 +229,12 @@ export function registerLinkAdminRoutes(
       if (!l) return
       if (body?.baseUrl) l.baseUrl = body.baseUrl.replace(/\/+$/, '')
       if (body?.name) l.name = body.name
+      // The ONLY way the anti-hijack latch clears: a human looked at the warning and
+      // said this machine is the one they meant. No probe result ever clears it.
+      if (body?.acknowledgeMachineChange) {
+        l.machineIdChanged = false
+        l.lastError = null
+      }
     })
     await probe(id)
     const stored = current(id)
@@ -184,6 +242,8 @@ export function registerLinkAdminRoutes(
   })
 
   app.delete('/api/v1/links/:id', (c) => {
+    const denied = gate(c, MANAGE)
+    if (denied) return denied
     const id = c.req.param('id')
     d.store.update((cfg) => { cfg.links = (cfg.links ?? []).filter((l) => l.id !== id) })
     return c.json({ ok: true })
@@ -206,7 +266,6 @@ export function registerLinkAdminRoutes(
       const l = (cfg.links ?? []).find((x) => x.id === id)
       if (!l) return
       applyProbeResult(l, p)
-      if (p.kind === 'ok' && p.raw?.machineName) l.name = p.raw.machineName
     })
   }
 }

@@ -167,3 +167,101 @@ test('probeOnce with no telemetry deps is a no-op, not a crash', async () => {
   await m.probeOnce('l1')
   assert.equal(cfg.links[0].status, 'online')
 })
+
+// ── Persist only on a real change (ADR-376 final review, I-4) ────────────────────────
+//
+// `ConfigStore.update` has no dirty check: it structuredClones the whole config,
+// validates it, then writeFileSync + renameSync the ENTIRE file, synchronously, on the
+// thread that also serves inference. `applyProbeResult` stamps a fresh `lastSeenAt` on
+// every successful probe, so an unconditional update meant one full config rewrite per
+// link per 15 s tick — ~5.8k/day with one link, ~17k with three — none of them carrying
+// new information. Phase 2 routes every inference request and every progress poll through
+// this same path, so a steady-state poll must not touch the disk at all.
+
+/** Same double as `mkDeps`, plus a count of how many times the config was actually
+ *  written. That count IS the assertion here — the record contents are covered above. */
+function mkCountingDeps(links: LinkRecord[]): { d: Deps; cfg: { links: LinkRecord[] }; writes: () => number } {
+  const cfg = { links, daemon: {}, apiKeys: [] }
+  let writes = 0
+  const d = {
+    store: {
+      snapshot: () => cfg,
+      update: (fn: (c: never) => void) => { writes++; fn(cfg as never) },
+    },
+  } as unknown as Deps
+  return { d, cfg: cfg as { links: LinkRecord[] }, writes: () => writes }
+}
+
+test('a steady-state poll that changes nothing does NOT rewrite config.json', async () => {
+  const { d, writes } = mkCountingDeps([rec()])
+  const m = new LinkManager(d, { fetchImpl: helloOk })
+  await m.probeOnce('l1')          // first probe: unknown → online, a real change
+  assert.equal(writes(), 1)
+  await m.probeOnce('l1')          // identical result
+  await m.probeOnce('l1')
+  await m.probeOnce('l1')
+  assert.equal(writes(), 1, 'unchanged polls must not touch the disk')
+})
+
+test('the heartbeat of an unchanged link is still tracked, just in memory', async () => {
+  const { d, cfg } = mkCountingDeps([rec()])
+  const m = new LinkManager(d, { fetchImpl: helloOk })
+  await m.probeOnce('l1')
+  const persisted = cfg.links[0].lastSeenAt
+  await new Promise((r) => setTimeout(r, 5))
+  await m.probeOnce('l1')
+  // Nothing durable changed, so the stored record is untouched...
+  assert.equal(cfg.links[0].lastSeenAt, persisted)
+  // ...but the manager still knows when the host was last reachable.
+  assert.ok(m.lastSeenAt('l1')! >= persisted!)
+})
+
+test('a status change still persists immediately', async () => {
+  let up = true
+  const fetchImpl = async () => {
+    if (!up) throw new TypeError('fetch failed')
+    return helloOk()
+  }
+  const { d, cfg, writes } = mkCountingDeps([rec()])
+  const m = new LinkManager(d, { fetchImpl: fetchImpl as typeof fetch })
+  await m.probeOnce('l1')
+  assert.equal(writes(), 1)
+  await m.probeOnce('l1')
+  assert.equal(writes(), 1)
+  up = false
+  await m.probeOnce('l1')
+  assert.equal(writes(), 2, 'a transition to unreachable must reach the disk')
+  assert.equal(cfg.links[0].status, 'unreachable')
+})
+
+test('a machineId change persists immediately — the anti-hijack latch is never in-memory-only', async () => {
+  let machine = 'm1'
+  const fetchImpl = (async () => new Response(JSON.stringify({
+    machineId: machine, machineName: 'workstation', appVersion: '1.11.2',
+    linkApiVersions: [1], capabilities: ['models:use'],
+  }), { status: 200, headers: { 'content-type': 'application/json' } })) as unknown as typeof fetch
+  const { d, cfg, writes } = mkCountingDeps([rec()])
+  const m = new LinkManager(d, { fetchImpl })
+  await m.probeOnce('l1')
+  const before = writes()
+  machine = 'stranger'
+  await m.probeOnce('l1')
+  assert.equal(writes(), before + 1)
+  assert.equal(cfg.links[0].machineIdChanged, true)
+})
+
+test('a capability change persists immediately, so a host-side edit self-heals on disk', async () => {
+  let caps = ['models:use']
+  const fetchImpl = (async () => new Response(JSON.stringify({
+    machineId: 'm1', machineName: 'workstation', appVersion: '1.11.2',
+    linkApiVersions: [1], capabilities: caps,
+  }), { status: 200, headers: { 'content-type': 'application/json' } })) as unknown as typeof fetch
+  const { d, cfg, writes } = mkCountingDeps([rec()])
+  const m = new LinkManager(d, { fetchImpl })
+  await m.probeOnce('l1')
+  const before = writes()
+  caps = ['models:use', 'models:load']
+  await m.probeOnce('l1')
+  assert.equal(writes(), before + 1)
+  assert.deepEqual(cfg.links[0].grantedCapabilities, ['models:use', 'models:load'])
+})

@@ -41,11 +41,19 @@ export interface LinkRecord {
   baseUrl: string
   token: string
   machineId: string | null
+  /** LATCHED anti-hijack flag: this URL answered as a different machine than the one the
+   *  user linked. Set on the probe that saw the change and NEVER cleared by a later probe
+   *  — only by an explicit user acknowledgement (PATCH { acknowledgeMachineChange: true }).
+   *  A warning that the next successful poll erases is not a warning; the peer keeps
+   *  talking to whatever now answers that URL until a human says that is fine.
+   *  Optional so an existing config.json needs no migration; absent means false. */
+  machineIdChanged?: boolean
   grantedCapabilities: LinkCapability[]
   linkApiVersion: number | null
   status: LinkStatus
   lastSeenAt: string | null
-  /** Human-readable reason for the current non-online status. */
+  /** Human-readable reason for the current non-online status — or, when
+   *  `machineIdChanged` is latched, for an ONLINE one. */
   lastError: string | null
 }
 
@@ -64,6 +72,7 @@ export function redactLink(rec: LinkRecord): RedactedLinkRecord {
     name: rec.name,
     baseUrl: rec.baseUrl,
     machineId: rec.machineId,
+    machineIdChanged: rec.machineIdChanged ?? false,
     grantedCapabilities: rec.grantedCapabilities,
     linkApiVersion: rec.linkApiVersion,
     status: rec.status,
