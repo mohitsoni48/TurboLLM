@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { Hono } from 'hono'
 import { registerLinkAdminRoutes } from './link-admin-routes'
 import { decodeLinkString, encodeLinkString } from '../link/link-string'
+import { LINK_PRESETS } from '../link/capabilities'
 import { Emitter } from '../telemetry/emit'
 import { readQueue } from '../telemetry/queue'
 import type { Deps } from '../deps'
@@ -300,6 +301,47 @@ test('mint emits link_minted with the capability count, never the token or capab
     const text = JSON.stringify(events)
     assert.ok(!text.includes('tllm-'))
     assert.ok(!/models:/.test(text))
+  } finally {
+    cleanup()
+  }
+})
+
+// Regression guard for the review finding: the mint route's telemetry-preset
+// validation must accept EXACTLY the domain preset names (`link/capabilities.ts`'s
+// `LINK_PRESETS`, the record actually used to expand a preset into capabilities), not
+// a separately-hand-maintained copy. If a fourth preset were ever added there without
+// this test, it would fail here rather than silently drift out of validation.
+test('mint accepts a preset name for every real domain preset, and echoes it into link_minted', async () => {
+  for (const presetName of Object.keys(LINK_PRESETS)) {
+    const { telemetry, dir, cleanup } = mkTelemetry()
+    try {
+      const { app } = mkApp(undefined, telemetry)
+      const caps = LINK_PRESETS[presetName as keyof typeof LINK_PRESETS]
+      const res = await app.request('/api/v1/links/mint', json({ name: 'x', capabilities: caps, preset: presetName }))
+      assert.equal(res.status, 200)
+      const minted = readQueue(dir)
+        .map((q) => q.event as { event: string; payload?: Record<string, unknown> })
+        .filter((e) => e.event === 'link_minted')
+      assert.equal(minted.length, 1)
+      assert.deepEqual(minted[0].payload, { capabilityCount: caps.length, preset: presetName })
+    } finally {
+      cleanup()
+    }
+  }
+})
+
+test('mint drops an unrecognized preset name instead of forwarding it to telemetry', async () => {
+  const { telemetry, dir, cleanup } = mkTelemetry()
+  try {
+    const { app } = mkApp(undefined, telemetry)
+    const res = await app.request('/api/v1/links/mint',
+      json({ name: 'x', capabilities: ['models:use'], preset: 'made-up-preset' }))
+    assert.equal(res.status, 200)
+    const minted = readQueue(dir)
+      .map((q) => q.event as { event: string; payload?: Record<string, unknown> })
+      .filter((e) => e.event === 'link_minted')
+    assert.equal(minted.length, 1)
+    assert.deepEqual(minted[0].payload, { capabilityCount: 1 }, 'no preset field at all — never a made-up value')
   } finally {
     cleanup()
   }

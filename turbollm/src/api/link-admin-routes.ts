@@ -7,8 +7,9 @@ import { applyProbeResult } from '../link/apply-probe'
 import { LinkClient } from '../link/link-client'
 import { decodeLinkString, encodeLinkString } from '../link/link-string'
 import { LINK_CAPABILITIES, redactLink, type LinkCapability, type LinkRecord } from '../link/types'
+import { LINK_PRESETS } from '../link/capabilities'
 import { emit } from '../telemetry/runtime/typed-emit'
-import { linkMinted, linkAdded, LINK_PRESETS, LINK_ADDED_OUTCOMES } from '../telemetry/events/link'
+import { linkMinted, linkAdded, LINK_ADDED_OUTCOMES } from '../telemetry/events/link'
 
 /** Turbo Link admin surface, on the NORMAL /api/v1 API — this is the user's own browser
  *  talking to their own daemon, so it is governed by lanAuth like everything else. The
@@ -89,8 +90,8 @@ export function registerLinkAdminRoutes(
     // never widen a grant. `d.telemetry` is optional (absent under tests, same
     // convention as tunnel/gate/links), so this must be a no-op when unset.
     if (d.telemetry) {
-      const preset = typeof body?.preset === 'string' && (LINK_PRESETS as readonly string[]).includes(body.preset)
-        ? (body.preset as (typeof LINK_PRESETS)[number])
+      const preset = typeof body?.preset === 'string' && Object.prototype.hasOwnProperty.call(LINK_PRESETS, body.preset)
+        ? (body.preset as keyof typeof LINK_PRESETS)
         : undefined
       emit(d.telemetry, linkMinted, { capabilityCount: caps.length, ...(preset ? { preset } : {}) })
     }

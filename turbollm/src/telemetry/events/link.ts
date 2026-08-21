@@ -14,13 +14,17 @@
  *  this on the serialized payload text, not a parsed object. */
 
 import { defineEvent, f } from '../core/define'
+import { LINK_PRESETS } from '../../link/capabilities'
 
-/** Mirrors `link/capabilities.ts`'s `LINK_PRESETS` keys — declared locally
- *  rather than imported at runtime, same convention as `gateway.ts`'s
- *  `HARNESSES`: an event's field vocabulary is a frozen registry fact, kept
- *  in sync by hand with its feature-code source, not re-derived from code
- *  that can change independently of what's already been reported. */
-export const LINK_PRESETS = ['inference', 'server', 'full'] as const
+/** The preset names, derived from `link/capabilities.ts`'s `LINK_PRESETS` record —
+ *  the actual domain source of truth used to expand a preset into capabilities —
+ *  rather than a second, telemetry-owned copy of the same three strings. A prior
+ *  version of this file duplicated the list by hand (wrongly citing `gateway.ts`'s
+ *  `HARNESSES` as precedent: that vocabulary has NO other domain source, so telemetry
+ *  genuinely owns it there — not the case here, where `link/capabilities.ts` already
+ *  existed first). `link-admin-routes.ts`'s mint validation imports `LINK_PRESETS`
+ *  directly from the same domain module, so both sides can only ever see the same set. */
+export const LINK_PRESET_NAMES = Object.keys(LINK_PRESETS) as [keyof typeof LINK_PRESETS, ...(keyof typeof LINK_PRESETS)[]]
 
 export const linkMinted = defineEvent({
   name: 'link_minted',
@@ -31,7 +35,7 @@ export const linkMinted = defineEvent({
   payload: {
     capabilityCount: f.int({ min: 0 }),
     // Absent when the token was built via "Customize" rather than a one-click preset.
-    preset: f.enum(LINK_PRESETS, { optional: true }),
+    preset: f.enum(LINK_PRESET_NAMES, { optional: true }),
   },
 })
 
