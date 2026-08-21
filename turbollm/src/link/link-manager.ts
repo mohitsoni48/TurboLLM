@@ -1,6 +1,6 @@
 import type { Deps } from '../deps'
+import { applyProbeResult } from './apply-probe'
 import { LinkClient } from './link-client'
-import { describeStatus, nextStatus } from './link-state'
 import type { LinkRecord } from './types'
 
 const DEFAULT_INTERVAL_MS = 15_000
@@ -52,26 +52,11 @@ export class LinkManager {
     const rec = this.get(id)
     if (!rec) return
     const probe = await new LinkClient(rec, { fetchImpl: this.fetchImpl }).hello()
-    const status = nextStatus(rec.status, probe)
 
     this.d.store.update((cfg) => {
       const l = (cfg.links ?? []).find((x) => x.id === id)
       if (!l) return
-      l.status = status
-      if (probe.kind === 'ok') {
-        l.grantedCapabilities = probe.capabilities
-        l.linkApiVersion = probe.version
-        l.lastSeenAt = new Date().toISOString()
-        // A changed machineId means this URL now serves a DIFFERENT box. Flag it loudly
-        // rather than silently adopting it — a reused tunnel hostname must not let a
-        // stranger's daemon inherit a link the user believes is their workstation.
-        l.lastError = l.machineId && l.machineId !== probe.machineId
-          ? `This URL now answers as a different machine than the one you linked.`
-          : null
-        l.machineId = probe.machineId
-      } else {
-        l.lastError = describeStatus(status, l.name)
-      }
+      applyProbeResult(l, probe)
     })
   }
 }

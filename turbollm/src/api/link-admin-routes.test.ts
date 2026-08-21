@@ -136,3 +136,84 @@ test('inbound lists granted keys with their capabilities and last-used, never a 
   assert.ok(body.includes('models:use'))
   assert.ok(!body.includes('hash'))
 })
+
+// ── Regression coverage: review findings on `models` validation and the
+// machineId-change latch (see apply-probe.ts).
+
+test('mint refuses a bare string for models instead of storing it (substring-matching escalation)', async () => {
+  const { app, cfg } = mkApp()
+  const res = await app.request('/api/v1/links/mint',
+    json({ name: 'x', capabilities: ['models:use'], models: 'somesubstring' }))
+  assert.equal(res.status, 400)
+  assert.equal((cfg.apiKeys as unknown[]).length, 0)
+})
+
+test('mint refuses a number for models', async () => {
+  const { app, cfg } = mkApp()
+  const res = await app.request('/api/v1/links/mint',
+    json({ name: 'x', capabilities: ['models:use'], models: 42 }))
+  assert.equal(res.status, 400)
+  assert.equal((cfg.apiKeys as unknown[]).length, 0)
+})
+
+test('mint refuses an array containing a non-string element for models', async () => {
+  const { app, cfg } = mkApp()
+  const res = await app.request('/api/v1/links/mint',
+    json({ name: 'x', capabilities: ['models:use'], models: ['qwen3', 42] }))
+  assert.equal(res.status, 400)
+  assert.equal((cfg.apiKeys as unknown[]).length, 0)
+})
+
+test('mint accepts an empty array for models — legal, means "all models"', async () => {
+  const { app, cfg } = mkApp()
+  const res = await app.request('/api/v1/links/mint',
+    json({ name: 'x', capabilities: ['models:use'], models: [] }))
+  assert.equal(res.status, 200)
+  const keys = cfg.apiKeys as { grant: { models?: string[] } }[]
+  assert.equal(keys.length, 1)
+  assert.equal(keys[0].grant.models, undefined)
+})
+
+test('mint accepts a valid array of model keys for models', async () => {
+  const { app, cfg } = mkApp()
+  const res = await app.request('/api/v1/links/mint',
+    json({ name: 'x', capabilities: ['models:use'], models: ['qwen3-30b'] }))
+  assert.equal(res.status, 200)
+  const keys = cfg.apiKeys as { grant: { models?: string[] } }[]
+  assert.deepEqual(keys[0].grant.models, ['qwen3-30b'])
+})
+
+test('PATCH re-probe flags a machineId change instead of silently adopting it — the Kaggle relink path', async () => {
+  // A reused tunnel hostname must not let a stranger's daemon quietly inherit a link
+  // the user believes points at their own workstation (LinkManager.probeOnce enforces
+  // the same latch; the admin route must share the exact same logic, not a copy).
+  const first = async () => new Response(JSON.stringify({
+    machineId: 'ORIGINAL', machineName: 'workstation', appVersion: '1', linkApiVersions: [1],
+    capabilities: ['models:use'],
+  }), { status: 200, headers: { 'content-type': 'application/json' } })
+  const { app, cfg } = mkApp(first)
+  await app.request('/api/v1/links', json({ linkString: encodeLinkString('http://old:6996', 'tllm-a') }))
+  const id = (cfg.links as { id: string }[])[0].id
+  assert.equal((cfg.links as { machineId: string | null }[])[0].machineId, 'ORIGINAL')
+
+  // Re-register routes against the SAME cfg/store, now with a hello() answering as a
+  // different machineId — exactly what a reused Kaggle tunnel hostname looks like — and
+  // drive the PATCH re-probe through it.
+  const second = async () => new Response(JSON.stringify({
+    machineId: 'DIFFERENT', machineName: 'stranger', appVersion: '1', linkApiVersions: [1],
+    capabilities: ['models:use'],
+  }), { status: 200, headers: { 'content-type': 'application/json' } })
+  const appPatched = new Hono()
+  registerLinkAdminRoutes(appPatched, {
+    version: '1.11.2',
+    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
+  } as unknown as Deps, { fetchImpl: second })
+  const res = await appPatched.request(`/api/v1/links/${id}`, {
+    method: 'PATCH', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ baseUrl: 'https://new-tunnel.trycloudflare.com' }),
+  })
+  assert.equal(res.status, 200)
+  const l = (cfg.links as { machineId: string | null; lastError: string | null }[])[0]
+  assert.equal(l.machineId, 'DIFFERENT')
+  assert.match(l.lastError ?? '', /different machine/i)
+})

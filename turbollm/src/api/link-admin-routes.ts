@@ -3,8 +3,8 @@ import { randomUUID } from 'node:crypto'
 import { networkInterfaces } from 'node:os'
 import { generateApiKey } from '../auth'
 import type { Deps } from '../deps'
+import { applyProbeResult } from '../link/apply-probe'
 import { LinkClient } from '../link/link-client'
-import { nextStatus, describeStatus } from '../link/link-state'
 import { decodeLinkString, encodeLinkString } from '../link/link-string'
 import { LINK_CAPABILITIES, type LinkCapability, type LinkRecord } from '../link/types'
 
@@ -22,7 +22,7 @@ export function registerLinkAdminRoutes(
   // ── Host side: mint a scoped token for another machine.
   app.post('/api/v1/links/mint', async (c) => {
     const body = await c.req.json().catch(() => null) as
-      { name?: string; capabilities?: string[]; models?: string[] } | null
+      { name?: string; capabilities?: string[]; models?: unknown } | null
     const name = body?.name?.trim()
     const caps = body?.capabilities ?? []
     if (!name) return c.json({ error: { code: 'bad_request', message: 'A name is required.' } }, 400)
@@ -39,6 +39,24 @@ export function registerLinkAdminRoutes(
         400,
       )
     }
+    // `models` MUST be validated as an array of non-empty strings, not merely truthy-
+    // `.length`-checked — a bare string also has `.length`, and if one slipped through
+    // into grant.models, capabilities.ts's `allowsModel` (Array.prototype.includes) would
+    // never see it, but a caller who later stores a string there would silently get
+    // String.prototype.includes' SUBSTRING semantics instead of exact match, widening a
+    // token meant to be scoped to one model into "any model key containing this text".
+    // An absent or empty array stays legal and means "every local model" (unchanged).
+    const rawModels = body?.models
+    let models: string[] | undefined
+    if (rawModels !== undefined) {
+      if (!Array.isArray(rawModels) || rawModels.some((m) => typeof m !== 'string' || m.trim() === '')) {
+        return c.json(
+          { error: { code: 'bad_request', message: 'models must be an array of model keys.' } },
+          400,
+        )
+      }
+      models = rawModels
+    }
 
     const { full, hash, prefix } = generateApiKey()
     const keyId = randomUUID()
@@ -52,7 +70,7 @@ export function registerLinkAdminRoutes(
         lastUsedAt: null,
         grant: {
           capabilities: caps as LinkCapability[],
-          ...(body?.models?.length ? { models: body.models } : {}),
+          ...(models && models.length ? { models } : {}),
         },
       })
     })
@@ -147,28 +165,20 @@ export function registerLinkAdminRoutes(
     return (d.store.snapshot().links ?? []).find((l) => l.id === id)
   }
 
-  /** Single-link probe. Duplicates LinkManager.probeOnce deliberately little: the admin
-   *  routes must work in tests where no LinkManager is wired (same optional-dep
-   *  convention as tunnel/gate), so it goes through LinkClient directly. */
+  /** Single-link probe. Constructs its own `LinkClient` (deliberately NOT going through
+   *  `LinkManager`, which is optional and absent in these tests — same optional-dep
+   *  convention as tunnel/gate), but the actual record-mutation logic — including the
+   *  machineId-change protection — lives in ONE place, `applyProbeResult`, shared with
+   *  `LinkManager.probeOnce`, so the two call sites cannot drift again. */
   async function probe(id: string): Promise<void> {
     const rec = current(id)
     if (!rec) return
     const p = await new LinkClient(rec, { fetchImpl }).hello()
-    const status = nextStatus(rec.status, p)
     d.store.update((cfg) => {
       const l = (cfg.links ?? []).find((x) => x.id === id)
       if (!l) return
-      l.status = status
-      if (p.kind === 'ok') {
-        l.grantedCapabilities = p.capabilities
-        l.linkApiVersion = p.version
-        l.machineId = p.machineId
-        l.lastSeenAt = new Date().toISOString()
-        l.lastError = null
-        if (p.raw?.machineName) l.name = p.raw.machineName
-      } else {
-        l.lastError = describeStatus(status, l.name)
-      }
+      applyProbeResult(l, p)
+      if (p.kind === 'ok' && p.raw?.machineName) l.name = p.raw.machineName
     })
   }
 }
