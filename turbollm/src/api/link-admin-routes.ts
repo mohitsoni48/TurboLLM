@@ -5,6 +5,7 @@ import { generateApiKey, hostGate } from '../auth'
 import type { Context } from 'hono'
 import type { Deps } from '../deps'
 import { applyProbeResult } from '../link/apply-probe'
+import { isValidMachineName, uniqueMachineName } from '../link/machine-name'
 import { LinkClient } from '../link/link-client'
 import { decodeLinkString, encodeLinkString } from '../link/link-string'
 import { LINK_CAPABILITIES, redactLink, type LinkCapability, type LinkRecord } from '../link/types'
@@ -197,7 +198,14 @@ export function registerLinkAdminRoutes(
     }
     const rec: LinkRecord = {
       id: randomUUID(),
-      name: new URL(decoded.baseUrl).hostname,
+      // A URL hostname cannot contain `/`, but it CAN duplicate an existing link's name
+      // (two tunnels on the same domain, two boxes both called `localhost`), and a
+      // duplicate name makes two links share one qualified-id namespace. Uniquified here,
+      // at the one moment the seed name is assigned. See machine-name.ts.
+      name: uniqueMachineName(
+        new URL(decoded.baseUrl).hostname,
+        (d.store.snapshot().links ?? []).map((l) => l.name),
+      ),
       baseUrl: decoded.baseUrl,
       token: decoded.token,
       machineId: null,
@@ -233,6 +241,35 @@ export function registerLinkAdminRoutes(
     const body = await c.req.json().catch(() => null) as
       { baseUrl?: string; name?: string; acknowledgeMachineChange?: boolean } | null
     if (!current(id)) return c.json({ error: { code: 'not_found', message: 'No such link.' } }, 404)
+    if (body?.name !== undefined) {
+      // Refused, never silently rewritten: a human typed this, and quietly turning
+      // `lab/rig` into `lab-rig` behind their back is worse than saying it is not allowed.
+      // `/` is barred because the name becomes the machine segment of every qualified
+      // `<machine>/<model>` id (machine-name.ts); a duplicate is barred because
+      // `RemoteCatalog.linkByName` takes the FIRST case-insensitive match, so two links
+      // sharing a name silently answer for each other.
+      if (!isValidMachineName(body.name)) {
+        return c.json(
+          {
+            error: {
+              code: 'bad_request',
+              message: "A machine name cannot be empty or contain '/' or '\\'.",
+            },
+          },
+          400,
+        )
+      }
+      const wanted = body.name.trim().toLowerCase()
+      const clash = (d.store.snapshot().links ?? []).some(
+        (l) => l.id !== id && l.name.trim().toLowerCase() === wanted,
+      )
+      if (clash) {
+        return c.json(
+          { error: { code: 'bad_request', message: `Another linked machine is already called '${body.name.trim()}'.` } },
+          400,
+        )
+      }
+    }
     if (body?.baseUrl) {
       try {
         const u = new URL(body.baseUrl)
@@ -245,7 +282,7 @@ export function registerLinkAdminRoutes(
       const l = (cfg.links ?? []).find((x) => x.id === id)
       if (!l) return
       if (body?.baseUrl) l.baseUrl = body.baseUrl.replace(/\/+$/, '')
-      if (body?.name) l.name = body.name
+      if (body?.name) l.name = body.name.trim()
       // The ONLY way the anti-hijack latch clears: a human looked at the warning and
       // said this machine is the one they meant. No probe result ever clears it.
       if (body?.acknowledgeMachineChange) {
@@ -282,7 +319,7 @@ export function registerLinkAdminRoutes(
     d.store.update((cfg) => {
       const l = (cfg.links ?? []).find((x) => x.id === id)
       if (!l) return
-      applyProbeResult(l, p)
+      applyProbeResult(l, p, (cfg.links ?? []).filter((x) => x.id !== id).map((x) => x.name))
     })
   }
 }

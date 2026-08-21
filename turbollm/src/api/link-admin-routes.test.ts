@@ -579,3 +579,59 @@ test('GET /api/v1/links/models carries the same host gate as the rest of this su
   const res = await app.request('/api/v1/links/models', { headers: { 'x-forwarded-for': '10.0.0.9' } })
   assert.equal(res.status, 403)
 })
+
+// ── Link names are a routing surface, not decoration (final-review C-2 / M-1) ──────────
+// A link's display name is the machine segment of every qualified `<machine>/<model>` id.
+// A `/` in it turns `lab/rig/Qwen3-35B` into machine `lab` (parseRemoteId splits on the
+// FIRST slash), which names no link, so the id falls through to the router's LOCAL
+// substring resolution and a local model answers with the wrong weights and no error.
+
+test('a hostile machineName from the handshake cannot carry the id separator', async () => {
+  const hello = async () => new Response(JSON.stringify({
+    machineId: 'm1', machineName: 'lab/rig', appVersion: '1', linkApiVersions: [1], capabilities: ['models:use'],
+  }), { status: 200, headers: { 'content-type': 'application/json' } })
+  const { app, cfg } = mkApp(hello)
+  await app.request('/api/v1/links', json({ linkString: encodeLinkString('http://h:6996', 'tllm-a') }))
+  const l = (cfg.links as { name: string }[])[0]
+  assert.equal(l.name, 'lab-rig')
+  assert.ok(!l.name.includes('/'))
+})
+
+test('two hosts reporting the SAME machineName get distinct link names', async () => {
+  const hello = async () => new Response(JSON.stringify({
+    machineId: 'm1', machineName: 'kaggle', appVersion: '1', linkApiVersions: [1], capabilities: ['models:use'],
+  }), { status: 200, headers: { 'content-type': 'application/json' } })
+  const { app, cfg } = mkApp(hello)
+  await app.request('/api/v1/links', json({ linkString: encodeLinkString('http://a:6996', 'tllm-a') }))
+  await app.request('/api/v1/links', json({ linkString: encodeLinkString('http://b:6996', 'tllm-b') }))
+  const names = (cfg.links as { name: string }[]).map((l) => l.name)
+  assert.deepEqual(names, ['kaggle', 'kaggle (2)'])
+})
+
+test('PATCH refuses a name containing the id separator instead of storing it', async () => {
+  const { app, cfg } = mkApp(async () => { throw new Error('x') })
+  await app.request('/api/v1/links', json({ linkString: encodeLinkString('http://h:6996', 'tllm-a') }))
+  const id = (cfg.links as { id: string }[])[0].id
+  const before = (cfg.links as { name: string }[])[0].name
+  for (const bad of ['lab/rig', 'lab\\rig', '   ']) {
+    const res = await app.request(`/api/v1/links/${id}`, {
+      method: 'PATCH', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: bad }),
+    })
+    assert.equal(res.status, 400)
+  }
+  assert.equal((cfg.links as { name: string }[])[0].name, before)
+})
+
+test('PATCH refuses a name another link already answers to', async () => {
+  const { app, cfg } = mkApp(async () => { throw new Error('x') })
+  await app.request('/api/v1/links', json({ linkString: encodeLinkString('http://a:6996', 'tllm-a') }))
+  await app.request('/api/v1/links', json({ linkString: encodeLinkString('http://b:6996', 'tllm-b') }))
+  const links = cfg.links as { id: string; name: string }[]
+  const res = await app.request(`/api/v1/links/${links[1].id}`, {
+    method: 'PATCH', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: links[0].name.toUpperCase() }),
+  })
+  assert.equal(res.status, 400)
+  assert.notEqual(links[1].name.toLowerCase(), links[0].name.toLowerCase())
+})

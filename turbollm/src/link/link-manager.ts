@@ -110,14 +110,19 @@ export class LinkManager {
     // The decision is made by running the SAME `applyProbeResult` against a copy — never
     // a second, hand-written notion of what a probe changes, which is exactly the drift
     // Ruling 7 closed.
+    // Sibling names, so a first-handshake adopt cannot collide with a link that already
+    // answers to that name (machine-name.ts). Computed from the same snapshot the copy
+    // below is made from, and recomputed inside the update so the persisted decision is
+    // made against the config actually being written.
+    const siblings = (this.d.store.snapshot().links ?? []).filter((l) => l.id !== id).map((l) => l.name)
     const next: LinkRecord = { ...rec, grantedCapabilities: [...rec.grantedCapabilities] }
-    applyProbeResult(next, probe)
+    applyProbeResult(next, probe, siblings)
     if (durableChange(rec, next)) {
       this.heartbeats.delete(id)
       this.d.store.update((cfg) => {
         const l = (cfg.links ?? []).find((x) => x.id === id)
         if (!l) return
-        applyProbeResult(l, probe)
+        applyProbeResult(l, probe, (cfg.links ?? []).filter((x) => x.id !== id).map((x) => x.name))
       })
     } else if (next.lastSeenAt && next.lastSeenAt !== rec.lastSeenAt) {
       // Nothing but the heartbeat moved — keep it in memory (see `lastSeenAt`).

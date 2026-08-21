@@ -15,6 +15,7 @@ import {
 } from '../api/download-lifecycle'
 import { allowsModel, hasCapability } from './capabilities'
 import { canWake, hostIdleState } from './host-idle'
+import { FALLBACK_MACHINE_NAME, sanitizeMachineName } from './machine-name'
 import { LINK_API_VERSIONS } from './protocol'
 import { LINK_CAPABILITIES, redactDownload, type HelloResponse } from './types'
 import { emit } from '../telemetry/runtime/typed-emit'
@@ -49,12 +50,17 @@ export function machineId(d: Deps): string {
  *  links. `os.hostname()` is cross-platform and needs no configuration; the constant
  *  survives only as a last resort for the (theoretical) empty-hostname case. */
 export function resolveMachineName(configured: string | undefined): string {
+  // Sanitised at the source, not just on adoption. A peer that trusts this field turns it
+  // into the machine segment of every qualified `<machine>/<model>` id, and `/` there
+  // sends the id into the peer's LOCAL substring resolution (machine-name.ts). A hostname
+  // cannot contain `/`, but `daemon.machineName` is a free-text field — and a peer running
+  // an older build has no sanitiser of its own, so the honest fix is to never emit one.
   const chosen = configured?.trim()
-  if (chosen) return chosen
+  if (chosen) return sanitizeMachineName(chosen)
   try {
-    return hostname().trim() || 'TurboLLM'
+    return sanitizeMachineName(hostname())
   } catch {
-    return 'TurboLLM'
+    return FALLBACK_MACHINE_NAME
   }
 }
 
