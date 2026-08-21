@@ -6,8 +6,22 @@
 // `retry: false` plus the `?? []` at the call site is what turns that 403, and a daemon
 // too old to know the route, into "no links" rather than an error banner on a screen that
 // has nothing to do with Turbo Link.
-import { useQuery } from '@tanstack/react-query'
-import { getLinkStatus, listLinks, listRemoteModels, type LinkRecord, type LinkRecordId, type RemoteStatus } from './link-api'
+import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  cancelRemoteDownload,
+  getLinkStatus,
+  listLinks,
+  listRemoteDownloads,
+  listRemoteModels,
+  remoteLoad,
+  remoteUnload,
+  startRemoteDownload,
+  type LinkRecord,
+  type LinkRecordId,
+  type LinkSummary,
+  type RemoteDownload,
+  type RemoteStatus,
+} from './link-api'
 import type { RemoteModelRow } from './remote-models'
 
 /** Poll cadence, matching the daemon's own link heartbeat: the server refreshes each
@@ -55,4 +69,133 @@ export function useLinkStatus(linkId: string | null) {
     refetchIntervalInBackground: false,
     retry: false,
   })
+}
+
+/** How often a linked host's download queue is re-read. Slower than the local 1.5 s poll on
+ *  purpose: each tick is a real network round-trip to another machine, multiplied by the
+ *  number of online links, and a progress bar that updates every 4 s is fine while a
+ *  multi-gigabyte transfer runs. */
+const REMOTE_DOWNLOAD_POLL_MS = 4_000
+
+/** Every online link's download queue, fanned out one query per link.
+ *
+ *  The fan-out lives HERE rather than in the Downloads screen deliberately: it is
+ *  concurrency plus per-machine error isolation, which is exactly the kind of logic the
+ *  dispatch says must not sit in a component. One machine being slow, unreachable, or
+ *  refusing for want of `downloads:read` leaves the others' rows on screen — each query
+ *  fails alone.
+ *
+ *  Only ONLINE links are queried at all. A non-online link contributes no rows by the same
+ *  rule `mergeFleet` enforces, so polling it would be a request per tick that could only
+ *  ever fail — and `retry: false` keeps even that single attempt from becoming a hang.
+ */
+export function useRemoteDownloads(links: LinkSummary[]) {
+  const online = links.filter((l) => l.status === 'online')
+  const results = useQueries({
+    queries: online.map((l) => ({
+      queryKey: ['link-downloads', l.id],
+      queryFn: () => listRemoteDownloads(l.id as LinkRecordId),
+      refetchInterval: REMOTE_DOWNLOAD_POLL_MS,
+      refetchIntervalInBackground: false,
+      retry: false,
+    })),
+  })
+  // Flattened and tagged with the link id, so the shape matches what `sourcesByLink` takes
+  // and the component never has to know a fan-out happened.
+  const rows: (RemoteDownload & { linkId: string })[] = []
+  online.forEach((l, i) => {
+    for (const d of results[i]?.data ?? []) rows.push({ ...d, linkId: l.id })
+  })
+  return {
+    rows,
+    /** Per-link failure, for the machine header. A machine whose queue could not be read
+     *  must say so — an unreadable queue and an empty one look identical otherwise. */
+    errorByLink: new Map(online.map((l, i) => [l.id, results[i]?.error ?? null])),
+    isLoading: results.some((r) => r.isLoading),
+  }
+}
+
+/** Invalidate everything a remote action can change. The load/unload/start routes answer
+ *  202 — QUEUED, not done — so the real feedback comes from the next status/downloads poll;
+ *  these invalidations just stop that first poll being up to a full interval away. */
+function useFleetInvalidation() {
+  const qc = useQueryClient()
+  return () => {
+    void qc.invalidateQueries({ queryKey: ['link-status'] })
+    void qc.invalidateQueries({ queryKey: ['link-models'] })
+    void qc.invalidateQueries({ queryKey: ['link-downloads'] })
+  }
+}
+
+/** Load / unload a model on a linked host.
+ *
+ *  Both resolve on the host's 202, which means QUEUED. Nothing here waits for the model to
+ *  actually come up — `useLinkStatus` reports that — so a slow load never blocks the UI and
+ *  an unreachable host fails as a typed 503 rather than a spinner that never resolves. */
+export function useRemoteModelActions() {
+  const invalidate = useFleetInvalidation()
+  return {
+    load: useMutation({
+      mutationFn: (v: { linkId: string; modelKey: string }) =>
+        remoteLoad(v.linkId as LinkRecordId, v.modelKey),
+      onSuccess: invalidate,
+    }),
+    unload: useMutation({
+      mutationFn: (v: { linkId: string }) => remoteUnload(v.linkId as LinkRecordId),
+      onSuccess: invalidate,
+    }),
+  }
+}
+
+/** Start / cancel a download on a linked host. The host owns the queue, the concurrency cap
+ *  and the repo/filename validation; this only asks. */
+export function useRemoteDownloadActions() {
+  const invalidate = useFleetInvalidation()
+  return {
+    start: useMutation({
+      mutationFn: (v: { linkId: string; repo: string; rfilename: string; size?: number; sha256?: string }) =>
+        startRemoteDownload(v.linkId as LinkRecordId, {
+          repo: v.repo,
+          rfilename: v.rfilename,
+          ...(v.size !== undefined ? { size: v.size } : {}),
+          ...(v.sha256 !== undefined ? { sha256: v.sha256 } : {}),
+        }),
+      onSuccess: invalidate,
+    }),
+    cancel: useMutation({
+      mutationFn: (v: { linkId: string; downloadId: string }) =>
+        cancelRemoteDownload(v.linkId as LinkRecordId, v.downloadId),
+      onSuccess: invalidate,
+    }),
+  }
+}
+
+/** Every online link's live engine/model state, one query per link.
+ *
+ *  Same fan-out shape (and same reasons) as `useRemoteDownloads`: per-machine isolation, and
+ *  only online links are asked at all. Feeds the Engines screen's read-only remote rows.
+ *
+ *  Polls on the link cadence rather than `useLinkStatus`'s 3 s: that hook exists for the ONE
+ *  host a chat is actively pointed at, where "what is it generating right now" is the whole
+ *  point. A fleet list is a list — refreshing every machine's engine card every 3 s would be
+ *  a request per link per tick for a screen nobody is watching that closely. */
+export function useRemoteEngines(links: LinkSummary[]) {
+  const online = links.filter((l) => l.status === 'online')
+  const results = useQueries({
+    queries: online.map((l) => ({
+      queryKey: ['link-engine', l.id],
+      queryFn: () => getLinkStatus(l.id as LinkRecordId),
+      refetchInterval: LINK_POLL_MS,
+      refetchIntervalInBackground: false,
+      retry: false,
+    })),
+  })
+  return online.map((link, i) => ({
+    link,
+    status: results[i]?.data ?? null,
+    // A machine that refused (no `models:use`) or dropped must say so rather than sit on a
+    // spinner: `LinkClient` never throws by contract, so this is always a typed answer.
+    error: results[i]?.error ?? null,
+    isLoading: results[i]?.isLoading ?? false,
+  }))
 }

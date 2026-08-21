@@ -53,6 +53,8 @@ import type {
 } from '../lib/types'
 import { useUiStore } from '../stores/ui'
 import { ScreenHeader, InlineError } from '../components/common'
+import { RemoteEngines } from './engines/RemoteEngines'
+import { useLinks } from '../lib/link-queries'
 import { StateChip } from '../components/StateChip'
 import { Badge } from '../components/ui/badge'
 import { Button } from '../components/ui/button'
@@ -414,6 +416,10 @@ export function EnginesScreen() {
   const backendsQ = useEngineBackends(provisioning)
   const logPanelOpen = useUiStore((s) => s.logPanelOpen)
   const setLogPanelOpen = useUiStore((s) => s.setLogPanelOpen)
+  // Soft read: `/api/v1/links` is host-gated, so a browser off-box 403s here. `retry: false`
+  // plus `?? []` turns that — and a daemon too old to know the route — into "no links"
+  // rather than an error banner on a screen that is mostly about local engines.
+  const linksQ = useLinks()
 
   const list = enginesQ.data
   const activeId = list?.activeEngineId ?? ''
@@ -451,7 +457,12 @@ export function EnginesScreen() {
           />
         )}
 
-        {/* Zone 3 — Diagnostics: live engine log, collapsed out of the main flow. */}
+        {/* Zone 3 — the fleet's other machines, READ-ONLY (ADR-139). Renders nothing at
+            all when this install has no links, so the screen is unchanged for everyone who
+            has not set Turbo Link up. */}
+        <RemoteEngines links={linksQ.data ?? []} />
+
+        {/* Zone 4 — Diagnostics: live engine log, collapsed out of the main flow. */}
         {activeEngine && <EngineLogPanel open={logPanelOpen} onOpenChange={setLogPanelOpen} />}
       </div>
     </div>

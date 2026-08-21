@@ -38,6 +38,11 @@ const AUTH_KEY = 'tllm.authToken'
 export class ApiError extends Error {
   code: string
   status: number
+  /** The capability a 403 named, when it named one (Turbo Link's peer-side admin proxy
+   *  relays the host's `error.capability` — see link-admin-routes.ts). Optional and unset
+   *  everywhere else; `describeRemoteFailure` is the only reader. Kept here rather than in
+   *  a subclass so the many `instanceof ApiError` checks across the app keep working. */
+  capability?: string
   constructor(code: string, message: string, status: number) {
     super(message)
     this.name = 'ApiError'

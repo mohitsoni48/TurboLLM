@@ -57,6 +57,21 @@ import {
   DialogTitle,
 } from '../components/ui/dialog'
 import { toast } from '../components/ui/sonner'
+import { mergeFleet, fleetMachines, type FleetMachine, type FleetOrigin, type FleetRow } from '../lib/fleet'
+import {
+  ALL_MACHINES,
+  filterByMachine,
+  machineOptions,
+  remoteModel,
+  remoteModelMatches,
+  sourcesByLink,
+  type FleetModel,
+  type MachineOption,
+} from '../lib/fleet-sources'
+import { useLinks, useRemoteModels, useRemoteModelActions } from '../lib/link-queries'
+import type { LinkSummary } from '../lib/link-api'
+import { MachineFilter, MachineNotes, OriginBadge } from '../components/fleet'
+import { RemoteModelRow } from './models/RemoteModelRow'
 import { ModelDetailDialog } from './models/ModelDetailDialog'
 import { DiscoverTab } from './models/DiscoverTab'
 import { HfRepoDialog } from './models/HfRepoDialog'
@@ -68,6 +83,15 @@ type Tab = 'library' | 'discover'
 /** A model name shared by 2+ quant variants renders as one row with a quant dropdown;
  *  a single-variant name is a plain row (spec 04 §2 / spec 11 §5). */
 type Group = { name: string; variants: ModelEntry[] }
+
+/** One row of the merged library. A LOCAL row is a whole quant `Group` (the existing
+ *  behaviour — several quants of one model collapse into a single row with a dropdown); a
+ *  REMOTE row is a single model.
+ *
+ *  Quants are deliberately NOT collapsed across machines. Two machines holding the same
+ *  Q4_K_M are two different things you can do — load it here, or load it there — and folding
+ *  them into one row would make the fleet's whole point invisible. */
+type LibRow = { kind: 'local'; group: Group } | { kind: 'remote'; model: FleetModel }
 
 /** Shared grid template so the column header and every row line up exactly. */
 const ROW_GRID: CSSProperties = { gridTemplateColumns: 'minmax(0,1fr) 104px 64px 52px 78px 148px' }
@@ -116,6 +140,9 @@ export function ModelsScreen() {
   const del = useDeleteModel()
   const { data: status } = useStatus()
   const { isPinned, togglePinned } = usePinnedModels()
+  const linksQ = useLinks()
+  const remoteModelsQ = useRemoteModels()
+  const remoteActions = useRemoteModelActions()
 
   // A load isn't instant: POST /load returns 202, then the engine spends seconds in
   // `starting` before `running`. Keep the Load buttons busy across that whole window.
@@ -147,6 +174,12 @@ export function ModelsScreen() {
   // "Find other quants": jump to the source repo when known, else Discover by name.
   const [discoverRepo, setDiscoverRepo] = useState<string | null>(null)
   const [presetSearch, setPresetSearch] = useState('')
+  // Which machine's rows to show. Defaults to everything: a fleet list that opened filtered
+  // would hide the very machines the feature exists to surface.
+  const [machineFilter, setMachineFilter] = useState<string>(ALL_MACHINES)
+  /** Remote action failures, keyed `<linkId>:<modelKey>` so two failing rows show two
+   *  different reasons rather than one shared banner. */
+  const [remoteFailures, setRemoteFailures] = useState<Record<string, unknown>>({})
   const onDiscover = (m: ModelEntry) => {
     if (m.sourceRepo) {
       setDiscoverRepo(m.sourceRepo)
@@ -184,6 +217,51 @@ export function ModelsScreen() {
     return true
   })
   const groups = groupModels(filtered, isPinned)
+
+  // ── Turbo Link: the rest of the fleet ────────────────────────────────────────
+  // Both reads are host-gated and soft (`retry: false` + `?? []`), so a browser off-box —
+  // or a daemon too old to know the routes — sees exactly the pre-Turbo-Link screen rather
+  // than an error banner.
+  const links: LinkSummary[] = linksQ.data ?? []
+  const remoteSources = sourcesByLink(links, remoteModelsQ.data ?? [], (r) => r.linkId).map((s) => ({
+    link: s.link,
+    rows: s.rows.map((r) => remoteModel(r.model)).filter((m) => remoteModelMatches(m, { q, facet: filter })),
+  }))
+  // The merge itself: local rows first, then each machine's block, order fully determined by
+  // the helper. Nothing here sorts.
+  const fleetRows = mergeFleet<LibRow>(
+    groups.map((g) => ({ kind: 'local' as const, group: g })),
+    remoteSources.map((s) => ({
+      link: s.link,
+      rows: s.rows.map((m) => ({ kind: 'remote' as const, model: m })),
+    })),
+  )
+  const visibleRows = filterByMachine(fleetRows, machineFilter)
+  // Machine headers come from the UNFILTERED sources, so selecting "All machines" still
+  // explains an offline machine that contributed nothing.
+  const machines = fleetMachines(remoteSources)
+  const machineOpts = machineOptions(links)
+
+  const linkFor = (linkId: string) => links.find((l) => l.id === linkId)
+
+  const onRemoteLoad = (linkId: string, modelKey: string) => {
+    track('models', 'load_remote_model')
+    remoteActions.load.mutate({ linkId, modelKey }, {
+      onError: (e) => setRemoteFailures((f) => ({ ...f, [`${linkId}:${modelKey}`]: e })),
+      onSuccess: () => setRemoteFailures((f) => {
+        const n = { ...f }; delete n[`${linkId}:${modelKey}`]; return n
+      }),
+    })
+  }
+  const onRemoteUnload = (linkId: string, modelKey: string) => {
+    track('models', 'unload_remote_model')
+    remoteActions.unload.mutate({ linkId }, {
+      onError: (e) => setRemoteFailures((f) => ({ ...f, [`${linkId}:${modelKey}`]: e })),
+      onSuccess: () => setRemoteFailures((f) => {
+        const n = { ...f }; delete n[`${linkId}:${modelKey}`]; return n
+      }),
+    })
+  }
 
   const onConfirmDelete = () => {
     const m = confirmDelete
@@ -274,7 +352,16 @@ export function ModelsScreen() {
           setShowIncompatible={setShowIncompatible}
           rescan={() => mut.rescan.mutate()}
           openFolders={() => setFoldersOpen(true)}
-          groups={groups}
+          rows={visibleRows}
+          machines={machines}
+          machineOpts={machineOpts}
+          machineFilter={machineFilter}
+          setMachineFilter={setMachineFilter}
+          linkFor={linkFor}
+          onRemoteLoad={onRemoteLoad}
+          onRemoteUnload={onRemoteUnload}
+          remoteBusy={remoteActions.load.isPending || remoteActions.unload.isPending}
+          remoteFailures={remoteFailures}
           setOpenKey={setOpenKey}
           setConfirmDelete={setConfirmDelete}
           onDiscover={onDiscover}
@@ -335,7 +422,16 @@ function LibraryTab({
   setShowIncompatible,
   rescan,
   openFolders,
-  groups,
+  rows,
+  machines,
+  machineOpts,
+  machineFilter,
+  setMachineFilter,
+  linkFor,
+  onRemoteLoad,
+  onRemoteUnload,
+  remoteBusy,
+  remoteFailures,
   setOpenKey,
   setConfirmDelete,
   onDiscover,
@@ -359,7 +455,16 @@ function LibraryTab({
   setShowIncompatible: (v: boolean) => void
   rescan: () => void
   openFolders: () => void
-  groups: Group[]
+  rows: FleetRow<LibRow>[]
+  machines: FleetMachine[]
+  machineOpts: MachineOption[]
+  machineFilter: string
+  setMachineFilter: (id: string) => void
+  linkFor: (linkId: string) => LinkSummary | undefined
+  onRemoteLoad: (linkId: string, modelKey: string) => void
+  onRemoteUnload: (linkId: string, modelKey: string) => void
+  remoteBusy: boolean
+  remoteFailures: Record<string, unknown>
   setOpenKey: (k: string | null) => void
   setConfirmDelete: (m: ModelEntry | null) => void
   onDiscover: (m: ModelEntry) => void
@@ -379,6 +484,7 @@ function LibraryTab({
   // Below md the wide six-column table would push its Load button ~350px off-screen,
   // so each model renders as a stacked card instead. Desktop keeps the aligned table.
   const isDesktop = useIsDesktop()
+  const hasLinks = machineOpts.length > 2
   const trackFilter = (f: Filter) => { track('models', 'filter_models'); setFilter(f) }
   const trackOpenFolders = () => { track('models', 'open_model_folders'); openFolders() }
   const trackRescan = () => { track('models', 'rescan_models'); rescan() }
@@ -411,6 +517,12 @@ function LibraryTab({
             ))}
           </div>
         )}
+        {/* Renders nothing at all when this install has no links. */}
+        <MachineFilter
+          options={machineOpts}
+          value={machineFilter}
+          onChange={(id) => { track('models', 'filter_models_by_machine'); setMachineFilter(id) }}
+        />
         <div className="ml-auto flex items-center gap-1.5">
           <Button variant="outline" size="sm" onClick={trackOpenFolders}>
             <FolderPlus size={14} />
@@ -440,6 +552,9 @@ function LibraryTab({
         </div>
       )}
 
+      {/* A linked machine that contributed no rows still says why. */}
+      <MachineNotes machines={machines} />
+
       {modelsQ.isLoading ? (
         <div className="flex flex-col gap-2">
           {[0, 1, 2].map((i) => (
@@ -448,7 +563,11 @@ function LibraryTab({
         </div>
       ) : modelsQ.isError ? (
         <InlineError message="Could not load models." onRetry={() => modelsQ.refetch()} screen="models" />
-      ) : models.length === 0 ? (
+      ) : models.length === 0 && rows.length === 0 ? (
+        // Guarded on the WHOLE fleet, not just this machine. Keyed on `models.length`
+        // alone, a machine with no local GGUFs but a linked machine full of them showed
+        // "No GGUF models found in your folders" and rendered no rows at all — the remote
+        // half was fetched, merged, and then thrown away by an empty state that predated it.
         <EmptyState
           icon={<Boxes size={24} />}
           message={
@@ -466,7 +585,7 @@ function LibraryTab({
             ) : undefined
           }
         />
-      ) : groups.length === 0 ? (
+      ) : rows.length === 0 ? (
         <EmptyState icon={<Search size={24} />} message="No models match your search or filter." />
       ) : (
         <div className="overflow-x-auto">
@@ -485,23 +604,51 @@ function LibraryTab({
                 <div />
               </div>
             )}
-            {groups.map((g) => (
-              <ModelRow
-                key={g.name.toLowerCase()}
-                group={g}
-                layout={isDesktop ? 'row' : 'card'}
-                onLoad={(key) => actions.load.mutate({ key })}
-                onEject={() => actions.eject.mutate()}
-                onTune={(key) => setOpenKey(key)}
-                onDelete={(m) => setConfirmDelete(m)}
-                onDiscover={onDiscover}
-                busy={loadBusy}
-                loadingKey={loadingKey}
-                ejecting={actions.eject.isPending}
-                isPinned={isPinned}
-                togglePinned={togglePinned}
-              />
-            ))}
+            {/* One list, in the order `mergeFleet` returned: this machine's rows first,
+                then each linked machine's block. The component only picks which row
+                renderer to use — it never decides the order or the membership. */}
+            {rows.map((r) => {
+              if (r.row.kind === 'local') {
+                return (
+                  <ModelRow
+                    key={`local:${r.row.group.name.toLowerCase()}`}
+                    group={r.row.group}
+                    origin={r.origin}
+                    showOrigin={hasLinks}
+                    layout={isDesktop ? 'row' : 'card'}
+                    onLoad={(key) => actions.load.mutate({ key })}
+                    onEject={() => actions.eject.mutate()}
+                    onTune={(key) => setOpenKey(key)}
+                    onDelete={(m) => setConfirmDelete(m)}
+                    onDiscover={onDiscover}
+                    busy={loadBusy}
+                    loadingKey={loadingKey}
+                    ejecting={actions.eject.isPending}
+                    isPinned={isPinned}
+                    togglePinned={togglePinned}
+                  />
+                )
+              }
+              // A remote ROW always carries a remote ORIGIN — `mergeFleet` pairs them — but
+              // the two are separate unions, so this narrows rather than casting.
+              if (r.origin.kind !== 'remote') return null
+              const { linkId } = r.origin
+              const { model } = r.row
+              return (
+                <RemoteModelRow
+                  key={`${linkId}:${model.key}`}
+                  model={model}
+                  origin={r.origin}
+                  link={linkFor(linkId)}
+                  layout={isDesktop ? 'row' : 'card'}
+                  rowGrid={ROW_GRID}
+                  onLoad={() => onRemoteLoad(linkId, model.key)}
+                  onUnload={() => onRemoteUnload(linkId, model.key)}
+                  busy={remoteBusy}
+                  failure={remoteFailures[`${linkId}:${model.key}`]}
+                />
+              )
+            })}
           </div>
         </div>
       )}
@@ -524,6 +671,8 @@ function useDeleteModel() {
  *  dropdown; the selected quant drives Size / Ctx / Speed / Load and the row actions. */
 function ModelRow({
   group,
+  origin,
+  showOrigin,
   layout = 'row',
   onLoad,
   onEject,
@@ -537,6 +686,13 @@ function ModelRow({
   togglePinned,
 }: {
   group: Group
+  /** Which machine this row came from. Always `local` here — the remote half is
+   *  `RemoteModelRow` — but it is threaded through so the origin column is rendered by the
+   *  same `OriginBadge` on both sides rather than hard-coded text on one. */
+  origin: FleetOrigin
+  /** Only shown once this install actually has links; a single-machine library has no
+   *  origin to disambiguate. */
+  showOrigin: boolean
   /** 'row' = the aligned desktop table row; 'card' = the mobile stacked card. */
   layout?: 'row' | 'card'
   onLoad: (key: string) => void
@@ -616,10 +772,13 @@ function ModelRow({
           </span>
         )}
       </div>
-      <div className="mt-0.5 truncate text-[12px] text-muted">
-        {m.arch}
-        {m.dir ? ` · ${m.dir}` : ''}
-        {loaded ? ' · running' : ''}
+      <div className="mt-0.5 flex items-center gap-2 truncate text-[12px] text-muted">
+        {showOrigin && <OriginBadge origin={origin} />}
+        <span className="truncate">
+          {m.arch}
+          {m.dir ? ` · ${m.dir}` : ''}
+          {loaded ? ' · running' : ''}
+        </span>
       </div>
     </div>
   )

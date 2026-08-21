@@ -78,6 +78,21 @@ function append(sentence: string, lastError: string | null): string {
   return extra ? `${sentence} ${extra}` : sentence
 }
 
+/** The sentence for "this link was not granted `cap`".
+ *
+ *  Exported because there are TWO places the user can meet this fact and they must not
+ *  drift: the pre-flight disabled control (below), and the post-flight 403 the host itself
+ *  returns when the two ends disagree about the grant (see `describeRemoteFailure` in
+ *  remote-failure.ts). The peer greys controls off the handshake, so reaching that 403 at
+ *  all means the handshake was stale — but the user should read the same explanation either
+ *  way, not two differently-worded ones for the same underlying problem.
+ *
+ *  Names BOTH the capability and the machine that would have to grant it, and says what to
+ *  do about it — this is the only place the user will ever learn any of it. */
+export function capabilityReason(cap: LinkCapability, name: string): string {
+  return `${CAPABILITY_VERB[cap]} ${name} needs the ${cap} permission, which this link was not granted. Mint a new link key on ${name} that includes ${cap}.`
+}
+
 /**
  * Is this action available on this row, and if not, what does the tooltip say?
  *
@@ -114,12 +129,7 @@ export function actionState(
   if (blocked) return { enabled: false, reason: blocked }
 
   if (!link.grantedCapabilities.includes(cap)) {
-    return {
-      enabled: false,
-      // Names BOTH the capability and the machine that would have to grant it, and says
-      // what to do about it — the tooltip is the only place the user will ever learn this.
-      reason: `${CAPABILITY_VERB[cap]} ${name} needs the ${cap} permission, which this link was not granted. Mint a new link key on ${name} that includes ${cap}.`,
-    }
+    return { enabled: false, reason: capabilityReason(cap, name) }
   }
 
   return { enabled: true }

@@ -30,12 +30,17 @@ async function request<T>(path: string, init?: RequestInit & { json?: unknown })
   const text = await res.text()
   const data = text ? safeJson(text) : undefined
   if (!res.ok) {
-    const env = data as { error?: { code?: string; message?: string } } | undefined
-    throw new ApiError(
+    const env = data as { error?: { code?: string; message?: string; capability?: string } } | undefined
+    const err = new ApiError(
       env?.error?.code ?? 'http_error',
       env?.error?.message ?? `Request failed with status ${res.status}.`,
       res.status,
     )
+    // The capability a host 403 named, carried through so the fleet screens can say WHICH
+    // permission is missing rather than a bare "forbidden". The proxy validates this against
+    // LINK_CAPABILITIES before relaying it, and `describeRemoteFailure` re-checks it.
+    if (typeof env?.error?.capability === 'string') err.capability = env.error.capability
+    throw err
   }
   return data as T
 }
@@ -220,4 +225,75 @@ export function deleteLink(id: LinkRecordId): Promise<{ ok: true }> {
  *  the shipped bug this function exists to make untypeable. */
 export function revokeInbound(id: ApiKeyId): Promise<{ ok: true }> {
   return request<{ ok: true }>(`/api/v1/keys/${encodeURIComponent(id)}`, { method: 'DELETE' })
+}
+
+/** One download as a linked host advertises it (GET /api/v1/links/:id/downloads).
+ *  Mirrors `RemoteDownload` in turbollm/src/link/types.ts.
+ *
+ *  Deliberately NARROWER than the local `DownloadRecord`: no `url`, no `dest`, no
+ *  `sha256`, and `name` is a bare filename rather than a path. That is not an oversight to
+ *  be "fixed" by adding them — `redactDownload` strips them on both sides of the wire
+ *  because they disclose the host's filesystem layout. `error` is a fixed string when the
+ *  download failed, never the host's own message. */
+export interface RemoteDownload {
+  id: string
+  name: string
+  repo: string
+  total: number
+  received: number
+  status: string
+  error: string | null
+  bytesPerSec: number
+  createdAt: string
+}
+
+/** Peer side: ask a linked host to load a model (POST /api/v1/links/:id/load).
+ *
+ *  Resolves on the host's 202 — the load is QUEUED there, not finished, exactly as a local
+ *  load is. The outcome arrives through `useLinkStatus` polling, the same way the local UI
+ *  learns a local load from `/api/v1/status`. A refusal is a typed ApiError whose `code`
+ *  (and `capability`, on a 403) distinguishes "not granted" from "host busy" from
+ *  "offline"; render it with `describeRemoteFailure`, never as a bare message. */
+export function remoteLoad(id: LinkRecordId, modelKey: string): Promise<{ ok: true }> {
+  return request<{ ok: true }>(`/api/v1/links/${encodeURIComponent(id)}/load`, {
+    method: 'POST',
+    json: { modelKey },
+  })
+}
+
+/** Peer side: ask a linked host to unload whatever it has loaded. */
+export function remoteUnload(id: LinkRecordId): Promise<{ ok: true }> {
+  return request<{ ok: true }>(`/api/v1/links/${encodeURIComponent(id)}/unload`, { method: 'POST' })
+}
+
+/** Peer side: one linked host's download queue.
+ *
+ *  A token without `downloads:read` is a NAMED 403 here, never an empty list — an empty
+ *  queue and an unreadable queue look identical on screen and send the user debugging the
+ *  wrong machine. */
+export function listRemoteDownloads(id: LinkRecordId): Promise<RemoteDownload[]> {
+  return request<{ downloads: RemoteDownload[] }>(
+    `/api/v1/links/${encodeURIComponent(id)}/downloads`,
+  ).then((r) => r.downloads)
+}
+
+/** Peer side: start a download ON the host. The host owns the real repo/filename
+ *  validation and the queue, so this sends only what it needs and lets it decide. */
+export function startRemoteDownload(
+  id: LinkRecordId,
+  input: { repo: string; rfilename: string; size?: number; sha256?: string },
+): Promise<{ ok: true }> {
+  return request<{ ok: true }>(`/api/v1/links/${encodeURIComponent(id)}/downloads`, {
+    method: 'POST',
+    json: input,
+  })
+}
+
+/** Peer side: cancel a download on the host — including one the host's own user started.
+ *  Downloads are host-owned; `downloads:write` is the grant that allows this. */
+export function cancelRemoteDownload(id: LinkRecordId, downloadId: string): Promise<{ ok: true }> {
+  return request<{ ok: true }>(
+    `/api/v1/links/${encodeURIComponent(id)}/downloads/${encodeURIComponent(downloadId)}`,
+    { method: 'DELETE' },
+  )
 }
