@@ -5,6 +5,7 @@ import type { Deps } from '../deps'
 import type { ApiKey } from '../config/config'
 import { linkAuth, requireCapability } from './link-auth'
 import { gatewayV1Handler } from '../gateway/gateway'
+import { buildModelStatus } from '../api/status-view'
 import { allowsModel, hasCapability } from './capabilities'
 import { canWake, hostIdleState } from './host-idle'
 import { LINK_API_VERSIONS } from './protocol'
@@ -108,6 +109,22 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
     const daemon = d.store.snapshot().daemon as { machineName?: string }
     return c.json({ machineName: resolveMachineName(daemon.machineName), models })
   })
+
+  /** Stats parity (spec §5.4). The host re-exports its EXISTING status shape; the peer
+   *  renders it with the components it already uses for its own engine card. There is no
+   *  remote-stats model and no translation layer — both this route and the local
+   *  `/api/v1/status` are fed by `buildModelStatus`, which is the only thing that keeps
+   *  them from drifting.
+   *
+   *  Gated on `models:use` rather than being open to any valid key: live t/s, TTFT and
+   *  context use describe what the machine's owner is doing right now, and a link that may
+   *  not use the models has no business watching them.
+   *
+   *  `engine.launchCommand` — the engine's absolute binary + model paths — is NOT part of
+   *  the shared builder, so it cannot cross here. See status-view.ts. */
+  linkApp.get('/api/link/v1/status', requireCapability('models:use'), (c) =>
+    c.json(buildModelStatus(d)),
+  )
 
   linkApp.post('/api/link/v1/chat/completions', requireCapability('models:use'), async (c) => {
     const key = c.get('linkKey')

@@ -1,6 +1,7 @@
 import { negotiateVersion, LINK_API_VERSIONS } from './protocol'
 import type { LinkProbe } from './link-state'
 import type { HelloResponse, LinkRecord, RemoteModel } from './types'
+import type { ModelStatusView } from '../api/status-view'
 
 const DEFAULT_TIMEOUT_MS = 8000
 
@@ -80,6 +81,27 @@ export class LinkClient {
       machineName: typeof body.machineName === 'string' ? body.machineName : '',
       models,
     }
+  }
+
+  /** The host's live engine/model stats — t/s, TTFT, prefill %, context use (spec §5.4).
+   *
+   *  Goes through `call()` like every other method, so it inherits the same total
+   *  "never throws, never adopts garbage" guarantee; a bespoke fetch here would be a
+   *  second, weaker contract for no gain.
+   *
+   *  The payload is the host's OWN `/api/v1/status` model-stat subset, handed back
+   *  untranslated: the peer renders it with the components it already uses locally, so any
+   *  reshaping here would be exactly the divergence §5.4 forbids. The only structural check
+   *  is that `engine` is an object — enough to reject a proxy's 200 without pretending to
+   *  re-validate a shape the host owns. */
+  async status(): Promise<LinkProbe | { kind: 'status'; status: ModelStatusView }> {
+    const res = await this.call('/api/link/v1/status', 'GET')
+    if (res.kind !== 'body') return res
+    const body = res.body as { engine?: unknown }
+    if (typeof body.engine !== 'object' || body.engine === null || Array.isArray(body.engine)) {
+      return { kind: 'network' }
+    }
+    return { kind: 'status', status: res.body as ModelStatusView }
   }
 
   /** Shared request path. Returns a discriminated result so callers never see an

@@ -62,6 +62,7 @@ import { sendConsentChoice } from '../telemetry/consent'
 import { readSentLog } from '../telemetry/log'
 import { TELEMETRY_SCHEMA_VERSION } from '../telemetry/schema'
 import { registerOnboardingRoutes } from './onboarding-routes'
+import { buildModelStatus } from './status-view'
 
 type Status = 200 | 201 | 202 | 400 | 401 | 403 | 404 | 409 | 500 | 501 | 503
 
@@ -80,42 +81,33 @@ async function body<T>(c: Context): Promise<T> {
 export function registerApi(app: Hono, d: Deps): void {
   // ---- meta ----
   app.get('/api/v1/status', (c) => {
-    const ms = d.manager.status()
-    const active = d.registry.active()
-    const engine: Record<string, unknown> = {
-      id: active?.id ?? '',
-      name: active?.name ?? '',
-      kind: active?.kind ?? '',
-      state: ms.state,
-      port: ms.port,
-      pid: ms.pid,
-    }
-    if (ms.err) engine.error = ms.err
-    const launchCommand = d.manager.launchCommand()
-    if (launchCommand) engine.launchCommand = launchCommand
+    // The engine/model/engineStats/liveGeneration block comes from the SHARED builder
+    // (status-view.ts) — the same one `GET /api/link/v1/status` re-exports, so a linked
+    // peer renders a host's numbers with the components it already uses for its own
+    // (ADR-376 §5.4). `parallelSlots`, the `error` field and the omit-vs-default rules all
+    // live there now; only the strictly local additions are made here.
+    const core = buildModelStatus(d)
     // How many generations this engine can serve at once (llama.cpp's `--parallel N`). Consumed
     // by `turbollm launch` to cap an agent CLI's own background-agent fan-out at what the engine
     // can actually run — see cli-launch.ts. Omitted, not defaulted to 1, when the engine
     // advertises no slot count: "unknown" and "exactly one" are different answers, and a client
     // must not read the former as the latter.
-    const parallelSlots = d.manager.parallelSlots()
-    if (parallelSlots !== null) engine.parallelSlots = parallelSlots
-    const model = ms.model
-      ? { key: ms.model.key, name: ms.model.name, quant: ms.model.quant, ctx: ms.model.ctx, vision: ms.model.vision, loadElapsedMs: ms.loadElapsedMs }
-      : null
-    // Live running-session stats (B4): only meaningful while the engine runs.
-    const engineStats = ms.state === 'running' ? d.manager.sessionStats() : null
-    // Live per-request progress for the engine card (prefill % / live token count).
-    const liveGeneration = ms.state === 'running' ? d.manager.liveGeneration() : null
+    //
+    // `launchCommand` is the engine's full argv: an absolute host binary path plus an absolute
+    // model path. It is added HERE rather than in the shared builder precisely so it can never
+    // reach a peer — the façade would have to construct the field itself, not merely forget to
+    // strip it.
+    const launchCommand = d.manager.launchCommand()
+    const engine: Record<string, unknown> = launchCommand ? { ...core.engine, launchCommand } : { ...core.engine }
     return c.json({
       version: d.version,
       engine,
-      model,
+      model: core.model,
       // Last model the user loaded (config-tracked) — lets `turbollm launch` auto-load the
       // true last-used model instead of guessing the first library entry (F-034).
       lastLoaded: d.store.snapshot().lastLoaded,
-      engineStats,
-      liveGeneration,
+      engineStats: core.engineStats,
+      liveGeneration: core.liveGeneration,
       // Auto-tune runner state (spec 09 §1): real progress while a sweep runs, then
       // a lingering done/error snapshot the detail dialog reads to show the result.
       bench: d.bench.status(),
