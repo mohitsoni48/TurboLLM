@@ -91,7 +91,12 @@ export interface Message {
   // `sink()` payloads) — `id`/`name`/`args`, not `name`/`arguments` as an earlier draft of this
   // client and spec §3.2's sample JSON both incorrectly showed.
   tool_calls?: Array<{ id: string; name: string; args: unknown; result?: unknown; error?: unknown }>
-  usage?: { prompt_tokens: number; completion_tokens: number; tokens_per_second: number; model: string }
+  // The raw engine `chunk.usage` object captured by generation.ts (prompt_tokens/completion_tokens
+  // at minimum; exact fields vary by engine) — NOT the richer, internal-chat-only MessageStats
+  // shape (tokens_per_second/model) an earlier draft of this type wrongly declared. openapi.ts's
+  // own schema for this field is intentionally generic (`additionalProperties: true`) for the
+  // same reason: the server makes no field-level contract here beyond "whatever the engine sent."
+  usage?: Record<string, unknown>
   metadata?: Record<string, unknown>
 }
 
