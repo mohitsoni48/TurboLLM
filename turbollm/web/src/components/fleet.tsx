@@ -229,6 +229,7 @@ export function DownloadTargetMenu({
   /** `null` = this machine. */
   onPick: (linkId: string | null) => void
 }) {
+  const menuId = useId()
   return (
     <DropdownMenu>
       <DropdownMenuTrigger
@@ -250,14 +251,22 @@ export function DownloadTargetMenu({
         </DropdownMenuItem>
         {links.map((l) => {
           const state = actionState('downloads:write', { kind: 'remote', linkId: l.id, machine: l.name }, l)
+          // Same `title` + `aria-describedby` pairing as `FleetAction`, for the same reason:
+          // a `title` alone is not reliably announced, so a disabled entry would be greyed
+          // out with its explanation reachable only by hovering. `describedby` ADDS to the
+          // item's accessible name rather than replacing it, so the machine's name — the
+          // thing the user is looking for in the menu — still announces first.
+          const reasonId = `${menuId}-${l.id}-reason`
           return (
             <DropdownMenuItem
               key={l.id}
               disabled={!state.enabled}
               title={state.enabled ? undefined : state.reason}
+              {...(state.enabled ? {} : { 'aria-describedby': reasonId })}
               onSelect={() => state.enabled && onPick(l.id)}
             >
               <Cloud size={14} /> {l.name}
+              {!state.enabled && <span id={reasonId} className="sr-only">{state.reason}</span>}
             </DropdownMenuItem>
           )
         })}

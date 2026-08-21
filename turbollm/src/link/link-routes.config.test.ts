@@ -18,7 +18,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { registerLinkApi } from './link-routes'
-import { ConfigStore, type ApiKey, type Config } from '../config/config'
+import { ConfigStore, ValueError, type ApiKey, type Config } from '../config/config'
 import type { Deps } from '../deps'
 import { CONFIG_BOUNDS, coerceBounded, type BoundedConfigPath } from '../config/config-bounds'
 
@@ -365,4 +365,44 @@ test('PARITY: nothing the link route accepts would be rejected by the owner\'s o
     }
   }
   assert.ok(accepted > 0, 'the probe set must include values that legitimately pass')
+})
+
+// ── The host's own validate() message must not cross the façade (final review M-1) ──────
+//
+// The `invalid_config` branch relayed `err.message` verbatim, on the stated grounds that a
+// `ValueError.message` is "a field name plus a constraint (never a host path)". That was
+// never enforced and is already false — config.ts throws
+// `agent "<id>" writeRoots must be within <dataDir> (v1 invariant)` — and `validate()` runs
+// over the WHOLE config on every update, so any pre-existing problem in a hand-edited
+// config.json is emitted to the first peer that patches anything. `field` is the structured,
+// actionable half; the prose is not.
+
+test('a failed host validate() yields the FIELD, never the message that carries a host path', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'tl-link-config-val-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const hostPath = join(dir, 'agents')
+  const real = mkDeps(t, [key('tllm-a', ['config:write', 'config:read'])])
+  // A store whose `update` fails the way a hand-edited config.json makes it fail. Real
+  // `ConfigStore.update` cannot be seeded into this state — it validates on the way in —
+  // and `resolveKey`'s own best-effort lastUsedAt stamp already swallows the throw, so auth
+  // still works exactly as it does in production.
+  const d = {
+    version: '1.11.2',
+    store: {
+      snapshot: () => real.store.snapshot(),
+      update: () => {
+        throw new ValueError('agents', `agent "coder" writeRoots must be within ${hostPath} (v1 invariant)`)
+      },
+    },
+  } as unknown as Deps
+
+  const res = await patch(app(d), 'tllm-a', { patch: { 'modelDefaults.ctx': 8192 } })
+  assert.equal(res.status, 400)
+  const text = await res.text()
+  assert.ok(!text.includes(hostPath), `the host path crossed the façade: ${text}`)
+  assert.ok(!text.includes('writeRoots'), text)
+  const body = JSON.parse(text) as { error: { code: string; field?: string; message: string } }
+  assert.equal(body.error.code, 'invalid_config')
+  assert.equal(body.error.field, 'agents')
+  assert.match(body.error.message, /agents/)
 })

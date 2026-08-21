@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { describeRemoteHost, findRemoteChoice, groupModelChoices, selectModel, type RemoteModelRow } from './remote-models'
+import { statusNote } from './fleet'
 import type { LinkRecord } from './link-api'
 import type { ModelEntry } from './types'
 
@@ -148,6 +149,27 @@ describe('groupModelChoices', () => {
     })
     expect(machine.note).toBeTruthy()
     expect(machine.note).toMatch(/workstation/)
+  })
+
+  // Final review M-2. This fallback was a SECOND copy of fleet.ts's, and it collapsed
+  // `revoked` and `incompatible` into "is not reachable" — the one collapse the design
+  // forbids, because "relink with a new key" and "update TurboLLM over there" are different
+  // fixes. It is now the same function, so the four states cannot re-diverge.
+  it('keeps the four non-online states apart, exactly as fleet.ts does', () => {
+    for (const status of ['revoked', 'incompatible', 'unreachable', 'unknown'] as const) {
+      const [, machine] = groupModelChoices({
+        local: [],
+        links: [link({ id: 'l1', name: 'workstation', status, lastError: null })],
+        remote: [],
+      })
+      expect(machine.note, status).toBe(statusNote('workstation', status))
+    }
+    const revoked = groupModelChoices({
+      local: [], remote: [],
+      links: [link({ id: 'l1', name: 'workstation', status: 'revoked', lastError: null })],
+    })[1]!
+    expect(revoked.note).toMatch(/revoked/i)
+    expect(revoked.note).not.toMatch(/not reachable/i)
   })
 
   it('drops cached rows for a link that is no longer online', () => {

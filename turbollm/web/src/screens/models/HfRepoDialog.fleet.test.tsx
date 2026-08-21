@@ -135,6 +135,31 @@ describe('HfRepoDialog — download target', () => {
     expect(item.getAttribute('data-disabled')).not.toBeNull()
   })
 
+  // Final review M-8. `FleetAction` pairs `title` with an `aria-describedby` target because
+  // a `title` alone is not reliably announced — a greyed entry whose only explanation is a
+  // hover tooltip is barely better than no explanation. The menu carried the weaker half.
+  it('announces the reason to a screen reader, not only on hover', async () => {
+    state.links = [link({ grantedCapabilities: ['downloads:read'] })]
+    renderContent()
+    await userEvent.click(await screen.findByTestId('download-target-trigger'))
+    const item = (await screen.findByText('workstation')).closest('[role="menuitem"]')!
+    const describedBy = item.getAttribute('aria-describedby')
+    expect(describedBy).toBeTruthy()
+    const reason = document.getElementById(describedBy!)
+    expect(reason?.textContent).toMatch(/downloads:write/)
+    // …and the machine's own name still announces first: `aria-describedby` ADDS to the
+    // accessible name where an `aria-label` would have replaced it.
+    expect(item.getAttribute('aria-label')).toBeNull()
+  })
+
+  it('leaves a PERMITTED machine undescribed — nothing to explain', async () => {
+    state.links = [link()]
+    renderContent()
+    await userEvent.click(await screen.findByTestId('download-target-trigger'))
+    const item = (await screen.findByText('workstation')).closest('[role="menuitem"]')!
+    expect(item.getAttribute('aria-describedby')).toBeNull()
+  })
+
   it('renders a refusal from the host through the shared failure taxonomy', async () => {
     state.links = [link()]
     state.startFail = { status: 503, error: { code: 'host_busy', message: 'x' } }

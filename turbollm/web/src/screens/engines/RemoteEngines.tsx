@@ -3,8 +3,11 @@
 //
 // ADR-139 settled that no remote caller gets engine add/scan access — the surface executes
 // a caller-supplied binary path, so it is not grantable to anything, valid key or not.
-// `engines:*` is therefore absent from `LINK_CAPABILITIES` entirely (and `web-mirror.test.ts`
-// guards that it stays absent, in any spelling).
+// `engines:*` is therefore absent from `LINK_CAPABILITIES` entirely. Two different guards
+// keep it that way, and they are not interchangeable: `turbollm/src/link/web-mirror.test.ts`
+// pins the web copy of the capability list against the backend's, so the CONSTANT can never
+// grow an engines member; `RemoteEngines.test.tsx` asserts that nothing this file RENDERS
+// ever matches /engines:/i, which is what stops a control appearing regardless.
 //
 // The interesting decision is how that absence is PRESENTED. Two wrong ways: leave remote
 // machines off the screen (the user assumes Turbo Link is broken, or that their fleet only

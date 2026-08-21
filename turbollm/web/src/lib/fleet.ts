@@ -44,8 +44,13 @@ export interface FleetMachine {
 
 /** Why a non-online machine has no rows, when the link itself didn't say. NAMES the
  *  machine: a fleet can hold several, so a bare "Not reachable." would not tell the user
- *  which one to go and wake up. Mirrors `fallbackNote` in remote-models.ts. */
-function fallbackNote(name: string, status: LinkStatus): string {
+ *  which one to go and wake up.
+ *
+ *  THE one copy. `remote-models.ts` used to carry a second, shorter version that collapsed
+ *  `revoked` and `incompatible` into "is not reachable" — the exact collapse the wire type
+ *  refuses to make, because the three states have three different fixes. A comment claiming
+ *  the two "mirror" each other is not a mirror; importing this is. */
+export function statusNote(name: string, status: LinkStatus): string {
   switch (status) {
     case 'unknown':
       return `${name} has not been checked yet.`
@@ -118,7 +123,7 @@ export function fleetMachines<T>(remote: FleetSource<T>[]): FleetMachine[] {
       linkId: link.id,
       machine: link.name,
       status: link.status,
-      note: online ? null : (link.lastError ?? fallbackNote(link.name, link.status)),
+      note: online ? null : (link.lastError ?? statusNote(link.name, link.status)),
       rowCount: online ? source.rows.length : 0,
     }
   })

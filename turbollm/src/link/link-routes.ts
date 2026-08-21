@@ -3,6 +3,9 @@ import { randomUUID } from 'node:crypto'
 import { hostname } from 'node:os'
 import type { Deps } from '../deps'
 import type { ApiKey } from '../config/config'
+// A VALUE import, not a type one: `ValueError.field` is the only part of a failed
+// `validate()` that may cross the façade (see the `invalid_config` branch below).
+import { ValueError } from '../config/config'
 import { linkAuth, requireCapability } from './link-auth'
 import { gatewayV1Handler } from '../gateway/gateway'
 import { buildModelStatus } from '../api/status-view'
@@ -434,11 +437,21 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
           500,
         )
       }
+      // The host's own `validate()` message does NOT cross. It was passed through here on
+      // the grounds that a `ValueError.message` is "a field name plus a constraint, never a
+      // host path" — which is not enforced and is already false: config.ts throws
+      // `agent "<id>" writeRoots must be within <dataDir> (v1 invariant)`, an absolute host
+      // path, and `validate()` runs over the WHOLE config on every update, so any peer
+      // holding `config:write` would collect it on its first patch. The field name is the
+      // actionable half and is structured, so compose from that instead.
       return c.json(
         {
           error: {
             code: 'invalid_config',
-            message: err instanceof Error ? err.message : 'The host rejected that config.',
+            ...(err instanceof ValueError ? { field: err.field } : {}),
+            message: err instanceof ValueError
+              ? `The host rejected that config: '${err.field}' is not valid on it.`
+              : 'The host rejected that config.',
           },
         },
         400,

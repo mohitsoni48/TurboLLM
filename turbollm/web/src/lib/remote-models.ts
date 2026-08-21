@@ -8,6 +8,7 @@
 // property instead of a thing someone has to remember while writing JSX.
 import type { LinkRecord } from './link-api'
 import type { LinkStatus } from './link-api'
+import { statusNote } from './fleet'
 import type { ModelEntry } from './types'
 
 /** One model as a linked host advertises it. Mirrors `RemoteModel` in
@@ -73,12 +74,15 @@ export function formatRemoteId(machineName: string, modelKey: string): string {
   return `${machineName}/${modelKey}`
 }
 
-/** Why a non-online machine has no models, when the link itself didn't say.
- *  Names the machine: this list can hold several, so "Not reachable." on its own would
- *  not tell the user WHICH one to go and wake up. */
-function fallbackNote(name: string, status: LinkStatus): string {
-  return status === 'unknown' ? `${name} has not been checked yet.` : `${name} is not reachable.`
-}
+/** Why a non-online machine has no models, when the link itself didn't say — `statusNote`
+ *  from fleet.ts, IMPORTED rather than re-written.
+ *
+ *  The copy that used to live here collapsed `revoked` and `incompatible` into "is not
+ *  reachable", which is the one collapse the design forbids: "relink with a new key" and
+ *  "update TurboLLM over there" are different fixes. It survived only because
+ *  `applyProbeResult` almost always sets `lastError` first, so the fallback rarely ran —
+ *  luck, not design. */
+const fallbackNote = statusNote
 
 /** A cold model can only be served if the host granted the peer the right to bring it up.
  *  Read from `grantedCapabilities` — what the HOST reported at handshake — never from a
