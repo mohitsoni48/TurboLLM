@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url'
 import { dirname, join, normalize } from 'node:path'
 import { Agent, setGlobalDispatcher } from 'undici'
 import { registerApi } from './api/routes'
+import { registerLinkAdminRoutes } from './api/link-admin-routes'
 import { registerChatRoutes } from './chat/chat-routes'
 import { registerChatAgentRoutes } from './chat/chat-agent-routes'
 import { registerPresetRoutes } from './api/preset-routes'
@@ -94,6 +95,7 @@ export function createApp(d: Deps): Hono {
   app.get('/healthz', (c) => c.json({ status: 'ok', version: d.version }))
 
   registerApi(app, d)
+  registerLinkAdminRoutes(app, d)
   registerChatRoutes(app, d)
   registerChatAgentRoutes(app, d)
   registerPresetRoutes(app, d)

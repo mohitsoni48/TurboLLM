@@ -49,11 +49,21 @@ const BY_SEGMENT: Record<string, string> = {
   // our UI) — unlike skills/chat-agents, every hit here is real image-gen
   // activity, not a side effect of an unrelated screen loading.
   comfyui: 'image',
+  // Turbo Link (ADR-376) admin surface — `/api/v1/links/*`, the user's own browser
+  // minting/managing links on their own daemon.
+  links: 'link',
 }
 
 /** The feature a request belongs to, or null if it is not an instrumented
- *  surface. Matches whole segments, so `/api/v1/codex` is not `code`. */
+ *  surface. Matches whole segments, so `/api/v1/codex` is not `code`.
+ *
+ *  `/api/link/v1/*` is Turbo Link's PEER-facing contract (link-routes.ts) — a
+ *  different machine calling in, not `/api/v1/...`, so it needs its own check rather
+ *  than falling out of the segment regex below. Both surfaces attribute to the same
+ *  `link` feature: whichever side of a link a request arrives on, it's the same
+ *  product surface being used. */
 export function featureForPath(path: string): string | null {
+  if (path === '/api/link/v1' || path.startsWith('/api/link/v1/')) return 'link'
   const m = /^\/api\/v1\/([^/?]+)/.exec(path)
   if (m === null) return null
   return BY_SEGMENT[m[1]] ?? null
