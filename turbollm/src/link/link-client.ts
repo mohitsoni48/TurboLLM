@@ -1,6 +1,6 @@
 import { negotiateVersion, LINK_API_VERSIONS } from './protocol'
 import type { LinkProbe } from './link-state'
-import type { HelloResponse, LinkRecord } from './types'
+import type { HelloResponse, LinkRecord, RemoteModel } from './types'
 
 const DEFAULT_TIMEOUT_MS = 8000
 
@@ -45,6 +45,40 @@ export class LinkClient {
       capabilities: body.capabilities,
       version,
       raw: body as HelloResponse,
+    }
+  }
+
+  /** The host's model list. Same total contract as `hello()`: it goes through `call()`,
+   *  so it never throws and never adopts a garbage shape.
+   *
+   *  A `models` result is the ONLY one that may populate the catalog — every other kind
+   *  means "we do not know what this machine has", which must read as an empty list, not
+   *  as a stale one. `http 403` is the normal answer for a token without `models:use`. */
+  async models(): Promise<LinkProbe | { kind: 'models'; machineName: string; models: RemoteModel[] }> {
+    const res = await this.call('/api/link/v1/models', 'GET')
+    if (res.kind !== 'body') return res
+    const body = res.body as { machineName?: unknown; models?: unknown }
+    if (!Array.isArray(body.models)) return { kind: 'network' }
+    const models: RemoteModel[] = []
+    for (const raw of body.models) {
+      if (typeof raw !== 'object' || raw === null) continue
+      const r = raw as Record<string, unknown>
+      // A row without a usable key can never be routed to, so it is dropped rather than
+      // half-adopted — a `key: undefined` entry would otherwise match a malformed request.
+      if (typeof r.key !== 'string' || !r.key) continue
+      models.push({
+        key: r.key,
+        name: typeof r.name === 'string' && r.name ? r.name : r.key,
+        quant: typeof r.quant === 'string' ? r.quant : null,
+        nativeCtx: typeof r.nativeCtx === 'number' ? r.nativeCtx : null,
+        vision: r.vision === true,
+        loaded: r.loaded === true,
+      })
+    }
+    return {
+      kind: 'models',
+      machineName: typeof body.machineName === 'string' ? body.machineName : '',
+      models,
     }
   }
 
