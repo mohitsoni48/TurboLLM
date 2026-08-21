@@ -36,7 +36,7 @@ Stdlib only (urllib) so it runs on Kaggle with no pip install.
 
   python3 deploy/kaggle/bench_vs_chat.py [--model KEY] [--ctx N] [--base URL]
 """
-import argparse, json, subprocess, sys, threading, time, urllib.request, urllib.error
+import argparse, json, subprocess, sys, threading, time, urllib.parse, urllib.request, urllib.error
 
 # Mirrors bench.ts — keep in sync with BENCH_CTX_FRACTION / BENCH_MAX_PROMPT_TOKENS / CHARS_PER_TOKEN.
 BENCH_CTX_FRACTION = 0.75
@@ -285,7 +285,10 @@ def main():
           f"  ttftMs={winner.get('ttftMs')}  vramMb={winner.get('vramMb')}\n  params: {fmt_params(winner['params'])}")
 
     call(B, "/api/v1/bench/save", "POST")
-    loaded = call(B, f"/api/v1/models/{key}").get("profile", {})
+    # Percent-encode: a model key is "<name>|<quant>|<bytes>" and the name can contain spaces
+    # (seen live: "qwen3.8 27b abliterated|Q6_K|22430999936"), which urllib rejects outright as a
+    # control character in the path. It threw AFTER the ~17-minute auto-tune had already run.
+    loaded = call(B, "/api/v1/models/" + urllib.parse.quote(key, safe="")).get("profile", {})
     print(f"\n== Saved model profile (what chat will load) ==\n  {fmt_params(loaded)}")
 
     print("\n== Loading model for chat (POST /api/v1/engine/start) ==", flush=True)
