@@ -139,14 +139,34 @@ describe('LoadStep recovery', () => {
     expect(trackRecoveryMock).toHaveBeenCalledWith('other', 'retry', 'fail')
   })
 
-  it('reports nothing at all when no recovery was attempted', async () => {
-    // A load that simply succeeds must never produce a recovery row — the ref is
-    // empty, so the settle effect has nothing to judge.
+  it('reports nothing when no recovery was attempted, and the settle effect is what suppresses it', async () => {
+    // Not vacuous: this fails if the settle effect ever reports without a pending
+    // attempt, which is the shape of the bug where a plain successful load would
+    // manufacture a recovery row.
     loadModelMock.mockResolvedValueOnce(undefined)
     statusMock.data = { model: { key: MODEL_KEY } }
     renderStep()
     await waitFor(() => expect(advanceMock).toHaveBeenCalled())
     expect(trackRecoveryMock).not.toHaveBeenCalled()
     expect(trackRecoveryTextMock).not.toHaveBeenCalled()
+  })
+
+  it('reports a download resume that finishes between polls, never having shown an intermediate status', async () => {
+    // useDownloads stops polling at 'done', so a fast resume can go error -> done
+    // with nothing observed in between. Gating success on first seeing the record
+    // leave 'error' dropped exactly the fastest successful retries.
+    downloadsMock.data = { downloads: [finishedDownload({ status: 'error', error: '404 fetching release asset' })] }
+    modelsMock.data = { models: [] }
+    const { rerender } = renderStep()
+
+    await userEvent.click(await screen.findByRole('button', { name: /retry/i }))
+    expect(resumeMock.mutate).toHaveBeenCalled()
+    expect(trackRecoveryTextMock).not.toHaveBeenCalled()
+
+    downloadsMock.data = { downloads: [finishedDownload({ status: 'done' })] }
+    rerender(<LoadStep onContinue={vi.fn()} onSkip={vi.fn()} ctx={baseCtx} />)
+
+    await waitFor(() => expect(trackRecoveryTextMock).toHaveBeenCalledTimes(1))
+    expect(trackRecoveryTextMock).toHaveBeenCalledWith('404 fetching release asset', 'resume', 'ok')
   })
 })

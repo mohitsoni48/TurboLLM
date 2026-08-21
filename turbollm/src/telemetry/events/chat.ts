@@ -20,9 +20,10 @@ export const chatDaily = defineEvent({
     // so every chart built on `timestamp` silently attributed a rollup to the
     // wrong date, and 17.7% of rows described a day 2+ back. Sent as an int
     // rather than a date string on purpose — the load-bearing schema rule is that
-    // no field is free-form text (schema.ts), and an offset is both bounded and
-    // strictly less identifying than a date while carrying the same information:
-    // the real day is `toDate(ts) - daysAgo`.
+    // no field is free-form text (schema.ts), and a bounded integer satisfies it
+    // where a date string would need a new bespoke field kind. It is NOT more
+    // private: the real day is `toDate(ts) - daysAgo`, so this carries exactly
+    // the same information a date would. The reason is schema shape, not privacy.
     //
     // OPTIONAL, and it must stay that way. Every client already in the field emits
     // this event without the field, so a REQUIRED `daysAgo` would make the newly

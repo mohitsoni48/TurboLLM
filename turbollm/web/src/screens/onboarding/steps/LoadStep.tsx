@@ -211,7 +211,14 @@ export default function LoadStep({ onContinue, ctx }: StepComponentProps) {
     if (!p) return
 
     if (p.kind === 'load') {
-      if (isLoaded && !p.wasLoaded) {
+      // `wasLoaded` means a model matching the expected key was ALREADY up when
+      // Retry was pressed, so "it is up now" cannot distinguish a successful retry
+      // from the state that preceded it. Report nothing rather than something:
+      // settling 'fail' here (the only branch still reachable) would make every
+      // such attempt a failure and bias the one metric that measures whether
+      // recovery works. A missing row is honest; a wrong one is not.
+      if (p.wasLoaded) return
+      if (isLoaded) {
         pendingRecoveryRef.current = null
         trackRecovery(p.failure, p.action, 'ok')
       } else if (loadFailed) {
@@ -223,15 +230,22 @@ export default function LoadStep({ onContinue, ctx }: StepComponentProps) {
 
     const record = downloadsQuery.data?.downloads.find((dl) => dl.id === p.downloadId)
     if (!record) return
+    // 'done' is checked BEFORE the leftError gate on purpose. useDownloads stops
+    // polling once a download reaches 'done', so a resume that finishes between
+    // two polls never shows an intermediate status — gating success on having
+    // first observed the record leave 'error' would silently drop exactly the
+    // fastest, most successful retries and skew the metric toward failure.
+    if (record.status === 'done') {
+      pendingRecoveryRef.current = null
+      trackRecoveryText(p.failureText, p.action, 'ok')
+      return
+    }
     if (!p.leftError) {
       // Still showing the pre-retry failure; nothing has been attempted yet.
       if (record.status !== 'error') p.leftError = true
       return
     }
-    if (record.status === 'done') {
-      pendingRecoveryRef.current = null
-      trackRecoveryText(p.failureText, p.action, 'ok')
-    } else if (record.status === 'error') {
+    if (record.status === 'error') {
       pendingRecoveryRef.current = null
       trackRecoveryText(p.failureText, p.action, 'fail')
     }

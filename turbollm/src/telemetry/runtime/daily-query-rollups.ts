@@ -41,6 +41,32 @@ export function checkDailyQueryRollups(
   telemetry: Emitter,
   today: () => string = () => new Date().toISOString().slice(0, 10),
 ): void {
+  // NEVER THROWS (ADR-009). Found during the v1.11.3 release gate: the three
+  // `db.*DailyStats()` calls below were unguarded, and cli.ts drives this from a
+  // bare `setInterval`. A throw from the SQLite layer — a locked file, a corrupt
+  // page, schema drift after a downgrade — is therefore a synchronous throw in a
+  // timer callback, and this process installs an `unhandledRejection` handler but
+  // NO `uncaughtException` one, so Node's default applies and the daemon dies.
+  // That orphans the llama-server child with the model still resident, which is
+  // the exact cascade the crash-safety comment at the top of cli.ts exists to
+  // prevent. Telemetry may not be a failure mode of the product; a lost rollup is
+  // the correct price, and every other module in this directory already makes the
+  // same trade.
+  try {
+    runDailyQueryRollups(dataDir, db, telemetry, today)
+  } catch {
+    // Best-effort by contract. The day's counters are lost when this fires —
+    // `takeRolledOver()` has already reset and persisted the boundary — but a
+    // missing rollup is recoverable and a dead daemon is not.
+  }
+}
+
+function runDailyQueryRollups(
+  dataDir: string,
+  db: ConversationStore,
+  telemetry: Emitter,
+  today: () => string,
+): void {
   const boundary = new DailyRollup<Record<string, number>>(dataDir, 'daily-query-rollups', {}, today)
   const rolled = boundary.takeRolledOver()
   if (!rolled) {

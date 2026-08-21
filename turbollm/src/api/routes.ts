@@ -808,7 +808,7 @@ export function registerApi(app: Hono, d: Deps): void {
     const upgrade = c.req.query('update') === '1'
     void (async () => {
       try {
-        d.provision.start('turboquant')
+        d.provision.start('turboquant', upgrade ? 'user_update' : 'user_install')
         // For update: remove existing dir so provisionTurboquant re-downloads the latest.
         if (upgrade) {
           const tqDir = join(root, 'turboquant')
@@ -849,7 +849,7 @@ export function registerApi(app: Hono, d: Deps): void {
     const hasNvidia = primaryVendor(getSysInfo()) === 'nvidia'
     void (async () => {
       try {
-        d.provision.start('koboldcpp')
+        d.provision.start('koboldcpp', upgrade ? 'user_update' : 'user_install')
         if (upgrade) {
           const dir = koboldcppDir(root)
           if (existsSync(dir)) rmSync(dir, { recursive: true, force: true })
@@ -884,7 +884,7 @@ export function registerApi(app: Hono, d: Deps): void {
     const upgrade = c.req.query('update') === '1'
     void (async () => {
       try {
-        d.provision.start('llamafile')
+        d.provision.start('llamafile', upgrade ? 'user_update' : 'user_install')
         if (upgrade) {
           const dir = llamafileDir(root)
           if (existsSync(dir)) rmSync(dir, { recursive: true, force: true })

@@ -215,3 +215,26 @@ test('checkDailyQueryRollups: passes through a real classified harness value, an
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('checkDailyQueryRollups: a throwing database never escapes into the caller (ADR-009)', () => {
+  const dir = tempDir()
+  try {
+    const telemetry = makeEmitter(dir)
+    // cli.ts drives this from a bare setInterval, and the process installs no
+    // uncaughtException handler — so before the v1.11.3 gate, a SQLite throw here
+    // killed the daemon and orphaned its engine child.
+    const exploding = {
+      chatDailyStats: () => { throw new Error('database is locked') },
+      gatewayDailyStats: () => { throw new Error('database is locked') },
+      codeDailyStats: () => { throw new Error('database is locked') },
+    } as never
+
+    let today = '2026-08-05'
+    assert.doesNotThrow(() => checkDailyQueryRollups(dir, exploding, telemetry, () => today))
+    today = '2026-08-06' // the rollover branch, where the db is actually queried
+    assert.doesNotThrow(() => checkDailyQueryRollups(dir, exploding, telemetry, () => today))
+    assert.deepEqual(names(dir), [], 'nothing is emitted when the query fails')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

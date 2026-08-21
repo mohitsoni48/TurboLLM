@@ -128,17 +128,50 @@ const events = [
 // the whole thing in double quotes is unambiguous to both cmd.exe and bash,
 // and every other interpolated value here is a fixed internal constant, not
 // external input, so there is nothing to escape defensively.
+/** Fields whose presence distinguishes the CURRENT payload shape of an event
+ *  from the bare shape older clients still send. */
+const SHAPE_MARKERS = {
+  chat_daily: 'daysAgo',
+  code_daily: 'daysAgo',
+  gateway_daily: 'daysAgo',
+  ui_daily: 'daysAgo',
+  feature_used_daily: 'daysAgo',
+  engine_installed: 'trigger',
+}
+
+/**
+ * Identify an event by NAME **and SHAPE**, not name alone.
+ *
+ * Verifying by name was the bug that made the dual-shape probe decorative: the
+ * bare and current variants of `chat_daily` both land under the name
+ * `chat_daily`, so a quarantined `chat_daily{daysAgo}` was masked by its bare
+ * twin still arriving and the script printed PASS. That is precisely the
+ * ADR-331 regression this probe exists to catch, so name-only matching made the
+ * gate unable to see the thing it was extended to see.
+ */
+function signature(event, payloadJson) {
+  const marker = SHAPE_MARKERS[event]
+  if (!marker) return event
+  let payload
+  try {
+    payload = JSON.parse(payloadJson)?.payload ?? {}
+  } catch {
+    return event
+  }
+  return marker in payload ? `${event}+${marker}` : event
+}
+
 function queryLanded() {
   const npx = process.platform === 'win32' ? 'npx.cmd' : 'npx'
-  const sql = `SELECT event FROM events WHERE machine_id = '${CANARY_MACHINE_ID}' AND received_at > datetime('now', '-5 minutes')`
+  const sql = `SELECT event, payload FROM events WHERE machine_id = '${CANARY_MACHINE_ID}' AND received_at > datetime('now', '-5 minutes')`
   const raw = execSync(`${npx} wrangler d1 execute ${DB_NAME} --remote --json --command "${sql}"`, {
     cwd: join(HERE, '..'),
     encoding: 'utf8',
   })
-  return new Set(JSON.parse(raw)[0].results.map((r) => r.event))
+  return new Set(JSON.parse(raw)[0].results.map((r) => signature(r.event, r.payload)))
 }
 
-const expected = new Set(events.map((e) => e.event))
+const expected = new Set(events.map((e) => signature(e.event, JSON.stringify(e))))
 
 // A fresh `wrangler deploy` is not instantly live on every edge node — found
 // live 2026-08-05, right after Phase 2 shipped `model_load`: the first

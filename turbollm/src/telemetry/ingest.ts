@@ -63,11 +63,19 @@ const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/
  * `properties.app.version` breaks. This only ADDS the flat aliases PostHog can
  * actually index, which is also why it is safe to ship ahead of any client.
  *
- * One level deep, on purpose: every payload in the registry is flat except
- * `bench_result`'s nested blocks, whose leaves are the benchmark page's
- * business and are already reachable in SQL. Values are limited to scalars, so
- * this can never widen what a property may contain beyond what `validateEvent`
- * already allowed through — it re-shapes accepted data, it never admits more.
+ * One level deep, and the scalar filter means NESTED blocks are dropped rather
+ * than flattened: `bench_result`'s `model`/`engine`/`params`/`result` and
+ * `model_load`'s `model`/`engine`/`params`/`fit` do not get flat aliases, so
+ * those leaves stay SQL-only. That is a real remaining gap, not an oversight —
+ * `model_load` is the richest payload in the registry and the one most worth
+ * breaking down by. Flattening a second level needs a naming decision
+ * (`payload_params_ctx`?) and a cardinality check first; the outcome/trigger/
+ * failReason/errorCode fields that answer most questions are scalars and are
+ * covered today.
+ *
+ * Values are limited to scalars, so this can never widen what a property may
+ * contain beyond what `validateEvent` already allowed through — it re-shapes
+ * accepted data, it never admits more.
  *
  * Lives here rather than in the Worker for the same reason validation does:
  * the Worker is a shell, and anything with a decision in it needs to be
