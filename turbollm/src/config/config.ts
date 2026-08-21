@@ -128,6 +128,13 @@ export interface Daemon {
    *  capabilities gated behind an explicit opt-in toggle in Settings → Experimental, off by
    *  default for new/distributed installs. */
   experimental: ExperimentalFeatures
+  /** Stable per-install identity for Turbo Link (ADR-376), minted once on first `hello`
+   *  and persisted here. Lets a peer distinguish "same box, new tunnel URL" from
+   *  "this URL now points at a different box". Absent until the façade is first hit. */
+  machineId?: string
+  /** Human-readable name Turbo Link's `hello` hands to a peer, seeding the peer's
+   *  display name for this host (spec §4.5). Falls back to "TurboLLM" when unset. */
+  machineName?: string
 }
 export interface ExperimentalFeatures {
   /** Master gate for the Memory feature — visibility AND behavior. When off:

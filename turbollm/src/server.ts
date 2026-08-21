@@ -16,6 +16,7 @@ import { featureForPath } from './telemetry/feature-map'
 import { registerTerminalRoutes } from './terminal/terminal-routes'
 import { registerRoutineRoutes } from './routines/routine-routes'
 import { lanAuth, codeAuth } from './auth'
+import { registerLinkApi } from './link/link-routes'
 
 // Reuse TCP connections for all engine and HF fetch calls. Without this, Node
 // opens a new connection per request — ~5–20 ms of extra latency every Claude
@@ -67,6 +68,11 @@ export function createApp(d: Deps): Hono {
   // Code-specific gate (independent of requireApiKey — see auth.ts's codeAuth doc comment):
   // Code always needs a key from a non-host device, even when the rest of the app is open.
   app.use('/api/v1/code/*', codeAuth(d))
+
+  // Turbo Link façade (ADR-376). MUST come after lanAuth so an ordinary LAN request is
+  // still subject to the normal gate, and it carries its own inverted gate internally —
+  // linkAuth exempts nothing, including loopback (spec §3.3).
+  registerLinkApi(app, d)
 
   // Feature-discovery + feature-engagement telemetry (ADR-299, the latter's
   // wiring added by the telemetry-review follow-up). Runs AFTER the auth gates
