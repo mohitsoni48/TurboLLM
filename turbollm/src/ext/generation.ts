@@ -153,6 +153,30 @@ function mapSampling(sampling: Record<string, unknown>, repeatPenaltyKey: string
   return out
 }
 
+/** Periodic mid-stream checkpoint thresholds (spec 27 §4.7, C2 fix): flush whichever comes
+ *  first — roughly every ~500ms of wall-clock time since the last successful flush, or roughly
+ *  every ~256 new characters of content+reasoning accumulated since the last flush. Exported so
+ *  the decision itself is directly unit-testable without a live engine (see generation.test.ts;
+ *  this file's own header comment explains why a full live-streaming test isn't feasible here). */
+export const FLUSH_INTERVAL_MS = 500
+export const FLUSH_MIN_CHARS = 256
+
+/** Pure "should I checkpoint now?" decision — no I/O, no clock reads of its own. The caller
+ *  supplies how much wall-clock time has elapsed and how many new characters have accumulated
+ *  since the last flush. Returns false whenever there is nothing new to persist
+ *  (`charsSinceLastFlush <= 0`) even if the interval has elapsed — flushing unchanged content
+ *  would just be a wasted store write for zero durability benefit. */
+export function shouldFlushCheckpoint(
+  elapsedMsSinceLastFlush: number,
+  charsSinceLastFlush: number,
+  opts: { intervalMs?: number; minChars?: number } = {},
+): boolean {
+  if (charsSinceLastFlush <= 0) return false
+  const intervalMs = opts.intervalMs ?? FLUSH_INTERVAL_MS
+  const minChars = opts.minChars ?? FLUSH_MIN_CHARS
+  return elapsedMsSinceLastFlush >= intervalMs || charsSinceLastFlush >= minChars
+}
+
 interface LoopHooks {
   onDelta: (text: string) => void
   onReasoning: (text: string) => void
@@ -390,6 +414,66 @@ export function createMakeBody(d: Deps): RunDeps['makeBody'] {
     let errorMessage: string | undefined
     let release: (() => void) | null = null
 
+    // Periodic mid-stream checkpoint (spec 27 §4.7, C2 fix): best-effort partial persistence so
+    // a hard daemon crash (OOM, unhandled exception, kill) mid-generation loses at most
+    // ~500ms/~256 chars of content, never everything generated so far for the turn — matching
+    // §6.4's guarantee ("nothing generated is lost — only resumability"). This is additive: the
+    // existing terminal `updateMessage` write below still runs on every exit path unchanged.
+    //
+    // Event-driven rather than a literal `setInterval`: content only ever changes inside the
+    // onDelta/onReasoning/onToolCall hooks below, so checking at those call sites (using a real
+    // `Date.now()` elapsed-time comparison, not a token/event count) is exactly as timely as a
+    // background timer would be — and there is no timer handle to leak or clean up on any exit
+    // path (normal completion, an engine error, or an aborted signal all just stop calling the
+    // hooks, so the checks simply stop happening; nothing to clearInterval). The extracted
+    // decision (`shouldFlushCheckpoint`) is directly unit-tested in generation.test.ts.
+    //
+    // Flushes are fire-and-forget from the hot loop (never awaited inline) so a slow adapter
+    // write can't stall engine throughput while `d.gate` is held — but `flushInFlight` is
+    // reconciled (awaited) once below, after the loop ends and the gate is released, so the
+    // authoritative terminal write can never be raced and overwritten by a lagging partial
+    // checkpoint that was still in flight when the loop returned.
+    //
+    // No `ifVersion` guard: the terminal write below has never carried one either (it
+    // unconditionally overwrites `content`/`reasoning`/`toolCalls`/`status` regardless of the
+    // message's current version), so an intermediate checkpoint adding a stricter guard than the
+    // authoritative final write would be inconsistent for no real benefit — a guarded flush that
+    // hit `version_conflict` would still need to fall back to *something* before the unguarded
+    // terminal write ran anyway. Concurrent-edit-during-generation races on this message id are
+    // a separate, already-tracked gap (final-review finding I3: no `run_active` 409 guard on
+    // message mutation) — out of this fix's scope, and not made any worse by matching the
+    // terminal write's existing behavior here.
+    let lastFlushAt = Date.now()
+    let lastFlushChars = 0
+    let lastFlushToolCalls = 0
+    let flushInFlight: Promise<void> | null = null
+
+    const maybeFlush = (force = false) => {
+      if (flushInFlight) return // a flush is already in progress; the next check picks up anything newer
+      const charsSinceLastFlush = finalContent.length + finalReasoning.length - lastFlushChars
+      const toolCallsSinceLastFlush = toolCalls.length - lastFlushToolCalls
+      if (charsSinceLastFlush <= 0 && toolCallsSinceLastFlush <= 0) return // nothing new to persist
+      if (!force && !shouldFlushCheckpoint(Date.now() - lastFlushAt, charsSinceLastFlush)) return
+
+      lastFlushAt = Date.now()
+      lastFlushChars = finalContent.length + finalReasoning.length
+      lastFlushToolCalls = toolCalls.length
+      flushInFlight = d.chatStore.updateMessage(scope, messageId, {
+        content: finalContent,
+        reasoning: finalReasoning,
+        toolCalls,
+        status: 'streaming',
+      }).then(
+        () => {},
+        () => {
+          // Best-effort, same as the terminal write below: a failed intermediate checkpoint
+          // (adapter hiccup, transient error) must never abort the generation — it just means
+          // this one checkpoint didn't land; the next checkpoint or the terminal write tries
+          // again with the fuller content.
+        },
+      ).finally(() => { flushInFlight = null })
+    }
+
     try {
       const chat = await d.chatStore.getChat(scope, chatId)
       if (!chat) throw new Error(`Chat ${chatId} no longer exists.`)
@@ -406,10 +490,10 @@ export function createMakeBody(d: Deps): RunDeps['makeBody'] {
       d.manager.generationStart()
       try {
         await runGenerationLoop(d, ctx, emit, signal, {
-          onDelta: (t) => { finalContent += t },
-          onReasoning: (t) => { finalReasoning += t },
+          onDelta: (t) => { finalContent += t; maybeFlush() },
+          onReasoning: (t) => { finalReasoning += t; maybeFlush() },
           onError: (m) => { errorMessage = m },
-          onToolCall: (tc) => toolCalls.push(tc),
+          onToolCall: (tc) => { toolCalls.push(tc); maybeFlush(true) },
         })
       } finally {
         d.manager.generationEnd()
@@ -421,6 +505,11 @@ export function createMakeBody(d: Deps): RunDeps['makeBody'] {
       // adapter I/O (standing invariant, spec 27 §8.2).
       release?.()
     }
+
+    // Reconcile any still-in-flight periodic checkpoint before the terminal write below (see
+    // the long comment above): this promise never rejects (errors are swallowed inside
+    // `maybeFlush`), so this can't throw — it only guarantees ordering.
+    if (flushInFlight) await flushInFlight
 
     const aborted = signal.aborted
     const status = aborted ? 'aborted' as const : errorMessage ? 'failed' as const : 'complete' as const
