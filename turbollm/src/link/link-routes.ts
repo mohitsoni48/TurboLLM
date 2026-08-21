@@ -3,7 +3,8 @@ import { randomUUID } from 'node:crypto'
 import { hostname } from 'node:os'
 import type { Deps } from '../deps'
 import type { ApiKey } from '../config/config'
-import { linkAuth } from './link-auth'
+import { linkAuth, requireCapability } from './link-auth'
+import { allowsModel } from './capabilities'
 import { LINK_API_VERSIONS } from './protocol'
 import { LINK_CAPABILITIES, type HelloResponse } from './types'
 
@@ -84,5 +85,25 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
       ...(models ? { models } : {}),
     }
     return c.json(body)
+  })
+
+  linkApp.get('/api/link/v1/models', requireCapability('models:use'), (c) => {
+    const key = c.get('linkKey')
+    const loadedKey = d.manager.status().model?.key ?? null
+    const models = d.scanner.list().models
+      .filter((e) => allowsModel(key, e.key))
+      .map((e) => ({
+        key: e.key,
+        name: e.name,
+        quant: e.quant ?? null,
+        nativeCtx: e.nativeCtx ?? null,
+        vision: Boolean(e.vision),
+        loaded: e.key === loadedKey,
+      }))
+    // Deliberately does NOT include `path`. A peer has no business knowing the host's
+    // filesystem layout, and it is the kind of field that leaks by accident when a
+    // handler spreads the whole entry.
+    const daemon = d.store.snapshot().daemon as { machineName?: string }
+    return c.json({ machineName: resolveMachineName(daemon.machineName), models })
   })
 }
