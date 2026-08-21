@@ -8,8 +8,10 @@ import { Hono } from 'hono'
 import { ConversationStore } from '../chat/db.js'
 import { ChatStoreRouter } from '../chat/store/router.js'
 import { registerExtChatRoutes, type ExtRouteDeps } from './routes.chats.js'
+import { registerExtRunRoutes } from './routes.runs.js'
+import { PublicRunManager } from './run-manager.js'
 import { IdempotencyStore } from './idempotency.js'
-import { TenantLimiter } from './limits.js'
+import { TenantLimiter, MAX_BODY_BYTES, MAX_ATTACHMENTS } from './limits.js'
 import { AuditLog } from './audit.js'
 
 const ACME = 'Bearer tllm-ext-acme'
@@ -70,6 +72,74 @@ const json = (auth: string, body?: unknown) => ({
   headers: { Authorization: auth, 'Content-Type': 'application/json' },
   ...(body ? { body: JSON.stringify(body) } : {}),
 })
+
+// A second harness, mirroring what mount.ts actually wires in production: both
+// registerExtChatRoutes AND registerExtRunRoutes on the SAME app, sharing the SAME
+// PublicRunManager instance — required for I3 (the chat routes need a live run registry to
+// check `run_active` against) and I6 (the generate-forward request-id fix can only be observed
+// end-to-end through both route sets together). `bodyFactory` lets a test hold a run open
+// (gate it on an unresolved promise) to exercise the in-flight-guard tests. Mirrors
+// routes.runs.test.ts's own `harness()`.
+function harnessWithRuns(bodyFactory?: () => Promise<{ status: 'complete' | 'aborted' }>, ext?: ExtRouteDeps) {
+  const dir = mkdtempSync(join(tmpdir(), 'turbollm-ext-routes-runs-'))
+  const conv = new ConversationStore(dir)
+  const chatStore = new ChatStoreRouter(conv.chatStore, conv.chatStore)
+  const d = {
+    db: conv,
+    chatStore,
+    store: { snapshot: () => ({ apiKeys: [
+      { hash: keyHash(ACME), tenant: 'acme' },
+      { hash: keyHash(GLOBEX), tenant: 'globex' },
+    ] }) },
+    manager: {
+      status: () => ({ state: 'running', model: 'test-model' }),
+      target: () => 'http://127.0.0.1:9999',
+    },
+  } as never
+  const runs = new PublicRunManager()
+  const app = new Hono()
+  registerExtChatRoutes(app, d, ext, runs)
+  registerExtRunRoutes(app, d, runs, {
+    makeBody: () => async ({ emit }) => {
+      await emit({ event: 'delta', data: { content: 'hello' } })
+      return bodyFactory ? await bodyFactory() : { status: 'complete' as const }
+    },
+  }, ext)
+  return { app, runs, db: conv, cleanup: () => { conv.close(); rmSync(dir, { recursive: true, force: true }) } }
+}
+
+async function newChat(app: Hono, title = 'X'): Promise<string> {
+  const res = await app.request('/api/ext/v1/chats', json(ACME, { title, owner: 'u1' }))
+  return (await res.json() as { id: string }).id
+}
+
+/** Starts a generate run whose body never settles until released, so a test can exercise the
+ *  "a mutation while a generation is in flight" guard (I3) with a real, live run — not a
+ *  stubbed check. Exposes `settle()` (release the gate, await the run actually ending — leaves
+ *  the app/db usable afterward, for a test that wants to check post-settlement behavior too)
+ *  and `finish()` (settle, then tear the whole harness down) — always call exactly one of them,
+ *  success or failure, mirroring routes.runs.test.ts's own gate/release pattern ("a second run
+ *  on the same chat is refused...", "cancel aborts an in-flight run"). */
+async function startInFlightGeneration() {
+  let release: () => void = () => {}
+  const gate = new Promise<void>((r) => { release = r })
+  const { app, runs, cleanup } = harnessWithRuns(async () => { await gate; return { status: 'complete' as const } })
+  const chatId = await newChat(app, 'InFlight')
+  const genRes = await app.request(`/api/ext/v1/chats/${chatId}/messages`,
+    json(ACME, { role: 'user', content: 'hi', owner: 'u1' }))
+  assert.equal(genRes.status, 202, 'setup: the generate call itself must succeed')
+  const run = await genRes.json() as { id: string; message_id: string }
+  const list = await (await app.request(`/api/ext/v1/chats/${chatId}/messages?owner=u1`, json(ACME))).json() as {
+    data: Array<{ id: string; role: string }>
+  }
+  const userMessageId = list.data.find((m) => m.role === 'user')!.id
+  const settle = async () => { release(); await runs.settled(run.id) }
+  return {
+    app, runs, chatId, runId: run.id, userMessageId, assistantMessageId: run.message_id,
+    settle, cleanup,
+    finish: async () => { await settle(); cleanup() },
+  }
+}
 
 test('create and fetch a chat', async () => {
   const { app, cleanup } = harness()
@@ -390,6 +460,259 @@ test('a tenant that exceeds its configured request rate gets 429, while a differ
 
     const otherTenant = await app.request('/api/ext/v1/chats', post(GLOBEX, 'Unaffected'))
     assert.equal(otherTenant.status, 201, 'a different tenant is unaffected by acme exhausting its own budget')
+  } finally {
+    cleanup()
+  }
+})
+
+// ── C4 — attachments on POST /chats/:id/messages ───────────────────────────────────────────
+// Final-gate finding C4 (this route's portion — the generate-path portion was already fixed on
+// routes.runs.ts by a sibling task). Before this fix: `attachments`/`metadata` were never read
+// off the body at all, and validation rejected empty `content` unconditionally, so an
+// attachments-only message could never be created through this route in either the
+// `generate:false` or the default (forwarding) path.
+test('an attachments-only message (no content) is accepted with generate:false, and the attachment round-trips', async () => {
+  const { app, cleanup } = harness()
+  try {
+    const chatId = await (async () => {
+      const made = await app.request('/api/ext/v1/chats', json(ACME, { title: 'Attach', owner: 'u1' }))
+      return (await made.json() as { id: string }).id
+    })()
+    const res = await app.request(`/api/ext/v1/chats/${chatId}/messages`,
+      json(ACME, { role: 'user', owner: 'u1', generate: false, attachments: ['data:image/png;base64,AAA='] }))
+    assert.equal(res.status, 201, 'attachments alone must satisfy "type a message or attach a file"')
+    const msg = await res.json() as { id: string }
+
+    const got = await app.request(`/api/ext/v1/messages/${msg.id}?owner=u1&include=attachments`, json(ACME))
+    const full = await got.json() as { attachments: string[]; content: string }
+    assert.deepEqual(full.attachments, ['data:image/png;base64,AAA='])
+    assert.equal(full.content, '')
+  } finally {
+    cleanup()
+  }
+})
+
+test('metadata is also forwarded into addMessage on the generate:false path', async () => {
+  const { app, cleanup } = harness()
+  try {
+    const made = await app.request('/api/ext/v1/chats', json(ACME, { title: 'Meta', owner: 'u1' }))
+    const chat = await made.json() as { id: string }
+    const res = await app.request(`/api/ext/v1/chats/${chat.id}/messages`,
+      json(ACME, { role: 'user', content: 'hi', owner: 'u1', generate: false, metadata: { source: 'import' } }))
+    assert.equal(res.status, 201)
+    const msg = await res.json() as { id: string }
+
+    const got = await app.request(`/api/ext/v1/messages/${msg.id}?owner=u1&include=metadata`, json(ACME))
+    const full = await got.json() as { metadata: Record<string, unknown> }
+    assert.deepEqual(full.metadata, { source: 'import' })
+  } finally {
+    cleanup()
+  }
+})
+
+// The default path (`generate` omitted) forwards internally to .../messages/generate via
+// app.fetch — this covers that attachments survive THAT forward too, not just the
+// generate:false direct-write path above.
+test('an attachments-only message survives the internal forward to the generate route', async () => {
+  const { app, runs, cleanup } = harnessWithRuns()
+  try {
+    const chatId = await newChat(app, 'ForwardAttach')
+    const res = await app.request(`/api/ext/v1/chats/${chatId}/messages`,
+      json(ACME, { role: 'user', owner: 'u1', attachments: ['data:image/png;base64,BBB='] }))
+    assert.equal(res.status, 202, 'attachments alone must also satisfy the generating path')
+    const run = await res.json() as { id: string }
+    await runs.settled(run.id)
+
+    const list = await (await app.request(`/api/ext/v1/chats/${chatId}/messages?owner=u1&include=attachments`, json(ACME))).json() as {
+      data: Array<{ role: string; attachments: string[] }>
+    }
+    const user = list.data.find((m) => m.role === 'user')!
+    const assistant = list.data.find((m) => m.role === 'assistant')!
+    assert.deepEqual(user.attachments, ['data:image/png;base64,BBB='], 'the USER turn keeps the attachment')
+    assert.deepEqual(assistant.attachments, [], 'the assistant placeholder never receives attachments')
+  } finally {
+    cleanup()
+  }
+})
+
+// ── C5 — body/attachment limits on POST /chats/:id/messages ────────────────────────────────
+test('a message body over the byte limit is refused with 413 payload_too_large, and nothing is persisted', async () => {
+  const { app, cleanup } = harness()
+  try {
+    const chatId = await (async () => {
+      const made = await app.request('/api/ext/v1/chats', json(ACME, { title: 'TooBig', owner: 'u1' }))
+      return (await made.json() as { id: string }).id
+    })()
+    const oversized = 'x'.repeat(MAX_BODY_BYTES + 1)
+    const res = await app.request(`/api/ext/v1/chats/${chatId}/messages`,
+      json(ACME, { role: 'user', content: oversized, owner: 'u1', generate: false }))
+    assert.equal(res.status, 413)
+    assert.equal((await res.json() as { error: { code: string } }).error.code, 'payload_too_large')
+
+    const list = await (await app.request(`/api/ext/v1/chats/${chatId}/messages?owner=u1`, json(ACME))).json() as { data: unknown[] }
+    assert.equal(list.data.length, 0, 'the oversized write must not have been persisted')
+  } finally {
+    cleanup()
+  }
+})
+
+test('a message with more attachments than the limit is refused with 413 payload_too_large', async () => {
+  const { app, cleanup } = harness()
+  try {
+    const chatId = await (async () => {
+      const made = await app.request('/api/ext/v1/chats', json(ACME, { title: 'TooMany', owner: 'u1' }))
+      return (await made.json() as { id: string }).id
+    })()
+    const tooMany = Array.from({ length: MAX_ATTACHMENTS + 1 }, (_, i) => `data:x/${i}`)
+    const res = await app.request(`/api/ext/v1/chats/${chatId}/messages`,
+      json(ACME, { role: 'user', owner: 'u1', generate: false, attachments: tooMany }))
+    assert.equal(res.status, 413)
+    assert.equal((await res.json() as { error: { code: string } }).error.code, 'payload_too_large')
+  } finally {
+    cleanup()
+  }
+})
+
+test('GET /capabilities reports the exact limits enforced on message creation — they cannot drift', async () => {
+  const { app, cleanup } = harness()
+  try {
+    const res = await app.request('/api/ext/v1/capabilities', { headers: { Authorization: ACME } })
+    const caps = await res.json() as { limits: { max_body_bytes: number; max_attachments: number } }
+    assert.equal(caps.limits.max_body_bytes, MAX_BODY_BYTES)
+    assert.equal(caps.limits.max_attachments, MAX_ATTACHMENTS)
+  } finally {
+    cleanup()
+  }
+})
+
+// ── I3 — run_active 409 guard on chat/message mutation ──────────────────────────────────────
+test('PATCH /chats/:id is refused with 409 run_active while a generation is in flight', async () => {
+  const ctx = await startInFlightGeneration()
+  try {
+    const res = await ctx.app.request(`/api/ext/v1/chats/${ctx.chatId}`, {
+      method: 'PATCH',
+      headers: { Authorization: ACME, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'Changed mid-run', owner: 'u1' }),
+    })
+    assert.equal(res.status, 409)
+    assert.equal((await res.json() as { error: { code: string } }).error.code, 'run_active')
+  } finally {
+    await ctx.finish()
+  }
+})
+
+test('DELETE /chats/:id is refused with 409 run_active while a generation is in flight', async () => {
+  const ctx = await startInFlightGeneration()
+  try {
+    const res = await ctx.app.request(`/api/ext/v1/chats/${ctx.chatId}?owner=u1`, {
+      method: 'DELETE',
+      headers: { Authorization: ACME },
+    })
+    assert.equal(res.status, 409)
+    assert.equal((await res.json() as { error: { code: string } }).error.code, 'run_active')
+  } finally {
+    await ctx.finish()
+  }
+})
+
+test('PATCH /messages/:id is refused with 409 run_active while a generation is in flight for its chat', async () => {
+  const ctx = await startInFlightGeneration()
+  try {
+    const res = await ctx.app.request(`/api/ext/v1/messages/${ctx.assistantMessageId}`, {
+      method: 'PATCH',
+      headers: { Authorization: ACME, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'edited mid-run', owner: 'u1' }),
+    })
+    assert.equal(res.status, 409)
+    assert.equal((await res.json() as { error: { code: string } }).error.code, 'run_active')
+  } finally {
+    await ctx.finish()
+  }
+})
+
+test('DELETE /messages/:id is refused with 409 run_active while a generation is in flight for its chat', async () => {
+  const ctx = await startInFlightGeneration()
+  try {
+    const res = await ctx.app.request(`/api/ext/v1/messages/${ctx.userMessageId}?owner=u1`, {
+      method: 'DELETE',
+      headers: { Authorization: ACME },
+    })
+    assert.equal(res.status, 409)
+    assert.equal((await res.json() as { error: { code: string } }).error.code, 'run_active')
+  } finally {
+    await ctx.finish()
+  }
+})
+
+test('once the run ends, the same mutation that was refused with run_active succeeds', async () => {
+  const ctx = await startInFlightGeneration()
+  try {
+    const duringRun = await ctx.app.request(`/api/ext/v1/chats/${ctx.chatId}`, {
+      method: 'PATCH',
+      headers: { Authorization: ACME, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'Changed mid-run', owner: 'u1' }),
+    })
+    assert.equal(duringRun.status, 409, 'sanity: still in flight at this point')
+
+    // Runs SETTLED (endedAt set) are no longer "active" — hasActiveRun filters on !endedAt —
+    // so the identical mutation must now succeed rather than being permanently blocked.
+    await ctx.settle()
+    const after = await ctx.app.request(`/api/ext/v1/chats/${ctx.chatId}`, {
+      method: 'PATCH',
+      headers: { Authorization: ACME, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'Changed after run', owner: 'u1' }),
+    })
+    assert.equal(after.status, 200, 'a settled run must not permanently block mutation of its chat')
+  } finally {
+    ctx.cleanup()
+  }
+})
+
+// ── I6 — generate-forward request-id correlation ────────────────────────────────────────────
+test('the generate-forward preserves the request id: message.create and run.start audit rows correlate even when the client sends none', async () => {
+  const { app, runs, cleanup } = harnessWithRuns()
+  try {
+    const chatId = await newChat(app, 'Correlate')
+    // Deliberately no X-Request-Id header — this is the exact case that was broken: without a
+    // client-supplied id, the outer request minted one and the re-entered forwarded request
+    // independently minted a SECOND, uncorrelated one.
+    const res = await app.request(`/api/ext/v1/chats/${chatId}/messages`,
+      json(ACME, { role: 'user', content: 'hi', owner: 'u1' }))
+    assert.equal(res.status, 202)
+    const run = await res.json() as { id: string }
+    await runs.settled(run.id)
+
+    const rows = await auditRows(app)
+    const createRow = rows.find((r) => r.action === 'message.create')
+    const startRow = rows.find((r) => r.action === 'run.start')
+    assert.ok(createRow, 'expected a message.create row')
+    assert.ok(startRow, 'expected a run.start row')
+    assert.ok(createRow!.request_id.length > 0 && createRow!.request_id !== 'unknown')
+    assert.equal(createRow!.request_id, startRow!.request_id,
+      'both audit rows for one logical call must share the same request id')
+  } finally {
+    cleanup()
+  }
+})
+
+test('the generate-forward still honors a CLIENT-supplied X-Request-Id end to end', async () => {
+  const { app, runs, cleanup } = harnessWithRuns()
+  try {
+    const chatId = await newChat(app, 'CorrelateClient')
+    const res = await app.request(`/api/ext/v1/chats/${chatId}/messages`, {
+      method: 'POST',
+      headers: { Authorization: ACME, 'Content-Type': 'application/json', 'X-Request-Id': 'req_client_supplied' },
+      body: JSON.stringify({ role: 'user', content: 'hi', owner: 'u1' }),
+    })
+    assert.equal(res.status, 202)
+    const run = await res.json() as { id: string }
+    await runs.settled(run.id)
+
+    const rows = await auditRows(app)
+    const createRow = rows.find((r) => r.action === 'message.create')
+    const startRow = rows.find((r) => r.action === 'run.start')
+    assert.equal(createRow!.request_id, 'req_client_supplied')
+    assert.equal(startRow!.request_id, 'req_client_supplied', 'the forward must carry the CLIENT id through, not mint its own')
   } finally {
     cleanup()
   }

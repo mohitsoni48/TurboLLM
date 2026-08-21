@@ -7,12 +7,17 @@
 import type { Hono } from 'hono'
 import { requestId as requestIdMiddleware } from 'hono/request-id'
 import type { Deps } from '../deps.js'
+import type { Scope } from '../chat/store/types.js'
 import { extAuth, requireScope, scopeFor } from './auth.js'
 import { extError, mapStoreError, requestId as makeRequestId } from './errors.js'
 import { parseInclude, toChatDTO, toMessageDTO } from './dto.js'
 import { IdempotencyStore } from './idempotency.js'
-import { TenantLimiter, DEFAULT_MAX_IN_FLIGHT_PER_TENANT, DEFAULT_REQUESTS_PER_MINUTE_PER_TENANT } from './limits.js'
+import {
+  TenantLimiter, DEFAULT_MAX_IN_FLIGHT_PER_TENANT, DEFAULT_REQUESTS_PER_MINUTE_PER_TENANT,
+  MAX_BODY_BYTES, MAX_ATTACHMENTS,
+} from './limits.js'
 import { AuditLog, auditMiddleware, recordRateLimitRefusal, toAuditDTO } from './audit.js'
+import type { PublicRunManager } from './run-manager.js'
 
 const BASE = '/api/ext/v1'
 /** Operation tag for `IdempotencyStore` (see idempotency.ts's own header comment on why this
@@ -31,14 +36,28 @@ export interface ExtRouteDeps {
   audit?: AuditLog
 }
 
+/** Spec 27 §7.2: mutating a chat/message while a generation is in flight for that chat must
+ *  409 `run_active` rather than let the mutation race the run's own terminal write (see C2's
+ *  fix in generation.ts — a mid-stream flush now exists, but a delete/edit racing it is still
+ *  a genuine correctness problem, not just a cosmetic one). `runs` is optional for the same
+ *  reason `ext` is (below): a pre-existing test harness that constructs this route set with no
+ *  run manager at all (nothing here needs one to compile or to exercise the chat/message CRUD
+ *  surface in isolation) must keep working exactly as before — undefined ⇒ never refuse a
+ *  mutation on this ground, which is exactly what happened before this fix existed. */
+function hasActiveRun(runs: PublicRunManager | undefined, scope: Scope, chatId: string): boolean {
+  if (!runs) return false
+  return runs.list(scope.tenant, scope.owner).some((r) => r.chatId === chatId && !r.endedAt)
+}
+
 /** `ext` is optional so every pre-existing test/caller that constructs this route set without
  *  it (mount.ts always supplies a shared instance in production; only ad-hoc test harnesses
  *  omit it) keeps compiling and behaving exactly as before — a private, generously-capped
  *  instance is created here as the fallback rather than making callers thread it through for
  *  tests that don't care about idempotency or rate limiting at all. `audit` similarly falls
  *  back to a private instance over the SAME connection (`d.db`) rather than forcing every
- *  ad-hoc test harness to construct one just to compile. */
-export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps): void {
+ *  ad-hoc test harness to construct one just to compile. `runs` is optional/undocumented here
+ *  by the same convention — see `hasActiveRun`'s own comment just above. */
+export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, runs?: PublicRunManager): void {
   const idempotency = ext?.idempotency ?? new IdempotencyStore()
   const limiter = ext?.limiter ?? new TenantLimiter({
     maxInFlight: DEFAULT_MAX_IN_FLIGHT_PER_TENANT,
@@ -84,7 +103,10 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps): v
 
   app.get(`${BASE}/capabilities`, (c) => c.json({
     capabilities: d.chatStore.capabilities,
-    limits: { max_page_size: 200, max_body_bytes: 1_048_576, max_attachments: 4 },
+    // MAX_BODY_BYTES/MAX_ATTACHMENTS (limits.ts) are the single source of truth — imported, not
+    // re-hardcoded, so what this advertises can never drift from what is actually enforced below
+    // and on the generate route (routes.runs.ts).
+    limits: { max_page_size: 200, max_body_bytes: MAX_BODY_BYTES, max_attachments: MAX_ATTACHMENTS },
   }))
 
   app.get(`${BASE}/chats`, requireScope('chats:read'), async (c) => {
@@ -164,9 +186,16 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps): v
 
   app.patch(`${BASE}/chats/:id`, auditMiddleware(audit, 'chat.update'), requireScope('chats:write'), async (c) => {
     const b = await body<{ title: string; system_prompt: string; sampling: Record<string, unknown>; metadata: Record<string, unknown>; owner: string; if_version: number }>(c)
+    const scope = scopeFor(c, b.owner)
+    const chatId = c.req.param('id')
+    // Spec §7.2: a chat with an active generation must refuse mutation with 409 run_active
+    // rather than let this race the run's own terminal write (see hasActiveRun's own comment).
+    if (hasActiveRun(runs, scope, chatId)) {
+      return extError(c, 'conflict', 'run_active', 'A generation is currently running for this chat.', { retryable: true })
+    }
     try {
       const chat = await d.chatStore.updateChat(
-        scopeFor(c, b.owner), c.req.param('id'),
+        scope, chatId,
         { title: b.title, systemPrompt: b.system_prompt, sampling: b.sampling, metadata: b.metadata },
         b.if_version,
       )
@@ -179,8 +208,13 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps): v
   })
 
   app.delete(`${BASE}/chats/:id`, auditMiddleware(audit, 'chat.delete'), requireScope('chats:write'), async (c) => {
+    const scope = scopeFor(c, c.req.query('owner'))
+    const chatId = c.req.param('id')
+    if (hasActiveRun(runs, scope, chatId)) {
+      return extError(c, 'conflict', 'run_active', 'A generation is currently running for this chat.', { retryable: true })
+    }
     try {
-      const gone = await d.chatStore.deleteChat(scopeFor(c, c.req.query('owner')), c.req.param('id'))
+      const gone = await d.chatStore.deleteChat(scope, chatId)
       if (!gone) return extError(c, 'not_found', 'not_found', 'Not found.')
       return c.body(null, 204)
     } catch (e) {
@@ -204,13 +238,38 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps): v
   })
 
   app.post(`${BASE}/chats/:id/messages`, auditMiddleware(audit, 'message.create'), requireScope('chats:write'), async (c) => {
-    const b = await body<{ role: 'user' | 'assistant'; content: string; reasoning: string; owner: string; generate: boolean }>(c)
+    const b = await body<{
+      role: 'user' | 'assistant'; content: string; reasoning: string; owner: string; generate: boolean
+      attachments?: string[]; metadata?: Record<string, unknown>
+    }>(c)
     const content = (b.content ?? '').trim()
-    if (!content) return extError(c, 'invalid_request', 'invalid_input', 'Type a message or attach a file.', { param: 'content' })
+    const attachments = b.attachments
+    // "Type a message OR attach a file" (spec 27 §3.2/§5.1) — content alone is no longer the
+    // only way to satisfy this; an attachments-only message is legitimate and must not be
+    // rejected just because `content` trims to empty. Mirrors the generate route's identical
+    // check (routes.runs.ts) so both message-creation paths honor the same rule.
+    if (!content && !(attachments?.length)) return extError(c, 'invalid_request', 'invalid_input', 'Type a message or attach a file.', { param: 'content' })
+
+    // Body/attachment caps (spec 27 §4.1), checked purely from the request body — before ANY
+    // store I/O — same discipline and the SAME imported constants (limits.ts) the generate
+    // route (routes.runs.ts) enforces, so the two routes' behavior is identical and neither can
+    // drift from what GET /capabilities advertises.
+    const bodyBytes = Buffer.byteLength(content, 'utf8')
+    if (bodyBytes > MAX_BODY_BYTES) {
+      return extError(c, 'invalid_request', 'payload_too_large',
+        `Message content is ${bodyBytes} bytes, exceeding the ${MAX_BODY_BYTES}-byte limit.`,
+        { status: 413, param: 'content' })
+    }
+    if (attachments && attachments.length > MAX_ATTACHMENTS) {
+      return extError(c, 'invalid_request', 'payload_too_large',
+        `Message has ${attachments.length} attachments, exceeding the ${MAX_ATTACHMENTS}-attachment limit.`,
+        { status: 413, param: 'attachments' })
+    }
+
     if (b.generate === false) {
       try {
         const msg = await d.chatStore.addMessage(scopeFor(c, b.owner), c.req.param('id'), {
-          role: b.role ?? 'user', content, reasoning: b.reasoning,
+          role: b.role ?? 'user', content, reasoning: b.reasoning, attachments, metadata: b.metadata,
         })
         // The real created message id — this route's own `:id` param names the CHAT, not the
         // message just created, so without this the audit row would point at the parent.
@@ -225,9 +284,20 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps): v
     // same content validator instead of duplicating it. That route re-derives scope from the
     // forwarded Authorization header — never from this request's already-resolved scope — so
     // its own tenant/owner checks stay the single source of truth.
+    //
+    // Headers are cloned (not passed through as-is) so `X-Request-Id` can be pinned to THIS
+    // request's own resolved id (`c.get('requestId')` — set by the request-id middleware above,
+    // from an inbound header or freshly generated) before the forward. Passing
+    // `c.req.raw.headers` straight through only carries the id when the CLIENT itself supplied
+    // one; when it didn't, hono/request-id mints a fresh id for the re-entered forwarded
+    // request too, so the `message.create` row here and the `run.start` row the generate route
+    // writes end up with two different, uncorrelated request ids for one logical call — the
+    // audit trail's whole point is per-request correlation, so this is what keeps that intact.
+    const fwdHeaders = new Headers(c.req.raw.headers)
+    fwdHeaders.set('X-Request-Id', c.get('requestId'))
     return app.fetch(new Request(new URL(`${BASE}/chats/${c.req.param('id')}/messages/generate`, c.req.url), {
       method: 'POST',
-      headers: c.req.raw.headers,
+      headers: fwdHeaders,
       body: JSON.stringify({ ...b, content }),
     }))
   })
@@ -245,9 +315,19 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps): v
 
   app.patch(`${BASE}/messages/:id`, auditMiddleware(audit, 'message.update'), requireScope('chats:write'), async (c) => {
     const b = await body<{ content: string; metadata: Record<string, unknown>; owner: string; if_version: number }>(c)
+    const scope = scopeFor(c, b.owner)
+    const id = c.req.param('id')
     try {
+      // A message's `:id` names the message, not its parent chat, so the active-run check
+      // (spec §7.2) needs a lookup first to learn which chat this message even belongs to —
+      // unlike the /chats/:id routes above, which already have the chat id from the URL.
+      const existing = await d.chatStore.getMessage(scope, id)
+      if (!existing) return extError(c, 'not_found', 'not_found', 'Not found.')
+      if (hasActiveRun(runs, scope, existing.chatId)) {
+        return extError(c, 'conflict', 'run_active', 'A generation is currently running for this chat.', { retryable: true })
+      }
       const msg = await d.chatStore.updateMessage(
-        scopeFor(c, b.owner), c.req.param('id'),
+        scope, id,
         { content: b.content, metadata: b.metadata, edited: true },
         b.if_version,
       )
@@ -260,8 +340,15 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps): v
   })
 
   app.delete(`${BASE}/messages/:id`, auditMiddleware(audit, 'message.delete'), requireScope('chats:write'), async (c) => {
+    const scope = scopeFor(c, c.req.query('owner'))
+    const id = c.req.param('id')
     try {
-      const gone = await d.chatStore.deleteMessage(scopeFor(c, c.req.query('owner')), c.req.param('id'))
+      const existing = await d.chatStore.getMessage(scope, id)
+      if (!existing) return extError(c, 'not_found', 'not_found', 'Not found.')
+      if (hasActiveRun(runs, scope, existing.chatId)) {
+        return extError(c, 'conflict', 'run_active', 'A generation is currently running for this chat.', { retryable: true })
+      }
+      const gone = await d.chatStore.deleteMessage(scope, id)
       if (!gone) return extError(c, 'not_found', 'not_found', 'Not found.')
       return c.body(null, 204)
     } catch (e) {

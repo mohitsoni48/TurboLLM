@@ -44,7 +44,11 @@ export function mountExtApi(app: Hono, d: Deps, runs: PublicRunManager, rd: RunD
     // and a run mutation for the same tenant land in the same table via the same instance.
     audit: new AuditLog(d.db),
   }
-  registerExtChatRoutes(app, d, ext)
+  // `runs` is threaded into the chat routes too (not just the run routes) so a chat/message
+  // mutation can refuse with 409 run_active while a generation is in flight for that chat
+  // (spec §7.2) — see routes.chats.ts's `hasActiveRun` for why this needs the SAME manager
+  // instance the generate route starts runs on, not a second one.
+  registerExtChatRoutes(app, d, ext, runs)
   registerExtRunRoutes(app, d, runs, rd, ext)
   // The document a client reads to discover the schema in the first place (Phase 4 Task 4).
   // Registered after the chat/run routes purely for source-order clarity — Hono matches this
