@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import { Hono } from 'hono'
 import { ConversationStore } from '../chat/db.js'
 import { ChatStoreRouter } from '../chat/store/router.js'
+import type { ChatStore } from '../chat/store/chat-store.js'
 import { registerExtChatRoutes, type ExtRouteDeps } from './routes.chats.js'
 import { registerExtRunRoutes } from './routes.runs.js'
 import { PublicRunManager } from './run-manager.js'
@@ -106,6 +107,53 @@ function harnessWithRuns(bodyFactory?: () => Promise<{ status: 'complete' | 'abo
     },
   }, ext)
   return { app, runs, db: conv, cleanup: () => { conv.close(); rmSync(dir, { recursive: true, force: true }) } }
+}
+
+// N4 (final-gate fix round) regression fixture: wraps a real ChatStore so `getChat` awaits
+// `gate` before proceeding, so a test can park a generate request precisely in the window
+// between routes.runs.ts's synchronous chat reservation (`runs.reserveChat`, held before ANY
+// `await`) and `runs.start()` actually creating a `PublicRun` record. Before the fix,
+// `hasActiveRun()` only consulted `runs.list()` and so could not see the chat as active until
+// several real `await`s later — a mutation racing this exact window was wrongly admitted
+// (live-reproduced: a DELETE succeeded with 204 here). Mirrors routes.runs.test.ts's
+// `chatStoreThatThrows` Proxy pattern, but delays instead of throwing.
+function chatStoreThatDelaysGetChat(base: ChatStore, gate: Promise<void>): ChatStore {
+  return new Proxy(base, {
+    get(target, prop, receiver) {
+      if (prop === 'getChat') {
+        return async (...args: unknown[]) => {
+          await gate
+          return (target.getChat as (...a: unknown[]) => unknown).apply(target, args)
+        }
+      }
+      return Reflect.get(target, prop, receiver)
+    },
+  }) as ChatStore
+}
+
+function harnessWithRunsDelayedGetChat(gate: Promise<void>) {
+  const dir = mkdtempSync(join(tmpdir(), 'turbollm-ext-routes-delay-'))
+  const conv = new ConversationStore(dir)
+  const chatStore = chatStoreThatDelaysGetChat(new ChatStoreRouter(conv.chatStore, conv.chatStore), gate)
+  const d = {
+    db: conv,
+    chatStore,
+    store: { snapshot: () => ({ apiKeys: [{ hash: keyHash(ACME), tenant: 'acme' }] }) },
+    manager: {
+      status: () => ({ state: 'running', model: 'test-model' }),
+      target: () => 'http://127.0.0.1:9999',
+    },
+  } as never
+  const runs = new PublicRunManager()
+  const app = new Hono()
+  registerExtChatRoutes(app, d, undefined, runs)
+  registerExtRunRoutes(app, d, runs, {
+    makeBody: () => async ({ emit }) => {
+      await emit({ event: 'delta', data: { content: 'hello' } })
+      return { status: 'complete' as const }
+    },
+  })
+  return { app, runs, cleanup: () => { conv.close(); rmSync(dir, { recursive: true, force: true }) } }
 }
 
 async function newChat(app: Hono, title = 'X'): Promise<string> {
@@ -327,6 +375,43 @@ test('a fresh Idempotency-Key on POST /chats still creates a genuinely new chat'
     const first = await (await app.request('/api/ext/v1/chats', post('ik-a'))).json() as { id: string }
     const second = await (await app.request('/api/ext/v1/chats', post('ik-b'))).json() as { id: string }
     assert.notEqual(first.id, second.id, 'a different key must not be treated as a replay')
+  } finally {
+    cleanup()
+  }
+})
+
+// ── N1 (final-gate fix round) — IdempotencyStore was not scoped by owner ───────────────────
+// Live-reproduced in the review this fixes: Owner A creates a chat with a shared
+// Idempotency-Key and private metadata; Owner B (SAME tenant, SAME key, different body) replays
+// that key and got back Owner A's exact chat object, private metadata included. `owner` is now
+// part of the cache key (idempotency.ts), so a different owner reusing the value must get a
+// genuinely fresh result, never the other owner's cached data.
+test('a same-tenant, different-owner replay of an Idempotency-Key on POST /chats gets a fresh chat, never the other owner\'s', async () => {
+  const { app, cleanup } = harness()
+  try {
+    const sharedKey = 'ik-cross-owner'
+    const ownerARes = await app.request('/api/ext/v1/chats', {
+      method: 'POST',
+      headers: { Authorization: ACME, 'Content-Type': 'application/json', 'Idempotency-Key': sharedKey },
+      body: JSON.stringify({ title: 'Owner A private chat', owner: 'owner-a', metadata: { secret: 'owner-A-only-data' } }),
+    })
+    assert.equal(ownerARes.status, 201)
+    const ownerAChat = await ownerARes.json() as { id: string; title: string; metadata?: Record<string, unknown> }
+    assert.equal(ownerAChat.metadata?.secret, 'owner-A-only-data', 'sanity: owner A\'s private metadata was actually stored')
+
+    // Owner B: SAME tenant, SAME Idempotency-Key VALUE, different owner and different body.
+    const ownerBRes = await app.request('/api/ext/v1/chats', {
+      method: 'POST',
+      headers: { Authorization: ACME, 'Content-Type': 'application/json', 'Idempotency-Key': sharedKey },
+      body: JSON.stringify({ title: 'Owner B chat', owner: 'owner-b' }),
+    })
+    assert.equal(ownerBRes.status, 201)
+    const ownerBChat = await ownerBRes.json() as { id: string; title: string; owner: string; metadata?: Record<string, unknown> }
+
+    assert.notEqual(ownerBChat.id, ownerAChat.id, 'owner B must get a genuinely fresh chat, not owner A\'s replayed result')
+    assert.equal(ownerBChat.title, 'Owner B chat', 'owner B\'s own request must actually execute, not return owner A\'s cached data')
+    assert.equal(ownerBChat.owner, 'owner-b')
+    assert.notEqual(ownerBChat.metadata?.secret, 'owner-A-only-data', 'owner B must never see owner A\'s private metadata')
   } finally {
     cleanup()
   }
@@ -573,6 +658,116 @@ test('a message with more attachments than the limit is refused with 413 payload
   }
 })
 
+// ── N5 (final-gate fix round) — 413 enforcement checked attachment COUNT, never byte SIZE ──
+test('attachments whose total byte size exceeds the limit are refused with 413, even with only a few of them', async () => {
+  const { app, cleanup } = harness()
+  try {
+    const chatId = await (async () => {
+      const made = await app.request('/api/ext/v1/chats', json(ACME, { title: 'BigAttach', owner: 'u1' }))
+      return (await made.json() as { id: string }).id
+    })()
+    // Two attachments, well under MAX_ATTACHMENTS, but their combined byte size exceeds
+    // MAX_BODY_BYTES — the count check alone would have admitted this.
+    const huge = 'x'.repeat(Math.ceil(MAX_BODY_BYTES / 2) + 1)
+    const res = await app.request(`/api/ext/v1/chats/${chatId}/messages`,
+      json(ACME, { role: 'user', owner: 'u1', generate: false, attachments: [huge, huge] }))
+    assert.equal(res.status, 413)
+    assert.equal((await res.json() as { error: { code: string } }).error.code, 'payload_too_large')
+
+    const list = await (await app.request(`/api/ext/v1/chats/${chatId}/messages?owner=u1`, json(ACME))).json() as { data: unknown[] }
+    assert.equal(list.data.length, 0, 'the oversized write must not have been persisted')
+  } finally {
+    cleanup()
+  }
+})
+
+test('a metadata blob over the byte limit is refused with 413, even with tiny content', async () => {
+  const { app, cleanup } = harness()
+  try {
+    const chatId = await (async () => {
+      const made = await app.request('/api/ext/v1/chats', json(ACME, { title: 'BigMeta', owner: 'u1' }))
+      return (await made.json() as { id: string }).id
+    })()
+    const res = await app.request(`/api/ext/v1/chats/${chatId}/messages`,
+      json(ACME, { role: 'user', content: 'hi', owner: 'u1', generate: false, metadata: { blob: 'x'.repeat(MAX_BODY_BYTES + 1) } }))
+    assert.equal(res.status, 413)
+    assert.equal((await res.json() as { error: { code: string } }).error.code, 'payload_too_large')
+
+    const list = await (await app.request(`/api/ext/v1/chats/${chatId}/messages?owner=u1`, json(ACME))).json() as { data: unknown[] }
+    assert.equal(list.data.length, 0, 'the oversized write must not have been persisted')
+  } finally {
+    cleanup()
+  }
+})
+
+// ── N6 (final-gate fix round) — PATCH /messages/:id had no body-size enforcement at all ────
+test('PATCH /messages/:id refuses an over-limit content edit with 413, and does not persist it', async () => {
+  const { app, cleanup } = harness()
+  try {
+    const made = await app.request('/api/ext/v1/chats', json(ACME, { title: 'EditLimit', owner: 'u1' }))
+    const chat = await made.json() as { id: string }
+    const created = await app.request(`/api/ext/v1/chats/${chat.id}/messages`,
+      json(ACME, { role: 'user', content: 'small', owner: 'u1', generate: false }))
+    const msg = await created.json() as { id: string; content: string }
+
+    const oversized = 'x'.repeat(MAX_BODY_BYTES + 1)
+    const res = await app.request(`/api/ext/v1/messages/${msg.id}`, {
+      method: 'PATCH',
+      headers: { Authorization: ACME, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: oversized, owner: 'u1' }),
+    })
+    assert.equal(res.status, 413)
+    assert.equal((await res.json() as { error: { code: string } }).error.code, 'payload_too_large')
+
+    const got = await (await app.request(`/api/ext/v1/messages/${msg.id}?owner=u1`, json(ACME))).json() as { content: string }
+    assert.equal(got.content, 'small', 'the edit must not have been persisted — the original content stands')
+  } finally {
+    cleanup()
+  }
+})
+
+test('PATCH /messages/:id refuses an over-limit metadata edit with 413', async () => {
+  const { app, cleanup } = harness()
+  try {
+    const made = await app.request('/api/ext/v1/chats', json(ACME, { title: 'EditMetaLimit', owner: 'u1' }))
+    const chat = await made.json() as { id: string }
+    const created = await app.request(`/api/ext/v1/chats/${chat.id}/messages`,
+      json(ACME, { role: 'user', content: 'small', owner: 'u1', generate: false }))
+    const msg = await created.json() as { id: string }
+
+    const res = await app.request(`/api/ext/v1/messages/${msg.id}`, {
+      method: 'PATCH',
+      headers: { Authorization: ACME, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ metadata: { blob: 'x'.repeat(MAX_BODY_BYTES + 1) }, owner: 'u1' }),
+    })
+    assert.equal(res.status, 413)
+    assert.equal((await res.json() as { error: { code: string } }).error.code, 'payload_too_large')
+  } finally {
+    cleanup()
+  }
+})
+
+test('PATCH /messages/:id still succeeds normally for an in-limit edit', async () => {
+  const { app, cleanup } = harness()
+  try {
+    const made = await app.request('/api/ext/v1/chats', json(ACME, { title: 'EditOk', owner: 'u1' }))
+    const chat = await made.json() as { id: string }
+    const created = await app.request(`/api/ext/v1/chats/${chat.id}/messages`,
+      json(ACME, { role: 'user', content: 'small', owner: 'u1', generate: false }))
+    const msg = await created.json() as { id: string }
+
+    const res = await app.request(`/api/ext/v1/messages/${msg.id}`, {
+      method: 'PATCH',
+      headers: { Authorization: ACME, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'edited', owner: 'u1' }),
+    })
+    assert.equal(res.status, 200)
+    assert.equal((await res.json() as { content: string }).content, 'edited')
+  } finally {
+    cleanup()
+  }
+})
+
 test('GET /capabilities reports the exact limits enforced on message creation — they cannot drift', async () => {
   const { app, cleanup } = harness()
   try {
@@ -668,6 +863,47 @@ test('once the run ends, the same mutation that was refused with run_active succ
   }
 })
 
+// ── N4 (final-gate fix round) — hasActiveRun() and the generate route's own reservation used
+// to be two independent, disagreeing mechanisms ───────────────────────────────────────────────
+// Before the fix, routes.runs.ts reserved its private `inflight` map slot synchronously (I5),
+// but `hasActiveRun()` only consulted `PublicRunManager.list()`, which gained an entry several
+// real `await`s later (once `runs.start()` actually ran, past `getChat`/`loadFullHistory`/two
+// `addMessage` calls). Live-reproduced: with `getChat` delayed, a DELETE fired in that window
+// succeeded with 204 instead of being blocked by `run_active`. Both routes now consult the same
+// `PublicRunManager.isChatActive`/`reserveChat`, so this window cannot exist any more.
+test('DELETE /chats/:id is refused with 409 run_active in the window before runs.start() completes (N4 regression)', async () => {
+  let release: () => void = () => {}
+  const gate = new Promise<void>((r) => { release = r })
+  const { app, runs, cleanup } = harnessWithRunsDelayedGetChat(gate)
+  try {
+    // Chat creation does not go through the delayed `getChat`, so this resolves immediately.
+    const made = await app.request('/api/ext/v1/chats', json(ACME, { title: 'Race', owner: 'u1' }))
+    const chat = await made.json() as { id: string }
+
+    // Fire the generate request — it reserves the chat SYNCHRONOUSLY, then blocks inside the
+    // delayed `getChat`, well before `runs.start()` creates any `PublicRun` record.
+    const genPromise = app.request(`/api/ext/v1/chats/${chat.id}/messages/generate`,
+      json(ACME, { role: 'user', content: 'hi', owner: 'u1' }))
+
+    // Give the generate request's synchronous prefix (through the reservation) a chance to run
+    // before we fire the racing mutation — the gate is not released yet, so however long this
+    // waits, the generate request cannot have progressed past it.
+    await new Promise((r) => setTimeout(r, 20))
+
+    const del = await app.request(`/api/ext/v1/chats/${chat.id}?owner=u1`, { method: 'DELETE', headers: { Authorization: ACME } })
+    assert.equal(del.status, 409, 'the chat must be seen as active from the moment the generate route reserves it, not only once a PublicRun record exists')
+    assert.equal((await del.json() as { error: { code: string } }).error.code, 'run_active')
+
+    release()
+    const genRes = await genPromise
+    assert.equal(genRes.status, 202, 'sanity: the generate request itself must still have succeeded once unblocked')
+    const run = await genRes.json() as { id: string }
+    await runs.settled(run.id)
+  } finally {
+    cleanup()
+  }
+})
+
 // ── I6 — generate-forward request-id correlation ────────────────────────────────────────────
 test('the generate-forward preserves the request id: message.create and run.start audit rows correlate even when the client sends none', async () => {
   const { app, runs, cleanup } = harnessWithRuns()
@@ -713,6 +949,84 @@ test('the generate-forward still honors a CLIENT-supplied X-Request-Id end to en
     const startRow = rows.find((r) => r.action === 'run.start')
     assert.equal(createRow!.request_id, 'req_client_supplied')
     assert.equal(startRow!.request_id, 'req_client_supplied', 'the forward must carry the CLIENT id through, not mint its own')
+  } finally {
+    cleanup()
+  }
+})
+
+// ── N7 (final-gate fix round) — generate-forward double-charged the rate limit and
+// mis-attributed the message.create audit row ──────────────────────────────────────────────
+// `POST /chats/:id/messages` (the documented primary use case) forwards internally via
+// `app.fetch(new Request(...))`, which re-enters the full middleware stack — including the
+// blanket per-tenant rate limiter — a SECOND time for one client-visible call. Separately, the
+// outer route's own `message.create` audit row never got `auditTargetId` set on this branch, so
+// it fell back to the chat id instead of the real created message id.
+test('the forwarding path (default POST /chats/:id/messages) consumes exactly ONE rate-limit unit, not two', async () => {
+  // Budget of 3: `newChat` below itself makes a `POST /chats` call that consumes one unit of
+  // the SAME shared per-tenant budget (the blanket limiter covers the whole surface, not just
+  // the forwarding route) — accounted for here so the remaining math isolates exactly what the
+  // forwarding call itself consumes.
+  const ext: ExtRouteDeps = { idempotency: new IdempotencyStore(), limiter: new TenantLimiter({ maxInFlight: 100, ratePerMinute: 3 }) }
+  const { app, runs, cleanup } = harnessWithRuns(undefined, ext)
+  try {
+    const chatId = await newChat(app, 'RateForward')   // consumes 1 of 3
+    const res = await app.request(`/api/ext/v1/chats/${chatId}/messages`,
+      json(ACME, { role: 'user', content: 'hi', owner: 'u1' }))
+    assert.equal(res.status, 202, 'the one logical call itself must be admitted')
+    const run = await res.json() as { id: string }
+    await runs.settled(run.id)
+
+    // If the forward had double-charged (the N7 bug), this ONE logical call would have consumed
+    // 2 of the remaining 2 units (newChat's 1 + the forward's 2 = 3 total), exhausting the
+    // budget — and this THIRD, entirely separate request would be refused. A correctly
+    // single-charged forward leaves exactly one unit for it.
+    const third = await app.request('/api/ext/v1/capabilities', { headers: { Authorization: ACME } })
+    assert.equal(third.status, 200, 'a single logical forwarding call must consume exactly one rate-limit unit, not two')
+  } finally {
+    cleanup()
+  }
+})
+
+test('a direct external request cannot spoof the internal-forward marker to dodge the rate limit', async () => {
+  const ext: ExtRouteDeps = { idempotency: new IdempotencyStore(), limiter: new TenantLimiter({ maxInFlight: 100, ratePerMinute: 1 }) }
+  const { app, cleanup } = harness(ext)
+  try {
+    const first = await app.request('/api/ext/v1/chats', json(ACME, { title: 'One', owner: 'u1' }))
+    assert.equal(first.status, 201, 'consumes the one-per-minute budget')
+
+    // A client guessing the header's NAME (it cannot know the per-process random token value)
+    // and attaching an arbitrary value must not bypass the budget.
+    const spoofed = await app.request('/api/ext/v1/chats', {
+      method: 'POST',
+      headers: { Authorization: ACME, 'Content-Type': 'application/json', 'X-Ext-Internal-Forward': 'guessed-or-empty' },
+      body: JSON.stringify({ title: 'Spoofed', owner: 'u1' }),
+    })
+    assert.equal(spoofed.status, 429, 'a spoofed internal-forward header must not exempt an external request from the budget')
+  } finally {
+    cleanup()
+  }
+})
+
+test('the forwarding path\'s message.create audit row targets the real created message id, not the chat id', async () => {
+  const { app, runs, cleanup } = harnessWithRuns()
+  try {
+    const chatId = await newChat(app, 'AuditForward')
+    const res = await app.request(`/api/ext/v1/chats/${chatId}/messages`,
+      json(ACME, { role: 'user', content: 'hi', owner: 'u1' }))
+    assert.equal(res.status, 202)
+    const run = await res.json() as { id: string }
+    await runs.settled(run.id)
+
+    const list = await (await app.request(`/api/ext/v1/chats/${chatId}/messages?owner=u1`, json(ACME))).json() as {
+      data: Array<{ id: string; role: string }>
+    }
+    const userMessageId = list.data.find((m) => m.role === 'user')!.id
+
+    const rows = await auditRows(app)
+    const createRow = rows.find((r) => r.action === 'message.create')
+    assert.ok(createRow, 'expected a message.create row')
+    assert.equal(createRow!.target_id, userMessageId, 'the forwarding-path message.create row must target the real created message, not the chat id')
+    assert.notEqual(createRow!.target_id, chatId, 'sanity: must not have fallen back to the chat id')
   } finally {
     cleanup()
   }

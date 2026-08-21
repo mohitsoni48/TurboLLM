@@ -402,6 +402,79 @@ test('a stale Idempotency-Key whose run has already been pruned is refused rathe
   }
 })
 
+// ── N1 (final-gate fix round) — IdempotencyStore was not scoped by owner ───────────────────
+// Live-reproduced in the review this fixes: Owner A starts a generation with an Idempotency-Key;
+// a different owner replaying that SAME key received Owner A's real run id and the full
+// streamed/replayed generation content. `owner` is now part of the cache key (idempotency.ts),
+// so a different owner reusing the value must get a genuinely fresh run of their own.
+test('a same-tenant, different-owner replay of an Idempotency-Key on the generate path never reattaches to the other owner\'s run', async () => {
+  const { app, runs, cleanup } = harness()
+  try {
+    const chatA = await newChat(app) // owner 'u1', see newChat()
+    const sharedKey = 'ik-cross-owner-gen'
+    const first = await app.request(`/api/ext/v1/chats/${chatA}/messages`, {
+      method: 'POST',
+      headers: { Authorization: ACME, 'Content-Type': 'application/json', 'Idempotency-Key': sharedKey },
+      body: JSON.stringify({ role: 'user', content: 'owner A secret', owner: 'u1' }),
+    })
+    assert.equal(first.status, 202)
+    const runA = await first.json() as { id: string }
+    await runs.settled(runA.id)
+
+    // A DIFFERENT chat belonging to a DIFFERENT owner, SAME tenant, replaying the SAME key.
+    const chatBRes = await app.request('/api/ext/v1/chats', post(ACME, { title: 'Owner B chat', owner: 'u2' }))
+    const chatB = (await chatBRes.json() as { id: string }).id
+
+    const second = await app.request(`/api/ext/v1/chats/${chatB}/messages`, {
+      method: 'POST',
+      headers: { Authorization: ACME, 'Content-Type': 'application/json', 'Idempotency-Key': sharedKey },
+      body: JSON.stringify({ role: 'user', content: 'owner B message', owner: 'u2' }),
+    })
+    assert.equal(second.status, 202, 'owner B\'s replay must start a genuinely fresh run, not be refused or reattached')
+    const runB = await second.json() as { id: string; chat_id: string }
+    assert.notEqual(runB.id, runA.id, 'owner B must never reattach to owner A\'s run')
+    assert.equal(runB.chat_id, chatB, 'the fresh run must belong to owner B\'s own chat')
+    await runs.settled(runB.id)
+
+    const listB = await (await app.request(`/api/ext/v1/chats/${chatB}/messages?owner=u2`, { headers: { Authorization: ACME } })).json() as {
+      data: Array<{ content: string; role: string }>
+    }
+    assert.ok(listB.data.every((m) => !m.content.includes('owner A secret')), 'owner B must never see owner A\'s generation content')
+  } finally {
+    cleanup()
+  }
+})
+
+// Defense in depth (N1): the route's own post-lookup guard checks `existing.owner !==
+// scope.owner` even though the owner-scoped cache key above should already make a cross-owner
+// hit structurally impossible. Simulates a cache entry that (as if the store's own keying had a
+// defect) somehow resolved for the WRONG owner, and confirms the route's second, independent
+// check still refuses to reattach.
+test('the generate replay branch refuses to reattach even if a cache entry somehow resolves to another owner\'s run (defense in depth)', async () => {
+  const ext: ExtRouteDeps = { idempotency: new IdempotencyStore(), limiter: new TenantLimiter({ maxInFlight: 100, ratePerMinute: 1000 }) }
+  const { app, runs, cleanup } = harness(undefined, ext)
+  try {
+    const chatA = await newChat(app) // owner 'u1'
+    const startedA = await (await app.request(`/api/ext/v1/chats/${chatA}/messages`,
+      post(ACME, { role: 'user', content: 'hi', owner: 'u1' }))).json() as { id: string }
+    await runs.settled(startedA.id)
+
+    // Plant an entry keyed under owner 'u2' that points at owner 'u1's real run — simulating a
+    // defect in the cache key derivation itself, which the route's OWN guard must not just trust.
+    ext.idempotency.remember('acme', 'u2', 'runs:generate', 'poisoned-key', { runId: startedA.id, userMessageId: 'x', messageId: 'y' })
+
+    const res = await app.request(`/api/ext/v1/chats/${chatA}/messages`, {
+      method: 'POST',
+      headers: { Authorization: ACME, 'Content-Type': 'application/json', 'Idempotency-Key': 'poisoned-key' },
+      body: JSON.stringify({ role: 'user', content: 'attempt', owner: 'u2' }),
+    })
+    assert.equal(res.status, 409, 'must not silently reattach to another owner\'s run via a mismatched cache entry')
+    assert.equal((await res.json() as { error: { code: string } }).error.code, 'idempotency_replay_expired')
+  } finally {
+    cleanup()
+  }
+})
+
 test('a tenant that exceeds its configured in-flight limit gets 429 on the generate endpoint, while a different tenant is unaffected', async () => {
   let release: () => void
   const gate = new Promise<void>((r) => { release = r })
@@ -690,6 +763,40 @@ test('a message with more attachments than the limit is refused with 413 payload
       post(ACME, { role: 'user', owner: 'u1', content: 'hi', attachments: ['a', 'b', 'c', 'd', 'e'] }))
     assert.equal(res.status, 413)
     assert.equal((await res.json() as { error: { code: string } }).error.code, 'payload_too_large')
+  } finally {
+    cleanup()
+  }
+})
+
+// ── N5 (final-gate fix round) — 413 enforcement checked attachment COUNT, never byte SIZE ──
+test('attachments whose total byte size exceeds the limit are refused with 413 on the generate route, even with only a few of them', async () => {
+  const { app, cleanup } = harness()
+  try {
+    const chatId = await newChat(app)
+    const huge = 'x'.repeat(Math.ceil(1_048_576 / 2) + 1)
+    const res = await app.request(`/api/ext/v1/chats/${chatId}/messages/generate`,
+      post(ACME, { role: 'user', owner: 'u1', attachments: [huge, huge] }))
+    assert.equal(res.status, 413)
+    assert.equal((await res.json() as { error: { code: string } }).error.code, 'payload_too_large')
+
+    const list = await (await app.request(`/api/ext/v1/chats/${chatId}/messages?owner=u1`, { headers: { Authorization: ACME } })).json() as { data: unknown[] }
+    assert.equal(list.data.length, 0, 'the oversized write must not have been persisted')
+  } finally {
+    cleanup()
+  }
+})
+
+test('a metadata blob over the byte limit is refused with 413 on the generate route, even with tiny content', async () => {
+  const { app, cleanup } = harness()
+  try {
+    const chatId = await newChat(app)
+    const res = await app.request(`/api/ext/v1/chats/${chatId}/messages/generate`,
+      post(ACME, { role: 'user', owner: 'u1', content: 'hi', metadata: { blob: 'x'.repeat(1_048_577) } }))
+    assert.equal(res.status, 413)
+    assert.equal((await res.json() as { error: { code: string } }).error.code, 'payload_too_large')
+
+    const list = await (await app.request(`/api/ext/v1/chats/${chatId}/messages?owner=u1`, { headers: { Authorization: ACME } })).json() as { data: unknown[] }
+    assert.equal(list.data.length, 0, 'the oversized write must not have been persisted')
   } finally {
     cleanup()
   }

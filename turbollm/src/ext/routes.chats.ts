@@ -5,6 +5,7 @@
 // never from the request — and every not-found path returns 404, not 403, so one tenant
 // can never use status codes to probe whether another tenant's id exists (spec 27 §7.2).
 import type { Hono } from 'hono'
+import { randomUUID } from 'node:crypto'
 import { requestId as requestIdMiddleware } from 'hono/request-id'
 import type { Deps } from '../deps.js'
 import type { Scope } from '../chat/store/types.js'
@@ -43,10 +44,20 @@ export interface ExtRouteDeps {
  *  reason `ext` is (below): a pre-existing test harness that constructs this route set with no
  *  run manager at all (nothing here needs one to compile or to exercise the chat/message CRUD
  *  surface in isolation) must keep working exactly as before — undefined ⇒ never refuse a
- *  mutation on this ground, which is exactly what happened before this fix existed. */
+ *  mutation on this ground, which is exactly what happened before this fix existed.
+ *
+ *  Delegates entirely to `runs.isChatActive` (N4, final-gate fix round) rather than reading
+ *  `runs.list()` directly, as an earlier version of this function did. That earlier version only
+ *  saw a chat as active once a real `PublicRun` record existed — which routes.runs.ts's generate
+ *  handler only creates several real `await`s after it has already synchronously reserved the
+ *  chat (I5's TOCTOU fix). A mutation racing that window saw `hasActiveRun` return false and was
+ *  wrongly admitted (live-reproduced: a `DELETE` succeeded with 204 in that window, and the
+ *  racing generate call then 404'd on its own vanished chat). `isChatActive` is the SAME
+ *  authoritative answer routes.runs.ts's own admission check (`reserveChat`) now consults, so the
+ *  two can never disagree again. */
 function hasActiveRun(runs: PublicRunManager | undefined, scope: Scope, chatId: string): boolean {
   if (!runs) return false
-  return runs.list(scope.tenant, scope.owner).some((r) => r.chatId === chatId && !r.endedAt)
+  return runs.isChatActive(scope, chatId)
 }
 
 /** `ext` is optional so every pre-existing test/caller that constructs this route set without
@@ -64,6 +75,20 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
     ratePerMinute: DEFAULT_REQUESTS_PER_MINUTE_PER_TENANT,
   })
   const audit = ext?.audit ?? new AuditLog(d.db)
+  // N7 (final-gate fix round): marks a request as the internal forward `POST
+  // /chats/:id/messages` makes to `.../messages/generate` below, so the blanket rate limiter
+  // (registered just below) can recognize and NOT re-charge it — `app.fetch(new Request(...))`
+  // re-enters this app's entire middleware stack as a brand-new top-level dispatch, so without
+  // this the forward silently consumed a SECOND rate-limit unit for one client-visible call.
+  // Generated fresh per registration (once per mounted app/process) rather than being a fixed
+  // string, and NEVER echoed back in any response this app sends — an external caller cannot
+  // learn it, so a request that presents this exact header/value pair can only be this route's
+  // own forward, never a spoofed direct call trying to dodge the budget. The forwarding branch
+  // always OVERWRITES this header with the real token right before forwarding (`fwdHeaders.set`),
+  // so even a client that guesses the header NAME and sends its own value on the outer request
+  // has that value replaced before the inner dispatch ever sees it.
+  const internalForwardToken = randomUUID()
+  const INTERNAL_FORWARD_HEADER = 'X-Ext-Internal-Forward'
 
   // Request-id FIRST — ahead of extAuth, rate-limiting, and every route. Honors an inbound
   // `X-Request-Id` request header when the caller sends one (validated: non-empty, ≤255
@@ -90,9 +115,17 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
   // so this records the refusal itself via `recordRateLimitRefusal` before returning it —
   // passing `429` explicitly rather than reading `c.res.status` (see that function's own doc
   // comment on why `c.res` isn't populated yet at this point in the middleware).
+  //
+  // N7 (final-gate fix round): skips the `tryRequest` charge — but still runs `next()` as
+  // normal, so auth/scope/route logic are untouched — for the internal forward the default
+  // `POST /chats/:id/messages` path makes to `.../messages/generate` (see
+  // `internalForwardToken`'s own comment above for why the header can't be spoofed). Before this
+  // fix, one client-visible call to the documented primary endpoint silently consumed TWO
+  // budget units, since the forward is a fresh top-level dispatch through this exact middleware.
   app.use(`${BASE}/*`, async (c, next) => {
     const tenant = c.get('extTenant') as string
-    if (!limiter.tryRequest(tenant)) {
+    const isInternalForward = c.req.header(INTERNAL_FORWARD_HEADER) === internalForwardToken
+    if (!isInternalForward && !limiter.tryRequest(tenant)) {
       await recordRateLimitRefusal(audit, c, 429)
       return extError(c, 'capacity', 'rate_limited',
         'Too many requests for this tenant. Slow down and retry shortly.',
@@ -132,14 +165,20 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
   // (see its own doc comment), so putting it first here still correctly captures the 403.
   app.post(`${BASE}/chats`, auditMiddleware(audit, 'chat.create'), requireScope('chats:write'), async (c) => {
     const b = await body<{ title: string; model: string; system_prompt: string; sampling: Record<string, unknown>; metadata: Record<string, unknown>; owner: string }>(c)
-    const tenant = c.get('extTenant') as string
+    // Resolved once, up front — both the idempotency lookup below and the createChat call use
+    // the SAME scope, so they can never disagree about which owner this request is for.
+    const scope = scopeFor(c, b.owner)
     const idempotencyKey = c.req.header('Idempotency-Key')?.trim() || undefined
 
     // Idempotent replay (spec §7.6): a cached key means THIS chat was already created by an
     // earlier attempt of the same request — return that frozen result rather than creating a
     // second chat. Checked before any store write, so a retry never even reaches createChat.
+    // `owner` is part of the cache key (N1, final-gate fix round) — a tenant's API key is
+    // shared across an integrator's many end users (spec 27 §3.1), so without this a different
+    // owner reusing the same Idempotency-Key value would replay THIS owner's chat verbatim,
+    // private metadata included (live-reproduced in the review this fixes).
     if (idempotencyKey) {
-      const cached = idempotency.lookup(tenant, IDEMPOTENCY_OP, idempotencyKey) as { id?: string } | null
+      const cached = idempotency.lookup(scope.tenant, scope.owner, IDEMPOTENCY_OP, idempotencyKey) as { id?: string } | null
       if (cached) {
         // Route has no `:id` param to fall back on (this is POST /chats) — without this, the
         // audit row for a replay would carry a null targetId even though the real chat id is
@@ -150,7 +189,7 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
     }
 
     try {
-      const chat = await d.chatStore.createChat(scopeFor(c, b.owner), {
+      const chat = await d.chatStore.createChat(scope, {
         title: b.title, model: b.model, systemPrompt: b.system_prompt,
         sampling: b.sampling, metadata: b.metadata,
       })
@@ -164,7 +203,7 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
       // concurrent retries still can't both observe a miss (the second's `createChat` may still
       // create a duplicate chat under a true race — see idempotency.ts's own residual-window
       // note — but a SEQUENTIAL retry, the actual reported failure mode, is fully covered).
-      if (idempotencyKey) idempotency.remember(tenant, IDEMPOTENCY_OP, idempotencyKey, dto)
+      if (idempotencyKey) idempotency.remember(scope.tenant, scope.owner, IDEMPOTENCY_OP, idempotencyKey, dto)
       return c.json(dto, 201)
     } catch (e) {
       const m = mapStoreError(e)
@@ -265,6 +304,29 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
         `Message has ${attachments.length} attachments, exceeding the ${MAX_ATTACHMENTS}-attachment limit.`,
         { status: 413, param: 'attachments' })
     }
+    // N5 (final-gate fix round): attachment COUNT alone doesn't bound total SIZE — each
+    // attachment is a base64 data-URI string that can be arbitrarily large on its own. Sum of
+    // byte lengths is a reasonable proxy for decoded size without base64-decoding each one.
+    // Mirrors the generate route's identical check (routes.runs.ts); see that file's comment on
+    // why this reuses `MAX_BODY_BYTES` rather than a dedicated attachment-bytes constant.
+    if (attachments) {
+      const attachmentBytes = attachments.reduce((sum, a) => sum + Buffer.byteLength(a, 'utf8'), 0)
+      if (attachmentBytes > MAX_BODY_BYTES) {
+        return extError(c, 'invalid_request', 'payload_too_large',
+          `Attachments total ${attachmentBytes} bytes, exceeding the ${MAX_BODY_BYTES}-byte limit.`,
+          { status: 413, param: 'attachments' })
+      }
+    }
+    // `metadata` had no size check at all — an integrator could smuggle an unbounded blob
+    // through this field alone even with `content`/`attachments` both small.
+    if (b.metadata) {
+      const metadataBytes = Buffer.byteLength(JSON.stringify(b.metadata), 'utf8')
+      if (metadataBytes > MAX_BODY_BYTES) {
+        return extError(c, 'invalid_request', 'payload_too_large',
+          `metadata is ${metadataBytes} bytes, exceeding the ${MAX_BODY_BYTES}-byte limit.`,
+          { status: 413, param: 'metadata' })
+      }
+    }
 
     if (b.generate === false) {
       try {
@@ -293,13 +355,29 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
     // request too, so the `message.create` row here and the `run.start` row the generate route
     // writes end up with two different, uncorrelated request ids for one logical call — the
     // audit trail's whole point is per-request correlation, so this is what keeps that intact.
+    // N7 (final-gate fix round): overwrites (never trusts a client-supplied value of) the
+    // internal-forward marker so the blanket rate limiter above recognizes this SPECIFIC
+    // outbound request as the one logical call's own forward and doesn't charge it a second
+    // budget unit — see `internalForwardToken`'s own comment near the top of this function for
+    // why an external caller cannot forge this.
     const fwdHeaders = new Headers(c.req.raw.headers)
     fwdHeaders.set('X-Request-Id', c.get('requestId'))
-    return app.fetch(new Request(new URL(`${BASE}/chats/${c.req.param('id')}/messages/generate`, c.req.url), {
+    fwdHeaders.set(INTERNAL_FORWARD_HEADER, internalForwardToken)
+    const fwdRes = await app.fetch(new Request(new URL(`${BASE}/chats/${c.req.param('id')}/messages/generate`, c.req.url), {
       method: 'POST',
       headers: fwdHeaders,
       body: JSON.stringify({ ...b, content }),
     }))
+    // N7: the forwarded call is a SEPARATE Hono dispatch with its own Context — the id of the
+    // message it actually created (the USER turn, not the assistant placeholder the JSON body's
+    // `message_id` field carries) never reaches THIS context on its own. Without this, the
+    // `message.create` audit row `auditMiddleware` writes for THIS route falls back to
+    // `c.req.param('id')`, which names the CHAT, not the message just created. The generate
+    // route echoes the real id back via a response header for exactly this purpose (see
+    // routes.runs.ts's `respondWithRun`).
+    const forwardedUserMessageId = fwdRes.headers.get('X-Ext-User-Message-Id')
+    if (forwardedUserMessageId) c.set('auditTargetId', forwardedUserMessageId)
+    return fwdRes
   })
 
   app.get(`${BASE}/messages/:id`, requireScope('chats:read'), async (c) => {
@@ -317,6 +395,28 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
     const b = await body<{ content: string; metadata: Record<string, unknown>; owner: string; if_version: number }>(c)
     const scope = scopeFor(c, b.owner)
     const id = c.req.param('id')
+    // N6 (final-gate fix round): both message-CREATION routes enforce MAX_BODY_BYTES before
+    // persistence; this EDIT path called `updateMessage` directly with no size check at all —
+    // a client could bypass the cap entirely by creating a small message, then PATCHing it to
+    // unbounded size. Checked purely off the request body, before any store I/O, same
+    // discipline as every other guard on this surface. `MessagePatch` (chat/store/types.ts) has
+    // no `attachments` field, so only `content`/`metadata` need a check here.
+    if (b.content !== undefined) {
+      const bodyBytes = Buffer.byteLength(b.content, 'utf8')
+      if (bodyBytes > MAX_BODY_BYTES) {
+        return extError(c, 'invalid_request', 'payload_too_large',
+          `Message content is ${bodyBytes} bytes, exceeding the ${MAX_BODY_BYTES}-byte limit.`,
+          { status: 413, param: 'content' })
+      }
+    }
+    if (b.metadata) {
+      const metadataBytes = Buffer.byteLength(JSON.stringify(b.metadata), 'utf8')
+      if (metadataBytes > MAX_BODY_BYTES) {
+        return extError(c, 'invalid_request', 'payload_too_large',
+          `metadata is ${metadataBytes} bytes, exceeding the ${MAX_BODY_BYTES}-byte limit.`,
+          { status: 413, param: 'metadata' })
+      }
+    }
     try {
       // A message's `:id` names the message, not its parent chat, so the active-run check
       // (spec §7.2) needs a lookup first to learn which chat this message even belongs to —

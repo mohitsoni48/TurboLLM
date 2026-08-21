@@ -66,6 +66,18 @@ function toRunDTO(r: PublicRun): Record<string, unknown> {
 function respondWithRun(
   c: Context, runs: PublicRunManager, run: PublicRun, userMsgId: string, assistantMsgId: string,
 ) {
+  // N7 (final-gate fix round): the wire response's own JSON body (`toRunDTO`) only carries the
+  // ASSISTANT placeholder's id as `message_id` — the USER message this call actually created has
+  // no field of its own there, and no field at all in the 202 JSON response shape. When
+  // routes.chats.ts's `POST /chats/:id/messages` forwards here via `app.fetch`, its own
+  // `message.create` audit row needs exactly that user-message id, but the forward is a
+  // completely separate Hono dispatch with its own Context — nothing about this response's BODY
+  // gets that id back to the outer caller without a wire-shape change. An internal-only response
+  // header is the low-footprint way to hand it back: present on every response from this route
+  // (not just forwarded ones — there is no cheap way to tell the two apart from here, and
+  // exposing an id the caller's own request already caused to exist is harmless), read by
+  // routes.chats.ts right after the forward resolves.
+  c.header('X-Ext-User-Message-Id', userMsgId)
   if ((c.req.header('Accept') ?? '').includes('text/event-stream')) {
     if (!runs.canReplayFrom(run.id, 0)) {
       return extError(c, 'conflict', 'replay_window_exceeded',
@@ -90,8 +102,6 @@ function respondWithRun(
  *  that construct this route set directly (without going through mount.ts) keep compiling and
  *  behaving exactly as before, with a private, generously-capped fallback instance. */
 export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager, rd: RunDeps, ext?: ExtRouteDeps): void {
-  /** One active run per chat, mirroring the internal `inflight` 409. */
-  const inflight = new Map<string, string>()
   const idempotency = ext?.idempotency ?? new IdempotencyStore()
   const limiter = ext?.limiter ?? new TenantLimiter({
     maxInFlight: DEFAULT_MAX_IN_FLIGHT_PER_TENANT,
@@ -116,12 +126,21 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
 
     // Idempotent replay (spec §7.6), checked before ANY validation/persistence/limiter charge —
     // a cached key means a run for this exact request already exists, so we reattach to THAT
-    // run instead of re-running any of the checks below.
+    // run instead of re-running any of the checks below. `owner` is part of the cache key (N1,
+    // final-gate fix round) — a tenant's API key is shared across an integrator's many end
+    // users (spec 27 §3.1), so without this a different owner reusing the same Idempotency-Key
+    // value would reattach to THIS owner's live run and receive its real run id and streamed
+    // content (live-reproduced in the review this fixes).
     if (idempotencyKey) {
-      const cached = idempotency.lookup(scope.tenant, IDEMPOTENCY_OP, idempotencyKey) as GenerateReplay | null
+      const cached = idempotency.lookup(scope.tenant, scope.owner, IDEMPOTENCY_OP, idempotencyKey) as GenerateReplay | null
       if (cached) {
         const existing = runs.get(cached.runId)
-        if (!existing || existing.tenant !== scope.tenant) {
+        // Belt-and-suspenders (N1): the owner-scoped cache key above should already make a
+        // cross-owner hit structurally impossible, but this checks `existing.owner` too — same
+        // discipline as the run-resource routes below, which check both `tenant` and `owner`
+        // even though `runs.list`/`runs.get` filtering is also supposed to be correct on its
+        // own. Two independent checks agreeing is the point.
+        if (!existing || existing.tenant !== scope.tenant || existing.owner !== scope.owner) {
           // PublicRunManager.prune() (server.ts, ~1h) retires ended runs well before the
           // idempotency entry's own TTL (24h default) expires — a replay CAN legitimately
           // outlive the run it points to. Failing closed here is deliberate: silently falling
@@ -159,22 +178,50 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
         `Message has ${attachments.length} attachments, exceeding the ${MAX_ATTACHMENTS}-attachment limit.`,
         { status: 413, param: 'attachments' })
     }
+    // N5 (final-gate fix round): attachment COUNT alone doesn't bound total SIZE — each
+    // attachment is a base64 data-URI string that can be arbitrarily large on its own, and a
+    // request with tiny `content` plus a few huge attachments sailed through the checks above
+    // unbounded. The sum of each attachment string's byte length is a reasonable proxy for
+    // decoded size without actually base64-decoding each one. Reuses `MAX_BODY_BYTES` rather
+    // than adding a dedicated, larger attachment-bytes constant to `limits.ts` — `limits.ts` is
+    // shared surface this task's file set doesn't own, and `MAX_BODY_BYTES` is a conservative
+    // but real bound either way.
+    if (attachments) {
+      const attachmentBytes = attachments.reduce((sum, a) => sum + Buffer.byteLength(a, 'utf8'), 0)
+      if (attachmentBytes > MAX_BODY_BYTES) {
+        return extError(c, 'invalid_request', 'payload_too_large',
+          `Attachments total ${attachmentBytes} bytes, exceeding the ${MAX_BODY_BYTES}-byte limit.`,
+          { status: 413, param: 'attachments' })
+      }
+    }
+    // `metadata` had no size check at all — an integrator could smuggle an unbounded blob
+    // through this field alone even with `content`/`attachments` both small.
+    if (b.metadata) {
+      const metadataBytes = Buffer.byteLength(JSON.stringify(b.metadata), 'utf8')
+      if (metadataBytes > MAX_BODY_BYTES) {
+        return extError(c, 'invalid_request', 'payload_too_large',
+          `metadata is ${metadataBytes} bytes, exceeding the ${MAX_BODY_BYTES}-byte limit.`,
+          { status: 413, param: 'metadata' })
+      }
+    }
 
-    // Reserve the inflight slot SYNCHRONOUSLY — before ANY `await` below (`getChat`,
-    // `loadFullHistory`, the persistence calls) — so two near-simultaneous generate requests for
-    // the same chat cannot both observe an empty slot and both proceed (the TOCTOU this map
-    // exists to prevent: JS only yields to another request's synchronous code at an `await`
-    // point, so check-then-set with no `await` between them is atomic in practice). The
-    // placeholder is replaced with the real run id once one exists, or removed again by
-    // `releaseInflight()` on every failure path between here and `runs.start()` — a request that
-    // reserves the slot but never actually starts a run (context overflow, a store failure, a
-    // rate-limit refusal) must not leave the chat permanently blocked.
-    if (inflight.has(chatId)) {
+    // Reserve the chat SYNCHRONOUSLY — before ANY `await` below (`getChat`, `loadFullHistory`,
+    // the persistence calls) — so two near-simultaneous generate requests for the same chat
+    // cannot both observe an empty slot and both proceed (the TOCTOU this exists to prevent: JS
+    // only yields to another request's synchronous code at an `await` point, so check-then-set
+    // with no `await` between them is atomic in practice — I5's fix). Owned by `runs`
+    // (PublicRunManager.reserveChat/releaseChat, N4 final-gate fix round) rather than a private
+    // Map local to this route, so routes.chats.ts's `hasActiveRun` guard — which used to consult
+    // only `runs.list()`, gaining an entry several real `await`s later once `runs.start()`
+    // actually ran — sees this chat as active from THIS line, not from several awaits later.
+    // Released on every failure path below via `releaseInflight()`, or once the run itself
+    // settles (see `runs.settled(...).finally()` near the bottom) — a request that reserves the
+    // chat but never actually starts a run (context overflow, a store failure, a rate-limit
+    // refusal) must not leave the chat permanently blocked.
+    if (!runs.reserveChat(scope, chatId)) {
       return extError(c, 'conflict', 'generation_in_flight', 'A generation is already running for this chat.', { retryable: true })
     }
-    const PENDING = ''   // never a real run id (`run_${uuid}`), so this can't collide
-    inflight.set(chatId, PENDING)
-    const releaseInflight = () => { if (inflight.get(chatId) === PENDING) inflight.delete(chatId) }
+    const releaseInflight = () => { runs.releaseChat(scope, chatId) }
 
     let chat: Chat | null
     try {
@@ -262,14 +309,14 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
     // already returned a live `PublicRun` at this line; the injected body's own first engine
     // fetch is still at least one microtask away. A retry that lands anywhere after this line
     // finds this entry and reattaches via the branch above instead of starting a second run.
-    if (idempotencyKey) idempotency.remember(scope.tenant, IDEMPOTENCY_OP, idempotencyKey, { runId: run.id, userMessageId: userMsgId, messageId: assistantMsgId } satisfies GenerateReplay)
-    // Upgrade the reservation to the real run id — the map has held `chatId` since before the
-    // first `await` above, so this is never a fresh `.set()` racing anything.
-    inflight.set(chatId, run.id)
+    if (idempotencyKey) idempotency.remember(scope.tenant, scope.owner, IDEMPOTENCY_OP, idempotencyKey, { runId: run.id, userMessageId: userMsgId, messageId: assistantMsgId } satisfies GenerateReplay)
+    // The chat reservation from before the first `await` above stays held — no "upgrade" step is
+    // needed: `runs.reserveChat`/`isChatActive` (run-manager.ts) don't care whether a real
+    // `PublicRun` exists yet, only that the chat is reserved, and it already is.
     // Released when the run actually SETTLES, not when this HTTP response is sent — the route
     // itself never blocks on generation, so this is fire-and-forget off the manager's own
     // completion signal (Task 3's `runs.settled`).
-    void runs.settled(run.id).finally(() => { inflight.delete(chatId); limiter.release(scope.tenant) })
+    void runs.settled(run.id).finally(() => { runs.releaseChat(scope, chatId); limiter.release(scope.tenant) })
 
     return respondWithRun(c, runs, run, userMsgId, assistantMsgId)
   })

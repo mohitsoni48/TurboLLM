@@ -127,6 +127,64 @@ test('runs are listed per owner within a tenant, and never leak across owners', 
   assert.equal(runs.list('acme').length, 2, 'omitting owner falls back to whole-tenant listing')
 })
 
+// ── N4 (final-gate fix round) — reserveChat/releaseChat/isChatActive, the single shared
+// mechanism replacing routes.runs.ts's own private `inflight` Map and routes.chats.ts's
+// `hasActiveRun` (which used to consult only `list()`, disagreeing with the reservation during
+// the window before a real PublicRun record exists). ─────────────────────────────────────────
+test('reserveChat marks a chat active immediately, before any run exists', () => {
+  const runs = new PublicRunManager()
+  assert.equal(runs.isChatActive(SCOPE, 'c1'), false, 'sanity: nothing reserved yet')
+  assert.equal(runs.reserveChat(SCOPE, 'c1'), true, 'a fresh reservation succeeds')
+  assert.equal(runs.isChatActive(SCOPE, 'c1'), true, 'active from the moment of reservation, no run needed')
+})
+
+test('reserveChat refuses a second reservation for the same chat while the first is held', () => {
+  const runs = new PublicRunManager()
+  assert.equal(runs.reserveChat(SCOPE, 'c1'), true)
+  assert.equal(runs.reserveChat(SCOPE, 'c1'), false, 'the chat is already reserved')
+})
+
+test('releaseChat frees the reservation, so a follow-up reserveChat succeeds again', () => {
+  const runs = new PublicRunManager()
+  assert.equal(runs.reserveChat(SCOPE, 'c1'), true)
+  runs.releaseChat(SCOPE, 'c1')
+  assert.equal(runs.isChatActive(SCOPE, 'c1'), false)
+  assert.equal(runs.reserveChat(SCOPE, 'c1'), true, 'released, so a new reservation is admitted')
+})
+
+test('releaseChat is idempotent — calling it twice, or on a chat never reserved, does not throw', () => {
+  const runs = new PublicRunManager()
+  assert.doesNotThrow(() => { runs.releaseChat(SCOPE, 'never-reserved') })
+  runs.reserveChat(SCOPE, 'c1')
+  runs.releaseChat(SCOPE, 'c1')
+  assert.doesNotThrow(() => { runs.releaseChat(SCOPE, 'c1') })
+})
+
+test('reservations are scoped by tenant+owner+chatId, not chatId alone', () => {
+  const runs = new PublicRunManager()
+  assert.equal(runs.reserveChat(SCOPE, 'c1'), true)
+  // A DIFFERENT owner reserving the SAME chatId string must not collide with the first — chat
+  // ids are unique in practice, but the reservation key matches every other scope check in this
+  // file (tenant+owner+chatId) as defense in depth.
+  assert.equal(runs.reserveChat({ tenant: 'acme', owner: 'u2' }, 'c1'), true)
+  assert.equal(runs.isChatActive(SCOPE, 'c1'), true)
+  assert.equal(runs.isChatActive({ tenant: 'acme', owner: 'u2' }, 'c1'), true)
+  assert.equal(runs.isChatActive({ tenant: 'globex', owner: 'u1' }, 'c1'), false, 'a different tenant entirely must not see this chat as active')
+})
+
+test('isChatActive also sees a real non-ended run even without an explicit reservation (defense in depth)', async () => {
+  const runs = new PublicRunManager()
+  let release: () => void
+  const gate = new Promise<void>((r) => { release = r })
+  const run = runs.start({ scope: SCOPE, chatId: 'c1', messageId: 'm1', body: fakeBody(1, gate) })
+  // No `reserveChat` call was ever made for this chat — the run's own existence must still be
+  // enough, mirroring the same defense-in-depth reasoning `list()`'s cross-owner filtering uses.
+  assert.equal(runs.isChatActive(SCOPE, 'c1'), true, 'a real, non-ended run makes the chat active even with no reservation')
+  release!()
+  await runs.settled(run.id)
+  assert.equal(runs.isChatActive(SCOPE, 'c1'), false, 'a settled (ended) run no longer counts as active')
+})
+
 test('an orphaned run with no subscriber and no poll is reaped', async () => {
   const runs = new PublicRunManager({ orphanTimeoutMs: 20 })
   let release: () => void

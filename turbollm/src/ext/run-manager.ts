@@ -81,6 +81,18 @@ const DEFAULT_ORPHAN_TIMEOUT_MS = 5 * 60_000
 
 export class PublicRunManager {
   private runs = new Map<string, RunState>()
+  /** Chats with a pending-or-active generation (N4, final-gate fix round). Keyed the same way
+   *  `list()` filters — tenant+owner+chatId — even though chat ids are unique on their own, so
+   *  this stays consistent with every other scope check in this file. This is the SINGLE
+   *  authoritative "is this chat generating?" answer, replacing what used to be two independent,
+   *  disagreeing mechanisms: routes.runs.ts's own private `inflight` Map (reserved synchronously
+   *  before any `await`, for I5's TOCTOU fix) and routes.chats.ts's `hasActiveRun` (which only
+   *  consulted `list()`, gaining an entry several real `await`s later, once `start()` actually
+   *  ran). A chat mutation racing the window between "the generate route committed" and "the
+   *  PublicRun record exists" used to see this chat as NOT active and be wrongly admitted —
+   *  live-reproduced in the review this fixes. `reserveChat`/`releaseChat`/`isChatActive` below
+   *  are the one place both routes now ask this question. */
+  private reservedChats = new Set<string>()
   private readonly bufferCap: number
   private readonly orphanTimeoutMs: number
   /** Optional write-through persistence (spec 27 §6.4). Undefined ⇒ purely in-memory, same
@@ -91,6 +103,45 @@ export class PublicRunManager {
     this.bufferCap = opts?.bufferCap ?? DEFAULT_BUFFER_CAP
     this.orphanTimeoutMs = opts?.orphanTimeoutMs ?? DEFAULT_ORPHAN_TIMEOUT_MS
     this.db = opts?.db
+  }
+
+  private chatKey(tenant: string, owner: string, chatId: string): string { return `${tenant} ${owner} ${chatId}` }
+
+  /** Reserve a chat for an about-to-start generation, SYNCHRONOUSLY and atomically — the caller
+   *  must call this with no `await` between its own admission decision and this call, exactly
+   *  like the `inflight` Map it replaces: JS only yields to another request's synchronous code
+   *  at an `await` point, so check-then-set with none in between is atomic in practice (I5's
+   *  TOCTOU fix, now owned here). Returns false when the chat is already reserved (or already
+   *  has a live, non-ended run) — the caller must refuse the request rather than reserve on top
+   *  of an existing hold. */
+  reserveChat(scope: Scope, chatId: string): boolean {
+    if (this.isChatActive(scope, chatId)) return false
+    this.reservedChats.add(this.chatKey(scope.tenant, scope.owner, chatId))
+    return true
+  }
+
+  /** Release a chat's reservation — called on every generate-route failure path between
+   *  `reserveChat` and a real run existing, and again once the run's `settled()` promise
+   *  resolves (mirrors the old `inflight` Map's `releaseInflight()` / `runs.settled(...).finally()`
+   *  pair exactly). Idempotent: safe to call more than once or on a chat that was never
+   *  reserved. */
+  releaseChat(scope: Scope, chatId: string): void {
+    this.reservedChats.delete(this.chatKey(scope.tenant, scope.owner, chatId))
+  }
+
+  /** Whether a chat has a generation that is reserved-but-not-yet-started OR already running
+   *  (spec 27 §7.2's `run_active` guard). The single source of truth consulted by BOTH the
+   *  generate route's own admission check (`reserveChat`, above) and routes.chats.ts's
+   *  `hasActiveRun` — so a chat/message mutation can never race a window where the two disagree
+   *  about whether a generation is in flight. Checks the reservation set first (covers the
+   *  window between the synchronous reserve and a real `PublicRun` existing, which is held for
+   *  the run's ENTIRE lifetime — see `reserveChat`/`releaseChat` above — so this alone covers
+   *  everything this process itself started) and real non-ended runs second, as defense in depth
+   *  for a run this process knows about via `db` (e.g. reconciled from a persisted row) but has
+   *  no in-memory reservation for. */
+  isChatActive(scope: Scope, chatId: string): boolean {
+    if (this.reservedChats.has(this.chatKey(scope.tenant, scope.owner, chatId))) return true
+    return this.list(scope.tenant, scope.owner).some((r) => r.chatId === chatId && !r.endedAt)
   }
 
   start(params: { scope: Scope; chatId: string; messageId: string; body: RunBody }): PublicRun {
