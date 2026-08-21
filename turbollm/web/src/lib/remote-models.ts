@@ -175,3 +175,56 @@ export function groupModelChoices({
 export function isFlat(groups: ModelGroup[]): boolean {
   return groups.length === 1
 }
+
+/** The remote model a qualified id names, or undefined for a local id.
+ *
+ *  This is the PEER-SIDE half of `ModelRouter.resolveRemoteTarget` (final-review C-1): the
+ *  chat screen has to know, before it does anything, whether the id the picker just handed
+ *  it belongs to another machine — because a remote id must NEVER reach the local engine
+ *  loader (`POST /api/v1/engine/start`), which aborts every in-flight generation and then
+ *  loads something else entirely.
+ *
+ *  Matched against the rows the daemon actually advertises, using the same
+ *  `formatRemoteId(link.name, model.key)` the dropdown emitted — never a `includes('/')`
+ *  test, which would misread a local model key that carries its own slashes
+ *  (`unsloth/Qwen3-GGUF`) as remote and silently stop it loading. */
+export function findRemoteChoice(
+  id: string,
+  links: LinkRecord[],
+  remote: RemoteModelRow[],
+): { id: string; name: string; machine: string } | undefined {
+  for (const link of links) {
+    if (link.status !== 'online') continue
+    for (const row of remote) {
+      if (row.linkId !== link.id) continue
+      if (formatRemoteId(link.name, row.model.key) !== id) continue
+      return { id, name: row.model.name, machine: link.name }
+    }
+  }
+  return undefined
+}
+
+/** What picking `id` in the model menu MEANS. */
+export type ModelSelection =
+  /** Another machine already has this model up. Route to it — no engine action at all. */
+  | { kind: 'remote'; id: string; name: string; machine: string }
+  /** This machine's own library. Load it, and stop routing to any machine. */
+  | { kind: 'local'; key: string }
+
+/** The chat screen's model-pick decision, as a pure function.
+ *
+ *  Extracted from the click handler deliberately (final-review C-1). The bug that shipped
+ *  was not in what the menu EMITS — `ModelLoadMenu.remote.test.tsx` already pinned the
+ *  qualified id — it was in what the receiver did with it: hand it to
+ *  `POST /api/v1/engine/start`, which runs `d.bench.cancel()` and `abortAllInFlightChats()`
+ *  before it even looks the key up, misses in the local scanner, and then 409s or loads a
+ *  different local model. Testing the handoff alone is exactly how that stayed green, so
+ *  the branch itself is the unit now. */
+export function selectModel(
+  id: string,
+  links: LinkRecord[],
+  remote: RemoteModelRow[],
+): ModelSelection {
+  const hit = findRemoteChoice(id, links, remote)
+  return hit ? { kind: 'remote', ...hit } : { kind: 'local', key: id }
+}

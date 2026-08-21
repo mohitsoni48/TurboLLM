@@ -4,7 +4,7 @@
 // history, attachments, or tool output — the strongest form of the "don't leak anything
 // but the user's own words" guarantee.
 import type { Deps } from '../deps'
-import { engineModelAlias } from '../engines/compat'
+import { callChatUpstream, type ChatUpstream } from './chat-upstream'
 
 const MIN_LENGTH = 12
 const MAX_FACTS_PER_TURN = 5
@@ -68,31 +68,29 @@ function parseFacts(raw: string): string[] {
 /** Fire-and-forget: extract durable facts from a just-sent user message and persist any
  *  new (non-duplicate) ones. Never throws — errors are silently swallowed, same as
  *  autoTitle, since this must never surface to the user or affect the chat response. */
-export async function extractMemoryFacts(d: Deps, convId: string, userText: string, target: string): Promise<void> {
+export async function extractMemoryFacts(d: Deps, convId: string, userText: string, upstream: ChatUpstream): Promise<void> {
   try {
     if (userText.trim().length < MIN_LENGTH) return
-    const ms = d.manager.status()
-    if (ms.state !== 'running') return
+    // Local-engine readiness is only a precondition for a LOCAL extraction. A remote turn
+    // runs on the host, which has its own model up; gating on this machine's engine would
+    // silently disable memory for every conversation held with a linked machine.
+    if (!upstream.remote && d.manager.status().state !== 'running') return
 
     // Low-priority afterthought, same as autoTitle: acquire the engine gate at 'bg' so any
     // foreground chat or agent run preempts it, and release as soon as the call returns.
-    const release = d.gate ? await d.gate.acquire('bg') : null
+    // A remote extraction takes no local slot — it touches no local engine (I-3).
+    const release = d.gate && !upstream.remote ? await d.gate.acquire('bg') : null
     let res: Response
     try {
-      res = await fetch(`${target}/v1/chat/completions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: engineModelAlias(d.registry.active()?.kind ?? '', d.manager.currentOpts()?.modelPath) ?? ms.model?.key,
+      res = await callChatUpstream(upstream, {
+          model: upstream.modelField,
           messages: [{ role: 'user', content: extractionPrompt(userText) }],
           stream: false,
           temperature: 0.2,
           max_tokens: 200,
           thinking_budget_tokens: 0,
           chat_template_kwargs: { enable_thinking: false },
-        }),
-        signal: AbortSignal.timeout(20_000),
-      })
+      }, AbortSignal.timeout(20_000))
     } finally {
       release?.()
     }

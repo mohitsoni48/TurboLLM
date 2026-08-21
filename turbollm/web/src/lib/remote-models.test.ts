@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { groupModelChoices, type RemoteModelRow } from './remote-models'
+import { findRemoteChoice, groupModelChoices, selectModel, type RemoteModelRow } from './remote-models'
 import type { LinkRecord } from './link-api'
 import type { ModelEntry } from './types'
 
@@ -191,5 +191,69 @@ describe('groupModelChoices', () => {
       remote: [],
     })
     expect(localGroup.choices[0].loaded).toBe(true)
+  })
+})
+
+// ── findRemoteChoice (final-review C-1) ────────────────────────────────────────────────
+// The chat screen's "is this id another machine's?" test. Getting it wrong in either
+// direction is a shipped bug: a false negative sends a qualified id to the LOCAL engine
+// loader (which aborts in-flight generations and loads a different model), and a false
+// positive stops an ordinary local model with a slash in its key from ever loading.
+
+describe('findRemoteChoice', () => {
+  const onlineLink = { id: 'l1', name: 'workstation', status: 'online', grantedCapabilities: ['models:use'] } as unknown as LinkRecord
+  const rows: RemoteModelRow[] = [{
+    linkId: 'l1',
+    machine: 'workstation',
+    model: { key: 'qwen3-35b', name: 'Qwen3 35B', quant: 'Q4_K_M', nativeCtx: 262144, vision: false, loaded: true },
+  }]
+
+  it('resolves the qualified id the dropdown emits', () => {
+    const hit = findRemoteChoice('workstation/qwen3-35b', [onlineLink], rows)
+    expect(hit).toEqual({ id: 'workstation/qwen3-35b', name: 'Qwen3 35B', machine: 'workstation' })
+  })
+
+  it('leaves a LOCAL key that happens to contain a slash alone', () => {
+    expect(findRemoteChoice('unsloth/Qwen3-GGUF', [onlineLink], rows)).toBeUndefined()
+    expect(findRemoteChoice('gemma-27b', [onlineLink], rows)).toBeUndefined()
+  })
+
+  it('does not resolve against a machine that is no longer online', () => {
+    const offline = { ...onlineLink, status: 'unreachable' } as unknown as LinkRecord
+    expect(findRemoteChoice('workstation/qwen3-35b', [offline], rows)).toBeUndefined()
+  })
+
+  it('is empty on an install with no links at all', () => {
+    expect(findRemoteChoice('workstation/qwen3-35b', [], [])).toBeUndefined()
+  })
+})
+
+describe('selectModel: what a pick in the chat menu actually does', () => {
+  const onlineLink = { id: 'l1', name: 'workstation', status: 'online', grantedCapabilities: ['models:use'] } as unknown as LinkRecord
+  const rows: RemoteModelRow[] = [{
+    linkId: 'l1',
+    machine: 'workstation',
+    model: { key: 'qwen3-35b', name: 'Qwen3 35B', quant: 'Q4_K_M', nativeCtx: 262144, vision: false, loaded: true },
+  }]
+
+  it('a remote pick is a ROUTING choice — never a local engine load', () => {
+    // The shipped bug: this id went to POST /api/v1/engine/start, which aborts every
+    // in-flight generation in every conversation before it even looks the key up.
+    expect(selectModel('workstation/qwen3-35b', [onlineLink], rows)).toEqual({
+      kind: 'remote', id: 'workstation/qwen3-35b', name: 'Qwen3 35B', machine: 'workstation',
+    })
+  })
+
+  it('a local pick still loads the local engine', () => {
+    expect(selectModel('gemma-27b', [onlineLink], rows)).toEqual({ kind: 'local', key: 'gemma-27b' })
+  })
+
+  it('a local key with a slash in it is a LOCAL load, not a route', () => {
+    expect(selectModel('unsloth/Qwen3-GGUF', [onlineLink], rows)).toEqual({ kind: 'local', key: 'unsloth/Qwen3-GGUF' })
+  })
+
+  it('a model on a machine that dropped is not routable — it falls back to a local load', () => {
+    const offline = { ...onlineLink, status: 'unreachable' } as unknown as LinkRecord
+    expect(selectModel('workstation/qwen3-35b', [offline], rows).kind).toBe('local')
   })
 })

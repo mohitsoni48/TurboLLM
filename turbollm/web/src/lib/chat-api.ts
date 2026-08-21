@@ -135,11 +135,15 @@ export async function* sendMessage(
   textAttachments?: string[],
   thinkingBudget?: number,
   reasoningEffort?: ReasoningEffort,
+  /** Turbo Link (ADR-376): the id the model picker selected. Sent ONLY when it names
+   *  another machine — a qualified `<machine>/<model>` id. Absent means "whatever this
+   *  machine has loaded", which is what every send did before Turbo Link and still does. */
+  model?: string,
 ): AsyncGenerator<ChatSseEvent> {
   const res = await fetch(`/api/v1/conversations/${encodeURIComponent(convId)}/messages`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ content, images: images?.length ? images : undefined, docContext: docContext || undefined, textAttachments: textAttachments?.length ? textAttachments : undefined, thinkingBudget: thinkingBudget !== undefined && thinkingBudget !== -1 ? thinkingBudget : undefined, reasoningEffort: reasoningEffort !== undefined && reasoningEffort !== DEFAULT_REASONING_EFFORT ? reasoningEffort : undefined }),
+    body: JSON.stringify({ content, images: images?.length ? images : undefined, docContext: docContext || undefined, textAttachments: textAttachments?.length ? textAttachments : undefined, thinkingBudget: thinkingBudget !== undefined && thinkingBudget !== -1 ? thinkingBudget : undefined, reasoningEffort: reasoningEffort !== undefined && reasoningEffort !== DEFAULT_REASONING_EFFORT ? reasoningEffort : undefined, model: model || undefined }),
     signal,
   })
   if (!res.ok || !res.body) {
@@ -186,11 +190,13 @@ export async function* continueConversation(
   signal: AbortSignal,
   thinkingBudget?: number,
   reasoningEffort?: ReasoningEffort,
+  /** See {@link sendMessage}. */
+  model?: string,
 ): AsyncGenerator<ChatSseEvent> {
   const res = await fetch(`/api/v1/conversations/${encodeURIComponent(convId)}/continue`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ thinkingBudget: thinkingBudget !== undefined && thinkingBudget !== -1 ? thinkingBudget : undefined, reasoningEffort: reasoningEffort !== undefined && reasoningEffort !== DEFAULT_REASONING_EFFORT ? reasoningEffort : undefined }),
+    body: JSON.stringify({ thinkingBudget: thinkingBudget !== undefined && thinkingBudget !== -1 ? thinkingBudget : undefined, reasoningEffort: reasoningEffort !== undefined && reasoningEffort !== DEFAULT_REASONING_EFFORT ? reasoningEffort : undefined, model: model || undefined }),
     signal,
   })
   if (!res.ok || !res.body) {
