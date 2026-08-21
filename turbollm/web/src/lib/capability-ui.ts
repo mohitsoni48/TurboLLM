@@ -11,7 +11,7 @@
 // answer is computed here and unit-tested without a browser: that is what makes "a disabled
 // control always carries an actionable reason" a property with a test rather than a rule
 // three components have to remember.
-import type { FleetRow } from './fleet'
+import type { FleetMachine, FleetRow } from './fleet'
 import type { LinkCapability, LinkStatus, LinkSummary } from './link-api'
 
 export type ActionState = { enabled: true } | { enabled: false; reason: string }
@@ -40,28 +40,19 @@ const CAPABILITY_VERB: Record<LinkCapability, string> = {
  *  into one "offline" — each one has a different fix.
  *
  *  Returns `null` for `online`, i.e. "connectivity is not the problem, keep going". */
-function connectivityReason(name: string, status: LinkStatus, lastError: string | null): string | null {
+function connectivityReason(name: string, status: LinkStatus): string | null {
   switch (status) {
     case 'online':
       return null
     case 'unreachable':
       // Must read as OFFLINE, and must not mention permissions at all.
-      return append(`${name} is offline, so this action is unavailable.`, lastError)
+      return `${name} is offline, so this action is unavailable.`
     case 'revoked':
-      return append(
-        `${name} revoked this link, so this action is unavailable. Relink to ${name} with a new link key to restore it.`,
-        lastError,
-      )
+      return `${name} revoked this link, so this action is unavailable. Relink to ${name} with a new link key to restore it.`
     case 'incompatible':
-      return append(
-        `${name} is running an incompatible version of TurboLLM, so this action is unavailable. Update TurboLLM on ${name}.`,
-        lastError,
-      )
+      return `${name} is running an incompatible version of TurboLLM, so this action is unavailable. Update TurboLLM on ${name}.`
     case 'unknown':
-      return append(
-        `${name} has not been checked yet, so this action is unavailable until its status is known.`,
-        lastError,
-      )
+      return `${name} has not been checked yet, so this action is unavailable until its status is known.`
     default: {
       // A new LinkStatus member is a COMPILE error here rather than a silent `undefined`
       // reaching a tooltip as an empty (or literally "undefined") string.
@@ -71,12 +62,14 @@ function connectivityReason(name: string, status: LinkStatus, lastError: string 
   }
 }
 
-/** Append the link's own message when it has one — it is the only part of the sentence that
- *  can say what actually went wrong ("Connection refused.", "401 from host."). */
-function append(sentence: string, lastError: string | null): string {
-  const extra = lastError?.trim()
-  return extra ? `${sentence} ${extra}` : sentence
-}
+/** `lastError` is deliberately NOT appended to the sentences above.
+ *
+ *  It reads as though it adds detail, and it does not: `applyProbeResult` sets a failing
+ *  link's `lastError` to `describeStatus(status, name)` — the same fact, already stated —
+ *  so the tooltip came out as *"workstation is offline, so this action is unavailable.
+ *  workstation is offline or unreachable."* The one `lastError` that says something new
+ *  (the machineId-changed warning) is only ever set on an ONLINE link, which never reaches
+ *  this function, and it has its own surface on the Machines list. */
 
 /** The sentence for "this link was not granted `cap`".
  *
@@ -91,6 +84,37 @@ function append(sentence: string, lastError: string | null): string {
  *  do about it — this is the only place the user will ever learn any of it. */
 export function capabilityReason(cap: LinkCapability, name: string): string {
   return `${CAPABILITY_VERB[cap]} ${name} needs the ${cap} permission, which this link was not granted. Mint a new link key on ${name} that includes ${cap}.`
+}
+
+/**
+ * The machines that are ONLINE and yet contribute no rows, because the host never granted
+ * the capability the list itself is gated on — shaped as `FleetMachine` notes so they
+ * render through the same `MachineNotes` component as the offline ones.
+ *
+ * `fleetMachines` cannot produce these and should not: its note is `null` for every online
+ * machine by design. But "this machine is online and contributed nothing" is exactly as
+ * confusing as a machine vanishing, which is the failure `fleetMachines` exists to prevent
+ * — a link without `models:use` yields no models, an empty machine-filter chip, and not one
+ * sentence anywhere saying why. This is that rule applied to a whole machine rather than to
+ * a single button.
+ *
+ * Pre-flight only, off the handshake — the same source `actionState` reads. A machine whose
+ * list request actually FAILED is a post-flight fact with its own channel
+ * (`describeRemoteFailure`), and callers that have one must not report both.
+ */
+export function machinesMissingCapability(
+  links: LinkSummary[],
+  cap: LinkCapability,
+): FleetMachine[] {
+  return links
+    .filter((l) => l.status === 'online' && !l.grantedCapabilities.includes(cap))
+    .map((l) => ({
+      linkId: l.id,
+      machine: l.name,
+      status: l.status,
+      note: capabilityReason(cap, l.name),
+      rowCount: 0,
+    }))
 }
 
 /**
@@ -125,7 +149,7 @@ export function actionState(
     }
   }
 
-  const blocked = connectivityReason(name, link.status, link.lastError)
+  const blocked = connectivityReason(name, link.status)
   if (blocked) return { enabled: false, reason: blocked }
 
   if (!link.grantedCapabilities.includes(cap)) {

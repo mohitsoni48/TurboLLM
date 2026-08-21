@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { actionState } from './capability-ui'
+import { actionState, capabilityReason, machinesMissingCapability } from './capability-ui'
 import type { FleetOrigin } from './fleet'
 import type { LinkCapability, LinkStatus, LinkSummary } from './link-api'
 
@@ -56,9 +56,19 @@ describe('actionState', () => {
     expect(reason).not.toMatch(/grant/i)
   })
 
-  it('an offline link appends the link’s own lastError when it has one', () => {
-    const state = actionState('models:load', REMOTE, link({ status: 'unreachable', lastError: 'Connection refused.' }))
-    expect(reasonOf(state)).toMatch(/Connection refused\./)
+  it('does NOT append the link’s lastError, which only ever repeats the sentence', () => {
+    // `applyProbeResult` sets a failing link's `lastError` to `describeStatus(status, name)`
+    // — the same fact the sentence above already states — so appending it produced
+    // "workstation is offline, so this action is unavailable. workstation is offline or
+    // unreachable." One statement of one fact.
+    const state = actionState(
+      'models:load',
+      REMOTE,
+      link({ status: 'unreachable', lastError: 'workstation is offline or unreachable.' }),
+    )
+    const reason = reasonOf(state)
+    expect(reason).toBe('workstation is offline, so this action is unavailable.')
+    expect(reason.match(/offline/gi)).toHaveLength(1)
   })
 
   it('a REVOKED link says revoked and points at relinking', () => {
@@ -128,5 +138,37 @@ describe('actionState', () => {
       link({ name: 'renamed-box', grantedCapabilities: [] }),
     )
     expect(reasonOf(state)).toMatch(/renamed-box/)
+  })
+})
+
+// ── An ONLINE machine that contributes nothing (final review I-4) ────────────────────────
+//
+// `fleetMachines` explains every machine that is not online, which was the whole point of
+// keeping offline machines represented. A machine that is online and STILL contributes no
+// rows — because the host never granted the capability its list is gated on — is the same
+// confusion with none of the explanation.
+describe('machinesMissingCapability', () => {
+  it('explains an online machine that was never granted the list capability', () => {
+    const [note] = machinesMissingCapability([link({ grantedCapabilities: ['models:load'] })], 'models:use')
+    expect(note).toBeTruthy()
+    expect(note!.linkId).toBe('l1')
+    expect(note!.rowCount).toBe(0)
+    expect(note!.note).toMatch(/models:use/)
+    expect(note!.note).toMatch(/workstation/)
+  })
+
+  it('says the same thing the disabled control would say', () => {
+    // One fact, one sentence. The pre-flight tooltip and the machine note must not drift
+    // into two differently-worded explanations of the same missing grant.
+    const [note] = machinesMissingCapability([link()], 'models:use')
+    expect(note!.note).toBe(capabilityReason('models:use', 'workstation'))
+  })
+
+  it('is silent for a machine that HAS the capability, and for one that is not online', () => {
+    expect(machinesMissingCapability([link({ grantedCapabilities: ['models:use'] })], 'models:use')).toEqual([])
+    // A non-online machine is `fleetMachines`' business — reported twice, the user reads two
+    // different reasons for one machine.
+    expect(machinesMissingCapability([link({ status: 'unreachable' })], 'models:use')).toEqual([])
+    expect(machinesMissingCapability([link({ status: 'revoked' })], 'models:use')).toEqual([])
   })
 })

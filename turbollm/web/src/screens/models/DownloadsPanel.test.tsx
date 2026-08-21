@@ -187,6 +187,26 @@ describe('DownloadsPanel — merged fleet', () => {
     expect(await screen.findByText(/downloads:read/)).toBeTruthy()
   })
 
+  // Final review I-4. The block above was computed and then thrown away by the
+  // `rows.length === 0` early return, so the explanation appeared only while some OTHER
+  // download happened to be in flight — i.e. never, on the fleet where it matters.
+  it('explains a refused read even when NOTHING else is downloading', async () => {
+    state.links = [link({ grantedCapabilities: [] })]
+    state.queueFail = { l1: { status: 403, error: { code: 'forbidden', message: 'x', capability: 'downloads:read' } } }
+    renderPanel()
+    expect(await screen.findByText(/downloads:read/)).toBeTruthy()
+    expect(screen.getByText(/workstation/)).toBeTruthy()
+  })
+
+  it('still stays hidden for a fleet that is merely idle', async () => {
+    // The early return's original point survives: three linked machines with empty queues
+    // must not conjure a "Downloads" heading that exists only to say they are idle.
+    state.links = [link(), link({ id: 'l2', name: 'kaggle' }), link({ id: 'l3', name: 'rig', status: 'unreachable' })]
+    const { container } = renderPanel()
+    await waitFor(() => expect(calls.some((c) => c.url.includes('/links/l2/downloads'))).toBe(true))
+    expect(container).toBeEmptyDOMElement()
+  })
+
   // Review M-1. Download ids are unique per MACHINE, not across the fleet. Keyed by bare id,
   // a refusal on one machine's row rendered on the other machine's row too.
   it('attaches a refusal to the row that caused it, even when two machines share an id', async () => {

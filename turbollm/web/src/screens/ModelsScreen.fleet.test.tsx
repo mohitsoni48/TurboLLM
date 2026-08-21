@@ -262,6 +262,26 @@ describe('ModelsScreen — merged fleet library', () => {
     expect(screen.getByRole('button', { name: 'workstation' })).toBeTruthy()
   })
 
+  // Final review I-4. The aggregated `/api/v1/links/models` route has no per-link error
+  // channel, so a link that is online but was never granted `models:use` contributed zero
+  // models, offered a machine-filter chip that yields an empty list, and said nothing at
+  // all. An online machine going silent is exactly as confusing as one that vanishes.
+  it('an ONLINE machine that was never granted models:use is explained, not silently empty', async () => {
+    state.links = [link({ grantedCapabilities: ['models:load'] })]
+    state.remote = []
+    renderScreen()
+    const note = await screen.findByText(/models:use/)
+    expect(note.textContent).toMatch(/workstation/)
+  })
+
+  it('says nothing extra about an online machine that simply has no models yet', async () => {
+    state.links = [link()]
+    state.remote = []
+    renderScreen()
+    await screen.findByRole('button', { name: 'workstation' })
+    expect(screen.queryByText(/models:use/)).toBeNull()
+  })
+
   it('two machines with the same model name produce two distinct rows', async () => {
     state.links = [link(), link({ id: 'l2', name: 'kaggle' })]
     state.remote = [remote({ name: 'Twin' }), remote({ name: 'Twin' }, 'l2')]

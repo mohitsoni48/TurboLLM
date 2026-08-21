@@ -76,7 +76,14 @@ export function DownloadsPanel() {
   // Nothing anywhere: the panel stays out of the way entirely, exactly as before. Note this
   // is keyed on ROWS, not on links — a fleet with three idle machines shows nothing, rather
   // than a "Downloads" heading that exists only to say three machines are idle.
-  if (rows.length === 0) return null
+  //
+  // `refusedReads` is part of that test, not something computed above it and then thrown
+  // away: a machine whose queue could not be READ is not an idle machine, and keyed on rows
+  // alone its explanation appeared only when some OTHER download happened to be in flight —
+  // i.e. exactly never, on the fleet where it matters most. Offline machines stay out of the
+  // test deliberately: they are the "three idle machines" case, and they are represented on
+  // the Machines list in Settings.
+  if (rows.length === 0 && refusedReads.length === 0) return null
 
   // Active/queued/paused first, then errored, then completed (terminal) last — applied
   // WITHIN the merged order so local still precedes remote at equal status.

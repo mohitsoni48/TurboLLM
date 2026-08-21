@@ -58,6 +58,7 @@ import {
 } from '../components/ui/dialog'
 import { toast } from '../components/ui/sonner'
 import { mergeFleet, fleetMachines, type FleetMachine, type FleetOrigin, type FleetRow } from '../lib/fleet'
+import { machinesMissingCapability } from '../lib/capability-ui'
 import {
   ALL_MACHINES,
   filterByMachine,
@@ -239,7 +240,11 @@ export function ModelsScreen() {
   const visibleRows = filterByMachine(fleetRows, machineFilter)
   // Machine headers come from the UNFILTERED sources, so selecting "All machines" still
   // explains an offline machine that contributed nothing.
-  const machines = fleetMachines(remoteSources)
+  // …plus the machines that are ONLINE and still contribute nothing, because the host never
+  // granted `models:use` — the capability its model list is gated on. `fleetMachines` cannot
+  // know that (its note is null for every online machine), so without this an un-granted
+  // link is a machine-filter chip that yields an empty list and not one word saying why.
+  const machines = [...fleetMachines(remoteSources), ...machinesMissingCapability(links, 'models:use')]
   const machineOpts = machineOptions(links)
 
   const linkFor = (linkId: string) => links.find((l) => l.id === linkId)
