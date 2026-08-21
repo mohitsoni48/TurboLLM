@@ -334,19 +334,26 @@ function buildSchemas(): Record<string, JsonSchema> {
     },
   }
 
+  // `content` is intentionally absent from `required` below: the live route code
+  // (routes.chats.ts, routes.runs.ts) accepts and persists an attachments-only message with
+  // absent/empty `content`, rejecting a request only when BOTH `content` is empty AND
+  // `attachments` is empty (`if (!content && !(attachments?.length)) return extError(...)`).
+  // JSON Schema has no direct way to express "at least one of these two properties" as part of
+  // a flat `required` list, so the real rule is documented in prose on the schema itself instead
+  // of encoded as a (misleading) `required: ['content']` that would contradict the server.
   const MessageInput: JsonSchema = {
     type: 'object',
+    description: 'At least one of `content` or a non-empty `attachments` array must be present — an attachments-only message with no content is valid and will be persisted as such.',
     properties: {
       role: { type: 'string', enum: ['user', 'assistant'] },
-      content: { type: 'string' },
+      content: { type: 'string', description: 'Optional if a non-empty `attachments` array is present — at least one of `content` or `attachments` is required.' },
       reasoning: { type: 'string' },
-      attachments: { type: 'array', items: { type: 'string' }, description: 'data: URIs. Max 4 per message (spec §4.1).' },
+      attachments: { type: 'array', items: { type: 'string' }, description: 'data: URIs. Max 4 per message (spec §4.1). Optional if `content` is present — at least one of `content` or `attachments` is required.' },
       owner: { type: 'string' },
       generate: { type: 'boolean', description: 'Defaults to true. false appends without starting a run.' },
       sampling: { type: 'object', additionalProperties: true },
       metadata: { type: 'object', additionalProperties: true },
     },
-    required: ['content'],
   }
 
   const MessagePatch: JsonSchema = {

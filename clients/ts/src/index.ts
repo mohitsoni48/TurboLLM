@@ -86,7 +86,11 @@ export interface Message {
   // Heavy fields — present only when requested via `?include=` (spec 27 §5.3).
   reasoning?: string
   attachments?: string[]
-  tool_calls?: Array<{ name: string; arguments: unknown; result?: unknown }>
+  // Matches the real wire shape persisted into `ChatMessage.toolCalls` and flowed unchanged
+  // through `dto.ts` (server's `generation.ts` `ToolCallRecord` / `tools/execute-with-approval.ts`
+  // `sink()` payloads) — `id`/`name`/`args`, not `name`/`arguments` as an earlier draft of this
+  // client and spec §3.2's sample JSON both incorrectly showed.
+  tool_calls?: Array<{ id: string; name: string; args: unknown; result?: unknown; error?: unknown }>
   usage?: { prompt_tokens: number; completion_tokens: number; tokens_per_second: number; model: string }
   metadata?: Record<string, unknown>
 }
@@ -152,15 +156,21 @@ export interface UpdateChatInput {
 export interface AppendMessageInput {
   owner?: string
   role?: MessageRole
-  content: string
+  // Optional, not required: the server accepts and persists an attachments-only message with
+  // absent/empty content, rejecting a request only when BOTH content and attachments are empty
+  // (spec 27's content-OR-attachments rule; matches SendParams below).
+  content?: string
   reasoning?: string
+  attachments?: string[]
+  metadata?: Record<string, unknown>
   include?: HeavyField[]
 }
 
 export interface SendParams {
   owner?: string
   role?: MessageRole
-  content: string
+  // Optional, not required — see AppendMessageInput's `content` doc comment for the rule.
+  content?: string
   attachments?: string[]
   sampling?: Record<string, unknown>
   metadata?: Record<string, unknown>
@@ -428,14 +438,17 @@ export class TurboLLMChat {
       this.request(`/messages/${encodeURIComponent(id)}`, { method: 'DELETE', query: { owner: opts.owner } }),
 
     /** The `generate: false` path (spec 27 §5.1): appends a message with no run, for
-     *  back-filling history without touching the GPU. */
+     *  back-filling history without touching the GPU. Forwards `attachments`/`metadata` just
+     *  like `send()`/`SendParams` do on the generate path — the server fully reads and persists
+     *  both here too, so silently dropping them would be client-side data loss. */
     append: (chatId: string, input: AppendMessageInput): Promise<Message> =>
       this.request(`/chats/${encodeURIComponent(chatId)}/messages`, {
         method: 'POST',
         query: { include: input.include?.join(',') },
         body: {
           owner: input.owner, role: input.role ?? 'user', content: input.content,
-          reasoning: input.reasoning, generate: false,
+          reasoning: input.reasoning, attachments: input.attachments, metadata: input.metadata,
+          generate: false,
         },
       }),
   }

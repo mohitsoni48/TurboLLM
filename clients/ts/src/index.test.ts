@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { TurboLLMChat } from './index.js'
+import type { AppendMessageInput, SendParams } from './index.js'
 
 /** A fetch stub returning a canned SSE body. */
 function sseFetch(frames: string): typeof fetch {
@@ -124,4 +125,37 @@ test('resume() reconciles past the replay window via runs.get()', async () => {
   for await (const ev of resumed) seen.push(ev.event)
   assert.deepEqual(seen, ['delta', 'done'])
   assert.equal(resumed.lastEventSeq, 102)
+})
+
+test('messages.append() forwards attachments and metadata, matching send()/SendParams', async () => {
+  let seenBody: Record<string, unknown> | undefined
+  const client = new TurboLLMChat({
+    baseUrl: 'http://x/api/ext/v1', apiKey: 'k',
+    fetch: (async (_url: string, init: RequestInit) => {
+      seenBody = JSON.parse(String(init.body)) as Record<string, unknown>
+      return new Response(
+        JSON.stringify({ id: 'm1', chat_id: 'c1', seq: 1, role: 'user', content: 'hi', status: 'complete', version: 1, created_at: 't', edited: false }),
+        { status: 201, headers: { 'Content-Type': 'application/json' } },
+      )
+    }) as unknown as typeof fetch,
+  })
+  await client.messages.append('c1', {
+    owner: 'u1', content: 'hi', attachments: ['data:text/plain;base64,aGk='], metadata: { source: 'import' },
+  })
+  assert.ok(seenBody, 'fetch was never called')
+  assert.deepEqual(seenBody!.attachments, ['data:text/plain;base64,aGk='], 'append() must forward attachments, not silently drop them')
+  assert.deepEqual(seenBody!.metadata, { source: 'import' }, 'append() must forward metadata, not silently drop it')
+  assert.equal(seenBody!.generate, false)
+})
+
+// Type-level check (this suite has no dedicated compile-time-assertion harness, so a runtime
+// construction that the TypeScript compiler must accept without `content` stands in for one —
+// `npx tsc --noEmit` on this file is itself part of the type check: SendParams.content and
+// AppendMessageInput.content must both be optional, matching the server's content-OR-attachments
+// rule (an attachments-only message is valid and must not be forced to carry `content`).
+test('SendParams and AppendMessageInput both compile and construct with content omitted', () => {
+  const sendParams: SendParams = { owner: 'u1', attachments: ['data:text/plain;base64,aGk='] }
+  const appendInput: AppendMessageInput = { owner: 'u1', attachments: ['data:text/plain;base64,aGk='] }
+  assert.equal(sendParams.content, undefined)
+  assert.equal(appendInput.content, undefined)
 })

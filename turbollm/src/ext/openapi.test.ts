@@ -55,6 +55,24 @@ test('heavy fields are marked optional so include= is discoverable from the sche
   assert.ok(msg.required.includes('content'))
 })
 
+// The live route code (routes.chats.ts, routes.runs.ts) accepts and persists an
+// attachments-only message with absent/empty `content` — it only rejects a request when BOTH
+// `content` and `attachments` are empty. `MessageInput.required` must not contradict that by
+// forcing `content`, which would misdocument the server's own "content OR attachments" rule
+// (the exact rule an earlier fix, C4, established for the runtime behavior).
+test('MessageInput does not require content, matching the server\'s content-OR-attachments rule', () => {
+  const doc = buildOpenApiDocument('1.0.0')
+  const input = doc.components.schemas.MessageInput as { required?: string[]; description?: string; properties: Record<string, { description?: string }> }
+  assert.ok(!(input.required ?? []).includes('content'), 'content must be optional — an attachments-only message is valid')
+  // The OR constraint can't be expressed structurally in a flat `required` list, so it must be
+  // documented in prose somewhere on the schema instead of silently dropped.
+  const documentedSomewhere =
+    (input.description ?? '').toLowerCase().includes('attachments') ||
+    (input.properties.content?.description ?? '').toLowerCase().includes('attachments') ||
+    (input.properties.attachments?.description ?? '').toLowerCase().includes('content')
+  assert.ok(documentedSomewhere, 'the content-OR-attachments rule must be documented in a description since required[] cannot express it')
+})
+
 // Test 4 above only exercises registerExtChatRoutes (its `d` fake has no `manager`/`gate`, which
 // routes.runs.ts's handlers need) — reviewed and confirmed a real gap: the 5 routes.runs.ts
 // routes (POST .../messages/generate, GET /runs, GET /runs/:id, GET /runs/:id/stream,
