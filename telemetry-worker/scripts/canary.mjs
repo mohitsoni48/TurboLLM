@@ -45,6 +45,11 @@ const events = [
   envelope('daily_active'),
   envelope('model_first_load', { payload: { outcome: 'ok' } }),
   envelope('engine_installed', { payload: { outcome: 'ok' } }),
+  // Same event WITH the fields the current client emits. Both shapes are fired on
+  // purpose: the bare one proves already-shipped binaries are still accepted, this
+  // one proves the release about to ship will not be quarantined. A canary that only
+  // probes yesterday's shape stops being a proof the moment the schema moves.
+  envelope('engine_installed', { payload: { outcome: 'ok', trigger: 'seed' } }),
   envelope('model_downloaded', { payload: { outcome: 'ok' } }),
   envelope('model_load', {
     payload: {
@@ -64,6 +69,7 @@ const events = [
   }),
   envelope('feature_first_use', { payload: { feature: 'chat' } }),
   envelope('feature_used_daily', { payload: { feature: 'chat', countBucket: '1' } }),
+  envelope('feature_used_daily', { payload: { feature: 'chat', countBucket: '1', daysAgo: 1 } }),
   envelope('error', { payload: { fingerprint: 'engine_crash' } }),
   envelope('bench_result', {
     hw: { cpu: 'canary-cpu', ramMb: 65536, gpus: [{ name: 'canary-gpu', vramMb: 16384 }] },
@@ -81,13 +87,30 @@ const events = [
       distinctModels: 1, toolCalls: 0, regenerates: 0, stops: 0,
     },
   }),
+  envelope('chat_daily', {
+    payload: {
+      conversations: 1, messages: 1, maxMessagesInConversation: 1, medianMessagesInConversation: 1,
+      distinctModels: 1, toolCalls: 0, regenerates: 0, stops: 0, daysAgo: 1,
+    },
+  }),
   envelope('gateway_daily', {
     payload: { harness: 'claude_code', protocol: 'anthropic', requests: 1, promptTokens: 1, genTokens: 1, distinctModels: 1 },
   }),
+  envelope('gateway_daily', {
+    payload: { harness: 'claude_code', protocol: 'anthropic', requests: 1, promptTokens: 1, genTokens: 1, distinctModels: 1, daysAgo: 1 },
+  }),
   envelope('harness_first_seen', { payload: { harness: 'claude_code', protocol: 'anthropic' } }),
   envelope('code_daily', { payload: { sessions: 1, turns: 1, toolCalls: 0 } }),
+  envelope('code_daily', { payload: { sessions: 1, turns: 1, toolCalls: 0, daysAgo: 1 } }),
   envelope('ui_action', { payload: { screen: 'engines', action: 'install_engine' } }),
   envelope('ui_daily', { payload: { screen: 'engines', actions: 1, distinctActions: 1 } }),
+  envelope('ui_daily', { payload: { screen: 'engines', actions: 1, distinctActions: 1, daysAgo: 1 } }),
+  // Neither onboarding event was ever covered here, which mattered: onboarding_recovery
+  // sat in the registry with no emitter at all and received zero events for its whole
+  // life, and a canary that never fired it could not tell that apart from a working
+  // event nobody happened to trigger. Now a deploy proves both are ingestible.
+  envelope('onboarding_profile', { payload: { profile: 'developer' } }),
+  envelope('onboarding_recovery', { payload: { failure: 'no_asset', action: 'resume', outcome: 'ok' } }),
 ]
 
 // `--file` sidesteps shell-quoting but ALSO changes what wrangler returns —

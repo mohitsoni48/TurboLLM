@@ -39,6 +39,61 @@ const MAX_PLAUSIBLE_TPS = 100_000
  *  same as a structurally invalid one, never quarantined. */
 const MAX_EVENT_BYTES = 4096
 
+/** A real release, as published to npm. Anything else (`canary`,
+ *  `posthog-verify`, `e2e-check`) is our own synthetic traffic. */
+const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/
+
+/**
+ * Project an event's NESTED blocks onto flat top-level property names for
+ * PostHog (2026-08-21 data-integrity audit).
+ *
+ * The whole envelope is forwarded as `properties`, which means `app` and
+ * `payload` arrive as JSON objects. PostHog does not register object-valued
+ * properties in its taxonomy, so for every app event the property picker
+ * offered exactly four things — `machineId`, `event`, `ts`, `schema` — and
+ * nothing else. Version, screen, action, outcome, failure reason, every
+ * counter: all present in the stored JSON, none of them selectable. Anyone
+ * building a chart by clicking could see WHERE a number moved and had no way
+ * to ask WHY, and every breakdown had to be hand-written HogQL. That single
+ * gap is most of why the data was described as unreadable.
+ *
+ * Flattening at the edge rather than in the client keeps the wire format, the
+ * privacy allow-list and the D1 mirror exactly as they were — the nested
+ * originals are still forwarded alongside, so nothing that already queries
+ * `properties.app.version` breaks. This only ADDS the flat aliases PostHog can
+ * actually index, which is also why it is safe to ship ahead of any client.
+ *
+ * One level deep, on purpose: every payload in the registry is flat except
+ * `bench_result`'s nested blocks, whose leaves are the benchmark page's
+ * business and are already reachable in SQL. Values are limited to scalars, so
+ * this can never widen what a property may contain beyond what `validateEvent`
+ * already allowed through — it re-shapes accepted data, it never admits more.
+ *
+ * Lives here rather than in the Worker for the same reason validation does:
+ * the Worker is a shell, and anything with a decision in it needs to be
+ * testable without miniflare.
+ */
+export function flattenForAnalytics(e: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  for (const block of ['app', 'payload'] as const) {
+    const v = e[block]
+    if (typeof v !== 'object' || v === null || Array.isArray(v)) continue
+    for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+      if (val === null || ['string', 'number', 'boolean'].includes(typeof val)) {
+        out[`${block}_${k}`] = val
+      }
+    }
+  }
+  // One clause any insight can filter on, instead of maintaining a version
+  // deny-list by hand. The deploy canary and the launch-day seed batch were
+  // 1,844 of 2,379 app_first_run events — a 5x inflation of the headline
+  // install number that nobody could see, because their only tell was a
+  // non-release version string buried inside a nested object.
+  const version = (e.app as { version?: unknown } | undefined)?.version
+  out.is_synthetic = typeof version === 'string' ? !SEMVER.test(version) : false
+  return out
+}
+
 export interface QuarantinedEvent {
   /** The raw, unvalidated event exactly as received. */
   raw: Record<string, unknown>
