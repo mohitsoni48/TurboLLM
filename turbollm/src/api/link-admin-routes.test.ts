@@ -127,6 +127,53 @@ test('GET /api/v1/links lists stored links for the settings UI', async () => {
   assert.equal(body.links[0].status, 'online')
 })
 
+// ── Regression coverage: the raw peer token must never reach the browser. `token` on
+// `LinkRecord` is a live bearer credential this machine presents to the host — distinct
+// from mint's one-time reveal of a FRESH token. These assert on the raw response TEXT,
+// not a parsed/typed object, so a nested or renamed occurrence can't slip past a
+// narrowly-typed assertion.
+
+test('POST /api/v1/links never echoes the raw token back to the browser', async () => {
+  const hello = async () => new Response(JSON.stringify({
+    machineId: 'm1', machineName: 'workstation', appVersion: '1.11.2',
+    linkApiVersions: [1], capabilities: ['models:use'],
+  }), { status: 200, headers: { 'content-type': 'application/json' } })
+  const { app } = mkApp(hello)
+  const res = await app.request('/api/v1/links', json({ linkString: encodeLinkString('http://h:6996', 'tllm-secret-abc') }))
+  const text = await res.text()
+  assert.ok(!text.includes('tllm-secret-abc'))
+  assert.ok(!text.includes('"token"'))
+})
+
+test('PATCH /api/v1/links/:id never echoes the raw token back to the browser', async () => {
+  const hello = async () => new Response(JSON.stringify({
+    machineId: 'm1', machineName: 'kaggle', appVersion: '1', linkApiVersions: [1], capabilities: ['models:use'],
+  }), { status: 200, headers: { 'content-type': 'application/json' } })
+  const { app, cfg } = mkApp(hello)
+  await app.request('/api/v1/links', json({ linkString: encodeLinkString('http://old:6996', 'tllm-secret-xyz') }))
+  const id = (cfg.links as { id: string }[])[0].id
+  const res = await app.request(`/api/v1/links/${id}`, {
+    method: 'PATCH', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ baseUrl: 'https://new-tunnel.trycloudflare.com' }),
+  })
+  const text = await res.text()
+  assert.ok(!text.includes('tllm-secret-xyz'))
+  assert.ok(!text.includes('"token"'))
+})
+
+test('GET /api/v1/links never echoes any stored raw token back to the browser', async () => {
+  const hello = async () => new Response(JSON.stringify({
+    machineId: 'm1', machineName: 'workstation', appVersion: '1.11.2',
+    linkApiVersions: [1], capabilities: ['models:use'],
+  }), { status: 200, headers: { 'content-type': 'application/json' } })
+  const { app } = mkApp(hello)
+  await app.request('/api/v1/links', json({ linkString: encodeLinkString('http://h:6996', 'tllm-secret-list') }))
+  const res = await app.request('/api/v1/links')
+  const text = await res.text()
+  assert.ok(!text.includes('tllm-secret-list'))
+  assert.ok(!text.includes('"token"'))
+})
+
 test('inbound lists granted keys with their capabilities and last-used, never a hash', async () => {
   const { app } = mkApp()
   await app.request('/api/v1/links/mint', json({ name: 'laptop', capabilities: ['models:use'] }))

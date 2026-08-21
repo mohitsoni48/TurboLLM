@@ -6,7 +6,7 @@ import type { Deps } from '../deps'
 import { applyProbeResult } from '../link/apply-probe'
 import { LinkClient } from '../link/link-client'
 import { decodeLinkString, encodeLinkString } from '../link/link-string'
-import { LINK_CAPABILITIES, type LinkCapability, type LinkRecord } from '../link/types'
+import { LINK_CAPABILITIES, redactLink, type LinkCapability, type LinkRecord } from '../link/types'
 
 /** Turbo Link admin surface, on the NORMAL /api/v1 API — this is the user's own browser
  *  talking to their own daemon, so it is governed by lanAuth like everything else. The
@@ -100,7 +100,7 @@ export function registerLinkAdminRoutes(
 
   // ── Peer side: list all links (settings UI's "linked machines" panel).
   app.get('/api/v1/links', (c) => {
-    return c.json({ links: d.store.snapshot().links ?? [] })
+    return c.json({ links: (d.store.snapshot().links ?? []).map(redactLink) })
   })
 
   // ── Peer side: add / edit / remove a link.
@@ -130,7 +130,8 @@ export function registerLinkAdminRoutes(
     // STORED — Kaggle hands back a new tunnel URL every session, so the relink flow must
     // be "edit the URL", never "delete and start over".
     await probe(rec.id)
-    return c.json({ link: current(rec.id) })
+    const stored = current(rec.id)
+    return c.json({ link: stored ? redactLink(stored) : null })
   })
 
   app.patch('/api/v1/links/:id', async (c) => {
@@ -152,7 +153,8 @@ export function registerLinkAdminRoutes(
       if (body?.name) l.name = body.name
     })
     await probe(id)
-    return c.json({ link: current(id) })
+    const stored = current(id)
+    return c.json({ link: stored ? redactLink(stored) : null })
   })
 
   app.delete('/api/v1/links/:id', (c) => {

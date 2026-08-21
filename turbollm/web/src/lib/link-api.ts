@@ -61,7 +61,13 @@ export type LinkStatus = 'unknown' | 'online' | 'unreachable' | 'revoked' | 'inc
 
 /** This machine's record of a host it has linked to (GET /api/v1/links,
  *  POST /api/v1/links, PATCH /api/v1/links/:id). `grantedCapabilities` is what the
- *  host reported at handshake — render capability chips from this, never from a guess. */
+ *  host reported at handshake — render capability chips from this, never from a guess.
+ *
+ *  Deliberately has NO `token` field, unlike the server's internal `LinkRecord`
+ *  (turbollm/src/link/types.ts) — the server-side `redactLink()` allowlist projection
+ *  strips the raw bearer credential before any of these three routes ever serializes a
+ *  link to the browser, so this type mirrors what's actually on the wire, not the
+ *  server's full internal record. */
 export interface LinkRecord {
   id: string
   name: string

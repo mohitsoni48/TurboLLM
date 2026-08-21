@@ -49,6 +49,29 @@ export interface LinkRecord {
   lastError: string | null
 }
 
+/** The subset of a `LinkRecord` safe to hand to the browser. Deliberately an ALLOWLIST
+ *  projection, not a delete-list: `token` is a live bearer credential this machine uses
+ *  to authenticate to the host, so building the response by spreading the record and
+ *  deleting `token` would leak-by-default the moment a future field is added to
+ *  `LinkRecord` — an allowlist fails safe instead. Every admin route that returns a
+ *  link (GET /api/v1/links, POST /api/v1/links, PATCH /api/v1/links/:id) must go
+ *  through this, never return a raw `LinkRecord` to the client. */
+export type RedactedLinkRecord = Omit<LinkRecord, 'token'>
+
+export function redactLink(rec: LinkRecord): RedactedLinkRecord {
+  return {
+    id: rec.id,
+    name: rec.name,
+    baseUrl: rec.baseUrl,
+    machineId: rec.machineId,
+    grantedCapabilities: rec.grantedCapabilities,
+    linkApiVersion: rec.linkApiVersion,
+    status: rec.status,
+    lastSeenAt: rec.lastSeenAt,
+    lastError: rec.lastError,
+  }
+}
+
 /** Host's reply to POST /api/link/v1/hello. */
 export interface HelloResponse {
   machineId: string
