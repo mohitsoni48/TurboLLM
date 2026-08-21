@@ -99,6 +99,25 @@ export interface LinkRecord {
   lastError: string | null
 }
 
+/** Everything a fleet-facing UI decision needs to know about a link, and nothing else —
+ *  the merged Models/Downloads/Engines lists (lib/fleet.ts) and the capability-aware action
+ *  states (lib/capability-ui.ts) both read exactly these five fields.
+ *
+ *  Defined ONCE for the whole web layer, here, next to the `LinkRecord` it projects. It
+ *  mirrors `LinkSummary` in turbollm/src/link/types.ts — which is the domain definition —
+ *  and exists separately only because this side of the wire boundary cannot import backend
+ *  source; that is the same hand-sync convention as every other type in this file. Do not
+ *  re-declare it in a consuming module: phase 1 shipped a bug where a second module copied a
+ *  domain record and business logic then validated against the copy.
+ *
+ *  Four of the five fields are `Pick`ed so they cannot drift from `LinkRecord`. `id` is
+ *  widened to a plain `string` deliberately: a `LinkRecordId` is assignable to it, so a real
+ *  `LinkRecord` still satisfies this type, while a caller (or a test) that only has a raw id
+ *  string does not have to brand-cast just to ask whether a button should be enabled. */
+export type LinkSummary = Pick<LinkRecord, 'name' | 'status' | 'grantedCapabilities' | 'lastError'> & {
+  id: string
+}
+
 /** One machine that has linked TO this one (GET /api/v1/links/inbound), derived from
  *  a granted API key. */
 export interface InboundLink {

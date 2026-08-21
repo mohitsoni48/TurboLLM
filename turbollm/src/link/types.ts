@@ -57,6 +57,21 @@ export interface LinkRecord {
   lastError: string | null
 }
 
+/** The single canonical definition of "everything a fleet-facing UI decision needs to know
+ *  about a link" — the merged Models/Downloads/Engines lists and the capability-aware
+ *  action states (ADR-376 phase 3) both read exactly these five fields and nothing else.
+ *
+ *  A `Pick` of `LinkRecord`, not a hand-written copy: phase 1 already shipped one bug where
+ *  a second module re-declared a domain record and business logic then validated against the
+ *  copy, so the field types here must keep following `LinkRecord` by construction. The web
+ *  layer mirrors this shape once (turbollm/web/src/lib/link-api.ts) purely because it is on
+ *  the far side of the wire boundary and cannot import backend source — same hand-sync
+ *  convention as the rest of that file. */
+export type LinkSummary = Pick<
+  LinkRecord,
+  'id' | 'name' | 'status' | 'grantedCapabilities' | 'lastError'
+>
+
 /** The subset of a `LinkRecord` safe to hand to the browser. Deliberately an ALLOWLIST
  *  projection, not a delete-list: `token` is a live bearer credential this machine uses
  *  to authenticate to the host, so building the response by spreading the record and
