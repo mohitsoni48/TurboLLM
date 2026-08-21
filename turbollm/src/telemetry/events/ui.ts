@@ -646,6 +646,15 @@ export const UI_ACTIONS = [
   'choose_profile', 'start_model_download', 'use_existing_models', 'open_discover_handoff',
   'pick_different_model', 'accept_autotune', 'decline_autotune', 'finish_onboarding',
   'resume_onboarding', 'dismiss_finish_banner', 'take_recovery_action',
+
+  // Turbo Link phase 3 (ADR-376): fleet control on the Models screen. `UI_ACTIONS` is a
+  // CLOSED enum — `uiAction` validates against it and `POST /api/v1/telemetry/ui` drops an
+  // unrecognised action while still answering 202 — so these five call sites existed and
+  // recorded nothing at all until they were listed here. ADR-376 makes `ui_action`
+  // attribution to the peer that took the click a load-bearing decision, and this project
+  // has already once read a telemetry defect as "nobody used it".
+  'load_remote_model', 'unload_remote_model', 'filter_models_by_machine',
+  'cancel_remote_download', 'download_hf_quant_remote',
 ] as const
 
 export const uiAction = defineEvent({

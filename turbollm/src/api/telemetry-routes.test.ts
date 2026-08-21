@@ -205,3 +205,39 @@ test('POST /api/v1/telemetry/regenerate-id: discards events queued under the old
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+// ── Turbo Link phase 3's clicks must actually be recorded (final review I-5) ────────────
+//
+// `UI_ACTIONS` is a closed enum and the route above drops an unknown action while still
+// answering 202 — deliberately (ADR-299 anti-probing), and it means a call site whose
+// action name was never added records NOTHING while reading as fully instrumented. All
+// five of phase 3's fleet actions were in that state. This is the guard that they arrive.
+//
+// Kept as a route test rather than an enum-membership assertion on purpose: membership is
+// what the emitter checks, so the thing worth pinning is the row landing in the queue.
+test('POST /api/v1/telemetry/ui: every Turbo Link fleet action is recorded, not dropped', async () => {
+  const actions = [
+    'load_remote_model', 'unload_remote_model', 'filter_models_by_machine',
+    'cancel_remote_download', 'download_hf_quant_remote',
+  ]
+  for (const action of actions) {
+    const dir = mkdtempSync(join(tmpdir(), 'turbollm-routes-'))
+    try {
+      const { app } = fakeApp(dir, { level: 'full', machineId: '11111111-1111-1111-1111-111111111111' }, { withEmitter: true })
+      const res = await app.request('/api/v1/telemetry/ui', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ screen: 'models', action }),
+      })
+      assert.equal(res.status, 202)
+      const queued = readQueue(dir).map((q) => q.event as { event: string; payload: unknown })
+      assert.deepEqual(
+        queued.find((q) => q.event === 'ui_action')?.payload,
+        { screen: 'models', action },
+        `${action} was dropped — add it to UI_ACTIONS`,
+      )
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+})
