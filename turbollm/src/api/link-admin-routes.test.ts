@@ -1,19 +1,40 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { Hono } from 'hono'
 import { registerLinkAdminRoutes } from './link-admin-routes'
 import { decodeLinkString, encodeLinkString } from '../link/link-string'
+import { Emitter } from '../telemetry/emit'
+import { readQueue } from '../telemetry/queue'
 import type { Deps } from '../deps'
 
-function mkApp(fetchImpl?: typeof fetch) {
+function mkApp(fetchImpl?: typeof fetch, telemetry?: Emitter) {
   const cfg: Record<string, unknown> = { apiKeys: [], links: [], daemon: { port: 6996 } }
   const d = {
     version: '1.11.2',
     store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
+    ...(telemetry ? { telemetry } : {}),
   } as unknown as Deps
   const app = new Hono()
   registerLinkAdminRoutes(app, d, { fetchImpl })
   return { app, cfg }
+}
+
+/** Real `Emitter` over a temp data dir, at `anon` consent — same convention as
+ *  `telemetry/emit.test.ts`'s `makeEmitter`. Returns the dir so a test can read
+ *  back exactly what was queued via `readQueue`. */
+function mkTelemetry(): { telemetry: Emitter; dir: string; cleanup: () => void } {
+  const dir = mkdtempSync(join(tmpdir(), 'turbollm-link-admin-telemetry-'))
+  const cfg = { telemetry: { level: 'anon', machineId: '33333333-3333-3333-3333-333333333333' } }
+  const telemetry = new Emitter({
+    dataDir: dir,
+    store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) } as never,
+    version: '1.11.2',
+    os: 'win32/x64',
+  })
+  return { telemetry, dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) }
 }
 
 const json = (body: unknown) => ({
@@ -263,4 +284,70 @@ test('PATCH re-probe flags a machineId change instead of silently adopting it �
   const l = (cfg.links as { machineId: string | null; lastError: string | null }[])[0]
   assert.equal(l.machineId, 'DIFFERENT')
   assert.match(l.lastError ?? '', /different machine/i)
+})
+
+// ── Telemetry (Task 11): link_minted / link_added ───────────────────────────
+
+test('mint emits link_minted with the capability count, never the token or capability names', async () => {
+  const { telemetry, dir, cleanup } = mkTelemetry()
+  try {
+    const { app } = mkApp(undefined, telemetry)
+    await app.request('/api/v1/links/mint', json({ name: 'laptop', capabilities: ['models:use', 'models:load'] }))
+    const events = readQueue(dir).map((q) => q.event as { event: string; payload?: Record<string, unknown> })
+    const minted = events.filter((e) => e.event === 'link_minted')
+    assert.equal(minted.length, 1)
+    assert.deepEqual(minted[0].payload, { capabilityCount: 2 })
+    const text = JSON.stringify(events)
+    assert.ok(!text.includes('tllm-'))
+    assert.ok(!/models:/.test(text))
+  } finally {
+    cleanup()
+  }
+})
+
+test('mint with no telemetry deps is a no-op, not a crash', async () => {
+  const { app } = mkApp()
+  const res = await app.request('/api/v1/links/mint', json({ name: 'x', capabilities: ['models:use'] }))
+  assert.equal(res.status, 200)
+})
+
+test('adding an unreachable link emits link_added with outcome "unreachable"', async () => {
+  const { telemetry, dir, cleanup } = mkTelemetry()
+  try {
+    const { app } = mkApp(async () => { throw new TypeError('fetch failed') }, telemetry)
+    await app.request('/api/v1/links', json({ linkString: encodeLinkString('http://dead:6996', 'tllm-abc') }))
+    const events = readQueue(dir).map((q) => q.event as { event: string; payload?: Record<string, unknown> })
+    const added = events.filter((e) => e.event === 'link_added')
+    assert.equal(added.length, 1)
+    assert.deepEqual(added[0].payload, { outcome: 'unreachable' })
+    const text = JSON.stringify(events)
+    assert.ok(!text.includes('tllm-'))
+    assert.ok(!text.includes('dead:6996'))
+  } finally {
+    cleanup()
+  }
+})
+
+test('adding an online link emits link_added with outcome "online"', async () => {
+  const hello = async () => new Response(JSON.stringify({
+    machineId: 'm1', machineName: 'workstation', appVersion: '1.11.2',
+    linkApiVersions: [1], capabilities: ['models:use'],
+  }), { status: 200, headers: { 'content-type': 'application/json' } })
+  const { telemetry, dir, cleanup } = mkTelemetry()
+  try {
+    const { app } = mkApp(hello, telemetry)
+    await app.request('/api/v1/links', json({ linkString: encodeLinkString('http://h:6996', 'tllm-abc') }))
+    const events = readQueue(dir).map((q) => q.event as { event: string; payload?: Record<string, unknown> })
+    const added = events.filter((e) => e.event === 'link_added')
+    assert.equal(added.length, 1)
+    assert.deepEqual(added[0].payload, { outcome: 'online' })
+  } finally {
+    cleanup()
+  }
+})
+
+test('adding a link with no telemetry deps is a no-op, not a crash', async () => {
+  const { app } = mkApp(async () => { throw new TypeError('fetch failed') })
+  const res = await app.request('/api/v1/links', json({ linkString: encodeLinkString('http://dead:6996', 'tllm-abc') }))
+  assert.equal(res.status, 200)
 })

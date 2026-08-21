@@ -7,6 +7,8 @@ import { applyProbeResult } from '../link/apply-probe'
 import { LinkClient } from '../link/link-client'
 import { decodeLinkString, encodeLinkString } from '../link/link-string'
 import { LINK_CAPABILITIES, redactLink, type LinkCapability, type LinkRecord } from '../link/types'
+import { emit } from '../telemetry/runtime/typed-emit'
+import { linkMinted, linkAdded, LINK_PRESETS, LINK_ADDED_OUTCOMES } from '../telemetry/events/link'
 
 /** Turbo Link admin surface, on the NORMAL /api/v1 API — this is the user's own browser
  *  talking to their own daemon, so it is governed by lanAuth like everything else. The
@@ -22,7 +24,7 @@ export function registerLinkAdminRoutes(
   // ── Host side: mint a scoped token for another machine.
   app.post('/api/v1/links/mint', async (c) => {
     const body = await c.req.json().catch(() => null) as
-      { name?: string; capabilities?: string[]; models?: unknown } | null
+      { name?: string; capabilities?: string[]; models?: unknown; preset?: string } | null
     const name = body?.name?.trim()
     const caps = body?.capabilities ?? []
     if (!name) return c.json({ error: { code: 'bad_request', message: 'A name is required.' } }, 400)
@@ -79,6 +81,20 @@ export function registerLinkAdminRoutes(
     const port = (cfg.daemon as { port?: number }).port ?? 6996
     const tunnelUrl = d.tunnel?.url() ?? null
     const baseUrl = tunnelUrl ?? `http://${lanHost()}:${port}`
+
+    // Telemetry (ADR-376 Task 11): count and preset name only — never the token, the
+    // capability list itself, or baseUrl. `preset` is a hint the caller may pass for
+    // reporting purposes alone; it does not affect what capabilities were actually
+    // granted (`caps`, validated above), so a bogus value here can only be dropped,
+    // never widen a grant. `d.telemetry` is optional (absent under tests, same
+    // convention as tunnel/gate/links), so this must be a no-op when unset.
+    if (d.telemetry) {
+      const preset = typeof body?.preset === 'string' && (LINK_PRESETS as readonly string[]).includes(body.preset)
+        ? (body.preset as (typeof LINK_PRESETS)[number])
+        : undefined
+      emit(d.telemetry, linkMinted, { capabilityCount: caps.length, ...(preset ? { preset } : {}) })
+    }
+
     // Revealed ONCE — only the hash is stored, same rule as every other key.
     return c.json({ keyId, token: full, linkString: encodeLinkString(baseUrl, full) })
   })
@@ -131,6 +147,15 @@ export function registerLinkAdminRoutes(
     // be "edit the URL", never "delete and start over".
     await probe(rec.id)
     const stored = current(rec.id)
+
+    // Telemetry (ADR-376 Task 11): the outcome enum only — never baseUrl, hostname, or
+    // token. `nextStatus()` (link-state.ts) never leaves a just-probed link at
+    // 'unknown', so `stored.status` is always one of LINK_ADDED_OUTCOMES here; the
+    // includes() guard is defensive rather than expected to ever reject a real value.
+    if (d.telemetry && stored && (LINK_ADDED_OUTCOMES as readonly string[]).includes(stored.status)) {
+      emit(d.telemetry, linkAdded, { outcome: stored.status as (typeof LINK_ADDED_OUTCOMES)[number] })
+    }
+
     return c.json({ link: stored ? redactLink(stored) : null })
   })
 

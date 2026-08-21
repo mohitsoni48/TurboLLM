@@ -1,15 +1,34 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { LinkManager } from './link-manager'
+import { Emitter } from '../telemetry/emit'
+import { readQueue } from '../telemetry/queue'
 import type { Deps } from '../deps'
 import type { LinkRecord } from './types'
 
-function mkDeps(links: LinkRecord[]): { d: Deps; cfg: { links: LinkRecord[] } } {
+function mkDeps(links: LinkRecord[], telemetry?: Emitter): { d: Deps; cfg: { links: LinkRecord[] } } {
   const cfg = { links, daemon: {}, apiKeys: [] }
   const d = {
     store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
+    ...(telemetry ? { telemetry } : {}),
   } as unknown as Deps
   return { d, cfg: cfg as { links: LinkRecord[] } }
+}
+
+/** Real `Emitter` over a temp data dir, at `anon` consent. */
+function mkTelemetry(): { telemetry: Emitter; dir: string; cleanup: () => void } {
+  const dir = mkdtempSync(join(tmpdir(), 'turbollm-link-manager-telemetry-'))
+  const cfg = { telemetry: { level: 'anon', machineId: '44444444-4444-4444-4444-444444444444' } }
+  const telemetry = new Emitter({
+    dataDir: dir,
+    store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) } as never,
+    version: '1.11.2',
+    os: 'win32/x64',
+  })
+  return { telemetry, dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) }
 }
 
 const rec = (over: Partial<LinkRecord> = {}): LinkRecord => ({
@@ -93,4 +112,58 @@ test('probeAll never rejects, even when every link fails', async () => {
   const { d } = mkDeps([rec({ id: 'a' }), rec({ id: 'b' })])
   const m = new LinkManager(d, { fetchImpl: async () => { throw new Error('boom') } })
   await m.probeAll()
+})
+
+// ── Telemetry (Task 11): link_status_changed ────────────────────────────────
+
+test('probeOnce emits link_status_changed when the status actually transitions', async () => {
+  const { telemetry, dir, cleanup } = mkTelemetry()
+  try {
+    const { d } = mkDeps([rec({ status: 'unknown' })], telemetry)
+    const m = new LinkManager(d, { fetchImpl: helloOk })
+    await m.probeOnce('l1')
+    const events = readQueue(dir).map((q) => q.event as { event: string; payload?: Record<string, unknown> })
+    const changed = events.filter((e) => e.event === 'link_status_changed')
+    assert.equal(changed.length, 1)
+    assert.deepEqual(changed[0].payload, { from: 'unknown', to: 'online' })
+  } finally {
+    cleanup()
+  }
+})
+
+test('probeOnce emits nothing when the status is unchanged', async () => {
+  const { telemetry, dir, cleanup } = mkTelemetry()
+  try {
+    const { d } = mkDeps([rec({ status: 'online' })], telemetry)
+    const m = new LinkManager(d, { fetchImpl: helloOk })
+    await m.probeOnce('l1')
+    const events = readQueue(dir).map((q) => q.event as { event: string })
+    assert.deepEqual(events.filter((e) => e.event === 'link_status_changed'), [])
+  } finally {
+    cleanup()
+  }
+})
+
+test('probeOnce link_status_changed payload never carries a token, url, or hostname', async () => {
+  const { telemetry, dir, cleanup } = mkTelemetry()
+  try {
+    const { d } = mkDeps([rec({
+      id: 'l1', status: 'unknown', baseUrl: 'https://secret-host.trycloudflare.com', token: 'tllm-super-secret',
+    })], telemetry)
+    const m = new LinkManager(d, { fetchImpl: helloOk })
+    await m.probeOnce('l1')
+    const text = JSON.stringify(readQueue(dir))
+    assert.ok(!text.includes('tllm-'))
+    assert.ok(!text.includes('secret-host'))
+    assert.ok(!/https?:\/\//.test(text))
+  } finally {
+    cleanup()
+  }
+})
+
+test('probeOnce with no telemetry deps is a no-op, not a crash', async () => {
+  const { d, cfg } = mkDeps([rec({ status: 'unknown' })])
+  const m = new LinkManager(d, { fetchImpl: helloOk })
+  await m.probeOnce('l1')
+  assert.equal(cfg.links[0].status, 'online')
 })

@@ -2,6 +2,8 @@ import type { Deps } from '../deps'
 import { applyProbeResult } from './apply-probe'
 import { LinkClient } from './link-client'
 import type { LinkRecord } from './types'
+import { emit } from '../telemetry/runtime/typed-emit'
+import { linkStatusChanged } from '../telemetry/events/link'
 
 const DEFAULT_INTERVAL_MS = 15_000
 
@@ -51,6 +53,7 @@ export class LinkManager {
   async probeOnce(id: string): Promise<void> {
     const rec = this.get(id)
     if (!rec) return
+    const fromStatus = rec.status
     const probe = await new LinkClient(rec, { fetchImpl: this.fetchImpl }).hello()
 
     this.d.store.update((cfg) => {
@@ -58,5 +61,14 @@ export class LinkManager {
       if (!l) return
       applyProbeResult(l, probe)
     })
+
+    // Telemetry (ADR-376 Task 11): from/to status only — never baseUrl, hostname, or
+    // token. Only fires on an actual transition, not on every poll tick (most polls
+    // don't change anything). `d.telemetry` is optional, same convention as
+    // tunnel/gate/links elsewhere on Deps, so this must be a no-op when unset.
+    const toStatus = this.get(id)?.status
+    if (this.d.telemetry && toStatus !== undefined && toStatus !== fromStatus) {
+      emit(this.d.telemetry, linkStatusChanged, { from: fromStatus, to: toStatus })
+    }
   }
 }
