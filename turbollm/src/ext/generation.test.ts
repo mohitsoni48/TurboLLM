@@ -16,7 +16,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ConversationStore } from '../chat/db.js'
 import { ChatStoreRouter } from '../chat/store/router.js'
-import { loadFullHistory, shouldFlushCheckpoint, FLUSH_INTERVAL_MS, FLUSH_MIN_CHARS } from './generation.js'
+import {
+  loadFullHistory, shouldFlushCheckpoint, FLUSH_INTERVAL_MS, FLUSH_MIN_CHARS,
+  extractChunkUsage, buildUsagePatch,
+} from './generation.js'
 
 const SCOPE = { tenant: 'acme', owner: 'u1' }
 
@@ -113,4 +116,55 @@ test('shouldFlushCheckpoint: respects overridden thresholds instead of the modul
   assert.equal(shouldFlushCheckpoint(999, 50, { intervalMs: 1000, minChars: 100 }), false)
   assert.equal(shouldFlushCheckpoint(1000, 50, { intervalMs: 1000, minChars: 100 }), true)
   assert.equal(shouldFlushCheckpoint(1, 100, { intervalMs: 1000, minChars: 100 }), true)
+})
+
+// ── extractChunkUsage / buildUsagePatch (final-review-round-3 Critical fix) ────────────────────
+//
+// Same rationale as shouldFlushCheckpoint above: there is no live model/engine in this
+// environment to drive a real streaming generation end-to-end (see this file's header comment
+// and generation.ts's own), so a genuine "does runGenerationLoop actually call updateMessage
+// with usage, does it emit the SSE event at the right point" test is not feasible here without a
+// fake-engine harness this test suite doesn't have. What IS practical and directly testable is
+// the pure decision logic that was deliberately extracted out of the per-chunk parse loop and
+// the patch-building closure specifically so it could be — mirroring the C2 fix's own precedent.
+test('extractChunkUsage: captures a real usage object, exactly as the engine sends it (no field renaming)', () => {
+  const chunk = { choices: [], usage: { prompt_tokens: 120, completion_tokens: 340, total_tokens: 460 } }
+  assert.deepEqual(extractChunkUsage(chunk), { prompt_tokens: 120, completion_tokens: 340, total_tokens: 460 })
+})
+
+test('extractChunkUsage: returns undefined when usage is absent — the ordinary case for every non-final chunk', () => {
+  assert.equal(extractChunkUsage({ choices: [{ delta: { content: 'hi' } }] }), undefined)
+  assert.equal(extractChunkUsage({}), undefined)
+})
+
+test('extractChunkUsage: treats null/non-object/array usage as absent rather than crashing or capturing garbage', () => {
+  assert.equal(extractChunkUsage({ usage: null }), undefined)
+  assert.equal(extractChunkUsage({ usage: 'not-an-object' }), undefined)
+  assert.equal(extractChunkUsage({ usage: 42 }), undefined)
+  assert.equal(extractChunkUsage({ usage: [1, 2, 3] }), undefined)
+})
+
+test('extractChunkUsage: still captures usage on a chunk whose choices array is empty — the exact chunk shape the old code silently discarded', () => {
+  const chunk = { choices: [], usage: { prompt_tokens: 10, completion_tokens: 5 } }
+  assert.deepEqual(extractChunkUsage(chunk), { prompt_tokens: 10, completion_tokens: 5 })
+})
+
+test('buildUsagePatch: omits the usage key entirely when nothing has arrived yet, rather than sending {}', () => {
+  const patch = buildUsagePatch(undefined)
+  assert.deepEqual(patch, {})
+  assert.equal('usage' in patch, false)
+})
+
+test('buildUsagePatch: includes the captured usage object once real data has arrived', () => {
+  const usage = { prompt_tokens: 10, completion_tokens: 20 }
+  assert.deepEqual(buildUsagePatch(usage), { usage })
+})
+
+test('buildUsagePatch: spreads cleanly into a patch literal alongside other fields, either way', () => {
+  const withUsage = { content: 'hi', status: 'complete' as const, ...buildUsagePatch({ prompt_tokens: 1 }) }
+  assert.deepEqual(withUsage, { content: 'hi', status: 'complete', usage: { prompt_tokens: 1 } })
+
+  const withoutUsage = { content: 'hi', status: 'streaming' as const, ...buildUsagePatch(undefined) }
+  assert.deepEqual(withoutUsage, { content: 'hi', status: 'streaming' })
+  assert.equal('usage' in withoutUsage, false)
 })

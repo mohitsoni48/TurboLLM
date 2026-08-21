@@ -177,11 +177,40 @@ export function shouldFlushCheckpoint(
   return elapsedMsSinceLastFlush >= intervalMs || charsSinceLastFlush >= minChars
 }
 
+/** Pure "is this chunk's usage worth capturing" check, mirroring chat-routes.ts's own
+ *  `if (chunk.usage) finalUsage = chunk.usage as typeof finalUsage` (final-review Critical
+ *  finding: that line's equivalent never existed in this file's loop at all). The engine's final
+ *  per-round SSE chunk — the one `stream_options: { include_usage: true }` on the outbound
+ *  request asks for — carries a real `usage` object alongside an EMPTY `choices` array, so this
+ *  must be checked before/independent of the `if (!choices?.length) continue` gate below; that
+ *  gate is exactly what silently discarded it before this fix. Returns the raw object unchanged
+ *  — no field renaming, no derived fields — because that IS the real wire shape the engine
+ *  sends, per chat-routes.ts's own identical, untransformed capture. Exported so the decision is
+ *  directly unit-testable without a live engine. */
+export function extractChunkUsage(chunk: Record<string, unknown>): Record<string, unknown> | undefined {
+  const usage = chunk.usage
+  if (!usage || typeof usage !== 'object' || Array.isArray(usage)) return undefined
+  return usage as Record<string, unknown>
+}
+
+/** Whether a captured usage object belongs in a `ChatMessage` patch — spread the result directly
+ *  into a patch literal. Deliberately OMITS the `usage` key entirely (rather than sending
+ *  `usage: {}` or a stale placeholder) until real usage data has actually arrived from the
+ *  engine: `MessagePatch.usage` is optional specifically so "not present" and "present but
+ *  empty" stay distinguishable, and `sqlite-chat-store.ts`'s `updateMessage` only touches the
+ *  `stats` column when `patch.usage !== undefined` — sending `usage: {}` on every checkpoint
+ *  before anything real has arrived would needlessly overwrite that column for no benefit.
+ *  Exported for the same reason as `extractChunkUsage`. */
+export function buildUsagePatch(usage: Record<string, unknown> | undefined): { usage?: Record<string, unknown> } {
+  return usage !== undefined ? { usage } : {}
+}
+
 interface LoopHooks {
   onDelta: (text: string) => void
   onReasoning: (text: string) => void
   onError: (message: string) => void
   onToolCall: (tc: ToolCallRecord) => void
+  onUsage: (usage: Record<string, unknown>) => void
 }
 
 /** Drives the engine for one turn, including any tool-call rounds, streaming deltas/reasoning
@@ -284,6 +313,11 @@ async function runGenerationLoop(d: Deps, ctx: GenerationCtx, emit: EmitSink, si
 
           let chunk: Record<string, unknown>
           try { chunk = JSON.parse(raw) as Record<string, unknown> } catch { continue }
+
+          // Must run BEFORE the `choices?.length` gate below — see extractChunkUsage's own
+          // comment for why the usage chunk would otherwise be silently discarded there.
+          const usage = extractChunkUsage(chunk)
+          if (usage) hooks.onUsage(usage)
 
           const choices = chunk.choices as Array<{
             delta?: { content?: string; reasoning_content?: string; reasoning?: string; tool_calls?: Array<{ index: number; id?: string; function?: { name?: string; arguments?: string } }> }
@@ -411,6 +445,9 @@ export function createMakeBody(d: Deps): RunDeps['makeBody'] {
     let finalContent = ''
     let finalReasoning = ''
     const toolCalls: ToolCallRecord[] = []
+    // undefined (not {}) until the engine's usage chunk actually arrives — see
+    // buildUsagePatch's doc comment for why that distinction is load-bearing, not cosmetic.
+    let finalUsage: Record<string, unknown> | undefined
     let errorMessage: string | undefined
     let release: (() => void) | null = null
 
@@ -463,6 +500,7 @@ export function createMakeBody(d: Deps): RunDeps['makeBody'] {
         reasoning: finalReasoning,
         toolCalls,
         status: 'streaming',
+        ...buildUsagePatch(finalUsage),
       }).then(
         () => {},
         () => {
@@ -494,6 +532,7 @@ export function createMakeBody(d: Deps): RunDeps['makeBody'] {
           onReasoning: (t) => { finalReasoning += t; maybeFlush() },
           onError: (m) => { errorMessage = m },
           onToolCall: (tc) => { toolCalls.push(tc); maybeFlush(true) },
+          onUsage: (u) => { finalUsage = u },
         })
       } finally {
         d.manager.generationEnd()
@@ -511,6 +550,14 @@ export function createMakeBody(d: Deps): RunDeps['makeBody'] {
     // `maybeFlush`), so this can't throw — it only guarantees ordering.
     if (flushInFlight) await flushInFlight
 
+    // Emitted before the terminal write/return below so it always lands before run-manager.ts's
+    // 'done' frame — that frame is only pushed to the buffer once this function's returned
+    // promise settles (see PublicRunManager.start()'s `params.body(...)` await). Skipped
+    // entirely (no event, no patch key below) if the engine never sent a usage chunk at all —
+    // e.g. the run was aborted before the stream's final chunk arrived — rather than
+    // emitting/persisting a fabricated zeroed placeholder.
+    if (finalUsage !== undefined) await emit({ event: 'usage', data: finalUsage })
+
     const aborted = signal.aborted
     const status = aborted ? 'aborted' as const : errorMessage ? 'failed' as const : 'complete' as const
     await d.chatStore.updateMessage(scope, messageId, {
@@ -518,6 +565,7 @@ export function createMakeBody(d: Deps): RunDeps['makeBody'] {
       reasoning: finalReasoning,
       toolCalls,
       status,
+      ...buildUsagePatch(finalUsage),
     }).catch(() => {
       // Best-effort: the run's own status (PublicRunManager) is authoritative for the caller
       // regardless of whether this write lands — a version conflict here (e.g. a concurrent
