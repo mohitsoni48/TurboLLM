@@ -99,3 +99,64 @@ test('a 200 application/json body that is a bare number yields network, not a th
   })
   assert.deepEqual(await c.hello(), { kind: 'network' })
 })
+
+// ── config()/writeConfig() (spec §5.8). Task 6 is the intended consumer; these pin the
+//    contract now so it cannot drift before that lands. ────────────────────────────────
+
+test('config() returns the host projection unchanged, and never re-validates its shape', async () => {
+  const c = new LinkClient(rec, {
+    fetchImpl: async () => new Response(
+      JSON.stringify({ config: { modelDefaults: { ctx: 8192 }, somethingNewTheHostAdded: 1 } }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    ),
+  })
+  const p = await c.config()
+  assert.equal(p.kind, 'config')
+  // Handed back whole: a peer-side shape filter would be a second copy of the host's
+  // allowlist that goes stale the day the host adds a field.
+  if (p.kind === 'config') {
+    assert.deepEqual(p.config, { modelDefaults: { ctx: 8192 }, somethingNewTheHostAdded: 1 })
+  }
+})
+
+test('config() on a 403 (no config:read) is an http probe, NOT an empty config', async () => {
+  // "We do not know this host's settings" must never render as "the host has no settings".
+  const c = new LinkClient(rec, { fetchImpl: async () => new Response('', { status: 403 }) })
+  assert.deepEqual(await c.config(), { kind: 'http', status: 403 })
+})
+
+test('config() rejects a garbage shape rather than adopting it', async () => {
+  for (const body of ['{}', '{"config":null}', '{"config":[]}', '{"config":"nope"}']) {
+    const c = new LinkClient(rec, {
+      fetchImpl: async () => new Response(body, { status: 200, headers: { 'content-type': 'application/json' } }),
+    })
+    assert.deepEqual(await c.config(), { kind: 'network' }, body)
+  }
+})
+
+test('writeConfig() sends the patch under `patch` and does not pre-filter it', async () => {
+  // The HOST holds the allowlist. A peer-side filter would be a second copy of it, so an
+  // out-of-scope path must go out on the wire and come back as the host's own 403.
+  let sent: { method?: string; body?: string } = {}
+  const c = new LinkClient(rec, {
+    fetchImpl: async (_u, init) => {
+      const i = init as RequestInit
+      sent = { method: i.method, body: i.body as string }
+      return new Response('', { status: 403 })
+    },
+  })
+  assert.deepEqual(await c.writeConfig({ apiKeys: [] }), { kind: 'http', status: 403 })
+  assert.equal(sent.method, 'PATCH')
+  assert.deepEqual(JSON.parse(sent.body!), { patch: { apiKeys: [] } })
+})
+
+test('writeConfig() reports accepted on a 200, and never throws on a dead host', async () => {
+  const ok = new LinkClient(rec, {
+    fetchImpl: async () => new Response(JSON.stringify({ ok: true, applied: ['gateway.keepN'] }),
+      { status: 200, headers: { 'content-type': 'application/json' } }),
+  })
+  assert.deepEqual(await ok.writeConfig({ 'gateway.keepN': 2 }), { kind: 'accepted' })
+
+  const dead = new LinkClient(rec, { fetchImpl: async () => { throw new TypeError('fetch failed') } })
+  assert.deepEqual(await dead.writeConfig({ 'gateway.keepN': 2 }), { kind: 'network' })
+})

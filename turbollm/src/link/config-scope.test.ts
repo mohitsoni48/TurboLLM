@@ -6,6 +6,20 @@ import {
   scrubConfigForRead,
   applyScopedPatch,
 } from './config-scope'
+import { CONFIG_BOUNDS } from '../config/config-bounds'
+
+/** The scope's leaf validators, reached through the public surface: `scrubConfigForRead`
+ *  emits a leaf only when its validator passes, so a single-leaf config round-tripped
+ *  through it is exactly `validator(value)`. Testing through the public API rather than
+ *  exporting the internal record keeps the module's surface as small as its contract. */
+const WRITABLE_LEAVES_FOR_TEST: Record<string, (v: unknown) => boolean> = Object.fromEntries(
+  Object.keys(CONFIG_BOUNDS).map((path) => [path, (v: unknown) => {
+    const segs = path.split('.')
+    const cfg = { [segs[0]!]: { [segs[1]!]: v } }
+    const out = scrubConfigForRead(cfg as never) as Record<string, Record<string, unknown>>
+    return out[segs[0]!]?.[segs[1]!] !== undefined
+  }]),
+)
 
 // ── Every one of these is a full compromise of the IAM model if it succeeds.
 test('apiKeys is never writable — a peer must not mint itself a full-access token', () => {
@@ -269,5 +283,80 @@ test('a non-object patch is rejected rather than crashing', () => {
   for (const bad of [null, undefined, 'apiKeys', 42, []]) {
     const r = applyScopedPatch(cfg, bad as never)
     assert.equal(r.ok, false)
+  }
+})
+
+// ── Review finding 1: the remote bounds must never be WIDER than the owner's own. ────────
+
+test('the remote leaf bounds are the LOCAL bounds — one shared table, no second copy', () => {
+  // The anti-drift property is structural: config-scope.ts imports CONFIG_BOUNDS rather
+  // than restating the numbers, and api/routes.ts validates against the same table. This
+  // walks the table and proves the remote validator tracks it exactly at every edge.
+  for (const [path, b] of Object.entries(CONFIG_BOUNDS)) {
+    const leaf = WRITABLE_LEAVES_FOR_TEST[path]
+    assert.ok(leaf, `${path} should be a writable leaf`)
+    assert.equal(leaf!(b.min), true, `${path}: min ${b.min} must be accepted`)
+    assert.equal(leaf!(b.min - 1), false, `${path}: below min must be rejected`)
+    if (Number.isSafeInteger(b.max)) {
+      assert.equal(leaf!(b.max), true, `${path}: max ${b.max} must be accepted`)
+      if (b.max < Number.MAX_SAFE_INTEGER) {
+        assert.equal(leaf!(b.max + 1), false, `${path}: above max must be rejected`)
+      }
+    }
+    // Strictly narrower than the local route, which coerces: no strings, no fractions.
+    assert.equal(leaf!(String(b.min)), false, `${path}: a numeric string must be rejected`)
+    assert.equal(leaf!(b.min + 0.5), false, `${path}: a fraction must be rejected`)
+  }
+})
+
+test('the exact values the review flagged are now refused', () => {
+  const cfg = { modelDefaults: { ctx: 4096, ngl: 50 } } as never
+  // ctx below the owner's 256 floor.
+  let r = applyScopedPatch(cfg, { 'modelDefaults.ctx': 128 })
+  assert.equal(r.ok, false)
+  if (!r.ok) assert.deepEqual(r.invalid, ['modelDefaults.ctx'])
+  // ngl = -1, which is NOT an "all layers" sentinel in this codebase — profileToArgs gates
+  // on `p.ngl > 0`, so it means no offload, and the owner's 0-99 control cannot represent
+  // it in order to correct it.
+  r = applyScopedPatch(cfg, { 'modelDefaults.ngl': -1 })
+  assert.equal(r.ok, false)
+  if (!r.ok) assert.deepEqual(r.invalid, ['modelDefaults.ngl'])
+  r = applyScopedPatch(cfg, { 'modelDefaults.ngl': 100 })
+  assert.equal(r.ok, false)
+  // Untouched throughout.
+  const c = cfg as unknown as { modelDefaults: { ctx: number; ngl: number } }
+  assert.equal(c.modelDefaults.ctx, 4096)
+  assert.equal(c.modelDefaults.ngl, 50)
+})
+
+test('a block write cannot smuggle an out-of-range leaf past the leaf bounds', () => {
+  const cfg = { modelDefaults: { ctx: 4096, ngl: 50 } } as never
+  const r = applyScopedPatch(cfg, { modelDefaults: { ctx: 1, ngl: -1 } })
+  assert.equal(r.ok, false)
+  assert.equal((cfg as unknown as { modelDefaults: { ctx: number } }).modelDefaults.ctx, 4096)
+})
+
+// ── Review finding 3: say plainly what a block write does. ───────────────────────────────
+
+test('a block write REPLACES the block, dropping optional leaves', () => {
+  // Documented, not accidental: `maxTokens`/`imageMaxTokens` are themselves writable
+  // leaves, so a block write that omits them reaches nothing a direct leaf write could not.
+  const cfg = { modelDefaults: { ctx: 4096, ngl: 50, maxTokens: 512, imageMaxTokens: 256 } } as never
+  const r = applyScopedPatch(cfg, { modelDefaults: { ctx: 8192, ngl: 60 } })
+  assert.equal(r.ok, true)
+  assert.deepEqual((cfg as unknown as { modelDefaults: unknown }).modelDefaults, { ctx: 8192, ngl: 60 })
+  // …and a block write still may not DROP a required key.
+  assert.equal(applyScopedPatch(cfg, { modelDefaults: { ctx: 8192 } }).ok, false)
+})
+
+// ── Review finding 7: allowlist lookups can never hit a prototype member. ────────────────
+
+test('a prototype-member name is rejected, never resolved against the allowlist', () => {
+  for (const p of ['toString', 'valueOf', 'hasOwnProperty', 'constructor']) {
+    assert.equal(isWritablePath(p), false)
+    const cfg = { modelDefaults: { ctx: 4096 } } as never
+    const r = applyScopedPatch(cfg, { [p]: 1 })
+    assert.equal(r.ok, false, `${p} must be refused, not crash`)
+    if (!r.ok) assert.deepEqual(r.rejected, [p])
   }
 })

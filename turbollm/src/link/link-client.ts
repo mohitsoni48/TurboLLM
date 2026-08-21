@@ -191,7 +191,14 @@ export class LinkClient {
     return res.kind === 'body' ? { kind: 'accepted' } : res
   }
 
-  /** The host's peer-visible config (spec §5.8). Goes through `call()` like every other
+  /** The host's peer-visible config (spec §5.8).
+   *
+   *  INTENDED CALLER: task 6, which wires the fleet screens — a remote machine's settings
+   *  panel is the only thing that needs this. It has no caller today, and that is why it is
+   *  called out here rather than left as unexplained dead code: the alternative was to ship
+   *  the host half of §5.8 with no client seam at all, and have task 6 re-derive it.
+   *
+   *  Goes through `call()` like every other
    *  method, so it inherits the same total "never throws, never adopts garbage" guarantee.
    *
    *  The body is the host's ALLOWLIST PROJECTION (config-scope.ts's `scrubConfigForRead`)

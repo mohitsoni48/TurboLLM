@@ -20,6 +20,7 @@ import { join } from 'node:path'
 import { registerLinkApi } from './link-routes'
 import { ConfigStore, type ApiKey, type Config } from '../config/config'
 import type { Deps } from '../deps'
+import { CONFIG_BOUNDS, coerceBounded, type BoundedConfigPath } from '../config/config-bounds'
 
 function key(raw: string, caps?: string[]): ApiKey {
   return {
@@ -283,4 +284,85 @@ test('a legacy full-access key is STILL bound by the path allowlist', async (t) 
   const res = await patch(app(h.d), 'tllm-legacy', { patch: { 'daemon.lanBind': true } })
   assert.equal(res.status, 403)
   assert.equal(h.onDisk().daemon.lanBind, false)
+})
+
+// ── Review finding 2: a write-only key must not get a free read. ─────────────────────────
+
+test('a config:write-only key gets the acknowledgement, NOT the projection', async (t) => {
+  const h = mkDeps(t, [key('tllm-w', ['config:write'])], (c) => {
+    c.modelDefaults.maxTokens = 4242 // a value the peer never wrote
+  })
+  const res = await patch(app(h.d), 'tllm-w', { patch: { 'daemon.theme': 'light' } })
+  assert.equal(res.status, 200)
+  const raw = await res.text()
+  const body = JSON.parse(raw) as { ok: boolean; applied: string[]; config?: unknown }
+  assert.equal(body.ok, true)
+  assert.deepEqual(body.applied, ['daemon.theme'])
+  // No echo at all — write permission is not read permission.
+  assert.equal(body.config, undefined)
+  assert.ok(!raw.includes('4242'), `a write-only key was handed a value it never wrote: ${raw}`)
+  // The write itself still landed.
+  assert.equal(h.onDisk().daemon.theme, 'light')
+})
+
+test('a key holding BOTH config:write and config:read still gets the projection', async (t) => {
+  const h = mkDeps(t, [key('tllm-rw', ['config:write', 'config:read'])])
+  const res = await patch(app(h.d), 'tllm-rw', { patch: { 'daemon.theme': 'light' } })
+  assert.equal(res.status, 200)
+  const body = await res.json() as { config?: Record<string, Record<string, unknown>> }
+  assert.equal(body.config?.modelDefaults?.ctx, 4096)
+})
+
+// ── Review finding 1: the remote bounds now match the owner's, end to end. ───────────────
+
+test('the values the owner\'s own route rejects are refused here too', async (t) => {
+  const h = mkDeps(t, [key('tllm-a', ['config:write'])])
+  const a = app(h.d)
+  for (const [path, value] of [
+    ['modelDefaults.ctx', 128],   // below the owner's 256 floor
+    ['modelDefaults.ngl', -1],    // not an "all layers" sentinel — the owner's control is 0-99
+    ['modelDefaults.ngl', 100],
+    ['modelDefaults.maxTokens', -1],
+    ['gateway.keepN', 5],
+  ] as const) {
+    const res = await patch(a, 'tllm-a', { patch: { [path]: value } })
+    assert.equal(res.status, 400, `${path}=${value} should be 400, got ${res.status}`)
+    const body = await res.json() as { error: { code: string; invalid: string[] } }
+    assert.equal(body.error.code, 'invalid_value')
+    assert.deepEqual(body.error.invalid, [path])
+  }
+  // Nothing landed.
+  const disk = h.onDisk()
+  assert.equal(disk.modelDefaults.ctx, 4096)
+  assert.equal(disk.gateway.keepN, 1)
+})
+
+test('PARITY: nothing the link route accepts would be rejected by the owner\'s own route', async (t) => {
+  // The honest form of "remote is never wider than local": drive the real link route, and
+  // check every acceptance against `coerceBounded` — the exact function api/routes.ts now
+  // validates with. A future widening of the remote gate fails here even if both bounds
+  // tables were (wrongly) re-forked.
+  const h = mkDeps(t, [key('tllm-a', ['config:write'])])
+  const a = app(h.d)
+  const probes: Array<[BoundedConfigPath, unknown]> = []
+  for (const path of Object.keys(CONFIG_BOUNDS) as BoundedConfigPath[]) {
+    const b = CONFIG_BOUNDS[path]
+    for (const v of [b.min - 1, b.min, b.min + 1, b.max, b.max + 1, b.min + 0.5, String(b.min), -1, 0]) {
+      probes.push([path, v])
+    }
+  }
+  let accepted = 0
+  for (const [path, value] of probes) {
+    const res = await patch(a, 'tllm-a', { patch: { [path]: value } })
+    if (res.status === 200) {
+      accepted++
+      assert.notEqual(
+        coerceBounded(path, value), null,
+        `the link route accepted ${path}=${JSON.stringify(value)} but the owner's own route rejects it`,
+      )
+    } else {
+      assert.equal(res.status, 400)
+    }
+  }
+  assert.ok(accepted > 0, 'the probe set must include values that legitimately pass')
 })

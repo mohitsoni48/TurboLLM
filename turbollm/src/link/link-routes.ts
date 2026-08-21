@@ -128,6 +128,18 @@ function linkDownloadErr(c: { json: (b: unknown, s: number) => Response }, f: Do
   )
 }
 
+/** Thrown inside `PATCH /api/link/v1/config`'s `store.update` callback when the second
+ *  `applyScopedPatch` pass disagrees with the dry-run. Unreachable today; it exists so that
+ *  if it ever DOES happen it aborts the write and surfaces as a 500, rather than committing
+ *  nothing and reporting 200. Distinct from `ValueError` so the two cannot be conflated:
+ *  one is "your patch was bad" (400), this is "our two passes disagreed" (500). */
+class ScopeDriftError extends Error {
+  constructor() {
+    super('scoped patch validation disagreed between passes')
+    this.name = 'ScopeDriftError'
+  }
+}
+
 /** Mount ONLY the façade's gate. Split out from `registerLinkApi` so `createApp` can put
  *  the gate before the feature-telemetry middleware and the handlers after it: telemetry
  *  must not count a request that was rejected, and a handler registered BEFORE the
@@ -401,9 +413,27 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
 
     try {
       d.store.update((cfg) => {
-        applyScopedPatch(cfg, patch as Record<string, unknown>)
+        // The return value is CHECKED, not discarded. It is the atomicity signal, and the
+        // dry-run above already proved this exact patch passes — so a rejection here means
+        // the two passes disagreed, which today is impossible (validation is pure and does
+        // not read the config) but would become possible the moment a leaf validator turns
+        // config-dependent. Throwing aborts `update` before it commits or writes the file,
+        // turning a would-be silent no-op-reported-as-200 into a loud failure.
+        const second = applyScopedPatch(cfg, patch as Record<string, unknown>)
+        if (!second.ok) throw new ScopeDriftError()
       })
     } catch (err) {
+      if (err instanceof ScopeDriftError) {
+        return c.json(
+          {
+            error: {
+              code: 'internal',
+              message: 'The host could not apply that config change.',
+            },
+          },
+          500,
+        )
+      }
       return c.json(
         {
           error: {
@@ -414,10 +444,19 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
         400,
       )
     }
+    // The echo is a READ, and write permission is not read permission. A key holding only
+    // `config:write` gets the acknowledgement and the list of paths IT just wrote — nothing
+    // else. Returning the whole projection unconditionally (as this route first did) handed
+    // a write-only token `modelDefaults.*`, `gateway.*` and `daemon.autoGenerateTitles`
+    // values it never wrote, quietly contradicting the boundary the GET route above
+    // documents. No secret was involved either way — the projection is secret-free — which
+    // is exactly why it was easy to miss.
     return c.json({
       ok: true,
       applied: dryRun.applied,
-      config: scrubConfigForRead(d.store.snapshot()),
+      ...(hasCapability(c.get('linkKey'), 'config:read')
+        ? { config: scrubConfigForRead(d.store.snapshot()) }
+        : {}),
     })
   })
 

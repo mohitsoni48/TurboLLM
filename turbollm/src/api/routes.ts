@@ -8,6 +8,7 @@ import { GATE_VERSION, gateNodeSource } from '../comfyui/gate-template'
 import { randomUUID } from 'node:crypto'
 import { homedir, networkInterfaces } from 'node:os'
 import { ValueError, getModelProfile, resolveConfiguredCtx, setModelProfile, deleteModelProfile, VRAM_HEADROOM_MIN_MB, VRAM_HEADROOM_MAX_MB, VRAM_HEADROOM_SPILL_MB, type ApiKey, type Engine, type McpServer } from '../config/config'
+import { CONFIG_BOUNDS, coerceBounded, isConfigTheme } from '../config/config-bounds'
 import type { Deps } from '../deps'
 import { abortAllInFlightChats } from '../chat/chat-routes'
 import { NameTakenError, NotFoundError, customSourceKey } from '../engines/registry'
@@ -1527,7 +1528,9 @@ export function registerApi(app: Hono, d: Deps): void {
       updates.port = v
     }
     if (b.theme !== undefined) {
-      if (!['system', 'light', 'dark'].includes(b.theme)) return err(c, 400, 'invalid_config_value', 'theme must be system, light, or dark.')
+      // Enum shared with the Turbo Link config scope (config-bounds.ts) so the remote gate
+      // can never drift wider than this one.
+      if (!isConfigTheme(b.theme)) return err(c, 400, 'invalid_config_value', 'theme must be system, light, or dark.')
       updates.theme = b.theme
     }
     // Turbo Link machine name (ADR-376): what a linked peer displays for this box. '' is a
@@ -1572,25 +1575,16 @@ export function registerApi(app: Hono, d: Deps): void {
     const md = b.modelDefaults
     const mdUpdates: { ctx?: number; ngl?: number; imageMaxTokens?: number; maxTokens?: number } = {}
     if (md) {
-      if (md.ctx !== undefined) {
-        const v = Number(md.ctx)
-        if (!Number.isFinite(v) || v < 256) return err(c, 400, 'invalid_config_value', 'modelDefaults.ctx must be at least 256.')
-        mdUpdates.ctx = Math.floor(v)
-      }
-      if (md.ngl !== undefined) {
-        const v = Number(md.ngl)
-        if (!Number.isFinite(v) || v < 0 || v > 99) return err(c, 400, 'invalid_config_value', 'modelDefaults.ngl must be 0–99.')
-        mdUpdates.ngl = Math.floor(v)
-      }
-      if (md.imageMaxTokens !== undefined) {
-        const v = Number(md.imageMaxTokens)
-        if (!Number.isFinite(v) || v < 0) return err(c, 400, 'invalid_config_value', 'modelDefaults.imageMaxTokens must be a non-negative number.')
-        mdUpdates.imageMaxTokens = Math.floor(v)
-      }
-      if (md.maxTokens !== undefined) {
-        const v = Number(md.maxTokens)
-        if (!Number.isFinite(v) || v < 0) return err(c, 400, 'invalid_config_value', 'modelDefaults.maxTokens must be a non-negative number (0 = unlimited).')
-        mdUpdates.maxTokens = Math.floor(v)
+      // Bounds + messages come from config-bounds.ts, which the Turbo Link config scope
+      // reads too. Task 3's review found the remote gate had drifted WIDER than this route
+      // (it accepted ctx < 256 and ngl = -1, neither of which config.validate() catches, so
+      // the value persisted). One table is what stops that recurring — a bound changed here
+      // moves the remote gate with it.
+      for (const f of ['ctx', 'ngl', 'imageMaxTokens', 'maxTokens'] as const) {
+        if (md[f] === undefined) continue
+        const v = coerceBounded(`modelDefaults.${f}`, md[f])
+        if (v === null) return err(c, 400, 'invalid_config_value', CONFIG_BOUNDS[`modelDefaults.${f}`].message)
+        mdUpdates[f] = v
       }
     }
 
@@ -1617,8 +1611,8 @@ export function registerApi(app: Hono, d: Deps): void {
     const gwUpdates: { autoSwap?: boolean; keepN?: number } = {}
     if (b.gateway?.autoSwap !== undefined) gwUpdates.autoSwap = !!b.gateway.autoSwap
     if (b.gateway?.keepN !== undefined) {
-      const v = Number(b.gateway.keepN)
-      if (!Number.isInteger(v) || v < 1 || v > 4) return err(c, 400, 'invalid_config_value', 'gateway.keepN must be 1–4.')
+      const v = coerceBounded('gateway.keepN', b.gateway.keepN)
+      if (v === null) return err(c, 400, 'invalid_config_value', CONFIG_BOUNDS['gateway.keepN'].message)
       gwUpdates.keepN = v
     }
 

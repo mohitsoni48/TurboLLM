@@ -1,4 +1,5 @@
 import type { Config } from '../config/config'
+import { isBoundedNumber, isConfigTheme } from '../config/config-bounds'
 
 /** Turbo Link's `config:read` / `config:write` scope (spec §5.8, ADR-376).
  *
@@ -47,9 +48,19 @@ import type { Config } from '../config/config'
 // A value that fails one is `invalid` (a 400), which is deliberately a different answer
 // from `rejected` (a 403): "that number is out of range" and "you may not touch that key
 // at all" are different facts and must not be collapsed into one message.
+//
+// EVERY ranged/enumerated bound below is imported from config/config-bounds.ts — the SAME
+// table the owner's own `PATCH /api/v1/settings` validates against. That is the fix for
+// task 3's review finding 1: the remote bounds had drifted WIDER than the local ones
+// (ctx < 256 and ngl = -1 both passed here, and neither is caught by config.validate(), so
+// the out-of-range value persisted), letting a peer put the host into a state its owner's
+// UI could not produce and could not re-produce in order to correct. Restating the numbers
+// here — even correctly — would just re-arm the same drift, so this file holds none of them.
+//
+// The remote checks are deliberately STRICTER than the local ones, which is always
+// allowed: `isBoundedNumber` takes no numeric strings and no fractions, because there is no
+// form control on the far end that needs the leniency.
 
-const isInt = (v: unknown, min: number, max: number): boolean =>
-  typeof v === 'number' && Number.isInteger(v) && v >= min && v <= max
 const isBool = (v: unknown): boolean => typeof v === 'boolean'
 
 /** Every writable LEAF, with the shape its value must have. The keys of this record are
@@ -68,30 +79,44 @@ const isBool = (v: unknown): boolean => typeof v === 'boolean'
  *  `build.toolchainDirs`, `devModel`, `hf`, `tools`/`search` (credentials), `mcp`
  *  (spawns processes), `code` (filesystem candidates), `agents`/`customAgents`,
  *  `comfyui`, and `version` (the schema version the migrator owns). */
-const WRITABLE_LEAVES: Record<string, (v: unknown) => boolean> = {
-  // Model defaults — the base LoadProfile applied to a model with no saved profile.
-  /** Default context window, in tokens. 0 = "let the heuristics decide". */
-  'modelDefaults.ctx': (v) => isInt(v, 0, 10_000_000),
-  /** Default GPU layers to offload. -1 = "all". */
-  'modelDefaults.ngl': (v) => isInt(v, -1, 10_000),
-  /** Generation default: hard cap on tokens per response (0 = unlimited). */
-  'modelDefaults.maxTokens': (v) => isInt(v, 0, 10_000_000),
-  /** Generation default: cap on tokens spent encoding one image. */
-  'modelDefaults.imageMaxTokens': (v) => isInt(v, 0, 1_000_000),
+const WRITABLE_LEAVES: Record<string, (v: unknown) => boolean> = Object.assign(
+  Object.create(null) as Record<string, (v: unknown) => boolean>,
+  {
+    // Model defaults — the base LoadProfile applied to a model with no saved profile.
+    /** Default context window, in tokens. Floor of 256 — the owner's own slider's floor. */
+    'modelDefaults.ctx': (v: unknown) => isBoundedNumber('modelDefaults.ctx', v),
+    /** Default GPU layers to offload, 0-99. There is NO -1 "all layers" sentinel in this
+     *  codebase: `profileToArgs` gates the flag on `p.ngl > 0`, so a negative value means
+     *  `-ngl` is simply never emitted — the engine default, i.e. NO offload. An earlier
+     *  version of this file accepted -1 and documented it as "all", which would have let a
+     *  peer silently drop the host's own local model loads to CPU-only, at a value the
+     *  owner's 0-99 control cannot even represent in order to correct it. */
+    'modelDefaults.ngl': (v: unknown) => isBoundedNumber('modelDefaults.ngl', v),
+    /** Generation default: hard cap on tokens per response (0 = unlimited). Worth stating
+     *  plainly in the owner-facing copy: this cap is read by LOCAL in-app chat too, not only
+     *  by what the peer asks for, so `config:write` is a knob on the host's own behaviour. */
+    'modelDefaults.maxTokens': (v: unknown) => isBoundedNumber('modelDefaults.maxTokens', v),
+    /** Generation default: cap on tokens spent encoding one image. */
+    'modelDefaults.imageMaxTokens': (v: unknown) => isBoundedNumber('modelDefaults.imageMaxTokens', v),
 
-  // Gateway preferences — how a request that names an unloaded model is served.
-  /** Auto-load the named model when a request asks for one that is not up. */
-  'gateway.autoSwap': isBool,
-  /** How many models stay hot at once. The daemon caps this at 4; so does this. */
-  'gateway.keepN': (v) => isInt(v, 1, 4),
+    // Gateway preferences — how a request that names an unloaded model is served. Both are
+    // resource-amplification knobs: they change how much VRAM the host commits on its
+    // OWNER's subsequent local loads, not just on how the peer is served. Bounded,
+    // recoverable, and both are values the owner's own UI can produce, so they stay — but
+    // that is the honest description of what this capability grants.
+    /** Auto-load the named model when a request asks for one that is not up. */
+    'gateway.autoSwap': isBool,
+    /** How many models stay hot at once. Bounded 1-4, same as the owner's own control. */
+    'gateway.keepN': (v: unknown) => isBoundedNumber('gateway.keepN', v),
 
-  // UI preferences — cosmetic and host-local. Enumerated, not free text: `theme` is typed
-  // `string` in Config, and a free-text write is how a host path or a script fragment ends
-  // up echoed back out through the read projection.
-  'daemon.theme': (v) => v === 'system' || v === 'light' || v === 'dark',
-  /** Ask the local model to title new conversations. */
-  'daemon.autoGenerateTitles': isBool,
-}
+    // UI preferences — cosmetic and host-local. Enumerated, not free text: `theme` is typed
+    // `string` in Config, and a free-text write is how a host path or a script fragment ends
+    // up echoed back out through the read projection.
+    'daemon.theme': isConfigTheme,
+    /** Ask the local model to title new conversations. */
+    'daemon.autoGenerateTitles': isBool,
+  },
+)
 
 /** Whole-BLOCK writes: a path that replaces an entire object at once.
  *
@@ -101,13 +126,23 @@ const WRITABLE_LEAVES: Record<string, (v: unknown) => boolean> = {
  *  escalation this file exists to prevent. A block is only listed when EVERY one of its
  *  keys is itself writable.
  *
- *  The value is the set of keys the block must contain in full: these mirror the required
+ *  The value is the set of keys a block write must supply: these mirror the REQUIRED
  *  (non-optional) fields of the corresponding `Config` interface, so a block write can
- *  never silently delete one. */
-const WRITABLE_BLOCKS: Record<string, readonly string[]> = {
-  modelDefaults: ['ctx', 'ngl'],
-  gateway: ['autoSwap', 'keepN'],
-}
+ *  never drop one of THOSE.
+ *
+ *  It is a replacement, not a merge, so the block's OPTIONAL leaves — `modelDefaults`'s
+ *  `maxTokens` and `imageMaxTokens` — ARE dropped by a block write that omits them, and
+ *  revert to their defaults. Deliberate, and not an escalation: both are themselves
+ *  writable leaves a peer can already set directly, so the block write reaches nothing new.
+ *  A peer that means to preserve them should patch the leaves instead. Pinned by
+ *  `a block write REPLACES the block, dropping optional leaves` in config-scope.test.ts. */
+const WRITABLE_BLOCKS: Record<string, readonly string[]> = Object.assign(
+  Object.create(null) as Record<string, readonly string[]>,
+  {
+    modelDefaults: ['ctx', 'ngl'],
+    gateway: ['autoSwap', 'keepN'],
+  },
+)
 
 /** Every path `config:write` may address: the blocks, then their leaves. Sorted so the
  *  list is stable across runs and diffs cleanly when a line is added. */
