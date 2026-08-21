@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -13,7 +13,6 @@ import type { ModelEntry } from '../lib/types'
 const state: { models: ModelEntry[]; links: LinkSummary[]; remote: RemoteRow[] } = {
   models: [], links: [], remote: [],
 }
-const remoteLoad = vi.fn()
 const localLoad = vi.fn()
 
 vi.mock('../lib/queries', () => ({
@@ -43,14 +42,44 @@ vi.mock('../lib/api', async (importOriginal) => ({
   deleteModel: vi.fn(),
 }))
 
-vi.mock('../lib/link-queries', () => ({
-  useLinks: () => ({ data: state.links }),
-  useRemoteModels: () => ({ data: state.remote }),
-  useRemoteModelActions: () => ({
-    load: { mutate: remoteLoad, isPending: false },
-    unload: { mutate: vi.fn(), isPending: false },
-  }),
-}))
+// link-queries is DELIBERATELY NOT MOCKED. The real hooks run against a stubbed `fetch`,
+// so a click travels component -> mutation -> link-api -> HTTP, and these tests assert the
+// REQUEST that comes out the far end rather than the argument handed to a mock.
+//
+// That distinction is the whole point: phase 2 shipped a Critical where a test pinned what
+// a click handed off and nothing about what the receiver did with it - the picker offered
+// remote models and selecting one silently loaded a different LOCAL model, because the
+// handoff was right and the receiver was wrong. A mocked `useRemoteModelActions` cannot
+// see that class of bug; this can.
+type Call = { url: string; method: string; body: unknown }
+const calls: Call[] = []
+/** Per-URL-substring canned failures, so one test can make the load POST refuse. */
+const failures = new Map<string, { status: number; error: Record<string, unknown> }>()
+
+function installFetch() {
+  vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input)
+    const method = init?.method ?? 'GET'
+    calls.push({ url, method, body: init?.body ? JSON.parse(init.body as string) : undefined })
+
+    for (const [needle, f] of failures) {
+      if (url.includes(needle)) {
+        return new Response(JSON.stringify({ error: f.error }), {
+          status: f.status, headers: { 'content-type': 'application/json' },
+        })
+      }
+    }
+    const json = (b: unknown) => new Response(JSON.stringify(b), {
+      status: 200, headers: { 'content-type': 'application/json' },
+    })
+    if (url.includes('/api/v1/links/models')) return json({ models: state.remote })
+    if (url.endsWith('/api/v1/links')) return json({ links: state.links })
+    return json({ ok: true })
+  }))
+}
+
+/** POSTs that actually left the app, ignoring the polling GETs. */
+const writes = () => calls.filter((c) => c.method !== 'GET')
 
 function entry(over: Partial<ModelEntry> = {}): ModelEntry {
   return {
@@ -89,8 +118,10 @@ beforeEach(() => {
   state.models = [entry()]
   state.links = []
   state.remote = []
-  remoteLoad.mockClear()
+  calls.length = 0
+  failures.clear()
   localLoad.mockClear()
+  installFetch()
 })
 
 describe('ModelsScreen — merged fleet library', () => {
@@ -102,18 +133,20 @@ describe('ModelsScreen — merged fleet library', () => {
     expect(screen.queryByText('This machine')).toBeNull()
   })
 
-  it('lists this machine\'s models before any linked machine\'s', () => {
+  it('lists this machine\'s models before any linked machine\'s', async () => {
     state.links = [link()]
     state.remote = [remote()]
     const { container } = renderScreen()
+    await screen.findByText('Remote Qwen')
     const text = container.textContent ?? ''
     expect(text.indexOf('Local Llama')).toBeLessThan(text.indexOf('Remote Qwen'))
   })
 
-  it('shows an origin for every row once a link exists', () => {
+  it('shows an origin for every row once a link exists', async () => {
     state.links = [link()]
     state.remote = [remote()]
     renderScreen()
+    await screen.findByText('Remote Qwen')
     // "This machine" appears both as a filter chip and as the local row's origin badge.
     expect(screen.getAllByText('This machine').length).toBeGreaterThan(0)
     expect(screen.getAllByText('workstation').length).toBeGreaterThan(0)
@@ -123,48 +156,117 @@ describe('ModelsScreen — merged fleet library', () => {
     state.links = [link()]
     state.remote = [remote()]
     renderScreen()
-    await userEvent.click(screen.getByRole('button', { name: 'workstation' }))
+    await userEvent.click(await screen.findByRole('button', { name: 'workstation' }))
     expect(screen.queryByText('Local Llama')).toBeNull()
     expect(screen.getByText('Remote Qwen')).toBeTruthy()
   })
 
-  it('loads a remote model through the link, never through the local engine route', async () => {
+  it('loads a remote model by POSTing that machine\'s load route, never the local engine route', async () => {
     // The bug this guards: a qualified remote id reaching POST /api/v1/engine/start aborts
-    // every in-flight generation and then loads a DIFFERENT local model.
+    // every in-flight generation and then loads a DIFFERENT local model. Asserted on the
+    // REQUEST, so pointing the mutation at the wrong route fails here.
     state.links = [link()]
     state.remote = [remote()]
     state.models = []
     renderScreen()
-    await userEvent.click(screen.getByRole('button', { name: /load/i }))
-    expect(remoteLoad.mock.calls[0][0]).toEqual({ linkId: 'l1', modelKey: 'r1' })
+    await userEvent.click(await screen.findByRole('button', { name: /load/i }))
+    await waitFor(() => expect(writes()).toHaveLength(1))
+    expect(writes()[0]).toEqual({
+      url: '/api/v1/links/l1/load', method: 'POST', body: { modelKey: 'r1' },
+    })
+    expect(calls.some((c) => c.url.includes('/engine/'))).toBe(false)
     expect(localLoad).not.toHaveBeenCalled()
   })
 
-  it('disables a remote Load, naming the capability, when the grant is missing', () => {
+  it('a disabled remote control issues no request at all when clicked', async () => {
+    // "Never a silent no-op" has a second half: it must also never be a silent REQUEST.
     state.links = [link({ grantedCapabilities: ['models:use'] })]
     state.remote = [remote()]
     state.models = []
     renderScreen()
-    const btn = screen.getByRole('button', { name: /load/i })
+    const btn = await screen.findByRole('button', { name: /load/i })
+    await userEvent.click(btn).catch(() => {})
+    expect(btn).toBeDisabled()
+    expect(writes()).toHaveLength(0)
+  })
+
+  it('unloads a loaded remote model through that machine\'s unload route', async () => {
+    state.links = [link()]
+    state.remote = [remote({ loaded: true })]
+    state.models = []
+    renderScreen()
+    await userEvent.click(await screen.findByRole('button', { name: /unload/i }))
+    await waitFor(() => expect(writes()).toHaveLength(1))
+    expect(writes()[0].url).toBe('/api/v1/links/l1/unload')
+  })
+
+  // Requirement: host_busy / model_not_loaded / a named-capability 403 must each render
+  // their OWN state. These drive a real failing HTTP response all the way through
+  // link-api's envelope parsing and describeRemoteFailure into the DOM.
+  it('renders a host_busy refusal as the host being busy', async () => {
+    state.links = [link()]; state.remote = [remote()]; state.models = []
+    failures.set('/load', { status: 503, error: { code: 'host_busy', message: 'x' } })
+    renderScreen()
+    await userEvent.click(await screen.findByRole('button', { name: /load/i }))
+    expect(await screen.findByText(/busy with its own work/i)).toBeTruthy()
+    expect(screen.queryByText(/permission/i)).toBeNull()
+  })
+
+  it('renders a 403 that names a capability by naming that capability', async () => {
+    state.links = [link()]; state.remote = [remote()]; state.models = []
+    failures.set('/load', { status: 403, error: { code: 'forbidden', message: 'x', capability: 'models:load' } })
+    renderScreen()
+    await userEvent.click(await screen.findByRole('button', { name: /load/i }))
+    // Proves the capability survived the HTTP envelope, not just a hand-set field.
+    expect(await screen.findByText(/models:load/)).toBeTruthy()
+  })
+
+  it('renders an offline refusal distinctly from a busy one', async () => {
+    state.links = [link()]; state.remote = [remote()]; state.models = []
+    failures.set('/load', { status: 503, error: { code: 'unavailable', message: 'x' } })
+    renderScreen()
+    await userEvent.click(await screen.findByRole('button', { name: /load/i }))
+    expect(await screen.findByText(/did not answer/i)).toBeTruthy()
+    expect(screen.queryByText(/busy with its own work/i)).toBeNull()
+  })
+
+  it('never renders the host-authored message, which can carry a host path', async () => {
+    state.links = [link()]; state.remote = [remote()]; state.models = []
+    failures.set('/load', {
+      status: 409,
+      error: { code: 'model_not_loadable', message: "ENOENT open 'D:\\models\\x.gguf'" },
+    })
+    const { container } = renderScreen()
+    await userEvent.click(await screen.findByRole('button', { name: /load/i }))
+    await waitFor(() => expect(writes()).toHaveLength(1))
+    expect(container.textContent ?? '').not.toMatch(/ENOENT|D:/)
+  })
+
+  it('disables a remote Load, naming the capability, when the grant is missing', async () => {
+    state.links = [link({ grantedCapabilities: ['models:use'] })]
+    state.remote = [remote()]
+    state.models = []
+    renderScreen()
+    const btn = await screen.findByRole('button', { name: /load/i })
     expect(btn).toBeDisabled()
     expect(btn.getAttribute('title')).toMatch(/models:load/)
   })
 
-  it('an offline machine contributes no rows but is still explained', () => {
+  it('an offline machine contributes no rows but is still explained', async () => {
     state.links = [link({ status: 'unreachable', lastError: 'workstation is not reachable.' })]
     state.remote = [remote()]
     renderScreen()
+    expect(await screen.findByText(/not reachable/i)).toBeTruthy()
     expect(screen.queryByText('Remote Qwen')).toBeNull()
-    expect(screen.getByText(/not reachable/i)).toBeTruthy()
     // …and it stays selectable in the filter, so the user can still ask about it.
     expect(screen.getByRole('button', { name: 'workstation' })).toBeTruthy()
   })
 
-  it('two machines with the same model name produce two distinct rows', () => {
+  it('two machines with the same model name produce two distinct rows', async () => {
     state.links = [link(), link({ id: 'l2', name: 'kaggle' })]
     state.remote = [remote({ name: 'Twin' }), remote({ name: 'Twin' }, 'l2')]
     state.models = []
     renderScreen()
-    expect(screen.getAllByText('Twin')).toHaveLength(2)
+    await waitFor(() => expect(screen.getAllByText('Twin')).toHaveLength(2))
   })
 })

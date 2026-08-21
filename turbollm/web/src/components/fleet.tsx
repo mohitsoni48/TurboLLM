@@ -8,12 +8,19 @@
 // `describeRemoteFailure` (what a refusal means). Nothing in this file re-derives any of
 // that — if a rule ends up here instead of in a helper, that is the finding the dispatch
 // warned about.
-import { AlertTriangle, Cloud, Loader2, Monitor, RotateCw } from 'lucide-react'
+import { AlertTriangle, ChevronDown, Cloud, Download, Loader2, Monitor, RotateCw } from 'lucide-react'
 import { useId, type ReactNode } from 'react'
 import type { FleetMachine, FleetOrigin } from '../lib/fleet'
 import type { MachineOption } from '../lib/fleet-sources'
 import type { RemoteFailure } from '../lib/remote-failure'
-import type { ActionState } from '../lib/capability-ui'
+import { actionState, type ActionState } from '../lib/capability-ui'
+import type { LinkSummary } from '../lib/link-api'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from './ui/dropdown-menu'
 import { Button } from './ui/button'
 
 /** Which machine a row came from. Reads as a word, not a bare icon: a lone cloud glyph in a
@@ -187,5 +194,74 @@ export function FleetFailure({ failure, onRetry }: { failure: RemoteFailure; onR
         </button>
       )}
     </div>
+  )
+}
+
+/**
+ * "Download to…" — pick which machine in the fleet should fetch a file.
+ *
+ * This is `startRemoteDownload`'s consumer, and the reason requirement 2 says
+ * "start/cancel driven by `actionState`" rather than just "cancel". A download is the one
+ * fleet action where the target is a genuine choice rather than a property of the row you
+ * clicked: the file exists on Hugging Face, not on any machine yet, so *which* machine
+ * fetches it is the question. Every other fleet control acts on a row that already belongs
+ * to a machine.
+ *
+ * With no links this collapses to the plain button it replaces — an install without Turbo
+ * Link sees no menu, no target, and no change at all.
+ *
+ * Each machine's entry is gated by `actionState('downloads:write', …)`, so a link without
+ * the grant is a disabled entry carrying the reason, never a hidden one: hiding it would
+ * make the machine look incapable rather than un-permitted, which is a different problem
+ * with a different fix.
+ */
+export function DownloadTargetMenu({
+  links,
+  busy,
+  disabled,
+  label,
+  onPick,
+}: {
+  links: LinkSummary[]
+  busy?: boolean
+  disabled?: boolean
+  label: string
+  /** `null` = this machine. */
+  onPick: (linkId: string | null) => void
+}) {
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger
+        data-testid="download-target-trigger"
+        disabled={disabled || busy}
+        className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-[var(--radius)] px-3 py-2 text-[13px] font-medium transition-colors disabled:opacity-50"
+        style={{ background: 'var(--accent)', color: 'var(--accent-ink, #fff)' }}
+      >
+        {busy ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
+        {label}
+        <ChevronDown size={13} />
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-[280px]">
+        <div className="px-2 py-1.5 text-[11px] font-medium uppercase tracking-wide text-muted">
+          Download to
+        </div>
+        <DropdownMenuItem onSelect={() => onPick(null)}>
+          <Monitor size={14} /> This machine
+        </DropdownMenuItem>
+        {links.map((l) => {
+          const state = actionState('downloads:write', { kind: 'remote', linkId: l.id, machine: l.name }, l)
+          return (
+            <DropdownMenuItem
+              key={l.id}
+              disabled={!state.enabled}
+              title={state.enabled ? undefined : state.reason}
+              onSelect={() => state.enabled && onPick(l.id)}
+            >
+              <Cloud size={14} /> {l.name}
+            </DropdownMenuItem>
+          )
+        })}
+      </DropdownMenuContent>
+    </DropdownMenu>
   )
 }

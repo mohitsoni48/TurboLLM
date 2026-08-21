@@ -244,6 +244,16 @@ export function ModelsScreen() {
 
   const linkFor = (linkId: string) => links.find((l) => l.id === linkId)
 
+  /** Is THIS row's action in flight? Scoped off the mutation's own `variables`, mirroring
+   *  the local library's `loadingKey`. A flat `isPending` spun and disabled every remote
+   *  row on every machine while one load was in flight — a wrong-row spinner, and the one
+   *  path where a disabled control carried no `actionState` reason. */
+  const remoteBusyFor = (linkId: string, modelKey: string): boolean =>
+    (remoteActions.load.isPending &&
+      remoteActions.load.variables?.linkId === linkId &&
+      remoteActions.load.variables?.modelKey === modelKey) ||
+    (remoteActions.unload.isPending && remoteActions.unload.variables?.linkId === linkId)
+
   const onRemoteLoad = (linkId: string, modelKey: string) => {
     track('models', 'load_remote_model')
     remoteActions.load.mutate({ linkId, modelKey }, {
@@ -360,7 +370,7 @@ export function ModelsScreen() {
           linkFor={linkFor}
           onRemoteLoad={onRemoteLoad}
           onRemoteUnload={onRemoteUnload}
-          remoteBusy={remoteActions.load.isPending || remoteActions.unload.isPending}
+          remoteBusyFor={remoteBusyFor}
           remoteFailures={remoteFailures}
           setOpenKey={setOpenKey}
           setConfirmDelete={setConfirmDelete}
@@ -430,7 +440,7 @@ function LibraryTab({
   linkFor,
   onRemoteLoad,
   onRemoteUnload,
-  remoteBusy,
+  remoteBusyFor,
   remoteFailures,
   setOpenKey,
   setConfirmDelete,
@@ -463,7 +473,7 @@ function LibraryTab({
   linkFor: (linkId: string) => LinkSummary | undefined
   onRemoteLoad: (linkId: string, modelKey: string) => void
   onRemoteUnload: (linkId: string, modelKey: string) => void
-  remoteBusy: boolean
+  remoteBusyFor: (linkId: string, modelKey: string) => boolean
   remoteFailures: Record<string, unknown>
   setOpenKey: (k: string | null) => void
   setConfirmDelete: (m: ModelEntry | null) => void
@@ -563,7 +573,7 @@ function LibraryTab({
         </div>
       ) : modelsQ.isError ? (
         <InlineError message="Could not load models." onRetry={() => modelsQ.refetch()} screen="models" />
-      ) : models.length === 0 && rows.length === 0 ? (
+      ) : models.length === 0 && rows.length === 0 && machineFilter === ALL_MACHINES ? (
         // Guarded on the WHOLE fleet, not just this machine. Keyed on `models.length`
         // alone, a machine with no local GGUFs but a linked machine full of them showed
         // "No GGUF models found in your folders" and rendered no rows at all — the remote
@@ -644,7 +654,7 @@ function LibraryTab({
                   rowGrid={ROW_GRID}
                   onLoad={() => onRemoteLoad(linkId, model.key)}
                   onUnload={() => onRemoteUnload(linkId, model.key)}
-                  busy={remoteBusy}
+                  busy={remoteBusyFor(linkId, model.key)}
                   failure={remoteFailures[`${linkId}:${model.key}`]}
                 />
               )

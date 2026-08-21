@@ -18,7 +18,7 @@ import { useState } from 'react'
 import { CheckCircle2, Download, RotateCw, X } from 'lucide-react'
 import { useDownloads, useDownloadMutations } from '../../lib/queries'
 import { useLinks, useRemoteDownloads, useRemoteDownloadActions } from '../../lib/link-queries'
-import { mergeFleet, fleetMachines, type FleetOrigin, type FleetRow } from '../../lib/fleet'
+import { mergeFleet, fleetMachines, type FleetMachine, type FleetOrigin, type FleetRow } from '../../lib/fleet'
 import {
   localDownload,
   remoteDownload,
@@ -42,8 +42,12 @@ export function DownloadsPanel() {
   const remote = useRemoteDownloads(links)
   const remoteActions = useRemoteDownloadActions()
 
-  /** Which row's remote action failed, and what it said. Keyed by row id so two failing
-   *  rows show two different reasons rather than one shared banner. */
+  /** Which row's remote action failed, and what it said.
+   *
+   *  Keyed by `rowKey`, the SAME function that keys the rendered rows. Keyed by bare
+   *  download id (as this first shipped), two machines whose queues each contain an id —
+   *  ids are only unique per machine — would show one machine's refusal on the other
+   *  machine's row. */
   const [failures, setFailures] = useState<Record<string, RemoteFailure>>({})
 
   const local = dlQ.data?.downloads ?? []
@@ -53,6 +57,21 @@ export function DownloadsPanel() {
   }))
   const rows = mergeFleet(local.map(localDownload), sources)
   const machines = fleetMachines(sources)
+
+  /** Online machines whose queue could not be READ, shaped as machine notes so they render
+   *  through the same component as the offline ones. `fleetMachines` cannot produce these:
+   *  its `note` is null for every online machine, by design. */
+  const refusedReads: FleetMachine[] = links.flatMap((l) => {
+    const err = remote.errorByLink.get(l.id)
+    if (!err || l.status !== 'online') return []
+    return [{
+      linkId: l.id,
+      machine: l.name,
+      status: l.status,
+      note: describeRemoteFailure(err, l.name).message,
+      rowCount: 0,
+    }]
+  })
 
   // Nothing anywhere: the panel stays out of the way entirely, exactly as before. Note this
   // is keyed on ROWS, not on links — a fleet with three idle machines shows nothing, rather
@@ -70,6 +89,20 @@ export function DownloadsPanel() {
   const linkFor = (origin: FleetOrigin): LinkSummary | undefined =>
     origin.kind === 'remote' ? links.find((l) => l.id === origin.linkId) : undefined
 
+  /** Busy state for the row that was actually clicked, not for every row on screen.
+   *
+   *  Keyed off the mutation's own `variables`, the way the local library's `loadingKey`
+   *  already does it. A flat `isPending` put a spinner on — and disabled — every other
+   *  machine's Cancel button while one cancel was in flight, and a busy-disabled control
+   *  has no `actionState` reason behind it, so it was also the one path where a disabled
+   *  control carried no explanation. */
+  const isCancelling = (r: FleetRow<FleetDownload>): boolean =>
+    r.origin.kind === 'local'
+      ? mut.cancel.isPending && mut.cancel.variables === r.row.id
+      : remoteActions.cancel.isPending &&
+        remoteActions.cancel.variables?.linkId === r.origin.linkId &&
+        remoteActions.cancel.variables?.downloadId === r.row.id
+
   const onCancel = (row: FleetRow<FleetDownload>) => {
     const { origin, row: d } = row
     if (origin.kind === 'local') {
@@ -78,15 +111,16 @@ export function DownloadsPanel() {
       return
     }
     track('models', 'cancel_remote_download')
+    const key = rowKey(origin, d.id)
     remoteActions.cancel.mutate(
       { linkId: origin.linkId, downloadId: d.id },
       {
         onError: (e) =>
           setFailures((f) => ({
             ...f,
-            [d.id]: describeRemoteFailure(e, linkFor(origin)?.name ?? origin.machine),
+            [key]: describeRemoteFailure(e, linkFor(origin)?.name ?? origin.machine),
           })),
-        onSuccess: () => setFailures((f) => { const n = { ...f }; delete n[d.id]; return n }),
+        onSuccess: () => setFailures((f) => { const n = { ...f }; delete n[key]; return n }),
       },
     )
   }
@@ -99,21 +133,24 @@ export function DownloadsPanel() {
         {activeCount > 0 && <span className="text-[12px] font-normal text-muted">· {activeCount} active</span>}
       </div>
 
-      {/* A machine that contributed no rows still gets a line saying why. */}
-      <MachineNotes machines={machines} />
+      {/* A machine that contributed no rows still gets a line saying why — whether it is
+          offline (`fleetMachines`) or online but refusing the read (`errorByLink`). Without
+          the second half, a link that is up but lacks `downloads:read` contributes no rows
+          and no explanation, which is indistinguishable from an idle machine. */}
+      <MachineNotes machines={[...machines, ...refusedReads]} />
 
       <div className="flex flex-col gap-2">
         {ordered.map((r) => (
           <DownloadRow
-            key={`${r.origin.kind === 'remote' ? r.origin.linkId : 'local'}:${r.row.id}`}
+            key={rowKey(r.origin, r.row.id)}
             row={r}
             link={linkFor(r.origin)}
             showOrigin={links.length > 0}
-            failure={failures[r.row.id]}
+            failure={failures[rowKey(r.origin, r.row.id)]}
             onCancel={() => onCancel(r)}
             onRemove={() => mut.remove.mutate(r.row.id)}
             onResume={() => mut.resume.mutate(r.row.id)}
-            cancelling={mut.cancel.isPending || remoteActions.cancel.isPending}
+            cancelling={isCancelling(r)}
             resuming={mut.resume.isPending}
           />
         ))}
@@ -242,4 +279,11 @@ function fmtSize(b: number): string {
 }
 function fmtSpeed(bps: number): string {
   return bps >= 1e6 ? `${(bps / 1e6).toFixed(1)} MB/s` : `${Math.round(bps / 1e3)} KB/s`
+}
+
+/** One identity for a merged row, used for BOTH its React key and its failure-map key.
+ *  Download ids are unique per machine, not across the fleet, so the machine has to be part
+ *  of the identity or two machines' rows collide. */
+function rowKey(origin: FleetOrigin, id: string): string {
+  return origin.kind === 'remote' ? `${origin.linkId}:${id}` : `local:${id}`
 }

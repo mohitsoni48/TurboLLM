@@ -60,3 +60,39 @@ if (typeof window !== 'undefined' && !window.matchMedia) {
     dispatchEvent: () => false,
   })) as unknown as typeof window.matchMedia
 }
+
+// Radix UI primitives (DropdownMenu, Select, …) drive their open/close state through
+// Pointer Events and pointer capture, neither of which jsdom implements. Without these an
+// interaction test can click a menu trigger, get no error, and simply never see the menu
+// open — a silent false negative rather than a failure, which is the worst shape for a
+// test shim to be missing. `Element.prototype.scrollIntoView` is the same story: Radix
+// calls it when focusing an item.
+//
+// Added when the first test that actually opens a dropdown was written (the Turbo Link
+// download-target menu). Kept in the shared setup rather than that one file because the app
+// has many dropdowns and the next test to open one should not have to rediscover this.
+for (const m of ['hasPointerCapture', 'setPointerCapture', 'releasePointerCapture'] as const) {
+  if (!(m in Element.prototype)) {
+    Object.defineProperty(Element.prototype, m, {
+      configurable: true,
+      value: m === 'hasPointerCapture' ? () => false : () => {},
+    })
+  }
+}
+if (!Element.prototype.scrollIntoView) {
+  Object.defineProperty(Element.prototype, 'scrollIntoView', { configurable: true, value: () => {} })
+}
+if (typeof window !== 'undefined' && !window.PointerEvent) {
+  // jsdom dispatches MouseEvent for pointer* types; Radix only needs the constructor to
+  // exist and to carry the pointer fields it reads.
+  class PointerEventPolyfill extends MouseEvent {
+    pointerId: number
+    pointerType: string
+    constructor(type: string, params: PointerEventInit = {}) {
+      super(type, params)
+      this.pointerId = params.pointerId ?? 1
+      this.pointerType = params.pointerType ?? 'mouse'
+    }
+  }
+  window.PointerEvent = PointerEventPolyfill as unknown as typeof PointerEvent
+}
