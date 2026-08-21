@@ -171,6 +171,37 @@ Cross-check note: this table came from driving llama-server directly (no daemon)
 model through the full daemon measured 4.3 t/s at the default split, so compare rows within
 this table, not against daemon numbers.
 
+## Measured: where the auto-tune vs chat gap actually goes
+
+Run ON DESIGN — ctx 32768, so the bench prompt reaches 24576 tokens (0.75x ctx, capped at 32k),
+the band bench.ts records as validated — with every chat leg measured against a prompt built to
+that same depth. Qwen3.6-35B-A3B UD-Q4_K_XL, 2x Tesla T4:
+
+| leg | tok/s | vs leg above |
+|-----|------:|-------------:|
+| A auto-tune reported | 35.7 | — |
+| B engine, non-streaming, 128 tok | 32.3 | 90% (run-to-run) |
+| C engine, streaming | 26.1 | 81% (streaming cost) |
+| D daemon, streaming | 25.1 | 96% (daemon proxy cost) |
+| **end to end (D vs A)** | | **70%** |
+
+The earlier "chat is 45% of auto-tune" figure was a harness artifact — it compared a 6k-deep bench
+against a near-zero-depth chat on a different endpoint. Measured properly the gap is 70%, and it
+decomposes into three ordinary costs rather than one defect:
+
+- **19 points of it is methodology, not speed.** Auto-tune reports llama.cpp's own
+  `timings.predicted_per_second`; a streaming client measures wall clock. Same config, same
+  engine, same depth — different quantity. If the headline number should match what users see,
+  it has to be measured the way users receive it.
+- **The daemon proxy costs 4%.** Worth stating plainly because it is the intuitive suspect and it
+  is not guilty: the Node SSE hop is nearly free.
+- **10% is run-to-run**, which is the noise floor for a single measured bench.
+
+At this depth the winner was `nCpuMoe=0` with both cards loaded (12925 / 12235 MiB, util 44% /
+74%) — full residency, no offload, genuinely dual-GPU. Prefill ran at 839 tok/s, i.e. **22.2 s to
+first token** at 24.6k depth. That dwarfs the decode delta, which is why ttfMs (not raw generation
+t/s) is the objective auto-tune ranks on.
+
 ## Notes / knobs
 
 - `TURBOLLM_MODEL_FILE` — override the GGUF (default `Qwen3.6-27B-Q4_K_M.gguf`; `Q5_K_M` also available).
