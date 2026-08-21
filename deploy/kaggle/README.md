@@ -112,6 +112,43 @@ In the GUI the hardware line should now read **`2× Tesla T4 · 30 GB · Linux`*
 When a discrepancy is root-caused, fix on the branch, push, `git pull` on Kaggle, restart,
 and re-run the script.
 
+## Measured: the 2xT4 layer-split is byte-imbalanced (Qwen3.6-35B-A3B Q8_0)
+
+`--n-cpu-moe N` strips the experts from the FIRST N layers, so those layers are ~10x lighter
+than the rest. llama.cpp's default split divides by LAYER COUNT, not by bytes, and TurboLLM
+emits no `--tensor-split` by default (profile.ts: 'layer' + empty tensorSplit + mainGpu -1 emit
+nothing), so the two cards end up wildly uneven. Measured by driving llama-server directly,
+36.9 GB model, ctx 8192, 2x Tesla T4 (30 GB pooled):
+
+| --n-cpu-moe | --tensor-split | decode t/s | GPU0 MiB | GPU1 MiB | resident |
+|------------:|:---------------|-----------:|---------:|---------:|---------:|
+| 24 | (default even) | 4.96 | 1707 | 14693 | 16400 |
+| 24 | 3,1            | 4.57 | 7901 |  8501 | 16402 |
+| 24 | 4,1            | 3.82 | 9629 |  6771 | 16400 |
+| 16 | 2,1            | **5.82** | 11837 | 11091 | **22928** |
+| 12 | 2,1            | OOM (failed to allocate compute buffers) | | | |
+
+Three things worth keeping:
+
+- **The imbalance is real.** The default split puts 1.7 GB on one card and 14.7 GB on the
+  other, so only ~16 GB of the 30 GB pool is ever used.
+- **Balancing alone makes it SLOWER** — 4.96 -> 4.57 -> 3.82 at an identical 16.4 GB resident.
+  The lopsided split was accidentally minimizing cross-device traffic; spreading the same
+  layers over both cards just adds a PCIe activation copy per layer boundary. A fix that only
+  rebalances `tensorSplit` is a regression.
+- **The win is balancing AND spending the freed VRAM**: at `2,1` the offload can drop from 24
+  CPU experts to 16, reaching 22.9 GB resident and 5.82 t/s (+17%). Below 16 it OOMs — 36.9 GB
+  has a hard floor in 30 GB of VRAM.
+
+The tuner cannot currently reach that config: `pickSplitStrategies` offers only {single-GPU,
+the profile's existing split} and never a rebalanced `tensorSplit`, so the offload search runs
+against the default even split and is structurally capped near 16 GB resident. Unlocking the
++17% means searching `nCpuMoe` and `tensorSplit` JOINTLY, not one with the other pinned.
+
+Cross-check note: this table came from driving llama-server directly (no daemon). The same
+model through the full daemon measured 4.3 t/s at the default split, so compare rows within
+this table, not against daemon numbers.
+
 ## Notes / knobs
 
 - `TURBOLLM_MODEL_FILE` — override the GGUF (default `Qwen3.6-27B-Q4_K_M.gguf`; `Q5_K_M` also available).
