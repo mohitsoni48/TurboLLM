@@ -9,13 +9,32 @@ import type { Deps } from '../deps'
  *  host's numbers with the exact components it already uses for its own, and the only way
  *  to keep that true over time is for both routes to be fed by this one builder.
  *
- *  What is NOT here is as deliberate as what is: `engine.launchCommand` is absent. It is
- *  the engine's full argv — an absolute host binary path plus an absolute model path — and
- *  it is the single most likely thing to leak across a link. The local route adds it on top
- *  of this object (see routes.ts), so the façade cannot include it even by accident: it
- *  would have to go out of its way to construct the field rather than merely forget to
- *  strip it. Anything added here in future is visible to every linked peer by default —
- *  add host paths, credentials, or key material to the local route, never to this. */
+ *  ## The rule for what may live here
+ *
+ *  **No host filesystem detail crosses the façade, and no field carrying FREE-FORM engine
+ *  output may live in this builder.** Not "strip `launchCommand`" — that is one instance of
+ *  the rule, and stating it narrowly is exactly how the second instance gets missed. Every
+ *  field below is a bounded scalar, an enum, or a piece of model metadata the peer already
+ *  learns from `GET /api/link/v1/models`. Anything whose value is produced by, or echoed
+ *  from, the engine process is out.
+ *
+ *  Two fields of the local `/api/v1/status` engine block are therefore absent, and the local
+ *  route adds them back on top of this object (see routes.ts) — so the façade cannot include
+ *  them even by accident: it would have to go out of its way to CONSTRUCT the field rather
+ *  than merely forget to strip it.
+ *
+ *   - `launchCommand` — the engine's full argv: an absolute host binary path plus an
+ *     absolute model path.
+ *   - `error` (`ErrInfo`) — carries `logTail: string[]`, the engine's raw stderr. llama.cpp
+ *     echoes the model path, the mmproj path and its own binary path in its error output, so
+ *     this leaks absolute host paths as a matter of routine, not as an edge case. The peer
+ *     does not need it: `engine.state === 'error'` already tells it the host's engine is
+ *     down, which is the whole of what a remote renderer can act on. A sanitised or
+ *     classified form could be re-added later if a peer UI ever needs the reason — but the
+ *     simplest thing that cannot leak is the right default.
+ *
+ *  Anything added here in future is visible to every linked peer by default. Add host paths,
+ *  raw process output, credentials, or key material to the local route, never to this. */
 export interface ModelStatusView {
   engine: {
     id: string
@@ -24,7 +43,6 @@ export interface ModelStatusView {
     state: string
     port: number | null
     pid: number | null
-    error?: unknown
     /** How many generations the engine can serve at once. Omitted — not defaulted to 1 —
      *  when the engine advertises no slot count, exactly as the local route does. */
     parallelSlots?: number
@@ -57,7 +75,8 @@ export function buildModelStatus(d: Deps): ModelStatusView {
     port: ms.port,
     pid: ms.pid,
   }
-  if (ms.err) engine.error = ms.err
+  // NO `engine.error` here — see the interface doc. `ErrInfo.logTail` is the engine's raw
+  // stderr and routinely contains absolute host paths. `state` already carries 'error'.
   const parallelSlots = d.manager.parallelSlots()
   if (parallelSlots !== null) engine.parallelSlots = parallelSlots
   return {

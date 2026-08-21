@@ -17,7 +17,31 @@ import type { ApiKey } from '../config/config'
 
 const LAUNCH_COMMAND = ['/opt/turbollm/engines/llama.cpp/llama-server', '-m', '/home/me/models/qwen3-35b.gguf']
 
-function mkDeps(keys: ApiKey[]): Deps {
+/** A realistic llama.cpp failure. The point of the fixture is `logTail`: the engine echoes
+ *  the model path, the mmproj path and its own binary path in its own stderr, so `ErrInfo`
+ *  leaks absolute host paths as a matter of routine, not as an edge case. Both a POSIX and
+ *  a Windows path are present so the drive-letter form is covered too. */
+const ERR_INFO = {
+  code: 'engine_exited',
+  message: "failed to load model from 'C:\\Users\\me\\models\\qwen3-35b.gguf'",
+  exitCode: 1,
+  logTail: [
+    'llama_model_load: loading model from /home/me/models/qwen3-35b.gguf',
+    'clip_model_load: failed to open /home/me/models/mmproj-qwen3.gguf',
+    'D:\\turbollm\\engines\\llama.cpp\\llama-server: error while loading shared libraries',
+  ],
+}
+
+/** Every substring that would prove a host path escaped, in both serialized forms. JSON
+ *  escapes a backslash, so a Windows path arrives as `C:\\Users\\…` in the response text. */
+const PATH_SHAPES: RegExp[] = [
+  /[A-Za-z]:\\/,                                  // drive-letter path, raw
+  /[A-Za-z]:\\\\/,                                // drive-letter path, JSON-escaped
+  /\/(home|Users|opt|usr|var|root|mnt|models|tmp)\//, // POSIX-absolute-looking segment
+  /\.gguf/,                                       // any model file, wherever it came from
+]
+
+function mkDeps(keys: ApiKey[], opts?: { state?: string; err?: unknown }): Deps {
   const cfg: Record<string, unknown> = {
     apiKeys: keys,
     links: [],
@@ -28,7 +52,8 @@ function mkDeps(keys: ApiKey[]): Deps {
     store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
     manager: {
       status: () => ({
-        state: 'running',
+        state: opts?.state ?? 'running',
+        err: opts?.err ?? null,
         port: 8081,
         pid: 4242,
         loadElapsedMs: 1200,
@@ -81,19 +106,60 @@ test('a token without models:use gets 403', async () => {
 })
 
 test('the payload carries no host paths, no engine binary, and no key material', async () => {
-  const d = mkDeps([key('tllm-a', ['models:use'])])
-  const res = await app(d).request('/api/link/v1/status', { headers: { 'X-TurboLLM-Auth': 'tllm-a' } })
-  // Assert on the SERIALIZED text: a leak nested three levels deep is still a leak, and a
-  // key-by-key check would only ever cover the fields someone remembered to look at.
-  const text = await res.text()
-  assert.equal(text.includes('launchCommand'), false, 'launchCommand must not cross the façade')
-  for (const needle of ['/opt/turbollm', '/home/me', 'llama-server', '.gguf', 'binPath']) {
-    assert.equal(text.includes(needle), false, `payload leaked ${needle}`)
+  // The general property, not a named-field check: NO host filesystem detail crosses the
+  // façade. Asserted on the SERIALIZED text so a leak nested three levels deep still trips
+  // it, and by path SHAPE so a field nobody thought to enumerate is caught automatically.
+  //
+  // Both fixtures are exercised — a healthy engine and a FAILED one. The failed case is the
+  // one that matters: `ErrInfo.logTail` is the engine's raw stderr, which is where llama.cpp
+  // prints the model, mmproj and binary paths.
+  for (const [label, opts] of [
+    ['running', undefined],
+    ['errored', { state: 'error', err: ERR_INFO }],
+  ] as const) {
+    const d = mkDeps([key('tllm-a', ['models:use'])], opts)
+    const res = await app(d).request('/api/link/v1/status', { headers: { 'X-TurboLLM-Auth': 'tllm-a' } })
+    assert.equal(res.status, 200)
+    const text = await res.text()
+
+    for (const shape of PATH_SHAPES) {
+      assert.equal(shape.test(text), false, `[${label}] payload leaked a path-shaped value matching ${shape}`)
+    }
+    // The specific fields that carry paths, named so a regression reads clearly.
+    assert.equal(text.includes('launchCommand'), false, `[${label}] launchCommand must not cross the façade`)
+    assert.equal(text.includes('logTail'), false, `[${label}] the engine log tail must not cross the façade`)
+    // The KEY form (`"error":`), not the bare word — `"state":"error"` legitimately contains it.
+    assert.equal(text.includes('"error":'), false, `[${label}] ErrInfo must not cross the façade`)
+    // Every literal path value from the fixtures, wherever it might have come from.
+    for (const needle of [...LAUNCH_COMMAND, ...ERR_INFO.logTail, ERR_INFO.message, '/opt/turbollm', 'llama-server', 'binPath']) {
+      assert.equal(text.includes(needle), false, `[${label}] payload leaked ${needle}`)
+    }
+    // Key material: neither the hash nor the presented token may appear anywhere.
+    const hash = createHash('sha256').update('tllm-a').digest('hex')
+    assert.equal(text.includes(hash), false, `[${label}] payload leaked a key hash`)
+    assert.equal(text.includes('tllm-a'), false, `[${label}] payload leaked the presented token`)
   }
-  // Key material: neither the hash nor the presented token may appear anywhere.
-  const hash = createHash('sha256').update('tllm-a').digest('hex')
-  assert.equal(text.includes(hash), false, 'payload leaked a key hash')
-  assert.equal(text.includes('tllm-a'), false, 'payload leaked the presented token')
+})
+
+test('an errored host still reports that it errored — state carries it, ErrInfo does not', async () => {
+  // Omitting `error` must not leave the peer blind: `state` is the bounded, enum-valued
+  // signal a remote renderer can actually act on, and it is enough.
+  const d = mkDeps([key('tllm-a', ['models:use'])], { state: 'error', err: ERR_INFO })
+  const res = await app(d).request('/api/link/v1/status', { headers: { 'X-TurboLLM-Auth': 'tllm-a' } })
+  const body = await res.json() as { engine: Record<string, unknown> }
+  assert.equal(body.engine.state, 'error')
+  assert.equal('error' in body.engine, false)
+})
+
+test('ErrInfo is absent from the SHARED builder, so the local route is the only thing that can add it', () => {
+  // The leak is closed by keeping a local-only field out of the shared builder — never by
+  // deleting diagnostics the local engine card depends on. `ms.err` is still there for
+  // routes.ts to attach; what changed is that the façade has no path to it.
+  const d = mkDeps([key('tllm-a', ['models:use'])], { state: 'error', err: ERR_INFO })
+  const engine = buildModelStatus(d).engine as Record<string, unknown>
+  assert.equal('error' in engine, false, 'ErrInfo must not be in the shared builder')
+  assert.equal(engine.state, 'error', 'but the state it describes still is')
+  assert.equal(d.manager.status().err, ERR_INFO, 'and the local route can still reach it')
 })
 
 test('the local status route still exposes launchCommand — the façade is the only thing that strips it', () => {

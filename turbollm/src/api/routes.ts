@@ -84,21 +84,32 @@ export function registerApi(app: Hono, d: Deps): void {
     // The engine/model/engineStats/liveGeneration block comes from the SHARED builder
     // (status-view.ts) — the same one `GET /api/link/v1/status` re-exports, so a linked
     // peer renders a host's numbers with the components it already uses for its own
-    // (ADR-376 §5.4). `parallelSlots`, the `error` field and the omit-vs-default rules all
-    // live there now; only the strictly local additions are made here.
+    // (ADR-376 §5.4). `parallelSlots` and the omit-vs-default rules live there now; only the
+    // strictly LOCAL-ONLY additions are made here.
+    //
+    // Both additions below exist here rather than in the shared builder for one reason: no
+    // host filesystem detail may cross the Turbo Link façade, so anything that can carry a
+    // path — an argv, or free-form engine output — is added on the local side. The façade
+    // would then have to CONSTRUCT the field to leak it, not merely forget to strip it.
+    //
+    //   - `launchCommand`: the engine's full argv — absolute binary path + absolute model path.
+    //   - `error` (ErrInfo): carries `logTail`, the engine's raw stderr. llama.cpp echoes the
+    //     model path, the mmproj path and its own binary path there as a matter of routine.
+    //
+    // `ms` is read here rather than threaded out of the builder because `Manager.status()` is
+    // a synchronous snapshot getter and this whole handler body is synchronous — the two reads
+    // cannot interleave, so they cannot disagree.
     const core = buildModelStatus(d)
+    const ms = d.manager.status()
     // How many generations this engine can serve at once (llama.cpp's `--parallel N`). Consumed
     // by `turbollm launch` to cap an agent CLI's own background-agent fan-out at what the engine
     // can actually run — see cli-launch.ts. Omitted, not defaulted to 1, when the engine
     // advertises no slot count: "unknown" and "exactly one" are different answers, and a client
     // must not read the former as the latter.
-    //
-    // `launchCommand` is the engine's full argv: an absolute host binary path plus an absolute
-    // model path. It is added HERE rather than in the shared builder precisely so it can never
-    // reach a peer — the façade would have to construct the field itself, not merely forget to
-    // strip it.
     const launchCommand = d.manager.launchCommand()
-    const engine: Record<string, unknown> = launchCommand ? { ...core.engine, launchCommand } : { ...core.engine }
+    const engine: Record<string, unknown> = { ...core.engine }
+    if (ms.err) engine.error = ms.err
+    if (launchCommand) engine.launchCommand = launchCommand
     return c.json({
       version: d.version,
       engine,
