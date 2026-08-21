@@ -3,7 +3,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { withBalancedSplit, pickSplitStrategies, overHeadroom } from './bench'
-import { deriveDefault } from '../models/profile'
+import { deriveDefault, deriveTensorSplit, estimateVramPerGpu } from '../models/profile'
 import type { LoadProfile } from '../models/profile'
 import type { ModelEntry } from '../models/scanner'
 import type { SysInfo } from '../sysinfo/sysinfo'
@@ -144,6 +144,20 @@ test('a split the user pinned is never overwritten', () => {
   const p = base(t4x2, { ctx: 8192, nCpuMoe: 24, ngl: 99 }, m)
   const pinned = { ...p, gpu: { ...p.gpu, tensorSplit: [1, 1] } }
   assert.deepEqual(withBalancedSplit(pinned, m, t4x2).gpu.tensorSplit, [1, 1])
+})
+
+// deriveTensorSplit balances bytes; it does NOT promise the result fits. At nCpuMoe=4 the
+// 36.9 GB model needs ~34 GB of a 30.7 GB pool, and the balanced split lands both cards at
+// ~110% of their VRAM. withBalancedSplit must decline it rather than hand the search a config
+// that cannot load — balancing is only ever worth applying when it actually resolves the overflow.
+test('a balanced split that still overflows is declined, not applied', () => {
+  const m = model({ sizeBytes: 36_903_140_320, ...MOE40 })
+  const p = base(t4x2, { ctx: 8192, nCpuMoe: 4, ngl: 99 }, m)
+  const ts = deriveTensorSplit(p, m, t4x2)
+  assert.ok(ts.length === 2, 'precondition: a split is derivable')
+  const balanced = estimateVramPerGpu({ ...p, gpu: { ...p.gpu, tensorSplit: ts } }, m, t4x2)
+  assert.equal(balanced.verdict, 'overflow', 'precondition: balancing does not rescue this offload')
+  assert.deepEqual(withBalancedSplit(p, m, t4x2).gpu.tensorSplit, [], 'must be left untouched')
 })
 
 test('single-GPU box → left alone', () => {
