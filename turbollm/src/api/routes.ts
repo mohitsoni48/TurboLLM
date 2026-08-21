@@ -61,6 +61,7 @@ import { readQueue, remove as removeQueued } from '../telemetry/queue'
 import { sendConsentChoice } from '../telemetry/consent'
 import { readSentLog } from '../telemetry/log'
 import { TELEMETRY_SCHEMA_VERSION } from '../telemetry/schema'
+import { classifyProvisionFailure } from '../telemetry/classify'
 import { registerOnboardingRoutes } from './onboarding-routes'
 
 type Status = 200 | 201 | 202 | 400 | 401 | 403 | 404 | 409 | 500 | 501 | 503
@@ -331,7 +332,7 @@ export function registerApi(app: Hono, d: Deps): void {
     provisionAbort = ac
     void (async () => {
       try {
-        d.provision.start(def.id)
+        d.provision.start(def.id, 'user_update')
         // Download the latest build into its OWN tag-keyed dir. The old dir is untouched,
         // so a failure here leaves the working install in place (rollback by construction).
         const newBin = await provisionBackend(
@@ -415,7 +416,7 @@ export function registerApi(app: Hono, d: Deps): void {
     const upgrade = c.req.query('update') === '1'
     void (async () => {
       try {
-        d.provision.start('mlx')
+        d.provision.start('mlx', 'runtime_env')
         const rt = await ensureMlxEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), upgrade)
         const eng = d.registry.addMlx(`MLX (${rt.version})`, rt.python, rt.version)
         d.registry.activate(eng.id)
@@ -439,7 +440,7 @@ export function registerApi(app: Hono, d: Deps): void {
     const upgrade = c.req.query('update') === '1'
     void (async () => {
       try {
-        d.provision.start('rapid-mlx')
+        d.provision.start('rapid-mlx', 'runtime_env')
         const rt = await ensureRapidMlxEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), upgrade)
         const eng = d.registry.addRapidMlx(`Rapid-MLX (${rt.version})`, rt.bin, rt.version)
         d.registry.activate(eng.id)
@@ -463,7 +464,7 @@ export function registerApi(app: Hono, d: Deps): void {
     const upgrade = c.req.query('update') === '1'
     void (async () => {
       try {
-        d.provision.start('mlx-vlm')
+        d.provision.start('mlx-vlm', 'runtime_env')
         const rt = await ensureMlxVlmEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), upgrade)
         const eng = d.registry.addMlxVlm(`MLX-VLM (${rt.version})`, rt.python, rt.version)
         d.registry.activate(eng.id)
@@ -757,7 +758,7 @@ export function registerApi(app: Hono, d: Deps): void {
     const upgrade = c.req.query('update') === '1'
     void (async () => {
       try {
-        d.provision.start('vllm')
+        d.provision.start('vllm', 'runtime_env')
         const rt = await ensureVllmEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), upgrade)
         const eng = d.registry.addVllm(`vLLM (${rt.version})`, rt.python, rt.version)
         d.registry.activate(eng.id)
@@ -778,7 +779,7 @@ export function registerApi(app: Hono, d: Deps): void {
     const upgrade = c.req.query('update') === '1'
     void (async () => {
       try {
-        d.provision.start('sglang')
+        d.provision.start('sglang', 'runtime_env')
         const rt = await ensureSglangEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), upgrade)
         const eng = d.registry.addSglang(`SGLang (${rt.version})`, rt.python, rt.version)
         d.registry.activate(eng.id)
@@ -1999,6 +2000,28 @@ export function registerApi(app: Hono, d: Deps): void {
     const b = await body<{ screen?: string; action?: string }>(c)
     try {
       if (b.screen && b.action) d.telemetry?.uiAction(b.screen, b.action)
+    } catch { /* best-effort */ }
+    return c.json({ ok: true }, 202)
+  })
+
+  // onboarding_recovery (spec 25 §8.2): same thin-forwarder shape and same
+  // always-202 opacity as the ui route above, for the same reason — the recovery
+  // buttons only exist in the browser, so this is the only way the outcome of a
+  // retry can reach the queue. Wired 2026-08-21: the event had been in the
+  // registry since it shipped with no caller anywhere, so the one instrument
+  // meant to explain WHY setup fails had never emitted a single event.
+  app.post('/api/v1/telemetry/recovery', async (c) => {
+    const b = await body<{ failure?: string; failureText?: string; action?: string; outcome?: string }>(c)
+    try {
+      // `failureText` is the daemon's OWN local error string, round-tripped through the
+      // browser only because that is where the recovery button lives. It is classified to
+      // an enum member HERE and the raw text never enters an event — the same arrangement
+      // `provision-state.ts` already uses, and the reason the no-free-form-strings
+      // guarantee still holds for an event whose trigger is a click.
+      const failure = b.failure ?? (b.failureText ? classifyProvisionFailure(b.failureText) : undefined)
+      if (failure && b.action && (b.outcome === 'ok' || b.outcome === 'fail')) {
+        d.telemetry?.onboardingRecovery(failure, b.action, b.outcome)
+      }
     } catch { /* best-effort */ }
     return c.json({ ok: true }, 202)
   })

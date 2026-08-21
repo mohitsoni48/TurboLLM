@@ -16,7 +16,7 @@
 import type { ConversationStore } from '../../chat/db'
 import type { Emitter } from '../emit'
 import { emit } from './typed-emit'
-import { DailyRollup } from './rollup'
+import { DailyRollup, daysBetween } from './rollup'
 import { chatDaily } from '../events/chat'
 import { gatewayDaily, HARNESSES } from '../events/gateway'
 import { codeDaily } from '../events/code'
@@ -58,12 +58,33 @@ export function checkDailyQueryRollups(
   }
 
   const day = rolled.day
+  const daysAgo = daysBetween(day, today())
 
+  // ZERO-SUPPRESSION (2026-08-21 data-integrity audit). `chat_daily` and `code_daily`
+  // used to be emitted unconditionally, right here, on any day boundary — so a machine
+  // that had never opened Code still reported a `code_daily` every single day, carrying
+  // an all-zero payload. The consequences were not subtle:
+  //
+  //   - 305 of 385 `code_daily` rows (79%) and 175 of 385 `chat_daily` rows (45%) were
+  //     empty, so "98 machines use Code" actually meant 18. Real Code reach was 5x
+  //     smaller than reported, and Gateway — which is zero-suppressed for free below,
+  //     because it loops over DB rows that only exist when there was traffic — looked
+  //     like half of Code when it is really 2.6x its size.
+  //   - Because both fired from this one shared boundary check, the two events were
+  //     byte-identical in every version bucket and on every day. That was the
+  //     "some numbers are constant" symptom, and it made the pair useless as
+  //     independent signals.
+  //   - Every per-user average (`turns`, `messages`, `medianMessagesInConversation`)
+  //     was diluted ~5x by the zero rows sitting in the denominator.
+  //
+  // A day with no activity is now simply not reported. Absence already means "no usage"
+  // for `gateway_daily` and `feature_used_daily`; this makes all four agree, which is
+  // the property that lets them be compared to each other at all.
   const chat = db.chatDailyStats(day)
-  emit(telemetry, chatDaily, chat)
+  if (hasActivity(chat)) emit(telemetry, chatDaily, { ...chat, daysAgo })
 
   const code = db.codeDailyStats(day)
-  emit(telemetry, codeDaily, code)
+  if (hasActivity(code)) emit(telemetry, codeDaily, { ...code, daysAgo })
 
   for (const g of db.gatewayDailyStats(day)) {
     // db.ts stores whatever classifyHarness() produced (always a HARNESSES member) plus
@@ -71,6 +92,17 @@ export function checkDailyQueryRollups(
     // against a hand-edited DB or a future direct writer, not an expected runtime path, and is
     // what lets `harness` below satisfy PayloadOf<>'s literal-enum type at all.
     const harness = HARNESS_SET.has(g.harness) ? (g.harness as (typeof HARNESSES)[number]) : 'unknown'
-    emit(telemetry, gatewayDaily, { ...g, harness })
+    emit(telemetry, gatewayDaily, { ...g, harness, daysAgo })
   }
+}
+
+/** Whether a rollup's counters describe anything that actually happened.
+ *
+ *  Deliberately "any counter non-zero" rather than naming one field per event:
+ *  a future counter added to either payload is covered automatically, whereas a
+ *  hand-picked sentinel field (`messages`, `sessions`) is exactly the kind of
+ *  second list that goes stale the moment someone adds a field and forgets this
+ *  call site — the failure mode ADR-333's registry redesign exists to stop. */
+function hasActivity(counters: Record<string, number>): boolean {
+  return Object.values(counters).some((n) => typeof n === 'number' && n > 0)
 }

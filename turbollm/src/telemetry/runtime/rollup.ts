@@ -40,6 +40,29 @@ function readFromDisk<Counters extends Record<string, number>>(dataDir: string, 
   }
 }
 
+/**
+ * Whole days between two `YYYY-MM-DD` strings, clamped to the range every
+ * rollup event's `daysAgo` field accepts (2026-08-21 data-integrity audit).
+ *
+ * Every daily-rollup event is stamped with its EMIT time, not the date its
+ * counters describe, and the two only coincide when the daemon happened to be
+ * running across that midnight. Charting rollups on `timestamp` therefore
+ * attributed 17.7% of rows to the wrong day. `daysAgo` is what makes the real
+ * day recoverable downstream (`toDate(ts) - daysAgo`), so it is computed here
+ * once rather than open-coded at each of the five emit sites.
+ *
+ * Returns 0 for anything unparseable or in the future — a wrong-but-bounded
+ * value that still validates beats dropping the event, which is the trade-off
+ * every other function in this module already makes.
+ */
+export function daysBetween(from: string, to: string): number {
+  const a = Date.parse(`${from}T00:00:00Z`)
+  const b = Date.parse(`${to}T00:00:00Z`)
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return 0
+  const days = Math.round((b - a) / 86_400_000)
+  return Math.min(366, Math.max(0, days))
+}
+
 function writeToDisk<Counters extends Record<string, number>>(dataDir: string, key: string, state: RollupState<Counters>): void {
   mkdirSync(join(dataDir, 'telemetry'), { recursive: true })
   writeFileSync(statePath(dataDir, key), JSON.stringify(state))

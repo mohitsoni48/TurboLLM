@@ -25,5 +25,8 @@ export const featureUsedDaily = defineEvent({
   payload: {
     feature: f.enum(FEATURES),
     countBucket: f.enum(COUNT_BUCKETS),
+    /** Whole days back from this event's `ts` that this count describes —
+     *  see `chat.ts` for the full rationale. */
+    daysAgo: f.int({ min: 0, max: 366, optional: true }),
   },
 })

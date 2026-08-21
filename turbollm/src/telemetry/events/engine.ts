@@ -7,7 +7,7 @@
  *  infrequent on its own, unlike a hot path that needed a ledger guard. */
 
 import { defineEvent, f } from '../core/define'
-import { OUTCOMES, PROVISION_FAIL_REASONS } from '../core/enums'
+import { OUTCOMES, PROVISION_FAIL_REASONS, PROVISION_TRIGGERS } from '../core/enums'
 
 export const engineInstalled = defineEvent({
   name: 'engine_installed',
@@ -17,6 +17,12 @@ export const engineInstalled = defineEvent({
   description: 'One engine provisioning attempt settled (success or failure).',
   payload: {
     outcome: f.enum(OUTCOMES),
+    // What caused this attempt (2026-08-21 data-integrity audit). Optional so the
+    // field can be added without the currently-deployed Worker rejecting events
+    // from clients that predate it — the exact compatibility break that silently
+    // killed `onboarding_step` for every already-shipped binary. Absent means
+    // "an older client that could not tell us"; it must NOT be read as 'seed'.
+    trigger: f.enum(PROVISION_TRIGGERS, { optional: true }),
     // Only ever sent on a failed attempt (classifyProvisionFailure) — same
     // convention onboarding_step's own failReason field used.
     failReason: f.enum(PROVISION_FAIL_REASONS, { optional: true }),

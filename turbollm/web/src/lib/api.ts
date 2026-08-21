@@ -118,6 +118,27 @@ export function track(screen: string, action: string): void {
   void request('/api/v1/telemetry/ui', { method: 'POST', json: { screen, action } }).catch(() => {})
 }
 
+/** Report the outcome of an onboarding recovery attempt (`onboarding_recovery`,
+ *  spec 25 §8.2). Same fire-and-forget contract as `track` above.
+ *
+ *  Call this when the remedy SETTLES, not when the button is clicked — the whole
+ *  value of the event is `outcome`, and a click alone cannot know it. `failure`
+ *  and `action` are validated server-side against the closed enums
+ *  (`events/onboarding.ts`); anything unrecognized is silently dropped. */
+export function trackRecovery(failure: string, action: string, outcome: 'ok' | 'fail'): void {
+  void request('/api/v1/telemetry/recovery', { method: 'POST', json: { failure, action, outcome } }).catch(() => {})
+}
+
+/** Same as {@link trackRecovery}, for the case where the browser holds the daemon's own
+ *  raw error STRING rather than an already-classified reason (a failed download's
+ *  `error` field). The text is sent back to the daemon purely so it can classify it into
+ *  a closed-enum member there — it never becomes part of a telemetry event, which is what
+ *  keeps the "no free-form strings ever leave the machine" guarantee intact for an event
+ *  that is necessarily triggered from the UI. */
+export function trackRecoveryText(failureText: string, action: string, outcome: 'ok' | 'fail'): void {
+  void request('/api/v1/telemetry/recovery', { method: 'POST', json: { failureText, action, outcome } }).catch(() => {})
+}
+
 // ── Status ───────────────────────────────────────────────────────────────────
 export function getStatus(): Promise<Status> {
   return request<Status>('/api/v1/status')
