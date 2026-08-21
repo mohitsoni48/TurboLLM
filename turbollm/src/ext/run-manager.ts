@@ -164,12 +164,30 @@ export class PublicRunManager {
     return row ? rowToRun(row) : null
   }
 
-  list(tenant: string): PublicRun[] {
-    const inMemory = [...this.runs.values()].filter((s) => s.run.tenant === tenant).map((s) => s.run)
+  /** Tenant scoping alone is not enough (spec 27 §3.1) — a tenant's API key is shared across
+   *  an integrator's many end users, so without an `owner` filter one owner can enumerate every
+   *  other owner's runs within the same tenant. `owner` is optional only so a caller that
+   *  genuinely wants the whole tenant (today: nothing in this codebase — every route threads a
+   *  real scope) still compiles; every HTTP route always passes one. Filters BOTH sources: the
+   *  in-memory map (this process's own live/recent runs) and the persisted rows `db.listExtRuns`
+   *  returns (spec 27 §6.4) — a durable row from another owner must never leak through the
+   *  fallback path either. Filtering happens here, in JS, rather than in a WHERE clause on the
+   *  `db.listExtRuns` SQL itself: `RunRecordStore` is a narrow port this file owns and tests
+   *  against without a real DB, and its `listExtRuns(tenant, limit?)` signature is shared with
+   *  the real `ConversationStore` implementation outside this file's scope for this change —
+   *  post-query filtering is fully correct (no row from another owner is ever returned to the
+   *  caller), just not the most efficient shape; pushing the filter into the SQL itself is a
+   *  reasonable follow-up whenever that store method is next touched. */
+  list(tenant: string, owner?: string): PublicRun[] {
+    const inMemory = [...this.runs.values()]
+      .filter((s) => s.run.tenant === tenant && (owner === undefined || s.run.owner === owner))
+      .map((s) => s.run)
     if (!this.db) return inMemory
     const seen = new Set(inMemory.map((r) => r.id))
     // In-memory copy wins on id collision — it is fresher than whatever was last flushed.
-    const persisted = this.db.listExtRuns(tenant).filter((r) => !seen.has(r.id)).map(rowToRun)
+    const persisted = this.db.listExtRuns(tenant)
+      .filter((r) => !seen.has(r.id) && (owner === undefined || r.owner === owner))
+      .map(rowToRun)
     return [...inMemory, ...persisted]
   }
 

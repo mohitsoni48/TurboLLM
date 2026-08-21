@@ -12,13 +12,17 @@
 import type { Hono, Context } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import type { Deps } from '../deps.js'
+import type { Chat, ChatMessage } from '../chat/store/types.js'
 import { requireScope, scopeFor } from './auth.js'
 import { extError, mapStoreError } from './errors.js'
 import { checkContextFits } from './context-limit.js'
 import { loadFullHistory, buildGenerationCtx } from './generation.js'
 import { PublicRunManager, type PublicRun, type RunBody } from './run-manager.js'
 import { IdempotencyStore } from './idempotency.js'
-import { TenantLimiter, DEFAULT_MAX_IN_FLIGHT_PER_TENANT, DEFAULT_REQUESTS_PER_MINUTE_PER_TENANT } from './limits.js'
+import {
+  TenantLimiter, DEFAULT_MAX_IN_FLIGHT_PER_TENANT, DEFAULT_REQUESTS_PER_MINUTE_PER_TENANT,
+  MAX_BODY_BYTES, MAX_ATTACHMENTS,
+} from './limits.js'
 import { AuditLog, auditMiddleware } from './audit.js'
 
 const BASE = '/api/ext/v1'
@@ -101,9 +105,13 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
   // never run for that refusal.
   app.post(`${BASE}/chats/:id/messages/generate`, auditMiddleware(audit, 'run.start'), requireScope('runs:write'), async (c) => {
     const chatId = c.req.param('id')
-    const b = await c.req.json().catch(() => ({})) as { role?: 'user'; content?: string; owner?: string }
+    const b = await c.req.json().catch(() => ({})) as {
+      role?: 'user'; content?: string; owner?: string
+      attachments?: string[]; metadata?: Record<string, unknown>
+    }
     const scope = scopeFor(c, b.owner)
     const content = (b.content ?? '').trim()
+    const attachments = b.attachments
     const idempotencyKey = c.req.header('Idempotency-Key')?.trim() || undefined
 
     // Idempotent replay (spec §7.6), checked before ANY validation/persistence/limiter charge —
@@ -130,17 +138,57 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
       }
     }
 
-    if (!content) return extError(c, 'invalid_request', 'invalid_input', 'Type a message or attach a file.', { param: 'content' })
+    // "Type a message OR attach a file" (spec 27 §3.2/§5.1) — content alone is no longer the
+    // only way to satisfy this; an attachments-only message is legitimate and must not be
+    // rejected just because `content` trims to empty.
+    if (!content && !(attachments?.length)) return extError(c, 'invalid_request', 'invalid_input', 'Type a message or attach a file.', { param: 'content' })
 
-    const chat = await d.chatStore.getChat(scope, chatId)
-    if (!chat) return extError(c, 'not_found', 'not_found', 'Not found.')
+    // Body/attachment caps (spec 27 §4.1), checked purely from the request body — before ANY
+    // store I/O, the inflight reservation below, or the limiter charge — so an over-limit write
+    // costs nothing and leaves nothing dangling, same discipline as every other pre-persistence
+    // guard on this route. `MAX_BODY_BYTES`/`MAX_ATTACHMENTS` (limits.ts) are the exact numbers
+    // `GET /capabilities` advertises — imported, not re-hardcoded, so the two can't drift.
+    const bodyBytes = Buffer.byteLength(content, 'utf8')
+    if (bodyBytes > MAX_BODY_BYTES) {
+      return extError(c, 'invalid_request', 'payload_too_large',
+        `Message content is ${bodyBytes} bytes, exceeding the ${MAX_BODY_BYTES}-byte limit.`,
+        { status: 413, param: 'content' })
+    }
+    if (attachments && attachments.length > MAX_ATTACHMENTS) {
+      return extError(c, 'invalid_request', 'payload_too_large',
+        `Message has ${attachments.length} attachments, exceeding the ${MAX_ATTACHMENTS}-attachment limit.`,
+        { status: 413, param: 'attachments' })
+    }
 
+    // Reserve the inflight slot SYNCHRONOUSLY — before ANY `await` below (`getChat`,
+    // `loadFullHistory`, the persistence calls) — so two near-simultaneous generate requests for
+    // the same chat cannot both observe an empty slot and both proceed (the TOCTOU this map
+    // exists to prevent: JS only yields to another request's synchronous code at an `await`
+    // point, so check-then-set with no `await` between them is atomic in practice). The
+    // placeholder is replaced with the real run id once one exists, or removed again by
+    // `releaseInflight()` on every failure path between here and `runs.start()` — a request that
+    // reserves the slot but never actually starts a run (context overflow, a store failure, a
+    // rate-limit refusal) must not leave the chat permanently blocked.
     if (inflight.has(chatId)) {
       return extError(c, 'conflict', 'generation_in_flight', 'A generation is already running for this chat.', { retryable: true })
     }
+    const PENDING = ''   // never a real run id (`run_${uuid}`), so this can't collide
+    inflight.set(chatId, PENDING)
+    const releaseInflight = () => { if (inflight.get(chatId) === PENDING) inflight.delete(chatId) }
+
+    let chat: Chat | null
+    try {
+      chat = await d.chatStore.getChat(scope, chatId)
+    } catch (e) {
+      releaseInflight()
+      const m = mapStoreError(e)
+      return extError(c, m.type, m.code, m.message, { status: m.status, retryable: m.retryable })
+    }
+    if (!chat) { releaseInflight(); return extError(c, 'not_found', 'not_found', 'Not found.') }
 
     const ms = d.manager.status()
     if (ms.state !== 'running' || !ms.model) {
+      releaseInflight()
       return extError(c, 'conflict', 'model_not_loaded', 'Load a model first.', { retryable: true })
     }
 
@@ -156,7 +204,14 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
     // the OLDEST page once a chat passes 200 stored messages (`SqliteChatStore.clampLimit`),
     // letting this check pass a conversation whose true full history overflows the window — see
     // `loadFullHistory`'s own header comment for the exact failure mode this avoids.
-    const history = await loadFullHistory(d.chatStore, scope, chatId)
+    let history: ChatMessage[]
+    try {
+      history = await loadFullHistory(d.chatStore, scope, chatId)
+    } catch (e) {
+      releaseInflight()
+      const m = mapStoreError(e)
+      return extError(c, m.type, m.code, m.message, { status: m.status, retryable: m.retryable })
+    }
     const ctx = buildGenerationCtx(chat, history)
     const prospective = [
       ...ctx.engineMessages.map((m) => ({ role: m.role, content: String(m.content ?? '') })),
@@ -164,6 +219,7 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
     ]
     const fit = checkContextFits(d, prospective)
     if (!fit.fits) {
+      releaseInflight()
       return extError(c, 'engine', 'context_overflow',
         `This conversation is about ${fit.estimated} tokens, which exceeds the loaded model's ${fit.limit}-token window. Start a new chat or load a longer-context model.`,
         { status: 409 })
@@ -172,22 +228,25 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
     // Per-tenant concurrency cap (spec 27 §8.4), checked BEFORE any persistence — a refusal
     // here must leave nothing dangling: no user turn, no assistant placeholder, no run.
     if (!limiter.tryAcquire(scope.tenant)) {
+      releaseInflight()
       return extError(c, 'capacity', 'rate_limited',
         'Too many concurrent generations for this tenant. Wait for one to finish and retry.',
         { status: 429, retryable: true, retryAfterMs: 5_000 })
     }
 
     // 2. Persist BEFORE the engine is touched. A failed write here costs no GPU time and
-    //    leaves the caller with nothing dangling.
+    //    leaves the caller with nothing dangling. Attachments/metadata are the USER turn's own —
+    //    the assistant placeholder never receives them, it starts genuinely empty.
     let userMsgId: string
     let assistantMsgId: string
     try {
-      const user = await d.chatStore.addMessage(scope, chatId, { role: 'user', content })
+      const user = await d.chatStore.addMessage(scope, chatId, { role: 'user', content, attachments, metadata: b.metadata })
       const placeholder = await d.chatStore.addMessage(scope, chatId, { role: 'assistant', content: '', status: 'streaming' })
       userMsgId = user.id
       assistantMsgId = placeholder.id
     } catch (e) {
       limiter.release(scope.tenant)
+      releaseInflight()
       const m = mapStoreError(e)
       return extError(c, m.type, m.code, m.message, { status: m.status, retryable: m.retryable })
     }
@@ -204,6 +263,8 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
     // fetch is still at least one microtask away. A retry that lands anywhere after this line
     // finds this entry and reattaches via the branch above instead of starting a second run.
     if (idempotencyKey) idempotency.remember(scope.tenant, IDEMPOTENCY_OP, idempotencyKey, { runId: run.id, userMessageId: userMsgId, messageId: assistantMsgId } satisfies GenerateReplay)
+    // Upgrade the reservation to the real run id — the map has held `chatId` since before the
+    // first `await` above, so this is never a fresh `.set()` racing anything.
     inflight.set(chatId, run.id)
     // Released when the run actually SETTLES, not when this HTTP response is sent — the route
     // itself never blocks on generation, so this is fire-and-forget off the manager's own
@@ -213,19 +274,31 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
     return respondWithRun(c, runs, run, userMsgId, assistantMsgId)
   })
 
-  app.get(`${BASE}/runs`, requireScope('chats:read'), (c) =>
-    c.json({ data: runs.list(c.get('extTenant') as string).map(toRunDTO) }))
+  // Every run lookup below checks BOTH `tenant` and `owner` (spec 27 §3.1) — tenant alone is
+  // not enough, since one tenant's API key is shared across an integrator's many end users.
+  // `scopeFor` resolves owner the same way every other route on this surface does (defaulting to
+  // 'default' when the request supplies none), so a caller that never sends `owner` still only
+  // ever sees its own default-owner runs, never another owner's. The not-found response is
+  // IDENTICAL whether the run belongs to another tenant, another owner, or doesn't exist at all —
+  // distinguishing those would leak existence across owners the same way a 403-vs-404 split would
+  // leak it across tenants (spec 27 §7.2's existing convention, just extended to `owner`).
+  app.get(`${BASE}/runs`, requireScope('chats:read'), (c) => {
+    const scope = scopeFor(c, c.req.query('owner'))
+    return c.json({ data: runs.list(scope.tenant, scope.owner).map(toRunDTO) })
+  })
 
   app.get(`${BASE}/runs/:id`, requireScope('chats:read'), (c) => {
+    const scope = scopeFor(c, c.req.query('owner'))
     const run = runs.get(c.req.param('id'))
-    if (!run || run.tenant !== c.get('extTenant')) return extError(c, 'not_found', 'not_found', 'Not found.')
+    if (!run || run.tenant !== scope.tenant || run.owner !== scope.owner) return extError(c, 'not_found', 'not_found', 'Not found.')
     runs.touch(run.id)   // a poll is liveness (spec §6.5) — without this the reaper kills pollers
     return c.json(toRunDTO(run))
   })
 
   app.get(`${BASE}/runs/:id/stream`, requireScope('chats:read'), (c) => {
+    const scope = scopeFor(c, c.req.query('owner'))
     const run = runs.get(c.req.param('id'))
-    if (!run || run.tenant !== c.get('extTenant')) return extError(c, 'not_found', 'not_found', 'Not found.')
+    if (!run || run.tenant !== scope.tenant || run.owner !== scope.owner) return extError(c, 'not_found', 'not_found', 'Not found.')
     const after = c.req.query('after') ? Number(c.req.query('after')) : 0
     if (!runs.canReplayFrom(run.id, after)) {
       return extError(c, 'conflict', 'replay_window_exceeded',
@@ -241,8 +314,9 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
   })
 
   app.post(`${BASE}/runs/:id/cancel`, auditMiddleware(audit, 'run.cancel'), requireScope('runs:write'), (c) => {
+    const scope = scopeFor(c, c.req.query('owner'))
     const run = runs.get(c.req.param('id'))
-    if (!run || run.tenant !== c.get('extTenant')) return extError(c, 'not_found', 'not_found', 'Not found.')
+    if (!run || run.tenant !== scope.tenant || run.owner !== scope.owner) return extError(c, 'not_found', 'not_found', 'Not found.')
     const cancelled = runs.cancel(run.id)
     if (!cancelled) return extError(c, 'conflict', 'not_active', 'That run has already ended.')
     return c.json(toRunDTO(run))

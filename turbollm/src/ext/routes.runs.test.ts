@@ -10,6 +10,7 @@ import { join } from 'node:path'
 import { Hono } from 'hono'
 import { ConversationStore } from '../chat/db.js'
 import { ChatStoreRouter } from '../chat/store/router.js'
+import { StoreError, type ChatStore } from '../chat/store/chat-store.js'
 import { hashKey } from '../auth.js'
 import { PublicRunManager } from './run-manager.js'
 import { registerExtChatRoutes } from './routes.chats.js'
@@ -67,6 +68,53 @@ const post = (auth: string, b: unknown, accept = 'application/json') => ({
   headers: { Authorization: auth, 'Content-Type': 'application/json', Accept: accept },
   body: JSON.stringify(b),
 })
+
+/** Wraps a real `ChatStore` so exactly one named method throws — `n` times before falling
+ *  through to the real implementation (default: forever). Mirrors routes.chats.test.ts's
+ *  `harnessNoAdapter` regression pattern (a store that throws `StoreError` for a route that,
+ *  before the fix, called it outside any try/catch) but at the METHOD level via `Proxy` rather
+ *  than swapping the whole store — `getChat`/`listMessages` are the two calls C3 found
+ *  unguarded, and `newChat()`'s own `POST /chats` (createChat) must keep working normally so a
+ *  chat exists to generate against in the first place. A non-accessor Proxy trap like this is
+ *  transparent to `this` binding for both plain methods and `ChatStoreRouter`'s own `capabilities`
+ *  getter (Reflect.get forwards the receiver correctly either way), so calls the real store makes
+ *  on itself (`pick()` reading `this.local`/`this.adapter`) are unaffected. */
+function chatStoreThatThrows(base: ChatStore, method: 'getChat' | 'listMessages', n = Infinity): ChatStore {
+  let thrown = 0
+  return new Proxy(base, {
+    get(target, prop, receiver) {
+      if (prop === method) {
+        return async (...args: unknown[]) => {
+          if (thrown < n) {
+            thrown++
+            throw new StoreError('contract_violation', 'simulated adapter failure')
+          }
+          return (target[method] as (...a: unknown[]) => unknown).apply(target, args)
+        }
+      }
+      return Reflect.get(target, prop, receiver)
+    },
+  }) as ChatStore
+}
+
+function harnessWithThrowingStore(method: 'getChat' | 'listMessages', n = Infinity) {
+  const dir = mkdtempSync(join(tmpdir(), 'turbollm-ext-runs-throw-'))
+  const conv = new ConversationStore(dir)
+  const chatStore = chatStoreThatThrows(new ChatStoreRouter(conv.chatStore, conv.chatStore), method, n)
+  const d = {
+    db: conv,
+    chatStore,
+    store: { snapshot: () => ({ apiKeys: [{ hash: hashKey('tllm-ext-acme'), tenant: 'acme' }] }) },
+    manager: { status: () => ({ state: 'running', model: 'test-model' }), target: () => 'http://127.0.0.1:9999' },
+  } as never
+  const runs = new PublicRunManager()
+  const app = new Hono()
+  registerExtChatRoutes(app, d)
+  registerExtRunRoutes(app, d, runs, {
+    makeBody: () => async ({ emit }) => { await emit({ event: 'delta', data: { content: 'hello' } }); return { status: 'complete' as const } },
+  })
+  return { app, runs, cleanup: () => { conv.close(); rmSync(dir, { recursive: true, force: true }) } }
+}
 
 async function newChat(app: Hono, auth = ACME) {
   const res = await app.request('/api/ext/v1/chats', post(auth, { title: 'Run', owner: 'u1' }))
@@ -144,7 +192,7 @@ test('GET /runs/{id} is the source of truth after the stream ends', async () => 
       post(ACME, { role: 'user', content: 'hi', owner: 'u1' }))).json() as { id: string }
     await runs.settled(started.id)
 
-    const res = await app.request(`/api/ext/v1/runs/${started.id}`, { headers: { Authorization: ACME } })
+    const res = await app.request(`/api/ext/v1/runs/${started.id}?owner=u1`, { headers: { Authorization: ACME } })
     assert.equal(res.status, 200)
     assert.equal((await res.json() as { status: string }).status, 'complete')
   } finally {
@@ -160,8 +208,8 @@ test('reattaching with ?after replays only later frames', async () => {
       post(ACME, { role: 'user', content: 'hi', owner: 'u1' }))).json() as { id: string }
     await runs.settled(started.id)
 
-    const full = await (await app.request(`/api/ext/v1/runs/${started.id}/stream`, { headers: { Authorization: ACME } })).text()
-    const tail = await (await app.request(`/api/ext/v1/runs/${started.id}/stream?after=2`, { headers: { Authorization: ACME } })).text()
+    const full = await (await app.request(`/api/ext/v1/runs/${started.id}/stream?owner=u1`, { headers: { Authorization: ACME } })).text()
+    const tail = await (await app.request(`/api/ext/v1/runs/${started.id}/stream?after=2&owner=u1`, { headers: { Authorization: ACME } })).text()
     assert.ok(full.length > tail.length)
     assert.match(tail, /event: done/, 'a late reattach still receives the terminal frame')
   } finally {
@@ -221,7 +269,7 @@ test('cancel aborts an in-flight run', async () => {
     const started = await (await app.request(`/api/ext/v1/chats/${chatId}/messages`,
       post(ACME, { role: 'user', content: 'hi', owner: 'u1' }))).json() as { id: string }
 
-    const res = await app.request(`/api/ext/v1/runs/${started.id}/cancel`, { method: 'POST', headers: { Authorization: ACME } })
+    const res = await app.request(`/api/ext/v1/runs/${started.id}/cancel?owner=u1`, { method: 'POST', headers: { Authorization: ACME } })
     assert.equal(res.status, 200)
     release!()
     await runs.settled(started.id)
@@ -486,6 +534,214 @@ test('an overflow that only shows up past message #200 is still caught (full-his
     // fix itself uses, since the public GET .../messages endpoint caps any single page at 200.
     const after = await loadFullHistory(chatStore, scope, chatId)
     assert.equal(after.length, 255, 'the refusal must not add a user/assistant pair on top of the seeded history')
+  } finally {
+    cleanup()
+  }
+})
+
+// ── Final-gate fix round: C1, cross-owner isolation on the run routes ──────────────────────
+// Every run route checked only `run.tenant`, never `run.owner` — one owner's API key could
+// list/read/cancel every OTHER owner's runs within the same tenant (empirically reproduced in
+// the final review). These are same-TENANT, different-OWNER cases — distinct from the
+// pre-existing cross-tenant coverage above, which uses an entirely unauthenticated key and so
+// never actually exercised the owner-scoping branch at all.
+test('a same-tenant, different-owner request cannot read a run (owner scoping, not just tenant)', async () => {
+  const { app, runs, cleanup } = harness()
+  try {
+    const chatId = await newChat(app) // owner 'u1', see newChat()
+    const started = await (await app.request(`/api/ext/v1/chats/${chatId}/messages`,
+      post(ACME, { role: 'user', content: 'hi', owner: 'u1' }))).json() as { id: string }
+    await runs.settled(started.id)
+
+    const res = await app.request(`/api/ext/v1/runs/${started.id}?owner=someone-else`, { headers: { Authorization: ACME } })
+    assert.equal(res.status, 404, 'same tenant, different owner must not see the run')
+    assert.equal((await res.json() as { error: { type: string } }).error.type, 'not_found', 'must not distinguish wrong-owner from wrong-tenant or not-found')
+  } finally {
+    cleanup()
+  }
+})
+
+test('a same-tenant, different-owner request cannot cancel a run, and the real owner\'s run is unaffected', async () => {
+  let release: () => void
+  const gate = new Promise<void>((r) => { release = r })
+  const { app, runs, cleanup } = harness(async () => { await gate; return { status: 'complete' as const } })
+  try {
+    const chatId = await newChat(app)
+    const started = await (await app.request(`/api/ext/v1/chats/${chatId}/messages`,
+      post(ACME, { role: 'user', content: 'hi', owner: 'u1' }))).json() as { id: string }
+
+    const res = await app.request(`/api/ext/v1/runs/${started.id}/cancel?owner=someone-else`,
+      { method: 'POST', headers: { Authorization: ACME } })
+    assert.equal(res.status, 404, 'same tenant, different owner must not be able to cancel')
+
+    release!()
+    await runs.settled(started.id)
+    assert.equal(runs.get(started.id)?.status, 'complete', "another owner's cancel attempt must not have touched the real owner's run")
+  } finally {
+    cleanup()
+  }
+})
+
+// ── Final-gate fix round: C3, unguarded getChat/loadFullHistory in the generate handler ─────
+// Every other store call on the generate path is wrapped in try/catch → mapStoreError →
+// extError. `getChat` and `loadFullHistory`'s own `listMessages` calls were not — a throwing
+// adapter (any real pluggable, non-SQLite ChatStore) fell through to Hono's bare, non-JSON 500.
+// Mirrors routes.chats.test.ts's `harnessNoAdapter` regression pattern, at the method level.
+test('getChat throwing in the generate handler surfaces a JSON error envelope, and releases the inflight reservation for a retry', async () => {
+  // Throws exactly once — the SECOND generate call for the same chat must succeed, proving the
+  // I5 inflight reservation this request took out was released on this failure path (not left
+  // dangling, which would otherwise permanently block the chat with `generation_in_flight`).
+  const { app, runs, cleanup } = harnessWithThrowingStore('getChat', 1)
+  try {
+    const chatId = await newChat(app)
+    const first = await app.request(`/api/ext/v1/chats/${chatId}/messages/generate`,
+      post(ACME, { role: 'user', content: 'hi', owner: 'u1' }))
+    const text = await first.text()
+    let parsed: { error?: { type?: unknown; code?: unknown; request_id?: unknown; retryable?: unknown } }
+    try {
+      parsed = JSON.parse(text)
+    } catch {
+      assert.fail(`response body is not JSON (bare framework error?): ${text.slice(0, 200)}`)
+    }
+    assert.ok(first.status >= 400, 'a store failure must not report success')
+    assert.equal(typeof parsed.error?.type, 'string')
+    assert.equal(typeof parsed.error?.code, 'string')
+    assert.equal(typeof parsed.error?.request_id, 'string')
+    assert.equal(typeof parsed.error?.retryable, 'boolean')
+
+    const second = await app.request(`/api/ext/v1/chats/${chatId}/messages/generate`,
+      post(ACME, { role: 'user', content: 'hi again', owner: 'u1' }))
+    assert.equal(second.status, 202, 'the failed attempt must not have left the chat permanently blocked')
+    const run = await second.json() as { id: string }
+    await runs.settled(run.id)
+  } finally {
+    cleanup()
+  }
+})
+
+test('listMessages (loadFullHistory) throwing in the generate handler surfaces a JSON error envelope, not a bare 500', async () => {
+  const { app, cleanup } = harnessWithThrowingStore('listMessages')
+  try {
+    const chatId = await newChat(app)
+    const res = await app.request(`/api/ext/v1/chats/${chatId}/messages/generate`,
+      post(ACME, { role: 'user', content: 'hi', owner: 'u1' }))
+    const text = await res.text()
+    let parsed: { error?: { type?: unknown; code?: unknown; request_id?: unknown; retryable?: unknown } }
+    try {
+      parsed = JSON.parse(text)
+    } catch {
+      assert.fail(`response body is not JSON (bare framework error?): ${text.slice(0, 200)}`)
+    }
+    assert.ok(res.status >= 400, 'a store failure must not report success')
+    assert.equal(typeof parsed.error?.type, 'string')
+    assert.equal(typeof parsed.error?.code, 'string')
+    assert.equal(typeof parsed.error?.request_id, 'string')
+    assert.equal(typeof parsed.error?.retryable, 'boolean')
+  } finally {
+    cleanup()
+  }
+})
+
+// ── Final-gate fix round: C4, attachments silently dropped on the generate path ─────────────
+test('an attachments-only message (no content) is accepted on the generate route, and only the user message keeps the attachments', async () => {
+  const { app, runs, cleanup } = harness()
+  try {
+    const chatId = await newChat(app)
+    const res = await app.request(`/api/ext/v1/chats/${chatId}/messages/generate`,
+      post(ACME, { role: 'user', owner: 'u1', attachments: ['data:image/png;base64,AAAA'] }))
+    assert.equal(res.status, 202, 'content-empty-but-attached must be accepted, not rejected as empty')
+    const run = await res.json() as { id: string }
+    await runs.settled(run.id)
+
+    const list = await (await app.request(`/api/ext/v1/chats/${chatId}/messages?owner=u1&include=attachments`,
+      { headers: { Authorization: ACME } })).json() as { data: Array<{ role: string; attachments: string[] }> }
+    const userMsg = list.data.find((m) => m.role === 'user')!
+    const assistantMsg = list.data.find((m) => m.role === 'assistant')!
+    assert.deepEqual(userMsg.attachments, ['data:image/png;base64,AAAA'], 'the attachment must round-trip on the user message')
+    assert.deepEqual(assistantMsg.attachments, [], 'the assistant placeholder never receives attachments')
+  } finally {
+    cleanup()
+  }
+})
+
+// ── Final-gate fix round: C5, body/attachment limits advertised but never enforced ──────────
+test('a message body over the byte limit is refused with 413 payload_too_large, and nothing is persisted', async () => {
+  const { app, cleanup } = harness()
+  try {
+    const chatId = await newChat(app)
+    const res = await app.request(`/api/ext/v1/chats/${chatId}/messages/generate`,
+      post(ACME, { role: 'user', owner: 'u1', content: 'x'.repeat(1_048_577) }))
+    assert.equal(res.status, 413)
+    assert.equal((await res.json() as { error: { code: string } }).error.code, 'payload_too_large')
+
+    const list = await (await app.request(`/api/ext/v1/chats/${chatId}/messages?owner=u1`,
+      { headers: { Authorization: ACME } })).json() as { data: unknown[] }
+    assert.equal(list.data.length, 0, 'an over-limit write must not persist anything')
+  } finally {
+    cleanup()
+  }
+})
+
+test('a message with more attachments than the limit is refused with 413 payload_too_large', async () => {
+  const { app, cleanup } = harness()
+  try {
+    const chatId = await newChat(app)
+    const res = await app.request(`/api/ext/v1/chats/${chatId}/messages/generate`,
+      post(ACME, { role: 'user', owner: 'u1', content: 'hi', attachments: ['a', 'b', 'c', 'd', 'e'] }))
+    assert.equal(res.status, 413)
+    assert.equal((await res.json() as { error: { code: string } }).error.code, 'payload_too_large')
+  } finally {
+    cleanup()
+  }
+})
+
+// ── Final-gate fix round: I5, inflight-map TOCTOU race ──────────────────────────────────────
+// Before the fix, `inflight.has(chatId)` was checked (originally even AFTER `getChat`) but not
+// `.set()` until right before the response, with real `await`s in between — two near-simultaneous
+// requests could both observe an empty slot and both start a run. Reproduced here exactly as the
+// final review did: a real `Promise.all` of two concurrent generate requests on the SAME chat.
+test('two concurrent generate requests for the same chat: exactly one starts a run, the other is refused with generation_in_flight', async () => {
+  const { app, runs, cleanup } = harness()
+  try {
+    const chatId = await newChat(app)
+    const [a, b] = await Promise.all([
+      app.request(`/api/ext/v1/chats/${chatId}/messages/generate`, post(ACME, { role: 'user', content: 'one', owner: 'u1' })),
+      app.request(`/api/ext/v1/chats/${chatId}/messages/generate`, post(ACME, { role: 'user', content: 'two', owner: 'u1' })),
+    ])
+    const statuses = [a.status, b.status].sort()
+    assert.deepEqual(statuses, [202, 409], 'exactly one concurrent request must be admitted, the other refused')
+
+    const refused = a.status === 409 ? a : b
+    assert.equal((await refused.json() as { error: { code: string } }).error.code, 'generation_in_flight')
+    const admitted = a.status === 202 ? a : b
+    const run = await admitted.json() as { id: string }
+    assert.ok(run.id, 'the admitted request must have actually started a real run')
+    await runs.settled(run.id)
+
+    // Exactly ONE user+assistant pair persisted — the loser never raced past the reservation
+    // into persistence.
+    const list = await (await app.request(`/api/ext/v1/chats/${chatId}/messages?owner=u1`,
+      { headers: { Authorization: ACME } })).json() as { data: unknown[] }
+    assert.equal(list.data.length, 2, 'exactly one user+assistant pair, not two')
+  } finally {
+    cleanup()
+  }
+})
+
+test('a context-overflow refusal releases the inflight reservation — a normal follow-up request is not blocked', async () => {
+  const smallWindow = () => ({ state: 'running', model: 'test-model', contextSize: 1000 })
+  const { app, runs, cleanup } = harness(undefined, undefined, smallWindow)
+  try {
+    const chatId = await newChat(app)
+    const overflow = await app.request(`/api/ext/v1/chats/${chatId}/messages`,
+      post(ACME, { role: 'user', content: 'x'.repeat(4000), owner: 'u1' }))
+    assert.equal(overflow.status, 409)
+
+    const ok = await app.request(`/api/ext/v1/chats/${chatId}/messages`,
+      post(ACME, { role: 'user', content: 'short', owner: 'u1' }))
+    assert.equal(ok.status, 202, 'a context-overflow refusal must not permanently block the chat')
+    const run = await ok.json() as { id: string }
+    await runs.settled(run.id)
   } finally {
     cleanup()
   }

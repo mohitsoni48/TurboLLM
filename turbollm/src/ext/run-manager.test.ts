@@ -109,6 +109,24 @@ test('runs are listed per tenant and never leak across tenants', async () => {
   assert.equal(runs.list('globex').length, 1)
 })
 
+// C1 (final-gate fix round): tenant scoping alone let one owner enumerate every other owner's
+// runs within the SAME tenant — a real cross-owner data leak, since one tenant's API key is
+// shared across an integrator's many end users (spec 27 §3.1). `list()` now takes an optional
+// `owner` and must filter by it whenever supplied, on top of the pre-existing tenant filter.
+test('runs are listed per owner within a tenant, and never leak across owners', async () => {
+  const runs = new PublicRunManager()
+  const mine = runs.start({ scope: { tenant: 'acme', owner: 'u1' }, chatId: 'c1', messageId: 'm1', body: fakeBody(1) })
+  const theirs = runs.start({ scope: { tenant: 'acme', owner: 'u2' }, chatId: 'c2', messageId: 'm2', body: fakeBody(1) })
+  await runs.settled(mine.id)
+  await runs.settled(theirs.id)
+
+  assert.deepEqual(runs.list('acme', 'u1').map((r) => r.id), [mine.id], 'owner u1 must see only its own run')
+  assert.deepEqual(runs.list('acme', 'u2').map((r) => r.id), [theirs.id], 'owner u2 must see only its own run')
+  // Omitting `owner` entirely is still supported (e.g. an internal/admin caller) and returns
+  // the whole tenant, matching the pre-existing tenant-only behavior above.
+  assert.equal(runs.list('acme').length, 2, 'omitting owner falls back to whole-tenant listing')
+})
+
 test('an orphaned run with no subscriber and no poll is reaped', async () => {
   const runs = new PublicRunManager({ orphanTimeoutMs: 20 })
   let release: () => void

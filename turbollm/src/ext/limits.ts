@@ -19,6 +19,15 @@ export const DEFAULT_MAX_IN_FLIGHT_PER_TENANT = 4
  *  one tenant can generate. */
 export const DEFAULT_REQUESTS_PER_MINUTE_PER_TENANT = 120
 
+// ── Message body / attachment caps (spec 27 §4.1) ──────────────────────────────────────────
+// Single source of truth for the numbers `GET /capabilities` (routes.chats.ts) advertises AND
+// what every message-creation path (routes.chats.ts's `POST /chats/:id/messages`, routes.runs.ts's
+// `POST /chats/:id/messages/generate`) actually enforces with a `413 payload_too_large`. Defined
+// here — a file both route modules already import — rather than in either route file itself, so
+// neither can drift from what `GET /capabilities` reports without the other noticing.
+export const MAX_BODY_BYTES = 1_048_576
+export const MAX_ATTACHMENTS = 4
+
 export class TenantLimiter {
   private buckets = new Map<string, Bucket>()
 

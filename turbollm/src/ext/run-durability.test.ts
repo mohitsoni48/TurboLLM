@@ -71,6 +71,26 @@ test('listing runs is tenant-scoped and survives a restart', async () => {
   }
 })
 
+test('listing runs is owner-scoped even when reading back from the persisted DB rows', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'turbollm-run-list-owner-'))
+  const db = new ConversationStore(dir)
+  try {
+    const runs = new PublicRunManager({ db })
+    const mine = runs.start({ scope: { tenant: 'acme', owner: 'u1' }, chatId: 'c1', messageId: 'm1', body: async () => ({ status: 'complete' }) })
+    const theirs = runs.start({ scope: { tenant: 'acme', owner: 'u2' }, chatId: 'c2', messageId: 'm2', body: async () => ({ status: 'complete' }) })
+    await runs.settled(mine.id)
+    await runs.settled(theirs.id)
+
+    // A fresh manager over the same DB (i.e. the daemon restarted) — the in-memory map is empty,
+    // so this exercises the `db.listExtRuns` fallback path specifically, not the in-memory filter.
+    const rebuilt = new PublicRunManager({ db })
+    assert.deepEqual(rebuilt.list('acme', 'u1').map((r) => r.id), [mine.id], 'owner u1 must not see owner u2\'s persisted run')
+    assert.deepEqual(rebuilt.list('acme', 'u2').map((r) => r.id), [theirs.id])
+  } finally {
+    db.close(); rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('with no db the manager still works, purely in memory', async () => {
   const runs = new PublicRunManager()
   const run = runs.start({ scope: SCOPE, chatId: 'c1', messageId: 'm1', body: async () => ({ status: 'complete' }) })
