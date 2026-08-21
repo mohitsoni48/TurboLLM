@@ -11,6 +11,7 @@ import { engineModelAlias } from '../engines/compat'
 import { presentedKey } from '../auth'
 import { noteLocalActivity } from '../link/host-idle'
 import { linkHeaders, proxyStream } from '../link/link-proxy'
+import { formatRemoteId } from '../link/model-id'
 import { sessionAuth } from '../code/session-auth'
 import { classifyHarness } from '../telemetry/classify'
 import { mapToOpenAI, mapFromOpenAI, streamToAnthropic, messageStartEvent, pingWhilePending, DEFAULT_PING_INTERVAL_MS, type AnthropicRequest, type StreamToolCall } from './anthropic'
@@ -624,10 +625,32 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   // it while auto-swap is off would let the user pick a model that silently never loads.
   if (c.req.method === 'GET' && pathname === '/v1/models') {
     const autoSwap = d.store.snapshot().gateway.autoSwap
-    const data = d.scanner.list().models.flatMap((m) => [
+    const data: Array<Record<string, unknown>> = d.scanner.list().models.flatMap((m) => [
       { id: m.key, object: 'model', owned_by: 'turbollm' },
       ...(autoSwap ? [{ id: `claude-${m.key}`, object: 'model', display_name: `${m.name} — TurboLLM` }] : []),
     ])
+    // Turbo Link (ADR-376 §1 decision 7): every model on every ONLINE linked host, under
+    // its qualified `<machine>/<model>` id — the exact id ModelRouter.resolveRemote routes
+    // on. Local ids above are untouched and stay bare; the qualifier is the only signal
+    // that a request is remote, so there is no migration and nothing is renamed.
+    //
+    // `RemoteCatalog.models()` is what makes "an offline link contributes nothing" true:
+    // it re-reads each link's LIVE status on every call, so a machine that dropped stops
+    // being advertised immediately rather than at the next poll. A listed-but-unusable
+    // model is worse than an absent one — the user picks it and every prompt 503s.
+    //
+    // Deliberately NOT gated on `autoSwap`: that gate exists because picking a local model
+    // from a harness's picker always costs a local swap. A remote model costs none — it
+    // runs on the other machine — so the user's local auto-swap preference has no bearing
+    // on whether it can be offered.
+    for (const row of d.remoteCatalog?.models() ?? []) {
+      data.push({
+        id: formatRemoteId(row.machine, row.model.key),
+        object: 'model',
+        owned_by: 'turbollm-link',
+        display_name: `${row.model.name} — ${row.machine}`,
+      })
+    }
     return c.json({ object: 'list', data })
   }
 

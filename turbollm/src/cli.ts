@@ -367,7 +367,7 @@ const startedAt = Date.now()
 // this cache offline-first; the startup check below warms it so the chip is ready.
 const appUpdates = new AppUpdateChecker(version)
 // `requestRestart` is attached after the server is created (it must close over it).
-const deps: Deps = { store, registry, manager, scanner, hashes, db, provision, build, updates, appUpdates, hf, downloads, bench, modelRouter, comfy, tools: toolRegistry, version, startedAt }
+const deps: Deps = { store, registry, manager, scanner, hashes, db, provision, build, updates, appUpdates, hf, downloads, bench, modelRouter, comfy, remoteCatalog, tools: toolRegistry, version, startedAt }
 // Sized to the RUNNING engine's own slot count, re-read on every admission (a model swap changes
 // it). `Infinity` when the engine advertises no `--parallel` — see Manager.parallelSlots() for why
 // that is not 1.

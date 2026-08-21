@@ -20,6 +20,7 @@ import type { AgentTaskState } from './agents/task-state'
 import type { Emitter } from './telemetry/emit'
 import type { CodeRunManager } from './code/code-run-manager'
 import type { LinkManager } from './link/link-manager'
+import type { RemoteCatalog } from './link/remote-catalog'
 
 export interface Deps {
   store: ConfigStore
@@ -87,4 +88,11 @@ export interface Deps {
   /** Turbo Link peer-side poll loop (ADR-376). Optional — absent under tests; only
    *  wired in the real serve() entrypoint, same convention as tunnel/gate/comfy. */
   links?: LinkManager
+  /** The peer's cache of what each ONLINE linked host currently has (ADR-376). The SAME
+   *  instance `ModelRouter` routes on, so `GET /v1/models` can only ever advertise ids the
+   *  router can actually resolve — a second, independently-refreshed catalog would let the
+   *  two disagree, which is precisely how a model gets listed and then 503s.
+   *  Optional — absent under tests and in any embedding without Turbo Link, in which case
+   *  `/v1/models` is exactly the pre-Turbo-Link local list. */
+  remoteCatalog?: RemoteCatalog
 }
