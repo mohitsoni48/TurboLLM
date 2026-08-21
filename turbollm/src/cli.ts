@@ -43,6 +43,7 @@ import { reapStaleTerminals, killTrackedTerminalsSync } from './terminal/termina
 import { provisionTunnelApiKey } from './auth'
 import { TunnelManager, reapStaleTunnels, killTrackedTunnelsSync } from './tunnel/manager'
 import { LinkManager } from './link/link-manager'
+import { RemoteCatalog } from './link/remote-catalog'
 import type { Deps } from './deps'
 import { TELEMETRY_ENV } from './telemetry/disabled'
 import { Emitter } from './telemetry/emit'
@@ -326,7 +327,14 @@ const bench = new BenchRunner(manager, store, scanner, registry, version, hf)
 const comfy = new ComfyGuard(store, manager)
 // Gateway intelligence (v0.6.0): auto model-swap router. Resolves the `model`
 // field in /v1/* requests and loads the matching model if not already running.
-const modelRouter = new ModelRouter(store, registry, manager, scanner, comfy)
+// Turbo Link (ADR-376): the peer's cache of what each linked host currently has. Handed to
+// the router as its 6th argument — WITHOUT it, `ModelRouter.resolveRemote` short-circuits and
+// a qualified `<machine>/<model>` id silently falls through to local resolution, i.e. answers
+// with the wrong weights instead of failing loudly. It is the proxy in gateway.ts that makes
+// switching it on safe. The link source is read LAZILY: `deps.links` is constructed further
+// down (it needs the assembled Deps), and the catalog is only ever consulted at request time.
+const remoteCatalog = new RemoteCatalog({ list: () => deps.links?.list() ?? [] })
+const modelRouter = new ModelRouter(store, registry, manager, scanner, comfy, remoteCatalog)
 // Tool registry (v0.7.0): built-in tools + MCP host. Syncs MCP servers from config.
 // Routine tools (Phase 4): `db` structurally satisfies RoutineToolsStore (createRoutine/
 // getRoutine/listRoutines/updateRoutine/deleteRoutine/listRoutineRuns all exist on
@@ -556,7 +564,9 @@ routineScheduler.start()
 // after listen(); nothing here binds a port or touches the network beyond the outbound
 // hello probes that start() immediately kicks off (LinkClient is timeout-bounded and
 // never throws, so a bad/unreachable link cannot block startup).
-deps.links = new LinkManager(deps)
+// The catalog rides the SAME poll tick: one loop, one set of outbound calls, and the models
+// are refreshed only after each link's status has been updated by that tick's probe.
+deps.links = new LinkManager(deps, { catalog: remoteCatalog })
 deps.links.start()
 
 // Safety-net watchdog for the interactive (ask/plan) claude_cli routine path

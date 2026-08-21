@@ -40,10 +40,18 @@ export class LinkManager {
   private readonly heartbeats = new Map<string, string>()
   private readonly intervalMs: number
   private readonly fetchImpl: typeof fetch | undefined
+  /** The peer's remote-model cache, refreshed on the back of this same poll loop (ADR-376).
+   *  Structural, not a `RemoteCatalog` import, so this class keeps no dependency on routing.
+   *  Optional: every pre-Turbo-Link construction site (and every test) works without one. */
+  private readonly catalog: { refresh(): Promise<void> } | undefined
 
-  constructor(private readonly d: Deps, opts?: { intervalMs?: number; fetchImpl?: typeof fetch }) {
+  constructor(
+    private readonly d: Deps,
+    opts?: { intervalMs?: number; fetchImpl?: typeof fetch; catalog?: { refresh(): Promise<void> } },
+  ) {
     this.intervalMs = opts?.intervalMs ?? DEFAULT_INTERVAL_MS
     this.fetchImpl = opts?.fetchImpl
+    this.catalog = opts?.catalog
   }
 
   list(): LinkRecord[] {
@@ -69,6 +77,11 @@ export class LinkManager {
   /** Probe every link concurrently. Resolves once all have settled; never rejects. */
   async probeAll(): Promise<void> {
     await Promise.allSettled(this.list().map((l) => this.probeOnce(l.id)))
+    // AFTER the probes, never before: the catalog drops the models of anything not `online`,
+    // so refreshing on stale statuses is what would leave an offline machine's model looking
+    // available. `RemoteCatalog.refresh` never rejects by contract; the guard is here anyway
+    // because probeAll's own "never rejects" promise is what the poll timer relies on.
+    await this.catalog?.refresh().catch(() => {})
   }
 
   /** Freshest known contact time for a link — the persisted value, or a newer in-memory

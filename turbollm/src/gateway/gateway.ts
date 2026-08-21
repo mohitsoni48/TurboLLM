@@ -10,6 +10,7 @@ import { clampMaxTokens } from '../config/config'
 import { engineModelAlias } from '../engines/compat'
 import { presentedKey } from '../auth'
 import { noteLocalActivity } from '../link/host-idle'
+import { linkHeaders, proxyStream } from '../link/link-proxy'
 import { sessionAuth } from '../code/session-auth'
 import { classifyHarness } from '../telemetry/classify'
 import { mapToOpenAI, mapFromOpenAI, streamToAnthropic, messageStartEvent, pingWhilePending, DEFAULT_PING_INTERVAL_MS, type AnthropicRequest, type StreamToolCall } from './anthropic'
@@ -230,9 +231,18 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
       )
     }
     const target = routeResult.target
+    /** Turbo Link (ADR-376): set only when the caller asked for `<machine>/<model>` and the
+     *  router resolved it to an online linked host. Everything below stays structurally
+     *  identical — only the URL, the headers and the outbound model id differ. */
+    const remote = routeResult.remote
 
     const status = d.manager.status()
-    const modelName = status.state === 'running' ? (status.model?.name ?? req.model ?? 'local') : (req.model ?? 'local')
+    // A remote answer must be labelled with the model the CALLER asked for. The local
+    // manager's loaded model is a different model on a different machine, and reporting it
+    // here would name the wrong weights in the response.
+    const modelName = remote
+      ? (req.model ?? 'remote')
+      : status.state === 'running' ? (status.model?.name ?? req.model ?? 'local') : (req.model ?? 'local')
 
     // ── Agent behaviour scaffolding for external coding CLIs (see agent-guidance.ts) ──────
     // Loop detection/breaking, search-on-repeated-failure, and version+docs-before-a-dependency
@@ -272,8 +282,16 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
     // instead requires the real currently-loaded model path in the field. Either way,
     // rewrite the outbound field (routing above already used the original id). No-op
     // for llama.cpp and its forks, which ignore the field entirely.
-    const oaiAlias = engineModelAlias(d.registry.active()?.kind ?? '', d.manager.currentOpts()?.modelPath)
-    if (oaiAlias) (oaiBody as Record<string, unknown>).model = oaiAlias
+    // A remote request is aliased by the HOST's engine, not this one: the host runs the same
+    // gatewayV1Handler behind its façade and applies its own engineModelAlias there. What it
+    // needs from us is the unqualified key it advertised — `<machine>/` prefixed, it would name
+    // no machine the host knows and silently fall back to whatever the host has loaded.
+    if (remote) {
+      (oaiBody as Record<string, unknown>).model = remote.modelKey
+    } else {
+      const oaiAlias = engineModelAlias(d.registry.active()?.kind ?? '', d.manager.currentOpts()?.modelPath)
+      if (oaiAlias) (oaiBody as Record<string, unknown>).model = oaiAlias
+    }
 
     // ── Concurrency: never exceed the engine's own slot count ─────────────────
     // Claude Code fans out background subagents, each of which is a full, independent request to
@@ -296,6 +314,26 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
     // upstream request is aborted instead of running to completion and queuing behind
     // the engine's slots forever.
     const ac = clientAbort(c)
+
+    /** The single outbound call both branches below make — local engine or Turbo Link host.
+     *  Defined once so the streaming and non-streaming paths cannot drift on which URL,
+     *  which credential, or which abort signal a remote request uses. `ac.signal` is the
+     *  same client-abort chain the local path already used, so invariant 6 (a client
+     *  disconnect must reach the generator) holds identically across the link. */
+    const callUpstream = (): Promise<Response> => {
+      const body = JSON.stringify(oaiBody)
+      if (remote) {
+        const headers = linkHeaders(remote, c.req.raw.headers)
+        headers.set('content-type', 'application/json') // re-serialised body; never inherited
+        return proxyStream(remote, '/v1/chat/completions', { method: 'POST', headers, body }, ac.signal)
+      }
+      return fetch(`${target}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+        signal: ac.signal,
+      })
+    }
 
     if (req.stream) {
       // ── ADR-347: the gate wait above and the fetch() below are exactly as silent to the
@@ -364,12 +402,7 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
             let res: Response
             try {
               res = await pingWhilePending(
-                fetch(`${target}/v1/chat/completions`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify(oaiBody),
-                  signal: ac.signal,
-                }),
+                callUpstream(),
                 ping,
                 pingIntervalMs,
                 // No onOrphan: an orphaned Response has nothing to release — its body is simply
@@ -468,12 +501,7 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
     const requestStart = Date.now()
     let res: Response
     try {
-      res = await fetch(`${target}/v1/chat/completions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(oaiBody),
-        signal: ac.signal,
-      })
+      res = await callUpstream()
     } catch (e) {
       d.manager.generationEnd()
       gateRelease?.()
@@ -654,10 +682,19 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
     )
   }
   const target = routeResult.target
+  /** Turbo Link (ADR-376) — see the identical binding in the /v1/messages handler above. */
+  const remote = routeResult.remote
 
-  const upstream = target + pathname + url.search
-  const headers = new Headers(c.req.raw.headers)
-  headers.delete('host')
+  // Local: the caller's whole header set, minus `host`. Remote: an ALLOWLIST (invariant 7).
+  // The peer's clients authenticate to THIS machine; their credential is meaningless on the
+  // host and forwarding it would hand another box a secret it was never issued. The link
+  // token replaces it, and is added nowhere else.
+  const remotePath = pathname + url.search
+  // Local branch only — the remote branch derives the façade URL inside proxyStream, so there
+  // is exactly one place that knows how a link URL is spelled.
+  const upstream = target + remotePath
+  const headers = remote ? linkHeaders(remote, c.req.raw.headers) : new Headers(c.req.raw.headers)
+  if (!remote) headers.delete('host')
 
   const maxLimit = d.store.snapshot().modelDefaults.maxTokens ?? 0
   // Cancel the upstream engine request if the client disconnects (same reason as
@@ -675,7 +712,12 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       // Rewrite the outbound model id for engines that serve under a fixed alias
       // (mlx-lm / vLLM) or that require the real loaded model path (mlx-vlm).
       // Routing above already used the caller's original id.
-      if (parsedBody) {
+      // Turbo Link: the HOST aliases for its own engine behind its façade (it runs this very
+      // function). What it needs is the unqualified key it advertised — the `<machine>/`
+      // prefix names no machine there and would silently route to whatever it has loaded.
+      if (parsedBody && remote) {
+        parsedBody.model = remote.modelKey
+      } else if (parsedBody) {
         const alias = engineModelAlias(d.registry.active()?.kind ?? '', d.manager.currentOpts()?.modelPath)
         if (alias) parsedBody.model = alias
       }
@@ -758,7 +800,12 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   const requestStart = Date.now()
   let res: Response
   try {
-    res = await fetch(upstream, init)
+    // proxyStream for the remote branch, not a bare fetch: it re-derives the façade URL from
+    // the same helper the tests pin, and refuses to wake a host for a client that has already
+    // gone away. `init.signal` is ac.signal, the client-abort chain (invariant 6).
+    res = remote
+      ? await proxyStream(remote, remotePath, init, ac.signal)
+      : await fetch(upstream, init)
   } catch (e) {
     chatGateRelease?.()
     const err = e as Error & { cause?: unknown }
