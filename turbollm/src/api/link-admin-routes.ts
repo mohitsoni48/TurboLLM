@@ -11,6 +11,7 @@ import { decodeLinkString, encodeLinkString } from '../link/link-string'
 import { LINK_CAPABILITIES, redactDownload, redactLink, type LinkCapability, type LinkRecord } from '../link/types'
 import { describeStatus, type LinkProbe } from '../link/link-state'
 import { LINK_PRESETS } from '../link/capabilities'
+import { scrubRemoteConfig } from '../link/config-scope'
 import { emit } from '../telemetry/runtime/typed-emit'
 import { linkMinted, linkAdded, LINK_ADDED_OUTCOMES } from '../telemetry/events/link'
 
@@ -470,6 +471,63 @@ export function registerLinkAdminRoutes(
     return out.kind === 'accepted' ? c.json({ ok: true }) : remoteFailure(c, rec, out)
   })
 
+  /** The host's peer-visible settings (spec §5.8, `config:read`).
+   *
+   *  Sixth route of the same shape as its five neighbours above and gated the same way —
+   *  it exists because `config:read`/`config:write` were the one pair of capabilities the
+   *  mint UI could grant with NOTHING in the product able to exercise them: the host façade
+   *  and `LinkClient.config()`/`writeConfig()` shipped, the peer hop did not. A grant the
+   *  user was told they were giving and cannot use is worse than one that was never
+   *  offered.
+   *
+   *  The body is projected AGAIN on this side, through the same allowlist the host used
+   *  (`scrubRemoteConfig`). Identical reasoning to the second `redactDownload` on
+   *  `GET :id/downloads`: the host is a separate install on a separate release cadence, and
+   *  this is precisely where a fifth host-filesystem leak would arrive. */
+  app.get('/api/v1/links/:id/config', async (c) => {
+    const denied = gate(c, VIEW)
+    if (denied) return denied
+    const rec = current(c.req.param('id'))
+    if (!rec) return noSuchLink(c)
+    const out = await new LinkClient(rec, { fetchImpl }).config()
+    if (out.kind !== 'config') return remoteFailure(c, rec, out)
+    return c.json({ config: scrubRemoteConfig(out.config) })
+  })
+
+  /** Write a scoped setting on the host (`config:write`). Body: `{ patch: { '<dotted.path>':
+   *  value } }`, exactly the façade's own shape.
+   *
+   *  The host owns the allowlist and the bounds — a second copy of `WRITABLE_CONFIG_PATHS`
+   *  on this side would be the drift-prone half of a pair, and the host must refuse an
+   *  out-of-scope path anyway. So this checks only that a patch is a non-empty object, and
+   *  a rejected path comes back as the host's own 403 through `remoteFailure`.
+   *
+   *  200, not 202: unlike load/unload the write is DONE when the host answers. Nothing of
+   *  the host's echo is returned — the peer asks `GET :id/config` for the new values, which
+   *  keeps one projection on the read path rather than two. */
+  app.patch('/api/v1/links/:id/config', async (c) => {
+    const denied = gate(c, MANAGE)
+    if (denied) return denied
+    const rec = current(c.req.param('id'))
+    if (!rec) return noSuchLink(c)
+    const body = await c.req.json().catch(() => ({})) as { patch?: unknown }
+    const patch = body.patch
+    if (typeof patch !== 'object' || patch === null || Array.isArray(patch)
+      || Object.keys(patch).length === 0) {
+      return c.json(
+        {
+          error: {
+            code: 'invalid_input',
+            message: "Body must be { patch: { '<config.path>': value } }.",
+          },
+        },
+        400,
+      )
+    }
+    const out = await new LinkClient(rec, { fetchImpl }).writeConfig(patch as Record<string, unknown>)
+    return out.kind === 'accepted' ? c.json({ ok: true }) : remoteFailure(c, rec, out)
+  })
+
   app.delete('/api/v1/links/:id', (c) => {
     const denied = gate(c, MANAGE)
     if (denied) return denied
@@ -512,6 +570,12 @@ function noSuchLink(c: Context): Response {
 const RELAYED: Record<number, 400 | 403 | 404 | 409 | 429 | 503 | undefined> = {
   400: 400, 403: 403, 404: 404, 409: 409, 429: 429, 503: 503,
 }
+
+/** The codes a host 401 may carry that really do mean "your token is no longer honoured".
+ *  `unauthorized` is what `linkAuth` emits; the other two are spellings an older or
+ *  differently-worded build could use for the same fact. Anything else on a 401 is some
+ *  OTHER credential the host is missing (`hf_unauthorized`), not this link's. */
+const AUTH_CODES: ReadonlySet<string> = new Set(['unauthorized', 'revoked', 'invalid_token'])
 
 /** Fallback code when the host named none. Never a stand-in for a code it DID name. */
 const DEFAULT_CODE: Record<number, string | undefined> = {
@@ -559,10 +623,26 @@ function remoteFailure(c: Context, rec: LinkRecord, probe: LinkProbe): Response 
   }
   // 401 is the one status NOT relayed as itself: a 401 from the host would read in the
   // browser as "you need to sign in to THIS daemon", which is the opposite of what
-  // happened. It is the host revoking this machine's token — the same fact `nextStatus`
-  // latches as `revoked` — and the remedy is a new link string.
+  // happened.
+  //
+  // But "401" and "the host revoked this machine" are NOT the same fact, and this route
+  // used to equate them. `linkAuth` answers 401 `unauthorized` for a token the host no
+  // longer honours — that IS revocation — while `downloadErrorStatus` maps `hf_unauthorized`
+  // to 401 as well, i.e. "the HOST has no Hugging Face credential for that gated repo".
+  // Told the second was the first, the user re-mints a token that was never the problem,
+  // re-links, and hits exactly the same wall. So revocation is claimed only when the host
+  // named no code at all, or named an auth one; a host that named something else keeps its
+  // own code and the peer says only that the host refused.
   if (probe.status === 401) {
-    return c.json({ error: { code: 'revoked', message: describeStatus('revoked', rec.name) } }, 403)
+    if (probe.code === undefined || AUTH_CODES.has(probe.code)) {
+      return c.json({ error: { code: 'revoked', message: describeStatus('revoked', rec.name) } }, 403)
+    }
+    // 403 rather than a relayed 401, for the reason above: this is the host refusing, not
+    // this daemon demanding a credential. The CODE is what the UI switches on.
+    return c.json(
+      { error: { code: probe.code, message: `${rec.name} refused this request.` } },
+      403,
+    )
   }
   const status = RELAYED[probe.status] ?? 502
   const code = probe.code ?? DEFAULT_CODE[status] ?? 'unavailable'

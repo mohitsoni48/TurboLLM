@@ -131,6 +131,36 @@ export function describeRemoteFailure(err: unknown, machine: string): RemoteFail
         message: `${machine} could not do that in its current state. Check what it is doing, then try again.`,
       }
 
+    // ── The download the host was asked to start ─────────────────────────────────
+    // These three used to fall through to the default's "try again" — which cannot help
+    // with any of them, and for `hf_unauthorized` the peer proxy used to relabel the whole
+    // thing as "your link was revoked". Each names the machine that has to be fixed, which
+    // is the host, not this one.
+    case 'hf_unauthorized':
+      return {
+        code,
+        retryable: false,
+        message: `${machine} has no Hugging Face token for that repository. Add one in Settings on ${machine} — this link is fine.`,
+      }
+    case 'hf_gated':
+      return {
+        code,
+        retryable: false,
+        message: `That repository is gated, and the Hugging Face account on ${machine} has not been granted access to it. Accept its terms with that account, then try again.`,
+      }
+    case 'no_model_dir':
+      return {
+        code,
+        retryable: false,
+        message: `${machine} has no model folder to download into. Add one in Settings on ${machine}.`,
+      }
+    case 'no_such_download':
+      return {
+        code,
+        retryable: false,
+        message: `${machine} no longer has that download. It may have finished or been removed there.`,
+      }
+
     // ── This machine's own view is stale ─────────────────────────────────────────
     case 'not_found':
       // Deliberately NOT the same as `remote_not_found`: this one means THIS machine has no

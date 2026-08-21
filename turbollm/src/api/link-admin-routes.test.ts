@@ -783,8 +783,19 @@ const OK_HOST = hostResponder((url, init) => {
   }
   if (url.endsWith('/api/link/v1/downloads')) return jsonRes({ downloads: [DOWNLOAD_ROW] }, 202)
   if (url.includes('/api/link/v1/downloads/')) return jsonRes({ ok: true })
+  if (url.endsWith('/api/link/v1/config') && (init?.method ?? 'GET') === 'GET') {
+    return jsonRes({ config: HOST_CONFIG })
+  }
+  if (url.endsWith('/api/link/v1/config')) return jsonRes({ ok: true, applied: ['modelDefaults.ctx'] })
   return jsonRes({ error: { code: 'not_found' } }, 404)
 })
+
+/** What a host's `config:read` projection looks like on the wire. */
+const HOST_CONFIG = {
+  modelDefaults: { ctx: 8192, ngl: 99 },
+  gateway: { autoSwap: true, keepN: 2 },
+  daemon: { theme: 'dark', autoGenerateTitles: true },
+}
 
 const POST = (body?: unknown) => ({
   method: 'POST',
@@ -859,6 +870,101 @@ test('DELETE /api/v1/links/:id/downloads/:downloadId cancels it on the host', as
   assert.ok(seen.some((u) => u.endsWith('/api/link/v1/downloads/d1')))
 })
 
+// ── Remote config: the capability that could be granted and not used (final review I-2) ──
+//
+// `config:read`/`config:write` shipped host-side, `LinkClient.config()`/`writeConfig()`
+// shipped, and the mint UI's "Full control" preset granted both — with no peer-side hop
+// anywhere, so nothing could exercise them. Same shape of gap as the five routes above.
+
+const PATCH = (body?: unknown) => ({
+  method: 'PATCH',
+  ...(body === undefined ? {} : { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }),
+})
+
+test("GET /api/v1/links/:id/config returns the host's peer-visible settings", async () => {
+  const { app, id } = await mkLinked(OK_HOST)
+  const res = await app.request(`/api/v1/links/${id}/config`)
+  assert.equal(res.status, 200)
+  assert.deepEqual(await res.json(), { config: HOST_CONFIG })
+})
+
+test('GET /api/v1/links/:id/config drops anything the host had no business sending', async () => {
+  // The peer projects the host's answer a SECOND time, exactly as it re-`redactDownload`s a
+  // remote queue: an older or hostile host can put a model directory, an API key or an
+  // absolute path in that body, and this is the one route where a fifth host-filesystem
+  // leak in this feature would arrive.
+  const responder = hostResponder(() => jsonRes({
+    config: {
+      ...HOST_CONFIG,
+      modelDirs: ['D:\\models'],
+      primaryModelDir: 'D:\\models',
+      apiKeys: [{ id: 'k1', value: 'tllm-supersecret' }],
+      daemon: { theme: 'dark', autoGenerateTitles: true, authToken: 'tllm-authtoken', port: 6996 },
+    },
+  }))
+  const { app, id } = await mkLinked(responder)
+  const res = await app.request(`/api/v1/links/${id}/config`)
+  const text = await res.text()
+  assert.ok(!text.includes('D:'), text)
+  assert.ok(!text.includes('modelDirs'), text)
+  assert.ok(!text.includes('apiKeys'), text)
+  assert.ok(!text.includes('authToken'), text)
+  assert.ok(!text.includes('tllm-'), text)
+  assert.deepEqual(JSON.parse(text), { config: HOST_CONFIG })
+})
+
+test('PATCH /api/v1/links/:id/config forwards the patch to the façade unchanged', async () => {
+  const seen: { url: string; method?: string; body: unknown }[] = []
+  const responder = hostResponder((url, init) => {
+    seen.push({ url, method: init?.method, body: init?.body ? JSON.parse(String(init.body)) : null })
+    return jsonRes({ ok: true, applied: ['modelDefaults.ctx'] })
+  })
+  const { app, id } = await mkLinked(responder)
+  const res = await app.request(`/api/v1/links/${id}/config`, PATCH({ patch: { 'modelDefaults.ctx': 4096 } }))
+  assert.equal(res.status, 200)
+  assert.deepEqual(await res.json(), { ok: true })
+  const call = seen.find((s) => s.url.endsWith('/api/link/v1/config'))
+  assert.ok(call, 'the host façade must be the thing that was called')
+  assert.equal(call!.method, 'PATCH')
+  assert.deepEqual(call!.body, { patch: { 'modelDefaults.ctx': 4096 } })
+})
+
+test('PATCH /api/v1/links/:id/config refuses a body with no patch in it', async () => {
+  const { app, id } = await mkLinked(OK_HOST)
+  for (const body of [undefined, {}, { patch: {} }, { patch: [1] }, { patch: 'ctx' }]) {
+    const res = await app.request(`/api/v1/links/${id}/config`, PATCH(body))
+    assert.equal(res.status, 400, JSON.stringify(body))
+    assert.equal((await res.json() as { error: { code: string } }).error.code, 'invalid_input')
+  }
+})
+
+test('a host 403 on config surfaces as a 403 naming the capability, not as a generic failure', async () => {
+  for (const [route, init, cap] of [
+    ['config', undefined, 'config:read'],
+    ['config', PATCH({ patch: { 'modelDefaults.ctx': 1 } }), 'config:write'],
+  ] as const) {
+    const responder = hostResponder(() => jsonRes(
+      { error: { code: 'forbidden', capability: cap, message: `This link is not granted '${cap}'.` } },
+      403,
+    ))
+    const { app, id } = await mkLinked(responder)
+    const res = await app.request(`/api/v1/links/${id}/${route}`, init)
+    assert.equal(res.status, 403)
+    const body = await res.json() as { error: { code: string; capability?: string } }
+    assert.equal(body.error.code, 'forbidden')
+    assert.equal(body.error.capability, cap)
+  }
+})
+
+test('a host that answers config with junk is a typed failure, never an empty settings view', async () => {
+  // "We could not read this host's settings" must not render as "the host has no settings".
+  const responder = hostResponder(() => jsonRes({ config: 'nope' }))
+  const { app, id } = await mkLinked(responder)
+  const res = await app.request(`/api/v1/links/${id}/config`)
+  assert.equal(res.status, 503)
+  assert.equal((await res.json() as { error: { code: string } }).error.code, 'unavailable')
+})
+
 // ── The host's refusal must survive the hop, not flatten to a 500 ──────────────────────
 // The UI renders "you were not granted models:load" and "the host is busy right now" as
 // different states with different remedies. Collapsing both into a generic failure is the
@@ -909,6 +1015,8 @@ const FLEET_ROUTES: { label: string; path: (id: string) => string; init?: Reques
   { label: 'GET :id/downloads', path: (id) => `/api/v1/links/${id}/downloads` },
   { label: 'POST :id/downloads', path: (id) => `/api/v1/links/${id}/downloads`, init: POST({ repo: 'a/b', rfilename: 'x.gguf' }) },
   { label: 'DELETE :id/downloads/:downloadId', path: (id) => `/api/v1/links/${id}/downloads/d1`, init: { method: 'DELETE' } },
+  { label: 'GET :id/config', path: (id) => `/api/v1/links/${id}/config` },
+  { label: 'PATCH :id/config', path: (id) => `/api/v1/links/${id}/config`, init: PATCH({ patch: { 'modelDefaults.ctx': 4096 } }) },
 ]
 
 for (const route of FLEET_ROUTES) {
@@ -953,6 +1061,34 @@ for (const route of FLEET_ROUTES) {
     assert.ok(!text.includes('baseUrl'))
   })
 }
+
+// ── 401 is not one fact (final review I-3) ────────────────────────────────────────────
+
+test('a bare host 401 still reads as revocation', async () => {
+  const responder = hostResponder(() => jsonRes(
+    { error: { code: 'unauthorized', message: 'A valid Turbo Link token is required.' } }, 401,
+  ))
+  const { app, id } = await mkLinked(responder)
+  const res = await app.request(`/api/v1/links/${id}/unload`, POST())
+  assert.equal(res.status, 403)
+  assert.equal((await res.json() as { error: { code: string } }).error.code, 'revoked')
+})
+
+test("a host 401 that names hf_unauthorized is NOT reported as a revoked link", async () => {
+  // `downloadErrorStatus` maps `hf_unauthorized` → 401: the HOST has no Hugging Face
+  // credential for a gated repo. Told "your link was revoked", the user re-mints a token
+  // that was never the problem and hits the same wall — two facts, two different fixes.
+  const responder = hostResponder(() => jsonRes(
+    { error: { code: 'hf_unauthorized', message: 'This repo needs a Hugging Face token.' } }, 401,
+  ))
+  const { app, id } = await mkLinked(responder)
+  const res = await app.request(`/api/v1/links/${id}/downloads`,
+    POST({ repo: 'meta-llama/Llama-3', rfilename: 'q4.gguf' }))
+  const body = await res.json() as { error: { code: string; message: string } }
+  assert.equal(body.error.code, 'hf_unauthorized')
+  assert.notEqual(body.error.code, 'revoked')
+  assert.doesNotMatch(body.error.message, /revoke/i)
+})
 
 test('a remote download row carries no host path and no host-authored error text', async () => {
   // Fifth-of-its-kind guard: `launchCommand`, `engine.error`'s log tail, the download

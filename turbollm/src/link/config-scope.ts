@@ -263,9 +263,31 @@ function writePath(cfg: Record<string, unknown>, path: string, value: unknown): 
  *  echoed back — which is also what guarantees only bounded numbers, booleans and one of
  *  three theme words ever reach a peer. */
 export function scrubConfigForRead(cfg: Config): unknown {
+  return projectScopedConfig(cfg)
+}
+
+/** The SAME projection, applied to a config that arrived from somewhere else — i.e. a
+ *  host's answer to `GET /api/link/v1/config`, read by a peer.
+ *
+ *  Defence in depth, and the exact counterpart of `redactDownload` being applied a second
+ *  time on the peer side (link-admin-routes.ts): the host already projects, but the host is
+ *  a separate install on a separate release cadence, and an older — or hostile — one can
+ *  put anything at all in that body. `LinkClient.config()` deliberately does not re-derive
+ *  the shape (that would be a weaker second copy of the allowlist); this IS the allowlist,
+ *  so running the foreign object through it costs nothing and cannot drift.
+ *
+ *  Four host-filesystem leaks have been found in this feature. A config body is the one
+ *  place a fifth would arrive, so nothing a peer forwards to its own browser may be a field
+ *  this list does not name — `modelDirs`, `primaryModelDir`, `apiKeys` and friends cannot
+ *  survive it, because it builds forward rather than deleting. */
+export function scrubRemoteConfig(raw: unknown): Record<string, unknown> {
+  return projectScopedConfig(raw)
+}
+
+function projectScopedConfig(src: unknown): Record<string, unknown> {
   const out: Record<string, unknown> = {}
   for (const [path, valid] of Object.entries(WRITABLE_LEAVES)) {
-    const v = readPath(cfg, path)
+    const v = readPath(src, path)
     if (v === undefined || !valid(v)) continue
     writePath(out, path, v)
   }

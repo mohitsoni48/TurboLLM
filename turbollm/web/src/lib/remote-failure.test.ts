@@ -82,3 +82,41 @@ describe('describeRemoteFailure', () => {
     expect(f.message).not.toMatch(/undefined/)
   })
 })
+
+// ── Download-specific host codes (final review M-7 and I-3) ──────────────────────────────
+//
+// All three used to reach the `default` branch, which says "try again" — and retrying
+// cannot help with any of them. `hf_unauthorized` was worse than that: the peer proxy
+// relabelled the host's 401 as "your link was revoked", sending the user to re-mint a
+// token that was never the problem.
+describe('describeRemoteFailure — the host could not fetch that file', () => {
+  it('hf_unauthorized points at the HOST’s Hugging Face token, not at the link', () => {
+    const f = describeRemoteFailure(apiErr('hf_unauthorized', 403), 'workstation')
+    expect(f.message).toMatch(/Hugging Face/i)
+    expect(f.message).toMatch(/workstation/)
+    expect(f.message).not.toMatch(/revoke/i)
+    expect(f.message).not.toMatch(/paste a new link/i)
+    expect(f.retryable).toBe(false)
+  })
+
+  it('hf_gated says the repo is gated, and does not offer a retry', () => {
+    const f = describeRemoteFailure(apiErr('hf_gated', 403), 'workstation')
+    expect(f.message).toMatch(/gated/i)
+    expect(f.retryable).toBe(false)
+  })
+
+  it('no_model_dir names the setting to fix, on the machine that has to fix it', () => {
+    const f = describeRemoteFailure(apiErr('no_model_dir', 409), 'workstation')
+    expect(f.message).toMatch(/model folder/i)
+    expect(f.message).toMatch(/workstation/)
+    expect(f.retryable).toBe(false)
+  })
+
+  it('none of them falls through to the generic "try again"', () => {
+    for (const code of ['hf_unauthorized', 'hf_gated', 'no_model_dir', 'no_such_download']) {
+      const f = describeRemoteFailure(apiErr(code, 400), 'workstation')
+      expect(f.message, code).not.toMatch(/Something went wrong/i)
+      expect(f.retryable, code).toBe(false)
+    }
+  })
+})

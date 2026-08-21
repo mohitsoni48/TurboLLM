@@ -4,6 +4,7 @@ import {
   WRITABLE_CONFIG_PATHS,
   isWritablePath,
   scrubConfigForRead,
+  scrubRemoteConfig,
   applyScopedPatch,
 } from './config-scope'
 import { CONFIG_BOUNDS } from '../config/config-bounds'
@@ -358,5 +359,54 @@ test('a prototype-member name is rejected, never resolved against the allowlist'
     const r = applyScopedPatch(cfg, { [p]: 1 })
     assert.equal(r.ok, false, `${p} must be refused, not crash`)
     if (!r.ok) assert.deepEqual(r.rejected, [p])
+  }
+})
+
+// ── The same projection, applied to a FOREIGN config (final review I-2) ─────────────────
+//
+// The peer now has `GET /api/v1/links/:id/config`, so a host's config body reaches a
+// browser for the first time. `LinkClient` hands it back unvalidated by design (a second,
+// weaker copy of the allowlist would drift), so the peer runs it through THIS list — the
+// same defence-in-depth as `redactDownload` being applied on both sides of the wire.
+
+test('scrubRemoteConfig keeps only the allowlisted leaves of a host body', () => {
+  const out = scrubRemoteConfig({
+    modelDefaults: { ctx: 8192, ngl: 99, maxTokens: 512 },
+    gateway: { autoSwap: true, keepN: 2 },
+    daemon: { theme: 'dark', autoGenerateTitles: false },
+  })
+  assert.deepEqual(out, {
+    modelDefaults: { ctx: 8192, ngl: 99, maxTokens: 512 },
+    gateway: { autoSwap: true, keepN: 2 },
+    daemon: { theme: 'dark', autoGenerateTitles: false },
+  })
+})
+
+test('scrubRemoteConfig drops host paths, secrets and network settings a host should never have sent', () => {
+  // Built FORWARD from the allowlist, so this holds for fields nobody has thought of yet —
+  // which is the whole reason the read surface is a projection rather than a deletion list.
+  const out = scrubRemoteConfig({
+    modelDirs: ['D:\models', '/home/dev/models'],
+    primaryModelDir: 'D:\models',
+    apiKeys: [{ id: 'k', hash: 'h', value: 'tllm-secret' }],
+    links: [{ token: 'tllm-other' }],
+    telemetry: { enabled: true },
+    daemon: { authToken: 'tllm-auth', lanBind: true, port: 6996, requireApiKey: false, theme: 'light' },
+    engines: [{ binPath: '/usr/local/bin/llama-server' }],
+    modelDefaults: { ctx: 4096, ngl: 40 },
+  })
+  assert.deepEqual(out, {
+    modelDefaults: { ctx: 4096, ngl: 40 },
+    daemon: { theme: 'light' },
+  })
+  const text = JSON.stringify(out)
+  for (const forbidden of ['D:', '/home', 'tllm-', 'authToken', 'lanBind', 'binPath', 'apiKeys']) {
+    assert.ok(!text.includes(forbidden), `${forbidden} survived the projection: ${text}`)
+  }
+})
+
+test('scrubRemoteConfig is total: junk, nulls and hostile shapes yield an empty object', () => {
+  for (const junk of [null, undefined, 'nope', 42, [], { modelDefaults: 'nope' }, { modelDefaults: { ctx: 'huge' } }]) {
+    assert.deepEqual(scrubRemoteConfig(junk), {})
   }
 })
