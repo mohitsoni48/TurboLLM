@@ -63,7 +63,16 @@ export class LinkClient {
       if (!res.ok) return { kind: 'http', status: res.status }
       const ct = res.headers.get('content-type') ?? ''
       if (!ct.includes('application/json')) return { kind: 'network' }
-      return { kind: 'body', body: await res.json() }
+      const parsed: unknown = await res.json()
+      // `application/json` guarantees valid JSON, not a useful shape: `null`, an array,
+      // or a bare string/number all parse without throwing. A proxy, captive portal, or
+      // misconfigured host can hand back any of those on a 200. Guarding here — not just
+      // in hello() — means every future method on this class (models(), status(), …)
+      // inherits the same total "never throws, never adopts garbage" guarantee.
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+        return { kind: 'network' }
+      }
+      return { kind: 'body', body: parsed }
     } catch {
       // Covers DNS failure, connection refused, TLS error, timeout abort, and malformed
       // JSON alike. All of them are "we could not talk to it" — never "revoked".

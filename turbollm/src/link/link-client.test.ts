@@ -71,3 +71,31 @@ test('presents the token and never logs it', async () => {
   await c.hello()
   assert.equal(seen, 'tllm-x')
 })
+
+test('a 200 application/json body of literal null yields network, not a throw', async () => {
+  const c = new LinkClient(rec, {
+    fetchImpl: async () => new Response('null', { status: 200, headers: { 'content-type': 'application/json' } }),
+  })
+  assert.deepEqual(await c.hello(), { kind: 'network' })
+})
+
+test('a 200 application/json body that is an array yields network, not a throw', async () => {
+  const c = new LinkClient(rec, {
+    fetchImpl: async () => new Response('[]', { status: 200, headers: { 'content-type': 'application/json' } }),
+  })
+  assert.deepEqual(await c.hello(), { kind: 'network' })
+})
+
+test('a 200 application/json body that is a bare string yields network, not a throw', async () => {
+  const c = new LinkClient(rec, {
+    fetchImpl: async () => new Response('"hi"', { status: 200, headers: { 'content-type': 'application/json' } }),
+  })
+  assert.deepEqual(await c.hello(), { kind: 'network' })
+})
+
+test('a 200 application/json body that is a bare number yields network, not a throw', async () => {
+  const c = new LinkClient(rec, {
+    fetchImpl: async () => new Response('42', { status: 200, headers: { 'content-type': 'application/json' } }),
+  })
+  assert.deepEqual(await c.hello(), { kind: 'network' })
+})
