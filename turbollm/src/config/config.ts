@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto'
 import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
+import type { LinkGrant, LinkRecord } from '../link/types'
 
 export const SCHEMA_VERSION = 4
 
@@ -171,6 +172,10 @@ export interface ApiKey {
   prefix: string
   createdAt: string
   lastUsedAt: string | null
+  /** Turbo Link capability grant (ADR-376). ABSENT = a full-access key, which is what
+   *  every key created before Turbo Link is. Never default this to an empty grant —
+   *  that would silently revoke every existing key. */
+  grant?: LinkGrant
 }
 export interface LastLoaded {
   modelKey: string
@@ -396,6 +401,9 @@ export interface Config {
   daemon: Daemon
   telemetry: Telemetry
   apiKeys: ApiKey[]
+  /** Turbo Link: hosts THIS machine has linked out to (ADR-376). The inbound side is
+   *  represented by apiKeys with a `grant`, not here. */
+  links: LinkRecord[]
   engines: Engine[]
   /** Custom (non-catalog) engine identities, kept across Disable — see {@link CustomEngineSource}. */
   customEngineSources: CustomEngineSource[]
@@ -565,6 +573,7 @@ export function defaultConfig(): Config {
     },
     telemetry: { level: 'full', machineId: '' },
     apiKeys: [],
+    links: [],
     engines: [],
     customEngineSources: [],
     activeEngineId: '',
@@ -742,6 +751,7 @@ function normalize(c: Config): void {
   c.modelDefaults = { ...d.modelDefaults, ...(c.modelDefaults ?? {}) }
   c.lastLoaded = { ...d.lastLoaded, ...(c.lastLoaded ?? {}) }
   c.apiKeys ??= []
+  c.links ??= []
   c.engines ??= []
   c.customEngineSources ??= []
   c.modelDirs ??= []
