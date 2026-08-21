@@ -29,18 +29,27 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ### Fixed
 
-- **Auto-tune now fills both GPUs on a multi-GPU box instead of leaving one of them nearly
-  empty.** On a machine with two cards, a mixture-of-experts model that needed some CPU offload
-  ended up piling almost all of its weight onto a single card — measured on two 16 GB cards, one
-  held 1.7 GB while the other sat at 14.7 GB, one step from running out. Auto-tune could only see
-  the combined pool, which still looked half free, so it read the ceiling it kept hitting as the
-  pool's rather than one card's and kept moving *more* work to the CPU to get away from it. The
-  result was a tune that used barely half the VRAM you paid for and ran the model on the processor
-  instead. TurboLLM now works out what each card will hold separately and places layers by their
-  real size, so the search stops as soon as the model genuinely fits. On two Tesla T4s,
-  Qwen3.6-35B-A3B at Q8 went from 16.4 GB of a 30.7 GB pool to 27.6 GB, and chat from 4.3 to
-  **10.0 tok/s** — with both cards doing work instead of one idling. Single-GPU machines and dense
-  (non-MoE) models are unaffected, and a GPU split you set yourself is never overridden.
+- **Auto-tune is smarter about dual-GPU machines.** With two cards, a mixture-of-experts model
+  that needed some CPU offload used to pile nearly all its weight onto one of them — measured on
+  two 16 GB cards, one held 1.7 GB while the other sat at 14.7 GB, a step from running out.
+  Auto-tune could only see the two cards added together, which still looked half free, so it read
+  the ceiling it kept hitting as the pool's rather than one card's and kept moving *more* work to
+  the CPU to escape it. The tune ended up using barely half the VRAM you have and running the
+  model on your processor instead. TurboLLM now works out what each card will hold separately and
+  places layers by their real size, so the search stops as soon as the model genuinely fits. On
+  two Tesla T4s, Qwen3.6-35B-A3B at Q8 went from 16.4 GB of a 30.7 GB pool to 27.6 GB, and chat
+  from 4.3 to **10.0 tok/s**, with both cards working instead of one idling. Single-GPU machines
+  and dense (non-MoE) models are unaffected, and a GPU split you set yourself is never overridden.
+
+### Added
+
+- **A Kaggle notebook for reproducing multi-GPU behaviour on real hardware** (`deploy/kaggle/`).
+  Kaggle hands out two Tesla T4s free, which makes it a genuine dual-GPU box for anyone without
+  one to test on. The notebook brings up TurboLLM there with a prebuilt CUDA engine, and
+  `bench_vs_chat.py` runs auto-tune and then measures real chat throughput at the same context
+  depth the tuner used — reporting the engine and the daemon separately so a difference can be
+  attributed rather than merely observed. This is research tooling, not part of the app; the
+  dual-GPU fix above came out of it.
 
 ## [1.11.2] - 2026-08-20
 

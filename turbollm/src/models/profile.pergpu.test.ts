@@ -18,8 +18,8 @@ function model(over: Partial<ModelEntry> = {}): ModelEntry {
     key: 'm|q4|1', name: 'm', path: '/models/m.gguf', dir: '/models', format: 'gguf',
     sizeBytes: 8_000_000_000, sizeLabel: '8 GB', arch: 'qwen3moe', quant: 'Q4_K_M',
     nativeCtx: 32768, blockCount: 40, headCountKv: 8, headDim: 0, moe: true, expertCount: 128,
-    nextnLayers: 0, vision: false, audio: false, mmprojPath: null, mmprojSizeBytes: 0,
-    hasChatTemplate: true, embedding: false, incomplete: false, parseError: null, loaded: false,
+    nextnLayers: 0, vision: false, audio: false, mmprojPath: null, mmprojSizeBytes: 0, hasChatTemplate: true, reasoningEffort: false, embedding: false,
+    incomplete: false, parseError: null, loaded: false, hasProfile: false,
     benchTps: null, mtime: '', ...over,
   }
 }

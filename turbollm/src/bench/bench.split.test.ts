@@ -29,8 +29,8 @@ function sys(gpus: number[]): SysInfo {
 // Empty flags = graceful-degrade → all flags allowed (a probed engine that supports split).
 const caps = { kvTypes: ['f16', 'q8_0', 'turbo4'], flags: [] as string[] }
 
-function base(s: SysInfo, over: Partial<LoadProfile> = {}): LoadProfile {
-  return { ...deriveDefault(model(), s), ...over }
+function base(s: SysInfo, over: Partial<LoadProfile> = {}, m: ModelEntry = model()): LoadProfile {
+  return { ...deriveDefault(m, s), ...over }
 }
 
 // ---- pickSplitStrategies ----------------------------------------------------
