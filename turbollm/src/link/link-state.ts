@@ -2,7 +2,13 @@ import type { LinkCapability, LinkStatus } from './types'
 
 export type LinkProbe =
   | { kind: 'ok'; machineId: string; capabilities: LinkCapability[]; version: number }
-  | { kind: 'http'; status: number }
+  /** `code` and `capability` are the MACHINE-READABLE half of the host's error body, and
+   *  the only half that ever crosses: a host `Error.message` routinely carries an absolute
+   *  path (see `redactDownload`'s note), so the peer composes its own sentence from its own
+   *  machine name instead. Both are optional — a host that answers a bare 4xx, or one
+   *  running an older build, simply yields neither, and every existing consumer
+   *  (`nextStatus`) reads `status` alone and is unaffected. */
+  | { kind: 'http'; status: number; code?: string; capability?: LinkCapability }
   | { kind: 'network' }
   | { kind: 'incompatible'; theirVersions: number[] }
 

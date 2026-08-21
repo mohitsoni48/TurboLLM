@@ -1,9 +1,43 @@
 import { negotiateVersion, LINK_API_VERSIONS } from './protocol'
 import type { LinkProbe } from './link-state'
-import type { HelloResponse, LinkRecord, RemoteDownload, RemoteModel } from './types'
+import { LINK_CAPABILITIES } from './types'
+import type { HelloResponse, LinkCapability, LinkRecord, RemoteDownload, RemoteModel } from './types'
 import type { ModelStatusView } from '../api/status-view'
 
 const DEFAULT_TIMEOUT_MS = 8000
+
+/** An error `code` is an identifier the two ends agree on, never prose. Bounded and
+ *  character-restricted so a host that puts a sentence (or a path) in that field yields
+ *  nothing at all rather than smuggling free text through the machine-readable channel. */
+const ERROR_CODE = /^[a-z][a-z0-9_]{0,63}$/i
+
+/** The machine-readable half of a host's error body — and nothing else.
+ *
+ *  `error.message` is deliberately NOT read: on the host it is frequently a raw
+ *  `Error.message` from the filesystem or network stack, i.e. an absolute path. The peer
+ *  has the machine's name and can write its own sentence. `capability` is validated against
+ *  `LINK_CAPABILITIES`, so it is one of eight known strings or absent.
+ *
+ *  Total, like everything else on this class: a non-JSON body, a hostile shape, or a
+ *  stream that fails mid-read all yield `{}` rather than throwing. */
+async function failureDetail(res: Response): Promise<{ code?: string; capability?: LinkCapability }> {
+  if (!(res.headers.get('content-type') ?? '').includes('application/json')) return {}
+  try {
+    const body = await res.json() as { error?: unknown }
+    const err = body?.error
+    if (typeof err !== 'object' || err === null || Array.isArray(err)) return {}
+    const { code, capability } = err as { code?: unknown; capability?: unknown }
+    const known: readonly string[] = LINK_CAPABILITIES
+    return {
+      ...(typeof code === 'string' && ERROR_CODE.test(code) ? { code } : {}),
+      ...(typeof capability === 'string' && known.includes(capability)
+        ? { capability: capability as LinkCapability }
+        : {}),
+    }
+  } catch {
+    return {}
+  }
+}
 
 /** The peer's HTTP client for one linked host.
  *
@@ -251,7 +285,12 @@ export class LinkClient {
         ...(json === undefined ? {} : { body: JSON.stringify(json) }),
         signal: AbortSignal.timeout(this.timeoutMs),
       })
-      if (!res.ok) return { kind: 'http', status: res.status }
+      // A refusal's TYPE travels with it. Without this, every non-2xx collapsed to a bare
+      // status and the peer could not tell "you were not granted models:load" (403) from
+      // "ComfyUI is rendering" (409 comfyui_busy) from "the host is in use locally"
+      // (503 host_busy) — states the fleet UI renders differently, with different remedies.
+      // Only the sanitised code and the capability name cross; see `failureDetail`.
+      if (!res.ok) return { kind: 'http', status: res.status, ...(await failureDetail(res)) }
       const ct = res.headers.get('content-type') ?? ''
       if (!ct.includes('application/json')) return { kind: 'network' }
       const parsed: unknown = await res.json()

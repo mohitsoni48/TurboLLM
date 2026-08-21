@@ -738,3 +738,249 @@ test('a loopback-only daemon can still mint — there is no open LAN to close', 
   const { app } = mkApp(undefined, undefined, { lanBind: false, requireApiKey: false })
   assert.equal((await app.request('/api/v1/links/mint', json({ name: 'laptop', capabilities: ['models:use'] }))).status, 200)
 })
+
+// ── Peer-side fleet control: load / unload / downloads (phase 3, task 5b) ──────────────
+//
+// `LinkClient.load/unload/downloads/startDownload/cancelDownload` shipped with the host's
+// façade in tasks 1–3 and had ZERO callers: the browser cannot call the façade itself,
+// because `redactLink` strips the link token from everything it ever sees (design
+// invariant 7). The proxy hop has to happen inside the peer daemon, and this is it.
+
+const HELLO_BODY = {
+  machineId: 'm1', machineName: 'rig', appVersion: '1', linkApiVersions: [1],
+  capabilities: ['models:load', 'models:unload', 'downloads:read', 'downloads:write'],
+}
+
+const DOWNLOAD_ROW = {
+  id: 'd1', name: 'qwen3-35b.Q4_K_M.gguf', repo: 'unsloth/Qwen3-35B-GGUF',
+  total: 100, received: 40, status: 'downloading', error: null,
+  bytesPerSec: 1024, createdAt: '2026-08-21T00:00:00.000Z',
+}
+
+const jsonRes = (body: unknown, status = 200) =>
+  new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
+
+/** A host that answers `hello` normally and hands every other call to `rest`. */
+function hostResponder(rest: (url: string, init?: RequestInit) => Response) {
+  return (async (url: unknown, init?: RequestInit) => (String(url).endsWith('/hello')
+    ? jsonRes(HELLO_BODY)
+    : rest(String(url), init))) as unknown as typeof fetch
+}
+
+/** Adds one link over `responder` and returns the app plus that link's id. */
+async function mkLinked(responder: typeof fetch) {
+  const { app, cfg } = mkApp(responder)
+  await app.request('/api/v1/links', json({ linkString: encodeLinkString('http://h:6996', 'tllm-secret') }))
+  const id = (cfg.links as { id: string }[])[0].id
+  return { app, cfg, id }
+}
+
+const OK_HOST = hostResponder((url, init) => {
+  if (url.endsWith('/api/link/v1/models/load')) return jsonRes({ ok: true }, 202)
+  if (url.endsWith('/api/link/v1/models/unload')) return jsonRes({ ok: true }, 202)
+  if (url.endsWith('/api/link/v1/downloads') && (init?.method ?? 'GET') === 'GET') {
+    return jsonRes({ downloads: [DOWNLOAD_ROW] })
+  }
+  if (url.endsWith('/api/link/v1/downloads')) return jsonRes({ downloads: [DOWNLOAD_ROW] }, 202)
+  if (url.includes('/api/link/v1/downloads/')) return jsonRes({ ok: true })
+  return jsonRes({ error: { code: 'not_found' } }, 404)
+})
+
+const POST = (body?: unknown) => ({
+  method: 'POST',
+  ...(body === undefined ? {} : { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }),
+})
+
+test('POST /api/v1/links/:id/load asks the host to load exactly the named model', async () => {
+  const seen: { url: string; body: unknown }[] = []
+  const responder = hostResponder((url, init) => {
+    seen.push({ url, body: init?.body ? JSON.parse(String(init.body)) : null })
+    return jsonRes({ ok: true }, 202)
+  })
+  const { app, id } = await mkLinked(responder)
+  const res = await app.request(`/api/v1/links/${id}/load`, POST({ modelKey: 'qwen3-35b' }))
+  assert.equal(res.status, 202)
+  assert.deepEqual(await res.json(), { ok: true })
+  const call = seen.find((s) => s.url.endsWith('/api/link/v1/models/load'))
+  assert.ok(call, 'the host façade must be the thing that was called')
+  assert.deepEqual(call!.body, { modelKey: 'qwen3-35b' })
+})
+
+test('POST /api/v1/links/:id/load refuses an empty modelKey rather than asking the host to guess', async () => {
+  const { app, id } = await mkLinked(OK_HOST)
+  const res = await app.request(`/api/v1/links/${id}/load`, POST({ modelKey: '  ' }))
+  assert.equal(res.status, 400)
+  assert.equal((await res.json() as { error: { code: string } }).error.code, 'invalid_input')
+})
+
+test('POST /api/v1/links/:id/unload asks the host to stop its engine', async () => {
+  const { app, id } = await mkLinked(OK_HOST)
+  const res = await app.request(`/api/v1/links/${id}/unload`, POST())
+  assert.equal(res.status, 202)
+  assert.deepEqual(await res.json(), { ok: true })
+})
+
+test("GET /api/v1/links/:id/downloads returns the host's queue", async () => {
+  const { app, id } = await mkLinked(OK_HOST)
+  const res = await app.request(`/api/v1/links/${id}/downloads`)
+  assert.equal(res.status, 200)
+  const body = await res.json() as { downloads: { id: string; name: string }[] }
+  assert.equal(body.downloads.length, 1)
+  assert.equal(body.downloads[0].id, 'd1')
+})
+
+test('POST /api/v1/links/:id/downloads queues a download on the host', async () => {
+  const seen: { url: string; body: unknown }[] = []
+  const responder = hostResponder((url, init) => {
+    seen.push({ url, body: init?.body ? JSON.parse(String(init.body)) : null })
+    return jsonRes({ downloads: [DOWNLOAD_ROW] }, 202)
+  })
+  const { app, id } = await mkLinked(responder)
+  const res = await app.request(`/api/v1/links/${id}/downloads`,
+    POST({ repo: 'unsloth/Qwen3-35B-GGUF', rfilename: 'q4.gguf', size: 100 }))
+  assert.equal(res.status, 202)
+  assert.deepEqual(await res.json(), { ok: true })
+  const call = seen.find((s) => s.url.endsWith('/api/link/v1/downloads'))
+  assert.deepEqual(call!.body, { repo: 'unsloth/Qwen3-35B-GGUF', rfilename: 'q4.gguf', size: 100 })
+})
+
+test('POST /api/v1/links/:id/downloads refuses a request naming no file', async () => {
+  const { app, id } = await mkLinked(OK_HOST)
+  assert.equal((await app.request(`/api/v1/links/${id}/downloads`, POST({ repo: 'a/b' }))).status, 400)
+})
+
+test('DELETE /api/v1/links/:id/downloads/:downloadId cancels it on the host', async () => {
+  const seen: string[] = []
+  const responder = hostResponder((url) => { seen.push(url); return jsonRes({ ok: true }) })
+  const { app, id } = await mkLinked(responder)
+  const res = await app.request(`/api/v1/links/${id}/downloads/d1`, { method: 'DELETE' })
+  assert.equal(res.status, 200)
+  assert.deepEqual(await res.json(), { ok: true })
+  assert.ok(seen.some((u) => u.endsWith('/api/link/v1/downloads/d1')))
+})
+
+// ── The host's refusal must survive the hop, not flatten to a 500 ──────────────────────
+// The UI renders "you were not granted models:load" and "the host is busy right now" as
+// different states with different remedies. Collapsing both into a generic failure is the
+// difference between an actionable screen and a shrug.
+
+test('a host 403 surfaces as a 403 NAMING the capability the link lacks', async () => {
+  const responder = hostResponder(() => jsonRes(
+    { error: { code: 'forbidden', capability: 'models:load', message: "This link is not granted 'models:load'." } },
+    403,
+  ))
+  const { app, id } = await mkLinked(responder)
+  const res = await app.request(`/api/v1/links/${id}/load`, POST({ modelKey: 'qwen3-35b' }))
+  assert.equal(res.status, 403)
+  const body = await res.json() as { error: { code: string; capability?: string } }
+  assert.equal(body.error.code, 'forbidden')
+  assert.equal(body.error.capability, 'models:load')
+})
+
+test('a typed host_busy 503 stays a typed host_busy 503', async () => {
+  const responder = hostResponder(() => jsonRes(
+    { error: { code: 'host_busy', message: 'The host is in use locally. Try again shortly.' } }, 503,
+  ))
+  const { app, id } = await mkLinked(responder)
+  const res = await app.request(`/api/v1/links/${id}/load`, POST({ modelKey: 'qwen3-35b' }))
+  assert.equal(res.status, 503)
+  assert.equal((await res.json() as { error: { code: string } }).error.code, 'host_busy')
+})
+
+test("a host 409 keeps its own code — 'ComfyUI is rendering' is not 'the host is offline'", async () => {
+  const responder = hostResponder(() => jsonRes({ error: { code: 'comfyui_busy' } }, 409))
+  const { app, id } = await mkLinked(responder)
+  const res = await app.request(`/api/v1/links/${id}/load`, POST({ modelKey: 'qwen3-35b' }))
+  assert.equal(res.status, 409)
+  assert.equal((await res.json() as { error: { code: string } }).error.code, 'comfyui_busy')
+})
+
+test('a host 404 for an unknown model does not read as an unknown LINK', async () => {
+  const responder = hostResponder(() => jsonRes({ error: { code: 'no_such_model' } }, 404))
+  const { app, id } = await mkLinked(responder)
+  const res = await app.request(`/api/v1/links/${id}/load`, POST({ modelKey: 'nope' }))
+  assert.equal(res.status, 404)
+  assert.equal((await res.json() as { error: { code: string } }).error.code, 'no_such_model')
+})
+
+const FLEET_ROUTES: { label: string; path: (id: string) => string; init?: RequestInit }[] = [
+  { label: 'POST :id/load', path: (id) => `/api/v1/links/${id}/load`, init: POST({ modelKey: 'm' }) },
+  { label: 'POST :id/unload', path: (id) => `/api/v1/links/${id}/unload`, init: POST() },
+  { label: 'GET :id/downloads', path: (id) => `/api/v1/links/${id}/downloads` },
+  { label: 'POST :id/downloads', path: (id) => `/api/v1/links/${id}/downloads`, init: POST({ repo: 'a/b', rfilename: 'x.gguf' }) },
+  { label: 'DELETE :id/downloads/:downloadId', path: (id) => `/api/v1/links/${id}/downloads/d1`, init: { method: 'DELETE' } },
+]
+
+for (const route of FLEET_ROUTES) {
+  test(`${route.label} refuses an unauthenticated open-LAN caller`, async () => {
+    // The link is added while the daemon is still loopback-only (the owner, at the
+    // keyboard), then the box is opened onto the LAN. That is the real posture under
+    // attack: an established link plus a stranger who can reach the daemon with no
+    // credential at all.
+    const { app, cfg, id } = await mkLinked(OK_HOST)
+    ;(cfg as { daemon: unknown }).daemon = { port: 6996, lanBind: true, requireApiKey: false }
+    const res = await app.request(route.path(id), {
+      ...route.init,
+      headers: { ...(route.init?.headers ?? {}), 'x-forwarded-for': '10.0.0.9' },
+    })
+    assert.equal(res.status, 403)
+    assert.equal((await res.json() as { error: { code: string } }).error.code, 'forbidden')
+  })
+
+  test(`${route.label} 404s an unknown link id instead of probing nothing`, async () => {
+    const { app } = await mkLinked(OK_HOST)
+    const res = await app.request(route.path('no-such-link'), route.init)
+    assert.equal(res.status, 404)
+    assert.equal((await res.json() as { error: { code: string } }).error.code, 'not_found')
+  })
+
+  test(`${route.label} turns an unreachable host into a typed error, never a hang`, async () => {
+    const dead = (async () => { throw new TypeError('fetch failed') }) as unknown as typeof fetch
+    const { app, cfg } = mkApp(dead)
+    await app.request('/api/v1/links', json({ linkString: encodeLinkString('http://dead:6996', 'tllm-secret') }))
+    const id = (cfg.links as { id: string }[])[0].id
+    const res = await app.request(route.path(id), route.init)
+    assert.equal(res.status, 503)
+    const body = await res.json() as { error: { code: string; message: string } }
+    assert.equal(body.error.code, 'unavailable')
+    assert.match(body.error.message, /did not answer/)
+  })
+
+  test(`${route.label} never echoes the link token`, async () => {
+    const { app, id } = await mkLinked(OK_HOST)
+    const text = await (await app.request(route.path(id), route.init)).text()
+    assert.ok(!text.includes('tllm-'), `${route.label} leaked a token: ${text}`)
+    assert.ok(!text.includes('baseUrl'))
+  })
+}
+
+test('a remote download row carries no host path and no host-authored error text', async () => {
+  // Fifth-of-its-kind guard: `launchCommand`, `engine.error`'s log tail, the download
+  // destination and the config projection were each a finding in this feature. A host
+  // running an older build (or a hostile one) can still put a path in `name` or a raw
+  // `ENOENT ... open '<abs path>.part'` in `error`; neither may reach the browser.
+  const responder = hostResponder(() => jsonRes({
+    downloads: [{
+      ...DOWNLOAD_ROW,
+      name: 'D:\\models\\qwen3.gguf',
+      error: "ENOENT: no such file or directory, open 'D:\\models\\qwen3.gguf.part'",
+    }],
+  }))
+  const { app, id } = await mkLinked(responder)
+  const text = await (await app.request(`/api/v1/links/${id}/downloads`)).text()
+  assert.ok(!text.includes('D:'), text)
+  assert.ok(!text.includes('ENOENT'), text)
+})
+
+test("a host's free-text failure message never reaches the browser verbatim", async () => {
+  // Only the CODE crosses. A host `Error.message` is routinely an absolute path, and the
+  // peer has a machine name of its own to build a sentence from.
+  const responder = hostResponder(() => jsonRes(
+    { error: { code: 'model_not_loadable', message: "could not read 'D:\\models\\qwen3.gguf'" } }, 409,
+  ))
+  const { app, id } = await mkLinked(responder)
+  const res = await app.request(`/api/v1/links/${id}/load`, POST({ modelKey: 'q' }))
+  const text = await res.text()
+  assert.ok(text.includes('model_not_loadable'))
+  assert.ok(!text.includes('D:'), text)
+})

@@ -8,7 +8,8 @@ import { applyProbeResult } from '../link/apply-probe'
 import { isValidMachineName, uniqueMachineName } from '../link/machine-name'
 import { LinkClient } from '../link/link-client'
 import { decodeLinkString, encodeLinkString } from '../link/link-string'
-import { LINK_CAPABILITIES, redactLink, type LinkCapability, type LinkRecord } from '../link/types'
+import { LINK_CAPABILITIES, redactDownload, redactLink, type LinkCapability, type LinkRecord } from '../link/types'
+import { describeStatus, type LinkProbe } from '../link/link-state'
 import { LINK_PRESETS } from '../link/capabilities'
 import { emit } from '../telemetry/runtime/typed-emit'
 import { linkMinted, linkAdded, LINK_ADDED_OUTCOMES } from '../telemetry/events/link'
@@ -368,6 +369,107 @@ export function registerLinkAdminRoutes(
     return c.json({ status: probe.status })
   })
 
+  /** ── Peer side: fleet control over one linked host (spec §5.3, §5.7) ─────────────────
+   *
+   *  WHY THESE EXIST AT ALL: the browser cannot talk to a host's `/api/link/v1` façade
+   *  itself, because `redactLink` strips `token` from every `LinkRecord` it ever sees
+   *  (design invariant 7 — the peer must never leak the link token to its own clients).
+   *  So the proxy hop happens here, in the peer daemon, which is the only thing holding
+   *  the credential. Tasks 1–3 shipped the host half and `LinkClient`'s methods; these
+   *  five routes are their first and only callers.
+   *
+   *  Every one of them is THIN on purpose: gate, resolve the link, call the existing
+   *  `LinkClient` method, map the result. Nothing here re-derives a load, a queue, or a
+   *  validation rule the host already owns — the host holds the grant, the model list and
+   *  the download allowlist, and a second copy on this side would drift from it.
+   *
+   *  Same host gate as every other route in this file. These act on ANOTHER machine using
+   *  a stored credential, so an unauthenticated open-LAN caller reaching them would be
+   *  strictly worse than reaching `GET /api/v1/links`: not disclosure but remote control. */
+  app.post('/api/v1/links/:id/load', async (c) => {
+    const denied = gate(c, MANAGE)
+    if (denied) return denied
+    const rec = current(c.req.param('id'))
+    if (!rec) return noSuchLink(c)
+    const body = await c.req.json().catch(() => ({})) as { modelKey?: unknown }
+    const modelKey = typeof body.modelKey === 'string' ? body.modelKey.trim() : ''
+    // Required here as well as on the host: `startEngine` reads an empty request as
+    // "re-load lastLoaded", and a click that silently loads a DIFFERENT model than the one
+    // on screen is the worst possible outcome of a missing field.
+    if (!modelKey) {
+      return c.json({ error: { code: 'invalid_input', message: 'modelKey is required.' } }, 400)
+    }
+    const out = await new LinkClient(rec, { fetchImpl }).load(modelKey)
+    // 202, matching the host: the load is QUEUED, not finished. The UI learns the outcome
+    // from its normal `/status` polling, exactly as it does for a local load.
+    return out.kind === 'accepted' ? c.json({ ok: true }, 202) : remoteFailure(c, rec, out)
+  })
+
+  app.post('/api/v1/links/:id/unload', async (c) => {
+    const denied = gate(c, MANAGE)
+    if (denied) return denied
+    const rec = current(c.req.param('id'))
+    if (!rec) return noSuchLink(c)
+    const out = await new LinkClient(rec, { fetchImpl }).unload()
+    return out.kind === 'accepted' ? c.json({ ok: true }, 202) : remoteFailure(c, rec, out)
+  })
+
+  /** `downloads:read` missing is a NAMED 403 from the host, and it stays one here — never
+   *  an empty 200. An empty queue and an unreadable queue look identical on screen and
+   *  send the user debugging the wrong machine. */
+  app.get('/api/v1/links/:id/downloads', async (c) => {
+    const denied = gate(c, VIEW)
+    if (denied) return denied
+    const rec = current(c.req.param('id'))
+    if (!rec) return noSuchLink(c)
+    const out = await new LinkClient(rec, { fetchImpl }).downloads()
+    if (out.kind !== 'downloads') return remoteFailure(c, rec, out)
+    // `redactDownload` a SECOND time, on this side of the wire. The host already applies it
+    // (link-routes.ts), so this is pure defence in depth and idempotent — but the host is a
+    // separate install on a separate release cadence, and an older or hostile one can still
+    // put an absolute path in `name` or a raw `ENOENT … open 'C:\…\x.gguf.part'` in `error`.
+    // Four host-filesystem leaks have been found in this feature already; the peer does not
+    // get to assume the far end is current.
+    return c.json({ downloads: out.downloads.map(redactDownload) })
+  })
+
+  /** Start a download on the host. `repo`/`rfilename` are checked only for PRESENCE here —
+   *  the host owns the real validation (`HF_REPO_ID`, `isSafeRepoFile`) because it owns the
+   *  filesystem those values resolve against, and a second copy of those rules on this side
+   *  would be the drift-prone half of the pair. `url` and `subdir` are not accepted at all:
+   *  `LinkClient.startDownload` cannot send them and the host drops them. */
+  app.post('/api/v1/links/:id/downloads', async (c) => {
+    const denied = gate(c, MANAGE)
+    if (denied) return denied
+    const rec = current(c.req.param('id'))
+    if (!rec) return noSuchLink(c)
+    const body = await c.req.json().catch(() => ({})) as Record<string, unknown>
+    const repo = typeof body.repo === 'string' ? body.repo.trim() : ''
+    const rfilename = typeof body.rfilename === 'string' ? body.rfilename.trim() : ''
+    if (!repo || !rfilename) {
+      return c.json(
+        { error: { code: 'invalid_input', message: 'repo and rfilename are required.' } },
+        400,
+      )
+    }
+    const out = await new LinkClient(rec, { fetchImpl }).startDownload(repo, rfilename, {
+      ...(typeof body.size === 'number' && Number.isFinite(body.size) && body.size >= 0
+        ? { size: body.size }
+        : {}),
+      ...(typeof body.sha256 === 'string' ? { sha256: body.sha256 } : {}),
+    })
+    return out.kind === 'accepted' ? c.json({ ok: true }, 202) : remoteFailure(c, rec, out)
+  })
+
+  app.delete('/api/v1/links/:id/downloads/:downloadId', async (c) => {
+    const denied = gate(c, MANAGE)
+    if (denied) return denied
+    const rec = current(c.req.param('id'))
+    if (!rec) return noSuchLink(c)
+    const out = await new LinkClient(rec, { fetchImpl }).cancelDownload(c.req.param('downloadId'))
+    return out.kind === 'accepted' ? c.json({ ok: true }) : remoteFailure(c, rec, out)
+  })
+
   app.delete('/api/v1/links/:id', (c) => {
     const denied = gate(c, MANAGE)
     if (denied) return denied
@@ -395,6 +497,88 @@ export function registerLinkAdminRoutes(
       applyProbeResult(l, p, (cfg.links ?? []).filter((x) => x.id !== id).map((x) => x.name))
     })
   }
+}
+
+/** An id that names no link at all. Distinct from a host 404 (`remote_not_found`, or the
+ *  host's own code): "you have no such machine" and "that machine has no such thing" are
+ *  different problems with different fixes, and one 404 code for both hides which. */
+function noSuchLink(c: Context): Response {
+  return c.json({ error: { code: 'not_found', message: 'No such link.' } }, 404)
+}
+
+/** The statuses a host refusal is allowed to keep. Anything outside this set is a host
+ *  misbehaving rather than a decision it made, and becomes a 502. Enumerated rather than
+ *  passed through so a host can never make this daemon answer 101, 204 or 3xx. */
+const RELAYED: Record<number, 400 | 403 | 404 | 409 | 429 | 503 | undefined> = {
+  400: 400, 403: 403, 404: 404, 409: 409, 429: 429, 503: 503,
+}
+
+/** Fallback code when the host named none. Never a stand-in for a code it DID name. */
+const DEFAULT_CODE: Record<number, string | undefined> = {
+  400: 'invalid_request',
+  403: 'forbidden',
+  404: 'remote_not_found',
+  409: 'conflict',
+  429: 'rate_limited',
+  502: 'unavailable',
+  503: 'unavailable',
+}
+
+/** Render a failed remote call for the browser, PRESERVING the distinction the host drew.
+ *
+ *  This is the whole point of the proxy hop being honest. The fleet UI renders "you were
+ *  not granted `models:load`" (403, with the capability named, remedy: re-mint the token),
+ *  "the host is in use locally" (503 `host_busy`, remedy: wait), "ComfyUI is rendering"
+ *  (409 `comfyui_busy`) and "that machine is offline" (503 `unavailable`) as four different
+ *  states. Flattening any of them into a generic 500 destroys the screen.
+ *
+ *  What crosses: the status (from the allowlist above) and the host's `code`/`capability`
+ *  (sanitised in `LinkClient.failureDetail`). What does NOT: the host's `message`. That
+ *  field is routinely a raw `Error.message` carrying an absolute host path — the fifth
+ *  member of a family of leaks this feature has already had four of — so every sentence
+ *  here is composed locally, out of the link's own display name.
+ *
+ *  `LinkClient` never throws by contract, so there is no exception path to guard: an
+ *  offline host arrives here as `network` and leaves as a typed 503, never as a hang and
+ *  never as a 500. */
+function remoteFailure(c: Context, rec: LinkRecord, probe: LinkProbe): Response {
+  if (probe.kind === 'network' || probe.kind === 'ok') {
+    // `ok` is unreachable — it is `hello()`'s success shape, which none of these callers
+    // can produce — but treating it as "we did not get an answer we understand" keeps this
+    // total rather than leaving a union member to fall off the end as `undefined`.
+    return c.json(
+      { error: { code: 'unavailable', message: `${rec.name} did not answer.` } },
+      503,
+    )
+  }
+  if (probe.kind === 'incompatible') {
+    return c.json(
+      { error: { code: 'incompatible', message: describeStatus('incompatible', rec.name) } },
+      503,
+    )
+  }
+  // 401 is the one status NOT relayed as itself: a 401 from the host would read in the
+  // browser as "you need to sign in to THIS daemon", which is the opposite of what
+  // happened. It is the host revoking this machine's token — the same fact `nextStatus`
+  // latches as `revoked` — and the remedy is a new link string.
+  if (probe.status === 401) {
+    return c.json({ error: { code: 'revoked', message: describeStatus('revoked', rec.name) } }, 403)
+  }
+  const status = RELAYED[probe.status] ?? 502
+  const code = probe.code ?? DEFAULT_CODE[status] ?? 'unavailable'
+  const message = probe.capability
+    ? `${rec.name} did not grant this machine '${probe.capability}'.`
+    : status === 403
+      ? `${rec.name} refused this request.`
+      : status === 404
+        ? `${rec.name} does not have what this request named.`
+        : status === 502
+          ? `${rec.name} answered with an unexpected error.`
+          : `${rec.name} could not do that right now.`
+  return c.json(
+    { error: { code, message, ...(probe.capability ? { capability: probe.capability } : {}) } },
+    status,
+  )
 }
 
 /** Best-effort LAN address for the minted link string. Falls back to a placeholder the
