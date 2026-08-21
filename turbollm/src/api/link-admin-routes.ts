@@ -80,6 +80,11 @@ export function registerLinkAdminRoutes(
     })
   })
 
+  // ── Peer side: list all links (settings UI's "linked machines" panel).
+  app.get('/api/v1/links', (c) => {
+    return c.json({ links: d.store.snapshot().links ?? [] })
+  })
+
   // ── Peer side: add / edit / remove a link.
   app.post('/api/v1/links', async (c) => {
     const body = await c.req.json().catch(() => null) as { linkString?: string } | null

@@ -112,6 +112,21 @@ test('DELETE removes the link', async () => {
   assert.equal((cfg.links as unknown[]).length, 0)
 })
 
+test('GET /api/v1/links lists stored links for the settings UI', async () => {
+  const hello = async () => new Response(JSON.stringify({
+    machineId: 'm1', machineName: 'workstation', appVersion: '1.11.2',
+    linkApiVersions: [1], capabilities: ['models:use'],
+  }), { status: 200, headers: { 'content-type': 'application/json' } })
+  const { app } = mkApp(hello)
+  await app.request('/api/v1/links', json({ linkString: encodeLinkString('http://h:6996', 'tllm-a') }))
+  const res = await app.request('/api/v1/links')
+  assert.equal(res.status, 200)
+  const body = await res.json() as { links: { name: string; status: string }[] }
+  assert.equal(body.links.length, 1)
+  assert.equal(body.links[0].name, 'workstation')
+  assert.equal(body.links[0].status, 'online')
+})
+
 test('inbound lists granted keys with their capabilities and last-used, never a hash', async () => {
   const { app } = mkApp()
   await app.request('/api/v1/links/mint', json({ name: 'laptop', capabilities: ['models:use'] }))

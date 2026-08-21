@@ -28,6 +28,7 @@ import { CodeContextSection } from './settings/CodeContextSection'
 import { CodeAgentSection } from './settings/CodeAgentSection'
 import { MemorySection } from './settings/MemorySection'
 import { ExperimentalSection } from './settings/ExperimentalSection'
+import { TurboLinkSection } from './settings/TurboLinkSection'
 
 import { ApiError, track, type TelemetryLevel } from '../lib/api'
 import { TELEMETRY_UI_ENABLED } from '../lib/flags'
@@ -639,6 +640,10 @@ export function SettingsScreen() {
                 reverseGate={comfyReverseGate}
                 setReverseGate={setComfyReverseGate}
               />
+
+              {/* Turbo Link (ADR-376): mint scoped tokens for other machines + manage
+                  machines this one has linked to. */}
+              <TurboLinkSection />
             </>
           )}
 
