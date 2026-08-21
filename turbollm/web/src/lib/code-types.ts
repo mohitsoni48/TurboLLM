@@ -10,16 +10,37 @@ export type CodeAgent = 'turbollm' | 'pi' | 'claude' | 'opencode'
 
 /** The single source of truth for which agents are actually offered anywhere in the app
  *  (Settings' CodeAgentSection, onboarding's PayoffStep agent picker) — shared so the two
- *  pickers can never drift. `pi` and `opencode` are deliberately withheld: both are still
- *  supported end to end (cli-launch.ts, this type, any session already created with one
- *  keeps working), just not offered until their terminal integration is verified against a
- *  real binary rather than shipping a choice that half-works (ADR-239). `terminalAvailable`
- *  filters out `claude` (needs a PTY via the optional native `node-pty` dependency, which
- *  npm silently skips when no prebuild fits — a perfectly healthy install can have no
- *  terminal backend at all) rather than offering it and failing at session-open. */
+ *  pickers can never drift.
+ *
+ *  `pi` and `opencode` were withheld by ADR-295 because neither had ever been verified against a
+ *  real binary. They are offered now because that verification was done: pi 0.84.2 and opencode
+ *  1.18.9 were both probed on a real install, and each one's session-id, permission-mode,
+ *  first-prompt and per-session-token wiring is built from flags read out of its own `--help`
+ *  rather than guessed (see cli-launch.ts's SUPPORTED, terminal-routes.ts's
+ *  AGENT_SESSION_ID_FLAGS/AGENT_PROMPT_STYLE, agent-modes.ts's permissionModeArgs).
+ *
+ *  DeepSeek Harness (`@deepseek-ai/dsh`) is deliberately NOT here. It was probed too, and it cannot
+ *  work as a Code-session agent yet for two measured reasons: it ships no `tui` profile (only `web`
+ *  and `headless`; a profile must first be provisioned with pnpm plugin installs), and its only
+ *  bundled provider adapter is `deepseek-official` — there is no OpenAI-compatible adapter to point
+ *  at TurboLLM's gateway. Listing it would be exactly the "coming soon, not actually installable"
+ *  entry ADR-239 exists to forbid. Its gateway-protocol support is already in place for when that
+ *  changes (telemetry's HARNESSES, classify.ts).
+ *
+ *  `terminalAvailable` filters out every PTY-backed agent (the native `node-pty` dependency is
+ *  OPTIONAL, and npm silently skips it when no prebuild fits the platform/ABI — a perfectly healthy
+ *  install can have no terminal backend at all) rather than offering one and failing at
+ *  session-open. */
 export const CODE_AGENTS: ReadonlyArray<{ id: CodeAgent; label: string; description: string; needsTerminal?: boolean }> = [
   { id: 'turbollm', label: 'turbollm', description: 'The built-in chat agent — uses whatever model TurboLLM has loaded.' },
   { id: 'claude', label: 'claude', description: 'Launches inside a full-screen terminal (turbollm launch claude).', needsTerminal: true },
+  // needsTerminal: true for BOTH. pi is a full-screen TUI exactly like the other two — it is
+  // launched by `turbollm launch pi` inside a PTY, and TurboLLM has no RPC-mode integration for it.
+  // (An earlier draft of this list marked pi `needsTerminal: false` on the theory that its `--mode
+  // rpc` flag meant no PTY was needed; nothing in this codebase drives that mode, so the flag would
+  // have offered pi on machines with no terminal backend and failed at session-open.)
+  { id: 'pi', label: 'pi', description: 'Launches inside a full-screen terminal (turbollm launch pi).', needsTerminal: true },
+  { id: 'opencode', label: 'opencode', description: 'Launches inside a full-screen terminal (turbollm launch opencode).', needsTerminal: true },
 ]
 
 export function availableCodeAgents(terminalAvailable: boolean): typeof CODE_AGENTS {

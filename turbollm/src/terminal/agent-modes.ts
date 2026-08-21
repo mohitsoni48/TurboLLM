@@ -3,9 +3,14 @@
 // in the CLI's default (founder, 2026-07-29: "if auto is selected, launch in auto, if plan then
 // plan").
 //
-// Only `claude` is mapped. Same rule AGENT_SESSION_ID_FLAGS already follows: an agent whose flag
-// syntax hasn't been confirmed against a real binary gets nothing rather than a guess that would
-// fail the launch outright (pi/opencode are withdrawn from the picker anyway, ADR-295).
+// Every harness here has been probed against a REAL installed binary — the rule AGENT_SESSION_ID_FLAGS
+// already followed, now applied per harness rather than only to claude:
+//   claude   2.1.232   `--permission-mode <value>`, value list read from its own --help
+//   opencode 1.18.9    `--auto` (boolean) and `--agent plan` (a real built-in agent)
+//   pi       0.84.2    no permission-mode concept at all; only tool allow/deny lists
+// An unprobed harness gets NOTHING rather than a guess that would fail the launch outright
+// (ADR-293: a bad flag value is a hard startup failure the daemon cannot even diagnose, because
+// reading the child's stderr aborts the process inside ConPTY).
 //
 // ── Why a preference list and not one hardcoded flag value ──────────────────────────────────
 // Measured against the installed CLI (Claude Code 2.1.220, `claude --permission-mode <x> --version`
@@ -122,4 +127,86 @@ export async function claudePermissionModeChoices(run: HelpRunner = realHelpRunn
 /** Test-only: drop the cached probe so a test can supply its own runner. */
 export function resetPermissionModeChoicesCache(): void {
   cachedChoices = null
+}
+
+// ── Per-harness mode ARGUMENTS ──────────────────────────────────────────────────────────────────
+//
+// Generalising `resolveClaudePermissionMode` to other harnesses cannot return a bare VALUE, because
+// the harnesses do not share a flag shape — that is the whole reason this is a separate function
+// rather than a wider lookup table:
+//   claude   → one flag with a value:  `--permission-mode auto`
+//   opencode → a boolean, or a whole different flag: `--auto`, or `--agent plan`
+//   pi       → no permission concept;  only `--exclude-tools`
+// So the contract is "give me the ARGS for this mode", and each harness answers in its own shape.
+
+/** opencode's mode mapping, measured against 1.18.9 (`opencode --help`, `opencode agent list`):
+ *  - auto → `--auto` — its own "auto-approve permissions that are not explicitly denied".
+ *  - plan → `--agent plan` — `plan (primary)` is a REAL built-in agent (confirmed in `agent list`),
+ *    and its permission set is what makes it a planning mode, so this is opencode's own concept
+ *    rather than something invented here.
+ *  - ask  → nothing. opencode's DEFAULT is to prompt for permission, which is exactly what "ask"
+ *    means, so the honest mapping is to pass no flag at all. */
+function opencodeModeArgs(mode: CodeModeId): string[] {
+  if (mode === 'auto') return ['--auto']
+  if (mode === 'plan') return ['--agent', 'plan']
+  return []
+}
+
+/** pi's mode mapping, measured against 0.84.2 (`pi --help`).
+ *
+ *  ⚠️ pi has NO permission-mode concept — no auto-approve flag, no per-call approval gate, and
+ *  `--plan` is explicitly documented as coming from an OPTIONAL extension ("Extensions can register
+ *  additional flags (e.g. --plan from plan-mode extension)"), so it cannot be relied on.
+ *
+ *  What pi does have is verified tool allow/deny lists. For `plan` we use `--exclude-tools
+ *  edit,write` — a real, documented flag — which removes pi's file-MUTATING tools while leaving
+ *  reading and shell exploration intact.
+ *
+ *  **This is an approximation, and the limitation is deliberate and load-bearing:** it stops the
+ *  `edit`/`write` tools, but pi keeps `bash`, and a shell can obviously still write files
+ *  (`echo … > f`). So plan mode for pi is "the editing tools are gone", NOT claude's enforced
+ *  "nothing is touched until you approve a plan". It is strictly better than ignoring the user's
+ *  chosen mode outright (which is what passing nothing would do, silently running plan mode as
+ *  auto), and it is built only from flags that actually exist. Anything stronger requires pi's
+ *  plan-mode extension, which TurboLLM does not install.
+ *
+ *  `auto` and `ask` both map to no args: pi's own default is to run its tools, so `auto` is already
+ *  its behaviour, and there is no gate to switch on for `ask`. */
+function piModeArgs(mode: CodeModeId): string[] {
+  if (mode === 'plan') return ['--exclude-tools', 'edit,write']
+  return []
+}
+
+/** The launch arguments that put `agent` into TurboLLM's `mode`, or `[]` when this harness has no
+ *  confirmed mapping (which launches it in its own default, exactly as before any of this existed).
+ *
+ *  `choices` is what the installed claude binary advertises — ignored by every other harness, and
+ *  safely passed as [] for them. */
+export function permissionModeArgs(agent: string, mode: string, choices: readonly string[] = []): string[] {
+  if (!CODE_MODES.has(mode)) return []
+  const m = mode as CodeModeId
+  if (agent === 'claude') {
+    const resolved = resolveClaudePermissionMode(m, choices)
+    return resolved ? ['--permission-mode', resolved] : []
+  }
+  if (agent === 'opencode') return opencodeModeArgs(m)
+  if (agent === 'pi') return piModeArgs(m)
+  return []
+}
+
+/** Whether a harness can genuinely ENFORCE TurboLLM's `plan` mode (nothing is written until the
+ *  user approves). Only claude can today — see piModeArgs for why pi's is an approximation, and
+ *  note opencode's `--agent plan` is its own agent whose enforcement we have not measured.
+ *
+ *  Exists so a surface that wants to be honest with the user ("plan mode is approximate on this
+ *  harness") has one place to ask, instead of each re-deriving it. */
+export function enforcesPlanMode(agent: string): boolean {
+  // opencode included on measured evidence, not assumption: its bundled `plan` agent is a
+  // `native` PRIMARY agent declaring `permission: { edit: { "*": "deny" } }` — a hard denial of
+  // every edit tool, read out of the 1.18.9 binary. That is strictly stronger than pi's
+  // `--exclude-tools` approximation, and at least as strong as claude's own mode.
+  //
+  // pi remains false, and correctly so: `--exclude-tools edit,write` removes the editing tools but
+  // leaves bash, which can still write files (see piModeArgs).
+  return agent === 'claude' || agent === 'opencode'
 }

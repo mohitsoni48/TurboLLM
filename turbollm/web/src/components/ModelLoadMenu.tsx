@@ -2,6 +2,8 @@ import { Check, ChevronDown, CircleSlash, Cpu, Loader2, SlidersHorizontal, Star 
 import type { ModelEntry } from '../lib/types'
 import { usePinnedModels } from '../lib/usePinnedModels'
 import { track } from '../lib/api'
+import { toast } from './ui/sonner'
+import { cn } from '../lib/utils'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -27,6 +29,7 @@ export function ModelLoadMenu({
   onSettings,
   align = 'start',
   screen,
+  blockedReason,
 }: {
   models: ModelEntry[]
   loadedKey?: string | null
@@ -38,6 +41,10 @@ export function ModelLoadMenu({
   onSettings?: (key: string) => void
   align?: 'start' | 'end'
   screen: 'chat' | 'code'
+  /** When set, this control cannot change the model, and clicking it explains why instead of
+   *  opening the list. For a harness whose model can only be chosen from INSIDE its own TUI
+   *  (opencode) — offering a picker that silently does nothing is worse than not offering one. */
+  blockedReason?: string
 }) {
   const { isPinned } = usePinnedModels()
   // Pinned models float to the top (same convention as the library list in ModelsScreen),
@@ -55,8 +62,16 @@ export function ModelLoadMenu({
   return (
     <DropdownMenu>
       <DropdownMenuTrigger
-        className="flex h-8 max-w-[160px] items-center gap-1.5 rounded-md border border-border bg-panel px-2.5 text-[13px] text-ink transition-colors hover:border-[color:var(--accent)] disabled:opacity-60 md:max-w-[260px]"
+        className={cn(
+          'flex h-8 max-w-[160px] items-center gap-1.5 rounded-md border border-border bg-panel px-2.5 text-[13px] text-ink transition-colors hover:border-[color:var(--accent)] disabled:opacity-60 md:max-w-[260px]',
+          blockedReason && 'cursor-not-allowed opacity-60 hover:border-border',
+        )}
         disabled={pending}
+        // Deliberately NOT the `disabled` attribute: a disabled button fires no click, so the user
+        // gets a dead control and no explanation. Blocking the open here keeps it clickable purely
+        // so the reason can be surfaced.
+        title={blockedReason}
+        onPointerDown={blockedReason ? (e) => { e.preventDefault(); toast.info(blockedReason) } : undefined}
       >
         {pending || ejecting ? (
           <Loader2 size={14} className="animate-spin text-muted" />

@@ -101,3 +101,52 @@ test('inheritedEnv leaves the concurrency cap alone — it is set by launchCli, 
   assert.equal(env.CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS, '4')
   assert.equal(env.CLAUDECODE, undefined)
 })
+
+// ── Cloud-provider credentials must not reach a locally-pointed harness (founder-reported) ─────
+// pi's `/model` picker showed 38 OpenAI and 22 Google models next to the 26 TurboLLM ones. Measured
+// cause: `~/.pi/agent/auth.json` was empty, but the daemon's env carried the user's own
+// OPENAI_API_KEY/GEMINI_API_KEY, and pi treats an env key as auth for its built-in providers.
+// Proven against the real binary: `pi --list-models` -> 38 openai + 22 google + 26 turbollm;
+// with those two vars unset -> 26 turbollm and nothing else.
+//
+// This is a correctness fix rather than tidying: a harness that can still SEE a paid cloud provider
+// can silently run turns against it, billing the user and sending their code off-box for a session
+// in which they explicitly chose a local model.
+
+test('inheritedEnv: strips every cloud-provider API key', () => {
+  const env = inheritedEnv({
+    OPENAI_API_KEY: 'sk-real',
+    GEMINI_API_KEY: 'AIza-real',
+    GOOGLE_API_KEY: 'g',
+    GOOGLE_GENERATIVE_AI_API_KEY: 'g2',
+    AZURE_OPENAI_API_KEY: 'az',
+    XAI_API_KEY: 'x',
+    GROQ_API_KEY: 'gq',
+    MISTRAL_API_KEY: 'm',
+    DEEPSEEK_API_KEY: 'ds',
+    OPENROUTER_API_KEY: 'or',
+    TOGETHER_API_KEY: 't',
+    FIREWORKS_API_KEY: 'f',
+    PERPLEXITY_API_KEY: 'p',
+    CEREBRAS_API_KEY: 'c',
+    ANTHROPIC_API_KEY: 'a',
+    PATH: '/usr/bin',
+  })
+  for (const key of [
+    'OPENAI_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'GOOGLE_GENERATIVE_AI_API_KEY',
+    'AZURE_OPENAI_API_KEY', 'XAI_API_KEY', 'GROQ_API_KEY', 'MISTRAL_API_KEY', 'DEEPSEEK_API_KEY',
+    'OPENROUTER_API_KEY', 'TOGETHER_API_KEY', 'FIREWORKS_API_KEY', 'PERPLEXITY_API_KEY',
+    'CEREBRAS_API_KEY', 'ANTHROPIC_API_KEY',
+  ]) {
+    assert.equal(env[key], undefined, `${key} must not reach a locally-pointed harness`)
+  }
+  assert.equal(env.PATH, '/usr/bin', 'stripping is targeted — the CLI must still be launchable')
+})
+
+test('inheritedEnv: a NON-credential provider variable is left alone', () => {
+  // The strip is a named list, not a `*_API_KEY` sweep: a user's own base-URL or region setting is
+  // not a credential and removing it could break a legitimate local setup.
+  const env = inheritedEnv({ OPENAI_BASE_URL: 'http://localhost:1234/v1', OPENAI_API_KEY: 'sk' })
+  assert.equal(env.OPENAI_BASE_URL, 'http://localhost:1234/v1')
+  assert.equal(env.OPENAI_API_KEY, undefined)
+})

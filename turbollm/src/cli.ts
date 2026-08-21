@@ -4,7 +4,7 @@ import { openSync, readFileSync } from 'node:fs'
 import { serve } from '@hono/node-server'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { ConfigStore, defaultConfig, defaultConfigPath, getModelProfile, migrateLegacyDataDir } from './config/config'
+import { ConfigStore, defaultConfig, defaultConfigPath, getModelProfile, resolveConfiguredCtx, migrateLegacyDataDir } from './config/config'
 import { Manager, killTrackedEnginesSync, reapStaleEngines, type StartOpts } from './engines/manager'
 import { ComfyGuard } from './engines/comfy-guard'
 import { Registry } from './engines/registry'
@@ -35,7 +35,7 @@ import { ModelRouter } from './gateway/model-router'
 import { ToolRegistry } from './tools/tool-registry'
 import { GenerationGate } from './agents/gate'
 import { AgentTaskState } from './agents/task-state'
-import { launchCli } from './cli-launch'
+import { launchCli, syncHarnessModelConfig, CONFIG_FILE_HARNESSES } from './cli-launch'
 import { writePidfile, removePidfile, stopDaemon, resolveDaemonPort } from './daemon-pid'
 import { runMcpServer } from './mcp-server'
 import { createApp } from './server'
@@ -155,7 +155,8 @@ if (argv[0] === 'launch') {
       a !== '--port' && arr[i - 1] !== '--port' &&
       a !== '--model' && arr[i - 1] !== '--model' &&
       a !== '--config' && arr[i - 1] !== '--config' &&
-      a !== '--token' && arr[i - 1] !== '--token',
+      a !== '--token' && arr[i - 1] !== '--token' &&
+      a !== '--code-session-id' && arr[i - 1] !== '--code-session-id',
   )
   const code = await launchCli(target, port, passthrough, undefined, modelKey, undefined, authToken)
   // Tell the daemon the agent is done. The shell that ran us stays alive on purpose
@@ -163,7 +164,17 @@ if (argv[0] === 'launch') {
   // running agent terminal — reattaching would hand the user a bare prompt with stale scrollback
   // and never relaunch. This is the only place that reliably knows the agent exited. Best-effort
   // and time-boxed: a failed report must never delay or block the CLI's own exit.
-  const codeSessionId = argValue('--session-id', '') || argValue('--resume', '')
+  // TurboLLM's OWN Code-session id, passed by buildTerminalLaunchCommand for every terminal launch
+  // and independent of whatever session flag the harness itself does or doesn't support.
+  //
+  // This used to read the HARNESS's `--session-id`/`--resume`, which opencode is deliberately never
+  // given (it cannot register a caller-chosen id at all). So for opencode this was always '' and the
+  // report never fired — leaving `agentExited` unset, so `POST .../terminal` took the reuse branch
+  // forever and handed the user a dead shell with stale scrollback on every reopen. That is verbatim
+  // the failure terminal-routes.ts documents as already fixed; for opencode it happened on every
+  // single exit. The harness flags remain as a fallback for a launch command built before this flag.
+  const codeSessionId =
+    argValue('--code-session-id', '') || argValue('--session-id', '') || argValue('--resume', '')
   if (codeSessionId) {
     try {
       await fetch(`http://127.0.0.1:${port}/api/v1/code/sessions/${codeSessionId}/terminal/agent-exited`, {
@@ -379,6 +390,47 @@ telemetry.dailyActive()
 // which fire load() without awaiting and so cannot see the outcome.
 manager.onLoadSettled = (ok, err, opts) => {
   const outcome = ok ? 'ok' : 'fail'
+  // ── Re-stamp every config-file harness with the model that just loaded ──────────────────────
+  // Config-file harnesses (pi/opencode/kilo/openclaw) learn a model's context window ONLY from the
+  // config we write. `prepareConfig` runs at LAUNCH, so it can only be right about the model loaded
+  // at that moment; every other model falls back to its native maximum. Swap models and the harness
+  // reads a file describing the previous state — founder-reported twice: pi showed 262144 (native)
+  // for a model the engine had actually loaded at 200704, then again at 163328.
+  //
+  // The first attempt at this fix hooked the Code TOOLBAR's load handler, which was the wrong layer:
+  // it only fires for loads started from that one screen, so a load from the Models screen, an
+  // auto-swap, a routine's model swap, or startup auto-load all left the config stale — which is
+  // exactly how the bug survived being "fixed". `onLoadSettled` is the daemon's single observer for
+  // EVERY load path, which is why it belongs here.
+  //
+  // Same contract as this callback's other observers: best-effort, never allowed to break a load.
+  if (ok) {
+    void (async () => {
+      try {
+        const st = manager.status()
+        if (st.state !== 'running' || !st.model?.key) return
+        // `scanner.list()` returns RAW entries with no `configuredCtx` — that field is computed, not
+        // stored. Resolving it here is what makes an UNLOADED model advertise the window it would
+        // really load with instead of its metadata ceiling. Without this the sync silently
+        // overwrote the launcher's correct values with nativeCtx on every single load.
+        const activeEngineId = registry.active()?.id ?? ''
+        const cfg = store.snapshot()
+        const models = scanner.list().models.map((m) => ({
+          ...m,
+          configuredCtx: resolveConfiguredCtx(cfg, m.key, activeEngineId),
+        }))
+        for (const target of CONFIG_FILE_HARNESSES) {
+          await syncHarnessModelConfig(target, {
+            port: store.snapshot().daemon.port,
+            pinnedModel: st.model.key,
+            modelName: st.model.name ?? st.model.key,
+            modelCtx: st.model.ctx,
+            models,
+          })
+        }
+      } catch { /* a harness config we cannot rewrite must never affect the load */ }
+    })()
+  }
   // The onboarding entry predicate (spec 25 §3): once ANY load has ever
   // succeeded, the wizard never shows again, regardless of `onboarding.status`.
   // A no-op past the first success (markEverLoadedModel checks before writing).

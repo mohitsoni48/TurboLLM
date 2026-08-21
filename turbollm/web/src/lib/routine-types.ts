@@ -9,7 +9,14 @@ export type ScheduleRule =
 
 export type RoutineFlavor = 'chat' | 'code'
 export type RoutineStatus = 'pending_confirmation' | 'active' | 'paused'
-export type CodingAgentChoice = 'pi' | 'claude_cli'
+/** Mirrors the backend's own union (src/routines/schema.ts) — keep them identical.
+ *  ⚠️ `'pi'` is the IN-APP pi-SDK engine, not the external `pi` CLI; every terminal harness carries
+ *  the `_cli` suffix. See the backend type's comment for why that asymmetry exists. */
+export type CodingAgentChoice = 'pi' | 'claude_cli' | 'opencode_cli' | 'pi_cli'
+
+/** Every accepted value, in the order the form offers them. Single list so the form options, the
+ *  draft-completeness check and the tool-card passthrough can't drift apart. */
+export const CODING_AGENT_CHOICES: readonly CodingAgentChoice[] = ['pi', 'claude_cli', 'opencode_cli', 'pi_cli']
 /** The backend spells this union inline on both `Routine.permissionMode` (schema.ts) and
  *  `RoutineBody.permissionMode` (routine-routes.ts) rather than naming it; named here because
  *  the form/draft layer (routine-form.ts) needs to refer to it. Structurally identical. */

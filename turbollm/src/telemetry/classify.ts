@@ -198,6 +198,12 @@ export function classifyHarness(userAgent: string | null | undefined): Harness {
   if (ua.includes('hermes-agent')) return 'hermes'
   if (ua.includes('openclaw')) return 'openclaw'
   if (ua.includes('pi-coding-agent') || ua.includes('earendil')) return 'pi'
+  // DeepSeek Harness (`@deepseek-ai/dsh`). Its real user-agent string is NOT yet verified against a
+  // running binary, so these are the two spellings that can't be anything else — deliberately NOT
+  // a bare `dsh`, which is three letters that would collide with unrelated UAs. An unmatched
+  // DeepSeek request lands in `unknown`, which is the honest outcome and is exactly the signal the
+  // spec says should drive refining this list.
+  if (ua.includes('deepseek-harness') || ua.includes('deepseek-ai')) return 'deepseek'
   if (ua.includes('continue-dev') || ua.includes('continuedev')) return 'continue'
   if (ua.includes('cline')) return 'cline'
   if (ua.includes('roo-code') || ua.includes('roocode')) return 'roo'

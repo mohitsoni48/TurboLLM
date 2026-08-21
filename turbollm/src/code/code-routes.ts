@@ -29,6 +29,7 @@ import { agentCwd, createSessionWorktree, removeSessionWorktree } from './worktr
 import { codeSessionExportFilename, serializeCodeSessionMarkdown } from './session-export'
 import { commitGitChanges, getGithubCompareUrl, getGitStatus, pushGitBranch } from './git-actions'
 import { runShellCommand, shellContextText } from './code-shell'
+import { agentAvailability, installAgent } from './agent-availability'
 import { agentsMdPresence } from './persona'
 import type { CodeMode } from './persona'
 import { sessionAuth } from './session-auth'
@@ -201,6 +202,35 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
 
   // ── launchpad "Coding activity" stats ─────────────────────────────────────────
   // Real numbers (db.ts's codeStats) — replaces code-mock.ts's always-fake CODE_STATS.
+  // ── which terminal-agent CLIs are installed on this machine ───────────────────────────────
+  // Reported rather than guessed at, so the picker can refuse to select a harness that would only
+  // fail at session-open (founder-reported live: choosing `pi` opened a terminal that immediately
+  // printed "pi is not installed or not on your PATH" and then sat there dead). Deliberately does
+  // NOT send label/description: those live in the frontend's own CODE_AGENTS, and duplicating them
+  // here would give the same copy two owners.
+  app.get('/api/v1/code/agents', async (c) => c.json({ agents: await agentAvailability() }))
+
+  // ── install a missing terminal-agent CLI ──────────────────────────────────────────────────
+  // Runs that harness's own registered install command (cli-launch.ts's SUPPORTED). The client
+  // chooses only WHICH known agent id — never the command itself — so there is no path from a
+  // request body to an arbitrary shell command.
+  app.post('/api/v1/code/agents/:id/install', async (c) => {
+    // ── Require a NON-SIMPLE request (hostile-review finding) ────────────────────────────────
+    // Hono's `cors()` only SETS response headers; for a non-OPTIONS request it calls next()
+    // unconditionally, and auth.ts's loopback carve-out lets any request from the user's own
+    // machine through. A `fetch(url,{method:'POST'})` with no body sets no Content-Type, making it
+    // a CORS-SIMPLE request — no preflight — so any website the user happened to be visiting could
+    // fire `npm install -g <pkg>` (and its postinstall scripts) with no interaction. Requiring a
+    // JSON content-type forces a preflight, which the origin allowlist then fails.
+    if (!(c.req.header('content-type') ?? '').toLowerCase().includes('application/json')) {
+      return err(c, 400, 'unsupported_media_type', 'This endpoint requires Content-Type: application/json.')
+    }
+    const id = c.req.param('id')
+    const result = await installAgent(id)
+    if (!result.ok) return err(c, 400, 'install_failed', result.message)
+    return c.json({ ok: true }, 200)
+  })
+
   app.get('/api/v1/code/stats', (c) => {
     const q = c.req.query('range')
     const range = q === '30d' || q === '7d' ? q : 'all'

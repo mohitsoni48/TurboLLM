@@ -51,6 +51,7 @@
 import type { AgentRun, ConversationStore } from '../chat/db'
 import type { GenerationGate } from '../agents/gate'
 import type { Routine, RoutineRun, RoutineRunStatus } from './schema'
+import { isTerminalCodingAgent, TERMINAL_CODE_AGENT } from './schema'
 import type { RouteResult } from '../gateway/model-router'
 import { decideModelAction } from './model-conflict'
 import type { CreateAgentTerminalResult } from '../terminal/terminal-routes'
@@ -89,6 +90,12 @@ export interface CliInteractiveDeps {
  *  nothing left in memory to restore FROM, so `finalizeInteractiveRun` simply skips it — no worse
  *  than the one-shot path's own documented behavior. */
 const pendingRestore = new Map<string, string>()
+
+/** The harness name to use in a user-facing error. This runner now drives claude, opencode and pi,
+ *  so a hardcoded "claude" sent the user to debug a CLI that was never involved. */
+function agentLabel(routine: Routine): string {
+  return isTerminalCodingAgent(routine.codingAgent) ? TERMINAL_CODE_AGENT[routine.codingAgent] : 'claude'
+}
 
 /** The real Chat/in-app-pi… no — the interactive CLI-flavor Routine executor (spec 20 §5/§6,
  *  ask/plan half of Phase 3's claude_cli support). Kicks the run off and returns quickly (spawn
@@ -136,7 +143,12 @@ export async function runCliInteractiveRoutine(
   deps.store.setConversationMode(conv.id, mode)
   const agentRun = deps.store.createAgentRun({
     convId: conv.id, title: routine.prompt.slice(0, 60), allowedTools: [],
-    repoRoot: routine.workspacePath, codeAgent: 'claude',
+    repoRoot: routine.workspacePath,
+    // Mapped from the routine's own choice, never hardcoded: this same runner now drives every
+    // terminal harness (claude/opencode/pi), and stamping 'claude' on an opencode routine would
+    // make createAgentTerminal build a claude launch command for it. See schema.ts's
+    // TERMINAL_CODE_AGENT for why the two vocabularies differ.
+    codeAgent: isTerminalCodingAgent(routine.codingAgent) ? TERMINAL_CODE_AGENT[routine.codingAgent] : 'claude',
   })
   deps.store.updateRoutineRun(run.id, { codeSessionId: agentRun.id })
   deps.store.addMessage(conv.id, 'user', routine.prompt)
@@ -151,7 +163,7 @@ export async function runCliInteractiveRoutine(
   const result = await deps.createTerminal(agentRun, { mode, firstMessage: routine.prompt })
   if (!result.ok) {
     if (previousModel) await restoreModel(deps, previousModel)
-    finish({ status: 'errored', error: `Could not start the interactive claude CLI session: ${result.message}` })
+    finish({ status: 'errored', error: `Could not start the interactive ${agentLabel(routine)} CLI session: ${result.message}` })
     return 'errored'
   }
 
@@ -220,7 +232,17 @@ export function sweepInteractiveCliRuns(deps: CliInteractiveSweepDeps): void {
     } catch {
       continue // not this module's problem to fix a corrupt snapshot — resumeRoutineRun's own callers own that
     }
-    if (routine.codingAgent !== 'claude_cli') continue // a pi tool-approval stall — untouched
+    // EVERY terminal harness, not just claude_cli. This sweep is the ONLY code that finalizes an
+    // interactive CLI routine run — `finalizeInteractiveRun` is module-private and every call site
+    // sits below this line. While this said `!== 'claude_cli'`, an opencode_cli/pi_cli run (which
+    // execute.ts routes here in every permission mode) fired once, parked at `needs_approval` with
+    // no `endedAt`, and stayed PARKED — which this module treats as "protected from a second
+    // concurrent fire", so the routine never fired again. Even the wall-clock timeout below could
+    // not rescue it, because that check is also past this `continue`.
+    //
+    // An in-app 'pi' routine still skips: it has no CLI, no PTY and no codeSessionId, and its
+    // tool-approval stall is genuinely not this sweep's problem.
+    if (!isTerminalCodingAgent(routine.codingAgent)) continue
     if (!run.codeSessionId) continue // should be unreachable for this codingAgent; defensive only
 
     if (deps.isAgentExited(run.codeSessionId)) {
@@ -228,7 +250,7 @@ export function sweepInteractiveCliRuns(deps: CliInteractiveSweepDeps): void {
       finalizeInteractiveRun(deps, run,
         exitCode === 0
           ? { status: 'ok', result: 'Completed — see the embedded session for the full transcript.' }
-          : { status: 'errored', error: `claude CLI exited with code ${exitCode ?? 'unknown'}.` })
+          : { status: 'errored', error: `${agentLabel(routine)} CLI exited with code ${exitCode ?? 'unknown'}.` })
       continue
     }
     if (!deps.isTerminalActive(run.codeSessionId)) {

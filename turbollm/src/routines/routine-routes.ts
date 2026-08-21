@@ -4,7 +4,8 @@ import type { Deps } from '../deps'
 import { isLocalRequest, verifyPresentedKey } from '../auth'
 import { computeNextFireTime } from './schedule'
 import { resumeRoutineRun } from './execute'
-import type { ScheduleRule, RoutineFlavor, Routine, RoutineRun } from './schema'
+import type { ScheduleRule, RoutineFlavor, Routine, RoutineRun, CodingAgentChoice } from './schema'
+import { CODING_AGENT_CHOICES } from './schema'
 
 type Status = 200 | 201 | 400 | 401 | 403 | 404 | 409 | 500 | 503
 
@@ -26,7 +27,7 @@ export interface RoutineBody {
   modelKey?: string
   agentId?: string
   workspacePath?: string
-  codingAgent?: 'pi' | 'claude_cli'
+  codingAgent?: CodingAgentChoice
   permissionMode?: 'auto' | 'plan' | 'ask'
 }
 
@@ -73,8 +74,10 @@ function validateCommonFields(b: RoutineBody): string | null {
   if (b.permissionMode !== undefined && b.permissionMode !== 'auto' && b.permissionMode !== 'plan' && b.permissionMode !== 'ask') {
     return 'permissionMode must be "auto", "plan" or "ask".'
   }
-  if (b.codingAgent !== undefined && b.codingAgent !== 'pi' && b.codingAgent !== 'claude_cli') {
-    return 'codingAgent must be "pi" or "claude_cli".'
+  // Driven off schema.ts's single list, so adding a harness there can never leave this validator
+  // silently rejecting it (and the error message can never drift out of sync with what's accepted).
+  if (b.codingAgent !== undefined && !CODING_AGENT_CHOICES.includes(b.codingAgent)) {
+    return `codingAgent must be one of: ${CODING_AGENT_CHOICES.map((c) => `"${c}"`).join(', ')}.`
   }
   if (b.scheduleRule !== undefined) return validateScheduleRule(b.scheduleRule)
   return null
@@ -102,7 +105,9 @@ export function validateCreate(b: RoutineBody, modelExists?: (key: string) => bo
   }
   if (b.flavor === 'chat' && !b.agentId?.trim()) return 'agentId is required for a chat-flavor routine.'
   if (b.flavor === 'code' && !b.workspacePath?.trim()) return 'workspacePath is required for a code-flavor routine.'
-  if (b.flavor === 'code' && b.codingAgent !== 'pi' && b.codingAgent !== 'claude_cli') return 'codingAgent must be "pi" or "claude_cli" for a code-flavor routine.'
+  if (b.flavor === 'code' && (b.codingAgent === undefined || !CODING_AGENT_CHOICES.includes(b.codingAgent))) {
+    return `codingAgent must be one of: ${CODING_AGENT_CHOICES.map((c) => `"${c}"`).join(', ')} for a code-flavor routine.`
+  }
   return validateCommonFields(b)
 }
 

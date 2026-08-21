@@ -1,12 +1,17 @@
 import { useId, useState } from 'react'
 import type { RoutineDraft } from '../../lib/routine-form'
+import type { CodingAgentChoice } from '../../lib/routine-types'
 import { useChatAgents, useModels } from '../../lib/queries'
 import { FsBrowser } from '../../screens/engines/FsBrowser'
 import { track } from '../../lib/api'
 
-const CODING_AGENT_OPTIONS: { value: 'pi' | 'claude_cli'; label: string }[] = [
+// Labels say plainly which one runs in-process and which shell out — the distinction that the
+// value names encode with the `_cli` suffix (routine-types.ts).
+const CODING_AGENT_OPTIONS: { value: CodingAgentChoice; label: string }[] = [
   { value: 'pi', label: 'In-app pi engine' },
   { value: 'claude_cli', label: 'Terminal claude CLI (local gateway)' },
+  { value: 'opencode_cli', label: 'Terminal opencode CLI (local gateway)' },
+  { value: 'pi_cli', label: 'Terminal pi CLI (local gateway)' },
 ]
 const PERMISSION_MODE_OPTIONS: { value: 'auto' | 'plan' | 'ask'; label: string }[] = [
   { value: 'ask', label: 'Ask before each tool call' },

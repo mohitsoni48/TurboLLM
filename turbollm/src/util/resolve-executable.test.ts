@@ -82,3 +82,48 @@ test('requiresShell: never on POSIX, where there is no shim problem', () => {
   assert.equal(requiresShell('/usr/bin/claude', 'linux'), false)
   assert.equal(requiresShell('/usr/bin/x.cmd', 'linux'), false)
 })
+
+// ── The npm-shim trap (founder-reported live, 2026-08-18) ──────────────────────────────────────
+// npm installs THREE files per global bin: an extension-less Unix shell script, plus `.cmd` and
+// `.ps1`. Listing the bare name as a candidate meant the Unix script won on Windows — and since
+// `isExecutableFile` returns true for ANY file there (no x-bit), it looked like a real hit, so
+// `requiresShell` said "no shell needed" and Node was asked to spawn a bash script as a Windows
+// process. Result: ENOENT ("pi is not installed or not on your PATH") for a CLI that was installed,
+// followed by a ConPTY abort. `claude` was unaffected only because it ships a real `claude.exe`.
+
+test('resolveExecutable: on win32 an npm shim resolves to .cmd, never the extension-less script', () => {
+  // Exactly what `npm i -g @earendil-works/pi-coding-agent` leaves on disk.
+  const dir = sandbox(['pi', 'pi.cmd', 'pi.ps1'])
+  try {
+    const hit = resolveExecutable('pi', { PATH: dir, PATHEXT: '.COM;.EXE;.BAT;.CMD' }, 'win32')
+    assert.equal(hit, join(dir, 'pi.cmd'), 'the extension-less Unix script is not launchable on Windows')
+    assert.equal(requiresShell(hit, 'win32'), true, 'a .cmd shim must go through a shell')
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('resolveExecutable: on win32 an extension-less-ONLY command is not found at all', () => {
+  // Honest "not found" beats returning a path Windows cannot execute — the caller then keeps its
+  // shell fallback instead of spawning something guaranteed to ENOENT.
+  const dir = sandbox(['weird'])
+  try {
+    assert.equal(resolveExecutable('weird', { PATH: dir, PATHEXT: '.EXE;.CMD' }, 'win32'), null)
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('resolveExecutable: POSIX still resolves the extension-less binary (unchanged)', () => {
+  // The bare name is the ONLY correct answer off Windows — this must not regress.
+  const dir = sandbox(['pi'])
+  try {
+    assert.equal(resolveExecutable('pi', { PATH: dir }, 'linux'), join(dir, 'pi'))
+    assert.equal(requiresShell(join(dir, 'pi'), 'linux'), false)
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('resolveExecutable: a real .exe still wins and still spawns without a shell (claude path)', () => {
+  const dir = sandbox(['claude', 'claude.exe'])
+  try {
+    const hit = resolveExecutable('claude', { PATH: dir, PATHEXT: '.COM;.EXE;.BAT;.CMD' }, 'win32')
+    assert.equal(hit, join(dir, 'claude.exe'))
+    assert.equal(requiresShell(hit, 'win32'), false)
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})

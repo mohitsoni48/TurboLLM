@@ -123,6 +123,25 @@ export function getStatus(): Promise<Status> {
   return request<Status>('/api/v1/status')
 }
 
+// ── Coding-agent availability ────────────────────────────────────────────────
+/** Whether each terminal-agent CLI is actually installed on this machine, and the command that
+ *  installs it. Label/description deliberately are NOT here — those live in code-types.ts's
+ *  CODE_AGENTS so that copy has exactly one owner. */
+export type AgentAvailability = { id: string; installed: boolean; installCommand: string }
+
+export function getAgentAvailability(): Promise<{ agents: AgentAvailability[] }> {
+  return request<{ agents: AgentAvailability[] }>('/api/v1/code/agents')
+}
+
+/** Run a harness's own registered install command. The caller picks only WHICH agent — never the
+ *  command — so no arbitrary command can be reached from the client. */
+export function installCodeAgent(id: string): Promise<{ ok: true }> {
+  // `json: {}` is load-bearing, not decoration: it sets Content-Type, which the daemon now REQUIRES
+  // on this route so the request is CORS-non-simple and gets preflighted. Without it a bare POST
+  // from any website would reach the handler (see the route's own comment).
+  return request<{ ok: true }>(`/api/v1/code/agents/${encodeURIComponent(id)}/install`, { method: 'POST', json: {} })
+}
+
 /** Live running-session stats (B4) ride on the status payload — surfaced from the
  *  status poll rather than a separate endpoint. Re-exported for convenience. */
 export type { EngineStats } from './types'
