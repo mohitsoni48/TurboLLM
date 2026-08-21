@@ -2,7 +2,7 @@
 // (which split modes the sweep tries, in order) and the split-aware overHeadroom budget.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { pickSplitStrategies, overHeadroom } from './bench'
+import { withBalancedSplit, pickSplitStrategies, overHeadroom } from './bench'
 import { deriveDefault } from '../models/profile'
 import type { LoadProfile } from '../models/profile'
 import type { ModelEntry } from '../models/scanner'
@@ -111,4 +111,44 @@ test('overHeadroom judges against the given budget, not a fixed pool', () => {
 test('overHeadroom never blocks on unknown VRAM or zero budget', () => {
   assert.equal(overHeadroom(null, 15360, 1024), false)
   assert.equal(overHeadroom(14000, 0, 1024), false)
+})
+
+// ---- withBalancedSplit ------------------------------------------------------
+// Ground truth: dual Tesla T4 (2x15360 MB) running Qwen3.6-35B-A3B. See deploy/kaggle/README.md.
+
+const MOE40 = { blockCount: 40, moe: true, expertCount: 128, arch: 'qwen3moe' } as Partial<ModelEntry>
+const t4x2 = sys([15360, 15360])
+
+test('offload that strands a card gets a byte-balanced tensor-split', () => {
+  const m = model({ sizeBytes: 36_903_140_320, ...MOE40 })   // Q8_0, needs offload on 2x16 GB
+  const p = { ...base(t4x2, { ctx: 8192, nCpuMoe: 24, ngl: 99 }, m) }
+  const out = withBalancedSplit(p, m, t4x2)
+  assert.ok(out.gpu.tensorSplit.length === 2, 'a split should be derived')
+  assert.ok(out.gpu.tensorSplit[0] > out.gpu.tensorSplit[1], 'the expert-stripped head is cheap, so GPU0 takes more layers')
+})
+
+test('no offload → left alone (even layers are already even bytes)', () => {
+  const m = model({ sizeBytes: 22_853_663_008, ...MOE40 })   // Q4_K_XL fits both cards at nCpuMoe 0
+  const p = base(t4x2, { ctx: 8192, nCpuMoe: 0, ngl: 99 }, m)
+  assert.deepEqual(withBalancedSplit(p, m, t4x2).gpu.tensorSplit, [])
+})
+
+test('dense model → left alone (uniform layers cannot be imbalanced)', () => {
+  const m = model({ sizeBytes: 40_000_000_000, moe: false, blockCount: 40 })
+  const p = base(t4x2, { ctx: 8192, ngl: 99 }, m)
+  assert.deepEqual(withBalancedSplit(p, m, t4x2).gpu.tensorSplit, [])
+})
+
+test('a split the user pinned is never overwritten', () => {
+  const m = model({ sizeBytes: 36_903_140_320, ...MOE40 })
+  const p = base(t4x2, { ctx: 8192, nCpuMoe: 24, ngl: 99 }, m)
+  const pinned = { ...p, gpu: { ...p.gpu, tensorSplit: [1, 1] } }
+  assert.deepEqual(withBalancedSplit(pinned, m, t4x2).gpu.tensorSplit, [1, 1])
+})
+
+test('single-GPU box → left alone', () => {
+  const one = sys([15360])
+  const m = model({ sizeBytes: 36_903_140_320, ...MOE40 })
+  const p = base(one, { ctx: 8192, nCpuMoe: 24, ngl: 99 }, m)
+  assert.deepEqual(withBalancedSplit(p, m, one).gpu.tensorSplit, [])
 })
