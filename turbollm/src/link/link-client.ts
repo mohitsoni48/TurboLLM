@@ -104,16 +104,47 @@ export class LinkClient {
     return { kind: 'status', status: res.body as ModelStatusView }
   }
 
+  /** Ask the host to load `modelKey` (spec §5.3). The host answers 202 the moment the load
+   *  is QUEUED, not when it finishes — so `accepted` means "the host took the request", and
+   *  the peer learns the outcome from its normal `status()` polling, exactly as the local UI
+   *  learns it from `/status`. Nothing here waits on a multi-minute weights load.
+   *
+   *  Goes through `call()` like every other method, so it inherits the same total
+   *  "never throws, never adopts garbage" guarantee. A 403 (no `models:load`, or a model
+   *  outside the grant) and a 404 (no such model there) both surface as `http` probes the
+   *  caller can render — never as an exception on the poll loop. */
+  async load(modelKey: string): Promise<LinkProbe | { kind: 'accepted' }> {
+    const res = await this.call('/api/link/v1/models/load', 'POST', { modelKey })
+    return res.kind === 'body' ? { kind: 'accepted' } : res
+  }
+
+  /** Ask the host to unload whatever it is running. Same `accepted`-means-queued contract
+   *  and same total guarantee as `load()`. `http 403` is the normal answer for a token
+   *  granted `models:load` but not `models:unload` — the two never imply each other. */
+  async unload(): Promise<LinkProbe | { kind: 'accepted' }> {
+    const res = await this.call('/api/link/v1/models/unload', 'POST')
+    return res.kind === 'body' ? { kind: 'accepted' } : res
+  }
+
   /** Shared request path. Returns a discriminated result so callers never see an
-   *  exception: `body` on a parsed 2xx, otherwise an http/network probe. */
+   *  exception: `body` on a parsed 2xx, otherwise an http/network probe.
+   *
+   *  `json` is sent as a JSON request body when present. Omitted entirely otherwise, so the
+   *  existing bodyless GET/POST callers are byte-for-byte unchanged. */
   private async call(
     path: string,
     method: string,
+    json?: unknown,
   ): Promise<LinkProbe | { kind: 'body'; body: unknown }> {
     try {
       const res = await this.fetchImpl(`${this.rec.baseUrl}${path}`, {
         method,
-        headers: { 'X-TurboLLM-Auth': this.rec.token, accept: 'application/json' },
+        headers: {
+          'X-TurboLLM-Auth': this.rec.token,
+          accept: 'application/json',
+          ...(json === undefined ? {} : { 'content-type': 'application/json' }),
+        },
+        ...(json === undefined ? {} : { body: JSON.stringify(json) }),
         signal: AbortSignal.timeout(this.timeoutMs),
       })
       if (!res.ok) return { kind: 'http', status: res.status }

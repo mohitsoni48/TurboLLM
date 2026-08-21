@@ -6,6 +6,7 @@ import type { ApiKey } from '../config/config'
 import { linkAuth, requireCapability } from './link-auth'
 import { gatewayV1Handler } from '../gateway/gateway'
 import { buildModelStatus } from '../api/status-view'
+import { startEngine, stopEngine } from '../api/engine-lifecycle'
 import { allowsModel, hasCapability } from './capabilities'
 import { canWake, hostIdleState } from './host-idle'
 import { LINK_API_VERSIONS } from './protocol'
@@ -153,6 +154,54 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
    *  the shared builder, so it cannot cross here. See status-view.ts. */
   linkApp.get('/api/link/v1/status', requireCapability('models:use'), (c) =>
     c.json(buildModelStatus(d)),
+  )
+
+  /** Remote model load (spec §5.3). Mounts the EXISTING `startEngine` — the same function
+   *  `POST /api/v1/engine/start` calls — behind `requireCapability`, so eviction, the keep-N
+   *  pool, the ComfyUI guard, the auto-tune kill switch and swap serialization are literally
+   *  the same code for a peer as for the local UI. Nothing here re-implements a load, and
+   *  nothing here adds a second lock: `startEngine` already goes through
+   *  `modelRouter.withSwapLock`, so a second remote load queues behind an in-flight one.
+   *
+   *  Three checks run BEFORE delegating, and all three are façade concerns the local route
+   *  has no business carrying:
+   *   1. `modelKey` is REQUIRED. `startEngine` treats an empty request as "re-load
+   *      `lastLoaded`" (the Engines "Start" button) — a peer must never trigger that by
+   *      omission, because the model it would load is one the grant may not even allow.
+   *   2. The grant allowlist, exact-match (`allowsModel`) — the same predicate
+   *      `GET /api/link/v1/models` filters with, so a peer can only load what it can see.
+   *   3. An unknown key is a clean 404. `startEngine` would otherwise fall through to its
+   *      transitional path/devModel branch and answer 409 `no_such_model` — a confusing
+   *      code for "you named a model I don't have", and one whose branch a remote caller
+   *      must never reach at all (it launches a caller-named FILESYSTEM PATH; ADR-139).
+   *      Passing `{ modelKey }` alone — never the peer's raw body — is what forecloses it.
+   *
+   *  The body it returns is `startEngine`'s own `{ ok: true }` / typed error, which carries
+   *  no filesystem detail (see engine-lifecycle.ts). */
+  linkApp.post('/api/link/v1/models/load', requireCapability('models:load'), async (c) => {
+    const key = c.get('linkKey')
+    const body = await c.req.json().catch(() => ({})) as { modelKey?: unknown }
+    const modelKey = typeof body.modelKey === 'string' ? body.modelKey.trim() : ''
+    if (!modelKey) {
+      return c.json({ error: { code: 'invalid_input', message: 'modelKey is required.' } }, 400)
+    }
+    if (!allowsModel(key, modelKey)) {
+      return c.json({ error: { code: 'forbidden', message: `This link may not use '${modelKey}'.` } }, 403)
+    }
+    if (!d.scanner.get(modelKey)) {
+      return c.json({ error: { code: 'no_such_model', message: `No model '${modelKey}' on this machine.` } }, 404)
+    }
+    return startEngine(c, d, { modelKey })
+  })
+
+  /** Remote unload (spec §5.3) — the SAME `stopEngine` `POST /api/v1/engine/stop` calls.
+   *
+   *  Gated on `models:unload`, which `models:load` deliberately does NOT imply: a token
+   *  granted "you may put a model up" was not granted "you may take the host's model down"
+   *  while its owner is mid-conversation. They are separate boxes in the mint UI and
+   *  separate gates here; capabilities.test.ts pins that they stay distinct. */
+  linkApp.post('/api/link/v1/models/unload', requireCapability('models:unload'), (c) =>
+    stopEngine(c, d),
   )
 
   linkApp.post('/api/link/v1/chat/completions', requireCapability('models:use'), async (c) => {
