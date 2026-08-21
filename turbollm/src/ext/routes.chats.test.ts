@@ -700,6 +700,66 @@ test('a metadata blob over the byte limit is refused with 413, even with tiny co
   }
 })
 
+// ── Round-3 final-whole-branch-review finding: "N5/N6's byte-size checks crash with a bare
+// non-JSON 500 on type-confused attachments/content" — body<T>() is a bare cast, not a schema
+// check, so a client sending a non-string attachment element or a non-array `attachments` used
+// to reach `Buffer.byteLength`/`.reduce` on the wrong shape and crash before this route's own
+// try/catch, producing Hono's bare non-JSON default 500 instead of the structured error
+// envelope. These reproduce the review's own live repro shapes exactly.
+test('attachments containing a non-string element is refused with a clean 400, not a bare 500', async () => {
+  const { app, cleanup } = harness()
+  try {
+    const chatId = await (async () => {
+      const made = await app.request('/api/ext/v1/chats', json(ACME, { title: 'BadAttachType', owner: 'u1' }))
+      return (await made.json() as { id: string }).id
+    })()
+    const res = await app.request(`/api/ext/v1/chats/${chatId}/messages`,
+      json(ACME, { role: 'user', owner: 'u1', generate: false, attachments: [12345] }))
+    const text = await res.text()
+    let parsed: { error?: { type?: unknown; code?: unknown } }
+    try {
+      parsed = JSON.parse(text)
+    } catch {
+      assert.fail(`response body is not JSON (bare framework error?): ${text.slice(0, 200)}`)
+    }
+    assert.equal(res.status, 400)
+    assert.equal(parsed.error?.type, 'invalid_request')
+    assert.equal(parsed.error?.code, 'invalid_input')
+
+    const list = await (await app.request(`/api/ext/v1/chats/${chatId}/messages?owner=u1`, json(ACME))).json() as { data: unknown[] }
+    assert.equal(list.data.length, 0, 'the malformed write must not have been persisted')
+  } finally {
+    cleanup()
+  }
+})
+
+test('a non-array attachments value is refused with a clean 400, not a bare 500', async () => {
+  const { app, cleanup } = harness()
+  try {
+    const chatId = await (async () => {
+      const made = await app.request('/api/ext/v1/chats', json(ACME, { title: 'BadAttachShape', owner: 'u1' }))
+      return (await made.json() as { id: string }).id
+    })()
+    const res = await app.request(`/api/ext/v1/chats/${chatId}/messages`,
+      json(ACME, { role: 'user', owner: 'u1', generate: false, attachments: { foo: 'bar' } }))
+    const text = await res.text()
+    let parsed: { error?: { type?: unknown; code?: unknown } }
+    try {
+      parsed = JSON.parse(text)
+    } catch {
+      assert.fail(`response body is not JSON (bare framework error?): ${text.slice(0, 200)}`)
+    }
+    assert.equal(res.status, 400)
+    assert.equal(parsed.error?.type, 'invalid_request')
+    assert.equal(parsed.error?.code, 'invalid_input')
+
+    const list = await (await app.request(`/api/ext/v1/chats/${chatId}/messages?owner=u1`, json(ACME))).json() as { data: unknown[] }
+    assert.equal(list.data.length, 0, 'the malformed write must not have been persisted')
+  } finally {
+    cleanup()
+  }
+})
+
 // ── N6 (final-gate fix round) — PATCH /messages/:id had no body-size enforcement at all ────
 test('PATCH /messages/:id refuses an over-limit content edit with 413, and does not persist it', async () => {
   const { app, cleanup } = harness()
@@ -742,6 +802,42 @@ test('PATCH /messages/:id refuses an over-limit metadata edit with 413', async (
     })
     assert.equal(res.status, 413)
     assert.equal((await res.json() as { error: { code: string } }).error.code, 'payload_too_large')
+  } finally {
+    cleanup()
+  }
+})
+
+// ── Round-3 final-whole-branch-review finding: same "bare 500 on type-confused JSON" defect,
+// on the PATCH path — `content: 999999` used to reach `Buffer.byteLength(b.content, 'utf8')`
+// with a number and crash before this route's own try/catch. Reproduces the review's own live
+// repro shape exactly.
+test('PATCH /messages/:id refuses a non-string content edit with a clean 400, not a bare 500', async () => {
+  const { app, cleanup } = harness()
+  try {
+    const made = await app.request('/api/ext/v1/chats', json(ACME, { title: 'BadContentType', owner: 'u1' }))
+    const chat = await made.json() as { id: string }
+    const created = await app.request(`/api/ext/v1/chats/${chat.id}/messages`,
+      json(ACME, { role: 'user', content: 'small', owner: 'u1', generate: false }))
+    const msg = await created.json() as { id: string; content: string }
+
+    const res = await app.request(`/api/ext/v1/messages/${msg.id}`, {
+      method: 'PATCH',
+      headers: { Authorization: ACME, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 999999, owner: 'u1' }),
+    })
+    const text = await res.text()
+    let parsed: { error?: { type?: unknown; code?: unknown } }
+    try {
+      parsed = JSON.parse(text)
+    } catch {
+      assert.fail(`response body is not JSON (bare framework error?): ${text.slice(0, 200)}`)
+    }
+    assert.equal(res.status, 400)
+    assert.equal(parsed.error?.type, 'invalid_request')
+    assert.equal(parsed.error?.code, 'invalid_input')
+
+    const got = await (await app.request(`/api/ext/v1/messages/${msg.id}?owner=u1`, json(ACME))).json() as { content: string }
+    assert.equal(got.content, 'small', 'the edit must not have been persisted — the original content stands')
   } finally {
     cleanup()
   }

@@ -119,6 +119,21 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
       role?: 'user'; content?: string; owner?: string
       attachments?: string[]; metadata?: Record<string, unknown>
     }
+    // Runtime shape guard (round-3 review finding, "N5/N6's byte-size checks crash..."): the
+    // `as` cast above is not a schema check, so a client can send `content: 999999` or
+    // `attachments: [999]` and hit `.trim()` / `Buffer.byteLength` / `.reduce` on a non-string
+    // value further down — each throws a synchronous TypeError before this route's own
+    // try/catch, which Hono's default handler (no `app.onError` registered anywhere in this
+    // app) turns into a bare, non-JSON "Internal Server Error" at 500 instead of the required
+    // structured error envelope. Checked here, before the idempotency-replay branch even runs
+    // (it doesn't touch these fields) and before the `.trim()` call two lines down — see
+    // routes.chats.ts's identical guard on its create-path handler for the full rationale.
+    if (b.content !== undefined && typeof b.content !== 'string') {
+      return extError(c, 'invalid_request', 'invalid_input', '`content` must be a string.', { param: 'content' })
+    }
+    if (b.attachments !== undefined && (!Array.isArray(b.attachments) || !b.attachments.every((a) => typeof a === 'string'))) {
+      return extError(c, 'invalid_request', 'invalid_input', '`attachments` must be an array of strings.', { param: 'attachments' })
+    }
     const scope = scopeFor(c, b.owner)
     const content = (b.content ?? '').trim()
     const attachments = b.attachments

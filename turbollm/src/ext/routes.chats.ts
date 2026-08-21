@@ -281,6 +281,22 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
       role: 'user' | 'assistant'; content: string; reasoning: string; owner: string; generate: boolean
       attachments?: string[]; metadata?: Record<string, unknown>
     }>(c)
+    // Runtime shape guard (round-3 review finding, "N5/N6's byte-size checks crash..."):
+    // `body<T>()` above is a bare `as Partial<T>` cast, not a schema check, so a client can send
+    // `content: 999999`, `attachments: [12345]`, or `attachments: {...}` (non-array) and hit
+    // `.trim()` / `Buffer.byteLength` / `.reduce` on a non-string value a few lines below — each
+    // throws a synchronous TypeError BEFORE this route's own try/catch, which Hono's default
+    // handler (no `app.onError` registered anywhere in this app) turns into a bare, non-JSON
+    // "Internal Server Error" at 500 instead of the required structured error envelope. Checked
+    // here, before ANY operation that assumes `content`/`attachments` are already the right
+    // shape — including the `.trim()` call two lines down, not just the byte-size checks further
+    // below, since `.trim()` on a non-string throws just as readily as `Buffer.byteLength` does.
+    if (b.content !== undefined && typeof b.content !== 'string') {
+      return extError(c, 'invalid_request', 'invalid_input', '`content` must be a string.', { param: 'content' })
+    }
+    if (b.attachments !== undefined && (!Array.isArray(b.attachments) || !b.attachments.every((a) => typeof a === 'string'))) {
+      return extError(c, 'invalid_request', 'invalid_input', '`attachments` must be an array of strings.', { param: 'attachments' })
+    }
     const content = (b.content ?? '').trim()
     const attachments = b.attachments
     // "Type a message OR attach a file" (spec 27 §3.2/§5.1) — content alone is no longer the
@@ -395,6 +411,14 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
     const b = await body<{ content: string; metadata: Record<string, unknown>; owner: string; if_version: number }>(c)
     const scope = scopeFor(c, b.owner)
     const id = c.req.param('id')
+    // Runtime shape guard (round-3 review finding — see the identical comment in the POST
+    // /chats/:id/messages handler above for the full explanation): `body<T>()` is a bare cast,
+    // so a PATCH with `content: 999999` would otherwise reach `Buffer.byteLength(b.content, ...)`
+    // just below with a non-string value and crash with a bare, non-JSON 500 before this route's
+    // own try/catch. Checked before the byte-size check, not inside it.
+    if (b.content !== undefined && typeof b.content !== 'string') {
+      return extError(c, 'invalid_request', 'invalid_input', '`content` must be a string.', { param: 'content' })
+    }
     // N6 (final-gate fix round): both message-CREATION routes enforce MAX_BODY_BYTES before
     // persistence; this EDIT path called `updateMessage` directly with no size check at all —
     // a client could bypass the cap entirely by creating a small message, then PATCHing it to

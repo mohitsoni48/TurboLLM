@@ -786,6 +786,36 @@ test('attachments whose total byte size exceeds the limit are refused with 413 o
   }
 })
 
+// ── Round-3 final-whole-branch-review finding: "N5/N6's byte-size checks crash with a bare
+// non-JSON 500 on type-confused attachments/content" — the route's `as` cast is not a schema
+// check, so a non-string attachment element used to reach `.reduce`/`Buffer.byteLength` with the
+// wrong shape and crash before this route's own try/catch, producing Hono's bare non-JSON
+// default 500 instead of the structured error envelope. Reproduces the review's own live repro
+// shape exactly.
+test('attachments containing a non-string element is refused with a clean 400 on the generate route, not a bare 500', async () => {
+  const { app, cleanup } = harness()
+  try {
+    const chatId = await newChat(app)
+    const res = await app.request(`/api/ext/v1/chats/${chatId}/messages/generate`,
+      post(ACME, { role: 'user', owner: 'u1', attachments: [999] }))
+    const text = await res.text()
+    let parsed: { error?: { type?: unknown; code?: unknown } }
+    try {
+      parsed = JSON.parse(text)
+    } catch {
+      assert.fail(`response body is not JSON (bare framework error?): ${text.slice(0, 200)}`)
+    }
+    assert.equal(res.status, 400)
+    assert.equal(parsed.error?.type, 'invalid_request')
+    assert.equal(parsed.error?.code, 'invalid_input')
+
+    const list = await (await app.request(`/api/ext/v1/chats/${chatId}/messages?owner=u1`, { headers: { Authorization: ACME } })).json() as { data: unknown[] }
+    assert.equal(list.data.length, 0, 'the malformed write must not have been persisted')
+  } finally {
+    cleanup()
+  }
+})
+
 test('a metadata blob over the byte limit is refused with 413 on the generate route, even with tiny content', async () => {
   const { app, cleanup } = harness()
   try {
