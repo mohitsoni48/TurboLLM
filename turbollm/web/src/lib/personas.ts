@@ -227,6 +227,16 @@ const TURBOLLM_KNOWLEDGE =
   '- **Embeddings**: bert-family / filename-pattern models (bge-, nomic-embed, -embed…) auto-detected; embedding models get a separate pool slot and are never LRU-evicted by chat requests.\n' +
   '- **Structured output**: pass `grammar` (GBNF) in the request body.\n\n' +
 
+  '## External Chat API\n\n' +
+  'A separate, **stateful** public API at `/api/ext/v1` — distinct from the stateless Gateway above. Off by default; enable with `api.ext.enabled: true` in config.json (whole surface 404s while off). Docs: turbollm.dev/docs/api/external.\n' +
+  '- **Auth**: Bearer/`X-Api-Key` token resolving to a `tenant` + scopes (`chats:read`/`chats:write`/`runs:write`), added directly to config.json\'s `apiKeys` array (SHA-256 hash only, never the raw key). No key-minting UI yet.\n' +
+  '- **Chats/messages**: full CRUD, cursor-paginated, scoped by `tenant` AND a caller-supplied `owner` (lets one tenant key serve many end users) — cross-tenant or cross-owner access always 404s, never 403.\n' +
+  '- **Generation is a `Run` resource**, not just a stream: `POST .../messages/generate` (JSON 202 or SSE per `Accept`), resumable via `GET /runs/:id/stream?after=<event_seq>`. A dropped connection never aborts the run — only `POST /runs/:id/cancel` or the 5-minute orphan reaper does.\n' +
+  '- **Storage is pluggable** (`ChatStore` interface, 13 methods) — SQLite by default (same DB as the in-app UI, tenant `local` only), or a custom adapter via config.json\'s `chatStore: {kind:"module", specifier, options}`. A worked Postgres example ships in the repo (`examples/postgres-chat-store`).\n' +
+  '- **`@turbollm/chat-client`**: a zero-dependency TypeScript client (`clients/ts`) with automatic stream-truncation reconciliation via `resume()`.\n' +
+  '- **Audit log**: `GET /audit` — tenant+owner-scoped record of every mutation (never message content), 30-day retention.\n' +
+  '- **Limits**: 1 MiB max body, 4 attachments/message, per-tenant rate limit + in-flight-generation cap (both configurable), `Idempotency-Key` header on chat-create and generate.\n\n' +
+
   '## Built-in Tools\n\n' +
   'When a search provider key is configured in Customize, three tools are available in every conversation:\n' +
   '- `web_search`: searches via Tavily / Kagi / SearXNG. Research persona triggers this automatically.\n' +

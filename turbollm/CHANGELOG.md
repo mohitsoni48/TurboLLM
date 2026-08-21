@@ -25,6 +25,32 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ### Nothing yet.
 
+## [1.11.3] - 2026-08-21
+
+### Added
+
+- **A public External Chat API for building real chat apps on TurboLLM — `/api/ext/v1`.** Send a
+  message, consume an SSE stream, and TurboLLM handles the rest: durable chat/message storage,
+  editing with optimistic concurrency, and resumable generation — a `Run` is a resource you can
+  poll or reconnect to, not just a stream that dies if the connection drops. Off by default — turn
+  it on with `api.ext.enabled` in `config.json`. Full guide at
+  [turbollm.dev/docs/api/external](https://turbollm.dev/docs/api/external).
+- **Bring your own database.** Storage behind the new API is a documented `ChatStore` interface,
+  not a fixed backend — SQLite by default, or point it at your own (a complete, tested Postgres
+  example ships in the repo under `examples/postgres-chat-store`).
+- **A generated OpenAPI 3.1 spec and a TypeScript client.** `@turbollm/chat-client` is a
+  zero-dependency package that gets the one genuinely hard part of streaming — reconciling after a
+  dropped connection without losing or duplicating content — right automatically.
+- **Multi-tenant from the start.** API keys carry a tenant and scopes; every request is further
+  scoped by an integrator-supplied `owner`, so one API key can serve many end users while keeping
+  them isolated from each other.
+- **A tenant-scoped audit log.** Every mutation through the new API — who, what, when, and the
+  outcome — is recorded and queryable, with message/chat content deliberately never retained in it.
+
+### Discord
+- New: a public API for building real chat apps on top of TurboLLM. Send a message, get a resumable stream back — TurboLLM handles storage, editing, and reconnects for you.
+- Comes with a ready-made TypeScript client and a working Postgres example if SQLite isn't your thing. Off by default; one config flag turns it on.
+
 ## [1.11.2] - 2026-08-20
 
 ### Added
