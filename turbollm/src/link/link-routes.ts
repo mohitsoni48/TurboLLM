@@ -14,6 +14,7 @@ import {
   type DownloadFailure,
 } from '../api/download-lifecycle'
 import { allowsModel, hasCapability } from './capabilities'
+import { applyScopedPatch, scrubConfigForRead } from './config-scope'
 import { canWake, hostIdleState } from './host-idle'
 import { FALLBACK_MACHINE_NAME, sanitizeMachineName } from './machine-name'
 import { LINK_API_VERSIONS } from './protocol'
@@ -320,6 +321,104 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
     const out = removeDownload(d, c.req.param('id'))
     if (!out.ok) return linkDownloadErr(c, out)
     return c.json({ ok: true })
+  })
+
+  /** Remote config read (spec §5.8). Returns `scrubConfigForRead`'s ALLOWLIST PROJECTION
+   *  of the host's config — never the config object, and never a spread-then-delete of it.
+   *  `config-scope.ts` carries the full reasoning; the rule this route embodies is that a
+   *  secret or a host path added to `Config` next quarter cannot leak here, because
+   *  nothing in this handler can emit a field the projection does not name.
+   *
+   *  Gated on `config:read` alone: a peer holding `config:write` but not `config:read` is
+   *  a legal (if odd) grant, and it does not get to read by writing. */
+  linkApp.get('/api/link/v1/config', requireCapability('config:read'), (c) =>
+    c.json({ config: scrubConfigForRead(d.store.snapshot()) }),
+  )
+
+  /** Remote config write (spec §5.8) — the highest-risk route in the façade.
+   *
+   *  The body is `{ patch: { '<dotted.path>': value } }` and the peer's paths are NEVER
+   *  merged into the config: every one is checked against `WRITABLE_CONFIG_PATHS` first,
+   *  and a patch containing any rejected path applies NOTHING. See config-scope.ts for why
+   *  each of `apiKeys`, `links`, `telemetry` and `daemon.lanBind` is a full compromise of
+   *  the capability model if it lands, and why atomicity is part of the defence rather
+   *  than a nicety.
+   *
+   *  Three answers, deliberately distinct:
+   *   - **403** — the patch names a path this link may never write. The rejected paths are
+   *     NAMED, for the same reason `requireCapability` names the capability: the peer greys
+   *     its own controls off the handshake, so reaching this means the two ends disagree,
+   *     and a nameless refusal is undiagnosable.
+   *   - **400** — every path is permitted but a VALUE failed its shape check. A different
+   *     fact from "you may not touch that", and collapsing the two would tell a peer its
+   *     grant was narrower than it is.
+   *   - **400 `invalid_config`** — the daemon's own `validate()` rejected the result. The
+   *     scope is the outer gate, not a replacement for it; `ValueError.message` is a field
+   *     name plus a constraint (never a host path), so it is safe to pass on.
+   *
+   *  The patch is dry-run against a SNAPSHOT before `store.update` is called at all, so a
+   *  refused patch never causes a config.json write. */
+  linkApp.patch('/api/link/v1/config', requireCapability('config:write'), async (c) => {
+    const body = await c.req.json().catch(() => ({})) as { patch?: unknown }
+    const patch = body.patch
+    if (typeof patch !== 'object' || patch === null || Array.isArray(patch)) {
+      return c.json(
+        {
+          error: {
+            code: 'invalid_request',
+            message: "Body must be { patch: { '<config.path>': value } }.",
+          },
+        },
+        400,
+      )
+    }
+
+    const dryRun = applyScopedPatch(d.store.snapshot(), patch as Record<string, unknown>)
+    if (!dryRun.ok) {
+      if (dryRun.rejected.length > 0) {
+        return c.json(
+          {
+            error: {
+              code: 'forbidden',
+              rejected: dryRun.rejected,
+              message: `This link may not write: ${dryRun.rejected.join(', ')}.`,
+            },
+          },
+          403,
+        )
+      }
+      return c.json(
+        {
+          error: {
+            code: 'invalid_value',
+            invalid: dryRun.invalid,
+            message: `Not an accepted value for: ${dryRun.invalid.join(', ')}.`,
+          },
+        },
+        400,
+      )
+    }
+
+    try {
+      d.store.update((cfg) => {
+        applyScopedPatch(cfg, patch as Record<string, unknown>)
+      })
+    } catch (err) {
+      return c.json(
+        {
+          error: {
+            code: 'invalid_config',
+            message: err instanceof Error ? err.message : 'The host rejected that config.',
+          },
+        },
+        400,
+      )
+    }
+    return c.json({
+      ok: true,
+      applied: dryRun.applied,
+      config: scrubConfigForRead(d.store.snapshot()),
+    })
   })
 
   linkApp.post('/api/link/v1/chat/completions', requireCapability('models:use'), async (c) => {

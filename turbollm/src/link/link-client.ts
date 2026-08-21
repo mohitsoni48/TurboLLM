@@ -191,6 +191,38 @@ export class LinkClient {
     return res.kind === 'body' ? { kind: 'accepted' } : res
   }
 
+  /** The host's peer-visible config (spec §5.8). Goes through `call()` like every other
+   *  method, so it inherits the same total "never throws, never adopts garbage" guarantee.
+   *
+   *  The body is the host's ALLOWLIST PROJECTION (config-scope.ts's `scrubConfigForRead`)
+   *  and is handed back UNVALIDATED beyond "it is an object": re-deriving its shape here
+   *  would be a second, weaker copy of the host's list that drifts the day a field is
+   *  added there. A `config` result is the only one that may populate a peer-side settings
+   *  view — `http 403` (no `config:read`) means "we do not know this host's settings",
+   *  which must never render as "the host has no settings". */
+  async config(): Promise<LinkProbe | { kind: 'config'; config: Record<string, unknown> }> {
+    const res = await this.call('/api/link/v1/config', 'GET')
+    if (res.kind !== 'body') return res
+    const body = res.body as { config?: unknown }
+    if (typeof body.config !== 'object' || body.config === null || Array.isArray(body.config)) {
+      return { kind: 'network' }
+    }
+    return { kind: 'config', config: body.config as Record<string, unknown> }
+  }
+
+  /** Write a scoped config patch on the host (spec §5.8). `patch` is flat and
+   *  dotted-path-keyed, e.g. `{ 'modelDefaults.ctx': 8192 }`.
+   *
+   *  The host decides what may be written, not this client — it holds the allowlist, and a
+   *  peer-side pre-filter would be a second copy of it that drifts. So a path outside the
+   *  host's scope comes back as `http 403` (with the rejected paths named in the body the
+   *  caller can surface), never as a silent partial write: the host applies the whole patch
+   *  or none of it. */
+  async writeConfig(patch: Record<string, unknown>): Promise<LinkProbe | { kind: 'accepted' }> {
+    const res = await this.call('/api/link/v1/config', 'PATCH', { patch })
+    return res.kind === 'body' ? { kind: 'accepted' } : res
+  }
+
   /** Shared request path. Returns a discriminated result so callers never see an
    *  exception: `body` on a parsed 2xx, otherwise an http/network probe.
    *
