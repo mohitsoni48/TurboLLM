@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { Hono } from 'hono'
 import { createHash, randomUUID } from 'node:crypto'
 import { linkAuth, requireCapability } from './link-auth'
+import { lanAuth } from '../auth'
 import type { Deps } from '../deps'
 import type { ApiKey } from '../config/config'
 
@@ -92,4 +93,72 @@ test('a Bearer token is accepted, matching every other auth surface', async () =
   const app = appWith(depsWith([keyFor('tllm-good', ['models:use'])], { lanBind: true, requireApiKey: true }))
   const res = await app.request('/api/link/v1/ping', { headers: { Authorization: 'Bearer tllm-good' } })
   assert.equal(res.status, 200)
+})
+
+
+// ── A granted token is a FAÇADE-ONLY credential (ADR-376 review, Important 1) ────────
+//
+// linkAuth is the ONLY gate that understands a capability grant. Everything else in the
+// daemon — lanAuth over /v1/*, codeAuth over Code, the terminal pty upgrade — checks the
+// hash alone, so a token minted as "Inference only" presented to the PUBLIC gateway would
+// otherwise sail through and reach the ordinary auto-swap path, loading and evicting
+// models on the host at will. The two halves of the rule are pinned together here so
+// neither can be relaxed without the other failing.
+
+/** The REAL middleware order from createApp (server.ts): lanAuth over EVERYTHING, then
+ *  linkAuth scoped to the façade. Composing only one of the two would have hidden the
+ *  defect this pair exists to pin — lanAuth sits in front of the façade as well, so a rule
+ *  that makes lanAuth refuse granted tokens locks the façade out of the very configuration
+ *  every real Turbo Link host runs in (LAN open, key required). */
+function serverOrderApp(d: Deps) {
+  const app = new Hono()
+  app.use('*', lanAuth(d))
+  app.use('/api/link/v1/*', linkAuth(d))
+  app.post('/v1/chat/completions', (c) => c.json({ ok: true }))
+  app.get('/api/link/v1/ping', (c) => c.json({ ok: true }))
+  return app
+}
+
+const ENFORCING = { lanBind: true, requireApiKey: true }
+
+test('a GRANTED link token is refused by lanAuth on the public /v1/* gateway', async () => {
+  const d = depsWith([keyFor('tllm-peer', ['models:use'])], ENFORCING)
+  const res = await serverOrderApp(d).request('/v1/chat/completions', {
+    method: 'POST', headers: { 'X-TurboLLM-Auth': 'tllm-peer' },
+  })
+  assert.equal(res.status, 401, 'models:use must not become models:load by changing the URL')
+})
+
+test('a granted token carrying EVERY capability is still refused there — the rule is the grant itself', async () => {
+  const caps = ['models:use', 'models:wake', 'models:load', 'models:unload', 'downloads:read', 'downloads:write', 'config:read', 'config:write']
+  const d = depsWith([keyFor('tllm-peer', caps)], ENFORCING)
+  const res = await serverOrderApp(d).request('/v1/chat/completions', {
+    method: 'POST', headers: { 'X-TurboLLM-Auth': 'tllm-peer' },
+  })
+  assert.equal(res.status, 401)
+})
+
+test('the SAME granted token is accepted on /api/link/v1/* THROUGH lanAuth, in server.ts order', async () => {
+  // The other half, and the one that actually bites: lanAuth gates the façade too. If the
+  // façade-only rule is enforced by making lanAuth refuse granted tokens outright, every
+  // real peer gets a 401 before linkAuth is ever reached. lanAuth must DELEGATE this prefix.
+  const d = depsWith([keyFor('tllm-peer', ['models:use'])], ENFORCING)
+  const res = await serverOrderApp(d).request('/api/link/v1/ping', { headers: { 'X-TurboLLM-Auth': 'tllm-peer' } })
+  assert.equal(res.status, 200, 'the façade is where a grant IS understood')
+})
+
+test('delegating the façade prefix does not make it open — linkAuth still 401s a keyless call', async () => {
+  const d = depsWith([keyFor('tllm-peer', ['models:use'])], ENFORCING)
+  const res = await serverOrderApp(d).request('/api/link/v1/ping')
+  assert.equal(res.status, 401)
+})
+
+test('an UNGRANTED legacy key is accepted on BOTH surfaces, exactly as before', async () => {
+  const d = depsWith([keyFor('tllm-legacy')], ENFORCING)
+  const pub = await serverOrderApp(d).request('/v1/chat/completions', {
+    method: 'POST', headers: { 'X-TurboLLM-Auth': 'tllm-legacy' },
+  })
+  assert.equal(pub.status, 200, 'no existing key may be revoked by this change')
+  const facade = await serverOrderApp(d).request('/api/link/v1/ping', { headers: { 'X-TurboLLM-Auth': 'tllm-legacy' } })
+  assert.equal(facade.status, 200)
 })

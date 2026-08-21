@@ -168,3 +168,64 @@ test('model matching is EXACT — a remote model is never resolved by substring'
   const res = await r.route('workstation/Qwen3')
   assert.equal('status' in res && res.status, 503)
 })
+
+
+// ── autoSwap OFF is the single most dangerous configuration for the remote guard, because
+// route()'s early return hands back the CURRENTLY LOADED local model without ever reaching
+// resolveEntry. One case above already pins the offline link there; these pin the rest of
+// the branch in the same configuration, in both directions — the guard must neither leak a
+// local answer nor silently disable federation.
+
+test('autoSwap OFF: a qualified id whose machine LACKS that model is a 503, not the loaded local model', async () => {
+  const r = mkRouter({
+    local: [{ key: 'local-llama', name: 'local-llama' }],
+    loaded: 'local-llama',
+    links: [link()],                                   // online, reachable
+    remoteModels: { l1: [{ key: 'Qwen3-35B', name: 'Qwen3-35B' }] },
+    autoSwap: false,
+  })
+  const res = await r.route('workstation/Gemma-27B')
+  assert.equal('status' in res && res.status, 503)
+})
+
+test('autoSwap OFF: exact model matching still holds for a remote id', async () => {
+  const r = mkRouter({
+    local: [{ key: 'local-llama', name: 'local-llama' }],
+    loaded: 'local-llama',
+    links: [link()],
+    remoteModels: { l1: [{ key: 'Qwen3-35B', name: 'Qwen3-35B' }] },
+    autoSwap: false,
+  })
+  const res = await r.route('workstation/Qwen3')
+  assert.equal('status' in res && res.status, 503)
+})
+
+test('autoSwap OFF: a RESOLVABLE qualified id still routes to the remote host, not the local fallback', async () => {
+  // The other direction of the same guard. autoSwap is a LOCAL swap policy; reading it as
+  // "federation off" would turn every remote request into a silently-local answer, which is
+  // precisely what invariant 5 forbids.
+  const r = mkRouter({
+    local: [{ key: 'local-llama', name: 'local-llama' }],
+    loaded: 'local-llama',
+    links: [link()],
+    remoteModels: { l1: [{ key: 'Qwen3-35B', name: 'Qwen3-35B' }] },
+    autoSwap: false,
+  })
+  const res = await r.route('workstation/Qwen3-35B')
+  assert.ok('target' in res, 'must not early-return the loaded local model')
+  const rem = (res as { remote: { baseUrl: string; modelKey: string } }).remote
+  assert.equal(rem.baseUrl, 'https://ws.trycloudflare.com')
+  assert.equal(rem.modelKey, 'Qwen3-35B')
+})
+
+test('autoSwap OFF: a BARE local id keeps its long-standing fallback to the loaded model', async () => {
+  // Explicitly NOT changed. The fallback exists so unrecognised aliases don't break
+  // clients; only QUALIFIED ids fail loudly. Pinned so the guard above cannot creep.
+  const r = mkRouter({
+    local: [{ key: 'local-llama', name: 'local-llama' }],
+    loaded: 'local-llama',
+    links: [link()],
+    autoSwap: false,
+  })
+  assert.ok('target' in (await r.route('something-nobody-has')))
+})

@@ -82,6 +82,28 @@ export function presentedKey(c: Context): string {
  *  even when enforcing: the SPA shell + its static assets (any path NOT under
  *  /api/ or /v1/) and the always-open health probe. A user must be able to load
  *  the page on the LAN to paste a key (spec 06 §5: `/healthz` always open). */
+/** The Turbo Link façade's path prefix. Duplicated as a literal here rather than imported
+ *  from link/ because link/link-auth.ts imports THIS module — the import would be a cycle.
+ *  Pinned by link-auth.test.ts, which composes both middlewares in server.ts's real order. */
+const LINK_API_PREFIX = '/api/link/v1/'
+
+/** Does this request belong to the Turbo Link façade, which carries its OWN gate?
+ *
+ *  lanAuth runs over `*`, so it sits in front of the façade as well as everything else.
+ *  That matters because a granted (link) token is deliberately refused by verifyKeyValue —
+ *  so if lanAuth judged this prefix, every real peer would be 401'd before linkAuth ever
+ *  ran, in exactly the configuration every Turbo Link host runs in (LAN open, key
+ *  required). lanAuth therefore DELEGATES here instead of deciding.
+ *
+ *  Delegating is strictly stronger, never weaker: linkAuth (link/link-auth.ts) exempts
+ *  NOTHING — not loopback, not "auth disabled", not a full-access key — and 401s anything
+ *  it cannot resolve to a stored key, which is more than lanAuth would ever demand of this
+ *  prefix. `registerLinkAuth` mounts it on precisely this path, immediately after lanAuth
+ *  in createApp; a path under this prefix that the façade does not serve simply 404s. */
+function isLinkFacade(c: Context): boolean {
+  return c.req.path.startsWith(LINK_API_PREFIX)
+}
+
 function isExempt(c: Context): boolean {
   if (c.req.path === '/healthz') return true
   if (c.req.method !== 'GET') return false
@@ -224,13 +246,31 @@ export function resolveKey(c: Context, d: Deps): ApiKey | undefined {
 /** Checks a raw candidate key against stored API keys; bumps lastUsedAt best-effort on a
  *  match. The credential-check core shared by every auth surface — HTTP (verifyPresentedKey,
  *  which sources the raw value from headers) and the WebSocket upgrade handler (which sources
- *  it from a query param, since browsers can't set custom headers on a WebSocket handshake). */
+ *  it from a query param, since browsers can't set custom headers on a WebSocket handshake).
+ *
+ *  A key carrying a Turbo Link `grant` is refused here as though it did not match at all
+ *  (ADR-376 review). Every surface downstream of this function — lanAuth over /v1/*,
+ *  codeAuth over Code's real shell and filesystem access, the terminal WebSocket's pty
+ *  upgrade — compares the hash and NOTHING else. A grant is only meaningful to linkAuth,
+ *  which reads it via resolveKey; so without this rule a token minted as "Inference only"
+ *  could simply be pointed at the PUBLIC /v1/chat/completions instead of the façade, reach
+ *  the ordinary auto-swap path, and load and evict models on the host at will. That would
+ *  reduce models:wake and models:load to advice. A granted token is therefore a
+ *  FAÇADE-ONLY credential, and this is the single choke point that enforces it.
+ *
+ *  Deliberately keyed on the PRESENCE of a grant, never on its contents: "this credential
+ *  was scoped for a peer" is the invariant, and a future capability must not be able to
+ *  widen it by accident. An ungranted legacy key — which is every key minted before Turbo
+ *  Link — is untouched and keeps working everywhere exactly as before. */
 export function verifyKeyValue(key: string, d: Deps): boolean {
   if (!key) return false
   const hash = hashKey(key)
   const cfg = d.store.snapshot()
   const match = cfg.apiKeys.find((k) => k.hash === hash)
   if (!match) return false
+  // Before the lastUsedAt bump on purpose: a refused credential must leave no trace of a
+  // successful use, and must be indistinguishable from a wrong key.
+  if (match.grant) return false
   // Best-effort lastUsedAt bump (spec 06 §5). Never block the request on it.
   try {
     d.store.update((mut) => {
@@ -256,6 +296,11 @@ export function verifyPresentedKey(c: Context, d: Deps): boolean {
  *  pass-through, so local dev and the UI can never be locked out. */
 export function lanAuth(d: Deps): MiddlewareHandler {
   return async (c, next) => {
+    // Hand the façade to its own gate before any of the LAN reasoning below — see
+    // isLinkFacade. Not folded into `isExempt`, whose meaning is "no credential surface
+    // applies"; the opposite is true here, a STRICTER one does.
+    if (isLinkFacade(c)) return next()
+
     const daemon = d.store.snapshot().daemon
     const allow = bypassesAuth({
       lanBind: daemon.lanBind,
