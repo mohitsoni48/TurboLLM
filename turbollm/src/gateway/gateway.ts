@@ -316,7 +316,16 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
     // the engine's slots forever.
     const ac = clientAbort(c)
 
-    /** The single outbound call both branches below make — local engine or Turbo Link host.
+    /** TELEMETRY ATTRIBUTION (spec §5.6): when `remote` is set this machine is the PEER —
+     *  it took the click and forwarded the request, but the host is what ran the tokens, and
+     *  the host reports it (`link/link-routes.ts`'s `reportServed`). Nothing on this branch
+     *  may emit an inference or engine event for the same generation: doing so double-counts
+     *  every federated generation and corrupts every funnel derived from it, by a factor that
+     *  grows with the number of linked machines. `ui_action` is the mirror image and stays
+     *  with the peer, where the click actually happened. `link-routes.telemetry.test.ts`
+     *  asserts both halves against one queue.
+     *
+     *  The single outbound call both branches below make — local engine or Turbo Link host.
      *  Defined once so the streaming and non-streaming paths cannot drift on which URL,
      *  which credential, or which abort signal a remote request uses. `ac.signal` is the
      *  same client-abort chain the local path already used, so invariant 6 (a client

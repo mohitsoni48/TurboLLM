@@ -7,7 +7,7 @@ import { validateEvent } from '../schema'
 import { Emitter } from '../emit'
 import { readQueue } from '../queue'
 import { emit } from '../runtime/typed-emit'
-import { linkMinted, linkAdded, linkStatusChanged, LINK_ADDED_OUTCOMES, LINK_STATUSES } from './link'
+import { linkMinted, linkAdded, linkStatusChanged, inferenceServed, LINK_ADDED_OUTCOMES, LINK_STATUSES, INFERENCE_ORIGINS } from './link'
 
 function envelope(event: string, payload: Record<string, unknown>): Record<string, unknown> {
   return {
@@ -22,8 +22,8 @@ function envelope(event: string, payload: Record<string, unknown>): Record<strin
 
 // ── Registration: since-generation + no-payload-leak by construction ───────
 
-test('link_minted/link_added/link_status_changed are all registered with a since generation', () => {
-  for (const def of [linkMinted, linkAdded, linkStatusChanged]) {
+test('every link event, inference_served included, is registered with a since generation', () => {
+  for (const def of [linkMinted, linkAdded, linkStatusChanged, inferenceServed]) {
     assert.equal(typeof def.since, 'number')
     assert.ok(def.since >= 1)
   }
@@ -151,7 +151,7 @@ test('the schema itself structurally cannot express a token or url — enum/int 
   // Belt-and-suspenders on top of the serialized-payload checks above: walk the field
   // specs directly and confirm none of them is an 'ident' (the one kind capable of
   // carrying free-form-ish text) or anything else that could carry a URL/token.
-  for (const def of [linkMinted, linkAdded, linkStatusChanged]) {
+  for (const def of [linkMinted, linkAdded, linkStatusChanged, inferenceServed]) {
     for (const [key, field] of Object.entries(def.payload ?? {})) {
       assert.ok(
         field.kind === 'enum' || field.kind === 'number' || field.kind === 'boolean',
@@ -165,4 +165,56 @@ test('LINK_STATUSES/LINK_ADDED_OUTCOMES are non-empty closed sets', () => {
   assert.ok(LINK_STATUSES.length >= 4)
   assert.ok(LINK_ADDED_OUTCOMES.length >= 3)
   assert.ok(!LINK_ADDED_OUTCOMES.includes('unknown' as never), 'unknown is never a post-probe outcome')
+})
+
+// ── inference_served: single-attribution for a federated generation (spec §5.6) ────────
+
+test('inference_served is version-gated to the SAME generation as the other link events', () => {
+  // Not a decorative number: a funnel over this event must filter on `app.version` first,
+  // and it can only do that if the event says which generation introduced it. A prior
+  // TurboLLM funnel understated activation 10× by mixing versions.
+  assert.equal(inferenceServed.since, linkMinted.since)
+})
+
+test('validateEvent: inference_served accepts every origin the enum declares', () => {
+  for (const via of INFERENCE_ORIGINS) {
+    const r = validateEvent(envelope('inference_served', { via, outcome: 'ok', streamed: false }))
+    assert.equal(r.ok, true, r.ok === false ? r.reason : '')
+  }
+})
+
+test('validateEvent: inference_served rejects an origin outside the enum', () => {
+  const r = validateEvent(envelope('inference_served', { via: 'workstation', outcome: 'ok', streamed: false }))
+  assert.equal(r.ok, false)
+  assert.match(r.reason, /via/)
+})
+
+test('validateEvent: inference_served requires all three fields', () => {
+  for (const missing of ['via', 'outcome', 'streamed']) {
+    const payload: Record<string, unknown> = { via: 'link', outcome: 'ok', streamed: true }
+    delete payload[missing]
+    assert.equal(validateEvent(envelope('inference_served', payload)).ok, false, `${missing} must be required`)
+  }
+})
+
+test('inference_served payload never carries a token, url, machine name, or model key', () => {
+  const dir = tempDir()
+  try {
+    const emitter = makeEmitter(dir)
+    emit(emitter, inferenceServed, { via: 'link', outcome: 'ok', streamed: true })
+    const text = JSON.stringify(readQueue(dir))
+    assert.ok(!text.includes('tllm-'))
+    assert.ok(!text.includes(SECRET_TOKEN))
+    assert.ok(!text.includes(SECRET_URL))
+    assert.ok(!text.includes(SECRET_HOST))
+    assert.ok(!/https?:\/\//.test(text))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('INFERENCE_ORIGINS keeps `link` at the end — the order is part of the schema', () => {
+  // Same append-only rule as HARNESSES (events/gateway.ts): inserting a value in the middle
+  // silently reinterprets every row already collected.
+  assert.deepEqual([...INFERENCE_ORIGINS], ['local', 'link'])
 })

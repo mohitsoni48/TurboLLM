@@ -10,6 +10,8 @@ import { allowsModel, hasCapability } from './capabilities'
 import { canWake, hostIdleState } from './host-idle'
 import { LINK_API_VERSIONS } from './protocol'
 import { LINK_CAPABILITIES, type HelloResponse } from './types'
+import { emit } from '../telemetry/runtime/typed-emit'
+import { inferenceServed } from '../telemetry/events/link'
 
 // linkAuth (link-auth.ts) puts the resolved key on the context as `linkKey`, but the
 // plain `Hono` type in this function's signature carries no Variables — so route
@@ -47,6 +49,33 @@ export function resolveMachineName(configured: string | undefined): string {
   } catch {
     return 'TurboLLM'
   }
+}
+
+/** Single-attribution reporting for a federated generation (spec §5.6).
+ *
+ *  THIS machine is the host — it ran the tokens, so it is the one that counts them. The
+ *  peer that took the click and proxied the request here reports nothing for the same
+ *  generation (see the remote branch in gateway/gateway.ts): counting on both ends would
+ *  double every federated generation and corrupt every funnel derived from it.
+ *
+ *  Three properties, all deliberate:
+ *   - **Absent telemetry is a no-op.** `d.telemetry` is optional (absent in tests, and
+ *     whenever the emitter failed to construct) — same convention as link-admin-routes.ts.
+ *   - **A throw can never reach the caller.** This runs on the generation path; attribution
+ *     must never be the reason a prompt fails. `Emitter.emit` swallows its own errors
+ *     today, so the catch is belt-and-braces against a future one that doesn't.
+ *   - **Only a REAL generation is counted.** Callers invoke this only after the shared
+ *     gateway handler answered; a capability refusal or a typed wake-gate 503 returns
+ *     earlier and is never reported, because the host ran nothing.
+ *
+ *  `cancelled` (core/enums.ts's `OUTCOMES`) is deliberately never emitted here: a client
+ *  that vanishes mid-stream is not observable at this point without instrumenting the SSE
+ *  relay itself, and a guessed value is worse than an absent one. */
+function reportServed(d: Deps, outcome: 'ok' | 'fail', streamed: boolean): void {
+  if (!d.telemetry) return
+  try {
+    emit(d.telemetry, inferenceServed, { via: 'link', outcome, streamed })
+  } catch { /* never break a generation over a telemetry write */ }
 }
 
 /** Mount ONLY the façade's gate. Split out from `registerLinkApi` so `createApp` can put
@@ -128,7 +157,7 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
 
   linkApp.post('/api/link/v1/chat/completions', requireCapability('models:use'), async (c) => {
     const key = c.get('linkKey')
-    const body = await c.req.json().catch(() => ({})) as { model?: string }
+    const body = await c.req.json().catch(() => ({})) as { model?: string; stream?: unknown }
     const requested = body.model ?? ''
     if (requested && !allowsModel(key, requested)) {
       return c.json({ error: { code: 'forbidden', message: `This link may not use '${requested}'.` } }, 403)
@@ -173,6 +202,10 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
     // reimplementation. `pathname` is what makes the peer's /api/link/v1 URL behave as
     // the /v1 route it proxies; `origin: 'link'` keeps this out of the local-activity
     // ledger the wake gate above reads.
-    return gatewayV1Handler(c, d, { pathname: '/v1/chat/completions', origin: 'link' })
+    const res = await gatewayV1Handler(c, d, { pathname: '/v1/chat/completions', origin: 'link' })
+    // Reported HERE and nowhere else: every early return above is a refusal, not a
+    // generation. See reportServed's own comment for why the peer stays silent.
+    reportServed(d, res.status < 400 ? 'ok' : 'fail', body.stream === true)
+    return res
   })
 }
