@@ -23,11 +23,44 @@ import { CopyButton } from '../../components/ui/copy-button'
 import { toast } from '../../components/ui/sonner'
 import { cn } from '../../lib/utils'
 
+/** The preset rows. The copy is the ONLY place the user learns what they are handing over,
+ *  so it says what the capability actually does rather than repeating its name.
+ *
+ *  "Full control" in particular used to read "everything above, plus downloads and config",
+ *  which understated both halves: `downloads:write` writes multi-gigabyte files to this
+ *  machine's disk and may cancel downloads its owner started, and `config:write` reaches
+ *  settings this machine reads for its OWN local use — the per-response token cap is
+ *  clamped onto local chat too, and auto-swap / keep-N change how much VRAM this machine
+ *  commits on the owner's own subsequent loads. */
 const PRESET_OPTIONS: { id: keyof typeof LINK_PRESETS; label: string; description: string }[] = [
   { id: 'inference', label: 'Inference only', description: 'Use models to generate — nothing else.' },
   { id: 'server', label: 'Server box', description: 'Use, wake, load, and unload models.' },
-  { id: 'full', label: 'Full control', description: 'Everything above, plus downloads and config.' },
+  {
+    id: 'full',
+    label: 'Full control',
+    description:
+      'Everything above, plus downloading models to this machine (multi-gigabyte files, '
+      + 'and cancelling downloads you started), and changing this machine’s model, gateway '
+      + 'and appearance defaults — including the token cap and VRAM settings this machine '
+      + 'applies to its own local chats.',
+  },
 ]
+
+/** What each raw capability grants, for the Customize list. Same rule as the presets: the
+ *  id alone ("config:write") tells the user nothing about what it reaches. */
+const CAPABILITY_NOTES: Record<LinkCapability, string> = {
+  'models:use': 'Send prompts to models already loaded here.',
+  'models:wake': 'Bring a cold model up to serve a request.',
+  'models:load': 'Load any model in this machine’s library, evicting what is loaded.',
+  'models:unload': 'Stop this machine’s engine, including a model you are using locally.',
+  'downloads:read': 'See this machine’s download queue.',
+  'downloads:write': 'Download models onto this machine’s disk, and cancel downloads — including your own.',
+  'config:read': 'Read this machine’s model, gateway and appearance defaults.',
+  'config:write':
+    'Change those defaults — context size, GPU layers, the per-response token cap and how '
+    + 'many models stay loaded. These apply to this machine’s own local use too. There is no '
+    + 'in-app screen for remote settings yet; it is reachable only through the API.',
+}
 
 /** Small pill for one granted capability. Always rendered from a record's
  *  `grantedCapabilities` (or a mint draft's own selection) — never inferred. */
@@ -282,14 +315,17 @@ function HostPanel({
           <CollapsibleContent>
             <div className="mt-2 flex flex-col gap-1.5 border-l border-border pl-3">
               {LINK_CAPABILITIES.map((cap) => (
-                <label key={cap} className="flex cursor-pointer items-center gap-2">
+                <label key={cap} className="flex cursor-pointer items-start gap-2">
                   <input
                     type="checkbox"
                     checked={customCaps.has(cap)}
                     onChange={() => toggleCap(cap)}
-                    className="h-3.5 w-3.5 accent-[var(--accent)]"
+                    className="mt-0.5 h-3.5 w-3.5 accent-[var(--accent)]"
                   />
-                  <span className="font-mono text-[12px] text-ink">{cap}</span>
+                  <span className="min-w-0">
+                    <span className="block font-mono text-[12px] text-ink">{cap}</span>
+                    <span className="block text-[11px] text-muted">{CAPABILITY_NOTES[cap]}</span>
+                  </span>
                 </label>
               ))}
             </div>

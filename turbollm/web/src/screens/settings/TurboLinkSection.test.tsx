@@ -86,4 +86,33 @@ describe('TurboLinkSection', () => {
     await userEvent.click(screen.getByRole('button', { name: /right machine/i }))
     await waitFor(() => expect(patchLink).toHaveBeenCalledWith('l1', { acknowledgeMachineChange: true }))
   })
+
+  // Final review I-6. "Everything above, plus downloads and config" understated both
+  // halves of what Full control hands over: `downloads:write` writes multi-gigabyte files
+  // to this machine's disk and may cancel downloads its owner started, and `config:write`
+  // reaches defaults this machine applies to its OWN local chats (the per-response token
+  // cap) and to how much VRAM it commits on the owner's own loads (auto-swap / keep-N).
+  // The spec's premise is that the user can see what they are granting.
+  it('says what "Full control" actually grants, in the preset copy itself', async () => {
+    render(<TurboLinkSection />)
+    const row = (await screen.findByLabelText(/Full control/i, { selector: 'input' })).closest('label')!
+    const copy = row.textContent ?? ''
+    expect(copy).toMatch(/download/i)
+    expect(copy).toMatch(/cancel/i)
+    expect(copy).toMatch(/token cap/i)
+    expect(copy).toMatch(/local chats/i)
+  })
+
+  it('explains every raw capability in the Customize list, not just its id', async () => {
+    render(<TurboLinkSection />)
+    await userEvent.click(await screen.findByText('Customize'))
+    // `config:write` is the one a user is most likely to grant without realising its reach,
+    // including the fact that no in-app screen drives it yet.
+    const row = (await screen.findByText('config:write')).closest('label')!
+    const copy = row.textContent ?? ''
+    expect(copy).toMatch(/token cap/i)
+    expect(copy).toMatch(/own local use/i)
+    expect(copy).toMatch(/no\s+in-app screen/i)
+  })
+
 })
