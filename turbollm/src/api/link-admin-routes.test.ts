@@ -523,3 +523,59 @@ test('only an explicit acknowledgement clears the machineId latch', async () => 
   assert.equal(body.link.machineIdChanged, false)
   assert.equal(body.link.lastError, null)
 })
+
+// ── Peer side: the remote model catalog the chat picker groups by machine (task 8) ──────
+//
+// The picker's grouping is pure and tested in `web/src/lib/remote-models.test.ts`; this is
+// the one route that feeds it. It is a thin read over `RemoteCatalog`, which already
+// re-checks each link's LIVE status on every call — so an offline machine contributes
+// nothing here without this route needing its own copy of that rule.
+
+function mkCatalogApp(rows: unknown[], daemon?: Record<string, unknown>) {
+  const cfg: Record<string, unknown> = { apiKeys: [], links: [], daemon: { port: 6996, ...daemon } }
+  const d = {
+    version: '1.11.2',
+    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
+    remoteCatalog: { models: () => rows },
+  } as unknown as Deps
+  const app = new Hono()
+  registerLinkAdminRoutes(app, d)
+  return app
+}
+
+const ROW = {
+  linkId: 'lnk1',
+  machine: 'workstation',
+  model: { key: 'qwen3-35b', name: 'Qwen3 35B', quant: 'Q4_K_M', nativeCtx: 262144, vision: false, loaded: true },
+}
+
+test('GET /api/v1/links/models returns the catalog rows the picker groups by machine', async () => {
+  const res = await mkCatalogApp([ROW]).request('/api/v1/links/models')
+  assert.equal(res.status, 200)
+  const body = await res.json() as { models: typeof ROW[] }
+  assert.deepEqual(body.models, [ROW])
+})
+
+test('GET /api/v1/links/models is empty, not an error, when nothing is linked', async () => {
+  const res = await mkCatalogApp([]).request('/api/v1/links/models')
+  assert.equal(res.status, 200)
+  assert.deepEqual(await res.json(), { models: [] })
+})
+
+test('GET /api/v1/links/models never discloses the host filesystem or a link token', async () => {
+  // Same rule as GET /api/link/v1/models on the host: no `path`, and certainly no
+  // credential. Asserted on the serialized text so a nested field cannot slip past.
+  const res = await mkCatalogApp([ROW]).request('/api/v1/links/models')
+  const text = await res.text()
+  assert.ok(!text.includes('path'))
+  assert.ok(!text.includes('tllm-'))
+  assert.ok(!text.includes('baseUrl'))
+})
+
+test('GET /api/v1/links/models carries the same host gate as the rest of this surface', async () => {
+  // Without the gate, an open-LAN stranger reads the full inventory of every machine this
+  // box links to — the same disclosure `GET /api/v1/links` is gated for.
+  const app = mkCatalogApp([ROW], { lanBind: true, requireApiKey: false })
+  const res = await app.request('/api/v1/links/models', { headers: { 'x-forwarded-for': '10.0.0.9' } })
+  assert.equal(res.status, 403)
+})

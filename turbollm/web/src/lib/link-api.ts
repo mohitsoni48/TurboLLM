@@ -54,6 +54,9 @@ function safeJson(text: string): unknown {
 // itself is just erased at compile time, so it's safe to import/re-export from here too.
 import type { LinkCapability } from './link-constants'
 export type { LinkCapability } from './link-constants'
+// Type-only, so this stays erased at compile time and cannot become a runtime cycle
+// (remote-models.ts imports the LinkRecord type from here).
+import type { RemoteModelRow } from './remote-models'
 
 /** Peer-side link lifecycle state. Three failure states, deliberately not collapsed
  *  into one "offline" — each carries its own actionable `lastError` on the record. */
@@ -138,6 +141,15 @@ export function listInbound(): Promise<InboundLink[]> {
 /** Peer side: machines this one has linked to. */
 export function listLinks(): Promise<LinkRecord[]> {
   return request<{ links: LinkRecord[] }>('/api/v1/links').then((r) => r.links)
+}
+
+/** Peer side: every model every ONLINE linked machine currently advertises, for the chat
+ *  model picker. The server re-reads each link's live status on every call, so a machine
+ *  that dropped contributes nothing here — a listed-but-unusable model is worse than an
+ *  absent one, since the user picks it and every prompt 503s. Group with
+ *  `groupModelChoices` (lib/remote-models.ts); never render these rows raw. */
+export function listRemoteModels(): Promise<RemoteModelRow[]> {
+  return request<{ models: RemoteModelRow[] }>('/api/v1/links/models').then((r) => r.models)
 }
 
 /** Peer side: add a link from a pasted link string. A junk string is a 400 (ApiError). */

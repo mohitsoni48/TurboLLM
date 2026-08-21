@@ -166,6 +166,23 @@ export function registerLinkAdminRoutes(
     })
   })
 
+  // ── Peer side: what every ONLINE linked machine currently advertises, for the chat
+  //    model picker (spec §5.3). A thin read over `RemoteCatalog`, which re-checks each
+  //    link's LIVE status on every call — so a machine that dropped stops contributing
+  //    models immediately rather than at the next poll, and this route needs no copy of
+  //    that rule. Registered before `/:id` is irrelevant (that route is PATCH/DELETE only),
+  //    but it sits with the other peer-side reads for the same reason `inbound` does.
+  //
+  //    Same host gate as the rest of this file: the row set is a full inventory of every
+  //    machine this box links to, which is exactly the disclosure `GET /api/v1/links` is
+  //    gated for. Rows carry no `path` and no token — `RemoteCatalog` stores only what the
+  //    host's own façade chose to advertise.
+  app.get('/api/v1/links/models', (c) => {
+    const denied = gate(c, VIEW)
+    if (denied) return denied
+    return c.json({ models: d.remoteCatalog?.models() ?? [] })
+  })
+
   // ── Peer side: add / edit / remove a link.
   app.post('/api/v1/links', async (c) => {
     const denied = gate(c, MANAGE)

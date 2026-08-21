@@ -29,6 +29,7 @@ import { ContextMeter } from './chat/ContextMeter'
 import { ConversationSidebar } from './chat/ConversationSidebar'
 import { readSavedSidebarWidth, SIDEBAR_MIN_W, sidebarMaxW, SidebarResizeHandle } from './chat/SidebarResizeHandle'
 import { ModelLoadMenu } from '../components/ModelLoadMenu'
+import { useLinks, useRemoteModels } from '../lib/link-queries'
 import { ModelDetailDialog } from './models/ModelDetailDialog'
 import { ConversationSettingsDialog, type ConversationSettingsDraft } from './chat/ConversationSettingsDialog'
 import { useUiStore } from '../stores/ui'
@@ -267,6 +268,11 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // llama.cpp, safetensors under MLX/vLLM. Keeps the chat model menu from listing
   // models that would 409 on load.
   const allModels = (modelsQ.data?.models ?? []).filter((m) => m.compatibleWithActiveEngine)
+  // Turbo Link (ADR-376 §6.3): models living on other machines, grouped under their machine
+  // in the picker below. Both queries fail soft (`?? []`) — a host-gated 403 or a daemon
+  // with no links must leave the chat screen exactly as it was, not error it.
+  const linksQ = useLinks()
+  const remoteModelsQ = useRemoteModels()
   // Gates ReasoningEffortSelect vs ThinkingBudgetSlider below — `status.model` (LoadedModel)
   // is a slim subset without capability flags, so look the full ModelEntry up by key.
   const loadedModelSupportsReasoningEffort = (modelsQ.data?.models ?? []).find((m) => m.key === model?.key)?.reasoningEffort ?? false
@@ -878,6 +884,8 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
             onEject={handleEject}
             onSettings={(key) => setSettingsKey(key)}
             screen="chat"
+            links={linksQ.data ?? []}
+            remoteModels={remoteModelsQ.data ?? []}
           />
           {model && (
             <Button
