@@ -179,6 +179,28 @@ export function isLocalOrAuthenticated(c: Context, d: Deps): boolean {
   return daemon.requireApiKey === true    // remote (or tunneled) allowed only behind required (verified) API key
 }
 
+/** Resolve the presented raw key to its stored ApiKey record, bumping lastUsedAt
+ *  best-effort on a match. `verifyKeyValue` answers "is this key valid?"; this answers
+ *  "WHICH key is this?", which Turbo Link needs because the capability grant lives on
+ *  the record. Same hash comparison, same best-effort usage bump — deliberately not a
+ *  second credential path. */
+export function resolveKey(c: Context, d: Deps): ApiKey | undefined {
+  const raw = presentedKey(c)
+  if (!raw) return undefined
+  const hash = hashKey(raw)
+  const match = d.store.snapshot().apiKeys.find((k) => k.hash === hash)
+  if (!match) return undefined
+  try {
+    d.store.update((mut) => {
+      const k = mut.apiKeys.find((x) => x.id === match.id)
+      if (k) k.lastUsedAt = new Date().toISOString()
+    })
+  } catch {
+    /* swallow — usage tracking is best-effort */
+  }
+  return match
+}
+
 /** Checks a raw candidate key against stored API keys; bumps lastUsedAt best-effort on a
  *  match. The credential-check core shared by every auth surface — HTTP (verifyPresentedKey,
  *  which sources the raw value from headers) and the WebSocket upgrade handler (which sources
