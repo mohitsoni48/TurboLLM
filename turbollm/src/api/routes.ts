@@ -51,7 +51,7 @@ import { ScannerError, type ModelEntry } from '../models/scanner'
 import { estimateVram, type LoadProfile, resolveProfile } from '../models/profile'
 import { amdApuOnly, getSysInfo, primaryVendor } from '../sysinfo/sysinfo'
 import { HfError, type HfSortOption } from '../hf/hf'
-import { DownloadError } from '../downloads/downloads'
+import type { EnqueueInput } from '../downloads/downloads'
 import { BenchError } from '../bench/bench'
 import { inferRepoFromPath } from './path-utils'
 import { validateLoadProfileFields, profilesEqual } from './profile-validate'
@@ -62,6 +62,7 @@ import { readSentLog } from '../telemetry/log'
 import { TELEMETRY_SCHEMA_VERSION } from '../telemetry/schema'
 import { registerOnboardingRoutes } from './onboarding-routes'
 import { startEngine, stopEngine, type EngineStartBody } from './engine-lifecycle'
+import { enqueueDownload, listDownloads, removeDownload } from './download-lifecycle'
 import { buildModelStatus } from './status-view'
 
 type Status = 200 | 201 | 202 | 400 | 401 | 403 | 404 | 409 | 500 | 501 | 503
@@ -2030,19 +2031,18 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   // ── Downloads (spec 10 §5–6, §8) ──────────────────────────────────────────
-  app.get('/api/v1/downloads', (c) => c.json({ downloads: d.downloads.list() }))
+  // list/enqueue/remove go through download-lifecycle.ts — the same functions the Turbo
+  // Link façade mounts, so the DownloadError → status table has exactly one definition.
+  app.get('/api/v1/downloads', (c) => c.json({ downloads: listDownloads(d) }))
 
   // Enqueue from an HF repo file {repo, rfilename} OR a raw URL {url}. 202.
   app.post('/api/v1/downloads', async (c) => {
-    const b = await body<{ repo?: string; rfilename?: string; url?: string; size?: number; sha256?: string; subdir?: string; excludeMmproj?: boolean }>(c)
-    try {
-      // One request may fan out into several files (split shards + a shared mmproj) —
-      // return every record created so the UI reflects the full queued set.
-      const recs = await d.downloads.enqueue(b)
-      return c.json({ downloads: recs }, 202)
-    } catch (e) {
-      return dlErr(c, e)
-    }
+    const b = await body<EnqueueInput>(c)
+    // One request may fan out into several files (split shards + a shared mmproj) —
+    // return every record created so the UI reflects the full queued set.
+    const out = await enqueueDownload(d, b)
+    if (!out.ok) return err(c, out.status, out.code, out.message)
+    return c.json({ downloads: out.downloads }, 202)
   })
 
   app.post('/api/v1/downloads/:id/cancel', (c) => {
@@ -2058,8 +2058,8 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   app.delete('/api/v1/downloads/:id', (c) => {
-    const ok = d.downloads.remove(c.req.param('id'))
-    if (!ok) return err(c, 404, 'no_such_download', 'No download with that id.')
+    const out = removeDownload(d, c.req.param('id'))
+    if (!out.ok) return err(c, out.status, out.code, out.message)
     return c.json({ ok: true })
   })
 
@@ -2419,15 +2419,6 @@ function hfErr(c: Context, e: unknown) {
   if (e instanceof HfError) {
     const status: Status =
       e.code === 'hf_unauthorized' ? 401 : e.code === 'hf_gated' ? 403 : e.code === 'hf_not_found' ? 404 : 503
-    return err(c, status, e.code, e.message)
-  }
-  return err(c, 500, 'internal', (e as Error).message)
-}
-
-function dlErr(c: Context, e: unknown) {
-  if (e instanceof DownloadError) {
-    const status: Status =
-      e.code === 'no_model_dir' ? 409 : e.code === 'hf_unauthorized' ? 401 : e.code === 'hf_gated' ? 403 : 400
     return err(c, status, e.code, e.message)
   }
   return err(c, 500, 'internal', (e as Error).message)

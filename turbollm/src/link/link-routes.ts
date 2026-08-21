@@ -7,10 +7,16 @@ import { linkAuth, requireCapability } from './link-auth'
 import { gatewayV1Handler } from '../gateway/gateway'
 import { buildModelStatus } from '../api/status-view'
 import { startEngine, stopEngine } from '../api/engine-lifecycle'
+import {
+  enqueueDownload,
+  listDownloads,
+  removeDownload,
+  type DownloadFailure,
+} from '../api/download-lifecycle'
 import { allowsModel, hasCapability } from './capabilities'
 import { canWake, hostIdleState } from './host-idle'
 import { LINK_API_VERSIONS } from './protocol'
-import { LINK_CAPABILITIES, type HelloResponse } from './types'
+import { LINK_CAPABILITIES, redactDownload, type HelloResponse } from './types'
 import { emit } from '../telemetry/runtime/typed-emit'
 import { inferenceServed } from '../telemetry/events/link'
 
@@ -77,6 +83,42 @@ function reportServed(d: Deps, outcome: 'ok' | 'fail', streamed: boolean): void 
   try {
     emit(d.telemetry, inferenceServed, { via: 'link', outcome, streamed })
   } catch { /* never break a generation over a telemetry write */ }
+}
+
+/** A Hugging Face repo id: exactly `owner/name`, both segments drawn from the character
+ *  set HF actually permits. Anchored and single-slash on purpose — `a/b/c`, `../../etc`
+ *  and a bare name are all malformed, and each of them would otherwise reach code that
+ *  builds a destination directory out of the string. */
+const HF_REPO_ID = /^[A-Za-z0-9][\w.-]*\/[\w.-]+$/
+
+/** A file WITHIN that repo: a `.gguf`, with no traversal and no absolute-path shape.
+ *  Forward slashes are allowed (HF repos have subfolders) — `\` is not, since it is a
+ *  separator on the host even though it is a legal filename character on HF. */
+function isSafeRepoFile(rfilename: string): boolean {
+  if (!rfilename || rfilename.length > 512) return false
+  if (!/\.gguf$/i.test(rfilename)) return false
+  if (rfilename.includes('\\') || rfilename.startsWith('/')) return false
+  if (/^[A-Za-z]:/.test(rfilename)) return false
+  return rfilename.split('/').every((seg) => seg !== '' && seg !== '.' && seg !== '..')
+}
+
+/** Serialize a `DownloadFailure` for a PEER.
+ *
+ *  The one difference from the local route's rendering, and the reason this exists: a
+ *  `hostDetail` message is a raw `Error.message` from the host's filesystem or network
+ *  stack, which routinely carries an absolute path. The local UI shows it (same machine);
+ *  a peer gets the code and a fixed string. The failure is still visible and still typed —
+ *  only the host's free text is withheld. */
+function linkDownloadErr(c: { json: (b: unknown, s: number) => Response }, f: DownloadFailure): Response {
+  return c.json(
+    {
+      error: {
+        code: f.code,
+        message: f.hostDetail ? 'The host could not start that download.' : f.message,
+      },
+    },
+    f.status,
+  )
 }
 
 /** Mount ONLY the façade's gate. Split out from `registerLinkApi` so `createApp` can put
@@ -203,6 +245,76 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
   linkApp.post('/api/link/v1/models/unload', requireCapability('models:unload'), (c) =>
     stopEngine(c, d),
   )
+
+  /** Remote downloads (spec §5.7). All three mount `download-lifecycle.ts` — the SAME
+   *  functions `/api/v1/downloads` uses — so the queue, the concurrency cap, the disk
+   *  check, the split-shard expansion and the DownloadError → status table are literally
+   *  one implementation for a peer and for the local UI.
+   *
+   *  `downloads:read` and `downloads:write` are separate gates and neither implies the
+   *  other: watching what a machine is pulling and making it pull something are different
+   *  grants. A read without the capability is a NAMED 403, never an empty list — an empty
+   *  200 reads as "the host has no downloads" and sends the user debugging the wrong box. */
+  linkApp.get('/api/link/v1/downloads', requireCapability('downloads:read'), (c) =>
+    c.json({ downloads: listDownloads(d).map(redactDownload) }),
+  )
+
+  /** Start a download on the host.
+   *
+   *  The peer's raw body is NEVER forwarded — the same rule as `models/load` (ADR-139).
+   *  Exactly two peer-chosen fields describe WHAT to fetch, and both are validated here:
+   *   - `repo` must be a well-formed `owner/name` HF id. `DownloadManager.enqueue` would
+   *     also reject a malformed one, but only after resolving a destination directory, and
+   *     validating at the boundary is what makes a garbage id a clean 400 instead of a
+   *     fault deeper in.
+   *   - `rfilename` must be a `.gguf` with no path traversal in it.
+   *
+   *  Three fields of `EnqueueInput` are deliberately DROPPED rather than passed through:
+   *   - `subdir` is `join()`ed onto the host's model dir unsanitised — a peer-supplied
+   *     `..` there writes outside it.
+   *   - `url` makes the host fetch an arbitrary origin (its own LAN, a cloud metadata
+   *     endpoint) and, with `subdir`, to an arbitrary filename.
+   *   - `excludeMmproj` is onboarding's internal flag, not part of this contract.
+   *  `size` and `sha256` ARE accepted: they only ever tighten behaviour (the free-disk
+   *  check and the checksum verification). */
+  linkApp.post('/api/link/v1/downloads', requireCapability('downloads:write'), async (c) => {
+    const body = await c.req.json().catch(() => ({})) as Record<string, unknown>
+    const repo = typeof body.repo === 'string' ? body.repo.trim() : ''
+    const rfilename = typeof body.rfilename === 'string' ? body.rfilename.trim() : ''
+    if (!HF_REPO_ID.test(repo) || !isSafeRepoFile(rfilename)) {
+      return c.json(
+        {
+          error: {
+            code: 'invalid_request',
+            message: "repo must be a Hugging Face 'owner/name' id and rfilename a .gguf file in it.",
+          },
+        },
+        400,
+      )
+    }
+    const out = await enqueueDownload(d, {
+      repo,
+      rfilename,
+      ...(typeof body.size === 'number' && Number.isFinite(body.size) && body.size >= 0
+        ? { size: body.size }
+        : {}),
+      ...(typeof body.sha256 === 'string' ? { sha256: body.sha256 } : {}),
+    })
+    if (!out.ok) return linkDownloadErr(c, out)
+    return c.json({ downloads: out.downloads.map(redactDownload) }, 202)
+  })
+
+  /** Cancel a download and forget it: `removeDownload` aborts the in-flight stream and
+   *  deletes the `.part`.
+   *
+   *  Works on ANY download, including one the host's own user started. Downloads are
+   *  host-owned; there is no per-link ownership model, and inventing one would mean a peer
+   *  could see a stuck download in the list it is granted to read and be unable to stop it. */
+  linkApp.delete('/api/link/v1/downloads/:id', requireCapability('downloads:write'), (c) => {
+    const out = removeDownload(d, c.req.param('id'))
+    if (!out.ok) return linkDownloadErr(c, out)
+    return c.json({ ok: true })
+  })
 
   linkApp.post('/api/link/v1/chat/completions', requireCapability('models:use'), async (c) => {
     const key = c.get('linkKey')

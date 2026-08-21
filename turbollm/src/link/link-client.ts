@@ -1,6 +1,6 @@
 import { negotiateVersion, LINK_API_VERSIONS } from './protocol'
 import type { LinkProbe } from './link-state'
-import type { HelloResponse, LinkRecord, RemoteModel } from './types'
+import type { HelloResponse, LinkRecord, RemoteDownload, RemoteModel } from './types'
 import type { ModelStatusView } from '../api/status-view'
 
 const DEFAULT_TIMEOUT_MS = 8000
@@ -123,6 +123,71 @@ export class LinkClient {
    *  granted `models:load` but not `models:unload` — the two never imply each other. */
   async unload(): Promise<LinkProbe | { kind: 'accepted' }> {
     const res = await this.call('/api/link/v1/models/unload', 'POST')
+    return res.kind === 'body' ? { kind: 'accepted' } : res
+  }
+
+  /** The host's download queue (spec §5.7). Goes through `call()` like every other method,
+   *  so it inherits the same total "never throws, never adopts garbage" guarantee.
+   *
+   *  A `downloads` result is the ONLY one that may populate a peer-side list. Everything
+   *  else — including `http 403` for a token without `downloads:read` — means "we do not
+   *  know what this machine is downloading", which the caller must render as unknown, NOT
+   *  as an empty queue. The host draws the same distinction (a missing capability is a 403
+   *  there, never a 200 with `[]`), and this is the peer half of it. */
+  async downloads(): Promise<LinkProbe | { kind: 'downloads'; downloads: RemoteDownload[] }> {
+    const res = await this.call('/api/link/v1/downloads', 'GET')
+    if (res.kind !== 'body') return res
+    const body = res.body as { downloads?: unknown }
+    if (!Array.isArray(body.downloads)) return { kind: 'network' }
+    const downloads: RemoteDownload[] = []
+    for (const raw of body.downloads) {
+      if (typeof raw !== 'object' || raw === null) continue
+      const r = raw as Record<string, unknown>
+      // A row without an id can never be cancelled, so it is dropped rather than
+      // half-adopted — the same rule `models()` applies to a row without a key.
+      if (typeof r.id !== 'string' || !r.id) continue
+      downloads.push({
+        id: r.id,
+        name: typeof r.name === 'string' ? r.name : '',
+        repo: typeof r.repo === 'string' ? r.repo : '',
+        total: typeof r.total === 'number' ? r.total : 0,
+        received: typeof r.received === 'number' ? r.received : 0,
+        status: typeof r.status === 'string' ? r.status : 'queued',
+        error: typeof r.error === 'string' ? r.error : null,
+        bytesPerSec: typeof r.bytesPerSec === 'number' ? r.bytesPerSec : 0,
+        createdAt: typeof r.createdAt === 'string' ? r.createdAt : '',
+      })
+    }
+    return { kind: 'downloads', downloads }
+  }
+
+  /** Ask the host to download `rfilename` from HF repo `repo`. `accepted` means the host
+   *  QUEUED it, exactly as `load()` means the host queued a load — the peer learns the
+   *  outcome from `downloads()` polling, never by waiting on a multi-gigabyte transfer.
+   *
+   *  Only these fields cross: the host drops `url`/`subdir` outright (they name a fetch
+   *  origin and a host directory), so sending them would be a silent no-op. */
+  async startDownload(
+    repo: string,
+    rfilename: string,
+    opts?: { size?: number; sha256?: string },
+  ): Promise<LinkProbe | { kind: 'accepted' }> {
+    const res = await this.call('/api/link/v1/downloads', 'POST', {
+      repo,
+      rfilename,
+      ...(opts?.size === undefined ? {} : { size: opts.size }),
+      ...(opts?.sha256 === undefined ? {} : { sha256: opts.sha256 }),
+    })
+    return res.kind === 'body' ? { kind: 'accepted' } : res
+  }
+
+  /** Cancel a download on the host and drop its record. Works on any download the host
+   *  has, including one its own user started — downloads are host-owned.
+   *
+   *  `id` is percent-encoded into the path: an id is host-minted today, but a value with a
+   *  `/` or `?` in it must never be able to address a different route. */
+  async cancelDownload(id: string): Promise<LinkProbe | { kind: 'accepted' }> {
+    const res = await this.call(`/api/link/v1/downloads/${encodeURIComponent(id)}`, 'DELETE')
     return res.kind === 'body' ? { kind: 'accepted' } : res
   }
 

@@ -104,6 +104,74 @@ export interface RemoteModel {
   loaded: boolean
 }
 
+/** One download as advertised by a linked host over `GET /api/link/v1/downloads`.
+ *
+ *  An ALLOWLIST projection of `DownloadRecord`, for the same reason `RedactedLinkRecord`
+ *  is one: a delete-list leaks by default the moment a field is added upstream. Every
+ *  omission below is deliberate, and the rule they follow is **no host filesystem detail
+ *  crosses the façade** — not "strip the field someone happened to name". This feature has
+ *  paid for that rule three times (the engine's `launchCommand`, then `engine.error`'s log
+ *  tail, then this).
+ *
+ *  Omitted, and why:
+ *   - `dest` — an ABSOLUTE path on the host's disk. The headline leak.
+ *   - `url` — the source URL. The peer either chose the repo itself or has no use for it,
+ *     and it is the field a future signed/credentialed download URL would land in.
+ *   - `sha256` — not host-private, but nothing peer-side renders it; kept off the wire so
+ *     the surface stays as small as what the peer actually needs. */
+export interface RemoteDownload {
+  id: string
+  /** Bare destination FILENAME — never a path fragment. See `redactDownload`. */
+  name: string
+  /** Source HF repo ("owner/name"), or '' for a raw-URL import. Public either way. */
+  repo: string
+  total: number
+  received: number
+  status: string
+  /** A FIXED string when the download failed, `null` otherwise — never the host's own
+   *  message. `DownloadRecord.error` holds a raw `Error.message`, which for an fs failure
+   *  is a full absolute path ("ENOENT … open 'D:\\models\\x.gguf.part'"). The peer still
+   *  needs to see THAT it failed; it has no business seeing where. */
+  error: string | null
+  bytesPerSec: number
+  createdAt: string
+}
+
+/** Generic stand-in for a host-authored download error message. */
+export const REMOTE_DOWNLOAD_ERROR = 'The download failed on the host machine.'
+
+/** Project a host `DownloadRecord` onto the wire shape a peer may see.
+ *
+ *  Typed structurally rather than against `DownloadRecord` so link/types.ts stays free of a
+ *  downloads import; the façade route is what binds the two, and `link-routes.downloads.test.ts`
+ *  pins the exact key set this produces. */
+export function redactDownload(rec: {
+  id: string
+  name: string
+  repo: string
+  total: number
+  received: number
+  status: string
+  error: string | null
+  bytesPerSec: number
+  createdAt: string
+}): RemoteDownload {
+  return {
+    id: rec.id,
+    // `basename`-equivalent without a node:path import: DownloadManager always sets `name`
+    // to a bare filename, but this is a trust boundary and a defensive last segment costs
+    // nothing if a future caller ever puts a fragment in there.
+    name: rec.name.split(/[\\/]/).pop() ?? rec.name,
+    repo: rec.repo,
+    total: rec.total,
+    received: rec.received,
+    status: rec.status,
+    error: rec.error === null ? null : REMOTE_DOWNLOAD_ERROR,
+    bytesPerSec: rec.bytesPerSec,
+    createdAt: rec.createdAt,
+  }
+}
+
 /** The peer-side view model for one link, shared by the backend and the web helpers so
  *  both agree on one shape. A strict subset of `LinkRecord` — never carries `token`. */
 export interface LinkSummary {
