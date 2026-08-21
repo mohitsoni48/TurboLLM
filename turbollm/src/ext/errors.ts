@@ -68,6 +68,27 @@ function defaultStatus(type: ExtErrorType): number {
   }
 }
 
+/** The app-wide `app.onError` handler (wired once, in `server.ts` — `createApp` has the full
+ *  reasoning). Extracted as a pure, directly-testable function rather than an inline closure so
+ *  a test can exercise it without standing up a full `Deps`/`createApp()` harness — mirrors
+ *  `generation.ts`'s `shouldFlushCheckpoint`/`extractChunkUsage` precedent for the same reason.
+ *  Scoped to only reshape `/api/ext/v1/*` responses (the one surface with a documented,
+ *  machine-checked error-envelope contract); every other route falls through to Hono's own
+ *  default behavior (an `HTTPException`'s own response if it has one, else a logged plain-text
+ *  500) — copied verbatim from Hono's own default `errorHandler` so this stays a strict backstop
+ *  for the ext API, not a whole-server behavior change. */
+export function extErrorHandler(err: unknown, c: Context): Response {
+  if (c.req.path.startsWith('/api/ext/v1/')) {
+    return extError(c, 'internal', 'internal', 'An unexpected error occurred.', { status: 500 })
+  }
+  if (err && typeof err === 'object' && 'getResponse' in err) {
+    const res = (err as { getResponse: () => Response }).getResponse()
+    return c.newResponse(res.body, res)
+  }
+  console.error(err)
+  return c.text('Internal Server Error', 500)
+}
+
 /** Translate a store failure into the public catalogue (spec 27 §7.2). An error that is not a
  *  StoreError is deliberately flattened to a generic `internal` — a raw message could carry
  *  SQL, filesystem paths, or another tenant's ids. */

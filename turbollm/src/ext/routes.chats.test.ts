@@ -9,6 +9,7 @@ import { ConversationStore } from '../chat/db.js'
 import { ChatStoreRouter } from '../chat/store/router.js'
 import type { ChatStore } from '../chat/store/chat-store.js'
 import { registerExtChatRoutes, type ExtRouteDeps } from './routes.chats.js'
+import { extErrorHandler } from './errors.js'
 import { registerExtRunRoutes } from './routes.runs.js'
 import { PublicRunManager } from './run-manager.js'
 import { IdempotencyStore } from './idempotency.js'
@@ -740,8 +741,13 @@ test('a non-array attachments value is refused with a clean 400, not a bare 500'
       const made = await app.request('/api/ext/v1/chats', json(ACME, { title: 'BadAttachShape', owner: 'u1' }))
       return (await made.json() as { id: string }).id
     })()
+    // `content` must be non-empty here — the pre-existing "type a message or attach a file"
+    // check would otherwise reject this request before the new shape guard is ever reached
+    // (an empty/absent content plus a non-array attachments' falsy `.length` already satisfies
+    // that earlier check), which would make this test pass for the wrong reason against both
+    // the pre-fix and post-fix code, without actually pinning down the crash it is named for.
     const res = await app.request(`/api/ext/v1/chats/${chatId}/messages`,
-      json(ACME, { role: 'user', owner: 'u1', generate: false, attachments: { foo: 'bar' } }))
+      json(ACME, { role: 'user', owner: 'u1', content: 'hi', generate: false, attachments: { foo: 'bar' } }))
     const text = await res.text()
     let parsed: { error?: { type?: unknown; code?: unknown } }
     try {
@@ -1125,5 +1131,50 @@ test('the forwarding path\'s message.create audit row targets the real created m
     assert.notEqual(createRow!.target_id, chatId, 'sanity: must not have fallen back to the chat id')
   } finally {
     cleanup()
+  }
+})
+
+// Closes a recurring failure class (round 1's C3, round 3's N5/N6-regression fix — each prior
+// fix closed one specific trigger, not the underlying gap): an unhandled throw anywhere on this
+// surface must never reach Hono's default handler, which returns a bare, non-JSON text/plain
+// 500. Uses a REAL, already-documented gap as the trigger rather than a fabricated one:
+// `hasActiveRun` (N4) calls `runs.isChatActive(...)` synchronously, OUTSIDE any try/catch, on
+// `DELETE /chats/:id` (see that handler — `hasActiveRun` runs before the try block starts) — so
+// a `runs` whose `isChatActive` throws is a genuine, reachable escape path today, not a
+// synthetic scenario invented just to exercise the backstop.
+//
+// `app.onError(extErrorHandler)` is wired here explicitly, mirroring exactly what `server.ts`'s
+// `createApp()` does — Hono has no per-route-group error-handler scoping (confirmed: a
+// try/catch middleware around `next()` can never observe a downstream throw at all, since
+// Hono's own dispatch layer always converts an error into a response before it could reach a
+// middleware's `next()` call; only a real `app.onError` registration works). Without this line
+// here, this test would fail the same way the original regression did — which is itself proof
+// this harness genuinely exercises the mechanism `server.ts` relies on, not a tautology.
+test('an unhandled throw anywhere on this surface still returns a JSON error envelope, not a bare 500 (catch-all backstop)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'turbollm-ext-routes-backstop-'))
+  const conv = new ConversationStore(dir)
+  const d = {
+    db: conv,
+    chatStore: new ChatStoreRouter(conv.chatStore, conv.chatStore),
+    store: { snapshot: () => ({ apiKeys: [{ hash: keyHash(ACME), tenant: 'acme' }] }) },
+  } as never
+  const throwingRuns = { isChatActive: () => { throw new Error('synthetic isChatActive failure') } } as never
+  const app = new Hono()
+  app.onError(extErrorHandler)
+  registerExtChatRoutes(app, d, undefined, throwingRuns)
+  try {
+    const created = await app.request('/api/ext/v1/chats', json(ACME, { title: 'Backstop', owner: 'u1' }))
+    const chatId = (await created.json() as { id: string }).id
+
+    const res = await app.request(`/api/ext/v1/chats/${chatId}?owner=u1`, { method: 'DELETE', headers: { Authorization: ACME } })
+    assert.equal(res.status, 500)
+    assert.ok(res.headers.get('Content-Type')?.includes('application/json'),
+      'a bare Hono default 500 is text/plain — this must be the structured JSON envelope instead')
+    const body = await res.json() as { error?: { type?: string; code?: string; request_id?: string } }
+    assert.equal(body.error?.type, 'internal')
+    assert.equal(body.error?.code, 'internal')
+    assert.ok(body.error?.request_id, 'still correlatable even for a fully unhandled throw')
+  } finally {
+    conv.close(); rmSync(dir, { recursive: true, force: true })
   }
 })

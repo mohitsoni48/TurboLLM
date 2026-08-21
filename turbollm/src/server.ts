@@ -20,6 +20,7 @@ import { mountExtApi } from './ext/mount'
 import { PublicRunManager } from './ext/run-manager'
 import { createMakeBody } from './ext/generation'
 import { DEFAULT_AUDIT_RETENTION_DAYS } from './ext/audit'
+import { extErrorHandler } from './ext/errors'
 
 // Reuse TCP connections for all engine and HF fetch calls. Without this, Node
 // opens a new connection per request — ~5–20 ms of extra latency every Claude
@@ -32,6 +33,18 @@ const WEB_ROOT = join(dirname(fileURLToPath(import.meta.url)), 'webdist')
 // the internal API, the engine gateway, and the embedded React SPA.
 export function createApp(d: Deps): Hono {
   const app = new Hono()
+
+  // Backstop for the "unhandled throw reaches Hono's default handler, which returns a bare,
+  // non-JSON text/plain 500" failure class on the external chat API (round 1's C3, round 3's
+  // N5/N6-regression fix — each prior fix closed one specific trigger, not the underlying gap).
+  // Hono only supports ONE `onError` handler per app instance (confirmed: `compose()` always
+  // receives `this.errorHandler` — never undefined, since Hono itself defaults it to its own
+  // generic-500 producer — so a per-route-group `try { await next() } catch {}` middleware can
+  // NEVER observe a downstream throw; it always resolves normally once Hono's own dispatch layer
+  // has already converted the error into a response, well before the rejection could reach a
+  // middleware's own `next()` call). `extErrorHandler` (errors.ts) is scoped internally to only
+  // reshape `/api/ext/v1/*` responses — see its own doc comment.
+  app.onError(extErrorHandler)
 
   // /v1/* (OpenAI/Anthropic-compatible gateway) stays fully permissive — arbitrary
   // client software (Claude Code, other CLIs/tools) needs to reach it cross-origin,
