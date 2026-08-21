@@ -10,6 +10,26 @@ import { registerExtRunRoutes } from './routes.runs.js'
 import { PublicRunManager } from './run-manager.js'
 import { ConversationStore } from '../chat/db.js'
 import { ChatStoreRouter } from '../chat/store/router.js'
+import { hashKey } from '../auth.js'
+
+type JsonSchemaLike = { required?: string[]; allOf?: { $ref?: string }[] }
+
+// Resolves a schema's FULL effective `required` set, including anything pulled in via
+// `allOf: [{ $ref: ... }]` (the exact mechanism `pageOf()` in openapi.ts uses to compose a
+// list schema out of the shared `Page` envelope) — a schema's own `properties`/`required`
+// block can look complete while still inheriting extra required fields from an `allOf` ref
+// that a real response never actually has to satisfy.
+function resolveRequired(schema: JsonSchemaLike, schemas: Record<string, JsonSchemaLike>): string[] {
+  const required = new Set(schema.required ?? [])
+  for (const sub of schema.allOf ?? []) {
+    if (!sub.$ref) continue
+    const name = sub.$ref.replace('#/components/schemas/', '')
+    const resolved = schemas[name]
+    assert.ok(resolved, `allOf references unknown schema ${name}`)
+    for (const f of resolveRequired(resolved, schemas)) required.add(f)
+  }
+  return [...required]
+}
 
 test('the document is valid OpenAPI 3.1 with a title and version', () => {
   const doc = buildOpenApiDocument('1.0.0')
@@ -107,6 +127,56 @@ test('no run route is registered that the manifest does not document', () => {
 
     for (const r of registered) {
       assert.ok(documented.has(r), `route ${r} is live but undocumented — add it to EXT_ROUTES`)
+    }
+  } finally {
+    conv.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// The drift-guard tests above only check that a route HAS a manifest entry — not that the
+// manifest's declared response schema actually matches what the route returns. GET /audit
+// slipped through exactly that gap: its `responseSchema: 'AuditPage'` was built with
+// `pageOf('AuditRow')`, which wraps the schema in `allOf: [{$ref: 'Page'}]` — and `Page`
+// requires `has_more`/`next_cursor`. The real route (routes.chats.ts) only ever returns
+// `{ data: [...] }`; `AuditLog.list()` (audit.ts) has no cursor parameter at all, just
+// `limit`/`since`. This test hits the real route and checks the real response body against
+// the schema's own fully-resolved `required` set (allOf included), so a mismatch between
+// "what the schema promises" and "what the handler returns" fails here directly — not just
+// "does a manifest entry exist."
+test('GET /audit response body satisfies every field its own documented schema requires', async () => {
+  const doc = buildOpenApiDocument('1.0.0')
+  const operation = doc.paths['/api/ext/v1/audit'].get as {
+    responses: Record<string, { content?: { 'application/json'?: { schema: { $ref?: string } } } }>
+  }
+  const schemaRef = operation.responses['200']?.content?.['application/json']?.schema
+  assert.ok(schemaRef?.$ref, 'GET /audit has no documented application/json response schema')
+  const schemaName = (schemaRef.$ref as string).replace('#/components/schemas/', '')
+  const required = resolveRequired(doc.components.schemas[schemaName] as JsonSchemaLike, doc.components.schemas as Record<string, JsonSchemaLike>)
+
+  const dir = mkdtempSync(join(tmpdir(), 'turbollm-ext-openapi-audit-'))
+  const conv = new ConversationStore(dir)
+  try {
+    const chatStore = new ChatStoreRouter(conv.chatStore, conv.chatStore)
+    const key = 'tllm-ext-openapi-audit-drift-test'
+    const d = {
+      db: conv,
+      chatStore,
+      store: { snapshot: () => ({ apiKeys: [{ hash: hashKey(key), tenant: 'acme' }] }) },
+    } as never
+    const app = new Hono()
+    registerExtChatRoutes(app, d)
+
+    const res = await app.request('/api/ext/v1/audit', { headers: { Authorization: `Bearer ${key}` } })
+    assert.equal(res.status, 200)
+    const responseBody = await res.json() as Record<string, unknown>
+
+    for (const field of required) {
+      assert.ok(
+        field in responseBody,
+        `${schemaName} declares "${field}" required, but the real GET /audit response has no such key ` +
+        `(got: ${Object.keys(responseBody).join(', ') || '<none>'}) — schema/route drift`,
+      )
     }
   } finally {
     conv.close()

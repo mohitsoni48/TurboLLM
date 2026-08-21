@@ -381,11 +381,23 @@ function buildSchemas(): Record<string, JsonSchema> {
     required: ['id', 'owner', 'action', 'target_id', 'request_id', 'status', 'key_prefix', 'at'],
   }
 
+  // NOT `pageOf('AuditRow')`: unlike the other List endpoints, GET /audit isn't cursor-paginated
+  // — `AuditLog.list()` (audit.ts) takes only `limit`/`since`, no cursor, and the route
+  // (routes.chats.ts) returns exactly `{ data: [...] }`. `pageOf()`'s `allOf: [Page]` would
+  // require `has_more`/`next_cursor`, which this response never has (openapi.test.ts's
+  // response-fidelity test catches that mismatch directly).
+  const AuditPage: JsonSchema = {
+    type: 'object',
+    description: 'A page of audit rows (spec 27 §10). Not cursor-paginated — page backward using `since`.',
+    properties: { data: { type: 'array', items: { $ref: '#/components/schemas/AuditRow' } } },
+    required: ['data'],
+  }
+
   return {
     Chat, Message, Run, Page, Error,
     Capabilities, ChatInput, ChatPatch, MessageInput, MessagePatch,
     ChatPage: pageOf('Chat'), MessagePage: pageOf('Message'), RunPage: pageOf('Run'),
-    AuditRow, AuditPage: pageOf('AuditRow'),
+    AuditRow, AuditPage,
     OpenApiDocument: { type: 'object', description: 'This document itself.', additionalProperties: true },
   }
 }
