@@ -91,12 +91,15 @@ export interface Message {
   // `sink()` payloads) — `id`/`name`/`args`, not `name`/`arguments` as an earlier draft of this
   // client and spec §3.2's sample JSON both incorrectly showed.
   tool_calls?: Array<{ id: string; name: string; args: unknown; result?: unknown; error?: unknown }>
-  // The raw engine `chunk.usage` object captured by generation.ts (prompt_tokens/completion_tokens
-  // at minimum; exact fields vary by engine) — NOT the richer, internal-chat-only MessageStats
-  // shape (tokens_per_second/model) an earlier draft of this type wrongly declared. openapi.ts's
-  // own schema for this field is intentionally generic (`additionalProperties: true`) for the
-  // same reason: the server makes no field-level contract here beyond "whatever the engine sent."
-  usage?: Record<string, unknown>
+  // The raw engine `chunk.usage` object captured by generation.ts — NOT the richer,
+  // internal-chat-only MessageStats shape (tokens_per_second/model) an earlier draft of this type
+  // wrongly declared as required; those come from a separate wire field (`chunk.timings`) plus
+  // local daemon state generation.ts never reads. prompt_tokens/completion_tokens are typed
+  // (optional, since an aborted/failed run may never receive a usage chunk at all) because they
+  // are the fields actually reliably present across engines — mirrors chat-routes.ts's own
+  // `finalUsage` local type. The index signature keeps this honest for anything engine-specific
+  // beyond that, matching openapi.ts's intentionally generic (`additionalProperties: true`) schema.
+  usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number; [key: string]: unknown }
   metadata?: Record<string, unknown>
 }
 
