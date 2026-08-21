@@ -9,6 +9,7 @@ import type { ToolCallRecord } from '../chat/db'
 import { clampMaxTokens } from '../config/config'
 import { engineModelAlias } from '../engines/compat'
 import { presentedKey } from '../auth'
+import { noteLocalActivity } from '../link/host-idle'
 import { sessionAuth } from '../code/session-auth'
 import { classifyHarness } from '../telemetry/classify'
 import { mapToOpenAI, mapFromOpenAI, streamToAnthropic, messageStartEvent, pingWhilePending, DEFAULT_PING_INTERVAL_MS, type AnthropicRequest, type StreamToolCall } from './anthropic'
@@ -136,6 +137,9 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
   // ── POST /v1/messages — Anthropic translation (spec 06 §2) ───────────────
 
   app.post('/v1/messages', async (c) => {
+    // The owner's own terminal agent. Turbo Link's façade never reaches this route, so
+    // everything arriving here is by definition local (host-idle.ts).
+    noteLocalActivity()
     // Parse body first — needed to extract model for auto-swap (v0.6.0) and
     // to validate max_tokens before potentially waiting for a model swap.
     let req: AnthropicRequest
@@ -550,232 +554,264 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
   })
 
   // ── /v1/* OpenAI pass-through (spec 06 §1) ────────────────────────────────
+  //
+  // The handler body lives in the exported gatewayV1Handler below rather than inline,
+  // because the Turbo Link façade (link/link-routes.ts) mounts the SAME function behind
+  // its capability gate. A second copy over there is exactly the fork the façade exists
+  // to avoid — this codebase has already paid once for two implementations of one idea
+  // drifting apart (admin probe() vs LinkManager.probeOnce).
 
-  app.all('/v1/*', async (c) => {
-    const url = new URL(c.req.url)
+  app.all('/v1/*', (c) => gatewayV1Handler(c, d))
+}
 
-    // GET /v1/models: always synthesise the list from the WHOLE local library (not just
-    // the loaded model), regardless of whether an engine is running — real key entries for
-    // OpenAI-style consumers. The `claude-<key>` alias (whose id passes Claude Code's
-    // discovery filter — it keeps only claude*/anthropic* ids — and which /v1/messages
-    // strips back to the real key before routing) is only added when gateway.autoSwap is
-    // on: picking a model from Claude Code's /model always requires a swap, so advertising
-    // it while auto-swap is off would let the user pick a model that silently never loads.
-    if (c.req.method === 'GET' && url.pathname === '/v1/models') {
-      const autoSwap = d.store.snapshot().gateway.autoSwap
-      const data = d.scanner.list().models.flatMap((m) => [
-        { id: m.key, object: 'model', owned_by: 'turbollm' },
-        ...(autoSwap ? [{ id: `claude-${m.key}`, object: 'model', display_name: `${m.name} — TurboLLM` }] : []),
-      ])
-      return c.json({ object: 'list', data })
-    }
+/** Overrides for a caller that is NOT the public /v1/* mount. */
+export interface GatewayV1Options {
+  /** The /v1 path to act on, when the request arrived under a different prefix. The
+   *  façade's POST /api/link/v1/chat/completions passes '/v1/chat/completions': without
+   *  it this handler would see a non-chat path, skip every chat-specific step, and
+   *  proxy the peer's request to <engine>/api/link/v1/chat/completions. */
+  pathname?: string
+  /** Where the request came from. 'link' means a Turbo Link peer: it must NOT count as
+   *  the OWNER touching their own machine (host-idle.ts), or one peer's request would
+   *  block the next peer's wake for the whole idle grace window. Defaults to 'local'. */
+  origin?: 'local' | 'link'
+}
 
-    const isChat = c.req.method === 'POST' && url.pathname === '/v1/chat/completions'
+/** The whole /v1/* surface: GET /v1/models synthesis, POST /v1/chat/completions (body
+ *  rewrite, auto-swap routing, engine gate, usage accounting), and plain pass-through for
+ *  everything else. Extracted verbatim from the inline registration above so the Turbo Link
+ *  façade routes a peer through the identical code path a local client takes. */
+export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Options = {}): Promise<Response> {
+  const url = new URL(c.req.url)
+  // Every decision below keys off the /v1 path, not off the URL the client actually hit —
+  // see GatewayV1Options.pathname. Defaults to the real one, so the public mount is unchanged.
+  const pathname = opts.pathname ?? url.pathname
 
-    // For chat completions: parse the body to extract the model field for
-    // auto-swap routing (v0.6.0) and to apply the max_tokens cap if set.
-    // For all other endpoints: skip body parsing and pass through untouched.
-    let parsedBody: Record<string, unknown> | null = null
+  // GET /v1/models: always synthesise the list from the WHOLE local library (not just
+  // the loaded model), regardless of whether an engine is running — real key entries for
+  // OpenAI-style consumers. The `claude-<key>` alias (whose id passes Claude Code's
+  // discovery filter — it keeps only claude*/anthropic* ids — and which /v1/messages
+  // strips back to the real key before routing) is only added when gateway.autoSwap is
+  // on: picking a model from Claude Code's /model always requires a swap, so advertising
+  // it while auto-swap is off would let the user pick a model that silently never loads.
+  if (c.req.method === 'GET' && pathname === '/v1/models') {
+    const autoSwap = d.store.snapshot().gateway.autoSwap
+    const data = d.scanner.list().models.flatMap((m) => [
+      { id: m.key, object: 'model', owned_by: 'turbollm' },
+      ...(autoSwap ? [{ id: `claude-${m.key}`, object: 'model', display_name: `${m.name} — TurboLLM` }] : []),
+    ])
+    return c.json({ object: 'list', data })
+  }
+
+  const isChat = c.req.method === 'POST' && pathname === '/v1/chat/completions'
+  // What "the owner is using this machine" means for wake gating (host-idle.ts): a real
+  // generation request from a local client. A Turbo Link peer routed through this same
+  // function is explicitly NOT that — see GatewayV1Options.origin.
+  if (isChat && opts.origin !== 'link') noteLocalActivity()
+
+  // For chat completions: parse the body to extract the model field for
+  // auto-swap routing (v0.6.0) and to apply the max_tokens cap if set.
+  // For all other endpoints: skip body parsing and pass through untouched.
+  let parsedBody: Record<string, unknown> | null = null
+  if (isChat) {
+    try { parsedBody = (await c.req.json()) as Record<string, unknown> } catch { parsedBody = null }
+  }
+  const { token: chatToken, codeSessionId: chatCodeSessionId } = resolveCodeSession(c)
+  const chatHarness = resolveHarness(c, d, 'openai')
+
+  // ── Agent scaffolding + coding-activity attribution for OPENAI-protocol harnesses ──────────
+  // Everything below this comment used to exist only on /v1/messages, i.e. only for `claude`.
+  // The split was never by agent — it was by PROTOCOL, so `pi`/`opencode`/DeepSeek Harness/
+  // `kilo`/`openclaw`/`hermes` and every plain script silently ran without loop breaking,
+  // search-on-repeated-failure, dependency discipline, the routine hint, or a tool-call
+  // timeline. One adapter (openai-guidance.ts) reuses the SAME rules rather than forking them.
+  //
+  // `chatGuidance` is computed here (before the body is mutated below) but applied inside the
+  // isChat body-rewrite block, so a non-chat passthrough pays nothing at all.
+  // Built ONLY when something will actually read it. The view walks every message and JSON.parses
+  // every historical tool call's `arguments`, synchronously on the daemon's single thread, once
+  // per turn and growing with the conversation — pure waste for a plain chat client with no tools
+  // and no Code session, which is exactly when both consumers below skip it.
+  const chatNeedsView = isChat && !!parsedBody && (!!chatCodeSessionId || declaresTools(parsedBody))
+  const chatView = chatNeedsView && parsedBody ? openAiRequestView(parsedBody) : null
+  if (chatView && chatCodeSessionId) {
+    // Confirm half of coding-activity attribution — the view's `tool_result` blocks are exactly
+    // what this reads, so no second adapter is needed. Runs before the request is touched, for
+    // the same reason as the Anthropic handler: it must happen for every real turn, including
+    // ones that later fail to route or never reach the engine.
+    commitConfirmedCodeToolCalls(d, chatCodeSessionId, chatView)
+  }
+  const chatGuidance = chatView && parsedBody && declaresTools(parsedBody)
+    ? analyzeTurn(chatView, url.origin)
+    : null
+
+  const requestedModel = isChat ? ((parsedBody?.model as string | undefined) ?? '') : ''
+  const routeResult = await d.modelRouter.route(requestedModel)
+  if ('status' in routeResult) {
+    return c.json(
+      { error: { message: routeResult.message, type: 'model_not_loaded', code: 'model_not_loaded' } },
+      503,
+    )
+  }
+  const target = routeResult.target
+
+  const upstream = target + pathname + url.search
+  const headers = new Headers(c.req.raw.headers)
+  headers.delete('host')
+
+  const maxLimit = d.store.snapshot().modelDefaults.maxTokens ?? 0
+  // Cancel the upstream engine request if the client disconnects (same reason as
+  // /v1/messages above) — abandoned OpenAI-protocol requests would otherwise keep
+  // generating and occupy engine slots.
+  const ac = clientAbort(c)
+  const init: RequestInit & { duplex?: 'half' } = { method: c.req.method, headers, signal: ac.signal }
+
+  if (c.req.method !== 'GET' && c.req.method !== 'HEAD') {
     if (isChat) {
-      try { parsedBody = (await c.req.json()) as Record<string, unknown> } catch { parsedBody = null }
-    }
-    const { token: chatToken, codeSessionId: chatCodeSessionId } = resolveCodeSession(c)
-    const chatHarness = resolveHarness(c, d, 'openai')
-
-    // ── Agent scaffolding + coding-activity attribution for OPENAI-protocol harnesses ──────────
-    // Everything below this comment used to exist only on /v1/messages, i.e. only for `claude`.
-    // The split was never by agent — it was by PROTOCOL, so `pi`/`opencode`/DeepSeek Harness/
-    // `kilo`/`openclaw`/`hermes` and every plain script silently ran without loop breaking,
-    // search-on-repeated-failure, dependency discipline, the routine hint, or a tool-call
-    // timeline. One adapter (openai-guidance.ts) reuses the SAME rules rather than forking them.
-    //
-    // `chatGuidance` is computed here (before the body is mutated below) but applied inside the
-    // isChat body-rewrite block, so a non-chat passthrough pays nothing at all.
-    // Built ONLY when something will actually read it. The view walks every message and JSON.parses
-    // every historical tool call's `arguments`, synchronously on the daemon's single thread, once
-    // per turn and growing with the conversation — pure waste for a plain chat client with no tools
-    // and no Code session, which is exactly when both consumers below skip it.
-    const chatNeedsView = isChat && !!parsedBody && (!!chatCodeSessionId || declaresTools(parsedBody))
-    const chatView = chatNeedsView && parsedBody ? openAiRequestView(parsedBody) : null
-    if (chatView && chatCodeSessionId) {
-      // Confirm half of coding-activity attribution — the view's `tool_result` blocks are exactly
-      // what this reads, so no second adapter is needed. Runs before the request is touched, for
-      // the same reason as the Anthropic handler: it must happen for every real turn, including
-      // ones that later fail to route or never reach the engine.
-      commitConfirmedCodeToolCalls(d, chatCodeSessionId, chatView)
-    }
-    const chatGuidance = chatView && parsedBody && declaresTools(parsedBody)
-      ? analyzeTurn(chatView, url.origin)
-      : null
-
-    const requestedModel = isChat ? ((parsedBody?.model as string | undefined) ?? '') : ''
-    const routeResult = await d.modelRouter.route(requestedModel)
-    if ('status' in routeResult) {
-      return c.json(
-        { error: { message: routeResult.message, type: 'model_not_loaded', code: 'model_not_loaded' } },
-        503,
-      )
-    }
-    const target = routeResult.target
-
-    const upstream = target + url.pathname + url.search
-    const headers = new Headers(c.req.raw.headers)
-    headers.delete('host')
-
-    const maxLimit = d.store.snapshot().modelDefaults.maxTokens ?? 0
-    // Cancel the upstream engine request if the client disconnects (same reason as
-    // /v1/messages above) — abandoned OpenAI-protocol requests would otherwise keep
-    // generating and occupy engine slots.
-    const ac = clientAbort(c)
-    const init: RequestInit & { duplex?: 'half' } = { method: c.req.method, headers, signal: ac.signal }
-
-    if (c.req.method !== 'GET' && c.req.method !== 'HEAD') {
-      if (isChat) {
-        // Body already parsed above for routing. Apply token cap if set.
-        if (parsedBody && maxLimit > 0) {
-          parsedBody.max_tokens = clampMaxTokens(parsedBody.max_tokens as number | undefined, maxLimit)
-        }
-        // Rewrite the outbound model id for engines that serve under a fixed alias
-        // (mlx-lm / vLLM) or that require the real loaded model path (mlx-vlm).
-        // Routing above already used the caller's original id.
-        if (parsedBody) {
-          const alias = engineModelAlias(d.registry.active()?.kind ?? '', d.manager.currentOpts()?.modelPath)
-          if (alias) parsedBody.model = alias
-        }
-        // Terminal-agent thinking-budget override (ADR-284) — OpenAI-protocol clients (pi/
-        // opencode via this passthrough) reach the same `thinking_budget_tokens` field the
-        // engine sampler reads directly (no Anthropic-shaped `thinking` object to translate,
-        // unlike /v1/messages above). Same session-scoped-token gate as that handler.
-        if (parsedBody && chatCodeSessionId) {
-          const override = sessionAuth.getThinkingBudgetForToken(chatToken)
-          if (override !== null) {
-            if (override > 0) parsedBody.thinking_budget_tokens = override
-            else delete parsedBody.thinking_budget_tokens
-          }
-          // Same override mechanism, for reasoning_effort — see session-auth.ts. 'off'
-          // collapses onto enable_thinking/thinking_budget_tokens (reasoning-effort.ts).
-          const effortOverride = sessionAuth.getReasoningEffortForToken(chatToken)
-          if (effortOverride === 'off') {
-            parsedBody.thinking_budget_tokens = 0
-            parsedBody.chat_template_kwargs = { ...(parsedBody.chat_template_kwargs as Record<string, unknown> ?? {}), enable_thinking: false }
-          } else if (effortOverride !== null) {
-            parsedBody.chat_template_kwargs = { ...(parsedBody.chat_template_kwargs as Record<string, unknown> ?? {}), reasoning_effort: effortOverride }
-          }
-        }
-        // Apply the scaffolding computed above. Standing rules go on the system message (stable
-        // for the whole session → the engine's reusable prompt prefix is unaffected after turn
-        // one); situational nudges go on the trailing user/tool turn, where they cost no prefix
-        // reuse and where the model actually acts on them. Same division as the Anthropic path.
-        if (parsedBody && chatGuidance) {
-          appendSystemRules(parsedBody, chatGuidance.system)
-          appendNudges(parsedBody, chatGuidance.nudges)
-          // The hard half of the loop breaker: at LOOP_ABORT_AFTER the model physically cannot
-          // emit the same call again and has to answer in text, which ends the loop. `'none'` is
-          // the OpenAI spelling of the Anthropic path's identical `oaiBody.tool_choice = 'none'`.
-          if (chatGuidance.forceTextOnly) parsedBody.tool_choice = 'none'
-        }
-        // A streaming OpenAI response omits the final `usage` chunk unless the caller
-        // opts in via `stream_options.include_usage` (standard OpenAI API behavior,
-        // which llama.cpp's server mirrors) — without this, recordOpenAiStreamUsage
-        // below silently sees no usage and GitHub #71 undercounts every streaming
-        // OpenAI-protocol client that doesn't already request it. Only fills the gap
-        // when the caller left it unset; never overrides an explicit choice.
-        if (parsedBody?.stream === true && parsedBody.stream_options === undefined) {
-          parsedBody.stream_options = { include_usage: true }
-        }
-        headers.delete('content-length') // re-serialised body has a new length
-        init.body = parsedBody ? JSON.stringify(parsedBody) : ''
-      } else {
-        init.body = c.req.raw.body
-        init.duplex = 'half'
+      // Body already parsed above for routing. Apply token cap if set.
+      if (parsedBody && maxLimit > 0) {
+        parsedBody.max_tokens = clampMaxTokens(parsedBody.max_tokens as number | undefined, maxLimit)
       }
-    }
-
-    // Unguarded before this fix: a throw here (e.g. the client disconnecting while the
-    // body was being parsed/routed above hands fetch an ALREADY-aborted signal, which
-    // throws immediately with no network I/O — clientAbort() fires ac.abort() synchronously
-    // when c.req.raw.signal.aborted is already true) escaped straight to Hono's default
-    // error handler: a bodyless 500 with no diagnostic, and no client-facing error envelope
-    // at all. Mirrors the /v1/messages handler's guard above.
-    // Same engine-slot limit the Anthropic handler enforces above, for OpenAI-protocol clients
-    // (opencode / kilo / pi / scripts) — they reach the identical single engine, so leaving this
-    // path ungated would just move the pile-up rather than remove it. Only chat completions: a
-    // /tokenize or /embeddings call isn't a generation and must never queue behind one.
-    let chatGateRelease: (() => void) | null = null
-    if (isChat && d.gate) {
-      try {
-        chatGateRelease = await d.gate.acquire('bg', { signal: c.req.raw.signal, timeoutMs: 600_000 })
-      } catch (e) {
-        const aborted = (e as Error).message === 'gate_acquire_aborted'
-        return c.json(
-          {
-            error: aborted
-              ? { message: 'Client disconnected while queued for the engine.', type: 'api_error', code: 'client_disconnected' }
-              : { message: 'Timed out waiting for a free engine slot.', type: 'api_error', code: 'engine_busy' },
-          },
-          aborted ? 400 : 503,
-        )
+      // Rewrite the outbound model id for engines that serve under a fixed alias
+      // (mlx-lm / vLLM) or that require the real loaded model path (mlx-vlm).
+      // Routing above already used the caller's original id.
+      if (parsedBody) {
+        const alias = engineModelAlias(d.registry.active()?.kind ?? '', d.manager.currentOpts()?.modelPath)
+        if (alias) parsedBody.model = alias
       }
+      // Terminal-agent thinking-budget override (ADR-284) — OpenAI-protocol clients (pi/
+      // opencode via this passthrough) reach the same `thinking_budget_tokens` field the
+      // engine sampler reads directly (no Anthropic-shaped `thinking` object to translate,
+      // unlike /v1/messages above). Same session-scoped-token gate as that handler.
+      if (parsedBody && chatCodeSessionId) {
+        const override = sessionAuth.getThinkingBudgetForToken(chatToken)
+        if (override !== null) {
+          if (override > 0) parsedBody.thinking_budget_tokens = override
+          else delete parsedBody.thinking_budget_tokens
+        }
+        // Same override mechanism, for reasoning_effort — see session-auth.ts. 'off'
+        // collapses onto enable_thinking/thinking_budget_tokens (reasoning-effort.ts).
+        const effortOverride = sessionAuth.getReasoningEffortForToken(chatToken)
+        if (effortOverride === 'off') {
+          parsedBody.thinking_budget_tokens = 0
+          parsedBody.chat_template_kwargs = { ...(parsedBody.chat_template_kwargs as Record<string, unknown> ?? {}), enable_thinking: false }
+        } else if (effortOverride !== null) {
+          parsedBody.chat_template_kwargs = { ...(parsedBody.chat_template_kwargs as Record<string, unknown> ?? {}), reasoning_effort: effortOverride }
+        }
+      }
+      // Apply the scaffolding computed above. Standing rules go on the system message (stable
+      // for the whole session → the engine's reusable prompt prefix is unaffected after turn
+      // one); situational nudges go on the trailing user/tool turn, where they cost no prefix
+      // reuse and where the model actually acts on them. Same division as the Anthropic path.
+      if (parsedBody && chatGuidance) {
+        appendSystemRules(parsedBody, chatGuidance.system)
+        appendNudges(parsedBody, chatGuidance.nudges)
+        // The hard half of the loop breaker: at LOOP_ABORT_AFTER the model physically cannot
+        // emit the same call again and has to answer in text, which ends the loop. `'none'` is
+        // the OpenAI spelling of the Anthropic path's identical `oaiBody.tool_choice = 'none'`.
+        if (chatGuidance.forceTextOnly) parsedBody.tool_choice = 'none'
+      }
+      // A streaming OpenAI response omits the final `usage` chunk unless the caller
+      // opts in via `stream_options.include_usage` (standard OpenAI API behavior,
+      // which llama.cpp's server mirrors) — without this, recordOpenAiStreamUsage
+      // below silently sees no usage and GitHub #71 undercounts every streaming
+      // OpenAI-protocol client that doesn't already request it. Only fills the gap
+      // when the caller left it unset; never overrides an explicit choice.
+      if (parsedBody?.stream === true && parsedBody.stream_options === undefined) {
+        parsedBody.stream_options = { include_usage: true }
+      }
+      headers.delete('content-length') // re-serialised body has a new length
+      init.body = parsedBody ? JSON.stringify(parsedBody) : ''
+    } else {
+      init.body = c.req.raw.body
+      init.duplex = 'half'
     }
+  }
 
-    const requestStart = Date.now()
-    let res: Response
+  // Unguarded before this fix: a throw here (e.g. the client disconnecting while the
+  // body was being parsed/routed above hands fetch an ALREADY-aborted signal, which
+  // throws immediately with no network I/O — clientAbort() fires ac.abort() synchronously
+  // when c.req.raw.signal.aborted is already true) escaped straight to Hono's default
+  // error handler: a bodyless 500 with no diagnostic, and no client-facing error envelope
+  // at all. Mirrors the /v1/messages handler's guard above.
+  // Same engine-slot limit the Anthropic handler enforces above, for OpenAI-protocol clients
+  // (opencode / kilo / pi / scripts) — they reach the identical single engine, so leaving this
+  // path ungated would just move the pile-up rather than remove it. Only chat completions: a
+  // /tokenize or /embeddings call isn't a generation and must never queue behind one.
+  let chatGateRelease: (() => void) | null = null
+  if (isChat && d.gate) {
     try {
-      res = await fetch(upstream, init)
+      chatGateRelease = await d.gate.acquire('bg', { signal: c.req.raw.signal, timeoutMs: 600_000 })
     } catch (e) {
-      chatGateRelease?.()
-      const err = e as Error & { cause?: unknown }
-      const isAbort = err.name === 'AbortError' || ac.signal.aborted
-      const cause = err.cause instanceof Error ? `: ${err.cause.message}` : ''
+      const aborted = (e as Error).message === 'gate_acquire_aborted'
       return c.json(
         {
-          error: {
-            message: isAbort
-              ? 'Client disconnected before the engine responded.'
-              : `${err.message || 'Engine unreachable.'}${cause}`,
-            type: 'api_error',
-            code: isAbort ? 'client_disconnected' : 'engine_unreachable',
-          },
+          error: aborted
+            ? { message: 'Client disconnected while queued for the engine.', type: 'api_error', code: 'client_disconnected' }
+            : { message: 'Timed out waiting for a free engine slot.', type: 'api_error', code: 'engine_busy' },
         },
-        500,
+        aborted ? 400 : 503,
       )
     }
+  }
 
-    // Best-effort session-stats recording (B4) for OpenAI chat completions, fully
-    // fail-safe and non-intrusive: tee the body so the client still gets the exact
-    // upstream stream/bytes unchanged while we sniff usage off the copy.
-    if (res.ok && res.body && isChat) {
-      try {
-        const [a, b] = res.body.tee()
-        // Mark in-flight + publish live token count to the engine card while the teed
-        // copy drains, paired so the counter can't leak. (OpenAI clients don't get the
-        // prefill % — injecting return_progress would pollute their stream.)
-        d.manager.generationStart()
-        // The requester's own `stream` flag decides the drain shape: a non-streaming
-        // OpenAI client (common for scripted/extension callers, `stream` false/absent)
-        // gets ONE plain JSON body from the engine, not SSE `data:` lines — the SSE
-        // parser would silently see no matches and record nothing (GitHub #71: this
-        // gap would have made external-client tracking wrong for a common case).
-        const drain = parsedBody?.stream === true
-          ? recordOpenAiStreamUsage(d, b, 'openai', requestedModel || null, chatCodeSessionId, requestStart, chatHarness)
-          : recordOpenAiJsonUsage(d, b, 'openai', requestedModel || null, chatCodeSessionId, requestStart, chatHarness)
-        // Released when the teed copy finishes draining — i.e. when the engine has actually
-        // stopped generating, NOT when this handler returns. Returning the streaming Response
-        // hands bytes to the client while the engine is still busy, so releasing the slot here
-        // would let the next queued request in on top of a still-running generation.
-        void drain.finally(() => { d.manager.generationEnd(); chatGateRelease?.() })
-        return new Response(a, { status: res.status, headers: res.headers })
-      } catch {
-        chatGateRelease?.()
-        return new Response(res.body, { status: res.status, headers: res.headers })
-      }
-    }
-
-    // Non-chat passthrough, or a chat response with no body to drain (an engine error) — nothing
-    // will ever call the drain's finally, so the slot has to be given back right here.
+  const requestStart = Date.now()
+  let res: Response
+  try {
+    res = await fetch(upstream, init)
+  } catch (e) {
     chatGateRelease?.()
-    return new Response(res.body, { status: res.status, headers: res.headers })
-  })
+    const err = e as Error & { cause?: unknown }
+    const isAbort = err.name === 'AbortError' || ac.signal.aborted
+    const cause = err.cause instanceof Error ? `: ${err.cause.message}` : ''
+    return c.json(
+      {
+        error: {
+          message: isAbort
+            ? 'Client disconnected before the engine responded.'
+            : `${err.message || 'Engine unreachable.'}${cause}`,
+          type: 'api_error',
+          code: isAbort ? 'client_disconnected' : 'engine_unreachable',
+        },
+      },
+      500,
+    )
+  }
+
+  // Best-effort session-stats recording (B4) for OpenAI chat completions, fully
+  // fail-safe and non-intrusive: tee the body so the client still gets the exact
+  // upstream stream/bytes unchanged while we sniff usage off the copy.
+  if (res.ok && res.body && isChat) {
+    try {
+      const [a, b] = res.body.tee()
+      // Mark in-flight + publish live token count to the engine card while the teed
+      // copy drains, paired so the counter can't leak. (OpenAI clients don't get the
+      // prefill % — injecting return_progress would pollute their stream.)
+      d.manager.generationStart()
+      // The requester's own `stream` flag decides the drain shape: a non-streaming
+      // OpenAI client (common for scripted/extension callers, `stream` false/absent)
+      // gets ONE plain JSON body from the engine, not SSE `data:` lines — the SSE
+      // parser would silently see no matches and record nothing (GitHub #71: this
+      // gap would have made external-client tracking wrong for a common case).
+      const drain = parsedBody?.stream === true
+        ? recordOpenAiStreamUsage(d, b, 'openai', requestedModel || null, chatCodeSessionId, requestStart, chatHarness)
+        : recordOpenAiJsonUsage(d, b, 'openai', requestedModel || null, chatCodeSessionId, requestStart, chatHarness)
+      // Released when the teed copy finishes draining — i.e. when the engine has actually
+      // stopped generating, NOT when this handler returns. Returning the streaming Response
+      // hands bytes to the client while the engine is still busy, so releasing the slot here
+      // would let the next queued request in on top of a still-running generation.
+      void drain.finally(() => { d.manager.generationEnd(); chatGateRelease?.() })
+      return new Response(a, { status: res.status, headers: res.headers })
+    } catch {
+      chatGateRelease?.()
+      return new Response(res.body, { status: res.status, headers: res.headers })
+    }
+  }
+
+  // Non-chat passthrough, or a chat response with no body to drain (an engine error) — nothing
+  // will ever call the drain's finally, so the slot has to be given back right here.
+  chatGateRelease?.()
+  return new Response(res.body, { status: res.status, headers: res.headers })
 }
 
 // ── Coding-activity attribution for terminal-agent sessions ─────────────────

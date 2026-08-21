@@ -4,7 +4,9 @@ import { hostname } from 'node:os'
 import type { Deps } from '../deps'
 import type { ApiKey } from '../config/config'
 import { linkAuth, requireCapability } from './link-auth'
-import { allowsModel } from './capabilities'
+import { gatewayV1Handler } from '../gateway/gateway'
+import { allowsModel, hasCapability } from './capabilities'
+import { canWake, hostIdleState } from './host-idle'
 import { LINK_API_VERSIONS } from './protocol'
 import { LINK_CAPABILITIES, type HelloResponse } from './types'
 
@@ -105,5 +107,55 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
     // handler spreads the whole entry.
     const daemon = d.store.snapshot().daemon as { machineName?: string }
     return c.json({ machineName: resolveMachineName(daemon.machineName), models })
+  })
+
+  linkApp.post('/api/link/v1/chat/completions', requireCapability('models:use'), async (c) => {
+    const key = c.get('linkKey')
+    const body = await c.req.json().catch(() => ({})) as { model?: string }
+    const requested = body.model ?? ''
+    if (requested && !allowsModel(key, requested)) {
+      return c.json({ error: { code: 'forbidden', message: `This link may not use '${requested}'.` } }, 403)
+    }
+
+    // Wake gating (spec §5.5). The idle judgement lives HERE because only the host can
+    // make it. A peer with models:use but not models:wake may use what is already up;
+    // anything else is a TYPED 503 the peer renders as "in use locally", never a
+    // generic error the user cannot act on.
+    //
+    // The loaded/cold comparison is an EXACT key match, deliberately, even though
+    // ModelRouter.resolveEntry matches fuzzily downstream: `loaded` is precisely the flag
+    // GET /api/link/v1/models already reported to this peer, so the gate answers the
+    // question the peer actually asked. A fuzzier test here would let a near-miss id slip
+    // past the gate and reach the swap machinery anyway.
+    const loaded = d.manager.status().model?.key ?? null
+    if (requested && requested !== loaded) {
+      if (hasCapability(key, 'models:load')) {
+        // Unconditional by design: models:load IS the "you may take the machine" grant.
+        // Fall through to the normal auto-swap path.
+      } else if (hasCapability(key, 'models:wake')) {
+        if (!canWake(hostIdleState(d))) {
+          return c.json(
+            { error: { code: 'host_busy', message: 'The host is in use locally. Try again shortly.' } },
+            503,
+          )
+        }
+      } else {
+        return c.json(
+          {
+            error: {
+              code: 'model_not_loaded',
+              message: `'${requested}' is not loaded on this machine, and this link may not load it.`,
+            },
+          },
+          503,
+        )
+      }
+    }
+
+    // The SAME function the public /v1/chat/completions mount calls — never a
+    // reimplementation. `pathname` is what makes the peer's /api/link/v1 URL behave as
+    // the /v1 route it proxies; `origin: 'link'` keeps this out of the local-activity
+    // ledger the wake gate above reads.
+    return gatewayV1Handler(c, d, { pathname: '/v1/chat/completions', origin: 'link' })
   })
 }

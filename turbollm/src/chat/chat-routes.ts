@@ -27,6 +27,7 @@ import { resolveProfile, type LoadProfile } from '../models/profile'
 import type { ModelInfo } from '../engines/manager'
 import { getModelProfile } from '../config/config'
 import { getSysInfo } from '../sysinfo/sysinfo'
+import { noteLocalActivity } from '../link/host-idle'
 
 /** The per-request code-routine trust decision. Exported ONLY so it can be behaviourally
  *  pinned — both generation entry points must call this, never inline the expression.
@@ -900,6 +901,10 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
   let engineFailed = false
   let liveOut = 0
 
+  // In-app chat is the owner using their own machine — the signal Turbo Link's wake
+  // gate reads to refuse a peer's model swap (link/host-idle.ts). The gateway records
+  // the terminal-agent paths; this is the only local path that never goes through it.
+  noteLocalActivity()
   d.manager.generationStart()
   try {
     // Get tool definitions once (or empty for engines that don't support tools)
