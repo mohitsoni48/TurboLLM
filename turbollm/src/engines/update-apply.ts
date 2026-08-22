@@ -72,7 +72,7 @@ async function applyLlamaCppUpdate(d: UpdateApplyDeps, engine: Engine, root: str
   const newDef = backendDefAt(backendId, latestTag)
   if (!newDef) throw new Error('No upstream build of this backend for your platform.')
 
-  d.provision.start(backendId)
+  d.provision.start(backendId, 'auto_update')
   try {
     const newBin = await provisionBackend(
       root, newDef, latestTag,
@@ -101,7 +101,7 @@ async function applyLlamaCppUpdate(d: UpdateApplyDeps, engine: Engine, root: str
 
 /** TurboQuant fork: remove the install dir + re-provision the fork's latest release. */
 async function applyForkUpdate(d: UpdateApplyDeps, engine: Engine, root: string, signal?: AbortSignal): Promise<void> {
-  d.provision.start('turboquant')
+  d.provision.start('turboquant', 'auto_update')
   try {
     const oldEng = d.registry.list().engines.find((e) => e.binPath === engine.binPath)
     if (oldEng && d.registry.active()?.id === oldEng.id) await d.manager.stopAndWait()
@@ -125,7 +125,7 @@ async function applyForkUpdate(d: UpdateApplyDeps, engine: Engine, root: string,
 /** KoboldCpp: remove the install dir + re-download the latest release binary. Mirrors
  *  the fork path (single dir, replaced wholesale). */
 async function applyKoboldcppUpdate(d: UpdateApplyDeps, engine: Engine, root: string, signal?: AbortSignal): Promise<void> {
-  d.provision.start('koboldcpp')
+  d.provision.start('koboldcpp', 'auto_update')
   try {
     if (d.registry.active()?.id === engine.id) await d.manager.stopAndWait()
     rmSync(koboldcppDir(root), { recursive: true, force: true })
@@ -142,7 +142,7 @@ async function applyKoboldcppUpdate(d: UpdateApplyDeps, engine: Engine, root: st
 
 /** llamafile: remove the install dir + re-download the latest portable binary. */
 async function applyLlamafileUpdate(d: UpdateApplyDeps, engine: Engine, root: string, signal?: AbortSignal): Promise<void> {
-  d.provision.start('llamafile')
+  d.provision.start('llamafile', 'auto_update')
   try {
     if (d.registry.active()?.id === engine.id) await d.manager.stopAndWait()
     rmSync(llamafileDir(root), { recursive: true, force: true })
@@ -161,7 +161,7 @@ const PIP_ENGINE_LABEL: Record<'mlx' | 'rapid-mlx' | 'mlx-vlm' | 'vllm', string>
 
 /** vLLM / MLX / Rapid-MLX / MLX-VLM: upgrade the package in place (uv pip install -U/--upgrade). */
 async function applyPipUpdate(d: UpdateApplyDeps, kind: 'mlx' | 'rapid-mlx' | 'mlx-vlm' | 'vllm', engine: Engine, root: string): Promise<void> {
-  d.provision.start(kind)
+  d.provision.start(kind, 'auto_update')
   try {
     if (d.registry.active()?.id === engine.id) await d.manager.stopAndWait()
     if (kind === 'mlx') {

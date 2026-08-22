@@ -20,6 +20,9 @@ export const codeDaily = defineEvent({
   lifecycle: 'daily-rollup',
   description: "Yesterday's Code (coding-agent) feature volume for this machine — sessions, turns, and tool calls.",
   payload: {
+    /** Whole days back from this event's `ts` that these counters describe —
+     *  see `chat.ts` for the full rationale. */
+    daysAgo: f.int({ min: 0, max: 366, optional: true }),
     sessions: f.int(),
     turns: f.int(),
     toolCalls: f.int(),

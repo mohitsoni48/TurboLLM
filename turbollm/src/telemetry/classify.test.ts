@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { classifyLoadFailure, classifyBenchFailure, classifyEngineErrorFingerprint, classifyProvisionFailure, classifyHarness } from './classify'
+import { classifyLoadFailure, classifyBenchFailure, classifyEngineErrorFingerprint, classifyProvisionFailure, classifyHarness, classifyLoadErrorCode } from './classify'
 import { FAIL_REASONS, ERROR_FINGERPRINTS, PROVISION_FAIL_REASONS } from './schema'
 import { HARNESSES } from './events/gateway'
 
@@ -226,4 +226,34 @@ test('classifyHarness: always returns a value from the enum, for arbitrary/hosti
       `classified value must be in the enum, got ${classifyHarness(ua)}`,
     )
   }
+})
+
+// ── classifyLoadErrorCode (2026-08-21 data-integrity audit) ──────────────────
+// 57.6% of failed loads classify as failReason:'other', and that tail cannot be
+// narrowed from telemetry because the error TEXT is never transmitted. The
+// structured code can be, because this codebase writes it from a fixed set.
+
+test('classifyLoadErrorCode: passes through a code this codebase actually emits', () => {
+  assert.equal(classifyLoadErrorCode({ code: 'engine_exited' }), 'engine_exited')
+  assert.equal(classifyLoadErrorCode({ code: 'readiness_timeout' }), 'readiness_timeout')
+  assert.equal(classifyLoadErrorCode({ code: 'engine_spawn_failed' }), 'engine_spawn_failed')
+})
+
+test('classifyLoadErrorCode: anything unrecognized becomes unknown, never passes through as a string', () => {
+  // A code assigned somewhere new must not be able to reach an event unvalidated
+  // just because it exists — that is the free-text leak this whole schema forbids.
+  assert.equal(classifyLoadErrorCode({ code: 'brand_new_code' }), 'unknown')
+  assert.equal(classifyLoadErrorCode({ code: 'D:/models/private.gguf' }), 'unknown')
+  assert.equal(classifyLoadErrorCode({}), 'unknown')
+  assert.equal(classifyLoadErrorCode(null), 'unknown')
+  assert.equal(classifyLoadErrorCode(undefined), 'unknown')
+})
+
+test('classifyLoadErrorCode: splits the failReason "other" tail rather than replacing it', () => {
+  // The pair is the point: 'other' + 'engine_exited' now reads as "the process
+  // died and the log said nothing we recognise" instead of being indistinguishable
+  // from every other unexplained failure.
+  const err = { code: 'engine_exited', message: 'something we have no sign list for' }
+  assert.equal(classifyLoadFailure(err), 'other')
+  assert.equal(classifyLoadErrorCode(err), 'engine_exited')
 })

@@ -83,17 +83,34 @@ test('ProvisionState.onSettled: reports both outcomes and survives a throwing ob
 // BEFORE it reaches onSettled — the observer may never see free text (same
 // invariant the doc comment on onSettled states).
 test('ProvisionState.onSettled: fail() classifies the error into a failReason enum, never passes the raw string', () => {
-  const seen: Array<{ ok: boolean; failReason?: string }> = []
+  const seen: Array<{ ok: boolean; trigger: string; failReason?: string }> = []
   const p = new ProvisionState()
-  p.onSettled = (ok, failReason) => seen.push({ ok, failReason })
+  p.onSettled = (ok, trigger, failReason) => seen.push({ ok, trigger, failReason })
+  p.start('llama-server', 'user_install')
   p.fail('404 fetching release asset')
-  assert.deepEqual(seen, [{ ok: false, failReason: 'no_asset' }])
+  assert.deepEqual(seen, [{ ok: false, trigger: 'user_install', failReason: 'no_asset' }])
 })
 
 test('ProvisionState.onSettled: done() reports ok with no failReason', () => {
-  const seen: Array<{ ok: boolean; failReason?: string }> = []
+  const seen: Array<{ ok: boolean; trigger: string; failReason?: string }> = []
   const p = new ProvisionState()
-  p.onSettled = (ok, failReason) => seen.push({ ok, failReason })
+  p.onSettled = (ok, trigger, failReason) => seen.push({ ok, trigger, failReason })
+  p.start('llama-server', 'user_install')
   p.done()
-  assert.deepEqual(seen, [{ ok: true, failReason: undefined }])
+  assert.deepEqual(seen, [{ ok: true, trigger: 'user_install', failReason: undefined }])
+})
+
+// The trigger is what separates the unattended boot-time seed from a user actually
+// choosing to install something — one event name covered both until the 2026-08-21
+// data-integrity audit, which made "installed an engine" look like a user milestone
+// on machines where nobody had done anything at all.
+test('ProvisionState.onSettled: carries the trigger that started this run, not the default', () => {
+  const seen: string[] = []
+  const p = new ProvisionState()
+  p.onSettled = (_ok, trigger) => seen.push(trigger)
+  p.start('llama-server', 'seed')
+  p.done()
+  p.start('llama-server', 'user_update')
+  p.fail('network unreachable')
+  assert.deepEqual(seen, ['seed', 'user_update'])
 })

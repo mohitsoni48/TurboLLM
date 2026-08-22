@@ -403,6 +403,149 @@ export function estimateVram(p: LoadProfile, m: ModelEntry, sys: SysInfo): VramF
   return { estMb, totalVramMb, pct, verdict }
 }
 
+/** What each GPU is projected to hold, index-aligned with `sys.gpus`. */
+export interface GpuSplitPlan {
+  /** Layer count assigned to each GPU. */
+  layers: number[]
+  /** Projected VRAM use per GPU, in MB. */
+  estMb: number[]
+  /** Each GPU's projected use as a fraction of ITS OWN VRAM. */
+  pct: number[]
+  /** The worst card's verdict — a split is only as good as its fullest GPU. */
+  verdict: FitVerdict
+}
+
+/** Share of an MoE layer's bytes that live in its expert tensors. Calibrated against measured
+ *  dual-T4 loads of Qwen3.6-35B-A3B: at --n-cpu-moe 24 of 40 blocks the two cards came out at
+ *  1707 / 14693 MiB, which solves to ~90% expert / ~10% attention per layer. `estimateVram`'s
+ *  pooled math uses 0.85 for the same quantity; kept separate so tightening one doesn't silently
+ *  move the other. */
+const MOE_EXPERT_SHARE = 0.9
+
+/** Fraction of a GGUF's on-disk bytes that actually becomes per-layer GPU weight. The rest is
+ *  container overhead plus non-layer tensors (embeddings / output head) that don't ride the layer
+ *  split. Calibrated the same way: 22.9 GB of Qwen3.6-35B-A3B at zero offload measured 10905 MiB
+ *  on GPU0 over 20 of 40 layers, which back-solves to ~0.95. */
+const GPU_WEIGHT_FRACTION = 0.95
+
+/** Per-card fixed cost (CUDA context + compute buffers). Charged to every participating card,
+ *  unlike estimateVram's single pooled 800 MB. */
+const PER_GPU_OVERHEAD_MB = 300
+
+/** Per-GPU VRAM projection for a multi-GPU split — the thing {@link estimateVram} cannot express.
+ *
+ *  estimateVram compares ONE scalar against the SUMMED pool, so a config that pins GPU1 at its
+ *  ceiling while GPU0 sits nearly empty still reads as comfortably fitting: measured on 2x16 GB,
+ *  --n-cpu-moe 24 put 1707 MB on GPU0 and 14693 MB on GPU1 — 16.4 GB against a 30.7 GB pool, or
+ *  "53%, fits", while GPU1 was one step from OOM. The offload search then can't tell that the
+ *  ceiling it keeps hitting is one card's, not the pool's, and backs off far further than needed
+ *  (nCpuMoe 24 where 16 was reachable once the layers were placed by BYTES).
+ *
+ *  Why layer counts don't track bytes: `--n-cpu-moe N` strips the experts out of the FIRST N
+ *  layers, leaving them ~10x lighter than the rest, while llama.cpp's default split divides by
+ *  layer COUNT. Dense models have uniform layers and so are already balanced — this only bites
+ *  MoE, which is most of what people run now. */
+export function estimateVramPerGpu(p: LoadProfile, m: ModelEntry, sys: SysInfo): GpuSplitPlan {
+  const n = sys.gpus.length
+  if (n === 0) return { layers: [], estMb: [], pct: [], verdict: 'cpu' }
+
+  const blocks = m.blockCount > 0 ? m.blockCount : 1
+  const sizeMb = m.sizeBytes / 1e6
+  const perLayerMb = (sizeMb * GPU_WEIGHT_FRACTION) / blocks
+  // MoE keeps every layer's attention on the GPU and only moves experts to the CPU, so all
+  // `blocks` layers still occupy VRAM. Dense drops whole layers, so only `ngl` of them do.
+  const residentLayers = m.moe ? blocks : Math.max(0, Math.min(p.ngl, blocks))
+  const nCpuMoe = m.moe ? Math.max(0, Math.min(p.nCpuMoe, blocks)) : 0
+
+  // Layers per GPU. splitMode 'none' pins everything to one card; otherwise honour tensorSplit's
+  // proportions, falling back to llama.cpp's own even division.
+  const layers = new Array<number>(n).fill(0)
+  if (p.gpu?.splitMode === 'none' || n === 1) {
+    layers[p.gpu && p.gpu.mainGpu >= 0 ? Math.min(p.gpu.mainGpu, n - 1) : 0] = residentLayers
+  } else {
+    const w = p.gpu?.tensorSplit?.length === n && p.gpu.tensorSplit.some((x) => x > 0)
+      ? p.gpu.tensorSplit
+      : new Array<number>(n).fill(1)
+    const sum = w.reduce((a, b) => a + b, 0) || 1
+    let placed = 0
+    for (let i = 0; i < n; i++) {
+      const take = i === n - 1 ? residentLayers - placed : Math.round((residentLayers * w[i]) / sum)
+      layers[i] = Math.max(0, take)
+      placed += layers[i]
+    }
+  }
+
+  // KV rides along with the layer that owns it (llama.cpp allocates it per-layer on that device),
+  // so it follows the same distribution as the weights and needs no placement of its own.
+  const kvElems = kvCacheElems(m, p.ctx)
+  const kvTotalMb = p.kvOffload === false
+    ? 0
+    : ((((kvElems / 2) * kvBytesPerElem(p.kvTypeK) + (kvElems / 2) * kvBytesPerElem(p.kvTypeV)) / 1e6)
+        + (ssmStateElems(m) * 4) / 1e6) * (p.kvUnified ? 1 : Math.max(1, p.parallel))
+  const kvPerLayerMb = kvTotalMb / Math.max(1, residentLayers)
+
+  const mmprojMb = p.useMmproj && p.mmprojGpu && m.mmprojPath ? (m.mmprojSizeBytes / 1e6) * 1.15 : 0
+  // Walk the layers in order so an MoE's light (expert-stripped) head lands on whichever cards
+  // the split actually gives it — that asymmetry is the entire point of this function.
+  const estMb = new Array<number>(n).fill(0)
+  let idx = 0
+  for (let g = 0; g < n; g++) {
+    let mb = 0
+    for (let k = 0; k < layers[g]; k++, idx++) {
+      mb += m.moe && idx < nCpuMoe ? perLayerMb * (1 - MOE_EXPERT_SHARE) : perLayerMb
+      mb += kvPerLayerMb
+    }
+    // Context + compute buffers land on every participating card, not once for the whole load.
+    estMb[g] = Math.round(mb + (layers[g] > 0 ? PER_GPU_OVERHEAD_MB : 0) + (g === 0 ? mmprojMb : 0))
+  }
+
+  const pct = estMb.map((mb, g) => mb / Math.max(1, sys.gpus[g]?.vramMb ?? 0))
+  const worst = Math.max(...pct)
+  const verdict: FitVerdict = worst <= 0.8 ? 'fits' : worst <= 0.95 ? 'tight' : 'overflow'
+  return { layers, estMb, pct, verdict }
+}
+
+/** Layer proportions that even out BYTES across the cards, for {@link GpuProfile.tensorSplit}.
+ *
+ *  Only meaningful when the layers themselves are uneven — i.e. MoE with `--n-cpu-moe` — and only
+ *  worth emitting when a card would otherwise saturate while another idles. Measured: with both
+ *  cards well short of their ceiling, rebalancing moved bytes around (7717/11303 -> 11369/7653)
+ *  and changed throughput by 0.5%, i.e. nothing. The win is not the balance itself, it is that a
+ *  balanced placement lets the offload search stop sooner (nCpuMoe 24 -> 16 on the same hardware,
+ *  4.96 -> 5.82 tok/s), so callers should only reach for this when the split is the binding
+ *  constraint. Returns [] when an even split is already right. */
+export function deriveTensorSplit(p: LoadProfile, m: ModelEntry, sys: SysInfo): number[] {
+  const n = sys.gpus.length
+  if (n < 2 || !m.moe || p.gpu?.splitMode === 'none') return []
+  const blocks = m.blockCount > 0 ? m.blockCount : 1
+  const nCpuMoe = Math.max(0, Math.min(p.nCpuMoe, blocks))
+  if (nCpuMoe === 0) return [] // uniform layers — llama.cpp's even split is already byte-balanced
+
+  const light = 1 - MOE_EXPERT_SHARE
+  const totalW = nCpuMoe * light + (blocks - nCpuMoe) * 1
+  const vram = sys.gpus.map((g) => g.vramMb || 0)
+  const vramSum = vram.reduce((a, b) => a + b, 0) || 1
+
+  // Walk the layers in order, handing each card layers until it has its VRAM-proportional share
+  // of the total weight. The light (expert-stripped) head is cheap, so the first card absorbs
+  // many more layers than an even split would give it.
+  const layers = new Array<number>(n).fill(0)
+  let idx = 0
+  let acc = 0
+  for (let g = 0; g < n; g++) {
+    const target = g === n - 1 ? Infinity : (totalW * vram[g]) / vramSum
+    while (idx < blocks && (g === n - 1 || acc < target)) {
+      acc += idx < nCpuMoe ? light : 1
+      layers[g]++
+      idx++
+      if (g < n - 1 && acc >= target) break
+    }
+    acc = 0
+  }
+  if (layers.some((l) => l === 0)) return [] // degenerate — leave llama.cpp's default alone
+  return layers
+}
+
 /** Computed defaults for a model (spec 05 §3). NOT saved until the user saves. */
 export function deriveDefault(m: ModelEntry, sys: SysInfo): LoadProfile {
   const hasGpu = sys.gpus.length > 0

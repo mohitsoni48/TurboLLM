@@ -670,5 +670,8 @@ export const uiDaily = defineEvent({
     screen: f.enum(SCREENS),
     actions: f.int(),
     distinctActions: f.int(),
+    /** Whole days back from this event's `ts` that these counts describe —
+     *  see `chat.ts` for the full rationale. */
+    daysAgo: f.int({ min: 0, max: 366, optional: true }),
   },
 })

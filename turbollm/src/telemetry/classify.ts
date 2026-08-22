@@ -76,6 +76,10 @@ const GGUF_SIGNS = [
 
 /** Classify a load failure. Never throws; never returns anything but an enum
  *  member. */
+import { LOAD_ERROR_CODES } from './events/model'
+
+type LoadErrorCode = (typeof LOAD_ERROR_CODES)[number]
+
 export function classifyLoadFailure(err: LoadError | null | undefined): FailReason {
   if (!err) return 'other'
 
@@ -243,4 +247,27 @@ export function classifyProvisionFailure(message: string | null | undefined): Pr
   if (NETWORK_SIGNS.some((s) => haystack.includes(s))) return 'network'
 
   return 'other'
+}
+
+/**
+ * Map a `LoadError.code` onto the closed `LOAD_ERROR_CODES` set for the
+ * `model_load` event (2026-08-21 data-integrity audit).
+ *
+ * The point is narrow and worth stating: `classifyLoadFailure` above sniffs
+ * TEXT, and when no sign matches it returns `'other'` — which is where 57.6% of
+ * real failures land. That tail is unnarrowable from telemetry by design, since
+ * the text itself is never transmitted. `code`, unlike the message, is written
+ * by this codebase from a fixed vocabulary, so it can be reported verbatim
+ * without weakening the no-free-form-strings guarantee, and it splits `other`
+ * into "the process died", "it never became ready", "we refused the engine",
+ * and "genuinely unknown".
+ *
+ * Anything unrecognised becomes `'unknown'` rather than being passed through:
+ * a code added elsewhere in the tree must never be able to reach an event as an
+ * unvalidated string just because it was assigned somewhere new.
+ */
+export function classifyLoadErrorCode(err: LoadError | null | undefined): LoadErrorCode {
+  const code = err?.code
+  if (typeof code !== 'string') return 'unknown'
+  return (LOAD_ERROR_CODES as readonly string[]).includes(code) ? (code as LoadErrorCode) : 'unknown'
 }

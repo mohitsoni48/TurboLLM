@@ -2,8 +2,8 @@
 // (which split modes the sweep tries, in order) and the split-aware overHeadroom budget.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { pickSplitStrategies, overHeadroom } from './bench'
-import { deriveDefault } from '../models/profile'
+import { withBalancedSplit, pickSplitStrategies, overHeadroom } from './bench'
+import { deriveDefault, deriveTensorSplit, estimateVramPerGpu } from '../models/profile'
 import type { LoadProfile } from '../models/profile'
 import type { ModelEntry } from '../models/scanner'
 import type { SysInfo } from '../sysinfo/sysinfo'
@@ -29,8 +29,8 @@ function sys(gpus: number[]): SysInfo {
 // Empty flags = graceful-degrade → all flags allowed (a probed engine that supports split).
 const caps = { kvTypes: ['f16', 'q8_0', 'turbo4'], flags: [] as string[] }
 
-function base(s: SysInfo, over: Partial<LoadProfile> = {}): LoadProfile {
-  return { ...deriveDefault(model(), s), ...over }
+function base(s: SysInfo, over: Partial<LoadProfile> = {}, m: ModelEntry = model()): LoadProfile {
+  return { ...deriveDefault(m, s), ...over }
 }
 
 // ---- pickSplitStrategies ----------------------------------------------------
@@ -111,4 +111,58 @@ test('overHeadroom judges against the given budget, not a fixed pool', () => {
 test('overHeadroom never blocks on unknown VRAM or zero budget', () => {
   assert.equal(overHeadroom(null, 15360, 1024), false)
   assert.equal(overHeadroom(14000, 0, 1024), false)
+})
+
+// ---- withBalancedSplit ------------------------------------------------------
+// Ground truth: dual Tesla T4 (2x15360 MB) running Qwen3.6-35B-A3B. See deploy/kaggle/README.md.
+
+const MOE40 = { blockCount: 40, moe: true, expertCount: 128, arch: 'qwen3moe' } as Partial<ModelEntry>
+const t4x2 = sys([15360, 15360])
+
+test('offload that strands a card gets a byte-balanced tensor-split', () => {
+  const m = model({ sizeBytes: 36_903_140_320, ...MOE40 })   // Q8_0, needs offload on 2x16 GB
+  const p = { ...base(t4x2, { ctx: 8192, nCpuMoe: 24, ngl: 99 }, m) }
+  const out = withBalancedSplit(p, m, t4x2)
+  assert.ok(out.gpu.tensorSplit.length === 2, 'a split should be derived')
+  assert.ok(out.gpu.tensorSplit[0] > out.gpu.tensorSplit[1], 'the expert-stripped head is cheap, so GPU0 takes more layers')
+})
+
+test('no offload → left alone (even layers are already even bytes)', () => {
+  const m = model({ sizeBytes: 22_853_663_008, ...MOE40 })   // Q4_K_XL fits both cards at nCpuMoe 0
+  const p = base(t4x2, { ctx: 8192, nCpuMoe: 0, ngl: 99 }, m)
+  assert.deepEqual(withBalancedSplit(p, m, t4x2).gpu.tensorSplit, [])
+})
+
+test('dense model → left alone (uniform layers cannot be imbalanced)', () => {
+  const m = model({ sizeBytes: 40_000_000_000, moe: false, blockCount: 40 })
+  const p = base(t4x2, { ctx: 8192, ngl: 99 }, m)
+  assert.deepEqual(withBalancedSplit(p, m, t4x2).gpu.tensorSplit, [])
+})
+
+test('a split the user pinned is never overwritten', () => {
+  const m = model({ sizeBytes: 36_903_140_320, ...MOE40 })
+  const p = base(t4x2, { ctx: 8192, nCpuMoe: 24, ngl: 99 }, m)
+  const pinned = { ...p, gpu: { ...p.gpu, tensorSplit: [1, 1] } }
+  assert.deepEqual(withBalancedSplit(pinned, m, t4x2).gpu.tensorSplit, [1, 1])
+})
+
+// deriveTensorSplit balances bytes; it does NOT promise the result fits. At nCpuMoe=4 the
+// 36.9 GB model needs ~34 GB of a 30.7 GB pool, and the balanced split lands both cards at
+// ~110% of their VRAM. withBalancedSplit must decline it rather than hand the search a config
+// that cannot load — balancing is only ever worth applying when it actually resolves the overflow.
+test('a balanced split that still overflows is declined, not applied', () => {
+  const m = model({ sizeBytes: 36_903_140_320, ...MOE40 })
+  const p = base(t4x2, { ctx: 8192, nCpuMoe: 4, ngl: 99 }, m)
+  const ts = deriveTensorSplit(p, m, t4x2)
+  assert.ok(ts.length === 2, 'precondition: a split is derivable')
+  const balanced = estimateVramPerGpu({ ...p, gpu: { ...p.gpu, tensorSplit: ts } }, m, t4x2)
+  assert.equal(balanced.verdict, 'overflow', 'precondition: balancing does not rescue this offload')
+  assert.deepEqual(withBalancedSplit(p, m, t4x2).gpu.tensorSplit, [], 'must be left untouched')
+})
+
+test('single-GPU box → left alone', () => {
+  const one = sys([15360])
+  const m = model({ sizeBytes: 36_903_140_320, ...MOE40 })
+  const p = base(one, { ctx: 8192, nCpuMoe: 24, ngl: 99 }, m)
+  assert.deepEqual(withBalancedSplit(p, m, one).gpu.tensorSplit, [])
 })

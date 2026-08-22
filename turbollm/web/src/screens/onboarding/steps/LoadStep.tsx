@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { AlertTriangle, Check, Download, Loader2, Terminal } from 'lucide-react'
 import { useDownloadMutations, useDownloads, useModels, useStatus } from '../../../lib/queries'
-import { loadModel, track } from '../../../lib/api'
+import { loadModel, track, trackRecovery, trackRecoveryText } from '../../../lib/api'
 import { useOnboardingMachine } from '../../../lib/onboarding/useOnboardingMachine'
 import type { StepComponentProps } from '../OnboardingScreen'
 
@@ -28,6 +28,23 @@ export default function LoadStep({ onContinue, ctx }: StepComponentProps) {
   const [loadTriggered, setLoadTriggered] = useState(false)
   const [loadFailed, setLoadFailed] = useState(false)
   const advancedRef = useRef(false)
+  // A retry is only worth measuring once we know whether it WORKED, and that answer
+  // arrives on a later render (the model comes up, or the download reaches a terminal
+  // status). This holds the in-flight attempt until then — `onboarding_recovery`'s whole
+  // point is the outcome, so reporting at click time records the question and never the
+  // answer.
+  //
+  // `wasLoaded` and `leftError` are the guards that keep the outcome honest. Without
+  // them the settle effect fires on the state that was ALREADY true when the button was
+  // clicked: a model still loaded from earlier reads as an instant 'ok', and a download
+  // record still sitting at 'error' (which is exactly why the retry button is on screen)
+  // reads as an instant 'fail'. Either way the event would report a constant and measure
+  // nothing — the precise failure mode this whole telemetry pass exists to remove.
+  const pendingRecoveryRef = useRef<
+    | { kind: 'load'; failure: string; action: string; wasLoaded: boolean }
+    | { kind: 'download'; failureText: string; action: string; downloadId: string; leftError: boolean }
+    | null
+  >(null)
 
   // 'error' is excluded from BOTH `activeDownload` and `finishedDownload` — it is neither
   // still in flight nor a success, and matching it against the old `!== 'done' && !==
@@ -173,6 +190,67 @@ export default function LoadStep({ onContinue, ctx }: StepComponentProps) {
     }
   }, [isLoaded, ctx.loadCompletedOnce, advance, patchCtx])
 
+  // Settle whichever recovery attempt is in flight, from OBSERVED state only.
+  //
+  // Load: the expected model actually coming up is 'ok'; landing back on the failure
+  // screen is 'fail'. `wasLoaded` suppresses the case where something was already
+  // loaded when the user clicked, which would otherwise report success for a retry
+  // that never happened.
+  //
+  // Download: a resume is judged on the download RECORD reaching a terminal status,
+  // not on the resume request being accepted. `resume.mutate` resolving only means the
+  // daemon took the request — reporting 'ok' there would have made this event a
+  // near-constant success, since that call essentially always succeeds. The record must
+  // first leave 'error' (`leftError`), and only then does 'done' mean the remedy worked.
+  //
+  // The ref is cleared as it settles, so each attempt reports exactly once and a user
+  // who retries three times before succeeding produces three honest rows — the most
+  // informative shape this event has, and why it is per-action rather than once-only.
+  useEffect(() => {
+    const p = pendingRecoveryRef.current
+    if (!p) return
+
+    if (p.kind === 'load') {
+      // `wasLoaded` means a model matching the expected key was ALREADY up when
+      // Retry was pressed, so "it is up now" cannot distinguish a successful retry
+      // from the state that preceded it. Report nothing rather than something:
+      // settling 'fail' here (the only branch still reachable) would make every
+      // such attempt a failure and bias the one metric that measures whether
+      // recovery works. A missing row is honest; a wrong one is not.
+      if (p.wasLoaded) return
+      if (isLoaded) {
+        pendingRecoveryRef.current = null
+        trackRecovery(p.failure, p.action, 'ok')
+      } else if (loadFailed) {
+        pendingRecoveryRef.current = null
+        trackRecovery(p.failure, p.action, 'fail')
+      }
+      return
+    }
+
+    const record = downloadsQuery.data?.downloads.find((dl) => dl.id === p.downloadId)
+    if (!record) return
+    // 'done' is checked BEFORE the leftError gate on purpose. useDownloads stops
+    // polling once a download reaches 'done', so a resume that finishes between
+    // two polls never shows an intermediate status — gating success on having
+    // first observed the record leave 'error' would silently drop exactly the
+    // fastest, most successful retries and skew the metric toward failure.
+    if (record.status === 'done') {
+      pendingRecoveryRef.current = null
+      trackRecoveryText(p.failureText, p.action, 'ok')
+      return
+    }
+    if (!p.leftError) {
+      // Still showing the pre-retry failure; nothing has been attempted yet.
+      if (record.status !== 'error') p.leftError = true
+      return
+    }
+    if (record.status === 'error') {
+      pendingRecoveryRef.current = null
+      trackRecoveryText(p.failureText, p.action, 'fail')
+    }
+  }, [isLoaded, loadFailed, downloadsQuery.data])
+
   if (loadFailed) {
     return (
       <div className="space-y-6">
@@ -187,7 +265,16 @@ export default function LoadStep({ onContinue, ctx }: StepComponentProps) {
         <div className="flex items-center gap-3">
           <button
             type="button"
-            onClick={() => { track('onboarding', 'take_recovery_action'); setLoadFailed(false); setLoadTriggered(false) }}
+            onClick={() => {
+              track('onboarding', 'take_recovery_action')
+              // 'other' is honest here, not lazy: the daemon still does not surface a
+              // classified load-failure reason on this path (see this file's header note
+              // on the `lastLoadError` gap), so any more specific value would be invented.
+              // Surfacing `classifyLoadFailure`'s result on Status is what upgrades it.
+              pendingRecoveryRef.current = { kind: 'load', failure: 'other', action: 'retry', wasLoaded: isLoaded }
+              setLoadFailed(false)
+              setLoadTriggered(false)
+            }}
             className="rounded-lg border border-accent bg-accent/10 text-accent px-4 py-2 text-sm font-medium hover:bg-accent/20 transition-colors"
           >
             Retry
@@ -220,7 +307,31 @@ export default function LoadStep({ onContinue, ctx }: StepComponentProps) {
         <div className="flex items-center gap-3">
           <button
             type="button"
-            onClick={() => { track('onboarding', 'take_recovery_action'); downloadMutations.resume.mutate(erroredDownload.id) }}
+            onClick={() => {
+              track('onboarding', 'take_recovery_action')
+              // The daemon's own error string goes back to the daemon to be classified
+              // into an enum member there — it never becomes part of an event as text.
+              const failureText = erroredDownload.error ?? ''
+              pendingRecoveryRef.current = {
+                kind: 'download',
+                failureText,
+                action: 'resume',
+                downloadId: erroredDownload.id,
+                leftError: false,
+              }
+              downloadMutations.resume.mutate(erroredDownload.id, {
+                // Only the ERROR path is judged here. A rejected resume request is a
+                // remedy that demonstrably did not work, and the record would stay at
+                // 'error' forever, so the settle effect above would never fire. Success
+                // is deliberately NOT reported here — see that effect for why.
+                onError: () => {
+                  const p = pendingRecoveryRef.current
+                  if (p?.kind !== 'download' || p.downloadId !== erroredDownload.id) return
+                  pendingRecoveryRef.current = null
+                  trackRecoveryText(failureText, 'resume', 'fail')
+                },
+              })
+            }}
             disabled={downloadMutations.resume.isPending}
             className="rounded-lg border border-accent bg-accent/10 text-accent px-4 py-2 text-sm font-medium hover:bg-accent/20 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
           >
