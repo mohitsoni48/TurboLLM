@@ -1607,14 +1607,26 @@ export function pickSplitStrategies(
  *  win is never the balance itself — it is that a balanced placement lets the search stop sooner.
  *  Dense models have uniform layers and are already balanced, so deriveTensorSplit returns [].
  *
- *  A split the user pinned themselves is left alone. */
+ *  **Auto-tune owns the split (founder call, 2026-08-22).** A `tensorSplit` already on the
+ *  profile is DISCARDED here rather than honoured, so the sweep always judges placement for
+ *  itself. A pinned split is exactly what caps the search: the offload probe can only move
+ *  `nCpuMoe`, so a split chosen for yesterday's model/ctx silently bounds today's resident
+ *  VRAM (measured: stuck at 16.4 GB of a 30.7 GB pool, 4.3 t/s chat, where the tuner reached
+ *  27.6 GB and 10.0 t/s once free to place layers itself). This is scoped to the sweep — a
+ *  normal load still uses whatever the profile says, and the tuned result only replaces it if
+ *  the user clicks Save in the results dialog. */
 export function withBalancedSplit(p: LoadProfile, m: ModelEntry, sys: SysInfo): LoadProfile {
-  if (sys.gpus.length < 2 || p.gpu.splitMode === 'none' || p.gpu.tensorSplit.length > 0) return p
-  if (estimateVramPerGpu(p, m, sys).verdict !== 'overflow') return p
-  const tensorSplit = deriveTensorSplit(p, m, sys)
-  if (tensorSplit.length === 0) return p
-  const balanced = { ...p, gpu: { ...p.gpu, tensorSplit } }
-  return estimateVramPerGpu(balanced, m, sys).verdict === 'overflow' ? p : balanced
+  if (sys.gpus.length < 2 || p.gpu.splitMode === 'none') return p
+  // Drop any pinned split FIRST: every judgement below — and the profile we hand back when
+  // balancing turns out not to help — is then auto-tune's own even-split baseline, never the
+  // user's. 'none' is left alone above because that is a single-GPU choice, not a split.
+  const even: LoadProfile =
+    p.gpu.tensorSplit.length > 0 ? { ...p, gpu: { ...p.gpu, tensorSplit: [] } } : p
+  if (estimateVramPerGpu(even, m, sys).verdict !== 'overflow') return even
+  const tensorSplit = deriveTensorSplit(even, m, sys)
+  if (tensorSplit.length === 0) return even
+  const balanced = { ...even, gpu: { ...even.gpu, tensorSplit } }
+  return estimateVramPerGpu(balanced, m, sys).verdict === 'overflow' ? even : balanced
 }
 
 /** The largest GPU-resident fraction (0..1) of `entry` that fits under `profile.gpu`'s own VRAM
