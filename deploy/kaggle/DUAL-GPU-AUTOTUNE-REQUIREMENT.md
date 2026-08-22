@@ -1,5 +1,56 @@
 # Dual-GPU auto-tune — THE REQUIREMENT
 
+---
+
+## ✅ THE ANSWER — best settings for Qwen3.8-27B Q4 on 2× Tesla T4
+
+Measured 2026-08-22 entirely through the GUI, on Kaggle 2× Tesla T4 (30720 MB pooled), engine
+TurboQuant CUDA (T4), model `Qwen3.8-27B-UD-Q4_K_XL` (17.9 GB, 65 blocks, ships a NextN head).
+
+**Use these:**
+
+| Setting | Value |
+|---|---|
+| Context length | **200,192** |
+| GPU layers | **ALL (65)** |
+| Split mode | **Layer** |
+| K cache type | **q8_0** |
+| V cache type | **turbo4** |
+| Flash attention | **On** |
+| KV cache | **GPU** |
+| Speculative decoding | **Off** ⚠️ (the default, NextN, is *slower* here) |
+
+→ **11.5–12 tok/s sustained at 200k context**, 28.7 / 30.7 GB, nothing on CPU.
+
+### Everything else that was tried, and why it lost
+
+| Config | Result |
+|---|---|
+| Same, but **Split mode = Row** (tensor-parallel) | **Crashes.** `CUDA error: invalid argument` in `ggml_backend_cuda_split_buffer_set_tensor`, ~8 s in. Fails at ctx 8,192 too (19.1/30.7 GB — not a memory problem). Row is unusable on T4 with this build. |
+| Same, but **speculative = NextN** (the DEFAULT), ctx 131,072 | **7.0 tok/s and still falling at 434 tokens** — a ~40% regression, at a *smaller* context. The draft head competes for the same starved GPUs. |
+| Same, but **K = turbo4** (what the panel steers you to) | **Fails to load, `exit 1`.** The fork silently upgrades K to `q8_0` (BUG-11), so the panel's "~25.4 GB · fits" was never real. |
+| ctx 200,192 with **f16** KV | ~45.4 / 30.7 GB — spills. |
+| ctx 200,192 with **q8_0 for both** K and V | ~32.0 / 30.7 GB — still over. |
+| **Single-GPU** (auto-tune's own first candidate) | Loads, but the probe finds only `ngl 31/65`, leaving 34 **dense** layers on 4 vCPUs. Observed crawling at `prefill 46%`; consumed the full per-test cap and could never win. |
+
+### The three findings that matter beyond this one box
+
+1. **`turbo4` for V, `q8_0` for K is what makes 200k fit at all.** Not a split-geometry question —
+   KV type is the dominant lever at depth, and it is the one thing auto-tune does **not** search
+   (ADR-219 removed that sweep). The user must set it by hand.
+2. **Speculative decoding is a hardware-dependent bet, and it is ON by default.** It wins big on the
+   reference 2× RTX 5060 Ti box (80% acceptance, 68 tok/s) and loses ~40% here. Nothing measures it.
+3. **Row must be a candidate even though it loses here.** It fails in 8 seconds, so offering it is
+   nearly free — and it is the only geometry that could ever reproduce the reference config.
+   Implemented; see BUG-6.
+
+**Honest gap:** auto-tune's own end-to-end answer for this model was never captured — its first
+candidate (single-GPU) ate the budget at this depth, and the sweep was cancelled twice. The table
+above is hand-measured. Whether auto-tune *lands* on the Layer/200k config is still unverified.
+
+---
+
+
 > Written 2026-08-22 after the founder got angry at how this was being handled.
 > Read this **first** in any session touching dual-GPU. It exists so the deviation
 > described below does not happen again.
