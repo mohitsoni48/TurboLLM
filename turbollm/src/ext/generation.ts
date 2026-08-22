@@ -155,16 +155,33 @@ export function buildEngineRequestBody(
   return { ...samplingOverride, ...controlFields }
 }
 
+// Round-2 release-gate finding H2: buildEngineRequestBody's control-field precedence (I7) only
+// protects the fields the caller explicitly names as controlFields (model/messages/stream/
+// stream_options) — it does nothing for a control-plane key this trailing passthrough loop lets
+// through that the ROUTE never happens to re-set afterward. `tool_choice` is exactly that case:
+// no route ever sets it explicitly, so there is no control field for a tenant's own
+// `sampling.tool_choice` to lose to, and it reached the engine verbatim (live-reproduced: a
+// tenant setting `tool_choice: 'required'` can COMPEL a tool call every turn, not just hope for
+// one — those calls then execute under the LOCAL install's own tool policy, sharpening I10's
+// already-accepted risk). `tools` has the same gap specifically on vLLM/SGLang, where the route
+// deliberately withholds `reqBody.tools` (`toolsSupported` false) — a tenant's own `sampling.tools`
+// reached the engine anyway on exactly the engines the route chose to suppress it on. Denylisted
+// here, not left to buildEngineRequestBody's spread order, since spread order alone only protects
+// fields the route actually sets — this protects a field even when the route sets nothing.
+const RESERVED_ENGINE_KEYS = new Set(['model', 'messages', 'stream', 'stream_options', 'tools', 'tool_choice'])
+
 /** Same camelCase → engine snake_case mapping chat-routes.ts's runGeneration applies to
- *  `conv.sampling`, applied here to the public `Chat.sampling` passthrough field. */
-function mapSampling(sampling: Record<string, unknown>, repeatPenaltyKey: string): Record<string, unknown> {
+ *  `conv.sampling`, applied here to the public `Chat.sampling` passthrough field. Exported so the
+ *  reserved-key denylist (RESERVED_ENGINE_KEYS, above) is directly testable — same reasoning as
+ *  `buildEngineRequestBody`: the loop that actually calls this does real HTTP. */
+export function mapSampling(sampling: Record<string, unknown>, repeatPenaltyKey: string): Record<string, unknown> {
   const out: Record<string, unknown> = {}
   for (const [camel, snake] of Object.entries(SAMPLING_KEYS)) {
     if (camel in sampling) out[snake] = sampling[camel]
   }
   if ('repeatPenalty' in sampling) out[repeatPenaltyKey] = sampling.repeatPenalty
   for (const [k, v] of Object.entries(sampling)) {
-    if (!(k in SAMPLING_KEYS) && k !== 'repeatPenalty' && k !== 'stop') out[k] = v
+    if (!(k in SAMPLING_KEYS) && k !== 'repeatPenalty' && k !== 'stop' && !RESERVED_ENGINE_KEYS.has(k)) out[k] = v
   }
   return out
 }

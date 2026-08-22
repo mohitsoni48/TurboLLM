@@ -18,7 +18,7 @@ import { ConversationStore } from '../chat/db.js'
 import { ChatStoreRouter } from '../chat/store/router.js'
 import {
   loadFullHistory, shouldFlushCheckpoint, FLUSH_INTERVAL_MS, FLUSH_MIN_CHARS,
-  extractChunkUsage, buildUsagePatch, buildEngineRequestBody,
+  extractChunkUsage, buildUsagePatch, buildEngineRequestBody, mapSampling,
 } from './generation.js'
 
 const SCOPE = { tenant: 'acme', owner: 'u1' }
@@ -193,4 +193,35 @@ test('buildEngineRequestBody: sampling cannot override model, messages, stream, 
   assert.equal(body.stream, true, 'sampling must not turn off streaming — the SSE read loop assumes it is on')
   assert.deepEqual(body.stream_options, { include_usage: true }, 'sampling must not override usage capture')
   assert.equal(body.temperature, 0.5, 'a non-reserved sampling key still comes through normally')
+})
+
+// Round-2 release-gate finding H2: buildEngineRequestBody's precedence only protects fields the
+// ROUTE explicitly sets afterward — tool_choice is never set by any route, so there was no
+// control field for it to lose to, and it reached the engine verbatim. Live-reproduced: a tenant
+// setting sampling.tool_choice: 'required' could COMPEL a tool call every turn (not just hope for
+// one), executed under the local install's own tool policy — sharpening I10's accepted risk.
+test('mapSampling: tool_choice never survives the passthrough, even though no route ever re-sets it', () => {
+  const out = mapSampling({ temperature: 0.7, tool_choice: 'required' }, 'repeat_penalty')
+  assert.equal('tool_choice' in out, false, 'tool_choice must be dropped, not passed through as an unrecognized key')
+  assert.equal(out.temperature, 0.7, 'a legitimate sampling key must still pass through')
+})
+
+// H2's second hole: `tools` leaked specifically on vLLM/SGLang, where the route deliberately
+// withholds reqBody.tools (toolsSupported false, since those engines default tool_choice to
+// "auto" once ANY tools array is present) — a tenant's own sampling.tools defeated that
+// suppression on exactly the engines it was meant to protect.
+test('mapSampling: tools never survives the passthrough, even on engines where the route withholds its own', () => {
+  const out = mapSampling({ tools: [{ type: 'function', function: { name: 'evil' } }] }, 'repeat_penalty')
+  assert.equal('tools' in out, false, 'tools must be dropped — the route decides tools, not tenant sampling JSON')
+})
+
+test('mapSampling: model, messages, stream, and stream_options are all denylisted too, not just tool_choice/tools', () => {
+  const out = mapSampling(
+    { model: 'x', messages: [{ role: 'user', content: 'x' }], stream: false, stream_options: {}, top_k: 40 },
+    'repeat_penalty',
+  )
+  for (const key of ['model', 'messages', 'stream', 'stream_options']) {
+    assert.equal(key in out, false, `${key} must be dropped by mapSampling's own denylist, not left to spread order alone`)
+  }
+  assert.equal(out.top_k, 40)
 })
