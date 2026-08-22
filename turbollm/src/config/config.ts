@@ -480,8 +480,13 @@ export interface Config {
     schemaVersion?: number
     everLoadedModel?: boolean
   }
-  /** External chat API (spec 27). Off by default — this surface exposes tenant data and
-   *  must be an explicit opt-in, never something a version bump switches on. */
+  /** External chat API (spec 27) — EXPERIMENTAL as of v1.11.3. Off by default — this surface
+   *  exposes tenant data and must be an explicit opt-in, never something a version bump
+   *  switches on. Known limitation an operator enabling this should know: a remote tenant's
+   *  generations currently inherit the LOCAL install's own tool permissions (toolPolicies,
+   *  autoAllowAll — including run_code on installs migrated from an older setting), not an
+   *  independent trust boundary of their own (server.ts logs a warning at startup when this is
+   *  enabled). */
   api?: { ext?: { enabled: boolean; maxInFlightPerTenant?: number; requestsPerMinutePerTenant?: number } }
 }
 

@@ -375,11 +375,14 @@ curl http://127.0.0.1:6996/v1/chat/completions \
   Claude Code below. No other local host offers this.
 - **Structured output** — constrain any response to a **GBNF grammar** (or JSON shape).
 - **API-key auth** you can require when sharing over a LAN (Settings → Network & sharing).
-- **A stateful External Chat API**, `/api/ext/v1`, for building a real chat product instead of the
-  gateway's stateless send-full-history-every-call model — persistence, history, message editing,
-  and resumable streaming generation are handled for you, with a documented interface to plug in
-  your own database instead of the SQLite default. Off by default; a generated OpenAPI spec and a
-  TypeScript client ship with it. [Full guide](https://turbollm.dev/docs/api/external).
+- **A stateful External Chat API** (**Experimental**), `/api/ext/v1`, for building a real chat
+  product instead of the gateway's stateless send-full-history-every-call model — persistence,
+  history, message editing, and resumable streaming generation are handled for you, with a
+  documented interface to plug in your own database instead of the SQLite default. Off by default;
+  a generated OpenAPI spec and a TypeScript client ship with it. The daemon logs a warning at
+  startup while it's enabled — a remote tenant's generations currently inherit this install's own
+  tool permissions, not an independent trust boundary of their own.
+  [Full guide](https://turbollm.dev/docs/api/external).
 
 **The gateway loads models for you.** Most local hosts make you load a model first, then call it.
 TurboLLM's gateway reads the `model` field of any incoming request, **fuzzy-matches it to your

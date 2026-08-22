@@ -129,6 +129,20 @@ export function createApp(d: Deps): Hono {
   const extRuns = new PublicRunManager({ orphanTimeoutMs: 5 * 60_000, db: d.db })
   extRuns.reconcileOnStartup()
   const ext = mountExtApi(app, d, extRuns, { makeBody: createMakeBody(d) })
+  // Release-gate I10: a public run's tools currently run under the LOCAL install's own
+  // toolPolicies/autoAllowAll (generation.ts), not an independent trust boundary — a remote
+  // tenant's chat can execute run_code/fetch_url (and any configured MCP tool) on installs
+  // where those are allow-policy. Shipped as an explicit, logged, EXPERIMENTAL opt-in (not
+  // blocked on building a separate ext-specific tool allowlist) rather than silently — an
+  // operator enabling this should see the trust-model change called out at the exact moment
+  // they turn it on, every time the daemon starts with it enabled.
+  if (ext) {
+    console.warn(
+      '[ext-api] /api/ext/v1 is enabled (EXPERIMENTAL). Remote tenants currently inherit this ' +
+      "install's own tool permissions for public generations, including run_code if it's " +
+      'allow-policy here — see config.json\'s api.ext doc comment.',
+    )
+  }
   const extRunsReaper = setInterval(() => {
     extRuns.reapOrphans()
     extRuns.prune(60 * 60_000)

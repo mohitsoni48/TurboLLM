@@ -25,15 +25,17 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ### Nothing yet.
 
-## [1.11.3] - 2026-08-21
+## [1.11.3] - 2026-08-22
 
 ### Added
 
-- **A public External Chat API for building real chat apps on TurboLLM — `/api/ext/v1`.** Send a
-  message, consume an SSE stream, and TurboLLM handles the rest: durable chat/message storage,
-  editing with optimistic concurrency, and resumable generation — a `Run` is a resource you can
-  poll or reconnect to, not just a stream that dies if the connection drops. Off by default — turn
-  it on with `api.ext.enabled` in `config.json`. Full guide at
+- **A public External Chat API for building real chat apps on TurboLLM — `/api/ext/v1`.**
+  **Experimental.** Send a message, consume an SSE stream, and TurboLLM handles the rest: durable
+  chat/message storage, editing with optimistic concurrency, and resumable generation — a `Run` is
+  a resource you can poll or reconnect to, not just a stream that dies if the connection drops. Off
+  by default — turn it on with `api.ext.enabled` in `config.json`; the daemon logs a warning at
+  startup while it's on, since a remote tenant's generations currently inherit this install's own
+  tool permissions rather than an independent trust boundary of their own. Full guide at
   [turbollm.dev/docs/api/external](https://turbollm.dev/docs/api/external).
 - **Bring your own database.** Storage behind the new API is a documented `ChatStore` interface,
   not a fixed backend — SQLite by default, or point it at your own (a complete, tested Postgres
@@ -48,7 +50,7 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   outcome — is recorded and queryable, with message/chat content deliberately never retained in it.
 
 ### Discord
-- New: a public API for building real chat apps on top of TurboLLM. Send a message, get a resumable stream back — TurboLLM handles storage, editing, and reconnects for you.
+- New (experimental): a public API for building real chat apps on top of TurboLLM. Send a message, get a resumable stream back — TurboLLM handles storage, editing, and reconnects for you.
 - Comes with a ready-made TypeScript client and a working Postgres example if SQLite isn't your thing. Off by default; one config flag turns it on.
 
 ## [1.11.2] - 2026-08-20
