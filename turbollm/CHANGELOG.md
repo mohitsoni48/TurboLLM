@@ -71,6 +71,50 @@ _Nothing yet._
 - Fixed: first-run setup could recommend a model too big for an iGPU-only machine, because it counted the shared VRAM and the system RAM it comes out of as two separate pools.
 - Fixed: switching to another browser tab mid-reply could lose the whole generation — the daemon kept generating but the reply was never saved. It's saved now, whatever the tab does.
 - Fixed: the Models library scrolls the page properly instead of being stuck in a little box of its own.
+## [1.11.6] - 2026-08-22
+
+> Upgrading from 1.11.2 (the last version on npm) also picks up **1.11.3** and **1.11.5**,
+> which were tagged but never published — the dual-GPU auto-tune fix and the External Chat API.
+> Their entries are below, unchanged.
+
+### Added
+
+- **Turbo Link — use another machine's models as if they were local. Experimental, off by
+  default** (Settings → Experimental → Turbo Link). Link a second TurboLLM install with a single
+  pasted link string, and its models show up everywhere yours do: in the chat model picker
+  (grouped by machine), in `/v1/models`, and in `launch --model`. Chat, load/unload, and downloads
+  all work against the linked machine over the same connection. It is fully built and tested but
+  has not yet been verified against a real second machine, which is why it ships behind the
+  experimental toggle — while that toggle is off, nothing about the app changes.
+- **One fleet view across your machines.** Models, Downloads, and Engines merge every linked
+  machine's rows into the list you already use, each row labelled with the machine it lives on.
+  Actions you can't perform on a remote row are disabled with the reason spelled out, rather than
+  failing after the click.
+- **Access you grant, not access you hand over.** A link key carries an explicit capability set —
+  three one-click presets (use models only / run a server / full control) plus a Customize view for
+  the raw permissions — and can be pinned to an allowlist of specific models. A granted key works
+  only on the link surface: every other authenticated endpoint refuses it. Keys are listed,
+  revocable from the host panel, and revocation takes effect on the peer without needing the peer's
+  cooperation. Links never chain — a linked machine serves only its own models, never a third
+  machine's.
+- **Honest attribution across machines.** A generation that runs on a linked host counts as that
+  host's work in its own stats and telemetry, so neither machine double-counts and neither
+  machine's numbers quietly absorb the other's.
+
+### Changed
+
+- **Auto-tune now decides the multi-GPU split itself, even if you pinned one.** A saved
+  `--tensor-split` used to be treated as off-limits, which quietly capped the tuner: the offload
+  search can only move layers between GPU and CPU, so a split chosen for a different model or
+  context size bounded how much VRAM the tuner could ever reach. It now starts from its own
+  baseline and places layers by size. This applies only while auto-tune is running — normal loads
+  still use exactly the split saved on the profile, and a tuned result replaces it only when you
+  click Save in the results dialog.
+
+### Discord
+- Fixed: on a two-GPU machine, auto-tune was loading nearly everything onto one card and offloading the rest to your CPU. It now places layers per card, so both get used.
+- New (experimental): Turbo Link lets you use another machine's models from this one, right in chat. Settings → Experimental.
+- New (experimental): a public API for building your own chat apps on top of TurboLLM. Off by default, manual setup for now.
 
 ## [1.11.5] - 2026-08-22
 

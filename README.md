@@ -291,6 +291,13 @@ the detail:
   in chat (name, preferences, hardware) using your own loaded model, and carries them into future
   new conversations. Nothing leaves your device; the full fact list is reviewable and deletable
   from Settings → Memory, and turning the toggle off stops new chats from seeing it immediately.
+- **Turbo Link** *(experimental, off by default)* — link a second machine running TurboLLM
+  with one pasted link string and use its models as if they were local: they appear in the chat
+  model picker (grouped by machine), in `/v1/models` and in `launch --model`, and Models,
+  Downloads and Engines merge both machines' rows into one list. You grant an explicit capability
+  set per link — use models only, run a server, or full control — optionally pinned to specific
+  models, and revocable at any time from the host. Not yet verified against a real two-machine
+  setup, so it stays behind Settings → Experimental.
 - **Thinking-budget control** — a graduated slider, not just on/off: cap reasoning to a specific
   token count, disable it entirely, or leave it unlimited. Works in Chat and Code alike.
 - **Reasoning-effort control** for models whose own chat template supports it (e.g. Qwen3.8) —

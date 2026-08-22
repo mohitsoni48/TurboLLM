@@ -139,11 +139,24 @@ test('dense model → left alone (uniform layers cannot be imbalanced)', () => {
   assert.deepEqual(withBalancedSplit(p, m, t4x2).gpu.tensorSplit, [])
 })
 
-test('a split the user pinned is never overwritten', () => {
+// Auto-tune owns the split (founder call, 2026-08-22): a pinned tensorSplit caps the offload
+// search at whatever placement it encodes, so the sweep discards it and decides for itself.
+test("a split the user pinned is replaced by auto-tune's own placement", () => {
   const m = model({ sizeBytes: 36_903_140_320, ...MOE40 })
   const p = base(t4x2, { ctx: 8192, nCpuMoe: 24, ngl: 99 }, m)
   const pinned = { ...p, gpu: { ...p.gpu, tensorSplit: [1, 1] } }
-  assert.deepEqual(withBalancedSplit(pinned, m, t4x2).gpu.tensorSplit, [1, 1])
+  const out = withBalancedSplit(pinned, m, t4x2).gpu.tensorSplit
+  assert.notDeepEqual(out, [1, 1], 'the pinned split must not survive the sweep')
+  assert.deepEqual(out, withBalancedSplit(p, m, t4x2).gpu.tensorSplit, 'same result as an unpinned profile')
+})
+
+// The override is unconditional, not just "when balancing wins": a pinned split on a profile
+// that fits comfortably is still dropped, so the sweep starts from the even baseline.
+test('a pinned split is dropped even when nothing overflows', () => {
+  const m = model({ sizeBytes: 8_000_000_000, ...MOE40 })
+  const p = base(t4x2, { ctx: 8192, nCpuMoe: 4, ngl: 99 }, m)
+  const pinned = { ...p, gpu: { ...p.gpu, tensorSplit: [3, 1] } }
+  assert.deepEqual(withBalancedSplit(pinned, m, t4x2).gpu.tensorSplit, [])
 })
 
 // deriveTensorSplit balances bytes; it does NOT promise the result fits. At nCpuMoe=4 the
