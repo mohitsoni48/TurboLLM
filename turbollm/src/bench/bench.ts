@@ -16,7 +16,7 @@ import type { Manager, StartOpts } from '../engines/manager'
 import type { Registry } from '../engines/registry'
 import type { Engine } from '../config/config'
 import type { Scanner, ModelEntry } from '../models/scanner'
-import { deriveDefault, estimateVram, gpuBudgetMb, profileToArgs, resolveProfile, type GpuProfile, type LoadProfile } from '../models/profile'
+import { deriveDefault, deriveTensorSplit, estimateVram, estimateVramPerGpu, gpuBudgetMb, profileToArgs, resolveProfile, type GpuProfile, type LoadProfile } from '../models/profile'
 import { isSpilling, spillFloor, spillMb } from './spill'
 import { getSysInfo, type SysInfo } from '../sysinfo/sysinfo'
 import type { HfClient } from '../hf/hf'
@@ -793,9 +793,10 @@ export class BenchRunner {
   private async probeVram(
     entry: ModelEntry,
     sys: SysInfo,
-    profile: LoadProfile,
+    profileIn: LoadProfile,
     caps: Engine['capabilities'],
   ): Promise<{ outcome: 'ok' | 'timeout' | 'crash' | 'oom'; vramAbsMb: number | null; spillMb: number | null }> {
+    const profile = withBalancedSplit(profileIn, entry, sys)
     const active = this.registry.active()
     if (!active) return { outcome: 'crash', vramAbsMb: null, spillMb: null }
     const testDeadline = Math.min(Date.now() + READY_TIMEOUT_MS + 5_000, this.deadline)
@@ -864,11 +865,14 @@ export class BenchRunner {
   private async benchAt(
     entry: ModelEntry,
     sys: SysInfo,
-    profile: LoadProfile,
+    profileIn: LoadProfile,
     caps: Engine['capabilities'],
     results: BenchCandidate[],
     label: string,
   ): Promise<{ cand: BenchCandidate; profile: LoadProfile } | null> {
+    // Same placement the probe used — and it rides out on the returned profile, so the winner
+    // that gets saved carries the split that was actually measured.
+    const profile = withBalancedSplit(profileIn, entry, sys)
     this.state = { ...this.state, step: `KV ${profile.kvTypeK}: measuring best (${label})…`, candidates: results }
     const cand = await this.measure(entry, sys, profile, caps, label, `Measuring ${label}`)
     results.push(cand)
@@ -1586,6 +1590,31 @@ export function pickSplitStrategies(
     seen.add(key)
     return true
   })
+}
+
+/** Give a candidate a byte-balanced `--tensor-split` when the even split would strand VRAM.
+ *
+ *  `--n-cpu-moe N` strips the experts out of the first N layers, leaving them ~10x lighter than
+ *  the rest, while llama.cpp's default split divides by layer COUNT. On 2x16 GB that put 1707 MB
+ *  on one card and 14693 MB on the other: the offload search then keeps hitting a ceiling that
+ *  belongs to ONE card while the pooled estimate still reads roomy, and retreats much further
+ *  than it needs to (measured nCpuMoe 24, where 16 was reachable once the layers were placed by
+ *  bytes — 4.96 vs 5.82 tok/s).
+ *
+ *  Applied ONLY when the even split actually overflows a card and balancing actually fixes it.
+ *  That restraint is measured, not stylistic: with both cards well short of their ceiling,
+ *  rebalancing moved bytes around (7717/11303 -> 11369/7653) and changed throughput by 0.5%. The
+ *  win is never the balance itself — it is that a balanced placement lets the search stop sooner.
+ *  Dense models have uniform layers and are already balanced, so deriveTensorSplit returns [].
+ *
+ *  A split the user pinned themselves is left alone. */
+export function withBalancedSplit(p: LoadProfile, m: ModelEntry, sys: SysInfo): LoadProfile {
+  if (sys.gpus.length < 2 || p.gpu.splitMode === 'none' || p.gpu.tensorSplit.length > 0) return p
+  if (estimateVramPerGpu(p, m, sys).verdict !== 'overflow') return p
+  const tensorSplit = deriveTensorSplit(p, m, sys)
+  if (tensorSplit.length === 0) return p
+  const balanced = { ...p, gpu: { ...p.gpu, tensorSplit } }
+  return estimateVramPerGpu(balanced, m, sys).verdict === 'overflow' ? p : balanced
 }
 
 /** The largest GPU-resident fraction (0..1) of `entry` that fits under `profile.gpu`'s own VRAM
