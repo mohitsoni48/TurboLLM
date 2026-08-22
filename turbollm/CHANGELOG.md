@@ -25,6 +25,53 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.11.7] - 2026-08-22
+
+### Fixed
+
+- **Auto-tune reported "No candidate completed successfully" on every integrated GPU.** On an
+  APU — an AMD/Intel iGPU, Apple Silicon, an ARM SoC — the GPU and the CPU share one physical
+  pool of memory, so the "the GPU has been pushed out into system RAM" check that tells auto-tune
+  a candidate is too big was true of every candidate it tried, and the sweep finished with nothing
+  to pick. One reporter's search walked 24 → 11 → 5 → 2 → 0 offloaded layers and rejected all
+  five. There is no VRAM/RAM boundary for anything to be pushed across on a shared-memory part,
+  and offloading more layers only moves weights from one region of that same RAM to another, so
+  the check is now skipped there entirely. Discrete cards are unchanged, including the rule that
+  an unreadable VRAM figure is still treated as a spill rather than waved through. (#179)
+- **A first-run model recommendation could size a model against memory an iGPU-only machine only
+  has once.** The setup wizard read an integrated GPU's *shared* VRAM and the system RAM it is
+  carved out of as two independent pools and added them together, so it could recommend a model
+  that does not actually fit. A model's GPU and RAM requirements now have to fit the single shared
+  pool together on such a machine. Machines with a real graphics card are unaffected, including
+  one that has an iGPU sitting alongside it — only a box where every adapter shares system RAM
+  counts as unified. (#164)
+- **The model browser scrolled inside a box of its own instead of moving the page.** The Models
+  library scrolled in a nested container while the page behind it stayed put, so the list felt
+  trapped in a small window and the browser's own scrollbar never appeared. That tab now scrolls
+  the page like an ordinary document. Also fixes Settings' sticky Save bar sitting behind the
+  bottom navigation bar on a phone. (#178)
+- **Backgrounding a browser tab could lose the entire reply.** When a tab went to the background
+  the browser tore down the connection, and the dead connection unwound the generation before the
+  reply was ever written to the database — the daemon had done the work and the message came back
+  empty, without even being marked as interrupted. A client that goes away can no longer abort a
+  run: generation continues, the reply is saved, and only the writes to the closed connection are
+  dropped. Three more faults found alongside it: a stream cancellation could crash the daemon
+  mid-generation and take the turn with it; a short reply interrupted early was saved as an empty
+  message, because the streaming parser holds back up to 29 characters it has not yet decided
+  about and that tail was never released on an interrupt; and a reply still being generated
+  rendered as a red error in the chat until it finished. (#177)
+- **Prompt tokens read 0 on an interrupted turn**, so a stopped reply showed "0+147 tokens" and
+  the context-used figure understated the conversation by the whole prompt, even though those
+  tokens really were in the cache. The count now falls back to the total the engine itself
+  reports while it ingests the prompt. It stays at 0, never a guess, when the engine reports no
+  progress at all. (item 9 of #52)
+
+### Discord
+- Fixed: on an integrated GPU (AMD/Intel APUs, Apple Silicon), auto-tune rejected every candidate and finished with "No candidate completed successfully". It was reading normal shared-memory use as the GPU overflowing — which can't happen when the GPU and CPU share one pool.
+- Fixed: first-run setup could recommend a model too big for an iGPU-only machine, because it counted the shared VRAM and the system RAM it comes out of as two separate pools.
+- Fixed: switching to another browser tab mid-reply could lose the whole generation — the daemon kept generating but the reply was never saved. It's saved now, whatever the tab does.
+- Fixed: the Models library scrolls the page properly instead of being stuck in a little box of its own.
+
 ## [1.11.5] - 2026-08-22
 
 ### Added
