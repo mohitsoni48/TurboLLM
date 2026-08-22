@@ -3,9 +3,10 @@
 // Single in-process holder; provisioning runs once at startup.
 
 import { classifyProvisionFailure } from '../telemetry/classify'
-import type { PROVISION_FAIL_REASONS } from '../telemetry/core/enums'
+import type { PROVISION_FAIL_REASONS, PROVISION_TRIGGERS } from '../telemetry/core/enums'
 
 type ProvisionFailReason = (typeof PROVISION_FAIL_REASONS)[number]
+export type ProvisionTrigger = (typeof PROVISION_TRIGGERS)[number]
 
 export interface ProvisionStatus {
   active: boolean
@@ -24,7 +25,18 @@ export class ProvisionState {
     return { ...this.s }
   }
 
-  start(backend: string): void {
+  /** What caused this provisioning run. Carried through to `engine_installed`
+   *  because, until the 2026-08-21 data-integrity audit, that one event name
+   *  covered four unrelated things — the unattended boot-time seed, a user
+   *  clicking Install, a user clicking Update, and the MLX/vLLM runtime
+   *  installers — with no way to tell them apart. 761 events over 322 machines
+   *  read as "2.4 engine installs per user", when most of them were the seed
+   *  running on its own, which made "installed an engine" look like a milestone
+   *  a user had reached when frequently nobody had done anything. */
+  private trigger: ProvisionTrigger = 'seed'
+
+  start(backend: string, trigger: ProvisionTrigger = 'user_install'): void {
+    this.trigger = trigger
     this.s = { active: true, phase: 'downloading', backend, pct: 0, part: 1, parts: 1, error: null }
   }
 
@@ -41,21 +53,23 @@ export class ProvisionState {
    *  deliberately never passed — only `failReason`, a `classifyProvisionFailure`
    *  enum member, so the only consumer still never sees free text even though
    *  it now learns *why*. */
-  onSettled?: (ok: boolean, failReason?: ProvisionFailReason) => void
+  onSettled?: (ok: boolean, trigger: ProvisionTrigger, failReason?: ProvisionFailReason) => void
 
   done(): void {
+    const trigger = this.trigger
     this.s = { active: false, phase: 'idle', backend: '', pct: 0, part: 1, parts: 1, error: null }
-    this.settle(true)
+    this.settle(true, trigger)
   }
 
   fail(error: string): void {
+    const trigger = this.trigger
     this.s = { active: false, phase: 'error', backend: this.s.backend, pct: 0, part: 1, parts: 1, error }
-    this.settle(false, classifyProvisionFailure(error))
+    this.settle(false, trigger, classifyProvisionFailure(error))
   }
 
-  private settle(ok: boolean, failReason?: ProvisionFailReason): void {
+  private settle(ok: boolean, trigger: ProvisionTrigger, failReason?: ProvisionFailReason): void {
     try {
-      this.onSettled?.(ok, failReason)
+      this.onSettled?.(ok, trigger, failReason)
     } catch {
       // Observers are advisory — they must not affect an engine install.
     }

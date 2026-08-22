@@ -361,7 +361,11 @@ test('useFeature: rolls over a bucketed count for the previous day once the day 
     const events = readQueue(dir).map((q) => q.event as { event: string; payload?: Record<string, unknown> })
     const rolled = events.filter((e) => e.event === 'feature_used_daily')
     assert.equal(rolled.length, 1)
-    assert.deepEqual(rolled[0].payload, { feature: 'chat', countBucket: '2-5' }, '4 uses buckets to 2-5, never the raw count')
+    assert.deepEqual(
+      rolled[0].payload,
+      { feature: 'chat', countBucket: '2-5', daysAgo: 1 },
+      '4 uses buckets to 2-5, never the raw count; daysAgo pins the count to 07-29, not the 07-30 emit date',
+    )
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -391,7 +395,7 @@ test('flushDailyUsage: rolls over a feature used only on the last active day', (
     tomorrow.flushDailyUsage()
     const events = readQueue(dir).map((q) => q.event as { event: string; payload?: Record<string, unknown> })
     const rolled = events.filter((e) => e.event === 'feature_used_daily')
-    assert.deepEqual(rolled[0].payload, { feature: 'code', countBucket: '2-5' })
+    assert.deepEqual(rolled[0].payload, { feature: 'code', countBucket: '2-5', daysAgo: 1 })
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -446,7 +450,7 @@ test('uiAction: rolls over ui_daily for the previous day once the calendar day c
     tomorrow.uiAction('engines', 'update_engine') // first click on day 2 triggers the rollover
     const events = readQueue(dir).map((q) => q.event as { event: string; payload?: Record<string, unknown> })
     const rolled = events.find((e) => e.event === 'ui_daily')
-    assert.deepEqual(rolled?.payload, { screen: 'engines', actions: 3, distinctActions: 2 })
+    assert.deepEqual(rolled?.payload, { screen: 'engines', actions: 3, distinctActions: 2, daysAgo: 1 })
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -478,7 +482,7 @@ test('flushUiDailyUsage: rolls over a screen used only on the last active day', 
     tomorrow.flushUiDailyUsage()
     const events = readQueue(dir).map((q) => q.event as { event: string; payload?: Record<string, unknown> })
     const rolled = events.find((e) => e.event === 'ui_daily')
-    assert.deepEqual(rolled?.payload, { screen: 'engines', actions: 2, distinctActions: 1 })
+    assert.deepEqual(rolled?.payload, { screen: 'engines', actions: 2, distinctActions: 1, daysAgo: 1 })
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -546,6 +550,67 @@ test('emitWithExtra: still respects consent and the kill switch, exactly like em
     const { emitter } = makeEmitter(dir, 'off')
     emitter.emitWithExtra('bench_result', FULL_BENCH_PAYLOAD, 'hw', { cpu: 'x', ramMb: 1, gpus: [] })
     assert.deepEqual(names(dir), [], 'off must block emitWithExtra exactly as it blocks emit')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// ── onboarding_recovery (2026-08-21 data-integrity audit) ────────────────────
+// This event was defined, registered and Worker-allow-listed, then never given a
+// caller: zero emit sites in the entire tree, so it had received exactly zero
+// events since shipping. It read as "nobody needs recovery" when it actually
+// meant "nothing can report it". These tests exist so it cannot go silent again.
+
+test('onboardingRecovery: emits failure, action and outcome — the event that had no caller at all', () => {
+  const dir = tempDir()
+  try {
+    const { emitter } = makeEmitter(dir, 'anon', '2026-08-21')
+    emitter.onboardingRecovery('no_asset', 'resume', 'ok')
+    const events = readQueue(dir).map((q) => q.event as { event: string; payload?: Record<string, unknown> })
+    const rec = events.find((e) => e.event === 'onboarding_recovery')
+    assert.deepEqual(rec?.payload, { failure: 'no_asset', action: 'resume', outcome: 'ok' })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('onboardingRecovery: per-action, so a user who retries three times before succeeding reports all three', () => {
+  const dir = tempDir()
+  try {
+    const { emitter } = makeEmitter(dir, 'anon', '2026-08-21')
+    emitter.onboardingRecovery('oom', 'smaller_quant', 'fail')
+    emitter.onboardingRecovery('oom', 'smaller_quant', 'fail')
+    emitter.onboardingRecovery('oom', 'lower_quant_retry', 'ok')
+    const outcomes = readQueue(dir)
+      .map((q) => q.event as { event: string; payload: { outcome: string } })
+      .filter((e) => e.event === 'onboarding_recovery')
+      .map((e) => e.payload.outcome)
+    assert.equal(outcomes.length, 3, 'a ledger guard here would discard the two attempts that explain the third')
+    assert.equal(outcomes.filter((o) => o === 'ok').length, 1)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('onboardingRecovery: an unrecognized failure or action never reaches the queue', () => {
+  const dir = tempDir()
+  try {
+    const { emitter } = makeEmitter(dir, 'anon', '2026-08-21')
+    // The values arrive from the browser, so the closed-enum check in validateEvent
+    // is the thing standing between a UI bug and free text on disk.
+    emitter.onboardingRecovery('C:/Users/me/models/private.gguf', 'retry', 'fail')
+    emitter.onboardingRecovery('oom', 'rm -rf /', 'fail')
+    assert.deepEqual(names(dir).filter((n) => n === 'onboarding_recovery'), [])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('onboardingRecovery: consent off sends nothing, same as every other anon event', () => {
+  const dir = tempDir()
+  try {
+    makeEmitter(dir, 'off', '2026-08-21').emitter.onboardingRecovery('no_asset', 'resume', 'ok')
+    assert.deepEqual(names(dir), [])
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

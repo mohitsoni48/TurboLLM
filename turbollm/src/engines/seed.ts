@@ -56,7 +56,7 @@ export async function seedDefaultEngines(
 
   for (const backend of chain) {
     try {
-      provision.start(backend.id)
+      provision.start(backend.id, 'seed')
       const binPath = await provisionBackend(enginesRoot, backend, tag, onProgress(backend.id))
       process.stdout.write('\n')
       // registry.add() probes the binary; a GPU build with no runtime throws here.

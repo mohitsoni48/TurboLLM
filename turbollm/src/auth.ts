@@ -27,8 +27,10 @@ import type { Deps } from './deps'
 const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1'])
 
 /** SHA-256 hex of the presented key — the SAME derivation used when keys are
- *  created (generateApiKey below). Stored config holds only this hash. */
-function hashKey(raw: string): string {
+ *  created (generateApiKey below). Stored config holds only this hash. Exported so the
+ *  external API's auth path (ext/auth.ts) hashes a presented key with the IDENTICAL
+ *  derivation used here, rather than risking the two ever drifting apart. */
+export function hashKey(raw: string): string {
   return createHash('sha256').update(raw).digest('hex')
 }
 

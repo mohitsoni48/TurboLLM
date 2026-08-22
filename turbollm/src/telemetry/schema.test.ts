@@ -69,13 +69,13 @@ test('validateEvent: harness_first_seen requires a known harness and protocol (s
 test('validateEvent: gateway_daily requires harness alongside protocol/volume fields', () => {
   const r = validateEvent(validEvent({
     event: 'gateway_daily',
-    payload: { harness: 'opencode', protocol: 'openai', requests: 3, promptTokens: 100, genTokens: 50, distinctModels: 1 },
+    payload: { harness: 'opencode', protocol: 'openai', requests: 3, promptTokens: 100, genTokens: 50, distinctModels: 1, daysAgo: 1 },
   }))
   assert.equal(r.ok, true, r.ok === false ? r.reason : '')
 
   const missingHarness = validateEvent(validEvent({
     event: 'gateway_daily',
-    payload: { protocol: 'openai', requests: 3, promptTokens: 100, genTokens: 50, distinctModels: 1 },
+    payload: { protocol: 'openai', requests: 3, promptTokens: 100, genTokens: 50, distinctModels: 1, daysAgo: 1 },
   }))
   assert.equal(missingHarness.ok, false)
   assert.match(missingHarness.reason, /harness/)
@@ -464,7 +464,7 @@ test('validateEvent: ui_action accepts the Phase 6ee CodeGitDialog batch actions
 })
 
 test('validateEvent: ui_daily requires screen plus both volume counters', () => {
-  const r = validateEvent(validEvent({ event: 'ui_daily', payload: { screen: 'engines', actions: 5, distinctActions: 3 } }))
+  const r = validateEvent(validEvent({ event: 'ui_daily', payload: { screen: 'engines', actions: 5, distinctActions: 3, daysAgo: 1 } }))
   assert.equal(r.ok, true, r.ok === false ? r.reason : '')
 
   const missingCounts = validateEvent(validEvent({ event: 'ui_daily', payload: { screen: 'engines' } }))
@@ -524,10 +524,10 @@ test('validateEvent: error requires a known fingerprint', () => {
 
 test('validateEvent: feature_used_daily requires a known feature and a bucketed count, never a raw number', () => {
   assert.equal(
-    validateEvent(validEvent({ event: 'feature_used_daily', payload: { feature: 'chat', countBucket: '6-20' } })).ok,
+    validateEvent(validEvent({ event: 'feature_used_daily', payload: { feature: 'chat', countBucket: '6-20', daysAgo: 1 } })).ok,
     true,
   )
-  const r = validateEvent(validEvent({ event: 'feature_used_daily', payload: { feature: 'chat', countBucket: 17 } }))
+  const r = validateEvent(validEvent({ event: 'feature_used_daily', payload: { feature: 'chat', countBucket: 17, daysAgo: 1 } }))
   assert.equal(r.ok, false, 'a raw number must never validate as a countBucket')
 })
 
@@ -544,10 +544,10 @@ test('validateEvent: model_first_load rejects a free-text failure message', () =
 
 test('validateEvent: feature_used_daily reports a bucket, never a raw count', () => {
   assert.equal(
-    validateEvent(validEvent({ event: 'feature_used_daily', payload: { feature: 'code', countBucket: '6-20' } })).ok,
+    validateEvent(validEvent({ event: 'feature_used_daily', payload: { feature: 'code', countBucket: '6-20', daysAgo: 1 } })).ok,
     true,
   )
-  const r = validateEvent(validEvent({ event: 'feature_used_daily', payload: { feature: 'code', countBucket: 17 } }))
+  const r = validateEvent(validEvent({ event: 'feature_used_daily', payload: { feature: 'code', countBucket: 17, daysAgo: 1 } }))
   assert.equal(r.ok, false)
   assert.match(r.reason, /countBucket/)
 })
@@ -889,5 +889,66 @@ test('validateEvent: ui_action accepts the Phase 7 Onboarding screen actions', (
   for (const action of actions) {
     const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'onboarding', action } }))
     assert.equal(r.ok, true, r.ok === false ? `onboarding/${action}: ${r.reason}` : '')
+  }
+})
+
+// ── Backward compatibility with already-shipped clients (2026-08-21 audit) ───
+// The single most expensive mistake this schema can make is turning a field
+// addition into a rejection of every binary already on a user's machine. That is
+// what happened to `onboarding_step`: it was removed from EVENT_NAMES, old
+// clients kept emitting it forever, and the Worker refused every one. A REQUIRED
+// new field does the same thing in the other direction — the deployed Worker
+// starts rejecting clients that predate the field. Every rollup event below is
+// emitted today by versions in the field that know nothing about `daysAgo`.
+test('validateEvent: every daily-rollup event still validates WITHOUT daysAgo, so shipped clients are not rejected', () => {
+  const legacy: Array<[string, Record<string, unknown>]> = [
+    ['chat_daily', {
+      conversations: 2, messages: 7, maxMessagesInConversation: 4, medianMessagesInConversation: 3,
+      distinctModels: 1, toolCalls: 0, regenerates: 0, stops: 0,
+    }],
+    ['code_daily', { sessions: 1, turns: 4, toolCalls: 6 }],
+    ['gateway_daily', {
+      harness: 'claude_code', protocol: 'anthropic', requests: 5,
+      promptTokens: 100, genTokens: 50, distinctModels: 1,
+    }],
+    ['ui_daily', { screen: 'engines', actions: 5, distinctActions: 3 }],
+    ['feature_used_daily', { feature: 'chat', countBucket: '6-20' }],
+  ]
+  for (const [event, payload] of legacy) {
+    const r = validateEvent(validEvent({ event, payload }))
+    assert.equal(r.ok, true, `${event} without daysAgo must still be accepted — ${r.ok === false ? r.reason : ''}`)
+  }
+})
+
+test('validateEvent: daysAgo is still range-checked when a current client does send it', () => {
+  assert.equal(validateEvent(validEvent({ event: 'code_daily', payload: { sessions: 1, turns: 1, toolCalls: 0, daysAgo: 0 } })).ok, true)
+  assert.equal(validateEvent(validEvent({ event: 'code_daily', payload: { sessions: 1, turns: 1, toolCalls: 0, daysAgo: 366 } })).ok, true)
+  const tooBig = validateEvent(validEvent({ event: 'code_daily', payload: { sessions: 1, turns: 1, toolCalls: 0, daysAgo: 367 } }))
+  assert.equal(tooBig.ok, false, 'an out-of-range offset must not validate')
+  const negative = validateEvent(validEvent({ event: 'code_daily', payload: { sessions: 1, turns: 1, toolCalls: 0, daysAgo: -1 } }))
+  assert.equal(negative.ok, false)
+})
+
+test('validateEvent: engine_installed still validates without the trigger field', () => {
+  // Same reasoning — `trigger` was added in the same pass and is emitted by no
+  // shipped client.
+  assert.equal(validateEvent(validEvent({ event: 'engine_installed', payload: { outcome: 'ok' } })).ok, true)
+  assert.equal(
+    validateEvent(validEvent({ event: 'engine_installed', payload: { outcome: 'ok', trigger: 'seed' } })).ok,
+    true,
+  )
+  assert.equal(
+    validateEvent(validEvent({ event: 'engine_installed', payload: { outcome: 'ok', trigger: 'not_a_trigger' } })).ok,
+    false,
+  )
+})
+
+test('validateEvent: engine_installed accepts every provisioning trigger, including the unattended one', () => {
+  // 'auto_update' exists because update-apply.ts's only caller is UpdateScheduler's
+  // ~24h timer — without it an unattended 3am engine swap is indistinguishable from
+  // a user clicking Update, which is the exact conflation this field was added to end.
+  for (const trigger of ['seed', 'user_install', 'user_update', 'runtime_env', 'build', 'auto_update']) {
+    const r = validateEvent(validEvent({ event: 'engine_installed', payload: { outcome: 'ok', trigger } }))
+    assert.equal(r.ok, true, `${trigger} must validate — ${r.ok === false ? r.reason : ''}`)
   }
 })

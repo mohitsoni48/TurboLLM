@@ -12,7 +12,7 @@
  * Deploy:  wrangler secret put POSTHOG_KEY   (then)   wrangler deploy
  */
 
-import { handleIngest, type IngestDeps } from '../../turbollm/src/telemetry/ingest'
+import { flattenForAnalytics, handleIngest, type IngestDeps } from '../../turbollm/src/telemetry/ingest'
 import { MACHINE_LIMIT, IP_LIMIT } from '../../turbollm/src/telemetry/rate-limit-window'
 import { RateLimiterDO } from './rate-limiter-do'
 
@@ -166,7 +166,16 @@ function makeDeps(env: Env): IngestDeps {
       const host = env.POSTHOG_HOST ?? 'https://us.i.posthog.com'
       const res = await fetch(`${host}/batch/`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: {
+          'content-type': 'application/json',
+          // Without this, PostHog sees no User-Agent on a server-to-server POST and
+          // files 100% of app telemetry under `no_user_agent`, which its bot detection
+          // then classes as automation — so every PostHog surface that filters bots
+          // (Web Analytics, and anything built from its defaults) hid the entire
+          // product (2026-08-21 data-integrity audit). Identifying the forwarder
+          // honestly is also just true: these events ARE relayed, not browser-sent.
+          'user-agent': 'turbollm-telemetry-worker/1 (+https://turbollm.dev)',
+        },
         body: JSON.stringify({
           api_key: env.POSTHOG_KEY,
           batch: events.map((e) => ({
@@ -174,7 +183,7 @@ function makeDeps(env: Env): IngestDeps {
             // No machineId → no distinct_id we could invent. 'anonymous' keeps
             // the consent ping countable without fabricating an identity.
             distinct_id: typeof e.machineId === 'string' ? e.machineId : 'anonymous',
-            properties: e,
+            properties: { ...e, ...flattenForAnalytics(e) },
             // Same reasoning as store() above: without this, PostHog stamps the event
             // with ingestion time instead of when it actually happened, which silently
             // breaks any funnel that requires strict step order (found 2026-08-01 — real

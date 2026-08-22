@@ -18,6 +18,7 @@ import { telemetryDisabled } from './disabled'
 import { TELEMETRY_SCHEMA_VERSION, REGISTRY, type EventName } from './schema'
 import { recordFeatureUse, flushStaleDailyUsage, persistDailyUsage } from './daily-usage'
 import { recordUiAction, flushStaleUiUsage, persistUiDailyUsage } from './runtime/ui-daily-usage'
+import { daysBetween } from './runtime/rollup'
 
 /** Just enough of ConfigStore for the emitter — kept structural so tests need
  *  no real config file. */
@@ -173,8 +174,11 @@ export class Emitter {
    */
   useFeature(feature: string): void {
     if (!this.canSend('feature_used_daily')) return
-    const rolled = recordFeatureUse(this.o.dataDir, feature, this.today())
-    if (rolled) this.emit('feature_used_daily', { feature, countBucket: rolled.bucket })
+    const today = this.today()
+    const rolled = recordFeatureUse(this.o.dataDir, feature, today)
+    if (rolled) {
+      this.emit('feature_used_daily', { feature, countBucket: rolled.bucket, daysAgo: daysBetween(rolled.day, today) })
+    }
   }
 
   /**
@@ -189,8 +193,9 @@ export class Emitter {
    */
   flushDailyUsage(): void {
     if (!this.canSend('feature_used_daily')) return
-    for (const { feature, bucket } of flushStaleDailyUsage(this.o.dataDir, this.today())) {
-      this.emit('feature_used_daily', { feature, countBucket: bucket })
+    const today = this.today()
+    for (const { feature, day, bucket } of flushStaleDailyUsage(this.o.dataDir, today)) {
+      this.emit('feature_used_daily', { feature, countBucket: bucket, daysAgo: daysBetween(day, today) })
     }
     persistDailyUsage(this.o.dataDir)
   }
@@ -206,8 +211,16 @@ export class Emitter {
   uiAction(screen: string, action: string): void {
     if (!this.canSend('ui_action')) return
     this.emit('ui_action', { screen, action })
-    const rolled = recordUiAction(this.o.dataDir, screen, action, this.today())
-    if (rolled) this.emit('ui_daily', { screen, actions: rolled.actions, distinctActions: rolled.distinctActions })
+    const today = this.today()
+    const rolled = recordUiAction(this.o.dataDir, screen, action, today)
+    if (rolled) {
+      this.emit('ui_daily', {
+        screen,
+        actions: rolled.actions,
+        distinctActions: rolled.distinctActions,
+        daysAgo: daysBetween(rolled.day, today),
+      })
+    }
   }
 
   /**
@@ -220,10 +233,34 @@ export class Emitter {
    */
   flushUiDailyUsage(): void {
     if (!this.canSend('ui_daily')) return
-    for (const { screen, actions, distinctActions } of flushStaleUiUsage(this.o.dataDir, this.today())) {
-      this.emit('ui_daily', { screen, actions, distinctActions })
+    const today = this.today()
+    for (const { screen, day, actions, distinctActions } of flushStaleUiUsage(this.o.dataDir, today)) {
+      this.emit('ui_daily', { screen, actions, distinctActions, daysAgo: daysBetween(day, today) })
     }
     persistUiDailyUsage(this.o.dataDir)
+  }
+
+  /**
+   * Emit `onboarding_recovery` — which setup failure the user hit, which remedy
+   * they picked, and whether it worked (spec 25 §8.2, ADR-338 Decision 8).
+   *
+   * This event was defined, registered and Worker-allow-listed, and then never
+   * given a caller: the 2026-08-21 data-integrity audit found zero emit sites in
+   * the entire tree, so it had received exactly zero events since it shipped. It
+   * was read as "nobody needs recovery" when it actually meant "nothing can ever
+   * report it". That mattered more than any other gap, because the largest real
+   * drop in the funnel is setup failure and this is the ONLY instrument that was
+   * meant to say why — the founder's exact complaint ("I can see where the drop
+   * is but can't understand why") was this missing call.
+   *
+   * Per-action, not once-only: a user who retries three times and succeeds on the
+   * third is the single most informative case there is, and a ledger guard would
+   * discard two thirds of it. Values are checked against the closed enums by
+   * `validateEvent` on the way into the queue, same as every other event, so an
+   * unrecognized string from the browser is silently dropped rather than stored.
+   */
+  onboardingRecovery(failure: string, action: string, outcome: 'ok' | 'fail'): void {
+    this.emit('onboarding_recovery', { failure, action, outcome })
   }
 
   /**

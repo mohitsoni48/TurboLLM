@@ -79,10 +79,11 @@ test('checkDailyQueryRollups: once the day rolls over, emits chat_daily, code_da
     const emittedNames = queued.map((q) => q.event).sort()
     assert.deepEqual(emittedNames, ['chat_daily', 'code_daily', 'gateway_daily', 'gateway_daily'].sort())
 
+    // `daysAgo: 1` — the counters describe 08-05, the event is stamped on 08-06.
     const chatEvent = queued.find((q) => q.event === 'chat_daily')
-    assert.deepEqual(chatEvent?.payload, chatStats)
+    assert.deepEqual(chatEvent?.payload, { ...chatStats, daysAgo: 1 })
     const codeEvent = queued.find((q) => q.event === 'code_daily')
-    assert.deepEqual(codeEvent?.payload, codeStats)
+    assert.deepEqual(codeEvent?.payload, { ...codeStats, daysAgo: 1 })
     // Sorted before comparing: queue file names are `<epoch-ms>-<uuid>.json`, so two events
     // queued within the same millisecond (as these are, emitted back to back in one synchronous
     // loop) tie-break on a random UUID — readQueue's emission order is not guaranteed here.
@@ -90,13 +91,90 @@ test('checkDailyQueryRollups: once the day rolls over, emits chat_daily, code_da
       .map((q) => q.payload as { protocol: string })
       .sort((a, b) => a.protocol.localeCompare(b.protocol))
     assert.deepEqual(gatewayEvents, [
-      { harness: 'unknown', protocol: 'anthropic', requests: 5, promptTokens: 100, genTokens: 50, distinctModels: 1 },
-      { harness: 'unknown', protocol: 'openai', requests: 2, promptTokens: 20, genTokens: 10, distinctModels: 1 },
+      { harness: 'unknown', protocol: 'anthropic', requests: 5, promptTokens: 100, genTokens: 50, distinctModels: 1, daysAgo: 1 },
+      { harness: 'unknown', protocol: 'openai', requests: 2, promptTokens: 20, genTokens: 10, distinctModels: 1, daysAgo: 1 },
     ])
 
     // A third call the SAME day must not re-emit — only a real boundary crossing does.
     checkDailyQueryRollups(dir, db, telemetry, () => today)
     assert.equal(readQueue(dir).length, 4, 'no new events queued for a same-day repeat call')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('checkDailyQueryRollups: a day with no chat and no code activity reports NEITHER event', () => {
+  const dir = tempDir()
+  try {
+    const telemetry = makeEmitter(dir)
+    // A machine that ran all day but never opened chat or Code. Before the
+    // 2026-08-21 audit fix both events were emitted anyway, carrying all-zero
+    // payloads: 79% of every code_daily row ever received was this, which is why
+    // code_daily and chat_daily were byte-identical and why "98 machines use Code"
+    // really meant 18.
+    const db = fakeDb(
+      { conversations: 0, messages: 0, maxMessagesInConversation: 0, medianMessagesInConversation: 0, distinctModels: 0, toolCalls: 0, regenerates: 0, stops: 0 },
+      [],
+      { sessions: 0, turns: 0, toolCalls: 0 },
+    )
+
+    let today = '2026-08-05'
+    checkDailyQueryRollups(dir, db, telemetry, () => today)
+    today = '2026-08-06'
+    checkDailyQueryRollups(dir, db, telemetry, () => today)
+
+    assert.deepEqual(names(dir), [], 'an idle day must be absent, not reported as a zero')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('checkDailyQueryRollups: chat activity alone reports chat_daily and NOT code_daily', () => {
+  const dir = tempDir()
+  try {
+    const telemetry = makeEmitter(dir)
+    // The case that made the two events indistinguishable: someone who chats but has
+    // never touched Code must not produce a code_daily at all.
+    const db = fakeDb(
+      { conversations: 2, messages: 7, maxMessagesInConversation: 4, medianMessagesInConversation: 3, distinctModels: 1, toolCalls: 0, regenerates: 0, stops: 0 },
+      [],
+      { sessions: 0, turns: 0, toolCalls: 0 },
+    )
+
+    let today = '2026-08-05'
+    checkDailyQueryRollups(dir, db, telemetry, () => today)
+    today = '2026-08-06'
+    checkDailyQueryRollups(dir, db, telemetry, () => today)
+
+    assert.deepEqual(names(dir), ['chat_daily'])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('checkDailyQueryRollups: daysAgo counts the real gap when the daemon was closed across several midnights', () => {
+  const dir = tempDir()
+  try {
+    const telemetry = makeEmitter(dir)
+    const db = fakeDb(
+      { conversations: 1, messages: 3, maxMessagesInConversation: 3, medianMessagesInConversation: 3, distinctModels: 1, toolCalls: 0, regenerates: 0, stops: 0 },
+      [],
+      { sessions: 0, turns: 0, toolCalls: 0 },
+    )
+
+    let today = '2026-08-05'
+    checkDailyQueryRollups(dir, db, telemetry, () => today) // tracks 08-05
+    today = '2026-08-09' // daemon was closed for four days
+    checkDailyQueryRollups(dir, db, telemetry, () => today)
+
+    const chat = readQueue(dir)
+      .map((q) => q.event as { event: string; payload: { daysAgo: number } })
+      .find((q) => q.event === 'chat_daily')
+    assert.equal(
+      chat?.payload.daysAgo,
+      4,
+      'the rollup reports the last day it TRACKED, not yesterday — charting it on the event ts would put it on the wrong date',
+    )
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -126,13 +204,36 @@ test('checkDailyQueryRollups: passes through a real classified harness value, an
       .map((q) => q.payload)
     assert.deepEqual(
       gatewayEvents.find((p) => p.protocol === 'anthropic'),
-      { protocol: 'anthropic', harness: 'claude_code', requests: 5, promptTokens: 100, genTokens: 50, distinctModels: 1 },
+      { protocol: 'anthropic', harness: 'claude_code', requests: 5, promptTokens: 100, genTokens: 50, distinctModels: 1, daysAgo: 1 },
     )
     assert.equal(
       gatewayEvents.find((p) => p.protocol === 'openai')?.harness,
       'unknown',
       'an unrecognized harness string must never reach emit() as-is',
     )
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('checkDailyQueryRollups: a throwing database never escapes into the caller (ADR-009)', () => {
+  const dir = tempDir()
+  try {
+    const telemetry = makeEmitter(dir)
+    // cli.ts drives this from a bare setInterval, and the process installs no
+    // uncaughtException handler — so before the v1.11.3 gate, a SQLite throw here
+    // killed the daemon and orphaned its engine child.
+    const exploding = {
+      chatDailyStats: () => { throw new Error('database is locked') },
+      gatewayDailyStats: () => { throw new Error('database is locked') },
+      codeDailyStats: () => { throw new Error('database is locked') },
+    } as never
+
+    let today = '2026-08-05'
+    assert.doesNotThrow(() => checkDailyQueryRollups(dir, exploding, telemetry, () => today))
+    today = '2026-08-06' // the rollover branch, where the db is actually queried
+    assert.doesNotThrow(() => checkDailyQueryRollups(dir, exploding, telemetry, () => today))
+    assert.deepEqual(names(dir), [], 'nothing is emitted when the query fails')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

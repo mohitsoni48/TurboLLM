@@ -27,6 +27,7 @@ import { HashStore } from './models/hashes'
 import { resolveProfile, profileToArgs, estimateVram, type LoadProfile } from './models/profile'
 import { getSysInfo } from './sysinfo/sysinfo'
 import { ConversationStore } from './chat/db'
+import { buildChatStore } from './chat/store/startup'
 import { HfClient } from './hf/hf'
 import { DownloadManager } from './downloads/downloads'
 import { BenchRunner } from './bench/bench'
@@ -48,7 +49,7 @@ import { isTurboLinkEnabled } from './link/gate'
 import type { Deps } from './deps'
 import { TELEMETRY_ENV } from './telemetry/disabled'
 import { Emitter } from './telemetry/emit'
-import { classifyLoadFailure, classifyEngineErrorFingerprint } from './telemetry/classify'
+import { classifyLoadFailure, classifyLoadErrorCode, classifyEngineErrorFingerprint } from './telemetry/classify'
 import { flush } from './telemetry/uploader'
 import { emit } from './telemetry/runtime/typed-emit'
 import { modelLoad, modelDownloaded, buildModelLoadConfig } from './telemetry/events/model'
@@ -380,8 +381,20 @@ const startedAt = Date.now()
 // the version we're running? Informational only — npm does the upgrade. The route serves
 // this cache offline-first; the startup check below warms it so the chip is ready.
 const appUpdates = new AppUpdateChecker(version)
+// Pluggable chat storage (spec 27 §4.5): compose the tenant-dispatching router here. A
+// misconfigured adapter must stop the daemon with a message the operator can act on —
+// never surface later as mysterious per-request failures, and never silently fall back
+// to SQLite for tenants the operator configured to go elsewhere.
+let chatStore
+try {
+  chatStore = await buildChatStore(store.snapshot().chatStore, db.chatStore, store.dir())
+} catch (e) {
+  console.error(`[fatal] ${(e as Error).message}`)
+  console.error('[fatal] Fix `chatStore` in config.json, or set { "kind": "sqlite" }, then restart.')
+  process.exit(1)
+}
 // `requestRestart` is attached after the server is created (it must close over it).
-const deps: Deps = { store, registry, manager, scanner, hashes, db, provision, build, updates, appUpdates, hf, downloads, bench, modelRouter, comfy, remoteCatalog, tools: toolRegistry, version, startedAt }
+const deps: Deps = { store, registry, manager, scanner, hashes, db, chatStore, provision, build, updates, appUpdates, hf, downloads, bench, modelRouter, comfy, remoteCatalog, tools: toolRegistry, version, startedAt }
 // Sized to the RUNNING engine's own slot count, re-read on every admission (a model swap changes
 // it). `Infinity` when the engine advertises no `--parallel` — see Manager.parallelSlots() for why
 // that is not 1.
@@ -393,6 +406,22 @@ deps.agentTasks = new AgentTaskState()
 // here that could leak if those checks were somehow skipped upstream.
 const telemetry = new Emitter({ dataDir: store.dir(), store, version, os: getSysInfo().os })
 deps.telemetry = telemetry
+// ORDER IS LOAD-BEARING (2026-08-21 data-integrity audit). `app_first_run` used to
+// sit on the deferred 3-second boot timer below, alongside the first queue flush.
+// That put it AFTER `seedDefaultEngines` (line ~301) had already settled, so on 108
+// of 319 machines the install's own `engine_installed` carried an EARLIER `ts` than
+// the `app_first_run` it was supposed to follow — median 7 seconds earlier. Every
+// ordered funnel in PostHog silently discarded those machines, turning a real ~13%
+// install→engine drop into a reported ~55% one. It was the single largest false
+// signal in the whole dataset, and it was a timer, not a user.
+//
+// Emitted here instead, synchronously, next to `dailyActive()` — which has always
+// done the same ledger read/write on this exact line with no ill effect, so the
+// "defer it so a slow disk cannot delay the listen socket" reasoning that put it on
+// the timer never actually applied to the claim itself, only to the network flush
+// (which stays deferred below). Nothing between here and the seed can emit, so this
+// is now provably the first event any install ever sends.
+telemetry.once('app_first_run')
 telemetry.dailyActive()
 // model_first_load (ADR-299): the single most valuable journey event — the only
 // signal separating "never tried" from "tried and it broke". Observed at
@@ -457,14 +486,14 @@ manager.onLoadSettled = (ok, err, opts) => {
     const vram = estimateVram(opts.profile, entry, getSysInfo())
     emit(telemetry, modelLoad, {
       outcome,
-      ...(ok ? {} : { failReason: classifyLoadFailure(err) }),
+      ...(ok ? {} : { failReason: classifyLoadFailure(err), errorCode: classifyLoadErrorCode(err) }),
       trigger: opts.trigger ?? 'manual',
       ...buildModelLoadConfig(entry, opts.profile, opts.engine, vram),
     })
   } else {
     emit(telemetry, modelLoad, {
       outcome,
-      ...(ok ? {} : { failReason: classifyLoadFailure(err) }),
+      ...(ok ? {} : { failReason: classifyLoadFailure(err), errorCode: classifyLoadErrorCode(err) }),
       trigger: opts.trigger ?? 'manual',
     })
   }
@@ -494,8 +523,8 @@ bench.telemetry = telemetry
 // `failReason` (telemetry-review follow-up): ProvisionState now classifies its own
 // failure via `classifyProvisionFailure` before it ever reaches this observer — see
 // provision-state.ts's `fail()` — so this call site still never touches free text.
-provision.onSettled = (ok, failReason) =>
-  emit(telemetry, engineInstalled, { outcome: ok ? 'ok' : 'fail', ...(failReason ? { failReason } : {}) })
+provision.onSettled = (ok, trigger, failReason) =>
+  emit(telemetry, engineInstalled, { outcome: ok ? 'ok' : 'fail', trigger, ...(failReason ? { failReason } : {}) })
 downloads.onSettled = (outcome) => {
   emit(telemetry, modelDownloaded, { outcome })
   // `error` (telemetry-review follow-up): only one ERROR_FINGERPRINTS bucket exists
@@ -512,12 +541,21 @@ downloads.onSettled = (outcome) => {
 // 'cancelled' deliberately does NOT emit 'error' (PR #105 review finding) — a build
 // the user aborted themselves is a choice, not a crash.
 build.onSettled = (outcome) => {
+  // Every outcome is now reported, not just the failures (2026-08-21 data-integrity
+  // audit). Emitting only on failure left 93 `build_failed` events with no
+  // denominator: there was literally no way to ask what fraction of compiles
+  // succeed, which is the only question that matters for a feature whose whole
+  // risk is "does it build on the user's machine". Reuses `engine_installed` with
+  // trigger:'build' rather than adding a fourth engine event — the outcome shape
+  // is identical and a separate name would just be another thing to join.
+  emit(telemetry, engineInstalled, { outcome, trigger: 'build' })
   if (outcome === 'fail') telemetry.error('build_failed')
 }
-// Deferred so a slow or failing disk cannot delay the listen socket; unref'd so
+// Deferred so a slow or failing network cannot delay the listen socket; unref'd so
 // it never holds the process open (ADR-009: telemetry is not a failure mode).
+// `app_first_run` no longer rides this timer — see the ordering comment where the
+// Emitter is constructed for why it must precede the engine seed.
 setTimeout(() => {
-  telemetry.once('app_first_run')
   void flush(store.dir(), store.snapshot().telemetry.level)
 }, 3_000).unref()
 // Recurring flush (ADR-299) — found missing during live end-to-end testing, not

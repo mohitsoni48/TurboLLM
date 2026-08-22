@@ -15,12 +15,32 @@ import type { ModelEntry } from '../../models/scanner'
 import type { Engine } from '../../config/config'
 import type { VramFit } from '../../models/profile'
 
+/**
+ * RETIRED in v1.10.3 — no shipping code path emits this any more (`cli.ts` and
+ * `bench/bench.ts` both say so at their retirement points). "First load" is now
+ * derived as the first `model_load` per machine.
+ *
+ * DELIBERATELY STILL REGISTERED, and it must stay that way (2026-08-21
+ * data-integrity audit). Deleting a name from the registry does not stop old
+ * clients sending it — it makes the WORKER start rejecting them, which is exactly
+ * what happened to `onboarding_step`: binaries already on users' machines kept
+ * emitting it forever and every one of those events was refused at the edge.
+ * Every install still on v1.10.2 or earlier emits this event today, and keeping
+ * the entry is what lets those events be accepted and stored normally.
+ *
+ * What it is NOT is a metric. Because only pre-1.10.3 clients can emit it, its
+ * machine count froze on 2026-08-06 and reads as a cliff — it showed 99 machines
+ * "ever loaded a model" when `model_load` showed 192, a 2x understatement that
+ * looked exactly like a regression. Do not put it in a funnel; use `model_load`.
+ * Remove the entry only once telemetry from pre-1.10.3 clients has genuinely
+ * stopped arriving.
+ */
 export const modelFirstLoad = defineEvent({
   name: 'model_first_load',
   since: 1,
   consent: 'anon',
   lifecycle: 'once-with-payload',
-  description: "The outcome of this install's first-ever model load attempt (including a failed one).",
+  description: "RETIRED (v1.10.3, derive from the first model_load instead). The outcome of this install's first-ever model load attempt — still accepted so pre-1.10.3 clients are not rejected at the edge.",
   payload: {
     outcome: f.enum(OUTCOMES),
     failReason: f.enum(FAIL_REASONS, { optional: true }),
@@ -51,6 +71,17 @@ export const modelDownloaded = defineEvent({
  *  (see cli.ts's own comment on this exact gap for `model_first_load`). */
 export const MODEL_LOAD_TRIGGERS = ['manual', 'autotune', 'gateway_switch', 'resume'] as const
 
+/** Structured `LoadError.code` values this product's own code emits (grep
+ *  `code: '...'` across src/). A closed set by construction — these strings are
+ *  written by us, never by an engine binary, a model file or a user — which is
+ *  what makes reporting one compatible with the no-free-form-strings rule.
+ *  `unknown` covers a code we do not recognise, so a future code added
+ *  elsewhere degrades to a named bucket rather than being dropped. */
+export const LOAD_ERROR_CODES = [
+  'readiness_timeout', 'engine_unsupported', 'engine_exited', 'engine_spawn_failed',
+  'model_load_failed', 'load_failed', 'model_not_loaded', 'unknown',
+] as const
+
 export const modelLoad = defineEvent({
   name: 'model_load',
   since: 2,
@@ -60,6 +91,19 @@ export const modelLoad = defineEvent({
   payload: {
     outcome: f.enum(OUTCOMES),
     failReason: f.enum(FAIL_REASONS, { optional: true }),
+    // The STRUCTURED error code the daemon's own code produced, alongside the
+    // text-sniffed `failReason` (2026-08-21 data-integrity audit).
+    //
+    // 57.6% of failed loads classify as `failReason: 'other'`, and that tail can
+    // never be narrowed from telemetry, because the thing that would explain it —
+    // the error text — is deliberately never transmitted. Adding more sign-lists
+    // to `classifyLoadFailure` would be guessing at strings nobody can see. This
+    // is the way out that does not break the privacy rule: `code` is emitted by
+    // OUR code from a closed set, never by a driver, a model file or a user, so
+    // it can be reported as an enum. `other` + `engine_exited` reads as "the
+    // process died and we could not say why from the log" — still a gap, but a
+    // named one, instead of an unsplittable half of every failure.
+    errorCode: f.enum(LOAD_ERROR_CODES, { optional: true }),
     trigger: f.enum(MODEL_LOAD_TRIGGERS),
 
     // Absent together when no profile/model-entry was available to report from

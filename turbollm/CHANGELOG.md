@@ -23,7 +23,70 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
-### Nothing yet.
+_Nothing yet._
+
+## [1.11.5] - 2026-08-22
+
+### Added
+
+- **A public External Chat API for building real chat apps on TurboLLM — `/api/ext/v1`.**
+  **Experimental — requires manual setup, no onboarding UI yet.** Send a message, consume an SSE
+  stream, and TurboLLM handles the rest: durable chat/message storage, editing with optimistic
+  concurrency, and resumable generation — a `Run` is a resource you can poll or reconnect to, not
+  just a stream that dies if the connection drops. Off by default (`api.ext.enabled` in
+  `config.json`). Using it today requires two manual `config.json` edits, neither exposed in any UI
+  yet: an API key with an explicit, non-`local` `tenant` field (the local tenant — TurboLLM's own
+  desktop UI data — is deliberately never reachable through this API), and a configured `chatStore`
+  adapter (the SQLite default only ever serves the `local` tenant, so a non-`local` request 501s
+  without one — a working Postgres example ships in the repo, see below). The daemon logs a warning
+  at startup while enabled, since a remote tenant's generations currently inherit this install's
+  own tool permissions rather than an independent trust boundary of their own. Full guide at
+  [turbollm.dev/docs/api/external](https://turbollm.dev/docs/api/external).
+- **Bring your own database.** Storage behind the new API is a documented `ChatStore` interface —
+  a complete, tested Postgres example ships in the repo under `examples/postgres-chat-store`, and
+  it's what makes the API usable for a real (non-`local`) tenant at all today.
+- **A generated OpenAPI 3.1 spec and a TypeScript client.** `@turbollm/chat-client` is a
+  zero-dependency package that gets the one genuinely hard part of streaming — reconciling after a
+  dropped connection without losing or duplicating content — right automatically.
+- **Multi-tenant by design.** API keys carry a tenant and scopes, and every request is further
+  scoped by an integrator-supplied `owner`, so one API key can serve many end users while keeping
+  them isolated from each other — there's just no key-minting UI yet (see above).
+- **A tenant-scoped audit log.** Every mutation through the new API — who, what, when, and the
+  outcome — is recorded and queryable, with message/chat content deliberately never retained in it.
+
+### Discord
+- New (experimental, manual setup required): a public API for building real chat apps on top of TurboLLM. Send a message, get a resumable stream back — TurboLLM handles storage, editing, and reconnects for you.
+- Comes with a ready-made TypeScript client and a working Postgres example — you'll need it, since the SQLite default only serves TurboLLM's own desktop UI, not external tenants yet. Off by default; full setup guide linked above.
+
+## [1.11.4] - 2026-08-22
+
+_No user-facing changes._
+
+## [1.11.3] - 2026-08-21
+
+### Fixed
+
+- **Auto-tune is smarter about dual-GPU machines.** With two cards, a mixture-of-experts model
+  that needed some CPU offload used to pile nearly all its weight onto one of them — measured on
+  two 16 GB cards, one held 1.7 GB while the other sat at 14.7 GB, a step from running out.
+  Auto-tune could only see the two cards added together, which still looked half free, so it read
+  the ceiling it kept hitting as the pool's rather than one card's and kept moving *more* work to
+  the CPU to escape it. The tune ended up using barely half the VRAM you have and running the
+  model on your processor instead. TurboLLM now works out what each card will hold separately and
+  places layers by their real size, so the search stops as soon as the model genuinely fits. On
+  two Tesla T4s, Qwen3.6-35B-A3B at Q8 went from 16.4 GB of a 30.7 GB pool to 27.6 GB, and chat
+  from 4.3 to **10.0 tok/s**, with both cards working instead of one idling. Single-GPU machines
+  and dense (non-MoE) models are unaffected, and a GPU split you set yourself is never overridden.
+
+### Added
+
+- **A Kaggle notebook for reproducing multi-GPU behaviour on real hardware** (`deploy/kaggle/`).
+  Kaggle hands out two Tesla T4s free, which makes it a genuine dual-GPU box for anyone without
+  one to test on. The notebook brings up TurboLLM there with a prebuilt CUDA engine, and
+  `bench_vs_chat.py` runs auto-tune and then measures real chat throughput at the same context
+  depth the tuner used — reporting the engine and the daemon separately so a difference can be
+  attributed rather than merely observed. This is research tooling, not part of the app; the
+  dual-GPU fix above came out of it.
 
 ## [1.11.2] - 2026-08-20
 

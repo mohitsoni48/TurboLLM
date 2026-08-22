@@ -25,6 +25,26 @@ export const FAIL_REASONS = ['oom', 'no_engine', 'bad_gguf', 'unsupported_arch',
  *  don't overlap much and shouldn't be merged into one. */
 export const PROVISION_FAIL_REASONS = ['network', 'no_asset', 'unsupported_platform', 'disk_full', 'permission_denied', 'other'] as const
 
+/** What caused an `engine_installed` event (2026-08-21 data-integrity audit).
+ *  Without this, the unattended boot-time seed, a user clicking Install, a user
+ *  clicking Update and the MLX/vLLM runtime installers were one indistinguishable
+ *  event — so "installed an engine" counted a thing the product did by itself as a
+ *  milestone the user had reached, and inflated the per-machine rate to 2.4.
+ *  `build` additionally gives compile-from-source a SUCCESS signal: until now
+ *  `build.onSettled` only ever emitted on failure, leaving 93 `build_failed`
+ *  events with no denominator to divide by.
+ *
+ *  `auto_update` is the same distinction one level down, and exists because the
+ *  first cut of this enum got it wrong: `update-apply.ts` hardcoded
+ *  `user_update`, but its only caller is `UpdateScheduler`'s ~24h timer
+ *  (cli.ts), so every unattended 3am engine swap was recorded as a user
+ *  clicking Update. That is precisely the "count what the product did as
+ *  something the user chose" error this whole enum was added to stop, so
+ *  shipping it that way would have launched the field already dishonest.
+ *  A user-initiated update comes through the routes instead, which tag
+ *  `user_update` themselves. */
+export const PROVISION_TRIGGERS = ['seed', 'user_install', 'user_update', 'runtime_env', 'build', 'auto_update'] as const
+
 /** Usage counts are bucketed, never raw: a raw count is a behavioural fingerprint. */
 export const COUNT_BUCKETS = ['1', '2-5', '6-20', '21-100', '100+'] as const
 

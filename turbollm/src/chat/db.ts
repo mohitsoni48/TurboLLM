@@ -3,6 +3,7 @@ import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import type { Routine, RoutineRun, RoutineFlavor, RoutineStatus, RoutineRunStatus, CodingAgentChoice, ScheduleRule } from '../routines/schema'
+import { SqliteChatStore } from './store/sqlite-chat-store.js'
 
 export interface Conversation {
   id: string
@@ -64,6 +65,16 @@ export interface Folder {
   sortOrder: number
   createdAt: string
   updatedAt: string
+}
+
+/** A public API run record (spec 27 §6.4) — durable so `GET /runs/{id}` survives a daemon
+ *  restart. Node-local operational state, not integrator data, so it lives in its own table
+ *  outside the pluggable ChatStore boundary. */
+export interface ExtRunRecord {
+  id: string; chatId: string; messageId: string; tenant: string; owner: string
+  status: string; eventSeq: number
+  error: { type: string; code: string; message: string } | null
+  createdAt: string; endedAt: string | null
 }
 
 /** One durable fact extracted from a user's own chat messages (Release 3, auto-memory).
@@ -492,6 +503,7 @@ export interface Message {
 interface ConvRow { id: string; title: string; system_prompt: string; model_key: string; sampling: string; expert_mode: number; tool_policy: string | null; kind: string | null; folder_id: string | null; tool_overrides: string | null; agent_id: string | null; completed_at: string | null; read_scope: string | null; agent_mode: string | null; skill_ids: string | null; allowed_tools: string | null; preserve_thinking: number; created_at: string; updated_at: string }
 interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; agent_id: string | null; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null; archived_at: string | null; completion: string | null; repo_root: string | null; repo_branch: string | null; use_worktree: number | null; worktree_branch: string | null; worktree_base: string | null; worktree_path: string | null; lines_added: number | null; lines_removed: number | null; compaction_summary: string | null; compaction_upto_message_id: string | null; compaction_tokens_before: number | null; cleared_upto_message_id: string | null; reverted_from_message_id: string | null; title_auto_synced: number | null; code_agent: string | null; terminal_launched_once: number | null }
 interface FolderRow { id: string; name: string; sort_order: number; created_at: string; updated_at: string }
+interface ExtRunRow { id: string; chat_id: string; message_id: string; tenant: string; owner: string; status: string; event_seq: number; error: string | null; created_at: string; ended_at: string | null }
 interface MsgRow  { id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string; reasoning: string; attachments: string; text_attachments: string | null; tool_calls: string | null; timeline: string | null; stats: string; model_key: string | null; research_meta: string | null; created_at: string; variant_group: string | null; is_active: number; branch_of: string | null; edited: number }
 
 // node:sqlite named-param objects need an explicit cast to Record<string, SQLInputValue>
@@ -516,6 +528,15 @@ function rowToConv(r: ConvRow): Conversation {
 
 function rowToFolder(r: FolderRow): Folder {
   return { id: r.id, name: r.name, sortOrder: r.sort_order, createdAt: r.created_at, updatedAt: r.updated_at }
+}
+
+function rowToExtRun(r: ExtRunRow): ExtRunRecord {
+  return {
+    id: r.id, chatId: r.chat_id, messageId: r.message_id, tenant: r.tenant, owner: r.owner,
+    status: r.status, eventSeq: r.event_seq,
+    error: r.error ? (safeJson(r.error) as ExtRunRecord['error']) : null,
+    createdAt: r.created_at, endedAt: r.ended_at,
+  }
 }
 
 function rowToAgentRun(r: AgentRunRow): AgentRun {
@@ -610,6 +631,20 @@ interface Changes { changes: number }
 
 export class ConversationStore {
   private db: DatabaseSync
+
+  private _chatStore?: SqliteChatStore
+
+  /** The raw handle, so the pluggable ChatStore can run over the SAME connection and
+   *  tables rather than opening a second one (WAL + locking would bite otherwise).
+   *  Phase 1 amendment 1: SqliteChatStore sits ALONGSIDE this class, not beneath it. */
+  get handle(): DatabaseSync { return this.db }
+
+  /** Lazily constructed so `new ConversationStore(dir)` stays cheap and so the
+   *  migration in the constructor has already run before any store touches a table. */
+  get chatStore(): SqliteChatStore {
+    if (!this._chatStore) this._chatStore = new SqliteChatStore(this.db)
+    return this._chatStore
+  }
 
   constructor(dataDir: string) {
     this.db = new DatabaseSync(join(dataDir, 'turbollm.db'))
@@ -1145,6 +1180,86 @@ export class ConversationStore {
     if (v < 44) {
       this.db.exec(`CREATE INDEX IF NOT EXISTS idx_api_usage_code_session_tokens ON api_usage(code_session_id, prompt_tokens);`)
       this.db.exec(`PRAGMA user_version = 44;`)
+    }
+    if (v < 45) {
+      // Spec 27 §9.1: tenancy for the public chat API. Every column is NOT NULL with a
+      // DEFAULT, so this is a metadata-only ALTER in SQLite and existing rows land in the
+      // local scope untouched. hasColumn guards each ADD because this branch's ladder has
+      // been renumbered before and a stored user_version can lag behind reality.
+      if (!this.hasColumn('conversations', 'tenant'))   this.db.exec(`ALTER TABLE conversations ADD COLUMN tenant TEXT NOT NULL DEFAULT 'local';`)
+      if (!this.hasColumn('conversations', 'owner'))    this.db.exec(`ALTER TABLE conversations ADD COLUMN owner TEXT NOT NULL DEFAULT 'default';`)
+      if (!this.hasColumn('conversations', 'version'))  this.db.exec(`ALTER TABLE conversations ADD COLUMN version INTEGER NOT NULL DEFAULT 1;`)
+      if (!this.hasColumn('conversations', 'metadata')) this.db.exec(`ALTER TABLE conversations ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}';`)
+
+      if (!this.hasColumn('messages', 'tenant'))   this.db.exec(`ALTER TABLE messages ADD COLUMN tenant TEXT NOT NULL DEFAULT 'local';`)
+      if (!this.hasColumn('messages', 'owner'))    this.db.exec(`ALTER TABLE messages ADD COLUMN owner TEXT NOT NULL DEFAULT 'default';`)
+      if (!this.hasColumn('messages', 'status'))   this.db.exec(`ALTER TABLE messages ADD COLUMN status TEXT NOT NULL DEFAULT 'complete';`)
+      if (!this.hasColumn('messages', 'version'))  this.db.exec(`ALTER TABLE messages ADD COLUMN version INTEGER NOT NULL DEFAULT 1;`)
+      if (!this.hasColumn('messages', 'metadata')) this.db.exec(`ALTER TABLE messages ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}';`)
+
+      // The three indexes spec 27 §4.1 requires of every adapter. Unlike the ADD COLUMNs
+      // these DO scan, so a large messages table takes a moment on first open after upgrade.
+      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_conv_scope_updated ON conversations(tenant, owner, updated_at DESC);`)
+      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_msg_scope_chat_seq ON messages(tenant, owner, conv_id, seq);`)
+      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_msg_variant ON messages(tenant, conv_id, variant_group);`)
+
+      this.db.exec(`PRAGMA user_version = 45;`)
+    }
+    if (v < 46) {
+      // Phase 2 Task 4: folder scoping for the FolderStore capability group (spec 27
+      // §4.2). Deliberately a NEW block rather than an extension of v45 above — v45 has
+      // already run (and bumped user_version to 45) on every database that has been
+      // opened since Task 1 landed, so an edit to that block would never execute again
+      // on any of those databases and the folders columns would silently never appear.
+      // hasColumn-guarded for the same reason as every other ALTER here: this ladder has
+      // been renumbered before and a stored user_version can lag behind reality.
+      if (!this.hasColumn('folders', 'tenant')) this.db.exec(`ALTER TABLE folders ADD COLUMN tenant TEXT NOT NULL DEFAULT 'local';`)
+      if (!this.hasColumn('folders', 'owner'))  this.db.exec(`ALTER TABLE folders ADD COLUMN owner TEXT NOT NULL DEFAULT 'default';`)
+      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_folders_scope ON folders(tenant, owner, sort_order);`)
+      this.db.exec(`PRAGMA user_version = 46;`)
+    }
+    if (v < 47) {
+      // Public API run records (spec 27 §6.4). Local-only: a run is node-local operational
+      // state (an abort controller, a cursor, an engine target), never integrator data, so it
+      // must NOT sit behind the pluggable store — that would force every adapter author to
+      // build a job table before streaming worked at all.
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS ext_runs (
+          id TEXT PRIMARY KEY,
+          chat_id TEXT NOT NULL,
+          message_id TEXT NOT NULL,
+          tenant TEXT NOT NULL,
+          owner TEXT NOT NULL,
+          status TEXT NOT NULL,
+          event_seq INTEGER NOT NULL DEFAULT 0,
+          error TEXT,
+          created_at TEXT NOT NULL,
+          ended_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_ext_runs_tenant ON ext_runs(tenant, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_ext_runs_status ON ext_runs(status);
+      `)
+      this.db.exec(`PRAGMA user_version = 47;`)
+    }
+    if (v < 48) {
+      // Audit trail for tenant-scoped mutations (spec 27 §10). There is deliberately NO
+      // content column: the log records THAT a chat or message changed, never what was said.
+      // A content-carrying audit log is a second, unscoped copy of every conversation.
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS ext_audit (
+          id TEXT PRIMARY KEY,
+          tenant TEXT NOT NULL,
+          owner TEXT NOT NULL,
+          action TEXT NOT NULL,
+          target_id TEXT,
+          request_id TEXT NOT NULL,
+          status INTEGER NOT NULL,
+          key_prefix TEXT NOT NULL,
+          at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ext_audit_tenant_at ON ext_audit(tenant, at DESC);
+      `)
+      this.db.exec(`PRAGMA user_version = 48;`)
     }
   }
 
@@ -1996,6 +2111,37 @@ export class ConversationStore {
     const now = new Date().toISOString()
     const changed = ((this.db.prepare(`UPDATE conversations SET folder_id = $fid, updated_at = $now WHERE id = $id`).run({ $id: convId, $fid: folderId, $now: now } as P) as unknown) as Changes).changes > 0
     return changed ? { ok: true } : { ok: false, reason: 'conversation_not_found' }
+  }
+
+  // ── Public API run records (v47 migration, spec 27 §6.4) ──────────────────
+
+  upsertExtRun(r: ExtRunRecord): void {
+    this.db.prepare(`INSERT INTO ext_runs (id,chat_id,message_id,tenant,owner,status,event_seq,error,created_at,ended_at)
+      VALUES ($id,$c,$m,$t,$o,$s,$seq,$e,$ca,$ea)
+      ON CONFLICT(id) DO UPDATE SET status=$s, event_seq=$seq, error=$e, ended_at=$ea`)
+      .run({
+        $id: r.id, $c: r.chatId, $m: r.messageId, $t: r.tenant, $o: r.owner,
+        $s: r.status, $seq: r.eventSeq, $e: r.error ? JSON.stringify(r.error) : null,
+        $ca: r.createdAt, $ea: r.endedAt,
+      } as P)
+  }
+
+  getExtRun(id: string): ExtRunRecord | null {
+    const r = this.db.prepare(`SELECT * FROM ext_runs WHERE id = $id`).get({ $id: id } as P) as unknown as ExtRunRow | undefined
+    return r ? rowToExtRun(r) : null
+  }
+
+  listExtRuns(tenant: string, limit = 100): ExtRunRecord[] {
+    return (this.db.prepare(`SELECT * FROM ext_runs WHERE tenant = $t ORDER BY created_at DESC LIMIT $l`)
+      .all({ $t: tenant, $l: limit } as P) as unknown as ExtRunRow[]).map(rowToExtRun)
+  }
+
+  /** Close out runs left mid-stream by a previous process (spec 27 §6.4). */
+  markStreamingExtRunsFailed(code: string, message: string): number {
+    const err = JSON.stringify({ type: 'engine', code, message })
+    const r = this.db.prepare(`UPDATE ext_runs SET status='failed', error=$e, ended_at=$now WHERE status IN ('queued','streaming')`)
+      .run({ $e: err, $now: new Date().toISOString() } as P) as unknown as Changes
+    return r.changes
   }
 
   // ── Agent run methods (v8 migration) ──────────────────────────────────────
