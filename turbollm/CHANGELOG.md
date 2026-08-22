@@ -25,17 +25,9 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
-## [1.11.3] - 2026-08-22
+## [1.11.4] - 2026-08-22
 
-### Changed
-
-- **The model setting "Parallel slots" is now "Parallel requests".** Same control, a name that
-  says what it actually does — how many requests the engine will work on at once.
-
-### Discord
-
-- Renamed **"Parallel slots"** to **"Parallel requests"** in model settings. Same setting, a name
-  that actually tells you what it does.
+_No user-facing changes._
 
 ## [1.11.3] - 2026-08-21
 
