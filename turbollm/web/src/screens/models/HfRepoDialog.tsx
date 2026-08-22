@@ -18,6 +18,9 @@ import rehypeSanitize, { defaultSchema } from 'rehype-sanitize'
 import { ChevronDown, Download, ExternalLink, Lock, Zap } from 'lucide-react'
 import { ApiError, track } from '../../lib/api'
 import { useDownloadMutations, useHfRepo, useModelActions, useStatus, useSysInfo } from '../../lib/queries'
+import { useLinks, useRemoteDownloadActions } from '../../lib/link-queries'
+import { DownloadTargetMenu } from '../../components/fleet'
+import { describeRemoteFailure } from '../../lib/remote-failure'
 import type { FitVerdict, HfRepoFile } from '../../lib/types'
 import { Button } from '../../components/ui/button'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '../../components/ui/dropdown-menu'
@@ -105,6 +108,10 @@ export function HfRepoContent({
   const sysQ = useSysInfo()
   const dlMut = useDownloadMutations()
   const actions = useModelActions()
+  // Host-gated and soft: no links (or a browser off-box) means the plain local button.
+  const links = useLinks().data ?? []
+  const remoteDl = useRemoteDownloadActions()
+  const [remoteDlError, setRemoteDlError] = useState<string | null>(null)
 
   const statusQ = useStatus()
   const engineKind = statusQ.data?.engine.kind ?? ''
@@ -153,6 +160,31 @@ export function HfRepoContent({
   const blockedByGate = gated
 
   const enqueueError = dlMut.enqueue.error instanceof ApiError ? dlMut.enqueue.error.message : null
+
+  /** Start the selected file downloading on a LINKED machine.
+   *
+   *  The host owns the queue, the concurrency cap and the repo/filename validation, so this
+   *  only asks — and a refusal comes back typed, rendered through the same
+   *  `describeRemoteFailure` taxonomy every other remote control uses rather than as a bare
+   *  message. */
+  const onDownloadTo = (linkId: string) => {
+    if (!detail || !selectedFile) return
+    const machine = links.find((l) => l.id === linkId)?.name ?? 'that machine'
+    setRemoteDlError(null)
+    remoteDl.start.mutate(
+      {
+        linkId,
+        repo: detail.repo,
+        rfilename: selectedFile.name,
+        size: selectedFile.sizeBytes,
+        ...(selectedFile.sha256 ? { sha256: selectedFile.sha256 } : {}),
+      },
+      {
+        onSuccess: () => { toast.success(`Downloading ${selectedFile.name} on ${machine}`) },
+        onError: (e) => setRemoteDlError(describeRemoteFailure(e, machine).message),
+      },
+    )
+  }
 
   const onDownload = () => {
     if (!detail || !selectedFile) return
@@ -270,6 +302,7 @@ export function HfRepoContent({
           )}
 
           {enqueueError && <p className="text-[12px]" style={{ color: 'var(--err)' }}>{enqueueError}</p>}
+          {remoteDlError && <p className="text-[12px]" style={{ color: 'var(--err)' }}>{remoteDlError}</p>}
 
           {/* Primary action */}
           <div className="flex items-center gap-2">
@@ -278,7 +311,7 @@ export function HfRepoContent({
                 <Zap size={14} />
                 Load
               </Button>
-            ) : (
+            ) : links.length === 0 ? (
               <Button
                 className="flex-1"
                 onClick={() => { track('models', 'download_hf_quant'); onDownload() }}
@@ -287,6 +320,24 @@ export function HfRepoContent({
                 <Download size={14} />
                 {dlMut.enqueue.isPending ? 'Adding…' : selectedIsLocal ? 'Re-download' : 'Download'}
               </Button>
+            ) : (
+              // With links, the target becomes a choice — the file is on Hugging Face, not
+              // on any machine yet, so WHICH machine fetches it is the actual question.
+              <DownloadTargetMenu
+                links={links}
+                busy={dlMut.enqueue.isPending || remoteDl.start.isPending}
+                disabled={blockedByGate || !selectedFile}
+                label={
+                  dlMut.enqueue.isPending || remoteDl.start.isPending
+                    ? 'Adding…'
+                    : selectedIsLocal ? 'Re-download' : 'Download'
+                }
+                onPick={(linkId) => {
+                  track('models', linkId ? 'download_hf_quant_remote' : 'download_hf_quant')
+                  if (linkId) onDownloadTo(linkId)
+                  else onDownload()
+                }}
+              />
             )}
           </div>
 

@@ -8,13 +8,13 @@ import { GATE_VERSION, gateNodeSource } from '../comfyui/gate-template'
 import { randomUUID } from 'node:crypto'
 import { homedir, networkInterfaces } from 'node:os'
 import { ValueError, getModelProfile, resolveConfiguredCtx, setModelProfile, deleteModelProfile, VRAM_HEADROOM_MIN_MB, VRAM_HEADROOM_MAX_MB, VRAM_HEADROOM_SPILL_MB, type ApiKey, type Engine, type McpServer } from '../config/config'
+import { CONFIG_BOUNDS, coerceBounded, isConfigTheme } from '../config/config-bounds'
 import type { Deps } from '../deps'
-import { type ModelInfo, type StartOpts } from '../engines/manager'
 import { abortAllInFlightChats } from '../chat/chat-routes'
 import { NameTakenError, NotFoundError, customSourceKey } from '../engines/registry'
 import { ProbeError, probe } from '../engines/probe'
 import { resolveServerBinary, suggestEngineName } from '../engines/scan'
-import { generateApiKey, isLocalRequest } from '../auth'
+import { generateApiKey, hostGate, isLocalRequest } from '../auth'
 import { enabledFeatures } from '../features'
 import { isTerminalBackendAvailable } from '../terminal/terminal-routes'
 import {
@@ -34,12 +34,12 @@ import {
   tagFromManagedBinPath,
 } from '../engines/update'
 import type { BackendId } from '../engines/download'
-import { ensureMlxEnv, mlxSamplingArgs } from '../engines/mlx'
+import { ensureMlxEnv } from '../engines/mlx'
 import { ensureRapidMlxEnv } from '../engines/rapid-mlx'
 import { ensureMlxVlmEnv } from '../engines/mlx-vlm'
 import { ensureVllmEnv } from '../engines/vllm'
 import { ensureSglangEnv } from '../engines/sglang'
-import { ensureKoboldcpp, koboldcppBinPath, koboldcppDir, koboldcppProfileToArgs } from '../engines/koboldcpp'
+import { ensureKoboldcpp, koboldcppBinPath, koboldcppDir } from '../engines/koboldcpp'
 import { ensureLlamafile, llamafileBinPath, llamafileDir } from '../engines/llamafile'
 import { catalogForPlatform, catalogEngine } from '../engines/catalog'
 import { checkBuildPrereqs } from '../engines/build-prereqs'
@@ -49,10 +49,10 @@ import { detectHardware } from '../engines/hardware'
 import { recommendEngines } from '../engines/recommend'
 import { engineAcceptsFormat, engineRejectsAudioModel } from '../engines/compat'
 import { ScannerError, type ModelEntry } from '../models/scanner'
-import { estimateVram, type LoadProfile, profileToArgs, resolveProfile, vllmProfileToArgs } from '../models/profile'
+import { estimateVram, type LoadProfile, resolveProfile } from '../models/profile'
 import { amdApuOnly, getSysInfo, primaryVendor } from '../sysinfo/sysinfo'
 import { HfError, type HfSortOption } from '../hf/hf'
-import { DownloadError } from '../downloads/downloads'
+import type { EnqueueInput } from '../downloads/downloads'
 import { BenchError } from '../bench/bench'
 import { inferRepoFromPath } from './path-utils'
 import { validateLoadProfileFields, profilesEqual } from './profile-validate'
@@ -63,6 +63,9 @@ import { readSentLog } from '../telemetry/log'
 import { TELEMETRY_SCHEMA_VERSION } from '../telemetry/schema'
 import { classifyProvisionFailure } from '../telemetry/classify'
 import { registerOnboardingRoutes } from './onboarding-routes'
+import { startEngine, stopEngine, type EngineStartBody } from './engine-lifecycle'
+import { enqueueDownload, listDownloads, removeDownload } from './download-lifecycle'
+import { buildModelStatus } from './status-view'
 
 type Status = 200 | 201 | 202 | 400 | 401 | 403 | 404 | 409 | 500 | 501 | 503
 
@@ -81,42 +84,44 @@ async function body<T>(c: Context): Promise<T> {
 export function registerApi(app: Hono, d: Deps): void {
   // ---- meta ----
   app.get('/api/v1/status', (c) => {
+    // The engine/model/engineStats/liveGeneration block comes from the SHARED builder
+    // (status-view.ts) — the same one `GET /api/link/v1/status` re-exports, so a linked
+    // peer renders a host's numbers with the components it already uses for its own
+    // (ADR-376 §5.4). `parallelSlots` and the omit-vs-default rules live there now; only the
+    // strictly LOCAL-ONLY additions are made here.
+    //
+    // Both additions below exist here rather than in the shared builder for one reason: no
+    // host filesystem detail may cross the Turbo Link façade, so anything that can carry a
+    // path — an argv, or free-form engine output — is added on the local side. The façade
+    // would then have to CONSTRUCT the field to leak it, not merely forget to strip it.
+    //
+    //   - `launchCommand`: the engine's full argv — absolute binary path + absolute model path.
+    //   - `error` (ErrInfo): carries `logTail`, the engine's raw stderr. llama.cpp echoes the
+    //     model path, the mmproj path and its own binary path there as a matter of routine.
+    //
+    // `ms` is read here rather than threaded out of the builder because `Manager.status()` is
+    // a synchronous snapshot getter and this whole handler body is synchronous — the two reads
+    // cannot interleave, so they cannot disagree.
+    const core = buildModelStatus(d)
     const ms = d.manager.status()
-    const active = d.registry.active()
-    const engine: Record<string, unknown> = {
-      id: active?.id ?? '',
-      name: active?.name ?? '',
-      kind: active?.kind ?? '',
-      state: ms.state,
-      port: ms.port,
-      pid: ms.pid,
-    }
-    if (ms.err) engine.error = ms.err
-    const launchCommand = d.manager.launchCommand()
-    if (launchCommand) engine.launchCommand = launchCommand
     // How many generations this engine can serve at once (llama.cpp's `--parallel N`). Consumed
     // by `turbollm launch` to cap an agent CLI's own background-agent fan-out at what the engine
     // can actually run — see cli-launch.ts. Omitted, not defaulted to 1, when the engine
     // advertises no slot count: "unknown" and "exactly one" are different answers, and a client
     // must not read the former as the latter.
-    const parallelSlots = d.manager.parallelSlots()
-    if (parallelSlots !== null) engine.parallelSlots = parallelSlots
-    const model = ms.model
-      ? { key: ms.model.key, name: ms.model.name, quant: ms.model.quant, ctx: ms.model.ctx, vision: ms.model.vision, loadElapsedMs: ms.loadElapsedMs }
-      : null
-    // Live running-session stats (B4): only meaningful while the engine runs.
-    const engineStats = ms.state === 'running' ? d.manager.sessionStats() : null
-    // Live per-request progress for the engine card (prefill % / live token count).
-    const liveGeneration = ms.state === 'running' ? d.manager.liveGeneration() : null
+    const launchCommand = d.manager.launchCommand()
+    const engine: Record<string, unknown> = { ...core.engine }
+    if (ms.err) engine.error = ms.err
+    if (launchCommand) engine.launchCommand = launchCommand
     return c.json({
       version: d.version,
       engine,
-      model,
+      model: core.model,
       // Last model the user loaded (config-tracked) — lets `turbollm launch` auto-load the
       // true last-used model instead of guessing the first library entry (F-034).
       lastLoaded: d.store.snapshot().lastLoaded,
-      engineStats,
-      liveGeneration,
+      engineStats: core.engineStats,
+      liveGeneration: core.liveGeneration,
       // Auto-tune runner state (spec 09 §1): real progress while a sweep runs, then
       // a lingering done/error snapshot the detail dialog reads to show the result.
       bench: d.bench.status(),
@@ -1200,156 +1205,13 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   // ---- lifecycle (A2) ----
-  app.post('/api/v1/engine/start', async (c) => {
-    const b = await body<{
-      modelKey?: string
-      profileOverrides?: Partial<LoadProfile>
-      modelPath?: string
-      extraArgs?: string[]
-      modelName?: string
-    }>(c)
-    const active = d.registry.active()
-    if (!active) return err(c, 409, 'no_active_engine', 'Register and select an engine first.')
-    // ComfyUI guard: while ComfyUI is rendering it owns the GPU, so refuse to load a
-    // model (it would thrash/OOM VRAM). The guard reloads automatically once idle.
-    if (d.comfy?.isBlocked()) return err(c, 409, 'comfyui_busy', 'ComfyUI is rendering — model loading is paused until its queue finishes.')
-    // Kill switch: loading a model takes over the engine — cancel any auto-tune and abort
-    // in-flight chats, then wait for auto-tune to release the engine so the load can't race
-    // the runner's teardown.
-    d.bench.cancel()
-    abortAllInFlightChats()
-    await d.bench.waitIdle()
-    const cfg = d.store.snapshot()
-    const sys = getSysInfo()
+  // Both lifecycle handlers live in engine-lifecycle.ts, not here: the Turbo Link façade
+  // (/api/link/v1/models/load and /unload) mounts the SAME functions behind
+  // requireCapability, so a linked peer gets identical eviction / keep-N / ComfyUI-guard /
+  // swap-serialization behaviour instead of a second, drifting implementation.
+  app.post('/api/v1/engine/start', async (c) => startEngine(c, d, await body<EngineStartBody>(c)))
 
-    // Preferred (A4): start by modelKey with a resolved LoadProfile. An empty
-    // request (the Engines "Start" button) re-loads the last model.
-    let key = b.modelKey ?? ''
-    if (!key && !b.modelPath && cfg.lastLoaded.modelKey) key = cfg.lastLoaded.modelKey
-    const entry = key ? d.scanner.get(key) : undefined
-
-    if (entry) {
-      if (entry.incomplete || entry.parseError) {
-        return err(c, 409, 'model_not_loadable', 'This model is incomplete or unreadable.')
-      }
-      // Engine/model format must match (spec 03 §2b/2c): llama.cpp + forks load
-      // GGUF; MLX and vLLM load safetensors model directories.
-      if (!engineAcceptsFormat(active.kind, entry.format)) {
-        return err(c, 409, 'engine_model_mismatch', formatMismatchMessage(active.kind, entry.format))
-      }
-      if (entry.audio && engineRejectsAudioModel(active.kind)) {
-        const engineLabel = active.kind === 'mlx-vlm' ? 'MLX-VLM' : 'Rapid-MLX'
-        // Rapid-MLX: confirmed live, reproduced end to end (see engineRejectsAudioModel's
-        // docblock). MLX-VLM: same underlying mlx_vlm sanitizer bug, but excluded here
-        // precautionarily from reading the source, not a fresh live reproduction — say so
-        // rather than stating it as flatly settled. Either way, plain MLX (mlx-lm) never
-        // attempts VLM/audio loading, so it's a safe fallback recommendation for both.
-        const certainty = active.kind === 'mlx-vlm' ? 'is expected to fail' : 'fails'
-        return err(
-          c,
-          409,
-          'engine_model_mismatch',
-          `${engineLabel} cannot load models with an audio tower — the audio encoder ${certainty} due to an upstream mlx-vlm bug in the sanitizer for these architectures. Switch to the MLX engine instead.`,
-        )
-      }
-      let opts: StartOpts
-      if (entry.format !== 'gguf') {
-        // MLX / vLLM: the model dir is the launch target (no llama.cpp -ngl/ctx knobs).
-        // MLX honors sampling defaults; vLLM honors its own load controls (F-027,
-        // --max-model-len/--gpu-memory-utilization/--dtype/…) built via vllmProfileToArgs,
-        // plus the multi-GPU shard count (ADR-054) mapped to --tensor-parallel-size below.
-        const savedProfile = getModelProfile(cfg, entry.key, active.id) as Partial<LoadProfile> | undefined
-        // Resolved once regardless of engine kind (mlx's own arg-building doesn't need
-        // it, but `model_load` telemetry — spec 23 §3.3 — wants the same full-config
-        // shape for every engine, not just vLLM).
-        const profile = resolveProfile(entry, sys, savedProfile, b.profileOverrides, cfg.modelDefaults)
-        const extraArgs =
-          active.kind === 'mlx'
-            ? mlxSamplingArgs(savedProfile?.sampling)
-            : active.kind === 'vllm'
-              ? vllmProfileToArgs(profile, entry.nativeCtx)
-              : []
-        opts = {
-          engine: active,
-          model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: entry.nativeCtx, vision: entry.vision },
-          modelPath: entry.path,
-          extraArgs,
-          tensorParallelSize: savedProfile?.gpu?.tensorParallelSize,
-          preferredPort: savedProfile?.port,
-          profile,
-          trigger: 'manual',
-        }
-      } else {
-        const saved = getModelProfile(cfg, entry.key, active.id) as Partial<LoadProfile> | undefined
-        const profile = resolveProfile(entry, sys, saved, b.profileOverrides, cfg.modelDefaults)
-        // KoboldCpp is a GGUF engine with its OWN flag names — build its arg-map instead of
-        // the llama-server profileToArgs. llamafile IS llama.cpp's server, so it keeps the
-        // full profileToArgs flags (the manager only prepends --server --no-webui for it).
-        const extraArgs =
-          active.kind === 'koboldcpp'
-            ? koboldcppProfileToArgs(profile, primaryVendor(sys), sys.gpus.length > 0)
-            : profileToArgs(profile, entry, active.capabilities, sys.cores, sys, active.binPath)
-        opts = {
-          engine: active,
-          model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: profile.ctx, vision: entry.vision },
-          modelPath: entry.path,
-          extraArgs,
-          preferredPort: profile.port,
-          profile,
-          trigger: 'manual',
-        }
-      }
-      // Single chokepoint (rule 3): load() stops the current model, runs the reverse
-      // gate (F-011: ask ComfyUI to free VRAM first), spawns, and waits for readiness —
-      // all under the global load lock so this can't race another load. Fire-and-forget:
-      // the UI polls /status for the starting→running/error transition, so we return 202
-      // immediately rather than blocking the HTTP request on a multi-second load.
-      //
-      // Wrapped in the router's own swap-serialization queue (same one route()/doLoad() use)
-      // so a concurrent auto-swap request (e.g. a terminal-agent session's own gateway
-      // traffic) can't independently decide "the primary is occupied mid-switch, evict it and
-      // load MY model instead" — it now waits for this manual switch to fully settle first.
-      // Without this, the two paths only shared the lower-level Manager.runExclusive gate,
-      // which prevents a double-SPAWN but not a second caller silently overriding which model
-      // ends up loaded — the model-router.ts withSwapLock doc comment has the full trace.
-      void d.modelRouter
-        .withSwapLock(() => d.manager.load(opts, { beforeStart: () => d.comfy?.freeComfyUIBeforeLoad() ?? Promise.resolve() }))
-        .then(() => d.modelRouter.markPrimaryLoaded())
-        .catch((e) => console.warn(`engine load failed: ${e}`))
-      d.store.update((x) => {
-        x.lastLoaded = { modelKey: entry.key, engineId: active.id }
-      })
-      return c.json({ ok: true }, 202)
-    }
-
-    // Transitional fallback: explicit path or migrated devModel (pre-A4 configs).
-    let modelPath = b.modelPath ?? ''
-    let extra = b.extraArgs ?? []
-    let name = b.modelName ?? ''
-    if (!modelPath && cfg.devModel) {
-      modelPath = cfg.devModel.modelPath
-      extra = cfg.devModel.extraArgs
-      name = cfg.devModel.label
-    }
-    if (!modelPath) return err(c, 409, 'no_such_model', 'No model specified. Pick one from the Models screen.')
-    const opts: StartOpts = { engine: active, model: deriveModel(modelPath, name, extra), modelPath, extraArgs: extra }
-    // Same single-chokepoint, fire-and-forget, swap-lock-coordinated load as the
-    // resolved-model branch above.
-    void d.modelRouter
-      .withSwapLock(() => d.manager.load(opts, { beforeStart: () => d.comfy?.freeComfyUIBeforeLoad() ?? Promise.resolve() }))
-      .then(() => d.modelRouter.markPrimaryLoaded())
-      .catch((e) => console.warn(`engine load failed: ${e}`))
-    return c.json({ ok: true }, 202)
-  })
-
-  app.post('/api/v1/engine/stop', (c) => {
-    // Kill switch: stopping the engine cancels auto-tune and aborts in-flight chats too —
-    // they all depend on the engine that's going away.
-    d.bench.cancel()
-    abortAllInFlightChats()
-    d.manager.stop()
-    return c.json({ ok: true }, 202)
-  })
+  app.post('/api/v1/engine/stop', (c) => stopEngine(c, d))
 
   app.post('/api/v1/engine/restart', (c) => {
     // Kill switch: cancel auto-tune + abort chats, wait for the runner to release the engine,
@@ -1628,6 +1490,7 @@ export function registerApi(app: Hono, d: Deps): void {
       idleTtlMinutes?: number
       port?: number
       theme?: string
+      machineName?: string
       autoGenerateTitles?: boolean
       autoMemoryEnabled?: boolean
       openBrowserOnStart?: boolean
@@ -1647,7 +1510,7 @@ export function registerApi(app: Hono, d: Deps): void {
       toolPolicies?: Record<string, string>
       autoAllowAll?: boolean
       cloudDeploy?: { runpodTemplateId?: string }
-      experimental?: { memory?: boolean; cloudDeploy?: boolean; routines?: boolean }
+      experimental?: { memory?: boolean; cloudDeploy?: boolean; routines?: boolean; turboLink?: boolean }
     }>(c)
 
     const updates: Record<string, unknown> = {}
@@ -1666,9 +1529,16 @@ export function registerApi(app: Hono, d: Deps): void {
       updates.port = v
     }
     if (b.theme !== undefined) {
-      if (!['system', 'light', 'dark'].includes(b.theme)) return err(c, 400, 'invalid_config_value', 'theme must be system, light, or dark.')
+      // Enum shared with the Turbo Link config scope (config-bounds.ts) so the remote gate
+      // can never drift wider than this one.
+      if (!isConfigTheme(b.theme)) return err(c, 400, 'invalid_config_value', 'theme must be system, light, or dark.')
       updates.theme = b.theme
     }
+    // Turbo Link machine name (ADR-376): what a linked peer displays for this box. '' is a
+    // legal value meaning "fall back to the OS hostname" (link-routes.ts resolves it), so
+    // this is a clear, not an error. Capped so a peer's list can't be defaced by a
+    // kilobyte-long name.
+    if (b.machineName !== undefined) updates.machineName = String(b.machineName).trim().slice(0, 64)
     if (b.autoGenerateTitles !== undefined) updates.autoGenerateTitles = !!b.autoGenerateTitles
     if (b.autoMemoryEnabled !== undefined) updates.autoMemoryEnabled = !!b.autoMemoryEnabled
     if (b.openBrowserOnStart !== undefined) updates.openBrowserOnStart = !!b.openBrowserOnStart
@@ -1706,25 +1576,16 @@ export function registerApi(app: Hono, d: Deps): void {
     const md = b.modelDefaults
     const mdUpdates: { ctx?: number; ngl?: number; imageMaxTokens?: number; maxTokens?: number } = {}
     if (md) {
-      if (md.ctx !== undefined) {
-        const v = Number(md.ctx)
-        if (!Number.isFinite(v) || v < 256) return err(c, 400, 'invalid_config_value', 'modelDefaults.ctx must be at least 256.')
-        mdUpdates.ctx = Math.floor(v)
-      }
-      if (md.ngl !== undefined) {
-        const v = Number(md.ngl)
-        if (!Number.isFinite(v) || v < 0 || v > 99) return err(c, 400, 'invalid_config_value', 'modelDefaults.ngl must be 0–99.')
-        mdUpdates.ngl = Math.floor(v)
-      }
-      if (md.imageMaxTokens !== undefined) {
-        const v = Number(md.imageMaxTokens)
-        if (!Number.isFinite(v) || v < 0) return err(c, 400, 'invalid_config_value', 'modelDefaults.imageMaxTokens must be a non-negative number.')
-        mdUpdates.imageMaxTokens = Math.floor(v)
-      }
-      if (md.maxTokens !== undefined) {
-        const v = Number(md.maxTokens)
-        if (!Number.isFinite(v) || v < 0) return err(c, 400, 'invalid_config_value', 'modelDefaults.maxTokens must be a non-negative number (0 = unlimited).')
-        mdUpdates.maxTokens = Math.floor(v)
+      // Bounds + messages come from config-bounds.ts, which the Turbo Link config scope
+      // reads too. Task 3's review found the remote gate had drifted WIDER than this route
+      // (it accepted ctx < 256 and ngl = -1, neither of which config.validate() catches, so
+      // the value persisted). One table is what stops that recurring — a bound changed here
+      // moves the remote gate with it.
+      for (const f of ['ctx', 'ngl', 'imageMaxTokens', 'maxTokens'] as const) {
+        if (md[f] === undefined) continue
+        const v = coerceBounded(`modelDefaults.${f}`, md[f])
+        if (v === null) return err(c, 400, 'invalid_config_value', CONFIG_BOUNDS[`modelDefaults.${f}`].message)
+        mdUpdates[f] = v
       }
     }
 
@@ -1751,8 +1612,8 @@ export function registerApi(app: Hono, d: Deps): void {
     const gwUpdates: { autoSwap?: boolean; keepN?: number } = {}
     if (b.gateway?.autoSwap !== undefined) gwUpdates.autoSwap = !!b.gateway.autoSwap
     if (b.gateway?.keepN !== undefined) {
-      const v = Number(b.gateway.keepN)
-      if (!Number.isInteger(v) || v < 1 || v > 4) return err(c, 400, 'invalid_config_value', 'gateway.keepN must be 1–4.')
+      const v = coerceBounded('gateway.keepN', b.gateway.keepN)
+      if (v === null) return err(c, 400, 'invalid_config_value', CONFIG_BOUNDS['gateway.keepN'].message)
       gwUpdates.keepN = v
     }
 
@@ -1853,6 +1714,7 @@ export function registerApi(app: Hono, d: Deps): void {
       if (b.experimental?.memory !== undefined) cfg.daemon.experimental.memory = !!b.experimental.memory
       if (b.experimental?.cloudDeploy !== undefined) cfg.daemon.experimental.cloudDeploy = !!b.experimental.cloudDeploy
       if (b.experimental?.routines !== undefined) cfg.daemon.experimental.routines = !!b.experimental.routines
+      if (b.experimental?.turboLink !== undefined) cfg.daemon.experimental.turboLink = !!b.experimental.turboLink
       // HF token (spec 10 §4): write-only. An explicit '' clears it. Never logged.
       if (b.hfToken !== undefined) cfg.hf.token = String(b.hfToken).trim()
       // Search provider config (F-020). All key/URL fields are write-only; '' clears them.
@@ -2187,19 +2049,18 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   // ── Downloads (spec 10 §5–6, §8) ──────────────────────────────────────────
-  app.get('/api/v1/downloads', (c) => c.json({ downloads: d.downloads.list() }))
+  // list/enqueue/remove go through download-lifecycle.ts — the same functions the Turbo
+  // Link façade mounts, so the DownloadError → status table has exactly one definition.
+  app.get('/api/v1/downloads', (c) => c.json({ downloads: listDownloads(d) }))
 
   // Enqueue from an HF repo file {repo, rfilename} OR a raw URL {url}. 202.
   app.post('/api/v1/downloads', async (c) => {
-    const b = await body<{ repo?: string; rfilename?: string; url?: string; size?: number; sha256?: string; subdir?: string; excludeMmproj?: boolean }>(c)
-    try {
-      // One request may fan out into several files (split shards + a shared mmproj) —
-      // return every record created so the UI reflects the full queued set.
-      const recs = await d.downloads.enqueue(b)
-      return c.json({ downloads: recs }, 202)
-    } catch (e) {
-      return dlErr(c, e)
-    }
+    const b = await body<EnqueueInput>(c)
+    // One request may fan out into several files (split shards + a shared mmproj) —
+    // return every record created so the UI reflects the full queued set.
+    const out = await enqueueDownload(d, b)
+    if (!out.ok) return err(c, out.status, out.code, out.message)
+    return c.json({ downloads: out.downloads }, 202)
   })
 
   app.post('/api/v1/downloads/:id/cancel', (c) => {
@@ -2215,22 +2076,17 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   app.delete('/api/v1/downloads/:id', (c) => {
-    const ok = d.downloads.remove(c.req.param('id'))
-    if (!ok) return err(c, 404, 'no_such_download', 'No download with that id.')
+    const out = removeDownload(d, c.req.param('id'))
+    if (!out.ok) return err(c, out.status, out.code, out.message)
     return c.json({ ok: true })
   })
 
   // ── API keys (spec 06 §5) ────────────────────────────────────────────────
-  // Host-only while the LAN is open and unauthenticated (lanBind on, requireApiKey off):
-  // lanAuth's bypassesAuth deliberately lets that combination through with NO credential at
-  // all (spec 06 §5's "opted into open LAN access"), which is fine for chat/models but would
-  // let any device that can merely load the page list key names or mint itself a durable
-  // `tllm-...` key with zero credential — a real self-escalation (that key keeps working even
-  // after requireApiKey is later turned on), not just an info leak. Once requireApiKey IS on,
-  // a non-host caller only reaches this handler at all by already having presented a valid key
-  // (lanAuth ran first), so self-service key management from another device is fine then.
+  // Host-only while the LAN is open and unauthenticated — see auth.ts's `hostGate` for the
+  // full rationale. It lives there, not here, so Turbo Link's credential routes
+  // (link-admin-routes.ts) share the one predicate instead of re-deriving it (ADR-376).
   function keysHostGate(c: Context): boolean {
-    return isLocalRequest(c, d) || d.store.snapshot().daemon.requireApiKey
+    return hostGate(c, d)
   }
 
   app.get('/api/v1/keys', (c) => {
@@ -2380,22 +2236,6 @@ function overlayModel(e: ModelEntry, d: Deps, lastTpsMap?: Map<string, number>) 
 
 // ---- helpers ----
 
-/** User-facing message when the active engine can't load a model's format (ADR-044). */
-function formatMismatchMessage(engineKind: string, format: 'gguf' | 'mlx'): string {
-  if (engineKind === 'mlx')
-    return 'The active engine is MLX — pick a safetensors model, or switch to a llama.cpp engine for GGUF.'
-  if (engineKind === 'rapid-mlx')
-    return 'The active engine is Rapid-MLX — pick a safetensors model, or switch to a llama.cpp engine for GGUF.'
-  if (engineKind === 'mlx-vlm')
-    return 'The active engine is MLX-VLM — pick a safetensors model, or switch to a llama.cpp engine for GGUF.'
-  if (engineKind === 'vllm')
-    return 'The active engine is vLLM — pick a safetensors / HF model, or switch to a llama.cpp engine for GGUF.'
-  // llama.cpp / fork active, model is a safetensors dir.
-  return format === 'mlx'
-    ? 'This is a safetensors model — activate an MLX or vLLM engine to load it.'
-    : 'The active engine can only load GGUF models.'
-}
-
 /** The /modeldirs response: the configured folders plus the EFFECTIVE primary
  *  (spec 01 §3, ADR-035) — the configured primary when it's still a valid dir,
  *  otherwise the first folder. Empty string when no folders are configured. */
@@ -2417,6 +2257,10 @@ function settingsPayload(d: Deps) {
     idleTtlMinutes: cfg.daemon.idleTtlMinutes,
     port: cfg.daemon.port,
     theme: cfg.daemon.theme,
+    // Turbo Link (ADR-376): what this box calls itself to a linked peer. Echoed raw —
+    // '' means "not set", and link-routes.ts resolves that to the OS hostname at
+    // handshake time. Not a secret.
+    machineName: cfg.daemon.machineName ?? '',
     autoGenerateTitles: cfg.daemon.autoGenerateTitles,
     autoMemoryEnabled: cfg.daemon.autoMemoryEnabled,
     openBrowserOnStart: cfg.daemon.openBrowserOnStart,
@@ -2598,15 +2442,6 @@ function hfErr(c: Context, e: unknown) {
   return err(c, 500, 'internal', (e as Error).message)
 }
 
-function dlErr(c: Context, e: unknown) {
-  if (e instanceof DownloadError) {
-    const status: Status =
-      e.code === 'no_model_dir' ? 409 : e.code === 'hf_unauthorized' ? 401 : e.code === 'hf_gated' ? 403 : 400
-    return err(c, status, e.code, e.message)
-  }
-  return err(c, 500, 'internal', (e as Error).message)
-}
-
 function benchError(c: Context, e: unknown) {
   if (e instanceof BenchError) {
     const status: Status =
@@ -2711,18 +2546,6 @@ function engineInstallDir(eng: Engine, enginesRoot: string): string | null {
     return inside(d) ? d : null
   }
   return null
-}
-
-function deriveModel(modelPath: string, name: string, extraArgs: string[]): ModelInfo {
-  let ctx = 0
-  for (let i = 0; i + 1 < extraArgs.length; i++) {
-    if (extraArgs[i] === '-c' || extraArgs[i] === '--ctx-size') ctx = Number(extraArgs[i + 1]) || 0
-  }
-  return { key: modelPath, name: name || cleanModelName(modelPath), quant: '', ctx, vision: false }
-}
-
-function cleanModelName(p: string): string {
-  return basename(p).replace(/\.gguf$/i, '')
 }
 
 function readTail(path: string, n: number): string[] {

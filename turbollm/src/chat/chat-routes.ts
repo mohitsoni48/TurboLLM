@@ -4,7 +4,6 @@ import { streamSSE } from 'hono/streaming'
 import { networkInterfaces } from 'node:os'
 import type { Deps } from '../deps'
 import { clampMaxTokens } from '../config/config'
-import { engineModelAlias } from '../engines/compat'
 import { feedChunk, flushState, initParseState } from './parser'
 import { needsExtraPass } from './think-utils'
 import { parseReasoningEffort, type ReasoningEffort } from './reasoning-effort'
@@ -28,6 +27,8 @@ import { resolveProfile, type LoadProfile } from '../models/profile'
 import type { ModelInfo } from '../engines/manager'
 import { getModelProfile } from '../config/config'
 import { getSysInfo } from '../sysinfo/sysinfo'
+import { noteLocalActivity } from '../link/host-idle'
+import { callChatUpstream, resolveChatUpstream, type ChatUpstream } from './chat-upstream'
 
 /** The per-request code-routine trust decision. Exported ONLY so it can be behaviourally
  *  pinned — both generation entry points must call this, never inline the expression.
@@ -58,7 +59,9 @@ export function abortAllInFlightChats(): number {
   return n
 }
 
-type S = 200 | 201 | 202 | 400 | 404 | 409 | 500
+// 503 joined the set with Turbo Link: a linked machine that is offline, or no longer
+// advertising the model, is a REMOTE availability failure, not a local 409.
+type S = 200 | 201 | 202 | 400 | 404 | 409 | 500 | 503
 function err(c: Context, s: S, code: string, msg: string) { return c.json({ error: { code, message: msg } }, s) }
 async function body<T>(c: Context): Promise<T> { try { return await c.req.json() as T } catch { return {} as T } }
 
@@ -267,7 +270,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
   app.post('/api/v1/conversations/:id/messages', async (c) => {
     const convId = c.req.param('id')
-    const b = await body<{ content?: string; images?: string[]; docContext?: string; textAttachments?: string[]; thinkingBudget?: number; reasoningEffort?: string }>(c)
+    const b = await body<{ content?: string; images?: string[]; docContext?: string; textAttachments?: string[]; thinkingBudget?: number; reasoningEffort?: string; model?: string }>(c)
     const content = (b.content ?? '').trim()
     const images = b.images ?? []
     const textAttachments = b.textAttachments ?? []
@@ -279,10 +282,14 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const conv = db.getConversation(convId, true)
     if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
 
-    const ms = d.manager.status()
-    if (ms.state !== 'running' || !ms.model) return err(c, 409, 'model_not_loaded', 'Load a model first.')
-    const target = d.manager.target()
-    if (!target) return err(c, 409, 'model_not_loaded', 'Engine not running.')
+    // Turbo Link (final-review C-1): `b.model` is the id the picker sent. A qualified
+    // `<machine>/<model>` id that names a linked machine resolves to that HOST — the local
+    // engine is not consulted, not loaded, and not required to be running. Anything else
+    // (including a local key that happens to contain a slash) takes the unchanged local
+    // path, which is what these same two checks did inline before.
+    const resolved = resolveChatUpstream(d, b.model)
+    if (!resolved.ok) return err(c, resolved.status, resolved.code, resolved.message)
+    const upstream = resolved.upstream
 
     if (inflight.has(convId)) return err(c, 409, 'generation_in_flight', 'A generation is already running for this conversation.')
 
@@ -336,7 +343,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
         : fullContent
       engineMessages.push({ role: 'user', content: userContent })
 
-      await runGeneration(d, sseSink(stream), { convId, conv, engineMessages, assistantMsg, ms, target, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), userText: content, isCodeAuthorized })
+      await runGeneration(d, sseSink(stream), { convId, conv, engineMessages, assistantMsg, upstream, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), userText: content, isCodeAuthorized })
     })
   })
 
@@ -345,15 +352,15 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
   app.post('/api/v1/conversations/:id/continue', async (c) => {
     const convId = c.req.param('id')
-    const b = await body<{ thinkingBudget?: number; reasoningEffort?: string }>(c)
+    const b = await body<{ thinkingBudget?: number; reasoningEffort?: string; model?: string }>(c)
 
     const conv = db.getConversation(convId, true)
     if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
 
-    const ms = d.manager.status()
-    if (ms.state !== 'running' || !ms.model) return err(c, 409, 'model_not_loaded', 'Load a model first.')
-    const target = d.manager.target()
-    if (!target) return err(c, 409, 'model_not_loaded', 'Engine not running.')
+    // Same remote-or-local resolution as the /messages route above (C-1).
+    const resolved = resolveChatUpstream(d, b.model)
+    if (!resolved.ok) return err(c, resolved.status, resolved.code, resolved.message)
+    const upstream = resolved.upstream
 
     if (inflight.has(convId)) return err(c, 409, 'generation_in_flight', 'A generation is already running for this conversation.')
 
@@ -402,7 +409,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
         engineMessages.push({ role: m.role, content })
       }
 
-      await runGeneration(d, sseSink(stream), { convId, conv, engineMessages, assistantMsg, ms, target, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), isCodeAuthorized })
+      await runGeneration(d, sseSink(stream), { convId, conv, engineMessages, assistantMsg, upstream, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), isCodeAuthorized })
     })
   })
 
@@ -692,15 +699,16 @@ function getLanIpForShare(): string {
 
 // ── shared generation streaming ───────────────────────────────────────────────
 
-type ManagerStatus = ReturnType<Deps['manager']['status']>
 
 interface GenerationCtx {
   convId: string
   conv: NonNullable<ReturnType<Deps['db']['getConversation']>>
   engineMessages: { role: string; content: unknown }[]
   assistantMsg: NonNullable<ReturnType<Deps['db']['getLastMessage']>>
-  ms: ManagerStatus
-  target: string
+  /** Where this turn generates — the local engine, or a linked host (chat-upstream.ts).
+   *  `upstream.remote` is the single test for "another machine did the work", which every
+   *  local ledger below branches on. */
+  upstream: ChatUpstream
   ac: AbortController
   /** Reasoning token budget for this turn: -1 = unlimited (default), 0 = thinking off
    *  entirely, N>0 = a real sampler-enforced cap. Sent to the engine as
@@ -779,7 +787,13 @@ function reportChatBenchResult(d: Deps, ms: ModelInfo, stats: Partial<MessageSta
 
 async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promise<void> {
   const { db } = d
-  const { convId, conv, assistantMsg, ms, target, ac, thinkingBudget, reasoningEffort } = ctx
+  const { convId, conv, assistantMsg, upstream, ac, thinkingBudget, reasoningEffort } = ctx
+  // A remote turn ran on ANOTHER machine: nothing below may write its numbers into this
+  // one's engine state. Same rule the gateway's own remote branch follows (I-4) — the
+  // peer's engine card must not read "Generating…" for work its engine is not doing, and
+  // `hostIdleState` reads sessionStats().activeRequests, so a false busy here would block a
+  // third machine's legitimate wake.
+  const localAccounting = !upstream.remote
 
   // Map conversation sampling overrides (camelCase) to the engine's snake_case names.
   const convS = conv.sampling ?? {}
@@ -900,7 +914,13 @@ async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promi
   let engineFailed = false
   let liveOut = 0
 
-  d.manager.generationStart()
+  // In-app chat is the owner using their own machine — the signal Turbo Link's wake
+  // gate reads to refuse a peer's model swap (link/host-idle.ts). The gateway records
+  // the terminal-agent paths; this is the only local path that never goes through it.
+  // Still local activity even for a remote turn: the OWNER of this machine is at the
+  // keyboard, which is exactly what the wake ledger records.
+  noteLocalActivity()
+  if (localAccounting) d.manager.generationStart()
   try {
     // Get tool definitions once (or empty for engines that don't support tools)
     const baseToolDefs = d.tools ? await d.tools.buildToolDefinitions() : []
@@ -938,7 +958,7 @@ async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promi
       toolIter++
 
       const reqBody: Record<string, unknown> = {
-        model: engineModelAlias(d.registry.active()?.kind ?? '', d.manager.currentOpts()?.modelPath) ?? ms.model!.key,
+        model: upstream.modelField,
         messages: iterMessages,
         stream: true,
         stream_options: { include_usage: true },
@@ -1001,13 +1021,7 @@ async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promi
         reqBody.tool_choice = { type: 'function', function: { name: 'web_search' } }
       }
 
-      const res = await fetch(`${target}/v1/chat/completions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(reqBody),
-        signal: ac.signal,
-        duplex: 'half',
-      })
+      const res = await callChatUpstream(upstream, reqBody, ac.signal)
 
       if (!res.ok || !res.body) {
         await emit({ event: 'error', data: { code: 'engine_error', message: `Engine returned ${res.status}` } })
@@ -1054,7 +1068,7 @@ async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promi
           const pp = chunk.prompt_progress as { processed?: number; total?: number; tps?: number } | undefined
           if (pp && pp.total) {
             const pct = Math.round((pp.processed ?? 0) / pp.total * 100)
-            d.manager.setLiveGen({ phase: 'prompt', pct, outputTokens: 0 })
+            if (localAccounting) d.manager.setLiveGen({ phase: 'prompt', pct, outputTokens: 0 })
             await emit({ event: 'progress', data: { phase: 'prompt', processed: pp.processed, total: pp.total, pct, tps: pp.tps ?? 0 } })
             continue
           }
@@ -1117,7 +1131,8 @@ async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promi
               fullContent += ev.text
               roundContent += ev.text
               if (!ttftMs) ttftMs = Date.now() - requestStart
-              d.manager.setLiveGen({ phase: 'gen', pct: 0, outputTokens: ++liveOut })
+              liveOut++
+              if (localAccounting) d.manager.setLiveGen({ phase: 'gen', pct: 0, outputTokens: liveOut })
               await emit({ event: 'delta', data: { delta: ev.text } })
             }
           }
@@ -1291,7 +1306,7 @@ async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promi
       console.log('[chat] BUG-001: final content is empty after stripping think blocks — making extra pass with tool_choice:none')
       iterMessages.push({ role: 'user', content: 'Please now write your final answer based on what you found.' })
       const reqBody: Record<string, unknown> = {
-        model: engineModelAlias(d.registry.active()?.kind ?? '', d.manager.currentOpts()?.modelPath) ?? ms.model!.key,
+        model: upstream.modelField,
         messages: iterMessages,
         stream: true,
         stream_options: { include_usage: true },
@@ -1330,13 +1345,7 @@ async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promi
       }
       if (Object.keys(templateKwargs).length) reqBody.chat_template_kwargs = templateKwargs
 
-      const res = await fetch(`${target}/v1/chat/completions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(reqBody),
-        signal: ac.signal,
-        duplex: 'half',
-      })
+      const res = await callChatUpstream(upstream, reqBody, ac.signal)
 
       if (res.ok && res.body) {
         const reader = res.body.getReader()
@@ -1384,7 +1393,8 @@ async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promi
               } else {
                 fullContent += ev.text
                 if (!ttftMs) ttftMs = Date.now() - requestStart
-                d.manager.setLiveGen({ phase: 'gen', pct: 0, outputTokens: ++liveOut })
+                liveOut++
+                if (localAccounting) d.manager.setLiveGen({ phase: 'gen', pct: 0, outputTokens: liveOut })
                 await emit({ event: 'delta', data: { delta: ev.text } })
               }
             }
@@ -1410,13 +1420,13 @@ async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promi
       await emit({ event: 'error', data: { code: 'engine_stopped', message: (e as Error).message } })
     }
   } finally {
-    d.manager.generationEnd()
+    if (localAccounting) d.manager.generationEnd()
     inflight.delete(convId)
   }
 
   const totalMs = Date.now() - requestStart
   const thinkMs = thinkStart && thinkEnd ? thinkEnd - thinkStart : 0
-  const ctxMax = ms.model?.ctx ?? 4096
+  const ctxMax = upstream.ctxMax
 
   // An aborted stream (Stop clicked, or the client disconnected mid-generation) can be cut off
   // before the engine's final usage/timings chunk ever arrives, leaving completion_tokens at its
@@ -1436,7 +1446,7 @@ async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promi
     // window (they're skipped only for recomputation), so they must stay counted here.
     ctxUsed: (finalUsage.prompt_tokens ?? 0) + genTokensFallback,
     ctxMax,
-    model: ms.model?.name ?? '',
+    model: upstream.modelName,
     aborted,
   }
   const fullPrompt = finalUsage.prompt_tokens ?? 0
@@ -1479,16 +1489,22 @@ async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promi
 
   db.updateMessage(assistantMsg.id, { content: fullContent, reasoning: fullReasoning, toolCalls: allToolCalls, stats, researchMeta })
   db.touchConversation(convId)
-  if (!aborted && !engineFailed && ms.model) reportChatBenchResult(d, ms.model, stats)
-
-  try {
-    d.manager.recordCompletion({
-      inputTokens: stats.promptTokens,
-      outputTokens: stats.genTokens,
-      promptTps: stats.promptTps,
-      genTps: stats.tps,
-    })
-  } catch { /* swallow — stats are best-effort */ }
+  // Both are LOCAL measurements of LOCAL hardware. A remote turn's t/s describes the
+  // HOST's GPU: reporting it as a bench_result for this machine's config would poison the
+  // fleet-wide bench corpus, and folding it into this manager's session averages is the
+  // very contamination I-4 closed on the gateway path.
+  if (localAccounting) {
+    const loaded = d.manager.status().model
+    if (!aborted && !engineFailed && loaded) reportChatBenchResult(d, loaded, stats)
+    try {
+      d.manager.recordCompletion({
+        inputTokens: stats.promptTokens,
+        outputTokens: stats.genTokens,
+        promptTps: stats.promptTps,
+        genTps: stats.tps,
+      })
+    } catch { /* swallow — stats are best-effort */ }
+  }
 
   const finalMsg = db.getMessage(assistantMsg.id)!
   // The client may have already disconnected (cancelled turn / closed tab); writing to a
@@ -1500,7 +1516,7 @@ async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promi
   } catch { /* client gone — nothing to flush to */ }
 
   if (!aborted && conv.title === 'New chat' && d.store.snapshot().daemon.autoGenerateTitles) {
-    setTimeout(() => { void autoTitle(d, convId, ctx.engineMessages, fullContent, target) }, 1000)
+    setTimeout(() => { void autoTitle(d, convId, ctx.engineMessages, fullContent, upstream) }, 1000)
   }
 
   // Release 3, auto-memory: extract durable facts from the just-typed user text (never
@@ -1514,7 +1530,7 @@ async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promi
   // hide its settings UI while extraction keeps running underneath.
   const daemonCfg = d.store.snapshot().daemon
   if (!aborted && ctx.userText && daemonCfg.experimental.memory && daemonCfg.autoMemoryEnabled) {
-    setTimeout(() => { void extractMemoryFacts(d, convId, ctx.userText!, target) }, 1500)
+    setTimeout(() => { void extractMemoryFacts(d, convId, ctx.userText!, upstream) }, 1500)
   }
 }
 
@@ -1536,11 +1552,13 @@ async function autoTitle(
   convId: string,
   prevMessages: { role: string; content: unknown }[],
   assistantReply: string,
-  target: string,
+  upstream: ChatUpstream,
 ): Promise<void> {
   try {
-    const ms = d.manager.status()
-    if (ms.state !== 'running') return
+    // The local-engine guard is exactly that — local. A remote turn's title is generated on
+    // the host, which has its own model up; this machine's engine may legitimately be
+    // stopped, and returning here would leave every remote conversation called "New chat".
+    if (!upstream.remote && d.manager.status().state !== 'running') return
     const titleMessages = [
       ...recentTitleTurns(prevMessages),
       { role: 'assistant', content: assistantReply.slice(0, 500) },
@@ -1554,23 +1572,20 @@ async function autoTitle(
     // Title generation is a LOW-PRIORITY afterthought — acquire the engine gate at 'bg' so
     // any foreground chat or agent run preempts it (it never blocks real work), and release
     // as soon as the small call returns.
-    const release = d.gate ? await d.gate.acquire('bg') : null
+    // The local engine's slot queue is for local work — a remote title costs this machine
+    // nothing but a socket (final-review I-3, same rule as the gateway).
+    const release = d.gate && !upstream.remote ? await d.gate.acquire('bg') : null
     let res: Response
     try {
-      res = await fetch(`${target}/v1/chat/completions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: engineModelAlias(d.registry.active()?.kind ?? '', d.manager.currentOpts()?.modelPath) ?? ms.model?.key,
-          messages: titleMessages,
-          stream: false,
-          temperature: 0.3,
-          max_tokens: 32,
-          thinking_budget_tokens: 0,
-          chat_template_kwargs: { enable_thinking: false },
-        }),
-        signal: AbortSignal.timeout(20_000),
-      })
+      res = await callChatUpstream(upstream, {
+        model: upstream.modelField,
+        messages: titleMessages,
+        stream: false,
+        temperature: 0.3,
+        max_tokens: 32,
+        thinking_budget_tokens: 0,
+        chat_template_kwargs: { enable_thinking: false },
+      }, AbortSignal.timeout(20_000))
     } finally {
       release?.()
     }
@@ -1598,10 +1613,12 @@ async function autoTitle(
 export async function autoTitleFromConversation(d: Deps, convId: string): Promise<void> {
   const conv = d.db.getConversation(convId, true)
   if (!conv || conv.title !== 'New chat' || !d.store.snapshot().daemon.autoGenerateTitles) return
-  const target = d.manager.target()
-  if (!target) return
+  // Agent runs are always local — they execute on this machine's own filesystem — so this
+  // resolves the local engine, exactly as the `d.manager.target()` call it replaces did.
+  const resolved = resolveChatUpstream(d)
+  if (!resolved.ok) return
   const msgs = (conv.messages ?? []).filter((m) => m.content).map((m) => ({ role: m.role, content: m.content }))
   if (!msgs.length) return
   const lastAssistant = [...msgs].reverse().find((m) => m.role === 'assistant')
-  await autoTitle(d, convId, msgs.slice(0, -1), typeof lastAssistant?.content === 'string' ? lastAssistant.content : '', target)
+  await autoTitle(d, convId, msgs.slice(0, -1), typeof lastAssistant?.content === 'string' ? lastAssistant.content : '', resolved.upstream)
 }

@@ -9,6 +9,9 @@ import type { ToolCallRecord } from '../chat/db'
 import { clampMaxTokens } from '../config/config'
 import { engineModelAlias } from '../engines/compat'
 import { presentedKey } from '../auth'
+import { noteLocalActivity } from '../link/host-idle'
+import { linkHeaders, proxyStream } from '../link/link-proxy'
+import { formatRemoteId } from '../link/model-id'
 import { sessionAuth } from '../code/session-auth'
 import { classifyHarness } from '../telemetry/classify'
 import { mapToOpenAI, mapFromOpenAI, streamToAnthropic, messageStartEvent, pingWhilePending, DEFAULT_PING_INTERVAL_MS, type AnthropicRequest, type StreamToolCall } from './anthropic'
@@ -136,6 +139,9 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
   // ── POST /v1/messages — Anthropic translation (spec 06 §2) ───────────────
 
   app.post('/v1/messages', async (c) => {
+    // The owner's own terminal agent. Turbo Link's façade never reaches this route, so
+    // everything arriving here is by definition local (host-idle.ts).
+    noteLocalActivity()
     // Parse body first — needed to extract model for auto-swap (v0.6.0) and
     // to validate max_tokens before potentially waiting for a model swap.
     let req: AnthropicRequest
@@ -226,9 +232,18 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
       )
     }
     const target = routeResult.target
+    /** Turbo Link (ADR-376): set only when the caller asked for `<machine>/<model>` and the
+     *  router resolved it to an online linked host. Everything below stays structurally
+     *  identical — only the URL, the headers and the outbound model id differ. */
+    const remote = routeResult.remote
 
     const status = d.manager.status()
-    const modelName = status.state === 'running' ? (status.model?.name ?? req.model ?? 'local') : (req.model ?? 'local')
+    // A remote answer must be labelled with the model the CALLER asked for. The local
+    // manager's loaded model is a different model on a different machine, and reporting it
+    // here would name the wrong weights in the response.
+    const modelName = remote
+      ? (req.model ?? 'remote')
+      : status.state === 'running' ? (status.model?.name ?? req.model ?? 'local') : (req.model ?? 'local')
 
     // ── Agent behaviour scaffolding for external coding CLIs (see agent-guidance.ts) ──────
     // Loop detection/breaking, search-on-repeated-failure, and version+docs-before-a-dependency
@@ -268,8 +283,16 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
     // instead requires the real currently-loaded model path in the field. Either way,
     // rewrite the outbound field (routing above already used the original id). No-op
     // for llama.cpp and its forks, which ignore the field entirely.
-    const oaiAlias = engineModelAlias(d.registry.active()?.kind ?? '', d.manager.currentOpts()?.modelPath)
-    if (oaiAlias) (oaiBody as Record<string, unknown>).model = oaiAlias
+    // A remote request is aliased by the HOST's engine, not this one: the host runs the same
+    // gatewayV1Handler behind its façade and applies its own engineModelAlias there. What it
+    // needs from us is the unqualified key it advertised — `<machine>/` prefixed, it would name
+    // no machine the host knows and silently fall back to whatever the host has loaded.
+    if (remote) {
+      (oaiBody as Record<string, unknown>).model = remote.modelKey
+    } else {
+      const oaiAlias = engineModelAlias(d.registry.active()?.kind ?? '', d.manager.currentOpts()?.modelPath)
+      if (oaiAlias) (oaiBody as Record<string, unknown>).model = oaiAlias
+    }
 
     // ── Concurrency: never exceed the engine's own slot count ─────────────────
     // Claude Code fans out background subagents, each of which is a full, independent request to
@@ -292,6 +315,55 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
     // upstream request is aborted instead of running to completion and queuing behind
     // the engine's slots forever.
     const ac = clientAbort(c)
+
+    /** TELEMETRY ATTRIBUTION (spec §5.6): when `remote` is set this machine is the PEER —
+     *  it took the click and forwarded the request, but the host is what ran the tokens, and
+     *  the host reports it (`link/link-routes.ts`'s `reportServed`). Nothing on this branch
+     *  may emit an inference or engine event for the same generation: doing so double-counts
+     *  every federated generation and corrupts every funnel derived from it, by a factor that
+     *  grows with the number of linked machines. `ui_action` is the mirror image and stays
+     *  with the peer, where the click actually happened. `link-routes.telemetry.test.ts`
+     *  asserts both halves against one queue.
+     *
+     *  The single outbound call both branches below make — local engine or Turbo Link host.
+     *  Defined once so the streaming and non-streaming paths cannot drift on which URL,
+     *  which credential, or which abort signal a remote request uses. `ac.signal` is the
+     *  same client-abort chain the local path already used, so invariant 6 (a client
+     *  disconnect must reach the generator) holds identically across the link. */
+    /** False for a federated request: THIS machine did not run the tokens, so none of its
+     *  local bookkeeping may be written from them (final-review I-1 and I-4).
+     *
+     *  Three separate ledgers hang off this one flag, and all three were wrong before:
+     *   - `d.manager.generationStart/setLiveGen/recordCompletion` — the peer's engine card
+     *     read "Generating…" while its own engine was idle or stopped, its session t/s
+     *     averages were contaminated with another machine's numbers, and (because
+     *     `hostIdleState` reads `sessionStats().activeRequests`) a peer that is ALSO a host
+     *     to a third machine marked itself busy while merely proxying, blocking that third
+     *     machine's legitimate wake.
+     *   - `d.db.recordApiUsage` — the rows behind `db.gatewayDailyStats`, which
+     *     `telemetry/runtime/daily-query-rollups.ts` emits as `gateway_daily`. The host
+     *     records the same generation behind its façade through the same code, so every
+     *     federated generation's requests and tokens landed on BOTH machines' rollup.
+     *   - the `inference_served` event, already correct (host-only, link-routes.ts).
+     *
+     *  Spec §5.4's answer for the peer's own UI is the host's `/api/link/v1/status`, read
+     *  over the link — never the peer writing the host's figures into its local manager. */
+    const localAccounting = !remote
+
+    const callUpstream = (): Promise<Response> => {
+      const body = JSON.stringify(oaiBody)
+      if (remote) {
+        const headers = linkHeaders(remote, c.req.raw.headers)
+        headers.set('content-type', 'application/json') // re-serialised body; never inherited
+        return proxyStream(remote, '/v1/chat/completions', { method: 'POST', headers, body }, ac.signal)
+      }
+      return fetch(`${target}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+        signal: ac.signal,
+      })
+    }
 
     if (req.stream) {
       // ── ADR-347: the gate wait above and the fetch() below are exactly as silent to the
@@ -322,7 +394,13 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
           try {
             await stream.writeSSE(messageStartEvent(msgId, modelName))
 
-            if (d.gate) {
+            // A REMOTE generation touches no local engine, so it must not take one of this
+            // machine's engine slots (final-review I-3). `d.gate` is sized to the LOCAL
+            // engine's `--parallel` count; on a laptop with a `--parallel 1` model loaded,
+            // gating remote traffic here serialises the workstation's GPU behind the
+            // laptop's own work and, worst case, times out after 600 s while the host sits
+            // idle — the exact configuration Turbo Link exists for.
+            if (d.gate && !remote) {
               try {
                 // Never proceed un-slotted on failure — that would silently breach the very
                 // limit this exists to enforce, and intermittently, which is worse than a clean
@@ -348,8 +426,12 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
             // counts Claude-CLI (Anthropic-protocol) traffic too — paired with generationEnd in
             // the outer finally below (generationStarted guards it: never call generationEnd for
             // a start that never happened, e.g. a gate timeout above).
-            d.manager.generationStart()
-            generationStarted = true
+            // Remote: this machine's engine is not generating anything — see the
+            // `localAccounting` note above `callUpstream`.
+            if (localAccounting) {
+              d.manager.generationStart()
+              generationStarted = true
+            }
 
             // For terminal-agent usage attribution/stats (ADR-284) — wall-clock request
             // duration, the simplest signal available without touching streamToAnthropic's own
@@ -360,12 +442,7 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
             let res: Response
             try {
               res = await pingWhilePending(
-                fetch(`${target}/v1/chat/completions`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify(oaiBody),
-                  signal: ac.signal,
-                }),
+                callUpstream(),
                 ping,
                 pingIntervalMs,
                 // No onOrphan: an orphaned Response has nothing to release — its body is simply
@@ -396,6 +473,7 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
             // that affects the client stream.
             const gen = streamToAnthropic(res.body, modelName, msgId, {
               onUsage: (u) => {
+                if (!localAccounting) return
                 try {
                   // The engine's own per-phase rates now ride along (ADR-300). This path —
                   // Anthropic streaming, i.e. every Claude Code request — was the one place
@@ -419,7 +497,10 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
               },
               // Live per-request progress for the engine card (prefill % + token count),
               // so Claude Code traffic shows the same live row as in-app chat.
-              onLive: (live) => { try { d.manager.setLiveGen(live) } catch { /* best-effort */ } },
+              onLive: (live) => {
+                if (!localAccounting) return
+                try { d.manager.setLiveGen(live) } catch { /* best-effort */ }
+              },
               // Coding-activity attribution for terminal-agent sessions — see
               // observeCodeSessionTurn. Nothing to attribute for any other client.
               onToolCalls: (calls) => {
@@ -451,7 +532,8 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
     // ── Non-streaming: the client just waits for one whole response, so there's no
     // idle-connection watchdog to defeat — keeps the original un-pinged gate/fetch sequence. ──
     let gateRelease: (() => void) | null = null
-    if (d.gate) {
+    // Local engine slots are for local work only — see the streaming branch (I-3).
+    if (d.gate && localAccounting) {
       try {
         gateRelease = await d.gate.acquire('bg', { signal: c.req.raw.signal, timeoutMs: gateAcquireTimeoutMs })
       } catch (e) {
@@ -460,25 +542,23 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
       }
     }
 
-    d.manager.generationStart()
+    // Paired with `endLocalGeneration` below so a remote request never starts, and never
+    // ends, a generation on this machine's own manager (I-4).
+    if (localAccounting) d.manager.generationStart()
+    const endLocalGeneration = () => { if (localAccounting) d.manager.generationEnd() }
     const requestStart = Date.now()
     let res: Response
     try {
-      res = await fetch(`${target}/v1/chat/completions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(oaiBody),
-        signal: ac.signal,
-      })
+      res = await callUpstream()
     } catch (e) {
-      d.manager.generationEnd()
+      endLocalGeneration()
       gateRelease?.()
       const { status, type, message } = classifyFetchError(e, ac)
       return c.json({ type: 'error', error: { type, message } }, status)
     }
 
     if (!res.ok || !res.body) {
-      d.manager.generationEnd()
+      endLocalGeneration()
       gateRelease?.()
       // Forward the engine's REAL status + whatever structured error it returned, instead of
       // flattening every distinct failure (bad request, model incompatibility, overload, crash)
@@ -493,8 +573,12 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
 
     try {
       const oaiRes = (await res.json()) as Record<string, unknown>
-      // session stats (B4) + durable #71 record, fail-safe
-      recordOpenAiUsage(d, oaiRes, 'anthropic', req.model ?? null, anthropicCodeSessionId, Date.now() - requestStart, anthropicHarness)
+      // session stats (B4) + durable #71 record, fail-safe. Skipped for a remote answer:
+      // the host already recorded this generation behind its façade, and recording it here
+      // too is what double-counted every federated generation in `gateway_daily` (I-1).
+      if (localAccounting) {
+        recordOpenAiUsage(d, oaiRes, 'anthropic', req.model ?? null, anthropicCodeSessionId, Date.now() - requestStart, anthropicHarness)
+      }
       // Same coding-activity attribution the streaming branch gets. A non-streaming turn has no
       // per-delta reassembly to do — the engine already hands back whole `arguments` strings —
       // but it must not be the one shape of terminal-agent turn that silently records nothing.
@@ -507,7 +591,7 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
       }
       return c.json(mapFromOpenAI(oaiRes, modelName))
     } finally {
-      d.manager.generationEnd()
+      endLocalGeneration()
       gateRelease?.()
     }
   })
@@ -550,232 +634,368 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
   })
 
   // ── /v1/* OpenAI pass-through (spec 06 §1) ────────────────────────────────
+  //
+  // The handler body lives in the exported gatewayV1Handler below rather than inline,
+  // because the Turbo Link façade (link/link-routes.ts) mounts the SAME function behind
+  // its capability gate. A second copy over there is exactly the fork the façade exists
+  // to avoid — this codebase has already paid once for two implementations of one idea
+  // drifting apart (admin probe() vs LinkManager.probeOnce).
 
-  app.all('/v1/*', async (c) => {
-    const url = new URL(c.req.url)
+  app.all('/v1/*', (c) => gatewayV1Handler(c, d))
+}
 
-    // GET /v1/models: always synthesise the list from the WHOLE local library (not just
-    // the loaded model), regardless of whether an engine is running — real key entries for
-    // OpenAI-style consumers. The `claude-<key>` alias (whose id passes Claude Code's
-    // discovery filter — it keeps only claude*/anthropic* ids — and which /v1/messages
-    // strips back to the real key before routing) is only added when gateway.autoSwap is
-    // on: picking a model from Claude Code's /model always requires a swap, so advertising
-    // it while auto-swap is off would let the user pick a model that silently never loads.
-    if (c.req.method === 'GET' && url.pathname === '/v1/models') {
-      const autoSwap = d.store.snapshot().gateway.autoSwap
-      const data = d.scanner.list().models.flatMap((m) => [
-        { id: m.key, object: 'model', owned_by: 'turbollm' },
-        ...(autoSwap ? [{ id: `claude-${m.key}`, object: 'model', display_name: `${m.name} — TurboLLM` }] : []),
-      ])
-      return c.json({ object: 'list', data })
-    }
+/** Overrides for a caller that is NOT the public /v1/* mount. */
+export interface GatewayV1Options {
+  /** The /v1 path to act on, when the request arrived under a different prefix. The
+   *  façade's POST /api/link/v1/chat/completions passes '/v1/chat/completions': without
+   *  it this handler would see a non-chat path, skip every chat-specific step, and
+   *  proxy the peer's request to <engine>/api/link/v1/chat/completions. */
+  pathname?: string
+  /** Where the request came from. 'link' means a Turbo Link peer: it must NOT count as
+   *  the OWNER touching their own machine (host-idle.ts), or one peer's request would
+   *  block the next peer's wake for the whole idle grace window. Defaults to 'local'. */
+  origin?: 'local' | 'link'
+}
 
-    const isChat = c.req.method === 'POST' && url.pathname === '/v1/chat/completions'
+/** The whole /v1/* surface: GET /v1/models synthesis, POST /v1/chat/completions (body
+ *  rewrite, auto-swap routing, engine gate, usage accounting), and plain pass-through for
+ *  everything else. Extracted verbatim from the inline registration above so the Turbo Link
+ *  façade routes a peer through the identical code path a local client takes. */
+export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Options = {}): Promise<Response> {
+  const url = new URL(c.req.url)
+  // Every decision below keys off the /v1 path, not off the URL the client actually hit —
+  // see GatewayV1Options.pathname. Defaults to the real one, so the public mount is unchanged.
+  const pathname = opts.pathname ?? url.pathname
 
-    // For chat completions: parse the body to extract the model field for
-    // auto-swap routing (v0.6.0) and to apply the max_tokens cap if set.
-    // For all other endpoints: skip body parsing and pass through untouched.
-    let parsedBody: Record<string, unknown> | null = null
-    if (isChat) {
-      try { parsedBody = (await c.req.json()) as Record<string, unknown> } catch { parsedBody = null }
-    }
-    const { token: chatToken, codeSessionId: chatCodeSessionId } = resolveCodeSession(c)
-    const chatHarness = resolveHarness(c, d, 'openai')
-
-    // ── Agent scaffolding + coding-activity attribution for OPENAI-protocol harnesses ──────────
-    // Everything below this comment used to exist only on /v1/messages, i.e. only for `claude`.
-    // The split was never by agent — it was by PROTOCOL, so `pi`/`opencode`/DeepSeek Harness/
-    // `kilo`/`openclaw`/`hermes` and every plain script silently ran without loop breaking,
-    // search-on-repeated-failure, dependency discipline, the routine hint, or a tool-call
-    // timeline. One adapter (openai-guidance.ts) reuses the SAME rules rather than forking them.
+  // GET /v1/models: always synthesise the list from the WHOLE local library (not just
+  // the loaded model), regardless of whether an engine is running — real key entries for
+  // OpenAI-style consumers. The `claude-<key>` alias (whose id passes Claude Code's
+  // discovery filter — it keeps only claude*/anthropic* ids — and which /v1/messages
+  // strips back to the real key before routing) is only added when gateway.autoSwap is
+  // on: picking a model from Claude Code's /model always requires a swap, so advertising
+  // it while auto-swap is off would let the user pick a model that silently never loads.
+  if (c.req.method === 'GET' && pathname === '/v1/models') {
+    const autoSwap = d.store.snapshot().gateway.autoSwap
+    const data: Array<Record<string, unknown>> = d.scanner.list().models.flatMap((m) => [
+      { id: m.key, object: 'model', owned_by: 'turbollm' },
+      ...(autoSwap ? [{ id: `claude-${m.key}`, object: 'model', display_name: `${m.name} — TurboLLM` }] : []),
+    ])
+    // Turbo Link (ADR-376 §1 decision 7): every model on every ONLINE linked host, under
+    // its qualified `<machine>/<model>` id — the exact id ModelRouter.resolveRemote routes
+    // on. Local ids above are untouched and stay bare; the qualifier is the only signal
+    // that a request is remote, so there is no migration and nothing is renamed.
     //
-    // `chatGuidance` is computed here (before the body is mutated below) but applied inside the
-    // isChat body-rewrite block, so a non-chat passthrough pays nothing at all.
-    // Built ONLY when something will actually read it. The view walks every message and JSON.parses
-    // every historical tool call's `arguments`, synchronously on the daemon's single thread, once
-    // per turn and growing with the conversation — pure waste for a plain chat client with no tools
-    // and no Code session, which is exactly when both consumers below skip it.
-    const chatNeedsView = isChat && !!parsedBody && (!!chatCodeSessionId || declaresTools(parsedBody))
-    const chatView = chatNeedsView && parsedBody ? openAiRequestView(parsedBody) : null
-    if (chatView && chatCodeSessionId) {
-      // Confirm half of coding-activity attribution — the view's `tool_result` blocks are exactly
-      // what this reads, so no second adapter is needed. Runs before the request is touched, for
-      // the same reason as the Anthropic handler: it must happen for every real turn, including
-      // ones that later fail to route or never reach the engine.
-      commitConfirmedCodeToolCalls(d, chatCodeSessionId, chatView)
+    // `RemoteCatalog.models()` is what makes "an offline link contributes nothing" true:
+    // it re-reads each link's LIVE status on every call, so a machine that dropped stops
+    // being advertised immediately rather than at the next poll. A listed-but-unusable
+    // model is worse than an absent one — the user picks it and every prompt 503s.
+    //
+    // Deliberately NOT gated on `autoSwap`: that gate exists because picking a local model
+    // from a harness's picker always costs a local swap. A remote model costs none — it
+    // runs on the other machine — so the user's local auto-swap preference has no bearing
+    // on whether it can be offered.
+    for (const row of d.remoteCatalog?.models() ?? []) {
+      data.push({
+        id: formatRemoteId(row.machine, row.model.key),
+        object: 'model',
+        owned_by: 'turbollm-link',
+        display_name: `${row.model.name} — ${row.machine}`,
+      })
     }
-    const chatGuidance = chatView && parsedBody && declaresTools(parsedBody)
-      ? analyzeTurn(chatView, url.origin)
-      : null
+    return c.json({ object: 'list', data })
+  }
 
-    const requestedModel = isChat ? ((parsedBody?.model as string | undefined) ?? '') : ''
-    const routeResult = await d.modelRouter.route(requestedModel)
-    if ('status' in routeResult) {
-      return c.json(
-        { error: { message: routeResult.message, type: 'model_not_loaded', code: 'model_not_loaded' } },
-        503,
-      )
-    }
-    const target = routeResult.target
+  const isChat = c.req.method === 'POST' && pathname === '/v1/chat/completions'
+  // What "the owner is using this machine" means for wake gating (host-idle.ts): a real
+  // generation request from a local client. A Turbo Link peer routed through this same
+  // function is explicitly NOT that — see GatewayV1Options.origin.
+  if (isChat && opts.origin !== 'link') noteLocalActivity()
 
-    const upstream = target + url.pathname + url.search
-    const headers = new Headers(c.req.raw.headers)
-    headers.delete('host')
+  // For chat completions: parse the body to extract the model field for
+  // auto-swap routing (v0.6.0) and to apply the max_tokens cap if set.
+  // For all other endpoints: skip body parsing and pass through untouched.
+  let parsedBody: Record<string, unknown> | null = null
+  if (isChat) {
+    try { parsedBody = (await c.req.json()) as Record<string, unknown> } catch { parsedBody = null }
+  }
+  const { token: chatToken, codeSessionId: chatCodeSessionId } = resolveCodeSession(c)
+  const chatHarness = resolveHarness(c, d, 'openai')
 
-    const maxLimit = d.store.snapshot().modelDefaults.maxTokens ?? 0
-    // Cancel the upstream engine request if the client disconnects (same reason as
-    // /v1/messages above) — abandoned OpenAI-protocol requests would otherwise keep
-    // generating and occupy engine slots.
-    const ac = clientAbort(c)
-    const init: RequestInit & { duplex?: 'half' } = { method: c.req.method, headers, signal: ac.signal }
+  // ── Agent scaffolding + coding-activity attribution for OPENAI-protocol harnesses ──────────
+  // Everything below this comment used to exist only on /v1/messages, i.e. only for `claude`.
+  // The split was never by agent — it was by PROTOCOL, so `pi`/`opencode`/DeepSeek Harness/
+  // `kilo`/`openclaw`/`hermes` and every plain script silently ran without loop breaking,
+  // search-on-repeated-failure, dependency discipline, the routine hint, or a tool-call
+  // timeline. One adapter (openai-guidance.ts) reuses the SAME rules rather than forking them.
+  //
+  // `chatGuidance` is computed here (before the body is mutated below) but applied inside the
+  // isChat body-rewrite block, so a non-chat passthrough pays nothing at all.
+  // Built ONLY when something will actually read it. The view walks every message and JSON.parses
+  // every historical tool call's `arguments`, synchronously on the daemon's single thread, once
+  // per turn and growing with the conversation — pure waste for a plain chat client with no tools
+  // and no Code session, which is exactly when both consumers below skip it.
+  const chatNeedsView = isChat && !!parsedBody && (!!chatCodeSessionId || declaresTools(parsedBody))
+  const chatView = chatNeedsView && parsedBody ? openAiRequestView(parsedBody) : null
+  if (chatView && chatCodeSessionId) {
+    // Confirm half of coding-activity attribution — the view's `tool_result` blocks are exactly
+    // what this reads, so no second adapter is needed. Runs before the request is touched, for
+    // the same reason as the Anthropic handler: it must happen for every real turn, including
+    // ones that later fail to route or never reach the engine.
+    commitConfirmedCodeToolCalls(d, chatCodeSessionId, chatView)
+  }
+  const chatGuidance = chatView && parsedBody && declaresTools(parsedBody)
+    ? analyzeTurn(chatView, url.origin)
+    : null
 
-    if (c.req.method !== 'GET' && c.req.method !== 'HEAD') {
-      if (isChat) {
-        // Body already parsed above for routing. Apply token cap if set.
-        if (parsedBody && maxLimit > 0) {
-          parsedBody.max_tokens = clampMaxTokens(parsedBody.max_tokens as number | undefined, maxLimit)
-        }
-        // Rewrite the outbound model id for engines that serve under a fixed alias
-        // (mlx-lm / vLLM) or that require the real loaded model path (mlx-vlm).
-        // Routing above already used the caller's original id.
-        if (parsedBody) {
-          const alias = engineModelAlias(d.registry.active()?.kind ?? '', d.manager.currentOpts()?.modelPath)
-          if (alias) parsedBody.model = alias
-        }
-        // Terminal-agent thinking-budget override (ADR-284) — OpenAI-protocol clients (pi/
-        // opencode via this passthrough) reach the same `thinking_budget_tokens` field the
-        // engine sampler reads directly (no Anthropic-shaped `thinking` object to translate,
-        // unlike /v1/messages above). Same session-scoped-token gate as that handler.
-        if (parsedBody && chatCodeSessionId) {
-          const override = sessionAuth.getThinkingBudgetForToken(chatToken)
-          if (override !== null) {
-            if (override > 0) parsedBody.thinking_budget_tokens = override
-            else delete parsedBody.thinking_budget_tokens
-          }
-          // Same override mechanism, for reasoning_effort — see session-auth.ts. 'off'
-          // collapses onto enable_thinking/thinking_budget_tokens (reasoning-effort.ts).
-          const effortOverride = sessionAuth.getReasoningEffortForToken(chatToken)
-          if (effortOverride === 'off') {
-            parsedBody.thinking_budget_tokens = 0
-            parsedBody.chat_template_kwargs = { ...(parsedBody.chat_template_kwargs as Record<string, unknown> ?? {}), enable_thinking: false }
-          } else if (effortOverride !== null) {
-            parsedBody.chat_template_kwargs = { ...(parsedBody.chat_template_kwargs as Record<string, unknown> ?? {}), reasoning_effort: effortOverride }
-          }
-        }
-        // Apply the scaffolding computed above. Standing rules go on the system message (stable
-        // for the whole session → the engine's reusable prompt prefix is unaffected after turn
-        // one); situational nudges go on the trailing user/tool turn, where they cost no prefix
-        // reuse and where the model actually acts on them. Same division as the Anthropic path.
-        if (parsedBody && chatGuidance) {
-          appendSystemRules(parsedBody, chatGuidance.system)
-          appendNudges(parsedBody, chatGuidance.nudges)
-          // The hard half of the loop breaker: at LOOP_ABORT_AFTER the model physically cannot
-          // emit the same call again and has to answer in text, which ends the loop. `'none'` is
-          // the OpenAI spelling of the Anthropic path's identical `oaiBody.tool_choice = 'none'`.
-          if (chatGuidance.forceTextOnly) parsedBody.tool_choice = 'none'
-        }
-        // A streaming OpenAI response omits the final `usage` chunk unless the caller
-        // opts in via `stream_options.include_usage` (standard OpenAI API behavior,
-        // which llama.cpp's server mirrors) — without this, recordOpenAiStreamUsage
-        // below silently sees no usage and GitHub #71 undercounts every streaming
-        // OpenAI-protocol client that doesn't already request it. Only fills the gap
-        // when the caller left it unset; never overrides an explicit choice.
-        if (parsedBody?.stream === true && parsedBody.stream_options === undefined) {
-          parsedBody.stream_options = { include_usage: true }
-        }
-        headers.delete('content-length') // re-serialised body has a new length
-        init.body = parsedBody ? JSON.stringify(parsedBody) : ''
-      } else {
-        init.body = c.req.raw.body
-        init.duplex = 'half'
+  const requestedModel = isChat ? ((parsedBody?.model as string | undefined) ?? '') : ''
+  const routeResult = await d.modelRouter.route(requestedModel)
+  if ('status' in routeResult) {
+    return c.json(
+      { error: { message: routeResult.message, type: 'model_not_loaded', code: 'model_not_loaded' } },
+      503,
+    )
+  }
+  const target = routeResult.target
+  /** Turbo Link (ADR-376) — see the identical binding in the /v1/messages handler above. */
+  const remote = routeResult.remote
+
+  // ── Links do not chain (ADR-376, "Rejected — links that chain") ───────────────────────
+  // This function is mounted TWICE: publicly at /v1/*, and behind the host's own façade
+  // (link-routes.ts, `origin: 'link'`). Without this guard, a peer sending
+  // `model: "ThirdBox/Qwen3"` to a host that itself has a link named ThirdBox would be
+  // relayed onward by the host — using the HOST's link token, on the host's authority.
+  // Capability sets would compose transitively in ways nobody can audit; a peer sees a
+  // host's LOCAL models only.
+  //
+  // Deliberately a typed error rather than `remote = undefined`. Clearing it would make the
+  // qualified id merely unresolved, which falls through to local resolution — and that is
+  // exactly the invariant-5 hazard the router's guard exists to prevent: the peer would be
+  // silently answered by the HOST's local model, wrong weights and no error at all.
+  if (remote && opts.origin === 'link') {
+    return c.json(
+      {
+        error: {
+          message:
+            `'${requestedModel}' names a machine linked to this one. A linked machine serves ` +
+            `only its own local models — link it directly instead.`,
+          type: 'invalid_request_error',
+          code: 'link_chaining_unsupported',
+        },
+      },
+      400,
+    )
+  }
+
+  // Local: the caller's whole header set, minus `host`. Remote: an ALLOWLIST (invariant 7).
+  // The peer's clients authenticate to THIS machine; their credential is meaningless on the
+  // host and forwarding it would hand another box a secret it was never issued. The link
+  // token replaces it, and is added nowhere else.
+  // A link serves CHAT only, and only a chat request ever resolves a remote target:
+  // `requestedModel` is read from the body for `/v1/chat/completions` alone, so every other
+  // verb routes with an empty id and can never reach the remote branch below. (Final-review
+  // M-2 supposed `/v1/embeddings` with a qualified id would proxy to the façade and 404;
+  // it does not — it is passed through to the LOCAL engine, exactly as before Turbo Link.)
+  //
+  // The query string is dropped for a remote request (M-5), for the same reason the header
+  // set is an allowlist: a caller that passes a credential as a query parameter would
+  // otherwise have it forwarded verbatim to another machine. Nothing on the façade's chat
+  // route reads a query parameter.
+  const remotePath = remote ? pathname : pathname + url.search
+  // Local branch only — the remote branch derives the façade URL inside proxyStream, so there
+  // is exactly one place that knows how a link URL is spelled.
+  const upstream = target + remotePath
+  const headers = remote ? linkHeaders(remote, c.req.raw.headers) : new Headers(c.req.raw.headers)
+  if (!remote) headers.delete('host')
+
+  const maxLimit = d.store.snapshot().modelDefaults.maxTokens ?? 0
+  // Cancel the upstream engine request if the client disconnects (same reason as
+  // /v1/messages above) — abandoned OpenAI-protocol requests would otherwise keep
+  // generating and occupy engine slots.
+  const ac = clientAbort(c)
+  const init: RequestInit & { duplex?: 'half' } = { method: c.req.method, headers, signal: ac.signal }
+
+  if (c.req.method !== 'GET' && c.req.method !== 'HEAD') {
+    if (isChat) {
+      // Body already parsed above for routing. Apply token cap if set.
+      if (parsedBody && maxLimit > 0) {
+        parsedBody.max_tokens = clampMaxTokens(parsedBody.max_tokens as number | undefined, maxLimit)
       }
-    }
-
-    // Unguarded before this fix: a throw here (e.g. the client disconnecting while the
-    // body was being parsed/routed above hands fetch an ALREADY-aborted signal, which
-    // throws immediately with no network I/O — clientAbort() fires ac.abort() synchronously
-    // when c.req.raw.signal.aborted is already true) escaped straight to Hono's default
-    // error handler: a bodyless 500 with no diagnostic, and no client-facing error envelope
-    // at all. Mirrors the /v1/messages handler's guard above.
-    // Same engine-slot limit the Anthropic handler enforces above, for OpenAI-protocol clients
-    // (opencode / kilo / pi / scripts) — they reach the identical single engine, so leaving this
-    // path ungated would just move the pile-up rather than remove it. Only chat completions: a
-    // /tokenize or /embeddings call isn't a generation and must never queue behind one.
-    let chatGateRelease: (() => void) | null = null
-    if (isChat && d.gate) {
-      try {
-        chatGateRelease = await d.gate.acquire('bg', { signal: c.req.raw.signal, timeoutMs: 600_000 })
-      } catch (e) {
-        const aborted = (e as Error).message === 'gate_acquire_aborted'
-        return c.json(
-          {
-            error: aborted
-              ? { message: 'Client disconnected while queued for the engine.', type: 'api_error', code: 'client_disconnected' }
-              : { message: 'Timed out waiting for a free engine slot.', type: 'api_error', code: 'engine_busy' },
-          },
-          aborted ? 400 : 503,
-        )
+      // Rewrite the outbound model id for engines that serve under a fixed alias
+      // (mlx-lm / vLLM) or that require the real loaded model path (mlx-vlm).
+      // Routing above already used the caller's original id.
+      // Turbo Link: the HOST aliases for its own engine behind its façade (it runs this very
+      // function). What it needs is the unqualified key it advertised — the `<machine>/`
+      // prefix names no machine there and would silently route to whatever it has loaded.
+      if (parsedBody && remote) {
+        parsedBody.model = remote.modelKey
+      } else if (parsedBody) {
+        const alias = engineModelAlias(d.registry.active()?.kind ?? '', d.manager.currentOpts()?.modelPath)
+        if (alias) parsedBody.model = alias
       }
+      // Terminal-agent thinking-budget override (ADR-284) — OpenAI-protocol clients (pi/
+      // opencode via this passthrough) reach the same `thinking_budget_tokens` field the
+      // engine sampler reads directly (no Anthropic-shaped `thinking` object to translate,
+      // unlike /v1/messages above). Same session-scoped-token gate as that handler.
+      if (parsedBody && chatCodeSessionId) {
+        const override = sessionAuth.getThinkingBudgetForToken(chatToken)
+        if (override !== null) {
+          if (override > 0) parsedBody.thinking_budget_tokens = override
+          else delete parsedBody.thinking_budget_tokens
+        }
+        // Same override mechanism, for reasoning_effort — see session-auth.ts. 'off'
+        // collapses onto enable_thinking/thinking_budget_tokens (reasoning-effort.ts).
+        const effortOverride = sessionAuth.getReasoningEffortForToken(chatToken)
+        if (effortOverride === 'off') {
+          parsedBody.thinking_budget_tokens = 0
+          parsedBody.chat_template_kwargs = { ...(parsedBody.chat_template_kwargs as Record<string, unknown> ?? {}), enable_thinking: false }
+        } else if (effortOverride !== null) {
+          parsedBody.chat_template_kwargs = { ...(parsedBody.chat_template_kwargs as Record<string, unknown> ?? {}), reasoning_effort: effortOverride }
+        }
+      }
+      // Apply the scaffolding computed above. Standing rules go on the system message (stable
+      // for the whole session → the engine's reusable prompt prefix is unaffected after turn
+      // one); situational nudges go on the trailing user/tool turn, where they cost no prefix
+      // reuse and where the model actually acts on them. Same division as the Anthropic path.
+      if (parsedBody && chatGuidance) {
+        appendSystemRules(parsedBody, chatGuidance.system)
+        appendNudges(parsedBody, chatGuidance.nudges)
+        // The hard half of the loop breaker: at LOOP_ABORT_AFTER the model physically cannot
+        // emit the same call again and has to answer in text, which ends the loop. `'none'` is
+        // the OpenAI spelling of the Anthropic path's identical `oaiBody.tool_choice = 'none'`.
+        if (chatGuidance.forceTextOnly) parsedBody.tool_choice = 'none'
+      }
+      // A streaming OpenAI response omits the final `usage` chunk unless the caller
+      // opts in via `stream_options.include_usage` (standard OpenAI API behavior,
+      // which llama.cpp's server mirrors) — without this, recordOpenAiStreamUsage
+      // below silently sees no usage and GitHub #71 undercounts every streaming
+      // OpenAI-protocol client that doesn't already request it. Only fills the gap
+      // when the caller left it unset; never overrides an explicit choice.
+      if (parsedBody?.stream === true && parsedBody.stream_options === undefined) {
+        parsedBody.stream_options = { include_usage: true }
+      }
+      headers.delete('content-length') // re-serialised body has a new length
+      init.body = parsedBody ? JSON.stringify(parsedBody) : ''
+    } else {
+      init.body = c.req.raw.body
+      init.duplex = 'half'
     }
+  }
 
-    const requestStart = Date.now()
-    let res: Response
+  // Unguarded before this fix: a throw here (e.g. the client disconnecting while the
+  // body was being parsed/routed above hands fetch an ALREADY-aborted signal, which
+  // throws immediately with no network I/O — clientAbort() fires ac.abort() synchronously
+  // when c.req.raw.signal.aborted is already true) escaped straight to Hono's default
+  // error handler: a bodyless 500 with no diagnostic, and no client-facing error envelope
+  // at all. Mirrors the /v1/messages handler's guard above.
+  // Same engine-slot limit the Anthropic handler enforces above, for OpenAI-protocol clients
+  // (opencode / kilo / pi / scripts) — they reach the identical single engine, so leaving this
+  // path ungated would just move the pile-up rather than remove it. Only chat completions: a
+  // /tokenize or /embeddings call isn't a generation and must never queue behind one.
+  let chatGateRelease: (() => void) | null = null
+  // `!remote` (I-3): the gate is sized to the LOCAL engine's `--parallel` count, and a
+  // federated generation touches no local engine. Gating it here throttles the other
+  // machine's GPU behind this one's work — on a `--parallel 1` laptop, serially.
+  if (isChat && d.gate && !remote) {
     try {
-      res = await fetch(upstream, init)
+      chatGateRelease = await d.gate.acquire('bg', { signal: c.req.raw.signal, timeoutMs: 600_000 })
     } catch (e) {
-      chatGateRelease?.()
-      const err = e as Error & { cause?: unknown }
-      const isAbort = err.name === 'AbortError' || ac.signal.aborted
-      const cause = err.cause instanceof Error ? `: ${err.cause.message}` : ''
+      const aborted = (e as Error).message === 'gate_acquire_aborted'
       return c.json(
         {
-          error: {
-            message: isAbort
-              ? 'Client disconnected before the engine responded.'
-              : `${err.message || 'Engine unreachable.'}${cause}`,
-            type: 'api_error',
-            code: isAbort ? 'client_disconnected' : 'engine_unreachable',
-          },
+          error: aborted
+            ? { message: 'Client disconnected while queued for the engine.', type: 'api_error', code: 'client_disconnected' }
+            : { message: 'Timed out waiting for a free engine slot.', type: 'api_error', code: 'engine_busy' },
         },
-        500,
+        aborted ? 400 : 503,
       )
     }
+  }
 
-    // Best-effort session-stats recording (B4) for OpenAI chat completions, fully
-    // fail-safe and non-intrusive: tee the body so the client still gets the exact
-    // upstream stream/bytes unchanged while we sniff usage off the copy.
-    if (res.ok && res.body && isChat) {
-      try {
-        const [a, b] = res.body.tee()
-        // Mark in-flight + publish live token count to the engine card while the teed
-        // copy drains, paired so the counter can't leak. (OpenAI clients don't get the
-        // prefill % — injecting return_progress would pollute their stream.)
-        d.manager.generationStart()
-        // The requester's own `stream` flag decides the drain shape: a non-streaming
-        // OpenAI client (common for scripted/extension callers, `stream` false/absent)
-        // gets ONE plain JSON body from the engine, not SSE `data:` lines — the SSE
-        // parser would silently see no matches and record nothing (GitHub #71: this
-        // gap would have made external-client tracking wrong for a common case).
-        const drain = parsedBody?.stream === true
-          ? recordOpenAiStreamUsage(d, b, 'openai', requestedModel || null, chatCodeSessionId, requestStart, chatHarness)
-          : recordOpenAiJsonUsage(d, b, 'openai', requestedModel || null, chatCodeSessionId, requestStart, chatHarness)
-        // Released when the teed copy finishes draining — i.e. when the engine has actually
-        // stopped generating, NOT when this handler returns. Returning the streaming Response
-        // hands bytes to the client while the engine is still busy, so releasing the slot here
-        // would let the next queued request in on top of a still-running generation.
-        void drain.finally(() => { d.manager.generationEnd(); chatGateRelease?.() })
-        return new Response(a, { status: res.status, headers: res.headers })
-      } catch {
-        chatGateRelease?.()
-        return new Response(res.body, { status: res.status, headers: res.headers })
-      }
-    }
-
-    // Non-chat passthrough, or a chat response with no body to drain (an engine error) — nothing
-    // will ever call the drain's finally, so the slot has to be given back right here.
+  const requestStart = Date.now()
+  let res: Response
+  try {
+    // proxyStream for the remote branch, not a bare fetch: it re-derives the façade URL from
+    // the same helper the tests pin, and refuses to wake a host for a client that has already
+    // gone away. `init.signal` is ac.signal, the client-abort chain (invariant 6).
+    res = remote
+      ? await proxyStream(remote, remotePath, init, ac.signal)
+      : await fetch(upstream, init)
+  } catch (e) {
     chatGateRelease?.()
-    return new Response(res.body, { status: res.status, headers: res.headers })
-  })
+    const err = e as Error & { cause?: unknown }
+    const isAbort = err.name === 'AbortError' || ac.signal.aborted
+    const cause = err.cause instanceof Error ? `: ${err.cause.message}` : ''
+    return c.json(
+      {
+        error: {
+          message: isAbort
+            ? 'Client disconnected before the engine responded.'
+            : `${err.message || 'Engine unreachable.'}${cause}`,
+          type: 'api_error',
+          code: isAbort ? 'client_disconnected' : 'engine_unreachable',
+        },
+      },
+      500,
+    )
+  }
+
+  // Best-effort session-stats recording (B4) for OpenAI chat completions, fully
+  // fail-safe and non-intrusive: tee the body so the client still gets the exact
+  // upstream stream/bytes unchanged while we sniff usage off the copy.
+  // `!remote` (I-1, I-4): the HOST recorded this generation behind its façade — through
+  // this very function — so recording it again here double-counts every federated
+  // generation in `gateway_daily`, and `generationStart()` would light up this machine's
+  // engine card (and its `hostIdleState`) for work its own engine is not doing.
+  if (res.ok && res.body && isChat && !remote) {
+    try {
+      const [a, b] = res.body.tee()
+      // Mark in-flight + publish live token count to the engine card while the teed
+      // copy drains, paired so the counter can't leak. (OpenAI clients don't get the
+      // prefill % — injecting return_progress would pollute their stream.)
+      d.manager.generationStart()
+      // The requester's own `stream` flag decides the drain shape: a non-streaming
+      // OpenAI client (common for scripted/extension callers, `stream` false/absent)
+      // gets ONE plain JSON body from the engine, not SSE `data:` lines — the SSE
+      // parser would silently see no matches and record nothing (GitHub #71: this
+      // gap would have made external-client tracking wrong for a common case).
+      const drain = parsedBody?.stream === true
+        ? recordOpenAiStreamUsage(d, b, 'openai', requestedModel || null, chatCodeSessionId, requestStart, chatHarness)
+        : recordOpenAiJsonUsage(d, b, 'openai', requestedModel || null, chatCodeSessionId, requestStart, chatHarness)
+      // Released when the teed copy finishes draining — i.e. when the engine has actually
+      // stopped generating, NOT when this handler returns. Returning the streaming Response
+      // hands bytes to the client while the engine is still busy, so releasing the slot here
+      // would let the next queued request in on top of a still-running generation.
+      void drain.finally(() => { d.manager.generationEnd(); chatGateRelease?.() })
+      return new Response(a, { status: res.status, headers: res.headers })
+    } catch {
+      chatGateRelease?.()
+      return new Response(res.body, { status: res.status, headers: res.headers })
+    }
+  }
+
+  // Non-chat passthrough, or a chat response with no body to drain (an engine error) — nothing
+  // will ever call the drain's finally, so the slot has to be given back right here.
+  chatGateRelease?.()
+  // ── No host filesystem detail crosses the façade (final-review M-6) ───────────────────
+  // llama.cpp's error JSON routinely embeds absolute model and binary paths, and this line
+  // relayed the engine's body unchanged. Locally that is the user's own machine and the
+  // detail is useful; behind the façade (`origin: 'link'`) it is another box's disk layout
+  // crossing a machine boundary. The STATUS is preserved, so the peer still classifies the
+  // failure — only the host's free text is withheld, exactly as `linkDownloadErr` and
+  // `status-view.ts` already do for their surfaces.
+  if (opts.origin === 'link' && !res.ok) {
+    return c.json(
+      {
+        error: {
+          message: "The host's engine could not complete the request.",
+          type: 'api_error',
+          code: 'engine_error',
+        },
+      },
+      asClientStatus(res.status),
+    )
+  }
+  return new Response(res.body, { status: res.status, headers: res.headers })
 }
 
 // ── Coding-activity attribution for terminal-agent sessions ─────────────────

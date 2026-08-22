@@ -10,7 +10,7 @@ import type { MiddlewareHandler } from 'hono'
 import type { Context } from 'hono'
 import type { Deps } from '../deps.js'
 import type { Scope } from '../chat/store/types.js'
-import { hashKey } from '../auth.js'
+import { hashKey, isFacadeOnlyKey } from '../auth.js'
 import { extError } from './errors.js'
 
 // Hono resolves `c.get`/`c.set` key types against this global map whenever the app instance
@@ -32,13 +32,27 @@ export interface ResolvedKey { tenant: string; scopes: string[] }
  *  (never the raw value, see ../auth.ts), so the presented key is hashed with the SAME
  *  derivation (`hashKey`) before comparison — comparing the raw value against the hash, as an
  *  earlier version of this function did, would reject every real key unconditionally. Legacy
- *  keys (no `tenant`) are `local` with all scopes, so nothing that works today stops working. */
+ *  keys (no `tenant`) are `local` with all scopes, so nothing that works today stops working.
+ *
+ *  A Turbo Link FAÇADE-ONLY key (one carrying a `grant`) is refused here as though it did not
+ *  match at all — the SAME rule, via the SAME predicate (`isFacadeOnlyKey`, see ../auth.ts's
+ *  doc comment on it and on verifyKeyValue), that `verifyKeyValue` applies to every internal
+ *  surface. This path exists because the external API resolves a key to a TENANT, not to a
+ *  yes/no, so it cannot simply call verifyKeyValue; it must still honour the refusal.
+ *
+ *  Pre-merge review of PR #185, finding I1: before this, the invariant "a granted token works
+ *  ONLY on /api/link/v1" held here purely because `lanAuth` happens to be registered ahead of
+ *  `mountExtApi` in server.ts. Exempting /api/ext/v1/* from lanAuth — the obvious one-line
+ *  change for a genuinely PUBLIC API — would silently have turned every façade-only token into
+ *  a full ext-API credential, with nothing failing to signal it. The property now comes from
+ *  the credential check, not from middleware ordering. */
 export function resolveTenantFromKey(presented: string, d: Deps): ResolvedKey | null {
   if (!presented) return null
   const hash = hashKey(presented)
   const keys = d.store.snapshot().apiKeys ?? []
   for (const record of keys) {
     if (!record.hash || record.hash !== hash) continue
+    if (isFacadeOnlyKey(record)) return null
     return { tenant: record.tenant ?? 'local', scopes: record.scopes ?? ALL_SCOPES }
   }
   return null

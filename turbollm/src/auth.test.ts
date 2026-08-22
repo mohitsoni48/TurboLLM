@@ -188,9 +188,14 @@ test('provisionTunnelApiKey: stores a fresh key and returns its full (unhashed) 
 const RAW_KEY = 'tllm-testkeyABCDEFGHIJKLMNOPQRSTUVWXYZ01'
 const RAW_KEY_HASH = createHash('sha256').update(RAW_KEY).digest('hex')
 
-function fakeDepsWithKeys(overrides: { lanBind?: boolean; tunnelActive?: boolean; hasKey?: boolean }): Deps {
+function fakeDepsWithKeys(overrides: { lanBind?: boolean; tunnelActive?: boolean; hasKey?: boolean; granted?: string[] }): Deps {
   const apiKeys = overrides.hasKey
-    ? [{ id: 'k1', name: 'test', hash: RAW_KEY_HASH, prefix: RAW_KEY.slice(0, 12), createdAt: '', lastUsedAt: null }]
+    ? [{
+        id: 'k1', name: 'test', hash: RAW_KEY_HASH, prefix: RAW_KEY.slice(0, 12), createdAt: '', lastUsedAt: null,
+        // A Turbo Link grant. Absent by default, so every existing test below still
+        // describes a plain legacy full-access key.
+        ...(overrides.granted ? { grant: { capabilities: overrides.granted } } : {}),
+      }]
     : []
   return {
     store: {
@@ -284,4 +289,58 @@ test('codeAuth: a genuinely tunneled request is never treated as local, even wit
   await codeAuth(d)(c, async () => { called = true })
   assert.equal(called, false)
   assert.equal(jsonResult()?.status, 401)
+})
+
+
+// ── Turbo Link tokens are FAÇADE-ONLY credentials (ADR-376 review, Important 1) ──────
+//
+// A key carrying a `grant` was minted for one specific peer with one specific capability
+// set, and /api/link/v1 is the only surface that knows how to enforce that set. Every
+// other auth surface — lanAuth's /v1/* gateway, codeAuth's shell-and-filesystem Code
+// routes, the terminal WebSocket's pty upgrade — checks the hash and nothing else, so
+// without this rule an "Inference only" token presented straight to the PUBLIC
+// /v1/chat/completions would reach the ordinary auto-swap path and could load and evict
+// models at will. That would make models:wake and models:load advisory rather than
+// enforced, which is the entire point of the capability model.
+//
+// So the general-purpose credential check treats a granted key as NO MATCH. resolveKey
+// (linkAuth's own path) deliberately still accepts it — see link-auth.test.ts.
+
+test('verifyPresentedKey: a GRANTED (Turbo Link) token is refused, exactly as if it did not match', () => {
+  const d = fakeDepsWithKeys({ hasKey: true, granted: ['models:use'] })
+  const c = fakeContext({ 'x-turbollm-auth': RAW_KEY })
+  assert.equal(verifyPresentedKey(c, d), false)
+})
+
+test('verifyPresentedKey: even a FULL-capability link grant is refused — the rule is the grant, not its contents', () => {
+  const d = fakeDepsWithKeys({
+    hasKey: true,
+    granted: ['models:use', 'models:wake', 'models:load', 'models:unload', 'downloads:read', 'downloads:write', 'config:read', 'config:write'],
+  })
+  const c = fakeContext({ 'x-turbollm-auth': RAW_KEY })
+  assert.equal(verifyPresentedKey(c, d), false)
+})
+
+test('verifyPresentedKey: an UNGRANTED legacy key is unaffected and still passes', () => {
+  const d = fakeDepsWithKeys({ hasKey: true })
+  const c = fakeContext({ 'x-turbollm-auth': RAW_KEY })
+  assert.equal(verifyPresentedKey(c, d), true)
+})
+
+test('codeAuth: a granted link token is refused — a peer must never reach shell and filesystem access', async () => {
+  const d = fakeDepsWithKeys({ lanBind: true, hasKey: true, granted: ['models:use', 'models:load'] })
+  const { c, jsonResult } = fakeMiddlewareContext({ 'x-turbollm-auth': RAW_KEY })
+  let called = false
+  await codeAuth(d)(c, async () => { called = true })
+  assert.equal(called, false)
+  assert.equal(jsonResult()?.status, 401)
+})
+
+test('codeAuth: the same request with an ungranted legacy key still passes', async () => {
+  const d = fakeDepsWithKeys({ lanBind: true, hasKey: true })
+  const { c, jsonResult } = fakeMiddlewareContext({ 'x-turbollm-auth': RAW_KEY })
+  let called = false
+  await codeAuth(d)(c, async () => { called = true })
+  assert.equal(called, true)
+  assert.equal(jsonResult(), undefined)
 })

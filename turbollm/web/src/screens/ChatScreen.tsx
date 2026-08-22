@@ -29,6 +29,8 @@ import { ContextMeter } from './chat/ContextMeter'
 import { ConversationSidebar } from './chat/ConversationSidebar'
 import { readSavedSidebarWidth, SIDEBAR_MIN_W, sidebarMaxW, SidebarResizeHandle } from './chat/SidebarResizeHandle'
 import { ModelLoadMenu } from '../components/ModelLoadMenu'
+import { useLinks, useLinkStatus, useRemoteModels } from '../lib/link-queries'
+import { describeRemoteHost, findRemoteChoice, selectModel } from '../lib/remote-models'
 import { ModelDetailDialog } from './models/ModelDetailDialog'
 import { ConversationSettingsDialog, type ConversationSettingsDraft } from './chat/ConversationSettingsDialog'
 import { useUiStore } from '../stores/ui'
@@ -267,6 +269,38 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // llama.cpp, safetensors under MLX/vLLM. Keeps the chat model menu from listing
   // models that would 409 on load.
   const allModels = (modelsQ.data?.models ?? []).filter((m) => m.compatibleWithActiveEngine)
+  // Turbo Link (ADR-376 §6.3): models living on other machines, grouped under their machine
+  // in the picker below. Both queries fail soft (`?? []`) — a host-gated 403 or a daemon
+  // with no links must leave the chat screen exactly as it was, not error it.
+  const linksQ = useLinks()
+  const remoteModelsQ = useRemoteModels()
+  /** Turbo Link (ADR-376, final-review C-1): the qualified `<machine>/<model>` id this
+   *  chat is pointed at, or null for "this machine's loaded model".
+   *
+   *  A remote model is NOT loaded — it is already up on the other box — so selecting one
+   *  is a routing choice, not an engine action. It deliberately does not touch
+   *  `modelActions.load`, which posts to the LOCAL engine loader: that aborts every
+   *  in-flight generation in every conversation before it does anything else, and then
+   *  either 409s or loads a completely different local model.
+   *
+   *  Component state, so it resets on reload — the daemon holds no per-conversation model
+   *  and inventing one here would be a schema decision this fix has no mandate for. */
+  const [remoteModelId, setRemoteModelId] = useState<string | null>(null)
+  const remoteChoice = remoteModelId
+    ? findRemoteChoice(remoteModelId, linksQ.data ?? [], remoteModelsQ.data ?? [])
+    : undefined
+  // A selection whose machine went offline (or whose model stopped being advertised)
+  // silently stops being a selection — the same rule the catalog enforces server-side:
+  // a listed-but-unusable model is worse than an absent one.
+  const activeRemoteId = remoteChoice?.id ?? null
+  // Stats parity (spec §5.4, final-review I-5): the HOST's own engine state, read over the
+  // link and rendered from the host's own `/api/v1/status` shape. Only polled while a chat
+  // is actually pointed at that machine. A soft read — a host that dropped is reported by
+  // the send itself, loudly and by name, not by an error banner on the header.
+  const remoteStatusQ = useLinkStatus(remoteChoice?.linkId ?? null)
+  const remoteHostState = activeRemoteId
+    ? (remoteStatusQ.data ? describeRemoteHost(remoteStatusQ.data) : remoteStatusQ.isError ? 'not answering' : null)
+    : null
   // Gates ReasoningEffortSelect vs ThinkingBudgetSlider below — `status.model` (LoadedModel)
   // is a slim subset without capability flags, so look the full ModelEntry up by key.
   const loadedModelSupportsReasoningEffort = (modelsQ.data?.models ?? []).find((m) => m.key === model?.key)?.reasoningEffort ?? false
@@ -277,12 +311,25 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     engineState === 'stopping'
 
   const handleLoadModel = (key: string) => {
+    // The branch itself is `selectModel` (lib/remote-models.ts) and is unit-tested there:
+    // a remote row's id names another machine and must NEVER reach the local engine
+    // loader, which aborts every in-flight generation before it does anything else.
+    const choice = selectModel(key, linksQ.data ?? [], remoteModelsQ.data ?? [])
+    if (choice.kind === 'remote') {
+      setRemoteModelId(choice.id)
+      return
+    }
+    // Picking a local model is also how the user comes BACK from a remote machine.
+    setRemoteModelId(null)
     modelActions.load.mutate(
-      { key },
+      { key: choice.key },
       { onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not load model.') },
     )
   }
   const handleEject = () => {
+    // Pointed at another machine, "Eject" means "stop using it" — this machine's engine is
+    // not what is serving these turns, and stopping it would be a surprising side effect.
+    if (activeRemoteId) { setRemoteModelId(null); return }
     // Ejecting kills the whole engine — every in-flight generation across every
     // conversation dies with it, not just the active one.
     if (Object.keys(abortRefs.current).length > 0) {
@@ -645,7 +692,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   const send = async (overrideInput?: string) => {
     const rawText = (overrideInput ?? input).trim()
     if ((!rawText && attachments.length === 0) || live) return
-    if (engineState !== 'running' || !model) { toast.error('Load a model first.'); return }
+    if (!ready) { toast.error('Load a model first.'); return }
 
     // A message that starts with '/skill-id' enables that skill for this send — no matter
     // how the token got there (picker click, Tab-complete, or just typed/pasted) — and the
@@ -705,7 +752,9 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
         // explicit override — it wins over the agent's own default system prompt.
         const finalSystemPrompt = pendingSystemPrompt.trim() || sp
         const newConv = await mut.create.mutateAsync({
-          modelKey: model.key,
+          // The model this conversation was STARTED with, for the sidebar label. A remote
+          // machine's qualified id is the honest value there — it is what answered.
+          modelKey: activeRemoteId ?? model?.key ?? '',
           systemPrompt: finalSystemPrompt || undefined,
           toolPolicy: selectedPersonaId === 'research' ? 'force_web_search' : undefined,
           skillIds: initialSkillIds.length ? initialSkillIds : undefined,
@@ -734,7 +783,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
       abortRefs.current[convId] = ac
 
       const textAttachmentNames = textAttachments.map((a) => a.file.name)
-      await streamFrom(convId, sendMessage(convId, text, ac.signal, images, docContext, textAttachmentNames, thinkingBudget, reasoningEffort))
+      await streamFrom(convId, sendMessage(convId, text, ac.signal, images, docContext, textAttachmentNames, thinkingBudget, reasoningEffort, activeRemoteId ?? undefined))
     } catch (e) {
       if (convId) clearLive(convId)
       if ((e as Error)?.name !== 'AbortError') {
@@ -754,10 +803,10 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     mut.editMsg.mutate({ convId: activeId, msgId, content }, {
       onSuccess: () => {
         userScrolledUp.current = false
-        if (isUserMessage && engineState === 'running' && model) {
+        if (isUserMessage && ready) {
           const ac = new AbortController()
           abortRefs.current[activeId] = ac
-          void streamFrom(activeId, continueConversation(activeId, ac.signal, thinkingBudget, reasoningEffort))
+          void streamFrom(activeId, continueConversation(activeId, ac.signal, thinkingBudget, reasoningEffort, activeRemoteId ?? undefined))
         }
       },
       onError: () => toast.error('Could not edit message.'),
@@ -766,11 +815,11 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
 
   const handleRegenerate = async () => {
     if (!activeId || live) return
-    if (engineState !== 'running' || !model) { toast.error('Load a model first.'); return }
+    if (!ready) { toast.error('Load a model first.'); return }
     await mut.regenerate.mutateAsync(activeId).catch(() => {})
     const ac = new AbortController()
     abortRefs.current[activeId] = ac
-    void streamFrom(activeId, continueConversation(activeId, ac.signal, thinkingBudget, reasoningEffort))
+    void streamFrom(activeId, continueConversation(activeId, ac.signal, thinkingBudget, reasoningEffort, activeRemoteId ?? undefined))
   }
 
   const handleDelete = (m: Message) => {
@@ -785,9 +834,13 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   const ctxUsed  = lastStats?.ctxUsed ?? 0
   // Prefer the currently-loaded model's ctx (fresh after a reload) over the last
   // message's reported max, which goes stale when settings change.
-  const ctxMax   = model?.ctx || lastStats?.ctxMax || 0
+  // On a remote machine the last reply's own reported max IS the fresh number — the local
+  // manager's `model.ctx` describes a different model on a different box.
+  const ctxMax   = activeRemoteId ? (lastStats?.ctxMax ?? 0) : (model?.ctx || lastStats?.ctxMax || 0)
 
-  const ready = engineState === 'running' && !!model
+  // Chatting with a linked machine needs nothing loaded HERE. Requiring it is precisely
+  // what made every remote row unusable.
+  const ready = activeRemoteId ? true : engineState === 'running' && !!model
 
   // At most one tool call awaits interactive approval at a time (the tool loop is sequential).
   // Read from the timeline — the actual live-updated source — not a separate tracked array.
@@ -870,16 +923,20 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
           )}
           <ModelLoadMenu
             models={allModels}
-            loadedKey={model?.key ?? null}
-            loadedName={model?.name ?? null}
+            loadedKey={activeRemoteId ?? model?.key ?? null}
+            loadedName={remoteChoice ? `${remoteChoice.name} — ${remoteChoice.machine}` : (model?.name ?? null)}
             pending={modelBusy}
             ejecting={modelActions.eject.isPending}
             onLoad={handleLoadModel}
             onEject={handleEject}
             onSettings={(key) => setSettingsKey(key)}
             screen="chat"
+            links={linksQ.data ?? []}
+            remoteModels={remoteModelsQ.data ?? []}
           />
-          {model && (
+          {/* Load settings are a LOCAL engine concern — there is nothing on this machine to
+              configure for a model running on another one. */}
+          {model && !activeRemoteId && (
             <Button
               size="icon"
               variant="ghost"
@@ -910,7 +967,15 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
               Loading model…{model?.loadElapsedMs != null && ` (${Math.round(model.loadElapsedMs / 1000)}s)`}
             </span>
           )}
-          {engineState === 'stopping' && <span className="text-[12px] text-muted">Ejecting…</span>}
+          {engineState === 'stopping' && !activeRemoteId && <span className="text-[12px] text-muted">Ejecting…</span>}
+          {remoteChoice && remoteHostState && (
+            <span
+              className="hidden text-[12px] text-muted sm:inline"
+              title={`Live state of ${remoteChoice.machine}, read over the link`}
+            >
+              {remoteChoice.machine}: {remoteHostState}
+            </span>
+          )}
           {ready && (
             <div className="ml-auto hidden sm:flex">
               <ContextMeter ctxUsed={ctxUsed} ctxMax={ctxMax} />
@@ -1147,7 +1212,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                   ref={inputRef}
                   rows={1}
                   className="max-h-40 min-h-9 flex-1 resize-none bg-transparent px-2 py-1.5 text-[15px] text-ink outline-none placeholder:overflow-hidden placeholder:whitespace-nowrap placeholder:text-faint"
-                  placeholder={ready ? `Message ${model.name}…` : 'Load a model above to start chatting'}
+                  placeholder={ready ? `Message ${remoteChoice?.name ?? model?.name ?? 'the model'}…` : 'Load a model above to start chatting'}
                   value={input}
                   disabled={!ready || !!live || !!editingId}
                   onChange={(e) => { setInput(e.target.value); autoResize() }}

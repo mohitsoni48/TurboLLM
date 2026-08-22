@@ -12,8 +12,18 @@ import { mlxSamplingArgs } from '../engines/mlx'
 import { koboldcppProfileToArgs } from '../engines/koboldcpp'
 import { engineAcceptsFormat } from '../engines/compat'
 import { getSysInfo } from '../sysinfo/sysinfo'
+import { parseRemoteId } from '../link/model-id'
+import type { RemoteCatalog } from '../link/remote-catalog'
 
-export type RouteResult = { target: string } | { status: 503; message: string }
+export type RouteResult =
+  | {
+      target: string
+      /** Present only for a Turbo Link remote model. The gateway uses this to build the
+       *  upstream URL and to present the LINK token instead of the caller's credential.
+       *  Absent = an ordinary local engine target, unchanged. */
+      remote?: { linkId: string; baseUrl: string; token: string; modelKey: string }
+    }
+  | { status: 503; message: string }
 
 interface PoolSlot {
   manager: Manager
@@ -39,6 +49,10 @@ export class ModelRouter {
     private manager: Manager,
     private scanner: Scanner,
     private comfy: ComfyGuard | undefined,
+    /** Turbo Link peer catalog (ADR-376). Optional and TRAILING so every pre-Turbo-Link
+     *  construction site keeps compiling unchanged; when absent, `route()` behaves
+     *  exactly as it did before — there are no links, so nothing can be remote. */
+    private catalog?: RemoteCatalog,
   ) {}
 
   /** Route a request to the correct model target URL.
@@ -47,6 +61,23 @@ export class ModelRouter {
    *  - Otherwise: loads the model (swapping / evicting LRU as needed) and waits. */
   async route(requestedModel: string): Promise<RouteResult> {
     const cfg = this.store.snapshot()
+
+    // Turbo Link (ADR-376). A qualified `<machine>/<model>` id is resolved here and
+    // NOWHERE ELSE, and it must FAIL LOUDLY rather than degrade to a local model.
+    //
+    // Two pieces of deliberately-helpful existing behaviour make this critical:
+    //   1. the autoSwap-off early return below hands back whatever is loaded, and
+    //   2. resolveEntry ends in a SUBSTRING match, then route() falls back to the loaded
+    //      model for anything unresolved, "so unrecognised aliases don't break clients".
+    // Composed, an offline peer would be silently answered by a local model with the
+    // wrong weights and no error. So: once an id parses as qualified AND names a known
+    // machine, every failure path from here is a 503. It never falls through.
+    //
+    // This sits at the VERY TOP of route(), above the autoSwap early return, because
+    // that return never reaches resolveRemote — with auto-swap off the whole guard would
+    // otherwise be bypassed, which is the single most dangerous configuration.
+    const remote = this.resolveRemote(requestedModel)
+    if (remote) return remote
 
     // Auto-swap disabled or no model requested → fall back to current loaded model.
     if (!cfg.gateway.autoSwap || !requestedModel.trim()) {
@@ -100,6 +131,10 @@ export class ModelRouter {
    *  (see routines/model-swap.ts) — this method has no opinion on whether now is a safe time to
    *  swap, only on HOW to swap once that's decided. */
   async loadExplicit(modelKey: string): Promise<RouteResult> {
+    // Same invariant-5 guard as route(): a routine pinned to `<machine>/<model>` must
+    // never be satisfied by resolveEntry's substring match against a LOCAL model.
+    const remote = this.resolveRemote(modelKey)
+    if (remote) return remote
     const entry = this.resolveEntry(modelKey)
     if (!entry) return { status: 503, message: `No model matching '${modelKey}' found. Add one in TurboLLM.` }
     return this.withSwapLock(() => this.doLoad(entry))
@@ -308,6 +343,55 @@ export class ModelRouter {
 
     if (lruKey !== null) this.extraSlots.delete(lruKey)
     return lruManager
+  }
+
+  /** PUBLIC view of `resolveRemote` — "does this id name a linked machine, and if so what
+   *  is the outcome?" — with no local resolution, no auto-swap and no side effects.
+   *
+   *  Exists so every other surface that must treat a qualified id as remote reuses THIS
+   *  resolution instead of growing its own. Two already do:
+   *   - in-app chat (chat/chat-upstream.ts), which must not hand a qualified id to the
+   *     LOCAL engine loader; and
+   *   - the host façade's chaining refusal (link/link-routes.ts), which has to recognise a
+   *     second-hop id before its wake gate answers with a misleading reason.
+   *  Three findings in this feature came from two implementations of one idea drifting
+   *  apart, so this is deliberately one function with two callers rather than three
+   *  copies of `parseRemoteId` + `linkByName`.
+   *
+   *  `undefined` means "not remote" — including the real case of a LOCAL model key that
+   *  happens to contain a slash (`unsloth/Qwen3-GGUF`), which must keep resolving locally. */
+  resolveRemoteTarget(requestedModel: string): RouteResult | undefined {
+    return this.resolveRemote(requestedModel)
+  }
+
+  /** Resolve a qualified id, or return undefined to let local resolution proceed.
+   *
+   *  Returns undefined ONLY when the id does not name a known linked machine — which
+   *  covers the real case of a LOCAL model key that happens to contain a slash
+   *  (`unsloth/Qwen3-GGUF`). Once the machine matches, every outcome is terminal. */
+  private resolveRemote(requestedModel: string): RouteResult | undefined {
+    if (!this.catalog) return undefined
+    const parsed = parseRemoteId(requestedModel.trim())
+    if (!parsed) return undefined
+    const link = this.catalog.linkByName(parsed.machine)
+    if (!link) return undefined
+
+    if (link.status !== 'online') {
+      return {
+        status: 503,
+        message:
+          `'${parsed.machine}' is not connected (${link.status}). ` +
+          `Reconnect it in Settings → Turbo Link.`,
+      }
+    }
+    const model = this.catalog.modelOn(link.id, parsed.model)
+    if (!model) {
+      return { status: 503, message: `'${parsed.machine}' does not have a model '${parsed.model}'.` }
+    }
+    return {
+      target: link.baseUrl,
+      remote: { linkId: link.id, baseUrl: link.baseUrl, token: link.token, modelKey: model.key },
+    }
   }
 
   private resolveEntry(requested: string): ModelEntry | undefined {

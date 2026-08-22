@@ -21,6 +21,7 @@ import { gatewayDaily, harnessFirstSeen } from './gateway'
 import { codeDaily } from './code'
 import { uiAction, uiDaily } from './ui'
 import { onboardingProfile, onboardingRecovery } from './onboarding'
+import { linkMinted, linkAdded, linkStatusChanged, inferenceServed } from './link'
 
 export const REGISTRY = {
   app_first_run: appFirstRun,
@@ -42,6 +43,10 @@ export const REGISTRY = {
   ui_daily: uiDaily,
   onboarding_profile: onboardingProfile,
   onboarding_recovery: onboardingRecovery,
+  link_minted: linkMinted,
+  link_added: linkAdded,
+  link_status_changed: linkStatusChanged,
+  inference_served: inferenceServed,
 } as const
 
 export type EventName = keyof typeof REGISTRY
@@ -68,4 +73,8 @@ export {
   uiDaily,
   onboardingProfile,
   onboardingRecovery,
+  linkMinted,
+  linkAdded,
+  linkStatusChanged,
+  inferenceServed,
 }

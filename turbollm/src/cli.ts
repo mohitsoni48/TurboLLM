@@ -43,6 +43,9 @@ import { registerTerminalWs } from './terminal/terminal-routes'
 import { reapStaleTerminals, killTrackedTerminalsSync } from './terminal/terminal-manager'
 import { provisionTunnelApiKey } from './auth'
 import { TunnelManager, reapStaleTunnels, killTrackedTunnelsSync } from './tunnel/manager'
+import { LinkManager } from './link/link-manager'
+import { RemoteCatalog } from './link/remote-catalog'
+import { isTurboLinkEnabled } from './link/gate'
 import type { Deps } from './deps'
 import { TELEMETRY_ENV } from './telemetry/disabled'
 import { Emitter } from './telemetry/emit'
@@ -326,7 +329,27 @@ const bench = new BenchRunner(manager, store, scanner, registry, version, hf)
 const comfy = new ComfyGuard(store, manager)
 // Gateway intelligence (v0.6.0): auto model-swap router. Resolves the `model`
 // field in /v1/* requests and loads the matching model if not already running.
-const modelRouter = new ModelRouter(store, registry, manager, scanner, comfy)
+// Turbo Link (ADR-376): the peer's cache of what each linked host currently has. Handed to
+// the router as its 6th argument — WITHOUT it, `ModelRouter.resolveRemote` short-circuits and
+// a qualified `<machine>/<model>` id silently falls through to local resolution, i.e. answers
+// with the wrong weights instead of failing loudly. It is the proxy in gateway.ts that makes
+// switching it on safe. The link source is read LAZILY: `deps.links` is constructed further
+// down (it needs the assembled Deps), and the catalog is only ever consulted at request time.
+// The experimental gate (Settings → Experimental, ADR-376) is injected as a live getter,
+// not a boot-time snapshot — same shape as `isRoutinesEnabled` below. Gating the catalog is
+// what makes remote models vanish from `/v1/models`, `ModelRouter`, chat and
+// `turbollm launch claude` the instant the flag goes off, with no restart.
+// It calls `isTurboLinkEnabled` rather than reading the config field inline: that helper is
+// the ONE symbol a reviewer greps to find every gate in this feature (link/gate.ts), and a
+// production wiring site that spells the check out by hand is exactly the one that would not
+// show up in that grep. It also brings the helper's optional chaining and `=== true`, so a
+// config that never went through normalize() reads "off" instead of throwing inside
+// `isUsable` on every /v1/models. `deps` is read lazily here, same as `list` above.
+const remoteCatalog = new RemoteCatalog(
+  { list: () => deps.links?.list() ?? [] },
+  { isEnabled: () => isTurboLinkEnabled(deps) },
+)
+const modelRouter = new ModelRouter(store, registry, manager, scanner, comfy, remoteCatalog)
 // Tool registry (v0.7.0): built-in tools + MCP host. Syncs MCP servers from config.
 // Routine tools (Phase 4): `db` structurally satisfies RoutineToolsStore (createRoutine/
 // getRoutine/listRoutines/updateRoutine/deleteRoutine/listRoutineRuns all exist on
@@ -371,7 +394,7 @@ try {
   process.exit(1)
 }
 // `requestRestart` is attached after the server is created (it must close over it).
-const deps: Deps = { store, registry, manager, scanner, hashes, db, chatStore, provision, build, updates, appUpdates, hf, downloads, bench, modelRouter, comfy, tools: toolRegistry, version, startedAt }
+const deps: Deps = { store, registry, manager, scanner, hashes, db, chatStore, provision, build, updates, appUpdates, hf, downloads, bench, modelRouter, comfy, remoteCatalog, tools: toolRegistry, version, startedAt }
 // Sized to the RUNNING engine's own slot count, re-read on every admission (a model swap changes
 // it). `Infinity` when the engine advertises no `--parallel` — see Manager.parallelSlots() for why
 // that is not 1.
@@ -586,6 +609,26 @@ const routineScheduler = new RoutineScheduler({
 })
 deps.routineScheduler = routineScheduler
 routineScheduler.start()
+
+// Turbo Link (ADR-376): peer-side poll loop over every linked host. Construction and
+// start() only need `deps.store`, not the bound socket, so — same convention as
+// codeRuns/routineScheduler just above — this runs before createApp(deps) rather than
+// after listen(); nothing here binds a port or touches the network beyond the outbound
+// hello probes that start() immediately kicks off (LinkClient is timeout-bounded and
+// never throws, so a bad/unreachable link cannot block startup).
+// The catalog rides the SAME poll tick: one loop, one set of outbound calls, and the models
+// are refreshed only after each link's status has been updated by that tick's probe.
+// `isEnabled` is a live getter (Settings → Experimental can flip it with no restart, and a
+// restart takes TurboLLM offline mid-session). While it is off, start() arms an inert timer
+// and nothing polls: no outbound probe, no config rewrite. The `links` in config are left
+// exactly where they are.
+// Same `isTurboLinkEnabled` call as the catalog above, and for the same reason: one grepped
+// symbol, one definition of what "on" means, no second hand-spelled copy to drift from it.
+deps.links = new LinkManager(deps, {
+  catalog: remoteCatalog,
+  isEnabled: () => isTurboLinkEnabled(deps),
+})
+deps.links.start()
 
 // Safety-net watchdog for the interactive (ask/plan) claude_cli routine path
 // (cli-interactive-runner.ts) — catches a parked run whose live terminal died without ever

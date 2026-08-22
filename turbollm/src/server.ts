@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url'
 import { dirname, join, normalize } from 'node:path'
 import { Agent, setGlobalDispatcher } from 'undici'
 import { registerApi } from './api/routes'
+import { registerLinkAdminRoutes } from './api/link-admin-routes'
 import { registerChatRoutes } from './chat/chat-routes'
 import { registerChatAgentRoutes } from './chat/chat-agent-routes'
 import { registerPresetRoutes } from './api/preset-routes'
@@ -16,6 +17,7 @@ import { featureForPath } from './telemetry/feature-map'
 import { registerTerminalRoutes } from './terminal/terminal-routes'
 import { registerRoutineRoutes } from './routines/routine-routes'
 import { lanAuth, codeAuth } from './auth'
+import { registerLinkApi, registerLinkAuth } from './link/link-routes'
 import { mountExtApi } from './ext/mount'
 import { PublicRunManager } from './ext/run-manager'
 import { createMakeBody } from './ext/generation'
@@ -85,6 +87,13 @@ export function createApp(d: Deps): Hono {
   // Code always needs a key from a non-host device, even when the rest of the app is open.
   app.use('/api/v1/code/*', codeAuth(d))
 
+  // Turbo Link's own gate (ADR-376). MUST come after lanAuth so an ordinary LAN request is
+  // still subject to the normal gate; it is an INVERSION of lanAuth and exempts nothing,
+  // including loopback (spec §3.3). Registered here, above the telemetry middleware, so a
+  // rejected peer never counts as feature usage — the façade's HANDLERS are registered
+  // below it instead (see registerLinkApi).
+  registerLinkAuth(app, d)
+
   // Feature-discovery + feature-engagement telemetry (ADR-299, the latter's
   // wiring added by the telemetry-review follow-up). Runs AFTER the auth gates
   // above, so a request that was rejected never counts as the user discovering
@@ -102,9 +111,21 @@ export function createApp(d: Deps): Hono {
     await next()
   })
 
+  // Turbo Link façade HANDLERS (ADR-376) — gate already registered above.
+  //
+  // These must come after the feature-telemetry middleware directly above. Hono composes
+  // matching handlers in registration order, so a route handler that returns without
+  // calling next() short-circuits every middleware registered later: registered above the
+  // telemetry middleware, `POST /api/link/v1/hello` never reached it, and the `link`
+  // feature was recorded for exactly one case — a 404 on a path the façade does not serve.
+  // A metric that fires only on failures is worse than none. Every future façade route
+  // inherits this ordering, so keep the registration here.
+  registerLinkApi(app, d, { authAlreadyRegistered: true })
+
   app.get('/healthz', (c) => c.json({ status: 'ok', version: d.version }))
 
   registerApi(app, d)
+  registerLinkAdminRoutes(app, d)
   registerChatRoutes(app, d)
   registerChatAgentRoutes(app, d)
   registerPresetRoutes(app, d)

@@ -21,6 +21,7 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { join, dirname } from 'node:path'
 import { buildShellCommand } from './util/shell-command'
 import { requiresShell, resolveExecutable } from './util/resolve-executable'
+import { isQualifiedId } from './link/model-id'
 
 /** Everything a harness might need to wire itself to this daemon, resolved once per launch and
  *  handed to every per-harness hook on {@link CliSpec}. Exists so adding a harness is a data entry
@@ -332,6 +333,27 @@ async function fetchModels(base: string, _fetch: typeof fetch = fetch): Promise<
     if (!res.ok) return []
     const data = (await res.json()) as { models?: ModelEntry[] }
     return data.models ?? []
+  } catch {
+    return []
+  }
+}
+
+/** Every model id the daemon's OpenAI-compatible gateway currently advertises, including
+ *  the qualified `<machine>/<model>` ids of every ONLINE linked host (ADR-376).
+ *
+ *  This is the right authority for a remote id and the local `/api/v1/models` is not:
+ *  `/v1/models` lists exactly what the gateway can route right now, so a link that has
+ *  gone offline contributes nothing and the id is simply absent — which is what turns a
+ *  dead link into a clear "not found" at launch instead of a failure at the first prompt.
+ *
+ *  Returns [] on any network error, like `fetchModels`: the caller treats an empty list as
+ *  "no remote model matched", which is the honest answer when we could not ask. */
+async function fetchGatewayModelIds(base: string, _fetch: typeof fetch = fetch): Promise<string[]> {
+  try {
+    const res = await _fetch(`${base}/v1/models`, { signal: AbortSignal.timeout(5000) })
+    if (!res.ok) return []
+    const data = (await res.json()) as { data?: Array<{ id?: unknown }> }
+    return (data.data ?? []).map((e) => e.id).filter((id): id is string => typeof id === 'string' && id.length > 0)
   } catch {
     return []
   }
@@ -1201,11 +1223,42 @@ export async function launchCli(
   const alreadyRunning =
     status?.engine?.state === 'running' && !!status?.model?.name
 
+  /** Set when `--model` named a model on a LINKED host (ADR-376). Nothing about it is
+   *  local: no key to resolve, nothing to load, and no local engine that has to be
+   *  running — the gateway's ModelRouter routes the qualified id to the host. */
+  let remoteModel: string | null = null
+
   if (modelKey) {
     // --model given: resolve against the library, then load if not already loaded.
     const models = await fetchModels(base, _fetch)
     const resolvedKey = resolveModelKey(models, modelKey)
-    if (!resolvedKey) {
+
+    // Turbo Link fallback, and deliberately a FALLBACK rather than a first check: a local
+    // key can legitimately contain a slash (`unsloth/Qwen3-GGUF`), so it parses as
+    // qualified while naming no machine at all. Local resolution therefore keeps first
+    // refusal and its behaviour is completely unchanged — a qualified id only reaches the
+    // link path when the local library has nothing for it.
+    if (!resolvedKey && isQualifiedId(modelKey)) {
+      // The daemon's own `/v1/models` is the authority: it lists exactly the qualified ids
+      // the gateway can actually route right now, so an offline machine's models are simply
+      // absent and a typo fails HERE rather than at the user's first prompt. Matched
+      // EXACTLY — the local resolver ends in a substring match, which is only safe because
+      // a wrong local guess still runs on this machine with weights the user can see.
+      const advertised = await fetchGatewayModelIds(base, _fetch)
+      if (advertised.includes(modelKey)) remoteModel = modelKey
+      else {
+        const remotes = advertised.filter((id) => isQualifiedId(id))
+        process.stderr.write(
+          `Model not found: "${modelKey}"\n` +
+            (remotes.length
+              ? `Models on linked machines:\n${remotes.map((id) => `  ${id}`).join('\n')}\n`
+              : `No linked machine is currently online — check Settings → Turbo Link.\n`),
+        )
+        return 1
+      }
+    }
+
+    if (!resolvedKey && !remoteModel) {
       const list = models.map((m) => `  ${m.key}  (${m.name})`).join('\n')
       process.stderr.write(
         `Model not found: "${modelKey}"\n` +
@@ -1213,8 +1266,13 @@ export async function launchCli(
       )
       return 1
     }
-    // Already loaded with the same key — skip the load.
-    if (alreadyRunning && status?.model?.key === resolvedKey) {
+
+    // Past the guards above, `!resolvedKey` means `remoteModel` — the model lives on
+    // another machine and there is nothing to load here. Skipping the local load is the
+    // whole point: a laptop borrowing a workstation's GPU must not spin up its own engine.
+    if (!resolvedKey) {
+      // Nothing to do.
+    } else if (alreadyRunning && status?.model?.key === resolvedKey) {
       // Fall through to launch.
     } else {
       process.stdout.write(`▸ Loading model "${resolvedKey}"…\n`)
@@ -1258,17 +1316,28 @@ export async function launchCli(
     if (refreshed) status = refreshed
   }
 
-  // At this point we expect a model to be loaded.
-  if (status?.engine?.state !== 'running' || !status?.model?.name) {
-    process.stderr.write(
-      `TurboLLM is running, but no model is loaded.\n` +
-        `Open ${base} → Models → Load a model, then run this again.\n`,
-    )
-    return 1
+  // At this point we expect a model to be loaded — UNLESS it is a remote one, in which
+  // case the local engine is deliberately untouched and demanding it be running would
+  // refuse the one configuration Turbo Link exists to serve: a machine with no GPU of its
+  // own driving a linked host's.
+  let model: string
+  let pinnedModel: string
+  if (remoteModel) {
+    model = remoteModel
+    // Verbatim, qualifier and all: this is exactly what ModelRouter.resolveRemote routes on.
+    pinnedModel = remoteModel
+  } else {
+    if (status?.engine?.state !== 'running' || !status?.model?.name) {
+      process.stderr.write(
+        `TurboLLM is running, but no model is loaded.\n` +
+          `Open ${base} → Models → Load a model, then run this again.\n`,
+      )
+      return 1
+    }
+    model = status.model.name
+    // Prefer the stable key over the display name — it's what the gateway routes on.
+    pinnedModel = status.model.key ?? model
   }
-  const model = status.model.name
-  // Prefer the stable key over the display name — it's what the gateway routes on.
-  const pinnedModel = status.model.key ?? model
   // Absent when the engine advertises no slot count (vLLM/mlx-lm do their own batching) — in that
   // case no cap is set and the CLI keeps its own default, rather than inventing a limit of 1.
   const parallelSlots = status.engine?.parallelSlots
@@ -1281,6 +1350,14 @@ export async function launchCli(
   // error, and every consumer falls back to the loaded model alone, so a hiccup degrades the picker
   // rather than failing the launch. Cheap — it is one loopback request.
   const libraryModels = spec.prepareConfig ? await fetchModels(base, _fetch) : []
+  // A config-file harness's picker can only offer what we write into its config, and a remote
+  // model is not in the LOCAL library — so pinning `turbollm/<machine>/<model>` without adding
+  // the row would point the harness at a model it does not know it has. `nativeCtx` is left
+  // unset: we have no honest figure for another machine's load profile, and advertisedCtx
+  // already prefers omitting the field to inventing a number.
+  if (remoteModel && spec.prepareConfig && !libraryModels.some((m) => m.key === remoteModel)) {
+    libraryModels.push({ key: remoteModel, name: remoteModel })
+  }
 
   // Everything a per-harness hook needs, resolved once.
   const launchCtx: LaunchContext = {

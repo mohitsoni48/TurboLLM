@@ -38,6 +38,11 @@ const AUTH_KEY = 'tllm.authToken'
 export class ApiError extends Error {
   code: string
   status: number
+  /** The capability a 403 named, when it named one (Turbo Link's peer-side admin proxy
+   *  relays the host's `error.capability` — see link-admin-routes.ts). Optional and unset
+   *  everywhere else; `describeRemoteFailure` is the only reader. Kept here rather than in
+   *  a subclass so the many `instanceof ApiError` checks across the app keep working. */
+  capability?: string
   constructor(code: string, message: string, status: number) {
     super(message)
     this.name = 'ApiError'
@@ -643,6 +648,9 @@ export type DaemonSettings = {
   /** Listen port (spec 08 §2). Takes effect on the next daemon restart. */
   port: number
   theme: string
+  /** Human-readable name this machine reports to a Turbo Link peer (ADR-376). Empty
+   *  means "use the OS hostname" — the daemon resolves the fallback, never the browser. */
+  machineName: string
   autoGenerateTitles: boolean
   /** Release 3: background extraction of durable facts from the user's own chat messages,
    *  injected into future new conversations. Off by default (opt-in trust surface). */
@@ -700,8 +708,12 @@ export type DaemonSettings = {
   /** Experimental feature flags (2026-07-14, Settings → Experimental). Off by default for
    *  new/distributed installs. Code used to be one of these — removed when it graduated to
    *  generally available (ADR-280). `routines` (2026-08-04) is the newest: Routines never shipped
-   *  outside this gate, so it defaults to off for every install, new or upgraded. */
-  experimental: { memory: boolean; cloudDeploy: boolean; routines: boolean }
+   *  outside this gate, so it defaults to off for every install, new or upgraded.
+   *  `turboLink` (2026-08-21, ADR-376) is the newest still: fully built and green, but never
+   *  verified against a real second machine, so it is opt-in. While it is off the Turbo Link
+   *  section does not render, `useLinks`/`useRemoteModels` do not fetch, and every merged
+   *  fleet list falls back to local-only rows with no origin column and no machine filter. */
+  experimental: { memory: boolean; cloudDeploy: boolean; routines: boolean; turboLink: boolean }
 }
 
 /** Tool-call approval gate policy (mirrors turbollm/src/tools/tool-policy.ts). */
