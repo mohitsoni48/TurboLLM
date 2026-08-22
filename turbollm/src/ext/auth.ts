@@ -50,12 +50,27 @@ function presented(c: Context): string {
   return c.req.header('X-Api-Key')?.trim() ?? ''
 }
 
+/** Every key issued today (legacy keys, `turbollm launch` keys, Cloud Launch tunnel keys) falls
+ *  back to `tenant: 'local'` with all scopes (`resolveTenantFromKey`'s own fallback) — and
+ *  there is no supported way yet to mint a key with an explicit non-local tenant. `local` is
+ *  the desktop UI's OWN chat data; without this, flipping `api.ext.enabled` on would turn
+ *  every key an operator has ever issued — including a tunnel key handed to an untrusted
+ *  device — into a full read/write/delete credential for their own chats via the external API. */
+const LOCAL_TENANT = 'local'
+
 export function extAuth(d: Deps): MiddlewareHandler {
   return async (c, next) => {
     const key = presented(c)
     const resolved = key ? resolveTenantFromKey(key, d) : null
     if (!resolved) {
       return extError(c, 'auth', 'unauthorized', 'A valid API key is required for the external API.')
+    }
+    if (resolved.tenant === LOCAL_TENANT) {
+      return extError(
+        c, 'auth', 'tenant_not_supported',
+        "This key resolves to the local tenant, which is not accessible via /api/ext/v1. Mint a key with an explicit, non-'local' tenant to use the external API.",
+        { status: 403 },
+      )
     }
     c.set('extTenant', resolved.tenant)
     c.set('extScopes', resolved.scopes)

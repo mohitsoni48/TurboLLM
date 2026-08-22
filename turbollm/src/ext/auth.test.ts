@@ -68,6 +68,37 @@ test('a valid key passes and puts the tenant on the context', async () => {
   assert.equal((await res.json() as { tenant: string }).tenant, 'acme')
 })
 
+// I2 (release-gate finding): every key issued by the product today — including a legacy key,
+// a Cloud Launch tunnel key, or a plain `turbollm launch`-generated key — resolves to
+// `tenant: 'local'` with every scope (resolveTenantFromKey's own fallback, and there is no
+// supported way yet to mint a key with an explicit non-local tenant). Once an operator flips
+// `api.ext.enabled`, that made every key they had ever issued a full read/write/delete
+// credential for their own chat history via the external API. `local` is the desktop UI's own
+// data — refused categorically here, not just left to the default-owner convention.
+test('a key that resolves to the local tenant is refused on the external API, even though it is valid everywhere else', async () => {
+  const app = new Hono()
+  const d = depsWith([{ key: 'tllm-legacy-key' }])   // no `tenant` field -> resolves to 'local'
+  app.use('/api/ext/v1/*', extAuth(d))
+  app.get('/api/ext/v1/ping', (c) => c.json({ ok: true }))
+
+  const res = await app.request('/api/ext/v1/ping', { headers: { Authorization: 'Bearer tllm-legacy-key' } })
+  assert.equal(res.status, 403)
+  const body = await res.json() as { error: { type: string; code: string } }
+  assert.equal(body.error.type, 'auth')
+  assert.equal(body.error.code, 'tenant_not_supported')
+})
+
+test('a non-local tenant is unaffected by the local-tenant refusal', async () => {
+  const app = new Hono()
+  const d = depsWith([{ key: 'tllm-ext-acme-secret', tenant: 'acme' }])
+  app.use('/api/ext/v1/*', extAuth(d))
+  app.get('/api/ext/v1/ping', (c) => c.json({ tenant: c.get('extTenant') }))
+
+  const res = await app.request('/api/ext/v1/ping', { headers: { Authorization: 'Bearer tllm-ext-acme-secret' } })
+  assert.equal(res.status, 200)
+  assert.equal((await res.json() as { tenant: string }).tenant, 'acme')
+})
+
 test('a tenant named in a header or body is ignored — only the key decides', async () => {
   const app = new Hono()
   const d = depsWith([{ key: 'tllm-ext-acme-secret', tenant: 'acme' }])
