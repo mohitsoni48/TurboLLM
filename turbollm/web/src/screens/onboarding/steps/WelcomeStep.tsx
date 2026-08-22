@@ -1,5 +1,6 @@
 import { Check, Cpu, HardDrive, Loader2, MonitorSmartphone } from 'lucide-react'
 import { useEngineBackends, useStatus } from '../../../lib/queries'
+import { primaryVendorSummary } from '../../../lib/vram'
 import type { StepComponentProps } from '../OnboardingScreen'
 
 /** Step 0 — Welcome + hardware readout (spec 25 §4). Shows what was actually
@@ -12,7 +13,11 @@ export default function WelcomeStep({ onContinue }: StepComponentProps) {
   const { data: status } = useStatus()
   const { data: backends } = useEngineBackends(status?.engineProvision?.active ?? false)
   const provision = status?.engineProvision
-  const gpu = backends?.gpus?.[0]
+  // Summarise EVERY card, not gpus[0]. A dual-GPU box read as a single card here — one name and
+  // one card's VRAM — while the rest of the app already shows "2× … 30 GB". primaryVendorSummary
+  // is the same helper the Engines hero uses (it sums the primary vendor and drops an iGPU that
+  // only shares system RAM, ADR-306), so the two readouts cannot drift apart again.
+  const hw = primaryVendorSummary(backends?.gpus ?? [])
 
   const provisionDone = !provision || (!provision.active && provision.phase !== 'error')
   const provisionFailed = provision?.phase === 'error'
@@ -38,11 +43,15 @@ export default function WelcomeStep({ onContinue }: StepComponentProps) {
         <div className="grid grid-cols-2 gap-3">
           <div className="flex items-center gap-2">
             <Cpu size={14} className="text-muted" />
-            <span className="text-sm text-ink">{gpu ? gpu.name : 'CPU only'}</span>
+            <span className="text-sm text-ink">
+              {hw.gpuName ? (hw.count > 1 ? `${hw.count}× ${hw.gpuName}` : hw.gpuName) : 'CPU only'}
+            </span>
           </div>
           <div className="flex items-center gap-2">
             <HardDrive size={14} className="text-muted" />
-            <span className="text-sm text-ink">{gpu ? `${Math.round(gpu.vramMb / 1024)} GB VRAM` : 'No discrete GPU'}</span>
+            <span className="text-sm text-ink">
+              {hw.gpuName ? `${Math.round(hw.vramMb / 1024)} GB VRAM` : 'No discrete GPU'}
+            </span>
           </div>
         </div>
       </div>
