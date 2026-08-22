@@ -88,6 +88,38 @@ test('a key that resolves to the local tenant is refused on the external API, ev
   assert.equal(body.error.code, 'tenant_not_supported')
 })
 
+// Round-2 release-gate finding H1a: the local-tenant refusal above made GET /capabilities and
+// GET /openapi.json unreachable to EVERY key today — a clean regression, since there is
+// currently no supported way to mint a non-local-tenant key at all, and these two routes carry
+// no tenant data whatsoever (pure schema/limits discovery, and the only two routes with no
+// requireScope call). A local-tenant key must still reach these specifically, while remaining
+// refused everywhere else.
+test('a local-tenant key still reaches GET /capabilities and GET /openapi.json — pure discovery routes, no tenant data', async () => {
+  const app = new Hono()
+  const d = depsWith([{ key: 'tllm-legacy-key' }])   // no `tenant` field -> resolves to 'local'
+  app.use('/api/ext/v1/*', extAuth(d))
+  app.get('/api/ext/v1/capabilities', (c) => c.json({ ok: true }))
+  app.get('/api/ext/v1/openapi.json', (c) => c.json({ ok: true }))
+
+  for (const path of ['/api/ext/v1/capabilities', '/api/ext/v1/openapi.json']) {
+    const res = await app.request(path, { headers: { Authorization: 'Bearer tllm-legacy-key' } })
+    assert.equal(res.status, 200, `${path} must stay reachable to a local-tenant key`)
+  }
+})
+
+test('the local-tenant refusal still applies to every OTHER route, even one with a similar-looking path', async () => {
+  const app = new Hono()
+  const d = depsWith([{ key: 'tllm-legacy-key' }])
+  app.use('/api/ext/v1/*', extAuth(d))
+  app.get('/api/ext/v1/chats', (c) => c.json({ ok: true }))
+  app.get('/api/ext/v1/capabilities/nested', (c) => c.json({ ok: true }))
+
+  for (const path of ['/api/ext/v1/chats', '/api/ext/v1/capabilities/nested']) {
+    const res = await app.request(path, { headers: { Authorization: 'Bearer tllm-legacy-key' } })
+    assert.equal(res.status, 403, `${path} must still be refused — the exemption is two exact paths, not a prefix`)
+  }
+})
+
 test('a non-local tenant is unaffected by the local-tenant refusal', async () => {
   const app = new Hono()
   const d = depsWith([{ key: 'tllm-ext-acme-secret', tenant: 'acme' }])

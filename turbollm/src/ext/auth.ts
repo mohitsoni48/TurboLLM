@@ -58,6 +58,18 @@ function presented(c: Context): string {
  *  device — into a full read/write/delete credential for their own chats via the external API. */
 const LOCAL_TENANT = 'local'
 
+/** Round-2 release-gate finding H1a: the local-tenant refusal below made these two routes
+ *  unreachable to EVERY key today (since there is currently no supported way to mint a
+ *  non-local-tenant key at all) — a clean regression, since they carry no tenant data
+ *  whatsoever. `GET /capabilities` and `GET /openapi.json` are the two live routes with no
+ *  `requireScope` call at all (openapi.ts's own manifest entries document why: pure schema/
+ *  limits discovery), and bootstrapping this API means being able to read the schema and
+ *  limits BEFORE a properly-tenanted key exists. Exempted from the local-tenant refusal
+ *  specifically — NOT from authentication itself, a valid key is still required — since a
+ *  local-tenant key is still a real, valid credential; it is only refused elsewhere because
+ *  those OTHER routes would hand it another tenant's (or the local install's own) data. */
+const TENANT_AGNOSTIC_PATHS = new Set(['/api/ext/v1/capabilities', '/api/ext/v1/openapi.json'])
+
 export function extAuth(d: Deps): MiddlewareHandler {
   return async (c, next) => {
     const key = presented(c)
@@ -65,7 +77,7 @@ export function extAuth(d: Deps): MiddlewareHandler {
     if (!resolved) {
       return extError(c, 'auth', 'unauthorized', 'A valid API key is required for the external API.')
     }
-    if (resolved.tenant === LOCAL_TENANT) {
+    if (resolved.tenant === LOCAL_TENANT && !TENANT_AGNOSTIC_PATHS.has(c.req.path)) {
       return extError(
         c, 'auth', 'tenant_not_supported',
         "This key resolves to the local tenant, which is not accessible via /api/ext/v1. Mint a key with an explicit, non-'local' tenant to use the external API.",
