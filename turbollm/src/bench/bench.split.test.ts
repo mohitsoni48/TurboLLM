@@ -179,3 +179,48 @@ test('single-GPU box → left alone', () => {
   const p = base(one, { ctx: 8192, nCpuMoe: 24, ngl: 99 }, m)
   assert.deepEqual(withBalancedSplit(p, m, one).gpu.tensorSplit, [])
 })
+
+// ---- ADR-379: the single-GPU gate judges the KV that will actually run ------------------
+// Live failure this fixes, 2x Tesla T4 (2x15360 MB), dense Qwen3.8-27B Q4_0 16.1 GB at
+// ctx 188416 with the user's q8_0 KV. The gate used to measure feasibility with the SMALLEST KV
+// the engine offers, so it opened a single-GPU branch whose real ceiling was ngl 28/65 = 0.43.
+// Bench log: probe ngl=32 oom, then 15/23/27/29/28 ok, then "bench ngl=28 -> TIMEOUT", then it
+// finally moved to the layer-split. ~13 minutes and a timeout for a branch that never could work.
+
+const T4x2_REAL = sys([15360, 15360])
+const DENSE_27B = { sizeBytes: 16_056_478_688, moe: false, blockCount: 65, arch: 'qwen3' } as Partial<ModelEntry>
+
+test('ADR-379: a dense model that needs both cards is NOT offered single-GPU', () => {
+  const m = model(DENSE_27B)
+  const p = base(T4x2_REAL, { ctx: 188416, ngl: 99, kvTypeK: 'q8_0', kvTypeV: 'q8_0' }, m)
+  const strats = pickSplitStrategies(m, T4x2_REAL, p, caps)
+  assert.ok(!strats.some((g) => g.splitMode === 'none'), 'single-GPU must not be offered')
+  assert.equal(strats.length, 1)
+  assert.equal(strats[0].splitMode, 'layer')
+})
+
+test('ADR-379: the verdict is not changed by a smaller KV the run will never use', () => {
+  // The old gate swapped in turbo4 here and flipped the answer. The engine still OFFERS turbo4 --
+  // caps is unchanged -- so this pins that offering it is no longer enough to open the branch.
+  const m = model(DENSE_27B)
+  const p = base(T4x2_REAL, { ctx: 188416, ngl: 99, kvTypeK: 'q8_0', kvTypeV: 'q8_0' }, m)
+  assert.ok(caps.kvTypes.includes('turbo4'), 'precondition: a smaller KV type is available')
+  assert.ok(!pickSplitStrategies(m, T4x2_REAL, p, caps).some((g) => g.splitMode === 'none'))
+})
+
+test('ADR-379: a dense model that comfortably fits one card still gets single-GPU (GitHub #62)', () => {
+  const m = model({ sizeBytes: 8_000_000_000, moe: false, blockCount: 32, arch: 'qwen3' })
+  const p = base(T4x2_REAL, { ctx: 4096, ngl: 99 }, m)
+  const strats = pickSplitStrategies(m, T4x2_REAL, p, caps)
+  assert.equal(strats[0].splitMode, 'none', 'tried first -- the likely winner')
+})
+
+test('ADR-379: the 0.5 threshold is untouched, so GitHub #62 still gets its shot', () => {
+  // Guards against fixing the gate by raising the bar, which was tried and reverted: it
+  // rejected the reported 0.43 case but also rejected #62 at ~0.72, which must still be
+  // offered. The KV type is what separates them, not the threshold.
+  const m = model({ sizeBytes: 15_000_000_000, blockCount: 32, nativeCtx: 8192 })
+  const s16 = sys([16000, 16000])
+  const strats = pickSplitStrategies(m, s16, base(s16, { ctx: 8192 }, m), caps)
+  assert.equal(strats[0].splitMode, 'none')
+})

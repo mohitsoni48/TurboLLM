@@ -1569,8 +1569,6 @@ export function pickSplitStrategies(
   // Single-GPU: as much of the model as this ONE card can hold. Judge feasibility with the SMALLEST
   // quality-preserving KV the engine offers (the inner KV sweep can pick it to fit), so a model that
   // only fits one card with turbo4 still gets the single-GPU branch it would win on.
-  const kvOpts = pickKvQuants(base.kvTypeK, caps.kvTypes)
-  const bestFitKv = kvOpts.reduce((a, b) => (kvBytes(b) < kvBytes(a) ? b : a), kvOpts[0] ?? base.kvTypeK)
   const mainGpu = base.gpu.mainGpu >= 0 ? base.gpu.mainGpu : 0
   const single: GpuProfile = { ...base.gpu, splitMode: 'none', mainGpu, tensorSplit: [] }
   // Feasibility is NOT "does the model fit at FULL GPU offload" — the inner offload search
@@ -1584,7 +1582,20 @@ export function pickSplitStrategies(
   // find the largest GPU-resident fraction this ONE card can hold and offer single-GPU only when
   // CPU wouldn't end up doing the majority of the work — below that, the summed multi-GPU pool
   // (kept as today's fallback either way) is the sounder bet.
-  const singleFrac = maxGpuFraction(entry, sys, { ...base, gpu: single, kvTypeK: bestFitKv, kvTypeV: bestFitKv })
+  //
+  // The 0.5 threshold is deliberately UNCHANGED. Raising it for dense models (partial residency
+  // hurts far more when every parameter is active) was tried and reverted: the KV fix below
+  // already rejects the reported failure at 0.43, while GitHub #62's "just missed the card" case
+  // computes ~0.72 and must still be offered. A higher bar fixed nothing extra and broke #62.
+  //
+  // Judged with the KV type that will ACTUALLY be used (ADR-379). This used to judge with the
+  // smallest KV the engine offers, justified by "the inner KV sweep can pick it to fit" — but
+  // ADR-219 removed that sweep, so nothing downstream can shrink the KV any more and the gate was
+  // answering a hypothetical. Live on 2x T4: a dense 27B at ctx 188416 with the user's q8_0 has a
+  // true single-card ceiling of ngl 28/65 = 0.43, but measured against turbo4 it cleared 0.5, so
+  // the doomed branch was opened anyway — six probes and a 10-minute bench TIMEOUT before falling
+  // through to the layer-split that was right from the start.
+  const singleFrac = maxGpuFraction(entry, sys, { ...base, gpu: single })
   if (singleFrac >= 0.5) strategies.push(single)
 
   // The profile's current split (default: layer across all GPUs) — always kept, as the fallback for

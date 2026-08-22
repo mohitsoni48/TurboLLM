@@ -16,8 +16,8 @@ import {
   type OnboardingState, type ProfileId,
 } from '../onboarding/state'
 import { recommend, type HardwareFacts } from '../onboarding/recommend'
-import { getSysInfo } from '../sysinfo/sysinfo'
 import { detectHardware } from '../engines/hardware'
+import { getSysInfo, type SysInfo } from '../sysinfo/sysinfo'
 import type { ConfigStore } from '../config/config'
 import type { Emitter } from '../telemetry/emit'
 
@@ -37,19 +37,25 @@ function isT0(hw: HardwareFacts): boolean {
  *  memory tiering is out of scope here (spec 25 §12 open question); until
  *  resolved, only discrete/dedicated VRAM is treated as `usableVramMb`.
  *
- *  `unifiedMemory` comes from `detectHardware()` rather than a local
- *  `gpus.some(g => g.unified)`, because `some()` answers the wrong question.
- *  It reports true for an Intel iGPU sitting beside an NVIDIA dGPU — a box
- *  whose `usableVramMb` is real, dedicated VRAM — and `recommend()` would then
- *  charge that card's VRAM against system RAM for no reason. `detectHardware`
- *  computes it over the adapters it actually summed, so it means what the
- *  joint-pool constraint needs it to mean: "this GPU budget IS system RAM".
- *  GitHub #164. */
-export function hardwareFactsFromSysInfo(): HardwareFacts {
-  const info = getSysInfo()
-  const primaryVramMb = info.gpus[0]?.vramMb ?? 0
-  const { unifiedMemory } = detectHardware(info)
-  return { usableVramMb: primaryVramMb, systemRamMb: info.ramMB, unifiedMemory }
+ *  BOTH fields come from `detectHardware()`, and that is the point: it is the single place
+ *  that knows which adapters actually count, so neither can drift from the loader.
+ *
+ *  `usableVramMb` is the whole primary-vendor pool, NOT `gpus[0]`. A multi-GPU box pools its
+ *  VRAM for inference — `gpuBudgetMb` sums it for any layer/row split, which is the default —
+ *  so sizing from one card recommended a model for half the machine: a 2x16 GB box resolved
+ *  against 15 GB and was offered a model it could hold twice over, silently. `detectHardware`
+ *  also drops an iGPU that merely shares system RAM (ADR-306/ADR-189), so the pool cannot be
+ *  inflated by a card nothing can be offloaded to.
+ *
+ *  `unifiedMemory` comes from the same call rather than a local `gpus.some(g => g.unified)`,
+ *  because `some()` answers the wrong question. It reports true for an Intel iGPU sitting
+ *  beside an NVIDIA dGPU — a box whose `usableVramMb` is real, dedicated VRAM — and
+ *  `recommend()` would then charge that card's VRAM against system RAM for no reason.
+ *  `detectHardware` computes it over the adapters it actually summed, so it means what the
+ *  joint-pool constraint needs it to mean: "this GPU budget IS system RAM". GitHub #164. */
+export function hardwareFactsFromSysInfo(info: SysInfo = getSysInfo()): HardwareFacts {
+  const { vramMb, unifiedMemory } = detectHardware(info)
+  return { usableVramMb: vramMb, systemRamMb: info.ramMB, unifiedMemory }
 }
 
 /** Pure, so the transition rules are testable without a server. `now` is
