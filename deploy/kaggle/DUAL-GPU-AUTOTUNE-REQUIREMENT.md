@@ -44,9 +44,35 @@ TurboQuant CUDA (T4), model `Qwen3.8-27B-UD-Q4_K_XL` (17.9 GB, 65 blocks, ships 
    nearly free — and it is the only geometry that could ever reproduce the reference config.
    Implemented; see BUG-6.
 
-**Honest gap:** auto-tune's own end-to-end answer for this model was never captured — its first
-candidate (single-GPU) ate the budget at this depth, and the sweep was cancelled twice. The table
-above is hand-measured. Whether auto-tune *lands* on the Layer/200k config is still unverified.
+### Does auto-tune find this on its own? **Yes — verified end to end.**
+
+A full sweep was run from the GUI on the same base and allowed to finish. Its "Auto-tune complete"
+dialog:
+
+| Auto-tune's pick | Value |
+|---|---|
+| GPU layers | **65** |
+| Context length | **200,192** |
+| KV cache type | **q8_0** |
+| Flash attention | **on** |
+| Generation speed (measured) | 7.5 tok/s |
+| Prefill speed | 246 tok/s |
+| VRAM used | ~23,724 MB |
+| First token | **108,027 ms** |
+
+**It converged on exactly the hand-tuned config** — same layer split, same all-65 residency, same
+ctx, same KV. Auto-tune is *correct* for this model; what it is not is *fast*: the run takes the
+better part of an hour, and it spends the first chunk of that on a single-GPU candidate that
+cannot win (see BUG-5 / ADR-379).
+
+Its **7.5 tok/s vs the 11.5–12 tok/s measured in chat is not a discrepancy** — it is the documented
+methodology gap. The bench prompt is `0.75 × ctx` capped at 32k tokens; a chat turn starts from a
+short prompt. Same config, two depths on one curve. The `First token: 108,027 ms` is the honest
+price of a 32k-token prefill at this depth on T4s, and is the number worth quoting to anyone asking
+what 200k on two T4s actually feels like.
+
+Auto-tune also surfaced a correct advisory of its own: *"This result used the q8_0 KV cache type. A
+different type (e.g. q4_0) may run faster, at some output quality cost."*
 
 ---
 

@@ -201,6 +201,25 @@ the configuration the dual-GPU work targets. Both defects share one consequence:
 - **Fix:** add the draft context to the estimate whenever the speculative mode is not `off`, or at
   minimum surface it in the panel so the number is not silently optimistic.
 
+### BUG-13 · The auto-tune progress display goes stale and never recovers — **OPEN**
+- **Observed live at ctx 200,192.** The progress line sat at
+  `KV q8_0: probing ngl=32 (range 0–65)…` for **~50 minutes**, unchanged, well past auto-tune's own
+  45-minute `TOTAL_BUDGET_MS`. Closing and reopening the settings dialog showed the true state:
+  `Measuring ngl=65 — measuring t/s…`. The sweep had been advancing the whole time; only the
+  displayed step was frozen.
+- **Same class as the engine badge sticking on `Stopping`** after an eject, which also only cleared
+  on a page reload. In both cases the client stops applying server state and shows one value
+  forever.
+- **Why it matters more than it sounds.** A frozen step makes a long-but-healthy run
+  indistinguishable from a hang. In this session it directly caused a *cancelled* sweep earlier on
+  (the run was at `prefill 46%` and progressing), and then a page reload — and a reload is
+  dangerous here because auto-tune holds its winner pending a **Save** click, with no GUI anywhere
+  to recover it afterwards (Model actions offers only Pin / Find other quants / Delete, and per
+  BUG-9 the bench log cannot even record which split strategy won).
+- **Not established:** whether a reload actually discards an already-finished winner. The one
+  reload in this session happened while the sweep was still running, so that remains untested —
+  do not assume it either way.
+
 ### Consequence for auto-tune
 Auto-tune's `ngl` search is probe-driven, so it *discovers* the real ceiling by loading — it is not
 misled the way the panel is. But `pickSplitStrategies` gates the single-GPU branch on
