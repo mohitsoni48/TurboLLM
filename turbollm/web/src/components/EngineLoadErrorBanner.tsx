@@ -4,7 +4,8 @@ import { X } from 'lucide-react'
 import type { EngineError, Status } from '../lib/types'
 import { Button } from './ui/button'
 import { CopyButton } from './ui/copy-button'
-import { track } from '../lib/api'
+import { track, loadModel } from '../lib/api'
+import { LoadFailureRecovery } from './LoadFailureRecovery'
 
 /** Every distinct `errInfo` the backend produces (`manager.ts` — `onTerminated`,
  *  `readiness`'s timeout/model-load-failure branches) is a fresh object literal, so
@@ -33,6 +34,7 @@ function errorKey(error: EngineError | undefined): string | null {
  */
 export function EngineLoadErrorBanner({ status }: { status: Status | undefined }) {
   const [dismissedKey, setDismissedKey] = useState<string | null>(null)
+  const [showLaunch, setShowLaunch] = useState(false)
   const navigate = useNavigate()
   const { pathname } = useLocation()
   const state = status?.engine.state
@@ -40,6 +42,21 @@ export function EngineLoadErrorBanner({ status }: { status: Status | undefined }
   const key = errorKey(error)
 
   if (state !== 'error' || !error || key === dismissedKey) return null
+
+  /** Re-attempt the load that just failed. `status.model` is null after a failure, so the
+   *  key comes from `lastLoaded` — the daemon's config-tracked record of what the user
+   *  asked for, which survives the failure. Returns whether it worked, so the recovery
+   *  event can report a real `outcome` rather than assuming the click succeeded. */
+  async function retryLoad(): Promise<boolean> {
+    const key = status?.lastLoaded
+    if (!key) return false
+    try {
+      await loadModel(key)
+      return true
+    } catch {
+      return false
+    }
+  }
 
   return (
     <div
@@ -71,6 +88,29 @@ export function EngineLoadErrorBanner({ status }: { status: Status | undefined }
           <X size={14} />
         </button>
       </div>
+      {/* ADR-338 Decision 4's invariant — no failure terminates without a next action.
+          Until this, the banner offered only "Copy log" and "Dismiss": diagnostics, not
+          remedies. `failReason` falls back to 'other' when the daemon predates the field
+          (or could not classify), and 'other' still yields actions, so this can never
+          render an empty row. */}
+      <LoadFailureRecovery
+        failure={error.failReason ?? 'other'}
+        launchCommand={status?.engine.launchCommand}
+        onRetry={async () => {
+          const ok = await retryLoad()
+          if (ok) setDismissedKey(key)
+          return ok
+        }}
+        onShowLaunchCommand={() => setShowLaunch((v) => !v)}
+      />
+      {showLaunch && status?.engine.launchCommand && (
+        <pre
+          className="mt-1.5 max-h-32 overflow-auto rounded-md px-3 py-2 font-mono text-[12px] leading-[1.5]"
+          style={{ background: 'var(--log-bg)', color: 'var(--log-ink)' }}
+        >
+          {status.engine.launchCommand}
+        </pre>
+      )}
       {error.logTail && error.logTail.length > 0 && (
         <pre
           className="mt-1.5 max-h-32 overflow-auto rounded-md px-3 py-2 font-mono text-[12px] leading-[1.5]"
