@@ -152,29 +152,6 @@ card). Every site below instead read the *first* card and reported half the mach
 
 ---
 
-### BUG-14 · Auto-tune never sweeps `parallel`, so it cannot see the only real dual-GPU headroom — **OPEN**
-- **Where:** `turbollm/src/bench/bench.ts`. `parallel` appears exactly twice — `parallel:
-  base.parallel` (line ~855) and `parallel: profile.parallel` (line ~911). Both merely **record**
-  whatever the user set. It is already a field on `BenchCandidate.params`, so the plumbing exists;
-  nothing varies it.
-- **Why it matters:** a layer split is pipeline *placement*, not pipeline *execution*. At batch=1
-  there is nothing to overlap, so GPU 0 idles while GPU 1 finishes — the measured `GPU1 98–99% /
-  GPU0 74%` imbalance. Concurrency is what harvests that idle time.
-- **Measured in the GUI**, same config (ctx 200,192 · layer · ngl 65 · K q8_0 / V turbo4 · spec
-  off), only `Parallel requests` changed, two chat tabs firing the identical prompt at once:
-
-  | Parallel requests | Per stream | Aggregate |
-  |---|---|---|
-  | 1 | 11.5–12 tok/s | ~12 tok/s |
-  | **2** | 9.0 tok/s each (stable 4+ min, 589 / 667 tokens) | **18.0 tok/s** |
-
-  **+50% aggregate for −25% per-stream.** The largest single improvement found in the whole
-  dual-GPU exercise, and auto-tune is blind to it.
-- **Not a straightforward "fix".** Auto-tune optimises single-stream tok/s; by that objective
-  `parallel=2` is a 25% *regression*. Sweeping it requires deciding what auto-tune optimises for
-  (latency vs throughput), which is a product decision — see the requirement doc. Recorded here so
-  the measurement is not lost, not as a self-evident code change.
-
 ### BUG-15 · A saved auto-tune result did not match the config the results dialog displayed — **OPEN, UNEXPLAINED**
 - **Observed:** the "Auto-tune complete" dialog reported `GPU layers 65 · Context length 200,192 ·
   KV cache type q8_0 · Flash attention on`. After clicking **Save**, the model's profile read
@@ -268,6 +245,31 @@ optimistic, in the one direction ADR-379 was written to prevent.
 ---
 
 ## Not a bug — recorded so it stops being re-reported
+
+**"Auto-tune should sweep `parallel` — concurrency is free throughput."** It should not.
+**Founder call, 2026-08-22: auto-tune honours the user's `Parallel requests` setting and does not
+tune it.** Today's code already does exactly that — `parallel: base.parallel` and
+`parallel: profile.parallel` in `bench.ts` pass the profile's value straight through — so **no code
+change is required, and none should be made.**
+
+The measurement that prompted the question is kept because it is useful, not because it is a defect.
+Same config throughout (ctx 200,192 · layer · ngl 65 · K `q8_0` / V `turbo4` · speculative off),
+only `Parallel requests` changed, two chat tabs firing the identical prompt at once:
+
+| Parallel requests | Per stream | Aggregate |
+|---|---|---|
+| 1 | 11.5–12 tok/s | ~12 tok/s |
+| 2 | 9.0 tok/s each (stable 4+ min, 589 / 667 tokens) | **18.0 tok/s** |
+
+That +50% aggregate is real — it is the idle 26% of GPU 0 (`GPU1 98–99% / GPU0 74%`) being
+harvested, the difference between pipeline *placement*, which a layer split gives you, and pipeline
+*execution*, which needs more than one request in flight.
+
+**Why it is still not auto-tune's business.** Auto-tune optimises single-stream tok/s, and by that
+objective `parallel=2` is a 25% **regression** — it would be right to reject it. Chasing aggregate
+throughput would mean changing what auto-tune optimises for, and silently trading a chatting user's
+latency for a throughput number they never asked for. Concurrency is a deployment choice the user
+makes; the tuner's job is to make their choice fast, not to overrule it.
 
 **"Auto-tune made my model slower."** Auto-tune benches at `0.75 × ctx` capped at 32k tokens; a
 quick chat test uses a short prompt. The same config measured **7.8 t/s at a 2,521-token prompt

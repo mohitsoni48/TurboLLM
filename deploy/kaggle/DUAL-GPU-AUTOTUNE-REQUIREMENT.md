@@ -52,15 +52,16 @@ identical prompt at once:
 harvested, and it is the only lever found in this whole exercise that beats the single-stream
 ceiling.
 
-**`parallel` is never swept by auto-tune.** In `bench.ts` it appears exactly twice — `parallel:
-base.parallel` and `parallel: profile.parallel` — both of which merely *record* whatever the user
-set. The field is already carried through `BenchCandidate.params`, so the plumbing exists; nothing
-varies it.
+**DECIDED — auto-tune honours the user's `Parallel requests` setting and does not tune it**
+(founder call, 2026-08-22). Today's code already does exactly that: `parallel: base.parallel` and
+`parallel: profile.parallel` in `bench.ts` pass the profile's value straight through. **No code
+change is required, and none should be made.**
 
-**Whether to act on this is a product call, not a tuning one.** It raises throughput for a serving
-or multi-agent workload and does nothing for one person chatting — that user just sees 12 tok/s
-become 9. Auto-tune optimises single-stream tok/s today, so sweeping `parallel` would need a
-target to optimise *for* before it means anything.
+The measurement stays because it is useful to *users* — someone running a serving or multi-agent
+workload on two cards should know that raising Parallel requests is where the headroom is. It is
+not auto-tune's call to make: the tuner optimises single-stream tok/s, by which `parallel=2` is a
+25% regression it would be right to reject, and trading a chatting user's latency for a throughput
+number they never asked for is exactly the kind of silent override the tuner should not do.
 
 ### The three findings that matter beyond this one box
 
