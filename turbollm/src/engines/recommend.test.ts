@@ -20,6 +20,7 @@ const nvidiaWin: HardwareProfile = {
   hasGpu: true,
   vramMb: 16384,
   gpuName: 'RTX 5070 Ti',
+  unifiedMemory: false,
 }
 const appleMac: HardwareProfile = {
   platform: 'darwin',
@@ -28,6 +29,7 @@ const appleMac: HardwareProfile = {
   hasGpu: true,
   vramMb: 0,
   gpuName: 'Apple M3 Max',
+  unifiedMemory: true,
 }
 const noGpu: HardwareProfile = {
   platform: 'linux',
@@ -35,6 +37,7 @@ const noGpu: HardwareProfile = {
   gpuVendor: 'unknown',
   hasGpu: false,
   vramMb: 0,
+  unifiedMemory: false,
 }
 
 // ── A small, deterministic fake catalog ─────────────────────────────────────

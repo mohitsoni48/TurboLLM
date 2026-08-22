@@ -17,6 +17,7 @@ import {
 } from '../onboarding/state'
 import { recommend, type HardwareFacts } from '../onboarding/recommend'
 import { getSysInfo } from '../sysinfo/sysinfo'
+import { detectHardware } from '../engines/hardware'
 import type { ConfigStore } from '../config/config'
 import type { Emitter } from '../telemetry/emit'
 
@@ -34,11 +35,20 @@ function isT0(hw: HardwareFacts): boolean {
 
 /** Real detected hardware -> the shape `recommend()` needs. Apple unified
  *  memory tiering is out of scope here (spec 25 §12 open question); until
- *  resolved, only discrete/dedicated VRAM is treated as `usableVramMb`. */
+ *  resolved, only discrete/dedicated VRAM is treated as `usableVramMb`.
+ *
+ *  `unifiedMemory` comes from `detectHardware()` rather than a local
+ *  `gpus.some(g => g.unified)`, because `some()` answers the wrong question.
+ *  It reports true for an Intel iGPU sitting beside an NVIDIA dGPU — a box
+ *  whose `usableVramMb` is real, dedicated VRAM — and `recommend()` would then
+ *  charge that card's VRAM against system RAM for no reason. `detectHardware`
+ *  computes it over the adapters it actually summed, so it means what the
+ *  joint-pool constraint needs it to mean: "this GPU budget IS system RAM".
+ *  GitHub #164. */
 export function hardwareFactsFromSysInfo(): HardwareFacts {
   const info = getSysInfo()
   const primaryVramMb = info.gpus[0]?.vramMb ?? 0
-  const unifiedMemory = info.gpus.some((g) => g.unified === true)
+  const { unifiedMemory } = detectHardware(info)
   return { usableVramMb: primaryVramMb, systemRamMb: info.ramMB, unifiedMemory }
 }
 

@@ -119,3 +119,103 @@ test('detectHardware: two real cards of the same vendor still pool, as before', 
   }
   assert.equal(detectHardware(info).vramMb, 49152)
 })
+
+// ── `unifiedMemory`: is `vramMb` a second pool, or a slice of `ramMB`? (GitHub #164) ─────────
+//
+// ADR-306 dropped unified adapters from the sum "as soon as the same vendor also has a real card",
+// which leaves the iGPU-ONLY box — nothing to exclude against — reporting a system-RAM-derived
+// `vramMb` with no signal that it OVERLAPS `ramMB`. These pin the flag that closes that gap. The
+// budget itself is deliberately unchanged: ADR-189 keeps the shared-memory heuristic for exactly
+// this box, and GitHub #85 raised the APU budget on purpose.
+
+test('detectHardware: an iGPU-only Windows box reports its budget as unified, not a second pool', () => {
+  // sysinfo.ts gives an iGPU 50% of system RAM (round(totalmem/1e6 * 0.5)) and tags it
+  // `unified: true`; ramMB is round(totalmem/1e6). 33.5 GB of RAM -> 16750 / 33500, exactly the
+  // shape reported in #164. `vramMb` must survive untouched, and the flag must be true.
+  const info: SysInfo = {
+    os: 'win32/x64',
+    cpu: 'AMD Ryzen 7 7840U',
+    cores: 16,
+    ramMB: 33500,
+    gpus: [{ name: 'AMD Radeon 780M Graphics', vramMb: 16750, vendor: 'amd', unified: true }],
+  }
+  const hw = detectHardware(info)
+  assert.equal(hw.vramMb, 16750, 'ADR-189: the iGPU-only budget is kept, not deleted')
+  assert.equal(hw.unifiedMemory, true, 'that 16750 MB is a slice of the same 33500 MB, not extra')
+})
+
+test('detectHardware: a discrete card of the same size is NOT unified', () => {
+  // The control for the test above: identical numbers, real VRAM. Nothing downstream may tighten.
+  const info: SysInfo = {
+    os: 'win32/x64',
+    cpu: 'Test CPU',
+    cores: 16,
+    ramMB: 33500,
+    gpus: [{ name: 'NVIDIA GeForce RTX 5070 Ti', vramMb: 16750, vendor: 'nvidia' }],
+  }
+  const hw = detectHardware(info)
+  assert.equal(hw.vramMb, 16750)
+  assert.equal(hw.unifiedMemory, false)
+})
+
+test('detectHardware: Strix Halo (GitHub #85) is unified and keeps its full raised budget', () => {
+  const info: SysInfo = {
+    ...dualNvidia,
+    ramMB: 131072,
+    gpus: [{ name: 'Strix Halo [Radeon 8050S / 8060S]', vramMb: 117037, vendor: 'amd', unified: true }],
+  }
+  const hw = detectHardware(info)
+  assert.equal(hw.vramMb, 117037, 'ADR-304/306/310: this budget was RAISED on purpose, never lower it')
+  assert.equal(hw.unifiedMemory, true)
+})
+
+test('detectHardware: Apple Silicon is unified', () => {
+  const info: SysInfo = {
+    os: 'darwin/arm64',
+    cpu: 'Apple M3 Max',
+    cores: 14,
+    ramMB: 36864,
+    gpus: [{ name: 'Apple M3 Max', vramMb: 27648, vendor: 'apple', unified: true }],
+  }
+  assert.equal(detectHardware(info).unifiedMemory, true)
+})
+
+test('detectHardware: an APU beside a same-vendor dGPU is NOT unified — the dGPU is what was summed', () => {
+  // The flag describes the adapters that actually contributed to `vramMb`. ADR-306 already dropped
+  // the APU here, so `vramMb` is the RX 7600M XT's real 8 GB and is genuinely a second pool.
+  const info: SysInfo = {
+    ...dualNvidia,
+    gpus: [
+      { name: 'Phoenix1 [Radeon 780M]', vramMb: 16512, vendor: 'amd', unified: true },
+      { name: 'Navi 33 [Radeon RX 7600M XT]', vramMb: 8192, vendor: 'amd' },
+    ],
+  }
+  const hw = detectHardware(info)
+  assert.equal(hw.vramMb, 8192)
+  assert.equal(hw.unifiedMemory, false, 'the summed adapter is a real card, so RAM is a separate pool')
+})
+
+test('detectHardware: an Intel iGPU beside an NVIDIA dGPU is NOT unified (cross-vendor)', () => {
+  // The case a naive `info.gpus.some(g => g.unified)` gets wrong: the summed budget is the 5070
+  // Ti's dedicated VRAM. Charging it against system RAM would penalise an ordinary gaming laptop.
+  const info: SysInfo = {
+    ...dualNvidia,
+    gpus: [
+      { name: 'Intel(R) UHD Graphics', vramMb: 32768, vendor: 'intel', unified: true },
+      { name: 'NVIDIA GeForce RTX 5070 Ti', vramMb: 16384, vendor: 'nvidia' },
+    ],
+  }
+  const hw = detectHardware(info)
+  assert.equal(hw.vramMb, 16384)
+  assert.equal(hw.unifiedMemory, false)
+})
+
+test('detectHardware: a CPU-only box is NOT unified — the empty-pool guard', () => {
+  // `[].every()` is `true`, so without the `length > 0` guard a box with no GPU at all would
+  // report unified and start charging a 0 MB GPU budget against system RAM.
+  const info: SysInfo = { ...dualNvidia, gpus: [] }
+  const hw = detectHardware(info)
+  assert.equal(hw.hasGpu, false)
+  assert.equal(hw.vramMb, 0)
+  assert.equal(hw.unifiedMemory, false)
+})
