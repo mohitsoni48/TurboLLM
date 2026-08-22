@@ -32,6 +32,9 @@ export const gatewayDaily = defineEvent({
   lifecycle: 'daily-rollup',
   description: "Yesterday's gateway request volume for this machine, grouped by protocol and harness.",
   payload: {
+    /** Whole days back from this event's `ts` that these counters describe —
+     *  see `chat.ts` for the full rationale. */
+    daysAgo: f.int({ min: 0, max: 366, optional: true }),
     harness: f.enum(HARNESSES),
     protocol: f.enum(['anthropic', 'openai']),
     requests: f.int(),

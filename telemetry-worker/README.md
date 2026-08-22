@@ -66,3 +66,38 @@ expensive.
 `202` is returned even when every event in the batch was dropped: telling a
 caller *which* events failed validation would hand a prober a free oracle for
 mapping the allow-list.
+
+## What PostHog actually receives
+
+The D1 mirror stores the event verbatim. The PostHog fan-out sends the same
+envelope **plus flat aliases** for everything nested inside it
+(`flattenForAnalytics`, in `../turbollm/src/telemetry/ingest.ts`).
+
+| In the event | Also sent as |
+|---|---|
+| `app.version` | `app_version` |
+| `app.os` | `app_os` |
+| `payload.<field>` | `payload_<field>` |
+| — | `is_synthetic` |
+
+This exists because PostHog does not register object-valued properties in its
+taxonomy. Forwarding only the nested envelope meant the property picker offered
+exactly four things for every app event — `machineId`, `event`, `ts`, `schema` —
+so no chart built by clicking could break down by version, screen, action,
+outcome or any counter. Those fields were all present in the stored JSON and
+none of them were selectable, which is most of why the data read as unusable.
+The nested originals are still sent, so existing `properties.app.version`-style
+queries keep working; this only adds what the UI can index.
+
+`is_synthetic` is true when `app.version` is not a semver release — the deploy
+canary (`scripts/canary.mjs`), load-test seeds, and anything else of ours. Filter
+it out of every insight. It is a flag rather than a rejection on purpose: the
+canary's whole job is to prove the real path works end to end, so it has to take
+the real path.
+
+**Changing any event's payload requires deploying this Worker in the same
+release.** The deployed schema snapshot is what validates incoming events, so a
+client that ships a new field first has those events quarantined (recoverable,
+but not in PostHog) until the Worker catches up. `npm run deploy` here, then
+commit the regenerated `deployed.schema.sha256`; the `schema-hash` check fails
+the build until you do.

@@ -45,6 +45,11 @@ const events = [
   envelope('daily_active'),
   envelope('model_first_load', { payload: { outcome: 'ok' } }),
   envelope('engine_installed', { payload: { outcome: 'ok' } }),
+  // Same event WITH the fields the current client emits. Both shapes are fired on
+  // purpose: the bare one proves already-shipped binaries are still accepted, this
+  // one proves the release about to ship will not be quarantined. A canary that only
+  // probes yesterday's shape stops being a proof the moment the schema moves.
+  envelope('engine_installed', { payload: { outcome: 'ok', trigger: 'seed' } }),
   envelope('model_downloaded', { payload: { outcome: 'ok' } }),
   envelope('model_load', {
     payload: {
@@ -64,6 +69,7 @@ const events = [
   }),
   envelope('feature_first_use', { payload: { feature: 'chat' } }),
   envelope('feature_used_daily', { payload: { feature: 'chat', countBucket: '1' } }),
+  envelope('feature_used_daily', { payload: { feature: 'chat', countBucket: '1', daysAgo: 1 } }),
   envelope('error', { payload: { fingerprint: 'engine_crash' } }),
   envelope('bench_result', {
     hw: { cpu: 'canary-cpu', ramMb: 65536, gpus: [{ name: 'canary-gpu', vramMb: 16384 }] },
@@ -81,13 +87,30 @@ const events = [
       distinctModels: 1, toolCalls: 0, regenerates: 0, stops: 0,
     },
   }),
+  envelope('chat_daily', {
+    payload: {
+      conversations: 1, messages: 1, maxMessagesInConversation: 1, medianMessagesInConversation: 1,
+      distinctModels: 1, toolCalls: 0, regenerates: 0, stops: 0, daysAgo: 1,
+    },
+  }),
   envelope('gateway_daily', {
     payload: { harness: 'claude_code', protocol: 'anthropic', requests: 1, promptTokens: 1, genTokens: 1, distinctModels: 1 },
   }),
+  envelope('gateway_daily', {
+    payload: { harness: 'claude_code', protocol: 'anthropic', requests: 1, promptTokens: 1, genTokens: 1, distinctModels: 1, daysAgo: 1 },
+  }),
   envelope('harness_first_seen', { payload: { harness: 'claude_code', protocol: 'anthropic' } }),
   envelope('code_daily', { payload: { sessions: 1, turns: 1, toolCalls: 0 } }),
+  envelope('code_daily', { payload: { sessions: 1, turns: 1, toolCalls: 0, daysAgo: 1 } }),
   envelope('ui_action', { payload: { screen: 'engines', action: 'install_engine' } }),
   envelope('ui_daily', { payload: { screen: 'engines', actions: 1, distinctActions: 1 } }),
+  envelope('ui_daily', { payload: { screen: 'engines', actions: 1, distinctActions: 1, daysAgo: 1 } }),
+  // Neither onboarding event was ever covered here, which mattered: onboarding_recovery
+  // sat in the registry with no emitter at all and received zero events for its whole
+  // life, and a canary that never fired it could not tell that apart from a working
+  // event nobody happened to trigger. Now a deploy proves both are ingestible.
+  envelope('onboarding_profile', { payload: { profile: 'developer' } }),
+  envelope('onboarding_recovery', { payload: { failure: 'no_asset', action: 'resume', outcome: 'ok' } }),
 ]
 
 // `--file` sidesteps shell-quoting but ALSO changes what wrangler returns —
@@ -105,17 +128,50 @@ const events = [
 // the whole thing in double quotes is unambiguous to both cmd.exe and bash,
 // and every other interpolated value here is a fixed internal constant, not
 // external input, so there is nothing to escape defensively.
+/** Fields whose presence distinguishes the CURRENT payload shape of an event
+ *  from the bare shape older clients still send. */
+const SHAPE_MARKERS = {
+  chat_daily: 'daysAgo',
+  code_daily: 'daysAgo',
+  gateway_daily: 'daysAgo',
+  ui_daily: 'daysAgo',
+  feature_used_daily: 'daysAgo',
+  engine_installed: 'trigger',
+}
+
+/**
+ * Identify an event by NAME **and SHAPE**, not name alone.
+ *
+ * Verifying by name was the bug that made the dual-shape probe decorative: the
+ * bare and current variants of `chat_daily` both land under the name
+ * `chat_daily`, so a quarantined `chat_daily{daysAgo}` was masked by its bare
+ * twin still arriving and the script printed PASS. That is precisely the
+ * ADR-331 regression this probe exists to catch, so name-only matching made the
+ * gate unable to see the thing it was extended to see.
+ */
+function signature(event, payloadJson) {
+  const marker = SHAPE_MARKERS[event]
+  if (!marker) return event
+  let payload
+  try {
+    payload = JSON.parse(payloadJson)?.payload ?? {}
+  } catch {
+    return event
+  }
+  return marker in payload ? `${event}+${marker}` : event
+}
+
 function queryLanded() {
   const npx = process.platform === 'win32' ? 'npx.cmd' : 'npx'
-  const sql = `SELECT event FROM events WHERE machine_id = '${CANARY_MACHINE_ID}' AND received_at > datetime('now', '-5 minutes')`
+  const sql = `SELECT event, payload FROM events WHERE machine_id = '${CANARY_MACHINE_ID}' AND received_at > datetime('now', '-5 minutes')`
   const raw = execSync(`${npx} wrangler d1 execute ${DB_NAME} --remote --json --command "${sql}"`, {
     cwd: join(HERE, '..'),
     encoding: 'utf8',
   })
-  return new Set(JSON.parse(raw)[0].results.map((r) => r.event))
+  return new Set(JSON.parse(raw)[0].results.map((r) => signature(r.event, r.payload)))
 }
 
-const expected = new Set(events.map((e) => e.event))
+const expected = new Set(events.map((e) => signature(e.event, JSON.stringify(e))))
 
 // A fresh `wrangler deploy` is not instantly live on every edge node — found
 // live 2026-08-05, right after Phase 2 shipped `model_load`: the first

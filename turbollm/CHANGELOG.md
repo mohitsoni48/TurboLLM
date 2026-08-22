@@ -23,7 +23,11 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
-### Nothing yet.
+_Nothing yet._
+
+## [1.11.4] - 2026-08-22
+
+_No user-facing changes._
 
 ## [1.11.3] - 2026-08-21
 
