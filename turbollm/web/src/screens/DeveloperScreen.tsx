@@ -10,6 +10,7 @@ import { useApiKeys, useNetworkInfo } from '../lib/queries'
 import { ApiError, getConnect, track, type ConnectStep, type NetworkInfo } from '../lib/api'
 import { toast } from '../components/ui/sonner'
 import { cn } from '../lib/utils'
+import { useDocumentScroll } from '../lib/scroll-mode'
 
 const BASE = window.location.origin
 
@@ -59,6 +60,8 @@ const CLI_LIST: Cli[] = [
 /** Developer — one job: point an outside app at this server. Connection (URL + keys),
  *  a card grid of one-command CLI setups, and a collapsed API reference. */
 export function DeveloperScreen() {
+  // Issue #178: a long, plain list screen — the window scrolls it, not an inner box.
+  useDocumentScroll()
   return (
     <div className="w-full px-4 py-6 md:px-6">
       <ScreenHeader

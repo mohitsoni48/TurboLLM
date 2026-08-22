@@ -50,7 +50,7 @@ function mockItems(items: RoutineWithLatestRun[]) {
  *  unconditionally (before its own `if (!p) return null`), so a QueryClientProvider is required
  *  even though this test mocks away every routine query. The plan's literal render helper omitted
  *  it and throws "No QueryClient set" on the first render. */
-function renderShell(status?: Status) {
+function renderShell(status?: Status, scroll?: 'bounded' | 'document') {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   // A FRESH element each call: re-rendering the same element reference makes React bail out of
   // reconciliation entirely, so `repoll()` would silently assert nothing.
@@ -58,7 +58,7 @@ function renderShell(status?: Status) {
     <QueryClientProvider client={qc}>
       <MemoryRouter>
         <TooltipProvider>
-          <Shell status={status} online={false} version="v0.0.0-dev">content</Shell>
+          <Shell status={status} online={false} version="v0.0.0-dev" scroll={scroll}>content</Shell>
         </TooltipProvider>
       </MemoryRouter>
     </QueryClientProvider>
@@ -161,5 +161,63 @@ describe('Shell nav badge', () => {
     mockItems([{ routine: routine(), latestRun: run() }])
     renderShell()
     expect(screen.queryByLabelText(/Workspace \(\d+ needing attention\)/)).not.toBeInTheDocument()
+  })
+})
+
+/** Issue #178. The shell has two layouts, and which one is live is what decides whether the WINDOW
+ *  can scroll a long screen. Chat/Workspace/Code/Discover must keep the bounded one; the list-style
+ *  screens opt into the document one via `useDocumentScroll()`. */
+describe('Shell scroll mode', () => {
+  function mainEl() {
+    return document.querySelector('main') as HTMLElement
+  }
+  function shellEl() {
+    return document.querySelector('.app-shell') as HTMLElement
+  }
+
+  it('defaults to the bounded shell: main is the scroller and <html> stays locked', () => {
+    renderShell()
+    expect(mainEl().className).toContain('overflow-auto')
+    expect(mainEl().className).toContain('min-h-0')
+    expect(shellEl().className).toContain('h-full')
+    expect(document.documentElement.classList.contains('tllm-doc-scroll')).toBe(false)
+  })
+
+  it('in document mode main stops being a scroller and <html> is unlocked', () => {
+    renderShell(undefined, 'document')
+    expect(mainEl().className).not.toContain('overflow-auto')
+    // `min-h-0` comes off with it, or `main` could collapse below its content in the
+    // now auto-height column.
+    expect(mainEl().className).not.toContain('min-h-0')
+    expect(shellEl().className).toContain('min-h-dvh')
+    expect(shellEl().className).not.toContain('h-full')
+    expect(document.documentElement.classList.contains('tllm-doc-scroll')).toBe(true)
+  })
+
+  it('removes the <html> unlock again when the shell unmounts', () => {
+    const { unmount } = renderShell(undefined, 'document')
+    expect(document.documentElement.classList.contains('tllm-doc-scroll')).toBe(true)
+    unmount()
+    expect(document.documentElement.classList.contains('tllm-doc-scroll')).toBe(false)
+  })
+
+  /** LOAD-BEARING: MobileNav used to be `position: static`, which only works while the page can't
+   *  scroll. Unlocked, a static bar sits at the end of a 3000px document — measured at top 3019 on
+   *  a 850px-tall viewport, i.e. off-screen. Same for the desktop rail, which would otherwise
+   *  stretch the full page height. */
+  it('keeps both nav surfaces pinned to the viewport, in either mode', () => {
+    for (const mode of ['bounded', 'document'] as const) {
+      const view = renderShell(undefined, mode)
+      const [rail, mobile] = Array.from(document.querySelectorAll('nav')) as HTMLElement[]
+      expect(rail.className).toContain('sticky')
+      expect(rail.className).toContain('top-0')
+      expect(rail.className).toContain('h-dvh')
+      expect(mobile.className).toContain('sticky')
+      expect(mobile.className).toContain('bottom-0')
+      expect(mobile.className).toContain('z-30')
+      // Pins the height index.css's `--tllm-mobile-nav-h` is written against.
+      expect(mobile.className).toContain('h-14')
+      view.unmount()
+    }
   })
 })

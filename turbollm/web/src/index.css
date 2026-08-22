@@ -135,13 +135,38 @@
   --font-mono: ui-monospace, "Cascadia Code", Consolas, monospace;
 }
 
-html,
-body,
-#root {
+/* Full-height SPA shell — the page itself never scrolls, inner panes do. Required by every
+   bounded view (Chat, Workspace, Code, the Discover split-pane, the routine editor…), all of
+   which pin a header/composer and scroll a list inside it off `h-full`.
+
+   Scoped to `html:not(.tllm-doc-scroll)` (issue #178) so the long list-style screens can hand
+   scrolling back to the window — see lib/scroll-mode.ts. Same opt-out shape as the
+   `html.tllm-config-open` / `html.tllm-resizing` state classes further down this file.
+
+   NOTE: `overflow: hidden` here is NOT what keeps the config panel clipped during its slide-in
+   (an earlier comment claimed it was). `.tllm-sheet` is `position: fixed` and animates within
+   the viewport; with the lock released the document's `scrollWidth` stays at the viewport width,
+   verified at 430px. */
+html:not(.tllm-doc-scroll),
+html:not(.tllm-doc-scroll) body,
+html:not(.tllm-doc-scroll) #root {
   height: 100%;
-  /* Full-height SPA shell — page itself never scrolls (inner panes do), and this
-     clips the config panel while it sits off-screen during its slide animation. */
   overflow: hidden;
+}
+
+/* Bottom inset an in-page `position: sticky` bar must clear (SettingsScreen's Save bar).
+   Zero in the bounded shell — there the scrollport is `main`, whose bottom edge already sits
+   above MobileNav — and zero on desktop, where MobileNav is `md:hidden`. Only below md WITH the
+   document scrolling does a `bottom: 0` sticky element land underneath the nav bar, so that is
+   the only case that gets an offset. Matches MobileNav's `h-14` in Shell.tsx; changing one
+   without the other leaves a gap or an overlap. */
+:root {
+  --tllm-mobile-nav-h: 0px;
+}
+@media (max-width: 767px) {
+  html.tllm-doc-scroll {
+    --tllm-mobile-nav-h: 3.5rem;
+  }
 }
 
 body {

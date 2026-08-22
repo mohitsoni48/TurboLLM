@@ -25,6 +25,7 @@ import { ApiError, deleteModel, track } from '../lib/api'
 import { queryKeys, useModelActions, useModelDirs, useModelMutations, useModels, useStatus } from '../lib/queries'
 import { useOnboardingState } from '../lib/onboarding-queries'
 import { usePinnedModels } from '../lib/usePinnedModels'
+import { useDocumentScroll } from '../lib/scroll-mode'
 import type { ModelEntry } from '../lib/types'
 import { cn } from '../lib/utils'
 import { useIsDesktop } from '../lib/useIsDesktop'
@@ -166,6 +167,11 @@ export function ModelsScreen() {
   // transition, not a URL-driven one.
   const [searchParams] = useSearchParams()
   const [tab, setTab] = useState<Tab>(searchParams.get('tab') === 'discover' ? 'discover' : 'library')
+  // Issue #178: the Library tab is a plain long list, so the WINDOW should scroll it. Discover
+  // is not — ADR-143 made it a resizable list/detail split-pane, deliberately on this same
+  // `/models` route, and it needs the bounded full-height shell to size its two panes. Hence the
+  // opt-in is keyed on the tab, not on the URL.
+  useDocumentScroll(tab === 'library')
   const [filter, setFilter] = useState<Filter>('all')
   const [search, setSearch] = useState('')
   const [showIncompatible, setShowIncompatible] = useState(false)
@@ -299,7 +305,13 @@ export function ModelsScreen() {
       className={
         tab === 'discover'
           ? 'flex h-full w-full flex-col overflow-hidden px-4 py-6 md:px-6'
-          : 'h-full w-full overflow-y-auto px-4 py-6 md:px-6'
+          // Issue #178: the Library tab used to add `h-full w-full overflow-y-auto` here, a SECOND
+          // scroller stacked on top of Shell's `main.overflow-auto` that scrolled nothing extra and
+          // only guaranteed the window itself never could. Plain flow now — the tab opts the whole
+          // document into scrolling instead (`useDocumentScroll` above). Discover keeps its bounded
+          // `h-full` box: ADR-143 makes it a resizable list/detail split-pane whose two panes scroll
+          // independently, and it shares this route rather than having one of its own.
+          : 'px-4 py-6 md:px-6'
       }
     >
       <ScreenHeader

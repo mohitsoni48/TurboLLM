@@ -8,6 +8,7 @@ import { useMcpMutations, useSettings } from '../lib/queries'
 import { ApiError, track } from '../lib/api'
 import type { McpServer, DaemonSettings, DaemonSettingsPatch } from '../lib/api'
 import { CLOUD_MCPS, LOCAL_MCPS, CLOUD_CATS, LOCAL_CATS, BUILTIN_SEARCH } from '../lib/mcp-catalog'
+import { useDocumentScroll } from '../lib/scroll-mode'
 import type { CloudEntry, LocalEntry, BuiltinSearchEntry } from '../lib/mcp-catalog'
 import { BRAND_ICONS } from '../lib/brand-icons'
 import { cn } from '../lib/utils'
@@ -22,6 +23,8 @@ const CUSTOMIZE_TABS = [
 type CustomizeTab = (typeof CUSTOMIZE_TABS)[number]['id']
 
 export function CustomizeScreen() {
+  // Issue #178: a long, plain list screen — the window scrolls it, not an inner box.
+  useDocumentScroll()
   const { query: settingsQ } = useSettings()
   const settings = settingsQ.data
   const [searchParams, setSearchParams] = useSearchParams()
