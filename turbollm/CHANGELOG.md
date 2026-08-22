@@ -30,28 +30,33 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 ### Added
 
 - **A public External Chat API for building real chat apps on TurboLLM — `/api/ext/v1`.**
-  **Experimental.** Send a message, consume an SSE stream, and TurboLLM handles the rest: durable
-  chat/message storage, editing with optimistic concurrency, and resumable generation — a `Run` is
-  a resource you can poll or reconnect to, not just a stream that dies if the connection drops. Off
-  by default — turn it on with `api.ext.enabled` in `config.json`; the daemon logs a warning at
-  startup while it's on, since a remote tenant's generations currently inherit this install's own
-  tool permissions rather than an independent trust boundary of their own. Full guide at
+  **Experimental — requires manual setup, no onboarding UI yet.** Send a message, consume an SSE
+  stream, and TurboLLM handles the rest: durable chat/message storage, editing with optimistic
+  concurrency, and resumable generation — a `Run` is a resource you can poll or reconnect to, not
+  just a stream that dies if the connection drops. Off by default (`api.ext.enabled` in
+  `config.json`). Using it today requires two manual `config.json` edits, neither exposed in any UI
+  yet: an API key with an explicit, non-`local` `tenant` field (the local tenant — TurboLLM's own
+  desktop UI data — is deliberately never reachable through this API), and a configured `chatStore`
+  adapter (the SQLite default only ever serves the `local` tenant, so a non-`local` request 501s
+  without one — a working Postgres example ships in the repo, see below). The daemon logs a warning
+  at startup while enabled, since a remote tenant's generations currently inherit this install's
+  own tool permissions rather than an independent trust boundary of their own. Full guide at
   [turbollm.dev/docs/api/external](https://turbollm.dev/docs/api/external).
-- **Bring your own database.** Storage behind the new API is a documented `ChatStore` interface,
-  not a fixed backend — SQLite by default, or point it at your own (a complete, tested Postgres
-  example ships in the repo under `examples/postgres-chat-store`).
+- **Bring your own database.** Storage behind the new API is a documented `ChatStore` interface —
+  a complete, tested Postgres example ships in the repo under `examples/postgres-chat-store`, and
+  it's what makes the API usable for a real (non-`local`) tenant at all today.
 - **A generated OpenAPI 3.1 spec and a TypeScript client.** `@turbollm/chat-client` is a
   zero-dependency package that gets the one genuinely hard part of streaming — reconciling after a
   dropped connection without losing or duplicating content — right automatically.
-- **Multi-tenant from the start.** API keys carry a tenant and scopes; every request is further
+- **Multi-tenant by design.** API keys carry a tenant and scopes, and every request is further
   scoped by an integrator-supplied `owner`, so one API key can serve many end users while keeping
-  them isolated from each other.
+  them isolated from each other — there's just no key-minting UI yet (see above).
 - **A tenant-scoped audit log.** Every mutation through the new API — who, what, when, and the
   outcome — is recorded and queryable, with message/chat content deliberately never retained in it.
 
 ### Discord
-- New (experimental): a public API for building real chat apps on top of TurboLLM. Send a message, get a resumable stream back — TurboLLM handles storage, editing, and reconnects for you.
-- Comes with a ready-made TypeScript client and a working Postgres example if SQLite isn't your thing. Off by default; one config flag turns it on.
+- New (experimental, manual setup required): a public API for building real chat apps on top of TurboLLM. Send a message, get a resumable stream back — TurboLLM handles storage, editing, and reconnects for you.
+- Comes with a ready-made TypeScript client and a working Postgres example — you'll need it, since the SQLite default only serves TurboLLM's own desktop UI, not external tenants yet. Off by default; full setup guide linked above.
 
 ## [1.11.2] - 2026-08-20
 
