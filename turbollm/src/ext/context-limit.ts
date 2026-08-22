@@ -25,8 +25,10 @@ export function checkContextFits(
   d: Deps,
   messages: Array<{ role: string; content: string }>,
 ): { fits: boolean; estimated: number; limit: number } {
-  const status = d.manager.status() as { contextSize?: number }
-  const limit = status.contextSize ?? 0
+  // The loaded model's context window is Status.model.ctx — there is no top-level
+  // "contextSize" field on Status anywhere in the daemon (an earlier version read one; it was
+  // always undefined in production, so this check silently never fired — see openapi review C1).
+  const limit = d.manager.status().model?.ctx ?? 0
   const estimated = estimateTokens(messages)
   // An unknown window is permissive: refusing a request because we could not READ the limit
   // would turn a missing field into an outage.

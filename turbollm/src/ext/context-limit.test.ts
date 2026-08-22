@@ -2,10 +2,17 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { checkContextFits, estimateTokens } from './context-limit.js'
+import type { Status } from '../engines/manager.js'
 
-const depsWithWindow = (n: number) => ({
-  manager: { status: () => ({ state: 'running', model: 'test', contextSize: n }) },
-} as never)
+// Built against the REAL `Status` shape (`model: ModelInfo | null`, context window on
+// `model.ctx` — there is no top-level `contextSize` field anywhere in the daemon). An earlier
+// version of this fixture invented `{ model: 'test', contextSize: n }`, which let
+// checkContextFits read a field that only ever existed in this test, never in production.
+const statusWithWindow = (n: number): Status => ({
+  state: 'running', err: null, port: 0, pid: 0, loadElapsedMs: 0,
+  model: { key: 'test', name: 'test', quant: 'Q4_K_M', ctx: n, vision: false },
+})
+const depsWithWindow = (n: number) => ({ manager: { status: () => statusWithWindow(n) } } as never)
 
 test('the estimate scales with content length', () => {
   const small = estimateTokens([{ role: 'user', content: 'hi' }])
@@ -36,6 +43,7 @@ test('headroom is reserved for the reply, so a prompt that exactly fills the win
 })
 
 test('an unknown window is permissive rather than blocking', () => {
-  const r = checkContextFits({ manager: { status: () => ({ state: 'running', model: 'm' }) } } as never, [{ role: 'user', content: 'hi' }])
+  const noModel: Status = { state: 'running', err: null, port: 0, pid: 0, loadElapsedMs: 0, model: null }
+  const r = checkContextFits({ manager: { status: () => noModel } } as never, [{ role: 'user', content: 'hi' }])
   assert.equal(r.fits, true, 'never refuse a request because we could not read the window')
 })
