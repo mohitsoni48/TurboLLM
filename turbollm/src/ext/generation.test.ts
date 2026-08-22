@@ -18,7 +18,7 @@ import { ConversationStore } from '../chat/db.js'
 import { ChatStoreRouter } from '../chat/store/router.js'
 import {
   loadFullHistory, shouldFlushCheckpoint, FLUSH_INTERVAL_MS, FLUSH_MIN_CHARS,
-  extractChunkUsage, buildUsagePatch,
+  extractChunkUsage, buildUsagePatch, buildEngineRequestBody,
 } from './generation.js'
 
 const SCOPE = { tenant: 'acme', owner: 'u1' }
@@ -167,4 +167,30 @@ test('buildUsagePatch: spreads cleanly into a patch literal alongside other fiel
   const withoutUsage = { content: 'hi', status: 'streaming' as const, ...buildUsagePatch(undefined) }
   assert.deepEqual(withoutUsage, { content: 'hi', status: 'streaming' })
   assert.equal('usage' in withoutUsage, false)
+})
+
+// Release-gate I7: samplingOverride is unvalidated integrator JSON (chat.sampling, stored
+// verbatim). A tenant setting sampling.model/.messages/.stream/.stream_options must never be
+// able to override this route's own control fields.
+test('buildEngineRequestBody: a legitimate sampling key merges in alongside the control fields', () => {
+  const body = buildEngineRequestBody(
+    { model: 'real-model', messages: [{ role: 'user', content: 'hi' }], stream: true },
+    { temperature: 0.7, top_p: 0.9 },
+  )
+  assert.deepEqual(body, {
+    temperature: 0.7, top_p: 0.9,
+    model: 'real-model', messages: [{ role: 'user', content: 'hi' }], stream: true,
+  })
+})
+
+test('buildEngineRequestBody: sampling cannot override model, messages, stream, or stream_options', () => {
+  const body = buildEngineRequestBody(
+    { model: 'real-model', messages: [{ role: 'user', content: 'real history' }], stream: true, stream_options: { include_usage: true } },
+    { model: 'attacker-model', messages: [{ role: 'user', content: 'smuggled prompt' }], stream: false, stream_options: { include_usage: false }, temperature: 0.5 },
+  )
+  assert.equal(body.model, 'real-model', 'sampling must not override which model is called')
+  assert.deepEqual(body.messages, [{ role: 'user', content: 'real history' }], 'sampling must not override the assembled history')
+  assert.equal(body.stream, true, 'sampling must not turn off streaming — the SSE read loop assumes it is on')
+  assert.deepEqual(body.stream_options, { include_usage: true }, 'sampling must not override usage capture')
+  assert.equal(body.temperature, 0.5, 'a non-reserved sampling key still comes through normally')
 })

@@ -139,6 +139,22 @@ const SAMPLING_KEYS: Record<string, string> = {
   presencePenalty: 'presence_penalty', frequencyPenalty: 'frequency_penalty',
 }
 
+/** Merges a caller-supplied sampling override UNDER this route's own control fields
+ *  (release-gate I7) — `samplingOverride` is unvalidated integrator JSON (`chat.sampling`,
+ *  stored verbatim; `mapSampling`'s own trailing loop copies through any key it doesn't
+ *  recognize), so a tenant setting `sampling.model`/`.messages`/`.stream`/`.stream_options`
+ *  must never be able to override what THIS route sends — e.g. `stream: false` would silently
+ *  break the SSE read loop, and `messages: [...]` would hand the shared engine a prompt that
+ *  skipped this route's own history assembly and context-window check entirely. Exported so the
+ *  precedence itself is directly testable without a live engine (the loop that actually calls
+ *  this does real HTTP and isn't unit-testable, per this file's header comment). */
+export function buildEngineRequestBody(
+  controlFields: Record<string, unknown>,
+  samplingOverride: Record<string, unknown>,
+): Record<string, unknown> {
+  return { ...samplingOverride, ...controlFields }
+}
+
 /** Same camelCase → engine snake_case mapping chat-routes.ts's runGeneration applies to
  *  `conv.sampling`, applied here to the public `Chat.sampling` passthrough field. */
 function mapSampling(sampling: Record<string, unknown>, repeatPenaltyKey: string): Record<string, unknown> {
@@ -250,11 +266,13 @@ async function runGenerationLoop(d: Deps, ctx: GenerationCtx, emit: EmitSink, si
     iter++
     if (signal.aborted) return
 
-    const reqBody: Record<string, unknown> = {
-      model: engineModelAlias(engineKind, d.manager.currentOpts()?.modelPath) ?? loadedModel.key,
-      messages, stream: true, stream_options: { include_usage: true },
-      ...samplingOverride,
-    }
+    const reqBody: Record<string, unknown> = buildEngineRequestBody(
+      {
+        model: engineModelAlias(engineKind, d.manager.currentOpts()?.modelPath) ?? loadedModel.key,
+        messages, stream: true, stream_options: { include_usage: true },
+      },
+      samplingOverride,
+    )
     if (stopStrings?.length) reqBody.stop = stopStrings
     const cappedMax = clampMaxTokens(reqBody.max_tokens as number | undefined, maxLimit)
     if (cappedMax != null) reqBody.max_tokens = cappedMax

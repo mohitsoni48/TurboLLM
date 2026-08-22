@@ -46,6 +46,14 @@ export interface RouteSpec {
    *  `POST .../messages/generate` and returns THIS shape instead. Documenting only the primary
    *  response would describe the minority code path and silently omit the majority one. */
   altResponse?: { status: string; description: string; schema: string; sse?: boolean }
+  /** Override for `buildOperation`'s default status inference (POST+schema -> 201, POST without
+   *  a schema -> 202, DELETE -> 204, else 200). Release-gate I11: that default is wrong for any
+   *  POST that doesn't actually return 201 — `POST .../messages/generate` returns 202 (it's a
+   *  Run, not a fully-formed resource yet) and `POST /runs/:id/cancel` returns 200 (updating an
+   *  existing resource, not creating one). Set explicitly rather than special-cased in the
+   *  inference function, so the NEXT route that doesn't fit the convention fails loudly (a
+   *  missing successStatus falls back to the wrong default) instead of silently drifting again. */
+  successStatus?: string
   errors: string[]
 }
 
@@ -142,7 +150,7 @@ export const EXT_ROUTES: RouteSpec[] = [
     summary: 'Start a generation run for a chat (SSE or JSON, per Accept).',
     scope: 'runs:write', audited: 'run.start',
     requestSchema: 'MessageInput', responseSchema: 'Run', sse: true,
-    errors: [...WRITE_ERRORS, 'engine'],
+    successStatus: '202', errors: [...WRITE_ERRORS, 'engine'],
   },
   {
     method: 'GET', path: '/runs',
@@ -162,7 +170,8 @@ export const EXT_ROUTES: RouteSpec[] = [
   {
     method: 'POST', path: '/runs/:id/cancel',
     summary: 'Abort a run.',
-    scope: 'runs:write', audited: 'run.cancel', responseSchema: 'Run', errors: WRITE_ERRORS,
+    scope: 'runs:write', audited: 'run.cancel', responseSchema: 'Run',
+    successStatus: '200', errors: WRITE_ERRORS,
   },
 
   // ── this task ─────────────────────────────────────────────────────────────────────────────
@@ -351,7 +360,11 @@ function buildSchemas(): Record<string, JsonSchema> {
       attachments: { type: 'array', items: { type: 'string' }, description: 'data: URIs. Max 4 per message (spec §4.1). Optional if `content` is present — at least one of `content` or `attachments` is required.' },
       owner: { type: 'string' },
       generate: { type: 'boolean', description: 'Defaults to true. false appends without starting a run.' },
-      sampling: { type: 'object', additionalProperties: true },
+      // Release-gate I6: no route on this surface reads a per-message `sampling` field — only
+      // POST /chats and PATCH /chats/:id/messages ("PATCH /chats/:id") ChatInput/ChatPatch's own
+      // CHAT-level `sampling` is ever used by generation (generation.ts's `ctx.chat.sampling`).
+      // A per-message override was documented and sent by the TS client but silently ignored —
+      // removed here (and from the client) rather than freezing a v1 field that does nothing.
       metadata: { type: 'object', additionalProperties: true },
     },
   }
@@ -402,19 +415,30 @@ function buildSchemas(): Record<string, JsonSchema> {
   }
 }
 
-/** Collects the `:param` names out of a Hono-style path. The path ITSELF is kept verbatim as
- *  the `paths` key (matching `r.path` byte-for-byte, `:id` included) rather than rewritten to
- *  OpenAPI 3.1's `{param}` template syntax — openapi.test.ts's second test builds its expected
- *  key as `` `/api/ext/v1${r.path}` `` with no translation, so a rewritten key would silently
- *  stop matching the manifest it is supposed to mirror. The trade-off, stated rather than
- *  hidden: strict OpenAPI tooling expects `{param}` templating for path parameters, so this
- *  document intentionally omits per-parameter `parameters` entries (there is no `{id}` for one
- *  to attach to) rather than emit a mismatched declaration that would itself be invalid. */
+/** Collects the `:param` names out of a Hono-style path. `route.path` itself is kept `:id`-style
+ *  everywhere it's used for comparison against a live Hono app (`app.routes[].path`, which the
+ *  drift-guard tests rely on matching byte-for-byte) — only `templatePath` (below), used solely
+ *  for the OpenAPI `paths` object's own KEY, converts to `{id}`. */
 function pathParamNames(path: string): string[] {
   const params: string[] = []
   path.replace(/:([A-Za-z0-9_]+)/g, (_m, name: string) => { params.push(name); return _m })
   return params
 }
+
+/** `:id` -> `{id}`, for the `paths` object key ONLY (spec-3.1-required templating). Release-gate
+ *  I11: the document previously kept Hono's `:id` syntax in the key itself and declared params
+ *  only via a non-standard `x-path-params` extension — a client generated from this document
+ *  requested the LITERAL path `/chats/:id`, since no standard OpenAPI tool understands `:id`
+ *  templating or that extension field. */
+function templatePath(path: string): string {
+  return path.replace(/:([A-Za-z0-9_]+)/g, '{$1}')
+}
+
+// Every route WITHOUT a requestSchema resolves `owner` from the query string (routes.chats.ts /
+// routes.runs.ts's `scopeFor(c, c.req.query('owner'))`) — a route WITH a requestSchema takes it
+// from the body instead (already covered by that schema's own `owner` property). These two are
+// the only routes with neither: `owner` isn't part of their scope at all.
+const NO_OWNER_PARAM_PATHS = new Set(['/capabilities', '/openapi.json'])
 
 function errorResponses(codes: string[]): Record<string, JsonSchema> {
   const responses: Record<string, JsonSchema> = {}
@@ -445,9 +469,11 @@ function operationIdFor(route: RouteSpec): string {
 }
 
 function buildOperation(route: RouteSpec): JsonSchema {
-  const successStatus = route.method === 'POST' ? (route.responseSchema ? '201' : '202')
+  const successStatus = route.successStatus ?? (
+    route.method === 'POST' ? (route.responseSchema ? '201' : '202')
     : route.method === 'DELETE' ? '204'
     : '200'
+  )
 
   // A MediaType object (the value under each content-type key) has no `description` field of
   // its own in OpenAPI 3.1 — only the enclosing Response object does. The SSE event-name note
@@ -497,11 +523,22 @@ function buildOperation(route: RouteSpec): JsonSchema {
     }
   }
 
+  // Path params: real `parameters` entries (release-gate I11), not the non-standard
+  // `x-path-params` extension this document used to rely on — see templatePath's doc comment.
+  const pathParams = pathParamNames(route.path).map((name) => ({
+    name, in: 'path', required: true, schema: { type: 'string' },
+  }))
+  const ownerParam = (!route.requestSchema && !NO_OWNER_PARAM_PATHS.has(route.path))
+    ? [{ name: 'owner', in: 'query', required: false, schema: { type: 'string' }, description: "The integrator's end user. Defaults to 'default'." }]
+    : []
+  const parameters = [...pathParams, ...ownerParam]
+
   const operation: JsonSchema = {
     operationId: operationIdFor(route),
     summary: route.summary,
     ...(route.scope ? { 'x-required-scope': route.scope } : {}),
     ...(route.audited ? { 'x-audited-action': route.audited } : {}),
+    ...(parameters.length ? { parameters } : {}),
     responses,
   }
 
@@ -530,16 +567,9 @@ export function buildOpenApiDocument(version: string): {
   const paths: Record<string, Record<string, JsonSchema>> = {}
 
   for (const route of EXT_ROUTES) {
-    const key = `/api/ext/v1${route.path}`
+    const key = `/api/ext/v1${templatePath(route.path)}`
     const pathItem = paths[key] ?? (paths[key] = {})
-    const operation = buildOperation(route)
-    // Documented as an extension field rather than a `parameters: [{in: 'path', ...}]` entry —
-    // see pathParamNames' own doc comment on why: the path key deliberately keeps `:id` rather
-    // than `{id}`, and OpenAPI requires an `in: path` parameter to correspond to a `{...}`
-    // template expression that literally isn't in this key.
-    const params = pathParamNames(route.path)
-    if (params.length) operation['x-path-params'] = params
-    pathItem[route.method.toLowerCase()] = operation
+    pathItem[route.method.toLowerCase()] = buildOperation(route)
   }
 
   return {
@@ -554,7 +584,13 @@ export function buildOpenApiDocument(version: string): {
     ],
     components: {
       securitySchemes: {
-        bearerAuth: { type: 'http', scheme: 'bearer', description: 'tllm-ext-<tenant-prefix>-<secret> (spec 27 §10). Server-side only — never ship in client JavaScript.' },
+        // Release-gate I11: this used to document a fictional `tllm-ext-<tenant-prefix>-<secret>`
+        // shape — generateApiKey() (auth.ts) has always produced `tllm-` + 40 random
+        // alphanumeric characters, with no tenant encoded in the key string itself (the tenant
+        // is a separate config.json field on the stored key record). There is currently no
+        // dedicated key-minting flow for this API; an operator adds `tenant`/`scopes` to a key
+        // entry in config.json directly.
+        bearerAuth: { type: 'http', scheme: 'bearer', description: "tllm-<40 random alphanumeric characters> (auth.ts's generateApiKey; spec 27 §10). The tenant is a separate field on the stored key record, not part of the key string. Server-side only — never ship in client JavaScript." },
       },
       schemas: buildSchemas(),
     },

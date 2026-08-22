@@ -180,7 +180,11 @@ export interface SendParams {
   // Optional, not required — see AppendMessageInput's `content` doc comment for the rule.
   content?: string
   attachments?: string[]
-  sampling?: Record<string, unknown>
+  // No per-message `sampling` field (release-gate I6): no route on the server ever read one —
+  // only chat-level sampling (chats.create/.update) affects generation. An earlier draft of this
+  // client sent one that the server silently ignored; removed rather than shipping a v1 field
+  // that does nothing. Use `chats.update(chatId, { sampling })` before sending if you need to
+  // change it.
   metadata?: Record<string, unknown>
   idempotencyKey?: string
 }
@@ -495,7 +499,7 @@ export class TurboLLMChat {
       headers: params.idempotencyKey ? { 'Idempotency-Key': params.idempotencyKey } : undefined,
       body: {
         owner: params.owner, role: params.role ?? 'user', content: params.content,
-        attachments: params.attachments, sampling: params.sampling, metadata: params.metadata,
+        attachments: params.attachments, metadata: params.metadata,
         generate: true,
       },
     }))
