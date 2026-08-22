@@ -134,6 +134,12 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
     if (b.attachments !== undefined && (!Array.isArray(b.attachments) || !b.attachments.every((a) => typeof a === 'string'))) {
       return extError(c, 'invalid_request', 'invalid_input', '`attachments` must be an array of strings.', { param: 'attachments' })
     }
+    // Same class of guard (release-gate I3): `owner` reaches `scopeFor`'s `.trim()` on the next
+    // line, so a non-string value (e.g. `owner: 12345`) would otherwise crash before this
+    // route's own try/catch instead of returning a clean 400.
+    if (b.owner !== undefined && typeof b.owner !== 'string') {
+      return extError(c, 'invalid_request', 'invalid_input', '`owner` must be a string.', { param: 'owner' })
+    }
     const scope = scopeFor(c, b.owner)
     const content = (b.content ?? '').trim()
     const attachments = b.attachments

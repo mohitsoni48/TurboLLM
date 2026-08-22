@@ -77,10 +77,16 @@ export class AuditLog {
   // cross-owner leak — same class as C1/N1 — chaining with the caller-supplied-owner design
   // into full cross-owner chat/message content disclosure via harvested owner ids + chat ids).
   list(tenant: string, owner: string, opts: { limit?: number; since?: string }): AuditRow[] {
+    // Release-gate I3: this was the one list endpoint on the surface with no clampLimit
+    // equivalent (sqlite-chat-store.ts's clampLimit is what every other list route goes
+    // through) — an invalid limit (NaN from `Number('abc')` at the route layer) bound straight
+    // into the SQL LIMIT clause and made node:sqlite throw, and a valid-but-huge limit was
+    // honored outright, contradicting the max_page_size:200 GET /capabilities advertises.
+    const limit = Number.isFinite(opts.limit) && (opts.limit as number) >= 1 ? Math.min(opts.limit as number, 200) : 200
     const rows = this.db.handle.prepare(
       `SELECT * FROM ext_audit WHERE tenant = $t AND owner = $o AND ($since IS NULL OR at >= $since)
        ORDER BY at DESC LIMIT $l`,
-    ).all({ $t: tenant, $o: owner, $since: opts.since ?? null, $l: opts.limit ?? 200 }) as unknown as Array<{
+    ).all({ $t: tenant, $o: owner, $since: opts.since ?? null, $l: limit }) as unknown as Array<{
       id: string; tenant: string; owner: string; action: string; target_id: string | null
       request_id: string; status: number; key_prefix: string; at: string
     }>

@@ -832,6 +832,30 @@ test('attachments containing a non-string element is refused with a clean 400 on
   }
 })
 
+// Release-gate I3: a non-string `owner` reached scopeFor's .trim() and crashed before this
+// route's own try/catch — live-reproduced in review as `GET /audit?limit=abc` and friends;
+// this is the generate route's own instance of the exact same class of bug.
+test('a non-string owner is refused with a clean 400 on the generate route, not a bare 500', async () => {
+  const { app, cleanup } = harness()
+  try {
+    const chatId = await newChat(app)
+    const res = await app.request(`/api/ext/v1/chats/${chatId}/messages/generate`,
+      post(ACME, { role: 'user', owner: 12345, content: 'hi' }))
+    const text = await res.text()
+    let parsed: { error?: { type?: unknown; code?: unknown } }
+    try {
+      parsed = JSON.parse(text)
+    } catch {
+      assert.fail(`response body is not JSON (bare framework error?): ${text.slice(0, 200)}`)
+    }
+    assert.equal(res.status, 400)
+    assert.equal(parsed.error?.type, 'invalid_request')
+    assert.equal(parsed.error?.code, 'invalid_input')
+  } finally {
+    cleanup()
+  }
+})
+
 test('a metadata blob over the byte limit is refused with 413 on the generate route, even with tiny content', async () => {
   const { app, cleanup } = harness()
   try {

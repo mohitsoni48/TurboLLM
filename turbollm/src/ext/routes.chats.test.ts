@@ -507,6 +507,34 @@ test('an inbound X-Request-Id is honored and shows up on the audit row for that 
   }
 })
 
+// Release-gate I3: GET /audit was the only route on the surface with no try/catch at all, and
+// its `limit` the only list limit with no clamp — live-reproduced in review as
+// `GET /audit?limit=abc` -> bare 500 internal (Number('abc') -> NaN -> node:sqlite bind throw).
+test('GET /audit with a non-numeric limit is refused with a clean 400, not a bare 500', async () => {
+  const { app, cleanup } = harness()
+  try {
+    await app.request('/api/ext/v1/chats', json(ACME, { title: 'X', owner: 'u1' }))
+    const res = await app.request('/api/ext/v1/audit?owner=u1&limit=abc', { headers: { Authorization: ACME } })
+    assert.equal(res.status, 400)
+    const body = await res.json() as { error: { type: string; code: string } }
+    assert.equal(body.error.type, 'invalid_request')
+    assert.equal(body.error.code, 'invalid_input')
+  } finally {
+    cleanup()
+  }
+})
+
+test('GET /audit with a negative or zero limit is refused with a clean 400', async () => {
+  const { app, cleanup } = harness()
+  try {
+    const res = await app.request('/api/ext/v1/audit?owner=u1&limit=0', { headers: { Authorization: ACME } })
+    assert.equal(res.status, 400)
+    assert.equal((await res.json() as { error: { code: string } }).error.code, 'invalid_input')
+  } finally {
+    cleanup()
+  }
+})
+
 test('a rate-limited mutation (the blanket per-tenant budget) still produces an audit row', async () => {
   const ext: ExtRouteDeps = { idempotency: new IdempotencyStore(), limiter: new TenantLimiter({ maxInFlight: 100, ratePerMinute: 1 }) }
   const { app, db, cleanup } = harness(ext)
@@ -767,6 +795,96 @@ test('a non-array attachments value is refused with a clean 400, not a bare 500'
 
     const list = await (await app.request(`/api/ext/v1/chats/${chatId}/messages?owner=u1`, json(ACME))).json() as { data: unknown[] }
     assert.equal(list.data.length, 0, 'the malformed write must not have been persisted')
+  } finally {
+    cleanup()
+  }
+})
+
+// ── Release-gate I3 — a non-string `owner` reached scopeFor's .trim() and crashed before any
+// route's own try/catch (live-reproduced in review as `POST /chats {"owner": 12345}` -> bare 500).
+// Every body-sourced `owner` call site gets the same regression test.
+test('POST /chats with a non-string owner is refused with a clean 400, not a bare 500', async () => {
+  const { app, cleanup } = harness()
+  try {
+    const res = await app.request('/api/ext/v1/chats', json(ACME, { title: 'BadOwner', owner: 12345 }))
+    const text = await res.text()
+    let parsed: { error?: { type?: unknown; code?: unknown } }
+    try {
+      parsed = JSON.parse(text)
+    } catch {
+      assert.fail(`response body is not JSON (bare framework error?): ${text.slice(0, 200)}`)
+    }
+    assert.equal(res.status, 400)
+    assert.equal(parsed.error?.type, 'invalid_request')
+    assert.equal(parsed.error?.code, 'invalid_input')
+  } finally {
+    cleanup()
+  }
+})
+
+test('POST /chats/:id/messages with a non-string owner is refused with a clean 400', async () => {
+  const { app, cleanup } = harness()
+  try {
+    const made = await app.request('/api/ext/v1/chats', json(ACME, { title: 'BadOwnerMsg', owner: 'u1' }))
+    const chatId = (await made.json() as { id: string }).id
+    const res = await app.request(`/api/ext/v1/chats/${chatId}/messages`,
+      json(ACME, { role: 'user', content: 'hi', owner: 12345, generate: false }))
+    assert.equal(res.status, 400)
+    const parsed = await res.json() as { error: { type: string; code: string } }
+    assert.equal(parsed.error.type, 'invalid_request')
+    assert.equal(parsed.error.code, 'invalid_input')
+  } finally {
+    cleanup()
+  }
+})
+
+test('PATCH /chats/:id with a non-string owner is refused with a clean 400', async () => {
+  const { app, cleanup } = harness()
+  try {
+    const made = await app.request('/api/ext/v1/chats', json(ACME, { title: 'BadOwnerPatch', owner: 'u1' }))
+    const chatId = (await made.json() as { id: string }).id
+    const res = await app.request(`/api/ext/v1/chats/${chatId}`, { ...json(ACME, { owner: 12345 }), method: 'PATCH' })
+    assert.equal(res.status, 400)
+    const parsed = await res.json() as { error: { code: string } }
+    assert.equal(parsed.error.code, 'invalid_input')
+  } finally {
+    cleanup()
+  }
+})
+
+test('PATCH /messages/:id with a non-string owner is refused with a clean 400', async () => {
+  const { app, cleanup } = harness()
+  try {
+    const made = await app.request('/api/ext/v1/chats', json(ACME, { title: 'BadOwnerMsgPatch', owner: 'u1' }))
+    const chatId = (await made.json() as { id: string }).id
+    const createdMsg = await app.request(`/api/ext/v1/chats/${chatId}/messages`,
+      json(ACME, { role: 'user', content: 'hi', owner: 'u1', generate: false }))
+    const msgId = (await createdMsg.json() as { id: string }).id
+    const res = await app.request(`/api/ext/v1/messages/${msgId}`, { ...json(ACME, { content: 'edited', owner: 12345 }), method: 'PATCH' })
+    assert.equal(res.status, 400)
+    const parsed = await res.json() as { error: { code: string } }
+    assert.equal(parsed.error.code, 'invalid_input')
+  } finally {
+    cleanup()
+  }
+})
+
+// A "system" role reaching the SQL bind unvalidated would then be replayed to the engine
+// mid-history (generation.ts's buildGenerationCtx) — the reviewer's exact concern.
+test('POST /chats/:id/messages refuses a role outside the documented user|assistant enum', async () => {
+  const { app, cleanup } = harness()
+  try {
+    const made = await app.request('/api/ext/v1/chats', json(ACME, { title: 'BadRole', owner: 'u1' }))
+    const chatId = (await made.json() as { id: string }).id
+    const res = await app.request(`/api/ext/v1/chats/${chatId}/messages`,
+      json(ACME, { role: 'system', content: 'hi', owner: 'u1', generate: false }))
+    assert.equal(res.status, 400)
+    const parsed = await res.json() as { error: { type: string; code: string } }
+    assert.equal(parsed.error.type, 'invalid_request')
+    assert.equal(parsed.error.code, 'invalid_input')
+
+    const list = await (await app.request(`/api/ext/v1/chats/${chatId}/messages?owner=u1`, json(ACME))).json() as { data: unknown[] }
+    assert.equal(list.data.length, 0, 'the invalid-role write must not have been persisted')
   } finally {
     cleanup()
   }
@@ -1168,6 +1286,12 @@ test('an unhandled throw anywhere on this surface still returns a JSON error env
   const app = new Hono()
   app.onError(extErrorHandler)
   registerExtChatRoutes(app, d, undefined, throwingRuns)
+  // Release-gate I3's compounding issue: extErrorHandler's ext-path branch used to return the
+  // mapped 500 WITHOUT ever logging the real error — every backstop-caught bug was invisible in
+  // the daemon log. Captures real console.error calls rather than trusting the source diff.
+  const realConsoleError = console.error
+  const logged: unknown[][] = []
+  console.error = (...args: unknown[]) => { logged.push(args) }
   try {
     const created = await app.request('/api/ext/v1/chats', json(ACME, { title: 'Backstop', owner: 'u1' }))
     const chatId = (await created.json() as { id: string }).id
@@ -1180,7 +1304,11 @@ test('an unhandled throw anywhere on this surface still returns a JSON error env
     assert.equal(body.error?.type, 'internal')
     assert.equal(body.error?.code, 'internal')
     assert.ok(body.error?.request_id, 'still correlatable even for a fully unhandled throw')
+    assert.equal(logged.length, 1, 'the real error must be logged, not just mapped into the response')
+    assert.ok(String(logged[0][0]).includes('synthetic isChatActive failure'),
+      'the logged value must be the real underlying error, not a generic placeholder')
   } finally {
+    console.error = realConsoleError
     conv.close(); rmSync(dir, { recursive: true, force: true })
   }
 })

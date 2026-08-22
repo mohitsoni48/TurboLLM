@@ -165,6 +165,13 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
   // (see its own doc comment), so putting it first here still correctly captures the 403.
   app.post(`${BASE}/chats`, auditMiddleware(audit, 'chat.create'), requireScope('chats:write'), async (c) => {
     const b = await body<{ title: string; model: string; system_prompt: string; sampling: Record<string, unknown>; metadata: Record<string, unknown>; owner: string }>(c)
+    // Same class of guard as `content`/`attachments` above (round-3 review): `body<T>()` is an
+    // unchecked cast, so a non-string `owner` (e.g. `owner: 12345`) would otherwise reach
+    // `scopeFor`'s `.trim()` and throw a bare TypeError before this route's own try/catch
+    // (release-gate I3).
+    if (b.owner !== undefined && typeof b.owner !== 'string') {
+      return extError(c, 'invalid_request', 'invalid_input', '`owner` must be a string.', { param: 'owner' })
+    }
     // Resolved once, up front — both the idempotency lookup below and the createChat call use
     // the SAME scope, so they can never disagree about which owner this request is for.
     const scope = scopeFor(c, b.owner)
@@ -225,6 +232,9 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
 
   app.patch(`${BASE}/chats/:id`, auditMiddleware(audit, 'chat.update'), requireScope('chats:write'), async (c) => {
     const b = await body<{ title: string; system_prompt: string; sampling: Record<string, unknown>; metadata: Record<string, unknown>; owner: string; if_version: number }>(c)
+    if (b.owner !== undefined && typeof b.owner !== 'string') {
+      return extError(c, 'invalid_request', 'invalid_input', '`owner` must be a string.', { param: 'owner' })
+    }
     const scope = scopeFor(c, b.owner)
     const chatId = c.req.param('id')
     // Spec §7.2: a chat with an active generation must refuse mutation with 409 run_active
@@ -296,6 +306,16 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
     }
     if (b.attachments !== undefined && (!Array.isArray(b.attachments) || !b.attachments.every((a) => typeof a === 'string'))) {
       return extError(c, 'invalid_request', 'invalid_input', '`attachments` must be an array of strings.', { param: 'attachments' })
+    }
+    // Same class of guard (release-gate I3): `owner` reaches `scopeFor`'s `.trim()` below, and
+    // `role` is bound straight into SQL and later replayed to the engine mid-history
+    // (generation.ts's buildGenerationCtx) — a non-string owner or an out-of-enum role must be
+    // a clean 400, not a crash or a silently-accepted `"system"` role.
+    if (b.owner !== undefined && typeof b.owner !== 'string') {
+      return extError(c, 'invalid_request', 'invalid_input', '`owner` must be a string.', { param: 'owner' })
+    }
+    if (b.role !== undefined && b.role !== 'user' && b.role !== 'assistant') {
+      return extError(c, 'invalid_request', 'invalid_input', "`role` must be 'user' or 'assistant'.", { param: 'role' })
     }
     const content = (b.content ?? '').trim()
     const attachments = b.attachments
@@ -409,6 +429,9 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
 
   app.patch(`${BASE}/messages/:id`, auditMiddleware(audit, 'message.update'), requireScope('chats:write'), async (c) => {
     const b = await body<{ content: string; metadata: Record<string, unknown>; owner: string; if_version: number }>(c)
+    if (b.owner !== undefined && typeof b.owner !== 'string') {
+      return extError(c, 'invalid_request', 'invalid_input', '`owner` must be a string.', { param: 'owner' })
+    }
     const scope = scopeFor(c, b.owner)
     const id = c.req.param('id')
     // Runtime shape guard (round-3 review finding — see the identical comment in the POST
@@ -488,10 +511,27 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
   // route was the one exception — tenant-only — live-reproduced as a real cross-owner leak of
   // every owner's identity + real resource ids, chaining with the caller-supplied-owner design
   // into full cross-owner chat/message content disclosure via the ordinary read routes).
+  // Release-gate I3: this was the only route on the whole surface with no try/catch at all —
+  // `GET /audit?limit=abc` (Number('abc') -> NaN -> node:sqlite throws on bind) crashed to a
+  // bare, unmapped 500 instead of the structured error envelope every other route returns.
+  // `limit` is validated here, before it ever reaches audit.list, same discipline as every
+  // other query-param-driven route on this surface.
   app.get(`${BASE}/audit`, requireScope('chats:read'), (c) => {
     const scope = scopeFor(c, c.req.query('owner'))
-    const limit = c.req.query('limit') ? Number(c.req.query('limit')) : undefined
-    const rows = audit.list(scope.tenant, scope.owner, { limit, since: c.req.query('since') })
-    return c.json({ data: rows.map(toAuditDTO) })
+    const limitParam = c.req.query('limit')
+    let limit: number | undefined
+    if (limitParam !== undefined) {
+      limit = Number(limitParam)
+      if (!Number.isInteger(limit) || limit < 1) {
+        return extError(c, 'invalid_request', 'invalid_input', '`limit` must be a positive integer.', { param: 'limit' })
+      }
+    }
+    try {
+      const rows = audit.list(scope.tenant, scope.owner, { limit, since: c.req.query('since') })
+      return c.json({ data: rows.map(toAuditDTO) })
+    } catch (e) {
+      const m = mapStoreError(e)
+      return extError(c, m.type, m.code, m.message, { status: m.status, retryable: m.retryable })
+    }
   })
 }

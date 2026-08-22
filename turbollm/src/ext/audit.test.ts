@@ -95,6 +95,36 @@ test('reads are not audited, only mutations', () => {
   }
 })
 
+// Release-gate I3: list() bound `opts.limit ?? 200` straight into the SQL LIMIT clause with no
+// clamp — a NaN (from the route layer's `Number('abc')`) or a valid-but-huge limit both reached
+// SQLite unchecked. This is the defense-in-depth half of the fix (the route now also validates
+// before calling in); list() itself must be safe against ANY caller, not just the one route.
+test('list() sanitizes an invalid limit instead of forwarding it to SQLite', () => {
+  const { audit, cleanup } = make()
+  try {
+    audit.record({ tenant: 'acme', owner: 'u1', action: 'chat.create', targetId: 'c1', requestId: 'r1', status: 201, keyPrefix: 'k' })
+    assert.doesNotThrow(() => audit.list('acme', 'u1', { limit: NaN }))
+    assert.doesNotThrow(() => audit.list('acme', 'u1', { limit: -5 }))
+    assert.doesNotThrow(() => audit.list('acme', 'u1', { limit: 0 }))
+    assert.equal(audit.list('acme', 'u1', { limit: NaN }).length, 1)
+  } finally {
+    cleanup()
+  }
+})
+
+test('list() clamps an oversized limit to the same 200-row cap GET /capabilities advertises', () => {
+  const { audit, cleanup } = make()
+  try {
+    for (let i = 0; i < 205; i++) {
+      audit.record({ tenant: 'acme', owner: 'u1', action: 'chat.create', targetId: `c${i}`, requestId: `r${i}`, status: 201, keyPrefix: 'k' })
+    }
+    const rows = audit.list('acme', 'u1', { limit: 1_000_000 })
+    assert.equal(rows.length, 200, 'a huge limit must be clamped, not honored outright')
+  } finally {
+    cleanup()
+  }
+})
+
 test('prune drops entries older than the retention window', () => {
   const { audit, db, cleanup } = make()
   try {

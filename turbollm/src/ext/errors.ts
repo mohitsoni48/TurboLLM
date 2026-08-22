@@ -79,6 +79,13 @@ function defaultStatus(type: ExtErrorType): number {
  *  for the ext API, not a whole-server behavior change. */
 export function extErrorHandler(err: unknown, c: Context): Response {
   if (c.req.path.startsWith('/api/ext/v1/')) {
+    // Release-gate I3's compounding issue: this branch returned the mapped 500 envelope
+    // WITHOUT ever logging the underlying error (unlike the non-ext branch below, which always
+    // does) — every bug that reached this backstop was invisible in the daemon log, including
+    // the invalid_cursor/owner/limit crashes this same review round fixed elsewhere. Logging
+    // here is what makes THIS backstop catch the next one too, not just stop it from being a
+    // bare non-JSON response.
+    console.error(err)
     return extError(c, 'internal', 'internal', 'An unexpected error occurred.', { status: 500 })
   }
   if (err && typeof err === 'object' && 'getResponse' in err) {
