@@ -38,12 +38,58 @@ test('the document is valid OpenAPI 3.1 with a title and version', () => {
   assert.equal(doc.info.version, '1.0.0')
 })
 
-test('every manifest route appears in paths under the ext base', () => {
+test('every manifest route appears in paths under the ext base, using {param} templating', () => {
   const doc = buildOpenApiDocument('1.0.0')
   for (const r of EXT_ROUTES) {
-    const path = `/api/ext/v1${r.path}`
+    // The paths KEY is `{id}`-templated (release-gate I11 — a real OpenAPI path key, not
+    // Hono's `:id` syntax); `r.path` itself stays `:id`-style everywhere else (see the
+    // route-existence tests below, which compare against Hono's own `app.routes`).
+    const path = `/api/ext/v1${r.path.replace(/:([A-Za-z0-9_]+)/g, '{$1}')}`
     assert.ok(doc.paths[path], `missing path ${path}`)
-    assert.ok(doc.paths[path][r.method.toLowerCase()], `missing ${r.method} on ${path}`)
+    const op = doc.paths[path][r.method.toLowerCase()] as { parameters?: Array<{ name: string; in: string }> } | undefined
+    assert.ok(op, `missing ${r.method} on ${path}`)
+    for (const name of (r.path.match(/:([A-Za-z0-9_]+)/g) ?? []).map((s) => s.slice(1))) {
+      assert.ok(
+        op!.parameters?.some((p) => p.name === name && p.in === 'path'),
+        `expected a real path parameter "${name}" on ${r.method} ${path}, not just a templated key`,
+      )
+    }
+  }
+})
+
+// Release-gate I11: buildOperation's default status inference (POST+schema -> 201) was wrong
+// for these two — POST .../messages/generate really returns 202 (routes.runs.ts), and
+// POST /runs/:id/cancel really returns 200 (it updates an existing resource, not creating one).
+// The sibling POST /chats/:id/messages entry already correctly documented 202 for the identical
+// forwarded behavior via altResponse, which is what made the other two's 201 self-contradictory.
+test('POST .../messages/generate documents 202, not the default-inferred 201', () => {
+  const doc = buildOpenApiDocument('1.0.0')
+  const op = doc.paths['/api/ext/v1/chats/{id}/messages/generate'].post as { responses: Record<string, unknown> }
+  assert.ok(op.responses['202'], 'expected a 202 response entry')
+  assert.ok(!op.responses['201'], 'must not ALSO claim 201 — that is the wrong status for this route')
+})
+
+test('POST /runs/:id/cancel documents 200, not the default-inferred 201', () => {
+  const doc = buildOpenApiDocument('1.0.0')
+  const op = doc.paths['/api/ext/v1/runs/{id}/cancel'].post as { responses: Record<string, unknown> }
+  assert.ok(op.responses['200'], 'expected a 200 response entry')
+  assert.ok(!op.responses['201'], 'cancelling an existing run is not resource creation')
+})
+
+// Release-gate I11: `owner` decides whose data a call reads or writes — it was undocumented on
+// every route, including the ones with no requestSchema (so no other way for a schema reader to
+// discover it exists at all).
+test('every route without a request body documents owner as an optional query parameter', () => {
+  const doc = buildOpenApiDocument('1.0.0')
+  const skip = new Set(['GET /capabilities', 'GET /openapi.json'])
+  for (const r of EXT_ROUTES) {
+    if (r.requestSchema || skip.has(`${r.method} ${r.path}`)) continue
+    const path = `/api/ext/v1${r.path.replace(/:([A-Za-z0-9_]+)/g, '{$1}')}`
+    const op = doc.paths[path][r.method.toLowerCase()] as { parameters?: Array<{ name: string; in: string; required: boolean }> }
+    const owner = op.parameters?.find((p) => p.name === 'owner')
+    assert.ok(owner, `expected an owner query param on ${r.method} ${r.path}`)
+    assert.equal(owner!.in, 'query')
+    assert.equal(owner!.required, false, "owner defaults to 'default' server-side, so it must not be required")
   }
 })
 
