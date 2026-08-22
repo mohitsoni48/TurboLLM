@@ -461,19 +461,26 @@ export class TurboLLMChat {
       }),
   }
 
+  // Every run route resolves owner from the QUERY STRING, never a body (routes.runs.ts) — the
+  // server 404s a run whose owner doesn't match the caller's own (scopeFor defaults absent
+  // owner to 'default'). Release-gate I5: none of these forwarded `owner` at all, so
+  // resume() — the client's headline feature and the whole reason it exists — was unusable for
+  // exactly the multi-owner case the README's own example demonstrates (a run created for
+  // `owner: 'user_123'` via `send()` 404s on the very next `runs.get`/`cancel`/`resume`).
   readonly runs = {
-    get: (id: string): Promise<Run> => this.request(`/runs/${encodeURIComponent(id)}`),
+    get: (id: string, opts: { owner?: string } = {}): Promise<Run> =>
+      this.request(`/runs/${encodeURIComponent(id)}`, { query: { owner: opts.owner } }),
 
-    list: (): Promise<Run[]> =>
-      this.request<{ data: Run[] }>(`/runs`).then((page) => page.data),
+    list: (opts: { owner?: string } = {}): Promise<Run[]> =>
+      this.request<{ data: Run[] }>(`/runs`, { query: { owner: opts.owner } }).then((page) => page.data),
 
-    cancel: (id: string): Promise<Run> =>
-      this.request(`/runs/${encodeURIComponent(id)}/cancel`, { method: 'POST' }),
+    cancel: (id: string, opts: { owner?: string } = {}): Promise<Run> =>
+      this.request(`/runs/${encodeURIComponent(id)}/cancel`, { method: 'POST', query: { owner: opts.owner } }),
 
     /** Attaches (or re-attaches, via `after`) to a run's SSE stream (spec 27 §6.3). */
-    stream: (runId: string, after?: number): RunStream =>
+    stream: (runId: string, after?: number, opts: { owner?: string } = {}): RunStream =>
       new RunStream(this.raw(`/runs/${encodeURIComponent(runId)}/stream`, {
-        query: { after },
+        query: { after, owner: opts.owner },
         accept: 'text/event-stream',
       })),
   }
@@ -497,18 +504,20 @@ export class TurboLLMChat {
   /** Convenience wrapper over `runs.stream` implementing spec §7.3's reconciliation rule: if
    *  the server answers `409 replay_window_exceeded` (the cursor aged out of the run's replay
    *  buffer), re-read the message via `runs.get` to resynchronize and attach fresh from the
-   *  run's current `event_seq` instead of surfacing the error to the caller. */
-  async resume(runId: string, afterSeq: number): Promise<RunStream> {
+   *  run's current `event_seq` instead of surfacing the error to the caller. `owner` must match
+   *  whatever the run was created under (`send()`'s own `owner` param) — omitting it defaults
+   *  to `'default'` server-side, same as every other call in this client (release-gate I5). */
+  async resume(runId: string, afterSeq: number, opts: { owner?: string } = {}): Promise<RunStream> {
     const probe = await this.raw(`/runs/${encodeURIComponent(runId)}/stream`, {
-      query: { after: afterSeq },
+      query: { after: afterSeq, owner: opts.owner },
       accept: 'text/event-stream',
     })
     if (probe.status === 409) {
       let code: string | undefined
       try { code = ((await probe.clone().json()) as { error?: { code?: string } }).error?.code } catch { /* ignore */ }
       if (code === 'replay_window_exceeded') {
-        const run = await this.runs.get(runId)
-        return this.runs.stream(runId, run.event_seq)
+        const run = await this.runs.get(runId, opts)
+        return this.runs.stream(runId, run.event_seq, opts)
       }
       throw new ApiError(409, ((await probe.json().catch(() => undefined)) as { error?: ExtErrorBody } | undefined)?.error)
     }

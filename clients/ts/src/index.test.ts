@@ -97,9 +97,11 @@ test('send() throws ApiError instead of silently yielding nothing on a pre-strea
 
 test('resume() reconciles past the replay window via runs.get()', async () => {
   let call = 0
+  const seenUrls: string[] = []
   const fakeFetch: typeof fetch = (async (url: string) => {
     call++
     const u = String(url)
+    seenUrls.push(u)
     if (u.includes('/stream')) {
       if (call === 1) {
         return new Response(
@@ -120,11 +122,51 @@ test('resume() reconciles past the replay window via runs.get()', async () => {
   }) as unknown as typeof fetch
 
   const client = new TurboLLMChat({ baseUrl: 'http://x/api/ext/v1', apiKey: 'k', fetch: fakeFetch })
-  const resumed = await client.resume('run_1', 5)
+  const resumed = await client.resume('run_1', 5, { owner: 'user_123' })
   const seen: string[] = []
   for await (const ev of resumed) seen.push(ev.event)
   assert.deepEqual(seen, ['delta', 'done'])
   assert.equal(resumed.lastEventSeq, 102)
+  // Release-gate I5: resume() previously sent no `owner` on ANY of its 3 requests (the initial
+  // stream probe, the runs.get resync, and the retry stream) — every run route resolves owner
+  // from the query string, so a run created for a non-default owner 404'd on every one of
+  // these, making resume() (the client's headline feature) unusable for exactly the multi-owner
+  // case send()'s own `owner` param exists for.
+  assert.equal(seenUrls.length, 3, 'expected the initial probe, runs.get, and the retry stream')
+  for (const u of seenUrls) assert.ok(u.includes('owner=user_123'), `expected owner=user_123 in ${u}`)
+})
+
+test('runs.get/list/cancel/stream all forward owner as a query param', async () => {
+  const seenUrls: string[] = []
+  const fakeFetch: typeof fetch = (async (url: string) => {
+    seenUrls.push(String(url))
+    return new Response(
+      JSON.stringify({ id: 'run_1', chat_id: 'c1', message_id: 'm1', status: 'complete', event_seq: 1, error: null, created_at: 't', ended_at: null }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    )
+  }) as unknown as typeof fetch
+  const client = new TurboLLMChat({ baseUrl: 'http://x/api/ext/v1', apiKey: 'k', fetch: fakeFetch })
+
+  await client.runs.get('run_1', { owner: 'user_123' })
+  await client.runs.cancel('run_1', { owner: 'user_123' })
+  client.runs.stream('run_1', 5, { owner: 'user_123' })
+  await new Promise((r) => setTimeout(r, 0))   // let the stream's fire-and-forget raw() call land
+
+  assert.equal(seenUrls.length, 3)
+  for (const u of seenUrls) assert.ok(u.includes('owner=user_123'), `expected owner=user_123 in ${u}`)
+})
+
+test('runs.list() forwards owner as a query param', async () => {
+  let seenUrl = ''
+  const client = new TurboLLMChat({
+    baseUrl: 'http://x/api/ext/v1', apiKey: 'k',
+    fetch: (async (url: string) => {
+      seenUrl = String(url)
+      return new Response(JSON.stringify({ data: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }) as unknown as typeof fetch,
+  })
+  await client.runs.list({ owner: 'user_123' })
+  assert.ok(seenUrl.includes('owner=user_123'), `expected owner=user_123 in ${seenUrl}`)
 })
 
 test('messages.append() forwards attachments and metadata, matching send()/SendParams', async () => {

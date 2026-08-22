@@ -71,8 +71,10 @@ for await (const _ev of stream) { /* render tokens as they arrive */ }
 
 if (stream.outcome === 'unknown' && stream.runId) {
   // Reconcile against the run record instead of guessing — the run may still be
-  // streaming, or may have finished after the connection dropped.
-  const run = await client.runs.get(stream.runId)
+  // streaming, or may have finished after the connection dropped. `owner` must match
+  // whichever owner the run was created under (every run route is owner-scoped
+  // server-side, same as chats/messages) — omitting it defaults to 'default'.
+  const run = await client.runs.get(stream.runId, { owner: 'user_123' })
   console.log('actual status:', run.status)
 }
 ```
@@ -83,7 +85,7 @@ server reports `409 replay_window_exceeded` (the cursor aged out of the run's in
 buffer):
 
 ```ts
-const resumed = await client.resume(stream.runId!, stream.lastEventSeq ?? 0)
+const resumed = await client.resume(stream.runId!, stream.lastEventSeq ?? 0, { owner: 'user_123' })
 for await (const ev of resumed) { /* continue rendering */ }
 ```
 
@@ -117,10 +119,12 @@ try {
 - `messages.list(chatId, opts?)`, `.get(id, opts?)`, `.update(id, patch)`, `.delete(id, opts?)`,
   `.append(chatId, input)` — the `generate: false` path: appends a message with no run, for
   back-filling history without touching the GPU
-- `runs.get(id)`, `.list()`, `.cancel(id)`, `.stream(runId, after?)`
+- `runs.get(id, opts?)`, `.list(opts?)`, `.cancel(id, opts?)`, `.stream(runId, after?, opts?)` —
+  every run route is owner-scoped server-side, so pass `{ owner }` here whenever the run wasn't
+  created under the default owner
 - `send(chatId, params)` — append a message and start a run, returning a `RunStream`
-- `resume(runId, afterSeq)` — reattach to an existing run, reconciling past the replay window
-  automatically
+- `resume(runId, afterSeq, opts?)` — reattach to an existing run, reconciling past the replay
+  window automatically; `opts.owner` must match the run's owner, same as the calls above
 
 All list endpoints return the cursor-paginated envelope `{ data, has_more, next_cursor }` (spec
 §5.2) — pass `next_cursor` back in as `cursor` to page forward.
