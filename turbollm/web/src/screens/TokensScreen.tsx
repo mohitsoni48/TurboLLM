@@ -5,6 +5,7 @@ import { Skeleton } from '../components/ui/skeleton'
 import { useTokenUsage } from '../lib/queries'
 import { track } from '../lib/api'
 import type { TokenUsageRange } from '../lib/types'
+import { useDocumentScroll } from '../lib/scroll-mode'
 import { ActivityHeatmap } from './tokens/ActivityHeatmap'
 import { ModelsTab } from './tokens/ModelsTab'
 import { ApiUsageTab } from './tokens/ApiUsageTab'
@@ -138,6 +139,8 @@ function Segmented<T extends string>({
  *  (streaks, peak hour, favorite model), a per-model breakdown, and a range filter —
  *  sourced entirely from message-level stats already persisted per turn. */
 export function TokensScreen() {
+  // Issue #178: a long, plain list screen — the window scrolls it, not an inner box.
+  useDocumentScroll()
   const [range, setRange] = useState<TokenUsageRange>('all')
   const [tab, setTab] = useState<'overview' | 'models' | 'api'>('overview')
   const { data, isLoading, isError, refetch } = useTokenUsage(range)

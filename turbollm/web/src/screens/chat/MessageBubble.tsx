@@ -563,6 +563,37 @@ export function StreamingBubble({
 
 // ── Completed message bubble ──────────────────────────────────────────────────
 
+/** PURE (GitHub #177) — is this bubble a placeholder row the daemon is STILL writing into?
+ *
+ *  The backend inserts the assistant row empty, with `stats: { aborted: false }`, before a single
+ *  token exists (chat-routes.ts, `db.addMessage(convId, 'assistant', '', …)`). Any client that is
+ *  not the tab which started the stream — after a reload, in a second tab, in a tab that was
+ *  backgrounded — has no local `live` entry for it (ChatScreen's `liveByConv` is per-tab React
+ *  state), so it fell straight through to the empty-message branch and painted a red
+ *  "This message is empty." card over a turn that was generating perfectly well.
+ *
+ *  All three conditions are required:
+ *   - `daemonGenerating` — /api/v1/status reports a `liveGeneration`. That is the DAEMON's view of
+ *     the world and it survives reloads, which is precisely what the local state cannot do.
+ *   - `isLast` — only the newest bubble can be the one being written into (ChatScreen passes
+ *     `isLast={i === arr.length - 1 && !live}`).
+ *   - the row is an UNFINALIZED placeholder — finalization always writes `totalMs`
+ *     (chat-routes.ts's stats object sets it unconditionally), so its ABSENCE is the durable
+ *     marker for "nothing has finalized this message yet". This is the condition that keeps a
+ *     genuinely empty FINISHED message showing its error card even while some other conversation
+ *     is generating: `liveGeneration` is engine-wide and carries no conversation id, so the
+ *     message row itself has to supply the "this one specifically is unfinished" evidence.
+ *
+ *  `aborted` is excluded on purpose: a stopped turn is finalized with `aborted: true` and must
+ *  keep reading "Generation failed or was stopped." */
+export function isAwaitingGeneration(
+  message: { stats: Partial<MessageStats> },
+  isLast: boolean,
+  daemonGenerating: boolean,
+): boolean {
+  return daemonGenerating && isLast && message.stats?.totalMs === undefined && !message.stats?.aborted
+}
+
 export function MessageBubble({
   message,
   convId,
@@ -574,6 +605,7 @@ export function MessageBubble({
   onEditSave,
   onEditCancel,
   showThinking = true,
+  daemonGenerating = false,
 }: {
   message: Message
   /** Needed for the chat-branching variant switcher (GitHub #52); optional so read-only
@@ -588,6 +620,9 @@ export function MessageBubble({
   onEditSave: (content: string) => void
   onEditCancel: () => void
   showThinking?: boolean
+  /** GitHub #177: the DAEMON reports a generation in flight (`/api/v1/status` → `liveGeneration`).
+   *  Defaults to false so every other caller (read-only share view, tests) is unchanged. */
+  daemonGenerating?: boolean
 }) {
   const [editDraft, setEditDraft] = useState(message.content)
   const isEditing = editingId === message.id
@@ -679,7 +714,11 @@ export function MessageBubble({
   // with empty content/reasoning but a real sources panel + confidence badge below — showing
   // "This message is empty." above real, populated content would be self-contradictory.
   const isEmptyFinish = !message.content?.trim() && !message.reasoning?.trim() && completedToolCalls.length === 0 && !message.researchMeta
-  const hasError = isEmptyFinish
+  // GitHub #177: "empty" and "failed" are not the same thing. An empty row whose generation the
+  // DAEMON says is still running is simply not finished yet — show the generating affordance, not
+  // a red error card. See isAwaitingGeneration for why all three of its conditions are needed.
+  const stillGenerating = isEmptyFinish && isAwaitingGeneration(message, isLast, daemonGenerating)
+  const hasError = isEmptyFinish && !stillGenerating
   const rm: ResearchMeta | undefined = message.researchMeta
   const verdicts = rm?.refereeVerdicts ?? []
   return (
@@ -713,6 +752,14 @@ export function MessageBubble({
           {message.stats.aborted ? 'Generation failed or was stopped.' : 'This message is empty.'}
           {isLast && onRegenerate && <button type="button" className="ml-3 underline" onClick={() => { track('chat', 'regenerate_message'); onRegenerate() }}>Regenerate</button>}
         </div>
+      ) : stillGenerating ? (
+        // GitHub #177: the turn is in flight on the daemon but this tab isn't the one streaming it
+        // (reload / second tab / restored background tab), so there's no StreamingBubble to show.
+        // Same wording and spinner the send button uses while a generation runs.
+        <div className="flex items-center gap-2 text-[13px] text-muted">
+          <Loader2 size={13} className="animate-spin" />
+          Generating…
+        </div>
       ) : (
         <div className="prose-tllm text-[15px] leading-[1.7] text-ink">
           {verdicts.length > 0
@@ -744,8 +791,10 @@ export function MessageBubble({
                 rendered all four buttons underneath regardless, which is the "block" the
                 follow-up report was pointing at. Delete/Regenerate stay: both are genuinely
                 useful on a failed/empty message. */}
-            {!hasError && <CopyButton text={message.content} className="rounded p-1 hover:bg-panel-2" screen="chat" />}
-            {!hasError && onEdit && <ActionBtn icon={<Pencil size={12} />} label="Edit" onClick={() => { track('chat', 'open_edit_message'); setEditDraft(message.content); onEdit(message) }} />}
+            {/* `stillGenerating` (GitHub #177) joins hasError here for the same reason: there is
+                no text to copy or edit yet, and the row is about to be rewritten by the daemon. */}
+            {!hasError && !stillGenerating && <CopyButton text={message.content} className="rounded p-1 hover:bg-panel-2" screen="chat" />}
+            {!hasError && !stillGenerating && onEdit && <ActionBtn icon={<Pencil size={12} />} label="Edit" onClick={() => { track('chat', 'open_edit_message'); setEditDraft(message.content); onEdit(message) }} />}
             {isLast && onRegenerate && <ActionBtn icon={<RefreshCw size={12} />} label="Regenerate" onClick={() => { track('chat', 'regenerate_message'); onRegenerate() }} />}
             {onDelete && <ActionBtn icon={<Trash2 size={12} />} label="Delete" onClick={() => { track('chat', 'delete_message'); onDelete(message) }} destructive />}
           </div>

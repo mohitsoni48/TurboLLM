@@ -15,6 +15,20 @@ export interface HardwareProfile {
   hasGpu: boolean // gpuVendor !== 'unknown' && gpus.length > 0
   vramMb: number // sum of vramMb across gpus, 0 if none
   gpuName?: string // name of the highest-ranked gpu
+  /** True when EVERY GPU that contributed to `vramMb` shares system RAM (`GpuInfo.unified`,
+   *  ADR-306) — an iGPU-only laptop, an AMD APU box (Strix Halo, GitHub #85), an Apple Silicon
+   *  Mac. It says `vramMb` is NOT a second pool: it is a slice of the same `SysInfo.ramMB` the
+   *  CPU side is drawing from, so a consumer must not spend both budgets independently.
+   *
+   *  This is the missing half of ADR-306. That entry dropped unified adapters from the sum "as
+   *  soon as the same vendor also has a real card" — correct, but it leaves the iGPU-ONLY box
+   *  (no discrete card, so nothing to exclude against) reporting a system-RAM-derived `vramMb`
+   *  with no signal that it overlaps RAM. Downstream fit checks then green-lit a plan whose
+   *  GPU-resident + CPU-resident halves together exceeded the box's total memory (GitHub #164).
+   *  ADR-189's iGPU heuristic and #85's raised APU budget both stay exactly as they are; this
+   *  only tells callers the two budgets are one pool. False on a CPU-only box (`length > 0`
+   *  guard: `[].every()` is `true`) and false whenever a real card is what's being summed. */
+  unifiedMemory: boolean
 }
 
 export function detectHardware(info: SysInfo = getSysInfo()): HardwareProfile {
@@ -43,6 +57,12 @@ export function detectHardware(info: SysInfo = getSysInfo()): HardwareProfile {
   // NVIDIA/AMD dGPU is common) isn't usable for offload, so it must not inflate the
   // budget. `ofVendor` is empty only when there's no GPU at all (vramMb correctly 0).
   const vramMb = ofVendor.reduce((sum, g) => sum + g.vramMb, 0)
+  // Computed over `ofVendor` — the adapters actually SUMMED above — not over `info.gpus`, so it
+  // answers the only question a fit check cares about: "is `vramMb` a slice of `ramMB`?". An
+  // Intel iGPU sitting beside an NVIDIA dGPU is therefore NOT unified here (the iGPU contributed
+  // nothing to `vramMb`), which is what distinguishes this from `unifiedMemoryOnly()` in
+  // sysinfo.ts. GitHub #164.
+  const unifiedMemory = ofVendor.length > 0 && ofVendor.every((g) => g.unified === true)
   return {
     platform: process.platform,
     arch,
@@ -50,5 +70,6 @@ export function detectHardware(info: SysInfo = getSysInfo()): HardwareProfile {
     hasGpu,
     vramMb,
     gpuName: headline?.name,
+    unifiedMemory,
   }
 }

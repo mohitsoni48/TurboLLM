@@ -55,6 +55,7 @@ import { useUiStore } from '../stores/ui'
 import { ScreenHeader, InlineError } from '../components/common'
 import { RemoteEngines } from './engines/RemoteEngines'
 import { useLinks } from '../lib/link-queries'
+import { useDocumentScroll } from '../lib/scroll-mode'
 import { StateChip } from '../components/StateChip'
 import { Badge } from '../components/ui/badge'
 import { Button } from '../components/ui/button'
@@ -409,6 +410,8 @@ function osLabel(platforms: string[]): string {
  *  3. Diagnostics — the running-engine status + live log, kept out of the default view.
  */
 export function EnginesScreen() {
+  // Issue #178: a long, plain list screen — the window scrolls it, not an inner box.
+  useDocumentScroll()
   const enginesQ = useEngines()
   const { data: status } = useStatus()
   const provisioning = !!status?.engineProvision?.active

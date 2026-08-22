@@ -3,7 +3,7 @@ import { useParams, useSearchParams } from 'react-router-dom'
 import { ArrowDown, Copy, Download, PanelLeft, Paperclip, SendHorizontal, Share2, SlidersHorizontal, Square, UserRound, X } from 'lucide-react'
 import { continueConversation, fetchSysInfo, listMemoryFacts, sendMessage } from '../lib/chat-api'
 import { extractPdfText } from '../lib/pdf-extract'
-import { useConversation, useConversationMutations } from '../lib/chat-queries'
+import { chatKeys, useConversation, useConversationMutations } from '../lib/chat-queries'
 import { useBuiltinAgentOverrides, useChatAgents, useEngines, useModelActions, useModelDetail, useModels, useSettings, useStatus } from '../lib/queries'
 import type { ChatSseEvent, Conversation, LiveToolCall, Message } from '../lib/chat-types'
 import { appendTextDelta, upsertToolCall, type LiveBlock } from '../lib/live-timeline'
@@ -849,6 +849,28 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
 
   const generatingIds = useMemo(() => new Set(Object.keys(liveByConv)), [liveByConv])
 
+  // GitHub #177: the DAEMON's own "something is generating right now" signal, selected off the
+  // status poll that's already running above (line 59) — no second poller, no new request. The
+  // local `live`/`liveByConv` state can't answer this: it belongs to the tab that started the
+  // stream, so after a reload (or in another tab) it's empty while the turn is still running,
+  // and the still-empty placeholder row rendered as a red "This message is empty." error.
+  // It is engine-wide and carries no conversation id, which is why MessageBubble additionally
+  // requires the row itself to be an unfinalized placeholder (isAwaitingGeneration).
+  const daemonGenerating = !!status?.liveGeneration
+
+  // Close the gap between "the daemon stopped generating" (status poll, 1–2s) and "this client
+  // has the finished message" (useConversation's 4s poll). Without this, a passive viewer's
+  // bubble could leave its Generating… state up to 4s before the persisted content arrives —
+  // and land back on the very error card this fix exists to remove. Fires only on the
+  // true→false edge, so it costs one extra fetch per generation at most.
+  const wasDaemonGenerating = useRef(false)
+  useEffect(() => {
+    if (wasDaemonGenerating.current && !daemonGenerating && activeId) {
+      void qc.invalidateQueries({ queryKey: chatKeys.detail(activeId) })
+    }
+    wasDaemonGenerating.current = daemonGenerating
+  }, [daemonGenerating, activeId, qc])
+
   return (
     <div className="flex h-full overflow-hidden">
       {/* Sidebar (collapsible, drag-resizable when open). The collapse/expand width
@@ -1088,6 +1110,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                   message={m}
                   convId={readonly ? undefined : activeId ?? undefined}
                   isLast={i === arr.length - 1 && !live}
+                  daemonGenerating={daemonGenerating}
                   onEdit={readonly ? undefined : (msg) => setEditingId(msg.id)}
                   onDelete={readonly ? undefined : handleDelete}
                   onRegenerate={readonly ? undefined : handleRegenerate}

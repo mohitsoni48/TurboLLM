@@ -59,6 +59,21 @@ export function amdApuOnly(info: SysInfo = getSysInfo()): boolean {
   return amd.length > 0 && amd.every((g) => g.unified)
 }
 
+/** True when EVERY detected GPU shares system RAM (`unified: true`) and there is at least one —
+ *  an AMD/Intel APU box, an Apple Silicon Mac, an ARM/Qualcomm mobile SoC. Vendor-agnostic on
+ *  purpose: what matters downstream is the memory topology, not who made the part.
+ *
+ *  Used by auto-tune's spill detection (GitHub #179, and the unified-ness `hardware.ts` computes
+ *  for #164): on a UMA part there is no VRAM/RAM boundary for weights to be demoted ACROSS, so
+ *  host-backed GPU memory is the normal state rather than evidence of a spill. See `spill.ts`.
+ *
+ *  The `length > 0` guard is load-bearing — `[].every()` is `true`, so without it a CPU-only box
+ *  (no GPUs at all) would report as unified. False also whenever ANY discrete card is present:
+ *  that card has its own VRAM and can genuinely spill out of it. */
+export function unifiedMemoryOnly(info: SysInfo = getSysInfo()): boolean {
+  return info.gpus.length > 0 && info.gpus.every((g) => g.unified === true)
+}
+
 export function classifyVendor(name: string): GpuVendor {
   const n = name.toLowerCase()
   if (/nvidia|geforce|rtx|gtx|quadro|tesla/.test(n)) return 'nvidia'
@@ -326,7 +341,14 @@ export function parseRocmSmi(memJson: string, nameJson = ''): GpuInfo[] {
     const nameFields = names[card] ?? {}
     const nameKey = Object.keys(nameFields).find((k) => /(Card Series|Card Model|Product Name|Device Name)/i.test(k))
     const name = (nameKey ? String(nameFields[nameKey]).trim() : '') || 'AMD Radeon GPU'
-    gpus.push({ name, vramMb: Math.round(bytes / 1e6), vendor: 'amd' })
+    // `unified` must be set HERE too, not only on the WMI/lspci paths (GitHub #179): rocm-smi is
+    // tried FIRST on AMD boxes, so on any APU where ROCm happens to resolve, this parser is the one
+    // that produces the GpuInfo — and without the flag that machine silently loses its unified-ness
+    // for every consumer of it (`amdApuOnly` backend selection, `unifiedMemoryOnly` spill gating).
+    // The generic fallback name ("AMD Radeon GPU") is deliberately NOT integrated by this test, so
+    // an unnamed discrete card keeps today's classification.
+    const integrated = isIntegratedGpuName(name)
+    gpus.push({ name, vramMb: Math.round(bytes / 1e6), vendor: 'amd', ...(integrated ? { unified: true } : {}) })
   }
   return gpus
 }

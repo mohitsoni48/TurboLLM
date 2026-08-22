@@ -4,7 +4,7 @@ import { streamSSE } from 'hono/streaming'
 import { networkInterfaces } from 'node:os'
 import type { Deps } from '../deps'
 import { clampMaxTokens } from '../config/config'
-import { feedChunk, flushState, initParseState } from './parser'
+import { feedChunk, flushState, initParseState, type ParseState } from './parser'
 import { needsExtraPass } from './think-utils'
 import { parseReasoningEffort, type ReasoningEffort } from './reasoning-effort'
 import { sseSink, type EmitSink } from './emit-sink.js'
@@ -785,9 +785,50 @@ function reportChatBenchResult(d: Deps, ms: ModelInfo, stats: Partial<MessageSta
   }
 }
 
-async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promise<void> {
+/** Wraps an emit sink so a DEAD CLIENT can never cost us generated output (GitHub #177).
+ *
+ *  Every `await emit(...)` in runGeneration writes to a live SSE stream, and writing to a
+ *  torn-down stream REJECTS. Any one of those rejections used to unwind the whole function —
+ *  past the single `db.updateMessage(...)` that persists `fullContent` at the end — leaving the
+ *  placeholder assistant row (inserted empty, `stats: { aborted: false }`, before the first
+ *  token) permanently blank with `aborted: false`. That is exactly the reporter's third bucket:
+ *  rows that are empty but not flagged aborted, with the model's real output thrown away.
+ *  The done-path emit was individually guarded for this reason; the error-path emit was not, and
+ *  neither were the ten emits inside the streaming loops.
+ *
+ *  So the guard belongs on the SEAM, not on individual call sites: the first failure latches the
+ *  client as gone and every later emit becomes a no-op. A dead client degrades to "keep
+ *  generating, keep persisting, stop writing to the socket" instead of unwinding. Abort semantics
+ *  are untouched — a real Stop click aborts via the AbortController (and a client disconnect via
+ *  `stream.onAbort`), which is what sets `aborted: true`; this only stops write failures from
+ *  being fatal. PURE-ish and exported so the latch behaviour is pinned by tests. */
+export function resilientSink(sink: EmitSink): EmitSink & { clientGone: () => boolean } {
+  let gone = false
+  const wrapped = async (ev: { event: string; data: unknown }): Promise<void> => {
+    if (gone) return
+    try {
+      await sink(ev)
+    } catch {
+      // Client is gone (cancelled turn / closed tab / reloaded). Nothing to flush to, ever
+      // again on this stream — and an unhandled rejection here would crash the daemon.
+      gone = true
+    }
+  }
+  return Object.assign(wrapped, { clientGone: () => gone })
+}
+
+/** The whole generation turn: engine call(s), tool loop, and the ONE write-back that persists
+ *  the reply. Exported ONLY so tests can drive it with a sink of their own — the persistence
+ *  invariant this function owns (GitHub #177: generated output must survive a client that has
+ *  gone away, an engine that dies mid-stream, and a Stop click) is not reachable through the
+ *  route, whose sink is hard-wired to the live SSE stream. Not part of any public API. */
+export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationCtx): Promise<void> {
   const { db } = d
   const { convId, conv, assistantMsg, upstream, ac, thinkingBudget, reasoningEffort } = ctx
+  // GitHub #177: never let a write to a torn-down stream unwind past the persistence write
+  // below. See resilientSink's doc comment — this is the invariant, not the individual
+  // try/catch at the two emit sites that happened to have one.
+  const emit = resilientSink(rawEmit)
   // A remote turn ran on ANOTHER machine: nothing below may write its numbers into this
   // one's engine state. Same rule the gateway's own remote branch follows (I-4) — the
   // peer's engine card must not read "Generating…" for work its engine is not doing, and
@@ -913,6 +954,24 @@ async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promi
   // false/true respectively), and first_chat needs the real three-way split.
   let engineFailed = false
   let liveOut = 0
+  /** The live round's parser state, or null once its end-of-stream flush has already run.
+   *  GitHub #177: the streaming parser legitimately withholds up to 29 characters as lookahead
+   *  (it cannot know yet whether they are the start of a `<|channel|>analysis…` tag), and that
+   *  tail is only released by `flushState` at end-of-stream. An abort or an engine death THROWS
+   *  out of the round loop before that flush ever runs, so every short interrupted reply — the
+   *  common case when a user hits Stop early — had its text dropped on the floor even though the
+   *  model really did produce it. Held here so the finalizer below can drain it. */
+  let pendingParse: ParseState | null = null
+  /** GitHub #52 item 9: the authoritative prompt-token count only arrives at the END of a round
+   *  (`usage.prompt_tokens` / `timings.prompt_n`), so a mid-stream abort leaves it at 0 — the UI
+   *  renders "0+147 tokens" and `ctxUsed` understates context by the entire prompt even though
+   *  those prompt tokens really are sitting in the KV cache. The engine streams `prompt_progress`
+   *  chunks WHILE it ingests the prompt (`{ processed, total }`, surfaced to the client as the
+   *  `progress` event), and that `total` IS the prompt size — the same number `prompt_tokens`
+   *  would have reported. Remember the last one seen and use it as the fallback. This is a
+   *  measured value from the engine, never an invented one: it stays 0 when the engine sends no
+   *  progress at all (e.g. `return_progress` unsupported), which is exactly today's behavior. */
+  let lastPromptTotal = 0
 
   // In-app chat is the owner using their own machine — the signal Turbo Link's wake
   // gate reads to refuse a peer's model swap (link/host-idle.ts). The gateway records
@@ -1032,7 +1091,12 @@ async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promi
       const decoder = new TextDecoder()
       let buf = ''
 
-      const cancelReader = () => void reader.cancel()
+      // `.catch()` is load-bearing (GitHub #177): on abort, the fetch layer ERRORS the body
+      // stream first (undici rejects the pending read with AbortError), and cancelling an
+      // already-errored stream returns a REJECTED promise. Bare `void reader.cancel()` left that
+      // floating — an unhandled rejection, i.e. a daemon crash mid-generation, which loses the
+      // turn's output the same way the unguarded emits did.
+      const cancelReader = () => { void reader.cancel().catch(() => {}) }
       if (ac.signal.aborted) {
         cancelReader()
       } else {
@@ -1042,6 +1106,7 @@ async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promi
       // Per-round state
       let roundContent = ''
       let parseState = initParseState()
+      pendingParse = parseState
       let finishReason = ''
       // Accumulate streaming tool_calls by index (OpenAI format: fragmented across chunks)
       const pendingToolCalls = new Map<number, { id: string; name: string; argsBuffer: string }>()
@@ -1067,6 +1132,8 @@ async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promi
           // Prompt progress
           const pp = chunk.prompt_progress as { processed?: number; total?: number; tps?: number } | undefined
           if (pp && pp.total) {
+            // #52 item 9: the only prompt-token number that exists before the round ends.
+            lastPromptTotal = pp.total
             const pct = Math.round((pp.processed ?? 0) / pp.total * 100)
             if (localAccounting) d.manager.setLiveGen({ phase: 'prompt', pct, outputTokens: 0 })
             await emit({ event: 'progress', data: { phase: 'prompt', processed: pp.processed, total: pp.total, pct, tps: pp.tps ?? 0 } })
@@ -1121,6 +1188,7 @@ async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promi
 
           const { state: nextState, events: parseEvents } = feedChunk(parseState, raw_content)
           parseState = nextState
+          pendingParse = parseState
           for (const ev of parseEvents) {
             if (ev.type === 'reasoning') {
               if (!thinkStart) thinkStart = Date.now()
@@ -1140,7 +1208,10 @@ async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promi
       }
       ac.signal.removeEventListener('abort', cancelReader)
 
-      // Flush lookahead buffer at end-of-stream.
+      // Flush lookahead buffer at end-of-stream. Clearing `pendingParse` first is what stops the
+      // interrupted-turn drain after the try/catch from flushing this same buffer a SECOND time
+      // (flushState is pure — it does not consume the buffer it reads).
+      pendingParse = null
       for (const ev of flushState(parseState)) {
         if (ev.type === 'reasoning') {
           fullReasoning += ev.text
@@ -1351,7 +1422,10 @@ async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promi
         const reader = res.body.getReader()
         const decoder = new TextDecoder()
         let buf = ''
-        const cancelReader = () => void reader.cancel()
+        // `.catch()` is load-bearing (GitHub #177) — see the identical guard in the main round
+        // loop above: on abort the fetch layer errors the body stream first, and cancelling an
+        // already-errored stream returns a REJECTED promise, which bare `void` left floating.
+        const cancelReader = () => { void reader.cancel().catch(() => {}) }
         if (ac.signal.aborted) {
           cancelReader()
         } else {
@@ -1359,6 +1433,7 @@ async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promi
         }
 
         let parseState = initParseState()
+        pendingParse = parseState
         roundLoop: while (true) {
           const { done, value } = await reader.read()
           if (done) break
@@ -1373,6 +1448,11 @@ async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promi
             try { chunk = JSON.parse(raw) as Record<string, unknown> } catch { continue }
             if (chunk.usage) finalUsage = chunk.usage as typeof finalUsage
             if (chunk.timings) finalTimings = chunk.timings as typeof finalTimings
+            // #52 item 9: the extra pass re-sends the whole conversation, so ITS prompt is the
+            // one occupying context when it is interrupted. Captured (not emitted — this pass
+            // has never streamed progress to the client and this fix does not change that).
+            const pp2 = chunk.prompt_progress as { total?: number } | undefined
+            if (pp2?.total) lastPromptTotal = pp2.total
             const choices = chunk.choices as Array<{ delta?: { content?: string; reasoning_content?: string; reasoning?: string }; finish_reason?: string }> | undefined
             if (!choices?.length) continue
             const delta = choices[0].delta ?? {}
@@ -1386,6 +1466,7 @@ async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promi
             if (!raw_content) continue
             const { state: nextState, events: parseEvents } = feedChunk(parseState, raw_content)
             parseState = nextState
+            pendingParse = parseState
             for (const ev of parseEvents) {
               if (ev.type === 'reasoning') {
                 fullReasoning += ev.text
@@ -1401,6 +1482,7 @@ async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promi
           }
         }
         ac.signal.removeEventListener('abort', cancelReader)
+        pendingParse = null
         for (const ev of flushState(parseState)) {
           if (ev.type === 'reasoning') {
             fullReasoning += ev.text
@@ -1417,11 +1499,34 @@ async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promi
     aborted = isAbort
     if (!isAbort) {
       engineFailed = true
-      await emit({ event: 'error', data: { code: 'engine_stopped', message: (e as Error).message } })
+      // Belt and braces on top of resilientSink (GitHub #177): this emit is the one that used
+      // to throw INSIDE the catch block, which no `finally` can contain — the rejection escaped
+      // the whole function and skipped the `db.updateMessage` below, discarding everything the
+      // model had already generated. Nothing after this point may be allowed to throw.
+      try {
+        await emit({ event: 'error', data: { code: 'engine_stopped', message: (e as Error).message } })
+      } catch { /* client gone — the message is still persisted below */ }
     }
   } finally {
     if (localAccounting) d.manager.generationEnd()
     inflight.delete(convId)
+  }
+
+  // GitHub #177: drain whatever the parser was still holding when the round was cut short (see
+  // `pendingParse`). Non-null ONLY on the interrupted paths — a round that reached its own
+  // end-of-stream flush nulls it first, so this can never double-count a normal turn.
+  if (pendingParse) {
+    for (const ev of flushState(pendingParse)) {
+      if (ev.type === 'reasoning') {
+        fullReasoning += ev.text
+      } else {
+        fullContent += ev.text
+        // Counted like any other streamed delta so the #52 `liveOut` token fallback below
+        // doesn't report "0 tokens" for a message that plainly has content.
+        liveOut++
+      }
+    }
+    pendingParse = null
   }
 
   const totalMs = Date.now() - requestStart
@@ -1437,6 +1542,13 @@ async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promi
   // the token count remains as 0+0, yet the model still sees the message in context, and the
   // total token count remains unchanged").
   const genTokensFallback = finalUsage.completion_tokens || liveOut
+  // The prompt half of the same problem (GitHub #52 item 9). `genTokens` has had its liveOut
+  // fallback for a while; `promptTokens` had none, so an interrupted turn rendered "0+147
+  // tokens" and ctxUsed was short by the ENTIRE prompt — the number the next turn's context
+  // budget is judged against. lastPromptTotal is the engine's own streamed prompt size (see its
+  // declaration); 0 when the engine never reported one, which reproduces the old behavior
+  // rather than fabricating a count.
+  const promptTokensFallback = finalUsage.prompt_tokens || lastPromptTotal
 
   const stats: Partial<MessageStats> = {
     ttftMs,
@@ -1444,7 +1556,7 @@ async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promi
     thinkMs,
     // Full context occupancy: cache-reused prompt tokens still sit in the KV cache / context
     // window (they're skipped only for recomputation), so they must stay counted here.
-    ctxUsed: (finalUsage.prompt_tokens ?? 0) + genTokensFallback,
+    ctxUsed: promptTokensFallback + genTokensFallback,
     ctxMax,
     model: upstream.modelName,
     aborted,
@@ -1461,7 +1573,9 @@ async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promi
     stats.tps          = finalTimings.predicted_per_second
     stats.cachedTokens = cachedExplicit ?? Math.max(0, (fullPrompt || processed) - processed)
   } else {
-    stats.promptTokens = fullPrompt
+    // No final timings — the interrupted/failed case. `fullPrompt` is 0 here whenever the usage
+    // chunk never landed, which is precisely when the streamed prompt total has to stand in.
+    stats.promptTokens = promptTokensFallback
     stats.genTokens    = genTokensFallback
     stats.genMs        = totalMs - ttftMs
     stats.tps          = stats.genMs > 0 ? Math.round((stats.genTokens / stats.genMs) * 1000 * 10) / 10 : 0

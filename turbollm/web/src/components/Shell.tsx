@@ -1,7 +1,8 @@
-import { type ReactNode, useEffect } from 'react'
+import { type ReactNode, useEffect, useLayoutEffect } from 'react'
 import { Link, NavLink, useLocation, useNavigate } from 'react-router-dom'
 import { BarChart3, Boxes, Code2, Cpu, PanelsTopLeft, Puzzle, Settings2 } from 'lucide-react'
 import { cn } from '../lib/utils'
+import { type ScrollMode, useScrollMode } from '../lib/scroll-mode'
 import type { Status } from '../lib/types'
 import { useRoutinesWithLatestRun } from '../lib/routine-queries'
 import { useSettings } from '../lib/queries'
@@ -31,11 +32,18 @@ export function Shell({
   status,
   online,
   version,
+  scroll,
   children,
 }: {
   status: Status | undefined
   online: boolean
   version: string
+  /**
+   * Force a scroll mode instead of resolving it from the mounted view's own
+   * `useDocumentScroll()` opt-in. Only tests pass this — App.tsx does not, so the
+   * screens stay the single source of truth for whether their content scrolls.
+   */
+  scroll?: ScrollMode
   children: ReactNode
 }) {
   // The wizard is a full-screen, linear flow (spec 25 §4) — every nav link is an
@@ -43,14 +51,47 @@ export function Shell({
   // "I don't need onboarding" already cover leaving on purpose. Found live: the
   // rail rendered right alongside the wizard, letting a click wander off to
   // Models/Settings/etc. mid-flow with no wizard-side awareness of the detour.
-  const onOnboarding = useLocation().pathname === '/onboarding'
+  const { pathname } = useLocation()
+  const onOnboarding = pathname === '/onboarding'
+
+  // Issue #178: the long list-style screens (Models library, Engines, Developer, Customize, Usage,
+  // Settings) opt into scrolling the DOCUMENT via `useDocumentScroll()`; Chat / Workspace / Code /
+  // Discover stay in the bounded shell, where a pane must stay pinned while an inner list scrolls.
+  // See lib/scroll-mode.ts for why this is per-view rather than per-route.
+  // Hook called unconditionally (rules of hooks) — the `scroll` override is applied to its result.
+  const requestedScroll = useScrollMode()
+  const documentScroll = (scroll ?? requestedScroll) === 'document'
+
+  // Release the `height: 100% / overflow: hidden` lock in index.css. Layout effect so the class and
+  // the markup below always agree within a single paint — a passive effect would let one frame of
+  // an unlocked <html> render behind a freshly-mounted bounded screen's `h-full` panes.
+  useLayoutEffect(() => {
+    const root = document.documentElement
+    root.classList.toggle('tllm-doc-scroll', documentScroll)
+    return () => root.classList.remove('tllm-doc-scroll')
+  }, [documentScroll])
+
+  // With the document scrolling, the scroll offset now survives a route change (it used to live on
+  // a per-screen element that unmounted with it), so a nav from halfway down Models would drop you
+  // halfway down Engines. Reset on every path change while in document mode; the bounded shell
+  // needs nothing here, and a tab flip inside one screen doesn't change `pathname`, so switching
+  // Models' Library/Discover tabs doesn't yank the page either.
+  // Guarded on a non-zero offset rather than called unconditionally: no point asking for a scroll
+  // that is already where it would land, and it keeps jsdom (which has no scrollTo) out of it.
+  useEffect(() => {
+    if (documentScroll && window.scrollY !== 0) window.scrollTo(0, 0)
+  }, [pathname, documentScroll])
+
   return (
-    <div className="app-shell flex h-full">
+    <div className={cn('app-shell flex', documentScroll ? 'min-h-dvh' : 'h-full')}>
       {!onOnboarding && <NavRail status={status} online={online} version={version} className="hidden md:flex" />}
       <div className="flex min-w-0 flex-1 flex-col">
         <EngineProvisionBanner status={status} />
         <EngineLoadErrorBanner status={status} />
-        <main className="min-h-0 flex-1 overflow-auto">{children}</main>
+        {/* Bounded mode: `main` is the scroller. Document mode: it must NOT be, or the window
+            still has nothing to scroll — and `min-h-0` comes off with it so `main` keeps a
+            content-height floor inside the now auto-height column. */}
+        <main className={cn('flex-1', !documentScroll && 'min-h-0 overflow-auto')}>{children}</main>
         {!onOnboarding && <MobileNav />}
       </div>
     </div>
@@ -143,6 +184,11 @@ function NavRail({
         // Icon-only at md–lg (w-16). At xl+ expand to show labels (w-48).
         'flex w-16 shrink-0 flex-col items-center bg-panel-2 py-3',
         'xl:w-48 xl:items-start xl:px-3',
+        // Issue #178: in document-scroll mode `.app-shell` is as tall as the page, so a stretched
+        // rail would run off the bottom with it. Pinned to one viewport instead. In bounded mode
+        // this is a no-op: `h-dvh` equals the shell height it already stretched to, and `sticky`
+        // has no scrolling ancestor to stick against.
+        'sticky top-0 h-dvh',
         className,
       )}
     >
@@ -269,7 +315,14 @@ function MobileNav() {
   // remembered right now, reading "not active" while genuinely inside Workspace.
   const { pathname } = useLocation()
   return (
-    <nav className="flex shrink-0 border-t border-border bg-panel-2 md:hidden">
+    // Issue #178, load-bearing: this used to be `position: static`, which is fine only while the
+    // page can't scroll. In document-scroll mode a static bar sits at the END of a 3000px page —
+    // i.e. nowhere near the screen. `sticky bottom-0` keeps it on the viewport edge, `z-30` keeps
+    // page content from painting over it. Both are inert in the bounded shell, where the column
+    // has no scrolling ancestor and the bar is already the last row of a 100vh flex column.
+    // `h-14` pins the height that index.css's `--tllm-mobile-nav-h` is written against (it was
+    // already 56px from its content; now it says so) — keep the two in step.
+    <nav className="sticky bottom-0 z-30 flex h-14 shrink-0 border-t border-border bg-panel-2 md:hidden">
       {NAV.map(({ to, label, icon: Icon }) => {
         const isActive = pathname === to || pathname.startsWith(`${to}/`)
         return (
