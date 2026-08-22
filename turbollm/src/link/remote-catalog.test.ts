@@ -9,6 +9,19 @@ const link = (over: Partial<LinkRecord> = {}): LinkRecord => ({
   status: 'online', lastSeenAt: null, lastError: null, ...over,
 })
 
+/** Construct the catalog with Turbo Link's experimental gate ON.
+ *
+ *  `isEnabled` is a REQUIRED constructor field (remote-catalog.ts): a missing gate must be
+ *  a compile error, not a silently enabled feature. This suite predates the gate and is
+ *  about the catalog's own caching/filtering, so it runs unlocked; the gate itself is
+ *  covered by experimental-gate.test.ts. */
+function mkCatalog(
+  src: { list: () => LinkRecord[] },
+  opts: Omit<ConstructorParameters<typeof RemoteCatalog>[1], 'isEnabled'> = {},
+) {
+  return new RemoteCatalog(src, { ...opts, isEnabled: () => true })
+}
+
 const json = (body: unknown) =>
   new Response(JSON.stringify(body), { headers: { 'content-type': 'application/json' } })
 
@@ -31,7 +44,7 @@ function source(records: LinkRecord[]) {
 
 test('refresh never throws when the host is unreachable', async () => {
   const { src } = source([link()])
-  const cat = new RemoteCatalog(src, {
+  const cat = mkCatalog(src, {
     fetchImpl: (async () => { throw new Error('ECONNREFUSED') }) as unknown as typeof fetch,
   })
   await cat.refresh() // must not reject
@@ -41,7 +54,7 @@ test('refresh never throws when the host is unreachable', async () => {
 
 test('refresh never throws on a 200 with a nonsense body', async () => {
   const { src } = source([link()])
-  const cat = new RemoteCatalog(src, {
+  const cat = mkCatalog(src, {
     fetchImpl: fetchFor({ 'https://ws.example': { machineName: 'ws', models: 'not-an-array' } }),
   })
   await cat.refresh()
@@ -50,7 +63,7 @@ test('refresh never throws on a 200 with a nonsense body', async () => {
 
 test('refresh caches an online link\'s models', async () => {
   const { src } = source([link()])
-  const cat = new RemoteCatalog(src, {
+  const cat = mkCatalog(src, {
     fetchImpl: fetchFor({
       'https://ws.example': {
         machineName: 'workstation',
@@ -69,7 +82,7 @@ test('refresh caches an online link\'s models', async () => {
 
 test('models are dropped the moment a link\'s status leaves online', async () => {
   const { src, state } = source([link()])
-  const cat = new RemoteCatalog(src, {
+  const cat = mkCatalog(src, {
     fetchImpl: fetchFor({
       'https://ws.example': { machineName: 'workstation', models: [{ key: 'Qwen3-35B', name: 'Qwen3-35B' }] },
     }),
@@ -91,7 +104,7 @@ test('models are dropped the moment a link\'s status leaves online', async () =>
 
 test('a link removed from the list drops its cached models', async () => {
   const { src, state } = source([link()])
-  const cat = new RemoteCatalog(src, {
+  const cat = mkCatalog(src, {
     fetchImpl: fetchFor({
       'https://ws.example': { machineName: 'workstation', models: [{ key: 'Qwen3-35B', name: 'Qwen3-35B' }] },
     }),
@@ -105,7 +118,7 @@ test('a link removed from the list drops its cached models', async () => {
 
 test('modelOn is EXACT — never a substring or case-insensitive match', async () => {
   const { src } = source([link()])
-  const cat = new RemoteCatalog(src, {
+  const cat = mkCatalog(src, {
     fetchImpl: fetchFor({
       'https://ws.example': { machineName: 'workstation', models: [{ key: 'Qwen3-35B', name: 'Qwen3-35B' }] },
     }),
@@ -120,7 +133,7 @@ test('modelOn is EXACT — never a substring or case-insensitive match', async (
 
 test('linkByName is case-insensitive and reads the live record', async () => {
   const { src, state } = source([link()])
-  const cat = new RemoteCatalog(src)
+  const cat = mkCatalog(src)
   assert.equal(cat.linkByName('WORKSTATION')?.id, 'l1')
   assert.equal(cat.linkByName('workstation')?.id, 'l1')
   assert.equal(cat.linkByName('work')?.id, undefined) // exact name, not a prefix
@@ -134,7 +147,7 @@ test('two machines exposing the same model name stay distinct', async () => {
     link(),
     link({ id: 'l2', name: 'kaggle', baseUrl: 'https://kg.example', token: 'tllm-other' }),
   ])
-  const cat = new RemoteCatalog(src, {
+  const cat = mkCatalog(src, {
     fetchImpl: fetchFor({
       'https://ws.example': { machineName: 'workstation', models: [{ key: 'Qwen3-35B', name: 'Qwen3-35B' }] },
       'https://kg.example': { machineName: 'kaggle', models: [{ key: 'Qwen3-35B', name: 'Qwen3-35B' }] },
@@ -153,7 +166,7 @@ test('two machines exposing the same model name stay distinct', async () => {
 
 test('a machine renamed by the user re-keys without a refresh', async () => {
   const { src, state } = source([link()])
-  const cat = new RemoteCatalog(src, {
+  const cat = mkCatalog(src, {
     fetchImpl: fetchFor({
       'https://ws.example': { machineName: 'workstation', models: [{ key: 'Qwen3-35B', name: 'Qwen3-35B' }] },
     }),
@@ -172,7 +185,7 @@ test('a machine renamed by the user re-keys without a refresh', async () => {
 test('a link without models:use is never fetched', async () => {
   let calls = 0
   const { src } = source([link({ grantedCapabilities: ['config:read'] })])
-  const cat = new RemoteCatalog(src, {
+  const cat = mkCatalog(src, {
     fetchImpl: (async () => { calls++; return json({ machineName: 'ws', models: [] }) }) as unknown as typeof fetch,
   })
   await cat.refresh()

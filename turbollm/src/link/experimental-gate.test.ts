@@ -92,14 +92,34 @@ test('isTurboLinkEnabled reads daemon.experimental.turboLink and fails closed', 
 
 // ── the host façade ───────────────────────────────────────────────────────────
 
+/** Every route the façade mounts, enumerated rather than sampled.
+ *
+ *  The gate is middleware on `/api/link/v1/*`, so coverage is structural and a sample would
+ *  pass — but enumerating is what catches the route someone later mounts just outside that
+ *  prefix, and it makes this list symmetrical with `ADMIN_ROUTES` below. Keep it in step with
+ *  the registrations in `link-routes.ts`. */
+const FACADE_ROUTES: [string, string][] = [
+  ['POST', '/api/link/v1/hello'],
+  ['GET', '/api/link/v1/models'],
+  ['GET', '/api/link/v1/status'],
+  ['POST', '/api/link/v1/models/load'],
+  ['POST', '/api/link/v1/models/unload'],
+  ['GET', '/api/link/v1/downloads'],
+  ['POST', '/api/link/v1/downloads'],
+  ['DELETE', '/api/link/v1/downloads/d1'],
+  ['GET', '/api/link/v1/config'],
+  ['PATCH', '/api/link/v1/config'],
+  ['POST', '/api/link/v1/chat/completions'],
+]
+
 test('the façade refuses every route with a typed error while the flag is off', async () => {
   const { d } = mkDeps(false)
-  for (const [method, path] of [
-    ['POST', '/api/link/v1/hello'],
-    ['GET', '/api/link/v1/models'],
-    ['GET', '/api/link/v1/status'],
-  ] as const) {
-    const res = await facade(d).request(path, { method, headers: { 'X-TurboLLM-Auth': 'tllm-a' } })
+  for (const [method, path] of FACADE_ROUTES) {
+    const res = await facade(d).request(path, {
+      method,
+      headers: { 'X-TurboLLM-Auth': 'tllm-a', 'content-type': 'application/json' },
+      ...(method === 'POST' || method === 'PATCH' ? { body: '{}' } : {}),
+    })
     assert.equal(res.status, 403, `${method} ${path}`)
     const body = await res.json() as { error: { code: string; message: string } }
     // Typed and specific: a 404 here would read to a peer as a link-API version mismatch
@@ -107,6 +127,21 @@ test('the façade refuses every route with a typed error while the flag is off',
     assert.equal(body.error.code, TURBO_LINK_DISABLED_CODE, `${method} ${path}`)
     assert.match(body.error.message, /Turbo Link/)
   }
+})
+
+test('FACADE_ROUTES is the WHOLE façade, and the whole façade is inside the gated prefix', () => {
+  // The enumeration above is only worth having if it cannot silently fall behind the router.
+  // This reads what the app actually mounted: every real handler must be represented, so a
+  // twelfth route added later fails here until it is listed — and any link route registered
+  // OUTSIDE `/api/link/v1/`, which is the case the middleware genuinely would not cover,
+  // fails here too.
+  const mounted = facade(mkDeps(true).d).routes
+    .filter((r) => r.method !== 'ALL' && r.path.startsWith('/api/link'))
+    .map((r) => `${r.method} ${r.path}`)
+  const listed = new Set(FACADE_ROUTES.map(([m, p]) => `${m} ${p.replace(/\/d1$/, '/:id')}`))
+  for (const r of mounted) assert.ok(listed.has(r), `${r} is mounted but not covered by FACADE_ROUTES`)
+  assert.equal(new Set(mounted).size, listed.size, 'FACADE_ROUTES lists a route the façade does not mount')
+  for (const r of mounted) assert.ok(r.includes(' /api/link/v1/'), `${r} sits outside the gated prefix`)
 })
 
 test('the façade refuses BEFORE resolving a token — a valid link key gets no further', async () => {

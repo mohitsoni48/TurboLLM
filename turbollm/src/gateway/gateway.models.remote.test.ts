@@ -46,7 +46,13 @@ function hostFetch(byBaseUrl: Record<string, RemoteModel[]>): typeof fetch {
 }
 
 async function catalogFor(links: LinkRecord[], byBaseUrl: Record<string, RemoteModel[]>): Promise<RemoteCatalog> {
-  const cat = new RemoteCatalog({ list: () => links }, { fetchImpl: hostFetch(byBaseUrl) })
+  // Turbo Link's experimental gate is a required constructor field (remote-catalog.ts).
+  // This suite asserts that remote models DO appear in /v1/models, so it runs unlocked;
+  // that they vanish when the flag is off is covered by link/experimental-gate.test.ts.
+  const cat = new RemoteCatalog(
+    { list: () => links },
+    { fetchImpl: hostFetch(byBaseUrl), isEnabled: () => true },
+  )
   await cat.refresh()
   return cat
 }

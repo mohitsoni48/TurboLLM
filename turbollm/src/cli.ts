@@ -44,6 +44,7 @@ import { provisionTunnelApiKey } from './auth'
 import { TunnelManager, reapStaleTunnels, killTrackedTunnelsSync } from './tunnel/manager'
 import { LinkManager } from './link/link-manager'
 import { RemoteCatalog } from './link/remote-catalog'
+import { isTurboLinkEnabled } from './link/gate'
 import type { Deps } from './deps'
 import { TELEMETRY_ENV } from './telemetry/disabled'
 import { Emitter } from './telemetry/emit'
@@ -337,9 +338,15 @@ const comfy = new ComfyGuard(store, manager)
 // not a boot-time snapshot — same shape as `isRoutinesEnabled` below. Gating the catalog is
 // what makes remote models vanish from `/v1/models`, `ModelRouter`, chat and
 // `turbollm launch claude` the instant the flag goes off, with no restart.
+// It calls `isTurboLinkEnabled` rather than reading the config field inline: that helper is
+// the ONE symbol a reviewer greps to find every gate in this feature (link/gate.ts), and a
+// production wiring site that spells the check out by hand is exactly the one that would not
+// show up in that grep. It also brings the helper's optional chaining and `=== true`, so a
+// config that never went through normalize() reads "off" instead of throwing inside
+// `isUsable` on every /v1/models. `deps` is read lazily here, same as `list` above.
 const remoteCatalog = new RemoteCatalog(
   { list: () => deps.links?.list() ?? [] },
-  { isEnabled: () => store.snapshot().daemon.experimental.turboLink },
+  { isEnabled: () => isTurboLinkEnabled(deps) },
 )
 const modelRouter = new ModelRouter(store, registry, manager, scanner, comfy, remoteCatalog)
 // Tool registry (v0.7.0): built-in tools + MCP host. Syncs MCP servers from config.
@@ -577,9 +584,11 @@ routineScheduler.start()
 // restart takes TurboLLM offline mid-session). While it is off, start() arms an inert timer
 // and nothing polls: no outbound probe, no config rewrite. The `links` in config are left
 // exactly where they are.
+// Same `isTurboLinkEnabled` call as the catalog above, and for the same reason: one grepped
+// symbol, one definition of what "on" means, no second hand-spelled copy to drift from it.
 deps.links = new LinkManager(deps, {
   catalog: remoteCatalog,
-  isEnabled: () => store.snapshot().daemon.experimental.turboLink,
+  isEnabled: () => isTurboLinkEnabled(deps),
 })
 deps.links.start()
 

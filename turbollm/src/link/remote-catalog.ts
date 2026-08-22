@@ -40,16 +40,18 @@ export class RemoteCatalog {
    *  disabling the feature drop remote models instantly rather than at the next poll. Exactly
    *  the rule a link going offline already follows.
    *
-   *  Defaults to always-enabled so every pre-existing construction site and test keeps its
-   *  previous behavior; `cli.ts` injects the real predicate. */
+   *  REQUIRED, with no default — see the matching note on `LinkManager.isEnabled`. A gate
+   *  whose absence means "fully enabled" makes a forgotten construction site silent, and a
+   *  silent missed call site is the exact failure this gate exists to prevent. Required means
+   *  TypeScript reports it instead. */
   private readonly isEnabled: () => boolean
 
   constructor(
     private readonly links: LinkSource,
-    opts?: { fetchImpl?: typeof fetch; isEnabled?: () => boolean },
+    opts: { fetchImpl?: typeof fetch; isEnabled: () => boolean },
   ) {
-    this.fetchImpl = opts?.fetchImpl
-    this.isEnabled = opts?.isEnabled ?? (() => true)
+    this.fetchImpl = opts.fetchImpl
+    this.isEnabled = opts.isEnabled
   }
 
   /** Re-fetch every online link's model list, concurrently and in isolation. Never

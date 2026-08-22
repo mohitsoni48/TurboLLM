@@ -31,6 +31,17 @@ function mkTelemetry(): { telemetry: Emitter; dir: string; cleanup: () => void }
   return { telemetry, dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) }
 }
 
+/** Construct the manager with Turbo Link's experimental gate ON.
+ *
+ *  `isEnabled` is a REQUIRED constructor field (link-manager.ts) so that a site which
+ *  forgets the gate is a compile error rather than a silently ungated feature. This suite
+ *  predates the gate and is about the manager's OWN behaviour — probing, backoff, telemetry
+ *  — so it runs with the feature unlocked, stated once here instead of on twenty call sites.
+ *  The gate's own behaviour is covered by experimental-gate.test.ts. */
+function mkManager(d: Deps, opts: Omit<ConstructorParameters<typeof LinkManager>[1], 'isEnabled'>) {
+  return new LinkManager(d, { ...opts, isEnabled: () => true })
+}
+
 const rec = (over: Partial<LinkRecord> = {}): LinkRecord => ({
   id: 'l1', name: 'workstation', baseUrl: 'http://h:6996', token: 'tllm-x',
   machineId: null, grantedCapabilities: [], linkApiVersion: null,
@@ -44,7 +55,7 @@ const helloOk = async () => new Response(JSON.stringify({
 
 test('a successful probe records capabilities, version, machineId and lastSeenAt', async () => {
   const { d, cfg } = mkDeps([rec()])
-  const m = new LinkManager(d, { fetchImpl: helloOk })
+  const m = mkManager(d, { fetchImpl: helloOk })
   await m.probeOnce('l1')
   const l = cfg.links[0]
   assert.equal(l.status, 'online')
@@ -58,7 +69,7 @@ test('capabilities re-reported on a later probe overwrite the cached set', async
   // Spec §5.4: a token edited on the host self-heals on the peer within one poll,
   // instead of staying stale until the user relinks.
   const { d, cfg } = mkDeps([rec({ grantedCapabilities: ['models:use'], status: 'online' })])
-  const m = new LinkManager(d, {
+  const m = mkManager(d, {
     fetchImpl: async () => new Response(JSON.stringify({
       machineId: 'm1', machineName: 'w', appVersion: '1', linkApiVersions: [1],
       capabilities: ['models:use', 'models:load'],
@@ -70,7 +81,7 @@ test('capabilities re-reported on a later probe overwrite the cached set', async
 
 test('a 401 marks revoked and does not wipe the record', async () => {
   const { d, cfg } = mkDeps([rec({ status: 'online', grantedCapabilities: ['models:use'] })])
-  const m = new LinkManager(d, { fetchImpl: async () => new Response('', { status: 401 }) })
+  const m = mkManager(d, { fetchImpl: async () => new Response('', { status: 401 }) })
   await m.probeOnce('l1')
   assert.equal(cfg.links[0].status, 'revoked')
   assert.equal(cfg.links[0].baseUrl, 'http://h:6996')
@@ -81,14 +92,14 @@ test('a machineId change is flagged in lastError rather than silently adopted', 
   // The URL was reused by a different box. Silently adopting it would let a stranger's
   // daemon inherit a link the user believes points at their workstation.
   const { d, cfg } = mkDeps([rec({ machineId: 'OLD', status: 'online' })])
-  const m = new LinkManager(d, { fetchImpl: helloOk })
+  const m = mkManager(d, { fetchImpl: helloOk })
   await m.probeOnce('l1')
   assert.match(cfg.links[0].lastError ?? '', /different machine/i)
 })
 
 test('probeOnce on an unknown id resolves quietly instead of throwing', async () => {
   const { d } = mkDeps([])
-  const m = new LinkManager(d, { fetchImpl: helloOk })
+  const m = mkManager(d, { fetchImpl: helloOk })
   await m.probeOnce('nope')
 })
 
@@ -98,7 +109,7 @@ test('one hanging link never blocks the others', async () => {
     rec({ id: 'slow', baseUrl: 'http://slow:6996' }),
     rec({ id: 'fast', baseUrl: 'http://fast:6996' }),
   ])
-  const m = new LinkManager(d, {
+  const m = mkManager(d, {
     fetchImpl: (u) => String(u).includes('slow')
       ? new Promise((_r, rej) => setTimeout(() => rej(new Error('t')), 50)) as Promise<Response>
       : helloOk(),
@@ -110,7 +121,7 @@ test('one hanging link never blocks the others', async () => {
 
 test('probeAll never rejects, even when every link fails', async () => {
   const { d } = mkDeps([rec({ id: 'a' }), rec({ id: 'b' })])
-  const m = new LinkManager(d, { fetchImpl: async () => { throw new Error('boom') } })
+  const m = mkManager(d, { fetchImpl: async () => { throw new Error('boom') } })
   await m.probeAll()
 })
 
@@ -120,7 +131,7 @@ test('probeOnce emits link_status_changed when the status actually transitions',
   const { telemetry, dir, cleanup } = mkTelemetry()
   try {
     const { d } = mkDeps([rec({ status: 'unknown' })], telemetry)
-    const m = new LinkManager(d, { fetchImpl: helloOk })
+    const m = mkManager(d, { fetchImpl: helloOk })
     await m.probeOnce('l1')
     const events = readQueue(dir).map((q) => q.event as { event: string; payload?: Record<string, unknown> })
     const changed = events.filter((e) => e.event === 'link_status_changed')
@@ -135,7 +146,7 @@ test('probeOnce emits nothing when the status is unchanged', async () => {
   const { telemetry, dir, cleanup } = mkTelemetry()
   try {
     const { d } = mkDeps([rec({ status: 'online' })], telemetry)
-    const m = new LinkManager(d, { fetchImpl: helloOk })
+    const m = mkManager(d, { fetchImpl: helloOk })
     await m.probeOnce('l1')
     const events = readQueue(dir).map((q) => q.event as { event: string })
     assert.deepEqual(events.filter((e) => e.event === 'link_status_changed'), [])
@@ -150,7 +161,7 @@ test('probeOnce link_status_changed payload never carries a token, url, or hostn
     const { d } = mkDeps([rec({
       id: 'l1', status: 'unknown', baseUrl: 'https://secret-host.trycloudflare.com', token: 'tllm-super-secret',
     })], telemetry)
-    const m = new LinkManager(d, { fetchImpl: helloOk })
+    const m = mkManager(d, { fetchImpl: helloOk })
     await m.probeOnce('l1')
     const text = JSON.stringify(readQueue(dir))
     assert.ok(!text.includes('tllm-'))
@@ -163,7 +174,7 @@ test('probeOnce link_status_changed payload never carries a token, url, or hostn
 
 test('probeOnce with no telemetry deps is a no-op, not a crash', async () => {
   const { d, cfg } = mkDeps([rec({ status: 'unknown' })])
-  const m = new LinkManager(d, { fetchImpl: helloOk })
+  const m = mkManager(d, { fetchImpl: helloOk })
   await m.probeOnce('l1')
   assert.equal(cfg.links[0].status, 'online')
 })
@@ -194,7 +205,7 @@ function mkCountingDeps(links: LinkRecord[]): { d: Deps; cfg: { links: LinkRecor
 
 test('a steady-state poll that changes nothing does NOT rewrite config.json', async () => {
   const { d, writes } = mkCountingDeps([rec()])
-  const m = new LinkManager(d, { fetchImpl: helloOk })
+  const m = mkManager(d, { fetchImpl: helloOk })
   await m.probeOnce('l1')          // first probe: unknown → online, a real change
   assert.equal(writes(), 1)
   await m.probeOnce('l1')          // identical result
@@ -205,7 +216,7 @@ test('a steady-state poll that changes nothing does NOT rewrite config.json', as
 
 test('the heartbeat of an unchanged link is still tracked, just in memory', async () => {
   const { d, cfg } = mkCountingDeps([rec()])
-  const m = new LinkManager(d, { fetchImpl: helloOk })
+  const m = mkManager(d, { fetchImpl: helloOk })
   await m.probeOnce('l1')
   const persisted = cfg.links[0].lastSeenAt
   await new Promise((r) => setTimeout(r, 5))
@@ -223,7 +234,7 @@ test('a status change still persists immediately', async () => {
     return helloOk()
   }
   const { d, cfg, writes } = mkCountingDeps([rec()])
-  const m = new LinkManager(d, { fetchImpl: fetchImpl as typeof fetch })
+  const m = mkManager(d, { fetchImpl: fetchImpl as typeof fetch })
   await m.probeOnce('l1')
   assert.equal(writes(), 1)
   await m.probeOnce('l1')
@@ -241,7 +252,7 @@ test('a machineId change persists immediately — the anti-hijack latch is never
     linkApiVersions: [1], capabilities: ['models:use'],
   }), { status: 200, headers: { 'content-type': 'application/json' } })) as unknown as typeof fetch
   const { d, cfg, writes } = mkCountingDeps([rec()])
-  const m = new LinkManager(d, { fetchImpl })
+  const m = mkManager(d, { fetchImpl })
   await m.probeOnce('l1')
   const before = writes()
   machine = 'stranger'
@@ -257,7 +268,7 @@ test('a capability change persists immediately, so a host-side edit self-heals o
     linkApiVersions: [1], capabilities: caps,
   }), { status: 200, headers: { 'content-type': 'application/json' } })) as unknown as typeof fetch
   const { d, cfg, writes } = mkCountingDeps([rec()])
-  const m = new LinkManager(d, { fetchImpl })
+  const m = mkManager(d, { fetchImpl })
   await m.probeOnce('l1')
   const before = writes()
   caps = ['models:use', 'models:load']

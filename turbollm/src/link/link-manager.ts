@@ -48,24 +48,29 @@ export class LinkManager {
    *  a snapshot value, so Settings → Experimental flips it with no daemon restart, exactly
    *  like `RoutineScheduler.isRoutinesEnabled`.
    *
-   *  Defaults to always-enabled so every pre-existing call site and test that predates this
-   *  gate keeps its exact previous behavior; `cli.ts` — the only production construction
-   *  site — always injects the real predicate. */
+   *  REQUIRED, deliberately — the one place this gate departs from `RoutineScheduler`, which
+   *  defaults its predicate to always-enabled. A default here would have to guess, and the
+   *  only two guesses are both wrong: "on" makes a construction site that forgets to inject
+   *  silently run the ungated feature, and the entire risk this gate exists to manage is a
+   *  missed call site. Making it a required field turns that miss into a compile error
+   *  instead. It also removes an asymmetry that would otherwise be genuinely confusing —
+   *  `isTurboLinkEnabled` fails CLOSED, so a sibling default of "on" for the same flag is
+   *  the sort of split a reader has to hold two rules in their head for. */
   private readonly isEnabled: () => boolean
 
   constructor(
     private readonly d: Deps,
-    opts?: {
+    opts: {
       intervalMs?: number
       fetchImpl?: typeof fetch
       catalog?: { refresh(): Promise<void> }
-      isEnabled?: () => boolean
+      isEnabled: () => boolean
     },
   ) {
-    this.intervalMs = opts?.intervalMs ?? DEFAULT_INTERVAL_MS
-    this.fetchImpl = opts?.fetchImpl
-    this.catalog = opts?.catalog
-    this.isEnabled = opts?.isEnabled ?? (() => true)
+    this.intervalMs = opts.intervalMs ?? DEFAULT_INTERVAL_MS
+    this.fetchImpl = opts.fetchImpl
+    this.catalog = opts.catalog
+    this.isEnabled = opts.isEnabled
   }
 
   list(): LinkRecord[] {

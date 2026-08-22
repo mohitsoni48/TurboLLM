@@ -9,7 +9,7 @@ import type { HelloResponse } from './types'
 
 function mkDeps(keys: ApiKey[]): Deps {
   const cfg: Record<string, unknown> = {
-    apiKeys: keys, links: [], daemon: { lanBind: true, requireApiKey: true, machineId: 'machine-abc' , experimental: { turboLink: true } },
+    apiKeys: keys, links: [], daemon: { lanBind: true, requireApiKey: true, machineId: 'machine-abc', experimental: { turboLink: true } },
   }
   return {
     version: '1.11.2',

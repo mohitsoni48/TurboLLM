@@ -55,7 +55,7 @@ function mkDeps(
   const cfg: Record<string, unknown> = {
     apiKeys: keys,
     links: [],
-    daemon: { lanBind: true, requireApiKey: true, machineId: 'machine-abc' , experimental: { turboLink: true } },
+    daemon: { lanBind: true, requireApiKey: true, machineId: 'machine-abc', experimental: { turboLink: true } },
   }
   const enqueued: EnqueueInput[] = []
   const removed: string[] = []

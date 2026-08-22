@@ -48,7 +48,7 @@ function mkDeps(
   const cfg: Record<string, unknown> = {
     apiKeys: keys,
     links: [],
-    daemon: { lanBind: true, requireApiKey: true, machineId: 'machine-abc' , experimental: { turboLink: true } },
+    daemon: { lanBind: true, requireApiKey: true, machineId: 'machine-abc', experimental: { turboLink: true } },
     modelProfiles: {}, modelPresets: {}, lastPresetId: {}, lastLoaded: {},
   }
   const loads: string[] = []

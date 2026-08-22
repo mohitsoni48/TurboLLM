@@ -20,7 +20,7 @@ function entry(overrides: Partial<ModelEntry>): ModelEntry {
 
 function mkDeps(keys: ApiKey[], models: ModelEntry[], loadedKey: string | null = null): Deps {
   const cfg: Record<string, unknown> = {
-    apiKeys: keys, links: [], daemon: { lanBind: true, requireApiKey: true, machineId: 'machine-abc' , experimental: { turboLink: true } },
+    apiKeys: keys, links: [], daemon: { lanBind: true, requireApiKey: true, machineId: 'machine-abc', experimental: { turboLink: true } },
   }
   return {
     version: '1.11.2',
