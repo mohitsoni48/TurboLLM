@@ -32,8 +32,18 @@ export const PROVISION_FAIL_REASONS = ['network', 'no_asset', 'unsupported_platf
  *  milestone the user had reached, and inflated the per-machine rate to 2.4.
  *  `build` additionally gives compile-from-source a SUCCESS signal: until now
  *  `build.onSettled` only ever emitted on failure, leaving 93 `build_failed`
- *  events with no denominator to divide by. */
-export const PROVISION_TRIGGERS = ['seed', 'user_install', 'user_update', 'runtime_env', 'build'] as const
+ *  events with no denominator to divide by.
+ *
+ *  `auto_update` is the same distinction one level down, and exists because the
+ *  first cut of this enum got it wrong: `update-apply.ts` hardcoded
+ *  `user_update`, but its only caller is `UpdateScheduler`'s ~24h timer
+ *  (cli.ts), so every unattended 3am engine swap was recorded as a user
+ *  clicking Update. That is precisely the "count what the product did as
+ *  something the user chose" error this whole enum was added to stop, so
+ *  shipping it that way would have launched the field already dishonest.
+ *  A user-initiated update comes through the routes instead, which tag
+ *  `user_update` themselves. */
+export const PROVISION_TRIGGERS = ['seed', 'user_install', 'user_update', 'runtime_env', 'build', 'auto_update'] as const
 
 /** Usage counts are bucketed, never raw: a raw count is a behavioural fingerprint. */
 export const COUNT_BUCKETS = ['1', '2-5', '6-20', '21-100', '100+'] as const

@@ -942,3 +942,13 @@ test('validateEvent: engine_installed still validates without the trigger field'
     false,
   )
 })
+
+test('validateEvent: engine_installed accepts every provisioning trigger, including the unattended one', () => {
+  // 'auto_update' exists because update-apply.ts's only caller is UpdateScheduler's
+  // ~24h timer — without it an unattended 3am engine swap is indistinguishable from
+  // a user clicking Update, which is the exact conflation this field was added to end.
+  for (const trigger of ['seed', 'user_install', 'user_update', 'runtime_env', 'build', 'auto_update']) {
+    const r = validateEvent(validEvent({ event: 'engine_installed', payload: { outcome: 'ok', trigger } }))
+    assert.equal(r.ok, true, `${trigger} must validate — ${r.ok === false ? r.reason : ''}`)
+  }
+})
