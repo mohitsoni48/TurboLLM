@@ -70,6 +70,13 @@ function installFetch() {
       if (state.cancelFail) return json({ error: state.cancelFail.error }, state.cancelFail.status)
       return json({ ok: true })
     }
+    // Turbo Link ships behind `daemon.experimental.turboLink` (Settings → Experimental),
+    // off by default, and `useLinks`/`useRemoteModels` do not fetch while it is off. This
+    // suite is about the MERGE, so the fixture has the feature unlocked; the gate's own
+    // behaviour is covered by lib/link-queries.gate.test.tsx.
+    if (url.includes('/api/v1/settings')) {
+      return json({ experimental: { memory: false, cloudDeploy: false, routines: false, turboLink: true } })
+    }
     if (url.endsWith('/api/v1/links')) return json({ links: state.links })
     return json({ ok: true })
   }))

@@ -1,4 +1,4 @@
-import { FlaskConical, Rocket, Brain, AlarmClock } from 'lucide-react'
+import { FlaskConical, Rocket, Brain, AlarmClock, Network } from 'lucide-react'
 import { useSettings } from '../../lib/queries'
 import { ApiError } from '../../lib/api'
 import { Badge } from '../../components/ui/badge'
@@ -46,13 +46,22 @@ function FeatureRow({
  *  founder was explicit that Memory's settings belong where they've always been, gated on
  *  visibility (and, on the backend, on actually running) by this checkbox alone, not relocated.
  *  Code used to be a third row here — removed when it graduated to generally available
- *  (ADR-280), rather than staying an opt-in toggle. */
+ *  (ADR-280), rather than staying an opt-in toggle.
+ *
+ *  Turbo Link (ADR-376) joined 2026-08-21 for a different reason from its neighbours: it is
+ *  not half-built, it is UNVERIFIED. It is complete and green, but every test it has ever
+ *  passed ran against this one machine, and it is a feature whose entire purpose is a second
+ *  one. Its row's copy says so plainly rather than selling it — someone turning this on is
+ *  volunteering to be the first real two-machine test, and should know that. The daemon
+ *  enforces the same flag on its own side (link/gate.ts): off means the host façade refuses
+ *  inbound links, the poll loop stops, and remote models leave every list — while the user's
+ *  saved links and granted tokens stay in config, untouched, for when it goes back on. */
 export function ExperimentalSection() {
   const { query: settingsQ, save } = useSettings()
-  const experimental = settingsQ.data?.experimental ?? { memory: false, cloudDeploy: false, routines: false }
+  const experimental = settingsQ.data?.experimental ?? { memory: false, cloudDeploy: false, routines: false, turboLink: false }
   const busy = save.isPending
 
-  const setFlag = (key: 'memory' | 'cloudDeploy' | 'routines', value: boolean) => {
+  const setFlag = (key: 'memory' | 'cloudDeploy' | 'routines' | 'turboLink', value: boolean) => {
     save.mutate(
       { experimental: { [key]: value } },
       { onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not update experimental setting.') },
@@ -92,6 +101,14 @@ export function ExperimentalSection() {
         description="Scheduled tasks that fire automatically with no one present — chat or Code agents on a timer. Unlocks the Routines tab in Workspace and lets chat/Code create one when on."
         checked={experimental.routines}
         onChange={(v) => setFlag('routines', v)}
+        disabled={busy}
+      />
+      <FeatureRow
+        icon={Network}
+        title="Turbo Link"
+        description="Use models running on your other machines from this one. Built and tested, but never yet run against a real second machine — expect rough edges. Turning it off leaves your linked machines saved, ready for when you turn it back on."
+        checked={experimental.turboLink}
+        onChange={(v) => setFlag('turboLink', v)}
         disabled={busy}
       />
     </section>

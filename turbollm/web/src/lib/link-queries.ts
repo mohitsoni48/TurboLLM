@@ -7,6 +7,7 @@
 // too old to know the route, into "no links" rather than an error banner on a screen that
 // has nothing to do with Turbo Link.
 import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
+import { getSettings } from './api'
 import {
   cancelRemoteDownload,
   getLinkStatus,
@@ -28,10 +29,36 @@ import type { RemoteModelRow } from './remote-models'
  *  link's status and catalog on that loop, so asking faster only adds requests. */
 const LINK_POLL_MS = 15_000
 
+/** Is Turbo Link unlocked? (`daemon.experimental.turboLink`, ADR-376 — the same
+ *  Settings → Experimental toggle the daemon gates on, see `turbollm/src/link/gate.ts`.)
+ *
+ *  Reads the settings query DIRECTLY rather than through `useSettings` so this module keeps
+ *  its existing independence from `queries.ts` — that module is the status/engines/models
+ *  core every screen mounts and this one is deliberately not coupled to it. The query key is
+ *  the same `['settings']`, so react-query serves both from one cache entry and one request.
+ *
+ *  `=== true` is not decoration: while the settings read is in flight `data` is undefined,
+ *  and the gate must read as OFF until the daemon has actually said otherwise. That is what
+ *  keeps a page load from firing one round of link polls before the flag arrives. */
+function useTurboLinkEnabled(): boolean {
+  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings, retry: false })
+  return data?.experimental?.turboLink === true
+}
+
+/** Every linked machine.
+ *
+ *  This hook and `useRemoteModels` below are the only two roots the front end reaches Turbo
+ *  Link through, so `enabled` here is the whole front-end gate: with the feature off both
+ *  stay `idle` (no request, not a discarded answer), every call site's `?? []` yields an
+ *  empty fleet, `machineOptions` collapses to All/This-machine and the filter hides itself,
+ *  `showOrigin` goes false, and the per-link fan-outs below are handed nothing to poll.
+ *  Every screen is then byte-for-byte the screen it was before Turbo Link existed. */
 export function useLinks() {
+  const enabled = useTurboLinkEnabled()
   return useQuery<LinkRecord[]>({
     queryKey: ['links'],
     queryFn: listLinks,
+    enabled,
     refetchInterval: LINK_POLL_MS,
     // A background tab has no picker open to keep fresh.
     refetchIntervalInBackground: false,
@@ -40,9 +67,11 @@ export function useLinks() {
 }
 
 export function useRemoteModels() {
+  const enabled = useTurboLinkEnabled()
   return useQuery<RemoteModelRow[]>({
     queryKey: ['link-models'],
     queryFn: listRemoteModels,
+    enabled,
     refetchInterval: LINK_POLL_MS,
     refetchIntervalInBackground: false,
     retry: false,
@@ -61,10 +90,14 @@ export function useRemoteModels() {
  *  really gone (the daemon answers a typed 503 naming it).
  */
 export function useLinkStatus(linkId: string | null) {
+  // Gated too, though with the feature off nothing can hand this a `linkId` in the first
+  // place (the link list it comes from is empty). Belt and braces for the one case that
+  // could: a chat still pointed at a remote model when the flag was flipped.
+  const turboLink = useTurboLinkEnabled()
   return useQuery<RemoteStatus>({
     queryKey: ['link-status', linkId],
     queryFn: () => getLinkStatus(linkId as LinkRecordId),
-    enabled: !!linkId,
+    enabled: turboLink && !!linkId,
     refetchInterval: 3_000,
     refetchIntervalInBackground: false,
     retry: false,

@@ -642,8 +642,11 @@ export function SettingsScreen() {
               />
 
               {/* Turbo Link (ADR-376): mint scoped tokens for other machines + manage
-                  machines this one has linked to. */}
-              <TurboLinkSection />
+                  machines this one has linked to. Only unlocked when Settings → Experimental's
+                  Turbo Link row is on — the same two-layer shape MemorySection follows above,
+                  and the same one the daemon enforces (link/gate.ts), so a machine with the
+                  flag off has no way to reach the surface AND refuses it on the wire. */}
+              {settings?.experimental?.turboLink && <TurboLinkSection />}
             </>
           )}
 

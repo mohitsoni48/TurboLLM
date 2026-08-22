@@ -687,8 +687,12 @@ export type DaemonSettings = {
   /** Experimental feature flags (2026-07-14, Settings → Experimental). Off by default for
    *  new/distributed installs. Code used to be one of these — removed when it graduated to
    *  generally available (ADR-280). `routines` (2026-08-04) is the newest: Routines never shipped
-   *  outside this gate, so it defaults to off for every install, new or upgraded. */
-  experimental: { memory: boolean; cloudDeploy: boolean; routines: boolean }
+   *  outside this gate, so it defaults to off for every install, new or upgraded.
+   *  `turboLink` (2026-08-21, ADR-376) is the newest still: fully built and green, but never
+   *  verified against a real second machine, so it is opt-in. While it is off the Turbo Link
+   *  section does not render, `useLinks`/`useRemoteModels` do not fetch, and every merged
+   *  fleet list falls back to local-only rows with no origin column and no machine filter. */
+  experimental: { memory: boolean; cloudDeploy: boolean; routines: boolean; turboLink: boolean }
 }
 
 /** Tool-call approval gate policy (mirrors turbollm/src/tools/tool-policy.ts). */
