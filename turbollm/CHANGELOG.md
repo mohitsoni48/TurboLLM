@@ -56,10 +56,9 @@ _Nothing yet._
   machine's numbers quietly absorb the other's.
 
 ### Discord
-- **Got two GPUs? Auto-tune now fills both.** A MoE model that needed some CPU offload used to pile almost everything onto one card and leave the other nearly idle, then push more work to your processor to escape a ceiling that wasn't real. On two Tesla T4s, Qwen3.6-35B-A3B at Q8 went from 16.4 GB used to 27.6 GB, and chat from 4.3 to **10.0 tok/s**. Single-GPU machines and dense models are unaffected, and a split you set yourself is never overridden.
-- **New (experimental): Turbo Link** — connect two machines running TurboLLM and use one's models from the other, right in chat. Your Models, Downloads and Engines screens show both machines' stuff in one list.
-- You decide exactly what a linked machine can do: just run models, run a whole server, or full control — and you can limit it to specific models and revoke access any time. Off by default while we test it against real two-machine setups — turn it on in Settings → Experimental.
-- **New (experimental, manual setup required): a public API for building real chat apps on top of TurboLLM.** Send a message, get a resumable stream back — TurboLLM handles storage, editing, and reconnects for you. Comes with a ready-made TypeScript client and a working Postgres example, which you'll need since the SQLite default only serves TurboLLM's own desktop UI. Off by default; setup guide at turbollm.dev/docs/api/external.
+- Fixed: on a two-GPU machine, auto-tune was loading nearly everything onto one card and offloading the rest to your CPU. It now places layers per card, so both get used.
+- New (experimental): Turbo Link lets you use another machine's models from this one, right in chat. Settings → Experimental.
+- New (experimental): a public API for building your own chat apps on top of TurboLLM. Off by default, manual setup for now.
 
 ## [1.11.5] - 2026-08-22
 
