@@ -42,10 +42,14 @@ function decodeChatCursor(raw) {
   try {
     parsed = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8'))
   } catch {
-    throw new StoreError('contract_violation', 'invalid_cursor: not decodable')
+    // invalid_cursor, not contract_violation: this is the CALLER's bad cursor, not the
+    // adapter returning malformed data — matches SqliteChatStore's identical fix (release-gate
+    // I3) so both reference adapters answer a caller's mistake with the same 400, not one 400
+    // and one 500 for the same request shape.
+    throw new StoreError('invalid_cursor', 'invalid_cursor: not decodable')
   }
   if (typeof parsed?.u !== 'string' || typeof parsed?.i !== 'string') {
-    throw new StoreError('contract_violation', 'invalid_cursor: wrong shape')
+    throw new StoreError('invalid_cursor', 'invalid_cursor: wrong shape')
   }
   return { updatedAt: parsed.u, id: parsed.i }
 }
@@ -59,10 +63,10 @@ function decodeSeqCursor(raw) {
   try {
     parsed = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8'))
   } catch {
-    throw new StoreError('contract_violation', 'invalid_cursor: not decodable')
+    throw new StoreError('invalid_cursor', 'invalid_cursor: not decodable')
   }
   if (typeof parsed?.s !== 'number') {
-    throw new StoreError('contract_violation', 'invalid_cursor: wrong shape')
+    throw new StoreError('invalid_cursor', 'invalid_cursor: wrong shape')
   }
   return parsed.s
 }

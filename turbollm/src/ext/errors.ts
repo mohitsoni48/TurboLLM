@@ -105,6 +105,8 @@ export function mapStoreError(e: unknown): MappedError {
         return { status: 400, type: 'invalid_request', code: 'invalid_scope', message: e.message, retryable: false }
       case 'contract_violation':
         return { status: 500, type: 'storage', code: 'storage_contract_violation', message: 'The configured chat store returned data that violates the store contract.', retryable: false }
+      case 'invalid_cursor':
+        return { status: 400, type: 'invalid_request', code: 'invalid_cursor', message: 'The provided cursor is not valid.', retryable: false }
     }
   }
   return {

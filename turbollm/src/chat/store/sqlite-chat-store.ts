@@ -56,11 +56,11 @@ function decodeCursor(raw: string): ChatCursor {
   try {
     parsed = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8'))
   } catch {
-    throw new StoreError('contract_violation', 'invalid_cursor: not decodable')
+    throw new StoreError('invalid_cursor', 'invalid_cursor: not decodable')
   }
   const c = parsed as Partial<ChatCursor>
   if (typeof c?.u !== 'string' || typeof c?.i !== 'string') {
-    throw new StoreError('contract_violation', 'invalid_cursor: wrong shape')
+    throw new StoreError('invalid_cursor', 'invalid_cursor: wrong shape')
   }
   return { u: c.u, i: c.i }
 }
@@ -79,10 +79,10 @@ function decodeSeqCursor(raw: string): number {
   try {
     parsed = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8'))
   } catch {
-    throw new StoreError('contract_violation', 'invalid_cursor: not decodable')
+    throw new StoreError('invalid_cursor', 'invalid_cursor: not decodable')
   }
   const c = parsed as { s?: unknown }
-  if (typeof c?.s !== 'number') throw new StoreError('contract_violation', 'invalid_cursor: wrong shape')
+  if (typeof c?.s !== 'number') throw new StoreError('invalid_cursor', 'invalid_cursor: wrong shape')
   return c.s
 }
 

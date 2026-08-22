@@ -38,6 +38,18 @@ test('store contract_violation maps to a non-retryable 500 storage error', () =>
   assert.equal(m.retryable, false)
 })
 
+// I3 (release-gate finding): a malformed pagination cursor is a CALLER mistake, not the
+// adapter violating its own contract — it was previously indistinguishable from
+// contract_violation (500 storage), which reads as an operator-facing incident and makes
+// retryable:false hand a well-behaved client no way to recover other than giving up.
+test('store invalid_cursor maps to a non-retryable 400 invalid_request, distinct from contract_violation', () => {
+  const m = mapStoreError(new StoreError('invalid_cursor', 'invalid_cursor: not decodable'))
+  assert.equal(m.status, 400)
+  assert.equal(m.type, 'invalid_request')
+  assert.equal(m.code, 'invalid_cursor')
+  assert.equal(m.retryable, false)
+})
+
 test('an unknown error maps to internal and never leaks its message', () => {
   const m = mapStoreError(new Error('SELECT * FROM secrets failed at /home/user/db'))
   assert.equal(m.status, 500)

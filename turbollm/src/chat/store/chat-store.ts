@@ -27,6 +27,10 @@ export type StoreErrorCode =
   | 'not_supported'
   | 'invalid_scope'
   | 'contract_violation'
+  /** A caller-supplied pagination cursor could not be decoded — distinct from
+   *  `contract_violation` (the ADAPTER returning malformed data): this is the CALLER's mistake,
+   *  maps to a non-retryable 400 rather than reading as a storage incident. */
+  | 'invalid_cursor'
 
 /** The single error type every adapter throws, so the service layer can map store
  *  failures onto the public error catalogue (spec 27 §7.2) without sniffing messages. */
