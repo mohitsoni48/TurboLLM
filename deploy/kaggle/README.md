@@ -162,10 +162,17 @@ Note the auto-tune vs chat gap (22.1 vs 10.0, 45%) survives the fix — both num
 doubled but the ratio did not move. That gap reproduces on a SINGLE card too, so it is a separate
 bug and not a dual-GPU one.
 
-The tuner cannot currently reach that config: `pickSplitStrategies` offers only {single-GPU,
-the profile's existing split} and never a rebalanced `tensorSplit`, so the offload search runs
-against the default even split and is structurally capped near 16 GB resident. Unlocking the
-+17% means searching `nCpuMoe` and `tensorSplit` JOINTLY, not one with the other pinned.
+> **Superseded 2026-08-22.** The paragraph below described the tuner BEFORE the fix and was
+> left in place under the "Verified fix" table above, which is confusing — the table is current,
+> this was not. `withBalancedSplit` now derives a byte-balanced `tensorSplit` inside the offload
+> search, so `nCpuMoe` and `tensorSplit` ARE searched jointly, which is what the table measures.
+> As of the same date the sweep also discards a split the user pinned, for the reason the old
+> text gives: a pinned split structurally caps the search.
+>
+> ~~The tuner cannot currently reach that config: `pickSplitStrategies` offers only {single-GPU,
+> the profile's existing split} and never a rebalanced `tensorSplit`, so the offload search runs
+> against the default even split and is structurally capped near 16 GB resident. Unlocking the
+> +17% means searching `nCpuMoe` and `tensorSplit` JOINTLY, not one with the other pinned.~~
 
 Cross-check note: this table came from driving llama-server directly (no daemon). The same
 model through the full daemon measured 4.3 t/s at the default split, so compare rows within

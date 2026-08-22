@@ -55,6 +55,16 @@ _Nothing yet._
   host's work in its own stats and telemetry, so neither machine double-counts and neither
   machine's numbers quietly absorb the other's.
 
+### Changed
+
+- **Auto-tune now decides the multi-GPU split itself, even if you pinned one.** A saved
+  `--tensor-split` used to be treated as off-limits, which quietly capped the tuner: the offload
+  search can only move layers between GPU and CPU, so a split chosen for a different model or
+  context size bounded how much VRAM the tuner could ever reach. It now starts from its own
+  baseline and places layers by size. This applies only while auto-tune is running — normal loads
+  still use exactly the split saved on the profile, and a tuned result replaces it only when you
+  click Save in the results dialog.
+
 ### Discord
 - Fixed: on a two-GPU machine, auto-tune was loading nearly everything onto one card and offloading the rest to your CPU. It now places layers per card, so both get used.
 - New (experimental): Turbo Link lets you use another machine's models from this one, right in chat. Settings → Experimental.
