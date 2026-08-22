@@ -156,6 +156,25 @@ export interface ExperimentalFeatures {
    *  create are left reachable, matching this file's existing "gate only what's asked" posture
    *  (routine-routes.ts's own doc comments make the same call for delete_routine/list_routines). */
   routines: boolean
+  /** Master gate for Turbo Link (ADR-376) — visibility AND behavior, the same two-layer shape
+   *  as `memory` and `routines`. Off for every install, new or upgraded: the feature is fully
+   *  built and green, but has never been verified against a real SECOND machine, and a
+   *  cross-machine feature that has only ever been exercised against itself is not something
+   *  to turn on for people by default.
+   *
+   *  When off, and this is the case that matters — a user who linked machines and then
+   *  toggled it back off — everything fails CLOSED and nothing is destroyed:
+   *    - the host façade `/api/link/v1` refuses every route with a typed 403 (never a 404,
+   *      which a peer would misread as a link-API version mismatch);
+   *    - the peer's `/api/v1/links*` admin routes all refuse;
+   *    - `LinkManager`'s poll loop makes no outbound request and writes no config;
+   *    - `RemoteCatalog` advertises nothing, so remote models vanish from `/v1/models`,
+   *      from `ModelRouter` and from chat, and `turbollm launch claude` stops offering them;
+   *    - the Settings section and every merged fleet list drop back to local-only.
+   *  Existing `links` and granted `apiKeys` are LEFT IN CONFIG untouched — turning the flag
+   *  back on restores the previous state exactly. See `link/gate.ts` for the one predicate
+   *  every one of those surfaces calls, and for the ADR-280 removal path. */
+  turboLink: boolean
 }
 export interface Telemetry {
   level: string
@@ -576,7 +595,7 @@ export function defaultConfig(): Config {
       theme: 'system',
       autoGenerateTitles: true,
       autoMemoryEnabled: false,
-      experimental: { memory: false, cloudDeploy: false, routines: false },
+      experimental: { memory: false, cloudDeploy: false, routines: false, turboLink: false },
     },
     telemetry: { level: 'full', machineId: '' },
     apiKeys: [],
@@ -1043,6 +1062,14 @@ function normalize(c: Config): void {
     memory: ex.memory === true || c.daemon.autoMemoryEnabled === true,
     cloudDeploy: ex.cloudDeploy === true,
     routines: ex.routines === true,
+    // `turboLink` (2026-08-21, ADR-376): same story as `routines` — Turbo Link never shipped
+    // outside this gate, so there is no "already opted in" signal to migrate forward and every
+    // config, new or upgraded, reads false until a human flips it in Settings → Experimental.
+    // Note what is NOT migrated here: a config that already carries `links` and granted
+    // `apiKeys` still gets `turboLink: false`. That is deliberate. The links stay in the file,
+    // untouched, and come back the moment the flag goes on; inferring consent from their
+    // presence would silently enable an unverified cross-machine feature on upgrade.
+    turboLink: ex.turboLink === true,
   }
   // Telemetry level (spec 09 §3): the UI exposes 'off' | 'anon' | 'full'. Migrate
   // legacy/unknown values safely → 'off' (the conservative, opt-in default).

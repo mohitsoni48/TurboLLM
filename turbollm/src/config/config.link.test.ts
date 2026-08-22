@@ -53,3 +53,52 @@ test('a link token in config.json survives a real write/read cycle unmangled', (
   assert.equal(c.links[0].token, 'tllm-AbC123')
   assert.equal(c.links[0].name, 'wörkstation')
 })
+
+// ── The experimental gate (`daemon.experimental.turboLink`) ───────────────────
+//
+// Turbo Link ships off by default: it is fully built and green, but has never been
+// verified against a real second machine. Normalisation is the whole migration story —
+// an absent flag must read as `false` without disturbing one other field.
+
+test('experimental.turboLink defaults to false on a config that predates the flag', () => {
+  const c = loadRaw({ daemon: { experimental: { memory: true, cloudDeploy: true, routines: true } } })
+  assert.equal(c.daemon.experimental.turboLink, false)
+  // …and the siblings it shares the block with are untouched by its arrival.
+  assert.equal(c.daemon.experimental.memory, true)
+  assert.equal(c.daemon.experimental.cloudDeploy, true)
+  assert.equal(c.daemon.experimental.routines, true)
+})
+
+test('a config with no experimental block at all still gets turboLink: false', () => {
+  const c = loadRaw({ daemon: {} })
+  assert.equal(c.daemon.experimental.turboLink, false)
+})
+
+test('experimental.turboLink survives a round trip when the user turns it on', () => {
+  const c = loadRaw({ daemon: { experimental: { turboLink: true } } })
+  assert.equal(c.daemon.experimental.turboLink, true)
+})
+
+test('only an exact `true` unlocks Turbo Link — a truthy string does not', () => {
+  const c = loadRaw({ daemon: { experimental: { turboLink: 'yes' } } })
+  assert.equal(c.daemon.experimental.turboLink, false)
+})
+
+test('adding the flag disturbs nothing else an existing user had configured', () => {
+  // The R3 guard, restated for this change: links, granted keys and daemon settings all
+  // come through a normalize() that now writes one extra boolean, and nothing else moves.
+  const c = loadRaw({
+    apiKeys: [{ id: 'a', name: 'peer', hash: 'h', prefix: 'tllm-abc', createdAt: 'x', lastUsedAt: null,
+      grant: { capabilities: ['models:use'] } }],
+    links: [{ id: 'l1', name: 'rig', baseUrl: 'http://rig:6996', token: 'tllm-t', machineId: 'm1',
+      grantedCapabilities: ['models:use'], linkApiVersion: 1, status: 'online', lastSeenAt: null, lastError: null }],
+    daemon: { theme: 'dark', autoGenerateTitles: false },
+  })
+  assert.equal(c.daemon.experimental.turboLink, false)
+  // Turning the feature off must never cost the user their links or their granted keys.
+  assert.equal(c.links.length, 1)
+  assert.equal(c.links[0].name, 'rig')
+  assert.deepEqual(c.apiKeys[0].grant, { capabilities: ['models:use'] })
+  assert.equal(c.daemon.theme, 'dark')
+  assert.equal(c.daemon.autoGenerateTitles, false)
+})
