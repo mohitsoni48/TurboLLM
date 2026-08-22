@@ -19,18 +19,22 @@ import { loadFullHistory } from './generation.js'
 import { IdempotencyStore } from './idempotency.js'
 import { TenantLimiter } from './limits.js'
 import { AuditLog } from './audit.js'
+import type { Status } from '../engines/manager.js'
 
 const ACME = 'Bearer tllm-ext-acme'
 const GLOBEX = 'Bearer tllm-ext-globex'
 
-/** Defaults to a `contextSize`-less status (permissive — see context-limit.ts), matching every
- *  pre-existing test in this file. Task 3's re-review added the `managerStatus` override so a
- *  handful of new tests can exercise a REAL (small) context window without disturbing any of the
- *  others, which all rely on the check being a no-op. */
+/** Defaults to a model-less status (permissive — see context-limit.ts, whose window check reads
+ *  `status.model?.ctx`), matching every pre-existing test in this file. Task 3's re-review added
+ *  the `managerStatus` override so a handful of new tests can exercise a REAL (small) context
+ *  window without disturbing any of the others, which all rely on the check being a no-op. Typed
+ *  against the real `Status` (release-gate C1: an earlier version of this fixture set a
+ *  `contextSize` field that context-limit.ts never actually read in production — `model.ctx` is
+ *  the real field — so this same fixture shape had been silently testing nothing). */
 function harness(
   bodyFactory?: () => Promise<{ status: 'complete' | 'aborted' }>,
   ext?: ExtRouteDeps,
-  managerStatus?: () => { state: string; model: string | null; contextSize?: number },
+  managerStatus?: () => Status,
 ) {
   const dir = mkdtempSync(join(tmpdir(), 'turbollm-ext-runs-'))
   const conv = new ConversationStore(dir)
@@ -46,7 +50,13 @@ function harness(
       { hash: hashKey('tllm-ext-globex'), tenant: 'globex' },
     ] }) },
     manager: {
-      status: managerStatus ?? (() => ({ state: 'running', model: 'test-model' })),
+      // `ctx: 0` keeps context-limit.ts's "an unknown window is permissive" branch — the
+      // model-loaded check (routes.runs.ts) needs `model` truthy, but this harness isn't
+      // exercising the context-window check unless a test passes its own `managerStatus`.
+      status: managerStatus ?? ((): Status => ({
+        state: 'running', err: null, port: 0, pid: 0, loadElapsedMs: 0,
+        model: { key: 'test-model', name: 'test-model', quant: 'Q4_K_M', ctx: 0, vision: false },
+      })),
       target: () => 'http://127.0.0.1:9999',
     },
   } as never
@@ -552,7 +562,10 @@ test('a chat-creation Idempotency-Key does not collide with a generate call reus
 // most safety-critical property this feature exists for — proof that the refusal happens before
 // ANY persistence, not after.
 test('an over-long prospective history is refused with context_overflow, and nothing is persisted', async () => {
-  const smallWindow = () => ({ state: 'running', model: 'test-model', contextSize: 1000 })
+  const smallWindow = (): Status => ({
+    state: 'running', err: null, port: 0, pid: 0, loadElapsedMs: 0,
+    model: { key: 'test-model', name: 'test-model', quant: 'Q4_K_M', ctx: 1000, vision: false },
+  })
   const { app, cleanup } = harness(undefined, undefined, smallWindow)
   try {
     const chatId = await newChat(app)
@@ -579,7 +592,10 @@ test('an over-long prospective history is refused with context_overflow, and not
 // would not have. The fix (reusing generation.ts's `loadFullHistory`, which pages via cursor until
 // exhausted) must see the true total, not just the first page.
 test('an overflow that only shows up past message #200 is still caught (full-history paging, not a single capped page)', async () => {
-  const midWindow = () => ({ state: 'running', model: 'test-model', contextSize: 2000 })
+  const midWindow = (): Status => ({
+    state: 'running', err: null, port: 0, pid: 0, loadElapsedMs: 0,
+    model: { key: 'test-model', name: 'test-model', quant: 'Q4_K_M', ctx: 2000, vision: false },
+  })
   const { app, chatStore, cleanup } = harness(undefined, undefined, midWindow)
   try {
     const chatId = await newChat(app)
@@ -866,7 +882,10 @@ test('two concurrent generate requests for the same chat: exactly one starts a r
 })
 
 test('a context-overflow refusal releases the inflight reservation — a normal follow-up request is not blocked', async () => {
-  const smallWindow = () => ({ state: 'running', model: 'test-model', contextSize: 1000 })
+  const smallWindow = (): Status => ({
+    state: 'running', err: null, port: 0, pid: 0, loadElapsedMs: 0,
+    model: { key: 'test-model', name: 'test-model', quant: 'Q4_K_M', ctx: 1000, vision: false },
+  })
   const { app, runs, cleanup } = harness(undefined, undefined, smallWindow)
   try {
     const chatId = await newChat(app)
