@@ -86,6 +86,27 @@ card). Every site below instead read the *first* card and reported half the mach
 - **Fix:** add a row candidate and let measured t/s decide, as the design already does for
   single-vs-layer. Cheap: the winner is chosen by measurement, so on PCIe-only boxes where row
   loses, it simply loses.
+- **FIXED in `pickSplitStrategies` (2026-08-22)** — row is now emitted on every multi-GPU box,
+  ordered **last** (the strategy loop breaks on the global deadline, so the newcomer is the first
+  thing dropped when budget runs short, never the layer-split default) and **skipped when the user
+  pinned a single GPU** (that is a choice of hardware, not of geometry).
+- **What row actually does on 2× T4 — measured in the GUI, and it settles the "wastes tuning
+  time" objection.** Selecting Split mode → Row and loading fails, at **both** ctx 200,192 and
+  ctx 8,192 (where the estimate is a roomy 19.1 / 30.7 GB), with the same fault:
+  ```
+  CUDA error: invalid argument
+  current device: 0, in function ggml_backend_cuda_split_buffer_set_tensor
+  ```
+  That is the row-split tensor-upload path, and it dies **~8 seconds in** — during
+  `common_init_result: fitting params to device memory`, long before any bench. So the real cost
+  of offering row on hardware that cannot use it is *eight seconds and a recorded `crash`
+  candidate*, not a wasted 10-minute bench slot. Meanwhile the reference box (2× RTX 5060 Ti,
+  `--split-mode tensor`, 68 tok/s — see `REFERENCE-CONFIGS.md`) is exactly the machine where this
+  candidate wins. Measurement decides, cheaply, in both directions.
+- **Note this is NOT the expensive branch.** At ctx 200,192 the branch that actually burns the
+  budget is **single-GPU** (BUG-5 / ADR-379): `maxGpuFraction` clears the 0.5 gate, the probe then
+  finds only `ngl 31/65`, and the sweep benches 34 dense layers on 4 vCPUs — observed crawling at
+  `prefill 46%` and consuming the full per-test cap.
 
 ### BUG-7 · `estimateVramPerGpu` ignores `ngl` for MoE — **OPEN (mine, ADR-379 follow-up)**
 - **Where:** `turbollm/src/models/profile.ts`, `estimateVramPerGpu()`
@@ -131,6 +152,22 @@ card). Every site below instead read the *first* card and reported half the mach
 
 ---
 
+### BUG-15 · A saved auto-tune result did not match the config the results dialog displayed — **OPEN, UNEXPLAINED**
+- **Observed:** the "Auto-tune complete" dialog reported `GPU layers 65 · Context length 200,192 ·
+  KV cache type q8_0 · Flash attention on`. After clicking **Save**, the model's profile read
+  **ctx 173,568, K `q4_0`, V `q4_0`, speculative `NextN`**.
+- **What it is NOT:** an auto-tune KV sweep. `pickKvQuants` is exported but **never called**
+  anywhere in the bench flow — ADR-219's removal holds. The `q4_0` mention the user saw came from
+  `kvSpeedAdvisory`, which only prints advice ("a different type (e.g. q4_0) may run faster") and
+  changes nothing.
+- **Deliberately not diagnosed further.** Several plausible stories exist (Save writing a different
+  profile than it rendered; the advisory being applied rather than displayed; a stale profile
+  read-back) and none is established. Needs a clean repro: run a sweep, screenshot the dialog,
+  click Save, and diff the persisted profile. Flagged because "Save writes something other than
+  what it showed you" would be serious if confirmed.
+
+---
+
 ## Observations without a diagnosis — do not "fix" blind
 
 ### OBS-1 · Q6_K is ~3× slower than Q4_K_XL on T4 — **UNEXPLAINED**
@@ -145,7 +182,94 @@ pipeline, but the 74% floor is not explained by it.
 
 ---
 
+## Theme 4 — the VRAM estimate does not model what the engine actually allocates
+
+Found 2026-08-22 driving the GUI on the 2× T4 box with **Qwen3.8-27B-UD-Q4_K_XL at ctx 200,192**,
+the configuration the dual-GPU work targets. Both defects share one consequence: the panel says
+**"fits comfortably"** and the load then dies with `exit 1`.
+
+### BUG-11 · The estimate ignores the fork's own auto-asymmetric KV upgrade — **OPEN**
+- **Where:** `turbollm/src/models/profile.ts`, `estimateVram()` / `estimateVramPerGpu()` — they size
+  the KV from the *selected* `kvTypeK`, and nothing tells them the engine may override it.
+- **Observed live**, straight from the engine log:
+  ```
+  llama_kv_cache: auto-asymmetric: GQA ratio 6:1 (n_head=24, n_head_kv=4) —
+      upgrading K from turbo4 to q8_0 to prevent quality degradation.
+      Disable with TURBO_AUTO_ASYMMETRIC=0
+  common_fit_params: failed to fit params to free device memory:
+      n_gpu_layers already set by user to 99, abort
+  ```
+- **The gap, measured in the panel itself:** selecting `turbo4` for K and V reports
+  **~25.4 / 30.7 GB · fits**. The engine silently runs K at `q8_0`, whose honest cost the panel
+  shows only if you *select* `q8_0` by hand: **~28.7 / 30.7 GB**. A 3.3 GB error, in the
+  optimistic direction, on a box with ~2 GB of headroom.
+- **Why it matters beyond the number:** `turbo4` is exactly what a TurboQuant user is steered
+  toward for long context, and the auto-upgrade fires on any GQA-heavy model — which is most
+  modern ones. The user is told the config fits, and it cannot.
+- **Fix:** mirror the engine's auto-asymmetric rule in the estimator (upgrade K to `q8_0` when the
+  GQA ratio crosses the fork's threshold), so the panel and the engine agree on one number.
+
+### BUG-12 · The estimate ignores the NextN/MTP draft context — **OPEN**
+- **Observed live:** `srv load_model: creating MTP draft context against the target model` — with
+  speculative decoding on (**NextN is the DEFAULT** for any model carrying a NextN head, and this
+  model ships one), the engine builds a *second* context. Its weights and KV are real VRAM that
+  `estimateVram` does not count.
+- **Fix:** add the draft context to the estimate whenever the speculative mode is not `off`, or at
+  minimum surface it in the panel so the number is not silently optimistic.
+
+### BUG-13 · The auto-tune progress display goes stale and never recovers — **OPEN**
+- **Observed live at ctx 200,192.** The progress line sat at
+  `KV q8_0: probing ngl=32 (range 0–65)…` for **~50 minutes**, unchanged, well past auto-tune's own
+  45-minute `TOTAL_BUDGET_MS`. Closing and reopening the settings dialog showed the true state:
+  `Measuring ngl=65 — measuring t/s…`. The sweep had been advancing the whole time; only the
+  displayed step was frozen.
+- **Same class as the engine badge sticking on `Stopping`** after an eject, which also only cleared
+  on a page reload. In both cases the client stops applying server state and shows one value
+  forever.
+- **Why it matters more than it sounds.** A frozen step makes a long-but-healthy run
+  indistinguishable from a hang. In this session it directly caused a *cancelled* sweep earlier on
+  (the run was at `prefill 46%` and progressing), and then a page reload — and a reload is
+  dangerous here because auto-tune holds its winner pending a **Save** click, with no GUI anywhere
+  to recover it afterwards (Model actions offers only Pin / Find other quants / Delete, and per
+  BUG-9 the bench log cannot even record which split strategy won).
+- **Not established:** whether a reload actually discards an already-finished winner. The one
+  reload in this session happened while the sweep was still running, so that remains untested —
+  do not assume it either way.
+
+### Consequence for auto-tune
+Auto-tune's `ngl` search is probe-driven, so it *discovers* the real ceiling by loading — it is not
+misled the way the panel is. But `pickSplitStrategies` gates the single-GPU branch on
+`maxGpuFraction`, which is built on the same `estimateVram`. Both bugs therefore push that gate
+optimistic, in the one direction ADR-379 was written to prevent.
+
+---
+
 ## Not a bug — recorded so it stops being re-reported
+
+**"Auto-tune should sweep `parallel` — concurrency is free throughput."** It should not.
+**Founder call, 2026-08-22: auto-tune honours the user's `Parallel requests` setting and does not
+tune it.** Today's code already does exactly that — `parallel: base.parallel` and
+`parallel: profile.parallel` in `bench.ts` pass the profile's value straight through — so **no code
+change is required, and none should be made.**
+
+The measurement that prompted the question is kept because it is useful, not because it is a defect.
+Same config throughout (ctx 200,192 · layer · ngl 65 · K `q8_0` / V `turbo4` · speculative off),
+only `Parallel requests` changed, two chat tabs firing the identical prompt at once:
+
+| Parallel requests | Per stream | Aggregate |
+|---|---|---|
+| 1 | 11.5–12 tok/s | ~12 tok/s |
+| 2 | 9.0 tok/s each (stable 4+ min, 589 / 667 tokens) | **18.0 tok/s** |
+
+That +50% aggregate is real — it is the idle 26% of GPU 0 (`GPU1 98–99% / GPU0 74%`) being
+harvested, the difference between pipeline *placement*, which a layer split gives you, and pipeline
+*execution*, which needs more than one request in flight.
+
+**Why it is still not auto-tune's business.** Auto-tune optimises single-stream tok/s, and by that
+objective `parallel=2` is a 25% **regression** — it would be right to reject it. Chasing aggregate
+throughput would mean changing what auto-tune optimises for, and silently trading a chatting user's
+latency for a throughput number they never asked for. Concurrency is a deployment choice the user
+makes; the tuner's job is to make their choice fast, not to overrule it.
 
 **"Auto-tune made my model slower."** Auto-tune benches at `0.75 × ctx` capped at 32k tokens; a
 quick chat test uses a short prompt. The same config measured **7.8 t/s at a 2,521-token prompt

@@ -1602,6 +1602,28 @@ export function pickSplitStrategies(
   // models too big for one card and so a tuned result can never be worse than today's default.
   strategies.push(base.gpu)
 
+  // Row (tensor-parallel): the two cards work on the SAME layer at once. A layer split is a
+  // sequential PIPELINE — measured on 2x T4 as GPU1 at 98-99% util while GPU0 sat at 74% — so it
+  // buys capacity, not speed, and row is the only mode where both cards contribute to one token.
+  //
+  // Row was previously left out on the reasoning that its per-layer all-reduce "rarely pays off on
+  // PCIe-only multi-GPU". That is a plausible prediction, not a measurement, and it made auto-tune
+  // structurally incapable of ever finding the best dual-GPU configuration: a user on 2x RTX 5060
+  // Ti reports 68 tok/s from a hand-written `--split-mode tensor` command line that this sweep
+  // could not have produced at any setting. The rest of this function already decides
+  // single-vs-layer by measured tok/s; row gets the same treatment, so on boxes where the
+  // all-reduce really does dominate it simply loses and costs only its probe.
+  //
+  // Kept LAST deliberately. The strategy loop breaks on the global deadline, so the extra branch is
+  // the first thing dropped when the budget runs short — a truncated sweep still returns the
+  // layer-split default rather than losing it to a newcomer.
+  //
+  // Skipped when the profile is pinned to a single GPU: "use one card" is a choice about which
+  // hardware to use at all, not a split geometry to be tuned, and offering a 2-GPU branch there
+  // would override it. (A pinned tensorSplit IS discarded — see withBalancedSplit — because that
+  // caps the offload search; a pinned 'none' does not.)
+  if (base.gpu.splitMode !== 'none') strategies.push({ ...base.gpu, splitMode: 'row', tensorSplit: [] })
+
   // De-dup by the fields that actually reach the launch args (e.g. the user already pinned 'none').
   const seen = new Set<string>()
   return strategies.filter((g) => {

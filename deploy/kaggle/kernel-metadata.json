@@ -1,13 +1,16 @@
 {
-  "id": "sonijisons/turbollm-dual-t4-oneclick",
-  "title": "TurboLLM — one-click (dual T4)",
+  "id": "sonijisons/turbollm-one-click-dual-t4",
+  "title": "TurboLLM \u2014 one-click (dual T4)",
   "code_file": "turbollm_oneclick.ipynb",
   "language": "python",
   "kernel_type": "notebook",
   "is_private": "false",
   "enable_gpu": "true",
   "enable_internet": "true",
-  "dataset_sources": ["sonijisons/turboquant-cuda-t4"],
+  "dataset_sources": [
+    "sonijisons/turboquant-cuda-t4",
+    "selahattinkabasakal/qwen3-8-gguf"
+  ],
   "competition_sources": [],
   "kernel_sources": [],
   "model_sources": []
