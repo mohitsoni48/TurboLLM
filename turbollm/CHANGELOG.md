@@ -27,6 +27,10 @@ _Nothing yet._
 
 ## [1.11.6] - 2026-08-22
 
+> Upgrading from 1.11.2 (the last version on npm) also picks up **1.11.3** and **1.11.5**,
+> which were tagged but never published — the dual-GPU auto-tune fix and the External Chat API.
+> Their entries are below, unchanged.
+
 ### Added
 
 - **Turbo Link — use another machine's models as if they were local. Experimental, off by
@@ -52,9 +56,10 @@ _Nothing yet._
   machine's numbers quietly absorb the other's.
 
 ### Discord
-- New (experimental): **Turbo Link** — connect two machines running TurboLLM and use one's models from the other, right in chat. Your Models, Downloads and Engines screens show both machines' stuff in one list.
-- You decide exactly what a linked machine can do: just run models, run a whole server, or full control — and you can limit it to specific models and revoke access any time.
-- It's off by default while we test it against real two-machine setups — turn it on in Settings → Experimental.
+- **Got two GPUs? Auto-tune now fills both.** A MoE model that needed some CPU offload used to pile almost everything onto one card and leave the other nearly idle, then push more work to your processor to escape a ceiling that wasn't real. On two Tesla T4s, Qwen3.6-35B-A3B at Q8 went from 16.4 GB used to 27.6 GB, and chat from 4.3 to **10.0 tok/s**. Single-GPU machines and dense models are unaffected, and a split you set yourself is never overridden.
+- **New (experimental): Turbo Link** — connect two machines running TurboLLM and use one's models from the other, right in chat. Your Models, Downloads and Engines screens show both machines' stuff in one list.
+- You decide exactly what a linked machine can do: just run models, run a whole server, or full control — and you can limit it to specific models and revoke access any time. Off by default while we test it against real two-machine setups — turn it on in Settings → Experimental.
+- **New (experimental, manual setup required): a public API for building real chat apps on top of TurboLLM.** Send a message, get a resumable stream back — TurboLLM handles storage, editing, and reconnects for you. Comes with a ready-made TypeScript client and a working Postgres example, which you'll need since the SQLite default only serves TurboLLM's own desktop UI. Off by default; setup guide at turbollm.dev/docs/api/external.
 
 ## [1.11.5] - 2026-08-22
 
