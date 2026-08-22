@@ -118,6 +118,9 @@ export const SPILL_FLOOR_CAP_MB = 2048
  *  MULTI-GPU: gated OFF entirely by `pooled` below — see that parameter's doc for why the
  *  corroboration is unsound, not just imprecise, once `vramAbsMb`/`budgetMb` are a summed pool.
  *
+ *  UNIFIED MEMORY: gated off one step earlier still, by `unified` — the whole function is
+ *  meaningless where there is no VRAM/RAM boundary to spill across. GitHub #179.
+ *
  *  @param vramAbsMb ABSOLUTE GPU VRAM in use for this candidate, MB (null when unreadable).
  *  @param budgetMb  The VRAM budget for this split — see `gpuBudgetMb`. 0 when there is no GPU.
  *  @param pooled    True when `vramAbsMb`/`budgetMb` are summed across more than one GPU (a
@@ -132,14 +135,38 @@ export const SPILL_FLOOR_CAP_MB = 2048
  *    including ones sitting right at the pool's own ceiling. Fixing this for real needs a
  *    per-adapter reading (the WDDM counter is per-LUID; `readGpuSharedMb`/`readGpuVramMb` sum it
  *    away) — until then, `pooled: true` just falls back to the tolerance-only check that shipped
- *    before this module existed, on exactly the configurations single-GPU testing never covers. */
+ *    before this module existed, on exactly the configurations single-GPU testing never covers.
+ *  @param unified True when every GPU on the box shares system RAM (`unifiedMemoryOnly`, sysinfo.ts)
+ *    — an AMD/Intel APU, Apple Silicon, an ARM/Qualcomm SoC. Returns false outright: on a UMA part
+ *    there is no VRAM/RAM boundary for the driver to demote an allocation ACROSS, so "host-backed
+ *    GPU memory" is simply where the model lives, not evidence that anything was displaced. The
+ *    knob the search would reach for (offload more layers to the CPU) moves weights from one region
+ *    of the SAME physical RAM to another and cannot reduce the reading, which is precisely the
+ *    dead-end this check exists to avoid.
+ *
+ *    GitHub #179: on a Ryzen APU, `readGpuVramMb` returns null on every probe (nvidia-smi doesn't
+ *    apply, rocm-smi isn't on Windows), which disabled BOTH existing escapes at once — the
+ *    proximity check at the bottom of this function is gated on `vramAbsMb !== null`, and
+ *    `spillFloor` returns early on the same condition so no floor ever accumulates. Every probe
+ *    therefore fell through to `return true`; the reporter's dense search walked 24 → 11 → 5 → 2 → 0
+ *    rejecting all five (measured spills 6235/3770/2736/2138/11035 MB against a 66123 MB budget)
+ *    and finished with `bestNgl = null` — "No candidate completed successfully", nothing benched.
+ *
+ *    Note this is NOT the same as "unknown VRAM ⇒ don't detect spill": an unknown reading on a
+ *    DISCRETE card still fails CLOSED (see the test at spill.test.ts asserting
+ *    `isSpilling(2914, null, CARD) === true`), because a discrete card really can spill and a
+ *    missing reading is no evidence that it didn't. Only a topology that makes spill physically
+ *    impossible earns the early exit. Related: #164 (`hardware.ts` computes the same unified-ness
+ *    for the fit estimate). */
 export function isSpilling(
   spill: number | null,
   vramAbsMb: number | null,
   budgetMb: number,
   floorMb: number | null = null,
   pooled = false,
+  unified = false,
 ): boolean {
+  if (unified) return false
   if (spill === null) return false
   const floor = pooled ? 0 : Math.min(floorMb ?? 0, SPILL_FLOOR_CAP_MB)
   if (spill - floor <= SPILL_TOLERANCE_MB) return false
@@ -170,7 +197,12 @@ export function isSpilling(
  *  `pooled: true` never learns anything (returns `floorMb` unchanged) — see {@link isSpilling}'s
  *  `pooled` doc: on a multi-GPU pool, a "roomy" probe can be a genuinely spilling card sitting
  *  next to an empty one, and learning a floor from that would make the mistake worse, not better,
- *  since it then discounts every later candidate by however much that card was really spilling. */
+ *  since it then discounts every later candidate by however much that card was really spilling.
+ *
+ *  No `unified` parameter, deliberately: {@link isSpilling} returns false before it ever consults a
+ *  floor on a unified box, so whatever this accumulates there is simply never read. On the machine
+ *  in GitHub #179 it is inert anyway — `vramAbsMb` is null on every probe, which is the early
+ *  return on the first line. Adding the flag here would be signature churn with no behaviour. */
 export function spillFloor(
   floorMb: number | null,
   spill: number | null,

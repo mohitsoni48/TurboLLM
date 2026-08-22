@@ -257,3 +257,82 @@ test('spillFloor: the cap does not interfere with real, sane floors', () => {
   assert.equal(spillFloor(null, 416, 9672, CARD), 416)
   assert.equal(spillFloor(416, 594, 14626, CARD), 416)
 })
+
+// ---- unified memory (APU / Apple Silicon / mobile SoC): nothing to spill ACROSS ---------------
+// GitHub #179. On a UMA part the GPU's "VRAM" is a slice of the same physical RAM the CPU uses, so
+// host-backed GPU memory is where the model normally lives — not evidence the driver demoted
+// anything. The search's only response to a spill (move more layers to the CPU) shuffles weights
+// between two regions of that one pool and cannot reduce the reading, so every probe is rejected
+// and the sweep ends with no winner at all.
+
+// The reporter's box: a Ryzen APU, 66123 MB of GPU budget carved out of system RAM.
+const APU_BUDGET = 66123
+
+test('isSpilling: unified=true accepts every probe from the GitHub #179 run', () => {
+  // The five probes the reporter's dense search actually ran (ngl 24, 11, 5, 2, 0) and the
+  // host-backed memory each reported. `vramAbsMb` is null on all of them because readGpuVramMb has
+  // only nvidia-smi and rocm-smi backends and rocm-smi is not on Windows — which is what disabled
+  // BOTH existing escapes at once: the proximity check is gated on `vramAbsMb !== null`, and
+  // spillFloor returns early on the same condition so no floor could ever accumulate.
+  const probes: Array<[ngl: number, spill: number]> = [[24, 6235], [11, 3770], [5, 2736], [2, 2138], [0, 11035]]
+  for (const [ngl, spill] of probes) {
+    // What shipped: every one rejected -> bestNgl stayed null -> "No candidate completed successfully".
+    assert.equal(isSpilling(spill, null, APU_BUDGET, null, false), true, `ngl=${ngl} sanity: pre-fix rejection`)
+    // With the fix: the search sees a fit and can actually bench something for t/s.
+    assert.equal(isSpilling(spill, null, APU_BUDGET, null, false, true), false, `ngl=${ngl} still rejected`)
+  }
+})
+
+test('isSpilling: unified=true beats even a reading that clears every other guard', () => {
+  // The reporter's suggested fix (treat a null vramAbsMb like `pooled`) does NOT work: the 512 MB
+  // tolerance check fires first, so all five probes above are still rejected. Pin that, so the
+  // weaker version cannot be reintroduced as "equivalent".
+  for (const spill of [6235, 3770, 2736, 2138, 11035]) {
+    assert.equal(isSpilling(spill, null, APU_BUDGET, null, true), true, 'pooled=true does not rescue this box')
+  }
+  // And the flag wins regardless of what the other inputs say — a saturated-looking reading, a
+  // learned floor, a pooled multi-APU split. None of them can make spill physically possible here.
+  assert.equal(isSpilling(6235, 65900, APU_BUDGET, null, false, true), false)
+  assert.equal(isSpilling(6235, 65900, APU_BUDGET, 2048, true, true), false)
+  assert.equal(isSpilling(11035, null, 0, null, false, true), false)
+})
+
+test('isSpilling: unified=true is the same answer for Apple / Intel / ARM / Qualcomm', () => {
+  // Every integrated part carries unified: true (sysinfo.ts), so they all revert to a fit-only
+  // search too. Correct by the same physics — one pool, no boundary — and worth stating explicitly
+  // because it is a behaviour change for Intel/ARM/Qualcomm iGPUs on Windows, not just for AMD.
+  // Apple was already a no-op by another route (readGpuSharedMb returns null on Metal by design).
+  for (const spill of [594, 3199.5, 6343.5]) {
+    assert.equal(isSpilling(spill, null, 24000, null, false, true), false)
+  }
+})
+
+test('isSpilling: a DISCRETE card is untouched — unified defaults off', () => {
+  // The boundary the reporter's "return false when vramAbsMb is null" would have destroyed: every
+  // Windows AMD box, discrete included, reads a null vramAbsMb (no rocm-smi on Windows), and those
+  // cards genuinely can spill. Unknown VRAM must keep failing CLOSED.
+  assert.equal(isSpilling(2914, null, CARD), true)
+  assert.equal(isSpilling(2914, null, CARD, null, false, false), true)
+  // …and the whole shipped single-GPU matrix still behaves exactly as before, unified defaulted off.
+  for (const under of [0, 186, 442]) assert.equal(isSpilling(under, SATURATED, CARD), false)
+  for (const over of [698, 2210, 2914]) assert.equal(isSpilling(over, SATURATED, CARD), true)
+  assert.equal(isSpilling(594, 9672, CARD), false, 'the NextN fixed-cost floor case is unchanged')
+})
+
+test('unified and pooled are orthogonal — the multi-GPU path is unchanged', () => {
+  // Same 2x16 GB layer-split scenario as the pooled section above, re-run with unified defaulted
+  // off: identical answers, so threading the new parameter through did not disturb that path.
+  assert.equal(isSpilling(3000, 23828, 32606, null, true), true)
+  assert.equal(isSpilling(3000, 23828, 32606, null, false), false)
+  assert.equal(spillFloor(null, 3000, 23828, 32606, true), null)
+})
+
+test('spillFloor needs no unified flag — it is already inert on the #179 box', () => {
+  // vramAbsMb is null on every probe there, which is spillFloor's first early return. And on a
+  // unified box where a VRAM reading IS available (e.g. an APU with rocm-smi on Linux), whatever it
+  // learns is never consulted, because isSpilling returns false before it reaches the floor.
+  let floor: number | null = null
+  for (const spill of [6235, 3770, 2736, 2138, 11035]) floor = spillFloor(floor, spill, null, APU_BUDGET)
+  assert.equal(floor, null, 'no floor can accumulate without a VRAM reading')
+  assert.equal(isSpilling(6235, null, APU_BUDGET, floor, false, true), false)
+})
