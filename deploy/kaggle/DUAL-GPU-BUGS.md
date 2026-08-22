@@ -152,6 +152,45 @@ card). Every site below instead read the *first* card and reported half the mach
 
 ---
 
+### BUG-14 · Auto-tune never sweeps `parallel`, so it cannot see the only real dual-GPU headroom — **OPEN**
+- **Where:** `turbollm/src/bench/bench.ts`. `parallel` appears exactly twice — `parallel:
+  base.parallel` (line ~855) and `parallel: profile.parallel` (line ~911). Both merely **record**
+  whatever the user set. It is already a field on `BenchCandidate.params`, so the plumbing exists;
+  nothing varies it.
+- **Why it matters:** a layer split is pipeline *placement*, not pipeline *execution*. At batch=1
+  there is nothing to overlap, so GPU 0 idles while GPU 1 finishes — the measured `GPU1 98–99% /
+  GPU0 74%` imbalance. Concurrency is what harvests that idle time.
+- **Measured in the GUI**, same config (ctx 200,192 · layer · ngl 65 · K q8_0 / V turbo4 · spec
+  off), only `Parallel requests` changed, two chat tabs firing the identical prompt at once:
+
+  | Parallel requests | Per stream | Aggregate |
+  |---|---|---|
+  | 1 | 11.5–12 tok/s | ~12 tok/s |
+  | **2** | 9.0 tok/s each (stable 4+ min, 589 / 667 tokens) | **18.0 tok/s** |
+
+  **+50% aggregate for −25% per-stream.** The largest single improvement found in the whole
+  dual-GPU exercise, and auto-tune is blind to it.
+- **Not a straightforward "fix".** Auto-tune optimises single-stream tok/s; by that objective
+  `parallel=2` is a 25% *regression*. Sweeping it requires deciding what auto-tune optimises for
+  (latency vs throughput), which is a product decision — see the requirement doc. Recorded here so
+  the measurement is not lost, not as a self-evident code change.
+
+### BUG-15 · A saved auto-tune result did not match the config the results dialog displayed — **OPEN, UNEXPLAINED**
+- **Observed:** the "Auto-tune complete" dialog reported `GPU layers 65 · Context length 200,192 ·
+  KV cache type q8_0 · Flash attention on`. After clicking **Save**, the model's profile read
+  **ctx 173,568, K `q4_0`, V `q4_0`, speculative `NextN`**.
+- **What it is NOT:** an auto-tune KV sweep. `pickKvQuants` is exported but **never called**
+  anywhere in the bench flow — ADR-219's removal holds. The `q4_0` mention the user saw came from
+  `kvSpeedAdvisory`, which only prints advice ("a different type (e.g. q4_0) may run faster") and
+  changes nothing.
+- **Deliberately not diagnosed further.** Several plausible stories exist (Save writing a different
+  profile than it rendered; the advisory being applied rather than displayed; a stale profile
+  read-back) and none is established. Needs a clean repro: run a sweep, screenshot the dialog,
+  click Save, and diff the persisted profile. Flagged because "Save writes something other than
+  what it showed you" would be serious if confirmed.
+
+---
+
 ## Observations without a diagnosis — do not "fix" blind
 
 ### OBS-1 · Q6_K is ~3× slower than Q4_K_XL on T4 — **UNEXPLAINED**

@@ -33,6 +33,35 @@ TurboQuant CUDA (T4), model `Qwen3.8-27B-UD-Q4_K_XL` (17.9 GB, 65 blocks, ships 
 | ctx 200,192 with **q8_0 for both** K and V | ~32.0 / 30.7 GB — still over. |
 | **Single-GPU** (auto-tune's own first candidate) | Loads, but the probe finds only `ngl 31/65`, leaving 34 **dense** layers on 4 vCPUs. Observed crawling at `prefill 46%`; consumed the full per-test cap and could never win. |
 
+### Concurrency is the one real headroom left — and auto-tune never looks for it
+
+A layer split is pipeline **placement**, not pipeline **execution**. At batch=1 there is nothing to
+overlap: GPU 0 computes layers 0–32, hands off, then idles while GPU 1 finishes — which is exactly
+the measured `GPU1 98–99% / GPU0 74%` imbalance. Real pipelining needs more than one request in
+flight.
+
+Measured in the GUI, same config, only `Parallel requests` changed, two chat tabs firing the
+identical prompt at once:
+
+| Parallel requests | Per stream | **Aggregate** |
+|---|---|---|
+| 1 | 11.5–12 tok/s | **~12 tok/s** |
+| **2** | 9.0 tok/s each (stable over 4+ min, 589 and 667 tokens) | **18.0 tok/s** |
+
+**+50% aggregate throughput for −25% per-stream latency.** That is the idle 26% of GPU 0 being
+harvested, and it is the only lever found in this whole exercise that beats the single-stream
+ceiling.
+
+**`parallel` is never swept by auto-tune.** In `bench.ts` it appears exactly twice — `parallel:
+base.parallel` and `parallel: profile.parallel` — both of which merely *record* whatever the user
+set. The field is already carried through `BenchCandidate.params`, so the plumbing exists; nothing
+varies it.
+
+**Whether to act on this is a product call, not a tuning one.** It raises throughput for a serving
+or multi-agent workload and does nothing for one person chatting — that user just sees 12 tok/s
+become 9. Auto-tune optimises single-stream tok/s today, so sweeping `parallel` would need a
+target to optimise *for* before it means anything.
+
 ### The three findings that matter beyond this one box
 
 1. **`turbo4` for V, `q8_0` for K is what makes 200k fit at all.** Not a split-geometry question —
