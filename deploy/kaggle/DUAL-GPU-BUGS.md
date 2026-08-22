@@ -86,6 +86,27 @@ card). Every site below instead read the *first* card and reported half the mach
 - **Fix:** add a row candidate and let measured t/s decide, as the design already does for
   single-vs-layer. Cheap: the winner is chosen by measurement, so on PCIe-only boxes where row
   loses, it simply loses.
+- **FIXED in `pickSplitStrategies` (2026-08-22)** — row is now emitted on every multi-GPU box,
+  ordered **last** (the strategy loop breaks on the global deadline, so the newcomer is the first
+  thing dropped when budget runs short, never the layer-split default) and **skipped when the user
+  pinned a single GPU** (that is a choice of hardware, not of geometry).
+- **What row actually does on 2× T4 — measured in the GUI, and it settles the "wastes tuning
+  time" objection.** Selecting Split mode → Row and loading fails, at **both** ctx 200,192 and
+  ctx 8,192 (where the estimate is a roomy 19.1 / 30.7 GB), with the same fault:
+  ```
+  CUDA error: invalid argument
+  current device: 0, in function ggml_backend_cuda_split_buffer_set_tensor
+  ```
+  That is the row-split tensor-upload path, and it dies **~8 seconds in** — during
+  `common_init_result: fitting params to device memory`, long before any bench. So the real cost
+  of offering row on hardware that cannot use it is *eight seconds and a recorded `crash`
+  candidate*, not a wasted 10-minute bench slot. Meanwhile the reference box (2× RTX 5060 Ti,
+  `--split-mode tensor`, 68 tok/s — see `REFERENCE-CONFIGS.md`) is exactly the machine where this
+  candidate wins. Measurement decides, cheaply, in both directions.
+- **Note this is NOT the expensive branch.** At ctx 200,192 the branch that actually burns the
+  budget is **single-GPU** (BUG-5 / ADR-379): `maxGpuFraction` clears the 0.5 gate, the probe then
+  finds only `ngl 31/65`, and the sweep benches 34 dense layers on 4 vCPUs — observed crawling at
+  `prefill 46%` and consuming the full per-test cap.
 
 ### BUG-7 · `estimateVramPerGpu` ignores `ngl` for MoE — **OPEN (mine, ADR-379 follow-up)**
 - **Where:** `turbollm/src/models/profile.ts`, `estimateVramPerGpu()`
@@ -142,6 +163,49 @@ guideline that matters more than any tuning knob** on T4-class hardware.
 GPU1 at 98–99% util, GPU0 at 74%, with 12525 / 13019 MiB. Byte-balancing does not address this,
 and `deriveTensorSplit` deliberately declines dense models. Consistent with the sequential
 pipeline, but the 74% floor is not explained by it.
+
+---
+
+## Theme 4 — the VRAM estimate does not model what the engine actually allocates
+
+Found 2026-08-22 driving the GUI on the 2× T4 box with **Qwen3.8-27B-UD-Q4_K_XL at ctx 200,192**,
+the configuration the dual-GPU work targets. Both defects share one consequence: the panel says
+**"fits comfortably"** and the load then dies with `exit 1`.
+
+### BUG-11 · The estimate ignores the fork's own auto-asymmetric KV upgrade — **OPEN**
+- **Where:** `turbollm/src/models/profile.ts`, `estimateVram()` / `estimateVramPerGpu()` — they size
+  the KV from the *selected* `kvTypeK`, and nothing tells them the engine may override it.
+- **Observed live**, straight from the engine log:
+  ```
+  llama_kv_cache: auto-asymmetric: GQA ratio 6:1 (n_head=24, n_head_kv=4) —
+      upgrading K from turbo4 to q8_0 to prevent quality degradation.
+      Disable with TURBO_AUTO_ASYMMETRIC=0
+  common_fit_params: failed to fit params to free device memory:
+      n_gpu_layers already set by user to 99, abort
+  ```
+- **The gap, measured in the panel itself:** selecting `turbo4` for K and V reports
+  **~25.4 / 30.7 GB · fits**. The engine silently runs K at `q8_0`, whose honest cost the panel
+  shows only if you *select* `q8_0` by hand: **~28.7 / 30.7 GB**. A 3.3 GB error, in the
+  optimistic direction, on a box with ~2 GB of headroom.
+- **Why it matters beyond the number:** `turbo4` is exactly what a TurboQuant user is steered
+  toward for long context, and the auto-upgrade fires on any GQA-heavy model — which is most
+  modern ones. The user is told the config fits, and it cannot.
+- **Fix:** mirror the engine's auto-asymmetric rule in the estimator (upgrade K to `q8_0` when the
+  GQA ratio crosses the fork's threshold), so the panel and the engine agree on one number.
+
+### BUG-12 · The estimate ignores the NextN/MTP draft context — **OPEN**
+- **Observed live:** `srv load_model: creating MTP draft context against the target model` — with
+  speculative decoding on (**NextN is the DEFAULT** for any model carrying a NextN head, and this
+  model ships one), the engine builds a *second* context. Its weights and KV are real VRAM that
+  `estimateVram` does not count.
+- **Fix:** add the draft context to the estimate whenever the speculative mode is not `off`, or at
+  minimum surface it in the panel so the number is not silently optimistic.
+
+### Consequence for auto-tune
+Auto-tune's `ngl` search is probe-driven, so it *discovers* the real ceiling by loading — it is not
+misled the way the panel is. But `pickSplitStrategies` gates the single-GPU branch on
+`maxGpuFraction`, which is built on the same `estimateVram`. Both bugs therefore push that gate
+optimistic, in the one direction ADR-379 was written to prevent.
 
 ---
 

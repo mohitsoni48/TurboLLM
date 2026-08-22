@@ -50,22 +50,39 @@ test('split-incapable engine → one strategy even on a multi-GPU box', () => {
   assert.equal(strats[0].splitMode, 'layer')
 })
 
-test('multi-GPU, model fits one card → single-GPU FIRST, then layer-split', () => {
+test('multi-GPU, model fits one card → single-GPU FIRST, then layer-split, then row', () => {
   const s = sys([24000, 24000])
   const strats = pickSplitStrategies(model({ sizeBytes: 8_000_000_000 }), s, base(s), caps)
-  assert.equal(strats.length, 2)
-  assert.equal(strats[0].splitMode, 'none') // tried first — the likely winner
-  assert.equal(strats[0].mainGpu, 0)
-  assert.equal(strats[1].splitMode, 'layer')
+  assert.deepEqual(strats.map((g) => g.splitMode), ['none', 'layer', 'row'])
+  assert.equal(strats[0].mainGpu, 0) // single-GPU tried first — the likely winner
 })
 
-test('multi-GPU, model too big for one card even at smallest KV → layer-split only', () => {
+test('multi-GPU, model too big for one card even at smallest KV → the two split modes, no single-GPU', () => {
   const s = sys([24000, 24000])
   // ~60 GB weights: even fully on CPU (ngl=0) plus KV/overhead this barely clears one 24 GB card,
   // and any real GPU residency overflows it fast — so single-GPU is well under 50% and skipped.
+  // Both MULTI-GPU geometries remain: layer (the default) and row (tensor-parallel).
   const strats = pickSplitStrategies(model({ sizeBytes: 60_000_000_000 }), s, base(s), caps)
-  assert.equal(strats.length, 1)
-  assert.equal(strats[0].splitMode, 'layer')
+  assert.deepEqual(strats.map((g) => g.splitMode), ['layer', 'row'])
+})
+
+test('row (tensor-parallel) is offered on every multi-GPU box, and always LAST', () => {
+  // Auto-tune could not previously express `--split-mode row` at all, so it was structurally
+  // incapable of finding the best dual-GPU config — a layer split is a sequential pipeline, and row
+  // is the only mode where both cards work the same layer at once. It goes last so that a sweep
+  // truncated by the global deadline still returns the layer-split default.
+  const s = sys([24000, 24000])
+  for (const bytes of [8_000_000_000, 60_000_000_000]) {
+    const strats = pickSplitStrategies(model({ sizeBytes: bytes }), s, base(s), caps)
+    assert.equal(strats.at(-1)?.splitMode, 'row', `row should be last for ${bytes} bytes`)
+    assert.deepEqual(strats.at(-1)?.tensorSplit, [], 'row starts from an even, unpinned split')
+  }
+})
+
+test('row is NOT offered when the user pinned a single GPU — that is a hardware choice, not a geometry', () => {
+  const s = sys([24000, 24000])
+  const pinned = base(s, { gpu: { splitMode: 'none', tensorSplit: [], mainGpu: 0, tensorParallelSize: 1 } })
+  assert.ok(!pickSplitStrategies(model(), s, pinned, caps).some((g) => g.splitMode === 'row'))
 })
 
 test('multi-GPU, model just barely exceeds one card at FULL offload → single-GPU still offered (GitHub #62)', () => {
@@ -195,8 +212,8 @@ test('ADR-379: a dense model that needs both cards is NOT offered single-GPU', (
   const p = base(T4x2_REAL, { ctx: 188416, ngl: 99, kvTypeK: 'q8_0', kvTypeV: 'q8_0' }, m)
   const strats = pickSplitStrategies(m, T4x2_REAL, p, caps)
   assert.ok(!strats.some((g) => g.splitMode === 'none'), 'single-GPU must not be offered')
-  assert.equal(strats.length, 1)
-  assert.equal(strats[0].splitMode, 'layer')
+  // Only the multi-GPU geometries remain, layer (the default) first.
+  assert.deepEqual(strats.map((g) => g.splitMode), ['layer', 'row'])
 })
 
 test('ADR-379: the verdict is not changed by a smaller KV the run will never use', () => {
