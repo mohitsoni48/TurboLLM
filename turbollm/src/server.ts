@@ -16,6 +16,11 @@ import { featureForPath } from './telemetry/feature-map'
 import { registerTerminalRoutes } from './terminal/terminal-routes'
 import { registerRoutineRoutes } from './routines/routine-routes'
 import { lanAuth, codeAuth } from './auth'
+import { mountExtApi } from './ext/mount'
+import { PublicRunManager } from './ext/run-manager'
+import { createMakeBody } from './ext/generation'
+import { DEFAULT_AUDIT_RETENTION_DAYS } from './ext/audit'
+import { extErrorHandler } from './ext/errors'
 
 // Reuse TCP connections for all engine and HF fetch calls. Without this, Node
 // opens a new connection per request — ~5–20 ms of extra latency every Claude
@@ -28,6 +33,18 @@ const WEB_ROOT = join(dirname(fileURLToPath(import.meta.url)), 'webdist')
 // the internal API, the engine gateway, and the embedded React SPA.
 export function createApp(d: Deps): Hono {
   const app = new Hono()
+
+  // Backstop for the "unhandled throw reaches Hono's default handler, which returns a bare,
+  // non-JSON text/plain 500" failure class on the external chat API (round 1's C3, round 3's
+  // N5/N6-regression fix — each prior fix closed one specific trigger, not the underlying gap).
+  // Hono only supports ONE `onError` handler per app instance (confirmed: `compose()` always
+  // receives `this.errorHandler` — never undefined, since Hono itself defaults it to its own
+  // generic-500 producer — so a per-route-group `try { await next() } catch {}` middleware can
+  // NEVER observe a downstream throw; it always resolves normally once Hono's own dispatch layer
+  // has already converted the error into a response, well before the rejection could reach a
+  // middleware's own `next()` call). `extErrorHandler` (errors.ts) is scoped internally to only
+  // reshape `/api/ext/v1/*` responses — see its own doc comment.
+  app.onError(extErrorHandler)
 
   // /v1/* (OpenAI/Anthropic-compatible gateway) stays fully permissive — arbitrary
   // client software (Claude Code, other CLIs/tools) needs to reach it cross-origin,
@@ -96,6 +113,50 @@ export function createApp(d: Deps): Hono {
   registerTerminalRoutes(app, d)
   registerRoutineRoutes(app, d)
   registerGateway(app, d)
+
+  // External chat API (spec 27) — flag-gated off by default (config.ts's `api.ext.enabled`);
+  // mountExtApi registers nothing at all when the flag is off, so this is a true no-op for
+  // every existing install until an operator opts in. Runs do not RESUME across a restart
+  // (spec 27 §6.4) — an in-flight generation is gone with the process either way — but the
+  // RECORD must survive, so a client that reconnects after a daemon bounce gets an honest
+  // `failed`/`daemon_restarted` answer instead of a 404 that looks like the run never
+  // existed. `db: d.db` is what makes `extRuns.reconcileOnStartup()` below operate on the
+  // real, persisted `ext_runs` table rather than an always-empty in-memory map (Phase 4
+  // Task 1's whole reason for existing). The reaper/prune tick mirrors the pattern already
+  // used elsewhere in this codebase for background sweeps (cli.ts's
+  // routineScheduler/cliInteractiveSweepTimer): unref'd so a pending tick can never keep the
+  // process alive on its own.
+  const extRuns = new PublicRunManager({ orphanTimeoutMs: 5 * 60_000, db: d.db })
+  extRuns.reconcileOnStartup()
+  const ext = mountExtApi(app, d, extRuns, { makeBody: createMakeBody(d) })
+  // Release-gate I10: a public run's tools currently run under the LOCAL install's own
+  // toolPolicies/autoAllowAll (generation.ts), not an independent trust boundary — a remote
+  // tenant's chat can execute run_code/fetch_url (and any configured MCP tool) on installs
+  // where those are allow-policy. Shipped as an explicit, logged, EXPERIMENTAL opt-in (not
+  // blocked on building a separate ext-specific tool allowlist) rather than silently — an
+  // operator enabling this should see the trust-model change called out at the exact moment
+  // they turn it on, every time the daemon starts with it enabled.
+  if (ext) {
+    console.warn(
+      '[ext-api] /api/ext/v1 is enabled (EXPERIMENTAL). Remote tenants currently inherit this ' +
+      "install's own tool permissions for public generations, including run_code if it's " +
+      'allow-policy here — see config.json\'s api.ext doc comment.',
+    )
+  }
+  const extRunsReaper = setInterval(() => {
+    extRuns.reapOrphans()
+    extRuns.prune(60 * 60_000)
+    // Idempotency entries outlive individual runs on purpose (24h default TTL vs the 1h run
+    // prune above) — see routes.runs.ts's `idempotency_replay_expired` handling for how a
+    // replay of an already-pruned run fails closed instead of double-generating. Still needs
+    // its own bound, so expired entries don't accumulate forever.
+    ext?.idempotency.prune()
+    // The audit trail (spec 27 §10) outlives both of the above by design — "who did what" is
+    // exactly the record an operator wants to still have after a run has aged out of the
+    // reaper above — but it still needs its own bound so ext_audit doesn't grow forever.
+    ext?.audit.prune(DEFAULT_AUDIT_RETENTION_DAYS)
+  }, 30_000)
+  extRunsReaper.unref()
 
   // Embedded SPA with client-side-routing fallback (spec 08 §1).
   app.get('/*', (c) => {

@@ -1,0 +1,16 @@
+{
+  "name": "postgres-chat-store-example",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Example ChatStore adapter over Postgres (TurboLLM spec 27) — proves the interface is implementable outside this repo. Not a published package.",
+  "type": "module",
+  "scripts": {
+    "test": "tsx --test conformance.test.mjs"
+  },
+  "dependencies": {
+    "pg": "^8.13.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0"
+  }
+}

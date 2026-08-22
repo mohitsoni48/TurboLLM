@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto'
 import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
+import type { ChatStoreConfig } from '../chat/store/load-adapter.js'
 
 export const SCHEMA_VERSION = 4
 
@@ -171,6 +172,12 @@ export interface ApiKey {
   prefix: string
   createdAt: string
   lastUsedAt: string | null
+  /** Which tenant this key authenticates (spec 27 §10). Absent on keys minted before the
+   *  external API existed — those are treated as `local`, preserving their behavior exactly. */
+  tenant?: string
+  /** Coarse permissions: 'chats:read' | 'chats:write' | 'runs:write'. Absent ⇒ all three,
+   *  so existing keys keep working unchanged. */
+  scopes?: string[]
 }
 export interface LastLoaded {
   modelKey: string
@@ -396,6 +403,9 @@ export interface Config {
   daemon: Daemon
   telemetry: Telemetry
   apiKeys: ApiKey[]
+  /** Where non-local tenants' chats are stored (spec 27 §4.3/§4.5). `tenant='local'` —
+   *  TurboLLM's own UI — is ALWAYS served by SQLite regardless of this setting. */
+  chatStore: ChatStoreConfig
   engines: Engine[]
   /** Custom (non-catalog) engine identities, kept across Disable — see {@link CustomEngineSource}. */
   customEngineSources: CustomEngineSource[]
@@ -470,6 +480,14 @@ export interface Config {
     schemaVersion?: number
     everLoadedModel?: boolean
   }
+  /** External chat API (spec 27) — EXPERIMENTAL as of v1.11.3. Off by default — this surface
+   *  exposes tenant data and must be an explicit opt-in, never something a version bump
+   *  switches on. Known limitation an operator enabling this should know: a remote tenant's
+   *  generations currently inherit the LOCAL install's own tool permissions (toolPolicies,
+   *  autoAllowAll — including run_code on installs migrated from an older setting), not an
+   *  independent trust boundary of their own (server.ts logs a warning at startup when this is
+   *  enabled). */
+  api?: { ext?: { enabled: boolean; maxInFlightPerTenant?: number; requestsPerMinutePerTenant?: number } }
 }
 
 export class ValueError extends Error {
@@ -565,6 +583,7 @@ export function defaultConfig(): Config {
     },
     telemetry: { level: 'full', machineId: '' },
     apiKeys: [],
+    chatStore: { kind: 'sqlite' },
     engines: [],
     customEngineSources: [],
     activeEngineId: '',
@@ -1043,6 +1062,14 @@ function normalize(c: Config): void {
   // A primary that no longer exists in modelDirs (folder removed/renamed) falls
   // back to the effective default (first dir) — reset rather than throw.
   if (c.primaryModelDir && !c.modelDirs.includes(c.primaryModelDir)) c.primaryModelDir = ''
+  // Pluggable chat storage (spec 27 §4.5): absent/malformed in pre-this-feature configs
+  // → { kind: 'sqlite' }, so an old config file keeps behaving exactly as before.
+  if (!c.chatStore || typeof c.chatStore !== 'object') c.chatStore = { kind: 'sqlite' }
+  // External chat API (spec 27 §4/§10): absent in pre-this-feature configs → disabled. Never
+  // flips an existing config's `enabled` — only seeds the block when it's missing entirely, so
+  // a version bump alone can never turn this surface on for someone who never opted in.
+  if (!c.api) c.api = {}
+  if (!c.api.ext) c.api.ext = { enabled: false }
   c.version = SCHEMA_VERSION
 }
 

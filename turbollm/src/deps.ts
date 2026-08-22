@@ -9,6 +9,7 @@ import type { AppUpdateChecker } from './app-update'
 import type { Scanner } from './models/scanner'
 import type { HashStore } from './models/hashes'
 import type { ConversationStore } from './chat/db'
+import type { ChatStore } from './chat/store/chat-store.js'
 import type { HfClient } from './hf/hf'
 import type { DownloadManager } from './downloads/downloads'
 import type { BenchRunner } from './bench/bench'
@@ -27,6 +28,10 @@ export interface Deps {
   scanner: Scanner
   hashes: HashStore
   db: ConversationStore
+  /** The pluggable chat store (spec 27). Phase 1: always SqliteChatStore over the same
+   *  handle as `db`. Phase 2 replaces this with a tenant-dispatching router. The web UI
+   *  does NOT go through this — it keeps using `db` directly (spec 27 §4.3). */
+  chatStore: ChatStore
   provision: ProvisionState
   /** Live status of an in-app compile-from-source run (ADR-100). One build at a time;
    *  guarded alongside `provision` so a build and a download never run concurrently. */

@@ -1,0 +1,29 @@
+{
+  "name": "@turbollm/chat-client",
+  "version": "0.1.0",
+  "description": "Zero-dependency TypeScript client for TurboLLM's public External Chat API (/api/ext/v1).",
+  "license": "FSL-1.1-ALv2",
+  "type": "module",
+  "private": true,
+  "main": "./src/index.js",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.js"
+    }
+  },
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "test": "tsx --test src/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "@types/node": "^22.0.0"
+  }
+}

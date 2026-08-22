@@ -8,6 +8,7 @@ import { engineModelAlias } from '../engines/compat'
 import { feedChunk, flushState, initParseState } from './parser'
 import { needsExtraPass } from './think-utils'
 import { parseReasoningEffort, type ReasoningEffort } from './reasoning-effort'
+import { sseSink, type EmitSink } from './emit-sink.js'
 
 import type { ClaimVerdict, ConversationStore, MessageStats, ResearchMeta, ResearchSource, ToolCallRecord } from './db'
 import { checkReply } from '../tools/research-referee.js'
@@ -335,7 +336,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
         : fullContent
       engineMessages.push({ role: 'user', content: userContent })
 
-      await runGeneration(d, stream, { convId, conv, engineMessages, assistantMsg, ms, target, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), userText: content, isCodeAuthorized })
+      await runGeneration(d, sseSink(stream), { convId, conv, engineMessages, assistantMsg, ms, target, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), userText: content, isCodeAuthorized })
     })
   })
 
@@ -401,7 +402,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
         engineMessages.push({ role: m.role, content })
       }
 
-      await runGeneration(d, stream, { convId, conv, engineMessages, assistantMsg, ms, target, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), isCodeAuthorized })
+      await runGeneration(d, sseSink(stream), { convId, conv, engineMessages, assistantMsg, ms, target, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), isCodeAuthorized })
     })
   })
 
@@ -691,7 +692,6 @@ function getLanIpForShare(): string {
 
 // ── shared generation streaming ───────────────────────────────────────────────
 
-type StreamHandle = Parameters<Parameters<typeof streamSSE>[1]>[0]
 type ManagerStatus = ReturnType<Deps['manager']['status']>
 
 interface GenerationCtx {
@@ -777,7 +777,7 @@ function reportChatBenchResult(d: Deps, ms: ModelInfo, stats: Partial<MessageSta
   }
 }
 
-async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx): Promise<void> {
+async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx): Promise<void> {
   const { db } = d
   const { convId, conv, assistantMsg, ms, target, ac, thinkingBudget, reasoningEffort } = ctx
 
@@ -1010,7 +1010,7 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
       })
 
       if (!res.ok || !res.body) {
-        await stream.writeSSE({ event: 'error', data: JSON.stringify({ code: 'engine_error', message: `Engine returned ${res.status}` }) })
+        await emit({ event: 'error', data: { code: 'engine_error', message: `Engine returned ${res.status}` } })
         return
       }
 
@@ -1055,7 +1055,7 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
           if (pp && pp.total) {
             const pct = Math.round((pp.processed ?? 0) / pp.total * 100)
             d.manager.setLiveGen({ phase: 'prompt', pct, outputTokens: 0 })
-            await stream.writeSSE({ event: 'progress', data: JSON.stringify({ phase: 'prompt', processed: pp.processed, total: pp.total, pct, tps: pp.tps ?? 0 }) })
+            await emit({ event: 'progress', data: { phase: 'prompt', processed: pp.processed, total: pp.total, pct, tps: pp.tps ?? 0 } })
             continue
           }
 
@@ -1086,7 +1086,7 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
               // may stream a long argument body next, and silence there reads as a freeze.
               if (entry.id && entry.name && !announcedToolCalls.has(tc.index)) {
                 announcedToolCalls.add(tc.index)
-                await stream.writeSSE({ event: 'tool_call', data: JSON.stringify({ id: entry.id, name: entry.name, args: {}, status: 'pending' }) })
+                await emit({ event: 'tool_call', data: { id: entry.id, name: entry.name, args: {}, status: 'pending' } })
               }
             }
             continue
@@ -1098,7 +1098,7 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
             if (!thinkStart) thinkStart = Date.now()
             thinkEnd = Date.now()
             fullReasoning += rc
-            await stream.writeSSE({ event: 'reasoning', data: JSON.stringify({ delta: rc }) })
+            await emit({ event: 'reasoning', data: { delta: rc } })
             continue
           }
 
@@ -1112,13 +1112,13 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
               if (!thinkStart) thinkStart = Date.now()
               thinkEnd = Date.now()
               fullReasoning += ev.text
-              await stream.writeSSE({ event: 'reasoning', data: JSON.stringify({ delta: ev.text }) })
+              await emit({ event: 'reasoning', data: { delta: ev.text } })
             } else {
               fullContent += ev.text
               roundContent += ev.text
               if (!ttftMs) ttftMs = Date.now() - requestStart
               d.manager.setLiveGen({ phase: 'gen', pct: 0, outputTokens: ++liveOut })
-              await stream.writeSSE({ event: 'delta', data: JSON.stringify({ delta: ev.text }) })
+              await emit({ event: 'delta', data: { delta: ev.text } })
             }
           }
         }
@@ -1129,11 +1129,11 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
       for (const ev of flushState(parseState)) {
         if (ev.type === 'reasoning') {
           fullReasoning += ev.text
-          await stream.writeSSE({ event: 'reasoning', data: JSON.stringify({ delta: ev.text }) })
+          await emit({ event: 'reasoning', data: { delta: ev.text } })
         } else {
           fullContent += ev.text
           roundContent += ev.text
-          await stream.writeSSE({ event: 'delta', data: JSON.stringify({ delta: ev.text }) })
+          await emit({ event: 'delta', data: { delta: ev.text } })
         }
       }
 
@@ -1168,9 +1168,9 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
 
           if (isSkillTool && skillTools) {
             // Emit pending event so the frontend can show "calling..."
-            await stream.writeSSE({
+            await emit({
               event: 'tool_call',
-              data: JSON.stringify({ id: tc.id, name: tc.name, args: parsedArgs, status: 'pending' }),
+              data: { id: tc.id, name: tc.name, args: parsedArgs, status: 'pending' },
             })
             try {
               result = skillTools.execute({ id: tc.id, name: tc.name, args: parsedArgs })
@@ -1178,9 +1178,9 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
               callError = (e as Error).message
               result = `Error: ${callError}`
             }
-            await stream.writeSSE({
+            await emit({
               event: 'tool_call',
-              data: JSON.stringify({ id: tc.id, name: tc.name, args: parsedArgs, status: callError ? 'error' : 'done', result }),
+              data: { id: tc.id, name: tc.name, args: parsedArgs, status: callError ? 'error' : 'done', result },
             })
           } else {
             // Live foreground chat gets the real approval gate (interactive: true) — an
@@ -1188,7 +1188,7 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
             // waits for POST .../tool-calls/:toolCallId/approve to resolve it.
             const approved = await executeToolCallWithApproval({
               tools: d.tools,
-              sink: (ev) => stream.writeSSE({ event: ev.event, data: JSON.stringify(ev.data) }),
+              sink: (ev) => emit({ event: ev.event, data: ev.data }),
               convId,
               id: tc.id,
               name: tc.name,
@@ -1370,7 +1370,7 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
             const rc = (delta.reasoning_content ?? delta.reasoning) as string | undefined
             if (rc) {
               fullReasoning += rc
-              await stream.writeSSE({ event: 'reasoning', data: JSON.stringify({ delta: rc }) })
+              await emit({ event: 'reasoning', data: { delta: rc } })
               continue
             }
             const raw_content = delta.content ?? ''
@@ -1380,12 +1380,12 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
             for (const ev of parseEvents) {
               if (ev.type === 'reasoning') {
                 fullReasoning += ev.text
-                await stream.writeSSE({ event: 'reasoning', data: JSON.stringify({ delta: ev.text }) })
+                await emit({ event: 'reasoning', data: { delta: ev.text } })
               } else {
                 fullContent += ev.text
                 if (!ttftMs) ttftMs = Date.now() - requestStart
                 d.manager.setLiveGen({ phase: 'gen', pct: 0, outputTokens: ++liveOut })
-                await stream.writeSSE({ event: 'delta', data: JSON.stringify({ delta: ev.text }) })
+                await emit({ event: 'delta', data: { delta: ev.text } })
               }
             }
           }
@@ -1394,10 +1394,10 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
         for (const ev of flushState(parseState)) {
           if (ev.type === 'reasoning') {
             fullReasoning += ev.text
-            await stream.writeSSE({ event: 'reasoning', data: JSON.stringify({ delta: ev.text }) })
+            await emit({ event: 'reasoning', data: { delta: ev.text } })
           } else {
             fullContent += ev.text
-            await stream.writeSSE({ event: 'delta', data: JSON.stringify({ delta: ev.text }) })
+            await emit({ event: 'delta', data: { delta: ev.text } })
           }
         }
       }
@@ -1407,7 +1407,7 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
     aborted = isAbort
     if (!isAbort) {
       engineFailed = true
-      await stream.writeSSE({ event: 'error', data: JSON.stringify({ code: 'engine_stopped', message: (e as Error).message }) })
+      await emit({ event: 'error', data: { code: 'engine_stopped', message: (e as Error).message } })
     }
   } finally {
     d.manager.generationEnd()
@@ -1496,7 +1496,7 @@ async function runGeneration(d: Deps, stream: StreamHandle, ctx: GenerationCtx):
   // regardless, and an unhandled rejection here would crash the daemon (and orphan the
   // engine), which is the root of the reported "requests never end / model stays loaded".
   try {
-    await stream.writeSSE({ event: 'done', data: JSON.stringify({ message: finalMsg }) })
+    await emit({ event: 'done', data: { message: finalMsg } })
   } catch { /* client gone — nothing to flush to */ }
 
   if (!aborted && conv.title === 'New chat' && d.store.snapshot().daemon.autoGenerateTitles) {
