@@ -245,25 +245,46 @@ export function resolveKey(c: Context, d: Deps): ApiKey | undefined {
   return match
 }
 
+/** Is this stored key a Turbo Link FAÇADE-ONLY credential — usable only on `/api/link/v1`
+ *  (resolveKey/linkAuth), and refused by every other credential path?
+ *
+ *  The rule itself (ADR-376 review): a key carrying a `grant` was minted FOR a peer, scoped to
+ *  a capability set that only the façade knows how to honour. Every other auth surface compares
+ *  the hash and nothing else, so without a refusal a token minted as "Inference only" could
+ *  simply be pointed at the PUBLIC /v1/chat/completions instead of the façade, reach the
+ *  ordinary auto-swap path, and load and evict models on the host at will — reducing
+ *  models:wake / models:load to advice.
+ *
+ *  Deliberately keyed on the PRESENCE of a grant, never on its contents: "this credential was
+ *  scoped for a peer" is the invariant, and a future capability must not be able to widen it by
+ *  accident. An ungranted legacy key — which is every key minted before Turbo Link — is
+ *  untouched and keeps working everywhere exactly as before.
+ *
+ *  Exported as ONE predicate rather than re-remembered per surface: the pre-merge review of
+ *  PR #185 (finding I1) found the External Chat API's own credential path
+ *  (`ext/auth.ts`'s resolveTenantFromKey) comparing hashes with no idea this rule existed,
+ *  because it landed on main independently. Any NEW code that resolves a presented key to a
+ *  stored record must call this — do not re-derive `!!key.grant` in a third place. */
+export function isFacadeOnlyKey(key: Pick<ApiKey, 'grant'>): boolean {
+  return !!key.grant
+}
+
 /** Checks a raw candidate key against stored API keys; bumps lastUsedAt best-effort on a
  *  match. The credential-check core shared by every auth surface — HTTP (verifyPresentedKey,
  *  which sources the raw value from headers) and the WebSocket upgrade handler (which sources
  *  it from a query param, since browsers can't set custom headers on a WebSocket handshake).
  *
  *  A key carrying a Turbo Link `grant` is refused here as though it did not match at all
- *  (ADR-376 review). Every surface downstream of this function — lanAuth over /v1/*,
- *  codeAuth over Code's real shell and filesystem access, the terminal WebSocket's pty
- *  upgrade — compares the hash and NOTHING else. A grant is only meaningful to linkAuth,
- *  which reads it via resolveKey; so without this rule a token minted as "Inference only"
- *  could simply be pointed at the PUBLIC /v1/chat/completions instead of the façade, reach
- *  the ordinary auto-swap path, and load and evict models on the host at will. That would
- *  reduce models:wake and models:load to advice. A granted token is therefore a
- *  FAÇADE-ONLY credential, and this is the single choke point that enforces it.
+ *  ({@link isFacadeOnlyKey}, ADR-376 review). Every surface downstream of THIS function —
+ *  lanAuth over /v1/*, codeAuth over Code's real shell and filesystem access, the terminal
+ *  WebSocket's pty upgrade — compares the hash and NOTHING else, so this is the choke point
+ *  for all of them.
  *
- *  Deliberately keyed on the PRESENCE of a grant, never on its contents: "this credential
- *  was scoped for a peer" is the invariant, and a future capability must not be able to
- *  widen it by accident. An ungranted legacy key — which is every key minted before Turbo
- *  Link — is untouched and keeps working everywhere exactly as before. */
+ *  It is NOT the only one in the process, and the earlier version of this comment claiming
+ *  "the single choke point" was wrong: the External Chat API (`ext/auth.ts`) landed on main
+ *  with its own hash comparison and never routes through here. It calls
+ *  {@link isFacadeOnlyKey} directly instead. Two enforcement points, ONE predicate — if you
+ *  add a third credential path, call the predicate rather than re-deriving the rule. */
 export function verifyKeyValue(key: string, d: Deps): boolean {
   if (!key) return false
   const hash = hashKey(key)
@@ -272,7 +293,7 @@ export function verifyKeyValue(key: string, d: Deps): boolean {
   if (!match) return false
   // Before the lastUsedAt bump on purpose: a refused credential must leave no trace of a
   // successful use, and must be indistinguishable from a wrong key.
-  if (match.grant) return false
+  if (isFacadeOnlyKey(match)) return false
   // Best-effort lastUsedAt bump (spec 06 §5). Never block the request on it.
   try {
     d.store.update((mut) => {
