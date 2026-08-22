@@ -1,6 +1,19 @@
 // Shared TS types mirroring the Go daemon API JSON (spec 02). Keep these in sync
 // with the daemon contract; the typed client in lib/api.ts returns these shapes.
 
+/** Mirrors the daemon's `FAIL_REASONS` (src/telemetry/core/enums.ts), which is what
+ *  `classifyLoadFailure` returns. Declared here because this file is the designated
+ *  mirror of the daemon contract; `screens/onboarding/recovery.ts` checks its runtime
+ *  array against this union rather than re-declaring it, so the two cannot drift. */
+export type LoadFailure =
+  | 'oom'
+  | 'no_engine'
+  | 'bad_gguf'
+  | 'unsupported_arch'
+  | 'timeout'
+  | 'cancelled'
+  | 'other'
+
 export type EngineState =
   | 'stopped'
   | 'starting'
@@ -13,6 +26,11 @@ export type EngineError = {
   message: string
   exitCode?: number
   logTail?: string[]
+  /** Server-side classification of this failure (`classifyLoadFailure`, ADR-338
+   *  Decision 4). Drives the one-click recovery offered in the error banner.
+   *  Optional because a daemon older than the field simply omits it — the UI
+   *  then falls back to `other`, which still offers a next action. */
+  failReason?: LoadFailure
 }
 
 /** Active engine runtime state from GET /api/v1/status (spec 02 §1). */
@@ -134,6 +152,10 @@ export type Status = {
   version: string
   engine: EngineRuntime
   model: LoadedModel | null
+  /** Key of the last model the user loaded, config-tracked by the daemon and sent on
+   *  every status poll. Survives a FAILED load — `model` above is null then — which is
+   *  what makes a one-click retry of the thing that just broke possible at all. */
+  lastLoaded?: string
   engineStats?: EngineStats | null
   liveGeneration?: LiveGeneration | null
   bench: BenchState

@@ -61,7 +61,7 @@ import { readQueue, remove as removeQueued } from '../telemetry/queue'
 import { sendConsentChoice } from '../telemetry/consent'
 import { readSentLog } from '../telemetry/log'
 import { TELEMETRY_SCHEMA_VERSION } from '../telemetry/schema'
-import { classifyProvisionFailure } from '../telemetry/classify'
+import { classifyLoadFailure, classifyProvisionFailure } from '../telemetry/classify'
 import { registerOnboardingRoutes } from './onboarding-routes'
 import { startEngine, stopEngine, type EngineStartBody } from './engine-lifecycle'
 import { enqueueDownload, listDownloads, removeDownload } from './download-lifecycle'
@@ -111,7 +111,16 @@ export function registerApi(app: Hono, d: Deps): void {
     // must not read the former as the latter.
     const launchCommand = d.manager.launchCommand()
     const engine: Record<string, unknown> = { ...core.engine }
-    if (ms.err) engine.error = ms.err
+    // `failReason` (ADR-338 Decision 4): the SAME `classifyLoadFailure` the telemetry
+    // path already runs on this exact object, now also handed to the UI so a failed load
+    // can offer a one-click recovery instead of dead-ending on "Copy log". Classified
+    // here rather than in the web bundle on purpose — one classifier, server-side, so the
+    // remedy a user is offered can never disagree with the reason we recorded.
+    //
+    // Unlike `logTail` this is a closed enum and carries no path or free text, so it is
+    // safe by construction; it rides with `error` only because that is the thing it
+    // describes.
+    if (ms.err) engine.error = { ...ms.err, failReason: classifyLoadFailure(ms.err) }
     if (launchCommand) engine.launchCommand = launchCommand
     return c.json({
       version: d.version,

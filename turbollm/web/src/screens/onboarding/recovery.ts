@@ -9,10 +9,16 @@
  *  `Record<AnyFailure, ...>` below is exhaustive, so adding a member to either
  *  enum without adding a recovery is a COMPILE error, not a runtime dead end. */
 
-export const LOAD_FAILURES = ['oom', 'no_engine', 'bad_gguf', 'unsupported_arch', 'timeout', 'cancelled', 'other'] as const
+import type { LoadFailure } from '../../lib/types'
+
+/** `satisfies` (not a plain `as const`) is the load-bearing part: it makes this array
+ *  provably identical to the `LoadFailure` union in `lib/types.ts`, which mirrors the
+ *  daemon's own enum. Adding a reason on the daemon side and forgetting it here is a
+ *  COMPILE error, the same guarantee the exhaustive `Record` below already gives. */
+export const LOAD_FAILURES = ['oom', 'no_engine', 'bad_gguf', 'unsupported_arch', 'timeout', 'cancelled', 'other'] as const satisfies readonly LoadFailure[]
 export const PROVISION_FAILURES = ['network', 'no_asset', 'unsupported_platform', 'disk_full', 'permission_denied'] as const
 
-export type LoadFailure = (typeof LOAD_FAILURES)[number]
+export type { LoadFailure }
 export type ProvisionFailure = (typeof PROVISION_FAILURES)[number]
 export type AnyFailure = LoadFailure | ProvisionFailure
 
@@ -41,11 +47,11 @@ const MAP: Record<AnyFailure, RecoveryAction[]> = {
   disk_full: [a('smaller-quant', 'Choose a smaller model', true), a('retry', 'Retry')],
   permission_denied: [a('show-path-fix', 'Show how to fix permissions', true), a('retry', 'Retry')],
   // Load
-  oom: [a('lower-quant-retry', 'Retry with a smaller quant', true), a('smaller-quant', 'Choose a smaller model')],
+  oom: [a('lower-quant-retry', 'Choose a smaller quant', true), a('smaller-quant', 'Choose a smaller model')],
   no_engine: [a('back-to-engine', 'Set up an engine', true)],
   bad_gguf: [a('redownload', 'Re-download the model', true), a('hf-search', 'Choose a different model')],
   unsupported_arch: [a('alt-engine', 'Try an engine that supports it', true), a('hf-search', 'Choose a different model')],
-  timeout: [a('retry', 'Retry with a longer timeout', true), a('smaller-quant', 'Choose a smaller model')],
+  timeout: [a('retry', 'Retry', true), a('smaller-quant', 'Choose a smaller model')],
   cancelled: [a('resume', 'Resume', true)],
   other: [a('show-launch-command', 'Show launch command and diagnostics', true), a('retry', 'Retry')],
 }
