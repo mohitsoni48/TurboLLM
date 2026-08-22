@@ -31,11 +31,30 @@ test('a thrown fetch yields a network probe — never propagates', async () => {
 })
 
 test('a timeout yields a network probe, not a hang', async () => {
+  // A host that accepts the connection and then never answers — the realistic failure the
+  // timeout exists for. The fake settles ONLY when the client's own abort signal fires, so
+  // this really is the timeout path and not just "a fetch that rejects" (covered above).
+  //
+  // The keepalive timer is load-bearing, not defensive padding. `AbortSignal.timeout()`
+  // unrefs its timer by design — a daemon poll must never hold the process open — so with
+  // nothing else pending the event loop drains before the abort can fire, the promise never
+  // settles, and node:test kills the whole file ("Promise resolution is still pending but
+  // the event loop has already resolved"). One ordinary, ref'd timer pins the loop open for
+  // the few ms this single request can take. It RESOLVES rather than rejects so that a
+  // regression which stops the abort from ever firing fails the assertion below loudly
+  // instead of quietly yielding the `network` the test wanted anyway.
   const c = new LinkClient(rec, {
     timeoutMs: 20,
-    fetchImpl: (_u, init) => new Promise((_res, rej) => {
-      (init as RequestInit).signal?.addEventListener('abort', () => rej(new Error('aborted')))
-    }) as Promise<Response>,
+    fetchImpl: (_u, init) => new Promise<Response>((res, rej) => {
+      const keepalive = setTimeout(() => res(new Response(JSON.stringify({
+        machineId: 'm1', machineName: 'workstation', appVersion: '1.11.2',
+        linkApiVersions: [1], capabilities: [],
+      }), { status: 200, headers: { 'content-type': 'application/json' } })), 2000)
+      ;(init as RequestInit).signal?.addEventListener('abort', () => {
+        clearTimeout(keepalive)
+        rej(new Error('aborted'))
+      })
+    }),
   })
   assert.deepEqual(await c.hello(), { kind: 'network' })
 })
