@@ -44,14 +44,28 @@ export class LinkManager {
    *  Structural, not a `RemoteCatalog` import, so this class keeps no dependency on routing.
    *  Optional: every pre-Turbo-Link construction site (and every test) works without one. */
   private readonly catalog: { refresh(): Promise<void> } | undefined
+  /** Live check for `daemon.experimental.turboLink` (ADR-376, link/gate.ts) — a getter, not
+   *  a snapshot value, so Settings → Experimental flips it with no daemon restart, exactly
+   *  like `RoutineScheduler.isRoutinesEnabled`.
+   *
+   *  Defaults to always-enabled so every pre-existing call site and test that predates this
+   *  gate keeps its exact previous behavior; `cli.ts` — the only production construction
+   *  site — always injects the real predicate. */
+  private readonly isEnabled: () => boolean
 
   constructor(
     private readonly d: Deps,
-    opts?: { intervalMs?: number; fetchImpl?: typeof fetch; catalog?: { refresh(): Promise<void> } },
+    opts?: {
+      intervalMs?: number
+      fetchImpl?: typeof fetch
+      catalog?: { refresh(): Promise<void> }
+      isEnabled?: () => boolean
+    },
   ) {
     this.intervalMs = opts?.intervalMs ?? DEFAULT_INTERVAL_MS
     this.fetchImpl = opts?.fetchImpl
     this.catalog = opts?.catalog
+    this.isEnabled = opts?.isEnabled ?? (() => true)
   }
 
   list(): LinkRecord[] {
@@ -62,9 +76,18 @@ export class LinkManager {
     return this.list().find((l) => l.id === id)
   }
 
+  /** Arm the poll loop.
+   *
+   *  While `daemon.experimental.turboLink` is off this does NOT poll: no boot probe, and
+   *  every tick short-circuits in `probeAll`. So a disabled feature makes zero outbound
+   *  requests and zero config writes — the only thing it holds is one unref'd, inert
+   *  `setInterval` handle, which is what lets the user flip the flag on in Settings and
+   *  have the fleet come back on the next tick instead of after a daemon restart. That
+   *  restart-free toggle is the same trade `RoutineScheduler` makes, and it matters more
+   *  here: restarting takes TurboLLM offline mid-session. */
   start(): void {
     if (this.timer) return
-    void this.probeAll()
+    if (this.isEnabled()) void this.probeAll()
     this.timer = setInterval(() => void this.probeAll(), this.intervalMs)
     this.timer.unref?.()
   }
@@ -76,6 +99,10 @@ export class LinkManager {
 
   /** Probe every link concurrently. Resolves once all have settled; never rejects. */
   async probeAll(): Promise<void> {
+    // The kill switch, checked per tick rather than once at start(): flipping the flag off
+    // stops the loop dead — no probe, no catalog refresh, no config rewrite — while the
+    // `links` themselves stay in config, untouched, ready for it to be flipped back on.
+    if (!this.isEnabled()) return
     await Promise.allSettled(this.list().map((l) => this.probeOnce(l.id)))
     // AFTER the probes, never before: the catalog drops the models of anything not `online`,
     // so refreshing on stale statuses is what would leave an offline machine's model looking
@@ -91,6 +118,10 @@ export class LinkManager {
   }
 
   async probeOnce(id: string): Promise<void> {
+    // Also gated, not just `probeAll`: this method is public and the admin
+    // `GET /api/v1/links/:id/status` route calls it directly. That route has its own gate,
+    // so this is defence in depth against a future caller that does not.
+    if (!this.isEnabled()) return
     const rec = this.get(id)
     if (!rec) return
     const fromStatus = rec.status

@@ -26,7 +26,7 @@ function mkDeps(recorded: string[]): Deps {
       grant: { capabilities: ['models:use'] },
     }],
     links: [],
-    daemon: { lanBind: true, requireApiKey: true, machineId: 'machine-abc', port: 6996 },
+    daemon: { lanBind: true, requireApiKey: true, machineId: 'machine-abc', port: 6996 , experimental: { turboLink: true } },
   }
   return {
     version: '1.11.2',

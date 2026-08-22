@@ -45,7 +45,7 @@ function mkDeps(keys: ApiKey[], opts?: { state?: string; err?: unknown }): Deps 
   const cfg: Record<string, unknown> = {
     apiKeys: keys,
     links: [],
-    daemon: { lanBind: true, requireApiKey: true, machineId: 'machine-abc', machineName: 'workstation' },
+    daemon: { lanBind: true, requireApiKey: true, machineId: 'machine-abc', machineName: 'workstation' , experimental: { turboLink: true } },
   }
   return {
     version: '1.11.2',

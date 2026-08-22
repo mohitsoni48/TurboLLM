@@ -2,6 +2,7 @@ import type { MiddlewareHandler } from 'hono'
 import { resolveKey } from '../auth'
 import type { Deps } from '../deps'
 import { hasCapability } from './capabilities'
+import { isTurboLinkEnabled, turboLinkDisabled, TURBO_LINK_DISABLED_HOST_MESSAGE } from './gate'
 import type { LinkCapability } from './types'
 
 /** Turbo Link's gate for /api/link/v1 — an INVERSION of lanAuth, and the reason the
@@ -21,6 +22,18 @@ import type { LinkCapability } from './types'
  *  Register it scoped to '/api/link/v1/*' AFTER lanAuth. */
 export function linkAuth(d: Deps): MiddlewareHandler {
   return async (c, next) => {
+    // The experimental gate, BEFORE the credential is even resolved (ADR-376,
+    // link/gate.ts). A host with Turbo Link switched off must not accept an inbound link
+    // at all, so this refuses ahead of `resolveKey`: a disabled host discloses no machine
+    // identity, no grant and no model list, and a valid token gets no further than an
+    // invalid one. It also means the flag is a genuine kill switch for a host that ALREADY
+    // handed out tokens — those keys stay in config and start working again the moment the
+    // flag goes back on, but until then every route above answers this.
+    //
+    // 403 with a named code, never 404: `/api/link/v1` is a versioned contract, and a 404
+    // reads to a peer as "that host is too old", sending its user after an upgrade that
+    // does not exist.
+    if (!isTurboLinkEnabled(d)) return turboLinkDisabled(c, TURBO_LINK_DISABLED_HOST_MESSAGE)
     const key = resolveKey(c, d)
     if (!key) {
       return c.json(

@@ -8,7 +8,12 @@ import type { Deps } from '../deps'
 import type { ApiKey } from '../config/config'
 
 function depsWith(keys: ApiKey[], daemon: { lanBind: boolean; requireApiKey: boolean }): Deps {
-  const cfg = { apiKeys: keys, daemon }
+  // Turbo Link ships behind `daemon.experimental.turboLink` (link/gate.ts), off by default,
+  // and `linkAuth` refuses everything ahead of `resolveKey` while it is off. This suite is
+  // about the auth INVERSION, so it runs with the feature unlocked; the gate's own
+  // behaviour — including that it refuses before a token is even resolved — is covered by
+  // link/experimental-gate.test.ts.
+  const cfg = { apiKeys: keys, daemon: { ...daemon, experimental: { turboLink: true } } }
   return {
     store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
   } as unknown as Deps

@@ -67,7 +67,7 @@ function inferenceEvents(dir: string): Record<string, unknown>[] {
 
 function hostDeps(keys: ApiKey[], telemetry?: Emitter): Deps {
   const cfg: Record<string, unknown> = {
-    apiKeys: keys, links: [], daemon: { lanBind: true, requireApiKey: true, machineId: 'machine-abc', machineName: MACHINE_NAME },
+    apiKeys: keys, links: [], daemon: { lanBind: true, requireApiKey: true, machineId: 'machine-abc', machineName: MACHINE_NAME , experimental: { turboLink: true } },
     gateway: { autoSwap: true }, modelDefaults: { maxTokens: 0 },
   }
   return {

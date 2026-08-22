@@ -9,7 +9,7 @@ import type { HelloResponse } from './types'
 
 function mkDeps(keys: ApiKey[]): Deps {
   const cfg: Record<string, unknown> = {
-    apiKeys: keys, links: [], daemon: { lanBind: true, requireApiKey: true, machineId: 'machine-abc' },
+    apiKeys: keys, links: [], daemon: { lanBind: true, requireApiKey: true, machineId: 'machine-abc' , experimental: { turboLink: true } },
   }
   return {
     version: '1.11.2',
@@ -90,7 +90,10 @@ test('mount order: an open LAN with no key still cannot reach the façade', asyn
   // actual composed middleware chain in the same order server.ts uses.
   const { lanAuth } = await import('../auth')
   const d = mkDeps([])
-  ;(d.store.snapshot() as unknown as Record<string, unknown>).daemon = { lanBind: true, requireApiKey: false }
+  // The whole daemon block is replaced, so the experimental flag has to be restated: this
+  // test is about lanAuth NOT waving a keyless caller through, and a 403 from the Turbo Link
+  // gate would mask whether the 401 it asserts is actually being produced.
+  ;(d.store.snapshot() as unknown as Record<string, unknown>).daemon = { lanBind: true, requireApiKey: false, experimental: { turboLink: true } }
   const a = new Hono()
   a.use('*', lanAuth(d))
   registerLinkApi(a, d)

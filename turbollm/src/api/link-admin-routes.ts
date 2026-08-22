@@ -1,4 +1,4 @@
-import type { Hono } from 'hono'
+import type { Hono, MiddlewareHandler } from 'hono'
 import { randomUUID } from 'node:crypto'
 import { networkInterfaces } from 'node:os'
 import { generateApiKey, hostGate } from '../auth'
@@ -12,6 +12,7 @@ import { LINK_CAPABILITIES, redactDownload, redactLink, type LinkCapability, typ
 import { describeStatus, type LinkProbe } from '../link/link-state'
 import { LINK_PRESETS } from '../link/capabilities'
 import { scrubRemoteConfig } from '../link/config-scope'
+import { isTurboLinkEnabled, turboLinkDisabled, TURBO_LINK_DISABLED_MESSAGE } from '../link/gate'
 import { emit } from '../telemetry/runtime/typed-emit'
 import { linkMinted, linkAdded, LINK_ADDED_OUTCOMES } from '../telemetry/events/link'
 
@@ -25,6 +26,28 @@ export function registerLinkAdminRoutes(
   opts?: { fetchImpl?: typeof fetch },
 ): void {
   const fetchImpl = opts?.fetchImpl
+
+  /** The experimental gate (ADR-376, link/gate.ts), as MIDDLEWARE rather than a call at the
+   *  top of each of the fifteen handlers below.
+   *
+   *  Middleware on purpose: a per-handler check is a checklist, and a checklist is one
+   *  forgotten line away from a hole — the sixteenth route added next month inherits this
+   *  one automatically. Both patterns are registered because Hono's `/*` does not match the
+   *  bare collection path, and `GET /api/v1/links` is exactly the route that lists every
+   *  linked machine.
+   *
+   *  This runs BEFORE `gate()`'s host check and before any handler, which is what makes the
+   *  flag a real kill switch rather than a UI preference: while it is off, `mint` issues no
+   *  key, `POST /api/v1/links` contacts no host, and — the part that matters most — the
+   *  DESTRUCTIVE routes are refused too. Turning the feature off must never cost the user a
+   *  link record or revoke a granted key; the config is left exactly as it was, so turning
+   *  it back on restores the previous state. */
+  const turboLinkGate: MiddlewareHandler = async (c, next) => {
+    if (!isTurboLinkEnabled(d)) return turboLinkDisabled(c, TURBO_LINK_DISABLED_MESSAGE)
+    return next()
+  }
+  app.use('/api/v1/links', turboLinkGate)
+  app.use('/api/v1/links/*', turboLinkGate)
 
   /** EVERY route in this file is credential management and therefore carries the same
    *  host gate as `/api/v1/keys` (auth.ts's `hostGate`).

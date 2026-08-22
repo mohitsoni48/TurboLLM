@@ -61,6 +61,10 @@ function mkDeps(t: { after: (fn: () => void) => void }, keys: ApiKey[], seed?: (
     c.apiKeys = keys
     c.daemon.lanBind = false
     c.daemon.requireApiKey = true
+    // Turbo Link ships behind `daemon.experimental.turboLink` (link/gate.ts), off by
+    // default. This suite is about the façade's OWN behaviour, so it runs with the feature
+    // unlocked; the gate itself is covered by experimental-gate.test.ts.
+    c.daemon.experimental.turboLink = true
     c.modelDefaults.ctx = 4096
     c.gateway.keepN = 1
     seed?.(c)

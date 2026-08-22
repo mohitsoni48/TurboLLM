@@ -30,7 +30,7 @@ function mkDeps(keys: ApiKey[], opts: { busy?: boolean; loaded?: string | null }
   const h: Harness = { routed: [] }
   const loaded = opts.loaded === undefined ? LOADED : opts.loaded
   const cfg: Record<string, unknown> = {
-    apiKeys: keys, links: [], daemon: { lanBind: true, requireApiKey: true, machineId: 'machine-abc' },
+    apiKeys: keys, links: [], daemon: { lanBind: true, requireApiKey: true, machineId: 'machine-abc' , experimental: { turboLink: true } },
     gateway: { autoSwap: true }, modelDefaults: { maxTokens: 0 },
   }
   const d = {

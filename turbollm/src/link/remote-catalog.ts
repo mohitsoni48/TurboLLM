@@ -34,9 +34,22 @@ export class RemoteCatalog {
   /** linkId → the models that link advertised on its last successful refresh. */
   private readonly cache = new Map<string, RemoteModel[]>()
   private readonly fetchImpl: typeof fetch | undefined
+  /** Live check for `daemon.experimental.turboLink` (ADR-376, link/gate.ts). A getter, not a
+   *  snapshot, so the flag takes effect without a daemon restart — and because it is
+   *  consulted from `isUsable`, it is re-evaluated on EVERY read, which is what makes
+   *  disabling the feature drop remote models instantly rather than at the next poll. Exactly
+   *  the rule a link going offline already follows.
+   *
+   *  Defaults to always-enabled so every pre-existing construction site and test keeps its
+   *  previous behavior; `cli.ts` injects the real predicate. */
+  private readonly isEnabled: () => boolean
 
-  constructor(private readonly links: LinkSource, opts?: { fetchImpl?: typeof fetch }) {
+  constructor(
+    private readonly links: LinkSource,
+    opts?: { fetchImpl?: typeof fetch; isEnabled?: () => boolean },
+  ) {
     this.fetchImpl = opts?.fetchImpl
+    this.isEnabled = opts?.isEnabled ?? (() => true)
   }
 
   /** Re-fetch every online link's model list, concurrently and in isolation. Never
@@ -68,6 +81,12 @@ export class RemoteCatalog {
   /** The link whose display name is `machineName`, case-insensitively. Exact name only —
    *  no prefix or substring matching, which would let one machine answer for another. */
   linkByName(machineName: string): LinkRecord | undefined {
+    // Gated as well as `models()`, and this is the one that makes chat fail CLOSED. It is
+    // what `ModelRouter.resolveRemote` asks first, and `undefined` there means "this is not
+    // a remote id at all" — so with the feature off, `rig/Qwen3-35B` falls through to
+    // ordinary local resolution and ends as a plain "no such model" instead of a 503 that
+    // names a machine the user can no longer reach.
+    if (!this.isEnabled()) return undefined
     const wanted = machineName.trim().toLowerCase()
     if (!wanted) return undefined
     return this.links.list().find((l) => l.name.trim().toLowerCase() === wanted)
@@ -92,6 +111,15 @@ export class RemoteCatalog {
   /** A link may advertise models only while it is online AND its token actually grants
    *  `models:use` — without that capability the host answers 403, so asking is pure noise. */
   private isUsable(link: LinkRecord): boolean {
+    // The experimental gate rides on the SAME predicate as "is this link online", rather
+    // than being a fourth check bolted onto each public method. That is deliberate: this one
+    // function is what `models()`, `modelOn()` and `refresh()` already agree on, so gating it
+    // makes remote models disappear from every downstream surface at once — `/v1/models`
+    // (gateway.ts), `ModelRouter.resolveRemoteTarget`, in-app chat (chat-upstream.ts), the
+    // Settings model list, and `turbollm launch claude`'s remote id resolution — with no
+    // chance of one of them being missed. `refresh()` filters on it too, so a cache that was
+    // warm when the flag flipped is EVICTED on the next refresh, not merely hidden.
+    if (!this.isEnabled()) return false
     return link.status === 'online' && link.grantedCapabilities.includes('models:use')
   }
 

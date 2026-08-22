@@ -37,7 +37,7 @@ function mkConfig(machineName?: string): Record<string, unknown> {
     daemon: {
       port: 6996, lanBind: false, requireApiKey: false, theme: 'system', idleTtlMinutes: 30,
       autoGenerateTitles: true, autoMemoryEnabled: false, openBrowserOnStart: true,
-      experimental: { memory: false, cloudDeploy: false, routines: false },
+      experimental: { memory: false, cloudDeploy: false, routines: false, turboLink: true },
       ...(machineName === undefined ? {} : { machineName }),
     },
   }

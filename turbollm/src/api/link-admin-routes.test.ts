@@ -13,7 +13,10 @@ import type { Deps } from '../deps'
 
 function mkApp(fetchImpl?: typeof fetch, telemetry?: Emitter, daemon?: Record<string, unknown>) {
   const cfg: Record<string, unknown> = {
-    apiKeys: [], links: [], daemon: { port: 6996, ...daemon },
+    // Turbo Link ships behind `daemon.experimental.turboLink` (link/gate.ts), off by
+    // default. This suite is about the admin routes' OWN behaviour, so it runs with the
+    // feature unlocked; the gate itself is covered by link/experimental-gate.test.ts.
+    apiKeys: [], links: [], daemon: { port: 6996, experimental: { turboLink: true }, ...daemon },
   }
   const d = {
     version: '1.11.2',
@@ -532,7 +535,7 @@ test('only an explicit acknowledgement clears the machineId latch', async () => 
 // nothing here without this route needing its own copy of that rule.
 
 function mkCatalogApp(rows: unknown[], daemon?: Record<string, unknown>) {
-  const cfg: Record<string, unknown> = { apiKeys: [], links: [], daemon: { port: 6996, ...daemon } }
+  const cfg: Record<string, unknown> = { apiKeys: [], links: [], daemon: { port: 6996, experimental: { turboLink: true }, ...daemon } }
   const d = {
     version: '1.11.2',
     store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
@@ -1026,7 +1029,7 @@ for (const route of FLEET_ROUTES) {
     // attack: an established link plus a stranger who can reach the daemon with no
     // credential at all.
     const { app, cfg, id } = await mkLinked(OK_HOST)
-    ;(cfg as { daemon: unknown }).daemon = { port: 6996, lanBind: true, requireApiKey: false }
+    ;(cfg as { daemon: unknown }).daemon = { port: 6996, lanBind: true, requireApiKey: false, experimental: { turboLink: true } }
     const res = await app.request(route.path(id), {
       ...route.init,
       headers: { ...(route.init?.headers ?? {}), 'x-forwarded-for': '10.0.0.9' },

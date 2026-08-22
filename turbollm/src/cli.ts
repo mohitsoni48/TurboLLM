@@ -333,7 +333,14 @@ const comfy = new ComfyGuard(store, manager)
 // with the wrong weights instead of failing loudly. It is the proxy in gateway.ts that makes
 // switching it on safe. The link source is read LAZILY: `deps.links` is constructed further
 // down (it needs the assembled Deps), and the catalog is only ever consulted at request time.
-const remoteCatalog = new RemoteCatalog({ list: () => deps.links?.list() ?? [] })
+// The experimental gate (Settings → Experimental, ADR-376) is injected as a live getter,
+// not a boot-time snapshot — same shape as `isRoutinesEnabled` below. Gating the catalog is
+// what makes remote models vanish from `/v1/models`, `ModelRouter`, chat and
+// `turbollm launch claude` the instant the flag goes off, with no restart.
+const remoteCatalog = new RemoteCatalog(
+  { list: () => deps.links?.list() ?? [] },
+  { isEnabled: () => store.snapshot().daemon.experimental.turboLink },
+)
 const modelRouter = new ModelRouter(store, registry, manager, scanner, comfy, remoteCatalog)
 // Tool registry (v0.7.0): built-in tools + MCP host. Syncs MCP servers from config.
 // Routine tools (Phase 4): `db` structurally satisfies RoutineToolsStore (createRoutine/
@@ -566,7 +573,14 @@ routineScheduler.start()
 // never throws, so a bad/unreachable link cannot block startup).
 // The catalog rides the SAME poll tick: one loop, one set of outbound calls, and the models
 // are refreshed only after each link's status has been updated by that tick's probe.
-deps.links = new LinkManager(deps, { catalog: remoteCatalog })
+// `isEnabled` is a live getter (Settings → Experimental can flip it with no restart, and a
+// restart takes TurboLLM offline mid-session). While it is off, start() arms an inert timer
+// and nothing polls: no outbound probe, no config rewrite. The `links` in config are left
+// exactly where they are.
+deps.links = new LinkManager(deps, {
+  catalog: remoteCatalog,
+  isEnabled: () => store.snapshot().daemon.experimental.turboLink,
+})
 deps.links.start()
 
 // Safety-net watchdog for the interactive (ask/plan) claude_cli routine path
