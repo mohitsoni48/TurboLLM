@@ -51,6 +51,7 @@ import { engineAcceptsFormat, engineRejectsAudioModel } from '../engines/compat'
 import { ScannerError, type ModelEntry } from '../models/scanner'
 import { estimateVram, type LoadProfile, resolveProfile } from '../models/profile'
 import { amdApuOnly, getSysInfo, primaryVendor } from '../sysinfo/sysinfo'
+import { requestUsage } from '../sysinfo/usage'
 import { HfError, type HfSortOption } from '../hf/hf'
 import type { EnqueueInput } from '../downloads/downloads'
 import { BenchError } from '../bench/bench'
@@ -1490,6 +1491,11 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   app.get('/api/v1/sysinfo', (c) => c.json(getSysInfo()))
+
+  // Live CPU/RAM/GPU usage (ADR-383): the freshest sample from the self-stopping sampler.
+  // Deliberately NOT folded into status-view.ts — the Turbo Link façade must stay untouched
+  // (spec D2), and a peer polling /status must not start GPU counter streams on this box.
+  app.get('/api/v1/hwstats', async (c) => c.json(await requestUsage()))
 
   // ── daemon settings (UI-exposed subset) ──
   app.get('/api/v1/settings', (c) => c.json(settingsPayload(d)))
