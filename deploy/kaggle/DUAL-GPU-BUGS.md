@@ -70,6 +70,7 @@ card). Every site below instead read the *first* card and reported half the mach
   True ceiling `ngl 28/65 = 0.43`, below the 0.5 gate; measured against `turbo4` it cleared it.
 - **Fix:** judge on `base.kvTypeK`. Threshold deliberately left at 0.5 — raising it for dense
   was tried and reverted because it also rejected GitHub #62 at ~0.72.
+- **Follow-up:** that last sentence turned out to be wrong on both halves — see **BUG-16**.
 
 ### BUG-6 · Auto-tune never tries row / tensor-parallel split — **OPEN, likely the biggest miss**
 - **Where:** `turbollm/src/bench/bench.ts`, `pickSplitStrategies()` — only ever generates
@@ -276,3 +277,27 @@ quick chat test uses a short prompt. The same config measured **7.8 t/s at a 2,5
 and 6.26 t/s at 32k**. Two points on one curve, not a regression. The auto-tune/chat gap measured
 on-design is **70%**, of which ~19 points is methodology (engine-internal `predicted_per_second`
 vs wall-clock streaming), ~10 points run-to-run, and only **4%** the daemon's proxy hop.
+
+### BUG-16 · The single-GPU gate still opened at mid depth, with half a dense model on CPU — **FIXED (ADR-384)**
+- **Where:** `turbollm/src/bench/bench.ts`, `pickSplitStrategies()` — the same gate as BUG-5.
+- **Was:** BUG-5 closed the *deep* end (ctx 188k+ computes 0.000, correctly skipped) but left a
+  band open in the middle. BUG-6's fix notes saw the symptom without naming it: *"the branch that
+  actually burns budget is single-GPU — it clears the 0.5 gate, probes down to `ngl 31/65`, then
+  benches 34 dense layers on four vCPUs."*
+- **Measured**, real Qwen3.8-27B UD-Q4_K_XL (dense, 65 blocks, 17.9 GB, `headCountKv` 4,
+  `headDim` 256) on 2x15360 MiB — model metadata pulled live off the box, fractions computed with
+  the real `estimateVram`:
+  ```
+  ctx   8192  q8_0 -> 0.708  (19/65 on CPU)  offered -> still offered   <- GitHub #62's shape
+  ctx  16384  f16  -> 0.523  (31/65 on CPU)  offered -> NOW SKIPPED
+  ctx  32768  q8_0 -> 0.523  (31/65 on CPU)  offered -> NOW SKIPPED
+  ctx 188416  q8_0 -> 0.000  (65/65 on CPU)  skipped (BUG-5)
+  ```
+- **Fix:** the bar is now `0.6` for **dense** and stays `0.5` for **MoE**
+  (`MIN_SINGLE_GPU_FRACTION_DENSE` / `..._MOE`). A dense layer is read on every token; an
+  offloaded MoE expert only when the router picks it — a MoE at 0.550 is pinned as still offered.
+- **Why BUG-5's "raising it broke #62" no longer holds:** #62's own fixture computes **0.875**,
+  not the ~0.72 estimated at the time, and every fixture `pickSplitStrategies` is pinned against
+  sits at >= 0.875 or <= 0.344 — the 0.5-0.6 band was empty of intended behaviour.
+- **Not fixed by this:** the branch is still entered on an estimate, and "auto-tune is correct;
+  it is merely slow" still stands at deep context.

@@ -1556,6 +1556,13 @@ export function overHeadroom(vramAbsMb: number | null, budgetMb: number, headroo
  *  second. Single-GPU is tried first because, when the model fits one card, it beats any split (a
  *  layer-split is a sequential cross-GPU pipeline + per-token PCIe activation copies), so a
  *  budget-truncated run still measured the likely winner. */
+/** Smallest GPU-resident fraction that makes a single-GPU branch worth a bench slot (ADR-384).
+ *  Split by architecture because CPU residency costs the two shapes very differently: every dense
+ *  layer is read on every token, while an offloaded MoE expert is read only when the router picks
+ *  it. See the reasoning in {@link pickSplitStrategies}. */
+const MIN_SINGLE_GPU_FRACTION_MOE = 0.5
+const MIN_SINGLE_GPU_FRACTION_DENSE = 0.6
+
 export function pickSplitStrategies(
   entry: ModelEntry,
   sys: SysInfo,
@@ -1583,10 +1590,28 @@ export function pickSplitStrategies(
   // CPU wouldn't end up doing the majority of the work — below that, the summed multi-GPU pool
   // (kept as today's fallback either way) is the sounder bet.
   //
-  // The 0.5 threshold is deliberately UNCHANGED. Raising it for dense models (partial residency
-  // hurts far more when every parameter is active) was tried and reverted: the KV fix below
-  // already rejects the reported failure at 0.43, while GitHub #62's "just missed the card" case
-  // computes ~0.72 and must still be offered. A higher bar fixed nothing extra and broke #62.
+  // The bar is 0.5 for MoE and 0.6 for DENSE (ADR-384). ADR-379 recorded the dense bar as
+  // deliberately unchanged, on the grounds that raising it "fixed nothing extra and broke #62".
+  // That was true of the evidence available then and is no longer true: the KV fix below closes
+  // the DEEP end (ctx 188k+ computes 0.000, correctly skipped) but leaves a band open in the
+  // middle. Measured on the real 2x T4 box with the real model — Qwen3.8-27B UD-Q4_K_XL, dense,
+  // 65 blocks — ctx 32768 at the user's q8_0 computes 0.523: it clears 0.5 and opens a branch
+  // that parks 31 of 65 DENSE layers on four vCPUs. A dense layer is touched on EVERY token, so
+  // that branch cannot beat a layer-split holding the whole model; it only costs a bench slot
+  // (up to the 10-minute timeout) to establish what the arithmetic already knew. ADR-381's
+  // "the branch that actually burns budget is single-GPU" is this band.
+  //
+  // Why 0.6, and why dense-only:
+  //   - It separates the two measured cases with margin on both sides — rejects 0.523, keeps the
+  //     same model at ctx 8192 (0.708, only 19 of 65 blocks on CPU), which is #62's shape.
+  //   - Every fixture this function is pinned against sits at >= 0.875 or <= 0.344, so the
+  //     0.5-0.6 band was empty of intended behavior. GitHub #62's own fixture computes 0.875,
+  //     not the ~0.72 ADR-379 estimated.
+  //   - Erring low is deliberate. Wrongly OFFERING costs one bench slot; wrongly SKIPPING costs
+  //     the better configuration and reproduces #62, which is the worse failure. So the bar sits
+  //     nearer the case it must reject than the case it must keep.
+  //   - MoE keeps 0.5: an offloaded expert is only read when the router selects it, so half a MoE
+  //     on CPU is nothing like half a dense model on CPU. A MoE at 0.550 is still offered.
   //
   // Judged with the KV type that will ACTUALLY be used (ADR-379). This used to judge with the
   // smallest KV the engine offers, justified by "the inner KV sweep can pick it to fit" — but
@@ -1596,7 +1621,9 @@ export function pickSplitStrategies(
   // the doomed branch was opened anyway — six probes and a 10-minute bench TIMEOUT before falling
   // through to the layer-split that was right from the start.
   const singleFrac = maxGpuFraction(entry, sys, { ...base, gpu: single })
-  if (singleFrac >= 0.5) strategies.push(single)
+  if (singleFrac >= (entry.moe ? MIN_SINGLE_GPU_FRACTION_MOE : MIN_SINGLE_GPU_FRACTION_DENSE)) {
+    strategies.push(single)
+  }
 
   // The profile's current split (default: layer across all GPUs) — always kept, as the fallback for
   // models too big for one card and so a tuned result can never be worse than today's default.
