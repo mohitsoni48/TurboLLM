@@ -16,6 +16,7 @@ import type {
   EngineUpdates,
   EnginesList,
   EngineScanResult,
+  HwUsage,
   UpdatePolicy,
   HfRepoDetail,
   HfSearchResult,
@@ -147,6 +148,14 @@ export function trackRecoveryText(failureText: string, action: string, outcome: 
 // ── Status ───────────────────────────────────────────────────────────────────
 export function getStatus(): Promise<Status> {
   return request<Status>('/api/v1/status')
+}
+
+// ── Hardware monitor (ADR-383) ─────────────────────────────────────────────
+/** The freshest live CPU/RAM/GPU usage sample. A GET that also (re)arms the daemon's
+ *  self-stopping sampler: every caller is a subscriber, and 6 s after the last one leaves
+ *  the sampling loop stops itself — so a mounted-but-unwanted poll is the whole cost model. */
+export function getHwStats(): Promise<HwUsage> {
+  return request<HwUsage>('/api/v1/hwstats')
 }
 
 // ── Coding-agent availability ────────────────────────────────────────────────
