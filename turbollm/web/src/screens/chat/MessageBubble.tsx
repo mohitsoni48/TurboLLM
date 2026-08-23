@@ -1,4 +1,4 @@
-import { memo, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -584,7 +584,7 @@ function EditTextarea({
   minRows: number
 }) {
   const ref = useRef<HTMLTextAreaElement>(null)
-  useLayoutEffect(() => {
+  const fit = useCallback(() => {
     const el = ref.current
     if (!el) return
     el.style.height = 'auto'
@@ -592,7 +592,27 @@ function EditTextarea({
     // here, so a plain scrollHeight leaves the box 2px short of its own content and the
     // textarea scrolls by a hairline even when everything fits.
     el.style.height = `${el.scrollHeight + (el.offsetHeight - el.clientHeight)}px`
-  }, [value])
+  }, [])
+  useLayoutEffect(fit, [value, fit])
+
+  // The height above is a pixel value measured at ONE width, so it goes stale the moment the
+  // column resizes and the text re-wraps: the conversation sidebar is collapsible AND
+  // drag-resizable, and dragging it while an edit box is open used to leave the box at its old
+  // height with a scrollbar back inside it until the next keystroke. Re-measure on width
+  // changes only — reacting to the height changes we just made ourselves would loop.
+  useEffect(() => {
+    const el = ref.current
+    if (!el || typeof ResizeObserver === 'undefined') return
+    let lastWidth = el.clientWidth
+    const ro = new ResizeObserver(() => {
+      const cur = ref.current
+      if (!cur || cur.clientWidth === lastWidth) return
+      lastWidth = cur.clientWidth
+      fit()
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [fit])
   return (
     <textarea
       ref={ref}
