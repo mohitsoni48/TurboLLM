@@ -273,6 +273,26 @@ export function parseIoregAccelerator(text: string): GpuSample[] {
  *  that last part is what keeps a dual-identical-card box (2x Tesla T4) from assigning both
  *  samples to card 0. When the reader is unavailable entirely, the cards are still described with
  *  null usage, so the UI shows the hardware with dashes rather than pretending it vanished. */
+/** Narrow a reader's adapter list down to the cards `SysInfo` says actually exist.
+ *
+ *  Windows needs this: the WDDM counters enumerate every adapter the OS knows about, including
+ *  software and virtual ones. Measured on the dev box, the counters reported THREE adapters where
+ *  `SysInfo` knows one — a real card at 12296.8 MB, a render-only adapter at 0, and a third
+ *  holding 1.5 GB of shared memory. Zipped naively, an AMD or Intel user would see two phantom
+ *  GPUs with zero capacity in the status bar (ADR-239: no dead UI).
+ *
+ *  `SysInfo` is the authority on which GPUs exist, so when a reader over-reports we keep the
+ *  cards that match by name, and otherwise the ones actually holding memory — a software adapter
+ *  holds none. Under-reporting is left alone; the merge pads it from `SysInfo`. */
+function selectSamples(sysGpus: SysInfo['gpus'], samples: GpuSample[]): GpuSample[] {
+  if (sysGpus.length === 0 || samples.length <= sysGpus.length) return samples
+  const names = new Set(sysGpus.map((g) => g.name.trim().toLowerCase()))
+  const named = samples.filter((s) => names.has(s.name.trim().toLowerCase()))
+  if (named.length > 0 && named.length <= sysGpus.length) return named
+  const held = (s: GpuSample) => (s.vramUsedMb ?? 0) + (s.vramSharedMb ?? 0)
+  return [...samples].sort((a, b) => held(b) - held(a)).slice(0, sysGpus.length)
+}
+
 export function mergeUsage(sys: SysInfo, samples: GpuSample[] | null): HwGpuUsage[] {
   const sysGpus = sys.gpus ?? []
   if (!samples || samples.length === 0) {
@@ -287,6 +307,7 @@ export function mergeUsage(sys: SysInfo, samples: GpuSample[] | null): HwGpuUsag
     }))
   }
 
+  const selected = selectSamples(sysGpus, samples)
   const claimed = new Set<number>()
   const claim = (sample: GpuSample, i: number): SysInfo['gpus'][number] | undefined => {
     const wanted = sample.name.trim().toLowerCase()
@@ -297,7 +318,7 @@ export function mergeUsage(sys: SysInfo, samples: GpuSample[] | null): HwGpuUsag
     return sysGpus[idx]
   }
 
-  return samples.map((s, i) => {
+  return selected.map((s, i) => {
     const match = claim(s, i)
     return {
       index: i,

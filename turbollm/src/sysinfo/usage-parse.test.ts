@@ -257,6 +257,55 @@ test('mergeUsage: unified resolves by name when the reader orders cards differen
   assert.equal(merged[1].vramTotalMb, 24000)
 })
 
+test('mergeUsage: Windows phantom adapters are dropped, not rendered as zero-capacity GPUs', () => {
+  // Captured live from the streaming WDDM reader on the dev box: the OS enumerates THREE adapters
+  // where SysInfo knows one — the real card, a render-only adapter holding nothing, and a third
+  // sitting on 1.5 GB of shared memory. Zipped naively, an AMD or Intel user (the people this
+  // reader exists for) would get two phantom GPUs with 0 GB capacity in the status bar.
+  const wddm = parseWddmSample(
+    '{"adapters":[' +
+      '{"id":"luid_0x00000000_0x000116eb_phys_0","dedicatedMb":12296.8,"sharedMb":276.5,"utilPct":77},' +
+      '{"id":"luid_0x00000000_0x00012ad4_phys_0","dedicatedMb":0,"sharedMb":0,"utilPct":0},' +
+      '{"id":"luid_0x00000000_0xd3f45800_phys_0","dedicatedMb":0,"sharedMb":1505.2,"utilPct":10}]}',
+  )
+  assert.equal(wddm.length, 3, 'the parser reports what the OS said')
+
+  const sys = sysWith({ name: 'AMD Radeon RX 7900 XTX', vramMb: 24000, vendor: 'amd' })
+  const merged = mergeUsage(sys, wddm)
+  assert.equal(merged.length, 1, 'the merge reports only the card SysInfo knows about')
+  assert.equal(merged[0].name, 'AMD Radeon RX 7900 XTX', 'and names it properly, not by LUID')
+  assert.equal(merged[0].vramUsedMb, 12296.8, 'keeping the adapter that actually holds memory')
+  assert.equal(merged[0].vramTotalMb, 24000)
+})
+
+test('mergeUsage: over-reporting is capped, but under-reporting is left alone', () => {
+  // Two cards known, one reported: the merge must not invent a second reading.
+  const sys = sysWith(
+    { name: 'Tesla T4', vramMb: 15360, vendor: 'nvidia' },
+    { name: 'Tesla T4', vramMb: 15360, vendor: 'nvidia' },
+  )
+  const merged = mergeUsage(sys, [sample({ id: '0', name: 'Tesla T4', vramUsedMb: 900, vramTotalMb: 15360 })])
+  assert.equal(merged.length, 1)
+  assert.equal(merged[0].vramUsedMb, 900)
+})
+
+test('mergeUsage: two identical cards each claim their own SysInfo entry', () => {
+  // Name matching alone would assign both samples to card 0; the claim set prevents that.
+  const sys = sysWith(
+    { name: 'Tesla T4', vramMb: 15360, vendor: 'nvidia' },
+    { name: 'Tesla T4', vramMb: 15360, vendor: 'nvidia' },
+  )
+  const merged = mergeUsage(sys, [
+    sample({ id: '0', name: 'Tesla T4', utilPct: 90, vramUsedMb: 900, vramTotalMb: null }),
+    sample({ id: '1', name: 'Tesla T4', utilPct: 5, vramUsedMb: 12, vramTotalMb: null }),
+  ])
+  assert.equal(merged.length, 2)
+  assert.equal(merged[0].utilPct, 90)
+  assert.equal(merged[1].utilPct, 5)
+  assert.equal(merged[0].vramTotalMb, 15360)
+  assert.equal(merged[1].vramTotalMb, 15360)
+})
+
 test('mergeUsage: a CPU-only box has no GPU entries at all', () => {
   // ADR-239: no dead UI. An empty list is what tells HardwareBar to omit the GPU groups.
   assert.deepEqual(mergeUsage(sysWith(), null), [])
