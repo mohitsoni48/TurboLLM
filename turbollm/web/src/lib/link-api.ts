@@ -297,3 +297,14 @@ export function cancelRemoteDownload(id: LinkRecordId, downloadId: string): Prom
     { method: 'DELETE' },
   )
 }
+
+/** Point this install at a linked machine's model, or clear it (`null`) to come back to this
+ *  machine. Persisted DAEMON-side (ADR-382): the selection has to be visible to surfaces that
+ *  are not this browser — above all `turbollm launch <cli>`, a separate process that was
+ *  auto-loading a local model while the UI showed a linked machine selected.
+ *
+ *  Rejects an id that names no ONLINE link advertising that model (400/503 with the router's
+ *  own message), so a bad pick fails here rather than at the user's first prompt. */
+export function setSelectedRemoteModel(model: string | null): Promise<{ ok: true; selectedRemoteModel: string }> {
+  return request('/api/v1/links/selected-model', { method: 'PUT', json: { model } })
+}

@@ -29,12 +29,19 @@ import { ThinkingBudgetSlider } from '../../components/ThinkingBudgetSlider'
 import { ReasoningEffortSelect, type ReasoningEffort } from '../../components/ReasoningEffortSelect'
 import { CodeStatsFooter } from './CodeStatsFooter'
 import type { ModelEntry } from '../../lib/types'
+import type { LinkRecord } from '../../lib/link-api'
+import type { RemoteModelRow } from '../../lib/remote-models'
 
 export interface TerminalToolbarProps {
   /** The CLI driving this session (`session.codeAgent` — 'claude', 'pi', 'opencode'). */
   agent: string
 
   models: ModelEntry[]
+  /** Turbo Link (ADR-376): linked machines and the models they advertise, passed straight to
+   *  ModelLoadMenu. Empty arrays on every install with no links — the picker then renders flat,
+   *  exactly as it did before Turbo Link existed. */
+  links?: LinkRecord[]
+  remoteModels?: RemoteModelRow[]
   loadedKey: string | null
   loadedName: string | null
   modelPending: boolean
@@ -62,7 +69,7 @@ export interface TerminalToolbarProps {
 }
 
 export function TerminalToolbar({
-  agent, models, loadedKey, loadedName, modelPending, ejecting, onLoadModel, onEjectModel, onModelSettings,
+  agent, models, links, remoteModels, loadedKey, loadedName, modelPending, ejecting, onLoadModel, onEjectModel, onModelSettings,
   ctxUsed, ctxMax, thinkingBudget, onThinkingBudgetChange, reasoningEffort, onReasoningEffortChange,
   lastPromptTokens, lastGenTokens, lastPromptTps, lastGenTps,
 }: TerminalToolbarProps) {
@@ -86,6 +93,8 @@ export function TerminalToolbar({
         )}
         <ModelLoadMenu
           models={models}
+          links={links}
+          remoteModels={remoteModels}
           loadedKey={loadedKey}
           loadedName={loadedName}
           pending={modelPending}

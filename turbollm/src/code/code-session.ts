@@ -34,10 +34,10 @@ import { createRobustBashOperations } from './robust-bash'
 import type { TextContent, ToolCall as PiToolCall, Usage } from '@earendil-works/pi-ai'
 import type { Deps } from '../deps'
 import type { Message as DbMessage } from '../chat/db'
-import { engineModelAlias } from '../engines/compat'
 import type { ReasoningEffort } from '../chat/reasoning-effort'
 import { SkillStore, type Skill } from '../agents/skills'
 import { isContainedFromRoot } from './containment'
+import { resolveCodeUpstream } from './code-upstream'
 import { buildAppendPrompt, toolsForMode, type CodeMode } from './persona'
 import {
   LOOP_ABORT_AFTER,
@@ -308,6 +308,11 @@ export interface RunCodeParams {
   reasoningEffort: ReasoningEffort | undefined
   /** The user's task text (first prompt of the run). */
   task: string
+  /** Turbo Link (ADR-376): the qualified `<machine>/<model>` id the Code picker selected,
+   *  or absent for "this machine's loaded model" — every pre-Turbo-Link caller. Resolved by
+   *  `resolveCodeUpstream`, which treats a non-matching id (including a local key carrying
+   *  its own slash) as local. */
+  model?: string
   /** Fires when the HTTP request is aborted / the run is stopped. */
   signal: AbortSignal
   sink: CodeSseSink
@@ -622,21 +627,23 @@ export function pickPrefillProgress(slots: unknown): PrefillProgress | null {
 export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResult> {
   const { d, convId, sessionId, repoRoot, mode, thinkingBudget, reasoningEffort, task: rawTask, signal, sink } = params
 
-  const ms = d.manager.status()
-  if (ms.state !== 'running' || !ms.model) throw new Error('model_not_loaded')
-  const target = d.manager.target()
-  if (!target) throw new Error('model_not_loaded')
-
-  // The model id the engine expects: an engine may expose an alias (e.g. vLLM) instead of
-  // TurboLLM's model key — mirror exactly how chat-routes resolves it.
-  const engineKind = d.registry.active()?.kind ?? ''
-  const modelId = engineModelAlias(engineKind, d.manager.currentOpts()?.modelPath) ?? ms.model.key
-  // REAL context window from the loaded model (plan §3, point 3) — never a hardcoded 32768.
-  const contextWindow = ms.model.ctx > 0 ? ms.model.ctx : 8192
-  // Captured once here (rather than re-read as `ms.model.name` at each registration site)
-  // because TS's null-narrowing of `ms.model` from the guard above doesn't reliably propagate
-  // into runSkillSubSession's nested function declaration below.
-  const modelDisplayName = ms.model.name || 'Local Model'
+  // Local engine or linked host — resolved ONCE for the whole turn, including every
+  // sub-session it spawns (delegate_task, invoke_skill), so a delegated sub-agent can never
+  // silently land on a different machine than its parent. Throws 'model_not_loaded' exactly
+  // where the two local guards used to; see resolveCodeUpstream.
+  // Captured here because the tool executors below shadow `params` with their own arguments.
+  const requestedModel = params.model
+  const upstream = resolveCodeUpstream(d, requestedModel)
+  // `''` for a remote turn. The ONLY consumer left is the llama.cpp /slots prefill poller,
+  // which is a local-engine endpoint and is simply not started when the tokens are being
+  // generated somewhere else.
+  const target = upstream.target
+  const modelId = upstream.modelId
+  const contextWindow = upstream.contextWindow
+  // Captured once here (rather than re-read at each registration site) because TS's
+  // null-narrowing of the loaded model doesn't reliably propagate into runSkillSubSession's
+  // nested function declaration below.
+  const modelDisplayName = upstream.modelName
 
   // The FULL shared SkillStore — the main prompt only ever sees names+descriptions of these
   // (persona.ts's skillCatalogBlock); invoke_skill (registered below) looks a specific one up
@@ -695,9 +702,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
 
   // Register TurboLLM's own local gateway as a custom OpenAI-completions provider (plan §3a).
   modelRegistry.registerProvider('local', {
-    baseUrl: `${target}/v1`,
-    apiKey: 'agent-key',
-    authHeader: true,
+    ...upstream.provider,
     api: 'openai-completions',
     models: [
       {
@@ -782,9 +787,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     const skillAuth = AuthStorage.inMemory()
     const skillRegistry = ModelRegistry.inMemory(skillAuth)
     skillRegistry.registerProvider('local', {
-      baseUrl: `${target}/v1`,
-      apiKey: 'agent-key',
-      authHeader: true,
+      ...upstream.provider,
       api: 'openai-completions',
       models: [{
         id: modelId,
@@ -808,7 +811,10 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
         releaseSkillGate()
         // Stays 'bg' — this is background sub-work, not the turn the user is watching — but takes
         // the same queue ceiling, so a long holder ahead of it isn't reported as a failure.
-        if (d.gate) skillHeldGate = await d.gate.acquire('bg', { signal, timeoutMs: GATE_QUEUE_TIMEOUT_MS })
+        // Not on a remote turn: the gate serializes THIS machine's single engine slot, and a
+        // run generating on a linked host occupies none of it — holding it would block local
+        // chat for the length of a borrowed-GPU run for no reason.
+        if (d.gate && !upstream.remote) skillHeldGate = await d.gate.acquire('bg', { signal, timeoutMs: GATE_QUEUE_TIMEOUT_MS })
         // Same stale-ceiling strip as the outer session's own hook above — this sub-session
         // declares the identical PI_MAX_OUTPUT_TOKENS and would otherwise forward it verbatim too.
         const payload = { ...(event.payload as Record<string, unknown>) }
@@ -952,9 +958,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     const subAuth = AuthStorage.inMemory()
     const subRegistry = ModelRegistry.inMemory(subAuth)
     subRegistry.registerProvider('local', {
-      baseUrl: `${target}/v1`,
-      apiKey: 'agent-key',
-      authHeader: true,
+      ...upstream.provider,
       api: 'openai-completions',
       models: [{
         id: modelId,
@@ -989,7 +993,8 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
         // 'bg' priority + subAc.signal: foreground Chat preempts, and a parent Stop / timeout gives
         // up a queued wait instead of hanging (see gate.ts). The parent isn't holding the gate here
         // (it released before executing this tool), so this acquire can't deadlock against it.
-        if (d.gate) subHeldGate = await d.gate.acquire('bg', { signal: subAc.signal, timeoutMs: GATE_QUEUE_TIMEOUT_MS })
+        // See the skill sub-session's note: no local engine slot is consumed by a remote turn.
+        if (d.gate && !upstream.remote) subHeldGate = await d.gate.acquire('bg', { signal: subAc.signal, timeoutMs: GATE_QUEUE_TIMEOUT_MS })
         const payload = { ...(event.payload as Record<string, unknown>) }
         delete payload.max_tokens
         delete payload.max_completion_tokens
@@ -1193,10 +1198,14 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       // user's own Code turn could hit `gate_acquire_timeout` and surface as a silent abort while
       // background traffic proceeded. 'fg' puts it ahead of every queued 'bg' waiter, and the
       // matching timeout stops a legitimately-long generation ahead of it from failing it.
-      if (d.gate) heldGate = await d.gate.acquire('fg', { signal, timeoutMs: GATE_QUEUE_TIMEOUT_MS })
+      // Skipped entirely for a remote turn — see the sub-session note above. Chat and Code on
+      // this machine stay fully available while a linked host does the work.
+      if (d.gate && !upstream.remote) heldGate = await d.gate.acquire('fg', { signal, timeoutMs: GATE_QUEUE_TIMEOUT_MS })
       // Gate acquired, request is about to go out — begin polling /slots for prefill progress for
       // THIS round (stopped on first token / completion / response end / abort). Best-effort.
-      startPrefillPoll()
+      // /slots is llama.cpp's own local endpoint — there is nothing to poll when the prompt is
+      // being processed on another machine, and `target` is deliberately '' there.
+      if (!upstream.remote) startPrefillPoll()
       roundStartedAt = Date.now()
       roundFirstTokenAt = undefined
       const payload = { ...(event.payload as Record<string, unknown>) }
@@ -1569,7 +1578,9 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
         const q = (params.question ?? '').trim()
         if (!q) return { content: [{ type: 'text', text: 'lookback_history: `question` must be non-empty.' }], details: {} }
         try {
-          const { answer } = await lookbackPreCompactionHistory({ d, convId, sessionId, repoRoot, question: q, signal })
+          // Same machine as the turn that asked — a lookback answered by a different model
+          // than the session is running on would read as the agent contradicting itself.
+          const { answer } = await lookbackPreCompactionHistory({ d, convId, sessionId, repoRoot, question: q, signal, model: requestedModel })
           return { content: [{ type: 'text', text: answer }], details: {} }
         } catch (e) {
           const message = e instanceof Error ? e.message : String(e)
@@ -1984,6 +1995,8 @@ export interface CompactCodeParams {
   convId: string
   sessionId: string
   repoRoot: string
+  /** Turbo Link (ADR-376): the qualified id this session is pointed at, if any. */
+  model?: string
   /** Optional focus for the summary, mirrors pi's own `/compact [instructions]`. */
   customInstructions?: string
 }
@@ -2016,13 +2029,12 @@ export async function compactCodeSession(params: CompactCodeParams): Promise<Com
   // as it was" contract.
   if (d.db.getAgentRun(sessionId)?.clearedUpToMessageId) throw new Error('session_cleared')
 
-  const ms = d.manager.status()
-  if (ms.state !== 'running' || !ms.model) throw new Error('model_not_loaded')
-  const target = d.manager.target()
-  if (!target) throw new Error('model_not_loaded')
-  const engineKind = d.registry.active()?.kind ?? ''
-  const modelId = engineModelAlias(engineKind, d.manager.currentOpts()?.modelPath) ?? ms.model.key
-  const contextWindow = ms.model.ctx > 0 ? ms.model.ctx : 8192
+  // Same local-or-linked-host resolution the main turn does — a session compacting (or
+  // looking back over) history it generated on another machine must summarize it with THAT
+  // machine's model, not with whatever happens to be loaded here.
+  const upstream = resolveCodeUpstream(d, params.model)
+  const modelId = upstream.modelId
+  const contextWindow = upstream.contextWindow
 
   const { summaryText, messages: effectiveMessages } = resolveEffectiveHistory(d, convId, sessionId)
   if (effectiveMessages.length === 0) throw new Error('nothing_to_compact')
@@ -2032,13 +2044,11 @@ export async function compactCodeSession(params: CompactCodeParams): Promise<Com
   const authStorage = AuthStorage.inMemory()
   const modelRegistry = ModelRegistry.inMemory(authStorage)
   modelRegistry.registerProvider('local', {
-    baseUrl: `${target}/v1`,
-    apiKey: 'agent-key',
-    authHeader: true,
+    ...upstream.provider,
     api: 'openai-completions',
     models: [{
       id: modelId,
-      name: ms.model.name || 'Local Model',
+      name: upstream.modelName,
       reasoning: false,
       input: ['text'],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -2142,6 +2152,8 @@ export interface LookbackParams {
   sessionId: string
   repoRoot: string
   question: string
+  /** Turbo Link (ADR-376): the qualified id this session is pointed at, if any. */
+  model?: string
   signal?: AbortSignal
 }
 
@@ -2167,13 +2179,12 @@ export async function lookbackPreCompactionHistory(params: LookbackParams): Prom
   const run = d.db.getAgentRun(sessionId)
   if (!run?.compactionUpToMessageId) throw new Error('nothing_compacted')
 
-  const ms = d.manager.status()
-  if (ms.state !== 'running' || !ms.model) throw new Error('model_not_loaded')
-  const target = d.manager.target()
-  if (!target) throw new Error('model_not_loaded')
-  const engineKind = d.registry.active()?.kind ?? ''
-  const modelId = engineModelAlias(engineKind, d.manager.currentOpts()?.modelPath) ?? ms.model.key
-  const contextWindow = ms.model.ctx > 0 ? ms.model.ctx : 8192
+  // Same local-or-linked-host resolution the main turn does — a session compacting (or
+  // looking back over) history it generated on another machine must summarize it with THAT
+  // machine's model, not with whatever happens to be loaded here.
+  const upstream = resolveCodeUpstream(d, params.model)
+  const modelId = upstream.modelId
+  const contextWindow = upstream.contextWindow
 
   // Everything up to and including the cut, from the FULL (never-deactivated-by-compaction) DB
   // history — compaction only ever moves this cursor, it never deletes rows, so this is genuinely
@@ -2186,13 +2197,11 @@ export async function lookbackPreCompactionHistory(params: LookbackParams): Prom
   const authStorage = AuthStorage.inMemory()
   const modelRegistry = ModelRegistry.inMemory(authStorage)
   modelRegistry.registerProvider('local', {
-    baseUrl: `${target}/v1`,
-    apiKey: 'agent-key',
-    authHeader: true,
+    ...upstream.provider,
     api: 'openai-completions',
     models: [{
       id: modelId,
-      name: ms.model.name || 'Local Model',
+      name: upstream.modelName,
       reasoning: false,
       input: ['text'],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },

@@ -243,6 +243,40 @@ export function registerLinkAdminRoutes(
     return c.json({ models: d.remoteCatalog?.models() ?? [] })
   })
 
+  // ── Which machine this install is POINTED AT (ADR-382) ──────────────────────────────────
+  //
+  // The selection used to live in the web app's UI store alone, which meant a different
+  // process could not see it: `turbollm launch pi` with no --model auto-loaded a LOCAL model
+  // while the UI showed a linked machine selected, then spent 180 s failing to load it
+  // (founder-reported, 2026-08-23). Persisting it here makes one selection true for every
+  // surface — this browser, another device's browser, and the CLI.
+  //
+  // Validated on write, not on read: an id that names no online link with that model is
+  // refused NOW, with the router's own message, rather than being stored and silently
+  // failing at the user's first prompt. Reads still re-resolve (a link can go offline
+  // afterwards), so a stale value degrades to the local path instead of breaking.
+  app.put('/api/v1/links/selected-model', async (c) => {
+    const denied = gate(c, MANAGE)
+    if (denied) return denied
+    const body = await c.req.json().catch(() => null) as { model?: string | null } | null
+    const wanted = (body?.model ?? '').trim()
+    if (!wanted) {
+      // Clearing is always allowed — it is how the user comes back to their own machine, and
+      // it must work even when the link they were using has since disappeared.
+      d.store.update((cfg) => { cfg.selectedRemoteModel = '' })
+      return c.json({ ok: true, selectedRemoteModel: '' })
+    }
+    const route = d.modelRouter?.resolveRemoteTarget?.(wanted)
+    if (!route) {
+      return c.json({ error: { code: 'not_remote', message: `'${wanted}' does not name a model on a linked machine.` } }, 400)
+    }
+    if ('status' in route) {
+      return c.json({ error: { code: 'remote_unavailable', message: route.message } }, 503)
+    }
+    d.store.update((cfg) => { cfg.selectedRemoteModel = wanted })
+    return c.json({ ok: true, selectedRemoteModel: wanted })
+  })
+
   // ── Peer side: add / edit / remove a link.
   app.post('/api/v1/links', async (c) => {
     const denied = gate(c, MANAGE)

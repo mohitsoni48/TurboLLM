@@ -478,6 +478,19 @@ export interface Config {
    *  Absent in pre-this-feature configs → normalize seeds the default. */
   vramHeadroomMb: number
   lastLoaded: LastLoaded
+  /** Turbo Link (ADR-382): the qualified `<machine>/<model>` id the user last pointed this
+   *  install at, or '' for 'this machine's own engine'.
+   *
+   *  DAEMON-side deliberately, right next to lastLoaded, and for the same reason: the browser
+   *  is not the only surface that has to know. It first lived in the web app's UI store, which
+   *  made `turbollm launch <cli>` (a different process entirely) auto-load a LOCAL model while
+   *  the UI showed a linked machine selected — founder-reported, 2026-08-23. A selection every
+   *  surface must agree on is daemon state, not view state.
+   *
+   *  Never trusted blindly on read: a link that is offline (or no longer advertises that model)
+   *  resolves to nothing through ModelRouter, so a stale value degrades to the local path
+   *  rather than failing every request. */
+  selectedRemoteModel: string
   autoLoadOnStart: boolean
   hf: HF
   modelDefaults: ModelDefaults
@@ -630,6 +643,7 @@ export function defaultConfig(): Config {
     benchResults: {},
     vramHeadroomMb: VRAM_HEADROOM_DEFAULT_MB,
     lastLoaded: { modelKey: '', engineId: '' },
+    selectedRemoteModel: '',
     autoLoadOnStart: false,
     hf: { token: '' },
     modelDefaults: { ctx: 8192, ngl: 99, imageMaxTokens: 0, maxTokens: 0 },
@@ -795,6 +809,9 @@ function normalize(c: Config): void {
   // (treat absent as defaults; never throw on an old file).
   c.modelDefaults = { ...d.modelDefaults, ...(c.modelDefaults ?? {}) }
   c.lastLoaded = { ...d.lastLoaded, ...(c.lastLoaded ?? {}) }
+  // Absent in every config written before ADR-382 → '' (no remote selection), which is exactly
+  // the pre-Turbo-Link behaviour.
+  if (typeof c.selectedRemoteModel !== 'string') c.selectedRemoteModel = ''
   c.apiKeys ??= []
   c.links ??= []
   c.engines ??= []

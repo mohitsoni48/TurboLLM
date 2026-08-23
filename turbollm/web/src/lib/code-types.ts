@@ -135,6 +135,10 @@ export interface CodeSendMessageBody {
   /** Delivery mode when a run is already active — 'steer' redirects the live turn, 'followUp'
    *  (default) queues behind it. Omitted = 'followUp'. */
   kind?: SteerKind
+  /** Turbo Link (ADR-376): the qualified `<machine>/<model>` id this turn should generate on.
+   *  Sent ONLY when the picker selected a model on another machine; absent means 'whatever this
+   *  machine has loaded', which is every ordinary session. */
+  model?: string
 }
 
 /** POST .../messages response (202). `steered` is true ONLY when a 'steer' actually injected into

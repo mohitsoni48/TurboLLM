@@ -206,6 +206,10 @@ interface DaemonStatus {
   engine?: { state?: string; parallelSlots?: number }
   model?: { name?: string; key?: string; ctx?: number } | null
   lastLoaded?: { modelKey?: string } | null
+  /** Turbo Link (ADR-382): the qualified `<machine>/<model>` id the user pointed this install
+   *  at in the UI, or '' / absent for 'this machine'. Daemon state, so this process can see a
+   *  choice made in a browser. */
+  selectedRemoteModel?: string
 }
 
 // Claude Code CLI's own documented range for CLAUDE_CODE_AUTO_COMPACT_WINDOW (env-vars docs,
@@ -1288,6 +1292,17 @@ export async function launchCli(
       const refreshed = await fetchStatus(base, _fetch)
       if (refreshed) status = refreshed
     }
+  } else if (status?.selectedRemoteModel && (await fetchGatewayModelIds(base, _fetch)).includes(status.selectedRemoteModel)) {
+    // No --model, but the user has pointed this install at a linked machine's model (ADR-382).
+    // That choice wins over BOTH auto-loading a local model and reusing whatever happens to be
+    // running here: it is an explicit selection, and the founder-reported symptom was exactly
+    // this branch not existing — the UI showed a linked machine while this process spent 180 s
+    // failing to auto-load a local 27B nobody had asked for.
+    //
+    // Re-checked against the gateway's OWN advertised ids rather than trusted from config, so a
+    // link that went offline since the pick simply falls through to the local path below
+    // instead of pinning the CLI to a machine that cannot answer.
+    remoteModel = status.selectedRemoteModel
   } else if (!alreadyRunning) {
     // No --model and no model loaded: auto-load the last-used / first available model.
     const models = await fetchModels(base, _fetch)
@@ -1342,7 +1357,14 @@ export async function launchCli(
   // case no cap is set and the CLI keeps its own default, rather than inventing a limit of 1.
   const parallelSlots = status.engine?.parallelSlots
 
-  const modelNote = modelKey ? `model: ${model}` : `using loaded model: ${model}`
+  // "loaded" would be a lie for a model that is up on ANOTHER machine and was never loaded
+  // here — and it is precisely the case the user needs the banner to confirm, since nothing
+  // else on this box will show it.
+  const modelNote = modelKey
+    ? `model: ${model}`
+    : remoteModel
+      ? `using selected remote model: ${model}`
+      : `using loaded model: ${model}`
   process.stdout.write(`▸ Launching ${spec.label} → TurboLLM  (${modelNote}, ${base})\n`)
 
   // The whole library, for the harnesses whose model picker can only offer what we write into their

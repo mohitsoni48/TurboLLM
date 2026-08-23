@@ -103,6 +103,11 @@ interface PendingTurn {
   /** What the caller requested for this message — recorded even for a queued entry so the UI can
    *  distinguish a steer that fell back to the queue from a plain follow-up (see SteerKind). */
   kind: SteerKind
+  /** Turbo Link (ADR-376): the qualified `<machine>/<model>` id this turn should generate on,
+   *  or undefined for this machine's loaded model. Captured PER TURN (not per session) for the
+   *  same reason chat sends it per message: the picker can move between turns, and a queued
+   *  turn must run on the machine it was submitted for. */
+  model?: string
 }
 
 interface ActiveTurn {
@@ -202,10 +207,10 @@ export class CodeRunManager {
    *
    * `queued` is true when the turn had to wait (a run was already active), false when it started.
    */
-  enqueue(sessionId: string, params: { convId: string; repoRoot: string; task: string; userMsgId: string; thinkingBudget?: number; reasoningEffort?: ReasoningEffort; kind?: SteerKind }): { queued: boolean } {
+  enqueue(sessionId: string, params: { convId: string; repoRoot: string; task: string; userMsgId: string; thinkingBudget?: number; reasoningEffort?: ReasoningEffort; kind?: SteerKind; model?: string }): { queued: boolean } {
     const s = this.ensure(sessionId, params.convId, params.repoRoot)
     const willQueue = s.active !== null
-    s.queue.push({ task: params.task, userMsgId: params.userMsgId, thinkingBudget: params.thinkingBudget ?? -1, reasoningEffort: params.reasoningEffort, kind: params.kind ?? 'followUp' })
+    s.queue.push({ task: params.task, userMsgId: params.userMsgId, thinkingBudget: params.thinkingBudget ?? -1, reasoningEffort: params.reasoningEffort, kind: params.kind ?? 'followUp', model: params.model })
     this.emitQueue(sessionId)
     void this.pump(sessionId)
     return { queued: willQueue }
@@ -227,7 +232,7 @@ export class CodeRunManager {
    */
   async steer(
     sessionId: string,
-    params: { convId: string; repoRoot: string; task: string; userMsgId: string; thinkingBudget?: number; reasoningEffort?: ReasoningEffort },
+    params: { convId: string; repoRoot: string; task: string; userMsgId: string; thinkingBudget?: number; reasoningEffort?: ReasoningEffort; model?: string },
   ): Promise<{ steered: boolean; queued: boolean }> {
     const active = this.sessions.get(sessionId)?.active
     if (active?.steer) {
@@ -360,8 +365,10 @@ export class CodeRunManager {
     }
 
     try {
-      const ms = this.d.manager.status()
-      const model = ms.model
+      // What this turn's stats are LABELLED with. For a Turbo Link turn the local engine did not
+      // run the tokens, so the local loaded model (often none at all) is the wrong answer — the
+      // qualified id the turn was submitted for is the honest one.
+      const statsModelKey = turn.model ?? this.d.manager.status().model?.key
       // START mode is read fresh from the conversation (runCodeSession re-reads it per tool call
       // for the live ask-gate switch); a run that starts with no model loaded fails cleanly below.
       const mode = (this.d.db.getConversation(s.convId)?.agentMode ?? 'auto') as CodeMode
@@ -375,6 +382,7 @@ export class CodeRunManager {
         thinkingBudget: turn.thinkingBudget,
         reasoningEffort: turn.reasoningEffort,
         task: turn.task,
+        model: turn.model,
         signal: ac.signal,
         sink,
         // Publish/withdraw the live turn's steer handle so steer() can inject into THIS turn.
@@ -399,7 +407,7 @@ export class CodeRunManager {
         toolCalls,
         timeline,
         stats: {
-          ctxUsed: ctxStats.ctxUsed, ctxMax: ctxStats.ctxMax, model: model?.key, aborted: result.aborted,
+          ctxUsed: ctxStats.ctxUsed, ctxMax: ctxStats.ctxMax, model: statsModelKey, aborted: result.aborted,
           // Real per-turn token/timing stats (foldTurnUsage, code-session.ts) — omitted by
           // runCodeSession (not zeroed) when the engine returned no usable usage at all.
           promptTokens: result.promptTokens, genTokens: result.genTokens, cachedTokens: result.cachedTokens,

@@ -156,6 +156,11 @@ export type Status = {
    *  every status poll. Survives a FAILED load — `model` above is null then — which is
    *  what makes a one-click retry of the thing that just broke possible at all. */
   lastLoaded?: string
+  /** Turbo Link (ADR-382): the qualified `<machine>/<model>` id this INSTALL is pointed at,
+   *  or '' for this machine's own engine. Daemon-side so every surface agrees — this browser,
+   *  another device's browser, and `turbollm launch <cli>`, which has no access to any of
+   *  them. Absent from an older daemon, which is read as ''. */
+  selectedRemoteModel?: string
   engineStats?: EngineStats | null
   liveGeneration?: LiveGeneration | null
   bench: BenchState
