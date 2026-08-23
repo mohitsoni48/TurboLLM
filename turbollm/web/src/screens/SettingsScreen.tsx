@@ -687,9 +687,12 @@ export function SettingsScreen() {
               Issue #178: this screen now scrolls the DOCUMENT, so the bar sticks against the
               viewport rather than against `main`'s old inner scrollport — and on mobile a plain
               `bottom-0` would park it underneath MobileNav. `--tllm-mobile-nav-h` is that bar's
-              height below md while document-scrolling, and 0px everywhere else (index.css). */}
+              height below md while document-scrolling, and 0px everywhere else (index.css).
+              + var(--tllm-hw-bar-h): with the ADR-383 status bar mounted in the Shell, the
+              document's bottom edge now sits ABOVE that bar too — issue #178's exact failure
+              mode (a sticky bar parked under another bar) if this offset is not added. */}
           {dirty && (
-            <div className="sticky bottom-[var(--tllm-mobile-nav-h)] z-20 -mx-4 mt-2 flex items-center justify-between border-t border-border bg-panel px-4 py-3 md:-mx-6 md:px-6">
+            <div className="sticky bottom-[calc(var(--tllm-mobile-nav-h)+var(--tllm-hw-bar-h))] z-20 -mx-4 mt-2 flex items-center justify-between border-t border-border bg-panel px-4 py-3 md:-mx-6 md:px-6">
               <span className="text-[13px] text-muted">Unsaved changes</span>
               <Button onClick={() => { track('settings', 'save_settings'); handleSave() }} disabled={save.isPending || settingsQ.isLoading}>
                 <Save size={14} />

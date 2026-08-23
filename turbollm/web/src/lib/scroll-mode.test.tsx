@@ -111,7 +111,14 @@ describe('index.css scroll lock', () => {
   })
 
   it('offsets in-page sticky bars past MobileNav only below md AND while document-scrolling', () => {
-    expect(CSS).toMatch(/:root \{\s*--tllm-mobile-nav-h: 0px;\s*\}/)
-    expect(CSS).toMatch(/@media \(max-width: 767px\) \{\s*html\.tllm-doc-scroll \{\s*--tllm-mobile-nav-h: 3\.5rem;/)
+    // The invariants, not the block's exact shape: both inset vars are 0 by default, and
+    // mobile-nav gains its 3.5rem only inside the md-max media query under document-scrolling.
+    expect(CSS).toMatch(/:root\s*\{[^}]*--tllm-mobile-nav-h: 0px;[^}]*\}/)
+    expect(CSS).toMatch(/@media \(max-width: 767px\)[\s\S]*?html\.tllm-doc-scroll\s*\{[^}]*--tllm-mobile-nav-h: 3\.5rem;/)
+    // ADR-383: the hardware bar's own height defaults to 0 and is non-zero ONLY in the same
+    // single case (mobile + document-scrolling + bar on) - asserted here so a future edit
+    // cannot make the Settings save-bar overlap the bar.
+    expect(CSS).toMatch(/:root\s*\{[^}]*--tllm-hw-bar-h: 0px;[^}]*\}/)
+    expect(CSS).toMatch(/html\.tllm-doc-scroll\.tllm-hw-bar\s*\{[^}]*--tllm-hw-bar-h: 1\.5rem;/)
   })
 })
