@@ -93,3 +93,5 @@ Thumbs.db
 # Local-only agent/tooling scratch dirs — not product source
 /.agents/
 /wrapper/
+# Worktree node_modules junction helper (Windows-only dev convenience)
+/scripts/link-node-modules.ps1
