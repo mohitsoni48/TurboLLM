@@ -152,8 +152,8 @@ export function updateCodeSessionTitle(id: string, title: string): Promise<{ ok:
  *  future turns replay the summary instead of every raw message. Blocked (409) while a run is
  *  active. Rejects with code 'nothing_to_compact' (400) when history is already short enough
  *  that pi found nothing worth summarizing. */
-export function compactCodeSession(id: string, instructions?: string): Promise<{ ok: true; summary: string; upToMessageId: string; tokensBefore: number }> {
-  return req(`/api/v1/code/sessions/${encodeURIComponent(id)}/compact`, { method: 'POST', json: { instructions } })
+export function compactCodeSession(id: string, instructions?: string, model?: string): Promise<{ ok: true; summary: string; upToMessageId: string; tokensBefore: number }> {
+  return req(`/api/v1/code/sessions/${encodeURIComponent(id)}/compact`, { method: 'POST', json: { instructions, model } })
 }
 
 /** Start (or queue) a turn. Returns immediately — the run is owned by the daemon, NOT by this
@@ -178,6 +178,9 @@ export async function startCodeRun(
   contextFiles?: string[],
   kind?: SteerKind,
   reasoningEffort?: ReasoningEffort,
+  /** Turbo Link: the qualified `<machine>/<model>` id, when this session is pointed at another
+   *  machine. Omitted for an ordinary local session. */
+  model?: string,
 ): Promise<CodeSendMessageResponse> {
   const body: CodeSendMessageBody = {
     content: content || undefined,
@@ -186,6 +189,7 @@ export async function startCodeRun(
     thinkingBudget: thinkingBudget !== undefined && thinkingBudget !== -1 ? thinkingBudget : undefined,
     reasoningEffort: reasoningEffort !== undefined && reasoningEffort !== DEFAULT_REASONING_EFFORT ? reasoningEffort : undefined,
     kind,
+    model: model || undefined,
   }
   return req(`/api/v1/code/sessions/${encodeURIComponent(sessionId)}/messages`, { method: 'POST', json: body })
 }

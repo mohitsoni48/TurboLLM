@@ -9,6 +9,9 @@ import { useIsDesktop } from '../../lib/useIsDesktop'
 import { cn, formatDiff } from '../../lib/utils'
 import { ApiError, track } from '../../lib/api'
 import { useGitBranch, useModelActions, useModels, useStatus } from '../../lib/queries'
+import { useLinks, useRemoteModels } from '../../lib/link-queries'
+import { findRemoteChoice, selectModel } from '../../lib/remote-models'
+import { useUiStore } from '../../stores/ui'
 import { createCodeSession } from '../../lib/code-api'
 import { useCodeStats } from '../../lib/code-queries'
 import { useWorkspaceSidebarOpen } from '../../lib/workspace-sidebar'
@@ -158,13 +161,31 @@ export function CodeHomeScreen() {
     engineState === 'stopping'
   const [settingsKey, setSettingsKey] = useState<string | null>(null)
 
+  // Turbo Link (ADR-376): a session can be STARTED against a linked machine's model, which is
+  // the case a laptop with no GPU of its own cares about most. Shared with Chat and the session
+  // screen via the UI store, so the machine you picked stays picked across screens.
+  const linksQ = useLinks()
+  const remoteModelsQ = useRemoteModels()
+  const remoteModelId = useUiStore((s) => s.remoteModelId)
+  const setRemoteModelId = useUiStore((s) => s.setRemoteModelId)
+  const remoteChoice = remoteModelId
+    ? findRemoteChoice(remoteModelId, linksQ.data ?? [], remoteModelsQ.data ?? [])
+    : undefined
+  const activeRemoteId = remoteChoice?.id ?? null
+
   const handleLoadModel = (key: string) => {
+    // A remote id names another machine — a routing choice, never a local engine load.
+    const choice = selectModel(key, linksQ.data ?? [], remoteModelsQ.data ?? [])
+    if (choice.kind === 'remote') { setRemoteModelId(choice.id); return }
+    setRemoteModelId(null)
     modelActions.load.mutate(
-      { key },
+      { key: choice.key },
       { onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not load model.') },
     )
   }
   const handleEject = () => {
+    // Pointed at another machine, Eject means stop using it — not kill this box's engine.
+    if (activeRemoteId) { setRemoteModelId(null); return }
     modelActions.eject.mutate(undefined, {
       onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not eject model.'),
     })
@@ -270,14 +291,16 @@ export function CodeHomeScreen() {
       return
     }
     if (!repoPath) { toast.error('Choose a repository first.'); return }
-    if (!engineReady || !model) { toast.error('Load a model first.'); return }
+    // A remote model is already up on the other machine — there is nothing to load here, so the
+    // local engine's state must not gate starting the session.
+    if (!activeRemoteId && (!engineReady || !model)) { toast.error('Load a model first.'); return }
 
     setSubmitting(true)
     try {
       const { sessionId } = await createCodeSession({
         repoRoot: repoPath,
         repoBranch: repoBranch || undefined,
-        modelKey: model.key,
+        modelKey: activeRemoteId ?? model?.key,
         mode: mode.id,
         task,
         useWorktree,
@@ -461,8 +484,10 @@ export function CodeHomeScreen() {
           mode={mode}
           onModeChange={setMode}
           models={allModels}
-          loadedKey={model?.key ?? null}
-          loadedName={model?.name ?? null}
+          links={linksQ.data ?? []}
+          remoteModels={remoteModelsQ.data ?? []}
+          loadedKey={activeRemoteId ?? model?.key ?? null}
+          loadedName={remoteChoice ? `${remoteChoice.name} — ${remoteChoice.machine}` : (model?.name ?? null)}
           modelPending={modelBusy}
           ejecting={modelActions.eject.isPending}
           onLoadModel={handleLoadModel}
@@ -474,7 +499,7 @@ export function CodeHomeScreen() {
           onModelSettings={(key) => setSettingsKey(key)}
           ctxUsed={0}
           ctxMax={model?.ctx ?? 0}
-          sendDisabled={!input.trim() || !repoPath || !engineReady || submitting}
+          sendDisabled={!input.trim() || !repoPath || (!engineReady && !activeRemoteId) || submitting}
           onAddContext={() => setContextBrowserOpen(true)}
           contextFiles={contextFiles}
           onRemoveContextFile={(p) => setContextFiles((cf) => cf.filter((x) => x !== p))}

@@ -15,6 +15,8 @@ import { ReasoningEffortSelect, type ReasoningEffort } from '../../components/Re
 import { toast } from '../../components/ui/sonner'
 import { browseFs, track } from '../../lib/api'
 import type { ModelEntry } from '../../lib/types'
+import type { LinkRecord } from '../../lib/link-api'
+import type { RemoteModelRow } from '../../lib/remote-models'
 import { cn } from '../../lib/utils'
 import { CodeStatsFooter } from './CodeStatsFooter'
 import { ContextUsageRing } from './ContextUsageRing'
@@ -188,6 +190,11 @@ export interface CodeComposerProps {
   onModeChange: (m: AgentMode) => void
 
   models: ModelEntry[]
+  /** Turbo Link (ADR-376): linked machines and the models they advertise, passed straight to
+   *  ModelLoadMenu. Empty arrays on every install with no links — the picker then renders flat,
+   *  exactly as it did before Turbo Link existed. */
+  links?: LinkRecord[]
+  remoteModels?: RemoteModelRow[]
   loadedKey: string | null
   loadedName: string | null
   modelPending: boolean
@@ -271,7 +278,7 @@ export interface CodeComposerProps {
 export function CodeComposer({
   inputRef, value, onValueChange, onSubmit, placeholder, textareaDisabled,
   repo, repoRoot, repoBranch, mode, onModeChange,
-  models, loadedKey, loadedName, modelPending, ejecting, onLoadModel, onEjectModel, onModelSettings,
+  models, links, remoteModels, loadedKey, loadedName, modelPending, ejecting, onLoadModel, onEjectModel, onModelSettings,
   ctxUsed, ctxMax, live, onStop, sendDisabled,
   onAddContext, contextFiles, onRemoveContextFile, hintText, statusText, slashCommands = [],
   thinkingBudget, onThinkingBudgetChange, reasoningEffort, onReasoningEffortChange, onImagesChange, lastPromptTokens, lastGenTokens,
@@ -829,6 +836,8 @@ export function CodeComposer({
           )}
           <ModelLoadMenu
             models={models}
+            links={links}
+            remoteModels={remoteModels}
             loadedKey={loadedKey}
             loadedName={loadedName}
             pending={modelPending}

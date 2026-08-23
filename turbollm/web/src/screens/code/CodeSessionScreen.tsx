@@ -5,6 +5,9 @@ import { ArrowDown, Diff, Download, Eraser, FolderOpen, GitBranch, MoreHorizonta
 import { ApiError, track } from '../../lib/api'
 import { skillKeys, fetchSkills } from '../../lib/agent-api'
 import { useModelActions, useModels, useStatus } from '../../lib/queries'
+import { useLinks, useRemoteModels } from '../../lib/link-queries'
+import { findRemoteChoice, selectModel } from '../../lib/remote-models'
+import { useUiStore } from '../../stores/ui'
 import { compactCodeSession, execShellCommand, revertCodeSession, sendCodeQueuedTurnNow, startCodeRun, steerOutcomeMessage, stopCodeSession } from '../../lib/code-api'
 import type { CodeAgent, QueuedTurn, ShellRun, SteerKind } from '../../lib/code-types'
 import {
@@ -178,6 +181,22 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
     modelActions.eject.isPending ||
     engineState === 'starting' ||
     engineState === 'stopping'
+  // Turbo Link (ADR-376): models on linked machines, offered here exactly as they are in Chat.
+  // A long agentic run is where borrowing another box's GPU is worth the most, so Code listing
+  // only local models was the odd one out. Both queries fail soft — an install with no links
+  // renders precisely as before.
+  const linksQ = useLinks()
+  const remoteModelsQ = useRemoteModels()
+  // Shared with Chat (stores/ui.ts): the machine you picked is the machine you picked, whichever
+  // screen you picked it on. It also has to outlive this screen, which unmounts on navigation.
+  const remoteModelId = useUiStore((s) => s.remoteModelId)
+  const setRemoteModelId = useUiStore((s) => s.setRemoteModelId)
+  const remoteChoice = remoteModelId
+    ? findRemoteChoice(remoteModelId, linksQ.data ?? [], remoteModelsQ.data ?? [])
+    : undefined
+  // A selection whose machine went offline silently stops being one — same rule the catalog
+  // enforces server-side, and the turn route re-checks it anyway (503, by name).
+  const activeRemoteId = remoteChoice?.id ?? null
   const [settingsKey, setSettingsKey] = useState<string | null>(null)
   const [gitDialogOpen, setGitDialogOpen] = useState(false)
   // A non-'turbollm' agent (config.ts's code.defaultAgent, snapshotted onto the session at
@@ -204,6 +223,23 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
   // user had mistyped it by hand.
   const terminalViewRef = useRef<TerminalViewHandle>(null)
   const handleLoadModel = (key: string) => {
+    // Turbo Link: a remote row's id names ANOTHER machine and must never reach the local engine
+    // loader, which aborts every in-flight generation before it even looks the key up. Selecting
+    // one is a routing choice — nothing is loaded here, because it is already up over there.
+    // `selectModel` is the same unit-tested branch ChatScreen uses (lib/remote-models.ts).
+    const choice = selectModel(key, linksQ.data ?? [], remoteModelsQ.data ?? [])
+    if (choice.kind === 'remote') {
+      setRemoteModelId(choice.id)
+      if (isTerminalSession) {
+        // A terminal harness picks its model from inside its own TUI against the gateway's
+        // advertised ids; switching a LIVE one to a linked machine is a separate piece of work
+        // (each harness's own /model command), so say so rather than silently doing nothing.
+        toast.info(`Pointed at ${choice.machine}. New Code sessions use it; this terminal keeps its own model.`)
+      }
+      return
+    }
+    // Picking a local model is also how the user comes BACK from a remote machine.
+    setRemoteModelId(null)
     modelActions.load.mutate(
       { key },
       {
@@ -236,6 +272,9 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
     )
   }
   const handleEject = () => {
+    // Pointed at another machine, "Eject" means "stop using it" — this machine's engine is not
+    // what is serving these turns, and stopping it would be a surprising side effect.
+    if (activeRemoteId) { setRemoteModelId(null); return }
     // Ejecting kills the whole engine — stop this session's own daemon-owned run first (so it
     // doesn't fail mid-engine-call), mirroring ChatScreen's handleEject aborting live chat gen.
     if (effectiveSessionId) void stopCodeSession(effectiveSessionId).catch(() => {})
@@ -456,7 +495,7 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
       // new session — the state update from that effect hasn't applied yet, so the closure here
       // would still hold the PREVIOUS session's value. readThinkingBudget is a synchronous
       // localStorage read, immune to that ordering race.
-      void startCodeRun(effectiveSessionId, '', readThinkingBudget(effectiveSessionId), undefined, undefined, undefined, readReasoningEffort(effectiveSessionId))
+      void startCodeRun(effectiveSessionId, '', readThinkingBudget(effectiveSessionId), undefined, undefined, undefined, readReasoningEffort(effectiveSessionId), activeRemoteId ?? undefined)
         .then(() => { void qc.invalidateQueries({ queryKey: codeKeys.detail(effectiveSessionId) }); clientRef.current?.connect() })
         .catch((e) => { autoStartedRef.current = null; toast.error(e instanceof ApiError ? e.message : 'Could not start the run.') })
     }
@@ -519,7 +558,7 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
     setInput('')
     setManualCompacting(true)
     try {
-      const result = await compactCodeSession(effectiveSessionId, instructions)
+      const result = await compactCodeSession(effectiveSessionId, instructions, activeRemoteId ?? undefined)
       void qc.invalidateQueries({ queryKey: codeKeys.detail(effectiveSessionId) })
       toast.success(`Compacted — ${result.tokensBefore.toLocaleString()} tokens of history summarized.`)
     } catch (e) {
@@ -658,7 +697,7 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
     // run. Either way it's owned server-side, so a queued follow-up survives a disconnect. The
     // open stream reflects the result (a new `queue` frame, or the turn going live when it runs).
     try {
-      const res = await startCodeRun(effectiveSessionId, text, thinkingBudget, promptOverride, filesToSend, kind, reasoningEffort)
+      const res = await startCodeRun(effectiveSessionId, text, thinkingBudget, promptOverride, filesToSend, kind, reasoningEffort, activeRemoteId ?? undefined)
       // `steered` reports whether a steer actually injected into the live turn vs. was queued —
       // confirm the real outcome. followUp needs no toast: its queued card already shows inline.
       if (kind === 'steer') toast.success(steerOutcomeMessage(res.steered))
@@ -922,8 +961,10 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
             <TerminalToolbar
               agent={session.codeAgent}
               models={allModels}
-              loadedKey={model?.key ?? null}
-              loadedName={model?.name ?? null}
+              links={linksQ.data ?? []}
+              remoteModels={remoteModelsQ.data ?? []}
+              loadedKey={activeRemoteId ?? model?.key ?? null}
+              loadedName={remoteChoice ? `${remoteChoice.name} — ${remoteChoice.machine}` : (model?.name ?? null)}
               modelPending={modelBusy}
               ejecting={modelActions.eject.isPending}
               onLoadModel={handleLoadModel}
@@ -1055,8 +1096,10 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
                 mode={modeInfo}
                 onModeChange={handleModeChange}
                 models={allModels}
-                loadedKey={model?.key ?? null}
-                loadedName={model?.name ?? null}
+                links={linksQ.data ?? []}
+                remoteModels={remoteModelsQ.data ?? []}
+                loadedKey={activeRemoteId ?? model?.key ?? null}
+                loadedName={remoteChoice ? `${remoteChoice.name} — ${remoteChoice.machine}` : (model?.name ?? null)}
                 modelPending={modelBusy}
                 ejecting={modelActions.eject.isPending}
                 onLoadModel={handleLoadModel}

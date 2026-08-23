@@ -283,9 +283,13 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
    *  in-flight generation in every conversation before it does anything else, and then
    *  either 409s or loads a completely different local model.
    *
-   *  Component state, so it resets on reload — the daemon holds no per-conversation model
-   *  and inventing one here would be a schema decision this fix has no mandate for. */
-  const [remoteModelId, setRemoteModelId] = useState<string | null>(null)
+   *  Held in the UI store, NOT in `useState`: every screen is lazily routed and unmounts
+   *  on navigation, so component state made the pick silently revert to the local model as
+   *  soon as the user visited another screen and came back. Still not per-conversation —
+   *  the daemon holds no per-conversation model and inventing one would be a schema
+   *  decision this has no mandate for — but it now outlives the screen (and a reload). */
+  const remoteModelId = useUiStore((s) => s.remoteModelId)
+  const setRemoteModelId = useUiStore((s) => s.setRemoteModelId)
   const remoteChoice = remoteModelId
     ? findRemoteChoice(remoteModelId, linksQ.data ?? [], remoteModelsQ.data ?? [])
     : undefined

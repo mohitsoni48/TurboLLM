@@ -232,12 +232,57 @@ test('ADR-379: a dense model that comfortably fits one card still gets single-GP
   assert.equal(strats[0].splitMode, 'none', 'tried first -- the likely winner')
 })
 
-test('ADR-379: the 0.5 threshold is untouched, so GitHub #62 still gets its shot', () => {
-  // Guards against fixing the gate by raising the bar, which was tried and reverted: it
-  // rejected the reported 0.43 case but also rejected #62 at ~0.72, which must still be
-  // offered. The KV type is what separates them, not the threshold.
+test('ADR-379: GitHub #62 still gets its shot after ADR-384 raised the DENSE bar', () => {
+  // Originally guarded the flat 0.5 bar. ADR-384 raised the bar for DENSE models only, so what
+  // this now pins is that #62 clears the higher one too — it computes 0.875 (4 of 32 blocks on
+  // CPU), nowhere near the 0.5–0.6 band ADR-384 closes. Note ADR-379 estimated this case at
+  // ~0.72; the fixture actually computes 0.875. The KV type (ADR-379) still separates #62 from
+  // the 0.43 case; the bar is what separates it from the half-on-CPU case.
   const m = model({ sizeBytes: 15_000_000_000, blockCount: 32, nativeCtx: 8192 })
   const s16 = sys([16000, 16000])
   const strats = pickSplitStrategies(m, s16, base(s16, { ctx: 8192 }, m), caps)
   assert.equal(strats[0].splitMode, 'none')
+})
+
+// ---- ADR-384: a dense model may not be tried single-GPU with half its layers on CPU --------
+// Ground truth pulled live off the Kaggle 2x T4 box: Qwen3.8-27B UD-Q4_K_XL, dense, 65 blocks,
+// 17,923,394,624 bytes, headCountKv 4, headDim 256, nativeCtx 262144.
+//
+// ADR-379 fixed the KV type the gate judges with, which correctly closed the deep end (ctx 188k+
+// computes 0.000). It left a band open in the middle: at ctx 32768/q8_0 the gate computes 0.523,
+// clears the flat 0.5 bar, and opens a single-GPU branch that parks 31 of 65 DENSE layers on the
+// CPU. Every one of those layers is touched on every token, so it cannot beat a layer-split that
+// holds the whole model — it just costs a bench slot (up to the 10-minute timeout) to prove it.
+// This is the band ADR-381 saw as "the branch that actually burns budget is single-GPU".
+
+const QWEN38_REAL = {
+  sizeBytes: 17_923_394_624, arch: 'qwen35', quant: 'Q4_K_XL', nativeCtx: 262144,
+  blockCount: 65, headCountKv: 4, headDim: 256, moe: false, nextnLayers: 1,
+} as Partial<ModelEntry>
+
+test('ADR-384: a dense model with ~half its layers on CPU is NOT offered single-GPU', () => {
+  const m = model(QWEN38_REAL)
+  const p = base(T4x2_REAL, { ctx: 32768, ngl: 99, kvTypeK: 'q8_0', kvTypeV: 'q8_0' }, m)
+  const strats = pickSplitStrategies(m, T4x2_REAL, p, caps)
+  assert.ok(!strats.some((g) => g.splitMode === 'none'), 'single-GPU must not be offered at 0.523')
+})
+
+test('ADR-384: the same model at a shallower ctx keeps its single-GPU shot', () => {
+  // ctx 8192 computes 0.708 — only 19 of 65 blocks on CPU. This is the shape GitHub #62 is about,
+  // and it must survive the higher bar, so the fix cannot just be "skip whenever it needs CPU".
+  const m = model(QWEN38_REAL)
+  const p = base(T4x2_REAL, { ctx: 8192, ngl: 99, kvTypeK: 'q8_0', kvTypeV: 'q8_0' }, m)
+  assert.equal(pickSplitStrategies(m, T4x2_REAL, p, caps)[0].splitMode, 'none')
+})
+
+test('ADR-384: MoE is untouched — partial residency is cheap when experts are idle', () => {
+  // 20 GB MoE at ctx 8192 computes 0.550 — inside the band the dense bar now rejects. It must
+  // still be offered: an offloaded expert is only read when the router picks it, so half a MoE
+  // on CPU is nothing like half a dense model on CPU. The bar is dense-only for that reason.
+  const m = model({ sizeBytes: 20_000_000_000, blockCount: 40, moe: true, expertCount: 128, arch: 'qwen3moe' })
+  const p = base(T4x2_REAL, { ctx: 8192, ngl: 99 }, m)
+  assert.ok(
+    pickSplitStrategies(m, T4x2_REAL, p, caps).some((g) => g.splitMode === 'none'),
+    'MoE single-GPU must still be offered inside the 0.5–0.6 band',
+  )
 })

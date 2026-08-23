@@ -129,6 +129,11 @@ export function registerApi(app: Hono, d: Deps): void {
       // Last model the user loaded (config-tracked) — lets `turbollm launch` auto-load the
       // true last-used model instead of guessing the first library entry (F-034).
       lastLoaded: d.store.snapshot().lastLoaded,
+      // Turbo Link (ADR-382): the linked-machine model this install is pointed at, or '' for
+      // local. On /status because every surface reads it here — the web app hydrates its picker
+      // from it, and `turbollm launch <cli>` (which has no access to browser state) uses it
+      // instead of auto-loading a local model the user did not ask for.
+      selectedRemoteModel: d.store.snapshot().selectedRemoteModel ?? '',
       engineStats: core.engineStats,
       liveGeneration: core.liveGeneration,
       // Auto-tune runner state (spec 09 §1): real progress while a sweep runs, then

@@ -54,14 +54,16 @@ function makeFetch(
   gatewayIds: string[],
   hits: Hits,
   engineState: 'running' | 'idle' = 'idle',
+  /** ADR-382: what the UI has this install pointed at, as /status reports it. */
+  selectedRemoteModel = '',
 ): typeof fetch {
   const fn = async (input: string | URL | globalThis.Request): Promise<Response> => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
 
     if (url.includes('/api/v1/status')) {
       const body = engineState === 'running'
-        ? { engine: { state: 'running' }, model: { key: LOCAL[0].key, name: LOCAL[0].name } }
-        : { engine: { state: 'idle' }, model: null }
+        ? { engine: { state: 'running' }, model: { key: LOCAL[0].key, name: LOCAL[0].name }, selectedRemoteModel }
+        : { engine: { state: 'idle' }, model: null, selectedRemoteModel }
       return { ok: true, status: 200, json: async () => body } as Response
     }
     if (url.includes('/api/v1/models')) {
@@ -149,6 +151,72 @@ test('a LOCAL key containing a slash still resolves locally, unchanged', async (
     assert.equal(code, 0)
     assert.equal(calls[0].env['ANTHROPIC_MODEL'], 'unsloth/Qwen3-GGUF')
     assert.equal(hits.engineStart, 0, 'already loaded — no reload')
+  } finally {
+    out.restore()
+  }
+})
+
+// ── ADR-382: no --model, but the UI has this install pointed at a linked machine ─────────
+//
+// The founder-reported symptom, verbatim: `turbollm launch pi` printed
+// "Auto-loading model qwen3.8-27b…", gave up after 180 s, and crashed — while the UI showed a
+// cloud model selected and ready. The selection lived only in the browser, so this process
+// never saw it. It is daemon state now (/status's selectedRemoteModel), and these tests fail
+// if the CLI ever goes back to guessing a local model instead of reading it.
+
+test('no --model: the daemon-side remote selection is used, and NOTHING is loaded locally', async () => {
+  const { calls, fn } = makeSpawn()
+  const hits: Hits = { engineStart: 0, gatewayModels: 0 }
+  const out = silenceOutput()
+  try {
+    const code = await launchCli(
+      'claude', 6996, [], fn,
+      undefined,
+      makeFetch(['qwen3-8b', 'workstation/Qwen3-35B'], hits, 'idle', 'workstation/Qwen3-35B'),
+    )
+    assert.equal(code, 0)
+    assert.equal(calls[0].env['ANTHROPIC_MODEL'], 'workstation/Qwen3-35B')
+    // THE bug: this used to be 1 — a 180-second local load nobody asked for.
+    assert.equal(hits.engineStart, 0, 'a remote selection must never trigger a local auto-load')
+  } finally {
+    out.restore()
+  }
+})
+
+test('the remote selection wins over a model that happens to be loaded locally', async () => {
+  // It is an explicit user choice; reusing whatever this box has running would silently ignore
+  // it, which is the same class of bug as auto-loading something else.
+  const { calls, fn } = makeSpawn()
+  const hits: Hits = { engineStart: 0, gatewayModels: 0 }
+  const out = silenceOutput()
+  try {
+    const code = await launchCli(
+      'claude', 6996, [], fn,
+      undefined,
+      makeFetch(['qwen3-8b', 'workstation/Qwen3-35B'], hits, 'running', 'workstation/Qwen3-35B'),
+    )
+    assert.equal(code, 0)
+    assert.equal(calls[0].env['ANTHROPIC_MODEL'], 'workstation/Qwen3-35B')
+    assert.equal(hits.engineStart, 0)
+  } finally {
+    out.restore()
+  }
+})
+
+test('a STALE selection (its machine went offline) falls back to the local path', async () => {
+  // Re-validated against what the gateway advertises RIGHT NOW rather than trusted from
+  // config — otherwise a link that dropped would pin the CLI to a machine that cannot answer.
+  const { calls, fn } = makeSpawn()
+  const hits: Hits = { engineStart: 0, gatewayModels: 0 }
+  const out = silenceOutput()
+  try {
+    const code = await launchCli(
+      'claude', 6996, [], fn,
+      undefined,
+      makeFetch(['qwen3-8b'], hits, 'running', 'workstation/Qwen3-35B'),
+    )
+    assert.equal(code, 0)
+    assert.equal(calls[0].env['ANTHROPIC_MODEL'], 'qwen3-8b', 'falls back to the loaded local model')
   } finally {
     out.restore()
   }

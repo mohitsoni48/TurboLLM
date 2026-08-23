@@ -34,7 +34,10 @@ import { agentsMdPresence } from './persona'
 import type { CodeMode } from './persona'
 import { sessionAuth } from './session-auth'
 
-type S = 200 | 201 | 202 | 400 | 404 | 409 | 500
+// 503 is Turbo Link's (ADR-376): a linked machine that went offline between the picker
+// listing it and this turn being submitted. Deliberately not 409 — nothing about THIS
+// machine's state is wrong, and the fix is on the other box.
+type S = 200 | 201 | 202 | 400 | 404 | 409 | 500 | 503
 function err(c: Context, s: S, code: string, msg: string) { return c.json({ error: { code, message: msg } }, s) }
 async function body<T>(c: Context): Promise<T> { try { return await c.req.json() as T } catch { return {} as T } }
 
@@ -483,13 +486,22 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     if (!run.repoRoot) return err(c, 400, 'invalid_input', 'Session has no repo root.')
     if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop or wait for the current run before compacting.')
     if (run.clearedUpToMessageId) return err(c, 409, 'session_cleared', 'Resume this session before compacting — compacting a cleared session would lose the hidden history.')
-    const ms = d.manager.status()
-    if (ms.state !== 'running' || !ms.model) return err(c, 409, 'model_not_loaded', 'Load a model first.')
-    const b = await body<{ instructions?: string }>(c)
+    const b = await body<{ instructions?: string; model?: string }>(c)
+    // Same Turbo Link branch as the turn route: a session whose history was generated on a
+    // linked machine is compacted BY that machine, so this machine's engine state is not what
+    // decides whether compaction can run.
+    const requestedModel = (b.model ?? '').trim() || undefined
+    const remoteRoute = requestedModel ? d.modelRouter.resolveRemoteTarget(requestedModel) : undefined
+    if (remoteRoute && 'status' in remoteRoute) return err(c, 503, 'remote_unavailable', remoteRoute.message)
+    if (!remoteRoute) {
+      const ms = d.manager.status()
+      if (ms.state !== 'running' || !ms.model) return err(c, 409, 'model_not_loaded', 'Load a model first.')
+    }
     try {
       const result = await compactCodeSession({
         d, convId: run.convId, sessionId: id, repoRoot: agentCwd(run),
         customInstructions: b.instructions?.trim() || undefined,
+        model: requestedModel,
       })
       return c.json({ ok: true, ...result })
     } catch (e) {
@@ -784,7 +796,7 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
   // that is how a follow-up submitted mid-run survives a disconnect and still fires in order.
   app.post('/api/v1/code/sessions/:id/messages', async (c) => {
     const id = c.req.param('id')
-    const b = await body<{ content?: string; promptOverride?: string; contextFiles?: string[]; thinkingBudget?: number; reasoningEffort?: string; kind?: string }>(c)
+    const b = await body<{ content?: string; promptOverride?: string; contextFiles?: string[]; thinkingBudget?: number; reasoningEffort?: string; kind?: string; model?: string }>(c)
     // How to deliver this message when a run is already active (Phase 1, ADR-246): 'steer'
     // redirects the CURRENTLY ACTIVE turn, 'followUp' queues a fresh turn behind it. Anything
     // else — including the field being omitted by the not-yet-updated frontend — defaults to
@@ -797,12 +809,23 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     if (!conv) return err(c, 404, 'not_found', 'Session conversation not found.')
     if (!run.repoRoot) return err(c, 400, 'invalid_input', 'Session has no repo root.')
 
-    // Fail fast with a clear message if there is no engine to run against right now. (A turn
+    // Fail fast with a clear message if there is nothing to run against right now. (A turn
     // that queues while a model is loaded but is then unloaded before it runs fails cleanly
     // inside the run instead — see code-run-manager.ts's turn executor.)
-    const ms = d.manager.status()
-    if (ms.state !== 'running' || !ms.model) return err(c, 409, 'model_not_loaded', 'Load a model first.')
-    if (!d.manager.target()) return err(c, 409, 'model_not_loaded', 'Engine not running.')
+    //
+    // Turbo Link (ADR-376): a turn pointed at a linked machine must NOT be judged by this
+    // machine's engine — the whole point is a box with no GPU of its own driving one that has
+    // it, where 'Load a model first' would refuse the only configuration the feature exists to
+    // serve. `resolveRemoteTarget` is the router's own resolution (never an `includes('/')`
+    // test), so a local key carrying its own slash still takes the local path below.
+    const requestedModel = (b.model ?? '').trim() || undefined
+    const remoteRoute = requestedModel ? d.modelRouter.resolveRemoteTarget(requestedModel) : undefined
+    if (remoteRoute && 'status' in remoteRoute) return err(c, 503, 'remote_unavailable', remoteRoute.message)
+    if (!remoteRoute) {
+      const ms = d.manager.status()
+      if (ms.state !== 'running' || !ms.model) return err(c, 409, 'model_not_loaded', 'Load a model first.')
+      if (!d.manager.target()) return err(c, 409, 'model_not_loaded', 'Engine not running.')
+    }
 
     // The task for this turn: an explicit message body wins; otherwise the last user message
     // (the seeded task on the first run).
@@ -835,7 +858,7 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     // commits silently did nothing while the repo went dirty. (The site fixed first was /compact —
     // a different one.) Caught by the pre-release review gate, which is why worktrees were cut
     // from v1.9.6 rather than shipped half-wired.
-    const enqueueParams = { convId: run.convId, repoRoot: agentCwd(run), task, userMsgId, thinkingBudget: b.thinkingBudget, reasoningEffort: parseReasoningEffort(b.reasoningEffort) }
+    const enqueueParams = { convId: run.convId, repoRoot: agentCwd(run), task, userMsgId, thinkingBudget: b.thinkingBudget, reasoningEffort: parseReasoningEffort(b.reasoningEffort), model: requestedModel }
     if (kind === 'steer') {
       const { steered, queued } = await runs.steer(id, enqueueParams)
       return c.json({ ok: true, queued, steered, userMessageId: userMsgId }, 202)

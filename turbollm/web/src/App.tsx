@@ -12,6 +12,7 @@ import { Shell } from './components/Shell'
 import { UnreachableOverlay } from './components/UnreachableOverlay'
 import { AuthGate } from './components/AuthGate'
 import { useStatus, useSettings, useDownloads } from './lib/queries'
+import { useUiStore } from './stores/ui'
 import { useOnboardingState } from './lib/onboarding-queries'
 import { ApiError, setAuthToken } from './lib/api'
 import { subscribeCodeAuthNeeded, isCodeAuthNeeded } from './lib/auth-signal'
@@ -124,6 +125,17 @@ function useResumeOnboardingAfterDiscoverDownload(shouldOnboard: boolean) {
 
 export function App() {
   const statusQ = useStatus()
+  // Turbo Link (ADR-382): the daemon owns which machine this install is pointed at, so mirror
+  // its value into the UI store on every status poll. Mounted HERE, once for the app's lifetime,
+  // because the screens that read the selection unmount on navigation — hydrating in one of them
+  // would make the value depend on which screen you happened to open first. The store ignores
+  // this while a pick of its own is in flight.
+  const syncRemoteModelId = useUiStore((s) => s.syncRemoteModelId)
+  const daemonRemoteModel = statusQ.data?.selectedRemoteModel
+  useEffect(() => {
+    if (daemonRemoteModel === undefined) return // older daemon / not loaded yet — leave the cache alone
+    syncRemoteModelId(daemonRemoteModel || null)
+  }, [daemonRemoteModel, syncRemoteModelId])
   const qc = useQueryClient()
   const onboardingQ = useOnboardingState()
   const shouldOnboard =
