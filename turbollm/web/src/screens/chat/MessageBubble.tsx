@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -561,6 +561,74 @@ export function StreamingBubble({
   )
 }
 
+// ── Edit textarea ─────────────────────────────────────────────────────────────
+
+// Editing a message used to drop it into a fixed 3/4-row box, so anything longer than a
+// few lines collapsed into a small scrolling window and you lost sight of the text you
+// came to edit. This grows to the FULL content height on open (and keeps tracking it as
+// you type), so the edit box is the same size as the message it replaces. `max-h-[60vh]`
+// is the only cap — a very long message scrolls internally rather than pushing the Save
+// buttons off screen. Resetting to 'auto' before reading scrollHeight is what lets it
+// shrink again after a deletion, not just grow.
+function EditTextarea({
+  value,
+  onChange,
+  onSave,
+  onCancel,
+  minRows,
+}: {
+  value: string
+  onChange: (v: string) => void
+  onSave: () => void
+  onCancel: () => void
+  minRows: number
+}) {
+  const ref = useRef<HTMLTextAreaElement>(null)
+  const fit = useCallback(() => {
+    const el = ref.current
+    if (!el) return
+    el.style.height = 'auto'
+    // `+ (offsetHeight - clientHeight)` is the 1px top/bottom border: box-sizing is border-box
+    // here, so a plain scrollHeight leaves the box 2px short of its own content and the
+    // textarea scrolls by a hairline even when everything fits.
+    el.style.height = `${el.scrollHeight + (el.offsetHeight - el.clientHeight)}px`
+  }, [])
+  useLayoutEffect(fit, [value, fit])
+
+  // The height above is a pixel value measured at ONE width, so it goes stale the moment the
+  // column resizes and the text re-wraps: the conversation sidebar is collapsible AND
+  // drag-resizable, and dragging it while an edit box is open used to leave the box at its old
+  // height with a scrollbar back inside it until the next keystroke. Re-measure on width
+  // changes only — reacting to the height changes we just made ourselves would loop.
+  useEffect(() => {
+    const el = ref.current
+    if (!el || typeof ResizeObserver === 'undefined') return
+    let lastWidth = el.clientWidth
+    const ro = new ResizeObserver(() => {
+      const cur = ref.current
+      if (!cur || cur.clientWidth === lastWidth) return
+      lastWidth = cur.clientWidth
+      fit()
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [fit])
+  return (
+    <textarea
+      ref={ref}
+      autoFocus
+      className="w-full resize-none overflow-y-auto max-h-[60vh] rounded-[var(--radius-lg)] border border-accent bg-panel px-4 py-2.5 text-[15px] leading-[1.6] text-ink outline-none"
+      rows={minRows}
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      onKeyDown={(e) => {
+        if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); onSave() }
+        if (e.key === 'Escape') onCancel()
+      }}
+    />
+  )
+}
+
 // ── Completed message bubble ──────────────────────────────────────────────────
 
 /** PURE (GitHub #177) — is this bubble a placeholder row the daemon is STILL writing into?
@@ -638,16 +706,12 @@ export function MessageBubble({
             // single-sentence message doesn't stretch absurdly wide on an ultrawide
             // monitor. Kept in sync with the non-editing bubble below — same value.
             <div className="w-full max-w-[min(88%,900px)]">
-              <textarea
-                autoFocus
-                className="w-full resize-none rounded-[var(--radius-lg)] border border-accent bg-panel px-4 py-2.5 text-[15px] leading-[1.6] text-ink outline-none"
-                rows={3}
+              <EditTextarea
                 value={editDraft}
-                onChange={(e) => setEditDraft(e.target.value)}
-                onKeyDown={(e) => {
-                  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); onEditSave(editDraft) }
-                  if (e.key === 'Escape') onEditCancel()
-                }}
+                onChange={setEditDraft}
+                onSave={() => onEditSave(editDraft)}
+                onCancel={onEditCancel}
+                minRows={1}
               />
               <div className="mt-1.5 flex gap-1.5 justify-end">
                 <Button size="sm" variant="ghost" onClick={() => { track('chat', 'cancel_edit_message'); onEditCancel() }}>Cancel</Button>
@@ -729,16 +793,12 @@ export function MessageBubble({
       <ToolCallsPanel calls={completedToolCalls} />
       {isEditing ? (
         <div className="w-full">
-          <textarea
-            autoFocus
-            className="w-full resize-none rounded-[var(--radius-lg)] border border-accent bg-panel px-4 py-2.5 text-[15px] leading-[1.6] text-ink outline-none"
-            rows={4}
+          <EditTextarea
             value={editDraft}
-            onChange={(e) => setEditDraft(e.target.value)}
-            onKeyDown={(e) => {
-              if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); onEditSave(editDraft) }
-              if (e.key === 'Escape') onEditCancel()
-            }}
+            onChange={setEditDraft}
+            onSave={() => onEditSave(editDraft)}
+            onCancel={onEditCancel}
+            minRows={2}
           />
           <div className="mt-1.5 flex gap-1.5">
             <Button size="sm" variant="ghost" onClick={() => { track('chat', 'cancel_edit_message'); onEditCancel() }}>Cancel</Button>
