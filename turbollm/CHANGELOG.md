@@ -65,10 +65,6 @@ _Nothing yet._
   message, because the streaming parser holds back up to 29 characters it has not yet decided
   about and that tail was never released on an interrupt; and a reply still being generated
   rendered as a red error in the chat until it finished. (#177)
-- **A first turn on a linked code session could use the wrong model.** The code agent resolves its
-  model from the linked machine's state at session start, and an earlier version could fall back to
-  the local machine's model when the linked pick hadn't settled. The link state is now queried
-  before the session picks a model. (#194)
 - **Auto-tune reported "No candidate completed successfully" on every integrated GPU.** On an
   APU — an AMD/Intel iGPU, Apple Silicon, an ARM SoC — the GPU and the CPU share one physical
   pool of memory, so the "the GPU has been pushed out into system RAM" check that tells auto-tune
@@ -80,7 +76,7 @@ _Nothing yet._
 - **The single-GPU gate in auto-tune judged a KV type the run would never use.** The bench
   probe evaluated a KV cache type that the model would never actually request, so a machine with a
   capable card could still get rejected. The probe now only tests the KV types the model
-  configuration actually uses. (#194)
+  configuration actually uses. (#191)
 - **A dense model with half its layers on CPU is not worth a single-GPU probe.** A benchmark
   probe that placed only some layers on the GPU — the rest on CPU — would falsely suggest a
   smaller model should be loaded on a dedicated card. The probe now requires all layers on the GPU
@@ -113,7 +109,6 @@ _Nothing yet._
 - Fixed: dual-GPU box was read as a single card and sized for one GPU.
 - Fixed: first-run setup could recommend a model too big for an iGPU-only machine, because it counted the shared VRAM and the system RAM it comes out of as two separate pools.
 - Fixed: switching to another browser tab mid-reply could lose the whole generation — the daemon kept generating but the reply was never saved. It's saved now, whatever the tab does.
-- Fixed: a first turn on a linked code session could use the wrong model.
 - Fixed: on an integrated GPU (AMD/Intel APUs, Apple Silicon), auto-tune rejected every candidate and finished with "No candidate completed successfully". It was reading normal shared-memory use as the GPU overflowing — which can't happen when the GPU and CPU share one pool.
 - Fixed: the single-GPU gate was judging a KV type the model would never use, and a dense model with half layers on CPU was falsely reported as worthwhile for a single-GPU setup.
 - Fixed: the Models library scrolls the page properly instead of being stuck in a little box of its own.
