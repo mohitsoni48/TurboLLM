@@ -162,10 +162,18 @@ html:not(.tllm-doc-scroll) #root {
    without the other leaves a gap or an overlap. */
 :root {
   --tllm-mobile-nav-h: 0px;
+  /* Height of the hardware status bar (ADR-383) that a sticky in-page bar must clear. 0px
+     unless the bar is actually shown AND the document is scrolling under MobileNav - the same
+     single case that gives --tllm-mobile-nav-h its 3.5rem. HardwareBar toggles the tllm-hw-bar
+     class on <html> for its lifetime, exactly like Shell does for tllm-doc-scroll. */
+  --tllm-hw-bar-h: 0px;
 }
 @media (max-width: 767px) {
   html.tllm-doc-scroll {
     --tllm-mobile-nav-h: 3.5rem;
+  }
+  html.tllm-doc-scroll.tllm-hw-bar {
+    --tllm-hw-bar-h: 1.5rem;
   }
 }
 

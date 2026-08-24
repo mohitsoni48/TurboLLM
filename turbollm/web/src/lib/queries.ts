@@ -18,6 +18,7 @@ import {
   getConnect,
   getEngineBackends,
   getGitBranch,
+  getHwStats,
   getModelDetail,
   getModelDirs,
   getModels,
@@ -127,6 +128,7 @@ import type {
   HfRepoDetail,
   HfSearchResult,
   HfSortOption,
+  HwUsage,
   LoadProfile,
   ModelDetail,
   ModelDirs,
@@ -152,6 +154,7 @@ export const queryKeys = {
   downloads: ['downloads'] as const,
   agentAvailability: ['agent-availability'] as const,
   tokenUsage: (range: TokenUsageRange) => ['token-usage', range] as const,
+  hwStats: ['hwstats'] as const,
 }
 
 /** Which terminal-agent CLIs are installed. Refetched on window focus so installing one in a
@@ -182,6 +185,33 @@ export function useStatus(): UseQueryResult<Status> {
         : 2000,
     refetchIntervalInBackground: false,
     // Keep the prior value visible while a poll is in flight to avoid flicker.
+    placeholderData: (prev) => prev,
+    retry: false,
+  })
+}
+
+/** Live hardware usage (ADR-383). Polls only while `enabled` — which HardwareBar ties to
+ *  the store's `hwBar` toggle and its own mountedness — so a user who turns the monitor off
+ *  costs the daemon nothing (the sampler idle-stops 6 s after the last subscriber leaves).
+ *  Cadence mirrors useStatus: 1 s while work is actively running (a generation, an auto-tune
+ *  sweep, or an engine build — the moments the numbers matter most), 2 s otherwise.
+ *  `placeholderData` keeps the last sample on screen while a poll is in flight, so the bar
+ *  never flickers back to placeholders. */
+export function useHwUsage(enabled: boolean): UseQueryResult<HwUsage> {
+  const qc = useQueryClient()
+  return useQuery({
+    queryKey: queryKeys.hwStats,
+    queryFn: getHwStats,
+    enabled,
+    refetchInterval: () => {
+      const s = qc.getQueryData<Status>(queryKeys.status)
+      return s?.bench?.running ||
+        s?.engineBuild?.active ||
+        (s?.engineStats?.activeRequests ?? 0) > 0
+        ? 1000
+        : 2000
+    },
+    refetchIntervalInBackground: false,
     placeholderData: (prev) => prev,
     retry: false,
   })

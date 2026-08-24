@@ -15,7 +15,6 @@ import {
   useNetworkInfo,
   useSettings,
   useStatus,
-  useSysInfo,
   useTelemetryPreview,
   useTelemetryLog,
   useRegenerateMachineId,
@@ -29,6 +28,7 @@ import { CodeAgentSection } from './settings/CodeAgentSection'
 import { MemorySection } from './settings/MemorySection'
 import { ExperimentalSection } from './settings/ExperimentalSection'
 import { TurboLinkSection } from './settings/TurboLinkSection'
+import { HardwareSection } from './settings/HardwareSection'
 
 import { ApiError, track, type TelemetryLevel } from '../lib/api'
 import { TELEMETRY_UI_ENABLED } from '../lib/flags'
@@ -143,7 +143,7 @@ function Slider({ label, hint, value, min, max, step, onChange, fmt }: {
 export function SettingsScreen() {
   // Issue #178: a long, plain list screen — the window scrolls it, not an inner box.
   useDocumentScroll()
-  const { theme, setTheme, fontSize, setFontSize } = useUiStore()
+  const { theme, setTheme, fontSize, setFontSize, hwBar, setHwBar } = useUiStore()
   const { query: settingsQ, save } = useSettings()
   const settings = settingsQ.data
   const modelDirsQ = useModelDirs()
@@ -400,6 +400,23 @@ export function SettingsScreen() {
                     type="checkbox"
                     checked={confirmDelete}
                     onChange={(e) => setConfirmDelete(e.target.checked)}
+                    className="h-4 w-4 accent-[var(--accent)]"
+                  />
+                </label>
+
+                {/* Show hardware monitor (ADR-383): persisted client-side (tllm.hwBar), ON by
+                    default. The Shell's bar self-gates on it, and the daemon's sampler
+                    idle-stops 6 s after the last subscriber leaves - so turning this off costs
+                    the box nothing. */}
+                <label className="flex cursor-pointer items-center justify-between border-t border-border py-2 pt-3">
+                  <div>
+                    <div className="text-[14px] font-medium text-ink">Show hardware monitor</div>
+                    <div className="text-[12px] text-muted">Show live CPU, RAM and GPU/VRAM usage in a bar on every screen. Live detail is in the System section below.</div>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={hwBar}
+                    onChange={(e) => setHwBar(e.target.checked)}
                     className="h-4 w-4 accent-[var(--accent)]"
                   />
                 </label>
@@ -665,8 +682,8 @@ export function SettingsScreen() {
 
           {activeCat === 'system' && (
             <>
-              {/* Hardware */}
-              <HardwarePanel />
+              {/* Hardware: static specs + live gauges with ~60 s sparklines (ADR-383). */}
+              <HardwareSection />
 
               {/* Privacy & telemetry (spec 09 §5) — hidden for MVP launch (ADR-041);
                   no telemetry uploader ships yet. Re-enable via flags.ts when it does. */}
@@ -687,9 +704,12 @@ export function SettingsScreen() {
               Issue #178: this screen now scrolls the DOCUMENT, so the bar sticks against the
               viewport rather than against `main`'s old inner scrollport — and on mobile a plain
               `bottom-0` would park it underneath MobileNav. `--tllm-mobile-nav-h` is that bar's
-              height below md while document-scrolling, and 0px everywhere else (index.css). */}
+              height below md while document-scrolling, and 0px everywhere else (index.css).
+              + var(--tllm-hw-bar-h): with the ADR-383 status bar mounted in the Shell, the
+              document's bottom edge now sits ABOVE that bar too — issue #178's exact failure
+              mode (a sticky bar parked under another bar) if this offset is not added. */}
           {dirty && (
-            <div className="sticky bottom-[var(--tllm-mobile-nav-h)] z-20 -mx-4 mt-2 flex items-center justify-between border-t border-border bg-panel px-4 py-3 md:-mx-6 md:px-6">
+            <div className="sticky bottom-[calc(var(--tllm-mobile-nav-h)+var(--tllm-hw-bar-h))] z-20 -mx-4 mt-2 flex items-center justify-between border-t border-border bg-panel px-4 py-3 md:-mx-6 md:px-6">
               <span className="text-[13px] text-muted">Unsaved changes</span>
               <Button onClick={() => { track('settings', 'save_settings'); handleSave() }} disabled={save.isPending || settingsQ.isLoading}>
                 <Save size={14} />
@@ -1410,48 +1430,6 @@ function RestartOverlay({ onDismiss }: { onDismiss: () => void }) {
         )}
       </div>
     </div>
-  )
-}
-
-// ── Hardware details (spec 08 §C) ─────────────────────────────────────────────
-
-function HardwarePanel() {
-  const { data: sys, isLoading } = useSysInfo()
-
-  return (
-    <section className="rounded-lg border border-border bg-panel p-4">
-      <h2 className="mb-3 text-[13px] font-semibold uppercase tracking-wide text-faint">Hardware</h2>
-
-      {isLoading || !sys ? (
-        <p className="text-[13px] text-faint">Detecting hardware…</p>
-      ) : (
-        <dl className="grid grid-cols-[auto_1fr] gap-x-6 gap-y-1.5">
-          {sys.gpus.length > 0 ? (
-            sys.gpus.map((g, i) => (
-              <StatRow
-                key={i}
-                label={sys.gpus.length > 1 ? `GPU ${i + 1}` : 'GPU'}
-                value={`${g.name}${g.vramMb > 0 ? ` · ${(g.vramMb / 1000).toFixed(1)} GB VRAM` : ''}`}
-              />
-            ))
-          ) : (
-            <StatRow label="GPU" value="None detected (CPU-only)" />
-          )}
-          <StatRow label="CPU" value={`${sys.cpu || 'Unknown'} · ${sys.cores} cores`} />
-          <StatRow label="RAM" value={`${(sys.ramMB / 1000).toFixed(1)} GB`} />
-          <StatRow label="OS" value={sys.os} />
-        </dl>
-      )}
-    </section>
-  )
-}
-
-function StatRow({ label, value }: { label: string; value: string }) {
-  return (
-    <>
-      <dt className="text-[13px] text-muted">{label}</dt>
-      <dd className="text-[13px] text-ink">{value}</dd>
-    </>
   )
 }
 

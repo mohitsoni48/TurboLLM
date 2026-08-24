@@ -10,6 +10,7 @@ import { track } from '../lib/api'
 import { rememberWorkspacePath, resolveNavTarget } from '../lib/workspace-nav'
 import { StateChip } from './StateChip'
 import { BoltMark } from './Logo'
+import { HardwareBar } from './HardwareBar'
 import { EngineProvisionBanner } from './EngineProvisionBanner'
 import { EngineLoadErrorBanner } from './EngineLoadErrorBanner'
 import {
@@ -92,6 +93,10 @@ export function Shell({
             still has nothing to scroll — and `min-h-0` comes off with it so `main` keeps a
             content-height floor inside the now auto-height column. */}
         <main className={cn('flex-1', !documentScroll && 'min-h-0 overflow-auto')}>{children}</main>
+        {/* ADR-383: the global hardware status bar, above MobileNav. It self-gates on the
+            store's hwBar toggle (rendering nothing when off) and polls only while mounted, so
+            mounting it here is one line and costs the daemon nothing when it is switched off. */}
+        {!onOnboarding && <HardwareBar />}
         {!onOnboarding && <MobileNav />}
       </div>
     </div>

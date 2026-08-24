@@ -46,11 +46,25 @@ export function applyFontSize(fontSize: FontSize): void {
   document.documentElement.style.setProperty('--font-scale', String(fontSize / 100))
 }
 
+// The hardware monitor (ADR-383) is ON by default: the status bar is the point of the
+// feature, and a fresh install should show it working. Only an explicit 'false' disables
+// it — mirroring the `!== 'false'` idiom SettingsScreen already uses for confirm-delete,
+// so garbage or an absent value degrades to the safe default instead of hiding the bar.
+const HW_BAR_KEY = 'tllm.hwBar'
+
+function readStoredHwBar(): boolean {
+  return localStorage.getItem(HW_BAR_KEY) !== 'false'
+}
+
 type UiState = {
   theme: Theme
   setTheme: (theme: Theme) => void
   fontSize: FontSize
   setFontSize: (fontSize: FontSize) => void
+  /** Whether the global hardware status bar is shown (ADR-383). Persisted to localStorage;
+   *  HardwareBar reads it directly, and the Settings → General toggle writes it. */
+  hwBar: boolean
+  setHwBar: (v: boolean) => void
   logPanelOpen: boolean
   setLogPanelOpen: (open: boolean) => void
   /** A conversation id another screen wants the Chat screen to open (e.g. the
@@ -113,6 +127,11 @@ export const useUiStore = create<UiState>((set) => ({
     localStorage.setItem(FONT_SIZE_KEY, String(fontSize))
     applyFontSize(fontSize)
     set({ fontSize })
+  },
+  hwBar: readStoredHwBar(),
+  setHwBar: (hwBar) => {
+    localStorage.setItem(HW_BAR_KEY, String(hwBar))
+    set({ hwBar })
   },
   logPanelOpen: false,
   setLogPanelOpen: (logPanelOpen) => set({ logPanelOpen }),

@@ -148,6 +148,34 @@ export type LiveGeneration = {
   outputTokens: number
 }
 
+/** Live hardware usage (ADR-383) — the /api/v1/hwstats body. MUST stay structurally
+ *  identical to `HwGpuUsage` in `src/sysinfo/usage-parse.ts`: the two declarations drift
+ *  silently otherwise, and only tsc over both trees plus the route test catch it. */
+export type HwGpuUsage = {
+  index: number
+  name: string
+  /** Utilization percent, or null when the reader has no value for this card (fail open —
+   *  null renders as —, never 0). */
+  utilPct: number | null
+  vramUsedMb: number | null
+  /** Always a number: the reader's total when it reports one, else the SysInfo-detected total. */
+  vramTotalMb: number
+  /** Windows WDDM shared (system-memory) usage; null elsewhere. */
+  vramSharedMb: number | null
+  /** True when `vramUsedMb` is a slice of system RAM rather than a second pool (Apple Silicon,
+   *  AMD APUs, iGPUs). The UI MUST branch on this, never on vendor: independent RAM + VRAM bars
+   *  on a unified box double-count the same bytes (ADR-306 / GitHub #164). */
+  unified: boolean
+}
+
+export type HwUsage = {
+  /** Busy percent over the last sample interval, null on the very first sample. */
+  cpuPct: number | null
+  ram: { usedMb: number; totalMb: number }
+  gpus: HwGpuUsage[]
+  sampledAt: number
+}
+
 export type Status = {
   version: string
   engine: EngineRuntime
