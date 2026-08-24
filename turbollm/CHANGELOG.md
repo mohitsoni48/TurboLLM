@@ -25,6 +25,22 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.11.8] - 2026-08-24
+
+### Added
+
+- **Live hardware monitoring: a global bottom status bar and Settings gauges** (ADR-383). A persistent strip at the bottom of every screen shows real-time CPU, RAM, GPU and VRAM — values and percentages — pulled from `nvidia-smi`, WDDM counters, `rocm-smi`, AMD sysfs, `ioreg`, or `/proc` on Linux. Clicking the bar opens a detailed view in Settings → System with live gauges and ~60 s SVG sparklines (no charting library). A toggle in Settings → General → "Show hardware monitor" lets you turn it off entirely; the daemon stops polling as soon as the bar is hidden. Correct on NVIDIA, AMD, Intel, Apple Silicon, APUs and iGPUs — multi-GPU boxes show a per-card split in a tooltip, and unified-memory machines never display phantom adapters.
+
+### Fixed
+
+- **API-key auth on LAN was rejecting valid keys from remote clients.** A key that was stored as a plaintext string instead of a hashed record was silently ignored by the auth middleware, so remote devices could not authenticate even when the key was correct. The key record now stores the SHA-256 hash, matching the verification path used by every other credential surface.
+
+### Discord
+- Live hardware monitoring is now a persistent bottom bar on every screen — CPU, RAM, GPU, VRAM with values and percentages. Click it for gauges and sparklines in Settings. Toggle it off from Settings → General.
+- Fixed: API keys stored from older versions were silently ignored on LAN — valid keys now work again.
+
+## [1.11.7] - 2026-08-22
+
 ## [1.11.7] - 2026-08-22
 
 ### Added

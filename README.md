@@ -56,6 +56,7 @@ LM Studio — and 2.2× on forks it can't load** ([the numbers](#speed-turbollm-
 - [Who this is for — and who it isn't](#who-this-is-for--and-who-it-isnt)
 - [Speed: TurboLLM vs LM Studio](#speed-turbollm-vs-lm-studio)
 - [Features](#features)
+- [Live hardware monitoring](#live-hardware-monitoring)
 - [Quick start](#quick-start)
 - [⭐ Bring any engine — the headline feature](#-bring-any-engine--the-headline-feature)
 - [Run Claude Code on your own GPU](#run-claude-code-on-your-own-gpu)
@@ -426,6 +427,18 @@ handoff is immediate and deterministic (the model is gone *before* ComfyUI execu
 (the one containing `custom_nodes`), click **Install gate** (it writes a small custom node wired to
 this daemon), then **restart ComfyUI** once. The panel shows a live indicator (rendering / idle /
 connected); **Remove** undoes it.
+
+</details>
+
+<details>
+<summary><strong>📊 Live hardware monitoring</strong></summary>
+
+<br/>
+
+- A **persistent bottom strip** on every screen shows real-time CPU, RAM, GPU and VRAM — values
+  and percentages — pulled from `nvidia-smi`, WDDM counters, `rocm-smi`, AMD sysfs, `ioreg`,
+  or `/proc` on Linux. Clicking the bar opens detailed gauges and sparklines in Settings → System.
+  Toggle it off entirely from Settings → General.
 
 </details>
 
