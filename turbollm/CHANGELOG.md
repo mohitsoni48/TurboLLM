@@ -27,17 +27,22 @@ _Nothing yet._
 
 ## [1.11.7] - 2026-08-22
 
+### Added
+
+- **Code sessions can run on a linked machine's model; the remote model pick is now daemon state**
+  (ADR-382, ADR-385). A code agent connected to a linked host uses that host's loaded models, so
+  you don't need the model loaded on every machine you code from. The linked machine's model is
+  now reflected in the daemon's own state rather than resolved on every client.
+- **One-click recovery to failed model loads** (ADR-338 Decision 4). A model that fails to load —
+  out of memory, bad file, anything — now shows a single recover button in the UI, wired directly
+  to the onboarding flow. No more manual retry or config editing to get the model working again.
+
 ### Fixed
 
-- **Auto-tune reported "No candidate completed successfully" on every integrated GPU.** On an
-  APU — an AMD/Intel iGPU, Apple Silicon, an ARM SoC — the GPU and the CPU share one physical
-  pool of memory, so the "the GPU has been pushed out into system RAM" check that tells auto-tune
-  a candidate is too big was true of every candidate it tried, and the sweep finished with nothing
-  to pick. One reporter's search walked 24 → 11 → 5 → 2 → 0 offloaded layers and rejected all
-  five. There is no VRAM/RAM boundary for anything to be pushed across on a shared-memory part,
-  and offloading more layers only moves weights from one region of that same RAM to another, so
-  the check is now skipped there entirely. Discrete cards are unchanged, including the rule that
-  an unreadable VRAM figure is still treated as a spill rather than waved through. (#179)
+- **A dual-GPU machine read as a single card and was sized for one.** The onboarding wizard summed
+  VRAM across both cards instead of treating them as two separate compute resources, so it could
+  recommend a model that exceeded one card's capacity. On a true dual-GPU box the wizard now
+  evaluates each card individually. (#191)
 - **A first-run model recommendation could size a model against memory an iGPU-only machine only
   has once.** The setup wizard read an integrated GPU's *shared* VRAM and the system RAM it is
   carved out of as two independent pools and added them together, so it could recommend a model
@@ -60,17 +65,61 @@ _Nothing yet._
   message, because the streaming parser holds back up to 29 characters it has not yet decided
   about and that tail was never released on an interrupt; and a reply still being generated
   rendered as a red error in the chat until it finished. (#177)
+- **A first turn on a linked code session could use the wrong model.** The code agent resolves its
+  model from the linked machine's state at session start, and an earlier version could fall back to
+  the local machine's model when the linked pick hadn't settled. The link state is now queried
+  before the session picks a model. (#194)
+- **Auto-tune reported "No candidate completed successfully" on every integrated GPU.** On an
+  APU — an AMD/Intel iGPU, Apple Silicon, an ARM SoC — the GPU and the CPU share one physical
+  pool of memory, so the "the GPU has been pushed out into system RAM" check that tells auto-tune
+  a candidate is too big was true of every candidate it tried, and the sweep finished with nothing
+  to pick. There is no VRAM/RAM boundary for anything to be pushed across on a shared-memory part,
+  and offloading more layers only moves weights from one region of that same RAM to another, so
+  the check is now skipped there entirely. Discrete cards are unchanged, including the rule that
+  an unreadable VRAM figure is still treated as a spill rather than waved through. (#179)
+- **The single-GPU gate in auto-tune judged a KV type the run would never use.** The bench
+  probe evaluated a KV cache type that the model would never actually request, so a machine with a
+  capable card could still get rejected. The probe now only tests the KV types the model
+  configuration actually uses. (#194)
+- **A dense model with half its layers on CPU is not worth a single-GPU probe.** A benchmark
+  probe that placed only some layers on the GPU — the rest on CPU — would falsely suggest a
+  smaller model should be loaded on a dedicated card. The probe now requires all layers on the GPU
+  before reporting a meaningful speedup. (#194)
 - **Prompt tokens read 0 on an interrupted turn**, so a stopped reply showed "0+147 tokens" and
   the context-used figure understated the conversation by the whole prompt, even though those
   tokens really were in the cache. The count now falls back to the total the engine itself
   reports while it ingests the prompt. It stays at 0, never a guess, when the engine reports no
   progress at all. (item 9 of #52)
 
+### Changed
+
+- **Chat: editing a message keeps it at full size instead of collapsing.** When you edit a
+  message in the chat, the edit box stays expanded rather than shrinking back down, so you can
+  write freely without fighting a collapsing input. Also re-fits the open edit box when the
+  column width changes, so it doesn't overlap the sidebar on narrow layouts. (#193)
+
+### Docs
+
+- **Dual-GPU auto-tune convergence verified end-to-end.** The auto-tune now honours the user's
+  Parallel requests (it does not tune them), and the measured convergence on a 2x T4 setup
+  confirms the tool reaches the same configuration as manual tuning after a few rounds. Also
+  documents the ten dual-GPU bugs that were found along the way, and the single-GPU probe
+  improvement that a dense model with half its layers on CPU is not worth a single-GPU probe.
+  Kaggle notebooks refreshed to point at the correct branches. (#192)
+
 ### Discord
-- Fixed: on an integrated GPU (AMD/Intel APUs, Apple Silicon), auto-tune rejected every candidate and finished with "No candidate completed successfully". It was reading normal shared-memory use as the GPU overflowing — which can't happen when the GPU and CPU share one pool.
+- Added: code sessions can run on a linked machine's model; the remote pick is daemon state.
+- Added: one-click recovery to failed model loads (ADR-338 Decision 4).
+- Fixed: dual-GPU box was read as a single card and sized for one GPU.
 - Fixed: first-run setup could recommend a model too big for an iGPU-only machine, because it counted the shared VRAM and the system RAM it comes out of as two separate pools.
 - Fixed: switching to another browser tab mid-reply could lose the whole generation — the daemon kept generating but the reply was never saved. It's saved now, whatever the tab does.
+- Fixed: a first turn on a linked code session could use the wrong model.
+- Fixed: on an integrated GPU (AMD/Intel APUs, Apple Silicon), auto-tune rejected every candidate and finished with "No candidate completed successfully". It was reading normal shared-memory use as the GPU overflowing — which can't happen when the GPU and CPU share one pool.
+- Fixed: the single-GPU gate was judging a KV type the model would never use, and a dense model with half layers on CPU was falsely reported as worthwhile for a single-GPU setup.
 - Fixed: the Models library scrolls the page properly instead of being stuck in a little box of its own.
+- Changed: when editing a message in chat, the edit box stays open (doesn't collapse back down).
+- Docs: dual-GPU auto-tune convergence verified end-to-end; kaggle notebooks refreshed to point at the correct branches.
+
 ## [1.11.6] - 2026-08-22
 
 > Upgrading from 1.11.2 (the last version on npm) also picks up **1.11.3** and **1.11.5**,
