@@ -390,7 +390,11 @@ export function runWithTimeout(
     // In the normal case settle() clearTimeout()s it, so there is never a lingering timer to worry
     // about holding the loop open.
     const timer = setTimeout(() => resolve(false), timeoutMs)
-    const child = spawnImpl(bin, args, { stdio: 'ignore' })
+    // A bare `pi` is an npm `.cmd`/`.ps1` shim on Windows, which spawn() cannot resolve without a
+    // shell (ENOENT otherwise) — the same reason the normal launch passes `shell: win32`. Without
+    // this the best-effort install silently fails on EVERY Windows machine, so web search never
+    // ships. `stdio: 'ignore'` keeps the install output out of the launch's own stderr.
+    const child = spawnImpl(bin, args, { stdio: 'ignore', shell: process.platform === 'win32' })
     const settle = (code: number | null) => {
       clearTimeout(timer)
       resolve(code === 0)

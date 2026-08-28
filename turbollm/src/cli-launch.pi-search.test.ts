@@ -202,6 +202,28 @@ test('runWithTimeout: resolves true on a clean exit, false on a non-zero exit', 
   assert.equal(await badP, false)
 })
 
+test('runWithTimeout: passes shell:true on win32 so a bare `pi` .cmd shim resolves (regression)', async () => {
+  // A bare `pi` is an npm `.cmd`/`.ps1` shim that spawn() cannot resolve without a shell (ENOENT
+  // otherwise) — measured live, the best-effort install returned false on EVERY Windows machine
+  // until the spawn was routed through a shell exactly like the normal launch. This pins that fix:
+  // capture the opts handed to the spawn and assert the shim is launched via a shell on Windows and
+  // without one elsewhere (where `pi` is a directly-executable binary).
+  let seenOpts: unknown
+  const capture = ((_cmd: string, _args: string[], opts: unknown) => {
+    seenOpts = opts
+    const ee = new EventEmitter() as ReturnType<typeof import('node:child_process').spawn>
+    setImmediate(() => ee.emit('exit', 0, null))
+    return ee
+  }) as Parameters<typeof runWithTimeout>[0]
+  const p = runWithTimeout(capture, 'pi', ['install'], 5000)
+  assert.equal(await p, true)
+  if (process.platform === 'win32') {
+    assert.deepEqual(seenOpts, { stdio: 'ignore', shell: true })
+  } else {
+    assert.deepEqual(seenOpts, { stdio: 'ignore', shell: false })
+  }
+})
+
 test('ensurePiSearchPackage: a SUCCESSFUL install is disclosed once but stays silent on the skip', async () => {
   // The success note must fire when WE install (once per machine) but NOT on the common already-present
   // skip — otherwise every launch would re-announce it. Two asserts, two paths.
