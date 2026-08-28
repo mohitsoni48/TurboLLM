@@ -58,6 +58,16 @@ function makeSpawn(): { calls: Captured[]; fn: Parameters<typeof launchCli>[3] }
   return { calls, fn }
 }
 
+/** The real pi CLI launch call — NOT the best-effort `pi install` that ensurePiSearchPackage runs
+ *  first (which now lands at calls[0]). Distinguished by the --api-key flag the install call never
+ *  carries. Every test here asserts on the CLI launch, so they all go through this. */
+function piLaunch(calls: Captured[]): Captured {
+  const launch = calls.find((c) => c.args.includes('--api-key'))
+  const allCalls = JSON.stringify(calls.map((c) => [c.cmd, c.args]))
+  assert.ok(launch, `expected the pi CLI launch (with --api-key); got ${allCalls}`)
+  return launch
+}
+
 /** Swallow only launchCli's own `▸ …` banner lines, exactly as cli-launch.mcp.test.ts does.
  *  A blanket stdout override also eats node:test's OWN reporter output, which silently hides every
  *  result produced while it is installed — measured while writing this file. */
@@ -94,10 +104,11 @@ test('pi: a session-scoped token is passed as --api-key', async () => {
   try {
     await launchCli('pi', 6996, [], fn, undefined, makeFetch(), SESSION_TOKEN, memFs())
   } finally { restore() }
-  assert.equal(calls.length, 1)
-  const i = calls[0].args.indexOf('--api-key')
-  assert.ok(i !== -1, `--api-key missing from ${JSON.stringify(calls[0].args)}`)
-  assert.equal(calls[0].args[i + 1], SESSION_TOKEN)
+  // Two spawns now: the best-effort `pi install` (ensurePiSearchPackage) runs first, then the CLI.
+  assert.ok(calls.length >= 1)
+  const i = piLaunch(calls).args.indexOf('--api-key')
+  assert.ok(i !== -1, `--api-key missing from ${JSON.stringify(piLaunch(calls).args)}`)
+  assert.equal(piLaunch(calls).args[i + 1], SESSION_TOKEN)
 })
 
 test('pi: --api-key is ALWAYS accompanied by an explicit provider and model', async () => {
@@ -110,7 +121,7 @@ test('pi: --api-key is ALWAYS accompanied by an explicit provider and model', as
   try {
     await launchCli('pi', 6996, [], fn, undefined, makeFetch(), SESSION_TOKEN, memFs())
   } finally { restore() }
-  const args = calls[0].args
+  const args = piLaunch(calls).args
   assert.ok(args.includes('--api-key'), 'precondition: the flag under test is present')
   const p = args.indexOf('--provider')
   const m = args.indexOf('--model')
@@ -137,8 +148,8 @@ test('pi: a hand-run launch (no session token) still gets the shared static one'
   try {
     await launchCli('pi', 6996, [], fn, undefined, makeFetch(), undefined, memFs())
   } finally { restore() }
-  const i = calls[0].args.indexOf('--api-key')
-  assert.equal(calls[0].args[i + 1], STATIC_TOKEN)
+  const i = piLaunch(calls).args.indexOf('--api-key')
+  assert.equal(piLaunch(calls).args[i + 1], STATIC_TOKEN)
 })
 
 test('pi: the SHARED config file keeps the static token, never the session one', async () => {
@@ -160,7 +171,7 @@ test('pi: passthrough args are preserved ahead of our own flags', async () => {
   try {
     await launchCli('pi', 6996, ['--session-id', 'abc'], fn, undefined, makeFetch(), SESSION_TOKEN, memFs())
   } finally { restore() }
-  assert.deepEqual(calls[0].args.slice(0, 2), ['--session-id', 'abc'])
+  assert.deepEqual(piLaunch(calls).args.slice(0, 2), ['--session-id', 'abc'])
 })
 
 // ── opencode: the token rides an env var ─────────────────────────────────────
