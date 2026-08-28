@@ -123,6 +123,58 @@ type PrepareResult = { ok: true } | { ok: false; message: string }
 
 const AUTH_TOKEN = 'turbollm-local'
 
+// The pi research package bootstrapped onto every launched `pi` so it ships with web search / fetch
+// out of the box instead of forcing each user to install it by hand. Pinned to a SPECIFIC version on
+// purpose: this is a third-party package that runs with FULL SYSTEM ACCESS in the user's environment
+// (pi's own docs warn about exactly that), so pulling `@latest` would let an upstream release silently
+// change what every user gets. 0.3.0 is the version reviewed here — 8 tools (websearch, codesearch,
+// context7, deepwiki, web_fetch, get_fetch_content, firecrawl_scrape, firecrawl_crawl), and it works
+// zero-config via the public Exa MCP server, so no API key is required. Set TOBOLLM_PI_DISABLE_SEARCH_INSTALL
+// to a truthy value (1/true/yes) to opt a machine out entirely.
+const PI_SEARCH_PACKAGE_NAME = '@heyhuynhgiabuu/pi-search'
+const PI_SEARCH_PACKAGE_SPEC = `${PI_SEARCH_PACKAGE_NAME}@0.3.0`
+const PI_SEARCH_INSTALL_DISABLED = () =>
+  ['1', 'true', 'yes'].includes(process.env.TOBOLLM_PI_DISABLE_SEARCH_INSTALL?.toLowerCase() ?? '')
+// The `npm:`-prefixed prefix pi stores for a package in `~/.pi/agent/settings.json`'s `packages`
+// array — the `npm:` prefix, the bare name, and the trailing `@` a version specifier follows. We match
+// on the NAME rather than the exact pinned version on purpose: a user's own manual install of ANY
+// version is respected, so we never silently downgrade them to our pinned 0.3.0 (see
+// piSearchPackagePresent). `pi install npm:<spec>` still pins the reviewed version for fresh installs.
+// VERIFIED against a live `pi install` on this machine: the entry really lands in that `packages`
+// array (what `pi list` reads back), so this prefix is not a guess. If pi ever moves the entry
+// elsewhere, this silently stops matching and every launch reinstalls — which is why the verified
+// location is called out here, as the regression guard for that assumption.
+const PI_SEARCH_PACKAGES_PREFIX = `npm:${PI_SEARCH_PACKAGE_NAME}@`
+// An OFFLINE machine has no recorded package, so `pi install` would otherwise retry the hung npm call
+// on EVERY launch. realRunCommand/realSpawn set no deadline of their own, so we bound it: after this
+// many ms we resolve false (the install is still running in the background, we just stop waiting).
+const PI_SEARCH_INSTALL_TIMEOUT_MS = 30_000
+/** Whether the pi-search package is ALREADY present in the user's pi packages list
+ *  (~/.pi/agent/settings.json → `packages`). A fast, OFFLINE-FREE local read — that is the whole
+ *  point: we must NOT run `pi install` (which hits npm, ~3 s, and hangs for offline users) on every
+ *  launch. This returns false when the file is missing or unparseable, so a fresh machine falls
+ *  through to the install exactly once. `stripJsonComments` reuses preparePi's own JSONC reader so a
+ *  hand-edited/commented settings.json still parses. */
+export async function piSearchPackagePresent(fs: ConfigFs): Promise<boolean> {
+  const path = join(fs.home, '.pi', 'agent', 'settings.json')
+  let raw: string
+  try {
+    raw = await fs.readFile(path)
+  } catch {
+    return false
+  }
+  let cfg: { packages?: unknown[] }
+  try {
+    cfg = JSON.parse(stripJsonComments(raw)) as typeof cfg
+  } catch {
+    return false
+  }
+  return (
+    Array.isArray(cfg.packages) &&
+    cfg.packages.some((p) => typeof p === 'string' && p.startsWith(PI_SEARCH_PACKAGES_PREFIX))
+  )
+}
+
 const SUPPORTED: Record<string, CliSpec> = {
   claude: {
     bin: 'claude',
@@ -317,6 +369,39 @@ const realSpawn: SpawnLike = (cmd, args, opts) => {
   // from a fixed safe character set. A hand-run `turbollm launch claude "…"` can still pass a
   // quote through, but that is the user's own shell invocation, not a privilege boundary.
   return spawn(buildShellCommand(cmd, args), opts)
+}
+
+/** Run a one-shot command via `spawnImpl`, resolving false if it does not exit within `timeoutMs`.
+ *  Used for the best-effort `pi install` so an OFFLINE machine cannot hang a launch on npm's own
+ *  unbounded retries (realRunCommand/realSpawn set none of their own). Resolving false here does NOT
+ *  kill the child — it keeps running in the background; we simply stop waiting. `spawnImpl` is injected
+ *  so a test can feed a child that never exits and assert the timeout fires without waiting the real
+ *  30 s. The timer is intentionally NOT unref'd — see the inline note. */
+export function runWithTimeout(
+  spawnImpl: SpawnLike,
+  bin: string,
+  args: string[],
+  timeoutMs: number,
+): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    // NOTE: deliberately NOT unref'd — the timer is the only handle keeping the event loop alive in
+    // the "child never exits" case, so an unref'd timer would let the loop drain and the awaited
+    // promise never resolve (this exact failure, caught in CI as 'event loop has already resolved').
+    // In the normal case settle() clearTimeout()s it, so there is never a lingering timer to worry
+    // about holding the loop open.
+    const timer = setTimeout(() => resolve(false), timeoutMs)
+    // A bare `pi` is an npm `.cmd`/`.ps1` shim on Windows, which spawn() cannot resolve without a
+    // shell (ENOENT otherwise) — the same reason the normal launch passes `shell: win32`. Without
+    // this the best-effort install silently fails on EVERY Windows machine, so web search never
+    // ships. `stdio: 'ignore'` keeps the install output out of the launch's own stderr.
+    const child = spawnImpl(bin, args, { stdio: 'ignore', shell: process.platform === 'win32' })
+    const settle = (code: number | null) => {
+      clearTimeout(timer)
+      resolve(code === 0)
+    }
+    child.on('error', () => settle(null))
+    child.on('exit', (code) => settle(code))
+  })
 }
 
 /** Fetch the current daemon status. Returns null on network error. */
@@ -1191,6 +1276,52 @@ export async function syncHarnessModelConfig(
  *  gateway can tell this session's requests apart from any other concurrent terminal-agent
  *  session (session-auth.ts). A manually-run `turbollm launch claude` omits it and keeps
  *  today's shared-token behavior. */
+/** Ensure a launched `pi` has the pi-search research package installed, BEST-EFFORT.
+ *
+ *  Only installs when the package is NOT already present (piSearchPackagePresent) — so the ~3 s
+ *  network `pi install` runs AT MOST ONCE per machine, and offline/already-present launches pay
+ *  nothing but a local settings read. This is the ONLY mechanism that makes the tools available by
+ *  default to every TurboLLM user: `turbollm launch pi` points a standalone `pi` at the daemon over
+ *  the OpenAI `/v1` API, where pi declares its own toolset and nothing can inject tools into it, so
+ *  the tools have to already be present on the pi side (see ensurePiSearchPackage's caller and the
+ *  no-tool-injection note there). A failure here must NEVER break the launch itself — a network
+ *  blip, a missing `pi` binary, or a rejected install just degrades to "no web search" with a
+ *  one-line stderr note, exactly like the MCP-bridge setup beside it.
+ *
+ *  `run` and `fs` are injectable so tests can assert the exact command and seed settings.json
+ *  without spawning a real pi or touching the real home dir. */
+export async function ensurePiSearchPackage(
+  run: RunCommand = realRunCommand,
+  fs: ConfigFs = realFs,
+): Promise<void> {
+  if (PI_SEARCH_INSTALL_DISABLED()) return
+  if (await piSearchPackagePresent(fs)) return
+  // realRunCommand resolves false (never throws) on a spawn error or non-zero exit, so capture the
+  // result and surface it — a silently-failed install would otherwise leave the user with "no web
+  // search" and no idea why. Still best-effort: the note never fails the launch itself.
+  let ok = false
+  try {
+    ok = await run('pi', ['install', `npm:${PI_SEARCH_PACKAGE_SPEC}`])
+  } catch {
+    ok = false
+  }
+  // Disclose BOTH outcomes on stderr — neither is noisy: a success fires exactly once per machine
+  // (the presence gate skips every later launch), and a failure is rare. The success disclosure is
+  // the supply-chain transparency the risk demands: a successful install must NOT be silent, so a user
+  // learns that full-system-access software was added and how to opt out.
+  if (ok) {
+    process.stderr.write(
+      `Note: installed pi research tools (${PI_SEARCH_PACKAGE_SPEC}); web search is now available. ` +
+      `Opt out any time with TOBOLLM_PI_DISABLE_SEARCH_INSTALL=1.\n`,
+    )
+  } else {
+    process.stderr.write(
+      `Note: could not auto-install pi research tools (${PI_SEARCH_PACKAGE_SPEC}); ` +
+      `web search will be unavailable until you run: pi install npm:${PI_SEARCH_PACKAGE_SPEC}.\n`,
+    )
+  }
+}
+
 export async function launchCli(
   target: string,
   port: number,
@@ -1411,6 +1542,21 @@ export async function launchCli(
       process.stderr.write(prep.message + '\n')
       return 1
     }
+  }
+
+  // Best-effort: give a launched `pi` its web-search / research tools out of the box so users never
+  // have to install them by hand. See ensurePiSearchPackage — a failure here must never break the
+  // launch itself. Scoped to pi only: the other harnesses wire tools their own way. The install
+  // reuses the SAME injected _spawn as the CLI launch itself (no separate injection point needed),
+  // so it gets the identical Windows-safe, shell-on-win32 spawn treatment as the real launch — and
+  // tests can assert on it.
+  if (target === 'pi') {
+    // Route the best-effort install through runWithTimeout so an offline machine can't hang this
+    // launch; see that function's doc comment. Still best-effort — a false (timeout/failed) install
+    // never fails the launch itself.
+    const piSearchRun: RunCommand = (bin, args) =>
+      runWithTimeout(_spawn, bin, args, PI_SEARCH_INSTALL_TIMEOUT_MS)
+    await ensurePiSearchPackage(piSearchRun, _mcpFs)
   }
 
   // Per-harness environment. `inheritedEnv` strips parent-agent markers FIRST, so the harness's

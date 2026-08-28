@@ -21,6 +21,15 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ---
 
+## [1.11.9] - 2026-08-28
+
+### Added
+
+- **Web search and research tools now ship by default when you launch `pi`.** TurboLLM now best-effort installs the `pi-search` package (web search, code search, context/deep-wiki, and web fetch / Firecrawl tools) onto a launched `pi` so those capabilities are ready out of the box instead of needing a manual install. It is pinned to a specific version, installs at most once per machine, and announces itself once; you can opt out any time with `TOBOLLM_PI_DISABLE_SEARCH_INSTALL=1`. If it cannot install (for example, offline) the launch still works — you simply will not have web search until you install it by hand.
+
+### Discord
+- Web search and research tools now come pre-installed when you launch `pi` — no manual setup. Turn it off anytime with the `TOBOLLM_PI_DISABLE_SEARCH_INSTALL=1` setting.
+
 ## [Unreleased]
 
 _Nothing yet._
