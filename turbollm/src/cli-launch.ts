@@ -1548,7 +1548,8 @@ export async function launchCli(
   // have to install them by hand. See ensurePiSearchPackage — a failure here must never break the
   // launch itself. Scoped to pi only: the other harnesses wire tools their own way. The install
   // reuses the SAME injected _spawn as the CLI launch itself (no separate injection point needed),
-  // so it gets the identical Windows-safe, no-shell spawn treatment — and tests can assert on it.
+  // so it gets the identical Windows-safe, shell-on-win32 spawn treatment as the real launch — and
+  // tests can assert on it.
   if (target === 'pi') {
     // Route the best-effort install through runWithTimeout so an offline machine can't hang this
     // launch; see that function's doc comment. Still best-effort — a false (timeout/failed) install
