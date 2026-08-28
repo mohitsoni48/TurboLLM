@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode, type Ref } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -561,63 +561,64 @@ export function StreamingBubble({
   )
 }
 
-// ── Edit textarea ─────────────────────────────────────────────────────────────
+// ── Edit-box geometry helpers ───────────────────────────────────────────────────
+//
+// Pure DOM helpers shared by the edit-click measurement and the column re-fit. They close
+// over nothing, so they live at module level rather than as per-render component closures.
 
-// Editing a message used to drop it into a fixed 3/4-row box, so anything longer than a
-// few lines collapsed into a small scrolling window and you lost sight of the text you
-// came to edit. This grows to the FULL content height on open (and keeps tracking it as
-// you type), so the edit box is the same size as the message it replaces. `max-h-[60vh]`
-// is the only cap — a very long message scrolls internally rather than pushing the Save
-// buttons off screen. Resetting to 'auto' before reading scrollHeight is what lets it
-// shrink again after a deletion, not just grow.
+/** Content-box width of `col` (clientWidth minus horizontal padding): the width the
+ *  message bubbles actually occupy inside it. */
+function colContentWidth(col: HTMLElement | null): number | null {
+  if (!col) return null
+  const s = getComputedStyle(col)
+  return col.clientWidth - (parseFloat(s.paddingLeft) || 0) - (parseFloat(s.paddingRight) || 0)
+}
+
+/** The bubble root: the nearest `.group`-class ancestor of `node`. */
+function bubbleRootOf(node: HTMLElement | null): HTMLElement | null {
+  let b = node
+  while (b && !(b.className || '').toString().includes('group')) b = b.parentElement
+  return b
+}
+
+// ── Edit textarea ─────────────────────────────────────────────────────────────
+//
+// Editing a message used to drop it into a fixed 3/4-row box, so anything longer than a few
+// lines collapsed into a small scrolling window and you lost sight of the text you came to
+// edit. The box is now the SAME size as the message it replaces: the parent pins this
+// wrapper to the bubble's measured width and mirrors the bubble's own type metrics (font,
+// line-height, padding) into `className`, so the text re-wraps the SAME way it wrapped in
+// the bubble — and the parent's fit() then lands the box at the same height, tracking it on
+// every keystroke.
+//
+// There is deliberately NO max-height cap: any cap would shrink a long message back into a
+// small scrolling window — the exact collapse this exists to remove. A very tall box pushes
+// the composer down, but the composer is disabled while editing, and Ctrl/Cmd+Enter saves
+// without scrolling. `overflow-y-auto` stays as a last resort for the transient frames
+// between a width change and the re-fit that follows it.
 function EditTextarea({
   value,
   onChange,
   onSave,
   onCancel,
+  ref,
+  className,
   minRows,
 }: {
   value: string
   onChange: (v: string) => void
   onSave: () => void
   onCancel: () => void
+  ref: Ref<HTMLTextAreaElement>
+  /** Type metrics mirroring the display bubble this box replaces (font is in the base). */
+  className: string
   minRows: number
 }) {
-  const ref = useRef<HTMLTextAreaElement>(null)
-  const fit = useCallback(() => {
-    const el = ref.current
-    if (!el) return
-    el.style.height = 'auto'
-    // `+ (offsetHeight - clientHeight)` is the 1px top/bottom border: box-sizing is border-box
-    // here, so a plain scrollHeight leaves the box 2px short of its own content and the
-    // textarea scrolls by a hairline even when everything fits.
-    el.style.height = `${el.scrollHeight + (el.offsetHeight - el.clientHeight)}px`
-  }, [])
-  useLayoutEffect(fit, [value, fit])
-
-  // The height above is a pixel value measured at ONE width, so it goes stale the moment the
-  // column resizes and the text re-wraps: the conversation sidebar is collapsible AND
-  // drag-resizable, and dragging it while an edit box is open used to leave the box at its old
-  // height with a scrollbar back inside it until the next keystroke. Re-measure on width
-  // changes only — reacting to the height changes we just made ourselves would loop.
-  useEffect(() => {
-    const el = ref.current
-    if (!el || typeof ResizeObserver === 'undefined') return
-    let lastWidth = el.clientWidth
-    const ro = new ResizeObserver(() => {
-      const cur = ref.current
-      if (!cur || cur.clientWidth === lastWidth) return
-      lastWidth = cur.clientWidth
-      fit()
-    })
-    ro.observe(el)
-    return () => ro.disconnect()
-  }, [fit])
   return (
     <textarea
       ref={ref}
       autoFocus
-      className="w-full resize-none overflow-y-auto max-h-[60vh] rounded-[var(--radius-lg)] border border-accent bg-panel px-4 py-2.5 text-[15px] leading-[1.6] text-ink outline-none"
+      className={`w-full resize-none overflow-y-auto rounded-[var(--radius-lg)] border border-accent bg-panel text-[15px] text-ink outline-none ${className}`}
       rows={minRows}
       value={value}
       onChange={(e) => onChange(e.target.value)}
@@ -695,18 +696,123 @@ export function MessageBubble({
   const [editDraft, setEditDraft] = useState(message.content)
   const isEditing = editingId === message.id
 
+  // ── Edit-box sizing: the box IS the bubble ──────────────────────────────────────
+  //
+  // The edit box must end up the SAME size as the display bubble it replaces — same width,
+  // same height — instead of a small fixed field. That requires tracking the bubble's real
+  // geometry, which the old code never did:
+  //
+  // WIDTH — the display bubble's width is measured the moment Edit is clicked (displayRef)
+  // and pinned onto the edit wrapper (editW; the +2px compensates the textarea's 1px border
+  // so the box's USABLE width equals the bubble's usable width and the text re-wraps exactly
+  // as it did in the bubble). For user bubbles the pin also fixes a collapse: that column is
+  // shrink-to-fit (its width IS its widest child), so the old unpinned width:100% wrapper
+  // resolved its percentage against a column as wide as its widest child — the ~160px
+  // Save/Cancel button row — leaving the textarea a narrow strip no matter how much text it
+  // held. Pinning makes the column follow the box instead.
+  //
+  // HEIGHT — fit() grows/shrinks the textarea to its full content at the current width, on
+  // open and on every keystroke. A pixel height measured at one width goes stale the moment
+  // the column width changes (the sidebar is collapsible AND drag-resizable), so while
+  // editing we watch the COLUMN — the message list, which is in the DOM in every mode — and
+  // re-pin + re-fit when its width changes. (The earlier version watched the textarea itself,
+  // but that effect ran once at mount with stable deps — when no textarea was in the DOM yet
+  // — and never ran again, so the re-fit was dead code in the real app. With a pinned width
+  // the textarea's own width never changes at all, so the column is the only thing to watch.)
+  //
+  // There is deliberately NO max-height cap (see the EditTextarea doc comment): capping would
+  // shrink a long message back into a small scrolling window — the exact collapse this exists
+  // to remove.
+  const displayRef = useRef<HTMLDivElement>(null)
+  const taRef = useRef<HTMLTextAreaElement>(null)
+  const [editW, setEditW] = useState<number | null>(null)
+  const clickGeom = useRef<{ bubbleW: number; colW: number } | null>(null)
+
+  const fit = useCallback(() => {
+    const el = taRef.current
+    if (!el) return
+    el.style.height = 'auto'
+    // `+ (offsetHeight - clientHeight)` is the 1px top/bottom border: box-sizing is border-box
+    // here, so a plain scrollHeight leaves the box 2px short of its own content and the
+    // textarea scrolls by a hairline even when everything fits. Resetting to 'auto' before
+    // reading scrollHeight is what lets the box shrink again after a deletion, not just grow.
+    el.style.height = `${el.scrollHeight + (el.offsetHeight - el.clientHeight)}px`
+  }, [])
+  // Runs at mount, the moment editing starts (isEditing flips), and after every keystroke.
+  // fit() bails itself out while the textarea is not mounted.
+  useLayoutEffect(() => {
+    if (isEditing) fit()
+  }, [isEditing, editDraft, fit])
+
+  // Re-pin to a NEW column width. Assistant: the display bubble is full-column-width, so the
+  // pin just follows the column. User: the display width is min(longest line, column, cap) —
+  // if the cap was already binding at click time it keeps binding (min(column, cap));
+  // otherwise the content width is fixed and only a shrinking column can reduce it further.
+  const applyPin = useCallback((colW: number) => {
+    if (message.role === 'assistant') {
+      setEditW(colW + 2)
+      return
+    }
+    const g = clickGeom.current
+    if (!g) return
+    const cap = (w: number) => Math.min(0.88 * w, 900)
+    const capBound = g.bubbleW >= Math.min(g.colW, cap(g.colW)) - 1
+    setEditW((capBound ? Math.min(colW, cap(colW)) : Math.min(g.bubbleW, colW, cap(colW))) + 2)
+  }, [message.role])
+
+  // Enter edit mode: measure the bubble we are about to replace, pin the box to it.
+  const beginEdit = () => {
+    const d = displayRef.current
+    const colW = colContentWidth(bubbleRootOf(d)?.parentElement ?? null)
+    clickGeom.current = d && colW != null ? { bubbleW: d.offsetWidth, colW } : null
+    // +2px = the textarea's 1px border on each side (see above). The >0 guard keeps
+    // zero-width environments (jsdom) on the unpinned fallback path.
+    setEditW(d && d.offsetWidth > 0 ? d.offsetWidth + 2 : null)
+    setEditDraft(message.content)
+    onEdit?.(message)
+  }
+
+  // While editing, re-pin + re-fit whenever the column width changes. The width-only guard
+  // (lastW) keeps it from reacting to the height changes we make ourselves.
+  useEffect(() => {
+    if (!isEditing || typeof ResizeObserver === 'undefined') return
+    const el = taRef.current
+    if (!el) return
+    const col = bubbleRootOf(el)?.parentElement ?? null
+    if (!col) return
+    let lastW = colContentWidth(col) ?? el.clientWidth
+    const ro = new ResizeObserver(() => {
+      const cur = taRef.current
+      if (!cur) return
+      const w = colContentWidth(col)
+      if (w == null || w === lastW) return
+      lastW = w
+      applyPin(w)
+      fit()
+    })
+    ro.observe(col)
+    return () => ro.disconnect()
+  }, [isEditing, fit, applyPin])
+
   if (message.role === 'user') {
     return (
       <div className="group flex justify-end gap-2">
         <div className="flex flex-col items-end gap-1">
           {isEditing ? (
-            // Was max-w-[75%] — wrapped user messages far too early given the rest of
-            // the app (composer, message column) deliberately has no width cap at all.
-            // min(88%, 900px): wide enough to stop premature wrapping, capped so a
-            // single-sentence message doesn't stretch absurdly wide on an ultrawide
-            // monitor. Kept in sync with the non-editing bubble below — same value.
-            <div className="w-full max-w-[min(88%,900px)]">
+            // The wrapper is pinned to the width the display bubble it replaces was actually
+            // occupying (beginEdit measures it — see the sizing block above), so the box is
+            // the SAME width as the bubble; because the textarea mirrors the bubble's
+            // font/leading/padding (px-4 py-2.5 leading-[1.6]), the text re-wraps the same
+            // way and the box lands on the same height. The pin also stops this shrink-to-fit
+            // column from collapsing to the button row's width. Unpinned (measurement
+            // unavailable) it falls back to the old cap behavior.
+            <div
+              className={editW != null ? undefined : 'w-full max-w-[min(88%,900px)]'}
+              style={editW != null ? { width: editW } : undefined}
+            >
               <EditTextarea
+                ref={taRef}
+                className="px-4 py-2.5 leading-[1.6]"
                 value={editDraft}
                 onChange={setEditDraft}
                 onSave={() => onEditSave(editDraft)}
@@ -720,7 +826,7 @@ export function MessageBubble({
             </div>
           ) : (
             <div className="flex max-w-[min(88%,900px)] flex-col items-end">
-              <div className="whitespace-pre-wrap break-words rounded-[var(--radius-lg)] bg-accent px-4 py-2.5 text-[15px] leading-[1.6] text-on-accent">
+              <div ref={displayRef} className="whitespace-pre-wrap break-words rounded-[var(--radius-lg)] bg-accent px-4 py-2.5 text-[15px] leading-[1.6] text-on-accent">
                 {message.content}
               </div>
               {message.attachments?.filter((a) => a.startsWith('data:image')).map((url, i) => (
@@ -743,7 +849,7 @@ export function MessageBubble({
               {convId && message.variantGroup && <VariantSwitcher convId={convId} message={message} />}
               <div className="hover-actions flex items-center gap-0.5">
                 <CopyButton text={message.content} className="rounded p-1 hover:bg-panel-2" screen="chat" />
-                {onEdit && <ActionBtn icon={<Pencil size={12} />}  label="Edit"   onClick={() => { track('chat', 'open_edit_message'); setEditDraft(message.content); onEdit(message) }} />}
+                {onEdit && <ActionBtn icon={<Pencil size={12} />}  label="Edit"   onClick={() => { track('chat', 'open_edit_message'); beginEdit() }} />}
                 {onDelete && <ActionBtn icon={<Trash2 size={12} />} label="Delete" onClick={() => { track('chat', 'delete_message'); onDelete(message) }} destructive />}
               </div>
             </div>
@@ -792,8 +898,13 @@ export function MessageBubble({
       )}
       <ToolCallsPanel calls={completedToolCalls} />
       {isEditing ? (
-        <div className="w-full">
+        // Pinned to the width the display bubble was occupying (beginEdit); the textarea
+        // mirrors the prose display's metrics (leading-[1.7], no padding — the prose column
+        // has none) so the text re-wraps the same way and the box lands on the same height.
+        <div className="w-full" style={editW != null ? { width: editW } : undefined}>
           <EditTextarea
+            ref={taRef}
+            className="leading-[1.7]"
             value={editDraft}
             onChange={setEditDraft}
             onSave={() => onEditSave(editDraft)}
@@ -821,7 +932,7 @@ export function MessageBubble({
           Generating…
         </div>
       ) : (
-        <div className="prose-tllm text-[15px] leading-[1.7] text-ink">
+        <div ref={displayRef} className="prose-tllm text-[15px] leading-[1.7] text-ink">
           {verdicts.length > 0
             ? <AnnotatedReply content={message.content} verdicts={verdicts} />
             : <Markdown>{message.content}</Markdown>
@@ -854,7 +965,7 @@ export function MessageBubble({
             {/* `stillGenerating` (GitHub #177) joins hasError here for the same reason: there is
                 no text to copy or edit yet, and the row is about to be rewritten by the daemon. */}
             {!hasError && !stillGenerating && <CopyButton text={message.content} className="rounded p-1 hover:bg-panel-2" screen="chat" />}
-            {!hasError && !stillGenerating && onEdit && <ActionBtn icon={<Pencil size={12} />} label="Edit" onClick={() => { track('chat', 'open_edit_message'); setEditDraft(message.content); onEdit(message) }} />}
+            {!hasError && !stillGenerating && onEdit && <ActionBtn icon={<Pencil size={12} />} label="Edit" onClick={() => { track('chat', 'open_edit_message'); beginEdit() }} />}
             {isLast && onRegenerate && <ActionBtn icon={<RefreshCw size={12} />} label="Regenerate" onClick={() => { track('chat', 'regenerate_message'); onRegenerate() }} />}
             {onDelete && <ActionBtn icon={<Trash2 size={12} />} label="Delete" onClick={() => { track('chat', 'delete_message'); onDelete(message) }} destructive />}
           </div>
