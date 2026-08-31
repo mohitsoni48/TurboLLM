@@ -1,0 +1,26 @@
+# Test image for running the TurboLLM daemon on a DIFFERENT port (6997)
+# so it does NOT collide with the host's running daemon on 6996.
+# Purpose: smoke-test the built binary in a clean Linux container.
+#
+# Build the bundle on the HOST first (avoids OOM inside Docker):
+#   npm run build:web && npm run build
+# Then build this image:
+#   docker build -f Dockerfile.test-port -t turbollm-test-port .
+# Run with a fresh data dir on port 6997:
+#   docker run --rm -p 6997:6997 -v /tmp/turbollm-test:/.turbollm turbollm-test-port
+
+FROM node:22-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl ca-certificates libvulkan1 libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY turbollm/package*.json ./
+RUN npm ci
+COPY turbollm/dist ./dist
+COPY turbollm/bin ./bin
+COPY turbollm/src/webdist ./dist/webdist
+
+ENV TURBOLLM_DATA_DIR=/.turbollm
+ENV TURBOLLM_PORT=6997
+CMD ["node", "/src/dist/cli.js", "--addr", "0.0.0.0:6997"]

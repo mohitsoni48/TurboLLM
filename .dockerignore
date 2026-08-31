@@ -18,3 +18,5 @@ lib
 # never reference the host's turbollm/dist at all.
 !turbollm/dist
 !turbollm/dist/**
+!turbollm/src/webdist
+!turbollm/src/webdist/**
