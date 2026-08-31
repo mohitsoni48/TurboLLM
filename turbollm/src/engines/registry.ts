@@ -440,10 +440,16 @@ export function isStaleCapabilities(flags: string[], flagInfo: FlagInfo[] | unde
   // removed" notice. A probe from before that fix (see extractFlags in probe.ts)
   // misread the mention as support and cached these as real flags — profileToArgs
   // then passes them straight through and the engine exits immediately on launch.
-  // A fresh probe of a genuinely-old llama.cpp that still supports them for real is
-  // an idempotent no-op here (the flags stay present either way), so this is safe
-  // to check unconditionally.
-  if (['--draft-max', '--draft-min', '--draft', '--draft-n', '--draft-n-min'].some((f) => flags.includes(f))) return true
+  // Only flag when a removed flag AND a successor flag are both present — only a
+  // mis-probed *new* build has both; a genuinely-old build has the removed flag
+  // but not the successor. A fresh probe of a genuinely-old llama.cpp that still
+  // supports them for real is an idempotent no-op (the flags stay present either
+  // way), so this is safe to check unconditionally.
+  const removed = ['--draft-max', '--draft-min', '--draft', '--draft-n', '--draft-n-min']
+  const successor = ['--spec-draft-n-max', '--spec-draft-n-min']
+  const hasRemoved = removed.some((f) => flags.includes(f))
+  const hasSuccessor = successor.some((f) => flags.includes(f))
+  if (hasRemoved && hasSuccessor) return true
   // Case 3 (spec 22, ADR-328): a probe from before `flagInfo` existed carries no
   // structured per-flag metadata at all — reprobe once to backfill it, so the generic
   // KV-type detection (kvTypes) reaches already-registered engines without a manual

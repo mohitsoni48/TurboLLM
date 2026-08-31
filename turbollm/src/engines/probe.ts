@@ -199,9 +199,14 @@ export function detectKvTypes(helpText: string, hasCacheTypeFlag: boolean): stri
  *  prose, not a value list, and would otherwise false-positive. Returns [] when nothing
  *  matches; NEVER guesses beyond what's actually printed. */
 export function parseEnumList(blockText: string): string[] {
-  const labeled = /allowed values:\s*([\s\S]+)/i.exec(blockText)
-  const bracketed = /\[([^\]\n]+)\]/.exec(blockText)
-  const raw = labeled?.[1] ?? bracketed?.[1]
+  let raw = /allowed values:\s*([\s\S]+)/i.exec(blockText)?.[1]
+    ?? /(?:^|[ \t])\[([^\]\n]+)\]/.exec(blockText)?.[1]
+  // Also try `{a,b,c}` / `(a|b|c)` syntax (llama.cpp's most common form).
+  if (!raw) {
+    const braceMatch = /(?:^|[ \t])\{([^}]+)\}/.exec(blockText)
+    const parenMatch = /(?:^|[ \t])\(([^)|]+)\)/.exec(blockText)
+    raw = braceMatch?.[1] ?? parenMatch?.[1]
+  }
   if (!raw) return []
   const values = raw
     .split(/[,|]/)
@@ -251,7 +256,7 @@ export function classifyFlag(flagName: string, helpText: string): FlagInfo {
   const re = new RegExp(
     `(?:^|\\n)[ \\t]*(?:${ALIAS}[ \\t]*,[ \\t]*)*` +
       `${escaped}(?![-a-zA-Z0-9])(?:[ \\t]*,[ \\t]*${ALIAS})*` +
-      `( *)(\\S+)?([\\s\\S]{0,400}?)` +
+      `( *)(\\S+)?([\\s\\S]+?)` +
       `(?=\\n\\s*\\(default|\\n[ \\t]*${ALIAS}|\\n\\n|$)`,
     'i',
   )
@@ -263,13 +268,35 @@ export function classifyFlag(flagName: string, helpText: string): FlagInfo {
   // I3: feed the placeholder token into the enum search too, not just the block — a bracket enum
   // written directly after the flag (e.g. `--spec-type [none|draft|nextn]  ...`) lands entirely
   // inside `placeholder` (no internal whitespace for `\S+` to stop at), not `block`.
-  const enumValues = parseEnumList(placeholder + '\n' + block)
+  // Also try `{a,b,c}` / `(a|b|c)` bracket syntax (llama.cpp's most common form).
+  //
+  // Important: the regex's non-greedy block capture can bleed into the NEXT flag's help text
+  // (e.g. `allowed values: f32, f16` from a sibling flag's block). Only search up to the next
+  // flag line — anything before a line that starts with a flag alias belongs to the current flag.
+  const nextFlagLine = block.match(/\n[ \t]*-{1,2}[a-zA-Z][a-zA-Z0-9-]*/)
+  const ownBlock = nextFlagLine ? block.slice(0, nextFlagLine.index) : block
+  const scanText = placeholder + '\n' + ownBlock
+  const enumValues = parseEnumList(scanText)
   if (enumValues.length > 0) return { name: flagName, kind: 'enum', enumValues }
+  const bracket = parseEnumBrackets(scanText)
+  if (bracket.length > 0) return { name: flagName, kind: 'enum', enumValues: bracket }
   // gap !== 1 (either 0 — bare flag, nothing follows at all — or 2+ — straight into prose, no
   // placeholder) or no placeholder captured at all → boolean. Only a single-space gap followed by
   // a real placeholder token is a value-taking flag with no detected enum.
   if (gap.length !== 1 || !placeholder) return { name: flagName, kind: 'boolean' }
   return { name: flagName, kind: 'valued' }
+}
+
+/** Parse `{a,b,c}` / `(a|b|c)` enum syntax from a flag's help text — llama.cpp's most common
+ *  form. Returns [] when none found; NEVER guesses beyond what's actually printed.
+ *  Anchors to line-start so it doesn't match `(default: ...)` from a sibling flag. */
+export function parseEnumBrackets(blockText: string): string[] {
+  const braceMatch = /(?:^|[ \t])\{([^}]+)\}/.exec(blockText)
+  const parenMatch = /(?:^|[ \t])\(([^)|]+)\)/.exec(blockText)
+  const raw = braceMatch?.[1] ?? parenMatch?.[1]
+  if (!raw) return []
+  const values = raw.split(/[|,]/).map((s) => s.trim()).filter((s) => /^[a-z][a-z0-9_-]*$/i.test(s))
+  return values.length >= 2 ? values : []
 }
 
 function firstNonEmptyLine(s: string): string {

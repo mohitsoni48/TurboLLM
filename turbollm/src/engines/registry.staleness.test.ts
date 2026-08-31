@@ -5,14 +5,26 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { isStaleCapabilities } from './registry'
 
-test('flags an engine that still carries the removed draft-max/draft-min flags', () => {
-  assert.equal(isStaleCapabilities(['--mtp-head', '--draft-max', '--draft-min'], []), true)
+test('does NOT flag an engine that only has removed draft flags (genuinely old build)', () => {
+  // A genuinely-old llama.cpp really supports --draft-max/--draft-min.
+  // The reprobe would re-capture the same flags, so it's a no-op — don't waste ~15s.
+  assert.equal(isStaleCapabilities(['--mtp-head', '--draft-max', '--draft-min'], []), false)
 })
 
-test('flags an engine carrying any one of the removed draft-family flags', () => {
-  assert.equal(isStaleCapabilities(['--draft'], []), true)
-  assert.equal(isStaleCapabilities(['--draft-n'], []), true)
-  assert.equal(isStaleCapabilities(['--draft-n-min'], []), true)
+test('does NOT flag an engine carrying only one removed draft-family flag (genuinely old build)', () => {
+  // Only a mis-probed *new* build has both a removed flag AND a successor flag.
+  // A genuinely-old build has the removed flag but not the successor.
+  assert.equal(isStaleCapabilities(['--draft'], []), false)
+  assert.equal(isStaleCapabilities(['--draft-n'], []), false)
+  assert.equal(isStaleCapabilities(['--draft-n-min'], []), false)
+})
+
+test('flags an engine carrying BOTH a removed AND a successor draft flag (mis-probed new build)', () => {
+  // Only a mis-probed new build has both — the removed flag from old-era probing
+  // and the successor from a later reprobe. This NEEDS a fresh probe.
+  assert.equal(isStaleCapabilities(['--draft', '--spec-draft-n-max'], []), true)
+  assert.equal(isStaleCapabilities(['--draft-max', '--draft-min', '--spec-draft-n-max', '--spec-draft-n-min'], []), true)
+  assert.equal(isStaleCapabilities(['--draft', '--draft-n', '--spec-draft-n-min'], []), true)
 })
 
 test('flags the pre-existing spec-type-without-enum staleness case', () => {
