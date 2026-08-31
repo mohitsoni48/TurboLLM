@@ -1261,6 +1261,14 @@ export class ConversationStore {
       `)
       this.db.exec(`PRAGMA user_version = 48;`)
     }
+    if (v < 49) {
+      // v49 (ADR-386, ctx-gauge-freeze fix): api_usage gains a `ctx_used` column that tracks the
+      // current context size, updated during /compact so the ring reflects post-compaction reality.
+      // `prompt_tokens` still carries the largest-request value (sub-agent safety net), but the
+      // ring now reads `ctx_used` — the actual context window fill — which compaction updates.
+      if (!this.hasColumn('api_usage', 'ctx_used')) this.db.exec(`ALTER TABLE api_usage ADD COLUMN ctx_used INTEGER DEFAULT 0;`)
+      this.db.exec(`PRAGMA user_version = 49;`)
+    }
   }
 
   listConversations(q?: string, kind: 'chat' | 'agent' | 'all' = 'all'): Conversation[] {
@@ -1630,8 +1638,8 @@ export class ConversationStore {
     // wall-clock. Absent (an engine that reports no timings) → null, and the reader falls back.
     const rate = (v: number | null | undefined) => (v != null && Number.isFinite(v) && v > 0 ? v : null)
     this.db.prepare(`
-      INSERT INTO api_usage (id, created_at, source, model_key, prompt_tokens, gen_tokens, code_session_id, duration_ms, prompt_tps, gen_tps, harness)
-      VALUES ($id, $createdAt, $source, $modelKey, $promptTokens, $genTokens, $codeSessionId, $durationMs, $promptTps, $genTps, $harness)
+      INSERT INTO api_usage (id, created_at, source, model_key, prompt_tokens, gen_tokens, code_session_id, duration_ms, prompt_tps, gen_tps, harness, ctx_used)
+      VALUES ($id, $createdAt, $source, $modelKey, $promptTokens, $genTokens, $codeSessionId, $durationMs, $promptTps, $genTps, $harness, $ctxUsed)
     `).run({
       $id: randomUUID(),
       $createdAt: new Date().toISOString(),
@@ -1644,7 +1652,41 @@ export class ConversationStore {
       $promptTps: rate(rec.promptTps),
       $genTps: rate(rec.genTps),
       $harness: rec.harness ?? null,
+      $ctxUsed: Math.max(0, Math.floor(rec.promptTokens) || 0),
     } as P)
+  }
+
+  /** Lower the current context size for a Code session after /compact, so the ctx gauge
+   *  reflects post-compaction reality (ADR-386). Updates the row with the MAX ctx_used
+   *  to the new value — this is what allows /compact to lower the ring's frozen ceiling.
+   *  If no row exists yet (fresh session compacted before first gateway request), creates one. */
+  setCodeSessionCtxUsed(codeSessionId: string, ctxUsed: number): void {
+    // Try to update the row with the MAX ctx_used first
+    const maxRow = this.db.prepare(`
+      SELECT id FROM api_usage
+      WHERE code_session_id = $codeSessionId AND ctx_used = (
+        SELECT MAX(ctx_used) FROM api_usage WHERE code_session_id = $codeSessionId
+      )
+      LIMIT 1
+    `).get({ $codeSessionId: codeSessionId } as P) as { id: string } | undefined
+    if (maxRow) {
+      this.db.prepare(`
+        UPDATE api_usage SET ctx_used = $ctxUsed, prompt_tokens = $promptTokens, created_at = $createdAt
+        WHERE id = $id
+      `).run({ $ctxUsed: ctxUsed, $promptTokens: ctxUsed, $createdAt: new Date().toISOString(), $id: maxRow.id } as P)
+    } else {
+      // No row exists yet — create one (fresh session compacted before first gateway request)
+      this.db.prepare(`
+        INSERT INTO api_usage (id, created_at, source, prompt_tokens, gen_tokens, code_session_id, ctx_used)
+        VALUES ($id, $createdAt, 'compact', $promptTokens, 0, $codeSessionId, $ctxUsed)
+      `).run({
+        $id: randomUUID(),
+        $createdAt: new Date().toISOString(),
+        $promptTokens: ctxUsed,
+        $codeSessionId: codeSessionId,
+        $ctxUsed: ctxUsed,
+      } as P)
+    }
   }
 
   /** The session's own gateway-request stats (ADR-284, revised twice — founder-reported "ctx
@@ -1680,24 +1722,17 @@ export class ConversationStore {
    *  non-terminal-agent one). */
   getLastApiUsageForSession(codeSessionId: string): { ctxUsed: number; promptTokens: number; genTokens: number; promptTps: number | null; genTps: number | null } | null {
     const row = this.db.prepare(`
-      SELECT prompt_tokens, gen_tokens, duration_ms, prompt_tps, gen_tps FROM api_usage
+      SELECT prompt_tokens, gen_tokens, duration_ms, prompt_tps, gen_tps, ctx_used FROM api_usage
       WHERE code_session_id = $codeSessionId
       ORDER BY created_at DESC LIMIT 1
-    `).get({ $codeSessionId: codeSessionId } as P) as unknown as { prompt_tokens: number; gen_tokens: number; duration_ms: number | null; prompt_tps: number | null; gen_tps: number | null } | undefined
+    `).get({ $codeSessionId: codeSessionId } as P) as unknown as { prompt_tokens: number; gen_tokens: number; duration_ms: number | null; prompt_tps: number | null; gen_tps: number | null; ctx_used: number } | undefined
     if (!row) return null
+    // ctx_used is the MAX across all rows — same high-water-mark semantics as the old
+    // MAX(prompt_tokens) approach, but now /compact can lower it via setCodeSessionCtxUsed.
+    // Sub-agent calls (smaller prompts) can't drag the ring down because MAX ignores them.
     const ctxUsed = (this.db.prepare(`
-      SELECT MAX(prompt_tokens) as maxPromptTokens FROM api_usage WHERE code_session_id = $codeSessionId
-    `).get({ $codeSessionId: codeSessionId } as P) as unknown as { maxPromptTokens: number }).maxPromptTokens
-    // The engine's own per-phase rates when the row has them (ADR-300) — llama.cpp times prefill
-    // and decode separately and reports each, which is the only way either number can be right.
-    //
-    // The fallback below (both counts ÷ the request's TOTAL wall-clock) is what every row used to
-    // get, and it is wrong for both phases by construction: prefill and decode run one after the
-    // other, so neither occupies the full duration. Live measurement that started this: 763
-    // generated tokens on a 62 s claude request came out as 12.3 tok/s against a real decode rate
-    // of ~78. It is kept ONLY so pre-v39 rows still show something rather than nothing, and it is
-    // deliberately the lower-priority branch — a new row always carries the real rates unless the
-    // engine reported none.
+      SELECT MAX(ctx_used) as maxCtxUsed FROM api_usage WHERE code_session_id = $codeSessionId
+    `).get({ $codeSessionId: codeSessionId } as P) as unknown as { maxCtxUsed: number }).maxCtxUsed
     const seconds = row.duration_ms != null && row.duration_ms > 0 ? row.duration_ms / 1000 : null
     return {
       ctxUsed,

@@ -30,6 +30,7 @@ import {
   type ToolResultEvent,
   type AgentSessionEvent,
 } from '@earendil-works/pi-coding-agent'
+import { estimateTokens, calculateContextTokens } from '@earendil-works/pi-coding-agent'
 import { createRobustBashOperations } from './robust-bash'
 import type { TextContent, ToolCall as PiToolCall, Usage } from '@earendil-works/pi-ai'
 import type { Deps } from '../deps'
@@ -1981,8 +1982,41 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
 
   const finalText = session.getLastAssistantText() ?? ''
   const stats = session.getSessionStats()
-  // Prefer pi's live context-usage estimate; fall back to the aggregate token total.
-  const contextUsed = stats.contextUsage?.tokens ?? stats.tokens.total ?? 0
+  // Prefer pi's live context-usage estimate; fall back to a token estimate from the
+  // session's current messages (not the cumulative total, which includes compacted history
+  // and would freeze the ring at the pre-compaction ceiling — ADR-386).
+  let contextUsed: number
+  if (stats.contextUsage?.tokens != null) {
+    contextUsed = stats.contextUsage.tokens
+  } else {
+    // No valid post-compaction assistant usage yet — estimate from the session's messages.
+    // This mirrors pi's estimateContextTokens: use the last assistant's real usage if
+    // available, then estimate trailing messages. Falls back to estimating all messages.
+    let lastUsage: Usage | undefined
+    let lastUsageIdx = -1
+    for (let i = session.messages.length - 1; i >= 0; i--) {
+      const m = session.messages[i]
+      if (m.role === 'assistant' && 'usage' in m) {
+        const u = (m as { usage?: Usage }).usage
+        if (u && calculateContextTokens(u) > 0) {
+          lastUsage = u
+          lastUsageIdx = i
+          break
+        }
+      }
+    }
+    if (lastUsage) {
+      contextUsed = calculateContextTokens(lastUsage)
+      for (let i = lastUsageIdx + 1; i < session.messages.length; i++) {
+        contextUsed += estimateTokens(session.messages[i])
+      }
+    } else {
+      contextUsed = 0
+      for (const m of session.messages) {
+        contextUsed += estimateTokens(m)
+      }
+    }
+  }
   const contextMax = stats.contextUsage?.contextWindow ?? contextWindow
   const usage = foldTurnUsage(stats.tokens, { promptMsTotal, genMsTotal, ttftMs, totalMs: Date.now() - turnStartedAt })
   session.dispose()
@@ -2007,6 +2041,9 @@ export interface CompactCodeResult {
    *  cuts here on future turns instead of replaying the raw messages. */
   upToMessageId: string
   tokensBefore: number
+  /** Post-compaction context size — used to update `api_usage.ctx_used` so the ctx gauge
+   *  reflects the new (smaller) context after compaction, not the frozen pre-compaction value. */
+  ctxUsed?: number
 }
 
 /** Manual /compact — summarizes this session's history-so-far (including any EARLIER
@@ -2143,7 +2180,17 @@ export async function compactCodeSession(params: CompactCodeParams): Promise<Com
     compactionTokensBefore: result.tokensBefore,
   })
 
-  return { summary: result.summary, upToMessageId, tokensBefore: result.tokensBefore }
+  // Update api_usage so the Code session's ctx gauge reflects the post-compaction context
+  // size (not the frozen pre-compaction MAX(prompt_tokens) that was the root cause of the
+  // ctx-gauge-freeze bug, ADR-386). The post-compaction context ≈ keepRecentTokens (recent raw tokens
+  // preserved) + summary tokens (estimated from the summary text length). This is an
+  // approximation — the exact token count depends on pi's tokenizer — but it's close enough
+  // for the ring display and far better than a stale ceiling value.
+  const summaryTokens = Math.ceil(result.summary.length / 4)
+  const ctxUsed = compactionSettings.keepRecentTokens + summaryTokens
+  d.db.setCodeSessionCtxUsed(sessionId, ctxUsed)
+
+  return { summary: result.summary, upToMessageId, tokensBefore: result.tokensBefore, ctxUsed }
 }
 
 export interface LookbackParams {

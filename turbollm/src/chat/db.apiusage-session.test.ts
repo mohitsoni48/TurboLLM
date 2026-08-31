@@ -202,3 +202,27 @@ test('v36 migration: re-opening an existing DB is idempotent (no error, columns 
     rmSync(root, { recursive: true, force: true })
   }
 })
+
+test('getLastApiUsageForSession: /compact lowers ctxUsed so the ring reflects post-compaction reality (ADR-412)', () => {
+  const root = makeTmpRoot()
+  const db = new ConversationStore(root)
+  try {
+    // Simulate a terminal-agent session that reached 98259 tokens (49% of 200k)
+    db.recordApiUsage({ source: 'anthropic', modelKey: 'm1', promptTokens: 98259, genTokens: 400, codeSessionId: 'sess-compact', durationMs: 5000, promptTps: 5000, genTps: 50 })
+    let usage = db.getLastApiUsageForSession('sess-compact')
+    assert.equal(usage!.ctxUsed, 98259, 'pre-compaction: ring shows the high-water mark')
+
+    // Simulate /compact reducing the context to 45000 tokens
+    db.setCodeSessionCtxUsed('sess-compact', 45000)
+    usage = db.getLastApiUsageForSession('sess-compact')
+    assert.equal(usage!.ctxUsed, 45000, 'post-compaction: ring reflects the new, smaller context')
+
+    // A subsequent gateway request with a smaller prompt should NOT raise the ring
+    db.recordApiUsage({ source: 'anthropic', modelKey: 'm1', promptTokens: 50000, genTokens: 200, codeSessionId: 'sess-compact', durationMs: 3000, promptTps: 3000, genTps: 40 })
+    usage = db.getLastApiUsageForSession('sess-compact')
+    assert.equal(usage!.ctxUsed, 50000, 'post-compact request: ring rises to the new larger request')
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
