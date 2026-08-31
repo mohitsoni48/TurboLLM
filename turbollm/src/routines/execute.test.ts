@@ -92,6 +92,28 @@ test('different model loaded and busy: skips with skipReason model_busy, never c
   assert.equal(fetchCalled, false)
 })
 
+test('ComfyUI busy on swap-in: skips with skipReason comfyui_busy, not errored (ADR-386)', async () => {
+  const { d, db } = fakeDeps({ loadedKey: 'other' })
+  // Force the swap-in load itself to report ComfyUI's own busy refusal, the same shape
+  // ModelRouter.loadExplicit returns when its ComfyUI-sharing guard is holding the model.
+  ;(d.modelRouter as unknown as ModelRouter).loadExplicit = async () =>
+    ({ status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.' })
+  const routine = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'agent-1' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  let fetchCalled = false
+  const original = globalThis.fetch
+  globalThis.fetch = (async () => { fetchCalled = true; return new Response('{}', { status: 200 }) }) as typeof fetch
+  let status: RoutineRunStatus
+  try {
+    status = await executeRoutine(d, routine, run)
+  } finally { globalThis.fetch = original }
+  const runs = db.listRoutineRuns(routine.id)
+  assert.equal(runs[0].status, 'skipped')
+  assert.equal(runs[0].skipReason, 'comfyui_busy')
+  assert.equal(status, 'skipped')
+  assert.equal(fetchCalled, false)
+})
+
 // Phase 3, Task 8: what used to be the 'not implemented yet' placeholder here is now a real call
 // into cli-routine.ts's self-contained orchestrator. Asserted through runCliRoutineBranch's
 // `_runCli` seam because the real orchestrator's very first step probes the installed `claude`

@@ -21,6 +21,7 @@ import { decideModelAction } from './model-conflict'
 export type ModelSwapOutcome =
   | { outcome: 'ran' }
   | { outcome: 'skip-busy' }
+  | { outcome: 'skip-comfyui-busy' }
   | { outcome: 'skip-load-failed'; message: string }
 
 export interface ModelSwapDeps {
@@ -50,7 +51,12 @@ export async function withPinnedModel(deps: ModelSwapDeps, pinnedModel: string, 
 
   // 'swap-then-run'
   const swapResult = await deps.modelRouter.loadExplicit(pinnedModel)
-  if ('status' in swapResult) return { outcome: 'skip-load-failed', message: swapResult.message }
+  if ('status' in swapResult) {
+    // ComfyUI busy is a temporary yield, not a load failure.
+    if (swapResult.message.includes('ComfyUI is rendering'))
+      return { outcome: 'skip-comfyui-busy' }
+    return { outcome: 'skip-load-failed', message: swapResult.message }
+  }
 
   try {
     await fn()

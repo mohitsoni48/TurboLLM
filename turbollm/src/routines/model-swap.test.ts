@@ -58,3 +58,29 @@ test('restore still runs even if fn throws', async () => {
   await assert.rejects(() => withPinnedModel(deps, 'a', async () => { throw new Error('task failed') }))
   assert.deepEqual(loadCalls, ['a', 'b'])
 })
+
+test('ComfyUI busy -> skip-comfyui-busy, fn never called (ADR-386, a temporary yield, not a load failure)', async () => {
+  const manager = {
+    status: () => ({ state: 'running', model: { key: 'b' } }),
+    sessionStats: () => ({ activeRequests: 0 }),
+  } as unknown as Manager
+  const modelRouter = {
+    loadExplicit: async () => ({ status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.' }),
+  } as unknown as ModelRouter
+  let called = false
+  const result = await withPinnedModel({ manager, modelRouter }, 'a', async () => { called = true })
+  assert.equal(result.outcome, 'skip-comfyui-busy')
+  assert.equal(called, false)
+})
+
+test('a genuine load failure (not ComfyUI) still reports skip-load-failed with the real message', async () => {
+  const manager = {
+    status: () => ({ state: 'running', model: { key: 'b' } }),
+    sessionStats: () => ({ activeRequests: 0 }),
+  } as unknown as Manager
+  const modelRouter = {
+    loadExplicit: async () => ({ status: 500, message: 'unknown model architecture: bailingmoe3' }),
+  } as unknown as ModelRouter
+  const result = await withPinnedModel({ manager, modelRouter }, 'a', async () => {})
+  assert.deepEqual(result, { outcome: 'skip-load-failed', message: 'unknown model architecture: bailingmoe3' })
+})

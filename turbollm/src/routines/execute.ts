@@ -84,6 +84,10 @@ function finalizeSwapOutcome(d: Deps, runId: string, swap: ModelSwapOutcome, ran
     d.db.updateRoutineRun(runId, { status: 'skipped', skipReason: 'model_busy', endedAt })
     return 'skipped'
   }
+  if (swap.outcome === 'skip-comfyui-busy') {
+    d.db.updateRoutineRun(runId, { status: 'skipped', skipReason: 'comfyui_busy', endedAt })
+    return 'skipped'
+  }
   d.db.updateRoutineRun(runId, { status: 'errored', error: swap.message, endedAt })
   return 'errored'
 }
