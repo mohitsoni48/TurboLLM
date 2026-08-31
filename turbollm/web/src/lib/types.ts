@@ -702,7 +702,7 @@ export type LoadProfile = {
   cacheReuse: number
   useJinja: boolean
   chatTemplateFile: string
-  speculative: 'off' | 'mtp' | 'nextn' | 'draft'
+  speculative: 'off' | 'mtp' | 'nextn' | 'draft' | 'dflash'
   mtpHeadPath: string
   draftModelPath: string
   sampling: Sampling

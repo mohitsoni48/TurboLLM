@@ -34,7 +34,17 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **Speculative decoding gains a DFlash mode.** The Speculative decoding section in a model's
+  load settings now offers `DFlash` alongside `MTP`/`NextN`/`Draft`, showing up whenever the
+  active engine reports support for it (`--spec-type` + `--spec-draft-model` +
+  `spec-type:draft-dflash`) — capability-gated like the others, not tied to any one engine or
+  fork. Picking it shows a single dropdown to choose a draft model from your library, scoped by
+  default to files published in the same source repo as the target model (with a "Show all
+  models" toggle, since a draft's own GGUF `arch` tag is deliberately different from the
+  target's — filtering on that would hide the correct file). The draft window and adaptive
+  controller reuse existing defaults, so there are no extra knobs to configure.
 
 ## [1.11.8] - 2026-08-24
 

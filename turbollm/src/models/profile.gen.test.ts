@@ -309,6 +309,25 @@ test('draftMin 0 is emitted (not treated as unset)', () => {
   assert.equal(args[args.indexOf('--draft-min') + 1], '0')
 })
 
+test('dflash mode emits --spec-type draft-dflash and --spec-draft-model', () => {
+  const p = { ...base(), speculative: 'dflash' as const, draftModelPath: '/models/draft-dflash.gguf' }
+  const args = profileToArgs(p, model(), caps)
+  assert.equal(args[args.indexOf('--spec-type') + 1], 'draft-dflash')
+  assert.equal(args[args.indexOf('--spec-draft-model') + 1], '/models/draft-dflash.gguf')
+  assert.equal(args[args.indexOf('--draft-max') + 1], '16')
+  assert.equal(args[args.indexOf('--draft-min') + 1], '1')
+})
+
+// Regression: dflash must be gated on the engine actually reporting spec-type:draft-dflash
+// support (probed capability), same as every other speculative mode — an engine that only
+// supports e.g. draft-simple must not silently get a --spec-type it will reject at launch.
+test('dflash mode is gated on the engine accepting spec-type:draft-dflash', () => {
+  const capNoDflash = { kvTypes: [], flags: ['--spec-type', '--spec-draft-model', 'spec-type:draft-simple'] }
+  const p = { ...base(), speculative: 'dflash' as const, draftModelPath: '/models/draft-dflash.gguf' }
+  const args = profileToArgs(p, model(), capNoDflash)
+  assert.ok(!args.includes('--spec-draft-model'), '--spec-draft-model must not be passed when the engine lacks draft-dflash support')
+})
+
 // Regression: the draft window is a property of the speculation mechanism itself
 // (llama.cpp's shared verify loop), not specific to how the draft is produced — it must
 // apply to 'mtp' and 'nextn' modes too, not only the external-draft-model 'draft' mode

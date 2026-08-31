@@ -1,7 +1,7 @@
 ﻿import { useEffect, useMemo, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
 import { ChevronDown, ExternalLink, Gauge, MoreHorizontal, RotateCcw, Save, X, Zap } from 'lucide-react'
 import { ApiError, track } from '../../lib/api'
-import { useBenchActions, useBenchState, useEngines, useModelActions, useModelDetail, useModelPresetMutations, useModelPresets, useStatus } from '../../lib/queries'
+import { useBenchActions, useBenchState, useEngines, useModelActions, useModelDetail, useModelPresetMutations, useModelPresets, useModels, useStatus } from '../../lib/queries'
 import type { CardSampling, LoadProfile, ModelPreset, SysGpu } from '../../lib/types'
 import { Input } from '../../components/ui/input'
 import { defaultGpu, defaultVllm } from '../../lib/types'
@@ -368,6 +368,11 @@ export function ModelDetailDialog({
   )
     specOptions.push('nextn')
   if (hasFlag('--model-draft')) specOptions.push('draft')
+  // DFlash = adaptive speculative decoding with a separate draft GGUF, same as `draft`
+  // but with its own --spec-type value. Not fork-specific — mainline llama.cpp and every
+  // fork we've probed exposes it, so (like `draft`) it's gated on engine capability only,
+  // never on model arch.
+  if (hasFlag('--spec-type') && hasFlag('--spec-draft-model') && specAccepts('draft-dflash')) specOptions.push('dflash')
 
   const fit = useMemo(() => {
     if (!detail || !draft) return null
@@ -731,12 +736,12 @@ export function ModelDetailDialog({
                   {draft.speculative === 'nextn' && (
                     <p className="text-[11px] text-faint">Uses this model's built-in NextN head — no extra file needed.</p>
                   )}
-                  {draft.speculative === 'draft' && (
-                    <PathField
-                      label="Draft model GGUF"
-                      hint="A small same-family model."
+                  {(draft.speculative === 'draft' || draft.speculative === 'dflash') && (
+                    <DraftModelSelect
+                      hint={draft.speculative === 'dflash' ? 'Adaptive DFlash draft model.' : 'A small same-family model.'}
                       value={draft.draftModelPath}
-                      placeholder="Path to small draft model"
+                      sourceRepo={detail.sourceRepo}
+                      excludePath={detail.path}
                       onChange={(v) => set('draftModelPath', v)}
                     />
                   )}
@@ -1351,7 +1356,7 @@ function GpuSplitControls({ gpus, gpu, setG }: {
   )
 }
 
-const SPEC_LABEL: Record<LoadProfile['speculative'], string> = { off: 'Off', mtp: 'MTP', nextn: 'NextN', draft: 'Draft' }
+const SPEC_LABEL: Record<LoadProfile['speculative'], string> = { off: 'Off', mtp: 'MTP', nextn: 'NextN', draft: 'Draft', dflash: 'DFlash' }
 
 function SpecSegmented({ value, options, onChange }: {
   value: LoadProfile['speculative']; options: Array<LoadProfile['speculative']>; onChange: (v: LoadProfile['speculative']) => void
@@ -1369,6 +1374,52 @@ function SpecSegmented({ value, options, onChange }: {
           {SPEC_LABEL[o]}
         </button>
       ))}
+    </div>
+  )
+}
+
+/** Draft-model picker for `draft`/`dflash` speculative modes. A draft model's own GGUF arch
+ *  tag is deliberately NOT the target's (e.g. a Qwen3.8-27B target pairs with a 5-block/1.9B
+ *  "dflash"-arch draft) — architecture equality would hide the one correct file. The reliable
+ *  signal instead is the source HF repo: draft models are almost always published alongside
+ *  their target. Defaults to same-repo-only when that yields at least one candidate, with an
+ *  escape hatch for the (rarer) cross-repo case. Mirrors RoutineFormFields' model select
+ *  (orphan-value fallback included, since a profile can carry a `draftModelPath` for a file
+ *  that's since been removed from the library). */
+function DraftModelSelect({ hint, value, onChange, sourceRepo, excludePath }: {
+  hint?: string; value: string; onChange: (v: string) => void; sourceRepo?: string | null; excludePath?: string
+}) {
+  const modelsQ = useModels()
+  const all = (modelsQ.data?.models ?? []).filter((m) => m.path !== excludePath)
+  const sameRepo = sourceRepo ? all.filter((m) => m.sourceRepo === sourceRepo) : []
+  const [showAll, setShowAll] = useState(false)
+  const scoped = sameRepo.length > 0 && !showAll
+  const models = scoped ? sameRepo : all
+  const orphanPath = value && !models.some((m) => m.path === value) ? value : null
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center justify-between">
+        <div className="text-[12px] text-ink">Draft model{hint && <span className="ml-1 text-faint">{hint}</span>}</div>
+        {sameRepo.length > 0 && (
+          <button type="button" onClick={() => setShowAll((s) => !s)} className="text-[11px] text-faint hover:text-ink">
+            {showAll ? 'Show same-repo only' : 'Show all models'}
+          </button>
+        )}
+      </div>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="w-full rounded-md border border-border bg-bg px-2 py-1 text-[12px] text-ink outline-none"
+      >
+        <option value="">Choose a model…</option>
+        {orphanPath && <option value={orphanPath}>{orphanPath} (not in the current library)</option>}
+        {models.map((m) => (
+          <option key={m.key} value={m.path} title={m.path}>
+            {m.name} · {m.quant} — {m.dir}
+          </option>
+        ))}
+      </select>
+      {scoped && <p className="text-[11px] text-faint">From {sourceRepo} — the source repo usually ships the matching draft.</p>}
     </div>
   )
 }

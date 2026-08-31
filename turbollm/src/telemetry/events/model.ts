@@ -150,7 +150,7 @@ export const modelLoad = defineEvent({
         batchSize: f.int({ optional: true }),
         uBatchSize: f.int({ optional: true }),
         cacheReuse: f.int(),
-        speculative: f.enum(['off', 'mtp', 'nextn', 'draft']),
+        speculative: f.enum(['off', 'mtp', 'nextn', 'draft', 'dflash']),
         contextOverflow: f.enum(['shift', 'keep']),
         nKeep: f.int(),
         ropeScalingType: f.enum(['none', 'linear', 'yarn']),

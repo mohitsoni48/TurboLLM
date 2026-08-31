@@ -136,7 +136,7 @@ export interface LoadProfile {
   cacheReuse: number
   useJinja: boolean
   chatTemplateFile: string
-  speculative: 'off' | 'mtp' | 'nextn' | 'draft'
+  speculative: 'off' | 'mtp' | 'nextn' | 'draft' | 'dflash'
   mtpHeadPath: string
   draftModelPath: string
   sampling: Sampling
@@ -797,6 +797,20 @@ export function profileToArgs(
   } else if (p.speculative === 'draft' && p.draftModelPath && has('--model-draft')) {
     if (specType) a.push('--spec-type', 'draft')
     a.push('--model-draft', p.draftModelPath)
+    specActive = true
+  } else if (
+    p.speculative === 'dflash' &&
+    p.draftModelPath &&
+    specType &&
+    specAccepts('draft-dflash') &&
+    has('--spec-draft-model')
+  ) {
+    // DFlash: adaptive speculative decoding with a separate draft GGUF (same
+    // --spec-draft-model flag as 'draft' mode's --model-draft — llama.cpp aliases
+    // them). --spec-dm-controller defaults to 'profit' (the adaptive controller)
+    // when omitted, so no extra flag is needed to get the adaptive behavior.
+    a.push('--spec-type', 'draft-dflash')
+    a.push('--spec-draft-model', p.draftModelPath)
     specActive = true
   }
   // Draft window (GitHub #35): how many tokens the draft head proposes per step before
