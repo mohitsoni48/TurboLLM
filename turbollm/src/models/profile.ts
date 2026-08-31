@@ -452,9 +452,12 @@ export function estimateVramPerGpu(p: LoadProfile, m: ModelEntry, sys: SysInfo):
   const blocks = m.blockCount > 0 ? m.blockCount : 1
   const sizeMb = m.sizeBytes / 1e6
   const perLayerMb = (sizeMb * GPU_WEIGHT_FRACTION) / blocks
-  // MoE keeps every layer's attention on the GPU and only moves experts to the CPU, so all
-  // `blocks` layers still occupy VRAM. Dense drops whole layers, so only `ngl` of them do.
-  const residentLayers = m.moe ? blocks : Math.max(0, Math.min(p.ngl, blocks))
+  // Dense drops whole layers, so only `ngl` of them occupy VRAM.
+  // MoE also honours `ngl` for the attention layers — lowering `ngl` frees GPU VRAM even
+  // for MoE, so the estimate must not always report `blocks` as resident (otherwise `ngl=0`
+  // reads "fits fully" while nothing is on the GPU). Expert layers move to CPU via
+  // `--n-cpu-moe` and don't need VRAM.
+  const residentLayers = Math.max(0, Math.min(p.ngl, blocks))
   const nCpuMoe = m.moe ? Math.max(0, Math.min(p.nCpuMoe, blocks)) : 0
 
   // Layers per GPU. splitMode 'none' pins everything to one card; otherwise honour tensorSplit's
