@@ -786,7 +786,7 @@ export function ModelDetailDialog({
                 <Row label="Engine port" hint="Pin this model's engine to a specific port instead of auto-assigning the first free one (8081+). Falls back to auto if taken.">
                   <DefaultableNumberInput value={draft.port || undefined} placeholder="auto" min={1024} max={65535} onChange={(v) => set('port', v)} />
                 </Row>
-                {detail.loaded && statusQ.data?.engine.launchCommand && (
+                {statusQ.data?.engine.launchCommand && (
                   <Row label="Launch command" hint="The exact command TurboLLM spawned this model with.">
                     <CopyButton text={statusQ.data.engine.launchCommand} label="Copy" size={14} screen="models" />
                   </Row>
@@ -1162,6 +1162,9 @@ function AutoTune({
             <p className="text-[12px] text-ink">Done — <span className="font-mono" style={{ color: 'var(--ok)' }}>{bestTps.toFixed(1)} tok/s</span>. Saved as this model's default.</p>
           )}
           {done && resultError && <p className="text-[12px]" style={{ color: 'var(--warn)' }}>{resultError}</p>}
+          {done && benchTps !== null && resultError && (
+            <p className="text-[12px] text-faint">Previous run: {benchTps.toFixed(1)} tok/s (this run failed)</p>
+          )}
           {startError && <p className="text-[12px]" style={{ color: 'var(--err)' }}>{startError}</p>}
         </div>
       )}
