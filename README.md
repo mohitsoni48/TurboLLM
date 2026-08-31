@@ -208,7 +208,7 @@ the detail:
 - **Full load-parameter UI**, a superset of what other tools expose: context length, GPU offload
   (`-ngl`), **MoE CPU-offload (`--n-cpu-moe`)**, parallel slots, **independent K and V cache-quant
   type** (incl. low-bit on supporting forks), CPU threads, flash attention, **speculative decoding
-  (NextN / MTP / draft, with a configurable draft min/max window)**, a **pinned engine port** per
+  (NextN / MTP / draft / DFlash, with a configurable draft min/max window)**, a **pinned engine port** per
   model, and a **custom/raw flags** field for anything not exposed as its own control.
 - **Copy the exact launch command** for a loaded model — runs the same config standalone with
   llama.cpp/the fork directly, no TurboLLM required.

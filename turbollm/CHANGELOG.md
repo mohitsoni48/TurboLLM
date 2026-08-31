@@ -32,7 +32,7 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 - They're ready out of the box: TurboLLM installs the pinned `pi-search` package (web search, code search, context/deep-wiki, web fetch/Firecrawl) best-effort on first launch.
 - Turn it off anytime with the `TOBOLLM_PI_DISABLE_SEARCH_INSTALL=1` setting — your launch still works, just without the auto-install.
 
-## [Unreleased]
+## [1.12.0] - 2026-08-31
 
 ### Added
 
@@ -45,6 +45,43 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   models" toggle, since a draft's own GGUF `arch` tag is deliberately different from the
   target's — filtering on that would hide the correct file). The draft window and adaptive
   controller reuse existing defaults, so there are no extra knobs to configure.
+- **Message editing now matches the message's own size.** Editing a chat message opens a box the
+  same size as the message it replaces — same width, font, and line metrics — instead of a small
+  fixed-height box. It tracks as you type and as the layout resizes, so long messages no longer
+  collapse into a tiny scroll window while you edit.
+
+### Fixed
+
+- **Code-session context gauge no longer freezes at its pre-compaction ceiling.** After
+  `/compact`, the gauge reflects the post-compaction context size (a new `ctx_used` tracking
+  value, DB migration to v49) instead of pinning at the largest request before compaction.
+- **Custom-engine git builds no longer stomp on each other.** A rebuild of one repo no longer
+  wipes a different fork's build directory (the build dir is now keyed on the full owner/repo
+  identity), the engine's display name is no longer silently reverted to a previously built
+  fork's name, and the catalog card now shows the build result instead of hiding it.
+- **A routine whose model swap hits a busy ComfyUI now reports *skipped*, not *errored*.** A
+  swap-in that yields to an in-flight ComfyUI render is a temporary skip, and the run now
+  records `skipped (ComfyUI busy)` instead of ending in error.
+- **Engine probing: flag classification and stale-capability rechecks.** `classifyFlag` no
+  longer misclassifies flags with long help blocks, now understands the `{a,b,c}` / `(a|b|c)`
+  enum spellings, and the stale-capabilities check no longer fires on genuinely old builds —
+  a reprobe is only requested when a removed draft flag AND its successor are both present.
+- **MoE VRAM estimate now honors `ngl`.** Mixture-of-experts models no longer report every
+  layer as resident — offloading whole layers with `ngl` frees GPU VRAM on MoE too, so
+  `ngl=0` no longer reads "fits fully" when nothing is on the GPU.
+- **Model detail dialog: launch command visible when unloaded, and a stale tuned tok/s no
+  longer masks a failed run.** The exact launch command now shows without requiring the model to
+  be loaded, and a failed auto-tune run shows "Previous run: X tok/s (this run failed)"
+  under the error instead of the stale number standing in for it.
+
+### Discord
+- Speculative decoding gains a DFlash mode — adaptive decoding with a separate draft model. It appears whenever your engine supports it; a dropdown picks the draft from your library, scoped by default to files published in the same source repo as the target model.
+- Editing a chat message now opens at exactly the size of the message — same width and text, tracking as you type — instead of a small fixed box.
+- Accuracy fixes: routine model swaps that hit a busy ComfyUI now show as *skipped* (not errored); rebuilding a custom engine no longer wipes another fork's build or reverts its name; the code-session context gauge updates after compaction instead of freezing; MoE VRAM estimates honor the offload setting; and the launch command is visible even before the model is loaded.
+
+## [Unreleased]
+
+_Nothing yet._
 
 ## [1.11.8] - 2026-08-24
 
