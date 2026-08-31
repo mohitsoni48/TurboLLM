@@ -90,6 +90,18 @@ export interface CatalogEngine {
    *  its variants at call time via llamaCppVariants(); other engines list them
    *  inline or leave undefined (handled in later phases). */
   variants?: EngineVariant[]
+  /** True ONLY for the backend-picker `llama.cpp` entry (ADR-388). `installEndpoint: ''` is
+   *  ambiguous — it also means "no real download path, build-from-source only" (Prism,
+   *  BeeLlama, ik_llama.cpp, TurboQuant, solar-open2, `llama.cpp-cuda-linux`), and those
+   *  entries WANT the generic sourceRepo-based "is a build of this repo already registered?"
+   *  match in `/api/v1/engines/catalog` — it is their only installed/enabled signal. The base
+   *  `llama.cpp` entry is different: its installed state comes entirely from the separate
+   *  backend-build detection (`LlamaCppBackendRows`, the "Manage GPU builds" expander), so
+   *  letting it ALSO claim the generic sourceRepo match stole a manually source-built plain
+   *  `ggml-org/llama.cpp` binary's registry id into `matchedRegistryIds` — hiding it from BOTH
+   *  the custom-engine card list AND the (non-existent, for this entry) manage-actions UI the
+   *  generic match implies. Set true to opt this entry out of that generic match. */
+  excludeFromSourceMatch?: boolean
 }
 
 // Maps each llama.cpp BackendId to the hardware it needs + how fast it is.
@@ -137,6 +149,9 @@ const ALL: CatalogEngine[] = [
     // llama.cpp expands into the backend sub-picker (existing UI); it has no single
     // install endpoint of its own.
     installEndpoint: '',
+    // Its installed state comes from the separate backend-build detection (LlamaCppBackendRows),
+    // not the generic sourceRepo match below — see the field's own doc comment (ADR-388).
+    excludeFromSourceMatch: true,
   },
   {
     // Upstream publishes NO Linux CUDA prebuilt (download.ts availableBackends() — Linux

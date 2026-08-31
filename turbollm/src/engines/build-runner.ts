@@ -47,6 +47,18 @@ export interface BuildRequest {
   toolchainDirs: string[]
 }
 
+/** PURE: the display name to register a (re)built engine under. The name THIS request
+ *  submitted always wins — a rebuild re-sends whatever the name box currently holds
+ *  (including a deliberate rename), and silently keeping the prior registration's stored name
+ *  instead discarded that every time (ADR-387 correction: the reported "always names it Prism"
+ *  bug had two causes — a cross-repo `buildDirName` collision, fixed separately, AND this;
+ *  rebuilding the SAME repo legitimately matches a prior registration every time, so this one
+ *  kept firing even after the collision fix). `priorName` is only a fallback for a
+ *  hypothetical caller that omits `name` entirely. */
+export function chooseEngineName(name: string | undefined, priorName: string | undefined): string {
+  return name ?? priorName ?? ''
+}
+
 export interface BuildHooks {
   phase: (p: BuildPhase) => void
   log: (line: string) => void
@@ -63,17 +75,27 @@ export interface BuildOutput {
 
 /** PURE: a filesystem-safe directory slug for a repo+branch, so a rebuild of the same
  *  source reuses (overwrites) the same dir. e.g. ("https://github.com/ikawrakow/ik_llama.cpp.git",
- *  "sidestream") → "ik_llama.cpp-sidestream". Falls back to "engine" for an unparseable URL. */
+ *  "sidestream") → "ikawrakow-ik_llama.cpp-sidestream". Falls back to "engine" for an unparseable URL.
+ *
+ *  Keyed on the FULL owner/repo identity ({@link normRepoUrl}), not just the trailing URL
+ *  segment (ADR-387) — countless llama.cpp forks keep the upstream repo NAME "llama.cpp" and
+ *  differ only by owner (PrismML-Eng/llama.cpp, ggml-org/llama.cpp, ...). Slugging by basename
+ *  alone collapsed every one of them onto the identical build directory: `runBuild`'s
+ *  clean-start `rmSync` silently wiped one fork's build when a different fork was built next,
+ *  and routes.ts's binPath-based "is this a rebuild?" check then treated the fresh build as a
+ *  rebuild of the OLD engine — inheriting its stored name no matter what name the user typed
+ *  for the new one (the reported "always names it Prism" bug — whichever llama.cpp fork was
+ *  built and named first won permanently). */
 export function buildDirName(repoUrl: string, branch?: string, commit?: string): string {
-  const last = repoUrl.trim().replace(/\/+$/, '').split(/[\\/]/).pop() ?? ''
-  const repo = last.replace(/\.git$/i, '').trim() || 'engine'
+  const repo = normRepoUrl(repoUrl) || 'engine'
   const b = (branch ?? '').trim()
   const sha = (commit ?? '').trim()
   // A pinned commit must land in its OWN dir — otherwise it collapses to the same name as a
   // plain branch build of the same repo and `runBuild`'s clean-start rmSync would silently wipe
   // an existing (possibly currently-installed) build of that repo.
   const raw = sha ? `${repo}-${sha.slice(0, 12)}` : b ? `${repo}-${b}` : repo
-  // Keep it tame on disk: collapse anything outside [A-Za-z0-9._-] to a single dash.
+  // Keep it tame on disk: collapse anything outside [A-Za-z0-9._-] to a single dash (also
+  // folds normRepoUrl's "/" separator into a dash, e.g. "owner/repo" → "owner-repo").
   return raw.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'engine'
 }
 
@@ -95,8 +117,13 @@ export function normRepoUrl(s?: string): string {
     .toLowerCase()
     .replace(/^https?:\/\//, '')
     .replace(/^github\.com\//, '')
-    .replace(/\.git$/, '')
+    // Trailing slash(es) stripped BEFORE the ".git" suffix — a URL ending ".git/" (trailing
+    // slash after ".git") left the ".git$" anchor unable to match when this ran the other way
+    // round (found via ADR-387's buildDirName fix, which routed through this function and
+    // exposed it): ".../llama.cpp.git/" normalized to ".../llama.cpp.git" instead of
+    // ".../llama.cpp", which would have let two spellings of the identical repo compare unequal.
     .replace(/\/+$/, '')
+    .replace(/\.git$/, '')
 }
 
 /** The built `llama-server` for a repo (+optional branch) under `enginesRoot`, or null. Used

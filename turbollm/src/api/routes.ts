@@ -43,7 +43,7 @@ import { ensureKoboldcpp, koboldcppBinPath, koboldcppDir } from '../engines/kobo
 import { ensureLlamafile, llamafileBinPath, llamafileDir } from '../engines/llamafile'
 import { catalogForPlatform, catalogEngine } from '../engines/catalog'
 import { checkBuildPrereqs } from '../engines/build-prereqs'
-import { runBuild, buildDirName, sameRepo, sourceBuildBinary, sourceBuildDirOf } from '../engines/build-runner'
+import { runBuild, buildDirName, chooseEngineName, sameRepo, sourceBuildBinary, sourceBuildDirOf } from '../engines/build-runner'
 import { provisionCuda } from '../engines/cuda-provision'
 import { detectHardware } from '../engines/hardware'
 import { recommendEngines } from '../engines/recommend'
@@ -540,14 +540,22 @@ export function registerApi(app: Hono, d: Deps): void {
       // as "solar-open2 already installed" and hand out a binary with no solar_open2 support at
       // all. Entries with no commit/patch pin (sourceCommit/patchUrl both '') still match each
       // other exactly as before.
-      const srcEng = regEngines.find(
-        (x) =>
-          sameRepo(x.sourceRepo, e.homepage) &&
-          (x.sourceCommit ?? '') === (e.sourceCommit ?? '') &&
-          (x.sourcePatchUrl ?? '') === (e.patchUrl ?? ''),
-      )
+      // Skip entirely for `excludeFromSourceMatch` entries (ADR-388) — the backend-picker
+      // `llama.cpp` card's installed state comes from LlamaCppBackendRows, not this. Without the
+      // guard, a manually source-built plain `ggml-org/llama.cpp` (no commit/patch — the same
+      // identity this card matches with) got its registry id silently claimed here, hiding it
+      // from BOTH the custom-engine card list AND this card's own UI (which never reads
+      // `sourceEngineId`) — founder-reported: "now it is only visible for selection in dropdown".
+      const srcEng = e.excludeFromSourceMatch
+        ? undefined
+        : regEngines.find(
+            (x) =>
+              sameRepo(x.sourceRepo, e.homepage) &&
+              (x.sourceCommit ?? '') === (e.sourceCommit ?? '') &&
+              (x.sourcePatchUrl ?? '') === (e.patchUrl ?? ''),
+          )
       let sourceBinPath: string | undefined = srcEng?.binPath
-      if (!srcEng) sourceBinPath = sourceBuildBinary(enginesRoot, e.homepage, undefined, e.sourceCommit) ?? undefined
+      if (!srcEng && !e.excludeFromSourceMatch) sourceBinPath = sourceBuildBinary(enginesRoot, e.homepage, undefined, e.sourceCommit) ?? undefined
       const sourceBuilt = !!srcEng || !!sourceBinPath
       if (srcEng) {
         installed = true
@@ -688,7 +696,7 @@ export function registerApi(app: Hono, d: Deps): void {
           if (d.registry.active()?.id === prior.id) await d.manager.stopAndWait()
           try { d.registry.remove(prior.id) } catch { /* already gone */ }
         }
-        const eng = (await d.registry.add(prior?.name ?? name ?? '', out.binPath, {
+        const eng = (await d.registry.add(chooseEngineName(name, prior?.name), out.binPath, {
           sourceRepo: repoUrl,
           sourceBranch: branch,
           sourceCommit: commit,

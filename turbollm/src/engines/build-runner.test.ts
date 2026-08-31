@@ -1,19 +1,19 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildDirName, CMAKE_CONFIGURE_ARGS, isIncompleteMetalBackendError, pickGenerator, vcvarsBatch, stripGenericAsmLanguage, sameRepo, sourceBuildDirOf, notCmakeProjectError, missingPatchShaError, sha256Hex, patchChecksumMismatchError } from './build-runner'
+import { buildDirName, chooseEngineName, CMAKE_CONFIGURE_ARGS, isIncompleteMetalBackendError, pickGenerator, vcvarsBatch, stripGenericAsmLanguage, sameRepo, normRepoUrl, sourceBuildDirOf, notCmakeProjectError, missingPatchShaError, sha256Hex, patchChecksumMismatchError } from './build-runner'
 import { join } from 'node:path'
 
-test('buildDirName: repo name from a .git URL, branch appended', () => {
-  assert.equal(buildDirName('https://github.com/ikawrakow/ik_llama.cpp.git', 'sidestream'), 'ik_llama.cpp-sidestream')
+test('buildDirName: owner/repo from a .git URL, branch appended', () => {
+  assert.equal(buildDirName('https://github.com/ikawrakow/ik_llama.cpp.git', 'sidestream'), 'ikawrakow-ik_llama.cpp-sidestream')
 })
 
-test('buildDirName: no branch → bare repo name; trailing slash + .git stripped', () => {
-  assert.equal(buildDirName('https://github.com/ggml-org/llama.cpp'), 'llama.cpp')
-  assert.equal(buildDirName('https://github.com/ggml-org/llama.cpp.git/'), 'llama.cpp')
+test('buildDirName: no branch → bare owner/repo slug; trailing slash + .git stripped', () => {
+  assert.equal(buildDirName('https://github.com/ggml-org/llama.cpp'), 'ggml-org-llama.cpp')
+  assert.equal(buildDirName('https://github.com/ggml-org/llama.cpp.git/'), 'ggml-org-llama.cpp')
 })
 
 test('buildDirName: sanitizes unsafe chars in branch to single dashes', () => {
-  assert.equal(buildDirName('https://github.com/owner/repo', 'feature/foo bar'), 'repo-feature-foo-bar')
+  assert.equal(buildDirName('https://github.com/owner/repo', 'feature/foo bar'), 'owner-repo-feature-foo-bar')
 })
 
 test('buildDirName: unparseable URL falls back to "engine"', () => {
@@ -32,9 +32,54 @@ test('buildDirName: a pinned commit gets its OWN dir, never the same as a plain 
   const pinnedWithBranch = buildDirName(repo, 'feature/turboquant-kv-cache', '11a241d0db78a68e0a5b99fe6f36de6683100f6a')
   assert.notEqual(pinned, plain)
   assert.notEqual(pinned, branched)
-  assert.equal(pinned, 'atomic-llama-cpp-turboquant-11a241d0db78')
+  assert.equal(pinned, 'atomicbot-ai-atomic-llama-cpp-turboquant-11a241d0db78')
   // commit takes priority over branch when both are set (same dir either way).
   assert.equal(pinnedWithBranch, pinned)
+})
+
+test('chooseEngineName: a freshly-submitted name ALWAYS wins over the prior registration (ADR-387 correction)', () => {
+  // The actual "always names it Prism" bug on a REBUILD of the same repo: rebuilding
+  // legitimately matches `prior`, and the old code kept prior.name unconditionally, discarding
+  // whatever new name the user just typed.
+  assert.equal(chooseEngineName('My New Name', 'Prism'), 'My New Name')
+  assert.equal(chooseEngineName('Prism v2', 'Prism'), 'Prism v2')
+})
+
+test('chooseEngineName: falls back to the prior name only when no name was submitted at all', () => {
+  assert.equal(chooseEngineName(undefined, 'Prism'), 'Prism')
+})
+
+test('chooseEngineName: a fresh build with neither a submitted nor a prior name is empty (registry.add derives one)', () => {
+  assert.equal(chooseEngineName(undefined, undefined), '')
+})
+
+test('normRepoUrl: strips scheme, github.com host, .git suffix, trailing slash, and case', () => {
+  assert.equal(normRepoUrl('https://github.com/GGML-org/Llama.cpp'), 'ggml-org/llama.cpp')
+  assert.equal(normRepoUrl('https://github.com/ggml-org/llama.cpp.git'), 'ggml-org/llama.cpp')
+  assert.equal(normRepoUrl('https://github.com/ggml-org/llama.cpp/'), 'ggml-org/llama.cpp')
+})
+
+test('normRepoUrl: a trailing slash AFTER ".git" still strips both (order-of-operations regression)', () => {
+  // Found via the buildDirName fix above: stripping ".git$" before the trailing slash left
+  // ".git" stranded whenever the URL ended ".git/" — two spellings of the same repo would then
+  // compare unequal in sameRepo/customSourceKey, the exact bug class this file fixes.
+  assert.equal(normRepoUrl('https://github.com/ggml-org/llama.cpp.git/'), 'ggml-org/llama.cpp')
+  assert.equal(normRepoUrl('https://github.com/ggml-org/llama.cpp.git//'), 'ggml-org/llama.cpp')
+})
+
+test('buildDirName: two DIFFERENT forks that share the upstream repo NAME never collide (ADR-387 regression)', () => {
+  // Countless llama.cpp forks keep the repo named "llama.cpp" and differ only by owner. Before
+  // the fix, buildDirName slugged on the trailing URL segment alone, so these produced the
+  // IDENTICAL directory — runBuild's clean-start rmSync would wipe one fork's build when the
+  // other was built next, and routes.ts's binPath-based rebuild check would then inherit the
+  // OLD engine's stored name for the NEW build no matter what name the user typed.
+  const prism = buildDirName('https://github.com/PrismML-Eng/llama.cpp', 'prism')
+  const upstream = buildDirName('https://github.com/ggml-org/llama.cpp')
+  const anotherFork = buildDirName('https://github.com/someone-else/llama.cpp')
+  assert.notEqual(prism, upstream)
+  assert.notEqual(prism, anotherFork)
+  assert.notEqual(upstream, anotherFork)
+  assert.equal(prism, 'prismml-eng-llama.cpp-prism')
 })
 
 test('CMAKE_CONFIGURE_ARGS: enables CUDA + Release, allows an unrecognized-but-newer host compiler', () => {
