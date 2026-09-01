@@ -12,6 +12,7 @@ vi.mock('../../lib/api', async (importOriginal) => ({
 }))
 
 const localCancel = vi.fn()
+const localRemove = vi.fn()
 
 // Only the LOCAL data layer is mocked. `link-queries` is deliberately real — see the note
 // in ModelsScreen.fleet.test.tsx: a mocked mutation can only prove what a click handed off,
@@ -22,7 +23,7 @@ vi.mock('../../lib/queries', () => ({
   useDownloads: () => ({ data: { downloads: state.local } }),
   useDownloadMutations: () => ({
     cancel: { mutate: localCancel, isPending: false, variables: undefined },
-    remove: { mutate: vi.fn(), isPending: false },
+    remove: { mutate: localRemove, isPending: false },
     resume: { mutate: vi.fn(), isPending: false },
   }),
 }))
@@ -106,6 +107,7 @@ beforeEach(() => {
   state.cancelFail = null
   calls.length = 0
   localCancel.mockClear()
+  localRemove.mockClear()
   installFetch()
 })
 
@@ -147,7 +149,9 @@ describe('DownloadsPanel — merged fleet', () => {
     state.queues = { l1: [remoteDl] }
     renderPanel()
     await screen.findByText('remote.gguf')
-    await userEvent.click(screen.getByRole('button', { name: /cancel/i }))
+    // Exact match, not /cancel/i: the header's new "Cancel all" bulk action also renders
+    // here (this row is cancellable), and a loose regex matches both.
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }))
     await waitFor(() => expect(writes()).toHaveLength(1))
     expect(writes()[0]).toEqual({ url: '/api/v1/links/l1/downloads/remote-1', method: 'DELETE' })
     expect(localCancel).not.toHaveBeenCalled()
@@ -264,5 +268,67 @@ describe('DownloadsPanel — merged fleet', () => {
     await screen.findByText('remote.gguf')
     const row = document.querySelector('[data-testid="download-row-remote-1"]')!
     expect(within(row as HTMLElement).queryByRole('button', { name: /resume/i })).toBeNull()
+  })
+
+  describe('bulk actions', () => {
+    it('offers neither bulk button when there is nothing to act on', () => {
+      state.local = [{ ...localDl, status: 'queued' }]
+      // A queued-only row is still "in progress" for rank purposes, so this alone would
+      // show Cancel all; the real check here is Dismiss all staying absent with no
+      // terminal row on the board.
+      renderPanel()
+      expect(screen.queryByRole('button', { name: 'Dismiss all' })).toBeNull()
+    })
+
+    it('shows Cancel all while a download is in progress, and it cancels every cancellable row', async () => {
+      state.local = [localDl]
+      state.links = [link()]
+      state.queues = { l1: [remoteDl] }
+      renderPanel()
+      await screen.findByText('remote.gguf')
+      expect(screen.queryByRole('button', { name: 'Dismiss all' })).toBeNull()
+      await userEvent.click(screen.getByRole('button', { name: 'Cancel all' }))
+      expect(localCancel).toHaveBeenCalledWith('local-1')
+      await waitFor(() => expect(writes()).toHaveLength(1))
+      expect(writes()[0]).toEqual({ url: '/api/v1/links/l1/downloads/remote-1', method: 'DELETE' })
+    })
+
+    it('skips a row Cancel all cannot act on — a link without downloads:write', async () => {
+      state.local = [localDl]
+      state.links = [link({ grantedCapabilities: ['downloads:read'] })]
+      state.queues = { l1: [remoteDl] }
+      renderPanel()
+      await screen.findByText('remote.gguf')
+      await userEvent.click(screen.getByRole('button', { name: 'Cancel all' }))
+      expect(localCancel).toHaveBeenCalledWith('local-1')
+      // The remote row is un-cancellable (no downloads:write), so Cancel all must not
+      // even attempt it — same rule FleetAction enforces per-row.
+      expect(writes()).toHaveLength(0)
+    })
+
+    it('shows Dismiss all once a download is done, and it dismisses every local terminal row', async () => {
+      state.local = [
+        { ...localDl, id: 'd1', name: 'done.gguf', status: 'done', received: 100 },
+        { ...localDl, id: 'd2', name: 'errored.gguf', status: 'error' },
+      ]
+      renderPanel()
+      await screen.findByText('done.gguf')
+      expect(screen.queryByRole('button', { name: 'Cancel all' })).toBeNull()
+      await userEvent.click(screen.getByRole('button', { name: 'Dismiss all' }))
+      expect(localRemove).toHaveBeenCalledWith('d1')
+      expect(localRemove).toHaveBeenCalledWith('d2')
+      expect(localRemove).toHaveBeenCalledTimes(2)
+    })
+
+    it('leaves a remote terminal row out of Dismiss all — removal is local-only housekeeping', async () => {
+      state.local = [{ ...localDl, status: 'done' }]
+      state.links = [link()]
+      state.queues = { l1: [{ ...remoteDl, status: 'done' }] }
+      renderPanel()
+      await screen.findByText('remote.gguf')
+      await userEvent.click(screen.getByRole('button', { name: 'Dismiss all' }))
+      expect(localRemove).toHaveBeenCalledTimes(1)
+      expect(localRemove).toHaveBeenCalledWith('local-1')
+    })
   })
 })

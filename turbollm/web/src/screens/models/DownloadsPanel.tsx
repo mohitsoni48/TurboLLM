@@ -132,12 +132,51 @@ export function DownloadsPanel() {
     )
   }
 
+  // Bulk actions in the header, next to the row-level ones. A row only counts as
+  // cancellable here if its OWN `actionState` says so — a remote row without
+  // `downloads:write` is silently skipped rather than firing a request that just
+  // becomes another inline failure, the same gate `FleetAction` applies per-row.
+  const cancellableRows = ordered.filter((r) => rank(r.row) === 0 && actionState('downloads:write', r.origin, linkFor(r.origin)).enabled)
+  // Dismiss is local-only housekeeping (see the per-row note below), so "all" means
+  // all of THIS machine's terminal rows, not the fleet's.
+  const dismissableRows = ordered.filter((r) => r.origin.kind === 'local' && (r.row.status === 'done' || r.row.status === 'error' || r.row.status === 'cancelled'))
+
+  const onCancelAll = () => {
+    track('models', 'cancel_all_downloads')
+    cancellableRows.forEach((r) => onCancel(r))
+  }
+  const onDismissAll = () => {
+    track('models', 'dismiss_all_downloads')
+    dismissableRows.forEach((r) => mut.remove.mutate(r.row.id))
+  }
+
   return (
     <div className="mb-5 rounded-lg border border-border bg-panel-2 p-4">
       <div className="mb-3 flex items-center gap-2 text-[13px] font-medium text-ink">
         <Download size={14} className="text-muted" />
         Downloads
         {activeCount > 0 && <span className="text-[12px] font-normal text-muted">· {activeCount} active</span>}
+        <div className="ml-auto flex items-center gap-3">
+          {cancellableRows.length > 0 && (
+            <button
+              type="button"
+              onClick={onCancelAll}
+              className="text-[12px] font-medium transition-colors hover:underline"
+              style={{ color: 'var(--err)' }}
+            >
+              Cancel all
+            </button>
+          )}
+          {dismissableRows.length > 0 && (
+            <button
+              type="button"
+              onClick={onDismissAll}
+              className="text-[12px] font-medium text-accent hover:underline"
+            >
+              Dismiss all
+            </button>
+          )}
+        </div>
       </div>
 
       {/* A machine that contributed no rows still gets a line saying why — whether it is
@@ -146,7 +185,10 @@ export function DownloadsPanel() {
           and no explanation, which is indistinguishable from an idle machine. */}
       <MachineNotes machines={[...machines, ...refusedReads]} />
 
-      <div className="flex flex-col gap-2">
+      {/* Capped to ~2 rows' height with its own scroll (TODO: "multipart download UX") — a
+          multipart model can produce a dozen simultaneous rows, and without a cap this panel
+          used to grow unbounded and shove the search list + detail pane off screen. */}
+      <div className="flex max-h-[172px] flex-col gap-2 overflow-y-auto pr-1">
         {ordered.map((r) => (
           <DownloadRow
             key={rowKey(r.origin, r.row.id)}
@@ -234,17 +276,19 @@ function DownloadRow({
           </FleetAction>
         )}
 
-        {/* Remove is list housekeeping on THIS machine's record. A remote row's terminal
-            entry belongs to the host's list, so there is nothing here to remove. */}
+        {/* Dismiss takes over Cancel's slot once the job is terminal — same size, same tap
+            target — so clearing a finished multipart download is one tap per row instead of
+            hunting for a small X icon. Local only: a remote row's terminal entry belongs to
+            the host's own list, so there is nothing here to remove. */}
         {isLocal && (isDone || isError || isCancelled) && (
-          <button
-            type="button"
-            aria-label="Remove from list"
+          <Button
+            size="sm"
+            variant="outline"
             onClick={() => { track('models', 'remove_download'); onRemove() }}
-            className="rounded p-1 text-muted transition-colors hover:text-ink"
           >
-            <X size={14} />
-          </button>
+            <X size={13} />
+            Dismiss
+          </Button>
         )}
       </div>
 
