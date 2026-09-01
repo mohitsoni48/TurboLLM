@@ -83,6 +83,28 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.12.1] - 2026-09-01
+
+### Fixed
+
+- **Loading an embedding model no longer evicts a running chat model.** The manual "Load" button
+  (and the Turbo Link facade sharing its code) now routes embedding models through the same
+  reserved-slot logic the auto-swap gateway already used, so both stay loaded together. Also
+  fixes the underlying detection gap that hid this in testing — decoder-architecture embedding
+  models (e.g. Qwen3-Embedding) are now correctly recognized — and hides the Sampling /
+  Speculative Decoding sections in an embedding model's config page, since they never applied.
+- **LAN sharing now picks your real network adapter, not a virtual one.** Fixes an issue where
+  LAN URLs could point at a Hyper-V/WSL virtual switch address instead of your actual Wi-Fi or
+  Ethernet adapter, making them unreachable from other devices on the network.
+- **The Downloads panel no longer grows unbounded and pushes the model list off screen.** It's
+  now capped to a couple of rows with its own scrollbar, the per-row remove icon is now a clear
+  Dismiss button, and you can Cancel all / Dismiss all from the panel header.
+
+### Discord
+- Fixed: loading an embedding model no longer kicks out your running chat model — both now stay loaded together.
+- Fixed: LAN sharing now picks your real Wi-Fi/Ethernet adapter instead of a virtual one, so links actually work from other devices.
+- Fixed: the Downloads panel no longer grows unbounded — it's capped with its own scroll, plus new Cancel all / Dismiss all buttons.
+
 ## [1.11.8] - 2026-08-24
 
 ### Added
