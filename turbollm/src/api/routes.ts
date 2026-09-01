@@ -6,10 +6,11 @@ import { execFileSync } from 'node:child_process'
 import { basename, dirname, join, resolve } from 'node:path'
 import { GATE_VERSION, gateNodeSource } from '../comfyui/gate-template'
 import { randomUUID } from 'node:crypto'
-import { homedir, networkInterfaces } from 'node:os'
+import { homedir } from 'node:os'
 import { ValueError, getModelProfile, resolveConfiguredCtx, setModelProfile, deleteModelProfile, VRAM_HEADROOM_MIN_MB, VRAM_HEADROOM_MAX_MB, VRAM_HEADROOM_SPILL_MB, type ApiKey, type Engine, type McpServer } from '../config/config'
 import { CONFIG_BOUNDS, coerceBounded, isConfigTheme } from '../config/config-bounds'
 import type { Deps } from '../deps'
+import { getLanIp } from '../net'
 import { abortAllInFlightChats } from '../chat/chat-routes'
 import { NameTakenError, NotFoundError, customSourceKey } from '../engines/registry'
 import { ProbeError, probe } from '../engines/probe'
@@ -1938,7 +1939,7 @@ export function registerApi(app: Hono, d: Deps): void {
     const cfg = d.store.snapshot()
     return c.json({
       lanBind: cfg.daemon.lanBind,
-      lanUrl: `http://${getLanIp()}:${cfg.daemon.port}`,
+      lanUrl: `http://${getLanIp() ?? '127.0.0.1'}:${cfg.daemon.port}`,
       hasApiKey: cfg.apiKeys.length > 0,
       requireApiKey: cfg.daemon.requireApiKey,
       isHost: isLocalRequest(c, d),
@@ -2176,7 +2177,7 @@ export function registerApi(app: Hono, d: Deps): void {
     const cli = c.req.param('cli')
     const cfg = d.store.snapshot()
     const { port, lanBind } = cfg.daemon
-    const host = lanBind ? getLanIp() : '127.0.0.1'
+    const host = lanBind ? (getLanIp() ?? '127.0.0.1') : '127.0.0.1'
     const base = `http://${host}:${port}`
     const ms = d.manager.status()
     const modelName = ms.state === 'running' ? (ms.model?.name ?? 'local') : 'local'
@@ -2607,17 +2608,6 @@ function listWindowsDrives(): { name: string; path: string; isDir: boolean }[] {
     }
   }
   return drives
-}
-
-function getLanIp(): string {
-  const nets = networkInterfaces()
-  for (const ifaces of Object.values(nets)) {
-    if (!ifaces) continue
-    for (const iface of ifaces) {
-      if (iface.family === 'IPv4' && !iface.internal) return iface.address
-    }
-  }
-  return '127.0.0.1'
 }
 
 // ── CLI connect snippet builders ───────────────────────────────────────────

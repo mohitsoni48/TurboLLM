@@ -1,7 +1,7 @@
 import type { Hono, MiddlewareHandler } from 'hono'
 import { randomUUID } from 'node:crypto'
-import { networkInterfaces } from 'node:os'
 import { generateApiKey, hostGate } from '../auth'
+import { getLanIp } from '../net'
 import type { Context } from 'hono'
 import type { Deps } from '../deps'
 import { applyProbeResult } from '../link/apply-probe'
@@ -722,10 +722,5 @@ function remoteFailure(c: Context, rec: LinkRecord, probe: LinkProbe): Response 
  *  user can edit rather than guessing wrong silently — a wrong-but-editable URL is a
  *  better failure than a confidently wrong one. */
 function lanHost(): string {
-  for (const iface of Object.values(networkInterfaces())) {
-    for (const a of iface ?? []) {
-      if (a.family === 'IPv4' && !a.internal) return a.address
-    }
-  }
-  return 'localhost'
+  return getLanIp() ?? 'localhost'
 }

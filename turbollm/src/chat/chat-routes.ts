@@ -1,8 +1,8 @@
 // Chat API routes (spec 07). Conversations CRUD + SSE streaming send + message actions.
 import type { Context, Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
-import { networkInterfaces } from 'node:os'
 import type { Deps } from '../deps'
+import { getLanIp } from '../net'
 import { clampMaxTokens } from '../config/config'
 import { feedChunk, flushState, initParseState, type ParseState } from './parser'
 import { needsExtraPass } from './think-utils'
@@ -687,14 +687,7 @@ function importOpenAiMessages(
 // ── LAN IP helper (F-023) ──────────────────────────────────────────────────────
 
 function getLanIpForShare(): string {
-  const nets = networkInterfaces()
-  for (const ifaces of Object.values(nets)) {
-    if (!ifaces) continue
-    for (const iface of ifaces) {
-      if (iface.family === 'IPv4' && !iface.internal) return iface.address
-    }
-  }
-  return '127.0.0.1'
+  return getLanIp() ?? '127.0.0.1'
 }
 
 // ── shared generation streaming ───────────────────────────────────────────────
