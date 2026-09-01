@@ -150,8 +150,15 @@ const EMBED_ARCHS = new Set([
   'bert', 'nomic-bert', 'jina-bert-v3-base', 'jina-bert',
   'distilbert', 'roberta', 'xlm-roberta', 'electra',
 ])
-// Filename patterns common for embedding / reranker models.
-const EMBED_FILE_RE = /\b(bge[-_]|nomic[-_]embed|all[-_]minilm|e5[-_]|gte[-_]|stella[-_]embed|jina[-_]embed|mxbai[-_]embed)\b/i
+// Filename patterns common for embedding / reranker models. The curated prefixes catch
+// classic sentence-transformer-style names that don't spell out "embed" (bge, e5, gte); the
+// trailing `embed(ding)?` is the generic catch-all for the newer wave of decoder-architecture
+// embedding models (Qwen3-Embedding, gte-Qwen2, granite-embedding, arctic-embed, …) whose repo
+// names just say so outright — missed live: `Qwen3-Embedding-0.6B-Q8_0.gguf` matched none of
+// the curated prefixes and its arch (`qwen3`) is shared with ordinary chat models, so it loaded
+// as an ordinary (non-embedding) model and evicted a running chat model instead of getting its
+// own pool slot (ADR-389's fix routes correctly once `embedding` is actually true).
+const EMBED_FILE_RE = /\b(bge[-_]|nomic[-_]embed|all[-_]minilm|e5[-_]|gte[-_]|stella[-_]embed|jina[-_]embed|mxbai[-_]embed|embed(ding)?)\b/i
 
 function isEmbeddingModel(arch: string, name: string): boolean {
   return EMBED_ARCHS.has(arch.toLowerCase()) || EMBED_FILE_RE.test(name)

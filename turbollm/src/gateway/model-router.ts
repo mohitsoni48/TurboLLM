@@ -130,14 +130,14 @@ export class ModelRouter {
    *  skipped. Callers are responsible for their OWN idle-vs-busy decision before calling this
    *  (see routines/model-swap.ts) — this method has no opinion on whether now is a safe time to
    *  swap, only on HOW to swap once that's decided. */
-  async loadExplicit(modelKey: string): Promise<RouteResult> {
+  async loadExplicit(modelKey: string, overrides?: Partial<LoadProfile>): Promise<RouteResult> {
     // Same invariant-5 guard as route(): a routine pinned to `<machine>/<model>` must
     // never be satisfied by resolveEntry's substring match against a LOCAL model.
     const remote = this.resolveRemote(modelKey)
     if (remote) return remote
     const entry = this.resolveEntry(modelKey)
     if (!entry) return { status: 503, message: `No model matching '${modelKey}' found. Add one in TurboLLM.` }
-    return this.withSwapLock(() => this.doLoad(entry))
+    return this.withSwapLock(() => this.doLoad(entry, overrides))
   }
 
   /** Acquire the SAME swap-serialization queue `route()` uses, then run `fn` exclusively with
@@ -205,7 +205,7 @@ export class ModelRouter {
 
   // ── internal ──────────────────────────────────────────────────────────────
 
-  private async doLoad(entry: ModelEntry): Promise<RouteResult> {
+  private async doLoad(entry: ModelEntry, overrides?: Partial<LoadProfile>): Promise<RouteResult> {
     // Re-check after acquiring the lock — another queued request may have already
     // loaded this model while we were waiting.
     {
@@ -233,7 +233,7 @@ export class ModelRouter {
       return { status: 503, message: `Active engine cannot load model format '${entry.format}'.` }
     }
 
-    const opts = this.buildOpts(entry, active)
+    const opts = this.buildOpts(entry, active, overrides)
     if (!opts) return { status: 503, message: 'Model is incomplete or unreadable.' }
 
     const keepN = Math.max(1, this.store.snapshot().gateway.keepN)
@@ -409,7 +409,7 @@ export class ModelRouter {
     return loadedKey === entry.key || loadedKey === entry.path
   }
 
-  private buildOpts(entry: ModelEntry, engine: Engine): StartOpts | null {
+  private buildOpts(entry: ModelEntry, engine: Engine, overrides?: Partial<LoadProfile>): StartOpts | null {
     if (entry.incomplete || entry.parseError) return null
     const cfg = this.store.snapshot()
     const sys = getSysInfo()
@@ -418,7 +418,7 @@ export class ModelRouter {
       // Resolved once regardless of engine kind — see routes.ts's identical load
       // route for why (model_load telemetry, spec 23 §3.3, wants the same
       // full-config shape whichever engine actually ends up loading).
-      const profile = resolveProfile(entry, sys, savedProfile, undefined, cfg.modelDefaults)
+      const profile = resolveProfile(entry, sys, savedProfile, overrides, cfg.modelDefaults)
       return {
         engine,
         model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: entry.nativeCtx, vision: entry.vision },
@@ -436,7 +436,7 @@ export class ModelRouter {
       }
     }
     const saved = getModelProfile(cfg, entry.key, engine.id) as Partial<LoadProfile> | undefined
-    const profile = resolveProfile(entry, sys, saved, undefined, cfg.modelDefaults)
+    const profile = resolveProfile(entry, sys, saved, overrides, cfg.modelDefaults)
     // KoboldCpp is a GGUF engine but uses its OWN flag names, so it gets its own small
     // arg-map (ctx/ngl + GPU backend) rather than the llama-server profileToArgs. llamafile
     // IS llama.cpp's server under the hood, so it keeps the full profileToArgs flags — the

@@ -48,12 +48,6 @@ export async function startEngine(c: Context, d: Deps, b: EngineStartBody): Prom
   // ComfyUI guard: while ComfyUI is rendering it owns the GPU, so refuse to load a
   // model (it would thrash/OOM VRAM). The guard reloads automatically once idle.
   if (d.comfy?.isBlocked()) return err(c, 409, 'comfyui_busy', 'ComfyUI is rendering — model loading is paused until its queue finishes.')
-  // Kill switch: loading a model takes over the engine — cancel any auto-tune and abort
-  // in-flight chats, then wait for auto-tune to release the engine so the load can't race
-  // the runner's teardown.
-  d.bench.cancel()
-  abortAllInFlightChats()
-  await d.bench.waitIdle()
   const cfg = d.store.snapshot()
   const sys = getSysInfo()
 
@@ -87,6 +81,29 @@ export async function startEngine(c: Context, d: Deps, b: EngineStartBody): Prom
         `${engineLabel} cannot load models with an audio tower — the audio encoder ${certainty} due to an upstream mlx-vlm bug in the sanitizer for these architectures. Switch to the MLX engine instead.`,
       )
     }
+
+    // Embedding models get their own pool slot via the router (same coexistence rule
+    // the auto-swap gateway path already uses — model-router.ts's `chatSlotCount`/
+    // `evictChatLru`) instead of replacing whatever's in the primary manager. Without
+    // this, clicking "Load" on an embedding model in the UI killed a running chat
+    // model's engine even though the two are meant to run side by side for RAG.
+    // Skips the kill switch below too: that exists to stop in-flight chats/auto-tune
+    // against an engine that's "going away" (chat-routes.ts's abortAllInFlightChats
+    // docblock) — the primary engine isn't going away here, so nothing needs aborting.
+    if (entry.embedding) {
+      void d.modelRouter
+        .loadExplicit(entry.key, b.profileOverrides)
+        .catch((e) => console.warn(`engine load failed: ${e}`))
+      return c.json({ ok: true }, 202)
+    }
+
+    // Kill switch: loading a model takes over the primary engine — cancel any auto-tune
+    // and abort in-flight chats, then wait for auto-tune to release the engine so the
+    // load can't race the runner's teardown.
+    d.bench.cancel()
+    abortAllInFlightChats()
+    await d.bench.waitIdle()
+
     let opts: StartOpts
     if (entry.format !== 'gguf') {
       // MLX / vLLM: the model dir is the launch target (no llama.cpp -ngl/ctx knobs).
@@ -167,6 +184,11 @@ export async function startEngine(c: Context, d: Deps, b: EngineStartBody): Prom
     name = cfg.devModel.label
   }
   if (!modelPath) return err(c, 409, 'no_such_model', 'No model specified. Pick one from the Models screen.')
+  // This legacy path always targets the primary manager directly (no scanner entry to
+  // read `.embedding` off), so the kill switch still applies here.
+  d.bench.cancel()
+  abortAllInFlightChats()
+  await d.bench.waitIdle()
   const opts: StartOpts = { engine: active, model: deriveModel(modelPath, name, extra), modelPath, extraArgs: extra }
   // Same single-chokepoint, fire-and-forget, swap-lock-coordinated load as the
   // resolved-model branch above.

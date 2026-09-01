@@ -693,8 +693,11 @@ export function ModelDetailDialog({
                 (rapidMlxServerCommand/mlxVlmServerCommand only pass serve/model/host/port) — the
                 banner above already sends users to per-conversation chat settings instead, so
                 showing these as editable/saveable launch-time controls here would be dead UI
-                contradicting that banner. */}
-            {!isRapidMlx && !isMlxVlm && (<>
+                contradicting that banner. Embedding models never sample a token at all — llama.cpp's
+                /v1/embeddings does one forward pass + pooling, so every one of these flags would be
+                silently ignored if sent (ADR-389: found live, temperature had no effect on a loaded
+                embedding model). */}
+            {!isRapidMlx && !isMlxVlm && !detail.embedding && (<>
             <SectionTitle>Sampling</SectionTitle>
             <Section>
               <Slider label="Temperature" value={draft.sampling.temp} min={0} max={2} step={0.05} onChange={(v) => setS('temp', v)} fmt={(v) => v.toFixed(2)} />
@@ -717,7 +720,9 @@ export function ModelDetailDialog({
             </Section>
             </>)}
 
-            {isLlamaCpp && specOptions.length > 1 && (
+            {/* Speculative decoding predicts extra GENERATED tokens per step — meaningless for an
+                embedding model, which never generates a token. */}
+            {isLlamaCpp && !detail.embedding && specOptions.length > 1 && (
               <>
                 <SectionTitle>Speculative decoding</SectionTitle>
                 <Section>
