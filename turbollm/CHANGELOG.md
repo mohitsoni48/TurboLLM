@@ -83,6 +83,26 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.12.2] - 2026-09-02
+
+### Added
+
+- **A headless/Docker TurboLLM can now log itself in.** A container binds on `0.0.0.0`, so the daemon demands an API key the moment it starts and there is no browser inside the container to sign in with — before this the only way in was to read a key out of `docker logs` by hand, and only if one already existed. Now the first boot mints an API key and prints it (a new `--print-token` flag, on by default in both official Dockerfiles), so it is always one command away. Each restart mints a fresh key, so re-run after a restart rather than reusing an old value — old keys keep working and can be revoked from Developer → API Keys once you are in. **`TURBOLLM_ADVERTISED_HOST`** is a new env override for when the daemon can only see a container-internal bridge address (Docker networking) — set it to the address other devices should reach, and the LAN-sharing links point there instead.
+- **Guided in-app engine builds now offer real install commands on a headless box.** The build-prerequisites step used to point at a dead website link; it now gives you the actual `apt`/`dnf`/`pacman`/`zypper`/`brew` command for your platform. The CUDA build runner also probes for a container-mounted `libcuda.so` (the NVIDIA runtime convention), so a from-source CUDA build's cmake configure succeeds on Kaggle/RunPod-style boxes instead of failing at the configure step.
+
+### Fixed
+
+- **Code sessions over Turbo Link no longer talk to the host's public gateway.** A linked code session was addressing the host's outer gateway port instead of the link facade, and sending the link token as a plain bearer token instead of the internal `X-TurboLLM-Auth` header. That was a real security defect: with "Require an API key" turned off, the capability checks behind those routes could be bypassed. It now routes through the same upstream-auth helpers chat already uses, so a linked code session goes where it should and the link token is never exposed as a bearer credential.
+- **A rejected build can no longer freeze the UI on "Preparing" forever.** If a build request was rejected on the server (403/409/400) before a build ever started, the build dialog sat on "Preparing" with no explanation. It now shows the server's own error message and lets you act on it.
+- **Five build/engine routes can no longer be triggered by just anyone on an open LAN.** The host-execution routes (build/run, build/cuda, install-prerequisites, add engine, scan engine) now require a verified API key from a non-host device, matching what Code sessions already needed — an open, keyless LAN still cannot trigger any of them, and a Turbo Link token is structurally excluded from them regardless.
+
+### Discord
+- Fixed: a headless/Docker TurboLLM can now log itself in — the first boot mints an API key and prints it (no browser needed inside the container), and every restart mints a fresh one. Grab it from `docker compose logs` and set `TURBOLLM_ADVERTISED_HOST` if your container only sees an internal address.
+- Fixed: building an engine from source in-app now gives you the real install command for your OS instead of a dead link, and a from-source CUDA build reaches compilation on Kaggle/RunPod-style boxes instead of stalling at configure.
+- Fixed: a Code session running over Turbo Link was addressing the host's public gateway and leaking the link token as a bearer token — a security hole when LAN key-requirement was off. Now it uses the link's own authenticated path.
+- Fixed: a build that a server rejected used to leave the build dialog stuck on "Preparing" forever; you now see the real error.
+- Fixed: an open, keyless LAN still can't trigger host build/engine actions — those routes now demand a verified API key from a remote device.
+
 ## [1.12.1] - 2026-09-01
 
 ### Fixed
