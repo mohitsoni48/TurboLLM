@@ -75,4 +75,9 @@ EXPOSE 6996/tcp
 ENTRYPOINT ["node", "bin/turbollm.mjs"]
 # --addr 0.0.0.0:... required in a container (default bind is loopback-only).
 # --no-open because there's no browser inside the container.
-CMD ["--addr", "0.0.0.0:6996", "--no-open"]
+# --print-token: with the named volume above persisting ~/.turbollm (including apiKeys)
+# across `restart: unless-stopped`, the automatic once-only bootstrap key only ever
+# prints on the container's very first boot — miss that line in `docker logs` (or lose
+# it to log rotation) and there is no way to recover it. --print-token mints and prints
+# a fresh, always-findable token on EVERY start instead: `docker logs turbollm-nvidia | grep 'Token:'`.
+CMD ["--addr", "0.0.0.0:6996", "--no-open", "--print-token"]

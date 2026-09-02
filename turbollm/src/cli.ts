@@ -41,7 +41,8 @@ import { runMcpServer } from './mcp-server'
 import { createApp } from './server'
 import { registerTerminalWs } from './terminal/terminal-routes'
 import { reapStaleTerminals, killTrackedTerminalsSync } from './terminal/terminal-manager'
-import { provisionTunnelApiKey } from './auth'
+import { provisionBootstrapApiKey, provisionTunnelApiKey } from './auth'
+import { getAdvertisedHost } from './net'
 import { TunnelManager, reapStaleTunnels, killTrackedTunnelsSync } from './tunnel/manager'
 import { LinkManager } from './link/link-manager'
 import { RemoteCatalog } from './link/remote-catalog'
@@ -231,10 +232,18 @@ if (hasFlag('--help', '-h')) {
     `Options:\n` +
     `  --port <n>     Port to listen on / connect to (default: 6996)\n` +
     `  --addr <h:p>   Full host:port override (e.g. 0.0.0.0:6996)\n` +
+    `                 Binding a non-loopback address turns on API-key enforcement;\n` +
+    `                 if no key exists yet, one is generated and printed on startup.\n` +
     `  --no-open      Do not open a browser window on startup\n` +
     `  --tunnel       Expose this daemon on the internet via a cloudflared quick\n` +
     `                 tunnel (Cloud Launch) — prints the public URL + a required\n` +
     `                 access token. For running TurboLLM on a rented cloud GPU box.\n` +
+    `  --print-token  Mint a fresh API key and print it as a stable 'Token:   <key>'\n` +
+    `                 line on every startup, whether or not one already existed —\n` +
+    `                 unlike the automatic non-loopback bootstrap key (which only\n` +
+    `                 ever mints once, on the very first boot), this always gives\n` +
+    `                 you a freshly known-good token to grep out of 'docker logs'\n` +
+    `                 after any restart. Default in the official Docker images.\n` +
     `  --config <f>   Path to a custom config file\n` +
     `  --no-telemetry Disable telemetry entirely, whatever this install's saved\n` +
     `                 setting says (same as TURBOLLM_TELEMETRY=off). For CI,\n` +
@@ -247,10 +256,20 @@ if (hasFlag('--help', '-h')) {
     `  turbollm --no-open               # start without opening a browser\n` +
     `  turbollm --addr 0.0.0.0:6996    # bind to all interfaces (LAN sharing)\n` +
     `  turbollm --tunnel --no-open      # run on a rented GPU box, reachable via a public URL\n` +
+    `  turbollm --addr 0.0.0.0:6996 --print-token   # LAN/Docker: always print a usable token\n` +
     `  turbollm --stop                  # stop the running daemon\n` +
     `  turbollm launch claude           # open Claude Code on your loaded model\n` +
     `  turbollm launch claude --model qwen3-8b   # load qwen3-8b, then launch\n` +
-    `  turbollm launch opencode         # wire opencode to TurboLLM, then launch it\n\n`,
+    `  turbollm launch opencode         # wire opencode to TurboLLM, then launch it\n\n` +
+    `Environment:\n` +
+    `  TURBOLLM_ADVERTISED_HOST\n` +
+    `                 Host (or host:port) to put in the URLs TurboLLM hands out —\n` +
+    `                 Turbo Link strings and chat-share links. Set this when the\n` +
+    `                 address others must use isn't one this machine can see, e.g.\n` +
+    `                 inside a Docker container, where the only interface found is\n` +
+    `                 the container-internal bridge IP (172.17.0.2) and the real\n` +
+    `                 address is the published host:port outside.\n` +
+    `                 e.g. TURBOLLM_ADVERTISED_HOST=192.168.1.50:6996\n\n`,
   )
   process.exit(0)
 }
@@ -690,6 +709,17 @@ const lastColon = addr.lastIndexOf(':')
 let host = addr.slice(0, lastColon) || '127.0.0.1'
 let port = Number(addr.slice(lastColon + 1)) || 6996
 
+// Headless bootstrap key: on a non-loopback bind with requireApiKey on and no key ever
+// minted, mint exactly one now so a remote/headless operator (a Docker container, where
+// binding 0.0.0.0 is mandatory for `-p` to publish anything, and `docker logs` is the only
+// way in) has a credential at all — see provisionBootstrapApiKey. Null on every other
+// boot; printed in the startup banner below, the one moment it's readable.
+const bootstrapKey = provisionBootstrapApiKey(deps, host)
+
+// Operator override for the address minted into Turbo Link strings / chat-share URLs
+// (net.ts). Surfaced in the banner so it's never a silent guess.
+const advertisedHost = getAdvertisedHost()
+
 // ── Cross-platform browser open ───────────────────────────────────────────────
 function openBrowser(url: string): void {
   let cmd: string
@@ -717,6 +747,13 @@ function openBrowser(url: string): void {
 
 // ── Start server ──────────────────────────────────────────────────────────────
 const noOpen = hasFlag('--no-open')
+// See provisionBootstrapApiKey's comment above for why the automatic bootstrap key
+// only ever mints once: a persisted volume (a Docker named volume across `restart:
+// unless-stopped`) already has keys on every boot after the first, so the operator
+// gets nothing to grep out of `docker logs` on a later restart. --print-token is the
+// explicit, ALWAYS-print escape hatch for that case — deliberately unconditional
+// (no lanBind/requireApiKey gate), since the caller opted in by name.
+const printTokenRequested = hasFlag('--print-token')
 
 // Cached for this process's lifetime: a raw API key can only ever be shown once
 // (the store keeps only its hash), so a tunnel that restarts in-place (a rebind, or
@@ -749,10 +786,45 @@ function listen(attempt = 0): void {
       if (host === '0.0.0.0') {
         console.log(`  Network: http://<your-ip>:${info.port}  (LAN)`)
       }
+      if (advertisedHost) {
+        console.log(`  Advertised: http://${advertisedHost.host}:${advertisedHost.port ?? info.port}  (TURBOLLM_ADVERTISED_HOST)`)
+      }
       console.log(``)
       console.log(`  API:     ${uiUrl}/api/v1/status`)
       console.log(`  Stop:    Ctrl+C`)
       console.log(``)
+      // Shown ONCE, ever — only the hash is stored, so this is the only moment the raw
+      // key exists in readable form. Boxed loudly on purpose: on a headless/Docker
+      // install this scrolls past in `docker logs` and is the operator's only way in.
+      if (bootstrapKey) {
+        console.log(`  ============================================================`)
+        console.log(`  This daemon is reachable from other machines, so the API`)
+        console.log(`  requires a key. One was generated for you just now:`)
+        console.log(``)
+        console.log(`      ${bootstrapKey}`)
+        console.log(``)
+        console.log(`  SAVE IT NOW — it is shown once and cannot be recovered.`)
+        console.log(`  Send it as 'X-TurboLLM-Auth: <key>' (or 'Authorization:`)
+        console.log(`  Bearer <key>'), or paste it into the web UI. Manage or`)
+        console.log(`  revoke it later under Developer -> API Keys.`)
+        console.log(`  ============================================================`)
+        console.log(``)
+      }
+      // --print-token: reuse the bootstrap key just minted above rather than minting a
+      // second one when both conditions coincide on a genuine first boot; on every later
+      // boot (bootstrapKey is null — a key already exists) mint a fresh dedicated one.
+      // Either way, print a stable 'Token:   <key>' line so `docker logs | grep Token:`
+      // (or any restart-policy-driven relaunch) always has something to find.
+      if (printTokenRequested) {
+        const printToken = bootstrapKey ?? provisionTunnelApiKey(deps, 'print-token')
+        if (!bootstrapKey) {
+          console.log(`  --print-token: a fresh API key was generated for you just now.`)
+          console.log(`  SAVE IT NOW — it is shown once and cannot be recovered.`)
+          console.log(``)
+        }
+        console.log(`  Token:   ${printToken}`)
+        console.log(``)
+      }
       if (!noOpen) {
         openBrowser(uiUrl)
       }

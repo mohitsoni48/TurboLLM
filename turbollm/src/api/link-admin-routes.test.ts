@@ -85,6 +85,46 @@ test('the minted link string decodes back to a usable url and token', async () =
   assert.ok(decoded!.baseUrl.startsWith('http'))
 })
 
+// ── TURBOLLM_ADVERTISED_HOST (net.ts) ────────────────────────────────────────────────
+//
+// Inside a Docker container the only non-internal interface is `eth0` at the
+// container-internal bridge address (172.17.0.2), so auto-detection mints a link string
+// pointing at an address no peer can reach. The operator states the real one instead.
+
+function withAdvertisedHost<T>(value: string | undefined, fn: () => Promise<T>): Promise<T> {
+  const prev = process.env.TURBOLLM_ADVERTISED_HOST
+  if (value === undefined) delete process.env.TURBOLLM_ADVERTISED_HOST
+  else process.env.TURBOLLM_ADVERTISED_HOST = value
+  return fn().finally(() => {
+    if (prev === undefined) delete process.env.TURBOLLM_ADVERTISED_HOST
+    else process.env.TURBOLLM_ADVERTISED_HOST = prev
+  })
+}
+
+async function mintBaseUrl(): Promise<string> {
+  const { app } = mkApp()
+  const body = await (await app.request('/api/v1/links/mint',
+    json({ name: 'laptop', capabilities: ['models:use'] }))).json() as { linkString: string }
+  return decodeLinkString(body.linkString)!.baseUrl
+}
+
+test('mint uses TURBOLLM_ADVERTISED_HOST over auto-detection, keeping the daemon port', async () => {
+  const baseUrl = await withAdvertisedHost('llm.example.com', mintBaseUrl)
+  assert.equal(baseUrl, 'http://llm.example.com:6996')
+})
+
+test('mint honours a port named in the override — the PUBLISHED port, not the bound one', async () => {
+  const baseUrl = await withAdvertisedHost('192.168.1.50:8443', mintBaseUrl)
+  assert.equal(baseUrl, 'http://192.168.1.50:8443')
+})
+
+test('mint falls back to auto-detection when the override is unset', async () => {
+  const baseUrl = await withAdvertisedHost(undefined, mintBaseUrl)
+  assert.ok(baseUrl.startsWith('http://'))
+  assert.ok(!baseUrl.includes('llm.example.com'))
+  assert.ok(baseUrl.endsWith(':6996'))
+})
+
 test('mint refuses an unknown capability instead of storing it', async () => {
   const { app, cfg } = mkApp()
   const res = await app.request('/api/v1/links/mint', json({ name: 'x', capabilities: ['engines:add'] }))

@@ -1,7 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { delimiter } from 'node:path'
-import { buildCommands, buildEnv, CMAKE_CONFIGURE_ARGS, CMAKE_CONFIGURE_ARGS_MACOS } from './build-prereqs'
+import { buildCommands, buildEnv, prereqInstallCommands, withInstallCommands, CMAKE_CONFIGURE_ARGS, CMAKE_CONFIGURE_ARGS_MACOS, type BuildPrereqTool, type PackageManager } from './build-prereqs'
+import { noInstallCommandError } from './build-runner'
 
 const PATH_KEY = Object.keys(process.env).find((k) => k.toLowerCase() === 'path') ?? 'PATH'
 
@@ -206,4 +207,116 @@ test('buildCommands: produces the macOS + Metal cmake steps (no CUDA flags, no r
 
 test('CMAKE_CONFIGURE_ARGS_MACOS: enables Metal + Release, no CUDA flags', () => {
   assert.deepEqual(CMAKE_CONFIGURE_ARGS_MACOS, ['-DGGML_METAL=ON', '-DCMAKE_BUILD_TYPE=Release'])
+})
+
+// ── Package-manager install commands ────────────────────────────────────────
+// The headless fix: on a self-hosted box with no local browser, a prereq's `installUrl` opens a
+// website in the OPERATOR's browser and installs nothing on the server that needs the toolchain.
+// These are the commands the daemon runs on the host instead (build-runner.ts runPrereqInstall).
+// Pure command GENERATION only — nothing here ever runs an installer.
+
+const tool = (id: BuildPrereqTool['id'], found = false): BuildPrereqTool =>
+  ({ id, name: id, found, installUrl: `https://example.invalid/${id}` })
+
+test('prereqInstallCommands: apt refreshes the package lists before installing', () => {
+  // Load-bearing, not belt-and-braces: a fresh Debian/Ubuntu container has NO apt lists, so a
+  // bare `apt-get install` there always fails with "Unable to locate package" — and a container
+  // is exactly the environment this feature exists for.
+  assert.deepEqual(prereqInstallCommands('apt-get', 'cmake', true), [
+    ['apt-get', 'update'],
+    ['apt-get', 'install', '-y', 'cmake'],
+  ])
+})
+
+test('prereqInstallCommands: non-root prefixes sudo -n (never interactive), root does not', () => {
+  // `sudo -n` on purpose: stdin isn't attached to anything, so a password prompt would hang
+  // forever instead of failing with something the user can read.
+  assert.deepEqual(prereqInstallCommands('dnf', 'git', false), [['sudo', '-n', 'dnf', 'install', '-y', 'git']])
+  assert.deepEqual(prereqInstallCommands('dnf', 'git', true), [['dnf', 'install', '-y', 'git']])
+})
+
+test('prereqInstallCommands: every Linux manager installs git and cmake non-interactively', () => {
+  for (const pm of ['apt-get', 'dnf', 'pacman', 'zypper'] as PackageManager[]) {
+    for (const id of ['git', 'cmake'] as BuildPrereqTool['id'][]) {
+      const cmds = prereqInstallCommands(pm, id, true)
+      assert.ok(cmds && cmds.length > 0, `${pm}/${id} should have an install command`)
+      const install = cmds[cmds.length - 1]
+      assert.equal(install[0], pm)
+      assert.ok(install.includes(id), `${pm}/${id} should install the "${id}" package`)
+      // No manager may be able to stop and ask a question mid-install.
+      assert.ok(
+        install.some((a) => a === '-y' || a === '--noconfirm' || a === '--non-interactive'),
+        `${pm} install is missing its non-interactive flag`,
+      )
+    }
+  }
+})
+
+test('prereqInstallCommands: the compiler maps to each distro\'s C++ toolchain package', () => {
+  assert.deepEqual(prereqInstallCommands('apt-get', 'gcc', true)![1], ['apt-get', 'install', '-y', 'build-essential'])
+  assert.deepEqual(prereqInstallCommands('dnf', 'gcc', true), [['dnf', 'install', '-y', 'gcc-c++', 'make']])
+  assert.deepEqual(prereqInstallCommands('pacman', 'gcc', true), [['pacman', '-Sy', '--noconfirm', 'base-devel']])
+  assert.deepEqual(prereqInstallCommands('zypper', 'gcc', true), [['zypper', '--non-interactive', 'install', 'gcc-c++', 'make']])
+})
+
+test('prereqInstallCommands: pacman refreshes its db (-Sy, not -S)', () => {
+  // A container's pacman db is typically empty/stale, which makes a plain -S install fail.
+  assert.equal(prereqInstallCommands('pacman', 'git', true)![0][1], '-Sy')
+})
+
+test('prereqInstallCommands: brew is never run under sudo, even for a non-root caller', () => {
+  // Homebrew refuses to run as root and breaks its own prefix permissions if forced.
+  assert.deepEqual(prereqInstallCommands('brew', 'cmake', false), [['brew', 'install', 'cmake']])
+  assert.deepEqual(prereqInstallCommands('brew', 'git', true), [['brew', 'install', 'git']])
+})
+
+test('prereqInstallCommands: CUDA only where a genuine one-command install exists', () => {
+  // apt (nvidia-cuda-toolkit) and pacman (cuda) ship real single-package toolkits. dnf/zypper
+  // realistically need NVIDIA's own repo bootstrap, and macOS has no CUDA at all — those keep
+  // the website link rather than TurboLLM guessing at a fragile repo setup.
+  assert.deepEqual(prereqInstallCommands('apt-get', 'cuda', true)![1], ['apt-get', 'install', '-y', 'nvidia-cuda-toolkit'])
+  assert.deepEqual(prereqInstallCommands('pacman', 'cuda', true), [['pacman', '-Sy', '--noconfirm', 'cuda']])
+  assert.equal(prereqInstallCommands('dnf', 'cuda', true), undefined)
+  assert.equal(prereqInstallCommands('zypper', 'cuda', true), undefined)
+  assert.equal(prereqInstallCommands('brew', 'cuda', true), undefined)
+})
+
+test('prereqInstallCommands: MSVC never gets one (Windows-only, GUI installer)', () => {
+  for (const pm of ['apt-get', 'dnf', 'pacman', 'zypper', 'brew'] as PackageManager[]) {
+    assert.equal(prereqInstallCommands(pm, 'msvc', true), undefined)
+  }
+})
+
+test('prereqInstallCommands: the macOS compiler stays link-only (Xcode CLT needs a GUI prompt)', () => {
+  assert.equal(prereqInstallCommands('brew', 'gcc', true), undefined)
+})
+
+test('withInstallCommands: only MISSING tools get commands; found ones are untouched', () => {
+  const out = withInstallCommands([tool('git', true), tool('cmake', false)], 'apt-get')
+  assert.equal(out[0].installCommands, undefined)
+  assert.ok((out[1].installCommands?.length ?? 0) > 0)
+})
+
+test('withInstallCommands: no package manager → every tool keeps only its website link', () => {
+  const tools = [tool('git'), tool('cmake'), tool('cuda')]
+  for (const t of withInstallCommands(tools, null)) assert.equal(t.installCommands, undefined)
+})
+
+test('withInstallCommands: a tool with no clean install (CUDA on dnf) keeps link-only', () => {
+  const out = withInstallCommands([tool('cuda'), tool('git')], 'dnf')
+  assert.equal(out[0].installCommands, undefined)
+  assert.ok((out[1].installCommands?.length ?? 0) > 0)
+})
+
+test('noInstallCommandError: null when there IS something to run', () => {
+  assert.equal(noInstallCommandError({ ...tool('git'), installCommands: [['apt-get', 'install', 'git']] }, 'apt-get'), null)
+})
+
+test('noInstallCommandError: names the manager, or says none was found, and always keeps the link', () => {
+  const withPm = noInstallCommandError(tool('cuda'), 'dnf')
+  assert.match(withPm!, /dnf/)
+  assert.match(withPm!, /example\.invalid\/cuda/)
+  const noPm = noInstallCommandError(tool('cuda'), null)
+  assert.match(noPm!, /No supported package manager/)
+  assert.match(noPm!, /example\.invalid\/cuda/)
 })

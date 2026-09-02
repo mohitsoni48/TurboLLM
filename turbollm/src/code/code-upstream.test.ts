@@ -44,9 +44,17 @@ test('a remote id resolves with the local engine stopped', () => {
   assert.equal(up.modelId, REMOTE.modelKey)
   assert.equal(up.modelName, 'Qwen3 35B')
   assert.equal(up.contextWindow, 131072)
-  assert.equal(up.provider.baseUrl, `${REMOTE.baseUrl}/v1`)
+  // The FAÇADE prefix, not the host's public /v1 mount — pi appends `/chat/completions`.
+  assert.equal(up.provider.baseUrl, `${REMOTE.baseUrl}/api/link/v1`)
   // Nothing may build a local engine URL for a turn running elsewhere.
   assert.equal(up.target, '')
+})
+
+test('a pasted tunnel URL with a trailing slash does not produce a doubled slash', () => {
+  const remote = { ...REMOTE, baseUrl: 'https://rig.trycloudflare.com/' }
+  const d = mkDeps({ localRunning: false, route: { target: remote.baseUrl, remote } })
+  const up = resolveCodeUpstream(d, 'rig/qwen3-35b')
+  assert.equal(up.provider.baseUrl, 'https://rig.trycloudflare.com/api/link/v1')
 })
 
 test('the link token travels as X-TurboLLM-Auth, never as the host bearer', () => {
@@ -55,8 +63,12 @@ test('the link token travels as X-TurboLLM-Auth, never as the host bearer', () =
 
   assert.equal(up.provider.headers?.['X-TurboLLM-Auth'], REMOTE.token)
   // `Authorization` on the host is its own API-key credential — a different secret with
-  // different scope. pi adds it only when authHeader is on, so this flag is the whole guard.
+  // different scope. `authHeader: false` is only HALF the guard: pi hands `apiKey` to the
+  // openai SDK, which sends `Authorization: Bearer <apiKey>` unconditionally. So the token
+  // must not be the apiKey either, or the secret ships in the header this test names.
   assert.equal(up.provider.authHeader, false)
+  assert.notEqual(up.provider.apiKey, REMOTE.token)
+  assert.ok(!JSON.stringify(up.provider.apiKey).includes('hostsecret'))
 })
 
 test('an offline link fails by name and never degrades to the local model', () => {

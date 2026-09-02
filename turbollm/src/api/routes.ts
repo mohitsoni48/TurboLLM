@@ -15,7 +15,7 @@ import { abortAllInFlightChats } from '../chat/chat-routes'
 import { NameTakenError, NotFoundError, customSourceKey } from '../engines/registry'
 import { ProbeError, probe } from '../engines/probe'
 import { resolveServerBinary, suggestEngineName } from '../engines/scan'
-import { generateApiKey, hostGate, isLocalRequest } from '../auth'
+import { generateApiKey, hostGate, isLocalOrAuthenticated, isLocalRequest } from '../auth'
 import { enabledFeatures } from '../features'
 import { isTerminalBackendAvailable } from '../terminal/terminal-routes'
 import {
@@ -44,7 +44,7 @@ import { ensureKoboldcpp, koboldcppBinPath, koboldcppDir } from '../engines/kobo
 import { ensureLlamafile, llamafileBinPath, llamafileDir } from '../engines/llamafile'
 import { catalogForPlatform, catalogEngine } from '../engines/catalog'
 import { checkBuildPrereqs } from '../engines/build-prereqs'
-import { runBuild, buildDirName, chooseEngineName, sameRepo, sourceBuildBinary, sourceBuildDirOf } from '../engines/build-runner'
+import { runBuild, runPrereqInstall, buildDirName, chooseEngineName, sameRepo, sourceBuildBinary, sourceBuildDirOf } from '../engines/build-runner'
 import { provisionCuda } from '../engines/cuda-provision'
 import { detectHardware } from '../engines/hardware'
 import { recommendEngines } from '../engines/recommend'
@@ -599,12 +599,14 @@ export function registerApi(app: Hono, d: Deps): void {
 
   // 1-click compile-from-source (ADR-100, Windows/Linux + CUDA, or macOS + Metal). Clones the
   // repo, runs cmake, compiles llama-server, then registers + activates the built binary.
-  // Long-running; 202 immediately + live phase/log via GET /status engineBuild. Gated to the
-  // local host — it executes a compiler from a user-supplied repo, so a LAN client must not
-  // trigger it.
+  // Long-running; 202 immediately + live phase/log via GET /status engineBuild. It executes a
+  // compiler from a user-supplied repo, so — same rule as Code's own host execution — a remote
+  // caller only reaches this with a verified API key (ADR-394); an OPEN, keyless LAN still
+  // cannot trigger it. Turbo Link tokens are unaffected: a granted key is refused earlier, by
+  // verifyKeyValue, so it never counts as "authenticated" here regardless of grant.
   app.post('/api/v1/build/run', async (c) => {
-    if (!isLocalRequest(c, d))
-      return err(c, 403, 'forbidden', 'Building an engine is only available on the machine running TurboLLM.')
+    if (!isLocalOrAuthenticated(c, d))
+      return err(c, 403, 'forbidden', 'Building an engine requires a valid API key from a non-host device.')
     if (process.platform !== 'win32' && process.platform !== 'linux' && process.platform !== 'darwin')
       return err(c, 409, 'unsupported_platform', 'In-app build is currently Windows, Linux, or macOS only.')
     const b = await body<{ repoUrl?: string; branch?: string; commit?: string; name?: string; patchUrl?: string; patchSha256?: string }>(c)
@@ -733,13 +735,59 @@ export function registerApi(app: Hono, d: Deps): void {
     return c.json({ ok: false })
   })
 
+  // Install ONE missing build prerequisite (git / cmake / CUDA / compiler) with the host's own
+  // package manager — apt-get / dnf / pacman / zypper on Linux, Homebrew on macOS. For a
+  // headless self-hosted box (Docker / a remote Linux server) the prereq list's install LINK is
+  // a dead end: clicking it opens a website in the operator's own browser, which installs
+  // nothing on the machine that actually needs the toolchain. Windows keeps the link-only
+  // behavior — MSVC and the CUDA Toolkit need GUI installers there.
+  // Long-running; 202 immediately + live log via GET /status engineBuild (phase 'provisioning'),
+  // and failures surface through BuildState.fail exactly like a failed build. It executes a
+  // package manager as root, so — the SAME isLocalOrAuthenticated rule as /build/run and
+  // /build/cuda (ADR-394) — an OPEN, keyless LAN can never trigger it, but a caller presenting
+  // a verified API key from another device can.
+  app.post('/api/v1/build/install-prereq', async (c) => {
+    if (!isLocalOrAuthenticated(c, d))
+      return err(c, 403, 'forbidden', 'Installing build prerequisites requires a valid API key from a non-host device.')
+    if (process.platform !== 'linux' && process.platform !== 'darwin')
+      return err(c, 409, 'unsupported_platform', 'Installing build prerequisites is currently Linux and macOS only — on Windows these tools need their own installers.')
+    const b = await body<{ tool?: string }>(c)
+    const tool = (b.tool ?? '').trim()
+    if (tool !== 'git' && tool !== 'cmake' && tool !== 'cuda' && tool !== 'gcc')
+      return err(c, 400, 'invalid_config_value', 'tool must be one of: git, cmake, cuda, gcc.')
+    const busy = engineWorkBusy(d)
+    if (busy) return err(c, 409, 'engine_already_running', busy)
+    const toolchainDirs = d.store.snapshot().build.toolchainDirs
+    const ac = new AbortController()
+    buildAbort = ac
+    d.build.start(tool)
+    d.build.phase('provisioning')
+    void (async () => {
+      try {
+        await runPrereqInstall({ tool, toolchainDirs }, { phase: (p) => d.build.phase(p), log: (line) => d.build.log(line) }, ac.signal)
+        d.build.done()
+      } catch (e) {
+        if ((e as Error)?.name === 'AbortError') {
+          d.build.log('Install cancelled.')
+          d.build.cancel('Install cancelled.')
+        } else {
+          d.build.fail(`Could not install ${tool}: ${e instanceof Error ? e.message : String(e)}`)
+        }
+      } finally {
+        if (buildAbort === ac) buildAbort = null
+      }
+    })()
+    return c.json({ accepted: true }, 202)
+  })
+
   // Auto-download a CUDA Toolkit from NVIDIA's redistributable archives (ADR-101) when the
   // user has no CUDA installed, so the 1-click build can compile. Streams via the same
   // engineBuild channel (phase 'provisioning'); on success the toolkit's bin dir is added to
-  // build.toolchainDirs so the prereq check + build immediately find nvcc. Local-host + Win gated.
+  // build.toolchainDirs so the prereq check + build immediately find nvcc. Same
+  // isLocalOrAuthenticated rule as the rest of this build group (ADR-394); Windows-only.
   app.post('/api/v1/build/cuda', async (c) => {
-    if (!isLocalRequest(c, d))
-      return err(c, 403, 'forbidden', 'Downloading CUDA is only available on the machine running TurboLLM.')
+    if (!isLocalOrAuthenticated(c, d))
+      return err(c, 403, 'forbidden', 'Downloading CUDA requires a valid API key from a non-host device.')
     if (process.platform !== 'win32')
       return err(c, 409, 'unsupported_platform', 'Automatic CUDA download is currently Windows x86_64 only.')
     const busy = engineWorkBusy(d)
@@ -934,10 +982,12 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   app.post('/api/v1/engines', async (c) => {
-    // Adding an engine probes (executes) a caller-supplied binary — a local-admin action.
-    // Refuse it from non-loopback callers even with a key (defense in depth).
-    if (!isLocalRequest(c, d))
-      return err(c, 403, 'forbidden', 'Engines can only be added from the machine running TurboLLM.')
+    // Adding an engine probes (executes) a caller-supplied binary. Same isLocalOrAuthenticated
+    // rule as the build routes (ADR-394): an OPEN, keyless LAN still can't trigger this, but a
+    // caller presenting a verified API key from another device can — the same trust level Code
+    // sessions already get for host execution.
+    if (!isLocalOrAuthenticated(c, d))
+      return err(c, 403, 'forbidden', 'Adding an engine requires a valid API key from a non-host device.')
     const b = await body<{ name?: string; binPath?: string; sourceRepo?: string; sourceBranch?: string; sourceCommit?: string }>(c)
     if (!b.binPath || !b.binPath.trim()) return err(c, 400, 'invalid_config_value', 'binPath is required.')
     try {
@@ -967,10 +1017,11 @@ export function registerApi(app: Hono, d: Deps): void {
   // flow. Registration still happens via POST /api/v1/engines. `{found:false}` (200)
   // when no binary turns up; ProbeError → 400 so wrong-OS / timeout reach the UI.
   app.post('/api/v1/engines/scan', async (c) => {
-    // Scanning probes (executes) the binary it finds — gate to the local host so a LAN
-    // client can't trigger arbitrary execution by pointing at any path (matches POST /engines).
-    if (!isLocalRequest(c, d))
-      return err(c, 403, 'forbidden', 'Engine scanning is only available on the machine running TurboLLM.')
+    // Scanning probes (executes) the binary it finds — same isLocalOrAuthenticated rule as
+    // POST /engines (ADR-394): an OPEN, keyless LAN can't trigger this by pointing at any path,
+    // but an authenticated caller from another device can.
+    if (!isLocalOrAuthenticated(c, d))
+      return err(c, 403, 'forbidden', 'Engine scanning requires a valid API key from a non-host device.')
     const b = await body<{ path?: string }>(c)
     const path = (b.path ?? '').trim()
     if (!path) return err(c, 400, 'invalid_config_value', 'path is required.')
@@ -1144,8 +1195,10 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   // ---- filesystem browser (spec 03 §9): pick an engine binary/folder by navigating
-  // the disk from the browser. LOCAL-ONLY (isLocalRequest, matching /engines/scan): a
-  // page on the LAN — even with a valid key — cannot read the filesystem through the
+  // the disk from the browser. LOCAL-ONLY (isLocalRequest) — deliberately STAYS stricter than
+  // /engines/scan post-ADR-394: this is arbitrary filesystem disclosure (every folder/file name
+  // under wherever the browse lands), a different threat than probing one caller-named binary,
+  // so a page on the LAN — even with a valid key — still cannot read the filesystem through the
   // daemon; only the browser on the machine running TurboLLM can. Deliberately NOT
   // home-confined, so an engine that lives on another drive (D:\) or outside home is
   // reachable — the local user already picks (and executes) arbitrary binaries via scan.

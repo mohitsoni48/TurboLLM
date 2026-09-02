@@ -1,7 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { bypassesAuth, isLocalRequest, isLocalOrAuthenticated, provisionTunnelApiKey, verifyPresentedKey, codeAuth } from './auth'
+import { bypassesAuth, isLocalRequest, isLocalOrAuthenticated, isLoopbackBindHost, provisionBootstrapApiKey, provisionTunnelApiKey, verifyPresentedKey, codeAuth } from './auth'
+import type { ApiKey } from './config/config'
 import type { Context } from 'hono'
 import type { Deps } from './deps'
 
@@ -179,6 +180,111 @@ test('provisionTunnelApiKey: stores a fresh key and returns its full (unhashed) 
   assert.equal(pushed.length, 1)
   assert.match(pushed[0].name, /^tunnel-/)
   assert.notEqual(pushed[0].hash, full) // only the hash is persisted, never the raw key
+})
+
+test('provisionTunnelApiKey: a custom label names the key instead of the "tunnel-" default', () => {
+  const pushed: Array<{ id: string; name: string; hash: string }> = []
+  const d = {
+    store: {
+      update: (fn: (cfg: { apiKeys: typeof pushed }) => void) => {
+        const cfg = { apiKeys: pushed }
+        fn(cfg)
+      },
+    },
+  } as unknown as Deps
+  const full = provisionTunnelApiKey(d, 'print-token')
+  assert.match(full, /^tllm-[0-9A-Za-z]{40}$/)
+  assert.equal(pushed.length, 1)
+  assert.match(pushed[0].name, /^print-token-/)
+})
+
+// ── Headless bootstrap key ──────────────────────────────────────────────────────────
+//
+// requireApiKey defaults to true, which is invisible on a desktop install because
+// bypassesAuth short-circuits on a loopback-only bind. A container has no choice but to
+// bind 0.0.0.0 (that's what makes `docker run -p` publish anything), so enforcement is
+// live from the first boot — and the only route to a key (POST /api/v1/keys, behind
+// hostGate) needs either host-local access or a key you don't have yet. Exactly one key
+// is therefore minted at startup, ever, and printed once.
+
+/** Deps whose store is a real mutable object, so "did it actually persist a key" and
+ *  "does a second call see it" are both observable. */
+function bootstrapDeps(overrides: { requireApiKey?: boolean; apiKeys?: ApiKey[] }): { d: Deps; apiKeys: ApiKey[] } {
+  const cfg = {
+    daemon: { lanBind: false, requireApiKey: overrides.requireApiKey ?? true },
+    apiKeys: overrides.apiKeys ?? [],
+  }
+  const d = {
+    store: {
+      snapshot: () => cfg as unknown as ReturnType<Deps['store']['snapshot']>,
+      update: (fn: (c: typeof cfg) => void) => fn(cfg),
+    },
+  } as unknown as Deps
+  return { d, apiKeys: cfg.apiKeys }
+}
+
+const EXISTING_KEY: ApiKey = {
+  id: 'k0', name: 'existing', hash: 'deadbeef', prefix: 'tllm-existin', createdAt: '', lastUsedAt: null,
+}
+
+test('isLoopbackBindHost: every spelling of a loopback-only bind', () => {
+  for (const h of ['127.0.0.1', '127.1.2.3', '::1', '[::1]', 'localhost', 'LOCALHOST', ' 127.0.0.1 ']) {
+    assert.equal(isLoopbackBindHost(h), true, h)
+  }
+})
+
+test('isLoopbackBindHost: anything reachable from another machine is not loopback', () => {
+  for (const h of ['0.0.0.0', '::', '[::]', '192.168.1.50', '172.17.0.2', 'llm.example.com', '']) {
+    assert.equal(isLoopbackBindHost(h), false, h)
+  }
+})
+
+test('provisionBootstrapApiKey: no key on a loopback-only bind — a desktop install is never asked for one', () => {
+  const { d, apiKeys } = bootstrapDeps({})
+  assert.equal(provisionBootstrapApiKey(d, '127.0.0.1'), null)
+  assert.equal(provisionBootstrapApiKey(d, '::1'), null)
+  assert.equal(provisionBootstrapApiKey(d, 'localhost'), null)
+  assert.equal(apiKeys.length, 0)
+})
+
+test('provisionBootstrapApiKey: THE CONTAINER CASE — non-loopback bind, no keys, enforcement on → mints one', () => {
+  const { d, apiKeys } = bootstrapDeps({})
+  const full = provisionBootstrapApiKey(d, '0.0.0.0')
+  assert.match(full ?? '', /^tllm-[0-9A-Za-z]{40}$/)
+  assert.equal(apiKeys.length, 1)
+  assert.match(apiKeys[0].name, /^bootstrap-/)
+  assert.notEqual(apiKeys[0].hash, full) // only the hash is persisted, never the raw key
+  assert.equal(apiKeys[0].lastUsedAt, null)
+  assert.equal(apiKeys[0].grant, undefined) // a full-access key, not a Turbo Link grant
+})
+
+test('provisionBootstrapApiKey: EXACTLY ONCE — a second boot with a key already stored mints nothing', () => {
+  const { d, apiKeys } = bootstrapDeps({})
+  assert.notEqual(provisionBootstrapApiKey(d, '0.0.0.0'), null)
+  assert.equal(apiKeys.length, 1)
+  // Second call = the next boot, same persisted config.
+  assert.equal(provisionBootstrapApiKey(d, '0.0.0.0'), null)
+  assert.equal(apiKeys.length, 1)
+})
+
+test('provisionBootstrapApiKey: a pre-existing key (any origin) blocks it — never mint a second silently', () => {
+  const { d, apiKeys } = bootstrapDeps({ apiKeys: [EXISTING_KEY] })
+  assert.equal(provisionBootstrapApiKey(d, '0.0.0.0'), null)
+  assert.equal(apiKeys.length, 1)
+  assert.equal(apiKeys[0].id, 'k0')
+})
+
+test('provisionBootstrapApiKey: requireApiKey off → nothing is enforced, so no key is needed', () => {
+  const { d, apiKeys } = bootstrapDeps({ requireApiKey: false })
+  assert.equal(provisionBootstrapApiKey(d, '0.0.0.0'), null)
+  assert.equal(apiKeys.length, 0)
+})
+
+test('provisionBootstrapApiKey: a specific LAN address counts as non-loopback too, not just 0.0.0.0', () => {
+  // `--addr 192.168.1.50:6996` is just as reachable from another machine.
+  const { d, apiKeys } = bootstrapDeps({})
+  assert.notEqual(provisionBootstrapApiKey(d, '192.168.1.50'), null)
+  assert.equal(apiKeys.length, 1)
 })
 
 // codeAuth (Code-specific gate, independent of the global requireApiKey toggle): Chat can

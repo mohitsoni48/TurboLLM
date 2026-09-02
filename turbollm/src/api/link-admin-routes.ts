@@ -1,7 +1,7 @@
 import type { Hono, MiddlewareHandler } from 'hono'
 import { randomUUID } from 'node:crypto'
 import { generateApiKey, hostGate } from '../auth'
-import { getLanIp } from '../net'
+import { getAdvertisedHost, getLanIp } from '../net'
 import type { Context } from 'hono'
 import type { Deps } from '../deps'
 import { applyProbeResult } from '../link/apply-probe'
@@ -171,7 +171,7 @@ export function registerLinkAdminRoutes(
     const cfg = d.store.snapshot()
     const port = (cfg.daemon as { port?: number }).port ?? 6996
     const tunnelUrl = d.tunnel?.url() ?? null
-    const baseUrl = tunnelUrl ?? `http://${lanHost()}:${port}`
+    const baseUrl = tunnelUrl ?? lanBaseUrl(port)
 
     // Telemetry (ADR-376 Task 11): count and preset name only — never the token, the
     // capability list itself, or baseUrl. `preset` is a hint the caller may pass for
@@ -718,9 +718,18 @@ function remoteFailure(c: Context, rec: LinkRecord, probe: LinkProbe): Response 
   )
 }
 
-/** Best-effort LAN address for the minted link string. Falls back to a placeholder the
- *  user can edit rather than guessing wrong silently — a wrong-but-editable URL is a
- *  better failure than a confidently wrong one. */
-function lanHost(): string {
-  return getLanIp() ?? 'localhost'
+/** Base URL for the minted link string, at the port the daemon is configured on.
+ *
+ *  Prefers the operator's `TURBOLLM_ADVERTISED_HOST` override (see net.ts) over LAN
+ *  auto-detection: inside a Docker container the auto-detected address is the
+ *  container-internal bridge IP (`172.17.0.2`), which is unreachable from anywhere the
+ *  peer actually is. The override may carry its own port (the published one, which need
+ *  not match the port bound inside the container); when it doesn't, keep ours.
+ *
+ *  Falls back to a placeholder the user can edit rather than guessing wrong silently — a
+ *  wrong-but-editable URL is a better failure than a confidently wrong one. */
+function lanBaseUrl(port: number): string {
+  const advertised = getAdvertisedHost()
+  if (advertised) return `http://${advertised.host}:${advertised.port ?? port}`
+  return `http://${getLanIp() ?? 'localhost'}:${port}`
 }

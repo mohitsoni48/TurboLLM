@@ -442,6 +442,10 @@ export type BuildPrereqTool = {
   found: boolean
   version?: string
   installUrl: string
+  /** Present (and non-empty) only for a MISSING tool the host's package manager can install:
+   *  the ordered argv steps TurboLLM would run on the daemon machine. Absent when the website
+   *  link is the only realistic path (all of Windows, CUDA on dnf/zypper, macOS's compiler). */
+  installCommands?: string[][]
 }
 
 /** GET /api/v1/build/prereqs payload. Guided build supports Windows, Linux (both + CUDA) and
@@ -451,6 +455,9 @@ export type BuildPrereqs = {
   supported: boolean
   os: 'windows' | 'linux' | 'macos' | 'other'
   tools: BuildPrereqTool[]
+  /** The host package manager the `installCommands` were generated for, or null when none was
+   *  detected (always null on Windows). Lets the UI name it instead of showing a bare button. */
+  packageManager: 'apt-get' | 'dnf' | 'pacman' | 'zypper' | 'brew' | null
 }
 
 // ── Engine recommendation (engine overhaul, Phase 2) ─────────────────────────

@@ -2,7 +2,7 @@
 import type { Context, Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import type { Deps } from '../deps'
-import { getLanIp } from '../net'
+import { getAdvertisedHost, getLanIp } from '../net'
 import { clampMaxTokens } from '../config/config'
 import { feedChunk, flushState, initParseState, type ParseState } from './parser'
 import { needsExtraPass } from './think-utils'
@@ -542,10 +542,9 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
 
     const cfg = d.store.snapshot()
-    const lanIp = getLanIpForShare()
-    const url = `http://${lanIp}:${cfg.daemon.port}/chat/${convId}`
-    const onlyLocal = lanIp === '127.0.0.1'
-    return c.json({ url, onlyLocal })
+    const share = getShareTarget(cfg.daemon.port)
+    const url = `http://${share.host}:${share.port}/chat/${convId}`
+    return c.json({ url, onlyLocal: share.onlyLocal })
   })
 
   // ── F-024 / F-036: import chat ────────────────────────────────────────────
@@ -684,10 +683,22 @@ function importOpenAiMessages(
   return c.json({ id: newConv.id }, 201)
 }
 
-// ── LAN IP helper (F-023) ──────────────────────────────────────────────────────
+// ── LAN share target (F-023) ───────────────────────────────────────────────────
 
-function getLanIpForShare(): string {
-  return getLanIp() ?? '127.0.0.1'
+/** Host + port to advertise in a chat share URL, and whether that URL is loopback-only
+ *  (which the UI surfaces as "this link only works on this machine").
+ *
+ *  The operator's `TURBOLLM_ADVERTISED_HOST` override (see net.ts) wins over LAN
+ *  auto-detection: running inside a container, `getLanIp()` returns the container-internal
+ *  bridge address, which is unreachable from the phone the user wants to open the link on.
+ *  An explicit override is by definition not loopback-only — the operator stated the
+ *  address others should use — so `onlyLocal` is false whenever one is set. The override
+ *  may name its own (published) port; without one, keep the daemon's. */
+function getShareTarget(defaultPort: number): { host: string; port: number; onlyLocal: boolean } {
+  const advertised = getAdvertisedHost()
+  if (advertised) return { host: advertised.host, port: advertised.port ?? defaultPort, onlyLocal: false }
+  const host = getLanIp() ?? '127.0.0.1'
+  return { host, port: defaultPort, onlyLocal: host === '127.0.0.1' }
 }
 
 // ── shared generation streaming ───────────────────────────────────────────────

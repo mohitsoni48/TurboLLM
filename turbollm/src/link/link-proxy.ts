@@ -41,6 +41,12 @@ export function buildUpstream(remote: Pick<RemoteTarget, 'baseUrl'>, path: strin
  *  can carry a secret, and nothing else travels. */
 const FORWARDED = ['content-type', 'accept'] as const
 
+/** The header a link token travels in — the ONE spelling, exported so a caller that cannot
+ *  use `linkHeaders` (pi's provider config takes a plain object, not a `Headers`) still names
+ *  it from here rather than re-typing the literal. `resolveKey` reads it case-insensitively,
+ *  so the casing is cosmetic; the point is that there is a single definition to change. */
+export const LINK_AUTH_HEADER = 'X-TurboLLM-Auth'
+
 /** Build the outbound header set for a link request.
  *
  *  Two distinct leaks are closed at once:
@@ -56,7 +62,7 @@ export function linkHeaders(remote: Pick<RemoteTarget, 'token'>, incoming?: Head
       if (v) out.set(name, v)
     }
   }
-  out.set('X-TurboLLM-Auth', remote.token)
+  out.set(LINK_AUTH_HEADER, remote.token)
   return out
 }
 

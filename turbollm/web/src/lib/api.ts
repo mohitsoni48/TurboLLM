@@ -284,6 +284,14 @@ export function provisionCuda(): Promise<{ accepted: boolean }> {
   return request('/api/v1/build/cuda', { method: 'POST', json: {} })
 }
 
+/** Install one missing build prerequisite with the host's package manager (apt-get/dnf/pacman/
+ *  zypper/brew) — the fix for a headless self-hosted box, where the install LINK only opens a
+ *  page in the operator's own browser and installs nothing on the server. 202 + progress via
+ *  GET /status engineBuild. Linux/macOS + local-host only. */
+export function installPrereq(tool: 'git' | 'cmake' | 'cuda' | 'gcc'): Promise<{ accepted: boolean }> {
+  return request('/api/v1/build/install-prereq', { method: 'POST', json: { tool } })
+}
+
 export function installVllm(): Promise<{ accepted: true; engine: 'vllm' }> {
   return request('/api/v1/engines/vllm', { method: 'POST', json: {} })
 }
