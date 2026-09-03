@@ -120,22 +120,7 @@ export async function probe(bin: string): Promise<ProbeResult> {
   const kvTypes = detectKvTypes(h.out, flags.includes('--cache-type-k'))
   const flagInfo = flags.map((f) => classifyFlag(f, h.out))
 
-  // Capture the accepted `--spec-type` enum values (e.g. `none,draft-mtp,nextn`)
-  // as `spec-type:<value>` pseudo-flags. The enum differs by engine — official
-  // llama.cpp has no `nextn`, the TurboQuant fork does — so speculative-decoding
-  // arg emission must check the VALUE is accepted, not just that the flag exists.
-  // The enum's printed form differs by engine: official llama.cpp lists it
-  // comma-separated (`none,draft-mtp,...`), the TurboQuant fork bracket/pipe
-  // (`[none|draft|nextn|...]`). Match only the actual enum (a bracket group, or a
-  // multi-value comma/pipe list) — never the prose mentions like `--spec-type mtp,
-  // or ...` — and union the values across all such occurrences.
-  const ENUM_RE = /--spec-type\s+(\[[^\]\n]+\]|[a-z][a-z0-9_-]*(?:[,|][a-z0-9_-]+)+)/gi
-  for (const m2 of h.out.matchAll(ENUM_RE)) {
-    for (const v of m2[1].replace(/[[\]]/g, '').split(/[,|]/)) {
-      const t = v.trim()
-      if (t) flags.push(`spec-type:${t}`)
-    }
-  }
+  for (const t of extractSpecTypeValues(h.out)) flags.push(`spec-type:${t}`)
 
   return { version, capabilities: { kvTypes, flags: [...new Set(flags)].sort(), flagInfo } }
 }
@@ -206,6 +191,39 @@ export function detectKvTypes(helpText: string, hasCacheTypeFlag: boolean): stri
     for (const extra of cacheTypeK.enumValues ?? []) if (!kvTypes.includes(extra)) kvTypes.push(extra)
   }
   return kvTypes
+}
+
+/** Capture the accepted `--spec-type` enum values (e.g. `none,draft-mtp,nextn`) as plain
+ *  value strings (the caller prefixes them `spec-type:<value>`). The enum differs by engine
+ *  — official llama.cpp has no `nextn`, the TurboQuant fork does — so speculative-decoding
+ *  arg emission must check the VALUE is accepted, not just that the flag exists.
+ *  The enum's printed form differs by engine:
+ *   - official llama.cpp/beellama/TurboQuant list it comma-separated directly after the flag
+ *     (`none,draft-mtp,...`), or bracket/pipe (`[none|draft|nextn|...]`);
+ *   - ik_llama.cpp prints only a placeholder after the flag (`SPEC[:k=v,...]`) and puts the
+ *     real enum on its OWN continuation line a bit further down (`types: none, draft,
+ *     dflash, ...`) — confirmed against its real --help output. Scoped to shortly after each
+ *     `--spec-type` occurrence so an unrelated "types:" mention elsewhere in the help text
+ *     can't leak in.
+ *  Never matches prose mentions like `--spec-type mtp, or ...` — only an actual value list —
+ *  and unions values across every occurrence found. */
+export function extractSpecTypeValues(helpText: string): string[] {
+  const values = new Set<string>()
+  const ENUM_RE = /--spec-type\s+(\[[^\]\n]+\]|[a-z][a-z0-9_-]*(?:[,|][a-z0-9_-]+)+)/gi
+  for (const m of helpText.matchAll(ENUM_RE)) {
+    for (const v of m[1].replace(/[[\]]/g, '').split(/[,|]/)) {
+      const t = v.trim()
+      if (t) values.add(t)
+    }
+  }
+  const TYPES_LINE_RE = /--spec-type\b[\s\S]{0,400}?\r?\n[ \t]*types:\s*([a-z0-9_][a-z0-9_, -]*)/gi
+  for (const m of helpText.matchAll(TYPES_LINE_RE)) {
+    for (const v of m[1].split(',')) {
+      const t = v.trim()
+      if (t) values.add(t)
+    }
+  }
+  return [...values]
 }
 
 /** Parses a comma/pipe-separated list of accepted values out of a flag's own help block.

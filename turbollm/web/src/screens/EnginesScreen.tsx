@@ -219,6 +219,7 @@ const ENGINE_META: Record<string, EngineMeta> = {
       'SOTA low-bit IQK / Trellis quants',
       'Best-in-class CPU + hybrid MoE speed',
       'Strong DeepSeek MLA / FlashMLA performance',
+      'Adaptive DFlash speculative decoding',
       'Same llama-server + GGUF flow',
     ],
     cons: ['No prebuilts — build from source', 'CPU + CUDA only (no ROCm/Metal)', 'Some quant types are fork-only'],

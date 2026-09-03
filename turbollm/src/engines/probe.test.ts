@@ -1,7 +1,7 @@
 // Capability-flag extraction from --help output (GitHub #43 regression).
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { extractFlags, detectKvTypes, parseEnumList, classifyFlag } from './probe'
+import { extractFlags, detectKvTypes, parseEnumList, classifyFlag, extractSpecTypeValues } from './probe'
 
 test('captures a normally-documented flag', () => {
   const help = `--cache-type-k TYPE     KV cache data type for K\n--parallel N            number of parallel sequences\n`
@@ -214,4 +214,46 @@ test('classifyFlag: a bare boolean flag at true end-of-line (zero trailing space
   const help = `--no-mmproj\nsome other line\n`
   const info = classifyFlag('--no-mmproj', help)
   assert.equal(info.kind, 'boolean')
+})
+
+// ---- extractSpecTypeValues: DFlash never showed up as an option for ik_llama.cpp because its
+// --help prints the --spec-type enum on its own continuation line ("types: none, draft,
+// dflash, ...") instead of directly after the flag like mainline/beellama/TurboQuant do — the
+// old regex only matched the latter form. Fixtures below are the real --help text from each
+// engine, captured live. ---------------------------------------------------------------------
+
+test('extractSpecTypeValues: mainline/beellama/TurboQuant comma list directly after the flag', () => {
+  const help =
+    `--spec-type none,draft-simple,draft-eagle3,draft-mtp,draft-dflash,draft-dspark,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache\n` +
+    `                                        comma-separated list of types of speculative decoding to use (default:\n` +
+    `                                        none)\n`
+  const values = extractSpecTypeValues(help)
+  assert.ok(values.includes('draft-dflash'))
+  assert.ok(values.includes('draft-mtp'))
+  assert.ok(!values.includes('speculative'), 'must not pick up words from the trailing description prose')
+})
+
+test('extractSpecTypeValues: bracket/pipe form (TurboQuant-style)', () => {
+  const help = `--spec-type [none|draft|nextn]         which speculative decoding mode to use\n`
+  assert.deepEqual(extractSpecTypeValues(help).sort(), ['draft', 'nextn', 'none'])
+})
+
+test('extractSpecTypeValues: ik_llama.cpp\'s real --help — enum on its own "types:" continuation line', () => {
+  const help =
+    `  --spec-type SPEC[:k=v,...]      canonical speculative stage entry; repeat for a supported two-stage chain.\n` +
+    `                                  types: none, draft, dflash, dspark, mtp, ngram-cache, ngram-simple, ngram-map-k, ngram-map-k4v, ngram-mod, suffix\n` +
+    `                                  examples: --spec-type mtp:n_max=1,p_min=0.0\n` +
+    `                                            --model-draft draft.gguf --spec-type dflash:n_max=4\n` +
+    `                                            --spec-type ngram-mod:n_max=64,n_min=2,ngram_size_n=8 --spec-type mtp:n_max=1,p_min=0.0\n` +
+    `                                            --spec-type "suffix:n_max=16,n_min=2,suffix_min_match_len=5,suffix_max_depth=64,suffix_corpus='/tmp/spec,type-corpus.json'"\n`
+  const values = extractSpecTypeValues(help)
+  assert.deepEqual(
+    values.sort(),
+    ['dflash', 'draft', 'dspark', 'mtp', 'ngram-cache', 'ngram-map-k', 'ngram-map-k4v', 'ngram-mod', 'ngram-simple', 'none', 'suffix'],
+  )
+})
+
+test('extractSpecTypeValues: an unrelated "types of X" mention elsewhere does not false-positive', () => {
+  const help = `some flag         does something with types of widgets, not speculative decoding\n`
+  assert.deepEqual(extractSpecTypeValues(help), [])
 })

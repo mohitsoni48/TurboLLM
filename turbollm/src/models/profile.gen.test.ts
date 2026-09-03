@@ -328,6 +328,19 @@ test('dflash mode is gated on the engine accepting spec-type:draft-dflash', () =
   assert.ok(!args.includes('--spec-draft-model'), '--spec-draft-model must not be passed when the engine lacks draft-dflash support')
 })
 
+// Regression: ik_llama.cpp genuinely supports DFlash but names things differently — it has
+// no --spec-draft-model alias (only --model-draft) and its --spec-type enum value is the
+// bare `dflash`, not mainline's `draft-dflash`. Confirmed live against the fork's real
+// --help output; dflash silently never fired for it before this fix (GitHub report).
+test('dflash mode works on ik_llama.cpp\'s naming (--model-draft, bare "dflash" value)', () => {
+  const ikLlamaCaps = { kvTypes: [], flags: ['--spec-type', '--model-draft', 'spec-type:dflash', 'spec-type:draft', 'spec-type:none'] }
+  const p = { ...base(), speculative: 'dflash' as const, draftModelPath: '/models/draft-dflash.gguf' }
+  const args = profileToArgs(p, model(), ikLlamaCaps)
+  assert.equal(args[args.indexOf('--spec-type') + 1], 'dflash')
+  assert.equal(args[args.indexOf('--model-draft') + 1], '/models/draft-dflash.gguf')
+  assert.ok(!args.includes('--spec-draft-model'), 'must not emit a flag ik_llama.cpp does not have')
+})
+
 // Regression: the draft window is a property of the speculation mechanism itself
 // (llama.cpp's shared verify loop), not specific to how the draft is produced — it must
 // apply to 'mtp' and 'nextn' modes too, not only the external-draft-model 'draft' mode
@@ -370,6 +383,19 @@ test('nextn mode on the TurboQuant fork (spec-type:nextn) still includes --model
   const args = profileToArgs(p, m, capFork)
   assert.equal(args[args.indexOf('--spec-type') + 1], 'nextn')
   assert.equal(args[args.indexOf('--model-draft') + 1], m.path)
+})
+
+// Regression: ik_llama.cpp has no `nextn`/`draft-mtp` value — it calls the same
+// self-contained built-in-head mechanism `mtp` (confirmed against its real --help:
+// `--spec-type mtp:n_max=1,p_min=0.0`, no --model-draft in the example). Same
+// no-model-draft semantics as mainline's draft-mtp, just a different value string —
+// nextn silently never fired for it before this fix.
+test('nextn mode on ik_llama.cpp (spec-type:mtp) omits --model-draft, like mainline draft-mtp', () => {
+  const capIkLlama = { kvTypes: [], flags: ['--spec-type', '--model-draft', 'spec-type:mtp', 'spec-type:dflash'] }
+  const p = { ...base(), speculative: 'nextn' as const }
+  const args = profileToArgs(p, model({ nextnLayers: 1 }), capIkLlama)
+  assert.equal(args[args.indexOf('--spec-type') + 1], 'mtp')
+  assert.ok(!args.includes('--model-draft'), '--model-draft must not be passed for ik_llama.cpp\'s self-contained mtp stage')
 })
 
 test('off mode emits no draft-max/draft-min flags', () => {

@@ -359,20 +359,29 @@ export function ModelDetailDialog({
   const specOptions: Array<LoadProfile['speculative']> = ['off']
   if (hasFlag('--spec-type') && hasFlag('--mtp-head') && modelSupportsMtp) specOptions.push('mtp')
   // NextN = the model's built-in head as a self-draft. The fork's spec-type is
-  // `nextn`; mainline llama.cpp's equivalent is `draft-mtp` — accept either.
+  // `nextn`; mainline llama.cpp's equivalent is `draft-mtp`; ik_llama.cpp calls the
+  // same self-contained mechanism `mtp` (confirmed against its real --help) — accept any.
   if (
     hasFlag('--spec-type') &&
     hasFlag('--model-draft') &&
     modelSupportsNextn &&
-    (specAccepts('nextn') || specAccepts('draft-mtp'))
+    (specAccepts('nextn') || specAccepts('draft-mtp') || specAccepts('mtp'))
   )
     specOptions.push('nextn')
   if (hasFlag('--model-draft')) specOptions.push('draft')
   // DFlash = adaptive speculative decoding with a separate draft GGUF, same as `draft`
   // but with its own --spec-type value. Not fork-specific — mainline llama.cpp and every
   // fork we've probed exposes it, so (like `draft`) it's gated on engine capability only,
-  // never on model arch.
-  if (hasFlag('--spec-type') && hasFlag('--spec-draft-model') && specAccepts('draft-dflash')) specOptions.push('dflash')
+  // never on model arch. Naming varies by fork: mainline/beellama/TurboQuant alias
+  // --spec-draft-model to --model-draft and use the enum value `draft-dflash`; ik_llama.cpp
+  // only has --model-draft (no --spec-draft-model alias) and its own bare `dflash` value —
+  // accept either name/value pair rather than hardcode mainline's.
+  if (
+    hasFlag('--spec-type') &&
+    (hasFlag('--spec-draft-model') || hasFlag('--model-draft')) &&
+    (specAccepts('draft-dflash') || specAccepts('dflash'))
+  )
+    specOptions.push('dflash')
 
   const fit = useMemo(() => {
     if (!detail || !draft) return null
