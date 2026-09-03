@@ -5,6 +5,23 @@ import { closeSync, existsSync, openSync, readSync, statSync } from 'node:fs'
 import { dirname } from 'node:path'
 import type { FlagInfo } from '../config/config'
 
+/** Every binary this module probes is a native engine (llama.cpp/koboldcpp/llamafile and their
+ *  forks) — Python engines (MLX, vLLM, SGLang, …) install through their own dedicated routes and
+ *  never reach `probe()`. Mirrors manager.ts's native-engine env exactly (a source build's
+ *  bundled runtime `.so`s — CUDA on Linux, or the whole runtime on Android, which ships with no
+ *  RPATH at all — aren't found without this): unlike Windows, the dynamic linker doesn't search
+ *  the executable's own directory by default. Confirmed live: an Android NDK cross-compiled
+ *  llama-server failed even `--version`/`--help` without it (GitHub #52 item 6 / ADR-390/391) —
+ *  a gap in the probe path specifically, since the actual launch path (manager.ts) already sets
+ *  this; probing and launching had silently drifted apart. Windows inherits the daemon env
+ *  unchanged, same as manager.ts. */
+function probeEnv(bin: string): NodeJS.ProcessEnv | undefined {
+  if (process.platform === 'win32') return undefined
+  const dir = dirname(bin)
+  const existing = process.env.LD_LIBRARY_PATH
+  return { ...process.env, LD_LIBRARY_PATH: existing ? `${dir}:${existing}` : dir }
+}
+
 export interface ProbeResult {
   version: string
   capabilities: { kvTypes: string[]; flags: string[]; flagInfo: FlagInfo[] }
@@ -47,7 +64,7 @@ function runCaptured(bin: string, arg: string): Promise<{ out: string; err: Erro
       // takes 10-30 s depending on the fork's embedded shaders. Use a longer
       // timeout on macOS so this first-run compilation doesn't fail the probe.
       const timeoutMs = process.platform === 'darwin' ? 60_000 : 15_000
-      execFile(bin, [arg], { cwd: dirname(bin), timeout: timeoutMs, windowsHide: true, maxBuffer: 4 * 1024 * 1024 }, (error, stdout, stderr) => {
+      execFile(bin, [arg], { cwd: dirname(bin), env: probeEnv(bin), timeout: timeoutMs, windowsHide: true, maxBuffer: 4 * 1024 * 1024 }, (error, stdout, stderr) => {
         resolve({ out: (stdout || '') + (stderr || ''), err: error })
       })
     } catch (e) {

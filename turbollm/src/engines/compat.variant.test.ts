@@ -39,10 +39,19 @@ const noGpu: HardwareProfile = {
   vramMb: 0,
   unifiedMemory: false,
 }
+const androidTermux: HardwareProfile = {
+  platform: 'android',
+  arch: 'arm64',
+  gpuVendor: 'unknown',
+  hasGpu: false,
+  vramMb: 0,
+  unifiedMemory: false,
+}
 
 const cudaReq: HardwareReq = { gpuVendor: ['nvidia'], backend: 'cuda' }
 const metalReq: HardwareReq = { platform: ['darwin'], gpuVendor: ['apple'], backend: 'metal' }
 const cpuReq: HardwareReq = { backend: 'cpu' }
+const androidReq: HardwareReq = { platform: ['android'] }
 
 test('evaluateVariant: NVIDIA box passes a cuda requirement', () => {
   assert.deepEqual(evaluateVariant(nvidiaWin, cudaReq), { ok: true })
@@ -70,6 +79,17 @@ test('evaluateVariant: a cpu requirement is always ok (every box)', () => {
   assert.deepEqual(evaluateVariant(amdWin, cpuReq), { ok: true })
   assert.deepEqual(evaluateVariant(appleMac, cpuReq), { ok: true })
   assert.deepEqual(evaluateVariant(noGpu, cpuReq), { ok: true })
+  assert.deepEqual(evaluateVariant(androidTermux, cpuReq), { ok: true })
+})
+
+test('evaluateVariant: Android/Termux box passes an android platform requirement', () => {
+  assert.deepEqual(evaluateVariant(androidTermux, androidReq), { ok: true })
+})
+
+test('evaluateVariant: a Windows box fails an android platform requirement with a platform reason', () => {
+  const r = evaluateVariant(nvidiaWin, androidReq)
+  assert.equal(r.ok, false)
+  assert.match(r.reason ?? '', /Android only/)
 })
 
 test('evaluateVariant: arch mismatch reports a clear reason', () => {

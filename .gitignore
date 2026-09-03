@@ -97,5 +97,8 @@ Thumbs.db
 # Local-only agent/tooling scratch dirs — not product source
 /.agents/
 /wrapper/
+
+# Standalone Android app R&D — its own separate git repo, not part of this one
+/TurboLLM Android/
 # Worktree node_modules junction helper (Windows-only dev convenience)
 /scripts/link-node-modules.ps1

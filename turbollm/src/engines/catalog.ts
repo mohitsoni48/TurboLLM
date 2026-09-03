@@ -144,7 +144,11 @@ const ALL: CatalogEngine[] = [
     provision: 'github-release',
     homepage: 'https://github.com/ggml-org/llama.cpp',
     repo: 'ggml-org/llama.cpp',
-    platforms: ['win32', 'darwin', 'linux'],
+    // 'android' included: upstream has no Android prebuilt (Bionic vs. glibc), so on Android
+    // this flows through the same LlamaCppBackendRows UI but availableBackends() (download.ts)
+    // resolves the archive from TurboLLM's OWN cross-compiled releases instead of upstream's —
+    // see ANDROID_REPO there. GitHub #52 item 6 / ADR-390/391.
+    platforms: ['win32', 'darwin', 'linux', 'android'],
     support: 'stable',
     // llama.cpp expands into the backend sub-picker (existing UI); it has no single
     // install endpoint of its own.
@@ -180,6 +184,38 @@ const ALL: CatalogEngine[] = [
         requires: { platform: ['linux'], gpuVendor: ['nvidia'] },
         stability: 'experimental',
         speed: 'fast',
+        hasPrebuilt: false,
+      },
+    ],
+  },
+  {
+    // GitHub #52 item 6, "Android out-of-box support". Fallback / advanced path, now that the
+    // main llama.cpp entry above carries a real Android prebuilt (TurboLLM's own NDK cross-
+    // compile, ADR-391): this stays useful for an ABI CI doesn't publish (e.g. armeabi-v7a), a
+    // llama.cpp commit newer than the last CI build, or Termux itself being unavailable/broken
+    // for the hosted download. Building from source inside Termux with Termux's own clang
+    // produces a Bionic-native binary directly, the same "no prebuilt → build it" treatment
+    // ik_llama.cpp already gets below. Termux reports process.platform === 'android' (not
+    // 'linux') — see sysinfo.ts and build-prereqs.ts for the other places that matters.
+    id: 'llama.cpp-android-source',
+    name: 'llama.cpp (Android / Termux, build from source)',
+    kind: 'llama-server',
+    description: 'Official llama.cpp, CPU-only, built from source inside Termux — the advanced/fallback path when the prebuilt above (llama.cpp entry) doesn\'t fit your device.',
+    provision: 'github-release',
+    homepage: 'https://github.com/ggml-org/llama.cpp',
+    repo: 'ggml-org/llama.cpp',
+    platforms: ['android'],
+    support: 'experimental',
+    installEndpoint: '',
+    note: 'Run inside Termux (not the Android app store — get Termux from F-Droid or its GitHub releases). First install the toolchain: `pkg install git cmake clang`. Then use the guided build below. Real-device verified: toolchain install + partial compile confirmed live on a real Android 14 (4KB-page) emulator; a full clean build was not timed to completion in that session (GitHub #52 item 6).',
+    variants: [
+      {
+        id: 'llama.cpp-android-source-cpu',
+        label: 'CPU — build from source',
+        repo: 'ggml-org/llama.cpp',
+        requires: { platform: ['android'] },
+        stability: 'experimental',
+        speed: 'baseline',
         hasPrebuilt: false,
       },
     ],

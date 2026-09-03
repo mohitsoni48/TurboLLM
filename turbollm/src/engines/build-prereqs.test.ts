@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { delimiter } from 'node:path'
-import { buildCommands, buildEnv, CMAKE_CONFIGURE_ARGS, CMAKE_CONFIGURE_ARGS_MACOS } from './build-prereqs'
+import { buildCommands, buildEnv, CMAKE_CONFIGURE_ARGS, CMAKE_CONFIGURE_ARGS_ANDROID, CMAKE_CONFIGURE_ARGS_MACOS } from './build-prereqs'
 
 const PATH_KEY = Object.keys(process.env).find((k) => k.toLowerCase() === 'path') ?? 'PATH'
 
@@ -206,4 +206,25 @@ test('buildCommands: produces the macOS + Metal cmake steps (no CUDA flags, no r
 
 test('CMAKE_CONFIGURE_ARGS_MACOS: enables Metal + Release, no CUDA flags', () => {
   assert.deepEqual(CMAKE_CONFIGURE_ARGS_MACOS, ['-DGGML_METAL=ON', '-DCMAKE_BUILD_TYPE=Release'])
+})
+
+test('CMAKE_CONFIGURE_ARGS_ANDROID: CPU-only Release build, no GPU backend flags', () => {
+  assert.deepEqual(CMAKE_CONFIGURE_ARGS_ANDROID, ['-DCMAKE_BUILD_TYPE=Release'])
+})
+
+test('buildCommands: produces the Android/Termux cmake steps, led by the pkg install step, and the binary-location note', () => {
+  const cmds = buildCommands('https://github.com/owner/repo', undefined, 'android')
+  assert.deepEqual(cmds, [
+    'pkg install -y git cmake clang',
+    'git clone --depth 1 "https://github.com/owner/repo" turbo-build',
+    'cd turbo-build',
+    `cmake -B build ${CMAKE_CONFIGURE_ARGS_ANDROID.join(' ')}`,
+    'cmake --build build -j --target llama-server',
+    '# Built binary: build/bin/llama-server — add it via "Add your own engine".',
+  ])
+})
+
+test('buildCommands: Android respects --branch like every other OS', () => {
+  const cmds = buildCommands('https://github.com/owner/repo', 'main', 'android')
+  assert.equal(cmds[1], 'git clone --branch "main" --depth 1 "https://github.com/owner/repo" turbo-build')
 })

@@ -1,0 +1,139 @@
+name: Android llama.cpp build
+
+# Cross-compiles llama.cpp for Android via the NDK and hosts it on THIS repo's own releases
+# (GitHub #52 item 6 / ADR-390/391) — upstream llama.cpp publishes no Android prebuilt at all
+# (its Linux releases are glibc-linked and won't load against Android's Bionic libc), so
+# TurboLLM builds and hosts its own. Tagged `android-<LLAMA_BUILD>` — independent of both
+# upstream's own release tags and this repo's own vX.Y.Z app tags — so Android tracks the
+# exact same llama.cpp commit as every other platform (download.ts's LLAMA_BUILD), decoupled
+# from the app's own release cadence.
+#
+# download.ts's availableBackends() (android branch) constructs the asset URL this produces:
+#   https://github.com/<this repo>/releases/download/android-<tag>/llama-<tag>-bin-android-<arch>.tar.gz
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'turbollm/src/engines/download.ts'
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: 'Rebuild even if a release for this tag already exists'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  check-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      needed: ${{ steps.check.outputs.needed }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract LLAMA_BUILD
+        id: tag
+        run: |
+          tag=$(grep -oP "export const LLAMA_BUILD = '\K[^']+" turbollm/src/engines/download.ts)
+          if [ -z "$tag" ]; then
+            echo "Could not extract LLAMA_BUILD from download.ts" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether android-${{ steps.tag.outputs.tag }} already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ inputs.force_rebuild }}" = "true" ]; then
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          elif gh release view "android-${{ steps.tag.outputs.tag }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release android-${{ steps.tag.outputs.tag }} already exists — skipping build."
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check-tag
+    if: needs.check-tag.outputs.needed == 'true'
+    name: Build (${{ matrix.abi }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            asset_arch: arm64
+            omp_arch: aarch64
+          - abi: x86_64
+            asset_arch: x64
+            omp_arch: x86_64
+
+    steps:
+      - name: Clone llama.cpp at ${{ needs.check-tag.outputs.tag }}
+        run: |
+          git clone --depth 1 --branch "${{ needs.check-tag.outputs.tag }}" \
+            https://github.com/ggml-org/llama.cpp llama.cpp-src
+
+      - name: Locate the Android NDK (ships preinstalled on GitHub-hosted Ubuntu runners)
+        id: ndk
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
+            echo "No Android NDK found on this runner (checked ANDROID_NDK_LATEST_HOME / ANDROID_NDK_HOME) — the runner image changed; pin an NDK download here instead." >&2
+            exit 1
+          fi
+          echo "path=$NDK" >> "$GITHUB_OUTPUT"
+
+      - name: Configure (CPU-only — matches CMAKE_CONFIGURE_ARGS_ANDROID in build-prereqs.ts)
+        run: |
+          cmake -B build -S llama.cpp-src \
+            -DCMAKE_TOOLCHAIN_FILE="${{ steps.ndk.outputs.path }}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=${{ matrix.abi }} \
+            -DANDROID_PLATFORM=android-24 \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build llama-server
+        run: cmake --build build -j --target llama-server
+
+      - name: Package (binary + its shared libs, self-contained like every other platform's archive)
+        # libomp.so isn't in build/bin — it's the NDK's own OpenMP runtime (ggml's CPU backend
+        # links against it), living under the toolchain dir, not the build output. Confirmed
+        # live: a build/bin-only archive is missing it and llama-server fails to even start
+        # ("CANNOT LINK EXECUTABLE ... library libomp.so not found").
+        run: |
+          mkdir -p out
+          cp build/bin/llama-server out/
+          cp build/bin/*.so* out/ 2>/dev/null || true
+          cp "${{ steps.ndk.outputs.path }}/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/"*"/lib/linux/${{ matrix.omp_arch }}/libomp.so" out/
+          tar -C out -czf "llama-${{ needs.check-tag.outputs.tag }}-bin-android-${{ matrix.asset_arch }}.tar.gz" .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-${{ matrix.abi }}
+          path: llama-*-bin-android-*.tar.gz
+
+  publish:
+    needs: [check-tag, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: android-*
+          merge-multiple: true
+
+      - name: Create the android-${{ needs.check-tag.outputs.tag }} release and upload both archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "android-${{ needs.check-tag.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --title "Android llama.cpp ${{ needs.check-tag.outputs.tag }}" \
+            --notes "Cross-compiled from ggml-org/llama.cpp@${{ needs.check-tag.outputs.tag }} via the Android NDK (CPU-only, arm64-v8a + x86_64). Not a TurboLLM app release — consumed by download.ts's availableBackends() on Android (GitHub #52 item 6 / ADR-390/391)." \
+            llama-*-bin-android-*.tar.gz
