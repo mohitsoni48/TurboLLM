@@ -364,7 +364,7 @@ const ALL: CatalogEngine[] = [
     name: 'ik_llama.cpp',
     kind: 'llama-server',
     description:
-      'A llama.cpp fork (ikawrakow) with CPU/GPU performance work and extra quant types. Ships llama-server but publishes no prebuilt binaries — build it, then add your own engine.',
+      'A llama.cpp fork (ikawrakow) with CPU/GPU performance work, extra quant types, and adaptive DFlash speculative decoding. Ships llama-server but publishes no prebuilt binaries — build it, then add your own engine.',
     provision: 'github-release',
     homepage: 'https://github.com/ikawrakow/ik_llama.cpp',
     repo: 'ikawrakow/ik_llama.cpp',

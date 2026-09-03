@@ -784,10 +784,15 @@ export function profileToArgs(
     // model (24GB → 59GB) for a 54% SLOWER generation, with no error printed —
     // a silent, severe regression (GitHub VRAM report). The TurboQuant fork's own
     // `nextn` spec-type value is a different codebase that DOES want --model-draft
-    // pointing at the same file (verified when this branch was first written) —
-    // only mainline's draft-mtp is exempted here.
-    const nextnVal = ['nextn', 'draft-mtp'].find((v) => specAccepts(v))
-    if (nextnVal === 'draft-mtp') {
+    // pointing at the same file (verified when this branch was first written).
+    // ik_llama.cpp has no `nextn`/`draft-mtp` value at all — it calls the same
+    // self-contained built-in-head mechanism `mtp` (confirmed against its real
+    // --help: `--spec-type mtp:n_max=1,p_min=0.0`, no --model-draft in the
+    // example, unlike its `dflash` stage which does take one) — same
+    // no-model-draft semantics as mainline's draft-mtp, just a different value
+    // string. Only `nextn` (the TurboQuant-style value) wants --model-draft.
+    const nextnVal = ['nextn', 'draft-mtp', 'mtp'].find((v) => specAccepts(v))
+    if (nextnVal === 'draft-mtp' || nextnVal === 'mtp') {
       a.push('--spec-type', nextnVal)
       specActive = true
     } else if (nextnVal === 'nextn' && has('--model-draft')) {
@@ -798,20 +803,22 @@ export function profileToArgs(
     if (specType) a.push('--spec-type', 'draft')
     a.push('--model-draft', p.draftModelPath)
     specActive = true
-  } else if (
-    p.speculative === 'dflash' &&
-    p.draftModelPath &&
-    specType &&
-    specAccepts('draft-dflash') &&
-    has('--spec-draft-model')
-  ) {
+  } else if (p.speculative === 'dflash' && p.draftModelPath && specType) {
     // DFlash: adaptive speculative decoding with a separate draft GGUF (same
     // --spec-draft-model flag as 'draft' mode's --model-draft — llama.cpp aliases
     // them). --spec-dm-controller defaults to 'profit' (the adaptive controller)
     // when omitted, so no extra flag is needed to get the adaptive behavior.
-    a.push('--spec-type', 'draft-dflash')
-    a.push('--spec-draft-model', p.draftModelPath)
-    specActive = true
+    // Naming varies by fork: mainline/beellama/TurboQuant alias --spec-draft-model to
+    // --model-draft and use the enum value `draft-dflash`; ik_llama.cpp only has
+    // --model-draft (no --spec-draft-model alias) and its own bare `dflash` value —
+    // accept either name/value pair rather than hardcode mainline's.
+    const dflashVal = ['draft-dflash', 'dflash'].find((v) => specAccepts(v))
+    const draftFlag = has('--spec-draft-model') ? '--spec-draft-model' : has('--model-draft') ? '--model-draft' : null
+    if (dflashVal && draftFlag) {
+      a.push('--spec-type', dflashVal)
+      a.push(draftFlag, p.draftModelPath)
+      specActive = true
+    }
   }
   // Draft window (GitHub #35): how many tokens the draft head proposes per step before
   // the main model verifies them, and the minimum before verification kicks in. This is

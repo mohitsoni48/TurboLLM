@@ -210,7 +210,7 @@ const TURBOLLM_KNOWLEDGE =
   '**llamafile** (Windows / Linux / macOS — GGUF):\n' +
   'GGUF model bundled into a single self-contained executable. Very easy distribution. Launch flag is `--no-webui` (not `--nobrowser`). Full gateway passthrough verified.\n\n' +
   '**ik_llama.cpp** (Linux / macOS — GGUF):\n' +
-  'Drop-in fork with additional quantization optimizations. No universal prebuilt — build from source, then register via "Add your own engine."\n\n' +
+  'Drop-in fork with additional quantization optimizations and adaptive DFlash speculative decoding. No universal prebuilt — build from source, then register via "Add your own engine."\n\n' +
   '**Prism** (Windows / Linux / macOS — GGUF):\n' +
   'llama.cpp fork tuned for 1-2 bit ternary/Bonsai models. Build-from-source only (guided walkthrough) — no one-click install, even though upstream publishes prebuilts.\n\n' +
   '**BeeLlama.cpp** (Windows / Linux / macOS — GGUF):\n' +
