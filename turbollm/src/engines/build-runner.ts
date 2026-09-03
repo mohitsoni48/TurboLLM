@@ -19,11 +19,59 @@ import { createHash } from 'node:crypto'
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { delimiter, dirname, join } from 'node:path'
 import { promisify } from 'node:util'
-import { buildEnv, checkBuildPrereqs, CMAKE_CONFIGURE_ARGS, CMAKE_CONFIGURE_ARGS_ANDROID, CMAKE_CONFIGURE_ARGS_MACOS, CMAKE_CONFIGURE_ARGS_MACOS_CPU, CUDA_RUNTIME_DLL_PREFIXES, CUDA_RUNTIME_SO_PREFIXES } from './build-prereqs'
+import {
+  buildEnv,
+  checkBuildPrereqs,
+  CMAKE_CONFIGURE_ARGS,
+  CMAKE_CONFIGURE_ARGS_ANDROID,
+  CMAKE_CONFIGURE_ARGS_MACOS,
+  CMAKE_CONFIGURE_ARGS_MACOS_CPU,
+  CUDA_RUNTIME_DLL_PREFIXES,
+  CUDA_RUNTIME_SO_PREFIXES,
+  type BuildPrereqTool,
+} from './build-prereqs'
 import { resolveServerBinary } from './scan'
 import type { BuildPhase } from './build-state'
 
 const execFileP = promisify(execFile)
+
+/** Locate libcuda.so's directory when it lives OUTSIDE the CUDA Toolkit's own search path —
+ *  the common shape on an NVIDIA-container-runtime GPU box (Kaggle, RunPod, generic
+ *  nvidia-docker): the driver stub is bind-mounted from the host, not installed alongside the
+ *  Toolkit, so CMake's FindCUDAToolkit can't resolve the `CUDA::cuda_driver` IMPORTED target and
+ *  the Generate step fails with "the target was not found" — even though `nvcc` itself is found
+ *  fine by checkBuildPrereqs (a separate, working probe; this failure only shows up once cmake
+ *  actually configures the CUDA language).
+ *
+ *  Live-reproduced on Kaggle 2026-09-02, twice: `nvcc` at 12.8, prereqs all green, guided build
+ *  still failed on `CUDA::cuda_driver ... target was not found`. First fix attempt used
+ *  `find / -name 'libcuda.so*'` (mirroring `deploy/kaggle/setup.sh`'s own bash recipe) — that
+ *  DID NOT WORK: live-verified `find /` and even `find /usr` alone exceed a 30s timeout on this
+ *  box (a genuinely slow/huge filesystem, not a fluke), so the probe silently timed out and
+ *  returned null every time, and the fix never actually engaged. The corrected approach —
+ *  `ldconfig -p`, which reads the dynamic linker's CACHE rather than walking the filesystem —
+ *  is both instant (no timeout risk) and directly answers the question that matters ("where
+ *  would the linker actually find this"). Live-confirmed on the same box: `libcuda.so` resolves
+ *  to `/usr/local/nvidia/lib64/libcuda.so`, a path `/usr/local/cuda*`-scoped searches never even
+ *  cover — the driver is mounted under a completely separate `/usr/local/nvidia/` prefix, the
+ *  standard nvidia-container-runtime convention. Best-effort either way: a missing `ldconfig`,
+ *  an empty cache, or no match just means the build proceeds without the override, exactly like
+ *  before this existed — never blocks a build that would otherwise have worked. */
+async function findLibcudaDir(signal: AbortSignal): Promise<string | null> {
+  try {
+    const { stdout } = await execFileP('ldconfig', ['-p'], {
+      timeout: 5000,
+      maxBuffer: 4 * 1024 * 1024,
+      signal,
+    })
+    // A cache line looks like: "\tlibcuda.so.1 (libc6,x86-64) => /usr/local/nvidia/lib64/libcuda.so.1"
+    const line = stdout.split('\n').find((l) => /\blibcuda\.so\b/.test(l))
+    const m = line ? line.match(/=>\s*(\S+)/) : null
+    return m ? dirname(m[1]) : null
+  } catch {
+    return null
+  }
+}
 
 export interface BuildRequest {
   repoUrl: string
@@ -518,6 +566,68 @@ function neutralizeGratuitousAsm(srcDir: string, log: (l: string) => void): void
   }
 }
 
+/** PURE: the actionable error when a prereq has no package-manager install path on this host —
+ *  null when it does. Keeps the "there is nothing to run, here's the link instead" wording in
+ *  one place (and unit-testable) instead of inline in the flow below. */
+export function noInstallCommandError(tool: BuildPrereqTool, packageManager: string | null): string | null {
+  if ((tool.installCommands?.length ?? 0) > 0) return null
+  return (
+    (packageManager
+      ? `TurboLLM doesn't have a one-command ${packageManager} install for ${tool.name} on this system. `
+      : `No supported package manager (apt-get, dnf, pacman, zypper, or Homebrew) was found on this system. `) +
+    `Install ${tool.name} yourself — see ${tool.installUrl} — then re-check.`
+  )
+}
+
+/** Install ONE missing build prerequisite with the host's own package manager, so a headless
+ *  self-hosted box (a Docker container / remote Linux server with no local browser) can
+ *  actually get its toolchain: the prereq list's `installUrl` only ever opened a website in
+ *  the *operator's* browser, which installs nothing on the machine that needs it.
+ *
+ *  The commands are not invented here — they come straight from `checkBuildPrereqs`, so what
+ *  runs is exactly what the UI showed. Streams every line through the same {@link BuildHooks}
+ *  the 1-click build uses, and throws on failure so the caller surfaces it via BuildState.fail
+ *  exactly like a failed build. Local-host gated at the route (see /api/v1/build/install-prereq)
+ *  by the SAME `isLocalRequest` predicate the 1-click build uses. */
+export async function runPrereqInstall(
+  req: { tool: BuildPrereqTool['id']; toolchainDirs: string[] },
+  hooks: BuildHooks,
+  signal: AbortSignal,
+): Promise<void> {
+  hooks.phase('provisioning')
+  const prereqs = await checkBuildPrereqs(req.toolchainDirs)
+  if (!prereqs.supported) throw new Error('Installing build prerequisites is currently Linux and macOS only.')
+  const tool = prereqs.tools.find((t) => t.id === req.tool)
+  if (!tool) throw new Error(`"${req.tool}" isn't a build prerequisite on this system.`)
+  if (tool.found) {
+    hooks.log(`${tool.name} is already installed${tool.version ? ` (${tool.version})` : ''} — nothing to do.`)
+    return
+  }
+  const noCommand = noInstallCommandError(tool, prereqs.packageManager)
+  if (noCommand) throw new Error(noCommand)
+
+  // DEBIAN_FRONTEND stops apt's post-install prompts (e.g. tzdata) from blocking on a stdin
+  // that isn't attached to anything — a hang would look identical to a very slow install.
+  const env = { ...buildEnv(req.toolchainDirs), DEBIAN_FRONTEND: 'noninteractive' }
+  for (const [cmd, ...args] of tool.installCommands!) {
+    hooks.log(`$ ${[cmd, ...args].join(' ')}`)
+    await runStep(cmd, args, { env, signal, onLine: hooks.log })
+  }
+
+  // Re-probe rather than trusting a zero exit code: a manager can "succeed" while leaving the
+  // tool off PATH (a wrong package name, a no-op on an already-broken install). Reporting a
+  // green result the build then contradicts is worse than reporting the failure here.
+  const after = await checkBuildPrereqs(req.toolchainDirs)
+  const now = after.tools.find((t) => t.id === req.tool)
+  if (!now?.found) {
+    throw new Error(
+      `The install commands ran, but ${tool.name} still isn't detected. Install it yourself — see ${tool.installUrl} — ` +
+        `or, if it landed somewhere off PATH, add that folder under Build environment and re-check.`,
+    )
+  }
+  hooks.log(`${now.name}${now.version ? ` ${now.version}` : ''} installed ✓`)
+}
+
 /** Run the full clone → configure → compile → locate flow. Throws on any failure (the
  *  caller surfaces it via BuildState.fail); on success returns the built binary + commit. */
 export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: AbortSignal): Promise<BuildOutput> {
@@ -693,13 +803,27 @@ export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: Abo
     }
   }
 
+  // Linux + CUDA only: probe for a driver-stub libcuda.so living outside the Toolkit's own
+  // search path (NVIDIA-container-runtime boxes — Kaggle, RunPod, generic nvidia-docker) and
+  // point CMAKE_LIBRARY_PATH at it. A no-op everywhere the driver lives in the Toolkit's normal
+  // location already (CMAKE_LIBRARY_PATH just adds a search location, never removes one). Only
+  // probed on Linux — `find` isn't a real Windows/macOS-Metal-build concern.
+  let linuxCudaArgs = CMAKE_CONFIGURE_ARGS
+  if (!isWindows && !isMac) {
+    const libcudaDir = await findLibcudaDir(signal)
+    if (libcudaDir) {
+      hooks.log(`libcuda.so found outside the CUDA Toolkit path — adding CMAKE_LIBRARY_PATH=${libcudaDir}`)
+      linuxCudaArgs = [...CMAKE_CONFIGURE_ARGS, `-DCMAKE_LIBRARY_PATH=${libcudaDir}`]
+    }
+  }
+
   const buildLog: string[] = []
   try {
     const configureArgs = isMac
       ? CMAKE_CONFIGURE_ARGS_MACOS
       : isAndroid
       ? CMAKE_CONFIGURE_ARGS_ANDROID
-      : CMAKE_CONFIGURE_ARGS
+      : linuxCudaArgs
     await configureAndCompile(configureArgs, buildLog)
   } catch (e) {
     // Some forks reference Metal-backend symbols their own vendored ggml doesn't implement

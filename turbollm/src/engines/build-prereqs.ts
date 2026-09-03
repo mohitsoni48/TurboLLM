@@ -46,6 +46,18 @@ export interface BuildPrereqTool {
   found: boolean
   version?: string
   installUrl: string
+  /** The ordered package-manager steps that would actually install this tool ON THIS HOST
+   *  (each entry is an argv: `[cmd, ...args]`), or undefined when there's no clean one-command
+   *  install and the {@link installUrl} website is the only realistic path.
+   *
+   *  Why this exists: `installUrl` is a DEAD END for anyone self-hosting headlessly (a Docker
+   *  container / remote Linux box with no local browser) — clicking that link in the web UI
+   *  opens a page in the *operator's own* browser, which installs nothing on the server that
+   *  actually needs the toolchain. These commands let the daemon install the prereq on the
+   *  machine that needs it (POST /api/v1/build/install-prereq → build-runner.ts's
+   *  `runPrereqInstall`), gated to the local host exactly like the 1-click build. Only ever
+   *  populated for a tool that is missing. */
+  installCommands?: string[][]
 }
 
 export interface BuildPrereqs {
@@ -55,6 +67,93 @@ export interface BuildPrereqs {
   /** Which toolchain shape `tools`/`buildCommands` reflect. 'other' when unsupported. */
   os: 'windows' | 'linux' | 'macos' | 'android' | 'other'
   tools: BuildPrereqTool[]
+  /** The host package manager the `installCommands` above were generated for, or null when
+   *  none was detected (or on Windows, where these tools need GUI installers). Surfaced so
+   *  the UI can say WHICH manager it would use rather than just showing a bare button. */
+  packageManager: PackageManager | null
+}
+
+/** A package manager we know how to drive non-interactively for the build prereqs.
+ *  Windows is deliberately absent — MSVC and the CUDA Toolkit need GUI installers there, so
+ *  Windows keeps the website-link behavior. */
+export type PackageManager = 'apt-get' | 'dnf' | 'pacman' | 'zypper' | 'brew'
+
+/** Linux managers, probed in this order (first one present wins). */
+const LINUX_PACKAGE_MANAGERS: PackageManager[] = ['apt-get', 'dnf', 'pacman', 'zypper']
+
+/** Which distro package(s) provide each prereq, per manager. A missing entry means there is no
+ *  clean one-command install for that tool with that manager — the website link stays the only
+ *  option (notably CUDA on dnf/zypper, which realistically needs NVIDIA's own repo bootstrap
+ *  rather than a single install, and every compiler/toolkit on macOS other than via Homebrew). */
+const PACKAGES: Record<PackageManager, Partial<Record<BuildPrereqTool['id'], string[]>>> = {
+  'apt-get': { git: ['git'], cmake: ['cmake'], gcc: ['build-essential'], cuda: ['nvidia-cuda-toolkit'] },
+  dnf: { git: ['git'], cmake: ['cmake'], gcc: ['gcc-c++', 'make'] },
+  pacman: { git: ['git'], cmake: ['cmake'], gcc: ['base-devel'], cuda: ['cuda'] },
+  zypper: { git: ['git'], cmake: ['cmake'], gcc: ['gcc-c++', 'make'] },
+  // macOS: the compiler is the Xcode Command Line Tools (`xcode-select --install` opens a GUI
+  // prompt, so it isn't something to run for the user headlessly) and there is no CUDA at all.
+  brew: { git: ['git'], cmake: ['cmake'] },
+}
+
+/** PURE: the privilege prefix for a system package manager. Running as root (the normal case
+ *  inside a Docker container — exactly the headless setup this is for) needs none. Otherwise
+ *  `sudo -n`: NON-interactive on purpose, so a box that would prompt for a password fails fast
+ *  with a clear error instead of hanging forever on a stdin nothing is attached to. Homebrew
+ *  must never be run under sudo, so it passes `sudo:false`. */
+function privilegePrefix(asRoot: boolean): string[] {
+  return asRoot ? [] : ['sudo', '-n']
+}
+
+/** PURE: the ordered argv steps that install `id` with `pm`, or undefined when that
+ *  combination has no clean one-command install (→ the caller keeps the website link).
+ *  `asRoot` skips the sudo prefix (see {@link privilegePrefix}).
+ *
+ *  The package-list refresh matters, it isn't belt-and-braces: a fresh Debian/Ubuntu container
+ *  ships with NO apt lists, so `apt-get install` there fails with "Unable to locate package"
+ *  every time — which is precisely the environment this feature exists for. */
+export function prereqInstallCommands(
+  pm: PackageManager,
+  id: BuildPrereqTool['id'],
+  asRoot: boolean,
+): string[][] | undefined {
+  const pkgs = PACKAGES[pm][id]
+  if (!pkgs || pkgs.length === 0) return undefined
+  if (pm === 'brew') return [['brew', 'install', ...pkgs]] // never under sudo
+  const sudo = privilegePrefix(asRoot)
+  switch (pm) {
+    case 'apt-get':
+      return [[...sudo, 'apt-get', 'update'], [...sudo, 'apt-get', 'install', '-y', ...pkgs]]
+    case 'dnf':
+      return [[...sudo, 'dnf', 'install', '-y', ...pkgs]]
+    case 'pacman':
+      // -Sy (not -S): a container's pacman db is typically empty/stale, which fails the install.
+      return [[...sudo, 'pacman', '-Sy', '--noconfirm', ...pkgs]]
+    case 'zypper':
+      return [[...sudo, 'zypper', '--non-interactive', 'install', ...pkgs]]
+  }
+}
+
+/** True when this process can install system packages without sudo. `process.getuid` is
+ *  POSIX-only (undefined on Windows) — the optional call keeps this cross-platform. */
+function runningAsRoot(): boolean {
+  return typeof process.getuid === 'function' && process.getuid() === 0
+}
+
+/** Which package manager this host actually has, probed the same way the tools above are —
+ *  by running it and seeing whether it's there. Linux tries the known managers in order;
+ *  macOS only has Homebrew; Windows has none (its prereqs need GUI installers). */
+export async function detectPackageManager(env: NodeJS.ProcessEnv): Promise<PackageManager | null> {
+  const candidates: PackageManager[] =
+    process.platform === 'linux' ? LINUX_PACKAGE_MANAGERS : process.platform === 'darwin' ? ['brew'] : []
+  for (const pm of candidates) {
+    try {
+      await runVersion(pm, ['--version'], env)
+      return pm
+    } catch {
+      // not installed / not on PATH — try the next one
+    }
+  }
+  return null
 }
 
 const INSTALL_URLS: Record<BuildPrereqTool['id'], string> = {
@@ -199,21 +298,42 @@ async function checkGcc(env: NodeJS.ProcessEnv): Promise<BuildPrereqTool> {
 export async function checkBuildPrereqs(toolchainDirs: string[] = []): Promise<BuildPrereqs> {
   const platform = process.platform
   if (platform !== 'win32' && platform !== 'linux' && platform !== 'darwin' && platform !== 'android') {
-    return { supported: false, os: 'other', tools: [] }
+    return { supported: false, os: 'other', tools: [], packageManager: null }
   }
   const env = buildEnv(toolchainDirs)
-  if (platform === 'darwin') {
-    const tools = await Promise.all([checkGit(env), checkCmake(env), checkGcc(env)])
-    return { supported: true, os: 'macos', tools }
-  }
+  // Android/Termux: CPU-only, no package-manager-driven prereq install (Termux uses `pkg`,
+  // outside the PackageManager union above) — buildCommands()'s android branch leads with
+  // `pkg install` directly instead.
   if (platform === 'android') {
     const tools = await Promise.all([checkGit(env), checkCmake(env), checkGcc(env)])
-    return { supported: true, os: 'android', tools }
+    return { supported: true, os: 'android', tools, packageManager: null }
   }
-  const tools = platform === 'win32'
-    ? await Promise.all([checkGit(env), checkCmake(env), checkCuda(env), checkMsvc(env)])
-    : await Promise.all([checkGit(env), checkCmake(env), checkCuda(env), checkGcc(env)])
-  return { supported: true, os: platform === 'win32' ? 'windows' : 'linux', tools }
+  const [tools, packageManager] = await Promise.all([
+    platform === 'darwin'
+      ? Promise.all([checkGit(env), checkCmake(env), checkGcc(env)])
+      : platform === 'win32'
+      ? Promise.all([checkGit(env), checkCmake(env), checkCuda(env), checkMsvc(env)])
+      : Promise.all([checkGit(env), checkCmake(env), checkCuda(env), checkGcc(env)]),
+    detectPackageManager(env),
+  ])
+  return {
+    supported: true,
+    os: platform === 'win32' ? 'windows' : platform === 'darwin' ? 'macos' : 'linux',
+    tools: withInstallCommands(tools, packageManager),
+    packageManager,
+  }
+}
+
+/** PURE: attach the host install command(s) to every MISSING tool (a tool that's already there
+ *  never needs one). Tools with no clean package-manager install keep only their website link. */
+export function withInstallCommands(tools: BuildPrereqTool[], pm: PackageManager | null): BuildPrereqTool[] {
+  if (!pm) return tools
+  const asRoot = runningAsRoot()
+  return tools.map((t) => {
+    if (t.found) return t
+    const installCommands = prereqInstallCommands(pm, t.id, asRoot)
+    return installCommands ? { ...t, installCommands } : t
+  })
 }
 
 /** The cmake CUDA configure flags — shared with the 1-click build (build-runner.ts imports

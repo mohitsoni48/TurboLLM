@@ -8,6 +8,7 @@ import {
   Loader2,
   Plus,
   RefreshCw,
+  Terminal,
   X,
   XCircle,
 } from 'lucide-react'
@@ -132,9 +133,16 @@ export function BuildGuideDialog({
   const build = useBuild()
   const [copied, setCopied] = useState(false)
   const [addOpen, setAddOpen] = useState(false)
-  // What the user last kicked off, so we can tell a CUDA download apart from a build (both
-  // stream through engineBuild + end at phase 'done', but only a build shows the success screen).
-  const [intent, setIntent] = useState<'build' | 'cuda' | null>(null)
+  // What the user last kicked off, so we can tell a CUDA download / prereq install apart from a
+  // build (all stream through engineBuild + end at phase 'done', but only a build shows the
+  // success screen — the other two just re-probe the prereqs).
+  const [intent, setIntent] = useState<'build' | 'cuda' | 'install' | null>(null)
+  // A rejection BEFORE the server ever calls d.build.start() (403 not-local-to-host, 409
+  // already-running, a 400 validation failure) never touches engineBuild at all — it stays at
+  // its untouched default (active:false, phase:'preparing'), which the effect below can never
+  // see as an error since engineBuild.phase never becomes 'error'. Without this, the mutation's
+  // own rejection was silently dropped and the dialog was stuck showing "Preparing" forever.
+  const [mutationError, setMutationError] = useState<string | null>(null)
 
   // Build-environment editor draft (null until edited → show the saved dirs).
   const savedDirs = settings.query.data?.build.toolchainDirs ?? []
@@ -162,7 +170,7 @@ export function BuildGuideDialog({
   useEffect(() => {
     if (!intent || !engineBuild || engineBuild.active) return
     if (engineBuild.phase === 'done') {
-      if (intent === 'cuda') {
+      if (intent === 'cuda' || intent === 'install') {
         void prereqsQ.refetch()
         void settings.query.refetch()
         setIntent(null)
@@ -195,16 +203,32 @@ export function BuildGuideDialog({
     void prereqsQ.refetch()
   }
 
+  const onMutationError = (e: unknown) => {
+    setIntent(null)
+    setMutationError(e instanceof Error ? e.message : String(e))
+  }
+
   const startBuild = () => {
+    setMutationError(null)
     setIntent('build')
     // commit/patchUrl/patchSha256 are only defined for a catalog entry that pins them (e.g.
     // solar-open2); undefined for every other entry, so their request shape is unchanged.
-    build.start.mutate({ repoUrl, branch, commit, patchUrl, patchSha256, name: engineName })
+    build.start.mutate({ repoUrl, branch, commit, patchUrl, patchSha256, name: engineName }, { onError: onMutationError })
   }
 
   const downloadCuda = () => {
+    setMutationError(null)
     setIntent('cuda')
-    build.cuda.mutate()
+    build.cuda.mutate(undefined, { onError: onMutationError })
+  }
+
+  // Install a missing prereq ON THE DAEMON MACHINE with its own package manager. This is the
+  // only path that works headlessly (Docker / a remote Linux server): the row's install LINK
+  // opens a website in whatever browser is showing this UI, which may not be the host at all.
+  const installPrereq = (tool: 'git' | 'cmake' | 'cuda' | 'gcc') => {
+    setMutationError(null)
+    setIntent('install')
+    build.installPrereq.mutate(tool, { onError: onMutationError })
   }
 
   const actionLabel = mode === 'rebuild' ? 'Rebuild now' : 'Build it for me'
@@ -257,6 +281,15 @@ export function BuildGuideDialog({
                     tool={t}
                     // CUDA can be auto-downloaded (ADR-101), but only on Windows so far.
                     onDownload={t.id === 'cuda' && !t.found && !showProgress && os === 'windows' ? downloadCuda : undefined}
+                    // Everything else missing that the host's package manager can install runs
+                    // ON THE HOST — the only option that works when the UI is open on another
+                    // machine (headless server / Docker).
+                    onInstall={
+                      !t.found && !showProgress && (t.installCommands?.length ?? 0) > 0 && t.id !== 'msvc'
+                        ? () => installPrereq(t.id as 'git' | 'cmake' | 'cuda' | 'gcc')
+                        : undefined
+                    }
+                    packageManager={prereqsQ.data?.packageManager ?? null}
                   />
                 ))}
               </div>
@@ -343,11 +376,21 @@ export function BuildGuideDialog({
             {showProgress && engineBuild && (
               <BuildProgress
                 build={engineBuild}
-                kind={intent === 'cuda' ? 'cuda' : 'build'}
+                kind={intent === 'cuda' ? 'cuda' : intent === 'install' ? 'install' : 'build'}
                 logRef={logRef}
                 onCancel={() => build.cancel.mutate()}
                 onClose={() => onOpenChange(false)}
               />
+            )}
+
+            {/* The request itself was rejected before any server-side build state ever
+                existed (403/409/400) — engineBuild never moves, so BuildProgress above never
+                shows this. Same visual treatment as its own error state. */}
+            {mutationError && (
+              <div className="flex items-center gap-2 rounded-lg border p-3 text-[13px]" style={{ borderColor: 'color-mix(in srgb, var(--err) 40%, var(--border))', background: 'color-mix(in srgb, var(--err) 8%, transparent)' }}>
+                <XCircle size={15} className="shrink-0" style={{ color: 'var(--err)' }} />
+                <span style={{ color: 'var(--err)' }}>{mutationError}</span>
+              </div>
             )}
 
             {/* Manual build commands (fallback / transparency) */}
@@ -417,8 +460,9 @@ function BuildProgress({
 }: {
   build: EngineBuild
   /** 'build' shows the celebratory engine-ready screen on success; 'cuda' (a toolkit
-   *  download) just streams progress — its completion is handled by re-probing prereqs. */
-  kind: 'build' | 'cuda'
+   *  download) and 'install' (a package-manager prereq install) just stream progress — their
+   *  completion is handled by re-probing prereqs. */
+  kind: 'build' | 'cuda' | 'install'
   logRef: React.RefObject<HTMLPreElement | null>
   onCancel: () => void
   onClose: () => void
@@ -471,7 +515,13 @@ function BuildProgress({
         ) : (
           <CheckCircle2 size={15} className="shrink-0" style={{ color: accent }} />
         )}
-        <span className="text-ink">{PHASE_LABEL[build.phase]}</span>
+        {/* A prereq install reuses the 'provisioning' phase, whose default label is the CUDA
+            download — say what's actually happening instead. */}
+        <span className="text-ink">
+          {kind === 'install' && build.phase === 'provisioning'
+            ? `Installing ${build.engine} with your package manager…`
+            : PHASE_LABEL[build.phase]}
+        </span>
         {build.active && (
           <button type="button" onClick={() => { track('engines', 'cancel_engine_build'); onCancel() }} className="ml-auto text-[12px] text-faint hover:text-ink">
             Cancel
@@ -492,8 +542,22 @@ function BuildProgress({
 }
 
 /** One prereq row: ✓ found (with version) or ✗ missing. A missing tool offers an install
- *  link; CUDA additionally offers a one-click auto-download (`onDownload`, ADR-101). */
-function PrereqRow({ tool, onDownload }: { tool: BuildPrereqTool; onDownload?: () => void }) {
+ *  link; CUDA additionally offers a one-click auto-download (`onDownload`, ADR-101), and any
+ *  tool the host's package manager can install offers `onInstall`, which runs that install ON
+ *  THE DAEMON MACHINE. The link is kept as a fallback but is no longer the only option — on a
+ *  headless self-hosted box it opens a page in the operator's browser and installs nothing on
+ *  the server. The exact commands are shown in the button's tooltip, so nothing runs unseen. */
+function PrereqRow({
+  tool,
+  onDownload,
+  onInstall,
+  packageManager,
+}: {
+  tool: BuildPrereqTool
+  onDownload?: () => void
+  onInstall?: () => void
+  packageManager?: string | null
+}) {
   return (
     <div className="flex items-center gap-2 text-[13px]">
       {tool.found ? (
@@ -515,13 +579,24 @@ function PrereqRow({ tool, onDownload }: { tool: BuildPrereqTool; onDownload?: (
               <Download size={12} /> Download CUDA
             </button>
           )}
+          {onInstall && (
+            <button
+              type="button"
+              onClick={() => { track('engines', 'install_build_prereq'); onInstall() }}
+              title={(tool.installCommands ?? []).map((argv) => argv.join(' ')).join('\n')}
+              className="inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[12px] font-medium transition-colors hover:opacity-80"
+              style={{ background: 'color-mix(in srgb, var(--accent) 15%, transparent)', color: 'var(--accent)' }}
+            >
+              <Terminal size={12} /> Install{packageManager ? ` (${packageManager})` : ''}
+            </button>
+          )}
           <a
             href={tool.installUrl}
             target="_blank"
             rel="noreferrer"
             className="inline-flex items-center gap-1 text-[12px] text-accent hover:underline"
           >
-            {onDownload ? 'or install manually' : 'Install'} <ExternalLink size={11} />
+            {onDownload || onInstall ? 'or install manually' : 'Install'} <ExternalLink size={11} />
           </a>
         </span>
       )}

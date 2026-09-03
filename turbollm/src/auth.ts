@@ -47,23 +47,75 @@ export function generateApiKey(): { full: string; hash: string; prefix: string }
   return { full, hash, prefix: full.slice(0, 12) }
 }
 
-/** Provision a fresh, dedicated API key for a Cloud Launch tunnel session and return
- *  its full (unhashed) value — the only moment it's ever available, since the store
- *  keeps only the hash (same rule as every other key, spec 06 §5). Always generates a
- *  new one rather than reusing an existing key: an existing key's raw value can never
- *  be recovered to print it, and a fresh, clearly-named key is easy to find and revoke
- *  later from Developer → API Keys. */
-export function provisionTunnelApiKey(d: Deps): string {
+/** Provision a fresh, dedicated API key and return its full (unhashed) value — the
+ *  only moment it's ever available, since the store keeps only the hash (same rule as
+ *  every other key, spec 06 §5). Always generates a new one rather than reusing an
+ *  existing key: an existing key's raw value can never be recovered to print it, and a
+ *  fresh, clearly-named key is easy to find and revoke later from Developer → API Keys.
+ *  `label` names the reason it was minted (shown as `<label>-<ISO timestamp>` in
+ *  Developer → API Keys) — defaults to the original Cloud Launch tunnel caller's own
+ *  naming; `--print-token` (cli.ts) passes `'print-token'` so the two are distinguishable
+ *  in the key list. */
+export function provisionTunnelApiKey(d: Deps, label = 'tunnel'): string {
   const { full, hash, prefix } = generateApiKey()
   const key: ApiKey = {
     id: randomUUID(),
-    name: `tunnel-${new Date().toISOString()}`,
+    name: `${label}-${new Date().toISOString()}`,
     hash,
     prefix,
     createdAt: new Date().toISOString(),
     lastUsedAt: null,
   }
   d.store.update((cfg) => cfg.apiKeys.push(key))
+  return full
+}
+
+/** Is the address the listener was bound to a loopback-only bind — i.e. unreachable from
+ *  any other machine, so nothing outside this host can ever hit the API? Distinct from
+ *  {@link LOOPBACK}, which classifies a REQUEST's remote address; this classifies the
+ *  daemon's own listen host, which is spelled differently (`localhost`, any `127.x.x.x`,
+ *  bracketed IPv6 as `--addr` accepts it). Anything unrecognised — `0.0.0.0`, `::`, a
+ *  specific LAN address, a hostname — counts as non-loopback, which is the safe direction:
+ *  it only ever leads to provisioning a credential, never to skipping enforcement. */
+export function isLoopbackBindHost(host: string): boolean {
+  const h = host.trim().toLowerCase().replace(/^\[|\]$/g, '')
+  if (h === 'localhost' || h === '::1' || h === '::ffff:127.0.0.1') return true
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h)
+}
+
+/** Mint the ONE bootstrap API key a headless install needs, or return null if it isn't
+ *  needed. Call once at startup, with the address actually bound.
+ *
+ *  The problem this solves: `requireApiKey` defaults to true (config.ts), which is
+ *  invisible on a desktop install because `bypassesAuth` short-circuits to "no
+ *  enforcement" on a loopback-only bind. A container is the opposite case — it MUST bind
+ *  `0.0.0.0` for `docker run -p` to publish anything at all — so enforcement is live from
+ *  the first boot, and the only route to a key (`POST /api/v1/keys`, behind
+ *  {@link hostGate}) requires either being local to the host or already holding a key.
+ *  Someone with `docker logs` and nothing else is locked out of their own daemon with no
+ *  way in. The key is printed once by the caller, which is the only moment it exists in
+ *  readable form (the store keeps only the hash, same rule as every other key).
+ *
+ *  Deliberately once-ever, keyed on "zero keys have EVER been minted": on any later boot a
+ *  key exists, and re-minting would quietly pile up credentials nobody asked for while
+ *  re-printing something the operator may already have distributed. `requireApiKey` off
+ *  means nothing is enforced, so no key is needed then either. This never disables or
+ *  relaxes enforcement — it only makes the credential obtainable. */
+export function provisionBootstrapApiKey(d: Deps, bindHost: string): string | null {
+  if (isLoopbackBindHost(bindHost)) return null
+  const cfg = d.store.snapshot()
+  if (cfg.daemon.requireApiKey !== true) return null
+  if (cfg.apiKeys.length > 0) return null
+  const { full, hash, prefix } = generateApiKey()
+  const key: ApiKey = {
+    id: randomUUID(),
+    name: `bootstrap-${new Date().toISOString()}`,
+    hash,
+    prefix,
+    createdAt: new Date().toISOString(),
+    lastUsedAt: null,
+  }
+  d.store.update((mut) => mut.apiKeys.push(key))
   return full
 }
 

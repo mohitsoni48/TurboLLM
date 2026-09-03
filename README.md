@@ -735,6 +735,23 @@ access your GPU directly for accelerated local LLM inference.
 > [GitHub repository](https://github.com/mohitsoni48/TurboLLM), not in the npm package —
 > clone the repo to use them.
 
+### Getting your API key
+
+The container publishes port 6996 on `0.0.0.0`, so TurboLLM's daemon requires an API key
+for every request the moment it starts — there is no browser inside the container to log
+in with. Both images launch with **`--print-token`**, which mints a fresh key and prints
+it on every container start (not just the first), so it's always one command away:
+
+```bash
+docker compose -f docker-compose-nvidia.yaml logs | grep 'Token:'   # or docker-compose-amd.yaml
+```
+
+Grab the value after `Token:` and either paste it into the web UI's login prompt, or send
+it yourself as `X-TurboLLM-Auth: <key>` (or `Authorization: Bearer <key>`). Each restart
+mints a new one, so re-run the command above after a restart rather than reusing an old
+value — old keys keep working too and can be revoked from Developer → API Keys once
+you're in.
+
 ---
 
 ### NVIDIA GPU (CUDA)

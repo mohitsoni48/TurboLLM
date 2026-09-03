@@ -70,6 +70,7 @@ import {
   runBuild as apiRunBuild,
   cancelBuild,
   provisionCuda as apiProvisionCuda,
+  installPrereq as apiInstallPrereq,
   listDownloads,
   listEngines,
   loadModel,
@@ -354,6 +355,12 @@ export function useBuild() {
     /** Auto-download a CUDA Toolkit (ADR-101); progress streams via the status poll. */
     cuda: useMutation({
       mutationFn: () => apiProvisionCuda(),
+      onSuccess: () => void qc.invalidateQueries({ queryKey: queryKeys.status }),
+    }),
+    /** Install one missing prereq with the host's package manager; progress streams via the
+     *  status poll. The point of it: on a headless box the install link is a dead end. */
+    installPrereq: useMutation({
+      mutationFn: (tool: 'git' | 'cmake' | 'cuda' | 'gcc') => apiInstallPrereq(tool),
       onSuccess: () => void qc.invalidateQueries({ queryKey: queryKeys.status }),
     }),
     /** Call when a build settles (done/error) to pull the new engine into the lists. */

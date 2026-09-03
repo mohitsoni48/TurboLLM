@@ -574,6 +574,9 @@ export const UI_ACTIONS = [
   'remove_build_search_dir', 'add_build_search_dir', 'recheck_build_prereqs',
   'copy_build_commands', 'close_build_guide', 'open_manual_build_handoff', 'start_engine_build',
   'dismiss_build_success', 'cancel_engine_build', 'download_cuda_toolkit',
+  // Install a missing build prereq with the host's own package manager (the headless fix:
+  // the install LINK opens a page in the operator's browser, not on the daemon machine).
+  'install_build_prereq',
 
   'toggle_agent_tool_group', 'back_to_agents', 'reset_agent_to_default', 'save_agent',
   'switch_agent_form_tab', 'delete_agent', 'cancel_delete_agent',
