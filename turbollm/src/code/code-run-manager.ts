@@ -30,6 +30,13 @@ import { autoTitleFromConversation } from '../chat/chat-routes'
 import { runCodeSession, type SteerHandle, type TodoItem } from './code-session'
 import type { CodeMode } from './persona'
 import type { ReasoningEffort } from '../chat/reasoning-effort'
+// Re-exported from run-buffer.ts (moved out — see that file's header for why: these have
+// zero real dependency on code-session.ts, but living in THIS file meant importing them
+// alone dragged in code-session.ts's pi-coding-agent chain anyway). Re-exporting keeps
+// every existing `from './code-run-manager'` import (this file's own use below, plus
+// code-run-manager.test.ts / code-run-manager.reconnect.test.ts) working unchanged.
+import { RingBuffer, subscribeToBuffer, type BufferedEvent, type Subscription } from './run-buffer'
+export { RingBuffer, subscribeToBuffer, type BufferedEvent, type Subscription }
 
 /** How a new message submitted while a run is active should be delivered (Phase 1, ADR-246):
  *  `'steer'` interrupts and redirects the CURRENTLY ACTIVE turn (pi's session.steer), `'followUp'`
@@ -47,51 +54,10 @@ export type CodeSessionRunner = typeof runCodeSession
  *  many text deltas; if the buffer overflows, a reconnecting client misses the earliest
  *  live deltas of the in-flight turn — but the final assistant text is DB-persisted on
  *  completion, so overflow only ever costs mid-stream cosmetic replay, never the result. */
-const BUFFER_CAP = 6000
-
 /** Grace window (ms) to retain a session's buffer after it goes fully idle, so a client that
  *  reconnects a moment after the last turn finished still gets a clean terminal handshake
  *  before falling back to the DB-persisted transcript. */
 const IDLE_RETAIN_MS = 30_000
-
-export interface BufferedEvent {
-  seq: number
-  event: string
-  data: unknown
-}
-
-/** A bounded, seq-numbered append log. `since(fromSeq)` is the replay primitive. */
-export class RingBuffer {
-  private events: BufferedEvent[] = []
-  private nextSeq = 0
-
-  /** `cap` is how many recent events are retained for replay. Defaults to BUFFER_CAP so the
-   *  Code path is unchanged; the public API passes its own (spec 27 §6.3). */
-  constructor(private readonly cap: number = BUFFER_CAP) {}
-
-  push(event: string, data: unknown): BufferedEvent {
-    const ev: BufferedEvent = { seq: this.nextSeq++, event, data }
-    this.events.push(ev)
-    if (this.events.length > this.cap) this.events.shift()
-    return ev
-  }
-
-  /** Every retained event with seq >= fromSeq, in order. */
-  since(fromSeq: number): BufferedEvent[] {
-    return this.events.filter((e) => e.seq >= fromSeq)
-  }
-
-  /** The seq the NEXT pushed event will get (one past the last). */
-  head(): number {
-    return this.nextSeq
-  }
-}
-
-/** A subscriber: an async-iterable of buffered events that first drains the replay backlog,
- *  then live-tails, and terminates when the session goes idle (or is closed by the caller). */
-export interface Subscription extends AsyncIterable<BufferedEvent> {
-  close(): void
-}
 
 interface PendingTurn {
   task: string
@@ -527,76 +493,5 @@ export class CodeRunManager {
       replayFloor: s.replayFloor,
       idleAtStart: s.active === null && s.queue.length === 0,
     })
-  }
-}
-
-/**
- * The core reconnect primitive, extracted pure so it's unit-testable without a live run.
- *
- * Returns an async-iterable that:
- *   1. first drains buffer.since(max(fromSeq, replayFloor)) — the replay backlog;
- *   2. then live-tails events the emitter emits as `('event', BufferedEvent)`;
- *   3. terminates (iterator done) when the emitter emits `('idle')` AND the backlog is drained,
- *      or when `idleAtStart` is true and the backlog is drained (session already idle), or when
- *      `.close()` / iterator `.return()` is called (the HTTP connection dropped).
- *
- * Invariant: the terminal event already pushed to the buffer (e.g. 'done'/'error') is always
- * delivered BEFORE the iterator ends — 'idle' never truncates a pending backlog.
- */
-export function subscribeToBuffer(
-  buffer: RingBuffer,
-  emitter: EventEmitter,
-  opts: { fromSeq: number; replayFloor: number; idleAtStart: boolean },
-): Subscription {
-  const effectiveFrom = Math.max(opts.fromSeq, opts.replayFloor)
-  const pending: BufferedEvent[] = buffer.since(effectiveFrom)
-  let ended = opts.idleAtStart
-  let closed = false
-  let resolver: ((r: IteratorResult<BufferedEvent>) => void) | null = null
-
-  const settle = (r: IteratorResult<BufferedEvent>) => {
-    const fn = resolver
-    resolver = null
-    fn?.(r)
-  }
-  const onEvent = (ev: BufferedEvent) => {
-    if (closed) return
-    if (resolver && pending.length === 0) settle({ value: ev, done: false })
-    else pending.push(ev)
-  }
-  const onIdle = () => {
-    ended = true
-    // Only resolve NOW if nothing is buffered; otherwise the pending drain in next() will
-    // observe `ended` and terminate after the last real event (e.g. the terminal 'done').
-    if (resolver && pending.length === 0) settle({ value: undefined as unknown as BufferedEvent, done: true })
-  }
-
-  emitter.on('event', onEvent)
-  emitter.once('idle', onIdle)
-
-  const close = () => {
-    if (closed) return
-    closed = true
-    emitter.off('event', onEvent)
-    emitter.off('idle', onIdle)
-    settle({ value: undefined as unknown as BufferedEvent, done: true })
-  }
-
-  return {
-    close,
-    [Symbol.asyncIterator]() {
-      return {
-        next(): Promise<IteratorResult<BufferedEvent>> {
-          if (closed) return Promise.resolve({ value: undefined as unknown as BufferedEvent, done: true })
-          if (pending.length > 0) return Promise.resolve({ value: pending.shift()!, done: false })
-          if (ended) { close(); return Promise.resolve({ value: undefined as unknown as BufferedEvent, done: true }) }
-          return new Promise<IteratorResult<BufferedEvent>>((res) => { resolver = res })
-        },
-        return(): Promise<IteratorResult<BufferedEvent>> {
-          close()
-          return Promise.resolve({ value: undefined as unknown as BufferedEvent, done: true })
-        },
-      }
-    },
   }
 }

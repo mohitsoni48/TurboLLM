@@ -1,0 +1,106 @@
+diff --git a/node_modules/typebox/build/format/_idna.mjs b/node_modules/typebox/build/format/_idna.mjs
+index 57baebc..f6a8e05 100644
+--- a/node_modules/typebox/build/format/_idna.mjs
++++ b/node_modules/typebox/build/format/_idna.mjs
+@@ -1,15 +1,34 @@
+ import * as Puny from './_puny.mjs';
+ // ------------------------------------------------------------------
+ // Unicode General Category Helper (RFC 5892)
+-// ------------------------------------------------------------------
++//
++// Built via new RegExp(string) behind a try/catch, not \p{...} literals, and cached once at
++// module load: a runtime whose Node build lacks full ICU data (nodejs-mobile, TurboLLM
++// Android's embedded runtime) can't even PARSE that literal syntax — a module-load-time
++// SyntaxError, not a catchable one, which crashes the whole process before any of its own
++// code runs. On such a runtime these fall back to "no match" (null), degrading a corner of
++// RFC 5892 label validation (Greek/Hebrew/Hiragana/Katakana/Han script and combining-mark
++// edge cases) rather than crashing entirely.
++// ------------------------------------------------------------------
++function mkUnicodeRe(pattern) {
++    try {
++        return new RegExp(pattern, 'u');
++    }
++    catch {
++        return null;
++    }
++}
++const RE_MN = mkUnicodeRe('\\p{Mn}');
++const RE_MC = mkUnicodeRe('\\p{Mc}');
++const RE_ME = mkUnicodeRe('\\p{Me}');
+ function IsNonspacingMark(cp) {
+-    return /\p{Mn}/u.test(String.fromCodePoint(cp));
++    return RE_MN ? RE_MN.test(String.fromCodePoint(cp)) : false;
+ }
+ function IsSpacingCombiningMark(cp) {
+-    return /\p{Mc}/u.test(String.fromCodePoint(cp));
++    return RE_MC ? RE_MC.test(String.fromCodePoint(cp)) : false;
+ }
+ function IsEnclosingMark(cp) {
+-    return /\p{Me}/u.test(String.fromCodePoint(cp));
++    return RE_ME ? RE_ME.test(String.fromCodePoint(cp)) : false;
+ }
+ function IsCombiningMark(cp) {
+     return IsNonspacingMark(cp) || IsSpacingCombiningMark(cp) || IsEnclosingMark(cp);
+@@ -73,20 +92,25 @@ const VIRAMA_CPS = new Set([
+ // ------------------------------------------------------------------
+ // Guards for CONTEXTO rules (RFC 5892 Appendix A)
+ // ------------------------------------------------------------------
++const RE_GREEK = mkUnicodeRe('\\p{Script=Greek}');
++const RE_HEBREW = mkUnicodeRe('\\p{Script=Hebrew}');
++const RE_HIRAGANA = mkUnicodeRe('\\p{Script=Hiragana}');
++const RE_KATAKANA = mkUnicodeRe('\\p{Script=Katakana}');
++const RE_HAN = mkUnicodeRe('\\p{Script=Han}');
+ function IsGreek(cp) {
+-    return /\p{Script=Greek}/u.test(String.fromCodePoint(cp));
++    return RE_GREEK ? RE_GREEK.test(String.fromCodePoint(cp)) : false;
+ }
+ function IsHebrew(cp) {
+-    return /\p{Script=Hebrew}/u.test(String.fromCodePoint(cp));
++    return RE_HEBREW ? RE_HEBREW.test(String.fromCodePoint(cp)) : false;
+ }
+ function IsHiragana(cp) {
+-    return /\p{Script=Hiragana}/u.test(String.fromCodePoint(cp));
++    return RE_HIRAGANA ? RE_HIRAGANA.test(String.fromCodePoint(cp)) : false;
+ }
+ function IsKatakana(cp) {
+-    return /\p{Script=Katakana}/u.test(String.fromCodePoint(cp));
++    return RE_KATAKANA ? RE_KATAKANA.test(String.fromCodePoint(cp)) : false;
+ }
+ function IsHan(cp) {
+-    return /\p{Script=Han}/u.test(String.fromCodePoint(cp));
++    return RE_HAN ? RE_HAN.test(String.fromCodePoint(cp)) : false;
+ }
+ function IsArabicIndicDigit(cp) {
+     return cp >= 0x0660 && cp <= 0x0669;
+diff --git a/node_modules/typebox/build/format/idn_email.mjs b/node_modules/typebox/build/format/idn_email.mjs
+index 2ff1ac1..d952769 100644
+--- a/node_modules/typebox/build/format/idn_email.mjs
++++ b/node_modules/typebox/build/format/idn_email.mjs
+@@ -1,4 +1,13 @@
+-const IdnEmail = /^(?!.*\.\.)[\p{L}\p{N}!#$%&'*+/=?^_`{|}~-]+(?:\.[\p{L}\p{N}!#$%&'*+/=?^_`{|}~-]+)*@[\p{L}\p{N}](?:[\p{L}\p{N}-]{0,61}[\p{L}\p{N}])?(?:\.[\p{L}\p{N}](?:[\p{L}\p{N}-]{0,61}[\p{L}\p{N}])?)*$/iu;
++let IdnEmail;
++try {
++    IdnEmail = new RegExp("^(?!.*\\.\\.)[\\p{L}\\p{N}!#$%&'*+/=?^_`{|}~-]+(?:\\.[\\p{L}\\p{N}!#$%&'*+/=?^_`{|}~-]+)*@[\\p{L}\\p{N}](?:[\\p{L}\\p{N}-]{0,61}[\\p{L}\\p{N}])?(?:\\.[\\p{L}\\p{N}](?:[\\p{L}\\p{N}-]{0,61}[\\p{L}\\p{N}])?)*" + "$", "iu");
++}
++catch {
++    // ASCII-only fallback for a runtime whose Node build lacks full ICU data (can't even
++    // parse \p{...} syntax) — real, non-ASCII IDN emails are rejected there instead of
++    // crashing the whole process. Accepted degradation, not a silent correctness bug.
++    IdnEmail = /^(?!.*\.\.)[a-zA-Z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-zA-Z0-9!#$%&'*+/=?^_`{|}~-]+)*@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/i;
++}
+ /**
+  * Returns true if the value is an IdnEmail
+  * @specification ajv-formats (unicode-extension)
+diff --git a/node_modules/typebox/build/guard/emit.mjs b/node_modules/typebox/build/guard/emit.mjs
+index b9b7ece..c2de800 100644
+--- a/node_modules/typebox/build/guard/emit.mjs
++++ b/node_modules/typebox/build/guard/emit.mjs
+@@ -2,7 +2,7 @@ import * as G from './guard.mjs';
+ // ------------------------------------------------------------------
+ // Identifier
+ // ------------------------------------------------------------------
+-const identifierRegExp = /^[\p{ID_Start}_$][\p{ID_Continue}_$\u200C\u200D]*$/u;
++let identifierRegExp; try { identifierRegExp = new RegExp('^[\\p{ID_Start}_$][\\p{ID_Continue}_$\\u200C\\u200D]*' + '$', 'u') } catch { identifierRegExp = /^[a-zA-Z_$][a-zA-Z0-9_$]*$/ }
+ /** Returns true if this value is a valid JavaScript identifier */
+ function IsIdentifier(value) {
+     return identifierRegExp.test(value);

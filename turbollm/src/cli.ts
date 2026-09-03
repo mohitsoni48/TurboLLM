@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process'
 import { openSync, readFileSync } from 'node:fs'
 import { serve } from '@hono/node-server'
 import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { ConfigStore, defaultConfig, defaultConfigPath, getModelProfile, resolveConfiguredCtx, migrateLegacyDataDir } from './config/config'
 import { Manager, killTrackedEnginesSync, reapStaleEngines, type StartOpts } from './engines/manager'
 import { ComfyGuard } from './engines/comfy-guard'
@@ -13,7 +13,6 @@ import { BuildState } from './engines/build-state'
 import { UpdateChecker } from './engines/update'
 import { UpdateScheduler } from './engines/update-scheduler'
 import { RoutineScheduler } from './routines/scheduler'
-import { CodeRunManager } from './code/code-run-manager'
 import { executeRoutine } from './routines/execute'
 import { sweepInteractiveCliRuns, type CliInteractiveSweepDeps } from './routines/cli-interactive-runner'
 import { getTerminalManager } from './terminal/terminal-routes'
@@ -39,7 +38,7 @@ import { AgentTaskState } from './agents/task-state'
 import { launchCli, syncHarnessModelConfig, CONFIG_FILE_HARNESSES } from './cli-launch'
 import { writePidfile, removePidfile, stopDaemon, resolveDaemonPort } from './daemon-pid'
 import { runMcpServer } from './mcp-server'
-import { createApp } from './server'
+import { createApp, registerCodeRoutesIfSupported } from './server'
 import { registerTerminalWs } from './terminal/terminal-routes'
 import { reapStaleTerminals, killTrackedTerminalsSync } from './terminal/terminal-manager'
 import { provisionBootstrapApiKey, provisionTunnelApiKey } from './auth'
@@ -622,7 +621,33 @@ if (tunnelRequested) deps.tunnel = new TunnelManager(store.dir())
 // routes (server.ts passes d.codeRuns into registerCodeRoutes) and in-app-pi Code Routine
 // execution (routines/code-runner.ts), so a routine's Code run is the same kind of observable
 // daemon-owned session a live one is.
-deps.codeRuns = new CodeRunManager(deps)
+//
+// Skipped entirely on Android (import included): CodeRunManager pulls in code-session.ts,
+// which statically imports @earendil-works/pi-ai/pi-coding-agent — a dependency chain that
+// uses \p{...} Unicode-property regex syntax nodejs-mobile's ICU-limited Node build can't
+// even parse (crashes the whole daemon before any of its own code runs — confirmed live,
+// see TurboLLM Android's BLUEPRINT.md Spike D). Code/Agents needs node-pty (also
+// unavailable there) regardless, so this costs nothing real on that platform.
+// `d.codeRuns` is already optional and already defensively checked at every real call site
+// (routines/code-runner.ts: "Code execution is not available (codeRuns not wired)") — this
+// is an already-supported state, not a new one.
+//
+// code-run-manager.ts ships as its OWN tsup entry, in its OWN separate build pass (see
+// tsup.config.ts) — not chunked/shared with cli.js — so this dynamic import can never
+// accidentally pull the pi-coding-agent chain into cli.js's own static output (esbuild's
+// default chunk-splitting did exactly that once, confirmed live). The specifier is built
+// via pathToFileURL(join(...)) rather than `new URL('./relative', import.meta.url)` on
+// purpose — that two-argument form is a recognized esbuild asset-reference idiom (the same
+// one builtin.ts's WORKER_PATH deliberately relies on for `new Worker(url)`) and esbuild
+// resolves/inlines it at BUILD time even inside `import()`, defeating the whole point of a
+// lazy import — also confirmed live, the actual bug this works around.
+if (process.platform !== 'android') {
+  const hereFile = fileURLToPath(import.meta.url)
+  const isDev = hereFile.endsWith('.ts')
+  const modPath = join(dirname(hereFile), isDev ? 'code' : '.', `code-run-manager${isDev ? '.ts' : '.js'}`)
+  const { CodeRunManager } = await import(pathToFileURL(modPath).href)
+  deps.codeRuns = new CodeRunManager(deps)
+}
 
 // Routine scheduler. executeRoutine covers every flavor now: chat and in-app-pi code (Phase 2)
 // plus terminal-`claude`-CLI code (Phase 3, dispatched to routines/cli-routine.ts as a top-level
@@ -680,6 +705,7 @@ const cliInteractiveSweepTimer = setInterval(() => sweepInteractiveCliRuns(cliIn
 cliInteractiveSweepTimer.unref()
 
 const app = createApp(deps)
+await registerCodeRoutesIfSupported(app, deps)
 
 // Warm the app-update cache shortly after boot (ADR-031: "once per daemon start") so the
 // Settings chip is ready without the user clicking refresh. Offline-silent; unref'd so it
