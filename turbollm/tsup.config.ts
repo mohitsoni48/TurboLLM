@@ -30,6 +30,11 @@ export default defineConfig({
   // pi-ai/pi-coding-agent pull in cross-spawn (dynamic require of child_process)
   // which esbuild cannot bundle; externalizing avoids the "Dynamic require of
   // child_process is not supported" crash at runtime.
-  external: ['node:sqlite', '@earendil-works/pi-ai', '@earendil-works/pi-coding-agent'],
+  // sql.js (Android's node:sqlite fallback — sqlite-adapter.ts) locates its own .wasm
+  // file relative to its OWN package folder at runtime; bundling it into cli.js would
+  // break that resolution (the wasm wouldn't be found relative to a single dist/cli.js).
+  // Externalizing keeps it a real node_modules dependency the Android app ships alongside
+  // dist/, so sql.js's normal resolution logic works unmodified.
+  external: ['node:sqlite', '@earendil-works/pi-ai', '@earendil-works/pi-coding-agent', 'sql.js'],
   noExternal: [],
 })

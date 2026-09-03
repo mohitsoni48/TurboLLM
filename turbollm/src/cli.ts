@@ -27,6 +27,7 @@ import { HashStore } from './models/hashes'
 import { resolveProfile, profileToArgs, estimateVram, type LoadProfile } from './models/profile'
 import { getSysInfo } from './sysinfo/sysinfo'
 import { ConversationStore } from './chat/db'
+import { preloadSqlJs } from './chat/store/sqlite-adapter'
 import { buildChatStore } from './chat/store/startup'
 import { HfClient } from './hf/hf'
 import { DownloadManager } from './downloads/downloads'
@@ -78,11 +79,16 @@ try {
 } catch { /* keep fallback */ }
 
 // ── Node version guard ────────────────────────────────────────────────────────
-// 22.13.0, not just 22 — that's when node:sqlite became available without the
-// --experimental-sqlite flag (GitHub #40); on 22.5.0-22.12.x importing it bare
-// throws ERR_UNKNOWN_BUILTIN_MODULE despite `node -v` reporting 22.x.
+// 22.13.0, not just 22, on desktop — that's when node:sqlite became available without
+// the --experimental-sqlite flag (GitHub #40); on 22.5.0-22.12.x importing it bare throws
+// ERR_UNKNOWN_BUILTIN_MODULE despite `node -v` reporting 22.x. Android is exempt: it never
+// touches node:sqlite at all (sqlite-adapter.ts routes it through sql.js instead — see that
+// module's header), and its embedded `nodejs-mobile` runtime ships Node 18.20.4, confirmed
+// live (TurboLLM Android's PROVENANCE.md + its emulator verification) — well under 22.13.0
+// but irrelevant to this specific guard's actual reason for existing.
+const isAndroid = process.platform === 'android'
 const [nodeMajor, nodeMinor] = process.versions.node.split('.').map(Number)
-if (nodeMajor < 22 || (nodeMajor === 22 && nodeMinor < 13)) {
+if (!isAndroid && (nodeMajor < 22 || (nodeMajor === 22 && nodeMinor < 13))) {
   process.stderr.write(
     `TurboLLM requires Node.js 22.13.0 or newer.\n` +
     `You are running Node.js ${process.versions.node}.\n` +
@@ -330,6 +336,10 @@ const scanner = new Scanner(store)
 seedDefaultModelDir(store, scanner)
 void scanner.rescan() // discover models in the background
 const hashes = new HashStore(store.dir())
+// Android only: sql.js's WASM module must finish loading before the first ConversationStore
+// construction below — openSqlDb() (sqlite-adapter.ts) is synchronous and throws if this
+// hasn't resolved yet. A no-op on every other platform.
+await preloadSqlJs()
 const db = new ConversationStore(store.dir())
 const hf = new HfClient(() => store.snapshot().hf.token, version)
 // A completed download triggers a rescan so the new model shows up in the library.
