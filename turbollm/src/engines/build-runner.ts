@@ -19,7 +19,17 @@ import { createHash } from 'node:crypto'
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { delimiter, dirname, join } from 'node:path'
 import { promisify } from 'node:util'
-import { buildEnv, checkBuildPrereqs, CMAKE_CONFIGURE_ARGS, CMAKE_CONFIGURE_ARGS_MACOS, CMAKE_CONFIGURE_ARGS_MACOS_CPU, CUDA_RUNTIME_DLL_PREFIXES, CUDA_RUNTIME_SO_PREFIXES, type BuildPrereqTool } from './build-prereqs'
+import {
+  buildEnv,
+  checkBuildPrereqs,
+  CMAKE_CONFIGURE_ARGS,
+  CMAKE_CONFIGURE_ARGS_ANDROID,
+  CMAKE_CONFIGURE_ARGS_MACOS,
+  CMAKE_CONFIGURE_ARGS_MACOS_CPU,
+  CUDA_RUNTIME_DLL_PREFIXES,
+  CUDA_RUNTIME_SO_PREFIXES,
+  type BuildPrereqTool,
+} from './build-prereqs'
 import { resolveServerBinary } from './scan'
 import type { BuildPhase } from './build-state'
 
@@ -623,6 +633,7 @@ export async function runPrereqInstall(
 export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: AbortSignal): Promise<BuildOutput> {
   const isWindows = process.platform === 'win32'
   const isMac = process.platform === 'darwin'
+  const isAndroid = process.platform === 'android'
   // Force git to FAIL fast instead of blocking on an interactive credential prompt (a
   // private/typo'd URL would otherwise hang the build with stdin ignored). GCM_INTERACTIVE
   // disables the Git Credential Manager GUI on Windows.
@@ -633,7 +644,7 @@ export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: Abo
   // with Metal instead, a system framework with no separate toolkit to check for.
   hooks.phase('preparing')
   const prereqs = await checkBuildPrereqs(req.toolchainDirs)
-  if (!prereqs.supported) throw new Error('In-app build is currently Windows, Linux, or macOS only.')
+  if (!prereqs.supported) throw new Error('In-app build is currently Windows, Linux, macOS, or Android (Termux) only.')
   const missing = prereqs.tools.filter((t) => (t.id === 'git' || t.id === 'cmake' || t.id === 'cuda') && !t.found)
   if (missing.length > 0) {
     const names = missing.map((t) => t.name).join(', ')
@@ -657,6 +668,8 @@ export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: Abo
     throw new Error(
       isMac
         ? 'Could not find a C++ compiler. Install the Xcode Command Line Tools (`xcode-select --install`) and retry.'
+        : isAndroid
+        ? 'Could not find a C++ compiler. Run `pkg install clang` in Termux and retry.'
         : 'Could not find a C++ compiler. Install one (e.g. `sudo apt install build-essential` on Debian/Ubuntu) and retry.',
     )
   }
@@ -771,8 +784,16 @@ export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: Abo
     }
 
     // Compile just the server target (Ninja/Makefiles parallelize with -j; NMake ignores it).
+    // Android is capped at -j2, not unbounded like every other platform: llama.cpp's large
+    // per-model-architecture translation-unit set is memory-heavy to compile in parallel, and an
+    // unbounded build reproducibly killed the whole session (not just the compiler — exit 255)
+    // on a 2 GB emulator; a real low-RAM phone can hit the identical wall. `os.cpus()` isn't a
+    // safe way to size the cap instead — it's unreliable on Android (often reports 1, per
+    // sysinfo.ts's own getCpuCoreCount fallback) — so this is a fixed, empirically-verified value
+    // (confirmed live: -j2 compiled clean to 100% where unbounded died twice around 35-41%),
+    // not a guess.
     hooks.phase('compiling')
-    const compileArgs = ['--build', buildSubdir, '-j', '--target', 'llama-server']
+    const compileArgs = ['--build', buildSubdir, '-j', ...(isAndroid ? ['2'] : []), '--target', 'llama-server']
     if (isWindows) {
       const compileBat = join(buildRoot, '_tllm_build.bat')
       writeFileSync(compileBat, vcvarsBatch(vcvars!, compileArgs))
@@ -798,11 +819,16 @@ export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: Abo
 
   const buildLog: string[] = []
   try {
-    await configureAndCompile(isMac ? CMAKE_CONFIGURE_ARGS_MACOS : linuxCudaArgs, buildLog)
+    const configureArgs = isMac
+      ? CMAKE_CONFIGURE_ARGS_MACOS
+      : isAndroid
+      ? CMAKE_CONFIGURE_ARGS_ANDROID
+      : linuxCudaArgs
+    await configureAndCompile(configureArgs, buildLog)
   } catch (e) {
     // Some forks reference Metal-backend symbols their own vendored ggml doesn't implement
     // (their Metal support is incomplete, not TurboLLM's build config) — retry CPU-only rather
-    // than just failing. Not a concern on Windows/Linux, which don't attempt Metal at all.
+    // than just failing. Not a concern on Windows/Linux/Android, which don't attempt Metal at all.
     if (!isMac || !isIncompleteMetalBackendError(buildLog)) throw e
     hooks.log(
       "This fork's Metal backend looks incomplete (references ggml_backend_metal_* symbols its " +
@@ -823,8 +849,9 @@ export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: Abo
   // DLLs/.so's, so copy them next to the binary (else the probe + every launch fail to
   // start with missing libs). On Linux the engine launcher also points LD_LIBRARY_PATH
   // at the binary's own directory so these bundled .so's are actually found at runtime.
-  // macOS builds link Metal (a system framework), so there's nothing to bundle.
+  // macOS builds link Metal (a system framework); Android v1 is CPU-only (no CUDA ever) —
+  // neither has anything to bundle.
   if (isWindows) copyCudaRuntimeDlls(env, dirname(binPath), hooks.log)
-  else if (!isMac) copyCudaRuntimeLibs(env, dirname(binPath), hooks.log)
+  else if (!isMac && !isAndroid) copyCudaRuntimeLibs(env, dirname(binPath), hooks.log)
   return { binPath, commit, buildRoot }
 }

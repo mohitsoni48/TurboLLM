@@ -32,6 +32,11 @@ export function stripMacOsQuarantine(dir: string): void {
 // Pinned known-good upstream build. Bump deliberately after testing.
 export const LLAMA_BUILD = 'b9608'
 const REPO = 'ggml-org/llama.cpp'
+// Upstream publishes no Android build (see availableBackends()'s android branch) — TurboLLM
+// cross-compiles it via the Android NDK in CI (.github/workflows/android-llama-build.yml) and
+// hosts it on its own releases, tagged `android-<LLAMA_BUILD>` so it tracks the exact same
+// upstream commit as every other platform without coupling to the app's own release cadence.
+const ANDROID_REPO = 'mohitsoni48/TurboLLM'
 // CUDA toolkit line for Windows prebuilts (13.x is required for Blackwell / RTX 50xx).
 const CUDA_VER = '13.3'
 
@@ -44,6 +49,14 @@ export interface BackendDef {
   label: string
   /** Archives to download + extract into the same dir (main binary first). */
   assets: string[]
+  /** Defaults to upstream llama.cpp (REPO). Set when a backend's prebuilt is hosted
+   *  elsewhere — Android's has no upstream prebuilt at all, so TurboLLM hosts its own. */
+  repo?: string
+  /** Defaults to provisionBackend()'s `tag` param. Set when the release lives under a
+   *  different tag than the plain build tag — Android's own releases are tagged
+   *  `android-<tag>` to stay distinguishable from TurboLLM's own app-version tags on the
+   *  same repo. */
+  releaseTag?: string
 }
 
 const plat = () => process.platform
@@ -86,16 +99,22 @@ export function availableBackends(tag = LLAMA_BUILD): BackendDef[] {
     // ROCm/SYCL only ship x64; drop them on arm64.
     return a === 'arm64' ? list.filter((b) => b.id === 'vulkan' || b.id === 'cpu') : list
   }
-  // Android (Termux): Node reports process.platform === 'android'. Upstream
-  // publishes NO prebuilt that runs on Android — the Ubuntu binaries are glibc
-  // and won't load against Android's bionic libc. Returning an empty list
-  // (instead of throwing) lets the Engines tab load: the backend picker is
-  // empty, the catalog cards are greyed out via supportedHere, and the user
-  // can still register a self-built llama-server via "Add your own engine".
-  // Throwing here used to 500 the /engines/backends + /engines/recommendation
-  // routes and leave the Engines tab stuck on a loading skeleton.
+  // Android (Termux): Node reports process.platform === 'android'. Upstream publishes NO
+  // prebuilt that runs on Android — the Ubuntu binaries are glibc and won't load against
+  // Android's bionic libc (GitHub #52 item 6 / ADR-390/391) — so TurboLLM cross-compiles its
+  // own via the Android NDK and hosts it on ANDROID_REPO instead. CPU-only for v1 (see
+  // CMAKE_CONFIGURE_ARGS_ANDROID in build-prereqs.ts for why); asset naming otherwise matches
+  // every other platform's `llama-<tag>-bin-<os>-<arch>.tar.gz` convention.
   if (plat() === 'android') {
-    return []
+    return [
+      {
+        id: 'cpu',
+        label: 'CPU',
+        assets: [`llama-${tag}-bin-android-${a}.tar.gz`],
+        repo: ANDROID_REPO,
+        releaseTag: `android-${tag}`,
+      },
+    ]
   }
   throw new Error(`unsupported platform: ${plat()}/${process.arch}`)
 }
@@ -339,7 +358,7 @@ export async function provisionBackend(
       const asset = backend.assets[i]
       const part = i + 1
       const tmp = join(enginesRoot, asset)
-      const url = `https://github.com/${REPO}/releases/download/${tag}/${asset}`
+      const url = `https://github.com/${backend.repo ?? REPO}/releases/download/${backend.releaseTag ?? tag}/${asset}`
       onProgress?.({ phase: 'downloading', pct: 0, part, parts })
       await downloadFile(url, tmp, (p) => onProgress?.({ ...p, part, parts }), signal)
       onProgress?.({ phase: 'extracting', pct: -1, part, parts })

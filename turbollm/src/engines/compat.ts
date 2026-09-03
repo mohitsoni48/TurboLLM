@@ -109,6 +109,7 @@ const PLATFORM_DISPLAY: Record<string, string> = {
   darwin: 'macOS',
   win32: 'Windows',
   linux: 'Linux',
+  android: 'Android',
 }
 
 function platformName(p: NodeJS.Platform): string {

@@ -61,10 +61,11 @@ export interface BuildPrereqTool {
 }
 
 export interface BuildPrereqs {
-  /** Guided build supports Windows, Linux (both + CUDA) and macOS (+ Metal). */
+  /** Guided build supports Windows, Linux (both + CUDA), macOS (+ Metal), and Android/Termux
+   *  (+ CPU only — see CMAKE_CONFIGURE_ARGS_ANDROID). */
   supported: boolean
   /** Which toolchain shape `tools`/`buildCommands` reflect. 'other' when unsupported. */
-  os: 'windows' | 'linux' | 'macos' | 'other'
+  os: 'windows' | 'linux' | 'macos' | 'android' | 'other'
   tools: BuildPrereqTool[]
   /** The host package manager the `installCommands` above were generated for, or null when
    *  none was detected (or on Windows, where these tools need GUI installers). Surfaced so
@@ -289,15 +290,24 @@ async function checkGcc(env: NodeJS.ProcessEnv): Promise<BuildPrereqTool> {
   return { id: 'gcc', name: 'C++ compiler (g++/clang++)', found, version, installUrl: INSTALL_URLS.gcc }
 }
 
-/** Detect the build toolchain: Windows/Linux + CUDA, or macOS + Metal (no GPU toolkit needed —
- *  Metal is a system framework, so macOS only needs git/cmake/a C++ compiler). `toolchainDirs`
- *  (ADR-100) are prepended to PATH so a conda-env / custom-path CUDA Toolkit is detected. */
+/** Detect the build toolchain: Windows/Linux + CUDA, macOS + Metal, or Android/Termux + CPU
+ *  (no GPU toolkit needed for macOS/Android — Metal is a system framework and Android v1 is
+ *  CPU-only, so both only need git/cmake/a C++ compiler; `checkGcc` already falls back to
+ *  `clang++`, which is what Termux's `pkg install clang` provides). `toolchainDirs` (ADR-100)
+ *  are prepended to PATH so a conda-env / custom-path CUDA Toolkit is detected. */
 export async function checkBuildPrereqs(toolchainDirs: string[] = []): Promise<BuildPrereqs> {
   const platform = process.platform
-  if (platform !== 'win32' && platform !== 'linux' && platform !== 'darwin') {
+  if (platform !== 'win32' && platform !== 'linux' && platform !== 'darwin' && platform !== 'android') {
     return { supported: false, os: 'other', tools: [], packageManager: null }
   }
   const env = buildEnv(toolchainDirs)
+  // Android/Termux: CPU-only, no package-manager-driven prereq install (Termux uses `pkg`,
+  // outside the PackageManager union above) — buildCommands()'s android branch leads with
+  // `pkg install` directly instead.
+  if (platform === 'android') {
+    const tools = await Promise.all([checkGit(env), checkCmake(env), checkGcc(env)])
+    return { supported: true, os: 'android', tools, packageManager: null }
+  }
   const [tools, packageManager] = await Promise.all([
     platform === 'darwin'
       ? Promise.all([checkGit(env), checkCmake(env), checkGcc(env)])
@@ -345,6 +355,12 @@ export const CMAKE_CONFIGURE_ARGS_MACOS = ['-DGGML_METAL=ON', '-DCMAKE_BUILD_TYP
  *  specific failure — see isIncompleteMetalBackendError). */
 export const CMAKE_CONFIGURE_ARGS_MACOS_CPU = ['-DGGML_METAL=OFF', '-DCMAKE_BUILD_TYPE=Release']
 
+/** Android/Termux v1 is CPU-only (ggml's CPU backend needs no extra flags to build) —
+ *  no Vulkan here yet, unlike desktop Linux/Windows, since llama.cpp's Vulkan backend on
+ *  Android is real but device-dependent and unverified on real hardware so far. Revisit once
+ *  the CPU path has real-device confirmation (GitHub #52 item 6). */
+export const CMAKE_CONFIGURE_ARGS_ANDROID = ['-DCMAKE_BUILD_TYPE=Release']
+
 /** CUDA runtime DLLs (Windows) / shared libs (Linux) a llama.cpp CUDA build links against at
  *  runtime. A build does NOT bundle these, so without copying them next to the binary the
  *  engine silently falls back to CPU. Shared with build-runner.ts's 1-click-build copy step. */
@@ -362,10 +378,12 @@ export const CUDA_RUNTIME_SO_PREFIXES = ['libcudart.so', 'libcublas.so', 'libcub
 export function buildCommands(
   repoUrl: string,
   branch?: string,
-  os: 'windows' | 'linux' | 'macos' = process.platform === 'win32'
+  os: 'windows' | 'linux' | 'macos' | 'android' = process.platform === 'win32'
     ? 'windows'
     : process.platform === 'darwin'
     ? 'macos'
+    : process.platform === 'android'
+    ? 'android'
     : 'linux',
 ): string[] {
   const b = (branch ?? '').trim()
@@ -379,6 +397,19 @@ export function buildCommands(
       clone,
       'cd turbo-build',
       `cmake -B build ${CMAKE_CONFIGURE_ARGS_MACOS.join(' ')}`,
+      'cmake --build build -j --target llama-server',
+      '# Built binary: build/bin/llama-server — add it via "Add your own engine".',
+    ]
+  }
+  if (os === 'android') {
+    // Termux ships none of git/cmake/clang by default — unlike the desktop OSes, where a
+    // compiler is a reasonable baseline assumption, so the command list leads with the pkg
+    // install step rather than pointing at an external download page.
+    return [
+      'pkg install -y git cmake clang',
+      clone,
+      'cd turbo-build',
+      `cmake -B build ${CMAKE_CONFIGURE_ARGS_ANDROID.join(' ')}`,
       'cmake --build build -j --target llama-server',
       '# Built binary: build/bin/llama-server — add it via "Add your own engine".',
     ]
