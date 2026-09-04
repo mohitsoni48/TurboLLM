@@ -453,9 +453,11 @@ export class Manager {
   }
 
   /** The exact command last spawned, formatted for copy-paste into a terminal
-   *  (GitHub Discord ask — "copy exact launch command"). Only meaningful while this
-   *  engine is the one actually running; null once stopped/swapped so a stale
-   *  command from a PREVIOUS model can never be copied as if it were current.
+   *  (GitHub Discord ask — "copy exact launch command"). Meaningful while this engine is
+   *  the one actually running, still starting, or just failed to start (its own error
+   *  banner's "show launch command and diagnostics" control, QA_BUGS.md BUG-11); null
+   *  once stopped/swapped for any other reason so a stale command from a PREVIOUS model
+   *  can never be copied as if it were current.
    *
    *  Deliberately NOT byte-identical to what TurboLLM itself spawned: the point of
    *  copying it is running the SAME model+config standalone, with llama.cpp/the fork
@@ -467,7 +469,17 @@ export class Manager {
    *  sampling, extra flags) is copied verbatim — it's what makes the command reproduce
    *  the exact same config. */
   launchCommand(): string | null {
-    if (this.state !== 'running' && this.state !== 'starting') return null
+    // 'error' is included deliberately (QA_BUGS.md BUG-11): `lastCommand` is set
+    // immediately before every spawn attempt (below), so right after a failed one the
+    // engine is in 'error' and `lastCommand` is exactly the argv that just failed — the
+    // most useful diagnostic a "show launch command" control could show. Excluding it
+    // left that button a documented no-op: the daemon had nothing to show, so toggling it
+    // visibly did nothing. This is still never a STALE command: the two 'error' returns
+    // that happen before a spawn is attempted (the vLLM/SGLang capability preflight,
+    // above) leave `lastCommand` at whatever the previous successful load set it to,
+    // which is a real "last command that ran" — not the made-up one this doc originally
+    // warned about (a different model's command shown as if it were the current one).
+    if (this.state !== 'running' && this.state !== 'starting' && this.state !== 'error') return null
     if (!this.lastCommand) return null
     const args = this.lastCommand.args.filter((a) => a !== '--no-webui')
     const quote = (s: string) => (/[\s"]/.test(s) ? `"${s.replace(/"/g, '\\"')}"` : s)

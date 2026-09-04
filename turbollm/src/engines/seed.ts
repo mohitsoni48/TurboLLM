@@ -2,12 +2,55 @@
 // GPU vendor, downloads the fastest llama.cpp backend it supports, and registers
 // it — trying the recommended backend, then Vulkan, then CPU if one won't probe.
 // No-ops if any engine is already configured. Never throws.
+import { join } from 'node:path'
 import type { Registry } from './registry'
 import type { ProvisionState } from './provision-state'
 import { amdApuOnly, getSysInfo, primaryVendor } from '../sysinfo/sysinfo'
 import { LLAMA_BUILD, fallbackChain, provisionBackend, recommendBackendId, type BackendId, type ProvisionProgress } from './download'
 
 const VALID_BACKENDS: BackendId[] = ['cuda', 'rocm', 'sycl', 'vulkan', 'metal', 'cpu']
+
+/** Fixed identity for the one engine the Android app ever registers for itself — never
+ *  user-renamable to something else on Android (there's no "add engine" UI reachable in
+ *  the WebView-only app shell), so matching on this exact name is a safe, stable way to
+ *  find "the engine this function owns" across restarts without persisting a separate id
+ *  anywhere. */
+const ANDROID_ENGINE_NAME = 'llama-server-android'
+
+/** BUG-01 fix (QA_BUGS.md): on Android, the llama-server binary bundled inside the APK
+ *  lives at `<nativeLibraryDir>/libllama_server.so` — the only on-disk location Android's
+ *  W^X hardening exempts from execve() (build.gradle.kts's jniLibs comment). Nothing in
+ *  the Android app shell ever registered that engine automatically; every prior
+ *  verification pass did it by hand with a one-off curl call. Worse, `nativeLibraryDir`
+ *  is re-derived by PackageManager on every install/update (a fresh signing session even
+ *  for the identical APK), so even a manually-registered engine's `binPath` goes stale
+ *  the moment the app is reinstalled — reproduced live: a plain `adb install -r` over an
+ *  already-registered engine turned a working chat completion into `spawn ... ENOENT`.
+ *
+ *  Called unconditionally at every daemon boot (cli.ts), before `seedDefaultEngines` —
+ *  a no-op on every platform except Android (gated on `TURBOLLM_ANDROID_NATIVE_LIB_DIR`,
+ *  set only by MainActivity.kt). Self-heals a stale path in place (same engine id, so any
+ *  existing per-engine profile/update-policy config survives) and registers fresh on a
+ *  genuine first launch — either way, "the app can load a model" never again depends on a
+ *  developer having run a manual registration step first. Errors are logged, not thrown:
+ *  a probe failure here must not take the rest of daemon startup down with it. */
+export async function ensureAndroidBundledEngine(registry: Registry): Promise<void> {
+  const nativeLibDir = process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR
+  if (!nativeLibDir) return
+  const binPath = join(nativeLibDir, 'libllama_server.so')
+  try {
+    const existing = registry.list().engines.find((e) => e.name === ANDROID_ENGINE_NAME)
+    if (!existing) {
+      await registry.add(ANDROID_ENGINE_NAME, binPath)
+      console.log(`android: registered bundled engine at ${binPath}`)
+    } else if (existing.binPath !== binPath) {
+      await registry.repairBinPath(existing.id, binPath)
+      console.log(`android: repaired stale engine path → ${binPath}`)
+    }
+  } catch (e) {
+    console.warn(`android: could not register/repair the bundled engine (${e instanceof Error ? e.message : e})`)
+  }
+}
 
 export async function seedDefaultEngines(
   registry: Registry,

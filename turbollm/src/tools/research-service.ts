@@ -344,6 +344,31 @@ export function aggregatorPenalty(title: string, url: string, intent?: string): 
  *  AGGREGATOR_PATTERNS. A bare year is included here and not there for the same reason
  *  aggregatorPenalty treats it as a modifier rather than a trigger: on a page it is an
  *  annual-refresh stamp, and in a query it pins retrieval to roundups republished that year. */
+/** Whether this runtime's regex engine accepts Unicode property escapes (`\p{...}` inside a
+ *  `/u` pattern) — true on desktop/full-ICU Node, false on Android's embedded nodejs-mobile
+ *  runtime, which ships without full ICU data. On that runtime, `\p{L}` inside a `/u` regex is
+ *  a PARSE-TIME SyntaxError, not a runtime one — a `/[^\p{L}\p{N}]+/u` regex LITERAL anywhere
+ *  in a file fails to parse the WHOLE file, crashing the daemon before any of its own code
+ *  runs (confirmed live: exactly this, at daemon boot, on a from-source Android build).
+ *  `new RegExp(string, flags)` compiles at runtime instead, so probing it here — and building
+ *  every such pattern the same way below — turns that crash into a catchable, one-time
+ *  feature check. */
+const SUPPORTS_UNICODE_PROPERTY_ESCAPES: boolean = (() => {
+  try {
+    new RegExp('\\p{L}', 'u')
+    return true
+  } catch {
+    return false
+  }
+})()
+
+/** Non-word-character class, Unicode-aware wherever the runtime supports it (identical
+ *  behavior to the original `[^\p{L}\p{N}]` literal on every platform but Android). The ASCII
+ *  fallback only reached there is strictly worse at segmenting non-Latin scripts, but a
+ *  degraded split beats the crash it replaces. */
+const NON_WORD_CLASS = SUPPORTS_UNICODE_PROPERTY_ESCAPES ? '[^\\p{L}\\p{N}]' : '[^A-Za-z0-9]'
+const NON_WORD_REGEX_FLAGS = SUPPORTS_UNICODE_PROPERTY_ESCAPES ? 'u' : ''
+
 /**
  * Substantive-term count for the "is anything left to search for?" guard.
  *
@@ -356,7 +381,7 @@ export function aggregatorPenalty(title: string, url: string, intent?: string): 
 function substantiveTermCount(text: string): number {
   return text
     .toLowerCase()
-    .split(/[^\p{L}\p{N}]+/u)
+    .split(new RegExp(`${NON_WORD_CLASS}+`, NON_WORD_REGEX_FLAGS))
     .filter((t) => t.length >= 2 && !STOP_WORDS.has(t)).length
 }
 
@@ -409,8 +434,13 @@ export function debaitQuery(query: string): string | null {
   for (const re of QUERY_ONLY_BAIT) out = out.replace(re, ' ')
 
   // Collapse the holes left behind, then trim leading/trailing punctuation the bait was attached
-  // to ("Best: mattresses?" → "mattresses"). Unicode-aware so non-Latin queries survive intact.
-  out = out.replace(/\s+/g, ' ').trim().replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '').trim()
+  // to ("Best: mattresses?" → "mattresses"). Unicode-aware so non-Latin queries survive intact
+  // (see NON_WORD_CLASS's own comment for why this is built via `new RegExp` and not a literal).
+  out = out
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(new RegExp(`^${NON_WORD_CLASS}+|${NON_WORD_CLASS}+$`, `g${NON_WORD_REGEX_FLAGS}`), '')
+    .trim()
 
   if (!out || out.toLowerCase() === query.trim().toLowerCase()) return null
   // Under two substantive terms there is nothing left to retrieve on — "best of 2026" reduces to

@@ -9,6 +9,7 @@ import type { ChatSseEvent, Conversation, LiveToolCall, Message } from '../lib/c
 import { appendTextDelta, upsertToolCall, type LiveBlock } from '../lib/live-timeline'
 import { ApiError, downloadChatExport, getDebugSnapshot, getShareUrl, importChat, track } from '../lib/api'
 import { useWorkspaceSidebarOpen } from '../lib/workspace-sidebar'
+import { useBackableOverlay } from '../lib/use-backable-overlay'
 import { Button } from '../components/ui/button'
 import {
   DropdownMenu,
@@ -107,6 +108,9 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // Below md the sidebar is an off-canvas drawer, hidden until opened from the header.
   const isDesktop = useIsDesktop()
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
+  // QA_BUGS.md BUG-02: Android hardware/gesture back closes this drawer instead of exiting
+  // the app — see the hook's own doc comment for why a plain boolean isn't enough on its own.
+  useBackableOverlay(mobileSidebarOpen, () => setMobileSidebarOpen(false))
   const sidebarRef = useRef<HTMLDivElement>(null)
   const [sidebarWidth, setSidebarWidth] = useState(() => Math.min(Math.max(readSavedSidebarWidth(), SIDEBAR_MIN_W), sidebarMaxW()))
   const [attachments, setAttachments] = useState<{ file: File; dataUrl: string }[]>([])

@@ -86,7 +86,14 @@ export function Shell({
   return (
     <div className={cn('app-shell flex', documentScroll ? 'min-h-dvh' : 'h-full')}>
       {!onOnboarding && <NavRail status={status} online={online} version={version} className="hidden md:flex" />}
-      <div className="flex min-w-0 flex-1 flex-col">
+      {/* QA_BUGS.md BUG-03/BUG-07: on a phone this column is the topmost content under the
+          status bar (NavRail is `hidden md:flex` below md, and even at md+ it doesn't cover
+          this column). `env(safe-area-inset-top)` is 0 on any browser without an inset
+          (desktop, older phones), so this is a no-op there — verified live in the Android
+          WebView the padding it does need to apply (55px on the current test device). One
+          padding here, on the shared ancestor of every banner and screen header, beats
+          chasing the inset onto each header/banner separately as new ones get added. */}
+      <div className="flex min-w-0 flex-1 flex-col pt-[env(safe-area-inset-top)]">
         <EngineProvisionBanner status={status} />
         <EngineLoadErrorBanner status={status} />
         {/* Bounded mode: `main` is the scroller. Document mode: it must NOT be, or the window
@@ -327,7 +334,13 @@ function MobileNav() {
     // has no scrolling ancestor and the bar is already the last row of a 100vh flex column.
     // `h-14` pins the height that index.css's `--tllm-mobile-nav-h` is written against (it was
     // already 56px from its content; now it says so) — keep the two in step.
-    <nav className="sticky bottom-0 z-30 flex h-14 shrink-0 border-t border-border bg-panel-2 md:hidden">
+    // QA_BUGS.md BUG-04: the gesture-navigation pill sits UNDER the bar's own icon row on a
+    // phone with no 3-button nav bar reserving that space — `pb-[env(safe-area-inset-bottom)]`
+    // adds that space back as extra room below the (still `h-14`, still vertically-centered)
+    // icon row rather than stealing from it, so the pill lands in blank space instead of
+    // slicing through "Customize"/"Usage"'s labels. Elsewhere (desktop, a phone with 3-button
+    // nav) the env() resolves to 0 and this is a no-op.
+    <nav className="sticky bottom-0 z-30 flex h-14 shrink-0 border-t border-border bg-panel-2 pb-[env(safe-area-inset-bottom)] md:hidden">
       {NAV.map(({ to, label, icon: Icon }) => {
         const isActive = pathname === to || pathname.startsWith(`${to}/`)
         return (
