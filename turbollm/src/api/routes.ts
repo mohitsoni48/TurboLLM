@@ -25,6 +25,7 @@ import {
   backendDir,
   deleteAllBackendBuilds,
   installedBackendBuild,
+  githubHeaders,
   latestReleaseTag,
   provisionBackend,
   provisionTurboquant,
@@ -44,7 +45,7 @@ import { ensureKoboldcpp, koboldcppBinPath, koboldcppDir } from '../engines/kobo
 import { ensureLlamafile, llamafileBinPath, llamafileDir } from '../engines/llamafile'
 import { catalogForPlatform, catalogEngine } from '../engines/catalog'
 import { checkBuildPrereqs } from '../engines/build-prereqs'
-import { runBuild, runPrereqInstall, buildDirName, chooseEngineName, sameRepo, sourceBuildBinary, sourceBuildDirOf } from '../engines/build-runner'
+import { runBuild, runPrereqInstall, buildDirName, chooseEngineName, normRepoUrl, sameRepo, sourceBuildBinary, sourceBuildDirOf } from '../engines/build-runner'
 import { provisionCuda } from '../engines/cuda-provision'
 import { detectHardware } from '../engines/hardware'
 import { recommendEngines } from '../engines/recommend'
@@ -500,9 +501,12 @@ export function registerApi(app: Hono, d: Deps): void {
   // Engine catalog (ADR-044): the hardcoded, browsable list of installable
   // engines for this platform. Per-entry `installed` is disk-based (files exist);
   // `enabled` is registry-based (a registered engine entry exists for this kind).
+  // Optional `branch` query param — when provided, source-built matching is scoped to
+  // that branch so each branch gets its own installed/enabled state on the card.
   app.get('/api/v1/engines/catalog', (c) => {
     const regEngines = d.registry.list().engines
     const enginesRoot = join(d.store.dir(), 'engines')
+    const branchParam = (c.req.query('branch') ?? '').trim() || undefined
     const items = catalogForPlatform().map((e) => {
       let installed: boolean | undefined
       let enabled: boolean | undefined
@@ -540,23 +544,29 @@ export function registerApi(app: Hono, d: Deps): void {
       // requiring the SAME commit + patch, a plain unpatched llama.cpp build would falsely read
       // as "solar-open2 already installed" and hand out a binary with no solar_open2 support at
       // all. Entries with no commit/patch pin (sourceCommit/patchUrl both '') still match each
-      // other exactly as before.
+      // other exactly as before — UNLESS a branch is requested, in which case we scope the
+      // match to that branch so each branch gets its own installed/enabled state.
       // Skip entirely for `excludeFromSourceMatch` entries (ADR-388) — the backend-picker
       // `llama.cpp` card's installed state comes from LlamaCppBackendRows, not this. Without the
       // guard, a manually source-built plain `ggml-org/llama.cpp` (no commit/patch — the same
       // identity this card matches with) got its registry id silently claimed here, hiding it
       // from BOTH the custom-engine card list AND this card's own UI (which never reads
       // `sourceEngineId`) — founder-reported: "now it is only visible for selection in dropdown".
+      // An entry is "branch-capable" when it has no pinned commit or patch — the user can
+      // build any branch, so the match should be scoped to the requested branch.
+      const isBranchCapable = !e.sourceCommit && !e.patchUrl
+      const matchBranch = isBranchCapable ? (branchParam ?? '') : undefined
       const srcEng = e.excludeFromSourceMatch
         ? undefined
         : regEngines.find(
             (x) =>
               sameRepo(x.sourceRepo, e.homepage) &&
               (x.sourceCommit ?? '') === (e.sourceCommit ?? '') &&
-              (x.sourcePatchUrl ?? '') === (e.patchUrl ?? ''),
+              (x.sourcePatchUrl ?? '') === (e.patchUrl ?? '') &&
+              (x.sourceBranch ?? '') === (matchBranch ?? ''),
           )
       let sourceBinPath: string | undefined = srcEng?.binPath
-      if (!srcEng && !e.excludeFromSourceMatch) sourceBinPath = sourceBuildBinary(enginesRoot, e.homepage, undefined, e.sourceCommit) ?? undefined
+      if (!srcEng && !e.excludeFromSourceMatch) sourceBinPath = sourceBuildBinary(enginesRoot, e.homepage, matchBranch, e.sourceCommit) ?? undefined
       const sourceBuilt = !!srcEng || !!sourceBinPath
       if (srcEng) {
         installed = true
@@ -596,6 +606,46 @@ export function registerApi(app: Hono, d: Deps): void {
   app.get('/api/v1/build/prereqs', async (c) =>
     c.json(await checkBuildPrereqs(d.store.snapshot().build.toolchainDirs)),
   )
+
+  // Fetch branch list for a GitHub repo (ADR branch selector). Accepts either a full HTTPS
+  // URL or an `owner/repo` identifier — normalises via normRepoUrl so both shapes work.
+  // Supports `limit` (default 50, max 100) and `offset` for pagination. Returns total count
+  // plus the page slice, with the default branch sorted first within the page.
+  app.get('/api/v1/build/git-branches', async (c) => {
+    const raw = (c.req.query('repo') ?? '').trim()
+    if (!raw) return err(c, 400, 'invalid_input', 'repo is required.')
+    const repo = normRepoUrl(raw)
+    if (!repo) return err(c, 400, 'invalid_input', 'repo must be a valid GitHub repo identifier.')
+    const limit = Math.min(parseInt(c.req.query('limit') ?? '50', 10) || 50, 100)
+    const offset = Math.max(parseInt(c.req.query('offset') ?? '0', 10) || 0, 0)
+    try {
+      // GitHub's branches API doesn't expose total count directly, so we fetch 100 (max per page)
+      // and use that as the total. The caller paginates client-side.
+      const res = await fetch(`https://api.github.com/repos/${repo}/branches?per_page=100`, {
+        headers: githubHeaders(),
+      })
+      if (!res.ok) throw new Error(`GitHub API returned HTTP ${res.status}`)
+      const data = (await res.json()) as { name: string }[]
+      // Try to detect the default branch from the repo metadata (second request).
+      let defaultBranch = ''
+      try {
+        const info = await fetch(`https://api.github.com/repos/${repo}`, {
+          headers: githubHeaders(),
+        })
+        if (info.ok) {
+          const j = await info.json() as { default_branch?: string }
+          defaultBranch = j.default_branch ?? ''
+        }
+      } catch { /* best-effort — caller falls back to 'main' */ }
+      const names = data.map((b) => b.name)
+      const sorted = defaultBranch ? [defaultBranch, ...names.filter((n) => n !== defaultBranch)] : names
+      const total = names.length
+      const page = sorted.slice(offset, offset + limit)
+      return c.json({ total, branches: page })
+    } catch (e) {
+      return err(c, 503, 'offline', `Could not fetch branches for ${repo}: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  })
 
   // 1-click compile-from-source (ADR-100, Windows/Linux + CUDA, or macOS + Metal). Clones the
   // repo, runs cmake, compiles llama-server, then registers + activates the built binary.

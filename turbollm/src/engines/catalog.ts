@@ -221,6 +221,39 @@ const ALL: CatalogEngine[] = [
     ],
   },
   {
+    // General-purpose build-from-source entry for official llama.cpp — cross-platform,
+    // branch-aware. Unlike llama.cpp-cuda-linux (Linux-only CUDA) and llama.cpp-android-source
+    // (Termux-only CPU), this works on every desktop OS and lets the user pick any branch.
+    // Each branch builds into its own directory and registers as a separate engine
+    // (e.g. Llama-main, Llama-my-feature). The main llama.cpp entry above handles the
+    // prebuilt download path; this is the source-build complement.
+    id: 'llama.cpp-source',
+    name: 'llama.cpp (Build from Source)',
+    kind: 'llama-server',
+    description:
+      'Official llama.cpp, compiled from source on your machine. Pick any branch — each becomes its own engine.',
+    provision: 'github-release',
+    homepage: 'https://github.com/ggml-org/llama.cpp',
+    repo: 'ggml-org/llama.cpp',
+    platforms: ['win32', 'darwin', 'linux'],
+    support: 'experimental',
+    installEndpoint: '',
+    note:
+      'No prebuilt binary. Select a branch below and TurboLLM clones + compiles it for you. '
+      + 'Each branch you build becomes a separate engine (e.g. Llama-main, Llama-my-feature).',
+    variants: [
+      {
+        id: 'llama.cpp-source-branch',
+        label: 'Build from source',
+        repo: 'ggml-org/llama.cpp',
+        requires: {},
+        stability: 'experimental',
+        speed: 'baseline',
+        hasPrebuilt: false,
+      },
+    ],
+  },
+  {
     id: 'vllm',
     name: 'vLLM',
     kind: 'vllm',
