@@ -18,6 +18,7 @@ import {
   getConnect,
   getEngineBackends,
   getGitBranch,
+  getGitBranches,
   getHwStats,
   getModelDetail,
   getModelDirs,
@@ -365,6 +366,33 @@ export function useBuild() {
     }),
     /** Call when a build settles (done/error) to pull the new engine into the lists. */
     refresh,
+  }
+}
+
+/** Branch list for a GitHub repo, used by the build-from-source branch dropdown. Disabled
+ *  by default — only enabled when a branch-capable catalog card is rendered.
+ *  Returns total count and the first page of branches (default: 50). */
+export function useGitBranches(repo: string | undefined, enabled = false): UseQueryResult<{ total: number; branches: string[] }> {
+  return useQuery({
+    queryKey: ['git-branches', repo],
+    queryFn: () => getGitBranches(repo!),
+    enabled: enabled && !!repo,
+    staleTime: 10 * 60 * 1000,
+    retry: false,
+  })
+}
+
+/** Load the next page of branches for a repo. Used by the branch dropdown's "Show more" button. */
+export function useLoadMoreBranches() {
+  const qc = useQueryClient()
+  return async (repo: string, offset: number): Promise<{ total: number; branches: string[] }> => {
+    const result = await getGitBranches(repo, { limit: 50, offset })
+    // Append the new page to the existing query data.
+    void qc.setQueryData(['git-branches', repo], (old: { total: number; branches: string[] } | undefined) => {
+      if (!old) return result
+      return { total: result.total, branches: [...old.branches, ...result.branches] }
+    })
+    return result
   }
 }
 

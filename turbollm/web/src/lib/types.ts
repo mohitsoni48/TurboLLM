@@ -427,6 +427,9 @@ export type CatalogEngine = {
   sourceBranch?: string
   /** Path to the built binary (used to Enable a built-but-disabled source engine). */
   sourceBinPath?: string
+  /** Installable variants (one per hardware path). Optional — llama.cpp derives its
+   *  variants at call time; other engines list them inline or leave undefined. */
+  variants?: EngineVariant[]
 }
 
 export type EngineCatalog = {

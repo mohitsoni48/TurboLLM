@@ -12,7 +12,9 @@ import {
   Flame,
   Gauge,
   Gem,
+  GitBranch,
   Layers,
+  Search,
   Loader2,
   Minus,
   MoreHorizontal,
@@ -34,6 +36,8 @@ import {
   useEngineRecommendation,
   useEngineUpdates,
   useEngines,
+  useGitBranches,
+  useLoadMoreBranches,
   useStatus,
   useSysInfo,
   useUpdatePolicyMutation,
@@ -402,6 +406,16 @@ function hardwareLabel(fit: EngineFit): string {
 const OS_SHORT: Record<string, string> = { win32: 'Win', linux: 'Linux', darwin: 'Mac' }
 function osLabel(platforms: string[]): string {
   return platforms.map((p) => OS_SHORT[p] ?? p).join(' · ')
+}
+
+/** Default engine name for a fresh build-from-source run. Official llama.cpp repos
+ *  get the `Llama-<Branch>` convention; forks get `<EngineName>-<Branch>`. */
+function defaultBuildName(catalog: CatalogEngine | undefined, branch: string): string {
+  const b = (branch || 'main').trim()
+  const officialLlama = ['llama.cpp', 'llama.cpp-cuda-linux', 'llama.cpp-android-source', 'llama.cpp-source'].includes(
+    catalog?.id ?? '',
+  )
+  return officialLlama ? `Llama-${b}` : `${catalog?.name ?? 'engine'}-${b}`
 }
 
 /**
@@ -951,6 +965,7 @@ function EngineGallery({
               onUpdate={doUpdate}
               onDelete={requestDelete}
               onSetPolicy={setPolicy}
+              onRefetchCatalog={() => void catalogQ.refetch()}
             />
           )
         })}
@@ -1054,6 +1069,7 @@ function EngineCard({
   onUpdate,
   onDelete,
   onSetPolicy,
+  onRefetchCatalog: _onRefetchCatalog,
 }: {
   fit: EngineFit
   catalog: CatalogEngine | undefined
@@ -1069,6 +1085,7 @@ function EngineCard({
   onUpdate: (e: CatalogEngine) => void
   onDelete: (e: CatalogEngine) => void
   onSetPolicy: (e: CatalogEngine, policy: UpdatePolicy) => void
+  onRefetchCatalog: () => void
 }) {
   const e = fit.engine
   const meta = metaFor(e.id)
@@ -1076,14 +1093,40 @@ function EngineCard({
   const [guideOpen, setGuideOpen] = useState(false)
   const [rebuildOpen, setRebuildOpen] = useState(false)
   const [buildsOpen, setBuildsOpen] = useState(false)
+  // Branch selected by the user for build-from-source entries. Default: main.
+  const [selectedBranch, setSelectedBranch] = useState('main')
   const isLlama = e.id === 'llama.cpp'
   const sourceBuilt = !!catalog?.sourceBuilt
   const incompatible = fit.compatible.length === 0
-  const buildYourself = !incompatible && fit.compatible.every((v) => !v.hasPrebuilt)
+  // Branch-capable: has a hasPrebuilt:false variant AND no pinned commit/patch.
+  const isBranchCapable = !catalog?.sourceCommit && !catalog?.patchUrl
+  const buildYourself = !incompatible && isBranchCapable && catalog?.variants?.some((v) => !v.hasPrebuilt)
   const isInstalled = !!catalog?.installed
   const isEnabled = !!catalog?.enabled
   const isDisabled = isInstalled && !isEnabled
   const compat = compatFor(fit)
+  // Fetch branch list in background for branch-capable entries; falls back to ['main'] on failure.
+  const branchesQ = useGitBranches(catalog?.homepage, buildYourself)
+  const loadMore = useLoadMoreBranches()
+  // Pagination + search state for the branch dropdown.
+  const [searchQuery, setSearchQuery] = useState('')
+  const allBranches = branchesQ.data?.branches ?? ['main']
+  const totalBranches = branchesQ.data?.total ?? allBranches.length
+  const hasMore = allBranches.length < totalBranches
+  const branchError = branchesQ.error
+  const isRateLimited =
+    branchError != null &&
+    typeof branchError === 'object' &&
+    'status' in branchError &&
+    (branchError as { status?: number }).status === 403
+  const filtered = useMemo(
+    () =>
+      searchQuery
+        ? allBranches.filter((b) => b.toLowerCase().includes(searchQuery.toLowerCase()))
+        : allBranches,
+    [allBranches, searchQuery],
+  )
+  const buildName = defaultBuildName(catalog, selectedBranch)
 
   return (
     <div className="flex flex-col rounded-xl border border-border bg-panel p-4">
@@ -1144,6 +1187,91 @@ function EngineCard({
               ))}
             </ul>
           </div>
+        </div>
+      )}
+
+      {/* Branch selector for build-from-source entries */}
+      {isBranchCapable && buildYourself && (
+        <div className="mt-3 flex flex-col gap-1.5">
+          <div className="flex items-center gap-2">
+            <GitBranch size={13} className="shrink-0 text-muted" />
+            <span className="text-[12px] text-muted shrink-0">Branch:</span>
+            <div className="relative flex-1">
+              <select
+                value={selectedBranch}
+                onChange={(e) => {
+                  setSelectedBranch(e.target.value)
+                  void _onRefetchCatalog()
+                }}
+                className="w-full rounded-md border border-border bg-panel-2 pl-2 pr-7 py-1 text-[12px] text-ink outline-none focus:border-accent font-mono appearance-none"
+                disabled={branchesQ.isLoading}
+              >
+                {branchesQ.isLoading ? (
+                  <option value="main" disabled>
+                    Loading branches…
+                  </option>
+                ) : filtered.length === 0 ? (
+                  <option value="main" disabled>
+                    No matching branches
+                  </option>
+                ) : (
+                  filtered.map((b) => (
+                    <option key={b} value={b}>
+                      {b}
+                    </option>
+                  ))
+                )}
+              </select>
+              <ChevronDown
+                size={13}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-muted pointer-events-none"
+              />
+            </div>
+          </div>
+          {/* Error state — GitHub rate limit or network failure */}
+          {isRateLimited && (
+            <p className="pl-9 text-[11px] text-warning">
+              GitHub API rate-limited. Set{' '}
+              <code className="rounded bg-panel-2 px-1">GITHUB_TOKEN</code> in the daemon env to
+              raise the limit from 60 → 5,000 req/hour.
+            </p>
+          )}
+          {/* Search filter + load more — shown only when there are many branches */}
+          {allBranches.length > 5 && !isRateLimited && (
+            <div className="flex items-center gap-2 pl-9">
+              <div className="relative flex-1">
+                <Search
+                  size={13}
+                  className="absolute left-2 top-1/2 -translate-y-1/2 text-muted pointer-events-none"
+                />
+                <input
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder={`Search ${totalBranches} branches…`}
+                  className="w-full rounded-md border border-border bg-panel-2 pl-7 pr-2 py-1 text-[12px] text-ink outline-none focus:border-accent"
+                />
+              </div>
+              <span className="text-[11px] text-muted shrink-0">
+                {filtered.length === totalBranches
+                  ? `${totalBranches} branches`
+                  : `${filtered.length} of ${totalBranches}`}
+              </span>
+              {hasMore && (
+                <button
+                  onClick={async () => {
+                    const nextOffset = allBranches.length
+                    void loadMore(catalog!.homepage!, nextOffset)
+                  }}
+                  disabled={branchesQ.isLoading}
+                  className="rounded-md border border-border bg-panel-2 px-2 py-0.5 text-[11px] text-muted hover:text-ink disabled:opacity-50 shrink-0"
+                >
+                  {branchesQ.isLoading
+                    ? 'Loading…'
+                    : `Show more (${totalBranches - allBranches.length} left)`}
+                </button>
+              )}
+            </div>
+          )}
         </div>
       )}
 
@@ -1230,7 +1358,7 @@ function EngineCard({
                   open={rebuildOpen}
                   onOpenChange={setRebuildOpen}
                   repoUrl={catalog.homepage}
-                  branch={catalog.sourceBranch || undefined}
+                  branch={selectedBranch || undefined}
                   commit={catalog.sourceCommit}
                   patchUrl={catalog.patchUrl}
                   patchSha256={catalog.patchSha256}
@@ -1253,10 +1381,11 @@ function EngineCard({
                 open={guideOpen}
                 onOpenChange={setGuideOpen}
                 repoUrl={catalog.homepage}
+                branch={selectedBranch || undefined}
                 commit={catalog.sourceCommit}
                 patchUrl={catalog.patchUrl}
                 patchSha256={catalog.patchSha256}
-                engineName={e.name}
+                engineName={buildName}
               />
             </>
           ) : (
