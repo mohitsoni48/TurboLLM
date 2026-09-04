@@ -94,10 +94,8 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 - **Branch selector UI now uses a proper dropdown.** Replaced the free-text input with a `<select>` element, a search bar (shown when the repo has >5 branches), and a 'Show more' button that loads the next 50 branches from GitHub. Rate-limit errors show a clear message with the `GITHUB_TOKEN` hint instead of silently falling back to a single branch.
 
 ### Discord
-- Build from source now has a branch dropdown instead of a text box — pick any branch and each one becomes its own engine.
-- Forks get `<Engine>-<branch>` naming (e.g. ik-<branch>); official llama.cpp repos get `Llama-<branch>`.
-- GitHub API rate limits are now much higher when you set GITHUB_TOKEN in the daemon environment.
-- The branch selector shows a clear error if GitHub rate-limits you, with a hint to set GITHUB_TOKEN.
+- Build from source now has branch selection — pick any branch and each becomes its own engine.
+- Added `llama.cpp-source` entry: build `Llama-main` (or any branch) directly from source.
 
 ## [Unreleased]
 
