@@ -114,6 +114,31 @@ test('recordCustomSource: survives being re-loaded from disk (real persistence, 
   assert.equal(reg2.customSources()[0].name, 'My Fork')
 })
 
+test('two engines from the same repo but different branches are both discoverable', () => {
+  const { reg, store } = freshRegistry()
+  // Seed two engines built from the same repo but different branches — mirrors what the
+  // build endpoint does after a successful compile (registry.add + activate).
+  store.update((c) => {
+    c.engines.push(
+      { id: 'e1', name: 'Llama-main', binPath: '/build/main/llama-server', kind: 'llama-server',
+        version: '1.0', capabilities: { kvTypes: [], flags: [] }, addedAt: new Date().toISOString(),
+        sourceRepo: 'https://github.com/ggml-org/llama.cpp', sourceBranch: 'main' },
+      { id: 'e2', name: 'Llama-my-feature', binPath: '/build/my-feature/llama-server', kind: 'llama-server',
+        version: '1.0', capabilities: { kvTypes: [], flags: [] }, addedAt: new Date().toISOString(),
+        sourceRepo: 'https://github.com/ggml-org/llama.cpp', sourceBranch: 'my-feature' },
+    )
+  })
+  const list = reg.list()
+  assert.equal(list.engines.length, 2)
+  // Both names survive — they are distinct engines, not a replace-in-place.
+  const names = list.engines.map((e) => e.name).sort()
+  assert.deepEqual(names, ['Llama-main', 'Llama-my-feature'])
+  // Both sourceBranch values are preserved.
+  const byBranch = Object.fromEntries(list.engines.map((e) => [e.sourceBranch ?? '', e.name]))
+  assert.equal(byBranch['main'], 'Llama-main')
+  assert.equal(byBranch['my-feature'], 'Llama-my-feature')
+})
+
 test('the whole point: Disable (registry.remove) does NOT erase the recorded custom source', () => {
   const { reg, store } = freshRegistry()
   reg.recordCustomSource({ name: 'My Fork', binPath: '/build/my-fork/llama-server', kind: 'llama-server', sourceRepo: 'https://github.com/user/fork', sourceBranch: 'main' })

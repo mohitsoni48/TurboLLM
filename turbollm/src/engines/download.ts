@@ -14,6 +14,19 @@ import type { GpuVendor } from '../sysinfo/sysinfo'
 
 const execFileP = promisify(execFile)
 
+/** Build standard GitHub API headers, injecting a `GITHUB_TOKEN` env var if present
+ *  so authenticated requests get 5,000 req/hour instead of the 60/hour unauthenticated
+ *  limit. Callers spread the result into their fetch() headers object. */
+export function githubHeaders(extra?: Record<string, string>): Record<string, string> {
+  const base: Record<string, string> = {
+    Accept: 'application/vnd.github+json',
+    'User-Agent': 'turbollm',
+  }
+  const token = process.env.GITHUB_TOKEN?.trim()
+  if (token) base['Authorization'] = `Bearer ${token}`
+  return { ...base, ...extra }
+}
+
 /**
  * Remove the com.apple.quarantine extended attribute that macOS sets on any
  * file downloaded from the internet. Without this, Gatekeeper silently blocks
@@ -468,7 +481,7 @@ export interface GithubRelease {
 export async function latestGithubRelease(repo: string, signal?: AbortSignal): Promise<GithubRelease> {
   const apiUrl = `https://api.github.com/repos/${repo}/releases/latest`
   const res = await fetch(apiUrl, {
-    headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'turbollm' },
+    headers: githubHeaders(),
     signal,
   })
   if (!res.ok) throw new Error(`could not query ${repo} releases: HTTP ${res.status}`)
@@ -490,7 +503,7 @@ export async function latestReleaseTag(repo: string, signal?: AbortSignal): Prom
 export async function latestCommitSha(repo: string, branch = '', signal?: AbortSignal): Promise<string> {
   const ref = branch.trim() ? encodeURIComponent(branch.trim()) : 'HEAD'
   const res = await fetch(`https://api.github.com/repos/${repo}/commits/${ref}`, {
-    headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'turbollm' },
+    headers: githubHeaders(),
     signal,
   })
   if (!res.ok) throw new Error(`could not query ${repo} commits: HTTP ${res.status}`)
@@ -517,7 +530,7 @@ export async function turboquantAssetUrl(
 ): Promise<string | null> {
   if (platform === 'win32') return null // no usable self-contained Windows prebuilt
   const res = await fetch(`https://api.github.com/repos/${repo}/releases?per_page=100`, {
-    headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'turbollm' },
+    headers: githubHeaders(),
     signal,
   })
   if (!res.ok) throw new Error(`could not query ${repo} releases: HTTP ${res.status}`)

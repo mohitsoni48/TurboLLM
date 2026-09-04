@@ -79,6 +79,24 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 - Editing a chat message now opens at exactly the size of the message — same width and text, tracking as you type — instead of a small fixed box.
 - Accuracy fixes: routine model swaps that hit a busy ComfyUI now show as *skipped* (not errored); rebuilding a custom engine no longer wipes another fork's build or reverts its name; the code-session context gauge updates after compaction instead of freezing; MoE VRAM estimates honor the offload setting; and the launch command is visible even before the model is loaded.
 
+## [1.12.3] - 2026-09-04
+
+### Added
+
+- **Branch selector dropdown for all build-from-source engines.** Any catalog entry with `hasPrebuilt:false` and no pinned commit/patch now shows a searchable branch dropdown instead of a free-text input. Pick any branch — each build becomes a separate engine (e.g. Llama-main, Llama-my-feature). Forks use `<Engine>-<branch>` naming; official llama.cpp repos use `Llama-<branch>`. Branches are fetched from GitHub in the background on startup, with client-side search and a 'Show more' button for repos with many branches. `solar-open2` (pinned commit + patch) is excluded automatically.
+
+### Changed
+
+- **GitHub API calls now respect `GITHUB_TOKEN` env var.** When set, all GitHub API requests (releases, commits, branches) include an Authorization header, raising the rate limit from 60/hour to 5,000/hour. Without it, unauthenticated requests still work but are subject to the lower limit.
+
+### Fixed
+
+- **Branch selector UI now uses a proper dropdown.** Replaced the free-text input with a `<select>` element, a search bar (shown when the repo has >5 branches), and a 'Show more' button that loads the next 50 branches from GitHub. Rate-limit errors show a clear message with the `GITHUB_TOKEN` hint instead of silently falling back to a single branch.
+
+### Discord
+- Build from source now has branch selection — pick any branch and each becomes its own engine.
+- Added `llama.cpp-source` entry: build `Llama-main` (or any branch) directly from source.
+
 ## [Unreleased]
 
 _Nothing yet._
