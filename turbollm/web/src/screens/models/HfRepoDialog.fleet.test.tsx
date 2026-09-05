@@ -40,6 +40,10 @@ vi.mock('../../lib/queries', () => ({
   useStatus: () => ({ data: { engine: { kind: 'llamacpp' } } }),
   useDownloadMutations: () => ({ enqueue: { mutate: enqueue, isPending: false, error: null } }),
   useModelActions: () => ({ load: { mutate: vi.fn(), isPending: false } }),
+  // Read only for `hfTokenSet`, which decides the gated block. This fixture's repo is
+  // ungated, so the value is irrelevant here — the gate itself is covered by
+  // HfRepoDialog.gated.test.tsx.
+  useSettings: () => ({ query: { data: { hfTokenSet: false } } }),
 }))
 
 vi.mock('../../lib/api', async (importOriginal) => ({
