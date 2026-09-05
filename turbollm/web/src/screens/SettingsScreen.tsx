@@ -307,7 +307,12 @@ export function SettingsScreen() {
       <div className="relative flex flex-col gap-4 md:flex-row md:gap-6">
         {/* Category nav: vertical rail at md+, horizontal scroller on mobile. */}
         <nav className="shrink-0 md:w-44">
-          <div className="flex gap-1 overflow-x-auto pb-1 md:flex-col md:overflow-visible md:pb-0">
+          {/* Wraps below md rather than scrolling: the three pills need ~430px, so on a 360px
+              phone "Tools & safety" was cut to "Tools &" at the screen edge with nothing marking
+              the strip as scrollable — a whole settings category you had to guess was there
+              (QA_UX_REPORT.md F-05). Three short pills wrap onto two lines and are simply all
+              visible; at md+ the rail is a vertical column as before. */}
+          <div className="flex flex-wrap gap-1 pb-1 md:flex-col md:flex-nowrap md:pb-0">
             {SETTINGS_CATS.map(({ id, label, icon: Icon }) => (
               <button
                 key={id}

@@ -503,7 +503,14 @@ export function CodeHomeScreen() {
           onAddContext={() => setContextBrowserOpen(true)}
           contextFiles={contextFiles}
           onRemoveContextFile={(p) => setContextFiles((cf) => cf.filter((x) => x !== p))}
-          hintText="Enter to start · Shift+Enter for newline · 100% local — your code never leaves this machine"
+          /* The full line needs ~440px and the footer truncates what doesn't fit, so on a 360px
+             phone it cut off mid-sentence at "…your code never leaves t" — losing exactly the
+             privacy promise it exists to make (QA_UX_REPORT.md F-03). Better to drop the keybind
+             half on mobile, where there's no physical keyboard to use it anyway, and keep the
+             claim whole. */
+          hintText={isDesktop
+            ? 'Enter to start · Shift+Enter for newline · 100% local — your code never leaves this machine'
+            : '100% local — your code never leaves this device'}
         />
       </div>
     </div>

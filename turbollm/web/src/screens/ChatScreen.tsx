@@ -56,6 +56,18 @@ interface LiveState {
   timeline: LiveBlock[]
 }
 
+/** Fit a model name into the composer placeholder. Measured on-device: the input is 230px at the
+ *  narrowest supported width (360px, minus the attach and send buttons), which holds ~31
+ *  characters at 15px — so 22 for the name once "Message " is accounted for. Past that the name is
+ *  cut and given a real ellipsis, since the browser won't add one to a placeholder itself.
+ *  The font is proportional, so this is a budget rather than a guarantee: it's sized against real
+ *  model names ("qwen2.5-0.5b-instruct" measures 210px of the 230 available), and a hypothetical
+ *  22 characters of capitals would still overrun. Worth revisiting only if names like that appear. */
+const PLACEHOLDER_NAME_MAX = 22
+function truncateName(name: string): string {
+  return name.length > PLACEHOLDER_NAME_MAX ? `${name.slice(0, PLACEHOLDER_NAME_MAX - 1)}…` : name
+}
+
 export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; convIdOverride?: string } = {}) {
   const { data: status } = useStatus()
   const model = status?.model
@@ -1250,13 +1262,16 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                 <textarea
                   ref={inputRef}
                   rows={1}
-                  className="max-h-40 min-h-9 flex-1 resize-none bg-transparent px-2 py-1.5 text-[15px] text-ink outline-none placeholder:overflow-hidden placeholder:whitespace-nowrap placeholder:text-faint"
-                  // Kept short enough to survive a 360px-wide phone: the old
-                  // "Load a model above to start chatting" clipped mid-word to
-                  // "…to start cha", which reads as a rendering bug rather than a hint
-                  // (QA_UX_REPORT.md P2-1). A placeholder can't ellipsize gracefully, so
-                  // the fix is fewer words rather than CSS.
-                  placeholder={ready ? `Message ${remoteChoice?.name ?? model?.name ?? 'the model'}…` : 'Load a model to start chatting'}
+                  className="max-h-40 min-h-9 flex-1 resize-none bg-transparent px-2 py-1.5 text-[15px] text-ink outline-none placeholder:overflow-hidden placeholder:text-ellipsis placeholder:whitespace-nowrap placeholder:text-faint"
+                  // Both halves of this string are shortened in JS rather than left to CSS,
+                  // because a <textarea> placeholder does NOT ellipsize: verified on-device that
+                  // `text-overflow: ellipsis` (the classes above, and the rule IS in the bundle)
+                  // has no effect on ::placeholder in Android's WebView — a long name still chops
+                  // mid-glyph. So: the idle text is short enough to fit 360px outright, and a long
+                  // model name gets a real "…" spliced in at a width that fits. Previously the
+                  // decorative trailing "…" was itself the thing being clipped, leaving what read
+                  // as a stray full stop after the model name (QA_UX_REPORT.md F-03, P2-1).
+                  placeholder={ready ? `Message ${truncateName(remoteChoice?.name ?? model?.name ?? 'the model')}` : 'Load a model to start chatting'}
                   value={input}
                   disabled={!ready || !!live || !!editingId}
                   onChange={(e) => { setInput(e.target.value); autoResize() }}
