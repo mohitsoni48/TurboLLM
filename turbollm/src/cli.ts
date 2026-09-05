@@ -19,7 +19,7 @@ import { sweepInteractiveCliRuns, type CliInteractiveSweepDeps } from './routine
 import { getTerminalManager } from './terminal/terminal-routes'
 import { AppUpdateChecker } from './app-update'
 import { applyEngineUpdate } from './engines/update-apply'
-import { seedDefaultEngines } from './engines/seed'
+import { seedDefaultEngines, ensureAndroidBundledEngine } from './engines/seed'
 import { engineAcceptsFormat } from './engines/compat'
 import { Scanner } from './models/scanner'
 import { seedDefaultModelDir } from './models/hf-cache'
@@ -333,7 +333,13 @@ const build = new BuildState()
 // Honest update checker (ADR-085): per-engine installed/latest/hasUpdate, in-memory cached.
 const updates = new UpdateChecker()
 const enginesDir = join(store.dir(), 'engines')
-void seedDefaultEngines(registry, enginesDir, provision).then(() => registry.ensureProbed())
+// Android's own bundled-engine bootstrap (BUG-01, QA_BUGS.md) — a no-op everywhere else —
+// runs first: it must land before seedDefaultEngines' "any engine already configured?"
+// gate so a repaired/first-registered Android engine correctly short-circuits the
+// network-download seed path instead of racing it.
+void ensureAndroidBundledEngine(registry)
+  .then(() => seedDefaultEngines(registry, enginesDir, provision))
+  .then(() => registry.ensureProbed())
 const manager = new Manager(store)
 const scanner = new Scanner(store)
 // First-run seed (ADR-092): if no model dirs are configured and the HF hub cache

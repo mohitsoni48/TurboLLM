@@ -114,7 +114,7 @@ describe('index.css scroll lock', () => {
     // The invariants, not the block's exact shape: both inset vars are 0 by default, and
     // mobile-nav gains its 3.5rem only inside the md-max media query under document-scrolling.
     expect(CSS).toMatch(/:root\s*\{[^}]*--tllm-mobile-nav-h: 0px;[^}]*\}/)
-    expect(CSS).toMatch(/@media \(max-width: 767px\)[\s\S]*?html\.tllm-doc-scroll\s*\{[^}]*--tllm-mobile-nav-h: 3\.5rem;/)
+    expect(CSS).toMatch(/@media \(max-width: 767px\)[\s\S]*?html\.tllm-doc-scroll\s*\{[^}]*--tllm-mobile-nav-h: calc\(3\.5rem \+ env\(safe-area-inset-bottom\)\);/)
     // ADR-383: the hardware bar's own height defaults to 0 and is non-zero ONLY in the same
     // single case (mobile + document-scrolling + bar on) - asserted here so a future edit
     // cannot make the Settings save-bar overlap the bar.

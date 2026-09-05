@@ -87,8 +87,14 @@ export function Shell({
     <div className={cn('app-shell flex', documentScroll ? 'min-h-dvh' : 'h-full')}>
       {!onOnboarding && <NavRail status={status} online={online} version={version} className="hidden md:flex" />}
       <div className="flex min-w-0 flex-1 flex-col">
-        {/* QA_BUGS.md BUG-07: the error banner inherits the top-safe-area problem (BUG-03).
-            Pad it so it sits below the status bar on Android. */}
+        {/* QA_BUGS.md BUG-03/BUG-07: on a phone this column is the topmost content under the
+            status bar (NavRail is `hidden md:flex` below md, and even at md+ it doesn't cover
+            this column). Android's WebView resolves `env(safe-area-inset-*)` to 0px on many
+            builds, so the native side injects the real inset as the `--tllm-safe-top` CSS
+            custom property instead (see DaemonWebViewScreen's injectSafeAreaInsets) — this
+            padding is a no-op everywhere the variable isn't set (desktop, non-Android). One
+            padding here, on the shared ancestor of every banner and screen header, beats
+            chasing the inset onto each header/banner separately as new ones get added. */}
         <div style={{ paddingTop: 'var(--tllm-safe-top)' }}>
           <EngineProvisionBanner status={status} />
           <EngineLoadErrorBanner status={status} />
@@ -333,6 +339,12 @@ function MobileNav() {
     // has no scrolling ancestor and the bar is already the last row of a 100vh flex column.
     // `h-14` pins the height that index.css's `--tllm-mobile-nav-h` is written against (it was
     // already 56px from its content; now it says so) — keep the two in step.
+    // QA_BUGS.md BUG-04: the gesture-navigation pill sits UNDER the bar's own icon row on a
+    // phone with no 3-button nav bar reserving that space. `--tllm-safe-bottom` (native-injected,
+    // see the Shell wrapper's paddingTop comment above) adds that space back as extra room below
+    // the (still `h-14`, still vertically-centered) icon row rather than stealing from it, so the
+    // pill lands in blank space instead of slicing through "Customize"/"Usage"'s labels. Elsewhere
+    // (desktop, a phone with 3-button nav, or where the variable isn't set) this is a no-op.
     <nav className="sticky bottom-0 z-30 flex h-14 shrink-0 border-t border-border bg-panel-2 md:hidden" style={{ paddingBottom: 'var(--tllm-safe-bottom)'}}>
       {NAV.map(({ to, label, icon: Icon }) => {
         const isActive = pathname === to || pathname.startsWith(`${to}/`)

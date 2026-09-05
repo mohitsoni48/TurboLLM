@@ -593,7 +593,13 @@ export function ConversationSidebar({
           kept in sync via the route (`mode` above). Lets the user flip modes from the sidebar
           itself, not just the main content header. This replaced the old single-purpose
           "Code · preview" footer link. */}
-      <div className="px-3 pt-3">
+      {/* QA_BUGS.md BUG-06: on mobile this sidebar renders as a `position: fixed` full-height
+          drawer (ChatScreen.tsx), not inside Shell's own column — Shell's top-inset padding
+          (Shell.tsx) never reaches a fixed-position element, so this pill needs the same
+          `env(safe-area-inset-top)` applied directly here, or the status bar clock renders
+          through it. 0 on desktop (this sidebar sits in normal flow there, beside content that
+          already starts below any inset) and 0 on any browser with no inset to report. */}
+      <div className="px-3 pt-[calc(0.75rem+env(safe-area-inset-top))]">
         <div className="flex overflow-hidden rounded-lg border border-border" role="group" aria-label="Workspace mode">
           {modeTabs.map(({ mode: m, href, label, icon: Icon }) =>
             mode === m ? (

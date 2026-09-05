@@ -177,7 +177,11 @@ html:not(.tllm-doc-scroll) #root {
 }
 @media (max-width: 767px) {
   html.tllm-doc-scroll {
-    --tllm-mobile-nav-h: 3.5rem;
+    /* QA_BUGS.md BUG-04: MobileNav's own box grew by env(safe-area-inset-bottom) (Shell.tsx)
+       so the gesture-nav pill lands below its icons instead of through "Customize"/"Usage" —
+       this offset has to grow by the same amount or HardwareBar/the Settings save bar sink
+       into that new padding instead of sitting flush above it. */
+    --tllm-mobile-nav-h: calc(3.5rem + env(safe-area-inset-bottom));
   }
   html.tllm-doc-scroll.tllm-hw-bar {
     --tllm-hw-bar-h: 1.5rem;

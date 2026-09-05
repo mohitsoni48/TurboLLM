@@ -111,7 +111,14 @@ export function EngineLoadErrorBanner({ status }: { status: Status | undefined }
           {status.engine.launchCommand}
         </pre>
       )}
-      {error.logTail && error.logTail.length > 0 && (
+      {/* QA_BUGS.md BUG-12: an ENOENT-style spawn failure never gets a chance to write
+          anything to stderr, so `logTail` comes back as `['']` — one empty line, not
+          "no lines". `.length > 0` alone rendered that as an unlabeled, contentless dark
+          box; requiring at least one NON-blank line matches what a human would call
+          "there is log output" and falls through to the "Copy log"/dismiss-only banner
+          (still fully informative — the error message above already has the real
+          reason) instead of an empty placeholder. */}
+      {error.logTail && error.logTail.some((line) => line.trim().length > 0) && (
         <pre
           className="mt-1.5 max-h-32 overflow-auto rounded-md px-3 py-2 font-mono text-[12px] leading-[1.5]"
           style={{ background: 'var(--log-bg)', color: 'var(--log-err-ink)' }}
