@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { Link } from 'react-router-dom'
 import type { LucideIcon } from 'lucide-react'
 import {
   Boxes,
@@ -1109,14 +1110,17 @@ function EngineCard({
   // ['main'] on failure. Search below filters this list client-side.
   const branchesQ = useGitBranches(catalog?.homepage, buildYourself)
   const [searchQuery, setSearchQuery] = useState('')
-  const allBranches = branchesQ.data?.branches ?? ['main']
+  // Fallback list when the lookup fails (offline, rate-limited): the entry's OWN default branch,
+  // not a hardcoded 'main'. `selectedBranch` already initialises from catalog.defaultBranch, so a
+  // hardcoded ['main'] left the selected value absent from the option list — the <select> then
+  // rendered as 'main' for every engine, including the ones whose default is master/concedo/prism.
+  const fallbackBranch = catalog?.defaultBranch ?? 'main'
+  const allBranches = branchesQ.data?.branches ?? [fallbackBranch]
   const totalBranches = branchesQ.data?.total ?? allBranches.length
   const branchError = branchesQ.error
-  const isRateLimited =
-    branchError != null &&
-    typeof branchError === 'object' &&
-    'status' in branchError &&
-    (branchError as { status?: number }).status === 403
+  // Keyed off the daemon's error CODE, not a bare 403: a 403 is also a plain permission failure,
+  // and the rate-limit case is the only one where "add a GitHub token" is the right advice.
+  const isRateLimited = branchError instanceof ApiError && branchError.code === 'github_rate_limited'
   const filtered = useMemo(
     () =>
       searchQuery
@@ -1229,8 +1233,10 @@ function EngineCard({
           {/* Error state — GitHub rate limit or network failure */}
           {isRateLimited && (
             <p className="pl-9 text-[11px] text-warning">
-              GitHub API rate-limited (60 req/hour). Add a GitHub token in Settings → GitHub to
-              raise the limit to 5,000 req/hour for branch lookups.
+              {branchError instanceof ApiError ? branchError.message : ''}{' '}
+              <Link to="/settings" className="underline underline-offset-2">
+                Open Settings → GitHub
+              </Link>
             </p>
           )}
           {/* Search filter + load more — shown only when there are many branches */}

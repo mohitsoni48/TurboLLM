@@ -616,14 +616,32 @@ export function registerApi(app: Hono, d: Deps): void {
     if (!raw) return err(c, 400, 'invalid_input', 'repo is required.')
     const repo = normRepoUrl(raw)
     if (!repo) return err(c, 400, 'invalid_input', 'repo must be a valid GitHub repo identifier.')
+    // Exhausted-rate-limit marker. GitHub answers 403 (classic) or 429 (secondary limit) with
+    // `x-ratelimit-remaining: 0`; that is NOT a generic outage, so it must reach the UI as its
+    // own code rather than collapsing into `offline` — the Engines card keys the "add a GitHub
+    // token" hint off it. A 403 WITHOUT that header is a real permission error (private repo,
+    // bad token) and stays generic, otherwise we would tell the user to fix a token that is
+    // already fine.
+    const rateLimited = (res: Response) =>
+      (res.status === 403 || res.status === 429) && res.headers.get('x-ratelimit-remaining') === '0'
+    const tokenSet = (d.store.snapshot().gh?.token ?? '').length > 0
     try {
       const names: string[] = []
       // GitHub caps per_page at 100; walk pages until one comes back short (the last page) or
       // a generous cap is hit (protects against an unbounded loop against a huge/malicious repo).
       for (let page = 1; page <= 20; page++) {
         const res = await fetch(`https://api.github.com/repos/${repo}/branches?per_page=100&page=${page}`, {
-          headers: githubHeaders({}, () => d.store.snapshot().gh.token),
+          headers: githubHeaders({}, () => d.store.snapshot().gh?.token ?? ''),
         })
+        if (rateLimited(res))
+          return err(
+            c,
+            403,
+            'github_rate_limited',
+            tokenSet
+              ? 'The configured GitHub token has exhausted its API rate limit (5,000 requests/hour). Branch lookups will work again after the limit resets.'
+              : 'GitHub’s unauthenticated API rate limit (60 requests/hour) is exhausted. Add a GitHub token in Settings to raise it to 5,000 requests/hour.',
+          )
         if (!res.ok) throw new Error(`GitHub API returned HTTP ${res.status}`)
         const data = (await res.json()) as { name: string }[]
         names.push(...data.map((b) => b.name))
@@ -633,7 +651,7 @@ export function registerApi(app: Hono, d: Deps): void {
       let defaultBranch = ''
       try {
         const info = await fetch(`https://api.github.com/repos/${repo}`, {
-          headers: githubHeaders({}, () => d.store.snapshot().gh.token),
+          headers: githubHeaders({}, () => d.store.snapshot().gh?.token ?? ''),
         })
         if (info.ok) {
           const j = await info.json() as { default_branch?: string }
@@ -1852,7 +1870,7 @@ export function registerApi(app: Hono, d: Deps): void {
       if (b.hfToken !== undefined) cfg.hf.token = String(b.hfToken).trim()
       // GitHub token (write-only, same semantics as HF): an explicit '' clears it.
       // Used to raise the rate limit from 60 → 5,000 req/hour for GitHub API calls.
-      if (b.ghToken !== undefined) cfg.gh.token = String(b.ghToken).trim()
+      if (b.ghToken !== undefined) (cfg.gh ??= { token: '' }).token = String(b.ghToken).trim()
       // Search provider config (F-020). All key/URL fields are write-only; '' clears them.
       // `search` is the canonical block; legacy top-level `tavilyApiKey` still works as an alias.
       cfg.tools.search ??= { provider: 'tavily' }
@@ -2412,7 +2430,7 @@ function settingsPayload(d: Deps) {
     // only whether one is set, so the UI can show "configured" without leaking it.
     hfTokenSet: cfg.hf.token.length > 0,
     // GitHub token is write-only: expose only whether it is set.
-    ghTokenSet: cfg.gh.token.length > 0,
+    ghTokenSet: (cfg.gh?.token ?? '').length > 0,
     // Tavily API key is write-only: expose only whether it is set (legacy field, kept for compat).
     tavilyKeySet: !!(cfg.tools.search?.tavilyApiKey ?? cfg.tools.tavily?.apiKey),
     // Search provider config (F-020): provider + which credentials are set. Keys are write-only
