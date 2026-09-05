@@ -2,8 +2,9 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Check, Compass, Download, ExternalLink, HardDrive, Loader2, Sparkles } from 'lucide-react'
 import { useOnboardingRecommendation } from '../../../lib/onboarding-queries'
-import { useDownloadMutations, useModels } from '../../../lib/queries'
+import { useDownloadMutations, useModels, useSysInfo } from '../../../lib/queries'
 import { loadModel, track } from '../../../lib/api'
+import { pickOnboardingModel } from '../../../lib/onboarding-pick'
 import { useOnboardingMachine } from '../../../lib/onboarding/useOnboardingMachine'
 import type { StepComponentProps } from '../OnboardingScreen'
 
@@ -18,6 +19,7 @@ export default function ModelStep({ onContinue, ctx }: StepComponentProps) {
   const navigate = useNavigate()
   const { patchCtx } = useOnboardingMachine()
   const recommendationQuery = useOnboardingRecommendation(ctx.profile)
+  const sysQuery = useSysInfo()
   const modelsQuery = useModels()
   const downloadMutations = useDownloadMutations()
   const [starting, setStarting] = useState(false)
@@ -61,7 +63,15 @@ export default function ModelStep({ onContinue, ctx }: StepComponentProps) {
   // offered alongside [Discover], so a Pro with a full model folder is never pushed into a
   // download" — found live by adversarial QA as a real, structural violation of that line,
   // not deferred scope.
-  if (!isPro && (recommendationQuery.isLoading || !ctx.profile)) {
+  //
+  // Sysinfo is waited on alongside the recommendation — the pick is screened against it
+  // (see `pickOnboardingModel`), so rendering before it lands would show the daemon's
+  // entry and then silently swap it for a smaller one a frame later, on exactly the
+  // low-memory devices where the swap matters most. The spinner already says "checking
+  // your hardware", which is now literally what it is doing. It never blocks for long:
+  // that query is `staleTime: Infinity, retry: false`, so a failure resolves rather than
+  // hanging, and a null sysinfo just means "trust the daemon" downstream.
+  if (!isPro && (recommendationQuery.isLoading || sysQuery.isLoading || !ctx.profile)) {
     return (
       <div className="flex items-center justify-center gap-2 text-muted py-8">
         <Loader2 size={20} className="animate-spin" />
@@ -73,8 +83,27 @@ export default function ModelStep({ onContinue, ctx }: StepComponentProps) {
   const rec = recommendationQuery.data?.recommendation
   const entry = rec?.kind === 'entry' ? rec.entry : null
 
+  // The daemon picks by VRAM band; this screens that pick against what THIS device can
+  // actually hold and degrades to a smaller real model instead of a 4 GB download that
+  // OOMs — see onboarding-pick.ts's header for the phone case that motivates it. `entry`
+  // is passed through untouched whenever it fits, which is every desktop with a card.
+  const pick = pickOnboardingModel(entry, sysQuery.data ?? null)
+  const picked = pick.kind === 'pick' ? pick : null
+  const sys = sysQuery.data
+
+  // Only ever a claim we can back with detected hardware: no sysinfo → no fit line at all,
+  // rather than a reassuring sentence about a machine we never measured (ADR-012's "always
+  // labeled an estimate" applies doubly to a number shown before first run).
+  const fitLine = !picked || !picked.budgetMb
+    ? null
+    : picked.source === 'small-device'
+      ? `Sized for this device — about ${(picked.budgetMb / 1024).toFixed(1)} GB is free for a model here, so this is the largest good one that will actually load.`
+      : sys?.gpus.length
+        ? `Fits your ${sys.gpus[0].name}.`
+        : `Fits in your ${Math.round((sys?.ramMB ?? 0) / 1024)} GB of RAM.`
+
   const startDownload = async () => {
-    if (!entry) return
+    if (!picked) return
     track('onboarding', 'start_model_download')
     setStarting(true)
     setError(null)
@@ -89,14 +118,14 @@ export default function ModelStep({ onContinue, ctx }: StepComponentProps) {
       // query cache, so LoadStep can mount on the very next render still seeing the
       // pre-download empty list. `useDownloadMutations().enqueue`'s `onSuccess: invalidate`
       // refreshes downloads/models/status immediately, closing that window.
-      const { downloads } = await downloadMutations.enqueue.mutateAsync({ repo: entry.repo, rfilename: entry.file, excludeMmproj: true })
+      const { downloads } = await downloadMutations.enqueue.mutateAsync({ repo: picked.repo, rfilename: picked.file, excludeMmproj: true })
       // Stamp the specific download record LoadStep should wait for — its eventual model
       // key isn't known yet (the file doesn't exist to scan), unlike `expectedModelKey`
       // below, so this is a download ID instead. Without it, LoadStep's fallback ("the
       // most recent finished download in the whole history") can match an older, unrelated,
       // already-loaded model while THIS download is still in flight — found live driving a
       // real, non-instant download against real HuggingFace.
-      const primary = downloads.find((d) => d.name === entry.file) ?? downloads[0]
+      const primary = downloads.find((d) => d.name === picked.file) ?? downloads[0]
       if (primary) patchCtx({ expectedDownloadId: primary.id })
       onContinue()
     } catch (e) {
@@ -141,17 +170,24 @@ export default function ModelStep({ onContinue, ctx }: StepComponentProps) {
             </p>
           </div>
         </button>
-      ) : entry ? (
-        <div className="bg-panel-2 border border-border rounded-xl p-5 space-y-4">
+      ) : picked ? (
+        <div className="bg-panel-2 border border-accent/40 rounded-xl p-5 space-y-4">
           <div className="flex items-start gap-4">
             <div className="flex-shrink-0 p-3 rounded-lg bg-accent/10">
               <HardDrive size={24} className="text-accent" />
             </div>
-            <div className="flex-1">
-              <span className="text-sm font-semibold text-ink">{entry.repo}</span>
-              <p className="text-xs text-muted mt-0.5">
-                {entry.file} · {(entry.bytes / GB).toFixed(1)} GB
+            <div className="flex-1 min-w-0">
+              {/* The model NAME leads, not the repo id. The card used to open with
+                  "unsloth/gemma-4-12b-it-GGUF" in the same weight as the filename under it,
+                  which reads as one row of an undifferentiated list rather than as a
+                  recommendation — founder-reported. Owner + exact file stay one line down,
+                  because they are what makes the pick checkable against Hugging Face. */}
+              <p className="text-[11px] uppercase tracking-wide text-accent font-medium">Recommended for you</p>
+              <span className="block text-base font-semibold text-ink mt-0.5 break-words">{picked.name}</span>
+              <p className="text-xs text-muted mt-0.5 break-all">
+                {picked.repo} · {picked.file} · {(picked.bytes / GB).toFixed(1)} GB
               </p>
+              {fitLine && <p className="text-xs text-muted mt-2">{fitLine}</p>}
             </div>
           </div>
 

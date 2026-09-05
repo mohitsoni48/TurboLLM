@@ -25,6 +25,7 @@ import { ModelDirs } from './models/ModelDirs'
 import { ToolPermissionsSection } from './settings/ToolPermissionsSection'
 import { CodeContextSection } from './settings/CodeContextSection'
 import { CodeAgentSection } from './settings/CodeAgentSection'
+import { useCodeFeatureEnabled } from '../lib/platform'
 import { MemorySection } from './settings/MemorySection'
 import { ExperimentalSection } from './settings/ExperimentalSection'
 import { TurboLinkSection } from './settings/TurboLinkSection'
@@ -182,6 +183,9 @@ export function SettingsScreen() {
 
   // Active category for the two-pane settings layout.
   const [activeCat, setActiveCat] = useState<CatId>('general')
+
+  // Whether the Code-only sections under "Tools & safety" render at all — see the gate there.
+  const codeEnabled = useCodeFeatureEnabled()
 
   useEffect(() => {
     if (settings) {
@@ -645,11 +649,21 @@ export function SettingsScreen() {
               {/* Tool permissions — moved here from Developer. */}
               <ToolPermissionsSection />
 
-              {/* Code's AGENTS.md-style standing-context candidate lists. */}
-              <CodeContextSection />
+              {/* Both of these exist only to serve Code, which is cut from the Android release
+                  (platform.ts) — so they go with it rather than sitting here configuring a
+                  feature with no way to reach it. `=== true` (not truthy) keeps them out of the
+                  window where sysinfo hasn't answered: appearing a beat late on desktop beats
+                  flashing them onto the Android app. "Tool permissions" above stays on every
+                  platform — it governs the chat/agent tool gate, not Code. */}
+              {codeEnabled === true && (
+                <>
+                  {/* Code's AGENTS.md-style standing-context candidate lists. */}
+                  <CodeContextSection />
 
-              {/* Which coding agent new Code sessions launch with. */}
-              <CodeAgentSection />
+                  {/* Which coding agent new Code sessions launch with. */}
+                  <CodeAgentSection />
+                </>
+              )}
             </>
           )}
 

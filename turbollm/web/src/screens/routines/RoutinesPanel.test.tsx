@@ -18,9 +18,17 @@ vi.mock('../../lib/routine-queries', async (importOriginal) => {
 // filters the "Routines" mode tab out entirely unless `daemon.experimental.routines` is on. Every
 // test in this file is exercising the (now-enabled) Routines mode itself, not the gate, so it
 // needs the flag reporting enabled by default.
+// `useSysInfo` is mocked for the same shape of reason: the Chat|Code switcher now omits the Code
+// tab on Android (lib/platform.ts), and it stays omitted until sysinfo positively says otherwise —
+// so an unmocked query, which never resolves under test, would read as "not confirmed yet" and
+// drop the tab this file's mode-switch assertion is about. Report a desktop platform.
 vi.mock('../../lib/queries', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../lib/queries')>()
-  return { ...actual, useSettings: () => ({ query: { data: { experimental: { routines: true } } } }) }
+  return {
+    ...actual,
+    useSettings: () => ({ query: { data: { experimental: { routines: true } } } }),
+    useSysInfo: () => ({ data: { os: 'linux/x64' }, isError: false }),
+  }
 })
 
 /** Reads the router's real location, so a navigation assertion checks where the app actually

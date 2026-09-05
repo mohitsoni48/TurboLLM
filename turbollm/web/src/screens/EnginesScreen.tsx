@@ -434,6 +434,9 @@ export function EnginesScreen() {
   const backendsQ = useEngineBackends(provisioning)
   const logPanelOpen = useUiStore((s) => s.logPanelOpen)
   const setLogPanelOpen = useUiStore((s) => s.setLogPanelOpen)
+  // Only read here to decide whether the install gallery is meaningful on this host — see the
+  // Zone 2 comment below. Cached with staleTime: Infinity, so this is not a second fetch.
+  const { data: sys } = useSysInfo()
   // Soft read: `/api/v1/links` is host-gated, so a browser off-box 403s here. `retry: false`
   // plus `?? []` turns that — and a daemon too old to know the route — into "no links"
   // rather than an error banner on a screen that is mostly about local engines.
@@ -459,13 +462,23 @@ export function EnginesScreen() {
           activeEngine={activeEngine}
         />
 
-        {/* Zone 2 — engine gallery */}
+        {/* Zone 2 — engine gallery.
+            Skipped entirely in the packaged Android app (`bundledEnginesOnly`): every control it
+            owns — install, update, build-from-source, add-your-own — depends on running a binary
+            the app itself put on disk, which Android's W^X hardening forbids outright. The whole
+            gallery was therefore a wall of cards whose every button was a dead end, on the
+            smallest screen we ship. Zone 1 above still lists and switches the engines that ARE
+            present, which on that platform is the entire job of this screen. This is deliberately
+            keyed off the daemon's own flag rather than `os === 'android'`, because Termux is also
+            android and there every one of these paths genuinely works. */}
         {enginesQ.isError ? (
           <InlineError
             message={enginesQ.error instanceof ApiError ? enginesQ.error.message : 'Could not load engines.'}
             onRetry={() => void enginesQ.refetch()}
             screen="engines"
           />
+        ) : sys?.bundledEnginesOnly ? (
+          <BundledEnginesNote />
         ) : (
           <EngineGallery
             rec={recQ.data}
@@ -1660,6 +1673,23 @@ function CatalogUpdateStatusLine({ st, repoUrl }: { st: EngineUpdateStatus | und
       Up to date · {st.latest ?? st.installed}
       {st.checkedAt ? ` · checked ${relativeTime(st.checkedAt)}` : ''}
     </span>
+  )
+}
+
+/** What stands in for the install gallery in the packaged Android app. Deliberately a plain
+ *  sentence rather than a card with a disabled button: the point is that there is nothing to do
+ *  here, and a greyed-out "Install" would only invite tapping (ADR-239 — no placeholder entries
+ *  that cannot act). It says where the engines came from so the screen doesn't read as broken. */
+function BundledEnginesNote() {
+  return (
+    <section className="flex flex-col gap-2">
+      <SectionLabel>Engines</SectionLabel>
+      <p className="rounded-xl border border-border bg-panel px-4 py-3 text-[13px] text-muted">
+        The engines below ship inside the app and are ready to use — pick one above. Android only
+        lets an app run code that was installed with it, so engines can&apos;t be downloaded or
+        built here the way they can on a computer.
+      </p>
+    </section>
   )
 }
 

@@ -35,6 +35,87 @@ export function primaryVendorSummary(gpus: VendorGpu[]): { gpuName: string | nul
   return { gpuName: headline?.name ?? null, vramMb, count: pool.length }
 }
 
+// ── "Will this repo run on THIS machine?" (Discover's fits-my-hardware filter) ──
+// Anticipated by ADR-338 Decision 6b, which sends the Pro onboarding branch into
+// DiscoverTab "seeded with a fits-your-hardware filter".
+//
+// This is a much coarser question than `estimateVram` above, and deliberately so: a
+// Discover row is an HF *repo*, and `HfSearchItem` carries no file sizes at all (only
+// repo/tags/downloads — see src/hf/hf.ts's search mapping). Pulling `getRepo` for every
+// row to get real sizes would be one HF round-trip per result on every keystroke's
+// worth of results. So the size comes from the parameter count that GGUF repo names
+// almost always spell out, and every constant below errs toward "too big" — a filter
+// that wrongly hides a runnable model is worse than one that lets a marginal one through.
+
+/** Bytes per parameter at ~Q4_K_M, measured across the usual suspects (Llama-3.1-8B
+ *  4.92 GB, Qwen2.5-3B 1.93 GB, Llama-3.2-1B 0.81 GB → 0.61–0.65). */
+const Q4_MB_PER_B_PARAMS = 620
+/** Engine + a modest KV window on top of the weights. Deliberately below `estimateVram`'s
+ *  flat 800 MB: that number budgets a full desktop context the user has actually chosen,
+ *  whereas this only asks whether the repo could ever load here — charging 800 MB against
+ *  a phone's ~1.3 GB budget would hide every model that genuinely runs on it. */
+const FIT_OVERHEAD_MB = 400
+
+export type FitHardware = { os: string; ramMB: number; gpus: SysGpu[] }
+
+/** How much model this machine can actually hold, in MB. 0 when it can't be known
+ *  (no sysinfo yet) — callers must hide the filter rather than filter against 0.
+ *
+ *  GPU boxes get **VRAM + usable system RAM**, not VRAM alone, because partial/MoE
+ *  offload is a headline feature here, not an edge case: ADR-338 Decision 6 ships a
+ *  35B-A3B coder pick to ≤16 GB cards precisely because experts spill to system RAM via
+ *  `nCpuMoe` ("the larger model goes to the smaller card"). A VRAM-only budget would hide
+ *  the model TurboLLM itself recommends — the same trap ADR-084 called out when it
+ *  rejected VRAM-gating the engine catalog for "risks wrongly hiding runnable" entries. */
+export function fitBudgetMb(sys: FitHardware): number {
+  if (!sys.ramMB) return 0
+  // Android has no discrete VRAM pool — it's one unified CPU memory space, and the OS,
+  // the WebView and the app itself stay resident in it. The low-memory killer also reaps
+  // the app well before RAM is literally exhausted, so the reserve is both proportional
+  // (40%) and absolute (1 GB): on the ~3.8 GB test device that leaves ~1.3 GB, which is
+  // about what a phone will really give a llama.cpp mmap.
+  if (sys.os.startsWith('android')) return Math.max(0, Math.round(sys.ramMB * 0.6) - 1024)
+  // Desktop: a flat 2 GB for the OS plus 30% slack, since spilling into swap is a hang,
+  // not a slowdown.
+  return gpuBudgetMb(sys.gpus) + Math.max(0, Math.round(sys.ramMB * 0.7) - 2048)
+}
+
+/** Parameter count in billions, read off an HF repo id ("Qwen3-30B-A3B-GGUF" → 30),
+ *  or null when the name doesn't say. Rules, all learned from real repo names:
+ *  - Takes the **max** of every size token, not the first: `Qwen3-30B-A3B` puts total
+ *    first while `OLMoE-1B-7B` puts active first, and total is what has to fit in memory.
+ *  - Skips `A`-prefixed tokens outright (`A3B` = active params, never resident-only).
+ *  - `8x7B` multiplies (→ 56, vs Mixtral's real ~47B: over, which is the safe side).
+ *  - `M` counts as millions, so `gemma-3-270m-it` is 0.27 and doesn't read as 270. */
+export function repoParamsB(repo: string): number | null {
+  const tokens: number[] = []
+  // The leading `[^a-z0-9]` is what rejects `a3b` and `q8_0`: a size token must start at a
+  // separator, never mid-word.
+  const re = /(?:^|[^a-z0-9])(?:(\d+(?:\.\d+)?)x)?(\d+(?:\.\d+)?)([bm])(?![a-z0-9])/gi
+  for (const m of repo.toLowerCase().matchAll(re)) {
+    const n = parseFloat(m[2]) * (m[1] ? parseFloat(m[1]) : 1)
+    tokens.push(m[3] === 'm' ? n / 1000 : n)
+  }
+  return tokens.length ? Math.max(...tokens) : null
+}
+
+/** Repo-level fit verdict against `fitBudgetMb`.
+ *
+ *  "Fits" means **at least one variant we'd actually recommend fits** — sized at Q4_K_M,
+ *  the bottom of the quality ladder rather than the bottom of the size ladder. A GGUF repo
+ *  is a ladder of quants, so judging it by its default/largest file would hide repos whose
+ *  smaller rungs run fine; judging it by its literal smallest (IQ1/Q2) would promise a
+ *  model that technically loads and answers gibberish. Q4 is the honest middle.
+ *
+ *  'unknown' when the name carries no parameter count. Those stay VISIBLE at the call
+ *  site: not knowing a model's size is not evidence that it's too big, and silently
+ *  dropping search results the filter can't judge is the failure mode to avoid. */
+export function repoFitVerdict(repo: string, budgetMb: number): 'fits' | 'too-big' | 'unknown' {
+  const paramsB = repoParamsB(repo)
+  if (paramsB === null || !budgetMb) return 'unknown'
+  return paramsB * Q4_MB_PER_B_PARAMS + FIT_OVERHEAD_MB <= budgetMb ? 'fits' : 'too-big'
+}
+
 function kvBytesPerElem(t: string): number {
   switch (t) {
     case 'f16': return 2

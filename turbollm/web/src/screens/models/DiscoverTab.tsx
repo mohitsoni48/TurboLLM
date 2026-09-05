@@ -10,8 +10,9 @@
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject } from 'react'
 import { Link2, Lock, Search } from 'lucide-react'
 import { ApiError, track } from '../../lib/api'
-import { useHfSearch } from '../../lib/queries'
+import { useHfSearch, useSysInfo } from '../../lib/queries'
 import type { HfSearchItem, HfSortOption } from '../../lib/types'
+import { fitBudgetMb, repoFitVerdict } from '../../lib/vram'
 import { EmptyState, InlineError } from '../../components/common'
 import { Input } from '../../components/ui/input'
 import { Sheet, SheetContent } from '../../components/ui/sheet'
@@ -86,10 +87,29 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
 
   const searchQ = useHfSearch(debounced, effectiveSort)
   const unreachable = searchQ.error instanceof ApiError && searchQ.error.code === 'hf_unreachable'
-  const results = searchQ.data?.results ?? []
+  const allResults = searchQ.data?.results ?? []
   const sortOptions: HfSortOption[] = searching
     ? ['best-match', 'trending', 'downloads', 'likes', 'modified', 'created']
     : ['trending', 'downloads', 'likes', 'modified', 'created']
+
+  // Fits-my-hardware filter (anticipated by ADR-338 Decision 6b's "Discover seeded with a
+  // fits-your-hardware filter"). Default ON only on the Android app: a phone genuinely
+  // cannot run most of what HF's trending page returns, so an unfiltered list there is
+  // mostly a list of downloads that will fail. On desktop it defaults OFF — downloading a
+  // model for later, for a second machine, or to sit behind a Turbo Link is normal, and
+  // pre-hiding results the user asked HF for would be presumptuous.
+  //
+  // `null` = untouched, so the platform default applies until the user overrides it; once
+  // they do, their choice sticks for the session rather than being re-derived per render.
+  const sys = useSysInfo().data
+  const budgetMb = sys ? fitBudgetMb(sys) : 0
+  const [fitsOnlyOverride, setFitsOnlyOverride] = useState<boolean | null>(null)
+  // No budget = no honest verdict (sysinfo still loading, or it failed — that query never
+  // retries). Hide the control entirely rather than show a checkbox that filters nothing.
+  const canFilterByFit = budgetMb > 0
+  const fitsOnly = canFilterByFit && (fitsOnlyOverride ?? !!sys?.os.startsWith('android'))
+  const results = fitsOnly ? allResults.filter((r) => repoFitVerdict(r.repo, budgetMb) !== 'too-big') : allResults
+  const hiddenByFit = allResults.length - results.length
 
   return (
     <div className="flex flex-col md:h-full md:min-h-0">
@@ -123,15 +143,35 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
             </button>
           </div>
 
-          <select
-            value={effectiveSort}
-            onChange={(e) => setSort(e.target.value as HfSortOption)}
-            className="self-end rounded-md border border-border bg-bg px-2 py-1 text-[12px] text-ink outline-none"
-          >
-            {sortOptions.map((s) => (
-              <option key={s} value={s}>{SORT_LABEL[s]}</option>
-            ))}
-          </select>
+          {/* flex-wrap, not overflow-x-auto: at the Android WebView's 360px viewport the
+              filter and the sort dropdown stack instead of hiding one behind a scrollbar
+              nobody discovers — the same "hidden scroll is undiscoverable" finding that made
+              ADR-074 keep the config dialog's scrollbar visible. */}
+          <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1.5">
+            {canFilterByFit && (
+              <label className="flex cursor-pointer items-center gap-1.5 text-[12px] text-muted">
+                <input
+                  type="checkbox"
+                  checked={fitsOnly}
+                  onChange={(e) => setFitsOnlyOverride(e.target.checked)}
+                  className="h-3.5 w-3.5 accent-[var(--accent)]"
+                />
+                Fits my hardware
+                {/* The count is what keeps the filter honest: a short list on a phone
+                    otherwise reads as "HF returned almost nothing", not "we hid 18". */}
+                {fitsOnly && hiddenByFit > 0 && <span className="text-faint">· {hiddenByFit} hidden</span>}
+              </label>
+            )}
+            <select
+              value={effectiveSort}
+              onChange={(e) => setSort(e.target.value as HfSortOption)}
+              className="ml-auto rounded-md border border-border bg-bg px-2 py-1 text-[12px] text-ink outline-none"
+            >
+              {sortOptions.map((s) => (
+                <option key={s} value={s}>{SORT_LABEL[s]}</option>
+              ))}
+            </select>
+          </div>
 
           <div className="flex min-h-0 flex-1 flex-col gap-1 md:overflow-y-auto">
             {searchQ.isLoading ? (
@@ -149,9 +189,17 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
                 screen="models"
               />
             ) : results.length === 0 ? (
+              // Distinguish "HF had nothing" from "we hid everything HF had" — otherwise the
+              // Android default-on filter looks like a broken search.
               <EmptyState
                 icon={<Search size={24} />}
-                message={searching ? `No models found for “${debounced}”.` : 'No models found.'}
+                message={
+                  hiddenByFit > 0
+                    ? `None of the ${hiddenByFit} results fit this machine's memory. Untick “Fits my hardware” to see them.`
+                    : searching
+                      ? `No models found for “${debounced}”.`
+                      : 'No models found.'
+                }
               />
             ) : (
               results.map((r) => (
