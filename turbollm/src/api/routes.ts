@@ -26,7 +26,6 @@ import {
   deleteAllBackendBuilds,
   installedBackendBuild,
   githubHeaders,
-  latestReleaseTag,
   provisionBackend,
   provisionTurboquant,
   recommendBackendId,
@@ -34,6 +33,7 @@ import {
 import {
   normalizeUpdatePolicy,
   tagFromManagedBinPath,
+  latestTagForInstalled,
 } from '../engines/update'
 import type { BackendId } from '../engines/download'
 import { ensureMlxEnv } from '../engines/mlx'
@@ -336,14 +336,17 @@ export function registerApi(app: Hono, d: Deps): void {
     if (!oldBin) return err(c, 409, 'not_installed', 'Backend is not installed — download it first.')
     { const busy = engineWorkBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
     // Honest upstream check FIRST: resolve the real latest tag. Offline → clear 503.
+    // Resolved in the INSTALLED tag's own format via the shared resolver: `releases/latest`
+    // returns llama.cpp's semver release (`v0.4.0`), which publishes no per-backend assets, so
+    // downloading it 404'd while the build the user actually wanted (b10818) was never fetched.
+    const installedTag = tagFromManagedBinPath(oldBin)
     let latestTag: string
     try {
-      latestTag = await latestReleaseTag('ggml-org/llama.cpp', AbortSignal.timeout(15_000))
+      latestTag = await latestTagForInstalled('ggml-org/llama.cpp', installedTag, AbortSignal.timeout(15_000))
     } catch {
       return err(c, 503, 'offline', "Couldn't reach GitHub to check for a newer build. Try again when online.")
     }
     if (!latestTag) return err(c, 503, 'offline', "GitHub didn't report a latest build. Try again later.")
-    const installedTag = tagFromManagedBinPath(oldBin)
     // Already on the real latest → honest "already latest" (no download).
     if (installedTag && installedTag === latestTag) {
       return c.json({ accepted: false, alreadyLatest: true, build: latestTag })

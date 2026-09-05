@@ -261,6 +261,25 @@ export function resolveUpdateSource(engine: Engine): ResolvedSource | null {
   return null
 }
 
+/** Resolve the latest tag of `repo` in the SAME format as the installed one.
+ *
+ *  llama.cpp publishes both `b#####` per-build tags and occasional semver releases (`v0.4.0`),
+ *  and marks the semver one as GitHub's "latest release". A build-tag install must therefore
+ *  resolve the newest BUILD tag, or the answer is either incomparable (the check) or not
+ *  downloadable (the apply).
+ *
+ *  Shared deliberately by BOTH the update check and the update apply. They resolved the tag
+ *  independently once: the check was taught about build tags while the applier still asked for
+ *  `releases/latest`, so the UI offered `b10455 -> b10818` and the download then 404'd against
+ *  `v0.4.0`, which has no per-backend assets. One resolver means they cannot disagree again. */
+export async function latestTagForInstalled(repo: string, installed: string, signal?: AbortSignal): Promise<string> {
+  if (parseBuildTag(installed) !== null) {
+    const buildTag = await latestBuildTagRelease(repo, signal)
+    if (buildTag) return buildTag
+  }
+  return latestReleaseTag(repo, signal)
+}
+
 /** Resolve the real latest version/tag for a source. GitHub releases/latest for
  *  github-release; PyPI JSON `info.version` for pip. Throws on network failure (the
  *  caller maps that to an `offline` status — it never fabricates a latest). */
@@ -281,11 +300,7 @@ export async function fetchLatest(src: ResolvedSource, signal?: AbortSignal): Pr
   // tags and occasional semver releases (`v0.4.0`), and marks the semver one as "latest" — so
   // `releases/latest` hands back a tag that cannot be compared against `b10455`, leaving the
   // engine stuck on "update status unavailable" while hundreds of newer builds exist.
-  if (parseBuildTag(src.installed) !== null) {
-    const buildTag = await latestBuildTagRelease(src.ref, signal)
-    if (buildTag) return buildTag
-  }
-  return latestReleaseTag(src.ref, signal)
+  return latestTagForInstalled(src.ref, src.installed, signal)
 }
 
 /** Produce an {@link UpdateStatus} for one engine. Resolves the source, fetches the

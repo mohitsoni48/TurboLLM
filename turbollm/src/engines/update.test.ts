@@ -19,6 +19,7 @@ import {
   type ResolvedSource,
 } from './update'
 import { GithubRateLimitError } from './download'
+import { latestTagForInstalled } from './update'
 import type { Engine } from '../config/config'
 import { engineIsIdle } from './update-scheduler'
 import type { Manager } from './manager'
@@ -471,4 +472,41 @@ test('UpdateChecker.checkAll + prune', async () => {
   checker.prune(new Set(['a']))
   assert.equal(checker.get('a') !== undefined, true)
   assert.equal(checker.get('b'), undefined)
+})
+
+
+// ─── latestTagForInstalled: one resolver for BOTH check and apply ─────────────
+// Regression: the check learned about build tags while the applier still asked for
+// `releases/latest`, so the UI offered b10455 -> b10818 and the download then 404'd
+// against v0.4.0 (a semver release that publishes no per-backend assets).
+
+test('latestTagForInstalled: a b-tag install resolves the newest BUILD tag', async () => {
+  const calls: string[] = []
+  global.fetch = (async (url: string) => {
+    calls.push(String(url))
+    if (String(url).includes('/releases?')) {
+      // Deliberately NOT in build-number order — releases come back newest-by-date.
+      return new Response(JSON.stringify([
+        { tag_name: 'v0.4.0' }, { tag_name: 'b10818' }, { tag_name: 'b10817' }, { tag_name: 'b9999' },
+      ]), { status: 200 })
+    }
+    return new Response(JSON.stringify({ tag_name: 'v0.4.0' }), { status: 200 })
+  }) as unknown as typeof fetch
+  const tag = await latestTagForInstalled('ggml-org/llama.cpp', 'b10455')
+  assert.equal(tag, 'b10818')
+  assert.ok(calls.some((u) => u.includes('/releases?')), 'must list releases, not releases/latest')
+})
+
+test('latestTagForInstalled: a semver install still uses releases/latest', async () => {
+  global.fetch = (async () =>
+    new Response(JSON.stringify({ tag_name: '1.99.3' }), { status: 200 })) as unknown as typeof fetch
+  assert.equal(await latestTagForInstalled('LostRuins/koboldcpp', '1.99.2'), '1.99.3')
+})
+
+test('latestTagForInstalled: falls back to releases/latest when no build tag exists', async () => {
+  global.fetch = (async (url: string) => {
+    if (String(url).includes('/releases?')) return new Response(JSON.stringify([{ tag_name: 'v1.0.0' }]), { status: 200 })
+    return new Response(JSON.stringify({ tag_name: 'v1.0.0' }), { status: 200 })
+  }) as unknown as typeof fetch
+  assert.equal(await latestTagForInstalled('some/repo', 'b1'), 'v1.0.0')
 })
