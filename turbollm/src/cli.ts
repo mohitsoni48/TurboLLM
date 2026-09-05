@@ -5,6 +5,7 @@ import { serve } from '@hono/node-server'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { ConfigStore, defaultConfig, defaultConfigPath, getModelProfile, resolveConfiguredCtx, migrateLegacyDataDir } from './config/config'
+import { setGithubTokenProvider } from './engines/download'
 import { Manager, killTrackedEnginesSync, reapStaleEngines, type StartOpts } from './engines/manager'
 import { ComfyGuard } from './engines/comfy-guard'
 import { Registry } from './engines/registry'
@@ -287,6 +288,12 @@ const store = ConfigStore.load(argValue('--config', defaultConfigPath()))
 if (store.brokenBackup()) {
   console.warn(`config was reset; previous file backed up at ${store.brokenBackup()}`)
 }
+
+// Make the user's configured GitHub token available to EVERY GitHub call in the process
+// (update checks, engine downloads), not just the ones that thread a token explicitly.
+// Read through the store on each call so a token saved in Settings takes effect immediately,
+// with no daemon restart.
+setGithubTokenProvider(() => store.snapshot().gh?.token ?? '')
 
 // ── --stop ────────────────────────────────────────────────────────────────────
 // Must come after ConfigStore.load so we have store.dir() for the pidfile path,

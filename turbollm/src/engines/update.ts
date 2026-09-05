@@ -15,7 +15,7 @@
 // the tests exercise directly; checkUpdate/the scheduler are thin shells over them.
 
 import type { Engine } from '../config/config'
-import { type BackendId, latestCommitSha, latestReleaseTag } from './download'
+import { type BackendId, GithubRateLimitError, latestBuildTagRelease, latestCommitSha, latestReleaseTag } from './download'
 
 // ─── Layer 1a: version/tag comparison (pure) ─────────────────────────────────
 
@@ -125,9 +125,11 @@ export interface UpdateStatus {
   hasUpdate: boolean
   /** ISO timestamp of when this status was produced. */
   checkedAt: string
-  /** Set when the check could not complete: 'offline' (network) or 'no_source'
-   *  (engine has no known update source). Mutually exclusive with a non-null latest. */
-  error?: 'offline' | 'no_source'
+  /** Set when the check could not complete: 'offline' (network), 'rate_limited' (GitHub's
+   *  API quota is spent — the box is online, so saying "offline" would misdirect the user
+   *  into debugging their connection) or 'no_source' (engine has no known update source).
+   *  Mutually exclusive with a non-null latest. */
+  error?: 'offline' | 'rate_limited' | 'no_source'
   /** When latest couldn't be parsed/compared against installed → result was `unknown`.
    *  The UI shows "couldn't compare" rather than a false up-to-date. */
   comparable: boolean
@@ -259,6 +261,25 @@ export function resolveUpdateSource(engine: Engine): ResolvedSource | null {
   return null
 }
 
+/** Resolve the latest tag of `repo` in the SAME format as the installed one.
+ *
+ *  llama.cpp publishes both `b#####` per-build tags and occasional semver releases (`v0.4.0`),
+ *  and marks the semver one as GitHub's "latest release". A build-tag install must therefore
+ *  resolve the newest BUILD tag, or the answer is either incomparable (the check) or not
+ *  downloadable (the apply).
+ *
+ *  Shared deliberately by BOTH the update check and the update apply. They resolved the tag
+ *  independently once: the check was taught about build tags while the applier still asked for
+ *  `releases/latest`, so the UI offered `b10455 -> b10818` and the download then 404'd against
+ *  `v0.4.0`, which has no per-backend assets. One resolver means they cannot disagree again. */
+export async function latestTagForInstalled(repo: string, installed: string, signal?: AbortSignal): Promise<string> {
+  if (parseBuildTag(installed) !== null) {
+    const buildTag = await latestBuildTagRelease(repo, signal)
+    if (buildTag) return buildTag
+  }
+  return latestReleaseTag(repo, signal)
+}
+
 /** Resolve the real latest version/tag for a source. GitHub releases/latest for
  *  github-release; PyPI JSON `info.version` for pip. Throws on network failure (the
  *  caller maps that to an `offline` status — it never fabricates a latest). */
@@ -274,7 +295,12 @@ export async function fetchLatest(src: ResolvedSource, signal?: AbortSignal): Pr
   }
   // Source-built engines (ADR-088): the repo's latest commit sha on the branch.
   if (src.source === 'source') return latestCommitSha(src.ref, src.branch ?? '', signal)
-  return latestReleaseTag(src.ref, signal)
+  // When the INSTALLED version is a llama.cpp-style build tag, resolve the newest build-tag
+  // release rather than GitHub's `releases/latest`. llama.cpp publishes both `b#####` per-build
+  // tags and occasional semver releases (`v0.4.0`), and marks the semver one as "latest" — so
+  // `releases/latest` hands back a tag that cannot be compared against `b10455`, leaving the
+  // engine stuck on "update status unavailable" while hundreds of newer builds exist.
+  return latestTagForInstalled(src.ref, src.installed, signal)
 }
 
 /** Produce an {@link UpdateStatus} for one engine. Resolves the source, fetches the
@@ -293,9 +319,12 @@ export async function computeUpdateStatus(
   let latest: string
   try {
     latest = await fetcher(src, signal)
-  } catch {
-    // Network failure / offline: report the "couldn't check" state, NEVER a false latest.
-    return { installed: src.installed, latest: null, hasUpdate: false, checkedAt, error: 'offline', comparable: false }
+  } catch (e) {
+    // Distinguish an exhausted GitHub quota from a real network failure. Both mean "couldn't
+    // check", but only one is fixable by the user (add a token), and calling a rate limit
+    // "offline" sends them debugging a connection that is working fine.
+    const error = e instanceof GithubRateLimitError ? 'rate_limited' : 'offline'
+    return { installed: src.installed, latest: null, hasUpdate: false, checkedAt, error, comparable: false }
   }
   if (!latest) {
     return { installed: src.installed, latest: null, hasUpdate: false, checkedAt, error: 'offline', comparable: false }

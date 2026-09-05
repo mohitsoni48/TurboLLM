@@ -761,6 +761,10 @@ export type DaemonSettingsPatch = Partial<Omit<DaemonSettings, 'comfyui' | 'tavi
    *  independently. */
   code?: Partial<DaemonSettings['code']>
   hfToken?: string
+  /** Write-only: set or clear ('') the stored GitHub token. Raises the GitHub API rate limit
+   *  for branch lookups from 60 to 5,000 requests/hour. Never echoed back — read the boolean
+   *  `ghTokenSet` from {@link DaemonSettings} instead. */
+  ghToken?: string
   /** Write-only: set or clear the Tavily API key (legacy alias for `search.tavilyApiKey`). */
   tavilyApiKey?: string
   /** Write-only search-provider patch (F-020). Key/URL fields set or clear ('') the stored value. */

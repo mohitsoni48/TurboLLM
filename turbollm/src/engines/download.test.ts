@@ -3,7 +3,7 @@
 // used by turboquantAssetUrl to pick the right release asset per OS.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { scoreAsset, pickReleaseAsset, recommendBackendId } from './download'
+import { scoreAsset, pickReleaseAsset, recommendBackendId, githubHeaders, setGithubTokenProvider, isRateLimited } from './download'
 import type { ReleaseAsset } from './download'
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
@@ -189,3 +189,63 @@ test('recommendBackendId: amdApuOnly is irrelevant to other vendors', { skip: pr
   assert.equal(recommendBackendId('nvidia', true, undefined, true), 'cuda')
 })
 
+
+
+// ─── githubHeaders: the configured token must reach EVERY GitHub call ──────────
+// Regression: the token saved in Settings was only threaded into the branch-selector
+// route, so update checks and downloads stayed unauthenticated and kept hitting the
+// 60/hour limit while a perfectly good token sat unused in the config.
+
+test('githubHeaders: uses the ambient configured token when no explicit tokenFn is given', () => {
+  setGithubTokenProvider(() => 'cfg-token')
+  try {
+    assert.equal(githubHeaders()['Authorization'], 'Bearer cfg-token')
+  } finally {
+    setGithubTokenProvider(null)
+  }
+})
+
+test('githubHeaders: an explicit tokenFn still wins over the ambient one', () => {
+  setGithubTokenProvider(() => 'cfg-token')
+  try {
+    assert.equal(githubHeaders({}, () => 'explicit')['Authorization'], 'Bearer explicit')
+  } finally {
+    setGithubTokenProvider(null)
+  }
+})
+
+test('githubHeaders: no token configured leaves the request unauthenticated', () => {
+  setGithubTokenProvider(() => '')
+  const prev = process.env.GITHUB_TOKEN
+  delete process.env.GITHUB_TOKEN
+  try {
+    assert.equal('Authorization' in githubHeaders(), false)
+  } finally {
+    setGithubTokenProvider(null)
+    if (prev !== undefined) process.env.GITHUB_TOKEN = prev
+  }
+})
+
+test('githubHeaders: a throwing provider degrades to unauthenticated, never breaks the call', () => {
+  setGithubTokenProvider(() => { throw new Error('store closed') })
+  const prev = process.env.GITHUB_TOKEN
+  delete process.env.GITHUB_TOKEN
+  try {
+    assert.equal('Authorization' in githubHeaders(), false)
+  } finally {
+    setGithubTokenProvider(null)
+    if (prev !== undefined) process.env.GITHUB_TOKEN = prev
+  }
+})
+
+test('isRateLimited: only a 403/429 WITH x-ratelimit-remaining 0 counts', () => {
+  const mk = (status: number, remaining: string | null) =>
+    new Response('', { status, headers: remaining === null ? {} : { 'x-ratelimit-remaining': remaining } })
+  assert.equal(isRateLimited(mk(403, '0')), true)
+  assert.equal(isRateLimited(mk(429, '0')), true)
+  // A plain permission error (private repo / bad token) must NOT be reported as a rate limit,
+  // or we would tell the user to fix a token that is already valid.
+  assert.equal(isRateLimited(mk(403, null)), false)
+  assert.equal(isRateLimited(mk(403, '17')), false)
+  assert.equal(isRateLimited(mk(404, '0')), false)
+})

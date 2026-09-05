@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { Link } from 'react-router-dom'
 import type { LucideIcon } from 'lucide-react'
 import {
   Boxes,
@@ -1107,16 +1108,26 @@ function EngineCard({
   const compat = compatFor(fit)
   // Fetch the full branch list in background for branch-capable entries; falls back to
   // ['main'] on failure. Search below filters this list client-side.
-  const branchesQ = useGitBranches(catalog?.homepage, buildYourself)
+  // Fetch the branch list ON DEMAND, not on render. Walking GitHub's pagination costs one
+  // request per 100 branches, so eagerly hydrating every branch-capable card cost ~27 requests
+  // per visit to this screen (llama.cpp alone has 771 branches = 8 pages) against an
+  // unauthenticated budget of 60/hour. Two visits starved every other GitHub call in the app —
+  // most visibly the engine update checker, which then reported "couldn't check for updates".
+  // Nobody needs the list until they actually open the dropdown, so wait until they do.
+  const [branchesWanted, setBranchesWanted] = useState(false)
+  const branchesQ = useGitBranches(catalog?.homepage, buildYourself && branchesWanted)
   const [searchQuery, setSearchQuery] = useState('')
-  const allBranches = branchesQ.data?.branches ?? ['main']
+  // Fallback list when the lookup fails (offline, rate-limited): the entry's OWN default branch,
+  // not a hardcoded 'main'. `selectedBranch` already initialises from catalog.defaultBranch, so a
+  // hardcoded ['main'] left the selected value absent from the option list — the <select> then
+  // rendered as 'main' for every engine, including the ones whose default is master/concedo/prism.
+  const fallbackBranch = catalog?.defaultBranch ?? 'main'
+  const allBranches = branchesQ.data?.branches ?? [fallbackBranch]
   const totalBranches = branchesQ.data?.total ?? allBranches.length
   const branchError = branchesQ.error
-  const isRateLimited =
-    branchError != null &&
-    typeof branchError === 'object' &&
-    'status' in branchError &&
-    (branchError as { status?: number }).status === 403
+  // Keyed off the daemon's error CODE, not a bare 403: a 403 is also a plain permission failure,
+  // and the rate-limit case is the only one where "add a GitHub token" is the right advice.
+  const isRateLimited = branchError instanceof ApiError && branchError.code === 'github_rate_limited'
   const filtered = useMemo(
     () =>
       searchQuery
@@ -1197,19 +1208,21 @@ function EngineCard({
             <div className="relative flex-1">
               <select
                 value={selectedBranch}
+                onMouseDown={() => setBranchesWanted(true)}
+                onFocus={() => setBranchesWanted(true)}
                 onChange={(e) => {
                   setSelectedBranch(e.target.value)
                   void _onRefetchCatalog()
                 }}
                 className="w-full rounded-md border border-border bg-panel-2 pl-2 pr-7 py-1 text-[12px] text-ink outline-none focus:border-accent font-mono appearance-none"
-                disabled={branchesQ.isLoading}
               >
                 {branchesQ.isLoading ? (
-                  <option value="main" disabled>
-                    Loading branches…
-                  </option>
+                  // Keep the CURRENT branch as the option while the list loads. The old markup
+                  // swapped in a hardcoded value="main" placeholder, which made the <select>'s
+                  // value disagree with selectedBranch for any engine whose default is not main.
+                  <option value={selectedBranch}>{selectedBranch} — loading branches…</option>
                 ) : filtered.length === 0 ? (
-                  <option value="main" disabled>
+                  <option value={selectedBranch} disabled>
                     No matching branches
                   </option>
                 ) : (
@@ -1229,8 +1242,10 @@ function EngineCard({
           {/* Error state — GitHub rate limit or network failure */}
           {isRateLimited && (
             <p className="pl-9 text-[11px] text-warning">
-              GitHub API rate-limited (60 req/hour). Add a GitHub token in Settings → GitHub to
-              raise the limit to 5,000 req/hour for branch lookups.
+              {branchError instanceof ApiError ? branchError.message : ''}{' '}
+              <Link to="/settings" className="underline underline-offset-2">
+                Open Settings → GitHub
+              </Link>
             </p>
           )}
           {/* Search filter + load more — shown only when there are many branches */}
@@ -1602,6 +1617,14 @@ function relativeTime(iso: string): string {
  *  without a real upstream check; offline/uncheckable says so explicitly. */
 function CatalogUpdateStatusLine({ st, repoUrl }: { st: EngineUpdateStatus | undefined; repoUrl?: string }) {
   if (!st) return null
+  if (st.error === 'rate_limited') {
+    return (
+      <span className="text-[11px]" style={{ color: 'var(--warn)' }}>
+        GitHub rate limit reached — add a token in{' '}
+        <Link to="/settings" className="underline underline-offset-2">Settings → GitHub</Link>
+      </span>
+    )
+  }
   if (st.error === 'offline') {
     return <span className="text-[11px] text-muted">Couldn&apos;t check for updates (offline)</span>
   }

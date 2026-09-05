@@ -18,6 +18,8 @@ import {
   UpdateChecker,
   type ResolvedSource,
 } from './update'
+import { GithubRateLimitError } from './download'
+import { latestTagForInstalled } from './update'
 import type { Engine } from '../config/config'
 import { engineIsIdle } from './update-scheduler'
 import type { Manager } from './manager'
@@ -243,6 +245,49 @@ test('computeUpdateStatus: network failure NEVER fabricates a latest', async () 
   assert.ok(st.checkedAt) // timestamp always present
 })
 
+test('computeUpdateStatus: a b-tag install compares against the newest BUILD tag, not releases/latest', async () => {
+  // Regression: llama.cpp tags every build `b#####` but also cuts semver releases (`v0.4.0`),
+  // and GitHub marks the semver one as "latest". Comparing b10455 against v0.4.0 is
+  // incomparable, so the engine reported "update status unavailable" forever despite being
+  // hundreds of builds behind. The fetcher below mimics the real resolver's choice.
+  const e = eng({ binPath: '/root/engines/llama.cpp-b10455-cuda/llama-server' })
+  const st = await computeUpdateStatus(e, async (src) => {
+    assert.equal(src.installed, 'b10455')
+    return 'b10818'
+  })
+  assert.equal(st.latest, 'b10818')
+  assert.equal(st.hasUpdate, true)
+  assert.equal(st.comparable, true)
+})
+
+test('computeUpdateStatus: a semver-tagged engine is unaffected by the build-tag path', async () => {
+  const e = eng({ kind: 'koboldcpp', version: '1.99.2' })
+  const st = await computeUpdateStatus(e, async () => '1.99.3')
+  assert.equal(st.latest, '1.99.3')
+  assert.equal(st.hasUpdate, true)
+})
+
+test('computeUpdateStatus: an exhausted GitHub quota reports rate_limited, NOT offline', async () => {
+  // Regression: a spent rate limit used to surface as 'offline', which told the user their
+  // machine had no network when it was online and the real fix was to add a GitHub token.
+  const e = eng({ binPath: '/root/engines/llama.cpp-b9608-cuda/llama-server' })
+  const st = await computeUpdateStatus(e, async () => {
+    throw new GithubRateLimitError('ggml-org/llama.cpp')
+  })
+  assert.equal(st.error, 'rate_limited')
+  assert.equal(st.latest, null)
+  assert.equal(st.hasUpdate, false)
+  assert.equal(st.comparable, false)
+})
+
+test('computeUpdateStatus: a non-rate-limit failure still reports offline', async () => {
+  const e = eng({ binPath: '/root/engines/llama.cpp-b9608-cuda/llama-server' })
+  const st = await computeUpdateStatus(e, async () => {
+    throw new Error('socket hang up')
+  })
+  assert.equal(st.error, 'offline')
+})
+
 test('computeUpdateStatus: empty latest treated as offline (no false up-to-date)', async () => {
   const e = eng({ kind: 'vllm', version: 'vllm 0.11.2' })
   const st = await computeUpdateStatus(e, async () => '')
@@ -427,4 +472,41 @@ test('UpdateChecker.checkAll + prune', async () => {
   checker.prune(new Set(['a']))
   assert.equal(checker.get('a') !== undefined, true)
   assert.equal(checker.get('b'), undefined)
+})
+
+
+// ─── latestTagForInstalled: one resolver for BOTH check and apply ─────────────
+// Regression: the check learned about build tags while the applier still asked for
+// `releases/latest`, so the UI offered b10455 -> b10818 and the download then 404'd
+// against v0.4.0 (a semver release that publishes no per-backend assets).
+
+test('latestTagForInstalled: a b-tag install resolves the newest BUILD tag', async () => {
+  const calls: string[] = []
+  global.fetch = (async (url: string) => {
+    calls.push(String(url))
+    if (String(url).includes('/releases?')) {
+      // Deliberately NOT in build-number order — releases come back newest-by-date.
+      return new Response(JSON.stringify([
+        { tag_name: 'v0.4.0' }, { tag_name: 'b10818' }, { tag_name: 'b10817' }, { tag_name: 'b9999' },
+      ]), { status: 200 })
+    }
+    return new Response(JSON.stringify({ tag_name: 'v0.4.0' }), { status: 200 })
+  }) as unknown as typeof fetch
+  const tag = await latestTagForInstalled('ggml-org/llama.cpp', 'b10455')
+  assert.equal(tag, 'b10818')
+  assert.ok(calls.some((u) => u.includes('/releases?')), 'must list releases, not releases/latest')
+})
+
+test('latestTagForInstalled: a semver install still uses releases/latest', async () => {
+  global.fetch = (async () =>
+    new Response(JSON.stringify({ tag_name: '1.99.3' }), { status: 200 })) as unknown as typeof fetch
+  assert.equal(await latestTagForInstalled('LostRuins/koboldcpp', '1.99.2'), '1.99.3')
+})
+
+test('latestTagForInstalled: falls back to releases/latest when no build tag exists', async () => {
+  global.fetch = (async (url: string) => {
+    if (String(url).includes('/releases?')) return new Response(JSON.stringify([{ tag_name: 'v1.0.0' }]), { status: 200 })
+    return new Response(JSON.stringify({ tag_name: 'v1.0.0' }), { status: 200 })
+  }) as unknown as typeof fetch
+  assert.equal(await latestTagForInstalled('some/repo', 'b1'), 'v1.0.0')
 })

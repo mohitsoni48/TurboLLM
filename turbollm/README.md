@@ -507,6 +507,10 @@ above.
 llama.cpp-compatible fork's git URL (+ optional branch, defaults to the repo's own default) and
 build it in-app with the same 1-click flow, no separate "point at a folder" step needed.
 
+Branch pickers and engine update checks both read GitHub's API, which allows 60 anonymous
+requests an hour. If you run into that ceiling, add a **GitHub token** in Settings → Models &
+loading to raise it to 5,000/hour — it is write-only and never leaves your machine.
+
 **Auto-provisioned default.** Don't want to fetch anything? On first run TurboLLM downloads
 the right upstream prebuilt for your GPU automatically — and a **backend picker** lets you
 switch between CUDA / ROCm / Metal / SYCL / Vulkan / CPU at any time (it downloads the variant
