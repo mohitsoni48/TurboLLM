@@ -2,6 +2,7 @@
 // GPU vendor, downloads the fastest llama.cpp backend it supports, and registers
 // it — trying the recommended backend, then Vulkan, then CPU if one won't probe.
 // No-ops if any engine is already configured. Never throws.
+import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import type { Registry } from './registry'
 import type { ProvisionState } from './provision-state'
@@ -16,6 +17,22 @@ const VALID_BACKENDS: BackendId[] = ['cuda', 'rocm', 'sycl', 'vulkan', 'metal', 
  *  find "the engine this function owns" across restarts without persisting a separate id
  *  anywhere. */
 const ANDROID_ENGINE_NAME = 'llama-server-android'
+
+/** The optional second engine: the same llama.cpp server built with the Vulkan backend, so the
+ *  GPU can be tried on devices whose driver supports it.
+ *
+ *  It is a SEPARATE, statically-linked binary rather than extra backend .so files next to the CPU
+ *  engine, and that is not a packaging preference — it is forced twice over. `nativeLibraryDir` is
+ *  flat, so a shared Vulkan build's libggml.so/libllama.so would collide with the CPU engine's
+ *  under identical names. And measured on a Galaxy S21 FE (Mali-G78): with `libggml-vulkan.so`
+ *  merely PRESENT in that directory, llama-server died during load_model even at `-ngl 0`, while
+ *  moving that one file aside let the identical binary load and serve in ~2s. Sharing a directory
+ *  would therefore let a flaky GPU driver take the working CPU engine down with it. Two
+ *  self-contained binaries keep that blast radius to whichever engine the user selected.
+ *
+ *  Registered only when the file is actually in the APK, so a build without it simply has one
+ *  engine instead of logging a failure for something that was never shipped. */
+const ANDROID_VULKAN_ENGINE_NAME = 'llama-server-android-vulkan'
 
 /** BUG-01 fix (QA_BUGS.md): on Android, the llama-server binary bundled inside the APK
  *  lives at `<nativeLibraryDir>/libllama_server.so` — the only on-disk location Android's
@@ -37,18 +54,31 @@ const ANDROID_ENGINE_NAME = 'llama-server-android'
 export async function ensureAndroidBundledEngine(registry: Registry): Promise<void> {
   const nativeLibDir = process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR
   if (!nativeLibDir) return
-  const binPath = join(nativeLibDir, 'libllama_server.so')
-  try {
-    const existing = registry.list().engines.find((e) => e.name === ANDROID_ENGINE_NAME)
-    if (!existing) {
-      await registry.add(ANDROID_ENGINE_NAME, binPath)
-      console.log(`android: registered bundled engine at ${binPath}`)
-    } else if (existing.binPath !== binPath) {
-      await registry.repairBinPath(existing.id, binPath)
-      console.log(`android: repaired stale engine path → ${binPath}`)
+
+  const bundled: { name: string; file: string; required: boolean }[] = [
+    { name: ANDROID_ENGINE_NAME, file: 'libllama_server.so', required: true },
+    { name: ANDROID_VULKAN_ENGINE_NAME, file: 'libllama_server_vk.so', required: false },
+  ]
+
+  for (const { name, file, required } of bundled) {
+    const binPath = join(nativeLibDir, file)
+    // Optional engines are skipped silently when absent: "this APK didn't ship the Vulkan
+    // binary" is a build configuration, not a fault worth a warning on every boot.
+    if (!required && !existsSync(binPath)) continue
+    try {
+      const existing = registry.list().engines.find((e) => e.name === name)
+      if (!existing) {
+        await registry.add(name, binPath)
+        console.log(`android: registered bundled engine ${name} at ${binPath}`)
+      } else if (existing.binPath !== binPath) {
+        await registry.repairBinPath(existing.id, binPath)
+        console.log(`android: repaired stale engine path for ${name} → ${binPath}`)
+      }
+    } catch (e) {
+      // Per-engine catch, deliberately: a Vulkan binary that won't probe on this device must
+      // not stop the CPU engine — the one that actually works — from being registered.
+      console.warn(`android: could not register/repair ${name} (${e instanceof Error ? e.message : e})`)
     }
-  } catch (e) {
-    console.warn(`android: could not register/repair the bundled engine (${e instanceof Error ? e.message : e})`)
   }
 }
 
