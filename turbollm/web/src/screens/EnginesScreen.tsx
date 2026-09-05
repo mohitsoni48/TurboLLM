@@ -1092,8 +1092,9 @@ function EngineCard({
   const [guideOpen, setGuideOpen] = useState(false)
   const [rebuildOpen, setRebuildOpen] = useState(false)
   const [buildsOpen, setBuildsOpen] = useState(false)
-  // Branch selected by the user for build-from-source entries. Default: main.
-  const [selectedBranch, setSelectedBranch] = useState('main')
+  // Branch selected by the user for build-from-source entries. Default: repo's default branch
+  // (catalog.defaultBranch), falling back to 'main' for unknown repos.
+  const [selectedBranch, setSelectedBranch] = useState(catalog?.defaultBranch ?? 'main')
   const isLlama = e.id === 'llama.cpp'
   const sourceBuilt = !!catalog?.sourceBuilt
   const incompatible = fit.compatible.length === 0
@@ -1228,9 +1229,8 @@ function EngineCard({
           {/* Error state — GitHub rate limit or network failure */}
           {isRateLimited && (
             <p className="pl-9 text-[11px] text-warning">
-              GitHub API rate-limited. Set{' '}
-              <code className="rounded bg-panel-2 px-1">GITHUB_TOKEN</code> in the daemon env to
-              raise the limit from 60 → 5,000 req/hour.
+              GitHub API rate-limited (60 req/hour). Add a GitHub token in Settings → GitHub to
+              raise the limit to 5,000 req/hour for branch lookups.
             </p>
           )}
           {/* Search filter + load more — shown only when there are many branches */}

@@ -217,6 +217,9 @@ export interface LastLoaded {
 export interface HF {
   token: string
 }
+export interface GitHub {
+  token: string
+}
 /** Web-search backend selection (F-020). */
 export type SearchProvider = 'tavily' | 'kagi' | 'searxng'
 export interface SearchConfig {
@@ -493,6 +496,7 @@ export interface Config {
   selectedRemoteModel: string
   autoLoadOnStart: boolean
   hf: HF
+  gh: GitHub
   modelDefaults: ModelDefaults
   featuredOverrideUrl: string
   comfyui: ComfyUI
@@ -646,6 +650,7 @@ export function defaultConfig(): Config {
     selectedRemoteModel: '',
     autoLoadOnStart: false,
     hf: { token: '' },
+    gh: { token: '' },
     modelDefaults: { ctx: 8192, ngl: 99, imageMaxTokens: 0, maxTokens: 0 },
     featuredOverrideUrl: '',
     comfyui: { enabled: false, gatePath: '', url: '', reverseGate: false, cachePersist: false },
@@ -805,6 +810,12 @@ function normalize(c: Config): void {
   c.daemon = { ...d.daemon, ...(c.daemon ?? {}) }
   c.telemetry = { ...d.telemetry, ...(c.telemetry ?? {}) }
   c.hf = { ...d.hf, ...(c.hf ?? {}) }
+  // `gh` was added to defaultConfig() WITHOUT a SCHEMA_VERSION bump, so every config file
+  // written before it (i.e. every existing install) has no `gh` key and migrate() never runs.
+  // Anything reading cfg.gh.token then throws — which took out GET /api/v1/settings (the whole
+  // Settings screen 500'd) and /api/v1/build/git-branches (branch dropdown silently fell back
+  // to a single 'main' entry). Backfill it here, next to hf, so old files self-heal on load.
+  c.gh = { ...d.gh, ...(c.gh ?? {}) }
   // Missing in pre-modelDefaults config files → fall back to the built-in defaults
   // (treat absent as defaults; never throw on an old file).
   c.modelDefaults = { ...d.modelDefaults, ...(c.modelDefaults ?? {}) }
