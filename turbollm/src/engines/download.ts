@@ -21,6 +21,19 @@ const execFileP = promisify(execFile)
  *  An empty/unset token falls back to the `GITHUB_TOKEN` env var, preserving the old
  *  env-only path for local dev or container setups. Callers spread the result into
  *  their fetch() headers object. */
+/** Ambient provider for the user's configured GitHub token, registered once at startup by
+ *  {@link setGithubTokenProvider}. Without it, only call sites that explicitly threaded a
+ *  `tokenFn` were authenticated — which meant a token saved in Settings raised the rate limit
+ *  for the branch dropdown but NOT for engine update checks or downloads, so those kept
+ *  failing at 60 requests/hour with a token sitting right there unused. */
+let ambientTokenFn: (() => string) | null = null
+
+/** Wire the config store into every GitHub call in the process. Called once during daemon
+ *  startup; safe to call again (last registration wins). */
+export function setGithubTokenProvider(fn: (() => string) | null): void {
+  ambientTokenFn = fn
+}
+
 export function githubHeaders(
   extra?: Record<string, string>,
   tokenFn?: () => string,
@@ -29,7 +42,12 @@ export function githubHeaders(
     Accept: 'application/vnd.github+json',
     'User-Agent': 'turbollm',
   }
-  let token = tokenFn?.() ?? ''
+  // Explicit argument wins, then the user's configured token, then the env var. Each step is
+  // guarded so a throwing/absent provider degrades to unauthenticated rather than breaking
+  // the request outright.
+  let token = ''
+  try { token = tokenFn?.() ?? '' } catch { token = '' }
+  if (!token) { try { token = ambientTokenFn?.() ?? '' } catch { token = '' } }
   if (!token) token = process.env.GITHUB_TOKEN?.trim() ?? ''
   if (token) base['Authorization'] = `Bearer ${token}`
   return { ...base, ...extra }
@@ -486,12 +504,31 @@ export interface GithubRelease {
 /** Resolve the latest GitHub release of `repo` (tag + assets) via the public API.
  *  Used by the honest update check (update.ts) to compare the installed tag against
  *  upstream. Throws on a non-2xx response (caller maps it to an offline/error state). */
+/** Thrown when GitHub refuses a request because the API rate limit is exhausted, as opposed
+ *  to any other failure. Callers distinguish it so the user is told the truth ("rate limit
+ *  reached — add a token") instead of a misleading "offline": the machine has a perfectly good
+ *  network connection, it has simply spent its 60 unauthenticated requests for the hour. */
+export class GithubRateLimitError extends Error {
+  constructor(repo: string) {
+    super(`GitHub API rate limit exhausted while querying ${repo}`)
+    this.name = 'GithubRateLimitError'
+  }
+}
+
+/** GitHub signals an exhausted quota as 403 (primary limit) or 429 (secondary limit) with
+ *  `x-ratelimit-remaining: 0`. A 403 WITHOUT that header is a genuine permission error and
+ *  must stay a normal failure — never tell someone to fix a token that is already valid. */
+export function isRateLimited(res: Response): boolean {
+  return (res.status === 403 || res.status === 429) && res.headers.get('x-ratelimit-remaining') === '0'
+}
+
 export async function latestGithubRelease(repo: string, signal?: AbortSignal): Promise<GithubRelease> {
   const apiUrl = `https://api.github.com/repos/${repo}/releases/latest`
   const res = await fetch(apiUrl, {
     headers: githubHeaders(),
     signal,
   })
+  if (isRateLimited(res)) throw new GithubRateLimitError(repo)
   if (!res.ok) throw new Error(`could not query ${repo} releases: HTTP ${res.status}`)
   return (await res.json()) as GithubRelease
 }
@@ -504,6 +541,40 @@ export async function latestReleaseTag(repo: string, signal?: AbortSignal): Prom
   return rel.tag_name ?? ''
 }
 
+/** Resolve the newest `b<number>`-style release tag (e.g. `b10818`) of `repo`, or '' when the
+ *  repo publishes none.
+ *
+ *  Needed because llama.cpp tags EVERY build as `b#####` but also cuts occasional semver
+ *  releases (`v0.4.0`) — and GitHub's `releases/latest` returns the semver one. An engine
+ *  installed from a `b#####` build then gets compared against `v0.4.0`, the two formats are
+ *  incomparable, and the update UI reports "update status unavailable" indefinitely even
+ *  though hundreds of newer builds exist. Comparing like with like is the only honest answer.
+ *
+ *  Sorted by build NUMBER, not by release date or list order: releases are returned newest-
+ *  first by creation time, which is not the same ordering as the build counter. */
+export async function latestBuildTagRelease(repo: string, signal?: AbortSignal): Promise<string> {
+  const res = await fetch(`https://api.github.com/repos/${repo}/releases?per_page=100`, {
+    headers: githubHeaders(),
+    signal,
+  })
+  if (isRateLimited(res)) throw new GithubRateLimitError(repo)
+  if (!res.ok) throw new Error(`could not list ${repo} releases: HTTP ${res.status}`)
+  const data = (await res.json()) as { tag_name?: string }[]
+  let best = ''
+  let bestNum = -1
+  for (const rel of data) {
+    const tag = (rel.tag_name ?? '').trim()
+    const m = /^v?b(\d+)$/i.exec(tag)
+    if (!m) continue
+    const n = Number(m[1])
+    if (Number.isInteger(n) && n > bestNum) {
+      bestNum = n
+      best = tag
+    }
+  }
+  return best
+}
+
 /** Resolve the latest commit SHA on a branch of `repo` (ADR-088). `branch` empty →
  *  the repo's default branch (the `HEAD` commits ref resolves it). Used by the honest
  *  source-built update check to detect "newer source available → rebuild". Throws on a
@@ -514,6 +585,7 @@ export async function latestCommitSha(repo: string, branch = '', signal?: AbortS
     headers: githubHeaders(),
     signal,
   })
+  if (isRateLimited(res)) throw new GithubRateLimitError(repo)
   if (!res.ok) throw new Error(`could not query ${repo} commits: HTTP ${res.status}`)
   const data = (await res.json()) as { sha?: string }
   return data.sha ?? ''

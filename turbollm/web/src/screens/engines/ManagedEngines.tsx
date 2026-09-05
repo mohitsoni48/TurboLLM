@@ -1,3 +1,4 @@
+import { Link } from 'react-router-dom'
 import { useState } from 'react'
 import { Check, Download, Loader2, MoreHorizontal, Sparkles } from 'lucide-react'
 import {
@@ -65,6 +66,14 @@ function relativeTime(iso: string): string {
  *  no recorded check yet (the row falls back to its installed line). */
 function UpdateStatusLine({ st }: { st: EngineUpdateStatus | undefined }) {
   if (!st) return null
+  if (st.error === 'rate_limited') {
+    return (
+      <span className="text-[12px]" style={{ color: 'var(--warn)' }}>
+        GitHub rate limit reached — add a token in{' '}
+        <Link to="/settings" className="underline underline-offset-2">Settings → GitHub</Link>
+      </span>
+    )
+  }
   if (st.error === 'offline') {
     return <span className="text-[12px] text-muted">Couldn&apos;t check for updates (offline)</span>
   }

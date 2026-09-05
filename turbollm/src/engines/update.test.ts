@@ -18,6 +18,7 @@ import {
   UpdateChecker,
   type ResolvedSource,
 } from './update'
+import { GithubRateLimitError } from './download'
 import type { Engine } from '../config/config'
 import { engineIsIdle } from './update-scheduler'
 import type { Manager } from './manager'
@@ -241,6 +242,49 @@ test('computeUpdateStatus: network failure NEVER fabricates a latest', async () 
   assert.equal(st.hasUpdate, false)
   assert.equal(st.error, 'offline')
   assert.ok(st.checkedAt) // timestamp always present
+})
+
+test('computeUpdateStatus: a b-tag install compares against the newest BUILD tag, not releases/latest', async () => {
+  // Regression: llama.cpp tags every build `b#####` but also cuts semver releases (`v0.4.0`),
+  // and GitHub marks the semver one as "latest". Comparing b10455 against v0.4.0 is
+  // incomparable, so the engine reported "update status unavailable" forever despite being
+  // hundreds of builds behind. The fetcher below mimics the real resolver's choice.
+  const e = eng({ binPath: '/root/engines/llama.cpp-b10455-cuda/llama-server' })
+  const st = await computeUpdateStatus(e, async (src) => {
+    assert.equal(src.installed, 'b10455')
+    return 'b10818'
+  })
+  assert.equal(st.latest, 'b10818')
+  assert.equal(st.hasUpdate, true)
+  assert.equal(st.comparable, true)
+})
+
+test('computeUpdateStatus: a semver-tagged engine is unaffected by the build-tag path', async () => {
+  const e = eng({ kind: 'koboldcpp', version: '1.99.2' })
+  const st = await computeUpdateStatus(e, async () => '1.99.3')
+  assert.equal(st.latest, '1.99.3')
+  assert.equal(st.hasUpdate, true)
+})
+
+test('computeUpdateStatus: an exhausted GitHub quota reports rate_limited, NOT offline', async () => {
+  // Regression: a spent rate limit used to surface as 'offline', which told the user their
+  // machine had no network when it was online and the real fix was to add a GitHub token.
+  const e = eng({ binPath: '/root/engines/llama.cpp-b9608-cuda/llama-server' })
+  const st = await computeUpdateStatus(e, async () => {
+    throw new GithubRateLimitError('ggml-org/llama.cpp')
+  })
+  assert.equal(st.error, 'rate_limited')
+  assert.equal(st.latest, null)
+  assert.equal(st.hasUpdate, false)
+  assert.equal(st.comparable, false)
+})
+
+test('computeUpdateStatus: a non-rate-limit failure still reports offline', async () => {
+  const e = eng({ binPath: '/root/engines/llama.cpp-b9608-cuda/llama-server' })
+  const st = await computeUpdateStatus(e, async () => {
+    throw new Error('socket hang up')
+  })
+  assert.equal(st.error, 'offline')
 })
 
 test('computeUpdateStatus: empty latest treated as offline (no false up-to-date)', async () => {
