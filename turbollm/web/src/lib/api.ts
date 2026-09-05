@@ -292,16 +292,11 @@ export function installPrereq(tool: 'git' | 'cmake' | 'cuda' | 'gcc'): Promise<{
   return request('/api/v1/build/install-prereq', { method: 'POST', json: { tool } })
 }
 
-/** Fetch a paginated slice of branch names for a GitHub repo. Returns total count plus the
- *  current page, with the default branch sorted first. Used by the build-from-source branch
- *  dropdown. */
-export function getGitBranches(
-  repo: string,
-  options?: { limit?: number; offset?: number },
-): Promise<{ total: number; branches: string[] }> {
-  const params = new URLSearchParams({ repo: encodeURIComponent(repo) })
-  if (options?.limit) params.set('limit', String(options.limit))
-  if (options?.offset) params.set('offset', String(options.offset))
+/** Fetch every branch name for a GitHub repo, with the default branch sorted first. Used by
+ *  the build-from-source branch dropdown, which does its own client-side search filtering
+ *  over the full list. */
+export function getGitBranches(repo: string): Promise<{ total: number; branches: string[] }> {
+  const params = new URLSearchParams({ repo })
   return request<{ total: number; branches: string[] }>(`/api/v1/build/git-branches?${params}`)
 }
 
