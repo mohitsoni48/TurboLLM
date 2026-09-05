@@ -54,6 +54,7 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
   const [selectedRepo, setSelectedRepo] = useState<string | null>(null)
   const [importOpen, setImportOpen] = useState(false)
   const listRef = useRef<HTMLDivElement>(null)
+  const detailRef = useRef<HTMLDivElement>(null)
   const [listWidth, setListWidth] = useState(() => Math.min(Math.max(readSavedListWidth(), LIST_MIN_W), listMaxW()))
   // Below md the split-pane stacks (list over detail); the fixed list width + resize
   // handle only apply on desktop.
@@ -65,6 +66,14 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
   useEffect(() => {
     if (presetQuery) setQuery(presetQuery)
   }, [presetQuery])
+
+  // Below md, list and detail share one scrolling page (see the list/detail wrapper
+  // classNames above) — picking a result reveals its detail somewhere below the fold
+  // rather than in a fixed side pane, so nudge the page down to it. Desktop's detail
+  // pane is already always visible beside the list; no scroll needed there.
+  useEffect(() => {
+    if (selectedRepo && !isDesktop) detailRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }, [selectedRepo, isDesktop])
 
   // Debounce the search input 400ms before it hits the network (spec 10 §2).
   useEffect(() => {
@@ -91,12 +100,17 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
     : ['trending', 'downloads', 'likes', 'modified', 'created']
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    <div className="flex flex-col md:h-full md:min-h-0">
       <DownloadsPanel />
 
       <div className="mt-3 flex min-h-0 flex-1 flex-col gap-3 md:flex-row md:gap-0">
-        {/* Left: search + sort + scrollable list */}
-        <div ref={listRef} className="flex max-h-[45vh] min-h-0 flex-col gap-2 md:max-h-none md:shrink-0 md:pr-3" style={isDesktop ? { width: listWidth } : undefined}>
+        {/* Left: search + sort + list. Below md this is one naturally-flowing block (the
+            page itself scrolls, via Shell's bounded `<main>`) — no internal max-height or
+            scroller of its own, which used to clip the list mid-row and force a second,
+            cramped scroll just to reach the detail pane below it. At md+ it goes back to
+            ADR-143's fixed-height split-pane, where the list genuinely needs its own
+            scrollbar since it sits beside (not above) the detail pane. */}
+        <div ref={listRef} className="flex min-h-0 flex-col gap-2 md:max-h-none md:shrink-0 md:pr-3" style={isDesktop ? { width: listWidth } : undefined}>
           <div className="flex items-center gap-2">
             <div className="relative flex-1">
               <Search size={15} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-faint" />
@@ -127,7 +141,7 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
             ))}
           </select>
 
-          <div className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto">
+          <div className="flex min-h-0 flex-1 flex-col gap-1 md:overflow-y-auto">
             {searchQ.isLoading ? (
               [0, 1, 2, 3].map((i) => <Skeleton key={i} className="h-[54px] w-full shrink-0 rounded-lg" />)
             ) : unreachable ? (
@@ -162,8 +176,11 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
 
         {isDesktop && <SplitResizeHandle listRef={listRef} onCommit={setListWidth} />}
 
-        {/* Right: permanent detail pane — no dialog, just swaps content on selection */}
-        <div className="min-h-0 flex-1 overflow-y-auto rounded-lg border border-border bg-panel p-5">
+        {/* Right: permanent detail pane — no dialog, just swaps content on selection. Below
+            md it sits in normal flow right under the list (see scrollIntoView above), so
+            selecting a result reveals its detail instead of trapping it in its own
+            barely-visible scroller. */}
+        <div ref={detailRef} className="min-h-0 flex-1 md:overflow-y-auto rounded-lg border border-border bg-panel p-5">
           {selectedRepo ? (
             <HfRepoContent
               repo={selectedRepo}
