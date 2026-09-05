@@ -14,6 +14,7 @@ import { useHfSearch } from '../../lib/queries'
 import type { HfSearchItem, HfSortOption } from '../../lib/types'
 import { EmptyState, InlineError } from '../../components/common'
 import { Input } from '../../components/ui/input'
+import { Sheet, SheetContent } from '../../components/ui/sheet'
 import { Skeleton } from '../../components/ui/skeleton'
 import { useIsDesktop } from '../../lib/useIsDesktop'
 import { DownloadsPanel } from './DownloadsPanel'
@@ -54,7 +55,6 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
   const [selectedRepo, setSelectedRepo] = useState<string | null>(null)
   const [importOpen, setImportOpen] = useState(false)
   const listRef = useRef<HTMLDivElement>(null)
-  const detailRef = useRef<HTMLDivElement>(null)
   const [listWidth, setListWidth] = useState(() => Math.min(Math.max(readSavedListWidth(), LIST_MIN_W), listMaxW()))
   // Below md the split-pane stacks (list over detail); the fixed list width + resize
   // handle only apply on desktop.
@@ -66,14 +66,6 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
   useEffect(() => {
     if (presetQuery) setQuery(presetQuery)
   }, [presetQuery])
-
-  // Below md, list and detail share one scrolling page (see the list/detail wrapper
-  // classNames above) — picking a result reveals its detail somewhere below the fold
-  // rather than in a fixed side pane, so nudge the page down to it. Desktop's detail
-  // pane is already always visible beside the list; no scroll needed there.
-  useEffect(() => {
-    if (selectedRepo && !isDesktop) detailRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-  }, [selectedRepo, isDesktop])
 
   // Debounce the search input 400ms before it hits the network (spec 10 §2).
   useEffect(() => {
@@ -176,12 +168,40 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
 
         {isDesktop && <SplitResizeHandle listRef={listRef} onCommit={setListWidth} />}
 
-        {/* Right: permanent detail pane — no dialog, just swaps content on selection. Below
-            md it sits in normal flow right under the list (see scrollIntoView above), so
-            selecting a result reveals its detail instead of trapping it in its own
-            barely-visible scroller. */}
-        <div ref={detailRef} className="min-h-0 flex-1 md:overflow-y-auto rounded-lg border border-border bg-panel p-5">
-          {selectedRepo ? (
+        {/* Right: permanent detail pane — no dialog, just swaps content on selection.
+            Desktop-only (ADR-143's always-visible split-pane); below md the detail
+            instead opens in the full-screen Sheet further down. */}
+        {isDesktop && (
+          <div className="min-h-0 flex-1 md:overflow-y-auto rounded-lg border border-border bg-panel p-5">
+            {selectedRepo ? (
+              <HfRepoContent
+                repo={selectedRepo}
+                onClose={() => setSelectedRepo(null)}
+                onSearch={(term) => {
+                  setSelectedRepo(null)
+                  setQuery(term)
+                }}
+              />
+            ) : (
+              <div className="flex h-full items-center justify-center">
+                <EmptyState icon={<Search size={24} />} message="Select a model to see its details." />
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Below md: the detail pane opens as a full-screen Sheet instead of sitting in the
+          page's normal flow — a dedicated "page" with its own close (X), rather than
+          burying the content further down the same scroll. Never open at md+ (isDesktop
+          gates it), where the inline pane above is already always visible. */}
+      <Sheet open={!isDesktop && !!selectedRepo} onOpenChange={(o) => !o && setSelectedRepo(null)} modal={false}>
+        <SheetContent
+          className="overflow-y-auto p-5"
+          onPointerDownOutside={(e) => e.preventDefault()}
+          onInteractOutside={(e) => e.preventDefault()}
+        >
+          {selectedRepo && (
             <HfRepoContent
               repo={selectedRepo}
               onClose={() => setSelectedRepo(null)}
@@ -190,13 +210,9 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
                 setQuery(term)
               }}
             />
-          ) : (
-            <div className="flex h-full items-center justify-center">
-              <EmptyState icon={<Search size={24} />} message="Select a model to see its details." />
-            </div>
           )}
-        </div>
-      </div>
+        </SheetContent>
+      </Sheet>
 
       <ImportUrlDialog
         open={importOpen}
