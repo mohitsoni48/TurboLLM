@@ -657,9 +657,17 @@ const ALL: CatalogEngine[] = [
 ]
 
 /** The catalog as seen on this platform: engines runnable here, plus a per-entry
- *  `supportedHere` flag so the UI can dim ones that won't run on this OS. */
+ *  `supportedHere` flag so the UI can dim ones that won't run on this OS.
+ *
+ *  Android is the one platform that gets the unsupported entries dropped outright rather than
+ *  dimmed. On desktop, "vLLM — Linux only" is useful information: it tells a Windows user what
+ *  they'd get on another machine, and the list is a comfortable browse. On a phone it's the
+ *  opposite — the overwhelming majority of the catalog can never run there (founder call), so
+ *  it reads as a wall of things that don't apply, burying the one or two that do. Revisit if
+ *  Android ever gains more runnable engines. */
 export function catalogForPlatform(platform: NodeJS.Platform = process.platform): Array<CatalogEngine & { supportedHere: boolean }> {
-  return ALL.map((e) => ({ ...e, supportedHere: e.platforms.includes(platform) }))
+  const withSupport = ALL.map((e) => ({ ...e, supportedHere: e.platforms.includes(platform) }))
+  return platform === 'android' ? withSupport.filter((e) => e.supportedHere) : withSupport
 }
 
 /** Look up a single catalog entry by id. */

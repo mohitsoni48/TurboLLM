@@ -1016,7 +1016,12 @@ function EngineGallery({
           <span className="text-sm font-medium text-ink">Add your own engine</span>
           <span className="text-[12px] text-muted"> — point at any llama-server compatible binary, or ask for a new one.</span>
         </div>
-        <div className="flex shrink-0 items-center gap-3">
+        {/* Wraps rather than `shrink-0`: on a phone these three controls are ~340px of
+            unshrinkable content in a ~390px card, so refusing to shrink pushed the last one
+            (the add button) past the card's own padding and off the screen edge — the founder
+            saw it as the page scrolling sideways. Wrapping costs desktop nothing; there the row
+            never runs out of room to begin with. */}
+        <div className="flex min-w-0 flex-wrap items-center gap-3">
           <a
             href={ISSUE_URL}
             target="_blank"
