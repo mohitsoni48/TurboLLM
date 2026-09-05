@@ -1251,7 +1251,12 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                   ref={inputRef}
                   rows={1}
                   className="max-h-40 min-h-9 flex-1 resize-none bg-transparent px-2 py-1.5 text-[15px] text-ink outline-none placeholder:overflow-hidden placeholder:whitespace-nowrap placeholder:text-faint"
-                  placeholder={ready ? `Message ${remoteChoice?.name ?? model?.name ?? 'the model'}…` : 'Load a model above to start chatting'}
+                  // Kept short enough to survive a 360px-wide phone: the old
+                  // "Load a model above to start chatting" clipped mid-word to
+                  // "…to start cha", which reads as a rendering bug rather than a hint
+                  // (QA_UX_REPORT.md P2-1). A placeholder can't ellipsize gracefully, so
+                  // the fix is fewer words rather than CSS.
+                  placeholder={ready ? `Message ${remoteChoice?.name ?? model?.name ?? 'the model'}…` : 'Load a model to start chatting'}
                   value={input}
                   disabled={!ready || !!live || !!editingId}
                   onChange={(e) => { setInput(e.target.value); autoResize() }}

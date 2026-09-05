@@ -30,16 +30,30 @@ export function useBackableOverlay(open: boolean, onClose: () => void): void {
     }
   }, [open])
 
+  // The listener is subscribed ONCE and reaches `onClose` through a ref, rather than depending on
+  // it. Depending on it looks harmless but silently breaks the hook for any caller that passes an
+  // inline closure (most of them): a real back gets handled by the router's own popstate listener
+  // first, that navigation re-renders the caller, `onClose` comes out with a fresh identity, and
+  // this effect tears down and re-adds its listener — synchronously, inside the same popstate
+  // dispatch. Per the DOM spec a listener removed mid-dispatch is never invoked, so ours was
+  // skipped and the overlay stayed open. It looked for all the world like the event wasn't firing:
+  // a hand-dispatched `new PopStateEvent('popstate')` (no router work, no re-render, no teardown)
+  // closed the dialog every time, while a genuine `history.back()` never did.
+  const onCloseRef = useRef(onClose)
+  useEffect(() => {
+    onCloseRef.current = onClose
+  })
+
   useEffect(() => {
     function onPopState() {
       // Only react while WE hold the top history entry — a real route-navigation popstate
       // (Link/back to an actual different screen) must pass through untouched.
       if (pushedRef.current) {
         pushedRef.current = false
-        onClose()
+        onCloseRef.current()
       }
     }
     window.addEventListener('popstate', onPopState)
     return () => window.removeEventListener('popstate', onPopState)
-  }, [onClose])
+  }, [])
 }
