@@ -37,7 +37,6 @@ import {
   useEngineUpdates,
   useEngines,
   useGitBranches,
-  useLoadMoreBranches,
   useStatus,
   useSysInfo,
   useUpdatePolicyMutation,
@@ -1105,14 +1104,12 @@ function EngineCard({
   const isEnabled = !!catalog?.enabled
   const isDisabled = isInstalled && !isEnabled
   const compat = compatFor(fit)
-  // Fetch branch list in background for branch-capable entries; falls back to ['main'] on failure.
+  // Fetch the full branch list in background for branch-capable entries; falls back to
+  // ['main'] on failure. Search below filters this list client-side.
   const branchesQ = useGitBranches(catalog?.homepage, buildYourself)
-  const loadMore = useLoadMoreBranches()
-  // Pagination + search state for the branch dropdown.
   const [searchQuery, setSearchQuery] = useState('')
   const allBranches = branchesQ.data?.branches ?? ['main']
   const totalBranches = branchesQ.data?.total ?? allBranches.length
-  const hasMore = allBranches.length < totalBranches
   const branchError = branchesQ.error
   const isRateLimited =
     branchError != null &&
@@ -1256,20 +1253,6 @@ function EngineCard({
                   ? `${totalBranches} branches`
                   : `${filtered.length} of ${totalBranches}`}
               </span>
-              {hasMore && (
-                <button
-                  onClick={async () => {
-                    const nextOffset = allBranches.length
-                    void loadMore(catalog!.homepage!, nextOffset)
-                  }}
-                  disabled={branchesQ.isLoading}
-                  className="rounded-md border border-border bg-panel-2 px-2 py-0.5 text-[11px] text-muted hover:text-ink disabled:opacity-50 shrink-0"
-                >
-                  {branchesQ.isLoading
-                    ? 'Loading…'
-                    : `Show more (${totalBranches - allBranches.length} left)`}
-                </button>
-              )}
             </div>
           )}
         </div>
