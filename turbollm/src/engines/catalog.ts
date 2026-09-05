@@ -77,8 +77,11 @@ export interface CatalogEngine {
   comingSoon?: boolean
   /** Extra context shown under the card (support caveats, etc.). */
   note?: string
+  /** Default branch for this repo (e.g. 'master' for llama.cpp, 'main' for most others).
+    *  Used to pre-select the branch in the dropdown — caller falls back to 'main'. */
+  defaultBranch?: string
   /** Pin the build-from-source to an exact commit SHA (7-40 hex). Set when the entry needs a
-   *  specific historical commit — e.g. one that a `patchUrl` was authored against. */
+    *  specific historical commit — e.g. one that a `patchUrl` was authored against. */
   sourceCommit?: string
   /** URL of a unified-diff patch applied on top of `sourceCommit` before compiling — for an
    *  architecture not yet in the repo's mainline (e.g. solar_open2). Requires `patchSha256`. */
@@ -156,6 +159,7 @@ const ALL: CatalogEngine[] = [
     // Its installed state comes from the separate backend-build detection (LlamaCppBackendRows),
     // not the generic sourceRepo match below — see the field's own doc comment (ADR-388).
     excludeFromSourceMatch: true,
+    defaultBranch: 'master',
   },
   {
     // Upstream publishes NO Linux CUDA prebuilt (download.ts availableBackends() — Linux
@@ -176,6 +180,7 @@ const ALL: CatalogEngine[] = [
     support: 'experimental',
     installEndpoint: '',
     note: 'Builds the official repo with -DGGML_CUDA=ON and bundles its CUDA runtime libraries next to the binary, so it runs standalone. Manages like any other engine afterward (rebuild on a newer commit, disable, delete).',
+    defaultBranch: 'master',
     variants: [
       {
         id: 'llama.cpp-cuda-source',
@@ -208,6 +213,7 @@ const ALL: CatalogEngine[] = [
     support: 'experimental',
     installEndpoint: '',
     note: 'Run inside Termux (not the Android app store — get Termux from F-Droid or its GitHub releases). First install the toolchain: `pkg install git cmake clang`. Then use the guided build below. Real-device verified: toolchain install + partial compile confirmed live on a real Android 14 (4KB-page) emulator; a full clean build was not timed to completion in that session (GitHub #52 item 6).',
+    defaultBranch: 'master',
     variants: [
       {
         id: 'llama.cpp-android-source-cpu',
@@ -241,6 +247,7 @@ const ALL: CatalogEngine[] = [
     note:
       'No prebuilt binary. Select a branch below and TurboLLM clones + compiles it for you. '
       + 'Each branch you build becomes a separate engine (e.g. Llama-main, Llama-my-feature).',
+    defaultBranch: 'master',
     variants: [
       {
         id: 'llama.cpp-source-branch',
@@ -268,6 +275,7 @@ const ALL: CatalogEngine[] = [
     support: 'experimental',
     installEndpoint: '/api/v1/engines/vllm',
     note: 'Officially supported on Linux + NVIDIA/CUDA. macOS is CPU-only experimental; Windows is unsupported upstream. Installs a multi-GB Python environment.',
+    defaultBranch: 'main',
     // Classification-only variant (its pip install path is unchanged). Lets the
     // matcher/recommender reason about vLLM's fit on this box: Linux + NVIDIA.
     variants: [
@@ -294,6 +302,7 @@ const ALL: CatalogEngine[] = [
     support: 'stable',
     installEndpoint: '/api/v1/engines/mlx',
     note: 'macOS (Apple Silicon) only.',
+    defaultBranch: 'main',
     // Classification-only variant (its pip install path is unchanged). Lets the
     // matcher/recommender reason about MLX's fit on this box: macOS + Apple GPU.
     variants: [
@@ -321,6 +330,7 @@ const ALL: CatalogEngine[] = [
     support: 'experimental',
     installEndpoint: '/api/v1/engines/rapid-mlx',
     note: 'macOS (Apple Silicon) only. Loads the same MLX-format model directories as the MLX engine.',
+    defaultBranch: 'main',
     variants: [
       {
         id: 'rapid-mlx',
@@ -355,6 +365,7 @@ const ALL: CatalogEngine[] = [
       'real tool calls for the handful of chat templates it has a matching parser for. Other ' +
       'models accept the request without error but never call a tool (confirmed live on ' +
       'Qwen2.5-VL: its own /health reports "loaded_tool_parser": null).',
+    defaultBranch: 'main',
     variants: [
       {
         id: 'mlx-vlm',
@@ -380,6 +391,7 @@ const ALL: CatalogEngine[] = [
     support: 'experimental',
     installEndpoint: '/api/v1/engines/sglang',
     note: 'Officially supported on Linux + NVIDIA/CUDA 12+. macOS and Windows are unsupported upstream. Installs a multi-GB Python environment.',
+    defaultBranch: 'main',
     variants: [
       {
         id: 'sglang-cuda',
@@ -409,6 +421,7 @@ const ALL: CatalogEngine[] = [
     support: 'experimental',
     installEndpoint: '',
     note: 'No prebuilt binaries are published. Build llama-server from the fork, then use "Add your own engine" to point TurboLLM at it — it runs on the standard llama-server path.',
+    defaultBranch: 'main',
     variants: [
       {
         id: 'ik_llama.cpp-source',
@@ -437,6 +450,7 @@ const ALL: CatalogEngine[] = [
     support: 'experimental',
     installEndpoint: '/api/v1/engines/llamafile',
     note: 'Downloads one portable executable that bundles llama.cpp. GPU acceleration depends on your platform/drivers; falls back to CPU.',
+    defaultBranch: 'main',
     variants: [
       {
         id: 'llamafile',
@@ -464,6 +478,7 @@ const ALL: CatalogEngine[] = [
     support: 'experimental',
     installEndpoint: '/api/v1/engines/koboldcpp',
     note: 'Downloads a single KoboldCpp binary. The CUDA build is used on NVIDIA GPUs; the portable build (Vulkan/CPU) elsewhere. Windows/Linux are x64-only; macOS is Apple Silicon only.',
+    defaultBranch: 'concedo',
     variants: [
       {
         id: 'koboldcpp-cuda',
@@ -514,6 +529,7 @@ const ALL: CatalogEngine[] = [
     support: 'experimental',
     installEndpoint: '/api/v1/engines/turboquant',
     note: 'Prebuilt: macOS (Apple Silicon), Linux x64 (Vulkan). On Windows, build llama-server from the fork, then use "Add your own engine".',
+    defaultBranch: 'master',
     variants: [
       {
         id: 'turboquant-macos-metal',
@@ -562,6 +578,7 @@ const ALL: CatalogEngine[] = [
     support: 'experimental',
     installEndpoint: '',
     note: 'Upstream publishes prebuilt binaries, but TurboLLM builds from source here (guided walkthrough) rather than resolving a specific release asset. Proven on a ternary/Bonsai-class model at 200K context (Q2_0 + q8 KV).',
+    defaultBranch: 'prism',
     variants: [
       {
         id: 'prism-source',
@@ -590,6 +607,7 @@ const ALL: CatalogEngine[] = [
     support: 'experimental',
     installEndpoint: '',
     note: "Upstream publishes prebuilt binaries, but TurboLLM builds from source here. The KVarN cache types (kvarn2...kvarn8, set via --cache-type-k/-v) show up directly in the KV cache type dropdown, but aren't in the auto-tune sweep yet — pick one manually.",
+    defaultBranch: 'main',
     variants: [
       {
         id: 'beellama-source',

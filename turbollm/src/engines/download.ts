@@ -14,15 +14,23 @@ import type { GpuVendor } from '../sysinfo/sysinfo'
 
 const execFileP = promisify(execFile)
 
-/** Build standard GitHub API headers, injecting a `GITHUB_TOKEN` env var if present
- *  so authenticated requests get 5,000 req/hour instead of the 60/hour unauthenticated
- *  limit. Callers spread the result into their fetch() headers object. */
-export function githubHeaders(extra?: Record<string, string>): Record<string, string> {
+/** Build standard GitHub API headers, injecting a token so authenticated requests
+ *  get 5,000 req/hour instead of the 60/hour unauthenticated limit.
+ *
+ *  `tokenFn` is supplied by the caller (the daemon passes `() => cfg.gh.token`).
+ *  An empty/unset token falls back to the `GITHUB_TOKEN` env var, preserving the old
+ *  env-only path for local dev or container setups. Callers spread the result into
+ *  their fetch() headers object. */
+export function githubHeaders(
+  extra?: Record<string, string>,
+  tokenFn?: () => string,
+): Record<string, string> {
   const base: Record<string, string> = {
     Accept: 'application/vnd.github+json',
     'User-Agent': 'turbollm',
   }
-  const token = process.env.GITHUB_TOKEN?.trim()
+  let token = tokenFn?.() ?? ''
+  if (!token) token = process.env.GITHUB_TOKEN?.trim() ?? ''
   if (token) base['Authorization'] = `Bearer ${token}`
   return { ...base, ...extra }
 }

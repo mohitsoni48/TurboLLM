@@ -622,7 +622,7 @@ export function registerApi(app: Hono, d: Deps): void {
       // a generous cap is hit (protects against an unbounded loop against a huge/malicious repo).
       for (let page = 1; page <= 20; page++) {
         const res = await fetch(`https://api.github.com/repos/${repo}/branches?per_page=100&page=${page}`, {
-          headers: githubHeaders(),
+          headers: githubHeaders({}, () => d.store.snapshot().gh.token),
         })
         if (!res.ok) throw new Error(`GitHub API returned HTTP ${res.status}`)
         const data = (await res.json()) as { name: string }[]
@@ -633,7 +633,7 @@ export function registerApi(app: Hono, d: Deps): void {
       let defaultBranch = ''
       try {
         const info = await fetch(`https://api.github.com/repos/${repo}`, {
-          headers: githubHeaders(),
+          headers: githubHeaders({}, () => d.store.snapshot().gh.token),
         })
         if (info.ok) {
           const j = await info.json() as { default_branch?: string }
@@ -1637,6 +1637,7 @@ export function registerApi(app: Hono, d: Deps): void {
       gateway?: { autoSwap?: boolean; keepN?: number }
       tavilyApiKey?: string
       search?: { provider?: string; tavilyApiKey?: string; kagiApiKey?: string; searxngUrl?: string }
+      ghToken?: string
       build?: { toolchainDirs?: string[] }
       code?: { agentsMdProjectCandidates?: string[]; agentsMdGlobalCandidates?: string[]; defaultAgent?: string }
       toolPolicies?: Record<string, string>
@@ -1849,6 +1850,9 @@ export function registerApi(app: Hono, d: Deps): void {
       if (b.experimental?.turboLink !== undefined) cfg.daemon.experimental.turboLink = !!b.experimental.turboLink
       // HF token (spec 10 §4): write-only. An explicit '' clears it. Never logged.
       if (b.hfToken !== undefined) cfg.hf.token = String(b.hfToken).trim()
+      // GitHub token (write-only, same semantics as HF): an explicit '' clears it.
+      // Used to raise the rate limit from 60 → 5,000 req/hour for GitHub API calls.
+      if (b.ghToken !== undefined) cfg.gh.token = String(b.ghToken).trim()
       // Search provider config (F-020). All key/URL fields are write-only; '' clears them.
       // `search` is the canonical block; legacy top-level `tavilyApiKey` still works as an alias.
       cfg.tools.search ??= { provider: 'tavily' }
@@ -2407,6 +2411,8 @@ function settingsPayload(d: Deps) {
     // The HF token is write-only over the wire (spec 10 §4): we never echo it back,
     // only whether one is set, so the UI can show "configured" without leaking it.
     hfTokenSet: cfg.hf.token.length > 0,
+    // GitHub token is write-only: expose only whether it is set.
+    ghTokenSet: cfg.gh.token.length > 0,
     // Tavily API key is write-only: expose only whether it is set (legacy field, kept for compat).
     tavilyKeySet: !!(cfg.tools.search?.tavilyApiKey ?? cfg.tools.tavily?.apiKey),
     // Search provider config (F-020): provider + which credentials are set. Keys are write-only
