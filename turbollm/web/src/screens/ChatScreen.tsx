@@ -928,7 +928,9 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
       <div className="relative flex min-w-0 flex-1 flex-col">
         {/* Read-only banner (F-023: shown when ?readonly=1) */}
         {readonly && (
-          <div className="flex shrink-0 items-center gap-2 border-b border-border bg-panel-2 px-4 py-1.5 text-[12px] text-muted" style={{ paddingTop: 'var(--tllm-safe-top)', paddingBottom: 'var(--tllm-safe-bottom)' }}>
+          // No --tllm-safe-top here: Shell.tsx's own wrapper already pads every screen's
+          // top by this exact inset once — this was adding it a second time.
+          <div className="flex shrink-0 items-center gap-2 border-b border-border bg-panel-2 px-4 py-1.5 text-[12px] text-muted" style={{ paddingBottom: 'var(--tllm-safe-bottom)' }}>
             <span className="font-medium text-ink">Shared view</span>
             <span className="text-faint">—</span>
             <span>read only</span>
@@ -936,11 +938,13 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
         )}
 
         {/* Chat header: model load/switch/eject (always available) */}
-        {/* QA_BUGS.md BUG-03: on Android the status bar overlaps the header because the WebView's
-            viewport starts at the top of the screen, not below the status bar. Pad the header by
-            the safe-area inset so the menu button, model pill, sliders, and thinking-budget icon
-            sit below the status bar and outside Android's mandatory-system-gestures zone. */}
-        <div className="flex h-12 shrink-0 items-center gap-1.5 border-b border-border px-3 md:gap-2 md:px-4" style={{ paddingTop: 'var(--tllm-safe-top)', paddingBottom: 'var(--tllm-safe-bottom)' }}>
+        {/* QA_BUGS.md BUG-03 (original fix, now superseded): the safe-area padding that used to
+            live here moved to Shell.tsx's own wrapper, which pads every screen's top by this
+            same inset once — applying it again here double-counted it (confirmed live: a real
+            "extra padding at the top", once the inset's own value got fixed to its correct,
+            smaller size — this double-count was always there, just masked by that bug's much
+            larger error). */}
+        <div className="flex h-12 shrink-0 items-center gap-1.5 border-b border-border px-3 md:gap-2 md:px-4" style={{ paddingBottom: 'var(--tllm-safe-bottom)' }}>
           {/* Mobile: open the conversation drawer (the sidebar is off-canvas below md). Not
               rendered when embedded — there is no drawer of this component's own to open. */}
           {!embedded && (

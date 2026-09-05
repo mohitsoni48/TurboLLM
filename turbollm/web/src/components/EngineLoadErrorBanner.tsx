@@ -61,7 +61,13 @@ export function EngineLoadErrorBanner({ status }: { status: Status | undefined }
   return (
     <div
       className="border-b px-4 py-2"
-      style={{ borderColor: 'var(--border)', background: 'var(--panel)', paddingTop: 'calc(var(--tllm-safe-top, 0px) + 0.5rem)', paddingBottom: 'calc(var(--tllm-safe-top, 0px) + 0.5rem)' }}
+      // No --tllm-safe-top contribution here: Shell.tsx's own wrapper around this component
+      // (and EngineProvisionBanner) already pads the whole group by the safe-area inset once,
+      // for every screen — adding it again here double-counted it (confirmed live: a real,
+      // founder-reported "extra padding at the top" once the inset's own value got fixed to
+      // its correct, smaller size elsewhere — the double-count was always there, just masked
+      // by the other bug's much larger error).
+      style={{ borderColor: 'var(--border)', background: 'var(--panel)', paddingTop: '0.5rem', paddingBottom: '0.5rem' }}
     >
       <div className="flex items-center gap-2 text-[13px]">
         <span className="flex-1 font-medium" style={{ color: 'var(--err)' }}>

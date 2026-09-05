@@ -345,12 +345,14 @@ function MobileNav() {
     // the (still `h-14`, still vertically-centered) icon row rather than stealing from it, so the
     // pill lands in blank space instead of slicing through "Customize"/"Usage"'s labels. Elsewhere
     // (desktop, a phone with 3-button nav, or where the variable isn't set) this is a no-op.
-    // will-change: transform forces this sticky bar onto its own GPU compositing layer —
-    // founder-reported: on this Android WebView, a fast vertical scroll could make the bar
-    // itself flicker out of view mid-gesture (a known sticky-position repaint timing issue on
-    // some WebView builds) before reappearing once the scroll settled. Promoting it to its own
-    // layer up front means it never has to be repainted mid-scroll in the first place.
-    <nav className="sticky bottom-0 z-30 flex h-14 shrink-0 border-t border-border bg-panel-2 md:hidden" style={{ paddingBottom: 'var(--tllm-safe-bottom)', willChange: 'transform' }}>
+    // A `will-change: transform` GPU-layer-promotion attempt here (same-day, meant to stop the
+    // bar flickering mid-scroll) turned out to cause a worse, confirmed regression instead: the
+    // nav icons' SVGs rendered with computed height 0 (verified live via CDP — width stayed
+    // 20px, only height collapsed), even outside any scroll gesture at all. Reverted — a
+    // speculative fix for an unconfirmed symptom isn't worth a definite one. If the flicker
+    // needs revisiting, do it with a transform-based promotion (e.g. `transform:
+    // translateZ(0)`) verified NOT to collapse child intrinsic sizing in this WebView first.
+    <nav className="sticky bottom-0 z-30 flex h-14 shrink-0 border-t border-border bg-panel-2 md:hidden" style={{ paddingBottom: 'var(--tllm-safe-bottom)' }}>
       {NAV.map(({ to, label, icon: Icon }) => {
         const isActive = pathname === to || pathname.startsWith(`${to}/`)
         return (
@@ -362,7 +364,13 @@ function MobileNav() {
               isActive ? 'text-accent' : 'text-muted',
             )}
           >
-            <Icon size={20} />
+            {/* Explicit h-5/w-5 (not just the size={20} prop, which sets bare width/height HTML
+                attributes): founder-reported and confirmed live via CDP — in this WebView, these
+                icons rendered with computed height 0 (width stayed 20px) inside this flex-col
+                link, even though the SVG's own attributes were correct. An explicit CSS size
+                wins regardless of whatever's failing to resolve the bare-attribute intrinsic
+                size here. */}
+            <Icon size={20} className="h-5 w-5 shrink-0" />
             <span>{label}</span>
           </NavLink>
         )
