@@ -607,25 +607,28 @@ export function registerApi(app: Hono, d: Deps): void {
     c.json(await checkBuildPrereqs(d.store.snapshot().build.toolchainDirs)),
   )
 
-  // Fetch branch list for a GitHub repo (ADR branch selector). Accepts either a full HTTPS
-  // URL or an `owner/repo` identifier — normalises via normRepoUrl so both shapes work.
-  // Supports `limit` (default 50, max 100) and `offset` for pagination. Returns total count
-  // plus the page slice, with the default branch sorted first within the page.
+  // Fetch the full branch list for a GitHub repo (ADR branch selector). Accepts either a full
+  // HTTPS URL or an `owner/repo` identifier — normalises via normRepoUrl so both shapes work.
+  // Returns every branch (GitHub paginated, 100/page) with the default branch sorted first;
+  // the caller does its own client-side search filtering over the full list.
   app.get('/api/v1/build/git-branches', async (c) => {
     const raw = (c.req.query('repo') ?? '').trim()
     if (!raw) return err(c, 400, 'invalid_input', 'repo is required.')
     const repo = normRepoUrl(raw)
     if (!repo) return err(c, 400, 'invalid_input', 'repo must be a valid GitHub repo identifier.')
-    const limit = Math.min(parseInt(c.req.query('limit') ?? '50', 10) || 50, 100)
-    const offset = Math.max(parseInt(c.req.query('offset') ?? '0', 10) || 0, 0)
     try {
-      // GitHub's branches API doesn't expose total count directly, so we fetch 100 (max per page)
-      // and use that as the total. The caller paginates client-side.
-      const res = await fetch(`https://api.github.com/repos/${repo}/branches?per_page=100`, {
-        headers: githubHeaders(),
-      })
-      if (!res.ok) throw new Error(`GitHub API returned HTTP ${res.status}`)
-      const data = (await res.json()) as { name: string }[]
+      const names: string[] = []
+      // GitHub caps per_page at 100; walk pages until one comes back short (the last page) or
+      // a generous cap is hit (protects against an unbounded loop against a huge/malicious repo).
+      for (let page = 1; page <= 20; page++) {
+        const res = await fetch(`https://api.github.com/repos/${repo}/branches?per_page=100&page=${page}`, {
+          headers: githubHeaders(),
+        })
+        if (!res.ok) throw new Error(`GitHub API returned HTTP ${res.status}`)
+        const data = (await res.json()) as { name: string }[]
+        names.push(...data.map((b) => b.name))
+        if (data.length < 100) break
+      }
       // Try to detect the default branch from the repo metadata (second request).
       let defaultBranch = ''
       try {
@@ -637,11 +640,8 @@ export function registerApi(app: Hono, d: Deps): void {
           defaultBranch = j.default_branch ?? ''
         }
       } catch { /* best-effort — caller falls back to 'main' */ }
-      const names = data.map((b) => b.name)
       const sorted = defaultBranch ? [defaultBranch, ...names.filter((n) => n !== defaultBranch)] : names
-      const total = names.length
-      const page = sorted.slice(offset, offset + limit)
-      return c.json({ total, branches: page })
+      return c.json({ total: sorted.length, branches: sorted })
     } catch (e) {
       return err(c, 503, 'offline', `Could not fetch branches for ${repo}: ${e instanceof Error ? e.message : String(e)}`)
     }
