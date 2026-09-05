@@ -548,6 +548,9 @@ export function SettingsScreen() {
               {/* Models — Hugging Face token (spec 10 §4) */}
               <HfTokenSection tokenSet={settings?.hfTokenSet ?? false} onSaved={() => void settingsQ.refetch()} />
 
+              {/* GitHub token (rate limit for branch lookups) */}
+              <GitHubTokenSection tokenSet={settings?.ghTokenSet ?? false} onSaved={() => void settingsQ.refetch()} />
+
               {/* Advanced — expert knobs, collapsed by default (auto-first) */}
               <Collapsible className="rounded-lg border border-border bg-panel p-4">
                 <CollapsibleTrigger className="group flex w-full items-center gap-2 text-left">
@@ -1189,6 +1192,74 @@ function HfTokenSection({ tokenSet, onSaved }: { tokenSet: boolean; onSaved: () 
           )}
         </div>
       )}
+    </section>
+  )
+}
+
+// ── GitHub token ───────────────────────────────────────────────────────────────
+
+function GitHubTokenSection({ tokenSet, onSaved }: { tokenSet: boolean; onSaved: () => void }) {
+  const { save } = useSettings()
+  const [token, setToken] = useState('')
+
+  const handleSaveToken = () => {
+    save.mutate(
+      { ghToken: token.trim() },
+      {
+        onSuccess: () => {
+          toast.success(token.trim() ? 'GitHub token saved' : 'GitHub token cleared')
+          setToken('')
+          onSaved()
+        },
+        onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not save the token.'),
+      },
+    )
+  }
+
+  return (
+    <section className="rounded-lg border border-border bg-panel p-4">
+      <h2 className="mb-1 text-[13px] font-semibold uppercase tracking-wide text-faint">GitHub</h2>
+      <p className="mb-3 text-[12px] text-muted">
+        A GitHub token removes rate limits (60 → 5,000 req/hour) for branch lookups when
+        building from source. Token is write-only — never echoed back.{' '}
+        <a
+          href="https://github.com/settings/tokens"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-ink underline-offset-2 hover:underline"
+        >
+          Create a token
+        </a>
+        .
+      </p>
+
+      <div className="flex items-center justify-between py-1">
+        <div className="text-[13px] text-muted">
+          {tokenSet ? (
+            <span className="inline-flex items-center gap-1.5 text-ink">
+              <Check size={13} style={{ color: 'var(--ok)' }} />A token is configured
+            </span>
+          ) : (
+            'No token configured'
+          )}
+        </div>
+      </div>
+
+      <div className="mt-1 flex flex-col gap-2 sm:flex-row sm:items-center">
+        <input
+          type="password"
+          value={token}
+          onChange={(e) => setToken(e.target.value)}
+          placeholder={tokenSet ? 'Enter a new token to replace the current one' : 'ghp_…'}
+          autoComplete="off"
+          className="flex-1 rounded-md border border-border bg-bg px-2 py-1.5 font-mono text-[13px] text-ink outline-none"
+        />
+        <div className="flex items-center gap-2">
+          <Button size="sm" onClick={() => { track('settings', 'save_gh_token'); handleSaveToken() }} disabled={save.isPending}>
+            {token.trim() ? 'Save token' : 'Clear token'}
+          </Button>
+        </div>
+      </div>
     </section>
   )
 }

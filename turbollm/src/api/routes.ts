@@ -26,7 +26,7 @@ import {
   deleteAllBackendBuilds,
   installedBackendBuild,
   githubHeaders,
-  latestReleaseTag,
+  isRateLimited,
   provisionBackend,
   provisionTurboquant,
   recommendBackendId,
@@ -34,6 +34,7 @@ import {
 import {
   normalizeUpdatePolicy,
   tagFromManagedBinPath,
+  latestTagForInstalled,
 } from '../engines/update'
 import type { BackendId } from '../engines/download'
 import { ensureMlxEnv } from '../engines/mlx'
@@ -336,14 +337,17 @@ export function registerApi(app: Hono, d: Deps): void {
     if (!oldBin) return err(c, 409, 'not_installed', 'Backend is not installed — download it first.')
     { const busy = engineWorkBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
     // Honest upstream check FIRST: resolve the real latest tag. Offline → clear 503.
+    // Resolved in the INSTALLED tag's own format via the shared resolver: `releases/latest`
+    // returns llama.cpp's semver release (`v0.4.0`), which publishes no per-backend assets, so
+    // downloading it 404'd while the build the user actually wanted (b10818) was never fetched.
+    const installedTag = tagFromManagedBinPath(oldBin)
     let latestTag: string
     try {
-      latestTag = await latestReleaseTag('ggml-org/llama.cpp', AbortSignal.timeout(15_000))
+      latestTag = await latestTagForInstalled('ggml-org/llama.cpp', installedTag, AbortSignal.timeout(15_000))
     } catch {
       return err(c, 503, 'offline', "Couldn't reach GitHub to check for a newer build. Try again when online.")
     }
     if (!latestTag) return err(c, 503, 'offline', "GitHub didn't report a latest build. Try again later.")
-    const installedTag = tagFromManagedBinPath(oldBin)
     // Already on the real latest → honest "already latest" (no download).
     if (installedTag && installedTag === latestTag) {
       return c.json({ accepted: false, alreadyLatest: true, build: latestTag })
@@ -616,14 +620,30 @@ export function registerApi(app: Hono, d: Deps): void {
     if (!raw) return err(c, 400, 'invalid_input', 'repo is required.')
     const repo = normRepoUrl(raw)
     if (!repo) return err(c, 400, 'invalid_input', 'repo must be a valid GitHub repo identifier.')
+    // Exhausted-rate-limit marker. GitHub answers 403 (classic) or 429 (secondary limit) with
+    // `x-ratelimit-remaining: 0`; that is NOT a generic outage, so it must reach the UI as its
+    // own code rather than collapsing into `offline` — the Engines card keys the "add a GitHub
+    // token" hint off it. A 403 WITHOUT that header is a real permission error (private repo,
+    // bad token) and stays generic, otherwise we would tell the user to fix a token that is
+    // already fine.
+    const tokenSet = (d.store.snapshot().gh?.token ?? '').length > 0
     try {
       const names: string[] = []
       // GitHub caps per_page at 100; walk pages until one comes back short (the last page) or
       // a generous cap is hit (protects against an unbounded loop against a huge/malicious repo).
       for (let page = 1; page <= 20; page++) {
         const res = await fetch(`https://api.github.com/repos/${repo}/branches?per_page=100&page=${page}`, {
-          headers: githubHeaders(),
+          headers: githubHeaders({}, () => d.store.snapshot().gh?.token ?? ''),
         })
+        if (isRateLimited(res))
+          return err(
+            c,
+            403,
+            'github_rate_limited',
+            tokenSet
+              ? 'The configured GitHub token has exhausted its API rate limit (5,000 requests/hour). Branch lookups will work again after the limit resets.'
+              : 'GitHub’s unauthenticated API rate limit (60 requests/hour) is exhausted. Add a GitHub token in Settings to raise it to 5,000 requests/hour.',
+          )
         if (!res.ok) throw new Error(`GitHub API returned HTTP ${res.status}`)
         const data = (await res.json()) as { name: string }[]
         names.push(...data.map((b) => b.name))
@@ -633,7 +653,7 @@ export function registerApi(app: Hono, d: Deps): void {
       let defaultBranch = ''
       try {
         const info = await fetch(`https://api.github.com/repos/${repo}`, {
-          headers: githubHeaders(),
+          headers: githubHeaders({}, () => d.store.snapshot().gh?.token ?? ''),
         })
         if (info.ok) {
           const j = await info.json() as { default_branch?: string }
@@ -1637,6 +1657,7 @@ export function registerApi(app: Hono, d: Deps): void {
       gateway?: { autoSwap?: boolean; keepN?: number }
       tavilyApiKey?: string
       search?: { provider?: string; tavilyApiKey?: string; kagiApiKey?: string; searxngUrl?: string }
+      ghToken?: string
       build?: { toolchainDirs?: string[] }
       code?: { agentsMdProjectCandidates?: string[]; agentsMdGlobalCandidates?: string[]; defaultAgent?: string }
       toolPolicies?: Record<string, string>
@@ -1849,6 +1870,9 @@ export function registerApi(app: Hono, d: Deps): void {
       if (b.experimental?.turboLink !== undefined) cfg.daemon.experimental.turboLink = !!b.experimental.turboLink
       // HF token (spec 10 §4): write-only. An explicit '' clears it. Never logged.
       if (b.hfToken !== undefined) cfg.hf.token = String(b.hfToken).trim()
+      // GitHub token (write-only, same semantics as HF): an explicit '' clears it.
+      // Used to raise the rate limit from 60 → 5,000 req/hour for GitHub API calls.
+      if (b.ghToken !== undefined) (cfg.gh ??= { token: '' }).token = String(b.ghToken).trim()
       // Search provider config (F-020). All key/URL fields are write-only; '' clears them.
       // `search` is the canonical block; legacy top-level `tavilyApiKey` still works as an alias.
       cfg.tools.search ??= { provider: 'tavily' }
@@ -2407,6 +2431,8 @@ function settingsPayload(d: Deps) {
     // The HF token is write-only over the wire (spec 10 §4): we never echo it back,
     // only whether one is set, so the UI can show "configured" without leaking it.
     hfTokenSet: cfg.hf.token.length > 0,
+    // GitHub token is write-only: expose only whether it is set.
+    ghTokenSet: (cfg.gh?.token ?? '').length > 0,
     // Tavily API key is write-only: expose only whether it is set (legacy field, kept for compat).
     tavilyKeySet: !!(cfg.tools.search?.tavilyApiKey ?? cfg.tools.tavily?.apiKey),
     // Search provider config (F-020): provider + which credentials are set. Keys are write-only

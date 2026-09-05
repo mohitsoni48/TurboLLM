@@ -237,7 +237,7 @@ export type AppUpdate = {
   latest: string | null
   hasUpdate: boolean
   checkedAt: string
-  error?: 'offline'
+  error?: 'offline' | 'rate_limited'
   comparable: boolean
 }
 
@@ -375,7 +375,7 @@ export type EngineUpdateStatus = {
   latest: string | null
   hasUpdate: boolean
   checkedAt: string
-  error?: 'offline' | 'no_source'
+  error?: 'offline' | 'rate_limited' | 'no_source'
   comparable: boolean
   /** Set for source-built engines (ADR-088): the update is a source change that can't be
    *  auto-applied (TurboLLM can't recompile). The UI shows "newer source available →
@@ -403,8 +403,11 @@ export type CatalogEngine = {
   installEndpoint: string
   comingSoon?: boolean
   note?: string
+  /** The default branch for this repo (e.g. 'master' for llama.cpp, 'main' for most others).
+    *  Used to pre-select the branch in the dropdown. */
+  defaultBranch?: string
   /** Pin the build-from-source to an exact commit (7-40 hex) — e.g. the commit a `patchUrl`
-   *  was authored against. */
+    *  was authored against. */
   sourceCommit?: string
   /** URL of a unified-diff patch applied on top of `sourceCommit` before compiling (an arch not
    *  yet in mainline, e.g. solar_open2). Sent to /build/run with `patchSha256`. */

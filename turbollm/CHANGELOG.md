@@ -101,6 +101,53 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.12.4] - 2026-09-05
+
+### Added
+
+- **You can now save a GitHub token in Settings → Models & loading.** GitHub allows only 60
+  unauthenticated API requests per hour per IP, shared across everything TurboLLM asks it —
+  listing branches for a build-from-source engine, checking engines for updates, and downloading
+  new engine builds. Once that budget is spent, all of those quietly stop working until the hour
+  rolls over. Adding a token raises the limit to 5,000 requests/hour and applies to every one of
+  those calls. The token is write-only: it is never shown again after saving, and the app only
+  ever reports whether one is configured. It takes effect immediately, with no restart.
+
+### Fixed
+
+- **Prebuilt llama.cpp engines could never be updated.** "Manage GPU builds" reported *"Update
+  status unavailable"* no matter how far behind the installed build was. llama.cpp tags every
+  build `b#####` but also cuts occasional versioned releases (`v0.4.0`) and marks those as
+  GitHub's "latest release" — so a build installed as `b10455` was being compared against
+  `v0.4.0`, two formats that cannot be ordered, and the answer was always "can't tell". Updates
+  now compare against the newest build tag, so an out-of-date engine is correctly offered as
+  `b10455 → b10818` and installs.
+- **The branch dropdown offered only "main" for every build-from-source engine.** The repository
+  name was double-encoded before being sent to GitHub, so the lookup always failed and the list
+  fell back to a single hardcoded "main" — which was also wrong for engines whose default branch
+  is something else. The dropdown now lists the repository's real branches, and falls back to the
+  engine's own default when GitHub cannot be reached: llama.cpp is `master`, KoboldCpp is
+  `concedo`, Prism is `prism`, TurboQuant is `master`.
+- **Repositories with more than 100 branches could not be fully listed or searched.** Only the
+  first page of results was ever fetched, so the search box and "load more" could never reach the
+  rest — llama.cpp alone has 771 branches. All of them are now listed and searchable.
+- **A used-up GitHub rate limit was reported as "offline".** Update checks said *"Couldn't check
+  for updates (offline)"* when the machine's network was perfectly fine and the real cause was
+  the hourly API budget being spent — sending you to debug a connection that was never broken. It
+  now says the rate limit was reached and links to where you can add a token to raise it.
+
+### Changed
+
+- **The branch list is fetched when you open the dropdown, not when the Engines screen loads.**
+  Previously, merely visiting Engines queried GitHub for every build-from-source engine listed,
+  spending part of the hourly API budget whether or not you intended to pick a branch.
+
+### Discord
+- Engine updates work again — a prebuilt llama.cpp build would say "update status unavailable" forever, no matter how old it was. It now sees the new build and installs it.
+- The branch picker for build-from-source engines only ever showed "main". It now lists every branch in the repo (llama.cpp has 771 of them) and searching actually finds them.
+- You can add a GitHub token in Settings → Models & loading. GitHub only allows 60 anonymous requests an hour, and running out is what made branch lists and update checks quietly stop working — a token raises that to 5,000.
+- When you do hit that limit, TurboLLM now tells you so instead of claiming you're offline.
+
 ## [1.12.2] - 2026-09-02
 
 ### Added

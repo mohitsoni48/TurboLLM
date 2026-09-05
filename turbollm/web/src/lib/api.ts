@@ -697,8 +697,10 @@ export type DaemonSettings = {
   /** ComfyUI GPU coordination settings. */
   comfyui: ComfyUiSettings
   /** Whether an HF token is stored (spec 10 §4). The token itself is never echoed
-   *  back — write it via {@link saveSettings}'s `hfToken` patch field only. */
+    *  back — write it via {@link saveSettings}'s `hfToken` patch field only. */
   hfTokenSet: boolean
+  /** Whether a GitHub token is stored (same write-only semantics as HF). */
+  ghTokenSet: boolean
   /** Gateway intelligence settings (ADR-06x): model auto-swap + keep-N pool. */
   gateway: { autoSwap: boolean; keepN: number }
   /** Whether a Tavily API key is configured (legacy mirror of `search.tavilyKeySet`). */
@@ -759,6 +761,10 @@ export type DaemonSettingsPatch = Partial<Omit<DaemonSettings, 'comfyui' | 'tavi
    *  independently. */
   code?: Partial<DaemonSettings['code']>
   hfToken?: string
+  /** Write-only: set or clear ('') the stored GitHub token. Raises the GitHub API rate limit
+   *  for branch lookups from 60 to 5,000 requests/hour. Never echoed back — read the boolean
+   *  `ghTokenSet` from {@link DaemonSettings} instead. */
+  ghToken?: string
   /** Write-only: set or clear the Tavily API key (legacy alias for `search.tavilyApiKey`). */
   tavilyApiKey?: string
   /** Write-only search-provider patch (F-020). Key/URL fields set or clear ('') the stored value. */

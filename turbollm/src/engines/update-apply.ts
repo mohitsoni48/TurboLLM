@@ -19,7 +19,6 @@ import type { Registry } from './registry'
 import {
   backendDefAt,
   backendDir,
-  latestReleaseTag,
   provisionBackend,
   provisionTurboquant,
 } from './download'
@@ -30,7 +29,7 @@ import { ensureVllmEnv } from './vllm'
 import { ensureKoboldcpp, koboldcppDir } from './koboldcpp'
 import { ensureLlamafile, llamafileDir } from './llamafile'
 import { primaryVendor } from '../sysinfo/sysinfo'
-import { backendIdFromBinPath, tagFromManagedBinPath } from './update'
+import { backendIdFromBinPath, tagFromManagedBinPath, latestTagForInstalled } from './update'
 
 export interface UpdateApplyDeps {
   store: ConfigStore
@@ -66,7 +65,10 @@ async function applyLlamaCppUpdate(d: UpdateApplyDeps, engine: Engine, root: str
   const backendId = backendIdFromBinPath(engine.binPath)
   if (!backendId) throw new Error('Could not determine the GPU backend of this build.')
   const installedTag = tagFromManagedBinPath(engine.binPath)
-  const latestTag = await latestReleaseTag(OFFICIAL_LLAMA_REPO, signal)
+  // Resolve through the SHARED resolver, in the installed tag's own format. Asking for
+  // `releases/latest` here returned llama.cpp's semver release (`v0.4.0`), which carries no
+  // per-backend assets — so the download 404'd on an update the checker had correctly offered.
+  const latestTag = await latestTagForInstalled(OFFICIAL_LLAMA_REPO, installedTag, signal)
   if (!latestTag) throw new Error('GitHub did not report a latest build.')
   if (installedTag && installedTag === latestTag) return // already latest — nothing to do
   const newDef = backendDefAt(backendId, latestTag)
