@@ -26,6 +26,7 @@ import {
   deleteAllBackendBuilds,
   installedBackendBuild,
   githubHeaders,
+  isRateLimited,
   provisionBackend,
   provisionTurboquant,
   recommendBackendId,
@@ -625,8 +626,6 @@ export function registerApi(app: Hono, d: Deps): void {
     // token" hint off it. A 403 WITHOUT that header is a real permission error (private repo,
     // bad token) and stays generic, otherwise we would tell the user to fix a token that is
     // already fine.
-    const rateLimited = (res: Response) =>
-      (res.status === 403 || res.status === 429) && res.headers.get('x-ratelimit-remaining') === '0'
     const tokenSet = (d.store.snapshot().gh?.token ?? '').length > 0
     try {
       const names: string[] = []
@@ -636,7 +635,7 @@ export function registerApi(app: Hono, d: Deps): void {
         const res = await fetch(`https://api.github.com/repos/${repo}/branches?per_page=100&page=${page}`, {
           headers: githubHeaders({}, () => d.store.snapshot().gh?.token ?? ''),
         })
-        if (rateLimited(res))
+        if (isRateLimited(res))
           return err(
             c,
             403,
