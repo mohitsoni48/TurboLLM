@@ -97,6 +97,7 @@ export async function seedDefaultEngines(
     }
   }
 
+  let lastError: string | undefined
   for (const backend of chain) {
     try {
       provision.start(backend.id, 'seed')
@@ -109,10 +110,14 @@ export async function seedDefaultEngines(
       return
     } catch (e) {
       process.stdout.write('\n')
-      console.warn(`seed: ${backend.id} engine unavailable (${e instanceof Error ? e.message : e})`)
+      lastError = e instanceof Error ? e.message : String(e)
+      console.warn(`seed: ${backend.id} engine unavailable (${lastError})`)
       // try next backend in the fallback chain
     }
   }
-  provision.fail('Could not download a default engine. Check your connection or add one manually.')
+  // Surface the real last-backend error alongside the generic message — a bare "could not
+  // download" hides whether it was actually a network failure, a bad archive, or (Android's
+  // real-world case) the download succeeding but the binary failing its post-download probe.
+  provision.fail(`Could not download a default engine.${lastError ? ` [${lastError}]` : ' Check your connection or add one manually.'}`)
   console.warn('seed: could not provision a default engine — add one manually in Settings.')
 }
