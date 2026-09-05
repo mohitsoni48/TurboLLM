@@ -205,6 +205,14 @@ body {
   font-size: calc(14px * var(--font-scale, 1));
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
+  /* Founder-reported on Android: the Engines screen (document-scroll mode, so it's exempt
+     from the bounded-mode `overflow: hidden` above) could be dragged sideways — this is
+     nothing but the WebView's default horizontal rubber-band/overscroll bounce, since the
+     app is single-column and never actually has content wider than the viewport. Nothing here
+     should ever scroll horizontally, in either scroll mode, so this is unconditional rather
+     than scoped to one of the two like the height rule above. */
+  overflow-x: hidden;
+  overscroll-behavior: none;
 }
 
 /* Default border color for the Tailwind `border` utility (matches our token). */

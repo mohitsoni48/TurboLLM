@@ -345,7 +345,12 @@ function MobileNav() {
     // the (still `h-14`, still vertically-centered) icon row rather than stealing from it, so the
     // pill lands in blank space instead of slicing through "Customize"/"Usage"'s labels. Elsewhere
     // (desktop, a phone with 3-button nav, or where the variable isn't set) this is a no-op.
-    <nav className="sticky bottom-0 z-30 flex h-14 shrink-0 border-t border-border bg-panel-2 md:hidden" style={{ paddingBottom: 'var(--tllm-safe-bottom)'}}>
+    // will-change: transform forces this sticky bar onto its own GPU compositing layer —
+    // founder-reported: on this Android WebView, a fast vertical scroll could make the bar
+    // itself flicker out of view mid-gesture (a known sticky-position repaint timing issue on
+    // some WebView builds) before reappearing once the scroll settled. Promoting it to its own
+    // layer up front means it never has to be repainted mid-scroll in the first place.
+    <nav className="sticky bottom-0 z-30 flex h-14 shrink-0 border-t border-border bg-panel-2 md:hidden" style={{ paddingBottom: 'var(--tllm-safe-bottom)', willChange: 'transform' }}>
       {NAV.map(({ to, label, icon: Icon }) => {
         const isActive = pathname === to || pathname.startsWith(`${to}/`)
         return (
