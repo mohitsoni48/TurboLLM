@@ -17,7 +17,7 @@ import rehypeRaw from 'rehype-raw'
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize'
 import { ChevronDown, Download, ExternalLink, Lock, Zap } from 'lucide-react'
 import { ApiError, track } from '../../lib/api'
-import { useDownloadMutations, useHfRepo, useModelActions, useStatus, useSysInfo } from '../../lib/queries'
+import { useDownloadMutations, useHfRepo, useModelActions, useSettings, useStatus, useSysInfo } from '../../lib/queries'
 import { useLinks, useRemoteDownloadActions } from '../../lib/link-queries'
 import { DownloadTargetMenu } from '../../components/fleet'
 import { describeRemoteFailure } from '../../lib/remote-failure'
@@ -114,6 +114,9 @@ export function HfRepoContent({
   const [remoteDlError, setRemoteDlError] = useState<string | null>(null)
 
   const statusQ = useStatus()
+  // Only for `hfTokenSet` (see `blockedByGate` below). Host-gated and soft like the reads
+  // above: a browser off-box that can't read settings simply reports "no token".
+  const settingsQ = useSettings()
   const engineKind = statusQ.data?.engine.kind ?? ''
   const detail = detailQ.data
   const vramMb = sysQ.data?.gpus?.[0]?.vramMb
@@ -153,11 +156,16 @@ export function HfRepoContent({
 
   const fit = selectedFile ? fileFit(selectedFile.sizeBytes, vramMb) : 'unknown'
   const gated = detail?.gated ?? false
-  // Gated repos require the user to accept the license + configure an HF token in
-  // Settings → Models (spec 10 §4). The token state isn't exposed to this screen, so
-  // gated repos route through the guided flow and disable the in-dialog download; the
-  // enqueue endpoint is authoritative and returns 401/403 if the token is missing.
-  const blockedByGate = gated
+  // Gated repos require BOTH halves: the license accepted on huggingface.co AND an HF
+  // token in Settings → Models (spec 10 §4; catalog spec "pass-through to HF auth, never
+  // circumvent"). Only the token half is knowable here — `/settings` reports `hfTokenSet`
+  // — and it is the half that makes the attempt pointless, so that alone decides whether
+  // the button is blocked. WITH a token we let the request through and leave the verdict
+  // to the download path, which is authoritative and already types both refusals
+  // (401 `hf_unauthorized` / 403 `hf_gated`, surfaced on the download row). Blocking every
+  // gated repo regardless of token stranded users who had one configured (issue #198).
+  const hfTokenSet = settingsQ.query.data?.hfTokenSet ?? false
+  const blockedByGate = gated && !hfTokenSet
 
   const enqueueError = dlMut.enqueue.error instanceof ApiError ? dlMut.enqueue.error.message : null
 
@@ -258,6 +266,8 @@ export function HfRepoContent({
           detail={detail}
           vramMb={vramMb}
           engineKind={engineKind}
+          hfTokenSet={hfTokenSet}
+          blockedByGate={blockedByGate}
           onDownload={onDownloadSafetensors}
           isPending={dlMut.enqueue.isPending}
         />
@@ -288,18 +298,7 @@ export function HfRepoContent({
           )}
 
           {/* Gated guidance */}
-          {blockedByGate && (
-            <div className="rounded-md border px-3 py-2.5 text-[12px]" style={{ borderColor: 'var(--warn)', background: 'color-mix(in srgb, var(--warn) 10%, transparent)' }}>
-              <p className="text-ink">This is a gated model.</p>
-              <p className="mt-1 text-muted">
-                Accept the license on{' '}
-                <a href={`https://huggingface.co/${detail.repo}`} target="_blank" rel="noreferrer" className="inline-flex items-center gap-0.5 underline" style={{ color: 'var(--accent)' }}>
-                  huggingface.co <ExternalLink size={11} />
-                </a>
-                , then add a Hugging Face token in Settings → Models.
-              </p>
-            </div>
-          )}
+          {gated && <GatedNotice repo={detail.repo} hfTokenSet={hfTokenSet} />}
 
           {enqueueError && <p className="text-[12px]" style={{ color: 'var(--err)' }}>{enqueueError}</p>}
           {remoteDlError && <p className="text-[12px]" style={{ color: 'var(--err)' }}>{remoteDlError}</p>}
@@ -536,17 +535,49 @@ function ModelCard({ text }: { text: string }) {
   )
 }
 
+/** The gated-repo notice, shared by the GGUF and safetensors bodies. Gating has two
+ *  halves — license accepted on HF, token configured here — so the copy says which one
+ *  is still on the user. With a token set the download is allowed to run (the failure,
+ *  if the license was never accepted, comes back typed from the download path); without
+ *  one there is nothing to try, so the button beside this notice is disabled. */
+function GatedNotice({ repo, hfTokenSet }: { repo: string; hfTokenSet: boolean }) {
+  const hfLink = (
+    <a href={`https://huggingface.co/${repo}`} target="_blank" rel="noreferrer" className="inline-flex items-center gap-0.5 underline" style={{ color: 'var(--accent)' }}>
+      huggingface.co <ExternalLink size={11} />
+    </a>
+  )
+  return (
+    <div className="rounded-md border px-3 py-2.5 text-[12px]" style={{ borderColor: 'var(--warn)', background: 'color-mix(in srgb, var(--warn) 10%, transparent)' }}>
+      <p className="text-ink">This is a gated model.</p>
+      {hfTokenSet ? (
+        <p className="mt-1 text-muted">
+          Your Hugging Face token will be used. Accept the license on {hfLink} with that same
+          account first — the download fails otherwise.
+        </p>
+      ) : (
+        <p className="mt-1 text-muted">
+          Accept the license on {hfLink}, then add a Hugging Face token in Settings → Models.
+        </p>
+      )}
+    </div>
+  )
+}
+
 /** Body shown for safetensors repos (MLX / vLLM) — no quant selection, whole-directory download. */
 function MlxRepoBody({
   detail,
   vramMb,
   engineKind,
+  hfTokenSet,
+  blockedByGate,
   onDownload,
   isPending,
 }: {
-  detail: { files: { sizeBytes: number }[]; gated: boolean }
+  detail: { repo: string; files: { sizeBytes: number }[]; gated: boolean }
   vramMb: number | undefined
   engineKind: string
+  hfTokenSet: boolean
+  blockedByGate: boolean
   onDownload: () => void
   isPending: boolean
 }) {
@@ -573,7 +604,11 @@ function MlxRepoBody({
         </span>
       </div>
 
-      <Button className="w-full" onClick={() => { track('models', 'download_hf_model'); onDownload() }} disabled={detail.gated || isPending}>
+      {/* Same gated rule as the GGUF body — a safetensors repo used to be blocked with no
+          explanation at all, since the notice only ever rendered on the GGUF side. */}
+      {detail.gated && <GatedNotice repo={detail.repo} hfTokenSet={hfTokenSet} />}
+
+      <Button className="w-full" onClick={() => { track('models', 'download_hf_model'); onDownload() }} disabled={blockedByGate || isPending}>
         <Download size={14} />
         {isPending ? 'Queuing…' : btnLabel}
       </Button>
