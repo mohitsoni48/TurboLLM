@@ -87,8 +87,12 @@ export function Shell({
     <div className={cn('app-shell flex', documentScroll ? 'min-h-dvh' : 'h-full')}>
       {!onOnboarding && <NavRail status={status} online={online} version={version} className="hidden md:flex" />}
       <div className="flex min-w-0 flex-1 flex-col">
-        <EngineProvisionBanner status={status} />
-        <EngineLoadErrorBanner status={status} />
+        {/* QA_BUGS.md BUG-07: the error banner inherits the top-safe-area problem (BUG-03).
+            Pad it so it sits below the status bar on Android. */}
+        <div style={{ paddingTop: 'var(--tllm-safe-top)' }}>
+          <EngineProvisionBanner status={status} />
+          <EngineLoadErrorBanner status={status} />
+        </div>
         {/* Bounded mode: `main` is the scroller. Document mode: it must NOT be, or the window
             still has nothing to scroll — and `min-h-0` comes off with it so `main` keeps a
             content-height floor inside the now auto-height column. */}
@@ -319,6 +323,8 @@ function MobileNav() {
   // moment the user is on a DIFFERENT Workspace sub-route than whichever one happens to be
   // remembered right now, reading "not active" while genuinely inside Workspace.
   const { pathname } = useLocation()
+  // QA_BUGS.md BUG-04: on Android the gesture-navigation home indicator overlaps the bottom
+  // tab bar. Pad the bottom by the safe-area inset so the tab labels sit above the pill.
   return (
     // Issue #178, load-bearing: this used to be `position: static`, which is fine only while the
     // page can't scroll. In document-scroll mode a static bar sits at the END of a 3000px page —
@@ -327,7 +333,7 @@ function MobileNav() {
     // has no scrolling ancestor and the bar is already the last row of a 100vh flex column.
     // `h-14` pins the height that index.css's `--tllm-mobile-nav-h` is written against (it was
     // already 56px from its content; now it says so) — keep the two in step.
-    <nav className="sticky bottom-0 z-30 flex h-14 shrink-0 border-t border-border bg-panel-2 md:hidden">
+    <nav className="sticky bottom-0 z-30 flex h-14 shrink-0 border-t border-border bg-panel-2 md:hidden" style={{ paddingBottom: 'var(--tllm-safe-bottom)'}}>
       {NAV.map(({ to, label, icon: Icon }) => {
         const isActive = pathname === to || pathname.startsWith(`${to}/`)
         return (

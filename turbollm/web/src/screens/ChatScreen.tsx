@@ -924,7 +924,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
       <div className="relative flex min-w-0 flex-1 flex-col">
         {/* Read-only banner (F-023: shown when ?readonly=1) */}
         {readonly && (
-          <div className="flex shrink-0 items-center gap-2 border-b border-border bg-panel-2 px-4 py-1.5 text-[12px] text-muted">
+          <div className="flex shrink-0 items-center gap-2 border-b border-border bg-panel-2 px-4 py-1.5 text-[12px] text-muted" style={{ paddingTop: 'var(--tllm-safe-top)', paddingBottom: 'var(--tllm-safe-bottom)' }}>
             <span className="font-medium text-ink">Shared view</span>
             <span className="text-faint">—</span>
             <span>read only</span>
@@ -932,7 +932,11 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
         )}
 
         {/* Chat header: model load/switch/eject (always available) */}
-        <div className="flex h-12 shrink-0 items-center gap-1.5 border-b border-border px-3 md:gap-2 md:px-4">
+        {/* QA_BUGS.md BUG-03: on Android the status bar overlaps the header because the WebView's
+            viewport starts at the top of the screen, not below the status bar. Pad the header by
+            the safe-area inset so the menu button, model pill, sliders, and thinking-budget icon
+            sit below the status bar and outside Android's mandatory-system-gestures zone. */}
+        <div className="flex h-12 shrink-0 items-center gap-1.5 border-b border-border px-3 md:gap-2 md:px-4" style={{ paddingTop: 'var(--tllm-safe-top)', paddingBottom: 'var(--tllm-safe-bottom)' }}>
           {/* Mobile: open the conversation drawer (the sidebar is off-canvas below md). Not
               rendered when embedded — there is no drawer of this component's own to open. */}
           {!embedded && (
@@ -1142,7 +1146,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
           <button
             type="button"
             onClick={() => { track('chat', 'scroll_to_latest'); userScrolledUp.current = false; scrollToBottom(true) }}
-            className="absolute bottom-28 left-1/2 -translate-x-1/2 flex animate-[tllm-rise-in_150ms_ease-out] items-center gap-1.5 rounded-full border border-border bg-panel px-3 py-1.5 text-[13px] text-muted shadow-[var(--shadow-2)] transition-colors hover:text-ink motion-reduce:animate-none"
+            className="absolute bottom-28 left-1/2 -translate-x-1/2 flex animate-[tllm-rise-in_150ms_ease-out] items-center gap-1.5 rounded-full border border-border bg-panel px-3 py-1.5 text-[13px] text-muted shadow-[var(--shadow-2)] transition-colors hover:text-ink motion-reduce:animate-none" style={{ marginBottom: 'var(--tllm-safe-bottom)'}}
           >
             <ArrowDown size={13} /> Jump to latest
           </button>
@@ -1151,7 +1155,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
         {/* Clipboard fallback modal (F-023): shown when navigator.clipboard is unavailable */}
         {clipboardFallback && (
           <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => { track('chat', 'dismiss_clipboard_modal'); setClipboardFallback(null) }}>
-            <div className="mx-4 w-full max-w-lg rounded-lg border border-border bg-panel p-4 shadow-[var(--shadow-2)]" onClick={(e) => e.stopPropagation()}>
+            <div className="mx-4 w-full max-w-lg rounded-lg border border-border bg-panel p-4 shadow-[var(--shadow-2)]" onClick={(e) => e.stopPropagation()} style={{ paddingBottom: 'calc(var(--tllm-safe-bottom, 0px) + 1rem)'}}>
               <div className="mb-2 flex items-center justify-between">
                 <span className="text-[13px] font-medium text-ink">{clipboardFallback.title}</span>
                 <button type="button" onClick={() => { track('chat', 'dismiss_clipboard_modal'); setClipboardFallback(null) }} className="text-faint hover:text-ink"><X size={14} /></button>

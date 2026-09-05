@@ -167,6 +167,13 @@ html:not(.tllm-doc-scroll) #root {
      single case that gives --tllm-mobile-nav-h its 3.5rem. HardwareBar toggles the tllm-hw-bar
      class on <html> for its lifetime, exactly like Shell does for tllm-doc-scroll. */
   --tllm-hw-bar-h: 0px;
+  /* Android safe-area insets (QA_BUGS.md BUG-03/04/06/07). The embedded System WebView on
+     Android resolves env(safe-area-inset-*) to 0px in some Chromium builds, so we also
+     expose CSS custom properties that the Android inject-JS patch (DaemonWebView.kt's
+     HEIGHT_FIX_JS) can override with real pixel values read from the native window insets.
+     Desktop browsers ignore these — they have no notches or gesture bars. */
+  --tllm-safe-top: 0px;
+  --tllm-safe-bottom: 0px;
 }
 @media (max-width: 767px) {
   html.tllm-doc-scroll {
@@ -174,6 +181,13 @@ html:not(.tllm-doc-scroll) #root {
   }
   html.tllm-doc-scroll.tllm-hw-bar {
     --tllm-hw-bar-h: 1.5rem;
+  }
+  /* On Android the status bar and gesture-nav pill eat into the viewport. The WebView's
+     injected JS (DaemonWebView.kt) sets these at runtime from the native insets; the
+     fallback `env()` values cover bare-browser testing on devices that do support them. */
+  :root {
+    --tllm-safe-top: env(safe-area-inset-top, 24px);
+    --tllm-safe-bottom: env(safe-area-inset-bottom, 24px);
   }
 }
 

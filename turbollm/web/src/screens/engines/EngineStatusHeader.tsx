@@ -118,12 +118,17 @@ export function EngineStatusHeader({
             </span>
             <CopyButton text={(error?.logTail ?? []).join('\n')} label="Copy" size={14} screen="engines" />
           </div>
-          <pre
-            className="max-h-48 overflow-auto rounded-md px-3 py-2 font-mono text-[12px] leading-[1.5]"
-            style={{ background: 'var(--log-bg)', color: 'var(--log-err-ink)' }}
-          >
-            {(error.logTail ?? []).join('\n') || 'No log output captured.'}
-          </pre>
+          {/* QA_BUGS.md BUG-12: hide the black log panel entirely when there's no content.
+              An empty <pre> with --log-bg (#0b0b0c) rendered as a solid-black rounded bar
+              with no visible text — read as a glitched UI element. */}
+          {((error.logTail ?? []).length > 0) && (
+            <pre
+              className="mt-1.5 max-h-48 overflow-auto rounded-md px-3 py-2 font-mono text-[12px] leading-[1.5]"
+              style={{ background: 'var(--log-bg)', color: 'var(--log-err-ink)' }}
+            >
+              {(error.logTail ?? []).join('\n')}
+            </pre>
+          )}
         </div>
       )}
     </>
