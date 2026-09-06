@@ -195,6 +195,24 @@ const admin = await worker.fetch(adminReq({ authorization: 'Bearer secret-token'
 const adminBody = await admin.json()
 if (admin.status === 200 && adminBody.count === rows.length) pass(`admin with token — ${adminBody.count} rows`)
 else fail('admin listing wrong: ' + admin.status)
+// A secret set via 'Get-Clipboard | wrangler secret put' arrives with a trailing
+// CRLF. The dashboard sends the clean string, so without trimming BOTH sides every
+// request 401s and nothing on screen explains why.
+const sloppyEnv = { DB: fakeDB, ADMIN_TOKEN: 'secret-token\r\n' };
+const sloppy = await worker.fetch(adminReq({ authorization: 'Bearer secret-token' }), sloppyEnv);
+const spaced = await worker.fetch(adminReq({ authorization: 'Bearer  secret-token  ' }), env);
+if (sloppy.status === 200 && spaced.status === 200) pass('trailing whitespace on either side of the token still authenticates');
+else fail(`whitespace-tolerant auth broken: storedCRLF=${sloppy.status} sentPadded=${spaced.status}`);
+
+// The dashboard runs from file:// (Origin: null), so EVERY admin response needs
+// access-control-allow-origin. Without it on the errors, the browser blocks the 401
+// body and the dashboard reports "could not reach the Worker" for a wrong token.
+const acao = (r) => r.headers.get('access-control-allow-origin');
+const a401 = await worker.fetch(adminReq({ authorization: 'Bearer nope' }), env);
+const a503 = await worker.fetch(adminReq({ authorization: 'Bearer x' }), { DB: fakeDB });
+if (acao(admin) === '*' && acao(a401) === '*' && acao(a503) === '*') pass('every admin response carries CORS (200, 401 and 503) so file:// can read the error');
+else fail(`admin CORS missing: 200=${acao(admin)} 401=${acao(a401)} 503=${acao(a503)}`);
+
 await check('admin with no secret configured', await worker.fetch(adminReq({ authorization: 'Bearer secret-token' }), { DB: fakeDB }), 503)
 
 // ── misc routes ────────────────────────────────────────────────────────────

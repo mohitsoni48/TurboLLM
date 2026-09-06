@@ -184,13 +184,41 @@ async function handleSignup(req: Request, env: Env, origin: string | null, ctx?:
   return json({ ok: true, status: updated ? 'updated' : 'registered', position }, 200, origin)
 }
 
+// Every /admin response — success AND failure — goes through here.
+//
+// `access-control-allow-origin: *` is safe precisely because the gate is a bearer
+// header rather than a cookie: no browser attaches it automatically, so there is no
+// cross-site request to forge. It has to be `*` because the dashboard is opened from
+// disk (file://), which sends `Origin: null`.
+//
+// The errors need it just as much as the success does. Without it the browser blocks
+// the 401 body, `fetch` rejects, and the dashboard reports "could not reach the
+// Worker" — a network error for what is really a wrong token. Shipped that way once;
+// it cost a debugging session.
+function adminJson(data: unknown, status: number): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "content-type": "application/json",
+      "access-control-allow-origin": "*",
+      "access-control-allow-headers": "authorization,content-type",
+      "cache-control": "no-store",
+    },
+  })
+}
+
 async function handleAdmin(req: Request, env: Env): Promise<Response> {
   if (!env.ADMIN_TOKEN) {
-    return json({ ok: false, error: 'ADMIN_TOKEN is not configured on this Worker.' }, 503, null)
+    return adminJson({ ok: false, error: "ADMIN_TOKEN is not configured on this Worker." }, 503)
   }
-  const given = (req.headers.get('authorization') ?? '').replace(/^Bearer\s+/i, '')
-  if (!given || !tokenMatches(given, env.ADMIN_TOKEN)) {
-    return json({ ok: false, error: 'Unauthorized.' }, 401, null)
+  // Both sides are trimmed. `Get-Clipboard | wrangler secret put` — the obvious way
+  // to set this without the value touching your shell history — pipes a trailing
+  // CRLF, so the stored secret ends in whitespace while the dashboard sends the clean
+  // string, and every request 401s for no visible reason. Trailing whitespace is never
+  // part of a token, so accepting it costs nothing and saves a baffling debug session.
+  const given = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "").trim()
+  if (!given || !tokenMatches(given, env.ADMIN_TOKEN.trim())) {
+    return adminJson({ ok: false, error: "Unauthorized." }, 401)
   }
 
   const { results } = await env.DB.prepare(
@@ -199,18 +227,7 @@ async function handleAdmin(req: Request, env: Env): Promise<Response> {
      FROM signups ORDER BY created_at DESC`,
   ).all()
 
-  // `access-control-allow-origin: *` is safe here precisely because the gate is
-  // a bearer header rather than a cookie: no browser attaches it automatically,
-  // so there is no cross-site request to forge. It has to be `*` because the
-  // dashboard is opened from disk (file://), which sends `Origin: null`.
-  return new Response(JSON.stringify({ ok: true, count: results.length, signups: results }), {
-    headers: {
-      'content-type': 'application/json',
-      'access-control-allow-origin': '*',
-      'access-control-allow-headers': 'authorization,content-type',
-      'cache-control': 'no-store',
-    },
-  })
+  return adminJson({ ok: true, count: results.length, signups: results }, 200)
 }
 
 export default {

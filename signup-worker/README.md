@@ -26,17 +26,16 @@ Paste the `database_id` it prints into `wrangler.toml`, then:
 
 ```powershell
 npx wrangler d1 execute turbollm-signup --remote --file=schema.sql
-npx wrangler secret put ADMIN_TOKEN
-npx wrangler secret put RESEND_API_KEY
 npx wrangler deploy
 ```
 
-For `ADMIN_TOKEN`, paste a long random string — it is the only thing standing between the public
-internet and the applicant list. Generate one with:
+Then set the two secrets — **follow "Setting the secrets" below rather than improvising**, because
+the obvious ways to do it fail quietly and one of them leaks the value. `ADMIN_TOKEN` is the only
+thing standing between the public internet and the applicant list.
 
-```powershell
-[Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
-```
+(Note for anyone reaching for a one-liner: `[Security.Cryptography.RandomNumberGenerator]::GetBytes(32)`
+is .NET Core only and throws on Windows PowerShell 5.1. Use the `::Create()` form in the next
+section, which works on both.)
 
 The deploy provisions `signup.turbollm.dev` as a custom domain (a proxied DNS record is created as
 part of the deploy, so "deployed" and "reachable" are the same statement). Verify:
@@ -44,6 +43,46 @@ part of the deploy, so "deployed" and "reachable" are the same statement). Verif
 ```powershell
 curl.exe https://signup.turbollm.dev/health
 ```
+
+## Setting the secrets — use a file, not the clipboard
+
+Both secrets cost a real debugging session to set correctly. Two traps, in order of how
+much time they burn:
+
+1. **`wrangler secret put X` takes the secret's NAME as its argument, and asks for the
+   value separately.** Passing the value creates a secret *named* after your token. Secret
+   names are not secret — `wrangler secret list` and the Cloudflare dashboard both print
+   them in plain text — so a key fed in this way must be treated as leaked and rotated.
+2. **`Get-Clipboard | wrangler secret put …` pipes a trailing CRLF**, and the clipboard can
+   change between generating a value and setting it. Either way the stored secret differs
+   from what you paste elsewhere, and every request 401s with nothing on screen explaining
+   why. (The Worker now trims both sides, so the newline alone no longer breaks it — but a
+   stale clipboard still will.)
+
+Use a file as the single source for both the secret and your test, so there is nothing to
+get out of sync (PowerShell):
+
+```powershell
+# 1. generate to a file — -NoNewline matters
+$b = New-Object byte[] 32
+([Security.Cryptography.RandomNumberGenerator]::Create()).GetBytes($b)
+(($b | ForEach-Object { $_.ToString('x2') }) -join '') | Set-Content -NoNewline "$env:TEMP\tok.txt"
+
+# 2. set it from that exact file
+Get-Content -Raw "$env:TEMP\tok.txt" | npx wrangler secret put ADMIN_TOKEN --name turbollm-signup
+
+# 3. prove it works, bypassing the dashboard entirely
+$t = (Get-Content -Raw "$env:TEMP\tok.txt").Trim()
+curl.exe -s -H "Authorization: Bearer $t" https://signup.turbollm.dev/admin/signups
+
+# 4. paste the file's contents into the dashboard, then delete it
+Remove-Item "$env:TEMP\tok.txt"
+```
+
+`{"ok":true,"count":0,...}` from step 3 means the token is right and any remaining problem
+is in the dashboard field. Confirm what is actually set with `npx wrangler secret list
+--name turbollm-signup` — you want exactly two entries named `ADMIN_TOKEN` and
+`RESEND_API_KEY`. A long random string appearing as a *name* means trap 1 happened.
 
 ## Confirmation email (Resend)
 
