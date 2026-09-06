@@ -7,6 +7,9 @@
 // dev server to fall back on (this project has no spare ports — ADR-401).
 import worker from './src/index.ts'
 import { buildConfirmation } from './src/email.ts'
+import { buildInvite } from './src/invite.ts'
+import { generate, OUT } from './scripts-build-templates.mjs'
+import { readFileSync } from 'node:fs'
 
 const ORIGIN = 'https://turbollm.dev'
 let rows = []
@@ -18,6 +21,11 @@ const fakeDB = {
     const stmt = {
       bind(...a) { args = a; return stmt },
       async run() {
+        if (/UPDATE signups SET invited_at/.test(sql)) {
+          const [at, id] = args
+          const r = rows.find((x) => x.id === id)
+          if (r) r.invited_at = at
+        }
         if (/UPDATE signups SET email_sent_at/.test(sql)) {
           const [sentAt, err, id] = args
           const r = rows.find((x) => x.id === id)
@@ -44,7 +52,19 @@ const fakeDB = {
         }
         return null
       },
-      async all() { return { results: rows } },
+      async all() {
+        if (/FROM signups\s+WHERE platforms LIKE/.test(sql)) {
+          const [pat] = args
+          const needle = pat.replace(/%/g, '')
+          let r = rows.filter((x) => (x.platforms || '').includes(needle))
+          if (!/resend/.test(sql) && /invited_at IS NULL/.test(sql)) r = r.filter((x) => !x.invited_at)
+          // Honour the LIMIT the Worker emits, so the test exercises the real clause.
+          const lim = /LIMIT (\d+)/.exec(sql)
+          if (lim) r = r.slice(0, Number(lim[1]))
+          return { results: r }
+        }
+        return { results: rows }
+      },
     }
     return stmt
   },
@@ -87,6 +107,11 @@ async function check(label, res, expectStatus, assert) {
   if (res.status === expectStatus && (!assert || assert(body, res))) pass(`${label} — ${res.status} ${JSON.stringify(body)}`)
   else fail(`${label}: got ${res.status} ${JSON.stringify(body)}`)
 }
+
+// ── templates are generated from the .md files ─────────────────────────────
+// A template edit that was never regenerated would ship the OLD copy silently.
+if (readFileSync(OUT, 'utf8') === generate()) pass('src/templates/index.ts is in sync with the .md sources')
+else fail('src/templates/index.ts is STALE — run: node scripts-build-templates.mjs')
 
 // ── core signup ────────────────────────────────────────────────────────────
 await check('valid signup', await worker.fetch(post(valid), env), 200, (b, r) =>
@@ -214,6 +239,79 @@ if (acao(admin) === '*' && acao(a401) === '*' && acao(a503) === '*') pass('every
 else fail(`admin CORS missing: 200=${acao(admin)} 401=${acao(a401)} 503=${acao(a503)}`);
 
 await check('admin with no secret configured', await worker.fetch(adminReq({ authorization: 'Bearer secret-token' }), { DB: fakeDB }), 503)
+
+// ── /admin/invite ──────────────────────────────────────────────────────────
+const invite = (body, headers = { authorization: 'Bearer secret-token' }) =>
+  new Request('https://signup.turbollm.dev/admin/invite', {
+    method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body),
+  })
+const LINK = 'https://play.google.com/apps/internaltest/123'
+
+await check('invite without a token', await worker.fetch(invite({ platform: 'android', url: LINK }, {}), env), 401)
+await check('invite with a bad platform', await worker.fetch(invite({ platform: 'symbian', url: LINK }), env), 400)
+await check('invite with a non-https url', await worker.fetch(invite({ platform: 'android', url: 'http://x' }), env), 400)
+
+// Dry run is the DEFAULT — omitting `send` must never mail a real list.
+mail = []
+const dry = await worker.fetch(invite({ platform: 'android', url: LINK }), env)
+const dryBody = await dry.json()
+const androidRows = rows.filter((r) => (r.platforms || '').includes('android') && !r.invited_at)
+if (dryBody.dryRun === true && dryBody.wouldSend === androidRows.length && mail.length === 0) {
+  pass(`invite defaults to a dry run — reported ${dryBody.wouldSend} recipients, sent 0`)
+} else fail('dry run wrong: ' + JSON.stringify(dryBody) + ' mails=' + mail.length)
+
+// Only android, and only once.
+mail = []
+const sendRes = await worker.fetch(invite({ platform: 'android', url: LINK, send: true }), env)
+const sendBody = await sendRes.json()
+const everyoneMailed = mail.every((m) => rows.find((r) => r.email === m.to[0] && (r.platforms || '').includes('android')))
+if (sendBody.sent === androidRows.length && mail.length === androidRows.length && everyoneMailed) {
+  pass(`invite sent to ${sendBody.sent} android testers, nobody else`)
+} else fail('send wrong: ' + JSON.stringify(sendBody) + ' mails=' + mail.length)
+if (mail[0] && mail[0].subject === 'Your TurboLLM Android build is ready' && mail[0].text.includes(LINK)
+    && mail[0].text.includes('Become a tester') && mail[0].text.includes('same Google account')) {
+  pass('invite email carries the link and the two Play gotchas (become a tester, right account)')
+} else fail('invite content wrong: ' + JSON.stringify(mail[0] && mail[0].subject))
+if (androidRows.every((r) => r.invited_at)) pass('invited_at stamped, so a re-run will skip them')
+else fail('invited_at not stamped')
+
+// Re-running must not mail the same people twice.
+mail = []
+const again = await worker.fetch(invite({ platform: 'android', url: LINK, send: true }), env)
+const againBody = await again.json()
+if (againBody.sent === 0 && mail.length === 0) pass('re-running the same invite mails nobody twice')
+else fail('re-run resent: ' + JSON.stringify(againBody))
+
+// resend:true is the deliberate override.
+mail = []
+const forced = await worker.fetch(invite({ platform: 'android', url: LINK, send: true, resend: true }), env)
+const forcedBody = await forced.json()
+if (forcedBody.sent === androidRows.length) pass('resend:true deliberately mails them again')
+else fail('resend override broken: ' + JSON.stringify(forcedBody))
+
+// A send failure must be reported, not silently counted as delivered.
+mailStatus = 500
+mail = []
+const brokeRes = await worker.fetch(invite({ platform: 'android', url: LINK, send: true, resend: true }), env)
+const broke = await brokeRes.json()
+if (broke.ok === false && broke.sent === 0 && broke.failed.length === androidRows.length && /resend 500/.test(broke.failed[0].error)) {
+  pass('a failed invite is reported per-recipient, not counted as sent')
+} else fail('failure reporting wrong: ' + JSON.stringify(broke))
+mailStatus = 200
+
+// `limit` is what a scheduled "invite the top N" run depends on, and it must mean
+// the longest-waiting people, not an arbitrary slice.
+mail = []
+rows.forEach((r) => { r.invited_at = null })
+const capped = await worker.fetch(invite({ platform: 'android', url: LINK, limit: 3 }), env)
+const cappedBody = await capped.json()
+const firstThree = rows.filter((r) => (r.platforms || '').includes('android')).slice(0, 3).map((r) => r.id)
+if (cappedBody.wouldSend === 3 && JSON.stringify(cappedBody.recipients.map((r) => r.id)) === JSON.stringify(firstThree)) {
+  pass('limit:3 picks the three lowest ids — the longest-waiting people')
+} else fail('limit wrong: ' + JSON.stringify(cappedBody.recipients))
+const bogus = await worker.fetch(invite({ platform: 'android', url: LINK, limit: -5 }), env)
+if ((await bogus.json()).limit === null) pass('a nonsense limit falls back to no limit rather than sending to nobody')
+else fail('negative limit not handled')
 
 // ── misc routes ────────────────────────────────────────────────────────────
 await check('health', await worker.fetch(new Request('https://signup.turbollm.dev/health'), env), 200)

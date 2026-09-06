@@ -13,6 +13,7 @@
 // Worker is verified by running it directly under `node --experimental-strip-types`
 // rather than against a dev server (ADR-401 — no spare ports exist in this project).
 import { sendConfirmation } from './email.ts'
+import { sendInvite } from './invite.ts'
 
 interface Env {
   DB: D1Database
@@ -207,7 +208,8 @@ function adminJson(data: unknown, status: number): Response {
   })
 }
 
-async function handleAdmin(req: Request, env: Env): Promise<Response> {
+/** Returns a Response when the caller is NOT allowed in, or null when they are. */
+function adminGate(req: Request, env: Env): Response | null {
   if (!env.ADMIN_TOKEN) {
     return adminJson({ ok: false, error: "ADMIN_TOKEN is not configured on this Worker." }, 503)
   }
@@ -220,6 +222,12 @@ async function handleAdmin(req: Request, env: Env): Promise<Response> {
   if (!given || !tokenMatches(given, env.ADMIN_TOKEN.trim())) {
     return adminJson({ ok: false, error: "Unauthorized." }, 401)
   }
+  return null
+}
+
+async function handleAdmin(req: Request, env: Env): Promise<Response> {
+  const denied = adminGate(req, env)
+  if (denied) return denied
 
   const { results } = await env.DB.prepare(
     `SELECT id, created_at, updated_at, name, email, reason, platforms, source, country,
@@ -228,6 +236,82 @@ async function handleAdmin(req: Request, env: Env): Promise<Response> {
   ).all()
 
   return adminJson({ ok: true, count: results.length, signups: results }, 200)
+}
+
+/**
+ * POST /admin/invite — mail a build link to everyone who signed up for one platform.
+ *
+ * Body: { platform: "android", url: "https://…", send?: true, resend?: true }
+ *
+ * `send` defaults to FALSE: without it this reports exactly who WOULD be mailed and
+ * sends nothing. Blasting a real list is not something to discover you have done.
+ *
+ * Skips anyone already stamped `invited_at` for this platform, so re-running it
+ * after adding new signups mails only the new people. `resend: true` overrides that.
+ */
+async function handleInvite(req: Request, env: Env): Promise<Response> {
+  let body: Record<string, unknown>
+  try {
+    body = (await req.json()) as Record<string, unknown>
+  } catch {
+    return adminJson({ ok: false, error: 'Malformed body.' }, 400)
+  }
+
+  const platform = String(body.platform ?? '')
+  const url = String(body.url ?? '')
+  const send = body.send === true
+  const resend = body.resend === true
+  // Ordered by id, so "limit" means the longest-waiting people — the queue number
+  // everyone was given IS the id, so inviting the top N is exactly what it looks like.
+  const rawLimit = Number(body.limit)
+  const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.floor(rawLimit), 500) : null
+
+  if (!PLATFORMS.includes(platform as Platform)) {
+    return adminJson({ ok: false, error: `platform must be one of: ${PLATFORMS.join(', ')}` }, 400)
+  }
+  if (!/^https:\/\/\S+$/.test(url)) {
+    return adminJson({ ok: false, error: 'url must be an https link.' }, 400)
+  }
+
+  // platforms is a JSON array in a TEXT column; the quotes make the match exact,
+  // so "ios" cannot match inside another value.
+  const { results } = await env.DB.prepare(
+    `SELECT id, name, email, invited_at FROM signups
+     WHERE platforms LIKE ? ${resend ? '' : 'AND invited_at IS NULL'}
+     ORDER BY id ${limit === null ? '' : 'LIMIT ' + limit}`,
+  )
+    .bind(`%"${platform}"%`)
+    .all<{ id: number; name: string; email: string; invited_at: number | null }>()
+
+  const recipients = results ?? []
+  if (!send) {
+    return adminJson({
+      ok: true,
+      dryRun: true,
+      platform,
+      url,
+      limit,
+      wouldSend: recipients.length,
+      recipients: recipients.map((r) => ({ id: r.id, email: r.email })),
+      note: 'Nothing was sent. Repeat with "send": true to actually mail these people.',
+    }, 200)
+  }
+
+  const sent: number[] = []
+  const failed: { id: number; email: string; error: string }[] = []
+  for (const r of recipients) {
+    const error = await sendInvite(env.RESEND_API_KEY, r.email, { name: r.name, platform, url })
+    if (error) {
+      failed.push({ id: r.id, email: r.email, error })
+      continue
+    }
+    // Stamped only after a successful send, so a failure can be retried by simply
+    // running the same call again.
+    await env.DB.prepare('UPDATE signups SET invited_at = ? WHERE id = ?').bind(Date.now(), r.id).run()
+    sent.push(r.id)
+  }
+
+  return adminJson({ ok: failed.length === 0, platform, url, sent: sent.length, sentIds: sent, failed }, 200)
 }
 
 export default {
@@ -249,6 +333,11 @@ export default {
     }
 
     if (url.pathname === '/health') return json({ ok: true }, 200, origin)
+    if (url.pathname === '/admin/invite' && req.method === 'POST') {
+      const denied = adminGate(req, env)
+      if (denied) return denied
+      return handleInvite(req, env)
+    }
     if (url.pathname === '/signup' && req.method === 'POST') return handleSignup(req, env, origin, ctx)
     if (url.pathname === '/admin/signups' && req.method === 'GET') return handleAdmin(req, env)
 
