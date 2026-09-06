@@ -19,13 +19,14 @@ import {
   useTelemetryLog,
   useRegenerateMachineId,
   useAppUpdate,
+  useSysInfo,
 } from '../lib/queries'
 import { CopyButton } from '../components/ui/copy-button'
 import { ModelDirs } from './models/ModelDirs'
 import { ToolPermissionsSection } from './settings/ToolPermissionsSection'
 import { CodeContextSection } from './settings/CodeContextSection'
 import { CodeAgentSection } from './settings/CodeAgentSection'
-import { useCodeFeatureEnabled } from '../lib/platform'
+import { useCodeFeatureEnabled, isAndroidOs } from '../lib/platform'
 import { MemorySection } from './settings/MemorySection'
 import { ExperimentalSection } from './settings/ExperimentalSection'
 import { TurboLinkSection } from './settings/TurboLinkSection'
@@ -1613,7 +1614,14 @@ function AboutSection() {
   const { data: status } = useStatus()
   const { data: update } = useAppUpdate()
   const installed = update?.installed || status?.version || ''
-  const hasUpdate = !!update?.hasUpdate && !!update?.latest
+  // The Android app's real update path is a new Play Store release, not `npm i -g turbollm` —
+  // there is no terminal to run it in and no npm on the device. `hasUpdate` therefore stays
+  // false on Android regardless of what the npm registry check says, hiding only the
+  // actionable banner below. The plain version row and the "you're on the latest version"
+  // confirmation (an npm-vs-bundled-daemon fact, not an instruction) stay on every platform —
+  // neither one implies an action a phone can't take.
+  const sys = useSysInfo().data
+  const hasUpdate = !!update?.hasUpdate && !!update?.latest && !isAndroidOs(sys?.os ?? '')
 
   return (
     <section className="rounded-lg border border-border bg-panel p-4">

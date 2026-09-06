@@ -16,7 +16,8 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '../components/ui/alert-dialog'
-import { useApiKeys, useNetworkInfo } from '../lib/queries'
+import { useApiKeys, useNetworkInfo, useSysInfo } from '../lib/queries'
+import { isAndroidOs } from '../lib/platform'
 import { ApiError, getConnect, track, type ConnectStep, type NetworkInfo } from '../lib/api'
 import { toast } from '../components/ui/sonner'
 import { cn } from '../lib/utils'
@@ -72,6 +73,14 @@ const CLI_LIST: Cli[] = [
 export function DeveloperScreen() {
   // Issue #178: a long, plain list screen — the window scrolls it, not an inner box.
   useDocumentScroll()
+  // "Connect an app" hands out one-command CLI setup snippets (Claude Code, Codex, ...) for a
+  // TERMINAL to run — meaningless on a phone, which has neither a terminal nor those CLIs
+  // installed. `?? ''` defaults to "show" while sysinfo is still loading rather than "hide":
+  // unlike the Code feature's nav/route gate, briefly showing this static section on Android
+  // for a moment has no functional cost (no redirect, no lost state), so there's no need for
+  // the three-state hold `useCodeFeatureEnabled` uses.
+  const sys = useSysInfo().data
+  const isAndroid = isAndroidOs(sys?.os ?? '')
   return (
     <div className="w-full px-4 py-6 md:px-6">
       <ScreenHeader
@@ -80,7 +89,7 @@ export function DeveloperScreen() {
       />
       <div className="flex flex-col gap-6">
         <ConnectionPanel />
-        <ConnectSection />
+        {!isAndroid && <ConnectSection />}
         <McpSection />
         <ApiReferenceSection />
       </div>

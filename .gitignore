@@ -29,6 +29,7 @@
 
 # TurboLLM daemon (Node/TS) build outputs
 /turbollm/dist/
+/turbollm/dist-android/
 /turbollm/src/webdist/
 # `npx tsx --test` resolving an unset TMPDIR to the literal string "undefined" (Windows dev box)
 /turbollm/undefined/
@@ -106,3 +107,7 @@ Thumbs.db
 /TurboLLM Android/
 # Worktree node_modules junction helper (Windows-only dev convenience)
 /scripts/link-node-modules.ps1
+
+# Local backups of a physical test device's TurboLLM data (adb-pulled tarball),
+# made before a signature-mismatch reinstall wipes it. Multi-GB, device-specific, never for git.
+/.tllm-device-backup/

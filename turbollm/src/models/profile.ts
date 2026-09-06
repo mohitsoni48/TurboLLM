@@ -558,8 +558,16 @@ export function deriveDefault(m: ModelEntry, sys: SysInfo): LoadProfile {
     nCpuMoe: 0,
     parallel: 1,
     kvUnified: true,
-    kvTypeK: 'f16',
-    kvTypeV: 'f16',
+    // Quantized KV by default on Android only: a phone's real budget is a few hundred MB once
+    // the OS and the app itself are subtracted (see fitBudgetMb, web/src/lib/vram.ts), and the
+    // KV cache is pure overhead on top of the weights — q4_0 cuts it to a quarter of f16's size
+    // (kvBytesPerElem below), which is the difference between a usable context window and an
+    // immediate OOM on this class of device. Desktop/other platforms keep f16 (llama.cpp's own
+    // default, and quality-preserving) — this is deliberately NOT a global default change.
+    // flashAttn: 'on' below is required for a quantized V cache to work at all in llama.cpp, and
+    // is already the default here regardless of platform, so the combination is always valid.
+    kvTypeK: sys.os.startsWith('android') ? 'q4_0' : 'f16',
+    kvTypeV: sys.os.startsWith('android') ? 'q4_0' : 'f16',
     // Flash attention on by default — faster and lower KV memory on every modern
     // backend; gated by engine capability in profileToArgs so it's a safe default.
     flashAttn: 'on',

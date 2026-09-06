@@ -13,6 +13,7 @@ import { ApiError, track } from '../../lib/api'
 import { useHfSearch, useSysInfo } from '../../lib/queries'
 import type { HfSearchItem, HfSortOption } from '../../lib/types'
 import { fitBudgetMb, repoFitsHardware } from '../../lib/vram'
+import { isAndroidOs } from '../../lib/platform'
 import { EmptyState, InlineError } from '../../components/common'
 import { Input } from '../../components/ui/input'
 import { Sheet, SheetContent } from '../../components/ui/sheet'
@@ -21,6 +22,26 @@ import { useIsDesktop } from '../../lib/useIsDesktop'
 import { DownloadsPanel } from './DownloadsPanel'
 import { HfRepoContent } from './HfRepoDialog'
 import { ImportUrlDialog } from './ImportUrlDialog'
+
+// Curated Android picks, pinned above the live list. Exists because the fits-my-hardware
+// filter's honest answer for most of what HF trending returns today is 'unknown' (ADR-402):
+// codename-branded frontier releases carry no "<N>B" token, so hiding them routinely leaves
+// the filtered browse view empty. These four give an Android user something concrete to tap
+// into in that exact common case, and stay pinned above the live list even when it isn't
+// empty — good starting points regardless of what's trending this week.
+//
+// Every repo id verified to exist against the live HF API on 2026-09-06 (not guessed), spanning
+// the real phone-budget range: 1B -> 1.7B -> 3B -> a 4B-class MoE. Deliberately independent of
+// onboarding-pick.ts's SMALL_DEVICE_LADDER (which shares two of these repos) — that module picks
+// exactly ONE model to open onboarding with; this is a browsable set, a different job, and
+// keeping them decoupled means changing one doesn't reshuffle the other silently.
+const ANDROID_CURATED_PICKS: { repo: string; note: string }[] = [
+  { repo: 'unsloth/Llama-3.2-1B-Instruct-GGUF', note: 'Fastest — the smallest capable pick' },
+  { repo: 'unsloth/Qwen3-1.7B-GGUF', note: 'Still light, a bit more capable' },
+  { repo: 'unsloth/Llama-3.2-3B-Instruct-GGUF', note: 'More capable, wants more RAM headroom' },
+  { repo: 'unsloth/gemma-4-E2B-it-GGUF', note: 'Most capable pick that still fits most phones' },
+]
+const ANDROID_CURATED_REPOS = new Set(ANDROID_CURATED_PICKS.map((p) => p.repo))
 
 const SORT_LABEL: Record<HfSortOption, string> = {
   'best-match': 'Best match',
@@ -109,8 +130,15 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
   const canFilterByFit = budgetMb > 0
   const fitsOnly = canFilterByFit && (fitsOnlyOverride ?? !!sys?.os.startsWith('android'))
   // repoFitsHardware — see its own doc comment for why 'unknown' must be hidden, not shown.
-  const results = fitsOnly ? allResults.filter((r) => repoFitsHardware(r.repo, budgetMb)) : allResults
-  const hiddenByFit = allResults.length - results.length
+  const fitFiltered = fitsOnly ? allResults.filter((r) => repoFitsHardware(r.repo, budgetMb)) : allResults
+  const hiddenByFit = allResults.length - fitFiltered.length
+
+  // Curated picks pin to the top of the list on Android, browsing only (not mid-search — once
+  // the user has typed a name they want THAT search's results, not a fixed banner mixed in).
+  // See ANDROID_CURATED_PICKS's own comment for why this exists. Excluded from the live list
+  // below so a repo that happens to also be trending never renders twice on screen.
+  const showCurated = !searching && isAndroidOs(sys?.os ?? '')
+  const results = showCurated ? fitFiltered.filter((r) => !ANDROID_CURATED_REPOS.has(r.repo)) : fitFiltered
 
   return (
     <div className="flex flex-col md:h-full md:min-h-0">
@@ -173,6 +201,24 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
               ))}
             </select>
           </div>
+
+          {showCurated && (
+            <div className="flex shrink-0 flex-col gap-1 border-b border-border pb-2">
+              <div className="px-1 text-[11px] font-medium uppercase tracking-wide text-faint">
+                Good picks for this device
+              </div>
+              {ANDROID_CURATED_PICKS.map((p) => (
+                <ListRow
+                  key={p.repo}
+                  repo={p.repo}
+                  title={p.repo}
+                  secondary={p.note}
+                  selected={selectedRepo === p.repo}
+                  onSelect={() => setSelectedRepo(p.repo)}
+                />
+              ))}
+            </div>
+          )}
 
           <div className="flex min-h-0 flex-1 flex-col gap-1 md:overflow-y-auto">
             {searchQ.isLoading ? (

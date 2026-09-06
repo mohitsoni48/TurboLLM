@@ -490,11 +490,21 @@ body {
   to { transform: translateX(100%); }
 }
 
-/* Mobile (default): full-screen takeover. */
+/* Mobile (default): full-screen takeover. `inset: 0` is genuinely flush to the physical
+   screen edges — this is DialogPrimitive.Content, portaled straight to document.body, so it
+   sits entirely OUTSIDE Shell's flex column and never inherits the safe-top wrapper div or
+   MobileNav's own bottom padding (Shell.tsx's comment on that wrapper: "one padding here...
+   beats chasing the inset onto each header separately" — a portal is exactly the case that
+   sentence doesn't reach). Measured live: with no padding here every Sheet — the Discover
+   model-detail pane included — rendered content from y=0 to the full viewport height,
+   under the status bar at the top and under the nav/gesture bar at the bottom. Same two
+   vars Shell already uses, same no-op-when-unset behavior on desktop/non-Android. */
 .tllm-sheet {
   inset: 0;
   width: 100%;
   max-width: none;
+  padding-top: var(--tllm-safe-top);
+  padding-bottom: var(--tllm-safe-bottom);
 }
 .tllm-sheet[data-state='open'] {
   animation: tllm-sheet-in-right 0.28s cubic-bezier(0.32, 0.72, 0, 1);
