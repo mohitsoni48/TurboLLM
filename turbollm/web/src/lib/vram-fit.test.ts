@@ -5,7 +5,7 @@
 // root's `tsx --test`. New web tests are Vitest, so they go in their own file rather than
 // dragging vram.test.ts across runners.
 import { describe, expect, test } from 'vitest'
-import { fitBudgetMb, repoFitVerdict, repoParamsB } from './vram'
+import { fitBudgetMb, repoFitsHardware, repoFitVerdict, repoParamsB } from './vram'
 
 describe('repoParamsB', () => {
   test('reads the usual GGUF repo names', () => {
@@ -83,11 +83,42 @@ describe('repoFitVerdict', () => {
     expect(repoFitVerdict('unsloth/Qwen3.6-35B-A3B-GGUF', desktop)).toBe('fits')
   })
 
-  test('an unreadable name is unknown, never too-big — the caller must keep showing it', () => {
+  // repoFitVerdict itself still distinguishes 'unknown' from 'too-big' — that's a real
+  // distinction the function reports honestly. It's repoFitsHardware, below, that collapses
+  // them into one boolean for the UI; this test is about the raw verdict only.
+  test('an unreadable name gets its own verdict, distinct from too-big', () => {
     expect(repoFitVerdict('openai/whisper-large-v3', phone)).toBe('unknown')
   })
 
   test('no budget means no verdict at all', () => {
     expect(repoFitVerdict('unsloth/Llama-3.2-1B-Instruct-GGUF', 0)).toBe('unknown')
+  })
+})
+
+describe('repoFitsHardware', () => {
+  const phone = fitBudgetMb({ os: 'android/arm64', ramMB: 7655, gpus: [] })
+
+  // The actual bug report: with the filter on, a 7.7 GB Android phone still showed
+  // Qwen3.8-Flash-Next, GLM-5.3-Flash and DeepSeek-V4-Flash-Vision-Exp — none carry a "<N>B"
+  // token, all fell through to 'unknown', and the old policy (only hide 'too-big') let them all
+  // stay visible. This must be false for every one of them, and it must not regress silently.
+  test.each([
+    'unsloth/Qwen3.8-Flash-Next-GGUF',
+    'orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF',
+    'unsloth/GLM-5.3-Flash-GGUF',
+    'unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF',
+    'AngelSlim/Hy4-preview-GGUF',
+  ])('hides the unsized codename model %s', (repo) => {
+    expect(repoFitVerdict(repo, phone)).toBe('unknown')
+    expect(repoFitsHardware(repo, phone)).toBe(false)
+  })
+
+  test('still shows a repo whose size the name actually states', () => {
+    expect(repoFitsHardware('XHToken/Spark-X2.5-4B-GGUF', phone)).toBe(true)
+    expect(repoFitsHardware('unsloth/Llama-3.2-1B-Instruct-GGUF', phone)).toBe(true)
+  })
+
+  test('still hides a named model that is genuinely too big', () => {
+    expect(repoFitsHardware('unsloth/Qwen3.6-35B-A3B-GGUF', phone)).toBe(false)
   })
 })

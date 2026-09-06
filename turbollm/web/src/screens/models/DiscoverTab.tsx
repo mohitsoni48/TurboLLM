@@ -12,7 +12,7 @@ import { Link2, Lock, Search } from 'lucide-react'
 import { ApiError, track } from '../../lib/api'
 import { useHfSearch, useSysInfo } from '../../lib/queries'
 import type { HfSearchItem, HfSortOption } from '../../lib/types'
-import { fitBudgetMb, repoFitVerdict } from '../../lib/vram'
+import { fitBudgetMb, repoFitsHardware } from '../../lib/vram'
 import { EmptyState, InlineError } from '../../components/common'
 import { Input } from '../../components/ui/input'
 import { Sheet, SheetContent } from '../../components/ui/sheet'
@@ -108,7 +108,8 @@ export function DiscoverTab({ presetQuery = '' }: { presetQuery?: string }) {
   // retries). Hide the control entirely rather than show a checkbox that filters nothing.
   const canFilterByFit = budgetMb > 0
   const fitsOnly = canFilterByFit && (fitsOnlyOverride ?? !!sys?.os.startsWith('android'))
-  const results = fitsOnly ? allResults.filter((r) => repoFitVerdict(r.repo, budgetMb) !== 'too-big') : allResults
+  // repoFitsHardware — see its own doc comment for why 'unknown' must be hidden, not shown.
+  const results = fitsOnly ? allResults.filter((r) => repoFitsHardware(r.repo, budgetMb)) : allResults
   const hiddenByFit = allResults.length - results.length
 
   return (

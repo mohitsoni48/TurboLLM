@@ -107,13 +107,33 @@ export function repoParamsB(repo: string): number | null {
  *  smaller rungs run fine; judging it by its literal smallest (IQ1/Q2) would promise a
  *  model that technically loads and answers gibberish. Q4 is the honest middle.
  *
- *  'unknown' when the name carries no parameter count. Those stay VISIBLE at the call
- *  site: not knowing a model's size is not evidence that it's too big, and silently
- *  dropping search results the filter can't judge is the failure mode to avoid. */
+ *  'unknown' when the name carries no parameter count — which is common, not rare: most of
+ *  today's frontier releases are codename-branded ("Flash", "Next", "Pro", a bare version
+ *  number like "GLM-5.3" or "DeepSeek-V4") with no "<N>B" anywhere in the repo name.
+ *  DiscoverTab hides 'unknown' the same as 'too-big' when its filter is on — verified live:
+ *  with 'unknown' left visible, a 7.7 GB Android phone's filtered Discover list was DOMINATED
+ *  by exactly those oversized codename models, because none of them carried a size token this
+ *  function could read. Treating "can't tell" as "assume it's fine" defeated the filter for
+ *  most of what it exists to catch. The trade-off runs the other way now — a repo that would
+ *  genuinely have fit can be hidden — but on the platform this defaults on for, a model that
+ *  silently OOMs is worse than one that never appears. See DiscoverTab for the hidden-count
+ *  UI that keeps this honest instead of silent. */
 export function repoFitVerdict(repo: string, budgetMb: number): 'fits' | 'too-big' | 'unknown' {
   const paramsB = repoParamsB(repo)
   if (paramsB === null || !budgetMb) return 'unknown'
   return paramsB * Q4_MB_PER_B_PARAMS + FIT_OVERHEAD_MB <= budgetMb ? 'fits' : 'too-big'
+}
+
+/** The actual policy DiscoverTab's "Fits my hardware" checkbox applies: show a repo only when
+ *  we can positively confirm it fits, i.e. only on a 'fits' verdict — 'unknown' is treated the
+ *  same as 'too-big', not as "innocent until proven big". Pulled out of the component and
+ *  tested directly because getting this backwards is exactly how the filter shipped broken:
+ *  with 'unknown' left visible, a real Android device's filtered list was DOMINATED by
+ *  codename-branded frontier models (Qwen3.8-Flash-Next, GLM-5.3-Flash,
+ *  DeepSeek-V4-Flash-Vision-Exp) that carry no "<N>B" token for `repoParamsB` to find — which
+ *  is most of what a trending page returns today, not an edge case. */
+export function repoFitsHardware(repo: string, budgetMb: number): boolean {
+  return repoFitVerdict(repo, budgetMb) === 'fits'
 }
 
 function kvBytesPerElem(t: string): number {
