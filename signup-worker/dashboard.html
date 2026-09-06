@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>TurboLLM — beta signups</title>
+<!--
+  LOCAL ONLY. Open this file straight from disk:
+      file:///D:/llama-turbo/signup-worker/dashboard.html
+  It is deliberately NOT under docs/site-build/pages/, so the site generator
+  never sees it and `wrangler pages deploy` can never publish it. The admin
+  token lives in this browser's localStorage and is sent as a bearer header;
+  nothing here is reachable from turbollm.dev.
+-->
+<style>
+  :root {
+    --bg: #14100e; --panel: #1d1917; --line: #2f2825; --text: #f0ebe8;
+    --dim: #a89c96; --accent: #c96442; --ok: #4a9d6e;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 22px 80px; }
+  header { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 22px; }
+  h1 { font-size: 19px; margin: 0; letter-spacing: -0.01em; }
+  h1 span { color: var(--accent); }
+  .muted { color: var(--dim); }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  input, button, select { font: inherit; border-radius: 8px; border: 1px solid var(--line); }
+  input, select { background: var(--panel); color: var(--text); padding: 8px 11px; }
+  input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  button { background: var(--accent); color: #fff; border-color: transparent; padding: 8px 14px; cursor: pointer; font-weight: 600; }
+  button.ghost { background: transparent; color: var(--text); border-color: var(--line); font-weight: 500; }
+  button:hover { filter: brightness(1.08); }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 22px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+  .card b { display: block; font-size: 28px; font-weight: 700; letter-spacing: -0.02em; }
+  .card small { color: var(--dim); text-transform: uppercase; font-size: 11px; letter-spacing: 0.06em; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; margin-bottom: 18px; }
+  .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.07em; color: var(--dim); margin: 0 0 14px; }
+  .bar { display: grid; grid-template-columns: 92px 1fr 46px; gap: 10px; align-items: center; margin-bottom: 7px; }
+  .bar i { font-style: normal; text-transform: capitalize; }
+  .bar div { height: 9px; background: #2b2320; border-radius: 5px; overflow: hidden; }
+  .bar div s { display: block; height: 100%; background: var(--accent); text-decoration: none; }
+  .bar b { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+  .days { display: flex; align-items: flex-end; gap: 3px; height: 76px; }
+  .days span { flex: 1; background: var(--accent); border-radius: 3px 3px 0 0; min-height: 2px; opacity: .85; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim); padding: 0 10px 9px; font-weight: 600; }
+  td { padding: 11px 10px; border-top: 1px solid var(--line); vertical-align: top; }
+  tr.reason td { border-top: 0; padding-top: 0; color: var(--dim); white-space: pre-wrap; }
+  .num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .tags { display: flex; gap: 4px; flex-wrap: wrap; }
+  .tag { font-size: 11px; padding: 2px 7px; border-radius: 999px; background: #2b2320; color: var(--dim); text-transform: capitalize; }
+  .err { color: #e0755c; }
+  #setup { max-width: 520px; }
+  #setup input { width: 100%; margin-bottom: 10px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>TurboLLM <span>beta signups</span></h1>
+    <div class="row">
+      <span id="stamp" class="muted"></span>
+      <button class="ghost" id="copyEmails" hidden>Copy emails</button>
+      <button class="ghost" id="csv" hidden>Export CSV</button>
+      <button id="reload" hidden>Refresh</button>
+      <button class="ghost" id="forget" hidden>Forget token</button>
+    </div>
+  </header>
+
+  <div class="panel" id="setup">
+    <h2>Connect</h2>
+    <input id="endpoint" placeholder="https://signup.turbollm.dev" />
+    <input id="token" type="password" placeholder="Admin token (wrangler secret ADMIN_TOKEN)" />
+    <div class="row"><button id="connect">Load signups</button><span id="err" class="err"></span></div>
+  </div>
+
+  <div id="app" hidden>
+    <div class="cards" id="cards"></div>
+    <div class="panel">
+      <h2>Platforms people can test on</h2>
+      <div id="platforms"></div>
+    </div>
+    <div class="panel">
+      <h2>Signups per day <span class="muted" id="daysRange"></span></h2>
+      <div class="days" id="days"></div>
+    </div>
+    <div class="panel">
+      <h2>Everyone <span class="muted">— filter</span></h2>
+      <div class="row" style="margin-bottom:14px">
+        <input id="q" placeholder="Search name, email or reason" style="flex:1;min-width:220px" />
+        <select id="plat"><option value="">All platforms</option></select>
+      </div>
+      <table><thead><tr><th>#</th><th>Who</th><th>Platforms</th><th>Where</th><th>When</th><th>Email</th></tr></thead><tbody id="rows"></tbody></table>
+    </div>
+  </div>
+</div>
+
+<script>
+const PLATFORMS = ['windows', 'macos', 'linux', 'android', 'ios'];
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const day = (ms) => new Date(ms).toISOString().slice(0, 10);
+let all = [];
+
+const store = {
+  get endpoint() { return localStorage.getItem('tllm-signup-endpoint') || 'https://signup.turbollm.dev'; },
+  get token() { return localStorage.getItem('tllm-signup-token') || ''; },
+  save(endpoint, token) {
+    localStorage.setItem('tllm-signup-endpoint', endpoint);
+    localStorage.setItem('tllm-signup-token', token);
+  },
+  clear() {
+    localStorage.removeItem('tllm-signup-token');
+    localStorage.removeItem('tllm-signup-endpoint');
+  },
+};
+
+async function load() {
+  const endpoint = $('endpoint').value.trim().replace(/\/$/, '');
+  const token = $('token').value.trim();
+  if (!endpoint || !token) { $('err').textContent = 'Both fields are required.'; return; }
+  $('err').textContent = 'Loading…';
+  try {
+    const res = await fetch(endpoint + '/admin/signups', { headers: { authorization: 'Bearer ' + token } });
+    const data = await res.json();
+    if (!res.ok || !data.ok) throw new Error(data.error || ('HTTP ' + res.status));
+    store.save(endpoint, token);
+    all = data.signups.map((s) => ({ ...s, platforms: JSON.parse(s.platforms || '[]') }));
+    $('err').textContent = '';
+    $('setup').hidden = true;
+    $('app').hidden = false;
+    for (const b of ['reload', 'forget', 'csv', 'copyEmails']) $(b).hidden = false;
+    $('stamp').textContent = 'Loaded ' + new Date().toLocaleTimeString();
+    render();
+  } catch (e) {
+    $('err').textContent = e.message === 'Failed to fetch'
+      ? 'Could not reach the Worker — check the URL and that it is deployed.'
+      : e.message;
+  }
+}
+
+function render() {
+  const now = Date.now(), DAY = 86400000;
+  const since = (d) => all.filter((s) => s.created_at > now - d * DAY).length;
+  const unsent = all.filter((s) => !s.email_sent_at).length;
+  const cards = [
+    ['Total', all.length],
+    ['Last 7 days', since(7)],
+    ['Last 24 hours', since(1)],
+    ['Countries', new Set(all.map((s) => s.country).filter(Boolean)).size],
+    ['Invited', all.filter((s) => s.invited_at).length],
+    ['Email unsent', unsent],
+  ];
+  $('cards').innerHTML = cards
+    .map(([l, v]) => `<div class="card"><b${l === 'Email unsent' && v ? ' style="color:#e0755c"' : ''}>${v}</b><small>${l}</small></div>`)
+    .join('');
+
+  const counts = Object.fromEntries(PLATFORMS.map((p) => [p, all.filter((s) => s.platforms.includes(p)).length]));
+  const max = Math.max(1, ...Object.values(counts));
+  $('platforms').innerHTML = PLATFORMS
+    .map((p) => `<div class="bar"><i>${p === 'macos' ? 'macOS' : p === 'ios' ? 'iOS' : p}</i><div><s style="width:${(counts[p] / max) * 100}%"></s></div><b>${counts[p]}</b></div>`)
+    .join('');
+
+  const days = 30;
+  const buckets = Array.from({ length: days }, (_, i) => {
+    const d = day(now - (days - 1 - i) * DAY);
+    return all.filter((s) => day(s.created_at) === d).length;
+  });
+  const dmax = Math.max(1, ...buckets);
+  $('days').innerHTML = buckets
+    .map((n, i) => `<span style="height:${(n / dmax) * 100}%" title="${day(now - (days - 1 - i) * DAY)}: ${n}"></span>`)
+    .join('');
+  $('daysRange').textContent = `— last ${days} days, peak ${dmax}`;
+
+  if ($('plat').options.length === 1) {
+    for (const p of PLATFORMS) $('plat').add(new Option(p === 'macos' ? 'macOS' : p === 'ios' ? 'iOS' : p, p));
+  }
+  renderRows();
+}
+
+function filtered() {
+  const q = $('q').value.trim().toLowerCase();
+  const p = $('plat').value;
+  return all.filter((s) => {
+    if (p && !s.platforms.includes(p)) return false;
+    if (!q) return true;
+    return (s.name + ' ' + s.email + ' ' + s.reason).toLowerCase().includes(q);
+  });
+}
+
+function renderRows() {
+  const rows = filtered();
+  $('rows').innerHTML = rows
+    .map(
+      (s) => `<tr>
+        <td class="muted num">#${s.id}</td>
+        <td><strong>${esc(s.name)}</strong><br /><a class="muted" href="mailto:${esc(s.email)}" style="color:var(--dim)">${esc(s.email)}</a></td>
+        <td><div class="tags">${s.platforms.map((p) => `<span class="tag">${esc(p)}</span>`).join('')}</div></td>
+        <td class="muted">${esc(s.country || '—')}</td>
+        <td class="muted">${new Date(s.created_at).toLocaleDateString()}</td>
+        <td>${
+          s.email_sent_at
+            ? '<span class="tag" style="background:rgba(74,157,110,.18);color:var(--ok)">sent</span>'
+            : `<span class="tag" style="background:rgba(224,117,92,.18);color:#e0755c" title="${esc(s.email_error || 'not sent')}">unsent</span>`
+        }</td>
+      </tr>
+      <tr class="reason"><td colspan="6">${esc(s.reason)}</td></tr>`,
+    )
+    .join('') || '<tr><td colspan="6" class="muted">Nothing matches.</td></tr>';
+}
+
+function csv() {
+  const cols = ['id', 'created_at', 'name', 'email', 'platforms', 'country', 'reason'];
+  const cell = (v) => '"' + String(Array.isArray(v) ? v.join('|') : v ?? '').replace(/"/g, '""') + '"';
+  const body = [cols.join(','), ...filtered().map((s) => cols.map((c) => cell(c === 'created_at' ? new Date(s[c]).toISOString() : s[c])).join(','))].join('\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([body], { type: 'text/csv' }));
+  a.download = 'turbollm-signups-' + day(Date.now()) + '.csv';
+  a.click();
+}
+
+$('endpoint').value = store.endpoint;
+$('token').value = store.token;
+$('connect').onclick = load;
+$('reload').onclick = load;
+$('q').oninput = renderRows;
+$('plat').onchange = renderRows;
+$('csv').onclick = csv;
+$('copyEmails').onclick = () => {
+  navigator.clipboard.writeText(filtered().map((s) => s.email).join(', '));
+  $('copyEmails').textContent = 'Copied ' + filtered().length;
+  setTimeout(() => ($('copyEmails').textContent = 'Copy emails'), 1600);
+};
+$('forget').onclick = () => { store.clear(); location.reload(); };
+$('token').addEventListener('keydown', (e) => { if (e.key === 'Enter') load(); });
+if (store.token) load();
+</script>
+</body>
+</html>

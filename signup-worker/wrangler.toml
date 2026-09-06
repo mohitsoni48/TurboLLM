@@ -1,0 +1,32 @@
+name = "turbollm-signup"
+main = "src/index.ts"
+compatibility_date = "2026-07-01"
+
+# Deliberately a SEPARATE Worker + D1 from `telemetry-worker/`, not a route added
+# to it. The telemetry pipeline's whole design promise (ADR-299, ADR-320) is that
+# it never holds anything that identifies a person; the beta form collects a name
+# and an email address, which is exactly that. Keeping them in different databases
+# means the privacy claim about telemetry stays literally true and auditable
+# instead of becoming "true except for one table."
+routes = [{ pattern = "signup.turbollm.dev", custom_domain = true }]
+
+# Kept on for the same reason telemetry-worker keeps it: a route can bind to a
+# hostname that has no DNS record, so "deploy succeeded" alone is not evidence
+# the endpoint is reachable. The workers.dev URL proves the pipeline independently
+# of DNS.
+workers_dev = true
+
+# Create with:  wrangler d1 create turbollm-signup
+# then paste the returned database_id here and apply schema.sql:
+#   wrangler d1 execute turbollm-signup --remote --file=schema.sql
+[[d1_databases]]
+binding = "DB"
+database_name = "turbollm-signup"
+database_id = "4514f960-f8b6-4a2d-832c-15699ec359b7"
+
+[observability]
+enabled = true
+
+# The read side is a secret, not a route nobody guesses:
+#   wrangler secret put ADMIN_TOKEN
+# Without it set, /admin/* returns 503 rather than falling open.
