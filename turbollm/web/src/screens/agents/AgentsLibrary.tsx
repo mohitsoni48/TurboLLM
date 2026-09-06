@@ -1,10 +1,11 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Bot, Plus, RotateCcw, Star, Wrench } from 'lucide-react'
 import { Button } from '../../components/ui/button'
 import { toast } from '../../components/ui/sonner'
-import { useBuiltinAgentOverrideMutations, useBuiltinAgentOverrides, useChatAgents } from '../../lib/queries'
-import { resolveAgents, getDefaultAgentId, setDefaultAgentId, type ResolvedAgent } from '../../lib/personas'
+import { useBuiltinAgentOverrideMutations, useBuiltinAgentOverrides, useChatAgents, useSysInfo } from '../../lib/queries'
+import { resolveAgents, getDefaultAgentId, hasExplicitDefaultAgent, setDefaultAgentId, type ResolvedAgent } from '../../lib/personas'
+import { isAndroidOs } from '../../lib/platform'
 import { ApiError, track } from '../../lib/api'
 
 function AgentCard({ agent, isDefault, onOpen, onSetDefault, onReset }: {
@@ -81,8 +82,20 @@ export function AgentsLibrary() {
   const overrideMut = useBuiltinAgentOverrideMutations()
   const agents = resolveAgents(customQ.data ?? [], overridesQ.data ?? {})
 
-  const [defaultId, setDefaultIdLocal] = useState(() => getDefaultAgentId())
+  const sysQ = useSysInfo()
+  const isAndroid = isAndroidOs(sysQ.data?.os ?? '')
+  const [defaultId, setDefaultIdLocal] = useState(() => getDefaultAgentId(isAndroid))
+  const userTouchedRef = useRef(false)
+  // Mirrors ChatScreen's same-named effect: isAndroid is unknown on first render, so this
+  // corrects a still-untouched "Default" starred badge to "Blank" once sysinfo answers,
+  // without ever overriding a real user choice (handleSetDefault below, or one made earlier).
+  useEffect(() => {
+    if (!isAndroid || userTouchedRef.current || hasExplicitDefaultAgent()) return
+    setDefaultIdLocal((prev) => (prev === 'default' ? 'blank' : prev))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAndroid])
   const handleSetDefault = (agent: ResolvedAgent) => {
+    userTouchedRef.current = true
     setDefaultAgentId(agent.id)
     setDefaultIdLocal(agent.id)
     toast.success(`${agent.name} is now the default agent for new chats.`)

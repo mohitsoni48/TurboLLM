@@ -430,17 +430,27 @@ const LS_CUSTOM_INSTRUCTIONS = 'tllm.personal.customInstructions'
 /** Any string is a valid agent id here — besides the fixed built-in {@link PersonaId}s,
  *  a user-created custom Agent (Customize → Agents) has an arbitrary server-issued id.
  *  Callers resolve the id against the combined builtin + custom list at render time and
- *  fall back gracefully (e.g. to the default agent) if it no longer exists. */
-export function getDefaultAgentId(): string {
-  return localStorage.getItem(LS_DEFAULT_PERSONA) || 'default'
+ *  fall back gracefully (e.g. to the default agent) if it no longer exists.
+ *
+ *  `isAndroid` only affects the built-in fallback, never an explicit user choice: on the
+ *  phone build's small on-device models, Default's personalization/tool-heavy system
+ *  prompt eats into a budget that's already tight, so a new install starts on Blank
+ *  (empty system prompt) instead — still just the ordinary starting point, changeable
+ *  the same way as any other platform's default. */
+export function getDefaultAgentId(isAndroid = false): string {
+  return localStorage.getItem(LS_DEFAULT_PERSONA) || (isAndroid ? 'blank' : 'default')
+}
+
+export function hasExplicitDefaultAgent(): boolean {
+  return localStorage.getItem(LS_DEFAULT_PERSONA) !== null
 }
 
 export function setDefaultAgentId(id: string): void {
   localStorage.setItem(LS_DEFAULT_PERSONA, id)
 }
 
-export function getConvAgentId(convId: string): string {
-  return localStorage.getItem(LS_CONV_PERSONA(convId)) || getDefaultAgentId()
+export function getConvAgentId(convId: string, isAndroid = false): string {
+  return localStorage.getItem(LS_CONV_PERSONA(convId)) || getDefaultAgentId(isAndroid)
 }
 
 export function setConvAgentId(convId: string, id: string): void {

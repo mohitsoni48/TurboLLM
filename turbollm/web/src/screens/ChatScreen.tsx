@@ -4,7 +4,8 @@ import { ArrowDown, Copy, Download, PanelLeft, Paperclip, SendHorizontal, Share2
 import { continueConversation, fetchSysInfo, listMemoryFacts, sendMessage } from '../lib/chat-api'
 import { extractPdfText } from '../lib/pdf-extract'
 import { chatKeys, useConversation, useConversationMutations } from '../lib/chat-queries'
-import { useBuiltinAgentOverrides, useChatAgents, useEngines, useModelActions, useModelDetail, useModels, useSettings, useStatus } from '../lib/queries'
+import { useBuiltinAgentOverrides, useChatAgents, useEngines, useModelActions, useModelDetail, useModels, useSettings, useStatus, useSysInfo } from '../lib/queries'
+import { isAndroidOs } from '../lib/platform'
 import type { ChatSseEvent, Conversation, LiveToolCall, Message } from '../lib/chat-types'
 import { appendTextDelta, upsertToolCall, type LiveBlock } from '../lib/live-timeline'
 import { ApiError, downloadChatExport, getDebugSnapshot, getShareUrl, importChat, track } from '../lib/api'
@@ -37,7 +38,7 @@ import { ConversationSettingsDialog, type ConversationSettingsDraft } from './ch
 import { useUiStore } from '../stores/ui'
 import { useIsDesktop } from '../lib/useIsDesktop'
 import {
-  buildSystemPrompt, getConvAgentId, getDefaultAgentId,
+  buildSystemPrompt, getConvAgentId, getDefaultAgentId, hasExplicitDefaultAgent,
   getPersonalization, resolveAgents, setConvAgentId,
 } from '../lib/personas'
 
@@ -133,25 +134,49 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   const [importError, setImportError] = useState<string | null>(null)
   const [importModelMismatch, setImportModelMismatch] = useState<string | null>(null)
 
+  // Android's on-device models are small enough that the fit-filter (DiscoverTab.tsx)
+  // only surfaces ~4B-and-under repos — unlimited thinking burns a chunk of their
+  // already-tight context/decode budget on reasoning tokens the user didn't ask for, so
+  // the phone build's untouched defaults (below) start from "off" instead. Purely the
+  // starting point: same per-conv/global override path as every other platform, and a
+  // user who's already made an explicit choice is never overridden by this.
+  const sysQ = useSysInfo()
+  const isAndroid = isAndroidOs(sysQ.data?.os ?? '')
+
   // Thinking budget — per-conversation, persisted in localStorage. -1 = unlimited
   // (reasoning models think freely, today's default), 0 = off (model answers directly,
   // no reasoning generated), N>0 = a real sampler-enforced token cap (thinking_budget_tokens
   // — see chat-routes.ts). Supersedes the old on/off-only `tllm.thinkingEnabled.*` toggle
   // (ADR-042) now that the engine genuinely supports a graduated budget, not just 0/-1.
-  // Reads per-conv key first; falls back to global default; defaults to unlimited.
+  // Reads per-conv key first; falls back to global default; defaults to unlimited (0 on
+  // Android — see comment above).
   const readThinkingBudget = (convId: string | null): number => {
     if (convId) {
       const perConv = localStorage.getItem(`tllm.thinkingBudget.${convId}`)
       if (perConv !== null) return Number(perConv)
     }
     const global = localStorage.getItem('tllm.thinkingBudget.default')
-    return global !== null ? Number(global) : -1
+    if (global !== null) return Number(global)
+    return isAndroid ? 0 : -1
   }
   const [thinkingBudget, setThinkingBudgetState] = useState<number>(() => readThinkingBudget(null))
+  const userTouchedThinkingRef = useRef(false)
   const setThinkingBudget = (val: number) => {
+    userTouchedThinkingRef.current = true
     if (activeId) localStorage.setItem(`tllm.thinkingBudget.${activeId}`, String(val))
     setThinkingBudgetState(val)
   }
+  // isAndroid is unknown (false) on first render — useSysInfo() hasn't answered yet — so the
+  // useState initializer above may have already locked in the desktop default (-1) for a split
+  // second before sysinfo resolves. Correct it once, but only for a still-untouched, still-fresh
+  // (no conversation opened yet) chat — never overrides an explicit per-conv/global choice or
+  // anything the user has already touched this session.
+  useEffect(() => {
+    if (!isAndroid || activeId || userTouchedThinkingRef.current) return
+    if (localStorage.getItem('tllm.thinkingBudget.default') !== null) return
+    setThinkingBudgetState((prev) => (prev === -1 ? 0 : prev))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAndroid])
 
   // Reasoning effort (Qwen3.8) — same per-conv/global persistence shape as thinkingBudget
   // above, but a DIFFERENT and independent control (see ReasoningEffortSelect.tsx): only
@@ -171,10 +196,23 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     setReasoningEffortState(val)
   }
 
-  // Agent — per-conversation, defaults to the default set in Customize → Agents.
-  // A plain string: besides the fixed built-in ids, a custom agent's id is an
-  // arbitrary server-issued one, resolved against `allAgents` below.
-  const [selectedPersonaId, setSelectedPersonaId] = useState<string>(() => getDefaultAgentId())
+  // Agent — per-conversation, defaults to the default set in Customize → Agents (Blank on
+  // Android when nothing's been explicitly set — see isAndroid comment above). A plain
+  // string: besides the fixed built-in ids, a custom agent's id is an arbitrary
+  // server-issued one, resolved against `allAgents` below.
+  const [selectedPersonaId, setSelectedPersonaId] = useState<string>(() => getDefaultAgentId(isAndroid))
+  const userTouchedPersonaRef = useRef(false)
+  const handlePersonaChange = (id: string) => {
+    userTouchedPersonaRef.current = true
+    setSelectedPersonaId(id)
+  }
+  // Same first-render race as thinkingBudget above: correct a still-untouched, still-fresh
+  // chat once isAndroid is actually known, never overriding an explicit choice.
+  useEffect(() => {
+    if (!isAndroid || activeId || userTouchedPersonaRef.current || hasExplicitDefaultAgent()) return
+    setSelectedPersonaId((prev) => (prev === 'default' ? 'blank' : prev))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAndroid])
   const customAgentsQ = useChatAgents()
   const builtinOverridesQ = useBuiltinAgentOverrides()
   const allAgents = resolveAgents(customAgentsQ.data ?? [], builtinOverridesQ.data ?? {})
@@ -534,7 +572,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     saveScrollOffset()
     setActiveId(null)
     setInput('')
-    setSelectedPersonaId(getDefaultAgentId())
+    setSelectedPersonaId(getDefaultAgentId(isAndroid))
     inputRef.current?.focus()
   }
 
@@ -551,7 +589,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     pendingScrollRestore.current = { id, top: scrollOffsets.current[id] ?? null }
     setActiveId(id)
     setEditingId(null)
-    setSelectedPersonaId(getConvAgentId(id))
+    setSelectedPersonaId(getConvAgentId(id, isAndroid))
     if (recentlyCompletedIds.has(id)) {
       setRecentlyCompletedIds((prev) => {
         const next = new Set(prev)
@@ -577,7 +615,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     setActiveId(null)
     setEditingId(null)
     setInput('')
-    setSelectedPersonaId(getDefaultAgentId())
+    setSelectedPersonaId(getDefaultAgentId(isAndroid))
   }
 
   const handleStop = async () => {
@@ -1104,7 +1142,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                 {model ? (
                   <>
                     <p className="text-[15px] font-medium text-ink">{model.name}</p>
-                    <AgentPicker selected={selectedPersonaId} onChange={setSelectedPersonaId} agents={allAgents} />
+                    <AgentPicker selected={selectedPersonaId} onChange={handlePersonaChange} agents={allAgents} />
                     <div className="flex flex-wrap justify-center gap-2">
                       {['Explain something to me', 'Help me write', 'Review this code'].map((s) => (
                         <button

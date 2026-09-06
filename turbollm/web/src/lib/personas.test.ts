@@ -36,3 +36,9 @@ test('resolveAgents: an override that explicitly restricts to zero tools stays z
 test('buildSystemPrompt: blank agent still returns an empty system prompt (unchanged)', () => {
   assert.equal(buildSystemPrompt('blank', 'ignored', { assistantName: '', userName: '', customInstructions: '' }), '')
 })
+
+// getDefaultAgentId/getConvAgentId's isAndroid fallback (personas.ts) isn't covered here: both
+// read/write `localStorage`, which this suite's node:test runner (tsx --test, no
+// --localstorage-file) only stubs — setItem/removeItem are undefined, so any test touching them
+// throws rather than exercising real behavior. Verified by hand instead (tsc + a manual read of
+// the two call sites) — see ChatScreen.tsx/AgentsLibrary.tsx's isAndroid wiring.
