@@ -12,7 +12,7 @@
  * Deploy:  wrangler secret put POSTHOG_KEY   (then)   wrangler deploy
  */
 
-import { flattenForAnalytics, handleIngest, type IngestDeps } from '../../turbollm/src/telemetry/ingest'
+import { analyticsIdentity, flattenForAnalytics, handleIngest, type IngestDeps } from '../../turbollm/src/telemetry/ingest'
 import { MACHINE_LIMIT, IP_LIMIT } from '../../turbollm/src/telemetry/rate-limit-window'
 import { RateLimiterDO } from './rate-limiter-do'
 
@@ -168,12 +168,16 @@ function makeDeps(env: Env): IngestDeps {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
-          // Without this, PostHog sees no User-Agent on a server-to-server POST and
-          // files 100% of app telemetry under `no_user_agent`, which its bot detection
-          // then classes as automation — so every PostHog surface that filters bots
-          // (Web Analytics, and anything built from its defaults) hid the entire
-          // product (2026-08-21 data-integrity audit). Identifying the forwarder
-          // honestly is also just true: these events ARE relayed, not browser-sent.
+          // Identifies the forwarder honestly on the HTTP hop: these events ARE
+          // relayed, not browser-sent.
+          //
+          // This header does NOT drive PostHog's bot classification, despite the
+          // 2026-08-21 audit adding it for exactly that reason. Classification
+          // reads the `$raw_user_agent` PROPERTY at query time, not the request
+          // header, so the header alone left every app event still filed as
+          // automation. `analyticsIdentity` below is the actual fix — see its
+          // doc comment in ingest.ts. Kept because it is true, not because it
+          // does anything for analytics.
           'user-agent': 'turbollm-telemetry-worker/1 (+https://turbollm.dev)',
         },
         body: JSON.stringify({
@@ -183,7 +187,7 @@ function makeDeps(env: Env): IngestDeps {
             // No machineId → no distinct_id we could invent. 'anonymous' keeps
             // the consent ping countable without fabricating an identity.
             distinct_id: typeof e.machineId === 'string' ? e.machineId : 'anonymous',
-            properties: { ...e, ...flattenForAnalytics(e) },
+            properties: { ...e, ...flattenForAnalytics(e), ...analyticsIdentity(e) },
             // Same reasoning as store() above: without this, PostHog stamps the event
             // with ingestion time instead of when it actually happened, which silently
             // breaks any funnel that requires strict step order (found 2026-08-01 — real

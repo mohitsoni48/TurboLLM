@@ -147,6 +147,58 @@ test('classifyEngineErrorFingerprint: a null error is other', () => {
   assert.equal(classifyEngineErrorFingerprint(null), 'other')
 })
 
+// ── the `other` split (2026-09-07 funnel audit) ──────────────────────────────
+// `other` was the single largest bucket in the whole `error` event — 162
+// machines over 30 days — and described nothing. Two unrelated things were
+// landing in it: structured error codes with no mapping (below) and auto-tune
+// sweep exhaustion (bench.ts). These pin the first half.
+
+test('classifyEngineErrorFingerprint: a structured code is reported, not flattened into other', () => {
+  // `code` is written by THIS codebase from LOAD_ERROR_CODES — never by a
+  // driver, a model file or a user — so naming it narrows the tail without
+  // weakening the no-free-form-strings rule.
+  assert.equal(classifyEngineErrorFingerprint(err({ code: 'engine_unsupported', message: '' })), 'engine_unsupported')
+  assert.equal(classifyEngineErrorFingerprint(err({ code: 'model_not_loaded', message: '' })), 'model_not_loaded')
+  assert.equal(classifyEngineErrorFingerprint(err({ code: 'load_failed', message: '' })), 'load_failed')
+})
+
+test('classifyEngineErrorFingerprint: engine_unsupported is no longer pooled with genuine unknowns', () => {
+  // The worst case of the old behaviour: a named, fully-understood condition
+  // that classifyLoadFailure maps to `no_engine` was silently landing in
+  // `other` here, alongside failures nobody could explain.
+  assert.equal(classifyLoadFailure(err({ code: 'engine_unsupported' })), 'no_engine')
+  assert.notEqual(classifyEngineErrorFingerprint(err({ code: 'engine_unsupported', message: '' })), 'other')
+})
+
+test('classifyEngineErrorFingerprint: only a genuinely unrecognised failure is other', () => {
+  // An error with a code outside LOAD_ERROR_CODES and text matching no sign
+  // list is honestly unknown — that, and only that, is what `other` should mean.
+  assert.equal(classifyEngineErrorFingerprint(err({ code: 'some_code_we_never_wrote', message: 'entirely unfamiliar' })), 'other')
+  assert.equal(classifyEngineErrorFingerprint({ message: 'entirely unfamiliar' }), 'other')
+})
+
+test('classifyEngineErrorFingerprint: text signs still win over the structured-code fallback', () => {
+  // Ordering regression guard: the fallback is a LAST resort. A load_failed
+  // wrapper around a real OOM must still report cuda_oom — reporting it as
+  // `load_failed` would be a fresh way of hiding the most actionable failure
+  // there is, which is exactly the class of bug this change exists to end.
+  assert.equal(classifyEngineErrorFingerprint(err({ code: 'load_failed', message: 'CUDA error: out of memory' })), 'cuda_oom')
+  assert.equal(classifyEngineErrorFingerprint(err({ code: 'load_failed', message: 'invalid magic in gguf' })), 'model_load_failed')
+})
+
+test('ERROR_FINGERPRINTS: the split values are registered, so the edge cannot reject them', () => {
+  // A fingerprint that is not a registry member is silently dropped by
+  // validateEvent — the failure mode this whole audit exists to catch.
+  for (const name of ['autotune_exhausted', 'engine_unsupported', 'model_not_loaded', 'load_failed']) {
+    assert.ok((ERROR_FINGERPRINTS as readonly string[]).includes(name), `${name} must be in ERROR_FINGERPRINTS`)
+  }
+  // `gateway_unreachable` has no emit site anywhere in the tree and has never
+  // been sent. It stays registered on purpose: deleting a name makes the Worker
+  // start REJECTING any client that still sends it, which is what killed
+  // `onboarding_step`. The gap is a missing emitter, not a missing enum value.
+  assert.ok((ERROR_FINGERPRINTS as readonly string[]).includes('gateway_unreachable'))
+})
+
 test('classifyProvisionFailure: always returns a value from the enum', () => {
   const inputs = [
     'TurboQuant has no prebuilt binary for this operating system in its latest release.',
