@@ -849,7 +849,12 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       // yet — a Code-session override, if set, replaces it below — so the two sources are
       // resolved to a single effective value before either ever touches the outbound body.
       let effort: ReturnType<typeof parseReasoningEffort> = undefined
-      if (parsedBody && typeof parsedBody.reasoning_effort === 'string') {
+      if (parsedBody && 'reasoning_effort' in parsedBody) {
+        // `parseReasoningEffort` already returns undefined for a non-string (e.g. a
+        // LiteLLM-style explicit `null` for an unset optional), so the delete below must not
+        // be gated on the value's type too — the key still has to go either way for "always
+        // deleted" above to be true, or a non-string value skips this parser entirely and
+        // reaches the engine exactly as raw as an unvalidated one would.
         effort = parseReasoningEffort(parsedBody.reasoning_effort)
         delete parsedBody.reasoning_effort
       }

@@ -160,3 +160,26 @@ test('a Code session with no reasoning-effort override set still gets the client
 
   assert.equal((outbound?.chat_template_kwargs as Record<string, unknown>)?.reasoning_effort, 'low')
 })
+
+test('a prototype-chain key never reaches the engine as a non-string reasoning_effort', async () => {
+  // ALIASES[value] on a plain object would resolve '__proto__' to Object.prototype itself,
+  // which then lands in chat_template_kwargs.reasoning_effort as a JSON object — exactly the
+  // raise_exception-triggering shape this whole feature exists to keep away from the engine.
+  const app = new Hono()
+  registerGateway(app, fakeDeps())
+  const outbound = await postChat(app, { reasoning_effort: '__proto__' })
+
+  assert.equal(outbound?.reasoning_effort, undefined)
+  assert.equal(outbound?.chat_template_kwargs, undefined)
+})
+
+test('a non-string reasoning_effort (e.g. an explicit null from an SDK wrapper) is still deleted, not forwarded raw', async () => {
+  const app = new Hono()
+  registerGateway(app, fakeDeps())
+
+  const nullBody = await postChat(app, { reasoning_effort: null })
+  assert.equal(nullBody && 'reasoning_effort' in nullBody, false)
+
+  const numberBody = await postChat(app, { reasoning_effort: 5 })
+  assert.equal(numberBody && 'reasoning_effort' in numberBody, false)
+})

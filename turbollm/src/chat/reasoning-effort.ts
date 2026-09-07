@@ -19,7 +19,12 @@ const VALID = new Set<string>(['off', 'low', 'medium', 'xhigh'])
 // anything else (GitHub #213: a client-side 'high' variant otherwise 500s the whole turn, or
 // silently never applies on an engine build old enough to forward it raw). Aliased here, in
 // the one shared parser, so every caller gets it for free rather than each reimplementing it.
-const ALIASES: Record<string, ReasoningEffort> = { high: 'xhigh' }
+// A `Map`, not a plain object: a plain-object lookup (`ALIASES[value]`) resolves inherited
+// `Object.prototype` members for a key like 'constructor' or '__proto__', handing back a
+// function or `Object.prototype` itself instead of `undefined` — which this parser's callers
+// then write straight into `chat_template_kwargs.reasoning_effort`, the exact `raise_exception`
+// this function exists to prevent. A `Map` has no prototype-chain lookup, so no key can do that.
+const ALIASES = new Map<string, ReasoningEffort>([['high', 'xhigh']])
 
 /** Undefined for anything not exactly one of the four supported values or the 'high' alias
  *  (including absent/undefined/empty-string input) — callers omit the field entirely rather
@@ -27,5 +32,5 @@ const ALIASES: Record<string, ReasoningEffort> = { high: 'xhigh' }
 export function parseReasoningEffort(value: unknown): ReasoningEffort | undefined {
   if (typeof value !== 'string') return undefined
   if (VALID.has(value)) return value as ReasoningEffort
-  return ALIASES[value]
+  return ALIASES.get(value)
 }

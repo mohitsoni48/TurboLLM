@@ -26,3 +26,14 @@ test('parseReasoningEffort rejects anything else, including near-misses and non-
     assert.equal(parseReasoningEffort(bad), undefined, `expected undefined for ${JSON.stringify(bad)}`)
   }
 })
+
+test('parseReasoningEffort does not resolve inherited Object.prototype members as an alias', () => {
+  // A plain-object alias lookup (`ALIASES[value]`) would resolve these to inherited
+  // Object.prototype members instead of undefined — a function for most of them, the
+  // prototype object itself for '__proto__' — which a caller then writes straight into
+  // `chat_template_kwargs.reasoning_effort`, crashing the engine's template on a non-string
+  // value. None of these are valid reasoning-effort values; all must come back undefined.
+  for (const key of ['constructor', 'toString', 'valueOf', 'hasOwnProperty', '__proto__', 'isPrototypeOf', 'propertyIsEnumerable', 'toLocaleString']) {
+    assert.equal(parseReasoningEffort(key), undefined, `expected undefined for prototype key ${JSON.stringify(key)}`)
+  }
+})
