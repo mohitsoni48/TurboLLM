@@ -10,6 +10,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Hono } from 'hono'
 import { registerGateway } from './gateway'
+import { sessionAuth } from '../code/session-auth'
 import type { Deps } from '../deps'
 
 const LIBRARY = [{ key: 'qwen3-8b|Q4|123', name: 'Qwen3 8B' }]
@@ -45,16 +46,20 @@ function captureOutboundFetch(): { calls: Array<{ url: string; body: Record<stri
   return { calls, restore: () => { globalThis.fetch = original } }
 }
 
-async function postChat(app: Hono, body: Record<string, unknown>) {
+async function postChatAs(app: Hono, token: string, body: Record<string, unknown>) {
   const capture = captureOutboundFetch()
   try {
     await app.request('/v1/chat/completions', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer turbollm-local' },
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify({ model: 'qwen3-8b|Q4|123', messages: [], stream: false, ...body }),
     })
   } finally { capture.restore() }
   return capture.calls[0]?.body
+}
+
+function postChat(app: Hono, body: Record<string, unknown>) {
+  return postChatAs(app, 'turbollm-local', body)
 }
 
 test('a client-supplied reasoning_effort is translated into chat_template_kwargs, not forwarded raw', async () => {
@@ -111,4 +116,47 @@ test('a caller-supplied chat_template_kwargs is preserved alongside the translat
   const kwargs = outbound?.chat_template_kwargs as Record<string, unknown>
   assert.equal(kwargs.reasoning_effort, 'medium')
   assert.equal(kwargs.some_other_flag, true)
+})
+
+// A Code-session client (launched via TurboLLM's own `turbollm launch`) carries a
+// session-scoped token AND may send its own top-level `reasoning_effort` on the same turn.
+// The persisted session override must win cleanly — not just be added alongside whatever the
+// client-value translation already wrote to chat_template_kwargs/thinking_budget_tokens.
+test("a Code-session override to a real effort clears a client-sent 'off' cleanly (no stale enable_thinking/thinking_budget_tokens)", async () => {
+  const app = new Hono()
+  registerGateway(app, fakeDeps())
+  const token = sessionAuth.mint('sess-conflict-a')
+  sessionAuth.setReasoningEffort('sess-conflict-a', 'low')
+
+  const outbound = await postChatAs(app, token, { reasoning_effort: 'off' })
+
+  const kwargs = outbound?.chat_template_kwargs as Record<string, unknown> | undefined
+  assert.equal(kwargs?.reasoning_effort, 'low', "the session's override must win")
+  assert.equal(kwargs?.enable_thinking, undefined, "no stale enable_thinking:false left over from the client's 'off'")
+  assert.equal(outbound?.thinking_budget_tokens, undefined, "no stale thinking_budget_tokens:0 left over from the client's 'off'")
+})
+
+test("a Code-session override to 'off' clears a client-sent real effort cleanly (no stale reasoning_effort)", async () => {
+  const app = new Hono()
+  registerGateway(app, fakeDeps())
+  const token = sessionAuth.mint('sess-conflict-b')
+  sessionAuth.setReasoningEffort('sess-conflict-b', 'off')
+
+  const outbound = await postChatAs(app, token, { reasoning_effort: 'medium' })
+
+  const kwargs = outbound?.chat_template_kwargs as Record<string, unknown> | undefined
+  assert.equal(kwargs?.enable_thinking, false, "the session's 'off' override must win")
+  assert.equal(outbound?.thinking_budget_tokens, 0)
+  assert.equal(kwargs?.reasoning_effort, undefined, "no stale reasoning_effort:'medium' left over from the client's value")
+})
+
+test('a Code session with no reasoning-effort override set still gets the client value translated', async () => {
+  const app = new Hono()
+  registerGateway(app, fakeDeps())
+  const token = sessionAuth.mint('sess-no-effort-override')
+  // No setReasoningEffort call — the client's own value should flow through untouched.
+
+  const outbound = await postChatAs(app, token, { reasoning_effort: 'low' })
+
+  assert.equal((outbound?.chat_template_kwargs as Record<string, unknown>)?.reasoning_effort, 'low')
 })

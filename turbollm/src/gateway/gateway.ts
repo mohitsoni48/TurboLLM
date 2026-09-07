@@ -840,44 +840,54 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       // vendored engine's own version-dependent compat shim means an older build silently
       // drops the unrecognized top-level key — every variant then renders identically,
       // since the template's own `reasoning_effort|default('xhigh')` wins every time with no
-      // visible error. Translated here instead, through the same validated parser the
+      // visible error. Parsed here instead, through the same validated parser the
       // session-token override below uses, so it works regardless of engine version and a
       // bad/unsupported value (or the standard OpenAI 'high', aliased to Qwen3.8's 'xhigh')
       // is handled once rather than left for the engine's `raise_exception` to hit. The raw
-      // key is always deleted: forwarding it too would either duplicate what's now in
-      // chat_template_kwargs or, if invalid, still reach a modern engine unsanitized.
+      // key is always deleted: forwarding it too would either duplicate what's below or, if
+      // invalid, still reach a modern engine unsanitized. Not applied to `chat_template_kwargs`
+      // yet — a Code-session override, if set, replaces it below — so the two sources are
+      // resolved to a single effective value before either ever touches the outbound body.
+      let effort: ReturnType<typeof parseReasoningEffort> = undefined
       if (parsedBody && typeof parsedBody.reasoning_effort === 'string') {
-        const clientEffort = parseReasoningEffort(parsedBody.reasoning_effort)
+        effort = parseReasoningEffort(parsedBody.reasoning_effort)
         delete parsedBody.reasoning_effort
-        if (clientEffort === 'off') {
-          parsedBody.thinking_budget_tokens = 0
-          parsedBody.chat_template_kwargs = { ...(parsedBody.chat_template_kwargs as Record<string, unknown> ?? {}), enable_thinking: false }
-        } else if (clientEffort !== undefined) {
-          parsedBody.chat_template_kwargs = { ...(parsedBody.chat_template_kwargs as Record<string, unknown> ?? {}), reasoning_effort: clientEffort }
-        }
       }
       // Terminal-agent thinking-budget override (ADR-284) — OpenAI-protocol clients (pi/
       // opencode via this passthrough) reach the same `thinking_budget_tokens` field the
       // engine sampler reads directly (no Anthropic-shaped `thinking` object to translate,
-      // unlike /v1/messages above). Same session-scoped-token gate as that handler. Runs
-      // AFTER the client-supplied translation above so a deliberate, persistent Code-session
-      // override still wins over whatever the CLI itself sent on this turn — same precedence
-      // the thinking-budget override next to it already has.
+      // unlike /v1/messages above). Same session-scoped-token gate as that handler.
       if (parsedBody && chatCodeSessionId) {
         const override = sessionAuth.getThinkingBudgetForToken(chatToken)
         if (override !== null) {
           if (override > 0) parsedBody.thinking_budget_tokens = override
           else delete parsedBody.thinking_budget_tokens
         }
-        // Same override mechanism, for reasoning_effort — see session-auth.ts. 'off'
-        // collapses onto enable_thinking/thinking_budget_tokens (reasoning-effort.ts).
+        // Same override mechanism, for reasoning_effort — see session-auth.ts. A deliberate,
+        // persistent Code-session override replaces whatever the client itself sent on this
+        // turn (including the plain-client value parsed above), same precedence the
+        // thinking-budget override above already has.
         const effortOverride = sessionAuth.getReasoningEffortForToken(chatToken)
-        if (effortOverride === 'off') {
+        if (effortOverride !== null) effort = effortOverride
+      }
+      // Applied exactly once, from whichever of the two sources above won, so a client value
+      // and a session override that disagree (e.g. client sends 'off' but the session's own
+      // override is 'low') can never leave a stale `enable_thinking`/`reasoning_effort` key
+      // behind from a discarded intermediate write — every prior key this pair can set is
+      // cleared before the winning one is applied. 'off' collapses onto
+      // enable_thinking/thinking_budget_tokens (reasoning-effort.ts) since it isn't itself a
+      // template value.
+      if (parsedBody && effort !== undefined) {
+        const kwargs = { ...(parsedBody.chat_template_kwargs as Record<string, unknown> ?? {}) }
+        delete kwargs.enable_thinking
+        delete kwargs.reasoning_effort
+        if (effort === 'off') {
           parsedBody.thinking_budget_tokens = 0
-          parsedBody.chat_template_kwargs = { ...(parsedBody.chat_template_kwargs as Record<string, unknown> ?? {}), enable_thinking: false }
-        } else if (effortOverride !== null) {
-          parsedBody.chat_template_kwargs = { ...(parsedBody.chat_template_kwargs as Record<string, unknown> ?? {}), reasoning_effort: effortOverride }
+          kwargs.enable_thinking = false
+        } else {
+          kwargs.reasoning_effort = effort
         }
+        parsedBody.chat_template_kwargs = kwargs
       }
       // Apply the scaffolding computed above. Standing rules go on the system message (stable
       // for the whole session → the engine's reusable prompt prefix is unaffected after turn
