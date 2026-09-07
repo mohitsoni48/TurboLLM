@@ -30,6 +30,7 @@ const AgentEditPage = lazy(() => import('./screens/agents/AgentEditPage').then((
 const ModelsScreen = lazy(() => import('./screens/ModelsScreen').then((m) => ({ default: m.ModelsScreen })))
 const TokensScreen = lazy(() => import('./screens/TokensScreen').then((m) => ({ default: m.TokensScreen })))
 const EnginesScreen = lazy(() => import('./screens/EnginesScreen').then((m) => ({ default: m.EnginesScreen })))
+const MonitorScreen = lazy(() => import('./screens/MonitorScreen').then((m) => ({ default: m.MonitorScreen })))
 const DeveloperScreen = lazy(() => import('./screens/DeveloperScreen').then((m) => ({ default: m.DeveloperScreen })))
 const CustomizeScreen = lazy(() => import('./screens/CustomizeScreen').then((m) => ({ default: m.CustomizeScreen })))
 const SettingsScreen = lazy(() => import('./screens/SettingsScreen').then((m) => ({ default: m.SettingsScreen })))
@@ -238,6 +239,7 @@ export function App() {
             <Route path="/models" element={<ModelsScreen />} />
             <Route path="/usage" element={<TokensScreen />} />
             <Route path="/engines" element={<EnginesScreen />} />
+            <Route path="/monitor" element={<MonitorScreen />} />
             <Route path="/developer" element={<DeveloperScreen />} />
             <Route path="/customize" element={<CustomizeScreen />} />
             <Route path="/settings" element={<SettingsScreen />} />

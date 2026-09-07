@@ -1,6 +1,6 @@
 import { type ReactNode, useEffect, useLayoutEffect } from 'react'
 import { Link, NavLink, useLocation, useNavigate } from 'react-router-dom'
-import { BarChart3, Boxes, Code2, Cpu, PanelsTopLeft, Puzzle, Settings2 } from 'lucide-react'
+import { Activity, BarChart3, Boxes, Code2, Cpu, PanelsTopLeft, Puzzle, Settings2 } from 'lucide-react'
 import { cn } from '../lib/utils'
 import { type ScrollMode, useScrollMode } from '../lib/scroll-mode'
 import type { Status } from '../lib/types'
@@ -23,6 +23,7 @@ const NAV = [
   { to: '/workspace', label: 'Workspace', icon: PanelsTopLeft },
   { to: '/models',    label: 'Models',    icon: Boxes },
   { to: '/engines',   label: 'Engines',   icon: Cpu },
+  { to: '/monitor',   label: 'Monitor',   icon: Activity },
   { to: '/customize', label: 'Customize', icon: Puzzle },
   { to: '/usage',     label: 'Usage',     icon: BarChart3 },
   { to: '/developer', label: 'Developer', icon: Code2 },

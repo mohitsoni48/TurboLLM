@@ -99,7 +99,13 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **A new Monitor tab** puts the live engine log and system hardware stats on one always-visible
+  screen (issue #211), instead of the log being tucked under a collapsed drawer on Engines and
+  stats only living in Settings → System. The top half auto-tracks the running engine's log with
+  a toggle to pause auto-scroll and review earlier output; the bottom half is the same live
+  CPU/RAM/GPU gauges and sparklines Settings → System already shows.
 
 ## [1.12.4] - 2026-09-05
 
