@@ -23,6 +23,20 @@ export interface SysInfo {
   cores: number
   ramMB: number
   gpus: GpuInfo[]
+  /** True inside the packaged Android app, where the engines that exist are the ones shipped in
+   *  the APK and nothing else can ever be added. `os` alone can't express this: Termux also
+   *  reports `android`, and there downloading or building an engine works normally.
+   *
+   *  The difference is Android's W^X hardening (API 29+): an app may not `execve()` a file it
+   *  wrote into its own storage, and only the installed APK's `nativeLibraryDir` is exempt. So a
+   *  downloaded engine binary on the app side is not "slow" or "unsupported", it is
+   *  unrunnable — proven on-device, where the same binary that failed from app storage ran fine
+   *  under `run-as`. Offering install / build-from-source / add-your-own there advertises paths
+   *  that cannot work, which is what this flag lets the UI stop doing.
+   *
+   *  Optional purely so the many `SysInfo` fixtures across the test suite don't each have to
+   *  restate a field none of them care about; `getSysInfo()` itself always populates it. */
+  bundledEnginesOnly?: boolean
 }
 
 let cached: SysInfo | null = null
@@ -35,6 +49,11 @@ export function getSysInfo(): SysInfo {
     cores: getCpuCoreCount(),
     ramMB: Math.round(os.totalmem() / 1e6),
     gpus: detectGpus(),
+    // The app hands us its nativeLibraryDir (MainActivity.kt) because that is the only directory
+    // it can execute from; Termux never sets it. So its presence is exactly "am I the packaged
+    // app", with no extra flag to keep in sync — and it is already load-bearing for registering
+    // the bundled engine (engines/seed.ts).
+    bundledEnginesOnly: process.platform === 'android' && !!process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR,
   }
   return cached
 }

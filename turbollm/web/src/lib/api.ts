@@ -928,6 +928,12 @@ export interface SysInfo {
   cores: number
   ramMB: number
   gpus: Array<{ name: string; vramMb: number; vendor: string }>
+  /** True inside the packaged Android app: the engines that exist are the ones shipped in the
+   *  APK, and install / build / add-your-own cannot work there at all (Android's W^X hardening —
+   *  see the daemon-side field in src/sysinfo/sysinfo.ts for why). Note this is NOT the same as
+   *  "os starts with android": Termux reports android too, and everything works normally there.
+   *  Optional so an older daemon (or a test fixture) simply reads as false. */
+  bundledEnginesOnly?: boolean
 }
 
 export function getSysInfo(): Promise<SysInfo> {

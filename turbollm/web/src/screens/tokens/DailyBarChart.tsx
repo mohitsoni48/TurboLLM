@@ -1,3 +1,5 @@
+import { useLayoutEffect, useRef } from 'react'
+
 const CHART_HEIGHT = 160
 const BAR_GAP = 2
 const MIN_TOTAL_WIDTH = 320
@@ -40,6 +42,18 @@ function formatAxisTick(n: number): string {
  *  width — only falls back to a fixed (scrollable) width when there are genuinely too
  *  many days to render legibly at the container's width. */
 export function DailyBarChart({ days }: { days: BarChartDay[] }) {
+  const scrollRef = useRef<HTMLDivElement>(null)
+
+  // Default scrolled to the right edge, exactly as ActivityHeatmap does and for the same reason:
+  // days run oldest-to-newest, so at scrollLeft 0 a wide "all" range opens on the empty months
+  // before the user ever ran anything. With a single day of usage the chart looked completely
+  // blank — axis and gridlines and nothing else — while the legend right underneath it listed
+  // real token counts, which reads as "usage tracking is broken" (QA_UX_REPORT.md F-02).
+  useLayoutEffect(() => {
+    const el = scrollRef.current
+    if (el) el.scrollLeft = el.scrollWidth
+  }, [days])
+
   if (!days.length) return null
 
   const rawMax = Math.max(...days.map((d) => d.totalTokens), 0)
@@ -49,7 +63,7 @@ export function DailyBarChart({ days }: { days: BarChartDay[] }) {
   const contentMinWidth = days.length * (MIN_BAR_WIDTH + BAR_GAP)
 
   return (
-    <div className="overflow-x-auto">
+    <div className="overflow-x-auto" ref={scrollRef}>
       <div className="flex" style={{ width: '100%', minWidth: Math.max(MIN_TOTAL_WIDTH, contentMinWidth) }}>
         <div
           className="flex shrink-0 flex-col justify-between pr-2 text-right text-[10px] text-faint"

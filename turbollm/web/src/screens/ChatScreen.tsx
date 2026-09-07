@@ -4,11 +4,13 @@ import { ArrowDown, Copy, Download, PanelLeft, Paperclip, SendHorizontal, Share2
 import { continueConversation, fetchSysInfo, listMemoryFacts, sendMessage } from '../lib/chat-api'
 import { extractPdfText } from '../lib/pdf-extract'
 import { chatKeys, useConversation, useConversationMutations } from '../lib/chat-queries'
-import { useBuiltinAgentOverrides, useChatAgents, useEngines, useModelActions, useModelDetail, useModels, useSettings, useStatus } from '../lib/queries'
+import { useBuiltinAgentOverrides, useChatAgents, useEngines, useModelActions, useModelDetail, useModels, useSettings, useStatus, useSysInfo } from '../lib/queries'
+import { isAndroidOs } from '../lib/platform'
 import type { ChatSseEvent, Conversation, LiveToolCall, Message } from '../lib/chat-types'
 import { appendTextDelta, upsertToolCall, type LiveBlock } from '../lib/live-timeline'
 import { ApiError, downloadChatExport, getDebugSnapshot, getShareUrl, importChat, track } from '../lib/api'
 import { useWorkspaceSidebarOpen } from '../lib/workspace-sidebar'
+import { useBackableOverlay } from '../lib/use-backable-overlay'
 import { Button } from '../components/ui/button'
 import {
   DropdownMenu,
@@ -36,7 +38,7 @@ import { ConversationSettingsDialog, type ConversationSettingsDraft } from './ch
 import { useUiStore } from '../stores/ui'
 import { useIsDesktop } from '../lib/useIsDesktop'
 import {
-  buildSystemPrompt, getConvAgentId, getDefaultAgentId,
+  buildSystemPrompt, getConvAgentId, getDefaultAgentId, hasExplicitDefaultAgent,
   getPersonalization, resolveAgents, setConvAgentId,
 } from '../lib/personas'
 
@@ -53,6 +55,18 @@ interface LiveState {
   liveGenTps: number  // rolling 2s window estimate during generation phase
   genTokens: number   // running count of generated tokens (content + reasoning) for this reply
   timeline: LiveBlock[]
+}
+
+/** Fit a model name into the composer placeholder. Measured on-device: the input is 230px at the
+ *  narrowest supported width (360px, minus the attach and send buttons), which holds ~31
+ *  characters at 15px — so 22 for the name once "Message " is accounted for. Past that the name is
+ *  cut and given a real ellipsis, since the browser won't add one to a placeholder itself.
+ *  The font is proportional, so this is a budget rather than a guarantee: it's sized against real
+ *  model names ("qwen2.5-0.5b-instruct" measures 210px of the 230 available), and a hypothetical
+ *  22 characters of capitals would still overrun. Worth revisiting only if names like that appear. */
+const PLACEHOLDER_NAME_MAX = 22
+function truncateName(name: string): string {
+  return name.length > PLACEHOLDER_NAME_MAX ? `${name.slice(0, PLACEHOLDER_NAME_MAX - 1)}…` : name
 }
 
 export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; convIdOverride?: string } = {}) {
@@ -107,6 +121,9 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // Below md the sidebar is an off-canvas drawer, hidden until opened from the header.
   const isDesktop = useIsDesktop()
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
+  // QA_BUGS.md BUG-02: Android hardware/gesture back closes this drawer instead of exiting
+  // the app — see the hook's own doc comment for why a plain boolean isn't enough on its own.
+  useBackableOverlay(mobileSidebarOpen, () => setMobileSidebarOpen(false))
   const sidebarRef = useRef<HTMLDivElement>(null)
   const [sidebarWidth, setSidebarWidth] = useState(() => Math.min(Math.max(readSavedSidebarWidth(), SIDEBAR_MIN_W), sidebarMaxW()))
   const [attachments, setAttachments] = useState<{ file: File; dataUrl: string }[]>([])
@@ -117,25 +134,49 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   const [importError, setImportError] = useState<string | null>(null)
   const [importModelMismatch, setImportModelMismatch] = useState<string | null>(null)
 
+  // Android's on-device models are small enough that the fit-filter (DiscoverTab.tsx)
+  // only surfaces ~4B-and-under repos — unlimited thinking burns a chunk of their
+  // already-tight context/decode budget on reasoning tokens the user didn't ask for, so
+  // the phone build's untouched defaults (below) start from "off" instead. Purely the
+  // starting point: same per-conv/global override path as every other platform, and a
+  // user who's already made an explicit choice is never overridden by this.
+  const sysQ = useSysInfo()
+  const isAndroid = isAndroidOs(sysQ.data?.os ?? '')
+
   // Thinking budget — per-conversation, persisted in localStorage. -1 = unlimited
   // (reasoning models think freely, today's default), 0 = off (model answers directly,
   // no reasoning generated), N>0 = a real sampler-enforced token cap (thinking_budget_tokens
   // — see chat-routes.ts). Supersedes the old on/off-only `tllm.thinkingEnabled.*` toggle
   // (ADR-042) now that the engine genuinely supports a graduated budget, not just 0/-1.
-  // Reads per-conv key first; falls back to global default; defaults to unlimited.
+  // Reads per-conv key first; falls back to global default; defaults to unlimited (0 on
+  // Android — see comment above).
   const readThinkingBudget = (convId: string | null): number => {
     if (convId) {
       const perConv = localStorage.getItem(`tllm.thinkingBudget.${convId}`)
       if (perConv !== null) return Number(perConv)
     }
     const global = localStorage.getItem('tllm.thinkingBudget.default')
-    return global !== null ? Number(global) : -1
+    if (global !== null) return Number(global)
+    return isAndroid ? 0 : -1
   }
   const [thinkingBudget, setThinkingBudgetState] = useState<number>(() => readThinkingBudget(null))
+  const userTouchedThinkingRef = useRef(false)
   const setThinkingBudget = (val: number) => {
+    userTouchedThinkingRef.current = true
     if (activeId) localStorage.setItem(`tllm.thinkingBudget.${activeId}`, String(val))
     setThinkingBudgetState(val)
   }
+  // isAndroid is unknown (false) on first render — useSysInfo() hasn't answered yet — so the
+  // useState initializer above may have already locked in the desktop default (-1) for a split
+  // second before sysinfo resolves. Correct it once, but only for a still-untouched, still-fresh
+  // (no conversation opened yet) chat — never overrides an explicit per-conv/global choice or
+  // anything the user has already touched this session.
+  useEffect(() => {
+    if (!isAndroid || activeId || userTouchedThinkingRef.current) return
+    if (localStorage.getItem('tllm.thinkingBudget.default') !== null) return
+    setThinkingBudgetState((prev) => (prev === -1 ? 0 : prev))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAndroid])
 
   // Reasoning effort (Qwen3.8) — same per-conv/global persistence shape as thinkingBudget
   // above, but a DIFFERENT and independent control (see ReasoningEffortSelect.tsx): only
@@ -155,10 +196,23 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     setReasoningEffortState(val)
   }
 
-  // Agent — per-conversation, defaults to the default set in Customize → Agents.
-  // A plain string: besides the fixed built-in ids, a custom agent's id is an
-  // arbitrary server-issued one, resolved against `allAgents` below.
-  const [selectedPersonaId, setSelectedPersonaId] = useState<string>(() => getDefaultAgentId())
+  // Agent — per-conversation, defaults to the default set in Customize → Agents (Blank on
+  // Android when nothing's been explicitly set — see isAndroid comment above). A plain
+  // string: besides the fixed built-in ids, a custom agent's id is an arbitrary
+  // server-issued one, resolved against `allAgents` below.
+  const [selectedPersonaId, setSelectedPersonaId] = useState<string>(() => getDefaultAgentId(isAndroid))
+  const userTouchedPersonaRef = useRef(false)
+  const handlePersonaChange = (id: string) => {
+    userTouchedPersonaRef.current = true
+    setSelectedPersonaId(id)
+  }
+  // Same first-render race as thinkingBudget above: correct a still-untouched, still-fresh
+  // chat once isAndroid is actually known, never overriding an explicit choice.
+  useEffect(() => {
+    if (!isAndroid || activeId || userTouchedPersonaRef.current || hasExplicitDefaultAgent()) return
+    setSelectedPersonaId((prev) => (prev === 'default' ? 'blank' : prev))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAndroid])
   const customAgentsQ = useChatAgents()
   const builtinOverridesQ = useBuiltinAgentOverrides()
   const allAgents = resolveAgents(customAgentsQ.data ?? [], builtinOverridesQ.data ?? {})
@@ -518,7 +572,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     saveScrollOffset()
     setActiveId(null)
     setInput('')
-    setSelectedPersonaId(getDefaultAgentId())
+    setSelectedPersonaId(getDefaultAgentId(isAndroid))
     inputRef.current?.focus()
   }
 
@@ -535,7 +589,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     pendingScrollRestore.current = { id, top: scrollOffsets.current[id] ?? null }
     setActiveId(id)
     setEditingId(null)
-    setSelectedPersonaId(getConvAgentId(id))
+    setSelectedPersonaId(getConvAgentId(id, isAndroid))
     if (recentlyCompletedIds.has(id)) {
       setRecentlyCompletedIds((prev) => {
         const next = new Set(prev)
@@ -561,7 +615,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     setActiveId(null)
     setEditingId(null)
     setInput('')
-    setSelectedPersonaId(getDefaultAgentId())
+    setSelectedPersonaId(getDefaultAgentId(isAndroid))
   }
 
   const handleStop = async () => {
@@ -924,7 +978,9 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
       <div className="relative flex min-w-0 flex-1 flex-col">
         {/* Read-only banner (F-023: shown when ?readonly=1) */}
         {readonly && (
-          <div className="flex shrink-0 items-center gap-2 border-b border-border bg-panel-2 px-4 py-1.5 text-[12px] text-muted">
+          // No --tllm-safe-top here: Shell.tsx's own wrapper already pads every screen's
+          // top by this exact inset once — this was adding it a second time.
+          <div className="flex shrink-0 items-center gap-2 border-b border-border bg-panel-2 px-4 py-1.5 text-[12px] text-muted" style={{ paddingBottom: 'var(--tllm-safe-bottom)' }}>
             <span className="font-medium text-ink">Shared view</span>
             <span className="text-faint">—</span>
             <span>read only</span>
@@ -932,7 +988,13 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
         )}
 
         {/* Chat header: model load/switch/eject (always available) */}
-        <div className="flex h-12 shrink-0 items-center gap-1.5 border-b border-border px-3 md:gap-2 md:px-4">
+        {/* QA_BUGS.md BUG-03 (original fix, now superseded): the safe-area padding that used to
+            live here moved to Shell.tsx's own wrapper, which pads every screen's top by this
+            same inset once — applying it again here double-counted it (confirmed live: a real
+            "extra padding at the top", once the inset's own value got fixed to its correct,
+            smaller size — this double-count was always there, just masked by that bug's much
+            larger error). */}
+        <div className="flex h-12 shrink-0 items-center gap-1.5 border-b border-border px-3 md:gap-2 md:px-4" style={{ paddingBottom: 'var(--tllm-safe-bottom)' }}>
           {/* Mobile: open the conversation drawer (the sidebar is off-canvas below md). Not
               rendered when embedded — there is no drawer of this component's own to open. */}
           {!embedded && (
@@ -1080,7 +1142,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                 {model ? (
                   <>
                     <p className="text-[15px] font-medium text-ink">{model.name}</p>
-                    <AgentPicker selected={selectedPersonaId} onChange={setSelectedPersonaId} agents={allAgents} />
+                    <AgentPicker selected={selectedPersonaId} onChange={handlePersonaChange} agents={allAgents} />
                     <div className="flex flex-wrap justify-center gap-2">
                       {['Explain something to me', 'Help me write', 'Review this code'].map((s) => (
                         <button
@@ -1142,7 +1204,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
           <button
             type="button"
             onClick={() => { track('chat', 'scroll_to_latest'); userScrolledUp.current = false; scrollToBottom(true) }}
-            className="absolute bottom-28 left-1/2 -translate-x-1/2 flex animate-[tllm-rise-in_150ms_ease-out] items-center gap-1.5 rounded-full border border-border bg-panel px-3 py-1.5 text-[13px] text-muted shadow-[var(--shadow-2)] transition-colors hover:text-ink motion-reduce:animate-none"
+            className="absolute bottom-28 left-1/2 -translate-x-1/2 flex animate-[tllm-rise-in_150ms_ease-out] items-center gap-1.5 rounded-full border border-border bg-panel px-3 py-1.5 text-[13px] text-muted shadow-[var(--shadow-2)] transition-colors hover:text-ink motion-reduce:animate-none" style={{ marginBottom: 'var(--tllm-safe-bottom)'}}
           >
             <ArrowDown size={13} /> Jump to latest
           </button>
@@ -1151,7 +1213,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
         {/* Clipboard fallback modal (F-023): shown when navigator.clipboard is unavailable */}
         {clipboardFallback && (
           <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => { track('chat', 'dismiss_clipboard_modal'); setClipboardFallback(null) }}>
-            <div className="mx-4 w-full max-w-lg rounded-lg border border-border bg-panel p-4 shadow-[var(--shadow-2)]" onClick={(e) => e.stopPropagation()}>
+            <div className="mx-4 w-full max-w-lg rounded-lg border border-border bg-panel p-4 shadow-[var(--shadow-2)]" onClick={(e) => e.stopPropagation()} style={{ paddingBottom: 'calc(var(--tllm-safe-bottom, 0px) + 1rem)'}}>
               <div className="mb-2 flex items-center justify-between">
                 <span className="text-[13px] font-medium text-ink">{clipboardFallback.title}</span>
                 <button type="button" onClick={() => { track('chat', 'dismiss_clipboard_modal'); setClipboardFallback(null) }} className="text-faint hover:text-ink"><X size={14} /></button>
@@ -1238,8 +1300,16 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                 <textarea
                   ref={inputRef}
                   rows={1}
-                  className="max-h-40 min-h-9 flex-1 resize-none bg-transparent px-2 py-1.5 text-[15px] text-ink outline-none placeholder:overflow-hidden placeholder:whitespace-nowrap placeholder:text-faint"
-                  placeholder={ready ? `Message ${remoteChoice?.name ?? model?.name ?? 'the model'}…` : 'Load a model above to start chatting'}
+                  className="max-h-40 min-h-9 flex-1 resize-none bg-transparent px-2 py-1.5 text-[15px] text-ink outline-none placeholder:overflow-hidden placeholder:text-ellipsis placeholder:whitespace-nowrap placeholder:text-faint"
+                  // Both halves of this string are shortened in JS rather than left to CSS,
+                  // because a <textarea> placeholder does NOT ellipsize: verified on-device that
+                  // `text-overflow: ellipsis` (the classes above, and the rule IS in the bundle)
+                  // has no effect on ::placeholder in Android's WebView — a long name still chops
+                  // mid-glyph. So: the idle text is short enough to fit 360px outright, and a long
+                  // model name gets a real "…" spliced in at a width that fits. Previously the
+                  // decorative trailing "…" was itself the thing being clipped, leaving what read
+                  // as a stray full stop after the model name (QA_UX_REPORT.md F-03, P2-1).
+                  placeholder={ready ? `Message ${truncateName(remoteChoice?.name ?? model?.name ?? 'the model')}` : 'Load a model to start chatting'}
                   value={input}
                   disabled={!ready || !!live || !!editingId}
                   onChange={(e) => { setInput(e.target.value); autoResize() }}

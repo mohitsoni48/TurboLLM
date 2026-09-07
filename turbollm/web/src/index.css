@@ -167,13 +167,31 @@ html:not(.tllm-doc-scroll) #root {
      single case that gives --tllm-mobile-nav-h its 3.5rem. HardwareBar toggles the tllm-hw-bar
      class on <html> for its lifetime, exactly like Shell does for tllm-doc-scroll. */
   --tllm-hw-bar-h: 0px;
+  /* Android safe-area insets (QA_BUGS.md BUG-03/04/06/07). The embedded System WebView on
+     Android resolves env(safe-area-inset-*) to 0px in some Chromium builds, so we also
+     expose CSS custom properties that the Android inject-JS patch (DaemonWebView.kt's
+     HEIGHT_FIX_JS) can override with real pixel values read from the native window insets.
+     Desktop browsers ignore these — they have no notches or gesture bars. */
+  --tllm-safe-top: 0px;
+  --tllm-safe-bottom: 0px;
 }
 @media (max-width: 767px) {
   html.tllm-doc-scroll {
-    --tllm-mobile-nav-h: 3.5rem;
+    /* QA_BUGS.md BUG-04: MobileNav's own box grew by env(safe-area-inset-bottom) (Shell.tsx)
+       so the gesture-nav pill lands below its icons instead of through "Customize"/"Usage" —
+       this offset has to grow by the same amount or HardwareBar/the Settings save bar sink
+       into that new padding instead of sitting flush above it. */
+    --tllm-mobile-nav-h: calc(3.5rem + env(safe-area-inset-bottom));
   }
   html.tllm-doc-scroll.tllm-hw-bar {
     --tllm-hw-bar-h: 1.5rem;
+  }
+  /* On Android the status bar and gesture-nav pill eat into the viewport. The WebView's
+     injected JS (DaemonWebView.kt) sets these at runtime from the native insets; the
+     fallback `env()` values cover bare-browser testing on devices that do support them. */
+  :root {
+    --tllm-safe-top: env(safe-area-inset-top, 24px);
+    --tllm-safe-bottom: env(safe-area-inset-bottom, 24px);
   }
 }
 
@@ -187,6 +205,14 @@ body {
   font-size: calc(14px * var(--font-scale, 1));
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
+  /* Founder-reported on Android: the Engines screen (document-scroll mode, so it's exempt
+     from the bounded-mode `overflow: hidden` above) could be dragged sideways — this is
+     nothing but the WebView's default horizontal rubber-band/overscroll bounce, since the
+     app is single-column and never actually has content wider than the viewport. Nothing here
+     should ever scroll horizontally, in either scroll mode, so this is unconditional rather
+     than scoped to one of the two like the height rule above. */
+  overflow-x: hidden;
+  overscroll-behavior: none;
 }
 
 /* Default border color for the Tailwind `border` utility (matches our token). */
@@ -464,11 +490,21 @@ body {
   to { transform: translateX(100%); }
 }
 
-/* Mobile (default): full-screen takeover. */
+/* Mobile (default): full-screen takeover. `inset: 0` is genuinely flush to the physical
+   screen edges — this is DialogPrimitive.Content, portaled straight to document.body, so it
+   sits entirely OUTSIDE Shell's flex column and never inherits the safe-top wrapper div or
+   MobileNav's own bottom padding (Shell.tsx's comment on that wrapper: "one padding here...
+   beats chasing the inset onto each header separately" — a portal is exactly the case that
+   sentence doesn't reach). Measured live: with no padding here every Sheet — the Discover
+   model-detail pane included — rendered content from y=0 to the full viewport height,
+   under the status bar at the top and under the nav/gesture bar at the bottom. Same two
+   vars Shell already uses, same no-op-when-unset behavior on desktop/non-Android. */
 .tllm-sheet {
   inset: 0;
   width: 100%;
   max-width: none;
+  padding-top: var(--tllm-safe-top);
+  padding-bottom: var(--tllm-safe-bottom);
 }
 .tllm-sheet[data-state='open'] {
   animation: tllm-sheet-in-right 0.28s cubic-bezier(0.32, 0.72, 0, 1);

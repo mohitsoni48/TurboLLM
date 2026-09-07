@@ -1,5 +1,6 @@
-// Conversation + message persistence (spec 01 §4). Uses node:sqlite (Node 22+).
-import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
+// Conversation + message persistence (spec 01 §4). Uses node:sqlite (Node 22+) on desktop;
+// Android uses a sql.js (WASM) fallback behind the same interface — see sqlite-adapter.ts.
+import { openSqlDb, type SqlDb, type SqlValue } from './store/sqlite-adapter.js'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import type { Routine, RoutineRun, RoutineFlavor, RoutineStatus, RoutineRunStatus, CodingAgentChoice, ScheduleRule } from '../routines/schema'
@@ -506,8 +507,8 @@ interface FolderRow { id: string; name: string; sort_order: number; created_at: 
 interface ExtRunRow { id: string; chat_id: string; message_id: string; tenant: string; owner: string; status: string; event_seq: number; error: string | null; created_at: string; ended_at: string | null }
 interface MsgRow  { id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string; reasoning: string; attachments: string; text_attachments: string | null; tool_calls: string | null; timeline: string | null; stats: string; model_key: string | null; research_meta: string | null; created_at: string; variant_group: string | null; is_active: number; branch_of: string | null; edited: number }
 
-// node:sqlite named-param objects need an explicit cast to Record<string, SQLInputValue>
-type P = Record<string, SQLInputValue>
+// Named-param objects need an explicit cast to Record<string, SqlValue>
+type P = Record<string, SqlValue>
 
 function safeJson(s: string): unknown { try { return JSON.parse(s) } catch { return {} } }
 
@@ -630,14 +631,14 @@ function rowToMsg(r: MsgRow): Message {
 interface Changes { changes: number }
 
 export class ConversationStore {
-  private db: DatabaseSync
+  private db: SqlDb
 
   private _chatStore?: SqliteChatStore
 
   /** The raw handle, so the pluggable ChatStore can run over the SAME connection and
    *  tables rather than opening a second one (WAL + locking would bite otherwise).
    *  Phase 1 amendment 1: SqliteChatStore sits ALONGSIDE this class, not beneath it. */
-  get handle(): DatabaseSync { return this.db }
+  get handle(): SqlDb { return this.db }
 
   /** Lazily constructed so `new ConversationStore(dir)` stays cheap and so the
    *  migration in the constructor has already run before any store touches a table. */
@@ -647,7 +648,7 @@ export class ConversationStore {
   }
 
   constructor(dataDir: string) {
-    this.db = new DatabaseSync(join(dataDir, 'turbollm.db'))
+    this.db = openSqlDb(join(dataDir, 'turbollm.db'))
     this.migrate()
   }
 
@@ -1311,7 +1312,7 @@ export class ConversationStore {
   updateConversation(id: string, patch: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'sampling' | 'modelKey' | 'skillIds' | 'preserveThinking'>>): boolean {
     const now = new Date().toISOString()
     const sets: string[] = ['updated_at = $now']
-    const params: Record<string, SQLInputValue> = { $id: id, $now: now }
+    const params: Record<string, SqlValue> = { $id: id, $now: now }
     if (patch.title !== undefined)        { sets.push('title = $title');      params.$title = patch.title }
     if (patch.systemPrompt !== undefined) { sets.push('system_prompt = $sp'); params.$sp    = patch.systemPrompt }
     if (patch.sampling !== undefined)     { sets.push('sampling = $samp');    params.$samp  = JSON.stringify(patch.sampling) }
@@ -1393,7 +1394,7 @@ export class ConversationStore {
 
   updateMessage(id: string, patch: Partial<Pick<Message, 'content' | 'reasoning' | 'toolCalls' | 'timeline' | 'stats' | 'researchMeta' | 'edited'>>): boolean {
     const sets: string[] = []
-    const params: Record<string, SQLInputValue> = { $id: id }
+    const params: Record<string, SqlValue> = { $id: id }
     if (patch.content      !== undefined) { sets.push('content = $content');         params.$content      = patch.content }
     if (patch.reasoning    !== undefined) { sets.push('reasoning = $reasoning');     params.$reasoning    = patch.reasoning }
     if (patch.toolCalls    !== undefined) { sets.push('tool_calls = $tc');           params.$tc           = JSON.stringify(patch.toolCalls) }
@@ -2214,7 +2215,7 @@ export class ConversationStore {
   listAgentRuns(opts?: { statuses?: string[] }): AgentRun[] {
     if (opts?.statuses?.length) {
       const placeholders = opts.statuses.map((_, i) => `$s${i}`).join(',')
-      const params: Record<string, SQLInputValue> = {}
+      const params: Record<string, SqlValue> = {}
       opts.statuses.forEach((s, i) => { params[`$s${i}`] = s })
       return (this.db.prepare(`SELECT * FROM agent_runs WHERE status IN (${placeholders}) ORDER BY updated_at DESC LIMIT 200`).all(params) as unknown as AgentRunRow[]).map(rowToAgentRun)
     }
@@ -2224,7 +2225,7 @@ export class ConversationStore {
   updateAgentRun(id: string, patch: Partial<Pick<AgentRun, 'status' | 'error' | 'startedAt' | 'endedAt' | 'title' | 'compactionSummary' | 'compactionUpToMessageId' | 'compactionTokensBefore' | 'titleAutoSynced' | 'terminalLaunchedOnce'>>): boolean {
     const now = new Date().toISOString()
     const sets: string[] = ['updated_at = $now']
-    const params: Record<string, SQLInputValue> = { $id: id, $now: now }
+    const params: Record<string, SqlValue> = { $id: id, $now: now }
     if (patch.status    !== undefined) { sets.push('status = $status');      params.$status  = patch.status }
     if (patch.error     !== undefined) { sets.push('error = $error');        params.$error   = patch.error }
     if (patch.startedAt !== undefined) { sets.push('started_at = $started'); params.$started = patch.startedAt }
@@ -2500,7 +2501,7 @@ export class ConversationStore {
   setRunDisposition(runId: string, completion: 'complete' | 'miss', archive: boolean): boolean {
     const now = new Date().toISOString()
     const sets = ['completion = $c', 'updated_at = $now']
-    const params: Record<string, SQLInputValue> = { $id: runId, $c: completion, $now: now }
+    const params: Record<string, SqlValue> = { $id: runId, $c: completion, $now: now }
     if (archive) { sets.push('archived_at = $now') }
     return ((this.db.prepare(`UPDATE agent_runs SET ${sets.join(', ')} WHERE id = $id`).run(params) as unknown) as Changes).changes > 0
   }

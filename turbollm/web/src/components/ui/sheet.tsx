@@ -14,7 +14,10 @@ import { cn } from '../../lib/utils'
  * Callers pass `modal={false}` on <Sheet> and keep the panel open while the user
  * interacts with the resized content behind it.
  */
-export const Sheet = DialogPrimitive.Root
+// Same Radix root as Dialog, reused so sheets get the same Android hardware-back handling
+// (see dialog.tsx's own comment — QA_UX_REPORT.md F-01). Keeping one implementation means a
+// sheet can't silently miss the fix the way it did before.
+export { Dialog as Sheet } from './dialog'
 export const SheetTrigger = DialogPrimitive.Trigger
 export const SheetClose = DialogPrimitive.Close
 

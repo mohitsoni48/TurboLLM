@@ -13,9 +13,24 @@ export type ReasoningEffort = 'off' | 'low' | 'medium' | 'xhigh'
 
 const VALID = new Set<string>(['off', 'low', 'medium', 'xhigh'])
 
-/** Undefined for anything not exactly one of the four supported values (including
- *  absent/undefined/empty-string input) — callers omit the field entirely rather than
- *  risk sending a value the template rejects. */
+// 'high' is the OpenAI-standard `reasoning_effort` enum value (low/medium/high) that generic
+// OpenAI-compatible clients — opencode, LiteLLM, plain SDK scripts — send natively; Qwen3.8's
+// own template only ever recognizes the literal string 'xhigh' and `raise_exception`s on
+// anything else (GitHub #213: a client-side 'high' variant otherwise 500s the whole turn, or
+// silently never applies on an engine build old enough to forward it raw). Aliased here, in
+// the one shared parser, so every caller gets it for free rather than each reimplementing it.
+// A `Map`, not a plain object: a plain-object lookup (`ALIASES[value]`) resolves inherited
+// `Object.prototype` members for a key like 'constructor' or '__proto__', handing back a
+// function or `Object.prototype` itself instead of `undefined` — which this parser's callers
+// then write straight into `chat_template_kwargs.reasoning_effort`, the exact `raise_exception`
+// this function exists to prevent. A `Map` has no prototype-chain lookup, so no key can do that.
+const ALIASES = new Map<string, ReasoningEffort>([['high', 'xhigh']])
+
+/** Undefined for anything not exactly one of the four supported values or the 'high' alias
+ *  (including absent/undefined/empty-string input) — callers omit the field entirely rather
+ *  than risk sending a value the template rejects. */
 export function parseReasoningEffort(value: unknown): ReasoningEffort | undefined {
-  return typeof value === 'string' && VALID.has(value) ? (value as ReasoningEffort) : undefined
+  if (typeof value !== 'string') return undefined
+  if (VALID.has(value)) return value as ReasoningEffort
+  return ALIASES.get(value)
 }

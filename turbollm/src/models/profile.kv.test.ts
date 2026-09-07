@@ -233,3 +233,18 @@ test('ssmStateElems: a rejected interval yields no recurrent-state term either',
   assert.equal(ssmStateElems(m), 0)
   assert.equal(kvCacheElems(m, CTX), legacyElems(m, CTX))
 })
+
+test('deriveDefault: Android defaults to a quantized KV cache; every other platform keeps f16', () => {
+  const android: SysInfo = { ...sys, os: 'android/arm64', gpus: [] }
+  const androidDefault = deriveDefault(dense, android)
+  assert.equal(androidDefault.kvTypeK, 'q4_0')
+  assert.equal(androidDefault.kvTypeV, 'q4_0')
+  // flashAttn defaults 'on' regardless of platform — required for a quantized V cache to
+  // actually take effect in llama.cpp, so the Android default above must never be paired
+  // with it silently turned off.
+  assert.equal(androidDefault.flashAttn, 'on')
+
+  const desktopDefault = deriveDefault(dense, sys)
+  assert.equal(desktopDefault.kvTypeK, 'f16')
+  assert.equal(desktopDefault.kvTypeV, 'f16')
+})

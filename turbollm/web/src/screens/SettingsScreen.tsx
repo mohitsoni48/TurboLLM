@@ -19,12 +19,14 @@ import {
   useTelemetryLog,
   useRegenerateMachineId,
   useAppUpdate,
+  useSysInfo,
 } from '../lib/queries'
 import { CopyButton } from '../components/ui/copy-button'
 import { ModelDirs } from './models/ModelDirs'
 import { ToolPermissionsSection } from './settings/ToolPermissionsSection'
 import { CodeContextSection } from './settings/CodeContextSection'
 import { CodeAgentSection } from './settings/CodeAgentSection'
+import { useCodeFeatureEnabled, isAndroidOs } from '../lib/platform'
 import { MemorySection } from './settings/MemorySection'
 import { ExperimentalSection } from './settings/ExperimentalSection'
 import { TurboLinkSection } from './settings/TurboLinkSection'
@@ -183,6 +185,9 @@ export function SettingsScreen() {
   // Active category for the two-pane settings layout.
   const [activeCat, setActiveCat] = useState<CatId>('general')
 
+  // Whether the Code-only sections under "Tools & safety" render at all — see the gate there.
+  const codeEnabled = useCodeFeatureEnabled()
+
   useEffect(() => {
     if (settings) {
       setTtl(settings.idleTtlMinutes)
@@ -307,7 +312,12 @@ export function SettingsScreen() {
       <div className="relative flex flex-col gap-4 md:flex-row md:gap-6">
         {/* Category nav: vertical rail at md+, horizontal scroller on mobile. */}
         <nav className="shrink-0 md:w-44">
-          <div className="flex gap-1 overflow-x-auto pb-1 md:flex-col md:overflow-visible md:pb-0">
+          {/* Wraps below md rather than scrolling: the three pills need ~430px, so on a 360px
+              phone "Tools & safety" was cut to "Tools &" at the screen edge with nothing marking
+              the strip as scrollable — a whole settings category you had to guess was there
+              (QA_UX_REPORT.md F-05). Three short pills wrap onto two lines and are simply all
+              visible; at md+ the rail is a vertical column as before. */}
+          <div className="flex flex-wrap gap-1 pb-1 md:flex-col md:flex-nowrap md:pb-0">
             {SETTINGS_CATS.map(({ id, label, icon: Icon }) => (
               <button
                 key={id}
@@ -640,11 +650,21 @@ export function SettingsScreen() {
               {/* Tool permissions — moved here from Developer. */}
               <ToolPermissionsSection />
 
-              {/* Code's AGENTS.md-style standing-context candidate lists. */}
-              <CodeContextSection />
+              {/* Both of these exist only to serve Code, which is cut from the Android release
+                  (platform.ts) — so they go with it rather than sitting here configuring a
+                  feature with no way to reach it. `=== true` (not truthy) keeps them out of the
+                  window where sysinfo hasn't answered: appearing a beat late on desktop beats
+                  flashing them onto the Android app. "Tool permissions" above stays on every
+                  platform — it governs the chat/agent tool gate, not Code. */}
+              {codeEnabled === true && (
+                <>
+                  {/* Code's AGENTS.md-style standing-context candidate lists. */}
+                  <CodeContextSection />
 
-              {/* Which coding agent new Code sessions launch with. */}
-              <CodeAgentSection />
+                  {/* Which coding agent new Code sessions launch with. */}
+                  <CodeAgentSection />
+                </>
+              )}
             </>
           )}
 
@@ -1594,7 +1614,14 @@ function AboutSection() {
   const { data: status } = useStatus()
   const { data: update } = useAppUpdate()
   const installed = update?.installed || status?.version || ''
-  const hasUpdate = !!update?.hasUpdate && !!update?.latest
+  // The Android app's real update path is a new Play Store release, not `npm i -g turbollm` —
+  // there is no terminal to run it in and no npm on the device. `hasUpdate` therefore stays
+  // false on Android regardless of what the npm registry check says, hiding only the
+  // actionable banner below. The plain version row and the "you're on the latest version"
+  // confirmation (an npm-vs-bundled-daemon fact, not an instruction) stay on every platform —
+  // neither one implies an action a phone can't take.
+  const sys = useSysInfo().data
+  const hasUpdate = !!update?.hasUpdate && !!update?.latest && !isAndroidOs(sys?.os ?? '')
 
   return (
     <section className="rounded-lg border border-border bg-panel p-4">

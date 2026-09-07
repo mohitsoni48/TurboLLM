@@ -779,12 +779,14 @@ export function CodeComposer({
         {/* Toolbar — same five-slot shape in both variants: mode | add-context |
             spacer | context ring | model | send/stop. Mode and model are both
             editable in both variants — "at any stage" applies to each identically.
-            `overflow-x-auto` is a safety net on narrow phones — with every slot filled
-            (mode + add-context + ring + thinking-budget + model + send/stop) the row
-            can exceed a ~375px viewport; scrolling the row itself keeps Send reachable
-            without changing layout at any width that already fits (same pattern the
-            launchpad's activity heatmap already uses for its own overflow-prone row). */}
-        <div className="flex items-center gap-1 overflow-x-auto px-2.5 pb-2.5">
+            With every slot filled (mode + add-context + ring + thinking-budget + model +
+            send/stop) the row exceeds a ~360px viewport, so it scrolls horizontally — but
+            send/stop sits OUTSIDE that scroller. Leaving it inside meant the primary action
+            of the whole screen started life off-screen, reachable only by discovering that a
+            row nothing marks as scrollable can be swiped. Everything else degrades fine that
+            way; Send doesn't. At widths that already fit, this is identical to before. */}
+        <div className="flex items-center gap-1 px-2.5 pb-2.5">
+        <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <button
@@ -848,6 +850,8 @@ export function CodeComposer({
             align="end"
             screen="code"
           />
+          </div>
+          <div className="flex shrink-0 items-center gap-1">
           {live ? (
             // Mid-run: Stop controls the live run; when there's text to submit, TWO send actions
             // appear (ADR-246) — Steer interjects into the CURRENT turn (redirects what it's doing
@@ -893,6 +897,7 @@ export function CodeComposer({
               <SendHorizontal size={15} />
             </Button>
           )}
+          </div>
         </div>
       </div>
       </div>
