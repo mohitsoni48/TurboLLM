@@ -87,8 +87,18 @@ export function Shell({
     <div className={cn('app-shell flex', documentScroll ? 'min-h-dvh' : 'h-full')}>
       {!onOnboarding && <NavRail status={status} online={online} version={version} className="hidden md:flex" />}
       <div className="flex min-w-0 flex-1 flex-col">
-        <EngineProvisionBanner status={status} />
-        <EngineLoadErrorBanner status={status} />
+        {/* QA_BUGS.md BUG-03/BUG-07: on a phone this column is the topmost content under the
+            status bar (NavRail is `hidden md:flex` below md, and even at md+ it doesn't cover
+            this column). Android's WebView resolves `env(safe-area-inset-*)` to 0px on many
+            builds, so the native side injects the real inset as the `--tllm-safe-top` CSS
+            custom property instead (see DaemonWebViewScreen's injectSafeAreaInsets) — this
+            padding is a no-op everywhere the variable isn't set (desktop, non-Android). One
+            padding here, on the shared ancestor of every banner and screen header, beats
+            chasing the inset onto each header/banner separately as new ones get added. */}
+        <div style={{ paddingTop: 'var(--tllm-safe-top)' }}>
+          <EngineProvisionBanner status={status} />
+          <EngineLoadErrorBanner status={status} />
+        </div>
         {/* Bounded mode: `main` is the scroller. Document mode: it must NOT be, or the window
             still has nothing to scroll — and `min-h-0` comes off with it so `main` keeps a
             content-height floor inside the now auto-height column. */}
@@ -319,6 +329,8 @@ function MobileNav() {
   // moment the user is on a DIFFERENT Workspace sub-route than whichever one happens to be
   // remembered right now, reading "not active" while genuinely inside Workspace.
   const { pathname } = useLocation()
+  // QA_BUGS.md BUG-04: on Android the gesture-navigation home indicator overlaps the bottom
+  // tab bar. Pad the bottom by the safe-area inset so the tab labels sit above the pill.
   return (
     // Issue #178, load-bearing: this used to be `position: static`, which is fine only while the
     // page can't scroll. In document-scroll mode a static bar sits at the END of a 3000px page —
@@ -327,7 +339,20 @@ function MobileNav() {
     // has no scrolling ancestor and the bar is already the last row of a 100vh flex column.
     // `h-14` pins the height that index.css's `--tllm-mobile-nav-h` is written against (it was
     // already 56px from its content; now it says so) — keep the two in step.
-    <nav className="sticky bottom-0 z-30 flex h-14 shrink-0 border-t border-border bg-panel-2 md:hidden">
+    // QA_BUGS.md BUG-04: the gesture-navigation pill sits UNDER the bar's own icon row on a
+    // phone with no 3-button nav bar reserving that space. `--tllm-safe-bottom` (native-injected,
+    // see the Shell wrapper's paddingTop comment above) adds that space back as extra room below
+    // the (still `h-14`, still vertically-centered) icon row rather than stealing from it, so the
+    // pill lands in blank space instead of slicing through "Customize"/"Usage"'s labels. Elsewhere
+    // (desktop, a phone with 3-button nav, or where the variable isn't set) this is a no-op.
+    // A `will-change: transform` GPU-layer-promotion attempt here (same-day, meant to stop the
+    // bar flickering mid-scroll) turned out to cause a worse, confirmed regression instead: the
+    // nav icons' SVGs rendered with computed height 0 (verified live via CDP — width stayed
+    // 20px, only height collapsed), even outside any scroll gesture at all. Reverted — a
+    // speculative fix for an unconfirmed symptom isn't worth a definite one. If the flicker
+    // needs revisiting, do it with a transform-based promotion (e.g. `transform:
+    // translateZ(0)`) verified NOT to collapse child intrinsic sizing in this WebView first.
+    <nav className="sticky bottom-0 z-30 flex h-14 shrink-0 border-t border-border bg-panel-2 md:hidden" style={{ paddingBottom: 'var(--tllm-safe-bottom)' }}>
       {NAV.map(({ to, label, icon: Icon }) => {
         const isActive = pathname === to || pathname.startsWith(`${to}/`)
         return (
@@ -339,7 +364,13 @@ function MobileNav() {
               isActive ? 'text-accent' : 'text-muted',
             )}
           >
-            <Icon size={20} />
+            {/* Explicit h-5/w-5 (not just the size={20} prop, which sets bare width/height HTML
+                attributes): founder-reported and confirmed live via CDP — in this WebView, these
+                icons rendered with computed height 0 (width stayed 20px) inside this flex-col
+                link, even though the SVG's own attributes were correct. An explicit CSS size
+                wins regardless of whatever's failing to resolve the bare-attribute intrinsic
+                size here. */}
+            <Icon size={20} className="h-5 w-5 shrink-0" />
             <span>{label}</span>
           </NavLink>
         )

@@ -304,13 +304,18 @@ export function ModelsScreen() {
     <div
       className={
         tab === 'discover'
-          ? 'flex h-full w-full flex-col overflow-hidden px-4 py-6 md:px-6'
+          // Below md, Discover is plain flow too — same reasoning as Library below — so
+          // list and detail share Shell's bounded `<main>` scroller as one natural page
+          // instead of each fighting for space in a cramped fixed-height box (a real
+          // founder-reported bug: the detail pane landed clipped at the screen edge). At
+          // md+ this goes back to a bounded `h-full` box: ADR-143 makes Discover a resizable
+          // list/detail split-pane whose two panes scroll independently side by side, which
+          // only makes sense once there's room for them to sit next to each other.
+          ? 'flex flex-col px-4 py-6 md:h-full md:w-full md:overflow-hidden md:px-6'
           // Issue #178: the Library tab used to add `h-full w-full overflow-y-auto` here, a SECOND
           // scroller stacked on top of Shell's `main.overflow-auto` that scrolled nothing extra and
           // only guaranteed the window itself never could. Plain flow now — the tab opts the whole
-          // document into scrolling instead (`useDocumentScroll` above). Discover keeps its bounded
-          // `h-full` box: ADR-143 makes it a resizable list/detail split-pane whose two panes scroll
-          // independently, and it shares this route rather than having one of its own.
+          // document into scrolling instead (`useDocumentScroll` above).
           : 'px-4 py-6 md:px-6'
       }
     >

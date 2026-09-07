@@ -2,8 +2,36 @@ import * as React from 'react'
 import * as AlertDialogPrimitive from '@radix-ui/react-alert-dialog'
 import { cn } from '../../lib/utils'
 import { buttonVariants } from './button'
+import { useBackableOverlay } from '../../lib/use-backable-overlay'
 
-export const AlertDialog = AlertDialogPrimitive.Root
+/** Radix's alert-dialog Root plus Android hardware-back handling, exactly as `Dialog` does it —
+ *  see dialog.tsx for why this lives on the primitive instead of on each caller (QA_UX_REPORT.md
+ *  F-01). Alert dialogs are confirmations, so back closing one is the same as choosing Cancel. */
+export function AlertDialog({
+  open,
+  defaultOpen,
+  onOpenChange,
+  ...props
+}: React.ComponentPropsWithoutRef<typeof AlertDialogPrimitive.Root>) {
+  const [uncontrolledOpen, setUncontrolledOpen] = React.useState(defaultOpen ?? false)
+  const isControlled = open !== undefined
+  const isOpen = isControlled ? open : uncontrolledOpen
+
+  const handleOpenChange = React.useCallback(
+    (next: boolean) => {
+      if (!isControlled) setUncontrolledOpen(next)
+      onOpenChange?.(next)
+    },
+    [isControlled, onOpenChange],
+  )
+
+  useBackableOverlay(
+    isOpen,
+    React.useCallback(() => handleOpenChange(false), [handleOpenChange]),
+  )
+
+  return <AlertDialogPrimitive.Root open={isOpen} onOpenChange={handleOpenChange} {...props} />
+}
 export const AlertDialogTrigger = AlertDialogPrimitive.Trigger
 
 function Overlay({

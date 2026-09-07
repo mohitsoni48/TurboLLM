@@ -356,6 +356,30 @@ export class Registry {
     return out!
   }
 
+  /** Re-point an existing engine at a new `binPath` and re-probe it there (BUG-01 fix,
+   *  QA_BUGS.md). Exists for the one case `reprobe()` doesn't cover: the binary itself
+   *  moved. On Android the APK's own `nativeLibraryDir` — where the bundled llama-server
+   *  is exempt from W^X (build.gradle.kts) — gets a fresh, unpredictable path on every
+   *  install/update (a new signing session, even for the same app), so a `binPath`
+   *  persisted from a previous install is guaranteed stale the moment the app is
+   *  reinstalled or auto-updated. Confirmed live: reinstalling over an existing engine
+   *  registration reproduced exactly BUG-01's `spawn ... ENOENT`. */
+  async repairBinPath(id: string, binPath: string): Promise<Engine> {
+    const e = this.get(id)
+    if (!e) throw new NotFoundError()
+    const pr = await probe(binPath)
+    let out: Engine | undefined
+    this.store.update((c) => {
+      const ce = findEngine(c.engines, id)
+      if (!ce) throw new NotFoundError()
+      ce.binPath = binPath
+      ce.version = pr.version
+      ce.capabilities = pr.capabilities
+      out = structuredClone(ce)
+    })
+    return out!
+  }
+
   async reprobe(id: string): Promise<Engine> {
     const e = this.get(id)
     if (!e) throw new NotFoundError()

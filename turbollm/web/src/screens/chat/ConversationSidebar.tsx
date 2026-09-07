@@ -27,6 +27,7 @@ import {
 import { cn, folderName, readLastChatConvId, readLastCodeSessionId } from '../../lib/utils'
 import { Skeleton } from '../../components/ui/skeleton'
 import { useArchiveCodeSession, useCodeSessionRename, useCodeSessions, useDeleteCodeSession } from '../../lib/code-queries'
+import { useCodeFeatureEnabled } from '../../lib/platform'
 import type { CodeSession, CodeSessionFilter, SessionStatus } from '../../lib/code-types'
 import { ApiError, track } from '../../lib/api'
 import { useRoutinesWithLatestRun, type RoutineWithLatestRun } from '../../lib/routine-queries'
@@ -393,6 +394,14 @@ export function ConversationSidebar({
   // the /workspace/routines* routes is what stops a stale link or typed URL from reaching
   // `isRoutinesMode` in the first place, so this file never needs to fall back out of it.
   const routinesEnabled = useSettings().query.data?.experimental?.routines ?? false
+  // Code is cut from the Android release (platform.ts). Same shape as `routinesEnabled` right
+  // above — the tab is omitted, and App.tsx's route gate is what keeps `isCodeMode` from being
+  // reachable at all there, so nothing below needs an Android branch of its own. `=== true`
+  // rather than a truthy check is load-bearing: the hook's third state is "sysinfo hasn't
+  // answered yet", and rendering the tab through that window would flash Code onto the Android
+  // app and then remove it. Costs desktop one beat before the tab appears; see the hook's
+  // header for why that trade goes this way.
+  const codeEnabled = useCodeFeatureEnabled() === true
   // Switching modes restores whatever conversation/session was last open in the OTHER
   // mode, instead of always resetting to that mode's list/launchpad root. Routines has no
   // such memory yet — it always lands on the list, same as a first-ever visit to Chat/Code
@@ -536,7 +545,8 @@ export function ConversationSidebar({
   // one more repetition of it. `label` doubles as the accessible name AND the visible text.
   const modeTabs: { mode: 'chat' | 'code' | 'routines'; href: string; label: string; icon: typeof MessageSquare }[] = [
     { mode: 'chat', href: chatModeHref, label: 'Chat', icon: MessageSquare },
-    { mode: 'code', href: codeModeHref, label: 'Code', icon: SquareTerminal },
+    // Omitted entirely on Android (feature cut there) — same treatment as Routines below.
+    ...(codeEnabled ? [{ mode: 'code' as const, href: codeModeHref, label: 'Code', icon: SquareTerminal }] : []),
     // Omitted entirely (not just disabled) while the experimental flag is off — see
     // `routinesEnabled`'s own comment above.
     ...(routinesEnabled ? [{ mode: 'routines' as const, href: routinesModeHref, label: 'Routines', icon: AlarmClock }] : []),
@@ -593,7 +603,13 @@ export function ConversationSidebar({
           kept in sync via the route (`mode` above). Lets the user flip modes from the sidebar
           itself, not just the main content header. This replaced the old single-purpose
           "Code · preview" footer link. */}
-      <div className="px-3 pt-3">
+      {/* QA_BUGS.md BUG-06: on mobile this sidebar renders as a `position: fixed` full-height
+          drawer (ChatScreen.tsx), not inside Shell's own column — Shell's top-inset padding
+          (Shell.tsx) never reaches a fixed-position element, so this pill needs the same
+          `env(safe-area-inset-top)` applied directly here, or the status bar clock renders
+          through it. 0 on desktop (this sidebar sits in normal flow there, beside content that
+          already starts below any inset) and 0 on any browser with no inset to report. */}
+      <div className="px-3 pt-[calc(0.75rem+env(safe-area-inset-top))]">
         <div className="flex overflow-hidden rounded-lg border border-border" role="group" aria-label="Workspace mode">
           {modeTabs.map(({ mode: m, href, label, icon: Icon }) =>
             mode === m ? (

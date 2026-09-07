@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { existsSync, readFileSync, statSync } from 'node:fs'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { dirname, join, normalize } from 'node:path'
 import { Agent, setGlobalDispatcher } from 'undici'
 import { registerApi } from './api/routes'
@@ -10,7 +10,6 @@ import { registerChatRoutes } from './chat/chat-routes'
 import { registerChatAgentRoutes } from './chat/chat-agent-routes'
 import { registerPresetRoutes } from './api/preset-routes'
 import { registerAgentRoutes } from './agents/agent-routes'
-import { registerCodeRoutes } from './code/code-routes'
 import type { Deps } from './deps'
 import { registerGateway } from './gateway/gateway'
 import { featureForPath } from './telemetry/feature-map'
@@ -130,7 +129,8 @@ export function createApp(d: Deps): Hono {
   registerChatAgentRoutes(app, d)
   registerPresetRoutes(app, d)
   registerAgentRoutes(app, d)
-  registerCodeRoutes(app, d, d.codeRuns)
+  // Code/Agents routes are registered lazily — see registerCodeRoutesIfSupported below —
+  // not here, so createApp() itself never touches that dependency chain.
   registerTerminalRoutes(app, d)
   registerRoutineRoutes(app, d)
   registerGateway(app, d)
@@ -194,6 +194,41 @@ export function createApp(d: Deps): Hono {
   })
 
   return app
+}
+
+/** Registers the Code/Agents feature's routes, lazily — call once, right after
+ *  `createApp()`, before the server starts accepting connections. NOT folded into
+ *  `createApp()` itself: `code-routes.ts` imports `code-session.ts`, which statically
+ *  imports `@earendil-works/pi-ai`/`pi-coding-agent`, which pull in `pi-tui` and `marked`.
+ *  Those use `\p{...}` Unicode-property regex syntax pervasively (emphasis/strikethrough
+ *  tokenizing, terminal text width) — TurboLLM Android's embedded `nodejs-mobile` runtime
+ *  ships a Node build without full ICU data, and can't even PARSE that syntax (a
+ *  module-load-time SyntaxError, not a catchable runtime one — confirmed live, it crashed
+ *  the whole daemon before any of its own code ran, see TurboLLM Android's BLUEPRINT.md
+ *  Spike D). A dynamic import here means that whole dependency chain is never even
+ *  resolved on a platform that can't run it, since Code/Agents needs `node-pty` (also
+ *  unavailable there) regardless — skipping registration entirely on Android costs nothing
+ *  real. Every other platform's behavior/route surface is unchanged (import resolves
+ *  immediately, same handlers as before, still registered in the same relative order
+ *  before terminal/routine/gateway/ext — Hono matches by path pattern, not registration
+ *  order, so moving this call out of `createApp()`'s synchronous body doesn't change
+ *  routing behavior). */
+export async function registerCodeRoutesIfSupported(app: Hono, d: Deps): Promise<void> {
+  if (process.platform === 'android') return
+  // code-routes.ts ships as its OWN tsup entry, in its OWN separate build pass (see
+  // tsup.config.ts) — not chunked/shared with cli.js — so this dynamic import can never
+  // accidentally pull the pi-coding-agent chain into cli.js's own static output (esbuild's
+  // default chunk-splitting did exactly that once, confirmed live). The specifier is built
+  // via pathToFileURL(join(...)) rather than `new URL('./relative', import.meta.url)` on
+  // purpose — that two-argument form is a recognized esbuild asset-reference idiom (the
+  // same one builtin.ts's WORKER_PATH deliberately relies on for `new Worker(url)`) and
+  // esbuild resolves/inlines it at BUILD time even inside `import()`, defeating the whole
+  // point of a lazy import — also confirmed live, the actual bug this works around.
+  const hereFile = fileURLToPath(import.meta.url)
+  const isDev = hereFile.endsWith('.ts')
+  const modPath = join(dirname(hereFile), isDev ? 'code' : '.', `code-routes${isDev ? '.ts' : '.js'}`)
+  const { registerCodeRoutes } = await import(pathToFileURL(modPath).href)
+  registerCodeRoutes(app, d, d.codeRuns)
 }
 
 function contentType(file: string): string {

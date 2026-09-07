@@ -1,11 +1,14 @@
 // Daemon-owned runs for the public API (spec 27 §6). The reconnect primitive is NOT
-// reimplemented here: RingBuffer + subscribeToBuffer come straight from code-run-manager.ts,
-// where they are already pure, exported, and covered by 16 tests. What is new is the run
-// LIFECYCLE — one run per generation, keyed by run id rather than session id, with liveness
-// that counts polling as well as streaming.
+// reimplemented here: RingBuffer + subscribeToBuffer come from run-buffer.ts (not
+// code-run-manager.ts directly — that file also pulls in code-session.ts's
+// @earendil-works/pi-coding-agent chain, which TurboLLM Android's embedded runtime can't
+// even parse; run-buffer.ts has zero dependency on that chain by construction), where they
+// are already pure, exported, and covered by 16 tests. What is new is the run LIFECYCLE —
+// one run per generation, keyed by run id rather than session id, with liveness that counts
+// polling as well as streaming.
 import { EventEmitter } from 'node:events'
 import { randomUUID } from 'node:crypto'
-import { RingBuffer, subscribeToBuffer, type Subscription } from '../code/code-run-manager.js'
+import { RingBuffer, subscribeToBuffer, type Subscription } from '../code/run-buffer.js'
 import type { EmitSink } from '../chat/emit-sink.js'
 import type { Scope } from '../chat/store/types.js'
 

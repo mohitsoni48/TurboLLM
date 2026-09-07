@@ -353,10 +353,30 @@ export function aggregatorPenalty(title: string, url: string, intent?: string): 
  * or Cyrillic query outright — which would silently deny the fan-out to exactly the users who
  * are not searching in English. Minimum length 2, because a CJK word routinely is two characters.
  */
+// nodejs-mobile (TurboLLM's embedded Android runtime, Node 18.20.4 without full ICU data —
+// see TurboLLM Android's PROVENANCE.md) can't even PARSE \p{...} Unicode-property regex
+// syntax as a literal — that's a MODULE-LOAD-time parse failure there, not a catchable
+// runtime error, and it crashed the whole daemon before any of its own code ran (confirmed
+// live on a real emulator run, 2026-09-03). Built via `new RegExp(string)` instead of a
+// literal so an unsupported runtime throws a normal, catchable SyntaxError right here
+// instead of failing to parse the entire file. The ASCII fallback deliberately mirrors
+// tokenize()'s own (`\W` ~= `[^A-Za-z0-9_]`) rather than silently matching nothing — losing
+// Unicode-awareness on that one runtime is an accepted, honest degradation, not a crash.
+function tryUnicodeRegex(pattern: string, flags: string, asciiFallback: RegExp): RegExp {
+  try {
+    return new RegExp(pattern, flags)
+  } catch {
+    return asciiFallback
+  }
+}
+
+const WORD_SPLIT_RE = tryUnicodeRegex('[^\\p{L}\\p{N}]+', 'u', /[^a-zA-Z0-9]+/)
+const TRIM_PUNCT_RE = tryUnicodeRegex('^[^\\p{L}\\p{N}]+|[^\\p{L}\\p{N}]+$', 'gu', /^[^a-zA-Z0-9]+|[^a-zA-Z0-9]+$/g)
+
 function substantiveTermCount(text: string): number {
   return text
     .toLowerCase()
-    .split(/[^\p{L}\p{N}]+/u)
+    .split(WORD_SPLIT_RE)
     .filter((t) => t.length >= 2 && !STOP_WORDS.has(t)).length
 }
 
@@ -410,7 +430,7 @@ export function debaitQuery(query: string): string | null {
 
   // Collapse the holes left behind, then trim leading/trailing punctuation the bait was attached
   // to ("Best: mattresses?" → "mattresses"). Unicode-aware so non-Latin queries survive intact.
-  out = out.replace(/\s+/g, ' ').trim().replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '').trim()
+  out = out.replace(/\s+/g, ' ').trim().replace(TRIM_PUNCT_RE, '').trim()
 
   if (!out || out.toLowerCase() === query.trim().toLowerCase()) return null
   // Under two substantive terms there is nothing left to retrieve on — "best of 2026" reduces to

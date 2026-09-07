@@ -16,6 +16,7 @@ import { useUiStore } from './stores/ui'
 import { useOnboardingState } from './lib/onboarding-queries'
 import { ApiError, setAuthToken } from './lib/api'
 import { subscribeCodeAuthNeeded, isCodeAuthNeeded } from './lib/auth-signal'
+import { useCodeFeatureEnabled } from './lib/platform'
 import { useRoutineNotificationPoller } from './lib/notify-routine'
 
 // Route-level code splitting: each screen loads only when first navigated to.
@@ -46,6 +47,20 @@ function ScreenFallback() {
       />
     </div>
   )
+}
+
+/** Platform gate for the Code routes. Three-state on purpose (see useCodeFeatureEnabled):
+ *  enabled → render Code; disabled (Android) → land on Chat, which is where every other
+ *  dead route in this file already lands; still unknown → hold on the same spinner the
+ *  route chunks themselves load behind, since redirecting on a guess would silently
+ *  rewrite a desktop user's `/workspace/code/:sessionId` deep link and lose the session id
+ *  before sysinfo ever answers. `replace` so the Android bounce doesn't leave a Code URL in
+ *  history for the hardware back button to walk straight back into. */
+function CodeGate({ children }: { children: ReactNode }) {
+  const codeEnabled = useCodeFeatureEnabled()
+  if (codeEnabled === undefined) return <ScreenFallback />
+  if (!codeEnabled) return <Navigate to="/workspace/chat" replace />
+  return <>{children}</>
 }
 
 /** Onboarding entry predicate (spec 25 §3): redirects to `/onboarding` while
@@ -205,9 +220,19 @@ export function App() {
             <Route path="/workspace/chat" element={<WorkspaceScreen />} />
             <Route path="/workspace/chat/:convId" element={<WorkspaceScreen />} />
             {/* Code — Workspace's second mode, not a separate nav item. Generally available
-                (ADR-280) — no longer gated behind an experimental-feature flag. */}
-            <Route path="/workspace/code" element={<CodeHomeScreen />} />
-            <Route path="/workspace/code/:sessionId" element={<CodeSessionScreen />} />
+                (ADR-280) — no longer gated behind an experimental-feature flag.
+                Cut from the Android release (platform.ts): Code drives git + a coding-agent CLI
+                over a checked-out repo, which is not a phone workflow. Gated HERE and not only
+                on the sidebar's mode tab for the same reason routines are — a bookmarked or
+                hand-typed URL must not be a backdoor around a hidden feature. It also catches
+                the one in-app link we can't gate at its source: onboarding's Developer payoff
+                hands off to `/workspace/code` (PayoffStep), which lands on Chat here instead.
+                `undefined` (sysinfo still loading) renders the same chunk-loading spinner the
+                Suspense boundary already shows, NOT a redirect — see useCodeFeatureEnabled's
+                header for why guessing "disabled" for one frame would destroy a desktop deep
+                link, while guessing "enabled" would briefly render Code on Android. */}
+            <Route path="/workspace/code" element={<CodeGate><CodeHomeScreen /></CodeGate>} />
+            <Route path="/workspace/code/:sessionId" element={<CodeGate><CodeSessionScreen /></CodeGate>} />
             {/* Routines — Workspace's THIRD mode (spec 20 §2.1), a peer of Chat/Code rather than
                 nested under Code — moved off /workspace/code/routines/* so the mode switch and
                 the URL agree about what's selected. `/routines/new` is declared before

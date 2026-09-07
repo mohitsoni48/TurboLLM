@@ -6,7 +6,18 @@ import { CopyButton } from '../components/ui/copy-button'
 import { ScreenHeader } from '../components/common'
 import { Button } from '../components/ui/button'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../components/ui/collapsible'
-import { useApiKeys, useNetworkInfo } from '../lib/queries'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '../components/ui/alert-dialog'
+import { useApiKeys, useNetworkInfo, useSysInfo } from '../lib/queries'
+import { isAndroidOs } from '../lib/platform'
 import { ApiError, getConnect, track, type ConnectStep, type NetworkInfo } from '../lib/api'
 import { toast } from '../components/ui/sonner'
 import { cn } from '../lib/utils'
@@ -62,6 +73,14 @@ const CLI_LIST: Cli[] = [
 export function DeveloperScreen() {
   // Issue #178: a long, plain list screen — the window scrolls it, not an inner box.
   useDocumentScroll()
+  // "Connect an app" hands out one-command CLI setup snippets (Claude Code, Codex, ...) for a
+  // TERMINAL to run — meaningless on a phone, which has neither a terminal nor those CLIs
+  // installed. `?? ''` defaults to "show" while sysinfo is still loading rather than "hide":
+  // unlike the Code feature's nav/route gate, briefly showing this static section on Android
+  // for a moment has no functional cost (no redirect, no lost state), so there's no need for
+  // the three-state hold `useCodeFeatureEnabled` uses.
+  const sys = useSysInfo().data
+  const isAndroid = isAndroidOs(sys?.os ?? '')
   return (
     <div className="w-full px-4 py-6 md:px-6">
       <ScreenHeader
@@ -70,7 +89,7 @@ export function DeveloperScreen() {
       />
       <div className="flex flex-col gap-6">
         <ConnectionPanel />
-        <ConnectSection />
+        {!isAndroid && <ConnectSection />}
         <McpSection />
         <ApiReferenceSection />
       </div>
@@ -85,6 +104,10 @@ function ConnectionPanel() {
   const { data: net } = useNetworkInfo()
   const [newName, setNewName] = useState('')
   const [justCreated, setJustCreated] = useState<string | null>(null)
+  // Revoking is irreversible and silently breaks whatever external tool is holding the key, so it
+  // gets a confirmation like deleting a conversation does (QA_UX_REPORT.md F-04 — the app's own
+  // "Confirm before deleting a conversation" setting sets that expectation).
+  const [pendingRevoke, setPendingRevoke] = useState<{ id: string; name: string; prefix: string } | null>(null)
   const keys = query.data?.keys ?? []
 
   // window.location.origin alone still reads 127.0.0.1/localhost when you're viewing the
@@ -170,7 +193,7 @@ function ConnectionPanel() {
                     </div>
                     <button
                       type="button"
-                      onClick={() => { track('developer', 'revoke_api_key'); handleRevoke(k.id, k.prefix) }}
+                      onClick={() => setPendingRevoke({ id: k.id, name: k.name, prefix: k.prefix })}
                       className="rounded p-1 text-faint transition-colors hover:text-err"
                       title="Revoke key"
                     >
@@ -197,6 +220,31 @@ function ConnectionPanel() {
           </>
         )}
       </div>
+
+      <AlertDialog open={!!pendingRevoke} onOpenChange={(o) => { if (!o) setPendingRevoke(null) }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Revoke {pendingRevoke?.name}?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Any app still using this key (<span className="font-mono">{pendingRevoke?.prefix}…</span>) stops
+              working immediately. This can't be undone — you'd have to create a new key and update the app.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                if (!pendingRevoke) return
+                track('developer', 'revoke_api_key')
+                handleRevoke(pendingRevoke.id, pendingRevoke.prefix)
+                setPendingRevoke(null)
+              }}
+            >
+              Revoke
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </section>
   )
 }

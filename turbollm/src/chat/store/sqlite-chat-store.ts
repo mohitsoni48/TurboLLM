@@ -1,20 +1,20 @@
 // SqliteChatStore — the default ChatStore, over TurboLLM's existing chat tables.
 //
-// Runs on the SAME DatabaseSync handle as ConversationStore and reads/writes the SAME
+// Runs on the SAME SqlDb handle as ConversationStore and reads/writes the SAME
 // `conversations` / `messages` rows, so a chat created here is visible in the web UI and
 // vice versa. Phase 2 (spec 27 §9.1) adds real tenant/owner/version/metadata/status
 // columns, so every statement below is scoped with `AND tenant = $t AND owner = $o`
 // (or the differently-named equivalent where `$t` already means something else in that
 // statement) — an unscoped query here would let one tenant read or clobber another's rows.
 import { randomUUID } from 'node:crypto'
-import type { DatabaseSync, SQLInputValue } from 'node:sqlite'
+import type { SqlDb, SqlValue } from './sqlite-adapter.js'
 import { branchingMethods, folderMethods } from './capabilities.js'
 import { StoreError, type BranchingStore, type ChatStore, type FolderStore, type StoreCapabilities } from './chat-store.js'
 import type {
   Chat, ChatInput, ChatMessage, ChatPatch, ListOpts, MessageInput, MessagePatch, MessageStatus, Page, Scope,
 } from './types.js'
 
-type P = Record<string, SQLInputValue>
+type P = Record<string, SqlValue>
 
 interface ConvRow {
   id: string; title: string; system_prompt: string; model_key: string; sampling: string
@@ -108,7 +108,7 @@ export class SqliteChatStore implements ChatStore, FolderStore, BranchingStore {
   declare freezeTail: BranchingStore['freezeTail']
   declare restoreTail: BranchingStore['restoreTail']
 
-  constructor(private readonly db: DatabaseSync) {
+  constructor(private readonly db: SqlDb) {
     Object.assign(this, folderMethods(db), branchingMethods(db))
   }
 
@@ -200,7 +200,7 @@ export class SqliteChatStore implements ChatStore, FolderStore, BranchingStore {
   async listChats(s: Scope, opts: ListOpts): Promise<Page<Chat>> {
     const limit = clampLimit(opts.limit)
     const where: string[] = [`kind = 'chat'`, `tenant = $t`, `owner = $o`]
-    const params: Record<string, SQLInputValue> = { $lim: limit + 1, $t: s.tenant, $o: s.owner }
+    const params: Record<string, SqlValue> = { $lim: limit + 1, $t: s.tenant, $o: s.owner }
 
     if (opts.q) { where.push(`title LIKE $q`); params.$q = `%${opts.q}%` }
     if (opts.cursor) {
@@ -241,7 +241,7 @@ export class SqliteChatStore implements ChatStore, FolderStore, BranchingStore {
     }
 
     const sets = ['updated_at = $now', 'version = version + 1']
-    const params: Record<string, SQLInputValue> = {
+    const params: Record<string, SqlValue> = {
       $id: id, $now: new Date().toISOString(), $tenant: s.tenant, $owner: s.owner,
     }
     if (patch.title !== undefined)        { sets.push('title = $t');           params.$t    = patch.title }
@@ -319,7 +319,7 @@ export class SqliteChatStore implements ChatStore, FolderStore, BranchingStore {
 
   async listMessages(s: Scope, chatId: string, opts: ListOpts): Promise<Page<ChatMessage>> {
     const limit = clampLimit(opts.limit)
-    const params: Record<string, SQLInputValue> = { $cid: chatId, $lim: limit + 1, $t: s.tenant, $o: s.owner }
+    const params: Record<string, SqlValue> = { $cid: chatId, $lim: limit + 1, $t: s.tenant, $o: s.owner }
     let afterSeq = 0
     if (opts.cursor) { afterSeq = decodeSeqCursor(opts.cursor) }
     params.$seq = afterSeq
@@ -346,7 +346,7 @@ export class SqliteChatStore implements ChatStore, FolderStore, BranchingStore {
     }
 
     const sets: string[] = []
-    const params: Record<string, SQLInputValue> = { $id: id, $t: s.tenant, $o: s.owner }
+    const params: Record<string, SqlValue> = { $id: id, $t: s.tenant, $o: s.owner }
     if (patch.content   !== undefined) { sets.push('content = $c');     params.$c  = patch.content }
     if (patch.reasoning !== undefined) { sets.push('reasoning = $r');   params.$r  = patch.reasoning }
     if (patch.toolCalls !== undefined) { sets.push('tool_calls = $tc'); params.$tc = JSON.stringify(patch.toolCalls) }

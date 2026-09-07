@@ -1,11 +1,11 @@
 // BranchingStore + FolderStore for SQLite (spec 27 §4.2). Split out of
 // sqlite-chat-store.ts so the required 13-method core stays readable on its own.
 import { randomUUID } from 'node:crypto'
-import type { DatabaseSync, SQLInputValue } from 'node:sqlite'
+import type { SqlDb, SqlValue } from './sqlite-adapter.js'
 import type { Folder } from './chat-store.js'
 import type { ChatMessage, MessageStatus, Scope } from './types.js'
 
-type P = Record<string, SQLInputValue>
+type P = Record<string, SqlValue>
 interface Changes { changes: number }
 
 interface FolderRow { id: string; name: string; sort_order: number; created_at: string; updated_at: string }
@@ -56,7 +56,7 @@ function rowToMessage(r: MsgRow): ChatMessage {
   }
 }
 
-export function folderMethods(db: DatabaseSync) {
+export function folderMethods(db: SqlDb) {
   return {
     async listFolders(s: Scope): Promise<Folder[]> {
       return (db.prepare(`SELECT * FROM folders WHERE tenant = $t AND owner = $o ORDER BY sort_order ASC, created_at ASC`)
@@ -113,7 +113,7 @@ export function folderMethods(db: DatabaseSync) {
   }
 }
 
-export function branchingMethods(db: DatabaseSync) {
+export function branchingMethods(db: SqlDb) {
   const seqOf = (s: Scope, chatId: string, messageId: string): number | null => {
     const r = db.prepare(`SELECT seq FROM messages WHERE id = $id AND conv_id = $c AND tenant = $t AND owner = $o`)
       .get({ $id: messageId, $c: chatId, $t: s.tenant, $o: s.owner } as P) as unknown as { seq: number } | undefined
