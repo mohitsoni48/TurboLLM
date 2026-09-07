@@ -119,6 +119,7 @@ import type {
   BenchState,
   BuildPrereqs,
   DownloadsList,
+  Engine,
   EngineBackends,
   EngineCatalog,
   EngineRecommendationResult,
@@ -287,6 +288,18 @@ export function useEngines(): UseQueryResult<EnginesList> {
     queryFn: listEngines,
     retry: false,
   })
+}
+
+/** The engine currently selected as active, derived from an `EnginesList` — centralized so
+ *  `EnginesScreen` and `MonitorScreen` (issue #211) can't drift on how "the active engine" is
+ *  computed (same "one rule, not two copies" reasoning as `workspace-nav.ts`'s
+ *  `resolveNavTarget`). Deliberately keyed off SELECTION (`activeEngineId`), not run state:
+ *  `manager.logPath()` on the daemon returns the last session's log even after a stop, so a
+ *  selected-but-stopped engine still has a real, readable log worth showing — gating on
+ *  `state !== 'stopped'` instead would hide that. */
+export function activeEngineOf(list: EnginesList | undefined): Engine | null {
+  const activeId = list?.activeEngineId ?? ''
+  return list?.engines.find((e) => e.id === activeId) ?? null
 }
 
 /** Available llama.cpp backends + the hardware-recommended one (ADR-025).

@@ -161,8 +161,10 @@ function NavRail({
     ? routineItems.filter((it) => it.latestRun?.status === 'needs_approval').length
     : 0
 
-  // Keyboard shortcuts: Ctrl+1–5 (or Cmd+1–5 on Mac) navigate to the
-  // corresponding NAV item. Ignored when focus is in an editable element.
+  // Keyboard shortcuts: Ctrl+1–9 (or Cmd+1–9 on Mac) navigate to the corresponding NAV item
+  // (currently 8 entries, so 9 is unused headroom for one more). Ignored when focus is in an
+  // editable element. Adding/removing/reordering a NAV entry renumbers every shortcut after it —
+  // intentional (the rail position is the source of truth), just worth knowing before moving one.
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
       if (!e.ctrlKey && !e.metaKey) return
@@ -336,12 +338,16 @@ function MobileNav() {
             key={to}
             to={resolveNavTarget(to)}
             className={cn(
-              'flex flex-1 flex-col items-center justify-center gap-1 py-2 text-[10px] transition-colors',
+              'flex min-w-0 flex-1 flex-col items-center justify-center gap-1 py-2 text-[10px] transition-colors',
               isActive ? 'text-accent' : 'text-muted',
             )}
           >
             <Icon size={20} />
-            <span>{label}</span>
+            {/* 8 items now (issue #211's Monitor tab): floors at the sum of the un-truncated
+                label widths without `min-w-0` on the flex-1 parent above — this keeps the bar
+                itself from forcing horizontal scroll on very narrow viewports, at the cost of
+                clipping a label there instead. */}
+            <span className="max-w-full truncate px-0.5">{label}</span>
           </NavLink>
         )
       })}

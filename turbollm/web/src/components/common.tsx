@@ -17,7 +17,7 @@ export function InlineError({
   message: string
   onRetry?: () => void
   className?: string
-  screen: 'tokens' | 'models' | 'routines' | 'engines'
+  screen: 'tokens' | 'models' | 'routines' | 'engines' | 'monitor'
 }) {
   return (
     <div

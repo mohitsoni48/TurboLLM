@@ -29,6 +29,7 @@ import {
   Zap,
 } from 'lucide-react'
 import {
+  activeEngineOf,
   useBackendInstall,
   useBuild,
   useEngineBackends,
@@ -440,8 +441,7 @@ export function EnginesScreen() {
   const linksQ = useLinks()
 
   const list = enginesQ.data
-  const activeId = list?.activeEngineId ?? ''
-  const activeEngine = list?.engines.find((e) => e.id === activeId) ?? null
+  const activeEngine = activeEngineOf(list)
 
   return (
     <div className="w-full px-4 py-6 md:px-6">

@@ -1,4 +1,6 @@
-import { useEngines, useStatus } from '../lib/queries'
+import { ApiError } from '../lib/api'
+import { activeEngineOf, useEngines, useStatus } from '../lib/queries'
+import { InlineError } from '../components/common'
 import { StateChip } from '../components/StateChip'
 import { MonitorLogPanel } from './monitor/MonitorLogPanel'
 import { HardwareSection } from './settings/HardwareSection'
@@ -23,9 +25,7 @@ export function MonitorScreen() {
   const enginesQ = useEngines()
   const { data: status } = useStatus()
 
-  const list = enginesQ.data
-  const activeId = list?.activeEngineId ?? ''
-  const activeEngine = list?.engines.find((e) => e.id === activeId) ?? null
+  const activeEngine = activeEngineOf(enginesQ.data)
   const engineState = status?.engine.state ?? 'stopped'
 
   return (
@@ -42,7 +42,17 @@ export function MonitorScreen() {
 
       <div className="flex min-h-0 flex-1 flex-col">
         <div className="min-h-0 flex-1 border-b border-border">
-          <MonitorLogPanel hasEngine={!!activeEngine} />
+          {enginesQ.isError ? (
+            <div className="p-4">
+              <InlineError
+                message={enginesQ.error instanceof ApiError ? enginesQ.error.message : 'Could not load engines.'}
+                onRetry={() => void enginesQ.refetch()}
+                screen="monitor"
+              />
+            </div>
+          ) : (
+            <MonitorLogPanel hasEngine={!!activeEngine} isLoading={enginesQ.isLoading} />
+          )}
         </div>
         <div className="min-h-0 flex-1 overflow-auto p-4 md:p-6">
           <HardwareSection />

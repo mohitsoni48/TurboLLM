@@ -10,7 +10,7 @@ import { Switch } from '../../components/ui/switch'
  *
  *  Shares the fetch/SSE/auto-scroll/cap logic with `EngineLogPanel` via `useEngineLog` —
  *  only the chrome around it differs. */
-export function MonitorLogPanel({ hasEngine }: { hasEngine: boolean }) {
+export function MonitorLogPanel({ hasEngine, isLoading }: { hasEngine: boolean; isLoading?: boolean }) {
   // Subscribe whenever an engine exists (starting/running/stopping all produce log output —
   // not just 'running'), same gate EnginesScreen uses to decide whether to mount the panel
   // at all. No engine at all → nothing to tail, so the hook stays inactive.
@@ -22,8 +22,8 @@ export function MonitorLogPanel({ hasEngine }: { hasEngine: boolean }) {
         <h2 className="text-[13px] font-semibold uppercase tracking-wide text-faint">Engine log</h2>
         {hasEngine && (
           <div className="flex items-center gap-3">
-            <label className="flex items-center gap-1.5 text-[12px] text-muted">
-              <Switch checked={autoScroll} onCheckedChange={(v) => { track('monitor', 'toggle_engine_log_autoscroll'); setAutoScroll(v) }} />
+            <label htmlFor="monitor-log-autoscroll" className="flex items-center gap-1.5 text-[12px] text-muted">
+              <Switch id="monitor-log-autoscroll" checked={autoScroll} onCheckedChange={(v) => { track('monitor', 'toggle_engine_log_autoscroll'); setAutoScroll(v) }} />
               Auto-scroll
             </label>
             <CopyButton text={lines.join('\n')} label="Copy all" size={14} screen="monitor" />
@@ -32,12 +32,16 @@ export function MonitorLogPanel({ hasEngine }: { hasEngine: boolean }) {
       </div>
       <div
         ref={viewportRef}
+        tabIndex={0}
+        aria-label="Engine log output"
         className="min-h-0 flex-1 overflow-auto px-4 py-3 font-mono text-[12px] leading-[1.5]"
         style={{ background: 'var(--log-bg)', color: 'var(--log-ink)' }}
       >
-        {!hasEngine ? (
+        {isLoading ? (
+          <span style={{ color: 'var(--log-faint)' }}>Loading…</span>
+        ) : !hasEngine ? (
           <span style={{ color: 'var(--log-faint)' }}>
-            No engine running — start one from Engines to see its log here.
+            No engine selected — pick one on Engines to see its log here.
           </span>
         ) : lines.length === 0 ? (
           <span style={{ color: 'var(--log-faint)' }}>No log output yet.</span>

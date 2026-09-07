@@ -39,8 +39,8 @@ export function EngineLogPanel({
         </CollapsibleTrigger>
         {open && (
           <div className="flex items-center gap-3">
-            <label className="flex items-center gap-1.5 text-[12px] text-muted">
-              <Switch checked={autoScroll} onCheckedChange={(v) => { track('engines', 'toggle_engine_log_autoscroll'); setAutoScroll(v) }} />
+            <label htmlFor="engine-log-autoscroll" className="flex items-center gap-1.5 text-[12px] text-muted">
+              <Switch id="engine-log-autoscroll" checked={autoScroll} onCheckedChange={(v) => { track('engines', 'toggle_engine_log_autoscroll'); setAutoScroll(v) }} />
               Auto-scroll
             </label>
             <CopyButton text={lines.join('\n')} label="Copy all" size={14} screen="engines" />
@@ -50,6 +50,8 @@ export function EngineLogPanel({
       <CollapsibleContent>
         <div
           ref={viewportRef}
+          tabIndex={0}
+          aria-label="Engine log output"
           className="max-h-80 overflow-auto rounded-b-[var(--radius)] px-3 py-2 font-mono text-[12px] leading-[1.5]"
           style={{ background: 'var(--log-bg)', color: 'var(--log-ink)' }}
         >

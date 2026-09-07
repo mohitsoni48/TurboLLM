@@ -12,18 +12,27 @@ import type { SysInfo } from '../lib/api'
 
 const state = vi.hoisted(() => ({
   enginesList: undefined as EnginesList | undefined,
+  enginesIsLoading: false,
+  enginesIsError: false,
   status: undefined as Status | undefined,
   hwUsage: undefined as HwUsage | undefined,
   sysInfo: undefined as SysInfo | undefined,
   trackCalls: [] as [string, string][],
   getEngineLogsCalls: 0,
+  refetchCalls: 0,
 }))
 
 vi.mock('../lib/queries', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/queries')>()
   return {
     ...actual,
-    useEngines: () => ({ data: state.enginesList, isLoading: false, isError: false }),
+    useEngines: () => ({
+      data: state.enginesList,
+      isLoading: state.enginesIsLoading,
+      isError: state.enginesIsError,
+      error: state.enginesIsError ? new Error('daemon unreachable') : null,
+      refetch: () => { state.refetchCalls += 1 },
+    }),
     useStatus: () => ({ data: state.status }),
     useHwUsage: () => ({ data: state.hwUsage, isFetching: false, isLoading: false }),
     useSysInfo: () => ({ data: state.sysInfo, isLoading: false }),
@@ -73,11 +82,14 @@ function renderScreen() {
 
 beforeEach(() => {
   state.enginesList = undefined
+  state.enginesIsLoading = false
+  state.enginesIsError = false
   state.status = undefined
   state.hwUsage = undefined
   state.sysInfo = undefined
   state.trackCalls = []
   state.getEngineLogsCalls = 0
+  state.refetchCalls = 0
 })
 
 describe('MonitorScreen', () => {
@@ -85,7 +97,7 @@ describe('MonitorScreen', () => {
     state.enginesList = { engines: [], activeEngineId: '', customDisabled: [] }
     await renderScreen()
 
-    expect(screen.getByText(/No engine running/)).toBeInTheDocument()
+    expect(screen.getByText(/No engine selected/)).toBeInTheDocument()
     expect(state.getEngineLogsCalls).toBe(0)
   })
 
@@ -110,6 +122,25 @@ describe('MonitorScreen', () => {
     fireEvent.click(toggle)
 
     expect(state.trackCalls).toContainEqual(['monitor', 'toggle_engine_log_autoscroll'])
+  })
+
+  it('shows a neutral loading state instead of flashing "No engine selected" while engines are still loading', async () => {
+    state.enginesIsLoading = true
+    await renderScreen()
+
+    expect(screen.getByText(/Loading/)).toBeInTheDocument()
+    expect(screen.queryByText(/No engine selected/)).not.toBeInTheDocument()
+    expect(state.getEngineLogsCalls).toBe(0)
+  })
+
+  it('shows a retryable error, not a misleading "No engine selected", when the engines list fails to load', async () => {
+    state.enginesIsError = true
+    await renderScreen()
+
+    expect(screen.getByRole('alert')).toBeInTheDocument()
+    expect(screen.queryByText(/No engine selected/)).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /retry/i }))
+    expect(state.refetchCalls).toBe(1)
   })
 
   it('renders the system stats pane (HardwareSection) below the log', async () => {
