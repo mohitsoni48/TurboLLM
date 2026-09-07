@@ -13,6 +13,7 @@ import { noteLocalActivity } from '../link/host-idle'
 import { linkHeaders, proxyStream } from '../link/link-proxy'
 import { formatRemoteId } from '../link/model-id'
 import { sessionAuth } from '../code/session-auth'
+import { parseReasoningEffort } from '../chat/reasoning-effort'
 import { classifyHarness } from '../telemetry/classify'
 import { mapToOpenAI, mapFromOpenAI, streamToAnthropic, messageStartEvent, pingWhilePending, DEFAULT_PING_INTERVAL_MS, type AnthropicRequest, type StreamToolCall } from './anthropic'
 import { analyzeTurn, applyAgentGuidance } from './agent-guidance'
@@ -832,10 +833,36 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
         const alias = engineModelAlias(d.registry.active()?.kind ?? '', d.manager.currentOpts()?.modelPath)
         if (alias) parsedBody.model = alias
       }
+      // A plain OpenAI-protocol client (opencode/LiteLLM/any `@ai-sdk/openai-compatible`
+      // caller — GitHub #213) sends the OpenAI-standard top-level `reasoning_effort` field,
+      // not TurboLLM's own `chat_template_kwargs.reasoning_effort` shape. Recent llama.cpp
+      // builds forward that field into chat_template_kwargs themselves, but relying on the
+      // vendored engine's own version-dependent compat shim means an older build silently
+      // drops the unrecognized top-level key — every variant then renders identically,
+      // since the template's own `reasoning_effort|default('xhigh')` wins every time with no
+      // visible error. Translated here instead, through the same validated parser the
+      // session-token override below uses, so it works regardless of engine version and a
+      // bad/unsupported value (or the standard OpenAI 'high', aliased to Qwen3.8's 'xhigh')
+      // is handled once rather than left for the engine's `raise_exception` to hit. The raw
+      // key is always deleted: forwarding it too would either duplicate what's now in
+      // chat_template_kwargs or, if invalid, still reach a modern engine unsanitized.
+      if (parsedBody && typeof parsedBody.reasoning_effort === 'string') {
+        const clientEffort = parseReasoningEffort(parsedBody.reasoning_effort)
+        delete parsedBody.reasoning_effort
+        if (clientEffort === 'off') {
+          parsedBody.thinking_budget_tokens = 0
+          parsedBody.chat_template_kwargs = { ...(parsedBody.chat_template_kwargs as Record<string, unknown> ?? {}), enable_thinking: false }
+        } else if (clientEffort !== undefined) {
+          parsedBody.chat_template_kwargs = { ...(parsedBody.chat_template_kwargs as Record<string, unknown> ?? {}), reasoning_effort: clientEffort }
+        }
+      }
       // Terminal-agent thinking-budget override (ADR-284) — OpenAI-protocol clients (pi/
       // opencode via this passthrough) reach the same `thinking_budget_tokens` field the
       // engine sampler reads directly (no Anthropic-shaped `thinking` object to translate,
-      // unlike /v1/messages above). Same session-scoped-token gate as that handler.
+      // unlike /v1/messages above). Same session-scoped-token gate as that handler. Runs
+      // AFTER the client-supplied translation above so a deliberate, persistent Code-session
+      // override still wins over whatever the CLI itself sent on this turn — same precedence
+      // the thinking-budget override next to it already has.
       if (parsedBody && chatCodeSessionId) {
         const override = sessionAuth.getThinkingBudgetForToken(chatToken)
         if (override !== null) {

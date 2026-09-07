@@ -99,7 +99,15 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **`reasoning_effort` sent by external OpenAI-compatible clients (opencode, LiteLLM, etc.)
+  could silently do nothing.** Those tools send the standard top-level `reasoning_effort`
+  field, which only takes effect if the underlying llama.cpp engine build happens to translate
+  it itself — an older build ignored it outright, so every effort level rendered identically
+  with no error. TurboLLM's gateway now translates it directly, so it works no matter which
+  engine build is installed. The standard OpenAI value `"high"` is also now accepted and mapped
+  to Qwen3.8's own `"xhigh"`, instead of crashing the request.
 
 ## [1.12.4] - 2026-09-05
 
