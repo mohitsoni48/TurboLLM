@@ -13,7 +13,7 @@ export function CopyButton({
   label?: string
   size?: number
   className?: string
-  screen: 'engines' | 'models' | 'developer' | 'settings' | 'code' | 'chat'
+  screen: 'engines' | 'models' | 'developer' | 'settings' | 'code' | 'chat' | 'monitor'
 }) {
   const [copied, setCopied] = useState(false)
 

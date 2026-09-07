@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from 'react'
 import { ChevronRight } from 'lucide-react'
-import { engineLogStreamUrl, getEngineLogs, track } from '../../lib/api'
+import { track } from '../../lib/api'
+import { useEngineLog } from '../../lib/use-engine-log'
 import { cn } from '../../lib/utils'
 import { CopyButton } from '../../components/ui/copy-button'
 import { Switch } from '../../components/ui/switch'
@@ -10,10 +10,10 @@ import {
   CollapsibleTrigger,
 } from '../../components/ui/collapsible'
 
-const MAX_LINES = 2000
-
 /** Collapsible engine log panel: initial tail (GET) + live SSE tail, auto-scroll
- *  toggle and "Copy all" (spec 03 §8/§9). */
+ *  toggle and "Copy all" (spec 03 §8/§9). Fetch/SSE/auto-scroll logic lives in
+ *  `useEngineLog` — shared with the Monitor screen's always-open log view (issue #211),
+ *  so there is exactly one place that fetches and caps the tail. */
 export function EngineLogPanel({
   open,
   onOpenChange,
@@ -21,53 +21,7 @@ export function EngineLogPanel({
   open: boolean
   onOpenChange: (open: boolean) => void
 }) {
-  const [lines, setLines] = useState<string[]>([])
-  const [autoScroll, setAutoScroll] = useState(true)
-  const viewportRef = useRef<HTMLDivElement>(null)
-
-  // Initial tail fetch + SSE live tail, active only while the panel is open.
-  useEffect(() => {
-    if (!open) return
-    let cancelled = false
-
-    void getEngineLogs(200)
-      .then((res) => {
-        if (!cancelled) setLines(res.lines ?? [])
-      })
-      .catch(() => {
-        /* daemon may be down — leave panel empty rather than crash */
-      })
-
-    const es = new EventSource(engineLogStreamUrl)
-    es.addEventListener('line', (ev) => {
-      try {
-        const data = JSON.parse((ev as MessageEvent).data) as { line?: string }
-        if (typeof data.line === 'string') {
-          setLines((prev) => {
-            const next = [...prev, data.line as string]
-            return next.length > MAX_LINES ? next.slice(next.length - MAX_LINES) : next
-          })
-        }
-      } catch {
-        /* ignore malformed frames */
-      }
-    })
-    es.onerror = () => {
-      /* stream closes when the engine stops; reconnection handled by browser */
-    }
-
-    return () => {
-      cancelled = true
-      es.close()
-    }
-  }, [open])
-
-  useEffect(() => {
-    if (autoScroll && viewportRef.current) {
-      viewportRef.current.scrollTop = viewportRef.current.scrollHeight
-    }
-  }, [lines, autoScroll])
-
+  const { lines, autoScroll, setAutoScroll, viewportRef } = useEngineLog(open)
 
   return (
     <Collapsible
@@ -85,8 +39,8 @@ export function EngineLogPanel({
         </CollapsibleTrigger>
         {open && (
           <div className="flex items-center gap-3">
-            <label className="flex items-center gap-1.5 text-[12px] text-muted">
-              <Switch checked={autoScroll} onCheckedChange={(v) => { track('engines', 'toggle_engine_log_autoscroll'); setAutoScroll(v) }} />
+            <label htmlFor="engine-log-autoscroll" className="flex items-center gap-1.5 text-[12px] text-muted">
+              <Switch id="engine-log-autoscroll" checked={autoScroll} onCheckedChange={(v) => { track('engines', 'toggle_engine_log_autoscroll'); setAutoScroll(v) }} />
               Auto-scroll
             </label>
             <CopyButton text={lines.join('\n')} label="Copy all" size={14} screen="engines" />
@@ -96,6 +50,8 @@ export function EngineLogPanel({
       <CollapsibleContent>
         <div
           ref={viewportRef}
+          tabIndex={0}
+          aria-label="Engine log output"
           className="max-h-80 overflow-auto rounded-b-[var(--radius)] px-3 py-2 font-mono text-[12px] leading-[1.5]"
           style={{ background: 'var(--log-bg)', color: 'var(--log-ink)' }}
         >

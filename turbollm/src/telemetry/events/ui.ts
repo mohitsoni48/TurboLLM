@@ -3,8 +3,9 @@
  *  value (`UI_ACTIONS`) plus one `track(screen, action)` call site.
  *
  *  `SCREENS` is spec 23's list, corrected against the actual frontend (`web/src/screens/`):
- *  spec 25 added the `onboarding` screen (the wizard's 9-step flow). Everything else
- *  matches a real top-level screen file.
+ *  spec 25 added the `onboarding` screen (the wizard's 9-step flow); issue #211 added
+ *  `monitor` (the live engine-log + system-stats dashboard). Everything else matches a real
+ *  top-level screen file.
  *
  *  `UI_ACTIONS` is intentionally NOT the full ~361-handler set yet — spec 23 §3.8 itself
  *  recommends landing this schema first, then instrumenting the 361 call sites in per-screen
@@ -22,7 +23,7 @@ import { defineEvent, f } from '../core/define'
 
 export const SCREENS = [
   'chat', 'models', 'engines', 'code', 'customize', 'settings', 'tokens',
-  'workspace', 'developer', 'routines', 'agents', 'skills', 'onboarding',
+  'workspace', 'developer', 'routines', 'agents', 'skills', 'onboarding', 'monitor',
 ] as const
 
 /** Batch 1 (Phase 6a): `EnginesScreen.tsx` + its `EngineCard`/`CustomEngineCard`
@@ -470,6 +471,11 @@ export const SCREENS = [
  *    `EnginesScreen.tsx` — the other textual match of its name, in `CodeTranscript.tsx`, is
  *    just a comment referencing its log-color convention, not an import).
  *    `toggle_engine_log_autoscroll` for the auto-scroll Switch.
+ *  - **Issue #211:** `screens/monitor/MonitorLogPanel.tsx` — the Monitor screen's always-open
+ *    log view, sharing `EngineLogPanel`'s fetch/SSE logic via `useEngineLog` but tagged
+ *    `monitor` (by embedding, same convention as every other screen-tagged shared component
+ *    here) — reuses `toggle_engine_log_autoscroll` and `copy_button_click` rather than minting
+ *    monitor-specific duplicates, since both are the same interaction on the same widget.
  *  - `screens/settings/CodeAgentSection.tsx` — tagged `settings`. `set_default_code_agent`
  *    for the agent picker.
  *  - `screens/code/ContextUsageRing.tsx` — tagged `code` (all three embeddings —

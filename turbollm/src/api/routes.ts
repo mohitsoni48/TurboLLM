@@ -1463,7 +1463,20 @@ export function registerApi(app: Hono, d: Deps): void {
 
   app.get('/api/v1/engine/logs/stream', (c) =>
     streamSSE(c, async (stream) => {
+      // `sent`/`lastPath` are this CONNECTION's own cursor. `manager.ts`'s engine start TRUNCATES
+      // the log file (a restart rewrites the same path from empty) and `logPath()` itself changes
+      // on an engine switch — either way `lines.length` can drop below `sent`, and unless the
+      // cursor is fixed the loop below (`sent < lines.length - 1`) simply stalls forever: no error,
+      // no new lines, until the new file eventually regrows past the old length. Previously this
+      // only bit a drawer that got reopened fresh after every switch (Engines); it bites a
+      // long-lived subscriber like the Monitor screen (issue #211) on every restart it's open for.
+      // Detecting "this is effectively a new log" (different path, OR the same path now shorter
+      // than what's already been sent) and reseeding `sent` to the file's CURRENT end — rather
+      // than 0 — also covers a brand-new connection's first tick: it starts from "now" instead of
+      // replaying the whole history, which used to race the client's own initial-tail GET
+      // (whichever arrived first, the result was either duplicated or truncated lines).
       let sent = 0
+      let lastPath = ''
       let aborted = false
       let ticks = 0
       stream.onAbort(() => {
@@ -1473,6 +1486,10 @@ export function registerApi(app: Hono, d: Deps): void {
         const path = d.manager.logPath()
         if (path && existsSync(path)) {
           const lines = readFileSync(path, 'utf8').split('\n')
+          if (path !== lastPath || sent > lines.length - 1) {
+            sent = Math.max(0, lines.length - 1)
+            lastPath = path
+          }
           for (; sent < lines.length - 1; sent++) {
             await stream.writeSSE({ event: 'line', data: JSON.stringify({ line: lines[sent].replace(/\r$/, '') }) })
           }
