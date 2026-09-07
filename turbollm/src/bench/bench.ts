@@ -273,8 +273,20 @@ export class BenchRunner {
     // here is a classifyBenchFailure() result ('oom'|'timeout'|'other'), a different
     // vocabulary from classifyEngineErrorFingerprint's — mapped by hand since it's a
     // small, fixed 3-way correspondence, not worth a shared classifier for.
+    //
+    // The third arm reports `autotune_exhausted`, not `other` (2026-09-07 funnel
+    // audit). A sweep that ran out of candidates without hitting OOM or a timeout
+    // is a KNOWN outcome of this search, not an unexplained failure — and sending
+    // it as `other` merged it with unrecognised engine errors from a completely
+    // different code path in cli.ts. That merge is most of why `other` was the
+    // largest bucket in the error event (162 machines / 30 days) and was
+    // unactionable: 90 machines had a failing auto-tune sweep in the same window,
+    // and nothing downstream could separate "the tuner gave up" from "the engine
+    // died in a way we could not classify".
     if (outcome === 'fail') {
-      this.telemetry.error(failReason === 'oom' ? 'cuda_oom' : failReason === 'timeout' ? 'engine_start_timeout' : 'other')
+      this.telemetry.error(
+        failReason === 'oom' ? 'cuda_oom' : failReason === 'timeout' ? 'engine_start_timeout' : 'autotune_exhausted',
+      )
     }
   }
 

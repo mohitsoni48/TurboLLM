@@ -5,7 +5,7 @@
 // that guarantee rot unnoticed.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { flattenForAnalytics, handleIngest, type IngestDeps, type QuarantinedEvent } from './ingest'
+import { analyticsIdentity, flattenForAnalytics, handleIngest, type IngestDeps, type QuarantinedEvent } from './ingest'
 
 function deps(over: Partial<IngestDeps> = {}): IngestDeps {
   const rows: unknown[][] = []
@@ -255,4 +255,47 @@ test('flattenForAnalytics: never emits a non-scalar, so it cannot widen what a p
   assert.equal(flat.payload_tps, 42)
   assert.equal('payload_model' in flat, false, 'a nested block must not be re-emitted as an object')
   assert.equal('payload_tags' in flat, false, 'an array must not be re-emitted')
+})
+
+// ── analyticsIdentity (2026-09-07 funnel audit) ──────────────────────────────
+// PostHog classifies bot-vs-human with getTrafficType(properties.$raw_user_agent)
+// at QUERY time. With that property absent it answers 'Automation', so 100% of
+// app telemetry was flagged $virt_is_bot and every bot-filtered surface showed
+// the product as empty. Verified against the live classifier: '' -> Automation,
+// any non-empty client string -> Regular.
+
+test('analyticsIdentity: reports the app version and OS the envelope already carries', () => {
+  const id = analyticsIdentity({ event: 'ui_action', app: { version: '1.12.4', os: 'win32/x64' } })
+  assert.equal(id.$raw_user_agent, 'TurboLLM/1.12.4 (win32/x64)')
+})
+
+test('analyticsIdentity: is NEVER empty, whatever the envelope is missing', () => {
+  // This is the whole contract. An empty or absent value is what PostHog reads
+  // as automation, so every branch must produce something — including the
+  // degenerate ones a malformed-but-valid envelope could reach.
+  const cases: Record<string, unknown>[] = [
+    { event: 'ui_action', app: { version: '1.12.4', os: 'win32/x64' } },
+    { event: 'ui_action', app: { version: '1.12.4' } },
+    { event: 'ui_action', app: {} },
+    { event: 'consent_choice', level: 'off' },
+    {},
+  ]
+  for (const e of cases) {
+    const ua = analyticsIdentity(e).$raw_user_agent
+    assert.equal(typeof ua, 'string', JSON.stringify(e))
+    assert.ok((ua as string).length > 0, `must not be empty for ${JSON.stringify(e)}`)
+  }
+})
+
+test('analyticsIdentity: consent_choice stays unattributable', () => {
+  // consent_choice carries no app block by design — it is the one thing an
+  // opted-out machine sends and must identify nothing. The fallback has to be
+  // non-empty without inventing a version, an OS or anything machine-specific.
+  const id = analyticsIdentity({ event: 'consent_choice', level: 'off' })
+  assert.equal(id.$raw_user_agent, 'TurboLLM')
+})
+
+test('analyticsIdentity: emits only $raw_user_agent, so it cannot smuggle extra properties', () => {
+  const id = analyticsIdentity({ event: 'ui_action', app: { version: '1.12.4', os: 'win32/x64' } })
+  assert.deepEqual(Object.keys(id), ['$raw_user_agent'])
 })

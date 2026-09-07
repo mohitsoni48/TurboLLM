@@ -48,11 +48,37 @@ export const PROVISION_TRIGGERS = ['seed', 'user_install', 'user_update', 'runti
 /** Usage counts are bucketed, never raw: a raw count is a behavioural fingerprint. */
 export const COUNT_BUCKETS = ['1', '2-5', '6-20', '21-100', '100+'] as const
 
-/** Known failure classes. Never log text — a fingerprint the client already
- *  recognises, or nothing at all. */
+/**
+ * Known failure classes. Never log text — a fingerprint the client already
+ * recognises, or nothing at all.
+ *
+ * The last four were added 2026-09-07, when `other` was found to be the single
+ * largest bucket in the whole `error` event (162 machines, 30 days) while
+ * saying nothing at all. It was not one failure: it merged an auto-tune sweep
+ * that exhausted its candidates with an engine error whose structured `code`
+ * simply had no mapping, and nothing downstream could tell those apart.
+ *
+ * `autotune_exhausted` is the sweep case (`bench.ts`) — a search that ran out
+ * of candidates without hitting OOM or a timeout, which is a normal, knowable
+ * outcome rather than a crash. The other three are `LOAD_ERROR_CODES` members
+ * that `classifyEngineErrorFingerprint` previously dropped on the floor. All
+ * four are written by THIS codebase from a closed vocabulary, never by a
+ * driver, a model file or a user, so naming them narrows the tail without
+ * weakening ADR-299's no-free-form-strings rule — the same move
+ * `model_load.errorCode` already made for the load path.
+ *
+ * `gateway_unreachable` has never been emitted by any client: it has no call
+ * site anywhere in the tree (verified 2026-09-07; zero events in 90 days).
+ * Gateway failures are genuinely uninstrumented, which is a real gap — but it
+ * is a missing emitter, not a missing enum value, so the entry stays and the
+ * gap is tracked separately. Never delete a name here to tidy up: old clients
+ * keep sending it and the Worker would start rejecting them.
+ */
 export const ERROR_FINGERPRINTS = [
   'cuda_oom', 'engine_crash', 'engine_start_timeout', 'model_load_failed',
-  'gateway_unreachable', 'download_failed', 'build_failed', 'other',
+  'gateway_unreachable', 'download_failed', 'build_failed',
+  'autotune_exhausted', 'engine_unsupported', 'model_not_loaded', 'load_failed',
+  'other',
 ] as const
 
 /** Consent levels, as sent by `consent_choice`. */

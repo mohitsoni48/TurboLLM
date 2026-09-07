@@ -102,6 +102,57 @@ export function flattenForAnalytics(e: Record<string, unknown>): Record<string, 
   return out
 }
 
+/**
+ * The client identity PostHog's traffic classifier actually reads
+ * (2026-09-07 funnel audit).
+ *
+ * PostHog decides bot-vs-human with `isLikelyBot(properties.$raw_user_agent)`
+ * and `getTrafficType(properties.$raw_user_agent)` — HogQL functions evaluated
+ * at QUERY time against the event's `$raw_user_agent` PROPERTY. It does not
+ * look at the User-Agent header of the request that delivered the batch.
+ *
+ * That distinction is the whole bug. The 2026-08-21 audit correctly diagnosed
+ * "100% of app telemetry is classed as automation because it has no user
+ * agent", and fixed it by setting a `user-agent` HEADER on the Worker's POST to
+ * `/batch/`. The header is honest and worth keeping, but it never becomes a
+ * property, so `$raw_user_agent` stayed null and nothing changed: measured
+ * 2026-09-07, all 16,907 `ui_action` events in seven days were still
+ * `$virt_is_bot = true`, `$virt_traffic_type = 'Automation'`, against
+ * `$pageview` from the same project at 3 of 1,128. Every PostHog surface that
+ * filters bots — Web Analytics especially — was hiding the entire product.
+ *
+ * Verified against the live classifier rather than reasoned about: an empty or
+ * absent value returns `Automation`, and every non-empty client string tested
+ * (including this one) returns `Regular`. Any real identity fixes it, so this
+ * sends the honest one rather than a placeholder — `app.version` and `app.os`
+ * are already on the envelope, and reporting them here means the analytics
+ * identity can never drift from the event that carries it.
+ *
+ * Safe to interpolate: both fields have passed `validateEvent` by the time this
+ * runs, so `version` is a bounded `f.ident()` (96 chars, `[A-Za-z0-9 ._:()+-]`)
+ * and `os` is the `${platform}/${arch}` shape `f.os()` allows. Neither can
+ * carry a quote, a control character or prose, so no free-form text reaches
+ * PostHog through this — the ADR-299 rule is untouched.
+ *
+ * `consent_choice` carries no `app` block by design (it must be unattributable),
+ * so it falls back to the bare product name: still non-empty, still `Regular`,
+ * still nothing that identifies a machine.
+ */
+export function analyticsIdentity(e: Record<string, unknown>): Record<string, unknown> {
+  const app = e.app as { version?: unknown; os?: unknown } | undefined
+  const version = typeof app?.version === 'string' ? app.version : undefined
+  const os = typeof app?.os === 'string' ? app.os : undefined
+
+  const ua =
+    version === undefined
+      ? 'TurboLLM'
+      : os === undefined
+        ? `TurboLLM/${version}`
+        : `TurboLLM/${version} (${os})`
+
+  return { $raw_user_agent: ua }
+}
+
 export interface QuarantinedEvent {
   /** The raw, unvalidated event exactly as received. */
   raw: Record<string, unknown>

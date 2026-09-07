@@ -14,12 +14,18 @@
  * exist. OOM is therefore checked first.
  */
 
-import type { FAIL_REASONS, PROVISION_FAIL_REASONS } from './core/enums'
+import type { ERROR_FINGERPRINTS, FAIL_REASONS, PROVISION_FAIL_REASONS } from './core/enums'
 import type { HARNESSES } from './events/gateway'
 
 type FailReason = (typeof FAIL_REASONS)[number]
 type Harness = (typeof HARNESSES)[number]
 type ProvisionFailReason = (typeof PROVISION_FAIL_REASONS)[number]
+/** Returned by {@link classifyEngineErrorFingerprint}. Typed against the enum
+ *  rather than `string` (2026-09-07) so a fingerprint that is not a registry
+ *  member cannot compile — the `error` event silently drops one that is not,
+ *  which is a failure mode worth catching in the type system instead of in
+ *  PostHog three weeks later. */
+type ErrorFingerprint = (typeof ERROR_FINGERPRINTS)[number]
 
 export interface LoadError {
   code?: string
@@ -144,8 +150,16 @@ export function classifyBenchFailure(results: readonly BenchProbeOutcome[]): 'oo
  * `engine_crash` is the deliberate fallback for `engine_exited`/
  * `engine_spawn_failed` codes with no more specific signal recognised — we DO
  * know structurally that the process died, so `other` would under-describe it.
+ *
+ * The structured-code fallback at the bottom exists for the same reason
+ * (2026-09-07 funnel audit). Before it, ANY error whose code was not one of the
+ * four handled above and whose text matched no sign list became `other` — and
+ * `other` was the largest bucket in the entire event, 162 machines over 30 days,
+ * describing nothing. `engine_unsupported` was the worst of these: a named,
+ * fully-understood condition that `classifyLoadFailure` maps to `no_engine`,
+ * silently pooled here with genuinely unknown failures.
  */
-export function classifyEngineErrorFingerprint(err: LoadError | null | undefined): string {
+export function classifyEngineErrorFingerprint(err: LoadError | null | undefined): ErrorFingerprint {
   if (!err) return 'other'
 
   if (err.code === 'readiness_timeout') return 'engine_start_timeout'
@@ -158,6 +172,16 @@ export function classifyEngineErrorFingerprint(err: LoadError | null | undefined
   if (GGUF_SIGNS.some((s) => haystack.includes(s))) return 'model_load_failed'
 
   if (err.code === 'engine_exited' || err.code === 'engine_spawn_failed') return 'engine_crash'
+
+  // Structured-code fallback. `code` comes from a closed vocabulary this
+  // codebase writes itself (`LOAD_ERROR_CODES`), never from a driver, a model
+  // file or a user, so reporting it verbatim is exactly as safe as reporting an
+  // enum — the same reasoning `model_load.errorCode` already ships on. Anything
+  // still unmatched is honestly unknown, and only that is `other`.
+  if (err.code === 'engine_unsupported') return 'engine_unsupported'
+  if (err.code === 'model_not_loaded') return 'model_not_loaded'
+  if (err.code === 'load_failed') return 'load_failed'
+
   return 'other'
 }
 
