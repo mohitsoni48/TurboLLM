@@ -23,6 +23,10 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [1.12.7] - 2026-09-08
+
 ### Fixed
 
 - **`npm i -g turbollm` failed outright with `'patch-package' is not recognized`**
@@ -63,6 +67,21 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   hardcoded list, so a fork's extra mode or an upstream rename needs no change here. An
   untouched profile launches exactly as it did before. This is a deliberately curated pair, not
   a return of the generic all-flags panel removed in v1.10.2.
+
+### Discord
+
+- **Please update — v1.12.5 and v1.12.6 could not be installed or updated at all.** `npm i -g
+  turbollm` failed partway through with a `patch-package` error. That's fixed. If you're stuck,
+  stop TurboLLM first, then install again; a leftover half-removed folder in your global npm
+  directory may need deleting by hand.
+- Extra command-line flags actually work now. You can type a flag and its value together, like
+  `--load-mode dio`, instead of adding them as two separate entries — and repeating a flag no
+  longer silently drops the second one. Flags you already saved are repaired automatically.
+- New under a model's Advanced settings: **Load mode** (its `dio` option skips the OS page cache,
+  which helps a lot if your system RAM is tight) and a **Disable memory-mapping** toggle. Both
+  appear only if your engine build supports them.
+- Turning reasoning off from opencode or another OpenAI-compatible client now works. Sending
+  `reasoning_effort: "none"` was being ignored, so the model kept thinking anyway.
 
 ## [1.12.6] - 2026-09-08
 
