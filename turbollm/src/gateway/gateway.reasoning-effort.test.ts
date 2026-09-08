@@ -183,3 +183,33 @@ test('a non-string reasoning_effort (e.g. an explicit null from an SDK wrapper) 
   const numberBody = await postChat(app, { reasoning_effort: 5 })
   assert.equal(numberBody && 'reasoning_effort' in numberBody, false)
 })
+
+// GitHub #213 follow-up (reported against v1.12.6, which already carried the #215 fix above).
+// opencode sends the OpenAI-standard `"none"` for its no-reasoning variant. That value was in
+// neither VALID nor ALIASES, so parseReasoningEffort returned undefined — and because the raw
+// top-level key is ALWAYS deleted, the parameter vanished completely on the way to the engine
+// rather than turning thinking off. The reporter saw exactly that: the field present when the
+// same client talked to LM Studio (which forwards it verbatim), absent through TurboLLM.
+test("GitHub #213: OpenAI's 'none' turns thinking off rather than vanishing en route to the engine", async () => {
+  const app = new Hono()
+  registerGateway(app, fakeDeps())
+  const outbound = await postChat(app, { reasoning_effort: 'none' })
+
+  assert.equal(outbound?.reasoning_effort, undefined, 'the raw top-level key must not reach the engine')
+  assert.equal(outbound?.thinking_budget_tokens, 0)
+  assert.equal((outbound?.chat_template_kwargs as Record<string, unknown>)?.enable_thinking, false)
+  assert.equal(
+    (outbound?.chat_template_kwargs as Record<string, unknown> | undefined)?.reasoning_effort,
+    undefined,
+    "'none' is not a template value — it must collapse onto enable_thinking, never be sent literally",
+  )
+})
+
+test("GitHub #213: OpenAI's 'minimal' maps to the lowest real thinking level rather than vanishing", async () => {
+  const app = new Hono()
+  registerGateway(app, fakeDeps())
+  const outbound = await postChat(app, { reasoning_effort: 'minimal' })
+
+  assert.equal(outbound?.reasoning_effort, undefined)
+  assert.equal((outbound?.chat_template_kwargs as Record<string, unknown>)?.reasoning_effort, 'low')
+})
