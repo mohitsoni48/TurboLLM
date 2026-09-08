@@ -39,7 +39,7 @@ export default defineConfig({
     // feature outright on the actual worker processes Vitest spawns removes the warning at the
     // source instead of just working around its symptom.
     execArgv: ['--no-experimental-webstorage'],
-    // engine-groups/personas/tool-explain/vram already use `node:test` and run via the
+    // argv/engine-groups/personas/tool-explain/vram already use `node:test` and run via the
     // repo root's `tsx --test` (backend convention) — leave them to that runner rather
     // than having Vitest try (and fail) to collect them too.
     exclude: [
@@ -50,6 +50,7 @@ export default defineConfig({
       // which spins up a vite dev server on 5173) never also collects it: this
       // suite assumes the real daemon on 6996, not a dev-server proxy.
       '**/e2e-onboarding/**',
+      'src/lib/argv.test.ts',
       'src/lib/engine-groups.test.ts',
       'src/lib/personas.test.ts',
       'src/lib/tool-explain.test.ts',

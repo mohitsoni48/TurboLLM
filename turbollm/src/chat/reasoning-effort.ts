@@ -13,18 +13,37 @@ export type ReasoningEffort = 'off' | 'low' | 'medium' | 'xhigh'
 
 const VALID = new Set<string>(['off', 'low', 'medium', 'xhigh'])
 
-// 'high' is the OpenAI-standard `reasoning_effort` enum value (low/medium/high) that generic
-// OpenAI-compatible clients — opencode, LiteLLM, plain SDK scripts — send natively; Qwen3.8's
-// own template only ever recognizes the literal string 'xhigh' and `raise_exception`s on
-// anything else (GitHub #213: a client-side 'high' variant otherwise 500s the whole turn, or
-// silently never applies on an engine build old enough to forward it raw). Aliased here, in
-// the one shared parser, so every caller gets it for free rather than each reimplementing it.
+// The OpenAI-standard `reasoning_effort` enum is what generic OpenAI-compatible clients —
+// opencode, LiteLLM, plain SDK scripts — send natively, and none of its values except
+// 'low'/'medium' are ones Qwen3.8's template accepts: it only ever recognizes
+// 'low'/'medium'/'xhigh' and `raise_exception`s on anything else. Every OpenAI value is
+// therefore aliased here, in the one shared parser, so each caller gets them for free rather
+// than reimplementing the mapping:
+//
+//   'high'    → 'xhigh'  GitHub #213: a client-side 'high' variant otherwise 500s the whole
+//                        turn, or silently never applies on an engine build old enough to
+//                        forward it raw.
+//   'none'    → 'off'    GitHub #213 follow-up, reported against v1.12.6 (which already had
+//                        the 'high' alias). OpenAI added 'none' for "don't reason at all",
+//                        and opencode sends it for its no-reasoning variant. Unmapped, it
+//                        parsed to undefined — and since gateway.ts ALWAYS deletes the raw
+//                        top-level key, the parameter vanished entirely instead of turning
+//                        thinking off. The reporter saw the field reach LM Studio (which
+//                        forwards it verbatim) but never TurboLLM's engine. 'off' is this
+//                        control's own no-thinking value, so 'none' means exactly it.
+//   'minimal' → 'low'    OpenAI's lowest non-zero tier, which has no distinct Qwen3.8
+//                        equivalent; the nearest real level beats silently dropping it.
+//
 // A `Map`, not a plain object: a plain-object lookup (`ALIASES[value]`) resolves inherited
 // `Object.prototype` members for a key like 'constructor' or '__proto__', handing back a
 // function or `Object.prototype` itself instead of `undefined` — which this parser's callers
 // then write straight into `chat_template_kwargs.reasoning_effort`, the exact `raise_exception`
 // this function exists to prevent. A `Map` has no prototype-chain lookup, so no key can do that.
-const ALIASES = new Map<string, ReasoningEffort>([['high', 'xhigh']])
+const ALIASES = new Map<string, ReasoningEffort>([
+  ['high', 'xhigh'],
+  ['none', 'off'],
+  ['minimal', 'low'],
+])
 
 /** Undefined for anything not exactly one of the four supported values or the 'high' alias
  *  (including absent/undefined/empty-string input) — callers omit the field entirely rather

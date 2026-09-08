@@ -2,7 +2,7 @@
 // rope scaling, frequency_penalty, stop strings.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { defaultSampling, deriveDefault, estimateVram, profileToArgs, resolveProfile } from './profile'
+import { defaultSampling, deriveDefault, estimateVram, profileToArgs, resolveProfile, tokenizeExtraArgs } from './profile'
 import type { LoadProfile } from './profile'
 import type { ModelEntry } from './scanner'
 import type { SysInfo } from '../sysinfo/sysinfo'
@@ -505,4 +505,189 @@ test('does not auto-add --no-mmap when the user already added -dio manually', ()
   const args = profileToArgs(p, bigModel(), caps, 0, amdApuSys(), ROCM_BIN)
   assert.equal(args.includes('--no-mmap'), false)
   assert.ok(args.includes('-dio'))
+})
+
+// ── Extra-flag tokenizing (GitHub #221) ───────────────────────────────────────
+// `extraArgs` is one-argv-element-per-entry, but the chip input / API / hand-edited
+// config.json all let a whole `--flag value` string land in a single entry, which the
+// engine receives as ONE argument and can't parse. resolveProfile normalises it on
+// every load, so already-saved profiles heal themselves with no migration.
+
+/** Index of `flag` in an arg list, asserting it is present. */
+function argIndex(args: string[], flag: string): number {
+  const i = args.indexOf(flag)
+  assert.notEqual(i, -1, `${flag} missing from ${JSON.stringify(args)}`)
+  return i
+}
+
+test('GitHub #221: a flag and value typed as one entry launch as two argv elements', () => {
+  const m = model()
+  const s = sys()
+  const resolved = resolveProfile(m, s, { extraArgs: ['--load-mode dio'] })
+  assert.deepEqual(resolved.extraArgs, ['--load-mode', 'dio'])
+  const args = profileToArgs(resolved, m, caps)
+  // The reporter's exact symptom: one argument containing a space (rendered quoted).
+  assert.equal(args.includes('--load-mode dio'), false)
+  assert.equal(args[argIndex(args, '--load-mode') + 1], 'dio')
+})
+
+test('GitHub #221: overrides (unsaved dialog edits) are tokenized too', () => {
+  const m = model()
+  const resolved = resolveProfile(m, sys(), undefined, { extraArgs: ['--load-mode dio'] })
+  assert.deepEqual(resolved.extraArgs, ['--load-mode', 'dio'])
+})
+
+test('tokenizeExtraArgs keeps a quoted value containing spaces as one token, quotes stripped', () => {
+  assert.deepEqual(
+    tokenizeExtraArgs(['--chat-template-file "C:\my path\t.jinja"']),
+    ['--chat-template-file', 'C:\my path\t.jinja'],
+  )
+  assert.deepEqual(tokenizeExtraArgs(["--grammar 'a b c'"]), ['--grammar', 'a b c'])
+})
+
+test('tokenizeExtraArgs is idempotent — a second pass is a no-op', () => {
+  const raw = ['--load-mode dio', '--chat-template-file "C:\my path\t.jinja"', '-dio', '--foo="a b"']
+  const once = tokenizeExtraArgs(raw)
+  assert.deepEqual(tokenizeExtraArgs(once), once)
+  // Specifically: the unquoted path token must not be chopped in half on reload.
+  assert.ok(once.includes('C:\my path\t.jinja'))
+})
+
+test('resolveProfile is idempotent over an already-resolved profile (reload-safe)', () => {
+  const m = model()
+  const s = sys()
+  const first = resolveProfile(m, s, { extraArgs: ['--chat-template-file "C:\my path\t.jinja"'] })
+  const second = resolveProfile(m, s, { extraArgs: first.extraArgs })
+  assert.deepEqual(second.extraArgs, first.extraArgs)
+})
+
+test('tokenizeExtraArgs leaves an already-correct single-token entry untouched', () => {
+  assert.deepEqual(tokenizeExtraArgs(['--no-mmap', '-dio', '--n-cpu-moe', '12']), ['--no-mmap', '-dio', '--n-cpu-moe', '12'])
+})
+
+test('tokenizeExtraArgs preserves duplicate tokens — argv is a sequence, not a set', () => {
+  assert.deepEqual(
+    tokenizeExtraArgs(['--lora a.gguf --lora b.gguf']),
+    ['--lora', 'a.gguf', '--lora', 'b.gguf'],
+  )
+  assert.deepEqual(tokenizeExtraArgs(['--lora', 'x.gguf', '--lora', 'x.gguf']), ['--lora', 'x.gguf', '--lora', 'x.gguf'])
+})
+
+test('tokenizeExtraArgs drops empty and whitespace-only entries', () => {
+  assert.deepEqual(tokenizeExtraArgs(['', '   ', '--flash-attn on']), ['--flash-attn', 'on'])
+  assert.deepEqual(tokenizeExtraArgs(undefined), [])
+})
+
+test('tokenizeExtraArgs does not split a bare value entry that contains spaces', () => {
+  // The workaround users were told to use: flag and value as separate chips. The value
+  // chip is not a flag, so it survives verbatim even with a space in it.
+  assert.deepEqual(
+    tokenizeExtraArgs(['--chat-template-file', 'C:\my path\t.jinja']),
+    ['--chat-template-file', 'C:\my path\t.jinja'],
+  )
+})
+
+test('GitHub #85 dedupe still fires when the user typed the flag run-together', () => {
+  // Tokenizing makes the extraArgs.includes() guards in profileToArgs more reliable:
+  // '--no-mmap -dio' used to be one opaque element that matched neither check.
+  const m = bigModel()
+  const p = resolveProfile(m, amdApuSys(), { extraArgs: ['--no-mmap -dio'] })
+  const args = profileToArgs(p, m, caps, 0, amdApuSys(), ROCM_BIN)
+  assert.equal(args.filter((a) => a === '--no-mmap').length, 1)
+})
+
+test('stop strings are never tokenized — a space inside a stop sequence is meaningful', () => {
+  // Guards the regression this fix could introduce: only extraArgs is normalised.
+  // (Stop strings are per-request, so they never reach profileToArgs — see the
+  // "stop strings do not appear in profileToArgs" test above.)
+  const stop = ['\nUser: ', 'END OF LINE', '--not a flag']
+  const resolved = resolveProfile(model(), sys(), { sampling: { ...defaultSampling(), stop } })
+  assert.deepEqual(resolved.sampling.stop, stop)
+})
+
+// ── GitHub #222: curated Advanced controls — --load-mode and an explicit --no-mmap ──
+// Two first-class llama.cpp controls added to the existing Advanced section (ADR-415). NOT the
+// generic all-flags panel removed in v1.10.2 (ADR-329) — these are hand-picked, and the load-mode
+// VALUES still come from the engine's own --help scrape rather than a hardcoded list here.
+
+// Every flag the default profile emits today, in order. This is the regression guard the whole
+// feature hangs on: a fresh profile must launch byte-identically to before #222 existed, so
+// neither new field may leak an argument until the user sets it.
+const DEFAULT_ARGS = ['-c', '8192', '-ngl', '99', '--parallel', '1', '--flash-attn', 'on', '--cache-reuse', '256', '--jinja']
+
+test('#222: a default profile emits exactly the same args as before load-mode/no-mmap existed', () => {
+  assert.deepEqual(profileToArgs(base(), model(), caps), DEFAULT_ARGS)
+})
+
+test('#222: deriveDefault leaves both new fields unset (absent = engine default)', () => {
+  const p = base()
+  assert.equal(p.loadMode, undefined)
+  assert.equal(p.noMmap, undefined)
+})
+
+test('#222: an explicit load mode is emitted with its value', () => {
+  const args = profileToArgs({ ...base(), loadMode: 'dio' }, model(), caps)
+  assert.equal(args[args.indexOf('--load-mode') + 1], 'dio')
+})
+
+test('#222: the load-mode value is passed through verbatim, not validated against a hardcoded list', () => {
+  // The UI sources its options from Capabilities.flagInfo, so a fork's novel mode must survive.
+  const args = profileToArgs({ ...base(), loadMode: 'some-fork-mode' }, model(), caps)
+  assert.equal(args[args.indexOf('--load-mode') + 1], 'some-fork-mode')
+})
+
+test('#222: an empty load mode emits nothing (the "engine default" choice)', () => {
+  const args = profileToArgs({ ...base(), loadMode: '' }, model(), caps)
+  assert.equal(args.includes('--load-mode'), false)
+})
+
+test('#222: --load-mode is skipped when the engine does not advertise it', () => {
+  const noLoadMode = { kvTypes: [], flags: ['-c', '--parallel'] }
+  const args = profileToArgs({ ...base(), loadMode: 'dio' }, model(), noLoadMode)
+  assert.equal(args.includes('--load-mode'), false)
+})
+
+test('#222: the explicit no-mmap toggle emits --no-mmap on ordinary hardware', () => {
+  const args = profileToArgs({ ...base(), noMmap: true }, model(), caps)
+  assert.equal(args.includes('--no-mmap'), true)
+})
+
+test('#222: noMmap false/absent emits nothing', () => {
+  assert.equal(profileToArgs({ ...base(), noMmap: false }, model(), caps).includes('--no-mmap'), false)
+  assert.equal(profileToArgs(base(), model(), caps).includes('--no-mmap'), false)
+})
+
+test('#222: the explicit no-mmap toggle is skipped when the engine does not advertise the flag', () => {
+  const noNoMmap = { kvTypes: [], flags: ['-c', '--parallel'] }
+  const args = profileToArgs({ ...base(), noMmap: true }, model(), noNoMmap)
+  assert.equal(args.includes('--no-mmap'), false)
+})
+
+test('#222: --no-mmap appears exactly once when the toggle AND the ROCm-APU auto path both fire', () => {
+  const args = profileToArgs({ ...base(), noMmap: true }, bigModel(), caps, 0, amdApuSys(), ROCM_BIN)
+  assert.equal(args.filter((x) => x === '--no-mmap').length, 1)
+})
+
+test('#222: --no-mmap appears exactly once when the toggle is on and the user also typed it', () => {
+  const p = { ...base(), noMmap: true, extraArgs: ['--no-mmap'] }
+  const args = profileToArgs(p, bigModel(), caps, 0, amdApuSys(), ROCM_BIN)
+  assert.equal(args.filter((x) => x === '--no-mmap').length, 1)
+})
+
+test('#222: a hand-typed -dio vetoes the ROCm auto path but not an explicit toggle', () => {
+  // -dio means "I already applied one of the two interchangeable #85 workarounds", so it
+  // suppresses the automatic add — but it must not silently discard a toggle the user just set.
+  const dioOnly = { ...base(), extraArgs: ['-dio'] }
+  assert.equal(profileToArgs(dioOnly, bigModel(), caps, 0, amdApuSys(), ROCM_BIN).includes('--no-mmap'), false)
+  const dioPlusToggle = { ...base(), noMmap: true, extraArgs: ['-dio'] }
+  const args = profileToArgs(dioPlusToggle, bigModel(), caps, 0, amdApuSys(), ROCM_BIN)
+  assert.equal(args.filter((x) => x === '--no-mmap').length, 1)
+})
+
+test('#222: both new fields survive a resolveProfile round-trip from a saved profile', () => {
+  const m = model()
+  const resolved = resolveProfile(m, sys(), { loadMode: 'dio', noMmap: true })
+  const args = profileToArgs(resolved, m, caps)
+  assert.equal(args[args.indexOf('--load-mode') + 1], 'dio')
+  assert.equal(args.includes('--no-mmap'), true)
 })

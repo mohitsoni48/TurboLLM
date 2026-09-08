@@ -177,6 +177,22 @@ export interface LoadProfile {
    *  mode (mtp/nextn/draft), not just `draft`. Min tokens drafted per step before
    *  verification (--draft-min). Absent → 1 (the previous hardcoded default). */
   draftMin?: number
+  /** llama.cpp --load-mode (GitHub #222): how the weights are read off disk — currently
+   *  `mmap` (upstream's default), `dio` (direct I/O, bypassing the OS page cache) or `read`.
+   *  Empty/absent → the flag is not emitted at all, leaving the engine's own default, so an
+   *  untouched profile launches exactly as it did before this field existed.
+   *
+   *  The accepted values are deliberately NOT modelled as a union here: the UI renders
+   *  whatever this engine's own `--help` advertised ({@link Capabilities.flagInfo}, ADR-328),
+   *  so an upstream rename or a fork's extra mode needs no change on our side. Older builds
+   *  spell the same idea `-dio` (single-dash, so not capability-probeable — ADR-324); that
+   *  spelling stays available through {@link LoadProfile.extraArgs}. */
+  loadMode?: string
+  /** llama.cpp --no-mmap (GitHub #222): read the whole file into memory instead of mapping
+   *  it. Absent/false → not emitted (engine default, mmap on). Independent of the automatic
+   *  ROCm + AMD-unified-APU workaround (GitHub #85 / ADR-324), which fires on its own; when
+   *  both would apply, {@link profileToArgs} still emits the flag exactly once. */
+  noMmap?: boolean
   /** Provenance of a saved profile (spec 05 §3, 09 §1): 'bench' = written by the
    *  auto-tune runner, 'user' = hand-saved. Absent on heuristic/global defaults. */
   tunedBy?: 'bench' | 'user'
@@ -635,6 +651,69 @@ function applyGlobalDefaults(base: LoadProfile, m: ModelEntry, sys: SysInfo, def
   }
 }
 
+/** GitHub #221: normalise user-entered extra flags into real argv elements.
+ *
+ *  `extraArgs` is one-argv-element-per-entry, but every way a user can supply it (the
+ *  chip input, the HTTP API, a hand-edited config.json) lets a whole `--flag value`
+ *  string land in a SINGLE entry — which the engine then receives as one argument and
+ *  cannot parse (the reporter saw it rendered as `"--load-mode dio"`, quoted because it
+ *  really was one argument containing a space).
+ *
+ *  Splitting is deliberately gated so the function is idempotent — {@link resolveProfile}
+ *  runs it on every load, over already-normalised saved profiles:
+ *   - only an entry whose first non-space character is `-` is a split candidate, so a
+ *     VALUE token that legitimately contains spaces (an unquoted `C:\my path\t.jinja`
+ *     produced by an earlier pass) is never chopped in half on the next load;
+ *   - and only when it has whitespace OUTSIDE quotes, so `--foo="a b"` (whose only space
+ *     is quoted) is left verbatim rather than becoming a `-`-leading token with a space
+ *     in it, which the next pass would then split.
+ *  Single/double quotes group a value containing spaces and are stripped from the result;
+ *  empty/whitespace-only results are dropped. An already-correct entry is returned as-is. */
+export function tokenizeExtraArgs(entries: readonly string[] | undefined): string[] {
+  const out: string[] = []
+  for (const entry of entries ?? []) {
+    if (typeof entry !== 'string') continue
+    if (!needsTokenize(entry)) {
+      if (entry.trim()) out.push(entry)
+      continue
+    }
+    let cur = ''
+    let quote: string | null = null
+    for (const ch of entry) {
+      if (quote) {
+        if (ch === quote) quote = null
+        else cur += ch
+      } else if (ch === '"' || ch === "'") {
+        quote = ch
+      } else if (/\s/.test(ch)) {
+        if (cur) out.push(cur)
+        cur = ''
+      } else {
+        cur += ch
+      }
+    }
+    if (cur) out.push(cur)
+  }
+  return out
+}
+
+/** True when an entry looks like a flag (`-…`) that has run-together arguments —
+ *  i.e. whitespace outside of any quoted section. See {@link tokenizeExtraArgs}. */
+function needsTokenize(entry: string): boolean {
+  if (!entry.trimStart().startsWith('-')) return false
+  let quote: string | null = null
+  for (const ch of entry.trim()) {
+    if (quote) {
+      if (ch === quote) quote = null
+    } else if (ch === '"' || ch === "'") {
+      quote = ch
+    } else if (/\s/.test(ch)) {
+      return true
+    }
+  }
+  return false
+}
+
 /** Merge heuristics <- global defaults <- saved <- overrides (field-level; sampling
  *  deep-merged). Precedence highest→lowest: per-request overrides > saved per-model
  *  profile > global model defaults > built-in heuristics (spec 05 §3). */
@@ -664,6 +743,11 @@ export function resolveProfile(
     // false) is corrected on the very next resolve, for every user, with no reset/migration
     // needed and no other tuned setting touched.
     useMmproj: m.vision,
+    // GitHub #221: normalise run-together flags (`--load-mode dio` typed as one entry)
+    // into real argv elements. Doing it here — after the merge, on the one path every
+    // load goes through — heals already-saved profiles and hand-edited config.json with
+    // no migration, and covers overrides/API callers that never touch the UI.
+    extraArgs: tokenizeExtraArgs(overrides?.extraArgs ?? saved?.extraArgs ?? base.extraArgs),
   }
 }
 
@@ -869,14 +953,22 @@ export function profileToArgs(
   if (m.embedding && has('--embeddings')) a.push('--embeddings')
   // Startup GBNF grammar constraint — only emitted when the user has set one.
   if (p.grammar && has('--grammar')) a.push('--grammar', p.grammar)
-  // GitHub #85 / ADR-324: skip if the user already added it themselves (e.g. copying the
-  // manual workaround from the issue) so it's never passed twice.
-  if (
-    isRocmUnifiedApuLoad(m, sys, binPath) &&
-    has('--no-mmap') &&
-    !p.extraArgs.includes('--no-mmap') &&
-    !p.extraArgs.includes('-dio')
-  ) {
+  // GitHub #222: explicit load mode. The value is whatever the engine's own --help
+  // advertised (the UI renders Capabilities.flagInfo's enum list; see LoadProfile.loadMode),
+  // so nothing here needs updating when upstream adds or renames a mode. Empty/absent leaves
+  // the engine's default, which keeps an untouched profile's launch command unchanged.
+  if (p.loadMode && has('--load-mode')) a.push('--load-mode', p.loadMode)
+  // --no-mmap has two independent sources: the user's explicit toggle (GitHub #222) and the
+  // automatic ROCm + AMD-unified-APU hang workaround (GitHub #85 / ADR-324). ONE emission
+  // site, so a load matching both still passes the flag exactly once.
+  //
+  // The two are deduped against `extraArgs` differently, on purpose. `--no-mmap` typed by
+  // hand suppresses both (it's literally the same flag, appended last anyway). `-dio` — the
+  // older single-dash spelling of direct I/O — suppresses only the AUTOMATIC path, where it
+  // means "the user already applied one of the two interchangeable #85 workarounds"; it must
+  // not veto an explicit toggle the user just ticked for an unrelated reason.
+  const autoNoMmap = isRocmUnifiedApuLoad(m, sys, binPath) && !p.extraArgs.includes('-dio')
+  if ((p.noMmap === true || autoNoMmap) && has('--no-mmap') && !p.extraArgs.includes('--no-mmap')) {
     a.push('--no-mmap')
   }
   a.push(...p.extraArgs)

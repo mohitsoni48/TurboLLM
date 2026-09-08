@@ -25,6 +25,64 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.12.7] - 2026-09-08
+
+### Fixed
+
+- **`npm i -g turbollm` failed outright with `'patch-package' is not recognized`**
+  ([#226](https://github.com/mohitsoni48/TurboLLM/issues/226)). v1.12.5 added a `postinstall`
+  script running `patch-package`, but npm does not install `devDependencies` for someone
+  installing the published package — so the binary was never there and every fresh install and
+  update hard-failed. The patch it was applying is a build-time concern that is not even
+  published (`patches/` is outside `files`), so it now runs via `prepare`, which fires in the
+  development repo and never for a registry install. A test fails the build if `postinstall`
+  is ever reintroduced.
+- **Extra command-line flags were passed to the engine as a single argument**
+  ([#221](https://github.com/mohitsoni48/TurboLLM/issues/221)). Typing `--load-mode dio` into
+  a model's "Extra command-line flags" produced one argv element containing a space, which
+  llama-server cannot parse — visible in the launch command as `"--load-mode dio"`. A flag and
+  its value can now be typed together and are split into real argv elements; quote a value that
+  itself contains spaces. Normalisation happens on every load, so profiles already saved with a
+  run-together flag repair themselves with no migration, and the HTTP API and a hand-edited
+  `config.json` get the same treatment. Stop strings are deliberately left alone, since a space
+  inside a stop sequence is meaningful.
+- **Repeated extra flags were silently dropped, and removing one chip removed all its
+  duplicates.** `--lora a.gguf --lora b.gguf` lost the second `--lora`, because the chip list
+  deduplicated by value and deleted by value. argv is a sequence, not a set.
+- **`reasoning_effort: "none"` was ignored instead of turning thinking off**
+  ([#213](https://github.com/mohitsoni48/TurboLLM/issues/213)). opencode and other
+  OpenAI-compatible clients send the standard `"none"` for their no-reasoning option. TurboLLM
+  recognised `low`/`medium`/`high`/`xhigh` but not `"none"`, and an unrecognised value is
+  dropped rather than passed to the engine — so the setting silently did nothing and the model
+  kept thinking. `"none"` now turns thinking off, and OpenAI's `"minimal"` maps to the lowest
+  thinking level instead of being ignored.
+
+### Added
+
+- **Load mode and memory-mapping controls, under a model's Advanced settings**
+  ([#222](https://github.com/mohitsoni48/TurboLLM/issues/222)). `--load-mode` (whose `dio`
+  option uses direct I/O and skips the OS page cache — the usual pick when system RAM is tight)
+  and an explicit `--no-mmap` toggle. Both appear only on engine builds that actually advertise
+  them, and the load-mode choices are read from that engine's own `--help` rather than a
+  hardcoded list, so a fork's extra mode or an upstream rename needs no change here. An
+  untouched profile launches exactly as it did before. This is a deliberately curated pair, not
+  a return of the generic all-flags panel removed in v1.10.2.
+
+### Discord
+
+- **Please update — v1.12.5 and v1.12.6 could not be installed or updated at all.** `npm i -g
+  turbollm` failed partway through with a `patch-package` error. That's fixed. If you're stuck,
+  stop TurboLLM first, then install again; a leftover half-removed folder in your global npm
+  directory may need deleting by hand.
+- Extra command-line flags actually work now. You can type a flag and its value together, like
+  `--load-mode dio`, instead of adding them as two separate entries — and repeating a flag no
+  longer silently drops the second one. Flags you already saved are repaired automatically.
+- New under a model's Advanced settings: **Load mode** (its `dio` option skips the OS page cache,
+  which helps a lot if your system RAM is tight) and a **Disable memory-mapping** toggle. Both
+  appear only if your engine build supports them.
+- Turning reasoning off from opencode or another OpenAI-compatible client now works. Sending
+  `reasoning_effort: "none"` was being ignored, so the model kept thinking anyway.
+
 ## [1.12.6] - 2026-09-08
 
 ### Added

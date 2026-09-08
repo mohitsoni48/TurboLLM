@@ -737,6 +737,14 @@ export type LoadProfile = {
   draftMax?: number
   /** Speculative `draft` mode window (GitHub #35). --draft-min; absent = 1 default. */
   draftMin?: number
+  /** llama.cpp --load-mode (GitHub #222). How the weights are read off disk — e.g. `mmap`,
+   *  `dio` (direct I/O), `read`. Empty/absent = not emitted, engine default. Free-form on
+   *  purpose: the dialog renders the values the engine's own --help advertised
+   *  (`Capabilities.flagInfo`), never a hardcoded list. */
+  loadMode?: string
+  /** llama.cpp --no-mmap (GitHub #222). Read the file into memory instead of mapping it.
+   *  Absent/false = engine default (mmap on). */
+  noMmap?: boolean
   tunedBy?: string
 }
 

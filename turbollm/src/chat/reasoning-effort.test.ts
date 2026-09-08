@@ -37,3 +37,24 @@ test('parseReasoningEffort does not resolve inherited Object.prototype members a
     assert.equal(parseReasoningEffort(key), undefined, `expected undefined for prototype key ${JSON.stringify(key)}`)
   }
 })
+
+// GitHub #213 follow-up, reported against v1.12.6 — which already shipped the 'high' alias
+// above, so this is a distinct gap, not a regression of it. OpenAI's enum also carries 'none'
+// (reason not at all) and 'minimal' (lowest tier). Neither was mapped, so both parsed to
+// undefined; gateway.ts always deletes the raw top-level key, so an opencode client asking
+// for no reasoning had the parameter silently dropped instead of thinking being turned off.
+test("parseReasoningEffort maps OpenAI's 'none' onto this control's own 'off' (GitHub #213 follow-up)", () => {
+  assert.equal(parseReasoningEffort('none'), 'off')
+})
+
+test("parseReasoningEffort maps OpenAI's 'minimal' onto the nearest real level, 'low'", () => {
+  assert.equal(parseReasoningEffort('minimal'), 'low')
+})
+
+test("the aliases stay one-way: Qwen3.8's own values never resolve to an OpenAI spelling", () => {
+  // 'off'/'low'/'medium'/'xhigh' must keep round-tripping verbatim now that more OpenAI
+  // spellings collapse onto them — an alias must never shadow a template-native value.
+  for (const native of ['off', 'low', 'medium', 'xhigh']) {
+    assert.equal(parseReasoningEffort(native), native)
+  }
+})

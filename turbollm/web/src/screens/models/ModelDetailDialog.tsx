@@ -6,6 +6,7 @@ import type { CardSampling, LoadProfile, ModelPreset, SysGpu } from '../../lib/t
 import { Input } from '../../components/ui/input'
 import { defaultGpu, defaultVllm } from '../../lib/types'
 import { estimateVram, gpuBudgetMb } from '../../lib/vram'
+import { tokenizeExtraArgs } from '../../lib/argv'
 import { Button } from '../../components/ui/button'
 import { CopyButton } from '../../components/ui/copy-button'
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '../../components/ui/sheet'
@@ -44,6 +45,12 @@ function loadModeForEngine(engineKind: string | undefined): LoadMode {
       return 'none'
   }
 }
+
+/** The "leave it to the engine" entry in the `--load-mode` dropdown (GitHub #222), mapping to an
+ *  empty `LoadProfile.loadMode` so no flag is emitted. It sits in the same list as the engine's
+ *  own probed values, so it must never collide with one: the probe only accepts values matching
+ *  `/^[a-z][a-z0-9_-]*$/` (`parseEnumList`, probe.ts), and the space here can't appear in one. */
+const ENGINE_DEFAULT_OPTION = 'engine default'
 
 /** Deep-merges a preset's stored profile onto the current draft. The nested merge is
  *  load-bearing: a preset saved by an older build may be missing fields inside sampling/gpu/vllm,
@@ -349,6 +356,17 @@ export function ModelDetailDialog({
   // Whether the engine accepts a given `--spec-type` value (probe captures these
   // as `spec-type:<value>`). Official llama.cpp lacks `nextn`; forks may add it.
   const specAccepts = (v: string) => flags.length === 0 || flags.includes(`spec-type:${v}`)
+  // GitHub #222: `--load-mode`'s accepted values, read from this engine's own --help scrape
+  // (`Capabilities.flagInfo`, ADR-328) instead of a hardcoded list — an upstream rename or a
+  // fork's extra mode then needs no change here. `flagInfo` is legitimately absent on engines
+  // registered before the field existed and on kinds that skip the --help probe (mlx/vllm/
+  // sglang), and the probe's classifier only reports an enum when it actually parsed one, so
+  // an empty list means "nothing to show" and the control simply doesn't render. This is a
+  // curated, per-flag reader — deliberately NOT the generic all-flags panel removed in
+  // v1.10.2 for being overwhelming (ADR-329).
+  const loadModeValues = hasFlag('--load-mode')
+    ? activeEngine?.capabilities.flagInfo?.find((f) => f.name === '--load-mode')?.enumValues ?? []
+    : []
   const arch = (detail?.arch ?? '').toLowerCase()
   const modelName = (detail?.name ?? '').toLowerCase()
   // MTP uses a SEPARATE Gemma-4 assistant head GGUF the user supplies, so it's gated
@@ -827,6 +845,23 @@ export function ModelDetailDialog({
                     </Row>
                   </>
                 )}
+                {loadModeValues.length > 0 && (
+                  <Row label="Load mode" hint="How the weights are read off disk. 'dio' uses direct I/O, skipping the OS page cache — the usual pick when system RAM is tight. Leave on engine default unless loading misbehaves.">
+                    <Select
+                      value={draft.loadMode || ENGINE_DEFAULT_OPTION}
+                      options={[ENGINE_DEFAULT_OPTION, ...loadModeValues]}
+                      onChange={(v) => { track('models', 'set_model_load_mode'); set('loadMode', v === ENGINE_DEFAULT_OPTION ? '' : v) }}
+                    />
+                  </Row>
+                )}
+                {hasFlag('--no-mmap') && (
+                  <Toggle
+                    label="Disable memory-mapping"
+                    hint="Reads the model into RAM instead of mapping the file (--no-mmap). Slower to load, but avoids page-cache thrashing — and it's the known fix for the load hang on AMD unified-memory APUs."
+                    value={draft.noMmap === true}
+                    onChange={(v) => { track('models', 'set_model_no_mmap'); set('noMmap', v) }}
+                  />
+                )}
               </Section>
             )}
             </>)}
@@ -835,13 +870,14 @@ export function ModelDetailDialog({
               <>
                 <SectionTitle>Custom flags</SectionTitle>
                 <Section>
-                  <Row label="Extra command-line flags" hint="Appended to the launch command last, so they can override anything above. Add the flag and its value as two separate entries — e.g. type --something, press Enter, type value, press Enter.">
+                  <Row label="Extra command-line flags" hint="Appended to the launch command last, so they can override anything above. Type the flag and its value together — e.g. --lora adapter.gguf — and press Enter. Quote a value that contains spaces.">
                     <div className="w-full" />
                   </Row>
                   <ChipListInput
                     value={draft.extraArgs}
                     onChange={(v) => set('extraArgs', v)}
                     emptyPlaceholder="Type a flag, press Enter"
+                    tokenize
                   />
                 </Section>
               </>
@@ -1456,24 +1492,39 @@ function PathField({ label, hint, value, placeholder, onChange }: {
 }
 
 /** Generic chip-list text input: type, press Enter (or blur), get a removable chip.
- *  Used for stop strings and for custom/raw engine flags (extraArgs) — same shape. */
-function ChipListInput({ value, onChange, placeholder = 'Add another…', emptyPlaceholder }: {
-  value: string[]; onChange: (v: string[]) => void; placeholder?: string; emptyPlaceholder: string
+ *  Used for stop strings and for custom/raw engine flags (extraArgs) — same shape.
+ *
+ *  `tokenize` (extraArgs only, GitHub #221) makes one chip per argv element: typing
+ *  `--load-mode dio` yields two chips, matching what the daemon will actually launch.
+ *  It must stay OFF for stop strings, where a space inside a value is meaningful.
+ *  It also turns off the duplicate check, because argv is a sequence, not a set —
+ *  `--lora a.gguf --lora b.gguf` legitimately repeats a token, and silently swallowing
+ *  the repeat produces a command the user never asked for. Stop strings keep the check:
+ *  they ARE a set, so a duplicate entry is a pure no-op and only clutters the list. */
+function ChipListInput({ value, onChange, placeholder = 'Add another…', emptyPlaceholder, tokenize = false }: {
+  value: string[]; onChange: (v: string[]) => void; placeholder?: string; emptyPlaceholder: string; tokenize?: boolean
 }) {
   const [input, setInput] = useState('')
   const add = (s: string) => {
-    const t = s.trim()
-    if (t && !value.includes(t)) onChange([...value, t])
+    if (tokenize) {
+      const tokens = tokenizeExtraArgs([s])
+      if (tokens.length) onChange([...value, ...tokens])
+    } else {
+      const t = s.trim()
+      if (t && !value.includes(t)) onChange([...value, t])
+    }
     setInput('')
   }
   return (
     <div className="flex flex-col gap-1.5">
       {value.length > 0 && (
         <div className="flex flex-wrap gap-1">
-          {value.map((s) => (
-            <span key={s} className="flex items-center gap-0.5 rounded border border-border bg-panel-2 px-1.5 py-0.5 font-mono text-[11px] text-ink">
+          {/* Keyed and removed by index, not by text: with `tokenize` on, repeated argv
+              tokens are legal, so the value is no longer unique per chip. */}
+          {value.map((s, i) => (
+            <span key={`${i}:${s}`} className="flex items-center gap-0.5 rounded border border-border bg-panel-2 px-1.5 py-0.5 font-mono text-[11px] text-ink">
               {s}
-              <button type="button" onClick={() => { track('models', 'remove_model_setting_chip'); onChange(value.filter((v) => v !== s)) }} className="ml-0.5 text-muted hover:text-[var(--err)]">×</button>
+              <button type="button" onClick={() => { track('models', 'remove_model_setting_chip'); onChange(value.filter((_, j) => j !== i)) }} className="ml-0.5 text-muted hover:text-[var(--err)]">×</button>
             </span>
           ))}
         </div>
