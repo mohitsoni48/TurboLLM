@@ -1,7 +1,7 @@
 // Internal API routes (/api/v1/*) per spec 02. Thin handlers over config/engines.
 import type { Context, Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { basename, dirname, join, resolve } from 'node:path'
 import { GATE_VERSION, gateNodeSource } from '../comfyui/gate-template'
@@ -1463,20 +1463,33 @@ export function registerApi(app: Hono, d: Deps): void {
 
   app.get('/api/v1/engine/logs/stream', (c) =>
     streamSSE(c, async (stream) => {
-      // `sent`/`lastPath` are this CONNECTION's own cursor. `manager.ts`'s engine start TRUNCATES
-      // the log file (a restart rewrites the same path from empty) and `logPath()` itself changes
-      // on an engine switch — either way `lines.length` can drop below `sent`, and unless the
-      // cursor is fixed the loop below (`sent < lines.length - 1`) simply stalls forever: no error,
-      // no new lines, until the new file eventually regrows past the old length. Previously this
-      // only bit a drawer that got reopened fresh after every switch (Engines); it bites a
-      // long-lived subscriber like the Monitor screen (issue #211) on every restart it's open for.
-      // Detecting "this is effectively a new log" (different path, OR the same path now shorter
-      // than what's already been sent) and reseeding `sent` to the file's CURRENT end — rather
-      // than 0 — also covers a brand-new connection's first tick: it starts from "now" instead of
-      // replaying the whole history, which used to race the client's own initial-tail GET
-      // (whichever arrived first, the result was either duplicated or truncated lines).
-      let sent = 0
+      // `bytePos`/`lastPath` are this CONNECTION's own cursor. `manager.ts`'s engine start
+      // TRUNCATES the log file (a restart rewrites the same path from empty) and `logPath()`
+      // itself changes on an engine switch — either way the file can shrink below `bytePos`,
+      // and unless the cursor is fixed the loop stalls forever: no error, no new lines, until
+      // the new file eventually regrows past the old length. Detecting "this is effectively a
+      // new log" (different path, OR the same path now shorter than what's already been read)
+      // and reseeding `bytePos` to the file's CURRENT size — rather than 0 — also covers a
+      // brand-new connection's first tick: it starts from "now" instead of replaying the whole
+      // history, which would otherwise race the client's own initial-tail GET (whichever
+      // arrived first, the result was either duplicated or truncated lines). Same semantics as
+      // before this rewrite (ADR-409's review, PR #216) — only the READ shape changed.
+      //
+      // Perf follow-up (docs/TODO.md, "Verification & chores", ADR-409 review item 2): the
+      // previous version did `readFileSync(path).split('\n')` — the WHOLE file, synchronously,
+      // every 400ms tick, for as long as Monitor/Engines-drawer is open. Harmless on a short
+      // log; on a long verbose session (tens of MB) it periodically blocked the daemon's event
+      // loop, including `/v1/chat/completions`. Now reads only the byte DELTA since the last
+      // tick via `readSync` at a tracked offset — a live-tailed log costs O(new bytes), not
+      // O(whole file), per tick. `dec` is a single persistent `TextDecoder` for the WHOLE
+      // connection (not reconstructed per tick) so a multi-byte UTF-8 character split across
+      // two ticks' byte ranges decodes correctly instead of emitting U+FFFD at the boundary
+      // (`{ stream: true }` holds back incomplete trailing bytes for the next chunk) — same
+      // technique `drainOpenAiSseForLog` uses for the exact same reason.
+      let bytePos = 0
       let lastPath = ''
+      let carry = '' // a line seen but not yet newline-terminated, held for the next tick
+      const dec = new TextDecoder()
       let aborted = false
       let ticks = 0
       stream.onAbort(() => {
@@ -1485,13 +1498,29 @@ export function registerApi(app: Hono, d: Deps): void {
       while (!aborted) {
         const path = d.manager.logPath()
         if (path && existsSync(path)) {
-          const lines = readFileSync(path, 'utf8').split('\n')
-          if (path !== lastPath || sent > lines.length - 1) {
-            sent = Math.max(0, lines.length - 1)
+          const size = statSync(path).size
+          if (path !== lastPath || size < bytePos) {
+            bytePos = size
             lastPath = path
+            carry = ''
+            dec.decode() // flush/reset any pending partial-char state from the OLD file
           }
-          for (; sent < lines.length - 1; sent++) {
-            await stream.writeSSE({ event: 'line', data: JSON.stringify({ line: lines[sent].replace(/\r$/, '') }) })
+          if (size > bytePos) {
+            const len = size - bytePos
+            const buf = Buffer.alloc(len)
+            const fd = openSync(path, 'r')
+            try {
+              readSync(fd, buf, 0, len, bytePos)
+            } finally {
+              closeSync(fd)
+            }
+            bytePos = size
+            const text = carry + dec.decode(buf, { stream: true })
+            const lines = text.split('\n')
+            carry = lines.pop() ?? ''
+            for (const line of lines) {
+              await stream.writeSSE({ event: 'line', data: JSON.stringify({ line: line.replace(/\r$/, '') }) })
+            }
           }
         }
         if (++ticks % 37 === 0) await stream.writeSSE({ data: '', event: 'ping' })
@@ -1499,6 +1528,63 @@ export function registerApi(app: Hono, d: Deps): void {
       }
     }),
   )
+
+  // ---- Developer request log (issue #211 follow-up) ----
+  // Every completion this daemon has proxied (external API clients, Code sessions, in-app
+  // Chat) — LM Studio-style: params, timings, tokens, and (opt-in) full request/response
+  // bodies. In-memory only (`RequestLog`, observability/request-log.ts); nothing here is ever
+  // persisted or sent to telemetry. Same auth treatment as `/api/v1/engine/logs` above — no
+  // per-route middleware, covered by the global `lanAuth` mounted in server.ts.
+  //
+  // `/stream` is registered BEFORE `/:id` so it can never be shadowed by the param route —
+  // Hono resolves a literal segment over a param one regardless of registration order, but
+  // ordering it this way keeps the intent obvious without relying on that.
+  app.get('/api/v1/requests/stream', (c) =>
+    streamSSE(c, async (stream) => {
+      if (!d.requestLog) return
+      let aborted = false
+      stream.onAbort(() => { aborted = true })
+      const unsubscribe = d.requestLog.subscribe((entry) => {
+        if (aborted) return
+        void stream.writeSSE({ event: 'entry', data: JSON.stringify(entry) })
+      })
+      let ticks = 0
+      try {
+        while (!aborted) {
+          if (++ticks % 37 === 0) await stream.writeSSE({ data: '', event: 'ping' })
+          await stream.sleep(400)
+        }
+      } finally {
+        unsubscribe()
+      }
+    }),
+  )
+
+  app.get('/api/v1/requests', (c) => {
+    if (!d.requestLog) return c.json({ entries: [] })
+    const q = c.req.query()
+    const limit = q.limit !== undefined ? Math.min(Math.max(Number(q.limit) || 0, 1), 2000) : undefined
+    const since = q.since !== undefined ? Number(q.since) : undefined
+    const source = q.source === 'openai' || q.source === 'anthropic' || q.source === 'chat' ? q.source : undefined
+    const status = q.status === 'ok' || q.status === 'error' ? q.status : undefined
+    // Bodies are withheld from the LIST endpoint unless explicitly requested — a row list
+    // rendering hundreds of entries has no business pulling every captured prompt/response
+    // over the wire just to show a time/status/tokens table.
+    const bodies = q.bodies === '1' || q.bodies === 'true'
+    return c.json({ entries: d.requestLog.list({ limit, since, source, modelKey: q.model, status, bodies }) })
+  })
+
+  app.get('/api/v1/requests/:id', (c) => {
+    if (!d.requestLog) return err(c, 404, 'not_found', 'No request log entry with that id.')
+    const entry = d.requestLog.get(c.req.param('id'))
+    if (!entry) return err(c, 404, 'not_found', 'No request log entry with that id.')
+    return c.json({ entry })
+  })
+
+  app.delete('/api/v1/requests', (c) => {
+    d.requestLog?.clear()
+    return c.json({ ok: true })
+  })
 
   // ---- auto-benchmark + auto-tune (M3, spec 09 §1) ----
   // Start a sweep for a model. 202 + poll /status `bench`. 409 when a run is already
@@ -1672,6 +1758,7 @@ export function registerApi(app: Hono, d: Deps): void {
       hfToken?: string
       comfyui?: { enabled?: boolean; url?: string; reverseGate?: boolean }
       gateway?: { autoSwap?: boolean; keepN?: number }
+      requestLog?: { enabled?: boolean; captureBodies?: boolean }
       tavilyApiKey?: string
       search?: { provider?: string; tavilyApiKey?: string; kagiApiKey?: string; searxngUrl?: string }
       ghToken?: string
@@ -1877,6 +1964,12 @@ export function registerApi(app: Hono, d: Deps): void {
       if (b.cloudDeploy?.runpodTemplateId !== undefined) {
         cfg.cloudDeploy.runpodTemplateId = String(b.cloudDeploy.runpodTemplateId).trim()
       }
+      // Developer request log (issue #211 follow-up): per-field merge, same reasoning as
+      // cloudDeploy/experimental just below — a patch toggling only `captureBodies` (the
+      // Privacy & telemetry checkbox) must not silently flip `enabled` back to its Object.assign
+      // default, and vice versa for a future toggle that touches only `enabled`.
+      if (b.requestLog?.enabled !== undefined) cfg.requestLog.enabled = !!b.requestLog.enabled
+      if (b.requestLog?.captureBodies !== undefined) cfg.requestLog.captureBodies = !!b.requestLog.captureBodies
       // Experimental feature flags (2026-07-14, Settings → Experimental): per-field merge, not
       // Object.assign(cfg.daemon, updates) — a patch touching only one flag must not clobber
       // the other back to whatever `updates.experimental` would otherwise silently overwrite it
@@ -2445,6 +2538,7 @@ function settingsPayload(d: Deps) {
     modelDefaults: cfg.modelDefaults,
     comfyui: cfg.comfyui,
     gateway: cfg.gateway,
+    requestLog: cfg.requestLog,
     // The HF token is write-only over the wire (spec 10 §4): we never echo it back,
     // only whether one is set, so the UI can show "configured" without leaking it.
     hfTokenSet: cfg.hf.token.length > 0,

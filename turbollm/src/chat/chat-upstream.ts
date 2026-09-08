@@ -22,6 +22,7 @@
 import { engineModelAlias } from '../engines/compat'
 import { linkHeaders, proxyStream, type RemoteTarget } from '../link/link-proxy'
 import type { Deps } from '../deps'
+import { extractParams, summarizeRequest, drainOpenAiSseForLog, requestLogConfig } from '../observability/request-log'
 
 /** Everything a chat turn needs to know about where it is being generated. */
 export interface ChatUpstream {
@@ -111,32 +112,108 @@ export function resolveChatUpstream(d: Deps, requestedModel?: string): ChatUpstr
  *  credential never travels, the link token is added in exactly one place, and an abort
  *  reaches the host instead of leaving it generating into a dead socket.
  *
- *  `fetchImpl` exists for tests; production passes nothing. */
+ *  `fetchImpl` exists for tests; production passes nothing.
+ *
+ *  `d` (optional — every existing caller keeps working unchanged if omitted) enables the
+ *  developer request log (issue #211 follow-up), captured HERE rather than at each of this
+ *  function's callers (chat-routes.ts's main turn loop, its regenerate branch, and its title
+ *  generator, plus memory.ts's auto-memory distillation) — this docstring's own claim, "the
+ *  ONE outbound call", is exactly why one capture point here covers all of them instead of
+ *  four separate ones that could drift. Every one of those is tagged `source: 'chat'` alike;
+ *  they aren't distinguished further (title-gen and memory calls are real engine work too, and
+ *  a developer debugging "why is my engine busy" benefits from seeing them, not having them
+ *  silently filtered out). */
 export function callChatUpstream(
   upstream: ChatUpstream,
   body: unknown,
   signal?: AbortSignal,
   fetchImpl: typeof fetch = fetch,
+  d?: Deps,
 ): Promise<Response> {
   const payload = JSON.stringify(body)
-  if (upstream.remote) {
-    const headers = linkHeaders(upstream.remote)
-    headers.set('content-type', 'application/json')
-    return proxyStream(
-      upstream.remote,
-      '/v1/chat/completions',
-      { method: 'POST', headers, body: payload },
-      signal,
-      fetchImpl,
-    )
-  }
-  return fetchImpl(`${upstream.target}/v1/chat/completions`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: payload,
-    signal,
-    // Required by undici whenever a body is present on some Node versions; harmless for a
-    // string body and preserved from the call sites this replaced.
-    duplex: 'half',
-  } as RequestInit)
+  const call = upstream.remote
+    ? (() => {
+        const headers = linkHeaders(upstream.remote!)
+        headers.set('content-type', 'application/json')
+        return proxyStream(
+          upstream.remote!,
+          '/v1/chat/completions',
+          { method: 'POST', headers, body: payload },
+          signal,
+          fetchImpl,
+        )
+      })
+    : () => fetchImpl(`${upstream.target}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: payload,
+        signal,
+        // Required by undici whenever a body is present on some Node versions; harmless for a
+        // string body and preserved from the call sites this replaced.
+        duplex: 'half',
+      } as RequestInit)
+
+  // Same double-count avoidance every federated ledger in this codebase follows (gateway.ts's
+  // `localAccounting`): a Turbo Link turn is already captured once, on the HOST's own gateway
+  // behind its façade — logging it again here, on the PEER that only forwarded it, would show
+  // every federated chat turn twice.
+  if (!d?.requestLog || upstream.remote) return call()
+  const rlCfg = requestLogConfig(d)
+  if (!rlCfg.enabled) return call()
+
+  const reqBody = body as Record<string, unknown>
+  const captureBody = !!rlCfg.captureBodies
+  const logId = d.requestLog.start({
+    source: 'chat',
+    harness: null,
+    codeSessionId: null,
+    modelKey: upstream.modelField || null,
+    remote: null,
+    stream: reqBody?.stream === true,
+    params: extractParams(reqBody),
+    counts: summarizeRequest(reqBody),
+    ...(captureBody ? { requestBody: payload } : {}),
+  })
+  const startedAt = Date.now()
+
+  return call().then(
+    (res) => {
+      if (!res.ok || !res.body) {
+        d.requestLog!.finalize(logId, { status: res.status, error: { code: 'engine_error', message: `Engine returned HTTP ${res.status}.` }, durationMs: Date.now() - startedAt })
+        return res
+      }
+      const [a, b] = res.body.tee()
+      const drain = reqBody?.stream === true
+        ? drainOpenAiSseForLog(b, { captureBody, startedAt }).then((r) => {
+            d.requestLog!.finalize(logId, {
+              status: res.status, promptTokens: r.promptTokens, completionTokens: r.completionTokens,
+              promptTps: r.promptTps, genTps: r.genTps, ttftMs: r.ttftMs, finishReason: r.finishReason,
+              durationMs: Date.now() - startedAt,
+              responseBody: captureBody ? JSON.stringify({ content: r.responseText }) : undefined,
+            })
+          })
+        : new Response(b).text().then((text) => {
+            let usage: { prompt_tokens?: number; completion_tokens?: number } | undefined
+            let finishReason: string | null = null
+            try {
+              const oai = JSON.parse(text) as { usage?: typeof usage; choices?: Array<{ finish_reason?: string }> }
+              usage = oai.usage
+              finishReason = oai.choices?.[0]?.finish_reason ?? null
+            } catch { /* not JSON — log status/timing only */ }
+            d.requestLog!.finalize(logId, {
+              status: res.status, promptTokens: usage?.prompt_tokens, completionTokens: usage?.completion_tokens,
+              finishReason, durationMs: Date.now() - startedAt,
+              responseBody: captureBody ? text : undefined,
+            })
+          })
+      drain.catch(() => {
+        d.requestLog!.finalize(logId, { status: res.status, error: { code: 'drain_error', message: 'Failed to read the response for the request log.' }, durationMs: Date.now() - startedAt })
+      })
+      return new Response(a, { status: res.status, headers: res.headers })
+    },
+    (e) => {
+      d.requestLog!.finalize(logId, { status: null, error: { code: 'engine_unreachable', message: (e as Error)?.message || 'Engine unreachable.' }, durationMs: Date.now() - startedAt })
+      throw e
+    },
+  )
 }

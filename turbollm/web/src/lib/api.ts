@@ -13,6 +13,8 @@ import type {
   EngineCatalog,
   EngineRecommendationResult,
   EngineLogs,
+  RequestLogEntry,
+  RequestLogList,
   EngineUpdates,
   EnginesList,
   EngineScanResult,
@@ -463,6 +465,40 @@ export function getEngineLogs(tail = 200): Promise<EngineLogs> {
 /** URL for the SSE live log tail (consumed via EventSource). */
 export const engineLogStreamUrl = '/api/v1/engine/logs/stream'
 
+// ── Developer request log (issue #211 follow-up) ─────────────────────────────
+export interface RequestLogFilter {
+  limit?: number
+  since?: number
+  source?: RequestLogEntry['source']
+  model?: string
+  status?: 'ok' | 'error'
+}
+
+/** Bodies are withheld unless the caller explicitly opts in — see routes.ts's same rule. */
+export function getRequests(filter: RequestLogFilter = {}, bodies = false): Promise<RequestLogList> {
+  const params = new URLSearchParams()
+  if (filter.limit !== undefined) params.set('limit', String(filter.limit))
+  if (filter.since !== undefined) params.set('since', String(filter.since))
+  if (filter.source) params.set('source', filter.source)
+  if (filter.model) params.set('model', filter.model)
+  if (filter.status) params.set('status', filter.status)
+  if (bodies) params.set('bodies', '1')
+  const qs = params.toString()
+  return request<RequestLogList>(`/api/v1/requests${qs ? `?${qs}` : ''}`)
+}
+
+export function getRequestDetail(id: string): Promise<{ entry: RequestLogEntry }> {
+  return request<{ entry: RequestLogEntry }>(`/api/v1/requests/${encodeURIComponent(id)}`)
+}
+
+export function clearRequests(): Promise<{ ok: true }> {
+  return request<{ ok: true }>('/api/v1/requests', { method: 'DELETE' })
+}
+
+/** URL for the SSE live entry stream (consumed via EventSource), same convention as
+ *  {@link engineLogStreamUrl}. */
+export const requestsStreamUrl = '/api/v1/requests/stream'
+
 // ── Filesystem browser (spec 03 §9) ──────────────────────────────────────────
 export interface FsEntry {
   name: string
@@ -703,6 +739,11 @@ export type DaemonSettings = {
   ghTokenSet: boolean
   /** Gateway intelligence settings (ADR-06x): model auto-swap + keep-N pool. */
   gateway: { autoSwap: boolean; keepN: number }
+  /** Developer request log (issue #211 follow-up): whether the log captures at all, and
+   *  whether captured entries include full prompt/response TEXT. `captureBodies` defaults off
+   *  — it lives in Settings → Privacy & telemetry, not Developer/Engines, because it's a
+   *  privacy choice: the log itself is always in-memory-only regardless of this flag. */
+  requestLog: { enabled: boolean; captureBodies: boolean }
   /** Whether a Tavily API key is configured (legacy mirror of `search.tavilyKeySet`). */
   tavilyKeySet: boolean
   /** Web-search provider config (F-020). Keys are write-only — only "is it set" booleans
@@ -752,7 +793,7 @@ export type SearchProvider = 'tavily' | 'kagi' | 'searxng'
  *  `hfToken` (spec 10 §4) that sets/clears the stored Hugging Face token. `comfyui`
  *  is patchable per-field (only `enabled` is set here; `gatePath` is owned by the
  *  install endpoints). */
-export type DaemonSettingsPatch = Partial<Omit<DaemonSettings, 'comfyui' | 'tavilyKeySet' | 'search' | 'mcp' | 'experimental' | 'code'>> & {
+export type DaemonSettingsPatch = Partial<Omit<DaemonSettings, 'comfyui' | 'tavilyKeySet' | 'search' | 'mcp' | 'experimental' | 'code' | 'requestLog'>> & {
   comfyui?: Partial<ComfyUiSettings>
   /** Patchable per-field — the backend applies each key independently (api/routes.ts), so a
    *  patch touching only one flag must not be forced to also supply the other. */
@@ -760,6 +801,10 @@ export type DaemonSettingsPatch = Partial<Omit<DaemonSettings, 'comfyui' | 'tavi
   /** Patchable per-field, same reason as `experimental` — routes.ts applies each candidate list
    *  independently. */
   code?: Partial<DaemonSettings['code']>
+  /** Patchable per-field, same reason as `experimental` — the Privacy & telemetry "Log prompts
+   *  and responses" checkbox must be able to flip `captureBodies` without also resending
+   *  `enabled`. */
+  requestLog?: Partial<DaemonSettings['requestLog']>
   hfToken?: string
   /** Write-only: set or clear ('') the stored GitHub token. Raises the GitHub API rate limit
    *  for branch lookups from 60 to 5,000 requests/hour. Never echoed back — read the boolean

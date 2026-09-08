@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import type { LucideIcon } from 'lucide-react'
 import {
   Boxes,
@@ -61,7 +61,10 @@ import { ScreenHeader, InlineError } from '../components/common'
 import { RemoteEngines } from './engines/RemoteEngines'
 import { useLinks } from '../lib/link-queries'
 import { useDocumentScroll } from '../lib/scroll-mode'
+import { cn } from '../lib/utils'
 import { StateChip } from '../components/StateChip'
+import { MonitorTab } from './engines/MonitorTab'
+import { TokensScreen } from './TokensScreen'
 import { Badge } from '../components/ui/badge'
 import { Button } from '../components/ui/button'
 import { Input } from '../components/ui/input'
@@ -425,8 +428,70 @@ function defaultBuildName(catalog: CatalogEngine | undefined, branch: string): s
  *  2. Engine gallery — one card per engine: hardware-fit mark, pros/cons, install/manage.
  *  3. Diagnostics — the running-engine status + live log, kept out of the default view.
  */
+// 3 tabs (issue #211 follow-up, superseding ADR-409's standalone `/monitor` route and the plain
+// `/usage` route): Engines (this screen's original whole content, unchanged, now
+// `EngineGalleryTab` below), Monitor (the engine log + hardware stats dashboard, relocated from
+// its own nav-rail entry into the screen it's actually about), Usage (the token-usage
+// dashboard, `TokensScreen`'s own body mounted unmodified). `?tab=` persists so
+// `/monitor`→`/engines?tab=monitor` and `/usage`→`/engines?tab=usage` redirects (App.tsx) land
+// correctly — same `useSearchParams` pattern as CustomizeScreen's own tabs.
+const ENGINES_TABS = [
+  { id: 'engines', label: 'Engines' },
+  { id: 'monitor', label: 'Monitor' },
+  { id: 'usage',   label: 'Usage' },
+] as const
+type EnginesTab = (typeof ENGINES_TABS)[number]['id']
+
 export function EnginesScreen() {
-  // Issue #178: a long, plain list screen — the window scrolls it, not an inner box.
+  const [searchParams, setSearchParams] = useSearchParams()
+  const tabParam = searchParams.get('tab')
+  const activeTab: EnginesTab = tabParam === 'monitor' ? 'monitor' : tabParam === 'usage' ? 'usage' : 'engines'
+  const setTab = (tab: EnginesTab) => setSearchParams(tab === 'engines' ? {} : { tab }, { replace: true })
+
+  return (
+    <div className={activeTab === 'monitor' ? 'flex h-full w-full flex-col overflow-hidden' : 'w-full'}>
+      <div className="shrink-0 px-4 pt-4 md:px-6">
+        <div className="inline-flex w-fit rounded-md border border-border p-0.5">
+          {ENGINES_TABS.map(({ id, label }) => (
+            <button
+              key={id}
+              type="button"
+              onClick={() => { track('engines', 'switch_engines_tab'); setTab(id) }}
+              className={cn(
+                'rounded px-3 py-1.5 text-[13px] font-medium transition-colors',
+                activeTab === id ? 'bg-accent/12 text-accent' : 'text-muted hover:text-ink',
+              )}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
+      {activeTab === 'engines' ? (
+        <EngineGalleryTab />
+      ) : activeTab === 'monitor' ? (
+        // Bounded, not document-scroll (ADR-409's whole reason): the log's own auto-scroll and
+        // the stats pane's independent scroll must never fight over the page's scroll position.
+        // `useDocumentScroll` is refcounted (lib/scroll-mode.ts) — MonitorTab simply never calls
+        // it, so mounting it here with EngineGalleryTab/TokensScreen unmounted (this ternary)
+        // resolves to 'bounded' the same way it did as a standalone route.
+        <div className="min-h-0 flex-1">
+          <MonitorTab />
+        </div>
+      ) : (
+        <TokensScreen />
+      )}
+    </div>
+  )
+}
+
+/** The Engines screen's original whole body (Zones 1–4), unchanged — extracted into its own
+ *  component only so `EnginesScreen` above can add tabs around it without growing this
+ *  1700+-line file further (issue #211 follow-up). */
+function EngineGalleryTab() {
+  // Issue #178: a long, plain list screen — the window scrolls it, not an inner box. Inert
+  // while the Monitor tab is mounted instead (this component is unmounted then) — see
+  // `EnginesScreen`'s own comment on why scroll-mode needs no explicit per-tab wiring here.
   useDocumentScroll()
   const enginesQ = useEngines()
   const { data: status } = useStatus()
@@ -447,7 +512,9 @@ export function EnginesScreen() {
   const activeEngine = activeEngineOf(list)
 
   return (
-    <div className="w-full px-4 py-6 md:px-6">
+    // `pt-4` not `py-6`: the parent `EnginesScreen` tab bar already owns the page's top
+    // padding (issue #211 follow-up) — this only needs its own bottom padding now.
+    <div className="w-full px-4 pb-6 pt-4 md:px-6">
       <ScreenHeader
         title="Engines"
         description="Pick the engine that fits your hardware. Each card shows what it’s good at, its trade-offs, and whether it runs on your machine."

@@ -100,4 +100,9 @@ export interface Deps {
    *  Optional — absent under tests and in any embedding without Turbo Link, in which case
    *  `/v1/models` is exactly the pre-Turbo-Link local list. */
   remoteCatalog?: RemoteCatalog
+  /** Developer request log (issue #211 follow-up): every completion this daemon proxies —
+   *  external API clients, Code sessions, and in-app Chat — with sampling params, timings and
+   *  token counts, in-memory only. Optional — absent under tests that don't exercise it, same
+   *  convention as gate/telemetry/agentTasks. */
+  requestLog?: import('./observability/request-log').RequestLog
 }
