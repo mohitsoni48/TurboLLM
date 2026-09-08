@@ -111,3 +111,7 @@ Thumbs.db
 # Local backups of a physical test device's TurboLLM data (adb-pulled tarball),
 # made before a signature-mismatch reinstall wipes it. Multi-GB, device-specific, never for git.
 /.tllm-device-backup/
+
+# Sibling app repos checked out alongside this one — never part of this repo
+/TurboLLM Android/
+/TurboLLM-Android-Llama/
