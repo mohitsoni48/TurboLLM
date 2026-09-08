@@ -36,6 +36,7 @@ import { ModelRouter } from './gateway/model-router'
 import { ToolRegistry } from './tools/tool-registry'
 import { GenerationGate } from './agents/gate'
 import { AgentTaskState } from './agents/task-state'
+import { RequestLog } from './observability/request-log'
 import { launchCli, syncHarnessModelConfig, CONFIG_FILE_HARNESSES } from './cli-launch'
 import { writePidfile, removePidfile, stopDaemon, resolveDaemonPort } from './daemon-pid'
 import { runMcpServer } from './mcp-server'
@@ -441,6 +442,12 @@ const deps: Deps = { store, registry, manager, scanner, hashes, db, chatStore, p
 // that is not 1.
 deps.gate = new GenerationGate(() => manager.parallelSlots() ?? Infinity)
 deps.agentTasks = new AgentTaskState()
+// Developer request log (issue #211 follow-up): sized off config so a raised `maxEntries`
+// (Settings) takes effect on next restart, same as other config-shaped-at-boot values here.
+// `enabled`/`captureBodies` are read live off the store by the capture sites themselves (never
+// baked into this instance), so toggling either in Settings takes effect on the very next
+// request with no restart needed.
+deps.requestLog = new RequestLog(store.snapshot().requestLog.maxEntries)
 
 // Journey telemetry (ADR-299). Constructing it is unconditional and harmless —
 // the Emitter itself enforces consent and the kill switch, so there is no state

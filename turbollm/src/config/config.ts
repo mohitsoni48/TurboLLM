@@ -280,6 +280,20 @@ export interface Gateway {
   keepN: number
 }
 
+/** The developer request log (issue #211 follow-up, superseding ADR-409): every completion this
+ *  daemon proxies — external API clients, Code sessions, and in-app Chat alike — with LM
+ *  Studio-style sampling params, timings and token counts. The log itself is ALWAYS in-memory
+ *  only (never persisted, never sent to telemetry) regardless of these settings; `enabled` only
+ *  gates whether entries are captured at all, and `captureBodies` gates the far more sensitive
+ *  full prompt/response text within those entries. */
+export interface RequestLogConfig {
+  enabled: boolean
+  /** Off by default (matches LM Studio's own default) — bodies are the most sensitive data in
+   *  the app. Metadata (params, tokens, timings, status) is captured either way. */
+  captureBodies: boolean
+  maxEntries: number
+}
+
 /** ComfyUI GPU-coordination (so the LLM engine and ComfyUI don't fight over VRAM).
  *  Push-based: a one-time-installed ComfyUI custom node calls TurboLLM the moment a
  *  render starts (TurboLLM unloads the model + blocks loads) and when the queue drains
@@ -501,6 +515,7 @@ export interface Config {
   featuredOverrideUrl: string
   comfyui: ComfyUI
   gateway: Gateway
+  requestLog: RequestLogConfig
   tools: ToolsConfig
   mcp: McpConfig
   /** Agents + skills configuration (spec 13 §2.1). */
@@ -655,6 +670,7 @@ export function defaultConfig(): Config {
     featuredOverrideUrl: '',
     comfyui: { enabled: false, gatePath: '', url: '', reverseGate: false, cachePersist: false },
     gateway: { autoSwap: true, keepN: 1 },
+    requestLog: { enabled: true, captureBodies: false, maxEntries: 500 },
     tools: {},
     mcp: { servers: [] },
     agents: { agents: [] },
@@ -920,6 +936,16 @@ function normalize(c: Config): void {
   c.gateway = {
     autoSwap: gw.autoSwap !== false,
     keepN: typeof gw.keepN === 'number' && gw.keepN >= 1 ? Math.min(Math.floor(gw.keepN), 4) : 1,
+  }
+  // Developer request log (issue #211 follow-up): absent in pre-this-feature configs →
+  // defaults (on, bodies off). `captureBodies` in particular must never silently flip on for
+  // an existing install just because the field was missing — it is the one field this block
+  // does NOT `!== false`-default to true.
+  const rl = (c.requestLog ?? {}) as Partial<RequestLogConfig>
+  c.requestLog = {
+    enabled: rl.enabled !== false,
+    captureBodies: rl.captureBodies === true,
+    maxEntries: typeof rl.maxEntries === 'number' && rl.maxEntries >= 50 ? Math.min(Math.floor(rl.maxEntries), 5000) : 500,
   }
   // Built-in tools (v0.7.0): absent in pre-v0.7.0 configs → empty defaults.
   const tl = (c.tools ?? {}) as Partial<ToolsConfig>

@@ -12,6 +12,7 @@ import { presentedKey } from '../auth'
 import { noteLocalActivity } from '../link/host-idle'
 import { linkHeaders, proxyStream } from '../link/link-proxy'
 import { formatRemoteId } from '../link/model-id'
+import { extractParams, summarizeRequest, drainOpenAiSseForLog, requestLogConfig, type RequestLogFinal } from '../observability/request-log'
 import { sessionAuth } from '../code/session-auth'
 import { parseReasoningEffort } from '../chat/reasoning-effort'
 import { classifyHarness } from '../telemetry/classify'
@@ -366,6 +367,45 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
       })
     }
 
+    // ── Developer request log (issue #211 follow-up) ───────────────────────────────────────
+    // Captured for LOCAL generations only — same `localAccounting` gate every other per-request
+    // ledger in this function uses (manager stats, `db.recordApiUsage`), and for the identical
+    // reason documented above `callUpstream`: a federated request is already captured once, on
+    // the HOST's own gateway behind its façade (the host runs this exact handler). Logging it
+    // again here would show every Turbo Link request twice, once per machine.
+    //
+    // Params/counts are extracted from `oaiBody` — the OUTBOUND, already-mapped request — not
+    // the raw Anthropic-shaped `req`. That's deliberate: it's what the engine actually received
+    // (after `mapToOpenAI`, agent-guidance nudges, and any thinking/reasoning-effort override),
+    // which is what a developer debugging model behavior wants to see, and it puts both the
+    // Anthropic and OpenAI-protocol capture sites on the same field names for one consistent
+    // Requests table.
+    const rlCfg = requestLogConfig(d)
+    const captureRequestBodies = !!rlCfg.captureBodies
+    const logId = localAccounting && d.requestLog && rlCfg.enabled
+      ? d.requestLog.start({
+          source: 'anthropic',
+          harness: anthropicHarness,
+          codeSessionId: anthropicCodeSessionId,
+          modelKey: req.model ?? null,
+          remote: null,
+          stream: !!req.stream,
+          params: extractParams(oaiBody as Record<string, unknown>),
+          counts: summarizeRequest(oaiBody as Record<string, unknown>),
+          ...(captureRequestBodies ? { requestBody: JSON.stringify(oaiBody) } : {}),
+        })
+      : null
+    let logFinalized = false
+    /** Every early-return path below must go through this, or the entry sits at `status: null`
+     *  ("pending") forever in the UI. Idempotent — a second call is a no-op via `logFinalized`,
+     *  so the `finally`-block fallback (client abort / engine crash mid-stream, below) can call
+     *  it unconditionally without double-finalizing a request that already completed normally. */
+    const finalizeLog = (result: RequestLogFinal): void => {
+      if (!logId || logFinalized) return
+      logFinalized = true
+      d.requestLog!.finalize(logId, result)
+    }
+
     if (req.stream) {
       // ── ADR-347: the gate wait above and the fetch() below are exactly as silent to the
       // client as the slow-prefill gap the keep-alive ping fix (ADR-342) closed — a Task-tool
@@ -418,6 +458,7 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
                 )
               } catch (e) {
                 const { type, message } = classifyGateError(e)
+                finalizeLog({ status: 503, error: { code: type, message } })
                 await stream.writeSSE({ event: 'error', data: JSON.stringify({ type: 'error', error: { type, message } }) })
                 return
               }
@@ -451,9 +492,15 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
               )
             } catch (e) {
               const { type, message } = classifyFetchError(e, ac)
+              finalizeLog({ status: null, error: { code: type, message }, durationMs: Date.now() - requestStart })
               await stream.writeSSE({ event: 'error', data: JSON.stringify({ type: 'error', error: { type, message } }) })
               return
             }
+            // Time-to-first-byte from the engine: an approximation of TTFT (prompt-processing
+            // time), not a per-delta measurement — `streamToAnthropic` doesn't currently surface
+            // the first content chunk's own arrival time. Close enough for a developer log;
+            // llama.cpp-family engines send SSE headers once the first token is ready.
+            const ttftMs = Date.now() - requestStart
 
             if (!res.ok || !res.body) {
               // Forward the engine's REAL status + whatever structured error it returned,
@@ -462,6 +509,10 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
               // flattening is what made bugs #1-#4 in a Code session all read identically from
               // the terminal, with no way to tell them apart.
               const { message, type } = await describeEngineError(res)
+              finalizeLog({
+                status: res.status, error: { code: type ?? anthropicErrorType(res.status), message },
+                durationMs: Date.now() - requestStart,
+              })
               await stream.writeSSE({
                 event: 'error',
                 data: JSON.stringify({ type: 'error', error: { type: type ?? anthropicErrorType(res.status), message } }),
@@ -494,6 +545,17 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
                     codeSessionId: anthropicCodeSessionId, durationMs: Date.now() - requestStart,
                     promptTps: u.promptTps, genTps: u.genTps, harness: anthropicHarness,
                   })
+                  // Developer request log — response BODY text is deliberately not captured on
+                  // this path even with captureBodies on: `streamToAnthropic` re-emits
+                  // Anthropic-shaped SSE from the engine's OpenAI-shaped stream and doesn't
+                  // currently surface the reassembled text here. Metadata (params, tokens,
+                  // timings, finish reason) is still fully captured. Full response-body capture
+                  // is supported on the OpenAI-protocol path below, which already holds the raw
+                  // bytes via `tee()`.
+                  finalizeLog({
+                    status: res.status, promptTokens: u.inputTokens, completionTokens: u.outputTokens,
+                    promptTps: u.promptTps, genTps: u.genTps, ttftMs, durationMs: Date.now() - requestStart,
+                  })
                 } catch { /* swallow — stats are best-effort */ }
               },
               // Live per-request progress for the engine card (prefill % + token count),
@@ -520,6 +582,11 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
             ac.abort() // also tear down the upstream on normal completion / write error
             if (generationStarted) d.manager.generationEnd()
             gateRelease?.()
+            // Fallback: if nothing above already finalized the log entry (a client disconnect
+            // mid-stream, or an exception `streamToAnthropic`'s own callbacks never got a
+            // chance to report), it must not sit at `status: null` forever — `finalizeLog` is
+            // idempotent, so this is a no-op for every path that already finalized normally.
+            finalizeLog({ status: null, error: { code: 'incomplete', message: 'Stream ended before a final usage report (client disconnect or engine error).' } })
           }
         } catch (e) {
           await stream.writeSSE({
@@ -539,6 +606,7 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
         gateRelease = await d.gate.acquire('bg', { signal: c.req.raw.signal, timeoutMs: gateAcquireTimeoutMs })
       } catch (e) {
         const { status, type, message } = classifyGateError(e)
+        finalizeLog({ status, error: { code: type, message } })
         return c.json({ type: 'error', error: { type, message } }, status)
       }
     }
@@ -555,6 +623,7 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
       endLocalGeneration()
       gateRelease?.()
       const { status, type, message } = classifyFetchError(e, ac)
+      finalizeLog({ status, error: { code: type, message }, durationMs: Date.now() - requestStart })
       return c.json({ type: 'error', error: { type, message } }, status)
     }
 
@@ -566,6 +635,10 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
       // to the same hardcoded 500/'api_error' — that flattening is what made bugs #1-#4 in a
       // Code session all read identically from the terminal, with no way to tell them apart.
       const { message, type } = await describeEngineError(res)
+      finalizeLog({
+        status: res.status, error: { code: type ?? anthropicErrorType(res.status), message },
+        durationMs: Date.now() - requestStart,
+      })
       return c.json(
         { type: 'error', error: { type: type ?? anthropicErrorType(res.status), message } },
         asClientStatus(res.status),
@@ -590,7 +663,18 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
       if (anthropicCodeSessionId) {
         try { observeCodeSessionTurn(d, anthropicCodeSessionId, openAiToolCalls(oaiRes)) } catch { /* swallow */ }
       }
+      const usage = oaiRes.usage as { prompt_tokens?: number; completion_tokens?: number } | undefined
+      finalizeLog({
+        status: res.status,
+        promptTokens: usage?.prompt_tokens, completionTokens: usage?.completion_tokens,
+        durationMs: Date.now() - requestStart,
+        finishReason: (oaiRes.choices as Array<{ finish_reason?: string }> | undefined)?.[0]?.finish_reason ?? null,
+        responseBody: captureRequestBodies ? JSON.stringify(oaiRes) : undefined,
+      })
       return c.json(mapFromOpenAI(oaiRes, modelName))
+    } catch (e) {
+      finalizeLog({ status: null, error: { code: 'internal_error', message: (e as Error)?.message || 'Failed to parse the engine response.' }, durationMs: Date.now() - requestStart })
+      throw e
     } finally {
       endLocalGeneration()
       gateRelease?.()
@@ -953,6 +1037,34 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
     }
   }
 
+  // ── Developer request log (issue #211 follow-up) ───────────────────────────────────────
+  // Same `isChat && !remote` gate as the usage-recording block below, for the identical
+  // double-counting reason (I-1/I-4 above): a federated request is already captured once, on
+  // the HOST's own gatewayV1Handler behind its façade. `parsedBody` is only non-null when
+  // `isChat` — the guard order below matters so this never reads a null body.
+  const rlCfg = requestLogConfig(d)
+  const logId = isChat && !remote && parsedBody && d.requestLog && rlCfg.enabled
+    ? d.requestLog.start({
+        source: 'openai',
+        harness: chatHarness,
+        codeSessionId: chatCodeSessionId,
+        modelKey: requestedModel || null,
+        remote: null,
+        stream: parsedBody.stream === true,
+        params: extractParams(parsedBody),
+        counts: summarizeRequest(parsedBody),
+        ...(rlCfg.captureBodies ? { requestBody: JSON.stringify(parsedBody) } : {}),
+      })
+    : null
+  let logFinalized = false
+  /** Idempotent, same pattern as `/v1/messages`' own `finalizeLog` above — every early-return
+   *  path from here on must go through this or the entry sits at `status: null` forever. */
+  const finalizeLog = (result: RequestLogFinal): void => {
+    if (!logId || logFinalized) return
+    logFinalized = true
+    d.requestLog!.finalize(logId, result)
+  }
+
   const requestStart = Date.now()
   let res: Response
   try {
@@ -967,18 +1079,12 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
     const err = e as Error & { cause?: unknown }
     const isAbort = err.name === 'AbortError' || ac.signal.aborted
     const cause = err.cause instanceof Error ? `: ${err.cause.message}` : ''
-    return c.json(
-      {
-        error: {
-          message: isAbort
-            ? 'Client disconnected before the engine responded.'
-            : `${err.message || 'Engine unreachable.'}${cause}`,
-          type: 'api_error',
-          code: isAbort ? 'client_disconnected' : 'engine_unreachable',
-        },
-      },
-      500,
-    )
+    const code = isAbort ? 'client_disconnected' : 'engine_unreachable'
+    const message = isAbort
+      ? 'Client disconnected before the engine responded.'
+      : `${err.message || 'Engine unreachable.'}${cause}`
+    finalizeLog({ status: 500, error: { code, message }, durationMs: Date.now() - requestStart })
+    return c.json({ error: { message, type: 'api_error', code } }, 500)
   }
 
   // Best-effort session-stats recording (B4) for OpenAI chat completions, fully
@@ -1001,22 +1107,37 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       // parser would silently see no matches and record nothing (GitHub #71: this
       // gap would have made external-client tracking wrong for a common case).
       const drain = parsedBody?.stream === true
-        ? recordOpenAiStreamUsage(d, b, 'openai', requestedModel || null, chatCodeSessionId, requestStart, chatHarness)
-        : recordOpenAiJsonUsage(d, b, 'openai', requestedModel || null, chatCodeSessionId, requestStart, chatHarness)
+        ? recordOpenAiStreamUsage(d, b, 'openai', requestedModel || null, chatCodeSessionId, requestStart, chatHarness, logId)
+        : recordOpenAiJsonUsage(d, b, 'openai', requestedModel || null, chatCodeSessionId, requestStart, chatHarness, logId)
       // Released when the teed copy finishes draining — i.e. when the engine has actually
       // stopped generating, NOT when this handler returns. Returning the streaming Response
       // hands bytes to the client while the engine is still busy, so releasing the slot here
       // would let the next queued request in on top of a still-running generation.
+      logFinalized = true // the drain above owns finalizing this entry now, not the fallback below
       void drain.finally(() => { d.manager.generationEnd(); chatGateRelease?.() })
       return new Response(a, { status: res.status, headers: res.headers })
-    } catch {
+    } catch (e) {
+      finalizeLog({ status: res.status, error: { code: 'tee_error', message: (e as Error)?.message || 'Failed to tee the response body.' } })
       chatGateRelease?.()
       return new Response(res.body, { status: res.status, headers: res.headers })
     }
   }
 
-  // Non-chat passthrough, or a chat response with no body to drain (an engine error) — nothing
-  // will ever call the drain's finally, so the slot has to be given back right here.
+  // Non-chat passthrough, or a chat response with no body to drain (an engine error, or —
+  // rarely — a 200 with an empty body) — nothing will ever call the drain's finally, so the
+  // slot has to be given back right here.
+  //
+  // Deliberately does NOT call `describeEngineError(res)` to enrich this log entry: that reads
+  // `res.text()`, which fully consumes `res.body` — and the code below still needs to hand that
+  // SAME body to the client unread (the whole point of a pass-through). A status-only message
+  // costs nothing to the stream; a detailed one would silently truncate every error response
+  // this branch forwards. Same "never touch the client-facing stream" rule the success path
+  // above follows via `tee()` instead.
+  finalizeLog(
+    res.ok
+      ? { status: res.status, durationMs: Date.now() - requestStart }
+      : { status: res.status, error: { code: 'engine_error', message: `Engine returned HTTP ${res.status}.` }, durationMs: Date.now() - requestStart },
+  )
   chatGateRelease?.()
   // ── No host filesystem detail crosses the façade (final-review M-6) ───────────────────
   // llama.cpp's error JSON routinely embeds absolute model and binary paths, and this line
@@ -1319,7 +1440,7 @@ function recordOpenAiUsage(d: Deps, oai: Record<string, unknown>, source: 'anthr
  *  stream; all errors are swallowed. `startedAt` (Date.now() at the ORIGINAL fetch call) —
  *  duration is computed here, at true completion, not at the call site (which fires before
  *  this drain even starts). */
-async function recordOpenAiJsonUsage(d: Deps, body: ReadableStream<Uint8Array>, source: 'anthropic' | 'openai', modelKey: string | null, codeSessionId: string | null = null, startedAt: number | null = null, harness: string | null = null): Promise<void> {
+async function recordOpenAiJsonUsage(d: Deps, body: ReadableStream<Uint8Array>, source: 'anthropic' | 'openai', modelKey: string | null, codeSessionId: string | null = null, startedAt: number | null = null, harness: string | null = null, logId: string | null = null): Promise<void> {
   try {
     const text = await new Response(body).text()
     const oai = JSON.parse(text) as Record<string, unknown>
@@ -1329,6 +1450,19 @@ async function recordOpenAiJsonUsage(d: Deps, body: ReadableStream<Uint8Array>, 
     // already existed for that path's OpenAI-shaped responses; nothing is forked.
     if (codeSessionId) {
       try { observeCodeSessionTurn(d, codeSessionId, openAiToolCalls(oai)) } catch { /* swallow */ }
+    }
+    // Developer request log (issue #211 follow-up) — same drained copy, no second parse.
+    if (logId && d.requestLog) {
+      const usage = oai.usage as { prompt_tokens?: number; completion_tokens?: number } | undefined
+      const timings = oai.timings as { prompt_per_second?: number; predicted_per_second?: number } | undefined
+      d.requestLog.finalize(logId, {
+        status: 200,
+        promptTokens: usage?.prompt_tokens, completionTokens: usage?.completion_tokens,
+        promptTps: timings?.prompt_per_second, genTps: timings?.predicted_per_second,
+        durationMs: startedAt != null ? Date.now() - startedAt : null,
+        finishReason: (oai.choices as Array<{ finish_reason?: string }> | undefined)?.[0]?.finish_reason ?? null,
+        responseBody: requestLogConfig(d).captureBodies ? text : undefined,
+      })
     }
   } catch { /* swallow — stats are best-effort */ }
 }
@@ -1375,58 +1509,58 @@ class StreamingToolCallAccumulator {
 /** Drain a teed copy of a streaming OpenAI SSE body to record final usage (B4) plus a
  *  durable `api_usage` row (GitHub #71). Never touches the client-facing stream; all
  *  errors are swallowed. `startedAt` — see recordOpenAiJsonUsage's doc comment; same reason. */
-async function recordOpenAiStreamUsage(d: Deps, body: ReadableStream<Uint8Array>, source: 'anthropic' | 'openai', modelKey: string | null, codeSessionId: string | null = null, startedAt: number | null = null, harness: string | null = null): Promise<void> {
+async function recordOpenAiStreamUsage(d: Deps, body: ReadableStream<Uint8Array>, source: 'anthropic' | 'openai', modelKey: string | null, codeSessionId: string | null = null, startedAt: number | null = null, harness: string | null = null, logId: string | null = null): Promise<void> {
+  // Developer request log (issue #211 follow-up): `captureBody` gates only whether the
+  // generated text is reassembled; TTFT/finish-reason are cheap enough to always track once
+  // `logId` exists.
+  const captureBody = logId ? requestLogConfig(d).captureBodies : false
+  let liveOut = 0 // running generated-token count for the live engine-card row
+  // Only allocated for a resolved Code session — a plain script's stream pays nothing.
+  const toolCalls = codeSessionId ? new StreamingToolCallAccumulator() : null
   try {
-    const reader = body.getReader()
-    const dec = new TextDecoder()
-    let buf = ''
-    let promptTokens = 0
-    let completionTokens = 0
-    let promptTps = 0
-    let genTps = 0
-    let liveOut = 0 // running generated-token count for the live engine-card row
-    // Only allocated for a resolved Code session — a plain script's stream pays nothing.
-    const toolCalls = codeSessionId ? new StreamingToolCallAccumulator() : null
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buf += dec.decode(value, { stream: true })
-      const lines = buf.split('\n')
-      buf = lines.pop() ?? ''
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue
-        const raw = line.slice(6).trim()
-        if (raw === '[DONE]') continue
-        let chunk: Record<string, unknown>
-        try { chunk = JSON.parse(raw) as Record<string, unknown> } catch { continue }
-        const usage = chunk.usage as { prompt_tokens?: number; completion_tokens?: number } | undefined
-        if (usage) {
-          if (usage.prompt_tokens) promptTokens = usage.prompt_tokens
-          if (usage.completion_tokens) completionTokens = usage.completion_tokens
-        }
-        const timings = chunk.timings as { prompt_per_second?: number; predicted_per_second?: number } | undefined
-        if (timings) {
-          if (timings.prompt_per_second) promptTps = timings.prompt_per_second
-          if (timings.predicted_per_second) genTps = timings.predicted_per_second
-        }
-        // Live token count for the engine card (each content chunk ≈ one token).
+    // The chunk-scan itself is shared with chat-upstream.ts's identical need (issue #211) —
+    // see `drainOpenAiSseForLog`'s own doc comment. `onChunk` carries everything that's
+    // specific to THIS call site: the live engine-card counter and terminal-agent tool-call
+    // accumulation, neither of which chat-upstream's capture needs.
+    const result = await drainOpenAiSseForLog(body, {
+      captureBody,
+      startedAt: startedAt ?? undefined,
+      onChunk: (chunk) => {
         const delta = (chunk.choices as Array<{ delta?: { content?: string; reasoning_content?: string } }> | undefined)?.[0]?.delta
         if (delta && (delta.content || delta.reasoning_content)) {
           try { d.manager.setLiveGen({ phase: 'gen', pct: 0, outputTokens: ++liveOut }) } catch { /* best-effort */ }
         }
         toolCalls?.observe(chunk)
-      }
-    }
+      },
+    })
+    const { promptTokens, completionTokens, promptTps, genTps, ttftMs, finishReason, responseText } = result
     if (codeSessionId && toolCalls) {
       try { observeCodeSessionTurn(d, codeSessionId, toolCalls.calls()) } catch { /* swallow */ }
     }
-    d.manager.recordCompletion({ inputTokens: promptTokens, outputTokens: completionTokens, promptTps, genTps })
+    d.manager.recordCompletion({ inputTokens: promptTokens, outputTokens: completionTokens, promptTps: promptTps ?? 0, genTps: genTps ?? 0 })
     d.db.recordApiUsage({
       source, modelKey, promptTokens, genTokens: completionTokens,
       codeSessionId, durationMs: startedAt != null ? Date.now() - startedAt : null, harness,
-      // Accumulated from the stream's own `timings` above (0 when the engine reported none —
+      // Accumulated from the stream's own `timings` above (null when the engine reported none —
       // recordApiUsage stores that as null, and the reader falls back to the old derivation).
-      promptTps, genTps,
+      promptTps: promptTps ?? undefined, genTps: genTps ?? undefined,
     })
-  } catch { /* swallow — stats are best-effort */ }
+    if (logId && d.requestLog) {
+      d.requestLog.finalize(logId, {
+        status: 200, promptTokens, completionTokens, promptTps, genTps, ttftMs, finishReason,
+        durationMs: startedAt != null ? Date.now() - startedAt : null,
+        responseBody: captureBody ? JSON.stringify({ content: responseText }) : undefined,
+      })
+    }
+  } catch (e) {
+    // The read loop itself failed (not "stats are best-effort" swallow-worthy from the log
+    // entry's point of view) — still finalize so the UI shows this request completed with an
+    // error, rather than sitting at "pending" forever.
+    if (logId && d.requestLog) {
+      d.requestLog.finalize(logId, {
+        status: null, error: { code: 'stream_read_error', message: (e as Error)?.message || 'Failed to read the engine stream.' },
+        durationMs: startedAt != null ? Date.now() - startedAt : null,
+      })
+    }
+  }
 }

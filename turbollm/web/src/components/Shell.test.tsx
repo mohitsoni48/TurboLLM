@@ -221,3 +221,27 @@ describe('Shell scroll mode', () => {
     }
   })
 })
+
+// Issue #211 follow-up: the rail dropped from 8 icons to 5 — Monitor and Usage folded into tabs
+// on Engines, Developer into a tab on Customize — because the founder's complaint was
+// specifically that 8 icons crowded the Android bottom bar. This locks the count and membership
+// down so a future addition has to make the same trade-off deliberately, not accidentally
+// regrow past 5.
+describe('Shell nav rail (issue #211 follow-up: 8 icons → 5)', () => {
+  it('renders exactly 5 nav destinations: Workspace, Models, Engines, Customize, Settings', () => {
+    const { unmount } = renderShell()
+    const rail = document.querySelectorAll('nav')[0] as HTMLElement
+    const labels = Array.from(rail.querySelectorAll('a[aria-label]')).map((el) => el.getAttribute('aria-label'))
+    expect(labels).toEqual(['Workspace', 'Models', 'Engines', 'Customize', 'Settings'])
+    unmount()
+  })
+
+  it('no longer links to the retired standalone Monitor, Usage, or Developer destinations', () => {
+    const { unmount } = renderShell()
+    const hrefs = Array.from(document.querySelectorAll('nav a')).map((a) => a.getAttribute('href'))
+    for (const retired of ['/monitor', '/usage', '/developer']) {
+      expect(hrefs).not.toContain(retired)
+    }
+    unmount()
+  })
+})

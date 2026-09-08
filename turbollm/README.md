@@ -439,6 +439,11 @@ connected); **Remove** undoes it.
   and percentages — pulled from `nvidia-smi`, WDDM counters, `rocm-smi`, AMD sysfs, `ioreg`,
   or `/proc` on Linux. Clicking the bar opens detailed gauges and sparklines in Settings → System.
   Toggle it off entirely from Settings → General.
+- **Engines → Monitor** puts the live engine log and those same hardware gauges on one
+  always-visible split screen, plus a second, LM Studio-style **developer request log**: every
+  completion the daemon serves — external API clients, Code sessions, in-app Chat — with
+  sampling params, timings, token counts, and (opt-in, off by default) full prompt/response
+  text. In-memory only; never written to disk or sent anywhere.
 
 </details>
 

@@ -29,10 +29,12 @@ const ChatScreen = lazy(() => import('./screens/ChatScreen').then((m) => ({ defa
 const SkillEditPage = lazy(() => import('./screens/skills/SkillEditPage').then((m) => ({ default: m.SkillEditPage })))
 const AgentEditPage = lazy(() => import('./screens/agents/AgentEditPage').then((m) => ({ default: m.AgentEditPage })))
 const ModelsScreen = lazy(() => import('./screens/ModelsScreen').then((m) => ({ default: m.ModelsScreen })))
-const TokensScreen = lazy(() => import('./screens/TokensScreen').then((m) => ({ default: m.TokensScreen })))
+// TokensScreen (Usage) and DeveloperScreen are no longer routed directly — issue #211's
+// follow-up folded them into EnginesScreen's "Usage" tab and CustomizeScreen's "Connect" tab
+// respectively (both via a static, non-lazy import inside those screens' own chunks).
+// MonitorScreen.tsx no longer exists — issue #211's follow-up moved it into EnginesScreen's
+// "Monitor" tab (screens/engines/MonitorTab.tsx).
 const EnginesScreen = lazy(() => import('./screens/EnginesScreen').then((m) => ({ default: m.EnginesScreen })))
-const MonitorScreen = lazy(() => import('./screens/MonitorScreen').then((m) => ({ default: m.MonitorScreen })))
-const DeveloperScreen = lazy(() => import('./screens/DeveloperScreen').then((m) => ({ default: m.DeveloperScreen })))
 const CustomizeScreen = lazy(() => import('./screens/CustomizeScreen').then((m) => ({ default: m.CustomizeScreen })))
 const SettingsScreen = lazy(() => import('./screens/SettingsScreen').then((m) => ({ default: m.SettingsScreen })))
 const OnboardingScreen = lazy(() => import('./screens/onboarding/OnboardingScreen').then((m) => ({ default: m.OnboardingScreen })))
@@ -262,10 +264,13 @@ export function App() {
             {/* Agents: managed from within Customize; this route is just the create/edit page. */}
             <Route path="/agents/:agentId" element={<AgentEditPage />} />
             <Route path="/models" element={<ModelsScreen />} />
-            <Route path="/usage" element={<TokensScreen />} />
             <Route path="/engines" element={<EnginesScreen />} />
-            <Route path="/monitor" element={<MonitorScreen />} />
-            <Route path="/developer" element={<DeveloperScreen />} />
+            {/* Issue #211 follow-up: Monitor and Usage folded into Engines' own tabs, Developer
+                into Customize's — these three redirects keep every pre-existing bookmark, doc
+                link, and ADR-409 deep link resolving instead of 404ing to Workspace. */}
+            <Route path="/monitor" element={<Navigate to="/engines?tab=monitor" replace />} />
+            <Route path="/usage" element={<Navigate to="/engines?tab=usage" replace />} />
+            <Route path="/developer" element={<Navigate to="/customize?tab=connect" replace />} />
             <Route path="/customize" element={<CustomizeScreen />} />
             <Route path="/settings" element={<SettingsScreen />} />
             <Route path="*" element={<Navigate to="/workspace/chat" replace />} />

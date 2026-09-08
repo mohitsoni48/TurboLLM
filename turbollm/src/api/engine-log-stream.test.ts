@@ -12,7 +12,7 @@
 // truncated lines — a fresh connection should instead start from the file's current end.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Hono } from 'hono'
@@ -133,5 +133,39 @@ test('GET /api/v1/engine/logs/stream: engine suite', async (t) => {
     const frame = await events.next()
     assert.equal(frame.event, 'line')
     assert.deepEqual(JSON.parse(frame.data), { line: 'engine two, line 2' })
+  })
+
+  // Perf follow-up coverage (docs/TODO.md, ADR-409 review item 2): the delta-read rewrite
+  // (readSync at a tracked byte offset instead of readFileSync-the-whole-file every tick)
+  // must still deliver every line, across multiple ticks, byte-for-byte — including a line
+  // whose content only becomes complete on a LATER write (a partial line held in `carry`)
+  // and a multi-byte UTF-8 character. Doesn't assert anything about the old implementation's
+  // performance (not observable from here) — only that the new read shape is still correct.
+  await t.test('multi-tick delta reads: every appended line arrives exactly once, including a multi-byte UTF-8 line', async () => {
+    const logD = join(dir, 'd.log')
+    writeFileSync(logD, 'seed\n')
+    const app = fakeApp(() => logD)
+
+    const res = await app.request('/api/v1/engine/logs/stream')
+    const events = sseEventReader(res.body!)
+    await new Promise((r) => setTimeout(r, 600)) // seed the cursor at the 1-line file's end
+
+    // Tick 1: two ASCII lines appended in one write.
+    appendFileSync(logD, 'line a\nline b\n')
+    assert.deepEqual(JSON.parse((await events.next()).data), { line: 'line a' })
+    assert.deepEqual(JSON.parse((await events.next()).data), { line: 'line b' })
+
+    // Tick 2: a multi-byte UTF-8 line (emoji + accented characters) — a byte-range read that
+    // happened to split this character mid-sequence would previously decode as U+FFFD; the
+    // persistent `TextDecoder({ stream: true })` must hold any split bytes across ticks.
+    appendFileSync(logD, 'GPU 温度 café 🚀\n')
+    assert.deepEqual(JSON.parse((await events.next()).data), { line: 'GPU 温度 café 🚀' })
+
+    // Tick 3: a line written WITHOUT a trailing newline yet must not be emitted early — it has
+    // to be held (`carry`) until the newline that completes it arrives in a later write.
+    appendFileSync(logD, 'partial-')
+    await new Promise((r) => setTimeout(r, 500)) // at least one more poll tick with no complete line
+    appendFileSync(logD, 'line c\n')
+    assert.deepEqual(JSON.parse((await events.next()).data), { line: 'partial-line c' })
   })
 })

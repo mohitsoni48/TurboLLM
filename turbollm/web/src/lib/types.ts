@@ -907,3 +907,32 @@ export type DownloadRecord = {
 export type DownloadsList = {
   downloads: DownloadRecord[]
 }
+
+// ── Developer request log (issue #211 follow-up) ─────────────────────────────
+// Mirrors turbollm/src/observability/request-log.ts's `RequestLogEntry` — kept as a hand-written
+// twin rather than a generated/shared type, matching every other daemon↔web type pair in this
+// file (e.g. EngineLogs, DownloadRecord).
+export type RequestLogSource = 'openai' | 'anthropic' | 'chat'
+
+export type RequestLogEntry = {
+  id: string
+  ts: number
+  source: RequestLogSource
+  harness: string | null
+  codeSessionId: string | null
+  modelKey: string | null
+  remote: string | null
+  stream: boolean
+  params: Record<string, unknown>
+  counts: { messages: number; tools: number; systemChars: number }
+  status: number | null
+  error: { code: string; message: string } | null
+  timings: { ttftMs: number | null; durationMs: number | null }
+  tokens: { prompt: number; completion: number; promptTps: number | null; genTps: number | null }
+  finishReason: string | null
+  bodies: { request: string; response: string } | null
+}
+
+export type RequestLogList = {
+  entries: RequestLogEntry[]
+}

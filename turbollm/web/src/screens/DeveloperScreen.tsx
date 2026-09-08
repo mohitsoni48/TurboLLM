@@ -99,7 +99,7 @@ export function DeveloperScreen() {
 
 // ── Connection (server URL + API keys) ────────────────────────────────────────
 
-function ConnectionPanel() {
+export function ConnectionPanel() {
   const { query, create, revoke } = useApiKeys()
   const { data: net } = useNetworkInfo()
   const [newName, setNewName] = useState('')
@@ -251,7 +251,7 @@ function ConnectionPanel() {
 
 // ── Connect an app ────────────────────────────────────────────────────────────
 
-function ConnectSection() {
+export function ConnectSection() {
   const { data: net } = useNetworkInfo()
   const [selected, setSelected] = useState<string>(CLI_LIST[0].id)
   const cli = CLI_LIST.find((c) => c.id === selected) ?? CLI_LIST[0]
@@ -369,7 +369,7 @@ const MCP_CLAUDE_CODE_SNIPPET: ConnectStep = {
   snippet: 'claude mcp add turbollm -- npx turbollm mcp-server',
 }
 
-function McpSection() {
+export function McpSection() {
   return (
     <section className="rounded-lg border border-border bg-panel p-4">
       <div className="mb-1 flex items-center gap-2">
@@ -422,7 +422,7 @@ function McpSection() {
 
 // ── API reference (collapsed) ─────────────────────────────────────────────────
 
-function ApiReferenceSection() {
+export function ApiReferenceSection() {
   const [open, setOpen] = useState(false)
   return (
     <Collapsible open={open} onOpenChange={setOpen} className="rounded-lg border border-border bg-panel p-4">

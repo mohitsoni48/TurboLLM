@@ -1,24 +1,34 @@
 import { useState, useMemo } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { ArrowLeft, Bot, Check, ChevronRight, Loader2, Pencil, Puzzle, Sparkles, Trash2, X } from 'lucide-react'
+import { ArrowLeft, Bot, Check, ChevronRight, Code2, Loader2, Pencil, Puzzle, Sparkles, Trash2, X } from 'lucide-react'
 import { ScreenHeader } from '../components/common'
 import { Button } from '../components/ui/button'
 import { toast } from '../components/ui/sonner'
-import { useMcpMutations, useSettings } from '../lib/queries'
+import { useMcpMutations, useSettings, useSysInfo } from '../lib/queries'
 import { ApiError, track } from '../lib/api'
 import type { McpServer, DaemonSettings, DaemonSettingsPatch } from '../lib/api'
 import { CLOUD_MCPS, LOCAL_MCPS, CLOUD_CATS, LOCAL_CATS, BUILTIN_SEARCH } from '../lib/mcp-catalog'
 import { useDocumentScroll } from '../lib/scroll-mode'
+import { isAndroidOs } from '../lib/platform'
 import type { CloudEntry, LocalEntry, BuiltinSearchEntry } from '../lib/mcp-catalog'
 import { BRAND_ICONS } from '../lib/brand-icons'
 import { cn } from '../lib/utils'
 import { SkillsLibrary } from './skills/SkillsLibrary'
 import { AgentsLibrary } from './agents/AgentsLibrary'
+// The former standalone Developer screen (issue #211 follow-up: 8-icon nav rail folded down to
+// 5). `DeveloperScreen.tsx` itself is UNCHANGED — these 4 sections are exported from it and
+// mounted directly here, under the `connect` tab, rather than nesting a second "Developer"
+// ScreenHeader inside this screen's own. `McpSection` is aliased: this file already defines its
+// OWN, unrelated `McpSection` further down (servers TurboLLM CALLS) — Developer's is the
+// opposite direction (TurboLLM AS an MCP server) and keeps its "TurboLLM MCP" heading, so the
+// two are distinguishable now that they sit one tab apart instead of two nav destinations apart.
+import { ApiReferenceSection, ConnectionPanel, ConnectSection, McpSection as TurboLlmMcpSection } from './DeveloperScreen'
 
 const CUSTOMIZE_TABS = [
-  { id: 'agents', label: 'Agents', icon: Bot },
-  { id: 'skills', label: 'Skills', icon: Sparkles },
-  { id: 'mcp',    label: 'MCP Servers', icon: Puzzle },
+  { id: 'agents',  label: 'Agents',      icon: Bot },
+  { id: 'skills',  label: 'Skills',      icon: Sparkles },
+  { id: 'mcp',     label: 'MCP Servers', icon: Puzzle },
+  { id: 'connect', label: 'Connect',     icon: Code2 },
 ] as const
 type CustomizeTab = (typeof CUSTOMIZE_TABS)[number]['id']
 
@@ -29,8 +39,13 @@ export function CustomizeScreen() {
   const settings = settingsQ.data
   const [searchParams, setSearchParams] = useSearchParams()
   const tabParam = searchParams.get('tab')
-  const activeTab: CustomizeTab = tabParam === 'mcp' ? 'mcp' : tabParam === 'skills' ? 'skills' : 'agents'
+  const activeTab: CustomizeTab =
+    tabParam === 'mcp' ? 'mcp' : tabParam === 'skills' ? 'skills' : tabParam === 'connect' ? 'connect' : 'agents'
   const setTab = (tab: CustomizeTab) => setSearchParams(tab === 'agents' ? {} : { tab }, { replace: true })
+  // "Connect an app" hands out one-command CLI setup snippets for a TERMINAL to run —
+  // meaningless on a phone. Same gate DeveloperScreen itself used to apply.
+  const sys = useSysInfo().data
+  const isAndroid = isAndroidOs(sys?.os ?? '')
 
   return (
     <div className="flex w-full flex-col gap-4 px-4 py-6 md:px-6">
@@ -60,11 +75,18 @@ export function CustomizeScreen() {
         <AgentsLibrary />
       ) : activeTab === 'skills' ? (
         <SkillsLibrary />
-      ) : (
+      ) : activeTab === 'mcp' ? (
         <McpSection
           servers={settings?.mcp?.servers ?? []}
           search={settings?.search ?? { provider: 'tavily', tavilyKeySet: false, kagiKeySet: false, searxngUrl: '' }}
         />
+      ) : (
+        <div className="flex flex-col gap-6">
+          <ConnectionPanel />
+          {!isAndroid && <ConnectSection />}
+          <TurboLlmMcpSection />
+          <ApiReferenceSection />
+        </div>
       )}
     </div>
   )

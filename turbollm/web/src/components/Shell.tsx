@@ -1,6 +1,6 @@
 import { type ReactNode, useEffect, useLayoutEffect } from 'react'
 import { Link, NavLink, useLocation, useNavigate } from 'react-router-dom'
-import { Activity, BarChart3, Boxes, Code2, Cpu, PanelsTopLeft, Puzzle, Settings2 } from 'lucide-react'
+import { Boxes, Cpu, PanelsTopLeft, Puzzle, Settings2 } from 'lucide-react'
 import { cn } from '../lib/utils'
 import { type ScrollMode, useScrollMode } from '../lib/scroll-mode'
 import type { Status } from '../lib/types'
@@ -19,14 +19,15 @@ import {
   TooltipTrigger,
 } from './ui/tooltip'
 
+// 5 entries (issue #211 follow-up, superseding ADR-409's 8): Monitor folded into Engines as a
+// tab, Usage into Engines, and Developer into Customize — see ADR-409's superseding entry in
+// decision-log.md for the full reasoning (mobile bottom-bar crowding at 8 icons, plus
+// telemetry showing `tokens`/`developer` as the two lowest-reach top-level destinations).
 const NAV = [
   { to: '/workspace', label: 'Workspace', icon: PanelsTopLeft },
   { to: '/models',    label: 'Models',    icon: Boxes },
   { to: '/engines',   label: 'Engines',   icon: Cpu },
-  { to: '/monitor',   label: 'Monitor',   icon: Activity },
   { to: '/customize', label: 'Customize', icon: Puzzle },
-  { to: '/usage',     label: 'Usage',     icon: BarChart3 },
-  { to: '/developer', label: 'Developer', icon: Code2 },
   { to: '/settings',  label: 'Settings',  icon: Settings2 },
 ] as const
 
@@ -56,10 +57,11 @@ export function Shell({
   const { pathname } = useLocation()
   const onOnboarding = pathname === '/onboarding'
 
-  // Issue #178: the long list-style screens (Models library, Engines, Developer, Customize, Usage,
-  // Settings) opt into scrolling the DOCUMENT via `useDocumentScroll()`; Chat / Workspace / Code /
-  // Discover stay in the bounded shell, where a pane must stay pinned while an inner list scrolls.
-  // See lib/scroll-mode.ts for why this is per-view rather than per-route.
+  // Issue #178: the long list-style screens (Models library, Engines, Customize, Settings — the
+  // former Developer/Usage screens still exist as tabs inside Customize/Engines respectively,
+  // issue #211 follow-up) opt into scrolling the DOCUMENT via `useDocumentScroll()`; Chat /
+  // Workspace / Code / Discover stay in the bounded shell, where a pane must stay pinned while an
+  // inner list scrolls. See lib/scroll-mode.ts for why this is per-view rather than per-route.
   // Hook called unconditionally (rules of hooks) — the `scroll` override is applied to its result.
   const requestedScroll = useScrollMode()
   const documentScroll = (scroll ?? requestedScroll) === 'document'
@@ -172,7 +174,7 @@ function NavRail({
     : 0
 
   // Keyboard shortcuts: Ctrl+1–9 (or Cmd+1–9 on Mac) navigate to the corresponding NAV item
-  // (currently 8 entries, so 9 is unused headroom for one more). Ignored when focus is in an
+  // (currently 5 entries, so 6–9 are unused headroom). Ignored when focus is in an
   // editable element. Adding/removing/reordering a NAV entry renumbers every shortcut after it —
   // intentional (the rail position is the source of truth), just worth knowing before moving one.
   useEffect(() => {
@@ -374,10 +376,10 @@ function MobileNav() {
                 wins regardless of whatever's failing to resolve the bare-attribute intrinsic
                 size here. */}
             <Icon size={20} className="h-5 w-5 shrink-0" />
-            {/* 8 items now (issue #211's Monitor tab): floors at the sum of the un-truncated
-                label widths without `min-w-0` on the flex-1 parent above — this keeps the bar
-                itself from forcing horizontal scroll on very narrow viewports, at the cost of
-                clipping a label there instead. */}
+            {/* Back down to 5 items (issue #211 follow-up, superseding the 8-icon bar ADR-409
+                shipped) — plenty of room now, but `min-w-0`+`truncate` stays as cheap insurance
+                against forcing horizontal scroll on a very narrow viewport, at worst clipping
+                a label there instead. */}
             <span className="max-w-full truncate px-0.5">{label}</span>
           </NavLink>
         )

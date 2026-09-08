@@ -3,13 +3,16 @@ import { useEngineLog } from '../../lib/use-engine-log'
 import { CopyButton } from '../../components/ui/copy-button'
 import { Switch } from '../../components/ui/switch'
 
-/** The Monitor screen's top pane (issue #211): the currently-loaded engine's log, always
- *  expanded (no Collapsible chrome — unlike `EngineLogPanel.tsx` on the Engines screen, this
- *  IS the screen, not a diagnostics drawer tucked under other content) and sized to fill
- *  whatever height the caller gives it rather than a fixed `max-h-80`.
+/** The Monitor tab's "Engine log" view (issue #211, relocated from a standalone `/monitor`
+ *  route into Engines by the same issue's follow-up), always expanded (no Collapsible chrome —
+ *  unlike `EngineLogPanel.tsx`'s collapsible diagnostics drawer, this IS the view, not
+ *  something tucked under other content) and sized to fill whatever height the caller gives it
+ *  rather than a fixed `max-h-80`.
  *
  *  Shares the fetch/SSE/auto-scroll/cap logic with `EngineLogPanel` via `useEngineLog` —
- *  only the chrome around it differs. */
+ *  only the chrome around it differs. Its sibling in the Monitor tab's segmented control,
+ *  `RequestsPanel`, is a DIFFERENT capture entirely (TurboLLM's own proxy layer, not the
+ *  engine's stderr) — see that file's own doc comment for why. */
 export function MonitorLogPanel({ hasEngine, isLoading }: { hasEngine: boolean; isLoading?: boolean }) {
   // Subscribe whenever an engine exists (starting/running/stopping all produce log output —
   // not just 'running'), same gate EnginesScreen uses to decide whether to mount the panel

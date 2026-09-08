@@ -1289,6 +1289,14 @@ function GitHubTokenSection({ tokenSet, onSaved }: { tokenSet: boolean; onSaved:
 function PrivacySection({ level, setLevel }: { level: TelemetryLevel; setLevel: (v: TelemetryLevel) => void }) {
   const [showPreview, setShowPreview] = useState(false)
   const { data: preview, isFetching } = useTelemetryPreview(showPreview ? level : null)
+  // Developer request log body capture (issue #211 follow-up): a separate privacy choice from
+  // telemetry above (nothing here is ever transmitted — it's an in-memory RAM buffer read only
+  // from Engines → Monitor → Requests) but the same KIND of choice ("should this app remember
+  // what I typed"), so it lives in this section rather than under Engines/Developer. Called
+  // fresh here rather than threaded through as a prop: this is the only place in Settings that
+  // needs it.
+  const { query: settingsQ, save } = useSettings()
+  const captureBodies = settingsQ.data?.requestLog?.captureBodies ?? false
 
   const options: { value: TelemetryLevel; label: string; desc: string }[] = [
     // The Off copy is deliberately literal (ADR-299 Decision 5). Choosing Off
@@ -1350,6 +1358,29 @@ function PrivacySection({ level, setLevel }: { level: TelemetryLevel; setLevel: 
           </div>
         )}
       </div>
+
+      {/* Developer request log body capture (issue #211 follow-up) — see this component's own
+          comment above `captureBodies` for why it lives here rather than under Engines. Same
+          checkbox-row pattern as "Show hardware monitor" above; also reachable from the gear
+          menu on Engines → Monitor → Requests itself, which patches the same setting. */}
+      <label className="mt-3 flex cursor-pointer items-start justify-between gap-3 border-t border-border pt-3">
+        <div>
+          <div className="text-[14px] font-medium text-ink">Log prompts and responses</div>
+          <div className="text-[12px] text-muted">
+            Engines → Monitor → Requests shows every completion this daemon serves (API clients,
+            Code, Chat) with sampling params, timings and token counts, regardless of this
+            setting. Turning this on ALSO captures the full prompt/response text for each one —
+            in memory on this machine only, never written to disk and never sent anywhere. Off by
+            default.
+          </div>
+        </div>
+        <input
+          type="checkbox"
+          checked={captureBodies}
+          onChange={(e) => { track('settings', 'toggle_request_log_bodies'); save.mutate({ requestLog: { captureBodies: e.target.checked } }) }}
+          className="mt-0.5 h-4 w-4 shrink-0 accent-[var(--accent)]"
+        />
+      </label>
 
       <SubmissionLog />
     </section>

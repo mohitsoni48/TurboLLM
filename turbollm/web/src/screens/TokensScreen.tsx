@@ -157,7 +157,9 @@ export function TokensScreen() {
   const isEmpty = data?.firstMessageAt === null && (data?.api.requests ?? 0) === 0
 
   return (
-    <div className="w-full px-4 py-6 md:px-6">
+    // `pt-4` not `py-6`: since issue #211's follow-up this is exclusively mounted as
+    // EnginesScreen's "Usage" tab body, whose own tab bar already owns the page's top padding.
+    <div className="w-full px-4 pb-6 pt-4 md:px-6">
       <ScreenHeader title="Usage" description="How much you've generated locally, over time." />
 
       {isLoading && (

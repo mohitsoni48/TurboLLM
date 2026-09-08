@@ -1084,7 +1084,7 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
         reqBody.tool_choice = { type: 'function', function: { name: 'web_search' } }
       }
 
-      const res = await callChatUpstream(upstream, reqBody, ac.signal)
+      const res = await callChatUpstream(upstream, reqBody, ac.signal, undefined, d)
 
       if (!res.ok || !res.body) {
         await emit({ event: 'error', data: { code: 'engine_error', message: `Engine returned ${res.status}` } })
@@ -1420,7 +1420,7 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
       }
       if (Object.keys(templateKwargs).length) reqBody.chat_template_kwargs = templateKwargs
 
-      const res = await callChatUpstream(upstream, reqBody, ac.signal)
+      const res = await callChatUpstream(upstream, reqBody, ac.signal, undefined, d)
 
       if (res.ok && res.body) {
         const reader = res.body.getReader()
@@ -1703,7 +1703,7 @@ async function autoTitle(
         max_tokens: 32,
         thinking_budget_tokens: 0,
         chat_template_kwargs: { enable_thinking: false },
-      }, AbortSignal.timeout(20_000))
+      }, AbortSignal.timeout(20_000), undefined, d)
     } finally {
       release?.()
     }

@@ -21,6 +21,48 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ---
 
+## [Unreleased]
+
+_Nothing yet._
+
+## [1.12.6] - 2026-09-08
+
+### Added
+
+- **A developer request log, under Engines → Monitor → Requests.** The engine's own log can
+  never show a request, a response, or a sampling parameter like temperature — TurboLLM now
+  captures that separately, at the proxy layer, so it works identically across every engine.
+  Every completion the daemon serves — external API clients (Claude Code, opencode, pi,
+  scripts), Code sessions, and in-app Chat — shows up with its harness, model, status, duration,
+  time-to-first-token, prompt→completion tokens, tokens/sec, and sampling params, filterable by
+  source with configurable columns. Click a row for a Params / Request / Response detail view.
+  Full prompt/response TEXT is opt-in ("Log prompts and responses" in the panel's gear menu or
+  Settings → Privacy & telemetry) and off by default; everything here is in-memory only on your
+  machine — never written to disk, never sent anywhere — and an Export JSONL button in the gear
+  menu is the only way to keep a copy.
+
+### Changed
+
+- **Left nav dropped from 8 icons to 5.** Monitor and Usage are now tabs on Engines; Developer
+  folded into a "Connect" tab on Customize (renamed from the old "Developer" screen — nothing
+  there changed, it just lives one click over now). Old links to `/monitor`, `/usage`, and
+  `/developer` still work and redirect to their new home.
+
+### Fixed
+
+- `GET /api/v1/engine/logs/stream` (Engines → Monitor's Engine log) was re-reading the whole log
+  file from disk every 400ms while open — harmless on a short log, but on a long verbose session
+  this periodically stalled other requests, including chat completions. It now reads only the
+  new bytes since the last check.
+
+### Discord
+- New: a developer request log under Engines → Monitor → Requests — see exactly what your engine
+  is being asked (params, timings, tokens) across the API, Code, and Chat, with an opt-in toggle
+  to also capture the full prompt/response text. Everything stays local, nothing is ever sent
+  anywhere.
+- The left nav is tidier: Monitor and Usage now live as tabs on Engines, and Developer moved into
+  Customize as a "Connect" tab — same features, fewer icons to scan.
+
 ## [1.11.9] - 2026-08-28
 
 ### Added
