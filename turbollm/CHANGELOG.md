@@ -23,7 +23,39 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **`npm i -g turbollm` failed outright with `'patch-package' is not recognized`**
+  ([#226](https://github.com/mohitsoni48/TurboLLM/issues/226)). v1.12.5 added a `postinstall`
+  script running `patch-package`, but npm does not install `devDependencies` for someone
+  installing the published package — so the binary was never there and every fresh install and
+  update hard-failed. The patch it was applying is a build-time concern that is not even
+  published (`patches/` is outside `files`), so it now runs via `prepare`, which fires in the
+  development repo and never for a registry install. A test fails the build if `postinstall`
+  is ever reintroduced.
+- **Extra command-line flags were passed to the engine as a single argument**
+  ([#221](https://github.com/mohitsoni48/TurboLLM/issues/221)). Typing `--load-mode dio` into
+  a model's "Extra command-line flags" produced one argv element containing a space, which
+  llama-server cannot parse — visible in the launch command as `"--load-mode dio"`. A flag and
+  its value can now be typed together and are split into real argv elements; quote a value that
+  itself contains spaces. Normalisation happens on every load, so profiles already saved with a
+  run-together flag repair themselves with no migration, and the HTTP API and a hand-edited
+  `config.json` get the same treatment. Stop strings are deliberately left alone, since a space
+  inside a stop sequence is meaningful.
+- **Repeated extra flags were silently dropped, and removing one chip removed all its
+  duplicates.** `--lora a.gguf --lora b.gguf` lost the second `--lora`, because the chip list
+  deduplicated by value and deleted by value. argv is a sequence, not a set.
+
+### Added
+
+- **Load mode and memory-mapping controls, under a model's Advanced settings**
+  ([#222](https://github.com/mohitsoni48/TurboLLM/issues/222)). `--load-mode` (whose `dio`
+  option uses direct I/O and skips the OS page cache — the usual pick when system RAM is tight)
+  and an explicit `--no-mmap` toggle. Both appear only on engine builds that actually advertise
+  them, and the load-mode choices are read from that engine's own `--help` rather than a
+  hardcoded list, so a fork's extra mode or an upstream rename needs no change here. An
+  untouched profile launches exactly as it did before. This is a deliberately curated pair, not
+  a return of the generic all-flags panel removed in v1.10.2.
 
 ## [1.12.6] - 2026-09-08
 
