@@ -72,7 +72,20 @@ export function CustomBuildDialog() {
 
           <DialogFooter>
             <Button variant="outline" onClick={() => { track('engines', 'cancel_custom_build_dialog'); setFormOpen(false) }}>Cancel</Button>
-            <Button onClick={() => { track('engines', 'continue_custom_build_dialog'); setFormOpen(false); setBuildOpen(true) }} disabled={!canContinue}>
+            <Button
+              onClick={() => {
+                track('engines', 'continue_custom_build_dialog')
+                setFormOpen(false)
+                // Defer to the next tick rather than opening BuildGuideDialog synchronously here.
+                // Both are separate Radix Dialog roots; closing one and mounting another inside the
+                // SAME click handler lets the new dialog's dismissable-layer see that very click as
+                // a "pointerdown outside" (its portal wasn't in the DOM yet when the event fired) and
+                // immediately close itself — a silent no-op with no error, no log line, nothing.
+                // Letting this dialog's close finish first avoids the race.
+                setTimeout(() => setBuildOpen(true), 0)
+              }}
+              disabled={!canContinue}
+            >
               Continue
             </Button>
           </DialogFooter>
