@@ -45,6 +45,13 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 - **Repeated extra flags were silently dropped, and removing one chip removed all its
   duplicates.** `--lora a.gguf --lora b.gguf` lost the second `--lora`, because the chip list
   deduplicated by value and deleted by value. argv is a sequence, not a set.
+- **`reasoning_effort: "none"` was ignored instead of turning thinking off**
+  ([#213](https://github.com/mohitsoni48/TurboLLM/issues/213)). opencode and other
+  OpenAI-compatible clients send the standard `"none"` for their no-reasoning option. TurboLLM
+  recognised `low`/`medium`/`high`/`xhigh` but not `"none"`, and an unrecognised value is
+  dropped rather than passed to the engine — so the setting silently did nothing and the model
+  kept thinking. `"none"` now turns thinking off, and OpenAI's `"minimal"` maps to the lowest
+  thinking level instead of being ignored.
 
 ### Added
 
