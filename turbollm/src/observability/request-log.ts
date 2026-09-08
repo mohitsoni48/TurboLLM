@@ -176,7 +176,7 @@ export class RequestLog {
       this.bodyBytes += byteLen(result.responseBody)
       this.evictToByteBudget()
     }
-    for (const fn of this.listeners) fn(entry)
+    this.notify(entry)
   }
 
   private append(entry: RequestLogEntry): void {
@@ -184,7 +184,19 @@ export class RequestLog {
     if (entry.bodies) this.bodyBytes += byteLen(entry.bodies.request) + byteLen(entry.bodies.response)
     while (this.entries.length > this.maxEntries) this.evictOldest()
     this.evictToByteBudget()
-    for (const fn of this.listeners) fn(entry)
+    this.notify(entry)
+  }
+
+  /** Every capture site calls `start`/`finalize` directly, mostly OUTSIDE their own try/catch
+   *  (the whole point is to observe a request without perturbing it) — a listener that throws
+   *  must never propagate out of here. Left unguarded, it would either break the real request
+   *  the caller is actually serving, or (worse, in gateway.ts/chat-upstream.ts's `.catch`-style
+   *  fallback finalizers) re-enter `finalize` and overwrite a just-recorded SUCCESS with a
+   *  spurious "drain failed" error. */
+  private notify(entry: RequestLogEntry): void {
+    for (const fn of this.listeners) {
+      try { fn(entry) } catch { /* a subscriber's own bug must never affect the capture site */ }
+    }
   }
 
   private evictToByteBudget(): void {

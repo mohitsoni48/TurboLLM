@@ -125,6 +125,18 @@ test('RequestLog: subscribe() fires on both start and finalize, unsubscribe stop
   assert.deepEqual(seen, [`${id}:pending`, `${id}:200`]) // unchanged after unsubscribe
 })
 
+test('RequestLog: a throwing subscriber never propagates out of start()/finalize(), and other subscribers still run', () => {
+  const log = new RequestLog()
+  const seen: string[] = []
+  log.subscribe(() => { throw new Error('a buggy subscriber') })
+  log.subscribe((e) => seen.push(`${e.id}:${e.status ?? 'pending'}`))
+
+  let id = ''
+  assert.doesNotThrow(() => { id = log.start(draft()) })
+  assert.doesNotThrow(() => log.finalize(id, { status: 200 }))
+  assert.deepEqual(seen, [`${id}:pending`, `${id}:200`])
+})
+
 test('extractParams: whitelists known sampling params, drops everything else', () => {
   const params = extractParams({
     temperature: 0.8, top_p: 0.9, messages: [{ role: 'user', content: 'hi' }],
