@@ -216,6 +216,10 @@ const TURBOLLM_KNOWLEDGE =
   '**BeeLlama.cpp** (Windows / Linux / macOS — GGUF):\n' +
   'llama.cpp fork adding variance-normalized KV-cache quantization (KVarN: `kvarn2`…`kvarn8`, set via `--cache-type-k`/`-v`), a KV precision tail, and adaptive DFlash speculative decoding. Build-from-source only. The KVarN types show up directly in the KV cache type dropdown (auto-discovered from the build\'s own --help output) but aren\'t in the auto-tune sweep yet — pick one manually.\n\n' +
 
+  '## Monitor\n\n' +
+  'Nav tab (rail order: Workspace, Models, Engines, Monitor, Customize, Usage, Developer, Settings) that puts the live engine log and system hardware stats on one always-visible, split screen — no more opening the Engines drawer or jumping to Settings → System to see them. Top half: the same log/auto-scroll behavior as the Engines diagnostics drawer (shows the last-loaded engine\'s log even after it stopped, gated on an engine being selected, not necessarily running). Bottom half: the same live CPU/RAM/GPU gauges and sparklines as Settings → System — same component, same data, so the two screens can never disagree.\n\n' +
+  '## Android app\n\n' +
+  'TurboLLM also ships as a native Android app (separate from `npx turbollm`) — the daemon runs inside the APK with a bundled Vulkan-accelerated engine for on-device GPU inference, no separate install step. The UI is the same shared codebase, adapted for a phone: Engines/Discover/Chat simplified, Code and Agents management hidden (desktop-only), model recommendations filtered to what the device can actually hold, and hardware Back / safe-area / swipe gestures behave like a native app. A fresh install starts on a lightweight default agent with thinking off, tuned for phone-class memory/compute.\n\n' +
   '## Gateway\n\n' +
   'TurboLLM at `http://localhost:6996` exposes:\n' +
   '- **OpenAI-compatible**: `POST /v1/chat/completions`, `GET /v1/models`, `POST /v1/embeddings`\n' +

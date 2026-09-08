@@ -628,7 +628,8 @@ Use `--config <file>` to point at an alternate config (its directory becomes the
 
   </details>
 
-- **Windows, macOS, or Linux.**
+- **Windows, macOS, or Linux** for `npx turbollm`. A native **Android app** also exists, with a
+  bundled Vulkan-accelerated engine — currently in closed/open testing, see turbollm.dev.
 - A GPU is recommended but **not required** — a CPU build is provisioned as a fallback.
 - On Windows, the first time the auto-downloaded `llama-server` runs, SmartScreen/Defender may
   prompt (it's an upstream binary). Allow it once.

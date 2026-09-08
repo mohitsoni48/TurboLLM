@@ -99,6 +99,10 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [1.12.5] - 2026-09-08
+
 ### Added
 
 - **A new Monitor tab** puts the live engine log and system hardware stats on one always-visible
@@ -106,6 +110,14 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   stats only living in Settings → System. The top half auto-tracks the running engine's log with
   a toggle to pause auto-scroll and review earlier output; the bottom half is the same live
   CPU/RAM/GPU gauges and sparklines Settings → System already shows.
+- **TurboLLM now runs as a native Android app.** The daemon ships inside the APK with a bundled
+  Vulkan-accelerated `llama-server` engine, so a phone can load and run a model with no separate
+  install step. The UI adapts for a phone: Engines, Discover, and Chat are simplified to the
+  screens that make sense on-device, model recommendations are filtered to what the device can
+  actually hold, a fresh install starts new chats on a lightweight agent with thinking off (to
+  fit a tighter memory/compute budget), and hardware Back, safe-area insets, and touch gestures
+  (like swiping between Engines pages) behave the way an Android app is expected to. GPU
+  detection now correctly reports the phone's real Vulkan GPU instead of "CPU-only."
 
 ### Fixed
 
@@ -117,6 +129,25 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   standard OpenAI `"high"` would 500 the whole turn. TurboLLM's gateway now translates and
   validates it directly, so it works no matter which engine build is installed, and `"high"`
   is mapped to Qwen3.8's own `"xhigh"` instead of erroring.
+- **The download button for a gated Hugging Face repo stayed disabled even with a valid token
+  configured** (#198). Gating actually has two independent halves — the license accepted on
+  huggingface.co, and a token saved in Settings → Models & loading — but only the token half is
+  visible to this screen, and the dialog was blocking on gated-ness alone regardless of it. A
+  configured token now lets the download through, and Hugging Face's own response (401/403) is
+  the authority on whether the license was actually accepted; the gated-repo notice now also
+  shows on the safetensors (MLX/vLLM) download path, which previously gave no explanation at all.
+
+### Discord
+
+- TurboLLM now runs as a native Android app — the daemon and a Vulkan-accelerated engine ship
+  inside the APK, so you can load and chat with a model right on your phone.
+- The Android app adapts to your device: simplified screens, model picks filtered to what your
+  phone can actually run, and a lighter default setup so chats stay fast on limited hardware.
+- A new Monitor tab shows the live engine log and hardware stats (CPU/RAM/GPU) together on one
+  screen instead of hunting through a drawer or Settings.
+- Fixed: a gated Hugging Face model's download button now works once you've added a token in
+  Settings, instead of staying greyed out regardless; and `reasoning_effort` from third-party
+  tools like opencode/LiteLLM now actually takes effect.
 
 ## [1.12.4] - 2026-09-05
 
