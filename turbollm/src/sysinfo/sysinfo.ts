@@ -395,7 +395,37 @@ function enumLinuxGpus(): GpuInfo[] {
     /* lspci not available (Android) — fall through to vulkaninfo */
   }
 
-  // 2) Android / Termux path (vulkaninfo)
+  // 2) Packaged Android app: ask the bundled Vulkan engine itself, via its own
+  // `--list-devices` (the same real device probe already confirmed working live — it's how
+  // "Vulkan0: Mali-G78 (6267 MiB, 6267 MiB free)" was found during the Galaxy S21 FE bring-up).
+  // `vulkaninfo` (the Termux path below) is a real Termux package the app never bundles and can
+  // never exec, so it always failed silently and the app reported "CPU-only" even once this
+  // exact engine loaded and served real completions. The engine only ships when its build
+  // pipeline embedded `libllama_server_vk.so` (build.gradle.kts's turbollmVulkanEngine flag),
+  // so its presence is the same "was this shipped" signal seed.ts's ensureAndroidBundledEngine
+  // already keys its own registration off of.
+  const nativeLibDir = process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR
+  if (process.platform === 'android' && nativeLibDir) {
+    const vkBin = `${nativeLibDir}/libllama_server_vk.so`
+    if (!fs.existsSync(vkBin)) return []
+    try {
+      const out = execFileSync(vkBin, ['--list-devices'], { timeout: 8000 }).toString()
+      // e.g. "  Vulkan0: Mali-G78 (3827 MiB, 3827 MiB free)"
+      const m = out.match(/^\s*Vulkan\d+:\s*(.+?)\s*\((\d+)\s*MiB/m)
+      if (m) {
+        const name = m[1].trim()
+        const vramMb = parseInt(m[2], 10) || Math.round((os.totalmem() / 1e6) * 0.5)
+        return [{ name, vramMb, vendor: classifyVendor(name), unified: true }]
+      }
+    } catch {
+      // The bundled engine failed to even enumerate a device — e.g. the RMX1921's Adreno 616,
+      // whose driver reports Vulkan 1.1 and refuses to init at all. Fall through to "no GPU"
+      // (llama-server-android, the CPU engine, is still registered and works).
+    }
+    return []
+  }
+
+  // 3) Android / Termux path (vulkaninfo)
   // lspci doesn't exist on Android. We fall back to vulkaninfo, which queries
   // the Vulkan loader directly. This correctly identifies Mali/Adreno GPUs.
   return enumVulkanGpus()
