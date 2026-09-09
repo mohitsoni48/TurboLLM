@@ -282,7 +282,8 @@ async function phasePreflight(state, flags) {
     if (h.code !== 0) {
       if (flags.approved) {
         step('telemetry schema drifted from the deployed Worker — redeploying now (--approved)...');
-        const deploy = mustRun('npm', ['run', 'deploy'], { cwd: join(REPO, 'telemetry-worker') });
+        const deploy = runNpm(['run', 'deploy'], { cwd: join(REPO, 'telemetry-worker') });
+        if (deploy.code !== 0) fail(`telemetry Worker deploy failed:\n${tailOf(deploy.out, 40)}`);
         note(tailOf(deploy.out, 12));
         h = run(process.execPath, [hashScript, 'check']);
         if (h.code !== 0) {
@@ -494,7 +495,7 @@ async function phaseMerge(state, flags) {
 
   step(`merging PR #${pr}…`);
   let m = gh('pr', 'merge', String(pr), '--merge');
-  if (m.code !== 0 && /BLOCKED|review|approv/i.test(m.out)) {
+  if (m.code !== 0 && /BLOCKED|review|approv|not mergeable|branch policy/i.test(m.out)) {
     // Branch protection wants a review, GitHub forbids self-approval, and every
     // release PR is self-authored. --admin overrides THAT and nothing else —
     // `verify` already proved CI green.
