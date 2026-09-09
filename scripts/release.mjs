@@ -63,6 +63,11 @@ const PHASES = [
   { name: 'merge', requires: ['verify'], mandatory: true, approval: true },
   { name: 'publish', requires: ['merge'], mandatory: true, approval: true },
   { name: 'announce', requires: ['publish'], mandatory: false, approval: true },
+  // Runs once CI is green (requires only `verify`, not `merge`/`publish` — a
+  // different flow from the npm/desktop cycle by explicit founder direction,
+  // ADR-411: local build, no Opus review gate, no `gh pr checks` of its own).
+  // Optional: not every checkout has the private TurboLLM Android/ repo.
+  { name: 'android', requires: ['verify'], mandatory: false, approval: true },
   { name: 'docs-drain', requires: ['publish'], mandatory: true, approval: false },
 ];
 const PHASE_NAMES = PHASES.map((p) => p.name);
@@ -757,6 +762,95 @@ async function waitForDesktopAssets(tag, timeoutMs) {
   }
 }
 
+// ── phase: android (optional, gated) ─────────────────────────────────────────
+// Mirrors docs/RELEASE.md's Android section exactly — same commands, same
+// order. Different flow from the npm/desktop cycle by explicit founder
+// direction (ADR-411): local build, no CI of its own, no Opus review gate.
+// `requires: ['verify']` (not merge/publish) is the "runs once CI is green"
+// placement — it does not wait on the npm publish, since the two ship
+// independently. Gated behind --approved: publishReleaseBundle/promote hit
+// the real Play Console the moment they run — same bar as npm publish.
+const ANDROID_DIR = () => join(REPO, 'TurboLLM Android');
+const GRADLEW = WIN ? 'gradlew.bat' : './gradlew';
+
+async function phaseAndroid(state, flags) {
+  const dir = ANDROID_DIR();
+  const out = [];
+  const note = (s) => { out.push(s); step(s); };
+
+  if (!existsSync(dir)) {
+    warnLine(`"${dir}" not found — skipping (this checkout doesn't have the private Android repo)`);
+    return 'skipped: TurboLLM Android/ not present in this checkout';
+  }
+  if (!existsSync(join(dir, GRADLEW))) {
+    warnLine(`${GRADLEW} not found in "${dir}" — skipping`);
+    return `skipped: ${GRADLEW} not present`;
+  }
+
+  if (!flags['dry-run']) {
+    requireApproval(flags, 'publishing the Android app to Play Console (internal + alpha + beta, real users)');
+  }
+
+  const vulkan = !flags['skip-vulkan-engine'];
+  const vulkanFlag = vulkan ? ['-PturbollmVulkanEngine=true'] : [];
+
+  // 1. Vulkan engine — only buildable inside WSL2/Linux (docs/RELEASE.md
+  //    Android §2). A founder running this from plain Windows PowerShell is
+  //    a real, expected case — warn and ship CPU-only rather than fail, same
+  //    as the runbook's own guidance.
+  if (vulkan) {
+    if (WIN) {
+      warnLine(
+        'Windows host — the Vulkan engine step needs WSL2. Run `bash "TurboLLM Android/scripts/build-vulkan-engine.sh"` '
+        + 'and `stage-vulkan-engine.sh` there first, or pass --skip-vulkan-engine to ship CPU-only on purpose.',
+      );
+      out.push('WARN vulkan engine not built from this host — ships whatever .so (if any) is already staged, or CPU-only');
+    } else if (flags['dry-run']) {
+      note('[dry-run] would build + stage the Vulkan engine');
+    } else {
+      step('building + staging the Vulkan engine (WSL2/Linux)…');
+      mustRun('bash', [join(dir, 'scripts', 'build-vulkan-engine.sh')], { cwd: dir });
+      mustRun('bash', [join(dir, 'scripts', 'stage-vulkan-engine.sh')], { cwd: dir });
+      note('Vulkan engine built + staged');
+    }
+  } else {
+    note('--skip-vulkan-engine passed — building CPU-only on purpose');
+  }
+
+  if (flags['dry-run']) {
+    return `${out.join('\n')}\n[dry-run] would: bundleRelease, publishReleaseBundle → internal, promote → alpha + beta, publishReleaseListing`;
+  }
+
+  // 2. Signed release bundle (signing + service-account creds already wired
+  //    through the gitignored local.properties — no extra setup here).
+  step('building the signed release bundle…');
+  mustRun(GRADLEW, ['bundleRelease', ...vulkanFlag], { cwd: dir });
+  note('release bundle built (composeApp-release.aab)');
+
+  // 3. Upload once to internal (cheapest, always accepts a fresh version
+  //    code), then PROMOTE that same version code — never re-run
+  //    publishReleaseBundle per track (Play's version code is strictly
+  //    increasing across every track combined, not per-track; ADR-412).
+  step('uploading to Play Console (track: internal)…');
+  mustRun(GRADLEW, ['publishReleaseBundle', ...vulkanFlag, '-PturbollmPlayTrack=internal'], { cwd: dir });
+  note('uploaded to internal');
+
+  for (const track of ['alpha', 'beta']) {
+    step(`promoting internal → ${track}…`);
+    mustRun(GRADLEW, ['promoteReleaseArtifact', '--from-track', 'internal', '--promote-track', track], { cwd: dir });
+    note(`promoted to ${track}`);
+  }
+
+  // 4. Store listing — fully automated (ADR-413), reads play-store-assets/
+  //    every run, so it always matches whatever that currently says.
+  step('syncing the store listing (publishReleaseListing)…');
+  mustRun(GRADLEW, ['publishReleaseListing'], { cwd: dir });
+  note('store listing synced');
+
+  okLine('Android release published (internal + alpha + beta), listing synced');
+  return out.join('\n');
+}
+
 // ── phase: announce ──────────────────────────────────────────────────────────
 // Dry-run by default; posting needs --approved. The helper is local-only
 // (docs/ is gitignored from this repo), so its absence is not fatal in a fresh
@@ -857,6 +951,7 @@ const RUNNERS = {
   verify: phaseVerify,
   merge: phaseMerge,
   publish: phasePublish,
+  android: phaseAndroid,
   announce: phaseAnnounce,
   'docs-drain': phaseDocsDrain,
 };
@@ -871,17 +966,19 @@ Phases, in order:
   prepare      version bump (daemon + wrapper) · changelog gate · README mirror · web build · commit + push
   verify       gh pr checks, with the one-shot rerun on a runner-acquisition failure
   merge        gh pr merge --admin · delete the branch · poll the post-merge main run   [--approved]
-  publish      tag · gh release create · npm publish via token · poll npm view · check CI installers  [--approved]
+  publish      tag · gh release create · wait for npm-publish.yml (OIDC) or fall back to token · poll npm view · check CI installers  [--approved]
+  android      optional: TurboLLM Android/ — Vulkan build (WSL2) · bundleRelease · publish internal → promote alpha+beta · sync listing  [--approved]
   announce     Discord post — --dry-run by default, posting needs --approved
   docs-drain   validate docs/CHANGELOG.md top == this version and TODO.md is drained
   report       print the receipt; exits non-zero if a mandatory phase never completed
 
 Options:
   --version X.Y.Z   the version being released (required unless it is already the only run in .omc/release)
-  --approved        the human gate for merge / npm publish / the Discord post — never inferred
+  --approved        the human gate for merge / npm publish / Android publish / the Discord post — never inferred
   --dry-run         do everything read-only that can be; print what would happen for the rest
   --pr <N>          the release PR number (otherwise resolved from the current branch)
   --verdict "…"     review only: the recorded review outcome
+  --skip-vulkan-engine   android only: ship CPU-only on purpose instead of building the WSL2 Vulkan engine
   --summary "…"     prepare only: the one-line summary in the release commit message
   --skip-desktop    publish only: warn instead of failing when CI installers are missing
   --resume          re-run a phase already recorded ok (otherwise it is reported and skipped)
@@ -912,6 +1009,7 @@ async function main() {
         'dry-run': { type: 'boolean', default: false },
         resume: { type: 'boolean', default: false },
         'skip-desktop': { type: 'boolean', default: false },
+        'skip-vulkan-engine': { type: 'boolean', default: false },
         pr: { type: 'string' },
         verdict: { type: 'string' },
         summary: { type: 'string' },
