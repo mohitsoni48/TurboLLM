@@ -56,6 +56,10 @@ _Nothing yet._
   dropped rather than passed to the engine — so the setting silently did nothing and the model
   kept thinking. `"none"` now turns thinking off, and OpenAI's `"minimal"` maps to the lowest
   thinking level instead of being ignored.
+- **"Add via git repo" → Continue did nothing** ([#228](https://github.com/mohitsoni48/TurboLLM/pull/228)).
+  Clicking Continue closed the form and returned you to the engine list with no error and no log
+  line, because the build-guide dialog that should have opened saw the very click that opened it
+  as an outside click and closed itself again.
 
 ### Added
 
@@ -82,6 +86,8 @@ _Nothing yet._
   appear only if your engine build supports them.
 - Turning reasoning off from opencode or another OpenAI-compatible client now works. Sending
   `reasoning_effort: "none"` was being ignored, so the model kept thinking anyway.
+- Adding an engine via a git repo works again — Continue used to just drop you back at the engine
+  list without saying why.
 
 ## [1.12.6] - 2026-09-08
 
