@@ -266,17 +266,38 @@ async function phasePreflight(state, flags) {
 
   // 4. telemetry schema-hash gate — run the SAME script CI runs, never a
   //    re-implementation of its hashing rules (it hashes the whole telemetry/
-  //    tree, not just schema.ts). Catching it here saves a red PR.
+  //    tree, not just schema.ts). ADR-331: a client-first schema/Worker
+  //    mismatch silently drops events at the edge with no error anywhere a
+  //    human would see it — it once cost 2 days of `first_chat` data. So this
+  //    is not just checked, it is FIXED here: on drift, with --approved, the
+  //    script redeploys the Worker itself (same as `cd telemetry-worker &&
+  //    npm run deploy` — deploys, records the hash, fires the canary that
+  //    proves the live pipe accepts every real event name) rather than just
+  //    telling a human to go run that command by hand. Without --approved it
+  //    still only reports — a Worker deploy is production infra, so the same
+  //    approval bar as merge/publish/announce applies.
   const hashScript = join(REPO, 'telemetry-worker', 'scripts', 'schema-hash.mjs');
   if (existsSync(hashScript)) {
-    const h = run(process.execPath, [hashScript, 'check']);
+    let h = run(process.execPath, [hashScript, 'check']);
     if (h.code !== 0) {
-      problems.push(
-        'telemetry schema-hash gate is RED — the telemetry sources changed since the Worker was deployed.\n'
-        + `  ${tailOf(h.out, 4).replace(/\n/g, '\n  ')}\n`
-        + '  Fix: `cd telemetry-worker && npm run deploy` (deploys, records the hash, fires the canary), then commit deployed.schema.sha256 in this PR.\n'
-        + '  Client-first ordering silently drops events at the edge — this must be green BEFORE the release PR merges.',
-      );
+      if (flags.approved) {
+        step('telemetry schema drifted from the deployed Worker — redeploying now (--approved)...');
+        const deploy = mustRun('npm', ['run', 'deploy'], { cwd: join(REPO, 'telemetry-worker') });
+        note(tailOf(deploy.out, 12));
+        h = run(process.execPath, [hashScript, 'check']);
+        if (h.code !== 0) {
+          problems.push('telemetry Worker deploy ran but the schema hash still does not match — inspect `telemetry-worker/scripts/schema-hash.mjs check` output above by hand before continuing.');
+        } else {
+          note('telemetry Worker redeployed — schema hash now matches (commit the updated deployed.schema.sha256 in this PR)');
+        }
+      } else {
+        problems.push(
+          'telemetry schema-hash gate is RED — the telemetry sources changed since the Worker was deployed.\n'
+          + `  ${tailOf(h.out, 4).replace(/\n/g, '\n  ')}\n`
+          + '  Re-run `preflight --approved` to have the script redeploy the Worker itself (this is a production infra change, so it needs the same approval as merge/publish), or run `cd telemetry-worker && npm run deploy` by hand.\n'
+          + '  Client-first ordering silently drops events at the edge — this must be green BEFORE the release PR merges.',
+        );
+      }
     } else note('telemetry schema hash matches the deployed Worker');
   } else {
     warnLine(`${hashScript} not found — skipping the telemetry gate`);
