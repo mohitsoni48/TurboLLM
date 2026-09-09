@@ -358,6 +358,24 @@ export interface CodeConfig {
 export interface CloudDeployConfig {
   runpodTemplateId: string
 }
+
+/** App-level auto-update settings (spec 29 B.4). Deliberately reuses the per-engine
+ *  update vocabulary (`normalizeUpdatePolicy`, engines/update.ts: `off | notify | auto`,
+ *  default `notify`) rather than inventing a second one — a user who has learned what
+ *  "notify" means for an engine must not have to learn a different meaning for the app.
+ *
+ *  `dismissedVersion` is the "don't nag me twice for the same release" memory (spec 29
+ *  B.3): the exact `latest` string the user dismissed the toast for. Daemon-side rather
+ *  than browser-side deliberately — the same install is reached from several browsers
+ *  (and from the desktop wrapper), and a per-browser memory would re-nag on each one. */
+export interface AppUpdateConfig {
+  /** `off` = never check/surface, `notify` = show the pill + one toast (default),
+   *  `auto` = apply at the next idle moment (desktop: download in the background and
+   *  install on quit). */
+  policy: string
+  /** The `latest` version whose toast the user dismissed, or '' when none. */
+  dismissedVersion: string
+}
 /** A user-created chat Agent (Customize → Agents): a named system prompt with a
  *  scoped skill + tool allow-list, selected when starting a new conversation —
  *  distinct from {@link AgentType} below, which scopes the separate pi-driven
@@ -531,6 +549,8 @@ export interface Config {
   code: CodeConfig
   /** Cloud Launch deploy-link settings (ADR-153). */
   cloudDeploy: CloudDeployConfig
+  /** App-level auto-update policy + dismissed-toast memory (spec 29 B.4). */
+  appUpdate: AppUpdateConfig
   devModel?: DevModel
   /** Onboarding progress (spec 25 §3, ADR-338). Absent on pre-v1.11 configs;
    *  `normalizeOnboarding` supplies the default, so no migration step is needed. */
@@ -679,6 +699,7 @@ export function defaultConfig(): Config {
     build: { toolchainDirs: [] },
     code: { agentsMdProjectCandidates: ['AGENTS.md', 'agents.md', 'CLAUDE.md'], agentsMdGlobalCandidates: ['agents.md', 'AGENTS.md', 'CLAUDE.md'], defaultAgent: 'turbollm' },
     cloudDeploy: { runpodTemplateId: '' },
+    appUpdate: { policy: 'notify', dismissedVersion: '' },
   }
 }
 
@@ -1117,6 +1138,15 @@ function normalize(c: Config): void {
   // Cloud Launch deploy-link settings (ADR-153): absent in pre-ADR-153 configs → ''.
   const cd = (c.cloudDeploy ?? {}) as Partial<CloudDeployConfig>
   c.cloudDeploy = { runpodTemplateId: typeof cd.runpodTemplateId === 'string' ? cd.runpodTemplateId.trim() : '' }
+  // App auto-update settings (spec 29 B.4): absent in pre-this-feature configs → the
+  // 'notify' default. The policy string is NOT validated here — `normalizeUpdatePolicy`
+  // (engines/update.ts) already maps anything unrecognized to 'notify' at every read
+  // site, which is the same one-source-of-truth arrangement the per-engine policy uses.
+  const au = (c.appUpdate ?? {}) as Partial<AppUpdateConfig>
+  c.appUpdate = {
+    policy: typeof au.policy === 'string' ? au.policy : 'notify',
+    dismissedVersion: typeof au.dismissedVersion === 'string' ? au.dismissedVersion : '',
+  }
   // Experimental feature flags (2026-07-14): absent in pre-this-decision configs → default
   // false for cloudDeploy, same conservative posture as lanBind. `memory` is the one
   // exception: a config that ALREADY had autoMemoryEnabled=true (the user had genuinely opted

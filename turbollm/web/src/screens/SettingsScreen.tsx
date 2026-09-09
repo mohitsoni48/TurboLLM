@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
-import { Moon, Sun, Monitor, Save, ExternalLink, ShieldAlert, RefreshCw, Check, X, Loader2, AlertTriangle, ArrowUpCircle, SlidersHorizontal, Boxes, ShieldCheck, Wifi, Cpu, ChevronRight, FlaskConical } from 'lucide-react'
+import { Moon, Sun, Monitor, Save, ExternalLink, ShieldAlert, RefreshCw, Check, X, Loader2, AlertTriangle, SlidersHorizontal, Boxes, ShieldCheck, Wifi, Cpu, ChevronRight, FlaskConical } from 'lucide-react'
 import { getPersonalization, savePersonalization, type Personalization } from '../lib/personas'
 import { ScreenHeader } from '../components/common'
+import { AppUpdateSettingsBlock } from '../components/AppUpdateControl'
 import { Button } from '../components/ui/button'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../components/ui/collapsible'
 import { cn } from '../lib/utils'
@@ -19,14 +20,12 @@ import {
   useTelemetryLog,
   useRegenerateMachineId,
   useAppUpdate,
-  useSysInfo,
 } from '../lib/queries'
-import { CopyButton } from '../components/ui/copy-button'
 import { ModelDirs } from './models/ModelDirs'
 import { ToolPermissionsSection } from './settings/ToolPermissionsSection'
 import { CodeContextSection } from './settings/CodeContextSection'
 import { CodeAgentSection } from './settings/CodeAgentSection'
-import { useCodeFeatureEnabled, isAndroidOs } from '../lib/platform'
+import { useCodeFeatureEnabled } from '../lib/platform'
 import { MemorySection } from './settings/MemorySection'
 import { ExperimentalSection } from './settings/ExperimentalSection'
 import { TurboLinkSection } from './settings/TurboLinkSection'
@@ -1631,13 +1630,14 @@ function PersonalizationSection() {
   )
 }
 
-// ── About + app self-update check (F-006, ADR-031) ────────────────────────────
-// Shows the running version and, when npm has a newer TurboLLM, an "update available"
-// chip with the install command to copy. Informational only — npm performs the upgrade;
-// the app never auto-updates itself. Offline-silent: when the npm check couldn't run we
-// just show the current version with no error (never a false "up to date").
-
-const APP_UPDATE_COMMAND = 'npm i -g turbollm'
+// ── About + app self-update (F-006, ADR-031; spec 29 B.3/B.4) ─────────────────
+// Shows the running version. Everything below it — the "update available" block, the
+// update dialog, and the off|notify|auto policy — is `AppUpdateSettingsBlock`, the SAME
+// component the NavRail's version pill mounts. Two mounts, one implementation: the whole
+// point (spec 29 B.3) is that these two surfaces cannot disagree about whether an update
+// exists or what pressing the button does, which two hand-kept copies would eventually do.
+//
+// This section used to own that markup itself, and could only offer a command to copy.
 
 function AboutSection() {
   // The running version always comes from /status (present immediately); the npm
@@ -1645,14 +1645,6 @@ function AboutSection() {
   const { data: status } = useStatus()
   const { data: update } = useAppUpdate()
   const installed = update?.installed || status?.version || ''
-  // The Android app's real update path is a new Play Store release, not `npm i -g turbollm` —
-  // there is no terminal to run it in and no npm on the device. `hasUpdate` therefore stays
-  // false on Android regardless of what the npm registry check says, hiding only the
-  // actionable banner below. The plain version row and the "you're on the latest version"
-  // confirmation (an npm-vs-bundled-daemon fact, not an instruction) stay on every platform —
-  // neither one implies an action a phone can't take.
-  const sys = useSysInfo().data
-  const hasUpdate = !!update?.hasUpdate && !!update?.latest && !isAndroidOs(sys?.os ?? '')
 
   return (
     <section className="rounded-lg border border-border bg-panel p-4">
@@ -1666,31 +1658,7 @@ function AboutSection() {
         <span className="font-mono text-[13px] text-ink">{installed ? `v${installed}` : '—'}</span>
       </div>
 
-      {hasUpdate ? (
-        <div
-          className="mt-2 flex flex-col gap-2 rounded-md border p-3"
-          style={{
-            borderColor: 'color-mix(in srgb, var(--accent) 40%, var(--border))',
-            background: 'color-mix(in srgb, var(--accent) 6%, transparent)',
-          }}
-        >
-          <div className="flex items-center gap-2 text-[13px] font-medium" style={{ color: 'var(--accent)' }}>
-            <ArrowUpCircle size={15} />
-            TurboLLM v{update!.latest} is available
-          </div>
-          <div className="text-[12px] text-muted">Update from your terminal:</div>
-          <div className="flex items-center justify-between gap-2 rounded-md border border-border bg-bg px-2.5 py-1.5">
-            <code className="select-all font-mono text-[12px] text-ink">{APP_UPDATE_COMMAND}</code>
-            <CopyButton text={APP_UPDATE_COMMAND} screen="settings" />
-          </div>
-        </div>
-      ) : update?.latest && !update.hasUpdate ? (
-        // Checked successfully and current — a quiet confirmation, no call to action.
-        <div className="mt-1 inline-flex items-center gap-1.5 text-[12px] text-faint">
-          <Check size={13} style={{ color: 'var(--ok)' }} />
-          You're on the latest version
-        </div>
-      ) : null}
+      <AppUpdateSettingsBlock />
     </section>
   )
 }

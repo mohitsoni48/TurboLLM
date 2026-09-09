@@ -47,6 +47,8 @@ import {
   updateLlamafile,
   getEngineUpdates,
   getAppUpdate,
+  setAppUpdatePolicy,
+  dismissAppUpdate,
   setEngineUpdatePolicy,
   getStatus,
   getTokenUsage,
@@ -455,6 +457,35 @@ export function useAppUpdate(): UseQueryResult<AppUpdate> {
     refetchIntervalInBackground: false,
     staleTime: 60_000,
     retry: false,
+  })
+}
+
+/** Set the app-level auto-update policy (off | notify | auto).
+ *
+ *  Note what is deliberately NOT here: applying the update and polling its progress. Those
+ *  two calls are made directly against `api.ts` from `AppUpdateControl`, because they run
+ *  THROUGH a daemon restart — every request in that window legitimately fails, and a query
+ *  hook's error/retry semantics would render that expected downtime as a failure. The
+ *  dialog needs "a rejection means still restarting", which is a plain poll loop, not a
+ *  query. */
+export function useAppUpdatePolicyMutation() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (policy: UpdatePolicy) => setAppUpdatePolicy(policy),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: queryKeys.appUpdate })
+    },
+  })
+}
+
+/** Remember a dismissed version so the toast never fires twice for the same release. */
+export function useDismissAppUpdateMutation() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (version: string) => dismissAppUpdate(version),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: queryKeys.appUpdate })
+    },
   })
 }
 

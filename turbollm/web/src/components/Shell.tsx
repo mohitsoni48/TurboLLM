@@ -13,6 +13,7 @@ import { BoltMark } from './Logo'
 import { HardwareBar } from './HardwareBar'
 import { EngineProvisionBanner } from './EngineProvisionBanner'
 import { EngineLoadErrorBanner } from './EngineLoadErrorBanner'
+import { AppUpdateRailSlot } from './AppUpdateControl'
 import {
   Tooltip,
   TooltipContent,
@@ -320,8 +321,13 @@ function NavRail({
             {(online ? 'Daemon connected' : 'Daemon offline') + ` · ${version}`}
           </TooltipContent>
         </Tooltip>
-        {/* Version string beneath the chip (xl+ only — no room when collapsed). */}
-        <span className="hidden text-[11px] text-faint xl:inline">{version}</span>
+        {/* Version string beneath the chip (xl+ only — no room when collapsed) — which
+            BECOMES the clickable update pill when npm has a newer TurboLLM (spec 29 B.3).
+            This spot rather than a banner because the version is already here: the thing a
+            user looks at to check what they're running becomes the thing that updates it.
+            AppUpdateRailSlot falls back to exactly this plain span when there's no update,
+            so the default appearance of the rail is unchanged. */}
+        <AppUpdateRailSlot version={version} />
       </div>
     </nav>
   )
