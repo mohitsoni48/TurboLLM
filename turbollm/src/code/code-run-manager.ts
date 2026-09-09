@@ -133,6 +133,18 @@ export class CodeRunManager {
     return !!s && (s.active !== null || s.queue.length > 0)
   }
 
+  /** Is ANY session mid-turn? The session-agnostic form of {@link isActive}, for callers that
+   *  must not disturb the daemon while a Code run is in flight — today the app self-update
+   *  pre-check (spec 29 B.1), which restarts the process and would take a running agent with
+   *  it. Deliberately not derived by iterating session ids at the call site: that would let a
+   *  caller miss a session it didn't know to ask about. */
+  anyActive(): boolean {
+    for (const s of this.sessions.values()) {
+      if (s.active !== null || s.queue.length > 0) return true
+    }
+    return false
+  }
+
   /** The turns currently WAITING behind the active turn (not the running one) — the server-side
    *  message queue, surfaced to the UI so its "Queued" chips survive a disconnect. `userMsgId`
    *  (not just index) identifies each entry so a per-chip action (sendNow) can target one

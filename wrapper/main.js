@@ -40,6 +40,67 @@ function getDaemonDir () {
 
 let daemonProcess = null
 
+// ── Auto-update (spec 29 B.2) ─────────────────────────────────────────────────
+// The desktop app updates itself through electron-updater against the `latest*.yml`
+// manifests electron-builder publishes onto each GitHub release. The npm/CLI install has
+// its own mechanism entirely (the daemon's POST /api/v1/app/update + the detached updater
+// helper) — this is the desktop half, and the two must never both run: the daemon's
+// install-method detection classifies the packaged daemon as `electron` precisely so it
+// refuses to shell out to npm inside an app bundle.
+//
+// TWO HARD PREREQUISITES, both owned by the version-lockstep PR (spec 29 Part C, PR 2),
+// which must land before this does anything at all:
+//   1. `wrapper/package.json`'s version must equal the published npm version. It has drifted
+//      three minors behind (1.9.7 vs 1.12.7). electron-updater compares the APP's own
+//      version against `latest.yml`, so with the drift in place the desktop app believes it
+//      is AHEAD of every release ever published and will never update — worse than no
+//      auto-update, because it looks like it works.
+//   2. `electron-builder.config.cjs` needs a `publish:` block, and the release workflow's
+//      upload globs need `latest*.yml` / `*.blockmap`. Without those manifests there is
+//      nothing for electron-updater to read.
+// Until then this whole block no-ops via the require guard below rather than crashing the
+// app on a missing dependency.
+//
+// Unsigned (spec 29 D6): updates install, but each one re-triggers SmartScreen on Windows.
+// That is a stated, accepted trade — not something to paper over here.
+const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000 // every 6h, plus once on launch
+
+function setupAutoUpdate () {
+  // Only meaningful in a packaged app: a dev run has no update manifest to compare against
+  // and electron-updater throws rather than no-oping.
+  if (!app.isPackaged) return
+
+  let autoUpdater
+  try {
+    ;({ autoUpdater } = require('electron-updater'))
+  } catch (err) {
+    // Dependency not installed yet (see prerequisite 2 above). Degrade to "no auto-update"
+    // — never to a failed launch.
+    console.warn('electron-updater not available; auto-update disabled:', err.message)
+    return
+  }
+
+  // Download in the background, install when the user quits anyway (spec 29 D5: desktop
+  // defaults to auto-download / notify-to-install). Deliberately NOT autoInstallOnAppQuit
+  // = false + a modal: interrupting someone mid-session to ask about an update is the
+  // behaviour that trains people to dismiss update prompts forever.
+  autoUpdater.autoDownload = true
+  autoUpdater.autoInstallOnAppQuit = true
+  // Unsigned builds (D6): electron-updater on Windows otherwise refuses to apply an update
+  // whose signature it cannot verify against the installed app's.
+  autoUpdater.disableWebInstaller = true
+
+  autoUpdater.on('error', (err) => { console.error('Auto-update error:', err && err.message ? err.message : err) })
+  autoUpdater.on('update-available', (info) => { console.log(`Update available: ${info && info.version}`) })
+  autoUpdater.on('update-downloaded', (info) => { console.log(`Update downloaded: ${info && info.version} — installs on quit`) })
+
+  const check = () => { autoUpdater.checkForUpdates().catch(() => { /* offline: try again next tick */ }) }
+  check()
+  const timer = setInterval(check, UPDATE_CHECK_INTERVAL_MS)
+  // Don't let the interval hold the app open past a quit.
+  app.on('before-quit', () => clearInterval(timer))
+}
+
 // ── Health check ──────────────────────────────────────────────────────────────
 function waitForDaemon (retryMs = 500, timeoutMs = 45000) {
   return new Promise((resolve, reject) => {
@@ -78,6 +139,12 @@ function launchDaemon () {
     cwd: daemonDir,
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true, // hide the console window on Windows
+    // The daemon's install-method detection (spec 29 B.1) reads this. It can infer the
+    // desktop case from `resources/daemon` in its own path, but that is a heuristic over a
+    // packaging layout; this is the wrapper stating the fact outright. It matters because
+    // getting it wrong means the daemon offering `npm i -g` inside an app bundle, which
+    // would "succeed" against an entirely different copy of TurboLLM.
+    env: { ...process.env, TURBOLLM_DESKTOP: '1' },
   })
 
   daemonProcess.stdout.on('data', (data) => { process.stdout.write(data) })
@@ -101,6 +168,8 @@ app.whenReady().then(() => {
     app.quit()
     return
   }
+
+  setupAutoUpdate()
 
   waitForDaemon().then(() => {
     mainWindow = new BrowserWindow({

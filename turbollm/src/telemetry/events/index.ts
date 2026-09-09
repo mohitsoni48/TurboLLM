@@ -22,6 +22,7 @@ import { codeDaily } from './code'
 import { uiAction, uiDaily } from './ui'
 import { onboardingProfile, onboardingRecovery } from './onboarding'
 import { linkMinted, linkAdded, linkStatusChanged, inferenceServed } from './link'
+import { appUpdateAvailable, appUpdateClicked, appUpdateApplied, appUpdateFailed } from './app-update'
 
 export const REGISTRY = {
   app_first_run: appFirstRun,
@@ -47,6 +48,10 @@ export const REGISTRY = {
   link_added: linkAdded,
   link_status_changed: linkStatusChanged,
   inference_served: inferenceServed,
+  app_update_available: appUpdateAvailable,
+  app_update_clicked: appUpdateClicked,
+  app_update_applied: appUpdateApplied,
+  app_update_failed: appUpdateFailed,
 } as const
 
 export type EventName = keyof typeof REGISTRY
@@ -77,4 +82,8 @@ export {
   linkAdded,
   linkStatusChanged,
   inferenceServed,
+  appUpdateAvailable,
+  appUpdateClicked,
+  appUpdateApplied,
+  appUpdateFailed,
 }

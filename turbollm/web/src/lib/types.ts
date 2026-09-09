@@ -239,6 +239,33 @@ export type AppUpdate = {
   checkedAt: string
   error?: 'offline' | 'rate_limited'
   comparable: boolean
+  /** How this daemon is installed (spec 29 B.1). Decides what the update dialog may
+   *  offer — a wrong guess is worse than no button, so the daemon classifies rather than
+   *  the browser. Optional: a daemon older than this feature simply omits it. */
+  method?: 'npm_global' | 'npx' | 'electron' | 'docker' | 'android' | 'source' | 'unknown'
+  /** May the daemon apply the update itself (POST /api/v1/app/update)? */
+  canSelfUpdate?: boolean
+  /** The copyable manual command. Always present when there is one — this is what keeps
+   *  the dialog from dead-ending on Docker / source / unknown installs. */
+  command?: string
+  /** One sentence explaining what to do instead, when self-update isn't offered. */
+  note?: string
+  /** App-level update policy (spec 29 B.4), same vocabulary as the per-engine one. */
+  policy?: UpdatePolicy
+  /** The version whose toast the user already dismissed, so it never nags twice. */
+  dismissedVersion?: string
+}
+
+/** Where an in-app update has got to (GET /api/v1/app/update/progress). `done`/`failed`
+ *  come from the RESTARTED daemon reading the updater helper's result file — the process
+ *  that ran the update is gone by the time there is an outcome. */
+export type AppUpdateProgress = {
+  state: 'idle' | 'downloading' | 'installing' | 'restarting' | 'done' | 'failed'
+  target: string | null
+  from: string | null
+  method: AppUpdate['method'] | null
+  error: string | null
+  at: string
 }
 
 /** Live ComfyUI coordination state (GET /api/v1/status). Drives the "paused while

@@ -6,6 +6,7 @@ import type { ProvisionState } from './engines/provision-state'
 import type { BuildState } from './engines/build-state'
 import type { UpdateChecker } from './engines/update'
 import type { AppUpdateChecker } from './app-update'
+import type { AppUpdateProgressState } from './app-update-apply'
 import type { Scanner } from './models/scanner'
 import type { HashStore } from './models/hashes'
 import type { ConversationStore } from './chat/db'
@@ -75,7 +76,10 @@ export interface Deps {
    *  Gracefully stops the engine, releases the listen socket, then spawns a detached
    *  replacement and exits. Optional: only wired in the real `serve()` entrypoint
    *  (cli.ts); absent under tests, where the restart route returns 501. */
-  requestRestart?: () => void
+  requestRestart?: (opts?: { exitOnly?: boolean }) => void
+  /** In-flight (or just-finished) app self-update state, spec 29 B.1. Optional — absent
+   *  under tests that don't exercise the apply routes, same convention as `appUpdates`. */
+  appUpdateProgress?: AppUpdateProgressState
   /** Re-point the HTTP listener at the host/port the config now wants, WITHOUT a full
    *  restart — keeps the engine + model loaded. Used for LAN/port changes. Wired only
    *  in the real `serve()` entrypoint (cli.ts); absent under tests. */

@@ -18,6 +18,13 @@ import { executeRoutine } from './routines/execute'
 import { sweepInteractiveCliRuns, type CliInteractiveSweepDeps } from './routines/cli-interactive-runner'
 import { getTerminalManager } from './terminal/terminal-routes'
 import { AppUpdateChecker } from './app-update'
+import {
+  AppUpdateProgressState,
+  classifyUpdateFailure,
+  consumeUpdateResult,
+  detectInstall,
+  writeRunState,
+} from './app-update-apply'
 import { applyEngineUpdate } from './engines/update-apply'
 import { seedDefaultEngines, ensureAndroidBundledEngine } from './engines/seed'
 import { engineAcceptsFormat } from './engines/compat'
@@ -57,6 +64,7 @@ import { flush } from './telemetry/uploader'
 import { emit } from './telemetry/runtime/typed-emit'
 import { modelLoad, modelDownloaded, buildModelLoadConfig } from './telemetry/events/model'
 import { engineInstalled } from './telemetry/events/engine'
+import { appUpdateAvailable, appUpdateApplied, appUpdateFailed } from './telemetry/events/app-update'
 import { checkDailyQueryRollups } from './telemetry/runtime/daily-query-rollups'
 import { markEverLoadedModel } from './api/onboarding-routes'
 
@@ -449,6 +457,22 @@ deps.agentTasks = new AgentTaskState()
 // request with no restart needed.
 deps.requestLog = new RequestLog(store.snapshot().requestLog.maxEntries)
 
+// App self-update apply state (spec 29 B.1). Two boot-time jobs:
+//  1. Record this daemon's launch identity (execPath/argv/cwd) so the detached update
+//     helper relaunches us exactly as we were started instead of guessing.
+//  2. Read — exactly once, then delete — the result file the helper wrote before it
+//     brought us back, so a completed or FAILED update is loud (a toast) rather than a
+//     version number that silently did or didn't change.
+deps.appUpdateProgress = new AppUpdateProgressState()
+writeRunState(store.dir(), version)
+const lastUpdateResult = consumeUpdateResult(store.dir())
+if (lastUpdateResult) deps.appUpdateProgress.adopt(lastUpdateResult)
+// Warm the install-method classification off the request path. Its one expensive signal is
+// `npm root -g`, a subprocess — memoized for the process lifetime, but the FIRST caller pays
+// for it, and that caller would otherwise be a routine `GET /api/v1/app/update` status poll
+// on whichever screen the user happened to open first.
+setTimeout(() => void detectInstall().catch(() => {}), 2_000).unref()
+
 // Journey telemetry (ADR-299). Constructing it is unconditional and harmless —
 // the Emitter itself enforces consent and the kill switch, so there is no state
 // here that could leak if those checks were somehow skipped upstream.
@@ -730,7 +754,33 @@ await registerCodeRoutesIfSupported(app, deps)
 // Warm the app-update cache shortly after boot (ADR-031: "once per daemon start") so the
 // Settings chip is ready without the user clicking refresh. Offline-silent; unref'd so it
 // never holds the process open. The 24h re-check is on-demand when the cache goes stale.
-setTimeout(() => void appUpdates.check(AbortSignal.timeout(10_000)).catch(() => {}), 5_000).unref()
+setTimeout(() => {
+  void appUpdates
+    .check(AbortSignal.timeout(10_000))
+    .then(async (status) => {
+      // spec 29 B.5: the "an update exists on this machine" signal — the denominator
+      // complaint #3 ("existing users never update") was never measurable without.
+      // Once per daemon start, and only on a REAL answer (an offline check reports
+      // hasUpdate: false, which must not be counted as "no update was available").
+      if (!status.hasUpdate) return
+      const info = await detectInstall()
+      emit(telemetry, appUpdateAvailable, { method: info.method, canSelfUpdate: info.canSelfUpdate })
+    })
+    .catch(() => {})
+}, 5_000).unref()
+
+// The outcome of an update applied by the PREVIOUS run of this daemon. It can only be
+// reported from here: the process that ran the update exited so the installer could
+// overwrite its own package files, so "did it work?" is a fact this boot inherits from
+// the helper's result file (consumed above) rather than something the updating process
+// could ever have sent itself.
+if (lastUpdateResult) {
+  const method = lastUpdateResult.method ?? 'unknown'
+  if (lastUpdateResult.state === 'done') emit(telemetry, appUpdateApplied, { method })
+  else if (lastUpdateResult.state === 'failed') {
+    emit(telemetry, appUpdateFailed, { method, reason: classifyUpdateFailure(lastUpdateResult.error) })
+  }
+}
 
 // Background auto-update checker (ADR-085, Phase 6): runs shortly after boot + every
 // ~24h. Refreshes per-engine update status; for 'auto' engines with an available update
@@ -1010,9 +1060,18 @@ function spawnReplacement(): void {
   })
   child.unref()
 }
-deps.requestRestart = () => {
+// `exitOnly` is the app-self-update mode (spec 29 B.1 step 2): tear down exactly as a
+// restart does — engine stopped, sockets drained, DB closed, port released — but do NOT
+// spawn a replacement. Something else is going to: the detached update helper is already
+// waiting for this PID to die so it can overwrite the package files (which Windows will
+// not let it do while we hold them) and then relaunch us. Respawning here would race the
+// installer against a live daemon, which is the precise failure this whole mechanism
+// exists to avoid. Expressed as a flag on the existing path rather than a second copy of
+// it, so the (carefully ordered, watchdog-guarded) teardown can never drift between the two.
+deps.requestRestart = (opts?: { exitOnly?: boolean }) => {
   if (restarting) return
   restarting = true
+  const respawn = !opts?.exitOnly
   updateScheduler.stop() // don't let an update tick fire mid-teardown
   routineScheduler.stop() // don't let a routine tick fire mid-teardown
   clearInterval(cliInteractiveSweepTimer)
@@ -1021,10 +1080,12 @@ deps.requestRestart = () => {
   const finish = () => {
     if (spawned) return
     spawned = true
-    try {
-      spawnReplacement()
-    } catch (e) {
-      console.warn(`restart spawn failed: ${e}`)
+    if (respawn) {
+      try {
+        spawnReplacement()
+      } catch (e) {
+        console.warn(`restart spawn failed: ${e}`)
+      }
     }
     process.exit(0)
   }

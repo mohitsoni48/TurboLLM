@@ -31,6 +31,7 @@ import type {
   ModelsList,
   Status,
   AppUpdate,
+  AppUpdateProgress,
   TokenUsageStats,
   TokenUsageRange,
 } from './types'
@@ -348,6 +349,31 @@ export function getEngineUpdates(refresh = false): Promise<EngineUpdates> {
  *  live re-check. Informational only; npm performs the upgrade. */
 export function getAppUpdate(refresh = false): Promise<AppUpdate> {
   return request<AppUpdate>(`/api/v1/app/update${refresh ? '?refresh=1' : ''}`)
+}
+
+/** Apply the update and restart (spec 29 B.1). 202 on accept; a 409 carries the reason it
+ *  was refused (a download in flight, a Code session running, an install method that can't
+ *  self-update). The daemon goes away moments after this resolves — the caller polls
+ *  {@link getAppUpdateProgress} / `/status` through the restart. */
+export function applyAppUpdate(): Promise<{ ok: boolean; updating: boolean; from: string; to: string; method: string }> {
+  return request('/api/v1/app/update', { method: 'POST', json: {} })
+}
+
+/** Poll an in-flight update. Also how the RESTARTED daemon reports the outcome of the
+ *  update that restarted it. */
+export function getAppUpdateProgress(): Promise<AppUpdateProgress> {
+  return request<AppUpdateProgress>('/api/v1/app/update/progress')
+}
+
+/** Set the app-level auto-update policy (off | notify | auto). */
+export function setAppUpdatePolicy(policy: UpdatePolicy): Promise<unknown> {
+  return request('/api/v1/app/update-policy', { method: 'PUT', json: { policy } })
+}
+
+/** Remember that the user dismissed the toast for this exact version, so it never asks
+ *  twice for the same release. */
+export function dismissAppUpdate(version: string): Promise<unknown> {
+  return request('/api/v1/app/update/dismiss', { method: 'POST', json: { version } })
 }
 
 /** Set an engine's auto-update policy (off | notify | auto). */
