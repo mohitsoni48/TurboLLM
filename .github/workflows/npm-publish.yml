@@ -1,0 +1,62 @@
+name: npm publish
+
+# Fires on the same event as desktop-release.yml (release: published — i.e. once
+# scripts/release.mjs's `publish` phase creates the GitHub Release for a tag).
+#
+# Uses npm's OIDC "trusted publishing" instead of a stored token: GitHub issues a
+# short-lived OIDC identity for this exact workflow run, npm verifies it against
+# the Trusted Publisher configured on the `turbollm` package (npmjs.com → package
+# → Settings → Trusted Publisher → GitHub Actions → this repo + this workflow
+# filename), and npm hands back a short-lived publish token that never touches
+# disk or a secret store. Nothing to rotate, nothing to leak — replaces the
+# granular-automation-token approach after npm's 2026-07-08 changelog announced
+# 2FA-bypass tokens lose direct-publish ability around January 2027.
+#
+# `workflow_dispatch` exists so a release whose GitHub Release already existed
+# before this workflow was added (or a publish that needs a manual re-run) can
+# still be published without recreating the release.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (e.g. v1.13.0) — checks out that tag and publishes whatever version turbollm/package.json has there.'
+        required: true
+
+permissions:
+  contents: read
+  id-token: write # required for npm OIDC trusted publishing
+
+jobs:
+  publish:
+    if: startsWith(github.event.release.tag_name || inputs.tag, 'v')
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: turbollm/package-lock.json
+          registry-url: 'https://registry.npmjs.org'
+
+      # Trusted publishing needs a recent npm CLI (11.5.1+) — Node 22's bundled
+      # npm may lag behind that on an older runner image, so pin it explicitly
+      # rather than trust whatever setup-node happened to bring.
+      - name: Ensure npm supports OIDC trusted publishing
+        run: npm install -g npm@latest
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: turbollm
+
+      # prepublishOnly (build:web + build) runs automatically as part of `npm
+      # publish` — see turbollm/package.json.
+      - name: Publish
+        run: npm publish --provenance
+        working-directory: turbollm
