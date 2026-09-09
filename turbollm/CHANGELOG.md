@@ -25,6 +25,38 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.13.0] - 2026-09-09
+
+### Added
+
+- **In-app self-update.** The version shown at the bottom of the nav rail (and in Settings →
+  About) is now a clickable pill when a newer TurboLLM is available — click it for a dialog
+  showing what changed, then **Update & restart** applies it without touching a terminal. Works
+  for a global npm install and an `npx` run; other install methods (Docker, source checkout,
+  Android) still show the copyable upgrade command, so the button is never a dead end. A new
+  `off | notify | auto` policy setting controls whether updates are only surfaced or applied
+  automatically at the next idle restart.
+- **macOS download.** `/download` now links the real, CI-built `TurboLLM-arm64.dmg` instead of
+  routing Mac users to the beta waitlist — it's been built on every release since v1.12.3, just
+  never linked.
+
+### Changed
+
+- The desktop Windows/Linux/macOS installers are confirmed CI-built on every release
+  (`.github/workflows/desktop-release.yml`) — the old manual local-build runbook (WSL2 rsync,
+  `xvfb-run` smoke tests) is retired as duplicate work.
+- The desktop app version now stays in lockstep with the npm version (was 3 minor versions
+  behind), which is what the new auto-updater compares against — CI now fails the build if they
+  ever drift again.
+- The release process itself is now driven by `scripts/release.mjs`, a phase-ordered script that
+  won't let a release step be silently skipped, includes an automated (token-based) npm publish
+  path, and folds the telemetry-Worker-drift check directly into release prep instead of a
+  separate always-on CI gate.
+
+### Discord
+- Update TurboLLM right from the app now — click the version in the bottom-left corner when an update's available, no more copy-pasting terminal commands.
+- macOS users: the real download link is live on turbollm.dev/download instead of the beta waitlist.
+
 ## [1.12.7] - 2026-09-08
 
 ### Fixed
