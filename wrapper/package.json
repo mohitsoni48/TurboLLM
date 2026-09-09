@@ -1,6 +1,6 @@
 {
   "name": "turbollm-desktop",
-  "version": "1.12.7",
+  "version": "1.13.0",
   "description": "TurboLLM Desktop — native window wrapper for the TurboLLM daemon",
   "main": "main.js",
   "license": "FSL-1.1-ALv2",
