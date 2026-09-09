@@ -282,7 +282,8 @@ async function phasePreflight(state, flags) {
     if (h.code !== 0) {
       if (flags.approved) {
         step('telemetry schema drifted from the deployed Worker — redeploying now (--approved)...');
-        const deploy = mustRun('npm', ['run', 'deploy'], { cwd: join(REPO, 'telemetry-worker') });
+        const deploy = runNpm(['run', 'deploy'], { cwd: join(REPO, 'telemetry-worker') });
+        if (deploy.code !== 0) fail(`telemetry Worker deploy failed:\n${tailOf(deploy.out, 40)}`);
         note(tailOf(deploy.out, 12));
         h = run(process.execPath, [hashScript, 'check']);
         if (h.code !== 0) {
