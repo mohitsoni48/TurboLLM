@@ -22,11 +22,22 @@ module.exports = {
     output: 'dist',
     buildResources: 'build',
   },
-  // Allowlist, not default include-everything: wrapper/dist (build output),
-  // wrapper/build (icon source, build-time only) and wrapper/node_modules
-  // (empty of runtime deps — main.js uses only Electron/Node builtins) must
-  // NOT end up inside the packaged app.
-  files: ['main.js', 'package.json'],
+  // Allowlist, not default include-everything: wrapper/dist (build output) and
+  // wrapper/build (icon source, build-time only) must NOT end up inside the
+  // packaged app.
+  //
+  // node_modules IS shipped now: `electron-updater` is a real runtime
+  // dependency of main.js (auto-update), so it has to exist inside the asar.
+  // electron-builder resolves the *production* dependency tree itself, so the
+  // devDependencies (electron, electron-builder) are still excluded — only the
+  // ~16 packages under `electron-updater` come along.
+  files: ['main.js', 'package.json', 'node_modules/**/*'],
+  // Emit latest.yml / latest-linux.yml / latest-mac.yml + .blockmap files
+  // alongside the installers. Without a publish provider electron-builder
+  // generates no update manifests at all, and electron-updater cannot work.
+  // Nothing is auto-published from here — desktop-release.yml uploads the
+  // artifacts onto the already-created GitHub release with `gh release upload`.
+  publish: [{ provider: 'github', owner: 'mohitsoni48', repo: 'TurboLLM' }],
   extraResources: [
     { from: join(TURBOLLM_ROOT, 'dist'), to: 'daemon/dist' },
     { from: join(TURBOLLM_ROOT, 'bin'), to: 'daemon/bin' },

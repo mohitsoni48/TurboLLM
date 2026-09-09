@@ -55,13 +55,62 @@ jobs:
         run: npm ci
         working-directory: wrapper
 
+      # The Electron app's own version is what electron-updater compares against
+      # latest.yml. If wrapper/ drifts behind turbollm/ (it sat three minors
+      # behind for months) the desktop app believes it is ahead of every
+      # published release and never updates. Fail the build instead.
+      - name: Assert wrapper/turbollm version lockstep
+        shell: bash
+        run: |
+          node -e "
+            const fs = require('node:fs');
+            const read = p => JSON.parse(fs.readFileSync(p, 'utf8')).version;
+            const daemon = read('turbollm/package.json');
+            const wrapper = read('wrapper/package.json');
+            if (daemon !== wrapper) {
+              console.error('Version mismatch: turbollm/package.json is ' + daemon + ' but wrapper/package.json is ' + wrapper + '. They must be identical — the desktop app version is what electron-updater compares against latest.yml.');
+              process.exit(1);
+            }
+            console.log('Version lockstep OK: ' + daemon);
+          "
+
       - name: Package installer
         run: npm run package
         working-directory: wrapper
+
+      # electron-builder only emits update manifests when a publish provider is
+      # configured. If that config is ever dropped the installers still build
+      # fine and auto-update silently dies — so assert the manifests exist.
+      - name: Assert update manifests were generated
+        shell: bash
+        working-directory: wrapper
+        run: |
+          shopt -s nullglob
+          manifests=(dist/latest*.yml)
+          if [ ${#manifests[@]} -eq 0 ]; then
+            echo "No dist/latest*.yml produced — electron-updater cannot work without it. Check the publish: block in electron-builder.config.cjs." >&2
+            ls -la dist || true
+            exit 1
+          fi
+          printf 'update manifest: %s\n' "${manifests[@]}"
 
       - name: Upload installer to the release
         shell: bash
         working-directory: wrapper
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.event.release.tag_name }}" ${{ matrix.artifact_glob }} --clobber
+        run: |
+          shopt -s nullglob
+          # Fixed installer names (TurboLLM-Setup-x64.exe / TurboLLM-arm64.dmg /
+          # TurboLLM-x86_64.AppImage) must keep uploading exactly as before —
+          # /download links releases/latest/download/<fixed-name>.
+          installers=(${{ matrix.artifact_glob }})
+          if [ ${#installers[@]} -eq 0 ]; then
+            echo "No installer matched ${{ matrix.artifact_glob }}" >&2
+            exit 1
+          fi
+          # Update manifests + differential-download blockmaps for
+          # electron-updater. Blockmaps do not exist for every target (AppImage
+          # has none), hence nullglob rather than a hard requirement.
+          manifests=(dist/latest*.yml dist/*.blockmap)
+          gh release upload "${{ github.event.release.tag_name }}" "${installers[@]}" "${manifests[@]}" --clobber
