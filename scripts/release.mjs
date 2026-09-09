@@ -547,7 +547,13 @@ async function phaseMerge(state, flags) {
 // already exists on disk or in the environment.
 const TOKEN_FILE = () => join(homedir(), '.turbollm-release', 'npm-token');
 
-function resolveNpmToken() {
+// OIDC trusted publishing (npm-publish.yml) is the primary path — see phasePublish.
+// This local-token path only exists as a bridge/fallback: a release whose GitHub
+// Release predates npm-publish.yml, or a one-off manual re-run. npm deprecates
+// direct-publish for 2FA-bypass tokens around January 2027, so this is not meant
+// to become the steady-state mechanism — pass {optional:true} to check without
+// failing when there's nothing to fall back to.
+function resolveNpmToken(opts = {}) {
   const env = (process.env.TURBOLLM_NPM_TOKEN || '').trim();
   if (env) return { token: env, source: 'env TURBOLLM_NPM_TOKEN' };
   const f = TOKEN_FILE();
@@ -555,14 +561,16 @@ function resolveNpmToken() {
     const t = readFileSync(f, 'utf8').trim();
     if (t) return { token: t, source: f };
   }
+  if (opts.optional) return null;
   fail(
-    'no npm token found.\n'
+    'no npm token found, and no npm-publish.yml OIDC run to fall back on.\n'
     + `Expected $TURBOLLM_NPM_TOKEN or a token file at ${f} (mode 600).\n\n`
     + 'The token has to be created by a human in the npmjs.com UI — this script cannot create credentials:\n'
     + '  npmjs.com → avatar → Access Tokens → Generate New Token → Granular Access Token\n'
     + `  · Packages: only \`${PKG}\` · Permissions: Read and write · Expiry: 90 days\n`
     + '  Docs: https://docs.npmjs.com/creating-and-viewing-access-tokens\n'
-    + 'Never commit it, never put it in an .npmrc git can see.',
+    + 'Never commit it, never put it in an .npmrc git can see.\n'
+    + '(Prefer setting up the npm-publish.yml Trusted Publisher instead — see docs/RELEASE.md.)',
   );
 }
 
@@ -646,21 +654,46 @@ async function phasePublish(state, flags) {
     note(`created GitHub release ${tag}`);
   }
 
-  // npm publish — the irreversible bit
+  // npm publish — the irreversible bit. OIDC trusted publishing (npm-publish.yml,
+  // triggered by the `release: published` event above) does the actual `npm
+  // publish` inside GitHub Actions — no stored token, nothing here to leak. This
+  // phase just confirms that workflow ran and the version actually landed;
+  // `npm view` is the only thing that counts as proof, same as before.
   const live = npmLatest();
   if (live === version) {
-    note(`npm already has ${version} — publish is idempotent, skipping the upload`);
+    note(`npm already has ${version} — publish is idempotent, skipping`);
+  } else if (flags['dry-run']) {
+    note(`[dry-run] would wait for npm-publish.yml on ${tag}, then poll npm view ${PKG} version`);
   } else {
-    requireApproval(flags, `publishing ${PKG}@${version} to npm`);
-    const { token, source } = resolveNpmToken();
-    note(`npm token source: ${source}`);
-    const res = npmPublishWithToken(token, { dryRun: !!flags['dry-run'] });
-    note(`npm publish (${flags['dry-run'] ? 'dry-run' : 'live'}) as ${res.whoami}`);
-    if (!flags['dry-run']) {
-      await pollNpmVersion(version);
-      note(`npm view ${PKG} version == ${version}`);
-      okLine(`${PKG}@${version} is live on npm`);
+    requireApproval(flags, `publishing ${PKG}@${version} to npm (via npm-publish.yml / OIDC)`);
+    // A GitHub Release that already existed BEFORE npm-publish.yml was added
+    // (or a rerun) won't have fired the `release: published` event for it —
+    // legacyToken() is the local fallback for that one-off case only.
+    const legacy = resolveNpmToken({ optional: true });
+    if (legacy) {
+      warnLine(`falling back to the local token (${legacy.source}) — npm-publish.yml did not pick up this release, or you're re-running after it was added later`);
+      const res = npmPublishWithToken(legacy.token, { dryRun: false });
+      note(`npm publish (legacy token path) as ${res.whoami}`);
+    } else {
+      note('waiting for the npm-publish.yml workflow (OIDC trusted publishing)…');
+      const runId = await waitForWorkflowRun('npm-publish.yml', tag, 5 * 60_000);
+      if (runId == null) {
+        fail(
+          `no npm-publish.yml run found for ${tag} after 5 minutes.\n`
+          + `  Either it hasn't started yet (check https://github.com/mohitsoni48/TurboLLM/actions/workflows/npm-publish.yml),\n`
+          + `  or the Trusted Publisher isn't configured yet on npmjs.com (package turbollm → Settings → Trusted Publisher → GitHub Actions → this repo + npm-publish.yml).\n`
+          + `  You can also dispatch it manually: \`gh workflow run npm-publish.yml -f tag=${tag}\`.`,
+        );
+      }
+      const conclusion = await waitForRun(runId, 10 * 60_000);
+      if (conclusion !== 'success') {
+        fail(`npm-publish.yml run ${runId} did not succeed (${conclusion}) — check https://github.com/mohitsoni48/TurboLLM/actions/runs/${runId}`);
+      }
+      note(`npm-publish.yml run ${runId} succeeded`);
     }
+    await pollNpmVersion(version);
+    note(`npm view ${PKG} version == ${version}`);
+    okLine(`${PKG}@${version} is live on npm`);
   }
 
   // desktop installers — CI builds them on `release: published`; verify the set
@@ -677,6 +710,37 @@ async function phasePublish(state, flags) {
   }
 
   return out.join('\n');
+}
+
+// Finds the most recent run of a given workflow file whose event was `release`
+// (or `workflow_dispatch`, for a manual re-run) and that started after `tag`'s
+// GitHub Release was created — so an unrelated older run for the same workflow
+// file never gets mistaken for this release's run. Returns the run id, or null
+// if none shows up before the timeout (e.g. the Trusted Publisher isn't
+// configured yet, so the workflow never got dispatched to begin with).
+async function waitForWorkflowRun(workflowFile, tag, timeoutMs) {
+  const releaseAt = gh('release', 'view', tag, '--json', 'createdAt', '-q', '.createdAt').stdout;
+  const since = releaseAt ? Date.parse(releaseAt) : 0;
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const r = gh(
+      'run', 'list', '--workflow', workflowFile, '--limit', '5',
+      '--json', 'databaseId,event,createdAt',
+    );
+    if (r.code === 0) {
+      try {
+        const runs = JSON.parse(r.stdout || '[]');
+        // 60s clock-skew grace on the lower bound only.
+        const match = runs.find((x) =>
+          (x.event === 'release' || x.event === 'workflow_dispatch')
+          && Date.parse(x.createdAt) >= since - 60_000);
+        if (match) return match.databaseId;
+      } catch { /* fall through to retry */ }
+    }
+    if (Date.now() > deadline) return null;
+    step(`waiting for ${workflowFile} to start for ${tag}…`);
+    await sleep(15_000);
+  }
 }
 
 async function waitForDesktopAssets(tag, timeoutMs) {
