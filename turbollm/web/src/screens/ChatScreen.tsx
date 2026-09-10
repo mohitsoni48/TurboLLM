@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useParams, useSearchParams } from 'react-router-dom'
-import { ArrowDown, Copy, Download, PanelLeft, Paperclip, SendHorizontal, Share2, SlidersHorizontal, Square, UserRound, X } from 'lucide-react'
+import { Archive as ArchiveIcon, ArrowDown, Copy, Download, PanelLeft, Paperclip, SendHorizontal, Share2, SlidersHorizontal, Square, UserRound, X } from 'lucide-react'
 import { continueConversation, fetchSysInfo, listMemoryFacts, sendMessage } from '../lib/chat-api'
 import { extractPdfText } from '../lib/pdf-extract'
 import { chatKeys, useConversation, useConversationMutations } from '../lib/chat-queries'
@@ -28,6 +28,7 @@ import { DEFAULT_REASONING_EFFORT, ReasoningEffortSelect, type ReasoningEffort }
 import { MessageBubble, StreamingBubble } from './chat/MessageBubble'
 import { ToolApprovalBar } from './chat/ToolApprovalBar'
 import { ContextMeter } from './chat/ContextMeter'
+import { CompactionDivider } from './chat/CompactionDivider'
 import { ConversationSidebar } from './chat/ConversationSidebar'
 import { readSavedSidebarWidth, SIDEBAR_MIN_W, sidebarMaxW, SidebarResizeHandle } from './chat/SidebarResizeHandle'
 import { ModelLoadMenu } from '../components/ModelLoadMenu'
@@ -55,6 +56,9 @@ interface LiveState {
   liveGenTps: number  // rolling 2s window estimate during generation phase
   genTokens: number   // running count of generated tokens (content + reasoning) for this reply
   timeline: LiveBlock[]
+  /** True while an auto-compact call (ADR-420) is in flight for this conversation's
+   *  current turn — drives the composer placeholder swap below. */
+  compacting: boolean
 }
 
 /** Fit a model name into the composer placeholder. Measured on-device: the input is 230px at the
@@ -679,10 +683,12 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
           deltaTimestamps.current[convId] = []
           setLiveByConv((prev) => ({
             ...prev,
-            [convId]: { assistantId: evt.data.assistantMessageId, content: '', reasoning: '', progress: null, liveGenTps: 0, genTokens: 0, timeline: [] },
+            [convId]: { assistantId: evt.data.assistantMessageId, content: '', reasoning: '', progress: null, liveGenTps: 0, genTokens: 0, timeline: [], compacting: false },
           }))
           // Optimistically reflect the new/last user msg in the UI by invalidating
           void qc.invalidateQueries({ queryKey: ['conversation', convId] })
+        } else if (evt.event === 'compaction') {
+          updateLive(convId, (l) => ({ ...l, compacting: evt.data.phase === 'start' }))
         } else if (evt.event === 'progress') {
           updateLive(convId, (l) => ({ ...l, progress: { phase: evt.data.phase, pct: evt.data.pct, tps: evt.data.tps } }))
         } else if (evt.event === 'reasoning') {
@@ -1069,6 +1075,17 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
               <ContextMeter ctxUsed={ctxUsed} ctxMax={ctxMax} />
             </div>
           )}
+          {ready && !readonly && activeId && ctxMax > 0 && ctxUsed / ctxMax > 0.5 && !live?.compacting && (
+            <Button
+              size="icon"
+              variant="ghost"
+              className="h-8 w-8"
+              title="Compact this conversation now"
+              onClick={() => { track('chat', 'manual_compact'); mut.compact.mutate(activeId, { onError: () => toast.error('Could not compact this conversation.') }) }}
+            >
+              <ArchiveIcon size={15} />
+            </Button>
+          )}
 
           {/* Share / Export menu (F-023, F-024) — only when a conversation is active */}
           {activeId && (
@@ -1171,19 +1188,27 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
             {messages
               .filter((m) => m.id !== live?.assistantId)
               .map((m, i, arr) => (
-                <MessageBubble
-                  key={m.id}
-                  message={m}
-                  convId={readonly ? undefined : activeId ?? undefined}
-                  isLast={i === arr.length - 1 && !live}
-                  daemonGenerating={daemonGenerating}
-                  onEdit={readonly ? undefined : (msg) => setEditingId(msg.id)}
-                  onDelete={readonly ? undefined : handleDelete}
-                  onRegenerate={readonly ? undefined : handleRegenerate}
-                  editingId={editingId}
-                  onEditSave={(content) => handleEditSave(m.id, content)}
-                  onEditCancel={() => setEditingId(null)}
-                />
+                <Fragment key={m.id}>
+                  <MessageBubble
+                    message={m}
+                    convId={readonly ? undefined : activeId ?? undefined}
+                    isLast={i === arr.length - 1 && !live}
+                    daemonGenerating={daemonGenerating}
+                    onEdit={readonly ? undefined : (msg) => setEditingId(msg.id)}
+                    onDelete={readonly ? undefined : handleDelete}
+                    onRegenerate={readonly ? undefined : handleRegenerate}
+                    editingId={editingId}
+                    onEditSave={(content) => handleEditSave(m.id, content)}
+                    onEditCancel={() => setEditingId(null)}
+                  />
+                  {conv?.compactionUpToMessageId === m.id && conv.compactionSummary && (
+                    <CompactionDivider
+                      summary={conv.compactionSummary}
+                      tokensBefore={conv.compactionTokensBefore ?? 0}
+                      onUndo={readonly ? undefined : () => mut.undoCompaction.mutate(activeId!, { onError: () => toast.error('Could not undo compaction.') })}
+                    />
+                  )}
+                </Fragment>
               ))}
 
             {/* Streaming bubble */}
@@ -1309,7 +1334,13 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                   // model name gets a real "…" spliced in at a width that fits. Previously the
                   // decorative trailing "…" was itself the thing being clipped, leaving what read
                   // as a stray full stop after the model name (QA_UX_REPORT.md F-03, P2-1).
-                  placeholder={ready ? `Message ${truncateName(remoteChoice?.name ?? model?.name ?? 'the model')}` : 'Load a model to start chatting'}
+                  placeholder={
+                    activeId && live?.compacting
+                      ? 'Compacting conversation…'
+                      : ready
+                        ? `Message ${truncateName(remoteChoice?.name ?? model?.name ?? 'the model')}`
+                        : 'Load a model to start chatting'
+                  }
                   value={input}
                   disabled={!ready || !!live || !!editingId}
                   onChange={(e) => { setInput(e.target.value); autoResize() }}
