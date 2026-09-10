@@ -8,6 +8,7 @@ import { feedChunk, flushState, initParseState, type ParseState } from './parser
 import { needsExtraPass } from './think-utils'
 import { parseReasoningEffort, type ReasoningEffort } from './reasoning-effort'
 import { sseSink, type EmitSink } from './emit-sink.js'
+import { buildEngineMessages } from './chat-compaction.js'
 
 import type { ClaimVerdict, ConversationStore, MessageStats, ResearchMeta, ResearchSource, ToolCallRecord } from './db'
 import { checkReply } from '../tools/research-referee.js'
@@ -64,36 +65,6 @@ export function abortAllInFlightChats(): number {
 type S = 200 | 201 | 202 | 400 | 404 | 409 | 500 | 503
 function err(c: Context, s: S, code: string, msg: string) { return c.json({ error: { code, message: msg } }, s) }
 async function body<T>(c: Context): Promise<T> { try { return await c.req.json() as T } catch { return {} as T } }
-
-// ── current-date injection ─────────────────────────────────────────────────
-// The date used to be baked into conv.systemPrompt once, client-side, at conversation
-// creation — so a chat started in March still told the model it was March in July.
-// It is now assembled per request instead, on every path that builds engineMessages.
-
-/** Matches the app's own injected date line so a prompt persisted with a stale copy can be
- *  cleaned before the fresh one is appended (the model must never see two dates). Deliberately
- *  narrow — whole line, our exact opening, length-bounded — so user-authored prose that merely
- *  mentions a date survives. Also matches the line this file emits, keeping the strip idempotent. */
-// `$` (with /m) is load-bearing: it forces the length bound to cover the WHOLE line, so a long
-// user-authored line that merely opens this way fails to match instead of being truncated at 140.
-const BAKED_DATE_LINE = /^Today['’]s date is [^\n]{0,140}$\n?/gm
-
-/** DATE ONLY, never a clock time: llama.cpp prefix-caching keys on the prompt prefix, so a
- *  per-turn timestamp would invalidate the prefill cache on every single turn. */
-function currentDateLine(now: Date): string {
-  const y = now.getFullYear()
-  const m = String(now.getMonth() + 1).padStart(2, '0')
-  const d = String(now.getDate()).padStart(2, '0')
-  return `Today's date is ${y}-${m}-${d}. Use it only when the request depends on the current date; otherwise ignore it.`
-}
-
-/** Stored system prompt + today's date, appended LAST so everything ahead of it stays a stable
- *  cache prefix across a date rollover. Callers must keep gating on a non-empty stored prompt —
- *  the Blank agent means zero system message, and that still holds. */
-export function withCurrentDate(systemPrompt: string, now = new Date()): string {
-  const base = systemPrompt.replace(BAKED_DATE_LINE, '').replace(/\n{3,}/g, '\n\n').trim()
-  return base ? `${base}\n\n${currentDateLine(now)}` : currentDateLine(now)
-}
 
 export function registerChatRoutes(app: Hono, d: Deps): void {
   const { db } = d
@@ -318,19 +289,10 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       // Emit meta event
       await stream.writeSSE({ event: 'meta', data: JSON.stringify({ userMessageId: userMsg.id, assistantMessageId: assistantMsg.id }) })
 
-      // Build messages array for engine
+      // Build messages array for engine (chat-compaction.ts — folds in the compaction
+      // summary + cut when one is resolvable; a plain passthrough when not).
       const allMsgs = (conv.messages ?? []).filter(m => m.id !== assistantMsg.id)
-      const engineMessages: { role: string; content: unknown }[] = []
-      if (conv.systemPrompt) engineMessages.push({ role: 'system', content: withCurrentDate(conv.systemPrompt) })
-      for (const m of allMsgs) {
-        // GitHub #52: when preserveThinking is on, fold past reasoning back into what's
-        // resent so the model sees its own prior thinking, not just the final answer —
-        // the default behavior (off) matches what's always been sent.
-        const content = (conv.preserveThinking && m.role === 'assistant' && m.reasoning?.trim())
-          ? `<think>\n${m.reasoning}\n</think>\n\n${m.content}`
-          : m.content
-        engineMessages.push({ role: m.role, content })
-      }
+      const engineMessages = buildEngineMessages(conv, allMsgs)
       // Fold any attached document text into the prompt; attach images as multimodal parts.
       const fullContent = b.docContext
         ? (content ? `${b.docContext}\n\n${content}` : b.docContext)
@@ -395,19 +357,11 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       // Emit meta event (no new user message — reuse the existing last user message id)
       await stream.writeSSE({ event: 'meta', data: JSON.stringify({ userMessageId: lastUser.id, assistantMessageId: assistantMsg.id }) })
 
-      // Build messages array for engine from the existing (already-trimmed) history.
+      // Build messages array for engine from the existing (already-trimmed) history
+      // (chat-compaction.ts — folds in the compaction summary + cut when one is
+      // resolvable; a plain passthrough when not).
       const allMsgs = (conv.messages ?? []).filter((m) => m.id !== assistantMsg.id)
-      const engineMessages: { role: string; content: unknown }[] = []
-      if (conv.systemPrompt) engineMessages.push({ role: 'system', content: withCurrentDate(conv.systemPrompt) })
-      for (const m of allMsgs) {
-        // GitHub #52: when preserveThinking is on, fold past reasoning back into what's
-        // resent so the model sees its own prior thinking, not just the final answer —
-        // the default behavior (off) matches what's always been sent.
-        const content = (conv.preserveThinking && m.role === 'assistant' && m.reasoning?.trim())
-          ? `<think>\n${m.reasoning}\n</think>\n\n${m.content}`
-          : m.content
-        engineMessages.push({ role: m.role, content })
-      }
+      const engineMessages = buildEngineMessages(conv, allMsgs)
 
       await runGeneration(d, sseSink(stream), { convId, conv, engineMessages, assistantMsg, upstream, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), isCodeAuthorized })
     })
