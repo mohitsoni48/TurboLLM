@@ -25,6 +25,22 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.13.1] - 2026-09-10
+
+### Fixed
+
+- **Code showed no sessions and every action failed, since v1.12.5.** Opening Code, listing
+  sessions, or doing anything with the Code/Agents feature silently failed. This was a routing
+  bug, not data loss — every session was safe in your local database the whole time, just
+  unreachable through the app. Update and it'll all be there again.
+
+### Discord
+- **Please update if Code has been broken for you.** Since v1.12.5, opening Code showed no
+  sessions and nothing worked — that's fixed in v1.13.1. Nothing was ever lost; your session
+  history was safe on disk the entire time, it just couldn't be reached. Update with
+  `npm i -g turbollm@latest` (or `npx turbollm@latest`) and your sessions will be right where you
+  left them.
+
 ## [1.13.0] - 2026-09-09
 
 ### Added

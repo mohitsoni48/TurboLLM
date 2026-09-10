@@ -179,7 +179,18 @@ export function createApp(d: Deps): Hono {
   }, 30_000)
   extRunsReaper.unref()
 
-  // Embedded SPA with client-side-routing fallback (spec 08 §1).
+  return app
+}
+
+/** Embedded SPA with client-side-routing fallback (spec 08 §1) — a catch-all `GET /*`, so it
+ *  MUST be the last route registered on `app`. Kept out of `createApp()` and called separately,
+ *  after `registerCodeRoutesIfSupported()`, because Hono routes are matched in REGISTRATION
+ *  order for an overlapping catch-all: a specific route added after `/*` is already registered
+ *  never gets reached, it falls through to this handler's 404 first (confirmed live — this is
+ *  what silently 404'd every `/api/v1/code/*` route from a7a85c2 onward, since that commit moved
+ *  Code/Agents route registration to run lazily, after `createApp()` returned with `/*` already
+ *  in place; the old inline comment claiming registration order didn't matter was wrong). */
+export function registerSpaFallback(app: Hono): void {
   app.get('/*', (c) => {
     const path = decodeURIComponent(new URL(c.req.url).pathname).replace(/^\/+/, '')
     if (path.startsWith('api/') || path.startsWith('v1/')) {
@@ -192,8 +203,6 @@ export function createApp(d: Deps): Hono {
     if (!existsSync(file)) return c.text('web ui not built — run `npm run build:web`', 500)
     return new Response(readFileSync(file), { status: 200, headers: { 'Content-Type': contentType(file) } })
   })
-
-  return app
 }
 
 /** Registers the Code/Agents feature's routes, lazily — call once, right after
@@ -210,9 +219,11 @@ export function createApp(d: Deps): Hono {
  *  unavailable there) regardless — skipping registration entirely on Android costs nothing
  *  real. Every other platform's behavior/route surface is unchanged (import resolves
  *  immediately, same handlers as before, still registered in the same relative order
- *  before terminal/routine/gateway/ext — Hono matches by path pattern, not registration
- *  order, so moving this call out of `createApp()`'s synchronous body doesn't change
- *  routing behavior). */
+ *  before terminal/routine/gateway/ext) — PROVIDED the caller registers the SPA catch-all
+ *  (`registerSpaFallback`, below) only AFTER awaiting this, never before: Hono matches routes
+ *  in registration order for an overlapping catch-all, so a `/*` added first silently shadows
+ *  every Code/Agents route added afterward (this is exactly what a7a85c2 broke — see
+ *  `registerSpaFallback`'s doc comment). */
 export async function registerCodeRoutesIfSupported(app: Hono, d: Deps): Promise<void> {
   if (process.platform === 'android') return
   // code-routes.ts ships as its OWN tsup entry, in its OWN separate build pass (see

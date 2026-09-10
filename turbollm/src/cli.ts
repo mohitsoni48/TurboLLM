@@ -47,7 +47,7 @@ import { RequestLog } from './observability/request-log'
 import { launchCli, syncHarnessModelConfig, CONFIG_FILE_HARNESSES } from './cli-launch'
 import { writePidfile, removePidfile, stopDaemon, resolveDaemonPort } from './daemon-pid'
 import { runMcpServer } from './mcp-server'
-import { createApp, registerCodeRoutesIfSupported } from './server'
+import { createApp, registerCodeRoutesIfSupported, registerSpaFallback } from './server'
 import { registerTerminalWs } from './terminal/terminal-routes'
 import { reapStaleTerminals, killTrackedTerminalsSync } from './terminal/terminal-manager'
 import { provisionBootstrapApiKey, provisionTunnelApiKey } from './auth'
@@ -750,6 +750,9 @@ cliInteractiveSweepTimer.unref()
 
 const app = createApp(deps)
 await registerCodeRoutesIfSupported(app, deps)
+// Must be registered last — it's a catch-all `GET /*`, and Hono shadows any route added
+// after an overlapping catch-all (see registerSpaFallback's doc comment in server.ts).
+registerSpaFallback(app)
 
 // Warm the app-update cache shortly after boot (ADR-031: "once per daemon start") so the
 // Settings chip is ready without the user clicking refresh. Offline-silent; unref'd so it
