@@ -31,6 +31,8 @@ import type { Deps } from '../deps.js'
  *  cleaned before the fresh one is appended (the model must never see two dates). Deliberately
  *  narrow — whole line, our exact opening, length-bounded — so user-authored prose that merely
  *  mentions a date survives. Also matches the line this file emits, keeping the strip idempotent. */
+// `$` (with /m) is load-bearing: it forces the length bound to cover the WHOLE line, so a long
+// user-authored line that merely opens this way fails to match instead of being truncated at 140.
 const BAKED_DATE_LINE = /^Today['’]s date is [^\n]{0,140}$\n?/gm
 
 /** DATE ONLY, never a clock time: llama.cpp prefix-caching keys on the prompt prefix, so a
@@ -155,6 +157,19 @@ export function pickCompactionCut(pool: Message[], ctxMax: number): { toSummariz
 
 // ── the summarization call ──────────────────────────────────────────────────────────
 
+/** Bounded, background-priority — this is NOT an interactive Code turn, so it does not
+ *  need Code's own 600s GATE_QUEUE_TIMEOUT_MS (code-session.ts). Short enough that a
+ *  stuck compaction gives up well before it could look like a hung chat turn. Without it
+ *  the acquire inherits gate.ts's 180s DEFAULT_ACQUIRE_TIMEOUT_MS, which — stacked on the
+ *  summarization timeout below — put up to 240s of unstoppable wait in the turn's own
+ *  critical path. */
+const COMPACTION_GATE_TIMEOUT_MS = 60_000
+
+/** How long the one summarization call may take before it is abandoned. Named rather than
+ *  inlined because it is half of the worst-case in-turn stall above; the two numbers are
+ *  read together or not at all. */
+const SUMMARIZATION_TIMEOUT_MS = 60_000
+
 function buildSummarizationPrompt(priorSummary: string | null, toSummarize: Message[]): { role: string; content: string }[] {
   const transcript = toSummarize.map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`).join('\n\n')
   const priorBlock = priorSummary ? `Summary of the conversation so far:\n${priorSummary}\n\n---\n\n` : ''
@@ -175,11 +190,24 @@ function buildSummarizationPrompt(priorSummary: string | null, toSummarize: Mess
  *  second model or a second server. Throws (never silently no-ops) on: conversation not
  *  found, upstream unavailable, nothing worth compacting, or a failed/empty summary — the
  *  caller (maybeAutoCompact for the auto path; the /compact route for the manual path)
- *  decides what "throws" means for its own contract. */
+ *  decides what "throws" means for its own contract.
+ *
+ *  `opts.upstream` is that chat's ALREADY-RESOLVED upstream, passed down by the caller —
+ *  the same shape autoTitle takes (chat-routes.ts), and for the same reason: re-resolving
+ *  here would have to call `resolveChatUpstream(d)` with no requested model, which always
+ *  takes the LOCAL branch. For a Turbo Link chat that either throws `model_not_loaded`
+ *  (compaction silently never runs, forever) or summarizes with whatever unrelated local
+ *  model happens to be up while sizing the tail against ITS context window rather than the
+ *  remote one the 80% trigger was measured against. The fallback below exists only for a
+ *  caller that genuinely has no upstream in hand.
+ *
+ *  `opts.signal` is the turn's own AbortController signal, so Stop can actually reach both
+ *  halves of the wait (gate queue + summarization call) instead of leaving an uninterruptible
+ *  blocking call in the chat turn's critical path. */
 export async function compactConversation(
   d: Deps,
   convId: string,
-  opts?: { fetchImpl?: typeof fetch },
+  opts?: { upstream?: ChatUpstream; signal?: AbortSignal; fetchImpl?: typeof fetch },
 ): Promise<{ summary: string; upToMessageId: string; tokensBefore: number }> {
   const conv = d.db.getConversation(convId, true)
   if (!conv) throw new Error('not_found')
@@ -187,9 +215,14 @@ export async function compactConversation(
 
   const { summary: priorSummary, rest: pool } = resolveCompactionCut(conv, activeMessages)
 
-  const resolved = resolveChatUpstream(d)
-  if (!resolved.ok) throw new Error(resolved.code)
-  const upstream: ChatUpstream = resolved.upstream
+  let upstream: ChatUpstream
+  if (opts?.upstream) {
+    upstream = opts.upstream
+  } else {
+    const resolved = resolveChatUpstream(d)
+    if (!resolved.ok) throw new Error(resolved.code)
+    upstream = resolved.upstream
+  }
 
   const picked = pickCompactionCut(pool, upstream.ctxMax)
   if (!picked) throw new Error('nothing_to_compact')
@@ -200,7 +233,15 @@ export async function compactConversation(
   // Same low-priority-background gate acquisition autoTitle uses (chat-routes.ts) — a
   // compaction call must never contend with real foreground chat/agent work for the
   // local engine's slot queue. Remote turns cost this machine nothing but a socket.
-  const release = d.gate && !upstream.remote ? await d.gate.acquire('bg') : null
+  // Unlike autoTitle (fire-and-forget behind a setTimeout, so its queue wait is invisible),
+  // this is AWAITED inside the turn — hence signal + an explicit timeout, exactly what every
+  // other in-turn acquire in this codebase passes (code-session.ts).
+  const release = d.gate && !upstream.remote
+    ? await d.gate.acquire('bg', { signal: opts?.signal, timeoutMs: COMPACTION_GATE_TIMEOUT_MS })
+    : null
+  // The caller's Stop and the hard cap, together: whichever fires first ends the call.
+  const timeoutSignal = AbortSignal.timeout(SUMMARIZATION_TIMEOUT_MS)
+  const callSignal = opts?.signal ? AbortSignal.any([opts.signal, timeoutSignal]) : timeoutSignal
   let res: Response
   try {
     res = await callChatUpstream(upstream, {
@@ -211,7 +252,7 @@ export async function compactConversation(
       max_tokens: 1024,
       thinking_budget_tokens: 0,
       chat_template_kwargs: { enable_thinking: false },
-    }, AbortSignal.timeout(60_000), opts?.fetchImpl, d)
+    }, callSignal, opts?.fetchImpl, d)
   } finally {
     release?.()
   }
@@ -230,11 +271,19 @@ export async function compactConversation(
  *  compaction fields on success so the caller's own buildEngineMessages call (right after
  *  this returns) sees them without a second DB read. Best-effort, same contract as
  *  autoTitle: a failed compaction must never surface to the user or block the turn — it
- *  just proceeds against the full (uncompacted) history, exactly today's behavior. */
+ *  just proceeds against the full (uncompacted) history, exactly today's behavior.
+ *
+ *  `upstream` and `signal` are REQUIRED, not optional: both call sites are turn routes that
+ *  already hold the turn's resolved upstream and its AbortController, and a compaction that
+ *  guessed either one would be exactly the two defects they exist to prevent (a remote chat
+ *  summarized by an unrelated local model, and a Stop that cannot reach an awaited call).
+ *  Passed straight through — this function re-resolves nothing. */
 export async function maybeAutoCompact(
   d: Deps,
   convId: string,
   conv: Conversation,
+  upstream: ChatUpstream,
+  signal: AbortSignal,
   emitCompactionEvent: (phase: 'start' | 'end') => Promise<void>,
 ): Promise<void> {
   const { ctxUsed, ctxMax } = lastCtxUsage(conv.messages ?? [])
@@ -242,7 +291,7 @@ export async function maybeAutoCompact(
   try { await emitCompactionEvent('start') } catch { /* client gone — same best-effort contract as the compaction call below */ }
   try {
     const fetchImpl = (d as unknown as { __fetchImplForTest?: typeof fetch }).__fetchImplForTest
-    const result = await compactConversation(d, convId, fetchImpl ? { fetchImpl } : undefined)
+    const result = await compactConversation(d, convId, { upstream, signal, ...(fetchImpl ? { fetchImpl } : {}) })
     conv.compactionSummary = result.summary
     conv.compactionUpToMessageId = result.upToMessageId
     conv.compactionTokensBefore = result.tokensBefore

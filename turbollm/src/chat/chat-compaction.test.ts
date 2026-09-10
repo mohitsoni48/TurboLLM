@@ -10,6 +10,7 @@ import {
   compactConversation, maybeAutoCompact,
 } from './chat-compaction.js'
 import type { Conversation, Message } from './db.js'
+import type { ChatUpstream } from './chat-upstream.js'
 import { ConversationStore } from './db.js'
 import { mkdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -239,6 +240,46 @@ function fakeDeps(db: ConversationStore, ctxMax = 8192): Deps {
   } as unknown as Deps
 }
 
+/** What a turn route hands down: the upstream it ALREADY resolved for this turn. Mirrors what
+ *  fakeDeps's fake local engine reports, so the local-path tests below behave exactly as they
+ *  did when compactConversation re-resolved it internally. `ctxMax` must match the fakeDeps
+ *  ctxMax used alongside it — pickCompactionCut now sizes the tail against the PASSED
+ *  upstream's window, not d.manager's. */
+function localUpstream(ctxMax = 8192): ChatUpstream {
+  return { modelField: 'm', modelName: 'Test Model', ctxMax, target: 'http://127.0.0.1:8081' }
+}
+
+/** A linked-host upstream, shaped exactly as resolveChatUpstream's REMOTE branch builds one
+ *  (chat-upstream.ts): unqualified modelField, the host's advertised ctx, and a RemoteTarget.
+ *  `target` is empty — nothing may build a local URL from a remote turn. */
+function remoteUpstream(ctxMax = 200): ChatUpstream {
+  return {
+    modelField: 'Qwen3-30B-A3B',
+    modelName: 'Qwen3 30B A3B (rig)',
+    ctxMax,
+    remote: { linkId: 'link-rig', baseUrl: 'https://rig.example', token: 'link-token-abc', modelKey: 'Qwen3-30B-A3B' },
+    target: '',
+  }
+}
+
+/** Deps with NO usable local engine — every local-resolution dependency throws on contact.
+ *  This is the whole point: `resolveChatUpstream`'s local branch calls `d.manager.status()`
+ *  first thing, so any code path that re-resolves instead of using the upstream it was handed
+ *  fails loudly here instead of silently summarizing a Turbo Link chat on this machine's model
+ *  (or throwing model_not_loaded forever, which is what shipped before this fix). */
+function noLocalEngineDeps(db: ConversationStore): Deps {
+  const boom = (): never => { throw new Error('local engine resolution must not happen when an upstream was passed in') }
+  return {
+    db,
+    store: { snapshot: () => ({ requestLog: { enabled: false } }) },
+    gate: undefined,
+    modelRouter: { resolveRemoteTarget: boom },
+    scanner: { get: () => undefined },
+    registry: { active: boom },
+    manager: { status: boom, target: boom, currentOpts: boom },
+  } as unknown as Deps
+}
+
 test('compactConversation: summarizes the older pool, leaves a raw tail, and persists the cut', async () => {
   const root = makeTmpRoot()
   const db = new ConversationStore(root)
@@ -326,7 +367,10 @@ test('maybeAutoCompact: no-op (no events, no DB change) when under threshold', a
     db.addMessage(conv.id, 'assistant', 'reply', { stats: { ctxUsed: 100, ctxMax: 8192 } })
     const events: string[] = []
     const fresh = db.getConversation(conv.id, true)!
-    await maybeAutoCompact(fakeDeps(db), conv.id, fresh, async (phase) => { events.push(phase) })
+    // upstream + signal are what the turn route hands down (it has both already). A never-
+    // aborted controller stands in for "the user did not press Stop" in every test here
+    // except the abort test further down, which uses a real one.
+    await maybeAutoCompact(fakeDeps(db), conv.id, fresh, localUpstream(), new AbortController().signal, async (phase) => { events.push(phase) })
     assert.deepEqual(events, [])
     assert.equal(db.getConversation(conv.id)!.compactionSummary, undefined)
   } finally {
@@ -352,7 +396,7 @@ test('maybeAutoCompact: fires start/end events, actually compacts, and the conv 
     // doc comment above compactConversation for what this property actually is.
     const d = fakeDeps(db, 200)
     ;(d as unknown as { __fetchImplForTest?: typeof fetch }).__fetchImplForTest = fetchImpl
-    await maybeAutoCompact(d, conv.id, fresh, async (phase) => { events.push(phase) })
+    await maybeAutoCompact(d, conv.id, fresh, localUpstream(200), new AbortController().signal, async (phase) => { events.push(phase) })
     assert.deepEqual(events, ['start', 'end'])
     // The two assertions that actually distinguish "compacted" from "silently no-op'd":
     assert.equal(db.getConversation(conv.id)!.compactionSummary, 'Summary text.')
@@ -378,7 +422,7 @@ test('maybeAutoCompact: a rejecting emitCompactionEvent callback does not crash 
     // The real caller (a later task) wires this to stream.writeSSE, which can reject on a
     // disconnected client — simulate that here.
     const rejectingEmit = async () => { throw new Error('client disconnected') }
-    await assert.doesNotReject(() => maybeAutoCompact(d, conv.id, fresh, rejectingEmit))
+    await assert.doesNotReject(() => maybeAutoCompact(d, conv.id, fresh, localUpstream(200), new AbortController().signal, rejectingEmit))
     // The actual compaction must still have happened despite the emit failures.
     assert.equal(db.getConversation(conv.id)!.compactionSummary, 'Summary text.')
   } finally {
@@ -401,9 +445,141 @@ test('maybeAutoCompact: a failed summarization call is swallowed — the turn is
     // before the network call is ever made.
     const d = fakeDeps(db, 200)
     ;(d as unknown as { __fetchImplForTest?: typeof fetch }).__fetchImplForTest = jsonFetch({}, 500)
-    await assert.doesNotReject(() => maybeAutoCompact(d, conv.id, fresh, async (phase) => { events.push(phase) }))
+    await assert.doesNotReject(() => maybeAutoCompact(d, conv.id, fresh, localUpstream(200), new AbortController().signal, async (phase) => { events.push(phase) }))
     assert.deepEqual(events, ['start', 'end']) // still brackets the attempt even though it failed
     assert.equal(db.getConversation(conv.id)!.compactionSummary, undefined) // nothing persisted
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ── Turbo Link: the passed-in upstream is the one that runs (final-review I-1) ───────────
+//
+// Every test above this point runs against fakeDeps, whose `modelRouter.resolveRemoteTarget`
+// returns undefined — so until these two tests existed, nothing in this branch ever exercised
+// a REMOTE upstream, which is exactly how "compaction silently re-resolves the local engine"
+// survived eight clean task reviews. The proof shape here is deliberate: the Deps stub has no
+// working local engine at all, so a re-resolution cannot quietly succeed and pass anyway.
+
+test('compactConversation: an explicitly-passed REMOTE upstream is used verbatim — the summarization goes to the linked host and the local engine is never consulted', async () => {
+  const root = makeTmpRoot()
+  const db = new ConversationStore(root)
+  try {
+    const conv = db.createConversation({ title: 'Test', modelKey: 'rig/Qwen3-30B-A3B' })
+    for (let i = 0; i < 8; i++) db.addMessage(conv.id, i % 2 === 0 ? 'user' : 'assistant', `message ${i} with enough real content to count as real tokens`)
+
+    let calledUrl: string | undefined
+    let calledBody: string | undefined
+    let authHeader: string | null | undefined
+    const fetchImpl: typeof fetch = (async (url: unknown, init: RequestInit | undefined) => {
+      calledUrl = String(url)
+      calledBody = init?.body as string
+      // link-proxy.ts's linkHeaders() builds a real Headers instance and proxyStream spreads
+      // the init through unchanged, so this is a Headers, not a plain object.
+      authHeader = (init?.headers as Headers | undefined)?.get('X-TurboLLM-Auth') ?? null
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'Remote summary.' } }] }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as unknown as typeof fetch
+
+    // noLocalEngineDeps throws from manager/registry/modelRouter — so this can only succeed if
+    // the passed-in upstream was used INSTEAD of a fresh (always-local) resolution.
+    const result = await compactConversation(noLocalEngineDeps(db), conv.id, { upstream: remoteUpstream(200), fetchImpl })
+
+    assert.equal(result.summary, 'Remote summary.')
+    // Went out over the Turbo Link façade (link-proxy.ts's buildUpstream), not a local engine URL.
+    assert.equal(calledUrl, 'https://rig.example/api/link/v1/chat/completions')
+    assert.equal(authHeader, 'link-token-abc') // ...carrying the link token, i.e. the real remote transport
+    // ...and asked for the HOST's model, not whatever this machine has loaded.
+    assert.equal((JSON.parse(calledBody!) as { model: string }).model, 'Qwen3-30B-A3B')
+    // The cut persists exactly as it does on the local path.
+    const updated = db.getConversation(conv.id)!
+    assert.equal(updated.compactionSummary, 'Remote summary.')
+    assert.equal(updated.compactionUpToMessageId, result.upToMessageId)
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('maybeAutoCompact: hands the upstream it was given straight through — a Turbo Link turn auto-compacts on its own host, never re-resolving locally', async () => {
+  const root = makeTmpRoot()
+  const db = new ConversationStore(root)
+  try {
+    const conv = db.createConversation({ title: 'Test', modelKey: 'rig/Qwen3-30B-A3B' })
+    for (let i = 0; i < 8; i++) db.addMessage(conv.id, i % 2 === 0 ? 'user' : 'assistant', `message ${i} with real content`)
+    db.addMessage(conv.id, 'assistant', 'reply', { stats: { ctxUsed: 9000, ctxMax: 10000 } })
+    const fresh = db.getConversation(conv.id, true)!
+
+    let calledUrl: string | undefined
+    const fetchImpl: typeof fetch = (async (url: unknown) => {
+      calledUrl = String(url)
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'Remote summary.' } }] }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as unknown as typeof fetch
+
+    const d = noLocalEngineDeps(db)
+    ;(d as unknown as { __fetchImplForTest?: typeof fetch }).__fetchImplForTest = fetchImpl
+    await maybeAutoCompact(d, conv.id, fresh, remoteUpstream(200), new AbortController().signal, async () => {})
+
+    assert.equal(calledUrl, 'https://rig.example/api/link/v1/chat/completions')
+    // maybeAutoCompact swallows every failure, so the DB write is the only honest proof it did
+    // not fall through to the local path (which would have thrown and been silently absorbed).
+    assert.equal(db.getConversation(conv.id)!.compactionSummary, 'Remote summary.')
+    assert.equal(fresh.compactionSummary, 'Remote summary.')
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ── the turn's Stop reaches both halves of the wait (final-review I-3) ───────────────────
+
+test('compactConversation: the gate acquire carries the caller\'s abort signal and a bounded timeout, and the slot is always released', async () => {
+  const root = makeTmpRoot()
+  const db = new ConversationStore(root)
+  try {
+    const conv = db.createConversation({ title: 'Test', modelKey: 'local-model' })
+    for (let i = 0; i < 8; i++) db.addMessage(conv.id, i % 2 === 0 ? 'user' : 'assistant', `message ${i} with real content`)
+    const acquired: Array<{ priority: string; opts?: { signal?: AbortSignal; timeoutMs?: number } }> = []
+    let releases = 0
+    // fakeDeps sets `gate: undefined`, so no test used to reach the acquire at all — this stub
+    // is what makes the acquire's arguments observable.
+    const d = fakeDeps(db, 200)
+    ;(d as unknown as { gate: unknown }).gate = {
+      acquire: async (priority: 'fg' | 'bg', opts?: { signal?: AbortSignal; timeoutMs?: number }) => {
+        acquired.push({ priority, opts })
+        return () => { releases++ }
+      },
+    }
+    const ac = new AbortController()
+    await compactConversation(d, conv.id, { upstream: localUpstream(200), signal: ac.signal, fetchImpl: jsonFetch({ choices: [{ message: { content: 'Summary text.' } }] }) })
+
+    assert.equal(acquired.length, 1)
+    assert.equal(acquired[0].priority, 'bg')          // never fg — compaction is background work
+    assert.equal(acquired[0].opts?.signal, ac.signal) // Stop can give up on a queued wait
+    assert.equal(acquired[0].opts?.timeoutMs, 60_000) // NOT gate.ts's 180s default
+    assert.equal(releases, 1)                         // released even though the call succeeded through a finally
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('compactConversation: an aborted caller signal reaches the summarization call itself, and nothing is persisted', async () => {
+  const root = makeTmpRoot()
+  const db = new ConversationStore(root)
+  try {
+    const conv = db.createConversation({ title: 'Test', modelKey: 'local-model' })
+    for (let i = 0; i < 8; i++) db.addMessage(conv.id, i % 2 === 0 ? 'user' : 'assistant', `message ${i} with real content`)
+    // A real fetch rejects on an aborted signal; the fakes elsewhere in this file ignore it, so
+    // this one checks it explicitly — that check IS the assertion.
+    const fetchImpl: typeof fetch = (async (_url: unknown, init: RequestInit | undefined) => {
+      if ((init?.signal as AbortSignal | undefined)?.aborted) throw new DOMException('The operation was aborted.', 'AbortError')
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'should never be reached' } }] }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as unknown as typeof fetch
+    const ac = new AbortController()
+    ac.abort()
+    await assert.rejects(() => compactConversation(fakeDeps(db, 200), conv.id, { upstream: localUpstream(200), signal: ac.signal, fetchImpl }))
+    assert.equal(db.getConversation(conv.id)!.compactionSummary, undefined)
   } finally {
     db.close()
     rmSync(root, { recursive: true, force: true })

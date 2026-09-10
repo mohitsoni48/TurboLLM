@@ -292,7 +292,10 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       // Auto-compact (ADR-420): checked BEFORE this turn's messages are built, using the
       // history as it stood before this turn's own user+placeholder rows were added —
       // exactly the "last completed turn's usage" the 80% threshold is meant to judge.
-      await maybeAutoCompact(d, convId, conv, (phase) => stream.writeSSE({ event: 'compaction', data: JSON.stringify({ phase }) }))
+      // `upstream` is THIS turn's already-resolved upstream (local or linked host) and `ac`
+      // is its abort — both are handed down rather than re-derived, so a Turbo Link chat
+      // summarizes on the host it is actually talking to and Stop can interrupt the wait.
+      await maybeAutoCompact(d, convId, conv, upstream, ac.signal, (phase) => stream.writeSSE({ event: 'compaction', data: JSON.stringify({ phase }) }))
 
       // Build messages array for engine (chat-compaction.ts — folds in the compaction
       // summary + cut when one is resolvable; a plain passthrough when not).
@@ -365,7 +368,8 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       // Auto-compact (ADR-420): checked BEFORE this turn's messages are built, using the
       // history as it stood before this turn's own user+placeholder rows were added —
       // exactly the "last completed turn's usage" the 80% threshold is meant to judge.
-      await maybeAutoCompact(d, convId, conv, (phase) => stream.writeSSE({ event: 'compaction', data: JSON.stringify({ phase }) }))
+      // Same upstream/abort hand-down as the /messages route above — see its comment.
+      await maybeAutoCompact(d, convId, conv, upstream, ac.signal, (phase) => stream.writeSSE({ event: 'compaction', data: JSON.stringify({ phase }) }))
 
       // Build messages array for engine from the existing (already-trimmed) history
       // (chat-compaction.ts — folds in the compaction summary + cut when one is
@@ -432,10 +436,19 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   // compactConversation call; this route just exposes it standalone, outside a turn.
   app.post('/api/v1/conversations/:id/compact', async (c) => {
     const convId = c.req.param('id')
-    if (!db.getConversation(convId)) return err(c, 404, 'not_found', 'Conversation not found.')
+    const conv = db.getConversation(convId)
+    if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
     if (inflight.has(convId)) return err(c, 409, 'generation_in_flight', 'Stop generation first.')
+    // Resolved HERE, like the two turn routes, rather than left to compactConversation to
+    // re-derive: a bare resolveChatUpstream(d) always lands on the local engine, which for a
+    // Turbo Link chat means either a hard 'model_not_loaded' or a summary written by an
+    // unrelated local model. Standing outside a turn there is no per-request `model` field to
+    // read, so the conversation's own bound `modelKey` (set at creation) is the hint — the
+    // same qualified `<machine>/<model>` id the composer would have sent for this chat.
+    const resolved = resolveChatUpstream(d, conv.modelKey)
+    if (!resolved.ok) return err(c, resolved.status, resolved.code, resolved.message)
     try {
-      await compactConversation(d, convId)
+      await compactConversation(d, convId, { upstream: resolved.upstream })
     } catch (e) {
       const code = e instanceof Error ? e.message : 'compaction_failed'
       if (code === 'nothing_to_compact') return err(c, 400, 'nothing_to_compact', 'Not enough history yet to compact.')
