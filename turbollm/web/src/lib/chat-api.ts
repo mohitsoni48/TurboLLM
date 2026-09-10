@@ -80,6 +80,16 @@ export function regenerate(convId: string): Promise<{ ok: true }> {
   return req(`/api/v1/conversations/${encodeURIComponent(convId)}/regenerate`, { method: 'POST', json: {} })
 }
 
+// ── Compaction (ADR-420) ─────────────────────────────────────────────────────
+
+export function compactConversation(id: string): Promise<Conversation> {
+  return req(`/api/v1/conversations/${encodeURIComponent(id)}/compact`, { method: 'POST', json: {} })
+}
+
+export function undoCompaction(id: string): Promise<Conversation> {
+  return req(`/api/v1/conversations/${encodeURIComponent(id)}/compact`, { method: 'DELETE' })
+}
+
 // ── Auto-memory (Release 3) ─────────────────────────────────────────────────────
 
 export function listMemoryFacts(): Promise<{ facts: MemoryFact[] }> {
