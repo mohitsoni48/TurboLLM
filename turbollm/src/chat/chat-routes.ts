@@ -8,7 +8,7 @@ import { feedChunk, flushState, initParseState, type ParseState } from './parser
 import { needsExtraPass } from './think-utils'
 import { parseReasoningEffort, type ReasoningEffort } from './reasoning-effort'
 import { sseSink, type EmitSink } from './emit-sink.js'
-import { buildEngineMessages } from './chat-compaction.js'
+import { buildEngineMessages, maybeAutoCompact, compactConversation } from './chat-compaction.js'
 
 import type { ClaimVerdict, ConversationStore, MessageStats, ResearchMeta, ResearchSource, ToolCallRecord } from './db'
 import { checkReply } from '../tools/research-referee.js'
@@ -289,6 +289,11 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       // Emit meta event
       await stream.writeSSE({ event: 'meta', data: JSON.stringify({ userMessageId: userMsg.id, assistantMessageId: assistantMsg.id }) })
 
+      // Auto-compact (ADR-420): checked BEFORE this turn's messages are built, using the
+      // history as it stood before this turn's own user+placeholder rows were added —
+      // exactly the "last completed turn's usage" the 80% threshold is meant to judge.
+      await maybeAutoCompact(d, convId, conv, (phase) => stream.writeSSE({ event: 'compaction', data: JSON.stringify({ phase }) }))
+
       // Build messages array for engine (chat-compaction.ts — folds in the compaction
       // summary + cut when one is resolvable; a plain passthrough when not).
       const allMsgs = (conv.messages ?? []).filter(m => m.id !== assistantMsg.id)
@@ -357,6 +362,11 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       // Emit meta event (no new user message — reuse the existing last user message id)
       await stream.writeSSE({ event: 'meta', data: JSON.stringify({ userMessageId: lastUser.id, assistantMessageId: assistantMsg.id }) })
 
+      // Auto-compact (ADR-420): checked BEFORE this turn's messages are built, using the
+      // history as it stood before this turn's own user+placeholder rows were added —
+      // exactly the "last completed turn's usage" the 80% threshold is meant to judge.
+      await maybeAutoCompact(d, convId, conv, (phase) => stream.writeSSE({ event: 'compaction', data: JSON.stringify({ phase }) }))
+
       // Build messages array for engine from the existing (already-trimmed) history
       // (chat-compaction.ts — folds in the compaction summary + cut when one is
       // resolvable; a plain passthrough when not).
@@ -415,6 +425,32 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     if (!msg || msg.convId !== convId) return err(c, 404, 'not_found', 'Message not found.')
     db.deleteMessage(msgId)
     return c.json({ ok: true })
+  })
+
+  // Manual compaction (ADR-420) — the header button. Auto-compact (maybeAutoCompact,
+  // called from the two turn-starting routes above) is the SAME underlying
+  // compactConversation call; this route just exposes it standalone, outside a turn.
+  app.post('/api/v1/conversations/:id/compact', async (c) => {
+    const convId = c.req.param('id')
+    if (!db.getConversation(convId)) return err(c, 404, 'not_found', 'Conversation not found.')
+    if (inflight.has(convId)) return err(c, 409, 'generation_in_flight', 'Stop generation first.')
+    try {
+      await compactConversation(d, convId)
+    } catch (e) {
+      const code = e instanceof Error ? e.message : 'compaction_failed'
+      if (code === 'nothing_to_compact') return err(c, 400, 'nothing_to_compact', 'Not enough history yet to compact.')
+      return err(c, 500, 'compaction_failed', 'Could not summarize this conversation.')
+    }
+    return c.json(db.getConversation(convId)!)
+  })
+
+  // Undo (ADR-420) — nulls the three compaction columns. No message is touched; this is a
+  // pure metadata revert, matching clearConversationCompaction's own doc comment.
+  app.delete('/api/v1/conversations/:id/compact', (c) => {
+    const convId = c.req.param('id')
+    if (!db.getConversation(convId)) return err(c, 404, 'not_found', 'Conversation not found.')
+    db.clearConversationCompaction(convId)
+    return c.json(db.getConversation(convId)!)
   })
 
   app.post('/api/v1/conversations/:id/regenerate', (c) => {
