@@ -239,7 +239,7 @@ export async function maybeAutoCompact(
 ): Promise<void> {
   const { ctxUsed, ctxMax } = lastCtxUsage(conv.messages ?? [])
   if (!shouldAutoCompact(ctxUsed, ctxMax)) return
-  await emitCompactionEvent('start')
+  try { await emitCompactionEvent('start') } catch { /* client gone — same best-effort contract as the compaction call below */ }
   try {
     const fetchImpl = (d as unknown as { __fetchImplForTest?: typeof fetch }).__fetchImplForTest
     const result = await compactConversation(d, convId, fetchImpl ? { fetchImpl } : undefined)
@@ -249,5 +249,5 @@ export async function maybeAutoCompact(
   } catch {
     // Best-effort — see doc comment above.
   }
-  await emitCompactionEvent('end')
+  try { await emitCompactionEvent('end') } catch { /* client gone */ }
 }

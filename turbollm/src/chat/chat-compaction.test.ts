@@ -363,6 +363,30 @@ test('maybeAutoCompact: fires start/end events, actually compacts, and the conv 
   }
 })
 
+test('maybeAutoCompact: a rejecting emitCompactionEvent callback does not crash the function or block the actual compaction', async () => {
+  const root = makeTmpRoot()
+  const db = new ConversationStore(root)
+  try {
+    const conv = db.createConversation({ title: 'Test', modelKey: 'local-model' })
+    for (let i = 0; i < 8; i++) db.addMessage(conv.id, i % 2 === 0 ? 'user' : 'assistant', `message ${i} with real content`)
+    db.addMessage(conv.id, 'assistant', 'reply', { stats: { ctxUsed: 9000, ctxMax: 10000 } })
+    const fresh = db.getConversation(conv.id, true)!
+    // Small ctx again — same reason as the other maybeAutoCompact tests: needs a real cut so
+    // compactConversation actually runs (and writes to the DB) rather than short-circuiting.
+    const d = fakeDeps(db, 200)
+    ;(d as unknown as { __fetchImplForTest?: typeof fetch }).__fetchImplForTest = jsonFetch({ choices: [{ message: { content: 'Summary text.' } }] })
+    // The real caller (a later task) wires this to stream.writeSSE, which can reject on a
+    // disconnected client — simulate that here.
+    const rejectingEmit = async () => { throw new Error('client disconnected') }
+    await assert.doesNotReject(() => maybeAutoCompact(d, conv.id, fresh, rejectingEmit))
+    // The actual compaction must still have happened despite the emit failures.
+    assert.equal(db.getConversation(conv.id)!.compactionSummary, 'Summary text.')
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('maybeAutoCompact: a failed summarization call is swallowed — the turn is never blocked (same best-effort contract as autoTitle)', async () => {
   const root = makeTmpRoot()
   const db = new ConversationStore(root)
