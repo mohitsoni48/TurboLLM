@@ -552,7 +552,7 @@ export function registerTerminalWs(server: import('http').Server, _d: Deps): voi
     // WebSocket handshake, so the key travels as a `key` query param instead of the
     // `X-TurboLLM-Auth` header the REST client uses (verifyKeyValue is the same
     // credential check either way).
-    const local = isLocalUpgrade(socket.remoteAddress, request.headers, _d)
+    const local = isLocalUpgrade(socket.remoteAddress, socket.localPort, request.headers, _d)
     if (!local && !verifyKeyValue(url.searchParams.get('key') ?? '', _d)) {
       socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n')
       socket.destroy()

@@ -6,13 +6,17 @@ import type { ApiKey } from './config/config'
 import type { Context } from 'hono'
 import type { Deps } from './deps'
 
-// Regression tests for ADR-152: a Cloud Launch tunnel's local leg connects via
-// 127.0.0.1, same as a genuinely local caller — so a request that actually traversed
-// the tunnel must never bypass auth via the loopback check. `tunneled` below is the
-// per-REQUEST signal (verified against a live cloudflared tunnel: Cloudflare's edge
-// injects cf-ray/cf-connecting-ip on every proxied request; a direct local request has
-// neither) — NOT a whole-daemon "a tunnel is active somewhere" flag, since that
-// broader form would also block the daemon's own local CLI tooling (--stop, launch).
+// Regression tests for ADR-152/ADR-422: a tunnel's local leg connects via 127.0.0.1,
+// same as a genuinely local caller — so a request that actually traversed remote access
+// must never bypass auth via the loopback check. `tunneled` below is the per-REQUEST
+// signal — originally verified against a live cloudflared tunnel's cf-ray header
+// (ADR-153, superseded by ADR-422's ingress-socket check: see auth.remote.test.ts for the
+// signal's own unit tests) — NOT a whole-daemon "remote access is active somewhere" flag,
+// since that broader form would also block the daemon's own local CLI tooling (--stop,
+// launch). The `bypassesAuth` tests below take `tunneled` as a plain boolean and so are
+// unaffected by how it's derived; `isLocalRequest`/`isLocalOrAuthenticated`/`codeAuth`
+// simulate it via `fakeDeps`'s/`fakeDepsWithKeys`'s `ingressPort` + a matching
+// `fakeContext`/`fakeMiddlewareContext` `localPort`, in place of the old cf-ray header.
 
 test('bypassesAuth: default state (no LAN, no tunnel) is a pure pass-through', () => {
   assert.equal(
@@ -89,31 +93,40 @@ test('bypassesAuth: tunneled + a genuinely remote caller (loopback=false) is sti
 
 // isLocalRequest gates local-admin actions that execute a caller-supplied binary
 // (add/scan engine, build-from-source, CUDA download) — a request that actually
-// traversed the tunnel must not reach these just because it LOOKS loopback, but the
-// daemon's own genuinely-local access (no Cloudflare headers) must be unaffected.
+// traversed remote access must not reach these just because it LOOKS loopback, but the
+// daemon's own genuinely-local access (not on the ingress socket) must be unaffected.
+//
+// NOTE (ADR-422): isTunneled is now keyed off which LOCAL port the request arrived on
+// (see auth.ts), not cf-ray. `fakeDeps`'s `ingressPort` and `fakeContext`'s `localPort`
+// simulate that socket instead of a header.
 
-function fakeDeps(overrides: { lanBind?: boolean; tunnelActive?: boolean; requireApiKey?: boolean }): Deps {
+function fakeDeps(overrides: { lanBind?: boolean; tunnelActive?: boolean; requireApiKey?: boolean; ingressPort?: number }): Deps {
   return {
     store: { snapshot: () => ({ daemon: { lanBind: overrides.lanBind ?? false, requireApiKey: overrides.requireApiKey ?? false } } as ReturnType<Deps['store']['snapshot']>) },
     tunnel: overrides.tunnelActive !== undefined ? ({ active: () => overrides.tunnelActive } as Deps['tunnel']) : undefined,
+    remote: overrides.ingressPort !== undefined ? ({ ingressPort: () => overrides.ingressPort } as Deps['remote']) : undefined,
   } as unknown as Deps
 }
 
-function fakeContext(headers: Record<string, string | undefined>): Context {
-  return { req: { header: (name: string) => headers[name.toLowerCase()] } } as unknown as Context
+function fakeContext(headers: Record<string, string | undefined>, localPort?: number): Context {
+  return {
+    req: { header: (name: string) => headers[name.toLowerCase()] },
+    env: localPort !== undefined ? { incoming: { socket: { localPort } } } : {},
+  } as unknown as Context
 }
 
-test('isLocalRequest: a tunneled request (cf-ray present) is never local, even though it looks loopback', () => {
-  const d = fakeDeps({ lanBind: false, tunnelActive: true })
-  const c = fakeContext({ 'cf-ray': 'abc123-DEL' })
+test('isLocalRequest: a tunneled request (arrived on the ingress socket) is never local, even though it looks loopback', () => {
+  const d = fakeDeps({ lanBind: false, ingressPort: 6997 })
+  const c = fakeContext({}, 6997)
   assert.equal(isLocalRequest(c, d), false)
 })
 
-test('isLocalRequest: tunnel active but THIS request carries no Cloudflare headers is still local', () => {
-  // The exact case that broke --stop/launch under the earlier (overbroad) fix: the
-  // tunnel is running, but this particular request is genuinely local.
-  const d = fakeDeps({ lanBind: false, tunnelActive: true })
-  const c = fakeContext({})
+test('isLocalRequest: an ingress listener is bound but THIS request did not arrive on it is still local', () => {
+  // The exact case that broke --stop/launch under the earlier (overbroad) cf-ray fix,
+  // restated against the new signal: the ingress listener is bound, but this particular
+  // request landed on the main port, not the ingress port.
+  const d = fakeDeps({ lanBind: false, ingressPort: 6997 })
+  const c = fakeContext({}, 6996)
   assert.equal(isLocalRequest(c, d), true)
 })
 
@@ -125,25 +138,25 @@ test('isLocalRequest: loopback-only bind with no tunnel at all is still always l
 
 // isLocalOrAuthenticated (agent actions: runs/config/skills, which execute on the host)
 // must inherit the SAME tunnel-safety guarantee as isLocalRequest — a request that
-// actually traversed the Cloud Launch tunnel looks loopback too, so it must never take
-// the bare loopback shortcut; it has to fall through to the requireApiKey check just
-// like any other non-loopback caller (ADR-152).
+// actually traversed remote access looks loopback too, so it must never take the bare
+// loopback shortcut; it has to fall through to the requireApiKey check just like any
+// other non-loopback caller (ADR-422, formerly ADR-152).
 
 test('isLocalOrAuthenticated: THE CRITICAL CASE — a tunneled request that looks loopback must NOT bypass without a key', () => {
-  const d = fakeDeps({ lanBind: false, tunnelActive: true, requireApiKey: false })
-  const c = fakeContext({ 'cf-ray': 'abc123-DEL' })
+  const d = fakeDeps({ lanBind: false, ingressPort: 6997, requireApiKey: false })
+  const c = fakeContext({}, 6997)
   assert.equal(isLocalOrAuthenticated(c, d), false)
 })
 
 test('isLocalOrAuthenticated: a tunneled request is allowed once requireApiKey is on (lanAuth already verified the key)', () => {
-  const d = fakeDeps({ lanBind: false, tunnelActive: true, requireApiKey: true })
-  const c = fakeContext({ 'cf-ray': 'abc123-DEL' })
+  const d = fakeDeps({ lanBind: false, ingressPort: 6997, requireApiKey: true })
+  const c = fakeContext({}, 6997)
   assert.equal(isLocalOrAuthenticated(c, d), true)
 })
 
-test('isLocalOrAuthenticated: tunnel active but THIS request carries no Cloudflare headers is still local', () => {
-  const d = fakeDeps({ lanBind: false, tunnelActive: true, requireApiKey: false })
-  const c = fakeContext({})
+test('isLocalOrAuthenticated: an ingress listener is bound but THIS request did not arrive on it is still local', () => {
+  const d = fakeDeps({ lanBind: false, ingressPort: 6997, requireApiKey: false })
+  const c = fakeContext({}, 6996)
   assert.equal(isLocalOrAuthenticated(c, d), true)
 })
 
@@ -294,7 +307,7 @@ test('provisionBootstrapApiKey: a specific LAN address counts as non-loopback to
 const RAW_KEY = 'tllm-testkeyABCDEFGHIJKLMNOPQRSTUVWXYZ01'
 const RAW_KEY_HASH = createHash('sha256').update(RAW_KEY).digest('hex')
 
-function fakeDepsWithKeys(overrides: { lanBind?: boolean; tunnelActive?: boolean; hasKey?: boolean; granted?: string[] }): Deps {
+function fakeDepsWithKeys(overrides: { lanBind?: boolean; tunnelActive?: boolean; ingressPort?: number; hasKey?: boolean; granted?: string[] }): Deps {
   const apiKeys = overrides.hasKey
     ? [{
         id: 'k1', name: 'test', hash: RAW_KEY_HASH, prefix: RAW_KEY.slice(0, 12), createdAt: '', lastUsedAt: null,
@@ -312,6 +325,7 @@ function fakeDepsWithKeys(overrides: { lanBind?: boolean; tunnelActive?: boolean
       update: (fn: (cfg: { apiKeys: typeof apiKeys }) => void) => fn({ apiKeys }),
     },
     tunnel: overrides.tunnelActive !== undefined ? ({ active: () => overrides.tunnelActive } as Deps['tunnel']) : undefined,
+    remote: overrides.ingressPort !== undefined ? ({ ingressPort: () => overrides.ingressPort } as Deps['remote']) : undefined,
   } as unknown as Deps
 }
 
@@ -343,10 +357,11 @@ test('verifyPresentedKey: the correct key via Authorization: Bearer → true', (
  *  everything lanAuth's own test suite above stops short of (it only tests the pure
  *  bypassesAuth/isLocalRequest logic). Records what json() returned, if anything; each test
  *  tracks whether its own next() ran via its own local closure variable. */
-function fakeMiddlewareContext(headers: Record<string, string | undefined>): { c: Context; jsonResult: () => { body: unknown; status: number } | undefined } {
+function fakeMiddlewareContext(headers: Record<string, string | undefined>, localPort?: number): { c: Context; jsonResult: () => { body: unknown; status: number } | undefined } {
   let jsonResult: { body: unknown; status: number } | undefined
   const c = {
     req: { header: (name: string) => headers[name.toLowerCase()] },
+    env: localPort !== undefined ? { incoming: { socket: { localPort } } } : {},
     json: (body: unknown, status: number) => { jsonResult = { body, status }; return jsonResult },
   } as unknown as Context
   return { c, jsonResult: () => jsonResult }
@@ -389,8 +404,8 @@ test('codeAuth: LAN-exposed + a WRONG key presented → still 401', async () => 
 })
 
 test('codeAuth: a genuinely tunneled request is never treated as local, even with lanBind off', async () => {
-  const d = fakeDepsWithKeys({ lanBind: false, tunnelActive: true, hasKey: true })
-  const { c, jsonResult } = fakeMiddlewareContext({ 'cf-ray': 'abc123-DEL' })
+  const d = fakeDepsWithKeys({ lanBind: false, ingressPort: 6997, hasKey: true })
+  const { c, jsonResult } = fakeMiddlewareContext({}, 6997)
   let called = false
   await codeAuth(d)(c, async () => { called = true })
   assert.equal(called, false)

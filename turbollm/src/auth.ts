@@ -5,17 +5,17 @@
 // gateway surface must carry a valid API key. Loopback is always exempt so the
 // local browser UI and `turbollm launch claude` keep working with no key.
 //
-// A Cloud Launch tunnel (ADR-045/152) breaks the loopback-as-trust assumption BY
-// ADDRESS ALONE: cloudflared's local leg connects to 127.0.0.1 too, so a request
-// that arrived over the public tunnel URL LOOKS identical to a trusted local caller
-// by address. The fix is NOT "distrust all loopback whenever a tunnel is merely
-// active" — that would also break the daemon's own local CLI tooling (`--stop`,
-// `launch claude`), which has no way to hold a usable key (only hashes are ever
-// stored). Verified empirically against a live cloudflared quick tunnel: Cloudflare's
-// edge injects `cf-ray`/`cf-connecting-ip` on every request it proxies, and a direct
-// local request carries neither — a remote caller can't spoof these away (Cloudflare's
-// edge controls them, not the client), so `isTunneled` below is a precise per-REQUEST
-// signal, not a whole-daemon flag.
+// Remote access (ADR-422, formerly the Cloud Launch tunnel of ADR-045/152) breaks the
+// loopback-as-trust assumption BY ADDRESS ALONE: every provider's local leg connects to
+// 127.0.0.1 too, so a request that arrived over the public URL LOOKS identical to a
+// trusted local caller by address. The fix is NOT "distrust all loopback whenever remote
+// access is merely active" — that would also break the daemon's own local CLI tooling
+// (`--stop`, `launch claude`), which has no way to hold a usable key (only hashes are ever
+// stored). `isTunneled` below instead keys off which LOCAL TCP port the connection arrived
+// on: the ingress listener binds a dedicated loopback port that only a provider's local leg
+// ever connects to, and a client cannot choose which of the daemon's sockets it lands on —
+// unlike a header, which only worked for Cloudflare because its edge (not the client)
+// controlled it.
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { getConnInfo } from '@hono/node-server/conninfo'
 import type { Context, MiddlewareHandler } from 'hono'
@@ -179,17 +179,38 @@ function isLoopback(c: Context): boolean | null {
   return LOOPBACK.has(addr)
 }
 
-/** True when THIS request actually traversed the Cloud Launch tunnel, as opposed to
- *  "a tunnel merely happens to be active elsewhere". Cloudflare's edge injects
- *  `cf-ray`/`cf-connecting-ip` on every request it proxies (verified empirically
- *  against a live quick tunnel) — a direct local request carries neither. A local
- *  caller forging these headers on their own request only makes THAT request MORE
- *  restricted (still needs a key), never less — it can't be used to impersonate a
- *  local caller from the remote side, since Cloudflare's edge (not the client)
- *  controls what a genuinely tunneled request carries. */
+/** The LOCAL port this connection arrived on, or undefined when it can't be determined.
+ *
+ *  Mirrors how @hono/node-server's own getConnInfo resolves its binding
+ *  (`c.env.server ? c.env.server : c.env`, then `.incoming.socket`) — verified against the
+ *  installed 2.1.0 dist. Unlike a header, a client cannot choose which of the daemon's
+ *  sockets its connection landed on, which is the whole point (ADR-422). */
+export function localPort(c: Context): number | undefined {
+  try {
+    const env = c.env as {
+      server?: { incoming?: { socket?: { localPort?: number } } }
+      incoming?: { socket?: { localPort?: number } }
+    }
+    const bindings = env?.server ? env.server : env
+    return bindings?.incoming?.socket?.localPort
+  } catch {
+    return undefined
+  }
+}
+
+/** True when THIS request actually arrived over remote access, as opposed to "remote access
+ *  merely happens to be on". Keyed off the dedicated loopback ingress socket (ADR-422,
+ *  spec 30 §2.2), which every provider's local leg connects to and nothing else does.
+ *
+ *  Replaces ADR-153's cf-ray/cf-connecting-ip check. That check was only ever safe because
+ *  Cloudflare's edge controlled the header; Tailscale Funnel, ngrok and a user-run frp inject
+ *  no equivalent, so a header-based signal would have read every one of them as a trusted
+ *  loopback caller and waved them through with no key at all. The socket cannot be forged in
+ *  either direction. */
 function isTunneled(c: Context, d: Deps): boolean {
-  if (!d.tunnel?.active()) return false
-  return !!(c.req.header('cf-ray') || c.req.header('cf-connecting-ip'))
+  const ingress = d.remote?.ingressPort()
+  if (ingress === undefined) return false
+  return localPort(c) === ingress
 }
 
 /** True when a request is local to the daemon host: either the daemon is loopback-only
@@ -227,10 +248,17 @@ export function hostGate(c: Context, d: Deps): boolean {
 }
 
 /** Same decision as {@link isLocalRequest}, for the one surface that has no Hono `Context`:
- *  the raw `http.Server` 'upgrade' event a WebSocket handshake arrives on (registerTerminalWs).
- *  Takes the remote address and headers directly instead of pulling them off a Context. */
-export function isLocalUpgrade(remoteAddress: string | undefined, headers: NodeJS.Dict<string | string[]>, d: Deps): boolean {
-  const tunneled = !!d.tunnel?.active() && !!(headers['cf-ray'] || headers['cf-connecting-ip'])
+ *  the raw `http.Server` 'upgrade' event a WebSocket handshake arrives on
+ *  (registerTerminalWs). Takes the socket's remote address and LOCAL port directly instead
+ *  of pulling them off a Context — the local port is the ingress signal (ADR-422). */
+export function isLocalUpgrade(
+  remoteAddress: string | undefined,
+  socketLocalPort: number | undefined,
+  _headers: NodeJS.Dict<string | string[]>,
+  d: Deps,
+): boolean {
+  const ingress = d.remote?.ingressPort()
+  const tunneled = ingress !== undefined && socketLocalPort === ingress
   if (tunneled) return false
   if (!d.store.snapshot().daemon.lanBind) return true // loopback-only bind → always local
   return !!remoteAddress && LOOPBACK.has(remoteAddress)
