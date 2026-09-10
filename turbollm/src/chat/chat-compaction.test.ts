@@ -7,8 +7,14 @@ import { test } from 'node:test'
 import {
   withCurrentDate, shouldAutoCompact, lastCtxUsage, resolveCompactionCut,
   buildEngineMessages, pickCompactionCut, AUTO_COMPACT_THRESHOLD,
+  compactConversation, maybeAutoCompact,
 } from './chat-compaction.js'
 import type { Conversation, Message } from './db.js'
+import { ConversationStore } from './db.js'
+import { mkdirSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import type { Deps } from '../deps.js'
 
 function makeMsg(role: 'user' | 'assistant', content: string, overrides: Partial<Message> = {}): Message {
   return {
@@ -191,4 +197,191 @@ test('pickCompactionCut: cutMessageId is the LAST message being summarized, and 
 test('pickCompactionCut: returns null when the whole pool already fits the tail budget (nothing worth cutting)', () => {
   const messages = [makeMsg('user', 'a'), makeMsg('assistant', 'b'), makeMsg('user', 'c'), makeMsg('assistant', 'd')]
   assert.equal(pickCompactionCut(messages, 1_000_000), null)
+})
+
+// ── compactConversation / maybeAutoCompact ──────────────────────────────────────────────
+
+function makeTmpRoot(): string {
+  const dir = join(tmpdir(), `turbollm-chat-compaction-test-${Date.now()}-${Math.floor(Math.random() * 1e9)}`)
+  mkdirSync(dir, { recursive: true })
+  return dir
+}
+
+/** Same shape as chat-upstream.request-log.test.ts's own jsonFetch — a fake fetchImpl that
+ *  answers the ONE outbound chat-completions call callChatUpstream makes, so
+ *  compactConversation never touches a real network or a real engine. */
+function jsonFetch(payload: unknown, status = 200): typeof fetch {
+  return (async () => new Response(JSON.stringify(payload), { status, headers: { 'content-type': 'application/json' } })) as typeof fetch
+}
+
+// resolveChatUpstream's LOCAL branch (chat-upstream.ts:87-104, the path taken whenever no
+// requestedModel is passed — every call in this file) reads d.manager.status()/.target()/
+// .currentOpts() and d.registry.active(), none of which the DB-only stub used elsewhere in
+// this file provides. Mirrors chat-routes.persist.test.ts's own mkHarness() stub for exactly
+// these fields — verified against that file rather than guessed. `ctxMax` is a parameter
+// (default 8192) rather than hardcoded because several tests below need it deliberately
+// SMALL — pickCompactionCut's tail budget is ~40% of it, and with the default 8192 every
+// short fixture conversation in this file fits entirely inside that budget, making
+// pickCompactionCut return null (nothing worth cutting) instead of exercising a real cut.
+function fakeDeps(db: ConversationStore, ctxMax = 8192): Deps {
+  return {
+    db,
+    store: { snapshot: () => ({ requestLog: { enabled: false } }) },
+    gate: undefined,
+    modelRouter: { resolveRemoteTarget: () => undefined },
+    scanner: { get: () => undefined },
+    registry: { active: () => ({ kind: 'llama.cpp', id: 'e1', capabilities: {} }) },
+    manager: {
+      status: () => ({ state: 'running', model: { key: 'm', name: 'Test Model', ctx: ctxMax } }),
+      target: () => 'http://127.0.0.1:8081',
+      currentOpts: () => null,
+    },
+  } as unknown as Deps
+}
+
+test('compactConversation: summarizes the older pool, leaves a raw tail, and persists the cut', async () => {
+  const root = makeTmpRoot()
+  const db = new ConversationStore(root)
+  try {
+    const conv = db.createConversation({ title: 'Test', modelKey: 'local-model' })
+    for (let i = 0; i < 8; i++) db.addMessage(conv.id, i % 2 === 0 ? 'user' : 'assistant', `message ${i} with enough real content to count as real tokens`)
+    const fetchImpl = jsonFetch({ choices: [{ message: { content: 'The user and assistant exchanged eight messages about testing.' } }] })
+    // ctxMax deliberately small (200, via fakeDeps's second param): pickCompactionCut's tail
+    // budget is ~40% of ctxMax, and these 8 short fixture messages would ALL fit inside the
+    // tail budget of the default 8192 — meaning pickCompactionCut would return null and this
+    // test would get nothing_to_compact instead of a real compaction. A small ctxMax forces a
+    // genuine cut, exercising the real code path this test is named for.
+    const result = await compactConversation(fakeDeps(db, 200), conv.id, { fetchImpl })
+    assert.equal(result.summary, 'The user and assistant exchanged eight messages about testing.')
+    assert.ok(result.tokensBefore > 0)
+    const updated = db.getConversation(conv.id)!
+    assert.equal(updated.compactionSummary, result.summary)
+    assert.equal(updated.compactionUpToMessageId, result.upToMessageId)
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('compactConversation: throws nothing_to_compact for a conversation too short to bother', async () => {
+  const root = makeTmpRoot()
+  const db = new ConversationStore(root)
+  try {
+    const conv = db.createConversation({ title: 'Test', modelKey: 'local-model' })
+    db.addMessage(conv.id, 'user', 'hi')
+    const fetchImpl = jsonFetch({ choices: [{ message: { content: 'irrelevant' } }] })
+    await assert.rejects(() => compactConversation(fakeDeps(db), conv.id, { fetchImpl }), /nothing_to_compact/)
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('compactConversation: a SECOND compaction compounds from the first cut, re-summarizing only the newly-uncovered pool', async () => {
+  const root = makeTmpRoot()
+  const db = new ConversationStore(root)
+  try {
+    const conv = db.createConversation({ title: 'Test', modelKey: 'local-model' })
+    const msgs = Array.from({ length: 8 }, (_, i) => db.addMessage(conv.id, i % 2 === 0 ? 'user' : 'assistant', `first batch message ${i} with real content`))
+    db.setConversationCompaction(conv.id, { summary: 'FIRST SUMMARY', upToMessageId: msgs[3].id, tokensBefore: 50 })
+    for (let i = 0; i < 8; i++) db.addMessage(conv.id, i % 2 === 0 ? 'user' : 'assistant', `second batch message ${i} with real content too`)
+
+    let capturedBody: string | undefined
+    const fetchImpl: typeof fetch = (async (_url, init) => {
+      capturedBody = init?.body as string
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'SECOND SUMMARY' } }] }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+
+    const result = await compactConversation(fakeDeps(db, 200), conv.id, { fetchImpl }) // small ctx — see the first compactConversation test's comment for why
+    assert.equal(result.summary, 'SECOND SUMMARY')
+    // The prompt sent to the model must have seeded the OLD summary as context, not just
+    // re-summarized from scratch — otherwise a compounding compaction quietly loses
+    // everything before the first cut.
+    assert.ok(capturedBody?.includes('FIRST SUMMARY'))
+    // And it must NOT include the first batch's raw message text — that's already covered
+    // by FIRST SUMMARY, and re-including it would defeat the point of compounding.
+    assert.ok(!capturedBody?.includes('first batch message 0'))
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('compactConversation: throws for a nonexistent conversation', async () => {
+  const root = makeTmpRoot()
+  const db = new ConversationStore(root)
+  try {
+    await assert.rejects(() => compactConversation(fakeDeps(db), 'does-not-exist'), /not_found/)
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('maybeAutoCompact: no-op (no events, no DB change) when under threshold', async () => {
+  const root = makeTmpRoot()
+  const db = new ConversationStore(root)
+  try {
+    const conv = db.createConversation({ title: 'Test', modelKey: 'local-model' })
+    db.addMessage(conv.id, 'assistant', 'reply', { stats: { ctxUsed: 100, ctxMax: 8192 } })
+    const events: string[] = []
+    const fresh = db.getConversation(conv.id, true)!
+    await maybeAutoCompact(fakeDeps(db), conv.id, fresh, async (phase) => { events.push(phase) })
+    assert.deepEqual(events, [])
+    assert.equal(db.getConversation(conv.id)!.compactionSummary, undefined)
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('maybeAutoCompact: fires start/end events, actually compacts, and the conv object is mutated in place when over the 80% threshold', async () => {
+  const root = makeTmpRoot()
+  const db = new ConversationStore(root)
+  try {
+    const conv = db.createConversation({ title: 'Test', modelKey: 'local-model' })
+    for (let i = 0; i < 8; i++) db.addMessage(conv.id, i % 2 === 0 ? 'user' : 'assistant', `message ${i} with real content`)
+    db.addMessage(conv.id, 'assistant', 'reply', { stats: { ctxUsed: 9000, ctxMax: 10000 } })
+    const events: string[] = []
+    const fresh = db.getConversation(conv.id, true)!
+    const fetchImpl = jsonFetch({ choices: [{ message: { content: 'Summary text.' } }] })
+    // Small ctx (200), same reason as the compactConversation tests above — the 8 fixture
+    // messages must NOT all fit inside pickCompactionCut's tail budget, or this test would
+    // silently degrade to exercising the no-op-because-nothing_to_compact path instead of a
+    // real compaction, while still passing on its events-only assertion. See __fetchImplForTest's
+    // doc comment above compactConversation for what this property actually is.
+    const d = fakeDeps(db, 200)
+    ;(d as unknown as { __fetchImplForTest?: typeof fetch }).__fetchImplForTest = fetchImpl
+    await maybeAutoCompact(d, conv.id, fresh, async (phase) => { events.push(phase) })
+    assert.deepEqual(events, ['start', 'end'])
+    // The two assertions that actually distinguish "compacted" from "silently no-op'd":
+    assert.equal(db.getConversation(conv.id)!.compactionSummary, 'Summary text.')
+    assert.equal(fresh.compactionSummary, 'Summary text.') // mutated in place, per maybeAutoCompact's own doc comment
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('maybeAutoCompact: a failed summarization call is swallowed — the turn is never blocked (same best-effort contract as autoTitle)', async () => {
+  const root = makeTmpRoot()
+  const db = new ConversationStore(root)
+  try {
+    const conv = db.createConversation({ title: 'Test', modelKey: 'local-model' })
+    for (let i = 0; i < 8; i++) db.addMessage(conv.id, i % 2 === 0 ? 'user' : 'assistant', `message ${i} with real content`)
+    db.addMessage(conv.id, 'assistant', 'reply', { stats: { ctxUsed: 9000, ctxMax: 10000 } })
+    const events: string[] = []
+    const fresh = db.getConversation(conv.id, true)!
+    // Small ctx again — this test needs pickCompactionCut to succeed and callChatUpstream to
+    // be the thing that actually fails (HTTP 500), not nothing_to_compact short-circuiting
+    // before the network call is ever made.
+    const d = fakeDeps(db, 200)
+    ;(d as unknown as { __fetchImplForTest?: typeof fetch }).__fetchImplForTest = jsonFetch({}, 500)
+    await assert.doesNotReject(() => maybeAutoCompact(d, conv.id, fresh, async (phase) => { events.push(phase) }))
+    assert.deepEqual(events, ['start', 'end']) // still brackets the attempt even though it failed
+    assert.equal(db.getConversation(conv.id)!.compactionSummary, undefined) // nothing persisted
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
 })

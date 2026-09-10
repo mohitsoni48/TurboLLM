@@ -19,6 +19,8 @@
 // referenced at the end of whichever task last touched it.
 import type { Conversation, Message } from './db.js'
 import { estimateTokens } from '../ext/context-limit.js'
+import { callChatUpstream, resolveChatUpstream, type ChatUpstream } from './chat-upstream.js'
+import type { Deps } from '../deps.js'
 
 // ── current-date injection (moved from chat-routes.ts, unchanged behavior) ─────────────
 // The date used to be baked into conv.systemPrompt once, client-side, at conversation
@@ -151,4 +153,101 @@ export function pickCompactionCut(pool: Message[], ctxMax: number): { toSummariz
   return { toSummarize, cutMessageId: toSummarize[toSummarize.length - 1].id }
 }
 
-// ── the summarization call (Task 3 fills in compactConversation/maybeAutoCompact below) ─
+// ── the summarization call ──────────────────────────────────────────────────────────
+
+function buildSummarizationPrompt(priorSummary: string | null, toSummarize: Message[]): { role: string; content: string }[] {
+  const transcript = toSummarize.map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`).join('\n\n')
+  const priorBlock = priorSummary ? `Summary of the conversation so far:\n${priorSummary}\n\n---\n\n` : ''
+  return [
+    {
+      role: 'system',
+      content: 'Summarize the conversation below so it can replace the raw messages while preserving everything a later reply would need: decisions made, facts stated, ongoing tasks, and the user\'s stated preferences. Be concise but do not drop anything load-bearing. Reply with ONLY the summary — no preamble, no "Here is a summary". /no_think',
+    },
+    { role: 'user', content: `${priorBlock}${transcript}` },
+  ]
+}
+
+/** Manual /compact-equivalent AND the async half auto-compact calls into. Summarizes
+ *  everything in the pool past any EARLIER compaction cut (resolveCompactionCut's `rest`),
+ *  seeding the old summary as context so a second compaction compounds instead of
+ *  re-summarizing from scratch. Always runs through the chat's OWN upstream — the same
+ *  local-or-linked-host resolution every other chat turn uses (chat-upstream.ts) — never a
+ *  second model or a second server. Throws (never silently no-ops) on: conversation not
+ *  found, upstream unavailable, nothing worth compacting, or a failed/empty summary — the
+ *  caller (maybeAutoCompact for the auto path; the /compact route for the manual path)
+ *  decides what "throws" means for its own contract. */
+export async function compactConversation(
+  d: Deps,
+  convId: string,
+  opts?: { fetchImpl?: typeof fetch },
+): Promise<{ summary: string; upToMessageId: string; tokensBefore: number }> {
+  const conv = d.db.getConversation(convId, true)
+  if (!conv) throw new Error('not_found')
+  const activeMessages = conv.messages ?? []
+
+  const { summary: priorSummary, rest: pool } = resolveCompactionCut(conv, activeMessages)
+
+  const resolved = resolveChatUpstream(d)
+  if (!resolved.ok) throw new Error(resolved.code)
+  const upstream: ChatUpstream = resolved.upstream
+
+  const picked = pickCompactionCut(pool, upstream.ctxMax)
+  if (!picked) throw new Error('nothing_to_compact')
+
+  const promptMessages = buildSummarizationPrompt(priorSummary, picked.toSummarize)
+  const tokensBefore = estimateTokens(picked.toSummarize.map((m) => ({ role: m.role, content: m.content })))
+
+  // Same low-priority-background gate acquisition autoTitle uses (chat-routes.ts) — a
+  // compaction call must never contend with real foreground chat/agent work for the
+  // local engine's slot queue. Remote turns cost this machine nothing but a socket.
+  const release = d.gate && !upstream.remote ? await d.gate.acquire('bg') : null
+  let res: Response
+  try {
+    res = await callChatUpstream(upstream, {
+      model: upstream.modelField,
+      messages: promptMessages,
+      stream: false,
+      temperature: 0.3,
+      max_tokens: 1024,
+      thinking_budget_tokens: 0,
+      chat_template_kwargs: { enable_thinking: false },
+    }, AbortSignal.timeout(60_000), opts?.fetchImpl, d)
+  } finally {
+    release?.()
+  }
+  if (!res.ok) throw new Error(`summarization_failed_${res.status}`)
+  const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> }
+  const summary = (data.choices?.[0]?.message?.content ?? '').replace(/<think>[\s\S]*?<\/think>/gi, '').trim()
+  if (!summary) throw new Error('empty_summary')
+
+  d.db.setConversationCompaction(convId, { summary, upToMessageId: picked.cutMessageId, tokensBefore })
+  return { summary, upToMessageId: picked.cutMessageId, tokensBefore }
+}
+
+/** Called from both turn-starting routes (chat-routes.ts) right after the 'meta' SSE
+ *  event, BEFORE the new turn's messages are built — so a successful compaction is
+ *  reflected in the very same turn's prompt. `conv` is mutated in place with the fresh
+ *  compaction fields on success so the caller's own buildEngineMessages call (right after
+ *  this returns) sees them without a second DB read. Best-effort, same contract as
+ *  autoTitle: a failed compaction must never surface to the user or block the turn — it
+ *  just proceeds against the full (uncompacted) history, exactly today's behavior. */
+export async function maybeAutoCompact(
+  d: Deps,
+  convId: string,
+  conv: Conversation,
+  emitCompactionEvent: (phase: 'start' | 'end') => Promise<void>,
+): Promise<void> {
+  const { ctxUsed, ctxMax } = lastCtxUsage(conv.messages ?? [])
+  if (!shouldAutoCompact(ctxUsed, ctxMax)) return
+  await emitCompactionEvent('start')
+  try {
+    const fetchImpl = (d as unknown as { __fetchImplForTest?: typeof fetch }).__fetchImplForTest
+    const result = await compactConversation(d, convId, fetchImpl ? { fetchImpl } : undefined)
+    conv.compactionSummary = result.summary
+    conv.compactionUpToMessageId = result.upToMessageId
+    conv.compactionTokensBefore = result.tokensBefore
+  } catch {
+    // Best-effort — see doc comment above.
+  }
+  await emitCompactionEvent('end')
+}
