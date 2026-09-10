@@ -165,3 +165,17 @@ test('buildSnapshot: settings_snapshot keepN defaults to 1 when gateway absent',
   assert.equal(snap.settings_snapshot.keepN, 1)
   assert.equal(snap.settings_snapshot.autoSwap, true)
 })
+
+test('buildSnapshot: includes compaction state when present', () => {
+  const m1 = makeMsg('user', 'old')
+  const m2 = makeMsg('assistant', 'new')
+  const conv = makeConv({ compactionSummary: 'earlier stuff', compactionUpToMessageId: m1.id, compactionTokensBefore: 42, messages: [m1, m2] })
+  const snap = buildSnapshot(conv, makeCfg(), VERSION, EXPORTED_AT, 'export')
+  assert.deepEqual(snap.compaction, { summary: 'earlier stuff', uptoMessageId: m1.id, tokensBefore: 42 })
+})
+
+test('buildSnapshot: omits compaction field entirely when the conversation was never compacted', () => {
+  const conv = makeConv({ messages: [makeMsg('user', 'hi')] })
+  const snap = buildSnapshot(conv, makeCfg(), VERSION, EXPORTED_AT, 'export')
+  assert.equal(snap.compaction, undefined)
+})

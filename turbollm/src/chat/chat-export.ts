@@ -31,6 +31,10 @@ export interface ChatSnapshot {
     autoSwap: boolean
     tavilyConfigured: boolean
   }
+  /** Compaction state (ADR-420) — present only when the conversation has been compacted at
+   *  least once. A round-tripped import without this field is simply an uncompacted chat;
+   *  no migration needed on the import side. */
+  compaction?: { summary: string; uptoMessageId: string; tokensBefore: number }
 }
 
 /**
@@ -79,5 +83,8 @@ export function buildSnapshot(
       autoSwap: cfg.gateway?.autoSwap ?? true,
       tavilyConfigured: !!(cfg.tools?.tavily?.apiKey),
     },
+    ...(conv.compactionSummary && conv.compactionUpToMessageId
+      ? { compaction: { summary: conv.compactionSummary, uptoMessageId: conv.compactionUpToMessageId, tokensBefore: conv.compactionTokensBefore ?? 0 } }
+      : {}),
   }
 }
