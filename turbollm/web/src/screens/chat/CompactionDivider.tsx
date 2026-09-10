@@ -25,6 +25,7 @@ export function CompactionDivider({ summary, tokensBefore, onUndo }: CompactionD
     <div className="my-3 flex flex-col gap-2">
       <button
         type="button"
+        aria-expanded={expanded}
         onClick={() => setExpanded((v) => !v)}
         className="flex items-center gap-1.5 self-center rounded-full border border-border px-3 py-1 text-[11px] text-muted hover:text-ink transition-colors"
       >

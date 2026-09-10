@@ -1075,16 +1075,30 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
               <ContextMeter ctxUsed={ctxUsed} ctxMax={ctxMax} />
             </div>
           )}
+          {/* Wrapped in the SAME `hidden sm:flex` as the ContextMeter above it, deliberately:
+              below `sm` the meter is display:none, so its `ml-auto` never applies — an
+              unwrapped button here would render flush against the left-hand header content
+              (Share's own `ml-auto` becoming the first auto margin and flying to the right),
+              leaving an unlabelled icon marooned mid-header with no context percentage
+              anywhere on screen to explain it and no tooltip on touch. No `ml-auto` of its
+              own is needed: at `sm` and up the meter's own `ml-auto` already absorbs the free
+              space, and this packs in directly beside it. */}
           {ready && !readonly && activeId && ctxMax > 0 && ctxUsed / ctxMax > 0.5 && !live?.compacting && (
-            <Button
-              size="icon"
-              variant="ghost"
-              className="h-8 w-8"
-              title="Compact this conversation now"
-              onClick={() => { track('chat', 'manual_compact'); mut.compact.mutate(activeId, { onError: () => toast.error('Could not compact this conversation.') }) }}
-            >
-              <ArchiveIcon size={15} />
-            </Button>
+            <div className="hidden sm:flex">
+              <Button
+                size="icon"
+                variant="ghost"
+                className="h-8 w-8"
+                title="Compact this conversation now"
+                // The manual path has no SSE stream, so `live.compacting` never covers it —
+                // without this the button stays clickable for the whole call and a second
+                // click fires a second concurrent summarization.
+                disabled={mut.compact.isPending}
+                onClick={() => { track('chat', 'manual_compact'); mut.compact.mutate(activeId, { onError: () => toast.error('Could not compact this conversation.') }) }}
+              >
+                <ArchiveIcon size={15} />
+              </Button>
+            </div>
           )}
 
           {/* Share / Export menu (F-023, F-024) — only when a conversation is active */}
@@ -1205,7 +1219,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                     <CompactionDivider
                       summary={conv.compactionSummary}
                       tokensBefore={conv.compactionTokensBefore ?? 0}
-                      onUndo={readonly ? undefined : () => mut.undoCompaction.mutate(activeId!, { onError: () => toast.error('Could not undo compaction.') })}
+                      onUndo={readonly ? undefined : () => { track('chat', 'undo_compaction'); mut.undoCompaction.mutate(activeId!, { onError: () => toast.error('Could not undo compaction.') }) }}
                     />
                   )}
                 </Fragment>
@@ -1335,7 +1349,10 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                   // decorative trailing "…" was itself the thing being clipped, leaving what read
                   // as a stray full stop after the model name (QA_UX_REPORT.md F-03, P2-1).
                   placeholder={
-                    activeId && live?.compacting
+                    // `live.compacting` is the AUTO path (an SSE event mid-turn); the manual
+                    // button is a plain POST with no stream, so it needs its own in-flight
+                    // flag or half the trigger surface shows no compacting state at all.
+                    activeId && (live?.compacting || mut.compact.isPending)
                       ? 'Compacting conversation…'
                       : ready
                         ? `Message ${truncateName(remoteChoice?.name ?? model?.name ?? 'the model')}`
