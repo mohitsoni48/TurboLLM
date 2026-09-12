@@ -95,10 +95,11 @@ test('DELETE /compact: clears a prior compaction and returns the updated convers
 test('POST /compact: honors the request body\'s `model`, not the conversation\'s stale bound `modelKey` (opus-review I-A)', async () => {
   const { app, store, cleanup } = makeApp()
   try {
-    // conv.modelKey is empty (unresolved → would fall through to the local engine, which is
-    // healthy in this harness). The request instead names a linked-but-disconnected remote —
-    // proving the route reads `b.model`, not `conv.modelKey`, when both could apply.
-    const conv = store.createConversation({ title: 'Test' })
+    // conv.modelKey is set to a DIFFERENT, disconnected remote than the body names — if the
+    // route consulted modelKey at all (even as a fallback), resolution would land on that
+    // remote instead. Pins that `b.model` wins outright, not just that it's read when
+    // modelKey happens to be empty.
+    const conv = store.createConversation({ title: 'Test', modelKey: 'other-rig/small' })
     store.addMessage(conv.id, 'user', 'hi')
     const res = await app.request(`/api/v1/conversations/${conv.id}/compact`, {
       method: 'POST',
@@ -108,6 +109,23 @@ test('POST /compact: honors the request body\'s `model`, not the conversation\'s
     assert.equal(res.status, 503)
     const body = await res.json() as { error: { code: string } }
     assert.equal(body.error.code, 'remote_unavailable')
+  } finally {
+    cleanup()
+  }
+})
+
+test('POST /compact: a bodyless request goes LOCAL even when `conv.modelKey` points at a remote — modelKey is never consulted as a fallback (opus-review I-A′, no older client to protect since the daemon ships its own webdist)', async () => {
+  const { app, store, cleanup } = makeApp()
+  try {
+    // If modelKey were read as a fallback, this would hit the disconnected 'linked-fake/big'
+    // remote and 503. Instead it must resolve to the (healthy) local engine and fail only on
+    // message count, proving modelKey plays no role at all in resolution.
+    const conv = store.createConversation({ title: 'Test', modelKey: 'linked-fake/big' })
+    store.addMessage(conv.id, 'user', 'hi')
+    const res = await app.request(`/api/v1/conversations/${conv.id}/compact`, { method: 'POST' })
+    assert.equal(res.status, 400)
+    const body = await res.json() as { error: { code: string } }
+    assert.equal(body.error.code, 'nothing_to_compact')
   } finally {
     cleanup()
   }

@@ -443,11 +443,15 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // re-derive: a bare resolveChatUpstream(d) always lands on the local engine, which for a
     // Turbo Link chat means either a hard 'model_not_loaded' or a summary written by an
     // unrelated local model. `b.model` is the picker's CURRENT selection, same as the turn
-    // routes read (final-review C-1 / I-A) — `conv.modelKey` is only a fallback hint for older
-    // clients that don't send it, since it's frozen at conversation creation and the model
-    // picker is global, not per-conversation (can drift from what the chat is actually using).
+    // routes read (final-review C-1 / I-A) and same as Code's own /compact (code-routes.ts).
+    // Deliberately NOT falling back to `conv.modelKey`: that's frozen at conversation creation
+    // while the model picker is global, so it drifts from whatever the chat is actually using —
+    // reading it here would silently route (and for a remote pick, send the whole transcript)
+    // to a host the chat may no longer be talking to (opus-review I-A′). There's no older
+    // client to protect either: the daemon ships its own webdist bundle, so server and client
+    // are always in lockstep.
     const b = await body<{ model?: string }>(c)
-    const resolved = resolveChatUpstream(d, b.model || conv.modelKey)
+    const resolved = resolveChatUpstream(d, b.model)
     if (!resolved.ok) return err(c, resolved.status, resolved.code, resolved.message)
     try {
       await compactConversation(d, convId, { upstream: resolved.upstream })
