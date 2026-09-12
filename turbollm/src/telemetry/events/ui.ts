@@ -664,6 +664,14 @@ export const UI_ACTIONS = [
   // has already once read a telemetry defect as "nobody used it".
   'load_remote_model', 'unload_remote_model', 'filter_models_by_machine',
   'cancel_remote_download', 'download_hf_quant_remote',
+
+  // Chat compaction (ADR-420): the header Compact button and the divider's Undo. Same
+  // CLOSED-enum trap as the Turbo Link batch directly above — `manual_compact` shipped as a
+  // `track()` call with no entry here and recorded nothing at all (final whole-branch review,
+  // I-2), which is the SECOND time this exact defect has been caught in this file. Adoption of
+  // the manual trigger and how often people undo a compaction are the two numbers that say
+  // whether the fixed 80% threshold is right, so neither may be silently dropped again.
+  'manual_compact', 'undo_compaction',
 ] as const
 
 export const uiAction = defineEvent({

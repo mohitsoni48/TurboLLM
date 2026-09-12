@@ -8,6 +8,7 @@ import { feedChunk, flushState, initParseState, type ParseState } from './parser
 import { needsExtraPass } from './think-utils'
 import { parseReasoningEffort, type ReasoningEffort } from './reasoning-effort'
 import { sseSink, type EmitSink } from './emit-sink.js'
+import { buildEngineMessages, maybeAutoCompact, compactConversation } from './chat-compaction.js'
 
 import type { ClaimVerdict, ConversationStore, MessageStats, ResearchMeta, ResearchSource, ToolCallRecord } from './db'
 import { checkReply } from '../tools/research-referee.js'
@@ -64,36 +65,6 @@ export function abortAllInFlightChats(): number {
 type S = 200 | 201 | 202 | 400 | 404 | 409 | 500 | 503
 function err(c: Context, s: S, code: string, msg: string) { return c.json({ error: { code, message: msg } }, s) }
 async function body<T>(c: Context): Promise<T> { try { return await c.req.json() as T } catch { return {} as T } }
-
-// ── current-date injection ─────────────────────────────────────────────────
-// The date used to be baked into conv.systemPrompt once, client-side, at conversation
-// creation — so a chat started in March still told the model it was March in July.
-// It is now assembled per request instead, on every path that builds engineMessages.
-
-/** Matches the app's own injected date line so a prompt persisted with a stale copy can be
- *  cleaned before the fresh one is appended (the model must never see two dates). Deliberately
- *  narrow — whole line, our exact opening, length-bounded — so user-authored prose that merely
- *  mentions a date survives. Also matches the line this file emits, keeping the strip idempotent. */
-// `$` (with /m) is load-bearing: it forces the length bound to cover the WHOLE line, so a long
-// user-authored line that merely opens this way fails to match instead of being truncated at 140.
-const BAKED_DATE_LINE = /^Today['’]s date is [^\n]{0,140}$\n?/gm
-
-/** DATE ONLY, never a clock time: llama.cpp prefix-caching keys on the prompt prefix, so a
- *  per-turn timestamp would invalidate the prefill cache on every single turn. */
-function currentDateLine(now: Date): string {
-  const y = now.getFullYear()
-  const m = String(now.getMonth() + 1).padStart(2, '0')
-  const d = String(now.getDate()).padStart(2, '0')
-  return `Today's date is ${y}-${m}-${d}. Use it only when the request depends on the current date; otherwise ignore it.`
-}
-
-/** Stored system prompt + today's date, appended LAST so everything ahead of it stays a stable
- *  cache prefix across a date rollover. Callers must keep gating on a non-empty stored prompt —
- *  the Blank agent means zero system message, and that still holds. */
-export function withCurrentDate(systemPrompt: string, now = new Date()): string {
-  const base = systemPrompt.replace(BAKED_DATE_LINE, '').replace(/\n{3,}/g, '\n\n').trim()
-  return base ? `${base}\n\n${currentDateLine(now)}` : currentDateLine(now)
-}
 
 export function registerChatRoutes(app: Hono, d: Deps): void {
   const { db } = d
@@ -318,19 +289,18 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       // Emit meta event
       await stream.writeSSE({ event: 'meta', data: JSON.stringify({ userMessageId: userMsg.id, assistantMessageId: assistantMsg.id }) })
 
-      // Build messages array for engine
+      // Auto-compact (ADR-420): checked BEFORE this turn's messages are built, using the
+      // history as it stood before this turn's own user+placeholder rows were added —
+      // exactly the "last completed turn's usage" the 80% threshold is meant to judge.
+      // `upstream` is THIS turn's already-resolved upstream (local or linked host) and `ac`
+      // is its abort — both are handed down rather than re-derived, so a Turbo Link chat
+      // summarizes on the host it is actually talking to and Stop can interrupt the wait.
+      await maybeAutoCompact(d, convId, conv, upstream, ac.signal, (phase) => stream.writeSSE({ event: 'compaction', data: JSON.stringify({ phase }) }))
+
+      // Build messages array for engine (chat-compaction.ts — folds in the compaction
+      // summary + cut when one is resolvable; a plain passthrough when not).
       const allMsgs = (conv.messages ?? []).filter(m => m.id !== assistantMsg.id)
-      const engineMessages: { role: string; content: unknown }[] = []
-      if (conv.systemPrompt) engineMessages.push({ role: 'system', content: withCurrentDate(conv.systemPrompt) })
-      for (const m of allMsgs) {
-        // GitHub #52: when preserveThinking is on, fold past reasoning back into what's
-        // resent so the model sees its own prior thinking, not just the final answer —
-        // the default behavior (off) matches what's always been sent.
-        const content = (conv.preserveThinking && m.role === 'assistant' && m.reasoning?.trim())
-          ? `<think>\n${m.reasoning}\n</think>\n\n${m.content}`
-          : m.content
-        engineMessages.push({ role: m.role, content })
-      }
+      const engineMessages = buildEngineMessages(conv, allMsgs)
       // Fold any attached document text into the prompt; attach images as multimodal parts.
       const fullContent = b.docContext
         ? (content ? `${b.docContext}\n\n${content}` : b.docContext)
@@ -395,19 +365,17 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       // Emit meta event (no new user message — reuse the existing last user message id)
       await stream.writeSSE({ event: 'meta', data: JSON.stringify({ userMessageId: lastUser.id, assistantMessageId: assistantMsg.id }) })
 
-      // Build messages array for engine from the existing (already-trimmed) history.
+      // Auto-compact (ADR-420): checked BEFORE this turn's messages are built, using the
+      // history as it stood before this turn's own user+placeholder rows were added —
+      // exactly the "last completed turn's usage" the 80% threshold is meant to judge.
+      // Same upstream/abort hand-down as the /messages route above — see its comment.
+      await maybeAutoCompact(d, convId, conv, upstream, ac.signal, (phase) => stream.writeSSE({ event: 'compaction', data: JSON.stringify({ phase }) }))
+
+      // Build messages array for engine from the existing (already-trimmed) history
+      // (chat-compaction.ts — folds in the compaction summary + cut when one is
+      // resolvable; a plain passthrough when not).
       const allMsgs = (conv.messages ?? []).filter((m) => m.id !== assistantMsg.id)
-      const engineMessages: { role: string; content: unknown }[] = []
-      if (conv.systemPrompt) engineMessages.push({ role: 'system', content: withCurrentDate(conv.systemPrompt) })
-      for (const m of allMsgs) {
-        // GitHub #52: when preserveThinking is on, fold past reasoning back into what's
-        // resent so the model sees its own prior thinking, not just the final answer —
-        // the default behavior (off) matches what's always been sent.
-        const content = (conv.preserveThinking && m.role === 'assistant' && m.reasoning?.trim())
-          ? `<think>\n${m.reasoning}\n</think>\n\n${m.content}`
-          : m.content
-        engineMessages.push({ role: m.role, content })
-      }
+      const engineMessages = buildEngineMessages(conv, allMsgs)
 
       await runGeneration(d, sseSink(stream), { convId, conv, engineMessages, assistantMsg, upstream, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), isCodeAuthorized })
     })
@@ -461,6 +429,47 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     if (!msg || msg.convId !== convId) return err(c, 404, 'not_found', 'Message not found.')
     db.deleteMessage(msgId)
     return c.json({ ok: true })
+  })
+
+  // Manual compaction (ADR-420) — the header button. Auto-compact (maybeAutoCompact,
+  // called from the two turn-starting routes above) is the SAME underlying
+  // compactConversation call; this route just exposes it standalone, outside a turn.
+  app.post('/api/v1/conversations/:id/compact', async (c) => {
+    const convId = c.req.param('id')
+    const conv = db.getConversation(convId)
+    if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
+    if (inflight.has(convId)) return err(c, 409, 'generation_in_flight', 'Stop generation first.')
+    // Resolved HERE, like the two turn routes, rather than left to compactConversation to
+    // re-derive: a bare resolveChatUpstream(d) always lands on the local engine, which for a
+    // Turbo Link chat means either a hard 'model_not_loaded' or a summary written by an
+    // unrelated local model. `b.model` is the picker's CURRENT selection, same as the turn
+    // routes read (final-review C-1 / I-A) and same as Code's own /compact (code-routes.ts).
+    // Deliberately NOT falling back to `conv.modelKey`: that's frozen at conversation creation
+    // while the model picker is global, so it drifts from whatever the chat is actually using —
+    // reading it here would silently route (and for a remote pick, send the whole transcript)
+    // to a host the chat may no longer be talking to (opus-review I-A′). There's no older
+    // client to protect either: the daemon ships its own webdist bundle, so server and client
+    // are always in lockstep.
+    const b = await body<{ model?: string }>(c)
+    const resolved = resolveChatUpstream(d, b.model)
+    if (!resolved.ok) return err(c, resolved.status, resolved.code, resolved.message)
+    try {
+      await compactConversation(d, convId, { upstream: resolved.upstream })
+    } catch (e) {
+      const code = e instanceof Error ? e.message : 'compaction_failed'
+      if (code === 'nothing_to_compact') return err(c, 400, 'nothing_to_compact', 'Not enough history yet to compact.')
+      return err(c, 500, 'compaction_failed', 'Could not summarize this conversation.')
+    }
+    return c.json(db.getConversation(convId)!)
+  })
+
+  // Undo (ADR-420) — nulls the three compaction columns. No message is touched; this is a
+  // pure metadata revert, matching clearConversationCompaction's own doc comment.
+  app.delete('/api/v1/conversations/:id/compact', (c) => {
+    const convId = c.req.param('id')
+    if (!db.getConversation(convId)) return err(c, 404, 'not_found', 'Conversation not found.')
+    db.clearConversationCompaction(convId)
+    return c.json(db.getConversation(convId)!)
   })
 
   app.post('/api/v1/conversations/:id/regenerate', (c) => {
