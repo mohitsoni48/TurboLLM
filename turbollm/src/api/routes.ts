@@ -1890,7 +1890,7 @@ export function registerApi(app: Hono, d: Deps): void {
       toolPolicies?: Record<string, string>
       autoAllowAll?: boolean
       cloudDeploy?: { runpodTemplateId?: string }
-      experimental?: { memory?: boolean; cloudDeploy?: boolean; routines?: boolean; turboLink?: boolean }
+      experimental?: { memory?: boolean; cloudDeploy?: boolean; routines?: boolean; turboLink?: boolean; remoteAccess?: boolean }
     }>(c)
 
     const updates: Record<string, unknown> = {}
@@ -2101,6 +2101,7 @@ export function registerApi(app: Hono, d: Deps): void {
       if (b.experimental?.cloudDeploy !== undefined) cfg.daemon.experimental.cloudDeploy = !!b.experimental.cloudDeploy
       if (b.experimental?.routines !== undefined) cfg.daemon.experimental.routines = !!b.experimental.routines
       if (b.experimental?.turboLink !== undefined) cfg.daemon.experimental.turboLink = !!b.experimental.turboLink
+      if (b.experimental?.remoteAccess !== undefined) cfg.daemon.experimental.remoteAccess = !!b.experimental.remoteAccess
       // HF token (spec 10 §4): write-only. An explicit '' clears it. Never logged.
       if (b.hfToken !== undefined) cfg.hf.token = String(b.hfToken).trim()
       // GitHub token (write-only, same semantics as HF): an explicit '' clears it.

@@ -176,6 +176,12 @@ export interface ExperimentalFeatures {
    *  back on restores the previous state exactly. See `link/gate.ts` for the one predicate
    *  every one of those surfaces calls, and for the ADR-280 removal path. */
   turboLink: boolean
+  /** Master gate for multi-provider Remote access (ADR-422) — visibility AND behaviour, the
+   *  same two-layer shape as `turboLink`. When off: the Settings → Remote access pane and the
+   *  shell chip do not render, `/api/v1/remote/*` refuses with a typed code, and the
+   *  supervisor does not run. Deliberately does NOT gate Phase 1's ingress listener or
+   *  `--tunnel`, both of which must keep working for every install. */
+  remoteAccess: boolean
 }
 export interface Telemetry {
   level: string
@@ -726,7 +732,7 @@ export function defaultConfig(): Config {
       theme: 'system',
       autoGenerateTitles: true,
       autoMemoryEnabled: false,
-      experimental: { memory: false, cloudDeploy: false, routines: false, turboLink: false },
+      experimental: { memory: false, cloudDeploy: false, routines: false, turboLink: false, remoteAccess: false },
     },
     telemetry: { level: 'full', machineId: '' },
     apiKeys: [],
@@ -1280,6 +1286,7 @@ function normalize(c: Config): void {
     // untouched, and come back the moment the flag goes on; inferring consent from their
     // presence would silently enable an unverified cross-machine feature on upgrade.
     turboLink: ex.turboLink === true,
+    remoteAccess: ex.remoteAccess === true,
   }
   // Telemetry level (spec 09 §3): the UI exposes 'off' | 'anon' | 'full'. Migrate
   // legacy/unknown values safely → 'off' (the conservative, opt-in default).
