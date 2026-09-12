@@ -123,8 +123,8 @@ update: useMutation({
       onSuccess: (_d, convId) => { invalidateDetail(convId); void qc.invalidateQueries({ queryKey: ['message-variants'] }) },
     }),
     compact: useMutation({
-      mutationFn: (convId: string) => compactConversation(convId),
-      onSuccess: (_d, convId) => invalidateDetail(convId),
+      mutationFn: ({ convId, model }: { convId: string; model?: string }) => compactConversation(convId, model),
+      onSuccess: (_d, { convId }) => invalidateDetail(convId),
     }),
     undoCompaction: useMutation({
       mutationFn: (convId: string) => undoCompaction(convId),

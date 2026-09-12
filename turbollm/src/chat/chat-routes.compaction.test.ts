@@ -39,6 +39,14 @@ function makeApp(): { app: Hono; store: ConversationStore; cleanup: () => void }
       setLiveGen: () => {},
       recordCompletion: () => {},
     },
+    // Only reached when a truthy `model` string is resolved (chat-upstream.ts's
+    // `wanted ? d.modelRouter?.resolveRemoteTarget?.(wanted) : undefined`) — a link the
+    // request names but that isn't connected, so resolution fails distinguishably from
+    // "no model requested, use local".
+    modelRouter: {
+      resolveRemoteTarget: (wanted: string) =>
+        wanted === 'linked-fake/big' ? { status: 503, message: 'rig not connected' } : undefined,
+    },
   } as unknown as Deps
   const app = new Hono()
   registerChatRoutes(app, d)
@@ -79,6 +87,27 @@ test('DELETE /compact: clears a prior compaction and returns the updated convers
     assert.equal(res.status, 200)
     const body = await res.json() as { compactionSummary?: string }
     assert.equal(body.compactionSummary, undefined)
+  } finally {
+    cleanup()
+  }
+})
+
+test('POST /compact: honors the request body\'s `model`, not the conversation\'s stale bound `modelKey` (opus-review I-A)', async () => {
+  const { app, store, cleanup } = makeApp()
+  try {
+    // conv.modelKey is empty (unresolved → would fall through to the local engine, which is
+    // healthy in this harness). The request instead names a linked-but-disconnected remote —
+    // proving the route reads `b.model`, not `conv.modelKey`, when both could apply.
+    const conv = store.createConversation({ title: 'Test' })
+    store.addMessage(conv.id, 'user', 'hi')
+    const res = await app.request(`/api/v1/conversations/${conv.id}/compact`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'linked-fake/big' }),
+    })
+    assert.equal(res.status, 503)
+    const body = await res.json() as { error: { code: string } }
+    assert.equal(body.error.code, 'remote_unavailable')
   } finally {
     cleanup()
   }

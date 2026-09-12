@@ -128,6 +128,16 @@ test('resolveCompactionCut: UNRESOLVABLE cut (message not in active list) never 
   assert.deepEqual(rest.map((m) => m.id), [m1.id, m2.id]) // ALL active messages, not a partial cut
 })
 
+test('resolveCompactionCut: cut resolves to the LAST active message → empty tail falls back to the full list, not a summary-only prompt (opus-review I-B)', () => {
+  const m1 = makeMsg('user', 'a'); const m2 = makeMsg('assistant', 'b')
+  // pickCompactionCut never produces this itself, but deleting every message after a real
+  // cut can — the cut message is still active, just now last in the list.
+  const conv = makeConv({ compactionSummary: 'earlier stuff', compactionUpToMessageId: m2.id })
+  const { summary, rest } = resolveCompactionCut(conv, [m1, m2])
+  assert.equal(summary, 'earlier stuff')
+  assert.deepEqual(rest.map((m) => m.id), [m1.id, m2.id]) // full list, never an empty tail
+})
+
 // ── buildEngineMessages ──────────────────────────────────────────────────────────────
 
 test('buildEngineMessages: no cut, no system prompt — plain passthrough', () => {

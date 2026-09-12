@@ -82,8 +82,8 @@ export function regenerate(convId: string): Promise<{ ok: true }> {
 
 // ── Compaction (ADR-420) ─────────────────────────────────────────────────────
 
-export function compactConversation(id: string): Promise<Conversation> {
-  return req(`/api/v1/conversations/${encodeURIComponent(id)}/compact`, { method: 'POST', json: {} })
+export function compactConversation(id: string, model?: string): Promise<Conversation> {
+  return req(`/api/v1/conversations/${encodeURIComponent(id)}/compact`, { method: 'POST', json: model ? { model } : {} })
 }
 
 export function undoCompaction(id: string): Promise<Conversation> {

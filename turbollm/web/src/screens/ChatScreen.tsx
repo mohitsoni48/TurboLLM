@@ -1094,7 +1094,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                 // without this the button stays clickable for the whole call and a second
                 // click fires a second concurrent summarization.
                 disabled={mut.compact.isPending}
-                onClick={() => { track('chat', 'manual_compact'); mut.compact.mutate(activeId, { onError: () => toast.error('Could not compact this conversation.') }) }}
+                onClick={() => { track('chat', 'manual_compact'); mut.compact.mutate({ convId: activeId, model: activeRemoteId ?? undefined }, { onError: () => toast.error('Could not compact this conversation.') }) }}
               >
                 <ArchiveIcon size={15} />
               </Button>

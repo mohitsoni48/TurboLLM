@@ -442,10 +442,12 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // Resolved HERE, like the two turn routes, rather than left to compactConversation to
     // re-derive: a bare resolveChatUpstream(d) always lands on the local engine, which for a
     // Turbo Link chat means either a hard 'model_not_loaded' or a summary written by an
-    // unrelated local model. Standing outside a turn there is no per-request `model` field to
-    // read, so the conversation's own bound `modelKey` (set at creation) is the hint — the
-    // same qualified `<machine>/<model>` id the composer would have sent for this chat.
-    const resolved = resolveChatUpstream(d, conv.modelKey)
+    // unrelated local model. `b.model` is the picker's CURRENT selection, same as the turn
+    // routes read (final-review C-1 / I-A) — `conv.modelKey` is only a fallback hint for older
+    // clients that don't send it, since it's frozen at conversation creation and the model
+    // picker is global, not per-conversation (can drift from what the chat is actually using).
+    const b = await body<{ model?: string }>(c)
+    const resolved = resolveChatUpstream(d, b.model || conv.modelKey)
     if (!resolved.ok) return err(c, resolved.status, resolved.code, resolved.message)
     try {
       await compactConversation(d, convId, { upstream: resolved.upstream })

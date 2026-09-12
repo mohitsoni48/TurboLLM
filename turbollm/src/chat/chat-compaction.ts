@@ -91,7 +91,11 @@ export function resolveCompactionCut(
 ): { summary: string | null; rest: Message[] } {
   if (!conv.compactionUpToMessageId || !conv.compactionSummary) return { summary: null, rest: activeMessages }
   const cutIdx = activeMessages.findIndex((m) => m.id === conv.compactionUpToMessageId)
-  const rest = cutIdx === -1 ? activeMessages : activeMessages.slice(cutIdx + 1)
+  // A cut resolved to the LAST active message (never produced by pickCompactionCut itself, but
+  // reachable if messages after the cut get deleted) would otherwise leave `rest` empty — an
+  // engine prompt with a summary and no active turn at all. Same never-lossy treatment as an
+  // unresolvable cut: fall back to the full active list rather than send a degenerate prompt.
+  const rest = cutIdx === -1 || cutIdx === activeMessages.length - 1 ? activeMessages : activeMessages.slice(cutIdx + 1)
   return { summary: conv.compactionSummary, rest }
 }
 
