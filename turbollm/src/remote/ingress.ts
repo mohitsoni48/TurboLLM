@@ -12,11 +12,21 @@ import type { RemoteIngress } from './ingress-types'
 type Server = ReturnType<typeof serve>
 
 export class IngressListener implements RemoteIngress {
-  private server: Server | null = null
+  private _server: Server | null = null
   private port: number | undefined
 
   ingressPort(): number | undefined {
     return this.port
+  }
+
+  /** The underlying Node HTTP(2) server bound by `start()`, or `null` before `start()` has
+   *  resolved and after `stop()`. Exists so a caller can attach additional raw-socket
+   *  behavior — namely the Code terminal's WebSocket `'upgrade'` handler — to the same
+   *  server that a tunnel provider's local leg now targets (ADR-422). Without this, a
+   *  provider pointed at the ingress port reaches a server with zero `'upgrade'` listeners,
+   *  and any WebSocket handshake arriving through it gets its socket destroyed. */
+  get server(): Server | null {
+    return this._server
   }
 
   /** Bind the ingress listener, resolving with the port actually bound. Idempotent:
@@ -31,14 +41,14 @@ export class IngressListener implements RemoteIngress {
       const s = serve({ fetch: app.fetch, hostname: '127.0.0.1', port }, (info) => {
         if (settled) return
         settled = true
-        this.server = s
+        this._server = s
         this.port = info.port
         resolve(info.port)
       })
       ;(s as unknown as { on?: (ev: 'error', cb: (e: Error) => void) => void }).on?.('error', (e) => {
         if (settled) return
         settled = true
-        this.server = null
+        this._server = null
         this.port = undefined
         reject(e)
       })
@@ -46,9 +56,9 @@ export class IngressListener implements RemoteIngress {
   }
 
   async stop(): Promise<void> {
-    const s = this.server
+    const s = this._server
     if (!s) return
-    this.server = null
+    this._server = null
     this.port = undefined
     await new Promise<void>((resolve) => {
       try {

@@ -964,7 +964,17 @@ function listen(attempt = 0): void {
       const wantIngress = resolveIngressPort(store.snapshot().remoteAccess.ingressPort, info.port)
       void ingress
         .start(app, wantIngress)
-        .then((p) => tunnelManager?.start(p))
+        .then((p) => {
+          // Mirror the main listener's terminal WebSocket wiring (see registerTerminalWs
+          // call below) onto the ingress server. cloudflared's local leg targets THIS
+          // server, not the main one — without this, a Code-terminal WS upgrade arriving
+          // over the tunnel hits a server with zero 'upgrade' listeners and Node destroys
+          // its socket with no application-level error (ADR-422). Runs exactly once: this
+          // whole block is gated by `ingress.ingressPort() === undefined` above, which is
+          // only true before the first successful start.
+          if (ingress.server) registerTerminalWs(ingress.server as unknown as import('http').Server, deps)
+          return tunnelManager?.start(p)
+        })
         .then((url) => {
           if (!url) return
           console.log(`  Tunnel:  ${url}`)
