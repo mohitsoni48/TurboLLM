@@ -1,6 +1,6 @@
 // Model discovery (A3, spec 04): scan model directories for GGUFs, parse their
 // headers, group split/mmproj files, and expose a rich model list. Path-cached.
-import { existsSync, lstatSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, realpathSync, statSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { migrateModelKey, type ConfigStore } from '../config/config'
 import { GgufError, type GgufMeta, parseGguf, quantFromName } from '../gguf/gguf'
@@ -289,8 +289,9 @@ export class Scanner {
     try {
       const dirs = this.store.snapshot().modelDirs
       const scan: ScanResult = { ggufs: [], mlxDirs: [] }
+      const visited = new Set<string>()
       for (const d of dirs) {
-        if (existsSync(d)) walk(d, scan)
+        if (existsSync(d)) walk(d, scan, visited)
         await tick()
       }
       this.pendingKeyMigrations = []
@@ -521,30 +522,33 @@ function isMlxModelDir(names: string[]): boolean {
   return hasConfig && hasWeights && hasTokenizer
 }
 
-function walk(dir: string, out: ScanResult): void {
+function walk(dir: string, out: ScanResult, visited: Set<string>): void {
   let names: string[]
   try {
+    // Follow junctions and symlinks, but visit each physical directory only once.
+    // Share this set across roots to handle overlapping configured folders too.
+    const real = realpathSync(dir)
+    if (visited.has(real)) return
     names = readdirSync(dir)
+    visited.add(real)
   } catch {
     return // permission / gone
   }
-  // An MLX model is a whole directory — record it and don't descend (the shards
-  // and tokenizer live inside).
+  // A Safetensors directory may also contain GGUFs or nested quant variants.
+  // Record the directory model without stopping discovery of those siblings.
   if (isMlxModelDir(names)) {
     out.mlxDirs.push(dir)
-    return
   }
   for (const name of names) {
     if (name === '.git' || name === 'node_modules') continue
     const full = join(dir, name)
     let st
     try {
-      st = lstatSync(full)
+      st = statSync(full)
     } catch {
       continue
     }
-    if (st.isSymbolicLink()) continue // avoid cycles
-    if (st.isDirectory()) walk(full, out)
+    if (st.isDirectory()) walk(full, out, visited)
     else if (st.isFile() && name.toLowerCase().endsWith('.gguf') && st.size >= 1 << 20) {
       out.ggufs.push({ path: full, size: st.size, mtime: st.mtimeMs })
     }
