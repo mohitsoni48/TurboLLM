@@ -210,6 +210,89 @@ test('pickCompactionCut: returns null when the whole pool already fits the tail 
   assert.equal(pickCompactionCut(messages, 1_000_000), null)
 })
 
+// ── pickCompactionCut: realCtxUsed calibration ──────────────────────────────────────────
+// Root cause of "many chats give an error/nothing_to_compact when trying to compact"
+// (live-reported 2026-09-12): estimateTokens (context-limit.ts) is deliberately calibrated
+// to UNDER-estimate — its own comment explains why, for its actual purpose of a permissive
+// pre-flight "will this fit" check. Reused here as an absolute measure against ctxMax, that
+// same under-estimate means a conversation the ENGINE itself reports as most of the way to
+// its limit can still read as "comfortably fits, nothing worth cutting." Confirmed live
+// against a real 60-message, zero-attachment conversation: raw estimate 70,093 tokens vs.
+// the engine's own reported 124,517 — off by 1.78x with no images involved at all.
+
+test('pickCompactionCut: realCtxUsed calibrates the estimate so a genuinely near-full conversation is not silently skipped', () => {
+  // Six ~130-char messages: the raw char-based estimate (~241 tokens) comfortably fits a
+  // 2000-token ctxMax's 300-token tail budget, so the UNCALIBRATED estimate finds nothing to
+  // compact — even though the same messages, per the engine's own accounting, use far more
+  // real context than their character count implies (chat-template overhead, tokenizer
+  // efficiency, or non-text content estimateTokens can't see).
+  const content = 'x'.repeat(130)
+  const messages = Array.from({ length: 6 }, (_, i) => makeMsg(i % 2 === 0 ? 'user' : 'assistant', content))
+  assert.equal(pickCompactionCut(messages, 2000), null) // uncalibrated: the exact bug
+
+  const picked = pickCompactionCut(messages, 2000, 1600) // engine's real ctxUsed, far above the raw estimate
+  assert.ok(picked, 'a real cut should be found once calibrated against the engine\'s own reported usage')
+  assert.ok(picked!.toSummarize.length > 0 && picked!.toSummarize.length < messages.length)
+})
+
+test('pickCompactionCut: an extreme realCtxUsed is clamped, not applied verbatim, but still always keeps at least the last message', () => {
+  const content = 'x'.repeat(200)
+  const messages = Array.from({ length: 6 }, (_, i) => makeMsg(i % 2 === 0 ? 'user' : 'assistant', content))
+  // A wildly implausible ratio (a single-data-point noise case) must not push the cut to a
+  // degenerate place — the clamp caps the scale, and the "always keep the last message"
+  // rule from the uncalibrated version still holds on top of it.
+  const picked = pickCompactionCut(messages, 100, 1_000_000)
+  assert.ok(picked)
+  assert.equal(picked!.toSummarize.length, messages.length - 1)
+})
+
+test('pickCompactionCut: a tiny pool ignores realCtxUsed — not enough text for the ratio to mean anything', () => {
+  const messages = [makeMsg('user', 'hi'), makeMsg('assistant', 'hey'), makeMsg('user', 'sup'), makeMsg('assistant', 'yo')]
+  assert.equal(pickCompactionCut(messages, 2000, 999_999), null)
+})
+
+// ── pickCompactionCut: preserveThinking's reasoning fold must count toward sizing ──────
+// Second live-reported factor (2026-09-12, same investigation as the calibration fix above):
+// a real preserveThinking conversation's reasoning fields ran 2-3x longer than their visible
+// content, and buildEngineMessages resends that reasoning as part of the tail (GitHub #52) —
+// but the sizing estimate only ever looked at `content`. Content-only, that conversation's
+// true prompt size looked like a 9.8x under-estimate (clamped to a degenerate 4x); counting
+// the reasoning fold brought the SAME conversation to a real, unclamped 2.98x. Ignoring
+// `preserveThinking` here doesn't just misestimate the tail's absolute size, it can pick the
+// wrong cut point entirely, since a badly under-counted tail looks artificially cheap to keep.
+
+test('pickCompactionCut: preserveThinking makes the sizing estimate count reasoning, not just content, changing which messages make the cut', () => {
+  const messages = Array.from({ length: 8 }, (_, i) =>
+    i % 2 === 0
+      ? makeMsg('user', 'ok continue')
+      : makeMsg('assistant', 'x'.repeat(200), { reasoning: 'y'.repeat(460) }),
+  )
+  const ctxMax = 2000
+  const realCtxUsed = 1600 // the engine's real prompt size, reasoning included
+
+  const withoutReasoning = pickCompactionCut(messages, ctxMax, realCtxUsed, false)
+  const withReasoning = pickCompactionCut(messages, ctxMax, realCtxUsed, true)
+  assert.ok(withoutReasoning && withReasoning)
+  // Content-only, the tail looks artificially small (each assistant message's true prompt
+  // cost is hidden), so it keeps too much in the "already fits" tail. Counting reasoning
+  // recognizes the tail is really much bigger and correctly summarizes more of the pool.
+  assert.ok(
+    withReasoning!.toSummarize.length > withoutReasoning!.toSummarize.length,
+    `expected preserveThinking=true to cut more (got ${withReasoning!.toSummarize.length} vs ${withoutReasoning!.toSummarize.length})`,
+  )
+})
+
+test('pickCompactionCut: preserveThinking defaults to false — a caller that omits it gets the unchanged content-only estimate', () => {
+  const messages = Array.from({ length: 8 }, (_, i) =>
+    i % 2 === 0
+      ? makeMsg('user', 'ok continue')
+      : makeMsg('assistant', 'x'.repeat(200), { reasoning: 'y'.repeat(460) }),
+  )
+  const withDefault = pickCompactionCut(messages, 2000, 1600)
+  const withExplicitFalse = pickCompactionCut(messages, 2000, 1600, false)
+  assert.deepEqual(withDefault, withExplicitFalse)
+})
+
 // ── compactConversation / maybeAutoCompact ──────────────────────────────────────────────
 
 function makeTmpRoot(): string {
@@ -308,6 +391,68 @@ test('compactConversation: summarizes the older pool, leaves a raw tail, and per
     const updated = db.getConversation(conv.id)!
     assert.equal(updated.compactionSummary, result.summary)
     assert.equal(updated.compactionUpToMessageId, result.upToMessageId)
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('compactConversation: uses the last message\'s real ctxUsed to calibrate the cut, succeeding where the raw char estimate alone would report nothing_to_compact', async () => {
+  const root = makeTmpRoot()
+  const db = new ConversationStore(root)
+  try {
+    const conv = db.createConversation({ title: 'Test', modelKey: 'local-model' })
+    // 8 messages of 100 chars each: their raw char-based estimate (~256 tokens) fits
+    // comfortably inside a ctxMax=2000 pool's 300-token tail budget on its own — so WITHOUT
+    // a real ctxUsed, this reports nothing_to_compact (proven by the sibling test below,
+    // same fixture, no stats). Recording the last assistant message's real ctxUsed at 1600
+    // (matching the "engine reports far more real usage than the char count implies" case
+    // this whole fix exists for) must turn that into a genuine compaction.
+    const content = 'x'.repeat(100)
+    for (let i = 0; i < 7; i++) db.addMessage(conv.id, i % 2 === 0 ? 'user' : 'assistant', content)
+    db.addMessage(conv.id, 'assistant', content, { stats: { ctxUsed: 1600, ctxMax: 2000 } })
+    const fetchImpl = jsonFetch({ choices: [{ message: { content: 'Summary of the exchange.' } }] })
+    const result = await compactConversation(fakeDeps(db, 2000), conv.id, { fetchImpl })
+    assert.equal(result.summary, 'Summary of the exchange.')
+    assert.ok(result.tokensBefore > 0)
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('compactConversation: with preserveThinking on, the reasoning fold must be counted or a real near-full conversation still reports nothing_to_compact', async () => {
+  const root = makeTmpRoot()
+  const db = new ConversationStore(root)
+  try {
+    const conv = db.createConversation({ title: 'Test', modelKey: 'local-model', preserveThinking: true })
+    for (let i = 0; i < 7; i++) {
+      db.addMessage(conv.id, i % 2 === 0 ? 'user' : 'assistant', i % 2 === 0 ? 'ok continue' : 'x'.repeat(200), i % 2 === 0 ? {} : { reasoning: 'y'.repeat(460) })
+    }
+    // Content alone (even calibrated) is nowhere near this conversation's real size — only
+    // counting the reasoning fold (GitHub #52) that preserveThinking resends explains it.
+    db.addMessage(conv.id, 'assistant', 'x'.repeat(200), { reasoning: 'y'.repeat(460), stats: { ctxUsed: 1600, ctxMax: 2000 } })
+    const fetchImpl = jsonFetch({ choices: [{ message: { content: 'Summary of the exchange.' } }] })
+    const result = await compactConversation(fakeDeps(db, 2000), conv.id, { fetchImpl })
+    assert.equal(result.summary, 'Summary of the exchange.')
+    assert.ok(result.tokensBefore > 0)
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('compactConversation: the SAME fixture as above but with no recorded ctxUsed reports nothing_to_compact — isolates that the fix above is really about calibration, not the fixture size', async () => {
+  const root = makeTmpRoot()
+  const db = new ConversationStore(root)
+  try {
+    const conv = db.createConversation({ title: 'Test', modelKey: 'local-model' })
+    const content = 'x'.repeat(100)
+    for (let i = 0; i < 8; i++) db.addMessage(conv.id, i % 2 === 0 ? 'user' : 'assistant', content)
+    await assert.rejects(
+      () => compactConversation(fakeDeps(db, 2000), conv.id, { fetchImpl: jsonFetch({}) }),
+      /nothing_to_compact/,
+    )
   } finally {
     db.close()
     rmSync(root, { recursive: true, force: true })

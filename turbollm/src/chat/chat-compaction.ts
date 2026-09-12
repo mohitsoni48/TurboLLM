@@ -106,20 +106,28 @@ export function resolveCompactionCut(
  *  is the caller's responsibility to have already filtered to the turn's real history (e.g.
  *  excluding the just-inserted placeholder assistant row), exactly as those two call sites
  *  already did before this extraction. */
+/** GitHub #52: when preserveThinking is on, fold past reasoning back into what's resent so
+ *  the model sees its own prior thinking, not just the final answer — the default behavior
+ *  (off) matches what's always been sent. Only ever applies to the raw tail; reasoning
+ *  behind the cut is already folded into the summary text itself, not resent. Shared by
+ *  buildEngineMessages (what actually gets sent) and the tail-sizing estimate below (how
+ *  big that will be) so the two can never drift apart — reasoning can run 2-3x longer than
+ *  the visible content, and a sizing estimate that only looked at `content` would badly
+ *  under-count every conversation using this setting (confirmed live: a real preserveThinking
+ *  conversation's tail estimated at 19.8k tokens sent as 65k once the fold is counted). */
+function effectiveTailText(preserveThinking: boolean, m: Message): string {
+  return (preserveThinking && m.role === 'assistant' && m.reasoning?.trim())
+    ? `<think>\n${m.reasoning}\n</think>\n\n${m.content}`
+    : m.content
+}
+
 export function buildEngineMessages(conv: Conversation, activeMessages: Message[]): { role: string; content: unknown }[] {
   const { summary, rest } = resolveCompactionCut(conv, activeMessages)
   const out: { role: string; content: unknown }[] = []
   if (conv.systemPrompt) out.push({ role: 'system', content: withCurrentDate(conv.systemPrompt) })
   if (summary) out.push({ role: 'system', content: `Earlier conversation summary:\n\n${summary}` })
   for (const m of rest) {
-    // GitHub #52: when preserveThinking is on, fold past reasoning back into what's resent
-    // so the model sees its own prior thinking, not just the final answer — the default
-    // behavior (off) matches what's always been sent. Only ever applies to the raw tail;
-    // reasoning behind the cut is already folded into the summary text itself, not resent.
-    const content = (conv.preserveThinking && m.role === 'assistant' && m.reasoning?.trim())
-      ? `<think>\n${m.reasoning}\n</think>\n\n${m.content}`
-      : m.content
-    out.push({ role: m.role, content })
+    out.push({ role: m.role, content: effectiveTailText(!!conv.preserveThinking, m) })
   }
   return out
 }
@@ -127,36 +135,69 @@ export function buildEngineMessages(conv: Conversation, activeMessages: Message[
 // ── tail sizing ──────────────────────────────────────────────────────────────────────
 
 /** How much of ctxMax the RAW tail (messages left uncompacted, sent verbatim) should try
- *  to occupy. Mirrors Code's own compactionSettingsFor keepRecentTokens (~35% of context),
- *  slightly more generous since Chat has no tool-loop/skill overhead competing for the
- *  same budget. */
-const KEEP_RECENT_FRACTION = 0.4
+ *  to occupy. Started at 0.4 (mirroring Code's own keepRecentTokens); cut to 0.15 on
+ *  founder feedback 2026-09-12, for two reasons that are really the same one: reserving
+ *  40% of the window for the tail means compaction frees far less than the user expected
+ *  at the moment they reached for it, AND it strands the cut deep in the conversation —
+ *  a 200k-context chat kept ~80k of raw tail, putting the transcript divider 13 messages
+ *  from the end, where it reads as a line dropped at random mid-conversation rather than
+ *  "everything above here is now a summary". 15% still leaves a substantial verbatim tail
+ *  (~30k tokens on a 200k model), and pickCompactionCut's "always keep at least the last
+ *  message" floor covers small-context models where 15% is only a turn or two. */
+const KEEP_RECENT_FRACTION = 0.15
 
 /** Below this many messages, compacting saves nothing worth a model call. */
 const MIN_MESSAGES_TO_COMPACT = 4
 
+/** `estimateTokens` (context-limit.ts) is deliberately calibrated to UNDER-estimate: its own
+ *  comment says so, because it exists for `checkContextFits`, where a false "fits" wastes one
+ *  generation but a false "doesn't fit" refuses a request that would have worked — the safe
+ *  direction is to lowball. That bias is exactly backwards for deciding whether there's real
+ *  work to compact: an underestimate here means "nothing to compact" for a conversation the
+ *  engine itself reports is genuinely near its limit. Anchors the naive per-message weights
+ *  to the engine's own last-reported prompt size for this pool, via one scale factor, so the
+ *  RELATIVE sizing (which messages make the cut) still comes from estimateTokens while the
+ *  ABSOLUTE budget comparison uses a real number. Clamped so one noisy or tiny-pool data
+ *  point can't swing the cut to a degenerate place; `realCtxUsed` is optional (tests, and any
+ *  future caller without a real number in hand) and simply no-ops back to the raw estimate.
+ *  `preserveThinking` must match what buildEngineMessages will actually fold into the tail
+ *  (see effectiveTailText) — confirmed live: a real preserveThinking conversation's tail
+ *  looked like a 9.8x under-estimate (content-only) until the reasoning fold was counted,
+ *  which alone brought it to 2.98x — comfortably inside this clamp, not requiring a wider one. */
+function calibratedTokenScale(pool: Message[], realCtxUsed: number | undefined, preserveThinking: boolean): number {
+  if (!realCtxUsed) return 1
+  const raw = estimateTokens(pool.map((m) => ({ role: m.role, content: effectiveTailText(preserveThinking, m) })))
+  if (raw < 200) return 1 // too little text for the ratio to mean anything
+  return Math.min(4, Math.max(0.5, realCtxUsed / raw))
+}
+
 /** Chooses how much of `pool` (already past any earlier compaction cut — see
  *  resolveCompactionCut's `rest`) to fold into a NEW summary, leaving a raw tail sized to
- *  ~40% of ctxMax (estimateTokens, context-limit.ts's existing chars/token heuristic) so
- *  the very next reply isn't answered from a summary-only prompt. Always keeps at least
- *  the single most recent message in the tail, even if it alone exceeds budget — an
- *  oversized tail is better than an empty one. Returns null when there is nothing worth
- *  compacting: too few messages, or the whole pool already fits the tail budget. */
-export function pickCompactionCut(pool: Message[], ctxMax: number): { toSummarize: Message[]; cutMessageId: string } | null {
+ *  ~40% of ctxMax so the very next reply isn't answered from a summary-only prompt. Always
+ *  keeps at least the single most recent message in the tail, even if it alone exceeds
+ *  budget — an oversized tail is better than an empty one. Returns null when there is
+ *  nothing worth compacting: too few messages, or the whole pool already fits the tail
+ *  budget. `realCtxUsed` — the engine's own last-reported prompt size for this exact pool,
+ *  from `lastCtxUsage` — calibrates the estimate; see calibratedTokenScale. `preserveThinking`
+ *  must be the conversation's own flag, so the sizing estimate matches what actually gets
+ *  resent (see effectiveTailText). */
+export function pickCompactionCut(pool: Message[], ctxMax: number, realCtxUsed?: number, preserveThinking = false): { toSummarize: Message[]; cutMessageId: string; tokensBefore: number } | null {
   if (pool.length < MIN_MESSAGES_TO_COMPACT) return null
+  const scale = calibratedTokenScale(pool, realCtxUsed, preserveThinking)
   const keepBudget = Math.max(1, Math.round(ctxMax * KEEP_RECENT_FRACTION))
   let tailStart = pool.length
   let tailTokens = 0
   while (tailStart > 0) {
     const next = pool[tailStart - 1]
-    const nextTokens = estimateTokens([{ role: next.role, content: next.content }])
+    const nextTokens = estimateTokens([{ role: next.role, content: effectiveTailText(preserveThinking, next) }]) * scale
     if (tailStart < pool.length && tailTokens + nextTokens > keepBudget) break
     tailTokens += nextTokens
     tailStart--
   }
   if (tailStart <= 0) return null // the whole pool already fits the tail budget
   const toSummarize = pool.slice(0, tailStart)
-  return { toSummarize, cutMessageId: toSummarize[toSummarize.length - 1].id }
+  const tokensBefore = Math.round(estimateTokens(toSummarize.map((m) => ({ role: m.role, content: effectiveTailText(preserveThinking, m) }))) * scale)
+  return { toSummarize, cutMessageId: toSummarize[toSummarize.length - 1].id, tokensBefore }
 }
 
 // ── the summarization call ──────────────────────────────────────────────────────────
@@ -228,11 +269,15 @@ export async function compactConversation(
     upstream = resolved.upstream
   }
 
-  const picked = pickCompactionCut(pool, upstream.ctxMax)
+  // The engine's own last-reported prompt size for this pool (already computed for the 80%
+  // auto-trigger check) calibrates pickCompactionCut's char-based estimate against reality —
+  // see calibratedTokenScale's doc comment for why the raw estimate alone under-fires.
+  const { ctxUsed: realCtxUsed } = lastCtxUsage(activeMessages)
+  const picked = pickCompactionCut(pool, upstream.ctxMax, realCtxUsed, !!conv.preserveThinking)
   if (!picked) throw new Error('nothing_to_compact')
 
   const promptMessages = buildSummarizationPrompt(priorSummary, picked.toSummarize)
-  const tokensBefore = estimateTokens(picked.toSummarize.map((m) => ({ role: m.role, content: m.content })))
+  const tokensBefore = picked.tokensBefore
 
   // Same low-priority-background gate acquisition autoTitle uses (chat-routes.ts) — a
   // compaction call must never contend with real foreground chat/agent work for the

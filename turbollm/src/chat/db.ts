@@ -64,6 +64,11 @@ export interface Conversation {
   compactionUpToMessageId?: string
   /** Estimated token count of what was folded into compactionSummary — display-only. */
   compactionTokensBefore?: number
+  /** When the compaction was applied (v51). The context meter reads the last assistant
+   *  message's RECORDED ctxUsed, which compaction never rewrites; comparing that message's
+   *  createdAt against this tells the UI whether the measurement predates the compaction
+   *  (project the new size) or a real turn has since run on the compacted prompt (trust it). */
+  compactionAppliedAt?: string
   createdAt: string
   updatedAt: string
   messages?: Message[]
@@ -512,7 +517,7 @@ export interface Message {
   edited: boolean
 }
 
-interface ConvRow { id: string; title: string; system_prompt: string; model_key: string; sampling: string; expert_mode: number; tool_policy: string | null; kind: string | null; folder_id: string | null; tool_overrides: string | null; agent_id: string | null; completed_at: string | null; read_scope: string | null; agent_mode: string | null; skill_ids: string | null; allowed_tools: string | null; preserve_thinking: number; compaction_summary: string | null; compaction_upto_message_id: string | null; compaction_tokens_before: number | null; created_at: string; updated_at: string }
+interface ConvRow { id: string; title: string; system_prompt: string; model_key: string; sampling: string; expert_mode: number; tool_policy: string | null; kind: string | null; folder_id: string | null; tool_overrides: string | null; agent_id: string | null; completed_at: string | null; read_scope: string | null; agent_mode: string | null; skill_ids: string | null; allowed_tools: string | null; preserve_thinking: number; compaction_summary: string | null; compaction_upto_message_id: string | null; compaction_tokens_before: number | null; compaction_applied_at: string | null; created_at: string; updated_at: string }
 interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; agent_id: string | null; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null; archived_at: string | null; completion: string | null; repo_root: string | null; repo_branch: string | null; use_worktree: number | null; worktree_branch: string | null; worktree_base: string | null; worktree_path: string | null; lines_added: number | null; lines_removed: number | null; compaction_summary: string | null; compaction_upto_message_id: string | null; compaction_tokens_before: number | null; cleared_upto_message_id: string | null; reverted_from_message_id: string | null; title_auto_synced: number | null; code_agent: string | null; terminal_launched_once: number | null }
 interface FolderRow { id: string; name: string; sort_order: number; created_at: string; updated_at: string }
 interface ExtRunRow { id: string; chat_id: string; message_id: string; tenant: string; owner: string; status: string; event_seq: number; error: string | null; created_at: string; ended_at: string | null }
@@ -535,7 +540,7 @@ function safeToolOverrides(s: string | null): Record<string, 'allow' | 'deny'> {
 }
 
 function rowToConv(r: ConvRow): Conversation {
-  return { id: r.id, title: r.title, systemPrompt: r.system_prompt, modelKey: r.model_key, sampling: safeJson(r.sampling) as Record<string, unknown>, expertMode: r.expert_mode === 1, toolPolicy: r.tool_policy ?? undefined, kind: (r.kind === 'agent' ? 'agent' : r.kind === 'code' ? 'code' : 'chat'), folderId: r.folder_id ?? null, toolOverrides: safeToolOverrides(r.tool_overrides), agentId: r.agent_id ?? undefined, completedAt: r.completed_at ?? undefined, readScope: r.read_scope ? (safeJson(r.read_scope) as string[]) : undefined, agentMode: r.agent_mode ?? undefined, skillIds: r.skill_ids ? (safeJson(r.skill_ids) as string[]) : undefined, allowedTools: r.allowed_tools ? (safeJson(r.allowed_tools) as string[]) : undefined, preserveThinking: r.preserve_thinking === 1, compactionSummary: r.compaction_summary ?? undefined, compactionUpToMessageId: r.compaction_upto_message_id ?? undefined, compactionTokensBefore: r.compaction_tokens_before ?? undefined, createdAt: r.created_at, updatedAt: r.updated_at }
+  return { id: r.id, title: r.title, systemPrompt: r.system_prompt, modelKey: r.model_key, sampling: safeJson(r.sampling) as Record<string, unknown>, expertMode: r.expert_mode === 1, toolPolicy: r.tool_policy ?? undefined, kind: (r.kind === 'agent' ? 'agent' : r.kind === 'code' ? 'code' : 'chat'), folderId: r.folder_id ?? null, toolOverrides: safeToolOverrides(r.tool_overrides), agentId: r.agent_id ?? undefined, completedAt: r.completed_at ?? undefined, readScope: r.read_scope ? (safeJson(r.read_scope) as string[]) : undefined, agentMode: r.agent_mode ?? undefined, skillIds: r.skill_ids ? (safeJson(r.skill_ids) as string[]) : undefined, allowedTools: r.allowed_tools ? (safeJson(r.allowed_tools) as string[]) : undefined, preserveThinking: r.preserve_thinking === 1, compactionSummary: r.compaction_summary ?? undefined, compactionUpToMessageId: r.compaction_upto_message_id ?? undefined, compactionTokensBefore: r.compaction_tokens_before ?? undefined, compactionAppliedAt: r.compaction_applied_at ?? undefined, createdAt: r.created_at, updatedAt: r.updated_at }
 }
 
 function rowToFolder(r: FolderRow): Folder {
@@ -1290,6 +1295,18 @@ export class ConversationStore {
       if (!this.hasColumn('conversations', 'compaction_tokens_before'))   this.db.exec(`ALTER TABLE conversations ADD COLUMN compaction_tokens_before INTEGER;`)
       this.db.exec(`PRAGMA user_version = 50;`)
     }
+    // v51: when the compaction was applied. The chat header's context meter reads the LAST
+    // assistant message's recorded ctxUsed — a measurement of what THAT turn actually sent,
+    // which compaction deliberately never rewrites. So right after compacting, the meter
+    // still shows the pre-compaction number and the feature looks like it did nothing
+    // (founder-reported 2026-09-12). This timestamp is what lets the UI tell "that
+    // measurement predates the compaction, project the new size" apart from "a real turn has
+    // since run on the compacted prompt, trust the measurement" — the two cases are otherwise
+    // indistinguishable, and survive a reload only if it's persisted.
+    if (v < 51) {
+      if (!this.hasColumn('conversations', 'compaction_applied_at')) this.db.exec(`ALTER TABLE conversations ADD COLUMN compaction_applied_at TEXT;`)
+      this.db.exec(`PRAGMA user_version = 51;`)
+    }
   }
 
   listConversations(q?: string, kind: 'chat' | 'agent' | 'all' = 'all'): Conversation[] {
@@ -1352,17 +1369,17 @@ export class ConversationStore {
   setConversationCompaction(id: string, patch: { summary: string; upToMessageId: string; tokensBefore: number }): boolean {
     const now = new Date().toISOString()
     return ((this.db.prepare(
-      `UPDATE conversations SET compaction_summary = $sum, compaction_upto_message_id = $upto, compaction_tokens_before = $tok, updated_at = $now WHERE id = $id`,
+      `UPDATE conversations SET compaction_summary = $sum, compaction_upto_message_id = $upto, compaction_tokens_before = $tok, compaction_applied_at = $now, updated_at = $now WHERE id = $id`,
     ).run({ $id: id, $sum: patch.summary, $upto: patch.upToMessageId, $tok: patch.tokensBefore, $now: now } as P) as unknown) as Changes).changes > 0
   }
 
-  /** Undo (manual, from the expanded transcript divider): nulls all three compaction
-   *  columns. No message is touched — this is a pure metadata revert, not a data
-   *  restore, since compaction never mutated or deleted anything to begin with. */
+  /** Undo (manual, from the expanded transcript divider): nulls all compaction columns.
+   *  No message is touched — this is a pure metadata revert, not a data restore, since
+   *  compaction never mutated or deleted anything to begin with. */
   clearConversationCompaction(id: string): boolean {
     const now = new Date().toISOString()
     return ((this.db.prepare(
-      `UPDATE conversations SET compaction_summary = NULL, compaction_upto_message_id = NULL, compaction_tokens_before = NULL, updated_at = $now WHERE id = $id`,
+      `UPDATE conversations SET compaction_summary = NULL, compaction_upto_message_id = NULL, compaction_tokens_before = NULL, compaction_applied_at = NULL, updated_at = $now WHERE id = $id`,
     ).run({ $id: id, $now: now } as P) as unknown) as Changes).changes > 0
   }
 

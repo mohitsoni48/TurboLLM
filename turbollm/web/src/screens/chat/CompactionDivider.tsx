@@ -30,10 +30,16 @@ export function CompactionDivider({ summary, tokensBefore, onUndo }: CompactionD
         className="flex items-center gap-1.5 self-center rounded-full border border-border px-3 py-1 text-[11px] text-muted hover:text-ink transition-colors"
       >
         {expanded ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
-        Context compacted · {fmtK(tokensBefore)} tokens summarized
+        Everything above is now sent as a summary · {fmtK(tokensBefore)} tokens freed
       </button>
       {expanded && (
         <div className="mx-auto max-w-[600px] rounded-lg border border-border bg-panel p-3 text-[13px] text-muted">
+          {/* Says plainly what the dimmed messages above are FOR — the divider used to read
+              "Context compacted · N tokens summarized" while that content sat visibly
+              unchanged right above it, which read as the feature having done nothing. */}
+          <p className="mb-2 text-[12px] text-faint">
+            The messages above are still here, but the model now reads this summary in their place:
+          </p>
           <p className="whitespace-pre-wrap">{summary}</p>
           {onUndo && (
             <button

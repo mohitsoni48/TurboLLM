@@ -140,6 +140,11 @@ export interface Conversation {
   compactionSummary?: string
   compactionUpToMessageId?: string
   compactionTokensBefore?: number
+  /** When the compaction was applied. The context meter reads the last assistant message's
+   *  RECORDED ctxUsed, which compaction never rewrites — comparing that message's createdAt
+   *  against this is what tells a stale pre-compaction measurement apart from a real
+   *  post-compaction one. */
+  compactionAppliedAt?: string
   createdAt: string
   updatedAt: string
   messages?: Message[]
