@@ -4,7 +4,15 @@ import { openSync, readFileSync } from 'node:fs'
 import { serve } from '@hono/node-server'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { ConfigStore, defaultConfig, defaultConfigPath, getModelProfile, resolveConfiguredCtx, migrateLegacyDataDir } from './config/config'
+import {
+  ConfigStore,
+  defaultConfig,
+  defaultConfigPath,
+  getModelProfile,
+  resolveConfiguredCtx,
+  migrateLegacyDataDir,
+  resolveIngressPort,
+} from './config/config'
 import { setGithubTokenProvider } from './engines/download'
 import { Manager, killTrackedEnginesSync, reapStaleEngines, type StartOpts } from './engines/manager'
 import { ComfyGuard } from './engines/comfy-guard'
@@ -53,6 +61,7 @@ import { reapStaleTerminals, killTrackedTerminalsSync } from './terminal/termina
 import { provisionBootstrapApiKey, provisionTunnelApiKey } from './auth'
 import { getAdvertisedHost } from './net'
 import { TunnelManager, reapStaleTunnels, killTrackedTunnelsSync } from './tunnel/manager'
+import { IngressListener } from './remote/ingress'
 import { LinkManager } from './link/link-manager'
 import { RemoteCatalog } from './link/remote-catalog'
 import { isTurboLinkEnabled } from './link/gate'
@@ -655,11 +664,19 @@ setInterval(() => telemetry.flushUiDailyUsage(), 5 * 60_000).unref()
 // daily-query-rollups.ts) rather than an in-memory accumulator, so there is no
 // separate "persist what's in progress" call to also wire here.
 setInterval(() => checkDailyQueryRollups(store.dir(), db, telemetry), 5 * 60_000).unref()
-// Cloud Launch (ADR-045/152): only wired when --tunnel is passed. Its mere presence
-// on Deps is what forces auth enforcement on tunneled traffic (see auth.ts lanAuth) —
-// absent entirely for the vast majority of runs that never asked for a tunnel.
-const tunnelRequested = hasFlag('--tunnel')
-if (tunnelRequested) deps.tunnel = new TunnelManager(store.dir())
+// Remote access (ADR-422). Config is the source of truth; `--tunnel` is a per-run override
+// meaning "cloudflare-quick for this run, don't persist" — kept ungated because
+// deploy/kaggle/serve.sh and deploy/runpod/Dockerfile both depend on it and cannot flip a
+// UI toggle (spec 30 §8.3).
+const tunnelFlag = hasFlag('--tunnel')
+const remoteWanted = tunnelFlag || store.snapshot().remoteAccess.enabled
+const ingress = new IngressListener()
+let tunnelManager: TunnelManager | null = null
+if (remoteWanted) {
+  deps.remote = ingress
+  tunnelManager = new TunnelManager(store.dir())
+  deps.tunnel = tunnelManager
+}
 
 // Shared Code-session run registry (Task 5): the SAME instance backs both the live Code UI
 // routes (server.ts passes d.codeRuns into registerCodeRoutes) and in-app-pi Code Routine
@@ -939,14 +956,17 @@ function listen(attempt = 0): void {
     // Keep the legacy one-liner for log parsers that key on it.
     process.stdout.write(`TurboLLM ${version} listening on http://${displayHost}:${info.port}\n`)
 
-    // Cloud Launch (ADR-045/152): (re)start the tunnel pointed at whatever port we
-    // just bound — covers both the initial start AND a later rebind (the tunnel
-    // manager tears down any prior tunnel before spawning the new one). Fire-and-
-    // forget: never blocks the banner or the listener on cloudflared's handshake.
-    if (deps.tunnel) {
-      void deps.tunnel
-        .start(info.port)
+    // Remote access (ADR-422): the provider points at the INGRESS port, not at the port we
+    // just bound. That is what lets a LAN/port rebind leave the public URL untouched —
+    // previously every rebind tore the tunnel down and re-issued a brand-new public URL.
+    // Fire-and-forget: never block the banner or the listener on a provider handshake.
+    if (remoteWanted && ingress.ingressPort() === undefined) {
+      const wantIngress = resolveIngressPort(store.snapshot().remoteAccess.ingressPort, info.port)
+      void ingress
+        .start(app, wantIngress)
+        .then((p) => tunnelManager?.start(p))
         .then((url) => {
+          if (!url) return
           console.log(`  Tunnel:  ${url}`)
           tunnelToken ??= provisionTunnelApiKey(deps)
           console.log(`  Token:   ${tunnelToken}`)
@@ -954,7 +974,7 @@ function listen(attempt = 0): void {
           console.log(``)
         })
         .catch((e) => {
-          console.error(`  Tunnel failed to start: ${e instanceof Error ? e.message : e}`)
+          console.error(`  Remote access failed to start: ${e instanceof Error ? e.message : e}`)
         })
     }
 
@@ -1098,7 +1118,7 @@ deps.requestRestart = (opts?: { exitOnly?: boolean }) => {
   const watchdog = setTimeout(finish, 14_000)
   watchdog.unref()
   try {
-    void Promise.all([manager.shutdown(), deps.tunnel?.shutdown() ?? Promise.resolve()]).finally(() => {
+    void Promise.all([manager.shutdown(), deps.tunnel?.shutdown() ?? Promise.resolve(), ingress.stop()]).finally(() => {
       try {
         db.close()
       } catch {
@@ -1195,7 +1215,7 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
     clearInterval(cliInteractiveSweepTimer)
     comfy.stop()
     toolRegistry.disconnectAll()
-    void Promise.all([manager.shutdown(), deps.tunnel?.shutdown() ?? Promise.resolve()]).finally(() => {
+    void Promise.all([manager.shutdown(), deps.tunnel?.shutdown() ?? Promise.resolve(), ingress.stop()]).finally(() => {
       db.close()
       server.close(() => process.exit(0))
     })
