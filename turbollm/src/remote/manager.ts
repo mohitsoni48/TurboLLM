@@ -8,6 +8,7 @@ import type { Hono } from 'hono'
 import { IngressListener } from './ingress'
 import type { RemoteIngress } from './ingress-types'
 import { backoffDelay, MAX_CONSECUTIVE_FAILURES } from './backoff'
+import { HEALTH_INTERVAL_MS } from './health'
 import type { RemoteProvider, RemoteState } from './types'
 
 export interface RemoteAccessOptions {
@@ -28,6 +29,7 @@ export class RemoteAccessManager implements RemoteIngress {
   private current: RemoteState = { kind: 'off' }
   private failures = 0
   private stopping = false
+  private healthTimer: NodeJS.Timeout | undefined
 
   constructor(private opts: RemoteAccessOptions) {}
 
@@ -110,6 +112,7 @@ export class RemoteAccessManager implements RemoteIngress {
       this.failures = 0
       this.set({ kind: 'connected', url, since: new Date().toISOString() })
       this.watch(provider)
+      this.startHealthLoop()
     } catch (e) {
       await this.ingress.stop()
       this.set({ kind: 'failed', reason: e instanceof Error ? e.message : String(e) })
@@ -121,6 +124,8 @@ export class RemoteAccessManager implements RemoteIngress {
    *  disabled toggle sitting in front of a live public URL. */
   async disable(): Promise<void> {
     this.stopping = true
+    clearInterval(this.healthTimer)
+    this.healthTimer = undefined
     const provider = this.provider
     this.provider = null
     if (provider) await provider.stop()
@@ -135,6 +140,23 @@ export class RemoteAccessManager implements RemoteIngress {
       if (this.stopping || this.provider !== provider) return // a stop we asked for
       void this.restart(`provider exited (code ${code})`)
     })
+  }
+
+  /** Poll the live public URL end-to-end. A failed probe is treated exactly like an
+   *  unexpected exit — the provider is torn down and restarted with backoff — because from
+   *  the user's point of view "the URL stopped answering" is the same event either way. */
+  private startHealthLoop(): void {
+    clearInterval(this.healthTimer)
+    this.healthTimer = setInterval(() => {
+      const url = this.url()
+      if (!url || this.stopping) return
+      void this.opts.probe(url).then(async (ok) => {
+        if (ok || this.stopping || this.url() !== url) return
+        await this.provider?.stop().catch(() => {})
+        void this.restart('health probe failed — the public URL stopped answering')
+      })
+    }, HEALTH_INTERVAL_MS)
+    this.healthTimer.unref()
   }
 
   /** Restart the current provider after an unexpected exit or a failed health probe. */
