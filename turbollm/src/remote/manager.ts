@@ -221,7 +221,22 @@ export class RemoteAccessManager implements RemoteIngress {
         const result = nextHealthCheck(ok, this.consecutiveProbeFailures)
         this.consecutiveProbeFailures = result.consecutiveFailures
         if (!result.shouldRestart) return
-        await this.provider?.stop().catch(() => {})
+        // ADR-422 Phase 3 final review, Important finding I2: calling provider.stop() here
+        // purely because an end-to-end probe failed is only safe for 'child-process' — that
+        // lifecycle's start() requires the child to print real evidence before resolving, so
+        // a stop()-then-restart() cycle is a legitimate way to recover a genuinely wedged
+        // child. For 'system-state' (Tailscale) it would issue a REAL `tailscale ... off`
+        // purely on the strength of a probe that can fail for reasons that have nothing to do
+        // with the tunnel itself (see health.ts's tailnet-reachability notes — userspace
+        // networking and disabled MagicDNS make the daemon's own probe of its OWN tailnet URL
+        // fail 100% of the time while the tunnel serves every other tailnet device fine), and
+        // a false-negative probe must never tear down a working tailnet service. For 'none'
+        // (custom) stop() is a guaranteed no-op anyway, since the user owns that tunnel. Only
+        // an explicit, user-initiated disable() may ever issue the real reset command on the
+        // strength of a health signal alone.
+        if (this.provider?.lifecycle === 'child-process') {
+          await this.provider.stop().catch(() => {})
+        }
         void this.restart('health probe failed — the public URL stopped answering', gen)
       })
     }, HEALTH_INTERVAL_MS)
@@ -278,7 +293,17 @@ export class RemoteAccessManager implements RemoteIngress {
       const port = this.ingress.ingressPort() ?? (await this.ingress.start(this.opts.app, this.opts.ingressPort))
       const { url } = await provider.start(port)
       if (gen !== this.generation) return
-      this.failures = 0
+      // ADR-422 Phase 3 final review, Important finding I2: start() succeeding is only real
+      // evidence of reachability for a 'child-process' provider — spawnAndWait requires the
+      // child to print concrete proof (a real URL) before resolving. For 'system-state' and
+      // 'none', start() trivially succeeds regardless of whether the tunnel is actually
+      // reachable (Tailscale's start() just re-issues `serve`/`funnel`; custom's start() is
+      // `this.started = true; return {url}`), so resetting the failure streak here would make
+      // the terminal `failed` state structurally unreachable for those lifecycles no matter
+      // how many times the probe keeps failing. Leaving the streak to accumulate across
+      // repeated probe-driven restarts is what makes `failed` reachable within
+      // MAX_CONSECUTIVE_FAILURES attempts once a tunnel is genuinely unreachable.
+      if (provider.lifecycle === 'child-process') this.failures = 0
       this.set({ kind: 'connected', url, since: new Date().toISOString() })
       this.watch(provider, gen)
     } catch (e) {

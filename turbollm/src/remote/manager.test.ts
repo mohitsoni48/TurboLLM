@@ -117,10 +117,13 @@ class ControllableProvider implements RemoteProvider {
  *  `ChildTunnel.stop()` has up to an 8s graceful-then-force window) — long enough for a
  *  concurrent `disable()` to run its OWN `stop()` call (a second, immediately-resolving call
  *  on the same instance) to completion while the first is still pending (ADR-422 final-review
- *  fix wave, New Breakage N1). */
+ *  fix wave, New Breakage N1). MUST be `child-process`: since the Phase 3 final-review fix for
+ *  finding I2, the health loop's failure path only calls `provider.stop()` for that lifecycle
+ *  (see manager.ts) — this class exists specifically to make the health loop's own stop() call
+ *  hang, so it must declare the one lifecycle that still triggers it. */
 class SlowStopProvider implements RemoteProvider {
   readonly id = 'custom' as const
-  readonly lifecycle = 'none' as const
+  readonly lifecycle = 'child-process' as const
   starts = 0
   stopCalls = 0
   private releaseFirstStop: (() => void) | undefined
@@ -144,6 +147,31 @@ class SlowStopProvider implements RemoteProvider {
   }
   releaseHungStop(): void {
     this.releaseFirstStop?.()
+  }
+}
+
+/** A 'system-state' provider whose start() ALWAYS trivially succeeds regardless of whether
+ *  the tunnel is actually reachable — exactly like the real TailscaleProvider, whose start()
+ *  just re-issues `serve`/`funnel` and proves nothing about reachability (ADR-422 Phase 3
+ *  final review, Important finding I2). Deliberately implements no `onExit` — a real
+ *  system-state provider has no process to report an exit for at all. */
+class FakeSystemStateProvider implements RemoteProvider {
+  readonly id = 'tailscale-serve' as const
+  readonly lifecycle = 'system-state' as const
+  starts = 0
+  stops = 0
+  async preflight(): Promise<PreflightState> {
+    return { kind: 'off' }
+  }
+  async start(): Promise<{ url: string }> {
+    this.starts++
+    return { url: 'https://box.tail1234.ts.net' }
+  }
+  async stop(): Promise<void> {
+    this.stops++
+  }
+  alive(): boolean {
+    return true
   }
 }
 
@@ -442,4 +470,63 @@ test('manager: a stale health-loop restart() after disable() during provider.sto
   assert.equal(m.state().kind, 'off', 'a stale health-loop restart must not resurrect the tunnel after disable()')
   assert.equal(providers.length, 1, 'no second, resurrected provider was ever created')
   assert.equal(m.ingressPort(), undefined)
+})
+
+// --- ADR-422 Phase 3 final review, Important finding I2 ------------------------------------
+// "Zero tests pair RemoteAccessManager with a non-child-process provider... I2 would have
+// been caught by one such test." A probe-driven restart succeeding proves nothing about
+// reachability for a 'system-state' provider (Tailscale's start() just re-issues
+// `serve`/`funnel`, regardless of whether the tailnet is actually reachable) — so resetting
+// the failure streak on such a "success" made `failed` structurally unreachable, and tearing
+// the provider down via stop() purely because an end-to-end probe failed would issue a REAL
+// `tailscale ... off` against a tunnel that may still be genuinely working (a false-negative
+// probe, not evidence of an actual outage — see health.ts's tailnet-reachability notes).
+
+test('manager: I2 — a system-state provider is never stop()ped by a health-probe failure, and repeated failures still reach failed', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] })
+  const p = new FakeSystemStateProvider()
+  const m = new RemoteAccessManager({ app, ingressPort: 0, makeProvider: () => p, probe: async () => false })
+
+  await m.enable()
+  assert.equal(m.state().kind, 'connected')
+  assert.equal(p.stops, 0)
+
+  /** Drain the real (unmocked) microtask/setImmediate queue until `cond` holds, or give up
+   *  after `maxFlushes`. Used only to let an already-in-motion, already-deterministic chain of
+   *  awaits (a real ingress-socket close callback, not a race whose outcome is in doubt) finish
+   *  draining — never to paper over a genuinely uncertain outcome. */
+  const flushUntil = async (cond: () => boolean, maxFlushes = 20): Promise<void> => {
+    for (let i = 0; i < maxFlushes && !cond(); i++) await flush()
+  }
+
+  for (let cycle = 1; cycle <= MAX_CONSECUTIVE_FAILURES + 1; cycle++) {
+    // Drive CONSECUTIVE_FAILURES_BEFORE_RESTART consecutive failed probes, which is what
+    // makes the health loop call restart() for this cycle.
+    for (let i = 0; i < CONSECUTIVE_FAILURES_BEFORE_RESTART; i++) {
+      t.mock.timers.tick(HEALTH_INTERVAL_MS)
+      await flush()
+      await flush()
+    }
+    // (a) The health loop's failure-handling path must NEVER call stop() on a system-state
+    // provider purely because the end-to-end probe failed — only an explicit disable() may.
+    assert.equal(p.stops, 0, `cycle ${cycle}: a probe-driven restart must not call stop()`)
+
+    if (cycle <= MAX_CONSECUTIVE_FAILURES) {
+      assert.equal(m.state().kind, 'reconnecting', `cycle ${cycle} should be reconnecting`)
+      t.mock.timers.tick(backoffDelay(cycle - 1))
+      await flush()
+      await flush()
+      assert.equal(m.state().kind, 'connected', `cycle ${cycle} should reconnect — the fake's start() always succeeds`)
+    }
+  }
+
+  // (b) Past MAX_CONSECUTIVE_FAILURES consecutive probe-driven restarts, the manager must
+  // settle in `failed` rather than looping connected/reconnecting forever — only possible
+  // because a system-state provider's trivially-successful start() never reset the streak.
+  await flushUntil(() => m.state().kind === 'failed')
+  assert.equal(m.state().kind, 'failed')
+  assert.equal(p.stops, 0, 'reaching failed must not have gone through a health-probe-driven stop() either')
+
+  await m.disable()
+  assert.equal(p.stops, 1, 'only the explicit, user-initiated disable() ever issues the real stop()')
 })
