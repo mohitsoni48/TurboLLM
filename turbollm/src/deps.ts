@@ -17,8 +17,7 @@ import type { BenchRunner } from './bench/bench'
 import type { ModelRouter } from './gateway/model-router'
 import type { ToolRegistry } from './tools/tool-registry'
 import type { GenerationGate } from './agents/gate'
-import type { TunnelManager } from './tunnel/manager'
-import type { RemoteIngress } from './remote/ingress-types'
+import type { RemoteControl } from './remote/ingress-types'
 import type { AgentTaskState } from './agents/task-state'
 import type { Emitter } from './telemetry/emit'
 import type { CodeRunManager } from './code/code-run-manager'
@@ -60,15 +59,14 @@ export interface Deps {
   /** Priority-queue mutex serialising engine calls (multiple concurrent generation
    *  requests). Optional — absent under tests; only wired in cli.ts. */
   gate?: GenerationGate
-  /** Cloud Launch tunnel (ADR-045/152): owns the cloudflared child when `--tunnel` is
-   *  active. Optional: only wired in the real `serve()` entrypoint (cli.ts); absent
-   *  under tests. Its presence/active() state is what forces auth enforcement on
-   *  tunneled traffic regardless of lanBind (see auth.ts lanAuth). */
-  tunnel?: TunnelManager
-  /** Remote access ingress (ADR-422). Present while the ingress listener is bound. THIS is
-   *  what makes a request "tunneled" — see auth.ts isTunneled. Replaces `tunnel`'s
-   *  mere-presence signal; `tunnel` stays until Phase 2 moves its remaining call sites. */
-  remote?: RemoteIngress
+  /** Remote access supervisor (ADR-422). Present while the daemon owns a
+   *  RemoteAccessManager — always in the real `serve()` entrypoint (cli.ts), absent under
+   *  tests that don't exercise it. Its ingress port being bound is what makes a request
+   *  "tunneled" — see auth.ts isTunneled. Widened from the narrow `RemoteIngress` seam
+   *  auth.ts needs to the full `RemoteControl` surface the API/UI need (state/url/enable/
+   *  disable), now that Task 9 wires `/api/v1/remote/*` on top of it. Replaces the old
+   *  `tunnel?: TunnelManager` field entirely — `TunnelManager` is deleted by this task. */
+  remote?: RemoteControl
   /** Background agent-task registry (reviewer + skill distill). Surfaced via /status
    *  so the UI can show running bg tasks inline. Optional — absent under tests. */
   agentTasks?: AgentTaskState

@@ -170,7 +170,7 @@ export function registerLinkAdminRoutes(
 
     const cfg = d.store.snapshot()
     const port = (cfg.daemon as { port?: number }).port ?? 6996
-    const tunnelUrl = d.tunnel?.url() ?? null
+    const tunnelUrl = d.remote?.url() ?? null
     const baseUrl = tunnelUrl ?? lanBaseUrl(port)
 
     // Telemetry (ADR-376 Task 11): count and preset name only — never the token, the

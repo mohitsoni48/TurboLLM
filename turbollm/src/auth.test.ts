@@ -100,10 +100,9 @@ test('bypassesAuth: tunneled + a genuinely remote caller (loopback=false) is sti
 // (see auth.ts), not cf-ray. `fakeDeps`'s `ingressPort` and `fakeContext`'s `localPort`
 // simulate that socket instead of a header.
 
-function fakeDeps(overrides: { lanBind?: boolean; tunnelActive?: boolean; requireApiKey?: boolean; ingressPort?: number }): Deps {
+function fakeDeps(overrides: { lanBind?: boolean; requireApiKey?: boolean; ingressPort?: number }): Deps {
   return {
     store: { snapshot: () => ({ daemon: { lanBind: overrides.lanBind ?? false, requireApiKey: overrides.requireApiKey ?? false } } as ReturnType<Deps['store']['snapshot']>) },
-    tunnel: overrides.tunnelActive !== undefined ? ({ active: () => overrides.tunnelActive } as Deps['tunnel']) : undefined,
     remote: overrides.ingressPort !== undefined ? ({ ingressPort: () => overrides.ingressPort } as Deps['remote']) : undefined,
   } as unknown as Deps
 }
@@ -131,7 +130,7 @@ test('isLocalRequest: an ingress listener is bound but THIS request did not arri
 })
 
 test('isLocalRequest: loopback-only bind with no tunnel at all is still always local (unchanged behavior)', () => {
-  const d = fakeDeps({ lanBind: false, tunnelActive: false })
+  const d = fakeDeps({ lanBind: false })
   const c = fakeContext({})
   assert.equal(isLocalRequest(c, d), true)
 })
@@ -161,19 +160,19 @@ test('isLocalOrAuthenticated: an ingress listener is bound but THIS request did 
 })
 
 test('isLocalOrAuthenticated: loopback-only bind with no tunnel at all is still always local (unchanged behavior)', () => {
-  const d = fakeDeps({ lanBind: false, tunnelActive: false })
+  const d = fakeDeps({ lanBind: false })
   const c = fakeContext({})
   assert.equal(isLocalOrAuthenticated(c, d), true)
 })
 
 test('isLocalOrAuthenticated: LAN-exposed, non-loopback, no tunnel, requireApiKey off — remote still blocked', () => {
-  const d = fakeDeps({ lanBind: true, tunnelActive: false, requireApiKey: false })
+  const d = fakeDeps({ lanBind: true, requireApiKey: false })
   const c = fakeContext({})
   assert.equal(isLocalOrAuthenticated(c, d), false)
 })
 
 test('isLocalOrAuthenticated: LAN-exposed, non-loopback, no tunnel, requireApiKey on — remote allowed (authenticated by lanAuth)', () => {
-  const d = fakeDeps({ lanBind: true, tunnelActive: false, requireApiKey: true })
+  const d = fakeDeps({ lanBind: true, requireApiKey: true })
   const c = fakeContext({})
   assert.equal(isLocalOrAuthenticated(c, d), true)
 })
@@ -307,7 +306,7 @@ test('provisionBootstrapApiKey: a specific LAN address counts as non-loopback to
 const RAW_KEY = 'tllm-testkeyABCDEFGHIJKLMNOPQRSTUVWXYZ01'
 const RAW_KEY_HASH = createHash('sha256').update(RAW_KEY).digest('hex')
 
-function fakeDepsWithKeys(overrides: { lanBind?: boolean; tunnelActive?: boolean; ingressPort?: number; hasKey?: boolean; granted?: string[] }): Deps {
+function fakeDepsWithKeys(overrides: { lanBind?: boolean; ingressPort?: number; hasKey?: boolean; granted?: string[] }): Deps {
   const apiKeys = overrides.hasKey
     ? [{
         id: 'k1', name: 'test', hash: RAW_KEY_HASH, prefix: RAW_KEY.slice(0, 12), createdAt: '', lastUsedAt: null,
@@ -324,7 +323,6 @@ function fakeDepsWithKeys(overrides: { lanBind?: boolean; tunnelActive?: boolean
       } as unknown as ReturnType<Deps['store']['snapshot']>),
       update: (fn: (cfg: { apiKeys: typeof apiKeys }) => void) => fn({ apiKeys }),
     },
-    tunnel: overrides.tunnelActive !== undefined ? ({ active: () => overrides.tunnelActive } as Deps['tunnel']) : undefined,
     remote: overrides.ingressPort !== undefined ? ({ ingressPort: () => overrides.ingressPort } as Deps['remote']) : undefined,
   } as unknown as Deps
 }

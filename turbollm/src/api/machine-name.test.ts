@@ -34,6 +34,17 @@ function mkConfig(machineName?: string): Record<string, unknown> {
     build: { toolchainDirs: [] },
     code: { agentsMdProjectCandidates: [], agentsMdGlobalCandidates: [], defaultAgent: 'turbollm' },
     cloudDeploy: { runpodTemplateId: '' },
+    remoteAccess: {
+      enabled: false,
+      provider: 'cloudflare-quick',
+      ingressPort: 6997,
+      cloudflare: { tunnelToken: '', hostname: '', accessTeamDomain: '', accessAud: '', requireAccess: false },
+      ngrok: { authtoken: '', domain: '' },
+      tailscale: { port: 443 },
+      custom: { publicUrl: '' },
+      tokenGrant: { capabilities: ['models:use'] },
+      lastUrl: '',
+    },
     daemon: {
       port: 6996, lanBind: false, requireApiKey: false, theme: 'system', idleTtlMinutes: 30,
       autoGenerateTitles: true, autoMemoryEnabled: false, openBrowserOnStart: true,

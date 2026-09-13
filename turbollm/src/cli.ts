@@ -60,8 +60,11 @@ import { registerTerminalWs } from './terminal/terminal-routes'
 import { reapStaleTerminals, killTrackedTerminalsSync } from './terminal/terminal-manager'
 import { provisionBootstrapApiKey, provisionTunnelApiKey } from './auth'
 import { getAdvertisedHost } from './net'
-import { TunnelManager, reapStaleTunnels, killTrackedTunnelsSync } from './tunnel/manager'
-import { IngressListener } from './remote/ingress'
+import { reapStaleTunnels, killTrackedTunnelsSync } from './remote/child-process'
+import { RemoteAccessManager } from './remote/manager'
+import { makeProvider } from './remote/providers/factory'
+import { probeUrl } from './remote/health'
+import { isRemoteAccessEnabled } from './remote/gate'
 import { LinkManager } from './link/link-manager'
 import { RemoteCatalog } from './link/remote-catalog'
 import { isTurboLinkEnabled } from './link/gate'
@@ -664,19 +667,6 @@ setInterval(() => telemetry.flushUiDailyUsage(), 5 * 60_000).unref()
 // daily-query-rollups.ts) rather than an in-memory accumulator, so there is no
 // separate "persist what's in progress" call to also wire here.
 setInterval(() => checkDailyQueryRollups(store.dir(), db, telemetry), 5 * 60_000).unref()
-// Remote access (ADR-422). Config is the source of truth; `--tunnel` is a per-run override
-// meaning "cloudflare-quick for this run, don't persist" — kept ungated because
-// deploy/kaggle/serve.sh and deploy/runpod/Dockerfile both depend on it and cannot flip a
-// UI toggle (spec 30 §8.3).
-const tunnelFlag = hasFlag('--tunnel')
-const remoteWanted = tunnelFlag || store.snapshot().remoteAccess.enabled
-const ingress = new IngressListener()
-let tunnelManager: TunnelManager | null = null
-if (remoteWanted) {
-  deps.remote = ingress
-  tunnelManager = new TunnelManager(store.dir())
-  deps.tunnel = tunnelManager
-}
 
 // Shared Code-session run registry (Task 5): the SAME instance backs both the live Code UI
 // routes (server.ts passes d.codeRuns into registerCodeRoutes) and in-app-pi Code Routine
@@ -766,6 +756,26 @@ const cliInteractiveSweepTimer = setInterval(() => sweepInteractiveCliRuns(cliIn
 cliInteractiveSweepTimer.unref()
 
 const app = createApp(deps)
+
+// Remote access (ADR-422). Config is the source of truth; `--tunnel` is a per-run override
+// meaning "cloudflare-quick for this run, don't persist" — kept ungated because
+// deploy/kaggle/serve.sh and deploy/runpod/Dockerfile both depend on it and cannot flip a
+// UI toggle (spec 30 §8.3).
+const tunnelFlag = hasFlag('--tunnel')
+// A persisted `remoteAccess.enabled: true` only auto-starts the supervisor when the
+// experimental flag is ALSO on (spec 30 §8.1: "the supervisor does not run" with the flag
+// off). `--tunnel` remains the one ungated override (§8.3) — it bypasses BOTH the flag and
+// the persisted `enabled` field entirely, exactly as it does today.
+const remoteWanted = tunnelFlag || (isRemoteAccessEnabled(deps) && store.snapshot().remoteAccess.enabled)
+const remote = new RemoteAccessManager({
+  app,
+  ingressPort: resolveIngressPort(store.snapshot().remoteAccess.ingressPort, store.snapshot().daemon.port),
+  // `--tunnel` is a per-run override meaning cloudflare-quick, don't persist (spec 30 §8.3).
+  makeProvider: () => makeProvider(tunnelFlag ? 'cloudflare-quick' : store.snapshot().remoteAccess.provider, deps),
+  probe: (url) => probeUrl(url),
+})
+deps.remote = remote
+
 await registerCodeRoutesIfSupported(app, deps)
 
 // Warm the app-update cache shortly after boot (ADR-031: "once per daemon start") so the
@@ -956,36 +966,24 @@ function listen(attempt = 0): void {
     // Keep the legacy one-liner for log parsers that key on it.
     process.stdout.write(`TurboLLM ${version} listening on http://${displayHost}:${info.port}\n`)
 
-    // Remote access (ADR-422): the provider points at the INGRESS port, not at the port we
-    // just bound. That is what lets a LAN/port rebind leave the public URL untouched —
-    // previously every rebind tore the tunnel down and re-issued a brand-new public URL.
-    // Fire-and-forget: never block the banner or the listener on a provider handshake.
-    if (remoteWanted && ingress.ingressPort() === undefined) {
-      const wantIngress = resolveIngressPort(store.snapshot().remoteAccess.ingressPort, info.port)
-      void ingress
-        .start(app, wantIngress)
-        .then((p) => {
-          // Mirror the main listener's terminal WebSocket wiring (see registerTerminalWs
-          // call below) onto the ingress server. cloudflared's local leg targets THIS
-          // server, not the main one — without this, a Code-terminal WS upgrade arriving
-          // over the tunnel hits a server with zero 'upgrade' listeners and Node destroys
-          // its socket with no application-level error (ADR-422). Runs exactly once: this
-          // whole block is gated by `ingress.ingressPort() === undefined` above, which is
-          // only true before the first successful start.
-          if (ingress.server) registerTerminalWs(ingress.server as unknown as import('http').Server, deps)
-          return tunnelManager?.start(p)
-        })
-        .then((url) => {
-          if (!url) return
-          console.log(`  Tunnel:  ${url}`)
-          tunnelToken ??= provisionTunnelApiKey(deps)
-          console.log(`  Token:   ${tunnelToken}`)
-          console.log(`           (required for anyone using this tunnel URL)`)
-          console.log(``)
-        })
-        .catch((e) => {
-          console.error(`  Remote access failed to start: ${e instanceof Error ? e.message : e}`)
-        })
+    // Runs once, at boot: this whole block is gated by remote.state().kind === 'off', which
+    // is only true before the first ever enable() call in this process's lifetime.
+    if (remoteWanted && remote.state().kind === 'off') {
+      void remote.enable().then(() => {
+        // Mirror the main listener's terminal WebSocket wiring onto the ingress server —
+        // preserves the fix from Phase 1 Task 3 (ADR-422): cloudflared's local leg targets
+        // the INGRESS server, not the main one, so without this a Code-terminal WS upgrade
+        // arriving over the tunnel hits a server with zero 'upgrade' listeners and Node
+        // destroys its socket with no application-level error.
+        if (remote.server) registerTerminalWs(remote.server as unknown as import('http').Server, deps)
+        const url = remote.url()
+        if (!url) return
+        console.log(`  Tunnel:  ${url}`)
+        tunnelToken ??= provisionTunnelApiKey(deps)
+        console.log(`  Token:   ${tunnelToken}`)
+        console.log(`           (required for anyone using this tunnel URL)`)
+        console.log(``)
+      })
     }
 
     // Write pidfile so `turbollm --stop` can find and stop this process (F-035). Written
@@ -1128,7 +1126,7 @@ deps.requestRestart = (opts?: { exitOnly?: boolean }) => {
   const watchdog = setTimeout(finish, 14_000)
   watchdog.unref()
   try {
-    void Promise.all([manager.shutdown(), deps.tunnel?.shutdown() ?? Promise.resolve(), ingress.stop()]).finally(() => {
+    void Promise.all([manager.shutdown(), remote.disable()]).finally(() => {
       try {
         db.close()
       } catch {
@@ -1225,7 +1223,7 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
     clearInterval(cliInteractiveSweepTimer)
     comfy.stop()
     toolRegistry.disconnectAll()
-    void Promise.all([manager.shutdown(), deps.tunnel?.shutdown() ?? Promise.resolve(), ingress.stop()]).finally(() => {
+    void Promise.all([manager.shutdown(), remote.disable()]).finally(() => {
       db.close()
       server.close(() => process.exit(0))
     })
