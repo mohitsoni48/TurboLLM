@@ -65,6 +65,7 @@ import { RemoteAccessManager } from './remote/manager'
 import { makeProvider } from './remote/providers/factory'
 import { probeUrl } from './remote/health'
 import { isRemoteAccessEnabled } from './remote/gate'
+import type { RemoteState } from './remote/types'
 import { LinkManager } from './link/link-manager'
 import { RemoteCatalog } from './link/remote-catalog'
 import { isTurboLinkEnabled } from './link/gate'
@@ -767,12 +768,52 @@ const tunnelFlag = hasFlag('--tunnel')
 // off). `--tunnel` remains the one ungated override (§8.3) — it bypasses BOTH the flag and
 // the persisted `enabled` field entirely, exactly as it does today.
 const remoteWanted = tunnelFlag || (isRemoteAccessEnabled(deps) && store.snapshot().remoteAccess.enabled)
+
+// Fires on EVERY transition into 'connected' — the very first connect and every automatic
+// reconnect after a restart (ADR-422 Phase 2 final review, Critical finding C2). Without this,
+// a headless operator (Kaggle, RunPod — no UI, and /api/v1/remote/status refuses while the
+// experimental flag is off) has no way to discover a rolled URL after a reconnect: previously
+// this print only ever ran once, inside the initial `remote.enable().then(...)` chain below.
+// `remote` is referenced here before its own declaration below — safe, because this function is
+// only ever CALLED later (asynchronously, from inside RemoteAccessManager.set()), by which point
+// `remote` has long since been assigned.
+let lastWiredServer: unknown = null
+function onRemoteState(s: RemoteState): void {
+  if (s.kind !== 'connected') return
+  // cloudflared's local leg targets the INGRESS server, not the main one (Phase 1 Task 3's fix
+  // round). A fresh server instance only appears after a disable()+enable() cycle — a
+  // provider-only crash-restart reuses the already-bound ingress — so dedupe on identity to
+  // avoid registering the WebSocket 'upgrade' handler twice on the same server.
+  if (remote.server && remote.server !== lastWiredServer) {
+    registerTerminalWs(remote.server as unknown as import('http').Server, deps)
+    lastWiredServer = remote.server
+  }
+  console.log(`  Tunnel:  ${s.url}`)
+  tunnelToken ??= provisionTunnelApiKey(deps)
+  console.log(`  Token:   ${tunnelToken}`)
+  console.log(`           (required for anyone using this tunnel URL)`)
+  console.log(``)
+  // spec 30 §2.4: "The last known URL persists in config.json so a daemon restart shows it
+  // immediately, flagged stale until the first successful probe" (ADR-422 final review,
+  // Important finding I4). Done here rather than by threading a config-store reference into
+  // RemoteAccessManager — cli.ts already has `store` in scope, and this keeps the manager free
+  // of a new dependency for a concern that's purely about persistence, not supervision.
+  try {
+    store.update((cfg) => {
+      cfg.remoteAccess.lastUrl = s.url
+    })
+  } catch {
+    /* best-effort — never fail a connect over a persistence hiccup */
+  }
+}
+
 const remote = new RemoteAccessManager({
   app,
   ingressPort: resolveIngressPort(store.snapshot().remoteAccess.ingressPort, store.snapshot().daemon.port),
   // `--tunnel` is a per-run override meaning cloudflare-quick, don't persist (spec 30 §8.3).
   makeProvider: () => makeProvider(tunnelFlag ? 'cloudflare-quick' : store.snapshot().remoteAccess.provider, deps),
   probe: (url) => probeUrl(url),
+  onState: onRemoteState,
 })
 deps.remote = remote
 
@@ -967,23 +1008,13 @@ function listen(attempt = 0): void {
     process.stdout.write(`TurboLLM ${version} listening on http://${displayHost}:${info.port}\n`)
 
     // Runs once, at boot: this whole block is gated by remote.state().kind === 'off', which
-    // is only true before the first ever enable() call in this process's lifetime.
+    // is only true before the first ever enable() call in this process's lifetime. All the
+    // work that used to live in this block's .then() callback — wiring the terminal WebSocket
+    // handler onto the ingress server, and printing 'Tunnel:'/'Token:' — now happens in
+    // onRemoteState above, which fires for this first connect AND every later automatic
+    // reconnect (ADR-422 Phase 2 final review, C2), so it is not duplicated here.
     if (remoteWanted && remote.state().kind === 'off') {
-      void remote.enable().then(() => {
-        // Mirror the main listener's terminal WebSocket wiring onto the ingress server —
-        // preserves the fix from Phase 1 Task 3 (ADR-422): cloudflared's local leg targets
-        // the INGRESS server, not the main one, so without this a Code-terminal WS upgrade
-        // arriving over the tunnel hits a server with zero 'upgrade' listeners and Node
-        // destroys its socket with no application-level error.
-        if (remote.server) registerTerminalWs(remote.server as unknown as import('http').Server, deps)
-        const url = remote.url()
-        if (!url) return
-        console.log(`  Tunnel:  ${url}`)
-        tunnelToken ??= provisionTunnelApiKey(deps)
-        console.log(`  Token:   ${tunnelToken}`)
-        console.log(`           (required for anyone using this tunnel URL)`)
-        console.log(``)
-      })
+      void remote.enable()
     }
 
     // Write pidfile so `turbollm --stop` can find and stop this process (F-035). Written
