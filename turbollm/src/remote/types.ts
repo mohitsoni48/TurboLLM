@@ -32,4 +32,11 @@ export interface RemoteProvider {
   stop(): Promise<void>
   /** Cheap liveness, polled by the supervisor between end-to-end health probes. */
   alive(): boolean
+  /** For a 'child-process' lifecycle provider: register a callback for when the underlying
+   *  process exits, for ANY reason. The supervisor uses this to distinguish a stop() it asked
+   *  for from an unexpected death (and restart accordingly) — see manager.ts's watch(). Declared
+   *  optional rather than required because 'system-state' and 'none' providers have no process
+   *  to report an exit for at all; every 'child-process' provider MUST implement it, or the
+   *  supervisor's whole restart mechanism is silently inert for that provider. */
+  onExit?(cb: (code: number | null) => void): void
 }

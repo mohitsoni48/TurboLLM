@@ -183,8 +183,7 @@ export class RemoteAccessManager implements RemoteIngress {
    *  WITHIN the same connection's lifetime (an earlier crash-restart), which the generation
    *  counter alone can't see since `restart()` deliberately does not bump it. */
   private watch(provider: RemoteProvider, gen: number): void {
-    const withExit = provider as RemoteProvider & { onExit?: (cb: (code: number | null) => void) => void }
-    withExit.onExit?.((code) => {
+    provider.onExit?.((code) => {
       if (gen !== this.generation || this.provider !== provider) return // a stop we asked for, or already superseded
       void this.restart(`provider exited (code ${code})`, gen)
     })
