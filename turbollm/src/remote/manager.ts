@@ -8,7 +8,7 @@ import type { Hono } from 'hono'
 import { IngressListener } from './ingress'
 import type { RemoteIngress } from './ingress-types'
 import { backoffDelay, MAX_CONSECUTIVE_FAILURES } from './backoff'
-import { HEALTH_INTERVAL_MS } from './health'
+import { HEALTH_INTERVAL_MS, nextHealthCheck } from './health'
 import type { RemoteProvider, RemoteState } from './types'
 
 export interface RemoteAccessOptions {
@@ -19,7 +19,10 @@ export interface RemoteAccessOptions {
   /** End-to-end reachability check against the live public URL. Injected so tests never
    *  make a real network call; production passes the probe from Task 8. */
   probe: (url: string) => Promise<boolean>
-  /** Called whenever the state changes, so the API/UI can observe transitions. */
+  /** Called whenever the state changes, so the API/UI can observe transitions. cli.ts wires
+   *  this to log the URL and persist it to config.json on every 'connected' transition — the
+   *  very first connect AND every automatic reconnect (ADR-422 Phase 2 final review, findings
+   *  C2 and I4). */
   onState?: (s: RemoteState) => void
 }
 
@@ -28,8 +31,31 @@ export class RemoteAccessManager implements RemoteIngress {
   private provider: RemoteProvider | null = null
   private current: RemoteState = { kind: 'off' }
   private failures = 0
-  private stopping = false
   private healthTimer: NodeJS.Timeout | undefined
+  private consecutiveProbeFailures = 0
+
+  /** Bumped by `enable()` (once it commits to doing real work — see the comment on `enable()`
+   *  for why that is AFTER its idempotency check, not before) and by `disable()` (always,
+   *  unconditionally, before any await). Every flow that awaits anything before touching
+   *  shared state (`this.provider`, the ingress, or `set()`) captures the generation in force
+   *  when IT started and re-checks it after each await; a mismatch means a newer
+   *  disable()/enable() has superseded this flow, which must then do nothing further rather
+   *  than mutate state it no longer owns.
+   *
+   *  This closes four interleavings the Phase 2 final review traced, all sharing one root
+   *  cause — a flow that is no longer current still mutating shared state (ADR-422 final
+   *  review, Important finding I1 plus the three previously-ledgered "cosmetic" races, two of
+   *  which turned out NOT to be cosmetic: see the comments on `enable()`'s catch and
+   *  `restart()`'s give-up branch below, both of which can tear a LIVE listener down into an
+   *  unrecoverable `failed` state, not just mis-paint a status field).
+   *
+   *  This single counter supersedes the narrower `this.stopping` flag and (mostly) the
+   *  `this.provider !== provider` identity checks the Task 7 fix round added for the same
+   *  purpose. `watch()` keeps an ADDITIONAL identity check alongside the generation check,
+   *  because it must also detect a same-generation provider replacement (a crash-restart
+   *  within one connection's lifetime, which `restart()` deliberately does NOT bump the
+   *  generation for) — something a generation number alone cannot distinguish. */
+  private generation = 0
 
   constructor(private opts: RemoteAccessOptions) {}
 
@@ -66,12 +92,16 @@ export class RemoteAccessManager implements RemoteIngress {
    *  connect attempt — until it resolves to `connected` or `failed`. Without excluding it here,
    *  an `enable()` call arriving mid-backoff (e.g. the user clicking "enable" while a
    *  "reconnecting…" indicator is showing) would run a second, competing connect attempt
-   *  concurrently with the pending restart: both would assign `this.provider`, both would race
-   *  unguarded on the shared `IngressListener`, and whichever's `provider.start()` resolved last
-   *  would win `state()` regardless of which provider was actually alive — silently disabling
-   *  future crash-detection for the connection actually in use (ADR-422 Task 7 fix round,
-   *  Critical finding). The simplest correct behavior is to let the pending restart continue
-   *  undisturbed, exactly like the `connected`/`starting` no-ops already do. */
+   *  concurrently with the pending restart (ADR-422 Task 7 fix round, Critical finding).
+   *
+   *  The generation counter is bumped AFTER this idempotency check, not before it, even though
+   *  disable() bumps unconditionally at its very top. A genuinely no-op enable() call (state
+   *  already connected/starting/reconnecting) must have ZERO side effects, including on the
+   *  generation number: bumping it unconditionally here would invalidate whatever flow is
+   *  currently in flight for no reason at all — concretely, a stray `enable()` call arriving
+   *  during a pending restart()'s backoff wait would make that restart() see a generation
+   *  mismatch once its timer fires and abandon a perfectly legitimate reconnection attempt,
+   *  permanently stranding the manager in `reconnecting` with nothing left to retry it. */
   async enable(): Promise<void> {
     if (
       this.current.kind === 'connected' ||
@@ -80,7 +110,7 @@ export class RemoteAccessManager implements RemoteIngress {
     ) {
       return
     }
-    this.stopping = false
+    const gen = ++this.generation
     this.failures = 0
     this.set({ kind: 'starting' })
 
@@ -90,13 +120,15 @@ export class RemoteAccessManager implements RemoteIngress {
     // Preflight BEFORE binding anything: a provider that cannot run must report why in the
     // user's own terms, not fail halfway through with a stack trace (spec 30 §7.5).
     const pre = await provider.preflight()
+    // A concurrent disable() (or, in principle, another enable() — though the idempotency
+    // guard above makes that unreachable) may have superseded this flow while we awaited
+    // preflight(). A stale flow does NOTHING further: no set(), and no touching
+    // `this.provider` — whichever newer flow bumped the generation already owns both
+    // (ADR-422 final review, ledgered race (c), reclassified from "cosmetic" to "must not
+    // paint a stale verdict over a live state").
+    if (gen !== this.generation) return
     if (pre.kind !== 'off') {
-      // This provider's start() was never called — don't leave it as `this.provider`, or a
-      // later disable() will call .stop() on an instance that never started (ADR-422 Task 7
-      // fix round, Important finding). Guard on identity rather than unconditionally nulling,
-      // matching the guard watch()'s own exit callback uses, in case a concurrent disable()
-      // already claimed `this.provider` for something else while we were awaiting preflight().
-      if (this.provider === provider) this.provider = null
+      this.provider = null
       this.set(pre)
       return
     }
@@ -104,26 +136,35 @@ export class RemoteAccessManager implements RemoteIngress {
     try {
       const port = await this.ingress.start(this.opts.app, this.opts.ingressPort)
       const { url } = await provider.start(port)
-      // A concurrent flow (disable(), or — pre-fix — a competing enable()/restart()) may have
-      // already superseded this provider while we were awaiting start(). Only the flow whose
-      // provider is still the tracked one gets to report success and re-arm watch(), mirroring
-      // the identity check watch()'s own exit callback already uses.
-      if (this.provider !== provider) return
+      if (gen !== this.generation) return // superseded while binding ingress / starting the provider
       this.failures = 0
       this.set({ kind: 'connected', url, since: new Date().toISOString() })
-      this.watch(provider)
-      this.startHealthLoop()
+      this.watch(provider, gen)
+      this.startHealthLoop(gen)
     } catch (e) {
+      // ADR-422 final review, ledgered race (a): if a DIFFERENT, now-current flow already
+      // rebuilt the ingress (a disable() then a fresh enable(), both of which ran while this
+      // attempt awaited provider.start()), `await this.ingress.stop()` below would tear down
+      // THAT live listener and stamp `failed` over a real `connected` state — one the manager
+      // could then never self-heal from, since the health loop short-circuits on a null
+      // `url()` while `failed`. Check the generation before calling stop() at all (so a stale
+      // flow never touches shared infrastructure it doesn't own), and again after (in case a
+      // disable()/enable() lands during the stop() call itself).
+      if (gen !== this.generation) return
       await this.ingress.stop()
+      if (gen !== this.generation) return
       this.set({ kind: 'failed', reason: e instanceof Error ? e.message : String(e) })
     }
   }
 
   /** Take remote access down. Always awaits the provider's own stop — for a `system-state`
    *  provider that call is what un-exposes the box, so a fire-and-forget here would leave a
-   *  disabled toggle sitting in front of a live public URL. */
+   *  disabled toggle sitting in front of a live public URL. Bumps the generation FIRST,
+   *  unconditionally, before any await — this is what makes disable() authoritative over any
+   *  flow already in flight, including a pending restart() sitting in its backoff wait
+   *  (ADR-422 final review, Important finding I1). */
   async disable(): Promise<void> {
-    this.stopping = true
+    this.generation++
     clearInterval(this.healthTimer)
     this.healthTimer = undefined
     const provider = this.provider
@@ -133,25 +174,46 @@ export class RemoteAccessManager implements RemoteIngress {
     this.set({ kind: 'off' })
   }
 
-  /** Watch a child-process provider for an unexpected exit and restart it with backoff. */
-  private watch(provider: RemoteProvider): void {
+  /** Watch a child-process provider for an unexpected exit and restart it with backoff. `gen`
+   *  is the generation captured by whichever enable()/restart() call successfully connected
+   *  this `provider` — checked here IN ADDITION to the provider-identity check, because the
+   *  two catch different kinds of staleness: `gen` mismatching means a disable()/enable()
+   *  cycle has run since (this whole connection is over); `this.provider !== provider`
+   *  mismatching means `restart()` already replaced this specific instance with a newer one
+   *  WITHIN the same connection's lifetime (an earlier crash-restart), which the generation
+   *  counter alone can't see since `restart()` deliberately does not bump it. */
+  private watch(provider: RemoteProvider, gen: number): void {
     const withExit = provider as RemoteProvider & { onExit?: (cb: (code: number | null) => void) => void }
     withExit.onExit?.((code) => {
-      if (this.stopping || this.provider !== provider) return // a stop we asked for
+      if (gen !== this.generation || this.provider !== provider) return // a stop we asked for, or already superseded
       void this.restart(`provider exited (code ${code})`)
     })
   }
 
-  /** Poll the live public URL end-to-end. A failed probe is treated exactly like an
-   *  unexpected exit — the provider is torn down and restarted with backoff — because from
-   *  the user's point of view "the URL stopped answering" is the same event either way. */
-  private startHealthLoop(): void {
+  /** Poll the live public URL end-to-end. A single failed probe is not enough to act on — see
+   *  health.ts's `nextHealthCheck` and `CONSECUTIVE_FAILURES_BEFORE_RESTART` (ADR-422 final
+   *  review, Critical finding C1): only a run of consecutive failures is treated like an
+   *  unexpected exit and restarted with backoff, because a lone blip (or an HTTP 429, which
+   *  `probeUrl` already treats as healthy) must not cost a user their public URL.
+   *
+   *  `gen` is captured once, at the connection this loop was started for, and re-checked on
+   *  every tick — belt-and-suspenders alongside `disable()`'s own `clearInterval` call, in
+   *  case a future refactor ever lets a tick fire after teardown. */
+  private startHealthLoop(gen: number): void {
     clearInterval(this.healthTimer)
+    this.consecutiveProbeFailures = 0
     this.healthTimer = setInterval(() => {
+      if (gen !== this.generation) {
+        clearInterval(this.healthTimer)
+        return
+      }
       const url = this.url()
-      if (!url || this.stopping) return
+      if (!url) return
       void this.opts.probe(url).then(async (ok) => {
-        if (ok || this.stopping || this.url() !== url) return
+        if (gen !== this.generation || this.url() !== url) return
+        const result = nextHealthCheck(ok, this.consecutiveProbeFailures)
+        this.consecutiveProbeFailures = result.consecutiveFailures
+        if (!result.shouldRestart) return
         await this.provider?.stop().catch(() => {})
         void this.restart('health probe failed — the public URL stopped answering')
       })
@@ -159,36 +221,49 @@ export class RemoteAccessManager implements RemoteIngress {
     this.healthTimer.unref()
   }
 
-  /** Restart the current provider after an unexpected exit or a failed health probe. */
+  /** Restart the current provider after an unexpected exit or a failed health probe. Part of
+   *  the class's existing public surface (a caller may also use it to force a retry).
+   *
+   *  Captures `gen` at entry but does NOT bump it — a crash-restart is part of the SAME
+   *  logical connection from the user's point of view, not a new one — and re-checks it after
+   *  every await before touching shared state. This is exactly the interleaving ADR-422's
+   *  final review traced as Important finding I1: `disable()` can run while this call is
+   *  parked in its backoff wait, and — pre-fix — a subsequent `enable()` reset the `stopping`
+   *  flag this function used to check, so the stale timer fired anyway and either leaked an
+   *  untracked provider `disable()` could no longer stop, or fought the new connection for
+   *  `this.provider` / the ingress. */
   async restart(reason: string): Promise<void> {
-    if (this.stopping) return
+    const gen = this.generation
     this.failures++
     if (this.failures > MAX_CONSECUTIVE_FAILURES) {
+      // ADR-422 final review, ledgered race (b) — the same shape as enable()'s catch above:
+      // never tear down a different, now-current flow's live listener just because THIS
+      // flow is giving up.
+      if (gen !== this.generation) return
       await this.ingress.stop()
+      if (gen !== this.generation) return
       this.set({ kind: 'failed', reason: `gave up after ${MAX_CONSECUTIVE_FAILURES} attempts: ${reason}` })
       return
     }
+    if (gen !== this.generation) return
     this.set({ kind: 'reconnecting', attempt: this.failures, lastError: reason })
     await new Promise((r) => setTimeout(r, backoffDelay(this.failures - 1)))
-    if (this.stopping) return
+    // The exact I1 interleaving: a disable() then a fresh enable() may have run to completion
+    // during this wait. A stale restart must not touch the ingress or `this.provider` at all
+    // — the new enable() already owns both.
+    if (gen !== this.generation) return
 
     const provider = this.opts.makeProvider()
     this.provider = provider
     try {
       const port = this.ingress.ingressPort() ?? (await this.ingress.start(this.opts.app, this.opts.ingressPort))
       const { url } = await provider.start(port)
-      // Same identity check as enable()'s success path: a concurrent disable() may have
-      // superseded this provider while start() was in flight, so only report success and
-      // re-arm watch() when this is still the tracked provider (ADR-422 Task 7 fix round).
-      if (this.provider !== provider) return
+      if (gen !== this.generation) return
       this.failures = 0
       this.set({ kind: 'connected', url, since: new Date().toISOString() })
-      this.watch(provider)
+      this.watch(provider, gen)
     } catch (e) {
-      // No identity check needed here: the only way `this.provider` could have changed out
-      // from under us by now is a concurrent disable(), which always sets `stopping = true`
-      // first — and this recursive restart() call's own top-of-function check already bails
-      // on that before doing anything else.
+      if (gen !== this.generation) return
       void this.restart(e instanceof Error ? e.message : String(e))
     }
   }
