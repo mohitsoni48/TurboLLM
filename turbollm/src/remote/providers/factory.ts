@@ -4,6 +4,7 @@ import type { RemoteProvider } from '../types'
 import { CloudflareQuickProvider } from './cloudflare-quick'
 import { CloudflareNamedProvider } from './cloudflare-named'
 import { TailscaleServeProvider, TailscaleFunnelProvider } from './tailscale'
+import { NgrokProvider } from './ngrok'
 
 /** One place that maps a provider id to an instance. Phase 3 adds the remaining five here;
  *  until then anything else falls back to the quick tunnel rather than throwing, so an id
@@ -20,6 +21,10 @@ export function makeProvider(id: RemoteProviderId, d: Deps): RemoteProvider {
       return new TailscaleServeProvider({ port: d.store.snapshot().remoteAccess.tailscale.port })
     case 'tailscale-funnel':
       return new TailscaleFunnelProvider({ port: d.store.snapshot().remoteAccess.tailscale.port })
+    case 'ngrok': {
+      const cfg = d.store.snapshot().remoteAccess.ngrok
+      return new NgrokProvider(d.store.dir(), { authtoken: cfg.authtoken, domain: cfg.domain })
+    }
     default:
       return new CloudflareQuickProvider(d.store.dir())
   }
