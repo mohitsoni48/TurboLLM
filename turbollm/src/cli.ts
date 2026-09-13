@@ -61,6 +61,7 @@ import { reapStaleTerminals, killTrackedTerminalsSync } from './terminal/termina
 import { provisionBootstrapApiKey, provisionTunnelApiKey } from './auth'
 import { getAdvertisedHost } from './net'
 import { reapStaleTunnels, killTrackedTunnelsSync } from './remote/child-process'
+import { reconcileTailscale } from './remote/providers/tailscale'
 import { RemoteAccessManager } from './remote/manager'
 import { makeProvider } from './remote/providers/factory'
 import { probeUrl } from './remote/health'
@@ -338,6 +339,15 @@ try {
   const reapedTunnels = reapStaleTunnels(store.dir())
   if (reapedTunnels > 0) console.log(`reaped ${reapedTunnels} orphaned tunnel process(es) from a previous run`)
 } catch { /* best-effort */ }
+// system-state equivalent of the reap above (ADR-422): an unclean exit can leave a Tailscale
+// serve/funnel pointing at our ingress port. Turn it off if config says remote access is off.
+void reconcileTailscale({
+  enabled: store.snapshot().remoteAccess.enabled,
+  provider: store.snapshot().remoteAccess.provider,
+  port: store.snapshot().remoteAccess.tailscale.port,
+}).then((acted) => {
+  if (acted) console.log('reset a Tailscale serve/funnel left over from a previous run')
+})
 // Same idea for terminal-agent CLI processes (claude/pi/opencode) orphaned by an unclean
 // previous shutdown — see terminal-manager.ts's pidfile-tracking header for why this
 // mattered in practice (found live: 11 leaked claude.exe processes after a day of testing).
