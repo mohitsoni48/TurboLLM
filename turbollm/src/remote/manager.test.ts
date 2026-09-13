@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { Hono } from 'hono'
 import { RemoteAccessManager } from './manager'
 import { backoffDelay, MAX_CONSECUTIVE_FAILURES } from './backoff'
+import { CONSECUTIVE_FAILURES_BEFORE_RESTART, HEALTH_INTERVAL_MS } from './health'
 import type { PreflightState, RemoteProvider } from './types'
 
 /** Poll `fn` until it returns true or `timeoutMs` elapses. Used only to wait for a real,
@@ -111,6 +112,41 @@ class ControllableProvider implements RemoteProvider {
   }
 }
 
+/** A provider whose FIRST `stop()` call hangs until manually released; every later call
+ *  resolves immediately. Models a slow-but-eventually-successful graceful shutdown (the real
+ *  `ChildTunnel.stop()` has up to an 8s graceful-then-force window) — long enough for a
+ *  concurrent `disable()` to run its OWN `stop()` call (a second, immediately-resolving call
+ *  on the same instance) to completion while the first is still pending (ADR-422 final-review
+ *  fix wave, New Breakage N1). */
+class SlowStopProvider implements RemoteProvider {
+  readonly id = 'custom' as const
+  readonly lifecycle = 'none' as const
+  starts = 0
+  stopCalls = 0
+  private releaseFirstStop: (() => void) | undefined
+  async preflight(): Promise<PreflightState> {
+    return { kind: 'off' }
+  }
+  async start(): Promise<{ url: string }> {
+    this.starts++
+    return { url: `https://example-${this.starts}.test` }
+  }
+  async stop(): Promise<void> {
+    this.stopCalls++
+    if (this.stopCalls === 1) {
+      await new Promise<void>((resolve) => {
+        this.releaseFirstStop = resolve
+      })
+    }
+  }
+  alive(): boolean {
+    return true
+  }
+  releaseHungStop(): void {
+    this.releaseFirstStop?.()
+  }
+}
+
 const mgr = (p: RemoteProvider) =>
   new RemoteAccessManager({ app, ingressPort: 0, makeProvider: () => p, probe: async () => true })
 
@@ -201,8 +237,9 @@ test('manager: enable() during reconnecting is a no-op, not a second competing c
   assert.equal(m.state().kind, 'reconnecting')
   assert.equal(p.starts, 1)
 
-  // Let the still-pending backoff timer see `stopping` and bail out cleanly (already-correct
-  // disable-during-backoff behavior), rather than leaking a live timer into later tests.
+  // Let the still-pending backoff timer see the generation bump and bail out cleanly
+  // (already-correct disable-during-backoff behavior), rather than leaking a live timer
+  // into later tests.
   await m.disable()
   assert.equal(m.state().kind, 'off')
 })
@@ -344,4 +381,65 @@ test('manager: restart() gives up after MAX_CONSECUTIVE_FAILURES and settles cle
   assert.equal(m.ingressPort(), undefined) // the give-up branch tore its own (uncontested) ingress down
 
   await m.disable()
+})
+
+// --- ADR-422 Phase 2 final-review FIX WAVE re-review: New Breakage N1 ----------------------
+// The generation-counter fix above closed I1 and the three ledgered races, but restart()
+// originally RE-CAPTURED `this.generation` at its own entry rather than inheriting the
+// caller's — which mattered for exactly one caller: the health loop, which awaits
+// `provider.stop()` between its own last generation check and its `restart()` call. A
+// disable() landing in that window bumps the generation out from under a check that already
+// passed, and a re-capturing restart() would silently adopt the NEW generation and proceed as
+// current — resurrecting a tunnel the user just explicitly stopped. The fix threads the
+// health loop's OWN already-checked `gen` into restart() as an explicit argument instead.
+test('manager: a stale health-loop restart() after disable() during provider.stop() must not resurrect the tunnel (N1)', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] })
+  const providers: SlowStopProvider[] = []
+  const m = new RemoteAccessManager({
+    app,
+    ingressPort: 0,
+    makeProvider: () => {
+      const p = new SlowStopProvider()
+      providers.push(p)
+      return p
+    },
+    probe: async () => false, // every probe fails, to reliably drive the restart path
+  })
+
+  await m.enable() // provider #0 connects
+  assert.equal(providers.length, 1)
+  assert.equal(m.state().kind, 'connected')
+
+  // Drive CONSECUTIVE_FAILURES_BEFORE_RESTART failed probes. Each tick's probe() resolves on
+  // a microtask (and nextHealthCheck/consecutiveProbeFailures bookkeeping runs synchronously
+  // after it), so flush after each tick to let that continuation actually run before the next.
+  for (let i = 0; i < CONSECUTIVE_FAILURES_BEFORE_RESTART; i++) {
+    t.mock.timers.tick(HEALTH_INTERVAL_MS)
+    await flush()
+    await flush()
+  }
+  // The health loop has now called provider.stop() (call #1, hung) and is parked immediately
+  // before its restart(reason, gen) call.
+  assert.equal(providers[0].stopCalls, 1)
+
+  // The exact N1 window: disable() runs to completion — including ITS OWN provider.stop() call
+  // (call #2 on the same instance, which resolves immediately) — WHILE call #1 is still hung.
+  await m.disable()
+  assert.equal(m.state().kind, 'off')
+  assert.equal(m.ingressPort(), undefined)
+
+  // Release the hung call. This lets the health loop's stale `.then()` continuation resume and
+  // call restart(reason, gen) with the now-superseded generation it captured before any of the
+  // above happened.
+  providers[0].releaseHungStop()
+  await flush()
+  await flush()
+  await flush()
+
+  // Pre-fix: restart() re-captured `this.generation` (now bumped by disable()+the implicit
+  // re-enable path) and proceeded as current — spawning a second provider and reconnecting to
+  // a NEW public URL moments after the user explicitly stopped the first one.
+  assert.equal(m.state().kind, 'off', 'a stale health-loop restart must not resurrect the tunnel after disable()')
+  assert.equal(providers.length, 1, 'no second, resurrected provider was ever created')
+  assert.equal(m.ingressPort(), undefined)
 })

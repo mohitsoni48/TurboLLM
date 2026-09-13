@@ -186,7 +186,7 @@ export class RemoteAccessManager implements RemoteIngress {
     const withExit = provider as RemoteProvider & { onExit?: (cb: (code: number | null) => void) => void }
     withExit.onExit?.((code) => {
       if (gen !== this.generation || this.provider !== provider) return // a stop we asked for, or already superseded
-      void this.restart(`provider exited (code ${code})`)
+      void this.restart(`provider exited (code ${code})`, gen)
     })
   }
 
@@ -198,7 +198,15 @@ export class RemoteAccessManager implements RemoteIngress {
    *
    *  `gen` is captured once, at the connection this loop was started for, and re-checked on
    *  every tick — belt-and-suspenders alongside `disable()`'s own `clearInterval` call, in
-   *  case a future refactor ever lets a tick fire after teardown. */
+   *  case a future refactor ever lets a tick fire after teardown.
+   *
+   *  The final `restart(reason, gen)` call passes THIS closure's `gen` explicitly rather than
+   *  letting `restart()` re-capture `this.generation` at call time (ADR-422 final-review fix
+   *  wave, New Breakage N1). There is a real `await` — `provider.stop()` — between this
+   *  callback's last generation check and the `restart()` call: a `disable()` landing during
+   *  that await bumps `this.generation`, and without passing the ALREADY-STALE `gen` through,
+   *  `restart()` would silently re-capture the NEW generation and proceed as if it were still
+   *  current — resurrecting a tunnel the user just explicitly stopped. */
   private startHealthLoop(gen: number): void {
     clearInterval(this.healthTimer)
     this.consecutiveProbeFailures = 0
@@ -215,37 +223,49 @@ export class RemoteAccessManager implements RemoteIngress {
         this.consecutiveProbeFailures = result.consecutiveFailures
         if (!result.shouldRestart) return
         await this.provider?.stop().catch(() => {})
-        void this.restart('health probe failed — the public URL stopped answering')
+        void this.restart('health probe failed — the public URL stopped answering', gen)
       })
     }, HEALTH_INTERVAL_MS)
     this.healthTimer.unref()
   }
 
   /** Restart the current provider after an unexpected exit or a failed health probe. Part of
-   *  the class's existing public surface (a caller may also use it to force a retry).
+   *  the class's existing public surface (a caller may also use it to force a retry — in which
+   *  case the default `gen = this.generation` is exactly right, since a manual caller has no
+   *  staler generation to inherit).
    *
-   *  Captures `gen` at entry but does NOT bump it — a crash-restart is part of the SAME
-   *  logical connection from the user's point of view, not a new one — and re-checks it after
-   *  every await before touching shared state. This is exactly the interleaving ADR-422's
-   *  final review traced as Important finding I1: `disable()` can run while this call is
-   *  parked in its backoff wait, and — pre-fix — a subsequent `enable()` reset the `stopping`
-   *  flag this function used to check, so the stale timer fired anyway and either leaked an
-   *  untracked provider `disable()` could no longer stop, or fought the new connection for
-   *  `this.provider` / the ingress. */
-  async restart(reason: string): Promise<void> {
-    const gen = this.generation
+   *  `gen` is a PARAMETER, not something this function re-derives, because a caller can await
+   *  something (health-loop's `provider.stop()`) between its own last generation check and this
+   *  call — during which a disable()/enable() cycle can run to completion and bump
+   *  `this.generation`. If `restart()` re-captured `this.generation` itself at entry, it would
+   *  silently adopt the NEW generation and proceed as if this call were still current
+   *  (ADR-422 final-review fix wave, New Breakage N1 — a `--stop` landing in that window could
+   *  resurrect the tunnel the user just explicitly stopped). Every synchronous caller (`watch()`,
+   *  this function's own catch-recursion) passes the exact `gen` it already validated, which is
+   *  a no-op change for them; only the health loop's await makes this distinction load-bearing.
+   *
+   *  Checked as the FIRST statement, before `this.failures++` — a stale call must not perturb
+   *  the CURRENT flow's failure/backoff bookkeeping either. Does NOT bump the generation itself
+   *  — a crash-restart is part of the SAME logical connection from the user's point of view, not
+   *  a new one — and re-checks after every subsequent await before touching shared state. This
+   *  is exactly the interleaving ADR-422's final review traced as Important finding I1:
+   *  `disable()` can run while this call is parked in its backoff wait, and — pre-fix — a
+   *  subsequent `enable()` reset the `stopping` flag this function used to check, so the stale
+   *  timer fired anyway and either leaked an untracked provider `disable()` could no longer
+   *  stop, or fought the new connection for `this.provider` / the ingress. */
+  async restart(reason: string, gen: number = this.generation): Promise<void> {
+    if (gen !== this.generation) return // already stale at entry — see the health-loop note above
     this.failures++
     if (this.failures > MAX_CONSECUTIVE_FAILURES) {
       // ADR-422 final review, ledgered race (b) — the same shape as enable()'s catch above:
       // never tear down a different, now-current flow's live listener just because THIS
-      // flow is giving up.
-      if (gen !== this.generation) return
+      // flow is giving up. (No re-check needed before this branch: the top-of-function check
+      // above already covers it, since nothing awaits between entry and here.)
       await this.ingress.stop()
       if (gen !== this.generation) return
       this.set({ kind: 'failed', reason: `gave up after ${MAX_CONSECUTIVE_FAILURES} attempts: ${reason}` })
       return
     }
-    if (gen !== this.generation) return
     this.set({ kind: 'reconnecting', attempt: this.failures, lastError: reason })
     await new Promise((r) => setTimeout(r, backoffDelay(this.failures - 1)))
     // The exact I1 interleaving: a disable() then a fresh enable() may have run to completion
@@ -264,7 +284,7 @@ export class RemoteAccessManager implements RemoteIngress {
       this.watch(provider, gen)
     } catch (e) {
       if (gen !== this.generation) return
-      void this.restart(e instanceof Error ? e.message : String(e))
+      void this.restart(e instanceof Error ? e.message : String(e), gen)
     }
   }
 }
