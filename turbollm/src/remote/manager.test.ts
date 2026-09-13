@@ -4,6 +4,7 @@ import { Hono } from 'hono'
 import { RemoteAccessManager } from './manager'
 import { backoffDelay, MAX_CONSECUTIVE_FAILURES } from './backoff'
 import { CONSECUTIVE_FAILURES_BEFORE_RESTART, HEALTH_INTERVAL_MS } from './health'
+import { TailscaleServeProvider, type RunTailscale } from './providers/tailscale'
 import type { PreflightState, RemoteProvider } from './types'
 
 /** Poll `fn` until it returns true or `timeoutMs` elapses. Used only to wait for a real,
@@ -529,4 +530,26 @@ test('manager: I2 — a system-state provider is never stop()ped by a health-pro
 
   await m.disable()
   assert.equal(p.stops, 1, 'only the explicit, user-initiated disable() ever issues the real stop()')
+})
+
+// --- ADR-422 Phase 3 final review, Important finding I3 (integration check) ----------------
+// I3's unit tests (tailscale.test.ts) prove TailscaleProvider.start() throws on a non-zero
+// exit code. This test proves the OTHER half: driven through the real supervisor (not a fake
+// provider), that throw actually lands in a real `failed` state carrying the real reason —
+// not a fabricated `connected` — which is the concrete failure I2/I3 together used to allow.
+test('manager: I3 — a real TailscaleServeProvider CLI failure surfaces as failed with the real reason, not a fabricated connect', async () => {
+  const RUNNING = JSON.stringify({ BackendState: 'Running', Self: { DNSName: 'box.tail1234.ts.net.' } })
+  const run: RunTailscale = async (args) => {
+    if (args[0] === 'status') return { code: 0, stdout: RUNNING, stderr: '' }
+    return { code: 1, stdout: '', stderr: 'tailscale: Funnel is not enabled for this tailnet' }
+  }
+  const p = new TailscaleServeProvider({ port: 443 }, run)
+  const m = new RemoteAccessManager({ app, ingressPort: 0, makeProvider: () => p, probe: async () => true })
+
+  await m.enable()
+  const s = m.state()
+  assert.equal(s.kind, 'failed')
+  assert.equal(s.kind === 'failed' && s.reason.includes('Funnel is not enabled for this tailnet'), true)
+
+  await m.disable()
 })

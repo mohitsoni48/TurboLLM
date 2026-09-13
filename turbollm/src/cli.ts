@@ -340,14 +340,20 @@ try {
   if (reapedTunnels > 0) console.log(`reaped ${reapedTunnels} orphaned tunnel process(es) from a previous run`)
 } catch { /* best-effort */ }
 // system-state equivalent of the reap above (ADR-422): an unclean exit can leave a Tailscale
-// serve/funnel pointing at our ingress port. Turn it off if config says remote access is off.
-void reconcileTailscale({
-  enabled: store.snapshot().remoteAccess.enabled,
-  provider: store.snapshot().remoteAccess.provider,
-  port: store.snapshot().remoteAccess.tailscale.port,
-}).then((acted) => {
+// serve/funnel pointing at our ingress port. Deliberately UNGATED (runs regardless of
+// `remoteAccess.enabled` or the experimental flag) and keyed off OBSERVED status rather than
+// desired config (ADR-422 Phase 3 final review, finding I1) — config-keyed reconciliation had
+// a false negative whenever the provider was switched away from Tailscale, or the
+// experimental flag was turned off while `enabled: true` was still persisted, in both of
+// which cases nothing would ever have reconciled a real leftover funnel again. Running this
+// unconditionally, before the supervisor's own enable() below, is safe: if config genuinely
+// still wants this exact provider, enable() re-issues the identical serve/funnel command
+// moments later, so this is at worst a harmless off-then-on.
+void reconcileTailscale(
+  resolveIngressPort(store.snapshot().remoteAccess.ingressPort, store.snapshot().daemon.port),
+).then((acted) => {
   if (acted) console.log('reset a Tailscale serve/funnel left over from a previous run')
-})
+}).catch(() => { /* best-effort, same posture as the other startup reaps above */ })
 // Same idea for terminal-agent CLI processes (claude/pi/opencode) orphaned by an unclean
 // previous shutdown — see terminal-manager.ts's pidfile-tracking header for why this
 // mattered in practice (found live: 11 leaked claude.exe processes after a day of testing).
