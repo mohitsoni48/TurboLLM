@@ -57,10 +57,27 @@ export class RemoteAccessManager implements RemoteIngress {
     this.opts.onState?.(s)
   }
 
-  /** Bring remote access up. Idempotent — a second call while connected is a no-op, so the
-   *  settings route can call it without tracking whether it is already running. */
+  /** Bring remote access up. Idempotent — a second call while connected, starting, OR
+   *  reconnecting is a no-op, so the settings route can call it without tracking whether it is
+   *  already running. `reconnecting` matters as much as the other two: it is the state
+   *  `restart()` holds for its *entire* in-flight window — through its backoff wait and its own
+   *  connect attempt — until it resolves to `connected` or `failed`. Without excluding it here,
+   *  an `enable()` call arriving mid-backoff (e.g. the user clicking "enable" while a
+   *  "reconnecting…" indicator is showing) would run a second, competing connect attempt
+   *  concurrently with the pending restart: both would assign `this.provider`, both would race
+   *  unguarded on the shared `IngressListener`, and whichever's `provider.start()` resolved last
+   *  would win `state()` regardless of which provider was actually alive — silently disabling
+   *  future crash-detection for the connection actually in use (ADR-422 Task 7 fix round,
+   *  Critical finding). The simplest correct behavior is to let the pending restart continue
+   *  undisturbed, exactly like the `connected`/`starting` no-ops already do. */
   async enable(): Promise<void> {
-    if (this.current.kind === 'connected' || this.current.kind === 'starting') return
+    if (
+      this.current.kind === 'connected' ||
+      this.current.kind === 'starting' ||
+      this.current.kind === 'reconnecting'
+    ) {
+      return
+    }
     this.stopping = false
     this.failures = 0
     this.set({ kind: 'starting' })
@@ -72,6 +89,12 @@ export class RemoteAccessManager implements RemoteIngress {
     // user's own terms, not fail halfway through with a stack trace (spec 30 §7.5).
     const pre = await provider.preflight()
     if (pre.kind !== 'off') {
+      // This provider's start() was never called — don't leave it as `this.provider`, or a
+      // later disable() will call .stop() on an instance that never started (ADR-422 Task 7
+      // fix round, Important finding). Guard on identity rather than unconditionally nulling,
+      // matching the guard watch()'s own exit callback uses, in case a concurrent disable()
+      // already claimed `this.provider` for something else while we were awaiting preflight().
+      if (this.provider === provider) this.provider = null
       this.set(pre)
       return
     }
@@ -79,6 +102,11 @@ export class RemoteAccessManager implements RemoteIngress {
     try {
       const port = await this.ingress.start(this.opts.app, this.opts.ingressPort)
       const { url } = await provider.start(port)
+      // A concurrent flow (disable(), or — pre-fix — a competing enable()/restart()) may have
+      // already superseded this provider while we were awaiting start(). Only the flow whose
+      // provider is still the tracked one gets to report success and re-arm watch(), mirroring
+      // the identity check watch()'s own exit callback already uses.
+      if (this.provider !== provider) return
       this.failures = 0
       this.set({ kind: 'connected', url, since: new Date().toISOString() })
       this.watch(provider)
@@ -127,10 +155,18 @@ export class RemoteAccessManager implements RemoteIngress {
     try {
       const port = this.ingress.ingressPort() ?? (await this.ingress.start(this.opts.app, this.opts.ingressPort))
       const { url } = await provider.start(port)
+      // Same identity check as enable()'s success path: a concurrent disable() may have
+      // superseded this provider while start() was in flight, so only report success and
+      // re-arm watch() when this is still the tracked provider (ADR-422 Task 7 fix round).
+      if (this.provider !== provider) return
       this.failures = 0
       this.set({ kind: 'connected', url, since: new Date().toISOString() })
       this.watch(provider)
     } catch (e) {
+      // No identity check needed here: the only way `this.provider` could have changed out
+      // from under us by now is a concurrent disable(), which always sets `stopping = true`
+      // first — and this recursive restart() call's own top-of-function check already bails
+      // on that before doing anything else.
       void this.restart(e instanceof Error ? e.message : String(e))
     }
   }
