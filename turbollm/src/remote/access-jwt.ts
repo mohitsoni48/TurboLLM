@@ -16,20 +16,44 @@ export interface Jwks {
 export type AccessResult = { ok: true; sub: string; email: string } | { ok: false; reason: string }
 
 const JWKS_TTL_MS = 60 * 60_000
-const cache = new Map<string, { at: number; jwks: Jwks }>()
+// I2 (Phase 5 final review): a failed fetch used to cache nothing at all, so an unauthenticated
+// party sending a junk assertion at the public URL forced one untimed outbound HTTPS request
+// per request, inside the auth path, before any credential was even checked. A short negative
+// TTL bounds that to at most one real fetch per window, while staying far shorter than the
+// success TTL so a transient outage self-heals quickly once the team domain is reachable again.
+const JWKS_FAILURE_TTL_MS = 30_000
+// Bounds how long a single JWKS fetch can hang the auth path when the team domain is
+// unreachable — previously unbounded, so an unreachable domain could stall every tunneled
+// request indefinitely.
+const JWKS_FETCH_TIMEOUT_MS = 5_000
+const cache = new Map<string, { at: number; jwks: Jwks | null }>()
 
-/** Fetch and cache a team's signing keys. Cached for an hour: Cloudflare rotates these
- *  rarely, and a fetch on every request would put an outbound network call in the auth path
- *  of every single tunneled request. */
+/** Fetch and cache a team's signing keys. A success is cached for an hour: Cloudflare rotates
+ *  these rarely, and a fetch on every request would put an outbound network call in the auth
+ *  path of every single tunneled request. A FAILURE is cached too, briefly (see
+ *  JWKS_FAILURE_TTL_MS above) — the caller (`lanAuth`) treats "could not fetch" as "no verified
+ *  assertion", so without this a failing team domain would be re-fetched on every single
+ *  request that presents any assertion at all, junk or not. */
 export async function fetchJwks(teamDomain: string, fetchImpl: typeof fetch = fetch): Promise<Jwks> {
   const url = `${teamDomain.replace(/\/+$/, '')}/cdn-cgi/access/certs`
   const hit = cache.get(url)
-  if (hit && Date.now() - hit.at < JWKS_TTL_MS) return hit.jwks
-  const res = await fetchImpl(url)
-  if (!res.ok) throw new Error(`could not fetch Access signing keys (${res.status})`)
-  const jwks = (await res.json()) as Jwks
-  cache.set(url, { at: Date.now(), jwks })
-  return jwks
+  if (hit) {
+    const ttl = hit.jwks ? JWKS_TTL_MS : JWKS_FAILURE_TTL_MS
+    if (Date.now() - hit.at < ttl) {
+      if (hit.jwks) return hit.jwks
+      throw new Error('could not fetch Access signing keys (cached failure)')
+    }
+  }
+  try {
+    const res = await fetchImpl(url, { signal: AbortSignal.timeout(JWKS_FETCH_TIMEOUT_MS) })
+    if (!res.ok) throw new Error(`could not fetch Access signing keys (${res.status})`)
+    const jwks = (await res.json()) as Jwks
+    cache.set(url, { at: Date.now(), jwks })
+    return jwks
+  } catch (e) {
+    cache.set(url, { at: Date.now(), jwks: null })
+    throw e
+  }
 }
 
 function decodeSegment(seg: string): Record<string, unknown> | null {
@@ -86,7 +110,13 @@ export async function verifyAccessJwt(
   if (!auds.includes(opts.aud)) return { ok: false, reason: 'audience does not match this application' }
 
   const now = Math.floor(Date.now() / 1000)
-  if (typeof claims.exp === 'number' && claims.exp < now) return { ok: false, reason: 'assertion has expired' }
+  // M2 (Phase 5 final review): `exp` must be mandatory, not merely checked-when-present — an
+  // assertion with no `exp` claim at all, or a non-numeric one, previously read as "never
+  // expires". Cloudflare always sets this in practice, so this is defense-in-depth rather
+  // than a live bug; it stops being latent the moment a signer other than Cloudflare enters
+  // the picture (see C3(b)/M1 in the same review).
+  if (typeof claims.exp !== 'number') return { ok: false, reason: 'assertion has no expiry' }
+  if (claims.exp < now) return { ok: false, reason: 'assertion has expired' }
   if (typeof claims.nbf === 'number' && claims.nbf > now + 60) return { ok: false, reason: 'assertion is not yet valid' }
 
   return { ok: true, sub: String(claims.sub ?? ''), email: String(claims.email ?? '') }
