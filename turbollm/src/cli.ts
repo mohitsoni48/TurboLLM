@@ -830,10 +830,25 @@ function onRemoteState(s: RemoteState): void {
     lastWiredServer = remote.server
   }
   console.log(`  Tunnel:  ${s.url}`)
-  tunnelToken ??= provisionTunnelApiKey(deps)
-  console.log(`  Token:   ${tunnelToken}`)
-  console.log(`           (required for anyone using this tunnel URL)`)
-  console.log(``)
+  // I1 (Phase 5 final review): this used to print (and mint, via provisionTunnelApiKey) an
+  // ORDINARY, ungranted, full-access key on every connect, including one this same request
+  // already minted a scoped `remote`-kind token for via `/api/v1/remote/start`
+  // (provisionRemoteApiKey) — two live credentials for the same URL, only one of which is
+  // capability-checked (grantKind === 'remote') or revoked by `/stop`
+  // (`revokeRemoteKeys` filters on grantKind, so the console key survives remote access being
+  // turned off). `remoteAccess.enabled` is persisted true exactly when a UI/config-managed
+  // connect is driving this — either `/start` just set it (this call), or it was already true
+  // from a previous session and this is an automatic reconnect — so gating on it here leaves
+  // the console-printed, ungranted key for the ONE case that has no other way to get a
+  // credential at all: the headless `--tunnel` override, which deliberately bypasses both the
+  // experimental flag and the persisted `enabled` field (see the comment at `tunnelFlag`'s
+  // declaration above).
+  if (!store.snapshot().remoteAccess.enabled) {
+    tunnelToken ??= provisionTunnelApiKey(deps)
+    console.log(`  Token:   ${tunnelToken}`)
+    console.log(`           (required for anyone using this tunnel URL)`)
+    console.log(``)
+  }
   // spec 30 §2.4: "The last known URL persists in config.json so a daemon restart shows it
   // immediately, flagged stale until the first successful probe" (ADR-422 final review,
   // Important finding I4). Done here rather than by threading a config-store reference into
