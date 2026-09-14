@@ -97,8 +97,21 @@ export function RemoteAccessSection() {
       { remoteAccess: { provider: p } },
       { onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not save the provider.') },
     )
-    runPreflight(p)
+    // Preflighting happens in the effect below, keyed on `provider` — not here — so a
+    // provider change preflights exactly once (C2, final-review.md).
   }
+
+  // C2 (final-review.md): preflight the SELECTED provider as soon as it is known — once on
+  // mount (after settings seed it) and again on every provider change — so "Check again" is
+  // reachable for the provider the user already had saved, not only for one they just
+  // clicked. Previously only selectProvider() preflighted, and it early-returned when
+  // reselecting the same id, so the seeded provider was never checked until the user picked
+  // something else and picked it back.
+  useEffect(() => {
+    if (!seeded) return
+    runPreflight(provider)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [seeded, provider])
 
   const saveCloudflare = () => {
     const patch: { tunnelToken?: string; hostname?: string } = { hostname: cfHostname.trim() }
@@ -139,7 +152,18 @@ export function RemoteAccessSection() {
     )
   }
 
-  const enabled = !!status?.enabled && status.state.kind !== 'off'
+  // I1/C1 (final-review.md): "on" must be read off the live runtime state, not the
+  // desired-config `status.enabled` flag — those two disagree during a stop's up-to-8s
+  // shutdown window (and permanently for needs-setup/unavailable), which is exactly the case
+  // RemoteChip.tsx already gets right. Matching it here means the pane and the chip never
+  // disagree about whether remote access is actually on.
+  const isOn = !!status && status.state.kind !== 'off'
+
+  // C3 (final-review.md): /remote/start acts on the daemon's persisted provider, not this
+  // component's local draft — a failed or in-flight provider-change PATCH can leave the two
+  // disagreeing (bypass (b)). Prefer server truth, once known, for anything that decides
+  // whether the exposure confirmation is required.
+  const effectiveProvider = status?.provider ?? provider
 
   // Shared by the direct-start path (non-public provider, or Retry below) and the
   // confirmed-start path (public provider, after ExposureConfirmDialog's onConfirm) — same
@@ -166,7 +190,9 @@ export function RemoteAccessSection() {
     // Publicly reachable provider: hold off starting until ExposureConfirmDialog's onConfirm.
     // Tailscale Serve (and any other non-public provider) is tailnet-only, so the dialog would
     // render null anyway — start directly with no confirmation, per Task 15's existing test.
-    if (isPublicProvider(provider)) {
+    // Gated on effectiveProvider (server truth over local draft), not `provider` alone — see
+    // C3 bypass (b) above.
+    if (isPublicProvider(effectiveProvider)) {
       setPendingEnable(true)
       return
     }
@@ -343,23 +369,49 @@ export function RemoteAccessSection() {
       </div>
 
       <div className="rounded-lg border border-border bg-panel p-4">
+        {/* I3 (final-review.md): a refused or unreachable status request must not render
+            identically to "off" — show it. */}
+        {statusQ.isError && (
+          <div
+            className="mb-3 flex items-center gap-1.5 rounded-md border p-2 text-[12px]"
+            style={{
+              borderColor: 'color-mix(in srgb, var(--err) 40%, var(--border))',
+              background: 'color-mix(in srgb, var(--err) 8%, transparent)',
+              color: 'var(--err)',
+            }}
+          >
+            <AlertTriangle size={13} />
+            {statusQ.error instanceof ApiError ? statusQ.error.message : 'Could not reach remote access status.'}
+          </div>
+        )}
         <div className="flex items-center justify-between gap-3">
           <div>
             <div className="text-[13px] font-medium text-ink">Remote access</div>
-            <div className="text-[11px] text-faint">{enabled ? 'On — reachable through this provider.' : 'Off.'}</div>
+            {/* Generic on/off state text — LiveStateBlock below carries every state-specific
+                detail (including WHY it isn't reachable), so this line no longer claims
+                "reachable" for a state that might be starting, reconnecting, failed,
+                needs-setup, or unavailable (C1, final-review.md). */}
+            <div className="text-[11px] text-faint">{isOn ? 'On.' : 'Off.'}</div>
           </div>
-          <Switch aria-label="Remote access" checked={enabled} onCheckedChange={onToggle} disabled={toggling} />
+          <Switch aria-label="Remote access" checked={isOn} onCheckedChange={onToggle} disabled={toggling} />
         </div>
         <div className="mt-3">
-          {/* Retry re-attempts a start the user already consented to when they first flipped the
-              switch on — it must not re-raise the exposure confirmation, so it calls doStart()
-              directly rather than onToggle(true). */}
-          <LiveStateBlock status={status} onRetry={doStart} />
+          {/* C3 bypass (a) (final-review.md): Retry must NOT assume the consent from the
+              original toggle-on still applies — the user can switch to a different (and
+              possibly public) provider before retrying a failed start. Routing through
+              onToggle(true) re-evaluates the exposure confirmation for whichever provider is
+              effectively current, exactly like flipping the switch fresh would. */}
+          <LiveStateBlock
+            status={status}
+            onRetry={() => onToggle(true)}
+            onCheckAgain={() => status && runPreflight(status.provider)}
+            checking={!!status && preflightingFor === status.provider}
+          />
         </div>
       </div>
 
       <ExposureConfirmDialog
-        provider={provider}
+        provider={effectiveProvider}
         open={pendingEnable}
         onConfirm={() => {
           setPendingEnable(false)
@@ -372,8 +424,20 @@ export function RemoteAccessSection() {
 }
 
 /** connected → URL + Copy; reconnecting → the word itself, attempt number, lastError; failed →
- *  reason + Retry; starting → spinner. Colors from tokens only (spec 30 §11). */
-function LiveStateBlock({ status, onRetry }: { status: RemoteStatus | undefined; onRetry: () => void }) {
+ *  reason + Retry; needs-setup/unavailable → reason + Check again (C1, final-review.md — this
+ *  used to fall through to `return null`, leaving the reason nowhere on screen); starting →
+ *  spinner. Colors from tokens only (spec 30 §11). */
+function LiveStateBlock({
+  status,
+  onRetry,
+  onCheckAgain,
+  checking,
+}: {
+  status: RemoteStatus | undefined
+  onRetry: () => void
+  onCheckAgain: () => void
+  checking: boolean
+}) {
   if (!status) return null
   const { state } = status
   if (state.kind === 'off') return null
@@ -412,6 +476,20 @@ function LiveStateBlock({ status, onRetry }: { status: RemoteStatus | undefined;
       <div className="flex items-center justify-between gap-2">
         <span className="text-[12px]" style={{ color: 'var(--err)' }}>{state.reason}</span>
         <Button size="sm" variant="outline" onClick={onRetry}>Retry</Button>
+      </div>
+    )
+  }
+
+  if (state.kind === 'needs-setup' || state.kind === 'unavailable') {
+    return (
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className="inline-flex items-center gap-1.5 text-[12px]" style={{ color: 'var(--err)' }}>
+          <AlertTriangle size={13} /> {state.reason}
+        </span>
+        <Button size="sm" variant="outline" onClick={onCheckAgain} disabled={checking}>
+          {checking ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
+          Check again
+        </Button>
       </div>
     )
   }
