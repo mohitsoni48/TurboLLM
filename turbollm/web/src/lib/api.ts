@@ -846,8 +846,11 @@ export type DaemonSettingsPatch = Partial<Omit<DaemonSettings, 'comfyui' | 'tavi
   /** Patchable per-field, same reason as `experimental` — routes.ts's PATCH handler applies
    *  each `remoteAccess.*` candidate independently (provider, ingressPort, cloudflare.*,
    *  ngrok.*, tailscale.port, custom.publicUrl), so a patch touching only the provider must not
-   *  be forced to also resend every secret field. */
-  remoteAccess?: Partial<Omit<RemoteAccessSettings, 'cloudflare' | 'ngrok' | 'tailscale' | 'custom'>> & {
+   *  be forced to also resend every secret field. `enabled`/`lastUrl` are excluded too (M5,
+   *  final-review.md): both are runtime-owned by /remote/start and /remote/stop, and the PATCH
+   *  handler silently ignores them, so typing them here as patchable would typecheck a write
+   *  that does nothing. */
+  remoteAccess?: Partial<Omit<RemoteAccessSettings, 'cloudflare' | 'ngrok' | 'tailscale' | 'custom' | 'enabled' | 'lastUrl'>> & {
     cloudflare?: { tunnelToken?: string; hostname?: string; accessTeamDomain?: string; accessAud?: string; requireAccess?: boolean }
     ngrok?: { authtoken?: string; domain?: string }
     tailscale?: { port?: number }
