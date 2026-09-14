@@ -57,8 +57,11 @@ async function request<T>(path: string, init?: RequestInit & { json?: unknown })
 }
 
 export const getRemoteStatus = () => request<RemoteStatus>('/api/v1/remote/status')
-export const startRemote = () => request<{ state: RemoteState }>('/api/v1/remote/start', { method: 'POST' })
-export const stopRemote = () => request<{ state: RemoteState }>('/api/v1/remote/stop', { method: 'POST' })
+// `token` is present exactly once per successful start (ADR-422 §6.3): the store keeps only
+// a hash, so this response is the only moment the raw value exists. Optional because a
+// caller-side error, or a start that never reaches the mint step, carries none.
+export const startRemote = () => request<{ state: RemoteState; token?: string }>('/api/v1/remote/start', { method: 'POST' })
+export const stopRemote = () => request<{ state: RemoteState; revoked?: number }>('/api/v1/remote/stop', { method: 'POST' })
 export const preflightRemote = (provider: RemoteProviderId) =>
   request<{ provider: RemoteProviderId; state: RemoteState }>('/api/v1/remote/preflight', { method: 'POST', json: { provider } })
 

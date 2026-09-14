@@ -826,6 +826,9 @@ export interface RemoteAccessSettings {
   ngrok: { hasAuthtoken: boolean; domain: string }
   tailscale: { port: number }
   custom: { publicUrl: string }
+  /** Capability scope minted remote tokens receive (ADR-422 §6.3). Not secret — a capability
+   *  list, not a credential — so it is echoed back as stored, unlike the `has*` secrets above. */
+  tokenGrant: { capabilities: string[]; models?: string[] }
   lastUrl: string
 }
 
@@ -855,6 +858,7 @@ export type DaemonSettingsPatch = Partial<Omit<DaemonSettings, 'comfyui' | 'tavi
     ngrok?: { authtoken?: string; domain?: string }
     tailscale?: { port?: number }
     custom?: { publicUrl?: string }
+    tokenGrant?: { capabilities?: string[]; models?: string[] }
   }
   /** Patchable per-field, same reason as `experimental` — routes.ts applies each candidate list
    *  independently. */

@@ -13,6 +13,7 @@ import {
 } from '../../lib/remote-api'
 import { ApiError, track } from '../../lib/api'
 import { useSettings } from '../../lib/queries'
+import { LINK_PRESETS, type LinkCapability } from '../../lib/link-constants'
 import { PROVIDER_CARDS } from './remote-provider-cards'
 import { ExposureConfirmDialog } from './ExposureConfirmDialog'
 import { Switch } from '../../components/ui/switch'
@@ -22,6 +23,13 @@ import { toast } from '../../components/ui/sonner'
 
 const PROVIDER_IDS = Object.keys(PROVIDER_CARDS) as RemoteProviderId[]
 const TAILSCALE_PORTS = [443, 8443, 10000] as const
+
+/** The capabilities offered to a remote-access token, deliberately narrower than Turbo
+ *  Link's own "Full control" preset: this token rides along a URL a user hands to their OWN
+ *  other devices, not a peer machine, so downloads and config capabilities (multi-gigabyte
+ *  writes, this machine's own local-use defaults) stay off the picker entirely rather than
+ *  one click away. */
+const REMOTE_TOKEN_CAPABILITIES = LINK_PRESETS.server
 
 /** Settings → Network & sharing's Remote access story (spec 30 §7, ADR-422): provider cards
  *  with real costs stated up front (engines-catalog convention — pros/cons only, no prose),
@@ -64,6 +72,12 @@ export function RemoteAccessSection() {
   const [tsPort, setTsPort] = useState<number>(443)
   const [customUrl, setCustomUrl] = useState('')
 
+  // The capability set a newly-minted remote token receives (ADR-422 §6.3), and the raw
+  // token value itself — held ONLY in memory, for exactly as long as this component stays
+  // mounted after a successful start, since the store never keeps anything but its hash.
+  const [tokenCaps, setTokenCaps] = useState<Set<LinkCapability>>(new Set(LINK_PRESETS.inference))
+  const [revealedToken, setRevealedToken] = useState<string | null>(null)
+
   useEffect(() => {
     const ra = settingsQ.data?.remoteAccess
     if (!ra || seeded) return
@@ -72,6 +86,7 @@ export function RemoteAccessSection() {
     setNgrokDomain(ra.ngrok?.domain ?? '')
     setTsPort(ra.tailscale?.port ?? 443)
     setCustomUrl(ra.custom?.publicUrl ?? '')
+    setTokenCaps(new Set((ra.tokenGrant?.capabilities ?? LINK_PRESETS.inference) as LinkCapability[]))
     setSeeded(true)
   }, [settingsQ.data, seeded])
 
@@ -160,6 +175,24 @@ export function RemoteAccessSection() {
     )
   }
 
+  // Applies to the NEXT token minted (on the next start) — this does not touch a token
+  // already handed out, which the daemon has no way to reach into a browser and revise.
+  const toggleTokenCap = (cap: LinkCapability, checked: boolean) => {
+    const next = new Set(tokenCaps)
+    if (checked) next.add(cap)
+    else next.delete(cap)
+    // Never persist an empty set: sanitizeTokenGrant (turbollm/src/remote/routes.ts) falls
+    // back to models:use server-side anyway, so an empty picker would silently diverge from
+    // what the next token actually gets.
+    const caps = next.size ? Array.from(next) : (['models:use'] as LinkCapability[])
+    setTokenCaps(new Set(caps))
+    track('settings', 'save_remote_token_grant')
+    save.mutate(
+      { remoteAccess: { tokenGrant: { capabilities: caps } } },
+      { onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not save the token permissions.') },
+    )
+  }
+
   // I1/C1 (final-review.md): "on" must be read off the live runtime state, not the
   // desired-config `status.enabled` flag — those two disagree during a stop's up-to-8s
   // shutdown window (and permanently for needs-setup/unavailable), which is exactly the case
@@ -205,9 +238,15 @@ export function RemoteAccessSection() {
   // tracking event, refetch and error handling either way.
   const doStart = () => {
     setToggling(true)
+    setRevealedToken(null)
     track('settings', 'start_remote')
     void startRemote()
-      .then(() => statusQ.refetch())
+      .then((res) => {
+        // Present exactly once per successful start (ADR-422 §6.3) — the store keeps only a
+        // hash, so this response is the only moment the raw value exists in readable form.
+        if (res.token) setRevealedToken(res.token)
+        return statusQ.refetch()
+      })
       .catch((e) => toast.error(e instanceof ApiError ? e.message : 'Could not update remote access.'))
       .finally(() => setToggling(false))
   }
@@ -215,6 +254,9 @@ export function RemoteAccessSection() {
   const onToggle = (checked: boolean) => {
     if (!checked) {
       setToggling(true)
+      // The token this stop is about to revoke is no longer any good — leaving it on screen
+      // would show a value that looks copyable but has already stopped working.
+      setRevealedToken(null)
       track('settings', 'stop_remote')
       void stopRemote()
         .then(() => statusQ.refetch())
@@ -417,6 +459,24 @@ export function RemoteAccessSection() {
             {statusQ.error instanceof ApiError ? statusQ.error.message : 'Could not reach remote access status.'}
           </div>
         )}
+        <div className="mb-3 flex flex-col gap-1.5 border-b border-border pb-3">
+          <div className="text-[12px] font-medium text-ink">Token permissions</div>
+          <p className="text-[11px] text-faint">
+            What the access token minted the next time you turn this on is allowed to do.
+          </p>
+          <div className="flex flex-col gap-1">
+            {REMOTE_TOKEN_CAPABILITIES.map((cap) => (
+              <label key={cap} className="flex items-center gap-2 text-[12px] text-ink">
+                <input
+                  type="checkbox"
+                  checked={tokenCaps.has(cap)}
+                  onChange={(e) => toggleTokenCap(cap, e.target.checked)}
+                />
+                <span className="font-mono">{cap}</span>
+              </label>
+            ))}
+          </div>
+        </div>
         <div className="flex items-center justify-between gap-3">
           <div>
             <div className="text-[13px] font-medium text-ink">Remote access</div>
@@ -439,6 +499,21 @@ export function RemoteAccessSection() {
               never assume stale consent still applies any more than Retry can. */}
           <LiveStateBlock status={status} onRetry={() => onToggle(true)} toggling={toggling} />
         </div>
+        {revealedToken && (
+          <div
+            className="mt-3 rounded-md border p-3"
+            style={{ borderColor: 'color-mix(in srgb, var(--accent) 40%, var(--border))', background: 'color-mix(in srgb, var(--accent) 8%, transparent)' }}
+          >
+            <div className="mb-1.5 text-[12px] font-medium text-ink">Access token</div>
+            <div className="flex items-center gap-2">
+              <span className="flex-1 truncate font-mono text-[12px] text-ink">{revealedToken}</span>
+              <CopyButton text={revealedToken} screen="settings" />
+            </div>
+            <p className="mt-2 text-[11px] text-faint">
+              Shown once — it cannot be recovered. Manage or revoke it in Developer → API Keys.
+            </p>
+          </div>
+        )}
       </div>
 
       <ExposureConfirmDialog

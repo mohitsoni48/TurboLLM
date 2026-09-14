@@ -22,7 +22,7 @@ import type { Context, MiddlewareHandler } from 'hono'
 import type { ApiKey } from './config/config'
 import type { Deps } from './deps'
 import { hasCapability } from './link/capabilities'
-import type { LinkCapability } from './link/types'
+import type { LinkCapability, LinkGrant } from './link/types'
 
 /** Loopback addresses that never require a key, in the forms Node surfaces them
  *  (IPv4, IPv6, and the IPv4-mapped-IPv6 form Windows/dual-stack sockets report). */
@@ -70,6 +70,41 @@ export function provisionTunnelApiKey(d: Deps, label = 'tunnel'): string {
   }
   d.store.update((cfg) => cfg.apiKeys.push(key))
   return full
+}
+
+/** Mint the capability-scoped credential a remote-access URL is shared with (ADR-422).
+ *
+ *  Always a fresh key rather than reusing one: a stored key's raw value can never be
+ *  recovered to show it again (only the hash is kept), and a clearly-named one is easy to
+ *  find and revoke later in Developer → API Keys. Returns the raw value, which is the only
+ *  moment it exists in readable form. */
+export function provisionRemoteApiKey(d: Deps, grant: LinkGrant): string {
+  const { full, hash, prefix } = generateApiKey()
+  const key: ApiKey = {
+    id: randomUUID(),
+    name: `remote-${new Date().toISOString()}`,
+    hash,
+    prefix,
+    createdAt: new Date().toISOString(),
+    lastUsedAt: null,
+    grant: { ...grant, kind: 'remote' },
+  }
+  d.store.update((cfg) => cfg.apiKeys.push(key))
+  return full
+}
+
+/** Revoke every remote-access token. Called when remote access is turned off: a credential
+ *  that outlives the URL it was minted for is a credential nobody is thinking about any
+ *  more. Scoped by grant KIND, so a Turbo Link peer's token and an ordinary user key are
+ *  both untouched. Returns how many were removed. */
+export function revokeRemoteKeys(d: Deps): number {
+  let removed = 0
+  d.store.update((cfg) => {
+    const before = cfg.apiKeys.length
+    cfg.apiKeys = cfg.apiKeys.filter((k) => grantKind(k) !== 'remote')
+    removed = before - cfg.apiKeys.length
+  })
+  return removed
 }
 
 /** Is the address the listener was bound to a loopback-only bind — i.e. unreachable from

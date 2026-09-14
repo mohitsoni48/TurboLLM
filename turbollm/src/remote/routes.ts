@@ -7,9 +7,10 @@
 import type { Hono } from 'hono'
 import type { Context } from 'hono'
 import type { Deps } from '../deps'
-import { hostGate } from '../auth'
+import { hostGate, provisionRemoteApiKey, revokeRemoteKeys } from '../auth'
 import { isRemoteAccessEnabled, REMOTE_DISABLED } from './gate'
 import { REMOTE_PROVIDERS, type RemoteProviderId } from '../config/config'
+import { LINK_CAPABILITIES, type LinkCapability } from '../link/types'
 
 async function body<T>(c: Context): Promise<T> {
   try {
@@ -17,6 +18,19 @@ async function body<T>(c: Context): Promise<T> {
   } catch {
     return {} as T
   }
+}
+
+/** The stored scope, narrowed to capabilities that actually exist. An unknown string is
+ *  dropped rather than passed through — a grant is an allow-list, and an allow-list that
+ *  carries entries nothing understands is one nobody can audit. */
+export function sanitizeTokenGrant(stored: { capabilities: string[]; models?: string[] }): {
+  capabilities: LinkCapability[]
+  models?: string[]
+} {
+  const caps = stored.capabilities.filter((c): c is LinkCapability =>
+    (LINK_CAPABILITIES as readonly string[]).includes(c),
+  )
+  return { capabilities: caps.length ? caps : ['models:use'], models: stored.models }
 }
 
 export function registerRemoteApi(app: Hono, d: Deps): void {
@@ -48,8 +62,14 @@ export function registerRemoteApi(app: Hono, d: Deps): void {
     d.store.update((cfg) => {
       cfg.remoteAccess.enabled = true
     })
+    // Minted here, returned ONCE. The store keeps only a hash, so this response is the only
+    // moment the raw value exists — the UI must show it immediately and say so.
+    const token = provisionRemoteApiKey(d, {
+      kind: 'remote',
+      ...sanitizeTokenGrant(d.store.snapshot().remoteAccess.tokenGrant),
+    })
     await d.remote?.enable()
-    return c.json({ state: d.remote?.state() ?? { kind: 'off' } })
+    return c.json({ state: d.remote?.state() ?? { kind: 'off' }, token })
   })
 
   app.post('/api/v1/remote/stop', async (c) => {
@@ -62,7 +82,8 @@ export function registerRemoteApi(app: Hono, d: Deps): void {
     // un-exposes the box, and a disabled toggle in front of a live public URL is the worst
     // failure this feature can have.
     await d.remote?.disable()
-    return c.json({ state: d.remote?.state() ?? { kind: 'off' } })
+    const revoked = revokeRemoteKeys(d)
+    return c.json({ state: d.remote?.state() ?? { kind: 'off' }, revoked })
   })
 
   app.post('/api/v1/remote/preflight', async (c) => {

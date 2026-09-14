@@ -1904,6 +1904,7 @@ export function registerApi(app: Hono, d: Deps): void {
         ngrok?: { authtoken?: string; domain?: string }
         tailscale?: { port?: number }
         custom?: { publicUrl?: string }
+        tokenGrant?: { capabilities?: string[]; models?: string[] }
       }
     }>(c)
 
@@ -2133,6 +2134,17 @@ export function registerApi(app: Hono, d: Deps): void {
         cfg.remoteAccess.tailscale.port = p === 8443 || p === 10000 ? p : 443
       }
       if (ra?.custom?.publicUrl !== undefined) cfg.remoteAccess.custom.publicUrl = String(ra.custom.publicUrl).trim()
+      // Only the SHAPE is enforced here (array of strings) — the same posture config.ts's own
+      // normalize takes. The actual allow-list check against LINK_CAPABILITIES happens at the
+      // point of use (remote/routes.ts's sanitizeTokenGrant, ADR-422), not here.
+      if (ra?.tokenGrant?.capabilities !== undefined) {
+        cfg.remoteAccess.tokenGrant.capabilities = ra.tokenGrant.capabilities.filter(
+          (x): x is string => typeof x === 'string',
+        )
+      }
+      if (ra?.tokenGrant?.models !== undefined) {
+        cfg.remoteAccess.tokenGrant.models = ra.tokenGrant.models.filter((x): x is string => typeof x === 'string')
+      }
       // HF token (spec 10 §4): write-only. An explicit '' clears it. Never logged.
       if (b.hfToken !== undefined) cfg.hf.token = String(b.hfToken).trim()
       // GitHub token (write-only, same semantics as HF): an explicit '' clears it.
@@ -2754,6 +2766,10 @@ function settingsPayload(d: Deps) {
       ngrok: { hasAuthtoken: !!cfg.remoteAccess.ngrok.authtoken, domain: cfg.remoteAccess.ngrok.domain },
       tailscale: { port: cfg.remoteAccess.tailscale.port },
       custom: { publicUrl: cfg.remoteAccess.custom.publicUrl },
+      // Not a secret — a capability list, same posture as toolPolicies above. Echoed as
+      // stored; sanitizeTokenGrant (remote/routes.ts) is what actually enforces the
+      // LINK_CAPABILITIES allow-list, at the point a token is minted.
+      tokenGrant: cfg.remoteAccess.tokenGrant,
       lastUrl: cfg.remoteAccess.lastUrl,
     },
   }
