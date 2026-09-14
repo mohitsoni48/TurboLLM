@@ -1,3 +1,4 @@
+import { useRef } from 'react'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -33,10 +34,36 @@ export function ExposureConfirmDialog({
   onConfirm: () => void
   onCancel: () => void
 }) {
+  // M3 (final-review.md): AlertDialogAction composes Radix's Dialog.Close, which calls
+  // onOpenChange(false) right after its own onClick — so confirming would run onConfirm AND
+  // THEN onCancel via onOpenChange. This ref, set synchronously inside the confirm handler and
+  // checked (then reset) in onOpenChange, tells "closed because confirmed" apart from "closed
+  // because cancelled/backed-out-of" so only one of the two callbacks ever fires per close.
+  // Reset again on open so the next open/close cycle starts clean.
+  const confirmedRef = useRef(false)
+
   if (!isPublicProvider(provider)) return null
   const card = PROVIDER_CARDS[provider]
+
+  const handleOpenChange = (o: boolean) => {
+    if (o) {
+      confirmedRef.current = false
+      return
+    }
+    if (confirmedRef.current) {
+      confirmedRef.current = false
+      return
+    }
+    onCancel()
+  }
+
+  const handleConfirm = () => {
+    confirmedRef.current = true
+    onConfirm()
+  }
+
   return (
-    <AlertDialog open={open} onOpenChange={(o) => !o && onCancel()}>
+    <AlertDialog open={open} onOpenChange={handleOpenChange}>
       <AlertDialogContent>
         <AlertDialogHeader>
           <AlertDialogTitle>This machine becomes reachable from the internet</AlertDialogTitle>
@@ -49,7 +76,7 @@ export function ExposureConfirmDialog({
         <AlertDialogFooter>
           <AlertDialogCancel>Cancel</AlertDialogCancel>
           <AlertDialogAction
-            onClick={onConfirm}
+            onClick={handleConfirm}
             className="border-[color:var(--warn)] text-[color:var(--warn)] hover:bg-[color:color-mix(in_srgb,var(--warn)_12%,transparent)]"
           >
             Turn it on
