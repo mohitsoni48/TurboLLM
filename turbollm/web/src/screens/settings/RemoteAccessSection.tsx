@@ -464,6 +464,10 @@ export function RemoteAccessSection() {
           <p className="text-[11px] text-faint">
             What the access token minted the next time you turn this on is allowed to do.
           </p>
+          <p className="text-[11px] text-faint">
+            A scoped token can chat and manage conversations; it cannot see full engine/model
+            status detail or change settings.
+          </p>
           <div className="flex flex-col gap-1">
             {REMOTE_TOKEN_CAPABILITIES.map((cap) => (
               <label key={cap} className="flex items-center gap-2 text-[12px] text-ink">
