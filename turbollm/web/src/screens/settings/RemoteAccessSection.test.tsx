@@ -172,6 +172,67 @@ describe('RemoteAccessSection', () => {
     expect(vi.mocked(startRemote)).not.toHaveBeenCalled()
   })
 
+  it('shows the exposure confirmation right after picking a public provider, before any status poll catches up (C-new-1)', async () => {
+    const remoteApi = await import('../../lib/remote-api')
+    // Server settled on a NON-public provider — gating on effectiveProvider (server truth)
+    // ALONE, as the first fix wave did, would read this stale value and skip the dialog for
+    // up to the full 6s poll interval after a completely ordinary provider change. The union
+    // gate must catch this via the local draft alone.
+    vi.mocked(remoteApi.getRemoteStatus).mockResolvedValueOnce({
+      provider: 'tailscale-serve',
+      enabled: false,
+      state: { kind: 'off' },
+      url: '',
+      ingressPort: null,
+    })
+    wrap(<RemoteAccessSection />)
+    await userEvent.click(await screen.findByRole('radio', { name: /ngrok/i }))
+    await userEvent.click(screen.getByRole('switch', { name: /remote access/i }))
+    expect(await screen.findByText(/reachable from the internet/i)).toBeTruthy()
+    expect(vi.mocked(startRemote)).not.toHaveBeenCalled()
+  })
+
+  it('names the provider the user actually selected in the confirmation, not a stale server value (I-new-1)', async () => {
+    const remoteApi = await import('../../lib/remote-api')
+    // Server still reports the OLD (also public) provider. Before this fix, the dialog was
+    // fed `effectiveProvider` (server truth) unconditionally, so it correctly decided to show
+    // but named the WRONG provider — a false claim about what is actually about to happen.
+    vi.mocked(remoteApi.getRemoteStatus).mockResolvedValueOnce({
+      provider: 'cloudflare-quick',
+      enabled: false,
+      state: { kind: 'off' },
+      url: '',
+      ingressPort: null,
+    })
+    wrap(<RemoteAccessSection />)
+    await userEvent.click(await screen.findByRole('radio', { name: /ngrok/i }))
+    await userEvent.click(screen.getByRole('switch', { name: /remote access/i }))
+    expect(await screen.findByText(/ngrok will publish this daemon/i)).toBeTruthy()
+    expect(screen.queryByText(/Cloudflare quick tunnel will publish/i)).toBeNull()
+  })
+
+  it('Check again for a stuck needs-setup/unavailable state actually retries the real start, not a no-op local check (I-new-2)', async () => {
+    const apiLib = await import('../../lib/api')
+    const remoteApi = await import('../../lib/remote-api')
+    // Both the seeded local draft and the server-reported provider are the SAME non-public
+    // id, so the exposure gate is definitively false and this test isolates exactly what
+    // I-new-2 is about: before this fix, Check again only called the client-side
+    // preflightRemote() (which mutates nothing server-side — the manager only re-evaluates
+    // preflight at its own enable()/disable()), so a cleared prerequisite left the daemon
+    // parked exactly where it was and the button visibly did nothing.
+    vi.mocked(apiLib.getSettings).mockResolvedValueOnce({ remoteAccess: { provider: 'tailscale-serve' } } as Awaited<ReturnType<typeof apiLib.getSettings>>)
+    vi.mocked(remoteApi.getRemoteStatus).mockResolvedValueOnce({
+      provider: 'tailscale-serve',
+      enabled: true,
+      state: { kind: 'unavailable', reason: 'Tailscale is not installed on this machine.' },
+      url: '',
+      ingressPort: null,
+    })
+    wrap(<RemoteAccessSection />)
+    await userEvent.click(await screen.findByRole('button', { name: /check again/i }))
+    await waitFor(() => expect(vi.mocked(startRemote)).toHaveBeenCalled())
+  })
+
   it('stops remote access from the section', async () => {
     const api = await import('../../lib/remote-api')
     // mockResolvedValueOnce, not mockResolvedValue: this file's vitest config sets no
@@ -193,15 +254,17 @@ describe('RemoteAccessSection', () => {
 
   it('turning on Tailscale Serve does NOT show an internet-exposure confirmation', async () => {
     const api = await import('../../lib/remote-api')
-    // C3 (final-review.md) made the toggle trust server truth (status.provider) over the
-    // local draft when deciding whether to confirm. Model the server having already caught
-    // up with a Tailscale Serve selection — as it would within one 6s poll after a
-    // successful provider save — rather than a stale cloudflare-quick left over from this
-    // file's shared default mock: that default was never a realistic settled state once a
-    // provider has actually been picked, and naively trusting server truth against IT would
-    // wrongly assert the dialog should show even though Tailscale Serve is genuinely
-    // non-public. The test's real intent — Serve gets no confirmation — is unchanged.
-    vi.mocked(api.getRemoteStatus).mockResolvedValueOnce({
+    // C3 (final-review.md) made the toggle also consult server truth (status.provider), and
+    // C-new-1's fix (final-review-fix-rereview.md) now refetches status right after a
+    // provider-change save resolves — so this test's mount AND that post-save refetch both
+    // need a consistent, settled Tailscale Serve status; `mockResolvedValue` (not `Once`)
+    // covers both calls. This is the last test in the file, so there is nothing after it for
+    // a non-Once override to leak into. Model the server having already caught up with a
+    // Tailscale Serve selection — as it would in practice — rather than a stale
+    // cloudflare-quick left over from this file's shared default mock: that default is not a
+    // realistic settled state once a provider has actually been picked. The test's real
+    // intent — Serve gets no confirmation — is unchanged.
+    vi.mocked(api.getRemoteStatus).mockResolvedValue({
       provider: 'tailscale-serve',
       enabled: false,
       state: { kind: 'off' },

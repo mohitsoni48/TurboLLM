@@ -95,7 +95,15 @@ export function RemoteAccessSection() {
     track('settings', 'select_remote_provider')
     save.mutate(
       { remoteAccess: { provider: p } },
-      { onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not save the provider.') },
+      {
+        // C-new-1 (final-review-fix-rereview.md): the polled ['remote-status'] cache is not
+        // invalidated by a settings save, so it can lag the server's now-current provider by
+        // up to the 6s refetch interval — exactly the window `effectiveProvider` below still
+        // has to tolerate. Refetching status the moment the save actually lands closes that
+        // window down to a single round trip instead of leaving it open for the full 6s.
+        onSuccess: () => void statusQ.refetch(),
+        onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not save the provider.'),
+      },
     )
     // Preflighting happens in the effect below, keyed on `provider` — not here — so a
     // provider change preflights exactly once (C2, final-review.md).
@@ -161,9 +169,36 @@ export function RemoteAccessSection() {
 
   // C3 (final-review.md): /remote/start acts on the daemon's persisted provider, not this
   // component's local draft — a failed or in-flight provider-change PATCH can leave the two
-  // disagreeing (bypass (b)). Prefer server truth, once known, for anything that decides
-  // whether the exposure confirmation is required.
+  // disagreeing (bypass (b)). `status?.provider` is the best available signal for what the
+  // server currently holds once a status poll has resolved.
   const effectiveProvider = status?.provider ?? provider
+
+  // C-new-1 (final-review-fix-rereview.md): gating on `effectiveProvider` ALONE re-opened a
+  // WIDER bypass than the one C3 closed — `['remote-status']` is polled on its own 6s
+  // schedule, untied to the settings save above, so for up to that long after a completely
+  // ordinary, successful provider change the poll still reports the OLD provider. Gating
+  // needs to be false-SAFE: require confirmation if EITHER the local draft (what the user
+  // just picked, and what a just-completed save has very likely already persisted
+  // server-side) OR the last-polled server value is public. This can only ever show the
+  // dialog MORE often than strictly necessary, never skip it when either signal says public.
+  const needsExposureConfirm = isPublicProvider(provider) || isPublicProvider(effectiveProvider)
+
+  // I-new-1 (final-review-fix-rereview.md): the dialog must name the provider that's actually
+  // responsible for the warning, not always whichever of the two happens to be server truth —
+  // showing "ngrok will publish this daemon" while the user has Tailscale Serve selected (or
+  // vice versa) is a false claim in whichever direction it's wrong. The common case is that
+  // the local draft IS the public one (matches the radio highlight, matches what a completed
+  // save has already persisted) — fall back to the server value only when the local draft
+  // ITSELF isn't the one that tripped the gate, i.e. a stale-server disagreement.
+  const dialogProvider = isPublicProvider(provider) ? provider : effectiveProvider
+
+  // M-new-1 (final-review-fix-rereview.md): `needsExposureConfirm` is re-derived from a
+  // POLLED value every render, so it can in principle turn false while the dialog is still
+  // open (the disagreement that made it true in the first place resolves mid-interaction) —
+  // without this, `pendingEnable` would stay stuck `true` with nothing rendering to clear it.
+  useEffect(() => {
+    if (pendingEnable && !needsExposureConfirm) setPendingEnable(false)
+  }, [pendingEnable, needsExposureConfirm])
 
   // Shared by the direct-start path (non-public provider, or Retry below) and the
   // confirmed-start path (public provider, after ExposureConfirmDialog's onConfirm) — same
@@ -190,9 +225,7 @@ export function RemoteAccessSection() {
     // Publicly reachable provider: hold off starting until ExposureConfirmDialog's onConfirm.
     // Tailscale Serve (and any other non-public provider) is tailnet-only, so the dialog would
     // render null anyway — start directly with no confirmation, per Task 15's existing test.
-    // Gated on effectiveProvider (server truth over local draft), not `provider` alone — see
-    // C3 bypass (b) above.
-    if (isPublicProvider(effectiveProvider)) {
+    if (needsExposureConfirm) {
       setPendingEnable(true)
       return
     }
@@ -396,22 +429,20 @@ export function RemoteAccessSection() {
           <Switch aria-label="Remote access" checked={isOn} onCheckedChange={onToggle} disabled={toggling} />
         </div>
         <div className="mt-3">
-          {/* C3 bypass (a) (final-review.md): Retry must NOT assume the consent from the
-              original toggle-on still applies — the user can switch to a different (and
-              possibly public) provider before retrying a failed start. Routing through
-              onToggle(true) re-evaluates the exposure confirmation for whichever provider is
-              effectively current, exactly like flipping the switch fresh would. */}
-          <LiveStateBlock
-            status={status}
-            onRetry={() => onToggle(true)}
-            onCheckAgain={() => status && runPreflight(status.provider)}
-            checking={!!status && preflightingFor === status.provider}
-          />
+          {/* C3 bypass (a) (final-review.md) / I-new-2 (final-review-fix-rereview.md): both
+              Retry (failed) and Check again (needs-setup/unavailable) call the SAME
+              onToggle(true) — a locally-scoped preflight() call updates nothing server-side
+              (the manager only re-evaluates preflight at its own enable()/disable(), so a
+              "clean" client-side recheck previously left the daemon parked exactly where it
+              was, with a button that visibly did nothing). Re-attempting the real start is the
+              only action that can actually un-stick it, and it also means Check again can
+              never assume stale consent still applies any more than Retry can. */}
+          <LiveStateBlock status={status} onRetry={() => onToggle(true)} toggling={toggling} />
         </div>
       </div>
 
       <ExposureConfirmDialog
-        provider={effectiveProvider}
+        provider={dialogProvider}
         open={pendingEnable}
         onConfirm={() => {
           setPendingEnable(false)
@@ -430,13 +461,11 @@ export function RemoteAccessSection() {
 function LiveStateBlock({
   status,
   onRetry,
-  onCheckAgain,
-  checking,
+  toggling,
 }: {
   status: RemoteStatus | undefined
   onRetry: () => void
-  onCheckAgain: () => void
-  checking: boolean
+  toggling: boolean
 }) {
   if (!status) return null
   const { state } = status
@@ -475,7 +504,7 @@ function LiveStateBlock({
     return (
       <div className="flex items-center justify-between gap-2">
         <span className="text-[12px]" style={{ color: 'var(--err)' }}>{state.reason}</span>
-        <Button size="sm" variant="outline" onClick={onRetry}>Retry</Button>
+        <Button size="sm" variant="outline" onClick={onRetry} disabled={toggling}>Retry</Button>
       </div>
     )
   }
@@ -486,8 +515,12 @@ function LiveStateBlock({
         <span className="inline-flex items-center gap-1.5 text-[12px]" style={{ color: 'var(--err)' }}>
           <AlertTriangle size={13} /> {state.reason}
         </span>
-        <Button size="sm" variant="outline" onClick={onCheckAgain} disabled={checking}>
-          {checking ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
+        {/* I-new-2 (final-review-fix-rereview.md): calls the SAME onRetry as the failed
+            branch above — a locally-scoped preflight() re-check updates nothing server-side
+            (the manager only re-evaluates at its own enable()/disable()), so the only action
+            that can actually un-stick a fixed prerequisite is re-attempting the real start. */}
+        <Button size="sm" variant="outline" onClick={onRetry} disabled={toggling}>
+          {toggling ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
           Check again
         </Button>
       </div>
