@@ -345,11 +345,17 @@ try {
 // desired config (ADR-422 Phase 3 final review, finding I1) — config-keyed reconciliation had
 // a false negative whenever the provider was switched away from Tailscale, or the
 // experimental flag was turned off while `enabled: true` was still persisted, in both of
-// which cases nothing would ever have reconciled a real leftover funnel again. Running this
-// unconditionally, before the supervisor's own enable() below, is safe: if config genuinely
-// still wants this exact provider, enable() re-issues the identical serve/funnel command
-// moments later, so this is at worst a harmless off-then-on.
-void reconcileTailscale(
+// which cases nothing would ever have reconciled a real leftover funnel again. Started here
+// (fire-and-forget, so it never delays app boot) but its promise is captured and AWAITED
+// below, right before the supervisor's own enable() call — a comment asserting "this runs
+// before enable()" is not the same as an ordering guarantee, and two independent `tailscale`
+// CLI spawns racing the HTTP listen callback on a cold box is a real, not theoretical,
+// interleaving (ADR-422 Phase 3 final-review fix wave re-review, New Breakage #1): without the
+// await, reconcile's `serve … off` can land on the serve enable() just created, silently
+// un-exposing a tunnel the UI still reports as connected. If config genuinely still wants this
+// exact provider, enable() re-issues the identical serve/funnel command right after this
+// resolves, so the sequencing is at worst a harmless off-then-on, never a lost update.
+const reconcileTailscalePromise = reconcileTailscale(
   resolveIngressPort(store.snapshot().remoteAccess.ingressPort, store.snapshot().daemon.port),
 ).then((acted) => {
   if (acted) console.log('reset a Tailscale serve/funnel left over from a previous run')
@@ -961,7 +967,7 @@ let rebinding = false // suppress the full banner + browser-open during an in-pl
 let prevHost = host // remembered before a rebind so we can revert if the new bind fails
 let prevPort = port
 function listen(attempt = 0): void {
-  const s = serve({ fetch: app.fetch, hostname: host, port }, (info) => {
+  const s = serve({ fetch: app.fetch, hostname: host, port }, async (info) => {
     const displayHost = host === '0.0.0.0' ? '0.0.0.0 (LAN)' : host
     const uiUrl = `http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${info.port}`
 
@@ -1030,6 +1036,12 @@ function listen(attempt = 0): void {
     // onRemoteState above, which fires for this first connect AND every later automatic
     // reconnect (ADR-422 Phase 2 final review, C2), so it is not duplicated here.
     if (remoteWanted && remote.state().kind === 'off') {
+      // Wait for the Tailscale reconcile started near the top of boot to actually finish
+      // before handing control to enable() — see the comment at its call site for why a
+      // fire-and-forget reconcile racing this exact call was a real bug, not a theoretical
+      // one. The promise never rejects (it swallows its own errors), so this never delays
+      // startup on a failure path, only on genuine in-flight `tailscale` CLI work.
+      await reconcileTailscalePromise
       void remote.enable()
     }
 

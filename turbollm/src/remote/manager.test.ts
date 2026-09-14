@@ -483,7 +483,15 @@ test('manager: a stale health-loop restart() after disable() during provider.sto
 // `tailscale ... off` against a tunnel that may still be genuinely working (a false-negative
 // probe, not evidence of an actual outage — see health.ts's tailnet-reachability notes).
 
-test('manager: I2 — a system-state provider is never stop()ped by a health-probe failure, and repeated failures still reach failed', async (t) => {
+// --- ADR-422 Phase 3 final-review fix-wave re-review, Important finding --------------------
+// The fix wave above closed I2's stop()-on-probe-failure half but left the SAME probe signal
+// able to drive a system-state provider all the way to the terminal `failed` teardown — in a
+// userspace-networking Tailscale deployment (RunPod/Kaggle) the daemon's own probe of its OWN
+// tailnet URL fails 100% of the time while the tunnel serves every other tailnet device fine,
+// so this walked a working tunnel into `failed` (ingress torn down, tailnet serve left
+// dangling, no auto-recovery) after ~35 minutes. The re-review's fix: gate the give-up branch
+// itself by the same lifecycle check already used for the stop() call right above it.
+test('manager: I2 follow-up — a system-state provider never reaches failed no matter how many probe-driven restarts occur', async (t) => {
   t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] })
   const p = new FakeSystemStateProvider()
   const m = new RemoteAccessManager({ app, ingressPort: 0, makeProvider: () => p, probe: async () => false })
@@ -492,17 +500,12 @@ test('manager: I2 — a system-state provider is never stop()ped by a health-pro
   assert.equal(m.state().kind, 'connected')
   assert.equal(p.stops, 0)
 
-  /** Drain the real (unmocked) microtask/setImmediate queue until `cond` holds, or give up
-   *  after `maxFlushes`. Used only to let an already-in-motion, already-deterministic chain of
-   *  awaits (a real ingress-socket close callback, not a race whose outcome is in doubt) finish
-   *  draining — never to paper over a genuinely uncertain outcome. */
-  const flushUntil = async (cond: () => boolean, maxFlushes = 20): Promise<void> => {
-    for (let i = 0; i < maxFlushes && !cond(); i++) await flush()
-  }
-
-  for (let cycle = 1; cycle <= MAX_CONSECUTIVE_FAILURES + 1; cycle++) {
-    // Drive CONSECUTIVE_FAILURES_BEFORE_RESTART consecutive failed probes, which is what
-    // makes the health loop call restart() for this cycle.
+  // Drive well PAST MAX_CONSECUTIVE_FAILURES consecutive probe-driven restarts with a probe
+  // that NEVER succeeds — exactly the pathological deployment above, where a successful probe
+  // (which would also reset the streak — see the test below) never happens at all, so the
+  // give-up gate is the only thing standing between this loop and a false `failed`.
+  const cycles = MAX_CONSECUTIVE_FAILURES + 3
+  for (let cycle = 1; cycle <= cycles; cycle++) {
     for (let i = 0; i < CONSECUTIVE_FAILURES_BEFORE_RESTART; i++) {
       t.mock.timers.tick(HEALTH_INTERVAL_MS)
       await flush()
@@ -511,25 +514,91 @@ test('manager: I2 — a system-state provider is never stop()ped by a health-pro
     // (a) The health loop's failure-handling path must NEVER call stop() on a system-state
     // provider purely because the end-to-end probe failed — only an explicit disable() may.
     assert.equal(p.stops, 0, `cycle ${cycle}: a probe-driven restart must not call stop()`)
-
-    if (cycle <= MAX_CONSECUTIVE_FAILURES) {
-      assert.equal(m.state().kind, 'reconnecting', `cycle ${cycle} should be reconnecting`)
-      t.mock.timers.tick(backoffDelay(cycle - 1))
-      await flush()
-      await flush()
-      assert.equal(m.state().kind, 'connected', `cycle ${cycle} should reconnect — the fake's start() always succeeds`)
-    }
+    assert.equal(m.state().kind, 'reconnecting', `cycle ${cycle} should be reconnecting`)
+    // backoffDelay caps at 60s well before this many cycles — tick the cap directly rather
+    // than recomputing an ever-growing 2**attempt for the later cycles.
+    t.mock.timers.tick(60_000)
+    await flush()
+    await flush()
+    assert.equal(m.state().kind, 'connected', `cycle ${cycle} should reconnect — the fake's start() always succeeds`)
   }
 
-  // (b) Past MAX_CONSECUTIVE_FAILURES consecutive probe-driven restarts, the manager must
-  // settle in `failed` rather than looping connected/reconnecting forever — only possible
-  // because a system-state provider's trivially-successful start() never reset the streak.
-  await flushUntil(() => m.state().kind === 'failed')
-  assert.equal(m.state().kind, 'failed')
-  assert.equal(p.stops, 0, 'reaching failed must not have gone through a health-probe-driven stop() either')
+  // (b) Even well past MAX_CONSECUTIVE_FAILURES consecutive probe-driven restarts, a
+  // system-state provider must still be alive and retrying at the 60s-capped cadence — the
+  // terminal `failed` teardown is reserved for 'child-process', where a probe failure is real
+  // evidence of an actual dead tunnel rather than a structurally-unreachable self-probe.
+  assert.notEqual(m.state().kind, 'failed')
+  assert.equal(p.stops, 0, 'must never have gone through a health-probe-driven stop() either')
 
   await m.disable()
   assert.equal(p.stops, 1, 'only the explicit, user-initiated disable() ever issues the real stop()')
+})
+
+// Note: a child-process provider whose start() keeps SUCCEEDING can never be driven to
+// 'failed' by probe failures alone, health-loop or otherwise — restart()'s success branch
+// resets `this.failures` to 0 on every successful reconnect for that lifecycle (correctly:
+// a real child printing real evidence it started IS reachability evidence). The existing
+// 'restart() gives up after MAX_CONSECUTIVE_FAILURES...' test above already proves child-
+// process still reaches `failed` (by calling restart() directly, faster than a real backoff
+// wait, so the streak accumulates before any reconnect can reset it) — that coverage is
+// unaffected by the lifecycle gate this fix adds, since WatchableProvider satisfies it.
+
+// --- ADR-422 Phase 3 final-review fix-wave re-review, Minor finding ------------------------
+// `this.failures` was a LIFETIME count for non-child-process lifecycles (nothing reset it
+// while connected), so a genuinely healthy Tailscale tunnel that hit ten separate,
+// widely-spaced three-minute blips over a long uptime would eventually report "gave up after
+// 10 attempts" for an outage that never happened. A real passing probe — unlike start()
+// succeeding, which the I2 fix already correctly refuses to trust for these lifecycles — IS
+// genuine end-to-end evidence, so it must reset the streak.
+test('manager: a successful probe resets the give-up counter, so widely-spaced blips never accumulate for a system-state provider', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] })
+  const p = new FakeSystemStateProvider()
+  let healthy = false
+  const m = new RemoteAccessManager({ app, ingressPort: 0, makeProvider: () => p, probe: async () => healthy })
+
+  await m.enable()
+  assert.equal(m.state().kind, 'connected')
+
+  // First blip: drive one full failed-probe -> restart -> reconnect cycle. `this.failures`
+  // is now 1 (observable via the next 'reconnecting' state's `attempt` field).
+  for (let i = 0; i < CONSECUTIVE_FAILURES_BEFORE_RESTART; i++) {
+    t.mock.timers.tick(HEALTH_INTERVAL_MS)
+    await flush()
+    await flush()
+  }
+  const first = m.state()
+  assert.equal(first.kind, 'reconnecting')
+  assert.equal(first.kind === 'reconnecting' && first.attempt, 1)
+  t.mock.timers.tick(60_000)
+  await flush()
+  await flush()
+  assert.equal(m.state().kind, 'connected')
+
+  // Let ONE probe succeed — a single passing health check, not a full reconnect — which must
+  // reset the streak even though nothing about the connection itself changed.
+  healthy = true
+  t.mock.timers.tick(HEALTH_INTERVAL_MS)
+  await flush()
+  await flush()
+  assert.equal(m.state().kind, 'connected', 'a passing probe must not itself disturb a connected state')
+  healthy = false
+
+  // Second blip, identical shape to the first. If the streak were a lifetime counter this
+  // would report attempt 2; since the intervening success reset it, it must report attempt 1
+  // again.
+  for (let i = 0; i < CONSECUTIVE_FAILURES_BEFORE_RESTART; i++) {
+    t.mock.timers.tick(HEALTH_INTERVAL_MS)
+    await flush()
+    await flush()
+  }
+  const second = m.state()
+  assert.equal(second.kind, 'reconnecting')
+  assert.equal(second.kind === 'reconnecting' && second.attempt, 1, 'the earlier successful probe must have reset the streak to 0')
+
+  t.mock.timers.tick(60_000)
+  await flush()
+  await flush()
+  await m.disable()
 })
 
 // --- ADR-422 Phase 3 final review, Important finding I3 (integration check) ----------------

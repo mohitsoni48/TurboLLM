@@ -167,13 +167,18 @@ export class TailscaleFunnelProvider extends TailscaleProvider {
 // --- Startup reconciliation (ADR-422 Phase 3 final review, finding I1) ---------------------
 //
 // `tailscale serve status --json` / `tailscale funnel status --json` are wired to the exact
-// same handler in Tailscale's own CLI (cmd/tailscale/cli/serve_legacy.go's `runServeStatus`,
-// registered from both `serve.go`'s and `funnel.go`'s "status" subcommand, tailscale/tailscale
-// @ main — read 2026-09-13 because neither CLI reference page documents the JSON shape at
+// same handler in Tailscale's own CLI: `cmd/tailscale/cli/serve_v2.go`'s `newServeV2Command`
+// is a single constructor used for BOTH `serve` and `funnel` (it `log.Fatalf`s unless told
+// which of the two it is being built for) and registers one `status` subcommand with
+// `Exec: e.runServeStatus` (defined in `serve_legacy.go`) either way — read 2026-09-13,
+// tailscale/tailscale @ main, because neither CLI reference page documents the JSON shape at
 // all: the `serve` reference page states outright that "`tailscale serve status` and
 // `tailscale serve status --json` return different information" without saying what the
-// latter is). Both commands just `json.MarshalIndent` the raw `*ipn.ServeConfig` fetched from
-// `GetServeConfig`. The fields this module reads, per `ipn/serve.go`:
+// latter is. (`funnel.go`'s own `newFunnelCommand`, which historically registered this
+// separately, is dead code kept only for an easy revert per its own TODO-to-delete comment —
+// `funnel.go:31` just forwards to `newServeV2Command(se, funnel)`.) Both commands just
+// `json.MarshalIndent` the raw `*ipn.ServeConfig` fetched from `GetServeConfig`. The fields
+// this module reads, per `ipn/serve.go`:
 //
 //   type ServeConfig struct {
 //     Web         map[HostPort]*WebServerConfig `json:",omitempty"` // "$SNI_NAME:$PORT" -> handlers

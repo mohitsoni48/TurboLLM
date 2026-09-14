@@ -220,6 +220,15 @@ export class RemoteAccessManager implements RemoteIngress {
         if (gen !== this.generation || this.url() !== url) return
         const result = nextHealthCheck(ok, this.consecutiveProbeFailures)
         this.consecutiveProbeFailures = result.consecutiveFailures
+        // ADR-422 Phase 3 final-review fix-wave re-review, Minor finding: a successful
+        // end-to-end probe is genuine evidence the connection is healthy — reset the
+        // give-up counter here too, not only on a successful reconnect (restart()'s own
+        // reset is gated to 'child-process', since start() succeeding proves nothing for
+        // the other lifecycles; a real passing probe is not subject to that caveat). Without
+        // this, `this.failures` was a lifetime count for 'system-state'/'none': a genuinely
+        // healthy tunnel that hit ten separate, widely-spaced blips over a long uptime would
+        // eventually report "gave up after 10 attempts" for an outage that never happened.
+        if (ok) this.failures = 0
         if (!result.shouldRestart) return
         // ADR-422 Phase 3 final review, Important finding I2: calling provider.stop() here
         // purely because an end-to-end probe failed is only safe for 'child-process' — that
@@ -270,7 +279,20 @@ export class RemoteAccessManager implements RemoteIngress {
   async restart(reason: string, gen: number = this.generation): Promise<void> {
     if (gen !== this.generation) return // already stale at entry — see the health-loop note above
     this.failures++
-    if (this.failures > MAX_CONSECUTIVE_FAILURES) {
+    // ADR-422 Phase 3 final-review fix-wave re-review, Important finding: giving up and
+    // tearing down the ingress must be gated the SAME way the stop()-on-probe-failure call
+    // above it is (health loop, further up in this file) — only 'child-process', where a
+    // failed probe/exit is real evidence the tunnel is actually dead. For 'system-state'
+    // (Tailscale) the identical probe signal can be a 100% false negative in a userspace-
+    // networking deployment (the daemon's own probe of its OWN tailnet URL can never
+    // succeed there, while the tunnel serves every other tailnet device fine) — treating
+    // that as terminal would tear down a working ingress and strand the tailnet serve
+    // pointed at a now-dead port with no automatic recovery. For 'none' (custom) the user
+    // owns the tunnel entirely; restarting it re-reads their config but proves nothing
+    // either way, so a probe failure there is equally uninformative. Both lifecycles instead
+    // fall through to the same backoff-and-retry path below, forever, at the 60s-capped
+    // cadence backoff.ts already documents as the intended behavior for "upstream is down".
+    if (this.provider?.lifecycle === 'child-process' && this.failures > MAX_CONSECUTIVE_FAILURES) {
       // ADR-422 final review, ledgered race (b) — the same shape as enable()'s catch above:
       // never tear down a different, now-current flow's live listener just because THIS
       // flow is giving up. (No re-check needed before this branch: the top-of-function check
