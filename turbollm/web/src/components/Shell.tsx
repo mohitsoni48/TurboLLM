@@ -11,6 +11,7 @@ import { rememberWorkspacePath, resolveNavTarget } from '../lib/workspace-nav'
 import { StateChip } from './StateChip'
 import { BoltMark } from './Logo'
 import { HardwareBar } from './HardwareBar'
+import { RemoteChip } from './RemoteChip'
 import { EngineProvisionBanner } from './EngineProvisionBanner'
 import { EngineLoadErrorBanner } from './EngineLoadErrorBanner'
 import { AppUpdateRailSlot } from './AppUpdateControl'
@@ -57,6 +58,14 @@ export function Shell({
   // Models/Settings/etc. mid-flow with no wizard-side awareness of the detour.
   const { pathname } = useLocation()
   const onOnboarding = pathname === '/onboarding'
+
+  // Remote access is experimental, off by default (Settings → Experimental) — read
+  // unconditionally, the same way NavRail's `routinesEnabled` does two lines below its own
+  // `useSettings()` call, rather than inline inside the `{!onOnboarding && ...}` JSX below:
+  // a hook call only reached when `!onOnboarding` is truthy is a conditional hook call (it
+  // wouldn't run on every render of this same mounted Shell instance, since onOnboarding
+  // flips as the route changes without Shell itself unmounting).
+  const remoteAccessEnabled = useSettings().query.data?.experimental?.remoteAccess ?? false
 
   // Issue #178: the long list-style screens (Models library, Engines, Customize, Settings — the
   // former Developer/Usage screens still exist as tabs inside Customize/Engines respectively,
@@ -111,6 +120,7 @@ export function Shell({
             store's hwBar toggle (rendering nothing when off) and polls only while mounted, so
             mounting it here is one line and costs the daemon nothing when it is switched off. */}
         {!onOnboarding && <HardwareBar />}
+        {!onOnboarding && <RemoteChip enabled={remoteAccessEnabled} />}
         {!onOnboarding && <MobileNav />}
       </div>
     </div>
