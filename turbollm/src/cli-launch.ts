@@ -1055,8 +1055,7 @@ export async function prepareHermes(base: string, _apiKey: string, modelKey: str
 }
 
 /**
- * POST /api/v1/engine/start with a modelKey and poll /api/v1/status until the
- * engine reaches state='running' for that model, or until timeoutMs elapses.
+ * POST /api/v1/engine/start with a modelKey, then wait for it to become the running model.
  *
  * `_fetch` is injectable for tests.
  */
@@ -1074,8 +1073,23 @@ async function loadAndWait(
     signal: AbortSignal.timeout(5000),
   })
   if (!loadRes.ok) return false
+  return waitForRunning(base, modelKey, timeoutMs, _fetch)
+}
 
-  // Poll status until running with the expected model key.
+/**
+ * Poll /api/v1/status until the engine reaches state='running' for `modelKey`, or until
+ * timeoutMs elapses. Split out of loadAndWait (ADR-425 D-G2): a caller that finds the model
+ * ALREADY loading — this daemon's own boot auto-load, or a manual Load started elsewhere —
+ * waits here directly instead of sending a second, redundant load request that would restart it.
+ *
+ * `_fetch` is injectable for tests.
+ */
+async function waitForRunning(
+  base: string,
+  modelKey: string,
+  timeoutMs = 180_000,
+  _fetch: typeof fetch = fetch,
+): Promise<boolean> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     await new Promise<void>((r) => setTimeout(r, 1000))
@@ -1091,6 +1105,35 @@ async function loadAndWait(
     }
   }
   return false
+}
+
+/** True when the primary engine is mid-load for exactly `key` — the state a boot auto-load
+ *  (ADR-425) or a manual Load elsewhere leaves in flight when `turbollm launch` runs concurrently.
+ *  Deliberately excludes 'stopping': that engine is on its way OUT, not on its way to `key`, so a
+ *  launch racing a stop must still request its own fresh load exactly as it did before this check
+ *  existed. */
+function isLoadingKey(status: DaemonStatus | null, key: string): boolean {
+  return status?.engine?.state === 'starting' && status?.model?.key === key
+}
+
+/** Bring `key` to the running model, whichever way it gets there: wait for a load already in
+ *  flight (ADR-425 D-G2, AC11), or start one ourselves. Prints exactly one banner. On success,
+ *  returns the refreshed status — or the caller's own `status`, when the final poll had nothing
+ *  newer to report. On failure, returns null; the caller prints its own message and exits. */
+async function awaitModelRunning(
+  base: string,
+  key: string,
+  status: DaemonStatus | null,
+  loadingBanner: string,
+  _fetch: typeof fetch,
+): Promise<{ status: DaemonStatus | null } | null> {
+  const waiting = isLoadingKey(status, key)
+  process.stdout.write(waiting ? `▸ Waiting for model "${key}" to finish loading…\n` : loadingBanner)
+  const ready = waiting
+    ? await waitForRunning(base, key, 180_000, _fetch)
+    : await loadAndWait(base, key, 180_000, _fetch)
+  if (!ready) return null
+  return { status: (await fetchStatus(base, _fetch)) ?? status }
 }
 
 // ── Don't inherit the PARENT agent session's identity (founder-reported, 2026-08-01) ──────────
@@ -1410,18 +1453,15 @@ export async function launchCli(
     } else if (alreadyRunning && status?.model?.key === resolvedKey) {
       // Fall through to launch.
     } else {
-      process.stdout.write(`▸ Loading model "${resolvedKey}"…\n`)
-      const loaded = await loadAndWait(base, resolvedKey, 180_000, _fetch)
-      if (!loaded) {
+      const outcome = await awaitModelRunning(base, resolvedKey, status, `▸ Loading model "${resolvedKey}"…\n`, _fetch)
+      if (!outcome) {
         process.stderr.write(
           `Model did not finish loading within 180 s. ` +
             `Check the TurboLLM UI for errors, or try again.\n`,
         )
         return 1
       }
-      // Re-fetch status to get the model name for the launch banner.
-      const refreshed = await fetchStatus(base, _fetch)
-      if (refreshed) status = refreshed
+      if (outcome.status) status = outcome.status
     }
   } else if (status?.selectedRemoteModel && (await fetchGatewayModelIds(base, _fetch)).includes(status.selectedRemoteModel)) {
     // No --model, but the user has pointed this install at a linked machine's model (ADR-382).
@@ -1449,17 +1489,15 @@ export async function launchCli(
     // the order the UI presents models.
     const lastKey = status?.lastLoaded?.modelKey
     const autoKey = lastKey && models.some((m) => m.key === lastKey) ? lastKey : models[0].key
-    process.stdout.write(`▸ Auto-loading model "${autoKey}"…\n`)
-    const loaded = await loadAndWait(base, autoKey, 180_000, _fetch)
-    if (!loaded) {
+    const outcome = await awaitModelRunning(base, autoKey, status, `▸ Auto-loading model "${autoKey}"…\n`, _fetch)
+    if (!outcome) {
       process.stderr.write(
         `Model did not finish loading within 180 s. ` +
           `Check the TurboLLM UI for errors, then run this again.\n`,
       )
       return 1
     }
-    const refreshed = await fetchStatus(base, _fetch)
-    if (refreshed) status = refreshed
+    if (outcome.status) status = outcome.status
   }
 
   // At this point we expect a model to be loaded — UNLESS it is a remote one, in which

@@ -10,15 +10,13 @@
 // that once (an admin `probe()` diverging from `LinkManager.probeOnce`).
 import type { Context } from 'hono'
 import { basename } from 'node:path'
-import { getModelProfile } from '../config/config'
 import type { Deps } from '../deps'
 import type { ModelInfo, StartOpts } from '../engines/manager'
 import { abortAllInFlightChats } from '../chat/chat-routes'
 import { engineAcceptsFormat, engineRejectsAudioModel } from '../engines/compat'
-import { koboldcppProfileToArgs } from '../engines/koboldcpp'
-import { mlxSamplingArgs } from '../engines/mlx'
-import { type LoadProfile, profileToArgs, resolveProfile, vllmProfileToArgs } from '../models/profile'
-import { getSysInfo, primaryVendor } from '../sysinfo/sysinfo'
+import { buildStartOpts } from '../engines/start-opts'
+import type { LoadProfile } from '../models/profile'
+import { getSysInfo } from '../sysinfo/sysinfo'
 
 type Status = 200 | 202 | 400 | 409 | 500
 
@@ -104,53 +102,7 @@ export async function startEngine(c: Context, d: Deps, b: EngineStartBody): Prom
     abortAllInFlightChats()
     await d.bench.waitIdle()
 
-    let opts: StartOpts
-    if (entry.format !== 'gguf') {
-      // MLX / vLLM: the model dir is the launch target (no llama.cpp -ngl/ctx knobs).
-      // MLX honors sampling defaults; vLLM honors its own load controls (F-027,
-      // --max-model-len/--gpu-memory-utilization/--dtype/…) built via vllmProfileToArgs,
-      // plus the multi-GPU shard count (ADR-054) mapped to --tensor-parallel-size below.
-      const savedProfile = getModelProfile(cfg, entry.key, active.id) as Partial<LoadProfile> | undefined
-      // Resolved once regardless of engine kind (mlx's own arg-building doesn't need
-      // it, but `model_load` telemetry — spec 23 §3.3 — wants the same full-config
-      // shape for every engine, not just vLLM).
-      const profile = resolveProfile(entry, sys, savedProfile, b.profileOverrides, cfg.modelDefaults)
-      const extraArgs =
-        active.kind === 'mlx'
-          ? mlxSamplingArgs(savedProfile?.sampling)
-          : active.kind === 'vllm'
-            ? vllmProfileToArgs(profile, entry.nativeCtx)
-            : []
-      opts = {
-        engine: active,
-        model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: entry.nativeCtx, vision: entry.vision },
-        modelPath: entry.path,
-        extraArgs,
-        tensorParallelSize: savedProfile?.gpu?.tensorParallelSize,
-        preferredPort: savedProfile?.port,
-        profile,
-        trigger: 'manual',
-      }
-    } else {
-      const saved = getModelProfile(cfg, entry.key, active.id) as Partial<LoadProfile> | undefined
-      const profile = resolveProfile(entry, sys, saved, b.profileOverrides, cfg.modelDefaults)
-      // KoboldCpp is a GGUF engine with its OWN flag names — build its arg-map instead of
-      // the llama-server profileToArgs. llamafile IS llama.cpp's server, so it keeps the
-      // full profileToArgs flags (the manager only prepends --server --no-webui for it).
-      const extraArgs =
-        active.kind === 'koboldcpp'
-          ? koboldcppProfileToArgs(profile, primaryVendor(sys), sys.gpus.length > 0)
-          : profileToArgs(profile, entry, active.capabilities, sys.cores, sys, active.binPath)
-      opts = {
-        engine: active,
-        model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: profile.ctx, vision: entry.vision },
-        modelPath: entry.path,
-        extraArgs,
-        preferredPort: profile.port,
-        profile,
-        trigger: 'manual',
-      }
-    }
+    const opts = buildStartOpts({ entry, engine: active, cfg, sys, overrides: b.profileOverrides, trigger: 'manual' })
     // Single chokepoint (rule 3): load() stops the current model, runs the reverse
     // gate (F-011: ask ComfyUI to free VRAM first), spawns, and waits for readiness —
     // all under the global load lock so this can't race another load. Fire-and-forget:
