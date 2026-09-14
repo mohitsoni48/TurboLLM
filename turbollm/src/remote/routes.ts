@@ -35,6 +35,15 @@ export function sanitizeTokenGrant(stored: { capabilities: string[]; models?: st
   return { capabilities: caps.length ? caps : ['models:use'], models: stored.models }
 }
 
+// I5 (Phase 5 final review): the scoped remote token is cached for the DAEMON PROCESS's
+// lifetime — spec 30 §6.3's own words — so a reconnect (another Retry click, toggling off
+// and back on) re-shows the SAME token instead of minting and orphaning a fresh one every
+// time. Mirrors cli.ts's own `let tunnelToken: string | null = null` convention for the
+// legacy tunnel token. Cleared by `/stop` below, and only by `/stop` — that is the one
+// action that actually revokes it (`revokeRemoteKeys`), so it is also the only action that
+// may make the NEXT `/start` mint genuinely fresh.
+let cachedRemoteToken: string | null = null
+
 export function registerRemoteApi(app: Hono, d: Deps): void {
   // Every route carries hostGate. Remote-access config IS credential management — it holds a
   // Cloudflare tunnel token and an ngrok authtoken, and turning it on publishes the daemon.
@@ -65,18 +74,31 @@ export function registerRemoteApi(app: Hono, d: Deps): void {
     d.store.update((cfg) => {
       cfg.remoteAccess.enabled = true
     })
-    // Minted here, returned ONCE. The store keeps only a hash, so this response is the only
-    // moment the raw value exists — the UI must show it immediately and say so.
-    const token = provisionRemoteApiKey(d, {
-      kind: 'remote',
-      ...sanitizeTokenGrant(d.store.snapshot().remoteAccess.tokenGrant),
-    })
+    // I5 (Phase 5 final review): mint AFTER `enable()` resolves, and only when it actually
+    // reached 'connected' — minting BEFORE used to reveal a freshly-minted token for a tunnel
+    // that never came up (a preflight failure, or a `failed` state), and every Retry click
+    // minted and orphaned another key on top of it. `provisionRemoteApiKey`/`revokeRemoteKeys`
+    // are the ones that make a remote token capability-checked and revocable at all
+    // (`grantKind === 'remote'`) — a token for a connection that never happened is neither
+    // useful nor safe to hand out.
     await d.remote?.enable()
+    const state = d.remote?.state() ?? { kind: 'off' }
+    // Cached for the daemon PROCESS's lifetime (spec 30 §6.3), not re-minted on every
+    // successful `/start` — a reconnect re-shows the SAME token instead of orphaning keys.
+    // Only `/stop` clears the cache (see below), which is also the only thing that revokes it.
+    if (state.kind === 'connected') {
+      cachedRemoteToken ??= provisionRemoteApiKey(d, {
+        kind: 'remote',
+        ...sanitizeTokenGrant(d.store.snapshot().remoteAccess.tokenGrant),
+      })
+    }
+    const token = state.kind === 'connected' ? (cachedRemoteToken ?? undefined) : undefined
     // Provider choice only — never the token or the URL this just minted (ADR-422 spec 30
     // §9). `d.telemetry` is optional (absent under tests), same convention as link-admin's
-    // `linkMinted` call site.
-    if (d.telemetry) emit(d.telemetry, remoteAccessEnabled, { provider })
-    const state = d.remote?.state() ?? { kind: 'off' }
+    // `linkMinted` call site. I5: gated on an actual successful connect, not emitted
+    // unconditionally on every call regardless of outcome — a failed attempt now emits only
+    // `remoteAccessPreflightFailed` below, not both (part of M5's "Retry double-counts" report).
+    if (d.telemetry && state.kind === 'connected') emit(d.telemetry, remoteAccessEnabled, { provider })
     // `RemoteAccessManager.enable()` runs its own preflight before ever binding anything
     // (manager.ts) and, on failure, leaves `state()` at 'unavailable'/'needs-setup' instead of
     // 'connected'. The manager has no `Deps` and cannot emit this itself (by design — see
@@ -101,6 +123,10 @@ export function registerRemoteApi(app: Hono, d: Deps): void {
     // failure this feature can have.
     await d.remote?.disable()
     const revoked = revokeRemoteKeys(d)
+    // I5: the ONLY place the cached token is cleared — this is also the only action that
+    // actually revokes it, so it is the only action that may make the next `/start` mint
+    // genuinely fresh rather than handing back a token that no longer exists.
+    cachedRemoteToken = null
     if (d.telemetry) emit(d.telemetry, remoteAccessDisabled, { provider })
     return c.json({ state: d.remote?.state() ?? { kind: 'off' }, revoked })
   })
