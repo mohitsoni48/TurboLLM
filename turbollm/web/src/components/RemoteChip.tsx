@@ -2,10 +2,11 @@ import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import * as Popover from '@radix-ui/react-popover'
 import { getRemoteStatus, isPublicProvider, stopRemote, type RemoteState } from '../lib/remote-api'
-import { track } from '../lib/api'
+import { ApiError, track } from '../lib/api'
 import { cn } from '../lib/utils'
 import { Button } from './ui/button'
 import { CopyButton } from './ui/copy-button'
+import { toast } from './ui/sonner'
 
 // Color per live state (spec 30 §11, tokens only): connected=ok, reconnecting/starting=warn,
 // failed=err. Same convention as StateChip.tsx's engine-state dot.
@@ -54,7 +55,10 @@ export function RemoteChip({ enabled }: { enabled: boolean }) {
 
   const stopSharing = () => {
     track('settings', 'stop_remote_from_chip')
-    void stopRemote().finally(() => void qc.invalidateQueries({ queryKey: ['remote-status'] }))
+    void stopRemote()
+      .then(() => setOpen(false))
+      .catch((e) => toast.error(e instanceof ApiError ? e.message : 'Could not stop remote access.'))
+      .finally(() => void qc.invalidateQueries({ queryKey: ['remote-status'] }))
   }
 
   return (
@@ -78,10 +82,15 @@ export function RemoteChip({ enabled }: { enabled: boolean }) {
         >
           <div className="flex flex-col gap-2">
             <div className="text-[13px] font-medium text-ink">{label}</div>
-            {status.url && (
+            {/* I2 (final-review.md): status.url is the persisted LAST-KNOWN URL outside
+                `connected` (routes.ts falls back to cfg.lastUrl), so gate on the live state,
+                not on the string being non-empty — otherwise starting/reconnecting/failed
+                hand out a dead URL with a Copy button and no staleness marker. Matches how
+                RemoteAccessSection.tsx's LiveStateBlock already does this correctly. */}
+            {state.kind === 'connected' && (
               <div className="flex items-center gap-2">
-                <span className="flex-1 truncate font-mono text-[11px] text-muted">{status.url}</span>
-                <CopyButton text={status.url} screen="settings" />
+                <span className="flex-1 truncate font-mono text-[11px] text-muted">{state.url}</span>
+                <CopyButton text={state.url} screen="settings" />
               </div>
             )}
             {state.kind === 'reconnecting' && (
