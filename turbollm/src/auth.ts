@@ -282,10 +282,24 @@ export function isLocalRequest(c: Context, d: Deps): boolean {
  *  `return next()` paths in `lanAuth` that let a request through with NO key presented at
  *  all — so once `requireApiKey` was on (the shipped default), an unauthenticated tailnet
  *  member or Access user could reach `POST /api/v1/keys` and mint a permanent, unscoped,
- *  un-revocable-by-`/stop` credential. `resolveKey` answers the question this gate actually
- *  needs asked — "did THIS request resolve to a real stored key?" — rather than "does global
- *  policy demand one", so an identity-only caller (no key at all) is correctly refused here
- *  even while being waved through the ordinary chat/models surface.
+ *  un-revocable-by-`/stop` credential.
+ *
+ *  N1 (Phase 5 final-review-fix re-review): the first fix here called `resolveKey` directly,
+ *  which matches on hash ALONE and does not apply the grant-kind rule every other credential
+ *  path applies ({@link isFacadeOnlyKey}: "any NEW code that resolves a presented key to a
+ *  stored record must call this — do not re-derive `!!key.grant` in a third place"). That
+ *  traded C1's hole in the default config (`requireApiKey: true`) for the SAME hole in a
+ *  different one (`lanBind: true, requireApiKey: false` — the open-LAN case this gate's own
+ *  first paragraph exists to protect): a `remote`-kind token, or even a Turbo Link façade-only
+ *  token, resolves to a real stored key and so passed `hostGate` there, letting the exact
+ *  chat-only token this feature publishes mint itself a permanent full-access credential and
+ *  revoke every other key on the box. `verifyPresentedKey(c, d)` — called here with NO
+ *  `ingress` flag, so it defaults to false — is the existing, already-correct answer: it
+ *  refuses ANY granted key (`link` or `remote` kind) unconditionally, and accepts only a real,
+ *  ungranted, stored key. That is exactly "did THIS request present an ordinary credential" —
+ *  the question this gate actually needs asked — without reopening the grant-kind rule this
+ *  file's own doc comments say has already caused two prior incidents (ADR-376's original
+ *  finding, and this one).
  *
  *  Lives here rather than inside `registerApi` so `/api/v1/keys`, `/api/v1/connect/:cli` and
  *  Turbo Link's `/api/v1/links*` (ADR-376) share ONE predicate — the v1.9.0 pre-release
@@ -293,7 +307,7 @@ export function isLocalRequest(c: Context, d: Deps): boolean {
  *  review found it missing again on `POST /api/v1/links/mint`, both because it was a private
  *  local function nothing new could reuse. */
 export function hostGate(c: Context, d: Deps): boolean {
-  return isLocalRequest(c, d) || !!resolveKey(c, d)
+  return isLocalRequest(c, d) || verifyPresentedKey(c, d)
 }
 
 /** Same decision as {@link isLocalRequest}, for the one surface that has no Hono `Context`:

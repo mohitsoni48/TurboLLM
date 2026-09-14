@@ -14,7 +14,8 @@ import { AuthGate } from './components/AuthGate'
 import { useStatus, useSettings, useDownloads } from './lib/queries'
 import { useUiStore } from './stores/ui'
 import { useOnboardingState } from './lib/onboarding-queries'
-import { ApiError, setAuthToken } from './lib/api'
+import { setAuthToken } from './lib/api'
+import { classifyStatusError } from './lib/connection-state'
 import { subscribeCodeAuthNeeded, isCodeAuthNeeded } from './lib/auth-signal'
 import { useCodeFeatureEnabled } from './lib/platform'
 import { useRoutineNotificationPoller } from './lib/notify-routine'
@@ -195,7 +196,18 @@ export function App() {
   // Code has its OWN always-on key gate independent of the global one (auth.ts's codeAuth) —
   // /status itself never 401s for it, so code-api.ts marks this separate signal instead.
   const codeAuthNeeded = useSyncExternalStore(subscribeCodeAuthNeeded, isCodeAuthNeeded)
-  const needsAuth = (statusQ.isError && statusQ.error instanceof ApiError && statusQ.error.status === 401) || codeAuthNeeded
+  // C2 (Phase 5 final-review-fix re-review, ADR-422): `scopedTokenLimited` (403) is neither
+  // "wrong/no credential" (401 — needsAuth) nor "daemon unreachable" — it is a capability-
+  // scoped remote-access token that can chat (auth.ts's requiredCapability deliberately never
+  // grants it config:read, since /status carries the engine's launchCommand and raw stderr,
+  // real filesystem detail). Before this, a phone opening a URL with a fresh, correctly-scoped
+  // token watched the status poll 403 three times in a row and landed on the same
+  // non-dismissible "Lost connection" overlay a genuinely dead daemon shows — the chat surface
+  // itself was reachable the whole time. There is nothing to prompt the user for here (unlike
+  // 401 — no key would fix this, a different token scope would), so this only ever suppresses
+  // the overlay below; the rest of the app renders normally with `statusQ.data` left undefined.
+  const { needsAuth: needsAuthFromStatus, scopedTokenLimited } = classifyStatusError(statusQ.isError, statusQ.error)
+  const needsAuth = needsAuthFromStatus || codeAuthNeeded
 
   // Latch the auth prompt once we've seen a 401, and keep it up until a poll finally
   // SUCCEEDS. Without this, a flaky LAN link (common on the remote machine where you're
@@ -208,8 +220,9 @@ export function App() {
     else if (statusQ.isSuccess) setAuthLatched(false)
   }, [needsAuth, statusQ.isSuccess])
 
-  // While the key prompt is up, the "lost connection" overlay must yield to it.
-  const unreachable = !authLatched && !needsAuth && failCount >= 3
+  // While the key prompt is up, or a scoped token is simply missing a capability it was never
+  // meant to have, the "lost connection" overlay must yield.
+  const unreachable = !authLatched && !needsAuth && !scopedTokenLimited && failCount >= 3
   const version = statusQ.data?.version ? `v${statusQ.data.version}` : 'v0.0.0-dev'
 
   return (
