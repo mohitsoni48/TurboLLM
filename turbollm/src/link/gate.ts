@@ -1,4 +1,5 @@
 import type { Context } from 'hono'
+import type { Config } from '../config/config'
 import type { Deps } from '../deps'
 
 /** The one predicate every Turbo Link surface asks before doing anything (ADR-376).
@@ -29,7 +30,14 @@ import type { Deps } from '../deps'
  *  from here — the same removal `experimental.code` got. Nothing else has to change,
  *  which is the point of keeping every check a single call to one symbol. */
 export function isTurboLinkEnabled(d: Deps): boolean {
-  const daemon = d.store.snapshot().daemon as { experimental?: { turboLink?: boolean } } | undefined
+  return isTurboLinkEnabledIn(d.store.snapshot())
+}
+
+/** Same predicate as `isTurboLinkEnabled`, for a caller that already holds a `Config` snapshot
+ *  rather than a live `Deps` graph — a pure planner (`engines/auto-load.ts`) is the reason this
+ *  exists: without it, that caller had to fabricate a fake `Deps` just to reach this one field. */
+export function isTurboLinkEnabledIn(cfg: Config): boolean {
+  const daemon = cfg.daemon as { experimental?: { turboLink?: boolean } } | undefined
   return daemon?.experimental?.turboLink === true
 }
 

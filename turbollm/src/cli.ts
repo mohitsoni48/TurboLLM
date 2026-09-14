@@ -4,9 +4,9 @@ import { openSync, readFileSync } from 'node:fs'
 import { serve } from '@hono/node-server'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { ConfigStore, defaultConfig, defaultConfigPath, getModelProfile, resolveConfiguredCtx, migrateLegacyDataDir } from './config/config'
+import { ConfigStore, defaultConfig, defaultConfigPath, resolveConfiguredCtx, migrateLegacyDataDir } from './config/config'
 import { setGithubTokenProvider } from './engines/download'
-import { Manager, killTrackedEnginesSync, reapStaleEngines, type StartOpts } from './engines/manager'
+import { Manager, killTrackedEnginesSync, reapStaleEngines } from './engines/manager'
 import { ComfyGuard } from './engines/comfy-guard'
 import { Registry } from './engines/registry'
 import { ProvisionState } from './engines/provision-state'
@@ -27,11 +27,11 @@ import {
 } from './app-update-apply'
 import { applyEngineUpdate } from './engines/update-apply'
 import { seedDefaultEngines, ensureAndroidBundledEngine } from './engines/seed'
-import { engineAcceptsFormat } from './engines/compat'
+import { runAutoLoad } from './engines/auto-load'
 import { Scanner } from './models/scanner'
 import { seedDefaultModelDir } from './models/hf-cache'
 import { HashStore } from './models/hashes'
-import { resolveProfile, profileToArgs, estimateVram, type LoadProfile } from './models/profile'
+import { estimateVram } from './models/profile'
 import { getSysInfo } from './sysinfo/sysinfo'
 import { ConversationStore } from './chat/db'
 import { preloadSqlJs } from './chat/store/sqlite-adapter'
@@ -355,7 +355,7 @@ const scanner = new Scanner(store)
 // exists, adopt it as the default so pre-existing HF models show up. One-time only;
 // triggers its own rescan. Must run BEFORE the background rescan below.
 seedDefaultModelDir(store, scanner)
-void scanner.rescan() // discover models in the background
+const initialScan = scanner.rescan() // discover models in the background; never rejects, awaited by auto-load
 const hashes = new HashStore(store.dir())
 // Android only: sql.js's WASM module must finish loading before the first ConversationStore
 // construction below — openSqlDb() (sqlite-adapter.ts) is synchronous and throws if this
@@ -1129,60 +1129,20 @@ deps.requestRestart = (opts?: { exitOnly?: boolean }) => {
 }
 
 // ── Auto-load last model on start (spec 05 §7) ────────────────────────────────
-// When enabled (Settings → Startup), re-load the last-used model so the daemon
-// comes back ready to chat. Resolves the saved modelKey through the scanner +
-// profile pipeline (same as POST /engine/start); falls back to a legacy devModel.
-void (async () => {
-  if (!cfg.autoLoadOnStart) return
-  // Don't fight ComfyUI for the GPU at startup — if it's already rendering, skip the
-  // auto-load (load it manually, or the guard's block lifts, once its queue drains).
-  if (comfy.isBlocked()) return
-  const active = registry.active()
-  if (!active) return
-  await scanner.rescan() // ensure the model list is populated before resolving
-  const sys = getSysInfo()
-  const entry = cfg.lastLoaded.modelKey ? scanner.get(cfg.lastLoaded.modelKey) : undefined
-
-  let opts: StartOpts | null = null
-  if (entry && !entry.incomplete && !entry.parseError && engineAcceptsFormat(active.kind, entry.format)) {
-    if (entry.format !== 'gguf') {
-      opts = {
-        engine: active,
-        model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: entry.nativeCtx, vision: entry.vision },
-        modelPath: entry.path,
-        extraArgs: [],
-        trigger: 'resume',
-      }
-    } else {
-      const saved = getModelProfile(cfg, entry.key, active.id) as Partial<LoadProfile> | undefined
-      const profile = resolveProfile(entry, sys, saved, undefined, cfg.modelDefaults)
-      opts = {
-        engine: active,
-        model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: profile.ctx, vision: entry.vision },
-        modelPath: entry.path,
-        extraArgs: profileToArgs(profile, entry, active.capabilities, sys.cores, sys, active.binPath),
-        profile,
-        trigger: 'resume',
-      }
-    }
-  } else if (cfg.devModel) {
-    opts = {
-      engine: active,
-      model: { key: cfg.devModel.modelPath, name: cfg.devModel.label, quant: '', ctx: 0, vision: false },
-      modelPath: cfg.devModel.modelPath,
-      extraArgs: cfg.devModel.extraArgs,
-      trigger: 'resume',
-    }
-  }
-  if (opts) {
-    // load() runs the reverse gate (F-011: ask ComfyUI to free its VRAM first) inside
-    // the global load lock, so auto-load can't race a gateway/HTTP load. No-op unless
-    // enabled + ComfyUI idle; non-fatal.
-    manager
-      .load(opts, { beforeStart: () => comfy.freeComfyUIBeforeLoad() })
-      .catch((e) => console.warn(`auto-load failed: ${e}`))
-  }
-})()
+// Not awaited, so boot never stalls. It waits for the boot scan itself, so a key the scan
+// migrates is resolved; the decision and every skip line live in engines/auto-load.ts.
+void runAutoLoad({
+  initialScan,
+  store,
+  registry,
+  comfy,
+  scanner,
+  manager,
+  modelRouter,
+  sysInfo: getSysInfo,
+  log: (line) => console.log(line),
+  warn: (line) => console.warn(line),
+})
 
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
 let shuttingDown = false

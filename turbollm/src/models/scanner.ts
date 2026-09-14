@@ -5,6 +5,7 @@ import { readdir, realpath, stat } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { migrateModelKey, type ConfigStore } from '../config/config'
 import { GgufError, type GgufMeta, parseGguf, quantFromName } from '../gguf/gguf'
+import { CoalescedRunner } from '../util/coalesced-runner'
 
 export interface ModelEntry {
   key: string
@@ -218,12 +219,16 @@ export class ScannerError extends Error {
 
 export class Scanner {
   private entries: ModelEntry[] = []
-  private scanning = false
+  private readonly passes = new CoalescedRunner(
+    () => this.scanOnce(),
+    (e) => console.warn(`model scan failed: ${e instanceof Error ? e.message : String(e)}`),
+  )
   private lastScanAt = ''
   private cache = new Map<string, CacheRow>()
   private cachePath: string
   // [legacyKey, key] pairs discovered during the CURRENT rescan — see the comment in `entryFor`
   // for why these are batched into one config write instead of applied as they're found.
+  // Per-pass instance state: safe only because `passes` never runs two scan passes at once (C1).
   private pendingKeyMigrations: Array<[string, string]> = []
 
   constructor(private store: ConfigStore) {
@@ -232,7 +237,7 @@ export class Scanner {
   }
 
   list(): { models: ModelEntry[]; scanning: boolean; lastScanAt: string } {
-    return { models: this.entries, scanning: this.scanning, lastScanAt: this.lastScanAt }
+    return { models: this.entries, scanning: this.passes.busy, lastScanAt: this.lastScanAt }
   }
 
   get(key: string): ModelEntry | undefined {
@@ -306,35 +311,39 @@ export class Scanner {
     return paths
   }
 
-  /** Re-scan all configured model directories. Coalesces concurrent calls. */
-  async rescan(): Promise<void> {
-    if (this.scanning) return
-    this.scanning = true
-    try {
-      const dirs = this.store.snapshot().modelDirs
-      const scan: ScanResult = { ggufs: [], mlxDirs: [] }
-      const roots = new Map<string, string>()
-      for (const dir of dirs) {
-        try {
-          const real = await realpath(dir)
-          if (!roots.has(real)) roots.set(real, resolve(dir))
-        } catch { /* missing / inaccessible root */ }
-      }
-      const state: WalkState = { directories: new Set(), files: new Set(), roots }
-      for (const dir of roots.values()) await walk(dir, scan, state)
-      this.pendingKeyMigrations = []
-      const gguf = await this.build(scan.ggufs)
-      const mlx = scan.mlxDirs.map((dir) => mlxEntryFor(dir))
-      this.entries = [...gguf, ...mlx].sort((a, b) => a.name.localeCompare(b.name))
-      this.lastScanAt = new Date().toISOString()
-      this.saveCache()
-      // One config write for the whole scan (see `entryFor`), not one per affected model.
-      if (this.pendingKeyMigrations.length > 0) {
-        const pairs = this.pendingKeyMigrations
-        this.store.update((cfg) => { for (const [oldKey, newKey] of pairs) migrateModelKey(cfg, oldKey, newKey) })
-      }
-    } finally {
-      this.scanning = false
+  /** Re-scan all configured model directories (ADR-425).
+   *   C1  never two scan passes at once;
+   *   C2  resolves only after a pass that STARTED no earlier than this call has finished, so a
+   *       caller (boot auto-load, delete) never reads a library walked before its own request;
+   *   C3  every call made while a pass runs shares ONE follow-up pass;
+   *   C4  never rejects: a failed pass logs `model scan failed: <message>` once and leaves the
+   *       previous entries in place. */
+  rescan(): Promise<void> {
+    return this.passes.request()
+  }
+
+  private async scanOnce(): Promise<void> {
+    const dirs = this.store.snapshot().modelDirs
+    const scan: ScanResult = { ggufs: [], mlxDirs: [] }
+    const roots = new Map<string, string>()
+    for (const dir of dirs) {
+      try {
+        const real = await realpath(dir)
+        if (!roots.has(real)) roots.set(real, resolve(dir))
+      } catch { /* missing / inaccessible root */ }
+    }
+    const state: WalkState = { directories: new Set(), files: new Set(), roots }
+    for (const dir of roots.values()) await walk(dir, scan, state)
+    this.pendingKeyMigrations = []
+    const gguf = await this.build(scan.ggufs)
+    const mlx = scan.mlxDirs.map((dir) => mlxEntryFor(dir))
+    this.entries = [...gguf, ...mlx].sort((a, b) => a.name.localeCompare(b.name))
+    this.lastScanAt = new Date().toISOString()
+    this.saveCache()
+    // One config write for the whole scan (see `entryFor`), not one per affected model.
+    if (this.pendingKeyMigrations.length > 0) {
+      const pairs = this.pendingKeyMigrations
+      this.store.update((cfg) => { for (const [oldKey, newKey] of pairs) migrateModelKey(cfg, oldKey, newKey) })
     }
   }
 
