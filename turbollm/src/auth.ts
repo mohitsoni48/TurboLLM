@@ -21,6 +21,8 @@ import { getConnInfo } from '@hono/node-server/conninfo'
 import type { Context, MiddlewareHandler } from 'hono'
 import type { ApiKey } from './config/config'
 import type { Deps } from './deps'
+import { hasCapability } from './link/capabilities'
+import type { LinkCapability } from './link/types'
 
 /** Loopback addresses that never require a key, in the forms Node surfaces them
  *  (IPv4, IPv6, and the IPv4-mapped-IPv6 form Windows/dual-stack sockets report). */
@@ -349,6 +351,36 @@ export function isFacadeOnlyKey(key: Pick<ApiKey, 'grant'>): boolean {
   return !!key.grant
 }
 
+/** Which enforcement path a stored key's grant belongs to (ADR-422).
+ *
+ *  A grant with no `kind` is a LINK grant: every grant minted before ADR-422 was minted for
+ *  a Turbo Link peer, and reading absent as anything else would silently widen tokens
+ *  already in the field. */
+export function grantKind(key: Pick<ApiKey, 'grant'>): 'none' | 'link' | 'remote' {
+  if (!key.grant) return 'none'
+  return key.grant.kind === 'remote' ? 'remote' : 'link'
+}
+
+/** The capability a request needs, or null when this path is not something a scoped remote
+ *  token may reach at all.
+ *
+ *  Null is DENY, never "no check required" — an unmapped path is one nobody has reasoned
+ *  about for a remote caller, and defaulting those open is how ADR-376's `/v1/*` defect
+ *  happened. Engine add/scan/build appear nowhere here on purpose: ADR-139 settled that no
+ *  remote caller executes a caller-supplied binary, valid token or not, and isLocalRequest
+ *  already refuses them independently. */
+export function requiredCapability(method: string, path: string): LinkCapability | null {
+  const m = method.toUpperCase()
+  const read = m === 'GET' || m === 'HEAD'
+  if (path.startsWith('/v1/')) return 'models:use'
+  if (path.startsWith('/api/v1/chat')) return 'models:use'
+  if (path === '/api/v1/models' || path.startsWith('/api/v1/models/')) return read ? 'models:use' : 'models:load'
+  if (path.startsWith('/api/v1/downloads')) return read ? 'downloads:read' : 'downloads:write'
+  if (path.startsWith('/api/v1/settings')) return read ? 'config:read' : 'config:write'
+  if (path === '/api/v1/status') return 'config:read'
+  return null
+}
+
 /** Checks a raw candidate key against stored API keys; bumps lastUsedAt best-effort on a
  *  match. The credential-check core shared by every auth surface — HTTP (verifyPresentedKey,
  *  which sources the raw value from headers) and the WebSocket upgrade handler (which sources
@@ -365,7 +397,7 @@ export function isFacadeOnlyKey(key: Pick<ApiKey, 'grant'>): boolean {
  *  with its own hash comparison and never routes through here. It calls
  *  {@link isFacadeOnlyKey} directly instead. Two enforcement points, ONE predicate — if you
  *  add a third credential path, call the predicate rather than re-deriving the rule. */
-export function verifyKeyValue(key: string, d: Deps): boolean {
+export function verifyKeyValue(key: string, d: Deps, opts?: { ingress?: boolean }): boolean {
   if (!key) return false
   const hash = hashKey(key)
   const cfg = d.store.snapshot()
@@ -373,7 +405,15 @@ export function verifyKeyValue(key: string, d: Deps): boolean {
   if (!match) return false
   // Before the lastUsedAt bump on purpose: a refused credential must leave no trace of a
   // successful use, and must be indistinguishable from a wrong key.
-  if (isFacadeOnlyKey(match)) return false
+  //
+  // The ADR-422 exception, and the ONLY one: a `remote`-kind grant is honoured when the
+  // request genuinely arrived on the ingress socket. A `link`-kind grant is still refused
+  // absolutely — ADR-376's rule is extended here, never loosened — and every caller that
+  // does not pass `ingress` (codeAuth over Code's real shell, the terminal WebSocket
+  // upgrade, ext/auth.ts's own path) keeps refusing both kinds, because the default is
+  // false. Capability enforcement for an accepted remote token is the CALLER's job; this
+  // function answers "is this credential usable here at all".
+  if (isFacadeOnlyKey(match) && !(opts?.ingress === true && grantKind(match) === 'remote')) return false
   // Best-effort lastUsedAt bump (spec 06 §5). Never block the request on it.
   try {
     d.store.update((mut) => {
@@ -389,8 +429,8 @@ export function verifyKeyValue(key: string, d: Deps): boolean {
 /** Checks the presented key (any of the accepted headers, see presentedKey) against stored API
  *  keys. Shared by lanAuth and codeAuth below so both enforce the identical credential check —
  *  only WHEN each one is triggered differs. */
-export function verifyPresentedKey(c: Context, d: Deps): boolean {
-  return verifyKeyValue(presentedKey(c), d)
+export function verifyPresentedKey(c: Context, d: Deps, opts?: { ingress?: boolean }): boolean {
+  return verifyKeyValue(presentedKey(c), d, opts)
 }
 
 /** LAN auth middleware (spec 06 §5). Register AFTER cors + the Server header and
@@ -413,12 +453,27 @@ export function lanAuth(d: Deps): MiddlewareHandler {
       exempt: isExempt(c),
     })
     if (allow) return next()
-    if (verifyPresentedKey(c, d)) return next()
 
-    return c.json(
-      { error: { code: 'unauthorized', message: 'A valid API key is required for non-local access.' } },
-      401,
-    )
+    const ingress = isTunneled(c, d)
+    if (!verifyPresentedKey(c, d, { ingress })) {
+      return c.json(
+        { error: { code: 'unauthorized', message: 'A valid API key is required for non-local access.' } },
+        401,
+      )
+    }
+    // A scoped remote token is additionally held to its capability set. An ordinary
+    // (ungranted) key skips this entirely and behaves exactly as it always has.
+    const resolved = ingress ? resolveKey(c, d) : undefined
+    if (resolved && grantKind(resolved) === 'remote') {
+      const need = requiredCapability(c.req.method, c.req.path)
+      if (!need || !hasCapability(resolved, need)) {
+        return c.json(
+          { error: { code: 'forbidden', message: 'This access token is not allowed to do that.', capability: need } },
+          403,
+        )
+      }
+    }
+    return next()
   }
 }
 

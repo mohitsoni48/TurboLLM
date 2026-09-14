@@ -20,6 +20,12 @@ export type LinkCapability = (typeof LINK_CAPABILITIES)[number]
 /** What a link token is allowed to do. Attached to an ApiKey as `grant`.
  *  ABSENT grant = a normal, pre-Turbo-Link full-access key (every existing key). */
 export interface LinkGrant {
+  /** Which enforcement path this grant belongs to.
+   *
+   *  ABSENT means 'link' — every grant minted before ADR-422 was minted for a Turbo Link
+   *  peer, so absent must not be read as "unscoped" or as the new kind. Deliberately the
+   *  opposite polarity to `ApiKey.grant` itself, where absent means full access. */
+  kind?: 'link' | 'remote'
   capabilities: LinkCapability[]
   /** Model keys this token may address. Absent or empty = every local model. */
   models?: string[]
