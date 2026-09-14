@@ -79,6 +79,7 @@ import { emit } from './telemetry/runtime/typed-emit'
 import { modelLoad, modelDownloaded, buildModelLoadConfig } from './telemetry/events/model'
 import { engineInstalled } from './telemetry/events/engine'
 import { appUpdateAvailable, appUpdateApplied, appUpdateFailed } from './telemetry/events/app-update'
+import { remoteAccessState } from './telemetry/events/remote'
 import { checkDailyQueryRollups } from './telemetry/runtime/daily-query-rollups'
 import { markEverLoadedModel } from './api/onboarding-routes'
 
@@ -801,6 +802,24 @@ const remoteWanted = tunnelFlag || (isRemoteAccessEnabled(deps) && store.snapsho
 // `remote` has long since been assigned.
 let lastWiredServer: unknown = null
 function onRemoteState(s: RemoteState): void {
+  // Provider-choice + state-transition telemetry (ADR-422 Phase 5 Task 22), gated to exactly
+  // the two transitions the plan asks for — 'connected' is steady state and would flood,
+  // 'off'/'starting' are not transitions worth a funnel over. Emitted HERE rather than from
+  // `RemoteAccessManager.set()` itself, for the same reason the `lastUrl` persistence below
+  // lives here and not in the manager: `onRemoteState` already fires on every `set()` call, so
+  // this reproduces the manager's telemetry-free-by-design boundary (see the comment on the
+  // `store.update` block further down) without adding a new dependency to it.
+  //
+  // Never the free-text `s.lastError`/`s.reason` — see telemetry/events/remote.ts's doc
+  // comment for why neither string can be made safe to emit (spec 30 §9: no URL, hostname,
+  // token or tailnet name, and an arbitrary child-process/Node error message can contain any
+  // of those).
+  if (s.kind === 'reconnecting' || s.kind === 'failed') {
+    emit(telemetry, remoteAccessState, {
+      provider: tunnelFlag ? 'cloudflare-quick' : store.snapshot().remoteAccess.provider,
+      state: s.kind,
+    })
+  }
   if (s.kind !== 'connected') return
   // cloudflared's local leg targets the INGRESS server, not the main one (Phase 1 Task 3's fix
   // round). A fresh server instance only appears after a disable()+enable() cycle — a

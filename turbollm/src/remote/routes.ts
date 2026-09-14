@@ -11,6 +11,8 @@ import { hostGate, provisionRemoteApiKey, revokeRemoteKeys } from '../auth'
 import { isRemoteAccessEnabled, REMOTE_DISABLED } from './gate'
 import { REMOTE_PROVIDERS, type RemoteProviderId } from '../config/config'
 import { LINK_CAPABILITIES, type LinkCapability } from '../link/types'
+import { emit } from '../telemetry/runtime/typed-emit'
+import { remoteAccessEnabled, remoteAccessDisabled, remoteAccessPreflightFailed } from '../telemetry/events/remote'
 
 async function body<T>(c: Context): Promise<T> {
   try {
@@ -59,6 +61,7 @@ export function registerRemoteApi(app: Hono, d: Deps): void {
   app.post('/api/v1/remote/start', async (c) => {
     const refused = guard(c)
     if (refused) return refused
+    const provider = d.store.snapshot().remoteAccess.provider
     d.store.update((cfg) => {
       cfg.remoteAccess.enabled = true
     })
@@ -69,12 +72,27 @@ export function registerRemoteApi(app: Hono, d: Deps): void {
       ...sanitizeTokenGrant(d.store.snapshot().remoteAccess.tokenGrant),
     })
     await d.remote?.enable()
-    return c.json({ state: d.remote?.state() ?? { kind: 'off' }, token })
+    // Provider choice only — never the token or the URL this just minted (ADR-422 spec 30
+    // §9). `d.telemetry` is optional (absent under tests), same convention as link-admin's
+    // `linkMinted` call site.
+    if (d.telemetry) emit(d.telemetry, remoteAccessEnabled, { provider })
+    const state = d.remote?.state() ?? { kind: 'off' }
+    // `RemoteAccessManager.enable()` runs its own preflight before ever binding anything
+    // (manager.ts) and, on failure, leaves `state()` at 'unavailable'/'needs-setup' instead of
+    // 'connected'. The manager has no `Deps` and cannot emit this itself (by design — see
+    // manager.ts's `onState` doc comment on why persistence-shaped concerns live in the
+    // caller); this is the same enable-time preflight outcome the standalone
+    // `/api/v1/remote/preflight` route above reports for an explicit pre-check.
+    if (d.telemetry && (state.kind === 'unavailable' || state.kind === 'needs-setup')) {
+      emit(d.telemetry, remoteAccessPreflightFailed, { provider, state: state.kind })
+    }
+    return c.json({ state, token })
   })
 
   app.post('/api/v1/remote/stop', async (c) => {
     const refused = guard(c)
     if (refused) return refused
+    const provider = d.store.snapshot().remoteAccess.provider
     d.store.update((cfg) => {
       cfg.remoteAccess.enabled = false
     })
@@ -83,6 +101,7 @@ export function registerRemoteApi(app: Hono, d: Deps): void {
     // failure this feature can have.
     await d.remote?.disable()
     const revoked = revokeRemoteKeys(d)
+    if (d.telemetry) emit(d.telemetry, remoteAccessDisabled, { provider })
     return c.json({ state: d.remote?.state() ?? { kind: 'off' }, revoked })
   })
 
@@ -95,6 +114,14 @@ export function registerRemoteApi(app: Hono, d: Deps): void {
     }
     const { makeProvider } = await import('./providers/factory')
     const state = await makeProvider(provider as RemoteProviderId, d).preflight()
+    // Only the closed `kind` discriminant — never `state.reason`, which is free text meant
+    // for the user's own screen, not the wire (see events/remote.ts's doc comment).
+    if (d.telemetry && (state.kind === 'unavailable' || state.kind === 'needs-setup')) {
+      emit(d.telemetry, remoteAccessPreflightFailed, {
+        provider: provider as RemoteProviderId,
+        state: state.kind,
+      })
+    }
     return c.json({ provider, state })
   })
 }
