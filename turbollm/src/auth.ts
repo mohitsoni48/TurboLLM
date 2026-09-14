@@ -23,6 +23,7 @@ import type { ApiKey } from './config/config'
 import type { Deps } from './deps'
 import { hasCapability } from './link/capabilities'
 import type { LinkCapability, LinkGrant } from './link/types'
+import { tailscaleIdentity } from './remote/identity'
 
 /** Loopback addresses that never require a key, in the forms Node surfaces them
  *  (IPv4, IPv6, and the IPv4-mapped-IPv6 form Windows/dual-stack sockets report). */
@@ -488,6 +489,13 @@ export function lanAuth(d: Deps): MiddlewareHandler {
       exempt: isExempt(c),
     })
     if (allow) return next()
+
+    // Tailscale Serve identity (ADR-422 §6.1): a tailnet-authenticated user needs no shared
+    // secret. Gated on BOTH the ingress socket and the active provider actually being Serve —
+    // Funnel sends no identity headers, so anything claiming one there is a forgery attempt.
+    if (isTunneled(c, d) && d.store.snapshot().remoteAccess.provider === 'tailscale-serve' && tailscaleIdentity(c)) {
+      return next()
+    }
 
     const ingress = isTunneled(c, d)
     if (!verifyPresentedKey(c, d, { ingress })) {
