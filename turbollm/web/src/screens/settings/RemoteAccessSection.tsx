@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { AlertTriangle, Check, Globe, Loader2, Minus, RefreshCw } from 'lucide-react'
 import {
   getRemoteStatus,
+  isPublicProvider,
   preflightRemote,
   startRemote,
   stopRemote,
@@ -13,6 +14,7 @@ import {
 import { ApiError, track } from '../../lib/api'
 import { useSettings } from '../../lib/queries'
 import { PROVIDER_CARDS } from './remote-provider-cards'
+import { ExposureConfirmDialog } from './ExposureConfirmDialog'
 import { Switch } from '../../components/ui/switch'
 import { Button } from '../../components/ui/button'
 import { CopyButton } from '../../components/ui/copy-button'
@@ -25,8 +27,9 @@ const TAILSCALE_PORTS = [443, 8443, 10000] as const
  *  with real costs stated up front (engines-catalog convention — pros/cons only, no prose),
  *  a preflight check that renders each provider's OWN reason rather than a generic red X, and
  *  the on/off switch that starts or stops the tunnel in place — no daemon restart, no model
- *  unload. The exposure-confirmation dialog for publicly reachable providers is Task 16, not
- *  built here — this switch calls startRemote()/stopRemote() directly. */
+ *  unload. Turning it on for a publicly reachable provider raises Task 16's
+ *  {@link ExposureConfirmDialog} first; turning it off, or turning on a tailnet-only provider
+ *  like Tailscale Serve, calls startRemote()/stopRemote() directly with no dialog at all. */
 export function RemoteAccessSection() {
   const { query: settingsQ, save } = useSettings()
   // Not `useRemoteStatus` (remote-api.ts's own export): that hook's internal call to
@@ -46,6 +49,9 @@ export function RemoteAccessSection() {
   const [preflight, setPreflight] = useState<{ provider: RemoteProviderId; state: RemoteState } | null>(null)
   const [preflightingFor, setPreflightingFor] = useState<RemoteProviderId | null>(null)
   const [toggling, setToggling] = useState(false)
+  // Set when the switch is flipped on for a publicly reachable provider, to hold
+  // ExposureConfirmDialog open until the user actually confirms (Task 16, spec 30 §7.2).
+  const [pendingEnable, setPendingEnable] = useState(false)
 
   // Per-provider field drafts, seeded once from settings then locally edited. Secrets
   // (cfToken/ngrokToken) start blank — they are write-only, never echoed back (same posture
@@ -135,14 +141,36 @@ export function RemoteAccessSection() {
 
   const enabled = !!status?.enabled && status.state.kind !== 'off'
 
-  const onToggle = (checked: boolean) => {
+  // Shared by the direct-start path (non-public provider, or Retry below) and the
+  // confirmed-start path (public provider, after ExposureConfirmDialog's onConfirm) — same
+  // tracking event, refetch and error handling either way.
+  const doStart = () => {
     setToggling(true)
-    track('settings', checked ? 'start_remote' : 'stop_remote')
-    const action = checked ? startRemote() : stopRemote()
-    void action
+    track('settings', 'start_remote')
+    void startRemote()
       .then(() => statusQ.refetch())
       .catch((e) => toast.error(e instanceof ApiError ? e.message : 'Could not update remote access.'))
       .finally(() => setToggling(false))
+  }
+
+  const onToggle = (checked: boolean) => {
+    if (!checked) {
+      setToggling(true)
+      track('settings', 'stop_remote')
+      void stopRemote()
+        .then(() => statusQ.refetch())
+        .catch((e) => toast.error(e instanceof ApiError ? e.message : 'Could not update remote access.'))
+        .finally(() => setToggling(false))
+      return
+    }
+    // Publicly reachable provider: hold off starting until ExposureConfirmDialog's onConfirm.
+    // Tailscale Serve (and any other non-public provider) is tailnet-only, so the dialog would
+    // render null anyway — start directly with no confirmation, per Task 15's existing test.
+    if (isPublicProvider(provider)) {
+      setPendingEnable(true)
+      return
+    }
+    doStart()
   }
 
   return (
@@ -323,9 +351,22 @@ export function RemoteAccessSection() {
           <Switch aria-label="Remote access" checked={enabled} onCheckedChange={onToggle} disabled={toggling} />
         </div>
         <div className="mt-3">
-          <LiveStateBlock status={status} onRetry={() => onToggle(true)} />
+          {/* Retry re-attempts a start the user already consented to when they first flipped the
+              switch on — it must not re-raise the exposure confirmation, so it calls doStart()
+              directly rather than onToggle(true). */}
+          <LiveStateBlock status={status} onRetry={doStart} />
         </div>
       </div>
+
+      <ExposureConfirmDialog
+        provider={provider}
+        open={pendingEnable}
+        onConfirm={() => {
+          setPendingEnable(false)
+          doStart()
+        }}
+        onCancel={() => setPendingEnable(false)}
+      />
     </section>
   )
 }
