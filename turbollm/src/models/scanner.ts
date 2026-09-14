@@ -1,7 +1,8 @@
 // Model discovery (A3, spec 04): scan model directories for GGUFs, parse their
 // headers, group split/mmproj files, and expose a rich model list. Path-cached.
-import { existsSync, lstatSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { basename, dirname, join } from 'node:path'
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { readdir, realpath, stat } from 'node:fs/promises'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { migrateModelKey, type ConfigStore } from '../config/config'
 import { GgufError, type GgufMeta, parseGguf, quantFromName } from '../gguf/gguf'
 
@@ -272,6 +273,29 @@ export class Scanner {
     const e = this.get(key)
     if (!e) throw new ScannerError('no_such_model', 'No model with that key.')
     const paths = this.filesFor(key)
+    // Preflight every shard before removing anything. Linked models remain readable,
+    // but deletion must be performed at their real location, not through an alias.
+    const roots = this.store.snapshot().modelDirs.flatMap((dir) => {
+      try { return [{ path: resolve(dir), real: realpathSync(dir) }] } catch { return [] }
+    })
+    for (const p of paths) {
+      const target = realpathSync(p)
+      const root = roots.filter((r) => isWithin(r.path, resolve(p)))
+        .sort((a, b) => b.path.length - a.path.length)[0]
+      const refuse = () => {
+        throw new ScannerError('unsafe_model_delete',
+          `Cannot delete linked or out-of-root model ${p}. Real target: ${target}. Manage it directly at its real location.`)
+      }
+      if (!root || !roots.some((r) => isWithin(r.real, target))) refuse()
+      // Checking the final component alone misses links in parent directories.
+      let current = resolve(p)
+      while (root) {
+        if (current === root.path && current !== resolve(p)) break
+        if (lstatSync(current).isSymbolicLink()) refuse()
+        if (current === root.path) break
+        current = dirname(current)
+      }
+    }
     if (e.format === 'mlx') {
       rmSync(e.path, { recursive: true, force: true })
     } else {
@@ -289,10 +313,15 @@ export class Scanner {
     try {
       const dirs = this.store.snapshot().modelDirs
       const scan: ScanResult = { ggufs: [], mlxDirs: [] }
-      for (const d of dirs) {
-        if (existsSync(d)) walk(d, scan)
-        await tick()
+      const roots = new Map<string, string>()
+      for (const dir of dirs) {
+        try {
+          const real = await realpath(dir)
+          if (!roots.has(real)) roots.set(real, resolve(dir))
+        } catch { /* missing / inaccessible root */ }
       }
+      const state: WalkState = { directories: new Set(), files: new Set(), roots }
+      for (const dir of roots.values()) await walk(dir, scan, state)
       this.pendingKeyMigrations = []
       const gguf = await this.build(scan.ggufs)
       const mlx = scan.mlxDirs.map((dir) => mlxEntryFor(dir))
@@ -318,6 +347,7 @@ export class Scanner {
     }
 
     const entries: ModelEntry[] = []
+    const seenSplits = new Set<string>()
     for (const [dir, group] of byDir) {
       const mmprojFiles = group.filter((f) => basename(f.path).toLowerCase().includes('mmproj'))
       const modelFiles = group.filter((f) => !basename(f.path).toLowerCase().includes('mmproj'))
@@ -353,6 +383,12 @@ export class Scanner {
       }
       for (const { shards, total } of splits.values()) {
         const present = [...shards.values()].sort((a, b) => a.path.localeCompare(b.path))
+        // Deduplicate complete shard groups, not individual shards: two HF
+        // revisions may share only SOME blobs and both still need all their parts.
+        const identity = JSON.stringify([total, [...shards].sort(([a], [b]) => a - b)
+          .map(([index, file]) => [index, file.realPath])])
+        if (seenSplits.has(identity)) continue
+        seenSplits.add(identity)
         const first = present[0]
         const totalSize = present.reduce((s, x) => s + x.size, 0)
         // Complete only when every index 1..total is present on disk (not merely when the
@@ -498,6 +534,7 @@ export class Scanner {
 }
 
 interface FileInfo {
+  realPath: string
   path: string
   size: number
   mtime: number
@@ -521,33 +558,56 @@ function isMlxModelDir(names: string[]): boolean {
   return hasConfig && hasWeights && hasTokenizer
 }
 
-function walk(dir: string, out: ScanResult): void {
+/** Limit accidental traversal through a link to a filesystem/home root. Directory
+ * I/O is asynchronous so a broad tree or slow mount does not block the daemon. */
+const MAX_SCAN_DEPTH = 32
+
+interface WalkState {
+  directories: Set<string>
+  files: Set<string>
+  roots: Map<string, string>
+}
+
+function isWithin(root: string, path: string): boolean {
+  const rel = relative(root, path)
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
+}
+
+async function walk(dir: string, out: ScanResult, state: WalkState, depth = 0, allowMlx = true): Promise<void> {
+  if (depth > MAX_SCAN_DEPTH) return
   let names: string[]
   try {
-    names = readdirSync(dir)
+    const real = await realpath(dir)
+    // An explicitly configured root owns its directory even when an alias is
+    // encountered first. Sorted children make other alias choices repeatable.
+    const owner = state.roots.get(real)
+    if (owner && (depth > 0 || owner !== dir)) return
+    if (state.directories.has(real)) return
+    state.directories.add(real) // don't retry unreadable directories via aliases
+    names = (await readdir(dir)).sort()
   } catch {
-    return // permission / gone
+    return // permission / gone / broken link
   }
-  // An MLX model is a whole directory — record it and don't descend (the shards
-  // and tokenizer live inside).
-  if (isMlxModelDir(names)) {
-    out.mlxDirs.push(dir)
-    return
-  }
+  const mlx = isMlxModelDir(names)
+  if (mlx && allowMlx) out.mlxDirs.push(dir)
+  // Still discover GGUF variants, but don't turn training checkpoints into new
+  // Safetensors models. A checkpoint can be opted into as an explicit root.
   for (const name of names) {
     if (name === '.git' || name === 'node_modules') continue
     const full = join(dir, name)
-    let st
     try {
-      st = lstatSync(full)
-    } catch {
-      continue
-    }
-    if (st.isSymbolicLink()) continue // avoid cycles
-    if (st.isDirectory()) walk(full, out)
-    else if (st.isFile() && name.toLowerCase().endsWith('.gguf') && st.size >= 1 << 20) {
-      out.ggufs.push({ path: full, size: st.size, mtime: st.mtimeMs })
-    }
+      const st = await stat(full)
+      if (st.isDirectory()) await walk(full, out, state, depth + 1, allowMlx && !mlx)
+      else if (st.isFile() && name.toLowerCase().endsWith('.gguf') && st.size >= 1 << 20) {
+        const real = await realpath(full)
+        // Projectors are shared per directory; shards are deduped as groups in
+        // build(). Dropping either here would break another model's companions.
+        const companion = name.toLowerCase().includes('mmproj') || SPLIT_RE.test(name)
+        if (!companion && state.files.has(real)) continue
+        state.files.add(real)
+        out.ggufs.push({ path: full, realPath: real, size: st.size, mtime: st.mtimeMs })
+      }
+    } catch { /* permission / gone / broken link */ }
   }
 }
 
