@@ -23,6 +23,7 @@ import type { ApiKey } from './config/config'
 import type { Deps } from './deps'
 import { hasCapability } from './link/capabilities'
 import type { LinkCapability, LinkGrant } from './link/types'
+import { fetchJwks, verifyAccessJwt } from './remote/access-jwt'
 import { tailscaleIdentity } from './remote/identity'
 
 /** Loopback addresses that never require a key, in the forms Node surfaces them
@@ -495,6 +496,30 @@ export function lanAuth(d: Deps): MiddlewareHandler {
     // Funnel sends no identity headers, so anything claiming one there is a forgery attempt.
     if (isTunneled(c, d) && d.store.snapshot().remoteAccess.provider === 'tailscale-serve' && tailscaleIdentity(c)) {
       return next()
+    }
+
+    // Cloudflare Access (ADR-422 §6.2). When requireAccess is on, a valid assertion is the
+    // ONLY way through on ingress — the bearer token is replaced, not supplemented. When it
+    // is off, a valid assertion is accepted in addition to a token.
+    const ra = d.store.snapshot().remoteAccess
+    if (isTunneled(c, d) && ra.cloudflare.accessTeamDomain && ra.cloudflare.accessAud) {
+      const assertion = c.req.header('Cf-Access-Jwt-Assertion') ?? ''
+      if (assertion) {
+        const jwks = await fetchJwks(ra.cloudflare.accessTeamDomain).catch(() => null)
+        if (jwks) {
+          const res = await verifyAccessJwt(assertion, {
+            teamDomain: ra.cloudflare.accessTeamDomain,
+            aud: ra.cloudflare.accessAud,
+            jwks,
+          })
+          if (res.ok) return next()
+          if (ra.cloudflare.requireAccess) {
+            return c.json({ error: { code: 'unauthorized', message: `Cloudflare Access: ${res.reason}` } }, 401)
+          }
+        }
+      } else if (ra.cloudflare.requireAccess) {
+        return c.json({ error: { code: 'unauthorized', message: 'Cloudflare Access sign-in is required.' } }, 401)
+      }
     }
 
     const ingress = isTunneled(c, d)
