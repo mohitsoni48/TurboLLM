@@ -387,7 +387,10 @@ test('turning the flag back on restores the fleet with no relink and no restart'
 
   const on = await app.request('/api/link/v1/hello', { method: 'POST', headers: { 'X-TurboLLM-Auth': 'tllm-a' } })
   assert.equal(on.status, 200)
-  assert.equal((await adminApp.request('/api/v1/links')).status, 200)
+  // C1 (Phase 5 final review): hostGate now requires THIS request to have actually resolved
+  // to a real stored key rather than trusting `requireApiKey === true` alone — present the
+  // same token already stored in this fixture (`key('tllm-a', ...)`, mkDeps above).
+  assert.equal((await adminApp.request('/api/v1/links', { headers: { 'X-TurboLLM-Auth': 'tllm-a' } })).status, 200)
   await cat.refresh()
   assert.equal(cat.models().length, 1, 'remote models must come back on the first refresh')
   assert.ok(cat.linkByName('workstation'), 'the existing link must still be addressable by name')

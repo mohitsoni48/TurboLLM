@@ -10,6 +10,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Hono } from 'hono'
 import { registerApi } from './routes'
+import { hashKey } from '../auth'
 import type { Deps } from '../deps'
 
 type FakeConfig = { daemon: { lanBind: boolean; requireApiKey: boolean; port: number }; apiKeys: Array<{ id: string; name: string; hash: string; prefix: string; createdAt: string; lastUsedAt: string | null }> }
@@ -49,8 +50,15 @@ test('GET /api/v1/keys: 200 when lanBind is off (loopback-only bind — always l
 })
 
 test('GET /api/v1/keys: 200 for a non-host caller once requireApiKey is already on (self-service is fine post-auth)', async () => {
-  const { app } = fakeApp(baseConfig({ lanBind: true, requireApiKey: true }))
-  const res = await app.request('/api/v1/keys')
+  // C1 (Phase 5 final review): hostGate no longer treats `requireApiKey === true` alone as
+  // proof of authentication — it requires THIS request to have actually resolved to a real
+  // stored key, exactly what `lanAuth` running in front of this route in the real server
+  // would have already verified. Present one here to model that.
+  const RAW = 'tllm-selfservicekeyselfservicekeyselfse1'
+  const cfg = baseConfig({ lanBind: true, requireApiKey: true })
+  cfg.apiKeys.push({ id: 'k1', name: 'self', hash: hashKey(RAW), prefix: RAW.slice(0, 12), createdAt: '', lastUsedAt: null })
+  const { app } = fakeApp(cfg)
+  const res = await app.request('/api/v1/keys', { headers: { 'X-TurboLLM-Auth': RAW } })
   assert.equal(res.status, 200)
 })
 
@@ -123,7 +131,12 @@ test('GET /api/v1/connect/:cli: 200 with a real live key when lanBind is off (lo
 })
 
 test('GET /api/v1/connect/:cli: 200 for a non-host caller once requireApiKey is already on (self-service is fine post-auth)', async () => {
-  const { app } = fakeApp(baseConfig({ lanBind: true, requireApiKey: true }))
-  const res = await app.request('/api/v1/connect/claude-code')
+  // C1 (Phase 5 final review): see the matching /api/v1/keys test above — hostGate now needs
+  // THIS request to have actually resolved to a real stored key.
+  const RAW = 'tllm-connectselfservicekeyconnectselfse1'
+  const cfg = baseConfig({ lanBind: true, requireApiKey: true })
+  cfg.apiKeys.push({ id: 'k1', name: 'self', hash: hashKey(RAW), prefix: RAW.slice(0, 12), createdAt: '', lastUsedAt: null })
+  const { app } = fakeApp(cfg)
+  const res = await app.request('/api/v1/connect/claude-code', { headers: { 'X-TurboLLM-Auth': RAW } })
   assert.equal(res.status, 200)
 })

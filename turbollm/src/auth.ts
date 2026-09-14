@@ -267,15 +267,25 @@ export function isLocalRequest(c: Context, d: Deps): boolean {
 }
 
 /** The gate every CREDENTIAL-MANAGEMENT route must carry: host-only while the LAN is open
- *  and unauthenticated (lanBind on, requireApiKey off), unrestricted once a key is required.
+ *  and unauthenticated (lanBind on, requireApiKey off), otherwise open to any caller who has
+ *  ALREADY presented a real, stored key for THIS request.
  *
  *  lanAuth's `bypassesAuth` deliberately lets that lanBind-on/requireApiKey-off combination
  *  through with NO credential at all (spec 06 §5's "opted into open LAN access"), which is
  *  fine for chat/models but would let any device that can merely load the page mint itself a
  *  durable key — a real self-escalation, since that key keeps working even after
- *  requireApiKey is later turned on. Once requireApiKey IS on, a non-host caller only reaches
- *  the handler at all by having already presented a valid key (lanAuth ran first), so
- *  self-service key management from another device is fine then.
+ *  requireApiKey is later turned on.
+ *
+ *  C1 (Phase 5 final review): this used to read `daemon.requireApiKey === true` as proof the
+ *  caller was authenticated, which was true only as long as the ONLY way past `lanAuth`
+ *  without a key was being local. Tasks 20/21 (Tailscale/Cloudflare Access identity) added
+ *  `return next()` paths in `lanAuth` that let a request through with NO key presented at
+ *  all — so once `requireApiKey` was on (the shipped default), an unauthenticated tailnet
+ *  member or Access user could reach `POST /api/v1/keys` and mint a permanent, unscoped,
+ *  un-revocable-by-`/stop` credential. `resolveKey` answers the question this gate actually
+ *  needs asked — "did THIS request resolve to a real stored key?" — rather than "does global
+ *  policy demand one", so an identity-only caller (no key at all) is correctly refused here
+ *  even while being waved through the ordinary chat/models surface.
  *
  *  Lives here rather than inside `registerApi` so `/api/v1/keys`, `/api/v1/connect/:cli` and
  *  Turbo Link's `/api/v1/links*` (ADR-376) share ONE predicate — the v1.9.0 pre-release
@@ -283,7 +293,7 @@ export function isLocalRequest(c: Context, d: Deps): boolean {
  *  review found it missing again on `POST /api/v1/links/mint`, both because it was a private
  *  local function nothing new could reuse. */
 export function hostGate(c: Context, d: Deps): boolean {
-  return isLocalRequest(c, d) || d.store.snapshot().daemon.requireApiKey === true
+  return isLocalRequest(c, d) || !!resolveKey(c, d)
 }
 
 /** Same decision as {@link isLocalRequest}, for the one surface that has no Hono `Context`:
@@ -410,11 +420,42 @@ export function requiredCapability(method: string, path: string): LinkCapability
   const m = method.toUpperCase()
   const read = m === 'GET' || m === 'HEAD'
   if (path.startsWith('/v1/')) return 'models:use'
-  if (path.startsWith('/api/v1/chat')) return 'models:use'
+  // I4 (Phase 5 final review): narrowed from a bare `startsWith('/api/v1/chat')`, which also
+  // matched `/api/v1/chat-agents*` and so mapped a chat-agent-definition WRITE — capable of
+  // rewriting a built-in agent's system prompt/tool allow-list, or deleting a custom one — to
+  // the minimum capability the product ever mints (`models:use`, config.ts's default
+  // tokenGrant). Chat-agents get their own, deliberate mapping just below instead.
+  if (path === '/api/v1/chat' || path.startsWith('/api/v1/chat/')) return 'models:use'
+  // A chat-agent-definition READ is as low-risk as reading the model list; a WRITE rewrites
+  // what a model is told to do (system prompt, tool allow-list) or deletes a saved one — that
+  // is a configuration change, not a chat action (I4).
+  if (path.startsWith('/api/v1/chat-agents')) return read ? 'models:use' : 'config:write'
+  // I3 (Phase 5 final review): permanent, irreversible deletion of a model's own file(s) from
+  // disk (scanner.delete -> rmSync) is never authorized for a remote grant, at ANY capability
+  // — unlike load/unload (`models:load`, below) or a model's saved presets (M6, unreviewed but
+  // lower-stakes, deliberately left as-is). Matched narrowly — exactly one path segment after
+  // `/models/`, no further subpath — so it catches only `DELETE /api/v1/models/:key`.
+  if (m === 'DELETE' && /^\/api\/v1\/models\/[^/]+$/.test(path)) return null
   if (path === '/api/v1/models' || path.startsWith('/api/v1/models/')) return read ? 'models:use' : 'models:load'
   if (path.startsWith('/api/v1/downloads')) return read ? 'downloads:read' : 'downloads:write'
   if (path.startsWith('/api/v1/settings')) return read ? 'config:read' : 'config:write'
   if (path === '/api/v1/status') return 'config:read'
+  // C2 (Phase 5 final review): the actual chat surface the web SPA calls — conversations
+  // (send/edit/regenerate/branch/tool-approval/folder-move/save-skill/export/share/import),
+  // folders, auto-memory, the tool catalog, and (read-only) hardware info. None of it touches
+  // model files, daemon settings or downloads, so it is exactly what `models:use` is for.
+  // Without this, a token minted from the Phase 5 UI's own picker (`models:use` at minimum)
+  // could reach `/v1/*` and `/api/v1/models` and nothing else — every real chat screen 403'd,
+  // including the feature's own headline "scan the QR, chat from your phone" journey.
+  // Deliberately NOT `/api/v1/status` or `/api/v1/settings`, above — see their own comments:
+  // status carries the engine's launchCommand (absolute binary/model paths) and raw stderr
+  // (which routinely echoes paths too) — a genuine filesystem-detail boundary, not an
+  // oversight this fix widens.
+  if (path === '/api/v1/sysinfo') return 'models:use'
+  if (path === '/api/v1/tools') return 'models:use'
+  if (path === '/api/v1/memory' || path.startsWith('/api/v1/memory/')) return 'models:use'
+  if (path === '/api/v1/folders' || path.startsWith('/api/v1/folders/')) return 'models:use'
+  if (path === '/api/v1/conversations' || path.startsWith('/api/v1/conversations/')) return 'models:use'
   return null
 }
 
@@ -501,9 +542,23 @@ export function lanAuth(d: Deps): MiddlewareHandler {
     // Cloudflare Access (ADR-422 §6.2). When requireAccess is on, a valid assertion is the
     // ONLY way through on ingress — the bearer token is replaced, not supplemented. When it
     // is off, a valid assertion is accepted in addition to a token.
+    //
+    // C3/I6 (Phase 5 final review): gated on `ra.provider === 'cloudflare-named'`, matching
+    // Task 20's own discipline one block above (which this block originally lacked).
+    // `accessTeamDomain`/`accessAud` are plain persisted strings that survive a provider
+    // switch (config.ts keeps them, and the settings PATCH updates them independently of
+    // `provider`), so without this check a leftover Access config from a past
+    // `cloudflare-named` setup either bricks auth on every OTHER provider (`requireAccess:
+    // true` — the error names a Cloudflare product the user isn't even using) or lets a
+    // captured/replayed Access JWT bypass auth entirely on them (`requireAccess: false`, since
+    // this block's `next()` skips the capability check too). It also made `requireAccess`
+    // silently unenforced on Tailscale Serve (I6): Task 20's own provider-gated block ran
+    // first and won, so an operator who believed "Access is mandatory" got an unauthenticated
+    // pass-through instead.
     const ra = d.store.snapshot().remoteAccess
-    if (isTunneled(c, d) && ra.cloudflare.accessTeamDomain && ra.cloudflare.accessAud) {
+    if (isTunneled(c, d) && ra.provider === 'cloudflare-named' && ra.cloudflare.accessTeamDomain && ra.cloudflare.accessAud) {
       const assertion = c.req.header('Cf-Access-Jwt-Assertion') ?? ''
+      let verified = false
       if (assertion) {
         const jwks = await fetchJwks(ra.cloudflare.accessTeamDomain).catch(() => null)
         if (jwks) {
@@ -512,12 +567,18 @@ export function lanAuth(d: Deps): MiddlewareHandler {
             aud: ra.cloudflare.accessAud,
             jwks,
           })
-          if (res.ok) return next()
-          if (ra.cloudflare.requireAccess) {
-            return c.json({ error: { code: 'unauthorized', message: `Cloudflare Access: ${res.reason}` } }, 401)
-          }
+          verified = res.ok
         }
-      } else if (ra.cloudflare.requireAccess) {
+      }
+      if (verified) return next()
+      // I2 (Phase 5 final review): `requireAccess: true` must refuse whenever control reaches
+      // here WITHOUT a genuinely verified assertion, for ANY reason — none presented, one that
+      // failed verification, or a JWKS fetch that itself failed. The previous structure only
+      // refused the "no assertion at all" case; a JUNK assertion sent during a JWKS outage hit
+      // neither branch and silently fell through to the ordinary bearer check instead, so the
+      // "the bearer token is replaced, not supplemented" guarantee held for an attacker who
+      // sent nothing and evaporated for one who sent garbage.
+      if (ra.cloudflare.requireAccess) {
         return c.json({ error: { code: 'unauthorized', message: 'Cloudflare Access sign-in is required.' } }, 401)
       }
     }

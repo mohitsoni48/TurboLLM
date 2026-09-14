@@ -7,6 +7,7 @@ import { Hono } from 'hono'
 import { registerLinkAdminRoutes } from './link-admin-routes'
 import { decodeLinkString, encodeLinkString } from '../link/link-string'
 import { LINK_PRESETS } from '../link/capabilities'
+import { hashKey } from '../auth'
 import { Emitter } from '../telemetry/emit'
 import { readQueue } from '../telemetry/queue'
 import type { Deps } from '../deps'
@@ -491,8 +492,17 @@ for (const route of GATED_ROUTES) {
   })
 
   test(`${route.label} is allowed once "Require an API key" is on (lanAuth verified the key first)`, async () => {
-    const { app } = mkApp(async () => { throw new TypeError('fetch failed') }, undefined, LOCKED_LAN)
-    const res = await app.request(route.path, route.init)
+    // C1 (Phase 5 final review): hostGate no longer treats `requireApiKey === true` alone as
+    // proof of authentication — it requires THIS request to have actually resolved to a real
+    // stored key, exactly what `lanAuth` running in front of this route in the real server
+    // would have already verified before ever reaching here. Present one to model that.
+    const RAW = 'tllm-hostgatekeyhostgatekeyhostgatekey01'
+    const { app, cfg } = mkApp(async () => { throw new TypeError('fetch failed') }, undefined, LOCKED_LAN)
+    ;(cfg.apiKeys as unknown[]).push({ id: 'k1', name: 'x', hash: hashKey(RAW), prefix: RAW.slice(0, 12), createdAt: '', lastUsedAt: null })
+    const res = await app.request(route.path, {
+      ...route.init,
+      headers: { ...(route.init?.headers ?? {}), 'X-TurboLLM-Auth': RAW },
+    })
     assert.notEqual(res.status, 403)
   })
 }
