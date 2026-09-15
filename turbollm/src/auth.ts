@@ -245,11 +245,25 @@ export function localPort(c: Context): number | undefined {
  *  Cloudflare's edge controlled the header; Tailscale Funnel, ngrok and a user-run frp inject
  *  no equivalent, so a header-based signal would have read every one of them as a trusted
  *  loopback caller and waved them through with no key at all. The socket cannot be forged in
- *  either direction. */
+ *  either direction.
+ *
+ *  Fails CLOSED, not open, when remote access is live but `localPort()` can't read it: it
+ *  returns `true` (treat as tunneled) rather than `false`. `localPort()` reads an undocumented
+ *  `@hono/node-server` internal under a `^2.1.0` caret range — verified correct against the
+ *  installed version today, but a future patch/minor bump could silently reshape it, and
+ *  `localPort()` swallows that as `undefined` rather than throwing. Reading "undetermined" as
+ *  "not tunneled" would be catastrophic here: a tunneled connection's REMOTE address is
+ *  loopback by construction (the provider's local leg proxies through 127.0.0.1), so
+ *  `isLocalRequest` would then also read it as genuinely local and grant it trust reserved for
+ *  the box's own local-admin actions (add/scan engine, build-from-source — arbitrary binary
+ *  execution). Reading "undetermined" as "tunneled" instead just asks an actually-local caller
+ *  for a key it may not always have — a loud, debuggable failure instead of a silent one. */
 function isTunneled(c: Context, d: Deps): boolean {
   const ingress = d.remote?.ingressPort()
   if (ingress === undefined) return false
-  return localPort(c) === ingress
+  const port = localPort(c)
+  if (port === undefined) return true
+  return port === ingress
 }
 
 /** True when a request is local to the daemon host: either the daemon is loopback-only
@@ -313,7 +327,12 @@ export function hostGate(c: Context, d: Deps): boolean {
 /** Same decision as {@link isLocalRequest}, for the one surface that has no Hono `Context`:
  *  the raw `http.Server` 'upgrade' event a WebSocket handshake arrives on
  *  (registerTerminalWs). Takes the socket's remote address and LOCAL port directly instead
- *  of pulling them off a Context — the local port is the ingress signal (ADR-422). */
+ *  of pulling them off a Context — the local port is the ingress signal (ADR-422).
+ *
+ *  Same fail-closed discipline as {@link isTunneled}: when remote access is live (`ingress`
+ *  is defined) but the socket's local port is somehow undetermined, this must NOT read as
+ *  "not tunneled" — that would let a tunneled connection (loopback by construction on its
+ *  remote address) fall through to the loopback check below and be trusted as local. */
 export function isLocalUpgrade(
   remoteAddress: string | undefined,
   socketLocalPort: number | undefined,
@@ -321,8 +340,10 @@ export function isLocalUpgrade(
   d: Deps,
 ): boolean {
   const ingress = d.remote?.ingressPort()
-  const tunneled = ingress !== undefined && socketLocalPort === ingress
-  if (tunneled) return false
+  if (ingress !== undefined) {
+    if (socketLocalPort === undefined) return false
+    if (socketLocalPort === ingress) return false
+  }
   if (!d.store.snapshot().daemon.lanBind) return true // loopback-only bind → always local
   return !!remoteAddress && LOOPBACK.has(remoteAddress)
 }

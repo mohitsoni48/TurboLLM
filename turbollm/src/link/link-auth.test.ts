@@ -19,11 +19,11 @@ function depsWith(keys: ApiKey[], daemon: { lanBind: boolean; requireApiKey: boo
   } as unknown as Deps
 }
 
-function keyFor(raw: string, caps?: string[]): ApiKey {
+function keyFor(raw: string, caps?: string[], kind?: 'link' | 'remote'): ApiKey {
   return {
     id: randomUUID(), name: 'peer', hash: createHash('sha256').update(raw).digest('hex'),
     prefix: raw.slice(0, 12), createdAt: 'c', lastUsedAt: null,
-    ...(caps ? { grant: { capabilities: caps as never } } : {}),
+    ...(caps ? { grant: { capabilities: caps as never, ...(kind ? { kind } : {}) } } : {}),
   }
 }
 
@@ -73,6 +73,12 @@ test('accepts a legacy full-access key (no grant)', async () => {
   const app = appWith(depsWith([keyFor('tllm-legacy')], { lanBind: true, requireApiKey: true }))
   const res = await app.request('/api/link/v1/ping', { headers: { 'X-TurboLLM-Auth': 'tllm-legacy' } })
   assert.equal(res.status, 200)
+})
+
+test('refuses a remote-kind token (ADR-422) even though resolveKey matches it by hash — a different façade, a different peer', async () => {
+  const app = appWith(depsWith([keyFor('tllm-remote', ['models:use'], 'remote')], { lanBind: true, requireApiKey: true }))
+  const res = await app.request('/api/link/v1/ping', { headers: { 'X-TurboLLM-Auth': 'tllm-remote' } })
+  assert.equal(res.status, 401)
 })
 
 // ── Capability gating

@@ -69,8 +69,15 @@ export function ExposureConfirmDialog({
           <AlertDialogTitle>This machine becomes reachable from the internet</AlertDialogTitle>
           <AlertDialogDescription>
             {card.title} will publish this daemon at a public URL. Anyone who has that URL and the
-            access token can chat with your models and use your hardware. The token is required —
-            requests over the tunnel are never let through without one.
+            access token can chat with your models and use your hardware.{' '}
+            {provider === 'cloudflare-named'
+              ? // Overstated before this fix: with Cloudflare Access turned on for this
+                // tunnel, auth.ts accepts a valid Access sign-in IN PLACE OF the token, not
+                // in addition to it (see lanAuth's "the bearer token is replaced, not
+                // supplemented" comment) — so "never let through without [the token]" was
+                // false for this one provider specifically.
+                'A request needs the token — or, if you turn on Cloudflare Access for this tunnel, a valid Access sign-in works instead. Either way, nothing gets through unauthenticated.'
+              : 'The token is required — requests over the tunnel are never let through without one.'}
           </AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>

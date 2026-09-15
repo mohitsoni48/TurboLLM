@@ -173,7 +173,8 @@ function calibratedTokenScale(pool: Message[], realCtxUsed: number | undefined, 
 
 /** Chooses how much of `pool` (already past any earlier compaction cut — see
  *  resolveCompactionCut's `rest`) to fold into a NEW summary, leaving a raw tail sized to
- *  ~40% of ctxMax so the very next reply isn't answered from a summary-only prompt. Always
+ *  ~15% of ctxMax (KEEP_RECENT_FRACTION, above) so the very next reply isn't answered from
+ *  a summary-only prompt. Always
  *  keeps at least the single most recent message in the tail, even if it alone exceeds
  *  budget — an oversized tail is better than an empty one. Returns null when there is
  *  nothing worth compacting: too few messages, or the whole pool already fits the tail
@@ -326,7 +327,10 @@ export async function compactConversation(
  *  already hold the turn's resolved upstream and its AbortController, and a compaction that
  *  guessed either one would be exactly the two defects they exist to prevent (a remote chat
  *  summarized by an unrelated local model, and a Stop that cannot reach an awaited call).
- *  Passed straight through — this function re-resolves nothing. */
+ *  Passed straight through — this function re-resolves nothing. `fetchImpl` is test-only
+ *  (production call sites never pass it, so `compactConversation` uses the real global
+ *  `fetch`) — a real parameter rather than a magic property smuggled onto `d`, so a test
+ *  double can never be mistaken for daemon state. */
 export async function maybeAutoCompact(
   d: Deps,
   convId: string,
@@ -334,12 +338,12 @@ export async function maybeAutoCompact(
   upstream: ChatUpstream,
   signal: AbortSignal,
   emitCompactionEvent: (phase: 'start' | 'end') => Promise<void>,
+  fetchImpl?: typeof fetch,
 ): Promise<void> {
   const { ctxUsed, ctxMax } = lastCtxUsage(conv.messages ?? [])
   if (!shouldAutoCompact(ctxUsed, ctxMax)) return
   try { await emitCompactionEvent('start') } catch { /* client gone — same best-effort contract as the compaction call below */ }
   try {
-    const fetchImpl = (d as unknown as { __fetchImplForTest?: typeof fetch }).__fetchImplForTest
     const result = await compactConversation(d, convId, { upstream, signal, ...(fetchImpl ? { fetchImpl } : {}) })
     conv.compactionSummary = result.summary
     conv.compactionUpToMessageId = result.upToMessageId

@@ -198,6 +198,19 @@ for (const format of ['gguf', 'mlx'] as const) {
   })
 }
 
+test('deleting a model whose file already vanished from disk raises no_such_model, not a raw ENOENT', async (t) => {
+  // A stale scan entry — an external process removed the file, or a race with another
+  // delete — must not let realpathSync's raw ENOENT escape as an unhandled error (the API
+  // route only recognizes ScannerError; anything else falls through to a bare 500).
+  const f = fixture(t)
+  const path = gguf(f.library)
+  const s = f.scanner()
+  await s.rescan()
+  const key = s.list().models[0].key
+  rmSync(path, { force: true })
+  await assert.rejects(s.delete(key), { code: 'no_such_model' })
+})
+
 test('deep trees are bounded and scanning yields within one root', async (t) => {
   const f = fixture(t)
   const shallow = gguf(f.library)

@@ -20,7 +20,23 @@
  *  six short ids (`cloudflare-quick`, `tailscale-serve`, …) — never a URL, hostname or token. */
 
 import { defineEvent, f } from '../core/define'
-import { REMOTE_PROVIDERS } from '../../config/config'
+
+/** Mirrors `RemoteProviderId` (config/config.ts)'s six provider ids, duplicated as a literal
+ *  rather than imported as a runtime value: config.ts pulls in `node:fs`/`node:os`/`node:crypto`
+ *  at module scope for the desktop/CLI daemon, which the Cloudflare Worker cannot bundle
+ *  (schema.ts's whole point is staying import-safe for the Worker — see its header comment).
+ *  Same discipline as REMOTE_STATE_TRANSITIONS/REMOTE_PREFLIGHT_FAILURE_KINDS below.
+ *  `remote.test.ts` imports the real REMOTE_PROVIDERS from config.ts and iterates it against
+ *  this file's event schemas, so a provider added to one list and not the other fails a test
+ *  instead of silently drifting. */
+const REMOTE_PROVIDERS = [
+  'cloudflare-quick',
+  'cloudflare-named',
+  'tailscale-serve',
+  'tailscale-funnel',
+  'ngrok',
+  'custom',
+] as const
 
 export const remoteAccessEnabled = defineEvent({
   name: 'remote_access_enabled',

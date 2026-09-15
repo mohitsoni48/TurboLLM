@@ -20,14 +20,20 @@ test('ngrok: preflight is ready with an authtoken', async () => {
   assert.equal((await new NgrokProvider('/tmp/data', cfg).preflight()).kind, 'off')
 })
 
-test('ngrok: argv targets the ingress port and carries the authtoken', () => {
+test('ngrok: argv targets the ingress port and never carries the authtoken', () => {
   const p = new NgrokProvider('/tmp/data', cfg)
-  assert.deepEqual(p.argv(6997), ['http', '6997', '--authtoken', '2abcDEF', '--log', 'stdout'])
+  assert.deepEqual(p.argv(6997), ['http', '6997', '--log', 'stdout'])
 })
 
-test('ngrok: a reserved domain is passed through when set', () => {
+test('ngrok: a reserved domain is passed through when set, still with no authtoken in argv', () => {
   const p = new NgrokProvider('/tmp/data', { authtoken: '2abcDEF', domain: 'llm.ngrok.app' })
-  assert.deepEqual(p.argv(6997), ['http', '6997', '--authtoken', '2abcDEF', '--log', 'stdout', '--domain', 'llm.ngrok.app'])
+  assert.deepEqual(p.argv(6997), ['http', '6997', '--log', 'stdout', '--domain', 'llm.ngrok.app'])
+})
+
+test('ngrok: the authtoken travels as NGROK_AUTHTOKEN, not argv — readable via /proc/*/cmdline otherwise', () => {
+  const p = new NgrokProvider('/tmp/data', cfg)
+  assert.deepEqual(p.env(), { NGROK_AUTHTOKEN: '2abcDEF' })
+  assert.equal(JSON.stringify(p.argv(6997)).includes('2abcDEF'), false)
 })
 
 test('ngrok: parses the assigned URL out of its log line', () => {

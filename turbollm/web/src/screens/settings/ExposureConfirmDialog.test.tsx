@@ -13,6 +13,13 @@ describe('ExposureConfirmDialog', () => {
   it('says an access token will be required', () => {
     render(<ExposureConfirmDialog provider="ngrok" open onConfirm={vi.fn()} onCancel={vi.fn()} />)
     expect(screen.getByText(/access token/i)).toBeTruthy()
+    expect(screen.getByText(/never let through without one/i)).toBeTruthy()
+  })
+
+  it('cloudflare-named names the Access sign-in exception instead of the blanket "never without one" claim, since auth.ts accepts a valid Access assertion in place of the token there', () => {
+    render(<ExposureConfirmDialog provider="cloudflare-named" open onConfirm={vi.fn()} onCancel={vi.fn()} />)
+    expect(screen.getByText(/Access sign-in works instead/i)).toBeTruthy()
+    expect(screen.queryByText(/never let through without one/i)).toBeNull()
   })
 
   it('confirming calls onConfirm exactly once', async () => {
