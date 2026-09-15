@@ -4,7 +4,14 @@ import { openSync, readFileSync } from 'node:fs'
 import { serve } from '@hono/node-server'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { ConfigStore, defaultConfig, defaultConfigPath, resolveConfiguredCtx, migrateLegacyDataDir } from './config/config'
+import {
+  ConfigStore,
+  defaultConfig,
+  defaultConfigPath,
+  resolveConfiguredCtx,
+  migrateLegacyDataDir,
+  resolveIngressPort,
+} from './config/config'
 import { setGithubTokenProvider } from './engines/download'
 import { Manager, killTrackedEnginesSync, reapStaleEngines } from './engines/manager'
 import { ComfyGuard } from './engines/comfy-guard'
@@ -52,7 +59,13 @@ import { registerTerminalWs } from './terminal/terminal-routes'
 import { reapStaleTerminals, killTrackedTerminalsSync } from './terminal/terminal-manager'
 import { provisionBootstrapApiKey, provisionTunnelApiKey } from './auth'
 import { getAdvertisedHost } from './net'
-import { TunnelManager, reapStaleTunnels, killTrackedTunnelsSync } from './tunnel/manager'
+import { reapStaleTunnels, killTrackedTunnelsSync } from './remote/child-process'
+import { reconcileTailscale } from './remote/providers/tailscale'
+import { RemoteAccessManager } from './remote/manager'
+import { makeProvider } from './remote/providers/factory'
+import { probeUrl } from './remote/health'
+import { isRemoteAccessEnabled } from './remote/gate'
+import type { RemoteState } from './remote/types'
 import { LinkManager } from './link/link-manager'
 import { RemoteCatalog } from './link/remote-catalog'
 import { isTurboLinkEnabled } from './link/gate'
@@ -65,6 +78,7 @@ import { emit } from './telemetry/runtime/typed-emit'
 import { modelLoad, modelDownloaded, buildModelLoadConfig } from './telemetry/events/model'
 import { engineInstalled } from './telemetry/events/engine'
 import { appUpdateAvailable, appUpdateApplied, appUpdateFailed } from './telemetry/events/app-update'
+import { remoteAccessState } from './telemetry/events/remote'
 import { checkDailyQueryRollups } from './telemetry/runtime/daily-query-rollups'
 import { markEverLoadedModel } from './api/onboarding-routes'
 
@@ -325,6 +339,27 @@ try {
   const reapedTunnels = reapStaleTunnels(store.dir())
   if (reapedTunnels > 0) console.log(`reaped ${reapedTunnels} orphaned tunnel process(es) from a previous run`)
 } catch { /* best-effort */ }
+// system-state equivalent of the reap above (ADR-422): an unclean exit can leave a Tailscale
+// serve/funnel pointing at our ingress port. Deliberately UNGATED (runs regardless of
+// `remoteAccess.enabled` or the experimental flag) and keyed off OBSERVED status rather than
+// desired config (ADR-422 Phase 3 final review, finding I1) — config-keyed reconciliation had
+// a false negative whenever the provider was switched away from Tailscale, or the
+// experimental flag was turned off while `enabled: true` was still persisted, in both of
+// which cases nothing would ever have reconciled a real leftover funnel again. Started here
+// (fire-and-forget, so it never delays app boot) but its promise is captured and AWAITED
+// below, right before the supervisor's own enable() call — a comment asserting "this runs
+// before enable()" is not the same as an ordering guarantee, and two independent `tailscale`
+// CLI spawns racing the HTTP listen callback on a cold box is a real, not theoretical,
+// interleaving (ADR-422 Phase 3 final-review fix wave re-review, New Breakage #1): without the
+// await, reconcile's `serve … off` can land on the serve enable() just created, silently
+// un-exposing a tunnel the UI still reports as connected. If config genuinely still wants this
+// exact provider, enable() re-issues the identical serve/funnel command right after this
+// resolves, so the sequencing is at worst a harmless off-then-on, never a lost update.
+const reconcileTailscalePromise = reconcileTailscale(
+  resolveIngressPort(store.snapshot().remoteAccess.ingressPort, store.snapshot().daemon.port),
+).then((acted) => {
+  if (acted) console.log('reset a Tailscale serve/funnel left over from a previous run')
+}).catch(() => { /* best-effort, same posture as the other startup reaps above */ })
 // Same idea for terminal-agent CLI processes (claude/pi/opencode) orphaned by an unclean
 // previous shutdown — see terminal-manager.ts's pidfile-tracking header for why this
 // mattered in practice (found live: 11 leaked claude.exe processes after a day of testing).
@@ -655,11 +690,6 @@ setInterval(() => telemetry.flushUiDailyUsage(), 5 * 60_000).unref()
 // daily-query-rollups.ts) rather than an in-memory accumulator, so there is no
 // separate "persist what's in progress" call to also wire here.
 setInterval(() => checkDailyQueryRollups(store.dir(), db, telemetry), 5 * 60_000).unref()
-// Cloud Launch (ADR-045/152): only wired when --tunnel is passed. Its mere presence
-// on Deps is what forces auth enforcement on tunneled traffic (see auth.ts lanAuth) —
-// absent entirely for the vast majority of runs that never asked for a tunnel.
-const tunnelRequested = hasFlag('--tunnel')
-if (tunnelRequested) deps.tunnel = new TunnelManager(store.dir())
 
 // Shared Code-session run registry (Task 5): the SAME instance backs both the live Code UI
 // routes (server.ts passes d.codeRuns into registerCodeRoutes) and in-app-pi Code Routine
@@ -749,6 +779,99 @@ const cliInteractiveSweepTimer = setInterval(() => sweepInteractiveCliRuns(cliIn
 cliInteractiveSweepTimer.unref()
 
 const app = createApp(deps)
+
+// Remote access (ADR-422). Config is the source of truth; `--tunnel` is a per-run override
+// meaning "cloudflare-quick for this run, don't persist" — kept ungated because
+// deploy/kaggle/serve.sh and deploy/runpod/Dockerfile both depend on it and cannot flip a
+// UI toggle (spec 30 §8.3).
+const tunnelFlag = hasFlag('--tunnel')
+// A persisted `remoteAccess.enabled: true` only auto-starts the supervisor when the
+// experimental flag is ALSO on (spec 30 §8.1: "the supervisor does not run" with the flag
+// off). `--tunnel` remains the one ungated override (§8.3) — it bypasses BOTH the flag and
+// the persisted `enabled` field entirely, exactly as it does today.
+const remoteWanted = tunnelFlag || (isRemoteAccessEnabled(deps) && store.snapshot().remoteAccess.enabled)
+
+// Fires on EVERY transition into 'connected' — the very first connect and every automatic
+// reconnect after a restart (ADR-422 Phase 2 final review, Critical finding C2). Without this,
+// a headless operator (Kaggle, RunPod — no UI, and /api/v1/remote/status refuses while the
+// experimental flag is off) has no way to discover a rolled URL after a reconnect: previously
+// this print only ever ran once, inside the initial `remote.enable().then(...)` chain below.
+// `remote` is referenced here before its own declaration below — safe, because this function is
+// only ever CALLED later (asynchronously, from inside RemoteAccessManager.set()), by which point
+// `remote` has long since been assigned.
+let lastWiredServer: unknown = null
+function onRemoteState(s: RemoteState): void {
+  // Provider-choice + state-transition telemetry (ADR-422 Phase 5 Task 22), gated to exactly
+  // the two transitions the plan asks for — 'connected' is steady state and would flood,
+  // 'off'/'starting' are not transitions worth a funnel over. Emitted HERE rather than from
+  // `RemoteAccessManager.set()` itself, for the same reason the `lastUrl` persistence below
+  // lives here and not in the manager: `onRemoteState` already fires on every `set()` call, so
+  // this reproduces the manager's telemetry-free-by-design boundary (see the comment on the
+  // `store.update` block further down) without adding a new dependency to it.
+  //
+  // Never the free-text `s.lastError`/`s.reason` — see telemetry/events/remote.ts's doc
+  // comment for why neither string can be made safe to emit (spec 30 §9: no URL, hostname,
+  // token or tailnet name, and an arbitrary child-process/Node error message can contain any
+  // of those).
+  if (s.kind === 'reconnecting' || s.kind === 'failed') {
+    emit(telemetry, remoteAccessState, {
+      provider: tunnelFlag ? 'cloudflare-quick' : store.snapshot().remoteAccess.provider,
+      state: s.kind,
+    })
+  }
+  if (s.kind !== 'connected') return
+  // cloudflared's local leg targets the INGRESS server, not the main one (Phase 1 Task 3's fix
+  // round). A fresh server instance only appears after a disable()+enable() cycle — a
+  // provider-only crash-restart reuses the already-bound ingress — so dedupe on identity to
+  // avoid registering the WebSocket 'upgrade' handler twice on the same server.
+  if (remote.server && remote.server !== lastWiredServer) {
+    registerTerminalWs(remote.server as unknown as import('http').Server, deps)
+    lastWiredServer = remote.server
+  }
+  console.log(`  Tunnel:  ${s.url}`)
+  // I1 (Phase 5 final review): this used to print (and mint, via provisionTunnelApiKey) an
+  // ORDINARY, ungranted, full-access key on every connect, including one this same request
+  // already minted a scoped `remote`-kind token for via `/api/v1/remote/start`
+  // (provisionRemoteApiKey) — two live credentials for the same URL, only one of which is
+  // capability-checked (grantKind === 'remote') or revoked by `/stop`
+  // (`revokeRemoteKeys` filters on grantKind, so the console key survives remote access being
+  // turned off). `remoteAccess.enabled` is persisted true exactly when a UI/config-managed
+  // connect is driving this — either `/start` just set it (this call), or it was already true
+  // from a previous session and this is an automatic reconnect — so gating on it here leaves
+  // the console-printed, ungranted key for the ONE case that has no other way to get a
+  // credential at all: the headless `--tunnel` override, which deliberately bypasses both the
+  // experimental flag and the persisted `enabled` field (see the comment at `tunnelFlag`'s
+  // declaration above).
+  if (!store.snapshot().remoteAccess.enabled) {
+    tunnelToken ??= provisionTunnelApiKey(deps)
+    console.log(`  Token:   ${tunnelToken}`)
+    console.log(`           (required for anyone using this tunnel URL)`)
+    console.log(``)
+  }
+  // spec 30 §2.4: "The last known URL persists in config.json so a daemon restart shows it
+  // immediately, flagged stale until the first successful probe" (ADR-422 final review,
+  // Important finding I4). Done here rather than by threading a config-store reference into
+  // RemoteAccessManager — cli.ts already has `store` in scope, and this keeps the manager free
+  // of a new dependency for a concern that's purely about persistence, not supervision.
+  try {
+    store.update((cfg) => {
+      cfg.remoteAccess.lastUrl = s.url
+    })
+  } catch {
+    /* best-effort — never fail a connect over a persistence hiccup */
+  }
+}
+
+const remote = new RemoteAccessManager({
+  app,
+  ingressPort: resolveIngressPort(store.snapshot().remoteAccess.ingressPort, store.snapshot().daemon.port),
+  // `--tunnel` is a per-run override meaning cloudflare-quick, don't persist (spec 30 §8.3).
+  makeProvider: () => makeProvider(tunnelFlag ? 'cloudflare-quick' : store.snapshot().remoteAccess.provider, deps),
+  probe: (url) => probeUrl(url),
+  onState: onRemoteState,
+})
+deps.remote = remote
+
 await registerCodeRoutesIfSupported(app, deps)
 // Must be registered last — it's a catch-all `GET /*`, and Hono shadows any route added
 // after an overlapping catch-all (see registerSpaFallback's doc comment in server.ts).
@@ -880,7 +1003,7 @@ let rebinding = false // suppress the full banner + browser-open during an in-pl
 let prevHost = host // remembered before a rebind so we can revert if the new bind fails
 let prevPort = port
 function listen(attempt = 0): void {
-  const s = serve({ fetch: app.fetch, hostname: host, port }, (info) => {
+  const s = serve({ fetch: app.fetch, hostname: host, port }, async (info) => {
     const displayHost = host === '0.0.0.0' ? '0.0.0.0 (LAN)' : host
     const uiUrl = `http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${info.port}`
 
@@ -942,23 +1065,20 @@ function listen(attempt = 0): void {
     // Keep the legacy one-liner for log parsers that key on it.
     process.stdout.write(`TurboLLM ${version} listening on http://${displayHost}:${info.port}\n`)
 
-    // Cloud Launch (ADR-045/152): (re)start the tunnel pointed at whatever port we
-    // just bound — covers both the initial start AND a later rebind (the tunnel
-    // manager tears down any prior tunnel before spawning the new one). Fire-and-
-    // forget: never blocks the banner or the listener on cloudflared's handshake.
-    if (deps.tunnel) {
-      void deps.tunnel
-        .start(info.port)
-        .then((url) => {
-          console.log(`  Tunnel:  ${url}`)
-          tunnelToken ??= provisionTunnelApiKey(deps)
-          console.log(`  Token:   ${tunnelToken}`)
-          console.log(`           (required for anyone using this tunnel URL)`)
-          console.log(``)
-        })
-        .catch((e) => {
-          console.error(`  Tunnel failed to start: ${e instanceof Error ? e.message : e}`)
-        })
+    // Runs once, at boot: this whole block is gated by remote.state().kind === 'off', which
+    // is only true before the first ever enable() call in this process's lifetime. All the
+    // work that used to live in this block's .then() callback — wiring the terminal WebSocket
+    // handler onto the ingress server, and printing 'Tunnel:'/'Token:' — now happens in
+    // onRemoteState above, which fires for this first connect AND every later automatic
+    // reconnect (ADR-422 Phase 2 final review, C2), so it is not duplicated here.
+    if (remoteWanted && remote.state().kind === 'off') {
+      // Wait for the Tailscale reconcile started near the top of boot to actually finish
+      // before handing control to enable() — see the comment at its call site for why a
+      // fire-and-forget reconcile racing this exact call was a real bug, not a theoretical
+      // one. The promise never rejects (it swallows its own errors), so this never delays
+      // startup on a failure path, only on genuine in-flight `tailscale` CLI work.
+      await reconcileTailscalePromise
+      void remote.enable()
     }
 
     // Write pidfile so `turbollm --stop` can find and stop this process (F-035). Written
@@ -1101,7 +1221,7 @@ deps.requestRestart = (opts?: { exitOnly?: boolean }) => {
   const watchdog = setTimeout(finish, 14_000)
   watchdog.unref()
   try {
-    void Promise.all([manager.shutdown(), deps.tunnel?.shutdown() ?? Promise.resolve()]).finally(() => {
+    void Promise.all([manager.shutdown(), remote.disable()]).finally(() => {
       try {
         db.close()
       } catch {
@@ -1158,7 +1278,7 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
     clearInterval(cliInteractiveSweepTimer)
     comfy.stop()
     toolRegistry.disconnectAll()
-    void Promise.all([manager.shutdown(), deps.tunnel?.shutdown() ?? Promise.resolve()]).finally(() => {
+    void Promise.all([manager.shutdown(), remote.disable()]).finally(() => {
       db.close()
       server.close(() => process.exit(0))
     })

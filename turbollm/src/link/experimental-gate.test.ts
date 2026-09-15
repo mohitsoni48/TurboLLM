@@ -375,6 +375,15 @@ test('turning the flag back on restores the fleet with no relink and no restart'
   const { d, cfg } = mkDeps(false)
   const flag = () => (cfg.daemon as { experimental: { turboLink: boolean } }).experimental
   const linksBefore = JSON.stringify(cfg.links)
+  // N1 (Phase 5 final-review-fix re-review): `/api/v1/links` is the HOST's own admin route
+  // for managing ITS list of linked peers — `'tllm-a'` is the PEER's own facade-authenticating
+  // credential (a genuine `grant`), which `hostGate` must now refuse there unconditionally
+  // (ADR-376: a link grant is refused absolutely, everywhere outside the facade — the earlier
+  // version of this line presented 'tllm-a' here too, which only ever passed because the
+  // first C1 fix used `resolveKey` — matches by hash alone — rather than the grant-aware
+  // `verifyPresentedKey` it uses now). An ordinary, ungranted key is the credential a host
+  // owner actually manages their own fleet with.
+  ;(cfg.apiKeys as ApiKey[]).push(key('tllm-owner'))
 
   const app = facade(d)
   const adminApp = admin(d)
@@ -406,7 +415,12 @@ test('turning the flag back on restores the fleet with no relink and no restart'
 
   const on = await app.request('/api/link/v1/hello', { method: 'POST', headers: { 'X-TurboLLM-Auth': 'tllm-a' } })
   assert.equal(on.status, 200)
-  assert.equal((await adminApp.request('/api/v1/links')).status, 200)
+  // C1 (Phase 5 final review): hostGate now requires THIS request to have actually resolved
+  // to a real stored key rather than trusting `requireApiKey === true` alone. N1 (Phase 5
+  // final-review-fix re-review): that real key must also be an ORDINARY one — a granted
+  // (link) credential like 'tllm-a' is refused here, by design, on the same ADR-376 basis
+  // the file's own header comment names as a hard invariant.
+  assert.equal((await adminApp.request('/api/v1/links', { headers: { 'X-TurboLLM-Auth': 'tllm-owner' } })).status, 200)
   await cat.refresh()
   assert.equal(cat.models().length, 1, 'remote models must come back on the first refresh')
   assert.ok(cat.linkByName('workstation'), 'the existing link must still be addressable by name')

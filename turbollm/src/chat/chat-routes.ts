@@ -2,6 +2,7 @@
 import type { Context, Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import type { Deps } from '../deps'
+import { resolveKey, grantKind } from '../auth'
 import { getAdvertisedHost, getLanIp } from '../net'
 import { clampMaxTokens } from '../config/config'
 import { feedChunk, flushState, initParseState, type ParseState } from './parser'
@@ -62,7 +63,9 @@ export function abortAllInFlightChats(): number {
 
 // 503 joined the set with Turbo Link: a linked machine that is offline, or no longer
 // advertising the model, is a REMOTE availability failure, not a local 409.
-type S = 200 | 201 | 202 | 400 | 404 | 409 | 500 | 503
+// 403 joined with ADR-422's N2 fix: a remote-access token is authenticated but
+// deliberately refused a specific action (persisting a global tool policy).
+type S = 200 | 201 | 202 | 400 | 403 | 404 | 409 | 500 | 503
 function err(c: Context, s: S, code: string, msg: string) { return c.json({ error: { code, message: msg } }, s) }
 async function body<T>(c: Context): Promise<T> { try { return await c.req.json() as T } catch { return {} as T } }
 
@@ -214,6 +217,17 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
     let decisionToApply: 'allow' | 'deny'
     if (decision === 'always_allow') {
+      // N2 (Phase 5 final-review-fix re-review): `always_allow` persists a GLOBAL tool policy
+      // to config.json for every future chat, host session included — a configuration change,
+      // not a chat action. This route sits entirely under `requiredCapability`'s `models:use`
+      // mapping (auth.ts), the product's own default and minimum remote-token scope, so
+      // without this check a bare chat-only token reaching the internet could permanently
+      // widen what tools run unattended on the host. A remote-kind grant still gets the same
+      // practical outcome for its OWN live session via 'allow_chat' below — only the
+      // persist-for-everyone effect is refused.
+      if (grantKind(resolveKey(c, d) ?? { grant: undefined }) === 'remote') {
+        return err(c, 403, 'forbidden', 'A remote access token cannot change tool permissions for every future chat — use "Allow for this chat" instead.')
+      }
       d.store.update((cfg) => {
         cfg.tools.toolPolicies = { ...(cfg.tools.toolPolicies ?? {}), [toolName]: 'allow' }
       })

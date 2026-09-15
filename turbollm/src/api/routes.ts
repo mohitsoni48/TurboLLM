@@ -7,7 +7,7 @@ import { basename, dirname, join, resolve } from 'node:path'
 import { GATE_VERSION, gateNodeSource } from '../comfyui/gate-template'
 import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
-import { ValueError, getModelProfile, resolveConfiguredCtx, setModelProfile, deleteModelProfile, VRAM_HEADROOM_MIN_MB, VRAM_HEADROOM_MAX_MB, VRAM_HEADROOM_SPILL_MB, type ApiKey, type Engine, type McpServer } from '../config/config'
+import { ValueError, getModelProfile, resolveConfiguredCtx, setModelProfile, deleteModelProfile, normalizeProvider, resolveIngressPort, VRAM_HEADROOM_MIN_MB, VRAM_HEADROOM_MAX_MB, VRAM_HEADROOM_SPILL_MB, type ApiKey, type Engine, type McpServer } from '../config/config'
 import { CONFIG_BOUNDS, coerceBounded, isConfigTheme } from '../config/config-bounds'
 import type { Deps } from '../deps'
 import { getLanIp } from '../net'
@@ -176,7 +176,7 @@ export function registerApi(app: Hono, d: Deps): void {
       telemetryLevel: d.store.snapshot().telemetry.level,
       uptimeSec: Math.floor((Date.now() - d.startedAt) / 1000),
       // Cloud Launch tunnel (ADR-045/152): null until --tunnel is active.
-      tunnel: d.tunnel ? d.tunnel.snapshot() : null,
+      tunnel: tunnelStatusSnapshot(d),
       // Local feature flags (TURBOLLM_FEATURES env var) — deliberately undocumented
       // in any user-facing README; see features.ts.
       features: enabledFeatures(),
@@ -1890,7 +1890,22 @@ export function registerApi(app: Hono, d: Deps): void {
       toolPolicies?: Record<string, string>
       autoAllowAll?: boolean
       cloudDeploy?: { runpodTemplateId?: string }
-      experimental?: { memory?: boolean; cloudDeploy?: boolean; routines?: boolean; turboLink?: boolean }
+      experimental?: { memory?: boolean; cloudDeploy?: boolean; routines?: boolean; turboLink?: boolean; remoteAccess?: boolean }
+      remoteAccess?: {
+        provider?: string
+        ingressPort?: number
+        cloudflare?: {
+          tunnelToken?: string
+          hostname?: string
+          accessTeamDomain?: string
+          accessAud?: string
+          requireAccess?: boolean
+        }
+        ngrok?: { authtoken?: string; domain?: string }
+        tailscale?: { port?: number }
+        custom?: { publicUrl?: string }
+        tokenGrant?: { capabilities?: string[]; models?: string[] }
+      }
     }>(c)
 
     const updates: Record<string, unknown> = {}
@@ -2101,6 +2116,35 @@ export function registerApi(app: Hono, d: Deps): void {
       if (b.experimental?.cloudDeploy !== undefined) cfg.daemon.experimental.cloudDeploy = !!b.experimental.cloudDeploy
       if (b.experimental?.routines !== undefined) cfg.daemon.experimental.routines = !!b.experimental.routines
       if (b.experimental?.turboLink !== undefined) cfg.daemon.experimental.turboLink = !!b.experimental.turboLink
+      if (b.experimental?.remoteAccess !== undefined) cfg.daemon.experimental.remoteAccess = !!b.experimental.remoteAccess
+      // Remote access: per-field merge, never Object.assign — a patch setting only the
+      // provider must not wipe a stored tunnel token, and vice versa.
+      const ra = b.remoteAccess
+      if (ra?.provider !== undefined) cfg.remoteAccess.provider = normalizeProvider(ra.provider)
+      if (ra?.ingressPort !== undefined) cfg.remoteAccess.ingressPort = resolveIngressPort(Number(ra.ingressPort), cfg.daemon.port)
+      if (ra?.cloudflare?.tunnelToken !== undefined) cfg.remoteAccess.cloudflare.tunnelToken = String(ra.cloudflare.tunnelToken).trim()
+      if (ra?.cloudflare?.hostname !== undefined) cfg.remoteAccess.cloudflare.hostname = String(ra.cloudflare.hostname).trim()
+      if (ra?.cloudflare?.accessTeamDomain !== undefined) cfg.remoteAccess.cloudflare.accessTeamDomain = String(ra.cloudflare.accessTeamDomain).trim()
+      if (ra?.cloudflare?.accessAud !== undefined) cfg.remoteAccess.cloudflare.accessAud = String(ra.cloudflare.accessAud).trim()
+      if (ra?.cloudflare?.requireAccess !== undefined) cfg.remoteAccess.cloudflare.requireAccess = !!ra.cloudflare.requireAccess
+      if (ra?.ngrok?.authtoken !== undefined) cfg.remoteAccess.ngrok.authtoken = String(ra.ngrok.authtoken).trim()
+      if (ra?.ngrok?.domain !== undefined) cfg.remoteAccess.ngrok.domain = String(ra.ngrok.domain).trim()
+      if (ra?.tailscale?.port !== undefined) {
+        const p = Number(ra.tailscale.port)
+        cfg.remoteAccess.tailscale.port = p === 8443 || p === 10000 ? p : 443
+      }
+      if (ra?.custom?.publicUrl !== undefined) cfg.remoteAccess.custom.publicUrl = String(ra.custom.publicUrl).trim()
+      // Only the SHAPE is enforced here (array of strings) — the same posture config.ts's own
+      // normalize takes. The actual allow-list check against LINK_CAPABILITIES happens at the
+      // point of use (remote/routes.ts's sanitizeTokenGrant, ADR-422), not here.
+      if (ra?.tokenGrant?.capabilities !== undefined) {
+        cfg.remoteAccess.tokenGrant.capabilities = ra.tokenGrant.capabilities.filter(
+          (x): x is string => typeof x === 'string',
+        )
+      }
+      if (ra?.tokenGrant?.models !== undefined) {
+        cfg.remoteAccess.tokenGrant.models = ra.tokenGrant.models.filter((x): x is string => typeof x === 'string')
+      }
       // HF token (spec 10 §4): write-only. An explicit '' clears it. Never logged.
       if (b.hfToken !== undefined) cfg.hf.token = String(b.hfToken).trim()
       // GitHub token (write-only, same semantics as HF): an explicit '' clears it.
@@ -2637,6 +2681,18 @@ function modelDirsPayload(d: Deps): { dirs: string[]; primaryDir: string } {
   return { dirs: cfg.modelDirs, primaryDir }
 }
 
+/** Back-compat mapping for /api/v1/status's `tunnel` field (spec 30 §5): the field's wire
+ *  shape — { active, url, error } — is unchanged even though TunnelManager was replaced by
+ *  RemoteAccessManager underneath it. External consumers and the deploy/ recipes read this
+ *  field by its existing shape; do not rename or restructure it here. */
+function tunnelStatusSnapshot(d: Deps): { active: boolean; url: string | null; error: string | null } | null {
+  if (!d.remote) return null
+  const s = d.remote.state()
+  const active = s.kind === 'connected' || s.kind === 'starting' || s.kind === 'reconnecting'
+  const error = s.kind === 'failed' ? s.reason : s.kind === 'reconnecting' ? s.lastError : null
+  return { active, url: d.remote.url(), error }
+}
+
 /** The UI-exposed settings subset. Telemetry is surfaced as the 3-option enum. */
 function settingsPayload(d: Deps) {
   const cfg = d.store.snapshot()
@@ -2694,6 +2750,28 @@ function settingsPayload(d: Deps) {
     // Not secret — echoed back directly so Settings can render Tool Permissions.
     toolPolicies: cfg.tools.toolPolicies ?? {},
     autoAllowAll: cfg.tools.autoAllowAll ?? false,
+    // Remote access (ADR-422). Secrets are WRITE-ONLY: the booleans say whether one is
+    // stored, never what it is — same posture as hfToken/ghToken/tavilyApiKey.
+    remoteAccess: {
+      enabled: cfg.remoteAccess.enabled,
+      provider: cfg.remoteAccess.provider,
+      ingressPort: cfg.remoteAccess.ingressPort,
+      cloudflare: {
+        hasTunnelToken: !!cfg.remoteAccess.cloudflare.tunnelToken,
+        hostname: cfg.remoteAccess.cloudflare.hostname,
+        accessTeamDomain: cfg.remoteAccess.cloudflare.accessTeamDomain,
+        accessAud: cfg.remoteAccess.cloudflare.accessAud,
+        requireAccess: cfg.remoteAccess.cloudflare.requireAccess,
+      },
+      ngrok: { hasAuthtoken: !!cfg.remoteAccess.ngrok.authtoken, domain: cfg.remoteAccess.ngrok.domain },
+      tailscale: { port: cfg.remoteAccess.tailscale.port },
+      custom: { publicUrl: cfg.remoteAccess.custom.publicUrl },
+      // Not a secret — a capability list, same posture as toolPolicies above. Echoed as
+      // stored; sanitizeTokenGrant (remote/routes.ts) is what actually enforces the
+      // LINK_CAPABILITIES allow-list, at the point a token is minted.
+      tokenGrant: cfg.remoteAccess.tokenGrant,
+      lastUrl: cfg.remoteAccess.lastUrl,
+    },
   }
 }
 

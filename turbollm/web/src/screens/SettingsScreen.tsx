@@ -29,6 +29,7 @@ import { useCodeFeatureEnabled } from '../lib/platform'
 import { MemorySection } from './settings/MemorySection'
 import { ExperimentalSection } from './settings/ExperimentalSection'
 import { TurboLinkSection } from './settings/TurboLinkSection'
+import { RemoteAccessSection } from './settings/RemoteAccessSection'
 import { HardwareSection } from './settings/HardwareSection'
 
 import { ApiError, track, type TelemetryLevel } from '../lib/api'
@@ -689,6 +690,11 @@ export function SettingsScreen() {
                   and the same one the daemon enforces (link/gate.ts), so a machine with the
                   flag off has no way to reach the surface AND refuses it on the wire. */}
               {settings?.experimental?.turboLink && <TurboLinkSection />}
+
+              {/* Remote access (ADR-422): reach this machine's chat from somewhere else.
+                  Same two-layer shape as Turbo Link just above — unlocked only when
+                  Settings → Experimental's Remote access row is on. */}
+              {settings?.experimental?.remoteAccess && <RemoteAccessSection />}
             </>
           )}
 

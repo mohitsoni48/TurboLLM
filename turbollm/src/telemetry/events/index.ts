@@ -23,6 +23,7 @@ import { uiAction, uiDaily } from './ui'
 import { onboardingProfile, onboardingRecovery } from './onboarding'
 import { linkMinted, linkAdded, linkStatusChanged, inferenceServed } from './link'
 import { appUpdateAvailable, appUpdateClicked, appUpdateApplied, appUpdateFailed } from './app-update'
+import { remoteAccessEnabled, remoteAccessDisabled, remoteAccessState, remoteAccessPreflightFailed } from './remote'
 
 export const REGISTRY = {
   app_first_run: appFirstRun,
@@ -52,6 +53,10 @@ export const REGISTRY = {
   app_update_clicked: appUpdateClicked,
   app_update_applied: appUpdateApplied,
   app_update_failed: appUpdateFailed,
+  remote_access_enabled: remoteAccessEnabled,
+  remote_access_disabled: remoteAccessDisabled,
+  remote_access_state: remoteAccessState,
+  remote_access_preflight_failed: remoteAccessPreflightFailed,
 } as const
 
 export type EventName = keyof typeof REGISTRY
@@ -86,4 +91,8 @@ export {
   appUpdateClicked,
   appUpdateApplied,
   appUpdateFailed,
+  remoteAccessEnabled,
+  remoteAccessDisabled,
+  remoteAccessState,
+  remoteAccessPreflightFailed,
 }

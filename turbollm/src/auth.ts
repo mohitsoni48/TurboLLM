@@ -5,22 +5,26 @@
 // gateway surface must carry a valid API key. Loopback is always exempt so the
 // local browser UI and `turbollm launch claude` keep working with no key.
 //
-// A Cloud Launch tunnel (ADR-045/152) breaks the loopback-as-trust assumption BY
-// ADDRESS ALONE: cloudflared's local leg connects to 127.0.0.1 too, so a request
-// that arrived over the public tunnel URL LOOKS identical to a trusted local caller
-// by address. The fix is NOT "distrust all loopback whenever a tunnel is merely
-// active" — that would also break the daemon's own local CLI tooling (`--stop`,
-// `launch claude`), which has no way to hold a usable key (only hashes are ever
-// stored). Verified empirically against a live cloudflared quick tunnel: Cloudflare's
-// edge injects `cf-ray`/`cf-connecting-ip` on every request it proxies, and a direct
-// local request carries neither — a remote caller can't spoof these away (Cloudflare's
-// edge controls them, not the client), so `isTunneled` below is a precise per-REQUEST
-// signal, not a whole-daemon flag.
+// Remote access (ADR-422, formerly the Cloud Launch tunnel of ADR-045/152) breaks the
+// loopback-as-trust assumption BY ADDRESS ALONE: every provider's local leg connects to
+// 127.0.0.1 too, so a request that arrived over the public URL LOOKS identical to a
+// trusted local caller by address. The fix is NOT "distrust all loopback whenever remote
+// access is merely active" — that would also break the daemon's own local CLI tooling
+// (`--stop`, `launch claude`), which has no way to hold a usable key (only hashes are ever
+// stored). `isTunneled` below instead keys off which LOCAL TCP port the connection arrived
+// on: the ingress listener binds a dedicated loopback port that only a provider's local leg
+// ever connects to, and a client cannot choose which of the daemon's sockets it lands on —
+// unlike a header, which only worked for Cloudflare because its edge (not the client)
+// controlled it.
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { getConnInfo } from '@hono/node-server/conninfo'
 import type { Context, MiddlewareHandler } from 'hono'
 import type { ApiKey } from './config/config'
 import type { Deps } from './deps'
+import { hasCapability } from './link/capabilities'
+import type { LinkCapability, LinkGrant } from './link/types'
+import { fetchJwks, verifyAccessJwt } from './remote/access-jwt'
+import { tailscaleIdentity } from './remote/identity'
 
 /** Loopback addresses that never require a key, in the forms Node surfaces them
  *  (IPv4, IPv6, and the IPv4-mapped-IPv6 form Windows/dual-stack sockets report). */
@@ -68,6 +72,41 @@ export function provisionTunnelApiKey(d: Deps, label = 'tunnel'): string {
   }
   d.store.update((cfg) => cfg.apiKeys.push(key))
   return full
+}
+
+/** Mint the capability-scoped credential a remote-access URL is shared with (ADR-422).
+ *
+ *  Always a fresh key rather than reusing one: a stored key's raw value can never be
+ *  recovered to show it again (only the hash is kept), and a clearly-named one is easy to
+ *  find and revoke later in Developer → API Keys. Returns the raw value, which is the only
+ *  moment it exists in readable form. */
+export function provisionRemoteApiKey(d: Deps, grant: LinkGrant): string {
+  const { full, hash, prefix } = generateApiKey()
+  const key: ApiKey = {
+    id: randomUUID(),
+    name: `remote-${new Date().toISOString()}`,
+    hash,
+    prefix,
+    createdAt: new Date().toISOString(),
+    lastUsedAt: null,
+    grant: { ...grant, kind: 'remote' },
+  }
+  d.store.update((cfg) => cfg.apiKeys.push(key))
+  return full
+}
+
+/** Revoke every remote-access token. Called when remote access is turned off: a credential
+ *  that outlives the URL it was minted for is a credential nobody is thinking about any
+ *  more. Scoped by grant KIND, so a Turbo Link peer's token and an ordinary user key are
+ *  both untouched. Returns how many were removed. */
+export function revokeRemoteKeys(d: Deps): number {
+  let removed = 0
+  d.store.update((cfg) => {
+    const before = cfg.apiKeys.length
+    cfg.apiKeys = cfg.apiKeys.filter((k) => grantKind(k) !== 'remote')
+    removed = before - cfg.apiKeys.length
+  })
+  return removed
 }
 
 /** Is the address the listener was bound to a loopback-only bind — i.e. unreachable from
@@ -179,17 +218,38 @@ function isLoopback(c: Context): boolean | null {
   return LOOPBACK.has(addr)
 }
 
-/** True when THIS request actually traversed the Cloud Launch tunnel, as opposed to
- *  "a tunnel merely happens to be active elsewhere". Cloudflare's edge injects
- *  `cf-ray`/`cf-connecting-ip` on every request it proxies (verified empirically
- *  against a live quick tunnel) — a direct local request carries neither. A local
- *  caller forging these headers on their own request only makes THAT request MORE
- *  restricted (still needs a key), never less — it can't be used to impersonate a
- *  local caller from the remote side, since Cloudflare's edge (not the client)
- *  controls what a genuinely tunneled request carries. */
+/** The LOCAL port this connection arrived on, or undefined when it can't be determined.
+ *
+ *  Mirrors how @hono/node-server's own getConnInfo resolves its binding
+ *  (`c.env.server ? c.env.server : c.env`, then `.incoming.socket`) — verified against the
+ *  installed 2.1.0 dist. Unlike a header, a client cannot choose which of the daemon's
+ *  sockets its connection landed on, which is the whole point (ADR-422). */
+export function localPort(c: Context): number | undefined {
+  try {
+    const env = c.env as {
+      server?: { incoming?: { socket?: { localPort?: number } } }
+      incoming?: { socket?: { localPort?: number } }
+    }
+    const bindings = env?.server ? env.server : env
+    return bindings?.incoming?.socket?.localPort
+  } catch {
+    return undefined
+  }
+}
+
+/** True when THIS request actually arrived over remote access, as opposed to "remote access
+ *  merely happens to be on". Keyed off the dedicated loopback ingress socket (ADR-422,
+ *  spec 30 §2.2), which every provider's local leg connects to and nothing else does.
+ *
+ *  Replaces ADR-153's cf-ray/cf-connecting-ip check. That check was only ever safe because
+ *  Cloudflare's edge controlled the header; Tailscale Funnel, ngrok and a user-run frp inject
+ *  no equivalent, so a header-based signal would have read every one of them as a trusted
+ *  loopback caller and waved them through with no key at all. The socket cannot be forged in
+ *  either direction. */
 function isTunneled(c: Context, d: Deps): boolean {
-  if (!d.tunnel?.active()) return false
-  return !!(c.req.header('cf-ray') || c.req.header('cf-connecting-ip'))
+  const ingress = d.remote?.ingressPort()
+  if (ingress === undefined) return false
+  return localPort(c) === ingress
 }
 
 /** True when a request is local to the daemon host: either the daemon is loopback-only
@@ -207,15 +267,39 @@ export function isLocalRequest(c: Context, d: Deps): boolean {
 }
 
 /** The gate every CREDENTIAL-MANAGEMENT route must carry: host-only while the LAN is open
- *  and unauthenticated (lanBind on, requireApiKey off), unrestricted once a key is required.
+ *  and unauthenticated (lanBind on, requireApiKey off), otherwise open to any caller who has
+ *  ALREADY presented a real, stored key for THIS request.
  *
  *  lanAuth's `bypassesAuth` deliberately lets that lanBind-on/requireApiKey-off combination
  *  through with NO credential at all (spec 06 §5's "opted into open LAN access"), which is
  *  fine for chat/models but would let any device that can merely load the page mint itself a
  *  durable key — a real self-escalation, since that key keeps working even after
- *  requireApiKey is later turned on. Once requireApiKey IS on, a non-host caller only reaches
- *  the handler at all by having already presented a valid key (lanAuth ran first), so
- *  self-service key management from another device is fine then.
+ *  requireApiKey is later turned on.
+ *
+ *  C1 (Phase 5 final review): this used to read `daemon.requireApiKey === true` as proof the
+ *  caller was authenticated, which was true only as long as the ONLY way past `lanAuth`
+ *  without a key was being local. Tasks 20/21 (Tailscale/Cloudflare Access identity) added
+ *  `return next()` paths in `lanAuth` that let a request through with NO key presented at
+ *  all — so once `requireApiKey` was on (the shipped default), an unauthenticated tailnet
+ *  member or Access user could reach `POST /api/v1/keys` and mint a permanent, unscoped,
+ *  un-revocable-by-`/stop` credential.
+ *
+ *  N1 (Phase 5 final-review-fix re-review): the first fix here called `resolveKey` directly,
+ *  which matches on hash ALONE and does not apply the grant-kind rule every other credential
+ *  path applies ({@link isFacadeOnlyKey}: "any NEW code that resolves a presented key to a
+ *  stored record must call this — do not re-derive `!!key.grant` in a third place"). That
+ *  traded C1's hole in the default config (`requireApiKey: true`) for the SAME hole in a
+ *  different one (`lanBind: true, requireApiKey: false` — the open-LAN case this gate's own
+ *  first paragraph exists to protect): a `remote`-kind token, or even a Turbo Link façade-only
+ *  token, resolves to a real stored key and so passed `hostGate` there, letting the exact
+ *  chat-only token this feature publishes mint itself a permanent full-access credential and
+ *  revoke every other key on the box. `verifyPresentedKey(c, d)` — called here with NO
+ *  `ingress` flag, so it defaults to false — is the existing, already-correct answer: it
+ *  refuses ANY granted key (`link` or `remote` kind) unconditionally, and accepts only a real,
+ *  ungranted, stored key. That is exactly "did THIS request present an ordinary credential" —
+ *  the question this gate actually needs asked — without reopening the grant-kind rule this
+ *  file's own doc comments say has already caused two prior incidents (ADR-376's original
+ *  finding, and this one).
  *
  *  Lives here rather than inside `registerApi` so `/api/v1/keys`, `/api/v1/connect/:cli` and
  *  Turbo Link's `/api/v1/links*` (ADR-376) share ONE predicate — the v1.9.0 pre-release
@@ -223,14 +307,21 @@ export function isLocalRequest(c: Context, d: Deps): boolean {
  *  review found it missing again on `POST /api/v1/links/mint`, both because it was a private
  *  local function nothing new could reuse. */
 export function hostGate(c: Context, d: Deps): boolean {
-  return isLocalRequest(c, d) || d.store.snapshot().daemon.requireApiKey === true
+  return isLocalRequest(c, d) || verifyPresentedKey(c, d)
 }
 
 /** Same decision as {@link isLocalRequest}, for the one surface that has no Hono `Context`:
- *  the raw `http.Server` 'upgrade' event a WebSocket handshake arrives on (registerTerminalWs).
- *  Takes the remote address and headers directly instead of pulling them off a Context. */
-export function isLocalUpgrade(remoteAddress: string | undefined, headers: NodeJS.Dict<string | string[]>, d: Deps): boolean {
-  const tunneled = !!d.tunnel?.active() && !!(headers['cf-ray'] || headers['cf-connecting-ip'])
+ *  the raw `http.Server` 'upgrade' event a WebSocket handshake arrives on
+ *  (registerTerminalWs). Takes the socket's remote address and LOCAL port directly instead
+ *  of pulling them off a Context — the local port is the ingress signal (ADR-422). */
+export function isLocalUpgrade(
+  remoteAddress: string | undefined,
+  socketLocalPort: number | undefined,
+  _headers: NodeJS.Dict<string | string[]>,
+  d: Deps,
+): boolean {
+  const ingress = d.remote?.ingressPort()
+  const tunneled = ingress !== undefined && socketLocalPort === ingress
   if (tunneled) return false
   if (!d.store.snapshot().daemon.lanBind) return true // loopback-only bind → always local
   return !!remoteAddress && LOOPBACK.has(remoteAddress)
@@ -321,6 +412,67 @@ export function isFacadeOnlyKey(key: Pick<ApiKey, 'grant'>): boolean {
   return !!key.grant
 }
 
+/** Which enforcement path a stored key's grant belongs to (ADR-422).
+ *
+ *  A grant with no `kind` is a LINK grant: every grant minted before ADR-422 was minted for
+ *  a Turbo Link peer, and reading absent as anything else would silently widen tokens
+ *  already in the field. */
+export function grantKind(key: Pick<ApiKey, 'grant'>): 'none' | 'link' | 'remote' {
+  if (!key.grant) return 'none'
+  return key.grant.kind === 'remote' ? 'remote' : 'link'
+}
+
+/** The capability a request needs, or null when this path is not something a scoped remote
+ *  token may reach at all.
+ *
+ *  Null is DENY, never "no check required" — an unmapped path is one nobody has reasoned
+ *  about for a remote caller, and defaulting those open is how ADR-376's `/v1/*` defect
+ *  happened. Engine add/scan/build appear nowhere here on purpose: ADR-139 settled that no
+ *  remote caller executes a caller-supplied binary, valid token or not, and isLocalRequest
+ *  already refuses them independently. */
+export function requiredCapability(method: string, path: string): LinkCapability | null {
+  const m = method.toUpperCase()
+  const read = m === 'GET' || m === 'HEAD'
+  if (path.startsWith('/v1/')) return 'models:use'
+  // I4 (Phase 5 final review): narrowed from a bare `startsWith('/api/v1/chat')`, which also
+  // matched `/api/v1/chat-agents*` and so mapped a chat-agent-definition WRITE — capable of
+  // rewriting a built-in agent's system prompt/tool allow-list, or deleting a custom one — to
+  // the minimum capability the product ever mints (`models:use`, config.ts's default
+  // tokenGrant). Chat-agents get their own, deliberate mapping just below instead.
+  if (path === '/api/v1/chat' || path.startsWith('/api/v1/chat/')) return 'models:use'
+  // A chat-agent-definition READ is as low-risk as reading the model list; a WRITE rewrites
+  // what a model is told to do (system prompt, tool allow-list) or deletes a saved one — that
+  // is a configuration change, not a chat action (I4).
+  if (path.startsWith('/api/v1/chat-agents')) return read ? 'models:use' : 'config:write'
+  // I3 (Phase 5 final review): permanent, irreversible deletion of a model's own file(s) from
+  // disk (scanner.delete -> rmSync) is never authorized for a remote grant, at ANY capability
+  // — unlike load/unload (`models:load`, below) or a model's saved presets (M6, unreviewed but
+  // lower-stakes, deliberately left as-is). Matched narrowly — exactly one path segment after
+  // `/models/`, no further subpath — so it catches only `DELETE /api/v1/models/:key`.
+  if (m === 'DELETE' && /^\/api\/v1\/models\/[^/]+$/.test(path)) return null
+  if (path === '/api/v1/models' || path.startsWith('/api/v1/models/')) return read ? 'models:use' : 'models:load'
+  if (path.startsWith('/api/v1/downloads')) return read ? 'downloads:read' : 'downloads:write'
+  if (path.startsWith('/api/v1/settings')) return read ? 'config:read' : 'config:write'
+  if (path === '/api/v1/status') return 'config:read'
+  // C2 (Phase 5 final review): the actual chat surface the web SPA calls — conversations
+  // (send/edit/regenerate/branch/tool-approval/folder-move/save-skill/export/share/import),
+  // folders, auto-memory, the tool catalog, and (read-only) hardware info. None of it touches
+  // model files, daemon settings or downloads, so it is exactly what `models:use` is for.
+  // Without this, a token minted from the Phase 5 UI's own picker (`models:use` at minimum)
+  // could reach `/v1/*` and `/api/v1/models` and nothing else — every real chat screen 403'd,
+  // including the feature's own headline "scan the QR, chat from your phone" journey.
+  // Deliberately NOT `/api/v1/status` or `/api/v1/settings`, above — see their own comments:
+  // status carries the engine's launchCommand (absolute binary/model paths) and raw stderr
+  // (which routinely echoes paths too) — a genuine filesystem-detail boundary, not an
+  // oversight this fix widens.
+  if (path === '/api/v1/sysinfo') return 'models:use'
+  if (path === '/api/v1/tools') return 'models:use'
+  if (path === '/api/v1/memory' || path.startsWith('/api/v1/memory/')) return 'models:use'
+  if (path === '/api/v1/folders' || path.startsWith('/api/v1/folders/')) return 'models:use'
+  if (path === '/api/v1/conversations' || path.startsWith('/api/v1/conversations/')) return 'models:use'
+  return null
+}
+
 /** Checks a raw candidate key against stored API keys; bumps lastUsedAt best-effort on a
  *  match. The credential-check core shared by every auth surface — HTTP (verifyPresentedKey,
  *  which sources the raw value from headers) and the WebSocket upgrade handler (which sources
@@ -337,7 +489,7 @@ export function isFacadeOnlyKey(key: Pick<ApiKey, 'grant'>): boolean {
  *  with its own hash comparison and never routes through here. It calls
  *  {@link isFacadeOnlyKey} directly instead. Two enforcement points, ONE predicate — if you
  *  add a third credential path, call the predicate rather than re-deriving the rule. */
-export function verifyKeyValue(key: string, d: Deps): boolean {
+export function verifyKeyValue(key: string, d: Deps, opts?: { ingress?: boolean }): boolean {
   if (!key) return false
   const hash = hashKey(key)
   const cfg = d.store.snapshot()
@@ -345,7 +497,15 @@ export function verifyKeyValue(key: string, d: Deps): boolean {
   if (!match) return false
   // Before the lastUsedAt bump on purpose: a refused credential must leave no trace of a
   // successful use, and must be indistinguishable from a wrong key.
-  if (isFacadeOnlyKey(match)) return false
+  //
+  // The ADR-422 exception, and the ONLY one: a `remote`-kind grant is honoured when the
+  // request genuinely arrived on the ingress socket. A `link`-kind grant is still refused
+  // absolutely — ADR-376's rule is extended here, never loosened — and every caller that
+  // does not pass `ingress` (codeAuth over Code's real shell, the terminal WebSocket
+  // upgrade, ext/auth.ts's own path) keeps refusing both kinds, because the default is
+  // false. Capability enforcement for an accepted remote token is the CALLER's job; this
+  // function answers "is this credential usable here at all".
+  if (isFacadeOnlyKey(match) && !(opts?.ingress === true && grantKind(match) === 'remote')) return false
   // Best-effort lastUsedAt bump (spec 06 §5). Never block the request on it.
   try {
     d.store.update((mut) => {
@@ -361,8 +521,8 @@ export function verifyKeyValue(key: string, d: Deps): boolean {
 /** Checks the presented key (any of the accepted headers, see presentedKey) against stored API
  *  keys. Shared by lanAuth and codeAuth below so both enforce the identical credential check —
  *  only WHEN each one is triggered differs. */
-export function verifyPresentedKey(c: Context, d: Deps): boolean {
-  return verifyKeyValue(presentedKey(c), d)
+export function verifyPresentedKey(c: Context, d: Deps, opts?: { ingress?: boolean }): boolean {
+  return verifyKeyValue(presentedKey(c), d, opts)
 }
 
 /** LAN auth middleware (spec 06 §5). Register AFTER cors + the Server header and
@@ -385,12 +545,78 @@ export function lanAuth(d: Deps): MiddlewareHandler {
       exempt: isExempt(c),
     })
     if (allow) return next()
-    if (verifyPresentedKey(c, d)) return next()
 
-    return c.json(
-      { error: { code: 'unauthorized', message: 'A valid API key is required for non-local access.' } },
-      401,
-    )
+    // Tailscale Serve identity (ADR-422 §6.1): a tailnet-authenticated user needs no shared
+    // secret. Gated on BOTH the ingress socket and the active provider actually being Serve —
+    // Funnel sends no identity headers, so anything claiming one there is a forgery attempt.
+    if (isTunneled(c, d) && d.store.snapshot().remoteAccess.provider === 'tailscale-serve' && tailscaleIdentity(c)) {
+      return next()
+    }
+
+    // Cloudflare Access (ADR-422 §6.2). When requireAccess is on, a valid assertion is the
+    // ONLY way through on ingress — the bearer token is replaced, not supplemented. When it
+    // is off, a valid assertion is accepted in addition to a token.
+    //
+    // C3/I6 (Phase 5 final review): gated on `ra.provider === 'cloudflare-named'`, matching
+    // Task 20's own discipline one block above (which this block originally lacked).
+    // `accessTeamDomain`/`accessAud` are plain persisted strings that survive a provider
+    // switch (config.ts keeps them, and the settings PATCH updates them independently of
+    // `provider`), so without this check a leftover Access config from a past
+    // `cloudflare-named` setup either bricks auth on every OTHER provider (`requireAccess:
+    // true` — the error names a Cloudflare product the user isn't even using) or lets a
+    // captured/replayed Access JWT bypass auth entirely on them (`requireAccess: false`, since
+    // this block's `next()` skips the capability check too). It also made `requireAccess`
+    // silently unenforced on Tailscale Serve (I6): Task 20's own provider-gated block ran
+    // first and won, so an operator who believed "Access is mandatory" got an unauthenticated
+    // pass-through instead.
+    const ra = d.store.snapshot().remoteAccess
+    if (isTunneled(c, d) && ra.provider === 'cloudflare-named' && ra.cloudflare.accessTeamDomain && ra.cloudflare.accessAud) {
+      const assertion = c.req.header('Cf-Access-Jwt-Assertion') ?? ''
+      let verified = false
+      if (assertion) {
+        const jwks = await fetchJwks(ra.cloudflare.accessTeamDomain).catch(() => null)
+        if (jwks) {
+          const res = await verifyAccessJwt(assertion, {
+            teamDomain: ra.cloudflare.accessTeamDomain,
+            aud: ra.cloudflare.accessAud,
+            jwks,
+          })
+          verified = res.ok
+        }
+      }
+      if (verified) return next()
+      // I2 (Phase 5 final review): `requireAccess: true` must refuse whenever control reaches
+      // here WITHOUT a genuinely verified assertion, for ANY reason — none presented, one that
+      // failed verification, or a JWKS fetch that itself failed. The previous structure only
+      // refused the "no assertion at all" case; a JUNK assertion sent during a JWKS outage hit
+      // neither branch and silently fell through to the ordinary bearer check instead, so the
+      // "the bearer token is replaced, not supplemented" guarantee held for an attacker who
+      // sent nothing and evaporated for one who sent garbage.
+      if (ra.cloudflare.requireAccess) {
+        return c.json({ error: { code: 'unauthorized', message: 'Cloudflare Access sign-in is required.' } }, 401)
+      }
+    }
+
+    const ingress = isTunneled(c, d)
+    if (!verifyPresentedKey(c, d, { ingress })) {
+      return c.json(
+        { error: { code: 'unauthorized', message: 'A valid API key is required for non-local access.' } },
+        401,
+      )
+    }
+    // A scoped remote token is additionally held to its capability set. An ordinary
+    // (ungranted) key skips this entirely and behaves exactly as it always has.
+    const resolved = ingress ? resolveKey(c, d) : undefined
+    if (resolved && grantKind(resolved) === 'remote') {
+      const need = requiredCapability(c.req.method, c.req.path)
+      if (!need || !hasCapability(resolved, need)) {
+        return c.json(
+          { error: { code: 'forbidden', message: 'This access token is not allowed to do that.', capability: need } },
+          403,
+        )
+      }
+    }
+    return next()
   }
 }
 

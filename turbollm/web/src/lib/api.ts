@@ -807,7 +807,29 @@ export type DaemonSettings = {
    *  verified against a real second machine, so it is opt-in. While it is off the Turbo Link
    *  section does not render, `useLinks`/`useRemoteModels` do not fetch, and every merged
    *  fleet list falls back to local-only rows with no origin column and no machine filter. */
-  experimental: { memory: boolean; cloudDeploy: boolean; routines: boolean; turboLink: boolean }
+  experimental: { memory: boolean; cloudDeploy: boolean; routines: boolean; turboLink: boolean; remoteAccess: boolean }
+  /** Remote access (ADR-422): settings-payload mirror of the daemon's `remoteAccess` config,
+   *  echoed back from `turbollm/src/api/routes.ts`'s `settingsPayload()`. */
+  remoteAccess: RemoteAccessSettings
+}
+
+/** Remote access (ADR-422): the settings-payload mirror of turbollm/src/api/routes.ts's
+ *  redacted `remoteAccess` block. Secrets are write-only — the `has*` booleans say whether one
+ *  is stored, never what it is, same posture as hfToken/ghTokenSet. `provider` is hand-kept in
+ *  sync with `RemoteProviderId` in `./remote-api.ts` rather than imported, to avoid a
+ *  settings<->feature-module import cycle (remote-api.ts already imports FROM api.ts). */
+export interface RemoteAccessSettings {
+  enabled: boolean
+  provider: 'cloudflare-quick' | 'cloudflare-named' | 'tailscale-serve' | 'tailscale-funnel' | 'ngrok' | 'custom'
+  ingressPort: number
+  cloudflare: { hasTunnelToken: boolean; hostname: string; accessTeamDomain: string; accessAud: string; requireAccess: boolean }
+  ngrok: { hasAuthtoken: boolean; domain: string }
+  tailscale: { port: number }
+  custom: { publicUrl: string }
+  /** Capability scope minted remote tokens receive (ADR-422 §6.3). Not secret — a capability
+   *  list, not a credential — so it is echoed back as stored, unlike the `has*` secrets above. */
+  tokenGrant: { capabilities: string[]; models?: string[] }
+  lastUrl: string
 }
 
 /** Tool-call approval gate policy (mirrors turbollm/src/tools/tool-policy.ts). */
@@ -819,11 +841,25 @@ export type SearchProvider = 'tavily' | 'kagi' | 'searxng'
  *  `hfToken` (spec 10 §4) that sets/clears the stored Hugging Face token. `comfyui`
  *  is patchable per-field (only `enabled` is set here; `gatePath` is owned by the
  *  install endpoints). */
-export type DaemonSettingsPatch = Partial<Omit<DaemonSettings, 'comfyui' | 'tavilyKeySet' | 'search' | 'mcp' | 'experimental' | 'code' | 'requestLog'>> & {
+export type DaemonSettingsPatch = Partial<Omit<DaemonSettings, 'comfyui' | 'tavilyKeySet' | 'search' | 'mcp' | 'experimental' | 'code' | 'requestLog' | 'remoteAccess'>> & {
   comfyui?: Partial<ComfyUiSettings>
   /** Patchable per-field — the backend applies each key independently (api/routes.ts), so a
    *  patch touching only one flag must not be forced to also supply the other. */
   experimental?: Partial<DaemonSettings['experimental']>
+  /** Patchable per-field, same reason as `experimental` — routes.ts's PATCH handler applies
+   *  each `remoteAccess.*` candidate independently (provider, ingressPort, cloudflare.*,
+   *  ngrok.*, tailscale.port, custom.publicUrl), so a patch touching only the provider must not
+   *  be forced to also resend every secret field. `enabled`/`lastUrl` are excluded too (M5,
+   *  final-review.md): both are runtime-owned by /remote/start and /remote/stop, and the PATCH
+   *  handler silently ignores them, so typing them here as patchable would typecheck a write
+   *  that does nothing. */
+  remoteAccess?: Partial<Omit<RemoteAccessSettings, 'cloudflare' | 'ngrok' | 'tailscale' | 'custom' | 'enabled' | 'lastUrl'>> & {
+    cloudflare?: { tunnelToken?: string; hostname?: string; accessTeamDomain?: string; accessAud?: string; requireAccess?: boolean }
+    ngrok?: { authtoken?: string; domain?: string }
+    tailscale?: { port?: number }
+    custom?: { publicUrl?: string }
+    tokenGrant?: { capabilities?: string[]; models?: string[] }
+  }
   /** Patchable per-field, same reason as `experimental` — routes.ts applies each candidate list
    *  independently. */
   code?: Partial<DaemonSettings['code']>

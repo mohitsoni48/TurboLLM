@@ -176,6 +176,12 @@ export interface ExperimentalFeatures {
    *  back on restores the previous state exactly. See `link/gate.ts` for the one predicate
    *  every one of those surfaces calls, and for the ADR-280 removal path. */
   turboLink: boolean
+  /** Master gate for multi-provider Remote access (ADR-422) — visibility AND behaviour, the
+   *  same two-layer shape as `turboLink`. When off: the Settings → Remote access pane and the
+   *  shell chip do not render, `/api/v1/remote/*` refuses with a typed code, and the
+   *  supervisor does not run. Deliberately does NOT gate Phase 1's ingress listener or
+   *  `--tunnel`, both of which must keep working for every install. */
+  remoteAccess: boolean
 }
 export interface Telemetry {
   level: string
@@ -357,6 +363,65 @@ export interface CodeConfig {
  *  bigger, not-yet-built feature (the BYO-cloud orchestration line, ADR-003). */
 export interface CloudDeployConfig {
   runpodTemplateId: string
+}
+
+/** Remote access provider ids (ADR-422, spec 30 §3). */
+export const REMOTE_PROVIDERS = [
+  'cloudflare-quick',
+  'cloudflare-named',
+  'tailscale-serve',
+  'tailscale-funnel',
+  'ngrok',
+  'custom',
+] as const
+export type RemoteProviderId = (typeof REMOTE_PROVIDERS)[number]
+
+/** Remote access (ADR-422). Top-level, like cloudDeploy/requestLog/tools — not nested under
+ *  `daemon` — because it owns its own credentials and runtime, not a daemon listener setting. */
+export interface RemoteAccessConfig {
+  /** Desired state. Survives restarts — this is what replaces `--tunnel`. */
+  enabled: boolean
+  provider: RemoteProviderId
+  /** Loopback port every provider's local leg connects to. MUST differ from daemon.port —
+   *  `resolveIngressPort` enforces that rather than letting the second bind fail at start. */
+  ingressPort: number
+  cloudflare: {
+    tunnelToken: string
+    hostname: string
+    accessTeamDomain: string
+    accessAud: string
+    requireAccess: boolean
+  }
+  ngrok: { authtoken: string; domain: string }
+  /** Tailscale's PUBLIC port — 443/8443/10000 only. NOT the local target, which is
+   *  ingressPort (spec 30 §3.4: do not conflate the two). */
+  tailscale: { port: 443 | 8443 | 10000 }
+  custom: { publicUrl: string }
+  /** Capability scope minted remote tokens receive (§6.3). Structural rather than an import
+   *  of link/types' LinkGrant: config.ts is the low-level store and must not depend on a
+   *  feature module. Phase 5 validates these strings against LINK_CAPABILITIES, where that
+   *  import is legal. */
+  tokenGrant: { capabilities: string[]; models?: string[] }
+  /** Last known public URL, shown immediately after a daemon restart, stale until probed. */
+  lastUrl: string
+}
+
+/** Coerce anything unrecognized to the zero-setup default rather than leaving a broken id
+ *  that no provider factory can resolve. */
+export function normalizeProvider(v: unknown): RemoteProviderId {
+  return (REMOTE_PROVIDERS as readonly string[]).includes(v as string)
+    ? (v as RemoteProviderId)
+    : 'cloudflare-quick'
+}
+
+/** The ingress listener and the main listener cannot share a port. Resolve the collision
+ *  here — at config-read time — so it surfaces as a corrected value rather than an
+ *  EADDRINUSE 30 seconds into startup. 6996/6997 are the only two ports this project uses,
+ *  so the swap is between exactly those (AGENTS.md §2). */
+export function resolveIngressPort(ingressPort: number, daemonPort: number): number {
+  const p = Number.isInteger(ingressPort) && ingressPort > 0 && ingressPort < 65536 ? ingressPort : 6997
+  if (p !== daemonPort) return p
+  return daemonPort === 6997 ? 6996 : 6997
 }
 
 /** App-level auto-update settings (spec 29 B.4). Deliberately reuses the per-engine
@@ -549,6 +614,8 @@ export interface Config {
   code: CodeConfig
   /** Cloud Launch deploy-link settings (ADR-153). */
   cloudDeploy: CloudDeployConfig
+  /** Remote access — tunnel providers, ingress port, credentials (ADR-422). */
+  remoteAccess: RemoteAccessConfig
   /** App-level auto-update policy + dismissed-toast memory (spec 29 B.4). */
   appUpdate: AppUpdateConfig
   devModel?: DevModel
@@ -665,7 +732,7 @@ export function defaultConfig(): Config {
       theme: 'system',
       autoGenerateTitles: true,
       autoMemoryEnabled: false,
-      experimental: { memory: false, cloudDeploy: false, routines: false, turboLink: false },
+      experimental: { memory: false, cloudDeploy: false, routines: false, turboLink: false, remoteAccess: false },
     },
     telemetry: { level: 'full', machineId: '' },
     apiKeys: [],
@@ -699,6 +766,17 @@ export function defaultConfig(): Config {
     build: { toolchainDirs: [] },
     code: { agentsMdProjectCandidates: ['AGENTS.md', 'agents.md', 'CLAUDE.md'], agentsMdGlobalCandidates: ['agents.md', 'AGENTS.md', 'CLAUDE.md'], defaultAgent: 'turbollm' },
     cloudDeploy: { runpodTemplateId: '' },
+    remoteAccess: {
+      enabled: false,
+      provider: 'cloudflare-quick',
+      ingressPort: 6997,
+      cloudflare: { tunnelToken: '', hostname: '', accessTeamDomain: '', accessAud: '', requireAccess: false },
+      ngrok: { authtoken: '', domain: '' },
+      tailscale: { port: 443 },
+      custom: { publicUrl: '' },
+      tokenGrant: { capabilities: ['models:use'] },
+      lastUrl: '',
+    },
     appUpdate: { policy: 'notify', dismissedVersion: '' },
   }
 }
@@ -1138,6 +1216,41 @@ function normalize(c: Config): void {
   // Cloud Launch deploy-link settings (ADR-153): absent in pre-ADR-153 configs → ''.
   const cd = (c.cloudDeploy ?? {}) as Partial<CloudDeployConfig>
   c.cloudDeploy = { runpodTemplateId: typeof cd.runpodTemplateId === 'string' ? cd.runpodTemplateId.trim() : '' }
+  // Remote access (ADR-422): absent in pre-ADR-422 configs → the full default block, so no
+  // migration step is needed (same posture as cloudDeploy above).
+  const ra = (c.remoteAccess ?? {}) as Partial<RemoteAccessConfig>
+  const rcf = (ra.cloudflare ?? {}) as Partial<RemoteAccessConfig['cloudflare']>
+  const rng = (ra.ngrok ?? {}) as Partial<RemoteAccessConfig['ngrok']>
+  const rts = (ra.tailscale ?? {}) as Partial<RemoteAccessConfig['tailscale']>
+  const rcu = (ra.custom ?? {}) as Partial<RemoteAccessConfig['custom']>
+  const str = (v: unknown): string => (typeof v === 'string' ? v.trim() : '')
+  c.remoteAccess = {
+    enabled: ra.enabled === true,
+    provider: normalizeProvider(ra.provider),
+    ingressPort: resolveIngressPort(typeof ra.ingressPort === 'number' ? ra.ingressPort : 6997, c.daemon.port),
+    cloudflare: {
+      tunnelToken: str(rcf.tunnelToken),
+      hostname: str(rcf.hostname),
+      accessTeamDomain: str(rcf.accessTeamDomain),
+      accessAud: str(rcf.accessAud),
+      requireAccess: rcf.requireAccess === true,
+    },
+    ngrok: { authtoken: str(rng.authtoken), domain: str(rng.domain) },
+    tailscale: { port: rts.port === 8443 || rts.port === 10000 ? rts.port : 443 },
+    custom: { publicUrl: str(rcu.publicUrl) },
+    // Only the SHAPE is guaranteed here. Phase 5 filters these against LINK_CAPABILITIES,
+    // where importing link/types is legal — a hand-edited config must not be able to invent
+    // a capability, but config.ts is the wrong layer to know what the real ones are.
+    tokenGrant: {
+      capabilities: Array.isArray(ra.tokenGrant?.capabilities)
+        ? ra.tokenGrant.capabilities.filter((x): x is string => typeof x === 'string')
+        : ['models:use'],
+      models: Array.isArray(ra.tokenGrant?.models)
+        ? ra.tokenGrant.models.filter((x): x is string => typeof x === 'string')
+        : undefined,
+    },
+    lastUrl: str(ra.lastUrl),
+  }
   // App auto-update settings (spec 29 B.4): absent in pre-this-feature configs → the
   // 'notify' default. The policy string is NOT validated here — `normalizeUpdatePolicy`
   // (engines/update.ts) already maps anything unrecognized to 'notify' at every read
@@ -1173,6 +1286,7 @@ function normalize(c: Config): void {
     // untouched, and come back the moment the flag goes on; inferring consent from their
     // presence would silently enable an unverified cross-machine feature on upgrade.
     turboLink: ex.turboLink === true,
+    remoteAccess: ex.remoteAccess === true,
   }
   // Telemetry level (spec 09 §3): the UI exposes 'off' | 'anon' | 'full'. Migrate
   // legacy/unknown values safely → 'off' (the conservative, opt-in default).
