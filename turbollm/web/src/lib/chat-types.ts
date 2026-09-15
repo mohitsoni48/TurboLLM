@@ -134,6 +134,17 @@ export interface Conversation {
    *  their final answer) so the model can see its own prior thinking. On by default for
    *  new conversations; conversations from before this default flipped stay off. */
   preserveThinking: boolean
+  /** Compaction (ADR-420). Undefined = never compacted. See the backend's
+   *  chat-compaction.ts for the full contract — the frontend only ever reads these three,
+   *  it never computes a cut itself. */
+  compactionSummary?: string
+  compactionUpToMessageId?: string
+  compactionTokensBefore?: number
+  /** When the compaction was applied. The context meter reads the last assistant message's
+   *  RECORDED ctxUsed, which compaction never rewrites — comparing that message's createdAt
+   *  against this is what tells a stale pre-compaction measurement apart from a real
+   *  post-compaction one. */
+  compactionAppliedAt?: string
   createdAt: string
   updatedAt: string
   messages?: Message[]
@@ -159,6 +170,7 @@ export interface Folder {
 // SSE event payloads
 export type ChatSseEvent =
   | { event: 'meta';      data: { userMessageId: string; assistantMessageId: string } }
+  | { event: 'compaction'; data: { phase: 'start' | 'end' } }
   | { event: 'progress';  data: { phase: string; processed: number; total: number; pct: number; tps: number } }
   | { event: 'reasoning'; data: { delta: string } }
   | { event: 'delta';     data: { delta: string } }

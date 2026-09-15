@@ -26,8 +26,8 @@ import { LinkManager } from './link-manager'
 import { RemoteCatalog } from './remote-catalog'
 import { ModelRouter } from '../gateway/model-router'
 import { verifyKeyValue } from '../auth'
-import { TURBO_LINK_DISABLED_CODE, isTurboLinkEnabled } from './gate'
-import type { ApiKey } from '../config/config'
+import { TURBO_LINK_DISABLED_CODE, isTurboLinkEnabled, isTurboLinkEnabledIn } from './gate'
+import type { ApiKey, Config } from '../config/config'
 import type { Deps } from '../deps'
 import type { LinkRecord } from './types'
 
@@ -88,6 +88,25 @@ test('isTurboLinkEnabled reads daemon.experimental.turboLink and fails closed', 
   // half-written file must never read as "on".
   const bare = { store: { snapshot: () => ({ daemon: {} }) } } as unknown as Deps
   assert.equal(isTurboLinkEnabled(bare), false)
+})
+
+test('isTurboLinkEnabledIn reads the same field straight off a Config, no Deps required', () => {
+  // The gate a pure planner (engines/auto-load.ts) calls: it has a Config snapshot, not a live
+  // Deps graph, and must not have to fabricate one to ask this question.
+  assert.equal(isTurboLinkEnabledIn(mkDeps(true).cfg as unknown as Config), true)
+  assert.equal(isTurboLinkEnabledIn(mkDeps(false).cfg as unknown as Config), false)
+  // Same fail-closed guarantee as isTurboLinkEnabled, on the same half-written shape.
+  const bare = { daemon: {} } as unknown as Config
+  assert.equal(isTurboLinkEnabledIn(bare), false)
+})
+
+test('isTurboLinkEnabled delegates to isTurboLinkEnabledIn rather than re-implementing the read', () => {
+  // Same input, both entry points — proves there is exactly one place this decision is made,
+  // which is the whole point of ADR-376's "one greppable gate" (this file's own header comment).
+  for (const on of [true, false]) {
+    const { d, cfg } = mkDeps(on)
+    assert.equal(isTurboLinkEnabled(d), isTurboLinkEnabledIn(cfg as unknown as Config))
+  }
 })
 
 // ── the host façade ───────────────────────────────────────────────────────────

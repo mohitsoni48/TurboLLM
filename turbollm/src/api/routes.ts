@@ -1781,7 +1781,7 @@ export function registerApi(app: Hono, d: Deps): void {
       const deleted = await d.scanner.delete(key)
       return c.json({ ok: true, deleted })
     } catch (e2) {
-      if (e2 instanceof ScannerError) return err(c, 404, e2.code, e2.message)
+      if (e2 instanceof ScannerError) return err(c, e2.code === 'unsafe_model_delete' ? 409 : 404, e2.code, e2.message)
       return err(c, 500, 'delete_failed', (e2 as Error).message)
     }
   })

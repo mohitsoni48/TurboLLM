@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useParams, useSearchParams } from 'react-router-dom'
-import { ArrowDown, Copy, Download, PanelLeft, Paperclip, SendHorizontal, Share2, SlidersHorizontal, Square, UserRound, X } from 'lucide-react'
+import { ArrowDown, Copy, Download, Loader2, PanelLeft, Paperclip, SendHorizontal, Share2, Shrink, SlidersHorizontal, Square, UserRound, X } from 'lucide-react'
 import { continueConversation, fetchSysInfo, listMemoryFacts, sendMessage } from '../lib/chat-api'
 import { extractPdfText } from '../lib/pdf-extract'
 import { chatKeys, useConversation, useConversationMutations } from '../lib/chat-queries'
@@ -28,6 +28,7 @@ import { DEFAULT_REASONING_EFFORT, ReasoningEffortSelect, type ReasoningEffort }
 import { MessageBubble, StreamingBubble } from './chat/MessageBubble'
 import { ToolApprovalBar } from './chat/ToolApprovalBar'
 import { ContextMeter } from './chat/ContextMeter'
+import { CompactionDivider } from './chat/CompactionDivider'
 import { ConversationSidebar } from './chat/ConversationSidebar'
 import { readSavedSidebarWidth, SIDEBAR_MIN_W, sidebarMaxW, SidebarResizeHandle } from './chat/SidebarResizeHandle'
 import { ModelLoadMenu } from '../components/ModelLoadMenu'
@@ -55,6 +56,9 @@ interface LiveState {
   liveGenTps: number  // rolling 2s window estimate during generation phase
   genTokens: number   // running count of generated tokens (content + reasoning) for this reply
   timeline: LiveBlock[]
+  /** True while an auto-compact call (ADR-420) is in flight for this conversation's
+   *  current turn — drives the composer placeholder swap below. */
+  compacting: boolean
 }
 
 /** Fit a model name into the composer placeholder. Measured on-device: the input is 230px at the
@@ -679,10 +683,12 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
           deltaTimestamps.current[convId] = []
           setLiveByConv((prev) => ({
             ...prev,
-            [convId]: { assistantId: evt.data.assistantMessageId, content: '', reasoning: '', progress: null, liveGenTps: 0, genTokens: 0, timeline: [] },
+            [convId]: { assistantId: evt.data.assistantMessageId, content: '', reasoning: '', progress: null, liveGenTps: 0, genTokens: 0, timeline: [], compacting: false },
           }))
           // Optimistically reflect the new/last user msg in the UI by invalidating
           void qc.invalidateQueries({ queryKey: ['conversation', convId] })
+        } else if (evt.event === 'compaction') {
+          updateLive(convId, (l) => ({ ...l, compacting: evt.data.phase === 'start' }))
         } else if (evt.event === 'progress') {
           updateLive(convId, (l) => ({ ...l, progress: { phase: evt.data.phase, pct: evt.data.pct, tps: evt.data.tps } }))
         } else if (evt.event === 'reasoning') {
@@ -747,10 +753,31 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     }
   }
 
+  // Manual compaction (ADR-420), the header button AND `/compact` (below) both dispatch
+  // through here — one trigger, one in-flight state (`mut.compact.isPending`), so the
+  // composer disable/banner and the button's own disabled state can never disagree about
+  // whether a compaction is running.
+  const runCompact = () => {
+    if (!activeId || mut.compact.isPending) return
+    track('chat', 'manual_compact')
+    mut.compact.mutate({ convId: activeId, model: activeRemoteId ?? undefined }, { onError: () => toast.error('Could not compact this conversation.') })
+  }
+
   const send = async (overrideInput?: string) => {
     const rawText = (overrideInput ?? input).trim()
     if ((!rawText && attachments.length === 0) || live) return
     if (!ready) { toast.error('Load a model first.'); return }
+
+    // `/compact` — a composer command, not a real turn: it never reaches the engine as a
+    // message, it just runs the same manual-compaction call as the header button (mirrors
+    // Code's own `/compact`, lib/code-commands.ts — no argument here, unlike Code's optional
+    // focus instructions, since chat's compaction has no such concept to pass one to).
+    if (/^\/compact\s*$/i.test(rawText)) {
+      setInput('')
+      setTimeout(autoResize, 0)
+      runCompact()
+      return
+    }
 
     // A message that starts with '/skill-id' enables that skill for this send — no matter
     // how the token got there (picker click, Tab-complete, or just typed/pasted) — and the
@@ -888,13 +915,44 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   }
 
   // Context meter
-  const lastStats = messages.findLast((m) => m.role === 'assistant')?.stats
-  const ctxUsed  = lastStats?.ctxUsed ?? 0
+  const lastAssistant = messages.findLast((m) => m.role === 'assistant')
+  const lastStats = lastAssistant?.stats
+  // `ctxUsed` is a MEASUREMENT of what the last turn actually sent, and compaction
+  // deliberately never rewrites an old message's stats. So straight after compacting, the
+  // meter would still read the pre-compaction number — the feature's whole effect invisible
+  // until the next message, which read as "compaction did nothing" (founder-reported
+  // 2026-09-12). When the last measurement predates the compaction, project the new size
+  // instead: the same measured number, minus what was folded into the summary, plus the
+  // summary itself. Once a real turn has run on the compacted prompt, its own measurement is
+  // authoritative and no projection is applied.
+  const measuredCtxUsed = lastStats?.ctxUsed ?? 0
+  const compactionIsNewerThanMeasurement = !!conv?.compactionAppliedAt && !!lastAssistant
+    && conv.compactionAppliedAt > lastAssistant.createdAt
+  const ctxUsed = compactionIsNewerThanMeasurement
+    ? Math.max(0, measuredCtxUsed - (conv!.compactionTokensBefore ?? 0) + Math.ceil((conv!.compactionSummary?.length ?? 0) / 3.5))
+    : measuredCtxUsed
   // Prefer the currently-loaded model's ctx (fresh after a reload) over the last
   // message's reported max, which goes stale when settings change.
   // On a remote machine the last reply's own reported max IS the fresh number — the local
   // manager's `model.ctx` describes a different model on a different box.
   const ctxMax   = activeRemoteId ? (lastStats?.ctxMax ?? 0) : (model?.ctx || lastStats?.ctxMax || 0)
+
+  // The transcript's own list (the live streaming bubble renders separately), plus where the
+  // compaction cut falls in it — everything at/before that index is dimmed, since it's no
+  // longer part of what the model sees.
+  const renderedMessages = messages.filter((m) => m.id !== live?.assistantId)
+  const compactedThroughIdx = conv?.compactionSummary && conv.compactionUpToMessageId
+    ? renderedMessages.findIndex((m) => m.id === conv.compactionUpToMessageId)
+    : -1
+  // Where the divider goes: after the last message that already existed when compaction ran.
+  // That's the moment the user pressed Compact, which is what the marker is reporting. Falls
+  // back to the cut itself for conversations compacted before compactionAppliedAt existed
+  // (pre-v51), which have no recorded moment to anchor to.
+  const dividerAfterIdx = !conv?.compactionSummary
+    ? -1
+    : conv.compactionAppliedAt
+      ? renderedMessages.reduce((last, m, i) => (m.createdAt <= conv.compactionAppliedAt! ? i : last), -1)
+      : compactedThroughIdx
 
   // Chatting with a linked machine needs nothing loaded HERE. Requiring it is precisely
   // what made every remote row unusable.
@@ -1069,6 +1127,31 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
               <ContextMeter ctxUsed={ctxUsed} ctxMax={ctxMax} />
             </div>
           )}
+          {/* Wrapped in the SAME `hidden sm:flex` as the ContextMeter above it, deliberately:
+              below `sm` the meter is display:none, so its `ml-auto` never applies — an
+              unwrapped button here would render flush against the left-hand header content
+              (Share's own `ml-auto` becoming the first auto margin and flying to the right),
+              leaving an unlabelled icon marooned mid-header with no context percentage
+              anywhere on screen to explain it and no tooltip on touch. No `ml-auto` of its
+              own is needed: at `sm` and up the meter's own `ml-auto` already absorbs the free
+              space, and this packs in directly beside it. */}
+          {ready && !readonly && activeId && ctxMax > 0 && ctxUsed / ctxMax > 0.5 && !live?.compacting && (
+            <div className="hidden sm:flex">
+              <Button
+                size="icon"
+                variant="ghost"
+                className="h-8 w-8"
+                title="Compact this conversation now"
+                // The manual path has no SSE stream, so `live.compacting` never covers it —
+                // without this the button stays clickable for the whole call and a second
+                // click fires a second concurrent summarization.
+                disabled={mut.compact.isPending}
+                onClick={runCompact}
+              >
+                <Shrink size={15} />
+              </Button>
+            </div>
+          )}
 
           {/* Share / Export menu (F-023, F-024) — only when a conversation is active */}
           {activeId && (
@@ -1168,22 +1251,46 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                 token has streamed), and the 'meta' event's optimistic refetch can pull it
                 into this list before the StreamingBubble below has caught up — a real empty
                 message bubble momentarily rendering above the answer that's still typing in. */}
-            {messages
-              .filter((m) => m.id !== live?.assistantId)
+            {renderedMessages
               .map((m, i, arr) => (
-                <MessageBubble
-                  key={m.id}
-                  message={m}
-                  convId={readonly ? undefined : activeId ?? undefined}
-                  isLast={i === arr.length - 1 && !live}
-                  daemonGenerating={daemonGenerating}
-                  onEdit={readonly ? undefined : (msg) => setEditingId(msg.id)}
-                  onDelete={readonly ? undefined : handleDelete}
-                  onRegenerate={readonly ? undefined : handleRegenerate}
-                  editingId={editingId}
-                  onEditSave={(content) => handleEditSave(m.id, content)}
-                  onEditCancel={() => setEditingId(null)}
-                />
+                <Fragment key={m.id}>
+                  {/* Dimmed above the cut: these messages are no longer sent to the model —
+                      the summary stands in for them. Nothing is hidden or collapsed (the
+                      "messages are never deleted" invariant is a UI promise too, and chat's
+                      branching relies on being able to scroll real history), but rendering
+                      them identically to live context is what made the divider read as a
+                      line dropped at random mid-conversation. Hover restores full contrast
+                      so the text stays readable on demand. */}
+                  <div className={cn(compactedThroughIdx >= 0 && i <= compactedThroughIdx && 'opacity-40 transition-opacity duration-150 hover:opacity-100')}>
+                    <MessageBubble
+                      message={m}
+                      convId={readonly ? undefined : activeId ?? undefined}
+                      isLast={i === arr.length - 1 && !live}
+                      daemonGenerating={daemonGenerating}
+                      onEdit={readonly ? undefined : (msg) => setEditingId(msg.id)}
+                      onDelete={readonly ? undefined : handleDelete}
+                      onRegenerate={readonly ? undefined : handleRegenerate}
+                      editingId={editingId}
+                      onEditSave={(content) => handleEditSave(m.id, content)}
+                      onEditCancel={() => setEditingId(null)}
+                    />
+                  </div>
+                  {/* The divider marks WHEN compaction happened, so it sits after the last
+                      message that existed at that moment — for a just-compacted chat that's
+                      the bottom of the transcript, which is where the user actually pressed
+                      Compact. Anchoring it to the CUT instead (its first shape) dropped a
+                      line into the middle of old history, where it read as random: the cut is
+                      a boundary in what the model still sees, and that's what the dimming
+                      above already shows. As new turns arrive it stays put rather than
+                      trailing them, since they postdate compactionAppliedAt. */}
+                  {i === dividerAfterIdx && conv?.compactionSummary && (
+                    <CompactionDivider
+                      summary={conv.compactionSummary}
+                      tokensBefore={conv.compactionTokensBefore ?? 0}
+                      onUndo={readonly ? undefined : () => { track('chat', 'undo_compaction'); mut.undoCompaction.mutate(activeId!, { onError: () => toast.error('Could not undo compaction.') }) }}
+                    />
+                  )}
+                </Fragment>
               ))}
 
             {/* Streaming bubble */}
@@ -1279,11 +1386,29 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                 </div>
               )}
 
+              {/* Prominent in-progress banner, directly above the textarea — same shape as
+                  Code's own manual-/compact banner (CodeComposer.tsx statusText), ported here
+                  because a placeholder-only "Compacting…" hint left the field itself fully
+                  typeable/sendable throughout the call, and was easy to miss entirely (the same
+                  founder-reported gap Code's compact hit first). `live?.compacting` covers the
+                  AUTO path (already disabled via the `!!live` checks below, since it's a real
+                  turn); `mut.compact.isPending` covers manual, which is a standalone POST with
+                  no `live` state of its own. */}
+              {activeId && (live?.compacting || mut.compact.isPending) && (
+                <div
+                  className="flex items-center gap-2 border-b px-3 py-2 text-[13px] font-medium"
+                  style={{ borderColor: 'var(--instruction-border)', background: 'var(--status-banner-bg)', color: 'var(--accent)' }}
+                >
+                  <Loader2 size={14} className="shrink-0 animate-spin" />
+                  <span>Compacting conversation…</span>
+                </div>
+              )}
+
               <div className="flex items-end gap-2 p-2">
                 <button
                   type="button"
                   onClick={() => { track('chat', 'attach_file'); fileInputRef.current?.click() }}
-                  disabled={!ready || !!live}
+                  disabled={!ready || !!live || mut.compact.isPending}
                   className="grid h-9 w-9 shrink-0 place-items-center rounded-md hover:bg-panel-2 disabled:opacity-40"
                   title="Attach image or document"
                 >
@@ -1309,9 +1434,18 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                   // model name gets a real "…" spliced in at a width that fits. Previously the
                   // decorative trailing "…" was itself the thing being clipped, leaving what read
                   // as a stray full stop after the model name (QA_UX_REPORT.md F-03, P2-1).
-                  placeholder={ready ? `Message ${truncateName(remoteChoice?.name ?? model?.name ?? 'the model')}` : 'Load a model to start chatting'}
+                  placeholder={
+                    // `live.compacting` is the AUTO path (an SSE event mid-turn); the manual
+                    // button is a plain POST with no stream, so it needs its own in-flight
+                    // flag or half the trigger surface shows no compacting state at all.
+                    activeId && (live?.compacting || mut.compact.isPending)
+                      ? 'Compacting conversation…'
+                      : ready
+                        ? `Message ${truncateName(remoteChoice?.name ?? model?.name ?? 'the model')}`
+                        : 'Load a model to start chatting'
+                  }
                   value={input}
-                  disabled={!ready || !!live || !!editingId}
+                  disabled={!ready || !!live || !!editingId || mut.compact.isPending}
                   onChange={(e) => { setInput(e.target.value); autoResize() }}
                   onKeyDown={(e) => {
                     if (skillPickerOpen) {
@@ -1341,7 +1475,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                     <Square size={15} />
                   </Button>
                 ) : (
-                  <Button size="icon" onClick={() => { track('chat', 'send_message'); void send() }} disabled={!ready || (!input.trim() && attachments.length === 0) || !!editingId} aria-label="Send">
+                  <Button size="icon" onClick={() => { track('chat', 'send_message'); void send() }} disabled={!ready || (!input.trim() && attachments.length === 0) || !!editingId || mut.compact.isPending} aria-label="Send">
                     <SendHorizontal size={15} />
                   </Button>
                 )}

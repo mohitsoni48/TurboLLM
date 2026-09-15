@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  createConversation, createFolder, deleteConversation, deleteFolder, deleteMemoryFact, deleteMessage, editMessage,
-  getConversation, listConversations, listFolders, listMemoryFacts, moveConversationToFolder, regenerate,
+  compactConversation, createConversation, createFolder, deleteConversation, deleteFolder, deleteMemoryFact, deleteMessage, editMessage,
+  getConversation, listConversations, listFolders, listMemoryFacts, moveConversationToFolder, regenerate, undoCompaction,
   renameFolder, stopGeneration, updateConversation,
 } from './chat-api'
 import type { Conversation } from './chat-types'
@@ -121,6 +121,14 @@ update: useMutation({
       // today only because the active message's id changes on refetch, which is load-bearing
       // but not obvious — invalidate explicitly instead of relying on that).
       onSuccess: (_d, convId) => { invalidateDetail(convId); void qc.invalidateQueries({ queryKey: ['message-variants'] }) },
+    }),
+    compact: useMutation({
+      mutationFn: ({ convId, model }: { convId: string; model?: string }) => compactConversation(convId, model),
+      onSuccess: (_d, { convId }) => invalidateDetail(convId),
+    }),
+    undoCompaction: useMutation({
+      mutationFn: (convId: string) => undoCompaction(convId),
+      onSuccess: (_d, convId) => invalidateDetail(convId),
     }),
     createFolder: useMutation({
       mutationFn: (name: string) => createFolder(name),

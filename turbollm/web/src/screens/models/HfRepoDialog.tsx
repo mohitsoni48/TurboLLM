@@ -22,6 +22,7 @@ import { useLinks, useRemoteDownloadActions } from '../../lib/link-queries'
 import { DownloadTargetMenu } from '../../components/fleet'
 import { describeRemoteFailure } from '../../lib/remote-failure'
 import type { FitVerdict, HfRepoFile } from '../../lib/types'
+import { gpuBudgetMb } from '../../lib/vram'
 import { Button } from '../../components/ui/button'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '../../components/ui/dropdown-menu'
 import { Sheet, SheetContent } from '../../components/ui/sheet'
@@ -119,7 +120,8 @@ export function HfRepoContent({
   const settingsQ = useSettings()
   const engineKind = statusQ.data?.engine.kind ?? ''
   const detail = detailQ.data
-  const vramMb = sysQ.data?.gpus?.[0]?.vramMb
+  // Discover has no load profile yet; use the default budget across all GPUs.
+  const vramMb = gpuBudgetMb(sysQ.data?.gpus ?? [])
   const isSafetensors = !!detail?.safetensors
   const [selected, setSelected] = useState<string>('')
 
