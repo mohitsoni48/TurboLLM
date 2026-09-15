@@ -25,6 +25,41 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.13.2] - 2026-09-15
+
+### Added
+
+- **Remote access** *(experimental, off by default)* — expose TurboLLM to the internet through
+  Cloudflare (Quick or Named tunnel), Tailscale (Serve or Funnel), ngrok, or your own reverse
+  proxy, from Settings → Network & sharing. A dedicated loopback ingress port replaces the old
+  `cf-ray`-header trust check, closing a hole where turning on any non-Cloudflare provider could
+  publish the daemon with no authentication at all. Enabling it mints a capability-scoped access
+  token — read-only, run-a-server, or full control, optionally pinned to specific models — instead
+  of handing out your regular API key, and the token is revoked automatically when you turn it
+  off. A live status chip shows connection state and lets you copy the current public URL or stop
+  sharing from anywhere in the app. Provider verification against real Cloudflare/Tailscale/ngrok
+  accounts is still in progress, so this stays behind Settings → Experimental for now — same as
+  Turbo Link.
+
+### Fixed
+
+- **Auto-load last model on start has never actually worked, since v0.1.0.** Reported as "load a
+  model, restart, and the last one doesn't come back." Root cause: the background model scan that
+  runs at startup and auto-load's own wait for it disagreed about when the scan was actually done,
+  so auto-load always looked up the last model against an empty library and silently gave up. Also
+  fixes a related bug where deleting a model could leave it listed until the next full rescan, and
+  quietly drifted start options (auto-load had its own copy of the model-launch flags that had
+  fallen out of sync with the manual Load button's — wrong flags for KoboldCpp, missing vLLM args).
+
+### Discord
+- 🌐 **Remote access, now built-in (experimental)** — turn on Settings → Experimental → Remote
+  access to share your TurboLLM instance over Cloudflare, Tailscale, ngrok, or your own tunnel,
+  with a scoped access token instead of a wide-open key. It's opt-in while we finish verifying it
+  against real accounts, so nothing changes unless you turn it on.
+- 🐛 **Auto-load last model, actually fixed this time** — this has quietly never worked, since the
+  very first release. If you restart TurboLLM expecting your last-used model to load automatically,
+  it now will.
+
 ## [1.13.1] - 2026-09-10
 
 ### Fixed
