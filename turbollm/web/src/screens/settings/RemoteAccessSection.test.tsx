@@ -31,20 +31,33 @@ const wrap = (ui: React.ReactElement) =>
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>{ui}</QueryClientProvider>)
 
 describe('RemoteAccessSection', () => {
-  it('states the quick tunnel cost on its card rather than hiding it', async () => {
+  it('states the quick tunnel cost on its card rather than hiding it (selected by default)', async () => {
     wrap(<RemoteAccessSection />)
     expect(await screen.findByText(/URL changes on every restart/i)).toBeTruthy()
     expect(screen.getByText(/no uptime guarantee/i)).toBeTruthy()
   })
 
-  it("warns that ngrok's interstitial appears in front of this UI", async () => {
+  it("warns that ngrok's interstitial appears in front of this UI, once selected", async () => {
+    // The Pros/Cons detail now expands only for the selected provider — a compact row per
+    // option, not a full spec dump for all six at once — so this needs a click first.
     wrap(<RemoteAccessSection />)
+    await userEvent.click(await screen.findByRole('radio', { name: /^ngrok$/i }))
     expect(await screen.findByText(/interstitial page in front of this UI/i)).toBeTruthy()
   })
 
-  it('describes Tailscale Serve as devices-only, not public', async () => {
+  it('describes Tailscale Serve as devices-only, not public, once selected', async () => {
     wrap(<RemoteAccessSection />)
+    await userEvent.click(await screen.findByRole('radio', { name: /tailscale serve/i }))
     expect(await screen.findByText(/your devices only/i)).toBeTruthy()
+  })
+
+  it('collapses unselected providers to a compact summary row, not a full Pros/Cons dump', async () => {
+    wrap(<RemoteAccessSection />)
+    // cloudflare-quick is selected by default and shows its detail...
+    expect(await screen.findByText(/URL changes on every restart/i)).toBeTruthy()
+    // ...but an unselected provider's Cons/Pros text is not dumped onto the page alongside it.
+    expect(screen.queryByText(/interstitial page in front of this UI/i)).toBeNull()
+    expect(screen.queryByText(/needs tailscale installed/i)).toBeNull()
   })
 
   it('renders a provider preflight reason verbatim, not a generic failure', async () => {

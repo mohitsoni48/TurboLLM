@@ -276,174 +276,21 @@ export function RemoteAccessSection() {
 
   return (
     <section className="flex flex-col gap-4">
+      {/* Primary card: the actual on/off control. This used to sit at the bottom of the
+          section, below the full provider list and the token-permissions checkboxes — easy to
+          miss on a page that scrolls, and disconnected from the heading that names it. It is
+          now the first thing this section renders, so it never depends on how far the reader
+          has scrolled. */}
       <div className="rounded-lg border border-border bg-panel p-4">
         <div className="mb-1 flex items-center gap-2">
           <Globe size={15} className="text-accent" />
           <h2 className="text-[13px] font-semibold uppercase tracking-wide text-faint">Remote access</h2>
         </div>
         <p className="mb-3 text-[12px] text-muted">
-          Reach this machine's chat from somewhere else. Each option's real cost is stated on its
-          card, before you turn it on.
+          Reach this machine's chat from somewhere else. Each option's real cost is stated below,
+          before you turn it on.
         </p>
 
-        <div role="radiogroup" aria-label="Remote access provider" className="flex flex-col gap-2">
-          {PROVIDER_IDS.map((id) => {
-            const card = PROVIDER_CARDS[id]
-            const selected = provider === id
-            const checking = preflightingFor === id
-            const reason =
-              preflight?.provider === id && (preflight.state.kind === 'unavailable' || preflight.state.kind === 'needs-setup')
-                ? preflight.state.reason
-                : null
-
-            return (
-              <div
-                key={id}
-                className="rounded-md border p-3"
-                style={{ borderColor: selected ? 'var(--accent)' : 'var(--border)' }}
-              >
-                <button type="button" role="radio" aria-checked={selected} aria-label={card.title} onClick={() => selectProvider(id)} className="w-full text-left">
-                  <div className="text-[13px] font-medium text-ink">{card.title}</div>
-                  <div className="mt-2 grid grid-cols-1 gap-x-4 gap-y-2 sm:grid-cols-2">
-                    <div>
-                      <div className="text-[11px] font-semibold" style={{ color: 'var(--ok)' }}>Pros</div>
-                      <ul className="mt-1 flex flex-col gap-1">
-                        {card.pros.map((p, i) => (
-                          <li key={i} className="flex gap-1.5 text-[12px] leading-snug text-ink">
-                            <Check size={12} className="mt-px shrink-0" style={{ color: 'var(--ok)' }} />
-                            <span>{p}</span>
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-                    <div>
-                      <div className="text-[11px] font-semibold" style={{ color: 'var(--warn)' }}>Cons</div>
-                      <ul className="mt-1 flex flex-col gap-1">
-                        {card.cons.map((c, i) => (
-                          <li key={i} className="flex gap-1.5 text-[12px] leading-snug text-ink">
-                            <Minus size={12} className="mt-px shrink-0" style={{ color: 'var(--warn)' }} />
-                            <span>{c}</span>
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-                  </div>
-                </button>
-
-                {selected && checking && !reason && (
-                  <div className="mt-3 flex items-center gap-1.5 text-[12px] text-faint">
-                    <Loader2 size={12} className="animate-spin" /> Checking…
-                  </div>
-                )}
-
-                {selected && reason && (
-                  <div
-                    className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-md border p-2"
-                    style={{ borderColor: 'color-mix(in srgb, var(--err) 40%, var(--border))', background: 'color-mix(in srgb, var(--err) 8%, transparent)' }}
-                  >
-                    <span className="inline-flex items-center gap-1.5 text-[12px]" style={{ color: 'var(--err)' }}>
-                      <AlertTriangle size={13} /> {reason}
-                    </span>
-                    <Button size="sm" variant="outline" onClick={() => runPreflight(id)} disabled={checking}>
-                      {checking ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
-                      Check again
-                    </Button>
-                  </div>
-                )}
-
-                {selected && id === 'cloudflare-named' && (
-                  <div className="mt-3 flex flex-col gap-2 border-t border-border pt-3">
-                    <label className="text-[12px] text-muted" htmlFor="remote-cf-token">Tunnel token</label>
-                    <input
-                      id="remote-cf-token"
-                      type="password"
-                      value={cfToken}
-                      onChange={(e) => setCfToken(e.target.value)}
-                      placeholder={settingsQ.data?.remoteAccess?.cloudflare?.hasTunnelToken ? 'Stored — leave blank to keep' : 'Paste the token from the Cloudflare dashboard'}
-                      spellCheck={false}
-                      autoComplete="off"
-                      className="rounded-md border border-border bg-bg px-2 py-1.5 text-[13px] text-ink outline-none"
-                    />
-                    <label className="text-[12px] text-muted" htmlFor="remote-cf-hostname">Hostname</label>
-                    <input
-                      id="remote-cf-hostname"
-                      type="text"
-                      value={cfHostname}
-                      onChange={(e) => setCfHostname(e.target.value)}
-                      placeholder="llm.example.com"
-                      spellCheck={false}
-                      autoComplete="off"
-                      className="rounded-md border border-border bg-bg px-2 py-1.5 text-[13px] text-ink outline-none"
-                    />
-                    <div><Button size="sm" variant="outline" onClick={saveCloudflare} disabled={save.isPending}>Save</Button></div>
-                  </div>
-                )}
-
-                {selected && id === 'ngrok' && (
-                  <div className="mt-3 flex flex-col gap-2 border-t border-border pt-3">
-                    <label className="text-[12px] text-muted" htmlFor="remote-ngrok-token">Authtoken</label>
-                    <input
-                      id="remote-ngrok-token"
-                      type="password"
-                      value={ngrokToken}
-                      onChange={(e) => setNgrokToken(e.target.value)}
-                      placeholder={settingsQ.data?.remoteAccess?.ngrok?.hasAuthtoken ? 'Stored — leave blank to keep' : 'Paste your ngrok authtoken'}
-                      spellCheck={false}
-                      autoComplete="off"
-                      className="rounded-md border border-border bg-bg px-2 py-1.5 text-[13px] text-ink outline-none"
-                    />
-                    <label className="text-[12px] text-muted" htmlFor="remote-ngrok-domain">Reserved domain (optional)</label>
-                    <input
-                      id="remote-ngrok-domain"
-                      type="text"
-                      value={ngrokDomain}
-                      onChange={(e) => setNgrokDomain(e.target.value)}
-                      placeholder="Leave blank for a random ngrok URL"
-                      spellCheck={false}
-                      autoComplete="off"
-                      className="rounded-md border border-border bg-bg px-2 py-1.5 text-[13px] text-ink outline-none"
-                    />
-                    <div><Button size="sm" variant="outline" onClick={saveNgrok} disabled={save.isPending}>Save</Button></div>
-                  </div>
-                )}
-
-                {selected && (id === 'tailscale-serve' || id === 'tailscale-funnel') && (
-                  <div className="mt-3 flex items-center gap-2 border-t border-border pt-3">
-                    <label className="text-[12px] text-muted" htmlFor="remote-ts-port">Port</label>
-                    <select
-                      id="remote-ts-port"
-                      value={tsPort}
-                      onChange={(e) => saveTailscalePort(Number(e.target.value))}
-                      className="rounded-md border border-border bg-bg px-2 py-1.5 text-[13px] text-ink outline-none"
-                    >
-                      {TAILSCALE_PORTS.map((p) => <option key={p} value={p}>{p}</option>)}
-                    </select>
-                  </div>
-                )}
-
-                {selected && id === 'custom' && (
-                  <div className="mt-3 flex flex-col gap-2 border-t border-border pt-3">
-                    <label className="text-[12px] text-muted" htmlFor="remote-custom-url">Public URL</label>
-                    <input
-                      id="remote-custom-url"
-                      type="text"
-                      value={customUrl}
-                      onChange={(e) => setCustomUrl(e.target.value)}
-                      placeholder="https://llm.example.com"
-                      spellCheck={false}
-                      autoComplete="off"
-                      className="rounded-md border border-border bg-bg px-2 py-1.5 font-mono text-[12px] text-ink outline-none"
-                    />
-                    <div><Button size="sm" variant="outline" onClick={saveCustomUrl} disabled={save.isPending}>Save</Button></div>
-                  </div>
-                )}
-              </div>
-            )
-          })}
-        </div>
-      </div>
-
-      <div className="rounded-lg border border-border bg-panel p-4">
         {/* I3 (final-review.md): a refused or unreachable status request must not render
             identically to "off" — show it. */}
         {statusQ.isError && (
@@ -459,31 +306,10 @@ export function RemoteAccessSection() {
             {statusQ.error instanceof ApiError ? statusQ.error.message : 'Could not reach remote access status.'}
           </div>
         )}
-        <div className="mb-3 flex flex-col gap-1.5 border-b border-border pb-3">
-          <div className="text-[12px] font-medium text-ink">Token permissions</div>
-          <p className="text-[11px] text-faint">
-            What the access token minted the next time you turn this on is allowed to do.
-          </p>
-          <p className="text-[11px] text-faint">
-            A scoped token can chat and manage conversations; it cannot see full engine/model
-            status detail or change settings.
-          </p>
-          <div className="flex flex-col gap-1">
-            {REMOTE_TOKEN_CAPABILITIES.map((cap) => (
-              <label key={cap} className="flex items-center gap-2 text-[12px] text-ink">
-                <input
-                  type="checkbox"
-                  checked={tokenCaps.has(cap)}
-                  onChange={(e) => toggleTokenCap(cap, e.target.checked)}
-                />
-                <span className="font-mono">{cap}</span>
-              </label>
-            ))}
-          </div>
-        </div>
-        <div className="flex items-center justify-between gap-3">
+
+        <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-bg p-3">
           <div>
-            <div className="text-[13px] font-medium text-ink">Remote access</div>
+            <div className="text-[13px] font-medium text-ink">{PROVIDER_CARDS[provider].title}</div>
             {/* Generic on/off state text — LiveStateBlock below carries every state-specific
                 detail (including WHY it isn't reachable), so this line no longer claims
                 "reachable" for a state that might be starting, reconnecting, failed,
@@ -492,6 +318,7 @@ export function RemoteAccessSection() {
           </div>
           <Switch aria-label="Remote access" checked={isOn} onCheckedChange={onToggle} disabled={toggling} />
         </div>
+
         <div className="mt-3">
           {/* C3 bypass (a) (final-review.md) / I-new-2 (final-review-fix-rereview.md): both
               Retry (failed) and Check again (needs-setup/unavailable) call the SAME
@@ -503,6 +330,7 @@ export function RemoteAccessSection() {
               never assume stale consent still applies any more than Retry can. */}
           <LiveStateBlock status={status} onRetry={() => onToggle(true)} toggling={toggling} />
         </div>
+
         {revealedToken && (
           <div
             className="mt-3 rounded-md border p-3"
@@ -518,6 +346,218 @@ export function RemoteAccessSection() {
             </p>
           </div>
         )}
+      </div>
+
+      {/* Provider picker: compact single-line rows. Pros/Cons and provider-specific fields used
+          to render for all six options at once, all the time — a long scroll of duplicated
+          detail. Only the selected row now expands, so choosing a provider looks like a normal
+          settings list instead of an unfiltered spec dump. */}
+      <div className="rounded-lg border border-border bg-panel p-4">
+        <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-faint">Provider</div>
+        <div role="radiogroup" aria-label="Remote access provider" className="flex flex-col gap-1.5">
+          {PROVIDER_IDS.map((id) => {
+            const card = PROVIDER_CARDS[id]
+            const selected = provider === id
+            const checking = preflightingFor === id
+            const reason =
+              preflight?.provider === id && (preflight.state.kind === 'unavailable' || preflight.state.kind === 'needs-setup')
+                ? preflight.state.reason
+                : null
+
+            return (
+              <div
+                key={id}
+                className="rounded-md border"
+                style={{
+                  borderColor: selected ? 'var(--accent)' : 'var(--border)',
+                  background: selected ? 'color-mix(in srgb, var(--accent) 6%, transparent)' : 'transparent',
+                }}
+              >
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={selected}
+                  aria-label={card.title}
+                  onClick={() => selectProvider(id)}
+                  className="flex w-full items-center gap-2.5 p-2.5 text-left"
+                >
+                  <span
+                    className="flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-full border"
+                    style={{ borderColor: selected ? 'var(--accent)' : 'var(--border-strong)' }}
+                  >
+                    {selected && <span className="h-1.5 w-1.5 rounded-full" style={{ background: 'var(--accent)' }} />}
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-[13px] font-medium text-ink">{card.title}</span>
+                    <span className="block truncate text-[11px] text-faint">{card.summary}</span>
+                  </span>
+                </button>
+
+                {selected && (
+                  <div className="border-t border-border px-3 pb-3 pt-2.5">
+                    <div className="grid grid-cols-1 gap-x-4 gap-y-2 sm:grid-cols-2">
+                      <div>
+                        <div className="text-[11px] font-semibold" style={{ color: 'var(--ok)' }}>Pros</div>
+                        <ul className="mt-1 flex flex-col gap-1">
+                          {card.pros.map((p, i) => (
+                            <li key={i} className="flex gap-1.5 text-[12px] leading-snug text-ink">
+                              <Check size={12} className="mt-px shrink-0" style={{ color: 'var(--ok)' }} />
+                              <span>{p}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                      <div>
+                        <div className="text-[11px] font-semibold" style={{ color: 'var(--warn)' }}>Cons</div>
+                        <ul className="mt-1 flex flex-col gap-1">
+                          {card.cons.map((c, i) => (
+                            <li key={i} className="flex gap-1.5 text-[12px] leading-snug text-ink">
+                              <Minus size={12} className="mt-px shrink-0" style={{ color: 'var(--warn)' }} />
+                              <span>{c}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    </div>
+
+                    {checking && !reason && (
+                      <div className="mt-3 flex items-center gap-1.5 text-[12px] text-faint">
+                        <Loader2 size={12} className="animate-spin" /> Checking…
+                      </div>
+                    )}
+
+                    {reason && (
+                      <div
+                        className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-md border p-2"
+                        style={{ borderColor: 'color-mix(in srgb, var(--err) 40%, var(--border))', background: 'color-mix(in srgb, var(--err) 8%, transparent)' }}
+                      >
+                        <span className="inline-flex items-center gap-1.5 text-[12px]" style={{ color: 'var(--err)' }}>
+                          <AlertTriangle size={13} /> {reason}
+                        </span>
+                        <Button size="sm" variant="outline" onClick={() => runPreflight(id)} disabled={checking}>
+                          {checking ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
+                          Check again
+                        </Button>
+                      </div>
+                    )}
+
+                    {id === 'cloudflare-named' && (
+                      <div className="mt-3 flex flex-col gap-2 border-t border-border pt-3">
+                        <label className="text-[12px] text-muted" htmlFor="remote-cf-token">Tunnel token</label>
+                        <input
+                          id="remote-cf-token"
+                          type="password"
+                          value={cfToken}
+                          onChange={(e) => setCfToken(e.target.value)}
+                          placeholder={settingsQ.data?.remoteAccess?.cloudflare?.hasTunnelToken ? 'Stored — leave blank to keep' : 'Paste the token from the Cloudflare dashboard'}
+                          spellCheck={false}
+                          autoComplete="off"
+                          className="rounded-md border border-border bg-bg px-2 py-1.5 text-[13px] text-ink outline-none"
+                        />
+                        <label className="text-[12px] text-muted" htmlFor="remote-cf-hostname">Hostname</label>
+                        <input
+                          id="remote-cf-hostname"
+                          type="text"
+                          value={cfHostname}
+                          onChange={(e) => setCfHostname(e.target.value)}
+                          placeholder="llm.example.com"
+                          spellCheck={false}
+                          autoComplete="off"
+                          className="rounded-md border border-border bg-bg px-2 py-1.5 text-[13px] text-ink outline-none"
+                        />
+                        <div><Button size="sm" variant="outline" onClick={saveCloudflare} disabled={save.isPending}>Save</Button></div>
+                      </div>
+                    )}
+
+                    {id === 'ngrok' && (
+                      <div className="mt-3 flex flex-col gap-2 border-t border-border pt-3">
+                        <label className="text-[12px] text-muted" htmlFor="remote-ngrok-token">Authtoken</label>
+                        <input
+                          id="remote-ngrok-token"
+                          type="password"
+                          value={ngrokToken}
+                          onChange={(e) => setNgrokToken(e.target.value)}
+                          placeholder={settingsQ.data?.remoteAccess?.ngrok?.hasAuthtoken ? 'Stored — leave blank to keep' : 'Paste your ngrok authtoken'}
+                          spellCheck={false}
+                          autoComplete="off"
+                          className="rounded-md border border-border bg-bg px-2 py-1.5 text-[13px] text-ink outline-none"
+                        />
+                        <label className="text-[12px] text-muted" htmlFor="remote-ngrok-domain">Reserved domain (optional)</label>
+                        <input
+                          id="remote-ngrok-domain"
+                          type="text"
+                          value={ngrokDomain}
+                          onChange={(e) => setNgrokDomain(e.target.value)}
+                          placeholder="Leave blank for a random ngrok URL"
+                          spellCheck={false}
+                          autoComplete="off"
+                          className="rounded-md border border-border bg-bg px-2 py-1.5 text-[13px] text-ink outline-none"
+                        />
+                        <div><Button size="sm" variant="outline" onClick={saveNgrok} disabled={save.isPending}>Save</Button></div>
+                      </div>
+                    )}
+
+                    {(id === 'tailscale-serve' || id === 'tailscale-funnel') && (
+                      <div className="mt-3 flex items-center gap-2 border-t border-border pt-3">
+                        <label className="text-[12px] text-muted" htmlFor="remote-ts-port">Port</label>
+                        <select
+                          id="remote-ts-port"
+                          value={tsPort}
+                          onChange={(e) => saveTailscalePort(Number(e.target.value))}
+                          className="rounded-md border border-border bg-bg px-2 py-1.5 text-[13px] text-ink outline-none"
+                        >
+                          {TAILSCALE_PORTS.map((p) => <option key={p} value={p}>{p}</option>)}
+                        </select>
+                      </div>
+                    )}
+
+                    {id === 'custom' && (
+                      <div className="mt-3 flex flex-col gap-2 border-t border-border pt-3">
+                        <label className="text-[12px] text-muted" htmlFor="remote-custom-url">Public URL</label>
+                        <input
+                          id="remote-custom-url"
+                          type="text"
+                          value={customUrl}
+                          onChange={(e) => setCustomUrl(e.target.value)}
+                          placeholder="https://llm.example.com"
+                          spellCheck={false}
+                          autoComplete="off"
+                          className="rounded-md border border-border bg-bg px-2 py-1.5 font-mono text-[12px] text-ink outline-none"
+                        />
+                        <div><Button size="sm" variant="outline" onClick={saveCustomUrl} disabled={save.isPending}>Save</Button></div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      </div>
+
+      <div className="rounded-lg border border-border bg-panel p-4">
+        <div className="flex flex-col gap-1.5">
+          <div className="text-[12px] font-medium text-ink">Token permissions</div>
+          <p className="text-[11px] text-faint">
+            What the access token minted the next time you turn this on is allowed to do.
+          </p>
+          <p className="text-[11px] text-faint">
+            A scoped token can chat and manage conversations; it cannot see full engine/model
+            status detail or change settings.
+          </p>
+          <div className="mt-1 flex flex-col gap-1">
+            {REMOTE_TOKEN_CAPABILITIES.map((cap) => (
+              <label key={cap} className="flex items-center gap-2 text-[12px] text-ink">
+                <input
+                  type="checkbox"
+                  checked={tokenCaps.has(cap)}
+                  onChange={(e) => toggleTokenCap(cap, e.target.checked)}
+                />
+                <span className="font-mono">{cap}</span>
+              </label>
+            ))}
+          </div>
+        </div>
       </div>
 
       <ExposureConfirmDialog
