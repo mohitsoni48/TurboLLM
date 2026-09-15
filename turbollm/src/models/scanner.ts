@@ -284,7 +284,15 @@ export class Scanner {
       try { return [{ path: resolve(dir), real: realpathSync(dir) }] } catch { return [] }
     })
     for (const p of paths) {
-      const target = realpathSync(p)
+      let target: string
+      try {
+        target = realpathSync(p)
+      } catch {
+        // The scan that produced this entry is stale — the file is already gone (a race
+        // with an external delete, or a broken symlink). Report it as the caller-actionable
+        // "nothing to delete" it actually is, not a raw ENOENT bubbling up as a bare 500.
+        throw new ScannerError('no_such_model', `Model file no longer exists on disk: ${p}.`)
+      }
       const root = roots.filter((r) => isWithin(r.path, resolve(p)))
         .sort((a, b) => b.path.length - a.path.length)[0]
       const refuse = () => {
@@ -294,11 +302,24 @@ export class Scanner {
       if (!root || !roots.some((r) => isWithin(r.real, target))) refuse()
       // Checking the final component alone misses links in parent directories.
       let current = resolve(p)
-      while (root) {
+      // Bounded, not `while (root)` unconditionally: `root` never changes, so nothing but
+      // the two `break`s below ever ended this loop. In the ordinary case `current` reaches
+      // `root.path` in a handful of hops (isWithin already proved `p` is nested under it),
+      // but a path-normalization edge case (case-insensitive filesystem, a trailing-slash
+      // mismatch) could leave `current` never matching it, and `dirname()` is a fixed point
+      // at the OS root (`dirname('/') === '/'`) — an unbounded version of this loop would
+      // then spin forever on synchronous `lstatSync` calls, freezing the whole daemon's
+      // event loop for every request, not just this one. No real path is anywhere near this
+      // deep, so the bound can never fire for a legitimate delete.
+      for (let hops = 0; root && hops < 256; hops++) {
         if (current === root.path && current !== resolve(p)) break
         if (lstatSync(current).isSymbolicLink()) refuse()
         if (current === root.path) break
         current = dirname(current)
+        if (hops === 255) {
+          throw new ScannerError('unsafe_model_delete',
+            `Could not confirm ${p} is safely inside its model directory (path walk exceeded 256 hops). Manage it directly at its real location.`)
+        }
       }
     }
     if (e.format === 'mlx') {

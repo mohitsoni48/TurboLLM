@@ -38,15 +38,23 @@ export class NgrokProvider implements RemoteProvider {
 
   argv(ingressPort: number): string[] {
     // --log stdout is what makes the assigned URL parseable at all; without it ngrok takes
-    // over the terminal with its TUI and prints nothing a parent process can read.
-    const args = ['http', String(ingressPort), '--authtoken', this.cfg.authtoken, '--log', 'stdout']
+    // over the terminal with its TUI and prints nothing a parent process can read. The
+    // authtoken travels via env(), not here — see its doc comment.
+    const args = ['http', String(ingressPort), '--log', 'stdout']
     if (this.cfg.domain) args.push('--domain', this.cfg.domain)
     return args
   }
 
+  /** The authtoken as an env var, never argv: argv is readable by any local user via
+   *  `/proc/<pid>/cmdline` (or Task Manager), an env var scoped to this one child is not.
+   *  `NGROK_AUTHTOKEN` is ngrok's own documented equivalent to `--authtoken`. */
+  env(): NodeJS.ProcessEnv {
+    return { NGROK_AUTHTOKEN: this.cfg.authtoken }
+  }
+
   async start(ingressPort: number): Promise<{ url: string }> {
     const { binPath } = await ensureNgrok(this.dataDir)
-    const url = await this.child.spawnAndWait(binPath, this.argv(ingressPort), NGROK_URL_RE)
+    const url = await this.child.spawnAndWait(binPath, this.argv(ingressPort), NGROK_URL_RE, 30_000, this.env())
     return { url }
   }
 

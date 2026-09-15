@@ -28,8 +28,15 @@ const TAILSCALE_PORTS = [443, 8443, 10000] as const
  *  Link's own "Full control" preset: this token rides along a URL a user hands to their OWN
  *  other devices, not a peer machine, so downloads and config capabilities (multi-gigabyte
  *  writes, this machine's own local-use defaults) stay off the picker entirely rather than
- *  one click away. */
-const REMOTE_TOKEN_CAPABILITIES = LINK_PRESETS.server
+ *  one click away.
+ *
+ *  Also narrower than `LINK_PRESETS.server` itself: `models:wake` is excluded because it is
+ *  meaningless on this facade. It exists for Turbo Link's peer-swap-while-idle mechanic
+ *  (host-idle.ts) — "may a PEER take someone else's idle machine" — and a remote-access
+ *  token authenticates the box's OWN owner reaching their OWN box, where that distinction
+ *  from `models:load` does not exist. Offering it as a checkbox here would let it look like
+ *  a real restriction when toggling it changes nothing on this facade. */
+const REMOTE_TOKEN_CAPABILITIES: LinkCapability[] = LINK_PRESETS.server.filter((c) => c !== 'models:wake')
 
 /** Settings → Network & sharing's Remote access story (spec 30 §7, ADR-422): provider cards
  *  with real costs stated up front (engines-catalog convention — pros/cons only, no prose),

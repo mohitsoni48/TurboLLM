@@ -132,11 +132,25 @@ export class ChildTunnel {
 
   /** Spawn and resolve with the first substring matching `urlPattern` in the child's combined
    *  stdout+stderr. cloudflared logs everything to stderr (verified in ADR-153) and ngrok's
-   *  useful line is on stdout, so both streams feed one buffer rather than guessing. */
-  async spawnAndWait(binPath: string, args: string[], urlPattern: RegExp, timeoutMs = 30_000): Promise<string> {
+   *  useful line is on stdout, so both streams feed one buffer rather than guessing.
+   *
+   *  `extraEnv` merges onto the daemon's own `process.env` (never replaces it — the child
+   *  still needs a normal PATH/HOME to run at all) rather than going in `args`: a secret in
+   *  argv is readable by any other local user via `/proc/<pid>/cmdline` (or Task Manager),
+   *  while an env var set only for this one child process is not. */
+  async spawnAndWait(
+    binPath: string,
+    args: string[],
+    urlPattern: RegExp,
+    timeoutMs = 30_000,
+    extraEnv?: NodeJS.ProcessEnv,
+  ): Promise<string> {
     await this.stop()
     return new Promise<string>((resolve, reject) => {
-      const child = spawn(binPath, args, { windowsHide: true })
+      const child = spawn(binPath, args, {
+        windowsHide: true,
+        ...(extraEnv ? { env: { ...process.env, ...extraEnv } } : {}),
+      })
       this.child = child
       writePid(this.dataDir, child.pid ?? 0)
 

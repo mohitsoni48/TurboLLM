@@ -301,9 +301,9 @@ the detail:
   setup, so it stays behind Settings → Experimental.
 - **Remote access** *(experimental, off by default)* — expose TurboLLM to the internet through
   Cloudflare (Quick or Named tunnel), Tailscale (Serve or Funnel), ngrok, or your own reverse
-  proxy, from Settings → Network & sharing. Enabling it mints a capability-scoped access token
-  (read-only, run-a-server, or full control, optionally pinned to specific models) instead of
-  exposing your regular API key, with a live status chip and one-click stop. Not yet verified
+  proxy, from Settings → Network & sharing. Enabling it mints a capability-scoped access token —
+  restrict it to chat-only, or also allow loading/unloading models — instead of exposing your
+  regular API key, with a live status chip and one-click stop. Not yet verified
   against real Cloudflare/Tailscale/ngrok accounts, so it stays behind Settings → Experimental.
 - **Thinking-budget control** — a graduated slider, not just on/off: cap reasoning to a specific
   token count, disable it entirely, or leave it unlimited. Works in Chat and Code alike.

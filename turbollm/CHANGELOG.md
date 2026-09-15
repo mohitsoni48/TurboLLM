@@ -34,10 +34,10 @@ _Nothing yet._
   proxy, from Settings → Network & sharing. A dedicated loopback ingress port replaces the old
   `cf-ray`-header trust check, closing a hole where turning on any non-Cloudflare provider could
   publish the daemon with no authentication at all. Enabling it mints a capability-scoped access
-  token — read-only, run-a-server, or full control, optionally pinned to specific models — instead
-  of handing out your regular API key, and the token is revoked automatically when you turn it
-  off. A live status chip shows connection state and lets you copy the current public URL or stop
-  sharing from anywhere in the app. Provider verification against real Cloudflare/Tailscale/ngrok
+  token — restrict it to chat-only, or also allow loading/unloading models — instead of handing
+  out your regular API key, and the token is revoked automatically when you turn it off. A live
+  status chip shows connection state and lets you copy the current public URL or stop sharing
+  from anywhere in the app. Provider verification against real Cloudflare/Tailscale/ngrok
   accounts is still in progress, so this stays behind Settings → Experimental for now — same as
   Turbo Link.
 

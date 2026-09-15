@@ -29,9 +29,17 @@ export type TailscalePublicPort = 443 | 8443 | 10000
  *  rejected Funnel approval, or any other non-ENOENT CLI failure silently reported success. */
 export type RunTailscale = (args: string[]) => Promise<{ code: number; stdout: string; stderr: string }>
 
+// Bounds how long a single `tailscale` invocation can hang boot or a request. Previously
+// unbounded, so a wedged tailscaled would hang `reconcileTailscale` — which cli.ts awaits
+// BEFORE writing the pidfile on a fresh boot — forever, leaving a daemon `--stop` can never
+// find because it never got that far. Every subcommand this file runs (`status`, `serve`,
+// `funnel`, `--bg`) talks to the LOCAL tailscaled over its own socket, not the network, so
+// 10s is generous rather than tight.
+const TAILSCALE_TIMEOUT_MS = 10_000
+
 export const runTailscale: RunTailscale = (args) =>
   new Promise((resolve, reject) => {
-    execFile('tailscale', args, { windowsHide: true }, (err: ExecFileException | null, stdout, stderr) => {
+    execFile('tailscale', args, { windowsHide: true, timeout: TAILSCALE_TIMEOUT_MS }, (err: ExecFileException | null, stdout, stderr) => {
       if (err && err.code === 'ENOENT') return reject(err)
       // execFile's error.code carries the real process exit code for a non-spawn failure
       // (it is only ever a STRING like 'ENOENT' when the process failed to spawn at all,

@@ -53,7 +53,16 @@ export class CloudflareNamedProvider implements RemoteProvider {
   }
 
   argv(): string[] {
-    return ['tunnel', 'run', '--token', this.cfg.tunnelToken]
+    // The token travels via env(), not here — see its doc comment.
+    return ['tunnel', 'run']
+  }
+
+  /** The tunnel token as an env var, never argv: argv is readable by any local user via
+   *  `/proc/<pid>/cmdline` (or Task Manager), an env var scoped to this one child is not.
+   *  `cloudflared tunnel run` reads `TUNNEL_TOKEN` when `--token`/a positional name is
+   *  absent — its own documented equivalent. */
+  env(): NodeJS.ProcessEnv {
+    return { TUNNEL_TOKEN: this.cfg.tunnelToken }
   }
 
   publicUrl(): string {
@@ -65,7 +74,13 @@ export class CloudflareNamedProvider implements RemoteProvider {
    *  still means "the edge accepted us" rather than merely "the process launched". */
   async start(): Promise<{ url: string }> {
     const { binPath } = await ensureCloudflared(this.dataDir)
-    await this.child.spawnAndWait(binPath, this.argv(), /Registered tunnel connection|Connection [0-9a-f-]+ registered/i)
+    await this.child.spawnAndWait(
+      binPath,
+      this.argv(),
+      /Registered tunnel connection|Connection [0-9a-f-]+ registered/i,
+      30_000,
+      this.env(),
+    )
     return { url: this.publicUrl() }
   }
 

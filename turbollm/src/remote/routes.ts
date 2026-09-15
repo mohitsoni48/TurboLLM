@@ -10,7 +10,8 @@ import type { Deps } from '../deps'
 import { hostGate, provisionRemoteApiKey, revokeRemoteKeys } from '../auth'
 import { isRemoteAccessEnabled, REMOTE_DISABLED } from './gate'
 import { REMOTE_PROVIDERS, type RemoteProviderId } from '../config/config'
-import { LINK_CAPABILITIES, type LinkCapability } from '../link/types'
+import type { LinkCapability } from '../link/types'
+import { LINK_PRESETS } from '../link/capabilities'
 import { emit } from '../telemetry/runtime/typed-emit'
 import { remoteAccessEnabled, remoteAccessDisabled, remoteAccessPreflightFailed } from '../telemetry/events/remote'
 
@@ -22,16 +23,25 @@ async function body<T>(c: Context): Promise<T> {
   }
 }
 
-/** The stored scope, narrowed to capabilities that actually exist. An unknown string is
- *  dropped rather than passed through — a grant is an allow-list, and an allow-list that
- *  carries entries nothing understands is one nobody can audit. */
+const REMOTE_TOKEN_CAPABILITIES = new Set<string>(LINK_PRESETS.server)
+
+/** The stored scope, narrowed to what a remote token may EVER carry — `LINK_PRESETS.server`
+ *  (`models:use`/`wake`/`load`/`unload`), never the full `LINK_CAPABILITIES` set. This is the
+ *  one and only enforcement point: `PATCH /api/v1/settings` deliberately accepts any
+ *  string array into `remoteAccess.tokenGrant.capabilities` (api/routes.ts's own comment
+ *  there says as much) and defers the allow-list check to here. Getting this list wrong
+ *  is therefore not a rough edge — a `config:write` or `downloads:*` entry that survived
+ *  this filter would reach `PATCH /api/v1/settings` with nothing but the SHAPE checked,
+ *  bypassing `link/config-scope.ts`'s allowlist entirely and reaching `daemon.lanBind` /
+ *  `daemon.requireApiKey` — exactly the escalation that file's own header comment exists to
+ *  prevent. `downloads:*`/`config:*` are Turbo Link's own broader "full" preset: a remote
+ *  token rides along a URL the owner hands to their OWN other devices, not a peer machine,
+ *  matching `RemoteAccessSection.tsx`'s UI, which never offers those capabilities either. */
 export function sanitizeTokenGrant(stored: { capabilities: string[]; models?: string[] }): {
   capabilities: LinkCapability[]
   models?: string[]
 } {
-  const caps = stored.capabilities.filter((c): c is LinkCapability =>
-    (LINK_CAPABILITIES as readonly string[]).includes(c),
-  )
+  const caps = stored.capabilities.filter((c): c is LinkCapability => REMOTE_TOKEN_CAPABILITIES.has(c))
   return { capabilities: caps.length ? caps : ['models:use'], models: stored.models }
 }
 

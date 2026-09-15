@@ -129,6 +129,17 @@ test('isLocalRequest: an ingress listener is bound but THIS request did not arri
   assert.equal(isLocalRequest(c, d), true)
 })
 
+test('isLocalRequest: fails CLOSED, not open — an ingress listener is bound but THIS request\'s local port could not be read at all', () => {
+  // Simulates localPort() returning undefined while remote access is live (an
+  // @hono/node-server internal shape change, not "no tunnel configured"). Must NOT read
+  // as "not tunneled": a tunneled connection's remote address is loopback by construction,
+  // so misreading this as local would grant it local-admin trust (add/scan engine,
+  // build-from-source) from anywhere on the internet with no key at all.
+  const d = fakeDeps({ lanBind: false, ingressPort: 6997 })
+  const c = fakeContext({}) // no localPort in the context at all
+  assert.equal(isLocalRequest(c, d), false)
+})
+
 test('isLocalRequest: loopback-only bind with no tunnel at all is still always local (unchanged behavior)', () => {
   const d = fakeDeps({ lanBind: false })
   const c = fakeContext({})

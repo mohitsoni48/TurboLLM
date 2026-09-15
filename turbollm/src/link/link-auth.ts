@@ -1,5 +1,5 @@
 import type { MiddlewareHandler } from 'hono'
-import { resolveKey } from '../auth'
+import { resolveKey, grantKind } from '../auth'
 import type { Deps } from '../deps'
 import { hasCapability } from './capabilities'
 import { isTurboLinkEnabled, turboLinkDisabled, TURBO_LINK_DISABLED_HOST_MESSAGE } from './gate'
@@ -35,7 +35,13 @@ export function linkAuth(d: Deps): MiddlewareHandler {
     // does not exist.
     if (!isTurboLinkEnabled(d)) return turboLinkDisabled(c, TURBO_LINK_DISABLED_HOST_MESSAGE)
     const key = resolveKey(c, d)
-    if (!key) {
+    // A `remote`-kind key (ADR-422) authenticates the daemon's OWNER reaching their OWN box
+    // through a public tunnel — a different trust relationship than a Turbo Link PEER
+    // machine, and `resolveKey` matches by hash alone, so it must be excluded here
+    // explicitly rather than assumed. Same discipline `hostGate`/`verifyKeyValue` already
+    // apply for the reverse direction (auth.ts's C1/N1 fix): a grant minted for one façade
+    // must never silently authenticate a different one it was never issued for.
+    if (!key || grantKind(key) === 'remote') {
       return c.json(
         { error: { code: 'unauthorized', message: 'A valid Turbo Link token is required.' } },
         401,

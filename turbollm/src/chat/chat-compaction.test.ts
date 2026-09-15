@@ -547,11 +547,9 @@ test('maybeAutoCompact: fires start/end events, actually compacts, and the conv 
     // Small ctx (200), same reason as the compactConversation tests above — the 8 fixture
     // messages must NOT all fit inside pickCompactionCut's tail budget, or this test would
     // silently degrade to exercising the no-op-because-nothing_to_compact path instead of a
-    // real compaction, while still passing on its events-only assertion. See __fetchImplForTest's
-    // doc comment above compactConversation for what this property actually is.
+    // real compaction, while still passing on its events-only assertion.
     const d = fakeDeps(db, 200)
-    ;(d as unknown as { __fetchImplForTest?: typeof fetch }).__fetchImplForTest = fetchImpl
-    await maybeAutoCompact(d, conv.id, fresh, localUpstream(200), new AbortController().signal, async (phase) => { events.push(phase) })
+    await maybeAutoCompact(d, conv.id, fresh, localUpstream(200), new AbortController().signal, async (phase) => { events.push(phase) }, fetchImpl)
     assert.deepEqual(events, ['start', 'end'])
     // The two assertions that actually distinguish "compacted" from "silently no-op'd":
     assert.equal(db.getConversation(conv.id)!.compactionSummary, 'Summary text.')
@@ -573,11 +571,11 @@ test('maybeAutoCompact: a rejecting emitCompactionEvent callback does not crash 
     // Small ctx again — same reason as the other maybeAutoCompact tests: needs a real cut so
     // compactConversation actually runs (and writes to the DB) rather than short-circuiting.
     const d = fakeDeps(db, 200)
-    ;(d as unknown as { __fetchImplForTest?: typeof fetch }).__fetchImplForTest = jsonFetch({ choices: [{ message: { content: 'Summary text.' } }] })
+    const fetchImpl = jsonFetch({ choices: [{ message: { content: 'Summary text.' } }] })
     // The real caller (a later task) wires this to stream.writeSSE, which can reject on a
     // disconnected client — simulate that here.
     const rejectingEmit = async () => { throw new Error('client disconnected') }
-    await assert.doesNotReject(() => maybeAutoCompact(d, conv.id, fresh, localUpstream(200), new AbortController().signal, rejectingEmit))
+    await assert.doesNotReject(() => maybeAutoCompact(d, conv.id, fresh, localUpstream(200), new AbortController().signal, rejectingEmit, fetchImpl))
     // The actual compaction must still have happened despite the emit failures.
     assert.equal(db.getConversation(conv.id)!.compactionSummary, 'Summary text.')
   } finally {
@@ -599,8 +597,8 @@ test('maybeAutoCompact: a failed summarization call is swallowed — the turn is
     // be the thing that actually fails (HTTP 500), not nothing_to_compact short-circuiting
     // before the network call is ever made.
     const d = fakeDeps(db, 200)
-    ;(d as unknown as { __fetchImplForTest?: typeof fetch }).__fetchImplForTest = jsonFetch({}, 500)
-    await assert.doesNotReject(() => maybeAutoCompact(d, conv.id, fresh, localUpstream(200), new AbortController().signal, async (phase) => { events.push(phase) }))
+    const fetchImpl = jsonFetch({}, 500)
+    await assert.doesNotReject(() => maybeAutoCompact(d, conv.id, fresh, localUpstream(200), new AbortController().signal, async (phase) => { events.push(phase) }, fetchImpl))
     assert.deepEqual(events, ['start', 'end']) // still brackets the attempt even though it failed
     assert.equal(db.getConversation(conv.id)!.compactionSummary, undefined) // nothing persisted
   } finally {
@@ -672,8 +670,7 @@ test('maybeAutoCompact: hands the upstream it was given straight through — a T
     }) as unknown as typeof fetch
 
     const d = noLocalEngineDeps(db)
-    ;(d as unknown as { __fetchImplForTest?: typeof fetch }).__fetchImplForTest = fetchImpl
-    await maybeAutoCompact(d, conv.id, fresh, remoteUpstream(200), new AbortController().signal, async () => {})
+    await maybeAutoCompact(d, conv.id, fresh, remoteUpstream(200), new AbortController().signal, async () => {}, fetchImpl)
 
     assert.equal(calledUrl, 'https://rig.example/api/link/v1/chat/completions')
     // maybeAutoCompact swallows every failure, so the DB write is the only honest proof it did

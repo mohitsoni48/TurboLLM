@@ -48,6 +48,15 @@ test('isLocalUpgrade: with no ingress listener at all, loopback is local', () =>
   assert.equal(isLocalUpgrade('127.0.0.1', 6996, {}, d), true)
 })
 
+test('isLocalUpgrade: fails CLOSED — ingress is live but the socket local port is undetermined', () => {
+  // Same fail-closed discipline as isTunneled/isLocalRequest in auth.ts: an ingress
+  // listener exists, but this socket's local port could not be read at all. Must not fall
+  // through to the loopback check, since a tunneled connection's remote address IS
+  // loopback by construction.
+  const d = depsWithIngress(6997)
+  assert.equal(isLocalUpgrade('127.0.0.1', undefined, {}, d), false)
+})
+
 test('THE CRITICAL CASE: an ingress request that looks loopback must not bypass', () => {
   // Same assertion auth.test.ts makes for the cf-ray era, restated against the new signal:
   // tunneled is now derived from the socket, but bypassesAuth's own logic is unchanged.

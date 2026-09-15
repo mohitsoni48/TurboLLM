@@ -2,9 +2,29 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { Hono } from 'hono'
 import type { Deps } from '../deps'
-import { registerRemoteApi } from './routes'
+import { registerRemoteApi, sanitizeTokenGrant } from './routes'
 import { defaultConfig, normalizeProvider } from '../config/config'
 import { isRemoteAccessEnabled } from './gate'
+
+test('sanitizeTokenGrant: strips config:*/downloads:* even if stored, keeps the four server capabilities', () => {
+  const r = sanitizeTokenGrant({
+    capabilities: ['models:use', 'models:wake', 'models:load', 'models:unload', 'config:write', 'config:read', 'downloads:read', 'downloads:write'],
+  })
+  assert.deepEqual(
+    [...r.capabilities].sort(),
+    ['models:load', 'models:unload', 'models:use', 'models:wake'],
+  )
+})
+
+test('sanitizeTokenGrant: a grant holding only config:write falls back to models:use, never an empty or config grant', () => {
+  const r = sanitizeTokenGrant({ capabilities: ['config:write'] })
+  assert.deepEqual(r.capabilities, ['models:use'])
+})
+
+test('sanitizeTokenGrant: an unknown string is dropped like any other out-of-scope capability', () => {
+  const r = sanitizeTokenGrant({ capabilities: ['models:use', 'made-up:capability'] })
+  assert.deepEqual(r.capabilities, ['models:use'])
+})
 
 const makeApp = (opts: { enabled: boolean; lanBind?: boolean }) => {
   const cfg = defaultConfig()
@@ -31,9 +51,17 @@ const makeApp = (opts: { enabled: boolean; lanBind?: boolean }) => {
   return { app, counts: () => ({ enabled, disabled }), cfg }
 }
 
+// These routes are the OWNER managing their own box locally (e.g. flipping the Settings
+// toggle) — never a request that arrived over the tunnel. `makeApp`'s fake Deps configures
+// an ingress port (6997) same as production, so since isTunneled/isLocalRequest now fail
+// CLOSED when a request's local port can't be determined at all, every call here must
+// simulate landing on a DIFFERENT, ordinary port — matching what a real Node HTTP server's
+// `c.env` would actually carry, the same shape `auth.remote.test.ts` uses.
+const LOCAL_ENV = { incoming: { socket: { localPort: 6996 } } }
+
 test('remote routes: status refuses with a typed code while the flag is off', async () => {
   const { app } = makeApp({ enabled: false })
-  const res = await app.request('/api/v1/remote/status')
+  const res = await app.request('/api/v1/remote/status', {}, LOCAL_ENV)
   assert.equal(res.status, 403)
   const body = (await res.json()) as { error: { code: string } }
   assert.equal(body.error.code, 'remote_access_disabled')
@@ -41,7 +69,7 @@ test('remote routes: status refuses with a typed code while the flag is off', as
 
 test('remote routes: status reports the provider and live state when enabled', async () => {
   const { app } = makeApp({ enabled: true })
-  const res = await app.request('/api/v1/remote/status')
+  const res = await app.request('/api/v1/remote/status', {}, LOCAL_ENV)
   assert.equal(res.status, 200)
   const body = (await res.json()) as { provider: string; state: { kind: string }; url: string }
   assert.equal(body.provider, 'cloudflare-quick')
@@ -51,7 +79,7 @@ test('remote routes: status reports the provider and live state when enabled', a
 
 test('remote routes: start sets enabled in config and calls the manager', async () => {
   const { app, counts, cfg } = makeApp({ enabled: true })
-  const res = await app.request('/api/v1/remote/start', { method: 'POST' })
+  const res = await app.request('/api/v1/remote/start', { method: 'POST' }, LOCAL_ENV)
   assert.equal(res.status, 200)
   assert.equal(counts().enabled, 1)
   assert.equal(cfg.remoteAccess.enabled, true)
@@ -59,8 +87,8 @@ test('remote routes: start sets enabled in config and calls the manager', async 
 
 test('remote routes: stop clears enabled in config and calls the manager', async () => {
   const { app, counts, cfg } = makeApp({ enabled: true })
-  await app.request('/api/v1/remote/start', { method: 'POST' })
-  const res = await app.request('/api/v1/remote/stop', { method: 'POST' })
+  await app.request('/api/v1/remote/start', { method: 'POST' }, LOCAL_ENV)
+  const res = await app.request('/api/v1/remote/stop', { method: 'POST' }, LOCAL_ENV)
   assert.equal(res.status, 200)
   assert.equal(counts().disabled, 1)
   assert.equal(cfg.remoteAccess.enabled, false)
@@ -141,6 +169,6 @@ test('remote routes: preflight rejects an unknown provider id', async () => {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ provider: 'not-a-provider' }),
-  })
+  }, LOCAL_ENV)
   assert.equal(res.status, 400)
 })

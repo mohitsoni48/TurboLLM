@@ -35,9 +35,15 @@ test('cloudflare-named: preflight is ready with both', async () => {
   assert.equal((await p.preflight()).kind, 'off')
 })
 
-test('cloudflare-named: argv runs the token, never the quick-tunnel form', () => {
+test('cloudflare-named: argv runs the token form, never the quick-tunnel form, and never carries the token itself', () => {
   const p = new CloudflareNamedProvider('/tmp/data', cfg)
-  assert.deepEqual(p.argv(), ['tunnel', 'run', '--token', cfg.tunnelToken])
+  assert.deepEqual(p.argv(), ['tunnel', 'run'])
+})
+
+test('cloudflare-named: the tunnel token travels as TUNNEL_TOKEN, not argv — readable via /proc/*/cmdline otherwise', () => {
+  const p = new CloudflareNamedProvider('/tmp/data', cfg)
+  assert.deepEqual(p.env(), { TUNNEL_TOKEN: cfg.tunnelToken })
+  assert.equal(JSON.stringify(p.argv()).includes(cfg.tunnelToken), false)
 })
 
 test('cloudflare-named: the public URL comes from the configured hostname', () => {
