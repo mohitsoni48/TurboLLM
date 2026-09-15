@@ -40,7 +40,7 @@ function makeValidAccessJwt(teamDomain: string, aud: string): string {
  *  URL falls through to the real `fetch`, so this can coexist with other tests in the file. */
 function stubJwksEndpoint(teamDomain: string): () => void {
   const real = globalThis.fetch
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+  globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
     if (String(input) === `${teamDomain}/cdn-cgi/access/certs`) {
       return new Response(ACCESS_JWKS_BODY, { status: 200 })
     }

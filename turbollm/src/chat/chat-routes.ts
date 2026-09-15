@@ -62,7 +62,9 @@ export function abortAllInFlightChats(): number {
 
 // 503 joined the set with Turbo Link: a linked machine that is offline, or no longer
 // advertising the model, is a REMOTE availability failure, not a local 409.
-type S = 200 | 201 | 202 | 400 | 404 | 409 | 500 | 503
+// 403 joined with ADR-422's N2 fix: a remote-access token is authenticated but
+// deliberately refused a specific action (persisting a global tool policy).
+type S = 200 | 201 | 202 | 400 | 403 | 404 | 409 | 500 | 503
 function err(c: Context, s: S, code: string, msg: string) { return c.json({ error: { code, message: msg } }, s) }
 async function body<T>(c: Context): Promise<T> { try { return await c.req.json() as T } catch { return {} as T } }
 
