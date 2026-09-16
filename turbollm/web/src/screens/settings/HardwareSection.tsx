@@ -12,6 +12,7 @@ import { useHwUsage, useSysInfo } from '../../lib/queries'
 import {
   aggregateGpu,
   fmtGb,
+  fmtMBps,
   fmtPct,
   isUnifiedBox,
   ramPct,
@@ -20,7 +21,7 @@ import {
   vramPct,
 } from '../../lib/hw-format'
 import { useUsageHistory } from '../../lib/use-usage-history'
-import type { HwGpuUsage, HwUsage } from '../../lib/types'
+import type { HwDiskUsage, HwGpuUsage, HwUsage } from '../../lib/types'
 
 /** Static spec row, kept byte-for-byte from the old HardwarePanel. */
 function StatRow({ label, value }: { label: string; value: string }) {
@@ -98,6 +99,57 @@ function Gauge({
       <Sparkline values={history} />
     </div>
   )
+}
+
+/** Read/write throughput rows (GitHub #211 follow-up). Not a percent gauge — there is no
+ *  meaningful "100%" for disk I/O — so this is a plain value row per direction rather than
+ *  reusing {@link Gauge}. Hidden entirely when `disk` is null (no reader for this platform, or
+ *  no rated sample yet): a dash pair with nothing to compare against would just be noise.
+ *
+ *  A combined reader (macOS iostat) reports one un-split figure, shown as a single Throughput
+ *  row. The branch is on `combined`, never on `writeMBps === null` — the latter cannot tell
+ *  "no split exists" from "the write figure was unreadable", which is an expected fail-open
+ *  state here (ADR-383). */
+function DiskSection({ disk }: { disk: HwDiskUsage }) {
+  return (
+    <div className="flex flex-col gap-1.5 border-t border-border pt-4">
+      <span className="text-[13px] text-muted">Disk I/O</span>
+      {disk.combined ? (
+        <Row label="Throughput" value={fmtMBps(disk.readMBps)} />
+      ) : (
+        <>
+          <Row label="Read" value={fmtMBps(disk.readMBps)} />
+          <Row label="Write" value={fmtMBps(disk.writeMBps)} />
+        </>
+      )}
+    </div>
+  )
+}
+
+/** One label/value line inside {@link DiskSection}. Not {@link StatRow}, which emits `<dt>/<dd>`
+ *  for the static specs `<dl>` and would be invalid markup here. */
+function Row({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-baseline justify-between gap-3 text-[13px]">
+      <span className="text-muted">{label}</span>
+      <span className="tabular-nums text-ink">{value}</span>
+    </div>
+  )
+}
+
+/** Sum of every card's shared/spilled memory (GitHub #211: "shared VRAM... will help identify
+ *  spillage"). Only sums cards that actually reported a figure — a card with none (nvidia-smi
+ *  never reports a shared pool, only WDDM/amdgpu do) contributes nothing rather than forcing
+ *  the whole total to null, since "no data from this card" and "this card reports zero" both
+ *  mean skip it here, not "unknown total". Returns 0 (not shown) when nothing spilled at all. */
+function totalSharedMb(gpus: HwGpuUsage[]): number {
+  return gpus.reduce((sum, g) => sum + (g.vramSharedMb ?? 0), 0)
+}
+
+/** ` · X GB shared` when there is something to report, else ''. A discrete card holding VRAM in
+ *  BOTH its own pool and a shared/system-memory slice is exactly what a spilled model looks like. */
+function sharedSuffix(sharedMb: number): string {
+  return sharedMb > 0 ? ` · ${fmtGb(sharedMb)} GB shared` : ''
 }
 
 export function HardwareSection() {
@@ -179,7 +231,7 @@ export function HardwareSection() {
                     <Gauge
                       label={usage.gpus.length > 1 ? 'VRAM (all cards)' : 'VRAM'}
                       pct={vramPct(usage)}
-                      detail={`${fmtGb(agg?.usedMb ?? null)} / ${fmtGb(agg?.totalMb ?? 0)} GB`}
+                      detail={`${fmtGb(agg?.usedMb ?? null)} / ${fmtGb(agg?.totalMb ?? 0)} GB${sharedSuffix(totalSharedMb(usage.gpus))}`}
                       history={history.map((h) => vramPct(h))}
                     />
                     {usage.gpus.length > 1 &&
@@ -188,7 +240,7 @@ export function HardwareSection() {
                           key={i}
                           label={`GPU ${i + 1} · ${g.name}`}
                           pct={g.utilPct}
-                          detail={`${fmtGb(g.vramUsedMb)} / ${fmtGb(g.vramTotalMb)} GB`}
+                          detail={`${fmtGb(g.vramUsedMb)} / ${fmtGb(g.vramTotalMb)} GB${sharedSuffix(g.vramSharedMb ?? 0)}`}
                           history={gpuHistory((x) => x.utilPct, usage, i)}
                         />
                       ))}
@@ -198,6 +250,7 @@ export function HardwareSection() {
                 )}
               </>
             )}
+            {usage.disk && <DiskSection disk={usage.disk} />}
           </>
         ) : (
           <p className="text-[13px] text-faint">Waiting for the first sample…</p>

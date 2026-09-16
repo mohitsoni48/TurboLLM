@@ -5,12 +5,16 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   cpuPctFromTimes,
+  diskstatsRate,
   mergeUsage,
   parseAmdgpuSysfs,
+  parseDiskstats,
   parseIoregAccelerator,
+  parseMacIostat,
   parseNvidiaSmiUsage,
   parseRocmUsage,
   parseWddmSample,
+  parseWindowsDiskSample,
   sumCpuTimes,
 } from './usage-parse'
 import type { GpuSample } from './usage-parse'
@@ -310,4 +314,131 @@ test('mergeUsage: a CPU-only box has no GPU entries at all', () => {
   // ADR-239: no dead UI. An empty list is what tells HardwareBar to omit the GPU groups.
   assert.deepEqual(mergeUsage(sysWith(), null), [])
   assert.deepEqual(mergeUsage(sysWith(), []), [])
+})
+
+// ── disk I/O (GitHub #211 follow-up) ────────────────────────────────────────────
+
+test('parseDiskstats: sums sectors across whole disks, skipping partitions', () => {
+  // Real-shaped /proc/diskstats: sda + sda1/sda2 (partitions of it) + a second NVMe disk.
+  const raw = [
+    '   8       0 sda 100 0 20000 0 50 0 10000 0 0 0 0',
+    '   8       1 sda1 10 0 2000 0 5 0 1000 0 0 0 0',
+    '   8       2 sda2 90 0 18000 0 45 0 9000 0 0 0 0',
+    ' 259       0 nvme0n1 200 0 40000 0 80 0 16000 0 0 0 0',
+    ' 259       1 nvme0n1p1 50 0 10000 0 20 0 4000 0 0 0 0',
+  ].join('\n')
+  const c = parseDiskstats(raw)
+  assert.ok(c)
+  // Only the two WHOLE disks (sda, nvme0n1) count — their listed partitions are excluded.
+  assert.equal(c!.sectorsRead, 20000 + 40000)
+  assert.equal(c!.sectorsWritten, 10000 + 16000)
+})
+
+test('parseDiskstats: no whole-disk line at all (e.g. a loop-only container) is null', () => {
+  assert.equal(parseDiskstats('   7       0 loop0 1 0 8 0 0 0 0 0 0 0 0'), null)
+})
+
+test('parseDiskstats: malformed/short lines are skipped, not crashed on', () => {
+  const c = parseDiskstats(['garbage', '   8       0 sda too short'].join('\n'))
+  assert.equal(c, null)
+})
+
+test('diskstatsRate: no prior sample yet is null, not a fabricated 0', () => {
+  assert.equal(diskstatsRate(null, 0, { sectorsRead: 100, sectorsWritten: 50 }, 1000), null)
+})
+
+test('diskstatsRate: rates sector deltas into MB/s over the elapsed interval', () => {
+  const prev = { sectorsRead: 1000, sectorsWritten: 500 }
+  // +2000 sectors read over 1 s = 2000*512 bytes/s = 1.024 MB/s.
+  const cur = { sectorsRead: 3000, sectorsWritten: 500 }
+  const r = diskstatsRate(prev, 0, cur, 1000)
+  assert.ok(r)
+  assert.ok(Math.abs(r!.readMBps! - 1.024) < 1e-9)
+  assert.equal(r!.writeMBps, 0)
+  assert.equal(r!.combined, false)
+})
+
+test('diskstatsRate: a non-positive elapsed interval is null, not a divide-by-zero', () => {
+  const s = { sectorsRead: 10, sectorsWritten: 10 }
+  assert.equal(diskstatsRate(s, 1000, s, 1000), null)
+  assert.equal(diskstatsRate(s, 1000, s, 500), null)
+})
+
+test('diskstatsRate: a counter reset (negative delta) reports null, not a negative rate', () => {
+  const prev = { sectorsRead: 5000, sectorsWritten: 5000 }
+  const cur = { sectorsRead: 100, sectorsWritten: 5000 } // device replaced/reattached
+  assert.equal(diskstatsRate(prev, 0, cur, 1000), null)
+})
+
+test('parseWindowsDiskSample: our own PowerShell JSON line, bytes/sec to MB/s', () => {
+  const s = parseWindowsDiskSample('{"readBps":1048576,"writeBps":524288}')
+  assert.ok(s)
+  assert.ok(Math.abs(s!.readMBps! - 1.048576) < 1e-9)
+  assert.ok(Math.abs(s!.writeMBps! - 0.524288) < 1e-9)
+  assert.equal(s!.combined, false)
+})
+
+test('parseWindowsDiskSample: malformed JSON or missing fields yields null, not a throw', () => {
+  assert.equal(parseWindowsDiskSample('not json'), null)
+  assert.equal(parseWindowsDiskSample('{"readBps":1}'), null)
+  assert.equal(parseWindowsDiskSample('{}'), null)
+})
+
+test('parseWindowsDiskSample: unmatched counter paths report null, never a fabricated 0 MB/s', () => {
+  // What the reader emits on a localized Windows install, where neither counter path matches
+  // the English substrings the script looks for: an unmeasured disk, not an idle one.
+  assert.equal(parseWindowsDiskSample('{"readBps":null,"writeBps":null}'), null)
+  // Half a reading is no reading either — a real read rate beside an unmeasurable write rate
+  // would otherwise render as a confident "0.0 MB/s" write.
+  assert.equal(parseWindowsDiskSample('{"readBps":1048576,"writeBps":null}'), null)
+  assert.equal(parseWindowsDiskSample('{"readBps":null,"writeBps":524288}'), null)
+})
+
+test('parseMacIostat: a single-disk data row is the combined throughput total', () => {
+  const s = parseMacIostat('   24.50   12  0.29 ')
+  assert.ok(s)
+  assert.ok(Math.abs(s!.readMBps! - 0.29) < 1e-9)
+  assert.equal(s!.writeMBps, null)
+  assert.equal(s!.combined, true)
+})
+
+test('parseMacIostat: a multi-disk data row sums every disk MB/s column', () => {
+  const s = parseMacIostat('   24.50   12  0.29     8.00    1  0.01 ')
+  assert.ok(s)
+  assert.ok(Math.abs(s!.readMBps! - 0.30) < 1e-9)
+  assert.equal(s!.writeMBps, null)
+  assert.equal(s!.combined, true)
+})
+
+test('parseMacIostat: the newest data row wins over earlier ones', () => {
+  const text = ['              disk0 ', '    KB/t  tps  MB/s ', '   24.50   12  0.29 ', '   16.00    4  7.50 '].join(
+    '\n',
+  )
+  const s = parseMacIostat(text)
+  assert.ok(s)
+  assert.ok(Math.abs(s!.readMBps! - 7.5) < 1e-9)
+})
+
+test('parseMacIostat: header-only output has no data row yet and is null', () => {
+  assert.equal(parseMacIostat('              disk0               disk1 '), null)
+  assert.equal(parseMacIostat('    KB/t  tps  MB/s     KB/t  tps  MB/s '), null)
+})
+
+test('parseMacIostat: garbage, blank and non-numeric input is null, not a throw', () => {
+  assert.equal(parseMacIostat(''), null)
+  assert.equal(parseMacIostat('\n\n   \n'), null)
+  assert.equal(parseMacIostat('command not found: iostat'), null)
+})
+
+test('parseMacIostat: a token count that is not a multiple of 3 is not a data row', () => {
+  assert.equal(parseMacIostat('   24.50   12 '), null)
+  assert.equal(parseMacIostat('   24.50   12  0.29   8.00 '), null)
+})
+
+test('parseMacIostat: an idle all-zero row is a real 0, not a fail-open null', () => {
+  const s = parseMacIostat('    0.00    0  0.00 ')
+  assert.ok(s)
+  assert.equal(s!.readMBps, 0)
+  assert.equal(s!.writeMBps, null)
+  assert.equal(s!.combined, true)
 })

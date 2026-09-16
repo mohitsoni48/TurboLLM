@@ -37,10 +37,28 @@ export interface HwGpuUsage {
   unified: boolean
 }
 
+/** Disk throughput, MB/s (10^6 bytes, matching this codebase's GB convention elsewhere).
+ *  Null fields/whole value follow the same fail-open rule as everything else here: no reader
+ *  for this platform, or no second sample yet to rate against → null, never a fabricated 0. */
+export interface DiskSample {
+  /** MB/s read. On a COMBINED reader (macOS) this is the read+write TOTAL, not the read half. */
+  readMBps: number | null
+  /** Always null when `combined` is true — the platform reports no split. */
+  writeMBps: number | null
+  /** True when the platform reports one un-split throughput figure. The UI MUST branch on this
+   *  rather than on `writeMBps === null`, which cannot distinguish "no split exists" from
+   *  "the write figure was unreadable". */
+  combined: boolean
+}
+
 export interface HwUsage {
   cpuPct: number | null
   ram: { usedMb: number; totalMb: number }
   gpus: HwGpuUsage[]
+  /** Null when this platform has no disk reader (see usage.ts's pickDiskReader) or the
+   *  first sample hasn't rated yet. GitHub #211 follow-up: lets the Monitor tab show whether
+   *  disk I/O is the bottleneck during model load / long KV-cache-memory sessions. */
+  disk: DiskSample | null
   sampledAt: number
 }
 
@@ -332,4 +350,118 @@ export function mergeUsage(sys: SysInfo, samples: GpuSample[] | null): HwGpuUsag
       unified: match?.unified === true,
     }
   })
+}
+
+// ── Disk I/O (GitHub #211 follow-up) ────────────────────────────────────────────
+
+/** Whole-disk device names as they appear in /proc/diskstats — deliberately excludes
+ *  partitions (sda1, nvme0n1p1, mmcblk0p1) so a busy partition's bytes aren't counted twice,
+ *  once for itself and once for the disk it lives on. */
+const WHOLE_DISK_RE = /^(?:sd[a-z]+|vd[a-z]+|xvd[a-z]+|nvme\d+n\d+|mmcblk\d+)$/
+
+export interface DiskCounters {
+  /** Sum of column 6 (sectors read) across every whole-disk device. Sectors are always
+   *  512 bytes in this file per the kernel's own documented convention, regardless of the
+   *  disk's real physical sector size. */
+  sectorsRead: number
+  sectorsWritten: number
+}
+
+/** Parse /proc/diskstats (Linux) into total sectors read/written across every whole disk.
+ *  Pure — usage.ts reads the file and keeps the previous snapshot to rate against. Null when
+ *  no line matches a whole-disk device at all (e.g. a container exposing only virtual/loop
+ *  devices), which the caller must treat the same as "no reader" rather than a real zero. */
+export function parseDiskstats(raw: string): DiskCounters | null {
+  let sectorsRead = 0
+  let sectorsWritten = 0
+  let matched = false
+  for (const line of raw.split('\n')) {
+    const f = line.trim().split(/\s+/)
+    if (f.length < 10) continue
+    if (!WHOLE_DISK_RE.test(f[2])) continue
+    const r = Number(f[5])
+    const w = Number(f[9])
+    if (!Number.isFinite(r) || !Number.isFinite(w)) continue
+    sectorsRead += r
+    sectorsWritten += w
+    matched = true
+  }
+  return matched ? { sectorsRead, sectorsWritten } : null
+}
+
+const SECTOR_BYTES = 512
+
+/** Rate two /proc/diskstats snapshots into MB/s. Null when there is no prior sample yet (the
+ *  reader's first tick), either snapshot failed to parse, or the elapsed time is non-positive
+ *  (clock oddity) — same fail-open convention as every other reader: never a fabricated 0. A
+ *  negative delta (counters reset by a device replaced/reattached mid-run) is reported the
+ *  same way rather than as a nonsensical negative rate. */
+export function diskstatsRate(
+  prev: DiskCounters | null,
+  prevAtMs: number,
+  cur: DiskCounters | null,
+  curAtMs: number,
+): DiskSample | null {
+  if (!prev || !cur) return null
+  const elapsedS = (curAtMs - prevAtMs) / 1000
+  if (elapsedS <= 0) return null
+  const readMBps = ((cur.sectorsRead - prev.sectorsRead) * SECTOR_BYTES) / 1e6 / elapsedS
+  const writeMBps = ((cur.sectorsWritten - prev.sectorsWritten) * SECTOR_BYTES) / 1e6 / elapsedS
+  if (readMBps < 0 || writeMBps < 0) return null
+  return { readMBps, writeMBps, combined: false }
+}
+
+/** Parse one line from the Windows streaming disk reader (usage.ts's DISK_STREAM_PS). Unlike
+ *  the Linux path, `Get-Counter`'s PhysicalDisk bytes/sec counters are already OS-computed
+ *  rates, so there is no delta math on this side — just unit conversion and a parse guard. */
+export function parseWindowsDiskSample(line: string): DiskSample | null {
+  let j: { readBps?: unknown; writeBps?: unknown }
+  try {
+    j = JSON.parse(line) as typeof j
+  } catch {
+    return null
+  }
+  if (typeof j.readBps !== 'number' || typeof j.writeBps !== 'number') return null
+  return { readMBps: j.readBps / 1e6, writeMBps: j.writeBps / 1e6, combined: false }
+}
+
+const IOSTAT_COLUMNS_PER_DISK = 3
+const IOSTAT_MBPS_COLUMN = 2
+
+/** Parse macOS `iostat -d -w 1` output into a combined-throughput sample: the newest complete
+ *  data row, summed across every disk column. Stock `iostat` has no read/write split, so this
+ *  reports one number with `combined: true` and a null `writeMBps`.
+ *
+ *  Null when no data row is present yet (the header display) or nothing parses — never a
+ *  fabricated 0. A row that sums to 0 is a real measurement (an idle disk) and is returned as 0.
+ *
+ *  `iostat`'s `MB/s` is MiB-based while this codebase's convention is `/1e6`. The ≈4.9 % gap is
+ *  accepted and recorded, not corrected.
+ *
+ *  UNVERIFIED on real Apple hardware, exactly like parseIoregAccelerator (ADR-383's known
+ *  limitations): it fails open to null if the output shape differs. */
+export function parseMacIostat(text: string): DiskSample | null {
+  let newestTotalMBps: number | null = null
+  for (const line of text.split('\n')) {
+    const total = sumDiskThroughput(line)
+    if (total !== null) newestTotalMBps = total
+  }
+  if (newestTotalMBps === null) return null
+  return { readMBps: newestTotalMBps, writeMBps: null, combined: true }
+}
+
+/** Sum the `MB/s` column of every `KB/t tps MB/s` triple on one iostat line. Null when the line
+ *  is not a data row at all — the `disk0` and `KB/t` headers, blanks, and anything whose token
+ *  count is not a positive multiple of 3 or which holds a non-numeric token. */
+function sumDiskThroughput(line: string): number | null {
+  const trimmed = line.trim()
+  if (!trimmed) return null
+  const columns = trimmed.split(/\s+/).map(Number)
+  if (columns.length % IOSTAT_COLUMNS_PER_DISK !== 0) return null
+  if (!columns.every((c) => Number.isFinite(c))) return null
+  let totalMBps = 0
+  for (let i = IOSTAT_MBPS_COLUMN; i < columns.length; i += IOSTAT_COLUMNS_PER_DISK) {
+    totalMBps += columns[i]
+  }
+  return totalMBps
 }

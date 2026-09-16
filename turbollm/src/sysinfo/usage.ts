@@ -17,19 +17,25 @@ import os from 'node:os'
 import { getSysInfo, type SysInfo } from './sysinfo'
 import {
   type CpuTimes,
+  type DiskCounters,
+  type DiskSample,
   type GpuSample,
   type HwUsage,
   cpuPctFromTimes,
+  diskstatsRate,
   mergeUsage,
   parseAmdgpuSysfs,
+  parseDiskstats,
   parseIoregAccelerator,
+  parseMacIostat,
   parseNvidiaSmiUsage,
   parseRocmUsage,
   parseWddmSample,
+  parseWindowsDiskSample,
   sumCpuTimes,
 } from './usage-parse'
 
-export type { HwUsage, HwGpuUsage } from './usage-parse'
+export type { HwUsage, HwGpuUsage, DiskSample } from './usage-parse'
 
 /** How often the loop samples while someone is watching. */
 const SAMPLE_MS = 1000
@@ -46,6 +52,16 @@ export interface GpuReader {
   readonly kind: string
   start(): void
   read(): Promise<GpuSample[] | null>
+  stop(): void
+}
+
+/** One box's disk I/O source (GitHub #211 follow-up). Same contract as {@link GpuReader}:
+ *  `read()` MUST resolve — never reject — and null means "nothing to report" (no reader for
+ *  this platform, or no second sample yet to rate against), which the UI renders as a dash. */
+export interface DiskReader {
+  readonly kind: string
+  start(): void
+  read(): Promise<DiskSample | null>
   stop(): void
 }
 
@@ -92,6 +108,80 @@ export function createLatchingReader(
       }
       if (++failures >= MAX_CONSECUTIVE_FAILURES) dead = true
       return null
+    },
+  }
+}
+
+/** Wrap a long-lived child that prints one sample per line. Deliberately NOT
+ *  {@link createLatchingReader}: a streamed reader answers null throughout its warm-up, which the
+ *  failure latch would read as three failures and switch the reader off before it ever spoke.
+ *  Instead the only thing that retires this reader is the child's own `error` event — a command
+ *  that cannot spawn will never spawn, so respawning it every second would be pure waste.
+ *
+ *  `parseLine` returns null for any line it does not recognise, and a null parse leaves the last
+ *  good sample in place rather than erasing it. */
+export function createStreamingReader<T>(
+  kind: string,
+  command: string,
+  args: string[],
+  parseLine: (line: string) => T | null,
+): { kind: string; start(): void; read(): Promise<T | null>; stop(): void } {
+  let child: ChildProcess | null = null
+  let latest: T | null = null
+  let buf = ''
+  let dead = false
+
+  return {
+    kind,
+    start() {
+      if (child) return
+      try {
+        child = spawn(command, args, {
+          windowsHide: true,
+          stdio: ['ignore', 'pipe', 'ignore'],
+        })
+      } catch {
+        dead = true
+        return
+      }
+      child.stdout?.setEncoding('utf8')
+      child.stdout?.on('data', (chunk: string) => {
+        buf += chunk
+        // Guard against a runaway buffer if the child ever emits without newlines.
+        if (buf.length > 1_000_000) buf = buf.slice(-100_000)
+        for (;;) {
+          const nl = buf.indexOf('\n')
+          if (nl < 0) break
+          const line = buf.slice(0, nl).trim()
+          buf = buf.slice(nl + 1)
+          if (!line) continue
+          const parsed = parseLine(line)
+          if (parsed !== null) latest = parsed
+        }
+      })
+      // A child that dies (missing command, blocked execution policy, localized counter names)
+      // latches this reader off rather than being respawned in a loop.
+      child.on('error', () => {
+        dead = true
+        child = null
+      })
+      child.on('exit', () => {
+        child = null
+      })
+    },
+    // Returns null until the first sample lands (~1.65 s for the WDDM counter stream). That is
+    // "not ready", not a failure — which is exactly why this reader is not wrapped in
+    // createLatchingReader: the latch would trip during the normal warm-up.
+    read: async () => (dead ? null : latest),
+    stop() {
+      try {
+        child?.kill()
+      } catch {
+        /* already gone */
+      }
+      child = null
+      latest = null
+      buf = ''
     },
   }
 }
@@ -197,68 +287,134 @@ export const WDDM_STREAM_PS = [
 ].join('\n')
 
 function wddmReader(): GpuReader {
-  let child: ChildProcess | null = null
-  let latest: GpuSample[] | null = null
-  let buf = ''
-  let dead = false
-
-  return {
-    kind: 'wddm',
-    start() {
-      if (child) return
-      try {
-        child = spawn('powershell', ['-NoProfile', '-NonInteractive', '-Command', WDDM_STREAM_PS], {
-          windowsHide: true,
-          stdio: ['ignore', 'pipe', 'ignore'],
-        })
-      } catch {
-        dead = true
-        return
-      }
-      child.stdout?.setEncoding('utf8')
-      child.stdout?.on('data', (chunk: string) => {
-        buf += chunk
-        // Guard against a runaway buffer if the child ever emits without newlines.
-        if (buf.length > 1_000_000) buf = buf.slice(-100_000)
-        for (;;) {
-          const nl = buf.indexOf('\n')
-          if (nl < 0) break
-          const line = buf.slice(0, nl).trim()
-          buf = buf.slice(nl + 1)
-          if (!line) continue
-          const parsed = parseWddmSample(line)
-          if (parsed.length > 0) latest = parsed
-        }
-      })
-      // A child that dies (missing PowerShell, blocked execution policy, localized counter names)
-      // latches this reader off rather than being respawned in a loop.
-      child.on('error', () => {
-        dead = true
-        child = null
-      })
-      child.on('exit', () => {
-        child = null
-      })
+  return createStreamingReader(
+    'wddm',
+    'powershell',
+    ['-NoProfile', '-NonInteractive', '-Command', WDDM_STREAM_PS],
+    (line) => {
+      const parsed = parseWddmSample(line)
+      return parsed.length > 0 ? parsed : null
     },
-    // Returns null until the first sample lands (~1.65 s). That is "not ready", not a failure —
-    // which is exactly why this reader is not wrapped in createLatchingReader: the latch would
-    // trip during the normal warm-up.
-    read: async () => (dead ? null : latest),
-    stop() {
-      try {
-        child?.kill()
-      } catch {
-        /* already gone */
-      }
-      child = null
-      latest = null
-      buf = ''
-    },
-  }
+  )
 }
 
 function nullReader(): GpuReader {
   return { kind: 'null', start: () => {}, read: async () => null, stop: () => {} }
+}
+
+// ── disk I/O readers (GitHub #211 follow-up) ────────────────────────────────────
+
+/** Streams the OS's own PhysicalDisk byte-rate counters, aggregated across every physical
+ *  disk (`_Total`) — same spawn/parse-line shape as {@link wddmReader}, but far simpler:
+ *  these two counters are already computed bytes/sec, so there is no per-adapter aggregation
+ *  or manual rate math on this side, just JSON passthrough.
+ *
+ *  The counter NAMES are localized, exactly as in {@link WDDM_STREAM_PS}, and the substring match
+ *  below is English. An unmatched path must therefore emit a null rather than the accumulator's
+ *  seed value: with `$ErrorActionPreference` suppressing the error that would otherwise kill the
+ *  child, a 0.0 seed would reach the UI as a confident "0.0 MB/s" on a busy disk. Nulls fail open
+ *  to a hidden Disk I/O section via parseWindowsDiskSample's number guard (ADR-383). */
+export const DISK_STREAM_PS = [
+  "$ErrorActionPreference='SilentlyContinue'",
+  "$c=@('\\PhysicalDisk(_Total)\\Disk Read Bytes/sec','\\PhysicalDisk(_Total)\\Disk Write Bytes/sec')",
+  'Get-Counter -Counter $c -SampleInterval 1 -Continuous | ForEach-Object {',
+  '$r=$null;$w=$null',
+  'foreach($s in $_.CounterSamples){',
+  '$p=$s.Path.ToLower()',
+  "if($p -like '*read bytes*'){$r=[double]$s.CookedValue}",
+  "elseif($p -like '*write bytes*'){$w=[double]$s.CookedValue}}",
+  'Write-Output (ConvertTo-Json -Compress -InputObject @{readBps=$r;writeBps=$w})',
+  '}',
+].join('\n')
+
+function windowsDiskReader(): DiskReader {
+  return createStreamingReader(
+    'windows-disk',
+    'powershell',
+    ['-NoProfile', '-NonInteractive', '-Command', DISK_STREAM_PS],
+    parseWindowsDiskSample,
+  )
+}
+
+/** Reads /proc/diskstats directly — a plain sync file read, no spawn needed at all. Keeps the
+ *  previous snapshot to rate against; the first tick after (re)start always reports null since
+ *  there is nothing yet to diff. A read failure (no /proc, permission) latches the reader off
+ *  for good: unlike a flaky vendor tool, a working /proc/diskstats never starts failing and
+ *  then recovers, so retrying it every tick would be pure waste. */
+function linuxDiskReader(): DiskReader {
+  let prev: DiskCounters | null = null
+  let prevAtMs = 0
+  let dead = false
+  return {
+    kind: 'linux-diskstats',
+    start() {
+      prev = null
+      prevAtMs = 0
+      dead = false
+    },
+    read: async () => {
+      if (dead) return null
+      try {
+        const cur = parseDiskstats(readFileSync('/proc/diskstats', 'utf8'))
+        const now = Date.now()
+        const rate = diskstatsRate(prev, prevAtMs, cur, now)
+        prev = cur
+        prevAtMs = now
+        return rate
+      } catch {
+        dead = true
+        return null
+      }
+    },
+    stop() {
+      prev = null
+      prevAtMs = 0
+    },
+  }
+}
+
+/** A line parser over `iostat -d -w 1` output that answers only with LIVE samples: BSD iostat's
+ *  first data row is an average since boot, not a measurement of now, so the first one is dropped.
+ *  Header rows parse to null and do not consume that skip.
+ *
+ *  Exported as its own factory because the reader that streams it can only be exercised on a Mac;
+ *  the since-boot skip is testable everywhere. */
+export function createLiveIostatParser(): (line: string) => DiskSample | null {
+  let seenFirstDataRow = false
+  return (line) => {
+    const sample = parseMacIostat(line)
+    if (!sample) return null
+    if (!seenFirstDataRow) {
+      seenFirstDataRow = true
+      return null
+    }
+    return sample
+  }
+}
+
+/** macOS combined-throughput reader. Stock `iostat` has no read/write split, so this reports one
+ *  number with `combined: true`. Streamed, not polled, because BSD iostat's first sample is a
+ *  since-boot average — a one-shot call would either lie or cost a blocking second on the tick
+ *  path. UNVERIFIED on real Apple hardware, exactly like ioregReader (ADR-383's known
+ *  limitations): it fails open to a hidden section if the output shape differs. */
+function darwinDiskReader(): DiskReader {
+  return createStreamingReader('darwin-iostat', 'iostat', ['-d', '-w', '1'], createLiveIostatParser())
+}
+
+function nullDiskReader(): DiskReader {
+  return { kind: 'null', start: () => {}, read: async () => null, stop: () => {} }
+}
+
+/** One reader per box, first match, never combined — Windows counters, Linux /proc/diskstats,
+ *  macOS `iostat`. The darwin reader is COMBINED: stock `iostat` reports one un-split throughput
+ *  figure per disk (no `-x`-style extended mode like Linux's), so its sample carries
+ *  `combined: true` and a null `writeMBps` and the UI renders a single Throughput row rather than
+ *  mislabelling a combined number as one side of a split. Anything else fails open to no reader. */
+export function pickDiskReader(): DiskReader {
+  if (process.platform === 'win32') return windowsDiskReader()
+  if (process.platform === 'linux') return linuxDiskReader()
+  if (process.platform === 'darwin') return darwinDiskReader()
+  return nullDiskReader()
 }
 
 /** First match wins — readers are never combined. See the module header for why. */
@@ -279,6 +435,8 @@ export function pickReader(sys: SysInfo): GpuReader {
 
 let reader: GpuReader | null = null
 let injected: GpuReader | null = null
+let diskReader: DiskReader | null = null
+let injectedDisk: DiskReader | null = null
 let timer: NodeJS.Timeout | null = null
 let idleTimer: NodeJS.Timeout | null = null
 let latest: HwUsage | null = null
@@ -291,8 +449,14 @@ function startLoop(): void {
   running = true
   prevCpu = null
   reader = injected ?? pickReader(getSysInfo())
+  diskReader = injectedDisk ?? pickDiskReader()
   try {
     reader.start()
+  } catch {
+    /* a reader that cannot start just never reports */
+  }
+  try {
+    diskReader.start()
   } catch {
     /* a reader that cannot start just never reports */
   }
@@ -322,6 +486,13 @@ async function tick(): Promise<HwUsage> {
       samples = null
     }
 
+    let disk: DiskSample | null = null
+    try {
+      disk = diskReader ? await diskReader.read() : null
+    } catch {
+      disk = null
+    }
+
     latest = {
       cpuPct,
       ram: {
@@ -329,6 +500,7 @@ async function tick(): Promise<HwUsage> {
         totalMb: Math.round(os.totalmem() / 1e6),
       },
       gpus: mergeUsage(getSysInfo(), samples),
+      disk,
       sampledAt: Date.now(),
     }
     return latest
@@ -359,8 +531,14 @@ export function stopUsageMonitor(): void {
     } catch {
       /* best effort */
     }
+    try {
+      diskReader?.stop()
+    } catch {
+      /* best effort */
+    }
   }
   reader = null
+  diskReader = null
   latest = null
   prevCpu = null
   running = false
@@ -372,6 +550,10 @@ process.once('exit', () => stopUsageMonitor())
 
 export function __setReaderForTests(r: GpuReader | null): void {
   injected = r
+}
+
+export function __setDiskReaderForTests(r: DiskReader | null): void {
+  injectedDisk = r
 }
 
 export function __tickForTests(): Promise<HwUsage> {

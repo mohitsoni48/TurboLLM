@@ -20,6 +20,13 @@ export function fmtPct(v: number | null): string {
   return `${Math.round(v)}%`
 }
 
+/** MB/s with one decimal (GitHub #211 follow-up: disk throughput). Null → the em-dash
+ *  placeholder, same fail-open convention as every other formatter here. */
+export function fmtMBps(v: number | null): string {
+  if (v === null) return '—'
+  return `${v.toFixed(1)} MB/s`
+}
+
 /** Threshold tone: danger at ≥ 95, warn at ≥ 85, ok below. Null is ok — an absent value is
  *  "nothing to alarm about", and failing open means it must not paint the bar red. */
 export function tone(pct: number | null): 'ok' | 'warn' | 'danger' {

@@ -101,6 +101,14 @@ export interface BackendDef {
    *  plain file on a Hugging Face model repo's `resolve/main`, not a tagged release). Takes
    *  priority over `repo`/`releaseTag` when set. */
   downloadBaseUrl?: string
+  /** Per-asset regex (parallel to `assets`) to resolve the REAL filename from the release's
+   *  asset list at download time, instead of trusting the literal name in `assets[i]`. Set
+   *  when upstream is known to rename this asset across releases without warning — llama.cpp
+   *  renamed the Windows ROCm archive from `*-bin-win-hip-radeon-x64.zip` to
+   *  `*-bin-win-rocm-<toolkit-ver>-x64.zip` mid-stream (GitHub #220), which turned every
+   *  hardcoded filename into a 404 the moment the pinned/latest tag crossed that rename.
+   *  `undefined` at an index keeps the old literal-URL behavior for that asset. */
+  assetPatterns?: (RegExp | undefined)[]
 }
 
 const plat = () => process.platform
@@ -125,7 +133,17 @@ export function availableBackends(tag = LLAMA_BUILD): BackendDef[] {
     if (a === 'arm64') return [def('cpu', 'CPU', `llama-${tag}-bin-win-cpu-arm64.zip`)]
     return [
       def('cuda', 'CUDA (NVIDIA)', `llama-${tag}-bin-win-cuda-${CUDA_VER}-x64.zip`, `cudart-llama-bin-win-cuda-${CUDA_VER}-x64.zip`),
-      def('rocm', 'ROCm / HIP (AMD Radeon)', `llama-${tag}-bin-win-hip-radeon-x64.zip`),
+      // Upstream has renamed this archive at least once (`*-bin-win-hip-radeon-x64.zip` →
+      // `*-bin-win-rocm-<toolkit-ver>-x64.zip`, GitHub #220) without any deprecation window,
+      // so the literal name below is only a fallback label — assetPatterns resolves the
+      // real filename from the release's own asset list at download time and survives the
+      // next rename too.
+      {
+        id: 'rocm',
+        label: 'ROCm / HIP (AMD Radeon)',
+        assets: [`llama-${tag}-bin-win-hip-radeon-x64.zip`],
+        assetPatterns: [/^llama-.+-bin-win-(?:hip-radeon|rocm-[\d.]+)-x64\.zip$/i],
+      },
       def('sycl', 'SYCL (Intel)', `llama-${tag}-bin-win-sycl-x64.zip`),
       def('vulkan', 'Vulkan (any GPU)', `llama-${tag}-bin-win-vulkan-x64.zip`),
       def('cpu', 'CPU', `llama-${tag}-bin-win-cpu-x64.zip`),
@@ -396,14 +414,33 @@ export async function provisionBackend(
 
   mkdirSync(destDir, { recursive: true })
   const parts = backend.assets.length
+  const tmpPaths: string[] = []
   try {
     for (let i = 0; i < parts; i++) {
-      const asset = backend.assets[i]
       const part = i + 1
-      const tmp = join(enginesRoot, asset)
-      const url = backend.downloadBaseUrl
-        ? `${backend.downloadBaseUrl}/${asset}`
-        : `https://github.com/${backend.repo ?? REPO}/releases/download/${backend.releaseTag ?? tag}/${asset}`
+      const pattern = backend.assetPatterns?.[i]
+      let assetName = backend.assets[i]
+      let url: string
+      if (backend.downloadBaseUrl) {
+        url = `${backend.downloadBaseUrl}/${assetName}`
+      } else {
+        const repo = backend.repo ?? REPO
+        const releaseTag = backend.releaseTag ?? tag
+        if (pattern) {
+          // The literal name in `assets[i]` is only a fallback label — upstream is known to
+          // rename this asset across releases (GitHub #220), so resolve the real filename
+          // from the release's own asset list instead of guessing it.
+          const releaseAssets = await releaseAssetsForTag(repo, releaseTag, signal)
+          const found = releaseAssets.find((a) => pattern.test(a.name))
+          if (!found) throw new Error(`no release asset matching ${pattern} in ${repo}@${releaseTag}`)
+          assetName = found.name
+          url = found.browser_download_url
+        } else {
+          url = `https://github.com/${repo}/releases/download/${releaseTag}/${assetName}`
+        }
+      }
+      const tmp = join(enginesRoot, assetName)
+      tmpPaths.push(tmp)
       onProgress?.({ phase: 'downloading', pct: 0, part, parts })
       await downloadFile(url, tmp, (p) => onProgress?.({ ...p, part, parts }), signal)
       onProgress?.({ phase: 'extracting', pct: -1, part, parts })
@@ -413,7 +450,7 @@ export async function provisionBackend(
   } catch (e) {
     // Cancelled or failed mid-download: remove partial archives + the half-built
     // backend dir so it isn't mistaken for an installed backend.
-    for (const asset of backend.assets) rmSync(join(enginesRoot, asset), { force: true })
+    for (const tmp of tmpPaths) rmSync(tmp, { force: true })
     rmSync(destDir, { recursive: true, force: true })
     throw e
   }
@@ -579,6 +616,22 @@ export async function latestBuildTagRelease(repo: string, signal?: AbortSignal):
     }
   }
   return best
+}
+
+/** Resolve the asset list of ONE specific release of `repo` by its exact tag (as opposed to
+ *  {@link latestGithubRelease}, which always resolves whichever release GitHub calls
+ *  "latest"). Used to look up the real filename of an asset upstream is known to rename
+ *  across releases (see {@link BackendDef.assetPatterns}) — provisioning always targets a
+ *  specific tag (pinned, or the one the update check resolved), never just "latest". */
+export async function releaseAssetsForTag(repo: string, tag: string, signal?: AbortSignal): Promise<ReleaseAsset[]> {
+  const res = await fetch(`https://api.github.com/repos/${repo}/releases/tags/${encodeURIComponent(tag)}`, {
+    headers: githubHeaders(),
+    signal,
+  })
+  if (isRateLimited(res)) throw new GithubRateLimitError(repo)
+  if (!res.ok) throw new Error(`could not query ${repo} release ${tag}: HTTP ${res.status}`)
+  const data = (await res.json()) as GithubRelease
+  return data.assets ?? []
 }
 
 /** Resolve the latest commit SHA on a branch of `repo` (ADR-088). `branch` empty →
