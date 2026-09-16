@@ -38,6 +38,7 @@ const box = (gpus: HwGpuUsage[], over: Partial<HwUsage> = {}): HwUsage => ({
   ram: { usedMb: 8000, totalMb: 32000 },
   sampledAt: 0,
   gpus,
+  disk: null,
   ...over,
 })
 

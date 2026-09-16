@@ -6,7 +6,14 @@ import { test } from 'node:test'
 import { Hono } from 'hono'
 import { registerApi } from './routes'
 import type { Deps } from '../deps'
-import { requestUsage, stopUsageMonitor, __setReaderForTests, type GpuReader } from '../sysinfo/usage'
+import {
+  requestUsage,
+  stopUsageMonitor,
+  __setDiskReaderForTests,
+  __setReaderForTests,
+  type DiskReader,
+  type GpuReader,
+} from '../sysinfo/usage'
 
 function fakeApp() {
   // The hwstats route never touches `d` — a minimal double is enough for registerApi.
@@ -22,6 +29,10 @@ function fakeApp() {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
+/** Without this the loop builds the REAL platform disk reader, which on darwin spawns an actual
+ *  `iostat -d -w 1` child from a unit test. The route's disk field is not what these cases assert. */
+const fakeDisk: DiskReader = { kind: 'fake-disk', start: () => {}, read: async () => null, stop: () => {} }
+
 test('GET /api/v1/hwstats returns the sampler shape', async (t) => {
   const starts: number[] = []
   const fake: GpuReader = {
@@ -32,11 +43,13 @@ test('GET /api/v1/hwstats returns the sampler shape', async (t) => {
     stop: () => {},
   }
   __setReaderForTests(fake)
+  __setDiskReaderForTests(fakeDisk)
   const app = fakeApp()
 
   t.after(() => {
     stopUsageMonitor()
     __setReaderForTests(null)
+    __setDiskReaderForTests(null)
   })
 
   // First call: no predecessor sample, so cpuPct is null — but the shape must be complete.
@@ -81,11 +94,13 @@ test('a reader that throws yields null usage, never a 500', async (t) => {
     stop: () => {},
   }
   __setReaderForTests(boom)
+  __setDiskReaderForTests(fakeDisk)
   const app = fakeApp()
 
   t.after(() => {
     stopUsageMonitor()
     __setReaderForTests(null)
+    __setDiskReaderForTests(null)
   })
 
   // First call starts the loop and burns the null-cpuPct first-tick slot.

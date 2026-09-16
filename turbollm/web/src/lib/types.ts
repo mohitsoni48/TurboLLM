@@ -168,11 +168,28 @@ export type HwGpuUsage = {
   unified: boolean
 }
 
+/** Disk throughput, MB/s (10^6 bytes). Null fields/whole value mean "nothing to report" —
+ *  no reader for this platform or no second sample yet to rate against — never a fabricated 0. */
+export type HwDiskUsage = {
+  /** MB/s read. On a COMBINED reader (macOS) this is the read+write TOTAL, not the read half. */
+  readMBps: number | null
+  /** Always null when `combined` is true — the platform reports no split. */
+  writeMBps: number | null
+  /** True when the platform reports one un-split throughput figure. The UI MUST branch on this
+   *  rather than on `writeMBps === null`, which cannot distinguish "no split exists" from
+   *  "the write figure was unreadable". */
+  combined: boolean
+}
+
 export type HwUsage = {
   /** Busy percent over the last sample interval, null on the very first sample. */
   cpuPct: number | null
   ram: { usedMb: number; totalMb: number }
   gpus: HwGpuUsage[]
+  /** GitHub #211 follow-up: lets the Monitor tab show whether disk I/O is the bottleneck
+   *  during model load or a long KV-cache-memory session. Null before the first rated sample,
+   *  or on a platform with no disk reader. */
+  disk: HwDiskUsage | null
   sampledAt: number
 }
 

@@ -23,7 +23,16 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **Disk I/O and shared/spilled VRAM on the Monitor tab's hardware panel** (GitHub #211
+  follow-up). Disk I/O shows live read/write MB/s (Windows via PhysicalDisk perf counters,
+  Linux via `/proc/diskstats`; macOS reports a single combined Throughput figure, because stock
+  `iostat` there has no read/write split — and that macOS path is designed but still unverified on
+  real Apple hardware) — useful for spotting whether disk is the bottleneck
+  during model load or a long KV-cache-memory session. Shared/spilled VRAM surfaces a discrete
+  GPU's usage of system memory (Windows WDDM "Shared Usage" / Linux amdgpu GTT) next to its own
+  VRAM figure, making it visible when a model has spilled out of the card's own pool.
 
 ## [1.13.2] - 2026-09-15
 

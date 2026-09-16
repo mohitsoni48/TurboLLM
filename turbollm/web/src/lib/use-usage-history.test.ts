@@ -7,6 +7,7 @@ const sample = (sampledAt: number, cpuPct: number | null = 50): HwUsage => ({
   cpuPct,
   ram: { usedMb: 8000, totalMb: 32000 },
   gpus: [],
+  disk: null,
   sampledAt,
 })
 

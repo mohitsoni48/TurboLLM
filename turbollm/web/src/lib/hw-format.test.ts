@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   aggregateGpu,
   fmtGb,
+  fmtMBps,
   fmtPct,
   isUnifiedBox,
   ramPct,
@@ -28,6 +29,7 @@ const box = (gpus: HwGpuUsage[], over: Partial<HwUsage> = {}): HwUsage => ({
   ram: { usedMb: 8000, totalMb: 32000 },
   sampledAt: 0,
   gpus,
+  disk: null,
   ...over,
 })
 
@@ -47,6 +49,15 @@ describe('fmtPct', () => {
     expect(fmtPct(38.4)).toBe('38%')
     expect(fmtPct(38.5)).toBe('39%')
     expect(fmtPct(100)).toBe('100%')
+  })
+})
+
+describe('fmtMBps', () => {
+  it('renders — for null', () => expect(fmtMBps(null)).toBe('—'))
+  it('renders one decimal with a unit suffix', () => {
+    expect(fmtMBps(12.5)).toBe('12.5 MB/s')
+    expect(fmtMBps(0)).toBe('0.0 MB/s')
+    expect(fmtMBps(1234.56)).toBe('1234.6 MB/s')
   })
 })
 
