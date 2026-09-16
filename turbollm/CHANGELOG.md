@@ -23,6 +23,10 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [1.13.3] - 2026-09-16
+
 ### Added
 
 - **Disk I/O and shared/spilled VRAM on the Monitor tab's hardware panel** (GitHub #211
@@ -33,6 +37,19 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   during model load or a long KV-cache-memory session. Shared/spilled VRAM surfaces a discrete
   GPU's usage of system memory (Windows WDDM "Shared Usage" / Linux amdgpu GTT) next to its own
   VRAM figure, making it visible when a model has spilled out of the card's own pool.
+
+### Fixed
+
+- **Windows ROCm engine update failed with HTTP 404** (GitHub #220). llama.cpp renamed the
+  Windows ROCm release asset (`*-bin-win-hip-radeon-x64.zip` → `*-bin-win-rocm-<toolkit-ver>-x64.zip`)
+  and the updater was building the download URL from a hardcoded filename. It now resolves the
+  real asset name from the release's own asset list, so a future upstream rename won't 404 again.
+
+### Discord
+- 🖴 **Disk I/O + shared VRAM on the Monitor tab** — see at a glance whether disk is the bottleneck
+  while a model loads or a long chat fills the KV cache, and whether a model has spilled out of
+  your GPU's own VRAM into system memory.
+- 🔧 **Fixed:** updating the Windows ROCm engine no longer 404s after an upstream llama.cpp rename.
 
 ## [1.13.2] - 2026-09-15
 

@@ -443,8 +443,9 @@ connected); **Remove** undoes it.
 
 - A **persistent bottom strip** on every screen shows real-time CPU, RAM, GPU and VRAM — values
   and percentages — pulled from `nvidia-smi`, WDDM counters, `rocm-smi`, AMD sysfs, `ioreg`,
-  or `/proc` on Linux. Clicking the bar opens detailed gauges and sparklines in Settings → System.
-  Toggle it off entirely from Settings → General.
+  or `/proc` on Linux. Clicking the bar opens detailed gauges and sparklines in Settings → System,
+  including live **disk I/O** (read/write MB/s) and a **shared/spilled VRAM** figure that shows
+  when a discrete GPU has spilled into system memory. Toggle it off entirely from Settings → General.
 - **Engines → Monitor** puts the live engine log and those same hardware gauges on one
   always-visible split screen, plus a second, LM Studio-style **developer request log**: every
   completion the daemon serves — external API clients, Code sessions, in-app Chat — with
