@@ -70,7 +70,7 @@ import { readSentLog } from '../telemetry/log'
 import { TELEMETRY_SCHEMA_VERSION } from '../telemetry/schema'
 import { classifyLoadFailure, classifyProvisionFailure } from '../telemetry/classify'
 import { registerOnboardingRoutes } from './onboarding-routes'
-import { startEngine, stopEngine, type EngineStartBody } from './engine-lifecycle'
+import { startEngine, stopEngine, type EngineStartBody, type EngineStopBody } from './engine-lifecycle'
 import { enqueueDownload, listDownloads, removeDownload } from './download-lifecycle'
 import { buildModelStatus } from './status-view'
 
@@ -1481,7 +1481,7 @@ export function registerApi(app: Hono, d: Deps): void {
   // swap-serialization behaviour instead of a second, drifting implementation.
   app.post('/api/v1/engine/start', async (c) => startEngine(c, d, await body<EngineStartBody>(c)))
 
-  app.post('/api/v1/engine/stop', (c) => stopEngine(c, d))
+  app.post('/api/v1/engine/stop', async (c) => stopEngine(c, d, await body<EngineStopBody>(c)))
 
   app.post('/api/v1/engine/restart', (c) => {
     // Kill switch: cancel auto-tune + abort chats, wait for the runner to release the engine,

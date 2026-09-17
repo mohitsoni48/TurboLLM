@@ -475,8 +475,12 @@ export function startEngine(): Promise<{ ok: true }> {
   return request<{ ok: true }>('/api/v1/engine/start', { method: 'POST', json: {} })
 }
 
-export function stopEngine(): Promise<{ ok: true }> {
-  return request<{ ok: true }>('/api/v1/engine/stop', { method: 'POST', json: {} })
+/** `modelKey` names a specific loaded model to stop — required when it names a model in its
+ *  own extra pool slot (an embedding model, ADR-389), or the engine ejected is whatever the
+ *  primary manager happens to be running instead (the bug this parameter fixes). Omitted,
+ *  this keeps stopping the primary manager exactly as before. */
+export function stopEngine(modelKey?: string): Promise<{ ok: true }> {
+  return request<{ ok: true }>('/api/v1/engine/stop', { method: 'POST', json: { modelKey } })
 }
 
 export function restartEngine(): Promise<{ ok: true }> {

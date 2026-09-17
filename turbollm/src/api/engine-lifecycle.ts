@@ -151,10 +151,49 @@ export async function startEngine(c: Context, d: Deps, b: EngineStartBody): Prom
   return c.json({ ok: true }, 202)
 }
 
-/** Unload whatever the primary manager is running. */
-export function stopEngine(c: Context, d: Deps): Response {
-  // Kill switch: stopping the engine cancels auto-tune and aborts in-flight chats too —
-  // they all depend on the engine that's going away.
+/** What `POST /api/v1/engine/stop` accepts. `modelKey` is optional and BACKWARD
+ *  COMPATIBLE: every existing caller (the topbar Eject, `/api/v1/engine/restart`, the Turbo
+ *  Link façade's `/unload`) still posts no body at all, which keeps stopping the primary
+ *  manager exactly as before. */
+export interface EngineStopBody {
+  modelKey?: string
+}
+
+/** Whether `modelKey` names the primary manager's CURRENTLY loaded model — by key or by
+ *  on-disk path, mirroring `ModelRouter.keysMatch`'s reason for accepting either: the
+ *  primary manager reports a model by whichever spelling `startEngine` last loaded it
+ *  under, so an exact-key-only check can miss a path-loaded model. */
+function namesPrimaryModel(d: Deps, modelKey: string): boolean {
+  const ms = d.manager.status()
+  const primaryKey = ms.model?.key
+  if (!primaryKey) return false
+  return primaryKey === modelKey || d.scanner.get(primaryKey)?.path === modelKey
+}
+
+/** Unload a model. When `modelKey` names a model loaded into its own extra pool slot (an
+ *  embedding model, ADR-389) that slot is stopped and nothing else is touched — the
+ *  symmetric counterpart to `startEngine`'s `entry.embedding` branch above. When `modelKey`
+ *  names the primary's own currently-loaded model (or no key is given at all — the Engines
+ *  page's own "Stop" button and every legacy caller), this stops the PRIMARY manager,
+ *  unchanged. Anything else — a key that names neither — is a safe no-op.
+ *
+ *  Before this, `stopEngine` took no model identity at all and always stopped the primary,
+ *  so ejecting an embedding model loaded alongside a chat model actually killed the chat
+ *  model instead. A first fix routed a non-matching key straight to "stop the primary" as
+ *  its fallback, which reintroduced the same failure a different way: a stale key (a
+ *  duplicate eject click landing after the slot already drained, or a load that hasn't
+ *  finished populating its pool slot yet) would ALSO fall through and kill whatever the
+ *  primary happened to be running — an unrelated model, still live. Only a key that
+ *  genuinely names the primary's own model may stop it; every other non-matching key is a
+ *  no-op, never a fallback. */
+export function stopEngine(c: Context, d: Deps, b: EngineStopBody = {}): Response {
+  if (b.modelKey) {
+    if (d.modelRouter.stopExplicit(b.modelKey)) return c.json({ ok: true }, 202)
+    if (!namesPrimaryModel(d, b.modelKey)) return c.json({ ok: true }, 202)
+  }
+  // Kill switch: stopping the PRIMARY engine cancels auto-tune and aborts in-flight chats
+  // too — they all depend on the engine that's going away. Not run above: the primary
+  // isn't going away when an extra slot was stopped, or nothing matched at all.
   d.bench.cancel()
   abortAllInFlightChats()
   d.manager.stop()

@@ -791,6 +791,11 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   }
 
   const isChat = c.req.method === 'POST' && pathname === '/v1/chat/completions'
+  // Embeddings requests carry their own `model` field too, and an embedding model always
+  // lives in its own pool slot (ModelRouter.doLoad's needsNewSlot) — it must route on that
+  // field the same way chat does, or it silently falls back to whatever the primary chat
+  // manager has loaded (which was never started with `--embeddings`) and 501s.
+  const isEmbeddings = c.req.method === 'POST' && pathname === '/v1/embeddings'
   // What "the owner is using this machine" means for wake gating (host-idle.ts): a real
   // generation request from a local client. A Turbo Link peer routed through this same
   // function is explicitly NOT that — see GatewayV1Options.origin.
@@ -798,10 +803,18 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
 
   // For chat completions: parse the body to extract the model field for
   // auto-swap routing (v0.6.0) and to apply the max_tokens cap if set.
+  // For embeddings: parse only to read `model` for routing — the buffered text (not a
+  // re-serialization) is what actually gets forwarded below, byte-for-byte.
   // For all other endpoints: skip body parsing and pass through untouched.
   let parsedBody: Record<string, unknown> | null = null
+  let embeddingsBodyText: string | null = null
   if (isChat) {
     try { parsedBody = (await c.req.json()) as Record<string, unknown> } catch { parsedBody = null }
+  } else if (isEmbeddings) {
+    try {
+      embeddingsBodyText = await c.req.text()
+      parsedBody = JSON.parse(embeddingsBodyText) as Record<string, unknown>
+    } catch { parsedBody = null }
   }
   const { token: chatToken, codeSessionId: chatCodeSessionId } = resolveCodeSession(c)
   const chatHarness = resolveHarness(c, d, 'openai')
@@ -832,7 +845,7 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
     ? analyzeTurn(chatView, url.origin)
     : null
 
-  const requestedModel = isChat ? ((parsedBody?.model as string | undefined) ?? '') : ''
+  const requestedModel = (isChat || isEmbeddings) ? ((parsedBody?.model as string | undefined) ?? '') : ''
   const routeResult = await d.modelRouter.route(requestedModel)
   if ('status' in routeResult) {
     return c.json(
@@ -843,6 +856,27 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   const target = routeResult.target
   /** Turbo Link (ADR-376) — see the identical binding in the /v1/messages handler above. */
   const remote = routeResult.remote
+
+  // Turbo Link is CHAT-only by design (ADR-376) — the comment below this block used to say
+  // a qualified id could never even reach the remote branch for a non-chat endpoint, since
+  // requestedModel was hardcoded to '' for everything but /v1/chat/completions. Making
+  // /v1/embeddings read its own `model` field (the actual fix this function exists for) made
+  // that comment's premise false for embeddings specifically: a qualified `<machine>/<model>`
+  // id now resolves and would otherwise proxy straight through. Refused explicitly here,
+  // before any of the link-chaining/header logic below runs, rather than silently expanding
+  // what a link can be asked to do.
+  if (remote && isEmbeddings) {
+    return c.json(
+      {
+        error: {
+          message: `'${requestedModel}' names a machine linked to this one. Turbo Link serves chat only — load the embedding model locally instead.`,
+          type: 'invalid_request_error',
+          code: 'link_embeddings_unsupported',
+        },
+      },
+      400,
+    )
+  }
 
   // ── Links do not chain (ADR-376, "Rejected — links that chain") ───────────────────────
   // This function is mounted TWICE: publicly at /v1/*, and behind the host's own façade
@@ -875,11 +909,14 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   // The peer's clients authenticate to THIS machine; their credential is meaningless on the
   // host and forwarding it would hand another box a secret it was never issued. The link
   // token replaces it, and is added nowhere else.
-  // A link serves CHAT only, and only a chat request ever resolves a remote target:
-  // `requestedModel` is read from the body for `/v1/chat/completions` alone, so every other
-  // verb routes with an empty id and can never reach the remote branch below. (Final-review
-  // M-2 supposed `/v1/embeddings` with a qualified id would proxy to the façade and 404;
-  // it does not — it is passed through to the LOCAL engine, exactly as before Turbo Link.)
+  // A link serves CHAT only. `requestedModel` is read from the body for
+  // `/v1/chat/completions` AND `/v1/embeddings` (the latter needs its own `model` field to
+  // route correctly among local pool slots — an unrelated fix); a qualified
+  // `<machine>/<model>` id sent to `/v1/embeddings` therefore CAN resolve to a remote
+  // target now, but is refused above (`link_embeddings_unsupported`) before ever reaching
+  // here — so every request that reaches this line, embeddings included, is guaranteed
+  // chat. Every other verb still routes with an empty id and can never reach the remote
+  // branch below at all.
   //
   // The query string is dropped for a remote request (M-5), for the same reason the header
   // set is an allowlist: a caller that passes a credential as a query parameter would
@@ -1001,6 +1038,15 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       }
       headers.delete('content-length') // re-serialised body has a new length
       init.body = parsedBody ? JSON.stringify(parsedBody) : ''
+    } else if (isEmbeddings) {
+      // Byte-for-byte passthrough of what was already buffered above to read `model` —
+      // unlike chat, nothing here needs rewriting, so the original text is forwarded as-is
+      // rather than re-serialized. The stale content-length header still has to go: undici
+      // validates it against the body it's actually given and refuses a mismatch outright
+      // (`fetch failed: invalid content-length header`), the same reason the isChat branch
+      // above deletes it before setting its own re-serialized body.
+      headers.delete('content-length')
+      init.body = embeddingsBodyText ?? ''
     } else {
       init.body = c.req.raw.body
       init.duplex = 'half'

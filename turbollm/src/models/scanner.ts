@@ -152,6 +152,20 @@ const EMBED_ARCHS = new Set([
   'bert', 'nomic-bert', 'jina-bert-v3-base', 'jina-bert',
   'distilbert', 'roberta', 'xlm-roberta', 'electra',
 ])
+// Decoder-architecture families CONFIRMED to need an explicit `--pooling last` for
+// /v1/embeddings to return correct vectors — llama.cpp's own GGUF pooling_type
+// auto-detection is tuned for genuine BERT-family archs (mean/cls) and does not reliably
+// infer 'last' for a causal architecture repurposed as an embedding model.
+//
+// Deliberately an ALLOW-list, not "anything that isn't a known BERT arch": `embedding` is
+// set by an arch-OR-filename match (EMBED_FILE_RE below), so a GGUF whose metadata failed
+// to parse (arch 'unknown') or a genuine BERT-family variant missing from EMBED_ARCHS above
+// (e.g. a newer jina-bert release) are both reachable with `embedding: true` — a deny-list
+// force-fed either one the wrong pooling type with no error, silently wrong vectors. Extend
+// this set only once a new family is actually confirmed needing it, not by assumption;
+// 'qwen3' is live-confirmed (Qwen3 Embedding), 'qwen2' from the same family (gte-Qwen2,
+// cited in EMBED_FILE_RE's own comment below).
+export const DECODER_EMBED_ARCHS = new Set(['qwen3', 'qwen2'])
 // Filename patterns common for embedding / reranker models. The curated prefixes catch
 // classic sentence-transformer-style names that don't spell out "embed" (bge, e5, gte); the
 // trailing `embed(ding)?` is the generic catch-all for the newer wave of decoder-architecture
