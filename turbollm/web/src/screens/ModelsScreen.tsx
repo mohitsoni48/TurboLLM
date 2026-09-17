@@ -649,7 +649,7 @@ function LibraryTab({
                     showOrigin={hasLinks}
                     layout={isDesktop ? 'row' : 'card'}
                     onLoad={(key) => actions.load.mutate({ key })}
-                    onEject={() => actions.eject.mutate()}
+                    onEject={(key) => actions.eject.mutate(key)}
                     onTune={(key) => setOpenKey(key)}
                     onDelete={(m) => setConfirmDelete(m)}
                     onDiscover={onDiscover}
@@ -728,7 +728,7 @@ function ModelRow({
   /** 'row' = the aligned desktop table row; 'card' = the mobile stacked card. */
   layout?: 'row' | 'card'
   onLoad: (key: string) => void
-  onEject: () => void
+  onEject: (key: string) => void
   onTune: (key: string) => void
   onDelete: (m: ModelEntry) => void
   onDiscover: (m: ModelEntry) => void
@@ -847,7 +847,7 @@ function ModelRow({
   const actionButtons = (
     <>
       {loaded ? (
-        <Button size="sm" onClick={() => { track('models', 'eject_model'); onEject() }} disabled={ejecting} title="Eject model (stop the engine)">
+        <Button size="sm" onClick={() => { track('models', 'eject_model'); onEject(m.key) }} disabled={ejecting} title="Eject model (stop the engine)">
           <CircleSlash size={14} />
           Eject
         </Button>

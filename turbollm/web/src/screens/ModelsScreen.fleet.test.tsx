@@ -14,6 +14,7 @@ const state: { models: ModelEntry[]; links: LinkSummary[]; remote: RemoteRow[] }
   models: [], links: [], remote: [],
 }
 const localLoad = vi.fn()
+const localEject = vi.fn()
 
 vi.mock('../lib/queries', () => ({
   queryKeys: { models: ['models'], status: ['status'] },
@@ -25,7 +26,7 @@ vi.mock('../lib/queries', () => ({
   }),
   useModelActions: () => ({
     load: { mutate: localLoad, isPending: false, variables: undefined },
-    eject: { mutate: vi.fn(), isPending: false },
+    eject: { mutate: localEject, isPending: false },
   }),
   useStatus: () => ({ data: { engine: { state: 'stopped' }, model: null } }),
 }))
@@ -128,6 +129,7 @@ beforeEach(() => {
   calls.length = 0
   failures.clear()
   localLoad.mockClear()
+  localEject.mockClear()
   installFetch()
 })
 
@@ -287,6 +289,17 @@ describe('ModelsScreen — merged fleet library', () => {
     renderScreen()
     await screen.findByRole('button', { name: 'workstation' })
     expect(screen.queryByText(/models:use/)).toBeNull()
+  })
+
+  // Regression: ejecting a specific row's model called the eject mutation with NO model
+  // identity at all, so the backend always stopped the primary manager regardless of which
+  // row's Eject button was clicked — ejecting an embedding model loaded into its own pool
+  // slot (ADR-389) actually stopped a running chat model instead.
+  it('ejecting a specific model row passes THAT model\'s key, not a bare eject', async () => {
+    state.models = [entry({ key: 'bge-m3', name: 'bge-m3', loaded: true })]
+    renderScreen()
+    await userEvent.click(await screen.findByRole('button', { name: /eject/i }))
+    expect(localEject).toHaveBeenCalledWith('bge-m3')
   })
 
   it('two machines with the same model name produce two distinct rows', async () => {

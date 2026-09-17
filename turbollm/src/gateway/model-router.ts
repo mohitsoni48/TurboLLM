@@ -171,6 +171,21 @@ export class ModelRouter {
     }
   }
 
+  /** Stop the extra pool slot named by `modelKey`, if one exists — the symmetric counterpart
+   *  to `loadExplicit`'s "an embedding model gets its own slot" rule (needsNewSlot above).
+   *  Returns false when `modelKey` doesn't name a live extra slot (including when it names
+   *  the PRIMARY manager's own model), so the caller knows to fall back to stopping the
+   *  primary — this method never touches it. Engine-lifecycle.ts's stopEngine() uses this so
+   *  ejecting a specific model (e.g. an embedding model loaded alongside a chat model) stops
+   *  THAT engine only, not whatever happens to be in the primary slot. */
+  stopExplicit(modelKey: string): boolean {
+    const slot = this.extraSlots.get(modelKey)
+    if (!slot) return false
+    slot.manager.stop()
+    this.extraSlots.delete(modelKey)
+    return true
+  }
+
   /** A manual switch (routes.ts) always loads directly into the PRIMARY manager, never an
    *  extra pool slot — so unlike `doLoad()`'s own bookkeeping, only `primaryLastUsed` needs
    *  updating on success. Without this, a manual switch left the router's own LRU timestamp

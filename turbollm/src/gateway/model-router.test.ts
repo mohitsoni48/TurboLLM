@@ -93,6 +93,39 @@ test('loadedModelKeys: pool-only (primary stopped) still reports pool slots', ()
   assert.deepEqual([...r.loadedModelKeys()], ['qwen-7b'])
 })
 
+// ── stopExplicit ──────────────────────────────────────────────────────────────
+// Regression for a real, live bug: ejecting an embedding model loaded into its own pool
+// slot (ADR-389) actually stopped the PRIMARY (chat) manager instead — engine-lifecycle.ts's
+// stopEngine() had no way to name which slot to stop, so it always called d.manager.stop()
+// unconditionally. Retrying then did nothing, because the primary was already stopped and
+// the embedding model was never in it to begin with.
+test('stopExplicit: stops and removes the named extra slot, reports true', () => {
+  const slotManager = fakeManager('running', 'bge-m3')
+  let stopped = 0
+  ;(slotManager as unknown as { stop: () => void }).stop = () => { stopped++ }
+  const r = router(fakeManager('running', 'llama-8b'), STORE, [
+    { manager: slotManager, modelKey: 'bge-m3', lastUsedMs: 0 },
+  ])
+
+  const result = r.stopExplicit('bge-m3')
+
+  assert.equal(result, true)
+  assert.equal(stopped, 1, 'the slot\'s own manager must be stopped')
+  assert.deepEqual([...r.loadedModelKeys()].sort(), ['llama-8b'], 'the slot is gone; the primary is untouched')
+})
+
+test('stopExplicit: a key naming no extra slot reports false and touches nothing', () => {
+  const r = router(fakeManager('running', 'llama-8b'), STORE, [
+    { manager: fakeManager('running', 'bge-m3'), modelKey: 'bge-m3', lastUsedMs: 0 },
+  ])
+
+  // 'llama-8b' is the PRIMARY's key, not an extra slot's — stopExplicit must not claim it.
+  const result = r.stopExplicit('llama-8b')
+
+  assert.equal(result, false)
+  assert.deepEqual([...r.loadedModelKeys()].sort(), ['bge-m3', 'llama-8b'], 'nothing was stopped')
+})
+
 // ── chatSlotCount / evictChatLru: 'stopping' must count as occupied ──────────────
 // Regression for a real, live bug: a manual model swap (routes.ts's /api/v1/engine/start,
 // which calls the PRIMARY manager directly, bypassing this router) passes the primary

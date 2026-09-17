@@ -447,7 +447,7 @@ export function ModelDetailDialog({
     if (detail.loaded) {
       // Stop the engine; the effect above starts the sweep once it reports stopped.
       setPendingBenchKey(detail.key)
-      actions.eject.mutate()
+      actions.eject.mutate(detail.key)
     } else {
       bench.start.mutate({ key: detail.key, base: draft ?? undefined })
     }

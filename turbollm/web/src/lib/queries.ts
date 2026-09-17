@@ -772,7 +772,7 @@ export function useModelActions() {
       },
     }),
     eject: useMutation({
-      mutationFn: () => stopEngine(),
+      mutationFn: (modelKey?: string) => stopEngine(modelKey),
       onSuccess: invalidate,
     }),
   }

@@ -151,10 +151,31 @@ export async function startEngine(c: Context, d: Deps, b: EngineStartBody): Prom
   return c.json({ ok: true }, 202)
 }
 
-/** Unload whatever the primary manager is running. */
-export function stopEngine(c: Context, d: Deps): Response {
-  // Kill switch: stopping the engine cancels auto-tune and aborts in-flight chats too —
-  // they all depend on the engine that's going away.
+/** What `POST /api/v1/engine/stop` accepts. `modelKey` is optional and BACKWARD
+ *  COMPATIBLE: every existing caller (the topbar Eject, `/api/v1/engine/restart`, the Turbo
+ *  Link façade's `/unload`) still posts no body at all, which keeps stopping the primary
+ *  manager exactly as before. */
+export interface EngineStopBody {
+  modelKey?: string
+}
+
+/** Unload a model. When `modelKey` names a model loaded into its own extra pool slot (an
+ *  embedding model, ADR-389) that slot is stopped and nothing else is touched — the
+ *  symmetric counterpart to `startEngine`'s `entry.embedding` branch above. Otherwise (no
+ *  key, or a key that isn't in any extra slot — including the primary's own model) this
+ *  stops the PRIMARY manager, unchanged.
+ *
+ *  Before this, `stopEngine` took no model identity at all and always stopped the primary,
+ *  so ejecting an embedding model loaded alongside a chat model actually killed the chat
+ *  model instead — and retrying did nothing, since the primary was already stopped and the
+ *  embedding model was never in it to begin with. */
+export function stopEngine(c: Context, d: Deps, b: EngineStopBody = {}): Response {
+  if (b.modelKey && d.modelRouter.stopExplicit(b.modelKey)) {
+    return c.json({ ok: true }, 202)
+  }
+  // Kill switch: stopping the PRIMARY engine cancels auto-tune and aborts in-flight chats
+  // too — they all depend on the engine that's going away. Not run above: the primary
+  // isn't going away when an extra slot was stopped instead.
   d.bench.cancel()
   abortAllInFlightChats()
   d.manager.stop()
