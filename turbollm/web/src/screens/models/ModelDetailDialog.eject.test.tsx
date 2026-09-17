@@ -18,7 +18,7 @@ const benchStartMutate = vi.fn()
 // Mutable, unlike the other FIXED_* fixtures below: the "wedges forever" regression test
 // needs to simulate the model list catching up (loaded: true -> false) AFTER the eject
 // click, which a frozen fixture can't express.
-let modelsState: { models: { key: string; loaded: boolean }[] } = { models: [{ key: 'bge-m3', loaded: true }] }
+let modelsState: { models: { key: string; loaded: boolean }[] } | undefined = { models: [{ key: 'bge-m3', loaded: true }] }
 
 function profile(): LoadProfile {
   return {
@@ -130,5 +130,17 @@ describe('ModelDetailDialog — "Stop & benchmark" eject targeting', () => {
     await waitFor(() => expect(benchStartMutate).toHaveBeenCalledWith(
       expect.objectContaining({ key: 'bge-m3' }),
     ))
+  })
+
+  // Regression (second Opus review pass, v1.13.4): `?? false` treated "the models list
+  // hasn't loaded yet" (a cold query cache, `modelsQ.data === undefined`) the same as
+  // "confirmed no longer loaded" — firing the deferred sweep on the SAME tick as the eject,
+  // before the model could possibly have actually stopped. Unresolved must mean "don't know
+  // yet, don't fire" (`?? true`, i.e. still-loaded-until-proven-otherwise), not "safe to go."
+  it('does NOT start the sweep while the models list is still unresolved (cold cache)', async () => {
+    modelsState = undefined
+    renderDialog()
+    await userEvent.click(await screen.findByRole('button', { name: /stop & benchmark/i }))
+    expect(benchStartMutate).not.toHaveBeenCalled()
   })
 })

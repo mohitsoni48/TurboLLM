@@ -347,7 +347,11 @@ export function ModelDetailDialog({
   // every extra slot, so this one check is correct for either case.
   useEffect(() => {
     if (!pendingBenchKey) return
-    const stillLoaded = modelsQ.data?.models.find((m) => m.key === pendingBenchKey)?.loaded ?? false
+    // `?? true`, not `false`: an unresolved models query (a cold cache — this effect can
+    // run before `useModels()` has ever fetched) must read as "still loaded, don't know
+    // yet," never as "confirmed stopped" — the latter fired the sweep on the same tick as
+    // the eject, before the model could possibly have actually stopped.
+    const stillLoaded = modelsQ.data?.models.find((m) => m.key === pendingBenchKey)?.loaded ?? true
     if (!stillLoaded) {
       bench.start.mutate({ key: pendingBenchKey, base: draft ?? undefined })
       setPendingBenchKey(null)
