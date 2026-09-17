@@ -25,6 +25,34 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.13.4] - 2026-09-17
+
+### Fixed
+
+- **`/v1/embeddings` now reaches the embedding model's own engine, not whatever chat model
+  happens to be loaded.** An embedding model loaded into its own pool slot (ADR-389) could
+  load fine but never actually answer an embeddings request — the gateway only read the
+  `model` field from the request body for `/v1/chat/completions`, so every other endpoint
+  silently routed to the primary chat engine instead, which wasn't started with
+  `--embeddings` and returned a 501.
+- **Decoder-architecture embedding models (Qwen3-Embedding, gte-Qwen2) now get the pooling
+  mode they need.** These rely on last-token pooling, which llama.cpp's own GGUF metadata
+  auto-detection doesn't reliably infer for a causal architecture repurposed as an embedding
+  model — previously producing silently wrong vectors with no error.
+- **Ejecting a specific model no longer stops the wrong engine.** Ejecting an embedding
+  model loaded alongside a chat model actually stopped the chat model instead, and retrying
+  did nothing — the eject action had no way to say which model to stop and always targeted
+  whatever the primary engine was running.
+
+### Discord
+
+- Fixed an embedding model (like Qwen3-Embedding) loaded alongside a chat model silently
+  failing every embedding request — it now answers correctly.
+- Fixed the pooling mode for these embedding models so they return correct vectors instead
+  of wrong ones.
+- Fixed the "Eject" button sometimes stopping the wrong model when more than one was loaded
+  at once.
+
 ## [1.13.3] - 2026-09-16
 
 ### Added
