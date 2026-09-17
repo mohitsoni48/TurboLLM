@@ -264,6 +264,32 @@ test('--embeddings gated by engine capability', () => {
   assert.equal(args.includes('--embeddings'), false)
 })
 
+// A decoder-architecture embedding model (Qwen3-Embedding, gte-Qwen2, e5-mistral, ...) uses
+// last-token pooling by convention; llama.cpp's own GGUF pooling_type auto-detection is tuned
+// for genuine BERT-family archs (mean/cls) and gets these wrong without an explicit override —
+// confirmed live: Qwen3 Embedding 0.6b never answers /v1/embeddings correctly without
+// `--pooling last`.
+test('--pooling last emitted for a decoder-architecture embedding model', () => {
+  const args = profileToArgs(base(), model({ embedding: true, arch: 'qwen3' }), caps)
+  assert.equal(args[args.indexOf('--pooling') + 1], 'last')
+})
+
+test('--pooling last NOT emitted for a genuine BERT-family embedding model', () => {
+  const args = profileToArgs(base(), model({ embedding: true, arch: 'bert' }), caps)
+  assert.equal(args.includes('--pooling'), false)
+})
+
+test('--pooling last NOT emitted for a non-embedding model', () => {
+  const args = profileToArgs(base(), model({ embedding: false, arch: 'qwen3' }), caps)
+  assert.equal(args.includes('--pooling'), false)
+})
+
+test('--pooling last gated by engine capability', () => {
+  const capNoPooling = { kvTypes: [], flags: ['--some-other-flag'] }
+  const args = profileToArgs(base(), model({ embedding: true, arch: 'qwen3' }), capNoPooling)
+  assert.equal(args.includes('--pooling'), false)
+})
+
 test('--grammar emitted when grammar is set', () => {
   const p = { ...base(), grammar: 'root ::= [a-z]+' }
   const args = profileToArgs(p, model(), caps)

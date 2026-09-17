@@ -4,7 +4,7 @@
 import type { Capabilities, ModelDefaults } from '../config/config'
 import { backendIdFromBinPath } from '../engines/update'
 import type { SysInfo } from '../sysinfo/sysinfo'
-import type { ModelEntry } from './scanner'
+import { EMBED_ARCHS, type ModelEntry } from './scanner'
 
 export interface Sampling {
   temp: number
@@ -951,6 +951,11 @@ export function profileToArgs(
   }
   // Embedding models activate the /v1/embeddings endpoint via --embeddings.
   if (m.embedding && has('--embeddings')) a.push('--embeddings')
+  // Decoder-architecture embedding models (Qwen3-Embedding, gte-Qwen2, e5-mistral, ...) rely on
+  // last-token pooling; llama.cpp's own GGUF pooling_type auto-detection is tuned for genuine
+  // BERT-family archs (EMBED_ARCHS: mean/cls) and gets these wrong without an explicit override —
+  // confirmed live: Qwen3 Embedding 0.6b never answers /v1/embeddings correctly without this.
+  if (m.embedding && !EMBED_ARCHS.has(m.arch.toLowerCase()) && has('--pooling')) a.push('--pooling', 'last')
   // Startup GBNF grammar constraint — only emitted when the user has set one.
   if (p.grammar && has('--grammar')) a.push('--grammar', p.grammar)
   // GitHub #222: explicit load mode. The value is whatever the engine's own --help

@@ -791,6 +791,11 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   }
 
   const isChat = c.req.method === 'POST' && pathname === '/v1/chat/completions'
+  // Embeddings requests carry their own `model` field too, and an embedding model always
+  // lives in its own pool slot (ModelRouter.doLoad's needsNewSlot) — it must route on that
+  // field the same way chat does, or it silently falls back to whatever the primary chat
+  // manager has loaded (which was never started with `--embeddings`) and 501s.
+  const isEmbeddings = c.req.method === 'POST' && pathname === '/v1/embeddings'
   // What "the owner is using this machine" means for wake gating (host-idle.ts): a real
   // generation request from a local client. A Turbo Link peer routed through this same
   // function is explicitly NOT that — see GatewayV1Options.origin.
@@ -798,10 +803,18 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
 
   // For chat completions: parse the body to extract the model field for
   // auto-swap routing (v0.6.0) and to apply the max_tokens cap if set.
+  // For embeddings: parse only to read `model` for routing — the buffered text (not a
+  // re-serialization) is what actually gets forwarded below, byte-for-byte.
   // For all other endpoints: skip body parsing and pass through untouched.
   let parsedBody: Record<string, unknown> | null = null
+  let embeddingsBodyText: string | null = null
   if (isChat) {
     try { parsedBody = (await c.req.json()) as Record<string, unknown> } catch { parsedBody = null }
+  } else if (isEmbeddings) {
+    try {
+      embeddingsBodyText = await c.req.text()
+      parsedBody = JSON.parse(embeddingsBodyText) as Record<string, unknown>
+    } catch { parsedBody = null }
   }
   const { token: chatToken, codeSessionId: chatCodeSessionId } = resolveCodeSession(c)
   const chatHarness = resolveHarness(c, d, 'openai')
@@ -832,7 +845,7 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
     ? analyzeTurn(chatView, url.origin)
     : null
 
-  const requestedModel = isChat ? ((parsedBody?.model as string | undefined) ?? '') : ''
+  const requestedModel = (isChat || isEmbeddings) ? ((parsedBody?.model as string | undefined) ?? '') : ''
   const routeResult = await d.modelRouter.route(requestedModel)
   if ('status' in routeResult) {
     return c.json(
@@ -1001,6 +1014,15 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       }
       headers.delete('content-length') // re-serialised body has a new length
       init.body = parsedBody ? JSON.stringify(parsedBody) : ''
+    } else if (isEmbeddings) {
+      // Byte-for-byte passthrough of what was already buffered above to read `model` —
+      // unlike chat, nothing here needs rewriting, so the original text is forwarded as-is
+      // rather than re-serialized. The stale content-length header still has to go: undici
+      // validates it against the body it's actually given and refuses a mismatch outright
+      // (`fetch failed: invalid content-length header`), the same reason the isChat branch
+      // above deletes it before setting its own re-serialized body.
+      headers.delete('content-length')
+      init.body = embeddingsBodyText ?? ''
     } else {
       init.body = c.req.raw.body
       init.duplex = 'half'

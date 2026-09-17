@@ -148,7 +148,7 @@ function attentionLayoutOf(meta: GgufMeta | null): Partial<ModelEntry> {
 const SPLIT_RE = /^(.*)-(\d{5})-of-(\d{5})\.gguf$/i
 
 // GGUF architectures that are always embedding models.
-const EMBED_ARCHS = new Set([
+export const EMBED_ARCHS = new Set([
   'bert', 'nomic-bert', 'jina-bert-v3-base', 'jina-bert',
   'distilbert', 'roberta', 'xlm-roberta', 'electra',
 ])
