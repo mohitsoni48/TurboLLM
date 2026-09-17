@@ -314,7 +314,7 @@ export function ModelDetailDialog({
 
   const detail = detailQ.data
   const statusQ = useStatus()
-  const engineState = statusQ.data?.engine.state
+  const modelsQ = useModels()
   useEffect(() => {
     if (detail) setDraft(structuredClone(detail.profile))
   }, [detail])
@@ -338,13 +338,21 @@ export function ModelDetailDialog({
   }, [modelKey])
 
   // After "Stop & benchmark", the eject takes a moment to drain the engine. Once the
-  // status poll reports it stopped, fire the deferred sweep (the runner 409s while busy).
+  // model list catches up and reports it no longer loaded, fire the deferred sweep (the
+  // runner 409s while busy). Watches THIS model's own `loaded` flag — not the primary
+  // engine's state — because eject (ModelRouter.stopExplicit, ADR-389) may target an
+  // extra pool slot without touching the primary at all: an embedding model ejected this
+  // way never moves the primary to 'stopped', so waiting on that state left the sweep
+  // wedged in `pending` forever. `loadedModelKeys()` already covers both the primary and
+  // every extra slot, so this one check is correct for either case.
   useEffect(() => {
-    if (pendingBenchKey && (engineState === 'stopped' || engineState === 'error')) {
+    if (!pendingBenchKey) return
+    const stillLoaded = modelsQ.data?.models.find((m) => m.key === pendingBenchKey)?.loaded ?? false
+    if (!stillLoaded) {
       bench.start.mutate({ key: pendingBenchKey, base: draft ?? undefined })
       setPendingBenchKey(null)
     }
-  }, [pendingBenchKey, engineState, bench.start])
+  }, [pendingBenchKey, modelsQ.data, bench.start])
 
   const kvTypes = activeEngine?.capabilities.kvTypes ?? ['f16']
 

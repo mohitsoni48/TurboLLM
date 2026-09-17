@@ -6,7 +6,7 @@
 // (ModelsScreen.fleet.test.tsx) and the underlying stopEngine() API call
 // (api.engine-lifecycle.test.ts).
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { ModelDetailDialog } from './ModelDetailDialog'
@@ -14,6 +14,11 @@ import { defaultGpu, defaultVllm } from '../../lib/types'
 import type { LoadProfile, ModelDetail } from '../../lib/types'
 
 const ejectMutate = vi.fn()
+const benchStartMutate = vi.fn()
+// Mutable, unlike the other FIXED_* fixtures below: the "wedges forever" regression test
+// needs to simulate the model list catching up (loaded: true -> false) AFTER the eject
+// click, which a frozen fixture can't express.
+let modelsState: { models: { key: string; loaded: boolean }[] } = { models: [{ key: 'bge-m3', loaded: true }] }
 
 function profile(): LoadProfile {
   return {
@@ -47,7 +52,6 @@ function detail(): ModelDetail {
 const FIXED_ENGINES = { engines: [{ id: 'e1', name: 'llama.cpp', kind: 'llama-server', capabilities: { kvTypes: ['f16'], flags: [] } }], activeEngineId: 'e1' }
 const FIXED_DETAIL = detail()
 const FIXED_PRESETS = { presets: [], pinnedId: null }
-const FIXED_MODELS = { models: [] }
 
 vi.mock('../../lib/queries', () => ({
   useEngines: () => ({ data: FIXED_ENGINES }),
@@ -59,7 +63,7 @@ vi.mock('../../lib/queries', () => ({
     reset: { mutate: vi.fn(), isPending: false },
   }),
   useBenchActions: () => ({
-    start: { mutate: vi.fn(), isPending: false, error: null },
+    start: { mutate: benchStartMutate, isPending: false, error: null },
     cancel: { mutate: vi.fn() },
     save: { mutate: vi.fn() },
   }),
@@ -70,22 +74,33 @@ vi.mock('../../lib/queries', () => ({
     apply: { mutate: vi.fn() }, create: { mutate: vi.fn(), isPending: false },
     update: { mutate: vi.fn(), isPending: false }, remove: { mutate: vi.fn() },
   }),
-  useModels: () => ({ data: FIXED_MODELS }),
+  useModels: () => ({ data: modelsState }),
 }))
 vi.mock('../../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../lib/api')>()),
   track: vi.fn(),
 }))
 
-beforeEach(() => { ejectMutate.mockClear() })
+beforeEach(() => {
+  ejectMutate.mockClear()
+  benchStartMutate.mockClear()
+  modelsState = { models: [{ key: 'bge-m3', loaded: true }] }
+})
 
 function renderDialog() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(
+  // A FRESH element each call, not a single reused reference: React bails out of
+  // re-rendering entirely when `rerender()` is given the exact same element object twice
+  // with no state/context update scheduled (the mocked hooks here are plain side-effect-free
+  // function calls, so nothing else triggers one) — the component's body, and therefore its
+  // effects, would silently never run again.
+  const buildTree = () => (
     <QueryClientProvider client={qc}>
       <ModelDetailDialog modelKey="bge-m3" onClose={vi.fn()} />
-    </QueryClientProvider>,
+    </QueryClientProvider>
   )
+  const result = render(buildTree())
+  return { ...result, rerenderSameTree: () => result.rerender(buildTree()) }
 }
 
 describe('ModelDetailDialog — "Stop & benchmark" eject targeting', () => {
@@ -93,5 +108,27 @@ describe('ModelDetailDialog — "Stop & benchmark" eject targeting', () => {
     renderDialog()
     await userEvent.click(await screen.findByRole('button', { name: /stop & benchmark/i }))
     expect(ejectMutate).toHaveBeenCalledWith('bge-m3')
+  })
+
+  // Regression: the deferred sweep used to wait on the PRIMARY manager's engine state
+  // reaching 'stopped' — correct back when eject always targeted the primary, but once
+  // eject correctly targets THIS model's own pool slot instead, ejecting a model that was
+  // never the primary (e.g. an embedding model in an extra slot) leaves the primary's
+  // state exactly as it was, so that wait condition never becomes true and the sweep
+  // never starts — "Stop & benchmark" wedges in `pending` forever with no error.
+  it('starts the deferred sweep once THIS model stops showing as loaded, not primary engine state', async () => {
+    const { rerenderSameTree } = renderDialog()
+    await userEvent.click(await screen.findByRole('button', { name: /stop & benchmark/i }))
+    expect(benchStartMutate).not.toHaveBeenCalled()
+
+    // The ejected model's own slot has now drained — simulate the model list catching up
+    // (this is what `useModels()`'s own polling would eventually report), independent of
+    // the primary engine, which was never touched.
+    modelsState = { models: [{ key: 'bge-m3', loaded: false }] }
+    rerenderSameTree()
+
+    await waitFor(() => expect(benchStartMutate).toHaveBeenCalledWith(
+      expect.objectContaining({ key: 'bge-m3' }),
+    ))
   })
 })

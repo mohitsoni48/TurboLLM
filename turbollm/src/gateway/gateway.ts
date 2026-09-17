@@ -857,6 +857,27 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   /** Turbo Link (ADR-376) — see the identical binding in the /v1/messages handler above. */
   const remote = routeResult.remote
 
+  // Turbo Link is CHAT-only by design (ADR-376) — the comment below this block used to say
+  // a qualified id could never even reach the remote branch for a non-chat endpoint, since
+  // requestedModel was hardcoded to '' for everything but /v1/chat/completions. Making
+  // /v1/embeddings read its own `model` field (the actual fix this function exists for) made
+  // that comment's premise false for embeddings specifically: a qualified `<machine>/<model>`
+  // id now resolves and would otherwise proxy straight through. Refused explicitly here,
+  // before any of the link-chaining/header logic below runs, rather than silently expanding
+  // what a link can be asked to do.
+  if (remote && isEmbeddings) {
+    return c.json(
+      {
+        error: {
+          message: `'${requestedModel}' names a machine linked to this one. Turbo Link serves chat only — load the embedding model locally instead.`,
+          type: 'invalid_request_error',
+          code: 'link_embeddings_unsupported',
+        },
+      },
+      400,
+    )
+  }
+
   // ── Links do not chain (ADR-376, "Rejected — links that chain") ───────────────────────
   // This function is mounted TWICE: publicly at /v1/*, and behind the host's own façade
   // (link-routes.ts, `origin: 'link'`). Without this guard, a peer sending
@@ -888,11 +909,14 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   // The peer's clients authenticate to THIS machine; their credential is meaningless on the
   // host and forwarding it would hand another box a secret it was never issued. The link
   // token replaces it, and is added nowhere else.
-  // A link serves CHAT only, and only a chat request ever resolves a remote target:
-  // `requestedModel` is read from the body for `/v1/chat/completions` alone, so every other
-  // verb routes with an empty id and can never reach the remote branch below. (Final-review
-  // M-2 supposed `/v1/embeddings` with a qualified id would proxy to the façade and 404;
-  // it does not — it is passed through to the LOCAL engine, exactly as before Turbo Link.)
+  // A link serves CHAT only. `requestedModel` is read from the body for
+  // `/v1/chat/completions` AND `/v1/embeddings` (the latter needs its own `model` field to
+  // route correctly among local pool slots — an unrelated fix); a qualified
+  // `<machine>/<model>` id sent to `/v1/embeddings` therefore CAN resolve to a remote
+  // target now, but is refused above (`link_embeddings_unsupported`) before ever reaching
+  // here — so every request that reaches this line, embeddings included, is guaranteed
+  // chat. Every other verb still routes with an empty id and can never reach the remote
+  // branch below at all.
   //
   // The query string is dropped for a remote request (M-5), for the same reason the header
   // set is an allowlist: a caller that passes a credential as a query parameter would

@@ -284,6 +284,28 @@ test('--pooling last NOT emitted for a non-embedding model', () => {
   assert.equal(args.includes('--pooling'), false)
 })
 
+// Regression (Opus release review, v1.13.4): the first version of this gate was a
+// DENY-list ("anything not exactly a known BERT arch gets --pooling last"), which fires
+// on every arch it doesn't recognize — not just genuine decoder models. `embedding` is set
+// by an arch-OR-filename match (scanner.ts's EMBED_FILE_RE), so these ARE reachable:
+// a GGUF whose metadata failed to parse reports arch 'unknown' while its filename still
+// matches (scanner.ts's incomplete/parseError fallback), and a real BERT-family variant
+// not in the curated EMBED_ARCHS list (e.g. a newer jina-bert release) both slip through
+// the deny-list and get force-fed last-token pooling — silently wrong embedding vectors,
+// no error. Fixed by flipping to an ALLOW-list of confirmed decoder-style embedding archs.
+test('--pooling last NOT emitted when the arch could not be determined (unknown)', () => {
+  const args = profileToArgs(base(), model({ embedding: true, arch: 'unknown' }), caps)
+  assert.equal(args.includes('--pooling'), false)
+})
+
+test('--pooling last NOT emitted for a BERT-family variant outside the curated arch list', () => {
+  // Not literally in scanner.ts's EMBED_ARCHS set, but still a genuine BERT-family model
+  // (mean/cls pooling, not last-token) — the exact class of near-miss the old deny-list
+  // misclassified.
+  const args = profileToArgs(base(), model({ embedding: true, arch: 'jina-bert-v2' }), caps)
+  assert.equal(args.includes('--pooling'), false)
+})
+
 test('--pooling last gated by engine capability', () => {
   const capNoPooling = { kvTypes: [], flags: ['--some-other-flag'] }
   const args = profileToArgs(base(), model({ embedding: true, arch: 'qwen3' }), capNoPooling)
