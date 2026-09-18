@@ -107,6 +107,51 @@ export function chooseEngineName(name: string | undefined, priorName: string | u
   return name ?? priorName ?? ''
 }
 
+/** The subset of a completed build's own identity needed to find what it should replace. */
+export interface BuildIdentity {
+  binPath: string
+  sourceRepo?: string
+  sourceBranch?: string
+  sourceCommit?: string
+}
+
+/** The subset of a registered {@link Engine}'s fields needed to match it against a build. */
+export interface RegisteredEngineIdentity {
+  id: string
+  name: string
+  binPath: string
+  sourceRepo?: string
+  sourceBranch?: string
+  sourceCommit?: string
+}
+
+/** PURE: find the existing registered engine (if any) that a freshly-completed build should
+ *  replace in place, so re-registering it doesn't collide with its own prior name (ADR-387/388).
+ *
+ * Matches by exact `binPath` first — the common case, since the same repo+branch+commit always
+ * slugs to the same build directory. Falls back to repo identity via {@link sameRepo} (never a
+ * raw string comparison — two spellings of the same repo, e.g. a trailing `.git`/slash, or a
+ * moved data dir (ADR-215) that changes the absolute `binPath` while the repo is unchanged, must
+ * still match), requiring an EXACT branch+commit match so a commit-pinned build never collapses
+ * onto a plain branch-tip build of the same repo, or vice versa.
+ *
+ * ADR-387 fixed `buildDirName`'s own repo comparison but explicitly flagged this exact class of
+ * bug as unaddressed here: "registration still matches by binary path before checking repo
+ * identity ... a future collision class would reopen the same failure shape." A raw `===` on
+ * `sourceRepo` was that collision class — it left a stranded prior registration (and its name)
+ * un-replaceable whenever `binPath` alone didn't match. */
+export function findPriorEngine(engines: RegisteredEngineIdentity[], build: BuildIdentity): RegisteredEngineIdentity | undefined {
+  return (
+    engines.find((e) => e.binPath === build.binPath) ??
+    engines.find(
+      (e) =>
+        sameRepo(e.sourceRepo, build.sourceRepo) &&
+        (e.sourceBranch ?? '') === (build.sourceBranch ?? '') &&
+        (e.sourceCommit ?? '') === (build.sourceCommit ?? ''),
+    )
+  )
+}
+
 export interface BuildHooks {
   phase: (p: BuildPhase) => void
   log: (line: string) => void
