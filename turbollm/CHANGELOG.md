@@ -25,6 +25,41 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.13.5] - 2026-09-18
+
+### Fixed
+
+- **vLLM and SGLang no longer blame a broken local install on "this platform isn't supported."**
+  The preflight check that probes whether the Python environment can actually import `uvloop`
+  treated *any* failure the same way — "vLLM/SGLang cannot run on Linux," even though Linux is
+  uvloop's primary supported platform with real prebuilt wheels. A stale or incomplete
+  environment (for example, after moving the data directory) now gets an honest "this
+  environment looks broken — reinstall the engine" message instead of a false claim that the
+  platform itself can't work. Only Windows and macOS (genuinely unsupported/experimental
+  upstream) still show the platform-limitation message.
+- **A custom engine build could get permanently stuck on "Name already in use."** Rebuilding an
+  engine matched its previous registration by exact binary path first, then by an exact-text
+  comparison of the source repo URL. Two spellings of the same repo (a trailing `.git` or
+  slash) — or moving the data directory, which changes the absolute build path — could make that
+  comparison miss, leaving the old registration (and its name) stranded and blocking every later
+  build under that name with no way to recover except renaming.
+- **SGLang's "Install" button was unconditionally disabled**, regardless of hardware. It shipped
+  fully wired on the backend but was missed in the frontend's install/update dispatch, so
+  clicking it never had any effect on any machine, NVIDIA GPU or not.
+- **SGLang never showed an available update.** It shipped without a case in the engine-update
+  resolver, so the Update button/badge never appeared and an `auto` update policy never fired for
+  it — only the manual "Check for update" dropdown action worked.
+
+### Discord
+
+- 🔧 **vLLM/SGLang fix:** if either engine failed with a "not supported on this platform" error
+  on Linux, that was wrong — it's now fixed to tell you the real problem (usually a broken
+  install) instead.
+- 🔧 **Engine builds:** rebuilding a custom engine could get stuck failing with "name already in
+  use" forever. Fixed.
+- 🔧 **SGLang:** the Install button on the Engines page actually works now — it was silently a
+  no-op before, even with a supported GPU. Update notifications for it work now too.
+
 ## [1.13.4] - 2026-09-17
 
 ### Fixed
