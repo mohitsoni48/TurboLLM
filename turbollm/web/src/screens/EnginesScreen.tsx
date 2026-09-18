@@ -851,6 +851,7 @@ function EngineGallery({
   // ── lifecycle (unchanged behavior; mirrors ManagedEngines.DiscoverEngines) ──
   const installFor = (e: CatalogEngine) => {
     if (e.installEndpoint === '/api/v1/engines/vllm') return install.vllm
+    if (e.installEndpoint === '/api/v1/engines/sglang') return install.sglang
     if (e.installEndpoint === '/api/v1/engines/mlx') return install.mlx
     if (e.installEndpoint === '/api/v1/engines/rapid-mlx') return install.rapidMlx
     if (e.installEndpoint === '/api/v1/engines/mlx-vlm') return install.mlxVlm
@@ -861,6 +862,7 @@ function EngineGallery({
   }
   const updateFor = (e: CatalogEngine) => {
     if (e.installEndpoint === '/api/v1/engines/vllm') return install.updateVllm
+    if (e.installEndpoint === '/api/v1/engines/sglang') return install.updateSglang
     if (e.installEndpoint === '/api/v1/engines/mlx') return install.updateMlx
     if (e.installEndpoint === '/api/v1/engines/rapid-mlx') return install.updateRapidMlx
     if (e.installEndpoint === '/api/v1/engines/mlx-vlm') return install.updateMlxVlm
