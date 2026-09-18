@@ -49,7 +49,7 @@ import { ensureKoboldcpp, koboldcppBinPath, koboldcppDir } from '../engines/kobo
 import { ensureLlamafile, llamafileBinPath, llamafileDir } from '../engines/llamafile'
 import { catalogForPlatform, catalogEngine } from '../engines/catalog'
 import { checkBuildPrereqs } from '../engines/build-prereqs'
-import { runBuild, runPrereqInstall, buildDirName, chooseEngineName, normRepoUrl, sameRepo, sourceBuildBinary, sourceBuildDirOf } from '../engines/build-runner'
+import { runBuild, runPrereqInstall, buildDirName, chooseEngineName, findPriorEngine, normRepoUrl, sameRepo, sourceBuildBinary, sourceBuildDirOf } from '../engines/build-runner'
 import { provisionCuda } from '../engines/cuda-provision'
 import { detectHardware } from '../engines/hardware'
 import { recommendEngines } from '../engines/recommend'
@@ -759,15 +759,12 @@ export function registerApi(app: Hono, d: Deps): void {
         // current build silently deletes the current one's registration (its files on disk are
         // untouched, but it vanishes from the engine list).
         // A failure HERE keeps the built binary on disk (no GC) so it isn't thrown away.
-        const engines = d.registry.list().engines
-        const prior =
-          engines.find((e) => e.binPath === out.binPath) ??
-          engines.find(
-            (e) =>
-              e.sourceRepo === repoUrl &&
-              (e.sourceBranch ?? '') === (branch ?? '') &&
-              (e.sourceCommit ?? '') === (commit ?? ''),
-          )
+        const prior = findPriorEngine(d.registry.list().engines, {
+          binPath: out.binPath,
+          sourceRepo: repoUrl,
+          sourceBranch: branch,
+          sourceCommit: commit,
+        })
         if (prior) {
           if (d.registry.active()?.id === prior.id) await d.manager.stopAndWait()
           try { d.registry.remove(prior.id) } catch { /* already gone */ }

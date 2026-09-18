@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildDirName, chooseEngineName, CMAKE_CONFIGURE_ARGS, isIncompleteMetalBackendError, pickGenerator, vcvarsBatch, stripGenericAsmLanguage, sameRepo, normRepoUrl, sourceBuildDirOf, notCmakeProjectError, missingPatchShaError, sha256Hex, patchChecksumMismatchError } from './build-runner'
+import { buildDirName, chooseEngineName, CMAKE_CONFIGURE_ARGS, isIncompleteMetalBackendError, pickGenerator, vcvarsBatch, stripGenericAsmLanguage, sameRepo, normRepoUrl, sourceBuildDirOf, notCmakeProjectError, missingPatchShaError, sha256Hex, patchChecksumMismatchError, findPriorEngine } from './build-runner'
 import { join } from 'node:path'
 
 test('buildDirName: owner/repo from a .git URL, branch appended', () => {
@@ -51,6 +51,57 @@ test('chooseEngineName: falls back to the prior name only when no name was submi
 
 test('chooseEngineName: a fresh build with neither a submitted nor a prior name is empty (registry.add derives one)', () => {
   assert.equal(chooseEngineName(undefined, undefined), '')
+})
+
+test('findPriorEngine: matches by exact binPath (the common rebuild case)', () => {
+  const engines = [{ id: '1', name: 'Prism', binPath: '/data/engines/build/owner-repo/llama-server' }]
+  const prior = findPriorEngine(engines, { binPath: '/data/engines/build/owner-repo/llama-server' })
+  assert.equal(prior?.id, '1')
+})
+
+test('findPriorEngine: matches by repo identity even when the URL spelling differs (regression, ADR-387 follow-up)', () => {
+  // ADR-387 fixed buildDirName's own repo comparison but explicitly flagged this exact class of
+  // bug as unaddressed at this OTHER call site: "registration still matches by binary path before
+  // checking repo identity ... a future collision class would reopen the same failure shape."
+  // A moved data dir (ADR-215) changes the absolute binPath even though repo+branch+commit are
+  // unchanged, and a raw `===` on sourceRepo then fails to see two spellings of the same repo as
+  // the same repo — leaving the old registration (and its name) stranded forever.
+  const engines = [
+    {
+      id: '1',
+      name: 'ik-llama',
+      binPath: '/old/data/dir/engines/build/ikawrakow-ik_llama.cpp/llama-server',
+      sourceRepo: 'https://github.com/ikawrakow/ik_llama.cpp.git/',
+      sourceBranch: 'main',
+      sourceCommit: '',
+    },
+  ]
+  const prior = findPriorEngine(engines, {
+    binPath: '/new/data/dir/engines/build/ikawrakow-ik_llama.cpp/llama-server',
+    sourceRepo: 'https://github.com/ikawrakow/ik_llama.cpp',
+    sourceBranch: 'main',
+    sourceCommit: '',
+  })
+  assert.equal(prior?.id, '1')
+})
+
+test('findPriorEngine: a commit-pinned build never matches a plain branch-tip build of the same repo, or vice versa', () => {
+  const engines = [
+    { id: '1', name: 'Prism', binPath: '/x/branch-build', sourceRepo: 'https://github.com/o/r', sourceBranch: 'main', sourceCommit: '' },
+  ]
+  const prior = findPriorEngine(engines, {
+    binPath: '/x/pinned-build',
+    sourceRepo: 'https://github.com/o/r',
+    sourceBranch: 'main',
+    sourceCommit: 'abc123',
+  })
+  assert.equal(prior, undefined)
+})
+
+test('findPriorEngine: an unrelated repo never matches', () => {
+  const engines = [{ id: '1', name: 'Other', binPath: '/x/other', sourceRepo: 'https://github.com/a/b' }]
+  const prior = findPriorEngine(engines, { binPath: '/x/new', sourceRepo: 'https://github.com/c/d' })
+  assert.equal(prior, undefined)
 })
 
 test('normRepoUrl: strips scheme, github.com host, .git suffix, trailing slash, and case', () => {

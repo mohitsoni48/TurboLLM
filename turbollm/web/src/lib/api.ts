@@ -307,6 +307,10 @@ export function installVllm(): Promise<{ accepted: true; engine: 'vllm' }> {
   return request('/api/v1/engines/vllm', { method: 'POST', json: {} })
 }
 
+export function installSglang(): Promise<{ accepted: true; engine: 'sglang' }> {
+  return request('/api/v1/engines/sglang', { method: 'POST', json: {} })
+}
+
 export function installTurboquant(): Promise<{ accepted: true; engine: 'turboquant' }> {
   return request('/api/v1/engines/turboquant', { method: 'POST', json: {} })
 }
@@ -425,6 +429,11 @@ export function enableBackend(id: string): Promise<{ ok: true; engineId: string 
 /** Update (upgrade) the vLLM engine to the latest release (passes -U to uv pip install). */
 export function updateVllm(): Promise<{ accepted: true; engine: 'vllm' }> {
   return request('/api/v1/engines/vllm?update=1', { method: 'POST', json: {} })
+}
+
+/** Update (upgrade) the SGLang engine to the latest release (passes -U to uv pip install). */
+export function updateSglang(): Promise<{ accepted: true; engine: 'sglang' }> {
+  return request('/api/v1/engines/sglang?update=1', { method: 'POST', json: {} })
 }
 
 /** Update (upgrade) the MLX engine to the latest release (passes --upgrade to uv pip install). */

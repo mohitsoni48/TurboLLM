@@ -65,26 +65,58 @@ export async function ensureVllmEnv(root: string, onProgress?: (p: ProvisionProg
   return { python: py, version }
 }
 
+function platformDisplay(platform: NodeJS.Platform): string {
+  return platform === 'win32' ? 'Windows' : platform === 'darwin' ? 'macOS' : platform
+}
+
+/**
+ * Turn a failed `import uvloop` probe into an actionable message. uvloop ships real
+ * manylinux wheels, so a failure on Linux is never "this platform has no build" — Linux is
+ * uvloop's primary target. Only Windows (unsupported upstream) and macOS (CPU-only
+ * experimental, per the module doc comment above) get the "unsupported platform" framing;
+ * everywhere else — including a missing interpreter (ENOENT) from a stale/broken venv —
+ * surfaces what actually failed instead of misdiagnosing a fixable local install as a
+ * platform limitation.
+ */
+export function classifyVllmBlocker(platform: NodeJS.Platform, error: unknown): string {
+  const plat = platformDisplay(platform)
+  if (platform === 'win32' || platform === 'darwin') {
+    return (
+      `vLLM cannot run on ${plat}: its OpenAI server requires uvloop (and other Linux-only ` +
+      `components such as NCCL/Triton), which have no ${plat} build. Use the llama.cpp / TurboQuant ` +
+      `engine for GGUF models here, or run vLLM under WSL2 / Linux.`
+    )
+  }
+  const err = error as (NodeJS.ErrnoException & { stderr?: string | Buffer }) | undefined
+  if (err?.code === 'ENOENT') {
+    return (
+      `vLLM's environment looks missing or broken (interpreter not found). ` +
+      `Reinstall the vLLM engine from the Engines page.`
+    )
+  }
+  const raw = err?.stderr ? String(err.stderr) : (err?.message ?? 'unknown error')
+  const detail = raw.trim().split('\n').filter(Boolean).slice(-1)[0] ?? raw.trim()
+  return (
+    `vLLM's environment looks broken or incomplete (uvloop failed to import: ${detail}). ` +
+    `${plat} is a supported platform for vLLM — reinstall the vLLM engine from the Engines ` +
+    `page rather than switching engines.`
+  )
+}
+
 /**
  * Preflight (ADR-080): can vLLM's OpenAI server actually run on this machine? Its entrypoint
- * hard-imports `uvloop` (POSIX-only) plus other Linux-only deps (NCCL, Triton, CUDA-graph capture),
- * so on Windows it crashes on import before loading anything. We probe the *concrete* blocker — can
- * the venv import uvloop — rather than guessing from `process.platform`, so this stays correct if a
- * future vLLM/uvloop ever gains Windows support. Returns a clear, actionable message when vLLM can't
+ * hard-imports `uvloop` plus other deps (NCCL, Triton, CUDA-graph capture), so a broken
+ * environment crashes on import before loading anything. We probe the *concrete* blocker — can
+ * the venv import uvloop — rather than assuming a platform can't work at all, then classify the
+ * result via {@link classifyVllmBlocker}. Returns a clear, actionable message when vLLM can't
  * serve here, or null when it can. Fast (~1s) and run once per load, before spawn.
  */
 export async function vllmServeBlocker(python: string): Promise<string | null> {
   try {
     await execFileP(python, ['-c', 'import uvloop'], { timeout: 20_000 })
     return null
-  } catch {
-    const plat =
-      process.platform === 'win32' ? 'Windows' : process.platform === 'darwin' ? 'macOS' : process.platform
-    return (
-      `vLLM cannot run on ${plat}: its OpenAI server requires uvloop (and other Linux-only ` +
-      `components such as NCCL/Triton), which have no ${plat} build. Use the llama.cpp / TurboQuant ` +
-      `engine for GGUF models here, or run vLLM under WSL2 / Linux.`
-    )
+  } catch (error) {
+    return classifyVllmBlocker(process.platform, error)
   }
 }
 
