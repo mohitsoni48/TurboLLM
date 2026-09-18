@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { engineAcceptsFormat, engineModelAlias, engineRejectsAudioModel, ENGINE_MODEL_ALIAS } from './compat'
-import { vllmServerCommand, vllmServeBlocker } from './vllm'
+import { vllmServerCommand, vllmServeBlocker, classifyVllmBlocker } from './vllm'
 import { mlxServerCommand, mlxSamplingArgs } from './mlx'
 import { mlxVlmServerCommand } from './mlx-vlm'
 
@@ -74,11 +74,36 @@ test('vllmServerCommand serves under the shared default_model alias', () => {
   assert.equal(args[i + 1], ENGINE_MODEL_ALIAS)
 })
 
+test('classifyVllmBlocker: Windows and macOS report an unsupported platform (ADR-080)', () => {
+  assert.match(classifyVllmBlocker('win32', new Error('boom')), /vLLM cannot run on Windows/)
+  assert.match(classifyVllmBlocker('darwin', new Error('boom')), /vLLM cannot run on macOS/)
+})
+
+test('classifyVllmBlocker: Linux reports a broken environment, never "no Linux build" (regression)', () => {
+  // uvloop ships real manylinux wheels — a Linux import failure is an environment problem
+  // (broken/incomplete venv), never a platform limitation. Conflating the two previously
+  // told Linux users to switch engines or run under WSL2 for a fixable local install issue.
+  const msg = classifyVllmBlocker('linux', new Error('ModuleNotFoundError: no module named uvloop'))
+  assert.doesNotMatch(msg, /cannot run on/i)
+  assert.match(msg, /reinstall/i)
+})
+
+test('classifyVllmBlocker: a missing interpreter (ENOENT) is a broken install, not an unsupported platform', () => {
+  const enoent = Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' })
+  assert.match(classifyVllmBlocker('linux', enoent), /interpreter not found/i)
+})
+
 test('vllmServeBlocker returns a clear message when the runtime cannot serve (ADR-080)', async () => {
-  // A bogus interpreter path can't import uvloop → the preflight reports vLLM can't run here,
-  // exactly as on Windows where uvloop has no build. (On Linux/macOS with a real venv it returns null.)
+  // A bogus interpreter path can't import uvloop → the preflight reports a blocker.
+  // On Windows/macOS that's framed as an unsupported platform; elsewhere (Linux) it must
+  // NOT claim "cannot run on Linux" since uvloop is fully supported there.
   const msg = await vllmServeBlocker(process.platform === 'win32' ? 'C:/no/such/python.exe' : '/no/such/python')
-  assert.ok(msg && /vLLM cannot run/.test(msg))
+  assert.ok(msg)
+  if (process.platform === 'win32' || process.platform === 'darwin') {
+    assert.match(msg!, /cannot run on/i)
+  } else {
+    assert.doesNotMatch(msg!, /cannot run on/i)
+  }
 })
 
 test('mlxServerCommand passes model/host/port and appends MLX-only extraArgs (no alias flag)', () => {

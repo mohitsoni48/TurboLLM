@@ -50,22 +50,53 @@ export async function ensureSglangEnv(root: string, onProgress?: (p: ProvisionPr
   return { python: py, version }
 }
 
+function platformDisplay(platform: NodeJS.Platform): string {
+  return platform === 'win32' ? 'Windows' : platform === 'darwin' ? 'macOS' : platform
+}
+
 /**
- * Preflight: can SGLang's server actually run here? Like vLLM it hard-requires
- * uvloop (POSIX-only). Returns a clear, actionable message when blocked, or null when OK.
+ * Turn a failed `import uvloop` probe into an actionable message. Mirrors vLLM's
+ * `classifyVllmBlocker` (ADR-080): uvloop ships real manylinux wheels, so a Linux failure is
+ * never "this platform has no build" — only Windows and macOS (unsupported upstream) get that
+ * framing. Everywhere else, including a missing interpreter (ENOENT) from a stale/broken venv,
+ * surfaces what actually failed instead of misdiagnosing a fixable local install as a platform
+ * limitation.
  */
-export async function sgLangServeBlocker(python: string): Promise<string | null> {
-  try {
-    await execFileP(python, ['-c', 'import uvloop'], { timeout: 20_000 })
-    return null
-  } catch {
-    const plat =
-      process.platform === 'win32' ? 'Windows' : process.platform === 'darwin' ? 'macOS' : process.platform
+export function classifySglangBlocker(platform: NodeJS.Platform, error: unknown): string {
+  const plat = platformDisplay(platform)
+  if (platform === 'win32' || platform === 'darwin') {
     return (
       `SGLang cannot run on ${plat}: its server requires uvloop (and other Linux-only ` +
       `components), which have no ${plat} build. Use the llama.cpp / TurboQuant ` +
       `engine for GGUF models here, or run SGLang under WSL2 / Linux.`
     )
+  }
+  const err = error as (NodeJS.ErrnoException & { stderr?: string | Buffer }) | undefined
+  if (err?.code === 'ENOENT') {
+    return (
+      `SGLang's environment looks missing or broken (interpreter not found). ` +
+      `Reinstall the SGLang engine from the Engines page.`
+    )
+  }
+  const raw = err?.stderr ? String(err.stderr) : (err?.message ?? 'unknown error')
+  const detail = raw.trim().split('\n').filter(Boolean).slice(-1)[0] ?? raw.trim()
+  return (
+    `SGLang's environment looks broken or incomplete (uvloop failed to import: ${detail}). ` +
+    `${plat} is a supported platform for SGLang — reinstall the SGLang engine from the Engines ` +
+    `page rather than switching engines.`
+  )
+}
+
+/**
+ * Preflight: can SGLang's server actually run here? Like vLLM it hard-requires
+ * uvloop. Returns a clear, actionable message when blocked, or null when OK.
+ */
+export async function sgLangServeBlocker(python: string): Promise<string | null> {
+  try {
+    await execFileP(python, ['-c', 'import uvloop'], { timeout: 20_000 })
+    return null
+  } catch (error) {
+    return classifySglangBlocker(process.platform, error)
   }
 }
 
