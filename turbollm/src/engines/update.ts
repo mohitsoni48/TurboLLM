@@ -244,6 +244,7 @@ export function resolveUpdateSource(engine: Engine): ResolvedSource | null {
   if (engine.kind === 'rapid-mlx') return { source: 'pip', ref: 'rapid-mlx', installed: versionFromPipString(engine.version) }
   if (engine.kind === 'mlx-vlm') return { source: 'pip', ref: 'mlx-vlm', installed: versionFromPipString(engine.version) }
   if (engine.kind === 'vllm') return { source: 'pip', ref: 'vllm', installed: versionFromPipString(engine.version) }
+  if (engine.kind === 'sglang') return { source: 'pip', ref: 'sglang', installed: versionFromPipString(engine.version) }
   // KoboldCpp / llamafile: single-binary engines provisioned from GitHub releases. Their
   // installed version IS the stored release tag (vX.Y.Z / X.Y.Z); compareBuildTags falls
   // back to semver ordering for non-`b<number>` tags.

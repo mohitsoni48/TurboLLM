@@ -206,7 +206,7 @@ const TURBOLLM_KNOWLEDGE =
   'High-throughput engine for safetensors. Requires the vLLM venv (provisioned in-app). Hard dependency on `uvloop` (POSIX-only) — on Windows it fails immediately with a clear message directing the user to WSL2/Linux.\n\n' +
 
   '**SGLang** (Linux / WSL2 only):\n' +
-  'Faster vLLM-class inference engine — OpenAI-compatible, HuggingFace safetensors (no GGUF), Python ≥3.10, CUDA 12/13. Launch: `python -m sglang.launch_server`. Load settings: `context-length` (≡ vLLM\'s `max-model-len`), `mem-fraction-static` (≡ `gpu-memory-utilization`), `tp` (tensor parallel), `served-model-name`, `api-key`, `disable-flashinfer` fallback. Greyed on Windows with "Linux/WSL2 only" message.\n\n' +
+  'Faster vLLM-class inference engine — OpenAI-compatible, HuggingFace safetensors (no GGUF), Python ≥3.10, CUDA 12/13. Launch: `python -m sglang.launch_server`. Load settings: `context-length` (≡ vLLM\'s `max-model-len`), `mem-fraction-static` (≡ `gpu-memory-utilization`), `tp` (tensor parallel), `served-model-name`, `api-key`, `disable-flashinfer` fallback. Install button enables based on real hardware detection (Linux + NVIDIA); shows a "not supported on your hardware" reason otherwise (v1.13.5 fix — it used to stay disabled unconditionally, even on a supported box).\n\n' +
   '**KoboldCpp** (Windows / Linux / macOS — GGUF):\n' +
   'Popular for creative writing. GGUF over OpenAI-compatible API. Install from releases; full load→serve→gateway pipeline verified working.\n\n' +
   '**llamafile** (Windows / Linux / macOS — GGUF):\n' +

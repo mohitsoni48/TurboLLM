@@ -831,6 +831,7 @@ function EngineGallery({
   const anyPending =
     provisioning ||
     install.vllm.isPending ||
+    install.sglang.isPending ||
     install.mlx.isPending ||
     install.rapidMlx.isPending ||
     install.mlxVlm.isPending ||
@@ -838,6 +839,7 @@ function EngineGallery({
     install.koboldcpp.isPending ||
     install.llamafile.isPending ||
     install.updateVllm.isPending ||
+    install.updateSglang.isPending ||
     install.updateMlx.isPending ||
     install.updateRapidMlx.isPending ||
     install.updateMlxVlm.isPending ||

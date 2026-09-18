@@ -188,6 +188,16 @@ test('resolveUpdateSource: mlx/vllm → PyPI package + stripped version', () => 
   })
 })
 
+test('resolveUpdateSource: sglang → PyPI package + stripped version (regression, was missing entirely)', () => {
+  // SGLang shipped (ADR-120) alongside vLLM but never got an update-source branch, so its
+  // Update button/badge never appeared and an `auto` update policy never fired.
+  assert.deepEqual(resolveUpdateSource(eng({ kind: 'sglang', version: 'sglang 0.4.1' })), {
+    source: 'pip',
+    ref: 'sglang',
+    installed: '0.4.1',
+  })
+})
+
 test('resolveUpdateSource: koboldcpp/llamafile → GitHub repo + stored tag (Phase 4)', () => {
   assert.deepEqual(resolveUpdateSource(eng({ kind: 'koboldcpp', version: 'v1.115.2' })), {
     source: 'github-release',
