@@ -12,7 +12,7 @@ import { CONFIG_BOUNDS, coerceBounded, isConfigTheme } from '../config/config-bo
 import type { Deps } from '../deps'
 import { getLanIp } from '../net'
 import { abortAllInFlightChats } from '../chat/chat-routes'
-import { NameTakenError, NotFoundError, customSourceKey } from '../engines/registry'
+import { NameTakenError, NotFoundError, customSourceKey, nameTakenMessage } from '../engines/registry'
 import { ProbeError, probe } from '../engines/probe'
 import { resolveServerBinary, suggestEngineName } from '../engines/scan'
 import { generateApiKey, hostGate, isLocalOrAuthenticated, isLocalRequest } from '../auth'
@@ -49,7 +49,7 @@ import { ensureKoboldcpp, koboldcppBinPath, koboldcppDir } from '../engines/kobo
 import { ensureLlamafile, llamafileBinPath, llamafileDir } from '../engines/llamafile'
 import { catalogForPlatform, catalogEngine } from '../engines/catalog'
 import { checkBuildPrereqs } from '../engines/build-prereqs'
-import { runBuild, runPrereqInstall, buildDirName, catalogBranchesToScan, chooseEngineName, findEngineForCatalogEntry, findPriorEngine, normRepoUrl, sameRepo, sourceBuildBinary, sourceBuildDirOf } from '../engines/build-runner'
+import { runBuild, runPrereqInstall, buildDirName, chooseEngineName, findCatalogBuildOnDisk, findEngineForCatalogEntry, findNameConflict, findPriorEngine, isEngineInBuildDir, normRepoUrl, sameRepo, sourceBuildDirOf } from '../engines/build-runner'
 import { provisionCuda } from '../engines/cuda-provision'
 import { detectHardware } from '../engines/hardware'
 import { recommendEngines } from '../engines/recommend'
@@ -561,13 +561,8 @@ export function registerApi(app: Hono, d: Deps): void {
       // from BOTH the custom-engine card list AND this card's own UI (which never reads
       // `sourceEngineId`) — founder-reported: "now it is only visible for selection in dropdown".
       const srcEng = e.excludeFromSourceMatch ? undefined : findEngineForCatalogEntry(regEngines, e, branchParam)
-      let sourceBinPath: string | undefined = srcEng?.binPath
-      if (!srcEng && !e.excludeFromSourceMatch) {
-        sourceBinPath =
-          catalogBranchesToScan(e, branchParam)
-            .map((branch) => sourceBuildBinary(enginesRoot, e.homepage, branch, e.sourceCommit))
-            .find((bin) => bin !== null) ?? undefined
-      }
+      const onDisk = !srcEng && !e.excludeFromSourceMatch ? findCatalogBuildOnDisk(enginesRoot, e, branchParam) : undefined
+      const sourceBinPath: string | undefined = srcEng?.binPath ?? onDisk?.binPath
       const sourceBuilt = !!srcEng || !!sourceBinPath
       if (srcEng) {
         installed = true
@@ -582,7 +577,7 @@ export function registerApi(app: Hono, d: Deps): void {
         enabled,
         sourceBuilt,
         sourceEngineId: srcEng?.id,
-        sourceBranch: srcEng?.sourceBranch ?? '',
+        sourceBranch: srcEng?.sourceBranch ?? onDisk?.branch ?? '',
         sourceBinPath: sourceBinPath ?? '',
       }
     })
@@ -705,6 +700,15 @@ export function registerApi(app: Hono, d: Deps): void {
     const enginesRoot = join(d.store.dir(), 'engines')
     const toolchainDirs = d.store.snapshot().build.toolchainDirs
     const buildRoot = join(enginesRoot, 'build', buildDirName(repoUrl, branch, commit))
+    // Both refusals are certain now and cost a second, versus a 15-minute compile that can only end
+    // in a registration error (name already held by an engine this build won't replace) or in a
+    // running engine's own files being replaced underneath it.
+    const engines = d.registry.list().engines
+    const conflict = findNameConflict(engines, name, { buildRoot, sourceRepo: repoUrl, sourceBranch: branch, sourceCommit: commit })
+    if (conflict) return err(c, 400, 'name_already_taken', nameTakenMessage(conflict, { sourceRepo: repoUrl, sourceBranch: branch }))
+    const running = d.registry.active()
+    if (running && engineBusy(d) && isEngineInBuildDir(running.binPath, buildRoot))
+      return err(c, 409, 'engine_in_use', `Stop "${running.name}" before rebuilding it — the rebuild replaces its files.`)
     // Reserve the build slot SYNCHRONOUSLY (before returning 202) so two near-simultaneous
     // POSTs can't both pass the busy-check and race on the same buildRoot / clobber buildAbort.
     const ac = new AbortController()
@@ -1053,19 +1057,20 @@ export function registerApi(app: Hono, d: Deps): void {
     // sessions already get for host execution.
     if (!isLocalOrAuthenticated(c, d))
       return err(c, 403, 'forbidden', 'Adding an engine requires a valid API key from a non-host device.')
-    const b = await body<{ name?: string; binPath?: string; sourceRepo?: string; sourceBranch?: string; sourceCommit?: string }>(c)
+    const b = await body<{ name?: string; binPath?: string; sourceRepo?: string; sourceBranch?: string; sourceCommit?: string; sourcePatchUrl?: string }>(c)
     if (!b.binPath || !b.binPath.trim()) return err(c, 400, 'invalid_config_value', 'binPath is required.')
     try {
       const { engine, warning } = await d.registry.add(b.name ?? '', b.binPath, {
         sourceRepo: b.sourceRepo,
         sourceBranch: b.sourceBranch,
         sourceCommit: b.sourceCommit,
+        sourcePatchUrl: b.sourcePatchUrl,
       })
       // Same custom-source tracking as the 1-click build completion above — a manually
       // pointed-at binary (with or without a sourceRepo) is just as much a "custom engine"
       // as a self-service build, and deserves the same Disable-survives-as-Enable treatment.
       if (!isCatalogRepo(b.sourceRepo)) {
-        d.registry.recordCustomSource({ name: engine.name, binPath: engine.binPath, kind: engine.kind, sourceRepo: b.sourceRepo, sourceBranch: b.sourceBranch, sourceCommit: b.sourceCommit })
+        d.registry.recordCustomSource({ name: engine.name, binPath: engine.binPath, kind: engine.kind, sourceRepo: b.sourceRepo, sourceBranch: b.sourceBranch, sourceCommit: b.sourceCommit, sourcePatchUrl: b.sourcePatchUrl })
       }
       // `probe_no_version` is non-blocking (spec 03 §2): the engine is saved, but
       // the response carries a warning flag so the dialog can prompt the user.

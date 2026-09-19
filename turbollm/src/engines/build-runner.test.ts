@@ -1,7 +1,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildDirName, chooseEngineName, CMAKE_CONFIGURE_ARGS, isIncompleteMetalBackendError, pickGenerator, vcvarsBatch, stripGenericAsmLanguage, sameRepo, normRepoUrl, sourceBuildDirOf, notCmakeProjectError, missingPatchShaError, sha256Hex, patchChecksumMismatchError, findPriorEngine, parseDefaultBranch, findEngineForCatalogEntry, catalogBranchesToScan } from './build-runner'
-import { join } from 'node:path'
+import { buildDirName, chooseEngineName, CMAKE_CONFIGURE_ARGS, isIncompleteMetalBackendError, pickGenerator, vcvarsBatch, stripGenericAsmLanguage, sameRepo, normRepoUrl, sourceBuildDirOf, notCmakeProjectError, missingPatchShaError, sha256Hex, patchChecksumMismatchError, findPriorEngine, parseDefaultBranch, findEngineForCatalogEntry, catalogBranchesToScan, legacyBuildDirName, findCatalogBuildOnDisk, findNameConflict, isEngineInBuildDir } from './build-runner'
+import { join, relative } from 'node:path'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 
 test('buildDirName: owner/repo from a .git URL, branch appended', () => {
   assert.equal(buildDirName('https://github.com/ikawrakow/ik_llama.cpp.git', 'sidestream'), 'ikawrakow-ik_llama.cpp-sidestream')
@@ -409,6 +411,17 @@ test('sourceBuildDirOf: null for a non-source-build binary path', () => {
   assert.equal(sourceBuildDirOf(join(root, 'turboquant', 'llama-server.exe'), root), null)
 })
 
+// A registered engine's binPath is stored exactly as typed (path.join would have collapsed the dot
+// segments, so these are raw strings). `?purge=1` deletes whatever this returns recursively:
+// "." made it the whole build/ directory (every source build), ".." the engines root itself.
+test('sourceBuildDirOf: a dot segment in the binPath never selects build/ itself or its parent', () => {
+  const root = join('C:', 'e', 'engines')
+  for (const step of ['.', '..', '...']) {
+    const bin = `C:/e/engines/build/${step}/prism/build/bin/llama-server.exe`
+    assert.equal(sourceBuildDirOf(bin, root), null, `"${step}" must not resolve to a directory to delete`)
+  }
+})
+
 // GitHub #61: exllamav3 (a pure-Python engine, no CMakeLists.txt) failed 1-click build with a
 // bare "cmake exited with code 1" and no explanation. notCmakeProjectError fails fast instead.
 test('notCmakeProjectError: null (no error) when CMakeLists.txt is present', () => {
@@ -459,4 +472,186 @@ test('patchChecksumMismatchError: actionable hard-fail when bytes do not match t
   assert.ok(msg && /did not match/.test(msg))
   assert.ok(msg && msg.includes(pinned.toLowerCase()) && msg.includes(actual.toLowerCase()))
   assert.ok(msg && /before any patch was applied/.test(msg))
+})
+
+// ── ADR-431 follow-ups ──────────────────────────────────────────────────────
+
+const serverExe = process.platform === 'win32' ? 'llama-server.exe' : 'llama-server'
+
+function withEnginesRoot(dirs: string[], body: (enginesRoot: string) => void): void {
+  const root = mkdtempSync(join(tmpdir(), 'tllm-engines-'))
+  try {
+    for (const dir of dirs) {
+      const bin = join(root, 'build', dir, 'build', 'bin')
+      mkdirSync(bin, { recursive: true })
+      writeFileSync(join(bin, serverExe), '')
+    }
+    body(root)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+}
+
+test('legacyBuildDirName: the pre-ADR-387 scheme slugged only the trailing URL segment', () => {
+  const sha = '846e991ec3c7ccec49112ff2c5b00b710e5f551d'
+  assert.equal(legacyBuildDirName('https://github.com/ggml-org/llama.cpp', undefined, sha), 'llama.cpp-846e991ec3c7')
+  assert.equal(legacyBuildDirName('https://github.com/ggml-org/llama.cpp.git/', undefined, sha), 'llama.cpp-846e991ec3c7')
+  assert.equal(legacyBuildDirName('https://github.com/PrismML-Eng/llama.cpp', 'prism'), 'llama.cpp-prism')
+  assert.equal(legacyBuildDirName('https://github.com/o/repo'), 'repo')
+})
+
+const PRISM_ENTRY = { homepage: 'https://github.com/PrismML-Eng/llama.cpp', defaultBranch: 'prism' }
+
+test('findCatalogBuildOnDisk: a card-built (named-branch) build is found and reports its branch', () => {
+  withEnginesRoot(['prismml-eng-llama.cpp-prism'], (root) => {
+    const found = findCatalogBuildOnDisk(root, PRISM_ENTRY)
+    assert.equal(found?.branch, 'prism')
+    assert.match(found?.binPath ?? '', /prismml-eng-llama\.cpp-prism/)
+  })
+})
+
+test('findCatalogBuildOnDisk: a blank-branch (bare directory) build is found with a blank branch', () => {
+  withEnginesRoot(['prismml-eng-llama.cpp'], (root) => {
+    assert.equal(findCatalogBuildOnDisk(root, PRISM_ENTRY)?.branch, '')
+  })
+})
+
+test('findCatalogBuildOnDisk: the named-branch build wins over the bare one', () => {
+  withEnginesRoot(['prismml-eng-llama.cpp', 'prismml-eng-llama.cpp-prism'], (root) => {
+    assert.equal(findCatalogBuildOnDisk(root, PRISM_ENTRY)?.branch, 'prism')
+  })
+})
+
+test('findCatalogBuildOnDisk: nothing on disk means undefined', () => {
+  withEnginesRoot([], (root) => assert.equal(findCatalogBuildOnDisk(root, PRISM_ENTRY), undefined))
+})
+
+test("findCatalogBuildOnDisk: a non-default branch never picks up the default branch's bare directory", () => {
+  withEnginesRoot(['prismml-eng-llama.cpp'], (root) => {
+    assert.equal(findCatalogBuildOnDisk(root, PRISM_ENTRY, 'dev'), undefined)
+  })
+})
+
+const SOLAR_ENTRY = { homepage: 'https://github.com/ggml-org/llama.cpp', sourceCommit: '846e991ec3c7ccec49112ff2c5b00b710e5f551d', patchUrl: 'https://x/p.diff' }
+
+test('findCatalogBuildOnDisk: a commit-pinned entry still finds a build made under the pre-ADR-387 directory name', () => {
+  // Solar Open 2's real build lives at engines/build/llama.cpp-846e991ec3c7. A Disabled one would
+  // otherwise read as "not installed" and offer a full rebuild over the top of good files.
+  withEnginesRoot(['llama.cpp-846e991ec3c7'], (root) => {
+    assert.match(findCatalogBuildOnDisk(root, SOLAR_ENTRY)?.binPath ?? '', /llama\.cpp-846e991ec3c7/)
+  })
+})
+
+test('findCatalogBuildOnDisk: the current directory name wins over the legacy one for a pinned entry', () => {
+  withEnginesRoot(['llama.cpp-846e991ec3c7', 'ggml-org-llama.cpp-846e991ec3c7'], (root) => {
+    assert.match(findCatalogBuildOnDisk(root, SOLAR_ENTRY)?.binPath ?? '', /ggml-org-llama\.cpp-846e991ec3c7/)
+  })
+})
+
+test('findCatalogBuildOnDisk: an UNPINNED entry never falls back to a legacy directory (any fork used that name)', () => {
+  // The pre-ADR-387 slug dropped the owner, so 'llama.cpp' could be ANY fork's build. Only a pinned
+  // commit is specific enough to trust.
+  withEnginesRoot(['llama.cpp'], (root) => {
+    assert.equal(findCatalogBuildOnDisk(root, { homepage: 'https://github.com/ggml-org/llama.cpp', defaultBranch: 'master' }), undefined)
+  })
+})
+
+const BUILD_ROOT = '/data/engines/build/prismml-eng-llama.cpp-prism'
+const holderOf = (over: Record<string, string | undefined> = {}) => ({
+  id: 'h',
+  name: 'Prism',
+  binPath: '/data/engines/prebuilt/llama-server',
+  sourceRepo: undefined as string | undefined,
+  sourceBranch: undefined as string | undefined,
+  sourceCommit: '',
+  ...over,
+})
+const buildOf = (over: Record<string, string | undefined> = {}) => ({
+  buildRoot: BUILD_ROOT,
+  sourceRepo: 'https://github.com/PrismML-Eng/llama.cpp',
+  sourceBranch: 'prism' as string | undefined,
+  sourceCommit: '',
+  ...over,
+})
+
+test('findNameConflict: an unrelated engine holding the name is a certain conflict', () => {
+  assert.equal(findNameConflict([holderOf()], 'Prism', buildOf())?.id, 'h')
+})
+
+test('findNameConflict: the name match is case-insensitive and trimmed, like the registry', () => {
+  assert.equal(findNameConflict([holderOf({ name: '  PRISM ' })], 'prism', buildOf())?.id, 'h')
+})
+
+test('findNameConflict: the engine this build will REPLACE is not a conflict (its files live in the build dir)', () => {
+  const inDir = holderOf({ binPath: BUILD_ROOT + '/build/bin/llama-server' })
+  assert.equal(findNameConflict([inDir], 'Prism', buildOf()), undefined)
+})
+
+test('findNameConflict: the same repo and branch will be replaced, so it is not a conflict', () => {
+  const same = holderOf({ sourceRepo: 'https://github.com/PrismML-Eng/llama.cpp.git', sourceBranch: 'prism' })
+  assert.equal(findNameConflict([same], 'Prism', buildOf()), undefined)
+})
+
+test('findNameConflict: a blank branch on either side is unknown, so never a certain conflict', () => {
+  const blank = holderOf({ sourceRepo: 'https://github.com/PrismML-Eng/llama.cpp', sourceBranch: '' })
+  assert.equal(findNameConflict([blank], 'Prism', buildOf()), undefined)
+  const named = holderOf({ sourceRepo: 'https://github.com/PrismML-Eng/llama.cpp', sourceBranch: 'prism' })
+  assert.equal(findNameConflict([named], 'Prism', buildOf({ sourceBranch: undefined })), undefined)
+})
+
+test('findNameConflict: the same repo on a DIFFERENT explicit branch is a certain conflict (the non-default-branch rebuild)', () => {
+  const other = holderOf({ sourceRepo: 'https://github.com/PrismML-Eng/llama.cpp', sourceBranch: 'main' })
+  assert.equal(findNameConflict([other], 'Prism', buildOf())?.id, 'h')
+})
+
+test('findNameConflict: a commit-pinned and a branch-tip build of one repo never replace each other', () => {
+  const pinned = holderOf({ sourceRepo: 'https://github.com/PrismML-Eng/llama.cpp', sourceBranch: 'prism', sourceCommit: 'abc123' })
+  assert.equal(findNameConflict([pinned], 'Prism', buildOf())?.id, 'h')
+})
+
+test('findNameConflict: no submitted name, or a free name, is never a conflict', () => {
+  assert.equal(findNameConflict([holderOf()], undefined, buildOf()), undefined)
+  assert.equal(findNameConflict([holderOf()], '   ', buildOf()), undefined)
+  assert.equal(findNameConflict([holderOf()], 'Something else', buildOf()), undefined)
+})
+
+test('isEngineInBuildDir: true only for a binary under that build directory, whatever the separators or case', () => {
+  assert.equal(isEngineInBuildDir(BUILD_ROOT + '/build/bin/llama-server', BUILD_ROOT), true)
+  assert.equal(isEngineInBuildDir('\\DATA\\ENGINES\\BUILD\\PRISMML-ENG-LLAMA.CPP-PRISM\\BUILD\\BIN\\LLAMA-SERVER.EXE', BUILD_ROOT), true)
+  assert.equal(isEngineInBuildDir(BUILD_ROOT + '-dev/build/bin/llama-server', BUILD_ROOT), false)
+  assert.equal(isEngineInBuildDir('/data/engines/llama.cpp-b10970-cuda/llama-server', BUILD_ROOT), false)
+})
+
+// runBuild() rmSync's `<engines>/build/<dirName>` recursively before every clone. A dir name of
+// ".." resolves to the engines root itself, so a repo URL ending in a dot segment used to be enough
+// to delete every installed engine with one POST to /api/v1/build/run.
+const HOSTILE_REPO_URLS = ['https://..', 'https://github.com/..', 'https://github.com/./', 'https://github.com/../', 'https://github.com/x/../..', '..', '.', '...', 'https://github.com/-..', '/..', '\\..']
+
+// A name is safe when joining it under build/ lands exactly one level down, on itself. ".." lands on
+// the engines root and "x/.." on build/ itself; a name that merely STARTS with dots ("..-..") is fine.
+function isStrictChildOfBuildDir(dirName: string): boolean {
+  const buildDir = join(tmpdir(), 'engines', 'build')
+  return dirName !== '' && dirName !== '.' && dirName !== '..' && relative(buildDir, join(buildDir, dirName)) === dirName
+}
+
+test('buildDirName: no repo URL, however hostile, can name a directory outside <engines>/build/<slug>', () => {
+  for (const url of HOSTILE_REPO_URLS) {
+    for (const [branch, commit] of [[undefined, undefined], ['..', undefined], ['main', '..'], [undefined, '../../x']] as const) {
+      const dir = buildDirName(url, branch, commit)
+      assert.ok(isStrictChildOfBuildDir(dir), `buildDirName(${JSON.stringify(url)}, ${branch}, ${commit}) = ${JSON.stringify(dir)} escapes the build directory`)
+    }
+  }
+})
+
+test('legacyBuildDirName: the pre-ADR-387 scheme is bounded the same way (it is used to look up, never to delete, but must not be a path either)', () => {
+  for (const url of HOSTILE_REPO_URLS) {
+    const dir = legacyBuildDirName(url)
+    assert.ok(isStrictChildOfBuildDir(dir), `legacyBuildDirName(${JSON.stringify(url)}) = ${JSON.stringify(dir)} escapes the build directory`)
+  }
+})
+
+test('buildDirName: ordinary URLs keep their existing names (no build directory on disk is renamed by the guard)', () => {
+  assert.equal(buildDirName('https://github.com/PrismML-Eng/llama.cpp', 'prism'), 'prismml-eng-llama.cpp-prism')
+  assert.equal(buildDirName('https://github.com/ggml-org/llama.cpp'), 'ggml-org-llama.cpp')
+  assert.equal(buildDirName('https://gitlab.com/group/sub.repo'), 'gitlab.com-group-sub.repo')
 })

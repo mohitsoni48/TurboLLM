@@ -25,6 +25,55 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.13.7] - 2026-09-19
+
+### Fixed
+
+- **A build that could only end in "Name already in use" no longer compiles for 15 minutes first.**
+  If the name you gave a build already belonged to a different engine, TurboLLM built the whole
+  thing and only then refused to register it. It now checks before it starts: the request fails in
+  well under a second, says which engine holds the name, and, when that engine is another branch of
+  the same repo, explains that a different branch is a separate engine and needs its own name. It
+  only refuses when it is certain the build would not replace that engine, so a rebuild of the
+  engine you already have is never blocked.
+- **Rebuilding an engine while it is running now tells you to stop it first.** A rebuild replaces the
+  engine's files, so doing it under a loaded model used to end in a raw "file in use" error from the
+  operating system. It now stops before touching anything and names the engine to stop.
+- **A Disabled engine you built from its card can be turned back on, and old-layout builds are found.**
+  The card looked for the engine's build folder but forgot which branch it was built for, so Enable
+  registered it as a different one. It now re-registers the engine with the branch its folder was
+  really built for. A build made by an older version under the previous folder naming (Solar Open 2
+  was one) also shows as installed again instead of "not installed." Engines pinned to an exact
+  commit or patch, like Solar Open 2, now keep that identity when you Enable them, so their card
+  recognises them afterwards instead of still saying "not installed."
+- **The branch dropdown could show one branch while a build used another.** When an engine's default
+  branch wasn't known and the fetched branch list didn't include it, the dropdown displayed the first
+  branch in the list, but the build request went out with no branch at all. The same thing happened
+  after typing in the branch search box: a search that didn't match the selected branch made the
+  dropdown display the first match while the build still used the previous selection. The branch the
+  build will use is now always in the list and always the one shown, and the "N of M" count no longer
+  counts it twice.
+- **Unusual repository addresses and engine paths are now safe.** A malformed repository address could
+  point a build at a folder outside its own build folder, and an engine registered with an unusual
+  binary path could make "delete files" select a whole folder of builds instead of just its own.
+  Build folder names are now always a single, real folder name.
+- **vLLM and SGLang were still misdiagnosed on macOS and less common systems.** uvloop ships macOS
+  builds, so a failed check on a Mac is a broken environment, not "cannot run on macOS," and the
+  message now says so. Only Windows is reported as unable to run them. The message calls Linux a
+  supported platform, says only that uvloop itself supports macOS (both engines are experimental or
+  unsupported upstream there), and describes any other system as unverified. The error detail in the
+  message is also shortened and shows your home folder as `~`.
+
+### Discord
+
+- 🔧 **Engine builds:** if the name you picked already belongs to another engine, TurboLLM now tells
+  you right away and names it, instead of compiling for a quarter of an hour and then failing.
+- 🔧 **Engine rebuilds:** rebuilding an engine that's currently running now asks you to stop it first,
+  rather than failing with a file-in-use error.
+- 🔧 **Engine cards:** a disabled engine you built from its card can be re-enabled on the right
+  branch, and older builds are recognised again.
+- 🔧 **vLLM / SGLang on Mac:** the error message no longer wrongly says it can't run on macOS.
+
 ## [1.13.6] - 2026-09-19
 
 ### Fixed

@@ -6,7 +6,7 @@
 // entry comes from a separate, slower query. The branch state was seeded once at mount from
 // `catalog?.defaultBranch ?? 'main'`, so a card that mounted before its catalog entry arrived
 // froze on 'main' forever, while the visible <option> (computed live) switched to the real default.
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { describe, expect, it, vi, beforeEach } from 'vitest'
@@ -78,8 +78,12 @@ const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200
 
 let releaseCatalog: () => void
 
+/** What GET /api/v1/build/git-branches returns for the repo (the daemon sorts the default first). */
+let gitBranches: string[] = []
+
 beforeEach(() => {
   engineDefaultBranch = 'prism'
+  gitBranches = []
   const catalogGate = new Promise<void>((resolve) => {
     releaseCatalog = resolve
   })
@@ -96,6 +100,7 @@ beforeEach(() => {
         await catalogGate
         return json(catalog())
       }
+      if (url.includes('/api/v1/build/git-branches')) return json({ total: gitBranches.length, branches: gitBranches })
       return json({})
     }),
   )
@@ -155,6 +160,44 @@ describe('EnginesScreen source-build branch (Prism "Remote branch main not found
     await waitFor(() => expect(buildRequests()).toHaveLength(1))
     const request = buildRequests()[0]
     expect(request).not.toHaveProperty('branch')
-    expect(String(request.name)).not.toMatch(/-main$/)
+    expect(request.name).toBe('Prism (llama.cpp fork)')
+  })
+
+  it('keeps the selected blank branch as a real option when the fetched branch list does not contain it', async () => {
+    // A <select> whose value matches no option DISPLAYS its first option while the state holds
+    // another: here it would show "main" on screen while the request went out with no branch.
+    engineDefaultBranch = undefined
+    gitBranches = ['main', 'dev']
+    renderEngines()
+    await screen.findByText('Prism (llama.cpp fork)')
+    releaseCatalog()
+
+    const row = (await screen.findByText('Branch:')).closest('div.flex') as HTMLElement
+    const select = within(row).getByRole('combobox') as HTMLSelectElement
+    fireEvent.focus(select)
+
+    await waitFor(() => expect(within(select).getAllByRole('option').map((o) => o.textContent)).toContain('dev'))
+    expect(within(select).getAllByRole('option').map((o) => o.textContent)).toEqual(['(repo default)', 'main', 'dev'])
+    expect(select.value).toBe('')
+  })
+
+  it('still shows the branch it will build after a search that filters that branch out', async () => {
+    // The search box filtered the selected branch out of the <select>, which then DISPLAYED the
+    // first match while the request went out with the branch in state ("prism").
+    gitBranches = ['prism', 'dev', 'develop', 'cuda-a', 'cuda-b', 'x1']
+    renderEngines()
+    await screen.findByText('Prism (llama.cpp fork)')
+    releaseCatalog()
+
+    const row = (await screen.findByText('Branch:')).closest('div.flex') as HTMLElement
+    const select = within(row).getByRole('combobox') as HTMLSelectElement
+    fireEvent.focus(select)
+    const search = await screen.findByPlaceholderText(/Search \d+ branches/)
+
+    fireEvent.change(search, { target: { value: 'cuda' } })
+
+    await waitFor(() => expect(within(select).getAllByRole('option').map((o) => o.textContent)).toEqual(['prism', 'cuda-a', 'cuda-b']))
+    expect(select.selectedOptions[0]?.value).toBe('prism')
+    expect(screen.getByText('2 of 6')).toBeTruthy()
   })
 })

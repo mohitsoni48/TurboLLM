@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { ConfigStore, CustomEngineSource, Engine, FlagInfo, UpdatePolicy, ValueError, findEngine } from '../config/config'
 import { probe } from './probe'
-import { normRepoUrl } from './build-runner'
+import { normRepoUrl, sameRepo } from './build-runner'
 
 /** Auto-provisioned official builds live under `<dataDir>/engines/llama.cpp-…/`.
  *  User forks are arbitrary paths and are never auto-removed. */
@@ -20,10 +20,26 @@ export class NotFoundError extends Error {
 /** Thrown by add()/addMlx() when another engine already uses the given name
  *  (case-insensitive, trimmed). Mapped to a 400 `name_already_taken` (spec 03 §2). */
 export class NameTakenError extends Error {
-  constructor() {
-    super('Name already in use — choose a different name.')
+  constructor(holder?: Pick<Engine, 'name' | 'sourceRepo' | 'sourceBranch'>, incoming?: IncomingSource) {
+    super(nameTakenMessage(holder, incoming))
     this.name = 'NameTakenError'
   }
+}
+
+interface IncomingSource {
+  sourceRepo?: string
+  sourceBranch?: string
+}
+
+export function nameTakenMessage(holder: Pick<Engine, 'name' | 'sourceRepo' | 'sourceBranch'> | undefined, incoming: IncomingSource | undefined): string {
+  if (!holder) return 'Name already in use — choose a different name.'
+  const base = `Name already in use by "${holder.name}" — choose a different name.`
+  const held = holder.sourceBranch?.trim()
+  const wanted = incoming?.sourceBranch?.trim()
+  const anotherBranchOfTheSameRepo = !!held && !!wanted && held !== wanted && sameRepo(holder.sourceRepo, incoming?.sourceRepo)
+  return anotherBranchOfTheSameRepo
+    ? `${base} It is a build of branch "${held}"; a build of "${wanted}" is a separate engine and needs its own name.`
+    : base
 }
 
 /** add() returns the saved engine plus a non-blocking warning when the probe ran
@@ -57,7 +73,7 @@ export class Registry {
     source?: { sourceRepo?: string; sourceBranch?: string; sourceCommit?: string; sourcePatchUrl?: string },
   ): Promise<AddResult> {
     const finalName = name.trim() || 'llama-server'
-    this.assertNameFree(finalName)
+    this.assertNameFree(finalName, source)
     const pr = await probe(binPath)
     const sourceRepo = source?.sourceRepo?.trim() || undefined
     const sourceBranch = source?.sourceBranch?.trim() || undefined
@@ -79,21 +95,23 @@ export class Registry {
     this.store.update((c) => {
       // Re-check under the store lock — the name could have been taken between the
       // pre-probe check and now (a probe can take up to 10s).
-      if (this.nameClash(c.engines, finalName)) throw new NameTakenError()
+      const holder = this.nameHolder(c.engines, finalName)
+      if (holder) throw new NameTakenError(holder, source)
       c.engines.push(eng)
       if (!c.activeEngineId) c.activeEngineId = eng.id
     })
     return { engine: eng, warning: pr.version === 'unknown' ? 'no_version' : undefined }
   }
 
-  /** True if any registered engine already uses `name` (case-insensitive, trimmed). */
-  private nameClash(engines: Engine[], name: string): boolean {
+  /** The registered engine that already uses `name` (case-insensitive, trimmed), if any. */
+  private nameHolder(engines: Engine[], name: string): Engine | undefined {
     const n = name.trim().toLowerCase()
-    return engines.some((e) => e.name.trim().toLowerCase() === n)
+    return engines.find((e) => e.name.trim().toLowerCase() === n)
   }
 
-  private assertNameFree(name: string): void {
-    if (this.nameClash(this.store.snapshot().engines, name)) throw new NameTakenError()
+  private assertNameFree(name: string, incoming?: IncomingSource): void {
+    const holder = this.nameHolder(this.store.snapshot().engines, name)
+    if (holder) throw new NameTakenError(holder, incoming)
   }
 
   /** Register an MLX engine (kind='mlx'). No llama-server probe — the binPath is

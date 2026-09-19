@@ -198,7 +198,7 @@ export function listEngines(): Promise<EnginesList> {
  *  probed OK but no version string was found (spec 03 §2 `probe_no_version`). */
 export type AddEngineResult = Engine & { warning: 'no_version' | null }
 
-export function addEngine(input: {
+export interface AddEngineInput {
   name: string
   binPath: string
   /** Optional GitHub source-repo URL the build came from (ADR-088) — enables the
@@ -207,7 +207,12 @@ export function addEngine(input: {
   sourceBranch?: string
   /** Set only when re-registering a build pinned to an exact historical commit. */
   sourceCommit?: string
-}): Promise<AddEngineResult> {
+  /** Set only when re-registering a build that had a patch applied. A pinned catalog card matches
+   *  its engine on repo + commit + patch, so an engine registered without it belongs to no card. */
+  sourcePatchUrl?: string
+}
+
+export function addEngine(input: AddEngineInput): Promise<AddEngineResult> {
   return request<AddEngineResult>('/api/v1/engines', { method: 'POST', json: input })
 }
 

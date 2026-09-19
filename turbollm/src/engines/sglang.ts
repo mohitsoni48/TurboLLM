@@ -5,12 +5,14 @@
 // install `sglang[all]`, and run its OpenAI server. No system Python is touched.
 //
 // Platform reality: SGLang officially targets Linux + NVIDIA/CUDA 12+. macOS and
-// Windows are unsupported upstream. Same uvloop preflight as vLLM.
+// Windows are unsupported upstream. Same uvloop preflight as vLLM — literally the
+// same classifier, which treats only Windows as a hard platform block.
 import { existsSync } from 'node:fs'
 import { execFile } from 'node:child_process'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { ensureUv } from './mlx'
+import { UvloopPreflight } from './py-engine-blocker'
 import type { ProvisionProgress } from './download'
 
 const execFileP = promisify(execFile)
@@ -50,54 +52,23 @@ export async function ensureSglangEnv(root: string, onProgress?: (p: ProvisionPr
   return { python: py, version }
 }
 
-function platformDisplay(platform: NodeJS.Platform): string {
-  return platform === 'win32' ? 'Windows' : platform === 'darwin' ? 'macOS' : platform
-}
+const uvloopPreflight = new UvloopPreflight('SGLang')
 
 /**
- * Turn a failed `import uvloop` probe into an actionable message. Mirrors vLLM's
- * `classifyVllmBlocker` (ADR-080): uvloop ships real manylinux wheels, so a Linux failure is
- * never "this platform has no build" — only Windows and macOS (unsupported upstream) get that
- * framing. Everywhere else, including a missing interpreter (ENOENT) from a stale/broken venv,
- * surfaces what actually failed instead of misdiagnosing a fixable local install as a platform
- * limitation.
+ * Turn a failed `import uvloop` probe into an actionable message — the same classifier vLLM
+ * uses (ADR-080), only the engine name differs. uvloop ships manylinux *and* macOS wheels, so
+ * only Windows is framed as a platform that cannot run SGLang.
  */
 export function classifySglangBlocker(platform: NodeJS.Platform, error: unknown): string {
-  const plat = platformDisplay(platform)
-  if (platform === 'win32' || platform === 'darwin') {
-    return (
-      `SGLang cannot run on ${plat}: its server requires uvloop (and other Linux-only ` +
-      `components), which have no ${plat} build. Use the llama.cpp / TurboQuant ` +
-      `engine for GGUF models here, or run SGLang under WSL2 / Linux.`
-    )
-  }
-  const err = error as (NodeJS.ErrnoException & { stderr?: string | Buffer }) | undefined
-  if (err?.code === 'ENOENT') {
-    return (
-      `SGLang's environment looks missing or broken (interpreter not found). ` +
-      `Reinstall the SGLang engine from the Engines page.`
-    )
-  }
-  const raw = err?.stderr ? String(err.stderr) : (err?.message ?? 'unknown error')
-  const detail = raw.trim().split('\n').filter(Boolean).slice(-1)[0] ?? raw.trim()
-  return (
-    `SGLang's environment looks broken or incomplete (uvloop failed to import: ${detail}). ` +
-    `${plat} is a supported platform for SGLang — reinstall the SGLang engine from the Engines ` +
-    `page rather than switching engines.`
-  )
+  return uvloopPreflight.classify(platform, error)
 }
 
 /**
  * Preflight: can SGLang's server actually run here? Like vLLM it hard-requires
  * uvloop. Returns a clear, actionable message when blocked, or null when OK.
  */
-export async function sgLangServeBlocker(python: string): Promise<string | null> {
-  try {
-    await execFileP(python, ['-c', 'import uvloop'], { timeout: 20_000 })
-    return null
-  } catch (error) {
-    return classifySglangBlocker(process.platform, error)
-  }
+export function sgLangServeBlocker(python: string): Promise<string | null> {
+  return uvloopPreflight.blockerFor(python)
 }
 
 /** Read the installed sglang version (also a smoke test that it imports). */

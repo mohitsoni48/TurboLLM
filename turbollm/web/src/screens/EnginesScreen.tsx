@@ -90,6 +90,9 @@ import {
 import { AddEngineDialog } from './engines/AddEngineDialog'
 import { BuildGuideDialog } from './engines/BuildGuideDialog'
 import { deleteTargetFor, type DeleteTarget } from '../lib/engine-delete-target'
+import { branchOptions } from '../lib/branch-options'
+import { branchLabel, defaultBuildName } from '../lib/engine-build-name'
+import { enableRequestFor } from '../lib/engine-enable-request'
 import { CustomBuildDialog } from './engines/CustomBuildDialog'
 import { EngineStatusHeader } from './engines/EngineStatusHeader'
 import { EngineLogPanel } from './engines/EngineLogPanel'
@@ -412,20 +415,6 @@ const OS_SHORT: Record<string, string> = { win32: 'Win', linux: 'Linux', darwin:
 function osLabel(platforms: string[]): string {
   return platforms.map((p) => OS_SHORT[p] ?? p).join(' · ')
 }
-
-/** Default engine name for a fresh build-from-source run. Official llama.cpp repos
- *  get the `Llama-<Branch>` convention; forks get `<EngineName>-<Branch>`. */
-function defaultBuildName(catalog: CatalogEngine | undefined, branch: string): string {
-  const b = branch.trim()
-  const officialLlama = ['llama.cpp', 'llama.cpp-cuda-linux', 'llama.cpp-android-source', 'llama.cpp-source'].includes(
-    catalog?.id ?? '',
-  )
-  const base = officialLlama ? 'Llama' : (catalog?.name ?? 'engine')
-  return b ? `${base}-${b}` : base
-}
-
-/** A blank branch means "the repo's own default", which the user should see spelled out. */
-const branchLabel = (branch: string): string => branch || '(repo default)'
 
 /**
  * Engines screen. Three calm zones:
@@ -898,7 +887,7 @@ function EngineGallery({
     track('engines', 'enable_engine')
     if (e.sourceBuilt && e.sourceBinPath) {
       engineMut.add.mutate(
-        { binPath: e.sourceBinPath, name: e.name, sourceRepo: e.homepage, sourceBranch: e.sourceBranch || undefined },
+        enableRequestFor(e),
         {
           onSuccess: () => toast.success(`${e.name} enabled`),
           onError: (err) => toast.error(err instanceof ApiError ? err.message : `Could not enable ${e.name}.`),
@@ -962,7 +951,7 @@ function EngineGallery({
   const doEnableCustom = (source: CustomEngineSource) => {
     track('engines', 'enable_engine')
     engineMut.add.mutate(
-      { name: source.name, binPath: source.binPath, sourceRepo: source.sourceRepo, sourceBranch: source.sourceBranch, sourceCommit: source.sourceCommit },
+      { name: source.name, binPath: source.binPath, sourceRepo: source.sourceRepo, sourceBranch: source.sourceBranch, sourceCommit: source.sourceCommit, sourcePatchUrl: source.sourcePatchUrl },
       {
         onSuccess: () => toast.success(`${source.name} enabled`),
         onError: (err) => toast.error(err instanceof ApiError ? err.message : `Could not enable ${source.name}.`),
@@ -1219,24 +1208,16 @@ function EngineCard({
   const [branchesWanted, setBranchesWanted] = useState(false)
   const branchesQ = useGitBranches(catalog?.homepage, buildYourself && branchesWanted)
   const [searchQuery, setSearchQuery] = useState('')
-  // Fallback list when the lookup fails (offline, rate-limited): the entry's OWN default branch,
-  // not a hardcoded 'main'. The list must always contain `selectedBranch` (the default until the
-  // user picks something else): a <select> whose value matches no option DISPLAYS its first option
-  // while the state holds another, which is how a hardcoded ['main'] rendered as 'main' for every
-  // engine, and how a lookup failure after the user picked a branch would do the same.
-  const allBranches = branchesQ.data?.branches ?? [selectedBranch]
-  const totalBranches = branchesQ.data?.total ?? allBranches.length
+  // The dropdown must always list `selectedBranch` (the default until the user picks something else,
+  // possibly blank = the repo default), whatever the search typed below has filtered out. See
+  // branchOptions. The lookup failing (offline, rate-limited) leaves just the selected branch.
+  const fetchedBranches = branchesQ.data?.branches ?? []
+  const totalBranches = branchesQ.data?.total ?? fetchedBranches.length
+  const { options: branchChoices, matched: matchedBranches } = branchOptions(selectedBranch, fetchedBranches, searchQuery)
   const branchError = branchesQ.error
   // Keyed off the daemon's error CODE, not a bare 403: a 403 is also a plain permission failure,
   // and the rate-limit case is the only one where "add a GitHub token" is the right advice.
   const isRateLimited = branchError instanceof ApiError && branchError.code === 'github_rate_limited'
-  const filtered = useMemo(
-    () =>
-      searchQuery
-        ? allBranches.filter((b) => b.toLowerCase().includes(searchQuery.toLowerCase()))
-        : allBranches,
-    [allBranches, searchQuery],
-  )
   const buildName = defaultBuildName(catalog, selectedBranch)
 
   return (
@@ -1323,12 +1304,8 @@ function EngineCard({
                   // swapped in a hardcoded value="main" placeholder, which made the <select>'s
                   // value disagree with selectedBranch for any engine whose default is not main.
                   <option value={selectedBranch}>{branchLabel(selectedBranch)} — loading branches…</option>
-                ) : filtered.length === 0 ? (
-                  <option value={selectedBranch} disabled>
-                    No matching branches
-                  </option>
                 ) : (
-                  filtered.map((b) => (
+                  branchChoices.map((b) => (
                     <option key={b} value={b}>
                       {branchLabel(b)}
                     </option>
@@ -1351,7 +1328,7 @@ function EngineCard({
             </p>
           )}
           {/* Search filter + load more — shown only when there are many branches */}
-          {allBranches.length > 5 && !isRateLimited && (
+          {fetchedBranches.length > 5 && !isRateLimited && (
             <div className="flex items-center gap-2 pl-9">
               <div className="relative flex-1">
                 <Search
@@ -1366,9 +1343,9 @@ function EngineCard({
                 />
               </div>
               <span className="text-[11px] text-muted shrink-0">
-                {filtered.length === totalBranches
+                {matchedBranches === totalBranches
                   ? `${totalBranches} branches`
-                  : `${filtered.length} of ${totalBranches}`}
+                  : `${matchedBranches} of ${totalBranches}`}
               </span>
             </div>
           )}
