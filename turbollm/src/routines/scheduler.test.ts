@@ -545,3 +545,41 @@ test('reconcileParkedRuns (via start()) does not adopt a parked row for a routin
     scheduler.stop()
   }
 })
+
+// ── runningRoutineIds (ADR-434 (i)(3)) ────────────────────────────────────────────
+// The Jev-load confirmation names the work a load would interrupt. A run parked awaiting an
+// approval is waiting on the user, not the engine, so it is not "running" — it stays in
+// `inFlight` (the overlap guard) but must not be reported.
+
+test('runningRoutineIds lists a routine whose run is executing, not one parked on needs_approval', async () => {
+  const store = freshStore()
+  const running = store.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'a' })
+  const parked = store.createRoutine({ flavor: 'chat', prompt: 'y', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'a' })
+  store.confirmRoutine(running.id, '2020-01-01T00:00:00.000Z')
+  store.confirmRoutine(parked.id, '2020-01-01T00:00:00.000Z')
+  let finishRun!: () => void
+  const runHeld = new Promise<void>((resolve) => { finishRun = resolve })
+  const now = new Date('2026-08-01T10:00:00.000Z')
+  const scheduler = new RoutineScheduler({
+    store,
+    now: () => now,
+    runRoutine: async (routine) => {
+      if (routine.id === parked.id) return 'needs_approval'
+      await runHeld
+      return 'ok'
+    },
+  })
+  await scheduler.tick()
+  await flush()
+
+  assert.deepEqual(scheduler.runningRoutineIds(), [running.id])
+
+  finishRun()
+  await flush()
+  assert.deepEqual(scheduler.runningRoutineIds(), [], 'a finished run is no longer running')
+})
+
+test('runningRoutineIds is empty when nothing has fired', () => {
+  const scheduler = new RoutineScheduler({ store: freshStore(), now: () => new Date(), runRoutine: async () => 'ok' })
+  assert.deepEqual(scheduler.runningRoutineIds(), [])
+})

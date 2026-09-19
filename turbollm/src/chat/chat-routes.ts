@@ -61,6 +61,12 @@ export function abortAllInFlightChats(): number {
   return n
 }
 
+/** The conversations with a generation in flight — exactly the chats abortAllInFlightChats()
+ *  would abort. Read by the active-work probe (ADR-434 (i)(3)). */
+export function inFlightChatIds(): string[] {
+  return [...inflight.keys()]
+}
+
 // 503 joined the set with Turbo Link: a linked machine that is offline, or no longer
 // advertising the model, is a REMOTE availability failure, not a local 409.
 // 403 joined with ADR-422's N2 fix: a remote-access token is authenticated but

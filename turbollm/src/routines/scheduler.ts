@@ -86,6 +86,12 @@ export class RoutineScheduler {
     if (this.timer) { clearInterval(this.timer); this.timer = null }
   }
 
+  /** Routines whose run is executing right now: `inFlight` minus runs parked awaiting an
+   *  approval, which wait on the user, not the engine (ADR-434 (i)(3)'s active-work probe). */
+  runningRoutineIds(): string[] {
+    return [...this.inFlight].filter((routineId) => !this.parked.has(routineId))
+  }
+
   /** Runs once at start(), BEFORE reconcileMissedRuns(): the parked guard (`inFlight`/`parked`)
    *  is in-memory only, so a daemon restart silently drops it even though the DB still correctly
    *  shows a stalled run as 'needs_approval'. Without this, a restart would let a normal tick (or

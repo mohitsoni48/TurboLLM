@@ -6,10 +6,13 @@
 // pass with tool_choice:'none' and use that result as the final reply.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { readFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { Hono } from 'hono'
 import { stripThinkingBlocks, needsExtraPass } from './think-utils.js'
-import { recentTitleTurns, chatCodeAuthorization } from './chat-routes.js'
+import { recentTitleTurns, chatCodeAuthorization, inFlightChatIds, registerChatRoutes } from './chat-routes.js'
+import { ConversationStore } from './db.js'
 import type { Deps } from '../deps.js'
 
 // ── stripThinkingBlocks ───────────────────────────────────────────────────────
@@ -209,4 +212,80 @@ test('C1 invariant: both chat generation entry points DERIVE isCodeAuthorized, n
   }
   assert.doesNotMatch(src, /isCodeAuthorized\s*[:=]\s*true/, 'no chat path may assert code authorization by literal')
   assert.match(src, /isCodeAuthorized: ctx\.isCodeAuthorized/, 'the tool loop must forward the per-request value, not recompute or fake one')
+})
+
+// ── inFlightChatIds (ADR-434 (i)(3)) ─────────────────────────────────────────────────────────
+// The Jev-load confirmation names the chats a load would interrupt: exactly the conversations
+// abortAllInFlightChats() would abort. Driven through the real POST /messages route with the
+// engine fetch held open, in the style of chat-routes.remote.test.ts (real store, no port).
+
+function inFlightHarness() {
+  const dir = mkdtempSync(join(tmpdir(), 'tllm-chat-inflight-'))
+  const store = new ConversationStore(dir)
+  const cfg = {
+    modelDefaults: { maxTokens: 0 },
+    gateway: { autoSwap: true },
+    daemon: { autoGenerateTitles: false, experimental: { memory: false }, autoMemoryEnabled: false },
+    tools: { toolPolicies: {}, autoAllowAll: false },
+  }
+  const d = {
+    db: store,
+    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
+    scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }), get: () => undefined },
+    registry: { active: () => ({ kind: 'llama.cpp', id: 'e1', capabilities: {} }) },
+    modelRouter: { resolveRemoteTarget: () => undefined },
+    manager: {
+      status: () => ({ state: 'running', model: { key: 'gemma-27b', name: 'Gemma 27B', ctx: 8192 } }),
+      target: () => 'http://engine.invalid',
+      currentOpts: () => null,
+      generationStart: () => {},
+      generationEnd: () => {},
+      setLiveGen: () => {},
+      recordCompletion: () => {},
+    },
+  } as unknown as Deps
+  const app = new Hono()
+  registerChatRoutes(app, d)
+  return { app, store, cleanup: () => { store.close(); rmSync(dir, { recursive: true, force: true }) } }
+}
+
+/** Holds the engine's reply until `finish()` — the chat stays in flight until then. */
+function holdEngineReply(): { finish: () => void; restore: () => void } {
+  const original = globalThis.fetch
+  let finish!: () => void
+  const released = new Promise<void>((resolve) => { finish = resolve })
+  globalThis.fetch = (async () => {
+    await released
+    const body = [
+      `data: ${JSON.stringify({ choices: [{ delta: { content: 'hello' } }] })}\n\n`,
+      `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] })}\n\n`,
+      'data: [DONE]\n\n',
+    ].join('')
+    return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+  }) as typeof fetch
+  return { finish, restore: () => { globalThis.fetch = original } }
+}
+
+test('inFlightChatIds lists a chat while its reply is generating, and drops it when done', async () => {
+  const h = inFlightHarness()
+  const engine = holdEngineReply()
+  try {
+    const conv = h.store.createConversation()
+    assert.deepEqual(inFlightChatIds(), [])
+
+    const res = await h.app.request(`/api/v1/conversations/${conv.id}/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ content: 'hi' }),
+    })
+    assert.equal(res.status, 200)
+    assert.deepEqual(inFlightChatIds(), [conv.id])
+
+    engine.finish()
+    await res.text()
+    assert.deepEqual(inFlightChatIds(), [])
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
 })
