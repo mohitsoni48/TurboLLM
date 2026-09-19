@@ -101,3 +101,57 @@ test('with no active engine every model is compatible, with no reason', async ()
     { compatibleWithActiveEngine: true, incompatibleReason: null },
   ])
 })
+
+// `GET /api/v1/status` carries a local-only `jev` field (architecture §2.8) so Workspace can
+// follow a loaded Jev model. The double mirrors status-fail-reason.test.ts's status double.
+function appWithPrimary(primaryKey: string | null) {
+  const cfg: Record<string, unknown> = {
+    daemon: { lanBind: false, requireApiKey: false, port: 6996, machineId: 'm', machineName: 'test' },
+    apiKeys: [],
+    links: [],
+    telemetry: { level: 'off', machineId: 'm' },
+  }
+  const library = new Map([JEV_MODEL, GGUF_MODEL].map((m) => [m.key, m]))
+  const d = {
+    version: 'test',
+    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => '/tmp/unused' },
+    manager: {
+      status: () => ({ state: primaryKey ? 'running' : 'stopped', err: null, port: 0, pid: 0, model: null }),
+      launchCommand: () => undefined,
+      parallelSlots: () => 1,
+      sessionStats: () => null,
+      liveGeneration: () => null,
+    },
+    modelRouter: {
+      aliveSlots: () => (primaryKey ? [{ modelKey: primaryKey, state: 'running', primary: true, lastUsedMs: 1 }] : []),
+    },
+    scanner: { get: (key: string) => library.get(key) },
+    registry: { active: () => ({ id: 'eng-1', name: 'vLLM', kind: 'vllm', binPath: 'engine' }) },
+    bench: { status: () => ({ state: 'idle' }) },
+    downloads: { activeCount: () => 0 },
+    provision: { get: () => undefined },
+    build: { get: () => undefined },
+  } as unknown as Deps
+  const app = new Hono()
+  registerApi(app, d)
+  return app
+}
+
+async function statusJev(primaryKey: string | null): Promise<unknown> {
+  const res = await appWithPrimary(primaryKey).request('/api/v1/status')
+  assert.equal(res.status, 200)
+  const body = (await res.json()) as Record<string, unknown>
+  assert.ok('jev' in body, 'status must always carry the jev field')
+  return body.jev
+}
+
+test('GET /api/v1/status reports jev:null when no Jev model is alive', async () => {
+  assert.equal(await statusJev(null), null)
+  assert.equal(await statusJev(GGUF_KEY), null)
+})
+
+test('GET /api/v1/status reports the loaded Jev model', async () => {
+  assert.deepEqual(await statusJev(JEV_KEY), {
+    key: JEV_KEY, name: 'qwen3.5 4b nli v2', labels: OPENJEV.labels, state: 'running', slot: 'primary',
+  })
+})

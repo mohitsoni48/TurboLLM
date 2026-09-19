@@ -73,6 +73,7 @@ import { registerOnboardingRoutes } from './onboarding-routes'
 import { startEngine, stopEngine, type EngineStartBody, type EngineStopBody } from './engine-lifecycle'
 import { enqueueDownload, listDownloads, removeDownload } from './download-lifecycle'
 import { buildModelStatus } from './status-view'
+import { jevStatus } from './jev-status'
 
 type Status = 200 | 201 | 202 | 400 | 401 | 403 | 404 | 409 | 500 | 501 | 503
 
@@ -141,6 +142,9 @@ export function registerApi(app: Hono, d: Deps): void {
       // from it, and `turbollm launch <cli>` (which has no access to browser state) uses it
       // instead of auto-loading a local model the user did not ask for.
       selectedRemoteModel: d.store.snapshot().selectedRemoteModel ?? '',
+      // The alive Jev model, if any (ADR-434 (i)(1)): Workspace becomes the Jev Playground while
+      // one is loaded in any slot. Local-only, like `launchCommand` — not in the shared builder.
+      jev: jevStatus(d),
       engineStats: core.engineStats,
       liveGeneration: core.liveGeneration,
       // Auto-tune runner state (spec 09 §1): real progress while a sweep runs, then
