@@ -49,7 +49,7 @@ import { ensureKoboldcpp, koboldcppBinPath, koboldcppDir } from '../engines/kobo
 import { ensureLlamafile, llamafileBinPath, llamafileDir } from '../engines/llamafile'
 import { catalogForPlatform, catalogEngine } from '../engines/catalog'
 import { checkBuildPrereqs } from '../engines/build-prereqs'
-import { runBuild, runPrereqInstall, buildDirName, chooseEngineName, findPriorEngine, normRepoUrl, sameRepo, sourceBuildBinary, sourceBuildDirOf } from '../engines/build-runner'
+import { runBuild, runPrereqInstall, buildDirName, catalogBranchesToScan, chooseEngineName, findEngineForCatalogEntry, findPriorEngine, normRepoUrl, sameRepo, sourceBuildBinary, sourceBuildDirOf } from '../engines/build-runner'
 import { provisionCuda } from '../engines/cuda-provision'
 import { detectHardware } from '../engines/hardware'
 import { recommendEngines } from '../engines/recommend'
@@ -561,19 +561,14 @@ export function registerApi(app: Hono, d: Deps): void {
       // `sourceEngineId`) — founder-reported: "now it is only visible for selection in dropdown".
       // An entry is "branch-capable" when it has no pinned commit or patch — the user can
       // build any branch, so the match should be scoped to the requested branch.
-      const isBranchCapable = !e.sourceCommit && !e.patchUrl
-      const matchBranch = isBranchCapable ? (branchParam ?? '') : undefined
-      const srcEng = e.excludeFromSourceMatch
-        ? undefined
-        : regEngines.find(
-            (x) =>
-              sameRepo(x.sourceRepo, e.homepage) &&
-              (x.sourceCommit ?? '') === (e.sourceCommit ?? '') &&
-              (x.sourcePatchUrl ?? '') === (e.patchUrl ?? '') &&
-              (x.sourceBranch ?? '') === (matchBranch ?? ''),
-          )
+      const srcEng = e.excludeFromSourceMatch ? undefined : findEngineForCatalogEntry(regEngines, e, branchParam)
       let sourceBinPath: string | undefined = srcEng?.binPath
-      if (!srcEng && !e.excludeFromSourceMatch) sourceBinPath = sourceBuildBinary(enginesRoot, e.homepage, matchBranch, e.sourceCommit) ?? undefined
+      if (!srcEng && !e.excludeFromSourceMatch) {
+        sourceBinPath =
+          catalogBranchesToScan(e, branchParam)
+            .map((branch) => sourceBuildBinary(enginesRoot, e.homepage, branch, e.sourceCommit))
+            .find((bin) => bin !== null) ?? undefined
+      }
       const sourceBuilt = !!srcEng || !!sourceBinPath
       if (srcEng) {
         installed = true

@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildDirName, chooseEngineName, CMAKE_CONFIGURE_ARGS, isIncompleteMetalBackendError, pickGenerator, vcvarsBatch, stripGenericAsmLanguage, sameRepo, normRepoUrl, sourceBuildDirOf, notCmakeProjectError, missingPatchShaError, sha256Hex, patchChecksumMismatchError, findPriorEngine, parseDefaultBranch } from './build-runner'
+import { buildDirName, chooseEngineName, CMAKE_CONFIGURE_ARGS, isIncompleteMetalBackendError, pickGenerator, vcvarsBatch, stripGenericAsmLanguage, sameRepo, normRepoUrl, sourceBuildDirOf, notCmakeProjectError, missingPatchShaError, sha256Hex, patchChecksumMismatchError, findPriorEngine, parseDefaultBranch, findEngineForCatalogEntry, catalogBranchesToScan } from './build-runner'
 import { join } from 'node:path'
 
 test('buildDirName: owner/repo from a .git URL, branch appended', () => {
@@ -185,6 +185,64 @@ test('findPriorEngine: a blank AND an explicitly-named-default registration — 
   assert.equal(findPriorEngine([named, blankBranchEngine], build)?.id, '2')
   const blankBuild = { binPath: '/x/new', sourceRepo: IK_REPO, sourceCommit: '', defaultBranch: 'main' }
   assert.equal(findPriorEngine([named, blankBranchEngine], blankBuild)?.id, '1')
+})
+
+const PRISM_HOME = 'https://github.com/PrismML-Eng/llama.cpp'
+const prismCard = { homepage: PRISM_HOME, defaultBranch: 'prism' }
+const registered = (id: string, sourceBranch?: string, extra: Record<string, string> = {}) => ({
+  id,
+  name: id,
+  binPath: `/x/${id}`,
+  sourceRepo: PRISM_HOME,
+  sourceBranch,
+  sourceCommit: '',
+  ...extra,
+})
+
+test('findEngineForCatalogEntry: a card finds the engine it built on the default branch (live-reproduced orphan)', () => {
+  // Reproduced live after a real Prism build: the engine registered as sourceBranch "prism", but the
+  // catalog matched by EXACT recorded branch against a request that never carries one (''), so the
+  // Prism card reported sourceBuilt:false and could not manage its own engine.
+  assert.equal(findEngineForCatalogEntry([registered('built', 'prism')], prismCard)?.id, 'built')
+})
+
+test('findEngineForCatalogEntry: a blank-branch (legacy / Add via git repo) registration still belongs to the card', () => {
+  assert.equal(findEngineForCatalogEntry([registered('legacy')], prismCard)?.id, 'legacy')
+})
+
+test('findEngineForCatalogEntry: an engine on a DIFFERENT branch is not the default card\'s engine', () => {
+  assert.equal(findEngineForCatalogEntry([registered('other', 'sidestream')], prismCard), undefined)
+})
+
+test('findEngineForCatalogEntry: an exact recorded-branch match beats a blank one, whatever the registry order', () => {
+  const blank = registered('blank')
+  const named = registered('named', 'prism')
+  assert.equal(findEngineForCatalogEntry([blank, named], prismCard)?.id, 'named')
+  assert.equal(findEngineForCatalogEntry([named, blank], prismCard)?.id, 'named')
+})
+
+test('findEngineForCatalogEntry: an explicitly requested branch finds that branch\'s engine only', () => {
+  const engines = [registered('default', 'prism'), registered('dev', 'dev')]
+  assert.equal(findEngineForCatalogEntry(engines, prismCard, 'dev')?.id, 'dev')
+})
+
+test('findEngineForCatalogEntry: a pinned-commit entry ignores the recorded branch (the commit is the identity)', () => {
+  const pinnedCard = { homepage: PRISM_HOME, sourceCommit: '846e991ec3c7', patchUrl: 'https://x/p.diff' }
+  const guessed = registered('pinned', 'main', { sourceCommit: '846e991ec3c7', sourcePatchUrl: 'https://x/p.diff' })
+  assert.equal(findEngineForCatalogEntry([guessed], pinnedCard)?.id, 'pinned')
+})
+
+test('findEngineForCatalogEntry: a different repo, or a different pinned commit, never matches', () => {
+  assert.equal(findEngineForCatalogEntry([{ ...registered('x', 'prism'), sourceRepo: 'https://github.com/a/b' }], prismCard), undefined)
+  const pinnedCard = { homepage: PRISM_HOME, sourceCommit: 'aaaa1111', patchUrl: 'https://x/p.diff' }
+  assert.equal(findEngineForCatalogEntry([registered('old', undefined, { sourceCommit: 'bbbb2222', sourcePatchUrl: 'https://x/p.diff' })], pinnedCard), undefined)
+})
+
+test('catalogBranchesToScan: the default branch first, then the legacy blank dir', () => {
+  assert.deepEqual(catalogBranchesToScan({ defaultBranch: 'prism' }), ['prism', undefined])
+  assert.deepEqual(catalogBranchesToScan({ defaultBranch: 'prism' }, 'dev'), ['dev', undefined])
+  assert.deepEqual(catalogBranchesToScan({}), [undefined])
+  assert.deepEqual(catalogBranchesToScan({ sourceCommit: 'abc' }), [undefined])
 })
 
 test('parseDefaultBranch: reads the branch out of `git ls-remote --symref <url> HEAD` output', () => {

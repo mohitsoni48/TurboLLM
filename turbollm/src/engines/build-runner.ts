@@ -173,6 +173,59 @@ function effectiveBranch(branch: string | undefined, defaultBranch: string | und
   return (branch ?? '').trim() || (defaultBranch ?? '')
 }
 
+/** The subset of a catalog entry needed to decide which registered engine is its build. */
+export interface CatalogEntryIdentity {
+  homepage: string
+  defaultBranch?: string
+  sourceCommit?: string
+  patchUrl?: string
+}
+
+export interface RegisteredSourceIdentity extends RegisteredEngineIdentity {
+  sourcePatchUrl?: string
+}
+
+/** A pinned commit / patch is the build's whole identity, so the branch it was recorded under is noise. */
+const isPinnedEntry = (entry: CatalogEntryIdentity): boolean => !!(entry.sourceCommit || entry.patchUrl)
+
+/** PURE: the registered engine a catalog card owns (so the card can Rebuild / Disable / Delete it).
+ *
+ * The catalog used to match on the EXACT recorded branch against a request that never carries one,
+ * so only blank-branch registrations were ever recognised: a Prism built from its own card
+ * (recorded `prism`) was orphaned from the Prism card. Branches are now compared as EFFECTIVE
+ * branches — blank means the entry's audited `defaultBranch`, same rule as {@link findPriorEngine} —
+ * so a blank registration and one recorded as the default both belong to the card, while an engine
+ * on any other branch stays a distinct (custom) engine. An exact recorded match wins over a blank
+ * one so the choice never depends on registry order. */
+export function findEngineForCatalogEntry(
+  engines: RegisteredSourceIdentity[],
+  entry: CatalogEntryIdentity,
+  requestedBranch?: string,
+): RegisteredSourceIdentity | undefined {
+  const sameBuild = engines.filter(
+    (e) =>
+      sameRepo(e.sourceRepo, entry.homepage) &&
+      (e.sourceCommit ?? '') === (entry.sourceCommit ?? '') &&
+      (e.sourcePatchUrl ?? '') === (entry.patchUrl ?? ''),
+  )
+  if (isPinnedEntry(entry)) return sameBuild[0]
+
+  const wanted = effectiveBranch(requestedBranch, entry.defaultBranch)
+  return (
+    sameBuild.find((e) => (e.sourceBranch ?? '').trim() === wanted) ??
+    sameBuild.find((e) => effectiveBranch(e.sourceBranch, entry.defaultBranch) === wanted)
+  )
+}
+
+/** PURE: the branch values whose build directory a catalog card should look in for a build that is
+ *  on disk but not registered (a Disabled engine). Cards build into the named-branch directory
+ *  (`…-prism`); "Add via git repo" with a blank branch built into the bare one, so both are scanned. */
+export function catalogBranchesToScan(entry: Omit<CatalogEntryIdentity, 'homepage'>, requestedBranch?: string): Array<string | undefined> {
+  if (isPinnedEntry(entry as CatalogEntryIdentity)) return [undefined]
+  const wanted = effectiveBranch(requestedBranch, entry.defaultBranch)
+  return wanted ? [wanted, undefined] : [undefined]
+}
+
 /** PURE: the repo's default branch from `git ls-remote --symref <url> HEAD`, whose first line is
  *  `ref: refs/heads/<branch>\tHEAD`. Undefined when there is no symref line (an empty repo, an
  *  unreadable remote, unexpected output) — callers treat that as "unknown", never as a branch. */
