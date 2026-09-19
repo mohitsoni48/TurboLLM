@@ -113,6 +113,8 @@ export interface BuildIdentity {
   sourceRepo?: string
   sourceBranch?: string
   sourceCommit?: string
+  /** The repo's real default branch, when it could be resolved — what a blank `sourceBranch` means. */
+  defaultBranch?: string
 }
 
 /** The subset of a registered {@link Engine}'s fields needed to match it against a build. */
@@ -141,28 +143,36 @@ export interface RegisteredEngineIdentity {
  * `sourceRepo` was that collision class — it left a stranded prior registration (and its name)
  * un-replaceable whenever `binPath` alone didn't match.
  *
- * Branch matching (ADR-428 follow-up) allows one blank side: "Add via git repo" lets a branch be
- * left blank to mean "the repo's own default branch" and registers with no `sourceBranch` at all,
- * while a later "Rebuild" of that same engine sends an EXPLICIT branch (the catalog's/UI's own
- * default-branch guess) — a different string, slugging to a different directory, for what is
- * unambiguously the same build target. That ambiguity is only bridged when it IS unambiguous:
- * exactly one non-commit-pinned registration exists for the repo. Two or more different branches
- * already tracked for the same repo means the user deliberately follows more than one — never
- * guess which one a blank branch meant; let an exact match (or none) stand. */
+ * Branches are compared as EFFECTIVE branches (ADR-428 follow-up): "Add via git repo" lets the
+ * branch be left blank to mean "the repo's own default branch" and registers with no
+ * `sourceBranch`, while a later "Rebuild" of that same engine sends the default branch by NAME —
+ * a different string, slugging to a different directory, for the same build target. A blank
+ * branch therefore resolves to `build.defaultBranch` before comparing. It is never resolved
+ * to "whatever is registered": a build of any OTHER branch is a distinct engine and must coexist
+ * with the blank one, not delete it. When the default could not be resolved, blank stays blank,
+ * so blank never bridges to a named branch — a wrong guess here removes a registration. */
 export function findPriorEngine(engines: RegisteredEngineIdentity[], build: BuildIdentity): RegisteredEngineIdentity | undefined {
   const byBinPath = engines.find((e) => e.binPath === build.binPath)
   if (byBinPath) return byBinPath
 
-  const sameRepoSameCommit = engines.filter(
-    (e) => sameRepo(e.sourceRepo, build.sourceRepo) && (e.sourceCommit ?? '') === (build.sourceCommit ?? ''),
+  const wantedBranch = effectiveBranch(build.sourceBranch, build.defaultBranch)
+  return engines.find(
+    (e) =>
+      sameRepo(e.sourceRepo, build.sourceRepo) &&
+      (e.sourceCommit ?? '') === (build.sourceCommit ?? '') &&
+      effectiveBranch(e.sourceBranch, build.defaultBranch) === wantedBranch,
   )
-  const exactBranch = sameRepoSameCommit.find((e) => (e.sourceBranch ?? '') === (build.sourceBranch ?? ''))
-  if (exactBranch) return exactBranch
+}
 
-  if (sameRepoSameCommit.length === 1 && (!sameRepoSameCommit[0].sourceBranch || !build.sourceBranch)) {
-    return sameRepoSameCommit[0]
-  }
-  return undefined
+function effectiveBranch(branch: string | undefined, defaultBranch: string | undefined): string {
+  return (branch ?? '').trim() || (defaultBranch ?? '')
+}
+
+/** PURE: the repo's default branch from `git ls-remote --symref <url> HEAD`, whose first line is
+ *  `ref: refs/heads/<branch>\tHEAD`. Undefined when there is no symref line (an empty repo, an
+ *  unreadable remote, unexpected output) — callers treat that as "unknown", never as a branch. */
+export function parseDefaultBranch(lsRemoteOutput: string): string | undefined {
+  return /^ref:\s+refs\/heads\/(\S+)\s+HEAD\s*$/m.exec(lsRemoteOutput)?.[1]
 }
 
 export interface BuildHooks {
@@ -177,6 +187,8 @@ export interface BuildOutput {
   commit: string
   /** Directory the build lives in (so the caller can GC on failure if desired). */
   buildRoot: string
+  /** The repo's default branch, resolved best-effort from the remote; undefined when unknown. */
+  defaultBranch?: string
 }
 
 /** PURE: a filesystem-safe directory slug for a repo+branch, so a rebuild of the same
@@ -766,6 +778,17 @@ export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: Abo
   // Record the built commit (ADR-088 provenance / rebuild comparison).
   const commit = (await runStep('git', ['-C', srcDir, 'rev-parse', 'HEAD'], { env, signal, onLine: () => {} })).trim()
 
+  // What a blank branch means for this repo, so registration can tell a blank-branch engine and
+  // a named-default-branch rebuild are the same engine. Best-effort and fail-open: it only ever
+  // ADDS a match, so an unreachable remote just means blank and named stay distinct.
+  let defaultBranch: string | undefined
+  try {
+    const lsRemote = await runStep('git', ['ls-remote', '--symref', req.repoUrl, 'HEAD'], { env, signal, onLine: () => {} })
+    defaultBranch = parseDefaultBranch(lsRemote)
+  } catch (e) {
+    if ((e as Error)?.name === 'AbortError') throw e
+  }
+
   // 1b) Apply a pinned, checksum-verified third-party patch on top of the checked-out commit,
   // when the catalog entry ships one — for an architecture not yet in the repo's mainline that
   // needs a patch to compile (e.g. solar_open2). OPT-IN: with no `patchUrl` the build below is
@@ -911,5 +934,5 @@ export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: Abo
   // neither has anything to bundle.
   if (isWindows) copyCudaRuntimeDlls(env, dirname(binPath), hooks.log)
   else if (!isMac && !isAndroid) copyCudaRuntimeLibs(env, dirname(binPath), hooks.log)
-  return { binPath, commit, buildRoot }
+  return { binPath, commit, buildRoot, defaultBranch }
 }

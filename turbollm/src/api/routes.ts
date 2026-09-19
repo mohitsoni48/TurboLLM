@@ -764,6 +764,7 @@ export function registerApi(app: Hono, d: Deps): void {
           sourceRepo: repoUrl,
           sourceBranch: branch,
           sourceCommit: commit,
+          defaultBranch: out.defaultBranch,
         })
         if (prior) {
           if (d.registry.active()?.id === prior.id) await d.manager.stopAndWait()

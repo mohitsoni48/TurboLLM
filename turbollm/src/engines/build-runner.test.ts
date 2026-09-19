@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildDirName, chooseEngineName, CMAKE_CONFIGURE_ARGS, isIncompleteMetalBackendError, pickGenerator, vcvarsBatch, stripGenericAsmLanguage, sameRepo, normRepoUrl, sourceBuildDirOf, notCmakeProjectError, missingPatchShaError, sha256Hex, patchChecksumMismatchError, findPriorEngine } from './build-runner'
+import { buildDirName, chooseEngineName, CMAKE_CONFIGURE_ARGS, isIncompleteMetalBackendError, pickGenerator, vcvarsBatch, stripGenericAsmLanguage, sameRepo, normRepoUrl, sourceBuildDirOf, notCmakeProjectError, missingPatchShaError, sha256Hex, patchChecksumMismatchError, findPriorEngine, parseDefaultBranch } from './build-runner'
 import { join } from 'node:path'
 
 test('buildDirName: owner/repo from a .git URL, branch appended', () => {
@@ -104,7 +104,16 @@ test('findPriorEngine: an unrelated repo never matches', () => {
   assert.equal(prior, undefined)
 })
 
-test('findPriorEngine: a blank branch matches a later build that names the default branch explicitly (live-reproduced regression)', () => {
+const IK_REPO = 'https://github.com/ikawrakow/ik_llama.cpp'
+const blankBranchEngine = {
+  id: '1',
+  name: 'ik_llama.cpp',
+  binPath: 'C:\\...\\build\\ikawrakow-ik_llama.cpp\\build\\bin\\llama-server.exe',
+  sourceRepo: IK_REPO,
+  sourceCommit: '',
+}
+
+test('findPriorEngine: a blank branch matches a later build that names the repo default explicitly (live-reproduced regression)', () => {
   // Reproduced live: "Add via git repo" leaves branch blank ("leave blank to build the repo's own
   // default branch" — CustomBuildDialog.tsx) and registers with sourceBranch undefined, landing at
   // the bare buildDirName (no branch suffix). The SAME engine's own "Rebuild" action later sends an
@@ -112,34 +121,70 @@ test('findPriorEngine: a blank branch matches a later build that names the defau
   // "main" for ik_llama.cpp), which slugs to a DIFFERENT directory/binPath. Neither the binPath
   // check nor an exact branch comparison sees these as the same target, so the stale registration
   // is never replaced and blocks the rebuild's name with NameTakenError forever.
-  const engines = [
-    {
-      id: '1',
-      name: 'ik_llama.cpp',
-      binPath: 'C:\\...\\build\\ikawrakow-ik_llama.cpp\\build\\bin\\llama-server.exe',
-      sourceRepo: 'https://github.com/ikawrakow/ik_llama.cpp',
-      sourceCommit: '',
-    },
-  ]
-  const prior = findPriorEngine(engines, {
+  const prior = findPriorEngine([blankBranchEngine], {
     binPath: 'C:\\...\\build\\ikawrakow-ik_llama.cpp-main\\build\\bin\\llama-server.exe',
-    sourceRepo: 'https://github.com/ikawrakow/ik_llama.cpp',
+    sourceRepo: IK_REPO,
     sourceBranch: 'main',
     sourceCommit: '',
+    defaultBranch: 'main',
   })
   assert.equal(prior?.id, '1')
 })
 
-test('findPriorEngine: never guesses which branch a blank one meant when multiple branches of the same repo are already tracked', () => {
-  // If the user deliberately registered more than one branch of the same fork, a blank branch on a
-  // NEW build is genuinely ambiguous — bridging it to either one risks silently replacing the wrong
-  // engine. Safer to fall through to no match (the pre-existing NameTaken error) than to guess.
-  const engines = [
-    { id: '1', name: 'fork-main', binPath: '/x/main', sourceRepo: 'https://github.com/o/r', sourceBranch: 'main', sourceCommit: '' },
-    { id: '2', name: 'fork-dev', binPath: '/x/dev', sourceRepo: 'https://github.com/o/r', sourceBranch: 'dev', sourceCommit: '' },
-  ]
-  const prior = findPriorEngine(engines, { binPath: '/x/new', sourceRepo: 'https://github.com/o/r', sourceCommit: '' })
+test('findPriorEngine: a blank-branch registration is NOT replaced by a build of a DIFFERENT branch (Opus review, destructive)', () => {
+  // The first version of this fix bridged a blank branch to ANY named branch, so adding a second
+  // engine from another branch of the same repo silently deleted the first. "Blank" means the
+  // repo's DEFAULT branch — a build of any other branch is a distinct engine that must coexist.
+  const prior = findPriorEngine([blankBranchEngine], {
+    binPath: '/x/ikawrakow-ik_llama.cpp-sidestream/llama-server',
+    sourceRepo: IK_REPO,
+    sourceBranch: 'sidestream',
+    sourceCommit: '',
+    defaultBranch: 'main',
+  })
   assert.equal(prior, undefined)
+})
+
+test('findPriorEngine: a blank new build matches an engine already registered under the resolved default branch', () => {
+  const namedMain = { id: '2', name: 'ik', binPath: '/x/named-main', sourceRepo: IK_REPO, sourceBranch: 'main', sourceCommit: '' }
+  const prior = findPriorEngine([namedMain], { binPath: '/x/new', sourceRepo: IK_REPO, sourceCommit: '', defaultBranch: 'main' })
+  assert.equal(prior?.id, '2')
+})
+
+test('findPriorEngine: never bridges blank to named when the default branch could not be resolved', () => {
+  // Fail closed: with no way to know that "main" is the default, treating the two as the same
+  // engine is a guess, and a wrong guess deletes a registration. Falls through to no match.
+  const prior = findPriorEngine([blankBranchEngine], {
+    binPath: '/x/new',
+    sourceRepo: IK_REPO,
+    sourceBranch: 'main',
+    sourceCommit: '',
+  })
+  assert.equal(prior, undefined)
+})
+
+test('findPriorEngine: with several branches tracked, only the one matching the build\'s effective branch is replaced', () => {
+  const dev = { id: '3', name: 'fork-dev', binPath: '/x/dev', sourceRepo: IK_REPO, sourceBranch: 'dev', sourceCommit: '' }
+  const prior = findPriorEngine([dev, blankBranchEngine], {
+    binPath: '/x/new',
+    sourceRepo: IK_REPO,
+    sourceBranch: 'main',
+    sourceCommit: '',
+    defaultBranch: 'main',
+  })
+  assert.equal(prior?.id, '1')
+})
+
+test('parseDefaultBranch: reads the branch out of `git ls-remote --symref <url> HEAD` output', () => {
+  const out = 'ref: refs/heads/main\tHEAD\n4c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d\tHEAD\n'
+  assert.equal(parseDefaultBranch(out), 'main')
+  assert.equal(parseDefaultBranch('ref: refs/heads/feature/x-y\tHEAD\nabc\tHEAD'), 'feature/x-y')
+})
+
+test('parseDefaultBranch: undefined when there is no symref line (empty repo, detached, garbage)', () => {
+  assert.equal(parseDefaultBranch(''), undefined)
+  assert.equal(parseDefaultBranch('4c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d\tHEAD\n'), undefined)
+  assert.equal(parseDefaultBranch('fatal: unable to access'), undefined)
 })
 
 test('normRepoUrl: strips scheme, github.com host, .git suffix, trailing slash, and case', () => {
