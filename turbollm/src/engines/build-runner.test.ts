@@ -175,6 +175,18 @@ test('findPriorEngine: with several branches tracked, only the one matching the 
   assert.equal(prior?.id, '1')
 })
 
+test('findPriorEngine: a blank AND an explicitly-named-default registration — the exact branch match wins, whatever the registry order (Opus pass 2)', () => {
+  // Both resolve to "main", so both are candidates. Picking by array position left the other one
+  // holding the name, which then failed the registration with NameTakenError AND deleted an engine
+  // the build was not aimed at. An exact stored-branch match is the more specific claim.
+  const named = { id: '2', name: 'ik-named', binPath: '/x/named', sourceRepo: IK_REPO, sourceBranch: 'main', sourceCommit: '' }
+  const build = { binPath: '/x/new', sourceRepo: IK_REPO, sourceBranch: 'main', sourceCommit: '', defaultBranch: 'main' }
+  assert.equal(findPriorEngine([blankBranchEngine, named], build)?.id, '2')
+  assert.equal(findPriorEngine([named, blankBranchEngine], build)?.id, '2')
+  const blankBuild = { binPath: '/x/new', sourceRepo: IK_REPO, sourceCommit: '', defaultBranch: 'main' }
+  assert.equal(findPriorEngine([named, blankBranchEngine], blankBuild)?.id, '1')
+})
+
 test('parseDefaultBranch: reads the branch out of `git ls-remote --symref <url> HEAD` output', () => {
   const out = 'ref: refs/heads/main\tHEAD\n4c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d\tHEAD\n'
   assert.equal(parseDefaultBranch(out), 'main')

@@ -155,12 +155,17 @@ export function findPriorEngine(engines: RegisteredEngineIdentity[], build: Buil
   const byBinPath = engines.find((e) => e.binPath === build.binPath)
   if (byBinPath) return byBinPath
 
+  const sameTarget = engines.filter(
+    (e) => sameRepo(e.sourceRepo, build.sourceRepo) && (e.sourceCommit ?? '') === (build.sourceCommit ?? ''),
+  )
+  // An exact stored-branch match is the more specific claim, so it wins over the resolved-default
+  // match: a blank registration and an explicitly-named-default one can both resolve to the same
+  // branch, and picking by registry order would delete the one this build wasn't aimed at.
+  const storedBranch = (build.sourceBranch ?? '').trim()
   const wantedBranch = effectiveBranch(build.sourceBranch, build.defaultBranch)
-  return engines.find(
-    (e) =>
-      sameRepo(e.sourceRepo, build.sourceRepo) &&
-      (e.sourceCommit ?? '') === (build.sourceCommit ?? '') &&
-      effectiveBranch(e.sourceBranch, build.defaultBranch) === wantedBranch,
+  return (
+    sameTarget.find((e) => (e.sourceBranch ?? '').trim() === storedBranch) ??
+    sameTarget.find((e) => effectiveBranch(e.sourceBranch, build.defaultBranch) === wantedBranch)
   )
 }
 
@@ -783,7 +788,9 @@ export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: Abo
   // ADDS a match, so an unreachable remote just means blank and named stay distinct.
   let defaultBranch: string | undefined
   try {
-    const lsRemote = await runStep('git', ['ls-remote', '--symref', req.repoUrl, 'HEAD'], { env, signal, onLine: () => {} })
+    // runStep has no timeout, so bound a stalled connection: abort when under 1 KB/s for 15 s.
+    const lsRemoteArgs = ['-c', 'http.lowSpeedLimit=1000', '-c', 'http.lowSpeedTime=15', 'ls-remote', '--symref', req.repoUrl, 'HEAD']
+    const lsRemote = await runStep('git', lsRemoteArgs, { env, signal, onLine: () => {} })
     defaultBranch = parseDefaultBranch(lsRemote)
   } catch (e) {
     if ((e as Error)?.name === 'AbortError') throw e
