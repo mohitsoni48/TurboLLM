@@ -241,8 +241,7 @@ export function legacyBuildDirName(repoUrl: string, branch?: string, commit?: st
   const repo = last.replace(/\.git$/i, '').trim() || 'engine'
   const b = (branch ?? '').trim()
   const sha = (commit ?? '').trim()
-  const raw = sha ? `${repo}-${sha.slice(0, 12)}` : b ? `${repo}-${b}` : repo
-  return raw.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'engine'
+  return asDirName(sha ? `${repo}-${sha.slice(0, 12)}` : b ? `${repo}-${b}` : repo)
 }
 
 /** A build found on disk for a catalog card, and the branch its directory was built for
@@ -364,10 +363,17 @@ export function buildDirName(repoUrl: string, branch?: string, commit?: string):
   // A pinned commit must land in its OWN dir — otherwise it collapses to the same name as a
   // plain branch build of the same repo and `runBuild`'s clean-start rmSync would silently wipe
   // an existing (possibly currently-installed) build of that repo.
-  const raw = sha ? `${repo}-${sha.slice(0, 12)}` : b ? `${repo}-${b}` : repo
-  // Keep it tame on disk: collapse anything outside [A-Za-z0-9._-] to a single dash (also
-  // folds normRepoUrl's "/" separator into a dash, e.g. "owner/repo" → "owner-repo").
-  return raw.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'engine'
+  return asDirName(sha ? `${repo}-${sha.slice(0, 12)}` : b ? `${repo}-${b}` : repo)
+}
+
+/** PURE: turns raw text into a single, safe directory name. Collapses anything outside
+ *  [A-Za-z0-9._-] to one dash (which also folds normRepoUrl's "/" separator, e.g. "owner/repo" →
+ *  "owner-repo"). A name made only of dots is a path step, not a name: "..", or "/.." which the
+ *  dash-trimming reduces to "..", would make `<engines>/build/<name>` the engines root itself, and
+ *  `runBuild`'s clean-start `rmSync` would delete every installed engine. Those become "engine". */
+function asDirName(raw: string): string {
+  const slug = raw.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '')
+  return /^\.*$/.test(slug) ? 'engine' : slug
 }
 
 /** PURE: loose equality of two repo identifiers (full URL or `owner/repo`), ignoring scheme,

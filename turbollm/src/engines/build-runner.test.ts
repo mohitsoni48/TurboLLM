@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { buildDirName, chooseEngineName, CMAKE_CONFIGURE_ARGS, isIncompleteMetalBackendError, pickGenerator, vcvarsBatch, stripGenericAsmLanguage, sameRepo, normRepoUrl, sourceBuildDirOf, notCmakeProjectError, missingPatchShaError, sha256Hex, patchChecksumMismatchError, findPriorEngine, parseDefaultBranch, findEngineForCatalogEntry, catalogBranchesToScan, legacyBuildDirName, findCatalogBuildOnDisk, findNameConflict, isEngineInBuildDir } from './build-runner'
-import { join } from 'node:path'
+import { join, relative } from 'node:path'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 
@@ -609,4 +609,38 @@ test('isEngineInBuildDir: true only for a binary under that build directory, wha
   assert.equal(isEngineInBuildDir('\\DATA\\ENGINES\\BUILD\\PRISMML-ENG-LLAMA.CPP-PRISM\\BUILD\\BIN\\LLAMA-SERVER.EXE', BUILD_ROOT), true)
   assert.equal(isEngineInBuildDir(BUILD_ROOT + '-dev/build/bin/llama-server', BUILD_ROOT), false)
   assert.equal(isEngineInBuildDir('/data/engines/llama.cpp-b10970-cuda/llama-server', BUILD_ROOT), false)
+})
+
+// runBuild() rmSync's `<engines>/build/<dirName>` recursively before every clone. A dir name of
+// ".." resolves to the engines root itself, so a repo URL ending in a dot segment used to be enough
+// to delete every installed engine with one POST to /api/v1/build/run.
+const HOSTILE_REPO_URLS = ['https://..', 'https://github.com/..', 'https://github.com/./', 'https://github.com/../', 'https://github.com/x/../..', '..', '.', '...', 'https://github.com/-..', '/..', '\\..']
+
+// A name is safe when joining it under build/ lands exactly one level down, on itself. ".." lands on
+// the engines root and "x/.." on build/ itself; a name that merely STARTS with dots ("..-..") is fine.
+function isStrictChildOfBuildDir(dirName: string): boolean {
+  const buildDir = join(tmpdir(), 'engines', 'build')
+  return dirName !== '' && dirName !== '.' && dirName !== '..' && relative(buildDir, join(buildDir, dirName)) === dirName
+}
+
+test('buildDirName: no repo URL, however hostile, can name a directory outside <engines>/build/<slug>', () => {
+  for (const url of HOSTILE_REPO_URLS) {
+    for (const [branch, commit] of [[undefined, undefined], ['..', undefined], ['main', '..'], [undefined, '../../x']] as const) {
+      const dir = buildDirName(url, branch, commit)
+      assert.ok(isStrictChildOfBuildDir(dir), `buildDirName(${JSON.stringify(url)}, ${branch}, ${commit}) = ${JSON.stringify(dir)} escapes the build directory`)
+    }
+  }
+})
+
+test('legacyBuildDirName: the pre-ADR-387 scheme is bounded the same way (it is used to look up, never to delete, but must not be a path either)', () => {
+  for (const url of HOSTILE_REPO_URLS) {
+    const dir = legacyBuildDirName(url)
+    assert.ok(isStrictChildOfBuildDir(dir), `legacyBuildDirName(${JSON.stringify(url)}) = ${JSON.stringify(dir)} escapes the build directory`)
+  }
+})
+
+test('buildDirName: ordinary URLs keep their existing names (no build directory on disk is renamed by the guard)', () => {
+  assert.equal(buildDirName('https://github.com/PrismML-Eng/llama.cpp', 'prism'), 'prismml-eng-llama.cpp-prism')
+  assert.equal(buildDirName('https://github.com/ggml-org/llama.cpp'), 'ggml-org-llama.cpp')
+  assert.equal(buildDirName('https://gitlab.com/group/sub.repo'), 'gitlab.com-group-sub.repo')
 })
