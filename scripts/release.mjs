@@ -32,7 +32,7 @@ import {
 } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -175,12 +175,19 @@ function recordPhase(state, name, status, extra = {}) {
 // Keep the last ~40 lines of a phase's output for the receipt.
 const tailOf = (s, lines = 40) => String(s || '').split(/\r?\n/).slice(-lines).join('\n');
 
-function assertOrder(state, phase) {
+// A `--dry-run` is recorded like any other phase, so without this a preview
+// satisfies the ordering guard and short-circuits the real run — which is how an
+// `announce` preview once ended a release having posted nothing.
+export const isRealOk = (rec) => rec?.status === 'ok' && !rec.dryRun;
+export const alreadyRecordedOk = (rec, flags = {}) => isRealOk(rec) && !flags.resume;
+
+export function assertOrder(state, phase) {
   const def = PHASES.find((p) => p.name === phase);
-  const missing = def.requires.filter((r) => state.phases[r]?.status !== 'ok');
+  const missing = def.requires.filter((r) => !isRealOk(state.phases[r]));
   if (missing.length) {
+    const describe = (m) => `\`${m}\`${state.phases[m]?.dryRun ? ' (recorded as a --dry-run only)' : ''}`;
     fail(
-      `phase \`${phase}\` cannot run: ${missing.map((m) => `\`${m}\``).join(', ')} `
+      `phase \`${phase}\` cannot run: ${missing.map(describe).join(', ')} `
       + `${missing.length > 1 ? 'are' : 'is'} not recorded ok in ${statePath(state.version)}.\n`
       + `Run the missing phase(s) first, or \`node scripts/release.mjs report --version ${state.version}\` to see where the run stands.`,
     );
@@ -347,6 +354,43 @@ async function phaseReview(state, flags) {
 }
 
 // ── phase: prepare ───────────────────────────────────────────────────────────
+// Everything a release run writes (here, or in preflight's telemetry redeploy)
+// or gates on. turbollm/src/webdist is deliberately absent: it is gitignored —
+// it reaches npm through package.json `files`, and naming it here would make
+// `git add` fatal.
+export const PREPARE_PATHS = [
+  'README.md',
+  'telemetry-worker/deployed.schema.sha256',
+  'turbollm/CHANGELOG.md',
+  'turbollm/README.md',
+  'turbollm/package-lock.json',
+  'turbollm/package.json',
+  'turbollm/web/src/lib/personas.ts',
+  'wrapper/package-lock.json',
+  'wrapper/package.json',
+];
+
+// Both halves come from git's own pathspec matching, so what is reported is
+// exactly what `git add -- <release>` stages.
+export function splitDirtyPaths(gitRun = git, paths = PREPARE_PATHS) {
+  const listed = (scope) => {
+    const lines = (r, what) => {
+      if (r.code !== 0) fail(`\`git ${what}\` failed while working out what to stage:\n${r.out}`);
+      return r.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    };
+    return new Set([
+      ...lines(gitRun('diff', '--name-only', 'HEAD', ...scope), 'diff --name-only HEAD'),
+      ...lines(gitRun('ls-files', '--others', '--exclude-standard', ...scope), 'ls-files --others'),
+    ]);
+  };
+  const release = listed(['--', ...paths]);
+  const all = listed([]);
+  return {
+    release: [...release].sort(),
+    unrelated: [...all].filter((p) => !release.has(p)).sort(),
+  };
+}
+
 async function phasePrepare(state, flags) {
   const version = state.version;
   const out = [];
@@ -406,19 +450,23 @@ async function phasePrepare(state, flags) {
     note('web bundle built');
   }
 
-  // commit + push
-  const dirty = mustGit('status', '--porcelain').stdout;
-  if (!dirty) {
-    note('nothing to commit — prepare is already applied (idempotent re-run)');
+  // commit + push — only the release's own paths
+  const { release, unrelated } = splitDirtyPaths();
+  if (unrelated.length) {
+    warnLine(`left alone (not this release's to commit): ${unrelated.join(', ')}`);
+    out.push(`WARN left alone: ${unrelated.join(', ')}`);
+  }
+  if (!release.length) {
+    note('nothing release-related to commit — prepare is already applied (idempotent re-run)');
   } else if (flags['dry-run']) {
-    note(`[dry-run] would commit + push:\n${dirty}`);
+    note(`[dry-run] would commit + push:\n${release.join('\n')}`);
   } else {
-    mustGit('add', '-A');
+    mustGit('add', '--', ...release);
     // No Co-Authored-By / AI attribution, ever (CLAUDE.md hard rule 1).
     const subject = `chore(release): v${version}${flags.summary ? ` — ${flags.summary}` : ''}`;
     mustGit('commit', '-m', subject);
     mustGit('push');
-    note(`committed + pushed \`${subject}\``);
+    note(`committed + pushed \`${subject}\` (${release.join(', ')})`);
   }
 
   return out.join('\n');
@@ -486,6 +534,33 @@ async function waitForRun(runId, timeoutMs) {
 }
 
 // ── phase: merge (gated) ─────────────────────────────────────────────────────
+// Runs AFTER the irreversible merge, so it must survive a dirty tree: `git pull`
+// rebases here and refuses any dirty tree outright, even one holding only a
+// parallel session's edits, which left v1.13.6's run half-done.
+export function syncMainFastForward(gitRun = git) {
+  const out = [];
+  const co = gitRun('checkout', 'main');
+  if (co.code !== 0) fail(`could not check out \`main\` after the merge:\n${co.out}`);
+  out.push('checked out main');
+
+  const fetched = gitRun('fetch', 'origin', 'main');
+  if (fetched.code !== 0) fail(`\`git fetch origin main\` failed after the merge:\n${fetched.out}`);
+  out.push('fetched origin/main');
+
+  const ff = gitRun('merge', '--ff-only', 'origin/main');
+  if (ff.code !== 0) {
+    fail(
+      'local `main` could not be fast-forwarded to `origin/main`.\n'
+      + 'The PR itself already merged — only this local sync failed, so nothing is lost.\n'
+      + 'Local main has commits origin does not, or the working tree conflicts with the incoming changes.\n'
+      + 'Sort it out by hand (`git log origin/main..main`, `git status`), then re-run with --resume.\n'
+      + `Do not discard anyone else's uncommitted work to make this pass.\n${ff.out}`,
+    );
+  }
+  out.push('fast-forwarded main to origin/main');
+  return out;
+}
+
 async function phaseMerge(state, flags) {
   requireApproval(flags, 'merging the release PR to main');
   if (!state.notes.reviewVerdict) fail('no Opus review verdict recorded — run the `review` phase first.');
@@ -511,8 +586,7 @@ async function phaseMerge(state, flags) {
   out.push(`merged PR #${pr}`);
   okLine(`merged PR #${pr}`);
 
-  mustGit('checkout', 'main');
-  mustGit('pull');
+  out.push(...syncMainFastForward());
   const del = git('branch', '-d', branch);
   out.push(del.code === 0 ? `deleted local ${branch}` : `local ${branch}: ${del.out}`);
   const delRemote = git('push', 'origin', '--delete', branch);
@@ -772,6 +846,23 @@ async function waitForDesktopAssets(tag, timeoutMs) {
 // the real Play Console the moment they run — same bar as npm publish.
 const ANDROID_DIR = () => join(REPO, 'TurboLLM Android');
 const GRADLEW = WIN ? 'gradlew.bat' : './gradlew';
+const VULKAN_ENGINE_REL = join('composeApp', 'src', 'androidMain', 'jniLibs', 'arm64-v8a', 'libllama_server_vk.so');
+
+// ADR-432: `build-vulkan-engine.sh`/`stage-vulkan-engine.sh` build the
+// dynamic-backend engine, which killed the CPU engine on a real device and
+// copies nothing into the app — so nothing here builds the engine, and a
+// missing .so is a hard stop rather than a warning that ships CPU-only.
+export function androidEngineProblem({ vulkanRequested, enginePresent, enginePath }) {
+  if (!vulkanRequested || enginePresent) return null;
+  return (
+    `the Vulkan engine is not staged — ${enginePath} does not exist.\n`
+    + 'Shipping now would send a CPU-only build to alpha + beta, to real testers.\n'
+    + 'This script cannot build it: it is a static AArch64 cross-build that needs WSL2/Linux.\n'
+    + '  bash "TurboLLM Android/scripts/build-static-engine.sh"\n'
+    + `(it builds the engine and copies it to ${enginePath} itself), then re-run this phase.\n`
+    + 'To ship CPU-only on purpose, pass --skip-vulkan-engine.'
+  );
+}
 
 async function phaseAndroid(state, flags) {
   const dir = ANDROID_DIR();
@@ -787,34 +878,23 @@ async function phaseAndroid(state, flags) {
     return `skipped: ${GRADLEW} not present`;
   }
 
-  if (!flags['dry-run']) {
-    requireApproval(flags, 'publishing the Android app to Play Console (internal + alpha + beta, real users)');
-  }
-
   const vulkan = !flags['skip-vulkan-engine'];
   const vulkanFlag = vulkan ? ['-PturbollmVulkanEngine=true'] : [];
 
-  // 1. Vulkan engine — only buildable inside WSL2/Linux (docs/RELEASE.md
-  //    Android §2). A founder running this from plain Windows PowerShell is
-  //    a real, expected case — warn and ship CPU-only rather than fail, same
-  //    as the runbook's own guidance.
-  if (vulkan) {
-    if (WIN) {
-      warnLine(
-        'Windows host — the Vulkan engine step needs WSL2. Run `bash "TurboLLM Android/scripts/build-vulkan-engine.sh"` '
-        + 'and `stage-vulkan-engine.sh` there first, or pass --skip-vulkan-engine to ship CPU-only on purpose.',
-      );
-      out.push('WARN vulkan engine not built from this host — ships whatever .so (if any) is already staged, or CPU-only');
-    } else if (flags['dry-run']) {
-      note('[dry-run] would build + stage the Vulkan engine');
-    } else {
-      step('building + staging the Vulkan engine (WSL2/Linux)…');
-      mustRun('bash', [join(dir, 'scripts', 'build-vulkan-engine.sh')], { cwd: dir });
-      mustRun('bash', [join(dir, 'scripts', 'stage-vulkan-engine.sh')], { cwd: dir });
-      note('Vulkan engine built + staged');
-    }
-  } else {
-    note('--skip-vulkan-engine passed — building CPU-only on purpose');
+  // 1. Vulkan engine — checked, never built. Before anything reaches gradle.
+  const enginePath = join(dir, VULKAN_ENGINE_REL);
+  const problem = androidEngineProblem({
+    vulkanRequested: vulkan,
+    enginePresent: existsSync(enginePath),
+    enginePath,
+  });
+  if (problem) fail(problem);
+  note(vulkan
+    ? `Vulkan engine staged: ${enginePath.replace(REPO, '.')}`
+    : '--skip-vulkan-engine passed — building CPU-only on purpose');
+
+  if (!flags['dry-run']) {
+    requireApproval(flags, 'publishing the Android app to Play Console (internal + alpha + beta, real users)');
   }
 
   if (flags['dry-run']) {
@@ -924,12 +1004,13 @@ function phaseReport(state) {
   for (const p of PHASES) {
     const rec = state.phases[p.name];
     const status = rec?.status;
-    const mark = status ? (icon[status] || '?') : dim('⬜');
+    const preview = status === 'ok' && rec.dryRun;
+    const mark = preview ? yellow('⏭️') : (status ? (icon[status] || '?') : dim('⬜'));
     const when = rec?.finishedAt ? dim(` ${rec.finishedAt}`) : '';
     const req = p.mandatory ? '' : dim(' (optional)');
-    log(`  ${mark} ${p.name.padEnd(11)}${req}${when}`);
+    log(`  ${mark} ${p.name.padEnd(11)}${req}${preview ? yellow(' [dry-run only]') : ''}${when}`);
     if (rec?.tail) for (const l of String(rec.tail).split('\n').slice(-4)) log(dim(`        ${l}`));
-    if (p.mandatory && status !== 'ok') missing.push(`${p.name} (${status || 'never ran'})`);
+    if (p.mandatory && !isRealOk(rec)) missing.push(`${p.name} (${preview ? 'dry-run only' : status || 'never ran'})`);
   }
   log('');
   if (state.notes.pr) log(dim(`  PR: #${state.notes.pr}`));
@@ -967,7 +1048,7 @@ Phases, in order:
   verify       gh pr checks, with the one-shot rerun on a runner-acquisition failure
   merge        gh pr merge --admin · delete the branch · poll the post-merge main run   [--approved]
   publish      tag · gh release create · wait for npm-publish.yml (OIDC) or fall back to token · poll npm view · check CI installers  [--approved]
-  android      optional: TurboLLM Android/ — Vulkan build (WSL2) · bundleRelease · publish internal → promote alpha+beta · sync listing  [--approved]
+  android      optional: TurboLLM Android/ — Vulkan engine staged (built in WSL2, not here) · bundleRelease · publish internal → promote alpha+beta · sync listing  [--approved]
   announce     Discord post — --dry-run by default, posting needs --approved
   docs-drain   validate docs/CHANGELOG.md top == this version and TODO.md is drained
   report       print the receipt; exits non-zero if a mandatory phase never completed
@@ -978,7 +1059,7 @@ Options:
   --dry-run         do everything read-only that can be; print what would happen for the rest
   --pr <N>          the release PR number (otherwise resolved from the current branch)
   --verdict "…"     review only: the recorded review outcome
-  --skip-vulkan-engine   android only: ship CPU-only on purpose instead of building the WSL2 Vulkan engine
+  --skip-vulkan-engine   android only: ship CPU-only on purpose instead of requiring the staged WSL2 Vulkan engine
   --summary "…"     prepare only: the one-line summary in the release commit message
   --skip-desktop    publish only: warn instead of failing when CI installers are missing
   --resume          re-run a phase already recorded ok (otherwise it is reported and skipped)
@@ -1034,7 +1115,7 @@ async function main() {
 
   if (phase === 'report') return phaseReport(state);
 
-  if (state.phases[phase]?.status === 'ok' && !flags.resume) {
+  if (alreadyRecordedOk(state.phases[phase], flags)) {
     okLine(`phase \`${phase}\` is already recorded ok for v${version} — nothing to do (pass --resume to force a re-run).`);
     return 0;
   }
@@ -1054,11 +1135,22 @@ async function main() {
   }
 }
 
-main().then(
-  (code) => process.exit(code ?? 0),
-  (err) => {
-    log('');
-    log(red(err instanceof ReleaseError ? `✖ ${err.message}` : `✖ ${err.stack || err.message}`));
-    process.exit(1);
-  },
-);
+export function isCliEntry(moduleUrl, argv1) {
+  if (!argv1) return false;
+  try {
+    return moduleUrl === pathToFileURL(argv1).href;
+  } catch {
+    return false;
+  }
+}
+
+if (isCliEntry(import.meta.url, process.argv[1])) {
+  main().then(
+    (code) => process.exit(code ?? 0),
+    (err) => {
+      log('');
+      log(red(err instanceof ReleaseError ? `✖ ${err.message}` : `✖ ${err.stack || err.message}`));
+      process.exit(1);
+    },
+  );
+}
