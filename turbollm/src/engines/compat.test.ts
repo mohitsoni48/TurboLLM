@@ -1,5 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { homedir } from 'node:os'
 import { engineAcceptsFormat, engineModelAlias, engineRejectsAudioModel, ENGINE_MODEL_ALIAS } from './compat'
 import { vllmServerCommand, vllmServeBlocker, classifyVllmBlocker } from './vllm'
 import { mlxServerCommand, mlxSamplingArgs } from './mlx'
@@ -74,9 +75,22 @@ test('vllmServerCommand serves under the shared default_model alias', () => {
   assert.equal(args[i + 1], ENGINE_MODEL_ALIAS)
 })
 
-test('classifyVllmBlocker: Windows and macOS report an unsupported platform (ADR-080)', () => {
+test('classifyVllmBlocker: Windows reports an unsupported platform (ADR-080)', () => {
   assert.match(classifyVllmBlocker('win32', new Error('boom')), /vLLM cannot run on Windows/)
-  assert.match(classifyVllmBlocker('darwin', new Error('boom')), /vLLM cannot run on macOS/)
+})
+
+test('classifyVllmBlocker: macOS reports a broken environment — uvloop ships macOS wheels', () => {
+  const msg = classifyVllmBlocker('darwin', new Error('ModuleNotFoundError: no module named uvloop'))
+  assert.doesNotMatch(msg, /cannot run on/i)
+  assert.match(msg, /macOS is a supported platform/)
+  assert.match(msg, /reinstall/i)
+})
+
+test('classifyVllmBlocker: an unverified platform is never claimed as supported', () => {
+  const msg = classifyVllmBlocker('freebsd', new Error('ModuleNotFoundError: no module named uvloop'))
+  assert.doesNotMatch(msg, /supported platform/i)
+  assert.match(msg, /unverified/i)
+  assert.match(msg, /reinstall/i)
 })
 
 test('classifyVllmBlocker: Linux reports a broken environment, never "no Linux build" (regression)', () => {
@@ -93,13 +107,55 @@ test('classifyVllmBlocker: a missing interpreter (ENOENT) is a broken install, n
   assert.match(classifyVllmBlocker('linux', enoent), /interpreter not found/i)
 })
 
+test('classifyVllmBlocker: CRLF stderr yields a clean last line, with no stray carriage return', () => {
+  const stderr = 'Traceback (most recent call last):\r\n  File "<string>", line 1\r\n    ImportError: libcuda.so.1  \r\n\r\n'
+  const msg = classifyVllmBlocker('linux', Object.assign(new Error('exit 1'), { stderr }))
+  assert.match(msg, /uvloop failed to import: ImportError: libcuda\.so\.1\)/)
+  assert.doesNotMatch(msg, /\r/)
+})
+
+test('classifyVllmBlocker: a huge stderr line is capped so it cannot bloat the UI message', () => {
+  const stderr = `ImportError: ${'x'.repeat(5000)}`
+  const msg = classifyVllmBlocker('linux', Object.assign(new Error('exit 1'), { stderr }))
+  const detail = msg.slice(msg.indexOf('uvloop failed to import: '), msg.indexOf(')'))
+  assert.ok(detail.length < 300, `detail was ${detail.length} chars`)
+  assert.match(msg, /…\)/)
+})
+
+test('classifyVllmBlocker: the home directory is redacted out of the detail', () => {
+  const home = homedir()
+  const slashed = home.split('\\').join('/')
+  const backslashed = home.split('/').join('\\')
+  const stderr = `ImportError: ${slashed}/.turbollm/engines/vllm and ${backslashed}\\venv`
+  const msg = classifyVllmBlocker('linux', Object.assign(new Error('exit 1'), { stderr }))
+  assert.ok(!msg.includes(slashed), 'forward-slash home leaked')
+  assert.ok(!msg.includes(backslashed), 'backslash home leaked')
+  assert.match(msg, /~/)
+})
+
+test('classifyVllmBlocker: a container with HOME=/ does not have every slash rewritten to ~', () => {
+  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE }
+  process.env.HOME = '/'
+  process.env.USERPROFILE = '/'
+  try {
+    const stderr = 'ImportError: /usr/lib/x86_64-linux-gnu/libcuda.so.1: cannot open shared object file'
+    const msg = classifyVllmBlocker('linux', Object.assign(new Error('exit 1'), { stderr }))
+    assert.match(msg, /\/usr\/lib\/x86_64-linux-gnu\/libcuda\.so\.1/)
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+})
+
 test('vllmServeBlocker returns a clear message when the runtime cannot serve (ADR-080)', async () => {
   // A bogus interpreter path can't import uvloop → the preflight reports a blocker.
-  // On Windows/macOS that's framed as an unsupported platform; elsewhere (Linux) it must
-  // NOT claim "cannot run on Linux" since uvloop is fully supported there.
+  // Only Windows frames that as an unsupported platform; elsewhere (Linux, macOS) it must
+  // NOT claim "cannot run on <plat>" since uvloop ships wheels for both.
   const msg = await vllmServeBlocker(process.platform === 'win32' ? 'C:/no/such/python.exe' : '/no/such/python')
   assert.ok(msg)
-  if (process.platform === 'win32' || process.platform === 'darwin') {
+  if (process.platform === 'win32') {
     assert.match(msg!, /cannot run on/i)
   } else {
     assert.doesNotMatch(msg!, /cannot run on/i)
