@@ -90,6 +90,7 @@ import {
 import { AddEngineDialog } from './engines/AddEngineDialog'
 import { BuildGuideDialog } from './engines/BuildGuideDialog'
 import { deleteTargetFor, type DeleteTarget } from '../lib/engine-delete-target'
+import { branchLabel, defaultBuildName } from '../lib/engine-build-name'
 import { CustomBuildDialog } from './engines/CustomBuildDialog'
 import { EngineStatusHeader } from './engines/EngineStatusHeader'
 import { EngineLogPanel } from './engines/EngineLogPanel'
@@ -412,20 +413,6 @@ const OS_SHORT: Record<string, string> = { win32: 'Win', linux: 'Linux', darwin:
 function osLabel(platforms: string[]): string {
   return platforms.map((p) => OS_SHORT[p] ?? p).join(' · ')
 }
-
-/** Default engine name for a fresh build-from-source run. Official llama.cpp repos
- *  get the `Llama-<Branch>` convention; forks get `<EngineName>-<Branch>`. */
-function defaultBuildName(catalog: CatalogEngine | undefined, branch: string): string {
-  const b = branch.trim()
-  const officialLlama = ['llama.cpp', 'llama.cpp-cuda-linux', 'llama.cpp-android-source', 'llama.cpp-source'].includes(
-    catalog?.id ?? '',
-  )
-  const base = officialLlama ? 'Llama' : (catalog?.name ?? 'engine')
-  return b ? `${base}-${b}` : base
-}
-
-/** A blank branch means "the repo's own default", which the user should see spelled out. */
-const branchLabel = (branch: string): string => branch || '(repo default)'
 
 /**
  * Engines screen. Three calm zones:
@@ -1219,12 +1206,13 @@ function EngineCard({
   const [branchesWanted, setBranchesWanted] = useState(false)
   const branchesQ = useGitBranches(catalog?.homepage, buildYourself && branchesWanted)
   const [searchQuery, setSearchQuery] = useState('')
-  // Fallback list when the lookup fails (offline, rate-limited): the entry's OWN default branch,
-  // not a hardcoded 'main'. The list must always contain `selectedBranch` (the default until the
-  // user picks something else): a <select> whose value matches no option DISPLAYS its first option
-  // while the state holds another, which is how a hardcoded ['main'] rendered as 'main' for every
-  // engine, and how a lookup failure after the user picked a branch would do the same.
-  const allBranches = branchesQ.data?.branches ?? [selectedBranch]
+  // The list must always contain `selectedBranch` (the default until the user picks something else,
+  // possibly blank = the repo default): a <select> whose value matches no option DISPLAYS its first
+  // option while the state holds another. That is how a hardcoded ['main'] rendered as 'main' for
+  // every engine, and how a lookup that fails or omits the selected branch would do the same. The
+  // lookup failing (offline, rate-limited) leaves just the selected branch.
+  const fetchedBranches = branchesQ.data?.branches ?? []
+  const allBranches = fetchedBranches.includes(selectedBranch) ? fetchedBranches : [selectedBranch, ...fetchedBranches]
   const totalBranches = branchesQ.data?.total ?? allBranches.length
   const branchError = branchesQ.error
   // Keyed off the daemon's error CODE, not a bare 403: a 403 is also a plain permission failure,
