@@ -256,12 +256,18 @@ export const INDEPENDENT_PATHS = ['signup-worker/'];
 // `run()` trims stdout, which eats the leading space of the FIRST porcelain
 // line (" M x" → "M x"), so the status column is matched loosely rather than
 // sliced at a fixed offset. A rename lists two paths; both must be independent.
+// A gate fails closed: a line this cannot parse blocks, it is never skipped.
 export function splitPreflightDirty(porcelain, independent = INDEPENDENT_PATHS) {
   const blocking = [];
   const tolerated = [];
   for (const raw of String(porcelain).split(/\r?\n/)) {
-    const m = /^[ MADRCU?!]{1,2}\s+(.+)$/.exec(raw.trimEnd());
-    if (!m) continue;
+    const line = raw.trimEnd();
+    if (!line) continue;
+    const m = /^[ MTADRCU?!]{1,2}\s+(.+)$/.exec(line);
+    if (!m) {
+      blocking.push(line);
+      continue;
+    }
     const entry = m[1];
     const paths = entry.split(' -> ').map((p) => p.replace(/^"|"$/g, ''));
     const allIndependent = paths.every((p) => independent.some((d) => p.startsWith(d)));

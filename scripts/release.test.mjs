@@ -152,6 +152,14 @@ test('preflight: an empty status is clean, and a look-alike directory name is no
   assert.deepEqual(blocking, ['signup-worker-old/a.ts', 'signup-workerX/b.ts']);
 });
 
+test('preflight fails closed: a file-type change or a line it cannot parse blocks instead of reading as clean', () => {
+  // ` T` (a file that became a symlink or back) is a real porcelain status a release must not ignore
+  assert.deepEqual(splitPreflightDirty(' T turbollm/src/api/routes.ts'), { blocking: ['turbollm/src/api/routes.ts'], tolerated: [] });
+  assert.deepEqual(splitPreflightDirty('T  turbollm/src/api/routes.ts').blocking, ['turbollm/src/api/routes.ts']);
+  // git printing something this parser does not know about must never be dropped on the floor
+  assert.deepEqual(splitPreflightDirty('warning: something odd'), { blocking: ['warning: something odd'], tolerated: [] });
+});
+
 test('preflight: a rename that crosses out of an independent directory still blocks', () => {
   const { blocking, tolerated } = splitPreflightDirty('R  signup-worker/a.ts -> turbollm/src/a.ts\nR  signup-worker/b.ts -> signup-worker/c.ts');
   assert.deepEqual(blocking, ['signup-worker/a.ts -> turbollm/src/a.ts']);
