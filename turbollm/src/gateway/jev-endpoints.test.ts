@@ -4,9 +4,15 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Hono } from 'hono'
+import type { Deps } from '../deps'
+import { lastLocalActivityMs, resetLocalActivity } from '../link/host-idle'
 import { DEFAULT_HYPOTHESIS_TEMPLATE, JevShapeError, type JevInfo } from '../models/jev'
+import type { ModelEntry } from '../models/scanner'
+import type { GatewayV1Options } from './gateway'
+import type { RouteResult } from './model-router'
 import {
   callEngineClassify,
+  handleJevRequest,
   JevEndpointError,
   jevEndpointFor,
   jevErrorResponse,
@@ -548,4 +554,206 @@ test('toRerankResponse: equal scores keep the documents\' input order', () => {
     const response = toRerankResponse(OPENJEV, franceRerank(), rows, F3_FRANCE.usage)
     assert.deepEqual(response.results.map((r) => r.index), [0, 1, 2])
   }
+})
+
+const OPENJEV_ENTRY = { ...OPENJEV } as unknown as ModelEntry
+const CHAT_ENTRY = { key: 'qwen3.6-35b-a3b-q3', name: 'Qwen3.6-35B Q3' } as unknown as ModelEntry
+const TEMPLATELESS_ENTRY = {
+  key: 'nli-no-template',
+  name: 'nli no template',
+  jev: openJevInfo({ nliTemplate: null }),
+} as unknown as ModelEntry
+const LINKED_ID = 'Rig/qwen3.5 4b nli v2'
+
+interface HarnessSetup {
+  origin?: GatewayV1Options['origin']
+  route?: RouteResult
+  reply?: () => Response
+}
+
+interface Harness {
+  app: Hono
+  routed: ModelEntry[]
+  resolvedLocally: string[]
+  engineCalls: EngineCall[]
+}
+
+/** handleJevRequest behind a Hono app, with a router double that records what it was asked and a
+ *  generation gate that must never be touched. Nothing binds a port; the engine is a fetch double. */
+function jevHarness(setup: HarnessSetup = {}): Harness {
+  const entries = [OPENJEV_ENTRY, CHAT_ENTRY, TEMPLATELESS_ENTRY]
+  const routed: ModelEntry[] = []
+  const resolvedLocally: string[] = []
+  const engine = recordingEngine(setup.reply ?? jsonReply(F2_KITCHEN))
+  const d = {
+    modelRouter: {
+      route: () => { throw new Error('handleJevRequest must never call route()') },
+      resolveRemoteTarget: (id: string) => (id === LINKED_ID ? { target: 'https://rig.invalid' } : undefined),
+      resolveLocal: (id: string) => {
+        resolvedLocally.push(id)
+        return entries.find((e) => e.key === id || e.name === id)
+      },
+      routeTo: async (entry: ModelEntry) => {
+        routed.push(entry)
+        return setup.route ?? { target: ENGINE_TARGET }
+      },
+    },
+    gate: { acquire: () => { throw new Error('classification must never queue on the generation gate') } },
+  } as unknown as Deps
+  const opts: GatewayV1Options = { origin: setup.origin }
+  const app = new Hono()
+  app.post('/v1/classify', (c) => handleJevRequest(c, d, 'classify', opts, engine.fetchImpl))
+  app.post('/v1/rerank', (c) => handleJevRequest(c, d, 'rerank', opts, engine.fetchImpl))
+  return { app, routed, resolvedLocally, engineCalls: engine.calls }
+}
+
+function postText(app: Hono, path: string, text: string): Promise<Response> {
+  return Promise.resolve(app.request(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: text }))
+}
+
+function postJson(app: Hono, path: string, body: unknown): Promise<Response> {
+  return postText(app, path, JSON.stringify(body))
+}
+
+async function assertRefused(res: Response, expected: JevHttpError): Promise<void> {
+  assert.equal(res.status, expected.status)
+  assert.deepEqual(await res.json(), { error: { message: expected.message, type: expected.type, code: expected.code } })
+}
+
+function engineInputsSent(harness: Harness): string[] {
+  assert.equal(harness.engineCalls.length, 1, 'exactly one engine call per request')
+  return (JSON.parse(String(harness.engineCalls[0].init.body)) as { input: string[] }).input
+}
+
+const LINK_CLASSIFY_UNSUPPORTED: JevHttpError = {
+  status: 400,
+  code: 'link_classify_unsupported',
+  type: 'invalid_request_error',
+  message: 'Turbo Link does not carry /v1/classify or /v1/rerank — call the machine that has the model.',
+}
+
+test('handleJevRequest step 1: a Turbo Link peer is refused before anything is read or routed', async () => {
+  resetLocalActivity()
+  const harness = jevHarness({ origin: 'link' })
+
+  await assertRefused(await postJson(harness.app, '/v1/classify', classifyBody()), LINK_CLASSIFY_UNSUPPORTED)
+
+  assert.deepEqual(harness.resolvedLocally, [])
+  assert.deepEqual(harness.routed, [])
+  assert.equal(harness.engineCalls.length, 0)
+  assert.equal(lastLocalActivityMs(), null, 'a peer request never counts as the owner using the machine')
+})
+
+test('handleJevRequest step 2: a body that is not JSON → 400 invalid_request', async () => {
+  const harness = jevHarness()
+  const notJson = invalidRequest('Request body must be a JSON object.')
+  await assertRefused(await postText(harness.app, '/v1/classify', '{"model": '), notJson)
+  assert.deepEqual(harness.resolvedLocally, [])
+})
+
+test('handleJevRequest step 3: a body that fails validation → that exact error, nothing resolved', async () => {
+  const harness = jevHarness()
+  await assertRefused(await postJson(harness.app, '/v1/rerank', rerankBody({ documents: [] })), BAD_DOCUMENTS)
+  assert.deepEqual(harness.resolvedLocally, [])
+})
+
+test('handleJevRequest step 4: a Turbo Link model id → 400 link_classify_unsupported, never resolved locally', async () => {
+  const harness = jevHarness()
+  await assertRefused(await postJson(harness.app, '/v1/rerank', rerankBody({ model: LINKED_ID })), LINK_CLASSIFY_UNSUPPORTED)
+  assert.deepEqual(harness.resolvedLocally, [])
+  assert.deepEqual(harness.routed, [])
+})
+
+test('handleJevRequest step 5: no local model by that name → 404 model_not_found', async () => {
+  const harness = jevHarness()
+  await assertRefused(await postJson(harness.app, '/v1/classify', classifyBody({ model: 'nope' })), {
+    status: 404, code: 'model_not_found', type: 'invalid_request_error', message: "No local model matches 'nope'.",
+  })
+  assert.deepEqual(harness.routed, [])
+})
+
+test('handleJevRequest step 6: a model that is not a Jev model → 400 not_a_jev_model, nothing loaded', async () => {
+  const harness = jevHarness()
+  await assertRefused(await postJson(harness.app, '/v1/classify', classifyBody({ model: CHAT_ENTRY.key })), {
+    status: 400,
+    code: 'not_a_jev_model',
+    type: 'invalid_request_error',
+    message: "'Qwen3.6-35B Q3' is not a Jev model — /v1/classify and /v1/rerank need a model whose config.json " +
+      'declares an NLI head (contradiction / entailment / neutral).',
+  })
+  assert.deepEqual(harness.routed, [])
+})
+
+test('handleJevRequest step 7: a Jev model without nli_template → 400 jev_template_missing, nothing loaded', async () => {
+  resetLocalActivity()
+  const harness = jevHarness()
+  const res = await postJson(harness.app, '/v1/classify', classifyBody({ model: TEMPLATELESS_ENTRY.name }))
+  assert.equal(res.status, 400)
+  assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'jev_template_missing')
+  assert.deepEqual(harness.routed, [])
+  assert.equal(lastLocalActivityMs(), null, 'a refused request is not activity')
+})
+
+test('handleJevRequest step 9: the router cannot produce a target → 503 model_not_loaded with its message', async () => {
+  const notLoaded = "'qwen3.5 4b nli v2' is not loaded. Load it from Models, or turn on auto-swap."
+  const harness = jevHarness({ route: { status: 503, message: notLoaded } })
+  await assertRefused(await postJson(harness.app, '/v1/classify', classifyBody()), {
+    status: 503, code: 'model_not_loaded', type: 'api_error', message: notLoaded,
+  })
+  assert.deepEqual(harness.routed, [OPENJEV_ENTRY], 'routed to exactly the named model')
+  assert.equal(harness.engineCalls.length, 0)
+})
+
+test('handleJevRequest step 10: an engine refusal passes through as its JevHttpError', async () => {
+  const harness = jevHarness({ reply: jsonReply({ error: { message: 'bad' } }, 422) })
+  await assertRefused(await postJson(harness.app, '/v1/classify', classifyBody()), {
+    status: 400, code: 'engine_rejected', type: 'invalid_request_error', message: 'bad',
+  })
+})
+
+test('handleJevRequest step 10: probs of the wrong shape (JevShapeError) → 502 engine_bad_response', async () => {
+  const wrongShape = withRows(kitchenRowsWith(0, { probs: [0.957, 0.043] }))
+  const harness = jevHarness({ reply: jsonReply(wrongShape) })
+  await assertRefused(await postJson(harness.app, '/v1/classify', classifyBody()), BAD_ENGINE_RESPONSE)
+})
+
+test('handleJevRequest: classify on the F1 model + F2 → 200 with the F7 body, one batched engine call', async () => {
+  resetLocalActivity()
+  const harness = jevHarness()
+
+  const res = await postJson(harness.app, '/v1/classify', classifyBody({ model: MODEL_NAME }))
+
+  assert.equal(res.status, 200)
+  assert.deepEqual(await res.json(), F7_CLASSIFY)
+  assert.deepEqual(harness.routed, [OPENJEV_ENTRY])
+  assert.deepEqual(engineInputsSent(harness), [
+    `Premise: ${KITCHEN_PREMISE}\nHypothesis: Someone is preparing food.`,
+    `Premise: ${KITCHEN_PREMISE}\nHypothesis: The kitchen is empty and silent.`,
+    `Premise: ${KITCHEN_PREMISE}\nHypothesis: The chef is wearing a blue apron.`,
+  ])
+  assert.equal(harness.engineCalls[0].url, 'http://engine.local/classify')
+  assert.ok(harness.engineCalls[0].init.signal instanceof AbortSignal, 'the client-abort signal reaches the engine')
+  assert.notEqual(lastLocalActivityMs(), null, 'a local classify counts as the owner using the machine')
+})
+
+test('handleJevRequest: rerank France + F3 → sorted F7 body, engine inputs built with the default template', async () => {
+  const harness = jevHarness({ reply: jsonReply(F3_FRANCE) })
+
+  const res = await postJson(harness.app, '/v1/rerank', rerankBody())
+
+  assert.equal(res.status, 200)
+  assert.deepEqual(await res.json(), F7_RERANK)
+  assert.deepEqual(engineInputsSent(harness), [
+    `Premise: ${FRANCE_QUERY}\nHypothesis: The correct answer is: Berlin`,
+    `Premise: ${FRANCE_QUERY}\nHypothesis: The correct answer is: Paris`,
+    `Premise: ${FRANCE_QUERY}\nHypothesis: The correct answer is: Madrid`,
+  ])
+})
+
+test('handleJevRequest: rerank with hypothesis_template "Answer: {}" builds the engine inputs with it', async () => {
+  const harness = jevHarness({ reply: jsonReply(F3_FRANCE) })
+
+  await postJson(harness.app, '/v1/rerank', rerankBody({ hypothesis_template: 'Answer: {}' }))
+
+  assert.deepEqual(engineInputsSent(harness), CITIES.map((city) => `Premise: ${FRANCE_QUERY}\nHypothesis: Answer: ${city}`))
 })

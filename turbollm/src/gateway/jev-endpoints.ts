@@ -4,15 +4,21 @@
 // registration order (ADR-421, divergence row 7). User strings are validated, never trimmed.
 import type { Context } from 'hono'
 import type { ContentfulStatusCode } from 'hono/utils/http-status'
+import type { Deps } from '../deps'
 import { ENGINE_MODEL_ALIAS } from '../engines/compat'
+import { noteLocalActivity } from '../link/host-idle'
 import {
+  buildNliInput,
   DEFAULT_HYPOTHESIS_TEMPLATE,
+  fillHypothesisTemplate,
+  JevShapeError,
   mapProbs,
   validateHypothesisTemplate,
   type JevInfo,
   type JevLabel,
 } from '../models/jev'
-import { describeEngineError } from './gateway'
+import type { ModelEntry } from '../models/scanner'
+import { clientAbort, describeEngineError, type GatewayV1Options } from './gateway'
 
 export type JevEndpoint = 'classify' | 'rerank'
 
@@ -93,6 +99,23 @@ export interface RerankResponse {
 export function jevEndpointFor(method: string, pathname: string): JevEndpoint | null {
   if (method !== 'POST') return null
   return Object.hasOwn(JEV_ENDPOINT_PATHS, pathname) ? JEV_ENDPOINT_PATHS[pathname] : null
+}
+
+/** One /v1/classify or /v1/rerank request: refuse a Turbo Link peer, validate, resolve exactly the
+ *  named local Jev model, route to it (auto-swap may load it), then one batched engine call. It never
+ *  takes the generation gate (classification is not a generation) and writes no request-log or usage
+ *  entry (divergence row 15). */
+export async function handleJevRequest(
+  c: Context,
+  d: Deps,
+  endpoint: JevEndpoint,
+  opts: GatewayV1Options,
+  fetchImpl: typeof fetch = fetch,
+): Promise<Response> {
+  if (opts.origin === 'link') return jevErrorResponse(c, LINK_CLASSIFY_UNSUPPORTED)
+  return endpoint === 'classify'
+    ? serveJevRequest(c, d, CLASSIFY_ENDPOINT, fetchImpl)
+    : serveJevRequest(c, d, RERANK_ENDPOINT, fetchImpl)
 }
 
 export function parseClassifyBody(raw: unknown): ClassifyInput | JevHttpError {
@@ -188,6 +211,128 @@ export function jevErrorResponse(c: Context, error: JevHttpError): Response {
 const JEV_ENDPOINT_PATHS: Readonly<Record<string, JevEndpoint>> = {
   '/v1/classify': 'classify',
   '/v1/rerank': 'rerank',
+}
+
+/** What the two endpoints do differently; serveJevRequest is everything they share. */
+interface EndpointBehaviour<Input extends { model: string }, Body> {
+  parse: (raw: unknown) => Input | JevHttpError
+  engineInputs: (nliTemplate: string, input: Input) => string[]
+  respond: (model: JevModel, input: Input, engine: EngineClassifyResult) => Body
+}
+
+const CLASSIFY_ENDPOINT: EndpointBehaviour<ClassifyInput, ClassifyResponse> = {
+  parse: parseClassifyBody,
+  engineInputs: (nliTemplate, input) =>
+    input.hypotheses.map((hypothesis) => buildNliInput(nliTemplate, input.premise, hypothesis)),
+  respond: (model, input, engine) => toClassifyResponse(model, input, engine.rows, engine.usage),
+}
+
+/** Each document becomes a hypothesis through the request's template, with the query as premise. */
+const RERANK_ENDPOINT: EndpointBehaviour<RerankInput, RerankResponse> = {
+  parse: parseRerankBody,
+  engineInputs: (nliTemplate, input) => input.documents.map((document) =>
+    buildNliInput(nliTemplate, input.query, fillHypothesisTemplate(input.hypothesisTemplate, document))),
+  respond: (model, input, engine) => toRerankResponse(model, input, engine.rows, engine.usage),
+}
+
+async function serveJevRequest<Input extends { model: string }, Body extends object>(
+  c: Context,
+  d: Deps,
+  endpoint: EndpointBehaviour<Input, Body>,
+  fetchImpl: typeof fetch,
+): Promise<Response> {
+  try {
+    const input = throwIfRefused(endpoint.parse(await jsonBodyOf(c)))
+    const { entry, nliTemplate } = resolveJevModel(d, input.model)
+    noteLocalActivity()
+    const target = await routeToJevModel(d, entry)
+    const inputs = endpoint.engineInputs(nliTemplate, input)
+    const engine = await callEngineClassify(target, inputs, clientAbort(c).signal, fetchImpl)
+    return c.json(endpoint.respond(entry, input, engine))
+  } catch (error) {
+    return jevErrorResponse(c, refusalFor(error))
+  }
+}
+
+/** An unparseable body reads as no body at all, which both parsers refuse as not a JSON object. */
+async function jsonBodyOf(c: Context): Promise<unknown> {
+  try {
+    return await c.req.json()
+  } catch {
+    return undefined
+  }
+}
+
+function throwIfRefused<T>(outcome: T | JevHttpError): T {
+  if (isRefusal(outcome)) throw new JevEndpointError(outcome)
+  return outcome
+}
+
+function isRefusal<T>(outcome: T | JevHttpError): outcome is JevHttpError {
+  return typeof outcome === 'object' && outcome !== null && 'code' in outcome
+}
+
+interface ResolvedJevModel {
+  entry: ModelEntry & JevModel
+  nliTemplate: string
+}
+
+/** Exactly the model the request names — a Turbo Link id is refused (ADR-427's embeddings stance)
+ *  and nothing ever falls back to another local model. */
+function resolveJevModel(d: Deps, requested: string): ResolvedJevModel {
+  if (d.modelRouter.resolveRemoteTarget(requested)) throw new JevEndpointError(LINK_CLASSIFY_UNSUPPORTED)
+  const entry = d.modelRouter.resolveLocal(requested)
+  if (!entry) throw new JevEndpointError(modelNotFound(requested))
+  if (!isJevModel(entry)) throw new JevEndpointError(notAJevModel(entry.name))
+  const nliTemplate = throwIfRefused(nliTemplateFor(entry))
+  return { entry, nliTemplate }
+}
+
+function isJevModel(entry: ModelEntry): entry is ModelEntry & JevModel {
+  return entry.jev !== undefined
+}
+
+/** routeTo, never route(): a model that isn't alive is loaded (auto-swap on) or refused, never
+ *  answered by whatever the primary holds (divergence row 6). */
+async function routeToJevModel(d: Deps, entry: ModelEntry): Promise<string> {
+  const route = await d.modelRouter.routeTo(entry)
+  if ('status' in route) {
+    throw new JevEndpointError({ status: 503, code: 'model_not_loaded', type: 'api_error', message: route.message })
+  }
+  return route.target
+}
+
+/** Any other error is a bug, not a refusal, and propagates. */
+function refusalFor(error: unknown): JevHttpError {
+  if (error instanceof JevEndpointError) return error.http
+  if (error instanceof JevShapeError) return BAD_ENGINE_RESPONSE
+  throw error
+}
+
+const LINK_CLASSIFY_UNSUPPORTED: JevHttpError = {
+  status: 400,
+  code: 'link_classify_unsupported',
+  type: 'invalid_request_error',
+  message: 'Turbo Link does not carry /v1/classify or /v1/rerank — call the machine that has the model.',
+}
+
+function modelNotFound(requested: string): JevHttpError {
+  return {
+    status: 404,
+    code: 'model_not_found',
+    type: 'invalid_request_error',
+    message: `No local model matches '${requested}'.`,
+  }
+}
+
+function notAJevModel(name: string): JevHttpError {
+  return {
+    status: 400,
+    code: 'not_a_jev_model',
+    type: 'invalid_request_error',
+    message: `'${name}' is not a Jev model — /v1/classify and /v1/rerank need a model whose config.json ` +
+      'declares an NLI head (contradiction / entailment / neutral).',
+  }
 }
 
 const NOT_A_JSON_OBJECT = 'Request body must be a JSON object.'
