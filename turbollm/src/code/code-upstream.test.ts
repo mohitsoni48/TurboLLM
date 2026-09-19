@@ -29,6 +29,7 @@ function mkDeps(opts: { localRunning?: boolean; route?: unknown } = {}): Deps {
       currentOpts: () => ({ modelPath: '/models/local.gguf' }),
     },
     registry: { active: () => ({ kind: 'llama-server' }) },
+    scanner: { get: () => undefined },
     modelRouter: { resolveRemoteTarget: () => opts.route },
     remoteCatalog: { modelOn: () => ({ key: REMOTE.modelKey, name: 'Qwen3 35B', nativeCtx: 131072 }) },
   } as unknown as Deps
