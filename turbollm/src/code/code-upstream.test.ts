@@ -96,6 +96,32 @@ test('no requested model is the unchanged local path', () => {
   assert.equal(up.contextWindow, 16384)
 })
 
+test('a Jev model as the local primary fails the Code turn with the jev_model_loaded sentence, not model_not_loaded', () => {
+  // ADR-434 (f), QA gap G5: resolveChatUpstream's 409 reaches Code as its own message, so the
+  // user sees why the turn can't run instead of an opaque engine error.
+  const jevPrimary = {
+    key: 'local-model',
+    name: 'Local Model',
+    jev: {
+      labels: ['contradiction', 'entailment', 'neutral'],
+      nliTemplate: 'Premise: {premise}\nHypothesis: {hypothesis}',
+      architecture: 'Qwen3_5ForSequenceClassification',
+      verified: true,
+    },
+  }
+  const d = { ...mkDeps({ localRunning: true }), scanner: { get: () => jevPrimary } } as unknown as Deps
+
+  assert.throws(() => resolveCodeUpstream(d), (e: unknown) => {
+    assert.ok(e instanceof Error)
+    assert.equal(
+      e.message,
+      'A Jev model is loaded — it labels text and cannot chat. Switch to a chat model, or use the Jev Playground.',
+    )
+    assert.notEqual(e.message, 'model_not_loaded')
+    return true
+  })
+})
+
 test('no requested model and no local engine still throws model_not_loaded', () => {
   assert.throws(() => resolveCodeUpstream(mkDeps({ localRunning: false })), /model_not_loaded/)
 })
