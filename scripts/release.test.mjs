@@ -18,6 +18,7 @@ import {
   isCliEntry,
   splitDirtyPaths,
   splitPreflightDirty,
+  stageReleasePaths,
   syncMainFastForward,
 } from './release.mjs';
 
@@ -171,6 +172,36 @@ test('the tolerated set names only directories no release phase reads', () => {
   for (const p of PREPARE_PATHS) {
     assert.ok(!INDEPENDENT_PATHS.some((d) => p.startsWith(d)), `${p} is release-owned and must never be tolerated`);
   }
+});
+
+// wrapper/ is gitignored in this repo yet its package.json is tracked (force-added). `git add -- <path>`
+// exits 1 for a path inside an ignored directory even when the file is tracked, which killed the first
+// scoped `prepare`; the old `git add -A` never named the path, so it never noticed.
+test('staging stages a tracked release file that sits inside a gitignored directory', () => {
+  const s = sandbox();
+  try {
+    put(s.work, '.gitignore', '/wrapper/\n');
+    put(s.work, 'wrapper/package.json', '{\n  "version": "1.0.0"\n}\n');
+    must(s.g, 'add', '.gitignore');
+    must(s.g, 'add', '-f', 'wrapper/package.json');
+    must(s.g, 'commit', '-m', 'wrapper is ignored but tracked');
+
+    put(s.work, 'turbollm/package.json', '{\n  "version": "1.0.1"\n}\n');
+    put(s.work, 'wrapper/package.json', '{\n  "version": "1.0.1"\n}\n');
+    put(s.work, 'signup-worker/index.ts', 'export const a = 2;\n');
+
+    stageReleasePaths(['turbollm/package.json', 'wrapper/package.json'], s.g);
+
+    const staged = must(s.g, 'diff', '--cached', '--name-only').stdout.split(/\r?\n/).filter(Boolean).sort();
+    assert.deepEqual(staged, ['turbollm/package.json', 'wrapper/package.json']);
+  } finally {
+    cleanup(s.root);
+  }
+});
+
+test('staging reports a real git failure instead of swallowing it', () => {
+  const failing = () => ({ code: 1, stdout: '', stderr: 'fatal: boom', out: 'fatal: boom' });
+  assert.throws(() => stageReleasePaths(['turbollm/package.json'], failing), /boom/);
 });
 
 test('PREPARE_PATHS names the release files and not the gitignored web bundle', () => {

@@ -426,6 +426,14 @@ export function splitDirtyPaths(gitRun = git, paths = PREPARE_PATHS) {
   };
 }
 
+// `-u` (tracked files only) rather than a plain add: wrapper/ is gitignored yet its package.json is
+// tracked, and `git add -- wrapper/package.json` exits 1 for a path inside an ignored directory even
+// then. Every release-owned file is edited in place, never created, so tracked-only is all it needs.
+export function stageReleasePaths(paths, gitRun = git) {
+  const r = gitRun('add', '-u', '--', ...paths);
+  if (r.code !== 0) fail(`\`git add\` failed while staging the release files:\n${r.out}`);
+}
+
 async function phasePrepare(state, flags) {
   const version = state.version;
   const out = [];
@@ -496,7 +504,7 @@ async function phasePrepare(state, flags) {
   } else if (flags['dry-run']) {
     note(`[dry-run] would commit + push:\n${release.join('\n')}`);
   } else {
-    mustGit('add', '--', ...release);
+    stageReleasePaths(release);
     // No Co-Authored-By / AI attribution, ever (CLAUDE.md hard rule 1).
     const subject = `chore(release): v${version}${flags.summary ? ` — ${flags.summary}` : ''}`;
     mustGit('commit', '-m', subject);
