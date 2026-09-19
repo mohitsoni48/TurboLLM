@@ -48,6 +48,16 @@ _Nothing yet._
   while the dropdown kept showing the correct one. It only affected engines whose default isn't
   `main` (Prism, the `master` ones, concedo), and only when the page loaded in that order. The
   default is now worked out fresh each time, and only a branch you pick yourself is remembered.
+  If an engine has no known default branch, no branch is sent at all and git uses the repo's own
+  default, instead of a guessed `main`. Every engine in the catalog was checked against its real
+  repository, and each one's default branch is correct.
+- **An engine you built from its own card wasn't recognised by that card afterwards.** After a
+  successful build (Prism, or ik_llama.cpp after a Rebuild) the engine registered fine, but its card
+  kept offering "Build from source" and couldn't Rebuild, Disable or Delete it. The card only
+  recognised engines that had been recorded with no branch at all. Cards now recognise their engine
+  whether the branch was left blank or recorded as the default, and an engine on any other branch
+  stays its own entry. If you have two builds of the same repo, the card manages the one built on the
+  default branch and the other appears under your custom engines.
 
 ### Discord
 
@@ -55,6 +65,8 @@ _Nothing yet._
   then fail with "name already in use." That's fixed. Rebuild now replaces the old entry.
 - 🔧 **Prism and similar engines:** building some engines could fail instantly with "remote branch
   main not found," even though the right branch was selected on screen. Fixed.
+- 🔧 **Engine cards:** an engine you built from its card (like Prism) is now recognised by that card,
+  so you can Rebuild, Disable or Delete it from there.
 
 ## [1.13.5] - 2026-09-18
 
