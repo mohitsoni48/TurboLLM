@@ -67,6 +67,50 @@ export function flagName(token: string): string | null {
   return name === '' ? null : name
 }
 
+/** The authors' multiple-choice convention (ADR-434 (d)); `/v1/rerank` callers may override it. */
+export const DEFAULT_HYPOTHESIS_TEMPLATE = 'The correct answer is: {}'
+
+/** Single-pass literal substitution of {premise}/{hypothesis}. The replacement is a callback,
+ *  so a premise containing the text "{hypothesis}" is never re-expanded and `$&`/`$1` in user
+ *  text are never read as replacement patterns. */
+export function buildNliInput(template: string, premise: string, hypothesis: string): string {
+  const pairText = { premise, hypothesis }
+  return template.replace(NLI_TEMPLATE_SLOT, (_slot, field: keyof typeof pairText) => pairText[field])
+}
+
+/** null when valid; otherwise the 400 message. Valid = a string, 1–1000 chars, containing `{}`. */
+export function validateHypothesisTemplate(t: unknown): string | null {
+  if (typeof t !== 'string' || !t.includes(DOCUMENT_SLOT)) {
+    return `hypothesis_template must contain ${DOCUMENT_SLOT} where each document goes.`
+  }
+  if (t.length > MAX_HYPOTHESIS_TEMPLATE_LENGTH) {
+    return `hypothesis_template must be at most ${MAX_HYPOTHESIS_TEMPLATE_LENGTH} characters.`
+  }
+  return null
+}
+
+/** Every literal `{}` → document (split/join, no regex, no format-string semantics). */
+export function fillHypothesisTemplate(t: string, document: string): string {
+  return t.split(DOCUMENT_SLOT).join(document)
+}
+
+/** The engine's `/classify` row did not have the shape the model's own labels require. */
+export class JevShapeError extends Error {}
+
+/** probs[i] ↔ labels[i]. Throws JevShapeError unless probs is an array of exactly
+ *  labels.length finite numbers. label = argmax (ties → lowest index). The engine's own `label`
+ *  string is ignored: one mapping, derived from the model's own id2label, is the only source. */
+export function mapProbs(
+  labels: readonly JevLabel[],
+  probs: unknown,
+): { label: JevLabel; probs: Record<JevLabel, number> } {
+  const classProbs = requireClassProbabilities(probs, labels.length)
+  return {
+    label: labels[indexOfStrongest(classProbs)],
+    probs: Object.fromEntries(labels.map((label, i) => [label, classProbs[i]])) as Record<JevLabel, number>,
+  }
+}
+
 const SEQUENCE_CLASSIFIER_SUFFIX = 'ForSequenceClassification'
 const NLI_CLASS_IDS = ['0', '1', '2']
 
@@ -103,6 +147,23 @@ function launchFlagsFor(architecture: string): readonly LaunchFlag[] {
 
 function hasVerifiedLaunch(architecture: string): boolean {
   return Object.hasOwn(JEV_LAUNCH_TABLE, architecture)
+}
+
+const NLI_TEMPLATE_SLOT = /\{(premise|hypothesis)\}/g
+const DOCUMENT_SLOT = '{}'
+const MAX_HYPOTHESIS_TEMPLATE_LENGTH = 1000
+
+function requireClassProbabilities(probs: unknown, classCount: number): number[] {
+  if (Array.isArray(probs) && probs.length === classCount && probs.every(isFiniteNumber)) return probs
+  throw new JevShapeError(`Expected ${classCount} finite class probabilities from the engine.`)
+}
+
+function indexOfStrongest(classProbs: readonly number[]): number {
+  return classProbs.reduce((strongest, p, i) => (p > classProbs[strongest] ? i : strongest), 0)
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value)
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

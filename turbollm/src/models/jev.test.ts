@@ -3,7 +3,20 @@
 // (chat models, 2/4-label classifiers, sentiment heads, malformed JSON) must stay untouched.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { detectJev, flagName, JEV_LAUNCH_TABLE, jevLaunchArgs, type JevInfo } from './jev'
+import {
+  buildNliInput,
+  DEFAULT_HYPOTHESIS_TEMPLATE,
+  detectJev,
+  fillHypothesisTemplate,
+  flagName,
+  JEV_LAUNCH_TABLE,
+  jevLaunchArgs,
+  JevShapeError,
+  mapProbs,
+  validateHypothesisTemplate,
+  type JevInfo,
+  type JevLabel,
+} from './jev'
 
 /** Fixture F1 — the OpenJev config.json fields that matter (plan Appendix). */
 function openJevConfig(): Record<string, unknown> {
@@ -167,3 +180,99 @@ test('an unverified architecture gets only vLLM\'s native --runner pooling', () 
 test('an unverified architecture whose user sets --runner gets nothing from the table', () => {
   assert.deepEqual(jevLaunchArgs(unverifiedJevInfo, ['--runner', 'generate']), [])
 })
+
+// NLI input and hypothesis templates — ADR-434 (d). Substitution is literal and single-pass:
+// user text is never re-expanded and never interpreted as a replacement pattern (QA E28).
+
+const OPENJEV_NLI_TEMPLATE = 'Premise: {premise}\nHypothesis: {hypothesis}'
+
+test('the OpenJev template joins the kitchen premise and hypothesis exactly', () => {
+  assert.equal(
+    buildNliInput(OPENJEV_NLI_TEMPLATE, 'A chef is chopping onions in a busy restaurant kitchen.', 'Someone is preparing food.'),
+    'Premise: A chef is chopping onions in a busy restaurant kitchen.\nHypothesis: Someone is preparing food.',
+  )
+})
+
+test('a premise that contains the text {hypothesis} is not re-expanded', () => {
+  assert.equal(
+    buildNliInput(OPENJEV_NLI_TEMPLATE, 'The note says {hypothesis}.', 'It rains.'),
+    'Premise: The note says {hypothesis}.\nHypothesis: It rains.',
+  )
+})
+
+test('replacement patterns like $& and $1 in a premise stay literal', () => {
+  assert.equal(
+    buildNliInput(OPENJEV_NLI_TEMPLATE, 'It costs $& and $1', 'It is priced.'),
+    'Premise: It costs $& and $1\nHypothesis: It is priced.',
+  )
+})
+
+const filledTemplates: Array<[string, string, string, string]> = [
+  ['the default template', DEFAULT_HYPOTHESIS_TEMPLATE, 'Paris', 'The correct answer is: Paris'],
+  ['every {} slot', '{} or {}', 'Paris', 'Paris or Paris'],
+  ['only {} slots, never format-string fields', '{0} {name} {}', 'Paris', '{0} {name} Paris'],
+  ['a document that itself contains {}', 'Answer: {}', 'set {} is empty', 'Answer: set {} is empty'],
+  ['a document with replacement patterns', 'Answer: {}', 'costs $& and $1', 'Answer: costs $& and $1'],
+]
+
+for (const [description, template, document, expected] of filledTemplates) {
+  test(`fillHypothesisTemplate fills ${description}`, () => {
+    assert.equal(fillHypothesisTemplate(template, document), expected)
+  })
+}
+
+const MISSING_SLOT = 'hypothesis_template must contain {} where each document goes.'
+const TOO_LONG = 'hypothesis_template must be at most 1000 characters.'
+
+const hypothesisTemplates: Array<[string, unknown, string | null]> = [
+  ['the default template', DEFAULT_HYPOTHESIS_TEMPLATE, null],
+  ['an empty string', '', MISSING_SLOT],
+  ['a number', 42, MISSING_SLOT],
+  ['a string without {}', 'no braces', MISSING_SLOT],
+  ['exactly 1000 characters with {}', '{}' + 'x'.repeat(998), null],
+  ['1001 characters with {}', '{}' + 'x'.repeat(999), TOO_LONG],
+]
+
+for (const [description, template, expected] of hypothesisTemplates) {
+  test(`validateHypothesisTemplate: ${description} → ${expected ?? 'valid'}`, () => {
+    assert.equal(validateHypothesisTemplate(template), expected)
+  })
+}
+
+// Probability mapping — ADR-434 (g) "label order is irrelevant": probs[i] belongs to labels[i],
+// the model's own id2label order. The engine's `label` string is never an input.
+
+const F1_LABELS: JevLabel[] = ['contradiction', 'entailment', 'neutral']
+const F4_LABELS: JevLabel[] = ['entailment', 'neutral', 'contradiction']
+
+test('F1 labels map an entailment row to entailment with every class probability', () => {
+  assert.deepEqual(mapProbs(F1_LABELS, [0, 0.957, 0.043]), {
+    label: 'entailment',
+    probs: { contradiction: 0, entailment: 0.957, neutral: 0.043 },
+  })
+})
+
+test('F4 permuted labels map through the model\'s own order', () => {
+  assert.deepEqual(mapProbs(F4_LABELS, [0.957, 0.043, 0]), {
+    label: 'entailment',
+    probs: { entailment: 0.957, neutral: 0.043, contradiction: 0 },
+  })
+})
+
+test('a tie picks the lowest class index', () => {
+  assert.equal(mapProbs(F4_LABELS, [0.5, 0.5, 0]).label, 'entailment')
+})
+
+const malformedProbs: Array<[string, unknown]> = [
+  ['two classes for three labels', [0.5, 0.5]],
+  ['a NaN probability', [NaN, 0.5, 0.5]],
+  ['an infinite probability', [Infinity, 0, 0]],
+  ['a string probability', ['0.5', 0.25, 0.25]],
+  ['not an array', '0.5'],
+]
+
+for (const [description, probs] of malformedProbs) {
+  test(`mapProbs throws JevShapeError for ${description}`, () => {
+    assert.throws(() => mapProbs(F1_LABELS, probs), JevShapeError)
+  })
+}
