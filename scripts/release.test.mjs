@@ -10,12 +10,14 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
+  INDEPENDENT_PATHS,
   PREPARE_PATHS,
   alreadyRecordedOk,
   androidEngineProblem,
   assertOrder,
   isCliEntry,
   splitDirtyPaths,
+  splitPreflightDirty,
   syncMainFastForward,
 } from './release.mjs';
 
@@ -130,6 +132,36 @@ test('prepare stages release files and never an unrelated dirty file', () => {
     assert.deepEqual(staged, ['turbollm/package.json']);
   } finally {
     cleanup(s.root);
+  }
+});
+
+// preflight used to fail on ANY dirty file, so another session's half-finished edit to a
+// separately deployed Worker blocked a release that never reads or ships it.
+test('preflight tolerates an independent deployable and still blocks anything a release ships', () => {
+  // run() trims stdout, so the first line arrives without its leading status space
+  const porcelain = ['M signup-worker/README.md', ' M signup-worker/src/index.ts', ' M turbollm/src/x.ts', '?? scripts/new.mjs'].join('\n');
+  const { blocking, tolerated } = splitPreflightDirty(porcelain);
+  assert.deepEqual(tolerated, ['signup-worker/README.md', 'signup-worker/src/index.ts']);
+  assert.deepEqual(blocking, ['turbollm/src/x.ts', 'scripts/new.mjs']);
+});
+
+test('preflight: an empty status is clean, and a look-alike directory name is not independent', () => {
+  assert.deepEqual(splitPreflightDirty(''), { blocking: [], tolerated: [] });
+  const { blocking, tolerated } = splitPreflightDirty(' M signup-worker-old/a.ts\n M signup-workerX/b.ts');
+  assert.deepEqual(tolerated, []);
+  assert.deepEqual(blocking, ['signup-worker-old/a.ts', 'signup-workerX/b.ts']);
+});
+
+test('preflight: a rename that crosses out of an independent directory still blocks', () => {
+  const { blocking, tolerated } = splitPreflightDirty('R  signup-worker/a.ts -> turbollm/src/a.ts\nR  signup-worker/b.ts -> signup-worker/c.ts');
+  assert.deepEqual(blocking, ['signup-worker/a.ts -> turbollm/src/a.ts']);
+  assert.deepEqual(tolerated, ['signup-worker/b.ts -> signup-worker/c.ts']);
+});
+
+test('the tolerated set names only directories no release phase reads', () => {
+  assert.deepEqual(INDEPENDENT_PATHS, ['signup-worker/']);
+  for (const p of PREPARE_PATHS) {
+    assert.ok(!INDEPENDENT_PATHS.some((d) => p.startsWith(d)), `${p} is release-owned and must never be tolerated`);
   }
 });
 

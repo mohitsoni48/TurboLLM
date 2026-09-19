@@ -246,16 +246,45 @@ function changelogSection(version) {
 }
 
 // ── phase: preflight ─────────────────────────────────────────────────────────
+// Separately deployed apps that no release phase reads, builds, gates on or
+// ships (the npm package is `bin` + `dist`; CI builds from committed content).
+// Someone else's half-finished edit there must not stop a release — the same
+// hazard `prepare` handles by staging only its own files. Anything else stays
+// blocking, so an unknown directory fails closed.
+export const INDEPENDENT_PATHS = ['signup-worker/'];
+
+// `run()` trims stdout, which eats the leading space of the FIRST porcelain
+// line (" M x" → "M x"), so the status column is matched loosely rather than
+// sliced at a fixed offset. A rename lists two paths; both must be independent.
+export function splitPreflightDirty(porcelain, independent = INDEPENDENT_PATHS) {
+  const blocking = [];
+  const tolerated = [];
+  for (const raw of String(porcelain).split(/\r?\n/)) {
+    const m = /^[ MADRCU?!]{1,2}\s+(.+)$/.exec(raw.trimEnd());
+    if (!m) continue;
+    const entry = m[1];
+    const paths = entry.split(' -> ').map((p) => p.replace(/^"|"$/g, ''));
+    const allIndependent = paths.every((p) => independent.some((d) => p.startsWith(d)));
+    (allIndependent ? tolerated : blocking).push(entry);
+  }
+  return { blocking, tolerated };
+}
+
 async function phasePreflight(state, flags) {
   const version = state.version;
   const problems = [];
   const out = [];
   const note = (s) => { out.push(s); step(s); };
 
-  // 1. clean tree
+  // 1. clean tree (except other people's edits to independently deployed apps)
   const dirty = mustGit('status', '--porcelain').stdout;
-  if (dirty) problems.push(`working tree is not clean:\n${dirty}`);
+  const { blocking, tolerated } = splitPreflightDirty(dirty);
+  if (blocking.length) problems.push(`working tree is not clean:\n${blocking.join('\n')}`);
   else note('working tree clean');
+  if (tolerated.length) {
+    warnLine(`not this release's, left alone: ${tolerated.join(', ')}`);
+    out.push(`WARN left alone: ${tolerated.join(', ')}`);
+  }
 
   // 2. on the release branch
   const branch = currentBranch();
