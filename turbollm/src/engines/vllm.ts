@@ -10,6 +10,7 @@
 // attempts `uv pip install vllm`, which fails loudly on an unsupported platform.
 import { existsSync } from 'node:fs'
 import { execFile } from 'node:child_process'
+import { hostname, machine, release, version as kernelBuild } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { ensureUv } from './mlx'
@@ -133,4 +134,31 @@ export function vllmServerCommand(
   if (tensorParallelSize > 1) args.push('--tensor-parallel-size', String(tensorParallelSize))
   args.push(...extraArgs)
   return { cmd: python, args }
+}
+
+/**
+ * Environment that picks vLLM's model runner for this host (ADR-435). vLLM 0.29 made Model
+ * Runner V2 the default; it keeps request state in a UVA buffer, which needs pinned host memory,
+ * and vLLM turns pinned memory off under WSL. There V2 dies at engine-core init with "UVA is not
+ * available" before any model code runs, whatever the model. The V1 runner still ships and works
+ * on WSL, so WSL gets it, unless the user already chose a runner on the daemon's environment.
+ * A blank value is not a choice: vLLM parses it with `int()` and would crash on it.
+ */
+export function vllmModelRunnerEnv(daemonEnv: NodeJS.ProcessEnv, uname: string): Record<string, string> {
+  const userChoseRunner = (daemonEnv.VLLM_USE_V2_MODEL_RUNNER ?? '').trim() !== ''
+  if (userChoseRunner || !isWsl(daemonEnv, uname)) return {}
+  return { VLLM_USE_V2_MODEL_RUNNER: '0' }
+}
+
+/** WSL_DISTRO_NAME is set for processes started through wsl.exe but not under systemd or in a
+ *  container; the uname catches those too (WSL2's kernel release says "microsoft"). */
+function isWsl(daemonEnv: NodeJS.ProcessEnv, uname: string): boolean {
+  return Boolean(daemonEnv.WSL_DISTRO_NAME) || /microsoft/i.test(uname)
+}
+
+/** The `platform.uname()` fields vLLM's `in_wsl()` searches for "microsoft" (its fifth, the system
+ *  name, is always "Linux" here), so TurboLLM predicts vLLM's own WSL verdict. '' off Linux. */
+export function hostUname(): string {
+  if (process.platform !== 'linux') return ''
+  return [hostname(), release(), kernelBuild(), machine()].join(' ')
 }

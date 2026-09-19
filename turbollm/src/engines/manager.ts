@@ -13,7 +13,7 @@ import { mlxVlmServerCommand } from './mlx-vlm'
 import { koboldcppServerCommand } from './koboldcpp'
 import { llamafileServerCommand } from './llamafile'
 import { slotCacheDir } from './slot-cache'
-import { vllmServerCommand, vllmServeBlocker } from './vllm'
+import { hostUname, vllmModelRunnerEnv, vllmServerCommand, vllmServeBlocker } from './vllm'
 import { sglangServerCommand, sgLangServeBlocker } from './sglang'
 
 export type State = 'stopped' | 'starting' | 'running' | 'stopping' | 'error'
@@ -805,8 +805,9 @@ const READINESS_TIMEOUT_MS = 600_000
  *     call (TurboLLM downloads models itself; it is offline-first), and
  *   - point the HF cache at a real, created dir inside the TurboLLM data dir so mlx-lm's
  *     `/v1/models` (which calls huggingface_hub `scan_cache_dir()`) doesn't crash with
- *     CacheNotFound when `~/.cache/huggingface/hub` is absent. */
-function pyEngineEnv(kind: string, dataDir: string, binPath: string): NodeJS.ProcessEnv | undefined {
+ *     CacheNotFound when `~/.cache/huggingface/hub` is absent, and
+ *   - on WSL, run vLLM's V1 model runner, since V2 cannot start there (`vllmModelRunnerEnv`). */
+export function pyEngineEnv(kind: string, dataDir: string, binPath: string): NodeJS.ProcessEnv | undefined {
   if (kind !== 'mlx' && kind !== 'rapid-mlx' && kind !== 'mlx-vlm' && kind !== 'vllm' && kind !== 'sglang') {
     if (process.platform === 'win32') return undefined
     const dir = dirname(binPath)
@@ -829,6 +830,7 @@ function pyEngineEnv(kind: string, dataDir: string, binPath: string): NodeJS.Pro
     TRANSFORMERS_OFFLINE: '1',
     HF_HOME: hfHome,
     HF_HUB_CACHE: hubCache,
+    ...(kind === 'vllm' ? vllmModelRunnerEnv(process.env, hostUname()) : {}),
   }
 }
 
