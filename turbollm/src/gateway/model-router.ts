@@ -10,7 +10,7 @@ import type { ComfyGuard } from '../engines/comfy-guard'
 import { resolveProfile, profileToArgs, vllmProfileToArgs, type LoadProfile } from '../models/profile'
 import { mlxSamplingArgs } from '../engines/mlx'
 import { koboldcppProfileToArgs } from '../engines/koboldcpp'
-import { engineAcceptsFormat } from '../engines/compat'
+import { modelIncompatibility } from '../engines/compat'
 import { getSysInfo } from '../sysinfo/sysinfo'
 import { parseRemoteId } from '../link/model-id'
 import type { RemoteCatalog } from '../link/remote-catalog'
@@ -244,9 +244,8 @@ export class ModelRouter {
 
     const active = this.registry.active()
     if (!active) return { status: 503, message: 'No active engine. Set one up in TurboLLM.' }
-    if (!engineAcceptsFormat(active.kind, entry.format)) {
-      return { status: 503, message: `Active engine cannot load model format '${entry.format}'.` }
-    }
+    const inc = modelIncompatibility(active.kind, entry)
+    if (inc) return { status: 503, message: inc.message }
 
     const opts = this.buildOpts(entry, active, overrides)
     if (!opts) return { status: 503, message: 'Model is incomplete or unreadable.' }

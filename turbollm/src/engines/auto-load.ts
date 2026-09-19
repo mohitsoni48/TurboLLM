@@ -10,7 +10,7 @@ import type { ModelRouter } from '../gateway/model-router'
 import type { ModelEntry, Scanner } from '../models/scanner'
 import type { SysInfo } from '../sysinfo/sysinfo'
 import type { ComfyGuard } from './comfy-guard'
-import { engineAcceptsFormat, engineRejectsAudioModel } from './compat'
+import { modelIncompatibility } from './compat'
 import type { Manager, StartOpts } from './manager'
 import type { Registry } from './registry'
 import { buildStartOpts } from './start-opts'
@@ -161,11 +161,14 @@ function unresolved(reason: AutoLoadSkipReason): LastModelResolution {
   return { kind: 'unresolved', reason }
 }
 
-/** Why `engine` can't load `entry`, or '' when it can. */
+/** Why `engine` can't load `entry`, or '' when it can. The format and audio wordings predate
+ *  the shared rule and are pinned by the boot skip lines, so they stay byte-identical. */
 function incompatibilityDetail(engine: Engine, entry: ModelEntry): string {
-  if (!engineAcceptsFormat(engine.kind, entry.format)) return `format ${entry.format}`
-  if (entry.audio && engineRejectsAudioModel(engine.kind)) return 'audio tower not supported'
-  return ''
+  const inc = modelIncompatibility(engine.kind, entry)
+  if (!inc) return ''
+  if (inc.code === 'format') return `format ${entry.format}`
+  if (inc.code === 'audio') return 'audio tower not supported'
+  return inc.label
 }
 
 function whyNothingLoads(reason: AutoLoadSkipReason): string {

@@ -310,6 +310,63 @@ test('loadExplicit loads the requested model even when autoSwap is globally disa
   assert.ok(loadedWith, 'expected Manager.load to be called even though autoSwap is disabled')
 })
 
+// ── doLoad: the shared modelIncompatibility() rule (ADR-434 (g), divergence row 2) ──
+// An auto-swap to a model the active engine cannot load answers 503 with the same message the
+// manual load guard uses, before anything is evicted or loaded. The audio check is new here.
+function recordingPrimary() {
+  const loads: unknown[] = []
+  const manager = {
+    status: (): Status => ({ state: 'stopped', err: null, port: 0, pid: 0, model: null, loadElapsedMs: 0 }),
+    load: async (opts: unknown) => { loads.push(opts) },
+    target: () => null,
+    touch: () => {},
+  } as unknown as Manager
+  return { manager, loads }
+}
+
+function autoSwapRouter(engineKind: string, entry: ModelEntry, primary: Manager): ModelRouter {
+  const scanner = { list: () => ({ models: [entry] }), get: () => undefined } as unknown as Scanner
+  const registry = { active: () => fakeEngine(engineKind) } as unknown as Registry
+  return new ModelRouter(fakeFullStore(), registry, primary, scanner, undefined)
+}
+
+test('route: an audio-tower model on Rapid-MLX is refused with the audio message and never loads', async () => {
+  const { manager, loads } = recordingPrimary()
+  const audioModel = { ...fakeEntry('gemma-audio'), audio: true } as ModelEntry
+  const r = autoSwapRouter('rapid-mlx', audioModel, manager)
+
+  const result = await r.route('gemma-audio')
+
+  assert.deepEqual(result, {
+    status: 503,
+    message:
+      'Rapid-MLX cannot load models with an audio tower — the audio encoder fails due to an upstream mlx-vlm bug in the sanitizer for these architectures. Switch to the MLX engine instead.',
+  })
+  assert.deepEqual(loads, [])
+})
+
+test('route: a Jev model on llama.cpp is refused with the needs-vLLM message and never loads', async () => {
+  const { manager, loads } = recordingPrimary()
+  const jevModel = {
+    ...fakeEntry('qwen3.5 4b nli v2'),
+    jev: {
+      labels: ['contradiction', 'entailment', 'neutral'],
+      nliTemplate: 'Premise: {premise}\nHypothesis: {hypothesis}',
+      architecture: 'Qwen3_5ForSequenceClassification',
+      verified: true,
+    },
+  } as ModelEntry
+  const r = autoSwapRouter('llama-server', jevModel, manager)
+
+  const result = await r.route('qwen3.5 4b nli v2')
+
+  assert.deepEqual(result, {
+    status: 503,
+    message: 'This is a Jev model — it runs only on vLLM (Linux or WSL2). Activate a vLLM engine to load it.',
+  })
+  assert.deepEqual(loads, [])
+})
+
 test('loadExplicit reports 503 for an unknown model key without touching the manager', async () => {
   const scanner = { get: () => undefined, list: () => ({ models: [] }) } as unknown as import('../models/scanner').Scanner
   let loadCalled = false
