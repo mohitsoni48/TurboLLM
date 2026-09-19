@@ -180,4 +180,24 @@ describe('EnginesScreen source-build branch (Prism "Remote branch main not found
     expect(within(select).getAllByRole('option').map((o) => o.textContent)).toEqual(['(repo default)', 'main', 'dev'])
     expect(select.value).toBe('')
   })
+
+  it('still shows the branch it will build after a search that filters that branch out', async () => {
+    // The search box filtered the selected branch out of the <select>, which then DISPLAYED the
+    // first match while the request went out with the branch in state ("prism").
+    gitBranches = ['prism', 'dev', 'develop', 'cuda-a', 'cuda-b', 'x1']
+    renderEngines()
+    await screen.findByText('Prism (llama.cpp fork)')
+    releaseCatalog()
+
+    const row = (await screen.findByText('Branch:')).closest('div.flex') as HTMLElement
+    const select = within(row).getByRole('combobox') as HTMLSelectElement
+    fireEvent.focus(select)
+    const search = await screen.findByPlaceholderText(/Search \d+ branches/)
+
+    fireEvent.change(search, { target: { value: 'cuda' } })
+
+    await waitFor(() => expect(within(select).getAllByRole('option').map((o) => o.textContent)).toEqual(['prism', 'cuda-a', 'cuda-b']))
+    expect(select.selectedOptions[0]?.value).toBe('prism')
+    expect(screen.getByText('2 of 6')).toBeTruthy()
+  })
 })
