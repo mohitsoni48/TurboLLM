@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { homedir } from 'node:os'
 import { engineAcceptsFormat, engineModelAlias, engineRejectsAudioModel, ENGINE_MODEL_ALIAS } from './compat'
 import { vllmServerCommand, vllmServeBlocker, classifyVllmBlocker } from './vllm'
+import { UvloopPreflight } from './py-engine-blocker'
 import { mlxServerCommand, mlxSamplingArgs } from './mlx'
 import { mlxVlmServerCommand } from './mlx-vlm'
 
@@ -79,10 +80,12 @@ test('classifyVllmBlocker: Windows reports an unsupported platform (ADR-080)', (
   assert.match(classifyVllmBlocker('win32', new Error('boom')), /vLLM cannot run on Windows/)
 })
 
-test('classifyVllmBlocker: macOS reports a broken environment — uvloop ships macOS wheels', () => {
+test('classifyVllmBlocker: macOS reports a broken environment — uvloop ships macOS wheels, but vLLM is not first-class there', () => {
   const msg = classifyVllmBlocker('darwin', new Error('ModuleNotFoundError: no module named uvloop'))
   assert.doesNotMatch(msg, /cannot run on/i)
-  assert.match(msg, /macOS is a supported platform/)
+  // The catalog calls vLLM on macOS experimental: only uvloop's own support may be asserted.
+  assert.doesNotMatch(msg, /macOS is a supported platform/i)
+  assert.match(msg, /uvloop itself supports macOS/)
   assert.match(msg, /reinstall/i)
 })
 
@@ -133,20 +136,31 @@ test('classifyVllmBlocker: the home directory is redacted out of the detail', ()
   assert.match(msg, /~/)
 })
 
-test('classifyVllmBlocker: a container with HOME=/ does not have every slash rewritten to ~', () => {
-  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE }
-  process.env.HOME = '/'
-  process.env.USERPROFILE = '/'
-  try {
-    const stderr = 'ImportError: /usr/lib/x86_64-linux-gnu/libcuda.so.1: cannot open shared object file'
-    const msg = classifyVllmBlocker('linux', Object.assign(new Error('exit 1'), { stderr }))
-    assert.match(msg, /\/usr\/lib\/x86_64-linux-gnu\/libcuda\.so\.1/)
-  } finally {
-    for (const [key, value] of Object.entries(saved)) {
-      if (value === undefined) delete process.env[key]
-      else process.env[key] = value
-    }
+// The home directory is injected, so none of these touch process.env (which every test in the
+// process shares).
+function brokenImport(home: () => string, stderr: string): string {
+  return new UvloopPreflight('vLLM', home).classify('linux', Object.assign(new Error('exit 1'), { stderr }))
+}
+
+test('UvloopPreflight: a container with HOME=/ does not have every slash rewritten to ~', () => {
+  const msg = brokenImport(() => '/', 'ImportError: /usr/lib/x86_64-linux-gnu/libcuda.so.1: cannot open shared object file')
+  assert.match(msg, /\/usr\/lib\/x86_64-linux-gnu\/libcuda\.so\.1/)
+})
+
+test('UvloopPreflight: the home directory is redacted whatever case Python spelled it in', () => {
+  // A case-insensitive filesystem lets Python print `c:\users\owner` for `C:\Users\Owner`.
+  const msg = brokenImport(() => 'C:\\Users\\Owner', 'ImportError: c:\\users\\owner\\venv and C:/USERS/OWNER/.turbollm')
+  assert.doesNotMatch(msg, /owner/i)
+  assert.match(msg, /~/)
+})
+
+test('UvloopPreflight: an unreadable home directory does not crash the error message', () => {
+  // os.homedir() throws (uv_os_homedir ENOENT) for a uid with no passwd entry and no HOME.
+  const unreadable = () => {
+    throw new Error('ENOENT: uv_os_homedir')
   }
+  const msg = brokenImport(unreadable, 'ImportError: libcuda.so.1')
+  assert.match(msg, /uvloop failed to import: ImportError: libcuda\.so\.1\)/)
 })
 
 test('vllmServeBlocker returns a clear message when the runtime cannot serve (ADR-080)', async () => {

@@ -8,11 +8,18 @@ test('classifySglangBlocker: Windows reports an unsupported platform', () => {
   assert.match(classifySglangBlocker('win32', new Error('boom')), /SGLang cannot run on Windows/)
 })
 
-test('classifySglangBlocker: macOS reports a broken environment — uvloop ships macOS wheels', () => {
+test('classifySglangBlocker: macOS reports a broken environment — uvloop ships macOS wheels, but SGLang is unsupported upstream there', () => {
   const msg = classifySglangBlocker('darwin', new Error('ModuleNotFoundError: no module named uvloop'))
   assert.doesNotMatch(msg, /cannot run on/i)
-  assert.match(msg, /macOS is a supported platform/)
+  // The catalog says SGLang on macOS is unsupported upstream: only uvloop's own support may be asserted.
+  assert.doesNotMatch(msg, /macOS is a supported platform/i)
+  assert.match(msg, /uvloop itself supports macOS/)
   assert.match(msg, /reinstall/i)
+})
+
+test('classifySglangBlocker: Linux, where SGLang is officially supported, still says so', () => {
+  const msg = classifySglangBlocker('linux', new Error('ModuleNotFoundError: no module named uvloop'))
+  assert.match(msg, /Linux is a supported platform for SGLang/)
 })
 
 test('classifySglangBlocker: an unverified platform is never claimed as supported', () => {
