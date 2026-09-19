@@ -10,9 +10,12 @@
 // shape other tests use — since there's no public seeder that doesn't drive a real load.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
 import { ModelRouter } from './model-router'
-import type { Manager, Status } from '../engines/manager'
-import type { ConfigStore, Engine } from '../config/config'
+import type { Manager, StartOpts, Status } from '../engines/manager'
+import { defaultConfig, type Config, type ConfigStore, type Engine } from '../config/config'
 import type { Registry } from '../engines/registry'
 import type { Scanner, ModelEntry } from '../models/scanner'
 
@@ -379,4 +382,95 @@ test('loadExplicit reports 503 for an unknown model key without touching the man
   const result = await r.loadExplicit('nonexistent')
   assert.equal('status' in result && result.status, 503)
   assert.equal(loadCalled, false)
+})
+
+// ── buildOpts: gateway loads build StartOpts through the one shared builder (divergence row 1) ──
+// A source scan, as engine-lifecycle.shared-builder.test.ts does for startEngine: a re-introduced
+// inline copy produces correct StartOpts on the day it lands, and only drifts later.
+const MODEL_ROUTER_SOURCE = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'model-router.ts'), 'utf8')
+
+const INLINE_BUILDER_CALLS = [
+  'profileToArgs(',
+  'koboldcppProfileToArgs(',
+  'vllmProfileToArgs(',
+  'mlxSamplingArgs(',
+  'resolveProfile(',
+  'getModelProfile(',
+]
+
+test('model-router.ts calls the shared buildStartOpts exactly once', () => {
+  assert.equal(MODEL_ROUTER_SOURCE.split('buildStartOpts(').length - 1, 1)
+})
+
+test('model-router.ts resolves no profile and builds no engine args of its own', () => {
+  const inlineCalls = INLINE_BUILDER_CALLS.filter((call) => MODEL_ROUTER_SOURCE.includes(call))
+
+  assert.deepEqual(inlineCalls, [], `build these through buildStartOpts instead:\n${inlineCalls.join('\n')}`)
+})
+
+const OPENJEV_LAUNCH_TOKENS = [
+  '--runner', 'pooling',
+  '--convert', 'classify',
+  '--hf-overrides', '{"architectures":["Qwen3_5ForConditionalGeneration"]}',
+  '--limit-mm-per-prompt', '{"image":0,"video":0}',
+]
+
+function builderEngine(kind: string): Engine {
+  return {
+    id: 'eng1', name: kind, kind, binPath: 'llama-server', version: 'b1',
+    capabilities: { kvTypes: [], flags: [] }, addedAt: 't',
+  } as unknown as Engine
+}
+
+function builderEntry(overrides: Partial<ModelEntry>): ModelEntry {
+  return {
+    key: 'model-a', name: 'Model A', path: '/models/model-a.gguf', dir: '/models',
+    format: 'gguf', sizeBytes: 1, sizeLabel: '1 GB', arch: 'qwen3', quant: 'Q4_K_M', nativeCtx: 4096,
+    blockCount: 1, headCountKv: 1, headDim: 1, moe: false, expertCount: 0, nextnLayers: 0,
+    vision: false, audio: false, mmprojPath: null, mmprojSizeBytes: 0, hasChatTemplate: true,
+    reasoningEffort: false, embedding: false, incomplete: false, parseError: null,
+    ...overrides,
+  } as unknown as ModelEntry
+}
+
+function routerWithConfig(cfg: Config): ModelRouter {
+  const store = { snapshot: () => cfg } as unknown as ConfigStore
+  return new ModelRouter(store, {} as never, fakeManager('stopped', null), {} as never, undefined)
+}
+
+function buildOptsOf(r: ModelRouter, entry: ModelEntry, engine: Engine): StartOpts | null {
+  return (r as unknown as { buildOpts(e: ModelEntry, g: Engine): StartOpts | null }).buildOpts(entry, engine)
+}
+
+test('buildOpts: a Jev model auto-swapped onto vLLM launches with the verified flags', () => {
+  const jevModel = builderEntry({
+    key: 'qwen3.5 4b nli v2', name: 'qwen3.5 4b nli v2', format: 'mlx', path: '/models/openjev/qwen3.5-4b-nli-v2',
+    nativeCtx: 262144,
+    jev: {
+      labels: ['contradiction', 'entailment', 'neutral'],
+      nliTemplate: 'Premise: {premise}\nHypothesis: {hypothesis}',
+      architecture: 'Qwen3_5ForSequenceClassification',
+      verified: true,
+    },
+  })
+
+  const opts = buildOptsOf(routerWithConfig(defaultConfig()), jevModel, builderEngine('vllm'))
+
+  assert.deepEqual(opts?.extraArgs.slice(-OPENJEV_LAUNCH_TOKENS.length), OPENJEV_LAUNCH_TOKENS)
+  assert.equal(opts?.trigger, 'gateway_switch')
+})
+
+test('buildOpts: a gateway load honours the saved profile pinned port', () => {
+  const cfg = defaultConfig()
+  cfg.modelProfiles['model-a'] = { eng1: { profile: { port: 6997 }, updatedAt: '2026-09-19T00:00:00.000Z' } }
+
+  const opts = buildOptsOf(routerWithConfig(cfg), builderEntry({}), builderEngine('llama-server'))
+
+  assert.equal(opts?.preferredPort, 6997)
+})
+
+test('buildOpts: an incomplete model builds nothing', () => {
+  const opts = buildOptsOf(routerWithConfig(defaultConfig()), builderEntry({ incomplete: true }), builderEngine('llama-server'))
+
+  assert.equal(opts, null)
 })

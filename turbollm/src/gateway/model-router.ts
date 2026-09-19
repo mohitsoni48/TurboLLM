@@ -3,14 +3,13 @@
 // the local model library and loads (or swaps to) that model automatically.
 // Inspired by llama-swap; operates on the existing Manager + Scanner primitives.
 import { Manager, type StartOpts } from '../engines/manager'
-import { getModelProfile, type ConfigStore, type Engine } from '../config/config'
+import type { ConfigStore, Engine } from '../config/config'
 import type { Registry } from '../engines/registry'
 import type { Scanner, ModelEntry } from '../models/scanner'
 import type { ComfyGuard } from '../engines/comfy-guard'
-import { resolveProfile, profileToArgs, vllmProfileToArgs, type LoadProfile } from '../models/profile'
-import { mlxSamplingArgs } from '../engines/mlx'
-import { koboldcppProfileToArgs } from '../engines/koboldcpp'
+import type { LoadProfile } from '../models/profile'
 import { modelIncompatibility } from '../engines/compat'
+import { buildStartOpts } from '../engines/start-opts'
 import { getSysInfo } from '../sysinfo/sysinfo'
 import { parseRemoteId } from '../link/model-id'
 import type { RemoteCatalog } from '../link/remote-catalog'
@@ -423,50 +422,14 @@ export class ModelRouter {
     return loadedKey === entry.key || loadedKey === entry.path
   }
 
+  /** Gateway loads build their StartOpts through the one shared builder (start-opts.ts), like the
+   *  manual Load and the boot resume, so a Jev model's launch flags and a pinned port reach
+   *  auto-swap loads too. doLoad has already checked compatibility, buildStartOpts's precondition. */
   private buildOpts(entry: ModelEntry, engine: Engine, overrides?: Partial<LoadProfile>): StartOpts | null {
     if (entry.incomplete || entry.parseError) return null
-    const cfg = this.store.snapshot()
-    const sys = getSysInfo()
-    if (entry.format !== 'gguf') {
-      const savedProfile = getModelProfile(cfg, entry.key, engine.id) as Partial<LoadProfile> | undefined
-      // Resolved once regardless of engine kind — see routes.ts's identical load
-      // route for why (model_load telemetry, spec 23 §3.3, wants the same
-      // full-config shape whichever engine actually ends up loading).
-      const profile = resolveProfile(entry, sys, savedProfile, overrides, cfg.modelDefaults)
-      return {
-        engine,
-        model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: entry.nativeCtx, vision: entry.vision },
-        modelPath: entry.path,
-        // MLX honors sampling as launch defaults; vLLM honors its own load controls (F-027).
-        extraArgs:
-          engine.kind === 'mlx'
-            ? mlxSamplingArgs(savedProfile?.sampling)
-            : engine.kind === 'vllm'
-              ? vllmProfileToArgs(profile, entry.nativeCtx)
-              : [],
-        tensorParallelSize: savedProfile?.gpu?.tensorParallelSize,
-        profile,
-        trigger: 'gateway_switch',
-      }
-    }
-    const saved = getModelProfile(cfg, entry.key, engine.id) as Partial<LoadProfile> | undefined
-    const profile = resolveProfile(entry, sys, saved, overrides, cfg.modelDefaults)
-    // KoboldCpp is a GGUF engine but uses its OWN flag names, so it gets its own small
-    // arg-map (ctx/ngl + GPU backend) rather than the llama-server profileToArgs. llamafile
-    // IS llama.cpp's server under the hood, so it keeps the full profileToArgs flags — the
-    // manager's llamafileServerCommand only prepends `--server --no-webui`.
-    const extraArgs =
-      engine.kind === 'koboldcpp'
-        ? koboldcppProfileToArgs(profile, sys.gpus[0]?.vendor ?? 'unknown', sys.gpus.length > 0)
-        : profileToArgs(profile, entry, engine.capabilities, sys.cores, sys, engine.binPath)
-    return {
-      engine,
-      model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: profile.ctx, vision: entry.vision },
-      modelPath: entry.path,
-      extraArgs,
-      profile,
-      trigger: 'gateway_switch',
-    }
+    return buildStartOpts({
+      entry, engine, cfg: this.store.snapshot(), sys: getSysInfo(), overrides, trigger: 'gateway_switch',
+    })
   }
 
 }

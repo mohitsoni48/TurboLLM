@@ -35,6 +35,26 @@ test('koboldcpp gets KoboldCpp flags, including --nogpu on a machine with no GPU
   assert.ok(!opts.extraArgs.includes('-c'))
 })
 
+// The gateway's own builder used to take KoboldCpp's backend from gpus[0], so an Intel iGPU
+// listed before an NVIDIA card picked Vulkan. The shared builder ranks vendors (R3).
+test('koboldcpp picks its GPU backend from the primary vendor, not the first GPU listed', () => {
+  const igpuFirst: SysInfo = {
+    ...NO_GPU_MACHINE,
+    gpus: [
+      { name: 'Intel UHD', vramMb: 1024, vendor: 'intel' },
+      { name: 'RTX 5070 Ti', vramMb: 16384, vendor: 'nvidia' },
+    ],
+  }
+
+  const opts = buildStartOpts({
+    entry: ggufModel(), engine: testEngine('koboldcpp'), cfg: defaultConfig(), sys: igpuFirst,
+    overrides: { ngl: 99 }, trigger: 'gateway_switch',
+  })
+
+  assert.ok(opts.extraArgs.includes('--usecuda'))
+  assert.ok(!opts.extraArgs.includes('--usevulkan'))
+})
+
 test('vllm gets --max-model-len from the saved vLLM profile', () => {
   const cfg = configWithSavedProfile({ vllm: { maxModelLen: 16384 } })
 
