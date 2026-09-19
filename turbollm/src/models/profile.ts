@@ -5,6 +5,7 @@ import type { Capabilities, ModelDefaults } from '../config/config'
 import { backendIdFromBinPath } from '../engines/update'
 import type { SysInfo } from '../sysinfo/sysinfo'
 import { DECODER_EMBED_ARCHS, type ModelEntry } from './scanner'
+import { jevLaunchArgs, type JevInfo } from './jev'
 
 export interface Sampling {
   temp: number
@@ -1010,8 +1011,11 @@ export function profileToArgs(
  *
  *  `nativeCtx` is the model's own uncapped `max_position_embeddings` (`ModelEntry.nativeCtx`) —
  *  deliberately NOT `p.ctx`, which `deriveDefault()` caps at 8192 for llama.cpp/MLX's KV-memory
- *  sizing and has no bearing on vLLM once `--max-model-len` is left unset (see below). */
-export function vllmProfileToArgs(p: LoadProfile, nativeCtx: number): string[] {
+ *  sizing and has no bearing on vLLM once `--max-model-len` is left unset (see below).
+ *
+ *  `jev` (ADR-434 (g)): a Jev model's verified classifier flags go between the profile's flags and
+ *  the user's extra args, minus any flag the user already set, so the user wins without duplicates. */
+export function vllmProfileToArgs(p: LoadProfile, nativeCtx: number, jev?: JevInfo): string[] {
   const v = p.vllm ?? defaultVllm()
   const a: string[] = []
   if (v.maxModelLen > 0) a.push('--max-model-len', String(v.maxModelLen))
@@ -1030,6 +1034,7 @@ export function vllmProfileToArgs(p: LoadProfile, nativeCtx: number): string[] {
   if (v.kvCacheDtype !== 'auto') a.push('--kv-cache-dtype', v.kvCacheDtype)
   if (v.enforceEager) a.push('--enforce-eager')
   if (v.trustRemoteCode) a.push('--trust-remote-code')
+  if (jev) a.push(...jevLaunchArgs(jev, p.extraArgs))
   a.push(...p.extraArgs)
   return a
 }

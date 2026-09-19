@@ -5,6 +5,7 @@ import { test } from 'node:test'
 import { deriveDefault, defaultVllm, vllmProfileToArgs } from './profile'
 import type { LoadProfile, VllmProfile } from './profile'
 import type { ModelEntry } from './scanner'
+import type { JevInfo } from './jev'
 import type { SysInfo } from '../sysinfo/sysinfo'
 
 function model(over: Partial<ModelEntry> = {}): ModelEntry {
@@ -119,4 +120,59 @@ test('user extraArgs pass through last', () => {
   const args = vllmProfileToArgs(p, MODEL_NATIVE_CTX)
   assert.ok(args.includes('--dtype'))
   assert.deepEqual(args.slice(-2), ['--seed', '7'])
+})
+
+// ADR-434 (g): a Jev model launches with the verified classifier flags, placed after the profile's
+// own flags and before the user's extra args, minus any flag the user already set (H2).
+const OPENJEV: JevInfo = {
+  labels: ['contradiction', 'entailment', 'neutral'],
+  nliTemplate: 'Premise: {premise}\nHypothesis: {hypothesis}',
+  architecture: 'Qwen3_5ForSequenceClassification',
+  verified: true,
+}
+
+const OPENJEV_LAUNCH_TOKENS = [
+  '--runner', 'pooling',
+  '--convert', 'classify',
+  '--hf-overrides', '{"architectures":["Qwen3_5ForConditionalGeneration"]}',
+  '--limit-mm-per-prompt', '{"image":0,"video":0}',
+]
+
+function withExtraArgs(extraArgs: string[]): LoadProfile {
+  return { ...deriveDefault(model(), sys), extraArgs }
+}
+
+test('a Jev model appends exactly the verified launch flags after the profile flags', () => {
+  const p = withExtraArgs([])
+
+  const args = vllmProfileToArgs(p, MODEL_NATIVE_CTX, OPENJEV)
+
+  assert.deepEqual(args, [...vllmProfileToArgs(p, MODEL_NATIVE_CTX), ...OPENJEV_LAUNCH_TOKENS])
+  assert.deepEqual(args, ['--max-num-batched-tokens', String(MODEL_NATIVE_CTX), ...OPENJEV_LAUNCH_TOKENS])
+})
+
+test('a Jev flag the user set appears once, in the user position (last)', () => {
+  const args = vllmProfileToArgs(withExtraArgs(['--runner', 'pooling']), MODEL_NATIVE_CTX, OPENJEV)
+
+  assert.equal(args.filter((token) => token === '--runner').length, 1)
+  assert.deepEqual(args.slice(-2), ['--runner', 'pooling'])
+})
+
+test('a user who set all four spike flags gets each exactly once, as typed', () => {
+  const args = vllmProfileToArgs(withExtraArgs(OPENJEV_LAUNCH_TOKENS), MODEL_NATIVE_CTX, OPENJEV)
+
+  assert.deepEqual(args, ['--max-num-batched-tokens', String(MODEL_NATIVE_CTX), ...OPENJEV_LAUNCH_TOKENS])
+})
+
+test('without a Jev descriptor the argv is unchanged for representative profiles', () => {
+  const fresh = withExtraArgs([])
+  const tuned = { ...withVllm({ maxModelLen: 16384, gpuMemoryUtilization: 0.8, dtype: 'bfloat16' }), extraArgs: ['--seed', '7'] }
+  const tiny = deriveDefault(model({ nativeCtx: 2048 }), sys)
+
+  assert.deepEqual(vllmProfileToArgs(fresh, MODEL_NATIVE_CTX, undefined), ['--max-num-batched-tokens', '32768'])
+  assert.deepEqual(vllmProfileToArgs(tuned, MODEL_NATIVE_CTX, undefined), [
+    '--max-model-len', '16384', '--max-num-batched-tokens', '16384', '--gpu-memory-utilization', '0.8',
+    '--dtype', 'bfloat16', '--seed', '7',
+  ])
+  assert.deepEqual(vllmProfileToArgs(tiny, 2048, undefined), [])
 })

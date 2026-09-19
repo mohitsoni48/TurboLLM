@@ -10,6 +10,7 @@ import type { ModelEntry } from '../models/scanner'
 import { type SysInfo, primaryVendor } from '../sysinfo/sysinfo'
 import { koboldcppProfileToArgs } from './koboldcpp'
 import type { StartOpts } from './manager'
+import { mlxSamplingArgs } from './mlx'
 import { buildStartOpts } from './start-opts'
 
 const NO_GPU_MACHINE: SysInfo = { os: 'win32', cpu: 'test', cores: 8, ramMB: 32768, gpus: [] }
@@ -60,6 +61,37 @@ test('building StartOpts leaves the config snapshot it reads unchanged', () => {
   }
 
   assert.deepEqual(cfg, before)
+})
+
+const OPENJEV_LAUNCH_TOKENS = [
+  '--runner', 'pooling',
+  '--convert', 'classify',
+  '--hf-overrides', '{"architectures":["Qwen3_5ForConditionalGeneration"]}',
+  '--limit-mm-per-prompt', '{"image":0,"video":0}',
+]
+
+function jevModel(): ModelEntry {
+  return ggufModel({
+    format: 'mlx', nativeCtx: 262144, path: 'D:\\models\\openjev\\qwen3.5-4b-nli-v2',
+    jev: {
+      labels: ['contradiction', 'entailment', 'neutral'],
+      nliTemplate: 'Premise: {premise}\nHypothesis: {hypothesis}',
+      architecture: 'Qwen3_5ForSequenceClassification',
+      verified: true,
+    },
+  })
+}
+
+test('a Jev model on vLLM launches with the verified classifier flags after the profile flags', () => {
+  const opts = resumeLoad(jevModel(), 'vllm')
+
+  assert.deepEqual(opts.extraArgs, ['--max-num-batched-tokens', '262144', ...OPENJEV_LAUNCH_TOKENS])
+})
+
+test('a Jev model on MLX keeps the MLX sampling path, with no Jev flags', () => {
+  const opts = resumeLoad(jevModel(), 'mlx')
+
+  assert.deepEqual(opts.extraArgs, mlxSamplingArgs(undefined))
 })
 
 function resumeLoad(entry: ModelEntry, kind: string, cfg: Config = defaultConfig()): StartOpts {
