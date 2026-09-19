@@ -4,17 +4,20 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Hono } from 'hono'
-import { DEFAULT_HYPOTHESIS_TEMPLATE } from '../models/jev'
+import { DEFAULT_HYPOTHESIS_TEMPLATE, type JevInfo } from '../models/jev'
 import {
   jevEndpointFor,
   jevErrorResponse,
   MAX_JEV_INPUTS,
+  nliTemplateFor,
   parseClassifyBody,
   parseRerankBody,
   type JevHttpError,
 } from './jev-endpoints'
 
 const MODEL_KEY = 'qwen3.5 4b nli v2|mlx-fp16|9012345678'
+const MODEL_NAME = 'qwen3.5 4b nli v2'
+const OPENJEV_TEMPLATE = 'Premise: {premise}\nHypothesis: {hypothesis}'
 const KITCHEN_PREMISE = 'A chef is chopping onions in a busy restaurant kitchen.'
 const KITCHEN_HYPOTHESES = [
   'Someone is preparing food.',
@@ -34,6 +37,17 @@ function classifyBody(overrides: Record<string, unknown> = {}): Record<string, u
 
 function rerankBody(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return { model: MODEL_KEY, query: FRANCE_QUERY, documents: CITIES, ...overrides }
+}
+
+/** Fixture F1's Jev descriptor, as detectJev() reads it from the OpenJev config.json. */
+function openJevInfo(overrides: Partial<JevInfo> = {}): JevInfo {
+  return {
+    labels: ['contradiction', 'entailment', 'neutral'],
+    nliTemplate: OPENJEV_TEMPLATE,
+    architecture: 'Qwen3_5ForSequenceClassification',
+    verified: true,
+    ...overrides,
+  }
 }
 
 function nonEmptyStrings(count: number): string[] {
@@ -211,6 +225,26 @@ test('rerank: checks run in order — query before documents before top_n before
     BAD_DOCUMENTS,
   )
   assert.deepEqual(parseRerankBody(rerankBody({ top_n: 0, hypothesis_template: 'x' })), BAD_TOP_N)
+})
+
+const TEMPLATE_MISSING: JevHttpError = {
+  status: 400,
+  code: 'jev_template_missing',
+  type: 'invalid_request_error',
+  message: "'qwen3.5 4b nli v2' doesn't say how to combine premise and hypothesis (its config.json has no " +
+    "nli_template), so TurboLLM can't build its input.",
+}
+
+test('nliTemplateFor: the model\'s own nli_template is returned as-is', () => {
+  assert.equal(nliTemplateFor({ name: MODEL_NAME, jev: openJevInfo() }), OPENJEV_TEMPLATE)
+})
+
+test('nliTemplateFor (Q1 default): no usable nli_template → 400 jev_template_missing, no fallback', () => {
+  assert.deepEqual(nliTemplateFor({ name: MODEL_NAME, jev: openJevInfo({ nliTemplate: null }) }), TEMPLATE_MISSING)
+})
+
+test('nliTemplateFor: an entry with no Jev descriptor has no template either', () => {
+  assert.deepEqual(nliTemplateFor({ name: MODEL_NAME }), TEMPLATE_MISSING)
 })
 
 test('jevErrorResponse answers the OpenAI error envelope with the error\'s status', async () => {

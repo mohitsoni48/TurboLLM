@@ -4,7 +4,7 @@
 // registration order (ADR-421, divergence row 7). User strings are validated, never trimmed.
 import type { Context } from 'hono'
 import type { ContentfulStatusCode } from 'hono/utils/http-status'
-import { DEFAULT_HYPOTHESIS_TEMPLATE, validateHypothesisTemplate } from '../models/jev'
+import { DEFAULT_HYPOTHESIS_TEMPLATE, validateHypothesisTemplate, type JevInfo } from '../models/jev'
 
 export type JevEndpoint = 'classify' | 'rerank'
 
@@ -63,6 +63,21 @@ export function parseRerankBody(raw: unknown): RerankInput | JevHttpError {
     documents: raw.documents.map(documentText),
     topN: raw.top_n,
     hypothesisTemplate,
+  }
+}
+
+/** The model's own premise/hypothesis template. Q1 default (architecture §5, ADR-436 (8)): with no
+ *  usable `nli_template` the model is refused rather than given a guessed prompt, because ADR-434 (d)
+ *  says the template is read from the model and never hardcoded. */
+export function nliTemplateFor(entry: { name: string; jev?: JevInfo }): string | JevHttpError {
+  const template = entry.jev?.nliTemplate
+  if (typeof template === 'string') return template
+  return {
+    status: 400,
+    code: 'jev_template_missing',
+    type: 'invalid_request_error',
+    message: `'${entry.name}' doesn't say how to combine premise and hypothesis (its config.json has no ` +
+      "nli_template), so TurboLLM can't build its input.",
   }
 }
 
