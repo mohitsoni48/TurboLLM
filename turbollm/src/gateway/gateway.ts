@@ -99,6 +99,13 @@ function asClientStatus(status: number): ContentfulStatusCode {
   return (status >= 400 && status <= 599 ? status : 500) as ContentfulStatusCode
 }
 
+/** Why a chat / embeddings / messages request naming a Jev model is refused, and where to go instead. */
+function jevWrongEndpointMessage(modelName: string, request: 'chat' | 'embeddings'): string {
+  const cannot = request === 'chat' ? 'chat' : 'produce embeddings'
+  return `'${modelName}' is a Jev model: it labels premise/hypothesis pairs and cannot ${cannot}. ` +
+    'Call POST /v1/classify (or /v1/rerank) instead.'
+}
+
 /** Classifies a `d.gate.acquire()` failure into one {status, type, message} shape shared by both
  *  the streaming (SSE `error` event, ADR-347 — `status` unused there, a stream is always 200 by
  *  the time it can fail this way) and non-streaming (JSON error response, where `status` is what
@@ -225,6 +232,15 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
     // Enforce the global "max response tokens" cap on external (Claude Code) traffic.
     const maxLimit = d.store.snapshot().modelDefaults.maxTokens ?? 0
     req.max_tokens = clampMaxTokens(req.max_tokens, maxLimit) ?? req.max_tokens
+
+    // A Jev model never chats (ADR-434 (f)); refuse before route() could auto-swap it in.
+    const jevModel = d.modelRouter.targetEntry(req.model ?? '')
+    if (jevModel?.jev) {
+      return c.json(
+        { type: 'error', error: { type: 'invalid_request_error', message: jevWrongEndpointMessage(jevModel.name, 'chat') } },
+        400,
+      )
+    }
 
     // Route to the requested model — may trigger an auto-swap (v0.6.0).
     const routeResult = await d.modelRouter.route(req.model ?? '')
@@ -854,6 +870,15 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
     : null
 
   const requestedModel = (isChat || isEmbeddings) ? ((parsedBody?.model as string | undefined) ?? '') : ''
+  // A Jev model can neither chat nor embed (ADR-434 (f)). Asked of targetEntry, which loads nothing,
+  // so the refusal never swaps the Jev model in first.
+  if (isChat || isEmbeddings) {
+    const jevModel = d.modelRouter.targetEntry(requestedModel)
+    if (jevModel?.jev) {
+      const message = jevWrongEndpointMessage(jevModel.name, isChat ? 'chat' : 'embeddings')
+      return c.json({ error: { type: 'invalid_request_error', code: 'jev_model_wrong_endpoint', message } }, 400)
+    }
+  }
   const routeResult = await d.modelRouter.route(requestedModel)
   if ('status' in routeResult) {
     return c.json(

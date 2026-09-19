@@ -18,6 +18,7 @@ function fakeDeps(routed: { model: string | null }): Deps {
   return {
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }) },
     modelRouter: {
+      targetEntry: () => undefined,
       route: async (m: string) => {
         routed.model = m
         return { target: 'http://engine.local' }
@@ -94,7 +95,7 @@ test('POST /v1/embeddings never proxies to a linked machine — Turbo Link is ch
   const app = new Hono()
   const d = {
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }) },
-    modelRouter: { route: async () => ({ target: REMOTE.baseUrl, remote: REMOTE }) },
+    modelRouter: { targetEntry: () => undefined, route: async () => ({ target: REMOTE.baseUrl, remote: REMOTE }) },
     store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }) },
     manager: { status: () => ({ state: 'stopped', model: null }), target: () => null },
     registry: { active: () => ({ kind: 'llama.cpp' }) },

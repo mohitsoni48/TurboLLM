@@ -20,6 +20,7 @@ function fakeDeps(routed: { model: string | null }, autoSwap = true): Deps {
   return {
     scanner: { list: () => ({ models: LIBRARY, scanning: false, lastScanAt: '' }) },
     modelRouter: {
+      targetEntry: () => undefined,
       route: async (m: string) => {
         routed.model = m
         return { target: 'http://engine.local' }

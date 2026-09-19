@@ -76,7 +76,7 @@ function hostDeps(keys: ApiKey[], telemetry?: Emitter): Deps {
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }) },
     db: { recordApiUsage: () => {} },
     registry: { active: () => ({ kind: 'llama.cpp' }) },
-    modelRouter: { route: async () => ({ target: 'http://engine.local' }), resolveRemoteTarget: () => undefined },
+    modelRouter: { targetEntry: () => undefined, route: async () => ({ target: 'http://engine.local' }), resolveRemoteTarget: () => undefined },
     manager: {
       status: () => ({ state: 'running', model: { key: LOADED } }),
       target: () => 'http://engine.local',
@@ -186,7 +186,7 @@ function peerDeps(telemetry: Emitter): Deps {
   const remote = { linkId: 'lnk1', baseUrl: HOST_URL, token: LINK_TOKEN, modelKey: COLD }
   return {
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }) },
-    modelRouter: { route: async () => ({ target: remote.baseUrl, remote }) },
+    modelRouter: { targetEntry: () => undefined, route: async () => ({ target: remote.baseUrl, remote }) },
     store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }) },
     manager: {
       status: () => ({ state: 'stopped', model: null }),

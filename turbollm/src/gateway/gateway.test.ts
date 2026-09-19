@@ -116,14 +116,20 @@ const F7_RERANK = {
   usage: { prompt_tokens: 51, total_tokens: 51 },
 }
 
-/** The members the /v1 paths under test touch; the router resolves by exact key or name. */
-function jevGatewayDeps(): Deps {
+/** The members the /v1 paths under test touch; the router resolves by exact key or name and records
+ *  every model route() is asked for. */
+function jevGatewayDeps(routed: string[] = []): Deps {
+  const byKeyOrName = (id: string) => LIBRARY.find((e) => e.key === id || e.name === id)
   return {
     scanner: { list: () => ({ models: LIBRARY, scanning: false, lastScanAt: '' }) },
     modelRouter: {
-      route: async () => ({ target: ENGINE }),
+      route: async (model: string) => {
+        routed.push(model)
+        return { target: ENGINE }
+      },
+      targetEntry: byKeyOrName,
       resolveRemoteTarget: () => undefined,
-      resolveLocal: (id: string) => LIBRARY.find((e) => e.key === id || e.name === id),
+      resolveLocal: byKeyOrName,
       routeTo: async () => ({ target: ENGINE }),
     },
     store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }) },
@@ -210,6 +216,70 @@ test('gatewayV1Handler behind the Turbo Link façade refuses /v1/classify (origi
     assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'link_classify_unsupported')
     assert.deepEqual(calls, [])
   })
+})
+
+const CANNOT_CHAT = "'qwen3.5 4b nli v2' is a Jev model: it labels premise/hypothesis pairs and cannot chat. " +
+  'Call POST /v1/classify (or /v1/rerank) instead.'
+const CANNOT_EMBED = "'qwen3.5 4b nli v2' is a Jev model: it labels premise/hypothesis pairs and cannot produce " +
+  'embeddings. Call POST /v1/classify (or /v1/rerank) instead.'
+
+test('POST /v1/chat/completions on a Jev model → 400 jev_model_wrong_endpoint, nothing routed or loaded', async () => {
+  const routed: string[] = []
+  await withEngine({}, async (calls) => {
+    const res = await postJson(gatewayApp(jevGatewayDeps(routed)), '/v1/chat/completions', {
+      model: JEV_KEY, messages: [{ role: 'user', content: 'hi' }],
+    })
+
+    assert.equal(res.status, 400)
+    assert.deepEqual(await res.json(), {
+      error: { type: 'invalid_request_error', code: 'jev_model_wrong_endpoint', message: CANNOT_CHAT },
+    })
+    assert.deepEqual(routed, [], 'route() must not run — it would auto-swap the Jev model in')
+    assert.deepEqual(calls, [])
+  })
+})
+
+test('POST /v1/embeddings on a Jev model → 400 jev_model_wrong_endpoint naming embeddings', async () => {
+  const routed: string[] = []
+  await withEngine({}, async (calls) => {
+    const res = await postJson(gatewayApp(jevGatewayDeps(routed)), '/v1/embeddings', {
+      model: 'qwen3.5 4b nli v2', input: 'hello world',
+    })
+
+    assert.equal(res.status, 400)
+    assert.deepEqual(await res.json(), {
+      error: { type: 'invalid_request_error', code: 'jev_model_wrong_endpoint', message: CANNOT_EMBED },
+    })
+    assert.deepEqual(routed, [])
+    assert.deepEqual(calls, [])
+  })
+})
+
+test('POST /v1/messages on a Jev model (claude- alias) → 400 in the Anthropic error envelope', async () => {
+  const routed: string[] = []
+  await withEngine({}, async (calls) => {
+    const res = await postJson(gatewayApp(jevGatewayDeps(routed)), '/v1/messages', {
+      model: `claude-${JEV_KEY}`, max_tokens: 64, messages: [{ role: 'user', content: 'hi' }],
+    })
+
+    assert.equal(res.status, 400)
+    assert.deepEqual(await res.json(), {
+      type: 'error', error: { type: 'invalid_request_error', message: CANNOT_CHAT },
+    })
+    assert.deepEqual(routed, [])
+    assert.deepEqual(calls, [])
+  })
+})
+
+test('chat, embeddings and messages on a GGUF model still route exactly as before', async () => {
+  const routed: string[] = []
+  const app = gatewayApp(jevGatewayDeps(routed))
+  await withEngine({}, async () => {
+    await postJson(app, '/v1/chat/completions', { model: GGUF_KEY, messages: [{ role: 'user', content: 'hi' }] })
+    await postJson(app, '/v1/embeddings', { model: GGUF_KEY, input: 'hello world' })
+    await postJson(app, '/v1/messages', { model: GGUF_KEY, max_tokens: 64, messages: [{ role: 'user', content: 'hi' }] })
+  })
+  assert.deepEqual(routed, [GGUF_KEY, GGUF_KEY, GGUF_KEY])
 })
 
 test('GET /v1/models marks a Jev model kind "jev" with no claude- alias; other rows are unchanged', async () => {
