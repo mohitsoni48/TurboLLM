@@ -45,8 +45,26 @@ export function detectJev(cfg: unknown): JevInfo | undefined {
     labels,
     nliTemplate: usableNliTemplate(cfg.nli_template),
     architecture,
-    verified: Object.hasOwn(JEV_LAUNCH_TABLE, architecture),
+    verified: hasVerifiedLaunch(architecture),
   }
+}
+
+/** The table's flags for this model, minus every flag the user's extraArgs already set
+ *  (compared by normalised name — see flagName()), flattened to argv in table order.
+ *  The user wins by omission, so no flag ever appears twice on the command line. */
+export function jevLaunchArgs(jev: JevInfo, userExtraArgs: readonly string[]): string[] {
+  const userFlagNames = new Set(userExtraArgs.map(flagName))
+  return launchFlagsFor(jev.architecture)
+    .filter(([flag]) => !userFlagNames.has(flagName(flag)))
+    .flatMap(([flag, value]) => (value === undefined ? [flag] : [flag, value]))
+}
+
+/** '--hf_overrides=…' → 'hf-overrides'; '--Runner' → 'runner'; non '--' tokens → null.
+ *  vLLM's FlexibleArgumentParser treats '_' and '-' alike, so the comparison must too. */
+export function flagName(token: string): string | null {
+  if (!token.startsWith('--')) return null
+  const name = token.slice(2).split('=')[0].replaceAll('_', '-').toLowerCase()
+  return name === '' ? null : name
 }
 
 const SEQUENCE_CLASSIFIER_SUFFIX = 'ForSequenceClassification'
@@ -77,6 +95,14 @@ function canonicalLabel(declared: unknown): string | undefined {
 function usableNliTemplate(declared: unknown): string | null {
   if (typeof declared !== 'string') return null
   return declared.includes('{premise}') && declared.includes('{hypothesis}') ? declared : null
+}
+
+function launchFlagsFor(architecture: string): readonly LaunchFlag[] {
+  return hasVerifiedLaunch(architecture) ? JEV_LAUNCH_TABLE[architecture] : JEV_DEFAULT_LAUNCH
+}
+
+function hasVerifiedLaunch(architecture: string): boolean {
+  return Object.hasOwn(JEV_LAUNCH_TABLE, architecture)
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

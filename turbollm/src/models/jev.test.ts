@@ -3,7 +3,7 @@
 // (chat models, 2/4-label classifiers, sentiment heads, malformed JSON) must stay untouched.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { detectJev, JEV_LAUNCH_TABLE } from './jev'
+import { detectJev, flagName, JEV_LAUNCH_TABLE, jevLaunchArgs, type JevInfo } from './jev'
 
 /** Fixture F1 — the OpenJev config.json fields that matter (plan Appendix). */
 function openJevConfig(): Record<string, unknown> {
@@ -100,4 +100,70 @@ test('the launch table holds exactly the flags the spike verified for OpenJev', 
       ['--limit-mm-per-prompt', '{"image":0,"video":0}'],
     ],
   })
+})
+
+// Launch-arg merge — ADR-434 (g) "the user's extra args still apply on top", ADR-415.
+// vLLM's argument parser treats '_' and '-' alike and accepts '--flag=value', so a user flag
+// written either way must suppress the table's copy of it.
+
+const flagNames: Array<[string, string | null]> = [
+  ['--hf_overrides={"a":1}', 'hf-overrides'],
+  ['--Runner', 'runner'],
+  ['--limit-mm-per-prompt', 'limit-mm-per-prompt'],
+  ['pooling', null],
+  ['-x', null],
+  ['--', null],
+]
+
+for (const [token, expected] of flagNames) {
+  test(`flagName(${JSON.stringify(token)}) → ${JSON.stringify(expected)}`, () => {
+    assert.equal(flagName(token), expected)
+  })
+}
+
+const openJevInfo: JevInfo = {
+  labels: ['contradiction', 'entailment', 'neutral'],
+  nliTemplate: 'Premise: {premise}\nHypothesis: {hypothesis}',
+  architecture: 'Qwen3_5ForSequenceClassification',
+  verified: true,
+}
+const unverifiedJevInfo: JevInfo = { ...openJevInfo, architecture: 'BertForSequenceClassification', verified: false }
+
+const OPENJEV_LAUNCH_TOKENS = [
+  '--runner', 'pooling',
+  '--convert', 'classify',
+  '--hf-overrides', '{"architectures":["Qwen3_5ForConditionalGeneration"]}',
+  '--limit-mm-per-prompt', '{"image":0,"video":0}',
+]
+
+test('a verified model with no user args gets the 8 table tokens, JSON values byte-identical', () => {
+  assert.deepEqual(jevLaunchArgs(openJevInfo, []), OPENJEV_LAUNCH_TOKENS)
+})
+
+test('a user --runner suppresses the table --runner and keeps the rest in table order', () => {
+  assert.deepEqual(jevLaunchArgs(openJevInfo, ['--runner', 'pooling']), OPENJEV_LAUNCH_TOKENS.slice(2))
+})
+
+test('a user --hf_overrides=… (underscore, inline value) suppresses the table --hf-overrides', () => {
+  assert.deepEqual(jevLaunchArgs(openJevInfo, ['--hf_overrides={"a":1}']), [
+    '--runner', 'pooling',
+    '--convert', 'classify',
+    '--limit-mm-per-prompt', '{"image":0,"video":0}',
+  ])
+})
+
+test('a user --RUNNER=pooling (upper case, inline value) suppresses the table --runner', () => {
+  assert.deepEqual(jevLaunchArgs(openJevInfo, ['--RUNNER=pooling']), OPENJEV_LAUNCH_TOKENS.slice(2))
+})
+
+test('a user who already carries all four spike flags gets none from the table', () => {
+  assert.deepEqual(jevLaunchArgs(openJevInfo, OPENJEV_LAUNCH_TOKENS), [])
+})
+
+test('an unverified architecture gets only vLLM\'s native --runner pooling', () => {
+  assert.deepEqual(jevLaunchArgs(unverifiedJevInfo, []), ['--runner', 'pooling'])
+})
+
+test('an unverified architecture whose user sets --runner gets nothing from the table', () => {
+  assert.deepEqual(jevLaunchArgs(unverifiedJevInfo, ['--runner', 'generate']), [])
 })
