@@ -158,19 +158,26 @@ export function findPriorEngine(engines: RegisteredEngineIdentity[], build: Buil
   const sameTarget = engines.filter(
     (e) => sameRepo(e.sourceRepo, build.sourceRepo) && (e.sourceCommit ?? '') === (build.sourceCommit ?? ''),
   )
-  // An exact stored-branch match is the more specific claim, so it wins over the resolved-default
-  // match: a blank registration and an explicitly-named-default one can both resolve to the same
-  // branch, and picking by registry order would delete the one this build wasn't aimed at.
-  const storedBranch = (build.sourceBranch ?? '').trim()
-  const wantedBranch = effectiveBranch(build.sourceBranch, build.defaultBranch)
-  return (
-    sameTarget.find((e) => (e.sourceBranch ?? '').trim() === storedBranch) ??
-    sameTarget.find((e) => effectiveBranch(e.sourceBranch, build.defaultBranch) === wantedBranch)
-  )
+  return pickByBranch(sameTarget, (build.sourceBranch ?? '').trim(), effectiveBranch(build.sourceBranch, build.defaultBranch), build.defaultBranch)
 }
 
 function effectiveBranch(branch: string | undefined, defaultBranch: string | undefined): string {
   return (branch ?? '').trim() || (defaultBranch ?? '').trim()
+}
+
+/** An exact recorded-branch match is the more specific claim, so it wins over the resolved-default
+ *  match: a blank registration and one recorded as the default both resolve to the same branch, and
+ *  picking by registry order would replace or claim the one the caller wasn't aiming at. */
+function pickByBranch<T extends { sourceBranch?: string }>(
+  candidates: T[],
+  exactBranch: string,
+  effective: string,
+  defaultBranch: string | undefined,
+): T | undefined {
+  return (
+    candidates.find((e) => (e.sourceBranch ?? '').trim() === exactBranch) ??
+    candidates.find((e) => effectiveBranch(e.sourceBranch, defaultBranch) === effective)
+  )
 }
 
 /** The subset of a catalog entry needed to decide which registered engine is its build. */
@@ -208,13 +215,11 @@ export function findEngineForCatalogEntry(
       (e.sourceCommit ?? '') === (entry.sourceCommit ?? '') &&
       (e.sourcePatchUrl ?? '') === (entry.patchUrl ?? ''),
   )
+  // Duplicates of one pinned identity are interchangeable, and the persisted registry order is stable.
   if (isPinnedEntry(entry)) return sameBuild[0]
 
   const wanted = effectiveBranch(requestedBranch, entry.defaultBranch)
-  return (
-    sameBuild.find((e) => (e.sourceBranch ?? '').trim() === wanted) ??
-    sameBuild.find((e) => effectiveBranch(e.sourceBranch, entry.defaultBranch) === wanted)
-  )
+  return pickByBranch(sameBuild, wanted, wanted, entry.defaultBranch)
 }
 
 /** PURE: the branch values whose build directory a catalog card should look in for a build that is
@@ -227,6 +232,93 @@ export function catalogBranchesToScan(entry: Omit<CatalogEntryIdentity, 'homepag
   const wanted = effectiveBranch(requestedBranch, entry.defaultBranch)
   if (!wanted) return [undefined]
   return wanted === (entry.defaultBranch ?? '').trim() ? [wanted, undefined] : [wanted]
+}
+
+/** PURE: the directory name the build used before ADR-387, which slugged only the trailing URL
+ *  segment and so dropped the owner. Kept solely to find builds made under that scheme. */
+export function legacyBuildDirName(repoUrl: string, branch?: string, commit?: string): string {
+  const last = repoUrl.trim().replace(/\/+$/, '').split(/[\\/]/).pop() ?? ''
+  const repo = last.replace(/\.git$/i, '').trim() || 'engine'
+  const b = (branch ?? '').trim()
+  const sha = (commit ?? '').trim()
+  const raw = sha ? `${repo}-${sha.slice(0, 12)}` : b ? `${repo}-${b}` : repo
+  return raw.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'engine'
+}
+
+/** A build found on disk for a catalog card, and the branch its directory was built for
+ *  ('' = the bare, blank-branch directory) so Enable can register it with the right branch. */
+export interface CatalogBuildOnDisk {
+  binPath: string
+  branch: string
+}
+
+function serverBinaryIn(enginesRoot: string, dirName: string): string | null {
+  const root = join(enginesRoot, 'build', dirName)
+  return resolveServerBinary(join(root, 'build')) ?? resolveServerBinary(root)
+}
+
+/** The build a catalog card owns on disk while no registry entry claims it (a Disabled engine).
+ *  Scans the directories {@link catalogBranchesToScan} names. A commit-pinned entry also tries the
+ *  pre-ADR-387 directory: the pinned commit is specific enough to trust, whereas an unpinned legacy
+ *  name ("llama.cpp") could be ANY fork's build, so those are never scanned. */
+export function findCatalogBuildOnDisk(
+  enginesRoot: string,
+  entry: CatalogEntryIdentity,
+  requestedBranch?: string,
+): CatalogBuildOnDisk | undefined {
+  for (const branch of catalogBranchesToScan(entry, requestedBranch)) {
+    const binPath = sourceBuildBinary(enginesRoot, entry.homepage, branch, entry.sourceCommit)
+    if (binPath) return { binPath, branch: branch ?? '' }
+  }
+  if (!entry.sourceCommit) return undefined
+  const legacy = serverBinaryIn(enginesRoot, legacyBuildDirName(entry.homepage, undefined, entry.sourceCommit))
+  return legacy ? { binPath: legacy, branch: '' } : undefined
+}
+
+const slashed = (path: string): string => path.replace(/\\/g, '/').toLowerCase()
+
+/** PURE: whether an engine's binary lives inside a build directory — i.e. a rebuild there replaces
+ *  (or, while it is running, breaks) that engine. Separator- and case-insensitive so a Windows
+ *  path compares equal to the one this process computed. */
+export function isEngineInBuildDir(binPath: string, buildRoot: string): boolean {
+  return slashed(binPath).startsWith(`${slashed(buildRoot).replace(/\/+$/, '')}/`)
+}
+
+/** What a build is about to produce, known BEFORE compiling: where it lands and which source it is. */
+export interface PendingBuild {
+  buildRoot: string
+  sourceRepo: string
+  sourceBranch?: string
+  sourceCommit?: string
+}
+
+const branchesProvablyDiffer = (a: string | undefined, b: string | undefined): boolean => {
+  const x = (a ?? '').trim()
+  const y = (b ?? '').trim()
+  return !!x && !!y && x !== y
+}
+
+/** PURE: an engine that already holds `name` and that this build will NOT replace — a name clash
+ *  that is certain now, so the request can fail in a second instead of after a 15-minute compile.
+ *  Deliberately conservative: it is certain only when the holder lives outside the build directory
+ *  AND is a different repo, a different commit, or the same repo on a provably different explicit
+ *  branch. A blank branch on either side is unknown until the default is resolved post-build, so it
+ *  is never reported — that case stays with {@link findPriorEngine}. */
+export function findNameConflict(
+  engines: RegisteredEngineIdentity[],
+  name: string | undefined,
+  build: PendingBuild,
+): RegisteredEngineIdentity | undefined {
+  const wanted = (name ?? '').trim().toLowerCase()
+  if (!wanted) return undefined
+  const holder = engines.find((e) => e.name.trim().toLowerCase() === wanted)
+  if (!holder) return undefined
+  const replaced =
+    isEngineInBuildDir(holder.binPath, build.buildRoot) ||
+    (sameRepo(holder.sourceRepo, build.sourceRepo) &&
+      (holder.sourceCommit ?? '') === (build.sourceCommit ?? '') &&
+      !branchesProvablyDiffer(holder.sourceBranch, build.sourceBranch))
+  return replaced ? undefined : holder
 }
 
 /** PURE: the repo's default branch from `git ls-remote --symref <url> HEAD`, whose first line is
@@ -309,8 +401,7 @@ export function normRepoUrl(s?: string): string {
  *  to detect a source-built engine whose registry entry was removed (disabled) but whose build
  *  output still sits on disk under `engines/build/<slug>/`. */
 export function sourceBuildBinary(enginesRoot: string, repoUrl: string, branch?: string, commit?: string): string | null {
-  const root = join(enginesRoot, 'build', buildDirName(repoUrl, branch, commit))
-  return resolveServerBinary(join(root, 'build')) ?? resolveServerBinary(root)
+  return serverBinaryIn(enginesRoot, buildDirName(repoUrl, branch, commit))
 }
 
 /** PURE: given a built engine's binPath, the `engines/build/<slug>` dir it lives under (for
