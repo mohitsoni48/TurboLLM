@@ -132,24 +132,37 @@ export interface RegisteredEngineIdentity {
  * slugs to the same build directory. Falls back to repo identity via {@link sameRepo} (never a
  * raw string comparison — two spellings of the same repo, e.g. a trailing `.git`/slash, or a
  * moved data dir (ADR-215) that changes the absolute `binPath` while the repo is unchanged, must
- * still match), requiring an EXACT branch+commit match so a commit-pinned build never collapses
- * onto a plain branch-tip build of the same repo, or vice versa.
+ * still match), requiring an EXACT commit match so a commit-pinned build never collapses onto a
+ * plain branch-tip build of the same repo, or vice versa.
  *
  * ADR-387 fixed `buildDirName`'s own repo comparison but explicitly flagged this exact class of
  * bug as unaddressed here: "registration still matches by binary path before checking repo
  * identity ... a future collision class would reopen the same failure shape." A raw `===` on
  * `sourceRepo` was that collision class — it left a stranded prior registration (and its name)
- * un-replaceable whenever `binPath` alone didn't match. */
+ * un-replaceable whenever `binPath` alone didn't match.
+ *
+ * Branch matching (ADR-428 follow-up) allows one blank side: "Add via git repo" lets a branch be
+ * left blank to mean "the repo's own default branch" and registers with no `sourceBranch` at all,
+ * while a later "Rebuild" of that same engine sends an EXPLICIT branch (the catalog's/UI's own
+ * default-branch guess) — a different string, slugging to a different directory, for what is
+ * unambiguously the same build target. That ambiguity is only bridged when it IS unambiguous:
+ * exactly one non-commit-pinned registration exists for the repo. Two or more different branches
+ * already tracked for the same repo means the user deliberately follows more than one — never
+ * guess which one a blank branch meant; let an exact match (or none) stand. */
 export function findPriorEngine(engines: RegisteredEngineIdentity[], build: BuildIdentity): RegisteredEngineIdentity | undefined {
-  return (
-    engines.find((e) => e.binPath === build.binPath) ??
-    engines.find(
-      (e) =>
-        sameRepo(e.sourceRepo, build.sourceRepo) &&
-        (e.sourceBranch ?? '') === (build.sourceBranch ?? '') &&
-        (e.sourceCommit ?? '') === (build.sourceCommit ?? ''),
-    )
+  const byBinPath = engines.find((e) => e.binPath === build.binPath)
+  if (byBinPath) return byBinPath
+
+  const sameRepoSameCommit = engines.filter(
+    (e) => sameRepo(e.sourceRepo, build.sourceRepo) && (e.sourceCommit ?? '') === (build.sourceCommit ?? ''),
   )
+  const exactBranch = sameRepoSameCommit.find((e) => (e.sourceBranch ?? '') === (build.sourceBranch ?? ''))
+  if (exactBranch) return exactBranch
+
+  if (sameRepoSameCommit.length === 1 && (!sameRepoSameCommit[0].sourceBranch || !build.sourceBranch)) {
+    return sameRepoSameCommit[0]
+  }
+  return undefined
 }
 
 export interface BuildHooks {

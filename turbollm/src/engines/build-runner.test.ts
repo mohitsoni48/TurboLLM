@@ -104,6 +104,44 @@ test('findPriorEngine: an unrelated repo never matches', () => {
   assert.equal(prior, undefined)
 })
 
+test('findPriorEngine: a blank branch matches a later build that names the default branch explicitly (live-reproduced regression)', () => {
+  // Reproduced live: "Add via git repo" leaves branch blank ("leave blank to build the repo's own
+  // default branch" — CustomBuildDialog.tsx) and registers with sourceBranch undefined, landing at
+  // the bare buildDirName (no branch suffix). The SAME engine's own "Rebuild" action later sends an
+  // EXPLICIT branch (EnginesScreen.tsx's selectedBranch, initialized from catalog.defaultBranch —
+  // "main" for ik_llama.cpp), which slugs to a DIFFERENT directory/binPath. Neither the binPath
+  // check nor an exact branch comparison sees these as the same target, so the stale registration
+  // is never replaced and blocks the rebuild's name with NameTakenError forever.
+  const engines = [
+    {
+      id: '1',
+      name: 'ik_llama.cpp',
+      binPath: 'C:\\...\\build\\ikawrakow-ik_llama.cpp\\build\\bin\\llama-server.exe',
+      sourceRepo: 'https://github.com/ikawrakow/ik_llama.cpp',
+      sourceCommit: '',
+    },
+  ]
+  const prior = findPriorEngine(engines, {
+    binPath: 'C:\\...\\build\\ikawrakow-ik_llama.cpp-main\\build\\bin\\llama-server.exe',
+    sourceRepo: 'https://github.com/ikawrakow/ik_llama.cpp',
+    sourceBranch: 'main',
+    sourceCommit: '',
+  })
+  assert.equal(prior?.id, '1')
+})
+
+test('findPriorEngine: never guesses which branch a blank one meant when multiple branches of the same repo are already tracked', () => {
+  // If the user deliberately registered more than one branch of the same fork, a blank branch on a
+  // NEW build is genuinely ambiguous — bridging it to either one risks silently replacing the wrong
+  // engine. Safer to fall through to no match (the pre-existing NameTaken error) than to guess.
+  const engines = [
+    { id: '1', name: 'fork-main', binPath: '/x/main', sourceRepo: 'https://github.com/o/r', sourceBranch: 'main', sourceCommit: '' },
+    { id: '2', name: 'fork-dev', binPath: '/x/dev', sourceRepo: 'https://github.com/o/r', sourceBranch: 'dev', sourceCommit: '' },
+  ]
+  const prior = findPriorEngine(engines, { binPath: '/x/new', sourceRepo: 'https://github.com/o/r', sourceCommit: '' })
+  assert.equal(prior, undefined)
+})
+
 test('normRepoUrl: strips scheme, github.com host, .git suffix, trailing slash, and case', () => {
   assert.equal(normRepoUrl('https://github.com/GGML-org/Llama.cpp'), 'ggml-org/llama.cpp')
   assert.equal(normRepoUrl('https://github.com/ggml-org/llama.cpp.git'), 'ggml-org/llama.cpp')
