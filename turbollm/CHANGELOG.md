@@ -43,16 +43,25 @@ _Nothing yet._
   The card looked for the engine's build folder but forgot which branch it was built for, so Enable
   registered it as a different one. It now re-registers the engine with the branch its folder was
   really built for. A build made by an older version under the previous folder naming (Solar Open 2
-  was one) also shows as installed again instead of "not installed."
+  was one) also shows as installed again instead of "not installed." Engines pinned to an exact
+  commit or patch, like Solar Open 2, now keep that identity when you Enable them, so their card
+  recognises them afterwards instead of still saying "not installed."
 - **The branch dropdown could show one branch while a build used another.** When an engine's default
   branch wasn't known and the fetched branch list didn't include it, the dropdown displayed the first
-  branch in the list, but the build request went out with no branch at all. The branch the build will
-  use is now always in the list and always the one shown.
+  branch in the list, but the build request went out with no branch at all. The same thing happened
+  after typing in the branch search box: a search that didn't match the selected branch made the
+  dropdown display the first match while the build still used the previous selection. The branch the
+  build will use is now always in the list and always the one shown, and the "N of M" count no longer
+  counts it twice.
+- **Building from an unusual repository address is now safe.** A malformed repository address could
+  point a build at a folder outside its own build folder. Build folder names are now always a single,
+  real folder name.
 - **vLLM and SGLang were still misdiagnosed on macOS and less common systems.** uvloop ships macOS
   builds, so a failed check on a Mac is a broken environment, not "cannot run on macOS," and the
-  message now says so. Only Windows is reported as unable to run them; Linux and macOS are called
-  supported, and any other system is described as unverified rather than supported. The error detail
-  in the message is also shortened and shows your home folder as `~`.
+  message now says so. Only Windows is reported as unable to run them. The message calls Linux a
+  supported platform, says only that uvloop itself supports macOS (both engines are experimental or
+  unsupported upstream there), and describes any other system as unverified. The error detail in the
+  message is also shortened and shows your home folder as `~`.
 
 ### Discord
 
