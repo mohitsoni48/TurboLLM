@@ -415,12 +415,16 @@ function osLabel(platforms: string[]): string {
 /** Default engine name for a fresh build-from-source run. Official llama.cpp repos
  *  get the `Llama-<Branch>` convention; forks get `<EngineName>-<Branch>`. */
 function defaultBuildName(catalog: CatalogEngine | undefined, branch: string): string {
-  const b = (branch || 'main').trim()
+  const b = branch.trim()
   const officialLlama = ['llama.cpp', 'llama.cpp-cuda-linux', 'llama.cpp-android-source', 'llama.cpp-source'].includes(
     catalog?.id ?? '',
   )
-  return officialLlama ? `Llama-${b}` : `${catalog?.name ?? 'engine'}-${b}`
+  const base = officialLlama ? 'Llama' : (catalog?.name ?? 'engine')
+  return b ? `${base}-${b}` : base
 }
+
+/** A blank branch means "the repo's own default", which the user should see spelled out. */
+const branchLabel = (branch: string): string => branch || '(repo default)'
 
 /**
  * Engines screen. Three calm zones:
@@ -1188,7 +1192,9 @@ function EngineCard({
   // while the build request sent 'main' ("Remote branch main not found" for Prism, master, etc.).
   // The recommendation's own engine carries defaultBranch too, so it is known even before the catalog.
   const [chosenBranch, setChosenBranch] = useState<string | undefined>(undefined)
-  const defaultBranch = catalog?.defaultBranch ?? e.defaultBranch ?? 'main'
+  // Unknown default = '' (no branch sent; git clones the repo's own default). Never guess 'main':
+  // a wrong guess is a hard "Remote branch main not found" for any repo whose default isn't main.
+  const defaultBranch = catalog?.defaultBranch ?? e.defaultBranch ?? ''
   const selectedBranch = chosenBranch ?? defaultBranch
   const isLlama = e.id === 'llama.cpp'
   const sourceBuilt = !!catalog?.sourceBuilt
@@ -1314,7 +1320,7 @@ function EngineCard({
                   // Keep the CURRENT branch as the option while the list loads. The old markup
                   // swapped in a hardcoded value="main" placeholder, which made the <select>'s
                   // value disagree with selectedBranch for any engine whose default is not main.
-                  <option value={selectedBranch}>{selectedBranch} — loading branches…</option>
+                  <option value={selectedBranch}>{branchLabel(selectedBranch)} — loading branches…</option>
                 ) : filtered.length === 0 ? (
                   <option value={selectedBranch} disabled>
                     No matching branches
@@ -1322,7 +1328,7 @@ function EngineCard({
                 ) : (
                   filtered.map((b) => (
                     <option key={b} value={b}>
-                      {b}
+                      {branchLabel(b)}
                     </option>
                   ))
                 )}

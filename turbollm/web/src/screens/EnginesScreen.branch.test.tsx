@@ -46,17 +46,22 @@ const PRISM_ENGINE = {
   variants: [PRISM_VARIANT],
 }
 
-const RECOMMENDATION = {
+/** The default branch the daemon reports for the engine; undefined = the catalog has none for it. */
+let engineDefaultBranch: string | undefined
+
+const engine = () => ({ ...PRISM_ENGINE, defaultBranch: engineDefaultBranch })
+
+const recommendation = () => ({
   hardware: { platform: 'win32', arch: 'x64', gpuVendor: 'nvidia', hasGpu: true, vramMb: 16303, gpuName: 'NVIDIA GeForce RTX 5070 Ti', unifiedMemory: false },
   recommendation: {
     recommended: null,
-    fits: [{ engine: PRISM_ENGINE, variants: [PRISM_VARIANT], compatible: [PRISM_VARIANT], recommended: false }],
+    fits: [{ engine: engine(), variants: [PRISM_VARIANT], compatible: [PRISM_VARIANT], recommended: false }],
   },
-}
+})
 
-const CATALOG = {
-  engines: [{ ...PRISM_ENGINE, supportedHere: true, sourceBuilt: false, sourceBranch: '', sourceBinPath: '' }],
-}
+const catalog = () => ({
+  engines: [{ ...engine(), supportedHere: true, sourceBuilt: false, sourceBranch: '', sourceBinPath: '' }],
+})
 
 const STATUS = {
   version: '0.0.0',
@@ -74,6 +79,7 @@ const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200
 let releaseCatalog: () => void
 
 beforeEach(() => {
+  engineDefaultBranch = 'prism'
   const catalogGate = new Promise<void>((resolve) => {
     releaseCatalog = resolve
   })
@@ -85,10 +91,10 @@ beforeEach(() => {
       if (/\/api\/v1\/status(\?|$)/.test(url)) return json(STATUS)
       if (/\/api\/v1\/settings(\?|$)/.test(url)) return json({ build: { toolchainDirs: [] } })
       if (url.includes('/api/v1/build/prereqs')) return json({ supported: true, os: 'windows', tools: [], packageManager: null })
-      if (url.includes('/api/v1/engines/recommendation')) return json(RECOMMENDATION)
+      if (url.includes('/api/v1/engines/recommendation')) return json(recommendation())
       if (url.includes('/api/v1/engines/catalog')) {
         await catalogGate
-        return json(CATALOG)
+        return json(catalog())
       }
       return json({})
     }),
@@ -131,5 +137,24 @@ describe('EnginesScreen source-build branch (Prism "Remote branch main not found
     fireEvent.click(await screen.findByRole('button', { name: /build it for me/i }))
     await waitFor(() => expect(buildRequests()).toHaveLength(1))
     expect(buildRequests()[0]).toMatchObject({ repoUrl: 'https://github.com/PrismML-Eng/llama.cpp', branch: 'prism' })
+  })
+
+  it('sends NO branch — not a guessed "main" — for an engine whose default branch is unknown', async () => {
+    // A guessed branch is exactly how "Remote branch main not found" happens for any repo whose
+    // default isn't main. With no known default the honest request is a blank branch, which git
+    // resolves to the repo's real default.
+    engineDefaultBranch = undefined
+    renderEngines()
+    await screen.findByText('Prism (llama.cpp fork)')
+
+    releaseCatalog()
+    fireEvent.click(await screen.findByRole('button', { name: /build from source/i }))
+    await screen.findByText(/Build .* from source/)
+    fireEvent.click(await screen.findByRole('button', { name: /build it for me/i }))
+
+    await waitFor(() => expect(buildRequests()).toHaveLength(1))
+    const request = buildRequests()[0]
+    expect(request).not.toHaveProperty('branch')
+    expect(String(request.name)).not.toMatch(/-main$/)
   })
 })
