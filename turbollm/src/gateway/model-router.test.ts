@@ -474,3 +474,161 @@ test('buildOpts: an incomplete model builds nothing', () => {
 
   assert.equal(opts, null)
 })
+
+// ── resolveLocal / targetEntry / routeTo / aliveSlots (architecture §2.4, ADR-060, ADR-376) ──
+// routeTo routes to exactly the entry it is given and never falls back to whatever the primary
+// holds; targetEntry answers "which local model would route() hit" without loading anything.
+// Targets are opaque strings here: nothing is ever contacted.
+const PRIMARY_TARGET = 'http://primary.invalid'
+const BETA_SLOT_TARGET = 'http://slot-beta.invalid'
+
+function namedEntry(key: string, name: string): ModelEntry {
+  return { ...fakeEntry(key), name } as ModelEntry
+}
+
+const ALPHA = namedEntry('alpha-key', 'Alpha Model')
+const BETA = namedEntry('beta-key', 'Beta')
+
+/** A primary Manager double holding `loadedKey` (running) or nothing. Its load() throws, so a test
+ *  that must not load anything fails loudly if it does. */
+function primaryHolding(loadedKey: string | null): Manager {
+  const model = loadedKey ? { key: loadedKey, name: loadedKey, quant: 'Q4', ctx: 4096, vision: false } : null
+  return {
+    status: (): Status => ({ state: loadedKey ? 'running' : 'stopped', err: null, port: 0, pid: 0, model, loadElapsedMs: 0 }),
+    target: () => (loadedKey ? PRIMARY_TARGET : null),
+    touch: () => {},
+    load: () => { throw new Error('this test must not load a model') },
+  } as unknown as Manager
+}
+
+function slotManager(state: Status['state'], modelKey: string, target: string): Manager {
+  const model = { key: modelKey, name: modelKey, quant: 'Q4', ctx: 4096, vision: false }
+  return {
+    status: (): Status => ({ state, err: null, port: 0, pid: 0, model, loadElapsedMs: 0 }),
+    target: () => target,
+    touch: () => {},
+  } as unknown as Manager
+}
+
+function routingRouter(opts: {
+  models: ModelEntry[]
+  primary: Manager
+  autoSwap?: boolean
+  slots?: PoolSlotShape[]
+}): ModelRouter {
+  const cfg = { gateway: { autoSwap: opts.autoSwap ?? true, keepN: 1 }, modelProfiles: {}, comfyui: {}, links: [] }
+  const store = { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) } as unknown as ConfigStore
+  const scanner = {
+    list: () => ({ models: opts.models }),
+    get: (key: string) => opts.models.find((m) => m.key === key),
+  } as unknown as Scanner
+  const registry = { active: () => fakeEngine('mlx') } as unknown as Registry
+  const r = new ModelRouter(store, registry, opts.primary, scanner, undefined)
+  const slots = new Map<string, PoolSlotShape>()
+  for (const s of opts.slots ?? []) slots.set(s.modelKey, s)
+  ;(r as unknown as { extraSlots: Map<string, PoolSlotShape> }).extraSlots = slots
+  return r
+}
+
+test('resolveLocal: exact key, exact name, case-insensitive name, then substring', () => {
+  const r = routingRouter({ models: [ALPHA, BETA], primary: primaryHolding(null) })
+
+  assert.equal(r.resolveLocal('beta-key'), BETA)
+  assert.equal(r.resolveLocal('Alpha Model'), ALPHA)
+  assert.equal(r.resolveLocal('alpha model'), ALPHA)
+  assert.equal(r.resolveLocal('pha mod'), ALPHA)
+  assert.equal(r.resolveLocal('gamma'), undefined)
+})
+
+test('targetEntry: a Turbo Link qualified id is never a local entry', () => {
+  const r = routingRouter({ models: [ALPHA], primary: primaryHolding('alpha-key') })
+  ;(r as unknown as { catalog: unknown }).catalog = {
+    linkByName: (name: string) => (name === 'workstation'
+      ? { id: 'l1', name: 'workstation', baseUrl: 'https://ws.invalid', token: 't', status: 'online' }
+      : undefined),
+    modelOn: () => ({ key: 'Alpha Model', name: 'Alpha Model' }),
+  }
+
+  assert.equal(r.targetEntry('workstation/Alpha Model'), undefined)
+})
+
+test('targetEntry: auto-swap off answers with the primary entry, whatever was named', () => {
+  const r = routingRouter({ models: [ALPHA, BETA], primary: primaryHolding('alpha-key'), autoSwap: false })
+
+  assert.equal(r.targetEntry('Beta'), ALPHA)
+})
+
+test('targetEntry: an empty model answers with the primary entry', () => {
+  const r = routingRouter({ models: [ALPHA, BETA], primary: primaryHolding('alpha-key') })
+
+  assert.equal(r.targetEntry(''), ALPHA)
+})
+
+test('targetEntry: a resolvable model answers with that entry, without loading it', () => {
+  const r = routingRouter({ models: [ALPHA, BETA], primary: primaryHolding('alpha-key') })
+
+  assert.equal(r.targetEntry('Beta'), BETA)
+})
+
+test('targetEntry: an unresolvable model answers with the primary entry, matched by path too', () => {
+  const r = routingRouter({ models: [ALPHA, BETA], primary: primaryHolding(ALPHA.path) })
+
+  assert.equal(r.targetEntry('gamma'), ALPHA)
+})
+
+test('targetEntry: with nothing loaded an unresolvable model has no target entry', () => {
+  const r = routingRouter({ models: [ALPHA, BETA], primary: primaryHolding(null) })
+
+  assert.equal(r.targetEntry('gamma'), undefined)
+  assert.equal(r.targetEntry(''), undefined)
+})
+
+test('routeTo: the entry running in the primary gets the primary target, with no load', async () => {
+  const r = routingRouter({ models: [ALPHA, BETA], primary: primaryHolding('alpha-key') })
+
+  assert.deepEqual(await r.routeTo(ALPHA), { target: PRIMARY_TARGET })
+})
+
+test('routeTo: the entry running in a pool slot gets that slot target', async () => {
+  const slot = { manager: slotManager('running', 'beta-key', BETA_SLOT_TARGET), modelKey: 'beta-key', lastUsedMs: 0 }
+  const r = routingRouter({ models: [ALPHA, BETA], primary: primaryHolding('alpha-key'), slots: [slot] })
+
+  assert.deepEqual(await r.routeTo(BETA), { target: BETA_SLOT_TARGET })
+})
+
+test('routeTo: an entry that is not alive is loaded once when auto-swap is on', async () => {
+  const { manager, finishLoad, calls } = controllableManager()
+  const r = routingRouter({ models: [ALPHA, BETA], primary: manager })
+
+  const routed = r.routeTo(BETA)
+  await tick()
+  finishLoad()
+
+  assert.deepEqual(await routed, { target: manager.target() })
+  assert.deepEqual(calls, ['beta-key'])
+})
+
+test('routeTo: with auto-swap off an entry that is not loaded is a 503, never the primary target', async () => {
+  const r = routingRouter({ models: [ALPHA, BETA], primary: primaryHolding('alpha-key'), autoSwap: false })
+
+  assert.deepEqual(await r.routeTo(BETA), {
+    status: 503,
+    message: "'Beta' is not loaded. Load it from Models, or turn on auto-swap.",
+  })
+})
+
+test('aliveSlots: the primary first, then alive pool slots; stopped slots are left out', () => {
+  const r = routingRouter({
+    models: [ALPHA, BETA],
+    primary: primaryHolding('alpha-key'),
+    slots: [
+      { manager: slotManager('starting', 'beta-key', BETA_SLOT_TARGET), modelKey: 'beta-key', lastUsedMs: 5 },
+      { manager: slotManager('stopped', 'gamma-key', 'http://slot-gamma.invalid'), modelKey: 'gamma-key', lastUsedMs: 7 },
+    ],
+  })
+
+  assert.deepEqual(r.aliveSlots(), [
+    { modelKey: 'alpha-key', state: 'running', primary: true, lastUsedMs: 0 },
+    { modelKey: 'beta-key', state: 'starting', primary: false, lastUsedMs: 5 },
+  ])
+})
